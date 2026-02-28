@@ -267,11 +267,28 @@ class TestConfigSet:
 
 
 class TestTimelockAddress:
-    def test_get_timelock_address(self, authed_client: tuple[TestClient, str]) -> None:
+    @patch("jmwalletd.routers.wallet_data.save_registry")
+    @patch("jmwalletd.routers.wallet_data.load_registry")
+    def test_get_timelock_address(
+        self,
+        mock_load_registry: Mock,
+        mock_save_registry: Mock,
+        authed_client: tuple[TestClient, str],
+    ) -> None:
         client, token = authed_client
         state = get_daemon_state()
         ws = state.wallet_service
         ws.get_fidelity_bond_address = Mock(return_value="bcrt1qfidelity123")
+        mock_key = MagicMock()
+        mock_key.get_public_key_bytes.return_value = bytes(33)
+        ws.get_fidelity_bond_key = Mock(return_value=mock_key)
+        ws.get_fidelity_bond_script = Mock(return_value=b"\x00" * 32)
+        ws.network = "signet"
+        ws.root_path = "m/84'/1'/0'"
+        mock_registry = MagicMock()
+        mock_registry.bonds = []
+        mock_registry.get_bond_by_address.return_value = None
+        mock_load_registry.return_value = mock_registry
 
         resp = client.get(
             "/api/v1/wallet/test_wallet.jmdat/address/timelock/new/2026-06",
@@ -279,10 +296,13 @@ class TestTimelockAddress:
         )
         assert resp.status_code == 200
         assert resp.json()["address"] == "bcrt1qfidelity123"
-        # Check that it was called with index 0
+        # Check that it was called with index 0 (no existing bonds for this locktime)
         ws.get_fidelity_bond_address.assert_called_once()
         args = ws.get_fidelity_bond_address.call_args
         assert args[0][0] == 0  # index is first arg
+        # Check that the bond was saved to the registry
+        mock_save_registry.assert_called_once()
+        mock_registry.add_bond.assert_called_once()
 
     def test_invalid_date_format(self, authed_client: tuple[TestClient, str]) -> None:
         client, token = authed_client

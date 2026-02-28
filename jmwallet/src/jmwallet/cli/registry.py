@@ -191,7 +191,9 @@ def registry_show(
 
 @app.command("registry-sync")
 def registry_sync(
-    mnemonic_file: Annotated[Path | None, typer.Option("--mnemonic-file", "-f")] = None,
+    mnemonic_file: Annotated[
+        Path | None, typer.Option("--mnemonic-file", "-f", envvar="MNEMONIC_FILE")
+    ] = None,
     prompt_bip39_passphrase: Annotated[
         bool, typer.Option("--prompt-bip39-passphrase", help="Prompt for BIP39 passphrase")
     ] = False,

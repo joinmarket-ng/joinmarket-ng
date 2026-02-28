@@ -104,6 +104,10 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
             burst_limit=config.message_burst_limit,
         )
 
+        # Fidelity bond addresses loaded at startup, kept for periodic rescans so
+        # newly funded bonds are detected without requiring a restart.
+        self._fidelity_bond_addresses: list[tuple[str, int, int]] = []
+
         # Rate limiter for orderbook requests to prevent spam attacks
         self._orderbook_rate_limiter = OrderbookRateLimiter(
             rate_limit=config.orderbook_rate_limit,
@@ -391,6 +395,10 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
                     )
 
             logger.info("Syncing wallet and fidelity bonds...")
+
+            # Store bond addresses on the instance so periodic rescans can use them
+            # to detect newly funded bonds without requiring a restart.
+            self._fidelity_bond_addresses = fidelity_bond_addresses
 
             # Setup descriptor wallet if needed (one-time operation)
             if isinstance(self.backend, DescriptorWalletBackend):
@@ -725,9 +733,9 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         from jmwallet.backends.descriptor_wallet import DescriptorWalletBackend
 
         if isinstance(self.backend, DescriptorWalletBackend):
-            await self.wallet.sync_with_descriptor_wallet()
+            await self.wallet.sync_with_descriptor_wallet(self._fidelity_bond_addresses)
         else:
-            await self.wallet.sync_all()
+            await self.wallet.sync_all(self._fidelity_bond_addresses)
 
         # Update current block height
         self.current_block_height = await self.backend.get_block_height()

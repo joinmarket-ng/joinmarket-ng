@@ -275,80 +275,101 @@ class WalletSyncMixin:
 
         discovered_utxos: list[UTXOInfo] = []
         batch_size = 100  # Process timenumbers in batches
-        is_descriptor_wallet = isinstance(self.backend, DescriptorWalletBackend)
+        descriptor_backend: DescriptorWalletBackend | None = (
+            self.backend if isinstance(self.backend, DescriptorWalletBackend) else None
+        )
 
-        for batch_start in range(0, TIMENUMBER_COUNT, batch_size):
-            batch_end = min(batch_start + batch_size, TIMENUMBER_COUNT)
-            addresses: list[str] = []
-            address_to_locktime: dict[str, tuple[int, int]] = {}  # address -> (locktime, index)
+        # Build the full address map across all timenumbers first.
+        all_address_to_locktime: dict[str, tuple[int, int]] = {}
+        for timenumber in range(TIMENUMBER_COUNT):
+            locktime = timenumber_to_timestamp(timenumber)
+            for idx in range(max_index):
+                address = self.get_fidelity_bond_address(idx, locktime)
+                all_address_to_locktime[address] = (locktime, idx)
 
-            # Generate addresses for this batch of timenumbers
-            for timenumber in range(batch_start, batch_end):
-                locktime = timenumber_to_timestamp(timenumber)
-                for idx in range(max_index):
-                    address = self.get_fidelity_bond_address(idx, locktime)
-                    addresses.append(address)
-                    address_to_locktime[address] = (locktime, idx)
-
-            # For descriptor wallet, import addresses before scanning
-            if is_descriptor_wallet:
-                fidelity_bond_addresses = [
-                    (addr, locktime, idx) for addr, (locktime, idx) in address_to_locktime.items()
-                ]
+        # For descriptor wallets, import all addresses in batches WITHOUT triggering
+        # a per-batch rescan.  A single blockchain rescan is run after all descriptors
+        # are imported so Bitcoin Core never rejects a batch with RPC -4
+        # "Wallet is currently rescanning".
+        if descriptor_backend is not None:
+            all_bond_addrs = [
+                (addr, lt, idx) for addr, (lt, idx) in all_address_to_locktime.items()
+            ]
+            for batch_start in range(0, len(all_bond_addrs), batch_size):
+                batch = all_bond_addrs[batch_start : batch_start + batch_size]
+                batch_end = batch_start + len(batch)
                 try:
                     await self.import_fidelity_bond_addresses(
-                        fidelity_bond_addresses=fidelity_bond_addresses,
-                        rescan=True,
+                        fidelity_bond_addresses=batch,
+                        rescan=False,
                     )
-                    # Wait for rescan to complete before querying UTXOs
-                    # This ensures the wallet has indexed all transactions for these addresses
-                    if hasattr(self.backend, "wait_for_rescan_complete"):
-                        logger.info("Waiting for wallet rescan to complete...")
-                        await self.backend.wait_for_rescan_complete(
-                            poll_interval=5.0,
-                            progress_callback=lambda p: logger.debug(f"Rescan progress: {p:.1%}"),
-                        )
                 except Exception as e:
                     logger.error(f"Failed to import batch {batch_start}-{batch_end}: {e}")
-                    continue
 
-            # Fetch UTXOs for all addresses in batch
+                if progress_callback:
+                    progress_callback(batch_end, TIMENUMBER_COUNT)
+
+            # Single rescan after all descriptors are registered.
+            logger.info(
+                "All fidelity bond addresses imported, starting full rescan from genesis..."
+            )
+            await descriptor_backend.start_background_rescan(0)
+            await descriptor_backend.wait_for_rescan_complete(
+                poll_interval=5.0,
+                progress_callback=lambda p: logger.debug(f"Rescan progress: {p:.1%}"),
+            )
+
+            # Query all UTXOs in a single call after rescan completes.
+            all_addresses = list(all_address_to_locktime.keys())
+            address_to_locktime = all_address_to_locktime
             try:
-                backend_utxos = await self.backend.get_utxos(addresses)
+                backend_utxos = await self.backend.get_utxos(all_addresses)
             except Exception as e:
-                logger.error(f"Failed to scan batch {batch_start}-{batch_end}: {e}")
-                continue
+                logger.error(f"Failed to fetch UTXOs after rescan: {e}")
+                backend_utxos = []
+        else:
+            # Non-descriptor backends: scan in batches and query UTXOs per batch.
+            backend_utxos = []
+            address_to_locktime = all_address_to_locktime
+            all_addresses_list = list(all_address_to_locktime.keys())
+            for batch_start in range(0, len(all_addresses_list), batch_size):
+                batch_addrs = all_addresses_list[batch_start : batch_start + batch_size]
+                batch_end = batch_start + len(batch_addrs)
+                try:
+                    batch_utxos = await self.backend.get_utxos(batch_addrs)
+                    backend_utxos.extend(batch_utxos)
+                except Exception as e:
+                    logger.error(f"Failed to scan batch {batch_start}-{batch_end}: {e}")
 
-            # Process found UTXOs
-            for utxo in backend_utxos:
-                if utxo.address in address_to_locktime:
-                    locktime, idx = address_to_locktime[utxo.address]
-                    path = f"{self.root_path}/0'/{FIDELITY_BOND_BRANCH}/{idx}:{locktime}"
+                if progress_callback:
+                    progress_callback(batch_end, TIMENUMBER_COUNT)
 
-                    utxo_info = _make_utxo_info(
-                        txid=utxo.txid,
-                        vout=utxo.vout,
-                        value=utxo.value,
-                        address=utxo.address,
-                        confirmations=utxo.confirmations,
-                        scriptpubkey=utxo.scriptpubkey,
-                        path=path,
-                        mixdepth=0,
-                        height=utxo.height,
-                        locktime=locktime,
-                    )
-                    discovered_utxos.append(utxo_info)
+        from jmcore.timenumber import format_locktime_date
 
-                    from jmcore.timenumber import format_locktime_date
+        # Process found UTXOs
+        for utxo in backend_utxos:
+            if utxo.address in address_to_locktime:
+                locktime, idx = address_to_locktime[utxo.address]
+                path = f"{self.root_path}/0'/{FIDELITY_BOND_BRANCH}/{idx}:{locktime}"
 
-                    logger.info(
-                        f"Discovered fidelity bond: {utxo.txid}:{utxo.vout} "
-                        f"value={utxo.value:,} sats, locktime={format_locktime_date(locktime)}"
-                    )
+                utxo_info = _make_utxo_info(
+                    txid=utxo.txid,
+                    vout=utxo.vout,
+                    value=utxo.value,
+                    address=utxo.address,
+                    confirmations=utxo.confirmations,
+                    scriptpubkey=utxo.scriptpubkey,
+                    path=path,
+                    mixdepth=0,
+                    height=utxo.height,
+                    locktime=locktime,
+                )
+                discovered_utxos.append(utxo_info)
 
-            # Progress callback
-            if progress_callback:
-                progress_callback(batch_end, TIMENUMBER_COUNT)
+                logger.info(
+                    f"Discovered fidelity bond: {utxo.txid}:{utxo.vout} "
+                    f"value={utxo.value:,} sats, locktime={format_locktime_date(locktime)}"
+                )
 
         # Add discovered UTXOs to mixdepth 0 cache
         if discovered_utxos:

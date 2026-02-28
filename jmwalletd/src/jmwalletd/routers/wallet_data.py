@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import calendar
+import datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends
 from loguru import logger
 
+from jmwallet.wallet.bond_registry import create_bond_info, load_registry, save_registry
+from jmwallet.wallet.constants import FIDELITY_BOND_BRANCH
 from jmwalletd.deps import get_daemon_state, require_auth
 from jmwalletd.errors import (
     ActionNotAllowed,
@@ -202,17 +206,44 @@ async def get_timelock_address(
 
     ws = state.wallet_service
     # Convert lockdate to locktime (first day of the month as UNIX timestamp).
-    import calendar
-    import datetime
-
     dt = datetime.datetime(year, month, 1, tzinfo=datetime.UTC)
     locktime = calendar.timegm(dt.timetuple())
 
-    # WalletService doesn't have get_next_fidelity_bond_index, so we use
-    # index 0 for now (matching the reference implementation's default).
-    # Users can override via the fidelity_bond_index config setting.
+    # Use the next available index for this locktime so callers can generate
+    # multiple addresses per expiry month without collision.
+    registry = load_registry(state.data_dir)
+    existing_indices = {b.index for b in registry.bonds if b.locktime == locktime}
     index = 0
+    while index in existing_indices:
+        index += 1
+
     address = ws.get_fidelity_bond_address(index, locktime)
+
+    # Persist the bond to the registry so the maker can pick it up at startup.
+    if not registry.get_bond_by_address(address):
+        pubkey_hex = (
+            ws.get_fidelity_bond_key(index, locktime).get_public_key_bytes(compressed=True).hex()
+        )
+        witness_script = ws.get_fidelity_bond_script(index, locktime)
+        path = f"{ws.root_path}/0'/{FIDELITY_BOND_BRANCH}/{index}"
+        bond_info = create_bond_info(
+            address=address,
+            locktime=locktime,
+            index=index,
+            path=path,
+            pubkey_hex=pubkey_hex,
+            witness_script=witness_script,
+            network=ws.network,
+        )
+        registry.add_bond(bond_info)
+        save_registry(registry, state.data_dir)
+        logger.debug(
+            "Registered fidelity bond address {} (index={}, locktime={}) in registry",
+            address,
+            index,
+            locktime,
+        )
+
     return GetAddressResponse(address=address)
 
 

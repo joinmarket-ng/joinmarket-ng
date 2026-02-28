@@ -42,3 +42,14 @@ class TestObWatch:
 
         resp = client.get("/api/v1/obwatch/refreshorderbook")
         assert resp.status_code == 200
+
+    @patch("jmwalletd.routers.obwatch.aiohttp.ClientSession.get")
+    def test_refresh_orderbook_post(self, mock_get: AsyncMock, client: TestClient) -> None:
+        """JAM calls POST /obwatch/refreshorderbook; ensure it is accepted."""
+        mock_resp = AsyncMock()
+        mock_resp.status = 200
+        mock_resp.json.return_value = {"offers": [], "fidelitybonds": []}
+        mock_get.return_value.__aenter__.return_value = mock_resp
+
+        resp = client.post("/api/v1/obwatch/refreshorderbook")
+        assert resp.status_code == 200

@@ -228,7 +228,8 @@ def generate(
 @app.command()
 def info(
     mnemonic_file: Annotated[
-        Path | None, typer.Option("--mnemonic-file", "-f", help="Path to mnemonic file")
+        Path | None,
+        typer.Option("--mnemonic-file", "-f", help="Path to mnemonic file", envvar="MNEMONIC_FILE"),
     ] = None,
     prompt_bip39_passphrase: Annotated[
         bool,
@@ -670,10 +671,11 @@ def _show_extended_wallet_info(
 @app.command()
 def validate(
     mnemonic_file: Annotated[
-        Path | None, typer.Option("--mnemonic-file", "-f", help="Path to mnemonic file")
+        Path | None,
+        typer.Option("--mnemonic-file", "-f", help="Path to mnemonic file", envvar="MNEMONIC_FILE"),
     ] = None,
 ) -> None:
-    """Validate a BIP39 mnemonic phrase.
+    """Validate a mnemonic phrase.
 
     Provide a mnemonic via --mnemonic-file, the MNEMONIC environment variable,
     or enter it interactively when prompted.

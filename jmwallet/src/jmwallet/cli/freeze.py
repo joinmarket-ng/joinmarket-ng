@@ -30,7 +30,8 @@ if TYPE_CHECKING:
 @app.command()
 def freeze(
     mnemonic_file: Annotated[
-        Path | None, typer.Option("--mnemonic-file", "-f", help="Path to mnemonic file")
+        Path | None,
+        typer.Option("--mnemonic-file", "-f", help="Path to mnemonic file", envvar="MNEMONIC_FILE"),
     ] = None,
     prompt_bip39_passphrase: Annotated[
         bool,

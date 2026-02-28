@@ -80,15 +80,15 @@ async def get_orderbook(
         )
 
 
-@router.get("/obwatch/refreshorderbook")
+@router.api_route("/obwatch/refreshorderbook", methods=["GET", "POST"])
 async def refresh_orderbook(
     state: DaemonState = Depends(get_daemon_state),
 ) -> JSONResponse:
     """Request the orderbook watcher to refresh its cache.
 
-    The reference implementation reloads the orderbook on this endpoint.
-    Our orderbook_watcher auto-refreshes every 30s, so this is a no-op
-    proxy that just returns the latest data.
+    Accepts both GET and POST to match the JAM reference implementation which
+    calls POST /obwatch/refreshorderbook.  Our orderbook_watcher auto-refreshes
+    every 30 s, so this is a no-op proxy that just returns the latest data.
     """
     url = f"{_get_obwatch_url(state)}/orderbook.json"
     try:

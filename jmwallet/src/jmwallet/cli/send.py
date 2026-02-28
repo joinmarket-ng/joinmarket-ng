@@ -24,7 +24,9 @@ from jmwallet.cli import app
 def send(
     destination: Annotated[str, typer.Argument(help="Destination address")],
     amount: Annotated[int, typer.Option("--amount", "-a", help="Amount in sats (0 for sweep)")] = 0,
-    mnemonic_file: Annotated[Path | None, typer.Option("--mnemonic-file", "-f")] = None,
+    mnemonic_file: Annotated[
+        Path | None, typer.Option("--mnemonic-file", "-f", envvar="MNEMONIC_FILE")
+    ] = None,
     prompt_bip39_passphrase: Annotated[
         bool, typer.Option("--prompt-bip39-passphrase", help="Prompt for BIP39 passphrase")
     ] = False,

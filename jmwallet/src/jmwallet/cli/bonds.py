@@ -23,7 +23,9 @@ from jmwallet.cli import app
 
 @app.command()
 def list_bonds(
-    mnemonic_file: Annotated[Path | None, typer.Option("--mnemonic-file", "-f")] = None,
+    mnemonic_file: Annotated[
+        Path | None, typer.Option("--mnemonic-file", "-f", envvar="MNEMONIC_FILE")
+    ] = None,
     prompt_bip39_passphrase: Annotated[
         bool, typer.Option("--prompt-bip39-passphrase", help="Prompt for BIP39 passphrase")
     ] = False,
@@ -257,7 +259,9 @@ async def _list_fidelity_bonds(
 
 @app.command("generate-bond-address")
 def generate_bond_address(
-    mnemonic_file: Annotated[Path | None, typer.Option("--mnemonic-file", "-f")] = None,
+    mnemonic_file: Annotated[
+        Path | None, typer.Option("--mnemonic-file", "-f", envvar="MNEMONIC_FILE")
+    ] = None,
     prompt_bip39_passphrase: Annotated[
         bool, typer.Option("--prompt-bip39-passphrase", help="Prompt for BIP39 passphrase")
     ] = False,
@@ -422,7 +426,9 @@ def generate_bond_address(
 
 @app.command("recover-bonds")
 def recover_bonds(
-    mnemonic_file: Annotated[Path | None, typer.Option("--mnemonic-file", "-f")] = None,
+    mnemonic_file: Annotated[
+        Path | None, typer.Option("--mnemonic-file", "-f", envvar="MNEMONIC_FILE")
+    ] = None,
     prompt_bip39_passphrase: Annotated[
         bool, typer.Option("--prompt-bip39-passphrase", help="Prompt for BIP39 passphrase")
     ] = False,
