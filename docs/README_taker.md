@@ -1,1 +1,0 @@
-../taker/README.md

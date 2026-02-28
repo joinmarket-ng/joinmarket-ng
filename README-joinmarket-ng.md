@@ -14,7 +14,7 @@ For full documentation, see [JoinMarket-NG Documentation](https://joinmarket-ng.
 
 See the [Installation Guide](https://joinmarket-ng.github.io/joinmarket-ng/install/) for detailed instructions.
 
-## Main Modules
+### Main Modules
 
 | Module | Description |
 |--------|-------------|
@@ -23,7 +23,7 @@ See the [Installation Guide](https://joinmarket-ng.github.io/joinmarket-ng/insta
 | [taker](https://joinmarket-ng.github.io/joinmarket-ng/README-taker/) | CoinJoin transaction initiation |
 | [maker](https://joinmarket-ng.github.io/joinmarket-ng/README-maker/) | Liquidity provision service |
 
-## Extra Modules
+### Extra Modules
 
 | Module | Description |
 |--------|-------------|
@@ -31,7 +31,7 @@ See the [Installation Guide](https://joinmarket-ng.github.io/joinmarket-ng/insta
 | [directory_server](https://joinmarket-ng.github.io/joinmarket-ng/README-directory-server/) | Peer discovery service |
 | [scripts](https://joinmarket-ng.github.io/joinmarket-ng/README-scripts/) | Utility scripts for development |
 
-## Technical Documentation
+### Technical Documentation
 
 [Technical Documentation](https://joinmarket-ng.github.io/joinmarket-ng/technical/) - Comprehensive documentation covering concepts, architecture, protocol, privacy mechanisms, wallet, configuration, security, development, and best practices.
 

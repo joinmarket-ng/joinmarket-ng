@@ -260,35 +260,36 @@ nav:
   # Comprehensive documentation about the JoinMarket NG protocol
   # These files contain mathematical formulas rendered via MathJax
   - Technical Documentation:
-      - technical-documentation/index.md
-      - Concepts: technical-documentation/DOCS01-Concepts.md
-      - JoinMarket-NG: technical-documentation/DOCS02-JoinMarket-NG.md
-      - Architecture: technical-documentation/DOCS03-Architecture.md
-      - Protocol: technical-documentation/DOCS04-Protocol.md
-      - Privacy Mechanisms: technical-documentation/DOCS05-Privacy-Mechanisms.md
-      - Wallet: technical-documentation/DOCS06-Wallet.md
-      - Configuration: technical-documentation/DOCS07-Configuration.md
-      - Security: technical-documentation/DOCS08-Security.md
-      - Development: technical-documentation/DOCS09-Development.md
-      - Best Practices: technical-documentation/DOCS10-Best-Practices.md
-      - References: technical-documentation/DOCS11-References.md
+      - technical/index.md
+      - Concepts: technical/concepts.md
+      - Overview: technical/overview.md
+      - Architecture: technical/architecture.md
+      - Protocol: technical/protocol.md
+      - Privacy: technical/privacy.md
+      - Wallet: technical/wallet.md
+      - Configuration: technical/configuration.md
+      - Security: technical/security.md
+      - Development: technical/development.md
+      - Best Practices: technical/best-practices.md
+      - References: technical/references.md
 
   # -------------------------------------------------------------------------
   # Main Modules
   # -------------------------------------------------------------------------
   # Documentation for the core modules
   - Main Modules:
-      - Wallet: README_jmwallet.md
-      - Taker: README_taker.md
-      - Maker: README_maker.md
+      - JM Core: README-jmcore.md
+      - Wallet: README-jmwallet.md
+      - Taker: README-taker.md
+      - Maker: README-maker.md
 
   # -------------------------------------------------------------------------
   # Extra Modules
   # -------------------------------------------------------------------------
   # Documentation for supplementary modules
   - Extra Modules:
-      - Orderbook Watcher: README_orderbook_watcher.md
-      - Directory Server: README_directory_server.md
+      - Orderbook Watcher: README-orderbook-watcher.md
+      - Directory Server: README-directory-server.md
 
   # -------------------------------------------------------------------------
   # Visual Separator
@@ -300,7 +301,7 @@ nav:
   # -------------------------------------------------------------------------
   # Scripts
   # -------------------------------------------------------------------------
-  - Scripts: README_scripts.md
+  - Scripts: README-scripts.md
 
   # -------------------------------------------------------------------------
   # API Reference

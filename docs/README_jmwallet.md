@@ -1,1 +1,0 @@
-../jmwallet/README.md

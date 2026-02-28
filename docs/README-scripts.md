@@ -15,6 +15,4 @@ Utility scripts for JoinMarket NG development and operations.
 - **update_readme_help.py** - Update README files with CLI command help sections (run manually when CLI changes)
 - **update-deps.sh** - Update project dependencies
 
-## Documentation
-
-For full documentation, see [JoinMarket NG Documentation](https://joinmarket-ng.github.io/joinmarket-ng/).
+Run any script with `--help` or `-h` for detailed usage information.

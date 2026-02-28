@@ -1,0 +1,69 @@
+<svg width="800" height="800" viewBox="0 0 800 800" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="flowGradientDense" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#9d4edd;stop-opacity:1" /> <stop offset="40%" style="stop-color:#3a86ff;stop-opacity:1" /> <stop offset="60%" style="stop-color:#3a86ff;stop-opacity:1" /> <stop offset="100%" style="stop-color:#9d4edd;stop-opacity:1" /> </linearGradient>
+
+    <filter id="glowDense">
+      <feGaussianBlur stdDeviation="3" result="coloredBlur"/>
+      <feMerge>
+        <feMergeNode in="coloredBlur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+
+    <style>
+      /* Monospace font for a technical/terminal feel */
+      .text-label { font-family: 'Courier New', monospace; font-weight: 900; fill: #ffffff; }
+      .btc-symbol { font-family: Arial, sans-serif; font-weight: bold; fill: white; }
+    </style>
+  </defs>
+
+  <rect width="800" height="800" fill="#13151a" />
+
+  <g stroke="url(#flowGradientDense)" stroke-width="3" fill="none" stroke-linecap="round" filter="url(#glowDense)" opacity="0.8">
+    <path d="M 50 80  C 250 80,  300 400, 350 400" />
+    <path d="M 50 120 C 250 120, 300 400, 350 400" />
+    <path d="M 50 160 C 250 160, 300 400, 350 400" />
+    <path d="M 50 200 C 250 200, 300 400, 350 400" />
+    <path d="M 50 240 C 250 240, 300 400, 350 400" />
+    <path d="M 50 280 C 250 280, 300 400, 350 400" />
+    <path d="M 50 320 C 250 320, 300 400, 350 400" />
+    <path d="M 50 360 C 250 360, 300 400, 350 400" />
+    <path d="M 50 400 L 350 400" />
+    <path d="M 50 440 C 250 440, 300 400, 350 400" />
+    <path d="M 50 480 C 250 480, 300 400, 350 400" />
+    <path d="M 50 520 C 250 520, 300 400, 350 400" />
+    <path d="M 50 560 C 250 560, 300 400, 350 400" />
+    <path d="M 50 600 C 250 600, 300 400, 350 400" />
+    <path d="M 50 640 C 250 640, 300 400, 350 400" />
+    <path d="M 50 680 C 250 680, 300 400, 350 400" />
+    <path d="M 50 720 C 250 720, 300 400, 350 400" />
+  </g>
+
+  <g stroke="url(#flowGradientDense)" stroke-width="3" fill="none" stroke-linecap="round" filter="url(#glowDense)" opacity="0.8">
+    <path d="M 450 400 C 500 400, 550 80,  750 80" />
+    <path d="M 450 400 C 500 400, 550 120, 750 120" />
+    <path d="M 450 400 C 500 400, 550 160, 750 160" />
+    <path d="M 450 400 C 500 400, 550 200, 750 200" />
+    <path d="M 450 400 C 500 400, 550 240, 750 240" />
+    <path d="M 450 400 C 500 400, 550 280, 750 280" />
+    <path d="M 450 400 C 500 400, 550 320, 750 320" />
+    <path d="M 450 400 C 500 400, 550 360, 750 360" />
+    <path d="M 450 400 L 750 400" />
+    <path d="M 450 400 C 500 400, 550 440, 750 440" />
+    <path d="M 450 400 C 500 400, 550 480, 750 480" />
+    <path d="M 450 400 C 500 400, 550 520, 750 520" />
+    <path d="M 450 400 C 500 400, 550 560, 750 560" />
+    <path d="M 450 400 C 500 400, 550 600, 750 600" />
+    <path d="M 450 400 C 500 400, 550 640, 750 640" />
+    <path d="M 450 400 C 500 400, 550 680, 750 680" />
+    <path d="M 450 400 C 500 400, 550 720, 750 720" />
+  </g>
+
+  <circle cx="400" cy="400" r="70" fill="#13151a" stroke="#f7931a" stroke-width="8" />
+  <circle cx="400" cy="400" r="60" fill="#f7931a" />
+  <text x="400" y="428" text-anchor="middle" font-size="80" class="btc-symbol">₿</text>
+
+  <text x="170" y="420" text-anchor="middle" font-size="100" class="text-label" stroke="#13151a" stroke-width="8" paint-order="stroke">JM</text>
+  <text x="630" y="420" text-anchor="middle" font-size="100" class="text-label" stroke="#13151a" stroke-width="8" paint-order="stroke">NG</text>
+</svg>
