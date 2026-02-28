@@ -9,10 +9,13 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 from jmcore.models import NetworkType, Offer, OfferType
-from jmwallet.wallet.models import UTXOInfo
+from jmwallet.backends.base import BondVerificationResult
 
 from taker.config import TakerConfig
 from taker.taker import Taker
+
+# Valid 33-byte compressed pubkey (hex) for tests
+TEST_PUBKEY_HEX = "02a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2"
 
 
 @pytest.fixture
@@ -51,28 +54,22 @@ async def test_update_offers_with_bond_values(mock_wallet, mock_backend, mock_co
     # Setup Taker
     taker = Taker(mock_wallet, mock_backend, mock_config)
 
-    # Mock current time and block height
+    # Mock current time
     current_time = int(time.time())
-    current_height = 800000
-    mock_backend.get_block_height = AsyncMock(return_value=current_height)
 
     # Create bond data
     # Bond 1: Valid bond, locked for 1 year in future
     txid1 = "a" * 64
     vout1 = 0
     locktime1 = current_time + 31536000  # +1 year
+    conf_time = current_time - (10000 * 600)  # approx 10000 blocks ago
     bond_data1 = {
         "utxo_txid": txid1,
         "utxo_vout": vout1,
         "locktime": locktime1,
-        "utxo_pub": "pubkey1",
+        "utxo_pub": TEST_PUBKEY_HEX,
         "cert_expiry": current_time + 100000,
     }
-
-    # Bond 2: Expired bond (locktime in past) - should still have value if burned?
-    # Actually checking the formula:
-    # if current_time > locktime, the second term subtracts value.
-    # But for this test, we just want to ensure it calculates *something* if valid.
 
     # Create Offers
     offer1 = Offer(
@@ -100,33 +97,19 @@ async def test_update_offers_with_bond_values(mock_wallet, mock_backend, mock_co
 
     offers = [offer1, offer2]
 
-    # Mock Backend Responses
-
-    # UTXO for Bond 1
-    # 10 BTC value, 10000 confirmations
-    utxo1 = UTXOInfo(
-        txid=txid1,
-        vout=vout1,
-        value=1_000_000_000,
-        address="addr1",
-        confirmations=10000,
-        scriptpubkey="script1",
-        path="path1",
-        mixdepth=0,
+    # Mock verify_bonds to return a valid result for Bond 1
+    mock_backend.verify_bonds = AsyncMock(
+        return_value=[
+            BondVerificationResult(
+                txid=txid1,
+                vout=vout1,
+                value=1_000_000_000,
+                confirmations=10000,
+                block_time=conf_time,
+                valid=True,
+            )
+        ]
     )
-
-    # UTXO lookup side effect
-    async def get_utxo_side_effect(txid, vout):
-        if txid == txid1 and vout == vout1:
-            return utxo1
-        return None
-
-    mock_backend.get_utxo = AsyncMock(side_effect=get_utxo_side_effect)
-
-    # Block time lookup (for confirmation time calculation)
-    # confirmation height = current - 10000 + 1
-    conf_time = current_time - (10000 * 600)  # approx 10000 blocks ago
-    mock_backend.get_block_time = AsyncMock(return_value=conf_time)
 
     # Run the method
     await taker._update_offers_with_bond_values(offers)
@@ -140,10 +123,12 @@ async def test_update_offers_with_bond_values(mock_wallet, mock_backend, mock_co
     # Offer 2 should remain 0
     assert offer2.fidelity_bond_value == 0
 
-    # Verify backend calls
-    mock_backend.get_block_height.assert_called_once()
-    # Should have called get_utxo for the bond
-    mock_backend.get_utxo.assert_called_with(txid1, vout1)
+    # Verify verify_bonds was called once with 1 bond
+    mock_backend.verify_bonds.assert_called_once()
+    bond_requests = mock_backend.verify_bonds.call_args[0][0]
+    assert len(bond_requests) == 1
+    assert bond_requests[0].txid == txid1
+    assert bond_requests[0].vout == vout1
 
 
 @pytest.mark.asyncio
@@ -151,14 +136,12 @@ async def test_update_offers_bond_missing_utxo(mock_wallet, mock_backend, mock_c
     """Test handling of missing UTXO (spent or invalid)."""
     taker = Taker(mock_wallet, mock_backend, mock_config)
 
-    mock_backend.get_block_height = AsyncMock(return_value=800000)
-
     txid = "b" * 64
     bond_data = {
         "utxo_txid": txid,
         "utxo_vout": 0,
         "locktime": int(time.time()) + 10000,
-        "utxo_pub": "pubkey",
+        "utxo_pub": TEST_PUBKEY_HEX,
         "cert_expiry": 0,
     }
 
@@ -173,8 +156,20 @@ async def test_update_offers_bond_missing_utxo(mock_wallet, mock_backend, mock_c
         fidelity_bond_data=bond_data,
     )
 
-    # Backend returns None for UTXO
-    mock_backend.get_utxo = AsyncMock(return_value=None)
+    # Backend verify_bonds returns invalid result
+    mock_backend.verify_bonds = AsyncMock(
+        return_value=[
+            BondVerificationResult(
+                txid=txid,
+                vout=0,
+                value=0,
+                confirmations=0,
+                block_time=0,
+                valid=False,
+                error="UTXO not found or spent",
+            )
+        ]
+    )
 
     await taker._update_offers_with_bond_values([offer])
 
@@ -186,14 +181,12 @@ async def test_update_offers_bond_unconfirmed_utxo(mock_wallet, mock_backend, mo
     """Test handling of unconfirmed UTXO."""
     taker = Taker(mock_wallet, mock_backend, mock_config)
 
-    mock_backend.get_block_height = AsyncMock(return_value=800000)
-
     txid = "c" * 64
     bond_data = {
         "utxo_txid": txid,
         "utxo_vout": 0,
         "locktime": int(time.time()) + 10000,
-        "utxo_pub": "pubkey",
+        "utxo_pub": TEST_PUBKEY_HEX,
         "cert_expiry": 0,
     }
 
@@ -208,18 +201,20 @@ async def test_update_offers_bond_unconfirmed_utxo(mock_wallet, mock_backend, mo
         fidelity_bond_data=bond_data,
     )
 
-    # Backend returns unconfirmed UTXO
-    utxo = UTXOInfo(
-        txid=txid,
-        vout=0,
-        value=100000000,
-        address="addr",
-        confirmations=0,  # Unconfirmed
-        scriptpubkey="script",
-        path="path",
-        mixdepth=0,
+    # Backend verify_bonds returns unconfirmed result
+    mock_backend.verify_bonds = AsyncMock(
+        return_value=[
+            BondVerificationResult(
+                txid=txid,
+                vout=0,
+                value=100000000,
+                confirmations=0,
+                block_time=0,
+                valid=False,
+                error="UTXO unconfirmed",
+            )
+        ]
     )
-    mock_backend.get_utxo = AsyncMock(return_value=utxo)
 
     await taker._update_offers_with_bond_values([offer])
 

@@ -7,17 +7,23 @@ import asyncio
 import os
 import signal
 import sys
+from typing import TYPE_CHECKING
 
 from jmcore.crypto import NickIdentity
 from jmcore.notifications import get_notifier
 from jmcore.paths import remove_nick_state, write_nick_state
 from jmcore.protocol import JM_VERSION
 from jmcore.settings import get_settings
+from jmwallet.backends.bitcoin_core import BitcoinCoreBackend
+from jmwallet.backends.neutrino import NeutrinoBackend
 from loguru import logger
 
 from orderbook_watcher.aggregator import OrderbookAggregator
 from orderbook_watcher.config import get_directory_nodes
 from orderbook_watcher.server import OrderbookServer
+
+if TYPE_CHECKING:
+    from jmwallet.backends.base import BlockchainBackend
 
 
 def setup_logging(level: str) -> None:
@@ -29,6 +35,50 @@ def setup_logging(level: str) -> None:
         level=level,
         colorize=True,
     )
+
+
+def _create_blockchain_backend(settings: object) -> BlockchainBackend | None:
+    """Create a blockchain backend for bond verification if Bitcoin settings are configured.
+
+    Returns a BitcoinCoreBackend for full node configurations, a NeutrinoBackend for
+    neutrino configurations, or None to fall back to the mempool.space API.
+    """
+    bitcoin_settings = settings.bitcoin  # type: ignore[attr-defined]
+    backend_type = bitcoin_settings.backend_type
+
+    if backend_type in ("scantxoutset", "descriptor_wallet"):
+        rpc_url = bitcoin_settings.rpc_url
+        rpc_user = bitcoin_settings.rpc_user
+        rpc_password = bitcoin_settings.rpc_password.get_secret_value()
+
+        if not rpc_url or not rpc_user:
+            logger.debug("Bitcoin RPC not configured, falling back to mempool API")
+            return None
+
+        logger.info(f"Using Bitcoin Core backend for bond verification (RPC: {rpc_url})")
+        return BitcoinCoreBackend(
+            rpc_url=rpc_url,
+            rpc_user=rpc_user,
+            rpc_password=rpc_password,
+        )
+
+    if backend_type == "neutrino":
+        neutrino_url = bitcoin_settings.neutrino_url
+
+        if not neutrino_url:
+            logger.debug("Neutrino URL not configured, falling back to mempool API")
+            return None
+
+        network = settings.network_config.network.value  # type: ignore[attr-defined]
+
+        logger.info(f"Using neutrino backend for bond verification (URL: {neutrino_url})")
+        return NeutrinoBackend(
+            neutrino_url=neutrino_url,
+            network=network,
+        )
+
+    logger.debug(f"Unknown backend type '{backend_type}', falling back to mempool API")
+    return None
 
 
 async def run_watcher(log_level: str | None = None) -> None:
@@ -78,6 +128,9 @@ async def run_watcher(log_level: str | None = None) -> None:
     write_nick_state(data_dir, "orderbook", watcher_nick)
     logger.info(f"Nick state written to {data_dir}/state/orderbook.nick")
 
+    # Create blockchain backend for bond verification if configured
+    blockchain_backend = _create_blockchain_backend(settings)
+
     aggregator = OrderbookAggregator(
         directory_nodes=directory_nodes,
         network=network.value,
@@ -88,6 +141,7 @@ async def run_watcher(log_level: str | None = None) -> None:
         max_message_size=watcher_settings.max_message_size,
         uptime_grace_period=watcher_settings.uptime_grace_period,
         stream_isolation=settings.tor.stream_isolation,
+        blockchain_backend=blockchain_backend,
     )
 
     server = OrderbookServer(watcher_settings, aggregator)

@@ -31,6 +31,8 @@ from loguru import logger
 from jmwallet.backends.base import (
     UTXO,
     BlockchainBackend,
+    BondVerificationRequest,
+    BondVerificationResult,
     Transaction,
     UTXOVerificationResult,
 )
@@ -572,8 +574,145 @@ class NeutrinoBackend(BlockchainBackend):
         # requires the 'address' parameter to scan filter matches.
         #
         # If we don't have the address, we can't look it up.
-        # Callers should use verify_utxo_with_metadata() instead.
+        # Callers should use verify_utxo_with_metadata() or verify_bonds() instead.
         return None
+
+    async def verify_bonds(
+        self,
+        bonds: list[BondVerificationRequest],
+    ) -> list[BondVerificationResult]:
+        """Verify fidelity bond UTXOs using compact block filter address scanning.
+
+        Since the neutrino backend cannot do arbitrary UTXO lookups (get_utxo returns
+        None), this method uses the pre-computed bond address from each request to scan
+        the UTXO set via the neutrino-api's address-based endpoint.
+
+        For each bond:
+        1. Use the pre-computed P2WSH address (derived from utxo_pub + locktime)
+        2. Query ``v1/utxo/{txid}/{vout}?address={addr}&start_height=0``
+        3. Parse the response to determine value, confirmations, and block time
+
+        Note: start_height=0 means a full scan from genesis. This is the safe default
+        when we don't know when the bond UTXO was created. The neutrino-api caches
+        filter data, so subsequent calls are faster.
+        """
+        if not bonds:
+            return []
+
+        current_height = await self.get_block_height()
+        semaphore = asyncio.Semaphore(10)
+
+        async def _verify_one(bond: BondVerificationRequest) -> BondVerificationResult:
+            async with semaphore:
+                try:
+                    # Use the neutrino-api single-UTXO endpoint with address hint
+                    response = await self._api_call(
+                        "GET",
+                        f"v1/utxo/{bond.txid}/{bond.vout}",
+                        params={"address": bond.address, "start_height": 0},
+                    )
+
+                    if response is None:
+                        return BondVerificationResult(
+                            txid=bond.txid,
+                            vout=bond.vout,
+                            value=0,
+                            confirmations=0,
+                            block_time=0,
+                            valid=False,
+                            error="UTXO not found",
+                        )
+
+                    if not response.get("unspent", False):
+                        return BondVerificationResult(
+                            txid=bond.txid,
+                            vout=bond.vout,
+                            value=0,
+                            confirmations=0,
+                            block_time=0,
+                            valid=False,
+                            error="UTXO spent",
+                        )
+
+                    value = response.get("value", 0)
+                    block_height = response.get("block_height", 0)
+                    confirmations = (
+                        max(0, current_height - block_height + 1) if block_height > 0 else 0
+                    )
+
+                    if confirmations <= 0:
+                        return BondVerificationResult(
+                            txid=bond.txid,
+                            vout=bond.vout,
+                            value=value,
+                            confirmations=0,
+                            block_time=0,
+                            valid=False,
+                            error="UTXO unconfirmed",
+                        )
+
+                    # Get block time for confirmation timestamp
+                    block_time = await self.get_block_time(block_height)
+
+                    return BondVerificationResult(
+                        txid=bond.txid,
+                        vout=bond.vout,
+                        value=value,
+                        confirmations=confirmations,
+                        block_time=block_time,
+                        valid=True,
+                    )
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code == 404:
+                        return BondVerificationResult(
+                            txid=bond.txid,
+                            vout=bond.vout,
+                            value=0,
+                            confirmations=0,
+                            block_time=0,
+                            valid=False,
+                            error="UTXO not found",
+                        )
+                    logger.warning(
+                        "Bond verification failed for {}:{}: {}",
+                        bond.txid,
+                        bond.vout,
+                        e,
+                    )
+                    return BondVerificationResult(
+                        txid=bond.txid,
+                        vout=bond.vout,
+                        value=0,
+                        confirmations=0,
+                        block_time=0,
+                        valid=False,
+                        error=str(e),
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Bond verification failed for {}:{}: {}",
+                        bond.txid,
+                        bond.vout,
+                        e,
+                    )
+                    return BondVerificationResult(
+                        txid=bond.txid,
+                        vout=bond.vout,
+                        value=0,
+                        confirmations=0,
+                        block_time=0,
+                        valid=False,
+                        error=str(e),
+                    )
+
+        results = await asyncio.gather(*[_verify_one(b) for b in bonds])
+        logger.debug(
+            "Verified {} bonds via neutrino: {} valid, {} invalid",
+            len(bonds),
+            sum(1 for r in results if r.valid),
+            sum(1 for r in results if not r.valid),
+        )
+        return list(results)
 
     def requires_neutrino_metadata(self) -> bool:
         """

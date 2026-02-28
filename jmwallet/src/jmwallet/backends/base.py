@@ -4,11 +4,15 @@ Base blockchain backend interface.
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from typing import Any
 
 from pydantic.dataclasses import dataclass
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -44,6 +48,48 @@ class UTXOVerificationResult:
     confirmations: int = 0
     error: str | None = None
     scriptpubkey_matches: bool = False
+
+
+@dataclass
+class BondVerificationRequest:
+    """Request to verify a single fidelity bond UTXO.
+
+    All fields are derived from the bond proof data. The address and scriptpubkey
+    are pre-computed by the caller using ``derive_bond_address(utxo_pub, locktime)``.
+    """
+
+    txid: str
+    """Transaction ID (hex, big-endian)"""
+    vout: int
+    """Output index"""
+    utxo_pub: bytes
+    """33-byte compressed public key from bond proof"""
+    locktime: int
+    """Locktime from bond proof (Unix timestamp)"""
+    address: str
+    """Derived P2WSH bech32 address"""
+    scriptpubkey: str
+    """Derived P2WSH scriptPubKey (hex)"""
+
+
+@dataclass
+class BondVerificationResult:
+    """Result of verifying a single fidelity bond UTXO."""
+
+    txid: str
+    """Transaction ID"""
+    vout: int
+    """Output index"""
+    value: int
+    """UTXO value in satoshis (0 if verification failed)"""
+    confirmations: int
+    """Number of confirmations (0 if unconfirmed or failed)"""
+    block_time: int
+    """Confirmation timestamp (0 if unconfirmed or failed)"""
+    valid: bool
+    """Whether the bond UTXO exists, is unspent, and has positive confirmations"""
+    error: str | None = None
+    """Error description if verification failed"""
 
 
 class BlockchainBackend(ABC):
@@ -280,6 +326,87 @@ class BlockchainBackend(ABC):
         # Default implementation for full node backends
         tx = await self.get_transaction(txid)
         return tx is not None
+
+    async def verify_bonds(
+        self,
+        bonds: list[BondVerificationRequest],
+    ) -> list[BondVerificationResult]:
+        """Verify multiple fidelity bond UTXOs in bulk.
+
+        This is the primary method for verifying fidelity bonds. Each backend can
+        override this for optimal performance:
+        - Bitcoin Core: JSON-RPC batch of gettxout calls (2 HTTP requests total)
+        - Neutrino: batch address rescan + individual UTXO lookups
+        - Mempool: parallel HTTP requests
+
+        The default implementation calls get_utxo() sequentially with a semaphore.
+
+        Args:
+            bonds: List of bond verification requests with pre-computed addresses
+
+        Returns:
+            List of verification results, one per input bond (same order)
+        """
+        if not bonds:
+            return []
+
+        current_height = await self.get_block_height()
+        semaphore = asyncio.Semaphore(10)
+
+        async def _verify_one(bond: BondVerificationRequest) -> BondVerificationResult:
+            async with semaphore:
+                try:
+                    utxo = await self.get_utxo(bond.txid, bond.vout)
+                    if utxo is None:
+                        return BondVerificationResult(
+                            txid=bond.txid,
+                            vout=bond.vout,
+                            value=0,
+                            confirmations=0,
+                            block_time=0,
+                            valid=False,
+                            error="UTXO not found or spent",
+                        )
+                    if utxo.confirmations <= 0:
+                        return BondVerificationResult(
+                            txid=bond.txid,
+                            vout=bond.vout,
+                            value=utxo.value,
+                            confirmations=0,
+                            block_time=0,
+                            valid=False,
+                            error="UTXO unconfirmed",
+                        )
+                    # Get the block time for the confirmation block
+                    conf_height = current_height - utxo.confirmations + 1
+                    block_time = await self.get_block_time(conf_height)
+                    return BondVerificationResult(
+                        txid=bond.txid,
+                        vout=bond.vout,
+                        value=utxo.value,
+                        confirmations=utxo.confirmations,
+                        block_time=block_time,
+                        valid=True,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Bond verification failed for %s:%d: %s",
+                        bond.txid,
+                        bond.vout,
+                        e,
+                    )
+                    return BondVerificationResult(
+                        txid=bond.txid,
+                        vout=bond.vout,
+                        value=0,
+                        confirmations=0,
+                        block_time=0,
+                        valid=False,
+                        error=str(e),
+                    )
+
+        results = await asyncio.gather(*[_verify_one(b) for b in bonds])
+        return list(results)
 
     async def close(self) -> None:
         """Close backend connection"""

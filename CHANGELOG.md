@@ -15,6 +15,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **Signet support in send command**: Sending to signet addresses (`tb1…`) now works correctly. Custom address decoding code replaced with `python-bitcointx` (`CCoinAddress`), which handles all address types and networks without manual script construction.
+- **Trustless fidelity bond verification across all blockchain backends**: Replaced mempool.space-dependent bond verification with a unified `BlockchainBackend.verify_bonds()` interface implemented for all backends.
+  - **Bitcoin Core backend**: Uses JSON-RPC batching (`_rpc_batch`) to verify all bonds in ~3 HTTP round-trips regardless of the number of bonds. Fetches UTXO existence (`gettxout`), block timestamps (`getblockhash` + `getblockheader`) in batched calls.
+  - **Neutrino backend**: Verifies bonds via the `v1/utxo` endpoint with address hints derived from the bond proof (pubkey + locktime), solving the previous inability to verify bonds on Neutrino (which requires an address to scan compact block filters).
+  - **Mempool backend**: Falls back to the existing MempoolAPI when no local node backend is configured.
+  - **`jmcore`**: Added `derive_bond_address()` and `BondAddressInfo` to `btc_script.py` for P2WSH address derivation from bond proofs, centralizing this logic.
+  - **Taker**: `_update_offers_with_bond_values` now delegates to `verify_bonds()` instead of calling MempoolAPI directly.
+  - **Orderbook Watcher**: `OrderbookAggregator` uses `verify_bonds()` with fallback to MempoolAPI when no backend is configured. Orderbook watchers in local node setups no longer leak bond queries to mempool.space.
 - **`jmwalletd` — JAM-compatible HTTP/WebSocket API daemon**: New monorepo package implementing the JoinMarket wallet RPC API as a FastAPI application, designed as a drop-in replacement for the reference `jmwalletd`. Enables the JAM web UI to work with joinmarket-ng's backend.
   - Full REST API on `/api/v1` matching the reference implementation's endpoints: wallet lifecycle (create, recover, open, lock, unlock), wallet data (display, UTXOs, addresses, seeds), transaction operations (direct send, freeze/unfreeze), CoinJoin control (taker, tumbler, maker start/stop), configuration (get/set), and session management.
   - WebSocket endpoint at `/jmws` (JAM-compatible), `/ws`, and `/api/v1/ws` for real-time CoinJoin state notifications with JWT authentication and heartbeat.

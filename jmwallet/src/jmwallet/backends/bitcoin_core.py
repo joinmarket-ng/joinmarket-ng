@@ -15,7 +15,13 @@ import httpx
 from jmcore.bitcoin import btc_to_sats
 from loguru import logger
 
-from jmwallet.backends.base import UTXO, BlockchainBackend, Transaction
+from jmwallet.backends.base import (
+    UTXO,
+    BlockchainBackend,
+    BondVerificationRequest,
+    BondVerificationResult,
+    Transaction,
+)
 
 # Timeout for regular RPC calls (seconds)
 DEFAULT_RPC_TIMEOUT = 30.0
@@ -110,6 +116,77 @@ class BitcoinCoreBackend(BlockchainBackend):
         except httpx.HTTPError as e:
             logger.error(f"RPC call failed: {method} - {e}")
             raise
+
+    async def _rpc_batch(
+        self,
+        requests: list[tuple[str, list]],
+        client: httpx.AsyncClient | None = None,
+    ) -> list[Any]:
+        """Make a JSON-RPC batch call to Bitcoin Core.
+
+        Sends multiple RPC calls in a single HTTP request. This is dramatically
+        more efficient than individual calls when verifying many UTXOs -- e.g.
+        100 gettxout calls become 1 HTTP round-trip instead of 100.
+
+        Args:
+            requests: List of (method, params) tuples
+            client: Optional httpx client (uses default client if not provided)
+
+        Returns:
+            List of results in the same order as requests. Failed calls return None.
+
+        Raises:
+            httpx.HTTPError: On connection/timeout errors
+        """
+        if not requests:
+            return []
+
+        batch_payload = []
+        for i, (method, params) in enumerate(requests):
+            batch_payload.append(
+                {
+                    "jsonrpc": "2.0",
+                    "id": i,
+                    "method": method,
+                    "params": params,
+                }
+            )
+
+        use_client = client or self.client
+
+        try:
+            response = await use_client.post(self.rpc_url, json=batch_payload)
+            response.raise_for_status()
+            data = response.json()
+        except httpx.TimeoutException as e:
+            logger.error(f"RPC batch call timed out ({len(requests)} requests) - {e}")
+            raise
+        except httpx.HTTPError as e:
+            logger.error(f"RPC batch call failed ({len(requests)} requests) - {e}")
+            raise
+
+        # Bitcoin Core returns results as a list, but order is NOT guaranteed
+        # to match request order. Index by id.
+        results: list[Any] = [None] * len(requests)
+        for item in data:
+            idx = item.get("id")
+            if idx is not None and 0 <= idx < len(requests):
+                if item.get("error"):
+                    error_info = item["error"]
+                    error_code = error_info.get("code", "unknown")
+                    error_msg = error_info.get("message", str(error_info))
+                    logger.debug(
+                        "RPC batch item %d (%s) error %s: %s",
+                        idx,
+                        requests[idx][0],
+                        error_code,
+                        error_msg,
+                    )
+                    results[idx] = None
+                else:
+                    results[idx] = item.get("result")
+
+        return results
 
     async def _scantxoutset_with_retry(
         self, descriptors: Sequence[str | dict[str, Any]]
@@ -509,6 +586,128 @@ class BitcoinCoreBackend(BlockchainBackend):
         except Exception as e:
             logger.error(f"Failed to get UTXO {txid}:{vout}: {e}")
             return None
+
+    async def verify_bonds(
+        self,
+        bonds: list[BondVerificationRequest],
+    ) -> list[BondVerificationResult]:
+        """Verify fidelity bond UTXOs using batched JSON-RPC calls.
+
+        Uses ``_rpc_batch()`` to verify all bonds in just 2-3 HTTP requests:
+        1. Batch ``gettxout`` for all bonds (1 request)
+        2. ``getblockchaininfo`` for current height (1 request, concurrent with #1)
+        3. Batch ``getblockheader`` for unique block hashes from results (1 request)
+
+        For 100 bonds this is ~3 HTTP round-trips instead of ~200 sequential ones.
+        """
+        if not bonds:
+            return []
+
+        # Step 1: Batch gettxout + getblockchaininfo concurrently
+        gettxout_requests: list[tuple[str, list]] = [
+            ("gettxout", [b.txid, b.vout, True]) for b in bonds
+        ]
+
+        gettxout_task = self._rpc_batch(gettxout_requests)
+        height_task = self.get_block_height()
+        gettxout_results, current_height = await asyncio.gather(gettxout_task, height_task)
+
+        # Step 2: Collect unique block hashes that need timestamp lookups
+        for result in gettxout_results:
+            if result is not None and result.get("confirmations", 0) > 0:
+                # gettxout returns bestblock but we need the block at confirmation height
+                # confirmations = tip - conf_height + 1, so conf_height = tip - confs + 1
+                confs = result["confirmations"]
+                conf_height = current_height - confs + 1
+                # We'll need the block hash for this height; collect heights first
+                result["_conf_height"] = conf_height
+
+        # Get block hashes for all unique confirmation heights
+        unique_conf_heights: set[int] = set()
+        for result in gettxout_results:
+            if result is not None and "_conf_height" in result:
+                unique_conf_heights.add(result["_conf_height"])
+
+        # Batch getblockhash for unique heights
+        height_to_time: dict[int, int] = {}
+        if unique_conf_heights:
+            sorted_heights = sorted(unique_conf_heights)
+            hash_requests: list[tuple[str, list]] = [("getblockhash", [h]) for h in sorted_heights]
+            hash_results = await self._rpc_batch(hash_requests)
+
+            # Now batch getblockheader for the hashes
+            header_requests: list[tuple[str, list]] = []
+            height_order: list[int] = []
+            for i, h in enumerate(sorted_heights):
+                block_hash = hash_results[i]
+                if block_hash is not None:
+                    header_requests.append(("getblockheader", [block_hash]))
+                    height_order.append(h)
+
+            if header_requests:
+                header_results = await self._rpc_batch(header_requests)
+                for i, h in enumerate(height_order):
+                    header = header_results[i]
+                    if header is not None:
+                        height_to_time[h] = header.get("time", 0)
+
+        # Step 3: Build results
+        results: list[BondVerificationResult] = []
+        for i, bond in enumerate(bonds):
+            gettxout_result = gettxout_results[i]
+
+            if gettxout_result is None:
+                results.append(
+                    BondVerificationResult(
+                        txid=bond.txid,
+                        vout=bond.vout,
+                        value=0,
+                        confirmations=0,
+                        block_time=0,
+                        valid=False,
+                        error="UTXO not found or spent",
+                    )
+                )
+                continue
+
+            confs = gettxout_result.get("confirmations", 0)
+            if confs <= 0:
+                value = btc_to_sats(gettxout_result.get("value", 0))
+                results.append(
+                    BondVerificationResult(
+                        txid=bond.txid,
+                        vout=bond.vout,
+                        value=value,
+                        confirmations=0,
+                        block_time=0,
+                        valid=False,
+                        error="UTXO unconfirmed",
+                    )
+                )
+                continue
+
+            value = btc_to_sats(gettxout_result.get("value", 0))
+            conf_height = gettxout_result.get("_conf_height", 0)
+            block_time = height_to_time.get(conf_height, 0)
+
+            results.append(
+                BondVerificationResult(
+                    txid=bond.txid,
+                    vout=bond.vout,
+                    value=value,
+                    confirmations=confs,
+                    block_time=block_time,
+                    valid=True,
+                )
+            )
+
+        logger.debug(
+            "Verified %d bonds: %d valid, %d invalid",
+            len(bonds),
+            sum(1 for r in results if r.valid),
+            sum(1 for r in results if not r.valid),
+        )
+        return results
 
     def can_provide_neutrino_metadata(self) -> bool:
         """

@@ -5,10 +5,18 @@ Beginner-friendly backend that requires no setup.
 
 from __future__ import annotations
 
+import asyncio
+
 import httpx
 from loguru import logger
 
-from jmwallet.backends.base import UTXO, BlockchainBackend, Transaction
+from jmwallet.backends.base import (
+    UTXO,
+    BlockchainBackend,
+    BondVerificationRequest,
+    BondVerificationResult,
+    Transaction,
+)
 
 
 class MempoolBackend(BlockchainBackend):
@@ -229,6 +237,128 @@ class MempoolBackend(BlockchainBackend):
         except Exception as e:
             logger.error(f"Failed to get UTXO {txid}:{vout}: {e}")
             return None
+
+    async def verify_bonds(
+        self,
+        bonds: list[BondVerificationRequest],
+    ) -> list[BondVerificationResult]:
+        """Verify fidelity bond UTXOs via parallel mempool.space API calls.
+
+        Fetches the tip height once, then issues parallel HTTP requests for each
+        bond UTXO with a semaphore to respect rate limits.
+
+        For each bond: outspend check + tx details = 2 HTTP requests.
+        """
+        if not bonds:
+            return []
+
+        tip_height = await self.get_block_height()
+        semaphore = asyncio.Semaphore(10)
+
+        async def _verify_one(bond: BondVerificationRequest) -> BondVerificationResult:
+            async with semaphore:
+                try:
+                    # Check if spent
+                    resp = await self.client.get(
+                        f"{self.base_url}/tx/{bond.txid}/outspend/{bond.vout}"
+                    )
+                    resp.raise_for_status()
+                    outspend = resp.json()
+
+                    if outspend.get("spent", False):
+                        return BondVerificationResult(
+                            txid=bond.txid,
+                            vout=bond.vout,
+                            value=0,
+                            confirmations=0,
+                            block_time=0,
+                            valid=False,
+                            error="UTXO spent",
+                        )
+
+                    # Get transaction details
+                    tx_resp = await self.client.get(f"{self.base_url}/tx/{bond.txid}")
+                    tx_resp.raise_for_status()
+                    tx_data = tx_resp.json()
+
+                    if bond.vout >= len(tx_data.get("vout", [])):
+                        return BondVerificationResult(
+                            txid=bond.txid,
+                            vout=bond.vout,
+                            value=0,
+                            confirmations=0,
+                            block_time=0,
+                            valid=False,
+                            error="vout index out of range",
+                        )
+
+                    output = tx_data["vout"][bond.vout]
+                    status = tx_data.get("status", {})
+                    confirmed = status.get("confirmed", False)
+                    block_height = status.get("block_height") if confirmed else None
+                    block_time = status.get("block_time", 0) if confirmed else 0
+
+                    confirmations = 0
+                    if block_height:
+                        confirmations = tip_height - block_height + 1
+
+                    if confirmations <= 0:
+                        return BondVerificationResult(
+                            txid=bond.txid,
+                            vout=bond.vout,
+                            value=output.get("value", 0),
+                            confirmations=0,
+                            block_time=0,
+                            valid=False,
+                            error="UTXO unconfirmed",
+                        )
+
+                    return BondVerificationResult(
+                        txid=bond.txid,
+                        vout=bond.vout,
+                        value=output.get("value", 0),
+                        confirmations=confirmations,
+                        block_time=block_time,
+                        valid=True,
+                    )
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code == 404:
+                        return BondVerificationResult(
+                            txid=bond.txid,
+                            vout=bond.vout,
+                            value=0,
+                            confirmations=0,
+                            block_time=0,
+                            valid=False,
+                            error="UTXO not found",
+                        )
+                    return BondVerificationResult(
+                        txid=bond.txid,
+                        vout=bond.vout,
+                        value=0,
+                        confirmations=0,
+                        block_time=0,
+                        valid=False,
+                        error=str(e),
+                    )
+                except Exception as e:
+                    return BondVerificationResult(
+                        txid=bond.txid,
+                        vout=bond.vout,
+                        value=0,
+                        confirmations=0,
+                        block_time=0,
+                        valid=False,
+                        error=str(e),
+                    )
+
+        results = await asyncio.gather(*[_verify_one(b) for b in bonds])
+        logger.debug(
+            f"Verified {len(bonds)} bonds: "
+            f"{sum(1 for r in results if r.valid)} valid, "
+            f"{sum(1 for r in results if not r.valid)} invalid"
+        )
+        return list(results)
 
     async def close(self) -> None:
         await self.client.aclose()

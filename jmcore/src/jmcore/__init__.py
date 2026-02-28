@@ -28,6 +28,7 @@ from jmcore.bitcoin import (
     serialize_transaction,
     sha256,
 )
+from jmcore.btc_script import BondAddressInfo, derive_bond_address
 from jmcore.commitment_blacklist import (
     CommitmentBlacklist,
     add_commitment,
@@ -325,6 +326,9 @@ __all__ = [
     "serialize_outpoint",
     "serialize_transaction",
     "sha256",
+    # Bond utilities
+    "BondAddressInfo",
+    "derive_bond_address",
     # Tasks
     "parse_directory_address",
     "run_periodic_task",

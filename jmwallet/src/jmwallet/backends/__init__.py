@@ -23,6 +23,8 @@ if the backend needs scriptPubKey/blockheight hints from peers.
 from jmwallet.backends.base import (
     UTXO,
     BlockchainBackend,
+    BondVerificationRequest,
+    BondVerificationResult,
     Transaction,
     UTXOVerificationResult,
 )
@@ -37,6 +39,8 @@ from jmwallet.backends.neutrino import NeutrinoBackend, NeutrinoConfig
 __all__ = [
     "BlockchainBackend",
     "BitcoinCoreBackend",
+    "BondVerificationRequest",
+    "BondVerificationResult",
     "DescriptorWalletBackend",
     "NeutrinoBackend",
     "NeutrinoConfig",

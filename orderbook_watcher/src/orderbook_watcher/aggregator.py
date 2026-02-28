@@ -7,12 +7,18 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from jmcore.bond_calc import calculate_timelocked_fidelity_bond_value
+from jmcore.btc_script import derive_bond_address
 from jmcore.mempool_api import MempoolAPI
 from jmcore.models import FidelityBond, Offer, OrderBook
 from loguru import logger
+
+if TYPE_CHECKING:
+    from jmwallet.backends.base import BlockchainBackend
+
+from jmwallet.backends.base import BondVerificationRequest
 
 from orderbook_watcher.directory_client import DirectoryClient
 from orderbook_watcher.health_checker import MakerHealthChecker
@@ -139,6 +145,7 @@ class OrderbookAggregator:
         max_message_size: int = 2097152,
         uptime_grace_period: int = 60,
         stream_isolation: bool = False,
+        blockchain_backend: BlockchainBackend | None = None,
     ) -> None:
         self.directory_nodes = directory_nodes
         self.network = network
@@ -151,6 +158,7 @@ class OrderbookAggregator:
         self.retry_delay = retry_delay
         self.max_message_size = max_message_size
         self.uptime_grace_period = uptime_grace_period
+        self.blockchain_backend = blockchain_backend
 
         # Build mempool proxy URL and pre-compute isolation credentials
         self._dir_username: str | None = None
@@ -1139,6 +1147,102 @@ class OrderbookAggregator:
         return bond
 
     async def _calculate_bond_values(self, orderbook: OrderBook) -> None:
+        """Calculate bond values, using blockchain backend if available, else mempool API."""
+        if self.blockchain_backend is not None:
+            await self._calculate_bond_values_via_backend(orderbook)
+        else:
+            await self._calculate_bond_values_via_mempool(orderbook)
+
+    async def _calculate_bond_values_via_backend(self, orderbook: OrderBook) -> None:
+        """Calculate bond values using the blockchain backend's verify_bonds().
+
+        This path is used when a full node or neutrino backend is configured,
+        providing trustless and private bond verification without external API calls.
+        """
+        current_time = int(datetime.now(UTC).timestamp())
+
+        # Build verification requests from bonds that need values
+        bonds_to_verify: list[tuple[FidelityBond, BondVerificationRequest]] = []
+
+        for bond in orderbook.fidelity_bonds:
+            if bond.bond_value is not None:
+                continue
+
+            # Get utxo_pub and locktime from bond data
+            bond_data = bond.fidelity_bond_data
+            utxo_pub_hex: str | None = None
+            locktime: int = bond.locktime
+
+            if bond_data:
+                utxo_pub_hex = bond_data.get("utxo_pub")
+
+            if not utxo_pub_hex and bond.script:
+                # Fallback: the `script` field stores utxo_pub hex
+                utxo_pub_hex = bond.script
+
+            if not utxo_pub_hex:
+                logger.debug(f"Bond {bond.utxo_txid}:{bond.utxo_vout} missing utxo_pub, skipping")
+                continue
+
+            try:
+                utxo_pub_bytes = bytes.fromhex(utxo_pub_hex)
+                bond_addr = derive_bond_address(utxo_pub_bytes, locktime, self.network)
+            except Exception as e:
+                logger.debug(
+                    f"Failed to derive bond address for {bond.utxo_txid}:{bond.utxo_vout}: {e}"
+                )
+                continue
+
+            request = BondVerificationRequest(
+                txid=bond.utxo_txid,
+                vout=bond.utxo_vout,
+                utxo_pub=utxo_pub_bytes,
+                locktime=locktime,
+                address=bond_addr.address,
+                scriptpubkey=bond_addr.scriptpubkey.hex(),
+            )
+            bonds_to_verify.append((bond, request))
+
+        if not bonds_to_verify:
+            return
+
+        logger.info(f"Verifying {len(bonds_to_verify)} bonds via blockchain backend...")
+
+        try:
+            assert self.blockchain_backend is not None
+            results = await self.blockchain_backend.verify_bonds(
+                [req for _, req in bonds_to_verify]
+            )
+        except Exception as e:
+            logger.error(f"Backend bond verification failed: {e}")
+            return
+
+        # Update bond objects with results
+        for (bond, _request), result in zip(bonds_to_verify, results, strict=True):
+            if not result.valid:
+                logger.debug(f"Bond {bond.utxo_txid}:{bond.utxo_vout} invalid: {result.error}")
+                continue
+
+            bond_value = calculate_timelocked_fidelity_bond_value(
+                result.value, result.block_time, bond.locktime, current_time
+            )
+
+            bond.bond_value = bond_value
+            bond.amount = result.value
+            bond.utxo_confirmation_timestamp = result.block_time
+            bond.utxo_confirmations = result.confirmations
+
+            logger.debug(
+                f"Bond {bond.counterparty}: value={bond_value}, "
+                f"amount={result.value}, locktime={datetime.utcfromtimestamp(bond.locktime)}, "
+                f"confirmed={datetime.utcfromtimestamp(result.block_time)}"
+            )
+
+        valid_count = sum(1 for r in results if r.valid)
+        logger.info(f"Bond verification complete: {valid_count}/{len(bonds_to_verify)} verified")
+
+    async def _calculate_bond_values_via_mempool(self, orderbook: OrderBook) -> None:
+        """Calculate bond values via mempool.space API (legacy path)."""
         current_time = int(datetime.now(UTC).timestamp())
 
         tasks = [

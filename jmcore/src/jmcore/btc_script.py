@@ -7,6 +7,7 @@ Uses python-bitcointx for script operations where appropriate.
 from __future__ import annotations
 
 import hashlib
+from dataclasses import dataclass
 
 from bitcointx.core.script import (
     OP_0,
@@ -111,3 +112,60 @@ def redeem_script_to_p2wsh_script(redeem_script: bytes) -> bytes:
     script_hash = hashlib.sha256(redeem_script).digest()
     script = CScript([OP_0, script_hash])
     return bytes(script)
+
+
+@dataclass(frozen=True)
+class BondAddressInfo:
+    """Derived address information for a fidelity bond UTXO."""
+
+    address: str
+    """Bech32 P2WSH address (e.g. bc1q... or tb1q...)"""
+    scriptpubkey: bytes
+    """P2WSH scriptPubKey bytes (OP_0 <32-byte-hash>)"""
+    witness_script: bytes
+    """The timelocked witness script: <locktime> OP_CLTV OP_DROP <pubkey> OP_CHECKSIG"""
+
+
+def derive_bond_address(
+    utxo_pub: bytes,
+    locktime: int,
+    network: str = "mainnet",
+) -> BondAddressInfo:
+    """
+    Derive the P2WSH fidelity bond address from a bond proof's public key and locktime.
+
+    Given the UTXO public key and locktime from a fidelity bond proof, this reconstructs
+    the timelocked witness script and derives the P2WSH address. This address can then be
+    used by any backend (full node, neutrino, mempool) to look up the bond UTXO.
+
+    Args:
+        utxo_pub: 33-byte compressed public key from the bond proof
+        locktime: Locktime value from the bond proof (Unix timestamp)
+        network: Bitcoin network ("mainnet", "testnet", "signet", "regtest")
+
+    Returns:
+        BondAddressInfo with address, scriptpubkey, and witness_script
+
+    Raises:
+        ValueError: If utxo_pub is not 33 bytes
+    """
+    # Import here to avoid circular imports (bitcoin.py imports from btc_script.py)
+    from jmcore.bitcoin import scriptpubkey_to_address
+
+    if len(utxo_pub) != 33:
+        raise ValueError(f"Invalid utxo_pub length: {len(utxo_pub)}, expected 33")
+
+    # Reconstruct the timelocked witness script
+    witness_script = mk_freeze_script(utxo_pub.hex(), locktime)
+
+    # Hash to P2WSH scriptPubKey
+    scriptpubkey = redeem_script_to_p2wsh_script(witness_script)
+
+    # Derive bech32 address
+    address = scriptpubkey_to_address(scriptpubkey, network)
+
+    return BondAddressInfo(
+        address=address,
+        scriptpubkey=scriptpubkey,
+        witness_script=witness_script,
+    )

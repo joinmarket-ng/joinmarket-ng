@@ -19,6 +19,8 @@ services:
       # Directory servers (signet)
       - NETWORK_CONFIG__DIRECTORY_SERVERS=signetvaxgd3ivj4tml4g6ed3samaa2rscre2gyeyohncmwk4fbesiqd.onion:5222
       # Orderbook watcher (local, managed by s6-overlay)
+      # Bond verification uses Bitcoin Core RPC (same as jmwalletd) for privacy.
+      # Falls back to mempool.space API if RPC is not configured.
       - DIRECTORY_NODES=signetvaxgd3ivj4tml4g6ed3samaa2rscre2gyeyohncmwk4fbesiqd.onion:5222
       - OBWATCH_URL=http://127.0.0.1:8000
       # Taker fee limits
