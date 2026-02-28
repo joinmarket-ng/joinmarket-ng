@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from typing import Any
 
 from fastapi import APIRouter, Depends
@@ -117,7 +118,7 @@ async def do_coinjoin(
                 state.activate_coinjoin_state(CoinjoinState.NOT_RUNNING)
 
         ws = state.wallet_service
-        asyncio.create_task(_run_coinjoin())
+        state._taker_task = asyncio.create_task(_run_coinjoin())
 
     except ImportError:
         state.activate_coinjoin_state(CoinjoinState.NOT_RUNNING)
@@ -178,7 +179,7 @@ async def run_schedule(
                 state.activate_coinjoin_state(CoinjoinState.NOT_RUNNING)
                 state.current_schedule = None
 
-        asyncio.create_task(_run_tumbler())
+        state._taker_task = asyncio.create_task(_run_tumbler())
 
         # Return initial schedule placeholder.
         return JSONResponse(content={"schedule": []}, status_code=202)
@@ -229,8 +230,15 @@ async def stop_coinjoin(
         except Exception:
             logger.exception("Error stopping taker")
 
+    if state._taker_task is not None and not state._taker_task.done():
+        state._taker_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await state._taker_task
+
     state.activate_coinjoin_state(CoinjoinState.NOT_RUNNING)
     state.current_schedule = None
+    state._taker_ref = None
+    state._taker_task = None
     return JSONResponse(content={}, status_code=202)
 
 
@@ -313,9 +321,9 @@ async def start_maker(
                 state.offer_list = None
                 state.nickname = None
                 state._maker_ref = None
+                state._maker_task = None
 
-        asyncio.create_task(_run_maker())
-
+        state._maker_task = asyncio.create_task(_run_maker())
     except ImportError:
         state.activate_coinjoin_state(CoinjoinState.NOT_RUNNING)
         raise BackendNotReady("Maker module not available.") from None
@@ -346,10 +354,16 @@ async def stop_maker(
         except Exception:
             logger.exception("Error stopping maker")
 
+    if state._maker_task is not None and not state._maker_task.done():
+        state._maker_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await state._maker_task
+
     state.activate_coinjoin_state(CoinjoinState.NOT_RUNNING)
     state.offer_list = None
     state.nickname = None
     state._maker_ref = None
+    state._maker_task = None
     return JSONResponse(content={}, status_code=202)
 
 

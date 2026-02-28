@@ -11,6 +11,7 @@ runtime objects like WalletService that are not serialisable.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import enum
 from pathlib import Path
 from typing import Any
@@ -56,6 +57,10 @@ class DaemonState:
         self._taker_ref: Any = None
         self._maker_ref: Any = None
 
+        # asyncio.Task handles for the background _run_maker / _run_taker coroutines.
+        self._maker_task: asyncio.Task[None] | None = None
+        self._taker_task: asyncio.Task[None] | None = None
+
         # Rescan state
         self.rescanning: bool = False
         self.rescan_progress: float = 0.0
@@ -86,10 +91,35 @@ class DaemonState:
         d = self.wallets_dir
         return sorted(f.name for f in d.iterdir() if f.suffix == ".jmdat")
 
-    def lock_wallet(self) -> bool:
-        """Lock the current wallet, returning whether it was already locked."""
+    async def lock_wallet(self) -> bool:
+        """Lock the current wallet, stopping any running maker/taker first.
+
+        Returns whether the wallet was already locked.
+        """
         if not self.wallet_loaded:
             return True  # already locked
+
+        # Stop the maker if running.
+        if self._maker_ref is not None:
+            try:
+                await self._maker_ref.stop()
+            except Exception:
+                logger.exception("Error stopping maker during wallet lock")
+        if self._maker_task is not None and not self._maker_task.done():
+            self._maker_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._maker_task
+
+        # Stop the taker if running.
+        if self._taker_ref is not None:
+            try:
+                await self._taker_ref.stop()
+            except Exception:
+                logger.exception("Error stopping taker during wallet lock")
+        if self._taker_task is not None and not self._taker_task.done():
+            self._taker_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._taker_task
 
         self.wallet_service = None
         self.wallet_name = ""
@@ -102,6 +132,8 @@ class DaemonState:
         self.nickname = None
         self._taker_ref = None
         self._maker_ref = None
+        self._maker_task = None
+        self._taker_task = None
         self.config_overrides.clear()
         self.token_authority.reset()
         return False  # was not locked, we just locked it

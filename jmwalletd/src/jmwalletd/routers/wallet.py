@@ -243,7 +243,7 @@ async def wallet_unlock(
 
     # If a different wallet is loaded, lock it first.
     if state.wallet_loaded:
-        state.lock_wallet()
+        await state.lock_wallet()
 
     try:
         wallet_service = await open_wallet(
@@ -282,7 +282,7 @@ async def wallet_lock(
     state: DaemonState = Depends(get_daemon_state),
 ) -> LockWalletResponse:
     """Lock the current wallet and stop all services."""
-    already_locked = state.lock_wallet()
+    already_locked = await state.lock_wallet()
     return LockWalletResponse(walletname=walletname, already_locked=already_locked)
 
 

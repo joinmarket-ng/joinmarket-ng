@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
 
 from jmwalletd.state import CoinjoinState, DaemonState
 
@@ -52,29 +54,59 @@ class TestDaemonState:
         wallets = daemon_state.list_wallets()
         assert wallets == ["alpha.jmdat", "beta.jmdat"]
 
-    def test_lock_wallet_when_not_loaded(self, daemon_state: DaemonState) -> None:
-        already = daemon_state.lock_wallet()
+    @pytest.mark.asyncio
+    async def test_lock_wallet_when_not_loaded(self, daemon_state: DaemonState) -> None:
+        already = await daemon_state.lock_wallet()
         assert already is True
 
-    def test_lock_wallet_when_loaded(
+    @pytest.mark.asyncio
+    async def test_lock_wallet_when_loaded(
         self, daemon_state: DaemonState, mock_wallet_service: MagicMock
     ) -> None:
         daemon_state.wallet_service = mock_wallet_service
         daemon_state.wallet_name = "w.jmdat"
-        already = daemon_state.lock_wallet()
+        already = await daemon_state.lock_wallet()
         assert already is False
         assert daemon_state.wallet_service is None
         assert daemon_state.wallet_name == ""
         assert daemon_state.coinjoin_state == CoinjoinState.NOT_RUNNING
 
-    def test_lock_wallet_resets_token_authority(
+    @pytest.mark.asyncio
+    async def test_lock_wallet_resets_token_authority(
         self, daemon_state: DaemonState, mock_wallet_service: MagicMock
     ) -> None:
         daemon_state.wallet_service = mock_wallet_service
         daemon_state.wallet_name = "w.jmdat"
         daemon_state.token_authority.issue("w.jmdat")
-        daemon_state.lock_wallet()
+        await daemon_state.lock_wallet()
         assert daemon_state.token_authority._wallet_name == ""
+
+    @pytest.mark.asyncio
+    async def test_lock_wallet_stops_running_maker(
+        self, daemon_state: DaemonState, mock_wallet_service: MagicMock
+    ) -> None:
+        """Locking the wallet while a maker is running must stop the maker."""
+        daemon_state.wallet_service = mock_wallet_service
+        daemon_state.wallet_name = "w.jmdat"
+        daemon_state.activate_coinjoin_state(CoinjoinState.MAKER_RUNNING)
+
+        mock_maker = MagicMock()
+        mock_maker.stop = AsyncMock()
+        daemon_state._maker_ref = mock_maker
+
+        async def _noop() -> None:
+            await asyncio.sleep(10)  # simulate a long-running maker task
+
+        task = asyncio.create_task(_noop())
+        daemon_state._maker_task = task
+
+        await daemon_state.lock_wallet()
+
+        mock_maker.stop.assert_awaited_once()
+        assert task.cancelled()
+        assert daemon_state._maker_ref is None
+        assert daemon_state._maker_task is None
+        assert daemon_state.coinjoin_state == CoinjoinState.NOT_RUNNING
 
     def test_activate_coinjoin_state_maker(self, daemon_state: DaemonState) -> None:
         daemon_state.activate_coinjoin_state(CoinjoinState.MAKER_RUNNING)
