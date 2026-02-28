@@ -132,6 +132,56 @@ class TestStartMaker:
             print(f"Error response: {resp.text}")
         assert resp.status_code == 202
 
+    @patch("jmwalletd._backend.get_backend", new_callable=AsyncMock)
+    @patch("maker.bot.MakerBot")
+    @patch("maker.config.MakerConfig")
+    @patch("jmcore.settings.get_settings")
+    def test_start_maker_uses_directory_servers_from_settings(
+        self,
+        mock_get_settings: Mock,
+        mock_config: Mock,
+        mock_maker_cls: Mock,
+        mock_backend: AsyncMock,
+        authed_client: tuple[TestClient, str],
+    ) -> None:
+        """MakerConfig must receive directory servers and Tor config from JoinMarketSettings."""
+        client, token = authed_client
+        mock_maker = AsyncMock()
+        mock_maker.nick = "JmMaker"
+        mock_maker.current_offers = []
+        mock_maker_cls.return_value = mock_maker
+
+        from jmcore.models import NetworkType
+
+        expected_dirs = ["testdirectoryfakeaddress.onion:5222"]
+        mock_settings = Mock()
+        mock_settings.get_directory_servers.return_value = expected_dirs
+        mock_settings.network_config.network = NetworkType.SIGNET
+        mock_settings.tor.socks_host = "127.0.0.1"
+        mock_settings.tor.socks_port = 9050
+        mock_settings.tor.stream_isolation = False
+        mock_get_settings.return_value = mock_settings
+
+        resp = client.post(
+            "/api/v1/wallet/test_wallet.jmdat/maker/start",
+            json={
+                "txfee": "1000",
+                "cjfee_a": "500",
+                "cjfee_r": "0.002",
+                "ordertype": "sw0reloffer",
+                "minsize": "100000",
+            },
+            headers=_auth_headers(token),
+        )
+        assert resp.status_code == 202
+
+        _, kwargs = mock_config.call_args
+        assert kwargs["network"] == NetworkType.SIGNET
+        assert kwargs["directory_servers"] == expected_dirs
+        assert kwargs["socks_host"] == "127.0.0.1"
+        assert kwargs["socks_port"] == 9050
+        assert kwargs["stream_isolation"] is False
+
 
 class TestStopMaker:
     def test_stop_maker(self, authed_client: tuple[TestClient, str]) -> None:

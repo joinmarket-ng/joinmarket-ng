@@ -258,6 +258,7 @@ async def start_maker(
         raise InvalidRequestFormat(f"Invalid maker parameter: {exc}") from exc
 
     try:
+        from jmcore.settings import get_settings
         from jmwalletd._backend import get_backend
         from maker.bot import MakerBot
         from maker.config import MakerConfig
@@ -268,6 +269,7 @@ async def start_maker(
             try:
                 ws = state.wallet_service
                 backend = await get_backend(state.data_dir)
+                jm_settings = get_settings()
                 config = MakerConfig(
                     mnemonic=ws.mnemonic,  # type: ignore[arg-type]
                     offer_type=body.ordertype,  # type: ignore[arg-type]
@@ -275,6 +277,11 @@ async def start_maker(
                     cj_fee_relative=cjfee_r,
                     cj_fee_absolute=cjfee_a,
                     tx_fee_contribution=txfee,
+                    network=jm_settings.network_config.network,
+                    directory_servers=jm_settings.get_directory_servers(),
+                    socks_host=jm_settings.tor.socks_host,
+                    socks_port=jm_settings.tor.socks_port,
+                    stream_isolation=jm_settings.tor.stream_isolation,
                 )
                 maker = MakerBot(
                     wallet=ws,
