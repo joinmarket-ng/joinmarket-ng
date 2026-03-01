@@ -271,7 +271,7 @@ class MessageRouter:
                              This is enabled when the requesting peer supports peerlist_features.
             chunk_size: Maximum number of peer entries per PEERLIST message (default: 20)
         """
-        logger.trace(
+        logger.debug(
             f"send_peerlist called for {to_key}, network={network}, "
             f"include_features={include_features}"
         )
@@ -293,7 +293,7 @@ class MessageRouter:
             envelope = MessageEnvelope(message_type=MessageType.PEERLIST, payload="")
             try:
                 await self.send_callback(to_key, envelope.to_bytes())
-                logger.trace(f"Sent empty peerlist to {to_key}")
+                logger.debug(f"Sent empty peerlist to {to_key}")
             except Exception as e:
                 logger.warning(f"Failed to send peerlist to {to_key}: {e}")
             return
@@ -315,7 +315,7 @@ class MessageRouter:
                 logger.warning(f"Failed to send peerlist chunk {chunks_sent + 1} to {to_key}: {e}")
                 return
 
-        logger.trace(
+        logger.debug(
             f"Sent peerlist to {to_key} ({len(entries)} peers in {chunks_sent} chunks, "
             f"include_features={include_features})"
         )
