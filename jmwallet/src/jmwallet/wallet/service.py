@@ -274,13 +274,16 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin):
 
     # -- Balance & UTXO queries (Group G) -----------------------------------
 
-    async def get_balance(self, mixdepth: int, include_fidelity_bonds: bool = True) -> int:
+    async def get_balance(
+        self, mixdepth: int, include_fidelity_bonds: bool = True, min_confirmations: int = 0
+    ) -> int:
         """Get balance for a mixdepth.
 
         Args:
             mixdepth: Mixdepth to get balance for
             include_fidelity_bonds: If True (default), include fidelity bond UTXOs.
                                     If False, exclude fidelity bond UTXOs.
+            min_confirmations: Minimum confirmations required (default: 0).
 
         Note:
             Frozen UTXOs are excluded from balance calculations.
@@ -292,15 +295,19 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin):
         utxos = [u for u in utxos if not u.frozen]
         if not include_fidelity_bonds:
             utxos = [u for u in utxos if not u.is_fidelity_bond]
+        if min_confirmations > 0:
+            utxos = [u for u in utxos if u.confirmations >= min_confirmations]
         return sum(utxo.value for utxo in utxos)
 
-    async def get_balance_for_offers(self, mixdepth: int) -> int:
+    async def get_balance_for_offers(self, mixdepth: int, min_confirmations: int = 0) -> int:
         """Get balance available for maker offers (excludes fidelity bond UTXOs).
 
         Fidelity bonds should never be automatically spent in CoinJoins,
         so makers must exclude them when calculating available offer amounts.
         """
-        return await self.get_balance(mixdepth, include_fidelity_bonds=False)
+        return await self.get_balance(
+            mixdepth, include_fidelity_bonds=False, min_confirmations=min_confirmations
+        )
 
     async def get_utxos(self, mixdepth: int) -> list[UTXOInfo]:
         """Get UTXOs for a mixdepth, syncing if not cached."""
@@ -328,12 +335,15 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin):
                     return utxo
         return None
 
-    async def get_total_balance(self, include_fidelity_bonds: bool = True) -> int:
+    async def get_total_balance(
+        self, include_fidelity_bonds: bool = True, min_confirmations: int = 0
+    ) -> int:
         """Get total balance across all mixdepths.
 
         Args:
             include_fidelity_bonds: If True (default), include fidelity bond UTXOs.
                                     If False, exclude fidelity bond UTXOs.
+            min_confirmations: Minimum confirmations required (default: 0).
 
         Note:
             Frozen UTXOs are excluded from balance calculations.
@@ -341,7 +351,9 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin):
         total = 0
         for mixdepth in range(self.mixdepth_count):
             balance = await self.get_balance(
-                mixdepth, include_fidelity_bonds=include_fidelity_bonds
+                mixdepth,
+                include_fidelity_bonds=include_fidelity_bonds,
+                min_confirmations=min_confirmations,
             )
             total += balance
         return total

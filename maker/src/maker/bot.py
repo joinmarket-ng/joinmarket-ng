@@ -733,7 +733,9 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         # Get current max balance available for offers before resync (excludes fidelity bonds)
         old_max_balance = 0
         for mixdepth in range(self.wallet.mixdepth_count):
-            balance = await self.wallet.get_balance_for_offers(mixdepth)
+            balance = await self.wallet.get_balance_for_offers(
+                mixdepth, min_confirmations=self.config.min_confirmations
+            )
             old_max_balance = max(old_max_balance, balance)
 
         # Sync wallet (use descriptor wallet if available for fast sync)
@@ -754,7 +756,9 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         # Get new max balance for offers after resync (excludes fidelity bonds)
         new_max_balance = 0
         for mixdepth in range(self.wallet.mixdepth_count):
-            balance = await self.wallet.get_balance_for_offers(mixdepth)
+            balance = await self.wallet.get_balance_for_offers(
+                mixdepth, min_confirmations=self.config.min_confirmations
+            )
             new_max_balance = max(new_max_balance, balance)
 
         total_balance = await self.wallet.get_total_balance()
