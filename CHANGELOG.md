@@ -31,6 +31,7 @@ For unattended/automated operation, set `MNEMONIC_PASSWORD` (or `wallet.mnemonic
 ### Security
 
 - **Remove sensitive credentials from CLI arguments** (#130, #132, #133, #136): The removed options appeared in shell history, `/proc/PID/cmdline`, `ps aux`, and audit logs. Secrets are now supplied via environment variables, config file, or interactive prompt. Added `MNEMONIC_PASSWORD` env var support for unattended decryption of encrypted mnemonic files.
+- **Fix bech32 checksum bypass in send command (SND-1)**: The hand-rolled bech32 decoder in `_send_transaction` stripped the 6-character checksum without verifying it, meaning a single-character typo in a destination address would silently send funds to a permanently unspendable output. Replaced with the `bech32` library which properly validates checksums per BIP173. Also fixed: unhandled `ValueError` on non-bech32 characters (e.g. uppercase from QR decoders), and `IndexError` on truncated addresses. The same hand-rolled encoder in the neutrino backend was replaced with `bech32.encode()`.
 
 ## [0.17.0] - 2026-02-25
 

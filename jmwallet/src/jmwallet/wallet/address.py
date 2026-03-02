@@ -1,17 +1,15 @@
 """
-Bitcoin address generation utilities.
+Bitcoin address generation and validation utilities.
 
-This module re-exports address utilities from jmcore.bitcoin
-for backward compatibility.
+This module provides thin wrappers around the ``bech32`` library and
+re-exports address utilities from ``jmcore.bitcoin`` for backward
+compatibility.
 """
 
 from __future__ import annotations
 
-# Keep bech32_encode for legacy imports from maker/tx_verification.py
 import bech32 as bech32_lib
 
-# Legacy exports for backward compatibility with existing imports
-# These were internal functions used by maker/tx_verification.py
 # Re-export from jmcore.bitcoin for backward compatibility
 from jmcore.bitcoin import (
     hash160,
@@ -22,66 +20,47 @@ from jmcore.bitcoin import (
 )
 
 
-def bech32_encode(hrp: str, data: list[int]) -> str:
-    """
-    Legacy wrapper for bech32 encoding.
+def bech32_decode(hrp: str, addr: str) -> tuple[int | None, list[int] | None]:
+    """Decode a bech32/bech32m address with full checksum verification.
 
-    This function is kept for backward compatibility with
-    maker/tx_verification.py which imports it.
+    Returns ``(witness_version, witness_program)`` on success, or
+    ``(None, None)`` if the address is malformed or the checksum is
+    invalid.
+
+    This is a thin wrapper around :func:`bech32.decode` to keep a
+    single call-site convention across the codebase.
     """
-    # First element is witness version, rest is the witness program in 5-bit groups
-    if data:
-        witver = data[0]
-        # Convert 5-bit groups back to 8-bit for bech32 lib
-        # The bech32 lib's encode takes 8-bit data and converts internally
-        # So we need to convert from 5-bit to 8-bit
-        witprog_5bit = data[1:]
-        # Convert 5-bit groups to bytes
-        acc = 0
-        bits = 0
-        witprog = []
-        for value in witprog_5bit:
-            acc = (acc << 5) | value
-            bits += 5
-            while bits >= 8:
-                bits -= 8
-                witprog.append((acc >> bits) & 0xFF)
-        result = bech32_lib.encode(hrp, witver, bytes(witprog))
-        if result is None:
-            raise ValueError("Failed to encode bech32")
-        return result
-    raise ValueError("Empty data")
+    return bech32_lib.decode(hrp, addr)
+
+
+def bech32_encode(hrp: str, witness_version: int, witness_program: bytes) -> str:
+    """Encode a witness program as a bech32 address.
+
+    Raises :class:`ValueError` if encoding fails (e.g. invalid
+    witness version or program length).
+    """
+    result = bech32_lib.encode(hrp, witness_version, witness_program)
+    if result is None:
+        raise ValueError(
+            f"Failed to encode bech32: version={witness_version}, program={witness_program.hex()}"
+        )
+    return result
 
 
 def convertbits(data: bytes, frombits: int, tobits: int, pad: bool = True) -> list[int]:
+    """Convert between bit groups.
+
+    Thin wrapper around :func:`bech32.convertbits`.  Kept for backward
+    compatibility.
     """
-    Convert between bit groups.
-
-    Legacy wrapper kept for backward compatibility.
-    """
-    acc = 0
-    bits = 0
-    ret = []
-    maxv = (1 << tobits) - 1
-    max_acc = (1 << (frombits + tobits - 1)) - 1
-
-    for value in data:
-        acc = ((acc << frombits) | value) & max_acc
-        bits += frombits
-        while bits >= tobits:
-            bits -= tobits
-            ret.append((acc >> bits) & maxv)
-
-    if pad:
-        if bits:
-            ret.append((acc << (tobits - bits)) & maxv)
-    elif bits >= frombits or ((acc << (tobits - bits)) & maxv):
-        raise ValueError("Invalid bits")
-
-    return ret
+    result = bech32_lib.convertbits(data, frombits, tobits, pad)
+    if result is None:
+        raise ValueError("convertbits failed")
+    return result
 
 
 __all__ = [
+    "bech32_decode",
     "bech32_encode",
     "convertbits",
     "hash160",

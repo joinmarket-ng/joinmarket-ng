@@ -802,48 +802,16 @@ class NeutrinoBackend(BlockchainBackend):
 
     def _encode_bech32_address(self, witness_program: bytes, witness_version: int) -> str:
         """Encode witness program as bech32 address."""
-        # Simplified bech32 encoding - in production use a proper library
+        from bech32 import encode as bech32_encode
+
         hrp = "bc" if self.network == "mainnet" else "bcrt" if self.network == "regtest" else "tb"
-
-        # Convert witness program to 5-bit groups
-        def convertbits(data: bytes, frombits: int, tobits: int, pad: bool = True) -> list[int]:
-            acc = 0
-            bits = 0
-            ret = []
-            maxv = (1 << tobits) - 1
-            for value in data:
-                acc = (acc << frombits) | value
-                bits += frombits
-                while bits >= tobits:
-                    bits -= tobits
-                    ret.append((acc >> bits) & maxv)
-            if pad and bits:
-                ret.append((acc << (tobits - bits)) & maxv)
-            return ret
-
-        charset = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
-
-        def bech32_polymod(values: list[int]) -> int:
-            gen = [0x3B6A57B2, 0x26508E6D, 0x1EA119FA, 0x3D4233DD, 0x2A1462B3]
-            chk = 1
-            for v in values:
-                b = chk >> 25
-                chk = ((chk & 0x1FFFFFF) << 5) ^ v
-                for i in range(5):
-                    chk ^= gen[i] if ((b >> i) & 1) else 0
-            return chk
-
-        def bech32_hrp_expand(hrp: str) -> list[int]:
-            return [ord(x) >> 5 for x in hrp] + [0] + [ord(x) & 31 for x in hrp]
-
-        def bech32_create_checksum(hrp: str, data: list[int]) -> list[int]:
-            values = bech32_hrp_expand(hrp) + data
-            polymod = bech32_polymod(values + [0, 0, 0, 0, 0, 0]) ^ 1
-            return [(polymod >> 5 * (5 - i)) & 31 for i in range(6)]
-
-        data = [witness_version] + convertbits(witness_program, 8, 5)
-        checksum = bech32_create_checksum(hrp, data)
-        return hrp + "1" + "".join(charset[d] for d in data + checksum)
+        result = bech32_encode(hrp, witness_version, witness_program)
+        if result is None:
+            raise ValueError(
+                f"Failed to encode bech32 address: "
+                f"version={witness_version}, program={witness_program.hex()}"
+            )
+        return result
 
     def _encode_base58check_address(self, payload: bytes, version: int) -> str:
         """Encode payload as base58check address."""

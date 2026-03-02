@@ -409,19 +409,21 @@ async def _send_transaction(
         from jmwallet.wallet.address import pubkey_to_p2wpkh_script
 
         # Convert destination to scriptPubKey
-        # For simplicity, assume bech32 (P2WPKH/P2WSH)
         if destination.startswith(("bc1", "tb1", "bcrt1")):
-            # Bech32 decode
-            from jmwallet.wallet.address import convertbits
+            from bech32 import decode as bech32_decode
 
-            hrp = destination[: destination.index("1")]
-            data_part = destination[len(hrp) + 1 :]
-            charset = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
-            data_values = [charset.index(c) for c in data_part]
-            # Remove checksum (last 6 characters)
-            witness_data = data_values[:-6]
-            witness_version = witness_data[0]
-            witness_program = bytes(convertbits(bytes(witness_data[1:]), 5, 8, False))
+            network_to_hrp = {"mainnet": "bc", "testnet": "tb", "regtest": "bcrt"}
+            expected_hrp = network_to_hrp.get(backend_settings.network, "bc")
+
+            witness_version, witness_program_list = bech32_decode(expected_hrp, destination)
+            if witness_version is None or witness_program_list is None:
+                logger.error(
+                    f"Invalid bech32 address (bad checksum, format, or wrong network): "
+                    f"{destination}"
+                )
+                raise typer.Exit(1)
+
+            witness_program = bytes(witness_program_list)
 
             if witness_version == 0 and len(witness_program) == 20:
                 # P2WPKH
