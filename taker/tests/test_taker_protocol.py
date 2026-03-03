@@ -12,7 +12,7 @@ Tests:
 from __future__ import annotations
 
 import base64
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from _taker_test_helpers import (
@@ -1013,7 +1013,10 @@ class TestUpdatePendingTransactionNow:
         return Taker(mock_wallet, mock_backend, mock_config)
 
     @pytest.mark.asyncio
-    async def test_update_pending_tx_with_mempool_access(self, taker_with_backend, tmp_path):
+    @patch("asyncio.sleep")
+    async def test_update_pending_tx_with_mempool_access(
+        self, mock_sleep, taker_with_backend, tmp_path
+    ):
         """Test that pending transaction is updated when mempool access is available."""
         from jmwallet.backends.base import Transaction
         from jmwallet.history import (
@@ -1069,7 +1072,10 @@ class TestUpdatePendingTransactionNow:
         assert history[0].confirmations >= 1
 
     @pytest.mark.asyncio
-    async def test_update_pending_tx_with_confirmations(self, taker_with_backend, tmp_path):
+    @patch("asyncio.sleep")
+    async def test_update_pending_tx_with_confirmations(
+        self, mock_sleep, taker_with_backend, tmp_path
+    ):
         """Test that confirmation count is properly recorded."""
         from jmwallet.backends.base import Transaction
         from jmwallet.history import (

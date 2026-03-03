@@ -958,7 +958,7 @@ class DescriptorWalletBackend(BlockchainBackend):
                 block_time=block_time,
             )
         except Exception as e:
-            logger.warning(f"Failed to get transaction {txid}: {e}")
+            logger.debug(f"Failed to get transaction {txid}: {e}")
             return None
 
     async def estimate_fee(self, target_blocks: int) -> float:

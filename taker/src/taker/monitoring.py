@@ -225,7 +225,10 @@ class TakerMonitoringMixin:
             has_mempool = self.backend.has_mempool_access()
 
             if has_mempool:
-                # Full node: can check mempool directly
+                # Full node: can check mempool directly.
+                # Wait a few seconds before the first check — the tx cannot be in the
+                # mempool immediately after broadcast due to network propagation delay.
+                await asyncio.sleep(5)
                 tx_info = await self.backend.get_transaction(txid)
                 if tx_info is not None:
                     confirmations = tx_info.confirmations

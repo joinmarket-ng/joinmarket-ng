@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **Maker PoDLE commitment failure due to unconfirmed UTXOs**: Fixed a bug where the maker bot would advertise liquidity based on unconfirmed UTXOs but fail to complete the coinjoin during `!auth` because unconfirmed UTXOs are excluded from the selection phase. The maker now correctly respects `min_confirmations` (default: 1) for all balance calculations used in offer creation and periodic updates, ensuring it only advertises spendable, confirmed liquidity.
+- **Spurious mempool warning after broadcast**: The taker no longer immediately checks the mempool for a just-broadcast transaction (which always fails with "No such mempool transaction"). A 5-second initial delay is now applied before the first mempool lookup in `_update_pending_transaction_now`. The `get_transaction` failure log in both backends is downgraded from WARNING to DEBUG since a missing mempool entry right after broadcast is an expected transient condition.
 
 ### Added
 

@@ -355,7 +355,7 @@ class BitcoinCoreBackend(BlockchainBackend):
             )
 
         except Exception as e:
-            logger.warning(f"Failed to fetch transaction {txid}: {e}")
+            logger.debug(f"Failed to fetch transaction {txid}: {e}")
             return None
 
     async def estimate_fee(self, target_blocks: int) -> float:
