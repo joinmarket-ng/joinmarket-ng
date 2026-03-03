@@ -14,6 +14,10 @@ For full documentation, see [JoinMarket-NG Documentation](https://joinmarket-ng.
 
 See the [Installation Guide](https://joinmarket-ng.github.io/joinmarket-ng/install/) for detailed instructions.
 
+## Technical Documentation
+
+[Technical Documentation](https://joinmarket-ng.github.io/joinmarket-ng/technical/) - Comprehensive documentation covering concepts, architecture, protocol, privacy mechanisms, wallet, configuration, security, development, and best practices.
+
 ## Main Modules
 
 | Module | Description |
@@ -29,11 +33,12 @@ See the [Installation Guide](https://joinmarket-ng.github.io/joinmarket-ng/insta
 |--------|-------------|
 | [orderbook_watcher](https://joinmarket-ng.github.io/joinmarket-ng/README-orderbook-watcher/) | Orderbook monitoring |
 | [directory_server](https://joinmarket-ng.github.io/joinmarket-ng/README-directory-server/) | Peer discovery service |
+
+## Signatures, Scripts
+| Module | Description |
+|--------|-------------|
+| [signatures](https://joinmarket-ng.github.io/joinmarket-ng/README-signatures) | GPG Signatures for JoinMarket NG Releases |
 | [scripts](https://joinmarket-ng.github.io/joinmarket-ng/README-scripts/) | Utility scripts for development |
-
-## Technical Documentation
-
-[Technical Documentation](https://joinmarket-ng.github.io/joinmarket-ng/technical/) - Comprehensive documentation covering concepts, architecture, protocol, privacy mechanisms, wallet, configuration, security, development, and best practices.
 
 ## Live Orderbook
 
@@ -47,4 +52,4 @@ See the [Installation Guide](https://joinmarket-ng.github.io/joinmarket-ng/insta
 
 ## License
 
-[MIT License](LICENSE)
+[MIT License](https://joinmarket-ng.github.io/joinmarket-ng/license/)

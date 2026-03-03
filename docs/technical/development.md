@@ -51,7 +51,7 @@ Docker images are built reproducibly using `SOURCE_DATE_EPOCH` to ensure identic
 
 Docker manifest digests vary based on manifest format (Docker distribution vs OCI) even for identical image content. CI pushes to a registry using Docker format, while local builds typically use OCI format. Layer digests are content-addressable hashes of the actual tar.gz layer content and are identical regardless of manifest format, making them reliable for reproducibility verification.
 
-**Verify a release:**
+**Verify a release:**{ #verify-a-release }
 
 ```bash
 # Check GPG signatures and published image digests
@@ -80,7 +80,7 @@ docker buildx inspect  # Should show: Driver: docker-container
 
 Alternatively, if using Docker Desktop, enable the "containerd image store" in Settings > Features in development.
 
-**Sign a release:**
+**Sign a release:**{ #sign-a-release }
 
 ```bash
 # Verify + reproduce build + sign (--reproduce is enabled by default)

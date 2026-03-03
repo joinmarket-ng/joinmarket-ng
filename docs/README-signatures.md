@@ -27,11 +27,11 @@ signatures/
 
 ## For Signers
 
-See [DOCS.md](../DOCS.md#signing-a-release) for instructions on how to sign a release.
+See [Sign](technical/development.md#sign-a-release) for instructions on how to sign a release.
 
 ## For Verifiers
 
-See [DOCS.md](../DOCS.md#verifying-signatures) for instructions on how to verify signatures.
+See [Verify](technical/development.md#verify-a-release) for instructions on how to verify signatures.
 
 ## Trusted Keys
 

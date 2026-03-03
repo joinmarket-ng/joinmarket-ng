@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - main
+      - docu-fixes
+      - docu-centralization
   workflow_dispatch:
 
 permissions:

@@ -297,10 +297,11 @@ nav:
   # This creates a horizontal line separator in the navigation menu
   # The actual styling is defined in docs/stylesheets/extra.css
   - '---': separator.md
-
+  
   # -------------------------------------------------------------------------
-  # Scripts
+  # Scripts, Signatures
   # -------------------------------------------------------------------------
+  - Signatures: README-signatures.md
   - Scripts: README-scripts.md
 
   # -------------------------------------------------------------------------
