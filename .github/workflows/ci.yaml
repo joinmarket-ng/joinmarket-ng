@@ -4,38 +4,14 @@ on:
   push:
     branches:
       - main
-    paths:
-      - 'jmcore/**'
-      - 'jmwallet/**'
-      - 'directory_server/**'
-      - 'orderbook_watcher/**'
-      - 'maker/**'
-      - 'taker/**'
-      - 'jmwalletd/**'
-      - 'tests/**'
-      - 'pytest.ini'
-      - 'docker-compose.yml'
-      - '.github/workflows/**'
-  # pull_request_target runs from the base branch context and has write permissions,
-  # which allows pushing to GHCR even for fork PRs.
-  # GitHub's built-in "Fork pull request workflows" approval setting gates external
-  # contributors (first-time contributors require maintainer approval before running).
-  # Organization members can run CI without approval.
-  # The workflow files themselves always run from the base branch (not the fork), so
-  # malicious workflow changes in a fork PR cannot affect the privileged execution.
   pull_request_target:
-    paths:
-      - 'jmcore/**'
-      - 'jmwallet/**'
-      - 'directory_server/**'
-      - 'orderbook_watcher/**'
-      - 'maker/**'
-      - 'taker/**'
-      - 'jmwalletd/**'
-      - 'tests/**'
-      - 'pytest.ini'
-      - 'docker-compose.yml'
-      - '.github/workflows/**'
+    # pull_request_target runs from the base branch context and has write permissions,
+    # which allows pushing to GHCR even for fork PRs.
+    # GitHub's built-in "Fork pull request workflows" approval setting gates external
+    # contributors (first-time contributors require maintainer approval before running).
+    # Organization members can run CI without approval.
+    # The workflow files themselves always run from the base branch (not the fork), so
+    # malicious workflow changes in a fork PR cannot affect the privileged execution.
   workflow_dispatch:
   workflow_call:
 
@@ -302,13 +278,14 @@ jobs:
       contents: read
       packages: read
     env:
-      MAKER_IMAGE: ${{ needs.build-images.outputs.maker_image }}
-      JMWALLETD_IMAGE: ${{ needs.build-images.outputs.jmwalletd_image }}
-      JAM_NG_IMAGE: ${{ needs.build-images.outputs.jam_ng_image }}
-      DIRECTORY_SERVER_IMAGE: ${{ needs.build-images.outputs.directory_server_image }}
+      MAKER_IMAGE: ghcr.io/${{ github.repository }}/maker:ci-${{ github.sha }}
+      JAM_NG_IMAGE: ghcr.io/${{ github.repository }}/jam-ng:ci-${{ github.sha }}
+      DIRECTORY_SERVER_IMAGE: ghcr.io/${{ github.repository }}/directory-server:ci-${{ github.sha }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -334,58 +311,54 @@ jobs:
       - name: Pull pre-built images
         run: |
           docker pull $MAKER_IMAGE &
-          docker pull $JMWALLETD_IMAGE &
+          docker pull $JAM_NG_IMAGE &
           docker pull $DIRECTORY_SERVER_IMAGE &
           wait
-
-      - name: Clone jam frontend
-        uses: actions/checkout@v4
-        with:
-          repository: joinmarket-webui/jam
-          ref: master
-          path: jam-frontend
-
-      - name: Build jam frontend
-        working-directory: jam-frontend
-        run: |
-          npm ci
-          VITE_JM_API_BASE_URL=http://localhost:28183 npm run build
 
       - name: Start e2e services
         run: |
           docker compose --profile e2e up -d
-          ./scripts/wait-for-service.sh http://localhost:18443 "Bitcoin Core" 60
-          ./scripts/wait-for-service.sh http://localhost:5222 "Directory Server" 60
-          ./scripts/wait-for-service.sh http://localhost:28183/api/v1/session "jmwalletd" 90
-          sleep 10
 
-      - name: Copy jam frontend into jmwalletd container
-        run: |
-          docker cp jam-frontend/dist/. jm-walletd:/root/.joinmarket-ng/jam/
+          .github/scripts/wait-for-service.sh "Bitcoin" \
+            "docker compose exec -T bitcoin bitcoin-cli -chain=regtest -rpcport=18443 -rpcuser=test -rpcpassword=test getblockchaininfo" \
+            60 1
+
+          .github/scripts/wait-for-service.sh "Directory Server" \
+            "nc -z localhost 5222" \
+            30 1
+
+          .github/scripts/wait-for-service.sh "jam-playwright" \
+            "curl -sf http://127.0.0.1:29183/api/v1/session" \
+            90 2
+
+          echo "E2E services ready!"
 
       - name: Run Playwright tests
         working-directory: tests/playwright
         env:
           CI: "true"
-          JAM_URL: http://localhost:28183
-          JMWALLETD_URL: http://localhost:28183
+          JAM_URL: http://localhost:29183
+          JMWALLETD_URL: http://localhost:29183
         run: npx playwright test
 
       - name: Show Docker logs on failure
         if: failure()
-        run: docker compose --profile e2e logs --tail=200
+        run: |
+          docker compose --profile e2e ps
+          docker compose --profile e2e logs --tail=200
 
       - name: Cleanup Docker services
         if: always()
         run: docker compose --profile e2e down -v
 
-      - name: Upload Playwright report
-        uses: actions/upload-artifact@v4
+      - name: Upload Playwright report and videos
+        uses: actions/upload-artifact@v6
         with:
           name: playwright-report
           path: |
             tests/playwright/playwright-report/
             tests/playwright/test-results/
+          retention-days: 14
         if: always()
 
   test-jmwallet:
