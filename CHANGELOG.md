@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.2] - 2026-03-04
+
 ### Fixed
 
 - **`orderbook_watcher` Docker container fails to start**: The `orderbook_watcher` Dockerfile was missing the `jmwallet` installation step. Since `orderbook_watcher/main.py` imports `BitcoinCoreBackend` and `NeutrinoBackend` from `jmwallet`, the container would crash with `ModuleNotFoundError: No module named 'jmwallet'`. Added `jmwallet` requirements and package installation to the Dockerfile and declared `jmwallet` as a dependency in `pyproject.toml`.
@@ -1015,7 +1017,8 @@ Releases prior to these changes (including 0.13.5, 0.13.6, and 0.13.7) cannot be
 - Pre-built image support for directory server compose.
 - Tor configuration instructions.
 
-[Unreleased]: ../../compare/0.19.1...HEAD
+[Unreleased]: ../../compare/0.19.2...HEAD
+[0.19.2]: ../../compare/0.19.1...0.19.2
 [0.19.1]: ../../compare/0.19.0...0.19.1
 [0.19.0]: ../../compare/0.18.0...0.19.0
 [0.18.0]: ../../compare/0.17.0...0.18.0
