@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-03-04
+
 ### Fixed
 
 - **Maker PoDLE commitment failure due to unconfirmed UTXOs**: Fixed a bug where the maker bot would advertise liquidity based on unconfirmed UTXOs but fail to complete the coinjoin during `!auth` because unconfirmed UTXOs are excluded from the selection phase. The maker now correctly respects `min_confirmations` (default: 1) for all balance calculations used in offer creation and periodic updates, ensuring it only advertises spendable, confirmed liquidity.
@@ -1001,7 +1003,8 @@ Releases prior to these changes (including 0.13.5, 0.13.6, and 0.13.7) cannot be
 - Pre-built image support for directory server compose.
 - Tor configuration instructions.
 
-[Unreleased]: ../../compare/0.18.0...HEAD
+[Unreleased]: ../../compare/0.19.0...HEAD
+[0.19.0]: ../../compare/0.18.0...0.19.0
 [0.18.0]: ../../compare/0.17.0...0.18.0
 [0.17.0]: ../../compare/0.16.0...0.17.0
 [0.16.0]: ../../compare/0.15.0...0.16.0
