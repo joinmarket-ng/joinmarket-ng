@@ -36,40 +36,44 @@ ARG SETUPTOOLS_VERSION
 ARG WHEEL_VERSION
 RUN echo "setuptools==${SETUPTOOLS_VERSION}" > /build/constraints.txt && \
     echo "wheel==${WHEEL_VERSION}" >> /build/constraints.txt
-ENV PIP_CONSTRAINT=/build/constraints.txt
+# NOTE: We do NOT set PIP_CONSTRAINT as an environment variable here.
+# PIP_CONSTRAINT is inherited by pip subprocess invocations (e.g. build-dep resolution
+# when compiling source packages on armv7 where no wheel exists). This causes a conflict
+# when a package's own build-deps request a different setuptools version.
+# Instead we pass --constraint explicitly only on our own installs.
 
 # Install jmcore dependencies (with hash verification)
 COPY jmcore/requirements.txt /build/jmcore/requirements.txt
 RUN if [ -n "$SOURCE_DATE_EPOCH" ]; then export SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH; fi && \
-    pip install --no-cache-dir --user -r /build/jmcore/requirements.txt
+    pip install --no-cache-dir --user --constraint /build/constraints.txt -r /build/jmcore/requirements.txt
 
 # Copy jmcore source and install (with notifications support)
 COPY jmcore/src /build/jmcore/src
 COPY jmcore/pyproject.toml /build/jmcore/
 RUN if [ -n "$SOURCE_DATE_EPOCH" ]; then export SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH; fi && \
-    pip install --no-cache-dir --user "/build/jmcore"
+    pip install --no-cache-dir --user --constraint /build/constraints.txt "/build/jmcore"
 
 # Install jmwallet dependencies
 COPY jmwallet/requirements.txt /build/jmwallet/requirements.txt
 RUN if [ -n "$SOURCE_DATE_EPOCH" ]; then export SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH; fi && \
-    pip install --no-cache-dir --user -r /build/jmwallet/requirements.txt
+    pip install --no-cache-dir --user --constraint /build/constraints.txt -r /build/jmwallet/requirements.txt
 
 # Copy jmwallet source and install
 COPY jmwallet/pyproject.toml /build/jmwallet/pyproject.toml
 COPY jmwallet/src /build/jmwallet/src
 RUN if [ -n "$SOURCE_DATE_EPOCH" ]; then export SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH; fi && \
-    pip install --no-cache-dir --user /build/jmwallet
+    pip install --no-cache-dir --user --constraint /build/constraints.txt /build/jmwallet
 
 # Install taker dependencies
 COPY taker/requirements.txt /build/taker/requirements.txt
 RUN if [ -n "$SOURCE_DATE_EPOCH" ]; then export SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH; fi && \
-    pip install --no-cache-dir --user -r /build/taker/requirements.txt
+    pip install --no-cache-dir --user --constraint /build/constraints.txt -r /build/taker/requirements.txt
 
 # Copy taker source and install
 COPY taker/src /build/taker/src
 COPY taker/pyproject.toml /build/taker/
 RUN if [ -n "$SOURCE_DATE_EPOCH" ]; then export SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH; fi && \
-    pip install --no-cache-dir --user /build/taker
+    pip install --no-cache-dir --user --constraint /build/constraints.txt /build/taker
 
 # =============================================================================
 # Production stage: Minimal runtime image

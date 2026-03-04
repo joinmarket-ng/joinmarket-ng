@@ -12,11 +12,18 @@ ARG NODE_SLIM_DIGEST=sha256:e8e2e91b1378f83c5b2dd15f0247f34110e2fe895f6ca7719dbb
 # Update with: ./scripts/update-base-images.sh
 ARG JAM_COMMIT=d5dd2add951db5d0807d4c0730dcdd2d9adfad75
 
+# Pin build tools for reproducible builds
+# setuptools version is stamped into WHEEL metadata (Generator: setuptools (x.y.z))
+# Different versions produce different WHEEL/RECORD files, breaking layer reproducibility
+# Update versions with: ./scripts/update-base-images.sh
+ARG SETUPTOOLS_VERSION=82.0.0
+ARG WHEEL_VERSION=0.46.3
+
 # =============================================================================
 # Stage 1: Build Python environment
 # =============================================================================
 FROM python:${PYTHON_VERSION}-slim@${PYTHON_SLIM_DIGEST} AS builder
-WORKDIR /app
+WORKDIR /build
 
 # build-essential + cmake + pkg-config needed to compile coincurve (no wheels for 3.14 yet)
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -25,38 +32,81 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config=1.8.1-4 \
     libffi-dev=3.4.8-2 \
     libsodium-dev=1.0.18-1+deb13u1 \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && rm -f /var/log/dpkg.log /var/log/apt/*.log
+
+# Reproducible builds: SOURCE_DATE_EPOCH must be set via --build-arg for reproducible builds
+# When not provided, pip install runs without it (non-reproducible but works)
+# Usage: docker build --build-arg SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) ...
+ARG SOURCE_DATE_EPOCH
+
+# Pin build tools for reproducible builds (re-declare to inherit global ARGs)
+ARG SETUPTOOLS_VERSION
+ARG WHEEL_VERSION
+RUN echo "setuptools==${SETUPTOOLS_VERSION}" > /build/constraints.txt && \
+    echo "wheel==${WHEEL_VERSION}" >> /build/constraints.txt
+# NOTE: We do NOT set PIP_CONSTRAINT as an environment variable here.
+# PIP_CONSTRAINT is inherited by pip subprocess invocations (e.g. build-dep resolution
+# when compiling source packages like httptools on armv7 where no wheel exists). This
+# causes a conflict when the package's own build-deps request a different setuptools
+# version. Instead we pass --constraint explicitly only on our own installs.
 
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-COPY jmcore/requirements.txt /tmp/requirements-jmcore.txt
-RUN pip install --no-cache-dir -r /tmp/requirements-jmcore.txt
+COPY jmcore/requirements.txt /build/requirements-jmcore.txt
+RUN if [ -n "$SOURCE_DATE_EPOCH" ]; then export SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH; fi && \
+    pip install --no-cache-dir --constraint /build/constraints.txt -r /build/requirements-jmcore.txt
 
-COPY jmwallet/requirements.txt /tmp/requirements-jmwallet.txt
-RUN pip install --no-cache-dir -r /tmp/requirements-jmwallet.txt
+COPY jmwallet/requirements.txt /build/requirements-jmwallet.txt
+RUN if [ -n "$SOURCE_DATE_EPOCH" ]; then export SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH; fi && \
+    pip install --no-cache-dir --constraint /build/constraints.txt -r /build/requirements-jmwallet.txt
 
-COPY maker/requirements.txt /tmp/requirements-maker.txt
-RUN pip install --no-cache-dir -r /tmp/requirements-maker.txt
+COPY maker/requirements.txt /build/requirements-maker.txt
+RUN if [ -n "$SOURCE_DATE_EPOCH" ]; then export SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH; fi && \
+    pip install --no-cache-dir --constraint /build/constraints.txt -r /build/requirements-maker.txt
 
-COPY taker/requirements.txt /tmp/requirements-taker.txt
-RUN pip install --no-cache-dir -r /tmp/requirements-taker.txt
+COPY taker/requirements.txt /build/requirements-taker.txt
+RUN if [ -n "$SOURCE_DATE_EPOCH" ]; then export SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH; fi && \
+    pip install --no-cache-dir --constraint /build/constraints.txt -r /build/requirements-taker.txt
 
-COPY orderbook_watcher/requirements.txt /tmp/requirements-obwatcher.txt
-RUN pip install --no-cache-dir -r /tmp/requirements-obwatcher.txt
+COPY orderbook_watcher/requirements.txt /build/requirements-obwatcher.txt
+RUN if [ -n "$SOURCE_DATE_EPOCH" ]; then export SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH; fi && \
+    pip install --no-cache-dir --constraint /build/constraints.txt -r /build/requirements-obwatcher.txt
 
-COPY jmwalletd/requirements.txt /tmp/requirements-jmwalletd.txt
-RUN pip install --no-cache-dir -r /tmp/requirements-jmwalletd.txt
+COPY jmwalletd/requirements.txt /build/requirements-jmwalletd.txt
+RUN if [ -n "$SOURCE_DATE_EPOCH" ]; then export SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH; fi && \
+    pip install --no-cache-dir --constraint /build/constraints.txt -r /build/requirements-jmwalletd.txt
 
-COPY . /app/
+# Copy source packages individually to allow layer caching per component
+COPY jmcore/src /build/jmcore/src
+COPY jmcore/pyproject.toml /build/jmcore/
+COPY jmwallet/src /build/jmwallet/src
+COPY jmwallet/pyproject.toml /build/jmwallet/
+COPY maker/src /build/maker/src
+COPY maker/pyproject.toml /build/maker/
+COPY taker/src /build/taker/src
+COPY taker/pyproject.toml /build/taker/
+COPY orderbook_watcher/src /build/orderbook_watcher/src
+COPY orderbook_watcher/pyproject.toml /build/orderbook_watcher/
+COPY jmwalletd/src /build/jmwalletd/src
+COPY jmwalletd/pyproject.toml /build/jmwalletd/
 
-RUN pip install --no-cache-dir --no-deps \
-    ./jmcore \
-    ./jmwallet \
-    ./maker \
-    ./taker \
-    ./orderbook_watcher \
-    ./jmwalletd
+# Normalize file timestamps so local working-copy mtimes don't differ from CI clone
+RUN if [ -n "$SOURCE_DATE_EPOCH" ]; then \
+        find /build/jmcore /build/jmwallet /build/maker /build/taker \
+             /build/orderbook_watcher /build/jmwalletd \
+             -exec touch -d @${SOURCE_DATE_EPOCH} {} +; \
+    fi
+
+RUN if [ -n "$SOURCE_DATE_EPOCH" ]; then export SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH; fi && \
+    pip install --no-cache-dir --no-deps --constraint /build/constraints.txt \
+        /build/jmcore \
+        /build/jmwallet \
+        /build/maker \
+        /build/taker \
+        /build/orderbook_watcher \
+        /build/jmwalletd
 
 # =============================================================================
 # Stage 2: jmwalletd — standalone API daemon (default target)
@@ -120,7 +170,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     wget=1.25.0-2 \
     xz-utils=5.8.1-1 \
     tor=0.4.8.16-1 \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && rm -f /var/log/dpkg.log /var/log/apt/*.log /var/cache/ldconfig/aux-cache
 
 # Install s6-overlay (noarch + arch-specific, checksums pinned)
 # noarch tarball is the same for all platforms
