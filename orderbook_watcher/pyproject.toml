@@ -21,6 +21,7 @@ dependencies = [
     "pydantic-settings>=2.0.0",
     "PySocks>=1.7.1",
     "jmcore",
+    "jmwallet",
 ]
 
 [project.optional-dependencies]

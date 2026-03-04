@@ -49,6 +49,17 @@ COPY jmcore/pyproject.toml /build/jmcore/
 RUN if [ -n "$SOURCE_DATE_EPOCH" ]; then export SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH; fi && \
     pip install --no-cache-dir --user "/build/jmcore"
 
+# Install jmwallet dependencies
+COPY jmwallet/requirements.txt /build/jmwallet/
+RUN if [ -n "$SOURCE_DATE_EPOCH" ]; then export SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH; fi && \
+    pip install --no-cache-dir --user -r /build/jmwallet/requirements.txt
+
+# Copy jmwallet source and install
+COPY jmwallet/src /build/jmwallet/src
+COPY jmwallet/pyproject.toml /build/jmwallet/
+RUN if [ -n "$SOURCE_DATE_EPOCH" ]; then export SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH; fi && \
+    pip install --no-cache-dir --user "/build/jmwallet"
+
 # Install orderbook_watcher dependencies
 COPY orderbook_watcher/requirements.txt /build/orderbook_watcher/
 RUN if [ -n "$SOURCE_DATE_EPOCH" ]; then export SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH; fi && \
