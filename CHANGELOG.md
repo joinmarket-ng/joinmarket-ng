@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.1] - 2026-03-04
+
 ### Fixed
 
 - **`jam-ng` armv7 Docker build**: Fixed two issues that prevented `linux/arm/v7` builds from succeeding.
@@ -1009,7 +1011,8 @@ Releases prior to these changes (including 0.13.5, 0.13.6, and 0.13.7) cannot be
 - Pre-built image support for directory server compose.
 - Tor configuration instructions.
 
-[Unreleased]: ../../compare/0.19.0...HEAD
+[Unreleased]: ../../compare/0.19.1...HEAD
+[0.19.1]: ../../compare/0.19.0...0.19.1
 [0.19.0]: ../../compare/0.18.0...0.19.0
 [0.18.0]: ../../compare/0.17.0...0.18.0
 [0.17.0]: ../../compare/0.16.0...0.17.0
