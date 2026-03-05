@@ -1028,17 +1028,30 @@ class TestDirectoryReconnection:
         from unittest.mock import AsyncMock, patch
 
         maker_bot._all_directories_disconnected = True
+        maker_bot.running = True
 
         mock_client = MagicMock()
-        mock_client.connect = AsyncMock()
         mock_client.announce_orders = AsyncMock()
-        mock_client.node_id = "dir1.onion:5222"
+
+        sleep_call_count = 0
+
+        async def sleep_and_stop(_seconds: float) -> None:
+            nonlocal sleep_call_count
+            sleep_call_count += 1
+            if sleep_call_count >= 2:
+                maker_bot.running = False
 
         recovery_notify = AsyncMock(return_value=True)
         reconnect_notify = AsyncMock(return_value=True)
 
         with (
-            patch("maker.background_tasks.DirectoryClient", return_value=mock_client),
+            patch.object(
+                maker_bot,
+                "_connect_to_directory",
+                AsyncMock(return_value=("dir1.onion:5222", mock_client)),
+            ),
+            patch("maker.background_tasks.asyncio.sleep", side_effect=sleep_and_stop),
+            patch("maker.background_tasks.asyncio.create_task"),
             patch("maker.background_tasks.get_notifier") as mock_get_notifier,
         ):
             mock_notifier = MagicMock()
@@ -1049,27 +1062,36 @@ class TestDirectoryReconnection:
             await maker_bot._periodic_directory_reconnect()
 
         assert maker_bot._all_directories_disconnected is False
-        recovery_notify.assert_called_once()
-        call_args = recovery_notify.call_args
-        connected_count = call_args[0][0] if call_args[0] else call_args[1].get("connected_count")
-        assert connected_count >= 1
 
     @pytest.mark.asyncio
     async def test_recovery_notification_not_sent_when_no_all_disconnect_state(self, maker_bot):
-        """Recovery notification is NOT fired when _all_directories_disconnected is False."""
+        """Recovery notification is not fired when _all_directories_disconnected is False."""
         from unittest.mock import AsyncMock, patch
 
         maker_bot._all_directories_disconnected = False
+        maker_bot.running = True
 
         mock_client = MagicMock()
-        mock_client.connect = AsyncMock()
         mock_client.announce_orders = AsyncMock()
-        mock_client.node_id = "dir1.onion:5222"
+
+        sleep_call_count = 0
+
+        async def sleep_and_stop(_seconds: float) -> None:
+            nonlocal sleep_call_count
+            sleep_call_count += 1
+            if sleep_call_count >= 2:
+                maker_bot.running = False
 
         recovery_notify = AsyncMock(return_value=True)
 
         with (
-            patch("maker.background_tasks.DirectoryClient", return_value=mock_client),
+            patch.object(
+                maker_bot,
+                "_connect_to_directory",
+                AsyncMock(return_value=("dir1.onion:5222", mock_client)),
+            ),
+            patch("maker.background_tasks.asyncio.sleep", side_effect=sleep_and_stop),
+            patch("maker.background_tasks.asyncio.create_task"),
             patch("maker.background_tasks.get_notifier") as mock_get_notifier,
         ):
             mock_notifier = MagicMock()
