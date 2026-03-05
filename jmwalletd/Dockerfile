@@ -140,9 +140,21 @@ CMD ["jmwalletd", "--no-tls"]
 # so the build platform doesn't matter. node:24-slim has no linux/arm/v7 image.
 # Pinned to a specific commit for reproducible builds.
 # Update JAM_COMMIT with: ./scripts/update-base-images.sh
+#
+# Reproducibility notes for this stage:
+# - webpack 5 (used by CRA/react-scripts) hashes outputs using [contenthash],
+#   which is derived purely from file content, not timestamps.
+# - GENERATE_SOURCEMAP=false eliminates source map files from the output, which
+#   removes any risk from path or metadata variance in source map generation.
+# - git clone sets all file mtimes to the current wall-clock time. We normalize
+#   them to SOURCE_DATE_EPOCH before building so babel-loader cache keys are
+#   deterministic across builds (even though cache misses don't affect output
+#   content, identical cache keys prevent any mtime-driven divergence).
+# - npm ci is deterministic from a pinned package-lock.json with integrity hashes.
 # =============================================================================
 FROM --platform=linux/amd64 node:${NODE_VERSION}-slim@${NODE_SLIM_DIGEST} AS jam-builder
 ARG JAM_COMMIT
+ARG SOURCE_DATE_EPOCH
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates=20230311+deb12u1 \
@@ -150,10 +162,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 RUN git clone https://github.com/joinmarket-webui/jam.git /app \
-    && git -C /app checkout "${JAM_COMMIT}"
+    && git -C /app checkout "${JAM_COMMIT}" \
+    && if [ -n "$SOURCE_DATE_EPOCH" ]; then \
+        find /app -exec touch -d "@${SOURCE_DATE_EPOCH}" {} +; \
+    fi
 
 WORKDIR /app
-RUN npm ci && npm run build
+# GENERATE_SOURCEMAP=false: skip source map generation for smaller output and to
+# avoid any path/metadata variance in source map content across build environments.
+RUN npm ci && GENERATE_SOURCEMAP=false npm run build
 
 # =============================================================================
 # Stage 4: jam-ng — self-contained: jmwalletd + JAM frontend + Tor + obwatcher
