@@ -42,6 +42,7 @@ class BackgroundTasksMixin:
     _orderbook_rate_limiter: OrderbookRateLimiter
     _direct_connection_rate_limiter: DirectConnectionRateLimiter
     _directory_reconnect_attempts: dict[str, int]
+    _all_directories_disconnected: bool
 
     async def _periodic_rescan(self: MakerBotProtocol) -> None:
         """Background task to periodically rescan wallet and update offers.
@@ -396,6 +397,15 @@ class BackgroundTasksMixin:
                                 new_node_id, connected_count, total_count
                             )
                         )
+
+                        # If all directories were previously disconnected, send a recovery alert
+                        if self._all_directories_disconnected:
+                            self._all_directories_disconnected = False
+                            asyncio.create_task(
+                                get_notifier().notify_all_directories_reconnected(
+                                    connected_count, total_count
+                                )
+                            )
                     else:
                         # Increment retry counter
                         self._directory_reconnect_attempts[node_id] = attempts + 1
@@ -645,6 +655,7 @@ class BackgroundTasksMixin:
                     )
                 )
                 if connected_count == 0:
+                    self._all_directories_disconnected = True
                     asyncio.create_task(get_notifier().notify_all_directories_disconnected())
                 break
             except Exception as e:

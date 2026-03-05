@@ -57,6 +57,7 @@ class MakerBotProtocol(Protocol):
     _orderbook_rate_limiter: OrderbookRateLimiter
     _direct_connection_rate_limiter: DirectConnectionRateLimiter
     _directory_reconnect_attempts: dict[str, int]
+    _all_directories_disconnected: bool
     _own_wallet_nicks: set[str]
 
     # -- Cross-mixin methods --

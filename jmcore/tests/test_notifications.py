@@ -392,6 +392,48 @@ class TestNotifier:
         assert result is False
 
     @pytest.mark.asyncio
+    async def test_notify_all_directories_reconnected_enabled_by_default(self) -> None:
+        """Test that all-directories-reconnected is enabled by default (reuses notify_all_disconnect)."""
+        config = NotificationConfig(enabled=True, urls=["test://"])
+        notifier = Notifier(config)
+
+        assert config.notify_all_disconnect is True
+
+        notifier._send = AsyncMock(return_value=True)
+
+        result = await notifier.notify_all_directories_reconnected(2, 3)
+
+        assert result is True
+        notifier._send.assert_called_once()
+        call_args = notifier._send.call_args
+        title = call_args[1].get("title") or call_args[0][0]
+        assert "RESOLVED" in title or "Reconnected" in title
+
+    @pytest.mark.asyncio
+    async def test_notify_all_directories_reconnected_disabled(self) -> None:
+        """Test that all-directories-reconnected respects notify_all_disconnect toggle."""
+        config = NotificationConfig(enabled=True, urls=["test://"], notify_all_disconnect=False)
+        notifier = Notifier(config)
+
+        result = await notifier.notify_all_directories_reconnected(1, 3)
+
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_notify_all_directories_reconnected_body_contains_counts(self) -> None:
+        """Test that the recovery notification body includes connection counts."""
+        config = NotificationConfig(enabled=True, urls=["test://"])
+        notifier = Notifier(config)
+
+        notifier._send = AsyncMock(return_value=True)
+
+        await notifier.notify_all_directories_reconnected(2, 3)
+
+        call_args = notifier._send.call_args
+        body = call_args[1].get("body") or call_args[0][1]
+        assert "2/3" in body
+
+    @pytest.mark.asyncio
     async def test_notify_startup_disabled(self) -> None:
         """Test that startup notification respects toggle."""
         config = NotificationConfig(enabled=True, urls=["test://"], notify_startup=False)

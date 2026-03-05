@@ -791,6 +791,24 @@ class Notifier:
             priority=NotificationPriority.FAILURE,
         )
 
+    async def notify_all_directories_reconnected(
+        self,
+        connected_count: int,
+        total_count: int,
+    ) -> bool:
+        """Notify when at least one directory server is reconnected after all were lost (recovery)."""
+        if not self.config.notify_all_disconnect:
+            return False
+
+        return await self._send(
+            title="RESOLVED: Directory Servers Reconnected",
+            body=(
+                f"Reconnected to directory servers ({connected_count}/{total_count}).\n"
+                "CoinJoins are possible again."
+            ),
+            priority=NotificationPriority.SUCCESS,
+        )
+
     async def notify_directory_reconnect(
         self,
         server: str,

@@ -1016,6 +1016,71 @@ class TestDirectoryReconnection:
         # dir2 and dir3 get new clients via connect()
         assert "dir1.onion:5222" in maker_bot.directory_clients
 
+    def test_all_directories_disconnected_initialized_false(self, maker_bot):
+        """_all_directories_disconnected flag starts as False."""
+        assert maker_bot._all_directories_disconnected is False
+
+    @pytest.mark.asyncio
+    async def test_recovery_notification_sent_when_all_directories_were_disconnected(
+        self, maker_bot
+    ):
+        """Recovery notification is sent when reconnecting after all-disconnect state."""
+        from unittest.mock import AsyncMock, patch
+
+        maker_bot._all_directories_disconnected = True
+
+        mock_client = MagicMock()
+        mock_client.connect = AsyncMock()
+        mock_client.announce_orders = AsyncMock()
+        mock_client.node_id = "dir1.onion:5222"
+
+        recovery_notify = AsyncMock(return_value=True)
+        reconnect_notify = AsyncMock(return_value=True)
+
+        with (
+            patch("maker.background_tasks.DirectoryClient", return_value=mock_client),
+            patch("maker.background_tasks.get_notifier") as mock_get_notifier,
+        ):
+            mock_notifier = MagicMock()
+            mock_notifier.notify_directory_reconnect = reconnect_notify
+            mock_notifier.notify_all_directories_reconnected = recovery_notify
+            mock_get_notifier.return_value = mock_notifier
+
+            await maker_bot._periodic_directory_reconnect()
+
+        assert maker_bot._all_directories_disconnected is False
+        recovery_notify.assert_called_once()
+        call_args = recovery_notify.call_args
+        connected_count = call_args[0][0] if call_args[0] else call_args[1].get("connected_count")
+        assert connected_count >= 1
+
+    @pytest.mark.asyncio
+    async def test_recovery_notification_not_sent_when_no_all_disconnect_state(self, maker_bot):
+        """Recovery notification is NOT fired when _all_directories_disconnected is False."""
+        from unittest.mock import AsyncMock, patch
+
+        maker_bot._all_directories_disconnected = False
+
+        mock_client = MagicMock()
+        mock_client.connect = AsyncMock()
+        mock_client.announce_orders = AsyncMock()
+        mock_client.node_id = "dir1.onion:5222"
+
+        recovery_notify = AsyncMock(return_value=True)
+
+        with (
+            patch("maker.background_tasks.DirectoryClient", return_value=mock_client),
+            patch("maker.background_tasks.get_notifier") as mock_get_notifier,
+        ):
+            mock_notifier = MagicMock()
+            mock_notifier.notify_directory_reconnect = AsyncMock(return_value=True)
+            mock_notifier.notify_all_directories_reconnected = recovery_notify
+            mock_get_notifier.return_value = mock_notifier
+
+            await maker_bot._periodic_directory_reconnect()
+
+        recovery_notify.assert_not_called()
+
     def test_config_startup_timeout_default(self):
         """Test default startup timeout value."""
         config = MakerConfig(

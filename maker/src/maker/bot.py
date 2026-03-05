@@ -137,6 +137,10 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         # Key: node_id (host:port), Value: number of reconnection attempts
         self._directory_reconnect_attempts: dict[str, int] = {}
 
+        # Track whether all directories were previously disconnected, so we can
+        # send a recovery notification when at least one reconnects
+        self._all_directories_disconnected: bool = False
+
         # Track last log time for rate-limited logging
         # Key: log_key, Value: timestamp of last log
         self._rate_limited_log_times: dict[str, float] = {}
