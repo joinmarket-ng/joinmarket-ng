@@ -494,9 +494,11 @@ async def _send_transaction(
             change_key = wallet.get_key_for_address(change_addr)
             if change_key:
                 if address_type == "p2tr":
-                    change_script = create_p2tr_scriptpubkey(
-                        change_key.get_public_key_bytes(compressed=True)[1:].hex()
-                    )
+                    from jmcore.bitcoin import taproot_tweak_pubkey
+
+                    x_only = change_key.get_public_key_bytes(compressed=True)[1:]
+                    tweaked = taproot_tweak_pubkey(x_only)
+                    change_script = create_p2tr_scriptpubkey(tweaked.hex())
                 else:
                     change_script = pubkey_to_p2wpkh_script(
                         change_key.get_public_key_bytes(compressed=True).hex()
