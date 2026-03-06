@@ -1428,6 +1428,36 @@ class Taker(TakerMonitoringMixin):
         return PhaseResult(
             success=True, failed_makers=failed_makers, blacklist_error=blacklist_error
         )
+    def _validate_maker_address_types(self, nick: str, cj_addr: str, change_addr: str) -> bool:
+        """
+        Validate that a maker's CoinJoin and change addresses match the taker's
+        address type. Mixed address types (P2WPKH + P2TR) in a CoinJoin make it
+        trivial to distinguish taker vs maker outputs.
+
+        Returns:
+            True if addresses are valid/compatible, False if they should be rejected.
+        """
+        taker_is_taproot = self.wallet.address_type == "p2tr"
+        p2tr_prefixes = ("bc1p", "tb1p", "bcrt1p")
+        maker_cj_is_taproot = cj_addr.startswith(p2tr_prefixes)
+        maker_change_is_taproot = change_addr.startswith(p2tr_prefixes)
+
+        if taker_is_taproot and (not maker_cj_is_taproot or not maker_change_is_taproot):
+            logger.warning(
+                f"Rejecting maker {nick}: taker uses P2TR but maker "
+                f"sent non-Taproot addresses (cj={cj_addr[:16]}..., "
+                f"change={change_addr[:16]}...)"
+            )
+            return False
+        elif not taker_is_taproot and (maker_cj_is_taproot or maker_change_is_taproot):
+            logger.warning(
+                f"Rejecting maker {nick}: taker uses P2WPKH but maker "
+                f"sent Taproot addresses (cj={cj_addr[:16]}..., "
+                f"change={change_addr[:16]}...)"
+            )
+            return False
+        return True
+
 
     async def _phase_auth(self) -> PhaseResult:
         """Send !auth with PoDLE proof and wait for !ioauth responses.
@@ -1697,6 +1727,7 @@ class Taker(TakerMonitoringMixin):
                     session.change_address = change_addr
                     session.auth_pubkey = auth_pub  # Store for later verification
                     session.responded_auth = True
+
 
                     if not self._validate_maker_address_types(nick, cj_addr, change_addr):
                         failed_makers.append(nick)
