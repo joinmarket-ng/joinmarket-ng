@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Taproot Support (BIP341)**: Added full support for Taproot (P2TR) across the protocol and wallet components.
+  - **Taker and Maker Negotiaton**: Takers can now negotiate output address types (P2TR or P2WPKH) with makers via an extension to the `!fill` message. Takers filter out makers whose address types differ to preserve privacy.
+  - **Taproot Wallet & Signing**: Unified `jmwallet` descriptor support to create and handle Taproot key paths. Signing logic correctly performs BIP341 keypath spending via `sign_p2tr_input`.
+  - **CLI Options**: Added `--address-type p2tr` flags to CLI commands such as `jm-maker start`, `jm-taker coinjoin`, and `jm-wallet send`. Changes default to `p2wpkh`.
+
 ### Changed
 
 - **Ephemeral-identity PoDLE commitment broadcast**: Commitment broadcasts (`!hp2`) are now sent from a fresh random nick on a separate Tor circuit, rather than from the maker's long-lived identity. After verifying a taker's PoDLE proof, the maker opens ephemeral connections to all directory servers using unique SOCKS5 credentials (forcing stream isolation) and a random nick identity, broadcasts the commitment, then tears down the connections. This prevents any party from correlating the `!hp2` broadcast with the maker that participated in the CoinJoin. The same ephemeral approach is used when relaying `!hp2` requests from other makers. Concurrent ephemeral broadcasts are capped at 2 via a semaphore to prevent Sybil DoS attacks.
