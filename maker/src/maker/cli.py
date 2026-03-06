@@ -302,7 +302,7 @@ def build_maker_config(
         bitcoin_network=effective_bitcoin_network,
         data_dir=effective_data_dir,
         backend_type=effective_backend_type,
-        address_type=address_type if address_type is not None else settings.wallet.address_type,
+        address_type=address_type if address_type is not None else "p2wpkh",
         backend_config=backend_config,
         directory_servers=dir_servers,
         socks_host=effective_socks_host,
