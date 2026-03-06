@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -23,6 +24,13 @@ def ws_client(
     pair = daemon_state_with_wallet.token_authority.issue("test_wallet.jmdat")
     client = TestClient(application)
     return client, pair.token
+
+
+def _wait_for_ws_client(state: DaemonState, *, timeout: float = 5.0) -> None:
+    """Block until the WebSocket endpoint has registered at least one client queue."""
+    deadline = time.monotonic() + timeout
+    while not state._ws_clients and time.monotonic() < deadline:
+        time.sleep(0.05)
 
 
 class TestWebSocketAuth:
@@ -48,6 +56,7 @@ class TestWebSocketNotifications:
 
         with client.websocket_connect("/api/v1/ws") as ws:
             ws.send_text(token)
+            _wait_for_ws_client(state)
             # Broadcast a coinjoin state change
             state.activate_coinjoin_state(CoinjoinState.NOT_RUNNING)
             # Read the notification
@@ -62,6 +71,7 @@ class TestWebSocketNotifications:
 
         with client.websocket_connect("/api/v1/ws") as ws:
             ws.send_text(token)
+            _wait_for_ws_client(state)
             state.broadcast_ws({"txid": "abc123", "txdetails": {"amount": 100_000}})
             msg = ws.receive_text()
             data = json.loads(msg)
