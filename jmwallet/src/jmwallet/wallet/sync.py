@@ -481,6 +481,18 @@ class WalletSyncMixin:
             descriptors.append({"desc": desc_int, "range": [0, scan_range - 1]})
             desc_to_path[desc_int] = (mixdepth, 1)
 
+            if self.address_type == "p2tr":
+                # Also import wpkh() descriptors over the same BIP86 paths so
+                # that P2WPKH addresses generated for legacy CoinJoin takers
+                # are discoverable on rescan.
+                wpkh_ext = f"wpkh({xpub}/0/*)"
+                descriptors.append({"desc": wpkh_ext, "range": [0, scan_range - 1]})
+                desc_to_path[wpkh_ext] = (mixdepth, 0)
+
+                wpkh_int = f"wpkh({xpub}/1/*)"
+                descriptors.append({"desc": wpkh_int, "range": [0, scan_range - 1]})
+                desc_to_path[wpkh_int] = (mixdepth, 1)
+
         # Add fidelity bond addresses to the scan
         if fidelity_bond_addresses:
             expected_hrp = get_hrp(self.network)

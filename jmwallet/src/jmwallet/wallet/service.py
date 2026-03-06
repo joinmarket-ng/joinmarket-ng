@@ -188,6 +188,13 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin):
             # Internal (change) addresses: .../1/*
             descriptors.append({"desc": f"{wrapper}({xpub}/1/*)", "range": [0, scan_range - 1]})
 
+            if self.address_type == "p2tr":
+                # Also import wpkh() descriptors over the same BIP86 paths so
+                # that P2WPKH addresses generated for legacy CoinJoin takers
+                # are discoverable on rescan.
+                descriptors.append({"desc": f"wpkh({xpub}/0/*)", "range": [0, scan_range - 1]})
+                descriptors.append({"desc": f"wpkh({xpub}/1/*)", "range": [0, scan_range - 1]})
+
         logger.debug(
             f"Generated {len(descriptors)} descriptors for {self.mixdepth_count} mixdepths "
             f"with range [0, {scan_range - 1}]"

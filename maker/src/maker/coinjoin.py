@@ -575,30 +575,54 @@ class CoinJoinSession:
             cj_index = self.wallet.get_next_address_index(cj_output_mixdepth, 1)
             change_index = self.wallet.get_next_address_index(max_mixdepth, 1)
 
-            # If the taker requested a specific address type (e.g., P2TR), generate
-            # addresses of that type. This ensures all CoinJoin outputs have uniform
-            # address types — critical for privacy.
-            addr_type = self.requested_address_type or self.wallet.address_type
-            if addr_type == "p2tr":
+            # Determine which address type to use for our CoinJoin outputs.
+            #
+            # Default to p2wpkh (NOT the wallet's own type) when the taker
+            # doesn't negotiate address_type.  A P2TR maker that blindly
+            # emits P2TR outputs for a legacy taker would produce the *only*
+            # non-P2WPKH equal-amount output in the transaction — a
+            # fingerprint that destroys CoinJoin privacy.
+            #
+            # When the taker explicitly requests P2TR we honour it, but only
+            # if our wallet actually uses P2TR descriptors.  Generating P2TR
+            # addresses from a P2WPKH wallet is unsafe: those outputs fall
+            # outside the wallet's wpkh() descriptors and become
+            # unrecoverable after a restart / rescan.
+            addr_type = self.requested_address_type or "p2wpkh"
+
+            if addr_type == "p2tr" and self.wallet.address_type != "p2tr":
+                raise ValueError(
+                    f"Taker requested address_type='p2tr' but this maker "
+                    f"wallet uses '{self.wallet.address_type}'. Rejecting "
+                    f"CoinJoin to avoid unrecoverable outputs."
+                )
+
+            if addr_type == self.wallet.address_type:
+                # Common path: requested type matches wallet type (or both
+                # default to p2wpkh).  Use the wallet's own address generation.
+                cj_address = self.wallet.get_change_address(cj_output_mixdepth, cj_index)
+                change_address = self.wallet.get_change_address(max_mixdepth, change_index)
+            else:
+                # Cross-type path: P2TR wallet serving a legacy taker that
+                # needs P2WPKH outputs.  Derive the same BIP86 keys but
+                # encode them as P2WPKH.  The wallet imports wpkh()
+                # descriptors over BIP86 paths at startup so these addresses
+                # are recoverable on rescan.
                 cj_key = self.wallet.master_key.derive(
                     f"{self.wallet.root_path}/{cj_output_mixdepth}'/1/{cj_index}"
                 )
-                cj_address = cj_key.get_p2tr_address(self.wallet.network)
-                # Cache the address so get_key_for_address works during signing
+                cj_address = cj_key.get_address(self.wallet.network)
                 self.wallet.address_cache[cj_address] = (cj_output_mixdepth, 1, cj_index)
 
                 change_key = self.wallet.master_key.derive(
                     f"{self.wallet.root_path}/{max_mixdepth}'/1/{change_index}"
                 )
-                change_address = change_key.get_p2tr_address(self.wallet.network)
+                change_address = change_key.get_address(self.wallet.network)
                 self.wallet.address_cache[change_address] = (max_mixdepth, 1, change_index)
                 logger.info(
-                    f"Using P2TR addresses per taker request: "
+                    f"P2TR wallet generating P2WPKH addresses for legacy taker: "
                     f"cj={cj_address[:16]}..., change={change_address[:16]}..."
                 )
-            else:
-                cj_address = self.wallet.get_change_address(cj_output_mixdepth, cj_index)
-                change_address = self.wallet.get_change_address(max_mixdepth, change_index)
 
             # Reserve addresses immediately after selection to prevent reuse
             # in concurrent CoinJoin sessions. Once shared with a taker, addresses
