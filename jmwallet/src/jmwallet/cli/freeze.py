@@ -66,6 +66,9 @@ def freeze(
         str | None,
         typer.Option("--log-level", "-l", help="Log level"),
     ] = None,
+    address_type: Annotated[
+        str, typer.Option("--address-type", "-A", help="Address type: p2wpkh (default) or p2tr")
+    ] = "p2wpkh",
 ) -> None:
     """Interactively freeze/unfreeze UTXOs to exclude them from coin selection.
 
@@ -105,6 +108,7 @@ def freeze(
             backend,
             resolved_bip39_passphrase,
             mixdepth_filter=mixdepth,
+            address_type=address_type,
         )
     )
 
@@ -114,6 +118,7 @@ async def _freeze_utxos(
     backend_settings: ResolvedBackendSettings,
     bip39_passphrase: str = "",
     mixdepth_filter: int | None = None,
+    address_type: str = "p2wpkh",
 ) -> None:
     """Interactive UTXO freeze/unfreeze implementation."""
     from jmwallet.backends.bitcoin_core import BitcoinCoreBackend
@@ -156,7 +161,7 @@ async def _freeze_utxos(
         )
 
         fingerprint = get_mnemonic_fingerprint(mnemonic, bip39_passphrase or "")
-        wallet_name = generate_wallet_name(fingerprint, network)
+        wallet_name = generate_wallet_name(fingerprint, network, address_type)
         backend = DescriptorWalletBackend(
             rpc_url=backend_settings.rpc_url,
             rpc_user=backend_settings.rpc_user,
@@ -179,6 +184,7 @@ async def _freeze_utxos(
         mixdepth_count=5,
         passphrase=bip39_passphrase,
         data_dir=data_dir,
+        address_type=address_type,
     )
 
     try:

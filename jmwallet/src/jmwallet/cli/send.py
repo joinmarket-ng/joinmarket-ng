@@ -81,6 +81,9 @@ def send(
         str | None,
         typer.Option("--log-level", "-l", help="Log level"),
     ] = None,
+    address_type: Annotated[
+        str, typer.Option("--address-type", "-A", help="Address type: p2wpkh (default) or p2tr")
+    ] = "p2wpkh",
 ) -> None:
     """Send a simple transaction from wallet to an address."""
     settings = setup_cli(log_level)
@@ -132,6 +135,7 @@ def send(
             yes,
             select_utxos,
             resolved_bip39_passphrase,
+            address_type=address_type,
         )
     )
 
@@ -148,6 +152,7 @@ async def _send_transaction(
     skip_confirmation: bool,
     interactive_utxo_selection: bool,
     bip39_passphrase: str = "",
+    address_type: str = "p2wpkh",
 ) -> None:
     """Send transaction implementation."""
     import math
@@ -168,6 +173,7 @@ async def _send_transaction(
         encode_varint,
         sign_p2wpkh_input,
         sign_p2wsh_input,
+        sign_p2tr_input,
     )
 
     # Load fidelity bond addresses from registry
@@ -194,7 +200,7 @@ async def _send_transaction(
             return
     elif backend_settings.backend_type == "descriptor_wallet":
         fingerprint = get_mnemonic_fingerprint(mnemonic, bip39_passphrase)
-        wallet_name = generate_wallet_name(fingerprint, backend_settings.network)
+        wallet_name = generate_wallet_name(fingerprint, backend_settings.network, address_type)
         backend = DescriptorWalletBackend(
             rpc_url=backend_settings.rpc_url,
             rpc_user=backend_settings.rpc_user,
@@ -251,6 +257,7 @@ async def _send_transaction(
         mixdepth_count=5,
         passphrase=bip39_passphrase,
         data_dir=backend_settings.data_dir,
+        address_type=address_type,
     )
 
     try:
@@ -348,12 +355,12 @@ async def _send_transaction(
             logger.warning(f"Could not determine address type for {destination}, assuming P2WPKH")
             dest_type = "p2wpkh"
 
-        input_types = ["p2wpkh"] * num_inputs
+        input_types = [address_type] * num_inputs
         output_types = [dest_type]
 
         # Initial assumption: we have change if not sweeping
         if amount > 0:
-            output_types.append("p2wpkh")  # Change is always P2WPKH
+            output_types.append(address_type)  # Change matches wallet address type
 
         estimated_vsize = estimate_vsize(input_types, output_types)
         estimated_fee = math.ceil(estimated_vsize * resolved_fee_rate)
@@ -417,6 +424,7 @@ async def _send_transaction(
         from bitcointx.wallet import CCoinAddress, CCoinAddressError
 
         from jmwallet.wallet.address import pubkey_to_p2wpkh_script
+        from jmcore.bitcoin import create_p2tr_scriptpubkey
 
         # Convert destination to scriptPubKey — CCoinAddress validates the
         # bech32 checksum, rejects wrong-network addresses, and handles all
@@ -485,9 +493,14 @@ async def _send_transaction(
             change_addr = wallet.get_change_address(mixdepth, change_index)
             change_key = wallet.get_key_for_address(change_addr)
             if change_key:
-                change_script = pubkey_to_p2wpkh_script(
-                    change_key.get_public_key_bytes(compressed=True).hex()
-                )
+                if address_type == "p2tr":
+                    change_script = create_p2tr_scriptpubkey(
+                        change_key.get_x_only_public_key().hex()
+                    )
+                else:
+                    change_script = pubkey_to_p2wpkh_script(
+                        change_key.get_public_key_bytes(compressed=True).hex()
+                    )
                 outputs_data.extend(change_amount.to_bytes(8, "little"))
                 outputs_data.extend(encode_varint(len(change_script)))
                 outputs_data.extend(change_script)
@@ -528,6 +541,30 @@ async def _send_transaction(
                     private_key=key.private_key,
                 )
                 witnesses.append(create_p2wsh_witness_stack(signature, witness_script))
+            elif utxo.is_p2tr:
+                # Taproot signing
+                # Need all prevouts scripts and values
+                from jmcore.bitcoin import (
+                    address_to_scriptpubkey,
+                    taproot_tweak_privkey,
+                )
+                import coincurve
+
+                prevouts_values = [u.value for u in utxos]
+                prevouts_scripts = [address_to_scriptpubkey(u.address) for u in utxos]
+
+                # Tweak private key for key-path spend
+                tweaked_priv_bytes = taproot_tweak_privkey(key.private_key.secret)
+                tweaked_priv = coincurve.PrivateKey(tweaked_priv_bytes)
+
+                signature = sign_p2tr_input(
+                    tx=tx,
+                    input_index=i,
+                    prevouts_values=prevouts_values,
+                    prevouts_scripts=prevouts_scripts,
+                    private_key=tweaked_priv,
+                )
+                witnesses.append([signature])
             elif utxo.is_p2wsh:
                 # P2WSH UTXO detected but locktime not known - this shouldn't happen
                 # if the wallet was synced correctly with fidelity bond locktimes
