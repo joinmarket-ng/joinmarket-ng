@@ -257,6 +257,7 @@ This implementation uses feature flags instead of protocol version bumps to enab
 |---------|-------------|
 | `extended_peerlist` | Supports extended peerlist format with feature flags in `F:` field |
 | `neutrino_compat` | Supports extended UTXO format with scriptPubKey and blockheight |
+| `taproot` | Supports Taproot (P2TR) address type negotiation in CoinJoin |
 
 **Extended Peerlist Format:**
 
@@ -285,5 +286,44 @@ Extended UTXO format includes scriptPubKey + block height for verification:
 ```
 
 The `features` dict is ignored by reference implementation but preserved for our peers.
+
+### Taproot Address-Type Negotiation
+
+Taproot (P2TR / BIP86) support is negotiated per-CoinJoin session via an optional `address_type` field in the `!fill` message. This design ensures backward compatibility -- legacy peers that don't understand the field simply ignore it.
+
+**Negotiation Flow:**
+
+1. Taker sends `!fill` with optional `address_type=p2tr` field
+2. Maker checks if it supports the requested type
+3. If supported: maker generates P2TR output addresses (bech32m)
+4. If not supported or field absent: maker defaults to P2WPKH (bech32)
+
+**Key Design Decisions:**
+
+- The `address_type` field defaults to `p2wpkh` when absent, ensuring backward compatibility
+- A P2TR-configured maker always falls back to `p2wpkh` when the taker doesn't request `p2tr`, so legacy takers work with P2TR makers
+- All equal-amount CoinJoin outputs use the same address type for privacy (mixing P2TR and P2WPKH outputs would be a privacy leak)
+- Change outputs follow the same address type as the CoinJoin outputs
+
+**Interoperability Matrix:**
+
+| Our Role | Peer | Address Type | Result |
+|----------|------|-------------|--------|
+| P2WPKH Taker | Reference Maker | p2wpkh | Works (standard flow) |
+| P2TR Taker | Reference Maker | p2tr | Taker filters out incompatible makers |
+| P2WPKH Taker | Our P2TR Maker | p2wpkh | Works (maker falls back to p2wpkh) |
+| P2TR Taker | Our P2TR Maker | p2tr | Works (full taproot CoinJoin) |
+| Reference Taker | Our P2WPKH Maker | p2wpkh | Works (standard flow) |
+| Reference Taker | Our P2TR Maker | p2wpkh | Works (maker falls back to p2wpkh) |
+
+**Signing Differences:**
+
+P2TR inputs use BIP341 key-path spending with Schnorr signatures:
+
+- Sighash: BIP341 (single SHA-256 + tagged hash, commits to ALL prevout values/scripts)
+- Signature: 64-byte Schnorr (SIGHASH_DEFAULT) or 65-byte (with explicit sighash byte)
+- Witness: Single element `[signature]` (no pubkey, unlike P2WPKH's `[signature, pubkey]`)
+
+P2WPKH inputs continue to use BIP143 sighash with DER-encoded ECDSA signatures.
 
 ---
