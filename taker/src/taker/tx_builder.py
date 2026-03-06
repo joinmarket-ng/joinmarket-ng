@@ -286,104 +286,122 @@ def build_coinjoin_tx(
     Returns:
         (tx_bytes, metadata)
     """
-    builder = CoinJoinTxBuilder(network)
+    try:
+        builder = CoinJoinTxBuilder(network)
 
-    # Build taker inputs
-    taker_inputs = [
-        TxInput.from_hex(
-            txid=u["txid"],
-            vout=u["vout"],
-            value=u["value"],
-            scriptpubkey=u.get("scriptpubkey", ""),
-        )
-        for u in taker_utxos
-    ]
-
-    # Calculate taker's fees paid to makers
-    total_maker_fee = sum(m["cjfee"] for m in maker_data.values())
-
-    # Taker's change = total_input - cj_amount - maker_fees - tx_fee
-    taker_change = taker_total_input - cj_amount - total_maker_fee - tx_fee
-
-    # Taker CJ output
-    taker_cj_output = TxOutput.from_address(taker_cj_address, cj_amount)
-
-    # Taker change output (if any)
-    taker_change_output = None
-    if taker_change > dust_threshold and taker_change_address:
-        taker_change_output = TxOutput.from_address(taker_change_address, taker_change)
-    elif taker_change > 0:
-        logger.warning(
-            f"Taker change {taker_change} sats "
-            + (
-                "has no address (sweep mode)"
-                if not taker_change_address
-                else f"is below dust threshold ({dust_threshold})"
+        # Build taker inputs
+        taker_inputs = []
+        for i, u in enumerate(taker_utxos):
+            if u.get("txid") is None:
+                logger.error(f"Taker UTXO {i} has None txid")
+            if u.get("value") is None:
+                logger.error(f"Taker UTXO {i} has None value")
+            taker_inputs.append(
+                TxInput.from_hex(
+                    txid=u["txid"],
+                    vout=u["vout"],
+                    value=u["value"],
+                    scriptpubkey=u.get("scriptpubkey", ""),
+                )
             )
-            + ", no change output will be created"
-        )
 
-    # Build maker data
-    maker_inputs: dict[str, list[TxInput]] = {}
-    maker_cj_outputs: dict[str, TxOutput] = {}
-    maker_change_outputs: dict[str, TxOutput] = {}
+        # Calculate taker's fees paid to makers
+        total_maker_fee = sum(m["cjfee"] for m in maker_data.values())
 
-    for nick, data in maker_data.items():
-        # Maker inputs
-        maker_inputs[nick] = [
-            TxInput.from_hex(
-                txid=u["txid"],
-                vout=u["vout"],
-                value=u["value"],
-                scriptpubkey=u.get("scriptpubkey", ""),
-            )
-            for u in data["utxos"]
-        ]
+        # Taker's change = total_input - cj_amount - maker_fees - tx_fee
+        taker_change = taker_total_input - cj_amount - total_maker_fee - tx_fee
 
-        # Maker CJ output (cj_amount)
-        maker_cj_outputs[nick] = TxOutput.from_address(data["cj_addr"], cj_amount)
+        # Taker CJ output
+        taker_cj_output = TxOutput.from_address(taker_cj_address, cj_amount)
 
-        # Maker change output
-        # Formula: change = inputs - cj_amount - txfee + cjfee
-        # (Maker pays txfee, receives cjfee from taker)
-        maker_total_input = sum(u["value"] for u in data["utxos"])
-        maker_txfee = data.get("txfee", 0)
-        maker_change = maker_total_input - cj_amount - maker_txfee + data["cjfee"]
-
-        logger.debug(
-            f"Maker {nick} change calculation: "
-            f"inputs={maker_total_input}, cj_amount={cj_amount}, "
-            f"cjfee={data['cjfee']}, txfee={maker_txfee}, change={maker_change}, "
-            f"dust_threshold={dust_threshold}"
-        )
-
-        if maker_change < 0:
-            # Negative change means maker's UTXOs are insufficient
-            # This can happen if UTXO verification failed (value=0) or if UTXOs were spent
-            raise ValueError(
-                f"Maker {nick} has insufficient funds: inputs={maker_total_input} sats, "
-                f"required={cj_amount + maker_txfee - data['cjfee']} sats, "
-                f"change={maker_change} sats. Maker's UTXOs may have been spent."
-            )
-        elif maker_change > dust_threshold:
-            maker_change_outputs[nick] = TxOutput.from_address(data["change_addr"], maker_change)
-        else:
+        # Taker change output (if any)
+        taker_change_output = None
+        if taker_change > dust_threshold and taker_change_address:
+            taker_change_output = TxOutput.from_address(taker_change_address, taker_change)
+        elif taker_change > 0:
             logger.warning(
-                f"Maker {nick} change {maker_change} sats is below dust threshold "
-                f"({dust_threshold}), "
-                "no change output will be created"
+                f"Taker change {taker_change} sats "
+                + (
+                    "has no address (sweep mode)"
+                    if not taker_change_address
+                    else f"is below dust threshold ({dust_threshold})"
+                )
+                + ", no change output will be created"
             )
 
-    tx_data = CoinJoinTxData(
-        taker_inputs=taker_inputs,
-        taker_cj_output=taker_cj_output,
-        taker_change_output=taker_change_output,
-        maker_inputs=maker_inputs,
-        maker_cj_outputs=maker_cj_outputs,
-        maker_change_outputs=maker_change_outputs,
-        cj_amount=cj_amount,
-        total_maker_fee=total_maker_fee,
-        tx_fee=tx_fee,
-    )
+        # Build maker data
+        maker_inputs: dict[str, list[TxInput]] = {}
+        maker_cj_outputs: dict[str, TxOutput] = {}
+        maker_change_outputs: dict[str, TxOutput] = {}
 
-    return builder.build_unsigned_tx(tx_data)
+        for nick, data in maker_data.items():
+            # Maker inputs
+            inputs = []
+            for i, u in enumerate(data["utxos"]):
+                if u.get("txid") is None:
+                    logger.error(f"Maker {nick} UTXO {i} has None txid")
+                if u.get("value") is None:
+                    logger.error(f"Maker {nick} UTXO {i} has None value")
+                inputs.append(
+                    TxInput.from_hex(
+                        txid=u["txid"],
+                        vout=u["vout"],
+                        value=u["value"],
+                        scriptpubkey=u.get("scriptpubkey", ""),
+                    )
+                )
+            maker_inputs[nick] = inputs
+
+            # Maker CJ output (cj_amount)
+            maker_cj_outputs[nick] = TxOutput.from_address(data["cj_addr"], cj_amount)
+
+            # Maker change output
+            # Formula: change = inputs - cj_amount - txfee + cjfee
+            # (Maker pays txfee, receives cjfee from taker)
+            maker_total_input = sum(u["value"] for u in data["utxos"])
+            maker_txfee = data.get("txfee", 0)
+            maker_change = maker_total_input - cj_amount - maker_txfee + data["cjfee"]
+
+            logger.debug(
+                f"Maker {nick} change calculation: "
+                f"inputs={maker_total_input}, cj_amount={cj_amount}, "
+                f"cjfee={data['cjfee']}, txfee={maker_txfee}, change={maker_change}, "
+                f"dust_threshold={dust_threshold}"
+            )
+
+            if maker_change < 0:
+                # Negative change means maker's UTXOs are insufficient
+                # This can happen if UTXO verification failed (value=0) or if UTXOs were spent
+                raise ValueError(
+                    f"Maker {nick} has insufficient funds: inputs={maker_total_input} sats, "
+                    f"required={cj_amount + maker_txfee - data['cjfee']} sats, "
+                    f"change={maker_change} sats. Maker's UTXOs may have been spent."
+                )
+            elif maker_change > dust_threshold:
+                maker_change_outputs[nick] = TxOutput.from_address(data["change_addr"], maker_change)
+            else:
+                logger.warning(
+                    f"Maker {nick} change {maker_change} sats is below dust threshold "
+                    f"({dust_threshold}), "
+                    "no change output will be created"
+                )
+
+        tx_data = CoinJoinTxData(
+            taker_inputs=taker_inputs,
+            taker_cj_output=taker_cj_output,
+            taker_change_output=taker_change_output,
+            maker_inputs=maker_inputs,
+            maker_cj_outputs=maker_cj_outputs,
+            maker_change_outputs=maker_change_outputs,
+            cj_amount=cj_amount,
+            total_maker_fee=total_maker_fee,
+            tx_fee=tx_fee,
+        )
+
+        return builder.build_unsigned_tx(tx_data)
+    except Exception as e:
+        import traceback
+
+        logger.error(f"Failed to build transaction: {e}")
+        logger.error(traceback.format_exc())
+        raise
