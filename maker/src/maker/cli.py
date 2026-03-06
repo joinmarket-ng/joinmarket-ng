@@ -58,6 +58,7 @@ def build_maker_config(
     tor_control_port: int | None = None,
     tor_cookie_path: Path | None = None,
     disable_tor_control: bool = False,
+    address_type: str | None = None,
     onion_serving_host: str | None = None,
     onion_serving_port: int | None = None,
     tor_target_host: str | None = None,
@@ -303,6 +304,7 @@ def build_maker_config(
         bitcoin_network=effective_bitcoin_network,
         data_dir=effective_data_dir,
         backend_type=effective_backend_type,
+        address_type=address_type if address_type is not None else settings.wallet.address_type,
         backend_config=backend_config,
         directory_servers=dir_servers,
         socks_host=effective_socks_host,
@@ -361,7 +363,7 @@ def create_wallet_service(config: MakerConfig) -> WalletService:
         network_str = (
             bitcoin_network.value if hasattr(bitcoin_network, "value") else str(bitcoin_network)
         )
-        wallet_name = generate_wallet_name(fingerprint, network_str)
+        wallet_name = generate_wallet_name(fingerprint, network_str, config.address_type)
         backend = DescriptorWalletBackend(
             rpc_url=backend_cfg.get("rpc_url", "http://127.0.0.1:8332"),
             rpc_user=backend_cfg.get("rpc_user", ""),
@@ -389,12 +391,13 @@ def create_wallet_service(config: MakerConfig) -> WalletService:
 
     wallet = WalletService(
         mnemonic=config.mnemonic.get_secret_value(),
+        passphrase=config.passphrase.get_secret_value(),
         backend=backend,
         network=bitcoin_network.value,
         mixdepth_count=config.mixdepth_count,
         gap_limit=config.gap_limit,
-        passphrase=config.passphrase.get_secret_value(),
         data_dir=config.data_dir,
+        address_type=config.address_type,
     )
     return wallet
 
@@ -575,6 +578,9 @@ def start(
         str | None,
         typer.Option("--log-level", "-l", help="Log level"),
     ] = None,
+    address_type: Annotated[
+        str, typer.Option("--address-type", "-A", help="Address type: p2wpkh (default) or p2tr")
+    ] = "p2wpkh",
 ) -> None:
     """
     Start the maker bot.
@@ -620,6 +626,7 @@ def start(
             tor_control_port=tor_control_port,
             tor_cookie_path=tor_cookie_path,
             disable_tor_control=disable_tor_control,
+            address_type=address_type,
             onion_serving_host=onion_serving_host,
             onion_serving_port=onion_serving_port,
             tor_target_host=tor_target_host,
@@ -722,6 +729,9 @@ def generate_address(
         str | None,
         typer.Option("--log-level", "-l", help="Log level"),
     ] = None,
+    address_type: Annotated[
+        str, typer.Option("--address-type", "-A", help="Address type: p2wpkh (default) or p2tr")
+    ] = "p2wpkh",
 ) -> None:
     """Generate a new receive address."""
     # Load settings (log_level=None means use settings.logging.level)
@@ -749,6 +759,7 @@ def generate_address(
             network=network,
             bitcoin_network=bitcoin_network,
             backend_type=backend_type,
+            address_type=address_type,
         )
     except ValueError as e:
         logger.error(str(e))

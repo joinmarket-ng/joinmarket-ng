@@ -22,6 +22,7 @@ from jmcore.protocol import (
     UTXOMetadata,
     format_utxo_list,
 )
+from jmcore.bitcoin import taproot_tweak_pubkey, encode_varint
 from jmwallet.backends.base import BlockchainBackend
 from jmwallet.wallet.models import UTXOInfo
 from jmwallet.wallet.service import WalletService
@@ -30,6 +31,7 @@ from jmwallet.wallet.signing import (
     create_p2wpkh_script_code,
     deserialize_transaction,
     sign_p2wpkh_input,
+    sign_p2tr_input,
 )
 from loguru import logger
 
@@ -68,6 +70,7 @@ class CoinJoinSession:
         taker_utxo_amtpercent: int = 20,
         session_timeout_sec: int = 300,
         merge_algorithm: str = "default",
+        requested_address_type: str | None = None,
     ):
         self.taker_nick = taker_nick
         self.offer = offer
@@ -78,6 +81,8 @@ class CoinJoinSession:
         self.taker_utxo_age = taker_utxo_age
         self.taker_utxo_amtpercent = taker_utxo_amtpercent
         self.merge_algorithm = merge_algorithm  # UTXO selection strategy
+        # Address type requested by taker (None = use wallet default)
+        self.requested_address_type = requested_address_type
 
         self.state = CoinJoinState.IDLE
         self.amount = 0
@@ -568,10 +573,32 @@ class CoinJoinSession:
 
             cj_output_mixdepth = (max_mixdepth + 1) % self.wallet.mixdepth_count
             cj_index = self.wallet.get_next_address_index(cj_output_mixdepth, 1)
-            cj_address = self.wallet.get_change_address(cj_output_mixdepth, cj_index)
-
             change_index = self.wallet.get_next_address_index(max_mixdepth, 1)
-            change_address = self.wallet.get_change_address(max_mixdepth, change_index)
+
+            # If the taker requested a specific address type (e.g., P2TR), generate
+            # addresses of that type. This ensures all CoinJoin outputs have uniform
+            # address types — critical for privacy.
+            addr_type = self.requested_address_type or self.wallet.address_type
+            if addr_type == "p2tr":
+                cj_key = self.wallet.master_key.derive(
+                    f"{self.wallet.root_path}/{cj_output_mixdepth}'/1/{cj_index}"
+                )
+                cj_address = cj_key.get_p2tr_address(self.wallet.network)
+                # Cache the address so get_key_for_address works during signing
+                self.wallet.address_cache[cj_address] = (cj_output_mixdepth, 1, cj_index)
+
+                change_key = self.wallet.master_key.derive(
+                    f"{self.wallet.root_path}/{max_mixdepth}'/1/{change_index}"
+                )
+                change_address = change_key.get_p2tr_address(self.wallet.network)
+                self.wallet.address_cache[change_address] = (max_mixdepth, 1, change_index)
+                logger.info(
+                    f"Using P2TR addresses per taker request: "
+                    f"cj={cj_address[:16]}..., change={change_address[:16]}..."
+                )
+            else:
+                cj_address = self.wallet.get_change_address(cj_output_mixdepth, cj_index)
+                change_address = self.wallet.get_change_address(max_mixdepth, change_index)
 
             # Reserve addresses immediately after selection to prevent reuse
             # in concurrent CoinJoin sessions. Once shared with a taker, addresses
@@ -613,6 +640,26 @@ class CoinJoinSession:
                 txid_hex = tx_input.txid_le[::-1].hex()
                 input_index_map[(txid_hex, tx_input.vout)] = idx
 
+            # For Taproot (BIP341), we need ALL prevouts to compute the sighash
+            # unless SIGHASH_ANYONECANPAY is used.
+            all_prevouts_values = []
+            all_prevouts_scripts = []
+            has_p2tr = any(utxo.address.startswith("bc1p") or utxo.address.startswith("tb1p") or utxo.address.startswith("bcrt1p") for utxo in self.our_utxos.values())
+            
+            if has_p2tr:
+                logger.debug("Taproot inputs detected, fetching all prevouts for sighash")
+                for inp in tx.inputs:
+                    txid = inp.txid_le[::-1].hex()
+                    utxo = await self.backend.get_utxo(txid, inp.vout)
+                    if not utxo:
+                        raise TransactionSigningError(f"Could not fetch prevout for {txid}:{inp.vout}")
+                    all_prevouts_values.append(utxo.value)
+                    # UTXOInfo.scriptpubkey is a hex string; sighash needs bytes
+                    spk = utxo.scriptpubkey
+                    all_prevouts_scripts.append(
+                        bytes.fromhex(spk) if isinstance(spk, str) else spk
+                    )
+
             for (txid, vout), utxo_info in self.our_utxos.items():
                 # Find the input index in the transaction
                 utxo_key = (txid, vout)
@@ -634,30 +681,56 @@ class CoinJoinSession:
                     raise TransactionSigningError(f"Missing key for address {utxo_info.address}")
 
                 priv_key = key.private_key
-                pubkey_bytes = key.get_public_key_bytes(compressed=True)
+                
+                # Check if it's P2TR
+                if utxo_info.address.startswith(("bc1p", "tb1p", "bcrt1p")):
+                    logger.debug(f"Signing P2TR input {input_index}")
 
-                logger.debug(
-                    f"Signing UTXO {txid}:{vout} at input_index={input_index}, "
-                    f"value={utxo_info.value}, address={utxo_info.address}, "
-                    f"pubkey={pubkey_bytes.hex()[:16]}..."
-                )
+                    # Use centralized taproot_tweak_privkey which correctly
+                    # handles the BIP341 even-Y negation rule.
+                    from jmcore.bitcoin import taproot_tweak_privkey
+                    import coincurve
 
-                script_code = create_p2wpkh_script_code(pubkey_bytes)
-                signature = sign_p2wpkh_input(
-                    tx=tx,
-                    input_index=input_index,
-                    script_code=script_code,
-                    value=utxo_info.value,
-                    private_key=priv_key,
-                )
+                    tweaked_priv_bytes = taproot_tweak_privkey(key.get_private_key_bytes())
+                    tweaked_priv = coincurve.PrivateKey(tweaked_priv_bytes)
 
-                # Format as CScript: varint(sig_len) + sig + varint(pub_len) + pub
-                # For lengths < 0x4c (76), varint is just the length byte
-                sig_len = len(signature)
-                pub_len = len(pubkey_bytes)
+                    signature = sign_p2tr_input(
+                        tx=tx,
+                        input_index=input_index,
+                        prevouts_values=all_prevouts_values,
+                        prevouts_scripts=all_prevouts_scripts,
+                        private_key=tweaked_priv,
+                        sighash_type=0x00,  # SIGHASH_DEFAULT
+                    )
+                    
+                    # For Taproot, the "signature" in JM format is just the sig (64 bytes)
+                    # or 65 bytes if sighash != default.
+                    # JM format: varint(sig_len) + sig
+                    # No pubkey needed for Taproot key-path witness
+                    sigmsg = encode_varint(len(signature)) + signature
+                else:
+                    # P2WPKH logic
+                    pubkey_bytes = key.get_public_key_bytes(compressed=True)
 
-                # Build the sigmsg in JM format
-                sigmsg = bytes([sig_len]) + signature + bytes([pub_len]) + pubkey_bytes
+                    logger.debug(
+                        f"Signing UTXO {txid}:{vout} at input_index={input_index}, "
+                        f"value={utxo_info.value}, address={utxo_info.address}, "
+                        f"pubkey={pubkey_bytes.hex()[:16]}..."
+                    )
+
+                    script_code = create_p2wpkh_script_code(pubkey_bytes)
+                    signature = sign_p2wpkh_input(
+                        tx=tx,
+                        input_index=input_index,
+                        script_code=script_code,
+                        value=utxo_info.value,
+                        private_key=priv_key,
+                    )
+
+                    # Format as CScript: varint(sig_len) + sig + varint(pub_len) + pub
+                    sig_len = len(signature)
+                    pub_len = len(pubkey_bytes)
+                    sigmsg = bytes([sig_len]) + signature + bytes([pub_len]) + pubkey_bytes
 
                 # Base64 encode for transmission
                 sig_b64 = base64.b64encode(sigmsg).decode("ascii")
