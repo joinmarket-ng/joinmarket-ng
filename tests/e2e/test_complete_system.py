@@ -792,6 +792,7 @@ async def test_taker_signing_integration(funded_taker_wallet: WalletService):
         taker.wallet = funded_taker_wallet
         taker.backend = mock_backend
         taker.config = mock_config
+        taker.maker_sessions = {}
         taker.unsigned_tx = tx_bytes
         taker.tx_metadata = metadata
         taker.selected_utxos = [taker_utxo]

@@ -18,7 +18,13 @@ import asyncio
 import time
 from typing import Any
 
-from jmcore.bitcoin import calculate_tx_vsize, get_txid, parse_transaction
+from jmcore.bitcoin import (
+    calculate_tx_vsize,
+    get_txid,
+    parse_transaction,
+    taproot_tweak_pubkey,
+    encode_varint,
+)
 from jmcore.bond_calc import calculate_timelocked_fidelity_bond_value
 from jmcore.btc_script import derive_bond_address
 from jmcore.commitment_blacklist import set_blacklist_path
@@ -34,13 +40,13 @@ from jmwallet.history import (
     update_taker_awaiting_transaction_broadcast,
 )
 from jmwallet.wallet.models import UTXOInfo
-from jmwallet.wallet.service import WalletService
 from jmwallet.wallet.signing import (
     TransactionSigningError,
     create_p2wpkh_script_code,
     create_witness_stack,
     deserialize_transaction,
     sign_p2wpkh_input,
+    sign_p2tr_input,
     verify_p2wpkh_signature,
 )
 from loguru import logger
@@ -715,7 +721,15 @@ class Taker(TakerMonitoringMixin):
                 key = self.wallet.get_key_for_address(addr)
                 if key is None:
                     return None
-                return key.get_private_key_bytes()
+                
+                priv_bytes = key.get_private_key_bytes()
+                # If it's a Taproot address, we must use the tweaked private key
+                # so the revealed public key P matches the UTXO's scriptPubKey.
+                if addr.startswith(("bc1p", "tb1p", "bcrt1p")):
+                    from jmcore.bitcoin import taproot_tweak_privkey
+                    priv_bytes = taproot_tweak_privkey(priv_bytes)
+                
+                return priv_bytes
 
             # Generate PoDLE from pre-selected UTXOs only
             # This ensures the commitment is from a UTXO that will be in the transaction
@@ -1313,9 +1327,12 @@ class Taker(TakerMonitoringMixin):
                     raise RuntimeError(f"No communication channel available for {nick}")
 
         # Send !fill to all makers using their designated channels
-        # Format: fill <oid> <amount> <taker_pubkey> <commitment>
+        # Format: fill <oid> <amount> <taker_pubkey> <commitment> [address_type=p2tr]
         for nick, session in self.maker_sessions.items():
             fill_data = f"{session.offer.oid} {self.cj_amount} {taker_pubkey} {commitment_hex}"
+            # Signal desired address type to makers (backwards compatible — old makers ignore it)
+            if self.wallet.address_type == "p2tr":
+                fill_data += " address_type=p2tr"
             channel = await self.directory_client.send_privmsg(
                 nick, "fill", fill_data, log_routing=True, force_channel=session.comm_channel
             )
@@ -1680,6 +1697,12 @@ class Taker(TakerMonitoringMixin):
                     session.change_address = change_addr
                     session.auth_pubkey = auth_pub  # Store for later verification
                     session.responded_auth = True
+
+                    if not self._validate_maker_address_types(nick, cj_addr, change_addr):
+                        failed_makers.append(nick)
+                        del self.maker_sessions[nick]
+                        continue
+
                     logger.debug(
                         f"Processed !ioauth from {nick}: {len(session.utxos)} UTXOs, "
                         f"cj_addr={cj_addr[:16]}..."
@@ -2393,6 +2416,28 @@ class Taker(TakerMonitoringMixin):
                 txid_hex = tx_input.txid_le[::-1].hex()
                 input_index_map[(txid_hex, tx_input.vout)] = idx
 
+            # For Taproot (BIP341), we need ALL prevouts to compute the sighash
+            all_prevouts_values = []
+            all_prevouts_scripts = []
+            has_p2tr = any(utxo.address.startswith(("bc1p", "tb1p", "bcrt1p")) for utxo in self.selected_utxos)
+            
+            # Check if any maker inputs are taproot
+            if not has_p2tr:
+                for session in self.maker_sessions.values():
+                    if any(u.get("address", "").startswith(("bc1p", "tb1p", "bcrt1p")) for u in session.utxos):
+                        has_p2tr = True
+                        break
+
+            if has_p2tr:
+                logger.debug("Taproot inputs detected in CJ, fetching all prevouts for sighash")
+                for inp in tx.inputs:
+                    txid = inp.txid_le[::-1].hex()
+                    utxo = await self.backend.get_utxo(txid, inp.vout)
+                    if not utxo:
+                        raise TransactionSigningError(f"Could not fetch prevout for {txid}:{inp.vout}")
+                    all_prevouts_values.append(utxo.value)
+                    all_prevouts_scripts.append(bytes.fromhex(utxo.scriptpubkey))
+
             # Sign each of our UTXOs
             for utxo in self.selected_utxos:
                 # Find the input index in the transaction
@@ -2416,20 +2461,47 @@ class Taker(TakerMonitoringMixin):
                     raise TransactionSigningError(f"Missing key for address {utxo.address}")
 
                 priv_key = key.private_key
-                pubkey_bytes = key.get_public_key_bytes(compressed=True)
+                
+                # Check if it's P2TR
+                if utxo.address.startswith(("bc1p", "tb1p", "bcrt1p")):
+                    logger.debug(f"Signing taker P2TR input {input_index}")
 
-                # Create script code and sign
-                script_code = create_p2wpkh_script_code(pubkey_bytes)
-                signature = sign_p2wpkh_input(
-                    tx=tx,
-                    input_index=input_index,
-                    script_code=script_code,
-                    value=utxo.value,
-                    private_key=priv_key,
-                )
+                    from jmcore.bitcoin import taproot_tweak_privkey, taproot_tweak_pubkey
+                    import coincurve
 
-                # Create witness stack
-                witness = create_witness_stack(signature, pubkey_bytes)
+                    # Tweak private key for key-path spend
+                    tweaked_priv_bytes = taproot_tweak_privkey(priv_key.secret)
+                    tweaked_priv = coincurve.PrivateKey(tweaked_priv_bytes)
+
+                    signature = sign_p2tr_input(
+                        tx=tx,
+                        input_index=input_index,
+                        prevouts_values=all_prevouts_values,
+                        prevouts_scripts=all_prevouts_scripts,
+                        private_key=tweaked_priv,
+                        sighash_type=0x00,  # SIGHASH_DEFAULT
+                    )
+
+                    witness = [signature]
+
+                    # For info/logging
+                    internal_pub = key.get_public_key_bytes(compressed=True)[1:]
+                    _, pubkey_bytes = taproot_tweak_pubkey(internal_pub)
+                else:
+                    pubkey_bytes = key.get_public_key_bytes(compressed=True)
+
+                    # Create script code and sign
+                    script_code = create_p2wpkh_script_code(pubkey_bytes)
+                    signature = sign_p2wpkh_input(
+                        tx=tx,
+                        input_index=input_index,
+                        script_code=script_code,
+                        value=utxo.value,
+                        private_key=priv_key,
+                    )
+
+                    # Create witness stack
+                    witness = create_witness_stack(signature, pubkey_bytes)
 
                 signatures_info.append(
                     {
