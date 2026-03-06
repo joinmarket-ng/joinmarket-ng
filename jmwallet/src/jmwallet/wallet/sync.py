@@ -449,16 +449,17 @@ class WalletSyncMixin:
         # Map fidelity bond address -> (locktime, index)
         bond_address_to_info: dict[str, tuple[int, int]] = {}
 
+        wrapper = "tr" if self.address_type == "p2tr" else "wpkh"
         for mixdepth in range(self.mixdepth_count):
             xpub = self.get_account_xpub(mixdepth)
 
             # External (receive) addresses: .../0/*
-            desc_ext = f"wpkh({xpub}/0/*)"
+            desc_ext = f"{wrapper}({xpub}/0/*)"
             descriptors.append({"desc": desc_ext, "range": [0, scan_range - 1]})
             desc_to_path[desc_ext] = (mixdepth, 0)
 
             # Internal (change) addresses: .../1/*
-            desc_int = f"wpkh({xpub}/1/*)"
+            desc_int = f"{wrapper}({xpub}/1/*)"
             descriptors.append({"desc": desc_int, "range": [0, scan_range - 1]})
             desc_to_path[desc_int] = (mixdepth, 1)
 
@@ -776,13 +777,14 @@ class WalletSyncMixin:
         """
         descriptors = []
 
+        wrapper = "tr" if self.address_type == "p2tr" else "wpkh"
         for mixdepth in range(self.mixdepth_count):
             xpub = self.get_account_xpub(mixdepth)
 
             # External (receive) addresses: .../0/*
             descriptors.append(
                 {
-                    "desc": f"wpkh({xpub}/0/*)",
+                    "desc": f"{wrapper}({xpub}/0/*)",
                     "range": [0, scan_range - 1],
                     "internal": False,
                 }
@@ -791,7 +793,7 @@ class WalletSyncMixin:
             # Internal (change) addresses: .../1/*
             descriptors.append(
                 {
-                    "desc": f"wpkh({xpub}/1/*)",
+                    "desc": f"{wrapper}({xpub}/1/*)",
                     "range": [0, scan_range - 1],
                     "internal": True,
                 }
@@ -1333,8 +1335,8 @@ class WalletSyncMixin:
             desc_base = desc
 
         # Extract the relative path [fingerprint/change/index] and pubkey
-        # Pattern: wpkh([fingerprint/change/index]pubkey)
-        match = re.search(r"wpkh\(\[[\da-f]+/(\d+)/(\d+)\]([\da-f]+)\)", desc_base, re.I)
+        # Pattern: wpkh([fingerprint/change/index]pubkey) or tr(...)
+        match = re.search(r"(?:wpkh|tr)\(\[[\da-f]+/(\d+)/(\d+)\]([\da-f]+)\)", desc_base, re.I)
         if not match:
             return None
 
