@@ -421,7 +421,7 @@ def taproot_tweak_pubkey(internal_pubkey: bytes, h: bytes | None = None) -> tupl
     if h is None:
         h = b""
 
-    tweak = hashlib.sha256(hashlib.sha256(b"TapTweak").digest() * 2 + internal_pubkey + h).digest()
+    tweak = tagged_hash("TapTweak", internal_pubkey + h)
 
     # tweak_add multiplies tweak by G and adds to pubkey
     tweaked_pub = pub.add(tweak)
@@ -445,8 +445,6 @@ def taproot_tweak_privkey(privkey_bytes: bytes, h: bytes | None = None) -> bytes
     Returns:
         32-byte tweaked private key
     """
-    import hashlib
-
     import coincurve
 
     from jmcore.constants import SECP256K1_N
@@ -466,8 +464,7 @@ def taproot_tweak_privkey(privkey_bytes: bytes, h: bytes | None = None) -> bytes
     if h is None:
         h = b""
 
-    tag_hash = hashlib.sha256(b"TapTweak").digest()
-    tweak = hashlib.sha256(tag_hash + tag_hash + internal_pub + h).digest()
+    tweak = tagged_hash("TapTweak", internal_pub + h)
 
     tweaked_priv = priv_key_even.add(tweak)
     return tweaked_priv.secret
@@ -1216,17 +1213,28 @@ def get_address_type(address: str) -> str:
     Raises:
         ValueError: If address is invalid or unknown type
     """
-    # Bech32 (SegWit)
+    # Bech32 / Bech32m (SegWit)
     if address.startswith(("bc1", "tb1", "bcrt1")):
         hrp_end = 4 if address.startswith("bcrt") else 2
         hrp = address[:hrp_end]
 
+        # Try Bech32 first (witness version 0)
         decoded = bech32_lib.decode(hrp, address)
-        if decoded[0] is None or decoded[1] is None:
-            raise ValueError(f"Invalid bech32 address: {address}")
-
         witver = decoded[0]
-        witprog = bytes(decoded[1])
+
+        if witver is not None and decoded[1] is not None:
+            witprog = bytes(decoded[1])
+        else:
+            # Bech32 failed — try Bech32m (witness version 1+, e.g. P2TR)
+            bech32m_decoded = bech32m_decode(hrp, address)
+            witver = bech32m_decoded[0]
+            witprog_data = bech32m_decoded[1]
+            if witver is None or witprog_data is None:
+                raise ValueError(f"Invalid bech32/bech32m address: {address}")
+            witprog_converted = bech32_lib.convertbits(witprog_data, 5, 8, False)
+            if witprog_converted is None:
+                raise ValueError(f"Invalid witness program padding: {address}")
+            witprog = bytes(witprog_converted)
 
         if witver == 0:
             if len(witprog) == 20:
