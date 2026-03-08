@@ -63,6 +63,9 @@ def list_bonds(
         str | None,
         typer.Option("--log-level", "-l", help="Log level"),
     ] = None,
+    address_type: Annotated[
+        str, typer.Option("--address-type", "-A", help="Address type: p2wpkh (default) or p2tr")
+    ] = "p2wpkh",
 ) -> None:
     """
     List all fidelity bonds in the wallet.
@@ -111,6 +114,7 @@ def list_bonds(
             backend,
             locktimes or [],
             resolved_bip39_passphrase,
+            address_type=address_type,
         )
     )
 
@@ -188,6 +192,7 @@ async def _list_fidelity_bonds(
     backend_settings: ResolvedBackendSettings,
     locktimes: list[int],
     bip39_passphrase: str = "",
+    address_type: str = "p2wpkh",
 ) -> None:
     """List fidelity bonds implementation."""
     from jmwallet.backends.bitcoin_core import BitcoinCoreBackend
@@ -225,6 +230,7 @@ async def _list_fidelity_bonds(
         mixdepth_count=5,
         passphrase=bip39_passphrase,
         data_dir=data_dir,
+        address_type=address_type,
     )
 
     # Verify metadata store is writable before syncing (fail fast on read-only mounts)
@@ -412,6 +418,9 @@ def generate_bond_address(
         str | None,
         typer.Option("--log-level", "-l", help="Log level"),
     ] = None,
+    address_type: Annotated[
+        str, typer.Option("--address-type", "-A", help="Address type: p2wpkh (default) or p2tr")
+    ] = "p2wpkh",
 ) -> None:
     """Generate a fidelity bond (timelocked P2WSH) address."""
     settings = setup_cli(log_level)
@@ -486,7 +495,8 @@ def generate_bond_address(
     master_key = HDKey.from_seed(seed)
 
     coin_type = 0 if resolved_network == "mainnet" else 1
-    path = f"m/84'/{coin_type}'/0'/{FIDELITY_BOND_BRANCH}/{index}"
+    bip_purpose = "86" if address_type == "p2tr" else "84"
+    path = f"m/{bip_purpose}'/{coin_type}'/0'/{FIDELITY_BOND_BRANCH}/{index}"
 
     key = master_key.derive(path)
     pubkey_hex = key.get_public_key_bytes(compressed=True).hex()
@@ -588,6 +598,9 @@ def recover_bonds(
         str | None,
         typer.Option("--log-level", "-l", help="Log level"),
     ] = None,
+    address_type: Annotated[
+        str, typer.Option("--address-type", "-A", help="Address type: p2wpkh (default) or p2tr")
+    ] = "p2wpkh",
 ) -> None:
     """
     Recover fidelity bonds by scanning all 960 possible timelocks.
@@ -632,6 +645,7 @@ def recover_bonds(
             backend_settings,
             max_index,
             resolved_bip39_passphrase,
+            address_type=address_type,
         )
     )
 
@@ -641,6 +655,7 @@ async def _recover_bonds_async(
     backend_settings: ResolvedBackendSettings,
     max_index: int,
     bip39_passphrase: str = "",
+    address_type: str = "p2wpkh",
 ) -> None:
     """Async implementation of fidelity bond recovery."""
     from jmcore.timenumber import TIMENUMBER_COUNT
@@ -672,7 +687,7 @@ async def _recover_bonds_async(
             return
     elif backend_settings.backend_type == "descriptor_wallet":
         fingerprint = get_mnemonic_fingerprint(mnemonic, bip39_passphrase)
-        wallet_name = generate_wallet_name(fingerprint, backend_settings.network)
+        wallet_name = generate_wallet_name(fingerprint, backend_settings.network, address_type)
         backend = DescriptorWalletBackend(
             rpc_url=backend_settings.rpc_url,
             rpc_user=backend_settings.rpc_user,
@@ -695,6 +710,7 @@ async def _recover_bonds_async(
         mixdepth_count=5,
         passphrase=bip39_passphrase,
         data_dir=backend_settings.data_dir,
+        address_type=address_type,
     )
 
     print("\nScanning for fidelity bonds...")

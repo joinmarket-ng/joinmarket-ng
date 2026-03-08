@@ -235,6 +235,7 @@ class TestTakerSigning:
             taker.wallet = mock_wallet
             taker.backend = mock_backend
             taker.config = mock_config
+            taker.maker_sessions = {}
             taker.selected_utxos = taker_utxos
 
             # Build the transaction
@@ -283,6 +284,7 @@ class TestTakerSigning:
             taker.wallet = mock_wallet
             taker.backend = mock_backend
             taker.config = mock_config
+            taker.maker_sessions = {}
             taker.selected_utxos = taker_utxos
 
             builder = CoinJoinTxBuilder(network="regtest")

@@ -214,6 +214,10 @@ class WalletConfig(BaseModel):
     )
 
     # HD wallet structure
+    address_type: str = Field(
+        default="p2wpkh",
+        description="Address type for the wallet: 'p2wpkh' or 'p2tr'",
+    )
     mixdepth_count: int = Field(
         default=5,
         ge=1,
