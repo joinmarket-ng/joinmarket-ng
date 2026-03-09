@@ -31,9 +31,14 @@ __all__ = [
 class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin):
     """
     JoinMarket wallet service.
-    Manages BIP84 hierarchical deterministic wallet with mixdepths.
+    Manages BIP84/BIP86 hierarchical deterministic wallet with mixdepths.
 
-    Derivation path: m/84'/0'/{mixdepth}'/{change}/{index}
+    Derivation paths:
+    - BIP84 (P2WPKH): m/84'/coin'/{mixdepth}'/{change}/{index}
+    - BIP86 (P2TR):   m/86'/coin'/{mixdepth}'/{change}/{index}
+
+    The path purpose (84 vs 86) is selected by the address_type parameter.
+
     - mixdepth: 0-4 (JoinMarket isolation levels)
     - change: 0 (external/receive), 1 (internal/change)
     - index: address index
