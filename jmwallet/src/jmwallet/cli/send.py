@@ -492,8 +492,8 @@ async def _send_transaction(
                     from jmcore.bitcoin import taproot_tweak_pubkey
 
                     x_only = change_key.get_public_key_bytes(compressed=True)[1:]
-                    tweaked = taproot_tweak_pubkey(x_only)
-                    change_script = create_p2tr_scriptpubkey(tweaked.hex())
+                    _, tweaked_x_only = taproot_tweak_pubkey(x_only)
+                    change_script = create_p2tr_scriptpubkey(tweaked_x_only)
                 else:
                     change_script = pubkey_to_p2wpkh_script(
                         change_key.get_public_key_bytes(compressed=True).hex()
