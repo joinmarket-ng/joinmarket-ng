@@ -435,3 +435,132 @@ class TestCertificateSignatureVerification:
         # Verify with wrong pubkey should fail
         is_valid = verify_raw_ecdsa(msg_hash, signature, wrong_pubkey)
         assert is_valid is False
+
+
+class TestRecoverableSignatureVerification:
+    """Tests for _verify_recoverable_signature with various header byte formats."""
+
+    @staticmethod
+    def _make_recoverable_sig(
+        privkey: PrivateKey,
+        message: bytes,
+        header_offset: int,
+    ) -> bytes:
+        """Create a recoverable signature with a specific header byte offset.
+
+        Args:
+            privkey: Key to sign with.
+            message: Raw message bytes (will be hashed with Bitcoin message format).
+            header_offset: Base header value (27=uncompressed, 31=compressed,
+                35=P2SH-P2WPKH, 39=P2WPKH).
+
+        Returns:
+            65-byte signature: header(1) + R(32) + S(32)
+        """
+        from jmcore.crypto import bitcoin_message_hash_bytes
+
+        msg_hash = bitcoin_message_hash_bytes(message)
+        # coincurve recoverable sign returns 65 bytes: R(32) + S(32) + recid(1)
+        sig = privkey.sign_recoverable(msg_hash, hasher=None)
+        r = sig[0:32]
+        s = sig[32:64]
+        recovery_id = sig[64]
+        header = header_offset + recovery_id
+        return bytes([header]) + r + s
+
+    def test_compressed_p2pkh_header(self) -> None:
+        """Header bytes 31-34 (compressed P2PKH) should verify."""
+        from jmwallet.cli.cold_wallet import _verify_recoverable_signature
+
+        utxo_privkey = PrivateKey()
+        utxo_pubkey = utxo_privkey.public_key.format(compressed=True)
+        cert_privkey = PrivateKey()
+        cert_pubkey_hex = cert_privkey.public_key.format(compressed=True).hex()
+        cert_expiry = 518
+
+        msg = f"fidelity-bond-cert|{cert_pubkey_hex}|{cert_expiry}".encode()
+        sig = self._make_recoverable_sig(utxo_privkey, msg, header_offset=31)
+
+        assert _verify_recoverable_signature(sig, cert_pubkey_hex, cert_expiry, utxo_pubkey)
+
+    def test_p2wpkh_header(self) -> None:
+        """Header bytes 39-42 (native segwit P2WPKH) should verify.
+
+        This is the format Trezor and Sparrow produce when signing with a bc1q address.
+        """
+        from jmwallet.cli.cold_wallet import _verify_recoverable_signature
+
+        utxo_privkey = PrivateKey()
+        utxo_pubkey = utxo_privkey.public_key.format(compressed=True)
+        cert_privkey = PrivateKey()
+        cert_pubkey_hex = cert_privkey.public_key.format(compressed=True).hex()
+        cert_expiry = 518
+
+        msg = f"fidelity-bond-cert|{cert_pubkey_hex}|{cert_expiry}".encode()
+        sig = self._make_recoverable_sig(utxo_privkey, msg, header_offset=39)
+
+        assert _verify_recoverable_signature(sig, cert_pubkey_hex, cert_expiry, utxo_pubkey)
+
+    def test_p2sh_p2wpkh_header(self) -> None:
+        """Header bytes 35-38 (nested segwit P2SH-P2WPKH) should verify."""
+        from jmwallet.cli.cold_wallet import _verify_recoverable_signature
+
+        utxo_privkey = PrivateKey()
+        utxo_pubkey = utxo_privkey.public_key.format(compressed=True)
+        cert_privkey = PrivateKey()
+        cert_pubkey_hex = cert_privkey.public_key.format(compressed=True).hex()
+        cert_expiry = 518
+
+        msg = f"fidelity-bond-cert|{cert_pubkey_hex}|{cert_expiry}".encode()
+        sig = self._make_recoverable_sig(utxo_privkey, msg, header_offset=35)
+
+        assert _verify_recoverable_signature(sig, cert_pubkey_hex, cert_expiry, utxo_pubkey)
+
+    def test_uncompressed_header(self) -> None:
+        """Header bytes 27-30 (uncompressed P2PKH) should verify."""
+        from jmwallet.cli.cold_wallet import _verify_recoverable_signature
+
+        utxo_privkey = PrivateKey()
+        utxo_pubkey = utxo_privkey.public_key.format(compressed=False)
+        cert_privkey = PrivateKey()
+        cert_pubkey_hex = cert_privkey.public_key.format(compressed=True).hex()
+        cert_expiry = 518
+
+        msg = f"fidelity-bond-cert|{cert_pubkey_hex}|{cert_expiry}".encode()
+        sig = self._make_recoverable_sig(utxo_privkey, msg, header_offset=27)
+
+        assert _verify_recoverable_signature(sig, cert_pubkey_hex, cert_expiry, utxo_pubkey)
+
+    def test_invalid_header_byte_rejected(self) -> None:
+        """Header bytes outside 27-42 should be rejected."""
+        from jmwallet.cli.cold_wallet import _verify_recoverable_signature
+
+        utxo_privkey = PrivateKey()
+        utxo_pubkey = utxo_privkey.public_key.format(compressed=True)
+        cert_privkey = PrivateKey()
+        cert_pubkey_hex = cert_privkey.public_key.format(compressed=True).hex()
+        cert_expiry = 518
+
+        msg = f"fidelity-bond-cert|{cert_pubkey_hex}|{cert_expiry}".encode()
+        sig = self._make_recoverable_sig(utxo_privkey, msg, header_offset=31)
+
+        # Replace header with invalid byte (outside all ranges)
+        bad_sig = bytes([43]) + sig[1:]
+        assert not _verify_recoverable_signature(bad_sig, cert_pubkey_hex, cert_expiry, utxo_pubkey)
+
+    def test_wrong_key_fails(self) -> None:
+        """Signature from wrong key should fail verification."""
+        from jmwallet.cli.cold_wallet import _verify_recoverable_signature
+
+        utxo_privkey = PrivateKey()
+        utxo_pubkey = utxo_privkey.public_key.format(compressed=True)
+        wrong_privkey = PrivateKey()
+        cert_privkey = PrivateKey()
+        cert_pubkey_hex = cert_privkey.public_key.format(compressed=True).hex()
+        cert_expiry = 518
+
+        msg = f"fidelity-bond-cert|{cert_pubkey_hex}|{cert_expiry}".encode()
+        # Sign with wrong key
+        sig = self._make_recoverable_sig(wrong_privkey, msg, header_offset=39)
+
+        assert not _verify_recoverable_signature(sig, cert_pubkey_hex, cert_expiry, utxo_pubkey)

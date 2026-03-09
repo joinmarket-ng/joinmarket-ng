@@ -242,9 +242,10 @@ async def _list_fidelity_bonds(
         # Load known bonds from registry for optimized scanning
         bond_registry = load_registry(data_dir)
         fidelity_bond_addresses: list[tuple[str, int, int]] = []
-        if bond_registry.bonds:
+        network_bonds = [bond for bond in bond_registry.bonds if bond.network == network]
+        if network_bonds:
             fidelity_bond_addresses = [
-                (bond.address, bond.locktime, bond.index) for bond in bond_registry.bonds
+                (bond.address, bond.locktime, bond.index) for bond in network_bonds
             ]
             logger.info(
                 f"Loading {len(fidelity_bond_addresses)} known bond(s) from registry for scanning"

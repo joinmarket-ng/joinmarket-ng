@@ -130,7 +130,9 @@ async def _freeze_utxos(
 
     bond_registry = load_registry(data_dir)
     fidelity_bond_addresses: list[tuple[str, int, int]] = [
-        (bond.address, bond.locktime, bond.index) for bond in bond_registry.bonds
+        (bond.address, bond.locktime, bond.index)
+        for bond in bond_registry.bonds
+        if bond.network == network
     ]
 
     # Create backend

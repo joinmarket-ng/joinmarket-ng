@@ -64,6 +64,12 @@ def create_bond_address(
     """
     setup_logging(log_level)
 
+    # Strip wpkh() wrapper if present (Sparrow copies pubkey as "wpkh(03abcd...)")
+    pubkey = pubkey.strip()
+    if pubkey.startswith("wpkh(") and pubkey.endswith(")"):
+        pubkey = pubkey[5:-1]
+        logger.info("Stripped wpkh() wrapper from public key")
+
     # Validate pubkey
     try:
         pubkey_bytes = bytes.fromhex(pubkey)
@@ -190,7 +196,13 @@ def create_bond_address(
     print("  3. Choose any address from the Deposit (m/84'/0'/0'/0/x) or")
     print("     Change (m/84'/0'/0'/1/x) account - use index 0 for simplicity")
     print("  4. Right-click the address and select 'Copy Public Key'")
-    print("  5. Use the copied public key with this command")
+    print("     If Sparrow copies it as 'wpkh(03abcd...)', that's fine -")
+    print("     this command strips the wpkh() wrapper automatically")
+    print("  5. Note the DERIVATION PATH: double-click the address (or click the")
+    print("     receive arrow) to see it (e.g., m/84'/0'/0'/0/0)")
+    print("  6. Note the MASTER FINGERPRINT: go to Settings (bottom-left) ->")
+    print("     Keystores section (e.g., aabbccdd)")
+    print("  -> You will need both when running 'spend-bond' later")
     print()
     print("NOTE: The /2 fidelity bond derivation path is NOT available in Sparrow.")
     print("      Using /0 (deposit) or /1 (change) addresses works fine.")
@@ -448,7 +460,10 @@ def prepare_certificate_message(
     print("  6. Click 'Sign Message' - hardware wallet will prompt for confirmation")
     print("  7. Copy the resulting base64 signature")
     print()
-    print("After signing, use 'jm-wallet import-certificate' with the signature.")
+    print("After signing, import with:")
+    print("  jm-wallet import-certificate <bond_address> \\")
+    print("    --cert-signature '<base64_signature>' \\")
+    print(f"    --cert-expiry {cert_expiry}")
     print("=" * 80 + "\n")
 
 
@@ -459,7 +474,11 @@ def _verify_recoverable_signature(
     Verify a 65-byte recoverable signature (Sparrow/Electrum format).
 
     Electrum format: 1 byte header + 32 bytes R + 32 bytes S
-    Header encodes recovery ID: 27-30 for uncompressed, 31-34 for compressed.
+    Header encodes recovery ID and address type:
+      27-30: P2PKH uncompressed
+      31-34: P2PKH compressed
+      35-38: P2SH-P2WPKH (nested segwit, compressed)
+      39-42: P2WPKH (native segwit, compressed)
 
     coincurve format: 32 bytes R + 32 bytes S + 1 byte recovery_id
 
@@ -475,10 +494,20 @@ def _verify_recoverable_signature(
     r = sig_bytes[1:33]
     s = sig_bytes[33:65]
 
-    # Determine recovery ID from header
-    # 27-30: uncompressed pubkey recovery
-    # 31-34: compressed pubkey recovery (Electrum/Sparrow default)
-    if 31 <= header <= 34:
+    # Determine recovery ID from header byte.
+    # Electrum/Sparrow encode both recovery ID and address type in the header:
+    #   27-30: P2PKH uncompressed
+    #   31-34: P2PKH compressed
+    #   35-38: P2SH-P2WPKH (nested segwit, compressed)
+    #   39-42: P2WPKH (native segwit, compressed)
+    # Trezor and Sparrow use the segwit ranges when signing with bc1q addresses.
+    if 39 <= header <= 42:
+        recovery_id = header - 39
+        compressed = True
+    elif 35 <= header <= 38:
+        recovery_id = header - 35
+        compressed = True
+    elif 31 <= header <= 34:
         recovery_id = header - 31
         compressed = True
     elif 27 <= header <= 30:
@@ -866,6 +895,23 @@ def spend_bond(
         Path | None,
         typer.Option("--output", "-o", help="Save PSBT to file (default: stdout only)"),
     ] = None,
+    test_unfunded: Annotated[
+        bool,
+        typer.Option(
+            "--test-unfunded",
+            help=(
+                "Allow generating a test PSBT even when the bond is unfunded, "
+                "using a synthetic UTXO for signer compatibility testing."
+            ),
+        ),
+    ] = False,
+    test_utxo_value: Annotated[
+        int,
+        typer.Option(
+            "--test-utxo-value",
+            help=("Synthetic UTXO value in sats when using --test-unfunded (default: 100000)."),
+        ),
+    ] = 100_000,
     data_dir: Annotated[
         Path | None,
         typer.Option(
@@ -885,29 +931,31 @@ def spend_bond(
 
     REQUIREMENTS:
     - The bond must exist in the registry (created with 'create-bond-address')
-    - The bond must be funded (use 'registry-sync' to update UTXO info)
+    - The bond must be funded (use 'registry-sync' to update UTXO info),
+      unless using --test-unfunded for a dry-run signer test
     - The locktime must have expired (or be close enough for your use case)
 
-    SIGNING OPTIONS:
+    SIGNING:
 
-    A) Hardware wallet (HWI):
-    1. Run this command with --master-fingerprint and --derivation-path
-    2. Install HWI: pip install hwi
-    3. Connect and unlock your hardware wallet
-    4. Run: python scripts/sign_bond_psbt.py <psbt_base64>
+    Most hardware wallets (Trezor, Coldcard, BitBox02, KeepKey) CANNOT sign
+    CLTV timelock P2WSH scripts -- their firmware rejects custom witness
+    scripts. Ledger and Blockstream Jade DO support arbitrary witness scripts
+    and may work via HWI (scripts/sign_bond_psbt.py).
 
-    B) Mnemonic (software signing):
+    Option A - Mnemonic signing (works with any device):
     1. Run: python scripts/sign_bond_mnemonic.py <psbt_base64>
     2. Enter your BIP39 mnemonic when prompted (hidden input)
     3. Broadcast: bitcoin-cli sendrawtransaction <signed_hex>
 
-    The --master-fingerprint and --derivation-path flags embed BIP32 key origin
-    info into the PSBT, allowing HWI to identify which key to use on the device.
-    The mnemonic script can also use BIP32 info from the PSBT, or accept a
-    --derivation-path argument directly.
+    Option B - HWI signing (Ledger and Jade only):
+    1. Install HWI: pip install -U hwi
+    2. Connect and unlock your hardware wallet
+    3. Run: python scripts/sign_bond_psbt.py <psbt_base64>
 
-    NOTE: Sparrow Wallet cannot sign CLTV timelock scripts (P2WSH with custom
-    witness scripts). Use one of the signing options above.
+    See docs/technical/privacy.md for strategies to reduce mnemonic exposure
+    (dedicated BIP39 passphrase, BIP-85 derived keys, air-gapped signing).
+
+    NOTE: Sparrow Wallet also cannot sign CLTV timelock scripts.
     """
     setup_logging(log_level)
 
@@ -941,18 +989,41 @@ def spend_bond(
         logger.info("Use 'jm-wallet registry-list' to see all bonds")
         raise typer.Exit(1)
 
-    # Validate bond is funded
-    if not bond.is_funded:
-        logger.error("Bond is not funded (no UTXO info)")
-        logger.info(
-            "Use 'jm-wallet registry-sync' to update UTXO info from the blockchain, "
-            "or manually fund the bond address first"
-        )
-        raise typer.Exit(1)
+    # Resolve bond UTXO source (real UTXO or synthetic dry-run UTXO)
+    is_test_unfunded_mode = False
+    if bond.is_funded:
+        assert bond.txid is not None
+        assert bond.vout is not None
+        assert bond.value is not None
+        txid = bond.txid
+        vout = bond.vout
+        input_value = bond.value
+    else:
+        if not test_unfunded:
+            logger.error("Bond is not funded (no UTXO info)")
+            logger.info(
+                "Use 'jm-wallet registry-sync' to update UTXO info from the blockchain, "
+                "or manually fund the bond address first"
+            )
+            logger.info(
+                "If you want to test signer compatibility before funding, rerun with "
+                "--test-unfunded"
+            )
+            raise typer.Exit(1)
 
-    assert bond.txid is not None
-    assert bond.vout is not None
-    assert bond.value is not None
+        if test_utxo_value <= 0:
+            logger.error("--test-utxo-value must be positive")
+            raise typer.Exit(1)
+
+        # Deterministic synthetic outpoint for dry-run signer testing.
+        txid = "11" * 32
+        vout = 0
+        input_value = test_utxo_value
+        is_test_unfunded_mode = True
+        logger.warning(
+            "Generating TEST PSBT for unfunded bond using synthetic UTXO metadata. "
+            "This PSBT is for signing-tool validation only and CANNOT be broadcast."
+        )
 
     # Warn if locktime hasn't expired yet
     import time
@@ -993,10 +1064,10 @@ def spend_bond(
     estimated_vsize = estimate_vsize(["p2wsh"], [dest_type])
     estimated_fee = math.ceil(estimated_vsize * fee_rate)
 
-    send_amount = bond.value - estimated_fee
+    send_amount = input_value - estimated_fee
     if send_amount <= 0:
         logger.error(
-            f"Bond value ({format_amount(bond.value)}) is too small to cover "
+            f"Bond value ({format_amount(input_value)}) is too small to cover "
             f"the fee ({format_amount(estimated_fee)} at {fee_rate:.1f} sat/vB)"
         )
         raise typer.Exit(1)
@@ -1057,18 +1128,18 @@ def spend_bond(
 
     # Build the unsigned transaction components
     tx_input = TxInput.from_hex(
-        txid=bond.txid,
-        vout=bond.vout,
+        txid=txid,
+        vout=vout,
         # Sequence must be < 0xFFFFFFFF to enable nLockTime checking
         sequence=0xFFFFFFFE,
-        value=bond.value,
+        value=input_value,
         scriptpubkey=p2wsh_scriptpubkey.hex(),
     )
     tx_output = TxOutput(value=send_amount, script=dest_scriptpubkey)
 
     # Create PSBT input metadata
     psbt_input = PSBTInput(
-        witness_utxo_value=bond.value,
+        witness_utxo_value=input_value,
         witness_utxo_script=p2wsh_scriptpubkey,
         witness_script=witness_script,
         sighash_type=1,  # SIGHASH_ALL
@@ -1098,9 +1169,11 @@ def spend_bond(
     print("\n" + "=" * 80)
     print("SPEND BOND PSBT")
     print("=" * 80)
+    if is_test_unfunded_mode:
+        print("\nMODE:             TEST-UNFUNDED (synthetic UTXO, not broadcastable)")
     print(f"\nBond Address:     {bond_address}")
-    print(f"Bond UTXO:        {bond.txid}:{bond.vout}")
-    print(f"Bond Value:       {format_amount(bond.value)}")
+    print(f"Bond UTXO:        {txid}:{vout}")
+    print(f"Bond Value:       {format_amount(input_value)}")
     print(f"Locktime:         {bond.locktime} ({locktime_dt.strftime('%Y-%m-%d')})")
     print(f"\nDestination:      {destination}")
     print(f"Send Amount:      {format_amount(send_amount)}")
@@ -1113,41 +1186,47 @@ def spend_bond(
     print("-" * 80)
     if output_file:
         print(f"\nSaved to: {output_file}")
+
     print("\n" + "=" * 80)
     print("HOW TO SIGN AND BROADCAST:")
     print("=" * 80)
     print()
+    if is_test_unfunded_mode:
+        print("WARNING: TEST-UNFUNDED mode uses a synthetic input and cannot be broadcast.")
+        print("  Use this only to validate your signing workflow before funding the bond.")
+        print()
+    print("NOTE: Most hardware wallets (Trezor, Coldcard, BitBox02, KeepKey)")
+    print("  CANNOT sign CLTV timelock P2WSH scripts. Ledger and Blockstream")
+    print("  Jade support arbitrary witness scripts and may work via HWI.")
+    print()
+    print("Option A - Mnemonic signing (works with any device):")
     if bip32_derivations:
-        print("Option A - Hardware wallet (HWI):")
-        print("  1. Install HWI: pip install hwi")
-        print("  2. Connect your hardware wallet and unlock it")
-        print("  3. Run: python scripts/sign_bond_psbt.py <psbt_base64>")
-        print("     Or manually:")
-        print("     hwi -t <device_type> signtx <psbt_base64>")
-        print("  4. Finalize: bitcoin-cli finalizepsbt <signed_psbt>")
-        print("  5. Broadcast: bitcoin-cli sendrawtransaction <signed_hex>")
-        print()
-        print("Option B - Mnemonic (software signing):")
         print("  1. Run: python scripts/sign_bond_mnemonic.py <psbt_base64>")
-        print("  2. Enter your BIP39 mnemonic when prompted (hidden input)")
-        print("  3. Broadcast: bitcoin-cli sendrawtransaction <signed_hex>")
-        print()
-        print("NOTE: Sparrow Wallet cannot sign CLTV timelock scripts.")
-        print("  Use one of the options above.")
     else:
-        print("Sign with mnemonic (no BIP32 derivation info needed):")
         print("  1. Run: python scripts/sign_bond_mnemonic.py <psbt_base64> \\")
         print("       --derivation-path \"m/84'/0'/0'/0/0\"")
-        print("  2. Enter your BIP39 mnemonic when prompted (hidden input)")
-        print("  3. Broadcast: bitcoin-cli sendrawtransaction <signed_hex>")
+    print("  2. Enter your BIP39 mnemonic when prompted (hidden input)")
+    print("  3. Broadcast: bitcoin-cli sendrawtransaction <signed_hex>")
+    print()
+    if bip32_derivations:
+        print("Option B - HWI signing (Ledger and Jade only):")
+        print("  1. Install HWI: pip install -U hwi")
+        print("  2. Connect and unlock your hardware wallet")
+        print("  3. Run: python scripts/sign_bond_psbt.py <psbt_base64>")
         print()
-        print("For hardware wallet signing, re-run with --master-fingerprint")
-        print("  and --derivation-path to embed BIP32 key origin info.")
+    if not bip32_derivations:
+        print("TIP: Re-run with --master-fingerprint and --derivation-path to")
+        print("  embed BIP32 key origin info (needed for HWI, optional for mnemonic).")
         print()
         print("  Example:")
         print("    jm-wallet spend-bond <bond_addr> <dest_addr> \\")
         print("      --master-fingerprint aabbccdd \\")
         print("      --derivation-path \"m/84'/0'/0'/0/0\"")
+        print()
+    print("See docs/technical/privacy.md for strategies to reduce mnemonic")
+    print("  exposure (dedicated BIP39 passphrase, BIP-85, air-gapped signing).")
+    print()
+    print("NOTE: Sparrow Wallet also cannot sign CLTV timelock scripts.")
     print()
     if bond.locktime > current_time:
         print("WARNING: The locktime has NOT expired yet!")

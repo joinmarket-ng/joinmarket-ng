@@ -135,35 +135,264 @@ Commands:
 **Certificate Chain:**
 
 ```
-UTXO keypair (cold) -> signs -> certificate (hot) -> signs -> nick proofs
+UTXO keypair (optionally cold) -> signs -> certificate (hot) -> signs -> nick proofs
 ```
 
 Allows cold storage of bond private key while hot wallet handles per-session proofs.
 
 **Cold Wallet Setup:**
 
-For maximum security, keep the bond UTXO private key on a hardware wallet:
+> **IMPORTANT -- HARDWARE WALLET LIMITATIONS:**
+>
+> Most hardware wallets **cannot sign** fidelity bond spending transactions. Bond UTXOs are P2WSH outputs with CLTV timelock witness scripts, and most firmware rejects custom witness scripts. **Only Ledger Nano S/X and Blockstream Jade** support this (see [HWI support matrix](https://hwi.readthedocs.io/en/latest/devices/index.html#support-matrix)). Trezor (all models), Coldcard, BitBox02, and KeepKey **cannot** sign bond redemptions ([Trezor firmware issue #416](https://github.com/trezor/trezor-firmware/issues/416), open since 2019).
+>
+> If your hardware wallet cannot sign CLTV scripts, you will need to enter your BIP39 mnemonic into the `sign_bond_mnemonic.py` script to spend the bond. This does not mean funds are lost -- it is an inconvenience that degrades security from "hardware wallet cold storage" to "software signing on a (potentially offline) computer". **Plan ahead**: use a CLTV compatible hardware wallet for full cold storage, or create a dedicated mnemonic/passphrase specifically for the bond so that mnemonic exposure does not risk your main wallet.
+>
+> **Before locking real funds**, complete the full workflow end-to-end including a test spend (without broadcasting) to confirm your tooling works. See "Test the full flow" below.
 
-1. Get public key from hardware wallet (Sparrow)
-2. Create bond address: `jm-wallet create-bond-address <pubkey> --locktime-date "2026-01"`
-3. Fund the bond address
-4. Generate hot keypair: `jm-wallet generate-hot-keypair --bond-address <addr>`
-5. Prepare certificate message: `jm-wallet prepare-certificate-message <addr>`
-6. Sign message in Sparrow (Standard/Electrum format, NOT BIP322)
-7. Import certificate: `jm-wallet import-certificate <addr> --cert-signature '<sig>' --cert-expiry <period>`
-8. Run maker - certificate used automatically
+For maximum security, keep the bond UTXO private key on a hardware wallet. The bond private key never touches any internet-connected device.
+
+1. **Get public key from Sparrow Wallet**:
+   - Open Sparrow Wallet with your hardware wallet connected
+   - Go to the **Addresses** tab
+   - Choose any address from the Deposit (`m/84'/0'/0'/0/x`) or Change (`m/84'/0'/0'/1/x`) account -- use index 0 for simplicity
+   - Right-click the address and select **"Copy Outpur Descriptor Key"**. **Important**: Sparrow may wrap the key as `wpkh(03abcd...)` -- if so, remove the `wpkh(` prefix and trailing `)` to get just the raw hex. The CLI will also strip this automatically.
+   - **Note the derivation path**: double-click the address (or click the receive arrow icon) to see the full derivation path (e.g., `m/84'/0'/0'/0/0`). You will need this later when spending the bond.
+   - **Note the master fingerprint**: go to **Settings** (bottom-left) -> **Keystores** section. The master fingerprint (4 bytes hex, e.g., `aabbccdd`) is shown there. You will need this later when spending the bond.
+   - **Note**: The `/2` fidelity bond derivation path is not available in Sparrow. Using `/0` or `/1` addresses works fine -- the bond address is derived from the public key itself, not the derivation path.
+
+2. **Create bond address** (on online machine -- NO private keys needed):
+   ```bash
+   jm-wallet create-bond-address "<pubkey_from_step_1>" \
+     --locktime-date "2026-01"
+   ```
+   This saves the bond to the registry automatically. The output shows both the bond P2WSH address (for funding) and the P2WPKH "Signing Address" (used later in Sparrow for message signing). Fund the bond P2WSH address with Bitcoin.
+
+3. **Generate hot wallet keypair** (on online machine):
+   ```bash
+   jm-wallet generate-hot-keypair --bond-address <bond_address>
+   ```
+   This creates a random keypair and saves it to the bond registry automatically. The keypair will be loaded automatically in subsequent steps.
+
+4. **Prepare certificate message** (on online machine):
+   ```bash
+   jm-wallet prepare-certificate-message <bond_address> \
+     --validity-periods 52  # ~2 years
+   ```
+   This fetches the current block height and outputs the message to sign. **Important**: Note the `Cert Expiry: period XXX` value shown -- you will need this exact number in step 6.
+
+   Example output:
+   ```
+   Current Block:         933047 (period 462)
+   Cert Expiry:           period 514 (block 1036224)   <-- USE THIS NUMBER!
+   Validity:              ~102 weeks (103177 blocks)
+
+   MESSAGE TO SIGN (copy this EXACTLY into Sparrow):
+   fidelity-bond-cert|03250c574fe8a2ea...|514
+   ```
+
+5. **Sign the message in Sparrow**:
+   - Open Sparrow Wallet and connect your hardware wallet
+   - Go to **Tools -> Sign/Verify Message**
+   - In the **Address** field, enter or select the **Signing Address** shown in step 2 (the P2WPKH `bc1q...` address, NOT the bond P2WSH address)
+   - Copy the **entire message** from step 4 (e.g., `fidelity-bond-cert|02abc...|514`) and paste it into the 'Message' field
+   - **Important**: Select **'Standard (Electrum)'** format, NOT BIP322
+   - Click 'Sign Message' -- your hardware wallet will prompt for confirmation
+   - Copy the resulting base64 signature
+
+   **Note on hardware wallets**: Different hardware wallets encode the signature header byte differently. Trezor uses the extended Electrum format that encodes the address type (P2WPKH) in the header byte. This is handled automatically by the import command.
+
+6. **Import certificate** (on online machine):
+   ```bash
+   jm-wallet import-certificate <bond_address> \
+     --cert-signature '<base64_signature_from_sparrow>' \
+     --cert-expiry 514   # <-- USE THE PERIOD NUMBER FROM STEP 4!
+   ```
+   **Critical**: The `--cert-expiry` value MUST match the period number shown in step 4. This is an ABSOLUTE period number, not a relative duration. Using the wrong value will cause the certificate to be rejected as expired.
+
+   The certificate pubkey and private key are loaded from the registry automatically (from step 3).
+
+7. **Test the full flow** -- generate a test spend PSBT (do NOT broadcast):
+   ```bash
+   jm-wallet spend-bond <bond_address> <any_address_you_control> \
+     --fee-rate 1.0 \
+     --test-unfunded \
+     --master-fingerprint <fingerprint_from_step_1> \
+     --derivation-path "<path_from_step_1>"
+   ```
+   Then verify you can sign it:
+   ```bash
+   # Ledger/Jade users -- test HWI signing:
+   python scripts/sign_bond_psbt.py <psbt_base64>
+
+   # All other devices -- test mnemonic signing:
+   python scripts/sign_bond_mnemonic.py <psbt_base64>
+   ```
+   **Do not broadcast** the test transaction -- just confirm that signing succeeds and produces valid output. Use `bitcoin-cli decoderawtransaction <signed_hex>` to inspect. `--test-unfunded` uses a synthetic input so you can validate derivation path, signer compatibility, and the full signing toolchain **before funding**.
+
+8. **Fund the bond** -- only after confirming the full flow works, send Bitcoin to the bond P2WSH address.
+
+9. **Run maker**: The maker automatically detects certificates and uses them.
+   ```bash
+   jm-maker start
+   ```
+
+**Security benefits:**
+- Bond UTXO private key NEVER leaves the hardware wallet (with CLTV compatible devices)
+- No mnemonic exposure to online systems (when using HWI signing on an offline machine)
+- Certificate expires after configurable period (~2 years default)
+- If hot wallet is compromised, attacker can only impersonate bond until expiry
+- Bond funds remain safe in cold storage
+
+**Certificate expiry explained:**
+
+The `cert_expiry` is an **absolute** period number that indicates when the certificate becomes invalid. The reference implementation validates: `current_block_height < cert_expiry * 2016`.
+
+- **Validity periods**: The `--validity-periods` option (default 52 = ~2 years) specifies how long the certificate should be valid from now
+- **Absolute period**: The command calculates `cert_expiry = current_period + validity_periods`
+- **Protocol limits**: The cert_expiry field is an unsigned 16-bit integer (max 65535)
+- **Practical range**: 1 to 52 periods (2 weeks to 2 years) validity is recommended
+
+**Renewing an expired certificate:**
+
+When your certificate expires, repeat steps 4-6 with a new message. The bond funds remain unaffected -- only the certificate needs re-signing.
 
 **Spending Bonds:**
 
-After locktime expires:
+> **Tested:** Bond creation verified with Sparrow Wallet and a hardware wallet (HWI >= 3.1.0). Bond redemption verified with `sign_bond_mnemonic.py`. Trezor cannot sign the redemption transaction due to the CLTV firmware limitation.
+
+After locktime expires, generate a PSBT for external signing:
 
 ```bash
-jm-wallet send <destination> --mixdepth 0 --amount 0  # Sweep
+jm-wallet spend-bond <bond_address> <destination_address> \
+  --fee-rate 1.0 \
+  --master-fingerprint <4_byte_hex> \
+  --derivation-path "m/84'/0'/0'/0/0"
 ```
 
-The wallet automatically handles P2WSH witness construction and nLockTime.
+The `--derivation-path` should match the address whose public key was used in `create-bond-address` (in Sparrow: double-click the address or click the receive arrow to see the path). The `--master-fingerprint` is found in Sparrow under Settings -> Keystores. Both are embedded as BIP32 key origin info in the PSBT, which helps signing tools derive the correct key.
 
-**Note:** P2WSH fidelity bond UTXOs cannot be used in CoinJoins.
+Use `--output psbt.txt` to save the PSBT to a file for transfer to a signing tool.
+
+For pre-funding dry-run signer tests, add `--test-unfunded` (optionally `--test-utxo-value`) to generate a non-broadcastable PSBT with synthetic UTXO metadata.
+
+**Hardware wallet compatibility:**
+
+| Device | Can sign CLTV bonds? | Notes |
+|--------|:--------------------:|-------|
+| Ledger Nano S/X | Yes | Bitcoin App 2.1+ requires standard BIP44/49/84/86 derivation for the key |
+| Blockstream Jade | Yes | Fully supported |
+| BitBox01 | Yes | Discontinued; not recommended for new setups |
+| Trezor (all models) | **No** | Firmware rejects non-multisig P2WSH; [issue #416](https://github.com/trezor/trezor-firmware/issues/416) open since 2019 |
+| Coldcard | **No** | Firmware only supports single-key and multisig |
+| BitBox02 | **No** | |
+| KeepKey | **No** | |
+
+**Option A -- HWI signing (Ledger and Jade only):**
+
+Ledger and Blockstream Jade support arbitrary witnessScript inputs, so they can sign CLTV bonds directly via HWI:
+
+```bash
+pip install -U hwi  # >= 3.1.0 for newer device models
+python scripts/sign_bond_psbt.py <psbt_base64>
+```
+
+Connect and unlock your device first. Close Sparrow or other wallet software that holds the USB connection. The script enumerates devices, signs, and outputs the transaction hex. If your wallet uses a BIP39 passphrase, add `--passphrase` to the script invocation.
+
+**Option B -- Mnemonic signing (works with any device):**
+
+For Trezor, Coldcard, BitBox02, KeepKey, or if HWI signing fails:
+
+```bash
+python scripts/sign_bond_mnemonic.py <psbt_base64>
+```
+
+The script prompts for your BIP39 mnemonic (hidden input), derives the key from the PSBT's BIP32 derivation info (or a `--derivation-path` argument), signs the CLTV witness script, and outputs the fully signed transaction hex.
+
+If your wallet uses a **BIP39 passphrase**:
+```bash
+python scripts/sign_bond_mnemonic.py --passphrase <psbt_base64>
+```
+
+Broadcast the signed transaction:
+```bash
+bitcoin-cli sendrawtransaction <signed_hex>
+```
+
+**Reducing mnemonic exposure:**
+
+Entering your BIP39 mnemonic into software exposes your entire wallet. The best approach is to **plan ahead** and avoid needing mnemonic signing entirely -- use a CLTV compatible HW wallet. If that is not an option, these strategies limit the blast radius:
+
+- **Dedicated mnemonic**: Generate a fresh 12- or 24-word seed used exclusively for fidelity bonds. This mnemonic holds only bond funds, so exposing it during signing cannot compromise your main wallet. The downside is managing a separate seed backup.
+
+- **[BIP-85](https://github.com/bitcoin/bips/blob/master/bip-0085.mediawiki) derived key** (Coldcard): Coldcard supports BIP-85 on-device, which can deterministically derive a child seed or WIF private key from your master seed. Go to `Advanced/Tools > Derive Seed B85 > WIF (private key)` and choose an index. The derived key cannot be used to recover the master seed. Use the derived public key when creating the bond address, and import the WIF for signing. The key is deterministic and can always be regenerated from the same seed + index. This is the ideal approach when using a Coldcard -- the master mnemonic is never exposed.
+
+- **Air-gapped signing**: Run `sign_bond_mnemonic.py` on an offline machine. A bootable [Tails](https://tails.net/) USB drive is a practical option -- it runs from RAM, routes all traffic through Tor by default, and leaves no trace after shutdown. Copy the PSBT to the Tails machine via a second USB drive, sign, copy the signed hex back. After entering the mnemonic on any machine (even Tails), consider that mnemonic compromised for high-value wallets. This is why a dedicated mnemonic is strongly preferred.
+
+**Note:** Sparrow Wallet cannot sign CLTV timelock scripts (P2WSH with custom witness scripts). It is used for key management, message signing (certificates), and can broadcast finalized transactions.
+
+**Note:** P2WSH fidelity bond UTXOs cannot be used in CoinJoins, just spend it first to a regular P2WPKH address you control, then use those funds in CoinJoins.
+
+**Migrating from the reference implementation:**
+
+If you have an existing fidelity bond in the [reference JoinMarket implementation](https://github.com/JoinMarket-Org/joinmarket-clientserver/) (hot wallet), you can register it in joinmarket-ng by signing a certificate with the bond's private key. Both helper scripts below are self-contained and only require `coincurve` (`pip install coincurve`).
+
+The reference implementation uses derivation path `m/84'/0'/0'/2/<timenumber>` for fidelity bond addresses, where `<timenumber>` is a monthly index (0 = Jan 2020, 1 = Feb 2020, ..., 959 = Dec 2099). Both the branch `/2` and the child `/<timenumber>` are **unhardened**, so the public key can be derived from the account xpub alone -- but signing requires the mnemonic.
+
+**Note:** The reference implementation's `wallet-tool.py signmessage` command **cannot** sign messages with fidelity bond paths. This is a bug in the reference code: `BTC_Timelocked_P2WSH` does not override the inherited `sign_message()` method, causing a type error when the `(privkey_bytes, locktime)` tuple is passed where raw bytes are expected. The `sign_bond_cert_reference.py` script below works around this by deriving the private key directly from the mnemonic.
+
+1. **Extract the fidelity bond xpub** from the reference wallet:
+   ```bash
+   python wallet-tool.py wallet.jmdat display
+   ```
+   Look for the `fbonds-mpk-xpub...` line under mixdepth 0. This is the account xpub at `m/84'/0'/0'`. Alternatively, use the xpub from the `m/84'/0'/0'/2` sub-header (the branch xpub).
+
+   **Note:** `wallet-tool.py display` shows fidelity bond **addresses** but not individual public keys. You need the xpub to derive the pubkey.
+
+2. **Derive the bond public key** using our helper script:
+   ```bash
+   # From the fbonds-mpk line (account xpub):
+   python scripts/derive_bond_pubkey.py \
+     --xpub <account_xpub> \
+     --locktime 2026-02
+
+   # Or from the /2 branch sub-header xpub:
+   python scripts/derive_bond_pubkey.py \
+     --xpub <branch_xpub> \
+     --locktime 2026-02 \
+     --branch-xpub
+
+   # To check the timenumber for a locktime without an xpub:
+   python scripts/derive_bond_pubkey.py --locktime 2026-02 --info
+   ```
+   The script outputs the 33-byte compressed public key hex and the exact `create-bond-address` command to run.
+
+3. **Create the bond address in joinmarket-ng** using the derived pubkey:
+   ```bash
+   jm-wallet create-bond-address <pubkey_hex> --locktime-date YYYY-MM
+   ```
+   Use the exact command printed by `derive_bond_pubkey.py`. Verify the generated address matches the bond address shown in the reference wallet.
+
+4. **Generate hot keypair and prepare certificate** (steps 3-4 from the cold wallet setup above).
+
+5. **Sign the certificate** using the bond mnemonic:
+   ```bash
+   python scripts/sign_bond_cert_reference.py \
+     --locktime 2026-02 \
+     --cert-pubkey <cert_pubkey_hex> \
+     --cert-expiry <period_number>
+   ```
+   The script prompts for your BIP39 mnemonic (hidden input), derives the private key at `m/84'/0'/0'/2/<timenumber>`, and signs the certificate message in Electrum recoverable format. If your wallet uses a BIP39 passphrase, add `--passphrase`. The base64 signature is printed to stdout.
+
+   **Security:** Entering your mnemonic into software exposes it. Use a dedicated mnemonic/passphrase for the bond (see "Reducing mnemonic exposure" above), or run the script on an air-gapped machine. After entering the mnemonic on any internet-connected device, consider it compromised.
+
+6. **Import the certificate** in joinmarket-ng:
+   ```bash
+   jm-wallet import-certificate <bond_address> \
+     --cert-signature '<base64_signature>' \
+     --cert-expiry <period_number>
+   ```
+   The `import-certificate` command automatically handles recoverable-to-DER signature conversion.
 
 ### Cryptographic Foundations
 

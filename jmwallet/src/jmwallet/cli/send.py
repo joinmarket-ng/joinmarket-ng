@@ -173,7 +173,9 @@ async def _send_transaction(
     # Load fidelity bond addresses from registry
     bond_registry = load_registry(backend_settings.data_dir)
     fidelity_bond_addresses: list[tuple[str, int, int]] = [
-        (bond.address, bond.locktime, bond.index) for bond in bond_registry.bonds
+        (bond.address, bond.locktime, bond.index)
+        for bond in bond_registry.bonds
+        if bond.network == backend_settings.network
     ]
 
     # Create backend based on type

@@ -183,6 +183,53 @@ class TestSpendBondCommand:
             )
             assert result.exit_code != 0
 
+    def test_test_unfunded_mode_allows_psbt_generation(self) -> None:
+        """--test-unfunded should create a dry-run PSBT for unfunded bonds."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            address = _create_unfunded_bond(data_dir)
+
+            result = runner.invoke(
+                app,
+                [
+                    "spend-bond",
+                    address,
+                    DEST_ADDRESS,
+                    "--data-dir",
+                    str(data_dir),
+                    "--test-unfunded",
+                ],
+            )
+
+            assert result.exit_code == 0
+            assert "MODE:             TEST-UNFUNDED" in result.stdout
+            assert "synthetic UTXO" in result.stdout
+            psbt_b64 = _extract_psbt_from_output(result.stdout.split("\n"))
+            assert psbt_b64 is not None
+            assert base64.b64decode(psbt_b64)[:5] == b"psbt\xff"
+
+    def test_test_unfunded_requires_positive_value(self) -> None:
+        """--test-utxo-value must be positive in --test-unfunded mode."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            address = _create_unfunded_bond(data_dir)
+
+            result = runner.invoke(
+                app,
+                [
+                    "spend-bond",
+                    address,
+                    DEST_ADDRESS,
+                    "--data-dir",
+                    str(data_dir),
+                    "--test-unfunded",
+                    "--test-utxo-value",
+                    "0",
+                ],
+            )
+
+            assert result.exit_code != 0
+
     def test_invalid_destination_address(self) -> None:
         """spend-bond should fail with an invalid destination."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -537,8 +584,8 @@ class TestSpendBondBIP32Derivation:
 
             assert result.exit_code != 0
 
-    def test_hwi_instructions_shown_with_derivation(self) -> None:
-        """When BIP32 derivation is provided, HWI instructions should be shown."""
+    def test_hwi_limitation_shown_with_derivation(self) -> None:
+        """When BIP32 derivation is provided, HW limitation warning should be shown."""
         with tempfile.TemporaryDirectory() as tmpdir:
             data_dir = Path(tmpdir)
             address = _create_funded_bond(data_dir)
@@ -559,9 +606,10 @@ class TestSpendBondBIP32Derivation:
             )
 
             assert result.exit_code == 0
-            assert "HWI" in result.stdout
-            assert "sign_bond_psbt.py" in result.stdout
-            assert "Sparrow Wallet cannot sign CLTV" in result.stdout
+            assert "hardware wallets" in result.stdout
+            assert "CANNOT sign" in result.stdout
+            assert "sign_bond_mnemonic.py" in result.stdout
+            assert "Sparrow Wallet" in result.stdout
 
     def test_no_derivation_shows_hint(self) -> None:
         """Without BIP32 derivation, output should hint to use the flags."""
@@ -581,8 +629,8 @@ class TestSpendBondBIP32Derivation:
             )
 
             assert result.exit_code == 0
-            assert "--master-fingerprint" in result.stdout
             assert "--derivation-path" in result.stdout
+            assert "sign_bond_mnemonic.py" in result.stdout
 
 
 def _extract_psbt_from_output(lines: list[str]) -> str | None:

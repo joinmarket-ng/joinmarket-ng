@@ -332,7 +332,9 @@ async def _show_wallet_info(
 
     bond_registry = load_registry(data_dir)
     fidelity_bond_addresses: list[tuple[str, int, int]] = [
-        (bond.address, bond.locktime, bond.index) for bond in bond_registry.bonds
+        (bond.address, bond.locktime, bond.index)
+        for bond in bond_registry.bonds
+        if bond.network == network
     ]
     if fidelity_bond_addresses:
         logger.info(f"Found {len(fidelity_bond_addresses)} fidelity bond(s) in registry")

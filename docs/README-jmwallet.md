@@ -233,67 +233,7 @@ jm-wallet list-bonds --mnemonic-file ~/my-wallet.mnemonic
 
 ## Cold Wallet Fidelity Bonds
 
-For maximum security, fidelity bonds can use a certificate chain that keeps the bond UTXO private key completely offline in a hardware wallet. The bond private key never touches any internet-connected device.
-
-### Workflow
-
-1. **Get public key from Sparrow Wallet**:
-
-   - Open Sparrow Wallet with your hardware wallet
-   - Go to Addresses tab
-   - Find/create address at path `m/84'/0'/0'/2/0` (fidelity bond path)
-   - Right-click the address and select "Copy Public Key"
-
-2. **Create bond address** (online - NO private keys needed):
-
-   ```bash
-   jm-wallet create-bond-address <pubkey_from_step_1> \
-     --locktime-date "2026-01"
-   ```
-   Fund this address with Bitcoin to create the bond.
-
-3. **Generate hot wallet keypair** (on online machine):
-
-   ```bash
-   jm-wallet generate-hot-keypair
-   ```
-   Save both the private and public keys securely.
-
-4. **Prepare certificate message** (online - NO private keys needed):
-   ```bash
-   jm-wallet prepare-certificate-message <bond_address> \
-     --cert-pubkey <hot_pubkey_from_step_3> \
-     --cert-expiry-blocks 104832
-   ```
-
-5. **Sign with hardware wallet** (using Sparrow):
-   - Open Sparrow Wallet and connect your hardware wallet
-   - Go to Tools -> Sign/Verify Message
-   - Select the address matching your bond's public key
-   - Paste the hex message from step 4
-   - Sign and copy the signature
-
-6. **Import certificate** (on online machine):
-   ```bash
-   jm-wallet import-certificate <bond_address> \
-     --cert-pubkey <hot_pubkey_from_step_3> \
-     --cert-privkey <hot_privkey_from_step_3> \
-     --cert-signature <signature_from_hardware_wallet> \
-     --cert-expiry 52
-   ```
-
-7. **Run maker** - it will automatically use the certificate.
-
-### Security Benefits
-
-- **Complete cold storage**: Bond private keys NEVER leave the hardware wallet
-- **No mnemonic exposure**: No mnemonics or private keys needed on online systems
-- **Public key only**: Bond address created from public key extracted from Sparrow
-- **Time-limited**: Certificate expires after ~2 years (configurable)
-- **Revocable**: If hot wallet is compromised, only the certificate is at risk, not the bond funds
-- **Renewable**: Sign a new message when the certificate expires
-
-See [Technical Documentation](technical/index.md) for detailed documentation.
+For maximum security, fidelity bonds can use a certificate chain that keeps the bond UTXO private key completely offline in a hardware wallet. See the [cold storage fidelity bond workflow](technical/privacy.md#cold-wallet-setup) in the technical documentation for the full step-by-step guide.
 
 ### All Commands
 

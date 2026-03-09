@@ -394,10 +394,13 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
             # Option 2: Load from registry (default)
             else:
                 bond_registry = load_registry(resolved_data_dir)
-                if bond_registry.bonds:
+                network_bonds = [
+                    bond for bond in bond_registry.bonds if bond.network == self.config.network
+                ]
+                if network_bonds:
                     # Extract (address, locktime, index) tuples from registry
                     fidelity_bond_addresses = [
-                        (bond.address, bond.locktime, bond.index) for bond in bond_registry.bonds
+                        (bond.address, bond.locktime, bond.index) for bond in network_bonds
                     ]
                     logger.info(
                         f"Loaded {len(fidelity_bond_addresses)} "
