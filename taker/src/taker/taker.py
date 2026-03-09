@@ -2005,6 +2005,10 @@ class Taker(TakerMonitoringMixin):
         privacy. For sweep budget calculations, use_base_rate=True to get
         a deterministic estimate.
 
+        Uses estimate_vsize() from jmcore.bitcoin which handles P2WPKH, P2TR,
+        and P2WSH input/output weights correctly. The wallet's address_type
+        determines the input/output type used for estimation.
+
         Args:
             num_inputs: Number of transaction inputs
             num_outputs: Number of transaction outputs
@@ -2017,8 +2021,12 @@ class Taker(TakerMonitoringMixin):
         """
         import math
 
-        # P2WPKH: ~68 vbytes per input, 31 vbytes per output, ~11 overhead
-        vsize = num_inputs * 68 + num_outputs * 31 + 11
+        from jmcore.bitcoin import estimate_vsize
+
+        addr_type = getattr(self.wallet, "address_type", "p2wpkh")
+        input_types = [addr_type] * num_inputs
+        output_types = [addr_type] * num_outputs
+        vsize = estimate_vsize(input_types, output_types)
 
         # Use base rate for deterministic calculations (sweeps),
         # otherwise use the session's randomized rate for privacy
