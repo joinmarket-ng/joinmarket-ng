@@ -22,6 +22,8 @@ from jmcore.bitcoin import (
     address_to_scriptpubkey,
     calculate_tx_vsize,
     decode_varint,
+    estimate_vsize,
+    get_address_type,
     get_txid,
     is_p2tr_address,
     parse_transaction,
@@ -1803,7 +1805,38 @@ class Taker(TakerMonitoringMixin):
                 num_outputs = 1 + len(self.maker_sessions) + 1 + len(self.maker_sessions)
 
             # Calculate actual tx fee based on real transaction size
-            actual_tx_fee = self._estimate_tx_fee(num_inputs, num_outputs)
+
+            taker_addr_type = getattr(self.wallet, "address_type", "p2wpkh")
+            input_types = [taker_addr_type] * num_taker_inputs
+            output_types = [taker_addr_type] * (1 if self.is_sweep else 2)
+
+            for session in self.maker_sessions.values():
+                for utxo in session.utxos:
+                    addr = utxo.get("address", "")
+                    try:
+                        input_types.append(get_address_type(addr) if addr else "p2wpkh")
+                    except Exception:
+                        input_types.append("p2wpkh")
+
+                try:
+                    output_types.append(
+                        get_address_type(session.cj_address) if session.cj_address else "p2wpkh"
+                    )
+                except Exception:
+                    output_types.append("p2wpkh")
+
+                try:
+                    output_types.append(
+                        get_address_type(session.change_address)
+                        if session.change_address
+                        else "p2wpkh"
+                    )
+                except Exception:
+                    output_types.append("p2wpkh")
+
+            actual_tx_fee = self._estimate_tx_fee(
+                num_inputs, num_outputs, input_types=input_types, output_types=output_types
+            )
 
             preselected_total = sum(u.value for u in self.preselected_utxos)
 
@@ -1996,7 +2029,13 @@ class Taker(TakerMonitoringMixin):
             return False
 
     def _estimate_tx_fee(
-        self, num_inputs: int, num_outputs: int, *, use_base_rate: bool = False
+        self,
+        num_inputs: int,
+        num_outputs: int,
+        *,
+        use_base_rate: bool = False,
+        input_types: list[str] | None = None,
+        output_types: list[str] | None = None,
     ) -> int:
         """Estimate transaction fee.
 
@@ -2006,8 +2045,9 @@ class Taker(TakerMonitoringMixin):
         a deterministic estimate.
 
         Uses estimate_vsize() from jmcore.bitcoin which handles P2WPKH, P2TR,
-        and P2WSH input/output weights correctly. The wallet's address_type
-        determines the input/output type used for estimation.
+        and P2WSH input/output weights correctly. If input_types or output_types
+        are not provided, it assumes the taker uses their address_type and makers
+        use "p2wpkh" conservatively.
 
         Args:
             num_inputs: Number of transaction inputs
@@ -2015,17 +2055,34 @@ class Taker(TakerMonitoringMixin):
             use_base_rate: If True, use the base fee rate instead of the
                           session's randomized rate. Used for sweep cj_amount
                           calculations where determinism is required.
+            input_types: Optional list of explicit address types for inputs
+            output_types: Optional list of explicit address types for outputs
 
         Returns:
             Estimated fee in satoshis
         """
         import math
 
-        from jmcore.bitcoin import estimate_vsize
-
         addr_type = getattr(self.wallet, "address_type", "p2wpkh")
-        input_types = [addr_type] * num_inputs
-        output_types = [addr_type] * num_outputs
+
+        if input_types is None:
+            # Assume ~1 taker input of addr_type, rest conservative p2wpkh
+            input_types = [addr_type] + ["p2wpkh"] * max(0, num_inputs - 1)
+
+        if output_types is None:
+            # Assume ~2 taker outputs of addr_type (CJ + change), rest conservative p2wpkh
+            output_types = [addr_type] * min(2, num_outputs) + ["p2wpkh"] * max(0, num_outputs - 2)
+
+        # Pad remaining with p2wpkh if lists are shorter than counts
+        if len(input_types) < num_inputs:
+            input_types = input_types + ["p2wpkh"] * (num_inputs - len(input_types))
+        if len(output_types) < num_outputs:
+            output_types = output_types + ["p2wpkh"] * (num_outputs - len(output_types))
+
+        # Truncate to exact counts
+        input_types = input_types[:num_inputs]
+        output_types = output_types[:num_outputs]
+
         vsize = estimate_vsize(input_types, output_types)
 
         # Use base rate for deterministic calculations (sweeps),
