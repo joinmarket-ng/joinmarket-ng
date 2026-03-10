@@ -122,7 +122,7 @@ def _derive_key_from_mnemonic(
     mnemonic: str,
     path_indices: list[int],
     passphrase: str = "",
-) -> tuple[bytes, bytes]:
+) -> tuple[bytearray, bytes]:
     """Derive a private key and public key from a BIP39 mnemonic.
 
     Args:
@@ -132,6 +132,8 @@ def _derive_key_from_mnemonic(
 
     Returns:
         Tuple of (private_key_bytes, compressed_public_key_bytes).
+        The private key is returned as a ``bytearray`` so the caller can
+        zero it in-place after use.
     """
     from coincurve import PrivateKey
 
@@ -164,7 +166,7 @@ def _derive_key_from_mnemonic(
 
     privkey = PrivateKey(key_bytes)
     pubkey = privkey.public_key.format(compressed=True)
-    return key_bytes, pubkey
+    return bytearray(key_bytes), pubkey
 
 
 def _make_bond_path(timenumber: int) -> list[int]:
@@ -195,7 +197,7 @@ def _path_to_string(indices: list[int]) -> str:
 
 
 def sign_certificate(
-    private_key_bytes: bytes,
+    private_key_bytes: bytes | bytearray,
     cert_pubkey_hex: str,
     cert_expiry: int,
 ) -> str:
@@ -360,7 +362,11 @@ workflow:
         print(f"Error: Key derivation failed: {e}", file=sys.stderr)
         sys.exit(1)
 
-    # Clear mnemonic from memory (best-effort)
+    # Best-effort memory clearing. Python strings are immutable so we can only
+    # rebind the name, not overwrite the underlying buffer. Intermediate
+    # derivation values and copies inside C extensions are also beyond our
+    # control. Better than nothing, but not a bulletproof guarantee -- we do
+    # our part.
     mnemonic = "x" * len(mnemonic)  # noqa: F841
     del mnemonic
 
@@ -376,7 +382,12 @@ workflow:
         print(f"Error: Signing failed: {e}", file=sys.stderr)
         sys.exit(1)
     finally:
-        privkey_bytes = b"\x00" * 32  # noqa: F841
+        # Zero the bytearray in-place before releasing the reference. This
+        # actually overwrites the buffer (unlike rebinding a bytes name), but
+        # copies held by coincurve's C layer and intermediate derivation values
+        # are still beyond our control -- better than nothing, not bulletproof.
+        for i in range(len(privkey_bytes)):
+            privkey_bytes[i] = 0
         del privkey_bytes
 
     # Output
