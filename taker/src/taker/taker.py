@@ -2389,15 +2389,11 @@ class Taker(TakerMonitoringMixin):
                                         break
                                 else:
                                     # No prevout data available for verification,
-                                    # accept signature without verification.
-                                    # This can happen when none of our own inputs
-                                    # are P2TR (so prevouts weren't fetched).
+                                    # reject signature instead of bypassing verification.
+                                    # Bypassing verification could lead to PoDLE burn.
                                     logger.warning(
                                         "Cannot verify P2TR signature: prevout data not available"
                                     )
-                                    matched_input_idx = idx
-                                    matched_is_p2tr = True
-                                    matched_signature = signature
                                     break
                             else:
                                 # P2WPKH: [sig_len][sig][pub_len][pubkey]
