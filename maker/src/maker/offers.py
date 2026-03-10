@@ -15,6 +15,30 @@ from maker.config import MakerConfig, OfferConfig
 from maker.fidelity import get_best_fidelity_bond
 
 
+def _round_maxsize_to_power_of_2(value: int) -> int:
+    """Round a satoshi amount down to the nearest power of 2.
+
+    This prevents observers from tracking a maker through offer
+    re-announcements by hiding exact balance changes.  Only balance
+    shifts that cross a power-of-2 boundary produce a visible offer
+    update, and even then only the bucket is revealed.
+
+    Examples:
+        150_000_000 (1.5 BTC) → 134_217_728 (≈1.34 BTC, 2^27)
+         70_000_000 (0.7 BTC) →  67_108_864 (≈0.67 BTC, 2^26)
+         10_000_000 (0.1 BTC) →   8_388_608 (≈0.08 BTC, 2^23)
+
+    Args:
+        value: Amount in satoshis (must be > 0)
+
+    Returns:
+        Largest power of 2 that is ≤ value, or 0 if value ≤ 0
+    """
+    if value <= 0:
+        return 0
+    return 1 << (value.bit_length() - 1)
+
+
 class OfferManager:
     """
     Creates and manages offers for the maker bot.
@@ -151,12 +175,22 @@ class OfferManager:
                 cjfee = str(offer_cfg.cj_fee_absolute)
                 min_size = offer_cfg.min_size
 
+            rounded_max = _round_maxsize_to_power_of_2(max_available)
+
+            if rounded_max <= offer_cfg.min_size:
+                logger.warning(
+                    f"Offer {offer_id}: Rounded maxsize too small: "
+                    f"rounded_max={rounded_max} <= min_size={offer_cfg.min_size} "
+                    f"(exact max_available={max_available})"
+                )
+                return None
+
             offer = Offer(
                 counterparty=self.maker_nick,
                 oid=offer_id,
                 ordertype=offer_cfg.offer_type,
                 minsize=min_size,
-                maxsize=max_available,
+                maxsize=rounded_max,
                 txfee=offer_cfg.tx_fee_contribution,
                 cjfee=cjfee,
                 fidelity_bond_value=fidelity_bond_value,
@@ -164,7 +198,7 @@ class OfferManager:
 
             logger.info(
                 f"Created offer {offer_id}: type={offer.ordertype.value}, "
-                f"size={min_size}-{max_available}, "
+                f"size={min_size}-{rounded_max} (exact={max_available}), "
                 f"cjfee={cjfee}, txfee={offer_cfg.tx_fee_contribution}, "
                 f"bond_value={fidelity_bond_value}"
             )
