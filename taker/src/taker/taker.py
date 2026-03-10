@@ -16,9 +16,18 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from jmcore.bitcoin import calculate_tx_vsize, get_txid, parse_transaction
+from jmcore.bitcoin import (
+    address_to_scriptpubkey,
+    calculate_tx_vsize,
+    decode_varint,
+    estimate_vsize,
+    get_address_type,
+    get_txid,
+    is_p2tr_address,
+    parse_transaction,
+)
 from jmcore.bond_calc import calculate_timelocked_fidelity_bond_value
 from jmcore.btc_script import derive_bond_address
 from jmcore.commitment_blacklist import set_blacklist_path
@@ -34,13 +43,14 @@ from jmwallet.history import (
     update_taker_awaiting_transaction_broadcast,
 )
 from jmwallet.wallet.models import UTXOInfo
-from jmwallet.wallet.service import WalletService
 from jmwallet.wallet.signing import (
     TransactionSigningError,
     create_p2wpkh_script_code,
     create_witness_stack,
     deserialize_transaction,
+    sign_p2tr_input,
     sign_p2wpkh_input,
+    verify_p2tr_signature,
     verify_p2wpkh_signature,
 )
 from loguru import logger
@@ -53,6 +63,9 @@ from taker.orderbook import OrderbookManager, calculate_cj_fee
 from taker.podle import ExtendedPoDLECommitment
 from taker.podle_manager import PoDLEManager
 from taker.tx_builder import CoinJoinTxBuilder, build_coinjoin_tx
+
+if TYPE_CHECKING:
+    from jmwallet.wallet.service import WalletService
 
 # Backward-compatible re-exports: many tests and modules import these from taker.taker
 __all__ = [
@@ -705,7 +718,16 @@ class Taker(TakerMonitoringMixin):
                 key = self.wallet.get_key_for_address(addr)
                 if key is None:
                     return None
-                return key.get_private_key_bytes()
+
+                priv_bytes = key.get_private_key_bytes()
+                # If it's a Taproot address, we must use the tweaked private key
+                # so the revealed public key P matches the UTXO's scriptPubKey.
+                if is_p2tr_address(addr):
+                    from jmcore.bitcoin import taproot_tweak_privkey
+
+                    priv_bytes = taproot_tweak_privkey(priv_bytes)
+
+                return priv_bytes
 
             # Generate PoDLE from pre-selected UTXOs only
             # This ensures the commitment is from a UTXO that will be in the transaction
@@ -1303,9 +1325,12 @@ class Taker(TakerMonitoringMixin):
                     raise RuntimeError(f"No communication channel available for {nick}")
 
         # Send !fill to all makers using their designated channels
-        # Format: fill <oid> <amount> <taker_pubkey> <commitment>
+        # Format: fill <oid> <amount> <taker_pubkey> <commitment> [address_type=p2tr]
         for nick, session in self.maker_sessions.items():
             fill_data = f"{session.offer.oid} {self.cj_amount} {taker_pubkey} {commitment_hex}"
+            # Signal desired address type to makers (backwards compatible — old makers ignore it)
+            if self.wallet.address_type == "p2tr":
+                fill_data += " address_type=p2tr"
             channel = await self.directory_client.send_privmsg(
                 nick, "fill", fill_data, log_routing=True, force_channel=session.comm_channel
             )
@@ -1401,6 +1426,36 @@ class Taker(TakerMonitoringMixin):
         return PhaseResult(
             success=True, failed_makers=failed_makers, blacklist_error=blacklist_error
         )
+
+    def _validate_maker_address_types(self, nick: str, cj_addr: str, change_addr: str) -> bool:
+        """
+        Validate that a maker's CoinJoin and change addresses match the taker's
+        address type. Mixed address types (P2WPKH + P2TR) in a CoinJoin make it
+        trivial to distinguish taker vs maker outputs.
+
+        Returns:
+            True if addresses are valid/compatible, False if they should be rejected.
+        """
+        taker_is_taproot = self.wallet.address_type == "p2tr"
+        p2tr_prefixes = ("bc1p", "tb1p", "bcrt1p")
+        maker_cj_is_taproot = cj_addr.startswith(p2tr_prefixes)
+        maker_change_is_taproot = change_addr.startswith(p2tr_prefixes)
+
+        if taker_is_taproot and (not maker_cj_is_taproot or not maker_change_is_taproot):
+            logger.warning(
+                f"Rejecting maker {nick}: taker uses P2TR but maker "
+                f"sent non-Taproot addresses (cj={cj_addr[:16]}..., "
+                f"change={change_addr[:16]}...)"
+            )
+            return False
+        elif not taker_is_taproot and (maker_cj_is_taproot or maker_change_is_taproot):
+            logger.warning(
+                f"Rejecting maker {nick}: taker uses P2WPKH but maker "
+                f"sent Taproot addresses (cj={cj_addr[:16]}..., "
+                f"change={change_addr[:16]}...)"
+            )
+            return False
+        return True
 
     async def _phase_auth(self) -> PhaseResult:
         """Send !auth with PoDLE proof and wait for !ioauth responses.
@@ -1670,6 +1725,12 @@ class Taker(TakerMonitoringMixin):
                     session.change_address = change_addr
                     session.auth_pubkey = auth_pub  # Store for later verification
                     session.responded_auth = True
+
+                    if not self._validate_maker_address_types(nick, cj_addr, change_addr):
+                        failed_makers.append(nick)
+                        del self.maker_sessions[nick]
+                        continue
+
                     logger.debug(
                         f"Processed !ioauth from {nick}: {len(session.utxos)} UTXOs, "
                         f"cj_addr={cj_addr[:16]}..."
@@ -1734,7 +1795,38 @@ class Taker(TakerMonitoringMixin):
                 num_outputs = 1 + len(self.maker_sessions) + 1 + len(self.maker_sessions)
 
             # Calculate actual tx fee based on real transaction size
-            actual_tx_fee = self._estimate_tx_fee(num_inputs, num_outputs)
+
+            taker_addr_type = getattr(self.wallet, "address_type", "p2wpkh")
+            input_types = [taker_addr_type] * num_taker_inputs
+            output_types = [taker_addr_type] * (1 if self.is_sweep else 2)
+
+            for session in self.maker_sessions.values():
+                for utxo in session.utxos:
+                    addr = utxo.get("address", "")
+                    try:
+                        input_types.append(get_address_type(addr) if addr else "p2wpkh")
+                    except Exception:
+                        input_types.append("p2wpkh")
+
+                try:
+                    output_types.append(
+                        get_address_type(session.cj_address) if session.cj_address else "p2wpkh"
+                    )
+                except Exception:
+                    output_types.append("p2wpkh")
+
+                try:
+                    output_types.append(
+                        get_address_type(session.change_address)
+                        if session.change_address
+                        else "p2wpkh"
+                    )
+                except Exception:
+                    output_types.append("p2wpkh")
+
+            actual_tx_fee = self._estimate_tx_fee(
+                num_inputs, num_outputs, input_types=input_types, output_types=output_types
+            )
 
             preselected_total = sum(u.value for u in self.preselected_utxos)
 
@@ -1927,7 +2019,13 @@ class Taker(TakerMonitoringMixin):
             return False
 
     def _estimate_tx_fee(
-        self, num_inputs: int, num_outputs: int, *, use_base_rate: bool = False
+        self,
+        num_inputs: int,
+        num_outputs: int,
+        *,
+        use_base_rate: bool = False,
+        input_types: list[str] | None = None,
+        output_types: list[str] | None = None,
     ) -> int:
         """Estimate transaction fee.
 
@@ -1936,20 +2034,46 @@ class Taker(TakerMonitoringMixin):
         privacy. For sweep budget calculations, use_base_rate=True to get
         a deterministic estimate.
 
+        Uses estimate_vsize() from jmcore.bitcoin which handles P2WPKH, P2TR,
+        and P2WSH input/output weights correctly. If input_types or output_types
+        are not provided, it assumes the taker uses their address_type and makers
+        use "p2wpkh" conservatively.
+
         Args:
             num_inputs: Number of transaction inputs
             num_outputs: Number of transaction outputs
             use_base_rate: If True, use the base fee rate instead of the
                           session's randomized rate. Used for sweep cj_amount
                           calculations where determinism is required.
+            input_types: Optional list of explicit address types for inputs
+            output_types: Optional list of explicit address types for outputs
 
         Returns:
             Estimated fee in satoshis
         """
         import math
 
-        # P2WPKH: ~68 vbytes per input, 31 vbytes per output, ~11 overhead
-        vsize = num_inputs * 68 + num_outputs * 31 + 11
+        addr_type = getattr(self.wallet, "address_type", "p2wpkh")
+
+        if input_types is None:
+            # Assume ~1 taker input of addr_type, rest conservative p2wpkh
+            input_types = [addr_type] + ["p2wpkh"] * max(0, num_inputs - 1)
+
+        if output_types is None:
+            # Assume ~2 taker outputs of addr_type (CJ + change), rest conservative p2wpkh
+            output_types = [addr_type] * min(2, num_outputs) + ["p2wpkh"] * max(0, num_outputs - 2)
+
+        # Pad remaining with p2wpkh if lists are shorter than counts
+        if len(input_types) < num_inputs:
+            input_types = input_types + ["p2wpkh"] * (num_inputs - len(input_types))
+        if len(output_types) < num_outputs:
+            output_types = output_types + ["p2wpkh"] * (num_outputs - len(output_types))
+
+        # Truncate to exact counts
+        input_types = input_types[:num_inputs]
+        output_types = output_types[:num_outputs]
+
+        vsize = estimate_vsize(input_types, output_types)
 
         # Use base rate for deterministic calculations (sweeps),
         # otherwise use the session's randomized rate for privacy
@@ -2246,6 +2370,26 @@ class Taker(TakerMonitoringMixin):
                     sig_infos: list[dict[str, Any]] = []
                     matched_indices: set[int] = set()
 
+                    # Pre-check if any maker UTXOs are P2TR, so we can fetch
+                    # prevout data needed for Taproot sighash verification.
+                    has_p2tr_maker = any(
+                        is_p2tr_address(u.get("address", "")) for u in session.utxos
+                    )
+                    all_prevouts_values: list[int] = []
+                    all_prevouts_scripts: list[bytes] = []
+                    if has_p2tr_maker:
+                        for inp in tx.inputs:
+                            inp_txid = inp.txid_le[::-1].hex()
+                            prevout = await self.backend.get_utxo(inp_txid, inp.vout)
+                            if prevout:
+                                all_prevouts_values.append(prevout.value)
+                                all_prevouts_scripts.append(bytes.fromhex(prevout.scriptpubkey))
+                            else:
+                                # Can't fetch prevout -- clear to disable verification
+                                all_prevouts_values = []
+                                all_prevouts_scripts = []
+                                break
+
                     for sig_idx, response_data in enumerate(response_data_list):
                         parts = response_data.strip().split()
                         if not parts:
@@ -2254,17 +2398,16 @@ class Taker(TakerMonitoringMixin):
                         encrypted_data = parts[0]
                         decrypted_sig = session.crypto.decrypt(encrypted_data)
 
-                        # Parse signature (same as before)
+                        # Decode the base64 signature data
                         padding_needed = (4 - len(decrypted_sig) % 4) % 4
                         padded_sig = decrypted_sig + "=" * padding_needed
                         sig_bytes = base64.b64decode(padded_sig)
-                        sig_len = sig_bytes[0]
-                        signature = sig_bytes[1 : 1 + sig_len]
-                        pub_len = sig_bytes[1 + sig_len]
-                        pubkey = sig_bytes[2 + sig_len : 2 + sig_len + pub_len]
 
                         # Try to verify against each of maker's inputs
                         matched_input_idx = None
+                        matched_is_p2tr = False
+                        matched_signature = b""
+                        matched_pubkey = b""
 
                         for idx in maker_input_indices:
                             if idx in matched_indices:
@@ -2273,20 +2416,65 @@ class Taker(TakerMonitoringMixin):
                             txid, vout = input_map[idx]
                             utxo = maker_utxo_map[(txid, vout)]
                             value = utxo["value"]
+                            address = utxo.get("address", "")
 
-                            # Create scriptCode for verification
-                            script_code = create_p2wpkh_script_code(pubkey)
+                            is_p2tr = is_p2tr_address(address)
 
-                            if verify_p2wpkh_signature(
-                                tx, idx, script_code, value, signature, pubkey
-                            ):
-                                matched_input_idx = idx
-                                break
+                            if is_p2tr:
+                                # P2TR: sig_bytes = varint(sig_len) + sig (no pubkey)
+                                sig_len, offset = decode_varint(sig_bytes, 0)
+                                signature = sig_bytes[offset : offset + sig_len]
+
+                                # Verify with Schnorr signature against the
+                                # x-only pubkey from the P2TR scriptPubKey.
+                                # We need all prevout data for the BIP341 sighash.
+                                if all_prevouts_values and all_prevouts_scripts:
+                                    spk = address_to_scriptpubkey(address)
+                                    x_only_pubkey = spk[2:]  # Strip OP_1 PUSH32
+
+                                    if verify_p2tr_signature(
+                                        tx,
+                                        idx,
+                                        all_prevouts_values,
+                                        all_prevouts_scripts,
+                                        signature,
+                                        x_only_pubkey,
+                                    ):
+                                        matched_input_idx = idx
+                                        matched_is_p2tr = True
+                                        matched_signature = signature
+                                        break
+                                else:
+                                    # No prevout data available for verification,
+                                    # reject signature instead of bypassing verification.
+                                    # Bypassing verification could lead to PoDLE burn.
+                                    logger.warning(
+                                        "Cannot verify P2TR signature: prevout data not available"
+                                    )
+                                    break
+                            else:
+                                # P2WPKH: [sig_len][sig][pub_len][pubkey]
+                                sig_len = sig_bytes[0]
+                                signature = sig_bytes[1 : 1 + sig_len]
+                                pub_len = sig_bytes[1 + sig_len]
+                                pubkey = sig_bytes[2 + sig_len : 2 + sig_len + pub_len]
+
+                                script_code = create_p2wpkh_script_code(pubkey)
+                                if verify_p2wpkh_signature(
+                                    tx, idx, script_code, value, signature, pubkey
+                                ):
+                                    matched_input_idx = idx
+                                    matched_signature = signature
+                                    matched_pubkey = pubkey
+                                    break
 
                         if matched_input_idx is not None:
                             matched_indices.add(matched_input_idx)
                             txid, vout = input_map[matched_input_idx]
-                            witness = [signature.hex(), pubkey.hex()]
+                            if matched_is_p2tr:
+                                witness = [matched_signature.hex()]
+                            else:
+                                witness = [matched_signature.hex(), matched_pubkey.hex()]
 
                             sig_infos.append({"txid": txid, "vout": vout, "witness": witness})
                             logger.debug(
@@ -2383,6 +2571,30 @@ class Taker(TakerMonitoringMixin):
                 txid_hex = tx_input.txid_le[::-1].hex()
                 input_index_map[(txid_hex, tx_input.vout)] = idx
 
+            # For Taproot (BIP341), we need ALL prevouts to compute the sighash
+            all_prevouts_values = []
+            all_prevouts_scripts = []
+            has_p2tr = any(is_p2tr_address(utxo.address) for utxo in self.selected_utxos)
+
+            # Check if any maker inputs are taproot
+            if not has_p2tr:
+                for session in self.maker_sessions.values():
+                    if any(is_p2tr_address(u.get("address", "")) for u in session.utxos):
+                        has_p2tr = True
+                        break
+
+            if has_p2tr:
+                logger.debug("Taproot inputs detected in CJ, fetching all prevouts for sighash")
+                for inp in tx.inputs:
+                    txid = inp.txid_le[::-1].hex()
+                    prevout = await self.backend.get_utxo(txid, inp.vout)
+                    if not prevout:
+                        raise TransactionSigningError(
+                            f"Could not fetch prevout for {txid}:{inp.vout}"
+                        )
+                    all_prevouts_values.append(prevout.value)
+                    all_prevouts_scripts.append(bytes.fromhex(prevout.scriptpubkey))
+
             # Sign each of our UTXOs
             for utxo in self.selected_utxos:
                 # Find the input index in the transaction
@@ -2406,20 +2618,47 @@ class Taker(TakerMonitoringMixin):
                     raise TransactionSigningError(f"Missing key for address {utxo.address}")
 
                 priv_key = key.private_key
-                pubkey_bytes = key.get_public_key_bytes(compressed=True)
 
-                # Create script code and sign
-                script_code = create_p2wpkh_script_code(pubkey_bytes)
-                signature = sign_p2wpkh_input(
-                    tx=tx,
-                    input_index=input_index,
-                    script_code=script_code,
-                    value=utxo.value,
-                    private_key=priv_key,
-                )
+                # Check if it's P2TR
+                if is_p2tr_address(utxo.address):
+                    logger.debug(f"Signing taker P2TR input {input_index}")
 
-                # Create witness stack
-                witness = create_witness_stack(signature, pubkey_bytes)
+                    import coincurve
+                    from jmcore.bitcoin import taproot_tweak_privkey, taproot_tweak_pubkey
+
+                    # Tweak private key for key-path spend
+                    tweaked_priv_bytes = taproot_tweak_privkey(priv_key.secret)
+                    tweaked_priv = coincurve.PrivateKey(tweaked_priv_bytes)
+
+                    signature = sign_p2tr_input(
+                        tx=tx,
+                        input_index=input_index,
+                        prevouts_values=all_prevouts_values,
+                        prevouts_scripts=all_prevouts_scripts,
+                        private_key=tweaked_priv,
+                        sighash_type=0x00,  # SIGHASH_DEFAULT
+                    )
+
+                    witness = [signature]
+
+                    # For info/logging
+                    internal_pub = key.get_public_key_bytes(compressed=True)[1:]
+                    _, pubkey_bytes = taproot_tweak_pubkey(internal_pub)
+                else:
+                    pubkey_bytes = key.get_public_key_bytes(compressed=True)
+
+                    # Create script code and sign
+                    script_code = create_p2wpkh_script_code(pubkey_bytes)
+                    signature = sign_p2wpkh_input(
+                        tx=tx,
+                        input_index=input_index,
+                        script_code=script_code,
+                        value=utxo.value,
+                        private_key=priv_key,
+                    )
+
+                    # Create witness stack
+                    witness = create_witness_stack(signature, pubkey_bytes)
 
                 signatures_info.append(
                     {

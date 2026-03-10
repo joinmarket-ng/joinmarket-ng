@@ -1,10 +1,36 @@
 ### HD Structure
 
-HD path: `m/84'/0'/0'/mixdepth/chain/index` (BIP84 P2WPKH)
+HD path: `m/84'/coin'/mixdepth'/chain/index` (BIP84 P2WPKH, default)
 
 - **Mixdepths**: 5 isolated accounts (0-4)
 - **Chains**: External (0) for receiving, Internal (1) for change
 - **Index**: Sequential address index
+- **Coin type**: 0 for mainnet, 1 for testnet/regtest
+
+### Taproot (P2TR) Support
+
+JoinMarket NG supports BIP86 taproot (P2TR) wallets via the `--address-type p2tr` CLI flag
+or the `address_type = "p2tr"` config setting.
+
+**Derivation path:** `m/86'/coin'/mixdepth'/chain/index` (BIP86, key-path only)
+
+The only difference from the default P2WPKH path is the BIP purpose: `86'` instead of `84'`.
+
+**Descriptor format:** `tr(xpub/0/*)` (receive), `tr(xpub/1/*)` (change) --
+compared to `wpkh(xpub/0/*)` / `wpkh(xpub/1/*)` for P2WPKH.
+
+**Signing:** P2TR inputs use BIP340 Schnorr signatures (64 bytes, `SIGHASH_DEFAULT`).
+The private key is tweaked per BIP341 before signing. The witness stack contains a
+single element `[schnorr_sig]`, unlike P2WPKH which has two `[ecdsa_sig, pubkey]`.
+
+**Interoperability:** When a P2TR maker receives a CoinJoin request from a legacy taker
+that does not negotiate `address_type`, the maker falls back to P2WPKH addresses. This
+ensures backward compatibility -- P2TR makers can serve both taproot-aware and legacy takers.
+
+**Fidelity bonds** always use P2WSH (timelocked `OP_CLTV` scripts), regardless of the
+wallet's `address_type`. The derivation branch is `2` (path: `m/purpose'/coin'/0'/2/index`),
+where `purpose` follows the wallet type (86 for P2TR, 84 for P2WPKH). The address itself
+is always P2WSH because the timelock script requires script-path spending.
 
 ### BIP39 Passphrase Support
 

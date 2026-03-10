@@ -98,6 +98,11 @@
 # ============================================================================
 
 [wallet]
+# Address type: "p2wpkh" (BIP84, default) or "p2tr" (BIP86 taproot)
+# Taproot uses BIP340 Schnorr signatures and bech32m encoding.
+# Fidelity bonds always use P2WSH regardless of this setting.
+# address_type = "p2wpkh"
+
 # Number of mixing depths (1-10)
 # mixdepth_count = 5
 

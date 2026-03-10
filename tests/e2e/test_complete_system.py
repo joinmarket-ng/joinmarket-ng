@@ -93,6 +93,7 @@ async def _create_funded_wallet(
     bitcoin_backend: BitcoinCoreBackend,
     mnemonic: str,
     *,
+    address_type: str = "p2wpkh",
     skip_msg: str = "Wallet has no funds. Auto-funding failed; please fund manually.",
 ):
     """Factory: create a WalletService, sync it, auto-fund if empty, and yield.
@@ -106,6 +107,7 @@ async def _create_funded_wallet(
         backend=bitcoin_backend,
         network="regtest",
         mixdepth_count=5,
+        address_type=address_type,
     )
 
     await wallet.sync_all()
@@ -435,6 +437,18 @@ async def funded_taker_wallet(bitcoin_backend):
         bitcoin_backend,
         TAKER_MNEMONIC,
         skip_msg="Taker wallet has no funds. Auto-funding failed; please fund manually.",
+    ):
+        yield w
+
+
+@pytest_asyncio.fixture
+async def funded_taker_wallet_p2tr(bitcoin_backend):
+    """Create and fund a P2TR (taproot) taker wallet using taker mnemonic."""
+    async for w in _create_funded_wallet(
+        bitcoin_backend,
+        TAKER_MNEMONIC,
+        address_type="p2tr",
+        skip_msg="P2TR taker wallet has no funds. Auto-funding failed.",
     ):
         yield w
 
@@ -790,9 +804,11 @@ async def test_taker_signing_integration(funded_taker_wallet: WalletService):
         taker.wallet = funded_taker_wallet
         taker.backend = mock_backend
         taker.config = mock_config
+        taker.maker_sessions = {}
         taker.unsigned_tx = tx_bytes
         taker.tx_metadata = metadata
         taker.selected_utxos = [taker_utxo]
+        taker.maker_sessions = {}  # No maker sessions in this unit test
 
         # Sign the inputs
         signatures = await taker._sign_our_inputs()
@@ -829,6 +845,152 @@ async def test_taker_signing_integration(funded_taker_wallet: WalletService):
 
         print("Correctly rejected incomplete signatures")
         print("Taker signing integration test PASSED")
+
+
+@pytest.mark.asyncio
+async def test_taker_p2tr_signing_integration(funded_taker_wallet_p2tr, taker_config):
+    """Test that a P2TR taker can sign its own inputs with Schnorr signatures.
+
+    This mirrors test_taker_signing_integration but uses a taproot (P2TR) wallet.
+    It verifies the BIP341 key-path signing pipeline:
+    1. P2TR UTXOs are detected from their scriptPubKey (prefix 5120)
+    2. All prevout values/scripts are fetched for BIP341 sighash
+    3. Private key is tweaked per BIP341 before Schnorr signing
+    4. Witness has 1 element (64-byte sig), not 2 (sig + pubkey as in P2WPKH)
+    """
+    from jmcore.bitcoin import (
+        TxInput,
+        TxOutput,
+        address_to_scriptpubkey,
+        create_p2tr_scriptpubkey,
+    )
+    from taker.tx_builder import CoinJoinTxBuilder, CoinJoinTxData
+    from unittest.mock import patch
+
+    wallet = funded_taker_wallet_p2tr
+
+    # Get P2TR UTXOs from the funded wallet
+    utxos_by_depth = {
+        md: wallet.get_all_utxos(md) for md in range(wallet.mixdepth_count)
+    }
+    our_utxos = [u for md_utxos in utxos_by_depth.values() for u in md_utxos]
+    assert len(our_utxos) > 0, "Taker P2TR wallet must have UTXOs"
+
+    taker_utxo = our_utxos[0]
+    assert taker_utxo.is_p2tr, (
+        f"Expected P2TR UTXO, got scriptpubkey: {taker_utxo.scriptpubkey}"
+    )
+
+    # Create a mock maker UTXO (also P2TR for a full-taproot CoinJoin)
+    _maker_address = wallet.get_address(1, 0, 0)  # mixdepth 1, external, index 0
+    _maker_spk = create_p2tr_scriptpubkey(
+        bytes.fromhex(taker_utxo.scriptpubkey)[2:]  # reuse key for simplicity
+    )
+
+    coinjoin_amount = 100_000
+    maker_fee = 1000
+    tx_fee = 500
+
+    # Build proper TxInput/TxOutput objects for CoinJoinTxData
+    taker_input = TxInput.from_hex(taker_utxo.txid, taker_utxo.vout)
+
+    dest_address = wallet.get_address(1, 0, 0)  # P2TR receive destination
+    change_address = wallet.get_address(0, 1, 0)  # P2TR change
+
+    taker_cj_out = TxOutput(
+        value=coinjoin_amount,
+        script=address_to_scriptpubkey(dest_address),
+    )
+    taker_change_val = taker_utxo.value - coinjoin_amount - maker_fee - tx_fee
+    taker_change_out = TxOutput(
+        value=taker_change_val,
+        script=address_to_scriptpubkey(change_address),
+    )
+
+    # Mock maker inputs and outputs (also P2TR to form an all-taproot CoinJoin)
+    maker_input = TxInput.from_hex("0" * 64, 0)
+    maker_cj_out = TxOutput(
+        value=coinjoin_amount,
+        script=address_to_scriptpubkey(dest_address),  # reuse address for simplicity
+    )
+    maker_change_out = TxOutput(
+        value=maker_fee,
+        script=address_to_scriptpubkey(dest_address),
+    )
+
+    cj_data = CoinJoinTxData(
+        taker_inputs=[taker_input],
+        taker_cj_output=taker_cj_out,
+        taker_change_output=taker_change_out,
+        maker_inputs={"maker1": [maker_input]},
+        maker_cj_outputs={"maker1": maker_cj_out},
+        maker_change_outputs={"maker1": maker_change_out},
+        cj_amount=coinjoin_amount,
+        total_maker_fee=maker_fee,
+        tx_fee=tx_fee,
+    )
+
+    builder = CoinJoinTxBuilder(network="regtest")
+    tx_bytes, metadata = builder.build_unsigned_tx(cj_data)
+
+    # Create a mock Taker and sign
+    # Mock backend.get_utxo so the P2TR sighash code can fetch prevouts for
+    # ALL transaction inputs (including the fake maker input which isn't on-chain).
+    from jmwallet.wallet.models import UTXOInfo as UtxoModel
+
+    async def _mock_get_utxo(txid: str, vout: int) -> UtxoModel | None:
+        # Return the real taker UTXO or a minimal fake one for maker inputs
+        if txid == taker_utxo.txid and vout == taker_utxo.vout:
+            return taker_utxo
+        # Fake maker prevout: must have a valid scriptpubkey and value
+        return UtxoModel(
+            txid=txid,
+            vout=vout,
+            value=coinjoin_amount + maker_fee,
+            address=dest_address,
+            confirmations=6,
+            scriptpubkey=address_to_scriptpubkey(dest_address).hex(),
+            path="m/86'/1'/0'/0/0",
+            mixdepth=0,
+        )
+
+    with patch.object(Taker, "__init__", lambda self, *a, **kw: None):
+        taker = Taker.__new__(Taker)
+        taker.wallet = wallet
+        taker.backend = wallet.backend
+        taker.config = taker_config
+        taker.unsigned_tx = tx_bytes
+        taker.tx_metadata = metadata
+        taker.selected_utxos = [taker_utxo]
+        taker.maker_sessions = {}
+        taker.backend.get_utxo = _mock_get_utxo
+
+        signatures = await taker._sign_our_inputs()
+
+    assert len(signatures) == 1, f"Expected 1 signature, got {len(signatures)}"
+
+    sig_entry = signatures[0]
+    # Each entry: {txid, vout, signature (hex), pubkey (hex), witness (list[hex])}
+    assert "signature" in sig_entry
+    assert "witness" in sig_entry
+    assert "txid" in sig_entry
+    assert "vout" in sig_entry
+
+    # P2TR witness: single element (Schnorr sig only), NOT [sig, pubkey]
+    witness = sig_entry["witness"]
+    assert len(witness) == 1, (
+        f"P2TR witness should have 1 element (sig only), got {len(witness)}"
+    )
+
+    sig_hex = witness[0]
+    sig_bytes = bytes.fromhex(sig_hex)
+
+    # BIP340 Schnorr signature: exactly 64 bytes for SIGHASH_DEFAULT
+    assert len(sig_bytes) == 64, (
+        f"Schnorr signature should be 64 bytes, got {len(sig_bytes)}"
+    )
+
+    print("P2TR taker signing integration test PASSED")
 
 
 # ==============================================================================

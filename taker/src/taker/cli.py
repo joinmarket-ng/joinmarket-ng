@@ -62,6 +62,7 @@ def build_taker_config(
     max_rel_fee: str | None = None,
     fee_rate: float | None = None,
     block_target: int | None = None,
+    address_type: str | None = None,
     bondless_makers_allowance: float | None = None,
     bond_value_exponent: float | None = None,
     bondless_require_zero_fee: bool | None = None,
@@ -212,6 +213,7 @@ def build_taker_config(
         minimum_makers=settings.taker.minimum_makers,
         rescan_interval_sec=settings.taker.rescan_interval_sec,
         select_utxos=select_utxos,
+        address_type=address_type if address_type is not None else settings.wallet.address_type,
     )
 
 
@@ -236,7 +238,7 @@ def create_backend(config: TakerConfig) -> Any:
         fingerprint = get_mnemonic_fingerprint(
             config.mnemonic.get_secret_value(), config.passphrase.get_secret_value() or ""
         )
-        wallet_name = generate_wallet_name(fingerprint, bitcoin_network.value)
+        wallet_name = generate_wallet_name(fingerprint, bitcoin_network.value, config.address_type)
         return DescriptorWalletBackend(
             rpc_url=config.backend_config["rpc_url"],
             rpc_user=config.backend_config["rpc_user"],
@@ -377,6 +379,9 @@ def coinjoin(
             help="Interactively select UTXOs (fzf-like TUI)",
         ),
     ] = False,
+    address_type: Annotated[
+        str, typer.Option("--address-type", "-A", help="Address type: p2wpkh (default) or p2tr")
+    ] = "p2wpkh",
     yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip confirmation prompt")] = False,
     log_level: Annotated[
         str | None,
@@ -431,6 +436,7 @@ def coinjoin(
             max_rel_fee=max_rel_fee,
             fee_rate=fee_rate,
             block_target=block_target,
+            address_type=address_type,
             bondless_makers_allowance=bondless_makers_allowance,
             bond_value_exponent=bond_value_exponent,
             bondless_require_zero_fee=bondless_require_zero_fee,
@@ -447,7 +453,14 @@ def coinjoin(
     try:
         asyncio.run(
             _run_coinjoin(
-                settings, config, amount, destination, mixdepth, config.counterparty_count, yes
+                settings,
+                config,
+                amount,
+                destination,
+                mixdepth,
+                config.counterparty_count,
+                address_type,
+                yes,
             )
         )
     except RuntimeError as e:
@@ -470,6 +483,7 @@ async def _run_coinjoin(
     destination: str,
     mixdepth: int,
     counterparties: int,
+    address_type: str,
     skip_confirmation: bool,
 ) -> None:
     """Run CoinJoin transaction."""
@@ -509,6 +523,7 @@ async def _run_coinjoin(
         network=bitcoin_network.value,
         mixdepth_count=config.mixdepth_count,
         data_dir=config.data_dir,
+        address_type=address_type,
     )
 
     # Create confirmation callback
@@ -653,6 +668,9 @@ def tumble(
         str | None,
         typer.Option("--log-level", "-l", help="Log level"),
     ] = None,
+    address_type: Annotated[
+        str, typer.Option("--address-type", "-A", help="Address type: p2wpkh (default) or p2tr")
+    ] = "p2wpkh",
 ) -> None:
     """
     Run a tumbler schedule of CoinJoins.
@@ -709,6 +727,7 @@ def tumble(
             directory_servers=directory_servers,
             tor_socks_host=tor_socks_host,
             tor_socks_port=tor_socks_port,
+            address_type=address_type,
         )
     except ValueError as e:
         logger.error(str(e))
@@ -719,7 +738,7 @@ def tumble(
     logger.info(f"Using backend: {config.backend_type}")
 
     try:
-        asyncio.run(_run_tumble(settings, config, schedule))
+        asyncio.run(_run_tumble(settings, config, schedule, address_type))
     except RuntimeError as e:
         # Clean error for expected failures (e.g., connection failures)
         logger.error(f"Tumble failed: {e}")
@@ -734,7 +753,7 @@ def tumble(
 
 
 async def _run_tumble(
-    settings: JoinMarketSettings, config: TakerConfig, schedule: Schedule
+    settings: JoinMarketSettings, config: TakerConfig, schedule: Schedule, address_type: str
 ) -> None:
     """Run tumbler schedule."""
     from taker.taker import Taker
@@ -773,6 +792,7 @@ async def _run_tumble(
         network=bitcoin_network.value,
         mixdepth_count=config.mixdepth_count,
         data_dir=config.data_dir,
+        address_type=address_type,
     )
 
     # Create taker
