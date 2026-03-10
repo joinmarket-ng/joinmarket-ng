@@ -256,6 +256,15 @@ class MakerConfig(WalletConfig):
         description="Interval in seconds for periodic wallet rescans (default: 10 minutes)",
     )
 
+    offer_reannounce_delay_max: int = Field(
+        default=600,
+        ge=0,
+        description=(
+            "Maximum random delay in seconds before re-announcing offers after "
+            "a balance change (0 = immediate, default: 600s = 10 minutes)"
+        ),
+    )
+
     # UTXO merge algorithm - how many UTXOs to use
     merge_algorithm: MergeAlgorithm = Field(
         default=MergeAlgorithm.DEFAULT,
