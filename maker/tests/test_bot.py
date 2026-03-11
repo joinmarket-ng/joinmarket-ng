@@ -571,7 +571,7 @@ class TestWalletRescanAndOfferUpdate:
                 oid=0,
                 ordertype=OfferType.SW0_RELATIVE,
                 minsize=100_000,
-                maxsize=400_000,  # Initial maxsize
+                maxsize=262_144,  # Initial maxsize (2^18, as OfferManager would produce)
                 txfee=1000,
                 cjfee="0.001",
             )
@@ -708,19 +708,21 @@ class TestOfferPrivacy:
     """
 
     def test_round_maxsize_to_power_of_2_exact_powers(self):
-        """Test rounding for exact powers of 2."""
+        """Test rounding for exact powers of 2 (value is unchanged)."""
         from maker.offers import _round_maxsize_to_power_of_2
 
         assert _round_maxsize_to_power_of_2(1) == 1
         assert _round_maxsize_to_power_of_2(2) == 2
         assert _round_maxsize_to_power_of_2(1024) == 1024
         assert _round_maxsize_to_power_of_2(1_048_576) == 1_048_576  # 2^20
-        assert _round_maxsize_to_power_of_2(100_000_000) == 67_108_864  # 2^26
+        assert _round_maxsize_to_power_of_2(67_108_864) == 67_108_864  # 2^26
 
     def test_round_maxsize_to_power_of_2_between_powers(self):
-        """Test rounding for values between powers of 2."""
+        """Test rounding for values between powers of 2 (value is floored)."""
         from maker.offers import _round_maxsize_to_power_of_2
 
+        # 100M sats (1 BTC) → 2^26 = 67_108_864
+        assert _round_maxsize_to_power_of_2(100_000_000) == 67_108_864
         # 150M sats (1.5 BTC) → 2^27 = 134_217_728
         assert _round_maxsize_to_power_of_2(150_000_000) == 134_217_728
         # 70M sats (0.7 BTC) → 2^26 = 67_108_864
@@ -906,6 +908,57 @@ class TestOfferPrivacy:
             mock_sleep.assert_not_called()
 
         bot._announce_offers.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_relative_offer_skipped_when_rounded_max_below_profit_minsize(
+        self, mock_wallet, mock_backend, config_no_delay
+    ):
+        """Regression: rounded_max must be compared against the effective min_size
+        (which accounts for profitability), not just offer_cfg.min_size.
+
+        With a high tx_fee_contribution relative to cj_fee_relative, min_size_for_profit
+        can exceed rounded_max even when rounded_max > offer_cfg.min_size, which would
+        produce an invalid offer where minsize > maxsize.
+        """
+        from unittest.mock import AsyncMock, patch
+
+        from maker.config import OfferConfig
+        from maker.offers import OfferManager
+
+        # max_balance=180_000, tx_fee_contribution=1000, cj_fee_relative=0.001
+        # max_available = 180_000 - 27_300 (dust) = 152_700
+        # rounded_max = 2^17 = 131_072
+        # min_size_for_profit = int(1.5 * 1000 / 0.001) = 1_500_000
+        # min_size = max(1_500_000, 27_300) = 1_500_000
+        # Without fix: rounded_max (131_072) > offer_cfg.min_size (27_300) -> CREATED
+        #              but minsize=1_500_000 > maxsize=131_072 (invalid offer!)
+        # With fix:    rounded_max (131_072) <= min_size (1_500_000) -> SKIPPED (correct)
+        config = MakerConfig(
+            mnemonic="test " * 12,
+            directory_servers=["localhost:5222"],
+            network=NetworkType.REGTEST,
+            offer_reannounce_delay_max=0,
+            offer_configs=[
+                OfferConfig(
+                    offer_type=OfferType.SW0_RELATIVE,
+                    min_size=27_300,
+                    cj_fee_relative="0.001",
+                    tx_fee_contribution=1_000,
+                )
+            ],
+        )
+        mock_wallet.get_balance_for_offers = AsyncMock(return_value=180_000)
+
+        manager = OfferManager(mock_wallet, config, "J5TestMaker")
+        with patch("maker.offers.get_best_fidelity_bond", new=AsyncMock(return_value=None)):
+            offers = await manager.create_offers()
+
+        # Offer must be skipped, not created with minsize > maxsize
+        assert offers == [], (
+            f"Expected no offers, but got {len(offers)} offer(s) with "
+            f"minsize={offers[0].minsize if offers else 'N/A'}, "
+            f"maxsize={offers[0].maxsize if offers else 'N/A'}"
+        )
 
 
 class TestPeerCountDetection:

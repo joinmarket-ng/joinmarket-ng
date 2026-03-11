@@ -177,10 +177,10 @@ class OfferManager:
 
             rounded_max = _round_maxsize_to_power_of_2(max_available)
 
-            if rounded_max <= offer_cfg.min_size:
+            if rounded_max <= min_size:
                 logger.warning(
                     f"Offer {offer_id}: Rounded maxsize too small: "
-                    f"rounded_max={rounded_max} <= min_size={offer_cfg.min_size} "
+                    f"rounded_max={rounded_max} <= min_size={min_size} "
                     f"(exact max_available={max_available})"
                 )
                 return None
