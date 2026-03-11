@@ -902,7 +902,9 @@ async def test_complete_coinjoin_two_makers(
 
         # Verify taker can see offers from Docker makers
         print("Fetching orderbook...")
-        offers = await taker.directory_client.fetch_orderbook(timeout=15.0)
+        offers = await taker.directory_client.fetch_orderbook(
+            max_wait=15.0, min_wait=15.0, quiet_period=0.0
+        )
         print(f"Found {len(offers)} offers in orderbook")
 
         if len(offers) < 2:
@@ -1017,7 +1019,9 @@ async def test_coinjoin_with_multi_utxo_maker(
 
         # Fetch orderbook
         print("Fetching orderbook...")
-        offers = await taker.directory_client.fetch_orderbook(timeout=15.0)
+        offers = await taker.directory_client.fetch_orderbook(
+            max_wait=15.0, min_wait=15.0, quiet_period=0.0
+        )
         print(f"Found {len(offers)} offers in orderbook")
 
         if len(offers) < 1:

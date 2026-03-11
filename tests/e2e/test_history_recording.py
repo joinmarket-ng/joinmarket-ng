@@ -199,7 +199,9 @@ async def test_coinjoin_creates_history_entry(
             await taker.start()
 
             # Fetch orderbook
-            offers = await taker.directory_client.fetch_orderbook(timeout=15.0)
+            offers = await taker.directory_client.fetch_orderbook(
+                max_wait=15.0, min_wait=15.0, quiet_period=0.0
+            )
             if len(offers) < 2:
                 pytest.skip(f"Need at least 2 offers, found {len(offers)}")
 

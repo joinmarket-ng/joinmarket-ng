@@ -1066,6 +1066,166 @@ jobs:
             coverage.xml
         if: always()
 
+  test-neutrino-reference:
+    needs: build-images
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: read
+    env:
+      DIRECTORY_SERVER_IMAGE: ghcr.io/${{ github.repository }}/directory-server:ci-${{ github.sha }}
+      ORDERBOOK_WATCHER_IMAGE: ghcr.io/${{ github.repository }}/orderbook-watcher:ci-${{ github.sha }}
+      MAKER_IMAGE: ghcr.io/${{ github.repository }}/maker:ci-${{ github.sha }}
+      TAKER_IMAGE: ghcr.io/${{ github.repository }}/taker:ci-${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: ./.github/actions/setup-python-deps
+        with:
+          components: jmcore,jmwallet,directory_server,orderbook_watcher,maker,taker
+          install-dev: 'true'
+
+      - name: Install JAM dependencies
+        run: |
+          pip install \
+            autobahn==22.7.1 \
+            twisted==22.10.0 \
+            mnemonic==0.20 \
+            pyjwt==2.4.0 \
+            klein \
+            werkzeug
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull pre-built images
+        run: |
+          docker pull $DIRECTORY_SERVER_IMAGE
+          docker pull $ORDERBOOK_WATCHER_IMAGE
+          docker pull $MAKER_IMAGE
+          docker pull $TAKER_IMAGE
+
+      - name: "Start reference + neutrino services"
+        env:
+          TOR_HS_ED25519_SECRET_KEY_BASE64: ${{ secrets.TOR_HS_ED25519_SECRET_KEY_BASE64 }}
+          DOCKER_BUILDKIT: 1
+          COMPOSE_DOCKER_CLI_BUILD: 1
+        run: |
+          docker compose --profile reference --profile neutrino up -d
+
+          echo "Waiting for Bitcoin..."
+          for i in {1..60}; do
+            if docker compose exec -T bitcoin bitcoin-cli -chain=regtest \
+                -rpcport=18443 -rpcuser=test -rpcpassword=test getblockchaininfo 2>/dev/null; then
+              echo "Bitcoin ready"
+              break
+            fi
+            echo "Attempt $i/60..."
+            sleep 2
+          done
+
+          echo "Waiting for directory server..."
+          for i in {1..30}; do
+            if nc -z localhost 5222 2>/dev/null; then
+              echo "Directory server ready"
+              break
+            fi
+            sleep 2
+          done
+
+          echo "Waiting for Tor hidden service..."
+          for i in {1..90}; do
+            if docker compose exec -T tor cat /var/lib/tor/directory/hostname 2>/dev/null | grep -q ".onion"; then
+              ONION=$(docker compose exec -T tor cat /var/lib/tor/directory/hostname 2>/dev/null | tr -d '[:space:]')
+              echo "Tor ready with onion address: $ONION"
+              break
+            fi
+            echo "Attempt $i/90: Waiting for Tor..."
+            sleep 2
+          done
+
+          echo "Waiting for JAM..."
+          for i in {1..30}; do
+            if docker compose exec -T jam sh -c "timeout 5 bash -c '</dev/tcp/127.0.0.1/80'" 2>/dev/null; then
+              echo "JAM ready"
+              break
+            fi
+            sleep 5
+          done
+
+          echo "Waiting for Neutrino..."
+          for i in {1..30}; do
+            if curl -s http://localhost:8334/v1/status >/dev/null 2>&1; then
+              echo "Neutrino ready"
+              break
+            fi
+            sleep 2
+          done
+
+          echo "Waiting for makers to connect and announce offers..."
+          sleep 60
+
+          echo "Reference + neutrino services ready!"
+
+      - name: Run neutrino-reference compatibility tests
+        env:
+          BITCOIN_RPC_URL: http://127.0.0.1:18443
+          BITCOIN_RPC_USER: test
+          BITCOIN_RPC_PASSWORD: test
+          NEUTRINO_URL: http://127.0.0.1:8334
+        run: |
+          pytest -c pytest.ini -m neutrino_reference --junitxml=junit/test-results.xml \
+            --cov --cov-report=term-missing --cov-report=xml \
+            -v -s --timeout=900 --reruns=1 --reruns-delay=10 --fail-on-skip
+
+      - name: Show logs
+        if: always()
+        run: |
+          echo "=== Docker compose status ==="
+          docker compose --profile reference --profile neutrino ps
+          echo ""
+          echo "=== Bitcoin logs ==="
+          docker compose logs bitcoin --tail=30
+          echo ""
+          echo "=== Directory logs ==="
+          docker compose logs directory --tail=50
+          echo ""
+          echo "=== Maker1 logs ==="
+          docker compose logs maker1 --tail=50
+          echo ""
+          echo "=== Maker2 logs ==="
+          docker compose logs maker2 --tail=50
+          echo ""
+          echo "=== Neutrino maker logs ==="
+          docker compose logs maker-neutrino --tail=100
+          echo ""
+          echo "=== Tor logs ==="
+          docker compose logs tor --tail=30
+          echo ""
+          echo "=== JAM logs ==="
+          docker compose logs jam --tail=50
+
+      - name: Cleanup
+        if: always()
+        run: docker compose --profile reference --profile neutrino down -v
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: neutrino-reference-results
+          path: |
+            junit/test-results.xml
+            coverage.xml
+        if: always()
+
   test-reference-maker:
     needs: build-images
     runs-on: ubuntu-latest
@@ -1403,6 +1563,7 @@ jobs:
       - test-reference-legacy
       - test-neutrino-functional
       - test-neutrino-coinjoin
+      - test-neutrino-reference
       - test-reference-maker
       # ARM builds (run in parallel with everything)
       - build-arm64

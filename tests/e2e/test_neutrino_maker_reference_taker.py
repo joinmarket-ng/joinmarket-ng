@@ -82,17 +82,16 @@ def ensure_neutrino_maker_running() -> bool:
 
 # Mark all tests in this module
 pytestmark = [
-    pytest.mark.reference,
-    pytest.mark.neutrino,
+    pytest.mark.neutrino_reference,
     pytest.mark.skipif(
         not is_jam_running(),
         reason="Reference services not running. Start with: "
-        "docker compose --profile all up -d",
+        "docker compose --profile reference --profile neutrino up -d",
     ),
     pytest.mark.skipif(
         not is_neutrino_maker_running(),
         reason="Neutrino maker not running. Start with: "
-        "docker compose --profile all up -d",
+        "docker compose --profile reference --profile neutrino up -d",
     ),
 ]
 
@@ -106,14 +105,18 @@ def neutrino_reference_services():
         pytest.skip(f"Compose file not found: {compose_file}")
 
     if not is_jam_running():
-        pytest.skip("JAM not running. Start with: docker compose --profile all up -d")
+        pytest.skip(
+            "JAM not running. Start with: docker compose --profile reference --profile neutrino up -d"
+        )
 
     if not is_tor_running():
-        pytest.skip("Tor not running. Start with: docker compose --profile all up -d")
+        pytest.skip(
+            "Tor not running. Start with: docker compose --profile reference --profile neutrino up -d"
+        )
 
     if not is_neutrino_maker_running():
         pytest.skip(
-            "Neutrino maker not running. Start with: docker compose --profile all up -d"
+            "Neutrino maker not running. Start with: docker compose --profile reference --profile neutrino up -d"
         )
 
     # Wait for core services
