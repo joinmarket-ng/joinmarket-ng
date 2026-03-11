@@ -147,6 +147,66 @@ jm-taker coinjoin \
   --counterparties 6
 ```
 
+### Swap Input (Fee Camouflage)
+
+Add a swap input to make your CoinJoin indistinguishable from a maker's on-chain footprint. The taker acquires an extra UTXO via a Lightning reverse submarine swap that covers all fees plus a fake "fee earned" amount:
+
+```bash
+jm-taker coinjoin \
+  --mnemonic-file ~/.joinmarket-ng/wallets/default.mnemonic \
+  --amount 1000000 \
+  --swap-input
+```
+
+With a specific swap provider (bypasses Nostr discovery):
+
+```bash
+jm-taker coinjoin \
+  --mnemonic-file ~/.joinmarket-ng/wallets/default.mnemonic \
+  --amount 1000000 \
+  --swap-input \
+  --swap-provider http://swap.example.com:9999
+```
+
+Or enable permanently in `~/.joinmarket-ng/config.toml`:
+
+```toml
+[swap]
+enabled = true
+# provider_url = "http://swap.example.com:9999"  # optional, otherwise uses Nostr discovery
+# max_swap_fee_pct = 2.0
+
+# When the swap amount is padded to the provider minimum, distribute leftover
+# sats across maker fees to equalize them (improves privacy). Default: true
+# equalize_fees = true
+
+# Optional: LND connection for automatic invoice payment
+# If configured, the taker pays swap invoices automatically via its own LND node.
+# If not configured, the invoice is logged for manual payment (or the provider
+# must be in mock mode for testing).
+# lnd_rest_url = "https://127.0.0.1:8081"
+# lnd_cert_path = "/path/to/tls.cert"
+# lnd_macaroon_path = "/path/to/admin.macaroon"
+```
+
+**How it works:**
+
+1. **Early discovery**: Before the CoinJoin confirmation prompt, the taker discovers a swap provider (via Nostr relays or direct URL) and checks that the expected swap amount meets the provider's minimum. The confirmation summary shows full swap details including provider fee, mining fee, and whether padding was applied.
+
+2. **Fee equalization**: If the swap amount is padded up to the provider's minimum (e.g., from 5,000 to 20,000 sats), the leftover sats are distributed across maker fees using a sequential leveling algorithm. This makes all maker fees more uniform, preventing an observer from matching individual CoinJoin outputs to specific orderbook offers. Disable with `equalize_fees = false`.
+
+3. **Stream isolation**: All swap-related Tor connections use separate circuits from directory and peer traffic, preventing traffic correlation.
+
+4. **Nostr DM-based RPC**: When the provider is discovered via Nostr (no direct HTTP URL), all swap communication uses NIP-04 encrypted direct messages (kind 25582) over Nostr relays. The taker generates a fresh ephemeral keypair per session, encrypts requests with ECDH + AES-256-CBC, and signs events with BIP-340 Schnorr. Responses are correlated by `reply_to` field. This eliminates any direct network connection to the provider.
+
+5. **Prepay invoice**: If the provider returns a `minerFeeInvoice` (a prepay for mining fees), the taker pays it before the main hold invoice. This matches the Electrum swap server protocol.
+
+6. **Trustless lockup detection**: Instead of trusting the provider's `/swapstatus` endpoint, the taker monitors for the lockup UTXO directly on-chain using its own Bitcoin node (`BlockchainBackend`). This provides trustless confirmation that the provider has locked funds into the swap contract.
+
+The swap input is best-effort: if the swap provider is unreachable or the swap fails, the CoinJoin proceeds normally without it. Not compatible with sweep mode (`--amount 0`).
+
+See [Swap Input](technical/privacy.md#swap-input-taker-fee-camouflage) for the privacy rationale and protocol details.
+
 ## Tumbler (Automated Mixing)
 
 For maximum privacy, use the tumbler to execute multiple CoinJoins over time.
@@ -360,6 +420,13 @@ Note: Takers only need Tor SOCKS proxy (port 9050) - they don't serve a hidden s
 | `TOR__SOCKS_HOST` | `127.0.0.1` | Tor SOCKS proxy host |
 | `TOR__SOCKS_PORT` | `9050` | Tor SOCKS proxy port |
 | `LOGGING__SENSITIVE_LOGGING` | `false` | Enable sensitive logging (set to `true`) |
+| `SWAP__ENABLED` | `false` | Enable swap input for fee camouflage |
+| `SWAP__PROVIDER_URL` | - | Direct swap provider URL (bypasses Nostr discovery) |
+| `SWAP__MAX_SWAP_FEE_PCT` | `2.0` | Maximum swap fee as percentage of swap amount |
+| `SWAP__EQUALIZE_FEES` | `true` | Distribute leftover sats across maker fees to equalize them |
+| `SWAP__LND_REST_URL` | - | LND REST API URL for automatic invoice payment |
+| `SWAP__LND_CERT_PATH` | - | Path to LND TLS certificate |
+| `SWAP__LND_MACAROON_PATH` | - | Path to LND admin macaroon |
 
 ## CLI Reference
 
@@ -389,6 +456,8 @@ jm-taker tumble --help
 | `--bondless-allowance` | 0.125 | Fraction of time to choose makers randomly (0.0-1.0) |
 | `--bond-exponent` | 1.3 | Exponent for fidelity bond value calculation |
 | `--bondless-zero-fee` | enabled | Require zero absolute fee for bondless spots |
+| `--swap-input` | disabled | Enable swap input for fee camouflage |
+| `--swap-provider` | - | Direct swap provider URL (bypasses Nostr discovery) |
 
 Use env vars for RPC credentials (see jmwallet README).
 

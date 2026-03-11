@@ -795,6 +795,7 @@ async def test_taker_signing_integration(funded_taker_wallet: WalletService):
         taker.unsigned_tx = tx_bytes
         taker.tx_metadata = metadata
         taker.selected_utxos = [taker_utxo]
+        taker.swap_input = None
 
         # Sign the inputs
         signatures = await taker._sign_our_inputs()

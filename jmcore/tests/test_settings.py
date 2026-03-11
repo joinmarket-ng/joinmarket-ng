@@ -44,7 +44,7 @@ def reset_settings_fixture(
 def temp_data_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Create a temporary data directory and set it as JOINMARKET_DATA_DIR."""
     data_dir = tmp_path / ".joinmarket-ng"
-    data_dir.mkdir(parents=True)
+    data_dir.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("JOINMARKET_DATA_DIR", str(data_dir))
     return data_dir
 

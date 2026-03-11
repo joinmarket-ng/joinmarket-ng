@@ -236,6 +236,7 @@ class TestTakerSigning:
             taker.backend = mock_backend
             taker.config = mock_config
             taker.selected_utxos = taker_utxos
+            taker.swap_input = None
 
             # Build the transaction
             builder = CoinJoinTxBuilder(network="regtest")
@@ -284,6 +285,7 @@ class TestTakerSigning:
             taker.backend = mock_backend
             taker.config = mock_config
             taker.selected_utxos = taker_utxos
+            taker.swap_input = None
 
             builder = CoinJoinTxBuilder(network="regtest")
             tx_bytes, metadata = builder.build_unsigned_tx(sample_coinjoin_tx_data)
@@ -314,6 +316,7 @@ class TestTakerSigning:
             taker.backend = mock_backend
             taker.config = mock_config
             taker.selected_utxos = []
+            taker.swap_input = None
             taker.unsigned_tx = b"\x02\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00"
 
             signatures = await taker._sign_our_inputs()
@@ -337,6 +340,7 @@ class TestTakerSigning:
             taker.backend = mock_backend
             taker.config = mock_config
             taker.selected_utxos = taker_utxos
+            taker.swap_input = None
             taker.unsigned_tx = b""
 
             signatures = await taker._sign_our_inputs()
@@ -456,6 +460,7 @@ class TestEdgeCases:
             taker.backend = mock_backend
             taker.config = mock_config
             taker.selected_utxos = utxos
+            taker.swap_input = None
 
             builder = CoinJoinTxBuilder(network="regtest")
             tx_bytes, metadata = builder.build_unsigned_tx(sample_coinjoin_tx_data)
@@ -505,6 +510,7 @@ class TestEdgeCases:
             taker.backend = mock_backend
             taker.config = mock_config
             taker.selected_utxos = utxos
+            taker.swap_input = None
 
             builder = CoinJoinTxBuilder(network="regtest")
             tx_bytes, metadata = builder.build_unsigned_tx(sample_coinjoin_tx_data)
@@ -610,6 +616,7 @@ class TestPhaseCollectSignaturesCompleteness:
             taker.unsigned_tx = tx_bytes
             taker.tx_metadata = metadata
             taker.selected_utxos = []
+            taker.swap_input = None
             taker.cj_amount = tx_data.cj_amount
             taker.cj_destination = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"
             taker.taker_change_address = ""

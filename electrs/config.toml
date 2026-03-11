@@ -1,0 +1,8 @@
+# Electrs configuration for regtest e2e testing
+# auth = "user:password" uses RPC username/password auth (no cookie file needed)
+auth = "test:test"
+network = "regtest"
+electrum_rpc_addr = "0.0.0.0:50001"
+daemon_rpc_addr = "jm-bitcoin:18443"
+daemon_p2p_addr = "jm-bitcoin:18444"
+db_dir = "/data"

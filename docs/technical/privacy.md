@@ -69,6 +69,53 @@ Selection priority: confirmations (desc) -> value (desc)
 - **Taker** (`cmtdata/commitments.json`): Tracks locally used commitments
 - **Maker** (`cmtdata/commitmentlist`): Network-wide blacklist via `!hp2`
 
+### Swap Input (Taker Fee Camouflage)
+
+In a standard CoinJoin, the taker pays fees (maker fees + tx fee) while makers earn fees. This asymmetry is visible on-chain: the taker's total input exceeds their total output by the fees paid, while each maker's total output exceeds their total input by the fee earned. An observer can exploit this with subset sum analysis to identify the taker.
+
+**Swap input** eliminates this asymmetry by adding an extra UTXO to the taker's inputs, obtained via a Lightning Network reverse submarine swap (LN -> on-chain). The swap amount covers:
+
+```
+swap_amount = sum(maker_fees) + tx_fee + fake_fee
+```
+
+Where `fake_fee` is a random amount in the range `[fake_fee_min, fake_fee_max]` (default: 100-1000 sats). After the swap input is added, the taker's change output gains sats relative to their wallet inputs — exactly like a maker earning a CoinJoin fee. An observer performing subset sum analysis sees every participant (taker and makers alike) with a net gain in their non-equal outputs.
+
+**Protocol: Electrum-Compatible P2WSH HTLC**
+
+The swap uses a reverse submarine swap: the taker pays a Lightning invoice and receives an on-chain UTXO locked in a P2WSH HTLC:
+
+```
+OP_SIZE <32> OP_EQUAL
+OP_IF
+    OP_HASH160 <ripemd160(sha256(preimage))> OP_EQUALVERIFY <claim_pubkey>
+OP_ELSE
+    OP_DROP <locktime> OP_CLTV OP_DROP <refund_pubkey>
+OP_ENDIF
+OP_CHECKSIG
+```
+
+The claim path requires the preimage (known to the taker, who generated it) and a signature from the claim key (also the taker's). This P2WSH construction is critical: the claim witness (`<signature> <preimage> <witness_script>`) can be embedded directly into the CoinJoin transaction without any interactive signing with the swap provider. Taproot-based protocols (e.g., Boltz) require MuSig2 co-signing, which is incompatible with CoinJoin signing flow.
+
+**Provider Discovery**
+
+Swap providers are discovered via Nostr relays using kind `30315` events with d-tag `electrum-swapserver-5` and network tag `#r net:<network>`. Alternatively, a direct HTTP URL can be specified via `--swap-provider` or `[swap] provider_url` in config.
+
+**Invoice Payment**
+
+The swap server (an Electrum daemon with the `swapserver` plugin) creates a real BOLT11 hold invoice via its built-in Lightning node. The taker pays the invoice automatically via its own LND node (configured with `lnd_rest_url`/`lnd_cert_path`/`lnd_macaroon_path`). If the server returns a `minerFeeInvoice` (prepay for on-chain mining fees), the taker pays it first before the main hold invoice. The server monitors invoice settlement and only broadcasts the lockup transaction after payment is confirmed.
+
+**Failure Mode**
+
+Swap input is best-effort. If the swap provider is unreachable, the swap times out, or verification fails, the taker falls back to a normal CoinJoin without the swap input. A warning is logged but the CoinJoin proceeds.
+
+**Limitations**
+
+- Incompatible with sweep mode (`--amount 0`) since sweep uses all inputs for a single output
+- Requires a Lightning Network route to the swap provider's node
+- The P2WSH swap input has a slightly larger witness (~165 vbytes vs ~68 for P2WPKH), but this is accounted for in fee calculation
+- The swap provider charges a fee (percentage + mining fee), which is an additional cost on top of normal CoinJoin fees
+
 ### Fidelity Bonds
 
 Fidelity bonds allow makers to prove locked bitcoins, improving trust and selection probability.

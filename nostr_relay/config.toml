@@ -1,0 +1,44 @@
+# Nostr relay configuration for regtest e2e testing
+# Used by scsibug/nostr-rs-relay
+#
+# Minimal config: accept all events, no authentication, no limits.
+# This relay handles:
+# - Kind 30315: Swap server offer announcements (NIP-38)
+# - Kind 25582: Encrypted DM RPCs for swap operations (NIP-04)
+
+[info]
+relay_url = "ws://jm-nostr-relay:7000/"
+name = "JoinMarket Regtest Relay"
+description = "Nostr relay for JoinMarket swap server e2e testing"
+
+[database]
+data_directory = "/usr/src/app/db"
+# In-memory mode for faster tests (no persistence needed)
+# engine = "sqlite"
+
+[network]
+port = 7000
+address = "0.0.0.0"
+# No remote IP header needed (internal Docker network)
+
+[limits]
+# Very permissive for testing
+messages_per_sec = 100
+max_event_bytes = 131072
+max_ws_message_bytes = 131072
+max_ws_frame_bytes = 131072
+broadcast_buffer = 16384
+event_persist_buffer = 4096
+
+# [authorization]
+# No pubkey_whitelist: accept events from all pubkeys in regtest.
+# Note: setting pubkey_whitelist = [] in nostr-rs-relay enables
+# restricted_writes, blocking ALL event submissions.
+
+[verified_users]
+# No NIP-05 verification needed for testing
+mode = "disabled"
+
+[pay_to_relay]
+# No payment required for testing
+enabled = false

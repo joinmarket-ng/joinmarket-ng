@@ -48,6 +48,9 @@ class CoinJoinTxData:
     total_maker_fee: int
     tx_fee: int
 
+    # Swap input tracking: index in taker_inputs that is the swap UTXO (None if no swap)
+    swap_input_index: int | None = None
+
 
 class CoinJoinTxBuilder:
     """
@@ -108,6 +111,12 @@ class CoinJoinTxBuilder:
             "input_values": [inp.value for inp, _ in all_inputs],
             "fee": tx_data.tx_fee,
         }
+
+        # Track swap input position after shuffle (if present)
+        if tx_data.swap_input_index is not None:
+            swap_txinput = tx_data.taker_inputs[tx_data.swap_input_index]
+            metadata["swap_input_txid"] = swap_txinput.txid
+            metadata["swap_input_vout"] = swap_txinput.vout
 
         # Serialize transaction
         tx_bytes = self._serialize_tx(
@@ -228,26 +237,36 @@ def calculate_tx_fee(
     num_maker_inputs: int,
     num_outputs: int,
     fee_rate: float,
+    num_swap_inputs: int = 0,
 ) -> int:
     """
     Calculate transaction fee based on estimated vsize.
 
     SegWit P2WPKH inputs: ~68 vbytes each
+    SegWit P2WSH inputs (swap HTLC claim): ~165 vbytes each
     P2WPKH outputs: 31 vbytes each
     Overhead: ~11 vbytes
 
     Args:
+        num_taker_inputs: Number of taker P2WPKH inputs
+        num_maker_inputs: Number of maker P2WPKH inputs
+        num_outputs: Number of outputs
         fee_rate: Fee rate in sat/vB (can be fractional, e.g. 0.5)
+        num_swap_inputs: Number of P2WSH swap inputs (usually 0 or 1)
 
     Returns:
         Fee in satoshis (rounded up to ensure minimum relay fee)
     """
     # Estimate virtual size
-    input_vsize = (num_taker_inputs + num_maker_inputs) * 68
+    # P2WSH HTLC claim witness: ~1 + 73 (sig) + 33 (preimage) + ~120 (script) = ~227 bytes
+    # P2WSH input vsize: 41 (non-witness) + 227/4 (witness discount) ~= 98 vbytes
+    # Conservative estimate: 165 vbytes for P2WSH swap input
+    p2wpkh_input_vsize = (num_taker_inputs + num_maker_inputs) * 68
+    p2wsh_input_vsize = num_swap_inputs * 165
     output_vsize = num_outputs * 31
     overhead = 11
 
-    vsize = input_vsize + output_vsize + overhead
+    vsize = p2wpkh_input_vsize + p2wsh_input_vsize + output_vsize + overhead
 
     # Round up to ensure we pay at least the minimum
     import math
@@ -268,6 +287,8 @@ def build_coinjoin_tx(
     tx_fee: int,
     network: str = "mainnet",
     dust_threshold: int = 27300,  # Default to DUST_THRESHOLD from jmcore.constants
+    # Optional swap input (submarine swap UTXO for fee/change balancing)
+    swap_utxo: dict[str, Any] | None = None,
 ) -> tuple[bytes, dict[str, Any]]:
     """
     Build a complete CoinJoin transaction.
@@ -276,12 +297,15 @@ def build_coinjoin_tx(
         taker_utxos: List of taker's UTXOs
         taker_cj_address: Taker's CJ output address
         taker_change_address: Taker's change address (empty string if no change needed)
-        taker_total_input: Total value of taker's inputs
+        taker_total_input: Total value of taker's inputs (excluding swap input)
         maker_data: Dict of maker nick -> {utxos, cj_addr, change_addr, cjfee, txfee}
         cj_amount: Equal CoinJoin output amount
         tx_fee: Total transaction fee
         network: Network name
         dust_threshold: Minimum output value in satoshis (default: 27300)
+        swap_utxo: Optional swap input dict with keys: txid, vout, value, scriptpubkey.
+            When provided, this UTXO is added to the taker's inputs. The caller must
+            have already adjusted taker_total_input to include the swap UTXO value.
 
     Returns:
         (tx_bytes, metadata)
@@ -298,6 +322,25 @@ def build_coinjoin_tx(
         )
         for u in taker_utxos
     ]
+
+    # Track swap input index (position in taker_inputs list, before shuffle)
+    swap_input_index: int | None = None
+
+    # Add swap UTXO to taker inputs if provided
+    if swap_utxo is not None:
+        swap_input_index = len(taker_inputs)
+        taker_inputs.append(
+            TxInput.from_hex(
+                txid=swap_utxo["txid"],
+                vout=swap_utxo["vout"],
+                value=swap_utxo["value"],
+                scriptpubkey=swap_utxo.get("scriptpubkey", ""),
+            )
+        )
+        logger.info(
+            f"Added swap input: {swap_utxo['txid']}:{swap_utxo['vout']} "
+            f"({swap_utxo['value']:,} sats)"
+        )
 
     # Calculate taker's fees paid to makers
     total_maker_fee = sum(m["cjfee"] for m in maker_data.values())
@@ -384,6 +427,7 @@ def build_coinjoin_tx(
         cj_amount=cj_amount,
         total_maker_fee=total_maker_fee,
         tx_fee=tx_fee,
+        swap_input_index=swap_input_index,
     )
 
     return builder.build_unsigned_tx(tx_data)

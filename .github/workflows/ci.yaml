@@ -221,6 +221,10 @@ jobs:
             "curl -sf http://127.0.0.1:28183/api/v1/getinfo" \
             60 2
 
+          .github/scripts/wait-for-service.sh "Swap Provider" \
+            "curl -sf http://127.0.0.1:9999/health" \
+            90 2
+
           echo "Waiting for makers to connect..."
           sleep 20
 
@@ -905,7 +909,7 @@ jobs:
 
           echo "Waiting for Neutrino..."
           for i in {1..30}; do
-            if curl -s http://localhost:8334/v1/status >/dev/null 2>&1; then
+            if curl -s http://localhost:8335/v1/status >/dev/null 2>&1; then
               echo "Neutrino ready"
               break
             fi
@@ -919,7 +923,8 @@ jobs:
           BITCOIN_RPC_URL: http://127.0.0.1:18443
           BITCOIN_RPC_USER: test
           BITCOIN_RPC_PASSWORD: test
-          NEUTRINO_URL: http://127.0.0.1:8334
+          NEUTRINO_URL: http://127.0.0.1:8335
+          JM_ORDERBOOK_WAIT_TIME: "10.0"
         run: |
           pytest -c pytest.ini -m neutrino -k "not test_coinjoin" --junitxml=junit/test-results.xml \
             --cov --cov-report=term-missing --cov-report=xml \
@@ -1019,7 +1024,7 @@ jobs:
 
           echo "Waiting for Neutrino..."
           for i in {1..30}; do
-            if curl -s http://localhost:8334/v1/status >/dev/null 2>&1; then
+            if curl -s http://localhost:8335/v1/status >/dev/null 2>&1; then
               echo "Neutrino ready"
               break
             fi
@@ -1033,7 +1038,8 @@ jobs:
           BITCOIN_RPC_URL: http://127.0.0.1:18443
           BITCOIN_RPC_USER: test
           BITCOIN_RPC_PASSWORD: test
-          NEUTRINO_URL: http://127.0.0.1:8334
+          NEUTRINO_URL: http://127.0.0.1:8335
+          JM_ORDERBOOK_WAIT_TIME: "10.0"
         run: |
           pytest -c pytest.ini -m neutrino -k "test_coinjoin" --junitxml=junit/test-results.xml \
             --cov --cov-report=term-missing --cov-report=xml \

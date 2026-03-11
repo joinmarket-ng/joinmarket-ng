@@ -48,6 +48,11 @@ services:
       options:
         max-size: "50m"
         max-file: "3"
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
     healthcheck:
       interval: 10s
       timeout: 10s
@@ -90,6 +95,11 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.2"
+          memory: 64M
     entrypoint: ["/bin/sh", "/scripts/regtest-miner.sh"]
     environment:
       - RPC_HOST=jm-bitcoin
@@ -290,6 +300,11 @@ services:
       options:
         max-size: "50m"
         max-file: "5"
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
     environment:
       - BITCOIN__BACKEND_TYPE=descriptor_wallet
       - BITCOIN__RPC_URL=http://jm-bitcoin:18443
@@ -467,6 +482,233 @@ services:
         condition: service_healthy
     profiles:
       - reference-maker
+      - all
+
+  # ============================================================================
+  # Electrum Swap Server Infrastructure (profile: e2e, all)
+  #
+  # Real Electrum swap server running the swapserver plugin with Lightning.
+  # All swap RPCs go through Nostr DMs (kind 25582, NIP-04 encrypted).
+  # No HTTP ports are exposed externally.
+  #
+  # Architecture:
+  #   bitcoind -> electrs -> electrum-swap-server -> nostr-relay <- taker
+  #   electrum-swap-server (built-in LN) <-> lnd-taker (channel)
+  # ============================================================================
+
+  # Electrs: Rust Electrum server indexing bitcoind for Electrum protocol
+  # Uses getumbrel/electrs (romanz/electrs fork, fully compatible with Electrum wallet)
+  # Note: romanz/electrs uses cookie-file auth, not --cookie=user:pass like mempool/electrs
+  electrs:
+    image: getumbrel/electrs:v0.10.9
+    container_name: jm-electrs
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+    environment:
+      ELECTRS_NETWORK: regtest
+      ELECTRS_DAEMON_RPC_ADDR: jm-bitcoin:18443
+      ELECTRS_DAEMON_P2P_ADDR: jm-bitcoin:18444
+      ELECTRS_ELECTRUM_RPC_ADDR: 0.0.0.0:50001
+      ELECTRS_DB_DIR: /data
+      ELECTRS_LOG_FILTERS: INFO
+    # Create a cookie file for RPC auth (no trailing newline) then exec electrs
+    entrypoint: ["sh", "-c", "printf 'test:test' > /tmp/cookie && exec electrs --cookie-file /tmp/cookie"]
+    volumes:
+      - electrs-data:/data
+    networks:
+      - jm-network
+    healthcheck:
+      test: ["CMD", "bash", "-c", "(echo > /dev/tcp/localhost/50001) 2>/dev/null"]
+      interval: 10s
+      timeout: 5s
+      start_period: 120s
+      retries: 18
+    depends_on:
+      bitcoin:
+        condition: service_healthy
+    profiles:
+      - e2e
+      - all
+
+  # Nostr relay: lightweight Rust relay for swap server DM communication
+  nostr-relay:
+    image: scsibug/nostr-rs-relay:latest
+    container_name: jm-nostr-relay
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128M
+    ports:
+      - "7000:7000"
+    volumes:
+      - ./nostr_relay/config.toml:/usr/src/app/config.toml:ro
+      - nostr-relay-data:/usr/src/app/db
+    networks:
+      - jm-network
+    healthcheck:
+      test: ["CMD", "bash", "-c", "(echo > /dev/tcp/localhost/7000) 2>/dev/null"]
+      interval: 10s
+      timeout: 5s
+      start_period: 10s
+      retries: 5
+    profiles:
+      - e2e
+      - all
+
+  # Electrum swap server: runs Electrum daemon with swapserver plugin
+  # Uses built-in Lightning node (no external LND needed for server side)
+  # Communicates with clients exclusively via Nostr DMs
+  electrum-swap-server:
+    build:
+      context: electrum_swap_server
+      dockerfile: Dockerfile
+    container_name: jm-electrum-swap
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+    environment:
+      - ELECTRS_HOST=jm-electrs
+      - ELECTRS_PORT=50001
+      - NOSTR_RELAY_URL=ws://jm-nostr-relay:7000
+      - SWAPSERVER_PORT=5455
+      - SWAPSERVER_FEE=5000
+      - BITCOIN_NETWORK=regtest
+    volumes:
+      - electrum-data:/home/electrum/.electrum
+      - ./shared:/shared
+    networks:
+      - jm-network
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /shared/electrum-swap-ready"]
+      interval: 10s
+      timeout: 5s
+      start_period: 120s
+      retries: 15
+    depends_on:
+      electrs:
+        condition: service_healthy
+      nostr-relay:
+        condition: service_healthy
+      bitcoin:
+        condition: service_healthy
+    profiles:
+      - e2e
+      - all
+
+  # ============================================================================
+  # LND Taker Node for Lightning Network (profile: e2e, all)
+  # The taker uses LND to pay Lightning invoices created by the swap server.
+  # A setup container opens a cross-implementation channel:
+  #   Electrum (built-in LN) <-> LND-taker
+  # ============================================================================
+
+  lnd-taker:
+    image: lightninglabs/lnd:v0.18.5-beta
+    container_name: jm-lnd-taker
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+    command:
+      - '--noseedbackup'
+      - '--bitcoin.active'
+      - '--bitcoin.regtest'
+      - '--bitcoin.node=bitcoind'
+      - '--bitcoind.rpchost=jm-bitcoin:18443'
+      - '--bitcoind.rpcuser=test'
+      - '--bitcoind.rpcpass=test'
+      - '--bitcoind.zmqpubrawblock=tcp://jm-bitcoin:28332'
+      - '--bitcoind.zmqpubrawtx=tcp://jm-bitcoin:28333'
+      - '--bitcoin.defaultchanconfs=1'
+      - '--listen=0.0.0.0:9735'
+      - '--rpclisten=0.0.0.0:10009'
+      - '--restlisten=0.0.0.0:8080'
+      - '--tlsextradomain=jm-lnd-taker'
+      - '--tlsextraip=0.0.0.0'
+      - '--alias=taker-ln'
+      - '--debuglevel=info'
+      - '--maxpendingchannels=10'
+      - '--accept-keysend'
+    ports:
+      - "10010:10009"
+      - "8081:8080"
+    volumes:
+      - lnd-taker-data:/root/.lnd
+      - ./shared:/shared
+    networks:
+      - jm-network
+    healthcheck:
+      test: ["CMD", "lncli", "--network=regtest", "getinfo"]
+      interval: 10s
+      timeout: 10s
+      start_period: 30s
+      retries: 10
+    depends_on:
+      bitcoin:
+        condition: service_healthy
+    profiles:
+      - e2e
+      - all
+
+  # Lightning channel setup: funds taker LND, opens a cross-implementation channel
+  # between Electrum's built-in LN node and LND-taker.
+  # Runs once on startup and exits.
+  lnd-setup:
+    image: lightninglabs/lnd:v0.18.5-beta
+    container_name: jm-lnd-setup
+    restart: "no"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    entrypoint: ["/bin/sh", "/scripts/setup-lightning.sh"]
+    volumes:
+      - lnd-taker-data:/lnd-taker:ro
+      - ./scripts:/scripts:ro
+      - ./shared:/shared
+    networks:
+      - jm-network
+    depends_on:
+      electrum-swap-server:
+        condition: service_healthy
+      lnd-taker:
+        condition: service_healthy
+      bitcoin:
+        condition: service_healthy
+    profiles:
+      - e2e
       - all
 
   # ============================================================================
@@ -713,6 +955,11 @@ services:
       options:
         max-size: "50m"
         max-file: "3"
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
     healthcheck:
       interval: 10s
       timeout: 10s
@@ -759,6 +1006,11 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.2"
+          memory: 64M
     entrypoint: ["/bin/sh", "/scripts/regtest-miner-jam.sh"]
     environment:
       - RPC_HOST=jm-bitcoin-jam
@@ -827,6 +1079,11 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 256M
     healthcheck:
       # Verify Tor has bootstrapped AND the cookie file is fully written (32 bytes).
       # The cookie file is required by makers/takers to authenticate to the control port.
@@ -1067,6 +1324,11 @@ services:
       options:
         max-size: "50m"
         max-file: "3"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 128M
     environment:
       - NETWORK=regtest
       - LISTEN_ADDR=0.0.0.0:8334
@@ -1074,7 +1336,7 @@ services:
       - LOG_LEVEL=debug
       - CONNECT_PEERS=jm-bitcoin:18444
     ports:
-      - "8334:8334"
+      - "8335:8334"
     volumes:
       - neutrino-data:/data/neutrino
     networks:
@@ -1196,6 +1458,10 @@ volumes:
   jmwalletd-data:
   jam-playwright-data:
   tor-data:
+  lnd-taker-data:
+  electrs-data:
+  electrum-data:
+  nostr-relay-data:
 
 networks:
   jm-network:

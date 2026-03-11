@@ -64,6 +64,16 @@ class TestBuildTakerConfig:
         settings.wallet.scan_lookback_blocks = 1000
         settings.wallet.default_fee_block_target = 3  # Has a default value
 
+        # Swap config (not enabled by default)
+        settings.swap.enabled = False
+        settings.swap.provider_url = ""
+        settings.swap.nostr_relays = []
+        settings.swap.max_swap_fee_pct = 1.0
+        settings.swap.fake_fee_min = 500
+        settings.swap.fake_fee_max = 5000
+        settings.swap.lockup_poll_interval = 2.0
+        settings.swap.lockup_timeout = 300.0
+
         return settings
 
     def test_fee_rate_without_block_target(

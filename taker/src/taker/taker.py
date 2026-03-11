@@ -41,6 +41,7 @@ from jmwallet.wallet.signing import (
     create_witness_stack,
     deserialize_transaction,
     sign_p2wpkh_input,
+    sign_p2wsh_input,
     verify_p2wpkh_signature,
 )
 from loguru import logger
@@ -49,7 +50,7 @@ from taker.config import BroadcastPolicy, Schedule, TakerConfig
 from taker.models import MakerSession, PhaseResult, TakerState
 from taker.monitoring import TakerMonitoringMixin
 from taker.multi_directory import MultiDirectoryClient
-from taker.orderbook import OrderbookManager, calculate_cj_fee
+from taker.orderbook import OrderbookManager, calculate_cj_fee, sample_fake_fee_from_orderbook
 from taker.podle import ExtendedPoDLECommitment
 from taker.podle_manager import PoDLEManager
 from taker.tx_builder import CoinJoinTxBuilder, build_coinjoin_tx
@@ -148,6 +149,10 @@ class Taker(TakerMonitoringMixin):
         # At build time, we use this budget (not a new estimate) to ensure the
         # actual tx fee matches what was budgeted, preventing residual fee issues.
         self._sweep_tx_fee_budget: int = 0
+
+        # Swap input: acquired via reverse submarine swap when swap_input is enabled.
+        # Stored after acquisition, used during tx building and signing.
+        self.swap_input: Any | None = None  # SwapInput from taker.swap.models
 
         # E2E encryption session for communication with makers
         self.crypto_session: CryptoSession | None = None
@@ -671,6 +676,79 @@ class Taker(TakerMonitoringMixin):
                 f"{estimated_outputs} outputs)"
             )
 
+            # --- Early swap provider discovery ---
+            # If swap_input is enabled, discover the provider now so we know its
+            # min_amount for the feasibility check and the confirmation prompt.
+            swap_provider_info: dict[str, Any] | None = None
+            self._swap_client: Any | None = None  # cached for reuse at build time
+
+            if self.config.swap_input.enabled and not self.is_sweep:
+                logger.info("Swap input enabled: discovering swap provider early...")
+                try:
+                    from taker.swap.client import SwapClient
+
+                    self._swap_client = SwapClient(
+                        provider_url=self.config.swap_input.provider_url or None,
+                        nostr_relays=self.config.swap_input.nostr_relays or None,
+                        network=(self.config.bitcoin_network or self.config.network).value,
+                        socks_host=(
+                            self.config.socks_host
+                            if self.config.socks_host != "127.0.0.1"
+                            else None
+                        ),
+                        socks_port=self.config.socks_port,
+                        max_swap_fee_pct=self.config.swap_input.max_swap_fee_pct,
+                        lnd_rest_url=self.config.swap_input.lnd_rest_url or None,
+                        lnd_cert_path=self.config.swap_input.lnd_cert_path or None,
+                        lnd_macaroon_path=self.config.swap_input.lnd_macaroon_path or None,
+                        backend=self.backend,
+                    )
+                    provider = await self._swap_client.discover_provider()
+
+                    # Estimate the swap amount for the feasibility check.
+                    # swap_needed = maker_fees + mining_fee + fake_fee_earned
+                    early_fake_fee = sample_fake_fee_from_orderbook(
+                        offers=self.orderbook_manager.offers,
+                        cj_amount=self.cj_amount,
+                        selected_nicks=set(self.maker_sessions.keys()),
+                        max_cj_fee=self.config.max_cj_fee,
+                    )
+                    estimated_swap_amount = total_fee + estimated_tx_fee + early_fake_fee
+                    actual_swap_amount = max(estimated_swap_amount, provider.min_amount)
+                    swap_fee = provider.calculate_fee(actual_swap_amount)
+
+                    swap_provider_info = {
+                        "provider_pubkey": provider.pubkey,
+                        "provider_fee_pct": provider.percentage_fee,
+                        "provider_mining_fee": provider.mining_fee,
+                        "provider_min_amount": provider.min_amount,
+                        "estimated_swap_amount": estimated_swap_amount,
+                        "actual_swap_amount": actual_swap_amount,
+                        "swap_fee": swap_fee,
+                        "padded": actual_swap_amount > estimated_swap_amount,
+                    }
+
+                    logger.info(
+                        f"Swap provider discovered: "
+                        f"fee={provider.percentage_fee}% + {provider.mining_fee} sats, "
+                        f"min_amount={provider.min_amount:,}"
+                    )
+                    logger.info(
+                        f"Estimated swap: needed={estimated_swap_amount:,} sats "
+                        f"(maker_fees={total_fee:,} + tx_fee={estimated_tx_fee:,} "
+                        f"+ fake_fee={early_fake_fee:,})"
+                    )
+                    if actual_swap_amount > estimated_swap_amount:
+                        logger.info(
+                            f"Swap amount will be padded from {estimated_swap_amount:,} "
+                            f"to provider minimum {provider.min_amount:,} sats"
+                        )
+
+                except Exception as e:
+                    logger.warning(f"Early swap provider discovery failed: {e}")
+                    logger.warning("Swap details will not be shown in confirmation prompt")
+                    self._swap_client = None
+
             # Prompt for confirmation after maker selection
             if hasattr(self, "confirmation_callback") and self.confirmation_callback:
                 try:
@@ -701,6 +779,7 @@ class Taker(TakerMonitoringMixin):
                         destination=destination,
                         mining_fee=estimated_tx_fee,
                         fee_rate=self._fee_rate,
+                        swap_info=swap_provider_info,
                     )
                     if not confirmed:
                         logger.info("CoinJoin cancelled by user")
@@ -1892,6 +1971,157 @@ class Taker(TakerMonitoringMixin):
                     "txfee": maker_txfee,
                 }
 
+            # --- Swap Input Acquisition ---
+            # If swap_input is enabled, acquire a reverse submarine swap UTXO.
+            # The swap amount covers: maker_fees + tx_fee + fake_fee_earned
+            # This makes taker's change = wallet_input - cj_amount + fake_fee
+            # which looks identical to a maker earning fees.
+            # The swap provider was already discovered during the early discovery
+            # phase (before the confirmation prompt) so its min_amount is known.
+            swap_utxo_dict: dict[str, Any] | None = None
+
+            if self.config.swap_input.enabled and not self.is_sweep:
+                self.state = TakerState.ACQUIRING_SWAP_INPUT
+                logger.info("Swap input enabled: acquiring submarine swap UTXO...")
+
+                fake_fee = sample_fake_fee_from_orderbook(
+                    offers=self.orderbook_manager.offers,
+                    cj_amount=self.cj_amount,
+                    selected_nicks=set(self.maker_sessions.keys()),
+                    max_cj_fee=self.config.max_cj_fee,
+                )
+
+                # Amount needed from swap: covers all fees + fake earned fee.
+                # Include the additional mining fee for the P2WSH swap input itself
+                # (swap input is ~165 vbytes vs ~68 for P2WPKH, so ~97 extra vbytes).
+                swap_input_extra_fee = self._estimate_tx_fee(
+                    num_inputs + 1, num_outputs, num_swap_inputs=1
+                ) - self._estimate_tx_fee(num_inputs, num_outputs)
+                swap_needed = total_maker_fee + tx_fee + swap_input_extra_fee + fake_fee
+
+                logger.info(
+                    f"Swap amount needed: {swap_needed:,} sats "
+                    f"(maker_fees={total_maker_fee:,}, tx_fee={tx_fee:,}, "
+                    f"swap_input_extra_fee={swap_input_extra_fee:,}, "
+                    f"fake_fee={fake_fee:,}) — will be padded to provider minimum if below it"
+                )
+
+                try:
+                    # Reuse the pre-discovered swap client if available (from early
+                    # discovery), otherwise create a fresh one as fallback.
+                    swap_client = getattr(self, "_swap_client", None)
+                    if swap_client is None:
+                        from taker.swap.client import SwapClient
+
+                        swap_client = SwapClient(
+                            provider_url=self.config.swap_input.provider_url or None,
+                            nostr_relays=self.config.swap_input.nostr_relays or None,
+                            network=(self.config.bitcoin_network or self.config.network).value,
+                            socks_host=(
+                                self.config.socks_host
+                                if self.config.socks_host != "127.0.0.1"
+                                else None
+                            ),
+                            socks_port=self.config.socks_port,
+                            max_swap_fee_pct=self.config.swap_input.max_swap_fee_pct,
+                            lnd_rest_url=self.config.swap_input.lnd_rest_url or None,
+                            lnd_cert_path=self.config.swap_input.lnd_cert_path or None,
+                            lnd_macaroon_path=self.config.swap_input.lnd_macaroon_path or None,
+                            backend=self.backend,
+                        )
+
+                    # Get current block height for timeout validation
+                    current_height = await self.backend.get_block_height()
+
+                    self.swap_input = await swap_client.acquire_swap_input(
+                        desired_amount_sats=swap_needed,
+                        current_block_height=current_height,
+                        wait_for_lockup=True,
+                        lockup_timeout=self.config.swap_input.lockup_timeout,
+                    )
+
+                    logger.info(
+                        f"Swap input acquired: {self.swap_input.txid}:{self.swap_input.vout} "
+                        f"({self.swap_input.value:,} sats)"
+                    )
+
+                    # --- Fee equalization (mandatory for privacy) ---
+                    # When the swap amount was padded up to the provider minimum,
+                    # the extra sats ("leftovers") MUST be distributed across maker
+                    # fees.  Letting any leftover go to taker change would make the
+                    # taker identifiable: an observer would see a change output that
+                    # received more fees than any orderbook offer charges.
+                    leftover_sats = self.swap_input.value - swap_needed
+                    if leftover_sats > 0:
+                        from taker.orderbook import equalize_maker_fees
+
+                        original_fees = {nick: maker_data[nick]["cjfee"] for nick in maker_data}
+                        equalized_fees = equalize_maker_fees(original_fees, leftover_sats)
+                        fee_adjustment = sum(
+                            equalized_fees[n] - original_fees[n] for n in original_fees
+                        )
+                        for nick in maker_data:
+                            maker_data[nick]["cjfee"] = equalized_fees[nick]
+                        total_maker_fee += fee_adjustment
+                        logger.info(
+                            f"Fee equalization: leftover={leftover_sats:,} sats, "
+                            f"distributed={fee_adjustment:,} sats across {len(maker_data)} makers"
+                        )
+
+                    # Build the swap UTXO dict for tx_builder
+                    swap_utxo_dict = self.swap_input.to_utxo_dict()
+
+                    # Adjust taker_total to include swap input value
+                    taker_total += self.swap_input.value
+
+                    # Recalculate tx_fee now that we have an additional P2WSH input.
+                    # The original estimate treated all inputs as P2WPKH (~68 vbytes),
+                    # but the swap input is P2WSH (~165 vbytes).  We pass the P2WPKH
+                    # count and the P2WSH count separately.
+                    old_tx_fee = tx_fee
+                    tx_fee = self._estimate_tx_fee(num_inputs, num_outputs, num_swap_inputs=1)
+                    swap_fee_delta = tx_fee - old_tx_fee
+                    if swap_fee_delta != 0:
+                        logger.info(
+                            f"Recalculated tx_fee for P2WSH swap input: "
+                            f"{old_tx_fee:,} -> {tx_fee:,} sats "
+                            f"(+{swap_fee_delta:,} sats)"
+                        )
+
+                    # Recalculate change: now taker appears to earn fake_fee
+                    # change = (wallet_inputs + swap_value) - cj_amount - maker_fees - tx_fee
+                    #        = wallet_inputs - cj_amount + fake_fee
+                    expected_change = taker_total - self.cj_amount - total_maker_fee - tx_fee
+                    logger.info(
+                        f"With swap input: taker_total={taker_total:,}, "
+                        f"expected_change={expected_change:,} "
+                        f"(fake_fee_earned={fake_fee:,})"
+                    )
+
+                    # Regenerate change address if we didn't have one before
+                    if not taker_change_address and expected_change > self.config.dust_threshold:
+                        change_index = self.wallet.get_next_address_index(mixdepth, 1)
+                        taker_change_address = self.wallet.get_change_address(
+                            mixdepth, change_index
+                        )
+                        self.taker_change_address = taker_change_address
+                        logger.debug(
+                            f"Generated change address for swap output "
+                            f"(expected: {expected_change} sats)"
+                        )
+
+                    # Update input count for logging
+                    num_taker_inputs += 1
+                    num_inputs += 1
+
+                except Exception as e:
+                    logger.error(f"Failed to acquire swap input: {e}")
+                    logger.warning("Proceeding without swap input (taker role not hidden)")
+                    self.swap_input = None
+                    swap_utxo_dict = None
+
+                self.state = TakerState.BUILDING_TX
+
             # Build transaction
             network = self.config.network.value
             self.unsigned_tx, self.tx_metadata = build_coinjoin_tx(
@@ -1912,6 +2142,7 @@ class Taker(TakerMonitoringMixin):
                 tx_fee=tx_fee,
                 network=network,
                 dust_threshold=self.config.dust_threshold,
+                swap_utxo=swap_utxo_dict,
             )
 
             logger.info(f"Built unsigned tx: {len(self.unsigned_tx)} bytes")
@@ -1937,7 +2168,12 @@ class Taker(TakerMonitoringMixin):
             return False
 
     def _estimate_tx_fee(
-        self, num_inputs: int, num_outputs: int, *, use_base_rate: bool = False
+        self,
+        num_inputs: int,
+        num_outputs: int,
+        *,
+        use_base_rate: bool = False,
+        num_swap_inputs: int = 0,
     ) -> int:
         """Estimate transaction fee.
 
@@ -1947,19 +2183,23 @@ class Taker(TakerMonitoringMixin):
         a deterministic estimate.
 
         Args:
-            num_inputs: Number of transaction inputs
+            num_inputs: Number of P2WPKH transaction inputs
             num_outputs: Number of transaction outputs
             use_base_rate: If True, use the base fee rate instead of the
                           session's randomized rate. Used for sweep cj_amount
                           calculations where determinism is required.
+            num_swap_inputs: Number of P2WSH swap inputs (usually 0 or 1).
+                            These are larger than P2WPKH inputs (~165 vs ~68
+                            vbytes) due to the HTLC witness script.
 
         Returns:
             Estimated fee in satoshis
         """
         import math
 
-        # P2WPKH: ~68 vbytes per input, 31 vbytes per output, ~11 overhead
-        vsize = num_inputs * 68 + num_outputs * 31 + 11
+        # P2WPKH: ~68 vbytes per input, P2WSH HTLC claim: ~165 vbytes
+        # P2WPKH output: 31 vbytes, overhead: ~11 vbytes
+        vsize = num_inputs * 68 + num_swap_inputs * 165 + num_outputs * 31 + 11
 
         # Use base rate for deterministic calculations (sweeps),
         # otherwise use the session's randomized rate for privacy
@@ -2232,6 +2472,18 @@ class Taker(TakerMonitoringMixin):
                     if not isinstance(response_data_list, list):
                         response_data_list = [response_data_list]
 
+                    # Deduplicate signatures that arrive via multiple directories.
+                    # When a maker is connected to N directories, each !sig message
+                    # is relayed N times. The encrypted payloads are identical so
+                    # simple dedup by value is safe.
+                    orig_count = len(response_data_list)
+                    response_data_list = list(dict.fromkeys(response_data_list))
+                    if len(response_data_list) < orig_count:
+                        logger.debug(
+                            f"Deduplicated {nick} signatures: "
+                            f"{orig_count} -> {len(response_data_list)}"
+                        )
+
                     if not response_data_list:
                         logger.warning(f"Empty !sig response from {nick}")
                         del self.maker_sessions[nick]
@@ -2393,6 +2645,11 @@ class Taker(TakerMonitoringMixin):
                 txid_hex = tx_input.txid_le[::-1].hex()
                 input_index_map[(txid_hex, tx_input.vout)] = idx
 
+            # Check if there's a swap input to sign (P2WSH instead of P2WPKH)
+            swap_input_key: tuple[str, int] | None = None
+            if self.swap_input is not None:
+                swap_input_key = (self.swap_input.txid, self.swap_input.vout)
+
             # Sign each of our UTXOs
             for utxo in self.selected_utxos:
                 # Find the input index in the transaction
@@ -2443,7 +2700,55 @@ class Taker(TakerMonitoringMixin):
 
                 logger.debug(f"Signed input {input_index} for UTXO {utxo.txid}:{utxo.vout}")
 
-            logger.info(f"Signed {len(signatures_info)} taker inputs")
+            # Sign swap input (P2WSH HTLC claim path) if present
+            if self.swap_input is not None and swap_input_key is not None:
+                if swap_input_key not in input_index_map:
+                    raise TransactionSigningError(
+                        f"Swap UTXO {self.swap_input.txid}:{self.swap_input.vout} "
+                        f"not found in transaction inputs"
+                    )
+
+                swap_idx = input_index_map[swap_input_key]
+                ws_bytes = self.swap_input.witness_script  # already bytes
+
+                # For P2WSH, the scriptCode in BIP143 is the witness script
+                from coincurve import PrivateKey
+
+                claim_key = PrivateKey(self.swap_input.claim_privkey)
+                swap_signature = sign_p2wsh_input(
+                    tx=tx,
+                    input_index=swap_idx,
+                    witness_script=ws_bytes,
+                    value=self.swap_input.value,
+                    private_key=claim_key,
+                )
+
+                # Build HTLC claim witness: [signature, preimage, witness_script]
+                from taker.swap.script import SwapScript
+
+                swap_witness = SwapScript.build_claim_witness(
+                    swap_signature, self.swap_input.preimage, ws_bytes
+                )
+
+                signatures_info.append(
+                    {
+                        "txid": self.swap_input.txid,
+                        "vout": self.swap_input.vout,
+                        "witness": [item.hex() for item in swap_witness],
+                    }
+                )
+
+                logger.info(
+                    f"Signed swap input {swap_idx} "
+                    f"({self.swap_input.txid[:16]}...:{self.swap_input.vout}) "
+                    f"with P2WSH claim witness"
+                )
+
+            swap_count = 1 if self.swap_input is not None else 0
+            logger.info(
+                f"Signed {len(signatures_info)} taker inputs"
+                + (f" (including {swap_count} swap input)" if swap_count else "")
+            )
             return signatures_info
 
         except TransactionSigningError as e:

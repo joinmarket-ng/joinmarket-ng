@@ -37,6 +37,7 @@ class TestIsolationCategory:
             "NOTIFICATION",
             "UPDATE_CHECK",
             "HEALTH_CHECK",
+            "SWAP",
         }
 
     def test_values_are_unique(self) -> None:

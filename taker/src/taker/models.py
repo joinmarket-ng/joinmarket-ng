@@ -24,6 +24,7 @@ class TakerState(StrEnum):
     SELECTING_MAKERS = "selecting_makers"
     FILLING = "filling"
     AUTHENTICATING = "authenticating"
+    ACQUIRING_SWAP_INPUT = "acquiring_swap_input"
     BUILDING_TX = "building_tx"
     COLLECTING_SIGNATURES = "collecting_signatures"
     BROADCASTING = "broadcasting"

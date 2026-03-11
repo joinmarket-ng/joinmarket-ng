@@ -53,8 +53,16 @@
 # rpc_user = ""
 # rpc_password = ""
 
-# Neutrino backend settings (only used when backend_type = "neutrino")
+# Neutrino backend settings (used by all components when backend_type = "neutrino")
 # neutrino_url = "http://127.0.0.1:8334"
+
+# Explicit peers for neutrino to connect to (host:port, used by all components).
+# Most signet nodes do NOT serve compact block filters, causing neutrino to
+# ban them and stall. Set this to a peer you know serves filters.
+# Leave empty to rely on DNS seeds only.
+# neutrino_connect_peers = [
+#   "your-filter-peer:38333",
+# ]
 
 # ============================================================================
 # Network Settings
@@ -287,6 +295,53 @@
 
 # Minimum number of makers required
 # minimum_makers = 1
+
+# ============================================================================
+# Swap Input Settings (Submarine Swap for Fee/Change Balancing)
+# ============================================================================
+#
+# When enabled, the taker acquires an extra UTXO via a Lightning Network reverse
+# submarine swap (pay LN invoice -> receive on-chain UTXO). This extra input
+# covers all fees (maker fees + tx fee) plus a fake "fee earned" amount, making
+# the taker's on-chain footprint indistinguishable from a maker's.
+#
+# PRIVACY BENEFIT: Defeats subset sum analysis and fee asymmetry heuristics.
+# COST: Swap provider fee (~0.5-1% of swap amount).
+# REQUIREMENT: Must have a Lightning wallet to pay the swap invoice.
+
+[swap]
+# Enable swap input for CoinJoin fee/change balancing
+# enabled = false
+
+# Direct HTTP URL for swap provider (bypasses Nostr discovery)
+# Useful for regtest or when using a known trusted provider
+# provider_url = ""
+
+# Nostr relay URLs for provider discovery (empty = use Electrum defaults)
+# nostr_relays = []
+
+# Maximum acceptable swap fee as percentage of swap amount
+# max_swap_fee_pct = 1.0
+
+# Polling interval for checking swap lockup transaction (seconds)
+# lockup_poll_interval = 2.0
+
+# Maximum wait time for swap lockup transaction (seconds)
+# lockup_timeout = 300.0
+
+# LND connection for automatic Lightning invoice payment (optional)
+# If configured, the taker pays the swap invoice automatically via its own LND node.
+# If not configured, the taker logs the invoice for manual payment.
+# lnd_rest_url = "https://127.0.0.1:8081"
+# lnd_cert_path = "/shared/lnd/taker-tls.cert"
+# lnd_macaroon_path = "/shared/lnd/taker-admin.macaroon"
+
+# When the swap amount is padded up to the provider minimum, the extra sats
+# ("leftovers") are distributed across maker fees to make them more uniform.
+# This is mandatory for privacy: leftover sats must never go to the taker's
+# change output, as that would make it trivially identifiable via surplus
+# analysis (see issue #114).  This setting is deprecated and ignored.
+# equalize_fees = true
 
 # ============================================================================
 # Directory Server Settings
