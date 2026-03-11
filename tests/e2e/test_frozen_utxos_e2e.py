@@ -352,12 +352,14 @@ class TestFreezeExcludesFromBalance:
         offer_balance_before = await wallet.get_balance_for_offers(0)
 
         utxos = await wallet.get_utxos(0)
-        # Sort descending so we freeze the largest UTXO -- this ensures
-        # the balance actually changes (md0 returns max single UTXO).
+        # Sort descending and freeze ALL UTXOs that share the maximum value so
+        # that the next call to get_balance_for_offers must return a strictly
+        # smaller number (or 0 if all UTXOs have equal value).
         utxos_sorted = sorted(utxos, key=lambda u: u.value, reverse=True)
-        target = utxos_sorted[0]
-
-        wallet.freeze_utxo(target.outpoint)
+        max_value = utxos_sorted[0].value
+        for target in utxos_sorted:
+            if target.value == max_value:
+                wallet.freeze_utxo(target.outpoint)
 
         offer_balance_after = await wallet.get_balance_for_offers(0)
         assert offer_balance_after < offer_balance_before
