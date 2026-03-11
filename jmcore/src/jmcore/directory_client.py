@@ -14,7 +14,6 @@ import base64
 import binascii
 import contextlib
 import json
-import os
 import struct
 import time
 from collections.abc import Callable
@@ -729,13 +728,32 @@ class DirectoryClient:
         logger.trace(f"Collected {len(messages)} messages in {duration}s")
         return messages
 
-    async def fetch_orderbooks(self) -> tuple[list[Offer], list[FidelityBond]]:
+    async def fetch_orderbooks(
+        self,
+        *,
+        max_wait: float = 120.0,
+        min_wait: float = 30.0,
+        quiet_period: float = 15.0,
+    ) -> tuple[list[Offer], list[FidelityBond]]:
         """
         Fetch orderbooks from all connected peers.
+
+        Uses adaptive listening: collects offers in small time chunks and exits early
+        when no new offers have arrived for ``quiet_period`` seconds (after at least
+        ``min_wait`` seconds have elapsed).
 
         Trusts the directory's orderbook as authoritative - if a maker has an offer
         in the directory, they are considered online. The directory server maintains
         the connection state and removes offers when makers disconnect.
+
+        Args:
+            max_wait: Hard ceiling in seconds (default 120). Based on empirical Tor
+                testing: 95th percentile ~101s, 99th percentile ~115s.
+            min_wait: Minimum seconds before early exit is allowed (default 30).
+                Prevents cutting off slow Tor responses during the initial burst.
+            quiet_period: Seconds without new offers to trigger early exit (default 15).
+                After min_wait, if no new offers arrive for this long, all responsive
+                makers are assumed to have replied.
 
         Returns:
             Tuple of (offers, fidelity_bonds)
@@ -761,23 +779,77 @@ class DirectoryClient:
         await self.connection.send(json.dumps(pubmsg).encode("utf-8"))
         logger.debug("Sent !orderbook broadcast to PUBLIC")
 
-        # Based on empirical testing with the main JoinMarket directory server over Tor,
-        # the response time distribution shows significant delays:
-        # - Median: ~38s (50% of offers)
-        # - 75th percentile: ~65s
-        # - 90th percentile: ~93s
-        # - 95th percentile: ~101s
-        # - 99th percentile: ~115s
-        # - Max observed: ~119s
-        # Using 120s (95th percentile + 20% buffer) ensures we capture ~95% of all offers.
-        # The wide distribution is due to Tor latency and maker response times.
+        # Adaptive orderbook listening: instead of waiting a fixed duration, we listen
+        # in small chunks and exit early once offers stop arriving. This dramatically
+        # reduces wait times when the network is responsive (e.g., regtest: ~2s instead
+        # of 120s) while still handling slow Tor responses on mainnet.
         #
-        # For testing, this can be overridden via JM_ORDERBOOK_WAIT_TIME environment variable.
-        listen_duration = float(os.environ.get("JM_ORDERBOOK_WAIT_TIME", "120.0"))
-        logger.info(f"Listening for offer announcements for {listen_duration} seconds...")
-        messages = await self.listen_for_messages(duration=listen_duration)
+        # Parameters:
+        #   max_wait: Hard ceiling (default 120s). Based on empirical Tor testing:
+        #     - 95th percentile response time: ~101s
+        #     - 99th percentile: ~115s, max observed: ~119s
+        #   min_wait: Floor before early exit is allowed (default 30s). Prevents
+        #     cutting off slow Tor responses during the initial burst of replies.
+        #   quiet_period: Seconds without new offers before exiting (default 15s).
+        #     After min_wait, if no new offers arrive for this long, we assume all
+        #     responsive makers have replied.
 
-        logger.info(f"Received {len(messages)} messages, parsing offers...")
+        # Sanity: clamp min_wait and quiet_period so they fit within max_wait
+        min_wait = min(min_wait, max_wait)
+        quiet_period = min(quiet_period, max_wait - min_wait) if max_wait > min_wait else 0.0
+
+        logger.info(
+            f"Listening for offers (max={max_wait}s, min={min_wait}s, quiet={quiet_period}s)..."
+        )
+
+        # Offer type prefixes for lightweight detection during listening.
+        # Full parsing happens after collection -- this is just for counting.
+        offer_prefixes = ("sw0absoffer", "sw0reloffer", "swabsoffer", "swreloffer")
+
+        messages: list[dict[str, Any]] = []
+        offer_count = 0
+        start_time = asyncio.get_event_loop().time()
+        last_offer_time = start_time
+        chunk_duration = 1.0  # Listen in 1s chunks for responsiveness
+
+        while True:
+            elapsed = asyncio.get_event_loop().time() - start_time
+            if elapsed >= max_wait:
+                break
+
+            # Check early exit: past min_wait and no new offers for quiet_period
+            if elapsed >= min_wait and quiet_period > 0:
+                silence = asyncio.get_event_loop().time() - last_offer_time
+                if silence >= quiet_period:
+                    logger.info(
+                        f"No new offers for {silence:.1f}s after {offer_count} offers, "
+                        f"exiting early at {elapsed:.1f}s"
+                    )
+                    break
+
+            remaining = max_wait - elapsed
+            listen_time = min(chunk_duration, remaining)
+            if listen_time <= 0:
+                break
+
+            chunk = await self.listen_for_messages(duration=listen_time)
+            new_offers = 0
+            for msg in chunk:
+                messages.append(msg)
+                # Lightweight offer detection: check if the line contains an offer type
+                line = msg.get("line", "")
+                if any(prefix in line for prefix in offer_prefixes):
+                    new_offers += 1
+
+            if new_offers > 0:
+                offer_count += new_offers
+                last_offer_time = asyncio.get_event_loop().time()
+                logger.debug(f"+{new_offers} offers (total: {offer_count}) at {elapsed:.1f}s")
+
+        total_elapsed = asyncio.get_event_loop().time() - start_time
+        logger.info(
+            f"Collected {len(messages)} messages ({offer_count} offers) in {total_elapsed:.1f}s"
+        )
 
         for response in messages:
             try:

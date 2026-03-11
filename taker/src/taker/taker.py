@@ -490,7 +490,11 @@ class Taker(TakerMonitoringMixin):
             # Now fetch orderbook after UTXO selection is done
             self.state = TakerState.FETCHING_ORDERBOOK
             logger.info("Fetching orderbook...")
-            offers = await self.directory_client.fetch_orderbook(self.config.order_wait_time)
+            offers = await self.directory_client.fetch_orderbook(
+                max_wait=self.config.order_wait_time,
+                min_wait=self.config.orderbook_min_wait,
+                quiet_period=self.config.orderbook_quiet_period,
+            )
 
             # Verify and calculate fidelity bond values
             await self._update_offers_with_bond_values(offers)

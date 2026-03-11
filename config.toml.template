@@ -275,7 +275,9 @@
 
 # Timeouts and intervals
 # maker_timeout_sec = 60
-# order_wait_time = 10.0
+# order_wait_time = 120.0        # Max seconds to wait (hard ceiling)
+# orderbook_min_wait = 30.0      # Min seconds before early exit is allowed
+# orderbook_quiet_period = 15.0  # Seconds of silence to trigger early exit
 # rescan_interval_sec = 600
 
 # Transaction broadcast settings

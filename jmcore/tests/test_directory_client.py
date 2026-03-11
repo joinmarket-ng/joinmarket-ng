@@ -1,5 +1,7 @@
+import asyncio
 import contextlib
 import json
+from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -538,3 +540,203 @@ async def test_get_peerlist_with_features_buffers_unexpected_messages():
     assert not client._message_buffer.empty()
     buffered_msg = await client._message_buffer.get()
     assert buffered_msg["type"] == MessageType.PUBMSG.value
+
+
+# ---------------------------------------------------------------------------
+# Adaptive orderbook listening tests
+# ---------------------------------------------------------------------------
+
+
+def _make_offer_msg(nick: str = "maker1", offer_type: str = "sw0reloffer") -> dict[str, Any]:
+    """Create a mock PUBMSG containing an offer."""
+    # Absolute offers (absoffer) use integer satoshi fees; relative use float fractions
+    cjfee = "1000" if "abs" in offer_type else "0.001"
+    return {
+        "type": MessageType.PUBMSG.value,
+        "line": f"{nick}!PUBLIC!{offer_type} 0 750000 790107726787 500 {cjfee}",
+    }
+
+
+def _make_non_offer_msg() -> dict[str, Any]:
+    """Create a mock PUBMSG that is NOT an offer (e.g. peerlist)."""
+    return {
+        "type": MessageType.PEERLIST.value,
+        "line": "nick1;loc1.onion:5222",
+    }
+
+
+@pytest.mark.asyncio
+async def test_adaptive_fetch_exits_early_after_quiet_period():
+    """
+    When offers arrive in the first chunk and then stop, fetch_orderbooks should
+    exit after min_wait + quiet_period instead of waiting the full max_wait.
+    """
+    mock_connection = AsyncMock()
+    mock_connection.is_connected.return_value = True
+
+    client = DirectoryClient("host", 1234, "mainnet")
+    client.connection = mock_connection
+
+    # Mock get_peerlist_with_features to return empty
+    client.get_peerlist_with_features = AsyncMock(return_value=[])
+
+    # Track call count to listen_for_messages
+    call_count = 0
+    offer_msg = _make_offer_msg()
+
+    async def mock_listen(duration: float = 5.0) -> list[dict[str, Any]]:
+        nonlocal call_count
+        call_count += 1
+        # First call: return an offer
+        if call_count == 1:
+            return [offer_msg]
+        # Subsequent calls: simulate passage of time with no offers
+        await asyncio.sleep(duration)
+        return []
+
+    client.listen_for_messages = mock_listen  # type: ignore[assignment]
+
+    start = asyncio.get_event_loop().time()
+    offers, bonds = await client.fetch_orderbooks(max_wait=30.0, min_wait=1.0, quiet_period=2.0)
+    elapsed = asyncio.get_event_loop().time() - start
+
+    # Should have exited well before max_wait (30s)
+    # Expected: ~min_wait(1) + quiet_period(2) = ~3s
+    assert elapsed < 10.0, f"Should exit early but took {elapsed:.1f}s"
+    # Should have found the offer
+    assert len(offers) == 1
+
+
+@pytest.mark.asyncio
+async def test_adaptive_fetch_respects_min_wait():
+    """
+    Even if offers arrive immediately and then stop, fetch_orderbooks should
+    not exit before min_wait has elapsed.
+    """
+    mock_connection = AsyncMock()
+    mock_connection.is_connected.return_value = True
+
+    client = DirectoryClient("host", 1234, "mainnet")
+    client.connection = mock_connection
+    client.get_peerlist_with_features = AsyncMock(return_value=[])
+
+    call_count = 0
+    offer_msg = _make_offer_msg()
+
+    async def mock_listen(duration: float = 5.0) -> list[dict[str, Any]]:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return [offer_msg]
+        await asyncio.sleep(duration)
+        return []
+
+    client.listen_for_messages = mock_listen  # type: ignore[assignment]
+
+    start = asyncio.get_event_loop().time()
+    offers, bonds = await client.fetch_orderbooks(max_wait=30.0, min_wait=3.0, quiet_period=1.0)
+    elapsed = asyncio.get_event_loop().time() - start
+
+    # Must wait at least min_wait (3s), even though quiet_period (1s) would trigger sooner
+    assert elapsed >= 3.0, f"Should wait at least min_wait but exited at {elapsed:.1f}s"
+    # But should still exit well before max_wait
+    assert elapsed < 10.0, f"Should exit early but took {elapsed:.1f}s"
+    assert len(offers) == 1
+
+
+@pytest.mark.asyncio
+async def test_adaptive_fetch_respects_max_wait():
+    """
+    If offers keep arriving, fetch_orderbooks should stop at max_wait.
+    """
+    mock_connection = AsyncMock()
+    mock_connection.is_connected.return_value = True
+
+    client = DirectoryClient("host", 1234, "mainnet")
+    client.connection = mock_connection
+    client.get_peerlist_with_features = AsyncMock(return_value=[])
+
+    counter = 0
+
+    async def mock_listen(duration: float = 5.0) -> list[dict[str, Any]]:
+        nonlocal counter
+        counter += 1
+        # Always return an offer (never quiet)
+        await asyncio.sleep(min(duration, 0.1))
+        return [_make_offer_msg(nick=f"maker{counter}")]
+
+    client.listen_for_messages = mock_listen  # type: ignore[assignment]
+
+    start = asyncio.get_event_loop().time()
+    offers, bonds = await client.fetch_orderbooks(max_wait=3.0, min_wait=1.0, quiet_period=1.0)
+    elapsed = asyncio.get_event_loop().time() - start
+
+    # Should stop at max_wait (3s), not run forever
+    assert elapsed < 5.0, f"Should respect max_wait but took {elapsed:.1f}s"
+    assert len(offers) > 0
+
+
+@pytest.mark.asyncio
+async def test_adaptive_fetch_no_offers_exits_after_min_wait_plus_quiet():
+    """
+    When no offers arrive at all, exit after min_wait + quiet_period.
+    last_offer_time is initialized to start_time, so silence is measured from start.
+    """
+    mock_connection = AsyncMock()
+    mock_connection.is_connected.return_value = True
+
+    client = DirectoryClient("host", 1234, "mainnet")
+    client.connection = mock_connection
+    client.get_peerlist_with_features = AsyncMock(return_value=[])
+
+    async def mock_listen(duration: float = 5.0) -> list[dict[str, Any]]:
+        await asyncio.sleep(duration)
+        return []
+
+    client.listen_for_messages = mock_listen  # type: ignore[assignment]
+
+    start = asyncio.get_event_loop().time()
+    offers, bonds = await client.fetch_orderbooks(max_wait=30.0, min_wait=2.0, quiet_period=2.0)
+    elapsed = asyncio.get_event_loop().time() - start
+
+    # Should exit after min_wait (2) when silence >= quiet_period (2).
+    # Since last_offer_time = start, silence = elapsed, so exits when elapsed >= max(2, 2) ~= 2-3s
+    assert elapsed < 10.0, f"Should exit early with no offers but took {elapsed:.1f}s"
+    assert len(offers) == 0
+
+
+@pytest.mark.asyncio
+async def test_adaptive_fetch_counts_different_offer_types():
+    """
+    The lightweight offer detection should count all offer types
+    (sw0reloffer, sw0absoffer, swreloffer, swabsoffer).
+    """
+    mock_connection = AsyncMock()
+    mock_connection.is_connected.return_value = True
+
+    client = DirectoryClient("host", 1234, "mainnet")
+    client.connection = mock_connection
+    client.get_peerlist_with_features = AsyncMock(return_value=[])
+
+    call_count = 0
+
+    async def mock_listen(duration: float = 5.0) -> list[dict[str, Any]]:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return [
+                _make_offer_msg("maker1", "sw0reloffer"),
+                _make_offer_msg("maker2", "sw0absoffer"),
+                _make_offer_msg("maker3", "swreloffer"),
+                _make_offer_msg("maker4", "swabsoffer"),
+                _make_non_offer_msg(),  # peerlist, not an offer
+            ]
+        await asyncio.sleep(duration)
+        return []
+
+    client.listen_for_messages = mock_listen  # type: ignore[assignment]
+
+    offers, bonds = await client.fetch_orderbooks(max_wait=30.0, min_wait=1.0, quiet_period=2.0)
+
+    # Should have parsed 4 offers (not the peerlist)
+    assert len(offers) == 4

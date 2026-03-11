@@ -532,7 +532,9 @@ async def test_taker_orderbook_fetch(bitcoin_backend, taker_config, directory_se
 
         # Fetch orderbook - may be empty if no makers are running
         offers = await taker.directory_client.fetch_orderbook(
-            timeout=taker_config.order_wait_time
+            max_wait=taker_config.order_wait_time,
+            min_wait=taker_config.orderbook_min_wait,
+            quiet_period=taker_config.orderbook_quiet_period,
         )
 
         # Offers should be a list (may be empty)

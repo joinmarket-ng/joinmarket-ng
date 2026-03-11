@@ -47,7 +47,6 @@ TEMP_TEST_OUTPUT="/tmp/jm_test_suite_$$.log"
 export BITCOIN_RPC_URL="http://127.0.0.1:18443"
 export BITCOIN_RPC_USER="test"
 export BITCOIN_RPC_PASSWORD="test"
-export JM_ORDERBOOK_WAIT_TIME="10.0"
 
 # Complete cleanup function
 cleanup_all() {

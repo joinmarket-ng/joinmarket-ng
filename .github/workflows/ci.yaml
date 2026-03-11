@@ -231,7 +231,6 @@ jobs:
           BITCOIN_RPC_URL: http://127.0.0.1:18443
           BITCOIN_RPC_USER: test
           BITCOIN_RPC_PASSWORD: test
-          JM_ORDERBOOK_WAIT_TIME: "10.0"
         run: |
           pytest -c pytest.ini -m e2e --junitxml=junit/test-results.xml \
             --cov --cov-report=term-missing --cov-report=xml \
@@ -641,7 +640,6 @@ jobs:
           BITCOIN_RPC_URL: http://127.0.0.1:18443
           BITCOIN_RPC_USER: test
           BITCOIN_RPC_PASSWORD: test
-          JM_ORDERBOOK_WAIT_TIME: "10.0"
         run: |
           pytest -c pytest.ini -m reference tests/e2e/test_our_maker_reference_taker.py \
             --junitxml=junit/test-results.xml \
@@ -798,7 +796,6 @@ jobs:
           BITCOIN_RPC_URL: http://127.0.0.1:18443
           BITCOIN_RPC_USER: test
           BITCOIN_RPC_PASSWORD: test
-          JM_ORDERBOOK_WAIT_TIME: "10.0"
         run: |
           pytest -c pytest.ini -m reference tests/e2e/test_reference_coinjoin.py tests/e2e/test_reference_bond_import.py \
             --junitxml=junit/test-results.xml \
@@ -923,7 +920,6 @@ jobs:
           BITCOIN_RPC_USER: test
           BITCOIN_RPC_PASSWORD: test
           NEUTRINO_URL: http://127.0.0.1:8334
-          JM_ORDERBOOK_WAIT_TIME: "10.0"
         run: |
           pytest -c pytest.ini -m neutrino -k "not test_coinjoin" --junitxml=junit/test-results.xml \
             --cov --cov-report=term-missing --cov-report=xml \
@@ -1038,7 +1034,6 @@ jobs:
           BITCOIN_RPC_USER: test
           BITCOIN_RPC_PASSWORD: test
           NEUTRINO_URL: http://127.0.0.1:8334
-          JM_ORDERBOOK_WAIT_TIME: "10.0"
         run: |
           pytest -c pytest.ini -m neutrino -k "test_coinjoin" --junitxml=junit/test-results.xml \
             --cov --cov-report=term-missing --cov-report=xml \
@@ -1167,7 +1162,6 @@ jobs:
           BITCOIN_RPC_URL: http://127.0.0.1:18445
           BITCOIN_RPC_USER: test
           BITCOIN_RPC_PASSWORD: test
-          JM_ORDERBOOK_WAIT_TIME: "10.0"
         run: |
           pytest -c pytest.ini -m reference_maker --junitxml=junit/test-results.xml \
             --cov --cov-report=term-missing --cov-report=xml \

@@ -118,9 +118,26 @@ class TakerConfig(WalletConfig):
         default=120.0,
         ge=1.0,
         description=(
-            "Seconds to wait for orderbook responses. Empirical testing shows 95th "
-            "percentile response time over Tor is ~101s. Default 120s (with 20% buffer) "
-            "captures ~95% of offers."
+            "Maximum seconds to wait for orderbook responses (hard ceiling). "
+            "Empirical testing shows 95th percentile response time over Tor is ~101s. "
+            "Default 120s provides a 20% buffer."
+        ),
+    )
+    orderbook_min_wait: float = Field(
+        default=30.0,
+        ge=0.0,
+        description=(
+            "Minimum seconds to listen before allowing early exit. "
+            "Prevents cutting off slow Tor responses during the initial burst."
+        ),
+    )
+    orderbook_quiet_period: float = Field(
+        default=15.0,
+        ge=1.0,
+        description=(
+            "Seconds without new offers before exiting early. "
+            "After orderbook_min_wait, if no new offers arrive for this long, "
+            "all responsive makers are assumed to have replied."
         ),
     )
 

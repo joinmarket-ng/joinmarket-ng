@@ -375,7 +375,12 @@ class MultiDirectoryClient:
                 logger.warning(f"Error closing connection to {server}: {e}")
         self.clients.clear()
 
-    async def fetch_orderbook(self, timeout: float = 120.0) -> list[Offer]:
+    async def fetch_orderbook(
+        self,
+        max_wait: float = 120.0,
+        min_wait: float = 30.0,
+        quiet_period: float = 15.0,
+    ) -> list[Offer]:
         """
         Fetch orderbook from all connected directory servers in parallel.
 
@@ -384,11 +389,9 @@ class MultiDirectoryClient:
         offers as "stale" based on slow peerlist responses.
 
         Args:
-            timeout: Timeout in seconds (default: 120s). Note: The actual timeout is
-                    controlled by DirectoryClient.fetch_orderbooks() which uses 120s
-                    to capture ~95% of offers based on empirical testing over Tor.
-                    The 95th percentile response time is ~101s, so 120s provides a
-                    20% safety buffer.
+            max_wait: Hard ceiling in seconds (default: 120s).
+            min_wait: Minimum seconds before early exit is allowed (default: 30s).
+            quiet_period: Seconds of silence before exiting early (default: 15s).
         """
         all_offers: list[Offer] = []
         seen_offers: set[tuple[str, int]] = set()
@@ -398,7 +401,9 @@ class MultiDirectoryClient:
         ) -> tuple[str, list[Offer]]:
             """Fetch offers from a single directory server."""
             try:
-                offers, _bonds = await client.fetch_orderbooks()
+                offers, _bonds = await client.fetch_orderbooks(
+                    max_wait=max_wait, min_wait=min_wait, quiet_period=quiet_period
+                )
                 return (server, offers)
             except Exception as e:
                 logger.warning(f"Failed to fetch orderbook from {server}: {e}")
