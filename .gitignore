@@ -92,3 +92,5 @@ docs/stylesheets/extra.css.backup*
 media/logo_title_v2.png
 media/logo_title_v3.png
 media/logo_title.png
+
+.flatpak-builder/

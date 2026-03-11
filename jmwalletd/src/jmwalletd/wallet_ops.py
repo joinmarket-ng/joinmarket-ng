@@ -16,6 +16,13 @@ from typing import Any
 from loguru import logger
 
 
+def _is_descriptor_backend(backend: Any) -> bool:
+    """Return True if *backend* supports descriptor wallet operations."""
+    from jmwallet.backends.descriptor_wallet import DescriptorWalletBackend
+
+    return isinstance(backend, DescriptorWalletBackend)
+
+
 def _get_network() -> str:
     """Return the configured Bitcoin network name (e.g. ``"signet"``).
 
@@ -84,7 +91,9 @@ async def create_wallet(
 
     # Ensure the watch-only descriptor wallet is loaded in Bitcoin Core
     # and import HD descriptors.  No rescan needed for a brand-new wallet.
-    await ws.setup_descriptor_wallet(rescan=False)
+    # Skipped for non-descriptor backends (e.g. neutrino).
+    if _is_descriptor_backend(backend):
+        await ws.setup_descriptor_wallet(rescan=False)
 
     # Initial sync to populate caches.
     await ws.sync()
@@ -146,7 +155,9 @@ async def recover_wallet(
 
     # Ensure the watch-only descriptor wallet is loaded in Bitcoin Core
     # and import HD descriptors so sync can find existing UTXOs.
-    await ws.setup_descriptor_wallet()
+    # Skipped for non-descriptor backends (e.g. neutrino).
+    if _is_descriptor_backend(backend):
+        await ws.setup_descriptor_wallet()
 
     await ws.sync()
 
@@ -188,7 +199,9 @@ async def open_wallet(
 
     # Ensure the watch-only descriptor wallet is loaded in Bitcoin Core
     # and import HD descriptors.  Idempotent — skips if already set up.
-    await ws.setup_descriptor_wallet()
+    # Skipped for non-descriptor backends (e.g. neutrino).
+    if _is_descriptor_backend(backend):
+        await ws.setup_descriptor_wallet()
 
     await ws.sync()
 

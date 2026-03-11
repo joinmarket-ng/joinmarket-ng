@@ -16,6 +16,22 @@ from jmwalletd.wallet_ops import (
 )
 
 
+def _make_descriptor_backend() -> MagicMock:
+    """Return a mock that passes isinstance checks for DescriptorWalletBackend."""
+    from jmwallet.backends.descriptor_wallet import DescriptorWalletBackend
+
+    mock = MagicMock(spec=DescriptorWalletBackend)
+    return mock
+
+
+def _make_neutrino_backend() -> MagicMock:
+    """Return a mock that does NOT pass isinstance checks for DescriptorWalletBackend."""
+    from jmwallet.backends.neutrino import NeutrinoBackend
+
+    mock = MagicMock(spec=NeutrinoBackend)
+    return mock
+
+
 class TestWalletFileIO:
     def test_save_and_load_roundtrip(self, tmp_path: Path) -> None:
         wallet_path = tmp_path / "test.jmdat"
@@ -63,7 +79,7 @@ class TestCreateWallet:
     @patch("jmwalletd.wallet_ops._get_network", return_value="mainnet")
     @patch("jmwalletd._backend.get_backend", new_callable=AsyncMock)
     @patch("jmwallet.wallet.service.WalletService")
-    async def test_creates_wallet(
+    async def test_creates_wallet_descriptor_backend(
         self,
         mock_ws_cls: MagicMock,
         mock_get_backend: AsyncMock,
@@ -77,7 +93,7 @@ class TestCreateWallet:
         mock_ws.sync = AsyncMock()
         mock_ws.setup_descriptor_wallet = AsyncMock()
         mock_ws_cls.return_value = mock_ws
-        mock_get_backend.return_value = MagicMock()
+        mock_get_backend.return_value = _make_descriptor_backend()
 
         ws, seedphrase = await create_wallet(
             wallet_path=wallet_path,
@@ -94,8 +110,41 @@ class TestCreateWallet:
         mock_ws_cls.assert_called_once()
         assert mock_ws_cls.call_args.kwargs["network"] == "mainnet"
 
-        # New wallet: descriptor wallet set up with no rescan.
+        # Descriptor backend: setup_descriptor_wallet called with no rescan.
         mock_ws.setup_descriptor_wallet.assert_awaited_once_with(rescan=False)
+
+    @patch("jmwalletd.wallet_ops._get_network", return_value="mainnet")
+    @patch("jmwalletd._backend.get_backend", new_callable=AsyncMock)
+    @patch("jmwallet.wallet.service.WalletService")
+    async def test_creates_wallet_neutrino_backend(
+        self,
+        mock_ws_cls: MagicMock,
+        mock_get_backend: AsyncMock,
+        mock_get_network: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        wallet_path = tmp_path / "wallets" / "new_neutrino.jmdat"
+        wallet_path.parent.mkdir(parents=True, exist_ok=True)
+
+        mock_ws = MagicMock()
+        mock_ws.sync = AsyncMock()
+        mock_ws.setup_descriptor_wallet = AsyncMock()
+        mock_ws_cls.return_value = mock_ws
+        mock_get_backend.return_value = _make_neutrino_backend()
+
+        ws, seedphrase = await create_wallet(
+            wallet_path=wallet_path,
+            password="password",
+            wallet_type="sw",
+            data_dir=tmp_path,
+        )
+        assert ws is mock_ws
+        assert wallet_path.exists()
+
+        # Neutrino backend: setup_descriptor_wallet must NOT be called.
+        mock_ws.setup_descriptor_wallet.assert_not_awaited()
+        # sync() must still be called.
+        mock_ws.sync.assert_awaited_once()
 
     @patch("jmwalletd.wallet_ops._get_network", return_value="signet")
     @patch("jmwalletd._backend.get_backend", new_callable=AsyncMock)
@@ -114,7 +163,7 @@ class TestCreateWallet:
         mock_ws.sync = AsyncMock()
         mock_ws.setup_descriptor_wallet = AsyncMock()
         mock_ws_cls.return_value = mock_ws
-        mock_get_backend.return_value = MagicMock()
+        mock_get_backend.return_value = _make_descriptor_backend()
 
         ws, _ = await create_wallet(
             wallet_path=wallet_path,
@@ -142,7 +191,7 @@ class TestRecoverWallet:
     @patch("jmwalletd.wallet_ops._get_network", return_value="mainnet")
     @patch("jmwalletd._backend.get_backend", new_callable=AsyncMock)
     @patch("jmwallet.wallet.service.WalletService")
-    async def test_recovers_wallet(
+    async def test_recovers_wallet_descriptor_backend(
         self,
         mock_ws_cls: MagicMock,
         mock_get_backend: AsyncMock,
@@ -157,7 +206,7 @@ class TestRecoverWallet:
         mock_ws.sync = AsyncMock()
         mock_ws.setup_descriptor_wallet = AsyncMock()
         mock_ws_cls.return_value = mock_ws
-        mock_get_backend.return_value = MagicMock()
+        mock_get_backend.return_value = _make_descriptor_backend()
 
         ws = await recover_wallet(
             wallet_path=wallet_path,
@@ -171,15 +220,48 @@ class TestRecoverWallet:
         mock_ws_cls.assert_called_once()
         assert mock_ws_cls.call_args.kwargs["network"] == "mainnet"
 
-        # Recovery needs full rescan (default rescan=True).
+        # Recovery with descriptor backend: needs full rescan (default rescan=True).
         mock_ws.setup_descriptor_wallet.assert_awaited_once_with()
+
+    @patch("jmwalletd.wallet_ops._get_network", return_value="mainnet")
+    @patch("jmwalletd._backend.get_backend", new_callable=AsyncMock)
+    @patch("jmwallet.wallet.service.WalletService")
+    async def test_recovers_wallet_neutrino_backend(
+        self,
+        mock_ws_cls: MagicMock,
+        mock_get_backend: AsyncMock,
+        mock_get_network: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        wallet_path = tmp_path / "wallets" / "recovered_neutrino.jmdat"
+        wallet_path.parent.mkdir(parents=True, exist_ok=True)
+        seedphrase = "abandon " * 11 + "about"
+
+        mock_ws = MagicMock()
+        mock_ws.sync = AsyncMock()
+        mock_ws.setup_descriptor_wallet = AsyncMock()
+        mock_ws_cls.return_value = mock_ws
+        mock_get_backend.return_value = _make_neutrino_backend()
+
+        ws = await recover_wallet(
+            wallet_path=wallet_path,
+            password="password",
+            wallet_type="sw",
+            seedphrase=seedphrase,
+            data_dir=tmp_path,
+        )
+        assert ws is mock_ws
+
+        # Neutrino backend: setup_descriptor_wallet must NOT be called.
+        mock_ws.setup_descriptor_wallet.assert_not_awaited()
+        mock_ws.sync.assert_awaited_once()
 
 
 class TestOpenWallet:
     @patch("jmwalletd.wallet_ops._get_network", return_value="mainnet")
     @patch("jmwalletd._backend.get_backend", new_callable=AsyncMock)
     @patch("jmwallet.wallet.service.WalletService")
-    async def test_opens_wallet(
+    async def test_opens_wallet_descriptor_backend(
         self,
         mock_ws_cls: MagicMock,
         mock_get_backend: AsyncMock,
@@ -201,7 +283,7 @@ class TestOpenWallet:
         mock_ws.sync = AsyncMock()
         mock_ws.setup_descriptor_wallet = AsyncMock()
         mock_ws_cls.return_value = mock_ws
-        mock_get_backend.return_value = MagicMock()
+        mock_get_backend.return_value = _make_descriptor_backend()
 
         ws = await open_wallet(
             wallet_path=wallet_path,
@@ -212,8 +294,47 @@ class TestOpenWallet:
         mock_ws_cls.assert_called_once()
         assert mock_ws_cls.call_args.kwargs["network"] == "mainnet"
 
-        # Open existing wallet: descriptor wallet set up with default rescan.
+        # Descriptor backend: setup_descriptor_wallet called with default rescan.
         mock_ws.setup_descriptor_wallet.assert_awaited_once_with()
+
+    @patch("jmwalletd.wallet_ops._get_network", return_value="mainnet")
+    @patch("jmwalletd._backend.get_backend", new_callable=AsyncMock)
+    @patch("jmwallet.wallet.service.WalletService")
+    async def test_opens_wallet_neutrino_backend(
+        self,
+        mock_ws_cls: MagicMock,
+        mock_get_backend: AsyncMock,
+        mock_get_network: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Neutrino backend: setup_descriptor_wallet must not be called on unlock."""
+        wallet_path = tmp_path / "wallets" / "neutrino.jmdat"
+        wallet_path.parent.mkdir(parents=True, exist_ok=True)
+
+        _save_wallet_file(
+            wallet_path=wallet_path,
+            mnemonic="abandon " * 11 + "about",
+            password="password",
+            wallet_type="sw",
+        )
+
+        mock_ws = MagicMock()
+        mock_ws.sync = AsyncMock()
+        mock_ws.setup_descriptor_wallet = AsyncMock()
+        mock_ws_cls.return_value = mock_ws
+        mock_get_backend.return_value = _make_neutrino_backend()
+
+        ws = await open_wallet(
+            wallet_path=wallet_path,
+            password="password",
+            data_dir=tmp_path,
+        )
+        assert ws is mock_ws
+
+        # Neutrino backend: setup_descriptor_wallet must NOT be called.
+        mock_ws.setup_descriptor_wallet.assert_not_awaited()
+        # sync() must still be called.
+        mock_ws.sync.assert_awaited_once()
 
     async def test_open_nonexistent(self, tmp_path: Path) -> None:
         wallet_path = tmp_path / "nonexistent.jmdat"

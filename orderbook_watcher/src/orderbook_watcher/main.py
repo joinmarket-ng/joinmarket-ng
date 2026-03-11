@@ -2,6 +2,8 @@
 Main entry point for the orderbook watcher.
 """
 
+from __future__ import annotations
+
 import argparse
 import asyncio
 import os

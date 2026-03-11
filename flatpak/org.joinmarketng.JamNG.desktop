@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Name=JAM-NG
+GenericName=Bitcoin CoinJoin Wallet
+Comment=Decentralized CoinJoin for Bitcoin privacy
+Icon=org.joinmarketng.JamNG
+Exec=jam-ng
+Terminal=false
+Categories=Finance;Network;
+Keywords=Bitcoin;CoinJoin;Privacy;Wallet;JoinMarket;
+StartupNotify=true
+Actions=Quit;
+
+[Desktop Action Quit]
+Name=Quit JAM-NG
+Exec=jam-ng-stop

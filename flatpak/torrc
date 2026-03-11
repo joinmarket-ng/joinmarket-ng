@@ -1,0 +1,22 @@
+# Tor configuration for JAM-NG Flatpak
+# This template is copied to ~/.joinmarket-ng/tor/torrc on every launch.
+# The __DATA_DIR__, __TOR_SOCKS_PORT__, and __TOR_CONTROL_PORT__ placeholders
+# are replaced by the entrypoint script.
+
+# Data directory (inside Flatpak sandbox)
+DataDirectory __DATA_DIR__/tor/data
+
+# Log to stdout (captured by entrypoint)
+Log notice stdout
+
+# SOCKS proxy for Bitcoin and directory server connections
+# IsolateSOCKSAuth: use SOCKS auth credentials for stream isolation
+# (jmcore sends unique credentials per connection for privacy)
+SocksPort 127.0.0.1:__TOR_SOCKS_PORT__ IsolateSOCKSAuth
+
+# Control port for creating ephemeral hidden services (maker)
+ControlPort 127.0.0.1:__TOR_CONTROL_PORT__
+
+# Cookie authentication for control port
+CookieAuthentication 1
+CookieAuthFile __DATA_DIR__/tor/data/control_auth_cookie
