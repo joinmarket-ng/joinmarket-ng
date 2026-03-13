@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Annotated
 
 import typer
-from jmcore.cli_common import setup_logging
+from jmcore.cli_common import resolve_backend_settings, setup_cli, setup_logging
 from loguru import logger
 
 from jmwallet.cli import app
@@ -321,9 +321,27 @@ def prepare_certificate_message(
             help="Data directory (default: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)",
         ),
     ] = None,
+    network: Annotated[str | None, typer.Option("--network", "-n", help="Bitcoin network")] = None,
+    backend_type: Annotated[
+        str | None,
+        typer.Option(
+            "--backend", "-b", help="Backend: scantxoutset | descriptor_wallet | neutrino"
+        ),
+    ] = None,
+    rpc_url: Annotated[str | None, typer.Option("--rpc-url", envvar="BITCOIN_RPC_URL")] = None,
+    neutrino_url: Annotated[
+        str | None, typer.Option("--neutrino-url", envvar="NEUTRINO_URL")
+    ] = None,
     mempool_api: Annotated[
         str,
-        typer.Option("--mempool-api", help="Mempool API URL for fetching block height (required)"),
+        typer.Option(
+            "--mempool-api",
+            help=(
+                "Mempool API URL for fetching block height. "
+                "Only used when no Bitcoin node backend is configured. "
+                "Example: http://localhost:8999/api"
+            ),
+        ),
     ] = "",
     log_level: Annotated[str, typer.Option("--log-level")] = "INFO",
 ) -> None:
@@ -345,7 +363,7 @@ def prepare_certificate_message(
     Where cert_expiry is the ABSOLUTE period number (current_period + validity_periods).
     The reference implementation validates that current_block < cert_expiry * 2016.
     """
-    setup_logging(log_level)
+    settings = setup_cli(log_level)
 
     from jmcore.paths import get_default_data_dir
 
@@ -384,16 +402,60 @@ def prepare_certificate_message(
         logger.error(f"Invalid certificate pubkey: {e}")
         raise typer.Exit(1)
 
-    # Fetch current block height from mempool API
-    import urllib.request
+    # Fetch current block height.
+    # Priority: configured Bitcoin node backend > explicit --mempool-api.
+    import asyncio
 
-    try:
-        with urllib.request.urlopen(f"{mempool_api}/blocks/tip/height", timeout=10) as response:
-            current_block_height = int(response.read().decode())
-        logger.info(f"Current block height: {current_block_height}")
-    except Exception as e:
-        logger.error(f"Failed to fetch block height from {mempool_api}: {e}")
-        logger.info("You can specify a different API with --mempool-api")
+    current_block_height: int | None = None
+
+    backend_settings = resolve_backend_settings(
+        settings,
+        network=network,
+        backend_type=backend_type,
+        rpc_url=rpc_url,
+        neutrino_url=neutrino_url,
+        data_dir=data_dir_opt,
+    )
+
+    node_available = bool(backend_settings.rpc_url or backend_settings.neutrino_url)
+
+    if node_available:
+        from jmwallet.backends.bitcoin_core import BitcoinCoreBackend
+        from jmwallet.backends.neutrino import NeutrinoBackend
+
+        try:
+            if backend_settings.backend_type == "neutrino":
+                node_backend: BitcoinCoreBackend | NeutrinoBackend = NeutrinoBackend(
+                    neutrino_url=backend_settings.neutrino_url,
+                    network=backend_settings.network,
+                )
+            else:
+                node_backend = BitcoinCoreBackend(
+                    rpc_url=backend_settings.rpc_url,
+                    rpc_user=backend_settings.rpc_user,
+                    rpc_password=backend_settings.rpc_password,
+                )
+            current_block_height = asyncio.run(node_backend.get_block_height())
+            logger.info(f"Current block height: {current_block_height} (from node)")
+        except Exception as e:
+            logger.error(f"Failed to fetch block height from Bitcoin node: {e}")
+            raise typer.Exit(1)
+    elif mempool_api:
+        from jmwallet.backends.mempool import MempoolBackend
+
+        try:
+            mempool_backend = MempoolBackend(base_url=mempool_api)
+            current_block_height = asyncio.run(mempool_backend.get_block_height())
+            logger.info(f"Current block height: {current_block_height} (from mempool API)")
+        except Exception as e:
+            logger.error(f"Failed to fetch block height from mempool API {mempool_api}: {e}")
+            raise typer.Exit(1)
+    else:
+        logger.error("No block height source available.")
+        logger.info(
+            "Configure a Bitcoin node in config.toml, pass --rpc-url / --neutrino-url, "
+            "or supply --mempool-api <url> as a fallback."
+        )
         raise typer.Exit(1)
 
     # Calculate cert_expiry as ABSOLUTE period number
@@ -662,9 +724,27 @@ def import_certificate(
         bool,
         typer.Option("--skip-verification", help="Skip signature verification (not recommended)"),
     ] = False,
+    network: Annotated[str | None, typer.Option("--network", "-n", help="Bitcoin network")] = None,
+    backend_type: Annotated[
+        str | None,
+        typer.Option(
+            "--backend", "-b", help="Backend: scantxoutset | descriptor_wallet | neutrino"
+        ),
+    ] = None,
+    rpc_url: Annotated[str | None, typer.Option("--rpc-url", envvar="BITCOIN_RPC_URL")] = None,
+    neutrino_url: Annotated[
+        str | None, typer.Option("--neutrino-url", envvar="NEUTRINO_URL")
+    ] = None,
     mempool_api: Annotated[
         str,
-        typer.Option("--mempool-api", help="Mempool API URL for fetching block height (required)"),
+        typer.Option(
+            "--mempool-api",
+            help=(
+                "Mempool API URL for validating cert expiry. "
+                "Only used when no Bitcoin node backend is configured. "
+                "Example: http://localhost:8999/api"
+            ),
+        ),
     ] = "",
     log_level: Annotated[str, typer.Option("--log-level")] = "INFO",
 ) -> None:
@@ -683,7 +763,7 @@ def import_certificate(
     The signature should be the base64 output from Sparrow's message signing tool,
     using the 'Standard (Electrum)' format.
     """
-    setup_logging(log_level)
+    settings = setup_cli(log_level)
 
     from coincurve import PrivateKey
     from jmcore.paths import get_default_data_dir
@@ -730,16 +810,56 @@ def import_certificate(
         logger.info("Use the same value shown by 'prepare-certificate-message'")
         raise typer.Exit(1)
 
-    # Fetch current block height to validate cert_expiry is in the future
-    import urllib.request
+    # Fetch current block height to validate cert_expiry is in the future.
+    # Priority: configured Bitcoin node backend > explicit --mempool-api.
+    import asyncio
 
-    try:
-        with urllib.request.urlopen(f"{mempool_api}/blocks/tip/height", timeout=10) as response:
-            current_block_height = int(response.read().decode())
-        logger.debug(f"Current block height: {current_block_height}")
-    except Exception as e:
-        logger.warning(f"Failed to fetch block height: {e}")
-        current_block_height = None
+    current_block_height: int | None = None
+
+    backend_settings = resolve_backend_settings(
+        settings,
+        network=network,
+        backend_type=backend_type,
+        rpc_url=rpc_url,
+        neutrino_url=neutrino_url,
+        data_dir=data_dir,
+    )
+
+    node_available = bool(backend_settings.rpc_url or backend_settings.neutrino_url)
+
+    if node_available:
+        from jmwallet.backends.bitcoin_core import BitcoinCoreBackend
+        from jmwallet.backends.neutrino import NeutrinoBackend
+
+        try:
+            if backend_settings.backend_type == "neutrino":
+                node_backend: BitcoinCoreBackend | NeutrinoBackend = NeutrinoBackend(
+                    neutrino_url=backend_settings.neutrino_url,
+                    network=backend_settings.network,
+                )
+            else:
+                node_backend = BitcoinCoreBackend(
+                    rpc_url=backend_settings.rpc_url,
+                    rpc_user=backend_settings.rpc_user,
+                    rpc_password=backend_settings.rpc_password,
+                )
+            current_block_height = asyncio.run(node_backend.get_block_height())
+            logger.debug(f"Current block height: {current_block_height} (from node)")
+        except Exception as e:
+            logger.warning(f"Failed to fetch block height from Bitcoin node: {e}")
+            current_block_height = None
+    elif mempool_api:
+        from jmwallet.backends.mempool import MempoolBackend
+
+        try:
+            mempool_backend = MempoolBackend(base_url=mempool_api)
+            current_block_height = asyncio.run(mempool_backend.get_block_height())
+            logger.debug(f"Current block height: {current_block_height} (from mempool API)")
+        except Exception as e:
+            logger.warning(f"Failed to fetch block height from mempool API {mempool_api}: {e}")
+            current_block_height = None
+    else:
+        logger.debug("No node backend or --mempool-api configured; skipping cert expiry validation")
 
     # Validate cert_expiry is in the future
     retarget_interval = 2016

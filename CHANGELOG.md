@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - **Removed default `mempool.space` public API dependency**: The `MempoolBackend` and `MempoolAPI` no longer default to the public `mempool.space` API. Users must now explicitly configure a `mempool_api_url` in `config.toml` or environment variables to use a self-hosted mempool instance for fidelity bond verification and wallet synchronization. Affected modules include `jmwallet`, `orderbook_watcher`, `cold_wallet.py`, and `fidelity_bond_tool.py`.
+- **`MempoolBackend` in `jmwallet` is opt-in only**: `jmwallet/backends/mempool.py` (`MempoolBackend`) remains available as an explicit opt-in wallet backend but is never instantiated by default. Wallet operations default to a local Bitcoin node via `BitcoinCoreBackend`, `DescriptorWalletBackend`, or `NeutrinoBackend`. The `orderbook_watcher` retains its optional mempool API fallback for fidelity bond observation only.
+- **`cold_wallet.py` block height uses configured node backend by default**: The `prepare-certificate-message` and `import-certificate` commands now use the same backend resolution as all other CLI commands (`--backend`, `--rpc-url`, `--neutrino-url`, `--network`, and `config.toml`). The `--mempool-api` flag is retained as an explicit opt-in fallback only when no node backend is configured; it is no longer the primary or required source. Removed the old direct `urllib`/`requests` calls against a bare `--mempool-api` URL that bypassed Tor.
 
 ### Fixed
 

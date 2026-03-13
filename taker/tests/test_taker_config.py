@@ -46,7 +46,7 @@ class TestTakerConfig:
         config = TakerConfig(
             mnemonic=sample_mnemonic,
             network="testnet",
-            backend_type="mempool",
+            backend_type="scantxoutset",
             directory_servers=["server1:5222", "server2:5222"],
             destination_address="tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx",
             amount=1_000_000,
@@ -59,7 +59,7 @@ class TestTakerConfig:
             minimum_makers=3,
         )
         assert config.network.value == "testnet"
-        assert config.backend_type == "mempool"
+        assert config.backend_type == "scantxoutset"
         assert len(config.directory_servers) == 2
         assert config.counterparty_count == 5
         assert config.max_cj_fee.abs_fee == 10_000
