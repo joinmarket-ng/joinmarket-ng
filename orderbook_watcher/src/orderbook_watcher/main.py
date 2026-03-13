@@ -102,7 +102,10 @@ async def run_watcher(log_level: str | None = None) -> None:
     logger.info(f"Nick: {watcher_nick}")
     logger.info(f"HTTP server: {watcher_settings.http_host}:{watcher_settings.http_port}")
     logger.info(f"Update interval: {watcher_settings.update_interval}s")
-    logger.info(f"Mempool API: {watcher_settings.mempool_api_url}")
+    if watcher_settings.mempool_api_url:
+        logger.info(f"Mempool API: {watcher_settings.mempool_api_url}")
+    else:
+        logger.warning("Mempool API not configured")
 
     # Directory nodes from env var (DIRECTORY_NODES) or config
     directory_nodes_str = os.environ.get("DIRECTORY_NODES", "")
