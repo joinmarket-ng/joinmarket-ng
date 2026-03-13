@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Removed default `mempool.space` public API dependency**: The `MempoolBackend` and `MempoolAPI` no longer default to the public `mempool.space` API. Users must now explicitly configure a `mempool_api_url` in `config.toml` or environment variables to use a self-hosted mempool instance for fidelity bond verification and wallet synchronization. Affected modules include `jmwallet`, `orderbook_watcher`, `cold_wallet.py`, and `fidelity_bond_tool.py`.
+
 ### Fixed
 
 - **Maker tracking via offer reannouncements**: After a coinjoin, makers re-announce offers with an exact `maxsize` reflecting their new balance, allowing observers to correlate balance changes with on-chain transactions (especially when combined with fidelity bond identity). Two mitigations: (1) `maxsize` is now rounded down to the nearest power of 2 so that small balance changes produce no visible offer update and (2) a configurable random delay (`offer_reannounce_delay_max`, default 600s) is applied before re-announcing to break timing correlation with block confirmations.
