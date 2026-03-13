@@ -25,11 +25,9 @@ class MempoolBackend(BlockchainBackend):
     Works with public instance or self-hosted.
     """
 
-    def __init__(self, base_url: str = "https://mempool.space/api", network: str = "mainnet"):
-        if network == "testnet":
-            base_url = "https://mempool.space/testnet/api"
-        elif network == "signet":
-            base_url = "https://mempool.space/signet/api"
+    def __init__(self, base_url: str, network: str = "mainnet"):
+        if not base_url:
+            raise ValueError("base_url is required for MempoolBackend")
 
         self.base_url = base_url.rstrip("/")
         self.network = network
