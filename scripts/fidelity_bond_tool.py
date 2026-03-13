@@ -340,7 +340,6 @@ def parse_bond_proof(proof_b64: str, maker_nick: str, taker_nick: str) -> dict:
             "txid": txid_display,
             "vout": vout,
             "outpoint": f"{txid_display}:{vout}",
-            "mempool_url": f"https://mempool.space/tx/{txid_display}",
         },
         "locktime": {
             "value": locktime,
@@ -470,8 +469,6 @@ def cmd_parse(args):
             print(f"✓ UTXO: {result['utxo']['outpoint']}")
             print(f"✓ Locktime: {result['locktime']['value']}")
             print(f"✓ Cert expires after block: {result['cert_expiry']['blocks']}")
-            print("\nView UTXO on blockchain explorer:")
-            print(f"  {result['utxo']['mempool_url']}")
             return 0
         else:
             print("✗ Signature validation FAILED")
@@ -528,8 +525,6 @@ def cmd_fetch_parse(args):
             print(f"✓ UTXO: {parsed['utxo']['outpoint']}")
             print(f"✓ Locktime: {parsed['locktime']['value']}")
             print(f"✓ Cert expires after block: {parsed['cert_expiry']['blocks']}")
-            print("\nView UTXO on blockchain explorer:")
-            print(f"  {parsed['utxo']['mempool_url']}")
             return 0
         else:
             print("✗ Signature validation FAILED")
