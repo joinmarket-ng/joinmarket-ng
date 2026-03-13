@@ -389,12 +389,33 @@ start_neutrino() {
         return 0
     fi
 
+    # Read user-configured connect peers (list in TOML, joined as comma-separated string).
+    local connect_peers
+    connect_peers=$(python3 -c "
+import sys
+try:
+    if sys.version_info >= (3, 11):
+        import tomllib
+    else:
+        import tomli as tomllib
+    with open('${CONFIG_FILE}', 'rb') as f:
+        config = tomllib.load(f)
+    peers = config.get('bitcoin', {}).get('neutrino_connect_peers', [])
+    if isinstance(peers, list):
+        print(','.join(peers))
+    elif peers:
+        print(peers)
+except Exception:
+    pass
+" 2>/dev/null || true)
+
     log "Starting neutrino-api light client..."
     NETWORK="${NETWORK}" \
     LISTEN_ADDR="127.0.0.1:${NEUTRINO_PORT}" \
     DATA_DIR="${NEUTRINO_DATA_DIR}" \
     LOG_LEVEL="${NEUTRINO_LOG_LEVEL:-info}" \
     TOR_PROXY="127.0.0.1:${TOR_SOCKS_PORT}" \
+    CONNECT_PEERS="${connect_peers}" \
     neutrinod > "${LOG_DIR}/neutrino.log" 2>&1 &
     local pid=$!
     PIDS+=("$pid")

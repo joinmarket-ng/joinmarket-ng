@@ -24,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Network switcher in GUI**: The control panel includes a network dropdown and a "Switch & Restart" button. Selecting a different network writes a restart request, sends SIGTERM to the entrypoint, and the entrypoint re-execs itself with `--network <new>` instead of exiting.
   - **Per-network data directories**: Each network (mainnet/signet/regtest) gets its own data directory with separate wallets, logs, config, neutrino data, and PID files. Mainnet uses `~/.joinmarket-ng/` directly for backwards compatibility; non-mainnet uses `~/.joinmarket-ng/{network}/`. Tor state is shared across all networks.
   - **Incremental log viewer with scroll preservation**: The GUI log viewer now appends only new content instead of re-rendering the entire file on each refresh. Scroll position is preserved when the user scrolls up to read earlier logs; auto-scroll to bottom only occurs if the user was already at the tail. Buffer is trimmed to prevent unbounded memory growth during long sessions.
+- **Neutrino connect peers configuration**: Added `neutrino_connect_peers` setting under `[bitcoin]` in `config.toml`. Most signet nodes do not serve compact block filters (BIP157/158), causing neutrino to ban them and stall. Set `neutrino_connect_peers` to a peer you control or know serves filters to avoid the ban loop. The flatpak entrypoint reads this setting and passes it to `neutrinod` via `CONNECT_PEERS`. Maker and taker CLIs also propagate these peers to the neutrino backend.
 
 ### Fixed
 
