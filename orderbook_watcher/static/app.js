@@ -400,10 +400,9 @@ async function fetchCurrentBlockHeight() {
     }
 
     try {
-        let mempoolApi = orderbookData.mempool_url || 'https://mempool.space';
-        // Use clearnet API even on onion for simplicity (API calls work)
-        if (mempoolApi.includes('.onion')) {
-            mempoolApi = 'https://mempool.space';
+        let mempoolApi = orderbookData.mempool_url || '';
+        if (!mempoolApi) {
+            return null;
         }
         const response = await fetch(`${mempoolApi}/api/blocks/tip/height`);
         if (response.ok) {
@@ -426,7 +425,7 @@ async function showBondModal(bondData, bondAmount, bondValue) {
 
     document.getElementById('bond-maker-nick').textContent = bondData.maker_nick;
 
-    let mempoolUrl = orderbookData.mempool_url || 'https://mempool.space';
+    let mempoolUrl = orderbookData.mempool_url || '';
     if (window.location.hostname.endsWith('.onion') && orderbookData.mempool_onion_url) {
         mempoolUrl = orderbookData.mempool_onion_url;
     }
