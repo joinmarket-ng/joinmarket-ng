@@ -42,6 +42,7 @@ def _make_server() -> OrderbookServer:
     settings = OrderbookWatcherSettings()
     aggregator = MagicMock(spec=OrderbookAggregator)
     aggregator.directory_nodes = [("dir1.onion", 5222)]
+    aggregator.mempool_api_url = "http://dummy.api"
     aggregator.node_statuses = {}
     aggregator.clients = {}
     return OrderbookServer(settings, aggregator)
