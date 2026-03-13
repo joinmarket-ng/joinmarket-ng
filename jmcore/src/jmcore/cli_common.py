@@ -63,6 +63,7 @@ class ResolvedBackendSettings:
     rpc_user: str
     rpc_password: str
     neutrino_url: str
+    neutrino_connect_peers: list[str]
     data_dir: Path
     scan_start_height: int | None = None
 
@@ -211,6 +212,9 @@ def resolve_backend_settings(
         neutrino_url if neutrino_url is not None else settings.bitcoin.neutrino_url
     )
 
+    # Resolve Neutrino connect peers
+    resolved_neutrino_connect_peers = settings.get_neutrino_connect_peers()
+
     # Resolve data directory
     resolved_data_dir = data_dir if data_dir is not None else settings.get_data_dir()
 
@@ -222,6 +226,7 @@ def resolve_backend_settings(
         rpc_user=resolved_rpc_user,
         rpc_password=resolved_rpc_password,
         neutrino_url=resolved_neutrino_url,
+        neutrino_connect_peers=resolved_neutrino_connect_peers,
         data_dir=resolved_data_dir,
         scan_start_height=settings.wallet.scan_start_height,
     )
@@ -627,6 +632,7 @@ def create_backend(
             neutrino_url=backend_settings.neutrino_url,
             network=backend_settings.bitcoin_network,
             scan_start_height=backend_settings.scan_start_height,
+            connect_peers=backend_settings.neutrino_connect_peers,
         )
     elif backend_type == "descriptor_wallet":
         if not wallet_name:

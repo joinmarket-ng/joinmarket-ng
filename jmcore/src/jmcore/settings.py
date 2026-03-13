@@ -172,6 +172,8 @@ class BitcoinSettings(BaseModel):
         default_factory=list,
         description=(
             "Explicit peer addresses for neutrino to connect to (host:port). "
+            "Applied globally to all components (maker, taker, jmwallet, etc.) "
+            "when using the neutrino backend. "
             "Most signet nodes do not serve compact block filters; use this to "
             "point neutrino at a known filter-serving peer. "
             "Leave empty to rely on DNS seeds."
@@ -979,7 +981,9 @@ def generate_config_template() -> str:
                     continue
                 # For neutrino_connect_peers, show an example with a comment
                 if field_name == "neutrino_connect_peers" and prefix == "bitcoin":
-                    lines.append("# Example (signet peer serving compact block filters):")
+                    lines.append(
+                        "# Explicit peers for neutrino (host:port, used by all components)."
+                    )
                     lines.append("# neutrino_connect_peers = [")
                     lines.append('#   "your-filter-peer:38333",')
                     lines.append("# ]")

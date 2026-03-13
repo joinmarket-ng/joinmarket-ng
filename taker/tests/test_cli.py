@@ -142,6 +142,45 @@ class TestBuildTakerConfig:
         assert config.fee_rate is None
         assert config.fee_block_target == 10  # From taker.fee_block_target, not wallet default
 
+    def test_neutrino_connect_peers_in_backend_config(
+        self, sample_mnemonic: str, mock_settings: MagicMock
+    ) -> None:
+        """Test that neutrino_connect_peers from settings flows into backend_config."""
+        mock_settings.bitcoin.backend_type = "neutrino"
+        mock_settings.get_neutrino_connect_peers.return_value = ["peer1.example.com:38333"]
+        mock_settings.swap.provider_url = "http://127.0.0.1:19999"
+
+        config = build_taker_config(
+            settings=mock_settings,
+            mnemonic=sample_mnemonic,
+            passphrase="",
+            destination="bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+            amount=100000,
+            mixdepth=0,
+        )
+
+        assert config.backend_type == "neutrino"
+        assert config.backend_config.get("connect_peers") == ["peer1.example.com:38333"]
+
+    def test_neutrino_empty_connect_peers_by_default(
+        self, sample_mnemonic: str, mock_settings: MagicMock
+    ) -> None:
+        """Test that connect_peers defaults to empty list when not configured."""
+        mock_settings.bitcoin.backend_type = "neutrino"
+        mock_settings.get_neutrino_connect_peers.return_value = []
+        mock_settings.swap.provider_url = "http://127.0.0.1:19999"
+
+        config = build_taker_config(
+            settings=mock_settings,
+            mnemonic=sample_mnemonic,
+            passphrase="",
+            destination="bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+            amount=100000,
+            mixdepth=0,
+        )
+
+        assert config.backend_config.get("connect_peers") == []
+
     def test_data_dir_flows_to_config(self, sample_mnemonic: str, mock_settings: MagicMock) -> None:
         """Verify data_dir from settings flows into TakerConfig.
 
