@@ -68,11 +68,11 @@ class MempoolAPIError(Exception):
 class MempoolAPI:
     def __init__(
         self,
-        base_url: str = "https://mempool.space/api",
+        base_url: str,
         timeout: float = 30.0,
         socks_proxy: str | None = None,
     ):
-        self.base_url = base_url.rstrip("/")
+        self.base_url = base_url.rstrip("/") if base_url else ""
         self.timeout = timeout
         self.socks_proxy = socks_proxy
 
@@ -117,6 +117,10 @@ class MempoolAPI:
 
     async def test_connection(self) -> bool:
         """Test if the API connection works by making a simple request."""
+        if not self.base_url:
+            logger.debug("Mempool API connection test skipped (no base_url configured)")
+            return False
+
         try:
             # Test with a lightweight endpoint - get current block tip height
             url = f"{self.base_url}/blocks/tip/height"
@@ -131,6 +135,9 @@ class MempoolAPI:
             return False
 
     async def _get(self, endpoint: str) -> dict[str, Any]:
+        if not self.base_url:
+            raise MempoolAPIError("Mempool API URL is not configured")
+
         url = f"{self.base_url}/{endpoint}"
         try:
             logger.debug(f"MempoolAPI request: GET {url}")
