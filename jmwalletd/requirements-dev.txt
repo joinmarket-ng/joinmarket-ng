@@ -1109,9 +1109,9 @@ pygments==2.19.2 \
     # via
     #   pytest
     #   rich
-pyjwt==2.11.0 \
-    --hash=sha256:35f95c1f0fbe5d5ba6e43f00271c275f7a1a4db1dab27bf708073b75318ea623 \
-    --hash=sha256:94a6bde30eb5c8e04fee991062b534071fd1439ef58d2adc9ccb823e7bcd0469
+pyjwt==2.12.0 \
+    --hash=sha256:2f62390b667cd8257de560b850bb5a883102a388829274147f1d724453f8fb02 \
+    --hash=sha256:9bb459d1bdd0387967d287f5656bf7ec2b9a26645d1961628cda1764e087fd6e
     # via jmwalletd (pyproject.toml)
 pytest==9.0.2 \
     --hash=sha256:711ffd45bf766d5264d487b917733b453d917afd2b0ad65223959f59089f875b \
