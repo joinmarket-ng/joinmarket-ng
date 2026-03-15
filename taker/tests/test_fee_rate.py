@@ -22,7 +22,7 @@ def _make_taker(
     can_estimate_fee: bool = True,
     estimate_fee_return: float = 5.0,
     mempool_min_fee: float | None = None,
-    tx_fee_factor: float = 1.0,
+    tx_fee_factor: float = 0.2,
 ) -> Taker:
     """Create a Taker with mocked internals for _resolve_fee_rate testing.
 
@@ -140,3 +140,17 @@ class TestResolveFeeRate:
         taker.backend.get_mempool_min_fee = AsyncMock(side_effect=Exception("unavailable"))
         rate = await taker._resolve_fee_rate()
         assert rate == 3.0
+
+    @pytest.mark.asyncio
+    async def test_default_randomization_factor_uses_20_percent_band(self) -> None:
+        """Default tx_fee_factor should randomize only within +20% band.
+
+        Reference implementation default is tx_fees_factor=0.2.
+        """
+        taker = _make_taker(fee_rate=1.0, tx_fee_factor=0.2)
+
+        with patch("random.uniform", return_value=1.2) as mock_uniform:
+            await taker._resolve_fee_rate()
+
+        mock_uniform.assert_called_once_with(1.0, 1.2)
+        assert taker._randomized_fee_rate == 1.2

@@ -500,9 +500,9 @@ class TakerSettings(BaseModel):
         description="Maximum relative CoinJoin fee (0.001 = 0.1%)",
     )
     tx_fee_factor: float = Field(
-        default=3.0,
-        ge=1.0,
-        description="Multiply estimated fee by this factor",
+        default=0.2,
+        ge=0.0,
+        description="Randomization factor for fees (randomized between base and base*(1+factor))",
     )
     fee_block_target: int | None = Field(
         default=None,
