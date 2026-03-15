@@ -274,6 +274,7 @@ class TestCreateBackend:
         mock_cls.assert_called_once_with(
             neutrino_url="http://127.0.0.1:8334",
             network="signet",
+            scan_start_height=None,
             connect_peers=peers,
         )
         assert result is mock_backend
@@ -306,6 +307,7 @@ class TestCreateBackend:
         mock_cls.assert_called_once_with(
             neutrino_url="http://127.0.0.1:8334",
             network="mainnet",
+            scan_start_height=None,
             connect_peers=[],
         )
 
