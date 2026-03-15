@@ -266,7 +266,15 @@ class SwapClient:
             else:
                 logger.info("No prepay invoice; main hold invoice payment started in background.")
         else:
-            logger.info(f"Pay this invoice to receive the swap UTXO: {swap_response.invoice}")
+            if swap_response.miner_fee_invoice:
+                logger.info(
+                    "Swap provider returned bundled invoices. You must pay BOTH invoices "
+                    "to trigger lockup broadcast."
+                )
+                logger.info(f"Main hold invoice: {swap_response.invoice}")
+                logger.info(f"Prepay miner-fee invoice: {swap_response.miner_fee_invoice}")
+            else:
+                logger.info(f"Pay this invoice to receive the swap UTXO: {swap_response.invoice}")
 
         # Step 6: Wait for lockup (provider broadcasts after payment)
         if wait_for_lockup:

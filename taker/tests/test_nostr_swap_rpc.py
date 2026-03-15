@@ -599,6 +599,57 @@ class TestSwapClientPrepayInvoice:
         assert client._pay_invoice.call_count == 1
         assert client._pay_invoice.call_args[0][0] == "lnbcrt_main_only"
 
+    @pytest.mark.asyncio
+    async def test_manual_mode_logs_both_invoices_when_prepay_present(self) -> None:
+        """Without LND, user must be told to pay both bundled invoices."""
+        from taker.swap.client import SwapClient
+        from taker.swap.models import ReverseSwapResponse
+
+        client = SwapClient(network="regtest")
+
+        client._provider = MagicMock(
+            offer_id="aa" * 32,
+            pubkey="test",
+            percentage_fee=0.5,
+            mining_fee=150,
+            min_amount=20_000,
+            max_reverse_amount=5_000_000,
+            http_url=None,
+            pow_bits=0,
+            calculate_invoice_amount=lambda x: x + 500,
+        )
+
+        swap_resp = ReverseSwapResponse(
+            id="swap3",
+            invoice="lnbcrt_main_invoice",
+            miner_fee_invoice="lnbcrt_prepay_invoice",
+            lockup_address="bcrt1qmockaddr",
+            redeem_script="ab" * 32,
+            timeout_block_height=800080,
+            onchain_amount=48000,
+        )
+
+        client._generate_swap_secrets = MagicMock()  # type: ignore[method-assign]
+        client._preimage_hash = b"\x00" * 32
+        client._claim_pubkey = b"\x02" + b"\x00" * 32
+        client._create_reverse_swap = AsyncMock(return_value=swap_resp)  # type: ignore[method-assign]
+        client._verify_swap_response = MagicMock()  # type: ignore[method-assign]
+        client._wait_for_lockup = AsyncMock(  # type: ignore[method-assign]
+            side_effect=TimeoutError("stop")
+        )
+
+        with patch("taker.swap.client.logger.info") as mock_info:
+            with pytest.raises(TimeoutError, match="stop"):
+                await client.acquire_swap_input(
+                    desired_amount_sats=48_000,
+                    current_block_height=800_000,
+                )
+
+        messages = "\n".join(str(c.args[0]) for c in mock_info.call_args_list if c.args)
+        assert "must pay BOTH invoices" in messages
+        assert "Main hold invoice: lnbcrt_main_invoice" in messages
+        assert "Prepay miner-fee invoice: lnbcrt_prepay_invoice" in messages
+
 
 # ---------------------------------------------------------------------------
 # Tests: NostrSwapRPC used by SwapClient._create_reverse_swap
