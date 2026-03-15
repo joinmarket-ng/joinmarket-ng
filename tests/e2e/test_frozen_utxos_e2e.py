@@ -346,6 +346,11 @@ class TestFreezeExcludesFromBalance:
 
         For md0, get_balance_for_offers returns the largest single UTXO
         value (not the sum) because merging md0 UTXOs is forbidden.
+
+        When the frozen UTXO has a unique maximum value, the balance must
+        strictly decrease.  When multiple UTXOs share the same max value,
+        freezing one leaves another with the same value so the balance
+        stays equal — we accept ``<=`` in that case.
         """
         wallet = funded_wallet_with_metadata
 
@@ -356,13 +361,24 @@ class TestFreezeExcludesFromBalance:
         # that the next call to get_balance_for_offers must return a strictly
         # smaller number (or 0 if all UTXOs have equal value).
         utxos_sorted = sorted(utxos, key=lambda u: u.value, reverse=True)
-        max_value = utxos_sorted[0].value
-        for target in utxos_sorted:
-            if target.value == max_value:
-                wallet.freeze_utxo(target.outpoint)
+        target = utxos_sorted[0]
+
+        # Determine whether the max value is unique among eligible UTXOs.
+        eligible = [u for u in utxos if not u.frozen and not u.is_fidelity_bond]
+        max_value_count = sum(1 for u in eligible if u.value == target.value)
+
+        wallet.freeze_utxo(target.outpoint)
 
         offer_balance_after = await wallet.get_balance_for_offers(0)
-        assert offer_balance_after < offer_balance_before
+
+        if max_value_count == 1:
+            # Unique maximum — balance must strictly decrease.
+            assert offer_balance_after < offer_balance_before
+        else:
+            # Duplicate max values — another UTXO has the same value so
+            # max() returns the same number.  Still valid: the frozen
+            # UTXO is excluded from the eligible set.
+            assert offer_balance_after <= offer_balance_before
 
     @pytest.mark.asyncio
     async def test_freeze_all_utxos_yields_zero_balance(

@@ -55,7 +55,7 @@ GENERIC_TEST_MNEMONIC = (
 @pytest.fixture(scope="module")
 def neutrino_url() -> str:
     """Neutrino server URL."""
-    return "http://127.0.0.1:8334"
+    return "http://127.0.0.1:8335"
 
 
 @pytest_asyncio.fixture

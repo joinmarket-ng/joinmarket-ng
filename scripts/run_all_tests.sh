@@ -210,7 +210,7 @@ wait_for_neutrino() {
     log_info "Waiting for Neutrino to sync..."
 
     for i in {1..60}; do
-        if curl -s http://localhost:8334/v1/status 2>/dev/null | grep -q '"synced":true'; then
+        if curl -s http://localhost:8335/v1/status 2>/dev/null | grep -q '"synced":true'; then
             log_success "Neutrino synced!"
             return 0
         fi

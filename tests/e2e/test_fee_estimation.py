@@ -126,7 +126,7 @@ class TestNeutrinoFeeEstimation:
     async def neutrino_backend(self):
         """Create Neutrino backend (may not be available)."""
         backend = NeutrinoBackend(
-            neutrino_url="http://127.0.0.1:8334",
+            neutrino_url="http://127.0.0.1:8335",
             network="regtest",
         )
 
@@ -341,7 +341,7 @@ class TestNeutrinoTakerFeeResolution:
     async def neutrino_backend(self):
         """Create Neutrino backend."""
         backend = NeutrinoBackend(
-            neutrino_url="http://127.0.0.1:8334",
+            neutrino_url="http://127.0.0.1:8335",
             network="regtest",
         )
 

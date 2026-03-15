@@ -17,10 +17,12 @@ from taker.orderbook import (
     choose_orders,
     dedupe_offers_by_bond,
     dedupe_offers_by_maker,
+    equalize_maker_fees,
     fidelity_bond_weighted_choose,
     filter_offers,
     is_fee_within_limits,
     random_order_choose,
+    sample_fake_fee_from_orderbook,
     weighted_order_choose,
 )
 
@@ -1062,3 +1064,402 @@ class TestFilterOffersByNickVersion:
         )
         # Only 3 J5 makers available
         assert len(orders) == 3
+
+
+class TestSampleFakeFeeFromOrderbook:
+    """Tests for sample_fake_fee_from_orderbook()."""
+
+    @pytest.fixture
+    def orderbook_offers(self) -> list[Offer]:
+        """Create a realistic orderbook with varied fees."""
+        return [
+            Offer(
+                counterparty="maker_a",
+                oid=0,
+                ordertype=OfferType.SW0_ABSOLUTE,
+                minsize=10_000,
+                maxsize=5_000_000,
+                txfee=500,
+                cjfee=1000,
+            ),
+            Offer(
+                counterparty="maker_b",
+                oid=0,
+                ordertype=OfferType.SW0_ABSOLUTE,
+                minsize=10_000,
+                maxsize=5_000_000,
+                txfee=500,
+                cjfee=1200,
+            ),
+            Offer(
+                counterparty="maker_c",
+                oid=0,
+                ordertype=OfferType.SW0_ABSOLUTE,
+                minsize=10_000,
+                maxsize=5_000_000,
+                txfee=500,
+                cjfee=800,
+            ),
+            Offer(
+                counterparty="maker_d",
+                oid=0,
+                ordertype=OfferType.SW0_ABSOLUTE,
+                minsize=10_000,
+                maxsize=5_000_000,
+                txfee=500,
+                cjfee=1100,
+            ),
+            Offer(
+                counterparty="maker_e",
+                oid=0,
+                ordertype=OfferType.SW0_ABSOLUTE,
+                minsize=10_000,
+                maxsize=5_000_000,
+                txfee=500,
+                cjfee=950,
+            ),
+            # Selected maker (should be excluded from sampling)
+            Offer(
+                counterparty="selected_maker",
+                oid=0,
+                ordertype=OfferType.SW0_ABSOLUTE,
+                minsize=10_000,
+                maxsize=5_000_000,
+                txfee=500,
+                cjfee=900,
+            ),
+        ]
+
+    def test_samples_from_orderbook_fees(self, orderbook_offers: list[Offer]) -> None:
+        """Fake fee should be drawn from non-selected orderbook fees."""
+        cj_amount = 100_000
+        selected = {"selected_maker"}
+        # Non-selected fees: 1000, 1200, 800, 1100, 950
+        # Mean = 1010, stdev ~ 138.6
+        # Range: [871, 1148]
+        # Eligible: 1000, 800 is excluded, 1200 is excluded, 1100, 950
+        # Actually: lower=max(1, 1010-138)=872, upper=1010+138=1148
+        # 800 < 872 -> excluded. 1200 > 1148 -> excluded.
+        # Filtered: [1000, 1100, 950]
+        results = set()
+        for _ in range(200):
+            fee = sample_fake_fee_from_orderbook(
+                offers=orderbook_offers,
+                cj_amount=cj_amount,
+                selected_nicks=selected,
+                max_cj_fee=MaxCjFee(abs_fee=50_000, rel_fee="0.05"),
+            )
+            results.add(fee)
+            assert fee > 0
+
+        # Should only produce values from the filtered set
+        assert results.issubset({950, 1000, 1100})
+
+    def test_excludes_selected_makers(self, orderbook_offers: list[Offer]) -> None:
+        """Fees from selected makers must not appear in the sample pool."""
+        cj_amount = 100_000
+        # Select all but one maker
+        selected = {"maker_a", "maker_b", "maker_c", "maker_d", "maker_e"}
+        # Only selected_maker (fee=900) remains, but need >= 3 -> fallback
+        # fallback_max = int(0.05 * 100_000) = 5000 -> range [1, 5000]
+        fee = sample_fake_fee_from_orderbook(
+            offers=orderbook_offers,
+            cj_amount=cj_amount,
+            selected_nicks=selected,
+            max_cj_fee=MaxCjFee(abs_fee=50_000, rel_fee="0.05"),
+        )
+        assert 1 <= fee <= 5000
+
+    def test_fallback_when_insufficient_offers(self) -> None:
+        """Falls back to derived range when fewer than 3 non-selected offers."""
+        offers = [
+            Offer(
+                counterparty="maker_a",
+                oid=0,
+                ordertype=OfferType.SW0_ABSOLUTE,
+                minsize=10_000,
+                maxsize=5_000_000,
+                txfee=500,
+                cjfee=1000,
+            ),
+        ]
+        # fallback_max = int(0.003 * 100_000) = 300 -> range [1, 300]
+        fee = sample_fake_fee_from_orderbook(
+            offers=offers,
+            cj_amount=100_000,
+            selected_nicks=set(),
+            max_cj_fee=MaxCjFee(abs_fee=50_000, rel_fee="0.003"),
+        )
+        assert 1 <= fee <= 300
+
+    def test_empty_orderbook_uses_fallback(self) -> None:
+        """Empty orderbook should use fallback range."""
+        # fallback_max = int(0.002 * 100_000) = 200 -> range [1, 200]
+        fee = sample_fake_fee_from_orderbook(
+            offers=[],
+            cj_amount=100_000,
+            selected_nicks=set(),
+            max_cj_fee=MaxCjFee(abs_fee=50_000, rel_fee="0.002"),
+        )
+        assert 1 <= fee <= 200
+
+    def test_offers_outside_amount_range_excluded(self) -> None:
+        """Offers that don't cover cj_amount should be excluded."""
+        offers = [
+            Offer(
+                counterparty=f"maker_{i}",
+                oid=0,
+                ordertype=OfferType.SW0_ABSOLUTE,
+                minsize=10_000,
+                maxsize=50_000,  # max < cj_amount
+                txfee=500,
+                cjfee=1000,
+            )
+            for i in range(5)
+        ]
+        # All offers excluded (maxsize < cj_amount) -> fallback
+        # fallback_max = int(0.006 * 100_000) = 600 -> range [1, 600]
+        fee = sample_fake_fee_from_orderbook(
+            offers=offers,
+            cj_amount=100_000,
+            selected_nicks=set(),
+            max_cj_fee=MaxCjFee(abs_fee=50_000, rel_fee="0.006"),
+        )
+        assert 1 <= fee <= 600
+
+    def test_all_identical_fees(self) -> None:
+        """When all fees are identical, return that fee."""
+        offers = [
+            Offer(
+                counterparty=f"maker_{i}",
+                oid=0,
+                ordertype=OfferType.SW0_ABSOLUTE,
+                minsize=10_000,
+                maxsize=5_000_000,
+                txfee=500,
+                cjfee=1500,
+            )
+            for i in range(5)
+        ]
+        fee = sample_fake_fee_from_orderbook(
+            offers=offers,
+            cj_amount=100_000,
+            selected_nicks=set(),
+            max_cj_fee=MaxCjFee(abs_fee=50_000, rel_fee="0.05"),
+        )
+        assert fee == 1500
+
+    def test_relative_fee_offers(self) -> None:
+        """Works with relative fee offers."""
+        offers = [
+            Offer(
+                counterparty=f"maker_{i}",
+                oid=0,
+                ordertype=OfferType.SW0_RELATIVE,
+                minsize=10_000,
+                maxsize=5_000_000,
+                txfee=500,
+                cjfee="0.001",  # 0.1% -> 100 sats on 100k
+            )
+            for i in range(5)
+        ]
+        fee = sample_fake_fee_from_orderbook(
+            offers=offers,
+            cj_amount=100_000,
+            selected_nicks=set(),
+            max_cj_fee=MaxCjFee(abs_fee=50_000, rel_fee="0.05"),
+        )
+        assert fee == 100  # 0.1% of 100,000
+
+    def test_mixed_offer_types(self) -> None:
+        """Handles a mix of absolute and relative offers."""
+        offers = [
+            Offer(
+                counterparty="abs_1",
+                oid=0,
+                ordertype=OfferType.SW0_ABSOLUTE,
+                minsize=10_000,
+                maxsize=5_000_000,
+                txfee=500,
+                cjfee=500,
+            ),
+            Offer(
+                counterparty="abs_2",
+                oid=0,
+                ordertype=OfferType.SW0_ABSOLUTE,
+                minsize=10_000,
+                maxsize=5_000_000,
+                txfee=500,
+                cjfee=600,
+            ),
+            Offer(
+                counterparty="rel_1",
+                oid=0,
+                ordertype=OfferType.SW0_RELATIVE,
+                minsize=10_000,
+                maxsize=5_000_000,
+                txfee=500,
+                cjfee="0.005",  # 0.5% of 100k = 500
+            ),
+            Offer(
+                counterparty="rel_2",
+                oid=0,
+                ordertype=OfferType.SW0_RELATIVE,
+                minsize=10_000,
+                maxsize=5_000_000,
+                txfee=500,
+                cjfee="0.0055",  # 0.55% of 100k = 550
+            ),
+        ]
+        # Fees: 500, 600, 500, 550 -> mean=537.5, stdev~41
+        # range: [496, 578] -> filtered: [500, 500, 550]
+        results = set()
+        for _ in range(200):
+            fee = sample_fake_fee_from_orderbook(
+                offers=offers,
+                cj_amount=100_000,
+                selected_nicks=set(),
+                max_cj_fee=MaxCjFee(abs_fee=50_000, rel_fee="0.01"),
+            )
+            results.add(fee)
+        assert results.issubset({500, 550})
+
+
+class TestEqualizeMakerFees:
+    """Tests for equalize_maker_fees()."""
+
+    def test_empty_dict(self) -> None:
+        """Empty maker_fees returns empty dict."""
+        result = equalize_maker_fees({}, 1000)
+        assert result == {}
+
+    def test_zero_leftover(self) -> None:
+        """Zero leftover returns fees unchanged."""
+        fees = {"alice": 100, "bob": 200, "carol": 300}
+        result = equalize_maker_fees(fees, 0)
+        assert result == fees
+
+    def test_negative_leftover(self) -> None:
+        """Negative leftover returns fees unchanged."""
+        fees = {"alice": 100, "bob": 200}
+        result = equalize_maker_fees(fees, -50)
+        assert result == fees
+
+    def test_single_maker(self) -> None:
+        """Single maker gets all leftover."""
+        result = equalize_maker_fees({"alice": 100}, 500)
+        assert result == {"alice": 600}
+
+    def test_all_equal_fees(self) -> None:
+        """All fees equal -> leftover distributed evenly (floor)."""
+        fees = {"alice": 100, "bob": 100, "carol": 100}
+        result = equalize_maker_fees(fees, 30)
+        # 30 / 3 = 10 each, no remainder
+        assert result == {"alice": 110, "bob": 110, "carol": 110}
+
+    def test_all_equal_fees_with_remainder(self) -> None:
+        """Indivisible remainder distributed 1 sat each to first makers."""
+        fees = {"alice": 100, "bob": 100, "carol": 100}
+        result = equalize_maker_fees(fees, 31)
+        # 31 / 3 = 10 each, 1 sat remainder -> first maker gets +1
+        assert result == {"alice": 111, "bob": 110, "carol": 110}
+        total_added = sum(result[n] - fees[n] for n in fees)
+        assert total_added == 31  # ALL leftover distributed
+
+    def test_two_makers_level_up(self) -> None:
+        """Two makers: raise lower to upper, distribute rest."""
+        fees = {"alice": 100, "bob": 200}
+        # Budget = 500. Raise alice (100 -> 200) costs 100.
+        # Remaining: 400. Both at 200. 400 / 2 = 200 each.
+        # Final: alice=400, bob=400
+        result = equalize_maker_fees(fees, 500)
+        assert result == {"alice": 400, "bob": 400}
+
+    def test_three_makers_sequential_leveling(self) -> None:
+        """Three distinct fees: sequential leveling."""
+        fees = {"alice": 100, "bob": 200, "carol": 300}
+        # Step 1: Raise alice (100 -> 200) costs 100. Budget = 1000 - 100 = 900.
+        # Step 2: alice+bob at 200, raise to 300 costs 2*100 = 200. Budget = 700.
+        # Step 3: all at 300. 700 / 3 = 233 each (remainder 1 sat -> first maker).
+        # Final: 534, 533, 533
+        result = equalize_maker_fees(fees, 1000)
+        assert result == {"alice": 534, "bob": 533, "carol": 533}
+        total_added = sum(result[n] - fees[n] for n in fees)
+        assert total_added == 1000  # ALL leftover distributed
+
+    def test_partial_leveling_budget_exhausted_mid_step(self) -> None:
+        """Budget runs out during leveling — partial raise."""
+        fees = {"alice": 100, "bob": 300}
+        # Raise alice (100 -> 300) costs 200, but budget = 50.
+        # Partial: 50 / 1 = 50. Alice gets 150.
+        result = equalize_maker_fees(fees, 50)
+        assert result == {"alice": 150, "bob": 300}
+
+    def test_partial_leveling_budget_exhausted_evenly(self) -> None:
+        """Budget exactly covers first leveling step, nothing left."""
+        fees = {"alice": 100, "bob": 200, "carol": 300}
+        # Step 1: Raise alice (100 -> 200) costs 100. Budget = 100 - 100 = 0.
+        # Done.
+        result = equalize_maker_fees(fees, 100)
+        assert result == {"alice": 200, "bob": 200, "carol": 300}
+
+    def test_budget_insufficient_for_per_maker_unit(self) -> None:
+        """Budget too small for 1 sat per maker -> remainder distribution handles it."""
+        fees = {"alice": 100, "bob": 100, "carol": 100}
+        # 2 sats / 3 makers = 0 per maker via floor, but remainder = 2 sats
+        # -> first 2 makers each get 1 extra sat
+        result = equalize_maker_fees(fees, 2)
+        assert result == {"alice": 101, "bob": 101, "carol": 100}
+        total_added = sum(result[n] - fees[n] for n in fees)
+        assert total_added == 2  # ALL leftover distributed
+
+    def test_total_added_never_exceeds_leftover(self) -> None:
+        """Sum of fee increases must equal the leftover budget exactly."""
+        fees = {"alice": 50, "bob": 150, "carol": 300, "dave": 310}
+        leftover = 777
+        result = equalize_maker_fees(fees, leftover)
+        total_added = sum(result[n] - fees[n] for n in fees)
+        assert total_added == leftover
+
+    def test_fees_never_decrease(self) -> None:
+        """No maker's fee should ever decrease."""
+        fees = {"alice": 50, "bob": 150, "carol": 300}
+        result = equalize_maker_fees(fees, 200)
+        for nick in fees:
+            assert result[nick] >= fees[nick]
+
+    def test_deterministic_output(self) -> None:
+        """Same input always produces same output."""
+        fees = {"alice": 100, "bob": 200, "carol": 300}
+        r1 = equalize_maker_fees(fees, 500)
+        r2 = equalize_maker_fees(fees, 500)
+        assert r1 == r2
+
+    def test_many_makers_stress(self) -> None:
+        """Handles a large number of makers correctly."""
+        fees = {f"maker_{i}": i * 10 for i in range(1, 21)}  # 10, 20, ..., 200
+        leftover = 50_000
+        result = equalize_maker_fees(fees, leftover)
+        total_added = sum(result[n] - fees[n] for n in fees)
+        assert total_added == leftover  # ALL leftover distributed
+        # All fees should be equal (budget is very generous)
+        values = list(result.values())
+        assert len(set(values)) <= 2  # at most 1 sat difference from remainder
+
+    def test_two_equal_one_higher(self) -> None:
+        """Two low fees and one high fee."""
+        fees = {"alice": 100, "bob": 100, "carol": 500}
+        # Budget = 800. Raise alice+bob (100 -> 500) costs 2*400 = 800. Exact.
+        result = equalize_maker_fees(fees, 800)
+        assert result == {"alice": 500, "bob": 500, "carol": 500}
+
+    def test_partial_group_raise(self) -> None:
+        """Budget only covers partial raise when group is large."""
+        fees = {"a": 100, "b": 100, "c": 100, "d": 200}
+        # Raise a,b,c (100 -> 200) costs 3*100 = 300. Budget = 200.
+        # Partial: 200 / 3 = 66 each. Remaining: 200 - 198 = 2 sats.
+        # Remainder: first 2 makers (a, b) each get 1 extra sat.
+        result = equalize_maker_fees(fees, 200)
+        assert result == {"a": 167, "b": 167, "c": 166, "d": 200}
+        total_added = sum(result[n] - fees[n] for n in fees)
+        assert total_added == 200  # ALL leftover distributed

@@ -37,6 +37,7 @@ class IsolationCategory(StrEnum):
     NOTIFICATION = "jm-notification"
     UPDATE_CHECK = "jm-update-check"
     HEALTH_CHECK = "jm-health-check"
+    SWAP = "jm-swap"
 
 
 # Per-process random token (hex-encoded 16 bytes = 32 hex chars).

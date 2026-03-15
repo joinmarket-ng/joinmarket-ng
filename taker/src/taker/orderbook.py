@@ -10,7 +10,9 @@ Implements:
 
 from __future__ import annotations
 
+import math
 import random
+import statistics
 from collections.abc import Callable
 from typing import Any
 
@@ -42,6 +44,193 @@ def calculate_cj_fee(offer: Offer, cj_amount: int) -> int:
         Fee in satoshis
     """
     return _calculate_cj_fee_raw(offer.ordertype, offer.cjfee, cj_amount)
+
+
+# Minimum number of non-selected offers needed to sample a fake fee
+# from the orderbook distribution. Below this, fall back to a range derived
+# from the taker's own fee limits.
+_MIN_OFFERS_FOR_SAMPLING = 3
+
+
+def sample_fake_fee_from_orderbook(
+    offers: list[Offer],
+    cj_amount: int,
+    selected_nicks: set[str],
+    max_cj_fee: MaxCjFee,
+) -> int:
+    """
+    Sample a fake fee that looks like a real maker fee from the current orderbook.
+
+    To make the taker's change output indistinguishable from a maker's change,
+    the "fee earned" by the taker should match the distribution of fees actually
+    charged by makers in the orderbook.
+
+    Strategy:
+        1. Compute fees for all non-selected offers whose amount range covers
+           ``cj_amount``.
+        2. If there are enough data points (>= ``_MIN_OFFERS_FOR_SAMPLING``),
+           filter to fees within 1 standard deviation of the mean (sanity bound)
+           and pick one uniformly at random.
+        3. Otherwise fall back to a range derived from the taker's own fee limits:
+           ``[1, int(float(max_cj_fee.rel_fee) * cj_amount)]``.  The upper bound
+           is the maximum fee the taker would accept from a relative-fee maker,
+           which is a natural proxy for what a plausible maker earns.
+
+    Args:
+        offers: Full orderbook offer list.
+        cj_amount: CoinJoin amount in satoshis.
+        selected_nicks: Nicks of makers already selected for this CoinJoin
+            (their fees are excluded so the fake fee is independent).
+        max_cj_fee: The taker's own fee limits (used to derive the fallback range).
+
+    Returns:
+        A fee in satoshis suitable for use as the taker's fake earned fee.
+    """
+    # Collect fees from non-selected offers whose range covers cj_amount
+    candidate_fees: list[int] = []
+    for offer in offers:
+        if offer.counterparty in selected_nicks:
+            continue
+        if not (offer.minsize <= cj_amount <= offer.maxsize):
+            continue
+        try:
+            fee = _calculate_cj_fee_raw(offer.ordertype, offer.cjfee, cj_amount)
+        except (ValueError, ZeroDivisionError):
+            continue
+        if fee > 0:
+            candidate_fees.append(fee)
+
+    if len(candidate_fees) < _MIN_OFFERS_FOR_SAMPLING:
+        # Derive fallback bounds from the taker's relative fee limit.
+        # Upper bound = max relative fee the taker accepts * cj_amount.
+        # Floor at 1 sat; if rel_fee is zero or the result rounds to zero, use 1.
+        fallback_max = max(1, int(float(max_cj_fee.rel_fee) * cj_amount))
+        logger.debug(
+            f"Not enough orderbook data for fake fee sampling "
+            f"({len(candidate_fees)} candidates < {_MIN_OFFERS_FOR_SAMPLING}), "
+            f"falling back to range [1, {fallback_max}]"
+        )
+        return random.randint(1, fallback_max)
+
+    mean = statistics.mean(candidate_fees)
+    stdev = statistics.pstdev(candidate_fees)  # population stdev (we have all data)
+
+    if stdev == 0 or math.isnan(stdev):
+        # All fees identical — just return one of them
+        return random.choice(candidate_fees)
+
+    # Keep only fees within 1 stddev of the mean
+    lower = max(1, int(mean - stdev))
+    upper = int(mean + stdev)
+    filtered = [f for f in candidate_fees if lower <= f <= upper]
+
+    if not filtered:
+        # Shouldn't happen with real data, but be defensive
+        filtered = candidate_fees
+
+    chosen = random.choice(filtered)
+    logger.debug(
+        f"Sampled fake fee {chosen:,} sats from {len(filtered)} offers "
+        f"(mean={mean:,.0f}, stdev={stdev:,.0f}, "
+        f"range=[{lower:,}, {upper:,}], total_candidates={len(candidate_fees)})"
+    )
+    return chosen
+
+
+def equalize_maker_fees(
+    maker_fees: dict[str, int],
+    leftover_sats: int,
+) -> dict[str, int]:
+    """Distribute swap leftover sats across maker fees to equalize them.
+
+    When the swap amount is padded up to the provider's minimum, the extra
+    sats ("leftovers") are distributed across maker fees so that individual
+    fees cannot be matched to specific orderbook offers.
+
+    **Privacy invariant:** ALL leftover sats MUST go to makers.  If any
+    leftover sats ended up in the taker's change, an observer could notice
+    that one change output received more than what any orderbook offer
+    charges, immediately identifying it as the taker's.
+
+    Algorithm (sequential leveling):
+        1. Sort fees ascending.
+        2. Raise the lowest fee(s) toward the next tier.  Cost = group_size * gap.
+        3. Repeat until budget exhausted or all fees are equal.
+        4. Distribute remaining budget equally (floor division).
+        5. Distribute the indivisible remainder (0 to n-1 sats) by giving
+           1 extra sat to the first ``remainder`` makers (sorted by fee
+           then nick for determinism).  This ensures the sum of adjustments
+           equals *exactly* ``leftover_sats``.
+
+    Args:
+        maker_fees: Mapping of maker nick -> current CJ fee in sats.
+        leftover_sats: Extra sats available from swap padding.
+
+    Returns:
+        New mapping of maker nick -> adjusted CJ fee in sats.
+        The sum of adjustments equals exactly ``leftover_sats``.
+    """
+    if leftover_sats <= 0 or not maker_fees:
+        return dict(maker_fees)
+
+    # Sort nicks by fee ascending, stable order by nick for determinism
+    sorted_nicks = sorted(maker_fees, key=lambda n: (maker_fees[n], n))
+    fees = [maker_fees[n] for n in sorted_nicks]
+    n = len(fees)
+    budget = leftover_sats
+
+    # Sequential leveling: raise the bottom group to the next tier
+    i = 0  # index of first nick NOT yet in the bottom group
+    while i < n - 1 and budget > 0:
+        # All nicks in [0, i] have the same fee (fees[0]).
+        # Try to raise them to fees[i+1].
+        group_size = i + 1
+        gap = fees[i + 1] - fees[0]
+        cost = group_size * gap
+
+        if cost == 0:
+            # fees[0] == fees[i+1], expand the group
+            i += 1
+            continue
+
+        if budget >= cost:
+            # Level up the entire bottom group
+            budget -= cost
+            for j in range(group_size):
+                fees[j] = fees[i + 1]
+            i += 1
+        else:
+            # Partial raise: distribute remaining budget evenly
+            per_maker = budget // group_size
+            if per_maker > 0:
+                for j in range(group_size):
+                    fees[j] += per_maker
+                budget -= per_maker * group_size
+            break
+    else:
+        # All fees are now equal; distribute remaining budget across all nicks
+        if budget > 0:
+            per_maker = budget // n
+            if per_maker > 0:
+                for j in range(n):
+                    fees[j] += per_maker
+                budget -= per_maker * n
+
+    # Distribute indivisible remainder: give 1 extra sat to the first
+    # ``budget`` makers.  This ensures ALL leftover sats go to makers --
+    # none leak into the taker's change output.
+    if budget > 0:
+        for j in range(min(budget, n)):
+            fees[j] += 1
+        budget = 0
+
+    result = {nick: fee for nick, fee in zip(sorted_nicks, fees)}
+    total_added = sum(result[n_key] - maker_fees[n_key] for n_key in maker_fees)
+    logger.debug(
+        f"Fee equalization: distributed {total_added:,} of {leftover_sats:,} leftover sats "
+        f"across {n} makers (all leftover distributed, 0 to taker change)"
+    )
+    return result
 
 
 def is_fee_within_limits(offer: Offer, cj_amount: int, max_cj_fee: MaxCjFee) -> bool:

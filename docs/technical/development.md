@@ -137,6 +137,90 @@ sha256:ghi789...
 ```
 Signatures are stored in `signatures/<version>/<fingerprint>.sig`.
 
+### Manual Testing: Swap Input
+
+The following workflow lets you manually test the `--swap-input` flow end-to-end in the local regtest Docker Compose stack — from starting the stack to paying the Lightning invoice and watching the CoinJoin complete.
+
+#### Prerequisites
+
+- Docker and Docker Compose installed
+- Working directory: repository root
+
+#### Step 1 — Start the e2e stack
+
+```bash
+docker compose --profile e2e up -d
+```
+
+This starts: `bitcoin`, `miner`, `directory`, `directory2`, `maker1/2/3`, `wallet-funder`, `lnd-taker`, `lnd-setup`, `electrs`, `nostr-relay`, `electrum-swap-server`, `orderbook-watcher`, `tor`, `jmwalletd`, `jam-playwright`.
+
+Wait ~90 seconds for `lnd-setup` to finish funding the Lightning channel between LND-taker and Electrum's built-in LN node, and for the Electrum swap server to announce its offer on the Nostr relay.
+
+```bash
+# Watch until electrum-swap-server shows "(healthy)"
+docker compose --profile e2e ps
+```
+
+#### Step 2 — Build the taker image from local source
+
+```bash
+docker compose build taker
+```
+
+#### Step 3 — Run the taker with swap input
+
+The regtest stack has 3 makers with minsizes of 2.5M, 3M, and 3.75M sats. Use `--amount` of at least **4,000,000 sats** and `--counterparties 3`.
+
+The taker wallet mnemonic (`burden notable love elephant orbit couch message galaxy elevator exile drop toilet`) is funded by `wallet-funder` with ~1,400 BTC.
+
+```bash
+docker compose --profile taker run --rm \
+  -e MNEMONIC="burden notable love elephant orbit couch message galaxy elevator exile drop toilet" \
+  -e NETWORK_CONFIG__NETWORK=testnet \
+  -e NETWORK_CONFIG__BITCOIN_NETWORK=regtest \
+  -e BITCOIN__BACKEND_TYPE=descriptor_wallet \
+  -e BITCOIN__RPC_URL=http://jm-bitcoin:18443 \
+  -e BITCOIN__RPC_USER=test \
+  -e BITCOIN__RPC_PASSWORD=test \
+  -e TAKER__MINIMUM_MAKERS=2 \
+  -e TAKER__MAX_CJ_FEE_REL=0.01 \
+  -e TAKER__MAX_CJ_FEE_ABS=10000 \
+  -e SWAP__NOSTR_RELAYS='["ws://jm-nostr-relay:7000"]' \
+  taker \
+  jm-taker coinjoin \
+    --amount 4000000 \
+    --destination INTERNAL \
+    --counterparties 3 \
+    --swap-input \
+    --directory jm-directory:5222 \
+    --yes \
+    --log-level INFO
+```
+
+> **Note:** Tor warnings like `[Errno 111] Connect call failed ('127.0.0.1', 9050)` are harmless -- makers are reached via directory routing inside `jm-network`.
+
+#### Step 4 — Watch completion
+
+The taker discovers the Electrum swap server via Nostr kind 30315 offer events on the relay, negotiates the swap via NIP-04 encrypted DMs (kind 25582), pays the Lightning invoice via LND-taker, and monitors for the lockup UTXO on-chain. Once the lockup is detected, it constructs and broadcasts the CoinJoin. The `miner` service mines every 10 seconds so confirmation is automatic.
+
+#### Why these parameters?
+
+| Parameter | Value | Reason |
+|-----------|-------|--------|
+| `--amount` | >= 4,000,000 sats | Maker minsizes are 2.5M / 3M / 3.75M sats; smaller amounts produce "0 eligible offers" |
+| `--counterparties` | 3 | Only 3 makers run in regtest; default of 10 causes "need 10, found 3" error |
+| `SWAP__NOSTR_RELAYS` | `["ws://jm-nostr-relay:7000"]` | Points to the regtest Nostr relay for swap server discovery |
+| `--directory` | `jm-directory:5222` | Regtest directory server inside `jm-network` |
+| `TAKER__MINIMUM_MAKERS` | 2 | Allows the run to succeed even if one maker drops |
+
+#### Swap amount padding
+
+With `--amount 4000000` and 3 makers, the actual swap-needed amount (maker_fees + tx_fee + fake_fee) is typically around 2,000-3,000 sats. Since this is below the swap provider's minimum of 20,000 sats, the amount is automatically padded up.
+
+The extra sats from padding are distributed across maker fees via the fee equalization algorithm, ensuring that **no leftover sats leak to the taker's change output**. This is critical for privacy -- if the taker's change received more than any maker fee in the orderbook, an observer could identify it as the taker.
+
+To test with a larger, more realistic swap amount where padding is not needed, use `--amount 50000000` (0.5 BTC). With higher CoinJoin amounts, maker fees scale up (relative fee offers charge a percentage), and the swap-needed amount may exceed the 20k minimum naturally.
+
 ### Troubleshooting
 
 **Wallet Sync Issues:**

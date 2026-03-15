@@ -6,6 +6,7 @@ requires-python = ">=3.11"
 dependencies = [
     "jmcore",
     "jmwallet",
+    "aiohttp>=3.9.0",
     "httpx>=0.25.0",
     "loguru>=0.7.0",
     "pydantic>=2.0.0",
@@ -38,6 +39,7 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
+pythonpath = ["src"]
 addopts = "-v --cov=taker --cov-report=html --cov-report=term --timeout=60"
 
 [tool.mypy]

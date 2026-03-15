@@ -29,7 +29,7 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     parser.addoption(
         "--neutrino-url",
         action="store",
-        default="http://127.0.0.1:8334",
+        default="http://127.0.0.1:8335",
         help="Neutrino REST API URL",
     )
 
@@ -57,12 +57,34 @@ def pytest_collection_modifyitems(
     config: pytest.Config,
     items: list[pytest.Item],
 ) -> None:
-    """Auto-add docker marker to tests that have profile-specific markers.
+    """Auto-add docker marker and deselect tests with unmet host-side dependencies.
 
-    This ensures that tests marked with e2e, reference, neutrino, or reference_maker
-    are also automatically marked with 'docker', so they get excluded by default.
+    1. Tests marked with e2e, reference, neutrino, or reference_maker are also
+       automatically marked with 'docker', so they get excluded by default.
+    2. Tests marked with 'reference' that require the reference implementation
+       (joinmarket-clientserver) are deselected when jmclient is not importable.
+       This prevents --fail-on-skip from converting expected skips into failures.
     """
     docker_marker = pytest.mark.docker
+
+    # Check if jmclient is importable (needed by reference-marked tests)
+    jmclient_available = True
+    try:
+        import importlib
+        import sys
+        import os
+
+        ref_path = os.path.join(
+            os.path.dirname(__file__), "../../joinmarket-clientserver/src"
+        )
+        if ref_path not in sys.path:
+            sys.path.insert(0, ref_path)
+        importlib.import_module("jmclient.fidelity_bond")
+    except (ImportError, ModuleNotFoundError):
+        jmclient_available = False
+
+    selected: list[pytest.Item] = []
+    deselected: list[pytest.Item] = []
 
     for item in items:
         # Check if item has any profile-specific marker
@@ -72,6 +94,16 @@ def pytest_collection_modifyitems(
         # If the test has a profile marker but not 'docker', add 'docker'
         if item_markers & profile_markers and "docker" not in item_markers:
             item.add_marker(docker_marker)
+
+        # Deselect reference tests when jmclient is not available
+        if "reference" in item_markers and not jmclient_available:
+            deselected.append(item)
+        else:
+            selected.append(item)
+
+    if deselected:
+        config.hook.pytest_deselected(items=deselected)
+        items[:] = selected
 
 
 @pytest.fixture(scope="session")

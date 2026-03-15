@@ -169,7 +169,7 @@ done
 
 # Wait for Neutrino to sync
 echo "Waiting for Neutrino..."
-until curl -s http://localhost:8334/v1/status 2>/dev/null | grep -q '"synced":true'; do
+until curl -s http://localhost:8335/v1/status 2>/dev/null | grep -q '"synced":true'; do
   echo "  Neutrino syncing..."
   sleep 5
 done
@@ -424,7 +424,7 @@ Pre-configured test wallet mnemonics (regtest only!):
 | Bitcoin-JAM RPC | http://localhost:18445 (reference profile) |
 | Directory Server | localhost:5222 |
 | Orderbook Watcher | http://localhost:8080 |
-| Neutrino API | http://localhost:8334 |
+| Neutrino API | http://localhost:8335 |
 
 ## Neutrino Backend
 
@@ -434,7 +434,7 @@ The neutrino backend is a BIP157/BIP158 light client that syncs with Bitcoin Cor
 
 Check neutrino sync status:
 ```bash
-curl -s http://localhost:8334/v1/status
+curl -s http://localhost:8335/v1/status
 # {"synced":true,"block_height":5490,"filter_height":5490,"peers":1}
 ```
 
