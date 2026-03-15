@@ -36,8 +36,6 @@ def create_app(*, data_dir: Path | None = None) -> FastAPI:
         title="JoinMarket wallet daemon",
         description="JAM-compatible HTTP/WebSocket API for JoinMarket-NG",
         version="0.17.0",
-        docs_url=None,  # Disable Swagger UI in production.
-        redoc_url=None,
     )
 
     # ------------------------------------------------------------------
@@ -114,9 +112,10 @@ def create_app(*, data_dir: Path | None = None) -> FastAPI:
     # ------------------------------------------------------------------
     # Serve JAM static files (if present).
     # ------------------------------------------------------------------
-    # Look in data_dir/jam or system path /usr/share/jmwalletd/jam
+    # Look in data_dir/jam, system path, or Flatpak prefix /app
     jam_dirs = [
         state.data_dir / "jam",
+        Path("/app/share/jmwalletd/jam"),
         Path("/usr/share/jmwalletd/jam"),
     ]
     static_dir: Path | None = None
@@ -127,24 +126,30 @@ def create_app(*, data_dir: Path | None = None) -> FastAPI:
 
     if static_dir:
         logger.info("Serving JAM from {}", static_dir)
-        from fastapi.responses import FileResponse
-        from fastapi.staticfiles import StaticFiles
+        from starlette.routing import Route
+        from starlette.staticfiles import StaticFiles as StarletteStaticFiles
 
         # Serve /assets folder
         if (static_dir / "assets").exists():
-            app.mount("/assets", StaticFiles(directory=static_dir / "assets"), name="assets")
+            app.mount(
+                "/assets", StarletteStaticFiles(directory=static_dir / "assets"), name="assets"
+            )
 
-        # SPA catch-all handler
-        @app.get("/{full_path:path}")
-        async def serve_spa(full_path: str) -> Any:
-            # If the path exists as a file, serve it (e.g. favicon.ico, manifest.json)
-            # excluding index.html to avoid serving it directly (optional)
+        # SPA catch-all: only intercept GET/HEAD requests so that POST/PUT/etc.
+        # to API paths that don't exist get a proper 404/405 from the API routers
+        # rather than being swallowed and served index.html or a 405.
+        async def serve_spa(request: Request) -> Any:
+            from fastapi.responses import FileResponse
+
+            full_path = request.path_params.get("full_path", "")
             path_obj = static_dir / full_path
-            if full_path != "" and path_obj.exists() and path_obj.is_file():
+            if full_path and path_obj.exists() and path_obj.is_file():
                 return FileResponse(path_obj)
-
-            # Otherwise serve index.html for client-side routing
             return FileResponse(static_dir / "index.html")
+
+        app.router.routes.append(
+            Route("/{full_path:path}", endpoint=serve_spa, methods=["GET", "HEAD"])
+        )
 
     # ------------------------------------------------------------------
     # CORS preflight handler for root (matching reference).

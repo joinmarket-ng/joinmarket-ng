@@ -117,6 +117,7 @@ def build_maker_config(
                 else str(effective_bitcoin_network)
             ),
             "scan_start_height": settings.wallet.scan_start_height,
+            "connect_peers": settings.get_neutrino_connect_peers(),
         }
 
     # Resolve directory servers

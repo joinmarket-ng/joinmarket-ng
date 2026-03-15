@@ -1,0 +1,108 @@
+name: Flatpak
+
+on:
+  push:
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+'
+  pull_request:
+    paths:
+      - 'flatpak/**'
+      - '.github/workflows/flatpak.yaml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-flatpak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    strategy:
+      matrix:
+        arch: [x86_64]
+        # aarch64 builds require QEMU and are much slower; enable when needed:
+        # arch: [x86_64, aarch64]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Get version
+        id: get_version
+        run: |
+          if [[ $GITHUB_REF == refs/tags/* ]]; then
+            VERSION=${GITHUB_REF#refs/tags/}
+          else
+            VERSION=$(git describe --tags --always)
+          fi
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Install Flatpak and flatpak-builder
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flatpak flatpak-builder
+
+      - name: Add Flathub remote
+        run: |
+          flatpak remote-add --user --if-not-exists \
+            flathub https://flathub.org/repo/flathub.flatpakrepo
+
+      - name: Install SDK and runtime
+        run: |
+          flatpak install --user --noninteractive flathub \
+            org.freedesktop.Platform//24.08 \
+            org.freedesktop.Sdk//24.08 \
+            org.freedesktop.Sdk.Extension.node24//24.08
+
+      # aarch64 cross-compilation setup (only for aarch64 matrix entry)
+      - name: Set up QEMU for aarch64
+        if: matrix.arch == 'aarch64'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Build Flatpak
+        run: |
+          flatpak-builder \
+            --user \
+            --force-clean \
+            --repo=flatpak-repo \
+            --arch=${{ matrix.arch }} \
+            build-dir \
+            flatpak/org.joinmarketng.JamNG.yml
+
+      - name: Create Flatpak bundle
+        run: |
+          flatpak build-bundle \
+            --arch=${{ matrix.arch }} \
+            flatpak-repo \
+            "org.joinmarketng.JamNG-${{ steps.get_version.outputs.version }}-${{ matrix.arch }}.flatpak" \
+            org.joinmarketng.JamNG
+
+      - name: Upload Flatpak artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: flatpak-${{ matrix.arch }}
+          path: "org.joinmarketng.JamNG-*.flatpak"
+
+      # Attach to release if triggered by a tag push
+      - name: Upload to release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Wait for the release to exist (created by release.yaml workflow)
+          VERSION=${{ steps.get_version.outputs.version }}
+          for i in $(seq 1 30); do
+            if gh release view "${VERSION}" >/dev/null 2>&1; then
+              break
+            fi
+            echo "Waiting for release ${VERSION} to be created... (attempt ${i}/30)"
+            sleep 10
+          done
+
+          gh release upload "${VERSION}" \
+            "org.joinmarketng.JamNG-${VERSION}-${{ matrix.arch }}.flatpak" \
+            --clobber

@@ -53,8 +53,16 @@
 # rpc_user = ""
 # rpc_password = ""
 
-# Neutrino backend settings (only used when backend_type = "neutrino")
+# Neutrino backend settings (used by all components when backend_type = "neutrino")
 # neutrino_url = "http://127.0.0.1:8334"
+
+# Explicit peers for neutrino to connect to (host:port, used by all components).
+# Most signet nodes do NOT serve compact block filters, causing neutrino to
+# ban them and stall. Set this to a peer you know serves filters.
+# Leave empty to rely on DNS seeds only.
+# neutrino_connect_peers = [
+#   "your-filter-peer:38333",
+# ]
 
 # ============================================================================
 # Network Settings

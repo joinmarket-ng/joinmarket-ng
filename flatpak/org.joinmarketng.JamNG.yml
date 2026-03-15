@@ -1,0 +1,188 @@
+# =============================================================================
+# Flatpak Manifest for JAM-NG (JoinMarket Next Generation)
+#
+# Self-contained CoinJoin application with:
+#   - jmwalletd (JAM-compatible HTTP/WebSocket API + JAM frontend)
+#   - Bundled Tor daemon (configurable to use system Tor)
+#   - Bundled neutrino-api light client (configurable for external/full node)
+#   - Orderbook watcher
+#   - Maker and Taker modules
+#
+# The app stores all state in ~/.joinmarket-ng/ on the host
+# (mapped to ~/.var/app/org.joinmarketng.JamNG/.joinmarket-ng by Flatpak).
+# Configuration is done via config.toml (created from template on first launch).
+#
+# Build: flatpak-builder --force-clean build-dir flatpak/org.joinmarketng.JamNG.yml
+# Install: flatpak-builder --user --install --force-clean build-dir flatpak/org.joinmarketng.JamNG.yml
+# Bundle: flatpak build-bundle repo org.joinmarketng.JamNG.flatpak org.joinmarketng.JamNG
+# =============================================================================
+id: org.joinmarketng.JamNG
+runtime: org.freedesktop.Platform
+runtime-version: '24.08'
+sdk: org.freedesktop.Sdk
+command: jam-ng
+
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.node24
+
+finish-args:
+  # Network access for Bitcoin P2P, Tor, directory servers
+  - --share=network
+  # Persist ~/.joinmarket-ng/ for wallet data, config, and state
+  - --persist=.joinmarket-ng
+  # Allow opening browser for JAM web UI
+  - --talk-name=org.freedesktop.portal.OpenURI
+  # Wayland/X11 for GTK3 GUI and xdg-open
+  - --socket=wayland
+  - --socket=fallback-x11
+  # X11 shared memory transport (for XWayland sessions)
+  - --share=ipc
+  # Python packages installed to /app prefix
+  - --env=PYTHONPATH=/app/lib/python3.12/site-packages
+
+cleanup:
+  - /include
+  - /lib/pkgconfig
+  - /share/man
+  - /share/doc
+  - '*.a'
+  - '*.la'
+
+modules:
+  # =========================================================================
+  # Module 1: libevent (Tor dependency)
+  # =========================================================================
+  - name: libevent
+    buildsystem: autotools
+    cleanup:
+      - /bin
+    sources:
+      - type: archive
+        url: https://github.com/libevent/libevent/releases/download/release-2.1.12-stable/libevent-2.1.12-stable.tar.gz
+        sha256: 92e6de1be9ec176428fd2367677e61ceffc2ee1cb119035037a27d346b0403bb
+
+  # =========================================================================
+  # Module 2: Tor daemon
+  # =========================================================================
+  - name: tor
+    buildsystem: autotools
+    sources:
+      - type: archive
+        url: https://dist.torproject.org/tor-0.4.8.16.tar.gz
+        sha256: 6540dd377a120fb8e7d27530aa3b7ff72a0fa5b4f670fe1d64c987c1cfd390cb
+
+  # =========================================================================
+  # Module 3: libsodium (required by coincurve / libnacl)
+  # =========================================================================
+  - name: libsodium
+    buildsystem: autotools
+    sources:
+      - type: archive
+        url: https://github.com/jedisct1/libsodium/releases/download/1.0.21-RELEASE/libsodium-1.0.21.tar.gz
+        sha256: 9e4285c7a419e82dedb0be63a72eea357d6943bc3e28e6735bf600dd4883feaf
+
+  # =========================================================================
+  # Module 4: neutrino-api (pre-built Go binary)
+  # Privacy-preserving Bitcoin light client using BIP157/BIP158.
+  # =========================================================================
+  - name: neutrino-api
+    buildsystem: simple
+    only-arches:
+      - x86_64
+      - aarch64
+    build-commands:
+      - install -Dm755 neutrinod /app/bin/neutrinod
+    sources:
+      - type: file
+        only-arches:
+          - x86_64
+        url: https://github.com/m0wer/neutrino-api/releases/download/v0.7.0/neutrinod-linux-amd64
+        sha256: 210bfc3b61bc676fde6bae4895706f4b8bacdf65fc9f5a0b3ddeb6d314c13daa
+        dest-filename: neutrinod
+      - type: file
+        only-arches:
+          - aarch64
+        url: https://github.com/m0wer/neutrino-api/releases/download/v0.7.0/neutrinod-linux-arm64
+        sha256: 6c8eb53fd4ea999ddb043b8bc24936611129d2fc3ae2a6659f6fa8a4b0fde6e3
+        dest-filename: neutrinod
+
+  # =========================================================================
+  # Module 5: JAM frontend (built from source with Node.js)
+  # Static JS/HTML served by jmwalletd at /usr/share/jmwalletd/jam/
+  # =========================================================================
+  - name: jam-frontend
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/node24/bin
+      # Network needed for npm ci to fetch dependencies.
+      # For fully offline builds, generate sources with flatpak-node-generator:
+      #   flatpak-node-generator npm package-lock.json -o flatpak/jam-npm-sources.json
+      # Then replace npm ci with: npm ci --offline, and add the generated sources file.
+      build-args:
+        - --share=network
+      env:
+        GENERATE_SOURCEMAP: 'false'
+    build-commands:
+      - npm ci
+      - npm run build
+      - mkdir -p /app/share/jmwalletd/jam
+      - cp -r dist/* /app/share/jmwalletd/jam/
+    sources:
+      - type: git
+        url: https://github.com/joinmarket-webui/jam.git
+        commit: d5dd2add951db5d0807d4c0730dcdd2d9adfad75
+
+  # =========================================================================
+  # Module 6: Python application
+  # jmcore, jmwallet, maker, taker, jmwalletd, orderbook_watcher
+  # =========================================================================
+  - name: jam-ng
+    buildsystem: simple
+    build-options:
+      # coincurve needs C compiler + cmake + pkg-config + libffi
+      build-args:
+        - --share=network
+      env:
+        PYTHONPATH: /app/lib/python3.12/site-packages
+    build-commands:
+      # Ensure pip and build tools are available
+      - pip3 install --no-cache-dir --ignore-installed --prefix=/app setuptools wheel
+
+      # Install all Python requirements in dependency order.
+      # Each component's requirements.txt is pip-compiled with hashes.
+      # --ignore-installed prevents pip from trying to uninstall read-only system packages.
+      - pip3 install --no-cache-dir --ignore-installed --prefix=/app -r jmcore/requirements.txt
+      - pip3 install --no-cache-dir --ignore-installed --prefix=/app -r jmwallet/requirements.txt
+      - pip3 install --no-cache-dir --ignore-installed --prefix=/app -r maker/requirements.txt
+      - pip3 install --no-cache-dir --ignore-installed --prefix=/app -r taker/requirements.txt
+      - pip3 install --no-cache-dir --ignore-installed --prefix=/app -r orderbook_watcher/requirements.txt
+      - pip3 install --no-cache-dir --ignore-installed --prefix=/app -r jmwalletd/requirements.txt
+
+      # Install our packages (no-deps since requirements handle dependencies)
+      - pip3 install --no-cache-dir --ignore-installed --no-deps --prefix=/app
+          ./jmcore ./jmwallet ./maker ./taker ./orderbook_watcher ./jmwalletd
+
+      # Install entrypoint script and stop helper
+      - install -Dm755 flatpak/jam-ng-entrypoint.sh /app/bin/jam-ng
+      - install -Dm755 flatpak/jam-ng-stop.sh /app/bin/jam-ng-stop
+
+      # Install config template
+      - install -Dm644 config.toml.template /app/share/joinmarket-ng/config.toml.template
+
+      # Install GUI control panel
+      - install -Dm644 flatpak/jam-ng-gui.py /app/share/joinmarket-ng/jam-ng-gui.py
+
+      # Install torrc template
+      - install -Dm644 flatpak/torrc /app/share/joinmarket-ng/torrc
+
+      # Install desktop file, icon, and metainfo
+      - install -Dm644 flatpak/org.joinmarketng.JamNG.desktop
+          /app/share/applications/org.joinmarketng.JamNG.desktop
+      - install -Dm644 flatpak/org.joinmarketng.JamNG.svg
+          /app/share/icons/hicolor/scalable/apps/org.joinmarketng.JamNG.svg
+      - install -Dm644 flatpak/org.joinmarketng.JamNG.metainfo.xml
+          /app/share/metainfo/org.joinmarketng.JamNG.metainfo.xml
+
+    sources:
+      - type: dir
+        path: ..

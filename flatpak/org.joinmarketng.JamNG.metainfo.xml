@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>org.joinmarketng.JamNG</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+
+  <name>JAM-NG</name>
+  <summary>Decentralized CoinJoin for Bitcoin privacy</summary>
+
+  <description>
+    <p>
+      JAM-NG (JoinMarket Next Generation) is a self-contained Bitcoin privacy
+      application that makes CoinJoin transactions accessible to everyone.
+      CoinJoin combines multiple users' funds into a single transaction, making
+      it difficult to trace individual coins on the blockchain.
+    </p>
+    <p>
+      This application bundles everything needed for private Bitcoin
+      transactions: the JAM web interface, a JoinMarket wallet daemon, a
+      Bitcoin light client (neutrino), and a Tor daemon for network privacy.
+      Just install, fund your wallet, and start using CoinJoin.
+    </p>
+    <p>Features:</p>
+    <ul>
+      <li>Web-based JAM interface for easy wallet management</li>
+      <li>Built-in Bitcoin light client (no full node required)</li>
+      <li>Bundled Tor daemon for network-level privacy</li>
+      <li>Maker and Taker roles for earning or spending CoinJoin fees</li>
+      <li>Orderbook watcher to monitor the CoinJoin market</li>
+      <li>Configurable: use external Bitcoin Core or neutrino nodes</li>
+    </ul>
+  </description>
+
+  <categories>
+    <category>Finance</category>
+    <category>Network</category>
+  </categories>
+
+  <url type="homepage">https://github.com/joinmarket-ng/joinmarket-ng</url>
+  <url type="bugtracker">https://github.com/joinmarket-ng/joinmarket-ng/issues</url>
+
+  <launchable type="desktop-id">org.joinmarketng.JamNG.desktop</launchable>
+
+  <provides>
+    <binary>jam-ng</binary>
+  </provides>
+
+  <content_rating type="oars-1.1"/>
+
+  <releases>
+    <release version="0.20.0" date="2026-03-11">
+      <description>
+        <p>Initial Flatpak release with bundled Tor, neutrino-api, and JAM frontend.</p>
+      </description>
+    </release>
+  </releases>
+</component>

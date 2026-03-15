@@ -112,6 +112,7 @@ def build_taker_config(
                 else str(effective_bitcoin_network)
             ),
             "scan_start_height": settings.wallet.scan_start_height,
+            "connect_peers": settings.get_neutrino_connect_peers(),
         }
 
     # Resolve directory servers
@@ -233,6 +234,7 @@ def create_backend(config: TakerConfig) -> Any:
             neutrino_url=config.backend_config.get("neutrino_url", "http://127.0.0.1:8334"),
             network=bitcoin_network.value,
             scan_start_height=config.backend_config.get("scan_start_height"),
+            connect_peers=config.backend_config.get("connect_peers", []),
         )
     elif config.backend_type == "descriptor_wallet":
         fingerprint = get_mnemonic_fingerprint(

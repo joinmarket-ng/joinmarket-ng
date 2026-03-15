@@ -168,6 +168,17 @@ class BitcoinSettings(BaseModel):
         default="http://127.0.0.1:8334",
         description="Neutrino REST API URL (for neutrino backend)",
     )
+    neutrino_connect_peers: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Explicit peer addresses for neutrino to connect to (host:port). "
+            "Applied globally to all components (maker, taker, jmwallet, etc.) "
+            "when using the neutrino backend. "
+            "Most signet nodes do not serve compact block filters; use this to "
+            "point neutrino at a known filter-serving peer. "
+            "Leave empty to rely on DNS seeds."
+        ),
+    )
 
 
 class NetworkSettings(BaseModel):
@@ -815,6 +826,10 @@ class JoinMarketSettings(BaseSettings):
         network_name = self.network_config.network.value
         return DEFAULT_DIRECTORY_SERVERS.get(network_name, [])
 
+    def get_neutrino_connect_peers(self) -> list[str]:
+        """Get the configured neutrino connect peers."""
+        return self.bitcoin.neutrino_connect_peers
+
 
 class TomlConfigSettingsSource(PydanticBaseSettingsSource):
     """
@@ -961,6 +976,16 @@ def generate_config_template() -> str:
                     lines.append("# directory_servers = [")
                     for server in DEFAULT_DIRECTORY_SERVERS["signet"]:
                         lines.append(f'#   "{server}",')
+                    lines.append("# ]")
+                    lines.append("")
+                    continue
+                # For neutrino_connect_peers, show an example with a comment
+                if field_name == "neutrino_connect_peers" and prefix == "bitcoin":
+                    lines.append(
+                        "# Explicit peers for neutrino (host:port, used by all components)."
+                    )
+                    lines.append("# neutrino_connect_peers = [")
+                    lines.append('#   "your-filter-peer:38333",')
                     lines.append("# ]")
                     lines.append("")
                     continue

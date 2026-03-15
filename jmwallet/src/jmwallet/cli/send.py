@@ -185,6 +185,7 @@ async def _send_transaction(
             neutrino_url=backend_settings.neutrino_url,
             network=backend_settings.network,
             scan_start_height=backend_settings.scan_start_height,
+            connect_peers=backend_settings.neutrino_connect_peers,
         )
         logger.info("Waiting for neutrino to sync...")
         synced = await backend.wait_for_sync(timeout=300.0)

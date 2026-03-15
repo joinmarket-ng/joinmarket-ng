@@ -211,6 +211,107 @@ class TestLoadMnemonicFromFile:
             os.unlink(temp_path)
 
 
+class TestResolveBackendSettings:
+    """Tests for resolve_backend_settings() populating neutrino_connect_peers."""
+
+    def test_resolve_backend_settings_neutrino_connect_peers_from_settings(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """resolve_backend_settings() picks up neutrino_connect_peers from settings."""
+        from jmcore.cli_common import resolve_backend_settings
+        from jmcore.settings import JoinMarketSettings
+
+        settings = JoinMarketSettings(
+            bitcoin={
+                "neutrino_connect_peers": ["peer1.example.com:38333", "peer2.example.com:38333"]
+            }
+        )
+        result = resolve_backend_settings(settings)
+        assert result.neutrino_connect_peers == [
+            "peer1.example.com:38333",
+            "peer2.example.com:38333",
+        ]
+
+    def test_resolve_backend_settings_empty_connect_peers_by_default(self) -> None:
+        """resolve_backend_settings() returns empty list when no peers configured."""
+        from jmcore.cli_common import resolve_backend_settings
+        from jmcore.settings import JoinMarketSettings
+
+        settings = JoinMarketSettings()
+        result = resolve_backend_settings(settings)
+        assert result.neutrino_connect_peers == []
+
+
+class TestCreateBackend:
+    """Tests for create_backend() passing connect_peers to NeutrinoBackend."""
+
+    def test_create_backend_neutrino_passes_connect_peers(self) -> None:
+        """create_backend() passes neutrino_connect_peers to NeutrinoBackend."""
+        from pathlib import Path
+        from unittest.mock import MagicMock, patch
+
+        from jmcore.cli_common import ResolvedBackendSettings, create_backend
+
+        peers = ["peer1.example.com:38333"]
+        backend_settings = ResolvedBackendSettings(
+            network="signet",
+            bitcoin_network="signet",
+            backend_type="neutrino",
+            rpc_url="",
+            rpc_user="",
+            rpc_password="",
+            neutrino_url="http://127.0.0.1:8334",
+            neutrino_connect_peers=peers,
+            data_dir=Path("/tmp"),
+        )
+
+        mock_backend = MagicMock()
+        with patch(
+            "jmwallet.backends.neutrino.NeutrinoBackend", return_value=mock_backend
+        ) as mock_cls:
+            result = create_backend(backend_settings)
+
+        mock_cls.assert_called_once_with(
+            neutrino_url="http://127.0.0.1:8334",
+            network="signet",
+            scan_start_height=None,
+            connect_peers=peers,
+        )
+        assert result is mock_backend
+
+    def test_create_backend_neutrino_empty_connect_peers(self) -> None:
+        """create_backend() passes empty list to NeutrinoBackend when no peers set."""
+        from pathlib import Path
+        from unittest.mock import MagicMock, patch
+
+        from jmcore.cli_common import ResolvedBackendSettings, create_backend
+
+        backend_settings = ResolvedBackendSettings(
+            network="mainnet",
+            bitcoin_network="mainnet",
+            backend_type="neutrino",
+            rpc_url="",
+            rpc_user="",
+            rpc_password="",
+            neutrino_url="http://127.0.0.1:8334",
+            neutrino_connect_peers=[],
+            data_dir=Path("/tmp"),
+        )
+
+        mock_backend = MagicMock()
+        with patch(
+            "jmwallet.backends.neutrino.NeutrinoBackend", return_value=mock_backend
+        ) as mock_cls:
+            create_backend(backend_settings)
+
+        mock_cls.assert_called_once_with(
+            neutrino_url="http://127.0.0.1:8334",
+            network="mainnet",
+            scan_start_height=None,
+            connect_peers=[],
+        )
+
+
 class TestResolveMnemonic:
     """Tests for resolve_mnemonic function."""
 
