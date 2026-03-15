@@ -7,6 +7,7 @@ dependencies = [
     "jmcore",
     "jmwallet",
     "aiohttp>=3.9.0",
+    "aiohttp-socks>=0.10.0",
     "httpx>=0.25.0",
     "loguru>=0.7.0",
     "pydantic>=2.0.0",
