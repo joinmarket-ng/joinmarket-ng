@@ -687,26 +687,8 @@ class Taker(TakerMonitoringMixin):
                 try:
                     from taker.swap.client import SwapClient
 
-                    self._swap_client = SwapClient(
-                        provider_url=self.config.swap_input.provider_url or None,
-                        nostr_relays=self.config.swap_input.nostr_relays or None,
-                        network=(self.config.bitcoin_network or self.config.network).value,
-                        socks_host=(
-                            self.config.socks_host
-                            if self.config.socks_host != "127.0.0.1"
-                            else None
-                        ),
-                        socks_port=self.config.socks_port,
-                        max_swap_fee_pct=self.config.swap_input.max_swap_fee_pct,
-                        lnd_rest_url=self.config.swap_input.lnd_rest_url or None,
-                        lnd_cert_path=self.config.swap_input.lnd_cert_path or None,
-                        lnd_macaroon_path=self.config.swap_input.lnd_macaroon_path or None,
-                        backend=self.backend,
-                    )
-                    provider = await self._swap_client.discover_provider()
-
-                    # Estimate the swap amount for the feasibility check.
-                    # swap_needed = maker_fees + mining_fee + fake_fee_earned
+                    # Estimate swap need before discovery so we can rank offers by
+                    # compatibility and effective fee for this amount.
                     early_fake_fee = sample_fake_fee_from_orderbook(
                         offers=self.orderbook_manager.offers,
                         cj_amount=self.cj_amount,
@@ -714,6 +696,24 @@ class Taker(TakerMonitoringMixin):
                         max_cj_fee=self.config.max_cj_fee,
                     )
                     estimated_swap_amount = total_fee + estimated_tx_fee + early_fake_fee
+
+                    self._swap_client = SwapClient(
+                        preferred_provider_pubkey=self.config.swap_input.provider_pubkey or None,
+                        nostr_relays=self.config.swap_input.nostr_relays or None,
+                        network=(self.config.bitcoin_network or self.config.network).value,
+                        socks_host=self.config.socks_host,
+                        socks_port=self.config.socks_port,
+                        max_swap_fee_pct=self.config.swap_input.max_swap_fee_pct,
+                        lnd_rest_url=self.config.swap_input.lnd_rest_url or None,
+                        lnd_cert_path=self.config.swap_input.lnd_cert_path or None,
+                        lnd_macaroon_path=self.config.swap_input.lnd_macaroon_path or None,
+                        backend=self.backend,
+                    )
+
+                    # swap_needed = maker_fees + mining_fee + fake_fee_earned
+                    provider = await self._swap_client.discover_provider(
+                        target_amount_sats=estimated_swap_amount
+                    )
                     actual_swap_amount = max(estimated_swap_amount, provider.min_amount)
                     swap_fee = provider.calculate_fee(actual_swap_amount)
 
@@ -2014,14 +2014,11 @@ class Taker(TakerMonitoringMixin):
                         from taker.swap.client import SwapClient
 
                         swap_client = SwapClient(
-                            provider_url=self.config.swap_input.provider_url or None,
+                            preferred_provider_pubkey=self.config.swap_input.provider_pubkey
+                            or None,
                             nostr_relays=self.config.swap_input.nostr_relays or None,
                             network=(self.config.bitcoin_network or self.config.network).value,
-                            socks_host=(
-                                self.config.socks_host
-                                if self.config.socks_host != "127.0.0.1"
-                                else None
-                            ),
+                            socks_host=self.config.socks_host,
                             socks_port=self.config.socks_port,
                             max_swap_fee_pct=self.config.swap_input.max_swap_fee_pct,
                             lnd_rest_url=self.config.swap_input.lnd_rest_url or None,
@@ -2037,7 +2034,10 @@ class Taker(TakerMonitoringMixin):
                         desired_amount_sats=swap_needed,
                         current_block_height=current_height,
                         wait_for_lockup=True,
-                        lockup_timeout=self.config.swap_input.lockup_timeout,
+                        lockup_timeout=min(
+                            self.config.swap_input.lockup_timeout,
+                            float(self.config.maker_timeout_sec),
+                        ),
                     )
 
                     logger.info(

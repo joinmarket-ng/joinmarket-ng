@@ -29,7 +29,11 @@ import time
 from typing import Any
 
 import aiohttp
-from jmcore.tor_isolation import IsolationCategory, build_isolated_proxy_url
+from jmcore.tor_isolation import (
+    IsolationCategory,
+    build_isolated_proxy_url,
+    normalize_proxy_url,
+)
 from loguru import logger
 
 from taker.swap.models import (
@@ -142,6 +146,18 @@ def _event_matches_network(tags: list[Any], network: str) -> bool:
     return network in tag_networks
 
 
+def _proxy_connector_from_isolated_url(proxy_url: str) -> aiohttp.TCPConnector:
+    """Build an aiohttp_socks connector from an isolated proxy URL.
+
+    ``aiohttp_socks`` does not accept the ``socks5h://`` scheme directly, so
+    we normalize to ``socks5://`` and pass ``rdns=True`` when needed.
+    """
+    from aiohttp_socks import ProxyConnector
+
+    normalized = normalize_proxy_url(proxy_url)
+    return ProxyConnector.from_url(normalized.url, rdns=normalized.rdns)
+
+
 class NostrSwapDiscovery:
     """Discovers swap providers via Nostr relays.
 
@@ -248,15 +264,15 @@ class NostrSwapDiscovery:
         proxy = None
         if self.socks_host:
             proxy = build_isolated_proxy_url(
-                self.socks_host, self.socks_port, IsolationCategory.SWAP
+                self.socks_host,
+                self.socks_port,
+                IsolationCategory.SWAP,
             )
 
         connector = None
         if proxy:
             try:
-                from aiohttp_socks import ProxyConnector
-
-                connector = ProxyConnector.from_url(proxy)
+                connector = _proxy_connector_from_isolated_url(proxy)
             except ImportError:
                 logger.warning("aiohttp_socks not installed, connecting without Tor")
 
@@ -422,12 +438,12 @@ class NostrSwapRPC:
         if not self.socks_host:
             return None
         try:
-            from aiohttp_socks import ProxyConnector
-
             proxy_url = build_isolated_proxy_url(
-                self.socks_host, self.socks_port, IsolationCategory.SWAP
+                self.socks_host,
+                self.socks_port,
+                IsolationCategory.SWAP,
             )
-            return ProxyConnector.from_url(proxy_url)  # type: ignore[return-value]
+            return _proxy_connector_from_isolated_url(proxy_url)
         except ImportError:
             logger.warning("aiohttp_socks not installed, connecting without Tor")
             return None
@@ -670,12 +686,12 @@ class HTTPSwapTransport:
         connector = None
         if self.socks_host:
             try:
-                from aiohttp_socks import ProxyConnector
-
                 proxy_url = build_isolated_proxy_url(
-                    self.socks_host, self.socks_port, IsolationCategory.SWAP
+                    self.socks_host,
+                    self.socks_port,
+                    IsolationCategory.SWAP,
                 )
-                connector = ProxyConnector.from_url(proxy_url)
+                connector = _proxy_connector_from_isolated_url(proxy_url)
             except ImportError:
                 logger.warning("aiohttp_socks not installed, connecting without Tor")
 
@@ -711,12 +727,12 @@ class HTTPSwapTransport:
         connector = None
         if self.socks_host:
             try:
-                from aiohttp_socks import ProxyConnector
-
                 proxy_url = build_isolated_proxy_url(
-                    self.socks_host, self.socks_port, IsolationCategory.SWAP
+                    self.socks_host,
+                    self.socks_port,
+                    IsolationCategory.SWAP,
                 )
-                connector = ProxyConnector.from_url(proxy_url)
+                connector = _proxy_connector_from_isolated_url(proxy_url)
             except ImportError:
                 pass
 

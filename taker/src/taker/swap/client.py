@@ -57,7 +57,7 @@ class SwapClient:
     def __init__(
         self,
         # Provider selection
-        provider_url: str | None = None,
+        preferred_provider_pubkey: str | None = None,
         nostr_relays: list[str] | None = None,
         # Network
         network: str = "mainnet",
@@ -77,7 +77,7 @@ class SwapClient:
         """Initialize the swap client.
 
         Args:
-            provider_url: Direct HTTP URL for a swap provider (skips Nostr discovery).
+            preferred_provider_pubkey: Preferred provider pubkey from Nostr discovery.
             nostr_relays: Nostr relay URLs for provider discovery.
             network: Bitcoin network name.
             socks_host: SOCKS5 proxy host for Tor.
@@ -91,7 +91,7 @@ class SwapClient:
                 When provided, lockup detection is fully trustless — the client
                 watches its own node instead of asking the swap provider.
         """
-        self.provider_url = provider_url
+        self.preferred_provider_pubkey = preferred_provider_pubkey
         self.nostr_relays = nostr_relays
         self.network = network
         self.socks_host = socks_host
@@ -127,7 +127,7 @@ class SwapClient:
         """Return the previously discovered/configured swap provider, if any."""
         return self._provider
 
-    async def discover_provider(self) -> SwapProvider:
+    async def discover_provider(self, target_amount_sats: int | None = None) -> SwapProvider:
         """Discover and cache a swap provider (Nostr or HTTP).
 
         Call this early in the CoinJoin flow so the provider's ``min_amount``
@@ -140,7 +140,7 @@ class SwapClient:
             ConnectionError: If no provider is reachable.
         """
         self.state = SwapState.DISCOVERING
-        provider = await self._get_provider()
+        provider = await self._get_provider(target_amount_sats=target_amount_sats)
         self._provider = provider
         self.state = SwapState.IDLE
         return provider
@@ -185,7 +185,11 @@ class SwapClient:
             )
         else:
             self.state = SwapState.DISCOVERING
-            provider = await self._get_provider(max_attempts=12, retry_interval=10.0)
+            provider = await self._get_provider(
+                max_attempts=12,
+                retry_interval=10.0,
+                target_amount_sats=desired_amount_sats,
+            )
             self._provider = provider
 
         # Clamp up to provider minimum: the extra amount becomes additional fake fee,
@@ -328,11 +332,13 @@ class SwapClient:
             pass
 
         try:
-            # Fallback: use the jmcore crypto module if it has key derivation
-            from jmcore.crypto import derive_public_key
+            # Fallback: use jmcore.crypto if it exposes derive_public_key.
+            import jmcore.crypto as jmcrypto
 
-            return derive_public_key(privkey)
-        except (ImportError, AttributeError):
+            derive_public_key = getattr(jmcrypto, "derive_public_key", None)
+            if callable(derive_public_key):
+                return derive_public_key(privkey)
+        except ImportError:
             pass
 
         # Last resort: use python-ecdsa
@@ -353,6 +359,7 @@ class SwapClient:
         self,
         max_attempts: int = 1,
         retry_interval: float = 10.0,
+        target_amount_sats: int | None = None,
     ) -> SwapProvider:
         """Get a swap provider, either from URL or via Nostr discovery.
 
@@ -366,6 +373,8 @@ class SwapClient:
                 Defaults to 1 (single attempt, fast failure).  The
                 ``acquire_swap_input`` path passes a higher value.
             retry_interval: Seconds between Nostr discovery attempts.
+            target_amount_sats: Optional expected swap amount for compatibility
+                filtering and fee ranking logs.
 
         Returns:
             Selected SwapProvider.
@@ -374,26 +383,6 @@ class SwapClient:
             ConnectionError: If no provider available after all attempts.
         """
         import asyncio
-
-        if self.provider_url:
-            # Direct HTTP provider — single attempt, no retry needed
-            transport = HTTPSwapTransport(
-                self.provider_url,
-                socks_host=self.socks_host,
-                socks_port=self.socks_port,
-            )
-            try:
-                pairs_data = await transport.get_pairs()
-                return HTTPSwapTransport.provider_from_pairs(pairs_data, self.provider_url)
-            except Exception as e:
-                logger.warning(f"Failed to get pairs from {self.provider_url}: {e}")
-                # Return a default provider with the URL
-                return SwapProvider(
-                    pubkey="http-provider",
-                    percentage_fee=0.5,
-                    mining_fee=1500,
-                    http_url=self.provider_url,
-                )
 
         # Nostr discovery with retry — the provider's kind 30315 offer may
         # not appear on the relay immediately (e.g. the swap server needs
@@ -409,9 +398,78 @@ class SwapClient:
         for attempt in range(1, max_attempts + 1):
             providers = await discovery.discover_providers()
             if providers:
+                compatible = providers
+                if target_amount_sats is not None:
+                    compatible = [
+                        p
+                        for p in providers
+                        if p.min_amount <= target_amount_sats <= p.max_reverse_amount
+                    ]
+
+                amount_for_ranking = (
+                    target_amount_sats if target_amount_sats is not None else 100_000
+                )
+                ranked = sorted(
+                    compatible,
+                    key=lambda p: (p.calculate_fee(amount_for_ranking), -p.pow_bits),
+                )
+
+                top = ranked[:5]
+                summary = ", ".join(
+                    f"{p.pubkey} fee@{amount_for_ranking:,}={p.calculate_fee(amount_for_ranking):,}"
+                    for p in top
+                )
+                if top:
+                    logger.info(f"Top swap offers (best fee first): {summary}")
+                elif target_amount_sats is not None:
+                    logger.warning(
+                        "No swap offers compatible with expected amount "
+                        f"{target_amount_sats:,} sats; falling back to all discovered offers"
+                    )
+                    ranked = sorted(
+                        providers,
+                        key=lambda p: (p.calculate_fee(amount_for_ranking), -p.pow_bits),
+                    )
+
+                if self.preferred_provider_pubkey:
+                    preferred = self.preferred_provider_pubkey.lower()
+                    exact = [p for p in ranked if p.pubkey.lower() == preferred]
+                    if exact:
+                        selected = exact[0]
+                        logger.info(f"Selected preferred swap provider {selected.pubkey}")
+                        if attempt > 1:
+                            logger.info(
+                                f"Swap provider discovered on attempt {attempt}/{max_attempts}"
+                            )
+                        return selected
+
+                    prefix_matches = [p for p in ranked if p.pubkey.lower().startswith(preferred)]
+                    if len(prefix_matches) == 1:
+                        selected = prefix_matches[0]
+                        logger.info(
+                            "Selected preferred swap provider by pubkey prefix "
+                            f"{preferred}: {selected.pubkey}"
+                        )
+                        if attempt > 1:
+                            logger.info(
+                                f"Swap provider discovered on attempt {attempt}/{max_attempts}"
+                            )
+                        return selected
+
+                    if len(prefix_matches) > 1:
+                        matches = ", ".join(p.pubkey for p in prefix_matches[:5])
+                        logger.warning(
+                            f"Preferred swap provider prefix is ambiguous, matches: {matches}"
+                        )
+                    else:
+                        logger.warning(
+                            "Preferred swap provider pubkey not found in current Nostr offers: "
+                            f"{self.preferred_provider_pubkey}"
+                        )
+
                 if attempt > 1:
                     logger.info(f"Swap provider discovered on attempt {attempt}/{max_attempts}")
-                return providers[0]
+                return ranked[0]
 
             if attempt < max_attempts:
                 logger.debug(
@@ -422,8 +480,7 @@ class SwapClient:
 
         raise ConnectionError(
             f"No swap providers found via Nostr after {max_attempts} attempts "
-            f"(~{max_attempts * retry_interval:.0f}s). "
-            "Configure a direct provider URL with swap_provider_url."
+            f"(~{max_attempts * retry_interval:.0f}s)."
         )
 
     async def _create_reverse_swap(

@@ -584,9 +584,9 @@ class SwapSettings(BaseModel):
         default=False,
         description="Enable swap input for CoinJoin fee/change balancing",
     )
-    provider_url: str = Field(
+    provider_pubkey: str = Field(
         default="",
-        description="Direct HTTP URL for swap provider (bypasses Nostr discovery)",
+        description="Preferred swap provider pubkey (optional)",
     )
     nostr_relays: list[str] = Field(
         default_factory=list,

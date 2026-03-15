@@ -313,9 +313,9 @@
 # Enable swap input for CoinJoin fee/change balancing
 # enabled = false
 
-# Direct HTTP URL for swap provider (bypasses Nostr discovery)
-# Useful for regtest or when using a known trusted provider
-# provider_url = ""
+# Preferred swap provider pubkey (optional)
+# If set, taker will try to pick this provider from discovered Nostr offers
+# provider_pubkey = ""
 
 # Nostr relay URLs for provider discovery (empty = use Electrum defaults)
 # nostr_relays = []

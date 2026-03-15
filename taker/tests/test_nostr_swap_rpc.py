@@ -172,6 +172,24 @@ class TestEventNetworkFiltering:
         assert _event_matches_network(tags, network) is expected
 
 
+class TestProxyConnectorNormalization:
+    """Tests for proxy URL normalization before aiohttp_socks connector creation."""
+
+    def test_proxy_connector_uses_normalized_url_and_rdns(self) -> None:
+        from taker.swap.nostr import _proxy_connector_from_isolated_url
+
+        with (
+            patch("taker.swap.nostr.normalize_proxy_url") as mock_normalize,
+            patch("aiohttp_socks.ProxyConnector.from_url") as mock_from_url,
+        ):
+            mock_normalize.return_value = MagicMock(url="socks5://127.0.0.1:9050", rdns=True)
+            mock_from_url.return_value = MagicMock()
+
+            _proxy_connector_from_isolated_url("socks5h://user:pass@127.0.0.1:9050")
+
+            mock_from_url.assert_called_once_with("socks5://127.0.0.1:9050", rdns=True)
+
+
 # ---------------------------------------------------------------------------
 # Tests: NostrSwapRPC.call()
 # ---------------------------------------------------------------------------
@@ -477,7 +495,6 @@ class TestSwapClientPrepayInvoice:
         from taker.swap.models import ReverseSwapResponse
 
         client = SwapClient(
-            provider_url="http://localhost:9999",
             network="regtest",
             lnd_rest_url="https://lnd:8080",
             lnd_cert_path="/tmp/tls.cert",
@@ -535,7 +552,6 @@ class TestSwapClientPrepayInvoice:
         from taker.swap.models import ReverseSwapResponse
 
         client = SwapClient(
-            provider_url="http://localhost:9999",
             network="regtest",
             lnd_rest_url="https://lnd:8080",
             lnd_cert_path="/tmp/tls.cert",
@@ -636,44 +652,6 @@ class TestSwapClientNostrRPC:
             socks_host=None,
             socks_port=9050,
         )
-
-    @pytest.mark.asyncio
-    async def test_uses_http_for_http_provider(self) -> None:
-        """Provider with http_url should use HTTPSwapTransport."""
-        from taker.swap.client import SwapClient
-        from taker.swap.models import SwapProvider
-
-        provider = SwapProvider(
-            pubkey="bb" * 32,
-            percentage_fee=0.5,
-            mining_fee=150,
-            min_amount=20_000,
-            max_reverse_amount=5_000_000,
-            http_url="http://localhost:9999",
-        )
-
-        client = SwapClient(provider_url="http://localhost:9999", network="regtest")
-        client._preimage_hash = b"\x00" * 32
-        client._claim_pubkey = b"\x02" + b"\x00" * 32
-
-        mock_response = {
-            "id": "swap_http",
-            "invoice": "lnbcrt1http",
-            "lockupAddress": "bcrt1qhttp",
-            "redeemScript": "ef" * 32,
-            "timeoutBlockHeight": 800080,
-            "onchainAmount": 48000,
-        }
-
-        with patch("taker.swap.client.HTTPSwapTransport") as mock_transport_cls:
-            mock_transport = AsyncMock()
-            mock_transport.call = AsyncMock(return_value=mock_response)
-            mock_transport_cls.return_value = mock_transport
-
-            result = await client._create_reverse_swap(provider, 50000)
-
-        assert result.id == "swap_http"
-        assert result.invoice == "lnbcrt1http"
 
     @pytest.mark.asyncio
     async def test_raises_when_no_transport(self) -> None:

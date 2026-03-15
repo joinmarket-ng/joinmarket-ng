@@ -66,7 +66,7 @@ class TestBuildTakerConfig:
 
         # Swap config (not enabled by default)
         settings.swap.enabled = False
-        settings.swap.provider_url = ""
+        settings.swap.provider_pubkey = ""
         settings.swap.nostr_relays = []
         settings.swap.max_swap_fee_pct = 1.0
         settings.swap.fake_fee_min = 500
