@@ -133,11 +133,12 @@ RUN mkdir -p /root/.joinmarket-ng
 ENV PYTHONUNBUFFERED=1
 ENV JOINMARKET_DATA_DIR=/root/.joinmarket-ng
 ENV JMWALLETD_HOST=0.0.0.0
+ENV JMWALLETD_NO_TLS=true
 
 EXPOSE 28183
 
 ENTRYPOINT ["tini", "--"]
-CMD ["jmwalletd", "--no-tls"]
+CMD ["jmwalletd"]
 
 # =============================================================================
 # Stage 3: Build JAM frontend (cloned from GitHub, no submodule required)

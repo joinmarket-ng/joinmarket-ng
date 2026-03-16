@@ -1,2 +1,2 @@
 #!/command/with-contenv sh
-exec /opt/venv/bin/jmwalletd --no-tls
+exec /opt/venv/bin/jmwalletd
