@@ -119,11 +119,19 @@ async def do_coinjoin(
                     backend=backend,
                     config=config,
                 )
+                state._taker_ref = taker
                 await taker.start()
+                await taker.do_coinjoin(
+                    amount=body.amount_sats,
+                    destination=body.destination,
+                    mixdepth=body.mixdepth,
+                    counterparty_count=body.counterparties,
+                )
             except Exception:
                 logger.exception("Coinjoin failed")
             finally:
                 state.activate_coinjoin_state(CoinjoinState.NOT_RUNNING)
+                state._taker_ref = None
 
         ws = state.wallet_service
         state._taker_task = asyncio.create_task(_run_coinjoin())
@@ -182,16 +190,32 @@ async def run_schedule(
                     backend=backend,
                     config=config,
                 )
+                state._taker_ref = taker
                 # run_schedule is the closest to tumbler in the Taker API.
                 if hasattr(taker, "run_schedule") and body.destination_addresses:
                     schedule = cast(list[str | int | float], body.destination_addresses)
                     state.current_schedule = [schedule]
                 await taker.start()
+                if hasattr(taker, "run_schedule") and body.destination_addresses:
+                    from taker.config import Schedule, ScheduleEntry
+
+                    entries = [
+                        ScheduleEntry(
+                            mixdepth=0,
+                            amount=0,
+                            counterparty_count=1,
+                            destination=destination,
+                        )
+                        for destination in body.destination_addresses
+                    ]
+                    schedule_obj = Schedule(entries=entries)
+                    await taker.run_schedule(schedule_obj)
             except Exception:
                 logger.exception("Tumbler failed")
             finally:
                 state.activate_coinjoin_state(CoinjoinState.NOT_RUNNING)
                 state.current_schedule = None
+                state._taker_ref = None
 
         state._taker_task = asyncio.create_task(_run_tumbler())
 
