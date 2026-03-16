@@ -160,6 +160,14 @@ interface DirectSendResponse {
   txid: string;
 }
 
+interface CoinjoinRequest {
+  mixdepth: number;
+  amount_sats: number;
+  counterparties: number;
+  destination: string;
+  txfee?: number;
+}
+
 interface WalletDisplayEntry {
   hd_path: string;
   address: string;
@@ -311,6 +319,36 @@ export async function directSend(
   return { txid, txinfo: res.txinfo || {} };
 }
 
+/** Start a collaborative send (coinjoin taker flow). */
+export async function startCoinjoin(
+  token: string,
+  req: CoinjoinRequest,
+  walletName?: string,
+): Promise<void> {
+  let name = walletName;
+  if (!name) {
+    const session = await getSession(token);
+    name = session.wallet_name;
+    if (!name) throw new Error("startCoinjoin: no wallet currently open");
+  }
+  await api(`/api/v1/wallet/${name}/taker/coinjoin`, {
+    method: "POST",
+    token,
+    body: JSON.stringify(req),
+  });
+}
+
+/** Stop a running collaborative send/tumbler. */
+export async function stopCoinjoin(token: string, walletName?: string): Promise<void> {
+  let name = walletName;
+  if (!name) {
+    const session = await getSession(token);
+    name = session.wallet_name;
+    if (!name) throw new Error("stopCoinjoin: no wallet currently open");
+  }
+  await api(`/api/v1/wallet/${name}/taker/stop`, { token });
+}
+
 /** Start the maker (earn) bot. All numeric fields must be passed as strings per the API spec. */
 export async function startMaker(
   token: string,
@@ -355,4 +393,10 @@ export async function stopMaker(token: string, walletName?: string): Promise<voi
   await api(`/api/v1/wallet/${name}/maker/stop`, { token });
 }
 
-export type { CreateWalletResponse, UnlockWalletResponse, SessionResponse, WalletDisplayResponse, DirectSendResponse };
+export type {
+  CreateWalletResponse,
+  UnlockWalletResponse,
+  SessionResponse,
+  WalletDisplayResponse,
+  DirectSendResponse,
+};

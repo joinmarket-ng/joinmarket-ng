@@ -93,6 +93,93 @@ test.describe("Direct Send", () => {
     await page.screenshot({ path: "test-results/send-completed.png", fullPage: true });
   });
 
+  test("send bitcoin via UI (collaborative)", async ({
+    page,
+    fundedWallet,
+    walletApi,
+    bitcoinRpc,
+  }) => {
+    const { token } = fundedWallet;
+
+    await loginViaUI(page, fundedWallet.walletName, fundedWallet.password);
+
+    // The send form is disabled while maker is active.
+    await walletApi.stopMaker(token).catch(() => undefined);
+    // Ensure no leftover taker run from a previous failed test.
+    await walletApi.stopCoinjoin(token).catch(() => undefined);
+
+    await page.goto("/send", { waitUntil: "domcontentloaded", timeout: 15_000 });
+    await dismissDialogs(page);
+
+    await expect(page.getByText("Send from")).toBeVisible({ timeout: 15_000 });
+
+    // Use Apricot (jar 0) which is funded by global setup.
+    await page
+      .locator("button")
+      .filter({ hasText: /Apricot/i })
+      .first()
+      .click({ force: true });
+
+    await dismissDialogs(page);
+
+    const destinationAddress = await bitcoinRpc.rpc<string>("getnewaddress");
+
+    const destInput = page.locator("#send-destination");
+    await expect(destInput).toBeEnabled({ timeout: 10_000 });
+    await destInput.fill(destinationAddress);
+    await page.locator("#send-amount").fill("50000");
+
+    await dismissDialogs(page);
+    await page
+      .getByRole("heading", { name: "Sending options" })
+      .getByRole("button")
+      .click();
+
+    const cjSwitch = page.locator("#switch-is-collaborative-transaction");
+    await expect(cjSwitch).toBeVisible({ timeout: 10_000 });
+    if (!(await cjSwitch.isChecked())) {
+      await cjSwitch.click();
+    }
+
+    // Keep collaborator count low so the regtest setup can always fill.
+    const collaboratorsInput = page
+      .locator('input[type="number"][placeholder="Other"]')
+      .first();
+    await expect(collaboratorsInput).toBeEnabled({ timeout: 10_000 });
+    await collaboratorsInput.fill("1");
+    await collaboratorsInput.blur();
+
+    const sendBtn = page
+      .getByRole("button", {
+        name: /^(Send|Ignore warning\s*&\s*try send)$/i,
+      })
+      .first();
+    await expect(sendBtn).toBeVisible({ timeout: 15_000 });
+    await sendBtn.click({ force: true });
+
+    await expect(page.getByText("Confirm payment")).toBeVisible({ timeout: 10_000 });
+    await expect(page.getByText(/Payment with privacy improvement/i)).toBeVisible({
+      timeout: 10_000,
+    });
+    await page.getByRole("button", { name: "Confirm" }).click();
+
+    await walletApi.waitForSession(
+      token,
+      (s) => s.coinjoin_in_process === true,
+      90_000,
+      2_000,
+    );
+    await walletApi.waitForSession(
+      token,
+      (s) => s.coinjoin_in_process === false,
+      240_000,
+      3_000,
+    );
+
+    // Mine a block after completion so the environment is stable for later tests.
+    await bitcoinRpc.mineBlocks(1);
+  });
+
   test("send via API and verify balance change", async ({
     fundedWallet,
     walletApi,
