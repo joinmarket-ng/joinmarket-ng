@@ -162,6 +162,12 @@ class TakerConfig(WalletConfig):
         default=OfferType.SW0_RELATIVE, description="Preferred offer type"
     )
     minimum_makers: int = Field(default=1, ge=1, description="Minimum number of makers required")
+    min_directory_confirmations: int = Field(
+        default=1,
+        ge=1,
+        description="Minimum number of independent directories an offer must appear on to be "
+        "accepted (default 1). Set this to >= 2 to prevent single-directory sybil attacks.",
+    )
     max_maker_replacement_attempts: int = Field(
         default=3,
         ge=0,

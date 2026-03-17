@@ -288,6 +288,11 @@
 # Minimum number of makers required
 # minimum_makers = 1
 
+# Minimum number of independent directories an offer must appear on to be accepted (default 1).
+# Setting this to 2 or more prevents single-directory sybil attacks by requiring
+# that an offer is broadcast across multiple independent directory servers.
+# min_directory_confirmations = 1
+
 # ============================================================================
 # Directory Server Settings
 # ============================================================================
