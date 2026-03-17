@@ -494,6 +494,7 @@ class Taker(TakerMonitoringMixin):
                 max_wait=self.config.order_wait_time,
                 min_wait=self.config.orderbook_min_wait,
                 quiet_period=self.config.orderbook_quiet_period,
+                min_directory_confirmations=self.config.min_directory_confirmations,
             )
 
             # Verify and calculate fidelity bond values

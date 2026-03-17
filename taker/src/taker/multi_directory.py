@@ -380,6 +380,7 @@ class MultiDirectoryClient:
         max_wait: float = 120.0,
         min_wait: float = 30.0,
         quiet_period: float = 15.0,
+        min_directory_confirmations: int = 1,
     ) -> list[Offer]:
         """
         Fetch orderbook from all connected directory servers in parallel.
@@ -392,9 +393,11 @@ class MultiDirectoryClient:
             max_wait: Hard ceiling in seconds (default: 120s).
             min_wait: Minimum seconds before early exit is allowed (default: 30s).
             quiet_period: Seconds of silence before exiting early (default: 15s).
+            min_directory_confirmations: Minimum directories an offer must be seen on.
         """
         all_offers: list[Offer] = []
-        seen_offers: set[tuple[str, int]] = set()
+        offer_sources: dict[tuple[str, int], set[str]] = {}
+        offer_objects: dict[tuple[str, int], Offer] = {}
 
         async def fetch_from_server(
             server: str, client: DirectoryClient
@@ -413,13 +416,28 @@ class MultiDirectoryClient:
         tasks = [fetch_from_server(server, client) for server, client in self.clients.items()]
         results = await asyncio.gather(*tasks)
 
-        # Aggregate and deduplicate offers
+        # Aggregate, deduplicate, and track directory sources
         for server, offers in results:
             for offer in offers:
                 key = (offer.counterparty, offer.oid)
-                if key not in seen_offers:
-                    seen_offers.add(key)
-                    all_offers.append(offer)
+                if key not in offer_sources:
+                    offer_sources[key] = set()
+                    offer_objects[key] = offer
+                offer_sources[key].add(server)
+
+        # Filter by minimum directory confirmations
+        filtered_count = 0
+        for key, sources in offer_sources.items():
+            if len(sources) >= min_directory_confirmations:
+                all_offers.append(offer_objects[key])
+            else:
+                filtered_count += 1
+
+        if filtered_count > 0:
+            logger.info(
+                f"Filtered {filtered_count} offers that did not meet the minimum "
+                f"directory confirmations ({min_directory_confirmations})"
+            )
 
         return all_offers
 
