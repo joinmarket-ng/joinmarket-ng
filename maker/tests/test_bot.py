@@ -1845,5 +1845,114 @@ class TestReferenceCompatHandshake:
         )
 
 
+class TestListenTasksMemoryLeak:
+    @pytest.fixture
+    def mock_wallet(self):
+        wallet = MagicMock()
+        wallet.mixdepth_count = 5
+        wallet.utxo_cache = {}
+        return wallet
+
+    @pytest.fixture
+    def mock_backend(self):
+        return MagicMock()
+
+    @pytest.fixture
+    def config(self):
+        return MakerConfig(
+            mnemonic="test " * 12,
+            directory_servers=["localhost:5222"],
+            network=NetworkType.REGTEST,
+        )
+
+    @pytest.fixture
+    def maker_bot(self, mock_wallet, mock_backend, config):
+        return MakerBot(
+            wallet=mock_wallet,
+            backend=mock_backend,
+            config=config,
+        )
+
+    def test_prune_done_tasks_removes_completed(self, maker_bot):
+        """_prune_done_tasks should filter out tasks whose done() returns True."""
+        import asyncio
+
+        loop = asyncio.new_event_loop()
+        try:
+
+            async def noop() -> None:
+                pass
+
+            task_done = loop.run_until_complete(asyncio.ensure_future(noop(), loop=loop))  # noqa: F841
+
+            # Create a task that is still pending
+            async def run_pending() -> None:
+                # Use a future that will never complete during this test
+                fut: asyncio.Future[None] = loop.create_future()
+                await fut
+
+            pending_task = loop.create_task(run_pending())
+
+            # Manually inject both into listen_tasks (simulate post-reconnect state)
+            # We need a "done" task; since loop.run_until_complete finished it, reuse
+            # a completed task by creating a new one and manually completing it.
+            async def already_done() -> None:
+                pass
+
+            completed_task = loop.create_task(already_done())
+            loop.run_until_complete(asyncio.sleep(0))  # Let completed_task finish
+
+            maker_bot.listen_tasks = [completed_task, pending_task]
+
+            maker_bot._prune_done_tasks()
+
+            # Only the pending task should remain
+            assert pending_task in maker_bot.listen_tasks
+            assert completed_task not in maker_bot.listen_tasks
+            assert len(maker_bot.listen_tasks) == 1
+
+            pending_task.cancel()
+            try:
+                loop.run_until_complete(pending_task)
+            except (asyncio.CancelledError, Exception):
+                pass
+        finally:
+            loop.close()
+
+    def test_prune_done_tasks_noop_when_all_running(self, maker_bot):
+        """_prune_done_tasks should leave running tasks untouched."""
+        import asyncio
+
+        loop = asyncio.new_event_loop()
+        try:
+
+            async def long_running() -> None:
+                fut: asyncio.Future[None] = loop.create_future()
+                await fut
+
+            t1 = loop.create_task(long_running())
+            t2 = loop.create_task(long_running())
+            maker_bot.listen_tasks = [t1, t2]
+
+            maker_bot._prune_done_tasks()
+
+            assert len(maker_bot.listen_tasks) == 2
+
+            for t in [t1, t2]:
+                t.cancel()
+                try:
+                    loop.run_until_complete(t)
+                except (asyncio.CancelledError, Exception):
+                    pass
+        finally:
+            loop.close()
+
+    def test_prune_done_tasks_noop_when_empty(self, maker_bot):
+        """_prune_done_tasks should be safe to call on an empty list."""
+        maker_bot.listen_tasks = []
+        maker_bot._prune_done_tasks()
+        assert maker_bot.listen_tasks == []
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
