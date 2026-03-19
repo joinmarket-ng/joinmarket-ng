@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Maker `listen_tasks` unbounded growth on repeated directory reconnections**: Every successful reconnection in `_periodic_directory_reconnect` appended a new `asyncio.Task` to `self.listen_tasks` without removing the old, completed task for that node. Over many reconnection cycles on an unstable network, `listen_tasks` accumulated dead task references indefinitely, causing memory pressure and degraded `asyncio.gather` performance. Fixed by adding a `_prune_done_tasks()` helper to `BackgroundTasksMixin` that filters out completed tasks, called before each reconnect listener is appended.
 - **`jmwalletd` coinjoin router settings consistency**: `taker/coinjoin` and `taker/schedule` now populate `TakerConfig` with network, directory server, and Tor stream-isolation settings from `JoinMarketSettings`, matching maker behavior and other modules.
 - **`/address/new/{mixdepth}` returned the same address repeatedly**: `WalletService.get_new_address()` now tracks issued receive addresses in-memory and treats them as used when selecting the next external index, so repeated calls return fresh addresses even before on-chain history exists. Added coverage in `jmwallet` and `jmwalletd` router tests.
 
