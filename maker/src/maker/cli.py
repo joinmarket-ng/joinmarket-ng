@@ -117,7 +117,7 @@ def build_maker_config(
                 else str(effective_bitcoin_network)
             ),
             "scan_start_height": settings.wallet.scan_start_height,
-            "connect_peers": settings.get_neutrino_connect_peers(),
+            "add_peers": settings.get_neutrino_add_peers(),
         }
 
     # Resolve directory servers
@@ -380,7 +380,7 @@ def create_wallet_service(config: MakerConfig) -> WalletService:
         backend = NeutrinoBackend(
             neutrino_url=backend_cfg.get("neutrino_url", "http://127.0.0.1:8334"),
             network=bitcoin_network.value,
-            connect_peers=backend_cfg.get("connect_peers", []),
+            add_peers=backend_cfg.get("add_peers", []),
             data_dir=backend_cfg.get("data_dir", "/data/neutrino"),
             scan_start_height=backend_cfg.get("scan_start_height"),
         )

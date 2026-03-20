@@ -166,6 +166,8 @@ class TestWalletUnlock:
         data = resp.json()
         assert data["walletname"] == "w.jmdat"
         assert "token" in data
+        assert mock_open.await_args is not None
+        assert mock_open.await_args.kwargs["sync_on_open"] is False
 
     def test_wallet_not_found(self, client: TestClient) -> None:
         resp = client.post(

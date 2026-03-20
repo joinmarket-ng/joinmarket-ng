@@ -60,6 +60,7 @@ class DaemonState:
         # asyncio.Task handles for the background _run_maker / _run_taker coroutines.
         self._maker_task: asyncio.Task[None] | None = None
         self._taker_task: asyncio.Task[None] | None = None
+        self._wallet_sync_task: asyncio.Task[None] | None = None
 
         # Rescan state
         self.rescanning: bool = False
@@ -121,6 +122,12 @@ class DaemonState:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._taker_task
 
+        # Stop any background wallet sync task.
+        if self._wallet_sync_task is not None and not self._wallet_sync_task.done():
+            self._wallet_sync_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._wallet_sync_task
+
         self.wallet_service = None
         self.wallet_name = ""
         self.wallet_password = ""
@@ -134,6 +141,7 @@ class DaemonState:
         self._maker_ref = None
         self._maker_task = None
         self._taker_task = None
+        self._wallet_sync_task = None
         self.config_overrides.clear()
         self.token_authority.reset()
         return False  # was not locked, we just locked it

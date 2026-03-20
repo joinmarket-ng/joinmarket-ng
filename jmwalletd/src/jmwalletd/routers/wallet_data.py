@@ -55,7 +55,8 @@ async def wallet_display(
 ) -> WalletDisplayResponse:
     """Return full wallet display with accounts, branches, and entries."""
     ws = state.wallet_service
-    await ws.sync()
+    if not state.rescanning:
+        await ws.sync()
 
     # Load history data so address statuses (cj-out, change, etc.) are
     # classified correctly.  Without this, all funded internal addresses
@@ -140,7 +141,8 @@ async def list_utxos(
 ) -> ListUtxosResponse:
     """List all UTXOs in the wallet."""
     ws = state.wallet_service
-    await ws.sync()
+    if not state.rescanning:
+        await ws.sync()
     utxo_entries: list[UTXOEntry] = []
 
     for mixdepth in range(ws.mixdepth_count):

@@ -96,14 +96,14 @@ modules:
       - type: file
         only-arches:
           - x86_64
-        url: https://github.com/m0wer/neutrino-api/releases/download/v0.8.0/neutrinod-linux-amd64
-        sha256: 258638b6937405810fdd5f593463cd449bd8f5c131814c424754cd11e1a30692
+        url: https://github.com/m0wer/neutrino-api/releases/download/v0.9.0/neutrinod-linux-amd64
+        sha256: b52a9507625b99b06ab87b7fd2fd6f5ac0b11f2df4e57a681d8901f11d79d60e
         dest-filename: neutrinod
       - type: file
         only-arches:
           - aarch64
-        url: https://github.com/m0wer/neutrino-api/releases/download/v0.8.0/neutrinod-linux-arm64
-        sha256: 63f95f8e03af7a300166bed5815f706c328a2e4d487d72bd17e44350020a7a53
+        url: https://github.com/m0wer/neutrino-api/releases/download/v0.9.0/neutrinod-linux-arm64
+        sha256: 66b0a15c8c213e2933e0dee2bd689080ce21e38e943f1254a75fa6c35b35dfc7
         dest-filename: neutrinod
 
   # =========================================================================

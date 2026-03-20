@@ -175,6 +175,7 @@ async def open_wallet(
     wallet_path: Path,
     password: str,
     data_dir: Path,
+    sync_on_open: bool = True,
 ) -> Any:
     """Open (unlock) an existing wallet file.
 
@@ -208,7 +209,8 @@ async def open_wallet(
     if _is_descriptor_backend(backend):
         await ws.setup_descriptor_wallet()
 
-    await ws.sync()
+    if sync_on_open:
+        await ws.sync()
 
     logger.info("Opened wallet: {}", wallet_path.name)
     return ws

@@ -6,6 +6,7 @@ wallet/{name}/unlock, wallet/{name}/lock, token refresh.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import jwt as pyjwt
@@ -83,6 +84,29 @@ def _get_offer_list_from_maker(
 
 
 router = APIRouter()
+
+
+async def _background_wallet_sync(state: DaemonState, walletname: str) -> None:
+    """Run wallet sync in the background after unlock.
+
+    This keeps unlock responsive while the neutrino backend performs longer
+    rescans.  Session status exposes `rescanning=true` during this task.
+    """
+    ws = state.wallet_service
+    if ws is None:
+        return
+
+    state.rescanning = True
+    state.rescan_progress = 0.0
+
+    try:
+        await ws.sync()
+        logger.info("Background wallet sync completed for {}", walletname)
+    except Exception:
+        logger.exception("Background wallet sync failed for {}", walletname)
+    finally:
+        state.rescanning = False
+        state.rescan_progress = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -291,6 +315,7 @@ async def wallet_unlock(
             wallet_path=wallet_path,
             password=body.password,
             data_dir=state.data_dir,
+            sync_on_open=False,
         )
     except OSError as exc:
         raise LockExists(str(exc)) from exc
@@ -300,6 +325,11 @@ async def wallet_unlock(
     state.wallet_service = wallet_service
     state.wallet_name = walletname
     state.wallet_password = body.password
+
+    # Kick off sync asynchronously so unlock returns immediately.
+    if state._wallet_sync_task is not None and not state._wallet_sync_task.done():
+        state._wallet_sync_task.cancel()
+    state._wallet_sync_task = asyncio.create_task(_background_wallet_sync(state, walletname))
 
     tokens = state.token_authority.issue(walletname)
 

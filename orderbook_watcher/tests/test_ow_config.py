@@ -44,13 +44,13 @@ def test_mempool_urls() -> None:
 
 
 class TestCreateBlockchainBackend:
-    """Tests for _create_blockchain_backend() passing connect_peers to NeutrinoBackend."""
+    """Tests for _create_blockchain_backend() passing add_peers to NeutrinoBackend."""
 
     def _make_settings(
         self,
         backend_type: str = "neutrino",
         neutrino_url: str = "http://127.0.0.1:8334",
-        connect_peers: list[str] | None = None,
+        add_peers: list[str] | None = None,
         scan_start_height: int | None = None,
     ) -> MagicMock:
         settings = MagicMock()
@@ -58,13 +58,13 @@ class TestCreateBlockchainBackend:
         settings.bitcoin.neutrino_url = neutrino_url
         settings.network_config.network.value = "signet"
         settings.wallet.scan_start_height = scan_start_height
-        settings.get_neutrino_connect_peers.return_value = connect_peers or []
+        settings.get_neutrino_add_peers.return_value = add_peers or []
         return settings
 
-    def test_neutrino_backend_passes_connect_peers(self) -> None:
-        """_create_blockchain_backend() passes connect_peers to NeutrinoBackend."""
+    def test_neutrino_backend_passes_add_peers(self) -> None:
+        """_create_blockchain_backend() passes add_peers to NeutrinoBackend."""
         peers = ["peer1.example.com:38333", "peer2.example.com:38333"]
-        settings = self._make_settings(connect_peers=peers)
+        settings = self._make_settings(add_peers=peers)
 
         mock_backend = MagicMock()
         with patch("orderbook_watcher.main.NeutrinoBackend", return_value=mock_backend) as mock_cls:
@@ -74,13 +74,13 @@ class TestCreateBlockchainBackend:
             neutrino_url="http://127.0.0.1:8334",
             network="signet",
             scan_start_height=None,
-            connect_peers=peers,
+            add_peers=peers,
         )
         assert result is mock_backend
 
-    def test_neutrino_backend_empty_connect_peers(self) -> None:
+    def test_neutrino_backend_empty_add_peers(self) -> None:
         """_create_blockchain_backend() passes empty list when no peers configured."""
-        settings = self._make_settings(connect_peers=[])
+        settings = self._make_settings(add_peers=[])
 
         mock_backend = MagicMock()
         with patch("orderbook_watcher.main.NeutrinoBackend", return_value=mock_backend) as mock_cls:
@@ -90,5 +90,5 @@ class TestCreateBlockchainBackend:
             neutrino_url="http://127.0.0.1:8334",
             network="signet",
             scan_start_height=None,
-            connect_peers=[],
+            add_peers=[],
         )

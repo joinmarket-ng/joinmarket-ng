@@ -57,9 +57,10 @@ class NeutrinoBackend(BlockchainBackend):
         self,
         neutrino_url: str = "http://127.0.0.1:8334",
         network: str = "mainnet",
-        connect_peers: list[str] | None = None,
+        add_peers: list[str] | None = None,
         data_dir: str = "/data/neutrino",
         scan_start_height: int | None = None,
+        scan_lookback_blocks: int = 52560,
     ):
         """
         Initialize Neutrino backend.
@@ -67,16 +68,19 @@ class NeutrinoBackend(BlockchainBackend):
         Args:
             neutrino_url: URL of the neutrino REST API (default port 8334)
             network: Bitcoin network (mainnet, testnet, regtest, signet)
-            connect_peers: List of peer addresses to connect to (optional)
+            add_peers: Preferred peer addresses to add (optional)
             data_dir: Directory for neutrino data (headers, filters)
             scan_start_height: Block height to start initial rescan from (optional).
                 If set, skips scanning blocks before this height during initial wallet sync.
                 Critical for performance on mainnet/signet where scanning from genesis is slow.
-                If None, defaults to _min_valid_blockheight for the network.
+                If None, a smart default is computed at first sync using scan_lookback_blocks.
+            scan_lookback_blocks: Number of blocks to look back from the chain tip when
+                scan_start_height is not set. Defaults to 52560 (~1 year of blocks).
+                Only used on networks where _min_valid_blockheight is 0 (signet, regtest).
         """
         self.neutrino_url = neutrino_url.rstrip("/")
         self.network = network
-        self.connect_peers = connect_peers or []
+        self.add_peers = add_peers or []
         self.data_dir = data_dir
         self.client = httpx.AsyncClient(timeout=300.0)
 
@@ -115,9 +119,13 @@ class NeutrinoBackend(BlockchainBackend):
         elif network == "signet":
             self._min_valid_blockheight = 0  # Signet started with SegWit
 
-        # Determine the effective start height for initial rescan.
-        # Explicit scan_start_height takes priority; otherwise fall back to
-        # _min_valid_blockheight (SegWit activation on the network).
+        # Store the explicit user override (may be None).
+        self._explicit_scan_start_height: int | None = scan_start_height
+        self._scan_lookback_blocks: int = scan_lookback_blocks
+
+        # _scan_start_height is resolved lazily in _resolve_scan_start_height()
+        # once we know the chain tip.  For now, use the explicit value or a
+        # placeholder that will be overwritten before the first rescan.
         self._scan_start_height: int = (
             scan_start_height if scan_start_height is not None else self._min_valid_blockheight
         )
@@ -228,6 +236,7 @@ class NeutrinoBackend(BlockchainBackend):
             True if synced, False if timeout
         """
         start_time = asyncio.get_event_loop().time()
+        last_progress_log = start_time
 
         while True:
             try:
@@ -242,7 +251,17 @@ class NeutrinoBackend(BlockchainBackend):
                     logger.info(f"Neutrino synced at height {block_height}")
                     return True
 
-                logger.debug(f"Syncing... blocks: {block_height}, filters: {filter_height}")
+                now = asyncio.get_event_loop().time()
+                # Log progress every 30 seconds at INFO level for user visibility
+                if now - last_progress_log >= 30.0:
+                    elapsed = now - start_time
+                    logger.info(
+                        f"Neutrino syncing... headers: {block_height}, "
+                        f"filters: {filter_height} ({elapsed:.0f}s elapsed)"
+                    )
+                    last_progress_log = now
+                else:
+                    logger.debug(f"Syncing... blocks: {block_height}, filters: {filter_height}")
 
             except Exception as e:
                 logger.warning(f"Waiting for neutrino daemon: {e}")
@@ -302,6 +321,37 @@ class NeutrinoBackend(BlockchainBackend):
         self._watched_outpoints.add(outpoint)
         logger.debug(f"Watching outpoint: {txid}:{vout}")
 
+    async def _resolve_scan_start_height(self, tip_height: int) -> int:
+        """Compute the effective scan start height for the initial rescan.
+
+        When the user has not set an explicit ``scan_start_height``, we use a
+        lookback window from the current chain tip instead of scanning from
+        genesis.  This is critical on signet/regtest where
+        ``_min_valid_blockheight`` is 0, which would otherwise scan 295k+
+        blocks on every first sync.
+
+        On mainnet/testnet, ``_min_valid_blockheight`` (SegWit activation) is
+        already a sensible default and is always honoured as a floor.
+
+        Returns:
+            The block height to start the initial rescan from.
+        """
+        if self._explicit_scan_start_height is not None:
+            return self._explicit_scan_start_height
+
+        if self._scan_lookback_blocks > 0 and tip_height > self._scan_lookback_blocks:
+            lookback_height = tip_height - self._scan_lookback_blocks
+            start = max(lookback_height, self._min_valid_blockheight)
+        else:
+            start = self._min_valid_blockheight
+
+        logger.info(
+            f"Computed scan start height: {start} "
+            f"(tip={tip_height}, lookback={self._scan_lookback_blocks}, "
+            f"min_valid={self._min_valid_blockheight})"
+        )
+        return start
+
     async def get_utxos(self, addresses: list[str]) -> list[UTXO]:
         """
         Get UTXOs for given addresses using neutrino's rescan capability.
@@ -309,9 +359,11 @@ class NeutrinoBackend(BlockchainBackend):
         Neutrino will scan the blockchain using compact block filters
         to find transactions relevant to the watched addresses.
 
-        On first call, triggers a blockchain rescan from the configured
-        scan_start_height (or network minimum) to ensure all historical UTXOs
-        are found (critical for wallets funded before neutrino started).
+        On first call, ensures the neutrino node is fully synced (headers +
+        compact block filters up to the chain tip) before triggering a
+        blockchain rescan.  This is critical because scanBlocks() can only
+        check filters it has already downloaded -- if the node is still
+        syncing, blocks containing funded transactions will be silently missed.
 
         After initial rescan, automatically rescans if new blocks have arrived
         to detect transactions that occurred after the last scan.
@@ -321,6 +373,19 @@ class NeutrinoBackend(BlockchainBackend):
         # Add addresses to watch list
         for address in addresses:
             await self.add_watch_address(address)
+
+        # ---- Ensure neutrino is synced before initial rescan ----
+        # Without this, the rescan may run against an incomplete filter set
+        # and silently miss blocks that contain our funded transactions.
+        if not self._initial_rescan_done and not self._synced:
+            logger.info("Waiting for neutrino to sync headers and filters before initial rescan...")
+            synced = await self.wait_for_sync(timeout=self._INITIAL_RESCAN_TIMEOUT_SECONDS)
+            if not synced:
+                logger.warning(
+                    "Neutrino did not fully sync within timeout; "
+                    "proceeding with rescan on partial filter set "
+                    "(balance may be incomplete until next sync)"
+                )
 
         # Get current tip height to check if new blocks have arrived
         current_height = await self.get_block_height()
@@ -333,12 +398,15 @@ class NeutrinoBackend(BlockchainBackend):
             f"last_rescan={self._last_rescan_height}, current={current_height}"
         )
         if not self._initial_rescan_done and self._watched_addresses:
+            # Resolve the scan start height now that we know the chain tip.
+            self._scan_start_height = await self._resolve_scan_start_height(current_height)
+
             completed = False
             if not self._initial_rescan_started:
                 logger.info(
                     f"Performing initial blockchain rescan for {len(self._watched_addresses)} "
                     f"watched addresses from height {self._scan_start_height} "
-                    "(this may take a moment)..."
+                    f"to {current_height} (this may take a moment)..."
                 )
                 try:
                     # Trigger rescan from configured start height for all watched addresses.
@@ -1217,6 +1285,6 @@ class NeutrinoConfig:
             args.append(f"--proxy={self.tor_socks}")
 
         for peer in self.peers:
-            args.append(f"--connect={peer}")
+            args.append(f"--addpeer={peer}")
 
         return args

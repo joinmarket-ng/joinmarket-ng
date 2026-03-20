@@ -168,23 +168,11 @@ class BitcoinSettings(BaseModel):
         default="http://127.0.0.1:8334",
         description="Neutrino REST API URL (for neutrino backend)",
     )
-    neutrino_connect_peers: list[str] = Field(
-        default_factory=list,
-        description=(
-            "Explicit peer addresses for neutrino to connect to (host:port). "
-            "Applied globally to all components (maker, taker, jmwallet, etc.) "
-            "when using the neutrino backend. "
-            "Most signet nodes do not serve compact block filters; use this to "
-            "point neutrino at a known filter-serving peer. "
-            "Leave empty to rely on DNS seeds."
-        ),
-    )
     neutrino_add_peers: list[str] = Field(
         default_factory=list,
         description=(
             "Preferred peer addresses for neutrino (host:port) while still allowing "
-            "DNS/discovery peers. Unlike neutrino_connect_peers, this does not restrict "
-            "connections to only the listed peers."
+            "DNS/discovery peers."
         ),
     )
 
@@ -834,10 +822,6 @@ class JoinMarketSettings(BaseSettings):
         network_name = self.network_config.network.value
         return DEFAULT_DIRECTORY_SERVERS.get(network_name, [])
 
-    def get_neutrino_connect_peers(self) -> list[str]:
-        """Get the configured neutrino connect peers."""
-        return self.bitcoin.neutrino_connect_peers
-
     def get_neutrino_add_peers(self) -> list[str]:
         """Get the configured neutrino add peers."""
         return self.bitcoin.neutrino_add_peers
@@ -991,12 +975,11 @@ def generate_config_template() -> str:
                     lines.append("# ]")
                     lines.append("")
                     continue
-                # For neutrino_connect_peers, show an example with a comment
-                if field_name == "neutrino_connect_peers" and prefix == "bitcoin":
+                if field_name == "neutrino_add_peers" and prefix == "bitcoin":
                     lines.append(
-                        "# Explicit peers for neutrino (host:port, used by all components)."
+                        "# Preferred peers for neutrino (host:port), while discovery stays enabled."
                     )
-                    lines.append("# neutrino_connect_peers = [")
+                    lines.append("# neutrino_add_peers = [")
                     lines.append('#   "your-filter-peer:38333",')
                     lines.append("# ]")
                     lines.append("")

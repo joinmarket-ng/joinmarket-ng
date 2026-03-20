@@ -80,7 +80,8 @@ async def get_backend(data_dir: Path, force_new: bool = False) -> Any:
             neutrino_url=neutrino_url,
             network=network,
             scan_start_height=settings.wallet.scan_start_height,
-            connect_peers=settings.get_neutrino_connect_peers(),
+            scan_lookback_blocks=settings.wallet.scan_lookback_blocks,
+            add_peers=settings.get_neutrino_add_peers(),
         )
     else:
         msg = f"Unknown backend type: {backend_type}"

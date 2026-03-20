@@ -142,12 +142,12 @@ class TestBuildTakerConfig:
         assert config.fee_rate is None
         assert config.fee_block_target == 10  # From taker.fee_block_target, not wallet default
 
-    def test_neutrino_connect_peers_in_backend_config(
+    def test_neutrino_add_peers_in_backend_config(
         self, sample_mnemonic: str, mock_settings: MagicMock
     ) -> None:
-        """Test that neutrino_connect_peers from settings flows into backend_config."""
+        """Test that neutrino_add_peers from settings flows into backend_config."""
         mock_settings.bitcoin.backend_type = "neutrino"
-        mock_settings.get_neutrino_connect_peers.return_value = ["peer1.example.com:38333"]
+        mock_settings.get_neutrino_add_peers.return_value = ["peer1.example.com:38333"]
         mock_settings.swap.provider_url = "http://127.0.0.1:19999"
 
         config = build_taker_config(
@@ -160,14 +160,14 @@ class TestBuildTakerConfig:
         )
 
         assert config.backend_type == "neutrino"
-        assert config.backend_config.get("connect_peers") == ["peer1.example.com:38333"]
+        assert config.backend_config.get("add_peers") == ["peer1.example.com:38333"]
 
-    def test_neutrino_empty_connect_peers_by_default(
+    def test_neutrino_empty_add_peers_by_default(
         self, sample_mnemonic: str, mock_settings: MagicMock
     ) -> None:
-        """Test that connect_peers defaults to empty list when not configured."""
+        """Test that add_peers defaults to empty list when not configured."""
         mock_settings.bitcoin.backend_type = "neutrino"
-        mock_settings.get_neutrino_connect_peers.return_value = []
+        mock_settings.get_neutrino_add_peers.return_value = []
         mock_settings.swap.provider_url = "http://127.0.0.1:19999"
 
         config = build_taker_config(
@@ -179,7 +179,7 @@ class TestBuildTakerConfig:
             mixdepth=0,
         )
 
-        assert config.backend_config.get("connect_peers") == []
+        assert config.backend_config.get("add_peers") == []
 
     def test_data_dir_flows_to_config(self, sample_mnemonic: str, mock_settings: MagicMock) -> None:
         """Verify data_dir from settings flows into TakerConfig.

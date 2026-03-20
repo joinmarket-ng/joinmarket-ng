@@ -212,41 +212,39 @@ class TestLoadMnemonicFromFile:
 
 
 class TestResolveBackendSettings:
-    """Tests for resolve_backend_settings() populating neutrino_connect_peers."""
+    """Tests for resolve_backend_settings() populating neutrino_add_peers."""
 
-    def test_resolve_backend_settings_neutrino_connect_peers_from_settings(
+    def test_resolve_backend_settings_neutrino_add_peers_from_settings(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """resolve_backend_settings() picks up neutrino_connect_peers from settings."""
+        """resolve_backend_settings() picks up neutrino_add_peers from settings."""
         from jmcore.cli_common import resolve_backend_settings
         from jmcore.settings import JoinMarketSettings
 
         settings = JoinMarketSettings(
-            bitcoin={
-                "neutrino_connect_peers": ["peer1.example.com:38333", "peer2.example.com:38333"]
-            }
+            bitcoin={"neutrino_add_peers": ["peer1.example.com:38333", "peer2.example.com:38333"]}
         )
         result = resolve_backend_settings(settings)
-        assert result.neutrino_connect_peers == [
+        assert result.neutrino_add_peers == [
             "peer1.example.com:38333",
             "peer2.example.com:38333",
         ]
 
-    def test_resolve_backend_settings_empty_connect_peers_by_default(self) -> None:
+    def test_resolve_backend_settings_empty_add_peers_by_default(self) -> None:
         """resolve_backend_settings() returns empty list when no peers configured."""
         from jmcore.cli_common import resolve_backend_settings
         from jmcore.settings import JoinMarketSettings
 
         settings = JoinMarketSettings()
         result = resolve_backend_settings(settings)
-        assert result.neutrino_connect_peers == []
+        assert result.neutrino_add_peers == []
 
 
 class TestCreateBackend:
-    """Tests for create_backend() passing connect_peers to NeutrinoBackend."""
+    """Tests for create_backend() passing add_peers to NeutrinoBackend."""
 
-    def test_create_backend_neutrino_passes_connect_peers(self) -> None:
-        """create_backend() passes neutrino_connect_peers to NeutrinoBackend."""
+    def test_create_backend_neutrino_passes_add_peers(self) -> None:
+        """create_backend() passes neutrino_add_peers to NeutrinoBackend."""
         from pathlib import Path
         from unittest.mock import MagicMock, patch
 
@@ -261,7 +259,7 @@ class TestCreateBackend:
             rpc_user="",
             rpc_password="",
             neutrino_url="http://127.0.0.1:8334",
-            neutrino_connect_peers=peers,
+            neutrino_add_peers=peers,
             data_dir=Path("/tmp"),
         )
 
@@ -275,11 +273,11 @@ class TestCreateBackend:
             neutrino_url="http://127.0.0.1:8334",
             network="signet",
             scan_start_height=None,
-            connect_peers=peers,
+            add_peers=peers,
         )
         assert result is mock_backend
 
-    def test_create_backend_neutrino_empty_connect_peers(self) -> None:
+    def test_create_backend_neutrino_empty_add_peers(self) -> None:
         """create_backend() passes empty list to NeutrinoBackend when no peers set."""
         from pathlib import Path
         from unittest.mock import MagicMock, patch
@@ -294,7 +292,7 @@ class TestCreateBackend:
             rpc_user="",
             rpc_password="",
             neutrino_url="http://127.0.0.1:8334",
-            neutrino_connect_peers=[],
+            neutrino_add_peers=[],
             data_dir=Path("/tmp"),
         )
 
@@ -308,7 +306,7 @@ class TestCreateBackend:
             neutrino_url="http://127.0.0.1:8334",
             network="mainnet",
             scan_start_height=None,
-            connect_peers=[],
+            add_peers=[],
         )
 
 

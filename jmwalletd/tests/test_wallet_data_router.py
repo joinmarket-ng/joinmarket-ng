@@ -55,6 +55,25 @@ class TestWalletDisplay:
         assert "walletinfo" in data
         ws.sync.assert_awaited_once()
 
+    def test_skips_sync_while_rescanning(self, authed_client: tuple[TestClient, str]) -> None:
+        client, token = authed_client
+        state = get_daemon_state()
+        ws = state.wallet_service
+
+        state.rescanning = True
+        ws.sync.reset_mock()
+        ws.mixdepth_count = 5
+        ws.get_balance = AsyncMock(return_value=100_000_000)
+        ws.get_available_balance = AsyncMock(return_value=90_000_000)
+        ws.get_address_info_for_mixdepth = Mock(return_value=[])
+
+        resp = client.get(
+            "/api/v1/wallet/test_wallet.jmdat/display",
+            headers=_auth_headers(token),
+        )
+        assert resp.status_code == 200
+        ws.sync.assert_not_awaited()
+
 
 class TestWalletDisplayWithHistory:
     """Verify that the display endpoint passes history data for address classification."""
@@ -146,6 +165,21 @@ class TestWalletDisplayWithHistory:
         data = resp.json()
         assert data["utxos"] == []
         ws.sync.assert_awaited_once()
+
+    def test_utxos_skip_sync_while_rescanning(self, authed_client: tuple[TestClient, str]) -> None:
+        client, token = authed_client
+        state = get_daemon_state()
+        ws = state.wallet_service
+
+        state.rescanning = True
+        ws.sync.reset_mock()
+
+        resp = client.get(
+            "/api/v1/wallet/test_wallet.jmdat/utxos",
+            headers=_auth_headers(token),
+        )
+        assert resp.status_code == 200
+        ws.sync.assert_not_awaited()
 
 
 class TestNewAddress:

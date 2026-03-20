@@ -223,12 +223,12 @@ class TestNeutrinoBackend:
         assert backend._scan_start_height == 481824
         await backend.close()
 
-        # Regtest: defaults to 0
+        # Regtest: defaults to 0 (before _resolve_scan_start_height runs)
         backend = NeutrinoBackend(neutrino_url="http://localhost:8334", network="regtest")
         assert backend._scan_start_height == 0
         await backend.close()
 
-        # Signet: defaults to 0
+        # Signet: defaults to 0 (before _resolve_scan_start_height runs)
         backend = NeutrinoBackend(neutrino_url="http://localhost:8334", network="signet")
         assert backend._scan_start_height == 0
         await backend.close()
@@ -256,7 +256,7 @@ class TestNeutrinoBackend:
     @pytest.mark.asyncio
     async def test_neutrino_backend_get_utxos_uses_scan_start_height(self):
         """Test that get_utxos uses scan_start_height for initial rescan."""
-        from unittest.mock import AsyncMock
+        from unittest.mock import AsyncMock, patch
 
         backend = NeutrinoBackend(
             neutrino_url="http://localhost:8334",
@@ -266,7 +266,10 @@ class TestNeutrinoBackend:
         backend._api_call = AsyncMock(return_value={"utxos": []})
         backend.get_block_height = AsyncMock(return_value=800000)
 
-        await backend.get_utxos(["bc1qtest123"])
+        # Mock wait_for_sync so we don't block on the v1/status polling loop
+        with patch.object(backend, "wait_for_sync", new_callable=AsyncMock) as mock_sync:
+            mock_sync.return_value = True
+            await backend.get_utxos(["bc1qtest123"])
 
         # The initial rescan should use start_height=750000
         rescan_call = backend._api_call.call_args_list[0]
@@ -407,7 +410,11 @@ class TestNeutrinoBackend:
         backend.get_block_height = AsyncMock(return_value=100)
         backend._api_call = AsyncMock(return_value={"utxos": []})
 
-        with patch.object(backend, "_wait_for_rescan", new_callable=AsyncMock) as mock_wait:
+        with (
+            patch.object(backend, "wait_for_sync", new_callable=AsyncMock) as mock_sync,
+            patch.object(backend, "_wait_for_rescan", new_callable=AsyncMock) as mock_wait,
+        ):
+            mock_sync.return_value = True
             mock_wait.side_effect = [False, False]
             await backend.get_utxos(["tb1qtest123"])
             await backend.get_utxos(["tb1qtest123"])
@@ -435,7 +442,11 @@ class TestNeutrinoBackend:
         backend.get_block_height = AsyncMock(return_value=321)
         backend._api_call = AsyncMock(return_value={"utxos": []})
 
-        with patch.object(backend, "_wait_for_rescan", new_callable=AsyncMock) as mock_wait:
+        with (
+            patch.object(backend, "wait_for_sync", new_callable=AsyncMock) as mock_sync,
+            patch.object(backend, "_wait_for_rescan", new_callable=AsyncMock) as mock_wait,
+        ):
+            mock_sync.return_value = True
             mock_wait.return_value = True
             await backend.get_utxos(["tb1qtest123"])
 
@@ -452,7 +463,11 @@ class TestNeutrinoBackend:
         backend.get_block_height = AsyncMock(return_value=321)
         backend._api_call = AsyncMock(return_value={"utxos": []})
 
-        with patch.object(backend, "_wait_for_rescan", new_callable=AsyncMock) as mock_wait:
+        with (
+            patch.object(backend, "wait_for_sync", new_callable=AsyncMock) as mock_sync,
+            patch.object(backend, "_wait_for_rescan", new_callable=AsyncMock) as mock_wait,
+        ):
+            mock_sync.return_value = True
             mock_wait.return_value = True
             await backend.get_utxos(["tb1qtest123"])
 
@@ -474,11 +489,162 @@ class TestNeutrinoBackend:
         backend._api_call = AsyncMock(return_value={"utxos": []})
         backend.get_block_height = AsyncMock(return_value=100)
 
-        with patch.object(backend, "_wait_for_rescan", new_callable=AsyncMock) as mock_wait:
+        with (
+            patch.object(backend, "wait_for_sync", new_callable=AsyncMock) as mock_sync,
+            patch.object(backend, "_wait_for_rescan", new_callable=AsyncMock) as mock_wait,
+        ):
+            mock_sync.return_value = True
             await backend.get_utxos(["bcrt1qtest"])
             mock_wait.assert_called_once()
 
         await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_resolve_scan_start_height_explicit_override(self):
+        """Explicit scan_start_height should always be used regardless of tip."""
+        backend = NeutrinoBackend(
+            neutrino_url="http://localhost:8334",
+            network="signet",
+            scan_start_height=250000,
+        )
+        result = await backend._resolve_scan_start_height(tip_height=300000)
+        assert result == 250000
+        await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_resolve_scan_start_height_lookback_on_signet(self):
+        """On signet (min_valid=0), lookback from tip should be used."""
+        backend = NeutrinoBackend(
+            neutrino_url="http://localhost:8334",
+            network="signet",
+            scan_lookback_blocks=10000,
+        )
+        result = await backend._resolve_scan_start_height(tip_height=295000)
+        # 295000 - 10000 = 285000, max(285000, 0) = 285000
+        assert result == 285000
+        await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_resolve_scan_start_height_lookback_on_mainnet(self):
+        """On mainnet, min_valid_blockheight (SegWit activation) is the floor."""
+        backend = NeutrinoBackend(
+            neutrino_url="http://localhost:8334",
+            network="mainnet",
+            scan_lookback_blocks=52560,
+        )
+        # tip=500000, lookback=500000-52560=447440, but min_valid=481824
+        result = await backend._resolve_scan_start_height(tip_height=500000)
+        assert result == 481824  # floor wins
+        await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_resolve_scan_start_height_lookback_above_min_valid(self):
+        """When lookback height exceeds min_valid, use lookback height."""
+        backend = NeutrinoBackend(
+            neutrino_url="http://localhost:8334",
+            network="mainnet",
+            scan_lookback_blocks=52560,
+        )
+        # tip=900000, lookback=900000-52560=847440, which > 481824
+        result = await backend._resolve_scan_start_height(tip_height=900000)
+        assert result == 847440
+        await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_resolve_scan_start_height_small_chain(self):
+        """When tip < lookback blocks, fallback to min_valid_blockheight."""
+        backend = NeutrinoBackend(
+            neutrino_url="http://localhost:8334",
+            network="regtest",
+            scan_lookback_blocks=52560,
+        )
+        # tip=100 is less than lookback=52560, so use min_valid=0
+        result = await backend._resolve_scan_start_height(tip_height=100)
+        assert result == 0
+        await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_get_utxos_calls_wait_for_sync_before_initial_rescan(self):
+        """get_utxos must call wait_for_sync before the first rescan."""
+        from unittest.mock import AsyncMock, patch
+
+        backend = NeutrinoBackend(neutrino_url="http://localhost:8334", network="signet")
+        backend.get_block_height = AsyncMock(return_value=295000)
+        backend._api_call = AsyncMock(return_value={"utxos": []})
+
+        call_order: list[str] = []
+
+        async def track_sync(*args: object, **kwargs: object) -> bool:
+            call_order.append("wait_for_sync")
+            return True
+
+        async def track_rescan(*args: object, **kwargs: object) -> bool:
+            call_order.append("_wait_for_rescan")
+            return True
+
+        with (
+            patch.object(backend, "wait_for_sync", side_effect=track_sync),
+            patch.object(backend, "_wait_for_rescan", side_effect=track_rescan),
+        ):
+            await backend.get_utxos(["tb1qtest123"])
+
+        assert "wait_for_sync" in call_order
+        assert "wait_for_sync" == call_order[0], "wait_for_sync must be called first"
+        await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_get_utxos_skips_wait_for_sync_when_already_synced(self):
+        """If _synced is True, wait_for_sync should not be called again."""
+        from unittest.mock import AsyncMock, patch
+
+        backend = NeutrinoBackend(neutrino_url="http://localhost:8334", network="signet")
+        backend._synced = True  # Already synced
+        backend.get_block_height = AsyncMock(return_value=295000)
+        backend._api_call = AsyncMock(return_value={"utxos": []})
+
+        with (
+            patch.object(backend, "wait_for_sync", new_callable=AsyncMock) as mock_sync,
+            patch.object(backend, "_wait_for_rescan", new_callable=AsyncMock) as mock_wait,
+        ):
+            mock_wait.return_value = True
+            await backend.get_utxos(["tb1qtest123"])
+            mock_sync.assert_not_called()
+
+        await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_get_utxos_skips_wait_for_sync_after_initial_rescan(self):
+        """After initial rescan is done, wait_for_sync should not be called."""
+        from unittest.mock import AsyncMock, patch
+
+        backend = NeutrinoBackend(neutrino_url="http://localhost:8334", network="signet")
+        backend._initial_rescan_done = True
+        backend._last_rescan_height = 295000
+        backend.get_block_height = AsyncMock(return_value=295000)
+        backend._api_call = AsyncMock(return_value={"utxos": []})
+
+        with patch.object(backend, "wait_for_sync", new_callable=AsyncMock) as mock_sync:
+            await backend.get_utxos(["tb1qtest123"])
+            mock_sync.assert_not_called()
+
+        await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_scan_lookback_blocks_parameter(self):
+        """Test that scan_lookback_blocks is stored and used correctly."""
+        backend = NeutrinoBackend(
+            neutrino_url="http://localhost:8334",
+            network="signet",
+            scan_lookback_blocks=1000,
+        )
+        assert backend._scan_lookback_blocks == 1000
+
+        # Default value
+        backend2 = NeutrinoBackend(neutrino_url="http://localhost:8334", network="signet")
+        assert backend2._scan_lookback_blocks == 52560
+
+        await backend.close()
+        await backend2.close()
 
     @pytest.mark.asyncio
     async def test_neutrino_backend_cannot_estimate_fee(self):
@@ -651,8 +817,8 @@ class TestNeutrinoBackend:
         assert "--testnet" in args
         assert "--restlisten=0.0.0.0:8334" in args
         assert "--proxy=127.0.0.1:9050" in args
-        assert "--connect=peer1:18333" in args
-        assert "--connect=peer2:18333" in args
+        assert "--addpeer=peer1:18333" in args
+        assert "--addpeer=peer2:18333" in args
 
 
 @pytest.mark.docker
