@@ -4,6 +4,7 @@ Tests for maker bot offer announcements with fidelity bond proofs.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 from unittest.mock import MagicMock
@@ -1318,6 +1319,11 @@ class TestDirectoryReconnection:
         recovery_notify = AsyncMock(return_value=True)
         reconnect_notify = AsyncMock(return_value=True)
 
+        def create_task_stub(coro: object) -> MagicMock:
+            if asyncio.iscoroutine(coro):
+                coro.close()
+            return MagicMock()
+
         with (
             patch.object(
                 maker_bot,
@@ -1325,7 +1331,7 @@ class TestDirectoryReconnection:
                 AsyncMock(return_value=("dir1.onion:5222", mock_client)),
             ),
             patch("maker.background_tasks.asyncio.sleep", side_effect=sleep_and_stop),
-            patch("maker.background_tasks.asyncio.create_task"),
+            patch("maker.background_tasks.asyncio.create_task", side_effect=create_task_stub),
             patch("maker.background_tasks.get_notifier") as mock_get_notifier,
         ):
             mock_notifier = MagicMock()
@@ -1358,6 +1364,11 @@ class TestDirectoryReconnection:
 
         recovery_notify = AsyncMock(return_value=True)
 
+        def create_task_stub(coro: object) -> MagicMock:
+            if asyncio.iscoroutine(coro):
+                coro.close()
+            return MagicMock()
+
         with (
             patch.object(
                 maker_bot,
@@ -1365,7 +1376,7 @@ class TestDirectoryReconnection:
                 AsyncMock(return_value=("dir1.onion:5222", mock_client)),
             ),
             patch("maker.background_tasks.asyncio.sleep", side_effect=sleep_and_stop),
-            patch("maker.background_tasks.asyncio.create_task"),
+            patch("maker.background_tasks.asyncio.create_task", side_effect=create_task_stub),
             patch("maker.background_tasks.get_notifier") as mock_get_notifier,
         ):
             mock_notifier = MagicMock()
@@ -1879,12 +1890,6 @@ class TestListenTasksMemoryLeak:
 
         loop = asyncio.new_event_loop()
         try:
-
-            async def noop() -> None:
-                pass
-
-            task_done = loop.run_until_complete(asyncio.ensure_future(noop(), loop=loop))  # noqa: F841
-
             # Create a task that is still pending
             async def run_pending() -> None:
                 # Use a future that will never complete during this test
