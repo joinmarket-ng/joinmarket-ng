@@ -903,12 +903,14 @@ jobs:
             sleep 2
           done
 
-          echo "Waiting for Neutrino..."
-          for i in {1..30}; do
-            if curl -s http://localhost:8334/v1/status >/dev/null 2>&1; then
-              echo "Neutrino ready"
+          echo "Waiting for Neutrino sync..."
+          for i in {1..120}; do
+            HEIGHT=$(curl -sf http://localhost:8334/v1/status 2>/dev/null | python3 -c 'import json,sys; print(int(json.load(sys.stdin).get("block_height", 0)))' 2>/dev/null || echo 0)
+            if [ "$HEIGHT" -gt 0 ]; then
+              echo "Neutrino ready at height: $HEIGHT"
               break
             fi
+            echo "Attempt $i/120: neutrino height=$HEIGHT"
             sleep 2
           done
 
@@ -1017,12 +1019,14 @@ jobs:
             sleep 2
           done
 
-          echo "Waiting for Neutrino..."
-          for i in {1..30}; do
-            if curl -s http://localhost:8334/v1/status >/dev/null 2>&1; then
-              echo "Neutrino ready"
+          echo "Waiting for Neutrino sync..."
+          for i in {1..120}; do
+            HEIGHT=$(curl -sf http://localhost:8334/v1/status 2>/dev/null | python3 -c 'import json,sys; print(int(json.load(sys.stdin).get("block_height", 0)))' 2>/dev/null || echo 0)
+            if [ "$HEIGHT" -gt 0 ]; then
+              echo "Neutrino ready at height: $HEIGHT"
               break
             fi
+            echo "Attempt $i/120: neutrino height=$HEIGHT"
             sleep 2
           done
 

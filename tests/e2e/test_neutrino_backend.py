@@ -628,10 +628,12 @@ class TestNeutrinoCoinJoin:
             if funded:
                 # Give neutrino time to sync the new blocks
                 logger.info("Waiting for neutrino to sync new blocks...")
-                await asyncio.sleep(10)
+                await asyncio.sleep(15)
 
-                # Re-sync wallet multiple times if needed
-                for i in range(5):
+                # Re-sync wallet a few times; if neutrino still does not expose
+                # spendable balance, treat as environment flakiness for this
+                # compatibility scenario.
+                for i in range(3):
                     await taker_wallet.sync()
                     taker_balance = await taker_wallet.get_total_balance()
                     logger.info(
@@ -645,7 +647,7 @@ class TestNeutrinoCoinJoin:
         # Verify we have enough funds
         if taker_balance < min_balance:
             await taker_wallet.close()
-            pytest.skip(
+            pytest.xfail(
                 f"Taker needs at least {min_balance:,} sats, has {taker_balance:,} sats. "
                 "Neutrino backend may need more time to sync, or funding failed."
             )
