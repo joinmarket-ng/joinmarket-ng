@@ -47,6 +47,42 @@ GENERIC_TEST_MNEMONIC = (
 )
 
 
+async def _wait_for_neutrino_ready(
+    backend: NeutrinoBackend,
+    timeout_seconds: float = 180.0,
+    poll_interval: float = 2.0,
+) -> int:
+    """Wait until neutrino reports a positive block height.
+
+    Newer neutrino-api builds can take longer to connect and start syncing,
+    especially right after container start. Polling here avoids flaky skips
+    in CI when tests start before the backend is actually usable.
+    """
+    import asyncio
+
+    deadline = asyncio.get_running_loop().time() + timeout_seconds
+    last_error: Exception | None = None
+
+    while asyncio.get_running_loop().time() < deadline:
+        try:
+            height = await backend.get_block_height()
+            if height > 0:
+                return height
+        except Exception as exc:
+            last_error = exc
+
+        await asyncio.sleep(poll_interval)
+
+    if last_error is not None:
+        pytest.fail(
+            f"Neutrino did not become ready before timeout. Last error: {last_error}"
+        )
+        raise AssertionError("unreachable")
+
+    pytest.fail("Neutrino did not become ready before timeout (height stayed at 0)")
+    raise AssertionError("unreachable")
+
+
 # ==============================================================================
 # Fixtures
 # ==============================================================================
@@ -66,13 +102,9 @@ async def neutrino_backend(neutrino_url: str):
         network="regtest",
     )
 
-    # Verify neutrino is available
-    try:
-        height = await backend.get_block_height()
-        if height <= 0:
-            pytest.skip(f"Neutrino not ready, height: {height}")
-    except Exception as e:
-        pytest.skip(f"Neutrino server not available: {e}")
+    # Verify neutrino is available and actually synced to a usable height.
+    height = await _wait_for_neutrino_ready(backend)
+    logger.info(f"Neutrino backend ready at height {height}")
 
     yield backend
     await backend.close()

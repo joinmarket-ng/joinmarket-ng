@@ -1072,7 +1072,7 @@ services:
       - LISTEN_ADDR=0.0.0.0:8334
       - DATA_DIR=/data/neutrino
       - LOG_LEVEL=debug
-      - CONNECT_PEERS=jm-bitcoin:18444
+      - ADD_PEERS=jm-bitcoin:18444
     ports:
       - "8334:8334"
     volumes:

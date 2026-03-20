@@ -29,8 +29,11 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import json
 import subprocess
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 
 import pytest
@@ -113,6 +116,59 @@ def ensure_neutrino_maker_running() -> bool:
     return is_neutrino_maker_running()
 
 
+def set_maker_service_running(service: str, should_run: bool) -> None:
+    """Start or stop a maker container and assert the state transition."""
+    container = f"jm-{service}"
+    action = "start" if should_run else "stop"
+    result = subprocess.run(
+        ["docker", action, container],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    if result.returncode != 0:
+        pytest.fail(f"Failed to {action} {container}: {result.stderr}")
+
+    state = subprocess.run(
+        ["docker", "inspect", "-f", "{{.State.Running}}", container],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    is_running = state.returncode == 0 and state.stdout.strip() == "true"
+    if is_running != should_run:
+        expected = "running" if should_run else "stopped"
+        pytest.fail(f"Service {container} is not {expected} after {action}")
+
+
+def wait_for_neutrino_backend_ready(timeout: int = 180) -> bool:
+    """Wait until the neutrino API reports a positive block height."""
+    status_url = "http://127.0.0.1:8334/v1/status"
+    deadline = time.time() + timeout
+
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(status_url, timeout=3) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+                height = int(payload.get("block_height", 0))
+                if height > 0:
+                    logger.info(f"Neutrino backend ready at height {height}")
+                    return True
+        except (
+            TimeoutError,
+            ValueError,
+            urllib.error.URLError,
+            json.JSONDecodeError,
+        ):
+            pass
+
+        time.sleep(2)
+
+    return False
+
+
 # Mark all tests in this module
 pytestmark = [
     pytest.mark.neutrino_reference,
@@ -152,14 +208,16 @@ def neutrino_reference_services():
             "Neutrino maker not running. Start with: docker compose --profile reference --profile neutrino up -d"
         )
 
+    if not wait_for_neutrino_backend_ready(timeout=240):
+        pytest.skip("Neutrino backend not ready (height <= 0)")
+
     # Wait for core services
     if not wait_for_services(timeout=STARTUP_TIMEOUT):
         pytest.skip("Services not healthy")
 
-    # Ensure neutrino maker is running and give it time to announce offers
+    # Ensure neutrino maker is running and allow brief startup time.
     ensure_neutrino_maker_running()
-    logger.info("Waiting for neutrino maker to announce offers...")
-    time.sleep(90)
+    time.sleep(15)
 
     yield {"compose_file": compose_file}
 
@@ -417,98 +475,118 @@ async def test_neutrino_maker_logs_incompatibility(
 
     ensure_neutrino_maker_running()
 
-    for attempt in range(1, MAX_CONTACT_ATTEMPTS + 1):
-        logger.info(
-            f"Incompatibility probe attempt {attempt}/{MAX_CONTACT_ATTEMPTS}: "
-            "running CoinJoin to trigger neutrino maker selection..."
-        )
+    # Force deterministic selection: keep exactly one regular maker + neutrino maker.
+    # With -N 2 and only maker1 + maker-neutrino running, the reference taker must
+    # contact the neutrino maker in each attempt.
+    set_maker_service_running("maker2", should_run=False)
+    set_maker_service_running("maker3", should_run=False)
 
-        # Fund and prepare wallet for this round
-        address = get_jam_wallet_address(wallet_name, wallet_password, mixdepth=0)
-        assert address, "Must have wallet address"
-        funded = fund_wallet_address(address, 0.2)
-        assert funded, f"Wallet must be funded (attempt {attempt})"
-        await asyncio.sleep(15)
-
-        dest_address = get_jam_wallet_address(wallet_name, wallet_password, mixdepth=1)
-        if not dest_address:
-            res = run_bitcoin_cmd(["getnewaddress", "", "bech32"])
-            dest_address = res.stdout.strip()
-
-        cleanup_wallet_lock(wallet_name)
-
-        # Snapshot time just before this CoinJoin so we can scope log checks
-        round_start = datetime.now(tz=timezone.utc)
-
-        result = _run_coinjoin(
-            compose_file,
-            wallet_name,
-            wallet_password,
-            dest_address,
-            timeout=NEUTRINO_PROBE_TIMEOUT,
-        )
-
-        logger.info(f"Attempt {attempt} sendpayment output:\n{result.stdout[-1000:]}")
-
-        # Collect logs produced during this round only
-        logs = get_neutrino_maker_logs_since(round_start)
-
-        if _neutrino_maker_was_contacted(logs):
-            logger.info(f"Neutrino maker was contacted on attempt {attempt}")
-
-            # Assert the incompatibility error was logged
-            logs_lower = logs.lower()
-            has_neutrino_error = (
-                "neutrino_incompatible" in logs_lower
-                or "neutrino backend cannot verify" in logs_lower
-                or "extended metadata" in logs_lower
-                or "neutrino_compat" in logs_lower
+    try:
+        for attempt in range(1, MAX_CONTACT_ATTEMPTS + 1):
+            logger.info(
+                f"Incompatibility probe attempt {attempt}/{MAX_CONTACT_ATTEMPTS}: "
+                "running CoinJoin to trigger neutrino maker selection..."
             )
 
-            assert has_neutrino_error, (
-                "Neutrino maker was contacted by the reference taker but did NOT "
-                "log the expected incompatibility error. "
-                "This means the incompatibility is not being detected or reported "
-                "correctly.\n"
-                f"Relevant logs:\n{logs}"
+            # Fund and prepare wallet for this round
+            address = get_jam_wallet_address(wallet_name, wallet_password, mixdepth=0)
+            assert address, "Must have wallet address"
+            funded = fund_wallet_address(address, 0.2)
+            assert funded, f"Wallet must be funded (attempt {attempt})"
+            await asyncio.sleep(15)
+
+            dest_address = get_jam_wallet_address(
+                wallet_name, wallet_password, mixdepth=1
+            )
+            if not dest_address:
+                res = run_bitcoin_cmd(["getnewaddress", "", "bech32"])
+                dest_address = res.stdout.strip()
+
+            cleanup_wallet_lock(wallet_name)
+
+            # Snapshot time just before this CoinJoin so we can scope log checks
+            round_start = datetime.now(tz=timezone.utc)
+
+            result = _run_coinjoin(
+                compose_file,
+                wallet_name,
+                wallet_password,
+                dest_address,
+                timeout=NEUTRINO_PROBE_TIMEOUT,
             )
 
             logger.info(
-                "Neutrino maker correctly detected and logged the incompatibility "
-                "with the legacy taker"
+                f"Attempt {attempt} sendpayment output:\n{result.stdout[-1000:]}"
             )
 
-            # Log relevant lines for debugging
-            for line in logs.splitlines():
-                line_lower = line.lower()
-                if any(
-                    kw in line_lower
-                    for kw in ["error", "auth", "neutrino", "incompatible", "metadata"]
-                ):
-                    logger.info(f"Relevant log: {line.strip()}")
+            # Collect logs produced during this round only
+            logs = get_neutrino_maker_logs_since(round_start)
 
-            # Mine a block to confirm the transaction, then we are done
+            if _neutrino_maker_was_contacted(logs):
+                logger.info(f"Neutrino maker was contacted on attempt {attempt}")
+
+                # Assert the incompatibility error was logged
+                logs_lower = logs.lower()
+                has_neutrino_error = (
+                    "neutrino_incompatible" in logs_lower
+                    or "neutrino backend cannot verify" in logs_lower
+                    or "extended metadata" in logs_lower
+                    or "neutrino_compat" in logs_lower
+                )
+
+                assert has_neutrino_error, (
+                    "Neutrino maker was contacted by the reference taker but did NOT "
+                    "log the expected incompatibility error. "
+                    "This means the incompatibility is not being detected or reported "
+                    "correctly.\n"
+                    f"Relevant logs:\n{logs}"
+                )
+
+                logger.info(
+                    "Neutrino maker correctly detected and logged the incompatibility "
+                    "with the legacy taker"
+                )
+
+                # Log relevant lines for debugging
+                for line in logs.splitlines():
+                    line_lower = line.lower()
+                    if any(
+                        kw in line_lower
+                        for kw in [
+                            "error",
+                            "auth",
+                            "neutrino",
+                            "incompatible",
+                            "metadata",
+                        ]
+                    ):
+                        logger.info(f"Relevant log: {line.strip()}")
+
+                # Mine a block to confirm the transaction, then we are done
+                run_bitcoin_cmd(["generatetoaddress", "1", dest_address])
+                _wait_for_node_sync(max_attempts=30)
+                return
+
+            logger.info(
+                f"Neutrino maker was not selected on attempt {attempt}. "
+                f"Retrying ({MAX_CONTACT_ATTEMPTS - attempt} attempts left)..."
+            )
+
+            # Mine a block and sync before the next round
             run_bitcoin_cmd(["generatetoaddress", "1", dest_address])
             _wait_for_node_sync(max_attempts=30)
-            return
+            # Brief pause to let offers propagate before the next round
+            await asyncio.sleep(15)
 
-        logger.info(
-            f"Neutrino maker was not selected on attempt {attempt}. "
-            f"Retrying ({MAX_CONTACT_ATTEMPTS - attempt} attempts left)..."
+        pytest.fail(
+            f"Neutrino maker was never selected by the reference taker after "
+            f"{MAX_CONTACT_ATTEMPTS} CoinJoin attempts. "
+            "This is statistically unlikely and may indicate the neutrino maker is "
+            "not advertising offers or is being excluded from selection."
         )
-
-        # Mine a block and sync before the next round
-        run_bitcoin_cmd(["generatetoaddress", "1", dest_address])
-        _wait_for_node_sync(max_attempts=30)
-        # Brief pause to let offers propagate before the next round
-        await asyncio.sleep(15)
-
-    pytest.fail(
-        f"Neutrino maker was never selected by the reference taker after "
-        f"{MAX_CONTACT_ATTEMPTS} CoinJoin attempts. "
-        "This is statistically unlikely and may indicate the neutrino maker is "
-        "not advertising offers or is being excluded from selection."
-    )
+    finally:
+        set_maker_service_running("maker2", should_run=True)
+        set_maker_service_running("maker3", should_run=True)
 
 
 @pytest.mark.asyncio

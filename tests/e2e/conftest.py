@@ -10,8 +10,11 @@ Also provides fixtures for Docker service detection and wallet funding.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import socket
+import urllib.error
+import urllib.request
 import time
 from collections.abc import AsyncGenerator
 from typing import TYPE_CHECKING
@@ -179,6 +182,34 @@ def is_bitcoin_running(host: str = "127.0.0.1", port: int = 18443) -> bool:
     return is_port_open(host, port)
 
 
+def wait_for_neutrino_ready_if_present(timeout: float = 180.0) -> bool:
+    """Wait for local neutrino to have a usable height when running.
+
+    Returns:
+        True if neutrino is not running locally or became ready.
+        False if neutrino is running but never became ready.
+    """
+    if not is_port_open("127.0.0.1", 8334, timeout=0.5):
+        return True
+
+    deadline = time.time() + timeout
+    status_url = "http://127.0.0.1:8334/v1/status"
+
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(status_url, timeout=2) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+                height = int(payload.get("block_height", 0))
+                if height > 0:
+                    return True
+        except (TimeoutError, ValueError, urllib.error.URLError, json.JSONDecodeError):
+            pass
+
+        time.sleep(2)
+
+    return False
+
+
 @pytest.fixture(scope="session")
 def docker_services_available() -> bool:
     """
@@ -285,6 +316,11 @@ def fresh_docker_makers():
     from jmcore.paths import get_used_commitments_path
 
     try:
+        if not wait_for_neutrino_ready_if_present(timeout=180):
+            logger.warning(
+                "Neutrino service is reachable but not ready (height <= 0) before maker restart"
+            )
+
         # Stop any non-e2e profile makers that might be running
         # This prevents stale offers from interfering with tests
         subprocess.run(
