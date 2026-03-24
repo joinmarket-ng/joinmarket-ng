@@ -8,16 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 ### Fixed
 - Fixed fidelity bond omission in offer re-announcements after directory reconnection.
-
-### Changed
-
-- **Release verification: skip `jam-ng` layer reproducibility check**: Updated `scripts/verify-release.sh --reproduce` to exclude `jam-ng` from layer digest comparison while still building it, matching the existing behavior in `scripts/sign-release.sh`. The `jam-ng` frontend bundle (react-scripts/webpack) remains non-deterministic across environments, so this avoids false reproducibility failures without skipping the image build.
-
-### Fixed
-
 - **Maker `listen_tasks` unbounded growth on repeated directory reconnections**: Every successful reconnection in `_periodic_directory_reconnect` appended a new `asyncio.Task` to `self.listen_tasks` without removing the old, completed task for that node. Over many reconnection cycles on an unstable network, `listen_tasks` accumulated dead task references indefinitely, causing memory pressure and degraded `asyncio.gather` performance. Fixed by adding a `_prune_done_tasks()` helper to `BackgroundTasksMixin` that filters out completed tasks, called before each reconnect listener is appended.
+- **In-memory address reservation lost on process restart**: Fixed a bug affecting makers where address reservations made during the `!ioauth` phase would be lost on process restart. The wallet now persists address reservations to `reservations.json` on disk, ensuring concurrent sessions and process restarts don't result in address reuse. Reservations are effectively cleared when the session completes or times out.
 - **`jmwalletd` coinjoin router settings consistency**: `taker/coinjoin` and `taker/schedule` now populate `TakerConfig` with network, directory server, and Tor stream-isolation settings from `JoinMarketSettings`, matching maker behavior and other modules.
 - **`/address/new/{mixdepth}` returned the same address repeatedly**: `WalletService.get_new_address()` now tracks issued receive addresses in-memory and treats them as used when selecting the next external index, so repeated calls return fresh addresses even before on-chain history exists. Added coverage in `jmwallet` and `jmwalletd` router tests.
+
+### Changed
+- **Release verification: skip `jam-ng` layer reproducibility check**: Updated `scripts/verify-release.sh --reproduce` to exclude `jam-ng` from layer digest comparison while still building it, matching the existing behavior in `scripts/sign-release.sh`. The `jam-ng` frontend bundle (react-scripts/webpack) remains non-deterministic across environments, so this avoids false reproducibility failures without skipping the image build.
 
 ## [0.21.0] - 2026-03-15
 
