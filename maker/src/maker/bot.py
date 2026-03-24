@@ -708,6 +708,18 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         """Clean up session lock when session is removed."""
         self._session_locks.pop(taker_nick, None)
 
+    def _remove_session(self, taker_nick: str) -> None:
+        if taker_nick in self.active_sessions:
+            session = self.active_sessions[taker_nick]
+
+            # Clear address reservations from wallet
+            if getattr(session, "reserved_addresses", None):
+                self.wallet.clear_reservations(session.reserved_addresses)
+
+            del self.active_sessions[taker_nick]
+
+        self._cleanup_session_lock(taker_nick)
+
     def _log_rate_limited(self, key: str, message: str, interval_sec: float = 10.0) -> None:
         """Log a warning message with rate limiting to avoid log spam.
 
@@ -734,8 +746,7 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
             logger.warning(
                 f"Cleaning up timed-out session with {nick} (state: {session.state}, age: {age}s)"
             )
-            del self.active_sessions[nick]
-            self._cleanup_session_lock(nick)
+            self._remove_session(nick)
 
         # Periodically cleanup old rate limiter entries to prevent memory growth
         self._orderbook_rate_limiter.cleanup_old_entries()

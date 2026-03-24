@@ -505,8 +505,7 @@ class ProtocolHandlersMixin:
                 # Validate channel consistency before processing
                 if not session.validate_channel(source):
                     logger.error(f"Channel consistency violation for !auth from {taker_nick}")
-                    del self.active_sessions[taker_nick]
-                    self._cleanup_session_lock(taker_nick)
+                    self._remove_session(taker_nick)
                     return
 
                 # Early state check to reject duplicate !auth messages
@@ -648,8 +647,7 @@ class ProtocolHandlersMixin:
                             error_msg,
                         )
                     )
-                    del self.active_sessions[taker_nick]
-                    self._cleanup_session_lock(taker_nick)
+                    self._remove_session(taker_nick)
 
             except Exception as e:
                 logger.error(f"Failed to handle !auth: {e}")
@@ -681,8 +679,7 @@ class ProtocolHandlersMixin:
                 # Validate channel consistency before processing
                 if not session.validate_channel(source):
                     logger.error(f"Channel consistency violation for !tx from {taker_nick}")
-                    del self.active_sessions[taker_nick]
-                    self._cleanup_session_lock(taker_nick)
+                    self._remove_session(taker_nick)
                     return
 
                 # Early state check to reject duplicate !tx messages
@@ -790,8 +787,7 @@ class ProtocolHandlersMixin:
                         )
                     )
 
-                    del self.active_sessions[taker_nick]
-                    self._cleanup_session_lock(taker_nick)
+                    self._remove_session(taker_nick)
 
                     # Nick regeneration disabled - see _regenerate_nick() docstring for rationale
 
@@ -805,8 +801,7 @@ class ProtocolHandlersMixin:
                             taker_nick, "TX verification failed", response.get("error", "")
                         )
                     )
-                    del self.active_sessions[taker_nick]
-                    self._cleanup_session_lock(taker_nick)
+                    self._remove_session(taker_nick)
 
             except Exception as e:
                 logger.error(f"Failed to handle !tx: {e}")

@@ -90,6 +90,7 @@ class CoinJoinSession:
         self.created_at = time.time()
         self.session_timeout_sec = session_timeout_sec
         self.comm_channel = ""  # Track communication channel ("direct" or "dir:<node_id>")
+        self.reserved_addresses: set[str] = set()  # Track addresses reserved in this session
 
         # Feature detection for extended UTXO format (neutrino_compat)
         # Initially, we use extended format if our own backend requires it (neutrino)
@@ -576,7 +577,8 @@ class CoinJoinSession:
             # Reserve addresses immediately after selection to prevent reuse
             # in concurrent CoinJoin sessions. Once shared with a taker, addresses
             # must never be reused even if the CoinJoin fails.
-            self.wallet.reserve_addresses({cj_address, change_address})
+            self.reserved_addresses = {cj_address, change_address}
+            self.wallet.reserve_addresses(self.reserved_addresses)
 
             logger.info(
                 f"Selected {len(selected)} UTXOs from mixdepth {max_mixdepth} "
