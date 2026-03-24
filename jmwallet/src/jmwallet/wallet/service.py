@@ -4,6 +4,7 @@ JoinMarket wallet service with mixdepth support.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -80,6 +81,8 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin):
         # These addresses have been shared with a taker but the CoinJoin hasn't
         # completed yet. They must not be reused until the session ends.
         self.reserved_addresses: set[str] = set()
+        if self.data_dir is not None:
+            self._load_reservations()
         # Track receive addresses that were already handed out via API/CLI.
         # Even if they do not appear on-chain yet, we should not reissue them.
         self.issued_receive_addresses: set[str] = set()
@@ -470,7 +473,46 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin):
             addresses: Set of addresses to reserve (typically cj_address + change_address)
         """
         self.reserved_addresses.update(addresses)
+        self._save_reservations()
         logger.debug(f"Reserved {len(addresses)} addresses: {addresses}")
+
+    def clear_reservations(self, addresses: set[str]) -> None:
+
+        self.reserved_addresses.difference_update(addresses)
+        self._save_reservations()
+        logger.debug(f"Cleared reservations for {len(addresses)} addresses")
+
+    def _save_reservations(self) -> None:
+
+        if self.data_dir is None:
+            return
+
+        reservations_file = self.data_dir / "reservations.json"
+        try:
+            with open(reservations_file, "w") as f:
+                json.dump(list(self.reserved_addresses), f)
+        except Exception as e:
+            logger.error(f"Failed to save address reservations: {e}")
+
+    def _load_reservations(self) -> None:
+
+        if self.data_dir is None:
+            return
+
+        reservations_file = self.data_dir / "reservations.json"
+        if not reservations_file.exists():
+            return
+
+        try:
+            with open(reservations_file) as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    self.reserved_addresses = set(data)
+                elif isinstance(data, dict) and "reservations" in data:
+                    self.reserved_addresses = set(data["reservations"])
+            logger.debug(f"Loaded {len(self.reserved_addresses)} address reservations from disk")
+        except Exception as e:
+            logger.error(f"Failed to load address reservations: {e}")
 
     async def sync(self) -> dict[int, list[UTXOInfo]]:
         """Sync wallet (alias for sync_all for backward compatibility)."""
