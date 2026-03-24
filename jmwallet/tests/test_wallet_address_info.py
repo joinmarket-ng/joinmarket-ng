@@ -1036,6 +1036,40 @@ class TestAddressReservation:
         index = wallet.get_next_address_index(mixdepth=0, change=0)
         assert index == 1
 
+    def test_reservations_persisted_across_restarts(self, test_mnemonic, test_network, tmp_path):
+        """Test that address reservations are written to disk and loaded on restart."""
+        backend = Mock()
+        backend.get_utxos = AsyncMock(return_value=[])
+        backend.close = AsyncMock()
+
+        wallet1 = WalletService(
+            mnemonic=test_mnemonic,
+            backend=backend,
+            network=test_network,
+            mixdepth_count=5,
+            data_dir=tmp_path,
+        )
+        wallet1.utxo_cache = {i: [] for i in range(5)}
+
+        addr = wallet1.get_change_address(0, 0)
+        wallet1.reserve_addresses({addr})
+        assert addr in wallet1.reserved_addresses
+
+        wallet2 = WalletService(
+            mnemonic=test_mnemonic,
+            backend=backend,
+            network=test_network,
+            mixdepth_count=5,
+            data_dir=tmp_path,
+        )
+        wallet2.utxo_cache = {i: [] for i in range(5)}
+
+        wallet2.address_cache[addr] = (0, 1, 0)
+
+        assert addr in wallet2.reserved_addresses
+
+        assert wallet2.get_next_address_index(0, 1) == 1
+
 
 class TestIssuedReceiveAddresses:
     """Tests for issued receive-address tracking."""
