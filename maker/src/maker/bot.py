@@ -53,6 +53,9 @@ from maker.rate_limiting import (
     OrderbookRateLimiter,
 )
 
+# Approximately 64MB of memory for str->float mapping (including overhead)
+MAX_LOG_RATE_LIMIT_ENTRIES = 200000
+
 
 class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixin):
     """
@@ -708,37 +711,46 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         """Clean up session lock when session is removed."""
         self._session_locks.pop(taker_nick, None)
 
-    def _log_rate_limited(self, key: str, message: str, interval_sec: float = 10.0) -> None:
-        """Log a warning message with rate limiting to avoid log spam.
-
-        Args:
-            key: Unique key for this log type (used for rate limiting)
-            message: The warning message to log
-            interval_sec: Minimum seconds between logs with the same key
+    def _log_rate_limited(
+        self, key: str, message: str, level: str = "warning", interval: float = 10.0
+    ) -> None:
+        """
+        Logs a message with rate limiting to prevent log spam.
         """
         now = time.time()
-        last_log_time = self._rate_limited_log_times.get(key, 0.0)
-        if now - last_log_time >= interval_sec:
-            logger.warning(message)
+
+        # Enforce maximum size to prevent memory leak
+        if (
+            key not in self._rate_limited_log_times
+            and len(self._rate_limited_log_times) >= MAX_LOG_RATE_LIMIT_ENTRIES
+        ):
+            # Remove the oldest entry (dictionaries preserve insertion order in Python 3.7+)
+            try:
+                oldest_key = next(iter(self._rate_limited_log_times))
+                del self._rate_limited_log_times[oldest_key]
+            except (StopIteration, KeyError):
+                pass
+
+        last_time = self._rate_limited_log_times.get(key, 0.0)
+        if now - last_time >= interval:
+            # Use getattr to call the correct logger method (e.g., logger.warning, logger.info)
+            log_method = getattr(logger, level, logger.warning)
+            log_method(message)
             self._rate_limited_log_times[key] = now
 
     def _cleanup_timed_out_sessions(self) -> None:
         """Remove timed-out sessions from active_sessions and clean up rate limiter."""
-        timed_out = [
-            nick for nick, session in self.active_sessions.items() if session.is_timed_out()
+        # Prune dead sessions
+        dead_sessions = [
+            sid for sid, session in self.active_sessions.items() if session.is_timed_out()
         ]
+        for sid in dead_sessions:
+            logger.debug("Cleaning up timed out session: {}", sid)
+            del self.active_sessions[sid]
+            self._cleanup_session_lock(sid)
 
-        for nick in timed_out:
-            session = self.active_sessions[nick]
-            age = int(asyncio.get_event_loop().time() - session.created_at)
-            logger.warning(
-                f"Cleaning up timed-out session with {nick} (state: {session.state}, age: {age}s)"
-            )
-            del self.active_sessions[nick]
-            self._cleanup_session_lock(nick)
-
-        # Periodically cleanup old rate limiter entries to prevent memory growth
-        self._orderbook_rate_limiter.cleanup_old_entries()
+        # Ensure rate limiters are cleaned up periodically
+        self._direct_connection_rate_limiter.cleanup_old_entries()
 
     async def _resync_wallet_and_update_offers(self) -> None:
         """Re-sync wallet and update offers if balance changed.
