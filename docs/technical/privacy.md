@@ -140,7 +140,7 @@ UTXO keypair (optionally cold) -> signs -> certificate (hot) -> signs -> nick pr
 
 Allows cold storage of bond private key while hot wallet handles per-session proofs.
 
-**Cold Wallet Setup:**
+**Cold Wallet Setup:**{ #cold-wallet-setup }
 
 > **IMPORTANT -- HARDWARE WALLET LIMITATIONS:**
 >
