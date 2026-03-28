@@ -94,18 +94,26 @@ cd joinmarket-ng
 python3 -m venv jmvenv
 source jmvenv/bin/activate
 
-# Install packages (in order)
-cd jmcore && pip install -e . && cd ..
-cd jmwallet && pip install -e . && cd ..
-cd maker && pip install -e . && cd ..  # if using maker
-cd taker && pip install -e . && cd ..  # if using taker
+# Install runtime packages (in order)
+python -m pip install -e ./jmcore
+python -m pip install -e ./jmwallet
+python -m pip install -e ./maker              # if using maker
+python -m pip install -e ./taker              # if using taker
+python -m pip install -e ./directory_server   # optional
+python -m pip install -e ./orderbook_watcher  # optional
+python -m pip install -e ./jmwalletd          # optional
 ```
 
 ### Development Dependencies
 
 ```bash
-cd jmcore && pip install -r requirements-dev.txt && cd ..
-cd jmwallet && pip install -r requirements-dev.txt && cd ..
+# Install all monorepo packages with test/lint tooling
+for d in jmcore jmwallet maker taker directory_server orderbook_watcher jmwalletd; do
+  python -m pip install -e "./${d}[dev]"
+done
+
+# Verify pytest plugins used by this repo are available
+python -m pytest --help | grep -E "--timeout|--reruns"
 ```
 
 ### Raspberry Pi Notes

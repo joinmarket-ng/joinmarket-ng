@@ -1,3 +1,19 @@
+### Development Environment Setup
+
+Install all local packages with development extras from the repository root:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+
+for d in jmcore jmwallet maker taker directory_server orderbook_watcher jmwalletd; do
+  python -m pip install -e "./${d}[dev]"
+done
+```
+
+This ensures pytest and the plugins used by repo defaults and CI (including timeout and rerun support) are installed for every component.
+
 ### Dependency Management
 
 Using [pip-tools](https://github.com/jazzband/pip-tools) for pinned dependencies:
