@@ -6,18 +6,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
-### Fixed
-- Fixed fidelity bond omission in offer re-announcements after directory reconnection.
 
-### Changed
-
-- **Release verification: skip `jam-ng` layer reproducibility check**: Updated `scripts/verify-release.sh --reproduce` to exclude `jam-ng` from layer digest comparison while still building it, matching the existing behavior in `scripts/sign-release.sh`. The `jam-ng` frontend bundle (react-scripts/webpack) remains non-deterministic across environments, so this avoids false reproducibility failures without skipping the image build.
+## [0.22.0] - 2026-03-29
 
 ### Fixed
 
 - **Maker `listen_tasks` unbounded growth on repeated directory reconnections**: Every successful reconnection in `_periodic_directory_reconnect` appended a new `asyncio.Task` to `self.listen_tasks` without removing the old, completed task for that node. Over many reconnection cycles on an unstable network, `listen_tasks` accumulated dead task references indefinitely, causing memory pressure and degraded `asyncio.gather` performance. Fixed by adding a `_prune_done_tasks()` helper to `BackgroundTasksMixin` that filters out completed tasks, called before each reconnect listener is appended.
 - **`jmwalletd` coinjoin router settings consistency**: `taker/coinjoin` and `taker/schedule` now populate `TakerConfig` with network, directory server, and Tor stream-isolation settings from `JoinMarketSettings`, matching maker behavior and other modules.
 - **`/address/new/{mixdepth}` returned the same address repeatedly**: `WalletService.get_new_address()` now tracks issued receive addresses in-memory and treats them as used when selecting the next external index, so repeated calls return fresh addresses even before on-chain history exists. Added coverage in `jmwallet` and `jmwalletd` router tests.
+- Retry full initial neutrino rescan when completion status cannot be confirmed (82235622)
+- Harden neutrino rescan/address handling and default Flatpak jmwalletd transport to TLS (010a7507)
+- Improve neutrino peer handling and initial rescan reliability across wallet and daemon flows (5faed9c9)
+- Fixed fidelity bond omission in offer re-announcements after directory reconnection.
+
+### Changed
+
+- **Release verification: skip `jam-ng` layer reproducibility check**: Updated `scripts/verify-release.sh --reproduce` to exclude `jam-ng` from layer digest comparison while still building it, matching the existing behavior in `scripts/sign-release.sh`. The `jam-ng` frontend bundle (react-scripts/webpack) remains non-deterministic across environments, so this avoids false reproducibility failures without skipping the image build.
+
+### Added
+
+- Add menu.joinmarket-ng.sh - an interactive text-based menu for joinmarket-ng operations, designed for Raspiblitz users. This script provides a user-friendly interface to manage wallets, send bitcoin (including CoinJoin), control the maker bot, and view information, all without needing to remember CLI commands. (2462834f)
+- Add Jam-NG Flatpak packaging with GTK control panel, multi-network support, and managed service startup (48ca761b)
+- Add neutrino_connect_peers configuration support across CLI tools and Flatpak wiring (525146b5)
 
 ## [0.21.0] - 2026-03-15
 
@@ -1083,7 +1093,8 @@ Releases prior to these changes (including 0.13.5, 0.13.6, and 0.13.7) cannot be
 - Pre-built image support for directory server compose.
 - Tor configuration instructions.
 
-[Unreleased]: ../../compare/0.21.0...HEAD
+[Unreleased]: ../../compare/0.22.0...HEAD
+[0.22.0]: ../../compare/0.21.0...0.22.0
 [0.21.0]: ../../compare/0.20.0...0.21.0
 [0.20.0]: ../../compare/0.19.3...0.20.0
 [0.19.3]: ../../compare/0.19.2...0.19.3
