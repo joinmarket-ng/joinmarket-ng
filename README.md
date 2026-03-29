@@ -39,6 +39,7 @@ See the [Installation Guide](https://joinmarket-ng.github.io/joinmarket-ng/insta
 |--------|-------------|
 | [signatures](https://joinmarket-ng.github.io/joinmarket-ng/README-signatures) | GPG Signatures for JoinMarket NG Releases |
 | [scripts](https://joinmarket-ng.github.io/joinmarket-ng/README-scripts/) | Utility scripts for development |
+| [raspiblitz-tui](https://joinmarket-ng.github.io/joinmarket-ng/README-raspiblitz-tui/) | Raspiblitz-compatible JoinMarket-NG TUI script |
 
 ## Live Orderbook
 

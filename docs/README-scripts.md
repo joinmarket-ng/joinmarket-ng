@@ -10,11 +10,14 @@ Utility scripts for JoinMarket NG development and operations.
 - **fund-test-wallets.sh** - Fund regtest wallets for testing
 - **generate_changelog.py** - Generate changelog entries from Conventional Commit trailers
 - **generate_tor_keys.py** - Generate Tor hidden service keys
+- **menu.joinmarket-ng.sh** - Raspiblitz-compatible interactive TUI script for JoinMarket-NG
 - **regtest-miner-jam.sh** - Run Bitcoin Core regtest miner for JAM compatibility testing
 - **regtest-miner.sh** - Run Bitcoin Core regtest miner
 - **run_all_tests.sh** - Execute complete test suite including Docker-based e2e tests
 - **update_readme_help.py** - Update README files with CLI command help sections (run manually when CLI changes)
 - **update-deps.sh** - Update project dependencies
 - **validate_commit_message.py** - Validate Conventional Commit messages and enforce `Changelog:` trailers for `feat`/`fix`
+
+See also: [Raspiblitz TUI Script](README-raspiblitz-tui.md)
 
 Run any script with `--help` or `-h` for detailed usage information.

@@ -303,6 +303,7 @@ nav:
   # -------------------------------------------------------------------------
   - Signatures: README-signatures.md
   - Scripts: README-scripts.md
+  - Raspiblitz TUI: README-raspiblitz-tui.md
 
   # -------------------------------------------------------------------------
   # API Reference
