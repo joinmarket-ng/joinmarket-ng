@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 
@@ -377,6 +378,79 @@ class TestRegistryPersistence:
 
         loaded = load_registry(tmp_path)
         assert len(loaded.bonds) == 0
+
+    def test_save_registry_is_atomic(self, tmp_path: Path) -> None:
+        """Failed replace should not corrupt existing registry file."""
+        initial = BondRegistry(
+            bonds=[
+                FidelityBondInfo(
+                    address="bc1qinitial",
+                    locktime=1735689600,
+                    locktime_human="2025-01-01 00:00:00",
+                    index=0,
+                    path="m/84'/0'/0'/2/0",
+                    pubkey="02" + "11" * 32,
+                    witness_script_hex="aa" * 20,
+                    network="mainnet",
+                    created_at="2025-01-01T00:00:00",
+                )
+            ]
+        )
+        save_registry(initial, tmp_path)
+
+        updated = BondRegistry(
+            bonds=[
+                FidelityBondInfo(
+                    address="bc1qupdated",
+                    locktime=1735689601,
+                    locktime_human="2025-01-01 00:00:01",
+                    index=1,
+                    path="m/84'/0'/0'/2/1",
+                    pubkey="03" + "22" * 32,
+                    witness_script_hex="bb" * 20,
+                    network="mainnet",
+                    created_at="2025-01-01T00:00:01",
+                )
+            ]
+        )
+
+        from unittest.mock import patch
+
+        with patch("jmwallet.wallet.bond_registry.os.replace", side_effect=OSError("disk full")):
+            try:
+                save_registry(updated, tmp_path)
+            except OSError:
+                pass
+
+        # Existing file must remain valid and unchanged.
+        loaded = json.loads(get_registry_path(tmp_path).read_text())
+        assert loaded["bonds"][0]["address"] == "bc1qinitial"
+
+        # Temporary file should be cleaned up on failure.
+        tmp_files = list(get_registry_path(tmp_path).parent.glob("*.tmp"))
+        assert tmp_files == []
+
+    def test_save_registry_sets_private_permissions(self, tmp_path: Path) -> None:
+        """Registry file should be written with mode 0600."""
+        registry = BondRegistry(
+            bonds=[
+                FidelityBondInfo(
+                    address="bc1qperm",
+                    locktime=1735689600,
+                    locktime_human="2025-01-01 00:00:00",
+                    index=0,
+                    path="m/84'/0'/0'/2/0",
+                    pubkey="02" + "33" * 32,
+                    witness_script_hex="cc" * 20,
+                    network="mainnet",
+                    created_at="2025-01-01T00:00:00",
+                )
+            ]
+        )
+
+        save_registry(registry, tmp_path)
+        mode = get_registry_path(tmp_path).stat().st_mode & 0o777
+        assert mode == 0o600
 
 
 class TestCreateBondInfo:

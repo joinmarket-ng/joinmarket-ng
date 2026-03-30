@@ -8,6 +8,8 @@ including addresses, locktimes, witness scripts, and UTXO tracking.
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -201,13 +203,35 @@ def save_registry(registry: BondRegistry, data_dir: Path) -> None:
     """
     registry_path = get_registry_path(data_dir)
     registry_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path: Path | None = None
 
     try:
-        registry_path.write_text(registry.model_dump_json(indent=2))
+        content = registry.model_dump_json(indent=2)
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=registry_path.parent,
+            prefix=f"{registry_path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temp_file:
+            temp_path = Path(temp_file.name)
+            temp_file.write(content)
+            temp_file.flush()
+            os.fchmod(temp_file.fileno(), 0o600)
+            os.fsync(temp_file.fileno())
+
+        os.replace(temp_path, registry_path)
         logger.debug(f"Saved bond registry to {registry_path}")
     except Exception as e:
         logger.error(f"Failed to save bond registry: {e}")
         raise
+    finally:
+        if temp_path is not None and temp_path.exists():
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
 
 
 def get_active_locktimes(data_dir: Path) -> list[int]:
