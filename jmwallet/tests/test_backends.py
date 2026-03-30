@@ -2,10 +2,14 @@
 Integration tests for BitcoinCoreBackend and NeutrinoBackend
 """
 
+from unittest.mock import AsyncMock, MagicMock
+
 import pytest
 from jmcore.crypto import KeyPair
 
+from jmwallet.backends.base import BondVerificationRequest
 from jmwallet.backends.bitcoin_core import BitcoinCoreBackend
+from jmwallet.backends.mempool import MempoolBackend
 from jmwallet.backends.neutrino import NeutrinoBackend, NeutrinoConfig
 from jmwallet.wallet.address import pubkey_to_p2wpkh_address
 
@@ -99,6 +103,28 @@ class TestBackendCloseReuse:
         await backend.close()
 
     @pytest.mark.asyncio
+    async def test_descriptor_wallet_close_cancels_background_rescan_task(self):
+        """Closing a DescriptorWalletBackend should cancel pending background rescans."""
+        import asyncio
+
+        from jmwallet.backends.descriptor_wallet import DescriptorWalletBackend
+
+        backend = DescriptorWalletBackend()
+
+        async def never_finishes() -> None:
+            await asyncio.sleep(60)
+
+        task = asyncio.create_task(never_finishes())
+        backend._background_rescan_task = task
+
+        await backend.close()
+
+        assert task.cancelled()
+        assert backend._background_rescan_task is None
+
+        await backend.close()
+
+    @pytest.mark.asyncio
     async def test_bitcoin_core_backend_reusable_after_close(self):
         """Closing a BitcoinCoreBackend should produce fresh httpx clients."""
         backend = BitcoinCoreBackend(
@@ -134,6 +160,185 @@ class TestBackendCloseReuse:
         assert backend._initial_rescan_done is False
         assert backend._synced is False
 
+        await backend.close()
+
+class TestMempoolBackendUnit:
+    """Unit tests for MempoolBackend logic."""
+
+    @pytest.mark.asyncio
+    async def test_get_utxos_computes_confirmations_from_tip(self):
+        backend = MempoolBackend(base_url="https://mempool.example", network="mainnet")
+
+        response_1 = MagicMock()
+        response_1.raise_for_status.return_value = None
+        response_1.json.return_value = [
+            {
+                "txid": "a" * 64,
+                "vout": 0,
+                "value": 12345,
+                "status": {"block_height": 700_000},
+            }
+        ]
+
+        response_2 = MagicMock()
+        response_2.raise_for_status.return_value = None
+        response_2.json.return_value = [
+            {
+                "txid": "b" * 64,
+                "vout": 1,
+                "value": 999,
+                "status": {},
+            }
+        ]
+
+        backend.client.get = AsyncMock(side_effect=[response_1, response_2])
+        backend.get_block_height = AsyncMock(return_value=700_010)
+
+        utxos = await backend.get_utxos(["bc1qaddr1", "bc1qaddr2"])
+
+        assert len(utxos) == 2
+        assert utxos[0].confirmations == 11
+        assert utxos[0].height == 700_000
+        assert utxos[1].confirmations == 0
+        assert utxos[1].height is None
+
+        backend.get_block_height.assert_called_once()
+        await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_get_transaction_does_not_fetch_tip_for_unconfirmed(self):
+        backend = MempoolBackend(base_url="https://mempool.example", network="mainnet")
+
+        tx_response = MagicMock()
+        tx_response.raise_for_status.return_value = None
+        tx_response.json.return_value = {
+            "status": {
+                "confirmed": False,
+            }
+        }
+
+        raw_response = MagicMock()
+        raw_response.raise_for_status.return_value = None
+        raw_response.text = "02000000"
+
+        backend.client.get = AsyncMock(side_effect=[tx_response, raw_response])
+        backend.get_block_height = AsyncMock(return_value=700_000)
+
+        tx = await backend.get_transaction("a" * 64)
+
+        assert tx is not None
+        assert tx.confirmations == 0
+        assert tx.block_height is None
+        backend.get_block_height.assert_not_called()
+        await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_get_transaction_handles_genesis_block_height(self):
+        backend = MempoolBackend(base_url="https://mempool.example", network="mainnet")
+
+        tx_response = MagicMock()
+        tx_response.raise_for_status.return_value = None
+        tx_response.json.return_value = {
+            "status": {
+                "confirmed": True,
+                "block_height": 0,
+                "block_time": 123,
+            }
+        }
+
+        raw_response = MagicMock()
+        raw_response.raise_for_status.return_value = None
+        raw_response.text = "02000000"
+
+        backend.client.get = AsyncMock(side_effect=[tx_response, raw_response])
+        backend.get_block_height = AsyncMock(return_value=10)
+
+        tx = await backend.get_transaction("a" * 64)
+
+        assert tx is not None
+        assert tx.confirmations == 11
+        assert tx.block_height == 0
+        backend.get_block_height.assert_called_once()
+        await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_get_utxo_does_not_fetch_tip_for_unconfirmed(self):
+        backend = MempoolBackend(base_url="https://mempool.example", network="mainnet")
+
+        outspend_response = MagicMock()
+        outspend_response.raise_for_status.return_value = None
+        outspend_response.json.return_value = {"spent": False}
+
+        tx_response = MagicMock()
+        tx_response.raise_for_status.return_value = None
+        tx_response.json.return_value = {
+            "vout": [
+                {
+                    "value": 12345,
+                    "scriptpubkey_address": "bc1qtest",
+                    "scriptpubkey": "0014" + "00" * 20,
+                }
+            ],
+            "status": {
+                "confirmed": False,
+            },
+        }
+
+        backend.client.get = AsyncMock(side_effect=[outspend_response, tx_response])
+        backend.get_block_height = AsyncMock(return_value=700_000)
+
+        utxo = await backend.get_utxo("a" * 64, 0)
+
+        assert utxo is not None
+        assert utxo.confirmations == 0
+        assert utxo.height is None
+        backend.get_block_height.assert_not_called()
+        await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_verify_bonds_handles_genesis_block_height(self):
+        backend = MempoolBackend(base_url="https://mempool.example", network="mainnet")
+
+        outspend_response = MagicMock()
+        outspend_response.raise_for_status.return_value = None
+        outspend_response.json.return_value = {"spent": False}
+
+        tx_response = MagicMock()
+        tx_response.raise_for_status.return_value = None
+        tx_response.json.return_value = {
+            "vout": [
+                {
+                    "value": 50_000,
+                    "scriptpubkey": "0014" + "11" * 20,
+                    "scriptpubkey_address": "bc1qbond",
+                }
+            ],
+            "status": {
+                "confirmed": True,
+                "block_height": 0,
+                "block_time": 123,
+            },
+        }
+
+        backend.client.get = AsyncMock(side_effect=[outspend_response, tx_response])
+        backend.get_block_height = AsyncMock(return_value=10)
+
+        bonds = [
+            BondVerificationRequest(
+                txid="a" * 64,
+                vout=0,
+                utxo_pub=b"\x02" + b"\x01" * 32,
+                locktime=1_956_528_000,
+                address="bc1qbond",
+                scriptpubkey="0014" + "11" * 20,
+            )
+        ]
+
+        results = await backend.verify_bonds(bonds)
+
+        assert len(results) == 1
+        assert results[0].valid is True
+        assert results[0].confirmations == 11
         await backend.close()
 
 

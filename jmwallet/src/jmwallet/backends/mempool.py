@@ -35,6 +35,7 @@ class MempoolBackend(BlockchainBackend):
 
     async def get_utxos(self, addresses: list[str]) -> list[UTXO]:
         utxos: list[UTXO] = []
+        tip_height: int | None = None
         for address in addresses:
             try:
                 response = await self.client.get(f"{self.base_url}/address/{address}/utxo")
@@ -42,14 +43,23 @@ class MempoolBackend(BlockchainBackend):
                 data = response.json()
 
                 for utxo_data in data:
+                    status = utxo_data.get("status", {})
+                    block_height = status.get("block_height")
+                    if block_height is not None and tip_height is None:
+                        tip_height = await self.get_block_height()
+
+                    confirmations = 0
+                    if block_height is not None and tip_height is not None:
+                        confirmations = max(tip_height - block_height + 1, 0)
+
                     utxo = UTXO(
                         txid=utxo_data["txid"],
                         vout=utxo_data["vout"],
                         value=utxo_data["value"],
                         address=address,
-                        confirmations=utxo_data["status"].get("block_height", 0),
+                        confirmations=confirmations,
                         scriptpubkey="",
-                        height=utxo_data["status"].get("block_height"),
+                        height=block_height,
                     )
                     utxos.append(utxo)
 
@@ -106,10 +116,10 @@ class MempoolBackend(BlockchainBackend):
             block_height = status.get("block_height") if confirmed else None
             block_time = status.get("block_time") if confirmed else None
 
-            tip_height = await self.get_block_height()
             confirmations = 0
-            if block_height:
-                confirmations = tip_height - block_height + 1
+            if block_height is not None:
+                tip_height = await self.get_block_height()
+                confirmations = max(tip_height - block_height + 1, 0)
 
             return Transaction(
                 txid=txid,
@@ -211,10 +221,10 @@ class MempoolBackend(BlockchainBackend):
             confirmed = status.get("confirmed", False)
             block_height = status.get("block_height") if confirmed else None
 
-            tip_height = await self.get_block_height()
             confirmations = 0
-            if block_height:
-                confirmations = tip_height - block_height + 1
+            if block_height is not None:
+                tip_height = await self.get_block_height()
+                confirmations = max(tip_height - block_height + 1, 0)
 
             return UTXO(
                 txid=txid,
@@ -297,8 +307,8 @@ class MempoolBackend(BlockchainBackend):
                     block_time = status.get("block_time", 0) if confirmed else 0
 
                     confirmations = 0
-                    if block_height:
-                        confirmations = tip_height - block_height + 1
+                    if block_height is not None:
+                        confirmations = max(tip_height - block_height + 1, 0)
 
                     if confirmations <= 0:
                         return BondVerificationResult(
