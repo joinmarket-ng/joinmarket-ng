@@ -59,6 +59,7 @@ Tests use pytest markers to organize by Docker profile:
 ## Commit and Changelog Policy
 
 - Follow Conventional Commits for all commit titles.
+- Use component scopes that match the code you changed (for example, `fix(jmwallet): ...`, `fix(jmwalletd): ...`, `fix(taker): ...`). Do not use sub-scopes like `jmwallet-history`.
 - For `feat:` and `fix:` commits, include at least one `Changelog:` trailer in the commit body/footer.
   - Example: `Changelog: Improve reconnect handling when directory nodes flap`
 - `docs:`, `test:`, `build:`, `refactor:`, `chore:`, and `ci:` commits do not require changelog trailers and are ignored by release changelog generation.
