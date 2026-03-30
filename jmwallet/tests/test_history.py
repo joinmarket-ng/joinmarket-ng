@@ -27,6 +27,7 @@ from jmwallet.history import (
     get_used_addresses,
     mark_pending_transaction_failed,
     read_history,
+    update_all_pending_transactions,
     update_awaiting_transaction_signed,
     update_pending_transaction_txid,
     update_taker_awaiting_transaction_broadcast,
@@ -713,6 +714,78 @@ class TestPendingTransactions:
         """Test updating a transaction that doesn't exist."""
         result = update_transaction_confirmation("nonexistent_tx", 1, temp_data_dir)
         assert result is False
+
+    def test_update_transaction_confirmation_preserves_file_on_write_failure(
+        self, temp_data_dir: Path
+    ) -> None:
+        """Atomic rewrite failure should not corrupt existing history."""
+        entry = _make_pending_maker_entry(txid="atomic_fail_txid")
+        append_history_entry(entry, temp_data_dir)
+
+        with patch("jmwallet.history.os.replace", side_effect=OSError("simulated fs error")):
+            result = update_transaction_confirmation("atomic_fail_txid", 2, temp_data_dir)
+
+        assert result is False
+
+        entries = read_history(temp_data_dir)
+        assert len(entries) == 1
+        assert entries[0].txid == "atomic_fail_txid"
+        assert entries[0].success is False
+        assert entries[0].confirmations == 0
+
+
+class TestPendingConfirmationRefresh:
+    """Tests for update_all_pending_transactions behavior."""
+
+    @pytest.mark.asyncio
+    async def test_mempool_seen_but_zero_conf_stays_pending(self, temp_data_dir: Path) -> None:
+        entry = _make_pending_maker_entry(txid="mempool_txid")
+        append_history_entry(entry, temp_data_dir)
+
+        mock_backend = MagicMock()
+        mock_backend.has_mempool_access.return_value = True
+        mock_backend.get_transaction = AsyncMock(
+            return_value=Transaction(
+                txid="mempool_txid",
+                raw="00",
+                confirmations=0,
+                block_height=None,
+            )
+        )
+
+        updated = await update_all_pending_transactions(mock_backend, data_dir=temp_data_dir)
+        assert updated == 0
+
+        pending = get_pending_transactions(temp_data_dir)
+        assert len(pending) == 1
+        assert pending[0].txid == "mempool_txid"
+        assert pending[0].success is False
+        assert pending[0].confirmations == 0
+
+    @pytest.mark.asyncio
+    async def test_positive_confirmations_mark_confirmed(self, temp_data_dir: Path) -> None:
+        entry = _make_pending_maker_entry(txid="confirmed_txid")
+        append_history_entry(entry, temp_data_dir)
+
+        mock_backend = MagicMock()
+        mock_backend.has_mempool_access.return_value = True
+        mock_backend.get_transaction = AsyncMock(
+            return_value=Transaction(
+                txid="confirmed_txid",
+                raw="00",
+                confirmations=3,
+                block_height=123,
+            )
+        )
+
+        updated = await update_all_pending_transactions(mock_backend, data_dir=temp_data_dir)
+        assert updated == 1
+
+        entries = read_history(temp_data_dir)
+        assert len(entries) == 1
+        assert entries[0].txid == "confirmed_txid"
+        assert entries[0].success is True
+        assert entries[0].confirmations == 3
 
 
 class TestUsedAddressTracking:

@@ -11,6 +11,8 @@ Stores a simple CSV log of all CoinJoin transactions with key metadata:
 from __future__ import annotations
 
 import csv
+import os
+import tempfile
 from dataclasses import fields
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -122,6 +124,45 @@ def append_history_entry(
         logger.debug(f"Appended history entry: txid={entry.txid[:16]}... role={entry.role}")
     except Exception as e:
         logger.error(f"Failed to write history entry: {e}")
+
+
+def _write_history_entries_atomic(
+    entries: list[TransactionHistoryEntry], history_path: Path
+) -> bool:
+    """Rewrite history CSV atomically to avoid partial-file corruption."""
+    fieldnames = _get_fieldnames()
+    temp_path: Path | None = None
+
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            newline="",
+            encoding="utf-8",
+            dir=history_path.parent,
+            prefix=f"{history_path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temp_file:
+            temp_path = Path(temp_file.name)
+            writer = csv.DictWriter(temp_file, fieldnames=fieldnames)
+            writer.writeheader()
+            for entry in entries:
+                row = {f.name: getattr(entry, f.name) for f in fields(entry)}
+                writer.writerow(row)
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+
+        os.replace(temp_path, history_path)
+        return True
+    except Exception as e:
+        logger.error(f"Failed to update history: {e}")
+        return False
+    finally:
+        if temp_path is not None and temp_path.exists():
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
 
 
 def read_history(
@@ -448,19 +489,7 @@ def update_transaction_confirmation(
     if not updated:
         return False
 
-    # Rewrite the entire history file
-    try:
-        fieldnames = _get_fieldnames()
-        with open(history_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            for entry in entries:
-                row = {f.name: getattr(entry, f.name) for f in fields(entry)}
-                writer.writerow(row)
-        return True
-    except Exception as e:
-        logger.error(f"Failed to update history: {e}")
-        return False
+    return _write_history_entries_atomic(entries, history_path)
 
 
 async def update_transaction_confirmation_with_detection(
@@ -530,19 +559,7 @@ async def update_transaction_confirmation_with_detection(
     if not updated:
         return False
 
-    # Rewrite the entire history file
-    try:
-        fieldnames = _get_fieldnames()
-        with open(history_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            for entry in entries:
-                row = {f.name: getattr(entry, f.name) for f in fields(entry)}
-                writer.writerow(row)
-        return True
-    except Exception as e:
-        logger.error(f"Failed to update history: {e}")
-        return False
+    return _write_history_entries_atomic(entries, history_path)
 
 
 def update_pending_transaction_txid(
@@ -585,19 +602,7 @@ def update_pending_transaction_txid(
     if not updated:
         return False
 
-    # Rewrite the entire history file
-    try:
-        fieldnames = _get_fieldnames()
-        with open(history_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            for entry in entries:
-                row = {f.name: getattr(entry, f.name) for f in fields(entry)}
-                writer.writerow(row)
-        return True
-    except Exception as e:
-        logger.error(f"Failed to update history: {e}")
-        return False
+    return _write_history_entries_atomic(entries, history_path)
 
 
 def update_awaiting_transaction_signed(
@@ -653,19 +658,7 @@ def update_awaiting_transaction_signed(
     if not updated:
         return False
 
-    # Rewrite the entire history file
-    try:
-        fieldnames = _get_fieldnames()
-        with open(history_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            for entry in entries:
-                row = {f.name: getattr(entry, f.name) for f in fields(entry)}
-                writer.writerow(row)
-        return True
-    except Exception as e:
-        logger.error(f"Failed to update history: {e}")
-        return False
+    return _write_history_entries_atomic(entries, history_path)
 
 
 def update_taker_awaiting_transaction_broadcast(
@@ -722,19 +715,7 @@ def update_taker_awaiting_transaction_broadcast(
     if not updated:
         return False
 
-    # Rewrite the entire history file
-    try:
-        fieldnames = _get_fieldnames()
-        with open(history_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            for entry in entries:
-                row = {f.name: getattr(entry, f.name) for f in fields(entry)}
-                writer.writerow(row)
-        return True
-    except Exception as e:
-        logger.error(f"Failed to update history: {e}")
-        return False
+    return _write_history_entries_atomic(entries, history_path)
 
 
 def mark_pending_transaction_failed(
@@ -795,19 +776,7 @@ def mark_pending_transaction_failed(
     if not updated:
         return False
 
-    # Rewrite the entire history file
-    try:
-        fieldnames = _get_fieldnames()
-        with open(history_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            for entry in entries:
-                row = {f.name: getattr(entry, f.name) for f in fields(entry)}
-                writer.writerow(row)
-        return True
-    except Exception as e:
-        logger.error(f"Failed to update history: {e}")
-        return False
+    return _write_history_entries_atomic(entries, history_path)
 
 
 def cleanup_stale_pending_transactions(
@@ -860,19 +829,9 @@ def cleanup_stale_pending_transactions(
     if count == 0:
         return 0
 
-    # Rewrite the entire history file
-    try:
-        fieldnames = _get_fieldnames()
-        with open(history_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            for entry in entries:
-                row = {f.name: getattr(entry, f.name) for f in fields(entry)}
-                writer.writerow(row)
+    if _write_history_entries_atomic(entries, history_path):
         return count
-    except Exception as e:
-        logger.error(f"Failed to update history: {e}")
-        return 0
+    return 0
 
 
 def create_taker_history_entry(
@@ -1141,19 +1100,7 @@ def update_transaction_peer_count(
     if not updated:
         return False
 
-    # Rewrite the entire history file
-    try:
-        fieldnames = _get_fieldnames()
-        with open(history_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            for entry in entries:
-                row = {f.name: getattr(entry, f.name) for f in fields(entry)}
-                writer.writerow(row)
-        return True
-    except Exception as e:
-        logger.error(f"Failed to update history: {e}")
-        return False
+    return _write_history_entries_atomic(entries, history_path)
 
 
 async def update_all_pending_transactions(
@@ -1192,12 +1139,11 @@ async def update_all_pending_transactions(
                 # Full node: can check mempool directly
                 tx_info = await backend.get_transaction(entry.txid)
                 if tx_info is not None:
-                    # Transaction is in mempool (confirmations=0) or confirmed (confirmations>0)
-                    if tx_info.confirmations >= 0:
-                        # Mark as success even with 0 confs (mempool visible)
+                    # Only mark as success after first block confirmation.
+                    if tx_info.confirmations > 0:
                         update_transaction_confirmation(
                             txid=entry.txid,
-                            confirmations=max(tx_info.confirmations, 1),
+                            confirmations=tx_info.confirmations,
                             data_dir=data_dir,
                         )
                         updated_count += 1
