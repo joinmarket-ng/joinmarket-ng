@@ -469,7 +469,7 @@ setup_data_directory() {
             # Fallback: create minimal config if download fails
             cat > "$config_file" << 'EOF'
 # JoinMarket-NG Configuration
-# See: https://github.com/joinmarket-ng/joinmarket-ng/blob/main/DOCS.md
+# See: https://joinmarket-ng.github.io/joinmarket-ng/
 # For full template: https://github.com/joinmarket-ng/joinmarket-ng/blob/main/config.toml.template
 
 # [bitcoin]

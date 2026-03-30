@@ -6,7 +6,7 @@ Utility scripts for JoinMarket NG development and operations.
 
 ### Development & Operations
 
-- **build_docs.py** - Generate API documentation from source code
+- **build_docs.py** - Reproduce `.github/workflows/mkdocs-pages.yml` locally (install docs deps + editable packages, then run `mkdocs build`)
 - **bump_version.py** - Bump the project version across all components
 - **coinjoin_notifier.py** - Monitor and notify about CoinJoin events
 - **fidelity_bond_tool.py** - Fetch, parse, and analyze fidelity bond proofs from mainnet makers
@@ -19,7 +19,7 @@ Utility scripts for JoinMarket NG development and operations.
 - **run_all_tests.sh** - Execute complete test suite including Docker-based e2e tests
 - **menu.joinmarket-ng.sh** - Raspiblitz-compatible interactive TUI wrapper for `jm-wallet`, `jm-maker`, and `jm-taker`
 - **sign-release.sh** - Sign a release tarball
-- **update_readme_help.py** - Update README files with CLI command help sections (run manually when CLI changes)
+- **update_readme_help.py** - Update module READMEs and `docs/README-*.md` pages with CLI command help sections (run manually when CLI changes)
 - **update-base-images.sh** - Update Docker base image digests
 - **update-deps.sh** - Update project dependencies
 - **update-flatpak-deps.py** - Update Flatpak manifest dependency versions and checksums

@@ -42,3 +42,9 @@ See [Verify](technical/development.md#verify-a-release) for instructions on how 
 Note: The list of trusted keys is maintained in `trusted-keys.txt` for automated verification.
 
 Full public keys are stored in `pubkeys/<fingerprint>.asc` for convenience.
+
+## Notes
+
+- Signature files are committed under `signatures/<version>/`.
+- Verification scripts are in `scripts/verify-release.sh` and `scripts/sign-release.sh`.
+- Release reproducibility details are documented in [Development](technical/development.md).

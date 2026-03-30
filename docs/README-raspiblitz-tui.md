@@ -41,3 +41,5 @@ Main menu actions include:
 ## Compatibility Goal
 
 Behavior and prompts are intentionally preserved for Raspiblitz users. Changes to this script should maintain the same end-user UI/UX unless there is a strong, explicit reason to change it.
+
+For script inventory and related tooling, see [Scripts](README-scripts.md).

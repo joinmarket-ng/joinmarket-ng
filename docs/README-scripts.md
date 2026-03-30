@@ -1,24 +1,18 @@
 # Scripts
 
-Utility scripts for JoinMarket NG development and operations.
+Utility scripts live in `scripts/`.
 
-## Available Scripts
+For the maintained, full list and descriptions, use:
 
-- **build_docs.py** - Generate API documentation from source code
-- **coinjoin_notifier.py** - Monitor and notify about CoinJoin events
-- **fidelity_bond_tool.py** - Fetch, parse, and analyze fidelity bond proofs from mainnet makers
-- **fund-test-wallets.sh** - Fund regtest wallets for testing
-- **generate_changelog.py** - Generate changelog entries from Conventional Commit trailers
-- **generate_tor_keys.py** - Generate Tor hidden service keys
-- **menu.joinmarket-ng.sh** - Raspiblitz-compatible interactive TUI script for JoinMarket-NG
-- **regtest-miner-jam.sh** - Run Bitcoin Core regtest miner for JAM compatibility testing
-- **regtest-miner.sh** - Run Bitcoin Core regtest miner
-- **run_all_tests.sh** - Execute complete test suite including Docker-based e2e tests
-- **update_readme_help.py** - Update README files with CLI command help sections (run manually when CLI changes)
-- **update-deps.sh** - Update project dependencies
-- **update-flatpak-deps.py** - Update Flatpak manifest dependency versions and checksums
-- **validate_commit_message.py** - Validate Conventional Commit messages and enforce `Changelog:` trailers for `feat`/`fix`
+- repository file: `scripts/README.md`
+
+This docs page intentionally stays minimal to avoid duplication.
+
+## Most Common Scripts
+
+- `scripts/run_all_tests.sh`: run unit + Docker-backed test phases
+- `scripts/generate_changelog.py`: generate release changelog entries
+- `scripts/update_readme_help.py`: refresh CLI help blocks in READMEs and docs pages
+- `scripts/menu.joinmarket-ng.sh`: Raspiblitz TUI wrapper
 
 See also: [Raspiblitz TUI Script](README-raspiblitz-tui.md)
-
-Run any script with `--help` or `-h` for detailed usage information.

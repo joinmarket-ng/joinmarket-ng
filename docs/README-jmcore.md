@@ -1,73 +1,45 @@
-# jmcore - JoinMarket Core Library
+# jmcore
 
-Shared library providing core functionality for JoinMarket components.
+`jmcore` is the shared library used by all JoinMarket NG components.
 
-## Features
+It provides protocol primitives, networking, models, and common utilities.
 
-- **Protocol**: Message types, serialization, and protocol constants
-- **Crypto**: Encryption, signing, and key management
-- **Network**: Connection management and Tor integration
-- **Models**: Pydantic models for type-safe data structures
+## What It Contains
+
+- Protocol message formats and helpers
+- Shared Pydantic models
+- Directory client and networking helpers
+- Cryptographic helpers (PoDLE, signatures, encryption utilities)
+- Configuration loading and path handling
+
+## Who Uses It
+
+- `jmwallet`
+- `maker`
+- `taker`
+- `directory_server`
+- `orderbook_watcher`
 
 ## Installation
 
 ```bash
-pip install -e .
-
-# Development
-pip install -e ".[dev]"
+python -m pip install -e ./jmcore
 ```
 
-## Usage
-
-```python
-from jmcore.protocol import MessageType, ProtocolMessage
-from jmcore.models import PeerInfo, MessageEnvelope
-
-# Create a message
-msg = ProtocolMessage(
-    type=MessageType.HANDSHAKE,
-    payload={"app": "joinmarket", "version": "2.1.0"}
-)
-
-# Serialize
-data = msg.to_json()
-```
-
-## Development
+Development install:
 
 ```bash
-# Run tests
-pytest
-
-# Lint
-ruff check src tests
-
-# Format
-ruff format src tests
-
-# Type check
-mypy src
+python -m pip install -e "./jmcore[dev]"
 ```
 
-## Architecture
+## API Docs
 
-### Protocol Layer (`jmcore.protocol`)
-- Message types and protocol constants
-- Serialization/deserialization
-- Protocol version management
+Use the generated API reference for module-level details:
 
-### Crypto Layer (`jmcore.crypto`)
-- NaCl-based encryption (libsodium)
-- Bitcoin key management
-- Signature verification
+- [API / jmcore](api/jmcore/index.md)
 
-### Network Layer (`jmcore.network`)
-- TCP connection abstractions
-- Async I/O primitives
-- Note: Tor anonymization is provided by separate Tor containers, not directly by jmcore
+## Related Docs
 
-### Models (`jmcore.models`)
-- Pydantic models for all data structures
-- Validation and serialization
-- Type safety
+- [Architecture](technical/architecture.md)
+- [Protocol](technical/protocol.md)
+- [Configuration](technical/configuration.md)

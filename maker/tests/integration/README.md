@@ -1,137 +1,40 @@
-# Integration Tests
+# Maker Integration Tests
 
-## Prerequisites
+This directory contains Docker-marked integration tests for maker/jmwallet behavior with a
+real Bitcoin Core regtest backend.
 
-- Docker and Docker Compose
-- Python 3.14+
-- pytest and pytest-asyncio
+## Preferred Way To Run
 
-## Setup
-
-1. **Start Bitcoin regtest node and directory server:**
+From repository root, use the orchestrated suite:
 
 ```bash
-cd maker/tests/integration
-docker-compose up -d
+./scripts/run_all_tests.sh
 ```
 
-2. **Wait for Bitcoin Core to be ready (about 30 seconds):**
+It already runs `maker/tests/integration/` in the Docker integration phase.
+
+## Run Only These Tests
+
+If you only want this subset:
 
 ```bash
-docker-compose logs -f bitcoin
-# Wait until you see "Initial setup: mining to mature coinbase (block 100/101)"
+# start local integration stack from this directory
+docker compose up -d
+
+# run test module from repository root
+pytest -m docker maker/tests/integration/test_wallet_bitcoin_core.py --fail-on-skip
+
+# cleanup
+docker compose down -v
 ```
 
-3. **Verify Bitcoin Core is accessible:**
+## Notes
 
-```bash
-docker exec jm-bitcoin-test bitcoin-cli -regtest -rpcuser=test -rpcpassword=test getblockchaininfo
-```
-
-## Running Tests
-
-```bash
-# From the maker directory
-cd /home/m0u/code/bitcoin/joinmarket-ng/maker
-
-# Install dependencies
-pip install -e ../jmwallet[dev]
-pip install -e .
-
-# Run integration tests
-pytest tests/integration/test_wallet_bitcoin_core.py -v
-
-# Run with coverage
-pytest tests/integration/test_wallet_bitcoin_core.py -v --cov=jmwallet
-```
-
-## Manual Testing
-
-```python
-import asyncio
-from jmwallet.backends.bitcoin_core import BitcoinCoreBackend
-from jmwallet.wallet.service import WalletService
-
-async def test():
-    # Connect to regtest Bitcoin Core
-    backend = BitcoinCoreBackend(
-        rpc_url="http://127.0.0.1:18443",
-        rpc_user="test",
-        rpc_password="test"
-    )
-
-    # Check connection
-    height = await backend.get_block_height()
-    print(f"Block height: {height}")
-
-    # Create wallet
-    mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
-    wallet = WalletService(
-        mnemonic=mnemonic,
-        backend=backend,
-        network="regtest"
-    )
-
-    # Generate address
-    addr = wallet.get_receive_address(0, 0)
-    print(f"Address: {addr}")
-
-    # Fund the address using Bitcoin Core
-    # (from another terminal)
-    # docker exec jm-bitcoin-test bitcoin-cli -regtest -rpcuser=test -rpcpassword=test generatetoaddress 1 <addr>
-
-    # Sync wallet
-    await wallet.sync_mixdepth(0)
-    balance = await wallet.get_balance(0)
-    print(f"Balance: {balance} sats")
-
-    await wallet.close()
-
-asyncio.run(test())
-```
-
-## Funding a Test Wallet
-
-```bash
-# Get an address from your wallet
-ADDR="bcrt1q..." # Your wallet address
-
-# Mine blocks to the address (coinbase reward)
-docker exec jm-bitcoin-test bitcoin-cli -regtest -rpcuser=test -rpcpassword=test generatetoaddress 110 $ADDR
-```
-
-## Cleanup
-
-```bash
-docker-compose down -v
-```
+- Tests are marked `docker` and excluded by default by root `pytest.ini`.
+- They expect Bitcoin RPC on `http://127.0.0.1:18443` with `test/test`.
+- The local compose file here starts `bitcoin`, `miner`, and `directory` containers.
 
 ## Troubleshooting
 
-### Bitcoin Core not responding
-
-```bash
-# Check if Bitcoin Core is running
-docker-compose ps
-
-# Check logs
-docker-compose logs bitcoin
-
-# Restart if needed
-docker-compose restart bitcoin
-```
-
-### Connection refused
-
-```bash
-# Make sure ports are exposed
-docker-compose port bitcoin 18443
-
-# Should show: 0.0.0.0:18443
-```
-
-### RPC authentication failed
-
-Check that docker-compose.yml has correct RPC credentials:
-- rpcuser=test
-- rpcpassword=test
+- Bitcoin unreachable: `docker compose ps` and `docker compose logs bitcoin`
+- Dirty state between runs: `docker compose down -v` and start again

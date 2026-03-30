@@ -1,324 +1,56 @@
-# JoinMarket-NG Installation Guide
+# Installation
 
-Complete guide for installing JoinMarket-NG on Linux, macOS, and Raspberry Pi.
+This page covers the minimum path to install JoinMarket NG and run your first commands.
 
-## System Requirements
+For day-to-day usage, continue with:
 
-- **Python**: 3.11 or higher (3.14 recommended)
-- **OS**: Linux, macOS, or Raspberry Pi OS
-- **Disk**: ~100MB for software, plus backend storage
-- **Network**: Internet connection (Tor installed automatically)
+- [Wallet guide](README-jmwallet.md)
+- [Taker guide](README-taker.md)
+- [Maker guide](README-maker.md)
 
----
+## Requirements
 
-## Quick Installation
+- Linux or macOS
+- Python 3.11+
+- A Bitcoin backend:
+  - `descriptor_wallet` (Bitcoin Core, recommended), or
+  - `neutrino` (light client)
 
-**One-line install** (Linux/macOS):
+## Recommended Install (Linux/macOS)
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/joinmarket-ng/joinmarket-ng/main/install.sh | bash
-```
-
-The installer will:
-- Install system dependencies (asks for confirmation)
-- Install and configure Tor
-- Create Python virtual environment at `~/.joinmarket-ng/venv/`
-- Install JoinMarket-NG (maker and taker by default)
-- Create config file at `~/.joinmarket-ng/config.toml`
-
-### Installation Options
-
-```bash
-# Maker only
-curl -sSL https://raw.githubusercontent.com/joinmarket-ng/joinmarket-ng/main/install.sh | bash -s -- --maker
-
-# Taker only
-curl -sSL https://raw.githubusercontent.com/joinmarket-ng/joinmarket-ng/main/install.sh | bash -s -- --taker
-
-# Specific version
-curl -sSL https://raw.githubusercontent.com/joinmarket-ng/joinmarket-ng/main/install.sh | bash -s -- --version 0.9.0
-
-# Skip Tor (configure manually)
-curl -sSL https://raw.githubusercontent.com/joinmarket-ng/joinmarket-ng/main/install.sh | bash -s -- --skip-tor
-```
-
-### After Installation
-
-Start a new terminal or run:
-
-```bash
 source ~/.joinmarket-ng/activate.sh
 ```
 
-### Updating
+What this does:
+
+- creates `~/.joinmarket-ng/venv`
+- installs `jmcore`, `jmwallet`, `jm-maker`, and `jm-taker`
+- creates `~/.joinmarket-ng/config.toml`
+- installs/configures Tor unless you pass `--skip-tor`
+
+Common options:
 
 ```bash
-# Latest version
+# taker only
+curl -sSL https://raw.githubusercontent.com/joinmarket-ng/joinmarket-ng/main/install.sh | bash -s -- --taker
+
+# maker only
+curl -sSL https://raw.githubusercontent.com/joinmarket-ng/joinmarket-ng/main/install.sh | bash -s -- --maker
+
+# skip Tor setup
+curl -sSL https://raw.githubusercontent.com/joinmarket-ng/joinmarket-ng/main/install.sh | bash -s -- --skip-tor
+
+# update existing installation
 curl -sSL https://raw.githubusercontent.com/joinmarket-ng/joinmarket-ng/main/install.sh | bash -s -- --update
-
-# Specific version
-curl -sSL https://raw.githubusercontent.com/joinmarket-ng/joinmarket-ng/main/install.sh | bash -s -- --update --version 0.9.0
 ```
 
-Restart any running maker/taker processes after updating.
+## Configure Backend
 
----
+Edit `~/.joinmarket-ng/config.toml`.
 
-## Manual Installation
-
-For development or custom setups.
-
-### System Dependencies
-
-**Debian/Ubuntu/Raspberry Pi OS:**
-
-```bash
-sudo apt update
-sudo apt install -y git build-essential libffi-dev libsodium-dev \
-  pkg-config python3 python3-venv python3-pip
-```
-
-**macOS:**
-
-```bash
-brew install libsodium pkg-config python3
-```
-
-### Clone and Install
-
-```bash
-git clone https://github.com/joinmarket-ng/joinmarket-ng.git
-cd joinmarket-ng
-
-# Create virtual environment
-python3 -m venv jmvenv
-source jmvenv/bin/activate
-
-# Install runtime packages (in order)
-python -m pip install -e ./jmcore
-python -m pip install -e ./jmwallet
-python -m pip install -e ./maker              # if using maker
-python -m pip install -e ./taker              # if using taker
-python -m pip install -e ./directory_server   # optional
-python -m pip install -e ./orderbook_watcher  # optional
-python -m pip install -e ./jmwalletd          # optional
-```
-
-### Development Dependencies
-
-```bash
-# Install all monorepo packages with test/lint tooling
-for d in jmcore jmwallet maker taker directory_server orderbook_watcher jmwalletd; do
-  python -m pip install -e "./${d}[dev]"
-done
-
-# Verify pytest plugins used by this repo are available
-python -m pytest --help | grep -E "--timeout|--reruns"
-```
-
-### Raspberry Pi Notes
-
-**Python 3.11+:**
-
-If your system Python is older than 3.11:
-
-```bash
-sudo apt install -y software-properties-common
-sudo add-apt-repository ppa:deadsnakes/ppa
-sudo apt update
-sudo apt install -y python3.11 python3.11-venv
-```
-
-Use `python3.11` instead of `python3` when creating the virtual environment.
-
-**Memory:** Raspberry Pi 4 with 4GB+ RAM recommended. For less RAM, use Neutrino backend.
-
----
-
-## Backend Setup
-
-JoinMarket-NG requires a Bitcoin blockchain backend. Choose one:
-
-### Option A: Bitcoin Core (Full Node)
-
-**Pros:** Maximum privacy, trustlessness, full compatibility
-**Cons:** ~600GB disk space, several days to sync
-
-1. Install Bitcoin Core (v24+) from https://bitcoincore.org/en/download/
-
-2. Configure `bitcoin.conf`:
-
-```conf
-server=1
-rpcuser=yourusername
-rpcpassword=yourpassword
-rpcport=8332
-
-# Optional: Reduce bandwidth
-maxconnections=8
-```
-
-3. Start Bitcoin Core and wait for sync
-
-4. Test connection:
-
-```bash
-bitcoin-cli getblockchaininfo
-```
-
-### Option B: Neutrino (Light Client)
-
-**Pros:** ~500MB disk space, syncs in minutes
-**Cons:** Some maker limitations
-
-1. Install Docker:
-
-```bash
-curl -fsSL https://get.docker.com -o get-docker.sh
-sudo sh get-docker.sh
-```
-
-2. Run Neutrino server:
-
-```bash
-docker run -d \
-  --name neutrino \
-  --restart unless-stopped \
-  -p 8334:8334 \
-  -v neutrino-data:/data/neutrino \
-  -e NETWORK=mainnet \
-  -e PREFETCH_LOOKBACK=105120 \
-  -e CLEARNET_INITIAL_SYNC=true \
-  ghcr.io/m0wer/neutrino-api:latest
-```
-
-Environment variables:
-
-| Variable | Default | Description |
-|---|---|---|
-| `NETWORK` | `mainnet` | Bitcoin network (`mainnet`, `testnet`, `signet`, `regtest`) |
-| `PREFETCH_LOOKBACK` | `0` (all) | Only prefetch filters for this many recent blocks. `105120` (~2 years) is recommended to avoid downloading ~15 GB of filters from genesis. |
-| `CLEARNET_INITIAL_SYNC` | `false` | Sync headers over clearnet before switching to Tor. Safe because headers are public data. Roughly 2x faster for initial sync. |
-| `TOR_PROXY` | *(none)* | SOCKS5 proxy for Tor (e.g. `127.0.0.1:9050`). Required for private P2P operation. |
-| `NO_AUTH` | `false` | Disable TLS and API token authentication (development/regtest only). |
-
-In this repository's `docker-compose.yml` (CI/regtest profiles), `NO_AUTH` is
-set to `true` by default for neutrino so integration tests can use HTTP
-(`http://jm-neutrino:8334`). Override with `NEUTRINO_NO_AUTH=false` if you
-want to exercise TLS+token auth in compose-based runs.
-
-#### Neutrino API Security (TLS + Auth Token)
-
-neutrino-api automatically generates a self-signed TLS certificate and a
-random API bearer token on first start. These protect against local
-eavesdropping and unauthorized access to the watched-address list (a
-privacy-sensitive resource).
-
-**Files generated in the data directory** (`/data/neutrino` by default):
-
-| File | Purpose |
-|---|---|
-| `tls.cert` | Self-signed TLS certificate (PEM). Share with clients for HTTPS pinning. |
-| `tls.key` | TLS private key. Never share. |
-| `auth_token` | 32-byte hex API token. Clients send this as `Authorization: Bearer <token>`. |
-
-**Connecting JoinMarket-NG to an authenticated neutrino-api:**
-
-```toml
-[bitcoin]
-backend_type = "neutrino"
-neutrino_url = "https://127.0.0.1:8334"
-neutrino_tls_cert = "/data/neutrino/tls.cert"
-neutrino_auth_token = "<contents of /data/neutrino/auth_token>"
-```
-
-Or via environment variables:
-
-```bash
-export BITCOIN__NEUTRINO_URL="https://127.0.0.1:8334"
-export BITCOIN__NEUTRINO_TLS_CERT="/data/neutrino/tls.cert"
-export BITCOIN__NEUTRINO_AUTH_TOKEN="$(cat /data/neutrino/auth_token)"
-```
-
-**Resetting credentials** (regenerates cert + token, clears watched addresses):
-
-```bash
-neutrinod --reset-auth --datadir /data/neutrino
-```
-
-**Disabling auth for development/regtest:**
-
-```bash
-docker run ... -e NO_AUTH=true ghcr.io/m0wer/neutrino-api:latest
-```
-
-> **Flatpak users:** TLS and auth are wired automatically when neutrino-api
-> runs as a bundled service. No manual configuration is needed.
-
-Or download binaries from [neutrino-api releases](https://github.com/m0wer/neutrino-api/releases).
-
-#### Pulling updates and redeploying neutrino-api
-
-When you want to upgrade the container, redeploy it with the latest image:
-
-1. **Pull the newest image tag**:
-
-   ```bash
-   docker pull ghcr.io/m0wer/neutrino-api:latest
-   ```
-
-2. **Stop and remove the running container** before starting the new one.
-   This avoids bbolt lock contention between old and new processes:
-
-   ```bash
-   docker stop neutrino
-   docker rm neutrino
-   ```
-
-3. **Start a fresh container** with the same volume and env vars:
-
-   ```bash
-   docker run -d \
-     --name neutrino \
-     --restart unless-stopped \
-     -p 8334:8334 \
-     -v neutrino-data:/data/neutrino \
-     -e NETWORK=mainnet \
-     -e PREFETCH_LOOKBACK=105120 \
-     -e CLEARNET_INITIAL_SYNC=true \
-     ghcr.io/m0wer/neutrino-api:latest
-   ```
-
-4. **Verify the new deployment**:
-
-   ```bash
-   docker logs --tail 50 neutrino
-   curl -s http://127.0.0.1:8334/v1/status | jq
-   ```
-
-The `neutrino-data` Docker volume preserves headers, filters, and rescan
-state across redeploys, so a full re-download is usually not required.
-
-**Version compatibility:** JoinMarket-NG works with neutrino-api v0.7.0+.
-v0.9.0+ is recommended for persistent rescan state (avoids redundant rescans),
-and v0.10.0+ is recommended for clearnet initial sync and prefetch lookback
-controls.
-
----
-
-## Configuration
-
-JoinMarket-NG uses TOML config at `~/.joinmarket-ng/config.toml`.
-
-### Backend Configuration
-
-Edit your config file:
-
-```bash
-nano ~/.joinmarket-ng/config.toml
-```
-
-**For Bitcoin Core:**
+### Bitcoin Core (`descriptor_wallet`, recommended)
 
 ```toml
 [bitcoin]
@@ -328,301 +60,93 @@ rpc_user = "your_rpc_user"
 rpc_password = "your_rpc_password"
 ```
 
-**For Neutrino:**
+### Neutrino (light client)
 
 ```toml
 [bitcoin]
 backend_type = "neutrino"
-neutrino_url = "https://127.0.0.1:8334"
-# TLS certificate and auth token (see "Neutrino API Security" above)
-neutrino_tls_cert = "/data/neutrino/tls.cert"
-neutrino_auth_token = "<contents of auth_token file>"
+neutrino_url = "http://127.0.0.1:8334"
 ```
 
-### Common Settings
-
-```toml
-[network]
-network = "mainnet"  # mainnet, testnet, signet, regtest
-
-[tor]
-socks_host = "127.0.0.1"
-socks_port = 9050
-
-[maker]
-cj_fee_relative = 0.001  # 0.1% fee
-min_size = 100000        # Minimum 100k sats
-
-[taker]
-counterparty_count = 3   # Makers per CoinJoin
-```
-
-### Configuration Priority
-
-Settings are loaded in order (highest priority first):
-
-1. CLI arguments (`--backend neutrino`)
-2. Environment variables (`BITCOIN__RPC_URL`)
-3. Config file (`~/.joinmarket-ng/config.toml`)
-4. Default values
-
----
-
-## Tor Setup
-
-JoinMarket-NG requires Tor for privacy. The installer configures Tor automatically.
-
-### Automated Setup
-
-When you run `install.sh`, it will:
-
-1. Detect and install Tor (apt/brew)
-2. Configure with localhost-only bindings:
-   ```conf
-   SocksPort 127.0.0.1:9050
-   ControlPort 127.0.0.1:9051
-   CookieAuthentication 1
-   ```
-3. Restart Tor and verify connectivity
-4. Backup existing config before changes
-
-### Manual Setup
-
-If you used `--skip-tor` or need manual configuration:
-
-**Install Tor:**
+Neutrino server example:
 
 ```bash
-# Linux
-sudo apt install -y tor
-
-# macOS
-brew install tor
+docker run -d \
+  --name neutrino \
+  --restart unless-stopped \
+  -p 8334:8334 \
+  -v neutrino-data:/data/neutrino \
+  -e NETWORK=mainnet \
+  ghcr.io/m0wer/neutrino-api
 ```
 
-**Configure** (`/etc/tor/torrc` on Linux, `$(brew --prefix)/etc/tor/torrc` on macOS):
+## First Run
 
-```conf
-SocksPort 127.0.0.1:9050
-ControlPort 127.0.0.1:9051
-CookieAuthentication 1
-```
-
-**Start Tor:**
+Create a wallet and inspect addresses:
 
 ```bash
-# Linux
-sudo systemctl start tor
-sudo systemctl enable tor
-
-# macOS
-brew services start tor
+jm-wallet generate
+jm-wallet info
 ```
 
-**Verify:**
+Then either:
 
 ```bash
-# SOCKS proxy
-curl --socks5-hostname 127.0.0.1:9050 https://check.torproject.org/api/ip
+# mix coins as taker
+jm-taker coinjoin --amount 1000000 --destination INTERNAL
 
-# Control port (for makers)
-nc -z 127.0.0.1 9051 && echo "Control port accessible"
+# or run maker bot
+jm-maker start
 ```
 
-### Component Requirements
+## Manual Install (from source)
 
-| Component | SOCKS Proxy | Control Port |
-|-----------|-------------|--------------|
-| Taker | Yes | No |
-| Orderbook Watcher | Yes | No |
-| Maker | Yes | Yes |
-| Directory Server | No | No (needs hidden service in torrc) |
+Use this for development or custom environments.
 
-Makers use the control port to create ephemeral hidden services dynamically.
-
-### DoS Defense for Makers
-
-For makers experiencing DoS attacks, use persistent hidden services with built-in defenses:
-
-```conf
-HiddenServiceDir /var/lib/tor/maker_hs
-HiddenServiceVersion 3
-HiddenServicePort 8765 127.0.0.1:8765
-
-# Rate limiting (Tor 0.4.2+)
-HiddenServiceEnableIntroDoSDefense 1
-HiddenServiceEnableIntroDoSRatePerSec 25
-HiddenServiceEnableIntroDoSBurstPerSec 200
-
-# PoW defense (Tor 0.4.8+ with --enable-gpl)
-HiddenServicePoWDefensesEnabled 1
-HiddenServicePoWQueueRate 250
-HiddenServicePoWQueueBurst 2500
-```
-
-| Feature | Ephemeral HS | Persistent HS |
-|---------|--------------|---------------|
-| Intro Point Rate Limiting | Not supported | Tor 0.4.2+ |
-| PoW Defense | Tor 0.4.9.2+ | Tor 0.4.8+ |
-
-### Troubleshooting Tor
-
-**"Could not connect to Tor SOCKS proxy"**
-- Verify Tor is running: `systemctl status tor`
-- Check port: `nc -z 127.0.0.1 9050`
-
-**"Could not authenticate to Tor control port"**
-- Ensure `CookieAuthentication 1` in torrc
-- Check cookie file permissions
-- Add user to `debian-tor` group: `sudo usermod -a -G debian-tor $USER`
-
-**"Control port not accessible"**
-- Verify `ControlPort` in torrc
-- Restart Tor after config changes
-
----
-
-## Next Steps
-
-### 1. Create a Wallet
+Debian/Ubuntu:
 
 ```bash
-mkdir -p ~/.joinmarket-ng/wallets
-jm-wallet generate --save --prompt-password \
-  --output ~/.joinmarket-ng/wallets/default.mnemonic
+sudo apt update
+sudo apt install -y git build-essential libffi-dev libsodium-dev pkg-config python3 python3-venv
 ```
 
-**IMPORTANT:** Write down the mnemonic - it's your only backup!
-
-### 2. Start Using JoinMarket
-
-**As a Taker** (mix your coins):
+macOS:
 
 ```bash
-jm-taker coinjoin -f ~/.joinmarket-ng/wallets/default.mnemonic --amount 1000000
+brew install libsodium pkg-config python3
 ```
 
-See [Taker](README-taker.md) for schedules and tumbler mode.
-
-**As a Maker** (earn fees):
-
-```bash
-jm-maker start -f ~/.joinmarket-ng/wallets/default.mnemonic
-```
-
-See [Maker](README-maker.md) for configuration.
-
----
-
-## Troubleshooting
-
-### Build Errors
-
-**"Could NOT find PkgConfig" / "CMake configuration failed"**
-
-Install build dependencies:
-
-```bash
-# Debian/Ubuntu
-sudo apt install -y build-essential libffi-dev libsodium-dev pkg-config
-
-# macOS
-brew install libsodium pkg-config
-```
-
-### Python Errors
-
-**"python3: command not found"**
-
-```bash
-# Debian/Ubuntu
-sudo apt install python3
-
-# macOS
-brew install python3
-```
-
-**"pip: command not found"**
-
-```bash
-sudo apt install python3-pip
-# or
-python3 -m ensurepip
-```
-
-**"externally-managed-environment" / "No module named 'venv'"**
-
-```bash
-sudo apt install python3-venv
-```
-
-### Installation Issues
-
-**Installation takes a long time**
-
-Some dependencies (like `coincurve`) compile from source. This is normal, especially on Raspberry Pi.
-
-For `jmwallet` source installs, prefer the pinned lockfiles:
-
-```bash
-cd jmwallet
-pip install -r requirements.txt
-pip install -r requirements-dev.txt  # optional, for contributors
-```
-
-This enforces dependency hashes from the lockfiles (important while `coincurve`
-is temporarily pinned to an upstream commit for Python 3.14 compatibility).
-
-**curl | bash not working**
-
-Download and run manually:
-
-```bash
-curl -o install.sh https://raw.githubusercontent.com/joinmarket-ng/joinmarket-ng/main/install.sh
-chmod +x install.sh
-./install.sh
-```
-
----
-
-## Docker Deployment
-
-For production or isolated environments:
+Install packages:
 
 ```bash
 git clone https://github.com/joinmarket-ng/joinmarket-ng.git
 cd joinmarket-ng
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
 
-# Maker
-cd maker && docker-compose up -d
-
-# Taker
-cd taker && docker-compose up -d
+python -m pip install -e ./jmcore
+python -m pip install -e ./jmwallet
+python -m pip install -e ./maker
+python -m pip install -e ./taker
 ```
 
-See component READMEs for Docker-specific configuration.
+## Tor Notes
 
----
+- Taker and orderbook watcher require Tor SOCKS (`127.0.0.1:9050`)
+- Maker additionally uses Tor control (`127.0.0.1:9051`) for ephemeral onion services
+- Directory server usually runs as a Tor hidden service in Docker (see [Directory Server](README-directory-server.md))
 
-## Uninstalling
+## Troubleshooting
 
-```bash
-# Remove virtual environment
-rm -rf ~/.joinmarket-ng/venv/
+- `jm-wallet: command not found`: run `source ~/.joinmarket-ng/activate.sh`
+- build dependency errors on Linux: install `build-essential libffi-dev libsodium-dev pkg-config`
+- Python venv issues: install `python3-venv`
+- RPC failures: verify Bitcoin Core is reachable and credentials in `config.toml` are correct
 
-# Remove data directory (CONTAINS WALLETS!)
-# rm -rf ~/.joinmarket-ng/
+## Next Docs
 
-# Remove shell integration from ~/.bashrc or ~/.zshrc
-```
-
-**Warning:** Back up your mnemonics before deleting `~/.joinmarket-ng/`!
-
----
-
-## Getting Help
-
-- **Technical docs:** [Technical Documentation](technical/index.md)
-- **Component guides:** [Maker](README-maker.md), [Taker](README-taker.md)
-- **Telegram:** https://t.me/joinmarketorg
-- **SimpleX:** https://smp12.simplex.im/g#bx_0bFdk7OnttE0jlytSd73jGjCcHy2qCrhmEzgWXTk
+- [Wallet](README-jmwallet.md)
+- [Taker](README-taker.md)
+- [Maker](README-maker.md)
+- [Technical Documentation](technical/index.md)

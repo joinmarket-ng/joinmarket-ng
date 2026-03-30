@@ -20,7 +20,7 @@ See [Installation](install.md) for complete installation instructions including:
 
 **Tor is REQUIRED for production use.** Makers need Tor for privacy and to advertise .onion addresses for direct peer connections.
 
-See [Installation - Tor Setup](install.md#tor-setup) for installation and configuration instructions.
+See [Installation - Tor Notes](install.md#tor-notes) for installation and configuration instructions.
 
 The maker bot tries to auto-detect Tor configuration. For manual setup, see [Environment Variables](#environment-variables).
 
@@ -518,9 +518,9 @@ Thresholds are configurable via environment variables if needed (see config.py).
 │ --help          Show this message and exit.                                  │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ╭─ Commands ───────────────────────────────────────────────────────────────────╮
-│ start              Start the maker bot.                                      │
-│ generate-address   Generate a new receive address.                           │
-│ config-init        Initialize the config file with default settings.         │
+│ start             Start the maker bot.                                       │
+│ generate-address  Generate a new receive address.                            │
+│ config-init       Initialize the config file with default settings.          │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ```
 

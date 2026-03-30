@@ -1,7 +1,7 @@
 ---
 title: Technical Documentation
 ---
-This document covers the JoinMarket protocol, implementation architecture, security model, and development guide.
+This section covers protocol behavior, architecture, privacy model, configuration, and development workflows.
 
 | Topic | Description |
 |-------|-------------|

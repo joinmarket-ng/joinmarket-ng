@@ -1,7 +1,5 @@
 # JoinMarket Wallet Library (jmwallet)
 
-> NOTE: For source installs, use the pinned lockfiles (`requirements.txt` / `requirements-dev.txt`) so dependency hashes are enforced, especially for `coincurve` while Python 3.14 support is pinned to an upstream commit.
-
 Modern HD wallet for JoinMarket with support for Bitcoin Core nodes and lightweight Neutrino SPV.
 
 ## Installation
@@ -48,7 +46,6 @@ jm-wallet generate --no-save --no-prompt-password
 jm-wallet import
 
 # Or pass mnemonic via environment variable (for scripting)
-# Recommended: use interactive entry on shared systems.
 MNEMONIC="your twelve or twenty-four word mnemonic phrase ..." jm-wallet import
 
 # Import a 12-word mnemonic
@@ -113,7 +110,7 @@ Lightweight SPV backend using BIP157/158 compact block filters.
 
 **Storage**: ~500 MB (vs ~900 GB for full node)
 
-**Privacy**: High when neutrino-api is run locally (default and recommended setup).
+**Privacy**: High (downloads filters, not addresses)
 
 Start Neutrino server with Docker:
 
@@ -147,7 +144,7 @@ jm-wallet info --backend neutrino
 | **Sync Speed** | ~1s | ~90s | ~5s |
 | **Storage** | ~900 GB | ~900 GB | ~500 MB |
 | **Setup** | One-time import | None | External server |
-| **Privacy** | High (own node) | High (own node) | High (local daemon) |
+| **Privacy** | High (own node) | High (own node) | High (filters) |
 | **Mempool** | ✅ Yes | ✅ Yes | ❌ No |
 
 ### 3. View Your Addresses
@@ -236,7 +233,7 @@ jm-wallet list-bonds --mnemonic-file ~/my-wallet.mnemonic
 
 ## Cold Wallet Fidelity Bonds
 
-For maximum security, fidelity bonds can use a certificate chain that keeps the bond UTXO private key completely offline in a hardware wallet. See the [cold storage fidelity bond workflow](technical/privacy.md#cold-wallet-setup) in the technical documentation for the full step-by-step guide.
+For maximum security, fidelity bonds can use a certificate chain that keeps the bond UTXO private key completely offline in a hardware wallet. See the [cold storage fidelity bond workflow](technical/privacy.md#fidelity-bonds) in the technical documentation for the full step-by-step guide.
 
 ### All Commands
 
@@ -257,38 +254,35 @@ For detailed help on any command, see the auto-generated help sections below.
 │ --help          Show this message and exit.                                  │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ╭─ Commands ───────────────────────────────────────────────────────────────────╮
-│ list-bonds                    List all fidelity bonds in the wallet.         │
-│ generate-bond-address         Generate a fidelity bond (timelocked P2WSH)    │
-│                               address.                                       │
-│ recover-bonds                 Recover fidelity bonds by scanning all 960     │
-│                               possible timelocks.                            │
-│ create-bond-address           Create a fidelity bond address from a public   │
-│                               key (cold wallet workflow).                    │
-│ generate-hot-keypair          Generate a hot wallet keypair for fidelity     │
-│                               bond certificates.                             │
-│ prepare-certificate-message   Prepare certificate message for signing with   │
-│                               hardware wallet (cold wallet support).         │
-│ import-certificate            Import a certificate signature for a fidelity  │
-│                               bond (cold wallet support).                    │
-│ spend-bond                    Generate a PSBT to spend a cold storage        │
-│                               fidelity bond after locktime expires.          │
-│ freeze                        Interactively freeze/unfreeze UTXOs to exclude │
-│                               them from coin selection.                      │
-│ history                       View CoinJoin transaction history.             │
-│ registry-list                 List all fidelity bonds in the registry.       │
-│ registry-show                 Show detailed information about a specific     │
-│                               fidelity bond.                                 │
-│ registry-sync                 Sync fidelity bond funding status from the     │
-│                               blockchain.                                    │
-│ send                          Send a simple transaction from wallet to an    │
-│                               address.                                       │
-│ import                        Import an existing BIP39 mnemonic phrase to    │
-│                               create/recover a wallet.                       │
-│ generate                      Generate a new BIP39 mnemonic phrase with      │
-│                               secure entropy.                                │
-│ info                          Display wallet information and balances by     │
-│                               mixdepth.                                      │
-│ validate                      Validate a BIP39 mnemonic phrase.              │
+│ list-bonds                   List all fidelity bonds in the wallet.          │
+│ generate-bond-address        Generate a fidelity bond (timelocked P2WSH)     │
+│                              address.                                        │
+│ recover-bonds                Recover fidelity bonds by scanning all 960      │
+│                              possible timelocks.                             │
+│ create-bond-address          Create a fidelity bond address from a public    │
+│                              key (cold wallet workflow).                     │
+│ generate-hot-keypair         Generate a hot wallet keypair for fidelity bond │
+│                              certificates.                                   │
+│ prepare-certificate-message  Prepare certificate message for signing with    │
+│                              hardware wallet (cold wallet support).          │
+│ import-certificate           Import a certificate signature for a fidelity   │
+│                              bond (cold wallet support).                     │
+│ spend-bond                   Generate a PSBT to spend a cold storage         │
+│                              fidelity bond after locktime expires.           │
+│ freeze                       Interactively freeze/unfreeze UTXOs to exclude  │
+│                              them from coin selection.                       │
+│ history                      View CoinJoin transaction history.              │
+│ registry-show                Show detailed information about a specific      │
+│                              fidelity bond.                                  │
+│ send                         Send a simple transaction from wallet to an     │
+│                              address.                                        │
+│ import                       Import an existing BIP39 mnemonic phrase to     │
+│                              create/recover a wallet.                        │
+│ generate                     Generate a new BIP39 mnemonic phrase with       │
+│                              secure entropy.                                 │
+│ info                         Display wallet information and balances by      │
+│                              mixdepth.                                       │
+│ validate                     Validate a mnemonic phrase.                     │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ```
 
@@ -303,14 +297,25 @@ For detailed help on any command, see the auto-generated help sections below.
 
  List all fidelity bonds in the wallet.
 
+ Without --mnemonic-file: shows bonds from the local registry (offline, fast).
+ With --mnemonic-file: scans the blockchain for bonds and updates the registry.
+
 ╭─ Options ────────────────────────────────────────────────────────────────────╮
-│ --mnemonic-file            -f      PATH                                      │
+│ --mnemonic-file            -f      PATH     [env var: MNEMONIC_FILE]         │
 │ --prompt-bip39-passphrase                   Prompt for BIP39 passphrase      │
 │ --network                  -n      TEXT     Bitcoin network                  │
 │ --backend                  -b      TEXT     Backend: scantxoutset |          │
 │                                             descriptor_wallet | neutrino     │
 │ --rpc-url                          TEXT     [env var: BITCOIN_RPC_URL]       │
 │ --locktime                 -L      INTEGER  Locktime(s) to scan for          │
+│ --data-dir                         PATH     Data directory (default:         │
+│                                             ~/.joinmarket-ng or              │
+│                                             $JOINMARKET_DATA_DIR)            │
+│ --funded-only                               Show only funded bonds (offline  │
+│                                             mode)                            │
+│ --active-only                               Show only active bonds (offline  │
+│                                             mode)                            │
+│ --json                     -j               Output as JSON (offline mode)    │
 │ --log-level                -l      TEXT     Log level                        │
 │ --help                                      Show this message and exit.      │
 ╰──────────────────────────────────────────────────────────────────────────────╯
@@ -328,7 +333,7 @@ For detailed help on any command, see the auto-generated help sections below.
  Generate a fidelity bond (timelocked P2WSH) address.
 
 ╭─ Options ────────────────────────────────────────────────────────────────────╮
-│ --mnemonic-file            -f      PATH                                      │
+│ --mnemonic-file            -f      PATH     [env var: MNEMONIC_FILE]         │
 │ --prompt-bip39-passphrase                   Prompt for BIP39 passphrase      │
 │ --locktime                 -L      INTEGER  Locktime as Unix timestamp       │
 │                                             [default: 0]                     │
@@ -366,7 +371,7 @@ For detailed help on any command, see the auto-generated help sections below.
  Use --max-index to scan more addresses per locktime if needed.
 
 ╭─ Options ────────────────────────────────────────────────────────────────────╮
-│ --mnemonic-file            -f      PATH                                      │
+│ --mnemonic-file            -f      PATH     [env var: MNEMONIC_FILE]         │
 │ --prompt-bip39-passphrase                   Prompt for BIP39 passphrase      │
 │ --network                  -n      TEXT     Bitcoin network                  │
 │ --backend                  -b      TEXT     Backend: scantxoutset |          │
@@ -499,16 +504,24 @@ For detailed help on any command, see the auto-generated help sections below.
 │ *    bond_address      TEXT  Bond P2WSH address [required]                   │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ╭─ Options ────────────────────────────────────────────────────────────────────╮
-│ --cert-pubkey             TEXT     Certificate public key (hex)              │
-│ --validity-periods        INTEGER  Certificate validity in 2016-block        │
-│                                    periods from now (1=~2wk, 52=~2yr)        │
-│                                    [default: 52]                             │
-│ --data-dir                PATH     Data directory (default: ~/.joinmarket-ng │
-│                                    or $JOINMARKET_DATA_DIR)                  │
-│ --mempool-api             TEXT     Mempool API URL for fetching block height │
-│                                    [default: https://mempool.space/api]      │
-│ --log-level               TEXT     [default: INFO]                           │
-│ --help                             Show this message and exit.               │
+│ --cert-pubkey               TEXT     Certificate public key (hex)            │
+│ --validity-periods          INTEGER  Certificate validity in 2016-block      │
+│                                      periods from now (1=~2wk, 52=~2yr)      │
+│                                      [default: 52]                           │
+│ --data-dir                  PATH     Data directory (default:                │
+│                                      ~/.joinmarket-ng or                     │
+│                                      $JOINMARKET_DATA_DIR)                   │
+│ --network           -n      TEXT     Bitcoin network                         │
+│ --backend           -b      TEXT     Backend: scantxoutset |                 │
+│                                      descriptor_wallet | neutrino            │
+│ --rpc-url                   TEXT     [env var: BITCOIN_RPC_URL]              │
+│ --neutrino-url              TEXT     [env var: NEUTRINO_URL]                 │
+│ --mempool-api               TEXT     Mempool API URL for fetching block      │
+│                                      height. Only used when no Bitcoin node  │
+│                                      backend is configured. Example:         │
+│                                      http://localhost:8999/api               │
+│ --log-level                 TEXT     [default: INFO]                         │
+│ --help                               Show this message and exit.             │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ```
 
@@ -531,11 +544,9 @@ For detailed help on any command, see the auto-generated help sections below.
  prepare-certificate-message. This is an ABSOLUTE period number, not a
  duration.
 
- If --cert-pubkey is not provided, it will be loaded from the bond registry
- (from a previous 'generate-hot-keypair --bond-address' call).
-
- The certificate private key is loaded from bond registry or requested via
- secure prompt if not available.
+ If --cert-pubkey and --cert-privkey are not provided, they will be loaded from
+ the bond registry (from a previous 'generate-hot-keypair --bond-address'
+ call).
 
  The signature should be the base64 output from Sparrow's message signing tool,
  using the 'Standard (Electrum)' format.
@@ -544,22 +555,29 @@ For detailed help on any command, see the auto-generated help sections below.
 │ *    address      TEXT  Bond address [required]                              │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ╭─ Options ────────────────────────────────────────────────────────────────────╮
-│ --cert-pubkey              TEXT     Certificate pubkey (hex)                 │
-│ --cert-signature           TEXT     Certificate signature (base64)           │
-│ --cert-expiry              INTEGER  Certificate expiry as ABSOLUTE period    │
-│                                     number (from                             │
-│                                     prepare-certificate-message)             │
-│                                     [default: 0]                             │
-│ --data-dir                 PATH     Data directory (default:                 │
-│                                     ~/.joinmarket-ng or                      │
-│                                     $JOINMARKET_DATA_DIR)                    │
-│ --skip-verification                 Skip signature verification (not         │
-│                                     recommended)                             │
-│ --mempool-api              TEXT     Mempool API URL for fetching block       │
-│                                     height                                   │
-│                                     [default: https://mempool.space/api]     │
-│ --log-level                TEXT     [default: INFO]                          │
-│ --help                              Show this message and exit.              │
+│ --cert-pubkey                TEXT     Certificate pubkey (hex)               │
+│ --cert-privkey               TEXT     Certificate private key (hex)          │
+│ --cert-signature             TEXT     Certificate signature (base64)         │
+│ --cert-expiry                INTEGER  Certificate expiry as ABSOLUTE period  │
+│                                       number (from                           │
+│                                       prepare-certificate-message)           │
+│                                       [default: 0]                           │
+│ --data-dir                   PATH     Data directory (default:               │
+│                                       ~/.joinmarket-ng or                    │
+│                                       $JOINMARKET_DATA_DIR)                  │
+│ --skip-verification                   Skip signature verification (not       │
+│                                       recommended)                           │
+│ --network            -n      TEXT     Bitcoin network                        │
+│ --backend            -b      TEXT     Backend: scantxoutset |                │
+│                                       descriptor_wallet | neutrino           │
+│ --rpc-url                    TEXT     [env var: BITCOIN_RPC_URL]             │
+│ --neutrino-url               TEXT     [env var: NEUTRINO_URL]                │
+│ --mempool-api                TEXT     Mempool API URL for validating cert    │
+│                                       expiry. Only used when no Bitcoin node │
+│                                       backend is configured. Example:        │
+│                                       http://localhost:8999/api              │
+│ --log-level                  TEXT     [default: INFO]                        │
+│ --help                                Show this message and exit.            │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ```
 
@@ -581,55 +599,66 @@ For detailed help on any command, see the auto-generated help sections below.
 
  REQUIREMENTS:
  - The bond must exist in the registry (created with 'create-bond-address')
- - The bond must be funded (use 'registry-sync' to update UTXO info)
+ - The bond must be funded (use 'registry-sync' to update UTXO info),
+   unless using --test-unfunded for a dry-run signer test
  - The locktime must have expired (or be close enough for your use case)
 
- SIGNING OPTIONS:
+ SIGNING:
 
- A) Hardware wallet (HWI):
- 1. Run this command with --master-fingerprint and --derivation-path
- 2. Install HWI: pip install hwi
- 3. Connect and unlock your hardware wallet
- 4. Run: python scripts/sign_bond_psbt.py <psbt_base64>
+ Most hardware wallets (Trezor, Coldcard, BitBox02, KeepKey) CANNOT sign
+ CLTV timelock P2WSH scripts -- their firmware rejects custom witness
+ scripts. Ledger and Blockstream Jade DO support arbitrary witness scripts
+ and may work via HWI (scripts/sign_bond_psbt.py).
 
- B) Mnemonic (software signing):
+ Option A - Mnemonic signing (works with any device):
  1. Run: python scripts/sign_bond_mnemonic.py <psbt_base64>
  2. Enter your BIP39 mnemonic when prompted (hidden input)
  3. Broadcast: bitcoin-cli sendrawtransaction <signed_hex>
 
- The --master-fingerprint and --derivation-path flags embed BIP32 key origin
- info into the PSBT, allowing HWI to identify which key to use on the device.
- The mnemonic script can also use BIP32 info from the PSBT, or accept a
- --derivation-path argument directly.
+ Option B - HWI signing (Ledger and Jade only):
+ 1. Install HWI: pip install -U hwi
+ 2. Connect and unlock your hardware wallet
+ 3. Run: python scripts/sign_bond_psbt.py <psbt_base64>
 
- NOTE: Sparrow Wallet cannot sign CLTV timelock scripts (P2WSH with custom
- witness scripts). Use one of the signing options above.
+ See docs/technical/privacy.md for strategies to reduce mnemonic exposure
+ (dedicated BIP39 passphrase, BIP-85 derived keys, air-gapped signing).
+
+ NOTE: Sparrow Wallet also cannot sign CLTV timelock scripts.
 
 ╭─ Arguments ──────────────────────────────────────────────────────────────────╮
 │ *    bond_address      TEXT  Bond P2WSH address to spend [required]          │
 │ *    destination       TEXT  Destination address for the funds [required]    │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ╭─ Options ────────────────────────────────────────────────────────────────────╮
-│ --fee-rate            -f      FLOAT  Fee rate in sat/vB [default: 1.0]       │
-│ --master-fingerprint  -m      TEXT   Master key fingerprint (4 bytes hex,    │
-│                                      e.g. 'aabbccdd'). Found in Sparrow:     │
-│                                      Settings -> Keystore -> Master          │
-│                                      fingerprint. Enables Sparrow and HWI to │
-│                                      identify the signing key.               │
-│ --derivation-path     -p      TEXT   BIP32 derivation path of the key used   │
-│                                      for the bond (e.g. "m/84'/0'/0'/0/0").  │
-│                                      This is the path of the address whose   │
-│                                      pubkey was used in                      │
-│                                      'create-bond-address'. Check Sparrow:   │
-│                                      Addresses tab -> right-click the        │
-│                                      address -> Copy -> Derivation Path.     │
-│ --output              -o      PATH   Save PSBT to file (default: stdout      │
-│                                      only)                                   │
-│ --data-dir                    PATH   Data directory (default:                │
-│                                      ~/.joinmarket-ng or                     │
-│                                      $JOINMARKET_DATA_DIR)                   │
-│ --log-level           -l      TEXT   [default: INFO]                         │
-│ --help                               Show this message and exit.             │
+│ --fee-rate            -f      FLOAT    Fee rate in sat/vB [default: 1.0]     │
+│ --master-fingerprint  -m      TEXT     Master key fingerprint (4 bytes hex,  │
+│                                        e.g. 'aabbccdd'). Found in Sparrow:   │
+│                                        Settings -> Keystore -> Master        │
+│                                        fingerprint. Enables Sparrow and HWI  │
+│                                        to identify the signing key.          │
+│ --derivation-path     -p      TEXT     BIP32 derivation path of the key used │
+│                                        for the bond (e.g.                    │
+│                                        "m/84'/0'/0'/0/0"). This is the path  │
+│                                        of the address whose pubkey was used  │
+│                                        in 'create-bond-address'. Check       │
+│                                        Sparrow: Addresses tab -> right-click │
+│                                        the address -> Copy -> Derivation     │
+│                                        Path.                                 │
+│ --output              -o      PATH     Save PSBT to file (default: stdout    │
+│                                        only)                                 │
+│ --test-unfunded                        Allow generating a test PSBT even     │
+│                                        when the bond is unfunded, using a    │
+│                                        synthetic UTXO for signer             │
+│                                        compatibility testing.                │
+│ --test-utxo-value             INTEGER  Synthetic UTXO value in sats when     │
+│                                        using --test-unfunded (default:       │
+│                                        100000).                              │
+│                                        [default: 100000]                     │
+│ --data-dir                    PATH     Data directory (default:              │
+│                                        ~/.joinmarket-ng or                   │
+│                                        $JOINMARKET_DATA_DIR)                 │
+│ --log-level           -l      TEXT     [default: INFO]                       │
+│ --help                                 Show this message and exit.           │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ```
 
@@ -651,6 +680,7 @@ For detailed help on any command, see the auto-generated help sections below.
 
 ╭─ Options ────────────────────────────────────────────────────────────────────╮
 │ --mnemonic-file            -f      PATH     Path to mnemonic file            │
+│                                             [env var: MNEMONIC_FILE]         │
 │ --prompt-bip39-passphrase                   Prompt for BIP39 passphrase      │
 │                                             interactively                    │
 │ --network                  -n      TEXT     Bitcoin network                  │
@@ -693,28 +723,6 @@ For detailed help on any command, see the auto-generated help sections below.
 </details>
 
 <details>
-<summary><code>jm-wallet registry-list --help</code></summary>
-
-```
-
- Usage: jm-wallet registry-list [OPTIONS]
-
- List all fidelity bonds in the registry.
-
-╭─ Options ────────────────────────────────────────────────────────────────────╮
-│ --data-dir             PATH  Data directory (default: ~/.joinmarket-ng or    │
-│                              $JOINMARKET_DATA_DIR)                           │
-│ --funded-only  -f            Show only funded bonds                          │
-│ --active-only  -a            Show only active (funded & not expired) bonds   │
-│ --json         -j            Output as JSON                                  │
-│ --log-level    -l      TEXT  [default: WARNING]                              │
-│ --help                       Show this message and exit.                     │
-╰──────────────────────────────────────────────────────────────────────────────╯
-```
-
-</details>
-
-<details>
 <summary><code>jm-wallet registry-show --help</code></summary>
 
 ```
@@ -738,33 +746,6 @@ For detailed help on any command, see the auto-generated help sections below.
 </details>
 
 <details>
-<summary><code>jm-wallet registry-sync --help</code></summary>
-
-```
-
- Usage: jm-wallet registry-sync [OPTIONS]
-
- Sync fidelity bond funding status from the blockchain.
-
-╭─ Options ────────────────────────────────────────────────────────────────────╮
-│ --mnemonic-file            -f      PATH                                      │
-│ --prompt-bip39-passphrase                Prompt for BIP39 passphrase         │
-│ --network                  -n      TEXT                                      │
-│ --backend                  -b      TEXT  Backend: scantxoutset |             │
-│                                          descriptor_wallet | neutrino        │
-│ --rpc-url                          TEXT  [env var: BITCOIN_RPC_URL]          │
-│ --neutrino-url                     TEXT  [env var: NEUTRINO_URL]             │
-│ --data-dir                         PATH  Data directory (default:            │
-│                                          ~/.joinmarket-ng or                 │
-│                                          $JOINMARKET_DATA_DIR)               │
-│ --log-level                -l      TEXT  Log level                           │
-│ --help                                   Show this message and exit.         │
-╰──────────────────────────────────────────────────────────────────────────────╯
-```
-
-</details>
-
-<details>
 <summary><code>jm-wallet send --help</code></summary>
 
 ```
@@ -779,7 +760,7 @@ For detailed help on any command, see the auto-generated help sections below.
 ╭─ Options ────────────────────────────────────────────────────────────────────╮
 │ --amount                   -a      INTEGER  Amount in sats (0 for sweep)     │
 │                                             [default: 0]                     │
-│ --mnemonic-file            -f      PATH                                      │
+│ --mnemonic-file            -f      PATH     [env var: MNEMONIC_FILE]         │
 │ --prompt-bip39-passphrase                   Prompt for BIP39 passphrase      │
 │ --mixdepth                 -m      INTEGER  Source mixdepth [default: 0]     │
 │ --fee-rate                         FLOAT    Manual fee rate in sat/vB (e.g.  │
@@ -818,7 +799,7 @@ For detailed help on any command, see the auto-generated help sections below.
  Import an existing BIP39 mnemonic phrase to create/recover a wallet.
 
  Enter your existing mnemonic interactively with autocomplete support,
- or pass it via the MNEMONIC environment variable.
+ or set the MNEMONIC environment variable.
 
  By default, saves to ~/.joinmarket-ng/wallets/default.mnemonic with password
  protection.
@@ -826,7 +807,7 @@ For detailed help on any command, see the auto-generated help sections below.
  Examples:
      jm-wallet import                          # Interactive input, 24 words
      jm-wallet import --words 12               # Interactive input, 12 words
-     MNEMONIC="word1 word2 ..." jm-wallet import  # Via environment variable
+     MNEMONIC="word1 word2 ..." jm-wallet import  # Via env var
      jm-wallet import -o my-wallet.mnemonic    # Custom output file
 
 ╭─ Options ────────────────────────────────────────────────────────────────────╮
@@ -893,6 +874,7 @@ For detailed help on any command, see the auto-generated help sections below.
 
 ╭─ Options ────────────────────────────────────────────────────────────────────╮
 │ --mnemonic-file            -f      PATH     Path to mnemonic file            │
+│                                             [env var: MNEMONIC_FILE]         │
 │ --prompt-bip39-passphrase                   Prompt for BIP39 passphrase      │
 │                                             interactively                    │
 │ --network                  -n      TEXT     Bitcoin network                  │
@@ -920,15 +902,16 @@ For detailed help on any command, see the auto-generated help sections below.
 
 ```
 
- Usage: jm-wallet validate [OPTIONS] [MNEMONIC_ARG]
+ Usage: jm-wallet validate [OPTIONS]
 
- Validate a BIP39 mnemonic phrase.
+ Validate a mnemonic phrase.
 
-╭─ Arguments ──────────────────────────────────────────────────────────────────╮
-│   mnemonic_arg      [MNEMONIC_ARG]  Mnemonic to validate                     │
-╰──────────────────────────────────────────────────────────────────────────────╯
+ Provide a mnemonic via --mnemonic-file, the MNEMONIC environment variable,
+ or enter it interactively when prompted.
+
 ╭─ Options ────────────────────────────────────────────────────────────────────╮
 │ --mnemonic-file  -f      PATH  Path to mnemonic file                         │
+│                                [env var: MNEMONIC_FILE]                      │
 │ --help                         Show this message and exit.                   │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ```

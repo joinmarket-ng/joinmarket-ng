@@ -263,7 +263,7 @@ jobs:
           # Layer digests are content-addressable hashes of the actual image layers,
           # which are identical regardless of manifest format (Docker vs OCI).
           #
-          # Verification instructions: See DOCS.md#reproducible-builds
+          # Verification instructions: see technical/development docs
 
           ## Git Commit
           commit: ${COMMIT_SHA}

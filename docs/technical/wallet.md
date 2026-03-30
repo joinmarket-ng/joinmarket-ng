@@ -1,3 +1,5 @@
+## Wallet
+
 ### HD Structure
 
 HD path: `m/84'/0'/0'/mixdepth/chain/index` (BIP84 P2WPKH)

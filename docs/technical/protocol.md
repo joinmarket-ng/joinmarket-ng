@@ -1,3 +1,5 @@
+## Protocol
+
 ### Transport Layer
 
 All messages use JSON-line envelopes terminated with `\r\n`:

@@ -4,69 +4,65 @@
 
 # JoinMarket NG
 
-JoinMarket NG (Next Generation) is a modern implementation of [JoinMarket](https://github.com/JoinMarket-Org/joinmarket-clientserver/) - decentralized Bitcoin privacy through CoinJoin.
+JoinMarket NG is a modern implementation of the JoinMarket CoinJoin protocol.
 
-## What It Is
+It is wire-compatible with the reference JoinMarket network and can run as:
 
-- **CoinJoin**: Mix your coins with others to break transaction history
-- **Decentralized**: No central coordinator - taker coordinates peer-to-peer
-- **Earn or spend**: Makers earn fees providing liquidity, takers pay fees for privacy
+- **Taker** (`jm-taker`) to initiate CoinJoin transactions
+- **Maker** (`jm-maker`) to provide liquidity and earn fees
 
-## What It Isn't
+## Start Here
 
-- Not a custodial mixer (you control your keys)
-- Not a centralized tumbler service
-- Not bulletproof - multiple rounds recommended for stronger privacy
+1. [Installation](install.md)
+2. [Wallet guide](README-jmwallet.md)
+3. [Taker guide](README-taker.md) or [Maker guide](README-maker.md)
 
 ## Quick Start
 
-**Install** (Linux/macOS):
+Install (Linux/macOS):
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/joinmarket-ng/joinmarket-ng/main/install.sh | bash
+source ~/.joinmarket-ng/activate.sh
 ```
 
-**Configure** (`~/.joinmarket-ng/config.toml`):
+Configure your backend in `~/.joinmarket-ng/config.toml`:
 
 ```toml
 [bitcoin]
-backend_type = "descriptor_wallet"  # or "neutrino" for light client
+backend_type = "descriptor_wallet"  # or "neutrino"
 rpc_url = "http://127.0.0.1:8332"
-rpc_user = "your_user"
-rpc_password = "your_password"
+rpc_user = "your_rpc_user"
+rpc_password = "your_rpc_password"
 ```
 
-**Create wallet**:
+Create a wallet and inspect addresses:
 
 ```bash
 jm-wallet generate
+jm-wallet info
 ```
 
-**Run your first CoinJoin** (as taker):
+Run a CoinJoin (taker) or start making offers (maker):
 
 ```bash
-jm-wallet info                    # Get deposit address, fund it
-jm-taker coinjoin --amount 1000000 --mixdepth 0 --destination INTERNAL
-```
-
-**Or earn fees** (as maker):
-
-```bash
+jm-taker coinjoin --amount 1000000 --destination INTERNAL
+# or
 jm-maker start
 ```
 
-## Why JoinMarket-NG?
+## Key Docs
 
-JoinMarket NG is a modern alternative to the reference implementation, fully compatible but with key improvements:
-
-**Cross-compatible**: Makers running JoinMarket-NG are automatically discovered by takers using the legacy implementation, and vice versa. The wire protocol is 100% compatible, so you can seamlessly join the existing JoinMarket network.
-
-- **No daemon** - just run commands, no background services
-- **Run maker + taker simultaneously** - no suspicious gaps in offers
-- **Light client support** - Neutrino backend, no full node required
-- **Modern codebase** - Python 3.14+, full type hints, ~100% test coverage
-
-See [JoinMarket-NG](technical/overview.md) for detailed comparison.
+- [Installation](install.md)
+- [Technical Documentation](technical/index.md)
+- [JM Core](README-jmcore.md)
+- [Wallet](README-jmwallet.md)
+- [Taker](README-taker.md)
+- [Maker](README-maker.md)
+- [Orderbook Watcher](README-orderbook-watcher.md)
+- [Directory Server](README-directory-server.md)
+- [Signatures](README-signatures.md)
+- [Scripts](README-scripts.md)
 
 ## Community
 

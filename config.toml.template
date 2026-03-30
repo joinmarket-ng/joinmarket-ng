@@ -1,6 +1,6 @@
 # JoinMarket-NG Configuration
 # Uncomment and modify settings as needed. Defaults are sensible for most users.
-# See: https://github.com/joinmarket-ng/joinmarket-ng/blob/main/DOCS.md
+# See documentation: https://joinmarket-ng.github.io/joinmarket-ng/
 
 # ============================================================================
 # Core Settings
@@ -45,7 +45,7 @@
 # ============================================================================
 
 [bitcoin]
-# Backend type: "descriptor_wallet" (default), "full_node", or "neutrino"
+# Backend type: "descriptor_wallet" (default), "scantxoutset", or "neutrino"
 # backend_type = "descriptor_wallet"
 
 # Bitcoin Core RPC settings (for all backend types)

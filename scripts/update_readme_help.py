@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""
-Script to automatically update README files with command help sections.
+"""Update CLI help sections in documentation files.
 
 This script extracts help text from CLI commands and inserts them into
-README files as collapsed details sections.
+auto-generated sections in both module READMEs and docs pages.
 """
 
 from __future__ import annotations
@@ -13,7 +12,6 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
 
 
 def get_command_help(command: list[str]) -> str:
@@ -253,32 +251,41 @@ def main() -> int:
     script_dir = Path(__file__).parent
     project_root = script_dir.parent
 
-    # Define commands and their README locations
-    commands_to_update: list[dict[str, Any]] = [
-        {
-            "command": "jm-wallet",
-            "readme": project_root / "jmwallet" / "README.md",
-        },
-        {
-            "command": "jm-maker",
-            "readme": project_root / "maker" / "README.md",
-        },
-        {
-            "command": "jm-taker",
-            "readme": project_root / "taker" / "README.md",
-        },
-        {
-            "command": "jm-directory-ctl",
-            "readme": project_root / "directory_server" / "README.md",
-        },
+    # Define commands and all docs files that should contain their help sections.
+    commands_to_update: list[tuple[str, list[Path]]] = [
+        (
+            "jm-wallet",
+            [
+                project_root / "jmwallet" / "README.md",
+                project_root / "docs" / "README-jmwallet.md",
+            ],
+        ),
+        (
+            "jm-maker",
+            [
+                project_root / "maker" / "README.md",
+                project_root / "docs" / "README-maker.md",
+            ],
+        ),
+        (
+            "jm-taker",
+            [
+                project_root / "taker" / "README.md",
+                project_root / "docs" / "README-taker.md",
+            ],
+        ),
+        (
+            "jm-directory-ctl",
+            [
+                project_root / "directory_server" / "README.md",
+                project_root / "docs" / "README-directory-server.md",
+            ],
+        ),
     ]
 
     modified = False
 
-    for item in commands_to_update:
-        command = item["command"]
-        readme = item["readme"]
-
+    for command, readmes in commands_to_update:
         print(f"Processing {command}...", file=sys.stderr)
 
         # Check if command is available
@@ -291,9 +298,10 @@ def main() -> int:
             )
             continue
 
-        # Update README
-        if update_readme_help(readme, command):
-            modified = True
+        # Update all target docs for this command.
+        for readme in readmes:
+            if update_readme_help(readme, command):
+                modified = True
 
     # Return exit code for pre-commit
     # 0 = no changes, 1 = changes made (pre-commit will fail and show diff)

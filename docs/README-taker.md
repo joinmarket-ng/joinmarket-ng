@@ -445,10 +445,10 @@ Use env vars for RPC credentials (see jmwallet README).
 │ --help          Show this message and exit.                                  │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ╭─ Commands ───────────────────────────────────────────────────────────────────╮
-│ coinjoin               Execute a single CoinJoin transaction.                │
-│ tumble                 Run a tumbler schedule of CoinJoins.                  │
-│ clear-ignored-makers   Clear the list of ignored makers.                     │
-│ config-init            Initialize the config file with default settings.     │
+│ coinjoin              Execute a single CoinJoin transaction.                 │
+│ tumble                Run a tumbler schedule of CoinJoins.                   │
+│ clear-ignored-makers  Clear the list of ignored makers.                      │
+│ config-init           Initialize the config file with default settings.      │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ```
 

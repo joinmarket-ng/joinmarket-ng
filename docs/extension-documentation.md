@@ -1,5 +1,7 @@
 # Dataclass `__init__` Extension Documentation
 
+Note: this is internal maintainer documentation for the MkDocs build pipeline and is intentionally excluded from the main navigation.
+
 ## Overview
 
 This document explains the custom Griffe extension used to hide auto-generated `__init__` methods from dataclass documentation in our mkdocstrings-based API reference.

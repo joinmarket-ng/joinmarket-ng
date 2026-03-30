@@ -1,11 +1,13 @@
-### System Overview
+# Architecture
+
+## System Overview
 
 <figure markdown="span">
   ![JoinMarket NG Architecture](../media/architecture2.svg)
   <figcaption>JoinMarket NG Architecture</figcaption>
 </figure>
 
-### Components
+## Components
 
 The implementation separates concerns into distinct packages:
 
@@ -19,7 +21,7 @@ The implementation separates concerns into distinct packages:
 | `orderbook_watcher` | Monitoring: orderbook visualization |
 | `neutrino_server` (external) | Lightweight SPV server (BIP157/158) - [github.com/m0wer/neutrino-api](https://github.com/m0wer/neutrino-api) |
 
-### Data Directory
+## Data Directory
 
 JoinMarket NG uses a dedicated data directory for persistent files shared across sessions.
 
