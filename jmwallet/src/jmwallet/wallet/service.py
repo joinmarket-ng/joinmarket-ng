@@ -49,13 +49,11 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin):
         data_dir: Path | None = None,
         passphrase: str = "",
     ):
-        self.mnemonic = mnemonic
         self.backend = backend
         self.network = network
         self.mixdepth_count = mixdepth_count
         self.gap_limit = gap_limit
         self.data_dir = data_dir
-        self.passphrase = passphrase
 
         seed = mnemonic_to_seed(mnemonic, passphrase)
         self.master_key = HDKey.from_seed(seed)
@@ -72,6 +70,7 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin):
         )
 
         self.address_cache: dict[str, tuple[int, int, int]] = {}
+        self._path_cache: dict[tuple[int, int, int], str] = {}
         self.utxo_cache: dict[int, list[UTXOInfo]] = {}
         # Track addresses that have ever had UTXOs (including spent ones)
         # This is used to correctly label addresses as "used-empty" vs "new"
@@ -98,11 +97,17 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin):
         if mixdepth >= self.mixdepth_count:
             raise ValueError(f"Mixdepth {mixdepth} exceeds maximum {self.mixdepth_count}")
 
+        path_key = (mixdepth, change, index)
+        cached = self._path_cache.get(path_key)
+        if cached is not None:
+            return cached
+
         path = f"{self.root_path}/{mixdepth}'/{change}/{index}"
         key = self.master_key.derive(path)
         address = key.get_address(self.network)
 
         self.address_cache[address] = (mixdepth, change, index)
+        self._path_cache[path_key] = address
 
         return address
 
@@ -429,6 +434,7 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin):
             from jmwallet.history import get_used_addresses
 
             cj_addresses = get_used_addresses(self.data_dir)
+            self._prune_reserved_addresses(cj_addresses | self.addresses_with_history)
             for address in cj_addresses:
                 if address in self.address_cache:
                     md, ch, idx = self.address_cache[address]
@@ -453,6 +459,25 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin):
                     max_index = idx
 
         return max_index + 1
+
+    def _prune_reserved_addresses(self, persisted_addresses: set[str]) -> None:
+        """Drop reserved addresses that are already tracked by durable history.
+
+        ``reserved_addresses`` only needs to keep addresses that were handed out in
+        this runtime but are not yet persisted in history. Once an address appears
+        in CoinJoin/chain history, keeping it in-memory is redundant.
+        """
+        if not self.reserved_addresses:
+            return
+
+        before = len(self.reserved_addresses)
+        self.reserved_addresses.difference_update(persisted_addresses)
+        removed = before - len(self.reserved_addresses)
+        if removed > 0:
+            logger.debug(
+                "Pruned %d reserved addresses now covered by persisted history",
+                removed,
+            )
 
     def reserve_addresses(self, addresses: set[str]) -> None:
         """

@@ -16,6 +16,7 @@ import pytest
 from jmwallet.history import (
     TransactionHistoryEntry,
     append_history_entry,
+    create_maker_history_entry,
     get_address_history_types,
     get_utxo_label,
 )
@@ -109,6 +110,21 @@ class TestAddressStatusDetermination:
             history_addresses={"bc1q_flagged": "flagged"},
         )
         assert status == "flagged"
+
+    def test_wallet_service_does_not_retain_mnemonic_or_passphrase(
+        self, mock_backend, test_mnemonic, test_network
+    ):
+        """WalletService should not keep mnemonic/passphrase as instance attributes."""
+        wallet = WalletService(
+            mnemonic=test_mnemonic,
+            backend=mock_backend,
+            network=test_network,
+            passphrase="secret-passphrase",
+            mixdepth_count=5,
+        )
+
+        assert "mnemonic" not in vars(wallet)
+        assert "passphrase" not in vars(wallet)
 
 
 class TestGetNextAddressIndex:
@@ -242,6 +258,21 @@ class TestGetNextAddressIndex:
         # External should return 4
         index_ext = wallet.get_next_address_index(mixdepth=0, change=0)
         assert index_ext == 4
+
+    def test_get_address_uses_cached_path(self, wallet):
+        """Repeated path lookups should use cached address without re-deriving."""
+        addr = wallet.get_address(0, 0, 0)
+
+        original_derive = wallet.master_key.derive
+
+        def fail_derive(path: str):
+            raise AssertionError(f"derive called unexpectedly for path {path}")
+
+        wallet.master_key.derive = fail_derive
+        try:
+            assert wallet.get_address(0, 0, 0) == addr
+        finally:
+            wallet.master_key.derive = original_derive
 
 
 class TestNextUnusedUnflaggedAddress:
@@ -1035,6 +1066,33 @@ class TestAddressReservation:
         # Next external should be 1
         index = wallet.get_next_address_index(mixdepth=0, change=0)
         assert index == 1
+
+    def test_reserved_addresses_pruned_when_persisted_in_history(self, wallet):
+        """Reserved addresses should be trimmed after durable history tracks them."""
+        with TemporaryDirectory() as tmpdir:
+            wallet.data_dir = Path(tmpdir)
+
+            cj_addr = wallet.get_change_address(1, 0)
+            change_addr = wallet.get_change_address(0, 0)
+            wallet.reserve_addresses({cj_addr, change_addr})
+            assert len(wallet.reserved_addresses) == 2
+
+            entry = create_maker_history_entry(
+                taker_nick="J5taker",
+                cj_amount=100000,
+                fee_received=10,
+                txfee_contribution=5,
+                cj_address=cj_addr,
+                change_address=change_addr,
+                our_utxos=[("a" * 64, 0)],
+                txid="b" * 64,
+                network="regtest",
+            )
+            append_history_entry(entry, wallet.data_dir)
+
+            # Trigger pruning through address index calculation path
+            _ = wallet.get_next_address_index(mixdepth=0, change=1)
+            assert len(wallet.reserved_addresses) == 0
 
 
 class TestIssuedReceiveAddresses:
