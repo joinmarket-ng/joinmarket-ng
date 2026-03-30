@@ -234,7 +234,12 @@ class WalletSyncMixin:
         if utxos:
             if 0 not in self.utxo_cache:
                 self.utxo_cache[0] = []
-            self.utxo_cache[0].extend(utxos)
+            existing_outpoints = {(u.txid, u.vout) for u in self.utxo_cache[0]}
+            for utxo_info in utxos:
+                outpoint = (utxo_info.txid, utxo_info.vout)
+                if outpoint not in existing_outpoints:
+                    self.utxo_cache[0].append(utxo_info)
+                    existing_outpoints.add(outpoint)
             logger.info(f"Found {len(utxos)} fidelity bond UTXOs")
 
         return utxos

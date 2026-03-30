@@ -677,6 +677,93 @@ class TestFidelityBondUTXOFiltering:
         assert sum(u.value for u in selected) == 750_000
 
 
+class TestSyncFidelityBondDeduplication:
+    """Tests that sync_fidelity_bonds does not duplicate outpoints in cache."""
+
+    @pytest.mark.asyncio
+    async def test_repeat_sync_does_not_duplicate_cached_bond(
+        self, wallet_with_timelocked: WalletService
+    ):
+        locktime = 1893456000
+        address = wallet_with_timelocked.get_fidelity_bond_address(0, locktime)
+        wallet_with_timelocked.backend.get_utxos = AsyncMock(
+            return_value=[
+                UTXOInfo(
+                    txid="d" * 64,
+                    vout=0,
+                    value=500_000,
+                    address=address,
+                    confirmations=100,
+                    scriptpubkey="0020" + "ee" * 32,
+                    path="",
+                    mixdepth=0,
+                    locktime=locktime,
+                )
+            ]
+        )
+
+        await wallet_with_timelocked.sync_fidelity_bonds([locktime])
+        await wallet_with_timelocked.sync_fidelity_bonds([locktime])
+
+        outpoints = [
+            (u.txid, u.vout)
+            for u in wallet_with_timelocked.utxo_cache.get(0, [])
+            if u.address == address
+        ]
+        assert outpoints.count(("d" * 64, 0)) == 1
+
+
+class TestFreezeUnfreezeGuard:
+    """Tests for fidelity-bond guard in bulk unfreeze path."""
+
+    def test_unfreeze_non_fidelity_bonds_skips_fidelity_bonds(self) -> None:
+        from jmwallet.cli.freeze import _unfreeze_non_fidelity_bonds
+
+        wallet = MagicMock()
+        utxos = [
+            UTXOInfo(
+                txid="e" * 64,
+                vout=0,
+                value=100_000,
+                address="bc1qnormal",
+                confirmations=10,
+                scriptpubkey="0014" + "11" * 20,
+                path="m/84'/0'/0'/0/0",
+                mixdepth=0,
+                frozen=True,
+            ),
+            UTXOInfo(
+                txid="f" * 64,
+                vout=1,
+                value=500_000,
+                address="bc1qbond",
+                confirmations=100,
+                scriptpubkey="0020" + "22" * 32,
+                path="m/84'/0'/0'/2/0",
+                mixdepth=0,
+                locktime=0,
+                frozen=True,
+            ),
+            UTXOInfo(
+                txid="a" * 64,
+                vout=2,
+                value=50_000,
+                address="bc1qunfrozen",
+                confirmations=3,
+                scriptpubkey="0014" + "33" * 20,
+                path="m/84'/0'/0'/0/1",
+                mixdepth=0,
+                frozen=False,
+            ),
+        ]
+
+        unfrozen_count, skipped_count = _unfreeze_non_fidelity_bonds(wallet, utxos)
+
+        assert unfrozen_count == 1
+        assert skipped_count == 1
+        wallet.toggle_freeze_utxo.assert_called_once_with(utxos[0].outpoint)
+
+
 # ---------------------------------------------------------------------------
 # Frozen UTXO filtering tests
 # ---------------------------------------------------------------------------
