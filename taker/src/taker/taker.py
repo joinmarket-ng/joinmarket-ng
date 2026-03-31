@@ -33,6 +33,7 @@ from jmcore.btc_script import derive_bond_address
 from jmcore.commitment_blacklist import set_blacklist_path
 from jmcore.crypto import NickIdentity
 from jmcore.encryption import CryptoSession
+from jmcore.models import is_taproot_offer_type
 from jmcore.notifications import get_notifier
 from jmcore.paths import read_nick_state
 from jmcore.protocol import JM_VERSION, parse_utxo_list
@@ -529,6 +530,12 @@ class Taker(TakerMonitoringMixin):
 
             self.state = TakerState.SELECTING_MAKERS
 
+            # Determine allowed offer types based on wallet address type
+            from jmcore.models import get_default_offer_types
+
+            allowed_types = get_default_offer_types(self.wallet.address_type)
+            logger.info(f"Filtering orderbook for offer types: {list(allowed_types)}")
+
             if self.is_sweep:
                 # SWEEP MODE: Select ALL UTXOs and calculate exact cj_amount for zero change
                 logger.info("Sweep mode: selecting UTXOs from mixdepth")
@@ -594,6 +601,7 @@ class Taker(TakerMonitoringMixin):
                         total_input_value=total_input_value,
                         my_txfee=estimated_tx_fee,
                         n=n_makers,
+                        allowed_types=allowed_types,
                     )
                 )
 
@@ -612,6 +620,7 @@ class Taker(TakerMonitoringMixin):
                 selected_offers, total_fee = self.orderbook_manager.select_makers(
                     cj_amount=self.cj_amount,
                     n=n_makers,
+                    allowed_types=allowed_types,
                 )
 
                 if len(selected_offers) < self.config.minimum_makers:
@@ -1336,11 +1345,18 @@ class Taker(TakerMonitoringMixin):
 
         # Send !fill to all makers using their designated channels
         # Format: fill <oid> <amount> <taker_pubkey> <commitment> [address_type=p2tr]
+
         for nick, session in self.maker_sessions.items():
             fill_data = f"{session.offer.oid} {self.cj_amount} {taker_pubkey} {commitment_hex}"
-            # Signal desired address type to makers (backwards compatible — old makers ignore it)
-            if self.wallet.address_type == "p2tr":
+
+            # Only explicitly signal address_type if the taker is P2TR and the offer type
+            # is NOT a dedicated Taproot type (i.e. legacy SW offer type).
+            # This honors the recommendation to support backward compatibility.
+            if self.wallet.address_type == "p2tr" and not is_taproot_offer_type(
+                session.offer.ordertype
+            ):
                 fill_data += " address_type=p2tr"
+
             channel = await self.directory_client.send_privmsg(
                 nick, "fill", fill_data, log_routing=True, force_channel=session.comm_channel
             )
