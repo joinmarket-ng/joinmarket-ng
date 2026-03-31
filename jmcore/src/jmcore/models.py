@@ -206,11 +206,37 @@ class OfferType(StrEnum):
     SW0_RELATIVE = "sw0reloffer"
     SWA_ABSOLUTE = "swabsoffer"
     SWA_RELATIVE = "swreloffer"
+    TR0_ABSOLUTE = "tr0absoffer"
+    TR0_RELATIVE = "tr0reloffer"
+    TRA_ABSOLUTE = "trabsoffer"
+    TRA_RELATIVE = "trreloffer"
 
 
 def is_absolute_offer_type(offer_type: OfferType) -> bool:
     """Check if an offer type uses absolute fees."""
-    return offer_type in (OfferType.SW0_ABSOLUTE, OfferType.SWA_ABSOLUTE)
+    return offer_type in (
+        OfferType.SW0_ABSOLUTE,
+        OfferType.SWA_ABSOLUTE,
+        OfferType.TR0_ABSOLUTE,
+        OfferType.TRA_ABSOLUTE,
+    )
+
+
+def is_taproot_offer_type(offer_type: OfferType) -> bool:
+    """Check if an offer type is for Taproot addresses."""
+    return offer_type in (
+        OfferType.TR0_ABSOLUTE,
+        OfferType.TR0_RELATIVE,
+        OfferType.TRA_ABSOLUTE,
+        OfferType.TRA_RELATIVE,
+    )
+
+
+def get_default_offer_types(address_type: str) -> set[OfferType]:
+    """Get the default offer types for a given address type."""
+    if address_type == "p2tr":
+        return {OfferType.TR0_RELATIVE, OfferType.TR0_ABSOLUTE}
+    return {OfferType.SW0_RELATIVE, OfferType.SW0_ABSOLUTE}
 
 
 def calculate_cj_fee(offer_type: OfferType, cjfee: str | int, amount: int) -> int:
@@ -265,7 +291,7 @@ class Offer(BaseModel):
     @classmethod
     def validate_cjfee(cls, v: str | int, info) -> str | int:
         ordertype = info.data.get("ordertype")
-        if ordertype in (OfferType.SW0_ABSOLUTE, OfferType.SWA_ABSOLUTE):
+        if is_absolute_offer_type(ordertype):
             return int(v)
         return str(v)
 

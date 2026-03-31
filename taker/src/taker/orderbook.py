@@ -100,6 +100,7 @@ def filter_offers(
         ignored_makers = set()
 
     if allowed_types is None:
+        # Default to all standard SW types for backward compatibility
         allowed_types = {OfferType.SW0_RELATIVE, OfferType.SW0_ABSOLUTE}
 
     if ignored_makers:
@@ -492,6 +493,7 @@ def choose_orders(
     min_nick_version: int | None = None,
     bondless_makers_allowance: float = 0.125,
     bondless_require_zero_fee: bool = True,
+    allowed_types: set[OfferType] | None = None,
 ) -> tuple[dict[str, Offer], int]:
     """
     Choose n orders from the orderbook for a CoinJoin.
@@ -506,6 +508,7 @@ def choose_orders(
         min_nick_version: Minimum required nick version (e.g., 6 for neutrino takers)
         bondless_makers_allowance: Probability of random selection vs fidelity bond weighting
         bondless_require_zero_fee: If True, bondless spots only select zero absolute fee offers
+        allowed_types: Set of allowed offer types (passed to filter_offers)
 
     Returns:
         (dict of counterparty -> offer, total_cj_fee)
@@ -528,6 +531,7 @@ def choose_orders(
         max_cj_fee=max_cj_fee,
         ignored_makers=ignored_makers,
         min_nick_version=min_nick_version,
+        allowed_types=allowed_types,
     )
 
     # Dedupe by maker (keep cheapest offer per counterparty)
@@ -570,6 +574,7 @@ def choose_sweep_orders(
     min_nick_version: int | None = None,
     bondless_makers_allowance: float = 0.125,
     bondless_require_zero_fee: bool = True,
+    allowed_types: set[OfferType] | None = None,
 ) -> tuple[dict[str, Offer], int, int]:
     """
     Choose n orders for a sweep transaction (no change).
@@ -588,6 +593,7 @@ def choose_sweep_orders(
         min_nick_version: Minimum required nick version (e.g., 6 for neutrino takers)
         bondless_makers_allowance: Probability of random selection vs fidelity bond weighting
         bondless_require_zero_fee: If True, bondless spots only select zero absolute fee offers
+        allowed_types: Set of allowed offer types (passed to filter_offers)
 
     Returns:
         (dict of counterparty -> offer, cj_amount, total_cj_fee)
@@ -617,6 +623,7 @@ def choose_sweep_orders(
         max_cj_fee=max_cj_fee,
         ignored_makers=ignored_makers,
         min_nick_version=min_nick_version,
+        allowed_types=allowed_types,
     )
 
     # Dedupe by maker
@@ -790,6 +797,7 @@ class OrderbookManager:
         honest_only: bool = False,
         min_nick_version: int | None = None,
         exclude_nicks: set[str] | None = None,
+        allowed_types: set[OfferType] | None = None,
     ) -> tuple[dict[str, Offer], int]:
         """
         Select makers for a CoinJoin.
@@ -800,6 +808,7 @@ class OrderbookManager:
             honest_only: Only select from honest makers
             min_nick_version: Minimum required nick version (e.g., 6 for neutrino takers)
             exclude_nicks: Additional nicks to exclude (e.g., current session makers)
+            allowed_types: Set of allowed offer types (passed to choose_orders)
 
         Returns:
             (selected offers dict, total fee)
@@ -824,6 +833,7 @@ class OrderbookManager:
             min_nick_version=min_nick_version,
             bondless_makers_allowance=self.bondless_makers_allowance,
             bondless_require_zero_fee=self.bondless_require_zero_fee,
+            allowed_types=allowed_types,
         )
 
     def select_makers_for_sweep(
@@ -834,6 +844,7 @@ class OrderbookManager:
         honest_only: bool = False,
         min_nick_version: int | None = None,
         exclude_nicks: set[str] | None = None,
+        allowed_types: set[OfferType] | None = None,
     ) -> tuple[dict[str, Offer], int, int]:
         """
         Select makers for a sweep CoinJoin.
@@ -845,6 +856,7 @@ class OrderbookManager:
             honest_only: Only select from honest makers
             min_nick_version: Minimum required nick version (e.g., 6 for neutrino takers)
             exclude_nicks: Additional nicks to exclude (e.g., current session makers)
+            allowed_types: Set of allowed offer types (passed to choose_sweep_orders)
 
         Returns:
             (selected offers dict, cj_amount, total fee)
@@ -870,4 +882,5 @@ class OrderbookManager:
             min_nick_version=min_nick_version,
             bondless_makers_allowance=self.bondless_makers_allowance,
             bondless_require_zero_fee=self.bondless_require_zero_fee,
+            allowed_types=allowed_types,
         )

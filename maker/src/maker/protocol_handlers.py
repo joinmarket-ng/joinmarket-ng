@@ -17,7 +17,7 @@ from jmcore.commitment_blacklist import add_commitment, check_commitment
 from jmcore.crypto import NickIdentity
 from jmcore.deduplication import MessageDeduplicator
 from jmcore.directory_client import DirectoryClient
-from jmcore.models import Offer
+from jmcore.models import Offer, is_taproot_offer_type
 from jmcore.notifications import get_notifier
 from jmcore.protocol import COMMAND_PREFIX, JM_VERSION, MessageType
 from jmcore.rate_limiter import RateLimitAction, RateLimiter
@@ -436,6 +436,21 @@ class ProtocolHandlersMixin:
                 )
                 return
 
+            # Determine address type from offer type (default behavior)
+            requested_address_type = None
+            if is_taproot_offer_type(offer.ordertype):
+                requested_address_type = "p2tr"
+
+            for part in parts[5:]:
+                if part.startswith("address_type="):
+                    requested_address_type = part.split("=", 1)[1]
+                    logger.info(
+                        f"Taker {taker_nick} requested "
+                        f"address_type={requested_address_type} "
+                        f"(offer type: {offer.ordertype.value})"
+                    )
+                    break
+
             is_valid, error = self.offer_manager.validate_offer_fill(offer, amount)
             if not is_valid:
                 logger.warning(f"Invalid fill request for offer {offer_id}: {error}")
@@ -448,6 +463,7 @@ class ProtocolHandlersMixin:
                 backend=self.backend,
                 session_timeout_sec=self.config.session_timeout_sec,
                 merge_algorithm=self.config.merge_algorithm.value,
+                requested_address_type=requested_address_type,
             )
 
             # Validate channel consistency (first message records the channel)

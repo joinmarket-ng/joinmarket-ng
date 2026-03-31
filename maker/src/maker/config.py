@@ -9,7 +9,7 @@ from enum import StrEnum
 
 from jmcore.config import TorControlConfig, WalletConfig, create_tor_control_config_from_env
 from jmcore.constants import DUST_THRESHOLD
-from jmcore.models import OfferType
+from jmcore.models import OfferType, is_absolute_offer_type
 from jmcore.tor_control import HiddenServiceDoSConfig
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -78,7 +78,12 @@ class OfferConfig(BaseModel):
     @model_validator(mode="after")
     def validate_fee_config(self) -> OfferConfig:
         """Validate fee configuration based on offer type."""
-        if self.offer_type in (OfferType.SW0_RELATIVE, OfferType.SWA_RELATIVE):
+        if self.offer_type in (
+            OfferType.SW0_RELATIVE,
+            OfferType.SWA_RELATIVE,
+            OfferType.TR0_RELATIVE,
+            OfferType.TRA_RELATIVE,
+        ):
             try:
                 cj_fee_float = float(self.cj_fee_relative)
                 if cj_fee_float <= 0:
@@ -96,7 +101,7 @@ class OfferConfig(BaseModel):
 
     def get_cjfee(self) -> str | int:
         """Get the appropriate cjfee value based on offer type."""
-        if self.offer_type in (OfferType.SW0_ABSOLUTE, OfferType.SWA_ABSOLUTE):
+        if is_absolute_offer_type(self.offer_type):
             return self.cj_fee_absolute
         return self.cj_fee_relative
 
@@ -357,7 +362,12 @@ class MakerConfig(WalletConfig):
         # (when offer_configs is set, those fields are ignored)
         if not self.offer_configs:
             # Validate cj_fee_relative for relative offer types
-            if self.offer_type in (OfferType.SW0_RELATIVE, OfferType.SWA_RELATIVE):
+            if self.offer_type in (
+                OfferType.SW0_RELATIVE,
+                OfferType.SWA_RELATIVE,
+                OfferType.TR0_RELATIVE,
+                OfferType.TRA_RELATIVE,
+            ):
                 try:
                     cj_fee_float = float(self.cj_fee_relative)
                     if cj_fee_float <= 0:

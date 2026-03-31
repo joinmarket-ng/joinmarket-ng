@@ -68,6 +68,7 @@ class WalletSyncMixin:
     utxo_cache: dict[int, list[UTXOInfo]]
     addresses_with_history: set[str]
     fidelity_bond_locktime_cache: dict[str, int]
+    address_type: str
 
     # Methods provided by the host class
     def get_address(self, mixdepth: int, change: int, index: int) -> str:
@@ -466,18 +467,31 @@ class WalletSyncMixin:
         # Map fidelity bond address -> (locktime, index)
         bond_address_to_info: dict[str, tuple[int, int]] = {}
 
+        wrapper = "tr" if self.address_type == "p2tr" else "wpkh"
         for mixdepth in range(self.mixdepth_count):
             xpub = self.get_account_xpub(mixdepth)
 
             # External (receive) addresses: .../0/*
-            desc_ext = f"wpkh({xpub}/0/*)"
+            desc_ext = f"{wrapper}({xpub}/0/*)"
             descriptors.append({"desc": desc_ext, "range": [0, scan_range - 1]})
             desc_to_path[desc_ext] = (mixdepth, 0)
 
             # Internal (change) addresses: .../1/*
-            desc_int = f"wpkh({xpub}/1/*)"
+            desc_int = f"{wrapper}({xpub}/1/*)"
             descriptors.append({"desc": desc_int, "range": [0, scan_range - 1]})
             desc_to_path[desc_int] = (mixdepth, 1)
+
+            if self.address_type == "p2tr":
+                # Also import wpkh() descriptors over the same BIP86 paths so
+                # that P2WPKH addresses generated for legacy CoinJoin takers
+                # are discoverable on rescan.
+                wpkh_ext = f"wpkh({xpub}/0/*)"
+                descriptors.append({"desc": wpkh_ext, "range": [0, scan_range - 1]})
+                desc_to_path[wpkh_ext] = (mixdepth, 0)
+
+                wpkh_int = f"wpkh({xpub}/1/*)"
+                descriptors.append({"desc": wpkh_int, "range": [0, scan_range - 1]})
+                desc_to_path[wpkh_int] = (mixdepth, 1)
 
         # Add fidelity bond addresses to the scan
         if fidelity_bond_addresses:
@@ -805,13 +819,14 @@ class WalletSyncMixin:
         """
         descriptors = []
 
+        wrapper = "tr" if self.address_type == "p2tr" else "wpkh"
         for mixdepth in range(self.mixdepth_count):
             xpub = self.get_account_xpub(mixdepth)
 
             # External (receive) addresses: .../0/*
             descriptors.append(
                 {
-                    "desc": f"wpkh({xpub}/0/*)",
+                    "desc": f"{wrapper}({xpub}/0/*)",
                     "range": [0, scan_range - 1],
                     "internal": False,
                 }
@@ -820,7 +835,7 @@ class WalletSyncMixin:
             # Internal (change) addresses: .../1/*
             descriptors.append(
                 {
-                    "desc": f"wpkh({xpub}/1/*)",
+                    "desc": f"{wrapper}({xpub}/1/*)",
                     "range": [0, scan_range - 1],
                     "internal": True,
                 }
@@ -1362,8 +1377,8 @@ class WalletSyncMixin:
             desc_base = desc
 
         # Extract the relative path [fingerprint/change/index] and pubkey
-        # Pattern: wpkh([fingerprint/change/index]pubkey)
-        match = re.search(r"wpkh\(\[[\da-f]+/(\d+)/(\d+)\]([\da-f]+)\)", desc_base, re.I)
+        # Pattern: wpkh([fingerprint/change/index]pubkey) or tr(...)
+        match = re.search(r"(?:wpkh|tr)\(\[[\da-f]+/(\d+)/(\d+)\]([\da-f]+)\)", desc_base, re.I)
         if not match:
             return None
 
@@ -1380,8 +1395,10 @@ class WalletSyncMixin:
                     derived_key = self.master_key.derive(
                         f"{self.root_path}/{mixdepth}'/{change}/{index}"
                     )
-                    derived_pubkey = derived_key.get_public_key_bytes(compressed=True).hex()
-                    if derived_pubkey == pubkey:
+                    compressed = derived_key.get_public_key_bytes(compressed=True)
+                    # P2WPKH descriptors use 33-byte compressed pubkey.
+                    # P2TR descriptors use the 32-byte x-only pubkey (no prefix byte).
+                    if compressed.hex() == pubkey or compressed[1:].hex() == pubkey:
                         return (mixdepth, change, index)
                 except Exception:
                     continue

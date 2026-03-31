@@ -156,7 +156,12 @@ class OfferManager:
                 return None
 
             # Calculate min_size based on offer type
-            if offer_cfg.offer_type in (OfferType.SW0_RELATIVE, OfferType.SWA_RELATIVE):
+            if offer_cfg.offer_type in (
+                OfferType.SW0_RELATIVE,
+                OfferType.SWA_RELATIVE,
+                OfferType.TR0_RELATIVE,
+                OfferType.TRA_RELATIVE,
+            ):
                 cjfee = offer_cfg.cj_fee_relative
 
                 # Validate cj_fee_relative to prevent division by zero

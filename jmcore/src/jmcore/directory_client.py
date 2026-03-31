@@ -804,7 +804,16 @@ class DirectoryClient:
 
         # Offer type prefixes for lightweight detection during listening.
         # Full parsing happens after collection -- this is just for counting.
-        offer_prefixes = ("sw0absoffer", "sw0reloffer", "swabsoffer", "swreloffer")
+        offer_prefixes = (
+            "sw0absoffer",
+            "sw0reloffer",
+            "swabsoffer",
+            "swreloffer",
+            "tr0absoffer",
+            "tr0reloffer",
+            "traabsoffer",
+            "trareloffer",
+        )
 
         messages: list[dict[str, Any]] = []
         offer_count = 0
@@ -1226,7 +1235,16 @@ class DirectoryClient:
             bond_data is the parsed fidelity bond dict or None.
             neutrino_compat is True if the deprecated !neutrino flag was present.
         """
-        offer_types = ["sw0absoffer", "sw0reloffer", "swabsoffer", "swreloffer"]
+        offer_types = [
+            "sw0absoffer",
+            "sw0reloffer",
+            "swabsoffer",
+            "swreloffer",
+            "tr0absoffer",
+            "tr0reloffer",
+            "traabsoffer",
+            "trareloffer",
+        ]
         for offer_type in offer_types:
             if not rest.startswith(offer_type):
                 continue

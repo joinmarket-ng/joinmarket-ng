@@ -337,6 +337,9 @@ class DescriptorWalletBackend(BlockchainBackend):
         This allows scanning recent history quickly without waiting for a full
         genesis-to-tip rescan.
 
+        If the node is pruned, ensures the timestamp is not earlier than the
+        oldest available block (prune height).
+
         Args:
             lookback_blocks: Number of blocks to look back (default: ~1 year)
 
@@ -344,11 +347,22 @@ class DescriptorWalletBackend(BlockchainBackend):
             Unix timestamp for the target block
         """
         try:
-            # Get current block height
-            current_height = await self.get_block_height()
+            # Get current block height and pruning info
+            blockchain_info = await self._rpc_call("getblockchaininfo", use_wallet=False)
+            current_height = blockchain_info.get("blocks", 0)
 
             # Calculate target height (don't go below 0)
             target_height = max(0, current_height - lookback_blocks)
+
+            # If node is pruned, ensure target_height is not below pruneheight
+            if blockchain_info.get("pruned", False):
+                prune_height = blockchain_info.get("pruneheight", 0)
+                if target_height < prune_height:
+                    logger.info(
+                        f"Pruned node detected: adjusting smart scan target height from "
+                        f"{target_height} to prune height {prune_height}"
+                    )
+                    target_height = prune_height
 
             # Get block time at target height
             block_hash = await self.get_block_hash(target_height)
@@ -1462,7 +1476,9 @@ class DescriptorWalletBackend(BlockchainBackend):
         self._descriptors_imported = False
 
 
-def generate_wallet_name(mnemonic_fingerprint: str, network: str = "mainnet") -> str:
+def generate_wallet_name(
+    mnemonic_fingerprint: str, network: str = "mainnet", address_type: str = "p2wpkh"
+) -> str:
     """
     Generate a deterministic wallet name from mnemonic fingerprint.
 
@@ -1472,11 +1488,15 @@ def generate_wallet_name(mnemonic_fingerprint: str, network: str = "mainnet") ->
     Args:
         mnemonic_fingerprint: First 8 chars of SHA256(mnemonic)
         network: Network name (mainnet, testnet, regtest)
+        address_type: Address type (p2wpkh or p2tr)
 
     Returns:
-        Wallet name like "jm_abc12345_mainnet"
+        Wallet name like "jm_abc12345_mainnet" (or "jm_abc12345_mainnet_tr")
     """
-    return f"jm_{mnemonic_fingerprint}_{network}"
+    name = f"jm_{mnemonic_fingerprint}_{network}"
+    if address_type == "p2tr":
+        name += "_tr"
+    return name
 
 
 def get_mnemonic_fingerprint(mnemonic: str, passphrase: str = "") -> str:

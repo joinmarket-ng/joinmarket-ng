@@ -53,6 +53,9 @@ def import_mnemonic(
         bool,
         typer.Option("--force", "-f", help="Overwrite existing file without confirmation"),
     ] = False,
+    address_type: Annotated[
+        str, typer.Option("--address-type", "-A", help="Address type: p2wpkh (default) or p2tr")
+    ] = "p2wpkh",
 ) -> None:
     """Import an existing BIP39 mnemonic phrase to create/recover a wallet.
 
@@ -154,6 +157,9 @@ def generate(
             help="Prompt for password interactively (default: prompt)",
         ),
     ] = True,
+    address_type: Annotated[
+        str, typer.Option("--address-type", "-A", help="Address type: p2wpkh (default) or p2tr")
+    ] = "p2wpkh",
 ) -> None:
     """Generate a new BIP39 mnemonic phrase with secure entropy.
 
@@ -266,6 +272,9 @@ def info(
         str | None,
         typer.Option("--log-level", "-l", help="Log level"),
     ] = None,
+    address_type: Annotated[
+        str, typer.Option("--address-type", "-a", help="Address type: p2wpkh (default) or p2tr")
+    ] = "p2wpkh",
 ) -> None:
     """Display wallet information and balances by mixdepth."""
     settings = setup_cli(log_level)
@@ -301,6 +310,7 @@ def info(
             resolved_bip39_passphrase,
             extended=extended,
             gap_limit=gap,
+            address_type=address_type,
         )
     )
 
@@ -311,6 +321,7 @@ async def _show_wallet_info(
     bip39_passphrase: str = "",
     extended: bool = False,
     gap_limit: int = 6,
+    address_type: str = "p2wpkh",
 ) -> None:
     """Show wallet info implementation."""
     from jmwallet.backends.bitcoin_core import BitcoinCoreBackend
@@ -360,7 +371,7 @@ async def _show_wallet_info(
         )
 
         fingerprint = get_mnemonic_fingerprint(mnemonic, bip39_passphrase or "")
-        wallet_name = generate_wallet_name(fingerprint, network)
+        wallet_name = generate_wallet_name(fingerprint, network, address_type)
         backend = DescriptorWalletBackend(
             rpc_url=backend_settings.rpc_url,
             rpc_user=backend_settings.rpc_user,
@@ -384,6 +395,7 @@ async def _show_wallet_info(
         mixdepth_count=5,
         passphrase=bip39_passphrase,
         data_dir=data_dir,
+        address_type=address_type,
     )
 
     try:
@@ -556,6 +568,8 @@ def _show_extended_wallet_info(
         if entry.change_address:
             pending_addresses.add(entry.change_address)
 
+    bip_purpose = "86" if wallet.address_type == "p2tr" else "84"
+
     for md in range(wallet.mixdepth_count):
         # Get account zpub (BIP84 format for native segwit)
         zpub = wallet.get_account_zpub(md)
@@ -567,7 +581,7 @@ def _show_extended_wallet_info(
             md, 0, gap_limit, used_addresses, history_addresses
         )
         # Get the external branch zpub path
-        ext_path = f"m/84'/{0 if wallet.network == 'mainnet' else 1}'/{md}'/0"
+        ext_path = f"m/{bip_purpose}'/{0 if wallet.network == 'mainnet' else 1}'/{md}'/0"
         print(f"external addresses\t{ext_path}\t{zpub}")
 
         ext_balance = 0
@@ -591,7 +605,7 @@ def _show_extended_wallet_info(
         int_addresses = wallet.get_address_info_for_mixdepth(
             md, 1, gap_limit, used_addresses, history_addresses
         )
-        int_path = f"m/84'/{0 if wallet.network == 'mainnet' else 1}'/{md}'/1"
+        int_path = f"m/{bip_purpose}'/{0 if wallet.network == 'mainnet' else 1}'/{md}'/1"
         print(f"internal addresses\t{int_path}")
 
         int_balance = 0

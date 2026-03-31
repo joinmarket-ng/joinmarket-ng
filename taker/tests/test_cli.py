@@ -63,6 +63,7 @@ class TestBuildTakerConfig:
         settings.wallet.background_full_rescan = False
         settings.wallet.scan_lookback_blocks = 1000
         settings.wallet.default_fee_block_target = 3  # Has a default value
+        settings.wallet.address_type = "p2wpkh"
 
         return settings
 

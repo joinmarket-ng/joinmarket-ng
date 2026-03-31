@@ -107,6 +107,14 @@ class UTXOInfo:
             return False
         return self.scriptpubkey.startswith("0014")
 
+    @property
+    def is_p2tr(self) -> bool:
+        """Check if this UTXO is P2TR (Taproot) based on scriptpubkey."""
+        # P2TR scriptpubkey: OP_1 (0x51) + PUSH32 (0x20) + 32-byte key = 34 bytes (68 hex chars)
+        if len(self.scriptpubkey) != 68:
+            return False
+        return self.scriptpubkey.startswith("5120")
+
 
 @dataclass
 class CoinSelection:

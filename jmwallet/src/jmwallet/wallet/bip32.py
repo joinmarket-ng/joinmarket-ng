@@ -154,6 +154,17 @@ class HDKey:
         pubkey_hex = self.get_public_key_bytes(compressed=True).hex()
         return pubkey_to_p2wpkh_address(pubkey_hex, network)
 
+    def get_p2tr_address(self, network: str = "mainnet") -> str:
+        """Get P2TR (Taproot) address for this key"""
+        from jmcore.bitcoin import pubkey_to_p2tr_address, taproot_tweak_pubkey
+
+        pubkey_bytes = self.get_public_key_bytes(compressed=True)
+        x_only_pubkey = pubkey_bytes[1:]
+
+        _, tweaked_pubkey = taproot_tweak_pubkey(x_only_pubkey)
+
+        return pubkey_to_p2tr_address(tweaked_pubkey, network)
+
     def sign(self, message: bytes) -> bytes:
         """Sign a message with this key (uses SHA256 hashing)."""
         return self._private_key.sign(message)
