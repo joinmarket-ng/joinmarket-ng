@@ -191,3 +191,44 @@ class TestGlobalBlacklist:
         new_commitment = "j" * 64
         assert commitment_blacklist.check_and_add_commitment(new_commitment) is True
         assert commitment_blacklist.check_and_add_commitment(new_commitment) is False
+
+
+class TestCommitmentBlacklistDataDir:
+    """Tests for CommitmentBlacklist with data_dir parameter."""
+
+    def test_init_with_data_dir(self, tmp_path: Path) -> None:
+        """Test creating blacklist with data_dir instead of explicit path."""
+        blacklist = CommitmentBlacklist(blacklist_path=None, data_dir=tmp_path)
+        # Should use cmtdata/commitmentlist under data_dir
+        assert "cmtdata" in str(blacklist.blacklist_path)
+        assert blacklist.blacklist_path.name == "commitmentlist"
+
+        # Should be functional
+        blacklist.add("a" * 64)
+        assert "a" * 64 in blacklist
+
+    def test_check_and_add_empty_string(self, tmp_path: Path) -> None:
+        """check_and_add with empty string should return False."""
+        blacklist = CommitmentBlacklist(tmp_path / "commitmentlist")
+        result = blacklist.check_and_add("")
+        assert result is False
+        assert len(blacklist) == 0
+
+    def test_check_and_add_whitespace_only(self, tmp_path: Path) -> None:
+        """check_and_add with whitespace-only should return False."""
+        blacklist = CommitmentBlacklist(tmp_path / "commitmentlist")
+        result = blacklist.check_and_add("   ")
+        assert result is False
+        assert len(blacklist) == 0
+
+    def test_get_blacklist_with_data_dir(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Test get_blacklist with data_dir parameter."""
+        from jmcore import commitment_blacklist
+
+        monkeypatch.setattr(commitment_blacklist, "_global_blacklist", None)
+
+        bl = commitment_blacklist.get_blacklist(data_dir=tmp_path)
+        assert bl is not None
+        assert "cmtdata" in str(bl.blacklist_path)

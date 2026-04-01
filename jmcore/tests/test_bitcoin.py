@@ -14,14 +14,34 @@ from jmcore.bitcoin import (
     PSBTInput,
     TxInput,
     TxOutput,
+    address_to_scriptpubkey,
+    btc_to_sats,
+    calculate_relative_fee,
+    calculate_sweep_amount,
     calculate_tx_vsize,
+    create_p2wpkh_script_code,
     create_psbt,
     decode_varint,
+    encode_varint,
     estimate_vsize,
+    format_amount,
+    get_address_type,
+    get_txid,
+    hash160,
+    hash256,
     parse_derivation_path,
     parse_transaction,
     psbt_to_base64,
+    pubkey_to_p2wpkh_address,
+    pubkey_to_p2wpkh_script,
+    sats_to_btc,
+    script_to_p2wsh_address,
     script_to_p2wsh_scriptpubkey,
+    scriptpubkey_to_address,
+    serialize_input,
+    serialize_outpoint,
+    serialize_transaction,
+    validate_satoshi_amount,
 )
 
 
@@ -711,3 +731,632 @@ class TestPSBTWithBIP32Derivation:
         decoded = base64.b64decode(b64)
         assert decoded == raw
         assert decoded.startswith(PSBT_MAGIC)
+
+
+# =============================================================================
+# Amount utility tests
+# =============================================================================
+
+
+class TestBtcToSats:
+    """Tests for btc_to_sats and sats_to_btc."""
+
+    def test_btc_to_sats_one_btc(self) -> None:
+        assert btc_to_sats(1.0) == 100_000_000
+
+    def test_btc_to_sats_fractional(self) -> None:
+        """0.0003 BTC should give 30000 sats, not 29999 due to float precision."""
+        assert btc_to_sats(0.0003) == 30_000
+
+    def test_sats_to_btc(self) -> None:
+        assert sats_to_btc(100_000_000) == 1.0
+
+    def test_sats_to_btc_zero(self) -> None:
+        assert sats_to_btc(0) == 0.0
+
+
+class TestFormatAmount:
+    """Tests for format_amount."""
+
+    def test_format_with_unit(self) -> None:
+        result = format_amount(1_000_000)
+        assert "1,000,000 sats" in result
+        assert "0.01000000 BTC" in result
+
+    def test_format_without_unit(self) -> None:
+        result = format_amount(1_000_000, include_unit=False)
+        assert result == "1,000,000"
+        assert "sats" not in result
+        assert "BTC" not in result
+
+    def test_format_zero(self) -> None:
+        result = format_amount(0, include_unit=False)
+        assert result == "0"
+
+
+class TestValidateSatoshiAmount:
+    """Tests for validate_satoshi_amount."""
+
+    def test_valid_amount(self) -> None:
+        validate_satoshi_amount(0)
+        validate_satoshi_amount(100_000_000)
+
+    def test_non_integer_raises(self) -> None:
+        with pytest.raises(TypeError, match="Amount must be an integer"):
+            validate_satoshi_amount(1.5)  # type: ignore[arg-type]
+
+    def test_negative_raises(self) -> None:
+        with pytest.raises(ValueError, match="Amount cannot be negative"):
+            validate_satoshi_amount(-1)
+
+
+class TestCalculateRelativeFee:
+    """Tests for calculate_relative_fee."""
+
+    def test_decimal_fee_rate(self) -> None:
+        assert calculate_relative_fee(100_000_000, "0.001") == 100_000
+
+    def test_integer_fee_rate_string(self) -> None:
+        """Integer fee_rate like '0' (no decimal point)."""
+        assert calculate_relative_fee(100_000, "0") == 0
+
+    def test_integer_fee_rate_multiplier(self) -> None:
+        """Integer fee_rate '1' means multiply by 1."""
+        assert calculate_relative_fee(100_000, "1") == 100_000
+
+    def test_invalid_integer_fee_rate_raises(self) -> None:
+        with pytest.raises(ValueError, match="Fee rate must be decimal string or integer"):
+            calculate_relative_fee(100_000, "abc")
+
+
+class TestCalculateSweepAmount:
+    """Tests for calculate_sweep_amount."""
+
+    def test_empty_fees_returns_full_amount(self) -> None:
+        assert calculate_sweep_amount(1_000_000, []) == 1_000_000
+
+    def test_single_relative_fee(self) -> None:
+        # available / (1 + 0.001) = 1000000 / 1.001 = 999000 (floor)
+        result = calculate_sweep_amount(1_000_000, ["0.001"])
+        assert result == 999000
+
+    def test_integer_fee_rates(self) -> None:
+        """Test sweep with integer fee rate strings (no decimal point)."""
+        # With fee_rate "1", total = available / (1 + 1) = 500000
+        result = calculate_sweep_amount(1_000_000, ["1"])
+        assert result == 500_000
+
+    def test_mixed_decimal_and_integer(self) -> None:
+        """Test sweep with a mix of fees including integer fee rates."""
+        result = calculate_sweep_amount(1_000_000, ["0.001", "0.002"])
+        # available / (1 + 0.001 + 0.002) = 1000000 / 1.003 = 997008 (floor)
+        assert result == 997008
+
+
+# =============================================================================
+# Address / scriptPubKey tests
+# =============================================================================
+
+
+class TestPubkeyToP2wpkhAddress:
+    """Tests for pubkey_to_p2wpkh_address."""
+
+    def test_invalid_pubkey_length(self) -> None:
+        """Non-33-byte pubkey should raise ValueError."""
+        with pytest.raises(ValueError, match="Invalid compressed pubkey length"):
+            pubkey_to_p2wpkh_address(b"\x02" + b"\x00" * 31)  # 32 bytes
+
+    def test_hex_string_input(self) -> None:
+        """Hex string pubkey input should work."""
+        pubkey_hex = "02" + "aa" * 32
+        addr = pubkey_to_p2wpkh_address(pubkey_hex, "regtest")
+        assert addr.startswith("bcrt1q")
+
+    def test_mainnet_address(self) -> None:
+        pubkey = b"\x02" + b"\xbb" * 32
+        addr = pubkey_to_p2wpkh_address(pubkey, "mainnet")
+        assert addr.startswith("bc1q")
+
+
+class TestAddressToScriptpubkey:
+    """Tests for address_to_scriptpubkey."""
+
+    def test_p2wpkh_address(self) -> None:
+        """Roundtrip: pubkey -> address -> scriptpubkey."""
+        pubkey = b"\x02" + b"\xcc" * 32
+        addr = pubkey_to_p2wpkh_address(pubkey, "regtest")
+        spk = address_to_scriptpubkey(addr)
+        assert spk[0] == 0x00 and spk[1] == 0x14
+        assert len(spk) == 22
+
+    def test_p2tr_address(self) -> None:
+        """P2TR address should produce OP_1 <32-byte> scriptpubkey."""
+        import bech32 as bech32_lib
+
+        # Create a synthetic P2TR address (witness version 1, 32-byte program)
+        pubkey_x = b"\xdd" * 32
+        addr = bech32_lib.encode("bcrt", 1, pubkey_x)
+        assert addr is not None
+
+        spk = address_to_scriptpubkey(addr)
+        assert spk[0] == 0x51  # OP_1
+        assert spk[1] == 0x20  # PUSH32
+        assert spk[2:] == pubkey_x
+
+    def test_p2pkh_address(self) -> None:
+        """P2PKH (legacy) address produces correct scriptpubkey."""
+        import base58 as b58
+
+        payload = bytes([0x6F]) + b"\xee" * 20  # testnet P2PKH
+        addr = b58.b58encode_check(payload).decode("ascii")
+        spk = address_to_scriptpubkey(addr)
+        # P2PKH: OP_DUP OP_HASH160 PUSH20 <hash> OP_EQUALVERIFY OP_CHECKSIG
+        assert spk[0] == 0x76 and spk[1] == 0xA9 and spk[2] == 0x14
+        assert spk[-2] == 0x88 and spk[-1] == 0xAC
+        assert len(spk) == 25
+
+    def test_p2sh_address(self) -> None:
+        """P2SH address produces correct scriptpubkey."""
+        import base58 as b58
+
+        payload = bytes([0xC4]) + b"\xff" * 20  # testnet P2SH
+        addr = b58.b58encode_check(payload).decode("ascii")
+        spk = address_to_scriptpubkey(addr)
+        # P2SH: OP_HASH160 PUSH20 <hash> OP_EQUAL
+        assert spk[0] == 0xA9 and spk[1] == 0x14
+        assert spk[-1] == 0x87
+        assert len(spk) == 23
+
+
+class TestScriptpubkeyToAddress:
+    """Tests for scriptpubkey_to_address."""
+
+    def test_p2wpkh_roundtrip(self) -> None:
+        pubkey = b"\x02" + b"\xaa" * 32
+        addr = pubkey_to_p2wpkh_address(pubkey, "regtest")
+        spk = address_to_scriptpubkey(addr)
+        recovered = scriptpubkey_to_address(spk, "regtest")
+        assert recovered == addr
+
+    def test_p2wsh_scriptpubkey(self) -> None:
+        """P2WSH scriptpubkey -> address -> scriptpubkey roundtrip."""
+        script_hash = b"\xab" * 32
+        spk = bytes([0x00, 0x20]) + script_hash
+        addr = scriptpubkey_to_address(spk, "regtest")
+        assert addr.startswith("bcrt1q")
+        recovered_spk = address_to_scriptpubkey(addr)
+        assert recovered_spk == spk
+
+    def test_p2tr_scriptpubkey(self) -> None:
+        """P2TR scriptpubkey -> address."""
+        x_only_key = b"\xcd" * 32
+        spk = bytes([0x51, 0x20]) + x_only_key
+        addr = scriptpubkey_to_address(spk, "regtest")
+        assert addr.startswith("bcrt1p")
+
+    def test_p2pkh_scriptpubkey(self) -> None:
+        """P2PKH scriptpubkey -> address."""
+        pkh = b"\xee" * 20
+        spk = bytes([0x76, 0xA9, 0x14]) + pkh + bytes([0x88, 0xAC])
+        addr = scriptpubkey_to_address(spk, "mainnet")
+        assert addr.startswith("1")
+
+    def test_p2sh_scriptpubkey(self) -> None:
+        """P2SH scriptpubkey -> address."""
+        sh = b"\xff" * 20
+        spk = bytes([0xA9, 0x14]) + sh + bytes([0x87])
+        addr = scriptpubkey_to_address(spk, "mainnet")
+        assert addr.startswith("3")
+
+    def test_unsupported_scriptpubkey_raises(self) -> None:
+        with pytest.raises(ValueError, match="Unsupported scriptPubKey"):
+            scriptpubkey_to_address(bytes([0xDE, 0xAD]), "mainnet")
+
+
+# =============================================================================
+# TxInput / TxOutput dict-like access tests
+# =============================================================================
+
+
+class TestTxInputDictAccess:
+    """Tests for TxInput.__getitem__ and .get() backward compatibility."""
+
+    def test_getitem_txid(self) -> None:
+        inp = TxInput.from_hex("aa" * 32, 0, value=50_000)
+        assert inp["txid"] == "aa" * 32
+
+    def test_getitem_vout(self) -> None:
+        inp = TxInput.from_hex("bb" * 32, 3)
+        assert inp["vout"] == 3
+
+    def test_getitem_scriptsig(self) -> None:
+        inp = TxInput.from_hex("cc" * 32, 0, scriptsig="deadbeef")
+        assert inp["scriptsig"] == "deadbeef"
+
+    def test_getitem_sequence(self) -> None:
+        inp = TxInput.from_hex("dd" * 32, 0, sequence=0xFFFFFFFE)
+        assert inp["sequence"] == 0xFFFFFFFE
+
+    def test_getitem_value(self) -> None:
+        inp = TxInput.from_hex("ee" * 32, 0, value=12345)
+        assert inp["value"] == 12345
+
+    def test_getitem_scriptpubkey(self) -> None:
+        inp = TxInput.from_hex("ff" * 32, 0, scriptpubkey="0014" + "ab" * 20)
+        assert inp["scriptpubkey"] == "0014" + "ab" * 20
+
+    def test_getitem_unknown_raises(self) -> None:
+        inp = TxInput.from_hex("aa" * 32, 0)
+        with pytest.raises(KeyError):
+            inp["nonexistent"]
+
+    def test_get_with_default(self) -> None:
+        inp = TxInput.from_hex("aa" * 32, 0)
+        assert inp.get("nonexistent", "fallback") == "fallback"
+
+    def test_get_existing_key(self) -> None:
+        inp = TxInput.from_hex("aa" * 32, 5)
+        assert inp.get("vout") == 5
+
+    def test_scriptsig_hex_property(self) -> None:
+        inp = TxInput.from_hex("aa" * 32, 0, scriptsig="cafe")
+        assert inp.scriptsig_hex == "cafe"
+
+
+class TestTxOutputDictAccess:
+    """Tests for TxOutput.__getitem__, .get(), and .scriptpubkey."""
+
+    def test_getitem_value(self) -> None:
+        out = TxOutput(value=50_000, script=bytes([0x00, 0x14]) + b"\x00" * 20)
+        assert out["value"] == 50_000
+
+    def test_getitem_scriptpubkey(self) -> None:
+        script = bytes([0x00, 0x14]) + b"\xab" * 20
+        out = TxOutput(value=50_000, script=script)
+        assert out["scriptpubkey"] == script.hex()
+
+    def test_getitem_unknown_raises(self) -> None:
+        out = TxOutput(value=1, script=b"\x00")
+        with pytest.raises(KeyError):
+            out["nonexistent"]
+
+    def test_get_with_default(self) -> None:
+        out = TxOutput(value=1, script=b"\x00")
+        assert out.get("nonexistent", 42) == 42
+
+    def test_get_existing_key(self) -> None:
+        out = TxOutput(value=99, script=b"\x00")
+        assert out.get("value") == 99
+
+    def test_scriptpubkey_property(self) -> None:
+        script = bytes([0x00, 0x14]) + b"\xcc" * 20
+        out = TxOutput(value=1, script=script)
+        assert out.scriptpubkey == script.hex()
+
+    def test_address_method(self) -> None:
+        """TxOutput.address() should resolve to bech32 address."""
+        script = bytes([0x00, 0x14]) + b"\xdd" * 20
+        out = TxOutput(value=1, script=script)
+        addr = out.address("regtest")
+        assert addr.startswith("bcrt1q")
+
+
+# =============================================================================
+# Serialization tests
+# =============================================================================
+
+
+class TestSerializeInputWithScriptsig:
+    """Test serialize_input with a non-empty scriptsig."""
+
+    def test_serialize_with_scriptsig(self) -> None:
+        inp = TxInput.from_hex("aa" * 32, 0, scriptsig="deadbeef")
+        serialized = serialize_input(inp, include_scriptsig=True)
+        # Should contain the scriptsig bytes
+        assert bytes.fromhex("deadbeef") in serialized
+
+    def test_serialize_without_scriptsig(self) -> None:
+        inp = TxInput.from_hex("aa" * 32, 0, scriptsig="deadbeef")
+        serialized = serialize_input(inp, include_scriptsig=False)
+        # Should have 0x00 for empty scriptsig
+        # 32 bytes txid_le + 4 bytes vout + 1 byte (0x00) + 4 bytes sequence = 41 bytes
+        assert len(serialized) == 41
+
+
+class TestGetTxid:
+    """Tests for get_txid."""
+
+    def test_txid_from_serialized_tx(self) -> None:
+        """Build a tx, serialize, compute txid, verify it's deterministic."""
+        inp = TxInput.from_hex("aa" * 32, 0)
+        out = TxOutput(value=50_000, script=bytes([0x00, 0x14]) + b"\x00" * 20)
+
+        tx_bytes = serialize_transaction(
+            version=2,
+            inputs=[inp],
+            outputs=[out],
+            locktime=0,
+        )
+        tx_hex = tx_bytes.hex()
+        txid = get_txid(tx_hex)
+
+        # Should be a 64-char hex string
+        assert len(txid) == 64
+        assert all(c in "0123456789abcdef" for c in txid)
+
+        # Computing again should be deterministic
+        assert get_txid(tx_hex) == txid
+
+    def test_txid_differs_for_different_txs(self) -> None:
+        """Different transactions should have different txids."""
+        inp1 = TxInput.from_hex("aa" * 32, 0)
+        inp2 = TxInput.from_hex("bb" * 32, 0)
+        out = TxOutput(value=50_000, script=bytes([0x00, 0x14]) + b"\x00" * 20)
+
+        tx1 = serialize_transaction(2, [inp1], [out], 0).hex()
+        tx2 = serialize_transaction(2, [inp2], [out], 0).hex()
+
+        assert get_txid(tx1) != get_txid(tx2)
+
+
+# =============================================================================
+# Script code tests
+# =============================================================================
+
+
+class TestCreateP2wpkhScriptCode:
+    """Tests for create_p2wpkh_script_code."""
+
+    def test_from_bytes(self) -> None:
+        pubkey = b"\x02" + b"\xaa" * 32
+        sc = create_p2wpkh_script_code(pubkey)
+        assert sc[:3] == b"\x76\xa9\x14"
+        assert sc[-2:] == b"\x88\xac"
+        assert len(sc) == 25
+
+    def test_from_hex(self) -> None:
+        """Hex string input should produce same result as bytes."""
+        pubkey_bytes = b"\x02" + b"\xbb" * 32
+        pubkey_hex = pubkey_bytes.hex()
+        assert create_p2wpkh_script_code(pubkey_hex) == create_p2wpkh_script_code(pubkey_bytes)
+
+
+# =============================================================================
+# get_address_type tests
+# =============================================================================
+
+
+class TestGetAddressType:
+    """Tests for get_address_type."""
+
+    def test_p2wpkh(self) -> None:
+        pubkey = b"\x02" + b"\xaa" * 32
+        addr = pubkey_to_p2wpkh_address(pubkey, "regtest")
+        assert get_address_type(addr) == "p2wpkh"
+
+    def test_p2wsh(self) -> None:
+        """P2WSH address should be detected."""
+        import bech32 as bech32_lib
+
+        script_hash = b"\xab" * 32
+        addr = bech32_lib.encode("bcrt", 0, script_hash)
+        assert addr is not None
+        assert get_address_type(addr) == "p2wsh"
+
+    def test_p2tr(self) -> None:
+        """P2TR address should be detected."""
+        import bech32 as bech32_lib
+
+        x_only = b"\xcd" * 32
+        addr = bech32_lib.encode("bcrt", 1, x_only)
+        assert addr is not None
+        assert get_address_type(addr) == "p2tr"
+
+    def test_p2pkh(self) -> None:
+        import base58 as b58
+
+        payload = bytes([0x00]) + b"\xee" * 20
+        addr = b58.b58encode_check(payload).decode("ascii")
+        assert get_address_type(addr) == "p2pkh"
+
+    def test_p2sh(self) -> None:
+        import base58 as b58
+
+        payload = bytes([0x05]) + b"\xff" * 20
+        addr = b58.b58encode_check(payload).decode("ascii")
+        assert get_address_type(addr) == "p2sh"
+
+    def test_invalid_address_raises(self) -> None:
+        with pytest.raises(ValueError, match="Unknown address type"):
+            get_address_type("not_a_valid_address")
+
+
+# =============================================================================
+# Hash function tests
+# =============================================================================
+
+
+class TestHashFunctions:
+    """Tests for hash160, hash256."""
+
+    def test_hash160_length(self) -> None:
+        result = hash160(b"test")
+        assert len(result) == 20
+
+    def test_hash256_length(self) -> None:
+        result = hash256(b"test")
+        assert len(result) == 32
+
+    def test_hash256_deterministic(self) -> None:
+        assert hash256(b"hello") == hash256(b"hello")
+
+    def test_hash256_different_inputs(self) -> None:
+        assert hash256(b"hello") != hash256(b"world")
+
+
+class TestParseDerivationPathEmpty:
+    """Test edge case: empty component in derivation path."""
+
+    def test_trailing_slash(self) -> None:
+        """m/84'/0'/ has trailing slash -> empty component should be skipped."""
+        result = parse_derivation_path("m/84'/0'/")
+        assert result == [84 | 0x80000000, 0 | 0x80000000]
+
+
+# =============================================================================
+# Varint encode/decode all branches
+# =============================================================================
+
+
+class TestVarintAllBranches:
+    """Tests for encode_varint/decode_varint covering all size branches."""
+
+    def test_encode_decode_small(self) -> None:
+        """Values < 0xFD use 1-byte encoding."""
+        for val in [0, 1, 127, 252]:
+            encoded = encode_varint(val)
+            assert len(encoded) == 1
+            decoded, offset = decode_varint(encoded)
+            assert decoded == val
+            assert offset == 1
+
+    def test_encode_decode_2byte(self) -> None:
+        """Values 0xFD..0xFFFF use 3-byte encoding (0xFD prefix)."""
+        for val in [0xFD, 0xFE, 0x1234, 0xFFFF]:
+            encoded = encode_varint(val)
+            assert len(encoded) == 3
+            assert encoded[0] == 0xFD
+            decoded, offset = decode_varint(encoded)
+            assert decoded == val
+            assert offset == 3
+
+    def test_encode_decode_4byte(self) -> None:
+        """Values 0x10000..0xFFFFFFFF use 5-byte encoding (0xFE prefix)."""
+        for val in [0x10000, 0x12345678, 0xFFFFFFFF]:
+            encoded = encode_varint(val)
+            assert len(encoded) == 5
+            assert encoded[0] == 0xFE
+            decoded, offset = decode_varint(encoded)
+            assert decoded == val
+            assert offset == 5
+
+    def test_encode_decode_8byte(self) -> None:
+        """Values > 0xFFFFFFFF use 9-byte encoding (0xFF prefix)."""
+        for val in [0x100000000, 0x123456789ABCDEF0]:
+            encoded = encode_varint(val)
+            assert len(encoded) == 9
+            assert encoded[0] == 0xFF
+            decoded, offset = decode_varint(encoded)
+            assert decoded == val
+            assert offset == 9
+
+
+# =============================================================================
+# More address / script coverage
+# =============================================================================
+
+
+class TestPubkeyToP2wpkhScript:
+    """Tests for pubkey_to_p2wpkh_script."""
+
+    def test_bytes_input(self) -> None:
+        pubkey = b"\x02" + b"\xaa" * 32
+        script = pubkey_to_p2wpkh_script(pubkey)
+        assert script[0] == 0x00 and script[1] == 0x14
+        assert len(script) == 22
+
+    def test_hex_input(self) -> None:
+        pubkey_hex = "02" + "bb" * 32
+        script = pubkey_to_p2wpkh_script(pubkey_hex)
+        assert script[0] == 0x00 and script[1] == 0x14
+        assert len(script) == 22
+
+
+class TestScriptToP2wshAddress:
+    """Tests for script_to_p2wsh_address."""
+
+    def test_basic(self) -> None:
+        script = b"\x01\x02\x03"
+        addr = script_to_p2wsh_address(script, "regtest")
+        assert addr.startswith("bcrt1q")
+
+    def test_mainnet(self) -> None:
+        script = b"\x04\x05\x06"
+        addr = script_to_p2wsh_address(script, "mainnet")
+        assert addr.startswith("bc1q")
+
+
+class TestSerializeOutpoint:
+    """Tests for serialize_outpoint."""
+
+    def test_basic(self) -> None:
+        result = serialize_outpoint("aa" * 32, 0)
+        assert len(result) == 36
+        # Last 4 bytes are vout
+        assert struct.unpack("<I", result[32:])[0] == 0
+
+    def test_nonzero_vout(self) -> None:
+        result = serialize_outpoint("bb" * 32, 7)
+        assert struct.unpack("<I", result[32:])[0] == 7
+
+
+class TestParsedTransactionAccessors:
+    """Tests for ParsedTransaction bytes accessors."""
+
+    def test_version_bytes(self) -> None:
+        """Construct a tx, parse it, check version_bytes."""
+        inp = TxInput.from_hex("aa" * 32, 0)
+        out = TxOutput(value=50_000, script=bytes([0x00, 0x14]) + b"\x00" * 20)
+        tx = serialize_transaction(2, [inp], [out], 0)
+        parsed = parse_transaction(tx.hex())
+        assert parsed.version_bytes == struct.pack("<I", 2)
+
+    def test_locktime_bytes(self) -> None:
+        inp = TxInput.from_hex("aa" * 32, 0)
+        out = TxOutput(value=50_000, script=bytes([0x00, 0x14]) + b"\x00" * 20)
+        tx = serialize_transaction(2, [inp], [out], 500_000)
+        parsed = parse_transaction(tx.hex())
+        assert parsed.locktime_bytes == struct.pack("<I", 500_000)
+
+    def test_sequence_bytes(self) -> None:
+        inp = TxInput.from_hex("aa" * 32, 0, sequence=0xFFFFFFFE)
+        out = TxOutput(value=50_000, script=bytes([0x00, 0x14]) + b"\x00" * 20)
+        tx = serialize_transaction(2, [inp], [out], 0)
+        parsed = parse_transaction(tx.hex())
+        assert parsed.inputs[0].sequence_bytes == struct.pack("<I", 0xFFFFFFFE)
+
+
+class TestTxOutputFromAddress:
+    """Tests for TxOutput.from_address factory."""
+
+    def test_from_bech32_address(self) -> None:
+        pubkey = b"\x02" + b"\xcc" * 32
+        addr = pubkey_to_p2wpkh_address(pubkey, "regtest")
+        out = TxOutput.from_address(addr, 100_000)
+        assert out.value == 100_000
+        assert out.script[0] == 0x00 and out.script[1] == 0x14
+
+
+class TestSerializeTransactionWithWitness:
+    """Tests for serialize_transaction with witness data."""
+
+    def test_with_witness(self) -> None:
+        """Serialize a witness tx and parse it back."""
+        inp = TxInput.from_hex("aa" * 32, 0)
+        out = TxOutput(value=50_000, script=bytes([0x00, 0x14]) + b"\x00" * 20)
+        witness = [[b"\x30" * 71, b"\x02" + b"\xaa" * 32]]
+
+        tx = serialize_transaction(2, [inp], [out], 0, witnesses=witness)
+        parsed = parse_transaction(tx.hex())
+        assert parsed.has_witness
+        assert len(parsed.witnesses) == 1
+        assert len(parsed.witnesses[0]) == 2
+
+    def test_without_witness(self) -> None:
+        """Non-witness tx should not have witness marker."""
+        inp = TxInput.from_hex("aa" * 32, 0)
+        out = TxOutput(value=50_000, script=bytes([0x00, 0x14]) + b"\x00" * 20)
+
+        tx = serialize_transaction(2, [inp], [out], 0, witnesses=None)
+        parsed = parse_transaction(tx.hex())
+        assert not parsed.has_witness

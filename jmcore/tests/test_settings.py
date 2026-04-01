@@ -14,6 +14,7 @@ from jmcore.models import NetworkType
 from jmcore.settings import (
     JoinMarketSettings,
     MakerSettings,
+    NetworkSettings,
     ensure_config_file,
     generate_config_template,
     get_config_path,
@@ -417,3 +418,128 @@ cj_fee_relative = 0.00001
         for input_val, expected in test_cases:
             settings = MakerSettings(cj_fee_relative=input_val)  # type: ignore[arg-type]
             assert settings.cj_fee_relative == expected, f"Failed for {input_val}"
+
+    def test_invalid_scientific_notation_passthrough(self) -> None:
+        """Invalid scientific notation string is passed through for pydantic validation."""
+        # "not_a_number_e5" contains 'e' but is not valid Decimal
+        settings = MakerSettings(cj_fee_relative="not_a_number_e5")
+        # Should be passed through as-is (pydantic doesn't enforce numeric strings on str field)
+        assert settings.cj_fee_relative == "not_a_number_e5"
+
+
+class TestParseDirectoryServers:
+    """Tests for NetworkSettings.parse_directory_servers validator."""
+
+    def test_json_list_string(self) -> None:
+        """JSON array string should be parsed."""
+        settings = NetworkSettings(directory_servers='["host1:5222", "host2:5222"]')
+        assert settings.directory_servers == ["host1:5222", "host2:5222"]
+
+    def test_json_single_string(self) -> None:
+        """JSON single string should be parsed."""
+        settings = NetworkSettings(directory_servers='"host1:5222"')
+        assert settings.directory_servers == ["host1:5222"]
+
+    def test_comma_separated_string(self) -> None:
+        """Comma-separated plain string should be parsed."""
+        settings = NetworkSettings(directory_servers="host1:5222,host2:5222")
+        assert settings.directory_servers == ["host1:5222", "host2:5222"]
+
+    def test_single_plain_string(self) -> None:
+        """Single plain string should be parsed as one-element list."""
+        settings = NetworkSettings(directory_servers="host1:5222")
+        assert settings.directory_servers == ["host1:5222"]
+
+    def test_list_passthrough(self) -> None:
+        """An actual list should pass through unchanged."""
+        settings = NetworkSettings(directory_servers=["host1:5222"])
+        assert settings.directory_servers == ["host1:5222"]
+
+    def test_empty_json_string(self) -> None:
+        """JSON empty string should produce empty list."""
+        settings = NetworkSettings(directory_servers='""')
+        assert settings.directory_servers == []
+
+
+class TestJoinMarketSettingsHelpers:
+    """Tests for JoinMarketSettings helper methods."""
+
+    def test_get_data_dir_with_explicit(
+        self, temp_data_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """get_data_dir returns explicit data_dir when set."""
+        settings = JoinMarketSettings(data_dir=temp_data_dir)
+        assert settings.get_data_dir() == temp_data_dir
+
+    def test_get_data_dir_default(self) -> None:
+        """get_data_dir returns default when not set."""
+        settings = JoinMarketSettings()
+        result = settings.get_data_dir()
+        assert isinstance(result, Path)
+
+    def test_get_neutrino_add_peers(self) -> None:
+        """get_neutrino_add_peers returns configured peers."""
+        settings = JoinMarketSettings()
+        peers = settings.get_neutrino_add_peers()
+        assert isinstance(peers, list)
+
+
+class TestConfigPathEnvVar:
+    """Tests for JOINMARKET_CONFIG_FILE environment variable."""
+
+    def test_explicit_config_file_env(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """JOINMARKET_CONFIG_FILE should override default config path."""
+        config_file = tmp_path / "custom_config.toml"
+        config_file.write_text("[tor]\nsocks_port = 9999\n")
+        monkeypatch.setenv("JOINMARKET_CONFIG_FILE", str(config_file))
+
+        settings = JoinMarketSettings()
+        assert settings.tor.socks_port == 9999
+
+    def test_config_file_not_found_uses_defaults(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Non-existent config file should use defaults."""
+        monkeypatch.setenv("JOINMARKET_CONFIG_FILE", str(tmp_path / "nonexistent.toml"))
+        settings = JoinMarketSettings()
+        # Should still work with defaults
+        assert settings.tor.socks_host == "127.0.0.1"
+
+
+class TestTomlLoadErrorHandling:
+    """Tests for TOML config loading error handling."""
+
+    def test_generic_exception_exits(
+        self, temp_data_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A file that causes a non-TOML error during loading should exit."""
+        config_path = temp_data_dir / "config.toml"
+        # Write binary garbage that won't parse as TOML
+        config_path.write_bytes(b"\x00\x01\x02\x03")
+
+        with pytest.raises(SystemExit) as exc_info:
+            JoinMarketSettings()
+        assert exc_info.value.code == 1
+
+
+class TestCommaListEnvSettingsSource:
+    """Tests for _CommaListEnvSettingsSource."""
+
+    def test_comma_separated_directory_servers(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Comma-separated env var for list[str] field should work."""
+        monkeypatch.setenv("NETWORK_CONFIG__DIRECTORY_SERVERS", "host1.onion:5222,host2.onion:5222")
+        settings = JoinMarketSettings()
+        servers = settings.network_config.directory_servers
+        assert "host1.onion:5222" in servers
+        assert "host2.onion:5222" in servers
+
+    def test_json_array_directory_servers(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """JSON array env var for list[str] field should work."""
+        monkeypatch.setenv(
+            "NETWORK_CONFIG__DIRECTORY_SERVERS", '["host1.onion:5222","host2.onion:5222"]'
+        )
+        settings = JoinMarketSettings()
+        servers = settings.network_config.directory_servers
+        assert servers == ["host1.onion:5222", "host2.onion:5222"]

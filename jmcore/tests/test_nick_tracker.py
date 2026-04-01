@@ -256,3 +256,67 @@ def test_no_callback():
 
     # Should not crash
     assert not tracker.is_nick_active("maker1")
+
+
+def test_nick_returns_after_marked_gone_on_directory():
+    """Test the branch where a nick returns to a directory it was previously marked gone on.
+
+    This exercises line 78: `elif is_present and old_status is False`.
+    """
+    tracker = NickTracker[str]()
+
+    # Nick present on dir1
+    tracker.mark_nick_present("maker1", "dir1")
+    # Also present on dir2 (so leaving dir1 won't trigger full leave)
+    tracker.mark_nick_present("maker1", "dir2")
+
+    # Nick gone from dir1 (but still on dir2, so not fully gone)
+    tracker.mark_nick_gone("maker1", "dir1")
+    assert tracker.is_nick_active("maker1")
+
+    # Nick RETURNS to dir1 while marked as gone there
+    tracker.mark_nick_present("maker1", "dir1")
+    assert tracker.is_nick_active("maker1")
+    assert set(tracker.get_active_directories_for_nick("maker1")) == {"dir1", "dir2"}
+
+
+def test_remove_directory_nick_gone_on_remaining():
+    """Test remove_directory when nick is marked gone on all remaining directories.
+
+    This exercises lines 173-180: the elif branch in remove_directory where
+    a nick still has directory entries but is_nick_active returns False.
+    """
+    left_nicks: list[str] = []
+
+    def on_leave(nick: str) -> None:
+        left_nicks.append(nick)
+
+    tracker = NickTracker[str](on_nick_leave=on_leave)
+
+    # maker1 on dir1 and dir2
+    tracker.mark_nick_present("maker1", "dir1")
+    tracker.mark_nick_present("maker1", "dir2")
+
+    # Mark maker1 as gone on dir2 (but still present on dir1)
+    tracker.mark_nick_gone("maker1", "dir2")
+    assert tracker.is_nick_active("maker1")  # still on dir1
+
+    # Now remove dir1 -- maker1's only active directory
+    # After removing dir1, maker1 is left with {dir2: False}
+    # That means is_nick_active -> False, hitting the elif branch
+    gone = tracker.remove_directory("dir1")
+
+    assert "maker1" in gone
+    assert "maker1" in left_nicks
+    assert not tracker.is_nick_active("maker1")
+
+
+def test_repr():
+    """Test NickTracker __repr__."""
+    tracker = NickTracker[str]()
+    tracker.mark_nick_present("maker1", "dir1")
+    tracker.mark_nick_present("maker2", "dir2")
+
+    repr_str = repr(tracker)
+    assert "NickTracker" in repr_str
+    assert "active_nicks=2" in repr_str

@@ -6,9 +6,16 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from jmcore.paths import (
     get_all_nick_states,
+    get_commitment_blacklist_path,
+    get_default_data_dir,
+    get_ignored_makers_path,
     get_nick_state_path,
+    get_used_commitments_path,
+    get_wallet_metadata_path,
     read_nick_state,
     remove_nick_state,
     write_nick_state,
@@ -171,3 +178,147 @@ class TestNickStateDefaultDataDir:
             assert path.name == "maker.nick"
             assert path.parent.name == "state"
             assert path == tmp_path / "state" / "maker.nick"
+
+
+class TestPathUtilities:
+    """Tests for path utility functions."""
+
+    def test_get_default_data_dir(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Test get_default_data_dir with JOINMARKET_DATA_DIR env var."""
+        from unittest.mock import patch
+
+        monkeypatch.setenv("JOINMARKET_DATA_DIR", "/tmp/jm-test-data")
+        with patch("pathlib.Path.mkdir"):
+            result = get_default_data_dir()
+            assert result == Path("/tmp/jm-test-data")
+
+    def test_get_default_data_dir_no_env(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Test get_default_data_dir falls back to home directory."""
+        monkeypatch.delenv("JOINMARKET_DATA_DIR", raising=False)
+        from unittest.mock import patch
+
+        with patch("pathlib.Path.home", return_value=tmp_path):
+            result = get_default_data_dir()
+            assert result == tmp_path / ".joinmarket-ng"
+
+    def test_get_commitment_blacklist_path(self, tmp_path: Path) -> None:
+        """Test get_commitment_blacklist_path with explicit data_dir."""
+        result = get_commitment_blacklist_path(tmp_path)
+        assert result == tmp_path / "cmtdata" / "commitmentlist"
+        assert result.parent.exists()
+
+    def test_get_commitment_blacklist_path_none(self, tmp_path: Path) -> None:
+        """Test get_commitment_blacklist_path with None data_dir."""
+        from unittest.mock import patch
+
+        with patch("jmcore.paths.get_default_data_dir", return_value=tmp_path):
+            result = get_commitment_blacklist_path(None)
+            assert result == tmp_path / "cmtdata" / "commitmentlist"
+
+    def test_get_used_commitments_path(self, tmp_path: Path) -> None:
+        """Test get_used_commitments_path."""
+        result = get_used_commitments_path(tmp_path)
+        assert result == tmp_path / "cmtdata" / "commitments.json"
+        assert result.parent.exists()
+
+    def test_get_used_commitments_path_none(self, tmp_path: Path) -> None:
+        """Test get_used_commitments_path with None uses default."""
+        from unittest.mock import patch
+
+        with patch("jmcore.paths.get_default_data_dir", return_value=tmp_path):
+            result = get_used_commitments_path(None)
+            assert result == tmp_path / "cmtdata" / "commitments.json"
+
+    def test_get_ignored_makers_path(self, tmp_path: Path) -> None:
+        """Test get_ignored_makers_path."""
+        result = get_ignored_makers_path(tmp_path)
+        assert result == tmp_path / "ignored_makers.txt"
+
+    def test_get_ignored_makers_path_none(self, tmp_path: Path) -> None:
+        """Test get_ignored_makers_path with None uses default."""
+        from unittest.mock import patch
+
+        with patch("jmcore.paths.get_default_data_dir", return_value=tmp_path):
+            result = get_ignored_makers_path(None)
+            assert result == tmp_path / "ignored_makers.txt"
+
+    def test_get_wallet_metadata_path(self, tmp_path: Path) -> None:
+        """Test get_wallet_metadata_path."""
+        result = get_wallet_metadata_path(tmp_path)
+        assert result == tmp_path / "wallet_metadata.jsonl"
+
+    def test_get_wallet_metadata_path_none(self, tmp_path: Path) -> None:
+        """Test get_wallet_metadata_path with None uses default."""
+        from unittest.mock import patch
+
+        with patch("jmcore.paths.get_default_data_dir", return_value=tmp_path):
+            result = get_wallet_metadata_path(None)
+            assert result == tmp_path / "wallet_metadata.jsonl"
+
+
+class TestNickStateStringDataDir:
+    """Tests for nick state functions with string data_dir."""
+
+    def test_get_nick_state_path_string(self, tmp_path: Path) -> None:
+        """get_nick_state_path with str data_dir should work."""
+        path = get_nick_state_path(str(tmp_path), "maker")
+        assert path == tmp_path / "state" / "maker.nick"
+
+    def test_write_and_read_string_data_dir(self, tmp_path: Path) -> None:
+        """write/read_nick_state should work with str data_dir."""
+        write_nick_state(str(tmp_path), "maker", "J5TESTSTR")
+        nick = read_nick_state(str(tmp_path), "maker")
+        assert nick == "J5TESTSTR"
+
+    def test_remove_nick_state_string_data_dir(self, tmp_path: Path) -> None:
+        """remove_nick_state should work with str data_dir."""
+        write_nick_state(str(tmp_path), "maker", "J5TESTSTR")
+        result = remove_nick_state(str(tmp_path), "maker")
+        assert result is True
+        assert read_nick_state(str(tmp_path), "maker") is None
+
+    def test_get_all_nick_states_string_data_dir(self, tmp_path: Path) -> None:
+        """get_all_nick_states with str data_dir."""
+        write_nick_state(tmp_path, "maker", "J5MAKERABC")
+        states = get_all_nick_states(str(tmp_path))
+        assert states == {"maker": "J5MAKERABC"}
+
+    def test_read_nick_state_oserror(self, tmp_path: Path) -> None:
+        """read_nick_state should return None on OSError."""
+        # Create state dir and a directory where a file would be (causes OSError on read)
+        state_dir = tmp_path / "state"
+        state_dir.mkdir(parents=True)
+        nick_path = state_dir / "maker.nick"
+        nick_path.mkdir()  # Make it a directory instead of file
+
+        nick = read_nick_state(tmp_path, "maker")
+        assert nick is None
+
+    def test_remove_nick_state_oserror(self, tmp_path: Path) -> None:
+        """remove_nick_state should return False on OSError."""
+        # Create state dir and make the nick file a non-empty directory
+        state_dir = tmp_path / "state"
+        state_dir.mkdir(parents=True)
+        nick_path = state_dir / "maker.nick"
+        nick_path.mkdir()
+        (nick_path / "child").write_text("block removal")
+
+        result = remove_nick_state(tmp_path, "maker")
+        assert result is False
+
+    def test_get_all_nick_states_oserror(self, tmp_path: Path) -> None:
+        """get_all_nick_states should skip files with OSError."""
+        state_dir = tmp_path / "state"
+        state_dir.mkdir(parents=True)
+
+        # Create a valid nick file
+        (state_dir / "maker.nick").write_text("J5GOOD\n")
+
+        # Create a nick file that's actually a directory (triggers OSError)
+        (state_dir / "broken.nick").mkdir()
+
+        states = get_all_nick_states(tmp_path)
+        assert "maker" in states
+        assert "broken" not in states
