@@ -7,6 +7,7 @@ import os
 import struct
 
 import pytest
+from maker.tx_verification import parse_transaction as maker_parse
 
 from jmcore.bitcoin import (
     PSBT_MAGIC,
@@ -1360,3 +1361,42 @@ class TestSerializeTransactionWithWitness:
         tx = serialize_transaction(2, [inp], [out], 0, witnesses=None)
         parsed = parse_transaction(tx.hex())
         assert not parsed.has_witness
+
+
+# =============================================================================
+# Maker parser leniency regression tests
+# =============================================================================
+
+
+class TestMakerParseLeniencyRegressions:
+    """Regression tests for malformed transaction handling in maker parser."""
+
+    def test_crash_lenience_bug(self) -> None:
+        tx_hex = "0000b7000000"
+        result = maker_parse(tx_hex, network="mainnet")
+        assert result is None
+
+    def test_truncated_witness(self) -> None:
+        # Valid tx but with 1 input and no witness data (illegal in SegWit mode)
+        tx_hex = (
+            "0100000000010100000000000000000000000000000000000000010000006600000000000000"
+            "000000000000ffffffff0140420f000000000016001475420f00000000b6240500a89d7b4c48"
+            "398a6f3b0021fc0000"
+        )
+        result = maker_parse(tx_hex, network="mainnet")
+        assert result is None
+
+    def test_minimum_inputs_outputs(self) -> None:
+        tx_hex = "01000000000000000000"
+        result = maker_parse(tx_hex)
+        assert result is None
+
+    def test_trailing_garbage(self) -> None:
+        # Valid tx with trailing byte "ff"
+        tx_hex = (
+            "0100000000010100000000000000000000000000000000000000010000006600000000000000"
+            "000000000000ffffffff0140420f000000000016001475420f00000000b6240500a89d7b4c48"
+            "398a6f3b0021fc0000ff"
+        )
+        result = maker_parse(tx_hex, network="mainnet")
+        assert result is None
