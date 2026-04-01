@@ -7,6 +7,7 @@ import os
 import struct
 
 import pytest
+from maker.tx_verification import parse_transaction as maker_parse
 
 from jmcore.bitcoin import (
     PSBT_MAGIC,
@@ -711,3 +712,10 @@ class TestPSBTWithBIP32Derivation:
         decoded = base64.b64decode(b64)
         assert decoded == raw
         assert decoded.startswith(PSBT_MAGIC)
+
+
+def test_output_value():
+
+    tx_hex = "010000000001010000000000000000000000000000000000000001000000660000000000000000000000000000ffffffff0140420f000000008616001475420f00000000b6240500a89d7b4c48398a6f3b0021fc0000"
+    result = maker_parse(tx_hex, network="mainnet")
+    assert result is None
