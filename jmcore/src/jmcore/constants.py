@@ -14,6 +14,7 @@ STANDARD_DUST_LIMIT = 546  # satoshis
 
 # Bitcoin amount conversion
 SATS_PER_BTC = 100_000_000
+MAX_MONEY = 21_000_000 * SATS_PER_BTC
 BTC_PER_SAT = 1.0 / SATS_PER_BTC  # For display only, never for calculations
 
 # Bitcoin dust threshold: 5x the standard P2PKH dust limit

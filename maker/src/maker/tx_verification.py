@@ -16,6 +16,7 @@ Reference: joinmarket-clientserver/src/jmclient/maker.py:verify_unsigned_tx()
 
 from __future__ import annotations
 
+import struct
 from typing import Any
 
 from jmcore.bitcoin import (
@@ -23,6 +24,7 @@ from jmcore.bitcoin import (
     get_hrp,
     scriptpubkey_to_address,
 )
+from jmcore.constants import MAX_MONEY
 from jmcore.models import NetworkType, OfferType
 from jmcore.models import calculate_cj_fee as calculate_cj_fee
 from jmwallet.wallet.models import UTXOInfo
@@ -202,7 +204,9 @@ def parse_transaction(
 
         outputs = []
         for _ in range(output_count):
-            value = int.from_bytes(tx_bytes[offset : offset + 8], "little")
+            value = struct.unpack("<q", tx_bytes[offset : offset + 8])[0]
+            if value < 0 or value > MAX_MONEY:
+                return None
             offset += 8
 
             script_len, offset = decode_varint(tx_bytes, offset)
