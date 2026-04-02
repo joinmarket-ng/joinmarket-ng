@@ -72,6 +72,26 @@ class TestDirectSend:
 
 
 class TestDoCoinjoin:
+    def test_start_coinjoin_requires_mnemonic(self, authed_client: tuple[TestClient, str]) -> None:
+        client, token = authed_client
+        state = get_daemon_state()
+        state.wallet_mnemonic = ""
+
+        resp = client.post(
+            "/api/v1/wallet/test_wallet.jmdat/taker/coinjoin",
+            json={
+                "mixdepth": 0,
+                "amount_sats": 100000,
+                "destination": "bcrt1qdest",
+                "counterparties": 3,
+                "txfee": 500,
+            },
+            headers=_auth_headers(token),
+        )
+
+        assert resp.status_code == 404
+        assert "Wallet mnemonic not available" in resp.json()["message"]
+
     @patch("jmwalletd._backend.get_backend", new_callable=AsyncMock)
     @patch("taker.taker.Taker")
     @patch("taker.config.TakerConfig")
@@ -85,6 +105,7 @@ class TestDoCoinjoin:
         authed_client: tuple[TestClient, str],
     ) -> None:
         client, token = authed_client
+        state = get_daemon_state()
         mock_taker = AsyncMock()
         mock_taker_cls.return_value = mock_taker
 
@@ -113,6 +134,7 @@ class TestDoCoinjoin:
         assert resp.status_code == 202
 
         _, kwargs = mock_config.call_args
+        assert kwargs["mnemonic"] == state.wallet_mnemonic
         assert kwargs["network"] == NetworkType.SIGNET
         assert kwargs["directory_servers"] == expected_dirs
         assert kwargs["socks_host"] == "127.0.0.1"
@@ -121,6 +143,26 @@ class TestDoCoinjoin:
 
 
 class TestStartMaker:
+    def test_start_maker_requires_mnemonic(self, authed_client: tuple[TestClient, str]) -> None:
+        client, token = authed_client
+        state = get_daemon_state()
+        state.wallet_mnemonic = ""
+
+        resp = client.post(
+            "/api/v1/wallet/test_wallet.jmdat/maker/start",
+            json={
+                "txfee": "1000",
+                "cjfee_a": "500",
+                "cjfee_r": "0.002",
+                "ordertype": "sw0reloffer",
+                "minsize": "100000",
+            },
+            headers=_auth_headers(token),
+        )
+
+        assert resp.status_code == 404
+        assert "Wallet mnemonic not available" in resp.json()["message"]
+
     @patch("jmwalletd._backend.get_backend", new_callable=AsyncMock)
     @patch("maker.bot.MakerBot")
     @patch("maker.config.MakerConfig")
@@ -166,6 +208,7 @@ class TestStartMaker:
     ) -> None:
         """MakerConfig must receive directory servers and Tor config from JoinMarketSettings."""
         client, token = authed_client
+        state = get_daemon_state()
         mock_maker = AsyncMock()
         mock_maker.nick = "JmMaker"
         mock_maker.current_offers = []
@@ -196,11 +239,28 @@ class TestStartMaker:
         assert resp.status_code == 202
 
         _, kwargs = mock_config.call_args
+        assert kwargs["mnemonic"] == state.wallet_mnemonic
         assert kwargs["network"] == NetworkType.SIGNET
         assert kwargs["directory_servers"] == expected_dirs
         assert kwargs["socks_host"] == "127.0.0.1"
         assert kwargs["socks_port"] == 9050
         assert kwargs["stream_isolation"] is False
+
+
+class TestRunSchedule:
+    def test_run_schedule_requires_mnemonic(self, authed_client: tuple[TestClient, str]) -> None:
+        client, token = authed_client
+        state = get_daemon_state()
+        state.wallet_mnemonic = ""
+
+        resp = client.post(
+            "/api/v1/wallet/test_wallet.jmdat/taker/schedule",
+            json={"destination_addresses": ["bcrt1qdest"]},
+            headers=_auth_headers(token),
+        )
+
+        assert resp.status_code == 404
+        assert "Wallet mnemonic not available" in resp.json()["message"]
 
 
 class TestStopMaker:

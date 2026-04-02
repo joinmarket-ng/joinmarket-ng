@@ -90,6 +90,8 @@ async def do_coinjoin(
     """Initiate a coinjoin transaction (asynchronous)."""
     if state.coinjoin_state != CoinjoinState.NOT_RUNNING:
         raise ServiceAlreadyStarted("A coinjoin or maker service is already running.")
+    if not state.wallet_mnemonic:
+        raise NoWalletFound("Wallet mnemonic not available in daemon state.")
 
     try:
         from jmwalletd._backend import get_backend
@@ -103,7 +105,7 @@ async def do_coinjoin(
                 backend = await get_backend(state.data_dir, force_new=True)
                 jm_settings = get_settings()
                 config = TakerConfig(
-                    mnemonic=ws.mnemonic,  # type: ignore[arg-type]
+                    mnemonic=state.wallet_mnemonic,
                     mixdepth=body.mixdepth,
                     amount=body.amount_sats,
                     destination_address=body.destination,  # type: ignore[arg-type]
@@ -164,6 +166,8 @@ async def run_schedule(
     """
     if state.coinjoin_state != CoinjoinState.NOT_RUNNING:
         raise ServiceAlreadyStarted("A coinjoin or maker service is already running.")
+    if not state.wallet_mnemonic:
+        raise NoWalletFound("Wallet mnemonic not available in daemon state.")
 
     try:
         from jmwalletd._backend import get_backend
@@ -178,7 +182,7 @@ async def run_schedule(
                 backend = await get_backend(state.data_dir, force_new=True)
                 jm_settings = get_settings()
                 config = TakerConfig(
-                    mnemonic=ws.mnemonic,  # type: ignore[arg-type]
+                    mnemonic=state.wallet_mnemonic,
                     network=jm_settings.network_config.network,
                     directory_servers=jm_settings.get_directory_servers(),
                     socks_host=jm_settings.tor.socks_host,
@@ -291,6 +295,8 @@ async def start_maker(
     """Start the yield generator (maker) service."""
     if state.coinjoin_state != CoinjoinState.NOT_RUNNING:
         raise ServiceAlreadyStarted("A coinjoin or maker service is already running.")
+    if not state.wallet_mnemonic:
+        raise NoWalletFound("Wallet mnemonic not available in daemon state.")
 
     # Parse maker parameters.
     try:
@@ -314,7 +320,7 @@ async def start_maker(
                 backend = await get_backend(state.data_dir, force_new=True)
                 jm_settings = get_settings()
                 config = MakerConfig(
-                    mnemonic=ws.mnemonic,  # type: ignore[arg-type]
+                    mnemonic=state.wallet_mnemonic,
                     offer_type=body.ordertype,  # type: ignore[arg-type]
                     min_size=minsize,
                     cj_fee_relative=cjfee_r,

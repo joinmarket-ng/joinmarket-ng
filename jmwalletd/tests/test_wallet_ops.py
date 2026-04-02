@@ -13,6 +13,7 @@ from jmwalletd.wallet_ops import (
     _save_wallet_file,
     create_wallet,
     open_wallet,
+    open_wallet_with_mnemonic,
     recover_wallet,
 )
 
@@ -389,3 +390,39 @@ class TestOpenWallet:
                 password="wrong_password",
                 data_dir=tmp_path,
             )
+
+    @patch("jmwalletd.wallet_ops._get_network", return_value="mainnet")
+    @patch("jmwalletd._backend.get_backend", new_callable=AsyncMock)
+    @patch("jmwallet.wallet.service.WalletService")
+    async def test_open_wallet_with_mnemonic_returns_seedphrase(
+        self,
+        mock_ws_cls: MagicMock,
+        mock_get_backend: AsyncMock,
+        mock_get_network: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        wallet_path = tmp_path / "wallets" / "existing.jmdat"
+        wallet_path.parent.mkdir(parents=True, exist_ok=True)
+        mnemonic = "abandon " * 11 + "about"
+        _save_wallet_file(
+            wallet_path=wallet_path,
+            mnemonic=mnemonic,
+            password="password",
+            wallet_type="sw-fb",
+        )
+
+        mock_ws = MagicMock()
+        mock_ws.sync = AsyncMock()
+        mock_ws.setup_descriptor_wallet = AsyncMock()
+        mock_ws_cls.return_value = mock_ws
+        mock_get_backend.return_value = _make_descriptor_backend()
+
+        ws, seedphrase = await open_wallet_with_mnemonic(
+            wallet_path=wallet_path,
+            password="password",
+            data_dir=tmp_path,
+            sync_on_open=False,
+        )
+
+        assert ws is mock_ws
+        assert seedphrase == mnemonic

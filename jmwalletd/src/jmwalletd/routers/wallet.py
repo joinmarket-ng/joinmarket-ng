@@ -44,7 +44,7 @@ from jmwalletd.models import (
 from jmwalletd.state import DaemonState
 from jmwalletd.wallet_ops import (
     create_wallet,
-    open_wallet,
+    open_wallet_with_mnemonic,
     recover_wallet,
 )
 
@@ -214,6 +214,7 @@ async def wallet_create(
         raise InvalidRequestFormat(str(exc)) from exc
 
     state.wallet_service = wallet_service
+    state.wallet_mnemonic = seedphrase
     state.wallet_name = body.walletname
     state.wallet_password = body.password
 
@@ -262,6 +263,7 @@ async def wallet_recover(
         raise InvalidRequestFormat(str(exc)) from exc
 
     state.wallet_service = wallet_service
+    state.wallet_mnemonic = body.seedphrase
     state.wallet_name = body.walletname
     state.wallet_password = body.password
 
@@ -311,7 +313,7 @@ async def wallet_unlock(
         await state.lock_wallet()
 
     try:
-        wallet_service = await open_wallet(
+        wallet_service, seedphrase = await open_wallet_with_mnemonic(
             wallet_path=wallet_path,
             password=body.password,
             data_dir=state.data_dir,
@@ -323,6 +325,7 @@ async def wallet_unlock(
         raise InvalidCredentials(str(exc)) from exc
 
     state.wallet_service = wallet_service
+    state.wallet_mnemonic = seedphrase
     state.wallet_name = walletname
     state.wallet_password = body.password
 

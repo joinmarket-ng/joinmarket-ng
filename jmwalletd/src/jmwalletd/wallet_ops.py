@@ -170,17 +170,17 @@ async def recover_wallet(
     return ws
 
 
-async def open_wallet(
+async def open_wallet_with_mnemonic(
     *,
     wallet_path: Path,
     password: str,
     data_dir: Path,
     sync_on_open: bool = True,
-) -> Any:
-    """Open (unlock) an existing wallet file.
+) -> tuple[Any, str]:
+    """Open (unlock) an existing wallet file and return mnemonic.
 
     Returns:
-        WalletService instance.
+        Tuple of (WalletService, seedphrase).
 
     Raises:
         FileNotFoundError: If the wallet file doesn't exist.
@@ -213,6 +213,31 @@ async def open_wallet(
         await ws.sync()
 
     logger.info("Opened wallet: {}", wallet_path.name)
+    return ws, seedphrase
+
+
+async def open_wallet(
+    *,
+    wallet_path: Path,
+    password: str,
+    data_dir: Path,
+    sync_on_open: bool = True,
+) -> Any:
+    """Open (unlock) an existing wallet file.
+
+    Returns:
+        WalletService instance.
+
+    Raises:
+        FileNotFoundError: If the wallet file doesn't exist.
+        ValueError: If the password is wrong.
+    """
+    ws, _ = await open_wallet_with_mnemonic(
+        wallet_path=wallet_path,
+        password=password,
+        data_dir=data_dir,
+        sync_on_open=sync_on_open,
+    )
     return ws
 
 

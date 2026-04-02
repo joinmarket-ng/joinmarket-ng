@@ -25,6 +25,7 @@ class TestDaemonState:
     def test_initial_state(self, data_dir: Path) -> None:
         state = DaemonState(data_dir=data_dir)
         assert state.wallet_service is None
+        assert state.wallet_mnemonic == ""
         assert state.wallet_name == ""
         assert state.coinjoin_state == CoinjoinState.NOT_RUNNING
         assert state.maker_running is False
@@ -64,10 +65,12 @@ class TestDaemonState:
         self, daemon_state: DaemonState, mock_wallet_service: MagicMock
     ) -> None:
         daemon_state.wallet_service = mock_wallet_service
+        daemon_state.wallet_mnemonic = "abandon " * 11 + "about"
         daemon_state.wallet_name = "w.jmdat"
         already = await daemon_state.lock_wallet()
         assert already is False
         assert daemon_state.wallet_service is None
+        assert daemon_state.wallet_mnemonic == ""
         assert daemon_state.wallet_name == ""
         assert daemon_state.coinjoin_state == CoinjoinState.NOT_RUNNING
 

@@ -274,8 +274,9 @@ async def get_seed(
     state: DaemonState = Depends(get_daemon_state),
 ) -> GetSeedResponse:
     """Return the wallet's BIP39 mnemonic seed phrase."""
-    ws = state.wallet_service
-    return GetSeedResponse(seedphrase=ws.mnemonic)
+    if not state.wallet_mnemonic:
+        raise ActionNotAllowed("Seed phrase is not available in daemon state.")
+    return GetSeedResponse(seedphrase=state.wallet_mnemonic)
 
 
 # ---------------------------------------------------------------------------

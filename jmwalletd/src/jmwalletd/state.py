@@ -42,6 +42,7 @@ class DaemonState:
 
         # Wallet
         self.wallet_service: Any = None  # WalletService | None
+        self.wallet_mnemonic: str = ""
         self.wallet_name: str = ""
         self.wallet_password: str = ""  # kept for re-unlock verification
 
@@ -129,6 +130,7 @@ class DaemonState:
                 await self._wallet_sync_task
 
         self.wallet_service = None
+        self.wallet_mnemonic = ""
         self.wallet_name = ""
         self.wallet_password = ""
         self.maker_running = False

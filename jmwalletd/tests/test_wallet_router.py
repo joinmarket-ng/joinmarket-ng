@@ -102,6 +102,7 @@ class TestWalletCreate:
         assert data["walletname"] == "new.jmdat"
         assert "token" in data
         assert "seedphrase" in data
+        assert daemon_state.wallet_mnemonic == data["seedphrase"]
 
     @patch("jmwalletd.routers.wallet.create_wallet", new_callable=AsyncMock)
     def test_already_loaded_returns_401(
@@ -148,15 +149,16 @@ class TestWalletRecover:
         data = resp.json()
         assert data["walletname"] == "recovered.jmdat"
         assert data["seedphrase"] == seedphrase
+        assert daemon_state.wallet_mnemonic == seedphrase
 
 
 class TestWalletUnlock:
-    @patch("jmwalletd.routers.wallet.open_wallet", new_callable=AsyncMock)
+    @patch("jmwalletd.routers.wallet.open_wallet_with_mnemonic", new_callable=AsyncMock)
     def test_success(
-        self, mock_open: AsyncMock, client: TestClient, daemon_state: DaemonState
+        self, mock_open_with_mnemonic: AsyncMock, client: TestClient, daemon_state: DaemonState
     ) -> None:
         (daemon_state.wallets_dir / "w.jmdat").touch()
-        mock_open.return_value = MagicMock()
+        mock_open_with_mnemonic.return_value = (MagicMock(), "abandon " * 11 + "about")
 
         resp = client.post(
             "/api/v1/wallet/w.jmdat/unlock",
@@ -166,8 +168,9 @@ class TestWalletUnlock:
         data = resp.json()
         assert data["walletname"] == "w.jmdat"
         assert "token" in data
-        assert mock_open.await_args is not None
-        assert mock_open.await_args.kwargs["sync_on_open"] is False
+        assert daemon_state.wallet_mnemonic == "abandon " * 11 + "about"
+        assert mock_open_with_mnemonic.await_args is not None
+        assert mock_open_with_mnemonic.await_args.kwargs["sync_on_open"] is False
 
     def test_wallet_not_found(self, client: TestClient) -> None:
         resp = client.post(

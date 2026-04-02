@@ -67,6 +67,7 @@ def daemon_state_with_wallet(
 ) -> DaemonState:
     """DaemonState with a loaded wallet."""
     daemon_state.wallet_service = mock_wallet_service
+    daemon_state.wallet_mnemonic = "abandon " * 11 + "about"
     daemon_state.wallet_name = "test_wallet.jmdat"
     daemon_state.token_authority.issue("test_wallet.jmdat")
     return daemon_state

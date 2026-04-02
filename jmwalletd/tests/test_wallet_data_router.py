@@ -262,7 +262,7 @@ class TestGetSeed:
     def test_returns_seed(self, authed_client: tuple[TestClient, str]) -> None:
         client, token = authed_client
         state = get_daemon_state()
-        state.wallet_service.mnemonic = "abandon " * 11 + "about"
+        state.wallet_mnemonic = "abandon " * 11 + "about"
 
         resp = client.get(
             "/api/v1/wallet/test_wallet.jmdat/getseed",
@@ -271,6 +271,18 @@ class TestGetSeed:
         assert resp.status_code == 200
         data = resp.json()
         assert data["seedphrase"] == "abandon " * 11 + "about"
+
+    def test_errors_when_no_mnemonic_set(self, authed_client: tuple[TestClient, str]) -> None:
+        client, token = authed_client
+        state = get_daemon_state()
+        state.wallet_mnemonic = ""
+
+        resp = client.get(
+            "/api/v1/wallet/test_wallet.jmdat/getseed",
+            headers=_auth_headers(token),
+        )
+        assert resp.status_code == 400
+        assert "Seed phrase is not available" in resp.json()["message"]
 
 
 class TestFreeze:
