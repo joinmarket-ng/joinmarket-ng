@@ -162,6 +162,7 @@ class TestBackendCloseReuse:
 
         await backend.close()
 
+
 class TestMempoolBackendUnit:
     """Unit tests for MempoolBackend logic."""
 
@@ -353,6 +354,22 @@ class TestBitcoinCoreBackendUnit:
         assert backend.can_estimate_fee() is True
 
     @pytest.mark.asyncio
+    async def test_warns_for_remote_non_https_rpc_url(self, monkeypatch):
+        """Remote non-HTTPS RPC URLs should emit a credential exposure warning."""
+        warning_calls: list[str] = []
+
+        def capture_warning(message: str, *args):
+            warning_calls.append(message % args if args else message)
+
+        monkeypatch.setattr("jmwallet.backends.bitcoin_core.logger.warning", capture_warning)
+
+        backend = BitcoinCoreBackend(
+            rpc_url="http://example.org:8332", rpc_user="test", rpc_password="test"
+        )
+        assert any("remote and non-HTTPS" in call for call in warning_calls)
+        await backend.close()
+
+    @pytest.mark.asyncio
     async def test_bitcoin_core_fee_returns_float(self):
         """Test that BitcoinCoreBackend fee estimation returns float."""
         from unittest.mock import AsyncMock
@@ -403,6 +420,42 @@ class TestBitcoinCoreBackendUnit:
         fee = await backend.estimate_fee(3)
         assert isinstance(fee, float)
         assert fee == 1.0
+
+    @pytest.mark.asyncio
+    async def test_get_utxos_warns_when_descriptor_address_not_queried(self, monkeypatch):
+        """Defensive warning should trigger for unexpected descriptor addresses."""
+        backend = BitcoinCoreBackend(
+            rpc_url="http://localhost:18443", rpc_user="test", rpc_password="test"
+        )
+
+        backend.get_block_height = AsyncMock(return_value=100)
+        backend._scantxoutset_with_retry = AsyncMock(
+            return_value={
+                "unspents": [
+                    {
+                        "txid": "a" * 64,
+                        "vout": 0,
+                        "amount": 0.0001,
+                        "height": 100,
+                        "desc": "addr(bc1qunexpected)#abcd",
+                        "scriptPubKey": "0014" + "00" * 20,
+                    }
+                ]
+            }
+        )
+
+        warning_calls: list[str] = []
+
+        def capture_warning(message: str, *args):
+            warning_calls.append(message % args if args else message)
+
+        monkeypatch.setattr("jmwallet.backends.bitcoin_core.logger.warning", capture_warning)
+
+        utxos = await backend.get_utxos(["bc1qrequested"])
+        assert len(utxos) == 1
+        assert any("address not in query set" in call for call in warning_calls)
+
+        await backend.close()
 
 
 class TestNeutrinoBackend:
@@ -480,6 +533,7 @@ class TestNeutrinoBackend:
         rescan_call = backend._api_call.call_args_list[0]
         assert rescan_call[0] == ("POST", "v1/rescan")
         assert rescan_call[1]["data"]["start_height"] == 750000
+        assert rescan_call[1]["data"]["addresses"] == ["bc1qtest123"]
         await backend.close()
 
     @pytest.mark.asyncio

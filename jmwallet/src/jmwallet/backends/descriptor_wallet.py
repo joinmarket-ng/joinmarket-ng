@@ -111,6 +111,7 @@ class DescriptorWalletBackend(BlockchainBackend):
 
         # Track background rescan status
         self._background_rescan_height: int | None = None
+        self._background_rescan_task: asyncio.Task[None] | None = None
 
     def _get_wallet_url(self) -> str:
         """Get the RPC URL for wallet-specific calls."""
@@ -591,7 +592,9 @@ class DescriptorWalletBackend(BlockchainBackend):
 
             # Create a task that won't block the caller
             # We don't await it - let it run in background
-            asyncio.create_task(self._run_background_rescan(start_height))
+            self._background_rescan_task = asyncio.create_task(
+                self._run_background_rescan(start_height)
+            )
 
             self._background_rescan_height = start_height
 
@@ -625,13 +628,16 @@ class DescriptorWalletBackend(BlockchainBackend):
                 await background_client.aclose()
 
             self._background_rescan_height = None
+            self._background_rescan_task = None
 
         except asyncio.CancelledError:
             logger.info("Background rescan was cancelled")
             self._background_rescan_height = None
+            self._background_rescan_task = None
         except Exception as e:
             logger.error(f"Background rescan failed: {e}")
             self._background_rescan_height = None
+            self._background_rescan_task = None
 
     async def get_rescan_status(self) -> dict[str, Any] | None:
         """
@@ -1452,6 +1458,12 @@ class DescriptorWalletBackend(BlockchainBackend):
 
     async def close(self) -> None:
         """Close backend connections and reset clients so the backend can be reused."""
+        if self._background_rescan_task and not self._background_rescan_task.done():
+            self._background_rescan_task.cancel()
+            await asyncio.gather(self._background_rescan_task, return_exceptions=True)
+        self._background_rescan_task = None
+        self._background_rescan_height = None
+
         await self.client.aclose()
         await self._import_client.aclose()
         # Re-create fresh clients so this instance is usable again if the

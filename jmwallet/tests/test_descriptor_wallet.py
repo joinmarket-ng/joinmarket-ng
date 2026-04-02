@@ -888,6 +888,30 @@ class TestBackgroundRescan:
     """Tests for background rescan functionality."""
 
     @pytest.mark.asyncio
+    async def test_run_background_rescan_clears_task_reference_on_success(self) -> None:
+        backend = DescriptorWalletBackend(wallet_name="test_rescan_cleanup")
+        backend._wallet_loaded = True
+        backend._background_rescan_height = 100
+        backend._background_rescan_task = AsyncMock()
+
+        async def mock_rpc(
+            method: str,
+            params: list[Any] | None = None,
+            client: Any = None,
+            use_wallet: bool = True,
+        ) -> Any:
+            if method == "rescanblockchain":
+                return {"start_height": 100, "stop_height": 200}
+            return {}
+
+        backend._rpc_call = mock_rpc  # type: ignore[method-assign]
+
+        await backend._run_background_rescan(100)
+
+        assert backend._background_rescan_height is None
+        assert backend._background_rescan_task is None
+
+    @pytest.mark.asyncio
     async def test_start_background_rescan(self) -> None:
         """Test that background rescan is started correctly."""
         backend = DescriptorWalletBackend(wallet_name="test_rescan")

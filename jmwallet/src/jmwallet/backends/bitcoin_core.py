@@ -6,10 +6,12 @@ Uses RPC calls but NOT wallet functionality (no BDB dependency).
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import os
 import random
 from collections.abc import Sequence
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 from jmcore.bitcoin import btc_to_sats
@@ -62,6 +64,21 @@ class BitcoinCoreBackend(BlockchainBackend):
         self.rpc_user = rpc_user
         self.rpc_password = rpc_password
         self.scan_timeout = scan_timeout
+
+        parsed = urlparse(self.rpc_url)
+        hostname = parsed.hostname or ""
+        is_local = hostname in ("127.0.0.1", "localhost", "::1") or hostname.endswith(".onion")
+        if not is_local:
+            try:
+                is_local = ipaddress.ip_address(hostname).is_loopback
+            except (ValueError, TypeError):
+                pass
+        if parsed.scheme != "https" and not is_local:
+            logger.warning(
+                "Bitcoin Core RPC URL is remote and non-HTTPS; "
+                "RPC credentials may be exposed in transit"
+            )
+
         # Client for regular RPC calls
         self.client = httpx.AsyncClient(timeout=DEFAULT_RPC_TIMEOUT, auth=(rpc_user, rpc_password))
         # Separate client for long-running scans
@@ -296,6 +313,7 @@ class BitcoinCoreBackend(BlockchainBackend):
         for i in range(0, len(addresses), batch_size):
             chunk = addresses[i : i + batch_size]
             descriptors = [f"addr({addr})" for addr in chunk]
+            queried_addresses = set(chunk)
             if SENSITIVE_LOGGING:
                 logger.debug(f"Scanning addresses batch {i // batch_size + 1}: {chunk}")
 
@@ -320,6 +338,11 @@ class BitcoinCoreBackend(BlockchainBackend):
                     address = ""
                     if desc.startswith("addr(") and desc.endswith(")"):
                         address = desc[5:-1]
+                        if address not in queried_addresses:
+                            logger.warning(
+                                "Descriptor scan returned address not in query set: %s",
+                                address,
+                            )
                     else:
                         # Only log warning if we really can't parse it (and it's not empty)
                         if desc:

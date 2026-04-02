@@ -17,6 +17,14 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class UTXO:
+    """Backend-layer UTXO model returned by blockchain backends.
+
+    This type intentionally only contains chain-derived fields. Wallet metadata
+    such as freeze state, labels, derivation path, fidelity-bond flags, and
+    locktime are attached later by the wallet service when converting backend
+    UTXOs into wallet-layer ``UTXOInfo`` entries.
+    """
+
     txid: str
     vout: int
     value: int
