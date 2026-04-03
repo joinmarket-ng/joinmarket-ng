@@ -63,3 +63,9 @@ class TestLogLeak:
         assert len(bot._rate_limited_log_times) == test_limit
         assert new_key in bot._rate_limited_log_times
         assert oldest_key not in bot._rate_limited_log_times, "Oldest key should have been evicted"
+
+    def test_log_rate_limited_uses_interval_keyword(self, bot):
+        """Ensure interval keyword usage works for rate-limited logs."""
+        bot._log_rate_limited("compat-key", "compat message", interval=10.0)
+
+        assert "compat-key" in bot._rate_limited_log_times

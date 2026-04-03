@@ -95,7 +95,13 @@ class MakerBotProtocol(Protocol):
     async def _deferred_wallet_resync(self) -> None: ...
 
     # Defined in MakerBot, called by DirectConnectionMixin
-    def _log_rate_limited(self, key: str, message: str, interval_sec: float = 10.0) -> None: ...
+    def _log_rate_limited(
+        self,
+        key: str,
+        message: str,
+        level: str = "warning",
+        interval: float = 10.0,
+    ) -> None: ...
 
     # Defined in BackgroundTasksMixin, called internally with Protocol-typed self
     async def _connect_to_directory(
