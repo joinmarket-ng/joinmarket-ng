@@ -338,6 +338,13 @@ class NotificationSettings(BaseModel):
         default=True,
         description="Send periodic summary notifications with CoinJoin stats",
     )
+    notify_summary_balance: bool = Field(
+        default=False,
+        description=(
+            "Include total wallet balance and UTXO count in periodic summary notifications. "
+            "Disabled by default for privacy."
+        ),
+    )
     summary_interval_hours: int = Field(
         default=24,
         ge=1,

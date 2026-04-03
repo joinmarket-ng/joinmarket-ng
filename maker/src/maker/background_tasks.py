@@ -771,6 +771,25 @@ class BackgroundTasksMixin:
                             f"(current: {current_version})"
                         )
 
+                # Collect wallet balance info if summary balance is enabled
+                total_balance: int | None = None
+                utxo_count: int | None = None
+                if notifier.config.notify_summary_balance:
+                    try:
+                        total_balance = await self.wallet.get_total_balance()
+                        utxo_count = sum(
+                            len(
+                                [
+                                    u
+                                    for u in self.wallet.utxo_cache.get(md, [])
+                                    if not u.frozen and not u.is_fidelity_bond
+                                ]
+                            )
+                            for md in range(self.wallet.mixdepth_count)
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to collect wallet balance for summary: {e}")
+
                 sent = await notifier.notify_summary(
                     period_label=period_label,
                     total_requests=int(stats["total_coinjoins"]),
@@ -782,6 +801,8 @@ class BackgroundTasksMixin:
                     utxos_disclosed=int(stats["utxos_disclosed"]),
                     version=current_version,
                     update_available=update_available,
+                    total_balance=total_balance,
+                    utxo_count=utxo_count,
                 )
 
                 if sent:

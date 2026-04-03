@@ -186,6 +186,7 @@
 
 # Periodic summary notifications (enabled by default)
 # notify_summary = true  # Send periodic CoinJoin stats summary (set to false to disable)
+# notify_summary_balance = false  # Include total balance and UTXO count in summary (privacy risk)
 # summary_interval_hours = 24  # Interval: 24 (daily), 168 (weekly), or custom (1-168)
 
 # Update checks (opt-in, disabled by default)

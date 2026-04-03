@@ -170,6 +170,13 @@ class NotificationConfig(BaseModel):
         default=True,
         description="Send periodic summary notifications with CoinJoin stats",
     )
+    notify_summary_balance: bool = Field(
+        default=False,
+        description=(
+            "Include total wallet balance and UTXO count in periodic summary "
+            "notifications. Disabled by default for privacy."
+        ),
+    )
     summary_interval_hours: int = Field(
         default=24,
         ge=1,
@@ -273,6 +280,7 @@ def convert_settings_to_notification_config(
         notify_rate_limit=ns.notify_rate_limit,
         notify_startup=ns.notify_startup,
         notify_summary=ns.notify_summary,
+        notify_summary_balance=ns.notify_summary_balance,
         summary_interval_hours=ns.summary_interval_hours,
         check_for_updates=ns.check_for_updates,
         retry_enabled=ns.retry_enabled,
@@ -584,6 +592,8 @@ class Notifier:
         utxos_disclosed: int = 0,
         version: str | None = None,
         update_available: str | None = None,
+        total_balance: int | None = None,
+        utxo_count: int | None = None,
     ) -> bool:
         """
         Send a periodic summary notification with CoinJoin statistics.
@@ -599,6 +609,10 @@ class Notifier:
             utxos_disclosed: Number of UTXOs disclosed to takers
             version: Current version string (e.g., "0.15.0"), shown if provided
             update_available: Latest version string if an update is available, None otherwise
+            total_balance: Total wallet balance in sats (only included when
+                           notify_summary_balance is enabled)
+            utxo_count: Total number of spendable UTXOs (only included when
+                        notify_summary_balance is enabled)
         """
         if not self.config.notify_summary:
             return False
@@ -618,6 +632,13 @@ class Notifier:
                 f" / {self._format_amount(total_volume)}\n"
                 f"UTXOs disclosed: {utxos_disclosed}"
             )
+
+        # Append wallet balance info if enabled and provided
+        if self.config.notify_summary_balance:
+            if total_balance is not None:
+                body += f"\nBalance: {self._format_amount(total_balance)}"
+            if utxo_count is not None:
+                body += f"\nUTXOs: {utxo_count}"
 
         # Append version info if provided
         if version:
