@@ -318,7 +318,7 @@ class DirectConnectionMixin:
                         self._log_rate_limited(
                             f"direct_parse_fail:{peer_str}",
                             f"Failed to parse direct message from {peer_str}: {msg_preview!r}",
-                            interval_sec=10,
+                            interval=10,
                         )
                         continue
 
