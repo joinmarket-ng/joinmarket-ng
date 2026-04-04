@@ -185,7 +185,7 @@ class TestSelectUtxos:
     def test_select_utxos_md0_refuses_merge(self, wallet_service: WalletService):
         """select_utxos() for md0 raises if no single UTXO covers the target."""
         # md0 has 100k + 50k + 30k, but no single UTXO covers 140k
-        with pytest.raises(ValueError, match="Cannot merge md0 UTXOs for privacy reasons"):
+        with pytest.raises(ValueError, match="Cannot merge non-CJ md0 UTXOs for privacy reasons"):
             wallet_service.select_utxos(0, 140_000, min_confirmations=1)
 
     def test_select_utxos_md0_with_include_utxos(self, wallet_service: WalletService):
@@ -233,6 +233,251 @@ class TestGetAllUtxos:
         """Empty mixdepth returns empty list."""
         all_utxos = wallet_service.get_all_utxos(2, min_confirmations=1)
         assert len(all_utxos) == 0
+
+
+# ---------------------------------------------------------------------------
+# Mixdepth 0 CoinJoin output exemption tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def wallet_with_cj_labels(test_mnemonic: str, mock_backend) -> WalletService:
+    """WalletService with md0 UTXOs that have CJ labels (cj-out, cj-change, deposit)."""
+    ws = WalletService(
+        mnemonic=test_mnemonic,
+        backend=mock_backend,
+        network="regtest",
+        mixdepth_count=5,
+        gap_limit=20,
+    )
+
+    ws.utxo_cache = {
+        0: [
+            # CJ output - can be merged
+            UTXOInfo(
+                txid="a" * 64,
+                vout=0,
+                value=60_000,
+                address="bcrt1cjout1",
+                confirmations=10,
+                scriptpubkey="0014" + "aa" * 20,
+                path="m/84'/0'/0'/0/0",
+                mixdepth=0,
+                label="cj-out",
+            ),
+            # CJ output - can be merged
+            UTXOInfo(
+                txid="b" * 64,
+                vout=0,
+                value=40_000,
+                address="bcrt1cjout2",
+                confirmations=8,
+                scriptpubkey="0014" + "bb" * 20,
+                path="m/84'/0'/0'/0/1",
+                mixdepth=0,
+                label="cj-out",
+            ),
+            # CJ change - restricted (same as deposit)
+            UTXOInfo(
+                txid="c" * 64,
+                vout=0,
+                value=70_000,
+                address="bcrt1cjchange",
+                confirmations=5,
+                scriptpubkey="0014" + "cc" * 20,
+                path="m/84'/0'/0'/0/2",
+                mixdepth=0,
+                label="cj-change",
+            ),
+            # Deposit - restricted
+            UTXOInfo(
+                txid="d" * 64,
+                vout=0,
+                value=50_000,
+                address="bcrt1deposit",
+                confirmations=3,
+                scriptpubkey="0014" + "dd" * 20,
+                path="m/84'/0'/0'/0/3",
+                mixdepth=0,
+                label="deposit",
+            ),
+            # No label - restricted
+            UTXOInfo(
+                txid="e" * 64,
+                vout=0,
+                value=30_000,
+                address="bcrt1nolabel",
+                confirmations=2,
+                scriptpubkey="0014" + "ee" * 20,
+                path="m/84'/0'/0'/0/4",
+                mixdepth=0,
+            ),
+        ],
+        1: [
+            UTXOInfo(
+                txid="f" * 64,
+                vout=0,
+                value=100_000,
+                address="bcrt1md1",
+                confirmations=10,
+                scriptpubkey="0014" + "ff" * 20,
+                path="m/84'/0'/1'/0/0",
+                mixdepth=1,
+            ),
+        ],
+    }
+
+    return ws
+
+
+class TestMd0CjOutputExemption:
+    """Tests that CJ outputs (label='cj-out') are exempt from md0 merge restriction."""
+
+    def test_select_utxos_md0_cj_outputs_can_merge(self, wallet_with_cj_labels: WalletService):
+        """select_utxos() for md0 can merge multiple cj-out UTXOs."""
+        # CJ pool: 60k + 40k = 100k, target is 90k -- needs both CJ outs
+        selected = wallet_with_cj_labels.select_utxos(0, 90_000, min_confirmations=1)
+        assert len(selected) == 2
+        assert all(u.label == "cj-out" for u in selected)
+        assert sum(u.value for u in selected) == 100_000
+
+    def test_select_utxos_md0_single_cj_out_sufficient(self, wallet_with_cj_labels: WalletService):
+        """When one cj-out is enough, select only that one."""
+        selected = wallet_with_cj_labels.select_utxos(0, 55_000, min_confirmations=1)
+        assert len(selected) == 1
+        assert selected[0].value == 60_000
+        assert selected[0].label == "cj-out"
+
+    def test_select_utxos_md0_falls_back_to_largest_non_cj(
+        self, wallet_with_cj_labels: WalletService
+    ):
+        """When CJ pool < target but a single non-CJ covers it, use that."""
+        # CJ pool = 100k < 65k target, but cj-change 70k covers it
+        # Actually CJ pool 100k >= 65k, so it prefers CJ pool
+        # Try a target where CJ pool can't cover but single non-CJ can
+        # Remove one CJ output to make pool smaller
+        wallet_with_cj_labels.utxo_cache[0] = [
+            u for u in wallet_with_cj_labels.utxo_cache[0] if u.txid != "b" * 64
+        ]
+        # Now CJ pool = 60k, non-CJ: cj-change=70k, deposit=50k, nolabel=30k
+        selected = wallet_with_cj_labels.select_utxos(0, 65_000, min_confirmations=1)
+        assert len(selected) == 1
+        assert selected[0].value == 70_000  # cj-change (largest non-CJ)
+
+    def test_select_utxos_md0_cj_change_not_merged(self, wallet_with_cj_labels: WalletService):
+        """cj-change is NOT exempt from md0 restriction."""
+        # Remove CJ outputs so only non-CJ UTXOs remain
+        wallet_with_cj_labels.utxo_cache[0] = [
+            u for u in wallet_with_cj_labels.utxo_cache[0] if u.label != "cj-out"
+        ]
+        # Non-CJ: cj-change=70k, deposit=50k, nolabel=30k
+        # Cannot merge, largest is 70k
+        with pytest.raises(ValueError, match="Cannot merge non-CJ md0 UTXOs"):
+            wallet_with_cj_labels.select_utxos(0, 100_000, min_confirmations=1)
+
+    def test_select_utxos_md0_restrict_false_allows_merge(
+        self, wallet_with_cj_labels: WalletService
+    ):
+        """restrict_md0=False allows merging all md0 UTXOs."""
+        selected = wallet_with_cj_labels.select_utxos(
+            0, 200_000, min_confirmations=1, restrict_md0=False
+        )
+        assert sum(u.value for u in selected) >= 200_000
+        assert len(selected) > 1
+
+    def test_select_utxos_with_merge_md0_cj_outputs_merge(
+        self, wallet_with_cj_labels: WalletService
+    ):
+        """select_utxos_with_merge() md0 can merge cj-out UTXOs with merge algo."""
+        selected = wallet_with_cj_labels.select_utxos_with_merge(
+            0, 55_000, min_confirmations=1, merge_algorithm="greedy"
+        )
+        # Greedy on CJ pool: selects both cj-out UTXOs
+        assert all(u.label == "cj-out" for u in selected)
+        assert len(selected) == 2
+
+    def test_select_utxos_with_merge_md0_gradual_cj(self, wallet_with_cj_labels: WalletService):
+        """Gradual merge adds one extra CJ output."""
+        selected = wallet_with_cj_labels.select_utxos_with_merge(
+            0, 55_000, min_confirmations=1, merge_algorithm="gradual"
+        )
+        # Minimum = 1 (60k covers 55k), gradual = +1 = 2 CJ outs
+        assert len(selected) == 2
+        assert all(u.label == "cj-out" for u in selected)
+
+    def test_select_utxos_with_merge_md0_non_cj_single_only(
+        self, wallet_with_cj_labels: WalletService
+    ):
+        """Non-CJ UTXOs in md0 still restricted to single UTXO even with greedy merge."""
+        # Remove CJ outputs
+        wallet_with_cj_labels.utxo_cache[0] = [
+            u for u in wallet_with_cj_labels.utxo_cache[0] if u.label != "cj-out"
+        ]
+        # Largest non-CJ is 70k, target is 50k
+        selected = wallet_with_cj_labels.select_utxos_with_merge(
+            0, 50_000, min_confirmations=1, merge_algorithm="greedy"
+        )
+        assert len(selected) == 1
+        assert selected[0].value == 70_000
+
+    def test_select_utxos_with_merge_md0_restrict_false(self, wallet_with_cj_labels: WalletService):
+        """restrict_md0=False allows full merge on md0."""
+        selected = wallet_with_cj_labels.select_utxos_with_merge(
+            0, 50_000, min_confirmations=1, merge_algorithm="greedy", restrict_md0=False
+        )
+        # All 5 UTXOs in md0 should be selected (greedy)
+        assert len(selected) == 5
+        assert sum(u.value for u in selected) == 250_000
+
+
+class TestGetBalanceForOffersCjExemption:
+    """Tests for get_balance_for_offers() with CJ output exemption."""
+
+    @pytest.mark.asyncio
+    async def test_md0_cj_pool_larger_than_single(self, wallet_with_cj_labels: WalletService):
+        """When CJ pool > largest non-CJ, effective balance is CJ pool."""
+        # CJ pool: 60k + 40k = 100k, largest non-CJ: 70k (cj-change)
+        balance = await wallet_with_cj_labels.get_balance_for_offers(0, min_confirmations=1)
+        assert balance == 100_000  # max(100k, 70k) = 100k
+
+    @pytest.mark.asyncio
+    async def test_md0_single_non_cj_larger_than_pool(self, wallet_with_cj_labels: WalletService):
+        """When largest non-CJ > CJ pool, effective balance is largest non-CJ."""
+        # Make CJ pool smaller by removing one CJ output
+        wallet_with_cj_labels.utxo_cache[0] = [
+            u for u in wallet_with_cj_labels.utxo_cache[0] if u.txid != "a" * 64
+        ]
+        # CJ pool: 40k, largest non-CJ: 70k
+        balance = await wallet_with_cj_labels.get_balance_for_offers(0, min_confirmations=1)
+        assert balance == 70_000  # max(40k, 70k) = 70k
+
+    @pytest.mark.asyncio
+    async def test_md0_restrict_false_returns_total(self, wallet_with_cj_labels: WalletService):
+        """restrict_md0=False returns total balance like non-md0."""
+        balance = await wallet_with_cj_labels.get_balance_for_offers(
+            0, min_confirmations=1, restrict_md0=False
+        )
+        # Total: 60k + 40k + 70k + 50k + 30k = 250k
+        assert balance == 250_000
+
+    @pytest.mark.asyncio
+    async def test_md0_only_cj_outputs(self, wallet_with_cj_labels: WalletService):
+        """When md0 has only cj-out UTXOs, pool sum is the balance."""
+        wallet_with_cj_labels.utxo_cache[0] = [
+            u for u in wallet_with_cj_labels.utxo_cache[0] if u.label == "cj-out"
+        ]
+        balance = await wallet_with_cj_labels.get_balance_for_offers(0, min_confirmations=1)
+        assert balance == 100_000  # max(100k, 0) = 100k
+
+    @pytest.mark.asyncio
+    async def test_md0_no_cj_outputs(self, wallet_with_cj_labels: WalletService):
+        """When md0 has no cj-out UTXOs, balance is largest single UTXO."""
+        wallet_with_cj_labels.utxo_cache[0] = [
+            u for u in wallet_with_cj_labels.utxo_cache[0] if u.label != "cj-out"
+        ]
+        balance = await wallet_with_cj_labels.get_balance_for_offers(0, min_confirmations=1)
+        # Largest non-CJ: cj-change=70k
+        assert balance == 70_000
 
 
 class TestGetBalanceForOffersMd0:
@@ -352,7 +597,7 @@ class TestSelectUtxosWithMerge:
 
     def test_mixdepth_0_insufficient_single_utxo_raises(self, wallet_service: WalletService):
         """mixdepth 0 should raise ValueError if no SINGLE UTXO is large enough."""
-        with pytest.raises(ValueError, match="Cannot merge md0 UTXOs for privacy reasons"):
+        with pytest.raises(ValueError, match="Cannot merge non-CJ md0 UTXOs for privacy reasons"):
             wallet_service.select_utxos_with_merge(
                 0, 140_000, min_confirmations=1, merge_algorithm="greedy"
             )
@@ -630,7 +875,7 @@ class TestFidelityBondUTXOFiltering:
         In md0 this is a privacy-driven error because merging is forbidden.
         """
         # Request 200k - more than non-FB 150k, largest single UTXO is 100k
-        with pytest.raises(ValueError, match="Cannot merge md0 UTXOs for privacy reasons"):
+        with pytest.raises(ValueError, match="Cannot merge non-CJ md0 UTXOs for privacy reasons"):
             wallet_with_timelocked.select_utxos(0, 200_000, min_confirmations=1)
 
     def test_get_all_utxos_excludes_fidelity_bonds_by_default(
@@ -871,7 +1116,7 @@ class TestFrozenUTXOFiltering:
         """
         # Spendable md0: 50k + 30k, but only single UTXO allowed.
         # Largest eligible (50k) < 90k -> raises.
-        with pytest.raises(ValueError, match="Cannot merge md0 UTXOs for privacy reasons"):
+        with pytest.raises(ValueError, match="Cannot merge non-CJ md0 UTXOs for privacy reasons"):
             wallet_with_frozen.select_utxos(0, 90_000, min_confirmations=1)
 
     def test_get_all_utxos_excludes_frozen(self, wallet_with_frozen: WalletService):

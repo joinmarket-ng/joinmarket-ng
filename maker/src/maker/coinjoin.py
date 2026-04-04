@@ -68,6 +68,7 @@ class CoinJoinSession:
         taker_utxo_amtpercent: int = 20,
         session_timeout_sec: int = 300,
         merge_algorithm: str = "default",
+        restrict_md0: bool = True,
     ):
         self.taker_nick = taker_nick
         self.offer = offer
@@ -78,6 +79,7 @@ class CoinJoinSession:
         self.taker_utxo_age = taker_utxo_age
         self.taker_utxo_amtpercent = taker_utxo_amtpercent
         self.merge_algorithm = merge_algorithm  # UTXO selection strategy
+        self.restrict_md0 = restrict_md0  # Mixdepth 0 UTXO merge restriction
 
         self.state = CoinJoinState.IDLE
         self.amount = 0
@@ -543,7 +545,9 @@ class CoinJoinSession:
             for md in range(self.wallet.mixdepth_count):
                 # Use balance for offers (excludes fidelity bonds)
                 balance = await self.wallet.get_balance_for_offers(
-                    md, min_confirmations=self.min_confirmations
+                    md,
+                    min_confirmations=self.min_confirmations,
+                    restrict_md0=self.restrict_md0,
                 )
                 balances[md] = balance
 
@@ -562,6 +566,7 @@ class CoinJoinSession:
                 required_amount,
                 self.min_confirmations,
                 merge_algorithm=self.merge_algorithm,
+                restrict_md0=self.restrict_md0,
             )
 
             utxos_dict = {(utxo.txid, utxo.vout): utxo for utxo in selected}

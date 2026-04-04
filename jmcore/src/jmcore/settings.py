@@ -338,6 +338,13 @@ class NotificationSettings(BaseModel):
         default=True,
         description="Send periodic summary notifications with CoinJoin stats",
     )
+    notify_summary_balance: bool = Field(
+        default=False,
+        description=(
+            "Include total wallet balance and UTXO count in periodic summary notifications. "
+            "Disabled by default for privacy."
+        ),
+    )
     summary_interval_hours: int = Field(
         default=24,
         ge=1,
@@ -411,6 +418,13 @@ class MakerSettings(BaseModel):
         default=1,
         ge=0,
         description="Minimum confirmations for UTXOs",
+    )
+    allow_mixdepth_zero_merge: bool = Field(
+        default=False,
+        description=(
+            "Disable the mixdepth 0 single-UTXO restriction "
+            "(experienced makers only, reduces privacy)"
+        ),
     )
     merge_algorithm: str = Field(
         default="default",

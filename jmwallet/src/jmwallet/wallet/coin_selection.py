@@ -25,6 +25,8 @@ class CoinSelectionMixin:
         min_confirmations: int = 1,
         include_utxos: list[UTXOInfo] | None = None,
         include_fidelity_bonds: bool = False,
+        *,
+        restrict_md0: bool = True,
     ) -> list[UTXOInfo]:
         """
         Select UTXOs for spending from a mixdepth.
@@ -38,6 +40,10 @@ class CoinSelectionMixin:
             include_fidelity_bonds: If True, include fidelity bond UTXOs in automatic
                                     selection. Defaults to False to prevent accidentally
                                     spending bonds.
+            restrict_md0: When True (default), mixdepth 0 non-CJ-output UTXOs are
+                          restricted to a single UTXO.  CoinJoin outputs (label
+                          ``"cj-out"``) are exempt and can be merged.  Set to False
+                          to disable the restriction.
         """
         utxos = self.utxo_cache.get(mixdepth, [])
 
@@ -58,11 +64,11 @@ class CoinSelectionMixin:
 
         eligible.sort(key=lambda u: u.value, reverse=True)
 
-        # Mixdepth 0 restriction: never merge UTXOs to avoid linking the
-        # fidelity bond with regular deposits/change.  Only the single
-        # largest eligible UTXO may be spent (mandatory include_utxos are
-        # still honoured so that PoDLE commitments work).
-        if mixdepth == 0:
+        # Mixdepth 0 restriction: avoid merging non-CoinJoin UTXOs to prevent
+        # linking deposits/fidelity bonds.  CoinJoin outputs (label "cj-out")
+        # are exempt because they already have CoinJoin privacy.
+        # When restrict_md0 is False the restriction is skipped entirely.
+        if mixdepth == 0 and restrict_md0:
             # Start with mandatory UTXOs if any
             selected: list[UTXOInfo] = []
             total = 0
@@ -71,6 +77,26 @@ class CoinSelectionMixin:
                     selected.append(utxo)
                     total += utxo.value
             if total >= target_amount:
+                return selected
+
+            # Split eligible UTXOs into CJ outputs (mergeable) and others (single only)
+            cj_outs = [u for u in eligible if u.label == "cj-out"]
+            non_cj = [u for u in eligible if u.label != "cj-out"]
+
+            remaining = target_amount - total
+
+            # Try CJ output pool first (can be merged safely)
+            cj_pool_value = sum(u.value for u in cj_outs)
+            if cj_pool_value >= remaining:
+                for utxo in cj_outs:
+                    selected.append(utxo)
+                    total += utxo.value
+                    if total >= target_amount:
+                        return selected
+
+            # Try single largest non-CJ UTXO
+            if non_cj and non_cj[0].value >= remaining:
+                selected.append(non_cj[0])
                 return selected
 
             if not eligible:
@@ -90,14 +116,14 @@ class CoinSelectionMixin:
                         f"{min_confirmations} confirmation(s) before use)"
                     )
                 raise ValueError("Insufficient funds: no eligible UTXOs in mixdepth 0")
-            if eligible[0].value + total < target_amount:
-                raise ValueError(
-                    f"Insufficient funds: largest md0 UTXO has {eligible[0].value}, "
-                    f"need {target_amount - total}. "
-                    f"Cannot merge md0 UTXOs for privacy reasons."
-                )
-            selected.append(eligible[0])
-            return selected
+
+            largest_non_cj = non_cj[0].value if non_cj else 0
+            raise ValueError(
+                f"Insufficient funds: CJ-output pool has {cj_pool_value}, "
+                f"largest non-CJ UTXO has {largest_non_cj}, "
+                f"need {remaining}. "
+                f"Cannot merge non-CJ md0 UTXOs for privacy reasons."
+            )
 
         selected = []
         total = 0
@@ -174,6 +200,8 @@ class CoinSelectionMixin:
         min_confirmations: int = 1,
         merge_algorithm: str = "default",
         include_fidelity_bonds: bool = False,
+        *,
+        restrict_md0: bool = True,
     ) -> list[UTXOInfo]:
         """
         Select UTXOs with merge algorithm for maker UTXO consolidation.
@@ -194,6 +222,10 @@ class CoinSelectionMixin:
             include_fidelity_bonds: If True, include fidelity bond UTXOs.
                                     Defaults to False since they should never be
                                     automatically spent in CoinJoins.
+            restrict_md0: When True (default), mixdepth 0 non-CJ-output UTXOs are
+                          restricted to a single UTXO.  CoinJoin outputs (label
+                          ``"cj-out"``) are exempt and can be merged.  Set to False
+                          to disable the restriction.
 
         Returns:
             List of selected UTXOs
@@ -201,8 +233,6 @@ class CoinSelectionMixin:
         Raises:
             ValueError: If insufficient funds
         """
-        import random as rand_module
-
         utxos = self.utxo_cache.get(mixdepth, [])
         eligible = [utxo for utxo in utxos if utxo.confirmations >= min_confirmations]
 
@@ -216,15 +246,40 @@ class CoinSelectionMixin:
         # Sort by value descending for efficient selection
         eligible.sort(key=lambda u: u.value, reverse=True)
 
-        if mixdepth == 0:
+        if mixdepth == 0 and restrict_md0:
             if not eligible:
                 raise ValueError("Insufficient funds: no eligible UTXOs in mixdepth 0")
-            if eligible[0].value < target_amount:
+
+            # CJ outputs can be merged; non-CJ outputs are single-UTXO only
+            cj_outs = [u for u in eligible if u.label == "cj-out"]
+            non_cj = [u for u in eligible if u.label != "cj-out"]
+
+            cj_pool_value = sum(u.value for u in cj_outs)
+            largest_non_cj = non_cj[0].value if non_cj else 0
+
+            if cj_pool_value >= target_amount:
+                # Select from CJ outputs (greedy by value, then apply merge)
+                selected: list[UTXOInfo] = []
+                total = 0
+                for utxo in cj_outs:
+                    selected.append(utxo)
+                    total += utxo.value
+                    if total >= target_amount:
+                        break
+                # Apply merge algorithm to remaining CJ outputs only
+                min_count = len(selected)
+                remaining_cj = cj_outs[min_count:]
+                selected = self._apply_merge_extras(selected, remaining_cj, merge_algorithm)
+                return selected
+            elif largest_non_cj >= target_amount:
+                return [non_cj[0]]
+            else:
                 raise ValueError(
-                    f"Insufficient funds: largest md0 UTXO has {eligible[0].value}, "
-                    f"need {target_amount}. Cannot merge md0 UTXOs for privacy reasons. "
+                    f"Insufficient funds: CJ-output pool has {cj_pool_value}, "
+                    f"largest non-CJ UTXO has {largest_non_cj}, "
+                    f"need {target_amount}. "
+                    f"Cannot merge non-CJ md0 UTXOs for privacy reasons."
                 )
-            return [eligible[0]]
 
         # First, select minimum needed (greedy by value)
         selected = []
@@ -259,6 +314,28 @@ class CoinSelectionMixin:
         remaining = eligible[min_count:]
 
         # Apply merge algorithm to add additional UTXOs
+        selected = self._apply_merge_extras(selected, remaining, merge_algorithm)
+
+        return selected
+
+    @staticmethod
+    def _apply_merge_extras(
+        selected: list[UTXOInfo],
+        remaining: list[UTXOInfo],
+        merge_algorithm: str,
+    ) -> list[UTXOInfo]:
+        """Apply merge algorithm to add extra UTXOs beyond the minimum selection.
+
+        Args:
+            selected: Already-selected UTXOs (minimum needed).
+            remaining: Eligible UTXOs not yet selected, sorted by value descending.
+            merge_algorithm: ``"default"`` | ``"gradual"`` | ``"greedy"`` | ``"random"``.
+
+        Returns:
+            Extended ``selected`` list (may be mutated in-place).
+        """
+        import random as rand_module
+
         if merge_algorithm == "greedy":
             # Add ALL remaining UTXOs
             selected.extend(remaining)

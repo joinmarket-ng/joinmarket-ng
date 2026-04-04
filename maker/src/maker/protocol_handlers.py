@@ -448,6 +448,7 @@ class ProtocolHandlersMixin:
                 backend=self.backend,
                 session_timeout_sec=self.config.session_timeout_sec,
                 merge_algorithm=self.config.merge_algorithm.value,
+                restrict_md0=not self.config.allow_mixdepth_zero_merge,
             )
 
             # Validate channel consistency (first message records the channel)

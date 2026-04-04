@@ -308,17 +308,28 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin):
             utxos = [u for u in utxos if u.confirmations >= min_confirmations]
         return sum(utxo.value for utxo in utxos)
 
-    async def get_balance_for_offers(self, mixdepth: int, min_confirmations: int = 0) -> int:
+    async def get_balance_for_offers(
+        self, mixdepth: int, min_confirmations: int = 0, *, restrict_md0: bool = True
+    ) -> int:
         """Get balance available for maker offers (excludes fidelity bond UTXOs).
 
         Fidelity bonds should never be automatically spent in CoinJoins,
         so makers must exclude them when calculating available offer amounts.
 
-        For mixdepth 0, only the largest single UTXO value is returned because
-        merging md0 UTXOs is forbidden for privacy reasons (it would link the
-        fidelity bond to regular deposits/change).
+        For mixdepth 0 (when ``restrict_md0`` is True), UTXOs that are **not**
+        CoinJoin outputs are restricted to a single UTXO to avoid linking
+        deposits or fidelity bonds.  CoinJoin outputs (``label == "cj-out"``)
+        are exempt because they already have CoinJoin privacy and can be
+        safely merged.
+
+        The effective balance is therefore::
+
+            max(sum_of_cj_outputs, largest_non_cj_output)
+
+        When ``restrict_md0`` is False (opt-in via config), mixdepth 0 is
+        treated the same as any other mixdepth.
         """
-        if mixdepth == 0:
+        if mixdepth == 0 and restrict_md0:
             if mixdepth not in self.utxo_cache:
                 await self.sync_mixdepth(mixdepth)
             utxos = self.utxo_cache.get(mixdepth, [])
@@ -329,7 +340,11 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin):
             ]
             if not eligible:
                 return 0
-            return max(u.value for u in eligible)
+
+            cj_pool = sum(u.value for u in eligible if u.label == "cj-out")
+            non_cj = [u for u in eligible if u.label != "cj-out"]
+            largest_single = max((u.value for u in non_cj), default=0)
+            return max(cj_pool, largest_single)
 
         return await self.get_balance(
             mixdepth, include_fidelity_bonds=False, min_confirmations=min_confirmations

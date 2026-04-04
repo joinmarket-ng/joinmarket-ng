@@ -958,6 +958,148 @@ class TestNotifySummary:
         assert "Version: 0.15.0" in body
         assert "(update available: 0.16.0)" in body
 
+    @pytest.mark.asyncio
+    async def test_summary_balance_disabled_by_default(self) -> None:
+        """Test that balance/UTXO info is NOT included when notify_summary_balance is False."""
+        config = NotificationConfig(enabled=True, urls=["test://"], notify_summary=True)
+        notifier = Notifier(config)
+        notifier._send = AsyncMock(return_value=True)
+
+        assert config.notify_summary_balance is False
+
+        await notifier.notify_summary(
+            period_label="Daily",
+            total_requests=5,
+            successful=5,
+            failed=0,
+            total_earnings=1000,
+            total_volume=5_000_000,
+            total_balance=1_500_000,
+            utxo_count=12,
+        )
+
+        call_kwargs = notifier._send.call_args
+        body = call_kwargs[1].get("body", call_kwargs[0][1] if len(call_kwargs[0]) > 1 else "")
+        assert "Balance:" not in body
+        assert "UTXOs: 12" not in body
+
+    @pytest.mark.asyncio
+    async def test_summary_balance_enabled(self) -> None:
+        """Test that balance and UTXO count are included when notify_summary_balance is True."""
+        config = NotificationConfig(
+            enabled=True,
+            urls=["test://"],
+            notify_summary=True,
+            notify_summary_balance=True,
+        )
+        notifier = Notifier(config)
+        notifier._send = AsyncMock(return_value=True)
+
+        await notifier.notify_summary(
+            period_label="Daily",
+            total_requests=5,
+            successful=5,
+            failed=0,
+            total_earnings=1000,
+            total_volume=5_000_000,
+            total_balance=1_500_000,
+            utxo_count=12,
+        )
+
+        call_kwargs = notifier._send.call_args
+        body = call_kwargs[1].get("body", call_kwargs[0][1] if len(call_kwargs[0]) > 1 else "")
+        assert "Balance:" in body
+        assert "1,500,000 sats" in body
+        assert "UTXOs: 12" in body
+
+    @pytest.mark.asyncio
+    async def test_summary_balance_enabled_zero_activity(self) -> None:
+        """Test balance info is shown even with zero CoinJoin activity."""
+        config = NotificationConfig(
+            enabled=True,
+            urls=["test://"],
+            notify_summary=True,
+            notify_summary_balance=True,
+        )
+        notifier = Notifier(config)
+        notifier._send = AsyncMock(return_value=True)
+
+        await notifier.notify_summary(
+            period_label="Daily",
+            total_requests=0,
+            successful=0,
+            failed=0,
+            total_earnings=0,
+            total_volume=0,
+            total_balance=2_000_000,
+            utxo_count=5,
+        )
+
+        call_kwargs = notifier._send.call_args
+        body = call_kwargs[1].get("body", call_kwargs[0][1] if len(call_kwargs[0]) > 1 else "")
+        assert "No CoinJoin activity" in body
+        assert "Balance:" in body
+        assert "UTXOs: 5" in body
+
+    @pytest.mark.asyncio
+    async def test_summary_balance_enabled_none_values(self) -> None:
+        """Test that None balance/utxo_count are gracefully omitted."""
+        config = NotificationConfig(
+            enabled=True,
+            urls=["test://"],
+            notify_summary=True,
+            notify_summary_balance=True,
+        )
+        notifier = Notifier(config)
+        notifier._send = AsyncMock(return_value=True)
+
+        await notifier.notify_summary(
+            period_label="Daily",
+            total_requests=1,
+            successful=1,
+            failed=0,
+            total_earnings=100,
+            total_volume=1_000_000,
+            total_balance=None,
+            utxo_count=None,
+        )
+
+        call_kwargs = notifier._send.call_args
+        body = call_kwargs[1].get("body", call_kwargs[0][1] if len(call_kwargs[0]) > 1 else "")
+        assert "Balance:" not in body
+        assert "UTXOs:" not in body
+
+    @pytest.mark.asyncio
+    async def test_summary_balance_amounts_hidden(self) -> None:
+        """Test that balance respects include_amounts=False privacy setting."""
+        config = NotificationConfig(
+            enabled=True,
+            urls=["test://"],
+            notify_summary=True,
+            notify_summary_balance=True,
+            include_amounts=False,
+        )
+        notifier = Notifier(config)
+        notifier._send = AsyncMock(return_value=True)
+
+        await notifier.notify_summary(
+            period_label="Daily",
+            total_requests=1,
+            successful=1,
+            failed=0,
+            total_earnings=100,
+            total_volume=1_000_000,
+            total_balance=1_500_000,
+            utxo_count=8,
+        )
+
+        call_kwargs = notifier._send.call_args
+        body = call_kwargs[1].get("body", call_kwargs[0][1] if len(call_kwargs[0]) > 1 else "")
+        # Balance amount should be hidden but label should still be present
+        assert "Balance: [hidden]" in body
+        # UTXO count is not an amount, should still show
+        assert "UTXOs: 8" in body
+
 
 class TestNotificationLogging:
     """Tests for notification logging."""
@@ -1274,6 +1416,7 @@ class TestConvertSettingsToNotificationConfig:
                 urls=["gotify://host/token"],
                 notify_summary=True,
                 summary_interval_hours=168,
+                notify_summary_balance=True,
             )
         )
 
@@ -1281,6 +1424,7 @@ class TestConvertSettingsToNotificationConfig:
 
         assert config.notify_summary is True
         assert config.summary_interval_hours == 168
+        assert config.notify_summary_balance is True
 
     def test_convert_check_for_updates_setting(self) -> None:
         """Test that check_for_updates setting is converted correctly."""

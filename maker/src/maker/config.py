@@ -265,6 +265,18 @@ class MakerConfig(WalletConfig):
         ),
     )
 
+    # Mixdepth 0 privacy restriction
+    allow_mixdepth_zero_merge: bool = Field(
+        default=False,
+        description=(
+            "When False (default), mixdepth 0 UTXOs are restricted to prevent "
+            "linking deposits/fidelity bonds via UTXO merging. CoinJoin outputs "
+            "(label 'cj-out') are always exempt from this restriction since they "
+            "already have CoinJoin privacy. Set to True to disable the restriction "
+            "entirely (experienced makers only)."
+        ),
+    )
+
     # UTXO merge algorithm - how many UTXOs to use
     merge_algorithm: MergeAlgorithm = Field(
         default=MergeAlgorithm.DEFAULT,

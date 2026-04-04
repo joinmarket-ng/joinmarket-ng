@@ -765,7 +765,9 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         old_max_balance = 0
         for mixdepth in range(self.wallet.mixdepth_count):
             balance = await self.wallet.get_balance_for_offers(
-                mixdepth, min_confirmations=self.config.min_confirmations
+                mixdepth,
+                min_confirmations=self.config.min_confirmations,
+                restrict_md0=not self.config.allow_mixdepth_zero_merge,
             )
             old_max_balance = max(old_max_balance, balance)
 
@@ -788,7 +790,9 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         new_max_balance = 0
         for mixdepth in range(self.wallet.mixdepth_count):
             balance = await self.wallet.get_balance_for_offers(
-                mixdepth, min_confirmations=self.config.min_confirmations
+                mixdepth,
+                min_confirmations=self.config.min_confirmations,
+                restrict_md0=not self.config.allow_mixdepth_zero_merge,
             )
             new_max_balance = max(new_max_balance, balance)
 

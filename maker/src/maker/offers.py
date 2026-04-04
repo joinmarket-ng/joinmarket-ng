@@ -70,7 +70,9 @@ class OfferManager:
             for mixdepth in range(self.wallet.mixdepth_count):
                 # Use balance for offers (excludes fidelity bonds)
                 balance = await self.wallet.get_balance_for_offers(
-                    mixdepth, min_confirmations=self.config.min_confirmations
+                    mixdepth,
+                    min_confirmations=self.config.min_confirmations,
+                    restrict_md0=not self.config.allow_mixdepth_zero_merge,
                 )
                 balances[mixdepth] = balance
 
