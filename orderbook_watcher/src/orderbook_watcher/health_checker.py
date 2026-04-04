@@ -288,48 +288,59 @@ class MakerHealthChecker:
         self, makers: list[tuple[str, str]], force: bool = False
     ) -> dict[str, MakerHealthStatus]:
         """
-        Check health of multiple makers in parallel.
+        Check health of multiple makers in priority-ordered chunks.
+
+        Makers are processed in the order provided.  Each chunk of
+        ``max_concurrent_checks`` makers runs in parallel; the next chunk
+        starts only after the previous one completes.  This guarantees that
+        high-priority makers (e.g. bonded, low-fee) are checked before
+        low-priority ones when the caller pre-sorts the list.
 
         Args:
-            makers: List of (nick, location) tuples
-            force: Force check even if recently checked
+            makers: List of (nick, location) tuples, ideally pre-sorted by
+                priority (bonded first, then fee-ascending).
+            force: Force check even if recently checked.
 
         Returns:
-            Dict mapping location to MakerHealthStatus
+            Dict mapping location to MakerHealthStatus.
         """
-        tasks = [self.check_maker(nick, location, force) for nick, location in makers]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
         status_map: dict[str, MakerHealthStatus] = {}
-        for (nick, location), result in zip(makers, results, strict=True):
-            if isinstance(result, BaseException):
-                # Handle both Exception and BaseException (e.g., asyncio.CancelledError)
-                logger.error(f"Health check for {nick} at {location} raised exception: {result}")
-                status_map[location] = MakerHealthStatus(
-                    location=location,
-                    nick=nick,
-                    reachable=False,
-                    last_check_time=time.time(),
-                    last_success_time=None,
-                    consecutive_failures=self.health_status.get(
-                        location,
-                        MakerHealthStatus(
-                            location=location,
-                            nick=nick,
-                            reachable=False,
-                            last_check_time=0,
-                            last_success_time=None,
-                            consecutive_failures=0,
-                            features=FeatureSet(),
-                        ),
-                    ).consecutive_failures
-                    + 1,
-                    features=FeatureSet(),
-                    error=str(result),
-                )
-            else:
-                # Type narrowing: result is MakerHealthStatus here
-                status_map[location] = result
+        chunk_size = self.max_concurrent_checks
+
+        for chunk_start in range(0, len(makers), chunk_size):
+            chunk = makers[chunk_start : chunk_start + chunk_size]
+            tasks = [self.check_maker(nick, location, force) for nick, location in chunk]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            for (nick, location), result in zip(chunk, results, strict=True):
+                if isinstance(result, BaseException):
+                    logger.error(
+                        f"Health check for {nick} at {location} raised exception: {result}"
+                    )
+                    status_map[location] = MakerHealthStatus(
+                        location=location,
+                        nick=nick,
+                        reachable=False,
+                        last_check_time=time.time(),
+                        last_success_time=None,
+                        consecutive_failures=self.health_status.get(
+                            location,
+                            MakerHealthStatus(
+                                location=location,
+                                nick=nick,
+                                reachable=False,
+                                last_check_time=0,
+                                last_success_time=None,
+                                consecutive_failures=0,
+                                features=FeatureSet(),
+                            ),
+                        ).consecutive_failures
+                        + 1,
+                        features=FeatureSet(),
+                        error=str(result),
+                    )
+                else:
+                    status_map[location] = result
 
         return status_map
 

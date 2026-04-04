@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "jmcore"
-version = "0.22.0"
+version = "0.23.0"
 description = "Core library for JoinMarket components"
 readme = "README.md"
 requires-python = ">=3.11"

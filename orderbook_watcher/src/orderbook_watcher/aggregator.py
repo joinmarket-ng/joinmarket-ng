@@ -486,12 +486,88 @@ class OrderbookAggregator:
 
         logger.info("Peerlist refresh task stopped")
 
+    def _prioritize_makers_for_scan(
+        self,
+        makers: list[tuple[str, str]],
+    ) -> list[tuple[str, str]]:
+        """Sort makers for scanning: bonded (desc bond value), then bondless (asc fee).
+
+        During sybil attacks the orderbook may contain thousands of fake offers.
+        Scanning them in arbitrary order wastes the limited concurrent-check
+        slots on attackers while legitimate makers never get their features
+        discovered.  By processing bonded makers first (highest bond value first)
+        and then bondless makers in ascending fee order we ensure the most
+        trustworthy and cheapest liquidity is scanned before the spam.
+
+        Args:
+            makers: List of (nick, location) tuples to prioritize.
+
+        Returns:
+            Sorted list of (nick, location) tuples.
+        """
+        # Build lookup: nick -> (best_bond_value, lowest_fee_rate)
+        # We scan all clients for the best bond value and lowest fee for each nick.
+        nick_bond_value: dict[str, int] = {}
+        nick_fee_rate: dict[str, float] = {}
+
+        for client in self.clients.values():
+            for key, offer_ts in client.offers.items():
+                nick = key[0]
+                offer = offer_ts.offer
+
+                # Track best (highest) bond value
+                bond_val = offer.fidelity_bond_value
+                if bond_val > nick_bond_value.get(nick, 0):
+                    nick_bond_value[nick] = bond_val
+
+                # Track lowest fee rate for ordering bondless makers.
+                # Normalise both offer types to a comparable float:
+                #   - Relative offers: the cjfee string is already a rate
+                #     (e.g. "0.003" = 0.3%)
+                #   - Absolute offers: express as rate relative to maxsize
+                #     so that we have a rough comparison metric.
+                try:
+                    if offer.is_absolute_fee():
+                        fee_rate = float(int(offer.cjfee)) / max(offer.maxsize, 1)
+                    else:
+                        fee_rate = float(offer.cjfee)
+                except (ValueError, TypeError, ZeroDivisionError):
+                    fee_rate = float("inf")
+
+                if fee_rate < nick_fee_rate.get(nick, float("inf")):
+                    nick_fee_rate[nick] = fee_rate
+
+        def sort_key(item: tuple[str, str]) -> tuple[int, float, float]:
+            nick = item[0]
+            bond = nick_bond_value.get(nick, 0)
+            fee = nick_fee_rate.get(nick, float("inf"))
+            # Primary: bonded first (group 0) vs bondless (group 1)
+            # Secondary for bonded: descending bond value (negate)
+            # Secondary for bondless: ascending fee rate
+            if bond > 0:
+                return (0, -bond, fee)
+            return (1, 0, fee)
+
+        sorted_makers = sorted(makers, key=sort_key)
+
+        # Log a brief summary
+        bonded_count = sum(1 for n, _ in sorted_makers if nick_bond_value.get(n, 0) > 0)
+        logger.info(
+            f"Scan priority: {bonded_count} bonded makers first, "
+            f"{len(sorted_makers) - bonded_count} bondless (fee-ascending)"
+        )
+        return sorted_makers
+
     async def _check_makers_without_features(self) -> None:
         """Check makers that have offers but no features discovered yet.
 
         This is called after peerlist refresh to ensure we discover features
         for makers whose features weren't included in the peerlist (e.g., from
         reference implementation directories that don't support peerlist_features).
+
+        Makers are scanned in priority order: bonded makers first (descending
+        bond value), then bondless makers in ascending fee order.  This ensures
+        legitimate makers get their features discovered before sybil spam.
         """
         makers_to_check: list[tuple[str, str]] = []
 
@@ -506,9 +582,9 @@ class OrderbookAggregator:
                     if location and location != "NOT-SERVING-ONION":
                         makers_to_check.append((nick, location))
 
-        # Deduplicate by location
+        # Deduplicate by location (keep first nick per location after priority sort)
         unique_makers = {loc: (nick, loc) for nick, loc in makers_to_check}
-        makers_list = list(unique_makers.values())
+        makers_list = self._prioritize_makers_for_scan(list(unique_makers.values()))
 
         if not makers_list:
             return
@@ -588,8 +664,8 @@ class OrderbookAggregator:
                         "unique makers"
                     )
 
-                    # Check makers in batch (with rate limiting via semaphore)
-                    makers_list = list(makers_to_check.values())
+                    # Sort by priority: bonded first (desc value), then bondless (asc fee)
+                    makers_list = self._prioritize_makers_for_scan(list(makers_to_check.values()))
                     health_statuses = await self.health_checker.check_makers_batch(makers_list)
 
                     # Log unreachable makers for debugging but DO NOT remove offers

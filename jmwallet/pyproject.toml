@@ -1,6 +1,6 @@
 [project]
 name = "jmwallet"
-version = "0.22.0"
+version = "0.23.0"
 description = "JoinMarket wallet library with pluggable blockchain backends"
 requires-python = ">=3.11"
 dependencies = [

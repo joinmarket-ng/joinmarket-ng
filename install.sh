@@ -22,7 +22,7 @@ VENV_DIR="${JMNG_VENV_DIR:-$HOME/.joinmarket-ng/venv}"
 DATA_DIR="${JOINMARKET_DATA_DIR:-$HOME/.joinmarket-ng}"
 PYTHON_MIN_VERSION="3.11"
 GITHUB_REPO="joinmarket-ng/joinmarket-ng"
-DEFAULT_VERSION="0.22.0"  # Updated on each release
+DEFAULT_VERSION="0.23.0"  # Updated on each release
 
 # Colors for output
 RED='\033[0;31m'

@@ -13,7 +13,7 @@ from typing import Any
 
 # The project version - update this when releasing
 # Format: MAJOR.MINOR.PATCH (Semantic Versioning)
-__version__ = "0.22.0"
+__version__ = "0.23.0"
 
 # Alias for convenience
 VERSION = __version__

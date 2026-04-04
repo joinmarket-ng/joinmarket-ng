@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-04-04
+
+### Added
+
+- Exempt CoinJoin outputs from mixdepth 0 merge restriction, improving maker max offer size ([8e0d4964](../../commit/8e0d496454b7eaf753352bf4f4c908b493f7316c))
+- Add allow_mixdepth_zero_merge config flag to disable md0 UTXO restriction ([8e0d4964](../../commit/8e0d496454b7eaf753352bf4f4c908b493f7316c))
+- Add optional balance/UTXO count to periodic summary notifications (opt-in via notify_summary_balance) ([bef401ef](../../commit/bef401ef0c2a216f80ef824f8ee67142a24e8545))
+- Scan bonded makers first and low-fee makers before spam during feature discovery ([7ede8d45](../../commit/7ede8d454e968138b279a46ea6ef2b722e6c7ab6))
+
+### Fixed
+
+- Make wallet history rewrites atomic and avoid 0-conf promotion to confirmed status ([01c73dae](../../commit/01c73dae85580c8cf945b4d01626072326862dbd))
+- Protect bond registry writes with atomic replacement and 0600 permissions ([bf0e855a](../../commit/bf0e855ad6dcab723a4aab08242381f8629a1c5b))
+- Prevent partial descriptor import failures from being treated as fully imported ([746a3a98](../../commit/746a3a98575497ca62b3fc33fca2736cb52c48c1))
+- Correct mempool backend confirmation calculation for UTXO queries ([a09e4c41](../../commit/a09e4c4160493082b55f77faae8e4b5a4a8a17fd))
+- Deduplicate fidelity bond cache entries and preserve fidelity bond freeze safety in bulk actions ([8c0321f9](../../commit/8c0321f98aa0d9057c4046c4b6aa65840088cac8))
+- Add send CLI safeguards for manual fee rate and change key derivation ([e80ba7c6](../../commit/e80ba7c68c00b0c2b8852acb899c432f0e8b0ca0))
+- Harden cold-wallet key handling and add offline current-block certificate workflows ([ef2a550a](../../commit/ef2a550a17d939ce3ee9f342f6bcee6978295177))
+- Keep fidelity bond UTXOs frozen when bulk-unfreezing regular coins ([83a39ba2](../../commit/83a39ba2f0057cc1bb2b6b728ebb90ad978bd8b6))
+- Reduce wallet service memory retention and keep reserved address tracking bounded by durable history. ([243c31cb](../../commit/243c31cbafb79abdf9ce4f3db375cc4c53becdd2))
+- Enforce strict BIP32 and segwit signing invariants to prevent silent invalid transaction signatures. ([28027d83](../../commit/28027d834ef5b31f7e280a8fa64be9991bddec5a))
+- Improve backend safety checks and lifecycle handling for RPC privacy, descriptor scans, and background rescans. ([0582ae82](../../commit/0582ae82100ab767f2b5a37805903499b777d3e5))
+- Keep descriptor wallet path and address caches consistent after cache clears. ([b8d1908b](../../commit/b8d1908b9fda4186cc368cb609cd9409ac949974))
+- Restore jmwalletd seed endpoint and service startup mnemonic wiring without reintroducing mnemonic storage on WalletService. ([772bafbb](../../commit/772bafbb7ecf88f304b4bebcaed37caccf03f397))
+- Reject transactions with output values exceeding the total possible Bitcoin supply (2.1 quadrillion sats) ([de79981d](../../commit/de79981dd92edeb959ae31a78fcc1606cd1e85db))
+- Enforce MAX_MONEY output value validation in shared transaction parser ([d2229365](../../commit/d22293658aef9629845eaf5d7cf299b1d2bf8abe))
+
 ## [0.22.0] - 2026-03-29
 
 ### Fixed
@@ -1093,7 +1120,8 @@ Releases prior to these changes (including 0.13.5, 0.13.6, and 0.13.7) cannot be
 - Pre-built image support for directory server compose.
 - Tor configuration instructions.
 
-[Unreleased]: ../../compare/0.22.0...HEAD
+[Unreleased]: ../../compare/0.23.0...HEAD
+[0.23.0]: ../../compare/0.22.0...0.23.0
 [0.22.0]: ../../compare/0.21.0...0.22.0
 [0.21.0]: ../../compare/0.20.0...0.21.0
 [0.20.0]: ../../compare/0.19.3...0.20.0
