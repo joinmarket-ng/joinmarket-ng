@@ -246,6 +246,31 @@ class TestEstimateVsize:
         assert vsize == expected
 
 
+class TestParseTransactionStrictness:
+    """Tests for strict transaction parsing behavior."""
+
+    def test_rejects_trailing_data(self) -> None:
+        """Parser must reject bytes after nLockTime."""
+        tx_hex = create_synthetic_segwit_tx(1, 1).hex() + "ff"
+
+        with pytest.raises(ValueError, match="Trailing data"):
+            parse_transaction(tx_hex)
+
+    def test_rejects_truncated_locktime(self) -> None:
+        """Parser must reject transaction missing full 4-byte locktime."""
+        tx_hex = create_synthetic_segwit_tx(1, 1)[:-1].hex()
+
+        with pytest.raises(ValueError, match="missing locktime"):
+            parse_transaction(tx_hex)
+
+    def test_rejects_excessive_input_count(self) -> None:
+        """Parser must reject pathological varint input counts."""
+        tx_hex = "01000000fd1127"  # version + varint(10001)
+
+        with pytest.raises(ValueError, match="Too many transaction inputs"):
+            parse_transaction(tx_hex)
+
+
 # =============================================================================
 # PSBT Tests
 # =============================================================================

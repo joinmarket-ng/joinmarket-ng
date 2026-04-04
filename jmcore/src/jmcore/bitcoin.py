@@ -842,46 +842,79 @@ def parse_transaction_bytes(tx_bytes: bytes) -> ParsedTransaction:
     Returns:
         ParsedTransaction object with typed TxInput/TxOutput lists
     """
+    max_inputs = 10_000
+    max_outputs = 10_000
+    max_witness_stack_items = 1_000
+
     offset = 0
+
+    if len(tx_bytes) < 4:
+        raise ValueError("Truncated transaction: missing version")
 
     # Version
     version = struct.unpack("<I", tx_bytes[offset : offset + 4])[0]
     offset += 4
 
     # Check for SegWit marker
-    marker = tx_bytes[offset]
-    flag = tx_bytes[offset + 1]
-    has_witness = marker == 0x00 and flag == 0x01
+    has_witness = False
+    if len(tx_bytes) >= offset + 2:
+        marker = tx_bytes[offset]
+        flag = tx_bytes[offset + 1]
+        has_witness = marker == 0x00 and flag == 0x01
     if has_witness:
         offset += 2
 
     # Inputs
     input_count, offset = decode_varint(tx_bytes, offset)
+    if input_count > max_inputs:
+        raise ValueError(f"Too many transaction inputs: {input_count}")
+
     inputs: list[TxInput] = []
     for _ in range(input_count):
+        if len(tx_bytes) < offset + 32 + 4:
+            raise ValueError("Truncated transaction input")
+
         txid_le = tx_bytes[offset : offset + 32]
         offset += 32
+
         vout = struct.unpack("<I", tx_bytes[offset : offset + 4])[0]
         offset += 4
+
         script_len, offset = decode_varint(tx_bytes, offset)
+        if script_len > len(tx_bytes) - offset:
+            raise ValueError("Truncated scriptSig")
         scriptsig = tx_bytes[offset : offset + script_len]
         offset += script_len
+
+        if len(tx_bytes) < offset + 4:
+            raise ValueError("Truncated input sequence")
         sequence = struct.unpack("<I", tx_bytes[offset : offset + 4])[0]
         offset += 4
+
         inputs.append(TxInput(txid_le=txid_le, vout=vout, scriptsig=scriptsig, sequence=sequence))
 
     # Outputs
     output_count, offset = decode_varint(tx_bytes, offset)
+    if output_count > max_outputs:
+        raise ValueError(f"Too many transaction outputs: {output_count}")
+
     outputs: list[TxOutput] = []
     for _ in range(output_count):
+        if len(tx_bytes) < offset + 8:
+            raise ValueError("Truncated transaction output value")
+
         value = struct.unpack("<q", tx_bytes[offset : offset + 8])[0]
         if value < 0 or value > MAX_MONEY:
             msg = f"Output value {value} outside valid range [0, {MAX_MONEY}]"
             raise ValueError(msg)
         offset += 8
+
         script_len, offset = decode_varint(tx_bytes, offset)
+        if script_len > len(tx_bytes) - offset:
+            raise ValueError("Truncated scriptPubKey")
         script = tx_bytes[offset : offset + script_len]
         offset += script_len
+
         outputs.append(TxOutput(value=value, script=script))
 
     # Witnesses
@@ -889,15 +922,27 @@ def parse_transaction_bytes(tx_bytes: bytes) -> ParsedTransaction:
     if has_witness:
         for _ in range(input_count):
             wit_count, offset = decode_varint(tx_bytes, offset)
+            if wit_count > max_witness_stack_items:
+                raise ValueError(f"Too many witness stack items: {wit_count}")
+
             wit_items = []
             for _ in range(wit_count):
                 item_len, offset = decode_varint(tx_bytes, offset)
+                if item_len > len(tx_bytes) - offset:
+                    raise ValueError("Truncated witness item")
                 wit_items.append(tx_bytes[offset : offset + item_len])
                 offset += item_len
+
             witnesses.append(wit_items)
 
     # Locktime
+    if len(tx_bytes) < offset + 4:
+        raise ValueError("Truncated transaction: missing locktime")
     locktime = struct.unpack("<I", tx_bytes[offset : offset + 4])[0]
+    offset += 4
+
+    if offset != len(tx_bytes):
+        raise ValueError("Trailing data after transaction locktime")
 
     return ParsedTransaction(
         version=version,
