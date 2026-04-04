@@ -24,7 +24,7 @@ import bech32 as bech32_lib
 from pydantic import validate_call
 from pydantic.dataclasses import dataclass
 
-from jmcore.constants import SATS_PER_BTC
+from jmcore.constants import MAX_MONEY, SATS_PER_BTC
 
 
 class NetworkType(StrEnum):
@@ -874,7 +874,10 @@ def parse_transaction_bytes(tx_bytes: bytes) -> ParsedTransaction:
     output_count, offset = decode_varint(tx_bytes, offset)
     outputs: list[TxOutput] = []
     for _ in range(output_count):
-        value = struct.unpack("<Q", tx_bytes[offset : offset + 8])[0]
+        value = struct.unpack("<q", tx_bytes[offset : offset + 8])[0]
+        if value < 0 or value > MAX_MONEY:
+            msg = f"Output value {value} outside valid range [0, {MAX_MONEY}]"
+            raise ValueError(msg)
         offset += 8
         script_len, offset = decode_varint(tx_bytes, offset)
         script = tx_bytes[offset : offset + script_len]
