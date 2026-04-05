@@ -398,7 +398,7 @@ class TestPoDLECommitment:
             p2=b"\x03" + bytes(32),
             sig=bytes(32),
             e=bytes(32),
-            utxo="txid:0",
+            utxo="a" * 64 + ":0",
             index=0,
         )
 
@@ -409,7 +409,7 @@ class TestPoDLECommitment:
         assert "sig" in revelation
         assert "e" in revelation
         assert "utxo" in revelation
-        assert revelation["utxo"] == "txid:0"
+        assert revelation["utxo"] == "a" * 64 + ":0"
 
     def test_to_commitment_str(self) -> None:
         """Test getting commitment as hex string with P prefix.
@@ -423,7 +423,7 @@ class TestPoDLECommitment:
             p2=b"\x03" + bytes(32),
             sig=bytes(32),
             e=bytes(32),
-            utxo="txid:0",
+            utxo="b" * 64 + ":0",
             index=0,
         )
 
@@ -458,7 +458,7 @@ class TestSerializeRevelation:
     def test_roundtrip(self) -> None:
         """Test serialization roundtrip."""
         private_key = bytes([8] * 32)
-        utxo_str = "g" * 64 + ":6"
+        utxo_str = "0" * 64 + ":6"
 
         original = generate_podle(private_key, utxo_str)
         wire = serialize_revelation(original)
@@ -479,7 +479,7 @@ class TestFullFlow:
         """Test full flow: generate commitment, serialize, parse, verify."""
         # Taker generates PoDLE
         private_key = bytes([9] * 32)
-        utxo_str = "h" * 64 + ":7"
+        utxo_str = "f" * 64 + ":7"
 
         commitment = generate_podle(private_key, utxo_str, index=0)
 
@@ -513,7 +513,7 @@ class TestFullFlow:
     def test_all_nums_indices(self) -> None:
         """Test PoDLE works with various NUMS indices including higher values."""
         private_key = bytes([10] * 32)
-        utxo_str = "i" * 64 + ":8"
+        utxo_str = "e" * 64 + ":8"
 
         # Test first 10 indices (commonly used)
         for idx in range(10):
@@ -533,7 +533,7 @@ class TestFullFlow:
     def test_high_nums_indices(self) -> None:
         """Test PoDLE works with higher NUMS indices (100, 200, 255)."""
         private_key = bytes([11] * 32)
-        utxo_str = "j" * 64 + ":9"
+        utxo_str = "d" * 64 + ":9"
 
         for idx in [100, 200, 255]:
             commitment = generate_podle(private_key, utxo_str, index=idx)
