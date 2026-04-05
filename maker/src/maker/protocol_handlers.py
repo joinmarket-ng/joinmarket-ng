@@ -19,7 +19,7 @@ from jmcore.deduplication import MessageDeduplicator
 from jmcore.directory_client import DirectoryClient
 from jmcore.models import Offer
 from jmcore.notifications import get_notifier
-from jmcore.protocol import COMMAND_PREFIX, JM_VERSION, MessageType
+from jmcore.protocol import COMMAND_PREFIX, JM_VERSION, MessageType, UTXOMetadata
 from jmcore.rate_limiter import RateLimitAction, RateLimiter
 from jmcore.tasks import parse_directory_address
 from jmwallet.backends.base import BlockchainBackend
@@ -30,6 +30,7 @@ from jmwallet.history import (
 )
 from jmwallet.wallet.service import WalletService
 from loguru import logger
+from pydantic import ValidationError
 
 from maker.coinjoin import CoinJoinSession
 from maker.config import MakerConfig
@@ -554,14 +555,19 @@ class ProtocolHandlersMixin:
 
                     utxo_str, p_hex, p2_hex, sig_hex, e_hex = revelation_parts
 
-                    # Parse utxo
+                    # Validate utxo
                     if ":" not in utxo_str:
                         logger.error(f"Invalid utxo format: {utxo_str}")
                         return
 
-                    # Validate utxo format (txid:vout)
                     if not utxo_str.rsplit(":", 1)[1].isdigit():
                         logger.error(f"Invalid vout in utxo: {utxo_str}")
+                        return
+
+                    try:
+                        UTXOMetadata.from_str(utxo_str)
+                    except (ValueError, ValidationError) as e:
+                        logger.error(f"Invalid UTXO in PoDLE revelation: {e}")
                         return
 
                     # parse_podle_revelation expects hex strings, not bytes

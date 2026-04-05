@@ -31,9 +31,11 @@ from typing import Any
 
 from coincurve import PublicKey
 from loguru import logger
+from pydantic import ValidationError
 from pydantic.dataclasses import dataclass
 
 from jmcore.constants import SECP256K1_N
+from jmcore.protocol import UTXOMetadata
 
 # Generator point G (compressed)
 # Standard secp256k1 generator point as defined in SEC2 v2.0 section 2.4.1
@@ -427,23 +429,16 @@ def parse_podle_revelation(revelation: dict[str, Any]) -> dict[str, Any] | None:
         sig_bytes = bytes.fromhex(revelation["sig"])
         e_bytes = bytes.fromhex(revelation["e"])
 
-        utxo_parts = revelation["utxo"].split(":")
-
-        # Legacy format: txid:vout (2 parts)
-        # Extended format: txid:vout:scriptpubkey:blockheight (4 parts)
-        if len(utxo_parts) == 2:
-            txid = utxo_parts[0]
-            vout = int(utxo_parts[1])
-            scriptpubkey = None
-            blockheight = None
-        elif len(utxo_parts) == 4:
-            txid = utxo_parts[0]
-            vout = int(utxo_parts[1])
-            scriptpubkey = utxo_parts[2]
-            blockheight = int(utxo_parts[3])
-            logger.debug(f"Parsed extended UTXO format: {txid}:{vout} with metadata")
-        else:
-            logger.warning(f"Invalid UTXO format: {revelation['utxo']}")
+        try:
+            utxo = UTXOMetadata.from_str(revelation["utxo"])
+            txid = utxo.txid
+            vout = utxo.vout
+            scriptpubkey = utxo.scriptpubkey
+            blockheight = utxo.blockheight
+            if scriptpubkey:
+                logger.debug(f"Parsed extended UTXO format: {txid}:{vout} with metadata")
+        except (ValueError, ValidationError):
+            logger.warning(f"Invalid UTXO format in PoDLE revelation: {revelation['utxo']}")
             return None
 
         result: dict[str, Any] = {

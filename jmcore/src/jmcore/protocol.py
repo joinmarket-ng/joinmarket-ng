@@ -49,6 +49,7 @@ Note: Plus separator is used because the peerlist itself uses commas to separate
 
 from __future__ import annotations
 
+import binascii
 import json
 import re
 from enum import IntEnum
@@ -241,6 +242,26 @@ class UTXOMetadata:
     scriptpubkey: str | None = None  # Hex-encoded scriptPubKey
     blockheight: int | None = None  # Block height where UTXO was confirmed
 
+    def __post_init__(self) -> None:
+        """Strict validation of UTXO fields to match legacy protocol."""
+        # TXID validation
+        if len(self.txid) != 64:
+            raise ValueError(f"Invalid TXID length: {len(self.txid)} (expected 64)")
+        try:
+            binascii.unhexlify(self.txid)
+        except (binascii.Error, TypeError) as exc:
+            raise ValueError(f"Invalid TXID hex: {self.txid}") from exc
+
+        # Vout validation (Bitcoin uint32)
+        if self.vout < 0:
+            raise ValueError(f"Invalid vout (must be non-negative): {self.vout}")
+        if self.vout > 0xFFFFFFFF:
+            raise ValueError(f"Invalid vout (overflow, max 4294967295): {self.vout}")
+
+        # Optional blockheight validation
+        if self.blockheight is not None and self.blockheight < 0:
+            raise ValueError(f"Invalid blockheight (must be non-negative): {self.blockheight}")
+
     def to_legacy_str(self) -> str:
         """Format as legacy string: txid:vout"""
         return f"{self.txid}:{self.vout}"
@@ -260,19 +281,31 @@ class UTXOMetadata:
         Extended format: txid:vout:scriptpubkey:blockheight
         """
         parts = s.split(":")
-        if len(parts) == 2:
-            # Legacy format
-            return cls(txid=parts[0], vout=int(parts[1]))
-        elif len(parts) == 4:
-            # Extended format
-            return cls(
-                txid=parts[0],
-                vout=int(parts[1]),
-                scriptpubkey=parts[2],
-                blockheight=int(parts[3]),
-            )
-        else:
+        if len(parts) not in [2, 4]:
             raise ValueError(f"Invalid UTXO format: {s}")
+
+        txid = parts[0]
+        try:
+            vout = int(parts[1])
+        except (ValueError, TypeError) as exc:
+            raise ValueError(f"Invalid vout (not an integer): {parts[1]}") from exc
+
+        if len(parts) == 2:
+            return cls(txid=txid, vout=vout)
+
+        # Extended format
+        scriptpubkey = parts[2]
+        try:
+            blockheight = int(parts[3])
+        except (ValueError, TypeError) as exc:
+            raise ValueError(f"Invalid blockheight (not an integer): {parts[3]}") from exc
+
+        return cls(
+            txid=txid,
+            vout=vout,
+            scriptpubkey=scriptpubkey,
+            blockheight=blockheight,
+        )
 
     def has_neutrino_metadata(self) -> bool:
         """Check if this UTXO has the metadata needed for Neutrino verification."""
