@@ -823,6 +823,83 @@ class TestNeutrinoBackend:
         await backend.close()
 
     @pytest.mark.asyncio
+    async def test_resolve_scan_start_height_creation_height_priority(self):
+        """creation_height should take priority over lookback but not explicit."""
+        backend = NeutrinoBackend(
+            neutrino_url="http://localhost:8334",
+            network="mainnet",
+            scan_lookback_blocks=52560,
+        )
+        backend.set_wallet_creation_height(800000)
+        result = await backend._resolve_scan_start_height(tip_height=900000)
+        # creation_height (800000) > min_valid (481824), use creation_height
+        assert result == 800000
+        await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_resolve_scan_start_height_explicit_beats_creation_height(self):
+        """Explicit scan_start_height beats creation_height."""
+        backend = NeutrinoBackend(
+            neutrino_url="http://localhost:8334",
+            network="mainnet",
+            scan_start_height=700000,
+        )
+        backend.set_wallet_creation_height(800000)
+        result = await backend._resolve_scan_start_height(tip_height=900000)
+        assert result == 700000  # Explicit wins
+        await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_resolve_scan_start_height_creation_height_clamped_to_min_valid(self):
+        """creation_height below min_valid_blockheight is clamped up."""
+        backend = NeutrinoBackend(
+            neutrino_url="http://localhost:8334",
+            network="mainnet",
+        )
+        backend.set_wallet_creation_height(100000)  # Below mainnet SegWit activation
+        result = await backend._resolve_scan_start_height(tip_height=900000)
+        assert result == 481824  # min_valid_blockheight wins
+        await backend.close()
+
+    def test_set_wallet_creation_height_ignored_when_explicit(self):
+        """set_wallet_creation_height is a no-op when explicit scan_start_height is set."""
+        backend = NeutrinoBackend(
+            neutrino_url="http://localhost:8334",
+            network="mainnet",
+            scan_start_height=700000,
+        )
+        backend.set_wallet_creation_height(800000)
+        assert backend._wallet_creation_height is None  # Should NOT be set
+
+    def test_set_wallet_creation_height_stored_when_no_explicit(self):
+        """set_wallet_creation_height stores value when no explicit override."""
+        backend = NeutrinoBackend(
+            neutrino_url="http://localhost:8334",
+            network="mainnet",
+        )
+        backend.set_wallet_creation_height(800000)
+        assert backend._wallet_creation_height == 800000
+
+    def test_set_wallet_creation_height_none_clears_hint(self):
+        """set_wallet_creation_height(None) clears any previously stored hint."""
+        backend = NeutrinoBackend(
+            neutrino_url="http://localhost:8334",
+            network="mainnet",
+        )
+        backend.set_wallet_creation_height(800000)
+        backend.set_wallet_creation_height(None)
+        assert backend._wallet_creation_height is None
+
+    def test_set_wallet_creation_height_negative_ignored(self):
+        """Negative creation heights are ignored to avoid invalid scan hints."""
+        backend = NeutrinoBackend(
+            neutrino_url="http://localhost:8334",
+            network="mainnet",
+        )
+        backend.set_wallet_creation_height(-1)
+        assert backend._wallet_creation_height is None
+
+    @pytest.mark.asyncio
     async def test_get_utxos_calls_wait_for_sync_before_initial_rescan(self):
         """get_utxos must call wait_for_sync before the first rescan."""
         from unittest.mock import AsyncMock, patch

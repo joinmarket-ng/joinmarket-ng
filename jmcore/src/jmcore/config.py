@@ -188,6 +188,15 @@ class WalletConfig(BaseModel):
         description="Backend-specific configuration",
     )
 
+    # Wallet creation height hint (populated from wallet file at load time)
+    creation_height: int | None = Field(
+        default=None,
+        description=(
+            "Block height at which the wallet was created. "
+            "Used to skip scanning blocks that predate the wallet."
+        ),
+    )
+
     # Directory servers
     directory_servers: list[str] = Field(
         default_factory=list,

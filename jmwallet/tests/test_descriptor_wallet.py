@@ -878,6 +878,58 @@ class TestSmartScan:
         assert getblockhash_calls[0][1] == [0]
         assert timestamp == 1231006505
 
+    @pytest.mark.asyncio
+    async def test_smart_scan_uses_creation_height(self) -> None:
+        """Smart scan uses creation_height instead of lookback when set."""
+        backend = DescriptorWalletBackend(wallet_name="test_creation_height")
+        backend.set_wallet_creation_height(800000)
+
+        rpc_calls: list[tuple[str, list[Any] | None]] = []
+
+        async def mock_rpc(
+            method: str,
+            params: list[Any] | None = None,
+            client: Any = None,
+            use_wallet: bool = True,
+        ) -> Any:
+            rpc_calls.append((method, params))
+            if method == "getblockchaininfo":
+                return {"blocks": 900000, "headers": 900000}
+            elif method == "getblockhash":
+                return "0000000000creation"
+            elif method == "getblockheader":
+                return {"time": 1710000000}  # Timestamp at creation height
+            return {}
+
+        backend._rpc_call = mock_rpc  # type: ignore[method-assign]
+
+        timestamp = await backend._get_smart_scan_timestamp()
+
+        # Should use creation_height=800000, not lookback=900000-52560=847440
+        getblockhash_calls = [call for call in rpc_calls if call[0] == "getblockhash"]
+        assert getblockhash_calls[0][1] == [800000]
+        assert timestamp == 1710000000
+
+    def test_set_wallet_creation_height(self) -> None:
+        """set_wallet_creation_height stores the height."""
+        backend = DescriptorWalletBackend(wallet_name="test_set_height")
+        assert backend._wallet_creation_height is None
+        backend.set_wallet_creation_height(800000)
+        assert backend._wallet_creation_height == 800000
+
+    def test_set_wallet_creation_height_none_clears_hint(self) -> None:
+        """set_wallet_creation_height(None) clears any previously stored hint."""
+        backend = DescriptorWalletBackend(wallet_name="test_clear_height")
+        backend.set_wallet_creation_height(800000)
+        backend.set_wallet_creation_height(None)
+        assert backend._wallet_creation_height is None
+
+    def test_set_wallet_creation_height_negative_ignored(self) -> None:
+        """Negative creation heights are ignored to avoid invalid scan hints."""
+        backend = DescriptorWalletBackend(wallet_name="test_negative_height")
+        backend.set_wallet_creation_height(-1)
+        assert backend._wallet_creation_height is None
+
 
 # =============================================================================
 # Background Rescan Tests

@@ -134,6 +134,19 @@ class BlockchainBackend(ABC):
         before a rescan).  Full-node backends can ignore this.
         """
 
+    def set_wallet_creation_height(self, height: int | None) -> None:
+        """Provide the block height at which the wallet was created.
+
+        Backends can use this as a hint to skip scanning blocks before
+        the wallet existed, avoiding unnecessary work during initial sync.
+        Only used when no explicit ``scan_start_height`` is configured.
+
+        Passing ``None`` clears any previously set hint.
+
+        The default implementation is a no-op; backends that support
+        scan optimisation override this method.
+        """
+
     @abstractmethod
     async def get_utxos(self, addresses: list[str]) -> list[UTXO]:
         """Get UTXOs for given addresses"""

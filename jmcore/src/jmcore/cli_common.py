@@ -91,6 +91,7 @@ class ResolvedMnemonic:
     mnemonic: str
     bip39_passphrase: str
     source: str  # Where the mnemonic came from (for logging)
+    creation_height: int | None = None  # Block height at wallet creation time
 
 
 # =============================================================================
@@ -479,6 +480,7 @@ def resolve_mnemonic(
     """
     resolved_mnemonic: str | None = None
     source = ""
+    mnemonic_file_path: Path | None = None  # Track file path for .meta loading
 
     # Priority 1: Direct mnemonic argument
     if mnemonic:
@@ -488,12 +490,14 @@ def resolve_mnemonic(
     # Priority 2: Mnemonic file argument
     elif mnemonic_file:
         resolved_mnemonic = load_mnemonic_from_file(mnemonic_file, password)
+        mnemonic_file_path = mnemonic_file
         source = f"--mnemonic-file ({mnemonic_file})"
 
     # Priority 3: MNEMONIC_FILE environment variable
     elif env_file := os.environ.get("MNEMONIC_FILE"):
         env_path = Path(env_file)
         resolved_mnemonic = load_mnemonic_from_file(env_path, password)
+        mnemonic_file_path = env_path
         source = f"MNEMONIC_FILE env ({env_path})"
 
     # Priority 4: MNEMONIC environment variable
@@ -509,6 +513,7 @@ def resolve_mnemonic(
         if config_password is None and settings.wallet.mnemonic_password:
             config_password = settings.wallet.mnemonic_password.get_secret_value()
         resolved_mnemonic = load_mnemonic_from_file(config_path, config_password)
+        mnemonic_file_path = config_path
         source = f"config file ({config_path})"
 
     # Priority 6: Default wallet path
@@ -520,6 +525,7 @@ def resolve_mnemonic(
             if config_password is None and settings.wallet.mnemonic_password:
                 config_password = settings.wallet.mnemonic_password.get_secret_value()
             resolved_mnemonic = load_mnemonic_from_file(default_wallet, config_password)
+            mnemonic_file_path = default_wallet
             source = f"default wallet ({default_wallet})"
 
     if resolved_mnemonic is None:
@@ -555,10 +561,34 @@ def resolve_mnemonic(
 
             resolved_passphrase = getpass.getpass("Enter BIP39 passphrase (leave empty for none): ")
 
+    # Load wallet metadata (creation_height) from companion .meta file
+    creation_height: int | None = None
+    if mnemonic_file_path is not None:
+        try:
+            from jmwallet.cli.mnemonic import load_mnemonic_meta
+
+            meta = load_mnemonic_meta(mnemonic_file_path)
+            raw_creation_height = meta.get("creation_height")
+            if isinstance(raw_creation_height, int) and not isinstance(raw_creation_height, bool):
+                if raw_creation_height >= 0:
+                    creation_height = raw_creation_height
+                    logger.debug(f"Loaded wallet creation height: {creation_height}")
+                else:
+                    logger.warning(
+                        f"Ignoring negative creation_height in metadata: {raw_creation_height}"
+                    )
+            elif raw_creation_height is not None:
+                logger.warning(
+                    f"Ignoring non-integer creation_height in metadata: {raw_creation_height!r}"
+                )
+        except Exception as exc:
+            logger.debug(f"Could not load mnemonic metadata: {exc}")
+
     return ResolvedMnemonic(
         mnemonic=resolved_mnemonic,
         bip39_passphrase=resolved_passphrase,
         source=source,
+        creation_height=creation_height,
     )
 
 
@@ -605,6 +635,7 @@ def create_backend(
     backend_settings: ResolvedBackendSettings,
     *,
     wallet_name: str | None = None,
+    creation_height: int | None = None,
 ) -> Any:
     """
     Create a backend instance based on resolved settings.
@@ -612,6 +643,7 @@ def create_backend(
     Args:
         backend_settings: Resolved backend settings
         wallet_name: Wallet name for descriptor_wallet backend
+        creation_height: Block height at wallet creation time (used as scan start hint)
 
     Returns:
         Backend instance (BitcoinCoreBackend, DescriptorWalletBackend, or NeutrinoBackend)
@@ -627,8 +659,9 @@ def create_backend(
 
     backend_type = backend_settings.backend_type
 
+    backend: BitcoinCoreBackend | DescriptorWalletBackend | NeutrinoBackend
     if backend_type == "neutrino":
-        return NeutrinoBackend(
+        backend = NeutrinoBackend(
             neutrino_url=backend_settings.neutrino_url,
             network=backend_settings.bitcoin_network,
             scan_start_height=backend_settings.scan_start_height,
@@ -637,14 +670,14 @@ def create_backend(
     elif backend_type == "descriptor_wallet":
         if not wallet_name:
             raise ValueError("wallet_name required for descriptor_wallet backend")
-        return DescriptorWalletBackend(
+        backend = DescriptorWalletBackend(
             rpc_url=backend_settings.rpc_url,
             rpc_user=backend_settings.rpc_user,
             rpc_password=backend_settings.rpc_password,
             wallet_name=wallet_name,
         )
     elif backend_type == "scantxoutset":
-        return BitcoinCoreBackend(
+        backend = BitcoinCoreBackend(
             rpc_url=backend_settings.rpc_url,
             rpc_user=backend_settings.rpc_user,
             rpc_password=backend_settings.rpc_password,
@@ -654,6 +687,11 @@ def create_backend(
             f"Invalid backend type: {backend_type}. "
             f"Valid options: scantxoutset, descriptor_wallet, neutrino"
         )
+
+    if creation_height is not None:
+        backend.set_wallet_creation_height(creation_height)
+
+    return backend
 
 
 def generate_descriptor_wallet_name(

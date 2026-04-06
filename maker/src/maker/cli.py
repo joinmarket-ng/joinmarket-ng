@@ -388,6 +388,9 @@ def create_wallet_service(config: MakerConfig) -> WalletService:
     else:
         raise typer.BadParameter(f"Unsupported backend: {backend_type}")
 
+    if config.creation_height is not None:
+        backend.set_wallet_creation_height(config.creation_height)
+
     wallet = WalletService(
         mnemonic=config.mnemonic.get_secret_value(),
         backend=backend,
@@ -598,6 +601,7 @@ def start(
         )
         resolved_mnemonic = resolved.mnemonic if resolved else ""
         resolved_passphrase = resolved.bip39_passphrase if resolved else ""
+        resolved_creation_height = resolved.creation_height if resolved else None
     except (ValueError, FileNotFoundError) as e:
         logger.error(str(e))
         raise typer.Exit(1)
@@ -637,6 +641,9 @@ def start(
     except ValueError as e:
         logger.error(str(e))
         raise typer.Exit(1)
+
+    if resolved_creation_height is not None:
+        config.creation_height = resolved_creation_height
 
     # Log configuration source
     logger.info(f"Using network: {config.network.value}")
@@ -737,6 +744,7 @@ def generate_address(
         )
         resolved_mnemonic = resolved.mnemonic if resolved else ""
         resolved_passphrase = resolved.bip39_passphrase if resolved else ""
+        resolved_creation_height = resolved.creation_height if resolved else None
     except (ValueError, FileNotFoundError) as e:
         logger.error(str(e))
         raise typer.Exit(1)
@@ -754,6 +762,9 @@ def generate_address(
     except ValueError as e:
         logger.error(str(e))
         raise typer.Exit(1)
+
+    if resolved_creation_height is not None:
+        config.creation_height = resolved_creation_height
 
     wallet = create_wallet_service(config)
     address = wallet.get_receive_address(0, 0)

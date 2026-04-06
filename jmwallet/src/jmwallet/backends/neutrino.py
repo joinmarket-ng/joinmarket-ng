@@ -123,12 +123,47 @@ class NeutrinoBackend(BlockchainBackend):
         self._explicit_scan_start_height: int | None = scan_start_height
         self._scan_lookback_blocks: int = scan_lookback_blocks
 
+        # Wallet creation height hint (set later via set_wallet_creation_height).
+        self._wallet_creation_height: int | None = None
+
         # _scan_start_height is resolved lazily in _resolve_scan_start_height()
         # once we know the chain tip.  For now, use the explicit value or a
         # placeholder that will be overwritten before the first rescan.
         self._scan_start_height: int = (
             scan_start_height if scan_start_height is not None else self._min_valid_blockheight
         )
+
+    def set_wallet_creation_height(self, height: int | None) -> None:
+        """Use wallet creation height as scan start if no explicit override.
+
+        When the wallet was created at a known block height, there is no
+        need to scan blocks before that point.  This takes priority over
+        the lookback-based default but NOT over an explicit
+        ``scan_start_height`` set by the user in config.
+
+        Passing ``None`` clears any previously set creation height hint.
+        """
+        if height is None:
+            self._wallet_creation_height = None
+            logger.debug("Cleared wallet creation height hint")
+            return
+
+        if not isinstance(height, int) or isinstance(height, bool):
+            logger.warning(f"Ignoring non-integer creation_height={height!r}")
+            return
+
+        if height < 0:
+            logger.warning(f"Ignoring invalid negative creation_height={height}")
+            return
+
+        if self._explicit_scan_start_height is not None:
+            logger.debug(
+                f"Ignoring creation_height={height}, "
+                f"explicit scan_start_height={self._explicit_scan_start_height} takes priority"
+            )
+            return
+        self._wallet_creation_height = height
+        logger.info(f"Wallet creation height set to {height} (will use as scan start hint)")
 
     async def _api_call(
         self,
@@ -324,20 +359,28 @@ class NeutrinoBackend(BlockchainBackend):
     async def _resolve_scan_start_height(self, tip_height: int) -> int:
         """Compute the effective scan start height for the initial rescan.
 
-        When the user has not set an explicit ``scan_start_height``, we use a
-        lookback window from the current chain tip instead of scanning from
-        genesis.  This is critical on signet/regtest where
-        ``_min_valid_blockheight`` is 0, which would otherwise scan 295k+
-        blocks on every first sync.
-
-        On mainnet/testnet, ``_min_valid_blockheight`` (SegWit activation) is
-        already a sensible default and is always honoured as a floor.
+        Priority order:
+        1. Explicit ``scan_start_height`` from config (always wins).
+        2. ``creation_height`` from wallet file (if wallet was created at a
+           known block height, no need to scan before that).
+        3. Lookback window from the current chain tip (signet/regtest where
+           ``_min_valid_blockheight`` is 0).
+        4. ``_min_valid_blockheight`` (SegWit activation on mainnet/testnet).
 
         Returns:
             The block height to start the initial rescan from.
         """
         if self._explicit_scan_start_height is not None:
             return self._explicit_scan_start_height
+
+        if self._wallet_creation_height is not None:
+            start = max(self._wallet_creation_height, self._min_valid_blockheight)
+            logger.info(
+                f"Using wallet creation height as scan start: {start} "
+                f"(creation={self._wallet_creation_height}, "
+                f"min_valid={self._min_valid_blockheight})"
+            )
+            return start
 
         if self._scan_lookback_blocks > 0 and tip_height > self._scan_lookback_blocks:
             lookback_height = tip_height - self._scan_lookback_blocks

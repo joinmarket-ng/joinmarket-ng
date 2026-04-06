@@ -301,6 +301,7 @@ def info(
             resolved_bip39_passphrase,
             extended=extended,
             gap_limit=gap,
+            creation_height=resolved.creation_height if resolved else None,
         )
     )
 
@@ -311,6 +312,7 @@ async def _show_wallet_info(
     bip39_passphrase: str = "",
     extended: bool = False,
     gap_limit: int = 6,
+    creation_height: int | None = None,
 ) -> None:
     """Show wallet info implementation."""
     from jmwallet.backends.bitcoin_core import BitcoinCoreBackend
@@ -375,6 +377,11 @@ async def _show_wallet_info(
         )
     else:
         raise ValueError(f"Unknown backend type: {backend_type}")
+
+    # If the wallet file records a creation height, tell the backend so it
+    # can skip scanning blocks that predate the wallet.
+    if creation_height is not None:
+        backend.set_wallet_creation_height(creation_height)
 
     # Create wallet with data_dir for history lookups
     wallet = WalletService(

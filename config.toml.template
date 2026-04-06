@@ -152,6 +152,8 @@
 
 # Explicit start height for initial scan (overrides scan_lookback_blocks if set)
 # Useful when you know when the wallet was first used. Set to 0 for full scan.
+# Note: wallets created via the daemon automatically record a creation height,
+# which is used as the scan start when this setting is not explicitly set.
 # scan_start_height = 0
 
 # Default fee estimation settings

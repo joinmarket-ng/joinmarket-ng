@@ -229,8 +229,9 @@ def create_backend(config: TakerConfig) -> Any:
     )
     from jmwallet.backends.neutrino import NeutrinoBackend
 
+    backend: BitcoinCoreBackend | DescriptorWalletBackend | NeutrinoBackend
     if config.backend_type == "neutrino":
-        return NeutrinoBackend(
+        backend = NeutrinoBackend(
             neutrino_url=config.backend_config.get("neutrino_url", "http://127.0.0.1:8334"),
             network=bitcoin_network.value,
             scan_start_height=config.backend_config.get("scan_start_height"),
@@ -241,18 +242,23 @@ def create_backend(config: TakerConfig) -> Any:
             config.mnemonic.get_secret_value(), config.passphrase.get_secret_value() or ""
         )
         wallet_name = generate_wallet_name(fingerprint, bitcoin_network.value)
-        return DescriptorWalletBackend(
+        backend = DescriptorWalletBackend(
             rpc_url=config.backend_config["rpc_url"],
             rpc_user=config.backend_config["rpc_user"],
             rpc_password=config.backend_config["rpc_password"],
             wallet_name=wallet_name,
         )
     else:  # scantxoutset
-        return BitcoinCoreBackend(
+        backend = BitcoinCoreBackend(
             rpc_url=config.backend_config["rpc_url"],
             rpc_user=config.backend_config["rpc_user"],
             rpc_password=config.backend_config["rpc_password"],
         )
+
+    if config.creation_height is not None:
+        backend.set_wallet_creation_height(config.creation_height)
+
+    return backend
 
 
 @app.command()
@@ -408,6 +414,7 @@ def coinjoin(
         )
         resolved_mnemonic = resolved.mnemonic if resolved else ""
         resolved_passphrase = resolved.bip39_passphrase if resolved else ""
+        resolved_creation_height = resolved.creation_height if resolved else None
     except (ValueError, FileNotFoundError) as e:
         logger.error(str(e))
         raise typer.Exit(1)
@@ -442,6 +449,9 @@ def coinjoin(
     except ValueError as e:
         logger.error(str(e))
         raise typer.Exit(1)
+
+    if resolved_creation_height is not None:
+        config.creation_height = resolved_creation_height
 
     # Log configuration source
     logger.info(f"Using network: {config.network.value}")
@@ -679,6 +689,7 @@ def tumble(
         )
         resolved_mnemonic = resolved.mnemonic if resolved else ""
         resolved_bip39_passphrase = resolved.bip39_passphrase if resolved else ""
+        resolved_creation_height = resolved.creation_height if resolved else None
     except (ValueError, FileNotFoundError) as e:
         logger.error(str(e))
         raise typer.Exit(1)
@@ -717,6 +728,9 @@ def tumble(
     except ValueError as e:
         logger.error(str(e))
         raise typer.Exit(1)
+
+    if resolved_creation_height is not None:
+        config.creation_height = resolved_creation_height
 
     # Log configuration
     logger.info(f"Using network: {config.network.value}")

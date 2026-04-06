@@ -79,6 +79,16 @@ async def create_wallet(
 
     backend = await get_backend(data_dir=data_dir)
 
+    # Record current block height as the wallet birthday.  Since this is a
+    # brand-new wallet, it cannot have received any funds before this point,
+    # so future rescans can safely start from this height.
+    creation_height: int | None = None
+    try:
+        creation_height = await backend.get_block_height()
+        logger.info(f"Recording wallet creation height: {creation_height}")
+    except Exception as exc:
+        logger.warning(f"Could not fetch block height for wallet birthday: {exc}")
+
     ws = WalletService(
         mnemonic=seedphrase,
         backend=backend,
@@ -92,6 +102,7 @@ async def create_wallet(
         mnemonic=seedphrase,
         password=password,
         wallet_type=wallet_type,
+        creation_height=creation_height,
     )
 
     # Ensure the watch-only descriptor wallet is loaded in Bitcoin Core
@@ -192,9 +203,14 @@ async def open_wallet_with_mnemonic(
     if not wallet_path.exists():
         raise FileNotFoundError(f"Wallet file not found: {wallet_path}")
 
-    seedphrase = _load_wallet_file(wallet_path=wallet_path, password=password)
+    seedphrase, creation_height = _load_wallet_file(wallet_path=wallet_path, password=password)
 
     backend = await get_backend(data_dir=data_dir)
+
+    # Propagate wallet creation height hint to the backend.  Passing None
+    # clears any stale hint from a previously opened wallet when backend
+    # instances are reused.
+    backend.set_wallet_creation_height(creation_height)
 
     ws = WalletService(
         mnemonic=seedphrase,
@@ -247,6 +263,7 @@ def _save_wallet_file(
     mnemonic: str,
     password: str,
     wallet_type: str,
+    creation_height: int | None = None,
 ) -> None:
     """Persist an encrypted wallet file.
 
@@ -271,12 +288,14 @@ def _save_wallet_file(
     key = base64.urlsafe_b64encode(kdf.derive(password.encode()))
     fernet = Fernet(key)
 
-    wallet_data = json.dumps(
-        {
-            "mnemonic": mnemonic,
-            "wallet_type": wallet_type,
-        }
-    ).encode()
+    wallet_data_dict: dict[str, str | int] = {
+        "mnemonic": mnemonic,
+        "wallet_type": wallet_type,
+    }
+    if creation_height is not None:
+        wallet_data_dict["creation_height"] = creation_height
+
+    wallet_data = json.dumps(wallet_data_dict).encode()
 
     encrypted = fernet.encrypt(wallet_data)
 
@@ -286,8 +305,12 @@ def _save_wallet_file(
     logger.debug("Saved wallet file: {}", wallet_path)
 
 
-def _load_wallet_file(*, wallet_path: Path, password: str) -> str:
-    """Load and decrypt a wallet file, returning the mnemonic.
+def _load_wallet_file(*, wallet_path: Path, password: str) -> tuple[str, int | None]:
+    """Load and decrypt a wallet file, returning the mnemonic and creation height.
+
+    Returns:
+        Tuple of (mnemonic, creation_height).  ``creation_height`` is ``None``
+        for wallet files created before this feature was added.
 
     Raises:
         ValueError: If the password is incorrect.
@@ -318,4 +341,13 @@ def _load_wallet_file(*, wallet_path: Path, password: str) -> str:
         raise ValueError("Wrong password or corrupted wallet file.") from exc
 
     data = json.loads(decrypted)
-    return data["mnemonic"]
+    mnemonic: str = data["mnemonic"]
+
+    raw_creation_height = data.get("creation_height")
+    creation_height: int | None
+    if isinstance(raw_creation_height, int) and not isinstance(raw_creation_height, bool):
+        creation_height = raw_creation_height if raw_creation_height >= 0 else None
+    else:
+        creation_height = None
+
+    return mnemonic, creation_height

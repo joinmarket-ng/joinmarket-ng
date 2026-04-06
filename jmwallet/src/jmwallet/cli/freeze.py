@@ -86,6 +86,7 @@ def freeze(
             raise ValueError("No mnemonic provided")
         resolved_mnemonic = resolved.mnemonic
         resolved_bip39_passphrase = resolved.bip39_passphrase
+        resolved_creation_height = resolved.creation_height
     except (FileNotFoundError, ValueError) as e:
         logger.error(str(e))
         raise typer.Exit(1)
@@ -105,6 +106,7 @@ def freeze(
             backend,
             resolved_bip39_passphrase,
             mixdepth_filter=mixdepth,
+            creation_height=resolved_creation_height,
         )
     )
 
@@ -114,6 +116,8 @@ async def _freeze_utxos(
     backend_settings: ResolvedBackendSettings,
     bip39_passphrase: str = "",
     mixdepth_filter: int | None = None,
+    *,
+    creation_height: int | None = None,
 ) -> None:
     """Interactive UTXO freeze/unfreeze implementation."""
     from jmwallet.backends.bitcoin_core import BitcoinCoreBackend
@@ -171,6 +175,9 @@ async def _freeze_utxos(
         )
     else:
         raise ValueError(f"Unknown backend type: {backend_type}")
+
+    if creation_height is not None:
+        backend.set_wallet_creation_height(creation_height)
 
     wallet = WalletService(
         mnemonic=mnemonic,

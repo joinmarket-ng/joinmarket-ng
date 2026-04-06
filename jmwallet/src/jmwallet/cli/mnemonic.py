@@ -245,6 +245,80 @@ def load_mnemonic_file(
 
 
 # ============================================================================
+# Mnemonic Metadata (wallet birthday / creation height)
+# ============================================================================
+
+
+def _meta_path(mnemonic_file: Path) -> Path:
+    """Return the path to the companion metadata file for a mnemonic file.
+
+    The metadata file lives alongside the mnemonic file with a ``.meta``
+    suffix appended, e.g. ``default.mnemonic`` -> ``default.mnemonic.meta``.
+    """
+    return mnemonic_file.with_name(mnemonic_file.name + ".meta")
+
+
+def save_mnemonic_meta(
+    mnemonic_file: Path,
+    *,
+    creation_height: int | None = None,
+) -> None:
+    """Persist wallet metadata alongside a mnemonic file.
+
+    The metadata is stored as a small JSON file (``<mnemonic_file>.meta``)
+    next to the mnemonic file.  Currently only ``creation_height`` is
+    stored, but the format is extensible.
+
+    Args:
+        mnemonic_file: Path to the mnemonic file (the .meta suffix is added).
+        creation_height: Block height at the time the wallet was created.
+    """
+    import json
+
+    meta: dict[str, int] = {}
+    if creation_height is not None:
+        meta["creation_height"] = creation_height
+
+    if not meta:
+        return  # Nothing to persist
+
+    path = _meta_path(mnemonic_file)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(meta, indent=2) + "\n")
+    os.chmod(path, 0o600)
+    logger.debug(f"Saved mnemonic metadata to {path}")
+
+
+def load_mnemonic_meta(mnemonic_file: Path) -> dict[str, int]:
+    """Load wallet metadata from a companion ``.meta`` file.
+
+    Returns an empty dict if the file does not exist (backward-compatible
+    with mnemonics created before this feature was added).
+
+    Args:
+        mnemonic_file: Path to the mnemonic file.
+
+    Returns:
+        Dict with metadata fields (currently only ``creation_height``).
+    """
+    import json
+
+    path = _meta_path(mnemonic_file)
+    if not path.exists():
+        return {}
+
+    try:
+        data = json.loads(path.read_text())
+        if isinstance(data, dict):
+            return data
+        logger.warning(f"Mnemonic metadata file has unexpected format: {path}")
+        return {}
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.warning(f"Failed to read mnemonic metadata from {path}: {exc}")
+        return {}
+
+
+# ============================================================================
 # BIP39 Wordlist and Interactive Mnemonic Input
 # ============================================================================
 

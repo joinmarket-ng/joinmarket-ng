@@ -353,3 +353,237 @@ class TestResolveMnemonic:
         assert result is not None
         assert result.mnemonic == mnemonic
         assert "default wallet" in result.source
+
+
+class TestCreateBackendCreationHeight:
+    """Tests for create_backend() with creation_height parameter."""
+
+    def test_create_backend_neutrino_with_creation_height(self) -> None:
+        """create_backend() calls set_wallet_creation_height when height is provided."""
+        from pathlib import Path
+        from unittest.mock import MagicMock, patch
+
+        from jmcore.cli_common import ResolvedBackendSettings, create_backend
+
+        backend_settings = ResolvedBackendSettings(
+            network="mainnet",
+            bitcoin_network="mainnet",
+            backend_type="neutrino",
+            rpc_url="",
+            rpc_user="",
+            rpc_password="",
+            neutrino_url="http://127.0.0.1:8334",
+            neutrino_add_peers=[],
+            data_dir=Path("/tmp"),
+        )
+
+        mock_backend = MagicMock()
+        with patch("jmwallet.backends.neutrino.NeutrinoBackend", return_value=mock_backend):
+            create_backend(backend_settings, creation_height=800000)
+
+        mock_backend.set_wallet_creation_height.assert_called_once_with(800000)
+
+    def test_create_backend_neutrino_without_creation_height(self) -> None:
+        """create_backend() does NOT call set_wallet_creation_height when None."""
+        from pathlib import Path
+        from unittest.mock import MagicMock, patch
+
+        from jmcore.cli_common import ResolvedBackendSettings, create_backend
+
+        backend_settings = ResolvedBackendSettings(
+            network="mainnet",
+            bitcoin_network="mainnet",
+            backend_type="neutrino",
+            rpc_url="",
+            rpc_user="",
+            rpc_password="",
+            neutrino_url="http://127.0.0.1:8334",
+            neutrino_add_peers=[],
+            data_dir=Path("/tmp"),
+        )
+
+        mock_backend = MagicMock()
+        with patch("jmwallet.backends.neutrino.NeutrinoBackend", return_value=mock_backend):
+            create_backend(backend_settings)
+
+        mock_backend.set_wallet_creation_height.assert_not_called()
+
+    def test_create_backend_descriptor_with_creation_height(self) -> None:
+        """create_backend() calls set_wallet_creation_height on descriptor backend."""
+        from pathlib import Path
+        from unittest.mock import MagicMock, patch
+
+        from jmcore.cli_common import ResolvedBackendSettings, create_backend
+
+        backend_settings = ResolvedBackendSettings(
+            network="mainnet",
+            bitcoin_network="mainnet",
+            backend_type="descriptor_wallet",
+            rpc_url="http://127.0.0.1:8332",
+            rpc_user="user",
+            rpc_password="pass",
+            neutrino_url="",
+            neutrino_add_peers=[],
+            data_dir=Path("/tmp"),
+        )
+
+        mock_backend = MagicMock()
+        with patch(
+            "jmwallet.backends.descriptor_wallet.DescriptorWalletBackend",
+            return_value=mock_backend,
+        ):
+            create_backend(
+                backend_settings,
+                wallet_name="test-wallet",
+                creation_height=790000,
+            )
+
+        mock_backend.set_wallet_creation_height.assert_called_once_with(790000)
+
+
+class TestMnemonicMeta:
+    """Tests for mnemonic metadata (.meta file) functions."""
+
+    def test_save_and_load_mnemonic_meta(self, tmp_path: Path) -> None:
+        """save_mnemonic_meta and load_mnemonic_meta round-trip."""
+        from jmwallet.cli.mnemonic import load_mnemonic_meta, save_mnemonic_meta
+
+        mnemonic_file = tmp_path / "default.mnemonic"
+        mnemonic_file.write_text("abandon " * 11 + "about")
+
+        save_mnemonic_meta(mnemonic_file, creation_height=850000)
+
+        meta = load_mnemonic_meta(mnemonic_file)
+        assert meta["creation_height"] == 850000
+
+    def test_meta_path_convention(self, tmp_path: Path) -> None:
+        """Meta file uses .meta suffix appended to the mnemonic file name."""
+        from jmwallet.cli.mnemonic import _meta_path
+
+        mnemonic_file = tmp_path / "default.mnemonic"
+        assert _meta_path(mnemonic_file) == tmp_path / "default.mnemonic.meta"
+
+    def test_load_mnemonic_meta_missing_file(self, tmp_path: Path) -> None:
+        """load_mnemonic_meta returns empty dict when .meta file does not exist."""
+        from jmwallet.cli.mnemonic import load_mnemonic_meta
+
+        mnemonic_file = tmp_path / "no_such.mnemonic"
+        meta = load_mnemonic_meta(mnemonic_file)
+        assert meta == {}
+
+    def test_load_mnemonic_meta_corrupted_json(self, tmp_path: Path) -> None:
+        """load_mnemonic_meta returns empty dict on corrupted JSON."""
+        from jmwallet.cli.mnemonic import load_mnemonic_meta
+
+        mnemonic_file = tmp_path / "default.mnemonic"
+        mnemonic_file.write_text("dummy")
+        meta_path = tmp_path / "default.mnemonic.meta"
+        meta_path.write_text("not valid json {{{")
+
+        meta = load_mnemonic_meta(mnemonic_file)
+        assert meta == {}
+
+    def test_save_mnemonic_meta_no_data_is_noop(self, tmp_path: Path) -> None:
+        """save_mnemonic_meta with no creation_height does not create a file."""
+        from jmwallet.cli.mnemonic import _meta_path, save_mnemonic_meta
+
+        mnemonic_file = tmp_path / "default.mnemonic"
+        mnemonic_file.write_text("dummy")
+
+        save_mnemonic_meta(mnemonic_file)
+
+        assert not _meta_path(mnemonic_file).exists()
+
+
+class TestResolveMnemonicCreationHeight:
+    """Tests for resolve_mnemonic() loading creation_height from .meta files."""
+
+    def test_resolve_mnemonic_loads_creation_height_from_meta(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """resolve_mnemonic populates creation_height when .meta file exists."""
+        import json
+
+        from jmcore.cli_common import resolve_mnemonic
+        from jmcore.settings import JoinMarketSettings
+
+        mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+
+        # Create plaintext mnemonic file
+        wallets_dir = tmp_path / "wallets"
+        wallets_dir.mkdir(parents=True)
+        mnemonic_file = wallets_dir / "default.mnemonic"
+        mnemonic_file.write_text(mnemonic)
+
+        # Create companion .meta file
+        meta_path = wallets_dir / "default.mnemonic.meta"
+        meta_path.write_text(json.dumps({"creation_height": 820000}))
+
+        monkeypatch.setenv("JOINMARKET_DATA_DIR", str(tmp_path))
+        settings = JoinMarketSettings(data_dir=tmp_path)
+
+        result = resolve_mnemonic(settings)
+        assert result is not None
+        assert result.mnemonic == mnemonic
+        assert result.creation_height == 820000
+
+    def test_resolve_mnemonic_no_meta_file_returns_none_creation_height(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """resolve_mnemonic returns creation_height=None when no .meta file."""
+        from jmcore.cli_common import resolve_mnemonic
+        from jmcore.settings import JoinMarketSettings
+
+        mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+
+        wallets_dir = tmp_path / "wallets"
+        wallets_dir.mkdir(parents=True)
+        mnemonic_file = wallets_dir / "default.mnemonic"
+        mnemonic_file.write_text(mnemonic)
+
+        monkeypatch.setenv("JOINMARKET_DATA_DIR", str(tmp_path))
+        settings = JoinMarketSettings(data_dir=tmp_path)
+
+        result = resolve_mnemonic(settings)
+        assert result is not None
+        assert result.creation_height is None
+
+    def test_resolve_mnemonic_direct_mnemonic_has_no_creation_height(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """resolve_mnemonic from --mnemonic argument has no creation_height."""
+        from jmcore.cli_common import resolve_mnemonic
+        from jmcore.settings import JoinMarketSettings
+
+        mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+        settings = JoinMarketSettings()
+
+        result = resolve_mnemonic(settings, mnemonic=mnemonic)
+        assert result is not None
+        assert result.creation_height is None
+
+    def test_resolve_mnemonic_ignores_invalid_meta_creation_height(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """resolve_mnemonic ignores non-integer creation_height values in .meta."""
+        import json
+
+        from jmcore.cli_common import resolve_mnemonic
+        from jmcore.settings import JoinMarketSettings
+
+        mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+
+        wallets_dir = tmp_path / "wallets"
+        wallets_dir.mkdir(parents=True)
+        mnemonic_file = wallets_dir / "default.mnemonic"
+        mnemonic_file.write_text(mnemonic)
+
+        meta_path = wallets_dir / "default.mnemonic.meta"
+        meta_path.write_text(json.dumps({"creation_height": "820000"}))
+
+        monkeypatch.setenv("JOINMARKET_DATA_DIR", str(tmp_path))
+        settings = JoinMarketSettings(data_dir=tmp_path)
+
+        result = resolve_mnemonic(settings)
+        assert result is not None
+        assert result.creation_height is None

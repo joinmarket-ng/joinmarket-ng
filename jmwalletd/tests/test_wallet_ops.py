@@ -18,19 +18,21 @@ from jmwalletd.wallet_ops import (
 )
 
 
-def _make_descriptor_backend() -> MagicMock:
+def _make_descriptor_backend(block_height: int = 800000) -> MagicMock:
     """Return a mock that passes isinstance checks for DescriptorWalletBackend."""
     from jmwallet.backends.descriptor_wallet import DescriptorWalletBackend
 
     mock = MagicMock(spec=DescriptorWalletBackend)
+    mock.get_block_height = AsyncMock(return_value=block_height)
     return mock
 
 
-def _make_neutrino_backend() -> MagicMock:
+def _make_neutrino_backend(block_height: int = 800000) -> MagicMock:
     """Return a mock that does NOT pass isinstance checks for DescriptorWalletBackend."""
     from jmwallet.backends.neutrino import NeutrinoBackend
 
     mock = MagicMock(spec=NeutrinoBackend)
+    mock.get_block_height = AsyncMock(return_value=block_height)
     return mock
 
 
@@ -48,8 +50,11 @@ class TestWalletFileIO:
         )
         assert wallet_path.exists()
 
-        loaded_mnemonic = _load_wallet_file(wallet_path=wallet_path, password=password)
+        loaded_mnemonic, creation_height = _load_wallet_file(
+            wallet_path=wallet_path, password=password
+        )
         assert loaded_mnemonic == mnemonic
+        assert creation_height is None  # No creation_height stored
 
     def test_load_wrong_password(self, tmp_path: Path) -> None:
         wallet_path = tmp_path / "test.jmdat"
@@ -426,3 +431,326 @@ class TestOpenWallet:
 
         assert ws is mock_ws
         assert seedphrase == mnemonic
+
+
+class TestCreationHeight:
+    """Tests for wallet creation height (birthday) feature."""
+
+    def test_save_and_load_with_creation_height(self, tmp_path: Path) -> None:
+        """Saving with creation_height and loading returns the height."""
+        wallet_path = tmp_path / "test.jmdat"
+        password = "test_password_123"
+        mnemonic = "abandon " * 11 + "about"
+
+        _save_wallet_file(
+            wallet_path=wallet_path,
+            mnemonic=mnemonic,
+            password=password,
+            wallet_type="sw-fb",
+            creation_height=800000,
+        )
+        assert wallet_path.exists()
+
+        loaded_mnemonic, creation_height = _load_wallet_file(
+            wallet_path=wallet_path, password=password
+        )
+        assert loaded_mnemonic == mnemonic
+        assert creation_height == 800000
+
+    def test_save_without_creation_height_backward_compat(self, tmp_path: Path) -> None:
+        """Old wallet files without creation_height load with None."""
+        wallet_path = tmp_path / "old_wallet.jmdat"
+        password = "test"
+        mnemonic = "abandon " * 11 + "about"
+
+        _save_wallet_file(
+            wallet_path=wallet_path,
+            mnemonic=mnemonic,
+            password=password,
+            wallet_type="sw",
+        )
+
+        loaded_mnemonic, creation_height = _load_wallet_file(
+            wallet_path=wallet_path, password=password
+        )
+        assert loaded_mnemonic == mnemonic
+        assert creation_height is None
+
+    def test_load_with_invalid_creation_height_type_returns_none(self, tmp_path: Path) -> None:
+        """Invalid creation_height types in wallet file are ignored."""
+        import base64
+        import json
+        import os
+
+        from cryptography.fernet import Fernet
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+
+        wallet_path = tmp_path / "invalid_birthday.jmdat"
+        password = "test_password_123"
+
+        # Manually craft an encrypted wallet payload with a string creation_height.
+        salt = os.urandom(16)
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=salt,
+            iterations=600_000,
+        )
+        key = base64.urlsafe_b64encode(kdf.derive(password.encode()))
+        fernet = Fernet(key)
+        payload = {
+            "mnemonic": "abandon " * 11 + "about",
+            "wallet_type": "sw",
+            "creation_height": "820000",
+        }
+        wallet_path.write_bytes(salt + fernet.encrypt(json.dumps(payload).encode()))
+
+        loaded_mnemonic, creation_height = _load_wallet_file(
+            wallet_path=wallet_path, password=password
+        )
+        assert loaded_mnemonic == "abandon " * 11 + "about"
+        assert creation_height is None
+
+    @patch("jmwalletd.wallet_ops._get_network", return_value="mainnet")
+    @patch("jmwalletd._backend.get_backend", new_callable=AsyncMock)
+    @patch("jmwallet.wallet.service.WalletService")
+    async def test_create_wallet_stores_creation_height(
+        self,
+        mock_ws_cls: MagicMock,
+        mock_get_backend: AsyncMock,
+        mock_get_network: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """create_wallet queries block height and stores it in the .jmdat file."""
+        wallet_path = tmp_path / "wallets" / "birthday.jmdat"
+        wallet_path.parent.mkdir(parents=True, exist_ok=True)
+
+        mock_ws = MagicMock()
+        mock_ws.sync = AsyncMock()
+        mock_ws.setup_descriptor_wallet = AsyncMock()
+        mock_ws_cls.return_value = mock_ws
+        mock_get_backend.return_value = _make_descriptor_backend(block_height=850000)
+
+        _, seedphrase = await create_wallet(
+            wallet_path=wallet_path,
+            password="password",
+            wallet_type="sw-fb",
+            data_dir=tmp_path,
+        )
+
+        # Verify creation_height was stored in the file
+        loaded_mnemonic, creation_height = _load_wallet_file(
+            wallet_path=wallet_path, password="password"
+        )
+        assert loaded_mnemonic == seedphrase
+        assert creation_height == 850000
+
+    @patch("jmwalletd.wallet_ops._get_network", return_value="mainnet")
+    @patch("jmwalletd._backend.get_backend", new_callable=AsyncMock)
+    @patch("jmwallet.wallet.service.WalletService")
+    async def test_create_wallet_graceful_on_block_height_failure(
+        self,
+        mock_ws_cls: MagicMock,
+        mock_get_backend: AsyncMock,
+        mock_get_network: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """create_wallet still works even if get_block_height fails."""
+        wallet_path = tmp_path / "wallets" / "no_birthday.jmdat"
+        wallet_path.parent.mkdir(parents=True, exist_ok=True)
+
+        mock_backend = _make_descriptor_backend()
+        mock_backend.get_block_height = AsyncMock(side_effect=RuntimeError("RPC down"))
+        mock_get_backend.return_value = mock_backend
+
+        mock_ws = MagicMock()
+        mock_ws.sync = AsyncMock()
+        mock_ws.setup_descriptor_wallet = AsyncMock()
+        mock_ws_cls.return_value = mock_ws
+
+        _, seedphrase = await create_wallet(
+            wallet_path=wallet_path,
+            password="password",
+            wallet_type="sw",
+            data_dir=tmp_path,
+        )
+
+        # Wallet created successfully, but no creation_height
+        loaded_mnemonic, creation_height = _load_wallet_file(
+            wallet_path=wallet_path, password="password"
+        )
+        assert loaded_mnemonic == seedphrase
+        assert creation_height is None
+
+    @patch("jmwalletd.wallet_ops._get_network", return_value="mainnet")
+    @patch("jmwalletd._backend.get_backend", new_callable=AsyncMock)
+    @patch("jmwallet.wallet.service.WalletService")
+    async def test_open_wallet_with_creation_height_calls_backend(
+        self,
+        mock_ws_cls: MagicMock,
+        mock_get_backend: AsyncMock,
+        mock_get_network: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """open_wallet_with_mnemonic calls set_wallet_creation_height on backend."""
+        wallet_path = tmp_path / "wallets" / "with_birthday.jmdat"
+        wallet_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Save a wallet file WITH creation_height
+        _save_wallet_file(
+            wallet_path=wallet_path,
+            mnemonic="abandon " * 11 + "about",
+            password="password",
+            wallet_type="sw-fb",
+            creation_height=790000,
+        )
+
+        mock_backend = _make_descriptor_backend()
+        mock_get_backend.return_value = mock_backend
+
+        mock_ws = MagicMock()
+        mock_ws.sync = AsyncMock()
+        mock_ws.setup_descriptor_wallet = AsyncMock()
+        mock_ws_cls.return_value = mock_ws
+
+        await open_wallet_with_mnemonic(
+            wallet_path=wallet_path,
+            password="password",
+            data_dir=tmp_path,
+            sync_on_open=False,
+        )
+
+        # Backend should have been told the creation height
+        mock_backend.set_wallet_creation_height.assert_called_once_with(790000)
+
+    @patch("jmwalletd.wallet_ops._get_network", return_value="mainnet")
+    @patch("jmwalletd._backend.get_backend", new_callable=AsyncMock)
+    @patch("jmwallet.wallet.service.WalletService")
+    async def test_open_wallet_without_creation_height_clears_backend_hint(
+        self,
+        mock_ws_cls: MagicMock,
+        mock_get_backend: AsyncMock,
+        mock_get_network: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """open_wallet_with_mnemonic clears backend creation height when wallet has none."""
+        wallet_path = tmp_path / "wallets" / "no_birthday.jmdat"
+        wallet_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Save a wallet file WITHOUT creation_height (old format)
+        _save_wallet_file(
+            wallet_path=wallet_path,
+            mnemonic="abandon " * 11 + "about",
+            password="password",
+            wallet_type="sw",
+        )
+
+        mock_backend = _make_neutrino_backend()
+        mock_get_backend.return_value = mock_backend
+
+        mock_ws = MagicMock()
+        mock_ws.sync = AsyncMock()
+        mock_ws_cls.return_value = mock_ws
+
+        await open_wallet_with_mnemonic(
+            wallet_path=wallet_path,
+            password="password",
+            data_dir=tmp_path,
+            sync_on_open=False,
+        )
+
+        # Backend should be explicitly cleared to avoid stale hint reuse.
+        mock_backend.set_wallet_creation_height.assert_called_once_with(None)
+
+    @patch("jmwalletd.wallet_ops._get_network", return_value="mainnet")
+    @patch("jmwalletd._backend.get_backend", new_callable=AsyncMock)
+    @patch("jmwallet.wallet.service.WalletService")
+    async def test_open_wallet_clears_stale_creation_height_between_wallets(
+        self,
+        mock_ws_cls: MagicMock,
+        mock_get_backend: AsyncMock,
+        mock_get_network: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Opening a wallet without birthday clears stale hint from prior wallet."""
+        wallets_dir = tmp_path / "wallets"
+        wallets_dir.mkdir(parents=True, exist_ok=True)
+
+        wallet_with_height = wallets_dir / "with_birthday.jmdat"
+        wallet_without_height = wallets_dir / "without_birthday.jmdat"
+
+        _save_wallet_file(
+            wallet_path=wallet_with_height,
+            mnemonic="abandon " * 11 + "about",
+            password="password",
+            wallet_type="sw-fb",
+            creation_height=790000,
+        )
+        _save_wallet_file(
+            wallet_path=wallet_without_height,
+            mnemonic="abandon " * 11 + "about",
+            password="password",
+            wallet_type="sw",
+        )
+
+        # Reuse the same backend mock to simulate cached backend instance.
+        mock_backend = _make_neutrino_backend()
+        mock_get_backend.return_value = mock_backend
+
+        mock_ws = MagicMock()
+        mock_ws.sync = AsyncMock()
+        mock_ws_cls.return_value = mock_ws
+
+        await open_wallet_with_mnemonic(
+            wallet_path=wallet_with_height,
+            password="password",
+            data_dir=tmp_path,
+            sync_on_open=False,
+        )
+        mock_backend.set_wallet_creation_height.assert_called_once_with(790000)
+
+        mock_backend.set_wallet_creation_height.reset_mock()
+
+        await open_wallet_with_mnemonic(
+            wallet_path=wallet_without_height,
+            password="password",
+            data_dir=tmp_path,
+            sync_on_open=False,
+        )
+        mock_backend.set_wallet_creation_height.assert_called_once_with(None)
+
+    @patch("jmwalletd.wallet_ops._get_network", return_value="mainnet")
+    @patch("jmwalletd._backend.get_backend", new_callable=AsyncMock)
+    @patch("jmwallet.wallet.service.WalletService")
+    async def test_recover_wallet_does_not_store_creation_height(
+        self,
+        mock_ws_cls: MagicMock,
+        mock_get_backend: AsyncMock,
+        mock_get_network: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Recovered wallets should NOT have creation_height (unknown birthday)."""
+        wallet_path = tmp_path / "wallets" / "recovered.jmdat"
+        wallet_path.parent.mkdir(parents=True, exist_ok=True)
+
+        mock_ws = MagicMock()
+        mock_ws.sync = AsyncMock()
+        mock_ws.setup_descriptor_wallet = AsyncMock()
+        mock_ws_cls.return_value = mock_ws
+        mock_get_backend.return_value = _make_descriptor_backend()
+
+        await recover_wallet(
+            wallet_path=wallet_path,
+            password="password",
+            wallet_type="sw",
+            seedphrase="abandon " * 11 + "about",
+            data_dir=tmp_path,
+        )
+
+        # Recovered wallet should have no creation_height
+        loaded_mnemonic, creation_height = _load_wallet_file(
+            wallet_path=wallet_path, password="password"
+        )
+        assert loaded_mnemonic == "abandon " * 11 + "about"
+        assert creation_height is None

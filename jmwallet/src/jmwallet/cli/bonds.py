@@ -92,6 +92,7 @@ def list_bonds(
             raise ValueError("No mnemonic provided")
         resolved_mnemonic = resolved.mnemonic
         resolved_bip39_passphrase = resolved.bip39_passphrase
+        resolved_creation_height = resolved.creation_height
     except (FileNotFoundError, ValueError) as e:
         logger.error(str(e))
         raise typer.Exit(1)
@@ -111,6 +112,7 @@ def list_bonds(
             backend,
             locktimes or [],
             resolved_bip39_passphrase,
+            creation_height=resolved_creation_height,
         )
     )
 
@@ -188,6 +190,8 @@ async def _list_fidelity_bonds(
     backend_settings: ResolvedBackendSettings,
     locktimes: list[int],
     bip39_passphrase: str = "",
+    *,
+    creation_height: int | None = None,
 ) -> None:
     """List fidelity bonds implementation."""
     from jmwallet.backends.bitcoin_core import BitcoinCoreBackend
@@ -215,6 +219,9 @@ async def _list_fidelity_bonds(
         rpc_user=backend_settings.rpc_user,
         rpc_password=backend_settings.rpc_password,
     )
+
+    if creation_height is not None:
+        backend.set_wallet_creation_height(creation_height)
 
     # Use large gap limit (1000) for discovery mode when scanning with --locktime
     gap_limit = 1000 if locktimes else 20
@@ -613,6 +620,7 @@ def recover_bonds(
             raise ValueError("No mnemonic provided")
         resolved_mnemonic = resolved.mnemonic
         resolved_bip39_passphrase = resolved.bip39_passphrase
+        resolved_creation_height = resolved.creation_height
     except (FileNotFoundError, ValueError) as e:
         logger.error(str(e))
         raise typer.Exit(1)
@@ -633,6 +641,7 @@ def recover_bonds(
             backend_settings,
             max_index,
             resolved_bip39_passphrase,
+            creation_height=resolved_creation_height,
         )
     )
 
@@ -642,6 +651,8 @@ async def _recover_bonds_async(
     backend_settings: ResolvedBackendSettings,
     max_index: int,
     bip39_passphrase: str = "",
+    *,
+    creation_height: int | None = None,
 ) -> None:
     """Async implementation of fidelity bond recovery."""
     from jmcore.timenumber import TIMENUMBER_COUNT
@@ -691,6 +702,9 @@ async def _recover_bonds_async(
             rpc_user=backend_settings.rpc_user,
             rpc_password=backend_settings.rpc_password,
         )
+
+    if creation_height is not None:
+        backend.set_wallet_creation_height(creation_height)
 
     wallet = WalletService(
         mnemonic=mnemonic,

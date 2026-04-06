@@ -115,6 +115,7 @@ def send(
             raise ValueError("No mnemonic provided")
         resolved_mnemonic = resolved.mnemonic
         resolved_bip39_passphrase = resolved.bip39_passphrase
+        resolved_creation_height = resolved.creation_height
     except (FileNotFoundError, ValueError) as e:
         logger.error(str(e))
         raise typer.Exit(1)
@@ -146,6 +147,7 @@ def send(
             yes,
             select_utxos,
             resolved_bip39_passphrase,
+            creation_height=resolved_creation_height,
         )
     )
 
@@ -162,6 +164,8 @@ async def _send_transaction(
     skip_confirmation: bool,
     interactive_utxo_selection: bool,
     bip39_passphrase: str = "",
+    *,
+    creation_height: int | None = None,
 ) -> None:
     """Send transaction implementation."""
     from jmwallet.backends.bitcoin_core import BitcoinCoreBackend
@@ -219,6 +223,9 @@ async def _send_transaction(
             rpc_user=backend_settings.rpc_user,
             rpc_password=backend_settings.rpc_password,
         )
+
+    if creation_height is not None:
+        backend.set_wallet_creation_height(creation_height)
 
     # Resolve fee rate
     # Get mempool minimum fee (if available) as a floor
