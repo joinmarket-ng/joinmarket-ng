@@ -43,12 +43,18 @@ def create_app(*, data_dir: Path | None = None) -> FastAPI:
         },
     )
 
-    # ------------------------------------------------------------------
-    # CORS -- match reference implementation's permissive policy.
-    # ------------------------------------------------------------------
+    allowed_origins = [
+        "http://localhost",
+        "http://127.0.0.1",
+        "http://[::1]",
+    ]
+    # Allow any port on localhost (common for development/custom setups)
+    allow_origin_regex = r"^http://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$"
+
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        allow_origins=allowed_origins,
+        allow_origin_regex=allow_origin_regex,
         allow_methods=["*"],
         allow_headers=["*"],
         allow_credentials=False,
@@ -115,15 +121,24 @@ def create_app(*, data_dir: Path | None = None) -> FastAPI:
     app.include_router(ws_router, prefix="/api/v1/ws")
 
     # ------------------------------------------------------------------
-    # CORS preflight handler for root (matching reference).
+    # CORS preflight handler for root (restricted to local origins).
     # Registered before SPA catch-all so GET / can be served by JAM.
     # ------------------------------------------------------------------
     @app.options("/")
-    async def cors_preflight() -> JSONResponse:
+    async def cors_preflight(request: Request) -> JSONResponse:
+        origin = request.headers.get("Origin")
+        import re
+
+        # Only allow local origins
+        def is_allowed(o: str | None) -> bool:
+            return bool(o and (o in allowed_origins or re.match(allow_origin_regex, o)))
+
+        allow_origin = origin if is_allowed(origin) else "http://localhost:28183"
+
         return JSONResponse(
             content={},
             headers={
-                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Origin": allow_origin,
                 "Access-Control-Allow-Methods": "POST",
             },
         )
