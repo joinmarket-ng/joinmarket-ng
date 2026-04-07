@@ -205,15 +205,33 @@ def _get_package_versions() -> dict[str, str]:
     return versions
 
 
-async def _get_neutrino_info(neutrino_url: str) -> dict[str, str]:
+async def _get_neutrino_info(
+    neutrino_url: str,
+    *,
+    tls_cert_path: str | None = None,
+    auth_token: str | None = None,
+) -> dict[str, str]:
     """Probe neutrino-api for sync status and capabilities (no wallet data)."""
+    import ssl
+    from pathlib import Path
+
     import httpx
 
     info: dict[str, str] = {}
     info["url"] = neutrino_url
 
+    # Build httpx client kwargs with optional TLS pinning and auth header.
+    client_kwargs: dict[str, Any] = {"timeout": 10.0}
+    if tls_cert_path:
+        cert = Path(tls_cert_path)
+        if cert.is_file():
+            ctx = ssl.create_default_context(cafile=str(cert))
+            client_kwargs["verify"] = ctx
+    if auth_token:
+        client_kwargs["headers"] = {"Authorization": f"Bearer {auth_token}"}
+
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(**client_kwargs) as client:
             # /v1/status -- always available
             status_resp = await client.get(f"{neutrino_url}/v1/status")
             status_resp.raise_for_status()
@@ -429,6 +447,8 @@ def debug_info(
     ]
     if backend.backend_type == "neutrino":
         lines.append(f"  url:     {backend.neutrino_url}")
+        lines.append(f"  tls:     {'enabled' if backend.neutrino_tls_cert else 'disabled'}")
+        lines.append(f"  auth:    {'enabled' if backend.neutrino_auth_token else 'disabled'}")
     else:
         lines.append(f"  rpc_url: {backend.rpc_url}")
     sections.append("\n".join(lines))
@@ -436,7 +456,13 @@ def debug_info(
     # -- Neutrino details (async probe) --------------------------------
     if backend.backend_type == "neutrino":
         try:
-            neutrino_info = asyncio.run(_get_neutrino_info(backend.neutrino_url))
+            neutrino_info = asyncio.run(
+                _get_neutrino_info(
+                    backend.neutrino_url,
+                    tls_cert_path=backend.neutrino_tls_cert,
+                    auth_token=backend.neutrino_auth_token,
+                )
+            )
             lines = ["Neutrino Server"]
             for key, value in neutrino_info.items():
                 if key == "url":

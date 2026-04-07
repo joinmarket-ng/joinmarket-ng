@@ -200,6 +200,55 @@ Environment variables:
 | `PREFETCH_LOOKBACK` | `0` (all) | Only prefetch filters for this many recent blocks. `105120` (~2 years) is recommended to avoid downloading ~15 GB of filters from genesis. |
 | `CLEARNET_INITIAL_SYNC` | `false` | Sync headers over clearnet before switching to Tor. Safe because headers are public data. Roughly 2x faster for initial sync. |
 | `TOR_PROXY` | *(none)* | SOCKS5 proxy for Tor (e.g. `127.0.0.1:9050`). Required for private P2P operation. |
+| `NO_AUTH` | `false` | Disable TLS and API token authentication (development/regtest only). |
+
+#### Neutrino API Security (TLS + Auth Token)
+
+neutrino-api automatically generates a self-signed TLS certificate and a
+random API bearer token on first start. These protect against local
+eavesdropping and unauthorized access to the watched-address list (a
+privacy-sensitive resource).
+
+**Files generated in the data directory** (`/data/neutrino` by default):
+
+| File | Purpose |
+|---|---|
+| `tls.cert` | Self-signed TLS certificate (PEM). Share with clients for HTTPS pinning. |
+| `tls.key` | TLS private key. Never share. |
+| `auth_token` | 32-byte hex API token. Clients send this as `Authorization: Bearer <token>`. |
+
+**Connecting JoinMarket-NG to an authenticated neutrino-api:**
+
+```toml
+[bitcoin]
+backend_type = "neutrino"
+neutrino_url = "https://127.0.0.1:8334"
+neutrino_tls_cert = "/data/neutrino/tls.cert"
+neutrino_auth_token = "<contents of /data/neutrino/auth_token>"
+```
+
+Or via environment variables:
+
+```bash
+export BITCOIN__NEUTRINO_URL="https://127.0.0.1:8334"
+export BITCOIN__NEUTRINO_TLS_CERT="/data/neutrino/tls.cert"
+export BITCOIN__NEUTRINO_AUTH_TOKEN="$(cat /data/neutrino/auth_token)"
+```
+
+**Resetting credentials** (regenerates cert + token, clears watched addresses):
+
+```bash
+neutrinod --reset-auth --datadir /data/neutrino
+```
+
+**Disabling auth for development/regtest:**
+
+```bash
+docker run ... -e NO_AUTH=true ghcr.io/m0wer/neutrino-api:latest
+```
+
+> **Flatpak users:** TLS and auth are wired automatically when neutrino-api
+> runs as a bundled service. No manual configuration is needed.
 
 Or download binaries from [neutrino-api releases](https://github.com/m0wer/neutrino-api/releases).
 
@@ -279,7 +328,10 @@ rpc_password = "your_rpc_password"
 ```toml
 [bitcoin]
 backend_type = "neutrino"
-neutrino_url = "http://127.0.0.1:8334"
+neutrino_url = "https://127.0.0.1:8334"
+# TLS certificate and auth token (see "Neutrino API Security" above)
+neutrino_tls_cert = "/data/neutrino/tls.cert"
+neutrino_auth_token = "<contents of auth_token file>"
 ```
 
 ### Common Settings

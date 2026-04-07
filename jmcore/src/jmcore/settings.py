@@ -214,6 +214,24 @@ class BitcoinSettings(BaseModel):
             "no explicit scan_start_height is set. Default ~2 years (105120 blocks)."
         ),
     )
+    neutrino_tls_cert: str | None = Field(
+        default=None,
+        description=(
+            "Path to neutrino-api TLS certificate for HTTPS verification. "
+            "When set, the neutrino backend connects over HTTPS and pins "
+            "the server certificate to this file (trust-on-first-use). "
+            "Generated automatically by neutrino-api on first start."
+        ),
+    )
+    neutrino_auth_token: str | None = Field(
+        default=None,
+        description=(
+            "API bearer token for neutrino-api authentication. "
+            "Sent as 'Authorization: Bearer <token>' on every request. "
+            "Generated automatically by neutrino-api on first start "
+            "and stored in its data directory as 'auth_token'."
+        ),
+    )
 
 
 class NetworkSettings(BaseModel):

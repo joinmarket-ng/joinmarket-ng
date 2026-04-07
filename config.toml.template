@@ -89,6 +89,19 @@
 # Default: 105120 (~2 years). Only used when scan_start_height is not set.
 # neutrino_scan_lookback_blocks = 105120
 
+# Neutrino-api security settings (auto-TLS + API token authentication).
+# When neutrino-api starts for the first time it generates a self-signed TLS
+# certificate (tls.cert + tls.key) and a random API token (auth_token) in its
+# data directory.  Set these to enable encrypted, authenticated communication.
+# In Flatpak deployments these are wired automatically from the neutrino data dir.
+#
+# Path to the neutrino-api TLS certificate (PEM).  Enables HTTPS with
+# certificate pinning (trust-on-first-use).
+# neutrino_tls_cert = "/data/neutrino/tls.cert"
+#
+# API bearer token for neutrino-api authentication.
+# neutrino_auth_token = ""
+
 # ============================================================================
 # Network Settings
 # ============================================================================

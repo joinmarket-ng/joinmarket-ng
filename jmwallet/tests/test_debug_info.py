@@ -363,3 +363,22 @@ class TestDebugInfoCommand:
         result = runner.invoke(app, ["debug-info", "--backend", "scantxoutset"])
         assert result.exit_code == 0
         assert "deployment:" in result.stdout
+
+    def test_neutrino_tls_auth_status_shown(self) -> None:
+        """Backend section should indicate TLS/auth enabled status."""
+        with patch("jmwallet.cli.debug_info._get_neutrino_info") as mock_probe:
+            mock_probe.return_value = {"status": "reachable", "block_height": "100"}
+            result = runner.invoke(
+                app,
+                [
+                    "debug-info",
+                    "--backend",
+                    "neutrino",
+                    "--neutrino-url",
+                    "http://127.0.0.1:8334",
+                ],
+            )
+            assert result.exit_code == 0, f"Failed: {result.stdout}"
+            # Without TLS/auth configured, should show disabled
+            assert "tls:     disabled" in result.stdout
+            assert "auth:    disabled" in result.stdout

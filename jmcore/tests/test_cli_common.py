@@ -274,6 +274,8 @@ class TestCreateBackend:
             network="signet",
             scan_start_height=None,
             add_peers=peers,
+            tls_cert_path=None,
+            auth_token=None,
         )
         assert result is mock_backend
 
@@ -307,6 +309,8 @@ class TestCreateBackend:
             network="mainnet",
             scan_start_height=None,
             add_peers=[],
+            tls_cert_path=None,
+            auth_token=None,
         )
 
 

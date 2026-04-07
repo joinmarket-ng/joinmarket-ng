@@ -2,7 +2,7 @@
 Integration tests for BitcoinCoreBackend and NeutrinoBackend
 """
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from jmcore.crypto import KeyPair
@@ -1634,6 +1634,104 @@ async def test_neutrino_backend_integration():
 
     finally:
         await backend.close()
+
+
+class TestNeutrinoBackendAuth:
+    """Unit tests for NeutrinoBackend TLS and auth token support."""
+
+    @pytest.mark.asyncio
+    async def test_no_auth_by_default(self):
+        """Without TLS/auth params, client should have no auth headers or custom verify."""
+        backend = NeutrinoBackend(neutrino_url="http://localhost:8334")
+        assert backend._tls_cert_path is None
+        assert backend._auth_token is None
+        # Default httpx client uses True for verify (system CA bundle)
+        assert "authorization" not in {k.lower() for k in backend.client.headers}
+        await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_auth_token_sets_bearer_header(self):
+        """When auth_token is provided, client should send Authorization header."""
+        backend = NeutrinoBackend(
+            neutrino_url="http://localhost:8334",
+            auth_token="deadbeef1234",
+        )
+        assert backend._auth_token == "deadbeef1234"
+        auth = backend.client.headers.get("authorization")
+        assert auth == "Bearer deadbeef1234"
+        await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_tls_cert_path_missing_file_warns(self, tmp_path):
+        """When tls_cert_path points to a nonexistent file, a warning is logged."""
+        missing = str(tmp_path / "nonexistent.cert")
+        with patch("jmwallet.backends.neutrino.logger") as mock_logger:
+            backend = NeutrinoBackend(
+                neutrino_url="https://localhost:8334",
+                tls_cert_path=missing,
+            )
+            mock_logger.warning.assert_called_once()
+            assert "not found" in mock_logger.warning.call_args[0][0]
+        await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_tls_cert_path_valid_file(self, tmp_path):
+        """When tls_cert_path is a real file, client should use a custom SSL context."""
+        import ssl
+
+        # Create a dummy PEM cert (won't validate but tests plumbing)
+        cert_file = tmp_path / "tls.cert"
+        cert_file.write_text("")  # placeholder
+        # We can't easily make a real cert in pure Python without extra deps,
+        # so just verify the code path doesn't crash by checking the verify attr
+        # is an SSLContext when a valid PEM is supplied.
+        # Instead, test with a mock to verify the ssl context is created.
+        with patch("jmwallet.backends.neutrino.ssl.create_default_context") as mock_ctx:
+            mock_ssl_ctx = MagicMock(spec=ssl.SSLContext)
+            mock_ctx.return_value = mock_ssl_ctx
+            backend = NeutrinoBackend(
+                neutrino_url="https://localhost:8334",
+                tls_cert_path=str(cert_file),
+            )
+            mock_ctx.assert_called_once_with(cafile=str(cert_file))
+            await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_close_preserves_auth_settings(self):
+        """After close(), the re-created client should still have auth headers."""
+        backend = NeutrinoBackend(
+            neutrino_url="http://localhost:8334",
+            auth_token="mytoken123",
+        )
+        original_client = backend.client
+        await backend.close()
+
+        assert backend.client is not original_client
+        assert not backend.client.is_closed
+        auth = backend.client.headers.get("authorization")
+        assert auth == "Bearer mytoken123"
+        await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_combined_tls_and_auth(self, tmp_path):
+        """Both TLS cert pinning and auth token can be used together."""
+        import ssl
+
+        cert_file = tmp_path / "tls.cert"
+        cert_file.write_text("")
+
+        with patch("jmwallet.backends.neutrino.ssl.create_default_context") as mock_ctx:
+            mock_ssl_ctx = MagicMock(spec=ssl.SSLContext)
+            mock_ctx.return_value = mock_ssl_ctx
+            backend = NeutrinoBackend(
+                neutrino_url="https://localhost:8334",
+                tls_cert_path=str(cert_file),
+                auth_token="combined_token",
+            )
+            mock_ctx.assert_called_once()
+            auth = backend.client.headers.get("authorization")
+            assert auth == "Bearer combined_token"
+            await backend.close()
 
 
 class TestSupportsDescriptorScan:

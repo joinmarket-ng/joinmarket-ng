@@ -360,7 +360,9 @@ export TOR__CONTROL_HOST="127.0.0.1"
 export TOR__CONTROL_PORT="${TOR_CONTROL_PORT}"
 export TOR__COOKIE_PATH="${TOR_DATA_DIR}/control_auth_cookie"
 export BITCOIN__BACKEND_TYPE="${BITCOIN__BACKEND_TYPE:-neutrino}"
-export BITCOIN__NEUTRINO_URL="http://127.0.0.1:${NEUTRINO_PORT}"
+export BITCOIN__NEUTRINO_URL="https://127.0.0.1:${NEUTRINO_PORT}"
+export BITCOIN__NEUTRINO_TLS_CERT="${NEUTRINO_DATA_DIR}/tls.cert"
+export BITCOIN__NEUTRINO_AUTH_TOKEN="\$(cat "${NEUTRINO_DATA_DIR}/auth_token" 2>/dev/null || true)"
 export JMWALLETD_NO_TLS="${JMWALLETD_NO_TLS:-false}"
 export NETWORK_CONFIG__NETWORK="${NETWORK}"
 export NETWORK_CONFIG__BITCOIN_NETWORK="${NETWORK}"
@@ -399,10 +401,12 @@ start_neutrino() {
         return 0
     fi
 
-    # Check if using external neutrino
+    # Check if using external neutrino (match both http and https schemes)
     local neutrino_url
-    neutrino_url=$(read_config_value "bitcoin" "neutrino_url" "http://127.0.0.1:${NEUTRINO_PORT}")
-    if [ "${neutrino_url}" != "http://127.0.0.1:${NEUTRINO_PORT}" ]; then
+    neutrino_url=$(read_config_value "bitcoin" "neutrino_url" "")
+    if [ -n "${neutrino_url}" ] \
+       && [ "${neutrino_url}" != "http://127.0.0.1:${NEUTRINO_PORT}" ] \
+       && [ "${neutrino_url}" != "https://127.0.0.1:${NEUTRINO_PORT}" ]; then
         log "Using external neutrino-api at ${neutrino_url}"
         return 0
     fi
@@ -446,6 +450,19 @@ except Exception:
 
     if ! wait_for_port "127.0.0.1" "${NEUTRINO_PORT}" "neutrino-api" 30; then
         log "WARNING: neutrino-api did not start in time; continuing without it."
+    fi
+
+    # Wire neutrino-api auto-generated TLS cert and auth token into the
+    # environment so that jmwalletd and CLI tools authenticate automatically.
+    if [ -f "${NEUTRINO_DATA_DIR}/tls.cert" ]; then
+        export BITCOIN__NEUTRINO_TLS_CERT="${NEUTRINO_DATA_DIR}/tls.cert"
+        export BITCOIN__NEUTRINO_URL="https://127.0.0.1:${NEUTRINO_PORT}"
+        log "Neutrino TLS certificate found: ${NEUTRINO_DATA_DIR}/tls.cert"
+    fi
+    if [ -f "${NEUTRINO_DATA_DIR}/auth_token" ]; then
+        BITCOIN__NEUTRINO_AUTH_TOKEN=$(cat "${NEUTRINO_DATA_DIR}/auth_token" 2>/dev/null || true)
+        export BITCOIN__NEUTRINO_AUTH_TOKEN
+        log "Neutrino auth token loaded from ${NEUTRINO_DATA_DIR}/auth_token"
     fi
 }
 

@@ -66,6 +66,8 @@ class ResolvedBackendSettings:
     neutrino_add_peers: list[str]
     data_dir: Path
     scan_start_height: int | None = None
+    neutrino_tls_cert: str | None = None
+    neutrino_auth_token: str | None = None
 
 
 @dataclass
@@ -157,6 +159,8 @@ def resolve_backend_settings(
     rpc_user: str | None = None,
     rpc_password: str | None = None,
     neutrino_url: str | None = None,
+    neutrino_tls_cert: str | None = None,
+    neutrino_auth_token: str | None = None,
     data_dir: Path | None = None,
 ) -> ResolvedBackendSettings:
     """
@@ -171,6 +175,8 @@ def resolve_backend_settings(
         rpc_user: CLI override for RPC user
         rpc_password: CLI override for RPC password
         neutrino_url: CLI override for Neutrino URL
+        neutrino_tls_cert: CLI override for Neutrino TLS certificate path
+        neutrino_auth_token: CLI override for Neutrino API auth token
         data_dir: CLI override for data directory
 
     Returns:
@@ -216,6 +222,18 @@ def resolve_backend_settings(
     # Resolve Neutrino add peers
     resolved_neutrino_add_peers = settings.get_neutrino_add_peers()
 
+    # Resolve Neutrino TLS cert path
+    resolved_neutrino_tls_cert = (
+        neutrino_tls_cert if neutrino_tls_cert is not None else settings.bitcoin.neutrino_tls_cert
+    )
+
+    # Resolve Neutrino auth token
+    resolved_neutrino_auth_token = (
+        neutrino_auth_token
+        if neutrino_auth_token is not None
+        else settings.bitcoin.neutrino_auth_token
+    )
+
     # Resolve data directory
     resolved_data_dir = data_dir if data_dir is not None else settings.get_data_dir()
 
@@ -230,6 +248,8 @@ def resolve_backend_settings(
         neutrino_add_peers=resolved_neutrino_add_peers,
         data_dir=resolved_data_dir,
         scan_start_height=settings.wallet.scan_start_height,
+        neutrino_tls_cert=resolved_neutrino_tls_cert,
+        neutrino_auth_token=resolved_neutrino_auth_token,
     )
 
 
@@ -666,6 +686,8 @@ def create_backend(
             network=backend_settings.bitcoin_network,
             scan_start_height=backend_settings.scan_start_height,
             add_peers=backend_settings.neutrino_add_peers,
+            tls_cert_path=backend_settings.neutrino_tls_cert,
+            auth_token=backend_settings.neutrino_auth_token,
         )
     elif backend_type == "descriptor_wallet":
         if not wallet_name:

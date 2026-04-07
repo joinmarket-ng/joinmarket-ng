@@ -90,6 +90,8 @@ async def get_backend(data_dir: Path, force_new: bool = False) -> Any:
             scan_start_height=settings.wallet.scan_start_height,
             scan_lookback_blocks=scan_lookback,
             add_peers=settings.get_neutrino_add_peers(),
+            tls_cert_path=settings.bitcoin.neutrino_tls_cert,
+            auth_token=settings.bitcoin.neutrino_auth_token,
         )
     else:
         msg = f"Unknown backend type: {backend_type}"

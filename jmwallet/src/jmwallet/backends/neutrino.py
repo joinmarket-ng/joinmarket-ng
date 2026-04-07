@@ -23,7 +23,9 @@ arbitrary queries by:
 from __future__ import annotations
 
 import asyncio
+import ssl
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -87,6 +89,8 @@ class NeutrinoBackend(BlockchainBackend):
         data_dir: str = "/data/neutrino",
         scan_start_height: int | None = None,
         scan_lookback_blocks: int = 105120,
+        tls_cert_path: str | None = None,
+        auth_token: str | None = None,
     ):
         """
         Initialize Neutrino backend.
@@ -103,12 +107,20 @@ class NeutrinoBackend(BlockchainBackend):
             scan_lookback_blocks: Number of blocks to look back from the chain tip when
                 scan_start_height is not set. Defaults to 105120 (~2 years of blocks).
                 Only used on networks where _min_valid_blockheight is 0 (signet, regtest).
+            tls_cert_path: Path to neutrino-api TLS certificate for HTTPS verification.
+                When set, the client connects over HTTPS and pins the server certificate.
+            auth_token: API bearer token for neutrino-api authentication.
+                Sent as ``Authorization: Bearer <token>`` on every request.
         """
         self.neutrino_url = neutrino_url.rstrip("/")
         self.network = network
         self.add_peers = add_peers or []
         self.data_dir = data_dir
-        self.client = httpx.AsyncClient(timeout=300.0)
+
+        # Store auth settings for client (re-)creation in close().
+        self._tls_cert_path = tls_cert_path
+        self._auth_token = auth_token
+        self.client = self._build_http_client()
 
         # Cache for watched addresses (neutrino needs to know what to scan for)
         self._watched_addresses: set[str] = set()
@@ -161,6 +173,28 @@ class NeutrinoBackend(BlockchainBackend):
 
         # Server capability detection (populated once on first connection).
         self._server_capabilities = ServerCapabilities()
+
+    def _build_http_client(self) -> httpx.AsyncClient:
+        """Create an ``httpx.AsyncClient`` with optional TLS pinning and auth."""
+        kwargs: dict[str, Any] = {"timeout": 300.0}
+
+        if self._tls_cert_path:
+            cert_path = Path(self._tls_cert_path)
+            if not cert_path.is_file():
+                logger.warning(
+                    f"TLS certificate not found at {cert_path}; "
+                    "falling back to default CA verification"
+                )
+            else:
+                ctx = ssl.create_default_context(cafile=str(cert_path))
+                kwargs["verify"] = ctx
+                logger.info(f"Neutrino HTTPS pinned to certificate {cert_path}")
+
+        if self._auth_token:
+            kwargs["headers"] = {"Authorization": f"Bearer {self._auth_token}"}
+            logger.debug("Neutrino API authentication enabled (Bearer token)")
+
+        return httpx.AsyncClient(**kwargs)
 
     def set_wallet_creation_height(self, height: int | None) -> None:
         """Use wallet creation height as scan start if no explicit override.
@@ -1432,7 +1466,7 @@ class NeutrinoBackend(BlockchainBackend):
         await self.client.aclose()
         # Re-create a fresh client so this instance is usable again if the
         # wallet service is restarted (e.g. maker stop -> start in jmwalletd).
-        self.client = httpx.AsyncClient(timeout=300.0)
+        self.client = self._build_http_client()
         self._watched_addresses = set()
         self._watched_outpoints = set()
         self._filter_header_tip = 0
