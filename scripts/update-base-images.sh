@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Update Base Image Digests and Apt Package Versions for Reproducible Builds
+# Update build pinning for reproducible builds
 #
-# This script updates the base image digests and pinned apt package versions
-# in all Dockerfiles to ensure reproducible builds. Run this periodically to
-# get security updates while maintaining reproducibility.
+# This script updates base image digests, pinned apt package versions,
+# selected build-time dependency pins in Dockerfiles, and Flatpak manifest
+# dependency sources/checksums to ensure reproducible builds.
+# Run this periodically to get security updates while maintaining reproducibility.
 #
 # Usage:
 #   ./scripts/update-base-images.sh [--check]
@@ -15,6 +16,7 @@
 # Requirements:
 #   - docker with buildx
 #   - sed
+#   - python3
 # =============================================================================
 
 set -euo pipefail
@@ -36,6 +38,62 @@ CHECK_ONLY=false
 if [[ "${1:-}" == "--check" ]]; then
     CHECK_ONLY=true
 fi
+
+update_flatpak_deps() {
+    local check_arg=()
+    if [[ "$CHECK_ONLY" == true ]]; then
+        check_arg=(--check)
+    fi
+
+    local script_path="$PROJECT_ROOT/scripts/update-flatpak-deps.py"
+    if [[ ! -f "$script_path" ]]; then
+        log_warn "Flatpak updater script not found: $script_path"
+        return
+    fi
+
+    echo ""
+    log_info "Phase 6: Checking Flatpak dependencies..."
+
+    local output
+    set +e
+    output=$(python3 "$script_path" "${check_arg[@]}" 2>&1)
+    local exit_code=$?
+    set -e
+
+    if [[ -n "$output" ]]; then
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            if [[ "$line" =~ ^\[(ERROR|WARN)\] ]]; then
+                log_warn "$line"
+            else
+                log_info "$line"
+            fi
+        done <<< "$output"
+    fi
+
+    if [[ "$CHECK_ONLY" == true ]]; then
+        if [[ $exit_code -eq 1 ]]; then
+            local count
+            count=$(grep -oP '\[WARN\]\s+\K[0-9]+' <<< "$output" | head -1 || echo "1")
+            UPDATES_NEEDED=$((UPDATES_NEEDED + count))
+        elif [[ $exit_code -ne 0 ]]; then
+            log_error "Flatpak dependency check failed"
+            exit $exit_code
+        fi
+    else
+        if [[ $exit_code -eq 0 ]]; then
+            local count
+            count=$(grep -oP '\[INFO\]\s+Applied\s+\K[0-9]+' <<< "$output" | head -1 || echo "0")
+            if [[ "$count" =~ ^[0-9]+$ ]] && [[ $count -gt 0 ]]; then
+                UPDATES_MADE=$((UPDATES_MADE + count))
+                UPDATES_NEEDED=$((UPDATES_NEEDED + count))
+            fi
+        else
+            log_error "Flatpak dependency update failed"
+            exit $exit_code
+        fi
+    fi
+}
 
 # Python version to use
 PYTHON_VERSION="3.14"
@@ -419,6 +477,9 @@ fi
 # =============================================================================
 # Summary
 # =============================================================================
+
+update_flatpak_deps
+
 echo ""
 if [[ "$CHECK_ONLY" == true ]]; then
     if [[ $UPDATES_NEEDED -gt 0 ]]; then

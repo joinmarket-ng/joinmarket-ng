@@ -1,5 +1,5 @@
 #!/bin/bash
-# Update all dependency lock files in the JoinMarket NG monorepo
+# Update dependency lock files and Flatpak sources in the JoinMarket NG monorepo
 #
 # Usage:
 #   ./scripts/update-deps.sh              # Update all dependencies
@@ -7,6 +7,10 @@
 #   ./scripts/update-deps.sh --prod-only  # Update only production dependencies
 
 set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+FLATPAK_UPDATER="$SCRIPT_DIR/update-flatpak-deps.py"
 
 run_pip_compile() {
     if command -v pip-compile >/dev/null 2>&1; then
@@ -111,12 +115,29 @@ if [ "$UPDATE_DEV" = true ]; then
     echo ""
 fi
 
+if [ "$UPDATE_PROD" = true ]; then
+    echo "Updating Flatpak dependencies..."
+    echo ""
+
+    if [ -f "$FLATPAK_UPDATER" ]; then
+        if command -v python3 >/dev/null 2>&1; then
+            python3 "$FLATPAK_UPDATER" --manifest "$PROJECT_ROOT/flatpak/org.joinmarketng.JamNG.yml"
+        else
+            python "$FLATPAK_UPDATER" --manifest "$PROJECT_ROOT/flatpak/org.joinmarketng.JamNG.yml"
+        fi
+    else
+        echo "Warning: Flatpak updater script not found at $FLATPAK_UPDATER"
+    fi
+
+    echo ""
+fi
+
 echo "========================================="
 echo "All dependencies updated successfully"
 echo "========================================="
 echo ""
 echo "Next steps:"
-echo "  1. Review changes: git diff */requirements*.txt requirements-docs.txt"
+echo "  1. Review changes: git diff */requirements*.txt requirements-docs.txt flatpak/org.joinmarketng.JamNG.yml"
 echo "  2. Test locally: pip install -r <package>/requirements-dev.txt"
 echo "  3. Run tests: pytest"
-echo "  4. Commit: git add */requirements*.txt requirements-docs.txt && git commit"
+echo "  4. Commit: git add */requirements*.txt requirements-docs.txt flatpak/org.joinmarketng.JamNG.yml && git commit"

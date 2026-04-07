@@ -22,6 +22,7 @@ Utility scripts for JoinMarket NG development and operations.
 - **update_readme_help.py** - Update README files with CLI command help sections (run manually when CLI changes)
 - **update-base-images.sh** - Update Docker base image digests
 - **update-deps.sh** - Update project dependencies
+- **update-flatpak-deps.py** - Update Flatpak manifest dependency versions and checksums
 - **verify-release.sh** - Verify a signed release tarball
 
 ### Fidelity Bond Cold Storage

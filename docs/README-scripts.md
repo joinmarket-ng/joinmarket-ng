@@ -16,6 +16,7 @@ Utility scripts for JoinMarket NG development and operations.
 - **run_all_tests.sh** - Execute complete test suite including Docker-based e2e tests
 - **update_readme_help.py** - Update README files with CLI command help sections (run manually when CLI changes)
 - **update-deps.sh** - Update project dependencies
+- **update-flatpak-deps.py** - Update Flatpak manifest dependency versions and checksums
 - **validate_commit_message.py** - Validate Conventional Commit messages and enforce `Changelog:` trailers for `feat`/`fix`
 
 See also: [Raspiblitz TUI Script](README-raspiblitz-tui.md)
