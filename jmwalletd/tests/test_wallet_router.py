@@ -274,16 +274,28 @@ class TestResponseHeaders:
         assert "no-store" in resp.headers.get("cache-control", "")
 
     def test_cors_headers(self, client: TestClient) -> None:
+        # Untrusted origin -- should NOT be allowed
         resp = client.options(
             "/api/v1/getinfo",
             headers={"Origin": "https://example.com", "Access-Control-Request-Method": "GET"},
         )
-        # CORS should allow all origins
-        assert resp.headers.get("access-control-allow-origin") == "*"
+        assert resp.headers.get("access-control-allow-origin") is None
+
+        # Trusted local origin -- should be allowed
+        origin = "http://localhost:3000"
+        resp = client.options(
+            "/api/v1/getinfo",
+            headers={"Origin": origin, "Access-Control-Request-Method": "GET"},
+        )
+        assert resp.headers.get("access-control-allow-origin") == origin
 
 
 class TestSessionOfferList:
-    """Verify that the session endpoint reads offer_list from the maker reference."""
+    """Verify that the session endpoint reads offer_list from the JoinMarket-NG maker.
+
+    Note: In the reference implementation (original JoinMarket), this was
+    a more permissive endpoint. JoinMarket-NG enforces stricter privacy here.
+    """
 
     def test_offer_list_from_maker_ref(self, authed_client: tuple[TestClient, str]) -> None:
         """When a maker is running, the session should return its offers."""
