@@ -469,8 +469,14 @@ except Exception:
 start_obwatcher() {
     log "Starting orderbook watcher..."
     JOINMARKET_DATA_DIR="${NET_DATA_DIR}" \
+    JOINMARKET_CONFIG_FILE="${CONFIG_FILE}" \
     NETWORK_CONFIG__NETWORK="${NETWORK}" \
     NETWORK_CONFIG__BITCOIN_NETWORK="${NETWORK}" \
+    TOR__SOCKS_HOST="127.0.0.1" \
+    TOR__SOCKS_PORT="${TOR_SOCKS_PORT}" \
+    TOR__CONTROL_HOST="127.0.0.1" \
+    TOR__CONTROL_PORT="${TOR_CONTROL_PORT}" \
+    TOR__COOKIE_PATH="${TOR_DATA_DIR}/control_auth_cookie" \
     ORDERBOOK_WATCHER__HTTP_PORT="${OBWATCHER_PORT}" \
     python3 -m orderbook_watcher.main > "${LOG_DIR}/obwatcher.log" 2>&1 &
     local pid=$!
@@ -584,6 +590,24 @@ main() {
     NEUTRINO_PORT=$(find_free_port)
     JMWALLETD_PORT=$(find_port_prefer 28183)
     OBWATCHER_PORT=$(find_port_prefer 8000)
+
+    # Export shared runtime env so every child process inherits the same
+    # dynamic network, Tor, and service endpoint settings.
+    export JOINMARKET_DATA_DIR="${NET_DATA_DIR}"
+    export JOINMARKET_CONFIG_FILE="${CONFIG_FILE}"
+    export NETWORK_CONFIG__NETWORK="${NETWORK}"
+    export NETWORK_CONFIG__BITCOIN_NETWORK="${NETWORK}"
+    export TOR__SOCKS_HOST="127.0.0.1"
+    export TOR__SOCKS_PORT="${TOR_SOCKS_PORT}"
+    export TOR__CONTROL_HOST="127.0.0.1"
+    export TOR__CONTROL_PORT="${TOR_CONTROL_PORT}"
+    export TOR__COOKIE_PATH="${TOR_DATA_DIR}/control_auth_cookie"
+    export ORDERBOOK_WATCHER__HTTP_PORT="${OBWATCHER_PORT}"
+    export JMWALLETD_PORT="${JMWALLETD_PORT}"
+    export JMWALLETD_HOST="127.0.0.1"
+    export OBWATCH_URL="http://127.0.0.1:${OBWATCHER_PORT}"
+    export BITCOIN__BACKEND_TYPE="${BITCOIN__BACKEND_TYPE:-neutrino}"
+    export BITCOIN__NEUTRINO_URL="${BITCOIN__NEUTRINO_URL:-http://127.0.0.1:${NEUTRINO_PORT}}"
 
     setup_data_dir
     save_env
