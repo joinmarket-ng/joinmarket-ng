@@ -1,25 +1,45 @@
 #!/bin/bash
-
+################################################################################
 # menu.joinmarket-ng.sh
-# TUI Menu for JoinMarket-NG on Raspiblitz
-# Runs as joinmarketng user (invoked via: sudo -u joinmarketng menu.sh)
-# Uses sudo only for specific privileged actions (maker-start/stop/status via bonus script)
+# TUI Menu for JoinMarket-NG
+#
+# Works in two environments:
+#   - Raspiblitz: Uses sudo bonus script for privileged maker operations
+#   - Standalone: Uses direct jm-maker commands, dynamic user detection
+#
+# Environment is auto-detected at startup.
+################################################################################
 
-# Config -- use explicit user home, not $HOME (which is /root when run as sudo)
-USER_JM="joinmarketng"
-HOME_JM="/home/${USER_JM}"
+# ---- Environment detection --------------------------------------------------
+# Raspiblitz ships a bonus script for privileged maker control.
+# If it exists, we use sudo calls for maker-start/stop/status and password
+# storage.  Otherwise we fall back to direct CLI commands.
+BONUS_SCRIPT="/home/admin/config.scripts/bonus.joinmarket-ng.sh"
+if [ -f "$BONUS_SCRIPT" ]; then
+    RASPIBLITZ=1
+    # On Raspiblitz the script runs as the joinmarketng user.
+    USER_JM="joinmarketng"
+    HOME_JM="/home/${USER_JM}"
+    VENV_BIN="${HOME_JM}/venv/bin"
+else
+    RASPIBLITZ=0
+    USER_JM=$(whoami)
+    HOME_JM="/home/${USER_JM}"
+    VENV_BIN="${HOME_JM}/.joinmarket-ng/venv/bin"
+fi
+
+# ---- Paths ------------------------------------------------------------------
 DATA_DIR="${HOME_JM}/.joinmarket-ng"
-VENV_BIN="${HOME_JM}/venv/bin"
 CONFIG_FILE="${DATA_DIR}/config.toml"
 LOG_DIR="${DATA_DIR}/logs"
 MAKER_ENV="${DATA_DIR}/.maker.env"
 
-# Defaults for send/coinjoin parameters
+# ---- Defaults for send/coinjoin parameters ----------------------------------
 DEFAULT_AMOUNT="0"
 DEFAULT_MIXDEPTH="0"
 DEFAULT_FEE_RATE=""
 DEFAULT_DESTINATION=""
-# Counterparty default: read from config.toml [taker] section, fall back to 10 (jm-taker default)
+# Counterparty default: read from config.toml [taker] section, fall back to 10
 DEFAULT_COUNTERPARTIES=$(python3 - "$CONFIG_FILE" <<'PYEOF' 2>/dev/null
 import sys, pathlib
 try:
@@ -42,15 +62,27 @@ DEFAULT_COUNTERPARTIES="${DEFAULT_COUNTERPARTIES:-10}"
 # Ensure log directory exists
 mkdir -p "$LOG_DIR"
 
-# Load environment
-source "$VENV_BIN/activate"
+# ---- Activate virtual environment -------------------------------------------
+# Skip if CLI tools are already available (e.g. pip-installed entry points).
+if ! command -v jm-wallet &>/dev/null; then
+    if [ -f "$VENV_BIN/activate" ]; then
+        source "$VENV_BIN/activate"
+    else
+        echo "ERROR: jm-wallet not found in PATH and no venv at $VENV_BIN"
+        exit 1
+    fi
+fi
 # Ensure ~/.local/bin is in PATH (fallback for pip console scripts)
 export PATH="${HOME_JM}/.local/bin:$PATH"
+
+# =============================================================================
+# Helpers
+# =============================================================================
 
 # Helper: Pause
 pause() {
   echo ""
-  read -p "Press [Enter] key to continue..." fackEnterKey
+  read -p "Press [Enter] key to continue..." fakeEnterKey
 }
 
 # Helper: Get configured mnemonic file from config.toml
@@ -61,6 +93,7 @@ get_mnemonic_file() {
 }
 
 # Helper: Set a value in config.toml (uncomment if needed)
+# Values are escaped for safe use in sed replacement strings.
 set_config_value() {
     local key=$1
     local value=$2
@@ -70,10 +103,14 @@ set_config_value() {
         value="\"${value}\""
     fi
 
+    # Escape sed metacharacters in the value (backslash, ampersand, pipe delimiter)
+    local sed_value
+    sed_value=$(printf '%s' "$value" | sed -e 's/[&\\/|]/\\&/g')
+
     if grep -q "^${key}[[:space:]]*=" "$CONFIG_FILE"; then
-        sed -i "s|^${key}[[:space:]]*=.*|${key} = ${value}|" "$CONFIG_FILE"
+        sed -i "s|^${key}[[:space:]]*=.*|${key} = ${sed_value}|" "$CONFIG_FILE"
     elif grep -q "^#[[:space:]]*${key}[[:space:]]*=" "$CONFIG_FILE"; then
-        sed -i "s|^#[[:space:]]*${key}[[:space:]]*=.*|${key} = ${value}|" "$CONFIG_FILE"
+        sed -i "s|^#[[:space:]]*${key}[[:space:]]*=.*|${key} = ${sed_value}|" "$CONFIG_FILE"
     else
         echo "# Warning: Could not find key '${key}' in config"
     fi
@@ -94,7 +131,7 @@ prompt_param() {
     local value
     value=$(whiptail --title " $title " \
       --inputbox "$prompt" \
-      10 68 "$default" 3>&1 1>&2 2>&3)
+      16 68 "$default" 3>&1 1>&2 2>&3)
     local rc=$?
     [ $rc -ne 0 ] && return 1
     echo "$value"
@@ -148,7 +185,112 @@ show_summary() {
     return $?
 }
 
+# Helper: Display send/coinjoin status summary with defaults.
+# Shows current parameter values inline while the user fills in each field.
+# Usage: display_send_status "Optional explanation text"
+display_send_status() {
+    local explanation="${1:-}"
+
+    # Fee display logic based on SEND_FEE_ENTERED flag
+    local fee_display
+    if [ -n "$SEND_FEE" ]; then
+        fee_display="$SEND_FEE"
+    elif [ "$SEND_FEE_ENTERED" = "1" ]; then
+        fee_display="auto"
+    else
+        fee_display="(default: auto)"
+    fi
+
+    cat <<EOF
+
+From wallet:     $(basename "$CURRENT_WALLET")
+Source Mixdepth: ${SEND_MIXDEPTH:-(default: ${DEFAULT_MIXDEPTH})}
+Amount:          ${SEND_AMOUNT:-(default: ${DEFAULT_AMOUNT})} sats
+Counterparties:  ${SEND_CP:-(default: ${DEFAULT_COUNTERPARTIES})} makers
+Fee Rate         ${fee_display} sats/vB
+Destination:     ${SEND_DEST:-not set}
+----------------------------------------------------------------
+${explanation}
+EOF
+}
+
+# Helper: Stop Maker Bot (standalone mode)
+# Cleans up process and files when not using the Raspiblitz bonus script.
+stop_maker() {
+    if pgrep -f "jm-maker" > /dev/null 2>&1; then
+        echo "Stopping maker bot..."
+
+        MAKER_PIDS=$(pgrep -f "jm-maker")
+        echo "Found maker processes: $MAKER_PIDS"
+
+        # Send graceful shutdown signal
+        for PID in $MAKER_PIDS; do
+            kill -TERM "$PID" 2>/dev/null
+        done
+
+        # Wait for graceful shutdown (up to 5 seconds)
+        echo "Waiting for graceful shutdown (up to 5 seconds)..."
+        sleep 5
+
+        # Force kill if still running
+        if pgrep -f "jm-maker" > /dev/null 2>&1; then
+            echo "Processes still running, forcing shutdown..."
+            pkill -KILL -f "jm-maker" 2>/dev/null
+        fi
+
+        echo "Maker processes stopped."
+    else
+        echo "No maker process running."
+    fi
+
+    # Clean up files
+    rm -f "$DATA_DIR/.maker.pid"
+    rm -f "$DATA_DIR/.maker.env"
+    rm -f "$DATA_DIR/state/maker.nick"
+    echo "Done."
+}
+
+# Helper: Store wallet password (environment-aware)
+store_password() {
+    local password="$1"
+    if [ "$RASPIBLITZ" = "1" ]; then
+        sudo "$BONUS_SCRIPT" store-password "$password"
+    else
+        set_config_value "mnemonic_password" "$password" "true"
+    fi
+}
+
+# Helper: Start maker (environment-aware)
+maker_start() {
+    if [ "$RASPIBLITZ" = "1" ]; then
+        sudo "$BONUS_SCRIPT" maker-start
+    else
+        jm-maker start
+    fi
+}
+
+# Helper: Stop maker (environment-aware)
+maker_stop() {
+    if [ "$RASPIBLITZ" = "1" ]; then
+        sudo "$BONUS_SCRIPT" maker-stop
+    else
+        stop_maker
+    fi
+}
+
+# Helper: Show maker status (environment-aware)
+maker_status() {
+    if [ "$RASPIBLITZ" = "1" ]; then
+        sudo "$BONUS_SCRIPT" maker-status
+    else
+        echo "Maker Bot: ($MAKER_STATUS)"
+    fi
+}
+
+# =============================================================================
 # Main Loop
+# =============================================================================
+
 while true; do
 
   # Get Maker Service Status
@@ -161,15 +303,20 @@ while true; do
   # Check if a wallet is configured
   CURRENT_WALLET=$(get_mnemonic_file)
   if [ -n "$CURRENT_WALLET" ]; then
-    WALLET_INFO="Wallet: $(basename "$CURRENT_WALLET")"
+    WALLET_INFO="Active Wallet: $(basename "$CURRENT_WALLET")"
   else
-    WALLET_INFO="Wallet: (none configured)"
+    WALLET_INFO="Active Wallet: (none configured)"
   fi
 
-  CHOICE=$(whiptail --title " JoinMarket-NG Menu " --menu "Maker: $MAKER_STATUS | $WALLET_INFO" 18 64 9 \
+CHOICE=$(whiptail --title " JoinMarket-NG Menu " \
+    --menu "
+$WALLET_INFO | Maker Bot: $MAKER_STATUS
+
+" \
+    18 64 9 \
     "S" "Send Bitcoin" \
     "W" "Wallet Management" \
-    "M" "Maker Bot Control (${MAKER_STATUS})" \
+    "M" "Maker Bot Control" \
     "C" "Edit Configuration" \
     "I" "Info / Documentation" \
     "X" "Exit" 3>&1 1>&2 2>&3)
@@ -190,34 +337,49 @@ while true; do
           continue
       fi
 
-      # 1. Destination address (required)
-      SEND_DEST=$(prompt_param "Destination" \
-        "Enter destination bitcoin address.\nLeave empty and press Enter for INTERNAL (next mixdepth, coinjoin only)." \
-        "$DEFAULT_DESTINATION") || continue
-      # For coinjoin with no destination, default to INTERNAL later
+      # Reset all send parameters at the start
+      SEND_MIXDEPTH=""
+      SEND_AMOUNT=""
+      SEND_CP=""
+      SEND_FEE=""
+      SEND_FEE_ENTERED=""
+      SEND_DEST=""
+
+      # 1. Source mixdepth
+      SEND_MIXDEPTH=$(prompt_param "Choose a mixdepth to send from" \
+        "$(display_send_status "Source mixdepth (account) to send from.")" \
+        "") || continue
+      SEND_MIXDEPTH=$(to_int "${SEND_MIXDEPTH:-$DEFAULT_MIXDEPTH}" "$DEFAULT_MIXDEPTH")
 
       # 2. Amount in satoshis
-      SEND_AMOUNT=$(prompt_param "Amount" \
-        "Amount in satoshis to send.\n0 = sweep entire mixdepth (best privacy for coinjoin)." \
-        "$DEFAULT_AMOUNT") || continue
-      SEND_AMOUNT=$(to_int "${SEND_AMOUNT}" "$DEFAULT_AMOUNT")
+      SEND_AMOUNT=$(prompt_param "Send Amount" \
+        "$(display_send_status "Amount in satoshis to send.\n0 = sweep entire mixdepth (best privacy for coinjoin).")" \
+        "") || continue
+      SEND_AMOUNT=$(to_int "${SEND_AMOUNT:-$DEFAULT_AMOUNT}" "$DEFAULT_AMOUNT")
 
-      # 3. Source mixdepth
-      SEND_MIXDEPTH=$(prompt_param "Source Mixdepth" \
-        "Source mixdepth (account) to send from." \
-        "$DEFAULT_MIXDEPTH") || continue
-      SEND_MIXDEPTH=$(to_int "${SEND_MIXDEPTH}" "$DEFAULT_MIXDEPTH")
+      # 3. Counterparties (0 = normal transaction, >0 = coinjoin)
+      SEND_CP=$(prompt_param "Counterparties" \
+        "$(display_send_status "Number of counterparties (makers) for CoinJoin.\n0 = normal transaction (no CoinJoin).\nRecommended for CoinJoin: 4-10.")" \
+        "") || continue
+      SEND_CP=$(to_int "${SEND_CP:-$DEFAULT_COUNTERPARTIES}" "$DEFAULT_COUNTERPARTIES")
 
       # 4. Fee rate
       SEND_FEE=$(prompt_param "Fee Rate" \
-        "Fee rate in sat/vB.\nLeave blank for automatic estimation (3-block target from config)." \
-        "$DEFAULT_FEE_RATE") || continue
+        "$(display_send_status "Fee rate in sat/vB.\nLeave blank for auto (block target in config).")" \
+        "") || continue
+      # Validate fee rate is numeric if provided
+      if [ -n "$SEND_FEE" ] && ! [[ "$SEND_FEE" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+          whiptail --title " Error " --msgbox "Fee rate must be a numeric value in sat/vB." 8 50
+          continue
+      fi
 
-      # 5. Number of counterparties (0 = normal transaction, >0 = coinjoin)
-      SEND_CP=$(prompt_param "Counterparties" \
-        "Number of counterparties (makers) for CoinJoin.\n0 = normal transaction (no CoinJoin).\nRecommended for CoinJoin: 4-10." \
-        "$DEFAULT_COUNTERPARTIES") || continue
-      SEND_CP=$(to_int "${SEND_CP}" "$DEFAULT_COUNTERPARTIES")
+      # Set flag to show "auto" instead of "(default: auto)" in next prompts
+      SEND_FEE_ENTERED="1"
+
+      # 5. Destination address (if empty: INTERNAL coinjoin to next mixdepth)
+      SEND_DEST=$(prompt_param "Destination Address" \
+        "$(display_send_status "Enter destination bitcoin address.\nLeave empty for INTERNAL (next mixdepth, coinjoin only).")" \
+        "") || continue
 
       # Apply INTERNAL default for coinjoin when destination is empty
       if [ -z "$SEND_DEST" ] && [ "$SEND_CP" -gt 0 ] 2>/dev/null; then
@@ -225,6 +387,16 @@ while true; do
       elif [ -z "$SEND_DEST" ]; then
           whiptail --title " Error " --msgbox "Destination address is required for normal transactions." 8 50
           continue
+      fi
+
+      # Validate destination looks like a bitcoin address (unless INTERNAL)
+      if [ "$SEND_DEST" != "INTERNAL" ]; then
+          # Accept mainnet (1/3/bc1), testnet (m/n/2/tb1), signet (tb1), regtest (bcrt1)
+          if ! [[ "$SEND_DEST" =~ ^[13mn2][a-km-zA-HJ-NP-Z1-9]{25,40}$ || \
+                  "$SEND_DEST" =~ ^(bc|tb|bcrt)1[0-9ac-hj-np-z]{11,71}$ ]]; then
+              whiptail --title " Error " --msgbox "Destination does not look like a valid Bitcoin address." 8 55
+              continue
+          fi
       fi
 
       # Determine transaction type label for summary
@@ -293,18 +465,37 @@ while true; do
     # WALLET MANAGEMENT
     # ------------------------------------------------------------------
     W)
-      # Wallet Submenu
-      WCHOICE=$(whiptail --title " Wallet Management " --menu "Choose option:" 20 64 11 \
-        "NEW"      "Create New Wallet (24-word seed)" \
-        "IMP"      "Import Existing Wallet (from seed)" \
-        "VAL"      "Validate a Seed Phrase" \
-        "BAL"      "View Wallet Info / Balance" \
-        "HIST"     "CoinJoin History" \
-        "FREEZE"   "Freeze / Unfreeze UTXOs" \
-        "SEL"      "Select Active Wallet" \
-        "BACK"     "Back to Main Menu" 3>&1 1>&2 2>&3)
+      # Wallet Management Submenu - loops until BACK is selected
+      while true; do
+        # Refresh wallet info at the START of each W submenu iteration
+        CURRENT_WALLET=$(get_mnemonic_file)
+        if [ -n "$CURRENT_WALLET" ]; then
+          WALLET_INFO="Wallet: $(basename "$CURRENT_WALLET")"
+        else
+          WALLET_INFO="Wallet: (none configured)"
+        fi
 
-      case $WCHOICE in
+        WCHOICE=$(whiptail --title " Wallet Management " \
+         --menu "
+ $WALLET_INFO
+
+         " 20 64 11 \
+          "NEW"      "Create New Wallet (24-word seed)" \
+          "IMP"      "Import Existing Wallet (from seed)" \
+          "VAL"      "Validate a Seed Phrase" \
+          "BAL"      "View Wallet Info / Balance" \
+          "HIST"     "CoinJoin History" \
+          "FREEZE"   "Freeze / Unfreeze UTXOs" \
+          "SEL"      "Select Active Wallet" \
+          "BACK"     "Back to Main Menu" 3>&1 1>&2 2>&3)
+
+        # Handle ESC/Cancel - exit W submenu
+        [ $? -ne 0 ] && break
+
+        case $WCHOICE in
+          # --------------------------------------------------------------
+          # NEW - Create New Wallet
+          # --------------------------------------------------------------
           NEW)
               clear
               echo "=== Create New Wallet ==="
@@ -316,6 +507,12 @@ while true; do
               WNAME=${WNAME:-default}
               # Strip extension if provided, we add .mnemonic
               WNAME="${WNAME%.mnemonic}"
+              # Validate: only safe characters, no path separators
+              if [[ ! "$WNAME" =~ ^[A-Za-z0-9._-]+$ ]]; then
+                  echo "Invalid wallet name. Use only letters, numbers, dot, underscore, and hyphen."
+                  pause
+                  continue
+              fi
 
               WALLET_PATH="$DATA_DIR/wallets/${WNAME}.mnemonic"
               mkdir -p "$DATA_DIR/wallets"
@@ -344,7 +541,7 @@ while true; do
                   if [[ "$STORE_PWD" =~ ^[Yy] ]]; then
                       read -r -s -p "Enter the wallet encryption password: " PWD_STORE
                       echo ""
-                      sudo /home/admin/config.scripts/bonus.joinmarket-ng.sh store-password "${PWD_STORE}"
+                      store_password "${PWD_STORE}"
                       unset PWD_STORE
                       echo "Password stored in config.toml."
                   fi
@@ -353,6 +550,10 @@ while true; do
               fi
               pause
               ;;
+
+          # --------------------------------------------------------------
+          # IMP - Import Wallet
+          # --------------------------------------------------------------
           IMP)
               clear
               echo "=== Import Wallet from Seed ==="
@@ -362,6 +563,12 @@ while true; do
               read -p "Enter wallet name (default: imported): " WNAME
               WNAME=${WNAME:-imported}
               WNAME="${WNAME%.mnemonic}"
+              # Validate: only safe characters, no path separators
+              if [[ ! "$WNAME" =~ ^[A-Za-z0-9._-]+$ ]]; then
+                  echo "Invalid wallet name. Use only letters, numbers, dot, underscore, and hyphen."
+                  pause
+                  continue
+              fi
 
               # Ask for word count
               WORDS_CHOICE=$(whiptail --title " Import Wallet " \
@@ -395,7 +602,7 @@ while true; do
                   if [[ "$STORE_PWD" =~ ^[Yy] ]]; then
                       read -r -s -p "Enter the wallet encryption password: " PWD_STORE
                       echo ""
-                      sudo /home/admin/config.scripts/bonus.joinmarket-ng.sh store-password "${PWD_STORE}"
+                      store_password "${PWD_STORE}"
                       unset PWD_STORE
                       echo "Password stored in config.toml."
                   fi
@@ -404,6 +611,10 @@ while true; do
               fi
               pause
               ;;
+
+          # --------------------------------------------------------------
+          # VAL - Validate Seed
+          # --------------------------------------------------------------
           VAL)
               clear
               echo "=== Validate Seed Phrase ==="
@@ -413,20 +624,56 @@ while true; do
               jm-wallet validate
               pause
               ;;
+
+          # --------------------------------------------------------------
+          # BAL - Wallet Info (with submenu)
+          # --------------------------------------------------------------
           BAL)
-              clear
-              echo "=== Wallet Info / Balance ==="
-              echo ""
-              if [ -z "$CURRENT_WALLET" ]; then
-                  echo "No wallet configured in config.toml (mnemonic_file is empty)."
-                  echo "Use 'Select Active Wallet' or 'Create New Wallet' first."
-              else
-                  echo "Active wallet: $(basename "$CURRENT_WALLET")"
-                  echo ""
-                  jm-wallet info
-              fi
-              pause
+              while true; do
+                  if [ -z "$CURRENT_WALLET" ]; then
+                      whiptail --title " Error " --msgbox "No wallet configured.\nUse 'Select Active Wallet' or 'Create New Wallet' first." 9 50
+                      break
+                  fi
+
+                  INFO_CHOICE=$(whiptail --title " Wallet Info " \
+                    --menu "Choose info display level:" \
+                    16 64 3 \
+                    "BASIC" "Basic balance by mixdepth" \
+                    "EXT" "Extended (detailed address list with status)" \
+                    "BACK" "Back to Wallet Management" 3>&1 1>&2 2>&3)
+
+                  # Handle ESC/Cancel
+                  [ $? -ne 0 ] && break
+
+                  case $INFO_CHOICE in
+                      BASIC)
+                          clear
+                          echo "=== Wallet Info (Basic) ==="
+                          echo ""
+                          echo "Active wallet: $(basename "$CURRENT_WALLET")"
+                          echo ""
+                          jm-wallet info
+                          pause
+                          ;;
+                      EXT)
+                          clear
+                          echo "=== Wallet Info (Extended) ==="
+                          echo ""
+                          echo "Active wallet: $(basename "$CURRENT_WALLET")"
+                          echo ""
+                          jm-wallet info --extended
+                          pause
+                          ;;
+                      BACK|"")
+                          break
+                          ;;
+                  esac
+              done
               ;;
+
+          # --------------------------------------------------------------
+          # HIST - CoinJoin History
+          # --------------------------------------------------------------
           HIST)
               if [ -z "$CURRENT_WALLET" ]; then
                   whiptail --title " Error " --msgbox "No wallet configured.\nSet up a wallet first (W -> NEW or SEL)." 9 50
@@ -435,10 +682,25 @@ while true; do
                   HIST_ROLE=$(prompt_param "Role Filter" \
                     "Filter by role: maker, taker.\nLeave blank for all." \
                     "") || continue
+                  # Validate role
+                  if [ -n "$HIST_ROLE" ]; then
+                      case "$HIST_ROLE" in
+                          maker|taker) ;;
+                          *)
+                              whiptail --title " Error " --msgbox "Invalid role '${HIST_ROLE}'.\nAllowed: maker, taker, or blank for all." 9 50
+                              continue
+                              ;;
+                      esac
+                  fi
 
                   HIST_LIMIT=$(prompt_param "Max Entries" \
                     "Maximum number of entries to show.\nLeave blank for all." \
                     "") || continue
+                  # Validate limit is numeric
+                  if [ -n "$HIST_LIMIT" ] && ! [[ "$HIST_LIMIT" =~ ^[0-9]+$ ]]; then
+                      whiptail --title " Error " --msgbox "Limit must be a positive integer." 8 40
+                      continue
+                  fi
 
                   whiptail --title " Statistics " \
                     --yesno "Show statistics summary?" \
@@ -472,6 +734,10 @@ while true; do
                   pause
               fi
               ;;
+
+          # --------------------------------------------------------------
+          # FREEZE - Freeze/Unfreeze UTXOs
+          # --------------------------------------------------------------
           FREEZE)
               clear
               echo "=== Freeze / Unfreeze UTXOs ==="
@@ -487,6 +753,10 @@ while true; do
               fi
               pause
               ;;
+
+          # --------------------------------------------------------------
+          # SEL - Select Active Wallet
+          # --------------------------------------------------------------
           SEL)
               clear
               echo "=== Select Active Wallet ==="
@@ -502,7 +772,10 @@ while true; do
                   echo "Current: $(get_mnemonic_file)"
                   echo ""
                   read -p "Enter wallet filename: " WNAME
-                  if [ -f "$DATA_DIR/wallets/$WNAME" ]; then
+                  # Validate: only safe characters, no path separators
+                  if [[ ! "$WNAME" =~ ^[A-Za-z0-9._-]+$ ]]; then
+                      echo "Invalid wallet filename. Use only letters, numbers, dot, underscore, and hyphen."
+                  elif [ -f "$DATA_DIR/wallets/$WNAME" ]; then
                       set_config_value "mnemonic_file" "$DATA_DIR/wallets/$WNAME" "true"
                       echo "Active wallet set to: $WNAME"
                       echo "Restart the maker service for changes to take effect."
@@ -512,7 +785,15 @@ while true; do
               fi
               pause
               ;;
-      esac
+
+          # --------------------------------------------------------------
+          # BACK - Exit Wallet Management
+          # --------------------------------------------------------------
+          BACK)
+              break
+              ;;
+        esac
+      done  # End W submenu loop
       ;;
 
     # ------------------------------------------------------------------
@@ -535,17 +816,17 @@ while true; do
               if [ -z "$CURRENT_WALLET" ]; then
                   echo "ERROR: No wallet configured. Set up a wallet first (W -> SEL or NEW)."
               else
-                  sudo /home/admin/config.scripts/bonus.joinmarket-ng.sh maker-start
+                  maker_start
                   sleep 2
                   echo ""
                   echo "Service status:"
-                  sudo /home/admin/config.scripts/bonus.joinmarket-ng.sh maker-status
+                  maker_status
               fi
               pause
               ;;
           STOP)
               clear
-              sudo /home/admin/config.scripts/bonus.joinmarket-ng.sh maker-stop
+              maker_stop
               pause
               ;;
           RESTART)
@@ -553,12 +834,12 @@ while true; do
               if [ -z "$CURRENT_WALLET" ]; then
                   echo "ERROR: No wallet configured. Set up a wallet first (W -> SEL or NEW)."
               else
-                  sudo /home/admin/config.scripts/bonus.joinmarket-ng.sh maker-stop
-                  sudo /home/admin/config.scripts/bonus.joinmarket-ng.sh maker-start
+                  maker_stop
+                  maker_start
                   sleep 2
                   echo ""
                   echo "Service status:"
-                  sudo /home/admin/config.scripts/bonus.joinmarket-ng.sh maker-status
+                  maker_status
               fi
               pause
               ;;
@@ -573,7 +854,7 @@ while true; do
               else
                   echo "No log file found at $LOG_FILE (maker may not have run yet)."
                   echo "Trying journalctl..."
-                  sudo /home/admin/config.scripts/bonus.joinmarket-ng.sh maker-status
+                  maker_status
               fi
               pause
               ;;
@@ -581,7 +862,7 @@ while true; do
               clear
               echo "=== Maker Service Status ==="
               echo ""
-              sudo /home/admin/config.scripts/bonus.joinmarket-ng.sh maker-status
+              maker_status
               pause
               ;;
           BONDS)
@@ -669,22 +950,22 @@ Data:   $DATA_DIR
 Logs:   $LOG_DIR
 
 CLI tools (from venv):
-  jm-wallet generate   - Create new wallet
-  jm-wallet import     - Import from seed
-  jm-wallet validate   - Validate a seed phrase
-  jm-wallet info       - Show balance by mixdepth
-  jm-wallet history    - CoinJoin history
-  jm-wallet send       - Send bitcoin
-  jm-wallet freeze     - Freeze/unfreeze UTXOs
-  jm-wallet list-bonds              - List fidelity bonds
-  jm-wallet generate-bond-address   - Create bond address
-  jm-maker start       - Maker bot (earn fees)
-  jm-taker coinjoin    - Run a CoinJoin
+  jm-wallet generate               - Create new wallet
+  jm-wallet import                 - Import from seed
+  jm-wallet validate               - Validate a seed phrase
+  jm-wallet info                   - Show balance by mixdepth
+  jm-wallet history                - CoinJoin history
+  jm-wallet send                   - Send bitcoin
+  jm-wallet freeze                 - Freeze/unfreeze UTXOs
+  jm-wallet list-bonds             - List fidelity bonds
+  jm-wallet generate-bond-address  - Create FB address
+  jm-maker start                   - Maker bot (earn fees)
+  jm-taker coinjoin                - Run a CoinJoin
 
 Maker service (as admin):
   sudo systemctl start joinmarket-ng-maker
   sudo systemctl stop joinmarket-ng-maker
-  sudo journalctl -u joinmarket-ng-maker -f" 24 60
+  sudo journalctl -u joinmarket-ng-maker -f" 24 66
       ;;
 
     X)

@@ -47,6 +47,9 @@ dev = [
     "mypy>=1.7.0",
 ]
 
+[project.scripts]
+jm-ng = "jmcore.tui:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
