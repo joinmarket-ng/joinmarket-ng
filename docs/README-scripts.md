@@ -13,6 +13,6 @@ This docs page intentionally stays minimal to avoid duplication.
 - `scripts/run_all_tests.sh`: run unit + Docker-backed test phases
 - `scripts/generate_changelog.py`: generate release changelog entries
 - `scripts/update_readme_help.py`: refresh CLI help blocks in READMEs and docs pages
-- `scripts/menu.joinmarket-ng.sh`: Raspiblitz TUI wrapper
+- `scripts/menu.joinmarket-ng.sh`: TUI menu (works on Raspiblitz and standalone)
 
-See also: [Raspiblitz TUI Script](README-raspiblitz-tui.md)
+See also: [TUI Menu](README-tui.md)

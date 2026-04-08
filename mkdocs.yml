@@ -253,7 +253,7 @@ nav:
   # -------------------------------------------------------------------------
   - Home: index.md
   - Installation: install.md
-  - 💻 Userfriendly TUI: joinmarket-ng-tui.md
+  - TUI Menu: README-tui.md
 
   # -------------------------------------------------------------------------
   # Protocol Documentation
