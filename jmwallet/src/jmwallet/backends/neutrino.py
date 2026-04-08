@@ -1190,15 +1190,22 @@ class NeutrinoBackend(BlockchainBackend):
 
     def can_provide_neutrino_metadata(self) -> bool:
         """
-        Neutrino backend cannot reliably provide metadata for all UTXOs.
+        Neutrino backend CAN provide metadata for its own wallet UTXOs.
 
-        Light clients can only provide metadata for UTXOs they've been watching.
-        They cannot provide metadata for arbitrary addresses like full nodes can.
+        A neutrino maker knows its own scriptpubkeys (derived from the wallet)
+        and block heights (from its own transaction history). This metadata is
+        included in !ioauth responses so that neutrino takers can verify the
+        maker's UTXOs via compact block filters.
+
+        Note: This is distinct from requires_neutrino_metadata(), which asks
+        whether this backend needs metadata FROM counterparties to verify THEIR
+        UTXOs. A neutrino backend both requires metadata from others AND can
+        provide metadata about its own UTXOs.
 
         Returns:
-            False - Neutrino cannot provide metadata for arbitrary UTXOs
+            True - Neutrino can provide scriptpubkey + blockheight for own UTXOs
         """
-        return False
+        return True
 
     async def verify_utxo_with_metadata(
         self,

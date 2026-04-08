@@ -1551,11 +1551,11 @@ class TestDirectConnectionHandshake:
         mock_conn.send.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_try_handle_handshake_neutrino_backend_no_neutrino_compat(self, maker_bot):
-        """Test that Neutrino backend doesn't advertise neutrino_compat."""
+    async def test_try_handle_handshake_backend_without_neutrino_compat(self, maker_bot):
+        """Test that a backend which can't provide metadata doesn't advertise neutrino_compat."""
         mock_conn = MagicMock(spec=TCPConnection)
 
-        # Configure backend as Neutrino (can't provide neutrino metadata)
+        # Configure backend that cannot provide neutrino metadata
         maker_bot.backend.can_provide_neutrino_metadata.return_value = False
 
         handshake_request = {
@@ -1588,6 +1588,47 @@ class TestDirectConnectionHandshake:
         features = response_data.get("features", {})
         assert "neutrino_compat" not in features or features.get("neutrino_compat") is False
         # But should still have peerlist_features
+        assert features.get("peerlist_features") is True
+
+    @pytest.mark.asyncio
+    async def test_try_handle_handshake_neutrino_backend_advertises_neutrino_compat(
+        self, maker_bot
+    ):
+        """Neutrino makers advertise neutrino_compat because they can provide own UTXO metadata."""
+        mock_conn = MagicMock(spec=TCPConnection)
+
+        # Neutrino backend: requires metadata from others AND can provide its own
+        maker_bot.backend.can_provide_neutrino_metadata.return_value = True
+        maker_bot.backend.requires_neutrino_metadata.return_value = True
+
+        handshake_request = {
+            "type": 793,
+            "line": json.dumps(
+                {
+                    "app-name": "joinmarket",
+                    "directory": False,
+                    "location-string": "NOT-SERVING-ONION",
+                    "proto-ver": 5,
+                    "features": {},
+                    "nick": "J5TestNick",
+                    "network": "regtest",
+                }
+            ),
+        }
+        data = json.dumps(handshake_request).encode("utf-8")
+
+        await maker_bot._try_handle_handshake(mock_conn, data, "test:1234")
+
+        response_bytes = mock_conn.send.call_args[0][0]
+        response = json.loads(response_bytes.decode("utf-8"))
+
+        assert response["type"] == 793
+        response_data = json.loads(response["line"])
+        assert response_data["directory"] is False
+
+        # Neutrino makers SHOULD advertise neutrino_compat
+        features = response_data.get("features", {})
+        assert features.get("neutrino_compat") is True
         assert features.get("peerlist_features") is True
 
 

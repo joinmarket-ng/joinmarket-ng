@@ -86,7 +86,7 @@ jm-maker start --mnemonic-file ~/.joinmarket-ng/wallets/default.mnemonic
 
 #### Option B: Neutrino Backend
 
-Lightweight alternative if you cannot run a full node. Note that Neutrino makers can only participate in CoinJoins with takers that support `neutrino_compat` mode.
+Lightweight alternative if you cannot run a full node. Note that Neutrino makers require takers that support `neutrino_compat` mode (all joinmarket-ng takers do, but reference implementation takers do not).
 
 Start Neutrino server:
 
@@ -300,9 +300,9 @@ A production-ready `docker-compose.yml` is provided in this directory with:
 - **Resource limits** for CPU and memory
 - **Health checks** for service dependencies
 
-> **Note**: Bitcoin Core is strongly recommended for makers. Neutrino-based makers can only
-> participate in CoinJoins with takers that support `neutrino_compat` mode, limiting your
-> potential earnings and network compatibility.
+> **Note**: Bitcoin Core is strongly recommended for makers. Neutrino-based makers require
+> takers that send extended UTXO metadata (`neutrino_compat`), which limits compatibility
+> to joinmarket-ng takers (reference implementation takers do not support this feature).
 
 ### Quick Start
 

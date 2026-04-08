@@ -1447,13 +1447,15 @@ class Taker(TakerMonitoringMixin):
 
             maker_requires_extended = session.supports_neutrino_compat
 
-            # Fail early if taker needs extended format but maker doesn't support it
-            # This happens when taker uses Neutrino backend but maker uses full node
-            # The maker won't be able to verify our UTXO without extended metadata
+            # Fail early if taker needs extended format but maker doesn't support it.
+            # This happens when taker uses Neutrino backend but maker doesn't advertise
+            # neutrino_compat (e.g., reference implementation makers). Without extended
+            # metadata, the taker cannot verify the maker's UTXOs via block filters.
             if taker_requires_extended and not maker_requires_extended:
                 logger.error(
                     f"Incompatible maker {nick}: taker uses Neutrino backend but maker "
-                    f"doesn't support neutrino_compat. Maker cannot verify our UTXOs."
+                    f"doesn't support neutrino_compat. Taker cannot verify maker's UTXOs "
+                    f"without extended metadata (scriptpubkey + blockheight)."
                 )
                 del self.maker_sessions[nick]
                 continue
@@ -1499,7 +1501,8 @@ class Taker(TakerMonitoringMixin):
         if len(self.maker_sessions) < self.config.minimum_makers:
             logger.error(
                 f"Not enough compatible makers: {len(self.maker_sessions)} "
-                f"< {self.config.minimum_makers}. Neutrino takers require neutrino_compat."
+                f"< {self.config.minimum_makers}. Neutrino takers require makers that "
+                f"provide extended UTXO metadata (neutrino_compat)."
             )
             return PhaseResult(success=False, failed_makers=incompatible_makers)
 

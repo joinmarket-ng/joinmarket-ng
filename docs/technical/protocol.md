@@ -256,7 +256,7 @@ This implementation uses feature flags instead of protocol version bumps to enab
 | Feature | Description |
 |---------|-------------|
 | `extended_peerlist` | Supports extended peerlist format with feature flags in `F:` field |
-| `neutrino_compat` | Supports extended UTXO format with scriptPubKey and blockheight |
+| `neutrino_compat` | Can provide extended UTXO format with scriptPubKey and blockheight for own UTXOs |
 
 **Extended Peerlist Format:**
 
@@ -274,6 +274,8 @@ Extended UTXO format includes scriptPubKey + block height for verification:
 |--------|---------|
 | Legacy | `txid:vout` |
 | Extended | `txid:vout:scriptpubkey:height` |
+
+Both full-node and neutrino joinmarket-ng makers advertise `neutrino_compat` because both can provide metadata for their own wallet UTXOs. Neutrino takers require this feature to verify maker UTXOs via compact block filters. Reference implementation makers do not advertise features, so neutrino takers filter them out during the auth phase.
 
 **Handshake Integration:**
 

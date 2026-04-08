@@ -331,20 +331,23 @@ class BlockchainBackend(ABC):
 
     def can_provide_neutrino_metadata(self) -> bool:
         """
-        Check if this backend can provide Neutrino-compatible metadata to peers.
+        Check if this backend can provide Neutrino-compatible metadata for its own UTXOs.
 
         This determines whether to advertise neutrino_compat feature to the network.
         Backends should return True if they can provide extended UTXO format with
-        scriptpubkey and blockheight fields.
+        scriptpubkey and blockheight fields for their own wallet UTXOs in !ioauth.
 
-        Full node backends (Bitcoin Core) can provide this metadata.
-        Light client backends (Neutrino) typically cannot reliably provide it for all UTXOs.
+        This is distinct from requires_neutrino_metadata(): a backend may both
+        require metadata from counterparties (to verify their UTXOs) AND provide
+        metadata about its own UTXOs. Both full node and neutrino backends can
+        provide their own UTXO metadata since they know their wallet's scriptpubkeys
+        and block heights.
 
         Returns:
             True if backend can provide scriptpubkey and blockheight for its UTXOs
         """
-        # Default: Full nodes can provide metadata, light clients cannot
-        return not self.requires_neutrino_metadata()
+        # Default: all backends can provide metadata for their own UTXOs
+        return True
 
     async def verify_tx_output(
         self,

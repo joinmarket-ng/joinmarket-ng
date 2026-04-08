@@ -474,6 +474,16 @@ class TestNeutrinoBackend:
         await backend.close()
 
     @pytest.mark.asyncio
+    async def test_neutrino_backend_metadata_capabilities(self):
+        """Neutrino backend requires metadata from peers and can provide its own."""
+        backend = NeutrinoBackend(neutrino_url="http://localhost:8334", network="regtest")
+        # Requires metadata from counterparties to verify their UTXOs
+        assert backend.requires_neutrino_metadata() is True
+        # Can provide metadata for its own wallet UTXOs (scriptpubkey + blockheight)
+        assert backend.can_provide_neutrino_metadata() is True
+        await backend.close()
+
+    @pytest.mark.asyncio
     async def test_neutrino_backend_scan_start_height_default(self):
         """Test that scan_start_height defaults to _min_valid_blockheight per network."""
         # Mainnet: defaults to SegWit activation height
