@@ -47,7 +47,10 @@ def main() -> None:
 
     print("Installing editable project packages...")
     editable_args = [str(ROOT / package) for package in EDITABLE_PACKAGES]
-    _run([python, "-m", "pip", "install", "-e", *editable_args])
+    editable_install_cmd = [python, "-m", "pip", "install"]
+    for editable_path in editable_args:
+        editable_install_cmd.extend(["-e", editable_path])
+    _run(editable_install_cmd)
 
     print("Building documentation with MkDocs...")
     _run([python, "-m", "mkdocs", "build"])

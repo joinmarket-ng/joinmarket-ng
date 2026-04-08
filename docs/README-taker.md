@@ -24,6 +24,7 @@ Store the mnemonic offline. See [Wallet guide](README-jmwallet.md).
 
 ### 2) Fund and inspect
 
+```bash
 jm-wallet info --mnemonic-file ~/.joinmarket-ng/wallets/default.mnemonic --backend neutrino
 ```
 

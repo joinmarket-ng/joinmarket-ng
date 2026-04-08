@@ -1,4 +1,4 @@
-## Privacy
+# Privacy
 
 ### Mixdepths
 
@@ -158,7 +158,7 @@ For maximum security, keep the bond UTXO private key on a hardware wallet. The b
    - Open Sparrow Wallet with your hardware wallet connected
    - Go to the **Addresses** tab
    - Choose any address from the Deposit (`m/84'/0'/0'/0/x`) or Change (`m/84'/0'/0'/1/x`) account -- use index 0 for simplicity
-   - Right-click the address and select **"Copy Outpur Descriptor Key"**. **Important**: Sparrow may wrap the key as `wpkh(03abcd...)` -- if so, remove the `wpkh(` prefix and trailing `)` to get just the raw hex. The CLI will also strip this automatically.
+   - Right-click the address and select **"Copy Output Descriptor Key"**. **Important**: Sparrow may wrap the key as `wpkh(03abcd...)` -- if so, remove the `wpkh(` prefix and trailing `)` to get just the raw hex. The CLI will also strip this automatically.
    - **Note the derivation path**: double-click the address (or click the receive arrow icon) to see the full derivation path (e.g., `m/84'/0'/0'/0/0`). You will need this later when spending the bond.
    - **Note the master fingerprint**: go to **Settings** (bottom-left) -> **Keystores** section. The master fingerprint (4 bytes hex, e.g., `aabbccdd`) is shown there. You will need this later when spending the bond.
    - **Note**: The `/2` fidelity bond derivation path is not available in Sparrow. Using `/0` or `/1` addresses works fine -- the bond address is derived from the public key itself, not the derivation path.
