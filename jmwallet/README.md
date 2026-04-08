@@ -45,6 +45,8 @@ For full documentation, see [jmwallet Documentation](https://joinmarket-ng.githu
 │                              bond (cold wallet support).                     │
 │ spend-bond                   Generate a PSBT to spend a cold storage         │
 │                              fidelity bond after locktime expires.           │
+│ debug-info                   Print privacy-friendly diagnostic information   │
+│                              for troubleshooting.                            │
 │ freeze                       Interactively freeze/unfreeze UTXOs to exclude  │
 │                              them from coin selection.                       │
 │ history                      View CoinJoin transaction history.              │
@@ -296,6 +298,9 @@ For full documentation, see [jmwallet Documentation](https://joinmarket-ng.githu
 │                                      height. Only used when no Bitcoin node  │
 │                                      backend is configured. Example:         │
 │                                      http://localhost:8999/api               │
+│ --current-block             INTEGER  Current block height override for       │
+│                                      offline/air-gapped workflows. Skips all │
+│                                      network block-height lookups.           │
 │ --log-level                 TEXT     [default: INFO]                         │
 │ --help                               Show this message and exit.             │
 ╰──────────────────────────────────────────────────────────────────────────────╯
@@ -320,9 +325,9 @@ For full documentation, see [jmwallet Documentation](https://joinmarket-ng.githu
  prepare-certificate-message. This is an ABSOLUTE period number, not a
  duration.
 
- If --cert-pubkey and --cert-privkey are not provided, they will be loaded from
- the bond registry (from a previous 'generate-hot-keypair --bond-address'
- call).
+ If --cert-pubkey is not provided, it will be loaded from the bond registry.
+ The certificate private key is loaded from the bond registry, or requested via
+ an interactive hidden prompt if unavailable there.
 
  The signature should be the base64 output from Sparrow's message signing tool,
  using the 'Standard (Electrum)' format.
@@ -332,7 +337,6 @@ For full documentation, see [jmwallet Documentation](https://joinmarket-ng.githu
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ╭─ Options ────────────────────────────────────────────────────────────────────╮
 │ --cert-pubkey                TEXT     Certificate pubkey (hex)               │
-│ --cert-privkey               TEXT     Certificate private key (hex)          │
 │ --cert-signature             TEXT     Certificate signature (base64)         │
 │ --cert-expiry                INTEGER  Certificate expiry as ABSOLUTE period  │
 │                                       number (from                           │
@@ -352,6 +356,9 @@ For full documentation, see [jmwallet Documentation](https://joinmarket-ng.githu
 │                                       expiry. Only used when no Bitcoin node │
 │                                       backend is configured. Example:        │
 │                                       http://localhost:8999/api              │
+│ --current-block              INTEGER  Current block height override for      │
+│                                       offline/air-gapped workflows. Skips    │
+│                                       all network block-height lookups.      │
 │ --log-level                  TEXT     [default: INFO]                        │
 │ --help                                Show this message and exit.            │
 ╰──────────────────────────────────────────────────────────────────────────────╯
@@ -435,6 +442,30 @@ For full documentation, see [jmwallet Documentation](https://joinmarket-ng.githu
 │                                        $JOINMARKET_DATA_DIR)                 │
 │ --log-level           -l      TEXT     [default: INFO]                       │
 │ --help                                 Show this message and exit.           │
+╰──────────────────────────────────────────────────────────────────────────────╯
+```
+
+</details>
+
+<details>
+<summary><code>jm-wallet debug-info --help</code></summary>
+
+```
+
+ Usage: jm-wallet debug-info [OPTIONS]
+
+ Print privacy-friendly diagnostic information for troubleshooting.
+
+ Outputs system details, package versions, and backend status.
+ No wallet keys, addresses, balances, or transaction data is included.
+
+╭─ Options ────────────────────────────────────────────────────────────────────╮
+│ --network       -n      TEXT  Bitcoin network                                │
+│ --backend       -b      TEXT  Backend: scantxoutset | descriptor_wallet |    │
+│                               neutrino                                       │
+│ --neutrino-url          TEXT  [env var: NEUTRINO_URL]                        │
+│ --log-level     -l      TEXT  Log level                                      │
+│ --help                        Show this message and exit.                    │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ```
 
