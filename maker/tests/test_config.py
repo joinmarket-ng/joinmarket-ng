@@ -475,6 +475,28 @@ class TestBuildMakerConfig:
         )
         assert config.allow_mixdepth_zero_merge is True
 
+    def test_neutrino_tls_and_auth_in_backend_config(self) -> None:
+        """Test that neutrino TLS cert and auth token flow into maker backend_config."""
+        from jmcore.settings import JoinMarketSettings
+
+        from maker.cli import build_maker_config
+
+        settings = JoinMarketSettings()
+        settings.bitcoin.backend_type = "neutrino"
+        settings.bitcoin.neutrino_url = "https://127.0.0.1:8334"
+        settings.bitcoin.neutrino_tls_cert = "/tmp/neutrino/tls.cert"
+        settings.bitcoin.neutrino_auth_token = "token-123"
+
+        config = build_maker_config(
+            settings=settings,
+            mnemonic=TEST_MNEMONIC,
+            passphrase="",
+        )
+
+        assert config.backend_type == "neutrino"
+        assert config.backend_config.get("tls_cert_path") == "/tmp/neutrino/tls.cert"
+        assert config.backend_config.get("auth_token") == "token-123"
+
 
 class TestCreateWalletService:
     """Tests for create_wallet_service function.
@@ -528,3 +550,40 @@ class TestCreateWalletService:
 
         assert wallet.data_dir is None
         assert wallet.metadata_store is None
+
+    def test_neutrino_backend_receives_tls_and_auth(self, tmp_path: Path) -> None:
+        """create_wallet_service() passes TLS cert and auth token to NeutrinoBackend."""
+        from unittest.mock import MagicMock, patch
+
+        from maker.cli import create_wallet_service
+
+        config = MakerConfig(
+            mnemonic=TEST_MNEMONIC,
+            cj_fee_relative="0.001",
+            data_dir=tmp_path,
+            backend_type="neutrino",
+            backend_config={
+                "neutrino_url": "https://127.0.0.1:8334",
+                "add_peers": ["bitcoin.sgn.space:38333"],
+                "scan_start_height": 123,
+                "tls_cert_path": "/tmp/neutrino/tls.cert",
+                "auth_token": "token-123",
+            },
+        )
+
+        mock_backend = MagicMock()
+        with patch(
+            "jmwallet.backends.neutrino.NeutrinoBackend", return_value=mock_backend
+        ) as mock_cls:
+            wallet = create_wallet_service(config)
+
+        mock_cls.assert_called_once_with(
+            neutrino_url="https://127.0.0.1:8334",
+            network="mainnet",
+            add_peers=["bitcoin.sgn.space:38333"],
+            data_dir="/data/neutrino",
+            scan_start_height=123,
+            tls_cert_path="/tmp/neutrino/tls.cert",
+            auth_token="token-123",
+        )
+        assert wallet.backend is mock_backend

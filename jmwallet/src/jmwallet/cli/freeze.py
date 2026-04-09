@@ -147,6 +147,8 @@ async def _freeze_utxos(
             network=network,
             scan_start_height=backend_settings.scan_start_height,
             add_peers=backend_settings.neutrino_add_peers,
+            tls_cert_path=backend_settings.neutrino_tls_cert,
+            auth_token=backend_settings.neutrino_auth_token,
         )
         logger.info("Waiting for neutrino to sync...")
         synced = await backend.wait_for_sync(timeout=300.0)

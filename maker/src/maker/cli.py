@@ -51,6 +51,8 @@ def build_maker_config(
     rpc_user: str | None = None,
     rpc_password: str | None = None,
     neutrino_url: str | None = None,
+    neutrino_tls_cert: str | None = None,
+    neutrino_auth_token: str | None = None,
     directory_servers: str | None = None,
     tor_socks_host: str | None = None,
     tor_socks_port: int | None = None,
@@ -99,6 +101,14 @@ def build_maker_config(
     effective_neutrino_url = (
         neutrino_url if neutrino_url is not None else settings.bitcoin.neutrino_url
     )
+    effective_neutrino_tls_cert = (
+        neutrino_tls_cert if neutrino_tls_cert is not None else settings.bitcoin.neutrino_tls_cert
+    )
+    effective_neutrino_auth_token = (
+        neutrino_auth_token
+        if neutrino_auth_token is not None
+        else settings.bitcoin.neutrino_auth_token
+    )
 
     # Build backend config
     backend_config: dict[str, Any] = {}
@@ -118,6 +128,8 @@ def build_maker_config(
             ),
             "scan_start_height": settings.wallet.scan_start_height,
             "add_peers": settings.get_neutrino_add_peers(),
+            "tls_cert_path": effective_neutrino_tls_cert,
+            "auth_token": effective_neutrino_auth_token,
         }
 
     # Resolve directory servers
@@ -384,6 +396,8 @@ def create_wallet_service(config: MakerConfig) -> WalletService:
             add_peers=backend_cfg.get("add_peers", []),
             data_dir=backend_cfg.get("data_dir", "/data/neutrino"),
             scan_start_height=backend_cfg.get("scan_start_height"),
+            tls_cert_path=backend_cfg.get("tls_cert_path"),
+            auth_token=backend_cfg.get("auth_token"),
         )
     else:
         raise typer.BadParameter(f"Unsupported backend: {backend_type}")

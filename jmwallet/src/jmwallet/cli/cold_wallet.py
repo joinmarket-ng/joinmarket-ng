@@ -469,6 +469,8 @@ def prepare_certificate_message(
                     node_backend: BitcoinCoreBackend | NeutrinoBackend = NeutrinoBackend(
                         neutrino_url=backend_settings.neutrino_url,
                         network=backend_settings.network,
+                        tls_cert_path=backend_settings.neutrino_tls_cert,
+                        auth_token=backend_settings.neutrino_auth_token,
                     )
                 else:
                     node_backend = BitcoinCoreBackend(
@@ -892,6 +894,8 @@ def import_certificate(
                     node_backend: BitcoinCoreBackend | NeutrinoBackend = NeutrinoBackend(
                         neutrino_url=backend_settings.neutrino_url,
                         network=backend_settings.network,
+                        tls_cert_path=backend_settings.neutrino_tls_cert,
+                        auth_token=backend_settings.neutrino_auth_token,
                     )
                 else:
                     node_backend = BitcoinCoreBackend(

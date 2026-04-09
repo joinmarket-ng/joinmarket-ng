@@ -9,7 +9,7 @@ from unittest.mock import MagicMock
 import pytest
 from jmcore.models import NetworkType
 
-from taker.cli import build_taker_config
+from taker.cli import build_taker_config, create_backend
 
 
 class TestBuildTakerConfig:
@@ -34,6 +34,8 @@ class TestBuildTakerConfig:
         settings.bitcoin.rpc_user = "user"
         settings.bitcoin.rpc_password.get_secret_value.return_value = "password"
         settings.bitcoin.neutrino_url = "http://localhost:8334"
+        settings.bitcoin.neutrino_tls_cert = None
+        settings.bitcoin.neutrino_auth_token = None
 
         # Tor config
         settings.tor.socks_host = "127.0.0.1"
@@ -180,6 +182,60 @@ class TestBuildTakerConfig:
         )
 
         assert config.backend_config.get("add_peers") == []
+
+    def test_neutrino_tls_and_auth_in_backend_config(
+        self, sample_mnemonic: str, mock_settings: MagicMock
+    ) -> None:
+        """Test that neutrino TLS cert and auth token flow into backend_config."""
+        mock_settings.bitcoin.backend_type = "neutrino"
+        mock_settings.get_neutrino_add_peers.return_value = []
+        mock_settings.bitcoin.neutrino_tls_cert = "/tmp/neutrino/tls.cert"
+        mock_settings.bitcoin.neutrino_auth_token = "token-123"
+
+        config = build_taker_config(
+            settings=mock_settings,
+            mnemonic=sample_mnemonic,
+            passphrase="",
+            destination="bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+            amount=100000,
+            mixdepth=0,
+        )
+
+        assert config.backend_config.get("tls_cert_path") == "/tmp/neutrino/tls.cert"
+        assert config.backend_config.get("auth_token") == "token-123"
+
+    def test_create_backend_neutrino_passes_tls_and_auth(self, sample_mnemonic: str) -> None:
+        """create_backend() passes TLS cert and auth token to NeutrinoBackend."""
+        from unittest.mock import MagicMock, patch
+
+        config = MagicMock()
+        config.backend_type = "neutrino"
+        config.backend_config = {
+            "neutrino_url": "https://127.0.0.1:8334",
+            "scan_start_height": 123,
+            "add_peers": ["bitcoin.sgn.space:38333"],
+            "tls_cert_path": "/tmp/neutrino/tls.cert",
+            "auth_token": "token-123",
+        }
+        config.bitcoin_network = NetworkType.SIGNET
+        config.network = NetworkType.SIGNET
+        config.creation_height = None
+
+        mock_backend = MagicMock()
+        with patch(
+            "jmwallet.backends.neutrino.NeutrinoBackend", return_value=mock_backend
+        ) as mock_cls:
+            result = create_backend(config)
+
+        mock_cls.assert_called_once_with(
+            neutrino_url="https://127.0.0.1:8334",
+            network="signet",
+            scan_start_height=123,
+            add_peers=["bitcoin.sgn.space:38333"],
+            tls_cert_path="/tmp/neutrino/tls.cert",
+            auth_token="token-123",
+        )
+        assert result is mock_backend
 
     def test_data_dir_flows_to_config(self, sample_mnemonic: str, mock_settings: MagicMock) -> None:
         """Verify data_dir from settings flows into TakerConfig.

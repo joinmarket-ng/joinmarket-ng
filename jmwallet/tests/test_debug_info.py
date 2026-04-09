@@ -6,9 +6,11 @@ from __future__ import annotations
 
 import asyncio
 import re
+from pathlib import Path
 from unittest.mock import patch
 
 import httpx
+from jmcore.cli_common import ResolvedBackendSettings
 from typer.testing import CliRunner
 
 from jmwallet.cli import app
@@ -364,9 +366,28 @@ class TestDebugInfoCommand:
         assert result.exit_code == 0
         assert "deployment:" in result.stdout
 
-    def test_neutrino_tls_auth_status_shown(self) -> None:
-        """Backend section should indicate TLS/auth enabled status."""
-        with patch("jmwallet.cli.debug_info._get_neutrino_info") as mock_probe:
+    def test_neutrino_tls_auth_status_disabled(self) -> None:
+        """Backend section should show TLS/auth disabled when not configured."""
+        no_tls_backend = ResolvedBackendSettings(
+            network="signet",
+            bitcoin_network="signet",
+            backend_type="neutrino",
+            rpc_url="",
+            rpc_user="",
+            rpc_password="",
+            neutrino_url="http://127.0.0.1:8334",
+            neutrino_add_peers=[],
+            data_dir=Path("/tmp/jm-test"),
+            neutrino_tls_cert=None,
+            neutrino_auth_token=None,
+        )
+        with (
+            patch("jmwallet.cli.debug_info._get_neutrino_info") as mock_probe,
+            patch(
+                "jmwallet.cli.debug_info.resolve_backend_settings",
+                return_value=no_tls_backend,
+            ),
+        ):
             mock_probe.return_value = {"status": "reachable", "block_height": "100"}
             result = runner.invoke(
                 app,
@@ -379,6 +400,42 @@ class TestDebugInfoCommand:
                 ],
             )
             assert result.exit_code == 0, f"Failed: {result.stdout}"
-            # Without TLS/auth configured, should show disabled
             assert "tls:     disabled" in result.stdout
             assert "auth:    disabled" in result.stdout
+
+    def test_neutrino_tls_auth_status_enabled(self) -> None:
+        """Backend section should show TLS/auth enabled when configured."""
+        tls_backend = ResolvedBackendSettings(
+            network="signet",
+            bitcoin_network="signet",
+            backend_type="neutrino",
+            rpc_url="",
+            rpc_user="",
+            rpc_password="",
+            neutrino_url="https://127.0.0.1:8334",
+            neutrino_add_peers=[],
+            data_dir=Path("/tmp/jm-test"),
+            neutrino_tls_cert="/path/to/tls.cert",
+            neutrino_auth_token="deadbeef",
+        )
+        with (
+            patch("jmwallet.cli.debug_info._get_neutrino_info") as mock_probe,
+            patch(
+                "jmwallet.cli.debug_info.resolve_backend_settings",
+                return_value=tls_backend,
+            ),
+        ):
+            mock_probe.return_value = {"status": "reachable", "block_height": "100"}
+            result = runner.invoke(
+                app,
+                [
+                    "debug-info",
+                    "--backend",
+                    "neutrino",
+                    "--neutrino-url",
+                    "https://127.0.0.1:8334",
+                ],
+            )
+            assert result.exit_code == 0, f"Failed: {result.stdout}"
+            assert "tls:     enabled" in result.stdout
+            assert "auth:    enabled" in result.stdout

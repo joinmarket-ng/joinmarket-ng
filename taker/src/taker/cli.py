@@ -55,6 +55,8 @@ def build_taker_config(
     rpc_user: str | None = None,
     rpc_password: str | None = None,
     neutrino_url: str | None = None,
+    neutrino_tls_cert: str | None = None,
+    neutrino_auth_token: str | None = None,
     directory_servers: str | None = None,
     tor_socks_host: str | None = None,
     tor_socks_port: int | None = None,
@@ -94,6 +96,14 @@ def build_taker_config(
     effective_neutrino_url = (
         neutrino_url if neutrino_url is not None else settings.bitcoin.neutrino_url
     )
+    effective_neutrino_tls_cert = (
+        neutrino_tls_cert if neutrino_tls_cert is not None else settings.bitcoin.neutrino_tls_cert
+    )
+    effective_neutrino_auth_token = (
+        neutrino_auth_token
+        if neutrino_auth_token is not None
+        else settings.bitcoin.neutrino_auth_token
+    )
 
     # Build backend config
     backend_config: dict[str, Any] = {}
@@ -113,6 +123,8 @@ def build_taker_config(
             ),
             "scan_start_height": settings.wallet.scan_start_height,
             "add_peers": settings.get_neutrino_add_peers(),
+            "tls_cert_path": effective_neutrino_tls_cert,
+            "auth_token": effective_neutrino_auth_token,
         }
 
     # Resolve directory servers
@@ -236,6 +248,8 @@ def create_backend(config: TakerConfig) -> Any:
             network=bitcoin_network.value,
             scan_start_height=config.backend_config.get("scan_start_height"),
             add_peers=config.backend_config.get("add_peers", []),
+            tls_cert_path=config.backend_config.get("tls_cert_path"),
+            auth_token=config.backend_config.get("auth_token"),
         )
     elif config.backend_type == "descriptor_wallet":
         fingerprint = get_mnemonic_fingerprint(

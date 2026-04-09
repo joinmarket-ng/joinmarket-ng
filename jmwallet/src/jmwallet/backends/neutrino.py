@@ -179,7 +179,7 @@ class NeutrinoBackend(BlockchainBackend):
         kwargs: dict[str, Any] = {"timeout": 300.0}
 
         if self._tls_cert_path:
-            cert_path = Path(self._tls_cert_path)
+            cert_path = Path(self._tls_cert_path).expanduser()
             if not cert_path.is_file():
                 logger.warning(
                     f"TLS certificate not found at {cert_path}; "
@@ -188,7 +188,7 @@ class NeutrinoBackend(BlockchainBackend):
             else:
                 ctx = ssl.create_default_context(cafile=str(cert_path))
                 kwargs["verify"] = ctx
-                logger.info(f"Neutrino HTTPS pinned to certificate {cert_path}")
+                logger.debug(f"Neutrino HTTPS pinned to certificate {cert_path}")
 
         if self._auth_token:
             kwargs["headers"] = {"Authorization": f"Bearer {self._auth_token}"}

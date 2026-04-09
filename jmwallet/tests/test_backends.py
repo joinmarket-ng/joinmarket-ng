@@ -1783,6 +1783,29 @@ class TestNeutrinoBackendAuth:
             assert auth == "Bearer combined_token"
             await backend.close()
 
+    @pytest.mark.asyncio
+    async def test_tls_cert_path_supports_tilde(self, tmp_path, monkeypatch):
+        """TLS cert path should support ~ expansion."""
+        import ssl
+
+        fake_home = tmp_path / "home"
+        cert_dir = fake_home / ".joinmarket-ng" / "neutrino"
+        cert_dir.mkdir(parents=True)
+        cert_file = cert_dir / "tls.cert"
+        cert_file.write_text("")
+
+        monkeypatch.setenv("HOME", str(fake_home))
+
+        with patch("jmwallet.backends.neutrino.ssl.create_default_context") as mock_ctx:
+            mock_ssl_ctx = MagicMock(spec=ssl.SSLContext)
+            mock_ctx.return_value = mock_ssl_ctx
+            backend = NeutrinoBackend(
+                neutrino_url="https://localhost:8334",
+                tls_cert_path="~/.joinmarket-ng/neutrino/tls.cert",
+            )
+            mock_ctx.assert_called_once_with(cafile=str(cert_file))
+            await backend.close()
+
 
 class TestSupportsDescriptorScan:
     """Unit tests for the supports_descriptor_scan capability flag."""
