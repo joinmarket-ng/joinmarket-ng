@@ -249,6 +249,71 @@ run_test_suite() {
     return 0
 }
 
+# Wait for jam-playwright container (serves JAM frontend + jmwalletd on port 29183)
+wait_for_jam_playwright() {
+    log_info "Waiting for jam-playwright (port 29183)..."
+
+    for i in {1..60}; do
+        if curl -sf http://localhost:29183/api/v1/session >/dev/null 2>&1; then
+            log_success "jam-playwright ready"
+            return 0
+        fi
+        echo "  Attempt $i/60: jam-playwright not ready..."
+        sleep 2
+    done
+
+    log_error "jam-playwright timeout"
+    return 1
+}
+
+# Run Playwright browser tests against the jam-playwright container.
+# Requires Node.js and npm. Skipped (with warning) if Node.js is not available.
+run_playwright_tests() {
+    log_info "=== Playwright Browser Tests ==="
+
+    if ! command -v node >/dev/null 2>&1; then
+        log_warning "Node.js not found — skipping Playwright tests"
+        return 0
+    fi
+
+    local PW_DIR="${PROJECT_ROOT}/tests/playwright"
+    if [ ! -f "${PW_DIR}/package.json" ]; then
+        log_warning "Playwright test directory not found — skipping"
+        return 0
+    fi
+
+    wait_for_jam_playwright || {
+        log_error "jam-playwright container not ready — skipping Playwright tests"
+        FAILED_TESTS+=("Playwright Tests")
+        FAILED_TEST_DETAILS+=("Playwright Tests:|jam-playwright container failed to start on port 29183")
+        return 0
+    }
+
+    log_info "Installing Playwright dependencies..."
+    (cd "${PW_DIR}" && npm install && npx playwright install chromium) || {
+        log_error "Playwright install failed"
+        FAILED_TESTS+=("Playwright Tests")
+        FAILED_TEST_DETAILS+=("Playwright Tests:|npm install or playwright install chromium failed")
+        return 0
+    }
+
+    log_info "Running Playwright tests..."
+    local test_output_file="${TEMP_TEST_OUTPUT}.playwright"
+    export JAM_URL="${JAM_URL:-http://localhost:29183}"
+    export JMWALLETD_URL="${JMWALLETD_URL:-http://localhost:29183}"
+
+    if (cd "${PW_DIR}" && npx playwright test) 2>&1 | tee "$test_output_file"; then
+        log_success "Playwright Tests passed"
+        rm -f "$test_output_file"
+    else
+        log_error "Playwright Tests failed"
+        FAILED_TESTS+=("Playwright Tests")
+        local failed_details
+        failed_details=$(grep -E "failed|Error|Timeout" "$test_output_file" | head -10 || echo "See full output for details")
+        FAILED_TEST_DETAILS+=("Playwright Tests:|$failed_details")
+    fi
+}
+
 # Restart makers to sync blockchain state
 restart_makers() {
     log_info "Clearing maker commitment blacklists..."
@@ -392,6 +457,10 @@ main() {
     else
         log_warning "No .coverage file found for docker integration tests"
     fi
+
+    # Run Playwright E2E tests against the jam-playwright container.
+    # The container is already running from the e2e profile above.
+    run_playwright_tests
 
     echo
 
@@ -591,6 +660,7 @@ main() {
         echo "  ✓ Unit Tests"
         echo "  ✓ E2E Tests"
         echo "  ✓ Docker Integration Tests"
+        echo "  ✓ Playwright Browser Tests"
         echo "  ✓ Reference Compatibility Tests"
         echo "  ✓ Reference Maker Tests"
         echo "  ✓ Neutrino Basic Tests"
@@ -669,7 +739,7 @@ Options:
 
 The script runs all tests in this order:
 1. Unit tests (no Docker)
-2. E2E tests (our implementation) + Docker integration tests
+2. E2E tests (our implementation) + Docker integration tests + Playwright browser tests
 3. Reference tests (JAM compatibility)
 4. Reference maker tests (JAM makers + our taker)
 5. Neutrino tests (light client backend)
