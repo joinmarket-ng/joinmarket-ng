@@ -2,7 +2,8 @@
  * E2E test: Wallet creation flow.
  *
  * Verifies that a user can create a new wallet through the jam-ng UI,
- * confirm their seed phrase, and land on the main wallet page.
+ * confirm their seed phrase, verify the mnemonic, and land on the main
+ * wallet page.
  */
 
 import { test, expect, loadCredentials } from "../fixtures";
@@ -38,14 +39,51 @@ test.describe("Wallet Creation", () => {
     await page.locator("#switch-reveal-seed").click();
 
     // Verify the seed phrase is displayed (12 or 24 words).
-    // The seed is shown inside the card, check it's not empty.
     await expect(page.getByText("Seed Phrase").first()).toBeVisible();
+
+    // Extract the seed words from the SeedPhraseGrid before proceeding.
+    // Each word is rendered inside a grid cell as:
+    //   <div class="bg-background ..."><span>N.</span><span>word</span></div>
+    // We extract the word text from each cell by taking the last <span>.
+    const seedCells = page.locator(".grid.font-mono .bg-background");
+    const seedWords: string[] = [];
+    const cellCount = await seedCells.count();
+    for (let i = 0; i < cellCount; i++) {
+      const wordSpan = seedCells.nth(i).locator("span").last();
+      const word = await wordSpan.textContent();
+      if (word && word.trim()) {
+        seedWords.push(word.trim());
+      }
+    }
+    console.log(`[wallet-creation] Extracted ${seedWords.length} seed words`);
+    expect(seedWords.length).toBeGreaterThanOrEqual(12);
 
     // Confirm the backup.
     await page.locator("#switch-confirm-backup").click();
 
-    // Click "Next" to proceed.
+    // Click "Next" to proceed to the mnemonic verification step.
     await page.getByRole("button", { name: "Next" }).click();
+
+    // Step 3: Verify mnemonic — click each word in the correct order.
+    await expect(
+      page.getByText("Verify Mnemonic Phrase"),
+    ).toBeVisible({ timeout: 10_000 });
+
+    // The shuffled words are shown as buttons. For each word in the original
+    // mnemonic order, find a matching button (not yet picked) and click it.
+    for (const word of seedWords) {
+      // Find all non-disabled buttons with this word text.
+      const wordBtn = page
+        .getByRole("button", { name: word, exact: true })
+        .filter({ hasNot: page.locator("[disabled]") })
+        .first();
+      await wordBtn.click();
+      // Brief pause to allow UI animation/state updates.
+      await page.waitForTimeout(100);
+    }
+
+    // All words selected — click "Fund Wallet" to complete.
+    await page.getByRole("button", { name: "Fund Wallet" }).click();
 
     // Should be redirected to the main wallet page.
     await page.waitForURL("/", { timeout: 30_000 });
