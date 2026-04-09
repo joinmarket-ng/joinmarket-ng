@@ -90,18 +90,18 @@ async def _wait_for_neutrino_ready(
 # ==============================================================================
 
 
-@pytest.fixture(scope="module")
-def neutrino_url() -> str:
-    """Neutrino server URL."""
-    return "http://127.0.0.1:8334"
-
-
 @pytest_asyncio.fixture
-async def neutrino_backend(neutrino_url: str):
+async def neutrino_backend(
+    neutrino_url: str,
+    neutrino_tls_cert: str | None,
+    neutrino_auth_token: str | None,
+):
     """Create and verify neutrino backend connection."""
     backend = NeutrinoBackend(
         neutrino_url=neutrino_url,
         network="regtest",
+        tls_cert_path=neutrino_tls_cert,
+        auth_token=neutrino_auth_token,
     )
 
     # Verify neutrino is available and actually synced to a usable height.

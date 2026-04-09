@@ -123,11 +123,18 @@ class TestNeutrinoFeeEstimation:
     """Test fee estimation with Neutrino backend."""
 
     @pytest_asyncio.fixture
-    async def neutrino_backend(self):
+    async def neutrino_backend(
+        self,
+        neutrino_url: str,
+        neutrino_tls_cert: str | None,
+        neutrino_auth_token: str | None,
+    ):
         """Create Neutrino backend (may not be available)."""
         backend = NeutrinoBackend(
-            neutrino_url="http://127.0.0.1:8334",
+            neutrino_url=neutrino_url,
             network="regtest",
+            tls_cert_path=neutrino_tls_cert,
+            auth_token=neutrino_auth_token,
         )
 
         try:
@@ -338,11 +345,18 @@ class TestNeutrinoTakerFeeResolution:
     """Test taker fee resolution with Neutrino backend."""
 
     @pytest_asyncio.fixture
-    async def neutrino_backend(self):
+    async def neutrino_backend(
+        self,
+        neutrino_url: str,
+        neutrino_tls_cert: str | None,
+        neutrino_auth_token: str | None,
+    ):
         """Create Neutrino backend."""
         backend = NeutrinoBackend(
-            neutrino_url="http://127.0.0.1:8334",
+            neutrino_url=neutrino_url,
             network="regtest",
+            tls_cert_path=neutrino_tls_cert,
+            auth_token=neutrino_auth_token,
         )
 
         try:

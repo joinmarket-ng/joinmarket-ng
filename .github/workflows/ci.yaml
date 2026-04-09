@@ -905,7 +905,12 @@ jobs:
 
           echo "Waiting for Neutrino sync..."
           for i in {1..120}; do
-            HEIGHT=$(curl -sf http://localhost:8334/v1/status 2>/dev/null | python3 -c 'import json,sys; print(int(json.load(sys.stdin).get("block_height", 0)))' 2>/dev/null || echo 0)
+            TOKEN=$(docker compose exec -T neutrino cat /data/neutrino/auth_token 2>/dev/null || true)
+            if [ -n "$TOKEN" ]; then
+              HEIGHT=$(curl -sk -H "Authorization: Bearer $TOKEN" https://localhost:8334/v1/status 2>/dev/null | python3 -c 'import json,sys; print(int(json.load(sys.stdin).get("block_height", 0)))' 2>/dev/null || echo 0)
+            else
+              HEIGHT=$(curl -sf http://localhost:8334/v1/status 2>/dev/null | python3 -c 'import json,sys; print(int(json.load(sys.stdin).get("block_height", 0)))' 2>/dev/null || echo 0)
+            fi
             if [ "$HEIGHT" -gt 0 ]; then
               echo "Neutrino ready at height: $HEIGHT"
               break
@@ -921,7 +926,7 @@ jobs:
           BITCOIN_RPC_URL: http://127.0.0.1:18443
           BITCOIN_RPC_USER: test
           BITCOIN_RPC_PASSWORD: test
-          NEUTRINO_URL: http://127.0.0.1:8334
+          NEUTRINO_URL: https://127.0.0.1:8334
         run: |
           pytest -c pytest.ini -m neutrino -k "not test_coinjoin" --junitxml=junit/test-results.xml \
             --cov --cov-report=term-missing --cov-report=xml \
@@ -1021,7 +1026,12 @@ jobs:
 
           echo "Waiting for Neutrino sync..."
           for i in {1..120}; do
-            HEIGHT=$(curl -sf http://localhost:8334/v1/status 2>/dev/null | python3 -c 'import json,sys; print(int(json.load(sys.stdin).get("block_height", 0)))' 2>/dev/null || echo 0)
+            TOKEN=$(docker compose exec -T neutrino cat /data/neutrino/auth_token 2>/dev/null || true)
+            if [ -n "$TOKEN" ]; then
+              HEIGHT=$(curl -sk -H "Authorization: Bearer $TOKEN" https://localhost:8334/v1/status 2>/dev/null | python3 -c 'import json,sys; print(int(json.load(sys.stdin).get("block_height", 0)))' 2>/dev/null || echo 0)
+            else
+              HEIGHT=$(curl -sf http://localhost:8334/v1/status 2>/dev/null | python3 -c 'import json,sys; print(int(json.load(sys.stdin).get("block_height", 0)))' 2>/dev/null || echo 0)
+            fi
             if [ "$HEIGHT" -gt 0 ]; then
               echo "Neutrino ready at height: $HEIGHT"
               break
@@ -1037,7 +1047,7 @@ jobs:
           BITCOIN_RPC_URL: http://127.0.0.1:18443
           BITCOIN_RPC_USER: test
           BITCOIN_RPC_PASSWORD: test
-          NEUTRINO_URL: http://127.0.0.1:8334
+          NEUTRINO_URL: https://127.0.0.1:8334
         run: |
           pytest -c pytest.ini -m neutrino -k "test_coinjoin" --junitxml=junit/test-results.xml \
             --cov --cov-report=term-missing --cov-report=xml \
@@ -1168,9 +1178,17 @@ jobs:
 
           echo "Waiting for Neutrino..."
           for i in {1..30}; do
-            if curl -s http://localhost:8334/v1/status >/dev/null 2>&1; then
-              echo "Neutrino ready"
-              break
+            TOKEN=$(docker compose exec -T neutrino cat /data/neutrino/auth_token 2>/dev/null || true)
+            if [ -n "$TOKEN" ]; then
+              if curl -sk -H "Authorization: Bearer $TOKEN" https://localhost:8334/v1/status >/dev/null 2>&1; then
+                echo "Neutrino ready"
+                break
+              fi
+            else
+              if curl -s http://localhost:8334/v1/status >/dev/null 2>&1; then
+                echo "Neutrino ready"
+                break
+              fi
             fi
             sleep 2
           done
@@ -1185,7 +1203,7 @@ jobs:
           BITCOIN_RPC_URL: http://127.0.0.1:18443
           BITCOIN_RPC_USER: test
           BITCOIN_RPC_PASSWORD: test
-          NEUTRINO_URL: http://127.0.0.1:8334
+          NEUTRINO_URL: https://127.0.0.1:8334
         run: |
           pytest -c pytest.ini -m neutrino_reference --junitxml=junit/test-results.xml \
             --cov --cov-report=term-missing --cov-report=xml \

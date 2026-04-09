@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import ssl
 import subprocess
 import time
 import urllib.error
@@ -146,12 +147,38 @@ def set_maker_service_running(service: str, should_run: bool) -> None:
 
 def wait_for_neutrino_backend_ready(timeout: int = 180) -> bool:
     """Wait until the neutrino API reports a positive block height."""
-    status_url = "http://127.0.0.1:8334/v1/status"
+    # Try authenticated HTTPS first (default), fall back to HTTP.
+    token: str | None = None
+    try:
+        result = subprocess.run(
+            ["docker", "exec", "jm-neutrino", "cat", "/data/neutrino/auth_token"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            token = result.stdout.strip()
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+
+    if token:
+        status_url = "https://127.0.0.1:8334/v1/status"
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    else:
+        status_url = "http://127.0.0.1:8334/v1/status"
+        ctx = None
+
     deadline = time.time() + timeout
 
     while time.time() < deadline:
         try:
-            with urllib.request.urlopen(status_url, timeout=3) as response:
+            req = urllib.request.Request(status_url)
+            if token:
+                req.add_header("Authorization", f"Bearer {token}")
+            with urllib.request.urlopen(req, timeout=3, context=ctx) as response:
                 payload = json.loads(response.read().decode("utf-8"))
                 height = int(payload.get("block_height", 0))
                 if height > 0:
