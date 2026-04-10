@@ -78,8 +78,8 @@ modules:
     buildsystem: autotools
     sources:
       - type: archive
-        url: https://github.com/jedisct1/libsodium/releases/download/1.0.21-RELEASE/libsodium-1.0.21.tar.gz
-        sha256: 9e4285c7a419e82dedb0be63a72eea357d6943bc3e28e6735bf600dd4883feaf
+        url: https://download.libsodium.org/libsodium/releases/libsodium-1.0.22.tar.gz
+        sha256: adbdd8f16149e81ac6078a03aca6fc03b592b89ef7b5ed83841c086191be3349
 
   # =========================================================================
   # Module 4: neutrino-api (pre-built Go binary)
@@ -96,14 +96,14 @@ modules:
       - type: file
         only-arches:
           - x86_64
-        url: https://github.com/m0wer/neutrino-api/releases/download/v1.0.1/neutrinod-linux-amd64
-        sha256: 48cc1ad5ea08519e091d1d82fbc6664d867a03ed81693c88e70c6682de2a1e6a
+        url: https://github.com/m0wer/neutrino-api/releases/download/v1.1.0/neutrinod-linux-amd64
+        sha256: 1fddd2d46779345e6d686e33685a3599b724310fcff231db3f6aadec97903056
         dest-filename: neutrinod
       - type: file
         only-arches:
           - aarch64
-        url: https://github.com/m0wer/neutrino-api/releases/download/v1.0.1/neutrinod-linux-arm64
-        sha256: 82acdccb38c2cd298b2b486706f56324b44d312d5ff9fad636a895c95ff9b847
+        url: https://github.com/m0wer/neutrino-api/releases/download/v1.1.0/neutrinod-linux-arm64
+        sha256: fb46930f9bf20a9e37dc53960b92247611787f721574c4a634674d5f143b67c7
         dest-filename: neutrinod
 
   # =========================================================================
