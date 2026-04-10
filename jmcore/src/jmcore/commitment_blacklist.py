@@ -10,12 +10,46 @@ The blacklist is shared across the JoinMarket network via !hp2 messages.
 
 from __future__ import annotations
 
+import re
 import threading
 from pathlib import Path
 
 from loguru import logger
 
 from jmcore.paths import get_commitment_blacklist_path
+
+# PoDLE commitments are SHA256 hashes of an EC point, encoded as hex.
+# That means exactly 64 hex characters (32 bytes).
+COMMITMENT_HEX_LENGTH = 64
+
+_HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
+
+
+def validate_commitment_hex(commitment: str) -> tuple[bool, str]:
+    """Validate that a commitment string is well-formed hex of the correct length.
+
+    A valid commitment (after prefix stripping) must be exactly 64
+    hex characters representing 32 bytes (SHA256 output).
+
+    Args:
+        commitment: The raw commitment string (prefix already stripped).
+
+    Returns:
+        A ``(valid, error_message)`` tuple.  When valid is True the
+        error_message is the empty string.
+    """
+    if not commitment:
+        return False, "empty commitment"
+
+    if len(commitment) != COMMITMENT_HEX_LENGTH:
+        return False, (
+            f"invalid commitment length {len(commitment)}, expected {COMMITMENT_HEX_LENGTH}"
+        )
+
+    if not _HEX_RE.match(commitment):
+        return False, "commitment contains non-hex characters"
+
+    return True, ""
 
 
 class CommitmentBlacklist:

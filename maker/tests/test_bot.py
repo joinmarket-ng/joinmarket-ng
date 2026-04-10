@@ -380,7 +380,7 @@ class TestHiddenServiceListener:
 
         # Create a mock connection that sends a fill command then disconnects
         fill_msg = json.dumps(
-            {"nick": "J5taker123", "cmd": "fill", "data": "0 1000000 abc123 Pcommitment"}
+            {"nick": "J5taker123", "cmd": "fill", "data": f"0 1000000 abc123 P{'ab' * 32}"}
         )
 
         async def mock_receive() -> bytes:

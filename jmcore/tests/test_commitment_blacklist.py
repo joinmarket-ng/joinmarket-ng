@@ -277,3 +277,95 @@ class TestCommitmentBlacklistDataDir:
         bl = commitment_blacklist.get_blacklist(data_dir=tmp_path)
         assert bl is not None
         assert "cmtdata" in str(bl.blacklist_path)
+
+
+class TestValidateCommitmentHex:
+    """Tests for the validate_commitment_hex helper."""
+
+    def test_valid_commitment(self) -> None:
+        """A 64-char lowercase hex string is valid."""
+        from jmcore.commitment_blacklist import validate_commitment_hex
+
+        valid, error = validate_commitment_hex("ab" * 32)
+        assert valid is True
+        assert error == ""
+
+    def test_valid_uppercase(self) -> None:
+        """Uppercase hex is also valid (normalization happens elsewhere)."""
+        from jmcore.commitment_blacklist import validate_commitment_hex
+
+        valid, error = validate_commitment_hex("AB" * 32)
+        assert valid is True
+        assert error == ""
+
+    def test_valid_mixed_case(self) -> None:
+        """Mixed-case hex is valid."""
+        from jmcore.commitment_blacklist import validate_commitment_hex
+
+        valid, error = validate_commitment_hex("aB" * 32)
+        assert valid is True
+        assert error == ""
+
+    def test_empty_string(self) -> None:
+        """Empty string is invalid."""
+        from jmcore.commitment_blacklist import validate_commitment_hex
+
+        valid, error = validate_commitment_hex("")
+        assert valid is False
+        assert "empty" in error
+
+    def test_too_short(self) -> None:
+        """Strings shorter than 64 chars are invalid."""
+        from jmcore.commitment_blacklist import validate_commitment_hex
+
+        valid, error = validate_commitment_hex("ab" * 16)
+        assert valid is False
+        assert "length" in error
+
+    def test_too_long(self) -> None:
+        """Strings longer than 64 chars are invalid."""
+        from jmcore.commitment_blacklist import validate_commitment_hex
+
+        valid, error = validate_commitment_hex("ab" * 33)
+        assert valid is False
+        assert "length" in error
+
+    def test_non_hex_characters(self) -> None:
+        """Strings with non-hex characters are invalid."""
+        from jmcore.commitment_blacklist import validate_commitment_hex
+
+        # 'g' is not a hex character
+        valid, error = validate_commitment_hex("g" * 64)
+        assert valid is False
+        assert "non-hex" in error
+
+    def test_with_spaces(self) -> None:
+        """Strings containing spaces are invalid."""
+        from jmcore.commitment_blacklist import validate_commitment_hex
+
+        valid, error = validate_commitment_hex("ab " + "cd" * 31)
+        assert valid is False
+        # Either length or non-hex depending on stripping
+        assert valid is False
+
+    def test_with_prefix_not_stripped(self) -> None:
+        """The 'P' prefix should be stripped before calling validate."""
+        from jmcore.commitment_blacklist import validate_commitment_hex
+
+        # "P" + 64 hex chars = 65 chars total, wrong length
+        valid, error = validate_commitment_hex("P" + "ab" * 32)
+        assert valid is False
+
+    def test_all_zeros(self) -> None:
+        """All-zeros commitment is syntactically valid."""
+        from jmcore.commitment_blacklist import validate_commitment_hex
+
+        valid, error = validate_commitment_hex("0" * 64)
+        assert valid is True
+
+    def test_all_f(self) -> None:
+        """All-f commitment is syntactically valid."""
+        from jmcore.commitment_blacklist import validate_commitment_hex
+
+        valid, error = validate_commitment_hex("f" * 64)
+        assert valid is True

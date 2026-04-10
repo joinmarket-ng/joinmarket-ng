@@ -436,7 +436,7 @@ class TestMakerBotMultiOfferFill:
                 with patch.object(maker_bot, "_send_response", new=AsyncMock()):
                     await maker_bot._handle_fill(
                         "J5Taker123",
-                        "fill 0 500000 taker_pk_hex Pcommitment123",
+                        f"fill 0 500000 taker_pk_hex P{'aa' * 32}",
                     )
 
         # Verify the correct offer was used
@@ -463,7 +463,7 @@ class TestMakerBotMultiOfferFill:
                 with patch.object(maker_bot, "_send_response", new=AsyncMock()):
                     await maker_bot._handle_fill(
                         "J5Taker456",
-                        "fill 1 200000 taker_pk_hex Pcommitment456",
+                        f"fill 1 200000 taker_pk_hex P{'bb' * 32}",
                     )
 
         # Verify the correct offer was used
@@ -478,7 +478,7 @@ class TestMakerBotMultiOfferFill:
         with patch("maker.protocol_handlers.check_commitment", return_value=True):
             await maker_bot._handle_fill(
                 "J5Taker789",
-                "fill 99 500000 taker_pk_hex Pcommitment789",  # oid=99 doesn't exist
+                f"fill 99 500000 taker_pk_hex P{'cc' * 32}",  # oid=99 doesn't exist
             )
 
         # Should not create a session - the invalid offer ID causes rejection
@@ -491,7 +491,7 @@ class TestMakerBotMultiOfferFill:
         with patch("maker.protocol_handlers.check_commitment", return_value=True):
             await maker_bot._handle_fill(
                 "J5TakerLow",
-                "fill 1 30000 taker_pk_hex Pcommitment_low",  # Below min_size=50_000
+                f"fill 1 30000 taker_pk_hex P{'dd' * 32}",  # Below min_size=50_000
             )
 
         # Should not create a session - amount validation fails
@@ -516,7 +516,7 @@ class TestMakerBotMultiOfferFill:
                     # Fill absolute offer (oid=1, min_size=50_000) with 60_000 - should work
                     await maker_bot._handle_fill(
                         "J5TakerOK",
-                        "fill 1 60000 taker_pk_hex Pcommitment_ok",
+                        f"fill 1 60000 taker_pk_hex P{'ee' * 32}",
                     )
 
         # Session should be created

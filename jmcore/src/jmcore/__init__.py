@@ -30,12 +30,14 @@ from jmcore.bitcoin import (
 )
 from jmcore.btc_script import BondAddressInfo, derive_bond_address
 from jmcore.commitment_blacklist import (
+    COMMITMENT_HEX_LENGTH,
     CommitmentBlacklist,
     add_commitment,
     check_and_add_commitment,
     check_commitment,
     get_blacklist,
     set_blacklist_path,
+    validate_commitment_hex,
 )
 from jmcore.config import (
     BackendConfig,
@@ -208,12 +210,14 @@ __all__ = [
     "TorControlConfig",
     "WalletConfig",
     # Commitment blacklist
+    "COMMITMENT_HEX_LENGTH",
     "CommitmentBlacklist",
     "add_commitment",
     "check_and_add_commitment",
     "check_commitment",
     "get_blacklist",
     "set_blacklist_path",
+    "validate_commitment_hex",
     # Encryption
     "CryptoSession",
     "NaclError",

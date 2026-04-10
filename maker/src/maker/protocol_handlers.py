@@ -13,7 +13,7 @@ import json
 import os
 from typing import TYPE_CHECKING, Any
 
-from jmcore.commitment_blacklist import add_commitment, check_commitment
+from jmcore.commitment_blacklist import add_commitment, check_commitment, validate_commitment_hex
 from jmcore.crypto import NickIdentity
 from jmcore.deduplication import MessageDeduplicator
 from jmcore.directory_client import DirectoryClient
@@ -417,6 +417,15 @@ class ProtocolHandlersMixin:
             # Strip commitment prefix if present (e.g., "P" for standard PoDLE)
             if commitment.startswith("P"):
                 commitment = commitment[1:]
+
+            # Validate commitment format before any further processing.
+            # Must be exactly 64 hex characters (32-byte SHA256 hash).
+            valid, error = validate_commitment_hex(commitment)
+            if not valid:
+                logger.warning(
+                    f"Rejecting !fill from {taker_nick}: {error} (raw={commitment[:32]!r})"
+                )
+                return
 
             # Check if commitment is already blacklisted
             if not check_commitment(commitment):
@@ -888,6 +897,12 @@ class ProtocolHandlersMixin:
 
             commitment = parts[1]
 
+            # Validate format before adding to blacklist
+            valid, error = validate_commitment_hex(commitment)
+            if not valid:
+                logger.debug(f"Ignoring invalid !hp2 commitment from {from_nick}: {error}")
+                return
+
             # Add to blacklist (persists to disk)
             if add_commitment(commitment):
                 logger.info(
@@ -925,6 +940,12 @@ class ProtocolHandlersMixin:
 
             commitment = parts[1]
             logger.info(f"Received commitment relay request from {from_nick}: {commitment[:16]}...")
+
+            # Validate format before relaying or blacklisting
+            valid, error = validate_commitment_hex(commitment)
+            if not valid:
+                logger.debug(f"Ignoring invalid !hp2 relay from {from_nick}: {error}")
+                return
 
             # Blacklist locally
             add_commitment(commitment)
