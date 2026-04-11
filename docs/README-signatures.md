@@ -35,10 +35,6 @@ then push the tag to trigger CI. CI verifies its builds match the signed manifes
 **CI-first** (for additional signers): Wait for CI to complete, then run
 `sign-release.sh` which downloads the manifest, reproduces locally, and signs.
 
-Current reproducibility exception: strict layer digest matching is skipped for
-`jam-ng` because the CRA/webpack frontend build is non-deterministic across
-environments.
-
 ## For Signers
 
 See [Sign](technical/development.md#sign-a-release) for instructions on how to sign a release.

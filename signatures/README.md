@@ -32,10 +32,6 @@ Two workflows are supported:
   `sign-release.sh --manifest`, push tag. CI verifies independently.
 - **CI-first**: Wait for CI, then `sign-release.sh` reproduces and signs.
 
-Current reproducibility exception: strict layer digest matching is skipped for
-`jam-ng` because the CRA/webpack frontend build is non-deterministic across
-environments.
-
 ## For Signers
 
 See [Sign](../docs/technical/development.md#sign-a-release) for instructions on how to sign a release.
