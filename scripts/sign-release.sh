@@ -60,6 +60,8 @@ rather than manifest digests, ensuring reliable comparison regardless of build e
 Builds are verified for the current architecture only (cross-platform builds via QEMU
 produce different layer digests than native builds).
 
+Reproduction uses Dockerfiles from the release commit to ensure strict historical accuracy.
+
 Examples:
   $(basename "$0") 1.0.0 --key ABCD1234...              # Verify and sign
   $(basename "$0") 1.0.0 --key ABCD1234... --no-reproduce  # Sign without verify (not recommended)
@@ -314,6 +316,7 @@ if [[ "$REPRODUCE" == true ]]; then
     git -C "$PROJECT_ROOT" worktree add --detach "$REPO_DIR" "$COMMIT"
     # Clean up worktree on exit
     trap "rm -rf '$WORK_DIR'; git -C '$PROJECT_ROOT' worktree remove --force '$REPO_DIR' 2>/dev/null || true" EXIT
+
     cd "$REPO_DIR"
 
     # Build images for current architecture only

@@ -100,6 +100,9 @@ See [Signatures](../README-signatures.md) for repository signature layout.
 ./scripts/verify-release.sh <version> --reproduce
 ```
 
+Reproduction uses Dockerfiles from the release commit to ensure strict
+historical accuracy.
+
 ## Sign a Release
 
 ```bash
