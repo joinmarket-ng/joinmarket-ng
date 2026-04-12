@@ -89,6 +89,12 @@ check_system_dependencies() {
         if ! dpkg -s build-essential &> /dev/null 2>&1; then
             missing_deps+=("build-essential")
         fi
+        if ! dpkg -s cmake &> /dev/null 2>&1; then
+            missing_deps+=("cmake")
+        fi
+        if ! dpkg -s ca-certificates &> /dev/null 2>&1; then
+            missing_deps+=("ca-certificates")
+        fi
         if ! dpkg -s libffi-dev &> /dev/null 2>&1; then
             missing_deps+=("libffi-dev")
         fi
@@ -111,6 +117,9 @@ check_system_dependencies() {
         if ! command -v brew &> /dev/null; then
             print_error "Homebrew not found. Install from https://brew.sh"
             exit 1
+        fi
+        if ! brew list cmake &> /dev/null 2>&1; then
+            missing_deps+=("cmake")
         fi
         if ! brew list libsodium &> /dev/null 2>&1; then
             missing_deps+=("libsodium")
@@ -844,7 +853,8 @@ main() {
     fi
 
     if [[ "$MODE" == "update" ]]; then
-        # Update mode - update packages and verify Tor config
+        # Update mode - check deps, update packages, and verify Tor config
+        check_system_dependencies
         setup_virtualenv
         update_packages
         create_shell_integration
