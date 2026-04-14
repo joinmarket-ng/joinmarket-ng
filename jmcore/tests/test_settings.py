@@ -981,6 +981,28 @@ class TestGetUserSectionRanges:
     def test_empty_text(self) -> None:
         assert _get_user_section_ranges("") == {}
 
+    def test_commented_section_acts_as_boundary(self) -> None:
+        """A commented section header should end the preceding uncommented section."""
+        text = "[bitcoin]\nbackend_type = 'neutrino'\n\n# [network_config]\n# network = 'mainnet'\n"
+        ranges = _get_user_section_ranges(text)
+        assert set(ranges.keys()) == {"bitcoin"}
+        bitcoin_text = text[ranges["bitcoin"][0] : ranges["bitcoin"][1]]
+        assert "[bitcoin]" in bitcoin_text
+        assert "# [network_config]" not in bitcoin_text
+
+    def test_only_uncommented_sections_returned(self) -> None:
+        """Commented section headers are boundaries but not in the returned ranges."""
+        text = (
+            "# [tor]\n# socks_host = '127.0.0.1'\n\n"
+            "[bitcoin]\nrpc_url = 'x'\n\n"
+            "# [maker]\n# cjfee_a = 500\n"
+        )
+        ranges = _get_user_section_ranges(text)
+        assert set(ranges.keys()) == {"bitcoin"}
+        bitcoin_text = text[ranges["bitcoin"][0] : ranges["bitcoin"][1]]
+        assert "rpc_url" in bitcoin_text
+        assert "# [maker]" not in bitcoin_text
+
 
 class TestKeyLevelMigration:
     """Tests for key-level migration within existing sections."""
@@ -1086,6 +1108,46 @@ class TestKeyLevelMigration:
         content = config_path.read_text()
         assert '# new_key = "value"' in content
         assert "# This is a detailed description" in content
+
+    def test_new_keys_placed_within_section_not_at_eof(self, tmp_path: Path) -> None:
+        """New keys for [bitcoin] must not be appended after later commented sections.
+
+        Regression test: when the user config has ``[bitcoin]`` followed by
+        ``# [network_config]``, ``# [wallet]``, etc., new bitcoin keys were
+        appended at EOF instead of within the ``[bitcoin]`` section because
+        ``_get_user_section_ranges`` did not use commented headers as boundaries.
+        """
+        config_path = tmp_path / "config.toml"
+        config_path.write_text(
+            '[bitcoin]\n# rpc_url = "http://127.0.0.1:8332"\n\n# [maker]\n# cjfee_a = 500\n'
+        )
+
+        template = """\
+# ============================================================================
+# Bitcoin Settings
+# ============================================================================
+
+[bitcoin]
+# rpc_url = "http://127.0.0.1:8332"
+# new_bitcoin_key = "new_value"
+
+# ============================================================================
+# Maker Settings
+# ============================================================================
+
+[maker]
+# cjfee_a = 500
+"""
+        result = migrate_config(config_path, template_text=template)
+
+        assert "key:bitcoin.new_bitcoin_key" in result
+        content = config_path.read_text()
+        # The new key must appear BEFORE the ``# [maker]`` line.
+        new_key_pos = content.index('# new_bitcoin_key = "new_value"')
+        maker_pos = content.index("# [maker]")
+        assert new_key_pos < maker_pos, (
+            f"new_bitcoin_key at {new_key_pos} should be before # [maker] at {maker_pos}"
+        )
 
 
 class TestEnsureConfigFileMigration:

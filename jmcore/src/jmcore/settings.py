@@ -1328,7 +1328,13 @@ def _get_section_keys(section_text: str) -> set[str]:
 
 
 def _get_user_section_ranges(user_text: str) -> dict[str, tuple[int, int]]:
-    """Return byte offset ranges for each section in the user's config.
+    """Return byte offset ranges for each **uncommented** section in the user's config.
+
+    Both uncommented (``[section]``) and commented (``# [section]``)
+    headers are used as section boundaries so that the range for an
+    uncommented section ends where the next header of either kind begins.
+    Only uncommented sections are included in the returned mapping because
+    key-level migration can only append to actual TOML sections.
 
     Args:
         user_text: Full text of the user's config.toml.
@@ -1336,14 +1342,26 @@ def _get_user_section_ranges(user_text: str) -> dict[str, tuple[int, int]]:
     Returns:
         Mapping of section name to ``(start, end)`` byte offsets.
         ``start`` is the position of the ``[section]`` header.
-        ``end`` is the start of the next section or end of file.
+        ``end`` is the start of the next section header (commented or not)
+        or end of file.
     """
-    section_re = re.compile(r"^\[(\w+)]", re.MULTILINE)
-    matches = list(section_re.finditer(user_text))
+    # Match both uncommented and commented section headers as boundaries.
+    boundary_re = re.compile(r"^(?:#\s*)?\[(\w+)]", re.MULTILINE)
+    all_matches = list(boundary_re.finditer(user_text))
+
+    # Only uncommented headers produce entries; commented ones are boundaries only.
+    uncommented_re = re.compile(r"^\[(\w+)]", re.MULTILINE)
+    uncommented_matches = list(uncommented_re.finditer(user_text))
+
     ranges: dict[str, tuple[int, int]] = {}
-    for idx, match in enumerate(matches):
+    for match in uncommented_matches:
         start = match.start()
-        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(user_text)
+        # Find the next boundary (commented or uncommented) after this one.
+        end = len(user_text)
+        for boundary in all_matches:
+            if boundary.start() > start:
+                end = boundary.start()
+                break
         ranges[match.group(1)] = (start, end)
     return ranges
 
@@ -1420,6 +1438,20 @@ def migrate_config(
         if not new_groups:
             continue
 
+        # Find the best insertion point: after the last key/comment line that
+        # belongs to this section's content, before any trailing blank lines or
+        # separator comments that visually belong to the next section.
+        insert_at = end
+        # Look for the last key assignment (commented or uncommented) in the
+        # section.  Insert after the end of its line.
+        last_key_match = None
+        for m in _KEY_RE.finditer(user_section_text):
+            last_key_match = m
+        if last_key_match is not None:
+            # Find end of the line containing the last key
+            line_end = user_section_text.find("\n", last_key_match.end())
+            insert_at = start + line_end + 1 if line_end >= 0 else start + len(user_section_text)
+
         # Build the text to insert at the end of this section.
         insert = "\n"
         for key, text in new_groups:
@@ -1428,10 +1460,10 @@ def migrate_config(
             logger.info(f"Added new key [{section_name}].{key}")
 
         # Ensure there's a newline before the insert.
-        if user_section_text and not user_section_text.endswith("\n"):
+        if insert_at > 0 and user_text[insert_at - 1] != "\n":
             insert = "\n" + insert
 
-        user_text = user_text[:end] + insert + user_text[end:]
+        user_text = user_text[:insert_at] + insert + user_text[insert_at:]
 
     # --- Phase 2: section-level merge for missing sections ---
     missing_sections = [name for name in template_blocks if name not in user_sections]
