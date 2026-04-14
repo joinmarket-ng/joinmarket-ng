@@ -452,6 +452,24 @@ except Exception:
     pass
 " 2>/dev/null || true)
 
+    # Read neutrino sync/prefetch settings so Flatpak honors config.toml.
+    local clearnet_initial_sync
+    local prefetch_filters
+    local prefetch_lookback_blocks
+
+    clearnet_initial_sync=$(read_config_value "bitcoin" "neutrino_clearnet_initial_sync" "true")
+    prefetch_filters=$(read_config_value "bitcoin" "neutrino_prefetch_filters" "true")
+    prefetch_lookback_blocks=$(read_config_value "bitcoin" "neutrino_prefetch_lookback_blocks" "105120")
+
+    # Neutrino expects lowercase booleans in env vars.
+    clearnet_initial_sync=$(printf '%s' "${clearnet_initial_sync}" | tr '[:upper:]' '[:lower:]')
+    prefetch_filters=$(printf '%s' "${prefetch_filters}" | tr '[:upper:]' '[:lower:]')
+    if [ -z "${prefetch_lookback_blocks}" ]; then
+        prefetch_lookback_blocks="105120"
+    fi
+
+    log "Neutrino sync settings: clearnet_initial_sync=${clearnet_initial_sync}, prefetch_filters=${prefetch_filters}, prefetch_lookback_blocks=${prefetch_lookback_blocks}"
+
     log "Starting neutrino-api light client..."
     NETWORK="${NETWORK}" \
     LISTEN_ADDR="127.0.0.1:${NEUTRINO_PORT}" \
@@ -459,6 +477,9 @@ except Exception:
     LOG_LEVEL="${NEUTRINO_LOG_LEVEL:-info}" \
     TOR_PROXY="127.0.0.1:${TOR_SOCKS_PORT}" \
     ADD_PEERS="${add_peers}" \
+    CLEARNET_INITIAL_SYNC="${clearnet_initial_sync}" \
+    PREFETCH_FILTERS="${prefetch_filters}" \
+    PREFETCH_LOOKBACK="${prefetch_lookback_blocks}" \
     neutrinod > "${LOG_DIR}/neutrino.log" 2>&1 &
     local pid=$!
     PIDS+=("$pid")
