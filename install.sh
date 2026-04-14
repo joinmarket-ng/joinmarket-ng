@@ -492,6 +492,49 @@ update_packages() {
     print_success "Update complete!"
 }
 
+# Migrate config file: add new sections and keys from the bundled template
+migrate_config() {
+    print_header "Migrating Configuration"
+
+    local config_file="$DATA_DIR/config.toml"
+
+    if [ ! -f "$config_file" ]; then
+        print_info "No config file found; will create from template"
+    else
+        print_info "Checking config for new sections and settings..."
+    fi
+
+    # Delegate to Python migrate_config which handles both cases
+    local result
+    result=$(python3 -c "
+from pathlib import Path
+from jmcore.settings import migrate_config
+changes = migrate_config(Path('$config_file'))
+for change in changes:
+    print(change)
+" 2>&1) || {
+        print_warning "Config migration failed; config file unchanged"
+        print_warning "You can manually update your config from config.toml.template"
+        return 0
+    }
+
+    if [ -z "$result" ]; then
+        print_info "Config is up to date"
+    else
+        local count=0
+        while IFS= read -r change; do
+            if [[ "$change" == section:* ]]; then
+                print_success "Added new section: [${change#section:}]"
+            elif [[ "$change" == key:* ]]; then
+                print_success "Added new setting: ${change#key:}"
+            fi
+            count=$((count + 1))
+        done <<< "$result"
+        print_success "Applied $count change(s) to $config_file"
+        print_info "Review $config_file to see the new settings"
+    fi
+}
+
 # Setup data directory and config
 setup_data_directory() {
     print_header "Setting Up Configuration"
@@ -896,6 +939,7 @@ main() {
         check_system_dependencies
         setup_virtualenv
         update_packages
+        migrate_config
         create_shell_integration
         if [[ "$SKIP_TOR" == "false" ]]; then
             setup_tor

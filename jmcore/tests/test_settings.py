@@ -16,10 +16,16 @@ from jmcore.settings import (
     JoinMarketSettings,
     MakerSettings,
     NetworkSettings,
+    _extract_key_groups,
+    _extract_section_blocks,
+    _get_section_keys,
+    _get_user_section_ranges,
+    _get_user_sections,
     ensure_config_file,
     generate_config_template,
     get_config_path,
     get_settings,
+    migrate_config,
     reset_settings,
 )
 
@@ -88,7 +94,8 @@ class TestConfigTemplate:
         assert result == config_path
         assert config_path.exists()
         content = config_path.read_text()
-        assert "# JoinMarket NG Configuration" in content
+        assert "# JoinMarket" in content
+        assert "[tor]" in content
 
     def test_ensure_config_file_does_not_overwrite(self, temp_data_dir: Path) -> None:
         """Test that ensure_config_file does not overwrite existing file."""
@@ -636,3 +643,457 @@ class TestNeutrinoAuthTokenFile:
 
         settings = BitcoinSettings(neutrino_auth_token_file="~/.joinmarket-ng/neutrino/auth_token")
         assert settings.neutrino_auth_token == "tilde-token"
+
+
+# ============================================================================
+# Config Migration Tests
+# ============================================================================
+
+MINI_TEMPLATE = """\
+# JoinMarket-NG Configuration
+
+# ============================================================================
+# Tor Settings
+# ============================================================================
+
+[tor]
+# socks_host = "127.0.0.1"
+# socks_port = 9050
+
+# ============================================================================
+# Bitcoin Settings
+# ============================================================================
+
+[bitcoin]
+# rpc_url = "http://127.0.0.1:8332"
+
+# ============================================================================
+# Maker Settings
+# ============================================================================
+
+[maker]
+# cjfee_a = 500
+# cjfee_r = 0.00002
+"""
+
+
+class TestExtractSectionBlocks:
+    """Tests for _extract_section_blocks."""
+
+    def test_extracts_all_sections(self) -> None:
+        blocks = _extract_section_blocks(MINI_TEMPLATE)
+        assert set(blocks.keys()) == {"tor", "bitcoin", "maker"}
+
+    def test_block_includes_header(self) -> None:
+        blocks = _extract_section_blocks(MINI_TEMPLATE)
+        assert "# Tor Settings" in blocks["tor"]
+        assert "[tor]" in blocks["tor"]
+
+    def test_block_includes_commented_keys(self) -> None:
+        blocks = _extract_section_blocks(MINI_TEMPLATE)
+        assert '# socks_host = "127.0.0.1"' in blocks["tor"]
+        assert "# socks_port = 9050" in blocks["tor"]
+
+    def test_block_does_not_include_other_sections(self) -> None:
+        blocks = _extract_section_blocks(MINI_TEMPLATE)
+        assert "[bitcoin]" not in blocks["tor"]
+        assert "[tor]" not in blocks["bitcoin"]
+
+    def test_empty_text(self) -> None:
+        assert _extract_section_blocks("") == {}
+
+    def test_no_sections(self) -> None:
+        assert _extract_section_blocks("# just a comment\nfoo = 1\n") == {}
+
+    def test_single_section(self) -> None:
+        text = """\
+# ============================================================================
+# Only Section
+# ============================================================================
+
+[only]
+# key = "value"
+"""
+        blocks = _extract_section_blocks(text)
+        assert set(blocks.keys()) == {"only"}
+        assert '# key = "value"' in blocks["only"]
+
+    def test_blocks_cover_entire_body(self) -> None:
+        """Concatenating all blocks reproduces the section content."""
+        blocks = _extract_section_blocks(MINI_TEMPLATE)
+        # Each section block should start with a separator header or section name
+        for name, block in blocks.items():
+            assert f"[{name}]" in block
+
+
+class TestGetUserSections:
+    """Tests for _get_user_sections."""
+
+    def test_detects_uncommented_sections(self) -> None:
+        text = "[tor]\nsocks_host = '127.0.0.1'\n\n[bitcoin]\nrpc_url = 'x'\n"
+        assert _get_user_sections(text) == {"tor", "bitcoin"}
+
+    def test_ignores_commented_sections(self) -> None:
+        text = "# [tor]\n[bitcoin]\nrpc_url = 'x'\n"
+        assert _get_user_sections(text) == {"bitcoin"}
+
+    def test_empty_text(self) -> None:
+        assert _get_user_sections("") == set()
+
+    def test_no_sections(self) -> None:
+        assert _get_user_sections("# just comments\n") == set()
+
+    def test_regex_fallback_on_invalid_toml(self) -> None:
+        """Even with broken TOML, we fall back to regex."""
+        text = "[bitcoin]\n= invalid toml\n[maker]\n"
+        sections = _get_user_sections(text)
+        assert "bitcoin" in sections
+        assert "maker" in sections
+
+
+class TestMigrateConfig:
+    """Tests for migrate_config."""
+
+    def test_creates_config_from_template_if_missing(self, tmp_path: Path) -> None:
+        config_path = tmp_path / "config.toml"
+        result = migrate_config(config_path, template_text=MINI_TEMPLATE)
+
+        assert result == []
+        assert config_path.exists()
+        content = config_path.read_text()
+        assert "[tor]" in content
+        assert "[bitcoin]" in content
+        assert "[maker]" in content
+
+    def test_adds_missing_sections(self, tmp_path: Path) -> None:
+        config_path = tmp_path / "config.toml"
+        # User has tor and bitcoin, missing maker
+        config_path.write_text("[tor]\nsocks_port = 9050\n\n[bitcoin]\nrpc_url = 'x'\n")
+
+        result = migrate_config(config_path, template_text=MINI_TEMPLATE)
+
+        assert "section:maker" in result
+        content = config_path.read_text()
+        assert "[maker]" in content
+        # Original content preserved
+        assert "socks_port = 9050" in content
+        assert "rpc_url = 'x'" in content
+
+    def test_preserves_existing_values(self, tmp_path: Path) -> None:
+        config_path = tmp_path / "config.toml"
+        config_path.write_text("[tor]\nsocks_port = 9999\n\n[bitcoin]\nrpc_url = 'custom'\n")
+
+        migrate_config(config_path, template_text=MINI_TEMPLATE)
+
+        content = config_path.read_text()
+        # User values are preserved
+        assert "socks_port = 9999" in content
+        assert "rpc_url = 'custom'" in content
+
+    def test_no_changes_when_all_sections_present(self, tmp_path: Path) -> None:
+        config_path = tmp_path / "config.toml"
+        original = (
+            '[tor]\n# socks_host = "127.0.0.1"\n# socks_port = 9050\n\n'
+            '[bitcoin]\n# rpc_url = "http://127.0.0.1:8332"\n\n'
+            "[maker]\n# cjfee_a = 500\n# cjfee_r = 0.00002\n"
+        )
+        config_path.write_text(original)
+
+        result = migrate_config(config_path, template_text=MINI_TEMPLATE)
+
+        assert result == []
+        assert config_path.read_text() == original
+
+    def test_idempotent(self, tmp_path: Path) -> None:
+        config_path = tmp_path / "config.toml"
+        config_path.write_text("[tor]\nsocks_port = 9050\n")
+
+        # First migration adds sections and keys
+        result1 = migrate_config(config_path, template_text=MINI_TEMPLATE)
+        content_after_first = config_path.read_text()
+
+        # Second migration changes nothing
+        result2 = migrate_config(config_path, template_text=MINI_TEMPLATE)
+        content_after_second = config_path.read_text()
+
+        assert len(result1) > 0
+        assert result2 == []
+        assert content_after_first == content_after_second
+
+    def test_adds_multiple_missing_sections(self, tmp_path: Path) -> None:
+        config_path = tmp_path / "config.toml"
+        config_path.write_text('[tor]\n# socks_host = "127.0.0.1"\n# socks_port = 9050\n')
+
+        result = migrate_config(config_path, template_text=MINI_TEMPLATE)
+
+        section_changes = {r for r in result if r.startswith("section:")}
+        assert section_changes == {"section:bitcoin", "section:maker"}
+        content = config_path.read_text()
+        assert "[bitcoin]" in content
+        assert "[maker]" in content
+
+    def test_creates_parent_directories(self, tmp_path: Path) -> None:
+        config_path = tmp_path / "deep" / "nested" / "config.toml"
+
+        migrate_config(config_path, template_text=MINI_TEMPLATE)
+
+        assert config_path.exists()
+
+    def test_handles_user_file_without_trailing_newline(self, tmp_path: Path) -> None:
+        config_path = tmp_path / "config.toml"
+        config_path.write_text("[tor]\nsocks_port = 9050")  # no trailing newline
+
+        migrate_config(config_path, template_text=MINI_TEMPLATE)
+
+        content = config_path.read_text()
+        # Should still be valid and parseable
+        assert "[tor]" in content
+        assert "[bitcoin]" in content
+        assert "[maker]" in content
+
+    def test_returns_empty_when_no_template(self, tmp_path: Path) -> None:
+        config_path = tmp_path / "config.toml"
+        config_path.write_text("[tor]\n")
+
+        result = migrate_config(config_path, template_text="")
+
+        assert result == []
+
+    def test_added_blocks_include_comment_headers(self, tmp_path: Path) -> None:
+        config_path = tmp_path / "config.toml"
+        config_path.write_text("[tor]\nsocks_port = 9050\n")
+
+        migrate_config(config_path, template_text=MINI_TEMPLATE)
+
+        content = config_path.read_text()
+        # The added sections should include their descriptive headers
+        assert "# Bitcoin Settings" in content
+        assert "# Maker Settings" in content
+
+    def test_with_bundled_template(self, tmp_path: Path) -> None:
+        """Test using the real bundled template (no explicit template_text)."""
+        config_path = tmp_path / "config.toml"
+        config_path.write_text("[tor]\nsocks_port = 9050\n")
+
+        result = migrate_config(config_path)
+
+        # Should add sections from bundled template (not tor, it exists)
+        section_changes = [r for r in result if r.startswith("section:")]
+        assert not any(r == "section:tor" for r in section_changes)
+        assert len(result) > 0
+        content = config_path.read_text()
+        assert "[bitcoin]" in content
+
+
+class TestExtractKeyGroups:
+    """Tests for _extract_key_groups."""
+
+    def test_extracts_commented_keys(self) -> None:
+        block = "[maker]\n# cjfee_a = 500\n# cjfee_r = 0.00002\n"
+        groups = _extract_key_groups(block)
+        keys = [k for k, _ in groups]
+        assert keys == ["cjfee_a", "cjfee_r"]
+
+    def test_includes_preceding_comments(self) -> None:
+        block = "[maker]\n# Fee settings\n# cjfee_a = 500\n"
+        groups = _extract_key_groups(block)
+        assert len(groups) == 1
+        key, text = groups[0]
+        assert key == "cjfee_a"
+        assert "# Fee settings" in text
+        assert "# cjfee_a = 500" in text
+
+    def test_blank_line_resets_comment_buffer(self) -> None:
+        block = "[maker]\n# Unrelated comment\n\n# cjfee_a = 500\n"
+        groups = _extract_key_groups(block)
+        assert len(groups) == 1
+        _, text = groups[0]
+        assert "Unrelated comment" not in text
+
+    def test_skips_section_headers(self) -> None:
+        block = "[maker]\n# cjfee_a = 500\n"
+        groups = _extract_key_groups(block)
+        keys = [k for k, _ in groups]
+        assert "maker" not in keys
+
+    def test_empty_block(self) -> None:
+        assert _extract_key_groups("") == []
+
+    def test_no_keys(self) -> None:
+        assert _extract_key_groups("[maker]\n# just a comment\n") == []
+
+
+class TestGetSectionKeys:
+    """Tests for _get_section_keys."""
+
+    def test_finds_uncommented_keys(self) -> None:
+        text = "[tor]\nsocks_host = '127.0.0.1'\nsocks_port = 9050\n"
+        assert _get_section_keys(text) == {"socks_host", "socks_port"}
+
+    def test_finds_commented_keys(self) -> None:
+        text = "[tor]\n# socks_host = '127.0.0.1'\n# socks_port = 9050\n"
+        assert _get_section_keys(text) == {"socks_host", "socks_port"}
+
+    def test_finds_mixed_keys(self) -> None:
+        text = "[tor]\nsocks_host = '127.0.0.1'\n# socks_port = 9050\n"
+        assert _get_section_keys(text) == {"socks_host", "socks_port"}
+
+    def test_empty_section(self) -> None:
+        assert _get_section_keys("[tor]\n") == set()
+
+
+class TestGetUserSectionRanges:
+    """Tests for _get_user_section_ranges."""
+
+    def test_single_section(self) -> None:
+        text = "[tor]\nsocks_port = 9050\n"
+        ranges = _get_user_section_ranges(text)
+        assert "tor" in ranges
+        assert text[ranges["tor"][0] : ranges["tor"][1]] == text
+
+    def test_multiple_sections(self) -> None:
+        text = "[tor]\nsocks_port = 9050\n\n[bitcoin]\nrpc_url = 'x'\n"
+        ranges = _get_user_section_ranges(text)
+        assert set(ranges.keys()) == {"tor", "bitcoin"}
+        # tor section ends where bitcoin starts
+        tor_text = text[ranges["tor"][0] : ranges["tor"][1]]
+        assert "[tor]" in tor_text
+        assert "[bitcoin]" not in tor_text
+
+    def test_empty_text(self) -> None:
+        assert _get_user_section_ranges("") == {}
+
+
+class TestKeyLevelMigration:
+    """Tests for key-level migration within existing sections."""
+
+    def test_adds_missing_key_to_existing_section(self, tmp_path: Path) -> None:
+        config_path = tmp_path / "config.toml"
+        config_path.write_text(
+            '[tor]\n# socks_host = "127.0.0.1"\n\n'
+            '[bitcoin]\n# rpc_url = "http://127.0.0.1:8332"\n\n'
+            "[maker]\n# cjfee_a = 500\n"
+        )
+
+        result = migrate_config(config_path, template_text=MINI_TEMPLATE)
+
+        # socks_port is missing from tor, cjfee_r from maker, rpc_url already exists
+        key_changes = [r for r in result if r.startswith("key:")]
+        assert "key:tor.socks_port" in key_changes
+        assert "key:maker.cjfee_r" in key_changes
+        content = config_path.read_text()
+        assert "# socks_port = 9050" in content
+        assert "# cjfee_r = 0.00002" in content
+
+    def test_does_not_duplicate_existing_keys(self, tmp_path: Path) -> None:
+        config_path = tmp_path / "config.toml"
+        config_path.write_text(
+            '[tor]\n# socks_host = "127.0.0.1"\n# socks_port = 9050\n\n'
+            '[bitcoin]\n# rpc_url = "http://127.0.0.1:8332"\n\n'
+            "[maker]\n# cjfee_a = 500\n# cjfee_r = 0.00002\n"
+        )
+
+        result = migrate_config(config_path, template_text=MINI_TEMPLATE)
+
+        assert result == []
+
+    def test_preserves_user_uncommented_keys(self, tmp_path: Path) -> None:
+        config_path = tmp_path / "config.toml"
+        config_path.write_text(
+            '[tor]\nsocks_host = "custom"\n\n'
+            '[bitcoin]\nrpc_url = "custom"\n\n'
+            "[maker]\ncjfee_a = 999\n"
+        )
+
+        migrate_config(config_path, template_text=MINI_TEMPLATE)
+
+        content = config_path.read_text()
+        # Original values preserved
+        assert 'socks_host = "custom"' in content
+        assert 'rpc_url = "custom"' in content
+        assert "cjfee_a = 999" in content
+        # Missing keys added
+        assert "# socks_port = 9050" in content
+        assert "# cjfee_r = 0.00002" in content
+
+    def test_key_level_idempotent(self, tmp_path: Path) -> None:
+        config_path = tmp_path / "config.toml"
+        config_path.write_text('[tor]\nsocks_host = "127.0.0.1"\n')
+
+        result1 = migrate_config(config_path, template_text=MINI_TEMPLATE)
+        content_after_first = config_path.read_text()
+
+        result2 = migrate_config(config_path, template_text=MINI_TEMPLATE)
+        content_after_second = config_path.read_text()
+
+        assert len(result1) > 0
+        assert result2 == []
+        assert content_after_first == content_after_second
+
+    def test_mixed_section_and_key_migration(self, tmp_path: Path) -> None:
+        """Both new sections and new keys within existing sections."""
+        config_path = tmp_path / "config.toml"
+        config_path.write_text('[tor]\nsocks_host = "127.0.0.1"\n')
+
+        result = migrate_config(config_path, template_text=MINI_TEMPLATE)
+
+        section_changes = [r for r in result if r.startswith("section:")]
+        key_changes = [r for r in result if r.startswith("key:")]
+        # bitcoin and maker are new sections
+        assert "section:bitcoin" in section_changes
+        assert "section:maker" in section_changes
+        # socks_port is a new key in existing tor section
+        assert "key:tor.socks_port" in key_changes
+
+    def test_key_with_comment_block_appended(self, tmp_path: Path) -> None:
+        """New keys should include their preceding comment documentation."""
+        template = """\
+# ============================================================================
+# Test Section
+# ============================================================================
+
+[test]
+# Simple key
+# simple = 1
+
+# This is a detailed description
+# of the new key
+# new_key = "value"
+"""
+        config_path = tmp_path / "config.toml"
+        config_path.write_text("[test]\n# simple = 1\n")
+
+        migrate_config(config_path, template_text=template)
+
+        content = config_path.read_text()
+        assert '# new_key = "value"' in content
+        assert "# This is a detailed description" in content
+
+
+class TestEnsureConfigFileMigration:
+    """Tests for ensure_config_file migration integration."""
+
+    def test_creates_config_on_first_run(self, temp_data_dir: Path) -> None:
+        config_path = temp_data_dir / "config.toml"
+        assert not config_path.exists()
+
+        result = ensure_config_file(temp_data_dir)
+
+        assert result == config_path
+        assert config_path.exists()
+        content = config_path.read_text()
+        assert "[tor]" in content
+        assert "[bitcoin]" in content
+
+    def test_migrates_on_subsequent_runs(self, temp_data_dir: Path) -> None:
+        config_path = temp_data_dir / "config.toml"
+        config_path.write_text("[tor]\nsocks_port = 9050\n")
+
+        result = ensure_config_file(temp_data_dir)
+
+        assert result == config_path
+        content = config_path.read_text()
+        # Original preserved
+        assert "socks_port = 9050" in content
+        # New sections added
+        assert "[bitcoin]" in content

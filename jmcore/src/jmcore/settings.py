@@ -36,8 +36,10 @@ Environment Variable Naming:
 
 from __future__ import annotations
 
+import importlib.resources
 import json
 import os
+import re
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, ClassVar, Self
@@ -1133,9 +1135,329 @@ def generate_config_template() -> str:
     return "\n".join(lines)
 
 
-def ensure_config_file(data_dir: Path | None = None) -> Path:
+def _get_bundled_template() -> str | None:
+    """Load the bundled config.toml.template from package data.
+
+    Returns:
+        Template text, or None if not available.
     """
-    Ensure the config file exists, creating a template if it doesn't.
+    try:
+        ref = importlib.resources.files("jmcore") / "data" / "config.toml.template"
+        return ref.read_text(encoding="utf-8")
+    except Exception:
+        return None
+
+
+def _extract_section_blocks(template_text: str) -> dict[str, str]:
+    """Extract named section blocks from a config template.
+
+    Each block includes the comment header (``# ===`` separator and title)
+    preceding its ``[section]`` header, the header itself, and all content
+    up to the next section separator or end-of-file.
+
+    Args:
+        template_text: Full text of the config template.
+
+    Returns:
+        Mapping of section name to its full text block (including leading
+        comment header).
+    """
+    # Match [section_name] at the start of a line
+    section_re = re.compile(r"^\[(\w+)]", re.MULTILINE)
+    matches = list(section_re.finditer(template_text))
+    if not matches:
+        return {}
+
+    blocks: dict[str, str] = {}
+    for idx, match in enumerate(matches):
+        section_name = match.group(1)
+
+        # Walk backwards from the [section] line to find the ``# ===``
+        # separator block that introduces this section.
+        section_line_start = match.start()
+        block_start = section_line_start
+        before = template_text[:section_line_start]
+
+        sep_pos = before.rfind("# " + "=" * 76)
+        if sep_pos < 0:
+            sep_pos = before.rfind("# ====")
+        if sep_pos >= 0:
+            # The template uses a pair of separator lines with a title between:
+            #   # ====...====
+            #   # Title
+            #   # ====...====
+            # sep_pos points at the closing separator. Look for the opening one.
+            before_sep = before[:sep_pos]
+            opening_sep = before_sep.rfind("# " + "=" * 76)
+            if opening_sep < 0:
+                opening_sep = before_sep.rfind("# ====")
+            if opening_sep >= 0:
+                # Use the opening separator as the start
+                line_start = before.rfind("\n", 0, opening_sep)
+            else:
+                # Only one separator found; use it
+                line_start = before.rfind("\n", 0, sep_pos)
+            block_start = line_start + 1 if line_start >= 0 else 0
+
+        # The block ends where the next section's block begins (or EOF).
+        if idx + 1 < len(matches):
+            next_match = matches[idx + 1]
+            next_section_start = next_match.start()
+            next_before = template_text[:next_section_start]
+            next_sep = next_before.rfind("# " + "=" * 76)
+            if next_sep < 0:
+                next_sep = next_before.rfind("# ====")
+            if next_sep >= 0:
+                # Find the opening separator of the next section's header block
+                before_next_sep = next_before[:next_sep]
+                next_opening = before_next_sep.rfind("# " + "=" * 76)
+                if next_opening < 0:
+                    next_opening = before_next_sep.rfind("# ====")
+                if next_opening >= 0:
+                    nl = next_before.rfind("\n", 0, next_opening)
+                else:
+                    nl = next_before.rfind("\n", 0, next_sep)
+                block_end = nl + 1 if nl >= 0 else next_sep
+            else:
+                block_end = next_section_start
+        else:
+            block_end = len(template_text)
+
+        blocks[section_name] = template_text[block_start:block_end]
+
+    return blocks
+
+
+# Regex matching a TOML key assignment: ``key = value`` or ``# key = value``.
+# Captures the key name.  Handles quoted keys (rare in our templates).
+_KEY_RE = re.compile(r"^#?\s*(\w+)\s*=", re.MULTILINE)
+
+
+def _get_user_sections(user_text: str) -> set[str]:
+    """Return the set of top-level TOML table names present in user text.
+
+    Uses tomlkit so that only *uncommented* ``[section]`` headers are
+    counted.
+
+    Args:
+        user_text: Contents of the user's config.toml.
+
+    Returns:
+        Set of section names found in the user config.
+    """
+    import tomlkit
+
+    try:
+        doc = tomlkit.parse(user_text)
+        return set(doc.keys())
+    except Exception:
+        # If parsing fails, fall back to regex (catches bare [section] lines)
+        return {m.group(1) for m in re.finditer(r"^\[(\w+)]", user_text, re.MULTILINE)}
+
+
+def _extract_key_groups(section_block: str) -> list[tuple[str, str]]:
+    """Extract key-name / text-block pairs from a template section block.
+
+    A "key group" is a commented-out key line (``# key = value``) together
+    with any preceding comment lines that document it.  Blank lines reset
+    the accumulated comment buffer.
+
+    Args:
+        section_block: The full text of one template section (as returned
+            by ``_extract_section_blocks``).
+
+    Returns:
+        List of ``(key_name, text_block)`` tuples in template order.
+        ``text_block`` includes the leading comment lines and the key line
+        itself, ready to be appended verbatim.
+    """
+    lines = section_block.splitlines(keepends=True)
+    groups: list[tuple[str, str]] = []
+    comment_buf: list[str] = []
+
+    for line in lines:
+        stripped = line.strip()
+
+        # Blank line resets the comment buffer
+        if not stripped:
+            comment_buf = []
+            continue
+
+        # Check if this line is a commented-out key assignment
+        m = re.match(r"^#\s*(\w+)\s*=", stripped)
+        if m:
+            key_name = m.group(1)
+            text = "".join(comment_buf) + line
+            groups.append((key_name, text))
+            comment_buf = []
+            continue
+
+        # Accumulate comment lines (skip section headers and separators)
+        if (
+            stripped.startswith("#")
+            and not stripped.startswith("# ==")
+            and not stripped.startswith("[")
+        ):
+            comment_buf.append(line)
+        else:
+            comment_buf = []
+
+    return groups
+
+
+def _get_section_keys(section_text: str) -> set[str]:
+    """Return all key names present in a section's text (commented or not).
+
+    Args:
+        section_text: The text of one section from the user's config,
+            from the ``[section]`` header to the next header or EOF.
+
+    Returns:
+        Set of key names found.
+    """
+    return {m.group(1) for m in _KEY_RE.finditer(section_text)}
+
+
+def _get_user_section_ranges(user_text: str) -> dict[str, tuple[int, int]]:
+    """Return byte offset ranges for each section in the user's config.
+
+    Args:
+        user_text: Full text of the user's config.toml.
+
+    Returns:
+        Mapping of section name to ``(start, end)`` byte offsets.
+        ``start`` is the position of the ``[section]`` header.
+        ``end`` is the start of the next section or end of file.
+    """
+    section_re = re.compile(r"^\[(\w+)]", re.MULTILINE)
+    matches = list(section_re.finditer(user_text))
+    ranges: dict[str, tuple[int, int]] = {}
+    for idx, match in enumerate(matches):
+        start = match.start()
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(user_text)
+        ranges[match.group(1)] = (start, end)
+    return ranges
+
+
+def migrate_config(
+    config_path: Path,
+    template_text: str | None = None,
+) -> list[str]:
+    """Add new sections and keys from the upstream template to an existing config.
+
+    This performs an **additive-only** merge:
+
+    * **Section level:** sections present in the template but absent from
+      the user's config are appended verbatim (including their comment
+      headers).
+    * **Key level:** for sections that already exist in the user's config,
+      new keys from the template that are absent (neither commented nor
+      uncommented) are appended as commented-out lines at the end of the
+      section.
+    * Existing keys and values are **never** modified -- user
+      customizations, commented-out keys, and whitespace are preserved.
+    * If ``config_path`` does not exist, a fresh config is created from
+      the template.
+
+    The function is safe to call repeatedly (idempotent): once a section
+    or key exists in the user file it will not be added again.
+
+    Args:
+        config_path: Path to the user's ``config.toml``.
+        template_text: Template text to merge from.  When *None*, the
+            bundled ``config.toml.template`` shipped with the package is
+            used.
+
+    Returns:
+        List of human-readable descriptions of changes made (empty if
+        nothing changed).  Each entry is either ``"section:<name>"`` for
+        a new section or ``"key:<section>.<key>"`` for a new key.
+    """
+    if template_text is None:
+        template_text = _get_bundled_template()
+    if template_text is None:
+        template_text = generate_config_template()
+    if not template_text:
+        logger.warning("No config template available; skipping migration")
+        return []
+
+    # If the config file doesn't exist, create it from the template.
+    if not config_path.exists():
+        logger.info(f"Config file missing; creating from template at {config_path}")
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(template_text)
+        return []
+
+    user_text = config_path.read_text()
+    user_sections = _get_user_sections(user_text)
+    template_blocks = _extract_section_blocks(template_text)
+
+    changes: list[str] = []
+
+    # --- Phase 1: key-level merge for existing sections ---
+    # Process in reverse section order so that byte offsets stay valid
+    # as we insert text.
+    section_ranges = _get_user_section_ranges(user_text)
+    for section_name in reversed(list(template_blocks)):
+        if section_name not in user_sections or section_name not in section_ranges:
+            continue
+
+        start, end = section_ranges[section_name]
+        user_section_text = user_text[start:end]
+        existing_keys = _get_section_keys(user_section_text)
+
+        template_key_groups = _extract_key_groups(template_blocks[section_name])
+        new_groups = [(key, text) for key, text in template_key_groups if key not in existing_keys]
+        if not new_groups:
+            continue
+
+        # Build the text to insert at the end of this section.
+        insert = "\n"
+        for key, text in new_groups:
+            insert += text
+            changes.append(f"key:{section_name}.{key}")
+            logger.info(f"Added new key [{section_name}].{key}")
+
+        # Ensure there's a newline before the insert.
+        if user_section_text and not user_section_text.endswith("\n"):
+            insert = "\n" + insert
+
+        user_text = user_text[:end] + insert + user_text[end:]
+
+    # --- Phase 2: section-level merge for missing sections ---
+    missing_sections = [name for name in template_blocks if name not in user_sections]
+    if missing_sections:
+        additions = "\n"
+        for name in missing_sections:
+            additions += template_blocks[name]
+            changes.append(f"section:{name}")
+            logger.info(f"Added new config section [{name}]")
+
+        if user_text and not user_text.endswith("\n"):
+            additions = "\n" + additions
+
+        user_text = user_text + additions
+
+    # Write if anything changed.
+    if changes:
+        config_path.write_text(user_text)
+        logger.info(
+            f"Merged {len(changes)} change(s) into {config_path}. "
+            "Review the file to see available settings."
+        )
+
+    else:
+        logger.debug("Config is up to date; no changes needed")
+
+    return changes
+
+
+def ensure_config_file(data_dir: Path | None = None) -> Path:
+    """Ensure the config file exists and is up to date.
+
+    On first run the config file is created from the bundled template.
+    On subsequent runs new sections from the template are merged into
+    the existing file (additive only -- user changes are never modified).
 
     Args:
         data_dir: Optional data directory path. Uses default if not provided.
@@ -1147,12 +1469,7 @@ def ensure_config_file(data_dir: Path | None = None) -> Path:
         data_dir = get_default_data_dir()
 
     config_path = data_dir / "config.toml"
-
-    if not config_path.exists():
-        logger.info(f"Creating config file template at {config_path}")
-        data_dir.mkdir(parents=True, exist_ok=True)
-        config_path.write_text(generate_config_template())
-
+    migrate_config(config_path)
     return config_path
 
 
@@ -1202,5 +1519,6 @@ __all__ = [
     "get_config_path",
     "generate_config_template",
     "ensure_config_file",
+    "migrate_config",
     "DEFAULT_DIRECTORY_SERVERS",
 ]
