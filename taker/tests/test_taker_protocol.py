@@ -1337,6 +1337,8 @@ class TestTakerHistoryHardening:
         self, mock_wallet, mock_backend, mock_config, sample_offer
     ):
         """Verify that _phase_collect_signatures aborts if history recording fails."""
+        from jmwallet.history import HistoryWriteError
+
         taker = Taker(mock_wallet, mock_backend, mock_config)
 
         nick = "J5maker1"
@@ -1353,7 +1355,10 @@ class TestTakerHistoryHardening:
 
         taker.directory_client = AsyncMock()
 
-        with patch("taker.taker.append_history_entry", return_value=False) as mock_append:
+        with patch(
+            "taker.taker.append_history_entry",
+            side_effect=HistoryWriteError("disk full"),
+        ) as mock_append:
             result = await taker._phase_collect_signatures()
 
             assert result is False

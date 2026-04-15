@@ -26,6 +26,10 @@ if TYPE_CHECKING:
     from jmwallet.backends.base import BlockchainBackend
 
 
+class HistoryWriteError(Exception):
+    """Raised when a history entry cannot be persisted to disk."""
+
+
 @dataclass
 class TransactionHistoryEntry:
     """A single CoinJoin transaction record."""
@@ -97,13 +101,16 @@ def _get_fieldnames() -> list[str]:
 def append_history_entry(
     entry: TransactionHistoryEntry,
     data_dir: Path | None = None,
-) -> bool:
+) -> None:
     """
     Append a transaction history entry to the CSV file.
 
     Args:
         entry: The transaction history entry to append
         data_dir: Optional data directory (defaults to get_default_data_dir())
+
+    Raises:
+        HistoryWriteError: If the entry cannot be written to disk.
     """
     history_path = _get_history_path(data_dir)
     fieldnames = _get_fieldnames()
@@ -122,10 +129,8 @@ def append_history_entry(
             writer.writerow(row)
 
         logger.debug(f"Appended history entry: txid={entry.txid[:16]}... role={entry.role}")
-        return True
     except Exception as e:
-        logger.error(f"Failed to write history entry: {e}")
-        return False
+        raise HistoryWriteError(f"Failed to write history entry: {e}") from e
 
 
 def _write_history_entries_atomic(

@@ -29,6 +29,7 @@ from jmcore.paths import read_nick_state
 from jmcore.protocol import FEATURE_NEUTRINO_COMPAT, JM_VERSION, parse_utxo_list
 from jmwallet.backends.base import BlockchainBackend, BondVerificationRequest
 from jmwallet.history import (
+    HistoryWriteError,
     append_history_entry,
     create_taker_history_entry,
     update_taker_awaiting_transaction_broadcast,
@@ -2230,16 +2231,14 @@ class Taker(TakerMonitoringMixin):
                 network=self.config.network.value,
                 failure_reason="Awaiting transaction",
             )
-            if not append_history_entry(history_entry, data_dir=self.config.data_dir):
-                logger.error("Aborting coinjoin to prevent address reuse.")
-                return False
+            append_history_entry(history_entry, data_dir=self.config.data_dir)
 
             logger.debug(
                 f"Recorded pre-broadcast history entry for CJ to {self.cj_destination[:20]}..."
                 + (" (no change)" if not self.taker_change_address else "")
             )
-        except Exception as e:
-            logger.error(f"Failed to record pre-broadcast history: {e}")
+        except HistoryWriteError as e:
+            logger.error(f"Aborting coinjoin to prevent address reuse: {e}")
             return False
 
         # Send ENCRYPTED !tx to each maker

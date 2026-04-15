@@ -13,6 +13,7 @@ import pytest
 
 from jmwallet.backends.base import Transaction
 from jmwallet.history import (
+    HistoryWriteError,
     TransactionHistoryEntry,
     _parse_utxos,
     append_history_entry,
@@ -152,8 +153,7 @@ class TestAppendAndReadHistory:
             cj_amount=1_000_000,
         )
 
-        res = append_history_entry(entry, temp_data_dir)
-        assert res is True
+        append_history_entry(entry, temp_data_dir)
         entries = read_history(temp_data_dir)
 
         assert len(entries) == 1
@@ -169,14 +169,13 @@ class TestAppendAndReadHistory:
                 txid=f"txid{i}" * 16,
                 cj_amount=(i + 1) * 100_000,
             )
-            res = append_history_entry(entry, temp_data_dir)
-            assert res is True
+            append_history_entry(entry, temp_data_dir)
 
         entries = read_history(temp_data_dir)
         assert len(entries) == 3
 
-    def test_append_history_failure_returns_false(self, temp_data_dir: Path) -> None:
-        """Test that append_history_entry returns False on failure."""
+    def test_append_history_failure_raises_error(self, temp_data_dir: Path) -> None:
+        """Test that append_history_entry raises HistoryWriteError on failure."""
         entry = TransactionHistoryEntry(
             timestamp="2024-01-01T00:00:00",
             role="taker",
@@ -185,8 +184,8 @@ class TestAppendAndReadHistory:
         )
 
         with patch("jmwallet.history.open", side_effect=OSError("simulated write error")):
-            res = append_history_entry(entry, temp_data_dir)
-            assert res is False
+            with pytest.raises(HistoryWriteError, match="simulated write error"):
+                append_history_entry(entry, temp_data_dir)
 
     def test_read_with_role_filter(self, temp_data_dir: Path) -> None:
         """Test reading with role filter."""

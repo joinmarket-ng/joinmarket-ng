@@ -4,6 +4,7 @@ Tests for taker transaction signing functionality.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -604,9 +605,10 @@ class TestPhaseCollectSignaturesCompleteness:
             taker.backend = AsyncMock()
             taker.config = MagicMock()
             taker.config.network.value = "regtest"
+            taker.config.tx_broadcast.value = "self"
             taker.config.maker_timeout_sec = 5
             taker.config.minimum_makers = 1  # Low threshold -- should NOT matter
-            taker.config.data_dir = "/tmp/test"
+            taker.config.data_dir = Path("/tmp/test")
             taker.unsigned_tx = tx_bytes
             taker.tx_metadata = metadata
             taker.selected_utxos = []
