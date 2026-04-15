@@ -97,7 +97,7 @@ def _get_fieldnames() -> list[str]:
 def append_history_entry(
     entry: TransactionHistoryEntry,
     data_dir: Path | None = None,
-) -> None:
+) -> bool:
     """
     Append a transaction history entry to the CSV file.
 
@@ -122,8 +122,10 @@ def append_history_entry(
             writer.writerow(row)
 
         logger.debug(f"Appended history entry: txid={entry.txid[:16]}... role={entry.role}")
+        return True
     except Exception as e:
         logger.error(f"Failed to write history entry: {e}")
+        return False
 
 
 def _write_history_entries_atomic(

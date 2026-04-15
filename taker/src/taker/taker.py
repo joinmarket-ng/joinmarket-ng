@@ -2230,14 +2230,17 @@ class Taker(TakerMonitoringMixin):
                 network=self.config.network.value,
                 failure_reason="Awaiting transaction",
             )
-            append_history_entry(history_entry, data_dir=self.config.data_dir)
+            if not append_history_entry(history_entry, data_dir=self.config.data_dir):
+                logger.error("Aborting coinjoin to prevent address reuse.")
+                return False
+
             logger.debug(
                 f"Recorded pre-broadcast history entry for CJ to {self.cj_destination[:20]}..."
                 + (" (no change)" if not self.taker_change_address else "")
             )
         except Exception as e:
-            logger.warning(f"Failed to record pre-broadcast history: {e}")
-            # Continue anyway - the CoinJoin can still proceed
+            logger.error(f"Failed to record pre-broadcast history: {e}")
+            return False
 
         # Send ENCRYPTED !tx to each maker
         for nick, session in self.maker_sessions.items():
