@@ -16,6 +16,7 @@ from jmcore.settings import (
     JoinMarketSettings,
     MakerSettings,
     NetworkSettings,
+    TakerSettings,
     _get_user_sections,
     config_diff,
     ensure_config_file,
@@ -475,6 +476,39 @@ cj_fee_relative = 0.00001
         settings = MakerSettings(cj_fee_relative="not_a_number_e5")
         # Should be passed through as-is (pydantic doesn't enforce numeric strings on str field)
         assert settings.cj_fee_relative == "not_a_number_e5"
+
+
+class TestTakerSettingsMaxCjFeeRelNormalization:
+    """Tests for TakerSettings max_cj_fee_rel scientific notation normalization."""
+
+    def test_float_converted_to_decimal_notation(self) -> None:
+        """Float values are converted to decimal notation."""
+        settings = TakerSettings(max_cj_fee_rel=0.00001)  # type: ignore[arg-type]
+        assert settings.max_cj_fee_rel == "0.00001"
+        assert "e" not in settings.max_cj_fee_rel.lower()
+
+    def test_scientific_notation_string_normalized(self) -> None:
+        """Scientific notation strings are normalized."""
+        settings = TakerSettings(max_cj_fee_rel="1e-05")
+        assert settings.max_cj_fee_rel == "0.00001"
+
+    def test_various_small_values(self) -> None:
+        """Normalization for various small fee values."""
+        test_cases = [
+            (0.0001, "0.0001"),
+            (0.00001, "0.00001"),
+            ("1e-4", "0.0001"),
+            ("1e-5", "0.00001"),
+            ("1E-9", "0.000000001"),
+        ]
+        for input_val, expected in test_cases:
+            settings = TakerSettings(max_cj_fee_rel=input_val)  # type: ignore[arg-type]
+            assert settings.max_cj_fee_rel == expected, f"Failed for {input_val}"
+
+    def test_normal_string_unchanged(self) -> None:
+        """Normal decimal string is not modified."""
+        settings = TakerSettings(max_cj_fee_rel="0.001")
+        assert settings.max_cj_fee_rel == "0.001"
 
 
 class TestParseDirectoryServers:

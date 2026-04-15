@@ -633,6 +633,20 @@ class TakerSettings(BaseModel):
         default="0.001",
         description="Maximum relative CoinJoin fee (0.001 = 0.1%)",
     )
+
+    @field_validator("max_cj_fee_rel", mode="before")
+    @classmethod
+    def normalize_max_cj_fee_rel(cls, v: str | float | int) -> str:
+        """Normalize to avoid scientific notation (same as MakerSettings.cj_fee_relative)."""
+        if isinstance(v, (int, float)):
+            return format(Decimal(str(v)), "f")
+        if isinstance(v, str) and "e" in v.lower():
+            try:
+                return format(Decimal(v), "f")
+            except InvalidOperation:
+                pass
+        return v
+
     tx_fee_factor: float = Field(
         default=3.0,
         ge=1.0,

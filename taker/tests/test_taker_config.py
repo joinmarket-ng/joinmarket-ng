@@ -30,6 +30,17 @@ class TestMaxCjFee:
         with pytest.raises(ValidationError):
             MaxCjFee(abs_fee=-1)
 
+    def test_rel_fee_scientific_notation_normalized(self) -> None:
+        """Scientific notation in rel_fee is normalized to fixed-point."""
+        fee = MaxCjFee(rel_fee="1E-5")
+        assert fee.rel_fee == "0.00001"
+
+    def test_rel_fee_float_input_normalized(self) -> None:
+        """Float input for rel_fee is normalized to fixed-point string."""
+        fee = MaxCjFee(rel_fee=0.00001)
+        assert fee.rel_fee == "0.00001"
+        assert "e" not in fee.rel_fee.lower()
+
 
 class TestTakerConfig:
     """Tests for TakerConfig model."""
