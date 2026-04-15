@@ -79,6 +79,7 @@ Components: `jmcore` (Lib), `directory_server`, `jmwallet`, `maker`, `taker`, `o
   - Focus on high-level concepts over implementation details.
   - Don't use more than 3 levels of headings.
 - Component-specific READMEs for setup and usage.
+- For docs-only fixes (typos/wording/example paths), do not add dedicated tests unless runtime behavior changes.
 
 ## References
 

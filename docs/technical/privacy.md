@@ -2,7 +2,9 @@
 
 ### Mixdepths
 
-HD path: `m/84'/0'/0'/mixdepth/chain/index` (P2WPKH Native SegWit)
+HD path: `m/84'/coin_type'/mixdepth'/chain/index` (P2WPKH Native SegWit)
+
+`coin_type` is `0` on mainnet and `1` on testnet/signet/regtest.
 
 **Design (Default: 5 isolated accounts):**
 
@@ -19,9 +21,9 @@ This prevents merging CoinJoin outputs with their change, blocking trivial linka
 
 Example:
 ```
-mixdepth 0/external: m/84'/0'/0'/0/0/0 -> bc1q... (receive)
-mixdepth 0/internal: m/84'/0'/0'/0/1/0 -> bc1q... (change)
-mixdepth 1/external: m/84'/0'/0'/1/0/0 -> bc1q... (CJ output from mixdepth 0)
+mixdepth 0/external: m/84'/0'/0'/0/0 -> bc1q... (receive)
+mixdepth 0/internal: m/84'/0'/0'/1/0 -> bc1q... (change)
+mixdepth 1/external: m/84'/0'/1'/0/0 -> bc1q... (CJ output from mixdepth 0)
 ```
 
 ### PoDLE (Proof of Discrete Log Equivalence)

@@ -2,7 +2,9 @@
 
 ### HD Structure
 
-HD path: `m/84'/0'/0'/mixdepth/chain/index` (BIP84 P2WPKH)
+HD path: `m/84'/coin_type'/mixdepth'/chain/index` (BIP84 P2WPKH)
+
+`coin_type` is `0` on mainnet and `1` on testnet/signet/regtest.
 
 - **Mixdepths**: 5 isolated accounts (0-4)
 - **Chains**: External (0) for receiving, Internal (1) for change
