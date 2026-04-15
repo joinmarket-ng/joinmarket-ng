@@ -52,10 +52,10 @@ curl -sSL https://raw.githubusercontent.com/joinmarket-ng/joinmarket-ng/main/ins
 When you run `install.sh --update`, the installer:
 
 - Upgrades all installed Python packages to the specified (or latest) version
-- Migrates your config: appends new commented-out keys to existing sections, and appends entirely new `[sections]` from the latest template
+- Checks your config for new settings: compares `config.toml` against the latest template and prints any new sections or keys that are available
 - Refreshes shell completions and Tor configuration
 
-Existing values in your config are never modified -- only new keys and sections from the template are added (commented out). The migration is idempotent: running it multiple times has no effect once all options are present.
+Your existing config is never modified. If new settings are available, the installer prints them so you can add them manually from `config.toml.template`.
 
 ## Configure Backend
 

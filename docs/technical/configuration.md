@@ -20,20 +20,13 @@ Template/reference:
 
 The installer creates a starter config automatically from the bundled template.
 
-## Config Migration
+## Config Updates
 
-When updating via `install.sh --update`, the bundled template is compared against your existing `config.toml` and new options are merged in. The merge is additive-only and works in two phases:
+Your `config.toml` is never modified automatically after creation. When updating via `install.sh --update`, the installer compares your config against the bundled template and prints any new sections or keys that are available but not yet in your file. You can then copy them manually from `config.toml.template`.
 
-- **Key-level**: for sections that already exist in your config, any keys present in the template but absent from your file are appended (commented out) at the end of the section. Your existing values and commented-out keys are never touched.
-- **Section-level**: sections present in the template but entirely absent from your config are appended verbatim (with all keys commented out).
+If `config.toml` is missing entirely (fresh install), it is created from the template.
 
-Other properties:
-
-- The migration is idempotent: running it multiple times produces the same result
-- If `config.toml` is missing entirely, it is recreated from the template
-- Existing values, comments, and whitespace are preserved
-
-The same logic is available programmatically via `jmcore.settings.migrate_config()`.
+The comparison is available programmatically via `jmcore.settings.config_diff()`, which returns a dict of missing sections and missing keys (per section) without modifying the file.
 
 ## Section Names
 
