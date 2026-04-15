@@ -95,21 +95,13 @@ def pytest_collection_modifyitems(
 def _read_neutrino_credential(filename: str) -> str | None:
     """Read a neutrino credential file from the Docker volume.
 
-    Copies the file from the jm-neutrino container to read its contents.
+    Copies the file from the neutrino container to read its contents.
     Returns None if the container is not running or the file doesn't exist.
     """
-    try:
-        result = subprocess.run(
-            ["docker", "exec", "jm-neutrino", "cat", f"/data/neutrino/{filename}"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            return result.stdout.strip()
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        pass
-    return None
+    from tests.e2e.docker_utils import docker_exec, get_container_name
+
+    container = get_container_name("neutrino")
+    return docker_exec(container, ["cat", f"/data/neutrino/{filename}"], timeout=5)
 
 
 def _extract_neutrino_tls_cert(tmp_dir: Path) -> str | None:
@@ -117,24 +109,13 @@ def _extract_neutrino_tls_cert(tmp_dir: Path) -> str | None:
 
     Returns the path to the extracted cert or None.
     """
-    try:
-        result = subprocess.run(
-            [
-                "docker",
-                "cp",
-                "jm-neutrino:/data/neutrino/tls.cert",
-                str(tmp_dir / "tls.cert"),
-            ],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if result.returncode == 0:
-            cert_path = tmp_dir / "tls.cert"
-            if cert_path.exists():
-                return str(cert_path)
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        pass
+    from tests.e2e.docker_utils import docker_cp, get_container_name
+
+    container = get_container_name("neutrino")
+    cert_path = tmp_dir / "tls.cert"
+    if docker_cp(f"{container}:/data/neutrino/tls.cert", str(cert_path)):
+        if cert_path.exists():
+            return str(cert_path)
     return None
 
 
@@ -308,13 +289,23 @@ def is_port_open(host: str, port: int, timeout: float = 1.0) -> bool:
         sock.close()
 
 
-def is_directory_server_running(host: str = "127.0.0.1", port: int = 5222) -> bool:
+def is_directory_server_running(
+    host: str = "127.0.0.1", port: int | None = None
+) -> bool:
     """Check if directory server is running on the specified port."""
+    if port is None:
+        from tests.e2e.docker_utils import get_directory_port
+
+        port = get_directory_port()
     return is_port_open(host, port)
 
 
-def is_bitcoin_running(host: str = "127.0.0.1", port: int = 18443) -> bool:
+def is_bitcoin_running(host: str = "127.0.0.1", port: int | None = None) -> bool:
     """Check if Bitcoin RPC is accessible."""
+    if port is None:
+        from tests.e2e.docker_utils import get_bitcoin_rpc_port
+
+        port = get_bitcoin_rpc_port()
     return is_port_open(host, port)
 
 
@@ -329,7 +320,11 @@ def wait_for_neutrino_ready_if_present(timeout: float = 180.0) -> bool:
         True if neutrino is not running locally or became ready.
         False if neutrino is running but never became ready.
     """
-    if not is_port_open("127.0.0.1", 8334, timeout=0.5):
+    from tests.e2e.docker_utils import get_neutrino_port
+
+    neutrino_port = get_neutrino_port()
+
+    if not is_port_open("127.0.0.1", neutrino_port, timeout=0.5):
         return True
 
     deadline = time.time() + timeout
@@ -339,13 +334,13 @@ def wait_for_neutrino_ready_if_present(timeout: float = 180.0) -> bool:
 
     # Build URL and request based on TLS availability
     if token:
-        status_url = "https://127.0.0.1:8334/v1/status"
+        status_url = f"https://127.0.0.1:{neutrino_port}/v1/status"
         # Skip cert verification for health check
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
     else:
-        status_url = "http://127.0.0.1:8334/v1/status"
+        status_url = f"http://127.0.0.1:{neutrino_port}/v1/status"
         ctx = None
 
     while time.time() < deadline:
@@ -374,13 +369,17 @@ def docker_services_available() -> bool:
     Returns True if both Bitcoin and Directory server are accessible.
     This is a session-scoped fixture so it's only checked once.
     """
-    bitcoin_ok = is_bitcoin_running()
-    directory_ok = is_directory_server_running()
+    from tests.e2e.docker_utils import get_bitcoin_rpc_port, get_directory_port
+
+    btc_port = get_bitcoin_rpc_port()
+    dir_port = get_directory_port()
+    bitcoin_ok = is_bitcoin_running(port=btc_port)
+    directory_ok = is_directory_server_running(port=dir_port)
 
     if not bitcoin_ok:
-        logger.warning("Bitcoin Core not accessible on port 18443")
+        logger.warning(f"Bitcoin Core not accessible on port {btc_port}")
     if not directory_ok:
-        logger.warning("Directory server not accessible on port 5222")
+        logger.warning(f"Directory server not accessible on port {dir_port}")
 
     return bitcoin_ok and directory_ok
 
@@ -467,9 +466,10 @@ def fresh_docker_makers():
     - Directory server reconnection
     - Offer announcement and propagation
     """
-    import subprocess
 
     from jmcore.paths import get_used_commitments_path
+
+    from tests.e2e.docker_utils import docker_exec, get_container_name
 
     try:
         if not wait_for_neutrino_ready_if_present(timeout=180):
@@ -479,8 +479,9 @@ def fresh_docker_makers():
 
         # Stop any non-e2e profile makers that might be running
         # This prevents stale offers from interfering with tests
+        maker_container = get_container_name("maker")
         subprocess.run(
-            ["docker", "stop", "jm-maker"],
+            ["docker", "stop", maker_container],
             capture_output=True,
             text=True,
             timeout=10,
@@ -495,35 +496,29 @@ def fresh_docker_makers():
             logger.info(f"Cleared taker used commitments: {taker_commitments}")
 
         # Clear commitment blacklists for all makers before restarting
-        for maker in ["jm-maker1", "jm-maker2", "jm-maker3", "jm-maker-neutrino"]:
+        maker_services = ["maker1", "maker2", "maker3", "maker-neutrino"]
+        for service in maker_services:
+            container = get_container_name(service)
             try:
-                subprocess.run(
+                docker_exec(
+                    container,
                     [
-                        "docker",
-                        "exec",
-                        maker,
                         "sh",
                         "-c",
                         "rm -rf /home/jm/.joinmarket-ng/cmtdata/commitmentlist",
                     ],
-                    capture_output=True,
-                    text=True,
                     timeout=10,
                 )
-                logger.debug(f"Cleared commitment blacklist for {maker}")
+                logger.debug(f"Cleared commitment blacklist for {container}")
             except Exception as e:
-                logger.warning(f"Failed to clear commitment blacklist for {maker}: {e}")
+                logger.warning(
+                    f"Failed to clear commitment blacklist for {container}: {e}"
+                )
 
         # Restart the e2e profile makers (including neutrino maker for neutrino tests)
+        restart_containers = [get_container_name(s) for s in maker_services]
         result = subprocess.run(
-            [
-                "docker",
-                "restart",
-                "jm-maker1",
-                "jm-maker2",
-                "jm-maker3",
-                "jm-maker-neutrino",
-            ],
+            ["docker", "restart", *restart_containers],
             capture_output=True,
             text=True,
             timeout=60,

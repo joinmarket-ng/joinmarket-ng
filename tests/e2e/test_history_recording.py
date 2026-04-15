@@ -129,7 +129,6 @@ async def test_coinjoin_creates_history_entry(
     due to various reasons (maker funds, network issues, etc.). The test
     test_history_recording_mechanism verifies the core functionality.
     """
-    import subprocess
 
     from jmcore.models import NetworkType
     from taker.config import TakerConfig
@@ -137,17 +136,11 @@ async def test_coinjoin_creates_history_entry(
     from tests.e2e.rpc_utils import mine_blocks
 
     # Check if Docker makers are running
-    try:
-        result = subprocess.run(
-            ["docker", "inspect", "-f", "{{.State.Running}}", "jm-maker1"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if result.stdout.strip() != "true":
-            pytest.skip("Docker maker1 not running")
-    except Exception:
-        pytest.skip("Docker not available or makers not running")
+    from tests.e2e.docker_utils import docker_inspect_running, get_container_name
+
+    maker1_container = get_container_name("maker1")
+    if not docker_inspect_running(maker1_container):
+        pytest.skip("Docker maker1 not running")
 
     # Create temporary data directory
     import tempfile

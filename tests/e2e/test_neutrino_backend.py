@@ -17,6 +17,8 @@ backend works correctly with the JoinMarket wallet implementation.
 
 from __future__ import annotations
 
+import os
+
 import pytest
 import pytest_asyncio
 from jmcore.models import NetworkType
@@ -47,6 +49,21 @@ GENERIC_TEST_MNEMONIC = (
 )
 
 COINBASE_MATURITY_CONFIRMATIONS = 100
+
+
+def _bitcoin_rpc_url() -> str:
+    """Return Bitcoin Core RPC URL, honoring parallel-suite overrides."""
+    return os.environ.get("BITCOIN_RPC_URL", "http://127.0.0.1:18443")
+
+
+def _directory_port() -> int:
+    """Return directory server port, honoring parallel-suite overrides."""
+    return int(os.environ.get("DIRECTORY_PORT", "5222"))
+
+
+def _directory_server_addr() -> str:
+    """Return directory server host:port for local test clients."""
+    return f"127.0.0.1:{_directory_port()}"
 
 
 async def _wait_for_neutrino_ready(
@@ -191,7 +208,7 @@ class TestNeutrinoMaker:
         config = MakerConfig(
             mnemonic=MAKER1_MNEMONIC,
             network="regtest",
-            directory_nodes=["localhost:5222"],
+            directory_nodes=[f"localhost:{_directory_port()}"],
             offer_fee_percentage=0.001,
             min_coinjoin_amount=100000,
         )
@@ -202,7 +219,7 @@ class TestNeutrinoMaker:
         config = MakerConfig(
             mnemonic=MAKER1_MNEMONIC,
             network="regtest",
-            directory_nodes=["localhost:5222"],
+            directory_nodes=[f"localhost:{_directory_port()}"],
             offer_fee_percentage=0.001,
             min_coinjoin_amount=100000,
         )
@@ -226,7 +243,7 @@ class TestNeutrinoTaker:
         config = TakerConfig(
             mnemonic=TAKER_MNEMONIC,
             network="regtest",
-            directory_nodes=["localhost:5222"],
+            directory_nodes=[f"localhost:{_directory_port()}"],
             coinjoin_amount=1_000_000,
             num_makers=2,
         )
@@ -237,7 +254,7 @@ class TestNeutrinoTaker:
         config = TakerConfig(
             mnemonic=TAKER_MNEMONIC,
             network="regtest",
-            directory_nodes=["localhost:5222"],
+            directory_nodes=[f"localhost:{_directory_port()}"],
             coinjoin_amount=1_000_000,
             num_makers=2,
         )
@@ -329,7 +346,6 @@ class TestNeutrinoCoinJoin:
         Requires: docker compose --profile neutrino up -d
         """
         import asyncio
-        import subprocess
 
         from jmwallet.backends.bitcoin_core import BitcoinCoreBackend
 
@@ -341,28 +357,18 @@ class TestNeutrinoCoinJoin:
             pytest.skip("Need sufficient blockchain height for coinbase maturity")
 
         # Check if Docker neutrino maker is running
-        try:
-            result = subprocess.run(
-                ["docker", "inspect", "-f", "{{.State.Running}}", "jm-maker-neutrino"],
-                capture_output=True,
-                text=True,
-                timeout=5,
+        from tests.e2e.docker_utils import docker_inspect_running, get_container_name
+
+        neutrino_maker_container = get_container_name("maker-neutrino")
+        if not docker_inspect_running(neutrino_maker_container):
+            pytest.skip(
+                "Docker neutrino maker not running. Start with: "
+                "docker compose --profile neutrino up -d"
             )
-            if result.stdout.strip() != "true":
-                pytest.skip(
-                    "Docker neutrino maker not running. Start with: "
-                    "docker compose --profile neutrino up -d"
-                )
-        except (
-            subprocess.TimeoutExpired,
-            FileNotFoundError,
-            subprocess.CalledProcessError,
-        ):
-            pytest.skip("Docker not available or neutrino maker not running")
 
         # Create Bitcoin Core backend for taker
         bitcoin_backend = BitcoinCoreBackend(
-            rpc_url="http://127.0.0.1:18443",
+            rpc_url=_bitcoin_rpc_url(),
             rpc_user="test",
             rpc_password="test",
         )
@@ -419,7 +425,7 @@ class TestNeutrinoCoinJoin:
         taker_config = TakerConfig(
             mnemonic=TAKER_MNEMONIC,
             network=NetworkType.TESTNET,  # Protocol network for directory server
-            directory_servers=["127.0.0.1:5222"],
+            directory_servers=[_directory_server_addr()],
             coinjoin_amount=50_000_000,  # 0.5 BTC
             counterparty_count=1,  # Only need 1 maker for this test
             minimum_makers=1,  # Allow single maker CoinJoin
@@ -512,7 +518,7 @@ class TestNeutrinoCoinJoin:
                     try:
                         async with httpx.AsyncClient(timeout=5.0) as client:
                             response = await client.post(
-                                "http://127.0.0.1:18443",
+                                _bitcoin_rpc_url(),
                                 auth=("test", "test"),
                                 json={
                                     "jsonrpc": "1.0",
@@ -607,7 +613,6 @@ class TestNeutrinoCoinJoin:
         and jm-maker1/jm-maker2 makers)
         """
         import asyncio
-        import subprocess
 
         from tests.e2e.rpc_utils import (
             BitcoinRPCError,
@@ -622,24 +627,14 @@ class TestNeutrinoCoinJoin:
             pytest.skip("Need sufficient blockchain height for coinbase maturity")
 
         # Check if Docker makers are running (we'll use Bitcoin Core-based makers)
-        try:
-            result = subprocess.run(
-                ["docker", "inspect", "-f", "{{.State.Running}}", "jm-maker1"],
-                capture_output=True,
-                text=True,
-                timeout=5,
+        from tests.e2e.docker_utils import docker_inspect_running, get_container_name
+
+        maker1_container = get_container_name("maker1")
+        if not docker_inspect_running(maker1_container):
+            pytest.skip(
+                "Docker maker1 not running. Start with: "
+                "docker compose --profile e2e up -d"
             )
-            if result.stdout.strip() != "true":
-                pytest.skip(
-                    "Docker maker1 not running. Start with: "
-                    "docker compose --profile e2e up -d"
-                )
-        except (
-            subprocess.TimeoutExpired,
-            FileNotFoundError,
-            subprocess.CalledProcessError,
-        ):
-            pytest.skip("Docker not available or makers not running")
 
         logger.info("Docker makers are running, proceeding with neutrino taker test")
 
@@ -799,7 +794,7 @@ class TestNeutrinoCoinJoin:
         taker_config = TakerConfig(
             mnemonic=TAKER_MNEMONIC,
             network=NetworkType.TESTNET,  # Protocol network for directory server
-            directory_servers=["127.0.0.1:5222"],
+            directory_servers=[_directory_server_addr()],
             coinjoin_amount=50_000_000,  # 0.5 BTC
             counterparty_count=1,  # Only need 1 maker for this test
             minimum_makers=1,  # Allow single maker CoinJoin
@@ -865,7 +860,7 @@ class TestNeutrinoCoinJoin:
                 from jmwallet.backends.bitcoin_core import BitcoinCoreBackend
 
                 bitcoin_backend = BitcoinCoreBackend(
-                    rpc_url="http://127.0.0.1:18443",
+                    rpc_url=_bitcoin_rpc_url(),
                     rpc_user="test",
                     rpc_password="test",
                 )
@@ -909,7 +904,7 @@ class TestNeutrinoCoinJoin:
                         try:
                             async with httpx.AsyncClient(timeout=5.0) as client:
                                 response = await client.post(
-                                    "http://127.0.0.1:18443",
+                                    _bitcoin_rpc_url(),
                                     auth=("test", "test"),
                                     json={
                                         "jsonrpc": "1.0",
@@ -989,7 +984,7 @@ class TestNeutrinoCoinJoin:
                     # This confirms the CoinJoin output is at the expected address
                     async with httpx.AsyncClient(timeout=5.0) as client:
                         response = await client.post(
-                            "http://127.0.0.1:18443",
+                            _bitcoin_rpc_url(),
                             auth=("test", "test"),
                             json={
                                 "jsonrpc": "1.0",

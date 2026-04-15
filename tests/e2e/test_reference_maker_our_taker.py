@@ -59,20 +59,9 @@ def run_jam_maker_cmd(
     maker_id: int, args: list[str], timeout: int = 60
 ) -> subprocess.CompletedProcess[str]:
     """Run a command inside a jam-maker container."""
-    compose_file = get_compose_file()
-    cmd = [
-        "docker",
-        "compose",
-        "-f",
-        str(compose_file),
-        "exec",
-        "-T",
-        f"jam-maker{maker_id}",
-    ] + args
-    logger.debug(f"Running in jam-maker{maker_id}: {' '.join(args)}")
-    return subprocess.run(
-        cmd, capture_output=True, text=True, timeout=timeout, check=False
-    )
+    from tests.e2e.docker_utils import run_container_cmd
+
+    return run_container_cmd(f"jam-maker{maker_id}", args, timeout)
 
 
 def create_jam_maker_wallet(
@@ -140,24 +129,16 @@ def get_jam_maker_address(maker_id: int, wallet_name: str, password: str) -> str
     Returns:
         First new address from mixdepth 0, or None if failed
     """
-    compose_file = get_compose_file()
-    cmd = [
-        "docker",
-        "compose",
-        "-f",
-        str(compose_file),
-        "exec",
-        "-T",
-        f"jam-maker{maker_id}",
-        "bash",
-        "-c",
-        f"echo '{password}' | python3 /src/scripts/wallet-tool.py "
-        f"--datadir=/root/.joinmarket-ng --wallet-password-stdin "
-        f"/root/.joinmarket-ng/wallets/{wallet_name} display",
-    ]
-
-    result = subprocess.run(
-        cmd, capture_output=True, text=True, timeout=120, check=False
+    result = run_jam_maker_cmd(
+        maker_id,
+        [
+            "bash",
+            "-c",
+            f"echo '{password}' | python3 /src/scripts/wallet-tool.py "
+            f"--datadir=/root/.joinmarket-ng --wallet-password-stdin "
+            f"/root/.joinmarket-ng/wallets/{wallet_name} display",
+        ],
+        timeout=120,
     )
 
     if result.returncode != 0:
@@ -315,12 +296,9 @@ def clear_taker_ignored_makers() -> bool:
     Returns:
         True if successful or file didn't exist
     """
-    compose_file = get_compose_file()
-    cmd = [
-        "docker",
-        "compose",
-        "-f",
-        str(compose_file),
+    from tests.e2e.docker_utils import get_compose_cmd_prefix
+
+    cmd = get_compose_cmd_prefix() + [
         "run",
         "--rm",
         "-T",
@@ -355,22 +333,10 @@ def clear_podle_blacklist(maker_id: int) -> bool:
     Returns:
         True if successful or file didn't exist
     """
-    compose_file = get_compose_file()
-    cmd = [
-        "docker",
-        "compose",
-        "-f",
-        str(compose_file),
-        "exec",
-        "-T",
-        f"jam-maker{maker_id}",
-        "rm",
-        "-f",
-        "/root/.joinmarket-ng/cmtdata/commitmentlist",
-    ]
-
-    result = subprocess.run(
-        cmd, capture_output=True, text=True, timeout=10, check=False
+    result = run_jam_maker_cmd(
+        maker_id,
+        ["rm", "-f", "/root/.joinmarket-ng/cmtdata/commitmentlist"],
+        timeout=10,
     )
     if result.returncode == 0:
         logger.info(f"Cleared PoDLE blacklist for jam-maker{maker_id}")
@@ -393,38 +359,16 @@ def cleanup_yieldgenerator(maker_id: int, wallet_name: str) -> None:
         maker_id: The maker container ID (1 or 2)
         wallet_name: Wallet filename (used to find the lock file)
     """
-    compose_file = get_compose_file()
-
     # Kill any existing yieldgenerator processes for this wallet
-    kill_cmd = [
-        "docker",
-        "compose",
-        "-f",
-        str(compose_file),
-        "exec",
-        "-T",
-        f"jam-maker{maker_id}",
-        "bash",
-        "-c",
-        f"pkill -f 'yg-privacyenhanced.py.*{wallet_name}' || true",
-    ]
-    subprocess.run(kill_cmd, capture_output=True, timeout=10, check=False)
+    run_jam_maker_cmd(
+        maker_id,
+        ["bash", "-c", f"pkill -f 'yg-privacyenhanced.py.*{wallet_name}' || true"],
+        timeout=10,
+    )
 
     # Remove the wallet lock file if it exists
     lock_file = f"/root/.joinmarket-ng/wallets/.{wallet_name}.lock"
-    rm_cmd = [
-        "docker",
-        "compose",
-        "-f",
-        str(compose_file),
-        "exec",
-        "-T",
-        f"jam-maker{maker_id}",
-        "rm",
-        "-f",
-        lock_file,
-    ]
-    result = subprocess.run(rm_cmd, capture_output=True, timeout=10, check=False)
+    result = run_jam_maker_cmd(maker_id, ["rm", "-f", lock_file], timeout=10)
     if result.returncode == 0:
         logger.debug(f"Cleaned up lock file for jam-maker{maker_id}")
 
@@ -486,12 +430,9 @@ def start_yieldgenerator(
     # Clear previous log file
     log_file.write_text("")
 
-    compose_file = get_compose_file()
-    cmd = [
-        "docker",
-        "compose",
-        "-f",
-        str(compose_file),
+    from tests.e2e.docker_utils import get_compose_cmd_prefix
+
+    cmd = get_compose_cmd_prefix() + [
         "exec",
         "-T",
         f"jam-maker{maker_id}",
@@ -572,12 +513,15 @@ def log_all_yieldgenerator_output(tail_lines: int = 100) -> None:
 
 
 def wait_for_yieldgenerator_ready(
-    process: subprocess.Popen[bytes], timeout: int = YIELDGEN_STARTUP_TIMEOUT
+    maker_id: int,
+    process: subprocess.Popen[bytes],
+    timeout: int = YIELDGEN_STARTUP_TIMEOUT,
 ) -> bool:
     """
-    Wait for yieldgenerator to be ready by monitoring its output.
+    Wait for yieldgenerator to be ready by monitoring its log output.
 
     Args:
+        maker_id: The maker container ID (1 or 2)
         process: The yieldgenerator process
         timeout: Maximum wait time in seconds
 
@@ -586,23 +530,56 @@ def wait_for_yieldgenerator_ready(
     """
     start_time = time.time()
 
+    ready_indicators = [
+        "all message channels connected",
+        "jm daemon setup complete",
+    ]
+    fatal_indicators = [
+        "failed to connect and handshake with any directories",
+        "traceback (most recent call last)",
+    ]
+
     while time.time() - start_time < timeout:
         if process.poll() is not None:
             # Process exited
             logger.error("Yieldgenerator process exited unexpectedly")
             return False
 
-        # Check if any output indicates ready state
-        # Note: We can't easily read stdout without blocking, so we use a time-based approach
-        # The yieldgenerator typically takes 30-60 seconds to be fully ready
-        time.sleep(5)
-
-        # After minimum startup time, consider it ready
-        if time.time() - start_time > 30:
-            logger.info("Yieldgenerator startup time elapsed, assuming ready")
+        output = get_yieldgenerator_logs(maker_id).lower()
+        if any(ind in output for ind in ready_indicators):
             return True
+        if any(ind in output for ind in fatal_indicators):
+            return False
+
+        time.sleep(2)
 
     return False
+
+
+def start_yieldgenerator_with_retry(
+    maker_id: int,
+    wallet_name: str,
+    password: str,
+    max_attempts: int = 2,
+) -> subprocess.Popen[bytes] | None:
+    """Start a yieldgenerator, retrying once if it does not become ready."""
+    for attempt in range(1, max_attempts + 1):
+        process = start_yieldgenerator(maker_id, wallet_name, password)
+        if process is None:
+            continue
+
+        if wait_for_yieldgenerator_ready(maker_id, process):
+            logger.info(
+                f"Yieldgenerator for jam-maker{maker_id} is ready (attempt {attempt}/{max_attempts})"
+            )
+            return process
+
+        logger.warning(
+            f"Yieldgenerator for jam-maker{maker_id} not ready (attempt {attempt}/{max_attempts})"
+        )
+        stop_yieldgenerator(process, maker_id, wallet_name)
+
+    return None
 
 
 def stop_yieldgenerator(
@@ -692,11 +669,9 @@ def _build_taker_docker_cmd(
     mixdepth: int = 0,
 ) -> list[str]:
     """Build the ``docker compose run ... taker-reference jm-taker coinjoin`` command."""
-    return [
-        "docker",
-        "compose",
-        "-f",
-        str(compose_file),
+    from tests.e2e.docker_utils import get_compose_cmd_prefix
+
+    return get_compose_cmd_prefix() + [
         "run",
         "--rm",
         "-e",
@@ -856,8 +831,10 @@ def running_yieldgenerators(funded_jam_makers):
     started_makers = []
 
     for maker in funded_jam_makers:
-        process = start_yieldgenerator(
-            maker["maker_id"], maker["wallet_name"], maker["password"]
+        process = start_yieldgenerator_with_retry(
+            maker["maker_id"],
+            maker["wallet_name"],
+            maker["password"],
         )
         if process:
             processes.append(process)
@@ -869,10 +846,6 @@ def running_yieldgenerators(funded_jam_makers):
             pytest.skip(
                 f"Failed to start yieldgenerator for jam-maker{maker['maker_id']}"
             )
-
-    # Wait for yieldgenerators to be ready
-    logger.info("Waiting for yieldgenerators to start and announce offers...")
-    time.sleep(60)  # Give time for Tor connections and offer announcements
 
     yield funded_jam_makers
 

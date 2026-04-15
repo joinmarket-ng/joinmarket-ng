@@ -153,11 +153,11 @@ def stop_conflicting_makers() -> None:
     UTXOs from the bitcoin-jam node, which causes coinjoin failures when the
     reference taker picks it up.
     """
-    conflicting_containers = ["jm-maker-neutrino", "jm-maker"]
-    for container in conflicting_containers:
-        result = run_compose_cmd(["stop", container], check=False)
+    conflicting_services = ["maker-neutrino", "maker"]
+    for service in conflicting_services:
+        result = run_compose_cmd(["stop", service], check=False)
         if result.returncode == 0:
-            logger.info(f"Stopped conflicting maker: {container}")
+            logger.info(f"Stopped conflicting maker service: {service}")
 
 
 @pytest.mark.asyncio

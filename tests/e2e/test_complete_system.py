@@ -58,25 +58,19 @@ GENERIC_TEST_MNEMONIC = (
 MINING_ADDRESS = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"
 
 
-def _require_docker_container(name: str) -> None:
-    """Skip the test if a Docker container is not running."""
-    try:
-        result = subprocess.run(
-            ["docker", "inspect", "-f", "{{.State.Running}}", name],
-            capture_output=True,
-            text=True,
-            timeout=5,
+def _require_docker_container(service: str) -> None:
+    """Skip the test if a Docker container for *service* is not running.
+
+    Resolves the container name via ``JM_CONTAINER_PREFIX`` for parallel test
+    suite isolation support.
+    """
+    from tests.e2e.docker_utils import docker_inspect_running, get_container_name
+
+    container = get_container_name(service)
+    if not docker_inspect_running(container):
+        pytest.skip(
+            f"Docker {container} not running. Start with: docker compose --profile e2e up -d"
         )
-        if result.stdout.strip() != "true":
-            pytest.skip(
-                f"Docker {name} not running. Start with: docker compose --profile e2e up -d"
-            )
-    except (
-        subprocess.TimeoutExpired,
-        FileNotFoundError,
-        subprocess.CalledProcessError,
-    ):
-        pytest.skip("Docker not available or containers not running")
 
 
 @pytest.fixture
@@ -145,7 +139,6 @@ async def directory_server():
     testnet and regtest (matching reference JoinMarket behavior).
     """
     import socket
-    import subprocess
     import sys
     import time
     from pathlib import Path
@@ -864,8 +857,8 @@ async def test_complete_coinjoin_two_makers(
     from tests.e2e.rpc_utils import mine_blocks
 
     # Check if Docker makers are running
-    _require_docker_container("jm-maker1")
-    _require_docker_container("jm-maker2")
+    _require_docker_container("maker1")
+    _require_docker_container("maker2")
 
     # Ensure coinbase maturity: mine extra blocks for any recent coinbase outputs
     print("Mining blocks to ensure coinbase maturity...")
@@ -982,7 +975,7 @@ async def test_coinjoin_with_multi_utxo_maker(
     from tests.e2e.rpc_utils import mine_blocks
 
     # Check if Docker maker3 is running (it has many UTXOs from mining)
-    _require_docker_container("jm-maker3")
+    _require_docker_container("maker3")
 
     # Mine extra blocks to ensure coinbase maturity
     print("Mining blocks to ensure coinbase maturity...")

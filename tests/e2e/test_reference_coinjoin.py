@@ -49,20 +49,10 @@ def get_directory_onion() -> str | None:
     The onion address is dynamically generated at container startup,
     so we need to read it from the Tor data volume.
     """
-    compose_file = get_compose_file()
-    cmd = [
-        "docker",
-        "compose",
-        "-f",
-        str(compose_file),
-        "exec",
-        "-T",
-        "tor",
-        "cat",
-        "/var/lib/tor/directory/hostname",
-    ]
-    result = subprocess.run(
-        cmd, capture_output=True, text=True, timeout=10, check=False
+    from tests.e2e.docker_utils import run_container_cmd as _run_container_cmd
+
+    result = _run_container_cmd(
+        "tor", ["cat", "/var/lib/tor/directory/hostname"], timeout=10
     )
 
     if result.returncode == 0:
@@ -77,59 +67,41 @@ def get_directory_onion() -> str | None:
 
 def get_compose_file() -> Path:
     """Get path to docker-compose file."""
-    return Path(__file__).parent.parent.parent / "docker-compose.yml"
+    from tests.e2e.docker_utils import get_compose_file as _get_compose_file
+
+    return _get_compose_file()
 
 
 def run_compose_cmd(
     args: list[str], check: bool = True
 ) -> subprocess.CompletedProcess[str]:
-    """Run a docker compose command."""
-    compose_file = get_compose_file()
-    cmd = [
-        "docker",
-        "compose",
-        "-f",
-        str(compose_file),
-    ] + args
-    logger.debug(f"Running: {' '.join(cmd)}")
-    return subprocess.run(cmd, capture_output=True, text=True, check=check)
+    """Run a docker compose command with project isolation support."""
+    from tests.e2e.docker_utils import run_compose_cmd as _run_compose_cmd
+
+    return _run_compose_cmd(args, check=check)
 
 
 def run_jam_cmd(args: list[str], timeout: int = 60) -> subprocess.CompletedProcess[str]:
     """Run a command inside the jam container."""
-    compose_file = get_compose_file()
-    cmd = [
-        "docker",
-        "compose",
-        "-f",
-        str(compose_file),
-        "exec",
-        "-T",
-        "jam",
-    ] + args
-    logger.debug(f"Running in jam: {' '.join(args)}")
-    return subprocess.run(
-        cmd, capture_output=True, text=True, timeout=timeout, check=False
-    )
+    from tests.e2e.docker_utils import run_container_cmd as _run_container_cmd
+
+    return _run_container_cmd("jam", args, timeout)
 
 
 def run_bitcoin_cmd(args: list[str]) -> subprocess.CompletedProcess[str]:
     """Run a bitcoin-cli command."""
-    compose_file = get_compose_file()
-    cmd = [
-        "docker",
-        "compose",
-        "-f",
-        str(compose_file),
-        "exec",
-        "-T",
+    from tests.e2e.docker_utils import run_container_cmd as _run_container_cmd
+
+    return _run_container_cmd(
         "bitcoin",
-        "bitcoin-cli",
-        "-regtest",
-        "-rpcuser=test",
-        "-rpcpassword=test",
-    ] + args
-    return subprocess.run(cmd, capture_output=True, text=True, check=False)
+        [
+            "bitcoin-cli",
+            "-regtest",
+            "-rpcuser=test",
+            "-rpcpassword=test",
+        ]
+        + args,
+    )
 
 
 async def rpc_call(method: str, params: list[Any] | None = None) -> Any:
@@ -258,28 +230,19 @@ def get_jam_wallet_address(
     # Clean up any stale lock file from previous runs
     cleanup_wallet_lock(wallet_name)
 
-    compose_file = get_compose_file()
+    from tests.e2e.docker_utils import run_container_cmd as _run_container_cmd
 
-    # Use bash to echo password and pipe it to wallet-tool.py
-    cmd = [
-        "docker",
-        "compose",
-        "-f",
-        str(compose_file),
-        "exec",
-        "-T",
+    result = _run_container_cmd(
         "jam",
-        "bash",
-        "-c",
-        f"echo '{password}' | python3 /src/scripts/wallet-tool.py "
-        f"--datadir=/root/.joinmarket-ng "
-        f"--wallet-password-stdin "
-        f"/root/.joinmarket-ng/wallets/{wallet_name} display",
-    ]
-
-    logger.debug(f"Getting address with command: {' '.join(cmd)}")
-    result = subprocess.run(
-        cmd, capture_output=True, text=True, timeout=60, check=False
+        [
+            "bash",
+            "-c",
+            f"echo '{password}' | python3 /src/scripts/wallet-tool.py "
+            f"--datadir=/root/.joinmarket-ng "
+            f"--wallet-password-stdin "
+            f"/root/.joinmarket-ng/wallets/{wallet_name} display",
+        ],
+        timeout=60,
     )
 
     if result.returncode != 0:
@@ -313,22 +276,19 @@ def get_jam_wallet_address(
 
 def run_bitcoin_jam_cmd(args: list[str]) -> subprocess.CompletedProcess[str]:
     """Run a bitcoin-cli command against the bitcoin-jam node."""
-    compose_file = get_compose_file()
-    cmd = [
-        "docker",
-        "compose",
-        "-f",
-        str(compose_file),
-        "exec",
-        "-T",
+    from tests.e2e.docker_utils import run_container_cmd as _run_container_cmd
+
+    return _run_container_cmd(
         "bitcoin-jam",
-        "bitcoin-cli",
-        "-regtest",
-        "-rpcuser=test",
-        "-rpcpassword=test",
-        "-rpcport=18445",
-    ] + args
-    return subprocess.run(cmd, capture_output=True, text=True, check=False)
+        [
+            "bitcoin-cli",
+            "-regtest",
+            "-rpcuser=test",
+            "-rpcpassword=test",
+            "-rpcport=18445",
+        ]
+        + args,
+    )
 
 
 def fund_wallet_address(address: str, amount_btc: float = 1.0) -> bool:
@@ -639,11 +599,11 @@ def stop_conflicting_makers() -> None:
     UTXOs from the bitcoin-jam node, which causes coinjoin failures when the
     reference taker picks it up.
     """
-    conflicting_containers = ["jm-maker-neutrino", "jm-maker"]
-    for container in conflicting_containers:
-        result = run_compose_cmd(["stop", container], check=False)
+    conflicting_services = ["maker-neutrino", "maker"]
+    for service in conflicting_services:
+        result = run_compose_cmd(["stop", service], check=False)
         if result.returncode == 0:
-            logger.info(f"Stopped conflicting maker: {container}")
+            logger.info(f"Stopped conflicting maker service: {service}")
 
 
 @pytest.mark.asyncio
@@ -692,12 +652,9 @@ async def test_execute_reference_coinjoin(funded_jam_wallet):
     cleanup_wallet_lock(wallet_name)
 
     # Run sendpayment.py
-    compose_file = get_compose_file()
-    cmd = [
-        "docker",
-        "compose",
-        "-f",
-        str(compose_file),
+    from tests.e2e.docker_utils import get_compose_cmd_prefix
+
+    cmd = get_compose_cmd_prefix() + [
         "exec",
         "-T",
         "jam",

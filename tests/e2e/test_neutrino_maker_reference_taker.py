@@ -120,7 +120,9 @@ def ensure_neutrino_maker_running() -> bool:
 
 def set_maker_service_running(service: str, should_run: bool) -> None:
     """Start or stop a maker container and assert the state transition."""
-    container = f"jm-{service}"
+    from tests.e2e.docker_utils import docker_inspect_running, get_container_name
+
+    container = get_container_name(service)
     action = "start" if should_run else "stop"
     result = subprocess.run(
         ["docker", action, container],
@@ -132,14 +134,7 @@ def set_maker_service_running(service: str, should_run: bool) -> None:
     if result.returncode != 0:
         pytest.fail(f"Failed to {action} {container}: {result.stderr}")
 
-    state = subprocess.run(
-        ["docker", "inspect", "-f", "{{.State.Running}}", container],
-        capture_output=True,
-        text=True,
-        timeout=10,
-        check=False,
-    )
-    is_running = state.returncode == 0 and state.stdout.strip() == "true"
+    is_running = docker_inspect_running(container)
     if is_running != should_run:
         expected = "running" if should_run else "stopped"
         pytest.fail(f"Service {container} is not {expected} after {action}")
@@ -147,28 +142,26 @@ def set_maker_service_running(service: str, should_run: bool) -> None:
 
 def wait_for_neutrino_backend_ready(timeout: int = 180) -> bool:
     """Wait until the neutrino API reports a positive block height."""
+    from tests.e2e.docker_utils import (
+        docker_exec,
+        get_container_name,
+        get_neutrino_port,
+    )
+
+    neutrino_port = get_neutrino_port()
+    container = get_container_name("neutrino")
+
     # Try authenticated HTTPS first (default), fall back to HTTP.
     token: str | None = None
-    try:
-        result = subprocess.run(
-            ["docker", "exec", "jm-neutrino", "cat", "/data/neutrino/auth_token"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            token = result.stdout.strip()
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        pass
+    token = docker_exec(container, ["cat", "/data/neutrino/auth_token"], timeout=5)
 
     if token:
-        status_url = "https://127.0.0.1:8334/v1/status"
+        status_url = f"https://127.0.0.1:{neutrino_port}/v1/status"
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
     else:
-        status_url = "http://127.0.0.1:8334/v1/status"
+        status_url = f"http://127.0.0.1:{neutrino_port}/v1/status"
         ctx = None
 
     deadline = time.time() + timeout

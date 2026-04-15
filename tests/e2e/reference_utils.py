@@ -1,61 +1,28 @@
 """
 Shared utilities for reference implementation tests (JAM).
+
+Delegates compose and container operations to ``docker_utils`` for
+parallel-test-suite isolation support.
 """
 
 from __future__ import annotations
 
 import subprocess
 import time
-from pathlib import Path
 
 from loguru import logger
+
+from tests.e2e.docker_utils import (
+    get_compose_file,  # noqa: F401 – re-exported for existing callers
+    run_compose_cmd,  # noqa: F401 – re-exported for existing callers
+    run_container_cmd,  # noqa: F401 – re-exported for existing callers
+)
 
 
 def is_service_running(service: str) -> bool:
     """Check if a Docker service is running."""
     result = run_compose_cmd(["ps", "-q", service])
     return bool(result.stdout.strip())
-
-
-def get_compose_file() -> Path:
-    """Get path to docker-compose file."""
-    # Assuming this file is in tests/e2e/
-    return Path(__file__).parent.parent.parent / "docker-compose.yml"
-
-
-def run_compose_cmd(
-    args: list[str], check: bool = True
-) -> subprocess.CompletedProcess[str]:
-    """Run a docker compose command."""
-    compose_file = get_compose_file()
-    cmd = [
-        "docker",
-        "compose",
-        "-f",
-        str(compose_file),
-    ] + args
-    logger.debug(f"Running: {' '.join(cmd)}")
-    return subprocess.run(cmd, capture_output=True, text=True, check=check)
-
-
-def run_container_cmd(
-    container: str, args: list[str], timeout: int = 60
-) -> subprocess.CompletedProcess[str]:
-    """Run a command inside a specific container."""
-    compose_file = get_compose_file()
-    cmd = [
-        "docker",
-        "compose",
-        "-f",
-        str(compose_file),
-        "exec",
-        "-T",
-        container,
-    ] + args
-    logger.debug(f"Running in {container}: {' '.join(args)}")
-    return subprocess.run(
-        cmd, capture_output=True, text=True, timeout=timeout, check=False
-    )
 
 
 def run_jam_cmd(args: list[str], timeout: int = 60) -> subprocess.CompletedProcess[str]:

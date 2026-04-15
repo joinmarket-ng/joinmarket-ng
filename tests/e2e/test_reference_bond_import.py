@@ -24,6 +24,8 @@ from typing import Any
 import pytest
 from loguru import logger
 
+from tests.e2e.docker_utils import get_compose_cmd_prefix
+
 # Mark all tests in this module as requiring Docker reference profile
 pytestmark = pytest.mark.reference
 
@@ -59,20 +61,16 @@ WALLET_SYNC_TIMEOUT = 60  # seconds
 
 def get_compose_file() -> Path:
     """Get path to docker-compose file."""
-    return Path(__file__).parent.parent.parent / "docker-compose.yml"
+    from tests.e2e.docker_utils import get_compose_file as _get_compose_file
+
+    return _get_compose_file()
 
 
 def run_compose_cmd(
     args: list[str], check: bool = True, timeout: int = 30
 ) -> subprocess.CompletedProcess[str]:
     """Run a docker compose command."""
-    compose_file = get_compose_file()
-    cmd = [
-        "docker",
-        "compose",
-        "-f",
-        str(compose_file),
-    ] + args
+    cmd = get_compose_cmd_prefix() + args
     logger.debug(f"Running: {' '.join(cmd)}")
     return subprocess.run(
         cmd, capture_output=True, text=True, check=check, timeout=timeout
@@ -83,16 +81,7 @@ def run_jam_cmd(
     args: list[str], timeout: int = 60, input_text: str | None = None
 ) -> subprocess.CompletedProcess[str]:
     """Run a command inside the jam container."""
-    compose_file = get_compose_file()
-    cmd = [
-        "docker",
-        "compose",
-        "-f",
-        str(compose_file),
-        "exec",
-        "-T",
-        "jam",
-    ] + args
+    cmd = get_compose_cmd_prefix() + ["exec", "-T", "jam"] + args
     logger.debug(f"Running in jam: {' '.join(args)}")
     return subprocess.run(
         cmd,
@@ -106,20 +95,19 @@ def run_jam_cmd(
 
 def run_bitcoin_cmd(args: list[str]) -> subprocess.CompletedProcess[str]:
     """Run a bitcoin-cli command."""
-    compose_file = get_compose_file()
-    cmd = [
-        "docker",
-        "compose",
-        "-f",
-        str(compose_file),
-        "exec",
-        "-T",
-        "bitcoin",
-        "bitcoin-cli",
-        "-regtest",
-        "-rpcuser=test",
-        "-rpcpassword=test",
-    ] + args
+    cmd = (
+        get_compose_cmd_prefix()
+        + [
+            "exec",
+            "-T",
+            "bitcoin",
+            "bitcoin-cli",
+            "-regtest",
+            "-rpcuser=test",
+            "-rpcpassword=test",
+        ]
+        + args
+    )
     return subprocess.run(cmd, capture_output=True, text=True, check=False)
 
 
@@ -158,12 +146,7 @@ def copy_expect_script_to_jam() -> bool:
         return False
 
     # Copy script to container
-    compose_file = get_compose_file()
-    cmd = [
-        "docker",
-        "compose",
-        "-f",
-        str(compose_file),
+    cmd = get_compose_cmd_prefix() + [
         "cp",
         str(script_path),
         "jam:/scripts/recover_wallet_with_passphrase.exp",
@@ -246,26 +229,17 @@ def get_jam_wallet_address(
 ) -> str | None:
     """Get a receive address from jam wallet."""
     cleanup_wallet_lock(wallet_name)
-
-    compose_file = get_compose_file()
-    cmd = [
-        "docker",
-        "compose",
-        "-f",
-        str(compose_file),
-        "exec",
-        "-T",
-        "jam",
-        "bash",
-        "-c",
-        f"echo '{password}' | python3 /src/scripts/wallet-tool.py "
-        f"--datadir=/root/.joinmarket-ng "
-        f"--wallet-password-stdin "
-        f"/root/.joinmarket-ng/wallets/{wallet_name} display",
-    ]
-
-    result = subprocess.run(
-        cmd, capture_output=True, text=True, timeout=60, check=False
+    result = run_jam_cmd(
+        [
+            "python3",
+            "/src/scripts/wallet-tool.py",
+            "--datadir=/root/.joinmarket-ng",
+            "--wallet-password-stdin",
+            f"/root/.joinmarket-ng/wallets/{wallet_name}",
+            "display",
+        ],
+        timeout=60,
+        input_text=f"{password}\n",
     )
 
     if result.returncode != 0:
@@ -312,25 +286,18 @@ def get_jam_fidelity_bond_address(
     """
     cleanup_wallet_lock(wallet_name)
 
-    compose_file = get_compose_file()
-    cmd = [
-        "docker",
-        "compose",
-        "-f",
-        str(compose_file),
-        "exec",
-        "-T",
-        "jam",
-        "bash",
-        "-c",
-        f"echo '{password}' | python3 /src/scripts/wallet-tool.py "
-        f"--datadir=/root/.joinmarket-ng "
-        f"--wallet-password-stdin "
-        f"/root/.joinmarket-ng/wallets/{wallet_name} gettimelockaddress {locktime_date}",
-    ]
-
-    result = subprocess.run(
-        cmd, capture_output=True, text=True, timeout=60, check=False
+    result = run_jam_cmd(
+        [
+            "python3",
+            "/src/scripts/wallet-tool.py",
+            "--datadir=/root/.joinmarket-ng",
+            "--wallet-password-stdin",
+            f"/root/.joinmarket-ng/wallets/{wallet_name}",
+            "gettimelockaddress",
+            locktime_date,
+        ],
+        timeout=60,
+        input_text=f"{password}\n",
     )
 
     if result.returncode != 0:
@@ -365,25 +332,17 @@ def get_jam_wallet_balance(wallet_name: str, password: str) -> dict[int, int]:
     """
     cleanup_wallet_lock(wallet_name)
 
-    compose_file = get_compose_file()
-    cmd = [
-        "docker",
-        "compose",
-        "-f",
-        str(compose_file),
-        "exec",
-        "-T",
-        "jam",
-        "bash",
-        "-c",
-        f"echo '{password}' | python3 /src/scripts/wallet-tool.py "
-        f"--datadir=/root/.joinmarket-ng "
-        f"--wallet-password-stdin "
-        f"/root/.joinmarket-ng/wallets/{wallet_name} display",
-    ]
-
-    result = subprocess.run(
-        cmd, capture_output=True, text=True, timeout=60, check=False
+    result = run_jam_cmd(
+        [
+            "python3",
+            "/src/scripts/wallet-tool.py",
+            "--datadir=/root/.joinmarket-ng",
+            "--wallet-password-stdin",
+            f"/root/.joinmarket-ng/wallets/{wallet_name}",
+            "display",
+        ],
+        timeout=60,
+        input_text=f"{password}\n",
     )
 
     if result.returncode != 0:
