@@ -833,6 +833,30 @@ class TestCalculateRelativeFee:
         with pytest.raises(ValueError, match="Fee rate must be decimal string or integer"):
             calculate_relative_fee(100_000, "abc")
 
+    def test_scientific_notation_fee_rate(self) -> None:
+        """Scientific notation like '1E-9' should be normalized and handled correctly."""
+        # 1E-9 * 100_000_000 = 0.1, rounded to 0 with banker's rounding
+        assert calculate_relative_fee(100_000_000, "1E-9") == 0
+
+    def test_scientific_notation_larger_value(self) -> None:
+        """Scientific notation '1E-5' = 0.00001 should work correctly."""
+        # 1E-5 * 100_000_000 = 1000
+        assert calculate_relative_fee(100_000_000, "1E-5") == 1000
+
+    def test_scientific_notation_with_coefficient(self) -> None:
+        """Scientific notation '5E-7' should work correctly."""
+        # 5E-7 * 100_000_000 = 50
+        assert calculate_relative_fee(100_000_000, "5E-7") == 50
+
+    def test_scientific_notation_lowercase(self) -> None:
+        """Lowercase 'e' in scientific notation should also work."""
+        assert calculate_relative_fee(100_000_000, "1e-5") == 1000
+
+    def test_invalid_scientific_notation_raises(self) -> None:
+        """Invalid scientific notation should raise ValueError."""
+        with pytest.raises(ValueError, match="Fee rate must be decimal string or integer"):
+            calculate_relative_fee(100_000, "1E-abc")
+
 
 class TestCalculateSweepAmount:
     """Tests for calculate_sweep_amount."""
@@ -856,6 +880,20 @@ class TestCalculateSweepAmount:
         result = calculate_sweep_amount(1_000_000, ["0.001", "0.002"])
         # available / (1 + 0.001 + 0.002) = 1000000 / 1.003 = 997008 (floor)
         assert result == 997008
+
+    def test_scientific_notation_fee_rates(self) -> None:
+        """Scientific notation fee rates should be normalized before processing."""
+        # "1E-5" == "0.00001", so result should match
+        result_sci = calculate_sweep_amount(1_000_000, ["1E-5"])
+        result_dec = calculate_sweep_amount(1_000_000, ["0.00001"])
+        assert result_sci == result_dec
+
+    def test_mixed_scientific_and_decimal(self) -> None:
+        """Mix of scientific notation and decimal fee rates."""
+        result = calculate_sweep_amount(1_000_000, ["1E-5", "0.001"])
+        # Same as ["0.00001", "0.001"]
+        expected = calculate_sweep_amount(1_000_000, ["0.00001", "0.001"])
+        assert result == expected
 
 
 # =============================================================================

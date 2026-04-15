@@ -269,7 +269,13 @@ class Offer(BaseModel):
         ordertype = info.data.get("ordertype")
         if ordertype in (OfferType.SW0_ABSOLUTE, OfferType.SWA_ABSOLUTE):
             return int(v)
-        return str(v)
+        # Normalize scientific notation to fixed-point decimal (e.g., "1E-9" -> "0.000000001")
+        s = str(v)
+        if "e" in s.lower():
+            from decimal import Decimal
+
+            s = format(Decimal(s), "f")
+        return s
 
     def is_absolute_fee(self) -> bool:
         return is_absolute_offer_type(self.ordertype)

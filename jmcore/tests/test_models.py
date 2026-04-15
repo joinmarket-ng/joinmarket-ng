@@ -306,6 +306,77 @@ class TestOffer:
         )
         assert not offer.is_absolute_fee()
 
+    def test_cjfee_scientific_notation_normalized(self):
+        """Relative offer cjfee in scientific notation is normalized to fixed-point."""
+        offer = Offer(
+            counterparty="J5TestMaker",
+            oid=0,
+            ordertype=OfferType.SW0_RELATIVE,
+            minsize=100_000,
+            maxsize=10_000_000,
+            txfee=0,
+            cjfee="1E-9",
+        )
+        assert offer.cjfee == "0.000000001"
+        assert "E" not in str(offer.cjfee)
+        assert "e" not in str(offer.cjfee)
+
+    def test_cjfee_scientific_notation_fee_calculation(self):
+        """Offer with scientific notation cjfee can calculate fees without error."""
+        offer = Offer(
+            counterparty="J5TestMaker",
+            oid=0,
+            ordertype=OfferType.SW0_RELATIVE,
+            minsize=100_000,
+            maxsize=10_000_000,
+            txfee=0,
+            cjfee="5E-7",
+        )
+        # 5E-7 * 100_000_000 = 50
+        assert offer.calculate_fee(100_000_000) == 50
+
+    def test_cjfee_lowercase_scientific_notation(self):
+        """Lowercase 'e' in scientific notation is also normalized."""
+        offer = Offer(
+            counterparty="J5TestMaker",
+            oid=0,
+            ordertype=OfferType.SW0_RELATIVE,
+            minsize=100_000,
+            maxsize=10_000_000,
+            txfee=0,
+            cjfee="1e-5",
+        )
+        assert offer.cjfee == "0.00001"
+
+    def test_cjfee_very_small_value_regression(self):
+        """Regression: very small cjfee parsed via Decimal must not crash fee calculation.
+
+        Reproduces the exact issue where str(Decimal("0.000000001")) produces "1E-9",
+        which then fails in calculate_relative_fee with:
+        "Fee rate must be decimal string or integer, got 1E-9"
+        """
+        from decimal import Decimal
+
+        # Simulate what directory_client does when parsing a relative offer
+        raw_cjfee = "0.000000001"
+        parsed_via_decimal = str(Decimal(raw_cjfee))  # produces "1E-9"
+        assert parsed_via_decimal == "1E-9"  # confirm the problematic behavior
+
+        # Creating an Offer with this value should normalize it
+        offer = Offer(
+            counterparty="J5TestMaker",
+            oid=0,
+            ordertype=OfferType.SW0_RELATIVE,
+            minsize=100_000,
+            maxsize=10_000_000,
+            txfee=0,
+            cjfee=parsed_via_decimal,
+        )
+        assert "E" not in str(offer.cjfee)
+        # Fee calculation should succeed without ValueError
+        fee = offer.calculate_fee(100_000_000)
+        assert isinstance(fee, int)
+
 
 # ==============================================================================
 # OrderBook Tests

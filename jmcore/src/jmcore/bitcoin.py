@@ -152,9 +152,17 @@ def calculate_relative_fee(amount_sats: int, fee_rate: str) -> int:
         >>> calculate_relative_fee(9994243, "0.000022")
         220  # matches reference implementation's Decimal rounding
     """
-    from decimal import Decimal
+    from decimal import Decimal, InvalidOperation
 
     validate_satoshi_amount(amount_sats)
+
+    # Normalize scientific notation (e.g., "1E-9" -> "0.000000001")
+    # This can happen when str(Decimal(...)) is used on very small values.
+    if "e" in fee_rate.lower():
+        try:
+            fee_rate = format(Decimal(fee_rate), "f")
+        except InvalidOperation as e:
+            raise ValueError(f"Fee rate must be decimal string or integer, got {fee_rate}") from e
 
     # Handle integer strings like "0" or "1"
     if "." not in fee_rate:
@@ -193,6 +201,16 @@ def calculate_sweep_amount(available_sats: int, relative_fees: list[str]) -> int
 
     if not relative_fees:
         return available_sats
+
+    # Normalize scientific notation in fee strings (e.g., "1E-9" -> "0.000000001")
+    from decimal import Decimal
+
+    normalized_fees = []
+    for fee in relative_fees:
+        if "e" in fee.lower():
+            fee = format(Decimal(fee), "f")
+        normalized_fees.append(fee)
+    relative_fees = normalized_fees
 
     # Parse all fee rates as fractions with common denominator
     # Example: ["0.001", "0.0015"] -> numerators=[1, 15], denominator=10000

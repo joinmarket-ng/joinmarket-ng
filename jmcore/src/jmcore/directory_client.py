@@ -1310,7 +1310,10 @@ class DirectoryClient:
                 if offer_type in ["sw0absoffer", "swabsoffer"]:
                     cjfee = str(int(cjfee_str))
                 else:
-                    cjfee = str(Decimal(cjfee_str))
+                    # Use fixed-point format to avoid scientific notation
+                    # (e.g., Decimal("0.000000001") -> "1E-9" with str(),
+                    # but "0.000000001" with format(..., "f"))
+                    cjfee = format(Decimal(cjfee_str), "f")
 
                 offer = Offer(
                     counterparty=from_nick,
