@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.0] - 2026-04-17
+
+### Added
+
+- Neutrino takers now fail fast when not enough compatible makers exist in the orderbook ([a5b8e34f](../../commit/a5b8e34f513fc4b3f73681a25f13f9d78e436c17))
+- Add automatic config.toml new settings diff during updates ([f8a5e65d](../../commit/f8a5e65d67058972f906045ce3fc59e7b97f9581), [ff6cf963](../../commit/ff6cf963f0c0d8f5ad7587cb9640014328552ff7))
+
+### Fixed
+
+- Installer script now checks for cmake and ca-certificates as ([64748a0a](../../commit/64748a0a817b2edc6b36ba604d5e566bc802d196))
+- Prevent installer updates from using Neutrino TLS cert as the global CA trust store ([05258a02](../../commit/05258a025774e3645162eaa09bc33d6cb23c526e))
+- Reassign PING message type from 797 to 798 per JMP-0004 ([a6753278](../../commit/a675327891442ae7bd83fbef4a3b73a584174e0f))
+- Make Flatpak neutrino startup honor prefetch settings from config.toml for faster bond verification lookups ([1928c1fc](../../commit/1928c1fcbafe3266da4d3b1c35995700f16d3d27))
+- Fix CoinJoin failure with very small maker fee rates causing "Fee rate must be decimal string or integer" error ([0f834535](../../commit/0f834535b57bb6b302d2c321d3fa27a769c531c4))
+- Normalize scientific notation in taker max CoinJoin fee settings ([9264a4fa](../../commit/9264a4fa9b4d3dac7844765144fd3c28dc6f44f9))
+- Abort CoinJoin if destination or change addresses cannot be successfully persisted to history ([479aab62](../../commit/479aab62f4ae1d6a723c49b5e27b9ac97d2972d7))
+- Fix fidelity bond recovery by deriving bond addresses from timenumber locktime paths and add manual import support. ([2c0a9b63](../../commit/2c0a9b63a49957e3dcecd215b113cb513122128c))
+
 ## [0.26.1] - 2026-04-12
 
 ## [0.26.0] - 2026-04-11
@@ -1191,7 +1209,8 @@ Releases prior to these changes (including 0.13.5, 0.13.6, and 0.13.7) cannot be
 - Pre-built image support for directory server compose.
 - Tor configuration instructions.
 
-[Unreleased]: ../../compare/0.26.1...HEAD
+[Unreleased]: ../../compare/0.27.0...HEAD
+[0.27.0]: ../../compare/0.26.1...0.27.0
 [0.26.1]: ../../compare/0.26.0...0.26.1
 [0.26.0]: ../../compare/0.25.0...0.26.0
 [0.25.0]: ../../compare/0.24.0...0.25.0
