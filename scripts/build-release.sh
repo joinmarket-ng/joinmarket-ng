@@ -59,13 +59,35 @@ Arguments:
                   If omitted, reads from jmcore/src/jmcore/version.py
 
 Options:
+  --jobs, -j <n>  Maximum parallel image builds
+                  Default: number of CPU cores on this machine
   --help          Show this help message
 
 Examples:
   $(basename "$0")                    # Use version from version.py
+  $(basename "$0") --jobs 4           # Build with 4 parallel jobs
   $(basename "$0") 1.0.0             # Explicit version
 EOF
     exit 1
+}
+
+detect_cpu_cores() {
+    if command -v nproc &> /dev/null; then
+        nproc
+        return 0
+    fi
+
+    if command -v getconf &> /dev/null; then
+        getconf _NPROCESSORS_ONLN
+        return 0
+    fi
+
+    if command -v sysctl &> /dev/null; then
+        sysctl -n hw.ncpu
+        return 0
+    fi
+
+    echo "1"
 }
 
 # Detect current architecture in Docker format
@@ -112,20 +134,37 @@ setup_buildx_builder() {
 
 # Parse arguments
 VERSION=""
+BUILD_JOBS=""
 
 while [[ $# -gt 0 ]]; do
-    case $1 in
+    case "$1" in
         --help|-h)
+            usage
+            ;;
+        --jobs|-j)
+            if [[ $# -lt 2 ]]; then
+                log_error "Missing value for $1"
+                usage
+            fi
+            BUILD_JOBS="$2"
+            shift 2
+            ;;
+        --jobs=*|-j=*)
+            BUILD_JOBS="${1#*=}"
+            shift
+            ;;
+        -* )
+            log_error "Unknown option: $1"
             usage
             ;;
         *)
             if [[ -z "$VERSION" ]]; then
                 VERSION="$1"
+                shift
             else
                 log_error "Unknown argument: $1"
                 usage
             fi
-            shift
             ;;
     esac
 done
@@ -138,6 +177,15 @@ if [[ -z "$VERSION" ]]; then
         exit 1
     fi
     log_info "Auto-detected version: $VERSION"
+fi
+
+if [[ -z "$BUILD_JOBS" ]]; then
+    BUILD_JOBS=$(detect_cpu_cores)
+fi
+
+if ! [[ "$BUILD_JOBS" =~ ^[0-9]+$ ]] || [[ "$BUILD_JOBS" -lt 1 ]]; then
+    log_error "Invalid value for --jobs: $BUILD_JOBS (must be an integer >= 1)"
+    exit 1
 fi
 
 # Check prerequisites
@@ -178,6 +226,7 @@ log_info "Building JoinMarket NG release $VERSION"
 log_info "Commit: $COMMIT_SHA"
 log_info "SOURCE_DATE_EPOCH: $SOURCE_DATE_EPOCH"
 log_info "Platform: $PLATFORM ($CURRENT_ARCH)"
+log_info "Parallel jobs: $BUILD_JOBS"
 echo ""
 
 # Create temp directory for build artifacts
@@ -196,51 +245,121 @@ mkdir -p "$OCI_DIR" "$DIGEST_DIR"
 
 BUILD_ERRORS=0
 
+build_image() {
+    local image="$1"
+    local dockerfile="$2"
+    local target="$3"
+
+    local oci_tar="$OCI_DIR/${image}.tar"
+    local oci_extract="$OCI_DIR/${image}"
+    local manifest_digest
+    local manifest_file
+    local -a build_cmd
+
+    mkdir -p "$oci_extract"
+
+    # Build command with optional --target
+    build_cmd=(docker buildx build
+        --file "$dockerfile"
+        --build-arg SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH"
+        --build-arg VERSION="$VERSION"
+        --platform "$PLATFORM"
+        --output "type=oci,dest=${oci_tar},rewrite-timestamp=true"
+        --no-cache)
+    if [[ -n "$target" ]]; then
+        build_cmd+=(--target "$target")
+    fi
+
+    if ! SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" "${build_cmd[@]}" \
+        "$PROJECT_ROOT" > "$WORK_DIR/${image}-build.log" 2>&1; then
+        return 1
+    fi
+
+    # Extract OCI tar and get layer digests
+    tar -xf "$oci_tar" -C "$oci_extract"
+
+    # Get the manifest digest from OCI index.json
+    manifest_digest=$(jq -r '.manifests[0].digest' "$oci_extract/index.json")
+    manifest_file="$oci_extract/blobs/sha256/${manifest_digest#sha256:}"
+
+    # Extract layer digests from the manifest
+    jq -r '.layers[].digest' "$manifest_file" | sort > "$DIGEST_DIR/${image}-${CURRENT_ARCH}-layers.txt"
+
+    # Clean up OCI files to save disk space
+    rm -rf "$oci_tar" "$oci_extract"
+}
+
+declare -a BUILD_PIDS=()
+declare -A PID_TO_IMAGE=()
+
+remove_pid_from_queue() {
+    local completed_pid="$1"
+    local -a remaining_pids=()
+    local queued_pid
+
+    for queued_pid in "${BUILD_PIDS[@]}"; do
+        if [[ "$queued_pid" != "$completed_pid" ]]; then
+            remaining_pids+=("$queued_pid")
+        fi
+    done
+
+    BUILD_PIDS=("${remaining_pids[@]}")
+}
+
+collect_build_result() {
+    local pid="$1"
+    local status="$2"
+    local image="${PID_TO_IMAGE[$pid]}"
+
+    if [[ "$status" -eq 0 ]]; then
+        layer_count=$(wc -l < "$DIGEST_DIR/${image}-${CURRENT_ARCH}-layers.txt")
+        log_info "  $image built successfully ($layer_count layers)"
+    else
+        log_error "  Build failed for $image (log: $WORK_DIR/${image}-build.log)"
+        BUILD_ERRORS=$((BUILD_ERRORS + 1))
+    fi
+
+    unset 'PID_TO_IMAGE[$pid]'
+    remove_pid_from_queue "$pid"
+}
+
+wait_for_next_build() {
+    local completed_pid=""
+    local wait_status=0
+
+    if wait -n -p completed_pid "${BUILD_PIDS[@]}"; then
+        wait_status=0
+    else
+        wait_status=$?
+    fi
+
+    if [[ -z "$completed_pid" ]]; then
+        log_error "Failed to determine which build process completed."
+        BUILD_ERRORS=$((BUILD_ERRORS + 1))
+        return
+    fi
+
+    collect_build_result "$completed_pid" "$wait_status"
+}
+
 for i in "${!IMAGES[@]}"; do
     image="${IMAGES[$i]}"
     dockerfile="${DOCKERFILES[$i]}"
     target="${TARGETS[$i]}"
 
-    log_info "Building $image for $PLATFORM..."
+    log_info "Building $image for $PLATFORM in parallel..."
+    build_image "$image" "$dockerfile" "$target" &
+    pid=$!
+    BUILD_PIDS+=("$pid")
+    PID_TO_IMAGE["$pid"]="$image"
 
-    OCI_TAR="$OCI_DIR/${image}.tar"
-    OCI_EXTRACT="$OCI_DIR/${image}"
-    mkdir -p "$OCI_EXTRACT"
-
-    # Build command with optional --target
-    BUILD_CMD=(docker buildx build
-        --file "$dockerfile"
-        --build-arg SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH"
-        --build-arg VERSION="$VERSION"
-        --platform "$PLATFORM"
-        --output "type=oci,dest=${OCI_TAR},rewrite-timestamp=true"
-        --no-cache)
-    if [[ -n "$target" ]]; then
-        BUILD_CMD+=(--target "$target")
+    if [[ ${#BUILD_PIDS[@]} -ge "$BUILD_JOBS" ]]; then
+        wait_for_next_build
     fi
+done
 
-    if ! SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" "${BUILD_CMD[@]}" \
-        "$PROJECT_ROOT" 2>&1 | tee "$WORK_DIR/${image}-build.log"; then
-        log_error "  Build failed for $image"
-        BUILD_ERRORS=$((BUILD_ERRORS + 1))
-        continue
-    fi
-
-    # Extract OCI tar and get layer digests
-    tar -xf "$OCI_TAR" -C "$OCI_EXTRACT"
-
-    # Get the manifest digest from OCI index.json
-    manifest_digest=$(jq -r '.manifests[0].digest' "$OCI_EXTRACT/index.json")
-    manifest_file="$OCI_EXTRACT/blobs/sha256/${manifest_digest#sha256:}"
-
-    # Extract layer digests from the manifest
-    jq -r '.layers[].digest' "$manifest_file" | sort > "$DIGEST_DIR/${image}-${CURRENT_ARCH}-layers.txt"
-
-    layer_count=$(wc -l < "$DIGEST_DIR/${image}-${CURRENT_ARCH}-layers.txt")
-    log_info "  Built successfully ($layer_count layers)"
-
-    # Clean up OCI files to save disk space
-    rm -rf "$OCI_TAR" "$OCI_EXTRACT"
+while [[ ${#BUILD_PIDS[@]} -gt 0 ]]; do
+    wait_for_next_build
 done
 
 echo ""
@@ -259,27 +378,27 @@ MANIFEST_FILE="$PROJECT_ROOT/release-manifest-${VERSION}.txt"
 
 log_info "Generating release manifest: $MANIFEST_FILE"
 
-cat > "$MANIFEST_FILE" << EOF
-# JoinMarket NG Release Manifest
-# Version: ${VERSION}
-# Commit: ${COMMIT_SHA}
-# Build Date: ${BUILD_DATE}
-# SOURCE_DATE_EPOCH: ${SOURCE_DATE_EPOCH}
-#
-# This manifest contains layer digests for reproducible build verification.
-# Layer digests are content-addressable hashes of the actual image layers,
-# which are identical regardless of manifest format (Docker vs OCI).
-#
-# Verification instructions: see technical/development docs
-
-## Git Commit
-commit: ${COMMIT_SHA}
-source_date_epoch: ${SOURCE_DATE_EPOCH}
-
-## Docker Images
-
-## Per-Platform Layer Digests (for reproducibility verification)
-EOF
+{
+    printf '# JoinMarket NG Release Manifest\n'
+    printf '# Version: %s\n' "$VERSION"
+    printf '# Commit: %s\n' "$COMMIT_SHA"
+    printf '# Build Date: %s\n' "$BUILD_DATE"
+    printf '# SOURCE_DATE_EPOCH: %s\n' "$SOURCE_DATE_EPOCH"
+    printf '#\n'
+    printf '# This manifest contains layer digests for reproducible build verification.\n'
+    printf '# Layer digests are content-addressable hashes of the actual image layers,\n'
+    printf '# which are identical regardless of manifest format (Docker vs OCI).\n'
+    printf '#\n'
+    printf '# Verification instructions: see technical/development docs\n'
+    printf '\n'
+    printf '## Git Commit\n'
+    printf 'commit: %s\n' "$COMMIT_SHA"
+    printf 'source_date_epoch: %s\n' "$SOURCE_DATE_EPOCH"
+    printf '\n'
+    printf '## Docker Images\n'
+    printf '\n'
+    printf '## Per-Platform Layer Digests (for reproducibility verification)\n'
+} > "$MANIFEST_FILE"
 
 # Add layer digests per platform (sorted by filename for deterministic order)
 for digest_file in $(ls "$DIGEST_DIR"/*-layers.txt 2>/dev/null | sort); do
