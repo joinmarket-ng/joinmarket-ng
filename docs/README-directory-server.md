@@ -12,7 +12,63 @@ Relay server for peer discovery and message routing in the JoinMarket network.
 - **Observability**: Structured logging with loguru
 - **Tor Hidden Service**: Run behind Tor for privacy (via separate container)
 
-## Installation
+## Running
+
+### Docker Compose quick start (Recommended)
+
+Use the `directory_server/docker-compose.yml` deployment for production-style operation
+behind a Tor hidden service. The compose stack isolates the directory server on an internal
+network with no direct internet access; only the Tor container bridges both internal and
+external networks.
+
+1. Go to the `directory_server` directory.
+2. Run `docker-compose up` (or `docker-compose up -d` for non-interactive run)
+
+Retrieve your `.onion` address:
+
+```bash
+cat tor/data/hostname
+```
+
+#### Docker Notes
+
+##### Network Architecture
+
+```
+Internet <--> [tor container] <-- internal network --> [directory_server container]
+```
+
+- `directory_server` lives on `joinmarket_directory_internal` (bridge, internal) -- no
+  direct internet access, no information leakage.
+- `tor` bridges `joinmarket_directory_internal` and `joinmarket_directory_external`,
+  exposing the directory server only as a Tor hidden service.
+
+##### Debug Image
+
+A debug variant with pdbpp and memray pre-installed is available:
+
+```bash
+docker pull ghcr.io/joinmarket-ng/joinmarket-ng/directory-server:main-debug
+```
+
+Profile memory with memray:
+
+```bash
+docker run -it --rm \
+  -v $(pwd)/memray-output:/app/memray-output \
+  ghcr.io/joinmarket-ng/joinmarket-ng/directory-server:main-debug \
+  memray run -o /app/memray-output/profile.bin -m directory_server.main
+```
+
+To attach memray to a running container, add `cap_add: [SYS_PTRACE]` to the
+service in `docker-compose.yml`, then:
+
+```bash
+docker exec -it joinmarket_directory_server \
+  python -m memray attach 1 --verbose
+```
+
+### Installation without Docker
 
 See [Installation](install.md) for general setup. For local development:
 
@@ -33,7 +89,7 @@ pip install -e .
 pip install -e ".[dev]"
 ```
 
-## Configuration
+#### Configuration
 
 Create a `.env` file or set environment variables:
 
@@ -62,62 +118,9 @@ Behavior summary:
 - Legacy/non-ping makers receive `!orderbook` as a compatibility liveness probe
 - Peers idle beyond hard eviction threshold are disconnected
 
-## Running
+## Optional
 
-### Docker Compose (Recommended)
-
-Use the `directory_server/docker-compose.yml` deployment for production-style operation
-behind a Tor hidden service. The compose stack isolates the directory server on an internal
-network with no direct internet access; only the Tor container bridges both internal and
-external networks.
-
-#### Initial Setup
-
-Prepare the Tor data directories with correct ownership and permissions:
-
-```bash
-cd directory_server
-mkdir -p tor/conf tor/data tor/run
-chmod 755 tor/conf tor/run
-chmod 700 tor/data
-chown -R 1000:1000 tor/
-```
-
-Create the Tor hidden service configuration:
-
-```bash
-cat > tor/conf/torrc << 'EOF'
-HiddenServiceDir /var/lib/tor
-HiddenServiceVersion 3
-HiddenServicePort 5222 directory_server:5222
-EOF
-```
-
-Start the stack and retrieve your `.onion` address:
-
-```bash
-docker compose up -d
-docker compose logs -f
-cat tor/data/hostname
-```
-
-#### Directory Structure After Setup
-
-```
-directory_server/
-  docker-compose.yml
-  tor/
-    conf/                   (drwxr-xr-x, uid 1000)
-      torrc                 (-rw-r--r--, uid 1000)
-    data/                   (drwx------, uid 1000)
-      hostname              (-rw-r--r--)
-      hs_ed25519_public_key (-rw-r--r--)
-      hs_ed25519_secret_key (-rw-------)
-      authorized_clients/   (drwx------)
-    run/                    (drwxr-xr-x, uid 1000)
-```
-
-#### Vanity Onion Address (Optional)
+### Vanity Onion Address
 
 Generate a vanity `.onion` address using
 [mkp224o](https://github.com/cathugger/mkp224o) before first start.
@@ -144,42 +147,6 @@ If the stack is already running, restart Tor to pick up the new keys:
 ```bash
 docker compose restart tor
 cat tor/data/hostname
-```
-
-#### Network Architecture
-
-```
-Internet <--> [tor container] <-- internal network --> [directory_server container]
-```
-
-- `directory_server` lives on `joinmarket_directory_internal` (bridge, internal) -- no
-  direct internet access, no information leakage.
-- `tor` bridges `joinmarket_directory_internal` and `joinmarket_directory_external`,
-  exposing the directory server only as a Tor hidden service.
-
-#### Debug Image
-
-A debug variant with pdbpp and memray pre-installed is available:
-
-```bash
-docker pull ghcr.io/joinmarket-ng/joinmarket-ng/directory-server:main-debug
-```
-
-Profile memory with memray:
-
-```bash
-docker run -it --rm \
-  -v $(pwd)/memray-output:/app/memray-output \
-  ghcr.io/joinmarket-ng/joinmarket-ng/directory-server:main-debug \
-  memray run -o /app/memray-output/profile.bin -m directory_server.main
-```
-
-To attach memray to a running container, add `cap_add: [SYS_PTRACE]` to the
-service in `docker-compose.yml`, then:
-
-```bash
-docker exec -it joinmarket_directory_server \
-  python -m memray attach 1 --verbose
 ```
 
 ## Health Check & Monitoring
