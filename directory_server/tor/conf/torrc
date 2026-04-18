@@ -1,0 +1,3 @@
+HiddenServiceDir /var/lib/tor
+HiddenServiceVersion 3
+HiddenServicePort 5222 directory_server:5222
