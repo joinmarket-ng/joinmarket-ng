@@ -334,6 +334,19 @@ jobs:
             signer=$(basename "$local_manifest" -manifest.txt)
             echo "=== Checking manifest from signer: $signer ==="
 
+            local_commit=$(awk -F': ' '$1=="commit" {print $2; exit}' "$local_manifest")
+            ci_commit=$(awk -F': ' '$1=="commit" {print $2; exit}' "release-manifest-${VERSION}.txt")
+
+            if [ -n "$local_commit" ] && [ -n "$ci_commit" ] && [ "$local_commit" != "$ci_commit" ]; then
+              echo "::error::Manifest commit mismatch for signer $signer"
+              echo "  Signer manifest commit: $local_commit"
+              echo "  CI release commit:      $ci_commit"
+              echo "  This signature was made for a different release commit."
+              ERRORS=$((ERRORS + 1))
+              echo ""
+              continue
+            fi
+
             # Extract layer digest sections from local manifest and compare
             # with CI-generated manifest
             while IFS= read -r section; do

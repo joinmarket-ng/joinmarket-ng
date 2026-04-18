@@ -150,3 +150,8 @@ historical accuracy.
 # Sign a locally-built manifest (from build-release.sh)
 ./scripts/sign-release.sh <version> --manifest release-manifest-<version>.txt --key <gpg-key-id>
 ```
+
+For the local-first workflow, the manifest must come from the same release
+commit as the local tag created by `bump_version.py`. `sign-release.sh` refuses
+to sign a local manifest if its embedded `commit:` does not match the release
+tag (or `HEAD` when no local tag exists).

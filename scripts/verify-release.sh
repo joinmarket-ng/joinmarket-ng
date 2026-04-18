@@ -52,6 +52,13 @@ detect_arch() {
     esac
 }
 
+extract_manifest_value() {
+    local key="$1"
+    local manifest_file="$2"
+
+    awk -F': ' -v key="$key" '$1 == key { print $2; exit }' "$manifest_file"
+}
+
 section_image_name() {
     local section="$1"
     section="${section%-amd64-layers}"
@@ -269,20 +276,31 @@ else
 
                     # Cross-check: verify local manifest layer digests match CI manifest
                     local_match=true
-                    while IFS= read -r section; do
-                        if is_skipped_section "$section"; then
-                            log_warn "  Skipping local-vs-CI layer check for $section (currently non-deterministic)"
-                            continue
-                        fi
+                    local_commit=$(extract_manifest_value "commit" "$local_manifest")
+                    ci_commit=$(extract_manifest_value "commit" "$MANIFEST_FILE")
 
-                        local_layers=$(sed -n "/^### ${section}\$/,/^###/{/^sha256:/p}" "$local_manifest" | sort)
-                        ci_layers=$(sed -n "/^### ${section}\$/,/^###/{/^sha256:/p}" "$MANIFEST_FILE" | sort)
+                    if [[ -n "$local_commit" && -n "$ci_commit" && "$local_commit" != "$ci_commit" ]]; then
+                        log_error "  Manifest commit mismatch!"
+                        log_error "    Signer local manifest commit: $local_commit"
+                        log_error "    CI release manifest commit:   $ci_commit"
+                        log_error "  The signature was made for a different release commit."
+                        local_match=false
+                    else
+                        while IFS= read -r section; do
+                            if is_skipped_section "$section"; then
+                                log_warn "  Skipping local-vs-CI layer check for $section (currently non-deterministic)"
+                                continue
+                            fi
 
-                        if [[ -n "$local_layers" && -n "$ci_layers" && "$local_layers" != "$ci_layers" ]]; then
-                            log_error "  Layer digest mismatch for $section!"
-                            local_match=false
-                        fi
-                    done < <(grep '^### ' "$local_manifest" | sed 's/^### //')
+                            local_layers=$(sed -n "/^### ${section}\$/,/^###/{/^sha256:/p}" "$local_manifest" | sort)
+                            ci_layers=$(sed -n "/^### ${section}\$/,/^###/{/^sha256:/p}" "$MANIFEST_FILE" | sort)
+
+                            if [[ -n "$local_layers" && -n "$ci_layers" && "$local_layers" != "$ci_layers" ]]; then
+                                log_error "  Layer digest mismatch for $section!"
+                                local_match=false
+                            fi
+                        done < <(grep '^### ' "$local_manifest" | sed 's/^### //')
+                    fi
 
                     if $local_match; then
                         log_info "  Local manifest layer digests match CI manifest"

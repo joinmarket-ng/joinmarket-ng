@@ -64,7 +64,8 @@ When signing a CI-built release (default, no --manifest):
 
 When signing a locally-built manifest (--manifest):
   The manifest was just generated from a local build, so reproduction is skipped
-  by default. Use --reproduce to force a rebuild and verify.
+  by default. Use --reproduce to force a rebuild and verify. The embedded
+  manifest commit must match your local release tag (or HEAD if no tag exists).
 
 The reproduce check compares layer digests (content-addressable, format-independent)
 rather than manifest digests, ensuring reliable comparison regardless of build environment.
@@ -105,6 +106,46 @@ detect_arch() {
         armv7l)  echo "arm-v7" ;;
         *)       echo "$arch" ;;
     esac
+}
+
+extract_manifest_value() {
+    local key="$1"
+    local manifest_file="$2"
+
+    awk -F': ' -v key="$key" '$1 == key { print $2; exit }' "$manifest_file"
+}
+
+validate_local_manifest_identity() {
+    local manifest_file="$1"
+    local version="$2"
+    local manifest_commit
+    local expected_commit
+    local expected_ref
+
+    manifest_commit=$(extract_manifest_value "commit" "$manifest_file")
+    if [[ -z "$manifest_commit" ]]; then
+        log_error "Local manifest is missing commit metadata: $manifest_file"
+        return 1
+    fi
+
+    if git -C "$PROJECT_ROOT" rev-parse -q --verify "refs/tags/${version}^{commit}" >/dev/null 2>&1; then
+        expected_ref="tag $version"
+        expected_commit=$(git -C "$PROJECT_ROOT" rev-list -n 1 "$version")
+    else
+        expected_ref="current HEAD"
+        expected_commit=$(git -C "$PROJECT_ROOT" rev-parse HEAD)
+        log_warn "Local tag $version not found; validating local manifest against current HEAD"
+    fi
+
+    if [[ "$manifest_commit" != "$expected_commit" ]]; then
+        log_error "Local manifest commit does not match $expected_ref."
+        log_error "  Manifest commit: $manifest_commit"
+        log_error "  Expected commit: $expected_commit"
+        log_error "Rebuild the manifest from the release commit before signing."
+        return 1
+    fi
+
+    log_info "Local manifest commit matches $expected_ref"
 }
 
 # Parse arguments
@@ -293,6 +334,10 @@ if [[ -n "$LOCAL_MANIFEST" ]]; then
     fi
     log_info "Using local manifest: $LOCAL_MANIFEST"
     cp "$LOCAL_MANIFEST" "$MANIFEST_FILE"
+
+    if ! validate_local_manifest_identity "$MANIFEST_FILE" "$VERSION"; then
+        exit 1
+    fi
 else
     # Download from GitHub Releases
     log_info "Downloading release manifest..."
