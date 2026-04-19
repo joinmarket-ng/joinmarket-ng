@@ -124,21 +124,8 @@
 # bitcoin_network = "mainnet"
 
 # Directory servers (leave empty to use network defaults)
-# Mainnet defaults (leave empty to use automatically):
-# directory_servers = [
-#   "satoshi2vcg5e2ept7tjkzlkpomkobqmgtsjzegg6wipnoajadissead.onion:5222",
-#   "coinjointovy3eq5fjygdwpkbcdx63d7vd4g32mw7y553uj3kjjzkiqd.onion:5222",
-#   "nakamotourflxwjnjpnrk7yc2nhkf6r62ed4gdfxmmn5f4saw5q5qoyd.onion:5222",
-#   "odpwaf67rs5226uabcamvypg3y4bngzmfk7255flcdodesqhsvkptaid.onion:5222",
-#   "jmarketxf5wc4aldf3slm5u6726zsky52bqnfv6qyxe5hnafgly6yuyd.onion:5222",
-#   "jmrust7bgdbdl6skkvuzhqost4jkikrluj6alemspeifm5hvgqz2qaad.onion:5222",
-# ]
-#
-# Signet defaults:
-# directory_servers = [
-#   "signetvaxgd3ivj4tml4g6ed3samaa2rscre2gyeyohncmwk4fbesiqd.onion:5222",
-#   "u5oj5etqex3vh7jagljf3e2lo4awmmtcw3klbrlt2fonzyozpn5txrqd.onion:5222",
-# ]
+# Override with a custom list if needed:
+# directory_servers = ["custom1.onion:5222", "custom2.onion:5222"]
 
 # How long to keep retrying directory connections at startup (Tor may still be
 # bootstrapping when the maker starts).  After this timeout, the background
