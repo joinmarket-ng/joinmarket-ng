@@ -160,7 +160,12 @@ def prompt_password_with_confirmation(max_attempts: int = 3) -> str:
         typer.Exit: If passwords don't match after max_attempts
     """
     for attempt in range(max_attempts):
-        password = typer.prompt("Enter encryption password", hide_input=True)
+        password = typer.prompt("Enter encryption password", default="", hide_input=True)
+        if not password:
+            typer.echo("WARNING: Empty password means the mnemonic will be stored in PLAINTEXT.")
+            if not typer.confirm("Continue without encryption?", default=False):
+                continue
+            return password
         confirm = typer.prompt("Confirm password", hide_input=True)
         if password == confirm:
             return password

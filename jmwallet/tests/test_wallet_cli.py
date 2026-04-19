@@ -1282,6 +1282,45 @@ def test_password_confirmation_fails_after_max_attempts():
         assert exc_info.value.exit_code == 1
 
 
+def test_password_confirmation_empty_password_accepted():
+    """Test that empty password is accepted after confirmation."""
+    from jmwallet.cli import prompt_password_with_confirmation
+
+    def mock_prompt(*args, **kwargs):
+        return ""
+
+    with (
+        patch.object(typer, "prompt", side_effect=mock_prompt),
+        patch.object(typer, "confirm", return_value=True),
+    ):
+        result = prompt_password_with_confirmation(max_attempts=3)
+
+    assert result == ""
+
+
+def test_password_confirmation_empty_password_declined():
+    """Test that declining empty password lets user retry."""
+    from jmwallet.cli import prompt_password_with_confirmation
+
+    call_count = 0
+    prompt_responses = ["", "securepass", "securepass"]
+    confirm_responses = [False]  # Decline empty password
+
+    def mock_prompt(*args, **kwargs):
+        nonlocal call_count
+        result = prompt_responses[call_count]
+        call_count += 1
+        return result
+
+    with (
+        patch.object(typer, "prompt", side_effect=mock_prompt),
+        patch.object(typer, "confirm", side_effect=confirm_responses),
+    ):
+        result = prompt_password_with_confirmation(max_attempts=3)
+
+    assert result == "securepass"
+
+
 def test_import_mnemonic_password_retry():
     """Test that import command uses password retry on mismatch."""
     mnemonic = "abandon " * 11 + "about"
