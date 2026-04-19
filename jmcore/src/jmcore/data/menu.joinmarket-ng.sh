@@ -536,8 +536,10 @@ $WALLET_INFO | Maker Bot: $MAKER_STATUS
           # --------------------------------------------------------------
           NEW)
               WNAME=$(whiptail --title " Create New Wallet " \
-                  --inputbox "Enter wallet name:" \
-                  10 50 "default" 3>&1 1>&2 2>&3) || continue
+                  --inputbox "Enter wallet name (leave empty for 'default'):" \
+                  10 55 "" 3>&1 1>&2 2>&3) || continue
+              # Use 'default' if empty
+              WNAME="${WNAME:-default}"
               # Strip extension if provided, we add .mnemonic
               WNAME="${WNAME%.mnemonic}"
               # Validate: only safe characters, no path separators
@@ -574,8 +576,10 @@ $WALLET_INFO | Maker Bot: $MAKER_STATUS
           # --------------------------------------------------------------
           IMP)
               WNAME=$(whiptail --title " Import Wallet " \
-                  --inputbox "Enter wallet name:" \
-                  10 50 "imported" 3>&1 1>&2 2>&3) || continue
+                  --inputbox "Enter wallet name (leave empty for 'imported'):" \
+                  10 55 "" 3>&1 1>&2 2>&3) || continue
+              # Use 'imported' if empty
+              WNAME="${WNAME:-imported}"
               WNAME="${WNAME%.mnemonic}"
               # Validate: only safe characters, no path separators
               if [[ ! "$WNAME" =~ ^[A-Za-z0-9._-]+$ ]]; then

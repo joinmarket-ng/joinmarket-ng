@@ -444,8 +444,8 @@ def _interactive_word_input(
                 sys.stdout.write(prompt + buffer)
                 sys.stdout.flush()
             else:
-                # Backspace on empty buffer - could signal "go back" but we'll ignore
-                continue
+                # Backspace on empty buffer - signal "go back"
+                return None
         elif ch == "\t":  # Tab - try to complete
             if buffer:
                 matches = get_word_completions(buffer, wordlist)
@@ -489,17 +489,6 @@ def _interactive_word_input(
 
         # Get matches for current buffer
         matches = get_word_completions(buffer, wordlist)
-
-        # Auto-complete if exactly one match and buffer is at least 3 chars
-        # (to avoid premature completion on short prefixes)
-        if len(matches) == 1 and len(buffer) >= 3:
-            completed_word = matches[0]
-            # Show completion
-            clear_len = len(prompt) + len(buffer) + len(suggestion_line) + 20
-            sys.stdout.write("\r" + " " * clear_len + "\r")
-            sys.stdout.write(prompt + completed_word + "\n")
-            sys.stdout.flush()
-            return completed_word
 
         # Update display
         clear_len = len(prompt) + len(buffer) + len(suggestion_line) + 20
@@ -588,7 +577,8 @@ def interactive_mnemonic_input(word_count: int = 24) -> str:
     console.print("\n[bold]Enter your BIP39 mnemonic phrase[/bold]")
     if use_realtime:
         console.print(
-            f"[dim]Expected: {word_count} words | Auto-completes | Ctrl+C to cancel[/dim]"
+            f"[dim]Expected: {word_count} words | Tab to complete | "
+            f"Backspace to go back | Ctrl+C to cancel[/dim]"
         )
     else:
         console.print(
@@ -606,6 +596,10 @@ def interactive_mnemonic_input(word_count: int = 24) -> str:
                 if use_realtime:
                     user_input = _interactive_word_input(prompt_text, wordlist)
                     if user_input is None:
+                        # Go back to previous word if possible
+                        if words:
+                            removed = words.pop()
+                            console.print(f"  [yellow]Removed: {removed}[/yellow]")
                         continue
                     user_input = user_input.strip().lower()
                 elif has_readline:

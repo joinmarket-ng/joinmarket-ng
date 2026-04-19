@@ -55,6 +55,13 @@ def test_tui_script_has_wallet_name_validation() -> None:
     assert "^[A-Za-z0-9._-]+$" in content
 
 
+def test_tui_script_wallet_name_not_prefilled() -> None:
+    """Wallet name inputs should start empty, not pre-filled with a default."""
+    content = SCRIPT_PATH.read_text()
+    # The inputbox should use empty string as initial value, not "default"/"imported"
+    assert "leave empty for" in content
+
+
 def test_tui_script_has_fee_rate_validation() -> None:
     """Fee rate must be validated as numeric when provided."""
     content = SCRIPT_PATH.read_text()
