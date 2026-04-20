@@ -137,6 +137,17 @@ def test_tui_script_post_wallet_create_warns_plaintext_storage() -> None:
     assert "PLAIN TEXT" in content
 
 
+def test_tui_script_new_wallet_offers_word_count_choice() -> None:
+    """Creating a new wallet must let the user pick 12 or 24 seed words
+    and pass --words to jm-wallet generate (issue #457)."""
+    content = SCRIPT_PATH.read_text()
+    # A menu with both options must appear in the NEW branch.
+    assert '"24" "24 words' in content
+    assert '"12" "12 words' in content
+    # generate must honour the chosen word count.
+    assert 'jm-wallet generate --words "$WORDS"' in content
+
+
 def test_tui_script_has_update_menu() -> None:
     """Main menu must offer an Update option."""
     content = SCRIPT_PATH.read_text()

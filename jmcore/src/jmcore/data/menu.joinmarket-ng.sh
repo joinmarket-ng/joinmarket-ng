@@ -701,17 +701,25 @@ $WALLET_INFO | Maker Bot: $MAKER_STATUS
                   continue
               fi
 
+              # Ask for seed word count (default 24; 12 is also widely supported)
+              WORDS_CHOICE=$(whiptail --title " Create New Wallet " --notags \
+                  --menu "How many seed words should the new wallet have?" 12 55 2 \
+                  "24" "24 words (recommended, 256-bit entropy)" \
+                  "12" "12 words (128-bit entropy)" \
+                  3>&1 1>&2 2>&3) || continue
+              WORDS="${WORDS_CHOICE:-24}"
+
               WALLET_PATH="$DATA_DIR/wallets/${WNAME}.mnemonic"
               mkdir -p "$DATA_DIR/wallets"
 
               clear
               echo "=== Create New Wallet ==="
               echo ""
-              echo "This will generate a new 24-word BIP39 mnemonic."
+              echo "This will generate a new ${WORDS}-word BIP39 mnemonic."
               echo "IMPORTANT: Write down the seed words! They are your backup."
               echo ""
               echo "Generating wallet..."
-              jm-wallet generate --prompt-password -o "$WALLET_PATH"
+              jm-wallet generate --words "$WORDS" --prompt-password -o "$WALLET_PATH"
               RESULT=$?
 
               if [ $RESULT -eq 0 ] && [ -f "$WALLET_PATH" ]; then
