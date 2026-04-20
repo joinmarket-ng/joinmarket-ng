@@ -593,7 +593,8 @@ def _show_extended_wallet_info(
                 status_display += " (unconfirmed)"
             if addr_info.address in frozen_addresses:
                 status_display += " [FROZEN]"
-            print(f"{addr_info.path:<24}{addr_info.address}\t{btc_balance:.8f}\t{status_display}")
+            if btc_balance > 0
+                print(f"{addr_info.path:<24}{addr_info.address}\t{btc_balance:.8f}\t{status_display}")
 
         print(f"Balance:\t{sats_to_btc(ext_balance):.8f}")
 
@@ -616,7 +617,8 @@ def _show_extended_wallet_info(
                 status_str += " (unconfirmed)"
             if addr_info.address in frozen_addresses:
                 status_str += " [FROZEN]"
-            print(f"{addr_info.path:<24}{addr_info.address}\t{btc_balance:.8f}\t{status_str}")
+            if btc_balance > 0
+                print(f"{addr_info.path:<24}{addr_info.address}\t{btc_balance:.8f}\t{status_str}")
 
         print(f"Balance:\t{sats_to_btc(int_balance):.8f}")
 
