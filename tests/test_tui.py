@@ -129,6 +129,14 @@ def test_tui_script_maker_start_has_wallet_picker() -> None:
     assert "Start Maker -- Select Wallet" in content
 
 
+def test_tui_script_post_wallet_create_warns_plaintext_storage() -> None:
+    """Storing the password in config.toml must show a security warning
+    (issue #453)."""
+    content = SCRIPT_PATH.read_text()
+    assert "Security Warning" in content
+    assert "PLAIN TEXT" in content
+
+
 def test_tui_script_has_update_menu() -> None:
     """Main menu must offer an Update option."""
     content = SCRIPT_PATH.read_text()

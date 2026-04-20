@@ -173,7 +173,13 @@
 
 # Mnemonic file settings (optional defaults)
 # mnemonic_file = ""            # Path to mnemonic file
-# mnemonic_password = ""        # Password for encrypted mnemonic
+#
+# SECURITY WARNING: mnemonic_password is stored IN PLAIN TEXT in this file.
+# Anyone who can read config.toml can decrypt the wallet, which defeats the
+# wallet's encryption. Only set it when you need unattended maker operation
+# and you trust the security of this machine. Prefer leaving it unset and
+# entering the password interactively when prompted by jm-wallet / jm-maker.
+# mnemonic_password = ""        # Password for encrypted mnemonic (plaintext!)
 
 # ============================================================================
 # Logging Settings

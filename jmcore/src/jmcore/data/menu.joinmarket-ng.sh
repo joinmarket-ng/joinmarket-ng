@@ -288,6 +288,13 @@ prompt_and_store_password() {
     local max_attempts=3
     local pwd_store
 
+    # Security warning first (#453). Make the trade-off explicit.
+    if ! whiptail --title " Security Warning " \
+        --yesno "Storing the wallet password in config.toml saves it in PLAIN TEXT.\n\nAnyone with read access to:\n  $CONFIG_FILE\ncan decrypt your wallet. This effectively defeats the\nwallet encryption.\n\nOnly store the password if the maker bot needs to start\nunattended and you trust the security of this machine.\n\nContinue and store the password?" \
+        18 70 --defaultno 3>&1 1>&2 2>&3; then
+        return 1
+    fi
+
     while [ $attempts -lt $max_attempts ]; do
         pwd_store=$(whiptail --title " Wallet Password " \
             --passwordbox "Enter the wallet encryption password for:\n$(basename "$wallet_path")" \
