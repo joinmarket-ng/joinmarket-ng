@@ -268,33 +268,106 @@ store_password() {
     fi
 }
 
+# Helper: Verify that a password can decrypt a wallet file.
+# Returns 0 if the password matches, non-zero otherwise.
+# Usage: verify_wallet_password "/path/to/wallet.mnemonic" "password"
+verify_wallet_password() {
+    local wallet_path="$1"
+    local password="$2"
+    MNEMONIC_PASSWORD="$password" jm-wallet verify-password \
+        -f "$wallet_path" --no-prompt >/dev/null 2>&1
+    return $?
+}
+
+# Helper: Prompt + validate the wallet password and store it on success.
+# Loops up to 3 times on mismatch. User can cancel at any time.
+# Usage: prompt_and_store_password "/path/to/wallet.mnemonic"
+prompt_and_store_password() {
+    local wallet_path="$1"
+    local attempts=0
+    local max_attempts=3
+    local pwd_store
+
+    while [ $attempts -lt $max_attempts ]; do
+        pwd_store=$(whiptail --title " Wallet Password " \
+            --passwordbox "Enter the wallet encryption password for:\n$(basename "$wallet_path")" \
+            10 60 3>&1 1>&2 2>&3)
+        local rc=$?
+        if [ $rc -ne 0 ]; then
+            # User cancelled
+            unset pwd_store
+            return 1
+        fi
+        if [ -z "$pwd_store" ]; then
+            whiptail --title " Error " --msgbox "Password cannot be empty." 8 40
+            attempts=$((attempts + 1))
+            continue
+        fi
+        if verify_wallet_password "$wallet_path" "$pwd_store"; then
+            store_password "${pwd_store}"
+            unset pwd_store
+            whiptail --title " Password Stored " \
+                --msgbox "Password verified and saved to config.toml." 8 55
+            return 0
+        fi
+        attempts=$((attempts + 1))
+        local remaining=$((max_attempts - attempts))
+        if [ $remaining -gt 0 ]; then
+            whiptail --title " Password Mismatch " \
+                --msgbox "The password does not decrypt the wallet.\n\n${remaining} attempt(s) remaining." \
+                10 60
+        else
+            whiptail --title " Password Mismatch " \
+                --msgbox "The password does not decrypt the wallet.\n\nToo many attempts. Password was NOT saved." \
+                10 60
+        fi
+    done
+    unset pwd_store
+    return 1
+}
+
 # Helper: Post-wallet-create prompts (set active wallet + store password)
 # Called after a successful wallet generate or import.
+#
+# Ensures mnemonic_file and mnemonic_password in config.toml stay consistent
+# (issue #455):
+#   - If the new wallet becomes the active one, the previously stored
+#     password is cleared before optionally asking to store a new one. This
+#     prevents the old password from sticking around mismatched.
+#   - If the user declines to set the wallet as active, we do not offer to
+#     store its password (it would mismatch the active wallet in config).
+#   - The store-password prompt (issue #452) now validates the entered
+#     password against the wallet file before writing it to config.toml.
+#
 # Usage: post_wallet_create "/path/to/wallet.mnemonic"
 post_wallet_create() {
     local wallet_path="$1"
+    local set_active=0
 
     # Ask to set as active wallet (default: Yes)
     if whiptail --title " Active Wallet " \
         --yesno "Set this wallet as the active wallet in config?\n\n$(basename "$wallet_path")" \
         10 60 3>&1 1>&2 2>&3; then
         set_config_value "mnemonic_file" "$wallet_path" "true"
+        # Clear any previously stored password -- it belongs to the old wallet.
+        clear_config_value "mnemonic_password"
+        set_active=1
         echo "Active wallet updated in config.toml"
+    fi
+
+    # Only offer to store the password when the new wallet is now the active
+    # wallet in config. Storing a password for a non-active wallet would
+    # guarantee a mismatch (issue #455).
+    if [ $set_active -ne 1 ]; then
+        return 0
     fi
 
     # Ask whether to store the encryption password
     if whiptail --title " Store Password " \
         --yesno "Store the wallet password in config.toml?\n\nThis lets all commands (including the maker) work without\nprompting. If you choose No, the maker will ask each time." \
         12 64 --defaultno 3>&1 1>&2 2>&3; then
-        local pwd_store
-        pwd_store=$(whiptail --title " Wallet Password " \
-            --passwordbox "Enter the wallet encryption password:" \
-            10 60 3>&1 1>&2 2>&3)
-        if [ $? -eq 0 ] && [ -n "$pwd_store" ]; then
-            store_password "${pwd_store}"
-            unset pwd_store
-            echo "Password stored in config.toml."
-        fi
+        prompt_and_store_password "$wallet_path" || \
+            echo "Password not stored."
     fi
 }
 

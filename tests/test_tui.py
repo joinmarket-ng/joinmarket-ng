@@ -98,6 +98,29 @@ def test_tui_script_select_wallet_clears_password() -> None:
     assert 'clear_config_value "mnemonic_password"' in content
 
 
+def test_tui_script_post_wallet_create_validates_password() -> None:
+    """The third password prompt (post_wallet_create) must validate the
+    password against the wallet file before saving it (issue #452)."""
+    content = SCRIPT_PATH.read_text()
+    assert "verify_wallet_password()" in content
+    assert "prompt_and_store_password()" in content
+    # The helper must actually invoke the verification CLI.
+    assert "jm-wallet verify-password" in content
+
+
+def test_tui_script_post_wallet_create_clears_password_on_activate() -> None:
+    """When a newly created/imported wallet is set as active, the old
+    mnemonic_password must be cleared to prevent mismatch (issue #455)."""
+    content = SCRIPT_PATH.read_text()
+    # The post_wallet_create function clears the password when set_active
+    # is taken. Grep for the specific sequence to avoid false positives.
+    post_create_block = content.split("post_wallet_create()", 1)[1].split(
+        "# Helper:", 1
+    )[0]
+    assert 'set_config_value "mnemonic_file"' in post_create_block
+    assert 'clear_config_value "mnemonic_password"' in post_create_block
+
+
 def test_tui_script_has_update_menu() -> None:
     """Main menu must offer an Update option."""
     content = SCRIPT_PATH.read_text()
