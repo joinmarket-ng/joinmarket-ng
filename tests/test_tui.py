@@ -121,6 +121,14 @@ def test_tui_script_post_wallet_create_clears_password_on_activate() -> None:
     assert 'clear_config_value "mnemonic_password"' in post_create_block
 
 
+def test_tui_script_maker_start_has_wallet_picker() -> None:
+    """Maker START must offer wallet selection before password prompts
+    when multiple wallets exist (issue #454)."""
+    content = SCRIPT_PATH.read_text()
+    assert "maker_prepare_wallet()" in content
+    assert "Start Maker -- Select Wallet" in content
+
+
 def test_tui_script_has_update_menu() -> None:
     """Main menu must offer an Update option."""
     content = SCRIPT_PATH.read_text()

@@ -380,6 +380,78 @@ maker_start() {
     fi
 }
 
+# Helper: Interactive wallet picker + (optional) password handling for the
+# maker START flow. When multiple wallets exist the user is asked to choose
+# one and the selection is written to config.toml, replacing any stale
+# password entry. This prevents "Decryption failed" errors where the user
+# had no way to tell which wallet the password prompt referred to
+# (issue #454).
+#
+# Usage: maker_prepare_wallet
+# Returns 0 if the caller should proceed with maker start, non-zero to abort.
+maker_prepare_wallet() {
+    local wallets
+    wallets=$(list_wallets)
+
+    if [ -z "$wallets" ]; then
+        whiptail --title " Error " \
+            --msgbox "No wallet files found in $DATA_DIR/wallets/\nCreate or import a wallet first (W -> NEW or IMP)." \
+            9 60
+        return 1
+    fi
+
+    # Count wallets without relying on subshells preserving state.
+    local wallet_count
+    wallet_count=$(printf '%s\n' "$wallets" | sed '/^$/d' | wc -l)
+
+    # Single wallet: just make sure it's the active one. No prompting needed
+    # beyond what jm-maker itself already does.
+    if [ "$wallet_count" -eq 1 ]; then
+        local only_wallet
+        only_wallet=$(printf '%s\n' "$wallets" | sed -n '1p')
+        local only_path="$DATA_DIR/wallets/$only_wallet"
+        if [ "$CURRENT_WALLET" != "$only_path" ]; then
+            set_config_value "mnemonic_file" "$only_path" "true"
+            clear_config_value "mnemonic_password"
+            CURRENT_WALLET="$only_path"
+        fi
+        return 0
+    fi
+
+    # Multiple wallets: ask the user to explicitly pick one.
+    local menu_items=()
+    while IFS= read -r wf; do
+        [ -z "$wf" ] && continue
+        menu_items+=("$wf" "$wf")
+    done <<< "$wallets"
+
+    local current_display
+    current_display=$(basename "${CURRENT_WALLET:-}" 2>/dev/null)
+    [ -z "$current_display" ] && current_display="(none)"
+
+    local selected
+    selected=$(whiptail --title " Start Maker -- Select Wallet " --notags \
+        --menu "Current active: ${current_display}\n\nChoose the wallet to use for the maker bot:" \
+        18 66 6 \
+        "${menu_items[@]}" 3>&1 1>&2 2>&3) || return 1
+
+    local selected_path="$DATA_DIR/wallets/$selected"
+    if [ ! -f "$selected_path" ]; then
+        whiptail --title " Error " --msgbox "File not found: $selected_path" 8 55
+        return 1
+    fi
+
+    # If the user picked a different wallet than the one in config, update
+    # config and drop the stale password -- this is the root cause of the
+    # #455 mismatch scenarios.
+    if [ "$CURRENT_WALLET" != "$selected_path" ]; then
+        set_config_value "mnemonic_file" "$selected_path" "true"
+        clear_config_value "mnemonic_password"
+        CURRENT_WALLET="$selected_path"
+    fi
+    return 0
+}
+
 # Helper: Stop maker (environment-aware)
 maker_stop() {
     if [ "$RASPIBLITZ" = "1" ]; then
@@ -890,8 +962,8 @@ $WALLET_INFO | Maker Bot: $MAKER_STATUS
       case $MCHOICE in
           START)
               clear
-              if [ -z "$CURRENT_WALLET" ]; then
-                  echo "ERROR: No wallet configured. Set up a wallet first (W -> SEL or NEW)."
+              if ! maker_prepare_wallet; then
+                  echo "Maker start cancelled."
               else
                   maker_start
                   sleep 2
@@ -908,8 +980,8 @@ $WALLET_INFO | Maker Bot: $MAKER_STATUS
               ;;
           RESTART)
               clear
-              if [ -z "$CURRENT_WALLET" ]; then
-                  echo "ERROR: No wallet configured. Set up a wallet first (W -> SEL or NEW)."
+              if ! maker_prepare_wallet; then
+                  echo "Maker restart cancelled."
               else
                   maker_stop
                   maker_start
