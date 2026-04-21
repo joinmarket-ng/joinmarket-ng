@@ -79,6 +79,20 @@ rpc_user = "your_rpc_user"
 rpc_password = "your_rpc_password"
 ```
 
+Cookie-based authentication (the default when `bitcoind` is started without
+explicit `rpcuser`/`rpcpassword`) works as well and avoids keeping RPC
+credentials in `config.toml`:
+
+```toml
+[bitcoin]
+backend_type = "descriptor_wallet"
+rpc_url = "http://127.0.0.1:8332"
+rpc_cookie_file = "~/.bitcoin/.cookie"
+```
+
+`rpc_cookie_file` is mutually exclusive with `rpc_user`/`rpc_password`: set
+one pair or the other, not both.
+
 ### Neutrino (light client)
 
 ```toml
