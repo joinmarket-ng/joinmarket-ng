@@ -183,6 +183,73 @@ def test_tui_script_update_warns_running_maker() -> None:
     assert "Maker Bot is currently running" in content
 
 
+def test_tui_script_update_shows_current_version_with_commit() -> None:
+    """The update menu title must show "vX.Y.Z (commit)" when the commit
+    hash is available (issue #451 point 1)."""
+    content = SCRIPT_PATH.read_text()
+    assert "get_commit_hash" in content
+    # Current label uses "v${CURRENT_VERSION}" and appends the short commit
+    # when present.
+    assert 'CURRENT_LABEL="v${CURRENT_VERSION} (${CURRENT_COMMIT})"' in content
+
+
+def test_tui_script_update_fetches_latest_stable_and_main() -> None:
+    """The update menu must look up the latest release tag and the
+    short hash of origin/main so STABLE/DEV entries show concrete
+    versions (issue #451 points 2 and 3)."""
+    content = SCRIPT_PATH.read_text()
+    # Latest stable release tag via GitHub API
+    assert "api.github.com/repos/joinmarket-ng/joinmarket-ng/releases/latest" in content
+    assert '"tag_name"' in content
+    # Latest main commit via git ls-remote
+    assert "git ls-remote" in content
+    assert "joinmarket-ng/joinmarket-ng.git" in content
+    # Lookups must have a bounded timeout so network issues don't hang the TUI.
+    assert "--max-time" in content
+
+
+def test_tui_script_update_confirm_shows_current_and_target() -> None:
+    """The confirm dialog must surface both the current and target
+    identifiers (issue #451 point 4)."""
+    content = SCRIPT_PATH.read_text()
+    confirm_block = content.split("Confirm Update", 1)[1].split("clear\n", 1)[0]
+    assert "Current:" in confirm_block
+    assert "Target:" in confirm_block
+    assert "${CURRENT_LABEL}" in confirm_block
+    assert "${TARGET_LABEL}" in confirm_block
+
+
+def test_tui_script_update_warns_when_already_current() -> None:
+    """When the selected channel matches the installed version, the
+    user must be warned before reinstalling (issue #451 point 5)."""
+    content = SCRIPT_PATH.read_text()
+    assert "Already Up to Date" in content
+    # The warning must default to "No" so pressing Enter does not
+    # trigger a redundant reinstall.
+    assert "--defaultno" in content
+
+
+def test_tui_script_update_cancel_returns_to_update_menu() -> None:
+    """Cancelling the confirm dialog must return to the update submenu
+    rather than the main menu (issue #451 point 6)."""
+    content = SCRIPT_PATH.read_text()
+    # The update case must wrap its prompts in its own loop so `continue`
+    # goes back to the channel picker, not to the outer main-menu loop.
+    update_block = content.split("    U)\n", 1)[1].split("\n    C)\n", 1)[0]
+    assert "while true; do" in update_block
+
+
+def test_tui_script_update_restart_hint_uses_jm_ng() -> None:
+    """The launcher binary is `jm-ng`, not `jm-tui`; both restart hints
+    in the update flow must use the correct name (issue #451 point 7)."""
+    content = SCRIPT_PATH.read_text()
+    update_block = content.split("    U)\n", 1)[1].split("\n    C)\n", 1)[0]
+    assert "jm-tui" not in update_block
+    # Restart hint appears twice: in the confirm dialog and the post-update
+    # message.
+    assert update_block.count("jm-ng") >= 2
+
+
 # ---------------------------------------------------------------------------
 # Python entry point tests
 # ---------------------------------------------------------------------------

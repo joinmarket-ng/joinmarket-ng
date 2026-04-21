@@ -1115,69 +1115,130 @@ $WALLET_INFO | Maker Bot: $MAKER_STATUS
       ;;
 
     U)
+      # Update flow (issue #451): resolve current, latest-stable and
+      # latest-main identifiers up front so the menu can display concrete
+      # versions/commits instead of generic labels.
       CURRENT_VERSION=$("${VENV_BIN}/python" -c "from jmcore.version import get_version; print(get_version())" 2>/dev/null || echo "unknown")
+      CURRENT_COMMIT=$("${VENV_BIN}/python" -c "from jmcore.version import get_commit_hash; h=get_commit_hash(); print(h or '')" 2>/dev/null || echo "")
 
-      UCHOICE=$(whiptail --title " Update JoinMarket-NG (current: v${CURRENT_VERSION}) " \
-          --menu "Choose update channel:" 16 64 5 \
-          "STABLE" "Latest stable release (recommended)" \
-          "DEV" "Latest development build (main branch)" \
-          "VERSION" "Install a specific version" \
-          "BACK" "Return to main menu" 3>&1 1>&2 2>&3)
-
-      [ $? != 0 ] && continue
-
-      case $UCHOICE in
-        STABLE)
-          UPDATE_ARGS=""
-          ;;
-        DEV)
-          UPDATE_ARGS="--dev"
-          ;;
-        VERSION)
-          TARGET_VERSION=$(whiptail --title " Specific Version " \
-              --inputbox "Enter version number (e.g. 0.27.0):" 9 50 "" 3>&1 1>&2 2>&3)
-          [ $? != 0 ] && continue
-          [ -z "$TARGET_VERSION" ] && continue
-          UPDATE_ARGS="--version $TARGET_VERSION"
-          ;;
-        BACK)
-          continue
-          ;;
-      esac
-
-      # Warn if maker bot is running
-      if [ "$MAKER_STATUS" = "RUNNING" ]; then
-          whiptail --title " Warning " --yesno \
-              "The Maker Bot is currently running.\n\nIt will be stopped during the update and must be restarted manually afterwards.\n\nContinue?" 12 60
-          [ $? != 0 ] && continue
-      fi
-
-      whiptail --title " Confirm Update " --yesno \
-          "Update JoinMarket-NG?\n\nChannel: ${UCHOICE}\nCurrent: v${CURRENT_VERSION}\n\nThe TUI will close during the update.\nRestart it afterwards with: jm-tui" 14 60
-      [ $? != 0 ] && continue
-
-      clear
-
-      if [ "$RASPIBLITZ" = "1" ]; then
-          if [ "$UCHOICE" = "VERSION" ]; then
-              sudo "$BONUS_SCRIPT" update "$TARGET_VERSION"
-          elif [ "$UCHOICE" = "DEV" ]; then
-              sudo "$BONUS_SCRIPT" update main
-          else
-              sudo "$BONUS_SCRIPT" update
-          fi
+      # Current label: "vX.Y.Z" plus short commit when we have one.
+      if [ -n "$CURRENT_COMMIT" ]; then
+          CURRENT_LABEL="v${CURRENT_VERSION} (${CURRENT_COMMIT})"
       else
-          # Standalone: download and run install.sh --update
-          echo "Downloading latest installer..."
-          INSTALL_SCRIPT=$(mktemp)
-          curl -sSL "https://raw.githubusercontent.com/joinmarket-ng/joinmarket-ng/main/install.sh" -o "$INSTALL_SCRIPT"
-          bash "$INSTALL_SCRIPT" --update $UPDATE_ARGS -y
-          rm -f "$INSTALL_SCRIPT"
+          CURRENT_LABEL="v${CURRENT_VERSION}"
       fi
 
-      echo ""
-      echo "Update complete. Please restart the TUI: jm-tui"
-      exit 0
+      # Best-effort network lookups. Short timeouts so a flaky connection
+      # can't wedge the menu; fall back to "unknown" when anything fails.
+      LATEST_STABLE=$(curl -fsSL --max-time 5 \
+          "https://api.github.com/repos/joinmarket-ng/joinmarket-ng/releases/latest" 2>/dev/null | \
+          grep -m1 '"tag_name"' | sed -E 's/.*"tag_name"[^"]*"([^"]+)".*/\1/' || true)
+      [ -z "$LATEST_STABLE" ] && LATEST_STABLE="unknown"
+
+      LATEST_MAIN=$(git ls-remote --quiet \
+          "https://github.com/joinmarket-ng/joinmarket-ng.git" HEAD 2>/dev/null | \
+          cut -c1-7 || true)
+      [ -z "$LATEST_MAIN" ] && LATEST_MAIN="unknown"
+
+      # Outer loop so "Cancel" on the confirm dialog returns to this menu
+      # instead of the top-level menu (#451 point 6).
+      while true; do
+        UCHOICE=$(whiptail --title " Update JoinMarket-NG (current: ${CURRENT_LABEL}) " \
+            --menu "Choose update channel:" 16 70 5 \
+            "STABLE"  "Latest stable release (v${LATEST_STABLE})" \
+            "DEV"     "Latest main commit (${LATEST_MAIN})" \
+            "VERSION" "Install a specific version" \
+            "BACK"    "Return to main menu" 3>&1 1>&2 2>&3) || break
+
+        TARGET_LABEL=""
+        case $UCHOICE in
+          STABLE)
+            UPDATE_ARGS=""
+            TARGET_LABEL="v${LATEST_STABLE}"
+            ;;
+          DEV)
+            UPDATE_ARGS="--dev"
+            TARGET_LABEL="main (${LATEST_MAIN})"
+            ;;
+          VERSION)
+            TARGET_VERSION=$(whiptail --title " Specific Version " \
+                --inputbox "Enter version number (e.g. 0.27.0):" 9 50 "" 3>&1 1>&2 2>&3) || continue
+            [ -z "$TARGET_VERSION" ] && continue
+            UPDATE_ARGS="--version $TARGET_VERSION"
+            TARGET_LABEL="v${TARGET_VERSION#v}"
+            ;;
+          BACK)
+            break
+            ;;
+          *)
+            continue
+            ;;
+        esac
+
+        # Warn if the target matches what's already installed (#451 point 5).
+        # The current identifier is "vX.Y.Z" for stable and the short
+        # commit for dev; compare against the matching component.
+        ALREADY_CURRENT=0
+        case $UCHOICE in
+          STABLE|VERSION)
+            if [ "$TARGET_LABEL" = "v${CURRENT_VERSION}" ]; then
+                ALREADY_CURRENT=1
+            fi
+            ;;
+          DEV)
+            if [ -n "$CURRENT_COMMIT" ] && [ "$LATEST_MAIN" = "$CURRENT_COMMIT" ]; then
+                ALREADY_CURRENT=1
+            fi
+            ;;
+        esac
+
+        if [ "$ALREADY_CURRENT" = "1" ]; then
+            if ! whiptail --title " Already Up to Date " --defaultno --yesno \
+                "You are already running ${TARGET_LABEL}.\n\nReinstall anyway?" \
+                10 60 3>&1 1>&2 2>&3; then
+                continue
+            fi
+        fi
+
+        # Warn if maker bot is running
+        if [ "$MAKER_STATUS" = "RUNNING" ]; then
+            if ! whiptail --title " Warning " --yesno \
+                "The Maker Bot is currently running.\n\nIt will be stopped during the update and must be restarted manually afterwards.\n\nContinue?" 12 60 3>&1 1>&2 2>&3; then
+                continue
+            fi
+        fi
+
+        # Confirm dialog -- show both current and target (#451 point 4).
+        if ! whiptail --title " Confirm Update " --yesno \
+            "Update JoinMarket-NG?\n\nCurrent:\t${CURRENT_LABEL}\nTarget:\t\t${TARGET_LABEL}\n\nThe TUI will close during the update.\nRestart it afterwards with: jm-ng" \
+            14 64 3>&1 1>&2 2>&3; then
+            # Cancel returns to the update menu (#451 point 6).
+            continue
+        fi
+
+        clear
+
+        if [ "$RASPIBLITZ" = "1" ]; then
+            if [ "$UCHOICE" = "VERSION" ]; then
+                sudo "$BONUS_SCRIPT" update "$TARGET_VERSION"
+            elif [ "$UCHOICE" = "DEV" ]; then
+                sudo "$BONUS_SCRIPT" update main
+            else
+                sudo "$BONUS_SCRIPT" update
+            fi
+        else
+            # Standalone: download and run install.sh --update
+            echo "Downloading latest installer..."
+            INSTALL_SCRIPT=$(mktemp)
+            curl -sSL "https://raw.githubusercontent.com/joinmarket-ng/joinmarket-ng/main/install.sh" -o "$INSTALL_SCRIPT"
+            bash "$INSTALL_SCRIPT" --update $UPDATE_ARGS -y
+            rm -f "$INSTALL_SCRIPT"
+        fi
+
+        echo ""
+        echo "Update complete. Please restart the TUI: jm-ng"
+        exit 0
+      done
       ;;
 
     C)
