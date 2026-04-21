@@ -1118,8 +1118,12 @@ $WALLET_INFO | Maker Bot: $MAKER_STATUS
       # Update flow (issue #451): resolve current, latest-stable and
       # latest-main identifiers up front so the menu can display concrete
       # versions/commits instead of generic labels.
-      CURRENT_VERSION=$("${VENV_BIN}/python" -c "from jmcore.version import get_version; print(get_version())" 2>/dev/null || echo "unknown")
-      CURRENT_COMMIT=$("${VENV_BIN}/python" -c "from jmcore.version import get_commit_hash; h=get_commit_hash(); print(h or '')" 2>/dev/null || echo "")
+      # Gather current version/commit from the installed package. We don't
+      # rely on ${VENV_BIN}/python here: on standalone (pip -e) installs the
+      # user's venv may not live at the hard-coded VENV_BIN path. The
+      # activation above already puts the right interpreter on PATH.
+      CURRENT_VERSION=$(python3 -c "from jmcore.version import get_version; print(get_version())" 2>/dev/null || echo "unknown")
+      CURRENT_COMMIT=$(python3 -c "from jmcore.version import get_commit_hash; h=get_commit_hash(); print(h or '')" 2>/dev/null || echo "")
 
       # Current label: "vX.Y.Z" plus short commit when we have one.
       if [ -n "$CURRENT_COMMIT" ]; then
