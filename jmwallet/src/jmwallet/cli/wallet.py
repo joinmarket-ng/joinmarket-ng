@@ -256,6 +256,18 @@ def info(
     gap: Annotated[
         int, typer.Option("--gap", "-g", help="Max address gap to show in extended view")
     ] = 6,
+    show_empty: Annotated[
+        bool,
+        typer.Option(
+            "--show-empty/--no-show-empty",
+            help=(
+                "In --extended view, show addresses with zero balance. "
+                "When disabled (default), empty addresses are hidden except "
+                "for the first unused one per branch so you still have a "
+                "fresh receive address."
+            ),
+        ),
+    ] = False,
     data_dir: Annotated[
         Path | None,
         typer.Option(
@@ -302,6 +314,7 @@ def info(
             resolved_bip39_passphrase,
             extended=extended,
             gap_limit=gap,
+            show_empty=show_empty,
             creation_height=resolved.creation_height if resolved else None,
         )
     )
@@ -313,6 +326,7 @@ async def _show_wallet_info(
     bip39_passphrase: str = "",
     extended: bool = False,
     gap_limit: int = 6,
+    show_empty: bool = False,
     creation_height: int | None = None,
 ) -> None:
     """Show wallet info implementation."""
@@ -487,7 +501,9 @@ async def _show_wallet_info(
         if extended:
             # Extended view with detailed address information
             print("\nJM wallet")
-            _show_extended_wallet_info(wallet, used_addresses, history_addresses, gap_limit)
+            _show_extended_wallet_info(
+                wallet, used_addresses, history_addresses, gap_limit, show_empty=show_empty
+            )
         else:
             # Simple view - show balance and suggested address per mixdepth
             print("\nBalance by mixdepth:")
@@ -520,11 +536,59 @@ async def _show_wallet_info(
         await wallet.close()
 
 
+def _print_branch_addresses(
+    addresses: list,  # list[AddressInfo] - avoid import cycle at module top
+    pending_addresses: set[str],
+    frozen_addresses: set[str],
+    show_empty: bool = False,
+) -> tuple[int, int]:
+    """Print addresses for one wallet branch and return (total_balance, hidden_count).
+
+    When ``show_empty`` is False, addresses with zero balance are skipped
+    except for the first unused "new" address, which is always shown so
+    the user still has a fresh receive address to copy. Total balance is
+    computed over all addresses (even skipped ones) so balance display
+    remains accurate. ``hidden_count`` counts addresses that were
+    omitted from the output because they were empty.
+    """
+    from jmcore.bitcoin import sats_to_btc
+
+    total_balance = 0
+    hidden = 0
+    first_empty_new_shown = False
+
+    for addr_info in addresses:
+        total_balance += addr_info.balance
+
+        # Filter empty addresses unless explicitly requested.
+        if not show_empty and addr_info.balance == 0:
+            # Always surface the first "new" (unused) address so the user
+            # still has a receive address in the output.
+            if addr_info.status == "new" and not first_empty_new_shown:
+                first_empty_new_shown = True
+            else:
+                hidden += 1
+                continue
+
+        btc_balance = sats_to_btc(addr_info.balance)
+        status_display: str = addr_info.status
+        if addr_info.address in pending_addresses:
+            status_display += " (pending)"
+        elif addr_info.has_unconfirmed:
+            status_display += " (unconfirmed)"
+        if addr_info.address in frozen_addresses:
+            status_display += " [FROZEN]"
+        print(f"{addr_info.path:<24}{addr_info.address}\t{btc_balance:.8f}\t{status_display}")
+
+    return total_balance, hidden
+
+
 def _show_extended_wallet_info(
     wallet: WalletService,
     used_addresses: set[str],
     history_addresses: dict[str, str],
     gap_limit: int,
+    show_empty: bool = False,
 ) -> None:
     """
     Display extended wallet information with detailed address listings.
@@ -534,6 +598,12 @@ def _show_extended_wallet_info(
     - Lists external and internal addresses with derivation paths
     - Shows address status (deposit, cj-out, non-cj-change, new, etc.)
     - Shows balance per address and per branch
+
+    When ``show_empty`` is False (the default), addresses with zero balance
+    are hidden to keep the output readable on long-running wallets. The
+    first unused "new" address of each branch is still displayed so the
+    user has a fresh receive address at a glance, and the number of
+    hidden entries is printed as a summary line.
     """
     from jmcore.bitcoin import sats_to_btc
 
@@ -581,20 +651,15 @@ def _show_extended_wallet_info(
         print(f"external addresses\t{ext_path}\t{zpub}")
 
         ext_balance = 0
-        for addr_info in ext_addresses:
-            btc_balance = sats_to_btc(addr_info.balance)
-            ext_balance += addr_info.balance
-            # Format: path  address  balance  status
-            # Pad path to ensure consistent alignment regardless of index digits
-            status_display: str = addr_info.status
-            if addr_info.address in pending_addresses:
-                status_display += " (pending)"
-            elif addr_info.has_unconfirmed:
-                status_display += " (unconfirmed)"
-            if addr_info.address in frozen_addresses:
-                status_display += " [FROZEN]"
-            print(f"{addr_info.path:<24}{addr_info.address}\t{btc_balance:.8f}\t{status_display}")
+        ext_balance, ext_hidden = _print_branch_addresses(
+            ext_addresses,
+            pending_addresses,
+            frozen_addresses,
+            show_empty=show_empty,
+        )
 
+        if ext_hidden:
+            print(f"\t\t\t({ext_hidden} empty addresses hidden; pass --show-empty to display)")
         print(f"Balance:\t{sats_to_btc(ext_balance):.8f}")
 
         # Internal addresses (change / CJ output)
@@ -604,20 +669,15 @@ def _show_extended_wallet_info(
         int_path = f"m/84'/{0 if wallet.network == 'mainnet' else 1}'/{md}'/1"
         print(f"internal addresses\t{int_path}")
 
-        int_balance = 0
-        for addr_info in int_addresses:
-            btc_balance = sats_to_btc(addr_info.balance)
-            int_balance += addr_info.balance
-            # Pad path to ensure consistent alignment regardless of index digits
-            status_str: str = addr_info.status
-            if addr_info.address in pending_addresses:
-                status_str += " (pending)"
-            elif addr_info.has_unconfirmed:
-                status_str += " (unconfirmed)"
-            if addr_info.address in frozen_addresses:
-                status_str += " [FROZEN]"
-            print(f"{addr_info.path:<24}{addr_info.address}\t{btc_balance:.8f}\t{status_str}")
+        int_balance, int_hidden = _print_branch_addresses(
+            int_addresses,
+            pending_addresses,
+            frozen_addresses,
+            show_empty=show_empty,
+        )
 
+        if int_hidden:
+            print(f"\t\t\t({int_hidden} empty addresses hidden; pass --show-empty to display)")
         print(f"Balance:\t{sats_to_btc(int_balance):.8f}")
 
         # Fidelity bond branch (only for mixdepth 0)
