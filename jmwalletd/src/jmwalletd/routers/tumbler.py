@@ -318,7 +318,11 @@ async def start_plan(
     from taker.taker import Taker
 
     async def _taker_factory(phase: Any) -> Any:
-        backend = await get_backend(state.data_dir, force_new=True)
+        backend = await get_backend(
+            state.data_dir,
+            force_new=True,
+            wallet_service=ws,
+        )
         config = TakerConfig(
             mnemonic=state.wallet_mnemonic,
             mixdepth=getattr(phase, "mixdepth", 0),
@@ -337,7 +341,11 @@ async def start_plan(
         return Taker(wallet=ws, backend=backend, config=config)
 
     async def _maker_factory(_phase: Any) -> Any:
-        backend = await get_backend(state.data_dir, force_new=True)
+        backend = await get_backend(
+            state.data_dir,
+            force_new=True,
+            wallet_service=ws,
+        )
         config = MakerConfig(
             mnemonic=state.wallet_mnemonic,
             network=jm_settings.network_config.network,

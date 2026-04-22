@@ -103,7 +103,12 @@ async def do_coinjoin(
         async def _run_coinjoin() -> None:
             taker: Any | None = None
             try:
-                backend = await get_backend(state.data_dir, force_new=True)
+                backend = await get_backend(
+                    state.data_dir,
+                    force_new=True,
+                    mnemonic=state.wallet_mnemonic,
+                    network=get_settings().network_config.network.value,
+                )
                 jm_settings = get_settings()
                 config = TakerConfig(
                     mnemonic=state.wallet_mnemonic,
@@ -226,7 +231,11 @@ async def start_maker(
         async def _run_maker() -> None:
             try:
                 ws = state.wallet_service
-                backend = await get_backend(state.data_dir, force_new=True)
+                backend = await get_backend(
+                    state.data_dir,
+                    force_new=True,
+                    wallet_service=ws,
+                )
                 jm_settings = get_settings()
                 config = MakerConfig(
                     mnemonic=state.wallet_mnemonic,

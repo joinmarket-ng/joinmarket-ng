@@ -77,7 +77,11 @@ async def create_wallet(
     mnemo = Mnemonic("english")
     seedphrase = mnemo.generate(strength=128)
 
-    backend = await get_backend(data_dir=data_dir)
+    backend = await get_backend(
+        data_dir=data_dir,
+        mnemonic=seedphrase,
+        network=_get_network(),
+    )
 
     # Record current block height as the wallet birthday.  Since this is a
     # brand-new wallet, it cannot have received any funds before this point,
@@ -153,7 +157,11 @@ async def recover_wallet(
         msg = f"Invalid wallet type: {wallet_type}. Must be one of {valid_types}"
         raise ValueError(msg)
 
-    backend = await get_backend(data_dir=data_dir)
+    backend = await get_backend(
+        data_dir=data_dir,
+        mnemonic=seedphrase,
+        network=_get_network(),
+    )
 
     ws = WalletService(
         mnemonic=seedphrase,
@@ -205,7 +213,11 @@ async def open_wallet_with_mnemonic(
 
     seedphrase, creation_height = _load_wallet_file(wallet_path=wallet_path, password=password)
 
-    backend = await get_backend(data_dir=data_dir)
+    backend = await get_backend(
+        data_dir=data_dir,
+        mnemonic=seedphrase,
+        network=_get_network(),
+    )
 
     # Propagate wallet creation height hint to the backend.  Passing None
     # clears any stale hint from a previously opened wallet when backend
