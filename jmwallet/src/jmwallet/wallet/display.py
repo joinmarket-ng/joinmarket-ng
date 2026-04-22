@@ -171,6 +171,18 @@ class WalletDisplayMixin:
                 # specific CoinJoin — so we label it distinctly from
                 # ordinary "non-cj-change" outputs.
                 return "cj-change"
+            elif history_type == "flagged":
+                # Address was shared as part of a CoinJoin we initiated
+                # (recorded in history), and now has funds at that address.
+                # This is our pending CJ output (not yet confirmed: the
+                # monitor will flip entry.success=True and the history_type
+                # to cj_out/change after first confirmation). Treat it as
+                # the CJ output it is rather than mislabeling it "deposit"
+                # (external) or "non-cj-change" (internal).
+                if is_external:
+                    return "cj-out"
+                else:
+                    return "cj-change"
             elif is_external:
                 return "deposit"
             else:

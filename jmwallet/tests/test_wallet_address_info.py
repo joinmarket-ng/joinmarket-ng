@@ -125,6 +125,36 @@ class TestAddressStatusDetermination:
         )
         assert status == "flagged"
 
+    def test_determine_status_pending_cj_out_external(self, wallet):
+        """A CoinJoin destination address with funds but whose history
+        entry is still 'flagged' (broadcast but not yet confirmed: the
+        monitor flips success=True only after first confirmation) must
+        be labeled cj-out, not deposit. Regression test for the bug
+        where pending CJ outputs briefly show as deposits.
+        """
+        status = wallet._determine_address_status(
+            address="bc1q_pending_cj",
+            balance=100000,
+            is_external=True,
+            used_addresses={"bc1q_pending_cj"},
+            history_addresses={"bc1q_pending_cj": "flagged"},
+        )
+        assert status == "cj-out"
+
+    def test_determine_status_pending_cj_change_internal(self, wallet):
+        """A CoinJoin change address with funds but still pending (history
+        entry success=False → flagged) must be labeled cj-change, not
+        non-cj-change.
+        """
+        status = wallet._determine_address_status(
+            address="bc1q_pending_change",
+            balance=40000,
+            is_external=False,
+            used_addresses={"bc1q_pending_change"},
+            history_addresses={"bc1q_pending_change": "flagged"},
+        )
+        assert status == "cj-change"
+
     def test_wallet_service_does_not_retain_mnemonic_or_passphrase(
         self, mock_backend, test_mnemonic, test_network
     ):
