@@ -47,7 +47,7 @@ router = APIRouter()
 # ---------------------------------------------------------------------------
 # GET /api/v1/wallet/{walletname}/display
 # ---------------------------------------------------------------------------
-@router.get("/wallet/{walletname}/display")
+@router.get("/wallet/{walletname}/display", operation_id="displaywallet")
 async def wallet_display(
     walletname: str,
     _auth: dict[str, Any] = Depends(require_auth),
@@ -136,7 +136,7 @@ async def wallet_display(
 # ---------------------------------------------------------------------------
 # GET /api/v1/wallet/{walletname}/utxos
 # ---------------------------------------------------------------------------
-@router.get("/wallet/{walletname}/utxos")
+@router.get("/wallet/{walletname}/utxos", operation_id="listutxos")
 async def list_utxos(
     walletname: str,
     _auth: dict[str, Any] = Depends(require_auth),
@@ -174,7 +174,7 @@ async def list_utxos(
 # ---------------------------------------------------------------------------
 # GET /api/v1/wallet/{walletname}/address/new/{mixdepth}
 # ---------------------------------------------------------------------------
-@router.get("/wallet/{walletname}/address/new/{mixdepth}")
+@router.get("/wallet/{walletname}/address/new/{mixdepth}", operation_id="getaddress")
 async def get_new_address(
     walletname: str,
     mixdepth: str,
@@ -200,7 +200,9 @@ async def get_new_address(
 # ---------------------------------------------------------------------------
 # GET /api/v1/wallet/{walletname}/address/timelock/new/{lockdate}
 # ---------------------------------------------------------------------------
-@router.get("/wallet/{walletname}/address/timelock/new/{lockdate}")
+@router.get(
+    "/wallet/{walletname}/address/timelock/new/{lockdate}", operation_id="gettimelockaddress"
+)
 async def get_timelock_address(
     walletname: str,
     lockdate: str,
@@ -273,7 +275,7 @@ async def get_timelock_address(
 # ---------------------------------------------------------------------------
 # GET /api/v1/wallet/{walletname}/getseed
 # ---------------------------------------------------------------------------
-@router.get("/wallet/{walletname}/getseed")
+@router.get("/wallet/{walletname}/getseed", operation_id="getseed")
 async def get_seed(
     walletname: str,
     _auth: dict[str, Any] = Depends(require_auth),
@@ -289,7 +291,7 @@ async def get_seed(
 # ---------------------------------------------------------------------------
 # POST /api/v1/wallet/{walletname}/freeze
 # ---------------------------------------------------------------------------
-@router.post("/wallet/{walletname}/freeze")
+@router.post("/wallet/{walletname}/freeze", operation_id="freeze")
 async def freeze_utxo(
     walletname: str,
     body: FreezeRequest,
@@ -343,7 +345,7 @@ _POLICY_DEFAULTS: dict[str, str] = {
 }
 
 
-@router.post("/wallet/{walletname}/configget")
+@router.post("/wallet/{walletname}/configget", operation_id="configget")
 async def config_get(
     walletname: str,
     body: ConfigGetRequest,
@@ -414,7 +416,7 @@ def _get_setting_value(settings: Any, section: str, field: str) -> Any:
 # ---------------------------------------------------------------------------
 # POST /api/v1/wallet/{walletname}/configset
 # ---------------------------------------------------------------------------
-@router.post("/wallet/{walletname}/configset")
+@router.post("/wallet/{walletname}/configset", operation_id="configsetting")
 async def config_set(
     walletname: str,
     body: ConfigSetRequest,
@@ -437,7 +439,7 @@ async def config_set(
 # ---------------------------------------------------------------------------
 # GET /api/v1/wallet/{walletname}/rescanblockchain/{blockheight}
 # ---------------------------------------------------------------------------
-@router.get("/wallet/{walletname}/rescanblockchain/{blockheight}")
+@router.get("/wallet/{walletname}/rescanblockchain/{blockheight}", operation_id="rescanblockchain")
 async def rescan_blockchain(
     walletname: str,
     blockheight: int,
@@ -473,7 +475,7 @@ async def rescan_blockchain(
 # ---------------------------------------------------------------------------
 # GET /api/v1/wallet/{walletname}/getrescaninfo
 # ---------------------------------------------------------------------------
-@router.get("/wallet/{walletname}/getrescaninfo")
+@router.get("/wallet/{walletname}/getrescaninfo", operation_id="getrescaninfo")
 async def get_rescan_info(
     walletname: str,
     _auth: dict[str, Any] = Depends(require_auth),
@@ -489,7 +491,7 @@ async def get_rescan_info(
 # ---------------------------------------------------------------------------
 # POST /api/v1/wallet/{walletname}/signmessage
 # ---------------------------------------------------------------------------
-@router.post("/wallet/{walletname}/signmessage")
+@router.post("/wallet/{walletname}/signmessage", operation_id="signmessage")
 async def sign_message(
     walletname: str,
     body: SignMessageRequest,
@@ -545,7 +547,7 @@ async def sign_message(
 # ---------------------------------------------------------------------------
 # GET /api/v1/wallet/yieldgen/report
 # ---------------------------------------------------------------------------
-@router.get("/wallet/yieldgen/report")
+@router.get("/wallet/yieldgen/report", operation_id="yieldgenreport")
 async def yieldgen_report(
     state: DaemonState = Depends(get_daemon_state),
 ) -> YieldGenReportResponse:
