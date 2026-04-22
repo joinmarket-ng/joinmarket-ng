@@ -38,7 +38,7 @@ router = APIRouter()
 # ---------------------------------------------------------------------------
 # POST /api/v1/wallet/{walletname}/taker/direct-send
 # ---------------------------------------------------------------------------
-@router.post("/wallet/{walletname}/taker/direct-send")
+@router.post("/wallet/{walletname}/taker/direct-send", operation_id="directsend")
 async def direct_send(
     walletname: str,
     body: DirectSendRequest,
@@ -79,7 +79,7 @@ async def direct_send(
 # ---------------------------------------------------------------------------
 # POST /api/v1/wallet/{walletname}/taker/coinjoin
 # ---------------------------------------------------------------------------
-@router.post("/wallet/{walletname}/taker/coinjoin", status_code=202)
+@router.post("/wallet/{walletname}/taker/coinjoin", status_code=202, operation_id="docoinjoin")
 async def do_coinjoin(
     walletname: str,
     body: DoCoinjoinRequest,
@@ -165,7 +165,7 @@ async def do_coinjoin(
 # ---------------------------------------------------------------------------
 # GET /api/v1/wallet/{walletname}/taker/stop
 # ---------------------------------------------------------------------------
-@router.get("/wallet/{walletname}/taker/stop", status_code=202)
+@router.get("/wallet/{walletname}/taker/stop", status_code=202, operation_id="stopcoinjoin")
 async def stop_coinjoin(
     walletname: str,
     _auth: dict[str, Any] = Depends(require_auth),
@@ -198,7 +198,7 @@ async def stop_coinjoin(
 # ---------------------------------------------------------------------------
 # POST /api/v1/wallet/{walletname}/maker/start
 # ---------------------------------------------------------------------------
-@router.post("/wallet/{walletname}/maker/start", status_code=202)
+@router.post("/wallet/{walletname}/maker/start", status_code=202, operation_id="startmaker")
 async def start_maker(
     walletname: str,
     body: StartMakerRequest,
@@ -286,7 +286,7 @@ async def start_maker(
 # ---------------------------------------------------------------------------
 # GET /api/v1/wallet/{walletname}/maker/stop
 # ---------------------------------------------------------------------------
-@router.get("/wallet/{walletname}/maker/stop", status_code=202)
+@router.get("/wallet/{walletname}/maker/stop", status_code=202, operation_id="stopmaker")
 async def stop_maker(
     walletname: str,
     _auth: dict[str, Any] = Depends(require_auth),

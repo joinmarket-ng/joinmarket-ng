@@ -113,7 +113,7 @@ async def _background_wallet_sync(state: DaemonState, walletname: str) -> None:
 # ---------------------------------------------------------------------------
 # GET /api/v1/getinfo
 # ---------------------------------------------------------------------------
-@router.get("/getinfo")
+@router.get("/getinfo", operation_id="version")
 async def get_info() -> GetInfoResponse:
     """Return backend version information."""
     from jmcore.version import __version__
@@ -124,7 +124,7 @@ async def get_info() -> GetInfoResponse:
 # ---------------------------------------------------------------------------
 # GET /api/v1/session
 # ---------------------------------------------------------------------------
-@router.get("/session")
+@router.get("/session", operation_id="session")
 async def get_session(
     request: Request,
     state: DaemonState = Depends(get_daemon_state),
@@ -176,7 +176,7 @@ async def get_session(
 # ---------------------------------------------------------------------------
 # GET /api/v1/wallet/all
 # ---------------------------------------------------------------------------
-@router.get("/wallet/all")
+@router.get("/wallet/all", operation_id="listwallets")
 async def list_wallets(
     state: DaemonState = Depends(get_daemon_state),
 ) -> ListWalletsResponse:
@@ -187,7 +187,7 @@ async def list_wallets(
 # ---------------------------------------------------------------------------
 # POST /api/v1/wallet/create
 # ---------------------------------------------------------------------------
-@router.post("/wallet/create", status_code=201)
+@router.post("/wallet/create", status_code=201, operation_id="createwallet")
 async def wallet_create(
     body: CreateWalletRequest,
     state: DaemonState = Depends(get_daemon_state),
@@ -235,7 +235,7 @@ async def wallet_create(
 # ---------------------------------------------------------------------------
 # POST /api/v1/wallet/recover
 # ---------------------------------------------------------------------------
-@router.post("/wallet/recover", status_code=201)
+@router.post("/wallet/recover", status_code=201, operation_id="recoverwallet")
 async def wallet_recover(
     body: RecoverWalletRequest,
     state: DaemonState = Depends(get_daemon_state),
@@ -284,7 +284,7 @@ async def wallet_recover(
 # ---------------------------------------------------------------------------
 # POST /api/v1/wallet/{walletname}/unlock
 # ---------------------------------------------------------------------------
-@router.post("/wallet/{walletname}/unlock")
+@router.post("/wallet/{walletname}/unlock", operation_id="unlockwallet")
 async def wallet_unlock(
     walletname: str,
     body: UnlockWalletRequest,
@@ -350,7 +350,7 @@ async def wallet_unlock(
 # ---------------------------------------------------------------------------
 # GET /api/v1/wallet/{walletname}/lock
 # ---------------------------------------------------------------------------
-@router.get("/wallet/{walletname}/lock")
+@router.get("/wallet/{walletname}/lock", operation_id="lockwallet")
 async def wallet_lock(
     walletname: str,
     _auth: dict[str, Any] = Depends(require_auth),
@@ -365,7 +365,7 @@ async def wallet_lock(
 # ---------------------------------------------------------------------------
 # POST /api/v1/token
 # ---------------------------------------------------------------------------
-@router.post("/token")
+@router.post("/token", operation_id="token")
 async def token_refresh(
     body: TokenRequest,
     _auth: dict[str, Any] = Depends(require_auth_allow_expired),

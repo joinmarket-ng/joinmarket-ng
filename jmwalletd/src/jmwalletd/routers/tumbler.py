@@ -187,7 +187,7 @@ def _runner_alive_for(state: DaemonState, wallet_name: str) -> bool:
 # ---------------------------------------------------------------------------
 # POST /api/v1/wallet/{walletname}/tumbler/plan
 # ---------------------------------------------------------------------------
-@router.post("/wallet/{walletname}/tumbler/plan", status_code=201)
+@router.post("/wallet/{walletname}/tumbler/plan", status_code=201, operation_id="tumblerplan")
 async def create_plan(
     walletname: str,
     body: TumblerPlanRequest,
@@ -247,7 +247,7 @@ async def create_plan(
 # ---------------------------------------------------------------------------
 # GET /api/v1/wallet/{walletname}/tumbler/status
 # ---------------------------------------------------------------------------
-@router.get("/wallet/{walletname}/tumbler/status")
+@router.get("/wallet/{walletname}/tumbler/status", operation_id="tumblerstatus")
 async def get_status(
     walletname: str,
     _auth: dict[str, Any] = Depends(require_auth),
@@ -283,7 +283,7 @@ async def get_status(
 # ---------------------------------------------------------------------------
 # POST /api/v1/wallet/{walletname}/tumbler/start
 # ---------------------------------------------------------------------------
-@router.post("/wallet/{walletname}/tumbler/start", status_code=202)
+@router.post("/wallet/{walletname}/tumbler/start", status_code=202, operation_id="tumblerstart")
 async def start_plan(
     walletname: str,
     _auth: dict[str, Any] = Depends(require_auth),
@@ -418,7 +418,7 @@ async def start_plan(
 # ---------------------------------------------------------------------------
 # POST /api/v1/wallet/{walletname}/tumbler/stop
 # ---------------------------------------------------------------------------
-@router.post("/wallet/{walletname}/tumbler/stop", status_code=202)
+@router.post("/wallet/{walletname}/tumbler/stop", status_code=202, operation_id="tumblerstop")
 async def stop_plan(
     walletname: str,
     _auth: dict[str, Any] = Depends(require_auth),
@@ -448,7 +448,9 @@ async def stop_plan(
 # ---------------------------------------------------------------------------
 # DELETE /api/v1/wallet/{walletname}/tumbler/plan
 # ---------------------------------------------------------------------------
-@router.delete("/wallet/{walletname}/tumbler/plan", status_code=204)
+@router.delete(
+    "/wallet/{walletname}/tumbler/plan", status_code=204, operation_id="tumblerplandelete"
+)
 async def delete_plan_endpoint(
     walletname: str,
     _auth: dict[str, Any] = Depends(require_auth),
