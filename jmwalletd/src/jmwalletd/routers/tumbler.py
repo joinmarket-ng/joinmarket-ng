@@ -100,6 +100,7 @@ def _phase_to_response(phase: Any) -> TumblerPhaseResponse:
         common.update(
             duration_seconds=phase.duration_seconds,
             target_cj_count=phase.target_cj_count,
+            idle_timeout_seconds=phase.idle_timeout_seconds,
             cj_served=phase.cj_served,
         )
     elif isinstance(phase, BondlessTakerBurstPhase):

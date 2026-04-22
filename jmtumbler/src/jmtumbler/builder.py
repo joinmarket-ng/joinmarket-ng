@@ -69,6 +69,10 @@ class TumbleParameters:
     rounding_chance: float = 0.25
     rounding_sigfigs: tuple[int, ...] = (2, 3, 4)
     maker_session_seconds: float = 20.0 * 60.0
+    maker_session_idle_timeout_seconds: float | None = None
+    """If set, maker phases exit successfully when no CoinJoin has been served
+    within this many seconds. Useful as a safety fallback when the wallet is
+    never selected as a counterparty."""
     bondless_burst_cj_count: int = 2
     bondless_burst_fraction: float = 0.2
     mintxcount: int = 2
@@ -168,6 +172,7 @@ class PlanBuilder:
                         MakerSessionPhase,
                         duration_seconds=self.params.maker_session_seconds,
                         target_cj_count=None,
+                        idle_timeout_seconds=self.params.maker_session_idle_timeout_seconds,
                         wait_seconds=self._sample_wait(rng),
                     )
                 )
