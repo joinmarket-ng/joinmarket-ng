@@ -1,26 +1,90 @@
 # JoinMarket Tumbler
 
-High-level CoinJoin scheduler for joinmarket-ng. Plans a role-mixed tumble
-across destinations and persists progress to a human-readable YAML file so
-that long-running schedules survive restarts.
+High-level CoinJoin scheduler that mixes a wallet across multiple destinations
+by interleaving taker CoinJoins, maker sessions, and bondless taker bursts.
+Each plan is persisted as YAML so long-running schedules can be inspected,
+paused, or resumed.
 
-## Features
+## Installation
 
-- **Role-mixed schedules**: interleaves taker CoinJoins, maker sessions, and
-  bondless taker bursts to diversify on-chain signatures.
-- **YAML persistence**: each plan is stored as a readable `plan.yaml` that can
-  be inspected, resumed, or cancelled.
-- **Concurrency-safe**: the runner coordinates with `jmwalletd` so manual
-  taker/maker operations are blocked while a tumble is in progress.
-- **Idle-timeout fallback**: maker phases exit gracefully when no CoinJoin is
-  served within a configurable window, preventing indefinite waits.
-- **CLI and HTTP**: drive the scheduler standalone via `jm-tumbler`, or through
-  the tumbler endpoints exposed by `jmwalletd`.
+Install JoinMarket-NG with the tumbler component (it depends on `taker` and
+`maker`):
 
-## Documentation
+```bash
+curl -sSL https://raw.githubusercontent.com/joinmarket-ng/joinmarket-ng/main/install.sh | bash -s -- --tumbler
+```
 
-For full documentation, see
-[jmtumbler Documentation](https://joinmarket-ng.github.io/joinmarket-ng/README-jmtumbler/).
+See [Installation](install.md) for backend setup, Tor configuration, and
+manual install.
+
+## Concepts
+
+A **plan** is a list of ordered **phases**. Each phase is one of:
+
+- `TakerCoinjoinPhase`: a single CoinJoin that advances funds across mixdepths
+  or toward a destination address.
+- `MakerSessionPhase`: runs a maker bot for a bounded window, so the wallet
+  alternates between "taker" and "maker" signatures on-chain.
+- `BondlessTakerBurstPhase`: a burst of small same-mixdepth CoinJoins with
+  orderbook-matched rounding, used to add noise to the subset-sum signature
+  of the funds.
+
+Plans are stored under `$JOINMARKET_DATA_DIR/tumbler/<wallet>/plan.yaml`. The
+same file is shared with `jmwalletd`, so a plan started from the CLI can be
+inspected (and vice versa) via the `/tumbler` HTTP endpoints.
+
+## Prerequisites
+
+- A funded joinmarket wallet (mnemonic file).
+- A working Bitcoin backend (`descriptor_wallet` or `neutrino`).
+- Tor for production use (maker phases rely on it).
+
+## Quick Start
+
+### 1) Build a plan
+
+```bash
+jm-tumbler plan \
+  --mnemonic-file ~/.joinmarket-ng/wallets/default.mnemonic \
+  --destination bc1qdest1... \
+  --destination bc1qdest2...
+```
+
+This inspects the wallet, picks reasonable defaults for maker counts and
+timings, and writes `plan.yaml`. Inspect it:
+
+```bash
+jm-tumbler status --mnemonic-file ~/.joinmarket-ng/wallets/default.mnemonic
+```
+
+### 2) Run the plan
+
+```bash
+jm-tumbler run --mnemonic-file ~/.joinmarket-ng/wallets/default.mnemonic
+```
+
+The runner executes phases in order, persists progress after every transition,
+and exits cleanly on `SIGINT`/`SIGTERM` (progress is kept; resume by calling
+`run` again).
+
+### 3) Cancel or restart
+
+```bash
+jm-tumbler delete --mnemonic-file ~/.joinmarket-ng/wallets/default.mnemonic
+```
+
+## Concurrency with jmwalletd
+
+While a tumble is in progress, `jmwalletd` blocks manual taker and maker calls
+(`/docoinjoin`, `/directsend`, `/startmaker`) to avoid colliding with the
+scheduler. Requests return `409 Conflict` until the tumble finishes or is
+stopped.
+
+## Idle-timeout fallback
+
+`MakerSessionPhase` accepts `idle_timeout_seconds`: if the maker is never
+selected as a counterparty during that window, the phase exits gracefully as
+completed. This prevents a tumble from stalling when no taker shows up.
 
 <!-- AUTO-GENERATED HELP START: jm-tumbler -->
 
@@ -224,20 +288,8 @@ For full documentation, see
 
 <!-- AUTO-GENERATED HELP END: jm-tumbler -->
 
-## Install (editable)
-
-```
-pip install -e jmcore -e jmwallet -e taker -e maker
-pip install -e jmtumbler[dev]
-```
-
-## Tests
-
-```
-pytest jmtumbler/tests
-```
-
 ## Design notes
 
-See [`docs/technical/tumbler-redesign.md`](../docs/technical/tumbler-redesign.md)
-for the full design.
+See [`technical/tumbler-redesign.md`](technical/tumbler-redesign.md) for the
+full design document covering phase kinds, persistence format, runner state
+machine, and interop with `taker` and `maker`.

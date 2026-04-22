@@ -281,6 +281,13 @@ def main() -> int:
                 project_root / "docs" / "README-directory-server.md",
             ],
         ),
+        (
+            "jm-tumbler",
+            [
+                project_root / "jmtumbler" / "README.md",
+                project_root / "docs" / "README-jmtumbler.md",
+            ],
+        ),
     ]
 
     modified = False
