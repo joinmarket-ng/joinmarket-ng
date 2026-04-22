@@ -250,8 +250,17 @@ class Taker(TakerMonitoringMixin):
         await self.sync_wallet()
         await self.connect()
 
-    async def stop(self) -> None:
-        """Stop the taker and close connections."""
+    async def stop(self, *, close_wallet: bool = True) -> None:
+        """Stop the taker and close connections.
+
+        Args:
+            close_wallet: If ``True`` (the default), also close the wallet's
+                backend connection. Pass ``False`` when the wallet is shared
+                with another component (e.g. a jmwalletd tumbler runner that
+                will reuse the same :class:`~jmwallet.wallet.service.WalletService`
+                instance across multiple taker phases) to avoid tearing down a
+                still-in-use wallet.
+        """
         logger.info("Stopping taker...")
         self.running = False
 
@@ -264,7 +273,8 @@ class Taker(TakerMonitoringMixin):
         self._background_tasks.clear()
 
         await self.directory_client.close_all()
-        await self.wallet.close()
+        if close_wallet:
+            await self.wallet.close()
         logger.info("Taker stopped")
 
     async def _update_offers_with_bond_values(self, offers: list) -> None:
