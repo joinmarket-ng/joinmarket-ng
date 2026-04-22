@@ -34,7 +34,9 @@ jobs:
             -e taker \
             -e maker \
             -e directory_server \
-            -e orderbook_watcher
+            -e orderbook_watcher \
+            -e jmwalletd \
+            -e jmtumbler
 
       - name: Build documentation
         run: |
