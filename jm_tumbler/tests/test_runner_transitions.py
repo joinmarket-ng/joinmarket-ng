@@ -634,3 +634,129 @@ class TestRunnerTakerInterop:
             assert call["amount"] == 1_000_000
         # All sub-CJ txids recorded on the burst phase.
         assert len(bursts[0].txids) == bursts[0].cj_count
+
+
+class TestConfirmationGate:
+    """The runner must wait for each phase's txid(s) to confirm before the
+    next phase starts. This mirrors the reference tumbler's ``restart_waiter``
+    and avoids the next phase hitting the Taker's ``taker_utxo_age`` wall on
+    an unconfirmed UTXO.
+    """
+
+    async def test_waits_for_confirmations_between_taker_phases(self, tmp_path: Path) -> None:
+        plan = _plan(tmp_path)
+        # Reduce to 2 phases so the test asserts on a single gate.
+        plan.phases = plan.phases[:2]
+
+        async def make_taker(phase: Any) -> FakeTaker:
+            return FakeTaker(phase)
+
+        # First two polls per txid return 0 confirmations, third returns enough.
+        polls: dict[str, int] = {}
+
+        async def get_confirmations(txid: str) -> int | None:
+            polls[txid] = polls.get(txid, 0) + 1
+            return polls[txid] - 1  # 0, 1, 2, ...
+
+        async def zero_sleep(_: float) -> None:
+            return None
+
+        ctx = RunnerContext(
+            wallet_service=FakeWalletService(),  # type: ignore[arg-type]
+            wallet_name="RunnerTest",
+            data_dir=tmp_path,
+            taker_factory=make_taker,
+            sleep=zero_sleep,
+            min_confirmations_between_phases=2,
+            get_confirmations=get_confirmations,
+            confirmation_poll_interval=0.0,
+        )
+        result = await TumbleRunner(plan, ctx).run()
+        assert result.status == PlanStatus.COMPLETED
+        # get_confirmations was polled at least ``min_conf + 1`` times for the
+        # first phase's txid before the gate released.
+        first_txid = result.phases[0].txid  # type: ignore[attr-defined]
+        assert first_txid is not None
+        assert polls[first_txid] >= 3
+
+    async def test_last_phase_does_not_gate(self, tmp_path: Path) -> None:
+        """No waiting after the final phase — nothing depends on it."""
+        plan = _plan(tmp_path)
+        plan.phases = plan.phases[:1]
+
+        polls: list[str] = []
+
+        async def get_confirmations(txid: str) -> int | None:
+            polls.append(txid)
+            return 0  # would never be "enough" if called
+
+        async def make_taker(phase: Any) -> FakeTaker:
+            return FakeTaker(phase)
+
+        async def zero_sleep(_: float) -> None:
+            return None
+
+        ctx = RunnerContext(
+            wallet_service=FakeWalletService(),  # type: ignore[arg-type]
+            wallet_name="RunnerTest",
+            data_dir=tmp_path,
+            taker_factory=make_taker,
+            sleep=zero_sleep,
+            min_confirmations_between_phases=2,
+            get_confirmations=get_confirmations,
+            confirmation_poll_interval=0.0,
+        )
+        result = await TumbleRunner(plan, ctx).run()
+        assert result.status == PlanStatus.COMPLETED
+        assert polls == []  # never polled because there's no next phase
+
+    async def test_stop_during_confirmation_wait_cancels_plan(self, tmp_path: Path) -> None:
+        plan = _plan(tmp_path)
+
+        async def make_taker(phase: Any) -> FakeTaker:
+            return FakeTaker(phase)
+
+        polls = 0
+
+        async def get_confirmations(txid: str) -> int | None:
+            nonlocal polls
+            polls += 1
+            return 0  # never confirms
+
+        async def zero_sleep(_: float) -> None:
+            return None
+
+        ctx = RunnerContext(
+            wallet_service=FakeWalletService(),  # type: ignore[arg-type]
+            wallet_name="RunnerTest",
+            data_dir=tmp_path,
+            taker_factory=make_taker,
+            sleep=zero_sleep,
+            min_confirmations_between_phases=2,
+            get_confirmations=get_confirmations,
+            confirmation_poll_interval=0.01,
+        )
+        runner = TumbleRunner(plan, ctx)
+        task = asyncio.create_task(runner.run())
+
+        async def _trigger_stop() -> None:
+            # Let the runner reach the confirmation wait, then cancel.
+            for _ in range(100):
+                await asyncio.sleep(0.01)
+                if polls > 0:
+                    break
+            runner.request_stop()
+
+        await asyncio.gather(task, _trigger_stop())
+        assert runner.plan.status == PlanStatus.CANCELLED
+
+    async def test_gate_disabled_when_get_confirmations_is_none(self, tmp_path: Path) -> None:
+        """Backwards-compat: default ctx (no callback) never polls."""
+        plan = _plan(tmp_path)
+
+        async def make_taker(phase: Any) -> FakeTaker:
+            return FakeTaker(phase)
+
+        runner = TumbleRunner(plan, _ctx(tmp_path, taker_factory=make_taker))
+        result = await runner.run()
+        assert result.status == PlanStatus.COMPLETED

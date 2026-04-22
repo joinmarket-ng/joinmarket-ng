@@ -82,6 +82,20 @@ class RunnerContext:
     on_state_changed: Callable[[Plan], None] | None = None
     # Override for tests: replacement for ``asyncio.sleep``.
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
+    # Confirmation gate between phases. After a taker-CJ phase broadcasts
+    # a txid, the next phase is delayed until that txid reaches
+    # ``min_confirmations_between_phases`` confirmations. This mirrors the
+    # reference tumbler's ``restart_waiter`` and prevents the next phase
+    # from hitting the Taker's ``taker_utxo_age`` wall when it tries to
+    # spend an unconfirmed output. Set to ``0`` to disable.
+    min_confirmations_between_phases: int = 5
+    # Optional callback returning the current confirmation count of a txid,
+    # or ``None`` if the transaction is not (yet) visible to the backend.
+    # Required when ``min_confirmations_between_phases > 0``.
+    get_confirmations: Callable[[str], Awaitable[int | None]] | None = None
+    # Polling interval for ``get_confirmations``. Tests override this to
+    # keep runs fast.
+    confirmation_poll_interval: float = 5.0
 
 
 class TumbleRunner:
@@ -124,6 +138,19 @@ class TumbleRunner:
                     self.plan.status = PlanStatus.CANCELLED
                     self._persist()
                     return self.plan
+                # Before advancing, wait for the phase's output(s) to reach
+                # ``taker_utxo_age`` confirmations so the next phase does not
+                # try to spend an unconfirmed UTXO. This mirrors the reference
+                # tumbler's ``restart_waiter``.
+                next_index = self.plan.current_phase + 1
+                has_next = next_index < len(self.plan.phases)
+                if has_next:
+                    try:
+                        await self._wait_for_phase_confirmations(phase)
+                    except _StopRequestedError:
+                        self.plan.status = PlanStatus.CANCELLED
+                        self._persist()
+                        return self.plan
                 self.plan.current_phase += 1
                 self._persist()
                 if phase.wait_seconds > 0 and self.plan.current() is not None:
@@ -412,6 +439,43 @@ class TumbleRunner:
             return
         raise _StopRequestedError()
 
+    async def _wait_for_phase_confirmations(self, phase: Phase) -> None:
+        """Wait for the phase's broadcast txid(s) to reach the confirmation gate.
+
+        Raises ``_StopRequestedError`` if a stop is signalled while polling.
+        Silently returns if the gate is disabled, no callback is wired, or the
+        phase produced no txids (e.g., a maker session).
+        """
+        min_conf = self.ctx.min_confirmations_between_phases
+        if min_conf <= 0:
+            return
+        get_confirmations = self.ctx.get_confirmations
+        if get_confirmations is None:
+            return
+        txids = _phase_txids(phase)
+        if not txids:
+            return
+        for txid in txids:
+            logger.info("tumbler: waiting for txid {} to reach {} confirmations", txid, min_conf)
+            while True:
+                if self._stop_requested.is_set():
+                    raise _StopRequestedError()
+                try:
+                    confirmations = await get_confirmations(txid)
+                except Exception:  # pragma: no cover - transient backend errors
+                    logger.exception("get_confirmations({}) failed; retrying", txid)
+                    confirmations = None
+                if confirmations is not None and confirmations >= min_conf:
+                    break
+                try:
+                    await asyncio.wait_for(
+                        self._stop_requested.wait(),
+                        timeout=self.ctx.confirmation_poll_interval,
+                    )
+                except TimeoutError:
+                    continue
+                raise _StopRequestedError()
+
     def _persist(self) -> None:
         save_plan(self.plan, self.ctx.data_dir)
         if self.ctx.on_state_changed is not None:
@@ -438,6 +502,16 @@ class TakerPhaseError(Exception):
 
 def _now() -> datetime:
     return datetime.now(UTC)
+
+
+def _phase_txids(phase: Phase) -> list[str]:
+    """Return txids produced by a phase, if any."""
+    if isinstance(phase, TakerCoinjoinPhase):
+        return [phase.txid] if phase.txid else []
+    if isinstance(phase, BondlessTakerBurstPhase):
+        return list(phase.txids)
+    # Maker sessions do not produce a single broadcast txid we control.
+    return []
 
 
 def _deadline(phase: MakerSessionPhase) -> datetime | None:

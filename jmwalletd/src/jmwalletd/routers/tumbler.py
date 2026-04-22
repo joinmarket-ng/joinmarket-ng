@@ -369,6 +369,22 @@ async def start_plan(
             }
         )
 
+    async def _get_confirmations(txid: str) -> int | None:
+        """Return confirmation count for ``txid`` via the shared backend.
+
+        ``get_transaction`` returns ``None`` when the backend has not yet seen
+        the transaction; we mirror that so the runner can keep polling.
+        """
+        try:
+            backend = await get_backend(state.data_dir, wallet_service=ws)
+            tx = await backend.get_transaction(txid)
+        except Exception:
+            logger.exception("get_confirmations(%s) backend error", txid)
+            return None
+        if tx is None:
+            return None
+        return int(tx.confirmations)
+
     ctx = RunnerContext(
         wallet_service=ws,
         wallet_name=state.wallet_name,
@@ -376,6 +392,7 @@ async def start_plan(
         taker_factory=_taker_factory,
         maker_factory=_maker_factory,
         on_state_changed=_on_state_changed,
+        get_confirmations=_get_confirmations,
     )
     runner = TumbleRunner(plan, ctx)
 
