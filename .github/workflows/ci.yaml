@@ -133,14 +133,14 @@ jobs:
       - uses: ./.github/actions/setup-python-deps
         with:
           python-version: ${{ matrix.python-version }}
-          components: jmcore,jmwallet,directory_server,orderbook_watcher,maker,taker,jmwalletd
+          components: jmcore,jmwallet,directory_server,orderbook_watcher,maker,taker,jmwalletd,jmtumbler
           install-dev: 'true'
 
       - name: Run unit tests
         run: |
-          pytest -c pytest.ini jmcore jmwallet directory_server orderbook_watcher maker taker jmwalletd \
+          pytest -c pytest.ini jmcore jmwallet directory_server orderbook_watcher maker taker jmwalletd jmtumbler \
             --junitxml=junit/unit-tests.xml \
-            --cov=jmcore --cov=jmwallet --cov=directory_server --cov=orderbook_watcher --cov=maker --cov=taker --cov=jmwalletd \
+            --cov=jmcore --cov=jmwallet --cov=directory_server --cov=orderbook_watcher --cov=maker --cov=taker --cov=jmwalletd --cov=jmtumbler \
             --cov-report=term-missing --cov-report=xml --cov-report=html \
             -v --fail-on-skip
 
@@ -184,7 +184,7 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/setup-python-deps
         with:
-          components: jmcore,jmwallet,directory_server,orderbook_watcher,maker,taker,jmwalletd
+          components: jmcore,jmwallet,directory_server,orderbook_watcher,maker,taker,jmwalletd,jmtumbler
           install-dev: 'true'
 
       - name: Set up Docker Buildx
