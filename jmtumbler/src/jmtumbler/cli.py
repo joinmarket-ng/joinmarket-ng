@@ -1,0 +1,729 @@
+"""
+Standalone command-line interface for the JoinMarket tumbler.
+
+Mirrors the patterns used by :mod:`taker.cli` and :mod:`maker.cli`:
+configuration is loaded from (in priority order) CLI arguments, environment
+variables, the config file at ``~/.joinmarket-ng/config.toml`` (or
+``$JOINMARKET_DATA_DIR/config.toml``), and built-in defaults.
+
+The CLI is a thin wrapper around :mod:`jmtumbler.builder`,
+:mod:`jmtumbler.persistence`, and :mod:`jmtumbler.runner`. Plans are
+persisted to ``<data_dir>/schedules/<wallet_name>.yaml`` so the same file
+is used whether the tumble runs from the CLI or from jmwalletd.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import signal
+from pathlib import Path
+from typing import Annotated, Any
+
+import typer
+from jmcore.cli_common import resolve_mnemonic, setup_cli
+from jmcore.models import NetworkType
+from jmcore.paths import remove_nick_state, write_nick_state
+from jmcore.settings import ensure_config_file
+from jmwallet.wallet.service import WalletService
+from loguru import logger
+
+from jmtumbler.builder import PlanBuilder, TumbleParameters
+from jmtumbler.persistence import (
+    PlanCorruptError,
+    PlanNotFoundError,
+    load_plan,
+    plan_path,
+    save_plan,
+)
+from jmtumbler.persistence import (
+    delete_plan as delete_plan_on_disk,
+)
+from jmtumbler.plan import Plan, PlanStatus
+from jmtumbler.runner import RunnerContext, TumbleRunner
+
+app = typer.Typer(
+    name="jm-tumbler",
+    help="JoinMarket tumbler - role-mixed CoinJoin schedules with YAML-persisted state",
+)
+
+
+# ---------------------------------------------------------------------------
+# Shared CLI helpers
+# ---------------------------------------------------------------------------
+
+
+def _load_or_error(wallet_name: str, data_dir: Path) -> Plan:
+    try:
+        return load_plan(wallet_name, data_dir)
+    except PlanNotFoundError:
+        logger.error(f"No tumbler plan found for wallet {wallet_name!r} under {data_dir}")
+        raise typer.Exit(1)
+    except PlanCorruptError as exc:
+        logger.error(f"Tumbler plan is corrupt: {exc}")
+        raise typer.Exit(1)
+
+
+def _summarise_plan(plan: Plan) -> None:
+    typer.echo(f"plan_id:      {plan.plan_id}")
+    typer.echo(f"wallet:       {plan.wallet_name}")
+    typer.echo(f"status:       {plan.status.value}")
+    typer.echo(f"phases:       {len(plan.phases)} (current={plan.current_phase})")
+    typer.echo(f"destinations: {', '.join(plan.destinations)}")
+    if plan.error:
+        typer.echo(f"error:        {plan.error}")
+    for phase in plan.phases:
+        marker = ">" if phase.index == plan.current_phase else " "
+        typer.echo(f" {marker} [{phase.index:02d}] {phase.kind.value:<22} {phase.status.value}")
+
+
+def _resolve_wallet_name(
+    settings: Any,
+    wallet_name: str | None,
+    mnemonic_file: Path | None,
+    prompt_bip39_passphrase: bool,
+) -> str:
+    """Return ``wallet_name`` if set, else derive it from the default mnemonic.
+
+    Mirrors the default-wallet resolution used by ``jm-wallet info`` so the
+    read-only ``status`` and ``delete`` commands stay symmetrical with
+    ``plan`` / ``run`` (which already fall back to the mnemonic fingerprint).
+    """
+    if wallet_name:
+        return wallet_name
+    try:
+        resolved = resolve_mnemonic(
+            settings,
+            mnemonic_file=mnemonic_file,
+            prompt_bip39_passphrase=prompt_bip39_passphrase,
+        )
+    except (ValueError, FileNotFoundError) as exc:
+        logger.error(str(exc))
+        raise typer.Exit(1)
+    if resolved is None:
+        logger.error("Could not resolve a wallet name; pass --wallet-name or configure a mnemonic.")
+        raise typer.Exit(1)
+    return _wallet_name_from_mnemonic(
+        resolved.mnemonic, resolved.bip39_passphrase or "", settings.network_config.network
+    )
+
+
+async def _collect_balances(wallet: WalletService, mixdepth_count: int) -> dict[int, int]:
+    balances: dict[int, int] = {}
+    for mixdepth in range(mixdepth_count):
+        try:
+            balances[mixdepth] = int(await wallet.get_balance(mixdepth))
+        except Exception:
+            logger.exception(f"failed to read balance for mixdepth {mixdepth}")
+            balances[mixdepth] = 0
+    return balances
+
+
+# ---------------------------------------------------------------------------
+# plan
+# ---------------------------------------------------------------------------
+@app.command("plan")
+def plan_command(
+    destinations: Annotated[
+        list[str],
+        typer.Option("--destination", "-d", help="External destination address (repeatable)"),
+    ],
+    mnemonic_file: Annotated[
+        Path | None, typer.Option("--mnemonic-file", "-f", help="Path to mnemonic file")
+    ] = None,
+    prompt_bip39_passphrase: Annotated[
+        bool,
+        typer.Option(
+            "--prompt-bip39-passphrase",
+            help="Prompt for BIP39 passphrase interactively",
+        ),
+    ] = False,
+    wallet_name: Annotated[
+        str | None,
+        typer.Option(
+            "--wallet-name",
+            "-w",
+            help="Wallet identifier for the plan file; defaults to the mnemonic fingerprint",
+        ),
+    ] = None,
+    network: Annotated[
+        NetworkType | None,
+        typer.Option("--network", case_sensitive=False, help="Bitcoin network"),
+    ] = None,
+    backend_type: Annotated[
+        str | None,
+        typer.Option(
+            "--backend", "-b", help="Backend type: scantxoutset | descriptor_wallet | neutrino"
+        ),
+    ] = None,
+    rpc_url: Annotated[
+        str | None,
+        typer.Option("--rpc-url", envvar="BITCOIN_RPC_URL", help="Bitcoin full node RPC URL"),
+    ] = None,
+    neutrino_url: Annotated[
+        str | None,
+        typer.Option("--neutrino-url", envvar="NEUTRINO_URL", help="Neutrino REST API URL"),
+    ] = None,
+    force: Annotated[
+        bool,
+        typer.Option(
+            "--force",
+            help="Overwrite an existing pending plan",
+        ),
+    ] = False,
+    seed: Annotated[
+        int | None,
+        typer.Option("--seed", help="Seed the plan builder RNG for reproducible schedules"),
+    ] = None,
+    maker_count_min: Annotated[int, typer.Option(help="Minimum counterparty count per CJ")] = 5,
+    maker_count_max: Annotated[int, typer.Option(help="Maximum counterparty count per CJ")] = 9,
+    mincjamount_sats: Annotated[int, typer.Option(help="Minimum CJ amount in sats")] = 100_000,
+    include_maker_sessions: Annotated[
+        bool, typer.Option("--maker-sessions/--no-maker-sessions")
+    ] = True,
+    include_bondless_bursts: Annotated[
+        bool, typer.Option("--bondless-bursts/--no-bondless-bursts")
+    ] = True,
+    log_level: Annotated[str | None, typer.Option("--log-level", "-l")] = None,
+) -> None:
+    """Build a tumbler plan for the given destinations and persist it."""
+    settings = setup_cli(log_level)
+    ensure_config_file(settings.get_data_dir())
+    data_dir = settings.get_data_dir()
+
+    try:
+        resolved = resolve_mnemonic(
+            settings,
+            mnemonic_file=mnemonic_file,
+            prompt_bip39_passphrase=prompt_bip39_passphrase,
+        )
+    except (ValueError, FileNotFoundError) as exc:
+        logger.error(str(exc))
+        raise typer.Exit(1)
+    if resolved is None:
+        logger.error("Could not resolve a mnemonic; supply --mnemonic-file or configure one.")
+        raise typer.Exit(1)
+
+    effective_wallet = wallet_name or _wallet_name_from_mnemonic(
+        resolved.mnemonic, resolved.bip39_passphrase or "", settings.network_config.network
+    )
+
+    existing: Plan | None
+    try:
+        existing = load_plan(effective_wallet, data_dir)
+    except PlanNotFoundError:
+        existing = None
+    except PlanCorruptError as exc:
+        logger.error(f"Tumbler plan is corrupt: {exc}")
+        raise typer.Exit(1)
+
+    if existing is not None and existing.status == PlanStatus.RUNNING:
+        logger.error(
+            f"A plan is already RUNNING for {effective_wallet}; use 'jm-tumbler stop' first."
+        )
+        raise typer.Exit(1)
+    if existing is not None and existing.status == PlanStatus.PENDING and not force:
+        logger.error("A pending plan already exists; pass --force to overwrite.")
+        raise typer.Exit(1)
+
+    try:
+        balances = asyncio.run(
+            _balances_for_mnemonic(
+                settings=settings,
+                mnemonic=resolved.mnemonic,
+                passphrase=resolved.bip39_passphrase or "",
+                network=network,
+                backend_type=backend_type,
+                rpc_url=rpc_url,
+                neutrino_url=neutrino_url,
+            )
+        )
+    except RuntimeError as exc:
+        logger.error(str(exc))
+        raise typer.Exit(1)
+
+    if not any(v > 0 for v in balances.values()):
+        logger.error("Wallet has no confirmed coins to tumble.")
+        raise typer.Exit(1)
+
+    try:
+        params = TumbleParameters(
+            destinations=list(destinations),
+            mixdepth_balances=balances,
+            maker_count_min=maker_count_min,
+            maker_count_max=maker_count_max,
+            mincjamount_sats=mincjamount_sats,
+            include_maker_sessions=include_maker_sessions,
+            include_bondless_bursts=include_bondless_bursts,
+            seed=seed,
+        )
+        plan = PlanBuilder(wallet_name=effective_wallet, params=params).build()
+    except ValueError as exc:
+        logger.error(str(exc))
+        raise typer.Exit(1)
+
+    path = save_plan(plan, data_dir)
+    typer.echo(f"Plan written to {path}")
+    _summarise_plan(plan)
+
+
+# ---------------------------------------------------------------------------
+# status
+# ---------------------------------------------------------------------------
+@app.command("status")
+def status_command(
+    wallet_name: Annotated[
+        str | None,
+        typer.Option(
+            "--wallet-name",
+            "-w",
+            help="Wallet identifier; defaults to the mnemonic fingerprint",
+        ),
+    ] = None,
+    mnemonic_file: Annotated[
+        Path | None, typer.Option("--mnemonic-file", "-f", help="Path to mnemonic file")
+    ] = None,
+    prompt_bip39_passphrase: Annotated[
+        bool,
+        typer.Option(
+            "--prompt-bip39-passphrase",
+            help="Prompt for BIP39 passphrase interactively",
+        ),
+    ] = False,
+    log_level: Annotated[str | None, typer.Option("--log-level", "-l")] = None,
+) -> None:
+    """Print the current plan for the given wallet."""
+    settings = setup_cli(log_level)
+    effective_wallet = _resolve_wallet_name(
+        settings, wallet_name, mnemonic_file, prompt_bip39_passphrase
+    )
+    plan = _load_or_error(effective_wallet, settings.get_data_dir())
+    _summarise_plan(plan)
+
+
+# ---------------------------------------------------------------------------
+# delete
+# ---------------------------------------------------------------------------
+@app.command("delete")
+def delete_command(
+    wallet_name: Annotated[
+        str | None,
+        typer.Option(
+            "--wallet-name",
+            "-w",
+            help="Wallet identifier; defaults to the mnemonic fingerprint",
+        ),
+    ] = None,
+    mnemonic_file: Annotated[
+        Path | None, typer.Option("--mnemonic-file", "-f", help="Path to mnemonic file")
+    ] = None,
+    prompt_bip39_passphrase: Annotated[
+        bool,
+        typer.Option(
+            "--prompt-bip39-passphrase",
+            help="Prompt for BIP39 passphrase interactively",
+        ),
+    ] = False,
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip confirmation prompt")] = False,
+    log_level: Annotated[str | None, typer.Option("--log-level", "-l")] = None,
+) -> None:
+    """Delete the on-disk plan for ``wallet_name``."""
+    settings = setup_cli(log_level)
+    data_dir = settings.get_data_dir()
+    effective_wallet = _resolve_wallet_name(
+        settings, wallet_name, mnemonic_file, prompt_bip39_passphrase
+    )
+    plan = _load_or_error(effective_wallet, data_dir)
+    if plan.status == PlanStatus.RUNNING:
+        logger.error("Plan is RUNNING; stop it before deleting.")
+        raise typer.Exit(1)
+    if not yes and not typer.confirm(
+        f"Delete tumbler plan for {effective_wallet} (status={plan.status.value})?"
+    ):
+        typer.echo("Cancelled.")
+        return
+    if delete_plan_on_disk(effective_wallet, data_dir):
+        typer.echo(f"Deleted {plan_path(effective_wallet, data_dir)}")
+    else:
+        typer.echo("Nothing to delete.")
+
+
+# ---------------------------------------------------------------------------
+# run
+# ---------------------------------------------------------------------------
+@app.command("run")
+def run_command(
+    mnemonic_file: Annotated[
+        Path | None, typer.Option("--mnemonic-file", "-f", help="Path to mnemonic file")
+    ] = None,
+    prompt_bip39_passphrase: Annotated[
+        bool,
+        typer.Option("--prompt-bip39-passphrase", help="Prompt for BIP39 passphrase interactively"),
+    ] = False,
+    wallet_name: Annotated[
+        str | None,
+        typer.Option(
+            "--wallet-name", "-w", help="Wallet identifier; defaults to the mnemonic fingerprint"
+        ),
+    ] = None,
+    network: Annotated[NetworkType | None, typer.Option("--network", case_sensitive=False)] = None,
+    backend_type: Annotated[
+        str | None,
+        typer.Option("--backend", "-b"),
+    ] = None,
+    rpc_url: Annotated[str | None, typer.Option("--rpc-url", envvar="BITCOIN_RPC_URL")] = None,
+    neutrino_url: Annotated[
+        str | None, typer.Option("--neutrino-url", envvar="NEUTRINO_URL")
+    ] = None,
+    directory_servers: Annotated[
+        str | None,
+        typer.Option("--directory", "-D", envvar="DIRECTORY_SERVERS"),
+    ] = None,
+    tor_socks_host: Annotated[str | None, typer.Option(help="Tor SOCKS host override")] = None,
+    tor_socks_port: Annotated[int | None, typer.Option(help="Tor SOCKS port override")] = None,
+    fee_rate: Annotated[
+        float | None,
+        typer.Option(
+            "--fee-rate",
+            help=(
+                "Manual fee rate in sat/vB (mutually exclusive with --block-target). "
+                "Required when the backend is neutrino."
+            ),
+        ),
+    ] = None,
+    block_target: Annotated[
+        int | None,
+        typer.Option(
+            "--block-target",
+            help=(
+                "Target blocks for fee estimation (mutually exclusive with --fee-rate). "
+                "Not supported with the neutrino backend."
+            ),
+        ),
+    ] = None,
+    min_confirmations_between_phases: Annotated[
+        int,
+        typer.Option(
+            "--min-confirmations",
+            help="Confirmations required before the next phase starts (0 disables gating)",
+        ),
+    ] = 5,
+    log_level: Annotated[str | None, typer.Option("--log-level", "-l")] = None,
+) -> None:
+    """Execute the saved plan for a wallet to completion."""
+    settings = setup_cli(log_level)
+    ensure_config_file(settings.get_data_dir())
+    data_dir = settings.get_data_dir()
+
+    if fee_rate is not None and block_target is not None:
+        logger.error("--fee-rate and --block-target are mutually exclusive.")
+        raise typer.Exit(1)
+
+    effective_backend_type = backend_type or settings.bitcoin.backend_type
+    if effective_backend_type == "neutrino" and fee_rate is None:
+        logger.error("Neutrino backend cannot estimate fees; pass --fee-rate <sat/vB> to proceed.")
+        raise typer.Exit(1)
+
+    try:
+        resolved = resolve_mnemonic(
+            settings,
+            mnemonic_file=mnemonic_file,
+            prompt_bip39_passphrase=prompt_bip39_passphrase,
+        )
+    except (ValueError, FileNotFoundError) as exc:
+        logger.error(str(exc))
+        raise typer.Exit(1)
+    if resolved is None:
+        logger.error("Could not resolve a mnemonic.")
+        raise typer.Exit(1)
+
+    effective_wallet = wallet_name or _wallet_name_from_mnemonic(
+        resolved.mnemonic, resolved.bip39_passphrase or "", settings.network_config.network
+    )
+    plan = _load_or_error(effective_wallet, data_dir)
+    if plan.status in (PlanStatus.COMPLETED, PlanStatus.FAILED, PlanStatus.CANCELLED):
+        logger.error(
+            f"Plan is in terminal state {plan.status.value}; create a new plan before running."
+        )
+        raise typer.Exit(1)
+    if plan.status == PlanStatus.RUNNING:
+        # A prior process crashed mid-run. Reconcile to FAILED and bail: the
+        # user must inspect and delete before re-planning.
+        plan.status = PlanStatus.FAILED
+        plan.error = plan.error or "previous run crashed"
+        save_plan(plan, data_dir)
+        logger.error("Plan was RUNNING on disk but no runner is attached; marked FAILED.")
+        raise typer.Exit(1)
+
+    try:
+        asyncio.run(
+            _run_plan(
+                settings=settings,
+                plan=plan,
+                mnemonic=resolved.mnemonic,
+                passphrase=resolved.bip39_passphrase or "",
+                creation_height=resolved.creation_height,
+                data_dir=data_dir,
+                network=network,
+                backend_type=backend_type,
+                rpc_url=rpc_url,
+                neutrino_url=neutrino_url,
+                directory_servers=directory_servers,
+                tor_socks_host=tor_socks_host,
+                tor_socks_port=tor_socks_port,
+                fee_rate=fee_rate,
+                block_target=block_target,
+                min_confirmations_between_phases=min_confirmations_between_phases,
+            )
+        )
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user")
+        raise typer.Exit(130)
+
+
+# ---------------------------------------------------------------------------
+# config-init
+# ---------------------------------------------------------------------------
+@app.command("config-init")
+def config_init(
+    data_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--data-dir",
+            "-d",
+            envvar="JOINMARKET_DATA_DIR",
+            help="Data directory for JoinMarket files",
+        ),
+    ] = None,
+) -> None:
+    """Initialize the config file with default settings."""
+    from jmcore.paths import get_default_data_dir
+
+    if data_dir is None:
+        data_dir = get_default_data_dir()
+    config_path = ensure_config_file(data_dir)
+    typer.echo(f"Config file created at: {config_path}")
+
+
+# ---------------------------------------------------------------------------
+# Implementation helpers
+# ---------------------------------------------------------------------------
+
+
+def _wallet_name_from_mnemonic(mnemonic: str, passphrase: str, network: NetworkType) -> str:
+    """Derive a stable wallet identifier from the mnemonic fingerprint.
+
+    Mirrors :func:`jmwallet.backends.descriptor_wallet.generate_wallet_name` so
+    both the CLI and jmwalletd-backed flows land on the same plan file.
+    """
+    from jmwallet.backends.descriptor_wallet import (
+        generate_wallet_name,
+        get_mnemonic_fingerprint,
+    )
+
+    fingerprint = get_mnemonic_fingerprint(mnemonic, passphrase)
+    return generate_wallet_name(fingerprint, network.value)
+
+
+async def _balances_for_mnemonic(
+    settings: Any,
+    mnemonic: str,
+    passphrase: str,
+    network: NetworkType | None,
+    backend_type: str | None,
+    rpc_url: str | None,
+    neutrino_url: str | None,
+) -> dict[int, int]:
+    """Open a read-only wallet, sync, and return per-mixdepth balances."""
+    from taker.cli import build_taker_config, create_backend
+
+    config = build_taker_config(
+        settings=settings,
+        mnemonic=mnemonic,
+        passphrase=passphrase,
+        network=network,
+        backend_type=backend_type,
+        rpc_url=rpc_url,
+        neutrino_url=neutrino_url,
+    )
+    backend = create_backend(config)
+    wallet = WalletService(
+        mnemonic=config.mnemonic.get_secret_value(),
+        passphrase=config.passphrase.get_secret_value(),
+        backend=backend,
+        network=(config.bitcoin_network or config.network).value,
+        mixdepth_count=config.mixdepth_count,
+        data_dir=config.data_dir,
+    )
+    try:
+        await wallet.sync()
+    except AttributeError:
+        # Older WalletService revisions sync lazily; balances will still work.
+        pass
+    try:
+        return await _collect_balances(wallet, config.mixdepth_count)
+    finally:
+        close = getattr(wallet, "close", None)
+        if close is not None:
+            try:
+                result = close()
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception:  # pragma: no cover - best effort close
+                logger.exception("wallet close failed")
+
+
+async def _run_plan(
+    settings: Any,
+    plan: Plan,
+    mnemonic: str,
+    passphrase: str,
+    creation_height: int | None,
+    data_dir: Path,
+    network: NetworkType | None,
+    backend_type: str | None,
+    rpc_url: str | None,
+    neutrino_url: str | None,
+    directory_servers: str | None,
+    tor_socks_host: str | None,
+    tor_socks_port: int | None,
+    fee_rate: float | None,
+    block_target: int | None,
+    min_confirmations_between_phases: int,
+) -> None:
+    """Instantiate backend, wallet, and runner; execute the plan."""
+    from maker.bot import MakerBot
+    from maker.cli import build_maker_config
+    from maker.cli import create_wallet_service as create_maker_wallet
+    from pydantic import SecretStr
+    from taker.cli import build_taker_config, create_backend
+    from taker.taker import Taker
+
+    # Shared wallet across all phases (the runner asks factories to build
+    # transient Takers/Makers but reuses this ``WalletService``).
+    taker_config = build_taker_config(
+        settings=settings,
+        mnemonic=mnemonic,
+        passphrase=passphrase,
+        network=network,
+        backend_type=backend_type,
+        rpc_url=rpc_url,
+        neutrino_url=neutrino_url,
+        directory_servers=directory_servers,
+        tor_socks_host=tor_socks_host,
+        tor_socks_port=tor_socks_port,
+        fee_rate=fee_rate,
+        block_target=block_target,
+    )
+    if creation_height is not None:
+        taker_config.creation_height = creation_height
+    shared_backend = create_backend(taker_config)
+    bitcoin_network = taker_config.bitcoin_network or taker_config.network
+    wallet = WalletService(
+        mnemonic=taker_config.mnemonic.get_secret_value(),
+        passphrase=taker_config.passphrase.get_secret_value(),
+        backend=shared_backend,
+        network=bitcoin_network.value,
+        mixdepth_count=taker_config.mixdepth_count,
+        data_dir=taker_config.data_dir,
+    )
+    try:
+        await wallet.sync()
+    except AttributeError:
+        pass
+
+    async def _taker_factory(phase: Any) -> Any:
+        backend = create_backend(taker_config)
+        config = build_taker_config(
+            settings=settings,
+            mnemonic=mnemonic,
+            passphrase=passphrase,
+            amount=getattr(phase, "amount", 0) or 0,
+            destination=getattr(phase, "destination", "INTERNAL") or "INTERNAL",
+            mixdepth=getattr(phase, "mixdepth", 0),
+            counterparties=getattr(phase, "counterparty_count", None),
+            network=network,
+            backend_type=backend_type,
+            rpc_url=rpc_url,
+            neutrino_url=neutrino_url,
+            directory_servers=directory_servers,
+            tor_socks_host=tor_socks_host,
+            tor_socks_port=tor_socks_port,
+            fee_rate=fee_rate,
+            block_target=block_target,
+        )
+        if creation_height is not None:
+            config.creation_height = creation_height
+        return Taker(wallet=wallet, backend=backend, config=config)
+
+    async def _maker_factory(_phase: Any) -> Any:
+        backend = create_backend(taker_config)
+        config = build_maker_config(
+            settings=settings,
+            mnemonic=mnemonic,
+            passphrase=passphrase,
+            network=network,
+            backend_type=backend_type,
+            rpc_url=rpc_url,
+            neutrino_url=neutrino_url,
+            directory_servers=directory_servers,
+            tor_socks_host=tor_socks_host,
+            tor_socks_port=tor_socks_port,
+        )
+        _ = SecretStr  # re-export guard for linter (SecretStr is used via config)
+        _ = create_maker_wallet  # silence unused-import; reserved for future fork
+        return MakerBot(wallet=wallet, backend=backend, config=config)
+
+    async def _get_confirmations(txid: str) -> int | None:
+        try:
+            tx = await shared_backend.get_transaction(txid)
+        except Exception:
+            logger.exception(f"get_confirmations({txid}) backend error")
+            return None
+        if tx is None:
+            return None
+        return int(tx.confirmations)
+
+    ctx = RunnerContext(
+        wallet_service=wallet,
+        wallet_name=plan.wallet_name,
+        data_dir=data_dir,
+        taker_factory=_taker_factory,
+        maker_factory=_maker_factory,
+        get_confirmations=_get_confirmations,
+        min_confirmations_between_phases=min_confirmations_between_phases,
+    )
+    runner = TumbleRunner(plan, ctx)
+
+    write_nick_state(data_dir, "tumbler", plan.wallet_name)
+    loop = asyncio.get_running_loop()
+    task = asyncio.create_task(runner.run())
+
+    def _signal_handler() -> None:
+        logger.info("Stop requested; finishing current phase then exiting.")
+        runner.request_stop()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _signal_handler)
+        except NotImplementedError:  # pragma: no cover - Windows
+            pass
+
+    try:
+        final = await task
+    finally:
+        remove_nick_state(data_dir, "tumbler")
+
+    typer.echo(f"Tumble finished with status: {final.status.value}")
+    if final.error:
+        typer.echo(f"error: {final.error}")
+    if final.status != PlanStatus.COMPLETED:
+        raise typer.Exit(1)
+
+
+def main() -> None:
+    """Entry point."""
+    app()
+
+
+if __name__ == "__main__":
+    main()
