@@ -103,6 +103,7 @@ async def do_coinjoin(
         state.activate_coinjoin_state(CoinjoinState.TAKER_RUNNING)
 
         async def _run_coinjoin() -> None:
+            taker: Any | None = None
             try:
                 backend = await get_backend(state.data_dir, force_new=True)
                 jm_settings = get_settings()
@@ -134,6 +135,14 @@ async def do_coinjoin(
             except Exception:
                 logger.exception("Coinjoin failed")
             finally:
+                # Always tear down the taker so its directory-client and
+                # background tasks do not leak. Keep the shared wallet open
+                # for any subsequent operation on the daemon.
+                if taker is not None:
+                    try:
+                        await taker.stop(close_wallet=False)
+                    except Exception:
+                        logger.exception("Taker teardown failed")
                 state.activate_coinjoin_state(CoinjoinState.NOT_RUNNING)
                 state._taker_ref = None
 
@@ -180,6 +189,7 @@ async def run_schedule(
         state.activate_coinjoin_state(CoinjoinState.TAKER_RUNNING)
 
         async def _run_tumbler() -> None:
+            taker: Any | None = None
             try:
                 ws = state.wallet_service
                 backend = await get_backend(state.data_dir, force_new=True)
@@ -220,6 +230,13 @@ async def run_schedule(
             except Exception:
                 logger.exception("Tumbler failed")
             finally:
+                # Always tear down the taker so its directory-client and
+                # background tasks do not leak. Keep the shared wallet open.
+                if taker is not None:
+                    try:
+                        await taker.stop(close_wallet=False)
+                    except Exception:
+                        logger.exception("Taker teardown failed")
                 state.activate_coinjoin_state(CoinjoinState.NOT_RUNNING)
                 state.current_schedule = None
                 state._taker_ref = None
