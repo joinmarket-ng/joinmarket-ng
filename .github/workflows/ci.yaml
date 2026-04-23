@@ -222,7 +222,7 @@ jobs:
             30 1
 
           .github/scripts/wait-for-service.sh "jmwalletd" \
-            "curl -sf http://127.0.0.1:28183/api/v1/getinfo" \
+            "curl -skf https://127.0.0.1:28183/api/v1/getinfo" \
             60 2
 
           echo "Waiting for makers to connect..."
@@ -333,7 +333,7 @@ jobs:
             30 1
 
           .github/scripts/wait-for-service.sh "jam-playwright" \
-            "curl -sf http://127.0.0.1:29183/api/v1/session" \
+            "curl -skf https://127.0.0.1:29183/api/v1/session" \
             90 2
 
           echo "E2E services ready!"
@@ -342,8 +342,10 @@ jobs:
         working-directory: tests/playwright
         env:
           CI: "true"
-          JAM_URL: http://localhost:29183
-          JMWALLETD_URL: http://localhost:29183
+          JAM_URL: https://localhost:29183
+          JMWALLETD_URL: https://localhost:29183
+          # jmwalletd serves a self-signed cert in the e2e stack; accept it for test-only traffic.
+          NODE_TLS_REJECT_UNAUTHORIZED: "0"
         run: npx playwright test
 
       - name: Show Docker logs on failure

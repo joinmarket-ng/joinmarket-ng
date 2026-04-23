@@ -26,7 +26,7 @@ import { saveCredentials } from "./fixtures";
 const WALLET_NAME = "pw-test.jmdat";
 const PASSWORD = "testpassword123";
 const MIN_BALANCE_BTC = 0.005;
-const JMWALLETD_URL = process.env.JMWALLETD_URL || "http://localhost:29183";
+const JMWALLETD_URL = process.env.JMWALLETD_URL || "https://localhost:29183";
 const BITCOIN_RPC_URL = process.env.BITCOIN_RPC_URL || "http://localhost:18443";
 const BITCOIN_RPC_USER = process.env.BITCOIN_RPC_USER || "test";
 const BITCOIN_RPC_PASS = process.env.BITCOIN_RPC_PASS || "test";

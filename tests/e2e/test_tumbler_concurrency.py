@@ -27,6 +27,7 @@ from loguru import logger
 from tests.e2e.test_tumbler_e2e import (
     API,
     FUND_AMOUNT_BTC,
+    TLS_VERIFY,
     _auth,
     _create_wallet,
     _ensure_no_wallet,
@@ -51,7 +52,7 @@ async def jmwalletd_ready() -> None:
 
 @pytest.fixture()
 async def client(jmwalletd_ready: None) -> AsyncGenerator[httpx.AsyncClient, None]:
-    async with httpx.AsyncClient(timeout=60) as c:
+    async with httpx.AsyncClient(timeout=60, verify=TLS_VERIFY) as c:
         yield c
 
 

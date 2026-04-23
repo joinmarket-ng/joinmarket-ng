@@ -28,6 +28,7 @@ from tests.e2e.test_tumbler_e2e import (
     API,
     FUND_AMOUNT_BTC,
     STATUS_POLL_INTERVAL_SEC,
+    TLS_VERIFY,
     _auth,
     _background_miner,
     _create_wallet,
@@ -63,7 +64,7 @@ async def jmwalletd_ready() -> None:
 
 @pytest.fixture()
 async def client(jmwalletd_ready: None) -> AsyncGenerator[httpx.AsyncClient, None]:
-    async with httpx.AsyncClient(timeout=60) as c:
+    async with httpx.AsyncClient(timeout=60, verify=TLS_VERIFY) as c:
         yield c
 
 

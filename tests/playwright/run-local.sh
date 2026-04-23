@@ -95,7 +95,7 @@ if [[ "${BLOCK_HEIGHT}" -gt "${MAX_HEIGHT}" ]]; then
 fi
 
 info "Waiting for jam-playwright (port 29183)..."
-timeout 120 bash -c 'until curl -sf http://localhost:29183/api/v1/session >/dev/null 2>&1; do sleep 2; done' || {
+timeout 120 bash -c 'until curl -skf https://localhost:29183/api/v1/session >/dev/null 2>&1; do sleep 2; done' || {
   error "jam-playwright container did not start in time"
   exit 1
 }
@@ -108,8 +108,10 @@ npx playwright install chromium
 
 # -- 3. Run tests --
 info "Running Playwright tests..."
-export JAM_URL="${JAM_URL:-http://localhost:29183}"
-export JMWALLETD_URL="${JMWALLETD_URL:-http://localhost:29183}"
+export JAM_URL="${JAM_URL:-https://localhost:29183}"
+export JMWALLETD_URL="${JMWALLETD_URL:-https://localhost:29183}"
+# jmwalletd serves a self-signed cert; allow Node's global fetch to accept it.
+export NODE_TLS_REJECT_UNAUTHORIZED=0
 
 # Build the playwright command.
 # --slowmo is passed as an env var PLAYWRIGHT_SLOWMO (read by playwright.config.ts)

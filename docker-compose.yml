@@ -265,7 +265,6 @@ services:
       # Regtest has no defaults so we must supply the local compose directories.
       - NETWORK_CONFIG__DIRECTORY_SERVERS=jm-directory:5222,jm-directory2:5223
       - JMWALLETD_HOST=0.0.0.0
-      - JMWALLETD_NO_TLS=true
       - LOGGING__LEVEL=DEBUG
       - OBWATCH_URL=http://jm-orderbook-watcher:8000
       - TOR__SOCKS_HOST=jm-tor
@@ -319,7 +318,6 @@ services:
       - NETWORK_CONFIG__NETWORK=testnet
       - NETWORK_CONFIG__BITCOIN_NETWORK=regtest
       - JMWALLETD_HOST=0.0.0.0
-      - JMWALLETD_NO_TLS=true
       - LOGGING__LEVEL=DEBUG
       - OBWATCH_URL=http://jm-orderbook-watcher:8000
       - TOR__SOCKS_HOST=jm-tor
