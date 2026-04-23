@@ -3,9 +3,14 @@
  *
  * Used ONLY for test setup/teardown (creating/unlocking a wallet, mining,
  * checking session state). All user interactions must go through the browser.
+ *
+ * jmwalletd presents a self-signed TLS cert in the e2e stack. The playwright
+ * runner relaxes Node's TLS verification via ``NODE_TLS_REJECT_UNAUTHORIZED=0``
+ * (set by ``run-local.sh`` and the CI workflow) so the global ``fetch`` works
+ * against the self-signed endpoint without additional dispatcher plumbing.
  */
 
-const JMWALLETD_URL = process.env.JMWALLETD_URL || "http://localhost:29183";
+const JMWALLETD_URL = process.env.JMWALLETD_URL || "https://localhost:29183";
 
 interface CreateWalletResponse {
   walletname: string;

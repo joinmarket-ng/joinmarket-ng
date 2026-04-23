@@ -18,8 +18,11 @@ import pytest
 
 pytestmark = pytest.mark.e2e
 
-JMWALLETD_URL = "http://127.0.0.1:28183"
+JMWALLETD_URL = "https://127.0.0.1:28183"
 API = f"{JMWALLETD_URL}/api/v1"
+
+# Self-signed cert on the e2e jmwalletd; clients must skip verification.
+TLS_VERIFY = False
 
 
 # ---------------------------------------------------------------------------
@@ -35,7 +38,7 @@ def _wallet_name() -> str:
 async def _wait_for_jmwalletd(timeout: float = 60.0) -> None:
     """Block until jmwalletd is responding on its HTTP port."""
     deadline = asyncio.get_event_loop().time() + timeout
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(verify=TLS_VERIFY) as client:
         while asyncio.get_event_loop().time() < deadline:
             try:
                 r = await client.get(f"{API}/getinfo", timeout=5)
@@ -138,7 +141,7 @@ async def jmwalletd_ready() -> None:
 @pytest.fixture()
 async def client(jmwalletd_ready: None) -> AsyncGenerator[httpx.AsyncClient, None]:
     """Shared async HTTP client that also ensures jmwalletd is up."""
-    async with httpx.AsyncClient(timeout=30) as c:
+    async with httpx.AsyncClient(timeout=30, verify=TLS_VERIFY) as c:
         yield c
 
 

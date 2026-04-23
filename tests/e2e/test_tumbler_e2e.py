@@ -35,8 +35,11 @@ from tests.e2e.rpc_utils import BitcoinRPCError, rpc_call
 
 pytestmark = pytest.mark.e2e
 
-JMWALLETD_URL = "http://127.0.0.1:28183"
+JMWALLETD_URL = "https://127.0.0.1:28183"
 API = f"{JMWALLETD_URL}/api/v1"
+
+# Self-signed cert on the e2e jmwalletd; clients must skip verification.
+TLS_VERIFY = False
 
 # Funds per mixdepth deposit. 1 BTC is well above the PoDLE commitment
 # requirement (20% of CJ amount) for the fractional/sweep CJs this test
@@ -64,7 +67,7 @@ def _auth(token: str) -> dict[str, str]:
 async def _wait_for_jmwalletd(timeout: float = 60.0) -> None:
     """Block until jmwalletd is responding on its HTTP port."""
     deadline = asyncio.get_event_loop().time() + timeout
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(verify=TLS_VERIFY) as client:
         while asyncio.get_event_loop().time() < deadline:
             try:
                 r = await client.get(f"{API}/getinfo", timeout=5)
@@ -413,7 +416,7 @@ async def jmwalletd_ready() -> None:
 async def client(jmwalletd_ready: None) -> AsyncGenerator[httpx.AsyncClient, None]:
     # Longer timeout than the default: CJ startup can take tens of seconds as
     # the taker builds PoDLE commitments and authenticates to the directory.
-    async with httpx.AsyncClient(timeout=60) as c:
+    async with httpx.AsyncClient(timeout=60, verify=TLS_VERIFY) as c:
         yield c
 
 
