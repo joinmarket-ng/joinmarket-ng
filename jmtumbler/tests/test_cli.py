@@ -161,3 +161,121 @@ class TestRunFeeOptions:
         # guard accepts the configuration.
         assert result.exit_code == 1
         m_resolve.assert_called_once()
+
+
+class TestRunCounterpartiesOption:
+    def test_counterparties_flag_is_accepted(self, tmp_path: Path) -> None:
+        # --counterparties plumbs through option parsing without tripping
+        # the fee or backend guards. Plan-load still fails (no plan on disk)
+        # but the option must at least be recognised by typer.
+        settings = _FakeSettings(tmp_path, backend="neutrino")
+
+        class _Resolved:
+            mnemonic = "abandon " * 11 + "about"
+            bip39_passphrase = ""
+            creation_height = None
+
+        with (
+            patch("jmtumbler.cli.setup_cli", return_value=settings),
+            patch("jmtumbler.cli.ensure_config_file"),
+            patch("jmtumbler.cli.resolve_mnemonic", return_value=_Resolved()),
+            patch("jmtumbler.cli._wallet_name_from_mnemonic", return_value="w"),
+        ):
+            result = runner.invoke(
+                app,
+                [
+                    "run",
+                    "--backend",
+                    "neutrino",
+                    "--fee-rate",
+                    "2",
+                    "--counterparties",
+                    "3",
+                ],
+            )
+        # Plan doesn't exist → exits 1 after option parsing, but typer must
+        # not reject the flag itself.
+        assert result.exit_code == 1
+        assert "No such option" not in result.stdout
+
+    def test_counterparties_rejects_out_of_range(self, tmp_path: Path) -> None:
+        settings = _FakeSettings(tmp_path, backend="neutrino")
+        with (
+            patch("jmtumbler.cli.setup_cli", return_value=settings),
+            patch("jmtumbler.cli.ensure_config_file"),
+        ):
+            result = runner.invoke(
+                app,
+                [
+                    "run",
+                    "--backend",
+                    "neutrino",
+                    "--fee-rate",
+                    "2",
+                    "--counterparties",
+                    "99",
+                ],
+            )
+        assert result.exit_code != 0
+
+
+class TestPlanDefaultsCounterpartyFromSettings:
+    def test_maker_count_defaults_pull_from_settings(self, tmp_path: Path) -> None:
+        """Without --maker-count-min/--max, the plan uses settings.taker.counterparty_count."""
+
+        class _Taker:
+            counterparty_count = 4
+
+        settings = _FakeSettings(tmp_path)
+        settings.taker = _Taker()  # type: ignore[attr-defined]
+
+        class _Resolved:
+            mnemonic = "abandon " * 11 + "about"
+            bip39_passphrase = ""
+            creation_height = None
+
+        captured: dict[str, TumbleParameters] = {}
+
+        class _FakeBuilder:
+            def __init__(self, wallet_name: str, params: TumbleParameters) -> None:
+                captured["params"] = params
+                self.params = params
+                self.wallet_name = wallet_name
+
+            def build(self):  # type: ignore[no-untyped-def]
+                from jmtumbler.builder import PlanBuilder
+
+                return PlanBuilder(self.wallet_name, self.params).build()
+
+        with (
+            patch("jmtumbler.cli.setup_cli", return_value=settings),
+            patch("jmtumbler.cli.ensure_config_file"),
+            patch("jmtumbler.cli.resolve_mnemonic", return_value=_Resolved()),
+            patch("jmtumbler.cli._wallet_name_from_mnemonic", return_value="w"),
+            patch(
+                "jmtumbler.cli._balances_for_mnemonic",
+                return_value=None,
+            ) as m_bal,
+            patch("jmtumbler.cli.PlanBuilder", _FakeBuilder),
+        ):
+            # _balances_for_mnemonic is awaited inside asyncio.run; return a
+            # coroutine-compatible result by patching asyncio.run itself.
+            with patch(
+                "jmtumbler.cli.asyncio.run",
+                return_value={0: 1_000_000, 1: 0},
+            ):
+                m_bal.return_value = {0: 1_000_000, 1: 0}
+                result = runner.invoke(
+                    app,
+                    [
+                        "plan",
+                        "-w",
+                        "w",
+                        "--destination",
+                        "bcrt1qdest0000000000000000000000000000000000abc",
+                    ],
+                )
+        assert result.exit_code == 0, result.stdout
+        params = captured["params"]
+        assert params.maker_count_min == 4
+        assert params.maker_count_max == 4

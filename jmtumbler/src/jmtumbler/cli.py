@@ -174,8 +174,22 @@ def plan_command(
         int | None,
         typer.Option("--seed", help="Seed the plan builder RNG for reproducible schedules"),
     ] = None,
-    maker_count_min: Annotated[int, typer.Option(help="Minimum counterparty count per CJ")] = 5,
-    maker_count_max: Annotated[int, typer.Option(help="Maximum counterparty count per CJ")] = 9,
+    maker_count_min: Annotated[
+        int | None,
+        typer.Option(
+            help=(
+                "Minimum counterparty count per CJ; defaults to settings.taker.counterparty_count"
+            ),
+        ),
+    ] = None,
+    maker_count_max: Annotated[
+        int | None,
+        typer.Option(
+            help=(
+                "Maximum counterparty count per CJ; defaults to settings.taker.counterparty_count"
+            ),
+        ),
+    ] = None,
     mincjamount_sats: Annotated[int, typer.Option(help="Minimum CJ amount in sats")] = 100_000,
     include_maker_sessions: Annotated[
         bool, typer.Option("--maker-sessions/--no-maker-sessions")
@@ -246,11 +260,17 @@ def plan_command(
         raise typer.Exit(1)
 
     try:
+        effective_min = (
+            maker_count_min if maker_count_min is not None else settings.taker.counterparty_count
+        )
+        effective_max = (
+            maker_count_max if maker_count_max is not None else settings.taker.counterparty_count
+        )
         params = TumbleParameters(
             destinations=list(destinations),
             mixdepth_balances=balances,
-            maker_count_min=maker_count_min,
-            maker_count_max=maker_count_max,
+            maker_count_min=effective_min,
+            maker_count_max=effective_max,
             mincjamount_sats=mincjamount_sats,
             include_maker_sessions=include_maker_sessions,
             include_bondless_bursts=include_bondless_bursts,
@@ -407,6 +427,18 @@ def run_command(
             help="Confirmations required before the next phase starts (0 disables gating)",
         ),
     ] = 5,
+    counterparties: Annotated[
+        int | None,
+        typer.Option(
+            "--counterparties",
+            min=1,
+            max=20,
+            help=(
+                "Override the counterparty count for every phase at runtime. "
+                "Useful when the configured count is unavailable on the chosen network."
+            ),
+        ),
+    ] = None,
     log_level: Annotated[str | None, typer.Option("--log-level", "-l")] = None,
 ) -> None:
     """Execute the saved plan for a wallet to completion."""
@@ -473,6 +505,7 @@ def run_command(
                 fee_rate=fee_rate,
                 block_target=block_target,
                 min_confirmations_between_phases=min_confirmations_between_phases,
+                counterparties_override=counterparties,
             )
         )
     except KeyboardInterrupt:
@@ -589,6 +622,7 @@ async def _run_plan(
     fee_rate: float | None,
     block_target: int | None,
     min_confirmations_between_phases: int,
+    counterparties_override: int | None = None,
 ) -> None:
     """Instantiate backend, wallet, and runner; execute the plan."""
     from maker.bot import MakerBot
@@ -633,6 +667,16 @@ async def _run_plan(
 
     async def _taker_factory(phase: Any) -> Any:
         backend = create_backend(taker_config)
+        effective_counterparties = (
+            counterparties_override
+            if counterparties_override is not None
+            else getattr(phase, "counterparty_count", None)
+        )
+        # The runner also reads phase.counterparty_count when calling
+        # ``do_coinjoin``; keep it consistent with the TakerConfig we build so
+        # the override applies uniformly.
+        if counterparties_override is not None and hasattr(phase, "counterparty_count"):
+            phase.counterparty_count = counterparties_override
         config = build_taker_config(
             settings=settings,
             mnemonic=mnemonic,
@@ -640,7 +684,7 @@ async def _run_plan(
             amount=getattr(phase, "amount", 0) or 0,
             destination=getattr(phase, "destination", "INTERNAL") or "INTERNAL",
             mixdepth=getattr(phase, "mixdepth", 0),
-            counterparties=getattr(phase, "counterparty_count", None),
+            counterparties=effective_counterparties,
             network=network,
             backend_type=backend_type,
             rpc_url=rpc_url,
