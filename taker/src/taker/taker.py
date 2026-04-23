@@ -2165,13 +2165,13 @@ class Taker(TakerMonitoringMixin):
             self._randomized_fee_rate = random.uniform(
                 base_rate, base_rate * (1 + self.config.tx_fee_factor)
             )
-            logger.debug(
-                f"Fee rate randomized: base={base_rate:.2f}, "
-                f"randomized={self._randomized_fee_rate:.2f} sat/vB "
-                f"(factor={self.config.tx_fee_factor})"
+            logger.info(
+                f"Randomized fee rate: {self._randomized_fee_rate:.2f} sat/vB "
+                f"(base={base_rate:.2f}, factor={self.config.tx_fee_factor})"
             )
         else:
             self._randomized_fee_rate = base_rate
+            logger.info(f"Fee rate randomization disabled (factor=0); using {base_rate:.2f} sat/vB")
 
     def _get_taker_cj_output_index(self) -> int | None:
         """
