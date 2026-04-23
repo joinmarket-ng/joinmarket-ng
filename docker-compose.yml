@@ -150,7 +150,7 @@ services:
     healthcheck:
       test: ["CMD", "jm-directory-ctl", "health"]
       interval: 10s
-      timeout: 5s
+      timeout: 15s
       retries: 5
     depends_on:
       bitcoin:
@@ -190,7 +190,7 @@ services:
     healthcheck:
       test: ["CMD", "jm-directory-ctl", "health"]
       interval: 10s
-      timeout: 5s
+      timeout: 15s
       retries: 5
     depends_on:
       bitcoin:
