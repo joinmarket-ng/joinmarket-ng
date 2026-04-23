@@ -196,6 +196,7 @@ def test_tui_script_maker_menu_loops_until_back() -> None:
     content = SCRIPT_PATH.read_text()
     maker_block = content.split("    M)\n", 1)[1].split("\n    U)\n", 1)[0]
     assert "while true; do" in maker_block
+    assert 'pgrep -f "jm-maker"' in maker_block
     assert "[ $? -ne 0 ] && break" in maker_block
     assert "BACK)\n              break" in maker_block
 

@@ -1089,6 +1089,13 @@ $WALLET_INFO | Maker Bot: $MAKER_STATUS
     M)
       # Maker submenu
       while true; do
+
+      if pgrep -f "jm-maker" > /dev/null 2>&1; then
+        MAKER_STATUS="RUNNING"
+      else
+        MAKER_STATUS="STOPPED"
+      fi
+
       MCHOICE=$(whiptail --title " Maker Bot (${MAKER_STATUS}) " --menu "Choose option:" 18 64 8 \
         "START"   "Start Maker Bot" \
         "STOP"    "Stop Maker Bot" \
