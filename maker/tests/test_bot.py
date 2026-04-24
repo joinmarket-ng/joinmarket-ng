@@ -402,6 +402,51 @@ class TestHiddenServiceListener:
         # After cleanup, connection should be removed
         assert "J5taker123" not in bot.direct_connections, "Connection should be cleaned up"
 
+    @pytest.mark.asyncio
+    async def test_on_direct_connection_clean_eof_not_logged_as_error(
+        self, mock_wallet, mock_backend, config_with_onion, caplog
+    ):
+        """Clean EOF after handshake must not surface as an ERROR.
+
+        Orderbook-watcher health checks and directory-handshake probes connect,
+        read the handshake response, and disconnect. The maker's receive loop
+        sees that as ``ConnectionError('Connection closed by peer')`` from
+        TCPConnection.receive(). It should log that at INFO, not ERROR, so it
+        doesn't swamp operator logs with every benign probe.
+        """
+        import logging
+
+        bot = MakerBot(
+            wallet=mock_wallet,
+            backend=mock_backend,
+            config=config_with_onion,
+        )
+        bot.running = True
+
+        mock_conn = MagicMock(spec=TCPConnection)
+        mock_conn.is_connected.side_effect = [True, True, False]
+
+        async def mock_receive() -> bytes:
+            raise ConnectionError("Connection closed by peer")
+
+        mock_conn.receive = mock_receive
+
+        async def mock_close() -> None:
+            pass
+
+        mock_conn.close = mock_close
+
+        with caplog.at_level(logging.INFO, logger="maker.direct_connection"):
+            await bot._on_direct_connection(mock_conn, "127.0.0.1:12345")
+
+        # No ERROR-level record should mention this peer_str.
+        errors = [
+            r for r in caplog.records if r.levelno >= logging.ERROR and "12345" in r.getMessage()
+        ]
+        assert errors == [], (
+            f"Clean EOF should not log at ERROR; got: {[r.getMessage() for r in errors]}"
+        )
+
 
 class TestHandlePush:
     """Tests for _handle_push method."""

@@ -388,6 +388,14 @@ class DirectConnectionMixin:
                 except TimeoutError:
                     # No message received, continue waiting
                     continue
+                except ConnectionError as e:
+                    # Remote closed the TCP connection. This is routine for
+                    # orderbook-watcher health checks and directory-handshake
+                    # discovery probes, which connect, read the handshake
+                    # response, and disconnect. Log at INFO so real problems
+                    # (parse errors, unexpected exceptions) still surface.
+                    logger.info(f"Direct connection from {peer_str} closed by peer: {e}")
+                    break
                 except Exception as e:
                     logger.error(f"Error processing direct message from {peer_str}: {e}")
                     break
