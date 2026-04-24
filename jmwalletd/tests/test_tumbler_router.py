@@ -239,6 +239,36 @@ class TestCreatePlan:
         assert resp.status_code == 400
         assert "no confirmed coins" in resp.json()["message"]
 
+    def test_create_plan_accepts_legacy_jam_parameters(
+        self,
+        app_with_wallet: TestClient,
+        auth_token: str,
+    ) -> None:
+        resp = app_with_wallet.post(
+            f"/api/v1/wallet/{WALLET}/tumbler/plan",
+            json={
+                "destinations": ["bcrt1qdestAaaaaa"],
+                "force": True,
+                "parameters": {
+                    "addrcount": 1,
+                    "minmakercount": 1,
+                    "makercountrange": [1, 0],
+                    "mixdepthcount": 1,
+                    "mintxcount": 1,
+                    "txcountparams": [1, 0],
+                    "timelambda": 0.025,
+                    "stage1_timelambda_increase": 1,
+                    "liquiditywait": 13,
+                    "waittime": 0,
+                },
+            },
+            headers=_auth(auth_token),
+        )
+        assert resp.status_code == 201, resp.text
+        body = resp.json()
+        assert body["status"] == PlanStatus.PENDING
+        assert len(body["phases"]) > 0
+
     def test_stop_not_running_uses_service_state_auth_header(
         self,
         app_with_wallet: TestClient,

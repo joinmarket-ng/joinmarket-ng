@@ -75,6 +75,45 @@ router = APIRouter()
 # ---------------------------------------------------------------------------
 
 
+def _normalize_legacy_tumbler_parameters(raw: dict[str, object] | None) -> dict[str, object]:
+    """Translate legacy JAM tumbler option names to ``TumbleParameters`` kwargs.
+
+    The current JAM sweep page still sends the old ``tumbler_options`` field
+    names in its testing payload. Accept them here so the HTTP surface remains
+    compatible while the frontend catches up.
+    """
+    if not raw:
+        return {}
+
+    params = dict(raw)
+    maker_count_range = params.pop("makercountrange", None)
+    if isinstance(maker_count_range, list) and len(maker_count_range) >= 1:
+        minimum = params.pop("minmakercount", None)
+        params.setdefault(
+            "maker_count_min", minimum if minimum is not None else maker_count_range[0]
+        )
+        spread = maker_count_range[1] if len(maker_count_range) > 1 else 0
+        if minimum is None:
+            minimum = maker_count_range[0]
+        if isinstance(minimum, int) and isinstance(spread, int):
+            params.setdefault("maker_count_max", minimum + spread)
+
+    time_lambda = params.pop("timelambda", None)
+    if time_lambda is not None:
+        params.setdefault("time_lambda_seconds", time_lambda)
+
+    # These legacy testing-only knobs do not have direct equivalents in the new
+    # planner and should not be forwarded into ``TumbleParameters``.
+    params.pop("addrcount", None)
+    params.pop("mixdepthcount", None)
+    params.pop("txcountparams", None)
+    params.pop("stage1_timelambda_increase", None)
+    params.pop("liquiditywait", None)
+    params.pop("waittime", None)
+
+    return params
+
+
 def _phase_to_response(phase: Any) -> TumblerPhaseResponse:
     """Flatten the discriminated-union phase into the wire response shape."""
     common: dict[str, Any] = {
@@ -219,7 +258,7 @@ async def create_plan(
     if not any(v > 0 for v in balances.values()):
         raise ActionNotAllowed("Wallet has no confirmed coins to tumble.")
 
-    extra = body.parameters or {}
+    extra = _normalize_legacy_tumbler_parameters(body.parameters)
     try:
         params = TumbleParameters(
             destinations=list(body.destinations),
