@@ -282,6 +282,89 @@ class TestOnionPeerConnection:
         # But success indicates the connect+handshake worked
 
     @pytest.mark.asyncio
+    async def test_connect_records_peer_features(self):
+        """OnionPeer stores features advertised by the peer during handshake.
+
+        This lets the taker skip incompatible makers before sending !fill,
+        rather than discovering the mismatch only during !auth / !pubkey
+        response parsing.
+        """
+        peer = OnionPeer(nick="J5maker", location="test.onion:5222")
+
+        # Unknown until handshake completes.
+        assert peer.supports_feature("neutrino_compat") is None
+
+        mock_connection = AsyncMock()
+        mock_connection.is_connected.return_value = True
+
+        import json
+
+        handshake_data = {
+            "app-name": "joinmarket",
+            "proto-ver": 5,
+            "directory": False,
+            "features": {"neutrino_compat": True, "peerlist_features": True},
+            "location-string": "test.onion:5222",
+            "nick": "J5maker",
+            "network": "regtest",
+        }
+        handshake_response = {"type": 793, "line": json.dumps(handshake_data)}
+        mock_connection.receive.return_value = json.dumps(handshake_response).encode()
+
+        with patch("jmcore.network.connect_via_tor", return_value=mock_connection):
+            success = await peer.connect(
+                our_nick="J5taker",
+                our_location="NOT-SERVING-ONION",
+                network="regtest",
+            )
+            await peer.disconnect()
+
+        assert success
+        assert peer.peer_features == {"neutrino_compat": True, "peerlist_features": True}
+        assert peer.supports_feature("neutrino_compat") is True
+        assert peer.supports_feature("peerlist_features") is True
+        # Known feature dict, feature absent -> False (not None).
+        assert peer.supports_feature("push_encrypted") is False
+
+    @pytest.mark.asyncio
+    async def test_connect_peer_without_features_is_unknown(self):
+        """A peer that handshakes with an empty features dict is treated as
+        "unknown compatibility" (None), so callers don't wrongly assume legacy
+        peers advertise no features when in fact they advertised nothing.
+        """
+        peer = OnionPeer(nick="J5maker", location="test.onion:5222")
+
+        mock_connection = AsyncMock()
+        mock_connection.is_connected.return_value = True
+
+        import json
+
+        handshake_data = {
+            "app-name": "joinmarket",
+            "proto-ver": 5,
+            "directory": False,
+            "features": {},
+            "location-string": "test.onion:5222",
+            "nick": "J5maker",
+            "network": "regtest",
+        }
+        handshake_response = {"type": 793, "line": json.dumps(handshake_data)}
+        mock_connection.receive.return_value = json.dumps(handshake_response).encode()
+
+        with patch("jmcore.network.connect_via_tor", return_value=mock_connection):
+            success = await peer.connect(
+                our_nick="J5taker",
+                our_location="NOT-SERVING-ONION",
+                network="regtest",
+            )
+            await peer.disconnect()
+
+        assert success
+        assert peer.peer_features == {}
+        # Empty features dict -> unknown (not "confirmed-no-support").
+        assert peer.supports_feature("neutrino_compat") is None
+
+    @pytest.mark.asyncio
     async def test_connect_handshake_rejected(self):
         """Test connection when handshake has wrong app name."""
         peer = OnionPeer(

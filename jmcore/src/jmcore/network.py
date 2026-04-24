@@ -417,6 +417,12 @@ class OnionPeer:
         self._base_backoff = 2.0  # seconds
         self._last_connect_attempt: float = 0.0
 
+        # Features advertised by the peer in its handshake response. Populated
+        # after a successful handshake. Empty dict means handshake did not
+        # include a features field (e.g., older peers) -- callers should treat
+        # this as "unknown" rather than "not supported".
+        self.peer_features: dict[str, Any] = {}
+
     def _parse_location(self) -> None:
         """Parse location string into hostname and port."""
         if self.location == "NOT-SERVING-ONION":
@@ -446,6 +452,19 @@ class OnionPeer:
     def status(self) -> int:
         """Get current connection status."""
         return self._status
+
+    def supports_feature(self, feature: str) -> bool | None:
+        """Return True/False if we know peer's support for feature, None if unknown.
+
+        Returns:
+            True if the peer advertised the feature in its handshake.
+            False if the handshake response included features but not this one.
+            None if no handshake has completed yet or the response had no
+            features field (treat as unknown, e.g., legacy peers).
+        """
+        if not self.peer_features:
+            return None
+        return bool(self.peer_features.get(feature, False))
 
     def is_connected(self) -> bool:
         """Check if peer is connected and ready to send messages."""
@@ -603,6 +622,14 @@ class OnionPeer:
             raise OnionPeerConnectionError(
                 f"Network mismatch: expected {network}, got {peer_network}"
             )
+
+        # Record advertised features (e.g., {"neutrino_compat": True}). Used by
+        # callers to filter incompatible peers before sending protocol messages.
+        raw_features = data.get("features", {})
+        if isinstance(raw_features, dict):
+            self.peer_features = dict(raw_features)
+        else:
+            self.peer_features = {}
 
         logger.debug(f"Handshake with peer {self.nick} successful")
 
