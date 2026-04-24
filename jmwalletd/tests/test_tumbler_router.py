@@ -239,6 +239,18 @@ class TestCreatePlan:
         assert resp.status_code == 400
         assert "no confirmed coins" in resp.json()["message"]
 
+    def test_stop_not_running_uses_service_state_auth_header(
+        self,
+        app_with_wallet: TestClient,
+        auth_token: str,
+    ) -> None:
+        resp = app_with_wallet.post(
+            f"/api/v1/wallet/{WALLET}/tumbler/stop",
+            headers=_auth(auth_token),
+        )
+        assert resp.status_code == 401
+        assert resp.headers["WWW-Authenticate"].startswith('Bearer, error="service_state"')
+
 
 # ----------------------------------------------------------------------------
 # GET /tumbler/status

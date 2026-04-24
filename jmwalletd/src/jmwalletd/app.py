@@ -22,7 +22,12 @@ from fastapi.responses import JSONResponse
 from loguru import logger
 
 from jmwalletd.deps import get_daemon_state, set_daemon_state
-from jmwalletd.errors import JMWalletDaemonError
+from jmwalletd.errors import (
+    InsufficientScope,
+    InvalidCredentials,
+    InvalidToken,
+    JMWalletDaemonError,
+)
 from jmwalletd.log_buffer import install_log_sink
 from jmwalletd.state import DaemonState
 
@@ -116,9 +121,16 @@ def create_app(*, data_dir: Path | None = None) -> FastAPI:
     async def daemon_error_handler(request: Request, exc: JMWalletDaemonError) -> JSONResponse:
         headers: dict[str, str] = {}
 
-        # Add WWW-Authenticate header for 401/403 errors (per RFC 6750).
+        # Add WWW-Authenticate header for auth-related 401/403 errors and label
+        # service-state 401s distinctly so JAM does not mis-handle them as an
+        # expired token.
         if exc.status_code in (401, 403):
-            error_type = "invalid_token" if exc.status_code == 401 else "insufficient_scope"
+            if isinstance(exc, (InvalidToken, InvalidCredentials)):
+                error_type = "invalid_token"
+            elif isinstance(exc, InsufficientScope):
+                error_type = "insufficient_scope"
+            else:
+                error_type = "service_state"
             headers["WWW-Authenticate"] = (
                 f'Bearer, error="{error_type}", error_description="{exc.detail}"'
             )

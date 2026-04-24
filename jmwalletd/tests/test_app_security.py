@@ -29,6 +29,7 @@ def test_invalid_token_rejected_on_session_endpoint(app_with_jam_assets: TestCli
         headers={"Authorization": "Bearer invalid-token"},
     )
     assert resp.status_code == 401
+    assert resp.headers["WWW-Authenticate"].startswith('Bearer, error="invalid_token"')
 
 
 def test_root_serves_spa_index(app_with_jam_assets: TestClient) -> None:
