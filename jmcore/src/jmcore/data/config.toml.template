@@ -328,7 +328,7 @@
 # Network/miner transaction fee settings
 # fee_rate takes precedence over fee_block_target when set
 # fee_rate = 10.0             # Manual fee rate in sat/vB (omit to use estimation)
-# tx_fee_factor = 3.0         # Fee estimation multiplier (minimum: 1.0)
+# tx_fee_factor = 0.2         # Fee randomization factor (0 disables; 0.2 = up to +20%)
 # fee_block_target = 6        # Target blocks for fee estimation (1-1008, omit to use default)
 
 # Fidelity bond settings

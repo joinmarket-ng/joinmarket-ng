@@ -643,9 +643,12 @@ class TakerSettings(BaseModel):
         return v
 
     tx_fee_factor: float = Field(
-        default=3.0,
-        ge=1.0,
-        description="Multiply estimated fee by this factor",
+        default=0.2,
+        ge=0.0,
+        description=(
+            "Fee randomization factor. 0 disables randomization; "
+            "0.2 randomizes up to 20% above the base rate."
+        ),
     )
     fee_rate: float | None = Field(
         default=None,

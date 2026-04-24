@@ -68,6 +68,10 @@ Configuration merges as: `config.toml` < environment variables < CLI flags.
 
 Backend setup and defaults: [Installation](install.md#configure-backend).
 
+`taker.tx_fee_factor` controls additive fee randomization, not a direct multiplier. A value
+of `0.2` picks a session fee rate between the base rate and `base_rate * 1.2`; `0` disables
+randomization.
+
 For all option details, use auto-generated command help below (`jm-taker coinjoin --help`, `jm-taker tumble --help`).
 
 ## Docker Deployment
