@@ -1002,6 +1002,141 @@ async def test_blacklist_rejection_doesnt_ignore_maker(
     assert maker_nick in taker.orderbook_manager.ignored_makers
 
 
+@pytest.mark.asyncio
+async def test_podle_skips_blacklisted_commitments(mock_wallet, tmp_path):
+    """PoDLEManager must skip commitments present in the local blacklist,
+    even on a fresh install where used_commitments is empty.
+    """
+    from jmcore.commitment_blacklist import set_blacklist_path
+    from jmcore.podle import generate_podle
+
+    from taker.podle_manager import PoDLEManager
+
+    # Isolate the global blacklist to this test's tmp dir
+    blacklist_path = tmp_path / "commitmentlist"
+    set_blacklist_path(blacklist_path=blacklist_path)
+
+    utxos = [make_utxo(txid_char="a", address="bcrt1qtest1")]
+    priv = b"\x01" * 32
+
+    # Pre-compute the index-0 commitment and add it to the blacklist so the
+    # manager is forced to use index 1.
+    utxo_str = f"{utxos[0].txid}:{utxos[0].vout}"
+    blacklisted_hex = generate_podle(priv, utxo_str, 0).commitment.hex()
+
+    from jmcore.commitment_blacklist import add_commitment
+
+    assert add_commitment(blacklisted_hex) is True
+
+    manager = PoDLEManager(data_dir=tmp_path)
+    commitment = manager.generate_fresh_commitment(
+        wallet_utxos=utxos,
+        cj_amount=10_000_000,
+        private_key_getter=lambda _addr: priv,
+        min_confirmations=1,
+        min_percent=20,
+        max_retries=3,
+    )
+
+    assert commitment is not None
+    # The manager must have moved past the blacklisted index 0.
+    assert commitment.commitment.index >= 1
+    # Blacklisted commitment must also be marked as used so we don't retry it.
+    assert blacklisted_hex in manager.used_commitments
+
+    # Reset global blacklist for other tests.
+    set_blacklist_path(blacklist_path=None, data_dir=None)
+
+
+@pytest.mark.asyncio
+async def test_expand_preselected_utxos_same_mixdepth(
+    mock_wallet, mock_backend, mock_config, tmp_path
+):
+    """_expand_preselected_utxos_same_mixdepth must add an eligible UTXO from
+    the same mixdepth that is not already in preselected_utxos.
+    """
+    mock_config.data_dir = tmp_path
+    taker = Taker(mock_wallet, mock_backend, mock_config)
+    taker.cj_amount = 10_000_000
+
+    already = make_utxo(txid_char="a", address="bcrt1qtest1")
+    candidate = make_utxo(
+        txid_char="b",
+        vout=1,
+        value=30_000_000,
+        address="bcrt1qtest2",
+        path="m/84'/1'/0'/0/1",
+    )
+
+    taker.preselected_utxos = [already]
+    # Return both; only the non-preselected one should be added.
+    mock_wallet.get_all_utxos = Mock(return_value=[already, candidate])
+
+    added = taker._expand_preselected_utxos_same_mixdepth(mixdepth=0)
+
+    assert added == 1
+    assert len(taker.preselected_utxos) == 2
+    assert (candidate.txid, candidate.vout) in {(u.txid, u.vout) for u in taker.preselected_utxos}
+
+    # A second call with no new eligible UTXOs must add nothing and not fail.
+    mock_wallet.get_all_utxos = Mock(return_value=[already, candidate])
+    added_again = taker._expand_preselected_utxos_same_mixdepth(mixdepth=0)
+    assert added_again == 0
+    assert len(taker.preselected_utxos) == 2
+
+
+@pytest.mark.asyncio
+async def test_remote_blacklist_reports_are_persisted(tmp_path):
+    """Commitments reported as blacklisted by remote makers must be persisted
+    to the local blacklist so we don't retry them on future sessions (or
+    across a fresh install of the taker).
+    """
+    from jmcore.commitment_blacklist import (
+        add_commitment,
+        check_commitment,
+        set_blacklist_path,
+    )
+
+    blacklist_path = tmp_path / "commitmentlist"
+    set_blacklist_path(blacklist_path=blacklist_path)
+
+    commitment_hex = "de" * 32
+
+    # Initially allowed (blacklist is empty).
+    assert check_commitment(commitment_hex) is True
+
+    # Persist a remote-reported blacklist hit and verify the global blacklist
+    # now rejects it on disk as well.
+    assert add_commitment(commitment_hex) is True
+    assert blacklist_path.exists()
+    contents = blacklist_path.read_text()
+    assert commitment_hex in contents
+
+    # A second call returns False (already present) but is still safe.
+    assert add_commitment(commitment_hex) is False
+    assert check_commitment(commitment_hex) is False
+
+    # Reset global blacklist for other tests.
+    set_blacklist_path(blacklist_path=None, data_dir=None)
+
+
+def test_phase_result_supports_blacklist_makers():
+    """PhaseResult must carry a blacklist_makers list so do_coinjoin can
+    classify minority vs majority blacklist rejections.
+    """
+    default = PhaseResult(success=False)
+    assert default.blacklist_makers == []
+
+    explicit = PhaseResult(
+        success=False,
+        failed_makers=["J5A", "J5B"],
+        blacklist_error=True,
+        blacklist_makers=["J5B"],
+    )
+    assert explicit.blacklist_makers == ["J5B"]
+    assert explicit.blacklist_error is True
+
+
 class TestUpdatePendingTransactionNow:
     """Tests for immediate pending transaction update on coinjoin completion."""
 

@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from jmcore.commitment_blacklist import get_blacklist
 from jmcore.paths import get_used_commitments_path
 from jmcore.podle import generate_podle
 from loguru import logger
@@ -117,6 +118,16 @@ class PoDLEManager:
             logger.warning("No eligible UTXOs for PoDLE")
             return None
 
+        # Consult both our local "used" set and the shared blacklist file.
+        # The blacklist (cmtdata/commitmentlist) may be populated from !hp2
+        # broadcasts or from remote "blacklisted" rejections we persisted.
+        # It is harmless (but slightly slower) when empty, e.g. fresh installs.
+        try:
+            blacklist = get_blacklist()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(f"Could not load commitment blacklist: {exc}")
+            blacklist = None
+
         # Try each UTXO in order (already sorted by confirmations, value)
         # Fresh UTXOs naturally succeed faster (at index 0)
         for utxo in eligible_utxos:
@@ -135,6 +146,16 @@ class PoDLEManager:
 
                     if commitment_hex in self.used_commitments:
                         logger.debug(f"PoDLE commitment for {utxo_str} index {index} already used")
+                        continue
+
+                    if blacklist is not None and blacklist.is_blacklisted(commitment_hex):
+                        logger.debug(
+                            f"PoDLE commitment for {utxo_str} index {index} is blacklisted"
+                        )
+                        # Also persist to used_commitments so we don't regenerate
+                        # the same candidate next call.
+                        self.used_commitments.add(commitment_hex)
+                        self._save()
                         continue
 
                     # Found unused commitment

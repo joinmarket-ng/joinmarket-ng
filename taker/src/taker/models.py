@@ -65,6 +65,11 @@ class PhaseResult:
     success: bool
     failed_makers: list[str] = Field(default_factory=list)
     blacklist_error: bool = False  # True if any maker rejected due to blacklisted commitment
+    # Subset of failed_makers that specifically rejected with a "blacklist" error.
+    # Used so the taker can tell "minority blacklist rejection" (probably a lying
+    # or out-of-sync maker -> ignore + replace the maker) from "majority blacklist
+    # rejection" (commitment really is known -> rotate commitment).
+    blacklist_makers: list[str] = Field(default_factory=list)
 
     @property
     def needs_replacement(self) -> bool:
