@@ -51,7 +51,7 @@ from taker.models import MakerSession, PhaseResult, TakerState
 from taker.monitoring import TakerMonitoringMixin
 from taker.multi_directory import MultiDirectoryClient
 from taker.orderbook import OrderbookManager, calculate_cj_fee
-from taker.podle import ExtendedPoDLECommitment
+from taker.podle import ExtendedPoDLECommitment, get_eligible_podle_utxos
 from taker.podle_manager import PoDLEManager
 from taker.tx_builder import CoinJoinTxBuilder, build_coinjoin_tx
 
@@ -848,20 +848,68 @@ class Taker(TakerMonitoringMixin):
             max_podle_retries = self.config.taker_utxo_retries
             max_replacement_attempts = self.config.max_maker_replacement_attempts
             replacement_attempt = 0
+            # Minority threshold: if strictly fewer than half of the asked makers
+            # reject with "blacklist", treat those as lying/out-of-sync makers and
+            # ignore them (replace via the normal path), keeping our current
+            # commitment for the remaining makers. This prevents a single maker
+            # from forcing us to burn a commitment / UTXO by always claiming
+            # "blacklisted" (anti-DoS, per user guidance: "if only one is
+            # rejecting everything we could replace it or untrust it; if all or
+            # most say the same then it might be on us").
 
             for podle_retry in range(max_podle_retries):
+                session_size_before_fill = len(self.maker_sessions)
                 fill_result = await self._phase_fill()
 
                 if fill_result.success:
                     break  # Success, proceed to next phase
 
-                if fill_result.blacklist_error:
-                    # Don't add makers to ignored list when commitment is blacklisted
-                    # The maker may accept a different commitment, so we should retry
-                    # with a new NUMS index or different UTXO
-                    logger.debug(
-                        f"Commitment blacklisted by makers: {fill_result.failed_makers}. "
-                        "Will retry with new commitment."
+                # Persist remotely-reported blacklisted commitments to our local
+                # blacklist so we don't try the same commitment again on future
+                # sessions (including after a fresh install). We do this whether
+                # it's minority or majority: at worst a malicious maker "burns"
+                # that one commitment, which we'd re-derive from the same UTXO
+                # at a different NUMS index on the next attempt.
+                if fill_result.blacklist_makers and self.podle_commitment is not None:
+                    commitment_hex = self.podle_commitment.commitment.commitment.hex()
+                    try:
+                        from jmcore.commitment_blacklist import add_commitment
+
+                        add_commitment(commitment_hex)
+                    except Exception as exc:  # pragma: no cover - defensive
+                        logger.warning(
+                            f"Could not persist remotely-reported blacklisted commitment: {exc}"
+                        )
+
+                # Classify "blacklist" errors as minority vs majority.
+                # Denominator is the session size just before this fill attempt.
+                n_blacklisted = len(fill_result.blacklist_makers)
+                majority_blacklist = (
+                    fill_result.blacklist_error
+                    and session_size_before_fill > 0
+                    and n_blacklisted * 2 >= session_size_before_fill
+                )
+
+                if fill_result.blacklist_error and not majority_blacklist:
+                    # Minority report: trust the majority (the others, or our
+                    # local state) over the rejecting maker(s). Treat them as
+                    # regular failed makers and try maker replacement.
+                    logger.warning(
+                        f"Minority blacklist rejection from {fill_result.blacklist_makers} "
+                        f"({n_blacklisted}/{session_size_before_fill}). Ignoring those makers "
+                        "and trying replacement with the same commitment."
+                    )
+                    for failed_nick in fill_result.failed_makers:
+                        self.orderbook_manager.add_ignored_maker(failed_nick)
+                        logger.debug(f"Added {failed_nick} to ignored makers (minority blacklist)")
+                    # Fall through to the maker-replacement block below.
+                elif fill_result.blacklist_error:
+                    # Majority blacklist: trust the signal, rotate commitment.
+                    # Don't ignore the makers themselves.
+                    logger.warning(
+                        f"Majority blacklist rejection ({n_blacklisted}/"
+                        f"{session_size_before_fill}) from {fill_result.blacklist_makers}. "
+                        "Rotating commitment and retrying."
                     )
                 elif fill_result.failed_makers:
                     # Add failed makers to ignore list for non-blacklist failures
@@ -869,7 +917,7 @@ class Taker(TakerMonitoringMixin):
                         self.orderbook_manager.add_ignored_maker(failed_nick)
                         logger.debug(f"Added {failed_nick} to ignored makers (failed fill)")
 
-                if fill_result.blacklist_error:
+                if majority_blacklist:
                     # Commitment was blacklisted - try with a new commitment
                     if podle_retry < max_podle_retries - 1:
                         logger.warning(
@@ -877,9 +925,14 @@ class Taker(TakerMonitoringMixin):
                             f"(attempt {podle_retry + 2}/{max_podle_retries})..."
                         )
 
-                        # The current commitment is already marked as used
-                        # Generate a new one (will use next index automatically)
-                        self.podle_commitment = self.podle_manager.generate_fresh_commitment(
+                        # The current commitment is already marked as used.
+                        # Try to generate a new one from the current preselected
+                        # UTXOs. If that's exhausted, expand preselected_utxos
+                        # with another eligible UTXO from the SAME mixdepth (to
+                        # preserve mixdepth isolation). The extra UTXO will also
+                        # be spent in the CoinJoin -- slightly higher miner fee,
+                        # but strictly better than failing.
+                        new_commitment = self.podle_manager.generate_fresh_commitment(
                             wallet_utxos=self.preselected_utxos,
                             cj_amount=self.cj_amount,
                             private_key_getter=get_private_key,
@@ -888,12 +941,32 @@ class Taker(TakerMonitoringMixin):
                             max_retries=self.config.taker_utxo_retries,
                         )
 
-                        if not self.podle_commitment:
+                        if new_commitment is None:
+                            added = self._expand_preselected_utxos_same_mixdepth(mixdepth)
+                            if added > 0:
+                                logger.info(
+                                    f"Preselected UTXOs exhausted for PoDLE; added {added} "
+                                    f"additional UTXO(s) from mixdepth {mixdepth}, which will "
+                                    "also be spent in the CoinJoin."
+                                )
+                                new_commitment = self.podle_manager.generate_fresh_commitment(
+                                    wallet_utxos=self.preselected_utxos,
+                                    cj_amount=self.cj_amount,
+                                    private_key_getter=get_private_key,
+                                    min_confirmations=self.config.taker_utxo_age,
+                                    min_percent=self.config.taker_utxo_amtpercent,
+                                    max_retries=self.config.taker_utxo_retries,
+                                )
+
+                        if new_commitment is None:
                             logger.error(
-                                "No more PoDLE commitments available - all indices exhausted"
+                                "No more PoDLE commitments available: all indices exhausted "
+                                f"across all eligible UTXOs in mixdepth {mixdepth}"
                             )
                             self.state = TakerState.FAILED
                             return None
+
+                        self.podle_commitment = new_commitment
 
                         # Reset maker sessions for retry (excluding ignored makers)
                         self.maker_sessions = {
@@ -1304,6 +1377,46 @@ class Taker(TakerMonitoringMixin):
             self.state = TakerState.FAILED
             return None
 
+    def _expand_preselected_utxos_same_mixdepth(self, mixdepth: int) -> int:
+        """Add another eligible UTXO from the same mixdepth to ``preselected_utxos``.
+
+        Called when all PoDLE indices on the currently preselected UTXOs are
+        exhausted (either used or blacklisted). The newly added UTXO will also
+        be spent in the CoinJoin, so we never cross mixdepth boundaries.
+
+        Returns the number of UTXOs actually added (0 if none available).
+        """
+        try:
+            all_utxos = self.wallet.get_all_utxos(mixdepth, self.config.taker_utxo_age)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(f"Could not list UTXOs in mixdepth {mixdepth}: {exc}")
+            return 0
+
+        already = {(u.txid, u.vout) for u in self.preselected_utxos}
+        # Only consider candidates that meet the PoDLE value threshold; otherwise
+        # they'd just inflate inputs without enabling a fresh commitment.
+        eligible = get_eligible_podle_utxos(
+            all_utxos,
+            self.cj_amount,
+            min_confirmations=self.config.taker_utxo_age,
+            min_percent=self.config.taker_utxo_amtpercent,
+        )
+        candidates = [u for u in eligible if (u.txid, u.vout) not in already]
+
+        if not candidates:
+            return 0
+
+        # Sorted by (confirmations, value) DESC from get_eligible_podle_utxos;
+        # add just one UTXO at a time to minimise bloating the transaction.
+        new_utxo = candidates[0]
+        self.preselected_utxos.append(new_utxo)
+        logger.info(
+            f"Expanded preselected UTXOs with {new_utxo.txid}:{new_utxo.vout} "
+            f"(value={new_utxo.value}, confs={new_utxo.confirmations}) from mixdepth "
+            f"{mixdepth} to enable a fresh PoDLE commitment."
+        )
+        return 1
+
     async def _phase_fill(self) -> PhaseResult:
         """Send !fill to all selected makers and wait for !pubkey responses.
 
@@ -1420,6 +1533,7 @@ class Taker(TakerMonitoringMixin):
 
         # Track failed makers and blacklist errors
         failed_makers: list[str] = []
+        blacklist_makers: list[str] = []
         blacklist_error = False
 
         # Process responses
@@ -1435,6 +1549,7 @@ class Taker(TakerMonitoringMixin):
                     # Check if this is a blacklist error
                     if "blacklist" in error_msg.lower():
                         blacklist_error = True
+                        blacklist_makers.append(nick)
                         logger.warning(
                             f"Commitment was blacklisted by {nick} - may need retry with new index"
                         )
@@ -1491,11 +1606,17 @@ class Taker(TakerMonitoringMixin):
         if len(self.maker_sessions) < self.config.minimum_makers:
             logger.error(f"Not enough makers responded: {len(self.maker_sessions)}")
             return PhaseResult(
-                success=False, failed_makers=failed_makers, blacklist_error=blacklist_error
+                success=False,
+                failed_makers=failed_makers,
+                blacklist_error=blacklist_error,
+                blacklist_makers=blacklist_makers,
             )
 
         return PhaseResult(
-            success=True, failed_makers=failed_makers, blacklist_error=blacklist_error
+            success=True,
+            failed_makers=failed_makers,
+            blacklist_error=blacklist_error,
+            blacklist_makers=blacklist_makers,
         )
 
     async def _phase_auth(self) -> PhaseResult:
