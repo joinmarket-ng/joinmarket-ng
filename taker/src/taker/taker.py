@@ -1404,6 +1404,33 @@ class Taker(TakerMonitoringMixin):
         )
         return 1
 
+    def _drop_neutrino_incompatible_sessions(self) -> list[str]:
+        """Drop sessions for makers whose handshake explicitly lacks neutrino_compat.
+
+        Called just after opportunistic direct-peer handshakes complete, to
+        avoid wasting a !fill + !pubkey round trip on a maker we already know
+        is incompatible. Peers whose feature status is unknown (no direct
+        handshake, or legacy peer that sent an empty features field) are kept
+        and revalidated during _phase_auth.
+
+        Returns the list of dropped nicks (empty if none).
+        """
+        dropped: list[str] = []
+        for nick in list(self.maker_sessions.keys()):
+            peer = self.directory_client._peer_connections.get(nick)
+            if peer is None:
+                continue
+            support = peer.supports_feature(FEATURE_NEUTRINO_COMPAT)
+            if support is False:
+                dropped.append(nick)
+        for nick in dropped:
+            logger.warning(
+                f"Dropping maker {nick} before !fill: peer handshake reports "
+                f"no neutrino_compat support (taker requires it)."
+            )
+            del self.maker_sessions[nick]
+        return dropped
+
     async def _phase_fill(self) -> PhaseResult:
         """Send !fill to all selected makers and wait for !pubkey responses.
 
@@ -1457,6 +1484,28 @@ class Taker(TakerMonitoringMixin):
                     logger.info(
                         f"Established {connected_count}/{len(pending_tasks)} direct connections"
                     )
+
+        # Pre-fill compatibility filter: once direct connections have handshaked,
+        # we know each peer's advertised features. If the taker requires
+        # neutrino_compat and a peer explicitly does NOT advertise it, drop the
+        # session now rather than wasting a !fill + !pubkey round trip (and a
+        # PoDLE retry if the maker happens to also blacklist our commitment).
+        #
+        # Peers whose feature support is still unknown (no direct handshake,
+        # or legacy peer with no features field) are kept; the existing check
+        # in _phase_auth will catch them later.
+        if self.backend.requires_neutrino_metadata():
+            incompatible = self._drop_neutrino_incompatible_sessions()
+            if incompatible and len(self.maker_sessions) < self.config.minimum_makers:
+                logger.error(
+                    f"After filtering {len(incompatible)} neutrino-incompatible maker(s), "
+                    f"only {len(self.maker_sessions)} remain (need "
+                    f"{self.config.minimum_makers})."
+                )
+                return PhaseResult(
+                    success=False,
+                    failed_makers=incompatible,
+                )
 
         # Determine and record communication channel for each maker
         for nick, session in self.maker_sessions.items():

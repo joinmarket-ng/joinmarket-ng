@@ -1137,6 +1137,85 @@ def test_phase_result_supports_blacklist_makers():
     assert explicit.blacklist_error is True
 
 
+def test_drop_neutrino_incompatible_sessions_keeps_unknowns(mock_wallet, mock_backend, mock_config):
+    """_drop_neutrino_incompatible_sessions removes only peers whose handshake
+    explicitly lacks neutrino_compat. Peers with no direct handshake yet and
+    peers that sent an empty features dict (legacy / unknown support) must be
+    left in place so the existing _phase_auth check can revalidate them.
+    """
+    taker = Taker(mock_wallet, mock_backend, mock_config)
+
+    # Three makers:
+    #   - J5A: direct-handshake peer advertising neutrino_compat -> keep
+    #   - J5B: direct-handshake peer explicitly not advertising it -> drop
+    #   - J5C: no direct connection yet -> keep (unknown support)
+    def offer(nick: str) -> Offer:
+        return Offer(
+            counterparty=nick,
+            oid=0,
+            ordertype=OfferType.SW0_RELATIVE.value,
+            minsize=100_000,
+            maxsize=10_000_000,
+            txfee=1000,
+            cjfee="0.001",
+        )
+
+    taker.maker_sessions = {
+        "J5A": MakerSession(nick="J5A", offer=offer("J5A"), supports_neutrino_compat=False),
+        "J5B": MakerSession(nick="J5B", offer=offer("J5B"), supports_neutrino_compat=False),
+        "J5C": MakerSession(nick="J5C", offer=offer("J5C"), supports_neutrino_compat=False),
+    }
+
+    peer_a = Mock()
+    peer_a.supports_feature.return_value = True
+    peer_b = Mock()
+    peer_b.supports_feature.return_value = False
+    # J5C has no entry in _peer_connections on purpose.
+    taker.directory_client._peer_connections = {"J5A": peer_a, "J5B": peer_b}
+
+    dropped = taker._drop_neutrino_incompatible_sessions()
+
+    assert dropped == ["J5B"]
+    assert set(taker.maker_sessions.keys()) == {"J5A", "J5C"}
+
+
+def test_drop_neutrino_incompatible_sessions_noop_when_all_compatible(
+    mock_wallet, mock_backend, mock_config
+):
+    """If no peer explicitly lacks neutrino_compat, the session is untouched.
+
+    Unknown status (None) must not be treated as incompatible, since many
+    legacy / reference makers handshake with an empty features field but
+    still support the feature in practice.
+    """
+    taker = Taker(mock_wallet, mock_backend, mock_config)
+
+    def offer(nick: str) -> Offer:
+        return Offer(
+            counterparty=nick,
+            oid=0,
+            ordertype=OfferType.SW0_RELATIVE.value,
+            minsize=100_000,
+            maxsize=10_000_000,
+            txfee=1000,
+            cjfee="0.001",
+        )
+
+    taker.maker_sessions = {
+        "J5A": MakerSession(nick="J5A", offer=offer("J5A"), supports_neutrino_compat=False),
+        "J5B": MakerSession(nick="J5B", offer=offer("J5B"), supports_neutrino_compat=False),
+    }
+
+    peer_a = Mock()
+    peer_a.supports_feature.return_value = True  # known-compatible
+    peer_b = Mock()
+    peer_b.supports_feature.return_value = None  # unknown -> keep
+    taker.directory_client._peer_connections = {"J5A": peer_a, "J5B": peer_b}
+
+    assert taker._drop_neutrino_incompatible_sessions() == []
+    assert set(taker.maker_sessions.keys()) == {"J5A", "J5B"}
+
+
 class TestUpdatePendingTransactionNow:
     """Tests for immediate pending transaction update on coinjoin completion."""
 
