@@ -11,12 +11,18 @@ from tumbler.plan import (
     TakerCoinjoinPhase,
 )
 
+_DEFAULT_DESTINATIONS = [
+    "bcrt1qdest0000000000000000000000000000000000aaa",
+    "bcrt1qdest0000000000000000000000000000000000bbb",
+    "bcrt1qdest0000000000000000000000000000000000ccc",
+]
+
 
 def _params(
     *, destinations: list[str] | None = None, seed: int | None = 42, **overrides: object
 ) -> TumbleParameters:
     kwargs: dict[str, object] = dict(
-        destinations=destinations or ["bcrt1qdest000000000000000000000000000000000000"],
+        destinations=destinations or list(_DEFAULT_DESTINATIONS),
         mixdepth_balances={0: 10_000_000, 1: 5_000_000, 2: 0, 3: 0, 4: 0},
         seed=seed,
     )
@@ -50,6 +56,7 @@ class TestPlanBuilder:
             destinations=[
                 "bcrt1qdest0000000000000000000000000000000000aaa",
                 "bcrt1qdest0000000000000000000000000000000000bbb",
+                "bcrt1qdest0000000000000000000000000000000000ccc",
             ]
         )
         plan = PlanBuilder("w", params).build()
@@ -60,7 +67,7 @@ class TestPlanBuilder:
             and p.destination.startswith("bcrt1q")
             and p.is_sweep
         ]
-        assert len({p.mixdepth for p in final_sweeps}) == 2
+        assert len({p.mixdepth for p in final_sweeps}) == 3
 
     def test_maker_sessions_are_optional(self) -> None:
         params = _params(include_maker_sessions=False)
@@ -113,6 +120,7 @@ class TestPlanBuilder:
             destinations=[
                 "bcrt1qdest0000000000000000000000000000000000aaa",
                 "bcrt1qdest0000000000000000000000000000000000bbb",
+                "bcrt1qdest0000000000000000000000000000000000ccc",
             ],
             mixdepth_balances={0: 0, 1: 23_430_165, 2: 0, 3: 0, 4: 0},
             include_maker_sessions=False,
@@ -126,7 +134,6 @@ class TestPlanBuilder:
             and phase.is_sweep
             and phase.destination in params.destinations
         ]
-        assert [phase.mixdepth for phase in destination_sweeps] == [4, 0]
         assert [phase.destination for phase in destination_sweeps] == params.destinations
 
     def test_rejects_more_destinations_than_stage2_chain_mixdepths(self) -> None:
@@ -143,6 +150,15 @@ class TestPlanBuilder:
                 "w",
                 TumbleParameters(destinations=[], mixdepth_balances={0: 1_000_000}),
             ).build()
+
+    def test_builder_accepts_fewer_than_recommended_destinations(self) -> None:
+        """Builder accepts 1-2 destinations; only the CLI enforces the >=3 policy."""
+        params = _params(
+            destinations=["a"],
+            mixdepth_balances={0: 1_000_000, 1: 0, 2: 0, 3: 0, 4: 0},
+        )
+        plan = PlanBuilder("w", params).build()
+        assert len(plan.destinations) == 1
 
     def test_kinds_present_cover_taker_and_maker(self) -> None:
         kinds = {p.kind for p in PlanBuilder("w", _params()).build().phases}

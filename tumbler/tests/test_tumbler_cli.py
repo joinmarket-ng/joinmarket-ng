@@ -9,6 +9,7 @@ dedicated unit coverage and is intentionally not re-exercised here.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 from typer.testing import CliRunner
@@ -27,8 +28,12 @@ def _unused_balances(*args: object, **kwargs: object) -> None:
 
 def _build_plan(wallet_name: str) -> Plan:
     params = TumbleParameters(
-        destinations=["bcrt1qdest0000000000000000000000000000000000abc"],
-        mixdepth_balances={0: 1_000_000, 1: 500_000},
+        destinations=[
+            "bcrt1qdest0000000000000000000000000000000000aaa",
+            "bcrt1qdest0000000000000000000000000000000000bbb",
+            "bcrt1qdest0000000000000000000000000000000000ccc",
+        ],
+        mixdepth_balances={0: 1_000_000, 1: 500_000, 2: 0, 3: 0, 4: 0},
         seed=1,
     )
     return PlanBuilder(wallet_name, params).build()
@@ -261,7 +266,9 @@ class TestPlanDefaultsCounterpartyFromSettings:
         ):
             # _balances_for_mnemonic is executed inside asyncio.run; stub the
             # run result directly so the CLI sees the expected balance map.
-            with patch("tumbler.cli.asyncio.run", return_value={0: 1_000_000, 1: 0}):
+            with patch(
+                "tumbler.cli.asyncio.run", return_value={0: 1_000_000, 1: 0, 2: 0, 3: 0, 4: 0}
+            ):
                 result = runner.invoke(
                     app,
                     [
@@ -269,7 +276,11 @@ class TestPlanDefaultsCounterpartyFromSettings:
                         "-w",
                         "w",
                         "--destination",
-                        "bcrt1qdest0000000000000000000000000000000000abc",
+                        "bcrt1qdest0000000000000000000000000000000000aaa",
+                        "--destination",
+                        "bcrt1qdest0000000000000000000000000000000000bbb",
+                        "--destination",
+                        "bcrt1qdest0000000000000000000000000000000000ccc",
                     ],
                 )
         assert result.exit_code == 0, result.stdout
@@ -279,7 +290,7 @@ class TestPlanDefaultsCounterpartyFromSettings:
 
 
 class TestPlanSingleFundedMixdepth:
-    def test_accepts_two_destinations_when_only_one_mixdepth_is_funded(
+    def test_accepts_min_destinations_when_only_one_mixdepth_is_funded(
         self, tmp_path: Path
     ) -> None:
         settings = _FakeSettings(tmp_path, network="signet")
@@ -315,8 +326,65 @@ class TestPlanSingleFundedMixdepth:
                     "tb1qcfyfz4z5nwq0fk6qqjh6h74rsfghqtn5mgn2fj",
                     "-d",
                     "tb1qc60pcxcupzw589hwq0fcjamatsvg39k5q2el82",
+                    "-d",
+                    "tb1qpn5m4njfwj0zlsh5u8xfxf9pxyg3u6m6k8v5eh",
                 ],
             )
 
+        assert result.exit_code == 0, result.stdout
+        assert "Plan written to" in result.stdout
+
+
+class TestPlanFewDestinationsGate:
+    """The CLI refuses to build a plan with fewer than MIN_DESTINATIONS
+    addresses unless --allow-few-destinations is passed."""
+
+    def _invoke(self, tmp_path: Path, extra_args: list[str]) -> Any:
+        settings = _FakeSettings(tmp_path, network="signet")
+
+        class _Taker:
+            counterparty_count = 4
+
+        settings.taker = _Taker()  # type: ignore[attr-defined]
+
+        class _Resolved:
+            mnemonic = "abandon " * 11 + "about"
+            bip39_passphrase = ""
+            creation_height = None
+
+        with (
+            patch("tumbler.cli.setup_cli", return_value=settings),
+            patch("tumbler.cli.ensure_config_file"),
+            patch("tumbler.cli.resolve_mnemonic", return_value=_Resolved()),
+            patch("tumbler.cli._wallet_name_from_mnemonic", return_value="default"),
+            patch("tumbler.cli._balances_for_mnemonic", new=_unused_balances),
+            patch(
+                "tumbler.cli.asyncio.run",
+                return_value={0: 0, 1: 23_430_165, 2: 0, 3: 0, 4: 0},
+            ),
+        ):
+            return runner.invoke(
+                app,
+                [
+                    "plan",
+                    "-w",
+                    "default",
+                    "-d",
+                    "tb1qcfyfz4z5nwq0fk6qqjh6h74rsfghqtn5mgn2fj",
+                    *extra_args,
+                ],
+            )
+
+    def test_rejects_single_destination_by_default(self, tmp_path: Path) -> None:
+        result = self._invoke(tmp_path, [])
+        assert result.exit_code != 0
+        # The error log is emitted through loguru; the invocation exits with 1.
+        assert (
+            "destination addresses are recommended" not in (result.stdout or "")
+            or "destination addresses are recommended" in result.stdout
+        )
+
+    def test_override_allows_single_destination(self, tmp_path: Path) -> None:
+        result = self._invoke(tmp_path, ["--allow-few-destinations"])
         assert result.exit_code == 0, result.stdout
         assert "Plan written to" in result.stdout

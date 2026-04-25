@@ -21,8 +21,12 @@ from tumbler.plan import Plan
 
 def _build_plan(wallet_name: str = "Satoshi") -> Plan:
     params = TumbleParameters(
-        destinations=["bcrt1qdest0000000000000000000000000000000000abc"],
-        mixdepth_balances={0: 1_000_000, 1: 500_000},
+        destinations=[
+            "bcrt1qdest0000000000000000000000000000000000aaa",
+            "bcrt1qdest0000000000000000000000000000000000bbb",
+            "bcrt1qdest0000000000000000000000000000000000ccc",
+        ],
+        mixdepth_balances={0: 1_000_000, 1: 500_000, 2: 0, 3: 0, 4: 0},
         seed=1,
     )
     return PlanBuilder(wallet_name, params).build()

@@ -38,7 +38,7 @@ from tumbler.persistence import (
 from tumbler.persistence import (
     delete_plan as delete_plan_on_disk,
 )
-from tumbler.plan import Plan, PlanStatus
+from tumbler.plan import MIN_DESTINATIONS, Plan, PlanStatus
 from tumbler.runner import RunnerContext, TumbleRunner
 
 app = typer.Typer(
@@ -194,9 +194,29 @@ def plan_command(
     include_maker_sessions: Annotated[
         bool, typer.Option("--maker-sessions/--no-maker-sessions")
     ] = True,
+    allow_few_destinations: Annotated[
+        bool,
+        typer.Option(
+            "--allow-few-destinations",
+            help=(
+                "Override the recommended minimum of "
+                f"{MIN_DESTINATIONS} destinations. Intended for development and "
+                "automated testing only: fewer destinations expose users to "
+                "pairwise re-aggregation heuristics."
+            ),
+        ),
+    ] = False,
     log_level: Annotated[str | None, typer.Option("--log-level", "-l")] = None,
 ) -> None:
     """Build a tumbler plan for the given destinations and persist it."""
+    if len(destinations) < MIN_DESTINATIONS and not allow_few_destinations:
+        logger.error(
+            "at least {} destination addresses are recommended (got {}). "
+            "Pass --allow-few-destinations to override.",
+            MIN_DESTINATIONS,
+            len(destinations),
+        )
+        raise typer.Exit(1)
     settings = setup_cli(log_level)
     ensure_config_file(settings.get_data_dir())
     data_dir = settings.get_data_dir()

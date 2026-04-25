@@ -94,8 +94,8 @@ class PlanBuilder:
     # ------------------------------------------------------------------ public
 
     def build(self) -> Plan:
-        if not self.params.destinations:
-            raise ValueError("at least one destination is required")
+        if self.params.num_destinations < 1:
+            raise ValueError("at least one destination address is required")
         if self.params.num_destinations > len(self._stage2_mixdepth_chain()):
             raise ValueError("tumble requires at least as many usable mixdepths as destinations")
 
