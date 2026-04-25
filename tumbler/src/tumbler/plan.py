@@ -61,6 +61,12 @@ class _PhaseBase(BaseModel):
     started_at: datetime | None = None
     finished_at: datetime | None = None
     error: str | None = None
+    # Retry bookkeeping (taker phases only use this; maker phases ignore it).
+    attempt_count: int = Field(
+        default=0,
+        ge=0,
+        description="Number of attempts made for this phase (for retry tracking).",
+    )
 
 
 class TakerCoinjoinPhase(_PhaseBase):
@@ -137,6 +143,13 @@ class PlanParameters(BaseModel):
     time_lambda_seconds: float = Field(default=30.0, gt=0.0)
     include_maker_sessions: bool = True
     mincjamount_sats: int = Field(default=100_000, ge=0)
+    max_phase_retries: int = Field(
+        default=3,
+        ge=0,
+        le=20,
+        description="Maximum number of re-tries for a failed taker CoinJoin phase. "
+        "Exhausting retries fails the entire plan.",
+    )
     seed: int | None = None
 
     @model_validator(mode="after")

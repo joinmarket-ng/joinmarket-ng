@@ -129,6 +129,11 @@ class TumbleRunner:
                     return self.plan
                 await self._run_one_phase(phase)
                 if phase.status == PhaseStatus.FAILED:
+                    if self._try_tweak_for_retry(phase):
+                        # Re-run the same phase index; bookkeeping
+                        # (attempt_count, PENDING reset) has been applied.
+                        self._persist()
+                        continue
                     self.plan.status = PlanStatus.FAILED
                     self.plan.error = phase.error
                     self._persist()
@@ -211,6 +216,76 @@ class TumbleRunner:
             phase.status = PhaseStatus.COMPLETED
         finally:
             phase.finished_at = datetime.now(UTC)
+
+    # ---------------------------------------------- retry / tweak (taker) ---
+
+    def _try_tweak_for_retry(self, phase: Phase) -> bool:
+        """
+        Mirror the reference tumbler's ``tweak_tumble_schedule``: after a
+        failed taker-coinjoin phase, try to make the next attempt more
+        likely to succeed by
+
+        * lowering ``counterparty_count`` toward ``maker_count_min``
+          (reference uses ``minimum_makers``),
+        * swapping the destination to the ``INTERNAL`` sentinel if it was
+          an externally-supplied address (so we don't keep retrying the
+          same final output, mirroring the reference behaviour of only
+          keeping external destinations on successful sweeps).
+
+        Returns ``True`` if the phase was rearmed for a retry, ``False``
+        if the retry budget is exhausted or the phase is not retryable.
+        Maker-session phases are currently not retried.
+        """
+        if not isinstance(phase, TakerCoinjoinPhase):
+            return False
+
+        max_retries = self.plan.parameters.max_phase_retries
+        # ``attempt_count`` counts *completed* attempts; we've just
+        # finished the (attempt_count+1)-th one, so compare against
+        # ``max_retries`` before incrementing.
+        if phase.attempt_count >= max_retries:
+            logger.warning(
+                "tumbler phase {} exhausted retry budget ({} attempts), failing plan",
+                phase.index,
+                phase.attempt_count + 1,
+            )
+            return False
+
+        phase.attempt_count += 1
+
+        # Lower counterparty_count toward the configured minimum.
+        minimum_makers = self.plan.parameters.maker_count_min
+        if phase.counterparty_count > minimum_makers:
+            new_cp = max(minimum_makers, phase.counterparty_count - 1)
+            logger.info(
+                "tumbler phase {} retry {}: lowering counterparty_count {} -> {}",
+                phase.index,
+                phase.attempt_count,
+                phase.counterparty_count,
+                new_cp,
+            )
+            phase.counterparty_count = new_cp
+
+        # If the destination is an externally-supplied address, swap it
+        # to the INTERNAL sentinel for the retry. The operator can still
+        # retarget a later phase to that address once the coins have
+        # progressed through the mixdepth chain.
+        if phase.destination != "INTERNAL":
+            logger.info(
+                "tumbler phase {} retry {}: swapping destination {!r} -> 'INTERNAL'",
+                phase.index,
+                phase.attempt_count,
+                phase.destination,
+            )
+            phase.destination = "INTERNAL"
+
+        # Rearm the phase: clear terminal state so ``_run_one_phase``
+        # can run it again cleanly.
+        phase.status = PhaseStatus.PENDING
+        phase.started_at = None
+        phase.finished_at = None
+        phase.error = None
+        return True
 
     # -------------------------------------- taker (single CJ) ---------------
 
@@ -373,7 +448,7 @@ class TumbleRunner:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await start_task
 
-    # --------------------------------------------------- misc helpers -------
+    # -------------------------------------- misc helpers -------------------
 
     async def _teardown_active(self) -> None:
         await self._teardown_taker()

@@ -326,6 +326,7 @@ class TumblerPhaseResponse(BaseModel):
     target_cj_count: int | None = None
     idle_timeout_seconds: float | None = None
     cj_served: int | None = None
+    attempt_count: int | None = None
 
 
 class TumblerPlanResponse(BaseModel):

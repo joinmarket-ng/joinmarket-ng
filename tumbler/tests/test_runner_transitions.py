@@ -267,6 +267,199 @@ class TestRunnerFailure:
         assert takers[0].stopped_with == {"close_wallet": False}
 
 
+class TestRunnerRetry:
+    """
+    Exercise the ``tweak_tumble_schedule`` equivalent: on a failed
+    taker-coinjoin phase the runner should rearm the same phase with a
+    lower ``counterparty_count`` and an ``INTERNAL`` destination, up to
+    ``max_phase_retries`` times before failing the whole plan.
+    """
+
+    async def test_retry_succeeds_on_second_attempt(self, tmp_path: Path) -> None:
+        plan = _plan(tmp_path)
+        # Keep retry budget at default (3). Pick the first phase and
+        # verify attempt_count starts at 0.
+        assert plan.phases[0].attempt_count == 0
+
+        attempts: list[dict[str, Any]] = []
+
+        async def make_taker(phase: Any) -> FakeTaker:
+            t = FakeTaker(phase)
+
+            async def flaky(
+                amount: int,
+                destination: str,
+                mixdepth: int = 0,
+                counterparty_count: int | None = None,
+            ) -> str | None:
+                attempts.append(
+                    {
+                        "phase_index": phase.index,
+                        "destination": destination,
+                        "counterparty_count": counterparty_count,
+                    }
+                )
+                # Fail the first attempt of phase 0, succeed afterwards.
+                if phase.index == 0 and phase.attempt_count == 0:
+                    return None  # signals TakerPhaseError inside runner
+                return f"txid-{phase.index}-{phase.attempt_count}"
+
+            t.do_coinjoin = flaky  # type: ignore[assignment]
+            return t
+
+        runner = TumbleRunner(plan, _ctx(tmp_path, taker_factory=make_taker))
+        result = await runner.run()
+
+        assert result.status == PlanStatus.COMPLETED
+        assert result.phases[0].status == PhaseStatus.COMPLETED
+        assert result.phases[0].attempt_count == 1
+        # Phase 0 was attempted twice; later phases only once each.
+        phase_0_attempts = [a for a in attempts if a["phase_index"] == 0]
+        assert len(phase_0_attempts) == 2
+
+    async def test_retry_swaps_external_destination_to_internal(self, tmp_path: Path) -> None:
+        plan = _plan(tmp_path)
+        # Find a phase that targets an external destination (not INTERNAL).
+        target = next(
+            p
+            for p in plan.phases
+            if isinstance(p, TakerCoinjoinPhase) and p.destination != "INTERNAL"
+        )
+        target_index = target.index
+        original_destination = target.destination
+        assert original_destination.startswith("bcrt1q")
+
+        observed: list[str] = []
+
+        async def make_taker(phase: Any) -> FakeTaker:
+            t = FakeTaker(phase)
+
+            async def flaky(
+                amount: int,
+                destination: str,
+                mixdepth: int = 0,
+                counterparty_count: int | None = None,
+            ) -> str | None:
+                if phase.index == target_index:
+                    observed.append(destination)
+                    if phase.attempt_count == 0:
+                        return None
+                return f"txid-{phase.index}"
+
+            t.do_coinjoin = flaky  # type: ignore[assignment]
+            return t
+
+        runner = TumbleRunner(plan, _ctx(tmp_path, taker_factory=make_taker))
+        result = await runner.run()
+
+        assert result.status == PlanStatus.COMPLETED
+        # First attempt saw the real address; retry saw an INTERNAL-derived
+        # wallet address (resolved via FakeWalletService.get_change_address
+        # → starts with "bcrt1qfake").
+        assert observed[0] == original_destination
+        assert observed[1].startswith("bcrt1qfake")
+        # The phase record itself now carries the INTERNAL sentinel.
+        assert result.phases[target_index].destination == "INTERNAL"
+
+    async def test_retry_lowers_counterparty_count_toward_minimum(self, tmp_path: Path) -> None:
+        plan = _plan(tmp_path)
+        # Force-set the first phase's counterparty_count above the floor
+        # so the tweak has room to reduce it.
+        stage1 = plan.phases[0]
+        assert isinstance(stage1, TakerCoinjoinPhase)
+        stage1.counterparty_count = plan.parameters.maker_count_min + 2
+
+        seen_cp: list[int | None] = []
+
+        async def make_taker(phase: Any) -> FakeTaker:
+            t = FakeTaker(phase)
+
+            async def flaky(
+                amount: int,
+                destination: str,
+                mixdepth: int = 0,
+                counterparty_count: int | None = None,
+            ) -> str | None:
+                if phase.index == 0:
+                    seen_cp.append(counterparty_count)
+                    if phase.attempt_count == 0:
+                        return None
+                return "tx"
+
+            t.do_coinjoin = flaky  # type: ignore[assignment]
+            return t
+
+        runner = TumbleRunner(plan, _ctx(tmp_path, taker_factory=make_taker))
+        result = await runner.run()
+
+        assert result.status == PlanStatus.COMPLETED
+        # Two calls: first at the original count, second one lower.
+        assert len(seen_cp) == 2
+        assert seen_cp[0] == plan.parameters.maker_count_min + 2
+        assert seen_cp[1] == plan.parameters.maker_count_min + 1
+
+    async def test_retry_budget_exhaustion_fails_plan(self, tmp_path: Path) -> None:
+        plan = _plan(tmp_path)
+        # Tighten the retry budget to keep the test quick and explicit.
+        plan.parameters = plan.parameters.model_copy(update={"max_phase_retries": 2})
+
+        call_counter = {"n": 0}
+
+        async def make_taker(phase: Any) -> FakeTaker:
+            t = FakeTaker(phase)
+
+            async def always_fail(
+                amount: int,
+                destination: str,
+                mixdepth: int = 0,
+                counterparty_count: int | None = None,
+            ) -> str | None:
+                call_counter["n"] += 1
+                return None  # always fails → TakerPhaseError
+
+            t.do_coinjoin = always_fail  # type: ignore[assignment]
+            return t
+
+        runner = TumbleRunner(plan, _ctx(tmp_path, taker_factory=make_taker))
+        result = await runner.run()
+
+        assert result.status == PlanStatus.FAILED
+        assert result.phases[0].status == PhaseStatus.FAILED
+        # One initial attempt + ``max_phase_retries`` retries = 3 calls.
+        assert call_counter["n"] == 3
+        assert result.phases[0].attempt_count == 2
+        # Subsequent phases never ran.
+        assert all(p.status == PhaseStatus.PENDING for p in result.phases[1:])
+
+    async def test_retry_budget_zero_disables_retries(self, tmp_path: Path) -> None:
+        plan = _plan(tmp_path)
+        plan.parameters = plan.parameters.model_copy(update={"max_phase_retries": 0})
+
+        calls = {"n": 0}
+
+        async def make_taker(phase: Any) -> FakeTaker:
+            t = FakeTaker(phase)
+
+            async def always_fail(
+                amount: int,
+                destination: str,
+                mixdepth: int = 0,
+                counterparty_count: int | None = None,
+            ) -> str | None:
+                calls["n"] += 1
+                return None
+
+            t.do_coinjoin = always_fail  # type: ignore[assignment]
+            return t
+
+        runner = TumbleRunner(plan, _ctx(tmp_path, taker_factory=make_taker))
+        result = await runner.run()
+
+        assert result.status == PlanStatus.FAILED
+        assert calls["n"] == 1
+        assert result.phases[0].attempt_count == 0
+
+
 class TestRunnerCancellation:
     async def test_request_stop_between_phases(self, tmp_path: Path) -> None:
         plan = _plan(tmp_path)

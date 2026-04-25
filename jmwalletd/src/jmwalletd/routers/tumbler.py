@@ -109,7 +109,6 @@ def _normalize_legacy_tumbler_parameters(raw: dict[str, object] | None) -> dict[
     params.pop("stage1_timelambda_increase", None)
     params.pop("liquiditywait", None)
     params.pop("waittime", None)
-
     # Dropped in the redesign: the bondless-taker burst phase no longer
     # exists in the new plan model. Swallow the key if a legacy client
     # (e.g. an old JAM) still sends it so we don't break their flow.
@@ -128,6 +127,7 @@ def _phase_to_response(phase: Any) -> TumblerPhaseResponse:
         "started_at": phase.started_at.isoformat() if phase.started_at else None,
         "finished_at": phase.finished_at.isoformat() if phase.finished_at else None,
         "error": phase.error,
+        "attempt_count": getattr(phase, "attempt_count", None),
     }
     if isinstance(phase, TakerCoinjoinPhase):
         common.update(

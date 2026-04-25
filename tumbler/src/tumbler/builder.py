@@ -70,6 +70,8 @@ class TumbleParameters:
     never selected as a counterparty."""
     mintxcount: int = 2
     """Minimum number of destination-bearing taker CJs per mixdepth (excluding sweep)."""
+    max_phase_retries: int = 3
+    """Maximum re-tries per failed taker CoinJoin phase before the plan fails."""
     seed: int | None = None
 
     @property
@@ -108,6 +110,7 @@ class PlanBuilder:
             time_lambda_seconds=self.params.time_lambda_seconds,
             include_maker_sessions=self.params.include_maker_sessions,
             mincjamount_sats=self.params.mincjamount_sats,
+            max_phase_retries=self.params.max_phase_retries,
             seed=self.params.seed,
         )
         return Plan(
