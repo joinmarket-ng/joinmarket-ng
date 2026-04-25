@@ -7,11 +7,13 @@ test creates a fresh wallet via the API, funds it with a single large
 UTXO, then issues ``POST /tumbler/plan`` + ``POST /tumbler/start`` and
 polls ``GET /tumbler/status`` until the plan terminates.
 
-Scope: smallest plan that still exercises the stage-1 sweep and stage-2
-sweep+fractional logic (``mintxcount=2``, ``include_maker_sessions=False``,
-``include_bondless_bursts=False``) -> 3 CoinJoin phases. ``maker_count_min``
-and ``maker_count_max`` are both ``2`` because only three makers are
-available in the ``e2e`` profile.
+Scope: smallest plan that still exercises stage-1 sweep and stage-2
+sweep+fractional logic (``mintxcount=2``, ``include_maker_sessions=False``).
+With one funded mixdepth on a 5-mixdepth wallet and one destination, the
+builder emits 1 stage-1 sweep + 4 stage-2 blocks of (1 fractional + 1
+sweep) = 9 CoinJoin phases. ``maker_count_min`` and ``maker_count_max``
+are both ``2`` because only three makers are available in the ``e2e``
+profile.
 
 Requires ``docker compose --profile e2e up -d`` and Bitcoin Core RPC
 reachable on ``127.0.0.1:18443`` (the default for the e2e profile).
@@ -238,11 +240,10 @@ def _minimal_plan_parameters() -> dict[str, Any]:
     - ``maker_count_min=maker_count_max=2``: only three makers in the e2e
       profile, and the reference JM CJ requires counterparty_count < maker
       count to guarantee a pool big enough to pick from.
-    - ``include_maker_sessions=False`` + ``include_bondless_bursts=False``:
-      keep the plan to taker-coinjoin phases only, which is what this test
-      exercises.
+    - ``include_maker_sessions=False``: keep the plan to taker-coinjoin
+      phases only, which is what this test exercises.
     - ``mintxcount=2``: smallest value that still produces a stage-2
-      fractional phase + stage-2 sweep phase (three CJs total).
+      fractional phase + stage-2 sweep phase per mixdepth in the chain.
     - ``time_lambda_seconds=1.0``: near-zero wait between phases.
     - ``seed=42``: deterministic plan layout across runs.
     """
@@ -250,7 +251,6 @@ def _minimal_plan_parameters() -> dict[str, Any]:
         "maker_count_min": 2,
         "maker_count_max": 2,
         "include_maker_sessions": False,
-        "include_bondless_bursts": False,
         "mintxcount": 2,
         "time_lambda_seconds": 1.0,
         "seed": 42,
@@ -466,8 +466,9 @@ async def test_tumbler_happy_path_runs_three_coinjoins_and_pays_destination(
 
     plan = await _post_plan(client, name, token, destination)
     assert plan["status"].lower() == "pending"
-    assert len(plan["phases"]) == 3, (
-        f"minimal plan should have exactly three CJ phases; got: "
+    # 1 stage-1 sweep + 4 stage-2 blocks of (mintxcount-1=1 fractional + 1 sweep) = 9.
+    assert len(plan["phases"]) == 9, (
+        f"minimal plan should have nine CJ phases; got: "
         f"{[p['kind'] for p in plan['phases']]}"
     )
     assert all(p["kind"] == "taker_coinjoin" for p in plan["phases"])

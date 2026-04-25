@@ -34,7 +34,6 @@ from loguru import logger
 
 from tumbler.persistence import save_plan
 from tumbler.plan import (
-    BondlessTakerBurstPhase,
     MakerSessionPhase,
     Phase,
     PhaseStatus,
@@ -191,8 +190,6 @@ class TumbleRunner:
                 await self._run_taker_phase(phase)
             elif isinstance(phase, MakerSessionPhase):
                 await self._run_maker_phase(phase)
-            elif isinstance(phase, BondlessTakerBurstPhase):
-                await self._run_bondless_burst_phase(phase)
             else:  # pragma: no cover - exhaustiveness
                 raise RuntimeError(f"unknown phase kind: {phase!r}")
         except _StopRequestedError:
@@ -226,10 +223,6 @@ class TumbleRunner:
             amount = await self._resolve_amount(phase)
             # ``Taker.do_coinjoin(amount, destination, mixdepth, counterparty_count)``
             # returns the broadcast txid as a str, or None on failure.
-            # Note: ``rounding`` is intentionally dropped: the reference
-            # taker ignores it and the kwarg is not part of ``do_coinjoin``'s
-            # signature. The field is retained on the phase for future
-            # plumbing but must not be forwarded here.
             result = await taker.do_coinjoin(
                 amount=amount,
                 destination=destination,
@@ -380,58 +373,6 @@ class TumbleRunner:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await start_task
 
-    # -------------------------------------- bondless burst ------------------
-
-    async def _run_bondless_burst_phase(self, phase: BondlessTakerBurstPhase) -> None:
-        """
-        Run a burst of small taker CoinJoins within a single mixdepth.
-
-        Each sub-CJ is executed via a fresh short-lived taker built from the
-        maker factory's twin, the :class:`RunnerContext.taker_factory`. A
-        sub-CJ is equivalent to a :class:`TakerCoinjoinPhase` with
-        ``destination='INTERNAL'`` whose target is the same mixdepth (a fresh
-        internal change-chain address is derived for every sub-CJ).
-        """
-        while phase.completed_count < phase.cj_count:
-            if self._stop_requested.is_set():
-                raise _StopRequestedError()
-            sub = TakerCoinjoinPhase(
-                index=phase.index,
-                mixdepth=phase.mixdepth,
-                amount_fraction=phase.amount_fraction,
-                counterparty_count=phase.counterparty_count,
-                destination="INTERNAL_SAME",
-                rounding=phase.rounding,
-            )
-            # Special sentinel: same-mixdepth internal address (no cross-mix).
-            taker = await self.ctx.taker_factory(sub)
-            self._active_taker = taker
-            try:
-                await taker.start()
-                destination = self._get_internal_address(phase.mixdepth)
-                # Resolve the fractional amount off the current mixdepth
-                # balance for each sub-CJ, matching _run_taker_phase.
-                balance = await self.ctx.wallet_service.get_balance(phase.mixdepth)
-                amount = int(int(balance) * phase.amount_fraction)
-                result = await taker.do_coinjoin(
-                    amount=amount,
-                    destination=destination,
-                    mixdepth=phase.mixdepth,
-                    counterparty_count=phase.counterparty_count,
-                )
-                if result is None:
-                    raise RuntimeError("taker.do_coinjoin returned no txid")
-                if isinstance(result, str):
-                    phase.txids.append(result)
-                else:
-                    txid = getattr(result, "txid", None)
-                    if isinstance(txid, str):
-                        phase.txids.append(txid)
-            finally:
-                await self._teardown_taker()
-            phase.completed_count += 1
-            self._persist()
-
     # --------------------------------------------------- misc helpers -------
 
     async def _teardown_active(self) -> None:
@@ -524,8 +465,6 @@ def _phase_txids(phase: Phase) -> list[str]:
     """Return txids produced by a phase, if any."""
     if isinstance(phase, TakerCoinjoinPhase):
         return [phase.txid] if phase.txid else []
-    if isinstance(phase, BondlessTakerBurstPhase):
-        return list(phase.txids)
     # Maker sessions do not produce a single broadcast txid we control.
     return []
 

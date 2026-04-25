@@ -15,7 +15,6 @@ from tumbler.persistence import (
     save_plan,
 )
 from tumbler.plan import (
-    BondlessTakerBurstPhase,
     MakerSessionPhase,
     Phase,
     PhaseKind,
@@ -26,7 +25,6 @@ from tumbler.plan import (
 )
 
 __all__ = [
-    "BondlessTakerBurstPhase",
     "MakerSessionPhase",
     "Phase",
     "PhaseKind",

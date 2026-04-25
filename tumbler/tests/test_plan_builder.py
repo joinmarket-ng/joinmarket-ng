@@ -6,7 +6,6 @@ import pytest
 
 from tumbler.builder import INTERNAL_DESTINATION, PlanBuilder, TumbleParameters
 from tumbler.plan import (
-    BondlessTakerBurstPhase,
     MakerSessionPhase,
     PhaseKind,
     TakerCoinjoinPhase,
@@ -63,11 +62,10 @@ class TestPlanBuilder:
         ]
         assert len({p.mixdepth for p in final_sweeps}) == 2
 
-    def test_maker_and_bondless_are_optional(self) -> None:
-        params = _params(include_maker_sessions=False, include_bondless_bursts=False)
+    def test_maker_sessions_are_optional(self) -> None:
+        params = _params(include_maker_sessions=False)
         plan = PlanBuilder("w", params).build()
         assert not any(isinstance(p, MakerSessionPhase) for p in plan.phases)
-        assert not any(isinstance(p, BondlessTakerBurstPhase) for p in plan.phases)
 
     def test_maker_session_present_before_destination_sweep_by_default(self) -> None:
         plan = PlanBuilder("w", _params()).build()
@@ -118,7 +116,6 @@ class TestPlanBuilder:
             ],
             mixdepth_balances={0: 0, 1: 23_430_165, 2: 0, 3: 0, 4: 0},
             include_maker_sessions=False,
-            include_bondless_bursts=False,
         )
         plan = PlanBuilder("w", params).build()
 
@@ -147,11 +144,10 @@ class TestPlanBuilder:
                 TumbleParameters(destinations=[], mixdepth_balances={0: 1_000_000}),
             ).build()
 
-    def test_kinds_present_cover_all_three(self) -> None:
+    def test_kinds_present_cover_taker_and_maker(self) -> None:
         kinds = {p.kind for p in PlanBuilder("w", _params()).build().phases}
         assert PhaseKind.TAKER_COINJOIN in kinds
         assert PhaseKind.MAKER_SESSION in kinds
-        assert PhaseKind.BONDLESS_TAKER_BURST in kinds
 
     def test_last_phase_has_zero_wait(self) -> None:
         plan = PlanBuilder("w", _params()).build()

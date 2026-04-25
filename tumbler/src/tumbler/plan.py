@@ -6,9 +6,6 @@ A ``Plan`` is an ordered list of ``Phase`` objects. Each phase is one of:
 * :class:`TakerCoinjoinPhase` - a single taker CoinJoin (optionally sweep).
 * :class:`MakerSessionPhase` - run a maker bot for a bounded time or
   until a target number of CoinJoins complete.
-* :class:`BondlessTakerBurstPhase` - a burst of taker CoinJoins within a
-  single mixdepth using orderbook-matched rounding; meant to raise the
-  cost of subset-sum analysis without requiring a fidelity bond.
 
 The plan and its phases form the single source of truth for a running
 tumble. Progress is persisted to a YAML file (see :mod:`tumbler.persistence`).
@@ -25,11 +22,10 @@ from pydantic import BaseModel, Field, model_validator
 
 
 class PhaseKind(StrEnum):
-    """Discriminator for the three phase variants."""
+    """Discriminator for the phase variants."""
 
     TAKER_COINJOIN = "taker_coinjoin"
     MAKER_SESSION = "maker_session"
-    BONDLESS_TAKER_BURST = "bondless_taker_burst"
 
 
 class PhaseStatus(StrEnum):
@@ -81,7 +77,6 @@ class TakerCoinjoinPhase(_PhaseBase):
         description="A bitcoin address, or the sentinel 'INTERNAL' to pick the "
         "next mixdepth's internal address at execution time.",
     )
-    rounding: int = Field(default=16, ge=1, description="Significant figures to round to.")
     txid: str | None = Field(
         default=None, description="Broadcast txid, set once the CoinJoin confirms."
     )
@@ -125,28 +120,8 @@ class MakerSessionPhase(_PhaseBase):
         return self
 
 
-class BondlessTakerBurstPhase(_PhaseBase):
-    """
-    A burst of same-mixdepth taker CoinJoins with orderbook-matched rounding.
-
-    This phase deliberately stays inside a single mixdepth: its goal is to add
-    noise to the subset-sum signature of the funds, not to mix them across
-    mixdepths. Each sub-CoinJoin uses ``amount_fraction`` plus ``rounding`` to
-    produce amounts that look like the prevailing offer denominations.
-    """
-
-    kind: Literal[PhaseKind.BONDLESS_TAKER_BURST] = PhaseKind.BONDLESS_TAKER_BURST
-    mixdepth: int = Field(..., ge=0, le=9)
-    cj_count: int = Field(..., ge=1, le=20, description="Number of sub-CoinJoins to perform.")
-    counterparty_count: int = Field(..., ge=1, le=20)
-    amount_fraction: float = Field(..., gt=0.0, le=1.0)
-    rounding: int = Field(default=4, ge=1)
-    completed_count: int = Field(default=0, ge=0)
-    txids: list[str] = Field(default_factory=list)
-
-
 Phase = Annotated[
-    TakerCoinjoinPhase | MakerSessionPhase | BondlessTakerBurstPhase,
+    TakerCoinjoinPhase | MakerSessionPhase,
     Field(discriminator="kind"),
 ]
 
@@ -161,9 +136,7 @@ class PlanParameters(BaseModel):
     maker_count_max: int = Field(default=9, ge=1, le=20)
     time_lambda_seconds: float = Field(default=30.0, gt=0.0)
     include_maker_sessions: bool = True
-    include_bondless_bursts: bool = True
     mincjamount_sats: int = Field(default=100_000, ge=0)
-    rounding_chance: float = Field(default=0.25, ge=0.0, le=1.0)
     seed: int | None = None
 
     @model_validator(mode="after")

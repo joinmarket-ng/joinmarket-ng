@@ -194,9 +194,6 @@ def plan_command(
     include_maker_sessions: Annotated[
         bool, typer.Option("--maker-sessions/--no-maker-sessions")
     ] = True,
-    include_bondless_bursts: Annotated[
-        bool, typer.Option("--bondless-bursts/--no-bondless-bursts")
-    ] = True,
     log_level: Annotated[str | None, typer.Option("--log-level", "-l")] = None,
 ) -> None:
     """Build a tumbler plan for the given destinations and persist it."""
@@ -273,7 +270,6 @@ def plan_command(
             maker_count_max=effective_max,
             mincjamount_sats=mincjamount_sats,
             include_maker_sessions=include_maker_sessions,
-            include_bondless_bursts=include_bondless_bursts,
             seed=seed,
         )
         plan = PlanBuilder(wallet_name=effective_wallet, params=params).build()
