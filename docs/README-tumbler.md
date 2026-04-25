@@ -1,7 +1,7 @@
 # JoinMarket Tumbler
 
-High-level CoinJoin scheduler that mixes a wallet across multiple destinations
-by interleaving taker CoinJoins, maker sessions, and bondless taker bursts.
+High-level CoinJoin scheduler that mixes a wallet across one or more
+destinations by interleaving taker CoinJoins with optional maker sessions.
 Each plan is persisted as YAML so long-running schedules can be inspected,
 paused, or resumed.
 
@@ -25,9 +25,6 @@ A **plan** is a list of ordered **phases**. Each phase is one of:
   or toward a destination address.
 - `MakerSessionPhase`: runs a maker bot for a bounded window, so the wallet
   alternates between "taker" and "maker" signatures on-chain.
-- `BondlessTakerBurstPhase`: a burst of small same-mixdepth CoinJoins with
-  orderbook-matched rounding, used to add noise to the subset-sum signature
-  of the funds.
 
 Plans are stored under `$JOINMARKET_DATA_DIR/tumbler/<wallet>/plan.yaml`. The
 same file is shared with `jmwalletd`, so a plan started from the CLI can be
@@ -164,20 +161,34 @@ completed. This prevents a tumble from stalling when no taker shows up.
 │                                                             schedules        │
 │    --maker-count-…                         INTEGER          Minimum          │
 │                                                             counterparty     │
-│                                                             count per CJ     │
-│                                                             [default: 5]     │
+│                                                             count per CJ;    │
+│                                                             defaults to      │
+│                                                             settings.taker.… │
 │    --maker-count-…                         INTEGER          Maximum          │
 │                                                             counterparty     │
-│                                                             count per CJ     │
-│                                                             [default: 9]     │
+│                                                             count per CJ;    │
+│                                                             defaults to      │
+│                                                             settings.taker.… │
 │    --mincjamount-…                         INTEGER          Minimum CJ       │
 │                                                             amount in sats   │
 │                                                             [default:        │
 │                                                             100000]          │
 │    --maker-sessio…      --no-maker-ses…                     [default:        │
 │                                                             maker-sessions]  │
-│    --bondless-bur…      --no-bondless-…                     [default:        │
-│                                                             bondless-bursts] │
+│    --allow-few-de…                                          Override the     │
+│                                                             recommended      │
+│                                                             minimum of 3     │
+│                                                             destinations.    │
+│                                                             Intended for     │
+│                                                             development and  │
+│                                                             automated        │
+│                                                             testing only:    │
+│                                                             fewer            │
+│                                                             destinations     │
+│                                                             expose users to  │
+│                                                             pairwise         │
+│                                                             re-aggregation   │
+│                                                             heuristics.      │
 │    --log-level      -l                     TEXT                              │
 │    --help                                                   Show this        │
 │                                                             message and      │
@@ -197,9 +208,13 @@ completed. This prevents a tumble from stalling when no taker shows up.
  Print the current plan for the given wallet.
 
 ╭─ Options ────────────────────────────────────────────────────────────────────╮
-│ *  --wallet-name  -w      TEXT  Wallet identifier [required]                 │
-│    --log-level    -l      TEXT                                               │
-│    --help                       Show this message and exit.                  │
+│ --wallet-name              -w      TEXT  Wallet identifier; defaults to the  │
+│                                          mnemonic fingerprint                │
+│ --mnemonic-file            -f      PATH  Path to mnemonic file               │
+│ --prompt-bip39-passphrase                Prompt for BIP39 passphrase         │
+│                                          interactively                       │
+│ --log-level                -l      TEXT                                      │
+│ --help                                   Show this message and exit.         │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ```
 
@@ -215,10 +230,14 @@ completed. This prevents a tumble from stalling when no taker shows up.
  Delete the on-disk plan for ``wallet_name``.
 
 ╭─ Options ────────────────────────────────────────────────────────────────────╮
-│ *  --wallet-name  -w      TEXT  [required]                                   │
-│    --yes          -y            Skip confirmation prompt                     │
-│    --log-level    -l      TEXT                                               │
-│    --help                       Show this message and exit.                  │
+│ --wallet-name              -w      TEXT  Wallet identifier; defaults to the  │
+│                                          mnemonic fingerprint                │
+│ --mnemonic-file            -f      PATH  Path to mnemonic file               │
+│ --prompt-bip39-passphrase                Prompt for BIP39 passphrase         │
+│                                          interactively                       │
+│ --yes                      -y            Skip confirmation prompt            │
+│ --log-level                -l      TEXT                                      │
+│ --help                                   Show this message and exit.         │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ```
 
@@ -254,11 +273,30 @@ completed. This prevents a tumble from stalling when no taker shows up.
 │                                                       override               │
 │ --tor-socks-port                INTEGER               Tor SOCKS port         │
 │                                                       override               │
+│ --fee-rate                      FLOAT                 Manual fee rate in     │
+│                                                       sat/vB (mutually       │
+│                                                       exclusive with         │
+│                                                       --block-target).       │
+│                                                       Required when the      │
+│                                                       backend is neutrino.   │
+│ --block-target                  INTEGER               Target blocks for fee  │
+│                                                       estimation (mutually   │
+│                                                       exclusive with         │
+│                                                       --fee-rate). Not       │
+│                                                       supported with the     │
+│                                                       neutrino backend.      │
 │ --min-confirmations             INTEGER               Confirmations required │
 │                                                       before the next phase  │
 │                                                       starts (0 disables     │
 │                                                       gating)                │
 │                                                       [default: 5]           │
+│ --counterparties                INTEGER RANGE         Override the           │
+│                                 [1<=x<=20]            counterparty count for │
+│                                                       every phase at         │
+│                                                       runtime. Useful when   │
+│                                                       the configured count   │
+│                                                       is unavailable on the  │
+│                                                       chosen network.        │
 │ --log-level             -l      TEXT                                         │
 │ --help                                                Show this message and  │
 │                                                       exit.                  │

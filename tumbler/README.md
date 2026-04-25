@@ -6,8 +6,8 @@ that long-running schedules survive restarts.
 
 ## Features
 
-- **Role-mixed schedules**: interleaves taker CoinJoins, maker sessions, and
-  bondless taker bursts to diversify on-chain signatures.
+- **Role-mixed schedules**: interleaves taker CoinJoins with optional maker
+  sessions to diversify on-chain signatures.
 - **YAML persistence**: each plan is stored as a readable `plan.yaml` that can
   be inspected, resumed, or cancelled.
 - **Concurrency-safe**: the runner coordinates with `jmwalletd` so manual
@@ -100,20 +100,34 @@ For full documentation, see
 │                                                             schedules        │
 │    --maker-count-…                         INTEGER          Minimum          │
 │                                                             counterparty     │
-│                                                             count per CJ     │
-│                                                             [default: 5]     │
+│                                                             count per CJ;    │
+│                                                             defaults to      │
+│                                                             settings.taker.… │
 │    --maker-count-…                         INTEGER          Maximum          │
 │                                                             counterparty     │
-│                                                             count per CJ     │
-│                                                             [default: 9]     │
+│                                                             count per CJ;    │
+│                                                             defaults to      │
+│                                                             settings.taker.… │
 │    --mincjamount-…                         INTEGER          Minimum CJ       │
 │                                                             amount in sats   │
 │                                                             [default:        │
 │                                                             100000]          │
 │    --maker-sessio…      --no-maker-ses…                     [default:        │
 │                                                             maker-sessions]  │
-│    --bondless-bur…      --no-bondless-…                     [default:        │
-│                                                             bondless-bursts] │
+│    --allow-few-de…                                          Override the     │
+│                                                             recommended      │
+│                                                             minimum of 3     │
+│                                                             destinations.    │
+│                                                             Intended for     │
+│                                                             development and  │
+│                                                             automated        │
+│                                                             testing only:    │
+│                                                             fewer            │
+│                                                             destinations     │
+│                                                             expose users to  │
+│                                                             pairwise         │
+│                                                             re-aggregation   │
+│                                                             heuristics.      │
 │    --log-level      -l                     TEXT                              │
 │    --help                                                   Show this        │
 │                                                             message and      │
@@ -133,9 +147,13 @@ For full documentation, see
  Print the current plan for the given wallet.
 
 ╭─ Options ────────────────────────────────────────────────────────────────────╮
-│ *  --wallet-name  -w      TEXT  Wallet identifier [required]                 │
-│    --log-level    -l      TEXT                                               │
-│    --help                       Show this message and exit.                  │
+│ --wallet-name              -w      TEXT  Wallet identifier; defaults to the  │
+│                                          mnemonic fingerprint                │
+│ --mnemonic-file            -f      PATH  Path to mnemonic file               │
+│ --prompt-bip39-passphrase                Prompt for BIP39 passphrase         │
+│                                          interactively                       │
+│ --log-level                -l      TEXT                                      │
+│ --help                                   Show this message and exit.         │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ```
 
@@ -151,10 +169,14 @@ For full documentation, see
  Delete the on-disk plan for ``wallet_name``.
 
 ╭─ Options ────────────────────────────────────────────────────────────────────╮
-│ *  --wallet-name  -w      TEXT  [required]                                   │
-│    --yes          -y            Skip confirmation prompt                     │
-│    --log-level    -l      TEXT                                               │
-│    --help                       Show this message and exit.                  │
+│ --wallet-name              -w      TEXT  Wallet identifier; defaults to the  │
+│                                          mnemonic fingerprint                │
+│ --mnemonic-file            -f      PATH  Path to mnemonic file               │
+│ --prompt-bip39-passphrase                Prompt for BIP39 passphrase         │
+│                                          interactively                       │
+│ --yes                      -y            Skip confirmation prompt            │
+│ --log-level                -l      TEXT                                      │
+│ --help                                   Show this message and exit.         │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ```
 
@@ -190,11 +212,30 @@ For full documentation, see
 │                                                       override               │
 │ --tor-socks-port                INTEGER               Tor SOCKS port         │
 │                                                       override               │
+│ --fee-rate                      FLOAT                 Manual fee rate in     │
+│                                                       sat/vB (mutually       │
+│                                                       exclusive with         │
+│                                                       --block-target).       │
+│                                                       Required when the      │
+│                                                       backend is neutrino.   │
+│ --block-target                  INTEGER               Target blocks for fee  │
+│                                                       estimation (mutually   │
+│                                                       exclusive with         │
+│                                                       --fee-rate). Not       │
+│                                                       supported with the     │
+│                                                       neutrino backend.      │
 │ --min-confirmations             INTEGER               Confirmations required │
 │                                                       before the next phase  │
 │                                                       starts (0 disables     │
 │                                                       gating)                │
 │                                                       [default: 5]           │
+│ --counterparties                INTEGER RANGE         Override the           │
+│                                 [1<=x<=20]            counterparty count for │
+│                                                       every phase at         │
+│                                                       runtime. Useful when   │
+│                                                       the configured count   │
+│                                                       is unavailable on the  │
+│                                                       chosen network.        │
 │ --log-level             -l      TEXT                                         │
 │ --help                                                Show this message and  │
 │                                                       exit.                  │
