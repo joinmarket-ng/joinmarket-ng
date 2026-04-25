@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncGenerator
+from datetime import datetime
 from typing import Any
 
 import httpx
@@ -43,18 +44,18 @@ from tests.e2e.test_tumbler_e2e import (
     _wait_for_sync_and_funds,
 )
 
-pytestmark = pytest.mark.e2e
+pytestmark = [pytest.mark.e2e, pytest.mark.tumbler_e2e]
 
 # Keep the deadline well above the idle window so a successful timeout is
 # unambiguous: if the phase exits via ``maker_session_seconds`` instead the
 # test will fail because the runner did not observe the idle path.
-IDLE_TIMEOUT_SECONDS = 15.0
-MAKER_SESSION_SECONDS = 300.0
+IDLE_TIMEOUT_SECONDS = 5.0
+MAKER_SESSION_SECONDS = 60.0
 
 # Wait budget for the maker phase to be reached and complete via idle.
 # stage-1 sweeps one mixdepth (one CJ) before the maker phase, so the
 # upper bound is dominated by the first CJ round-trip plus the idle window.
-MAKER_PHASE_TIMEOUT_SEC = 600.0
+MAKER_PHASE_TIMEOUT_SEC = 180.0
 
 
 @pytest.fixture(scope="module")
@@ -105,7 +106,7 @@ async def _post_plan_with_idle_fallback(
                 "maker_count_max": 2,
                 "include_maker_sessions": True,
                 "mintxcount": 2,
-                "time_lambda_seconds": 1.0,
+                "time_lambda_seconds": 0.1,
                 # Generous upper bound; if the phase exits because this
                 # deadline fires instead of the idle timeout, the test
                 # fails because the assertion below requires cj_served==0
@@ -191,7 +192,6 @@ async def test_maker_phase_exits_via_idle_timeout_when_no_cj_served(
     )
 
     await _post_start(client, name, token)
-    start_ts = asyncio.get_event_loop().time()
     async with _background_miner():
         maker_phase = await _poll_until_maker_phase_completed(
             client,
@@ -200,7 +200,6 @@ async def test_maker_phase_exits_via_idle_timeout_when_no_cj_served(
             maker_phase_index=maker_index,
             timeout=MAKER_PHASE_TIMEOUT_SEC,
         )
-    maker_elapsed = asyncio.get_event_loop().time() - start_ts
 
     # Stop the plan: we're not interested in the remaining stage-2 phases.
     try:
@@ -216,9 +215,19 @@ async def test_maker_phase_exits_via_idle_timeout_when_no_cj_served(
         f"expected zero CJs served for idle-timeout path: {maker_phase}"
     )
     # The phase must have exited via ``idle_timeout_seconds``, not the
-    # generous ``maker_session_seconds`` deadline. Allow headroom for
-    # stage-1 sweep latency but keep the bound well below the 300s
-    # maker_session_seconds deadline.
-    assert maker_elapsed < MAKER_SESSION_SECONDS * 0.5, (
-        f"maker phase took {maker_elapsed:.0f}s; idle path should exit quickly"
+    # ``maker_session_seconds`` deadline. Use the persisted phase
+    # timestamps so the bound is independent of stage-1 sweep latency
+    # (which can dominate wall-clock under load).
+    started_at = maker_phase.get("started_at")
+    finished_at = maker_phase.get("finished_at")
+    assert started_at and finished_at, maker_phase
+    started_dt = datetime.fromisoformat(started_at)
+    finished_dt = datetime.fromisoformat(finished_at)
+    phase_elapsed = (finished_dt - started_dt).total_seconds()
+    # Allow generous headroom over the idle window for shutdown/teardown
+    # but stay well below the maker_session_seconds deadline.
+    assert phase_elapsed < MAKER_SESSION_SECONDS * 0.5, (
+        f"maker phase ran for {phase_elapsed:.0f}s; idle path should exit "
+        f"within roughly {IDLE_TIMEOUT_SECONDS}s, not the "
+        f"{MAKER_SESSION_SECONDS}s deadline"
     )
