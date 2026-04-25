@@ -42,7 +42,7 @@ from tests.e2e.test_tumbler_e2e import (
 )
 from tests.e2e.rpc_utils import rpc_call
 
-pytestmark = pytest.mark.e2e
+pytestmark = [pytest.mark.e2e, pytest.mark.tumbler_e2e]
 
 
 @pytest.fixture(scope="module")

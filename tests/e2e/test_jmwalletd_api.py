@@ -10,6 +10,7 @@ Requires: ``docker compose --profile e2e up -d``
 from __future__ import annotations
 
 import asyncio
+import os
 import uuid
 from collections.abc import AsyncGenerator
 
@@ -18,7 +19,7 @@ import pytest
 
 pytestmark = pytest.mark.e2e
 
-JMWALLETD_URL = "https://127.0.0.1:28183"
+JMWALLETD_URL = os.environ.get("JMWALLETD_URL", "https://127.0.0.1:28183")
 API = f"{JMWALLETD_URL}/api/v1"
 
 # Self-signed cert on the e2e jmwalletd; clients must skip verification.
