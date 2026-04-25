@@ -8,6 +8,7 @@ tests from the monorepo root.
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 # ---------------------------------------------------------------------------
@@ -18,7 +19,7 @@ TEST_MNEMONIC = (
     "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
 )
 
-TEST_RPC_URL = "http://localhost:18443"
+TEST_RPC_URL = os.getenv("BITCOIN_RPC_URL", "http://localhost:18443")
 TEST_RPC_USER = "test"
 TEST_RPC_PASSWORD = "test"
 

@@ -5,6 +5,7 @@ Integration tests for BitcoinCoreBackend and NeutrinoBackend
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _jmwallet_test_helpers import TEST_RPC_PASSWORD, TEST_RPC_URL, TEST_RPC_USER
 from jmcore.crypto import KeyPair
 
 from jmwallet.backends.base import BondVerificationRequest
@@ -20,7 +21,9 @@ async def test_bitcoin_core_backend_integration():
     """Integration test requiring Docker Bitcoin Core service."""
     # Connect to the regtest node defined in docker-compose
     backend = BitcoinCoreBackend(
-        rpc_url="http://localhost:18443", rpc_user="test", rpc_password="test"
+        rpc_url=TEST_RPC_URL,
+        rpc_user=TEST_RPC_USER,
+        rpc_password=TEST_RPC_PASSWORD,
     )
 
     try:
@@ -29,7 +32,7 @@ async def test_bitcoin_core_backend_integration():
             await backend.get_block_height()
         except Exception:
             pytest.fail(
-                "Bitcoin Core not available at localhost:18443. "
+                f"Bitcoin Core not available at {TEST_RPC_URL}. "
                 "Start with: docker compose up -d bitcoin"
             )
             return
@@ -128,7 +131,7 @@ class TestBackendCloseReuse:
     async def test_bitcoin_core_backend_reusable_after_close(self):
         """Closing a BitcoinCoreBackend should produce fresh httpx clients."""
         backend = BitcoinCoreBackend(
-            rpc_url="http://localhost:18443", rpc_user="test", rpc_password="test"
+            rpc_url=TEST_RPC_URL, rpc_user=TEST_RPC_USER, rpc_password=TEST_RPC_PASSWORD
         )
         original_client = backend.client
         original_scan_client = backend._scan_client
@@ -349,7 +352,7 @@ class TestBitcoinCoreBackendUnit:
     def test_bitcoin_core_can_estimate_fee(self):
         """Test that BitcoinCoreBackend reports it can estimate fees."""
         backend = BitcoinCoreBackend(
-            rpc_url="http://localhost:18443", rpc_user="test", rpc_password="test"
+            rpc_url=TEST_RPC_URL, rpc_user=TEST_RPC_USER, rpc_password=TEST_RPC_PASSWORD
         )
         assert backend.can_estimate_fee() is True
 
@@ -375,7 +378,7 @@ class TestBitcoinCoreBackendUnit:
         from unittest.mock import AsyncMock
 
         backend = BitcoinCoreBackend(
-            rpc_url="http://localhost:18443", rpc_user="test", rpc_password="test"
+            rpc_url=TEST_RPC_URL, rpc_user=TEST_RPC_USER, rpc_password=TEST_RPC_PASSWORD
         )
 
         # Mock the RPC call to return a known fee rate (BTC/kB)
@@ -404,7 +407,7 @@ class TestBitcoinCoreBackendUnit:
         from unittest.mock import AsyncMock
 
         backend = BitcoinCoreBackend(
-            rpc_url="http://localhost:18443", rpc_user="test", rpc_password="test"
+            rpc_url=TEST_RPC_URL, rpc_user=TEST_RPC_USER, rpc_password=TEST_RPC_PASSWORD
         )
 
         # Mock the RPC call to raise an exception
@@ -425,7 +428,7 @@ class TestBitcoinCoreBackendUnit:
     async def test_get_utxos_warns_when_descriptor_address_not_queried(self, monkeypatch):
         """Defensive warning should trigger for unexpected descriptor addresses."""
         backend = BitcoinCoreBackend(
-            rpc_url="http://localhost:18443", rpc_user="test", rpc_password="test"
+            rpc_url=TEST_RPC_URL, rpc_user=TEST_RPC_USER, rpc_password=TEST_RPC_PASSWORD
         )
 
         backend.get_block_height = AsyncMock(return_value=100)
@@ -1832,7 +1835,7 @@ class TestSupportsDescriptorScan:
     def test_bitcoin_core_supports_descriptor_scan(self):
         """BitcoinCoreBackend must report supports_descriptor_scan=True."""
         backend = BitcoinCoreBackend(
-            rpc_url="http://localhost:18443", rpc_user="test", rpc_password="test"
+            rpc_url=TEST_RPC_URL, rpc_user=TEST_RPC_USER, rpc_password=TEST_RPC_PASSWORD
         )
         assert backend.supports_descriptor_scan is True
 

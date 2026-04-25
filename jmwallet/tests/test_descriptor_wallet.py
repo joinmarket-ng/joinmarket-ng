@@ -746,7 +746,7 @@ async def test_descriptor_wallet_backend_integration():
             assert height >= 0
         except Exception:
             pytest.skip(
-                "Bitcoin Core not available at localhost:18443. "
+                f"Bitcoin Core not available at {TEST_RPC_URL}. "
                 "Start with: docker compose up -d bitcoin"
             )
             return
