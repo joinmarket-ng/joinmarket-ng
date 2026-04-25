@@ -1,5 +1,5 @@
 """
-Tests for :class:`jmtumbler.runner.TumbleRunner`.
+Tests for :class:`tumbler.runner.TumbleRunner`.
 
 These tests fake out the taker and maker so we can drive the runner's state
 machine deterministically, focusing on:
@@ -16,9 +16,9 @@ import asyncio
 from pathlib import Path
 from typing import Any
 
-from jmtumbler.builder import PlanBuilder, TumbleParameters
-from jmtumbler.persistence import load_plan, save_plan
-from jmtumbler.plan import (
+from tumbler.builder import PlanBuilder, TumbleParameters
+from tumbler.persistence import load_plan, save_plan
+from tumbler.plan import (
     BondlessTakerBurstPhase,
     MakerSessionPhase,
     PhaseStatus,
@@ -26,7 +26,7 @@ from jmtumbler.plan import (
     PlanStatus,
     TakerCoinjoinPhase,
 )
-from jmtumbler.runner import RunnerContext, TumbleRunner
+from tumbler.runner import RunnerContext, TumbleRunner
 
 # --------------------------------------------------------------------------- fakes
 
@@ -542,7 +542,7 @@ class TestRunnerTakerInterop:
         """
         import logging
 
-        from jmtumbler.runner import TakerPhaseError
+        from tumbler.runner import TakerPhaseError
 
         plan = _plan(tmp_path)
 
@@ -565,11 +565,11 @@ class TestRunnerTakerInterop:
         from loguru import logger as loguru_logger
 
         handler_id = loguru_logger.add(
-            lambda msg: logging.getLogger("jmtumbler").error(msg.record["message"]),
+            lambda msg: logging.getLogger("tumbler").error(msg.record["message"]),
             level="ERROR",
         )
         try:
-            with caplog.at_level(logging.ERROR, logger="jmtumbler"):
+            with caplog.at_level(logging.ERROR, logger="tumbler"):
                 await TumbleRunner(plan, _ctx(tmp_path, taker_factory=make_taker)).run()
         finally:
             loguru_logger.remove(handler_id)

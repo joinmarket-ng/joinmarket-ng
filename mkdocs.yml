@@ -114,7 +114,7 @@ plugins:
             - maker/src         # Maker module for liquidity provision
             - directory_server/src    # Directory server for peer discovery
             - orderbook_watcher/src   # Orderbook monitoring
-            - jmtumbler/src     # Tumbler scheduler
+            - tumbler/src     # Tumbler scheduler
           options:
             # Use NumPy-style docstring parsing
             # NumPy style is used because it's readable and supports
@@ -285,7 +285,7 @@ nav:
       - Wallet: README-jmwallet.md
       - Taker: README-taker.md
       - Maker: README-maker.md
-      - Tumbler: README-jmtumbler.md
+      - Tumbler: README-tumbler.md
 
   # -------------------------------------------------------------------------
   # Extra Modules

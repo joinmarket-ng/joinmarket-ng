@@ -1,11 +1,11 @@
-"""Tests for :mod:`jmtumbler.builder`."""
+"""Tests for :mod:`tumbler.builder`."""
 
 from __future__ import annotations
 
 import pytest
 
-from jmtumbler.builder import INTERNAL_DESTINATION, PlanBuilder, TumbleParameters
-from jmtumbler.plan import (
+from tumbler.builder import INTERNAL_DESTINATION, PlanBuilder, TumbleParameters
+from tumbler.plan import (
     BondlessTakerBurstPhase,
     MakerSessionPhase,
     PhaseKind,

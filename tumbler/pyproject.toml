@@ -15,7 +15,7 @@ dependencies = [
 ]
 
 [project.scripts]
-jm-tumbler = "jmtumbler.cli:main"
+jm-tumbler = "tumbler.cli:main"
 
 [project.optional-dependencies]
 dev = [
@@ -42,7 +42,7 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
-addopts = "-v --cov=jmtumbler --cov-report=html --cov-report=term --timeout=60"
+addopts = "-v --cov=tumbler --cov-report=html --cov-report=term --timeout=60"
 
 [tool.mypy]
 python_version = "3.11"

@@ -575,10 +575,10 @@ run_suite_unit() {
         COVERAGE_FILE=.coverage.unit pytest -c pytest.ini --fail-on-skip \
             -lv \
             --cov=jmcore --cov=jmwallet --cov=directory_server --cov=jmwalletd \
-            --cov=jmtumbler \
+            --cov=tumbler \
             --cov=orderbook_watcher --cov=maker --cov=taker \
             --cov-report=term-missing \
-            jmcore/ jmwallet/ directory_server/ jmwalletd/ jmtumbler/ orderbook_watcher/ maker/ taker/
+            jmcore/ jmwallet/ directory_server/ jmwalletd/ tumbler/ orderbook_watcher/ maker/ taker/
     } > "$log" 2>&1
 }
 

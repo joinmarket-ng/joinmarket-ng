@@ -8,13 +8,13 @@ YAML state file so plans can be resumed after a restart.
 
 from jmcore.version import __version__
 
-from jmtumbler.builder import PlanBuilder, TumbleParameters
-from jmtumbler.persistence import (
+from tumbler.builder import PlanBuilder, TumbleParameters
+from tumbler.persistence import (
     load_plan,
     plan_path,
     save_plan,
 )
-from jmtumbler.plan import (
+from tumbler.plan import (
     BondlessTakerBurstPhase,
     MakerSessionPhase,
     Phase,

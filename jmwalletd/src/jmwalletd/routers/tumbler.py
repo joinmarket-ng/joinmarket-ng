@@ -1,7 +1,7 @@
-"""Tumbler endpoints backed by :mod:`jmtumbler`.
+"""Tumbler endpoints backed by :mod:`tumbler`.
 
 The router exposes a small, stateless-ish HTTP surface over the persistent
-YAML plan managed by :mod:`jmtumbler.persistence` and the in-memory runner
+YAML plan managed by :mod:`tumbler.persistence` and the in-memory runner
 owned by :class:`jmwalletd.state.DaemonState`:
 
 * ``POST /tumbler/plan``    -- build a new plan and persist it as ``PENDING``.
@@ -20,7 +20,7 @@ owned by :class:`jmwalletd.state.DaemonState`:
 
 See ``docs/technical/tumbler-redesign.md`` for the state matrix and
 subset-sum rationale. The router itself is intentionally thin so all plan
-semantics stay in :mod:`jmtumbler`.
+semantics stay in :mod:`tumbler`.
 """
 
 from __future__ import annotations
@@ -31,8 +31,9 @@ from typing import Any
 
 from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
-from jmtumbler.builder import PlanBuilder, TumbleParameters
-from jmtumbler.persistence import (
+from loguru import logger
+from tumbler.builder import PlanBuilder, TumbleParameters
+from tumbler.persistence import (
     PlanCorruptError,
     PlanNotFoundError,
     delete_plan,
@@ -40,15 +41,14 @@ from jmtumbler.persistence import (
     plan_path,
     save_plan,
 )
-from jmtumbler.plan import (
+from tumbler.plan import (
     BondlessTakerBurstPhase,
     MakerSessionPhase,
     Plan,
     PlanStatus,
     TakerCoinjoinPhase,
 )
-from jmtumbler.runner import RunnerContext, TumbleRunner
-from loguru import logger
+from tumbler.runner import RunnerContext, TumbleRunner
 
 from jmcore.settings import get_settings
 from jmwalletd.deps import get_daemon_state, require_auth, require_wallet_match
@@ -513,7 +513,7 @@ async def delete_plan_endpoint(
 
 
 # The ``plan_path`` import is kept public here so tests that want to assert
-# the schedules directory layout can do so without pulling jmtumbler directly.
+# the schedules directory layout can do so without pulling tumbler directly.
 _ = plan_path
 # ``BackendNotReady`` is kept imported because factories that import taker/
 # maker modules at call time may fail with it; the import site lives inside

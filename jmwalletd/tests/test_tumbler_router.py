@@ -29,9 +29,9 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
-from jmtumbler.builder import PlanBuilder, TumbleParameters
-from jmtumbler.persistence import load_plan, plan_path, save_plan
-from jmtumbler.plan import Plan, PlanStatus
+from tumbler.builder import PlanBuilder, TumbleParameters
+from tumbler.persistence import load_plan, plan_path, save_plan
+from tumbler.plan import Plan, PlanStatus
 
 from jmwalletd.deps import get_daemon_state
 from jmwalletd.state import CoinjoinState, DaemonState

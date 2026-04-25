@@ -6,8 +6,8 @@ configuration is loaded from (in priority order) CLI arguments, environment
 variables, the config file at ``~/.joinmarket-ng/config.toml`` (or
 ``$JOINMARKET_DATA_DIR/config.toml``), and built-in defaults.
 
-The CLI is a thin wrapper around :mod:`jmtumbler.builder`,
-:mod:`jmtumbler.persistence`, and :mod:`jmtumbler.runner`. Plans are
+The CLI is a thin wrapper around :mod:`tumbler.builder`,
+:mod:`tumbler.persistence`, and :mod:`tumbler.runner`. Plans are
 persisted to ``<data_dir>/schedules/<wallet_name>.yaml`` so the same file
 is used whether the tumble runs from the CLI or from jmwalletd.
 """
@@ -27,19 +27,19 @@ from jmcore.settings import ensure_config_file
 from jmwallet.wallet.service import WalletService
 from loguru import logger
 
-from jmtumbler.builder import PlanBuilder, TumbleParameters
-from jmtumbler.persistence import (
+from tumbler.builder import PlanBuilder, TumbleParameters
+from tumbler.persistence import (
     PlanCorruptError,
     PlanNotFoundError,
     load_plan,
     plan_path,
     save_plan,
 )
-from jmtumbler.persistence import (
+from tumbler.persistence import (
     delete_plan as delete_plan_on_disk,
 )
-from jmtumbler.plan import Plan, PlanStatus
-from jmtumbler.runner import RunnerContext, TumbleRunner
+from tumbler.plan import Plan, PlanStatus
+from tumbler.runner import RunnerContext, TumbleRunner
 
 app = typer.Typer(
     name="jm-tumbler",

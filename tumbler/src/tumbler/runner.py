@@ -1,12 +1,12 @@
 """
 Tumble runner.
 
-Executes a :class:`~jmtumbler.plan.Plan` against a live wallet plus blockchain
+Executes a :class:`~tumbler.plan.Plan` against a live wallet plus blockchain
 and directory backends. The runner owns the Taker / MakerBot lifecycle for the
 duration of each phase and is responsible for:
 
 * transitioning phase and plan statuses through
-  :data:`~jmtumbler.plan.PhaseStatus`,
+  :data:`~tumbler.plan.PhaseStatus`,
 * persisting the plan to YAML on every state change (so that a restart of
   jmwalletd can resume),
 * guaranteeing that the Taker and MakerBot are torn down in ``finally`` even
@@ -32,8 +32,8 @@ from jmcore.settings import get_settings
 from jmwallet.wallet.service import WalletService
 from loguru import logger
 
-from jmtumbler.persistence import save_plan
-from jmtumbler.plan import (
+from tumbler.persistence import save_plan
+from tumbler.plan import (
     BondlessTakerBurstPhase,
     MakerSessionPhase,
     Phase,

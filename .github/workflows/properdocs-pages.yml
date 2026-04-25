@@ -36,7 +36,7 @@ jobs:
             -e directory_server \
             -e orderbook_watcher \
             -e jmwalletd \
-            -e jmtumbler
+            -e tumbler
 
       - name: Build documentation
         run: |

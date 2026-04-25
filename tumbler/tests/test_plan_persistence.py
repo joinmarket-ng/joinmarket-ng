@@ -1,4 +1,4 @@
-"""Tests for :mod:`jmtumbler.persistence`."""
+"""Tests for :mod:`tumbler.persistence`."""
 
 from __future__ import annotations
 
@@ -7,8 +7,8 @@ from pathlib import Path
 import pytest
 import yaml
 
-from jmtumbler.builder import PlanBuilder, TumbleParameters
-from jmtumbler.persistence import (
+from tumbler.builder import PlanBuilder, TumbleParameters
+from tumbler.persistence import (
     PlanCorruptError,
     PlanNotFoundError,
     delete_plan,
@@ -16,7 +16,7 @@ from jmtumbler.persistence import (
     plan_path,
     save_plan,
 )
-from jmtumbler.plan import Plan
+from tumbler.plan import Plan
 
 
 def _build_plan(wallet_name: str = "Satoshi") -> Plan:

@@ -1,4 +1,4 @@
-"""CLI-level tests for :mod:`jmtumbler.cli`.
+"""CLI-level tests for :mod:`tumbler.cli`.
 
 These exercise the thin wrapper behaviours that surround the runner: option
 validation, wallet-name defaulting from the mnemonic, and neutrino fee
@@ -13,10 +13,10 @@ from unittest.mock import patch
 
 from typer.testing import CliRunner
 
-from jmtumbler.builder import PlanBuilder, TumbleParameters
-from jmtumbler.cli import app
-from jmtumbler.persistence import save_plan
-from jmtumbler.plan import Plan
+from tumbler.builder import PlanBuilder, TumbleParameters
+from tumbler.cli import app
+from tumbler.persistence import save_plan
+from tumbler.plan import Plan
 
 runner = CliRunner()
 
@@ -35,7 +35,7 @@ def _build_plan(wallet_name: str) -> Plan:
 
 
 class _FakeSettings:
-    """Minimal ``settings`` stand-in for :func:`jmtumbler.cli._resolve_wallet_name`.
+    """Minimal ``settings`` stand-in for :func:`tumbler.cli._resolve_wallet_name`.
 
     We only touch ``get_data_dir`` and ``network_config.network``; the
     neutrino-path test additionally touches ``bitcoin.backend_type``.
@@ -73,9 +73,9 @@ class TestStatusDefaultsWalletFromMnemonic:
             bip39_passphrase = ""
 
         with (
-            patch("jmtumbler.cli.setup_cli", return_value=settings),
-            patch("jmtumbler.cli.resolve_mnemonic", return_value=_Resolved()),
-            patch("jmtumbler.cli._wallet_name_from_mnemonic", return_value=wallet_name),
+            patch("tumbler.cli.setup_cli", return_value=settings),
+            patch("tumbler.cli.resolve_mnemonic", return_value=_Resolved()),
+            patch("tumbler.cli._wallet_name_from_mnemonic", return_value=wallet_name),
         ):
             result = runner.invoke(app, ["status"])
 
@@ -85,8 +85,8 @@ class TestStatusDefaultsWalletFromMnemonic:
     def test_reports_error_when_no_wallet_and_no_mnemonic(self, tmp_path: Path) -> None:
         settings = _FakeSettings(tmp_path)
         with (
-            patch("jmtumbler.cli.setup_cli", return_value=settings),
-            patch("jmtumbler.cli.resolve_mnemonic", return_value=None),
+            patch("tumbler.cli.setup_cli", return_value=settings),
+            patch("tumbler.cli.resolve_mnemonic", return_value=None),
         ):
             result = runner.invoke(app, ["status"])
         assert result.exit_code == 1
@@ -104,9 +104,9 @@ class TestDeleteDefaultsWalletFromMnemonic:
             bip39_passphrase = ""
 
         with (
-            patch("jmtumbler.cli.setup_cli", return_value=settings),
-            patch("jmtumbler.cli.resolve_mnemonic", return_value=_Resolved()),
-            patch("jmtumbler.cli._wallet_name_from_mnemonic", return_value=wallet_name),
+            patch("tumbler.cli.setup_cli", return_value=settings),
+            patch("tumbler.cli.resolve_mnemonic", return_value=_Resolved()),
+            patch("tumbler.cli._wallet_name_from_mnemonic", return_value=wallet_name),
         ):
             result = runner.invoke(app, ["delete", "--yes"])
 
@@ -120,9 +120,9 @@ class TestRunFeeOptions:
         settings = _FakeSettings(tmp_path)
 
         with (
-            patch("jmtumbler.cli.setup_cli", return_value=settings),
-            patch("jmtumbler.cli.ensure_config_file"),
-            patch("jmtumbler.cli.resolve_mnemonic") as m_resolve,
+            patch("tumbler.cli.setup_cli", return_value=settings),
+            patch("tumbler.cli.ensure_config_file"),
+            patch("tumbler.cli.resolve_mnemonic") as m_resolve,
         ):
             result = runner.invoke(
                 app, ["run", "-w", "w", "--fee-rate", "2", "--block-target", "6"]
@@ -135,9 +135,9 @@ class TestRunFeeOptions:
         settings = _FakeSettings(tmp_path, backend="neutrino")
 
         with (
-            patch("jmtumbler.cli.setup_cli", return_value=settings),
-            patch("jmtumbler.cli.ensure_config_file"),
-            patch("jmtumbler.cli.resolve_mnemonic") as m_resolve,
+            patch("tumbler.cli.setup_cli", return_value=settings),
+            patch("tumbler.cli.ensure_config_file"),
+            patch("tumbler.cli.resolve_mnemonic") as m_resolve,
         ):
             result = runner.invoke(app, ["run", "-w", "w", "--backend", "neutrino"])
         assert result.exit_code == 1
@@ -155,10 +155,10 @@ class TestRunFeeOptions:
             creation_height = None
 
         with (
-            patch("jmtumbler.cli.setup_cli", return_value=settings),
-            patch("jmtumbler.cli.ensure_config_file"),
-            patch("jmtumbler.cli.resolve_mnemonic", return_value=_Resolved()) as m_resolve,
-            patch("jmtumbler.cli._wallet_name_from_mnemonic", return_value="w"),
+            patch("tumbler.cli.setup_cli", return_value=settings),
+            patch("tumbler.cli.ensure_config_file"),
+            patch("tumbler.cli.resolve_mnemonic", return_value=_Resolved()) as m_resolve,
+            patch("tumbler.cli._wallet_name_from_mnemonic", return_value="w"),
         ):
             result = runner.invoke(app, ["run", "--backend", "neutrino", "--fee-rate", "2"])
         # Plan does not exist → _load_or_error exits 1, but only *after* the
@@ -180,10 +180,10 @@ class TestRunCounterpartiesOption:
             creation_height = None
 
         with (
-            patch("jmtumbler.cli.setup_cli", return_value=settings),
-            patch("jmtumbler.cli.ensure_config_file"),
-            patch("jmtumbler.cli.resolve_mnemonic", return_value=_Resolved()),
-            patch("jmtumbler.cli._wallet_name_from_mnemonic", return_value="w"),
+            patch("tumbler.cli.setup_cli", return_value=settings),
+            patch("tumbler.cli.ensure_config_file"),
+            patch("tumbler.cli.resolve_mnemonic", return_value=_Resolved()),
+            patch("tumbler.cli._wallet_name_from_mnemonic", return_value="w"),
         ):
             result = runner.invoke(
                 app,
@@ -205,8 +205,8 @@ class TestRunCounterpartiesOption:
     def test_counterparties_rejects_out_of_range(self, tmp_path: Path) -> None:
         settings = _FakeSettings(tmp_path, backend="neutrino")
         with (
-            patch("jmtumbler.cli.setup_cli", return_value=settings),
-            patch("jmtumbler.cli.ensure_config_file"),
+            patch("tumbler.cli.setup_cli", return_value=settings),
+            patch("tumbler.cli.ensure_config_file"),
         ):
             result = runner.invoke(
                 app,
@@ -247,24 +247,21 @@ class TestPlanDefaultsCounterpartyFromSettings:
                 self.wallet_name = wallet_name
 
             def build(self):  # type: ignore[no-untyped-def]
-                from jmtumbler.builder import PlanBuilder
+                from tumbler.builder import PlanBuilder
 
                 return PlanBuilder(self.wallet_name, self.params).build()
 
         with (
-            patch("jmtumbler.cli.setup_cli", return_value=settings),
-            patch("jmtumbler.cli.ensure_config_file"),
-            patch("jmtumbler.cli.resolve_mnemonic", return_value=_Resolved()),
-            patch("jmtumbler.cli._wallet_name_from_mnemonic", return_value="w"),
-            patch("jmtumbler.cli._balances_for_mnemonic", new=_unused_balances),
-            patch("jmtumbler.cli.PlanBuilder", _FakeBuilder),
+            patch("tumbler.cli.setup_cli", return_value=settings),
+            patch("tumbler.cli.ensure_config_file"),
+            patch("tumbler.cli.resolve_mnemonic", return_value=_Resolved()),
+            patch("tumbler.cli._wallet_name_from_mnemonic", return_value="w"),
+            patch("tumbler.cli._balances_for_mnemonic", new=_unused_balances),
+            patch("tumbler.cli.PlanBuilder", _FakeBuilder),
         ):
             # _balances_for_mnemonic is executed inside asyncio.run; stub the
             # run result directly so the CLI sees the expected balance map.
-            with patch(
-                "jmtumbler.cli.asyncio.run",
-                return_value={0: 1_000_000, 1: 0},
-            ):
+            with patch("tumbler.cli.asyncio.run", return_value={0: 1_000_000, 1: 0}):
                 result = runner.invoke(
                     app,
                     [
@@ -298,13 +295,13 @@ class TestPlanSingleFundedMixdepth:
             creation_height = None
 
         with (
-            patch("jmtumbler.cli.setup_cli", return_value=settings),
-            patch("jmtumbler.cli.ensure_config_file"),
-            patch("jmtumbler.cli.resolve_mnemonic", return_value=_Resolved()),
-            patch("jmtumbler.cli._wallet_name_from_mnemonic", return_value="default"),
-            patch("jmtumbler.cli._balances_for_mnemonic", new=_unused_balances),
+            patch("tumbler.cli.setup_cli", return_value=settings),
+            patch("tumbler.cli.ensure_config_file"),
+            patch("tumbler.cli.resolve_mnemonic", return_value=_Resolved()),
+            patch("tumbler.cli._wallet_name_from_mnemonic", return_value="default"),
+            patch("tumbler.cli._balances_for_mnemonic", new=_unused_balances),
             patch(
-                "jmtumbler.cli.asyncio.run",
+                "tumbler.cli.asyncio.run",
                 return_value={0: 0, 1: 23_430_165, 2: 0, 3: 0, 4: 0},
             ),
         ):

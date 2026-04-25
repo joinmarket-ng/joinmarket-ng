@@ -24,7 +24,7 @@ from jmwalletd.auth import JMTokenAuthority
 class CoinjoinState(enum.IntEnum):
     """Matches reference implementation's coinjoin state constants.
 
-    ``TUMBLER_RUNNING`` is a jm-ng extension used while a :mod:`jmtumbler`
+    ``TUMBLER_RUNNING`` is a jm-ng extension used while a :mod:`tumbler`
     plan is executing; it is distinct from ``TAKER_RUNNING`` so that direct
     single-shot taker runs and tumbler runs can be mutually excluded from
     one another without conflating the two.
@@ -70,7 +70,7 @@ class DaemonState:
         self._taker_task: asyncio.Task[None] | None = None
         self._wallet_sync_task: asyncio.Task[None] | None = None
 
-        # Tumbler runtime. ``tumble_runner`` is a ``jmtumbler.runner.TumbleRunner``
+        # Tumbler runtime. ``tumble_runner`` is a ``tumbler.runner.TumbleRunner``
         # and ``tumble_task`` is the task running ``runner.run()``. They are kept
         # as dedicated fields (rather than reusing ``_taker_ref`` / ``_taker_task``)
         # so that direct single-shot taker runs cannot be interfered with by the
@@ -238,13 +238,13 @@ class DaemonState:
         logging / metrics.
         """
         # Local import to avoid a circular dependency at module import time.
-        from jmtumbler.persistence import (
+        from tumbler.persistence import (
             SCHEDULES_SUBDIR,
             PlanCorruptError,
             load_plan,
             save_plan,
         )
-        from jmtumbler.plan import PhaseStatus, PlanStatus
+        from tumbler.plan import PhaseStatus, PlanStatus
 
         schedules_dir = self.data_dir / SCHEDULES_SUBDIR
         if not schedules_dir.exists():

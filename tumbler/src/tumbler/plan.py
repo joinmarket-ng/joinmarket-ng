@@ -11,7 +11,7 @@ A ``Plan`` is an ordered list of ``Phase`` objects. Each phase is one of:
   cost of subset-sum analysis without requiring a fidelity bond.
 
 The plan and its phases form the single source of truth for a running
-tumble. Progress is persisted to a YAML file (see :mod:`jmtumbler.persistence`).
+tumble. Progress is persisted to a YAML file (see :mod:`tumbler.persistence`).
 """
 
 from __future__ import annotations

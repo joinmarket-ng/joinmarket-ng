@@ -96,15 +96,15 @@ COPY orderbook_watcher/src /build/orderbook_watcher/src
 COPY orderbook_watcher/pyproject.toml /build/orderbook_watcher/
 COPY jmwalletd/src /build/jmwalletd/src
 COPY jmwalletd/pyproject.toml /build/jmwalletd/
-# jmtumbler has no external runtime deps beyond those already installed by
+# tumbler has no external runtime deps beyond those already installed by
 # jmcore/jmwallet/maker/taker (loguru, pydantic, pyyaml); no requirements.txt.
-COPY jmtumbler/src /build/jmtumbler/src
-COPY jmtumbler/pyproject.toml /build/jmtumbler/
+COPY tumbler/src /build/tumbler/src
+COPY tumbler/pyproject.toml /build/tumbler/
 
 # Normalize file timestamps so local working-copy mtimes don't differ from CI clone
 RUN if [ -n "$SOURCE_DATE_EPOCH" ]; then \
         find /build/jmcore /build/jmwallet /build/maker /build/taker \
-             /build/orderbook_watcher /build/jmwalletd /build/jmtumbler \
+             /build/orderbook_watcher /build/jmwalletd /build/tumbler \
              -exec touch -d @${SOURCE_DATE_EPOCH} {} +; \
     fi
 
@@ -115,7 +115,7 @@ RUN if [ -n "$SOURCE_DATE_EPOCH" ]; then export SOURCE_DATE_EPOCH=$SOURCE_DATE_E
         /build/maker \
         /build/taker \
         /build/orderbook_watcher \
-        /build/jmtumbler \
+        /build/tumbler \
         /build/jmwalletd
 
 # =============================================================================

@@ -20,7 +20,7 @@ that long-running schedules survive restarts.
 ## Documentation
 
 For full documentation, see
-[jmtumbler Documentation](https://joinmarket-ng.github.io/joinmarket-ng/README-jmtumbler/).
+[tumbler Documentation](https://joinmarket-ng.github.io/joinmarket-ng/README-tumbler/).
 
 <!-- AUTO-GENERATED HELP START: jm-tumbler -->
 
@@ -228,13 +228,13 @@ For full documentation, see
 
 ```
 pip install -e jmcore -e jmwallet -e taker -e maker
-pip install -e jmtumbler[dev]
+pip install -e tumbler[dev]
 ```
 
 ## Tests
 
 ```
-pytest jmtumbler/tests
+pytest tumbler/tests
 ```
 
 ## Design notes

@@ -284,8 +284,8 @@ def main() -> int:
         (
             "jm-tumbler",
             [
-                project_root / "jmtumbler" / "README.md",
-                project_root / "docs" / "README-jmtumbler.md",
+                project_root / "tumbler" / "README.md",
+                project_root / "docs" / "README-tumbler.md",
             ],
         ),
     ]
