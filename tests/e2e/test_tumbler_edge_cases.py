@@ -48,7 +48,7 @@ from tests.e2e.test_tumbler_e2e import (
 )
 from tests.e2e.rpc_utils import rpc_call
 
-pytestmark = pytest.mark.e2e
+pytestmark = [pytest.mark.e2e, pytest.mark.tumbler_e2e]
 
 
 # ---------------------------------------------------------------------------
@@ -63,6 +63,10 @@ async def jmwalletd_ready() -> None:
 
 @pytest.fixture()
 async def client(jmwalletd_ready: None) -> AsyncGenerator[httpx.AsyncClient, None]:
+    # Function-scoped so the underlying httpx connection pool (and any
+    # ``asyncio.Event`` it internally creates) is bound to the test's own
+    # event loop. pytest-asyncio defaults to a fresh loop per test, and a
+    # module-scoped client would re-use a now-closed loop on the second test.
     async with httpx.AsyncClient(timeout=60, verify=TLS_VERIFY) as c:
         yield c
 
@@ -71,8 +75,12 @@ async def client(jmwalletd_ready: None) -> AsyncGenerator[httpx.AsyncClient, Non
 async def funded_wallet(
     client: httpx.AsyncClient,
 ) -> AsyncGenerator[tuple[str, str, str], None]:
-    """Same shape as test_tumbler_e2e.funded_wallet, kept independent so
-    parametrised retry tests don't share a wallet across test functions."""
+    """Create+fund a fresh wallet per test.
+
+    Function-scoped so each test starts from a clean daemon state — module
+    scope would carry a previous test's PENDING plan over and force-overwrite
+    coupling, and would also re-bind httpx internals to a stale event loop.
+    """
     await _ensure_no_wallet(client)
     name, token, _ = await _create_wallet(client)
     try:
@@ -103,7 +111,6 @@ async def _post_plan_with(
         json={
             "destinations": [destination],
             "parameters": parameters,
-            "force": False,
         },
         headers=_auth(token),
     )
@@ -138,7 +145,7 @@ async def test_legacy_jam_payload_with_bondless_field_is_accepted(
             "maker_count_max": 2,
             "include_maker_sessions": False,
             "mintxcount": 2,
-            "time_lambda_seconds": 1.0,
+            "time_lambda_seconds": 0.1,
             "seed": 7,
         },
     )
@@ -167,7 +174,7 @@ async def test_max_phase_retries_zero_fails_plan_on_first_failure(
             "maker_count_max": 19,
             "include_maker_sessions": False,
             "mintxcount": 2,
-            "time_lambda_seconds": 0.5,
+            "time_lambda_seconds": 0.1,
             "max_phase_retries": 0,
             "seed": 11,
         },
@@ -177,7 +184,7 @@ async def test_max_phase_retries_zero_fails_plan_on_first_failure(
     await _post_start(client, name, token)
     async with _background_miner():
         # Plan should fail quickly: no retries, no successful CJ rounds.
-        final = await _poll_until_terminal(client, name, token, timeout=300.0)
+        final = await _poll_until_terminal(client, name, token, timeout=120.0)
     assert final["status"].lower() == "failed", final
     # The first phase must carry attempt_count == 0 (no retries used) and
     # have its FAILED status preserved on disk.
@@ -213,7 +220,7 @@ async def test_retry_swaps_external_destination_to_internal_on_failure(
             "maker_count_max": 19,
             "include_maker_sessions": False,
             "mintxcount": 2,
-            "time_lambda_seconds": 0.5,
+            "time_lambda_seconds": 0.1,
             "max_phase_retries": 1,
             "seed": 23,
         },
@@ -227,7 +234,7 @@ async def test_retry_swaps_external_destination_to_internal_on_failure(
     # but along the way the runner will have rewritten the destination on
     # the failing phase to "INTERNAL" before exhausting the retry budget.
     async with _background_miner():
-        final = await _poll_until_terminal(client, name, token, timeout=300.0)
+        final = await _poll_until_terminal(client, name, token, timeout=120.0)
     assert final["status"].lower() == "failed", final
 
     # The first phase that originally pointed at the external address
@@ -263,7 +270,7 @@ async def test_status_endpoint_exposes_attempt_count(
             "maker_count_max": 2,
             "include_maker_sessions": False,
             "mintxcount": 2,
-            "time_lambda_seconds": 1.0,
+            "time_lambda_seconds": 0.1,
             "seed": 3,
         },
     )
