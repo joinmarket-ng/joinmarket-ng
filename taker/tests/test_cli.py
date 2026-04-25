@@ -141,6 +141,29 @@ class TestBuildTakerConfig:
         assert config.fee_rate is None
         assert config.fee_block_target == 6
 
+    def test_counterparties_override_caps_minimum_makers(
+        self, sample_mnemonic: str, mock_settings: MagicMock
+    ) -> None:
+        """A per-run counterparty override must not leave a stale higher
+        minimum-maker threshold behind.
+
+        This matters for tumbler sweeps on sparse networks like signet:
+        ``--counterparties 1`` should allow a 1-maker sweep if the taker
+        explicitly requested that, even if config.toml normally requires 4.
+        """
+        config = build_taker_config(
+            settings=mock_settings,
+            mnemonic=sample_mnemonic,
+            passphrase="",
+            destination="bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+            amount=0,
+            mixdepth=0,
+            counterparties=1,
+        )
+
+        assert config.counterparty_count == 1
+        assert config.minimum_makers == 1
+
     def test_taker_fee_rate_setting_honored_without_cli_flag(
         self, sample_mnemonic: str, mock_settings: MagicMock
     ) -> None:

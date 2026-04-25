@@ -918,6 +918,7 @@ class TestSweepCjAmountPreservation:
                 "address": "bcrt1qmaker",
             },
         ]
+
         maker_session.cj_address = "bcrt1qqyqszqgpqyqszqgpqyqszqgpqyqszqgpvxat9t"
         maker_session.change_address = "bcrt1qqgpqyqszqgpqyqszqgpqyqszqgpqyqszazmwwa"
         maker_session.crypto = CryptoSession()

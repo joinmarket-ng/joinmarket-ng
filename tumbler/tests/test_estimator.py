@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from tumbler.builder import PlanBuilder, TumbleParameters
 from tumbler.estimator import _vbytes_for_coinjoin, estimate_plan_costs
 from tumbler.plan import (
@@ -96,8 +98,11 @@ class TestEstimatePlanCosts:
             max_cj_fee_abs_sats=500,
             max_cj_fee_rel="0.001",
         )
-        assert est.total_miner_fee_sats == 0
-        assert est.fee_rate_sat_vb is None
+        # When no rate is supplied we now use a labelled fallback so users
+        # always see a ballpark miner-fee figure rather than "n/a".
+        assert est.total_miner_fee_sats > 0
+        assert est.fee_rate_sat_vb == 10.0
+        assert est.fee_rate_source == "fallback"
 
     def test_duration_includes_wait_and_confirmations(self) -> None:
         plan = _build_plan()
@@ -197,6 +202,61 @@ class TestEstimatePlanCosts:
         # Min uses idle_timeout, max uses full duration.
         assert est.total_duration_seconds_min == 10.0 + 120.0
         assert est.total_duration_seconds_max == 10.0 + 600.0
+
+    def test_balance_and_percentage_fields(self) -> None:
+        plan = _build_plan()
+        est = estimate_plan_costs(
+            plan,
+            mixdepth_balances=_BALANCES,
+            max_cj_fee_abs_sats=500,
+            max_cj_fee_rel="0.001",
+            fee_rate_sat_vb=5.0,
+        )
+        # Total balance and per-mixdepth map must round-trip what we passed.
+        assert est.total_balance_sats == sum(_BALANCES.values())
+        assert est.mixdepth_balances == dict(_BALANCES)
+        # Percentages are derived; verify they line up with the absolute
+        # numbers (guards against accidental divisions by something else).
+        assert est.total_max_cj_fee_pct == pytest.approx(
+            100.0 * est.total_max_cj_fee_sats / est.total_balance_sats
+        )
+        assert est.total_miner_fee_pct == pytest.approx(
+            100.0 * est.total_miner_fee_sats / est.total_balance_sats
+        )
+        assert est.total_max_fee_pct == pytest.approx(
+            est.total_max_cj_fee_pct + est.total_miner_fee_pct
+        )
+
+    def test_percentages_safe_when_balance_zero(self) -> None:
+        plan = _build_plan()
+        est = estimate_plan_costs(
+            plan,
+            mixdepth_balances={},
+            max_cj_fee_abs_sats=500,
+            max_cj_fee_rel="0.001",
+            fee_rate_sat_vb=5.0,
+        )
+        # Without balances we shouldn't blow up dividing by zero; the
+        # rendered output just shows 0.0% which the user can interpret.
+        assert est.total_balance_sats == 0
+        assert est.total_max_cj_fee_pct == 0.0
+        assert est.total_miner_fee_pct == 0.0
+        assert est.total_max_fee_pct == 0.0
+
+    def test_fee_rate_source_propagates(self) -> None:
+        plan = _build_plan()
+        est = estimate_plan_costs(
+            plan,
+            mixdepth_balances=_BALANCES,
+            max_cj_fee_abs_sats=500,
+            max_cj_fee_rel="0.001",
+            fee_rate_sat_vb=3.0,
+            fee_rate_source="estimated",
+        )
+        # Source label must round-trip; CLI uses it to annotate "(estimated)"
+        # vs "(configured)" vs "(fallback)".
+        assert est.fee_rate_source == "estimated"
+        assert est.fee_rate_sat_vb == 3.0
 
 
 class TestVbytesForCoinjoin:

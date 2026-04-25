@@ -52,6 +52,7 @@ class _FakeSettings:
                 value = network
 
             self.network = _N()
+            self.bitcoin_network = None
 
     class _Bitcoin:
         def __init__(self, backend_type: str) -> None:
@@ -271,7 +272,8 @@ class TestPlanDefaultsCounterpartyFromSettings:
             # _balances_for_mnemonic is executed inside asyncio.run; stub the
             # run result directly so the CLI sees the expected balance map.
             with patch(
-                "tumbler.cli.asyncio.run", return_value={0: 1_000_000, 1: 0, 2: 0, 3: 0, 4: 0}
+                "tumbler.cli.asyncio.run",
+                return_value=({0: 1_000_000, 1: 0, 2: 0, 3: 0, 4: 0}, None, "fallback"),
             ):
                 result = runner.invoke(
                     app,
@@ -321,7 +323,7 @@ class TestPlanSingleFundedMixdepth:
             patch("tumbler.cli._balances_for_mnemonic", new=_unused_balances),
             patch(
                 "tumbler.cli.asyncio.run",
-                return_value={0: 0, 1: 23_430_165, 2: 0, 3: 0, 4: 0},
+                return_value=({0: 0, 1: 23_430_165, 2: 0, 3: 0, 4: 0}, None, "fallback"),
             ),
         ):
             result = runner.invoke(
@@ -372,7 +374,7 @@ class TestPlanFewDestinationsGate:
             patch("tumbler.cli._balances_for_mnemonic", new=_unused_balances),
             patch(
                 "tumbler.cli.asyncio.run",
-                return_value={0: 0, 1: 23_430_165, 2: 0, 3: 0, 4: 0},
+                return_value=({0: 0, 1: 23_430_165, 2: 0, 3: 0, 4: 0}, None, "fallback"),
             ),
         ):
             return runner.invoke(

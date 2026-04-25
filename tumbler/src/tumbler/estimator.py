@@ -29,8 +29,14 @@ from tumbler.plan import (
 # which we surface separately so the user can scale it themselves.
 _TAKER_PHASE_HANDSHAKE_SECONDS = 60.0
 
-# Per-mixdepth fallback when we don't know the actual balance: pick the
-# mincjamount so fee bounds stay finite without misrepresenting size.
+# Conservative default sat/vB used when neither fee_rate nor fee_block_target
+# is configured. 10 sat/vB is comfortably above mainnet floor congestion and
+# below typical fee-spike levels; the actual rate quoted by
+# ``estimatesmartfee`` at run time will replace this.
+_DEFAULT_FALLBACK_FEE_RATE_SAT_VB = 10.0
+
+# Per-mixdepth fallback when we don't know the actual balance: zero, so the
+# estimate stays a lower bound rather than fabricating numbers.
 _UNKNOWN_BALANCE_FALLBACK_SATS = 0
 
 
@@ -54,7 +60,7 @@ def _vbytes_for_coinjoin(counterparty_count: int) -> int:
 
 @dataclass
 class PhaseCostEstimate:
-    """Per-phase breakdown — useful for tabular display."""
+    """Per-phase breakdown -- useful for tabular display."""
 
     index: int
     kind: str
@@ -72,20 +78,49 @@ class PlanEstimate:
 
     taker_phase_count: int
     maker_phase_count: int
-    total_max_cj_fee_sats: int
-    total_miner_fee_sats: int
-    total_wait_seconds: float
-    total_duration_seconds_min: float
-    total_duration_seconds_expected: float
-    total_duration_seconds_max: float
-    confirmation_block_count: int
-    fee_rate_sat_vb: float | None
+    total_balance_sats: int
+    """Sum of ``mixdepth_balances`` at plan time, in sats."""
+    mixdepth_balances: dict[int, int] = field(default_factory=dict)
+    """Snapshot of per-mixdepth balances used for sizing phases."""
+    total_max_cj_fee_sats: int = 0
+    total_miner_fee_sats: int = 0
+    total_wait_seconds: float = 0.0
+    total_duration_seconds_min: float = 0.0
+    total_duration_seconds_expected: float = 0.0
+    total_duration_seconds_max: float = 0.0
+    confirmation_block_count: int = 0
+    fee_rate_sat_vb: float = 0.0
+    fee_rate_source: str = "fallback"
+    """One of ``configured`` (settings.taker.fee_rate set), ``estimated``
+    (settings.taker.fee_block_target set; rate inferred at plan time), or
+    ``fallback`` (neither set; using a conservative built-in default)."""
     phases: list[PhaseCostEstimate] = field(default_factory=list)
 
     @property
     def total_max_fee_sats(self) -> int:
         """Upper bound on total fees (CJ counterparty fees + miner fees)."""
         return self.total_max_cj_fee_sats + self.total_miner_fee_sats
+
+    @property
+    def total_max_cj_fee_pct(self) -> float:
+        """CJ fee upper bound as a percentage of total balance."""
+        if self.total_balance_sats <= 0:
+            return 0.0
+        return 100.0 * self.total_max_cj_fee_sats / self.total_balance_sats
+
+    @property
+    def total_miner_fee_pct(self) -> float:
+        """Miner fee estimate as a percentage of total balance."""
+        if self.total_balance_sats <= 0:
+            return 0.0
+        return 100.0 * self.total_miner_fee_sats / self.total_balance_sats
+
+    @property
+    def total_max_fee_pct(self) -> float:
+        """Total upper-bound fees as a percentage of total balance."""
+        if self.total_balance_sats <= 0:
+            return 0.0
+        return 100.0 * self.total_max_fee_sats / self.total_balance_sats
 
 
 def estimate_plan_costs(
@@ -95,6 +130,7 @@ def estimate_plan_costs(
     max_cj_fee_abs_sats: int,
     max_cj_fee_rel: str | float,
     fee_rate_sat_vb: float | None = None,
+    fee_rate_source: str | None = None,
     confirmation_block_count: int = 5,
     block_time_seconds: float = 600.0,
 ) -> PlanEstimate:
@@ -109,17 +145,23 @@ def estimate_plan_costs(
         Current confirmed balance per mixdepth in sats. Used to size sweep
         and fractional phases (which carry ``amount=0`` / ``amount_fraction``
         on the persisted phase). When ``None``, sweeps and fractional phases
-        contribute no CJ fee to the estimate (lower bound).
+        size to zero (lower bound).
     max_cj_fee_abs_sats, max_cj_fee_rel
         Local fee bounds taken from ``settings.taker.max_cj_fee``. The
         estimator uses ``max(abs_fee, rel_fee * amount)`` as the per-maker
         upper bound and multiplies by counterparty_count, mirroring how
         ``filter_offers`` rejects offers above either bound.
     fee_rate_sat_vb
-        If provided, miner-fee estimate uses
-        ``fee_rate_sat_vb * vbytes(counterparty_count)`` per CJ. When
-        ``None``, the miner-fee column is zero so the user knows the figure
-        is missing rather than estimated.
+        Miner-fee rate used per CJ tx. When ``None``, the estimator uses a
+        conservative built-in default (10 sat/vB) and reports
+        ``fee_rate_source='fallback'`` so the caller can label the figure
+        as estimated. Always producing a number is intentional: an "n/a"
+        column gives users no signal of the worst-case miner cost.
+    fee_rate_source
+        Optional label overriding the default classification of the fee
+        rate (``configured`` / ``estimated`` / ``fallback``). Useful when
+        the caller resolved a ``fee_block_target`` to a concrete rate
+        upstream and wants the output labelled accordingly.
     confirmation_block_count
         ``RunnerContext.min_confirmations_between_phases`` (default 5).
         Plumbed into the duration estimate so the inter-phase wait for
@@ -130,6 +172,14 @@ def estimate_plan_costs(
     """
     rel_fee = float(Decimal(str(max_cj_fee_rel)))
     balances: Mapping[int, int] = mixdepth_balances or {}
+    total_balance = sum(max(int(v), 0) for v in balances.values())
+
+    if fee_rate_sat_vb is None:
+        effective_fee_rate = _DEFAULT_FALLBACK_FEE_RATE_SAT_VB
+        effective_source = fee_rate_source or "fallback"
+    else:
+        effective_fee_rate = float(fee_rate_sat_vb)
+        effective_source = fee_rate_source or "configured"
 
     phases: list[PhaseCostEstimate] = []
     total_cj_fee = 0
@@ -176,11 +226,7 @@ def estimate_plan_costs(
             )
             phase_cj_fee = per_maker_fee * counterparties
 
-            phase_miner_fee = (
-                int(round(fee_rate_sat_vb * _vbytes_for_coinjoin(counterparties)))
-                if fee_rate_sat_vb is not None
-                else 0
-            )
+            phase_miner_fee = int(round(effective_fee_rate * _vbytes_for_coinjoin(counterparties)))
 
             description = (
                 f"mixdepth={mixdepth} sweep"
@@ -270,6 +316,8 @@ def estimate_plan_costs(
     return PlanEstimate(
         taker_phase_count=taker_count,
         maker_phase_count=maker_count,
+        total_balance_sats=total_balance,
+        mixdepth_balances={int(k): int(v) for k, v in balances.items()},
         total_max_cj_fee_sats=total_cj_fee,
         total_miner_fee_sats=total_miner_fee,
         total_wait_seconds=total_wait,
@@ -277,6 +325,7 @@ def estimate_plan_costs(
         total_duration_seconds_expected=total_expected,
         total_duration_seconds_max=total_max,
         confirmation_block_count=confirmation_block_count,
-        fee_rate_sat_vb=fee_rate_sat_vb,
+        fee_rate_sat_vb=effective_fee_rate,
+        fee_rate_source=effective_source,
         phases=phases,
     )

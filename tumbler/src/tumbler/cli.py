@@ -101,23 +101,31 @@ def _summarise_plan(plan: Plan, estimate: PlanEstimate | None = None) -> None:
         return
 
     typer.echo("")
+    typer.echo("Wallet balance")
+    typer.echo("--------------")
+    typer.echo(f"  total:                  {_format_sats(estimate.total_balance_sats)}")
+    for mixdepth, balance in sorted(estimate.mixdepth_balances.items()):
+        if balance > 0:
+            typer.echo(f"    mixdepth {mixdepth}:           {_format_sats(balance)}")
+
+    typer.echo("")
     typer.echo("Estimated cost & time")
     typer.echo("---------------------")
     typer.echo(f"  taker phases:           {estimate.taker_phase_count}")
     typer.echo(f"  maker phases:           {estimate.maker_phase_count}")
     typer.echo(
-        f"  max counterparty fees:  {_format_sats(estimate.total_max_cj_fee_sats)}  (upper bound)"
+        f"  max counterparty fees:  {_format_sats(estimate.total_max_cj_fee_sats)}"
+        f"  ({estimate.total_max_cj_fee_pct:.3f}% of balance, upper bound)"
     )
-    if estimate.fee_rate_sat_vb is not None:
-        typer.echo(
-            f"  est. miner fees:        {_format_sats(estimate.total_miner_fee_sats)}"
-            f"  (@ {estimate.fee_rate_sat_vb:.2f} sat/vB)"
-        )
-    else:
-        typer.echo(
-            "  est. miner fees:        n/a  (set settings.taker.fee_rate or fee_block_target)"
-        )
-    typer.echo(f"  total fee upper bound:  {_format_sats(estimate.total_max_fee_sats)}")
+    typer.echo(
+        f"  est. miner fees:        {_format_sats(estimate.total_miner_fee_sats)}"
+        f"  ({estimate.total_miner_fee_pct:.3f}% of balance,"
+        f" @ {estimate.fee_rate_sat_vb:.2f} sat/vB {estimate.fee_rate_source})"
+    )
+    typer.echo(
+        f"  total fee upper bound:  {_format_sats(estimate.total_max_fee_sats)}"
+        f"  ({estimate.total_max_fee_pct:.3f}% of balance)"
+    )
     typer.echo(
         f"  inter-phase wait:       {_format_duration(estimate.total_wait_seconds)}"
         "  (sum of randomised waits)"
@@ -314,7 +322,7 @@ def plan_command(
         raise typer.Exit(1)
 
     try:
-        balances = asyncio.run(
+        balances, fee_rate, fee_rate_source = asyncio.run(
             _balances_for_mnemonic(
                 settings=settings,
                 mnemonic=resolved.mnemonic,
@@ -362,11 +370,8 @@ def plan_command(
         mixdepth_balances=balances,
         max_cj_fee_abs_sats=settings.taker.max_cj_fee_abs,
         max_cj_fee_rel=settings.taker.max_cj_fee_rel,
-        # fee_block_target requires a live RPC call to estimatesmartfee, so
-        # only honour an explicit fee_rate here. The miner-fee column shows
-        # "n/a" otherwise; the user can re-run with --fee-rate or check the
-        # active value via `jm-tumbler config-init`.
-        fee_rate_sat_vb=settings.taker.fee_rate,
+        fee_rate_sat_vb=fee_rate,
+        fee_rate_source=fee_rate_source,
     )
     _summarise_plan(plan, estimate=estimate)
 
@@ -666,8 +671,14 @@ async def _balances_for_mnemonic(
     backend_type: str | None,
     rpc_url: str | None,
     neutrino_url: str | None,
-) -> dict[int, int]:
-    """Open a read-only wallet, sync, and return per-mixdepth balances."""
+) -> tuple[dict[int, int], float | None, str]:
+    """Open a read-only wallet, sync, and return balances + a fee-rate estimate.
+
+    Returns ``(balances, fee_rate_sat_vb, fee_rate_source)``. The fee rate
+    is resolved from ``settings.taker.fee_rate`` (configured), then
+    ``settings.taker.fee_block_target`` via the live backend (estimated),
+    then ``None`` (caller falls back to a built-in default).
+    """
     from taker.cli import build_taker_config, create_backend
 
     config = build_taker_config(
@@ -694,7 +705,9 @@ async def _balances_for_mnemonic(
         # Older WalletService revisions sync lazily; balances will still work.
         pass
     try:
-        return await _collect_balances(wallet, config.mixdepth_count)
+        balances = await _collect_balances(wallet, config.mixdepth_count)
+        fee_rate, fee_source = await _resolve_fee_rate(settings, backend)
+        return balances, fee_rate, fee_source
     finally:
         close = getattr(wallet, "close", None)
         if close is not None:
@@ -704,6 +717,34 @@ async def _balances_for_mnemonic(
                     await result
             except Exception:  # pragma: no cover - best effort close
                 logger.exception("wallet close failed")
+
+
+async def _resolve_fee_rate(settings: Any, backend: Any) -> tuple[float | None, str]:
+    """Resolve a sat/vB rate from settings.taker, falling back to estimatesmartfee.
+
+    Returns ``(rate, source)`` where ``source`` is one of ``configured``
+    (manual ``fee_rate``), ``estimated`` (resolved from ``fee_block_target``
+    via the backend), or ``fallback`` (neither available; caller picks a
+    built-in default).
+    """
+    if settings.taker.fee_rate is not None:
+        return float(settings.taker.fee_rate), "configured"
+    target = settings.taker.fee_block_target
+    if target is None:
+        return None, "fallback"
+    estimate = getattr(backend, "estimate_fee", None)
+    if estimate is None:
+        return None, "fallback"
+    try:
+        # Backends return BTC/kvB by convention; convert to sat/vB.
+        btc_per_kvb = await estimate(int(target))
+        if btc_per_kvb is None or btc_per_kvb <= 0:
+            return None, "fallback"
+        sat_per_vb = float(btc_per_kvb) * 1e8 / 1000.0
+        return sat_per_vb, "estimated"
+    except Exception:  # pragma: no cover - best effort: fall through to default
+        logger.exception("fee rate estimation failed; falling back to built-in default")
+        return None, "fallback"
 
 
 async def _run_plan(

@@ -145,6 +145,12 @@ def build_taker_config(
     effective_counterparties = (
         counterparties if counterparties is not None else settings.taker.counterparty_count
     )
+    # If the caller explicitly lowers the maker count for this run (for example
+    # a signet / testnet tumbler override), keep the effective minimum-maker
+    # threshold consistent with that request. Otherwise sweep mode can select a
+    # valid 1-maker CoinJoin and then reject it against a stale higher
+    # ``minimum_makers`` from config.
+    effective_minimum_makers = min(settings.taker.minimum_makers, effective_counterparties)
     effective_max_abs_fee = (
         max_abs_fee if max_abs_fee is not None else settings.taker.max_cj_fee_abs
     )
@@ -226,7 +232,7 @@ def build_taker_config(
         order_wait_time=settings.taker.order_wait_time,
         tx_broadcast=broadcast_policy,
         broadcast_peer_count=settings.taker.broadcast_peer_count,
-        minimum_makers=settings.taker.minimum_makers,
+        minimum_makers=effective_minimum_makers,
         rescan_interval_sec=settings.taker.rescan_interval_sec,
         select_utxos=select_utxos,
     )
