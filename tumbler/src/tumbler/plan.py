@@ -48,6 +48,20 @@ class PlanStatus(StrEnum):
     CANCELLED = "cancelled"
 
 
+# Recommended minimum number of external destination addresses for a plan.
+#
+# Three destinations guarantee that the final funds cannot be trivially
+# re-aggregated by correlating two sweeps: with only two destinations, an
+# observer who identifies one recipient can deduce the other. Three breaks
+# pairwise identifiability and matches the reference tumbler's recommendation.
+#
+# This is only enforced at the CLI boundary; library consumers (the
+# ``jmwalletd`` API, tests, development tooling, JAM v2 which sends to a
+# single address) may pass fewer destinations. Protocol-level validation
+# only requires ``>= 1`` here.
+MIN_DESTINATIONS = 3
+
+
 class _PhaseBase(BaseModel):
     """Fields shared by every phase variant."""
 
@@ -168,7 +182,13 @@ class Plan(BaseModel):
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     status: PlanStatus = PlanStatus.PENDING
     destinations: list[str] = Field(
-        ..., min_length=1, description="External destination addresses."
+        ...,
+        min_length=1,
+        description=(
+            "External destination addresses. "
+            f"The CLI enforces at least {MIN_DESTINATIONS} to avoid pairwise "
+            "re-aggregation heuristics; library consumers may pass fewer."
+        ),
     )
     parameters: PlanParameters = Field(default_factory=PlanParameters)
     phases: list[Phase] = Field(default_factory=list)

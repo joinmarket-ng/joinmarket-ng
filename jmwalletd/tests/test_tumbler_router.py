@@ -233,7 +233,7 @@ class TestCreatePlan:
         ws.get_balance.return_value = 0
         resp = app_with_wallet.post(
             f"/api/v1/wallet/{WALLET}/tumbler/plan",
-            json={"destinations": ["bcrt1qdestAaaaaa"]},
+            json={"destinations": ["bcrt1qdestAaaaaa", "bcrt1qdestBbbbbb"]},
             headers=_auth(auth_token),
         )
         assert resp.status_code == 400
@@ -247,7 +247,7 @@ class TestCreatePlan:
         resp = app_with_wallet.post(
             f"/api/v1/wallet/{WALLET}/tumbler/plan",
             json={
-                "destinations": ["bcrt1qdestAaaaaa"],
+                "destinations": ["bcrt1qdestAaaaaa", "bcrt1qdestBbbbbb"],
                 "force": True,
                 "parameters": {
                     "addrcount": 1,
