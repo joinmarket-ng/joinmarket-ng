@@ -17,9 +17,8 @@ The plan is a sequence of phases grouped into two conceptual stages:
   funds reach a destination.
 * **Stage 2 - destination mixing.** For each destination, schedule a
   small number of fractional taker CoinJoins, optionally interleaved with
-  :class:`~tumbler.plan.MakerSessionPhase` sessions and
-  :class:`~tumbler.plan.BondlessTakerBurstPhase` sub-bursts, and a final
-  sweep to the destination address.
+  :class:`~tumbler.plan.MakerSessionPhase` sessions, and a final sweep to
+  the destination address.
 
 The role mixing mitigates, but does not eliminate, the subset-sum signature
 problem tracked in upstream issue #114. See the design doc at
@@ -35,7 +34,6 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from tumbler.plan import (
-    BondlessTakerBurstPhase,
     MakerSessionPhase,
     Phase,
     PhaseKind,
@@ -64,17 +62,12 @@ class TumbleParameters:
     maker_count_max: int = 9
     time_lambda_seconds: float = 30.0
     include_maker_sessions: bool = True
-    include_bondless_bursts: bool = True
     mincjamount_sats: int = 100_000
-    rounding_chance: float = 0.25
-    rounding_sigfigs: tuple[int, ...] = (2, 3, 4)
     maker_session_seconds: float = 20.0 * 60.0
     maker_session_idle_timeout_seconds: float | None = None
     """If set, maker phases exit successfully when no CoinJoin has been served
     within this many seconds. Useful as a safety fallback when the wallet is
     never selected as a counterparty."""
-    bondless_burst_cj_count: int = 2
-    bondless_burst_fraction: float = 0.2
     mintxcount: int = 2
     """Minimum number of destination-bearing taker CJs per mixdepth (excluding sweep)."""
     seed: int | None = None
@@ -114,9 +107,7 @@ class PlanBuilder:
             maker_count_max=self.params.maker_count_max,
             time_lambda_seconds=self.params.time_lambda_seconds,
             include_maker_sessions=self.params.include_maker_sessions,
-            include_bondless_bursts=self.params.include_bondless_bursts,
             mincjamount_sats=self.params.mincjamount_sats,
-            rounding_chance=self.params.rounding_chance,
             seed=self.params.seed,
         )
         return Plan(
@@ -144,7 +135,6 @@ class PlanBuilder:
                     amount=0,
                     counterparty_count=self._sample_counterparty_count(rng),
                     destination=INTERNAL_DESTINATION,
-                    rounding=16,
                     wait_seconds=self._sample_wait(rng, stage1=True),
                 )
             )
@@ -156,7 +146,7 @@ class PlanBuilder:
         stage-2 block per mixdepth.
 
         This mirrors the reference tumbler's structure: every stage-2
-        mixdepth gets maker/bondless/fractional activity, intermediate final
+        mixdepth gets maker and fractional activity, intermediate final
         sweeps advance to ``INTERNAL``, and only the last N mixdepths in the
         chain sweep to the user-supplied external destinations.
         """
@@ -176,18 +166,6 @@ class PlanBuilder:
                         wait_seconds=self._sample_wait(rng),
                     )
                 )
-            if self.params.include_bondless_bursts:
-                phases.append(
-                    self._new_phase(
-                        BondlessTakerBurstPhase,
-                        mixdepth=mixdepth,
-                        cj_count=self.params.bondless_burst_cj_count,
-                        counterparty_count=self._sample_counterparty_count(rng),
-                        amount_fraction=self.params.bondless_burst_fraction,
-                        rounding=self._sample_rounding(rng, force=True),
-                        wait_seconds=self._sample_wait(rng),
-                    )
-                )
             # Fractional destination CJs (at least mintxcount-1 before the sweep).
             fractions = self._destination_fractions(self.params.mintxcount, rng)
             for fraction in fractions:
@@ -198,7 +176,6 @@ class PlanBuilder:
                         amount_fraction=fraction,
                         counterparty_count=self._sample_counterparty_count(rng),
                         destination=INTERNAL_DESTINATION,
-                        rounding=self._sample_rounding(rng),
                         wait_seconds=self._sample_wait(rng),
                     )
                 )
@@ -212,7 +189,6 @@ class PlanBuilder:
                     amount=0,
                     counterparty_count=self._sample_counterparty_count(rng),
                     destination=destination_map.get(mixdepth, INTERNAL_DESTINATION),
-                    rounding=16,
                     # No trailing wait on the very last phase.
                     wait_seconds=0.0 if is_last else self._sample_wait(rng),
                 )
@@ -266,11 +242,6 @@ class PlanBuilder:
         # rng.random() can return 0; guard against log(0).
         u = max(u, 1e-9)
         return min(-math.log(u) * lam, lam * 10.0)
-
-    def _sample_rounding(self, rng: random.Random, force: bool = False) -> int:
-        if force or rng.random() < self.params.rounding_chance:
-            return rng.choice(self.params.rounding_sigfigs)
-        return 16
 
     def _destination_fractions(self, mintxcount: int, rng: random.Random) -> list[float]:
         """

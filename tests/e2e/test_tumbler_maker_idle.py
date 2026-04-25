@@ -104,7 +104,6 @@ async def _post_plan_with_idle_fallback(
                 "maker_count_min": 2,
                 "maker_count_max": 2,
                 "include_maker_sessions": True,
-                "include_bondless_bursts": False,
                 "mintxcount": 2,
                 "time_lambda_seconds": 1.0,
                 # Generous upper bound; if the phase exits because this
@@ -177,10 +176,11 @@ async def test_maker_phase_exits_via_idle_timeout_when_no_cj_served(
 
     plan = await _post_plan_with_idle_fallback(client, name, token, destination)
     phase_kinds = [p["kind"] for p in plan["phases"]]
-    # Expected layout with mintxcount=2 and funds in mixdepth 0 only:
-    # [stage-1 sweep (taker_coinjoin), maker_session, fractional (taker_coinjoin),
-    #  sweep (taker_coinjoin)].
-    assert phase_kinds.count("maker_session") == 1, phase_kinds
+    # Expected layout with mintxcount=2, funds in mixdepth 0 only on a
+    # 5-mixdepth wallet, and ``include_maker_sessions=True``:
+    # 1 stage-1 sweep (taker_coinjoin) + 4 stage-2 blocks of
+    # (maker_session, fractional taker_coinjoin, sweep taker_coinjoin).
+    assert phase_kinds.count("maker_session") >= 1, phase_kinds
     maker_index = phase_kinds.index("maker_session")
     assert maker_index >= 1, (
         f"maker phase should sit after at least one stage-1 sweep: {phase_kinds}"

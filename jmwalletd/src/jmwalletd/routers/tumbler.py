@@ -42,7 +42,6 @@ from tumbler.persistence import (
     save_plan,
 )
 from tumbler.plan import (
-    BondlessTakerBurstPhase,
     MakerSessionPhase,
     Plan,
     PlanStatus,
@@ -111,6 +110,11 @@ def _normalize_legacy_tumbler_parameters(raw: dict[str, object] | None) -> dict[
     params.pop("liquiditywait", None)
     params.pop("waittime", None)
 
+    # Dropped in the redesign: the bondless-taker burst phase no longer
+    # exists in the new plan model. Swallow the key if a legacy client
+    # (e.g. an old JAM) still sends it so we don't break their flow.
+    params.pop("include_bondless_bursts", None)
+
     return params
 
 
@@ -132,7 +136,6 @@ def _phase_to_response(phase: Any) -> TumblerPhaseResponse:
             amount_fraction=phase.amount_fraction,
             counterparty_count=phase.counterparty_count,
             destination=phase.destination,
-            rounding=phase.rounding,
             txid=phase.txid,
         )
     elif isinstance(phase, MakerSessionPhase):
@@ -141,16 +144,6 @@ def _phase_to_response(phase: Any) -> TumblerPhaseResponse:
             target_cj_count=phase.target_cj_count,
             idle_timeout_seconds=phase.idle_timeout_seconds,
             cj_served=phase.cj_served,
-        )
-    elif isinstance(phase, BondlessTakerBurstPhase):
-        common.update(
-            mixdepth=phase.mixdepth,
-            amount_fraction=phase.amount_fraction,
-            counterparty_count=phase.counterparty_count,
-            rounding=phase.rounding,
-            cj_count=phase.cj_count,
-            completed_count=phase.completed_count,
-            txids=list(phase.txids),
         )
     return TumblerPhaseResponse(**common)
 

@@ -321,11 +321,7 @@ class TumblerPhaseResponse(BaseModel):
     amount_fraction: float | None = None
     counterparty_count: int | None = None
     destination: str | None = None
-    rounding: int | None = None
     txid: str | None = None
-    txids: list[str] | None = None
-    completed_count: int | None = None
-    cj_count: int | None = None
     duration_seconds: float | None = None
     target_cj_count: int | None = None
     idle_timeout_seconds: float | None = None

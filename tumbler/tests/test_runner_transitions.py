@@ -19,7 +19,6 @@ from typing import Any
 from tumbler.builder import PlanBuilder, TumbleParameters
 from tumbler.persistence import load_plan, save_plan
 from tumbler.plan import (
-    BondlessTakerBurstPhase,
     MakerSessionPhase,
     PhaseStatus,
     Plan,
@@ -140,13 +139,12 @@ class FakeMaker:
 # --------------------------------------------------------------------------- helpers
 
 
-def _plan(tmp_path: Path, *, include_maker: bool = False, include_bondless: bool = False) -> Plan:
+def _plan(tmp_path: Path, *, include_maker: bool = False) -> Plan:
     params = TumbleParameters(
         destinations=["bcrt1qdest0000000000000000000000000000000000zzz"],
         mixdepth_balances={0: 5_000_000, 1: 0, 2: 0, 3: 0, 4: 0},
         seed=1,
         include_maker_sessions=include_maker,
-        include_bondless_bursts=include_bondless,
         mintxcount=2,
     )
     plan = PlanBuilder("RunnerTest", params).build()
@@ -363,21 +361,6 @@ class TestRunnerMakerPhase:
         # No CJs were served and the target was not met; exit was due to idle.
         for mp in maker_phases:
             assert mp.cj_served == 0
-
-
-class TestRunnerBondlessBurst:
-    async def test_burst_runs_configured_cj_count(self, tmp_path: Path) -> None:
-        plan = _plan(tmp_path, include_bondless=True)
-        bursts = [p for p in plan.phases if isinstance(p, BondlessTakerBurstPhase)]
-        assert bursts, "expected a bondless burst"
-        bursts[0].cj_count = 3
-
-        async def make_taker(phase: Any) -> FakeTaker:
-            return FakeTaker(phase)
-
-        await TumbleRunner(plan, _ctx(tmp_path, taker_factory=make_taker)).run()
-        assert bursts[0].completed_count == 3
-        assert len(bursts[0].txids) == 3
 
 
 # --------------------------------------------------------------- taker-interop
@@ -602,75 +585,6 @@ class TestRunnerTakerInterop:
         assert result.status == PlanStatus.COMPLETED
         taker_phases = [p for p in result.phases if isinstance(p, TakerCoinjoinPhase)]
         assert all(p.txid == "obj-txid-xyz" for p in taker_phases)
-
-    async def test_bondless_burst_forwards_clean_kwargs_and_int_amount(
-        self, tmp_path: Path
-    ) -> None:
-        """Bondless burst sub-CJs must obey the same runner->taker contract."""
-        plan = _plan(tmp_path, include_bondless=True)
-        bursts = [p for p in plan.phases if isinstance(p, BondlessTakerBurstPhase)]
-        assert bursts
-        bursts[0].cj_count = 2
-        bursts[0].amount_fraction = 0.1
-
-        wallet = FakeWalletService(balance_sats=10_000_000)
-        seen: list[dict[str, Any]] = []
-
-        async def make_taker(phase: Any) -> FakeTaker:
-            t = FakeTaker(phase)
-
-            async def trace(
-                amount: int,
-                destination: str,
-                mixdepth: int = 0,
-                counterparty_count: int | None = None,
-            ) -> str | None:
-                seen.append(
-                    {
-                        "phase_index": getattr(phase, "index", None),
-                        "amount": amount,
-                        "destination": destination,
-                        "mixdepth": mixdepth,
-                        "counterparty_count": counterparty_count,
-                    }
-                )
-                return f"burst-tx-{len(seen)}"
-
-            t.do_coinjoin = trace  # type: ignore[assignment]
-            return t
-
-        async def zero_sleep(_: float) -> None:
-            return None
-
-        ctx = RunnerContext(
-            wallet_service=wallet,  # type: ignore[arg-type]
-            wallet_name="RunnerTest",
-            data_dir=tmp_path,
-            taker_factory=make_taker,
-            sleep=zero_sleep,
-        )
-        await TumbleRunner(plan, ctx).run()
-
-        burst_calls = [
-            c
-            for c in seen
-            if c["phase_index"] == bursts[0].index
-            and c["mixdepth"] == bursts[0].mixdepth
-            and c["destination"].startswith("bcrt1qfake")
-        ]
-        assert len(burst_calls) == bursts[0].cj_count
-        for call in burst_calls:
-            assert set(call.keys()) == {
-                "phase_index",
-                "amount",
-                "destination",
-                "mixdepth",
-                "counterparty_count",
-            }
-            # 10% of 10_000_000 == 1_000_000 sats.
-            assert call["amount"] == 1_000_000
-        # All sub-CJ txids recorded on the burst phase.
-        assert len(bursts[0].txids) == bursts[0].cj_count
 
 
 class TestConfirmationGate:
