@@ -28,6 +28,7 @@ from jmwallet.wallet.service import WalletService
 from loguru import logger
 
 from tumbler.builder import PlanBuilder, TumbleParameters
+from tumbler.estimator import PlanEstimate, estimate_plan_costs
 from tumbler.maker_policy import apply_tumbler_maker_policy
 from tumbler.persistence import (
     PlanCorruptError,
@@ -64,7 +65,27 @@ def _load_or_error(wallet_name: str, data_dir: Path) -> Plan:
         raise typer.Exit(1)
 
 
-def _summarise_plan(plan: Plan) -> None:
+def _format_duration(seconds: float) -> str:
+    """Render a seconds value as ``HhMm`` / ``MmSs`` / ``Ss`` for humans."""
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    if seconds < 3600:
+        return f"{int(seconds // 60)}m{int(seconds % 60):02d}s"
+    if seconds < 86400:
+        return f"{int(seconds // 3600)}h{int((seconds % 3600) // 60):02d}m"
+    days = int(seconds // 86400)
+    hours = int((seconds % 86400) // 3600)
+    return f"{days}d{hours:02d}h"
+
+
+def _format_sats(sats: int) -> str:
+    """Render sats with thousands separators and a BTC hint for big values."""
+    if sats >= 100_000:
+        return f"{sats:,} sats ({sats / 1e8:.8f} BTC)"
+    return f"{sats:,} sats"
+
+
+def _summarise_plan(plan: Plan, estimate: PlanEstimate | None = None) -> None:
     typer.echo(f"plan_id:      {plan.plan_id}")
     typer.echo(f"wallet:       {plan.wallet_name}")
     typer.echo(f"status:       {plan.status.value}")
@@ -75,6 +96,41 @@ def _summarise_plan(plan: Plan) -> None:
     for phase in plan.phases:
         marker = ">" if phase.index == plan.current_phase else " "
         typer.echo(f" {marker} [{phase.index:02d}] {phase.kind.value:<22} {phase.status.value}")
+
+    if estimate is None:
+        return
+
+    typer.echo("")
+    typer.echo("Estimated cost & time")
+    typer.echo("---------------------")
+    typer.echo(f"  taker phases:           {estimate.taker_phase_count}")
+    typer.echo(f"  maker phases:           {estimate.maker_phase_count}")
+    typer.echo(
+        f"  max counterparty fees:  {_format_sats(estimate.total_max_cj_fee_sats)}  (upper bound)"
+    )
+    if estimate.fee_rate_sat_vb is not None:
+        typer.echo(
+            f"  est. miner fees:        {_format_sats(estimate.total_miner_fee_sats)}"
+            f"  (@ {estimate.fee_rate_sat_vb:.2f} sat/vB)"
+        )
+    else:
+        typer.echo(
+            "  est. miner fees:        n/a  (set settings.taker.fee_rate or fee_block_target)"
+        )
+    typer.echo(f"  total fee upper bound:  {_format_sats(estimate.total_max_fee_sats)}")
+    typer.echo(
+        f"  inter-phase wait:       {_format_duration(estimate.total_wait_seconds)}"
+        "  (sum of randomised waits)"
+    )
+    typer.echo(
+        f"  total duration:         min {_format_duration(estimate.total_duration_seconds_min)}"
+        f", expected {_format_duration(estimate.total_duration_seconds_expected)}"
+        f", max {_format_duration(estimate.total_duration_seconds_max)}"
+    )
+    typer.echo(
+        f"  per-phase confirmations: {estimate.confirmation_block_count} blocks"
+        f"  (~{_format_duration(estimate.confirmation_block_count * 600)} on mainnet)"
+    )
 
 
 def _resolve_wallet_name(
@@ -300,7 +356,35 @@ def plan_command(
 
     path = save_plan(plan, data_dir)
     typer.echo(f"Plan written to {path}")
-    _summarise_plan(plan)
+
+    estimate = estimate_plan_costs(
+        plan,
+        mixdepth_balances=balances,
+        max_cj_fee_abs_sats=settings.taker.max_cj_fee_abs,
+        max_cj_fee_rel=settings.taker.max_cj_fee_rel,
+        # fee_block_target requires a live RPC call to estimatesmartfee, so
+        # only honour an explicit fee_rate here. The miner-fee column shows
+        # "n/a" otherwise; the user can re-run with --fee-rate or check the
+        # active value via `jm-tumbler config-init`.
+        fee_rate_sat_vb=settings.taker.fee_rate,
+    )
+    _summarise_plan(plan, estimate=estimate)
+
+    # Echo the relevant taker config so the user knows what bounds were
+    # applied -- these are the same knobs that gate every CJ during run.
+    typer.echo("")
+    typer.echo("Active taker config")
+    typer.echo("-------------------")
+    typer.echo(f"  max_cj_fee_abs:         {settings.taker.max_cj_fee_abs} sats")
+    typer.echo(f"  max_cj_fee_rel:         {settings.taker.max_cj_fee_rel}")
+    typer.echo(
+        f"  counterparty_count:     {settings.taker.counterparty_count}"
+        f" (plan range: {effective_min}-{effective_max})"
+    )
+    if settings.taker.fee_rate is not None:
+        typer.echo(f"  fee_rate:               {settings.taker.fee_rate} sat/vB")
+    elif settings.taker.fee_block_target is not None:
+        typer.echo(f"  fee_block_target:       {settings.taker.fee_block_target} blocks")
 
 
 # ---------------------------------------------------------------------------

@@ -234,6 +234,10 @@ class TestPlanDefaultsCounterpartyFromSettings:
 
         class _Taker:
             counterparty_count = 4
+            max_cj_fee_abs = 500
+            max_cj_fee_rel = "0.001"
+            fee_rate = None
+            fee_block_target = None
 
         settings = _FakeSettings(tmp_path)
         settings.taker = _Taker()  # type: ignore[attr-defined]
@@ -297,6 +301,10 @@ class TestPlanSingleFundedMixdepth:
 
         class _Taker:
             counterparty_count = 4
+            max_cj_fee_abs = 500
+            max_cj_fee_rel = "0.001"
+            fee_rate = None
+            fee_block_target = None
 
         settings.taker = _Taker()  # type: ignore[attr-defined]
 
@@ -344,6 +352,10 @@ class TestPlanFewDestinationsGate:
 
         class _Taker:
             counterparty_count = 4
+            max_cj_fee_abs = 500
+            max_cj_fee_rel = "0.001"
+            fee_rate = None
+            fee_block_target = None
 
         settings.taker = _Taker()  # type: ignore[attr-defined]
 
