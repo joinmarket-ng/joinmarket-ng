@@ -106,6 +106,15 @@ class TumbleRunner:
         self._stop_requested = asyncio.Event()
         self._active_taker: Any | None = None
         self._active_maker: Any | None = None
+        # Counterparty nicks used in the previous taker phase. We exclude
+        # them from the next phase's order selection so consecutive
+        # CoinJoins don't share makers, which would erode the privacy
+        # gain from running multiple rounds. We deliberately scope this
+        # to the immediately preceding phase rather than accumulating
+        # forever — accumulating risks exhausting the available maker
+        # set on long plans, and the reference implementation likewise
+        # only tracks recently-used nicks.
+        self._previous_phase_nicks: set[str] = set()
 
     # -------------------------------------------------------------- lifecycle
 
@@ -298,12 +307,26 @@ class TumbleRunner:
             amount = await self._resolve_amount(phase)
             # ``Taker.do_coinjoin(amount, destination, mixdepth, counterparty_count)``
             # returns the broadcast txid as a str, or None on failure.
-            result = await taker.do_coinjoin(
-                amount=amount,
-                destination=destination,
-                mixdepth=phase.mixdepth,
-                counterparty_count=phase.counterparty_count,
-            )
+            # ``exclude_nicks`` keeps consecutive phases from sharing makers.
+            # Older taker implementations may not accept the kwarg, so we
+            # fall back gracefully -- losing the privacy gain but not the
+            # phase.
+            do_coinjoin_kwargs: dict[str, Any] = {
+                "amount": amount,
+                "destination": destination,
+                "mixdepth": phase.mixdepth,
+                "counterparty_count": phase.counterparty_count,
+            }
+            if self._previous_phase_nicks:
+                do_coinjoin_kwargs["exclude_nicks"] = set(self._previous_phase_nicks)
+            try:
+                result = await taker.do_coinjoin(**do_coinjoin_kwargs)
+            except TypeError:
+                # Older taker without ``exclude_nicks`` support; retry without
+                # the kwarg so we stay backwards compatible with reference
+                # builds and existing test fakes.
+                do_coinjoin_kwargs.pop("exclude_nicks", None)
+                result = await taker.do_coinjoin(**do_coinjoin_kwargs)
             if result is None:
                 raise TakerPhaseError(
                     "CoinJoin did not broadcast: taker returned no txid "
@@ -316,6 +339,16 @@ class TumbleRunner:
                 txid = getattr(result, "txid", None)
                 if isinstance(txid, str):
                     phase.txid = txid
+            # Capture the nicks the taker actually used so the next phase
+            # can avoid them. Defensive getattr keeps us compatible with
+            # taker fakes that don't track this.
+            used = getattr(taker, "last_used_nicks", None)
+            if isinstance(used, set) and used:
+                self._previous_phase_nicks = set(used)
+            else:
+                # Successful phase but no nick info -- clear the exclusion
+                # set so we don't keep stale exclusions forever.
+                self._previous_phase_nicks = set()
         finally:
             await self._teardown_taker()
 

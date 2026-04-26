@@ -74,9 +74,10 @@ class FakeTaker:
     """Successful taker: records call and returns a deterministic txid string.
 
     Mirrors the real ``Taker.do_coinjoin`` signature
-    ``(amount, destination, mixdepth=0, counterparty_count=None) -> str | None``.
-    Accepting only those kwargs means the test suite fails loudly if the
-    runner ever leaks a stray ``rounding`` / ``amount_fraction`` kwarg again.
+    ``(amount, destination, mixdepth=0, counterparty_count=None,
+    exclude_nicks=None) -> str | None``. Accepting only those kwargs means
+    the test suite fails loudly if the runner ever leaks a stray
+    ``rounding`` / ``amount_fraction`` kwarg again.
     """
 
     def __init__(self, phase: Any) -> None:
@@ -84,6 +85,9 @@ class FakeTaker:
         self.started = False
         self.stopped_with: dict[str, Any] | None = None
         self.do_coinjoin_kwargs: dict[str, Any] | None = None
+        # Default last_used_nicks: the runner reads this to populate the
+        # exclusion set for the next phase. Tests override per-instance.
+        self.last_used_nicks: set[str] = set()
 
     async def start(self) -> None:
         self.started = True
@@ -94,12 +98,14 @@ class FakeTaker:
         destination: str,
         mixdepth: int = 0,
         counterparty_count: int | None = None,
+        exclude_nicks: set[str] | None = None,
     ) -> str | None:
         self.do_coinjoin_kwargs = {
             "amount": amount,
             "destination": destination,
             "mixdepth": mixdepth,
             "counterparty_count": counterparty_count,
+            "exclude_nicks": exclude_nicks,
         }
         # txid derived from inputs so tests can assert stable output.
         return f"txid-{mixdepth}-{amount}"
@@ -115,6 +121,7 @@ class ExplodingTaker(FakeTaker):
         destination: str,
         mixdepth: int = 0,
         counterparty_count: int | None = None,
+        exclude_nicks: set[str] | None = None,
     ) -> str | None:
         raise RuntimeError("simulated failure")
 
@@ -778,6 +785,138 @@ class TestRunnerTakerInterop:
         assert result.status == PlanStatus.COMPLETED
         taker_phases = [p for p in result.phases if isinstance(p, TakerCoinjoinPhase)]
         assert all(p.txid == "obj-txid-xyz" for p in taker_phases)
+
+
+class TestMakerNickExclusion:
+    """The runner must exclude the previous phase's makers from the next
+    phase's order selection so consecutive CoinJoins don't share counterparties.
+    The exclusion window is *one* phase deep (not cumulative) to avoid
+    starving long plans of available makers.
+    """
+
+    async def test_first_phase_has_no_exclusion(self, tmp_path: Path) -> None:
+        # The runner starts with an empty exclusion set, so the very first
+        # taker phase must be invoked without an exclude_nicks kwarg.
+        plan = _plan(tmp_path)
+        captured: list[set[str] | None] = []
+
+        async def make_taker(phase: Any) -> FakeTaker:
+            t = FakeTaker(phase)
+            t.last_used_nicks = {f"maker_{phase.index}_a", f"maker_{phase.index}_b"}
+            original = t.do_coinjoin
+
+            async def spy(**kwargs: Any) -> str | None:
+                captured.append(kwargs.get("exclude_nicks"))
+                return await original(**kwargs)
+
+            t.do_coinjoin = spy  # type: ignore[assignment]
+            return t
+
+        await TumbleRunner(plan, _ctx(tmp_path, taker_factory=make_taker)).run()
+        assert captured, "expected at least one taker phase"
+        # First phase must have no exclusion -- nothing has been used yet.
+        assert captured[0] is None
+
+    async def test_subsequent_phase_excludes_previous_nicks(self, tmp_path: Path) -> None:
+        plan = _plan(tmp_path)
+        captured: list[set[str] | None] = []
+
+        async def make_taker(phase: Any) -> FakeTaker:
+            t = FakeTaker(phase)
+            # Each phase advertises a deterministic nick set so we can assert
+            # that the *next* phase received exactly that set as exclusion.
+            t.last_used_nicks = {f"maker_{phase.index}_a", f"maker_{phase.index}_b"}
+            original = t.do_coinjoin
+
+            async def spy(**kwargs: Any) -> str | None:
+                captured.append(kwargs.get("exclude_nicks"))
+                return await original(**kwargs)
+
+            t.do_coinjoin = spy  # type: ignore[assignment]
+            return t
+
+        result = await TumbleRunner(plan, _ctx(tmp_path, taker_factory=make_taker)).run()
+        assert result.status == PlanStatus.COMPLETED
+        taker_phases = [p for p in result.phases if isinstance(p, TakerCoinjoinPhase)]
+        assert len(captured) == len(taker_phases)
+        # Phase i (i>0) must have been called with the nicks reported by
+        # phase i-1's taker -- not a cumulative union, just the prior round.
+        for i in range(1, len(taker_phases)):
+            prev_index = taker_phases[i - 1].index
+            expected = {f"maker_{prev_index}_a", f"maker_{prev_index}_b"}
+            assert captured[i] == expected, (
+                f"phase {i} should exclude phase {i - 1}'s nicks {expected}, got {captured[i]}"
+            )
+
+    async def test_no_used_nicks_clears_exclusion(self, tmp_path: Path) -> None:
+        # If a taker reports no last_used_nicks (e.g. a fake or an older
+        # implementation), the exclusion set must be cleared so we don't
+        # carry stale exclusions forward indefinitely.
+        plan = _plan(tmp_path)
+        captured: list[set[str] | None] = []
+        call_index = {"i": 0}
+
+        async def make_taker(phase: Any) -> FakeTaker:
+            t = FakeTaker(phase)
+            # Only the first phase reports nicks; subsequent phases report none.
+            if call_index["i"] == 0:
+                t.last_used_nicks = {"maker_a", "maker_b"}
+            else:
+                t.last_used_nicks = set()
+            call_index["i"] += 1
+            original = t.do_coinjoin
+
+            async def spy(**kwargs: Any) -> str | None:
+                captured.append(kwargs.get("exclude_nicks"))
+                return await original(**kwargs)
+
+            t.do_coinjoin = spy  # type: ignore[assignment]
+            return t
+
+        await TumbleRunner(plan, _ctx(tmp_path, taker_factory=make_taker)).run()
+        # First phase: empty exclusion.
+        assert captured[0] is None
+        # Second phase: exclusion is the first phase's nicks.
+        if len(captured) >= 2:
+            assert captured[1] == {"maker_a", "maker_b"}
+        # Third phase: cleared because phase 2 reported no nicks.
+        if len(captured) >= 3:
+            assert captured[2] is None
+
+    async def test_legacy_taker_without_exclude_nicks_kwarg(self, tmp_path: Path) -> None:
+        # Older taker builds (or simple test fakes) may not accept the new
+        # kwarg. The runner must fall back gracefully so the phase still runs.
+        plan = _plan(tmp_path)
+        seen_kwargs: list[dict[str, Any]] = []
+
+        class LegacyTaker(FakeTaker):
+            async def do_coinjoin(  # type: ignore[override]
+                self,
+                amount: int,
+                destination: str,
+                mixdepth: int = 0,
+                counterparty_count: int | None = None,
+            ) -> str | None:
+                # No ``exclude_nicks`` kwarg -- TypeError on first attempt
+                # forces the runner's fallback path.
+                seen_kwargs.append(
+                    {
+                        "amount": amount,
+                        "destination": destination,
+                        "mixdepth": mixdepth,
+                        "counterparty_count": counterparty_count,
+                    }
+                )
+                return f"legacy-{mixdepth}-{amount}"
+
+        async def make_taker(phase: Any) -> LegacyTaker:
+            t = LegacyTaker(phase)
+            t.last_used_nicks = {"maker_x"}
+            return t
+
+        result = await TumbleRunner(plan, _ctx(tmp_path, taker_factory=make_taker)).run()
+        assert result.status == PlanStatus.COMPLETED
+        assert seen_kwargs, "legacy taker should still have been invoked"
 
 
 class TestConfirmationGate:

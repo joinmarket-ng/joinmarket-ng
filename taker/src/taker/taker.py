@@ -142,6 +142,13 @@ class Taker(TakerMonitoringMixin):
         self.txid: str = ""
         self.preselected_utxos: list[UTXOInfo] = []  # UTXOs pre-selected for CoinJoin
         self.selected_utxos: list[UTXOInfo] = []  # Taker's final selected UTXOs for signing
+        # Counterparty nicks selected for the most recent ``do_coinjoin`` call.
+        # Tumbler reads this to exclude reused makers across phases (see
+        # https://github.com/JoinMarket-Org/joinmarket-clientserver issue
+        # tracker / tumbler privacy notes). Replacement makers picked during
+        # honest-default fallback are added incrementally, so the set always
+        # reflects every counterparty that ended up in the final tx.
+        self.last_used_nicks: set[str] = set()
         self.cj_destination: str = ""  # Taker's CJ destination address for broadcast verification
         self.taker_change_address: str = ""  # Taker's change address for broadcast verification
         # For sweeps: store the tx_fee budget calculated at order selection time
@@ -385,6 +392,7 @@ class Taker(TakerMonitoringMixin):
         destination: str,
         mixdepth: int = 0,
         counterparty_count: int | None = None,
+        exclude_nicks: set[str] | None = None,
     ) -> str | None:
         """
         Execute a single CoinJoin transaction.
@@ -394,11 +402,18 @@ class Taker(TakerMonitoringMixin):
             destination: Destination address ("INTERNAL" for next mixdepth)
             mixdepth: Source mixdepth
             counterparty_count: Number of makers (default from config)
+            exclude_nicks: Additional maker nicks to exclude from selection
+                (on top of ``orderbook_manager.ignored_makers`` and
+                ``own_wallet_nicks``). Tumbler uses this to prevent the
+                same maker from re-appearing across consecutive plan phases.
 
         Returns:
             Transaction ID if successful, None otherwise
         """
         try:
+            # Reset per-call state so callers reading ``last_used_nicks`` after
+            # a failure don't pick up nicks from a previous successful round.
+            self.last_used_nicks = set()
             n_makers = counterparty_count or self.config.counterparty_count
 
             # Determine destination address
@@ -651,6 +666,7 @@ class Taker(TakerMonitoringMixin):
                         my_txfee=estimated_tx_fee,
                         n=n_makers,
                         required_features=required_features,
+                        exclude_nicks=exclude_nicks,
                     )
                 )
 
@@ -660,6 +676,10 @@ class Taker(TakerMonitoringMixin):
                     return None
 
                 logger.info(f"Sweep: cj_amount={self.cj_amount:,} sats calculated for zero change")
+                # Record initial counterparties so callers (e.g. the tumbler)
+                # can avoid reusing them in the next round, even if a
+                # replacement maker is later swapped in.
+                self.last_used_nicks = set(selected_offers.keys())
 
             else:
                 # NORMAL MODE: Select minimum UTXOs needed
@@ -670,12 +690,18 @@ class Taker(TakerMonitoringMixin):
                     cj_amount=self.cj_amount,
                     n=n_makers,
                     required_features=required_features,
+                    exclude_nicks=exclude_nicks,
                 )
 
                 if len(selected_offers) < self.config.minimum_makers:
                     logger.error(f"Not enough makers selected: {len(selected_offers)}")
                     self.state = TakerState.FAILED
                     return None
+
+                # Record initial counterparties so callers (e.g. the tumbler)
+                # can avoid reusing them in the next round, even if a
+                # replacement maker is later swapped in.
+                self.last_used_nicks = set(selected_offers.keys())
 
                 # Pre-select UTXOs for CoinJoin, then generate PoDLE from one of them
                 # This ensures the PoDLE UTXO is one we'll actually use in the transaction
@@ -1008,6 +1034,9 @@ class Taker(TakerMonitoringMixin):
 
                     # Update selected_offers for potential future retries
                     selected_offers.update(replacement_offers)
+                    # Track replacements too so the tumbler's exclusion set
+                    # reflects every nick that actually entered the tx.
+                    self.last_used_nicks.update(replacement_offers.keys())
                     continue
 
                 # Failed and no replacement possible
