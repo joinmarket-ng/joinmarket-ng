@@ -127,53 +127,82 @@ truth.
 
 ```yaml
 plan_id: 01HP5K9K2H3XR0QW0A1B2C3D4E
-wallet_name: alice.jmdat
-created_at: 2026-04-22T12:34:56Z
-updated_at: 2026-04-22T12:41:03Z
+wallet_name: alice
+created_at: '2026-04-22T12:34:56Z'
+updated_at: '2026-04-22T12:41:03Z'
+status: running
 destinations:
-  - bcrt1q...abc
+  - tb1qdest...aaa
+  - tb1qdest...bbb
+  - tb1qdest...ccc
 parameters:
-  maker_count_min: 5
-  maker_count_max: 9
-  mintxcount: 2
-  time_lambda_seconds: 21600
+  maker_count_min: 2
+  maker_count_max: 2
+  time_lambda_seconds: 3600.0
   include_maker_sessions: true
+  mincjamount_sats: 100000
   max_phase_retries: 3
-  seed: 8f3a2b6e7c1d4f59
+  seed: null
 phases:
   - index: 0
+    status: running
+    wait_seconds: 4372.841689800661
+    started_at: '2026-04-22T12:34:56Z'
+    finished_at: null
+    error: null
+    attempt_count: 0
     kind: taker_coinjoin
-    status: completed
     mixdepth: 0
-    amount_sats: 0
+    amount: 0
+    amount_fraction: null
+    counterparty_count: 2
     destination: INTERNAL
-    counterparty_count: 7
-    started_at: 2026-04-22T12:34:56Z
-    finished_at: 2026-04-22T12:38:02Z
-    txid: 9ab4...c7
-    attempt_count: 0
+    txid: null
+    rounding_sigfigs: null
   - index: 1
+    status: pending
+    wait_seconds: 2398.5842161882597
+    started_at: null
+    finished_at: null
+    error: null
+    attempt_count: 0
     kind: maker_session
-    status: pending
-    maker_session_seconds: 43200
-    maker_session_idle_timeout_seconds: null
-    offer:
-      ordertype: sw0absoffer
-      minsize: 500000
-      cjfee_r: "0.001"
-      cjfee_a: 0
-      txfee: 0
-    attempt_count: 0
+    duration_seconds: 1200.0
+    target_cj_count: null
+    idle_timeout_seconds: null
+    cj_served: 0
   - index: 2
-    kind: taker_coinjoin
     status: pending
-    mixdepth: 1
-    amount_sats: 0
-    destination: bcrt1q...abc
-    counterparty_count: 7
+    wait_seconds: 857.4411187260438
+    started_at: null
+    finished_at: null
+    error: null
     attempt_count: 0
+    kind: taker_coinjoin
+    mixdepth: 1
+    amount: null
+    amount_fraction: 0.5097
+    counterparty_count: 2
+    destination: INTERNAL
+    txid: null
+    rounding_sigfigs: null
+  - index: 3
+    status: pending
+    wait_seconds: 0.0
+    started_at: null
+    finished_at: null
+    error: null
+    attempt_count: 0
+    kind: taker_coinjoin
+    mixdepth: 1
+    amount: 0
+    amount_fraction: null
+    counterparty_count: 2
+    destination: tb1qdest...aaa
+    txid: null
+    rounding_sigfigs: null
 current_phase: 1
-status: running
+error: null
 ```
 
 Phase `status` is one of `pending | running | completed | failed |
@@ -218,7 +247,8 @@ short double-maker window.
 ```python
 from pathlib import Path
 
-from tumbler import Plan, PlanBuilder, PlanParameters, TumbleRunner
+from tumbler import PlanBuilder, TumbleRunner
+from tumbler.builder import TumbleParameters
 
 balances = {0: 200_000_000, 1: 0, 2: 0, 3: 0, 4: 0}
 destinations = [
@@ -227,22 +257,19 @@ destinations = [
     "bcrt1qdest0000000000000000000000000000000000ccc",
 ]
 
-params = PlanParameters(
+params = TumbleParameters(
+    destinations=destinations,
+    mixdepth_balances=balances,
     maker_count_min=5,
     maker_count_max=9,
-    mintxcount=2,
     time_lambda_seconds=21600.0,
     include_maker_sessions=True,
+    maker_session_seconds=43200.0,
     max_phase_retries=3,
     seed=42,
 )
 
-plan: Plan = PlanBuilder(
-    wallet_name="alice.jmdat",
-    destinations=destinations,
-    mixdepth_balances=balances,
-    parameters=params,
-).build()
+plan = PlanBuilder(wallet_name="alice", params=params).build()
 
 runner = TumbleRunner(plan=plan, data_dir=Path("/tmp/jm-tumbler"), ...)
 await runner.run()
