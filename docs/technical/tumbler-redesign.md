@@ -136,7 +136,7 @@ parameters:
   maker_count_min: 5
   maker_count_max: 9
   mintxcount: 2
-  time_lambda_seconds: 180
+  time_lambda_seconds: 21600
   include_maker_sessions: true
   max_phase_retries: 3
   seed: 8f3a2b6e7c1d4f59
@@ -155,13 +155,13 @@ phases:
   - index: 1
     kind: maker_session
     status: pending
-    maker_session_seconds: 21600
-    maker_session_idle_timeout_seconds: 1800
+    maker_session_seconds: 43200
+    maker_session_idle_timeout_seconds: null
     offer:
-      ordertype: sw0reloffer
+      ordertype: sw0absoffer
       minsize: 500000
-      cjfee_r: "0.0002"
-      cjfee_a: 1000
+      cjfee_r: "0.001"
+      cjfee_a: 0
       txfee: 0
     attempt_count: 0
   - index: 2
@@ -231,7 +231,7 @@ params = PlanParameters(
     maker_count_min=5,
     maker_count_max=9,
     mintxcount=2,
-    time_lambda_seconds=120.0,
+    time_lambda_seconds=21600.0,
     include_maker_sessions=True,
     max_phase_retries=3,
     seed=42,

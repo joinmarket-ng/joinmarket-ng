@@ -119,8 +119,8 @@ plans on-chain. Concretely:
   This alternates the wallet's on-chain signature between "taker" and
   "maker" roles so timing-correlation against orderbook activity is
   much harder.
-- **Long, randomized waits.** The default `time_lambda_seconds=3600`
-  (one hour mean, exponentially distributed) plus a 3x multiplier on
+- **Long, randomized waits.** The default `time_lambda_seconds=21600`
+  (six hour mean, exponentially distributed) plus a 3x multiplier on
   stage-1 sweeps matches the reference defaults. Tuning this much lower
   largely defeats the timing-correlation defence.
 - **Stage-1 cleavage.** The plan splits naturally into "stage 1" (sweep
@@ -169,6 +169,24 @@ roughly like this:
 
 The exact shape varies with wallet balances, destination count, seed, and
 whether maker sessions are enabled.
+
+## Example payout shape
+
+Suppose the wallet starts with 0.50000000 BTC, the plan estimator reports a
+worst-case total cost of 0.00265800 BTC, and the three destination-bearing
+stage-2 sweeps eventually land like this:
+
+| Destination | Received amount |
+| --- | --- |
+| `bc1qdest1...` | 0.17340000 BTC |
+| `bc1qdest2...` | 0.16195000 BTC |
+| `bc1qdest3...` | 0.16199200 BTC |
+
+Those payouts sum to 0.49734200 BTC, which is exactly the starting 0.50000000
+BTC minus the 0.00265800 BTC worst-case fees from the estimator. In a real run,
+the actual split and actual fees vary with sampled fractions, maker selection,
+and the prevailing fee rate, but this is the shape to expect: several unequal
+final sweeps whose total matches the wallet balance minus fees.
 
 ## Fees and safety
 
