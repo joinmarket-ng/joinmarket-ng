@@ -9,9 +9,8 @@ the user has configured the standalone ``maker`` bot:
 1. **Zero absolute fee, sw0absoffer.** The session is short-lived and
    bondless (see #2), so the offer would otherwise be ignored by takers
    filtering on fees and bonds. A 0-sat absolute offer is the cheapest
-   way to be picked. The reference implementation rejects ``cjfee_r==0``
-   for relative offers, so a tumbler maker session uses an absolute-fee
-   offer instead and leaves ``cj_fee_relative`` untouched.
+   way to be picked. Absolute offers only advertise/use ``cjfee_a``;
+   ``cj_fee_relative`` is irrelevant in this mode.
 
 2. **No fidelity bond.** Reusing a long-term bond from the funded wallet
    would link every tumbler maker session (and therefore the inputs they
@@ -42,6 +41,10 @@ def apply_tumbler_maker_policy(config: MakerConfig) -> MakerConfig:
     """
     config.offer_type = OfferType.SW0_ABSOLUTE
     config.cj_fee_absolute = 0
+    # Absolute offers ignore cj_fee_relative, but pin it to a harmless
+    # default instead of carrying through an operator-specific value into
+    # a tumbler-controlled session and then mentioning that value in docs.
+    config.cj_fee_relative = "0.001"
     config.no_fidelity_bond = True
     # Multi-offer takes precedence over the single-offer fields when
     # non-empty (see ``MakerConfig.get_effective_offers``); a non-empty

@@ -44,13 +44,17 @@ def _vbytes_for_coinjoin(counterparty_count: int) -> int:
     """
     Approximate vbyte size for a sw0 CoinJoin transaction.
 
-    Heuristic: one taker output + change + per-counterparty (input+output)
-    pair. Numbers track roughly with measurements on regtest sw0
-    transactions; precise sizes are wallet-dependent so the estimator is
-    deliberately coarse.
+    Mirrors the taker's own coarse fee model in
+    ``Taker._estimate_tx_fee``: P2WPKH inputs at ~68 vB, outputs at
+    ~31 vB, and ~11 vB overhead.
+
+    The tumbler estimator intentionally stays approximate because the real
+    transaction shape depends on maker input counts, whether the taker has
+    change, and sweep-vs-normal mode. But it should not wildly disagree with
+    the fee numbers shown by the taker itself.
     """
     fixed = 11  # version + locktime + segwit marker/flag + input/output counts
-    # Taker contributes one input (~68 vb sw0 p2wpkh) + one CJ output + one
+    # Taker contributes one input (~68 vb P2WPKH) + one CJ output + one
     # change output (~31 vb each).
     taker = 68 + 31 + 31
     # Each counterparty contributes one input + one CJ output + one change.

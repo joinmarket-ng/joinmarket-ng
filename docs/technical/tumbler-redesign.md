@@ -63,9 +63,10 @@ time; a phase completes (or fails) before the next begins. Two phase
 kinds are supported:
 
 - `taker_coinjoin` — a single CoinJoin as taker. Carries `mixdepth`,
-  `amount_sats` (with `0` meaning sweep), `destination` (an external
-  address or the literal `"INTERNAL"`), `counterparty_count`, and an
-  optional `rounding` digit count.
+  one of `amount` (sats; `0` means sweep) or `amount_fraction` (of the
+  current mixdepth balance), `destination` (an external address or the
+  literal `"INTERNAL"`), `counterparty_count`, and an optional
+  `rounding_sigfigs` (significant-figure count for amount obfuscation).
 - `maker_session` — runs `MakerBot` for a bounded window or until a
   target number of CoinJoins have been served, whichever comes first.
   Carries `maker_session_seconds`, `maker_session_idle_timeout_seconds`,
@@ -246,3 +247,84 @@ calls. It enforces a recommended minimum of three destinations to keep
 the final-mixdepth payout from collapsing onto a single address; tests
 and library callers can opt out via `--allow-few-destinations` (CLI)
 or by passing a single destination directly to `PlanBuilder`.
+
+## Privacy invariants
+
+The plan builder is constrained to satisfy a fixed set of
+privacy/safety properties for *every* seed. These are not aspirational;
+they are pinned by `tumbler/tests/test_privacy_invariants.py` over 20
+seeds across 4 balance scenarios:
+
+- Every external destination receives at least one payout.
+- Per-phase amount fractions are bounded in `[0.05, 1.0)` and the
+  per-mixdepth fractional sum stays below `0.96`, guaranteeing a
+  trailing sweep with non-dust value.
+- Per-phase counterparty fee bound matches
+  `max(cj_fee_abs, cj_fee_rel * amount) * counterparty_count` so the
+  upfront estimate cannot under-promise.
+- Worst-case total fee never exceeds the starting balance: the protocol
+  cannot drain the wallet to fees.
+- The estimator's reported balance equals the configured per-mixdepth
+  balance map (no silent field drift).
+- Phase indices are contiguous; counts match `taker + maker`.
+
+## Amount rounding
+
+By default a fraction of non-sweep taker CJs (`rounding_chance=0.25`)
+have their resolved sat amount rounded to a random number of
+significant figures, drawn from a weighted distribution
+(`rounding_sigfig_weights=(55, 15, 25, 65, 40)` for 1-5 sigfigs).
+This is a 1:1 port of the reference's `do_round` schedule entry and
+prevents the wallet's sat-precise balance from leaking through to the
+CoinJoin amount. Sweeps and explicit-amount phases never round.
+The rounding is sampled at plan-build time and stored on
+`TakerCoinjoinPhase.rounding_sigfigs`, so the persisted plan is
+deterministic given the seed.
+
+## Maker exclusion across phases
+
+Within a single tumble, the runner remembers which counterparty nicks
+were used in the previous phase and passes them as `exclude_nicks` to
+`Taker.do_coinjoin` for the next one. The exclusion window is one phase
+deep (not cumulative): a longer window risks starving long plans of
+counterparties when the orderbook is thin. This frustrates a coordinated
+set of malicious makers from intersecting the same wallet across
+consecutive phases of the same tumble.
+
+The runner falls back to the legacy `do_coinjoin` signature on
+`TypeError` so it stays compatible with reference takers and existing
+test fakes that have not yet adopted the kwarg.
+
+## Maker policy in tumbler-driven sessions
+
+Maker phases inside a tumbler plan run with a forced policy: absolute
+fee `cjfee_a = 0` and `ordertype = sw0absoffer`. This means the wallet
+is offering free CoinJoin liquidity for the duration of the maker
+session - which is exactly the role-mixing signal we want, since a
+profit-motivated maker has a different on-chain footprint than a
+mixing-motivated one. The `cjfee_r` field is left at the configured
+value to keep relative-offer-only takers from rejecting our offer
+outright (the reference taker implementation refuses `cjfee_r=0`).
+
+The mutator lives in `tumbler/src/tumbler/maker_policy.py` and is wired
+into both maker factories. Tests in
+`tumbler/tests/test_maker_policy.py` pin the behavior.
+
+## Fee estimator
+
+`tumbler.estimator.estimate_plan_costs` computes an upper bound on
+total cost before the plan runs. The estimate covers:
+
+- **Counterparty fees** per taker phase, taken as `max(abs, rel*amount)
+  * counterparty_count`, summed across all taker phases (sweeps included).
+- **Miner fees** per taker phase, computed from the same coarse fee
+  model the taker uses for its own operator prompts: ~68 vB per P2WPKH
+  input, ~31 vB per P2WPKH output, plus ~11 vB fixed overhead, at the
+  resolved sat/vB.
+- **Fee-rate source labelling**: `configured` if the user passed
+  `--fee-rate`, `estimated` if the runner queried `estimatesmartfee`,
+  `fallback` if neither was available (default 10 sat/vB).
+
+The estimate is rendered by `jm-tumbler plan` so users see the
+worst-case spend and can tune knobs before running. The same model is
+used to assert the no-fund-loss invariant in tests.

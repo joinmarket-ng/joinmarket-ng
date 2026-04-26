@@ -83,6 +83,145 @@ stopped.
 selected as a counterparty during that window, the phase exits gracefully as
 completed. This prevents a tumble from stalling when no taker shows up.
 
+## Why a tumbler? Privacy rationale
+
+A single CoinJoin breaks the obvious link between an input and the equal-
+amount output, but a chain analyst with patience can still re-aggregate
+funds by following amount, timing, and address-reuse heuristics. A tumbler
+defeats those heuristics by spreading the wallet's exit across many
+CoinJoins, several mixdepths, and at least three external destinations.
+
+The defaults are chosen to mirror the reference implementation's
+[Tumbler Guide](https://github.com/JoinMarket-Org/joinmarket-clientserver/blob/master/docs/tumblerguide.md)
+so that joinmarket-ng plans are statistically indistinguishable from
+reference plans on-chain. Concretely:
+
+- **At least three destinations.** Two destinations let an observer
+  pair-match outputs by elimination; three or more force genuine ambiguity.
+  The CLI refuses fewer than three unless `--allow-few-destinations` is
+  set (development only).
+- **Multiple CJs per mixdepth before sweeping.** Each mixdepth ships out
+  several fractional payouts and then a final sweep. A single sweep would
+  expose the full balance and trivially re-link to it.
+- **Random fractional amounts with a 5% floor.** Fractions are sampled
+  uniformly from the "sorted knives" scheme and clamped to >= 0.05; the
+  per-mixdepth sum is normalized to leave >= 0.05 for the trailing sweep.
+  This guarantees at least one sweep transaction (which empties UTXO
+  metadata) without producing dust-sized payouts.
+- **Significant-figure rounding (default 25% of phases).** Non-sweep CJ
+  amounts are rounded to a random number of significant figures
+  (1-5, weighted toward 4) so the sat-precise wallet balance does not
+  leak through to the chain. Disable with `rounding_chance=0.0`.
+- **Maker rounds between taker phases.** When `--maker-sessions` is on
+  (default), every taker mixdepth is preceded by a bounded maker session.
+  This alternates the wallet's on-chain signature between "taker" and
+  "maker" roles so timing-correlation against orderbook activity is
+  much harder.
+- **Long, randomized waits.** The default `time_lambda_seconds=3600`
+  (one hour mean, exponentially distributed) plus a 3x multiplier on
+  stage-1 sweeps matches the reference defaults. Tuning this much lower
+  largely defeats the timing-correlation defence.
+- **Stage-1 cleavage.** The plan splits naturally into "stage 1" (sweep
+  every funded mixdepth out of its starting UTXO set, breaking the link
+  to pre-tumble history) and "stage 2" (drain the resulting internal
+  balances out to the external destinations). Stage-1 phases get the
+  longer wait by design.
+- **Non-overlapping makers.** Within one tumble, the runner remembers
+  which counterparty nicks were used in the previous phase and excludes
+  them from the next maker selection. A coordinated set of malicious
+  makers cannot trivially intersect across phases.
+
+If you reduce any of these knobs (smaller waits, fewer destinations,
+disabled maker sessions, disabled rounding) you trade real privacy for
+speed. The plan estimator (`jm-tumbler plan` output) prints the resulting
+worst-case fees so you can see what you are paying for.
+
+## Worked example
+
+A typical mainnet tumble with three destinations, a wallet holding
+0.50 BTC across two mixdepths, on a node with `estimatesmartfee` available:
+
+```bash
+jm-tumbler plan \
+  --mnemonic-file ~/.joinmarket-ng/wallets/default.mnemonic \
+  --backend descriptor_wallet \
+  --rpc-url http://user:pass@127.0.0.1:8332 \
+  --destination bc1qdest1xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx \
+  --destination bc1qdest2xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx \
+  --destination bc1qdest3xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+```
+
+The output summarises the plan and an upfront fee estimate:
+
+```
+plan: 18 phases (12 taker CJs, 6 maker sessions)
+balance: 0.50000000 BTC across mixdepths {0: 30000000, 1: 20000000}
+fee rate: 18 sat/vB (estimated)
+worst-case maker fees: 0.00071400 BTC (0.14%)
+worst-case miner fees: 0.00194400 BTC (0.39%)
+worst-case total cost: 0.00265800 BTC (0.53%)
+estimated runtime: 14h - 36h (mean, 90th percentile)
+```
+
+Then run it (this blocks the terminal; safe to `Ctrl-C` and resume):
+
+```bash
+jm-tumbler run \
+  --mnemonic-file ~/.joinmarket-ng/wallets/default.mnemonic \
+  --backend descriptor_wallet \
+  --rpc-url http://user:pass@127.0.0.1:8332 \
+  --directory <directory-onion-1>,<directory-onion-2>,<directory-onion-3>
+```
+
+While the tumble is in progress, `jmwalletd` returns `409 Conflict` for
+manual taker/maker calls on the same wallet (see "Concurrency" above).
+
+## Fees and safety
+
+Three cost components contribute to the worst case:
+
+1. **Counterparty (maker) fees.** Each taker CJ pays each counterparty
+   either an absolute fee (`max_cj_fee_abs`) or a fraction of the CJ
+   amount (`max_cj_fee_rel`), whichever is larger. The plan estimator
+   uses these caps as an upper bound; actual fees depend on the orders
+   selected at runtime.
+2. **Miner fees.** Estimated per phase from the same coarse vsize
+   model the taker uses for its own prompts: ~68 vB per P2WPKH input,
+   ~31 vB per P2WPKH output, plus ~11 vB fixed overhead. If `--block-target`
+   is set the runner asks the backend for an
+   estimate; otherwise `--fee-rate` applies; otherwise the estimator
+   falls back to 10 sat/vB and labels the source as `fallback`.
+3. **Tumbler-internal CJs.** Stage 1 doesn't reach an external
+   destination - it only cleaves the pre-tumble link - but those CJs
+   still cost both maker and miner fees. They are included in the
+   estimate.
+
+Built-in safety properties (verified by the test suite, see
+`tumbler/tests/test_privacy_invariants.py`):
+
+- The estimator's reported total balance equals the configured per-
+  mixdepth balance map (no silent field drift).
+- The worst-case total fee never exceeds the starting balance: a tumble
+  cannot drain the wallet to the protocol.
+- Every external destination receives at least one payout in every plan,
+  regardless of seed.
+- Fractional amounts always sum to less than 1.0 with a 0.05 reserve, so
+  every mixdepth ends with a sweep transaction.
+
+If a phase fails (network blip, fee-rate spike rejecting the bid), the
+runner retries up to `max_phase_retries` (default 3) before marking the
+plan failed. The YAML file is updated on every transition, so a crashed
+process can be resumed by re-running `jm-tumbler run`.
+
+## Configuration
+
+Tumbler defaults live in `config.toml` under the `[tumbler]` section.
+Run `jm-tumbler config-init` to write a copy of `config.toml.template`
+to your data directory; relevant keys are documented inline there.
+Per-plan knobs (`--maker-count-min`, `--mincjamount-sats`,
+`--maker-sessions/--no-maker-sessions`, `--seed`, ...) override the
+config for one invocation only.
+
 <!-- AUTO-GENERATED HELP START: jm-tumbler -->
 
 <details>
