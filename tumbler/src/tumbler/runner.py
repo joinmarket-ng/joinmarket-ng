@@ -369,7 +369,15 @@ class TumbleRunner:
             # Sweep sentinel: Taker.do_coinjoin treats amount=0 as sweep.
             return 0
         balance = await self.ctx.wallet_service.get_balance(phase.mixdepth)
-        return int(int(balance) * fraction)
+        amount = int(int(balance) * fraction)
+        if phase.rounding_sigfigs is not None and amount > 0:
+            # Privacy: obfuscate the relationship between balance and CJ
+            # amount by rounding to a few significant figures (matches the
+            # reference ``rounding`` schedule entry).
+            from tumbler.plan import round_to_significant_figures
+
+            amount = round_to_significant_figures(amount, phase.rounding_sigfigs)
+        return amount
 
     async def _resolve_destination(self, phase: TakerCoinjoinPhase) -> str:
         """Resolve the 'INTERNAL' sentinel to a concrete next-mixdepth address."""

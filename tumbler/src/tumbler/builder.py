@@ -84,6 +84,17 @@ class TumbleParameters:
     """Minimum number of destination-bearing taker CJs per mixdepth (excluding sweep)."""
     max_phase_retries: int = 3
     """Maximum re-tries per failed taker CoinJoin phase before the plan fails."""
+    rounding_chance: float = 0.25
+    """Probability that any given non-sweep taker CJ amount is rounded to a
+    random number of significant figures. Reference default is 0.25 (25%).
+    Set to 0.0 to disable rounding entirely. Sweeps are never rounded.
+    """
+    rounding_sigfig_weights: tuple[float, float, float, float, float] = (55, 15, 25, 65, 40)
+    """Weights for choosing the number of significant figures to round to
+    when rounding fires. The five weights map to 1, 2, 3, 4, 5 sigfigs
+    respectively. Reference defaults from
+    ``jmclient/cli_options.py:rounding_sigfig_weights``.
+    """
     seed: int | None = None
 
     @property
@@ -192,6 +203,7 @@ class PlanBuilder:
                         counterparty_count=self._sample_counterparty_count(rng),
                         destination=INTERNAL_DESTINATION,
                         wait_seconds=self._sample_wait(rng),
+                        rounding_sigfigs=self._sample_rounding_sigfigs(rng),
                     )
                 )
             # Final sweep of the mixdepth: advance internally until the last
@@ -259,6 +271,19 @@ class PlanBuilder:
         # rng.random() can return 0; guard against log(0).
         u = max(u, 1e-9)
         return min(-math.log(u) * lam, lam * 10.0)
+
+    def _sample_rounding_sigfigs(self, rng: random.Random) -> int | None:
+        """Sample a sigfig count or ``None`` to skip rounding for this phase.
+
+        Mirrors the reference's per-tx ``do_round = random() < rounding_chance``
+        followed by a weighted choice over ``rounding_sigfig_weights``.
+        """
+        chance = self.params.rounding_chance
+        if chance <= 0.0 or rng.random() >= chance:
+            return None
+        weights = list(self.params.rounding_sigfig_weights)
+        # Weighted choice over [1, 2, 3, 4, 5] sigfigs.
+        return int(rng.choices([1, 2, 3, 4, 5], weights=weights, k=1)[0])
 
     def _destination_fractions(self, mintxcount: int, rng: random.Random) -> list[float]:
         """

@@ -100,6 +100,20 @@ class TakerCoinjoinPhase(_PhaseBase):
     txid: str | None = Field(
         default=None, description="Broadcast txid, set once the CoinJoin confirms."
     )
+    rounding_sigfigs: int | None = Field(
+        default=None,
+        ge=1,
+        le=8,
+        description=(
+            "If set, round the resolved sat amount to this many significant "
+            "figures before dispatching to the taker. Mirrors the reference "
+            "implementation's ``rounding`` schedule entry: a sub-BTC amount "
+            "like 0.13256 BTC rounded to 2 sigfigs becomes 0.13 BTC, which "
+            "obfuscates the relationship between the wallet balance and the "
+            "CoinJoin amount. Sweeps (amount==0 / amount_fraction==0) ignore "
+            "this field."
+        ),
+    )
 
     @model_validator(mode="after")
     def _validate_amount(self) -> TakerCoinjoinPhase:
@@ -219,3 +233,33 @@ class Plan(BaseModel):
     def touch(self) -> None:
         """Update ``updated_at`` to now (UTC)."""
         self.updated_at = datetime.now(UTC)
+
+
+def round_to_significant_figures(value: int, sigfigs: int) -> int:
+    """Round ``value`` to ``sigfigs`` significant figures in base 10.
+
+    Mirrors ``round_to_significant_figures`` in the reference
+    ``jmclient.taker``: the smallest power of ten greater than ``value`` is
+    used as the scale, then the value is rounded to ``sigfigs`` sigfigs
+    around it. Examples (``sigfigs=2``)::
+
+        13_256_421 -> 13_000_000
+        9_876      -> 9_900
+        1_000_000  -> 1_000_000
+        0          -> 0
+
+    Raises ``ValueError`` if ``value`` is negative or ``sigfigs`` is not in
+    ``[1, 8]`` (matching the model bounds).
+    """
+    if value < 0:
+        raise ValueError("round_to_significant_figures requires a non-negative value")
+    if not 1 <= sigfigs <= 8:
+        raise ValueError("sigfigs must be in [1, 8]")
+    if value == 0:
+        return 0
+    for p in range(-10, 20):
+        power10 = 10**p
+        if power10 > value:
+            sf_power10 = 10**sigfigs
+            return int(round(value / power10 * sf_power10) * power10 / sf_power10)
+    raise RuntimeError("round_to_significant_figures: value out of range")
