@@ -85,6 +85,22 @@ COPY taker/pyproject.toml /build/taker/
 RUN if [ -n "$SOURCE_DATE_EPOCH" ]; then export SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH; fi && \
     pip install --no-cache-dir --user --build-constraint /build/constraints.txt /build/taker
 
+# Copy maker source and install (required by jm-tumbler)
+COPY maker/requirements.txt /build/maker/requirements.txt
+RUN if [ -n "$SOURCE_DATE_EPOCH" ]; then export SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH; fi && \
+    pip install --no-cache-dir --user -r /build/maker/requirements.txt
+
+COPY maker/src /build/maker/src
+COPY maker/pyproject.toml /build/maker/
+RUN if [ -n "$SOURCE_DATE_EPOCH" ]; then export SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH; fi && \
+    pip install --no-cache-dir --user --build-constraint /build/constraints.txt /build/maker
+
+# Copy tumbler source and install so the taker image also provides jm-tumbler
+COPY tumbler/src /build/tumbler/src
+COPY tumbler/pyproject.toml /build/tumbler/
+RUN if [ -n "$SOURCE_DATE_EPOCH" ]; then export SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH; fi && \
+    pip install --no-cache-dir --user --build-constraint /build/constraints.txt /build/tumbler
+
 # Normalize installed Python environment mtimes for reproducible COPY layer digests
 RUN if [ -n "$SOURCE_DATE_EPOCH" ]; then \
         find /root/.local -exec touch -d @${SOURCE_DATE_EPOCH} {} +; \
