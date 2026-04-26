@@ -342,6 +342,75 @@ class TestDescriptorWalletBackendUnit:
         )
 
     @pytest.mark.asyncio
+    async def test_import_descriptors_recovers_from_http_read_timeout(
+        self, mock_backend: DescriptorWalletBackend
+    ) -> None:
+        """Regression test for issue #472.
+
+        The first ``importdescriptors`` call with smart-scan can keep the HTTP
+        connection open longer than the configured read timeout because the
+        rescan it triggers runs synchronously inside the RPC. Instead of
+        bubbling up an opaque ``httpx.ReadTimeout``, the backend should wait
+        for the rescan to finish and confirm the import via ``listdescriptors``.
+        """
+        import httpx
+
+        backend = mock_backend
+
+        rescan_states = iter(
+            [
+                # First poll: rescan is in progress
+                {"in_progress": True, "progress": 0.4},
+                # Second poll: rescan finished
+                {"in_progress": False, "progress": 1.0},
+            ]
+        )
+
+        async def mock_rpc(method, params=None, client=None, use_wallet=True):
+            if method == "getdescriptorinfo":
+                return {"descriptor": f"{params[0]}#check"}
+            if method == "importdescriptors":
+                # Simulate Bitcoin Core taking longer than IMPORT_RPC_TIMEOUT.
+                raise httpx.ReadTimeout("simulated read timeout", request=None)
+            if method == "getwalletinfo":
+                state = next(rescan_states, {"in_progress": False})
+                if state["in_progress"]:
+                    return {
+                        "scanning": {
+                            "duration": 30,
+                            "progress": state["progress"],
+                        }
+                    }
+                return {"scanning": False}
+            if method == "listdescriptors":
+                return {"descriptors": [{"desc": "wpkh(xpub.../0/*)#check"}]}
+            raise ValueError(f"Unexpected method: {method}")
+
+        backend._rpc_call = mock_rpc
+
+        # Speed the wait_for_rescan_complete polling loop up so the test is
+        # quick. The default 5s poll + 30s grace would otherwise dominate.
+        original_wait = backend.wait_for_rescan_complete
+
+        async def fast_wait(**kwargs):
+            kwargs["poll_interval"] = 0.01
+            kwargs.setdefault("startup_grace_period", 0.05)
+            return await original_wait(**kwargs)
+
+        backend.wait_for_rescan_complete = fast_wait  # type: ignore[method-assign]
+
+        result = await backend.import_descriptors(
+            [{"desc": "wpkh(xpub.../0/*)", "range": [0, 999]}],
+            rescan=True,
+            smart_scan=False,  # avoid the extra _get_smart_scan_timestamp call
+            background_full_rescan=False,
+        )
+
+        assert result["success_count"] == 1
+        assert result["error_count"] == 0
+        assert backend._descriptors_imported is True
+
+    @pytest.mark.asyncio
     async def test_get_utxos(self, mock_backend: DescriptorWalletBackend):
         """Test getting UTXOs via listunspent."""
         backend = mock_backend

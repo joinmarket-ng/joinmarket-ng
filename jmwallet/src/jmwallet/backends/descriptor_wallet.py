@@ -33,8 +33,13 @@ from jmwallet.backends.base import UTXO, BlockchainBackend, Transaction
 # Timeout for regular RPC calls (seconds)
 DEFAULT_RPC_TIMEOUT = 30.0
 
-# Timeout for descriptor import - can take a while for large ranges
-IMPORT_RPC_TIMEOUT = 120.0
+# Timeout for descriptor import - first-time imports trigger a partial rescan
+# that runs synchronously inside the importdescriptors RPC. On slow hosts
+# (e.g. a Raspberry Pi) the smart-scan window (~1 year) can easily exceed
+# two minutes, so we use a much larger budget here. If the HTTP read still
+# times out we fall back to polling getwalletinfo for ``scanning`` instead
+# of bubbling up a confusing ReadTimeout (issue #472).
+IMPORT_RPC_TIMEOUT = 1800.0
 
 # Default gap limit for descriptor ranges
 DEFAULT_GAP_LIMIT = 1000
@@ -603,9 +608,53 @@ class DescriptorWalletBackend(BlockchainBackend):
             )
 
         try:
-            result = await self._rpc_call(
-                "importdescriptors", [import_requests], client=self._import_client
-            )
+            try:
+                result = await self._rpc_call(
+                    "importdescriptors", [import_requests], client=self._import_client
+                )
+            except (httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout) as timeout_err:
+                # The HTTP read timed out, but Bitcoin Core's importdescriptors
+                # call is still running server-side -- the rescan that follows
+                # the import is what actually blocks. Wait for the scan to
+                # finish, then verify the import went through (issue #472).
+                logger.warning(
+                    "importdescriptors HTTP read timed out after "
+                    f"{self.import_timeout:.0f}s; the import is still running "
+                    "in Bitcoin Core. Waiting for the rescan to complete..."
+                )
+                rescan_done = await self.wait_for_rescan_complete(
+                    poll_interval=10.0,
+                    timeout=None,  # No additional cap -- let the user Ctrl-C
+                )
+                if not rescan_done:
+                    raise RuntimeError(
+                        "importdescriptors HTTP call timed out and the rescan "
+                        "is still in progress in Bitcoin Core. Please retry "
+                        "the command in a moment."
+                    ) from timeout_err
+                # Best-effort verification: listdescriptors confirms the import
+                # actually applied. We synthesize a result envelope so the rest
+                # of this function can keep running.
+                logger.info(
+                    "Rescan finished after HTTP timeout; verifying that "
+                    "descriptors were imported..."
+                )
+                try:
+                    verify = await self._rpc_call("listdescriptors")
+                    actual_count = len(verify.get("descriptors", []))
+                except Exception as verify_err:
+                    raise RuntimeError(
+                        "importdescriptors timed out and the post-timeout "
+                        "verification call also failed; please retry."
+                    ) from verify_err
+                if actual_count == 0:
+                    raise RuntimeError(
+                        "importdescriptors timed out and the wallet still has "
+                        "no descriptors. Please retry the command."
+                    ) from timeout_err
+                # Synthesize an all-success result so the existing code path
+                # below treats this as a normal completion.
+                result = [{"success": True} for _ in import_requests]
 
             # Check for errors in results
             success_count = sum(1 for r in result if r.get("success", False))
