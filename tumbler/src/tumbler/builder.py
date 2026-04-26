@@ -60,11 +60,11 @@ class TumbleParameters:
     """Current confirmed balance per mixdepth, in satoshis."""
     maker_count_min: int = 5
     maker_count_max: int = 9
-    time_lambda_seconds: float = 60.0 * 60.0
+    time_lambda_seconds: float = 6.0 * 60.0 * 60.0
     """Average wait between phases (mean of an exponential distribution).
 
-    Default is 60 minutes, matching the reference implementation's
-    ``--timelambda=60`` option. Anything shorter risks defeating the
+    Default is 6 hours, matching the reference implementation's
+    ``--timelambda=360`` option. Anything shorter risks defeating the
     timing-correlation defence; values are clamped per-sample at 10x mean.
     """
     stage1_wait_multiplier: float = 3.0
@@ -75,7 +75,7 @@ class TumbleParameters:
     """
     include_maker_sessions: bool = True
     mincjamount_sats: int = 100_000
-    maker_session_seconds: float = 20.0 * 60.0
+    maker_session_seconds: float = 12.0 * 60.0 * 60.0
     maker_session_idle_timeout_seconds: float | None = None
     """If set, maker phases exit successfully when no CoinJoin has been served
     within this many seconds. Useful as a safety fallback when the wallet is

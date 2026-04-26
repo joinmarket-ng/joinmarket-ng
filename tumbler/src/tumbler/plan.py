@@ -168,7 +168,7 @@ class PlanParameters(BaseModel):
 
     maker_count_min: int = Field(default=5, ge=1, le=20)
     maker_count_max: int = Field(default=9, ge=1, le=20)
-    time_lambda_seconds: float = Field(default=30.0, gt=0.0)
+    time_lambda_seconds: float = Field(default=6.0 * 60.0 * 60.0, gt=0.0)
     include_maker_sessions: bool = True
     mincjamount_sats: int = Field(default=100_000, ge=0)
     max_phase_retries: int = Field(
