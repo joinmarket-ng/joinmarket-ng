@@ -70,6 +70,30 @@ class TorControlConfig(BaseModel):
     model_config = {"frozen": False}
 
 
+def detect_tor_cookie_path() -> Path | None:
+    """Probe the well-known Tor control-cookie locations and return the first
+    one that exists and has non-zero size.
+
+    The cookie file is created by Tor on startup and is empty if Tor wasn't
+    configured to write there, so we filter empty files to avoid handing a
+    bogus path to ``TorControlClient``.
+
+    Probed paths (ordered by likelihood on modern Linux systems):
+        - /run/tor/control.authcookie       (Debian/Ubuntu with systemd)
+        - /var/run/tor/control.authcookie   (Older systems; often a symlink)
+        - /var/lib/tor/control_auth_cookie  (Tor's torrc example default)
+    """
+    common_paths = (
+        Path("/run/tor/control.authcookie"),
+        Path("/var/run/tor/control.authcookie"),
+        Path("/var/lib/tor/control_auth_cookie"),
+    )
+    for path in common_paths:
+        if path.exists() and path.stat().st_size > 0:
+            return path
+    return None
+
+
 def create_tor_control_config_from_env() -> TorControlConfig:
     """
     Create TorControlConfig from environment variables with smart defaults.
@@ -94,25 +118,9 @@ def create_tor_control_config_from_env() -> TorControlConfig:
     tor = settings.tor
 
     # Try to find cookie path
-    cookie_path: Path | None = None
-    if tor.cookie_path:
-        cookie_path = Path(tor.cookie_path)
-    else:
-        # Try common paths (ordered by likelihood on modern Linux systems)
-        # - /run/tor/control.authcookie: Debian/Ubuntu with systemd (most common)
-        # - /var/run/tor/control.authcookie: Older systems (often symlink to /run)
-        # - /var/lib/tor/control_auth_cookie: Tor default example in torrc
-        common_paths = [
-            Path("/run/tor/control.authcookie"),
-            Path("/var/run/tor/control.authcookie"),
-            Path("/var/lib/tor/control_auth_cookie"),
-        ]
-        for path in common_paths:
-            # Check that file exists AND has content (non-zero size)
-            # An empty cookie file indicates Tor isn't configured to write there
-            if path.exists() and path.stat().st_size > 0:
-                cookie_path = path
-                break
+    cookie_path: Path | None = (
+        Path(tor.cookie_path) if tor.cookie_path else detect_tor_cookie_path()
+    )
 
     return TorControlConfig(
         enabled=tor.control_enabled,
@@ -339,6 +347,7 @@ __all__ = [
     "TorConfig",
     "TorControlConfig",
     "create_tor_control_config_from_env",
+    "detect_tor_cookie_path",
     "BackendConfig",
     "WalletConfig",
     "DirectoryServerConfig",

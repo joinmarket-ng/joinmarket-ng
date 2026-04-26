@@ -60,6 +60,96 @@ class TestTorControlConfig:
         assert config.cookie_path is None
 
 
+class TestDetectTorCookiePath:
+    """``detect_tor_cookie_path`` should probe well-known Tor cookie locations
+    (issue #471) and skip empty/missing files."""
+
+    @staticmethod
+    def _patch(monkeypatch, mapping: dict[str, tuple[bool, int]]) -> None:
+        """Replace ``Path`` in ``jmcore.config`` with a wrapper whose
+        ``exists()``/``stat()`` honour ``mapping`` (path -> (exists, size)).
+
+        Paths not in ``mapping`` fall back to the real ``Path`` so the rest of
+        the module keeps working.
+        """
+        from jmcore import config as cfg_mod
+
+        real_path_cls = Path
+
+        def _factory(p: str) -> Path:
+            wrapped = real_path_cls(p)
+            spec = mapping.get(str(wrapped))
+            if spec is None:
+                return wrapped
+
+            exists, size = spec
+
+            class _Stub:
+                def __init__(self, inner: Path) -> None:
+                    self._inner = inner
+
+                def __str__(self) -> str:
+                    return str(self._inner)
+
+                def __eq__(self, other: object) -> bool:
+                    return self._inner == other
+
+                def __hash__(self) -> int:
+                    return hash(self._inner)
+
+                def exists(self) -> bool:
+                    return exists
+
+                def stat(self):  # type: ignore[no-untyped-def]
+                    class _S:
+                        st_size = size
+
+                    return _S()
+
+            return _Stub(wrapped)  # type: ignore[return-value]
+
+        monkeypatch.setattr(cfg_mod, "Path", _factory)
+
+    def test_returns_first_non_empty_cookie(self, monkeypatch):
+        from jmcore.config import detect_tor_cookie_path
+
+        self._patch(
+            monkeypatch,
+            {
+                "/run/tor/control.authcookie": (True, 32),
+                "/var/run/tor/control.authcookie": (True, 32),
+                "/var/lib/tor/control_auth_cookie": (True, 32),
+            },
+        )
+        assert detect_tor_cookie_path() == Path("/run/tor/control.authcookie")
+
+    def test_skips_empty_cookie_files(self, monkeypatch):
+        from jmcore.config import detect_tor_cookie_path
+
+        self._patch(
+            monkeypatch,
+            {
+                "/run/tor/control.authcookie": (True, 0),
+                "/var/run/tor/control.authcookie": (False, 0),
+                "/var/lib/tor/control_auth_cookie": (True, 32),
+            },
+        )
+        assert detect_tor_cookie_path() == Path("/var/lib/tor/control_auth_cookie")
+
+    def test_returns_none_when_no_cookie_present(self, monkeypatch):
+        from jmcore.config import detect_tor_cookie_path
+
+        self._patch(
+            monkeypatch,
+            {
+                "/run/tor/control.authcookie": (False, 0),
+                "/var/run/tor/control.authcookie": (False, 0),
+                "/var/lib/tor/control_auth_cookie": (False, 0),
+            },
+        )
+        assert detect_tor_cookie_path() is None
+
+
 class TestBackendConfig:
     def test_default_values(self):
         config = BackendConfig()

@@ -16,7 +16,7 @@ from typing import Annotated, Any
 
 import typer
 from jmcore.cli_common import resolve_mnemonic, setup_cli
-from jmcore.config import TorControlConfig
+from jmcore.config import TorControlConfig, detect_tor_cookie_path
 from jmcore.models import NetworkType, OfferType
 from jmcore.notifications import get_notifier
 from jmcore.paths import remove_nick_state, write_nick_state
@@ -168,6 +168,12 @@ def build_maker_config(
             effective_cookie_path = tor_cookie_path
         elif settings.tor.cookie_path:
             effective_cookie_path = Path(settings.tor.cookie_path)
+        else:
+            # Auto-detect cookie at well-known Tor locations so the maker
+            # works out of the box on systems where install.sh / the distro
+            # configured CookieAuthentication without writing the path back
+            # into config.toml (issue #471).
+            effective_cookie_path = detect_tor_cookie_path()
 
         tor_control_cfg = TorControlConfig(
             enabled=settings.tor.control_enabled,
