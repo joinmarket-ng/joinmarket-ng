@@ -410,18 +410,21 @@ async def start_plan(
     async def _get_confirmations(txid: str) -> int | None:
         """Return confirmation count for ``txid`` via the shared backend.
 
-        ``get_transaction`` returns ``None`` when the backend has not yet seen
-        the transaction; we mirror that so the runner can keep polling.
+        Two-stage lookup (see :func:`tumbler.confirmations.resolve_confirmations`):
+
+        1. ``backend.get_transaction(txid)`` (full nodes / mempool.space).
+        2. Watched-address fallback via the CoinJoin history file
+           (works with neutrino, which cannot fetch arbitrary txids by
+           id but *can* match watched addresses via BIP158).
         """
+        from tumbler.confirmations import resolve_confirmations
+
         try:
             backend = await get_backend(state.data_dir, wallet_service=ws)
-            tx = await backend.get_transaction(txid)
         except Exception:
-            logger.exception("get_confirmations(%s) backend error", txid)
+            logger.exception("get_confirmations(%s) backend resolution failed", txid)
             return None
-        if tx is None:
-            return None
-        return int(tx.confirmations)
+        return await resolve_confirmations(txid, backend, state.data_dir)
 
     ctx = RunnerContext(
         wallet_service=ws,

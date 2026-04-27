@@ -866,14 +866,9 @@ async def _run_plan(
         return MakerBot(wallet=wallet, backend=backend, config=config)
 
     async def _get_confirmations(txid: str) -> int | None:
-        try:
-            tx = await shared_backend.get_transaction(txid)
-        except Exception:
-            logger.exception(f"get_confirmations({txid}) backend error")
-            return None
-        if tx is None:
-            return None
-        return int(tx.confirmations)
+        from tumbler.confirmations import resolve_confirmations
+
+        return await resolve_confirmations(txid, shared_backend, data_dir)
 
     ctx = RunnerContext(
         wallet_service=wallet,
