@@ -199,8 +199,16 @@ class TumbleRunner:
                 self.plan.current_phase += 1
                 self._persist()
                 if phase.wait_seconds > 0 and self.plan.current() is not None:
+                    next_phase = self.plan.current()
+                    next_index = next_phase.index if next_phase is not None else "?"
                     try:
-                        await self._wait_interruptibly(phase.wait_seconds)
+                        await self._wait_interruptibly_with_progress(
+                            phase.wait_seconds,
+                            label=(
+                                f"inter-phase delay before phase {next_index}"
+                                f" (after phase {phase.index})"
+                            ),
+                        )
                     except _StopRequestedError:
                         self.plan.status = PlanStatus.CANCELLED
                         self._persist()
@@ -558,6 +566,21 @@ class TumbleRunner:
         with contextlib.suppress(asyncio.CancelledError):
             await stop_task
         await sleep_task
+
+    async def _wait_interruptibly_with_progress(self, seconds: float, *, label: str) -> None:
+        """Sleep for ``seconds``, emitting a single start log with local ETA."""
+        if seconds <= 0:
+            return
+        started = _now()
+        eta = started + _td_from_seconds(seconds)
+        eta_local = eta.astimezone() if eta.tzinfo is not None else eta
+        logger.info(
+            "tumbler: {} -- sleeping {:.0f}s (until {})",
+            label,
+            seconds,
+            eta_local.isoformat(timespec="seconds"),
+        )
+        await self._wait_interruptibly(seconds)
 
     async def _wait_for_phase_confirmations(self, phase: Phase) -> None:
         """Wait for the phase's broadcast txid(s) to reach the confirmation gate.

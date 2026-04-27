@@ -1282,3 +1282,68 @@ class TestConfirmationGate:
         result = await TumbleRunner(plan, ctx).run()
         assert result.status == PlanStatus.COMPLETED
         assert observed_txids and observed_txids[0] is not None
+
+
+class TestInterPhaseWaitLogging:
+    """The inter-phase ``wait_seconds`` delay must be visible in the logs.
+
+    Without this, an operator watching the journal sees the confirmation
+    gate clear and then nothing for hours -- indistinguishable from the
+    runner being stuck. The runner emits a single start/eta line.
+    """
+
+    async def test_inter_phase_wait_emits_single_local_eta_log(
+        self, tmp_path: Path, caplog: Any
+    ) -> None:
+        import logging
+
+        from loguru import logger as loguru_logger
+
+        plan = _plan(tmp_path)
+        plan.phases = plan.phases[:2]
+        # Set a non-trivial wait so the wait branch fires; sleep is
+        # patched to a no-op so the test runs instantly.
+        plan.phases[0].wait_seconds = 600.0
+
+        # Bridge loguru -> stdlib logging so caplog captures runner output.
+        class _PropagateHandler(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                logging.getLogger(record.name).handle(record)
+
+        sink_id = loguru_logger.add(_PropagateHandler(), level="INFO", format="{message}")
+        try:
+            caplog.set_level(logging.INFO)
+
+            async def make_taker(phase: Any) -> FakeTaker:
+                return FakeTaker(phase)
+
+            async def get_confirmations(_txid: str) -> int | None:
+                return 99  # immediately satisfy the confirmation gate
+
+            async def zero_sleep(_: float) -> None:
+                return None
+
+            ctx = RunnerContext(
+                wallet_service=FakeWalletService(),  # type: ignore[arg-type]
+                wallet_name="RunnerTest",
+                data_dir=tmp_path,
+                taker_factory=make_taker,
+                sleep=zero_sleep,
+                min_confirmations_between_phases=2,
+                get_confirmations=get_confirmations,
+                confirmation_poll_interval=0.0,
+            )
+            result = await TumbleRunner(plan, ctx).run()
+        finally:
+            loguru_logger.remove(sink_id)
+
+        assert result.status == PlanStatus.COMPLETED
+        wait_logs = [
+            r.getMessage()
+            for r in caplog.records
+            if "inter-phase delay before phase 1" in r.getMessage()
+        ]
+        assert len(wait_logs) == 1, f"expected single wait log; got {wait_logs}"
+        assert "sleeping 600s" in wait_logs[0]
+        assert "until " in wait_logs[0]
+        assert "+" in wait_logs[0] or "-" in wait_logs[0], wait_logs[0]
