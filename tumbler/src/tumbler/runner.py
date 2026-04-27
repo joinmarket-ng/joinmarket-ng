@@ -102,6 +102,24 @@ class RunnerContext:
     # Polling interval for ``get_confirmations``. Tests override this to
     # keep runs fast.
     confirmation_poll_interval: float = 5.0
+    # How often to emit a "still waiting" progress log while the
+    # confirmation gate polls. Independent of ``confirmation_poll_interval``
+    # so we can poll often (cheap) but log sparingly. Set to ``0`` to log
+    # on every poll.
+    confirmation_progress_log_interval: float = 60.0
+    # Maximum wall-clock seconds the confirmation gate will keep waiting
+    # when the backend has *never* returned a numeric confirmation count
+    # for the broadcast txid. Some light-client backends (e.g. neutrino)
+    # cannot resolve arbitrary transactions by txid and ``get_transaction``
+    # always returns ``None``; without this fallback the runner would stall
+    # forever between phases. After this timeout we log a clear warning
+    # and proceed to the inter-phase wait, trusting the broadcast we
+    # already observed. If the backend has returned at least one numeric
+    # confirmation count, the gate stays in standard polling mode (the
+    # backend can see the tx, it just hasn't matured yet) and this
+    # timeout does not apply. Set to ``0`` to disable the fallback (the
+    # original always-block behaviour).
+    confirmation_unknown_timeout: float = 1800.0
     # Delay before retrying a failed taker phase. Applied with a simple
     # linear backoff: ``retry_delay_seconds * attempt_count``.
     retry_delay_seconds: float = 30.0
@@ -161,6 +179,10 @@ class TumbleRunner:
                     self.plan.status = PlanStatus.CANCELLED
                     self._persist()
                     return self.plan
+                # Persist the completed phase (including its broadcast txid)
+                # *before* the confirmation gate so the txid hits disk even
+                # if the gate runs for hours or jmwalletd is restarted.
+                self._persist()
                 # Before advancing, wait for the phase's output(s) to reach
                 # ``taker_utxo_age`` confirmations so the next phase does not
                 # try to spend an unconfirmed UTXO. This mirrors the reference
@@ -543,6 +565,12 @@ class TumbleRunner:
         Raises ``_StopRequestedError`` if a stop is signalled while polling.
         Silently returns if the gate is disabled, no callback is wired, or the
         phase produced no txids (e.g., a maker session).
+
+        If the backend never returns a numeric confirmation count (e.g.
+        neutrino, which cannot resolve arbitrary transactions by txid), the
+        gate falls back to the inter-phase wait after
+        ``confirmation_unknown_timeout`` seconds so the plan can keep
+        progressing instead of stalling forever.
         """
         min_conf = self.ctx.min_confirmations_between_phases
         if min_conf <= 0:
@@ -553,8 +581,21 @@ class TumbleRunner:
         txids = _phase_txids(phase)
         if not txids:
             return
+        poll_interval = self.ctx.confirmation_poll_interval
+        progress_interval = self.ctx.confirmation_progress_log_interval
+        unknown_timeout = self.ctx.confirmation_unknown_timeout
         for txid in txids:
-            logger.info("tumbler: waiting for txid {} to reach {} confirmations", txid, min_conf)
+            logger.info(
+                "tumbler: waiting for txid {} to reach {} confirmations (polling every {:.0f}s)",
+                txid,
+                min_conf,
+                poll_interval,
+            )
+            wait_started = _now()
+            last_progress_log = wait_started
+            ever_resolved = False
+            poll_count = 0
+            unknown_warned = False
             while True:
                 if self._stop_requested.is_set():
                     raise _StopRequestedError()
@@ -563,12 +604,65 @@ class TumbleRunner:
                 except Exception:  # pragma: no cover - transient backend errors
                     logger.exception("get_confirmations({}) failed; retrying", txid)
                     confirmations = None
-                if confirmations is not None and confirmations >= min_conf:
+                poll_count += 1
+                if confirmations is not None:
+                    ever_resolved = True
+                    if confirmations >= min_conf:
+                        logger.info(
+                            "tumbler: txid {} reached {} confirmations after {:.0f}s",
+                            txid,
+                            confirmations,
+                            (_now() - wait_started).total_seconds(),
+                        )
+                        break
+                # Periodic progress log so the user can see the runner is
+                # alive even when the backend is slow or silent.
+                now = _now()
+                elapsed = (now - wait_started).total_seconds()
+                since_last_log = (now - last_progress_log).total_seconds()
+                if progress_interval <= 0 or since_last_log >= progress_interval:
+                    if confirmations is None:
+                        logger.info(
+                            "tumbler: txid {} still unresolved by backend "
+                            "after {:.0f}s ({} polls); will keep polling",
+                            txid,
+                            elapsed,
+                            poll_count,
+                        )
+                    else:
+                        logger.info(
+                            "tumbler: txid {} at {}/{} confirmations after {:.0f}s",
+                            txid,
+                            confirmations,
+                            min_conf,
+                            elapsed,
+                        )
+                    last_progress_log = now
+                # Fallback: if the backend has *never* resolved this txid
+                # (e.g. neutrino), break the gate after the configured
+                # timeout so the plan can proceed to the inter-phase wait.
+                if not ever_resolved and unknown_timeout > 0 and elapsed >= unknown_timeout:
+                    if not unknown_warned:
+                        logger.warning(
+                            "tumbler: backend cannot resolve txid {} after "
+                            "{:.0f}s ({} polls). The broadcast was already "
+                            "logged so the transaction is on the network; "
+                            "continuing to the inter-phase wait without "
+                            "confirming the {}-confirmation gate. If your "
+                            "backend supports get_transaction (Bitcoin Core "
+                            "or mempool.space), confirmations would be "
+                            "tracked normally.",
+                            txid,
+                            elapsed,
+                            poll_count,
+                            min_conf,
+                        )
+                        unknown_warned = True
                     break
                 try:
                     await asyncio.wait_for(
                         self._stop_requested.wait(),
-                        timeout=self.ctx.confirmation_poll_interval,
+                        timeout=poll_interval,
                     )
                 except TimeoutError:
                     continue

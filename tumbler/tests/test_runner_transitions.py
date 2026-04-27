@@ -1139,3 +1139,146 @@ class TestConfirmationGate:
         runner = TumbleRunner(plan, _ctx(tmp_path, taker_factory=make_taker))
         result = await runner.run()
         assert result.status == PlanStatus.COMPLETED
+
+    async def test_unknown_txid_falls_back_after_timeout(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        """Light-client backends (e.g. neutrino) cannot resolve arbitrary
+        txids, so ``get_confirmations`` returns ``None`` indefinitely. The
+        gate must fall back to the inter-phase wait after
+        ``confirmation_unknown_timeout`` instead of stalling forever.
+        """
+        from datetime import UTC, datetime, timedelta
+
+        from tumbler import runner as runner_mod
+
+        plan = _plan(tmp_path)
+        plan.phases = plan.phases[:2]
+
+        async def make_taker(phase: Any) -> FakeTaker:
+            return FakeTaker(phase)
+
+        polls = 0
+
+        async def get_confirmations(_txid: str) -> int | None:
+            nonlocal polls
+            polls += 1
+            return None  # backend never resolves the txid
+
+        # Drive a virtual clock so the timeout triggers without real waits.
+        base = datetime(2026, 1, 1, tzinfo=UTC)
+        ticks = {"n": 0}
+
+        def fake_now() -> datetime:
+            # Advance by 60s every call so the 300s timeout is reached
+            # within a handful of polls.
+            ticks["n"] += 1
+            return base + timedelta(seconds=60 * ticks["n"])
+
+        monkeypatch.setattr(runner_mod, "_now", fake_now)
+
+        async def zero_sleep(_: float) -> None:
+            return None
+
+        ctx = RunnerContext(
+            wallet_service=FakeWalletService(),  # type: ignore[arg-type]
+            wallet_name="RunnerTest",
+            data_dir=tmp_path,
+            taker_factory=make_taker,
+            sleep=zero_sleep,
+            min_confirmations_between_phases=2,
+            get_confirmations=get_confirmations,
+            confirmation_poll_interval=0.0,
+            confirmation_progress_log_interval=0.0,
+            confirmation_unknown_timeout=300.0,
+        )
+        result = await TumbleRunner(plan, ctx).run()
+        assert result.status == PlanStatus.COMPLETED
+        # We polled at least until the timeout fired and then proceeded.
+        assert polls >= 1
+        # The first phase's txid was persisted to disk before the gate ran,
+        # so a restart could resume from a known broadcast txid.
+        first_phase = result.phases[0]
+        assert isinstance(first_phase, TakerCoinjoinPhase)
+        assert first_phase.txid is not None
+
+    async def test_unknown_timeout_disabled_keeps_polling(self, tmp_path: Path) -> None:
+        """``confirmation_unknown_timeout=0`` preserves the strict legacy
+        behaviour: keep polling until the txid resolves, even if it takes
+        many polls of ``None``."""
+        plan = _plan(tmp_path)
+        plan.phases = plan.phases[:2]
+
+        async def make_taker(phase: Any) -> FakeTaker:
+            return FakeTaker(phase)
+
+        polls = 0
+
+        async def get_confirmations(_txid: str) -> int | None:
+            nonlocal polls
+            polls += 1
+            # First 3 polls: unresolved. Then start returning real numbers.
+            if polls < 4:
+                return None
+            return polls - 3  # 1, 2, 3, ...
+
+        async def zero_sleep(_: float) -> None:
+            return None
+
+        ctx = RunnerContext(
+            wallet_service=FakeWalletService(),  # type: ignore[arg-type]
+            wallet_name="RunnerTest",
+            data_dir=tmp_path,
+            taker_factory=make_taker,
+            sleep=zero_sleep,
+            min_confirmations_between_phases=2,
+            get_confirmations=get_confirmations,
+            confirmation_poll_interval=0.0,
+            confirmation_unknown_timeout=0.0,  # disabled
+        )
+        result = await TumbleRunner(plan, ctx).run()
+        assert result.status == PlanStatus.COMPLETED
+        # Polled past the unresolved phase and into the resolving phase.
+        assert polls >= 5
+
+    async def test_phase_txid_persisted_before_confirmation_gate(self, tmp_path: Path) -> None:
+        """The phase's broadcast txid must hit disk *before* the runner
+        enters the (potentially long) confirmation wait, so a daemon
+        restart mid-wait does not lose the broadcast record."""
+        plan = _plan(tmp_path)
+        plan.phases = plan.phases[:2]
+
+        observed_txids: list[str | None] = []
+
+        async def make_taker(phase: Any) -> FakeTaker:
+            return FakeTaker(phase)
+
+        first_seen = {"done": False}
+
+        async def get_confirmations(txid: str) -> int | None:
+            # On the first poll, snapshot the persisted plan from disk to
+            # confirm the txid was already saved.
+            if not first_seen["done"]:
+                first_seen["done"] = True
+                persisted = load_plan(plan.wallet_name, tmp_path)
+                first_persisted_phase = persisted.phases[0]
+                assert isinstance(first_persisted_phase, TakerCoinjoinPhase)
+                observed_txids.append(first_persisted_phase.txid)
+            return 99  # immediately satisfy the gate
+
+        async def zero_sleep(_: float) -> None:
+            return None
+
+        ctx = RunnerContext(
+            wallet_service=FakeWalletService(),  # type: ignore[arg-type]
+            wallet_name="RunnerTest",
+            data_dir=tmp_path,
+            taker_factory=make_taker,
+            sleep=zero_sleep,
+            min_confirmations_between_phases=2,
+            get_confirmations=get_confirmations,
+            confirmation_poll_interval=0.0,
+        )
+        result = await TumbleRunner(plan, ctx).run()
+        assert result.status == PlanStatus.COMPLETED
+        assert observed_txids and observed_txids[0] is not None
