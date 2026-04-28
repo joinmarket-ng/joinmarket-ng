@@ -140,4 +140,12 @@ Legacy entries written before per-wallet tagging have an empty fingerprint and
 are hidden from filtered views; pass `--all-wallets` to `jm-wallet history` to
 see them.
 
+### Viewing the Seed (`jm-wallet showseed`)
+
+`jm-wallet showseed -f <mnemonic-file>` prints the BIP39 seed words after
+prompting for the password (when the file is encrypted). The command is
+intentionally guarded by a `y/N` confirmation; pass `--yes` to skip it in
+scripts. Seed words give full control of the funds: only run the command in
+a private setting, and never paste the output anywhere.
+
 ---

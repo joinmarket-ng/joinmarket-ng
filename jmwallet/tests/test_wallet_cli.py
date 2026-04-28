@@ -1523,3 +1523,97 @@ def test_prompt_for_password_without_path_generic() -> None:
         _prompt_for_password()
 
     assert "mnemonic file password" in captured["text"].lower()
+
+
+# ============================================================================
+# showseed subcommand (issue #474)
+# ============================================================================
+
+
+_SHOWSEED_MNEMONIC = (
+    "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+)
+
+
+def test_showseed_encrypted_with_password_prints_words() -> None:
+    """Encrypted wallet + correct password decrypts and prints all 12 words."""
+    password = "correct_horse_battery_staple"
+    with tempfile.TemporaryDirectory() as tmpdir:
+        wallet = _make_encrypted_wallet(tmpdir, password)
+        result = runner.invoke(
+            app,
+            ["showseed", "-f", str(wallet), "-p", password, "--yes"],
+        )
+        assert result.exit_code == 0, result.stdout
+        for word in _SHOWSEED_MNEMONIC.split():
+            assert word in result.stdout
+        # Numbered output by default.
+        assert " 1. abandon" in result.stdout
+        assert "12. about" in result.stdout
+
+
+def test_showseed_encrypted_wrong_password_errors() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        wallet = _make_encrypted_wallet(tmpdir, "right_password")
+        result = runner.invoke(
+            app,
+            ["showseed", "-f", str(wallet), "-p", "wrong_password", "--yes"],
+        )
+        assert result.exit_code == 1
+        assert "incorrect password" in result.stdout.lower()
+
+
+def test_showseed_plaintext_wallet_works_without_password() -> None:
+    """Plaintext mnemonic files should be readable without a password."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out = Path(tmpdir) / "plain.mnemonic"
+        out.write_text(_SHOWSEED_MNEMONIC)
+        result = runner.invoke(
+            app,
+            ["showseed", "-f", str(out), "--yes", "--no-numbered"],
+        )
+        assert result.exit_code == 0, result.stdout
+        assert _SHOWSEED_MNEMONIC in result.stdout
+
+
+def test_showseed_missing_file_exits_nonzero() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        missing = Path(tmpdir) / "missing.mnemonic"
+        result = runner.invoke(
+            app,
+            ["showseed", "-f", str(missing), "--yes"],
+        )
+        assert result.exit_code == 1
+        assert "not found" in result.stdout.lower()
+
+
+def test_showseed_aborts_without_yes_flag() -> None:
+    """Without --yes, the user must confirm interactively. Sending 'n' aborts."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out = Path(tmpdir) / "plain.mnemonic"
+        out.write_text(_SHOWSEED_MNEMONIC)
+        result = runner.invoke(
+            app,
+            ["showseed", "-f", str(out)],
+            input="n\n",
+        )
+        assert result.exit_code == 1
+        assert "aborted" in result.stdout.lower()
+        # Seed must NOT leak when the user declines.
+        assert "abandon" not in result.stdout.lower().replace("aborted", "")
+
+
+def test_showseed_password_via_env_var() -> None:
+    password = "env_password_42"
+    with tempfile.TemporaryDirectory() as tmpdir:
+        wallet = _make_encrypted_wallet(tmpdir, password)
+        result = runner.invoke(
+            app,
+            ["showseed", "-f", str(wallet), "--yes"],
+            env={"MNEMONIC_PASSWORD": password},
+        )
+        assert result.exit_code == 0, result.stdout
+        assert "abandon" in result.stdout
+        # Warning is sent to stderr; CliRunner mixes streams by default but the
+        # word "WARNING" must appear somewhere in the captured output.
+        assert "WARNING" in result.output

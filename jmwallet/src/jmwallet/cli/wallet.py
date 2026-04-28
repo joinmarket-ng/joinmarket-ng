@@ -907,3 +907,114 @@ def validate(
     else:
         print("Mnemonic is INVALID")
         raise typer.Exit(1)
+
+
+@app.command()
+def showseed(
+    mnemonic_file: Annotated[
+        Path,
+        typer.Option(
+            "--mnemonic-file",
+            "-f",
+            help="Path to the mnemonic file",
+            envvar="MNEMONIC_FILE",
+        ),
+    ],
+    password: Annotated[
+        str | None,
+        typer.Option(
+            "--password",
+            "-p",
+            help=(
+                "Password for an encrypted mnemonic file. If not given, the "
+                "MNEMONIC_PASSWORD env var is used, otherwise an interactive "
+                "prompt is shown."
+            ),
+            envvar="MNEMONIC_PASSWORD",
+        ),
+    ] = None,
+    numbered: Annotated[
+        bool,
+        typer.Option(
+            "--numbered/--no-numbered",
+            help="Print each seed word on its own line, prefixed with its index.",
+        ),
+    ] = True,
+    yes: Annotated[
+        bool,
+        typer.Option(
+            "--yes",
+            "-y",
+            help="Skip the interactive 'Are you sure?' confirmation. Use with care.",
+        ),
+    ] = False,
+) -> None:
+    """Display the BIP39 seed words (mnemonic) of an existing wallet.
+
+    Reads the encrypted ``.mnemonic`` file produced by ``jm-wallet generate``
+    (or any compatible wallet) and prints the seed words to stdout.
+
+    SECURITY:
+    - The seed words give full control over all funds. Never share them, never
+      type them into a website, never store them in cloud sync.
+    - Only run this command in a private setting. Output goes to stdout in
+      plaintext; redirect carefully.
+    - The password is required when the mnemonic file is encrypted.
+    """
+    if not mnemonic_file.exists():
+        print(f"Error: Mnemonic file not found: {mnemonic_file}")
+        raise typer.Exit(1)
+
+    # Try plaintext load first; if encrypted, prompt for / use password.
+    try:
+        mnemonic = load_mnemonic_file(mnemonic_file)
+    except ValueError as e:
+        if "encrypted" in str(e).lower():
+            if not password:
+                password = typer.prompt("Enter password to decrypt mnemonic file", hide_input=True)
+            try:
+                mnemonic = load_mnemonic_file(mnemonic_file, password)
+            except ValueError as e2:
+                msg = str(e2).lower()
+                if "decryption failed" in msg or "wrong password" in msg:
+                    print("Error: Incorrect password.")
+                else:
+                    print(f"Error: {e2}")
+                raise typer.Exit(1)
+            except FileNotFoundError as e2:
+                print(f"Error: {e2}")
+                raise typer.Exit(1)
+        else:
+            print(f"Error: {e}")
+            raise typer.Exit(1)
+    except FileNotFoundError as e:
+        print(f"Error: {e}")
+        raise typer.Exit(1)
+
+    if not yes:
+        # Interactive guard so seed words are never accidentally splashed on
+        # a shared terminal (e.g. when the user mistypes another command).
+        confirm = typer.confirm(
+            "About to print the BIP39 seed words to stdout. "
+            "Are you in a private setting and sure you want to continue?",
+            default=False,
+        )
+        if not confirm:
+            print("Aborted.")
+            raise typer.Exit(1)
+
+    words = mnemonic.strip().split()
+
+    typer.secho(
+        "WARNING: Anyone with these words can spend all your funds. "
+        "Do not share them, photograph them, or paste them into any website.",
+        fg=typer.colors.RED,
+        bold=True,
+        err=True,
+    )
+
+    if numbered:
+        for i, word in enumerate(words, start=1):
+            print(f"{i:2d}. {word}")
+    else:
+        print(mnemonic.strip())
