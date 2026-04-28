@@ -31,6 +31,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Usage: docker build --build-arg SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) ...
 ARG SOURCE_DATE_EPOCH
 
+# Stamp the commit/ref into the built wheels so the running TUI can
+# show "main / abc1234" instead of falling back to the static version
+# string (issue #451). When omitted the build hook falls back to live
+# git, then to nothing.
+ARG JOINMARKET_BUILD_COMMIT
+ARG JOINMARKET_BUILD_REF
+ENV JOINMARKET_BUILD_COMMIT=${JOINMARKET_BUILD_COMMIT}
+ENV JOINMARKET_BUILD_REF=${JOINMARKET_BUILD_REF}
+
 # Pin build tools for reproducible builds (re-declare to inherit global ARGs)
 ARG SETUPTOOLS_VERSION
 ARG WHEEL_VERSION
@@ -54,6 +63,7 @@ RUN if [ -n "$SOURCE_DATE_EPOCH" ]; then export SOURCE_DATE_EPOCH=$SOURCE_DATE_E
 # WHEEL metadata (Generator: setuptools x.y.z) and breaking layer reproducibility.
 COPY jmcore/src /build/jmcore/src
 COPY jmcore/pyproject.toml /build/jmcore/
+COPY jmcore/setup.py /build/jmcore/
 RUN if [ -n "$SOURCE_DATE_EPOCH" ]; then export SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH; fi && \
     pip install --no-cache-dir --user --build-constraint /build/constraints.txt "/build/jmcore"
 

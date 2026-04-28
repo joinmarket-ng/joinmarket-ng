@@ -10,9 +10,20 @@ from jmcore.version import (
     UpdateCheckResult,
     _parse_version_tag,
     check_for_updates_from_github,
+    get_build_ref,
     get_commit_hash,
     get_version,
 )
+
+
+def _hide_build_info() -> dict[str, object]:
+    """Make ``import jmcore._build_info`` raise ImportError.
+
+    Used by tests that exercise the live-git fallback path; without this,
+    a wheel built with ``setup.py`` (or a previous test run) may have left
+    ``_build_info.py`` on disk and short-circuit the chain.
+    """
+    return {"jmcore._build_info": None}
 
 
 class TestGetCommitHash:
@@ -26,16 +37,49 @@ class TestGetCommitHash:
         assert all(c in "0123456789abcdef" for c in result)
 
     def test_returns_none_when_git_missing(self) -> None:
-        """When git is not found, return None."""
-        with patch("subprocess.run", side_effect=FileNotFoundError):
+        """When git is not found and no _build_info, return None."""
+        with (
+            patch.dict("sys.modules", _hide_build_info()),
+            patch("subprocess.run", side_effect=FileNotFoundError),
+        ):
             assert get_commit_hash() is None
 
     def test_returns_none_on_failure(self) -> None:
-        """When git command fails, return None."""
+        """When git command fails and no _build_info, return None."""
         mock_result = MagicMock()
         mock_result.returncode = 128
-        with patch("subprocess.run", return_value=mock_result):
+        with (
+            patch.dict("sys.modules", _hide_build_info()),
+            patch("subprocess.run", return_value=mock_result),
+        ):
             assert get_commit_hash() is None
+
+    def test_prefers_build_info_over_git(self) -> None:
+        """A stamped _build_info.COMMIT must take precedence over git."""
+        fake_module = MagicMock()
+        fake_module.COMMIT = "deadbee"
+        fake_module.REF = "main"
+        with patch.dict("sys.modules", {"jmcore._build_info": fake_module}):
+            assert get_commit_hash() == "deadbee"
+            assert get_build_ref() == "main"
+
+    def test_falls_back_to_git_when_build_info_empty(self) -> None:
+        """An empty _build_info.COMMIT must NOT shadow the live git lookup."""
+        fake_module = MagicMock()
+        fake_module.COMMIT = ""
+        fake_module.REF = ""
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = "abc1234\n"
+        with (
+            patch.dict("sys.modules", {"jmcore._build_info": fake_module}),
+            patch("subprocess.run", return_value=mock_result),
+        ):
+            assert get_commit_hash() == "abc1234"
+
+    def test_get_build_ref_returns_none_when_unstamped(self) -> None:
+        with patch.dict("sys.modules", _hide_build_info()):
+            assert get_build_ref() is None
 
 
 class TestParseVersionTag:

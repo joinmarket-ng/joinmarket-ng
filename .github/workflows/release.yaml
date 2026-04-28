@@ -181,6 +181,8 @@ jobs:
           build-args: |
             VERSION=${{ needs.create-release.outputs.version }}
             SOURCE_DATE_EPOCH=${{ env.SOURCE_DATE_EPOCH }}
+            JOINMARKET_BUILD_COMMIT=${{ github.sha }}
+            JOINMARKET_BUILD_REF=${{ github.ref_name }}
         env:
           SOURCE_DATE_EPOCH: ${{ env.SOURCE_DATE_EPOCH }}
 

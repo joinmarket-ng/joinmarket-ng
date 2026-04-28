@@ -31,10 +31,27 @@ def get_version() -> str:
 def get_commit_hash() -> str | None:
     """Return the short git commit hash, or None if unavailable.
 
-    This runs ``git rev-parse --short HEAD`` from the package directory.
-    Returns None when git is not installed, the code is not in a git repo,
-    or the command fails for any other reason.
+    Resolution order:
+
+    1. ``jmcore._build_info.COMMIT`` -- written at wheel build time by
+       ``setup.py``. This is the only source that survives non-editable
+       installs (``pip install git+...``, Docker, release wheels) where
+       the package directory has no ``.git``.
+    2. Live ``git rev-parse --short HEAD`` from the package directory.
+       Works for editable installs (``pip install -e``) where the source
+       tree retains its working ``.git``.
+    3. ``None`` when neither source produced a hash.
     """
+    try:
+        from jmcore import _build_info  # type: ignore[attr-defined,import-not-found]
+
+        commit = getattr(_build_info, "COMMIT", "") or ""
+        commit = commit.strip()
+        if commit:
+            return commit
+    except ImportError:
+        pass
+
     import subprocess
     from pathlib import Path
 
@@ -47,8 +64,29 @@ def get_commit_hash() -> str | None:
             cwd=Path(__file__).parent,
         )
         if result.returncode == 0:
-            return result.stdout.strip()
+            return result.stdout.strip() or None
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+    return None
+
+
+def get_build_ref() -> str | None:
+    """Return the branch or tag the package was built from, if known.
+
+    Populated by ``setup.py`` from the ``JOINMARKET_BUILD_REF`` environment
+    variable (set by ``install.sh``) or, as a fallback, the local ``git``
+    branch/tag when building from a working tree. Non-editable installs
+    that lack both leave this as ``None``; callers should treat that as
+    "unknown" rather than "stable".
+    """
+    try:
+        from jmcore import _build_info  # type: ignore[attr-defined,import-not-found]
+
+        ref = getattr(_build_info, "REF", "") or ""
+        ref = ref.strip()
+        if ref:
+            return ref
+    except ImportError:
         pass
     return None
 

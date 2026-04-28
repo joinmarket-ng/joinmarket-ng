@@ -18,6 +18,10 @@ parts/
 sdist/
 var/
 wheels/
+
+# Generated at build time by per-package setup.py to record the commit
+# the wheel was built from. Never commit this file.
+**/src/*/_build_info.py
 *.egg-info/
 .installed.cfg
 *.egg

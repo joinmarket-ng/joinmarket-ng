@@ -397,6 +397,17 @@ install_packages() {
 
     local git_base="git+https://github.com/${GITHUB_REPO}.git@${VERSION}"
 
+    # Stamp commit/ref into the built wheels so the TUI can display them
+    # post-install (issue #451). Resolve VERSION (may be a tag, branch, or
+    # commit) to a short hash; on failure we leave the env unset and the
+    # build hook will fall back to live git.
+    local install_commit
+    install_commit=$(resolve_to_commit_hash "$VERSION" 2>/dev/null || echo "")
+    if [ -n "$install_commit" ] && [ "$install_commit" != "$VERSION" ]; then
+        export JOINMARKET_BUILD_COMMIT="${install_commit:0:7}"
+    fi
+    export JOINMARKET_BUILD_REF="$VERSION"
+
     # Always install core libraries
     print_info "Installing jmcore..."
     pip install "${git_base}#subdirectory=jmcore" --quiet
@@ -449,6 +460,12 @@ update_packages() {
     fi
 
     local git_base="git+https://github.com/${GITHUB_REPO}.git@${commit_hash}"
+
+    # Stamp the commit/ref into the wheels so the running TUI can
+    # display them later. Each package's setup.py picks these up
+    # (issue #451).
+    export JOINMARKET_BUILD_COMMIT="${commit_hash:0:7}"
+    export JOINMARKET_BUILD_REF="$VERSION"
 
     # Update core libraries (force reinstall to handle same version, different commit)
     print_info "Updating jmcore..."
