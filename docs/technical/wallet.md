@@ -122,4 +122,22 @@ Both maker and taker support periodic rescanning:
 
 **Taker:** Rescans between schedule entries to track pending confirmations.
 
+### Multiple Wallets in One Data Directory
+
+JoinMarket-NG records every CoinJoin (as taker or maker) in a single
+`coinjoin_history.csv` file inside the data directory. Each row is tagged with
+the BIP32 master fingerprint (`wallet_fingerprint`, first 4 bytes of `m/0`),
+so commands like `jm-wallet history` and `jm-wallet info` filter to the
+correct wallet automatically when a mnemonic is supplied.
+
+Recommended practice is still to give each wallet its own data directory via
+the `JOINMARKET_DATA_DIR` env variable or the `--data-dir` flag. This keeps
+config, logs, and the order registry per-wallet, and avoids cases where one
+wallet sees pending entries created by another (still tracked correctly, just
+visually noisy).
+
+Legacy entries written before per-wallet tagging have an empty fingerprint and
+are hidden from filtered views; pass `--all-wallets` to `jm-wallet history` to
+see them.
+
 ---

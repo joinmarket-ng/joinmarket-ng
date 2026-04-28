@@ -76,6 +76,17 @@ class TransactionHistoryEntry:
     # Network
     network: str = "mainnet"
 
+    # Wallet identity (issue #473): scopes the entry to a specific wallet so
+    # that switching wallets from the same data directory does not surface
+    # another wallet's history (and especially not its phantom pending
+    # transactions). The value is the BIP32 master m/0 fingerprint hex
+    # (8 chars) of the wallet that produced the entry. Defaults to an empty
+    # string for backwards compatibility with pre-existing CSV files written
+    # before this column existed; legacy rows are treated as belonging to no
+    # known wallet and are therefore filtered out when a wallet filter is
+    # active.
+    wallet_fingerprint: str = ""
+
 
 def _get_history_path(data_dir: Path | None = None) -> Path:
     """
@@ -176,6 +187,7 @@ def read_history(
     data_dir: Path | None = None,
     limit: int | None = None,
     role_filter: Literal["maker", "taker"] | None = None,
+    wallet_fingerprint: str | None = None,
 ) -> list[TransactionHistoryEntry]:
     """
     Read transaction history from the CSV file.
@@ -184,6 +196,11 @@ def read_history(
         data_dir: Optional data directory (defaults to get_default_data_dir())
         limit: Maximum number of entries to return (most recent first)
         role_filter: Filter by role (maker/taker)
+        wallet_fingerprint: If provided, only return entries belonging to this
+            wallet (matched by their ``wallet_fingerprint`` column). Entries
+            without a recorded fingerprint (legacy rows from before issue #473)
+            are excluded from the filtered view to prevent another wallet's
+            entries from leaking into the active wallet's history.
 
     Returns:
         List of TransactionHistoryEntry objects
@@ -228,11 +245,19 @@ def read_history(
                         utxos_used=row.get("utxos_used", ""),
                         broadcast_method=row.get("broadcast_method", ""),
                         network=row.get("network", "mainnet"),
+                        wallet_fingerprint=row.get("wallet_fingerprint", ""),
                     )
 
                     # Apply role filter
                     if role_filter and entry.role != role_filter:
                         continue
+
+                    # Apply wallet filter (issue #473): legacy rows without a
+                    # recorded fingerprint do not match any specific wallet
+                    # and are therefore hidden from the per-wallet view.
+                    if wallet_fingerprint is not None:
+                        if entry.wallet_fingerprint != wallet_fingerprint:
+                            continue
 
                     entries.append(entry)
                 except (ValueError, KeyError) as e:
@@ -330,14 +355,22 @@ def _compute_stats(entries: list[TransactionHistoryEntry]) -> dict[str, int | fl
     }
 
 
-def get_history_stats(data_dir: Path | None = None) -> dict[str, int | float]:
+def get_history_stats(
+    data_dir: Path | None = None,
+    wallet_fingerprint: str | None = None,
+) -> dict[str, int | float]:
     """
     Get aggregate statistics from transaction history.
+
+    Args:
+        data_dir: Optional data directory.
+        wallet_fingerprint: If provided, restrict statistics to entries
+            belonging to the given wallet (issue #473).
 
     Returns:
         Dict with statistics (see _compute_stats for full list).
     """
-    entries = read_history(data_dir)
+    entries = read_history(data_dir, wallet_fingerprint=wallet_fingerprint)
     return _compute_stats(entries)
 
 
@@ -345,6 +378,7 @@ def get_history_stats_for_period(
     hours: float,
     role_filter: Literal["maker", "taker"] | None = None,
     data_dir: Path | None = None,
+    wallet_fingerprint: str | None = None,
 ) -> dict[str, int | float]:
     """
     Get aggregate statistics for a specific time period.
@@ -358,11 +392,13 @@ def get_history_stats_for_period(
         hours: Number of hours to look back (e.g., 24 for daily, 168 for weekly)
         role_filter: Optional filter by role ("maker" or "taker")
         data_dir: Optional data directory
+        wallet_fingerprint: If provided, restrict statistics to entries
+            belonging to the given wallet (issue #473).
 
     Returns:
         Dict with statistics (see _compute_stats for full list).
     """
-    entries = read_history(data_dir, role_filter=role_filter)
+    entries = read_history(data_dir, role_filter=role_filter, wallet_fingerprint=wallet_fingerprint)
 
     if not entries:
         return _compute_stats([])
@@ -391,6 +427,7 @@ def create_maker_history_entry(
     our_utxos: list[tuple[str, int]],
     txid: str | None = None,
     network: str = "mainnet",
+    wallet_fingerprint: str = "",
 ) -> TransactionHistoryEntry:
     """
     Create a history entry for a maker CoinJoin (initially marked as pending).
@@ -436,10 +473,14 @@ def create_maker_history_entry(
         change_address=change_address,
         utxos_used=",".join(f"{txid}:{vout}" for txid, vout in our_utxos),
         network=network,
+        wallet_fingerprint=wallet_fingerprint,
     )
 
 
-def get_pending_transactions(data_dir: Path | None = None) -> list[TransactionHistoryEntry]:
+def get_pending_transactions(
+    data_dir: Path | None = None,
+    wallet_fingerprint: str | None = None,
+) -> list[TransactionHistoryEntry]:
     """
     Get all pending (unconfirmed) transactions from history.
 
@@ -448,10 +489,17 @@ def get_pending_transactions(data_dir: Path | None = None) -> list[TransactionHi
     - Not yet completed (completed_at is empty) - excludes failed transactions
     - Either have a txid waiting for confirmation, or no txid yet (needs discovery)
 
+    Args:
+        data_dir: Optional data directory.
+        wallet_fingerprint: If provided, only return pending entries for the
+            given wallet (issue #473). This is what prevents another wallet's
+            phantom pending transactions from showing up under a freshly
+            generated wallet.
+
     Returns:
         List of pending entries (includes entries without txid)
     """
-    entries = read_history(data_dir)
+    entries = read_history(data_dir, wallet_fingerprint=wallet_fingerprint)
     return [e for e in entries if not e.success and e.confirmations == 0 and not e.completed_at]
 
 
@@ -459,6 +507,7 @@ def update_transaction_confirmation(
     txid: str,
     confirmations: int,
     data_dir: Path | None = None,
+    wallet_fingerprint: str | None = None,
 ) -> bool:
     """
     Update a transaction's confirmation status in the history file.
@@ -473,6 +522,9 @@ def update_transaction_confirmation(
         txid: Transaction ID to update
         confirmations: Current number of confirmations
         data_dir: Optional data directory
+        wallet_fingerprint: If provided, only match entries belonging to this
+            wallet (issue #473). Prevents updating another wallet's entry when
+            multiple wallets share the same data directory.
 
     Returns:
         True if transaction was found and updated, False otherwise
@@ -486,6 +538,8 @@ def update_transaction_confirmation(
 
     for entry in entries:
         if entry.txid == txid:
+            if wallet_fingerprint is not None and entry.wallet_fingerprint != wallet_fingerprint:
+                continue
             entry.confirmations = confirmations
             if confirmations > 0 and not entry.success:
                 # Mark as successful on first confirmation
@@ -513,6 +567,7 @@ async def update_transaction_confirmation_with_detection(
     confirmations: int,
     backend: BlockchainBackend | Any | None = None,
     data_dir: Path | None = None,
+    wallet_fingerprint: str | None = None,
 ) -> bool:
     """
     Update transaction confirmation and detect peer count for makers.
@@ -526,6 +581,8 @@ async def update_transaction_confirmation_with_detection(
         confirmations: Current number of confirmations
         backend: Blockchain backend for fetching transaction (optional, for peer detection)
         data_dir: Optional data directory
+        wallet_fingerprint: If provided, only match entries belonging to this
+            wallet (issue #473).
 
     Returns:
         True if transaction was found and updated, False otherwise
@@ -539,6 +596,8 @@ async def update_transaction_confirmation_with_detection(
 
     for entry in entries:
         if entry.txid == txid:
+            if wallet_fingerprint is not None and entry.wallet_fingerprint != wallet_fingerprint:
+                continue
             entry.confirmations = confirmations
             if confirmations > 0 and not entry.success:
                 # Mark as successful on first confirmation
@@ -582,6 +641,7 @@ def update_pending_transaction_txid(
     destination_address: str,
     txid: str,
     data_dir: Path | None = None,
+    wallet_fingerprint: str | None = None,
 ) -> bool:
     """
     Update a pending transaction's txid by matching the destination address.
@@ -593,6 +653,8 @@ def update_pending_transaction_txid(
         destination_address: The CoinJoin destination address to match
         txid: The discovered transaction ID
         data_dir: Optional data directory
+        wallet_fingerprint: If provided, only match entries belonging to this
+            wallet (issue #473).
 
     Returns:
         True if a matching entry was found and updated, False otherwise
@@ -607,6 +669,8 @@ def update_pending_transaction_txid(
     for entry in entries:
         # Match by destination address and empty txid (pending without txid)
         if entry.destination_address == destination_address and not entry.txid:
+            if wallet_fingerprint is not None and entry.wallet_fingerprint != wallet_fingerprint:
+                continue
             entry.txid = txid
             logger.info(
                 f"Updated pending transaction for {destination_address[:20]}... "
@@ -627,6 +691,7 @@ def update_awaiting_transaction_signed(
     fee_received: int,
     txfee_contribution: int,
     data_dir: Path | None = None,
+    wallet_fingerprint: str | None = None,
 ) -> bool:
     """
     Update a pending "Awaiting transaction" entry when the maker signs the tx.
@@ -641,6 +706,8 @@ def update_awaiting_transaction_signed(
         fee_received: CoinJoin fee earned
         txfee_contribution: Mining fee contribution
         data_dir: Optional data directory
+        wallet_fingerprint: If provided, only match entries belonging to this
+            wallet (issue #473).
 
     Returns:
         True if a matching entry was found and updated, False otherwise
@@ -659,6 +726,8 @@ def update_awaiting_transaction_signed(
             and entry.failure_reason == "Awaiting transaction"
             and not entry.txid  # Should not have txid yet
         ):
+            if wallet_fingerprint is not None and entry.wallet_fingerprint != wallet_fingerprint:
+                continue
             entry.txid = txid
             entry.fee_received = fee_received
             entry.txfee_contribution = txfee_contribution
@@ -683,6 +752,7 @@ def update_taker_awaiting_transaction_broadcast(
     txid: str,
     mining_fee: int,
     data_dir: Path | None = None,
+    wallet_fingerprint: str | None = None,
 ) -> bool:
     """
     Update a pending "Awaiting transaction" entry when the taker broadcasts the tx.
@@ -697,6 +767,8 @@ def update_taker_awaiting_transaction_broadcast(
         txid: The transaction ID
         mining_fee: Actual mining fee paid (may differ from estimate)
         data_dir: Optional data directory
+        wallet_fingerprint: If provided, only match entries belonging to this
+            wallet (issue #473).
 
     Returns:
         True if a matching entry was found and updated, False otherwise
@@ -717,6 +789,8 @@ def update_taker_awaiting_transaction_broadcast(
             and entry.failure_reason == "Awaiting transaction"
             and not entry.txid  # Should not have txid yet
         ):
+            if wallet_fingerprint is not None and entry.wallet_fingerprint != wallet_fingerprint:
+                continue
             entry.txid = txid
             entry.mining_fee_paid = mining_fee
             entry.net_fee = -(entry.total_maker_fees_paid + mining_fee)
@@ -739,6 +813,7 @@ def mark_pending_transaction_failed(
     failure_reason: str,
     data_dir: Path | None = None,
     txid: str | None = None,
+    wallet_fingerprint: str | None = None,
 ) -> bool:
     """
     Mark a pending transaction as failed by matching the destination address and optionally txid.
@@ -753,6 +828,8 @@ def mark_pending_transaction_failed(
         data_dir: Optional data directory
         txid: Optional transaction ID for more precise matching (when multiple entries
               share the same destination address)
+        wallet_fingerprint: If provided, only match entries belonging to this
+            wallet (issue #473).
 
     Returns:
         True if a matching entry was found and updated, False otherwise
@@ -777,6 +854,9 @@ def mark_pending_transaction_failed(
             if txid is not None and entry.txid != txid:
                 continue
 
+            if wallet_fingerprint is not None and entry.wallet_fingerprint != wallet_fingerprint:
+                continue
+
             entry.success = False
             entry.failure_reason = failure_reason
             entry.completed_at = datetime.now().isoformat()
@@ -798,6 +878,7 @@ def mark_pending_transaction_failed(
 def cleanup_stale_pending_transactions(
     max_age_minutes: int = 60,
     data_dir: Path | None = None,
+    wallet_fingerprint: str | None = None,
 ) -> int:
     """
     Mark all stale pending transactions as failed.
@@ -808,6 +889,9 @@ def cleanup_stale_pending_transactions(
     Args:
         max_age_minutes: Mark entries older than this as failed (default: 60)
         data_dir: Optional data directory
+        wallet_fingerprint: If provided, only clean up stale pending entries
+            for the given wallet (issue #473). Other wallets' pending entries
+            in the same shared CSV are left untouched.
 
     Returns:
         Number of entries marked as failed
@@ -816,6 +900,7 @@ def cleanup_stale_pending_transactions(
     if not history_path.exists():
         return 0
 
+    # Read full history (no wallet filter) so the rewrite preserves all entries
     entries = read_history(data_dir)
     count = 0
     now = datetime.now()
@@ -823,6 +908,10 @@ def cleanup_stale_pending_transactions(
     for entry in entries:
         # Only process pending entries (success=False, confirmations=0, no completed_at)
         if not entry.success and entry.confirmations == 0 and not entry.completed_at:
+            # Skip entries that don't belong to the active wallet when a
+            # filter is set so we don't mutate other wallets' pending state.
+            if wallet_fingerprint is not None and entry.wallet_fingerprint != wallet_fingerprint:
+                continue
             try:
                 timestamp = datetime.fromisoformat(entry.timestamp)
                 age_minutes = (now - timestamp).total_seconds() / 60
@@ -864,6 +953,7 @@ def create_taker_history_entry(
     network: str = "mainnet",
     success: bool = False,  # Default to pending
     failure_reason: str = "Awaiting transaction",
+    wallet_fingerprint: str = "",
 ) -> TransactionHistoryEntry:
     """
     Create a history entry for a taker CoinJoin.
@@ -918,10 +1008,14 @@ def create_taker_history_entry(
         utxos_used=",".join(f"{txid}:{vout}" for txid, vout in selected_utxos),
         broadcast_method=broadcast_method,
         network=network,
+        wallet_fingerprint=wallet_fingerprint,
     )
 
 
-def get_used_addresses(data_dir: Path | None = None) -> set[str]:
+def get_used_addresses(
+    data_dir: Path | None = None,
+    wallet_fingerprint: str | None = None,
+) -> set[str]:
     """
     Get all addresses that have been used in CoinJoin history.
 
@@ -934,11 +1028,13 @@ def get_used_addresses(data_dir: Path | None = None) -> set[str]:
 
     Args:
         data_dir: Optional data directory
+        wallet_fingerprint: If provided, only consider entries belonging to
+            the given wallet (issue #473).
 
     Returns:
         Set of addresses that should not be reused
     """
-    entries = read_history(data_dir)
+    entries = read_history(data_dir, wallet_fingerprint=wallet_fingerprint)
     used_addresses = set()
 
     for entry in entries:
@@ -950,7 +1046,10 @@ def get_used_addresses(data_dir: Path | None = None) -> set[str]:
     return used_addresses
 
 
-def get_address_history_types(data_dir: Path | None = None) -> dict[str, str]:
+def get_address_history_types(
+    data_dir: Path | None = None,
+    wallet_fingerprint: str | None = None,
+) -> dict[str, str]:
     """
     Get the history type for each address used in CoinJoin history.
 
@@ -965,11 +1064,13 @@ def get_address_history_types(data_dir: Path | None = None) -> dict[str, str]:
 
     Args:
         data_dir: Optional data directory (defaults to get_default_data_dir())
+        wallet_fingerprint: If provided, only consider entries belonging to
+            the given wallet (issue #473).
 
     Returns:
         Dict mapping address -> type string
     """
-    entries = read_history(data_dir)
+    entries = read_history(data_dir, wallet_fingerprint=wallet_fingerprint)
     address_types: dict[str, str] = {}
 
     for entry in entries:
@@ -996,7 +1097,11 @@ def get_address_history_types(data_dir: Path | None = None) -> dict[str, str]:
     return address_types
 
 
-def get_utxo_label(address: str, data_dir: Path | None = None) -> str:
+def get_utxo_label(
+    address: str,
+    data_dir: Path | None = None,
+    wallet_fingerprint: str | None = None,
+) -> str:
     """
     Get a human-readable label for a UTXO based on its address history.
 
@@ -1009,11 +1114,13 @@ def get_utxo_label(address: str, data_dir: Path | None = None) -> str:
     Args:
         address: The address to get a label for
         data_dir: Optional data directory (defaults to get_default_data_dir())
+        wallet_fingerprint: If provided, only consider entries belonging to
+            the given wallet (issue #473).
 
     Returns:
         Human-readable label for the UTXO
     """
-    history_types = get_address_history_types(data_dir)
+    history_types = get_address_history_types(data_dir, wallet_fingerprint=wallet_fingerprint)
 
     if address in history_types:
         history_type = history_types[address]
@@ -1122,6 +1229,7 @@ def update_transaction_peer_count(
 async def update_all_pending_transactions(
     backend: BlockchainBackend | Any,
     data_dir: Path | None = None,
+    wallet_fingerprint: str | None = None,
 ) -> int:
     """
     Update the status of all pending transactions using the blockchain backend.
@@ -1134,11 +1242,13 @@ async def update_all_pending_transactions(
     Args:
         backend: Blockchain backend to query transaction status
         data_dir: Optional data directory
+        wallet_fingerprint: If provided, only update pending entries for the
+            given wallet (issue #473).
 
     Returns:
         Number of transactions that were updated
     """
-    pending = get_pending_transactions(data_dir)
+    pending = get_pending_transactions(data_dir, wallet_fingerprint=wallet_fingerprint)
     if not pending:
         return 0
 

@@ -620,6 +620,7 @@ class ProtocolHandlersMixin:
                             our_utxos=our_utxos,
                             txid=None,  # Unknown until tx is signed
                             network=self.config.network.value,
+                            wallet_fingerprint=self.wallet.wallet_fingerprint,
                         )
                         # Override failure_reason to indicate addresses revealed but awaiting tx
                         history_entry.failure_reason = "Awaiting transaction"
@@ -767,6 +768,7 @@ class ProtocolHandlersMixin:
                             fee_received=fee_received,
                             txfee_contribution=txfee_contribution,
                             data_dir=self.config.data_dir,
+                            wallet_fingerprint=self.wallet.wallet_fingerprint,
                         )
                         net = fee_received - txfee_contribution
                         if updated:
@@ -788,6 +790,7 @@ class ProtocolHandlersMixin:
                                 our_utxos=our_utxos,
                                 txid=txid,
                                 network=self.config.network.value,
+                                wallet_fingerprint=self.wallet.wallet_fingerprint,
                             )
                             append_history_entry(history_entry, data_dir=self.config.data_dir)
                             logger.debug(f"Created new CoinJoin history: net fee {net} sats")

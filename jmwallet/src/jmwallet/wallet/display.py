@@ -27,6 +27,7 @@ class WalletDisplayMixin:
     fidelity_bond_locktime_cache: dict[str, int]
     root_path: str
     data_dir: Path | None
+    wallet_fingerprint: str
 
     # Methods provided by the host class
     def get_address(self, mixdepth: int, change: int, index: int) -> str:
@@ -221,7 +222,9 @@ class WalletDisplayMixin:
             if self.data_dir:
                 from jmwallet.history import get_used_addresses
 
-                used_addresses = get_used_addresses(self.data_dir)
+                used_addresses = get_used_addresses(
+                    self.data_dir, wallet_fingerprint=self.wallet_fingerprint
+                )
             else:
                 used_addresses = set()
 
@@ -284,7 +287,9 @@ class WalletDisplayMixin:
             if self.data_dir:
                 from jmwallet.history import get_used_addresses
 
-                used_addresses = get_used_addresses(self.data_dir)
+                used_addresses = get_used_addresses(
+                    self.data_dir, wallet_fingerprint=self.wallet_fingerprint
+                )
             else:
                 used_addresses = set()
 

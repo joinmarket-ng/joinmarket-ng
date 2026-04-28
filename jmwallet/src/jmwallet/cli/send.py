@@ -317,7 +317,11 @@ async def _send_transaction(
 
             # Populate labels for each UTXO based on history
             for utxo in utxos:
-                utxo.label = get_utxo_label(utxo.address, backend_settings.data_dir)
+                utxo.label = get_utxo_label(
+                    utxo.address,
+                    backend_settings.data_dir,
+                    wallet_fingerprint=wallet.wallet_fingerprint,
+                )
 
             try:
                 selected_utxos = select_utxos_interactive(utxos, amount)

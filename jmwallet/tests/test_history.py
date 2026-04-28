@@ -2176,3 +2176,108 @@ class TestAddressHistoryTypesAfterConfirmation:
         # These should be flagged since they were never used successfully
         assert history_types.get("bc1qfailed_only_addr") == "flagged"
         assert history_types.get("bc1qfailed_only_chg") == "flagged"
+
+
+class TestWalletFingerprintIsolation:
+    """Issue #473: history must be scoped per wallet via wallet_fingerprint."""
+
+    FP_A = "aabbccdd"
+    FP_B = "11223344"
+
+    def _make(self, fp: str, txid: str, addr: str) -> TransactionHistoryEntry:
+        return create_maker_history_entry(
+            taker_nick="J5taker",
+            cj_amount=100_000,
+            fee_received=10,
+            txfee_contribution=5,
+            cj_address=addr,
+            change_address="bc1qchg" + fp,
+            our_utxos=[(txid, 0)],
+            txid=txid,
+            network="regtest",
+            wallet_fingerprint=fp,
+        )
+
+    def test_read_history_filters_by_fingerprint(self, temp_data_dir: Path) -> None:
+        append_history_entry(self._make(self.FP_A, "a" * 64, "bc1qaaaa"), temp_data_dir)
+        append_history_entry(self._make(self.FP_B, "b" * 64, "bc1qbbbb"), temp_data_dir)
+
+        a_only = read_history(temp_data_dir, wallet_fingerprint=self.FP_A)
+        b_only = read_history(temp_data_dir, wallet_fingerprint=self.FP_B)
+        all_entries = read_history(temp_data_dir)
+
+        assert len(a_only) == 1 and a_only[0].destination_address == "bc1qaaaa"
+        assert len(b_only) == 1 and b_only[0].destination_address == "bc1qbbbb"
+        assert len(all_entries) == 2
+
+    def test_get_used_addresses_filters_by_fingerprint(self, temp_data_dir: Path) -> None:
+        append_history_entry(self._make(self.FP_A, "a" * 64, "bc1qaaaa"), temp_data_dir)
+        append_history_entry(self._make(self.FP_B, "b" * 64, "bc1qbbbb"), temp_data_dir)
+
+        addrs_a = get_used_addresses(temp_data_dir, wallet_fingerprint=self.FP_A)
+        addrs_b = get_used_addresses(temp_data_dir, wallet_fingerprint=self.FP_B)
+
+        assert "bc1qaaaa" in addrs_a and "bc1qbbbb" not in addrs_a
+        assert "bc1qbbbb" in addrs_b and "bc1qaaaa" not in addrs_b
+
+    def test_get_pending_transactions_scoped(self, temp_data_dir: Path) -> None:
+        # Pending entries (no txid)
+        a = create_maker_history_entry(
+            taker_nick="J5taker",
+            cj_amount=100_000,
+            fee_received=10,
+            txfee_contribution=5,
+            cj_address="bc1qaaaa",
+            change_address="bc1qchg-a",
+            our_utxos=[("a" * 64, 0)],
+            txid="",
+            network="regtest",
+            wallet_fingerprint=self.FP_A,
+        )
+        b = create_maker_history_entry(
+            taker_nick="J5taker",
+            cj_amount=200_000,
+            fee_received=20,
+            txfee_contribution=5,
+            cj_address="bc1qbbbb",
+            change_address="bc1qchg-b",
+            our_utxos=[("b" * 64, 0)],
+            txid="",
+            network="regtest",
+            wallet_fingerprint=self.FP_B,
+        )
+        append_history_entry(a, temp_data_dir)
+        append_history_entry(b, temp_data_dir)
+
+        pa = get_pending_transactions(temp_data_dir, wallet_fingerprint=self.FP_A)
+        pb = get_pending_transactions(temp_data_dir, wallet_fingerprint=self.FP_B)
+        assert len(pa) == 1 and pa[0].destination_address == "bc1qaaaa"
+        assert len(pb) == 1 and pb[0].destination_address == "bc1qbbbb"
+
+    def test_legacy_entries_without_fingerprint_visible_unfiltered(
+        self, temp_data_dir: Path
+    ) -> None:
+        """Backwards compat: pre-#473 rows have empty fingerprint and remain
+        visible when no filter is supplied."""
+        legacy = create_maker_history_entry(
+            taker_nick="J5taker",
+            cj_amount=100_000,
+            fee_received=10,
+            txfee_contribution=5,
+            cj_address="bc1qlegacy",
+            change_address="bc1qchg-legacy",
+            our_utxos=[("c" * 64, 0)],
+            txid="c" * 64,
+            network="regtest",
+            # No wallet_fingerprint argument -> empty string default.
+        )
+        assert legacy.wallet_fingerprint == ""
+        append_history_entry(legacy, temp_data_dir)
+
+        all_entries = read_history(temp_data_dir)
+        assert len(all_entries) == 1
+
+        # When filtering by a real fingerprint, legacy rows are correctly hidden
+        # to keep new wallets isolated from pre-existing shared history.
+        scoped = read_history(temp_data_dir, wallet_fingerprint=self.FP_A)
+        assert scoped == []

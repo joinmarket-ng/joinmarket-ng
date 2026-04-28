@@ -1101,6 +1101,7 @@ class TestAddressReservation:
                 our_utxos=[("a" * 64, 0)],
                 txid="b" * 64,
                 network="regtest",
+                wallet_fingerprint=wallet.wallet_fingerprint,
             )
             append_history_entry(entry, wallet.data_dir)
 

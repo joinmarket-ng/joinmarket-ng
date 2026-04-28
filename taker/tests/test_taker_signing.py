@@ -177,6 +177,7 @@ class TestTakerSigning:
         wallet = MagicMock()
         wallet.network = "regtest"
         wallet.mixdepth_count = 5
+        wallet.wallet_fingerprint = "deadbeef"
 
         # Mock get_key_for_address to return proper HD keys
         def get_key_for_address(address: str) -> HDKey | None:
@@ -437,6 +438,7 @@ class TestEdgeCases:
         # Create wallet that returns None for get_key_for_address
         wallet = MagicMock()
         wallet.get_key_for_address = MagicMock(return_value=None)
+        wallet.wallet_fingerprint = "deadbeef"
 
         utxos = [
             UTXOInfo(
@@ -499,6 +501,7 @@ class TestEdgeCases:
 
         wallet = MagicMock()
         wallet.get_key_for_address = MagicMock(return_value=key0)
+        wallet.wallet_fingerprint = "deadbeef"
 
         with patch.object(Taker, "__init__", lambda self, *args, **kwargs: None):
             taker = Taker.__new__(Taker)
@@ -602,6 +605,7 @@ class TestPhaseCollectSignaturesCompleteness:
         with patch.object(Taker, "__init__", lambda self, *args, **kwargs: None):
             taker = Taker.__new__(Taker)
             taker.wallet = MagicMock()
+            taker.wallet.wallet_fingerprint = "deadbeef"
             taker.backend = AsyncMock()
             taker.config = MagicMock()
             taker.config.network.value = "regtest"

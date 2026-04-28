@@ -49,6 +49,7 @@ def mock_wallet():
     wallet.get_key_for_address = Mock()
     wallet.select_utxos = Mock(return_value=[make_utxo(txid_char="a", address="bcrt1qtest1")])
     wallet.close = AsyncMock()
+    wallet.wallet_fingerprint = "deadbeef"
     return wallet
 
 
@@ -1041,6 +1042,7 @@ class TestUpdatePendingTransactionNow:
             source_mixdepth=0,
             selected_utxos=[("b" * 64, 0)],
             txid=txid,
+            wallet_fingerprint="deadbeef",
         )
         append_history_entry(entry, data_dir=tmp_path)
 
@@ -1099,6 +1101,7 @@ class TestUpdatePendingTransactionNow:
             source_mixdepth=1,
             selected_utxos=[("d" * 64, 1)],
             txid=txid,
+            wallet_fingerprint="deadbeef",
         )
         append_history_entry(entry, data_dir=tmp_path)
 
@@ -1152,6 +1155,7 @@ class TestUpdatePendingTransactionNow:
             source_mixdepth=0,
             selected_utxos=[("f" * 64, 0)],
             txid=txid,
+            wallet_fingerprint="deadbeef",
         )
         append_history_entry(entry, data_dir=tmp_path)
 
@@ -1195,6 +1199,7 @@ class TestUpdatePendingTransactionNow:
             source_mixdepth=2,
             selected_utxos=[("h" * 64, 0)],
             txid=txid,
+            wallet_fingerprint="deadbeef",
         )
         append_history_entry(entry, data_dir=tmp_path)
 
@@ -1256,6 +1261,7 @@ class TestHistoryMiningFeeRecording:
             selected_utxos=[("a" * 64, 0)],
             txid="",
             failure_reason="Awaiting transaction",
+            wallet_fingerprint="deadbeef",
         )
         append_history_entry(entry, data_dir=tmp_path)
 
@@ -1311,6 +1317,7 @@ class TestHistoryMiningFeeRecording:
             selected_utxos=[("b" * 64, 0), ("c" * 64, 1)],
             txid="",
             failure_reason="Awaiting transaction",
+            wallet_fingerprint="deadbeef",
         )
         append_history_entry(entry, data_dir=tmp_path)
 

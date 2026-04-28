@@ -62,8 +62,10 @@ async def wallet_display(
     # Load history data so address statuses (cj-out, change, etc.) are
     # classified correctly.  Without this, all funded internal addresses
     # fall through to the "non-cj-change" default.
-    used_addresses = get_used_addresses(state.data_dir)
-    history_addresses = get_address_history_types(state.data_dir)
+    used_addresses = get_used_addresses(state.data_dir, wallet_fingerprint=ws.wallet_fingerprint)
+    history_addresses = get_address_history_types(
+        state.data_dir, wallet_fingerprint=ws.wallet_fingerprint
+    )
 
     accounts: list[WalletDisplayAccount] = []
     total_balance = 0

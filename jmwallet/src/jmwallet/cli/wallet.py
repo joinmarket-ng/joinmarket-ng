@@ -465,7 +465,9 @@ async def _show_wallet_info(
 
         # Update any pending transaction statuses
         # This safeguards against one-shot coinjoins that exited before confirmation
-        await update_all_pending_transactions(backend, data_dir)
+        await update_all_pending_transactions(
+            backend, data_dir, wallet_fingerprint=wallet.wallet_fingerprint
+        )
 
         from jmcore.bitcoin import format_amount
 
@@ -494,12 +496,18 @@ async def _show_wallet_info(
         # Show pending transactions if any
         from jmwallet.history import cleanup_stale_pending_transactions, get_pending_transactions
 
-        # Clean up any stale pending transactions (older than 60 minutes)
-        cleaned = cleanup_stale_pending_transactions(max_age_minutes=60, data_dir=data_dir)
+        # Clean up any stale pending transactions (older than 60 minutes).
+        # Scope to the active wallet (issue #473) so we don't mark another
+        # wallet's pending entries as failed from this wallet's CLI run.
+        cleaned = cleanup_stale_pending_transactions(
+            max_age_minutes=60,
+            data_dir=data_dir,
+            wallet_fingerprint=wallet.wallet_fingerprint,
+        )
         if cleaned > 0:
             logger.info(f"Cleaned up {cleaned} stale pending transaction(s)")
 
-        pending = get_pending_transactions(data_dir)
+        pending = get_pending_transactions(data_dir, wallet_fingerprint=wallet.wallet_fingerprint)
         if pending:
             print(f"\nPending Transactions: {len(pending)}")
             for entry in pending:
@@ -508,9 +516,11 @@ async def _show_wallet_info(
                 else:
                     print(f"  [Broadcasting...] - {entry.role}")
 
-        # Get history info for address status
-        used_addresses = get_used_addresses(data_dir)
-        history_addresses = get_address_history_types(data_dir)
+        # Get history info for address status (scoped to active wallet, #473)
+        used_addresses = get_used_addresses(data_dir, wallet_fingerprint=wallet.wallet_fingerprint)
+        history_addresses = get_address_history_types(
+            data_dir, wallet_fingerprint=wallet.wallet_fingerprint
+        )
 
         if extended:
             # Extended view with detailed address information
@@ -656,8 +666,10 @@ def _show_extended_wallet_info(
     print("  flagged     - Shared with peers but tx failed (do not reuse)")
     print()
 
-    # Get pending transactions to mark addresses
-    pending_txs = get_pending_transactions(wallet.data_dir)
+    # Get pending transactions to mark addresses (scoped to active wallet, #473)
+    pending_txs = get_pending_transactions(
+        wallet.data_dir, wallet_fingerprint=wallet.wallet_fingerprint
+    )
     pending_addresses = set()
     for entry in pending_txs:
         if entry.destination_address:

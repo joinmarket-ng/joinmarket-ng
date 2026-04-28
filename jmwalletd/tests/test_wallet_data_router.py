@@ -107,9 +107,17 @@ class TestWalletDisplayWithHistory:
         )
         assert resp.status_code == 200
 
-        # Verify that history helpers were called with the data dir.
-        mock_get_used.assert_called_once_with(state.data_dir)
-        mock_get_history.assert_called_once_with(state.data_dir)
+        # Verify that history helpers were called with the data dir scoped to
+        # the active wallet (issue #473: wallet_fingerprint isolation).
+        mock_get_used.assert_called_once()
+        used_args, used_kwargs = mock_get_used.call_args
+        assert used_args == (state.data_dir,)
+        assert "wallet_fingerprint" in used_kwargs
+
+        mock_get_history.assert_called_once()
+        hist_args, hist_kwargs = mock_get_history.call_args
+        assert hist_args == (state.data_dir,)
+        assert "wallet_fingerprint" in hist_kwargs
 
         # Verify get_address_info_for_mixdepth was called with history data.
         # It's called once for each (mixdepth, change) pair: 5 * 2 = 10 calls.

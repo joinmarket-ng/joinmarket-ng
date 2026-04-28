@@ -63,6 +63,10 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin):
 
         # Log fingerprint for debugging (helps identify passphrase issues)
         fingerprint = self.master_key.derive("m/0").fingerprint.hex()
+        # Expose fingerprint as a stable wallet identifier (issue #473).
+        # This is the same 8-char hex used by the descriptor wallet name and
+        # by the CoinJoin history CSV to scope entries to a specific wallet.
+        self.wallet_fingerprint = fingerprint
         logger.info(
             f"Initialized wallet: fingerprint={fingerprint}, "
             f"mixdepths={mixdepth_count}, network={network}, "
@@ -470,7 +474,9 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin):
         if self.data_dir:
             from jmwallet.history import get_used_addresses
 
-            cj_addresses = get_used_addresses(self.data_dir)
+            cj_addresses = get_used_addresses(
+                self.data_dir, wallet_fingerprint=self.wallet_fingerprint
+            )
             self._prune_reserved_addresses(cj_addresses | self.addresses_with_history)
             for address in cj_addresses:
                 if address in self.address_cache:

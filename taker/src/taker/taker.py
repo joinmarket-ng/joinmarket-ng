@@ -454,7 +454,11 @@ class Taker(TakerMonitoringMixin):
 
                     # Populate labels for each UTXO based on history
                     for utxo in available_utxos:
-                        utxo.label = get_utxo_label(utxo.address, self.config.data_dir)
+                        utxo.label = get_utxo_label(
+                            utxo.address,
+                            self.config.data_dir,
+                            wallet_fingerprint=self.wallet.wallet_fingerprint,
+                        )
 
                     logger.info(
                         f"Launching interactive UTXO selector ({len(available_utxos)} available, "
@@ -1244,6 +1248,7 @@ class Taker(TakerMonitoringMixin):
                     txid=self.txid,
                     mining_fee=actual_mining_fee,
                     data_dir=self.config.data_dir,
+                    wallet_fingerprint=self.wallet.wallet_fingerprint,
                 )
                 if updated:
                     logger.debug(
@@ -2230,6 +2235,7 @@ class Taker(TakerMonitoringMixin):
                 broadcast_method=self.config.tx_broadcast.value,
                 network=self.config.network.value,
                 failure_reason="Awaiting transaction",
+                wallet_fingerprint=self.wallet.wallet_fingerprint,
             )
             append_history_entry(history_entry, data_dir=self.config.data_dir)
 
@@ -2547,6 +2553,7 @@ class Taker(TakerMonitoringMixin):
                 broadcast_method=broadcast_method,
                 network=self.config.network.value,
                 failure_reason="User declined broadcast (manual broadcast pending)",
+                wallet_fingerprint=self.wallet.wallet_fingerprint,
             )
 
             # Format as CSV line for manual addition

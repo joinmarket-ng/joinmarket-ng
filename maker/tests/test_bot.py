@@ -975,6 +975,7 @@ class TestPeerCountDetection:
         wallet.utxo_cache = {}
         wallet.sync_all = AsyncMock()
         wallet.get_total_balance = AsyncMock(return_value=1_000_000)
+        wallet.wallet_fingerprint = "deadbeef"
         return wallet
 
     @pytest.fixture
@@ -1039,6 +1040,7 @@ class TestPeerCountDetection:
             our_utxos=[("abcd1234" * 8, 0)],
             txid="test_txid_123",
             network="regtest",
+            wallet_fingerprint="deadbeef",
         )
         append_history_entry(entry, data_dir=tmp_path)
 

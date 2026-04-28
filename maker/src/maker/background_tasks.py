@@ -454,7 +454,7 @@ class BackgroundTasksMixin:
 
         logger.info("Pending transaction monitor stopped")
 
-    async def _update_pending_history(self) -> None:
+    async def _update_pending_history(self: MakerBotProtocol) -> None:
         """Check and update pending transaction confirmations in history.
 
         For entries without txid, attempts to discover the txid by checking
@@ -472,7 +472,10 @@ class BackgroundTasksMixin:
             update_transaction_confirmation_with_detection,
         )
 
-        pending = get_pending_transactions(data_dir=self.config.data_dir)
+        wallet_fp = self.wallet.wallet_fingerprint
+        pending = get_pending_transactions(
+            data_dir=self.config.data_dir, wallet_fingerprint=wallet_fp
+        )
         if not pending:
             return
 
@@ -499,6 +502,7 @@ class BackgroundTasksMixin:
                                 destination_address=entry.destination_address,
                                 txid=txid,
                                 data_dir=self.config.data_dir,
+                                wallet_fingerprint=wallet_fp,
                             )
                             logger.info(
                                 f"Discovered txid {txid[:16]}... for address "
@@ -515,6 +519,7 @@ class BackgroundTasksMixin:
                                     "taker never broadcast transaction"
                                 ),
                                 data_dir=self.config.data_dir,
+                                wallet_fingerprint=wallet_fp,
                             )
                             continue
                         else:
@@ -543,6 +548,7 @@ class BackgroundTasksMixin:
                             ),
                             data_dir=self.config.data_dir,
                             txid=entry.txid,
+                            wallet_fingerprint=wallet_fp,
                         )
                     elif age_minutes > 30:
                         # Log warning after 30 minutes
@@ -565,6 +571,7 @@ class BackgroundTasksMixin:
                         confirmations=confirmations,
                         backend=self.backend,
                         data_dir=self.config.data_dir,
+                        wallet_fingerprint=wallet_fp,
                     )
 
             except Exception as e:

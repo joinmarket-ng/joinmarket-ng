@@ -74,7 +74,10 @@ class TakerMonitoringMixin:
                 if not self.running:
                     break
 
-                pending = get_pending_transactions(data_dir=self.config.data_dir)
+                pending = get_pending_transactions(
+                    data_dir=self.config.data_dir,
+                    wallet_fingerprint=self.wallet.wallet_fingerprint,
+                )
                 if not pending:
                     continue
 
@@ -129,6 +132,7 @@ class TakerMonitoringMixin:
                 txid=entry.txid,
                 confirmations=confirmations,
                 data_dir=self.config.data_dir,
+                wallet_fingerprint=self.wallet.wallet_fingerprint,
             )
 
             logger.info(
@@ -182,6 +186,7 @@ class TakerMonitoringMixin:
                 txid=entry.txid,
                 confirmations=1,  # We know it's confirmed but not exact count
                 data_dir=self.config.data_dir,
+                wallet_fingerprint=self.wallet.wallet_fingerprint,
             )
 
             logger.info(
@@ -239,6 +244,7 @@ class TakerMonitoringMixin:
                             txid=txid,
                             confirmations=max(confirmations, 1),
                             data_dir=self.config.data_dir,
+                            wallet_fingerprint=self.wallet.wallet_fingerprint,
                         )
                         if confirmations > 0:
                             logger.info(
@@ -269,6 +275,7 @@ class TakerMonitoringMixin:
                             txid=txid,
                             confirmations=1,
                             data_dir=self.config.data_dir,
+                            wallet_fingerprint=self.wallet.wallet_fingerprint,
                         )
                         logger.info(f"CoinJoin {txid[:16]}... confirmed via Neutrino block filters")
                     else:
