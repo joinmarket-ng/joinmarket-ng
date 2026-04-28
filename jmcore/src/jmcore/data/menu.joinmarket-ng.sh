@@ -1382,9 +1382,20 @@ $WALLET_INFO | Maker Bot: $MAKER_STATUS
       # activation above already puts the right interpreter on PATH.
       CURRENT_VERSION=$(python3 -c "from jmcore.version import get_version; print(get_version())" 2>/dev/null || echo "unknown")
       CURRENT_COMMIT=$(python3 -c "from jmcore.version import get_commit_hash; h=get_commit_hash(); print(h or '')" 2>/dev/null || echo "")
+      CURRENT_REF=$(python3 -c "from jmcore.version import get_build_ref; r=get_build_ref(); print(r or '')" 2>/dev/null || echo "")
 
-      # Current label: "vX.Y.Z" plus short commit when we have one.
-      if [ -n "$CURRENT_COMMIT" ]; then
+      # Current label distinguishes a stable release ("v0.27.0 (abc1234)")
+      # from a development build ("main / abc1234"): if we have a commit
+      # but the build ref is anything other than a release tag matching
+      # the version, we report it as a dev build. The display matches
+      # what L3ftBlank reported in #451.
+      IS_DEV_BUILD=0
+      if [ -n "$CURRENT_REF" ] && [ "$CURRENT_REF" != "v${CURRENT_VERSION}" ] && [ "$CURRENT_REF" != "${CURRENT_VERSION}" ]; then
+          IS_DEV_BUILD=1
+      fi
+      if [ "$IS_DEV_BUILD" = "1" ] && [ -n "$CURRENT_COMMIT" ]; then
+          CURRENT_LABEL="${CURRENT_REF} / ${CURRENT_COMMIT}"
+      elif [ -n "$CURRENT_COMMIT" ]; then
           CURRENT_LABEL="v${CURRENT_VERSION} (${CURRENT_COMMIT})"
       else
           CURRENT_LABEL="v${CURRENT_VERSION}"
@@ -1454,12 +1465,17 @@ $WALLET_INFO | Maker Bot: $MAKER_STATUS
         esac
 
         # Warn if the target matches what's already installed (#451 point 5).
-        # The current identifier is "vX.Y.Z" for stable and the short
-        # commit for dev; compare against the matching component.
+        # We compare on commit when both sides know it; otherwise we fall
+        # back to the version string. A user on a dev build (commit known,
+        # ref != stable tag) selecting STABLE is NOT considered up-to-date
+        # even if the version number matches the latest release, because
+        # the stable build would replace their dev commit.
         ALREADY_CURRENT=0
         case $UCHOICE in
           STABLE|VERSION)
-            if [ "$TARGET_LABEL" = "v${CURRENT_VERSION}" ]; then
+            if [ "$IS_DEV_BUILD" = "1" ]; then
+                ALREADY_CURRENT=0
+            elif [ "$TARGET_LABEL" = "v${CURRENT_VERSION}" ]; then
                 ALREADY_CURRENT=1
             fi
             ;;

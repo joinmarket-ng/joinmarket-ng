@@ -252,12 +252,32 @@ def test_tui_script_update_warns_running_maker() -> None:
 
 def test_tui_script_update_shows_current_version_with_commit() -> None:
     """The update menu title must show "vX.Y.Z (commit)" when the commit
-    hash is available (issue #451 point 1)."""
+    hash is available and we're on a stable build (issue #451 point 1)."""
     content = SCRIPT_PATH.read_text()
     assert "get_commit_hash" in content
-    # Current label uses "v${CURRENT_VERSION}" and appends the short commit
-    # when present.
+    # Stable build label includes the short commit when present.
     assert 'CURRENT_LABEL="v${CURRENT_VERSION} (${CURRENT_COMMIT})"' in content
+
+
+def test_tui_script_update_shows_dev_ref_with_commit() -> None:
+    """When the build ref is set to a non-tag (e.g. ``main``), the title
+    must show ``main / abc1234`` instead of falling back to the static
+    version, matching the expected behaviour from issue #451's follow-up
+    comment."""
+    content = SCRIPT_PATH.read_text()
+    assert "get_build_ref" in content
+    assert "IS_DEV_BUILD=1" in content
+    assert 'CURRENT_LABEL="${CURRENT_REF} / ${CURRENT_COMMIT}"' in content
+
+
+def test_tui_script_update_dev_to_stable_not_already_current() -> None:
+    """A user on a dev build must NOT be told they are already on
+    ``vX.Y.Z`` when selecting STABLE, even when the static version
+    string happens to match (issue #451 follow-up)."""
+    content = SCRIPT_PATH.read_text()
+    # The STABLE/VERSION branch of ALREADY_CURRENT must short-circuit to
+    # 0 when IS_DEV_BUILD is set.
+    assert 'if [ "$IS_DEV_BUILD" = "1" ]; then' in content
 
 
 def test_tui_script_update_fetches_latest_stable_and_main() -> None:
