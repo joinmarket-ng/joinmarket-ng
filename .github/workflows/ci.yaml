@@ -236,7 +236,7 @@ jobs:
           BITCOIN_RPC_USER: test
           BITCOIN_RPC_PASSWORD: test
         run: |
-          pytest -c pytest.ini -m e2e --junitxml=junit/test-results.xml \
+          pytest -c pytest.ini -m "e2e and not tumbler_e2e" --junitxml=junit/test-results.xml \
             --cov --cov-report=term-missing --cov-report=xml \
             -v -s --timeout=300 --reruns=1 --reruns-delay=10 --fail-on-skip
 
@@ -268,6 +268,123 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: e2e-results
+          path: |
+            junit/test-results.xml
+            coverage.xml
+        if: always()
+
+  test-tumbler:
+    needs: build-images
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: read
+    env:
+      # Use pre-built images from CI
+      DIRECTORY_SERVER_IMAGE: ghcr.io/${{ github.repository }}/directory-server:ci-unsafe-do-not-run-${{ github.event.pull_request.head.sha || github.sha }}
+      ORDERBOOK_WATCHER_IMAGE: ghcr.io/${{ github.repository }}/orderbook-watcher:ci-unsafe-do-not-run-${{ github.event.pull_request.head.sha || github.sha }}
+      MAKER_IMAGE: ghcr.io/${{ github.repository }}/maker:ci-unsafe-do-not-run-${{ github.event.pull_request.head.sha || github.sha }}
+      TAKER_IMAGE: ghcr.io/${{ github.repository }}/taker:ci-unsafe-do-not-run-${{ github.event.pull_request.head.sha || github.sha }}
+      JMWALLETD_IMAGE: ghcr.io/${{ github.repository }}/jmwalletd:ci-unsafe-do-not-run-${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/setup-python-deps
+        with:
+          components: jmcore,jmwallet,directory_server,orderbook_watcher,maker,taker,jmwalletd,tumbler
+          install-dev: 'true'
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull pre-built images
+        run: |
+          docker pull $DIRECTORY_SERVER_IMAGE
+          docker pull $ORDERBOOK_WATCHER_IMAGE
+          docker pull $MAKER_IMAGE
+          docker pull $TAKER_IMAGE
+          docker pull $JMWALLETD_IMAGE
+
+      - name: "Start e2e services"
+        env:
+          DOCKER_BUILDKIT: 1
+          COMPOSE_DOCKER_CLI_BUILD: 1
+        run: |
+          # Start with pre-built images (env vars override build)
+          docker compose --profile e2e up -d
+
+          .github/scripts/wait-for-service.sh "Bitcoin" \
+            "docker compose exec -T bitcoin bitcoin-cli -chain=regtest -rpcport=18443 -rpcuser=test -rpcpassword=test getblockchaininfo" \
+            60 1
+
+          .github/scripts/wait-for-service.sh "Directory Server" \
+            "nc -z localhost 5222" \
+            30 1
+
+          .github/scripts/wait-for-service.sh "jmwalletd" \
+            "curl -skf https://127.0.0.1:28183/api/v1/getinfo" \
+            60 2
+
+          echo "Waiting for makers to connect..."
+          sleep 20
+
+          echo "E2E services ready!"
+
+      - name: Run tumbler e2e tests
+        env:
+          BITCOIN_RPC_URL: http://127.0.0.1:18443
+          BITCOIN_RPC_USER: test
+          BITCOIN_RPC_PASSWORD: test
+        run: |
+          pytest -c pytest.ini -m tumbler_e2e --junitxml=junit/test-results.xml \
+            --cov --cov-report=term-missing --cov-report=xml \
+            -v -s --timeout=600 --reruns=1 --reruns-delay=10 --fail-on-skip
+
+      - name: Show logs
+        if: always()
+        run: |
+          echo "=== Docker compose status ==="
+          docker compose --profile e2e ps
+          echo ""
+          echo "=== Bitcoin logs ==="
+          docker compose logs bitcoin --tail=30
+          echo ""
+          echo "=== Directory logs ==="
+          docker compose logs directory --tail=30
+          echo ""
+          echo "=== Maker1 logs ==="
+          docker compose logs maker1 --tail=100
+          echo ""
+          echo "=== Maker2 logs ==="
+          docker compose logs maker2 --tail=100
+          echo ""
+          echo "=== Maker3 logs ==="
+          docker compose logs maker3 --tail=100
+          echo ""
+          echo "=== jmwalletd logs ==="
+          docker compose logs jmwalletd --tail=200
+          echo ""
+          echo "=== orderbook-watcher logs ==="
+          docker compose logs orderbook-watcher --tail=100
+
+      - name: Cleanup
+        if: always()
+        run: docker compose --profile e2e down -v
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: tumbler-results
           path: |
             junit/test-results.xml
             coverage.xml
@@ -1610,6 +1727,7 @@ jobs:
       - test-directory-server-docker
       # Integration tests (depend on build-images)
       - test-e2e
+      - test-tumbler
       - test-playwright
       - test-reference-interop
       - test-reference-legacy
