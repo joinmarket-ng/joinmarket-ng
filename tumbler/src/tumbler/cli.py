@@ -271,6 +271,14 @@ def plan_command(
             ),
         ),
     ] = False,
+    data_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--data-dir",
+            envvar="JOINMARKET_DATA_DIR",
+            help="Data directory (default: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)",
+        ),
+    ] = None,
     log_level: Annotated[str | None, typer.Option("--log-level", "-l")] = None,
 ) -> None:
     """Build a tumbler plan for the given destinations and persist it."""
@@ -282,7 +290,7 @@ def plan_command(
             len(destinations),
         )
         raise typer.Exit(1)
-    settings = setup_cli(log_level)
+    settings = setup_cli(log_level, data_dir=data_dir)
     ensure_config_file(settings.get_data_dir())
     data_dir = settings.get_data_dir()
 
@@ -415,10 +423,18 @@ def status_command(
             help="Prompt for BIP39 passphrase interactively",
         ),
     ] = False,
+    data_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--data-dir",
+            envvar="JOINMARKET_DATA_DIR",
+            help="Data directory (default: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)",
+        ),
+    ] = None,
     log_level: Annotated[str | None, typer.Option("--log-level", "-l")] = None,
 ) -> None:
     """Print the current plan for the given wallet."""
-    settings = setup_cli(log_level)
+    settings = setup_cli(log_level, data_dir=data_dir)
     effective_wallet = _resolve_wallet_name(
         settings, wallet_name, mnemonic_file, prompt_bip39_passphrase
     )
@@ -450,10 +466,18 @@ def delete_command(
         ),
     ] = False,
     yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip confirmation prompt")] = False,
+    data_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--data-dir",
+            envvar="JOINMARKET_DATA_DIR",
+            help="Data directory (default: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)",
+        ),
+    ] = None,
     log_level: Annotated[str | None, typer.Option("--log-level", "-l")] = None,
 ) -> None:
     """Delete the on-disk plan for ``wallet_name``."""
-    settings = setup_cli(log_level)
+    settings = setup_cli(log_level, data_dir=data_dir)
     data_dir = settings.get_data_dir()
     effective_wallet = _resolve_wallet_name(
         settings, wallet_name, mnemonic_file, prompt_bip39_passphrase
@@ -545,10 +569,18 @@ def run_command(
             ),
         ),
     ] = None,
+    data_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--data-dir",
+            envvar="JOINMARKET_DATA_DIR",
+            help="Data directory (default: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)",
+        ),
+    ] = None,
     log_level: Annotated[str | None, typer.Option("--log-level", "-l")] = None,
 ) -> None:
     """Execute the saved plan for a wallet to completion."""
-    settings = setup_cli(log_level)
+    settings = setup_cli(log_level, data_dir=data_dir)
     ensure_config_file(settings.get_data_dir())
     data_dir = settings.get_data_dir()
 
