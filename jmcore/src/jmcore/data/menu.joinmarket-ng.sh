@@ -677,11 +677,8 @@ while true; do
   fi
 
 CHOICE=$(whiptail --title " JoinMarket-NG Menu " \
-    --menu "
-$WALLET_INFO | Maker Bot: $MAKER_STATUS
-
-" \
-    18 64 10 \
+    --menu "\n$WALLET_INFO | Maker Bot: $MAKER_STATUS" \
+    18 64 7 \
     "S" "Send Bitcoin" \
     "W" "Wallet Management" \
     "M" "Maker Bot Control" \
@@ -845,16 +842,14 @@ $WALLET_INFO | Maker Bot: $MAKER_STATUS
             CURRENT_WALLET=""
         fi
         if [ -n "$CURRENT_WALLET" ]; then
-          WALLET_INFO="Wallet: $(basename "$CURRENT_WALLET")"
+          WALLET_INFO="Active Wallet: $(basename "$CURRENT_WALLET")"
         else
-          WALLET_INFO="Wallet: (none configured)"
+          WALLET_INFO="Active Wallet: (none configured)"
         fi
 
         WCHOICE=$(whiptail --title " Wallet Management " \
-         --menu "
- $WALLET_INFO
-
-         " 20 64 11 \
+         --menu "\n$WALLET_INFO | Maker Bot: $MAKER_STATUS" \
+         20 64 8 \
           "NEW"      "Create New Wallet (12 or 24-word seed)" \
           "IMP"      "Import Existing Wallet (from seed)" \
           "VAL"      "Validate a Seed Phrase" \
@@ -1000,8 +995,8 @@ $WALLET_INFO | Maker Bot: $MAKER_STATUS
                   fi
 
                   INFO_CHOICE=$(whiptail --title " Wallet Info " \
-                    --menu "Choose info display level:" \
-                    16 64 3 \
+                    --menu "\n$WALLET_INFO | Maker Bot: $MAKER_STATUS\n\nChoose info display level:" \
+                    18 64 3 \
                     "BASIC" "Basic balance by mixdepth" \
                     "EXT" "Extended (detailed address list with status)" \
                     "BACK" "Back to Wallet Management" 3>&1 1>&2 2>&3)
@@ -1147,7 +1142,7 @@ $WALLET_INFO | Maker Bot: $MAKER_STATUS
               done <<< "$WALLETS"
 
               WNAME=$(whiptail --title " Select Active Wallet " --notags \
-                  --menu "Current: $(basename "$(get_mnemonic_file)" 2>/dev/null || echo '(none)')\n\nChoose a wallet:" \
+                  --menu "\n$WALLET_INFO | Maker Bot: $MAKER_STATUS\n\nChoose a wallet:" \
                   18 64 6 \
                   "${MENU_ITEMS[@]}" 3>&1 1>&2 2>&3) || continue
 
@@ -1199,7 +1194,9 @@ $WALLET_INFO | Maker Bot: $MAKER_STATUS
         MAKER_STATUS="STOPPED"
       fi
 
-      MCHOICE=$(whiptail --title " Maker Bot (${MAKER_STATUS}) " --menu "Choose option:" 18 64 8 \
+      MCHOICE=$(whiptail --title " Maker Bot Control " \
+        --menu "\n$WALLET_INFO | Maker Bot: $MAKER_STATUS" \
+        18 64 7 \
         "START"   "Start Maker Bot" \
         "STOP"    "Stop Maker Bot" \
         "RESTART" "Restart Maker Bot" \
@@ -1272,8 +1269,8 @@ $WALLET_INFO | Maker Bot: $MAKER_STATUS
               # Fidelity bond submenu
               while true; do
                 BCHOICE=$(whiptail --title " Fidelity Bonds " \
-                  --menu "Fidelity bonds lock coins until a date to boost maker reputation.\nExpired bonds appear in wallet balance and are spendable." \
-                  16 72 4 \
+                  --menu "\n$WALLET_INFO | Maker Bot: $MAKER_STATUS\n\nFidelity bonds lock coins until a date to boost maker reputation.\nExpired bonds appear in wallet balance and are spendable." \
+                  18 72 3 \
                   "LIST"   "List existing fidelity bonds" \
                   "CREATE" "Generate a new bond address (lock coins)" \
                   "BACK"   "Back to Maker Menu" 3>&1 1>&2 2>&3)
@@ -1433,12 +1430,12 @@ $WALLET_INFO | Maker Bot: $MAKER_STATUS
       # instead of the top-level menu (#451 point 6).
       while true; do
         UCHOICE=$(whiptail --title " Update JoinMarket-NG (current: ${CURRENT_LABEL}) " \
-            --menu "Choose update channel:" 16 70 5 \
+            --menu "\n$WALLET_INFO | Maker Bot: $MAKER_STATUS\n\nChoose update channel:" \
+            16 70 4 \
             "STABLE"  "Latest stable release (v${LATEST_STABLE})" \
             "DEV"     "Latest main commit (${LATEST_MAIN})" \
             "VERSION" "Install a specific version" \
             "BACK"    "Return to main menu" 3>&1 1>&2 2>&3) || break
-
         TARGET_LABEL=""
         case $UCHOICE in
           STABLE)
@@ -1553,7 +1550,8 @@ $WALLET_INFO | Maker Bot: $MAKER_STATUS
       whiptail --title " JoinMarket-NG Info " --msgbox "\
 JoinMarket-NG - Next Generation CoinJoin
 
-Docs: https://github.com/joinmarket-ng/joinmarket-ng
+GitHub: https://github.com/joinmarket-ng/joinmarket-ng
+Documentation: https://joinmarket-ng.github.io/joinmarket-ng/
 
 Config: $CONFIG_FILE
 Data:   $DATA_DIR
