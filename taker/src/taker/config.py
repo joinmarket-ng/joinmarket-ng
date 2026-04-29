@@ -4,12 +4,32 @@ Configuration for JoinMarket Taker.
 
 from __future__ import annotations
 
+import random
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 
 from jmcore.config import WalletConfig
 from jmcore.models import OfferType
 from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
+
+# Default counterparty count is randomized per CoinJoin in [MIN, MAX] when no
+# explicit value is configured.  The 8-10 range matches the upstream
+# JoinMarket sendpayment default and avoids fingerprinting jm-ng takers via a
+# fixed counterparty count (see issue #468).
+DEFAULT_COUNTERPARTY_COUNT_MIN = 8
+DEFAULT_COUNTERPARTY_COUNT_MAX = 10
+
+
+def resolve_counterparty_count(value: int | None) -> int:
+    """Resolve an effective counterparty count for one CoinJoin attempt.
+
+    When ``value`` is ``None``, draws a uniformly random integer from
+    ``[DEFAULT_COUNTERPARTY_COUNT_MIN, DEFAULT_COUNTERPARTY_COUNT_MAX]``.
+    Otherwise the explicit value is returned unchanged.
+    """
+    if value is None:
+        return random.randint(DEFAULT_COUNTERPARTY_COUNT_MIN, DEFAULT_COUNTERPARTY_COUNT_MAX)
+    return value
 
 
 class BroadcastPolicy(StrEnum):
@@ -73,8 +93,16 @@ class TakerConfig(WalletConfig):
     )
     amount: int = Field(default=0, ge=0, description="Amount in sats (0 = sweep)")
     mixdepth: int = Field(default=0, ge=0, description="Source mixdepth")
-    counterparty_count: int = Field(
-        default=10, ge=1, le=20, description="Number of makers to select"
+    counterparty_count: int | None = Field(
+        default=None,
+        ge=1,
+        le=20,
+        description=(
+            "Number of makers to select. When unset, a random value in "
+            "[8, 10] is drawn for every CoinJoin (matches the upstream "
+            "JoinMarket sendpayment default and avoids fingerprinting via a "
+            "fixed counterparty count)."
+        ),
     )
 
     # Fee settings

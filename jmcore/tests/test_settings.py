@@ -165,7 +165,10 @@ class TestSettingsDefaults:
         """Test default taker settings."""
         settings = JoinMarketSettings()
 
-        assert settings.taker.counterparty_count == 10
+        # counterparty_count defaults to None: a random value in [8, 10] is
+        # drawn per CoinJoin (matches upstream sendpayment, avoids
+        # fingerprinting via a fixed value -- see issue #468).
+        assert settings.taker.counterparty_count is None
         assert settings.taker.max_cj_fee_abs == 500
         assert settings.taker.max_cj_fee_rel == "0.001"
         assert settings.taker.tx_broadcast == "random-peer"

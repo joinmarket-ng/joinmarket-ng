@@ -508,7 +508,7 @@ async def _run_coinjoin(
     amount: int,
     destination: str,
     mixdepth: int,
-    counterparties: int,
+    counterparties: int | None,
     skip_confirmation: bool,
 ) -> None:
     """Run CoinJoin transaction."""

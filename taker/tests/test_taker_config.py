@@ -7,7 +7,40 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from taker.config import MaxCjFee, Schedule, ScheduleEntry, TakerConfig
+from taker.config import (
+    DEFAULT_COUNTERPARTY_COUNT_MAX,
+    DEFAULT_COUNTERPARTY_COUNT_MIN,
+    MaxCjFee,
+    Schedule,
+    ScheduleEntry,
+    TakerConfig,
+    resolve_counterparty_count,
+)
+
+
+class TestResolveCounterpartyCount:
+    """Tests for resolve_counterparty_count helper."""
+
+    def test_explicit_value_returned(self) -> None:
+        """Explicit values are returned unchanged."""
+        for value in (1, 5, 20):
+            assert resolve_counterparty_count(value) == value
+
+    def test_none_picks_random_in_range(self) -> None:
+        """None draws a random integer in [MIN, MAX] (matches upstream)."""
+        seen = {resolve_counterparty_count(None) for _ in range(200)}
+        assert seen <= set(
+            range(DEFAULT_COUNTERPARTY_COUNT_MIN, DEFAULT_COUNTERPARTY_COUNT_MAX + 1)
+        )
+        # With 200 draws we expect to cover every value in the range.
+        assert seen == set(
+            range(DEFAULT_COUNTERPARTY_COUNT_MIN, DEFAULT_COUNTERPARTY_COUNT_MAX + 1)
+        )
+
+    def test_default_range_matches_upstream(self) -> None:
+        """The default 8-10 range matches upstream sendpayment."""
+        assert DEFAULT_COUNTERPARTY_COUNT_MIN == 8
+        assert DEFAULT_COUNTERPARTY_COUNT_MAX == 10
 
 
 class TestMaxCjFee:
@@ -50,7 +83,9 @@ class TestTakerConfig:
         config = TakerConfig(mnemonic=sample_mnemonic)
         assert config.mnemonic.get_secret_value() == sample_mnemonic
         assert config.network.value == "mainnet"
-        assert config.counterparty_count == 10
+        # counterparty_count defaults to None: a random value in [8, 10] is
+        # drawn per CoinJoin (matches upstream JoinMarket sendpayment).
+        assert config.counterparty_count is None
 
     def test_full_config(self, sample_mnemonic: str) -> None:
         """Test full configuration with all options."""

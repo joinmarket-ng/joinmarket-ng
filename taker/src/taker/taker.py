@@ -46,7 +46,7 @@ from jmwallet.wallet.signing import (
 )
 from loguru import logger
 
-from taker.config import BroadcastPolicy, Schedule, TakerConfig
+from taker.config import BroadcastPolicy, Schedule, TakerConfig, resolve_counterparty_count
 from taker.models import MakerSession, PhaseResult, TakerState
 from taker.monitoring import TakerMonitoringMixin
 from taker.multi_directory import MultiDirectoryClient
@@ -389,7 +389,15 @@ class Taker(TakerMonitoringMixin):
             Transaction ID if successful, None otherwise
         """
         try:
-            n_makers = counterparty_count or self.config.counterparty_count
+            # When the caller does not pin a counterparty count, fall back to
+            # the configured value (which may itself be ``None`` to request a
+            # random draw from the upstream-aligned [8, 10] range).
+            requested = (
+                counterparty_count
+                if counterparty_count is not None
+                else self.config.counterparty_count
+            )
+            n_makers = resolve_counterparty_count(requested)
 
             # Determine destination address
             if destination == "INTERNAL":

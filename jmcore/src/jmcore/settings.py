@@ -621,11 +621,16 @@ class MakerSettings(BaseModel):
 class TakerSettings(BaseModel):
     """Taker-specific settings."""
 
-    counterparty_count: int = Field(
-        default=10,
+    counterparty_count: int | None = Field(
+        default=None,
         ge=1,
         le=20,
-        description="Number of makers to select for CoinJoin",
+        description=(
+            "Number of makers to select for CoinJoin. When unset, a random "
+            "value in [8, 10] is drawn for every CoinJoin (matches upstream "
+            "JoinMarket sendpayment and avoids fingerprinting via a fixed "
+            "counterparty count). Set explicitly to override."
+        ),
     )
     max_cj_fee_abs: int = Field(
         default=500,

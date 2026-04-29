@@ -329,7 +329,10 @@
 # ============================================================================
 
 [taker]
-# Number of counterparty makers to use (1-20)
+# Number of counterparty makers to use (1-20).
+# When unset, a random value in [8, 10] is drawn for every CoinJoin (matches
+# the upstream JoinMarket sendpayment default and avoids fingerprinting via a
+# fixed counterparty count). Set explicitly to override.
 # counterparty_count = 10
 
 # Maximum acceptable coinjoin fees (paid to makers, not network/miner fees)
