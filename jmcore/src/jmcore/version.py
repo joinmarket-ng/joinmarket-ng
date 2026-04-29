@@ -7,7 +7,9 @@ All components inherit their version from here.
 
 from __future__ import annotations
 
+import importlib
 import logging
+import sys
 from dataclasses import dataclass
 from typing import Any
 
@@ -28,6 +30,26 @@ def get_version() -> str:
     return __version__
 
 
+def _get_build_info_module() -> object | None:
+    """Return ``jmcore._build_info`` respecting explicit test overrides.
+
+    Tests patch ``sys.modules["jmcore._build_info"]`` to either inject a fake
+    stamped module or explicitly hide the module with ``None``. Using
+    ``importlib.import_module`` directly would bypass that intent in an editable
+    install because the on-disk ``_build_info.py`` still exists inside the
+    worktree. Check ``sys.modules`` first so tests can deterministically control
+    whether stamped build metadata is visible.
+    """
+    module_name = "jmcore._build_info"
+    if module_name in sys.modules:
+        return sys.modules[module_name]
+
+    try:
+        return importlib.import_module(module_name)
+    except ImportError:
+        return None
+
+
 def get_commit_hash() -> str | None:
     """Return the short git commit hash, or None if unavailable.
 
@@ -42,15 +64,12 @@ def get_commit_hash() -> str | None:
        tree retains its working ``.git``.
     3. ``None`` when neither source produced a hash.
     """
-    try:
-        from jmcore import _build_info  # type: ignore[attr-defined,import-not-found]
-
-        commit = getattr(_build_info, "COMMIT", "") or ""
+    build_info = _get_build_info_module()
+    if build_info is not None:
+        commit = getattr(build_info, "COMMIT", "") or ""
         commit = commit.strip()
         if commit:
             return commit
-    except ImportError:
-        pass
 
     import subprocess
     from pathlib import Path
@@ -79,15 +98,12 @@ def get_build_ref() -> str | None:
     that lack both leave this as ``None``; callers should treat that as
     "unknown" rather than "stable".
     """
-    try:
-        from jmcore import _build_info  # type: ignore[attr-defined,import-not-found]
-
-        ref = getattr(_build_info, "REF", "") or ""
+    build_info = _get_build_info_module()
+    if build_info is not None:
+        ref = getattr(build_info, "REF", "") or ""
         ref = ref.strip()
         if ref:
             return ref
-    except ImportError:
-        pass
     return None
 
 
