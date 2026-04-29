@@ -271,6 +271,16 @@ services:
       - TOR__SOCKS_PORT=9050
       - TOR__CONTROL_HOST=jm-tor
       - TOR__CONTROL_PORT=9051
+      # Tumbler runner pacing overrides for e2e tests. Production defaults
+      # in :class:`jmcore.settings.TumblerSettings` are intentionally long
+      # (30 min retry / 30 s confirmation poll / 6 confirmations between
+      # phases) so the runner waits patiently for blockchain confirmations
+      # in the real world. The tumbler e2e suite mines blocks rapidly via
+      # ``_mine_blocks_periodically`` and only polls status for ~15 min
+      # per phase, so we collapse the pacing here.
+      - TUMBLER__RETRY_DELAY_SECONDS=10
+      - TUMBLER__CONFIRMATION_POLL_INTERVAL=2
+      - TUMBLER__MIN_CONFIRMATIONS_BETWEEN_PHASES=1
     ports:
       - "28183:28183"
     volumes:

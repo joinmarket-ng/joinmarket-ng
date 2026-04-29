@@ -778,6 +778,42 @@ class TakerSettings(BaseModel):
     )
 
 
+class TumblerSettings(BaseModel):
+    """Tumbler runner timing knobs.
+
+    These mirror :class:`tumbler.runner.RunnerContext` fields that govern
+    inter-phase pacing. Production defaults are intentionally long so the
+    runner waits patiently for blockchain confirmations and UTXO age between
+    CoinJoin phases. Test environments should shorten these via env vars
+    (``TUMBLER__RETRY_DELAY_SECONDS``, ``TUMBLER__CONFIRMATION_POLL_INTERVAL``,
+    ``TUMBLER__MIN_CONFIRMATIONS_BETWEEN_PHASES``) so e2e suites observe
+    retries within a reasonable wall-clock budget.
+    """
+
+    min_confirmations_between_phases: int = Field(
+        default=6,
+        ge=0,
+        description=(
+            "Minimum confirmations on a CoinJoin output before the next "
+            "tumbler phase may spend it. Set to 0 to disable the gate."
+        ),
+    )
+    confirmation_poll_interval: float = Field(
+        default=30.0,
+        gt=0.0,
+        description="Polling interval (seconds) for the confirmation gate.",
+    )
+    retry_delay_seconds: float = Field(
+        default=1800.0,
+        ge=0.0,
+        description=(
+            "Base delay (seconds) before retrying a failed taker phase. "
+            "Applied with linear backoff: ``retry_delay_seconds * "
+            "attempt_count``. Set to 0 to retry immediately."
+        ),
+    )
+
+
 class DirectoryServerSettings(BaseModel):
     """Directory server specific settings."""
 
@@ -1005,6 +1041,7 @@ class JoinMarketSettings(BaseSettings):
     # Component-specific settings
     maker: MakerSettings = Field(default_factory=MakerSettings)
     taker: TakerSettings = Field(default_factory=TakerSettings)
+    tumbler: TumblerSettings = Field(default_factory=TumblerSettings)
     directory_server: DirectoryServerSettings = Field(default_factory=DirectoryServerSettings)
     orderbook_watcher: OrderbookWatcherSettings = Field(default_factory=OrderbookWatcherSettings)
 

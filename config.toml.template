@@ -379,6 +379,29 @@
 # minimum_makers = 4
 
 # ============================================================================
+# Tumbler Settings
+# ============================================================================
+# These mirror ``tumbler.runner.RunnerContext`` fields that govern
+# inter-phase pacing. Production defaults are intentionally long so the
+# runner waits patiently for blockchain confirmations and UTXO age between
+# CoinJoin phases; tighten via env vars (TUMBLER__RETRY_DELAY_SECONDS, ...)
+# in test environments.
+
+[tumbler]
+# Minimum confirmations on a CoinJoin output before the next tumbler phase
+# may spend it. Set to 0 to disable the gate.
+# min_confirmations_between_phases = 6
+
+# Polling interval (seconds) for the confirmation gate.
+# confirmation_poll_interval = 30.0
+
+# Base delay (seconds) before retrying a failed taker phase. Applied with
+# linear backoff: ``retry_delay_seconds * attempt_count``. Set to 0 to retry
+# immediately.
+# retry_delay_seconds = 1800.0
+
+
+# ============================================================================
 # Directory Server Settings
 # ============================================================================
 

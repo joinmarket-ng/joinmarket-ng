@@ -434,6 +434,9 @@ async def start_plan(
         maker_factory=_maker_factory,
         on_state_changed=_on_state_changed,
         get_confirmations=_get_confirmations,
+        min_confirmations_between_phases=jm_settings.tumbler.min_confirmations_between_phases,
+        confirmation_poll_interval=jm_settings.tumbler.confirmation_poll_interval,
+        retry_delay_seconds=jm_settings.tumbler.retry_delay_seconds,
     )
     runner = TumbleRunner(plan, ctx)
 
