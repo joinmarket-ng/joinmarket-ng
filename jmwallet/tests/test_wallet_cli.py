@@ -636,8 +636,13 @@ def test_generate_with_output_auto_saves():
         assert output_file.exists(), "File should be saved when --output is specified"
 
 
-def test_generate_with_save_uses_default_path():
+def test_generate_with_save_uses_default_path(monkeypatch):
     """Test that default behavior saves to default path."""
+    # Ensure no leaked JOINMARKET_DATA_DIR env var overrides Path.home() resolution.
+    # Typer's ``envvar="JOINMARKET_DATA_DIR"`` on ``--data-dir`` would otherwise
+    # bypass the ``Path.home`` patch below and resolve to a stale directory.
+    monkeypatch.delenv("JOINMARKET_DATA_DIR", raising=False)
+
     with tempfile.TemporaryDirectory() as tmpdir:
         # Override home directory for this test
         with patch.object(Path, "home", return_value=Path(tmpdir)):
@@ -712,8 +717,11 @@ def test_generate_overwrite_protection():
         assert output_file.read_text() != "existing mnemonic"
 
 
-def test_info_uses_default_wallet():
+def test_info_uses_default_wallet(monkeypatch):
     """Test that info command can use default wallet path."""
+    # Ensure no leaked JOINMARKET_DATA_DIR env var overrides Path.home() resolution.
+    monkeypatch.delenv("JOINMARKET_DATA_DIR", raising=False)
+
     with tempfile.TemporaryDirectory() as tmpdir:
         # Create default wallet
         default_wallet = Path(tmpdir) / ".joinmarket-ng" / "wallets" / "default.mnemonic"
