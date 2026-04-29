@@ -259,12 +259,11 @@
 [maker]
 # Minimum CoinJoin amount (in satoshis) that this maker will offer.
 #
-# There is no protocol-level minimum balance per mixdepth to run a maker;
-# 100000 ("100k sats") is a common orientation value for new users but is
-# not a requirement. Lower min_size lets you serve takers requesting
-# smaller mixes at the cost of producing smaller UTXOs.
+# Lower min_size lets you serve takers requesting smaller mixes at the cost of
+# producing smaller UTXOs.
 #
-# Default: DUST_THRESHOLD (the reference implementation's dust limit).
+# Default: 100000 (matches the upstream JoinMarket reference; using a different
+# value may make jm-ng makers fingerprintable).
 # min_size = 100000
 
 # IMPORTANT: offer_type determines which fee setting is used.
@@ -282,9 +281,11 @@
 # offer_type = "sw0reloffer"
 
 # Fee settings (only one is used based on offer_type above)
-# cj_fee_relative = "0.001"  # 0.001 = 0.1% relative fee (for sw0reloffer)
-# cj_fee_absolute = 500      # Absolute fee in satoshis (for sw0absoffer)
-# tx_fee_contribution = 0    # Mining fee contribution in satoshis
+# Defaults match the upstream JoinMarket reference so that jm-ng makers are
+# not trivially distinguishable from reference makers.
+# cj_fee_relative = "0.00002"  # 0.00002 = 0.002% relative fee (for sw0reloffer)
+# cj_fee_absolute = 500        # Absolute fee in satoshis (for sw0absoffer)
+# tx_fee_contribution = 0      # Mining fee contribution in satoshis
 
 # Minimum confirmations for UTXOs
 # min_confirmations = 1

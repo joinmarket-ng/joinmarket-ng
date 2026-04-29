@@ -53,7 +53,6 @@ from pydantic_settings import (
     SettingsConfigDict,
 )
 
-from jmcore.constants import DUST_THRESHOLD
 from jmcore.models import (
     DIRECTORY_NODES_MAINNET,
     DIRECTORY_NODES_SIGNET,
@@ -519,17 +518,24 @@ class MakerSettings(BaseModel):
     """Maker-specific settings."""
 
     min_size: int = Field(
-        default=DUST_THRESHOLD,
+        default=100_000,
         ge=0,
-        description="Minimum CoinJoin amount in satoshis (default: dust threshold)",
+        description=(
+            "Minimum CoinJoin amount in satoshis. Default 100_000 matches the "
+            "upstream JoinMarket reference (avoids fingerprinting jm-ng "
+            "makers via different defaults -- see issue #468)."
+        ),
     )
     offer_type: str = Field(
         default="sw0reloffer",
         description="Offer type: sw0reloffer (relative) or sw0absoffer (absolute)",
     )
     cj_fee_relative: str = Field(
-        default="0.001",
-        description="Relative CoinJoin fee (0.001 = 0.1%)",
+        default="0.00002",
+        description=(
+            "Relative CoinJoin fee. Default 0.00002 (0.002%) matches the "
+            "upstream JoinMarket reference."
+        ),
     )
     cj_fee_absolute: int = Field(
         default=500,

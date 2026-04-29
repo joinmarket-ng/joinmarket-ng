@@ -8,7 +8,6 @@ from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 
 from jmcore.config import TorControlConfig, WalletConfig, create_tor_control_config_from_env
-from jmcore.constants import DUST_THRESHOLD
 from jmcore.models import OfferType
 from jmcore.tor_control import HiddenServiceDoSConfig
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -50,13 +49,20 @@ class OfferConfig(BaseModel):
         description="Offer type (sw0reloffer for relative, sw0absoffer for absolute)",
     )
     min_size: int = Field(
-        default=DUST_THRESHOLD,
+        default=100_000,
         ge=0,
-        description="Minimum CoinJoin amount in satoshis (default: dust threshold)",
+        description=(
+            "Minimum CoinJoin amount in satoshis. "
+            "Default 100_000 matches the upstream JoinMarket reference."
+        ),
     )
     cj_fee_relative: str = Field(
-        default="0.001",
-        description="Relative CJ fee as decimal (0.001 = 0.1%). Used when offer_type is relative.",
+        default="0.00002",
+        description=(
+            "Relative CJ fee as decimal. Default 0.00002 (0.002%) matches the "
+            "upstream JoinMarket reference and avoids fingerprinting jm-ng "
+            "makers via different fee defaults."
+        ),
     )
     cj_fee_absolute: int = Field(
         default=500,
@@ -189,10 +195,13 @@ class MakerConfig(WalletConfig):
     offer_type: OfferType = Field(
         default=OfferType.SW0_RELATIVE, description="Offer type (relative/absolute fee)"
     )
-    min_size: int = Field(
-        default=DUST_THRESHOLD, ge=0, description="Minimum CoinJoin amount in satoshis"
+    min_size: int = Field(default=100_000, ge=0, description="Minimum CoinJoin amount in satoshis")
+    cj_fee_relative: str = Field(
+        default="0.00002",
+        description=(
+            "Relative CJ fee. Default 0.00002 (0.002%) matches the upstream JoinMarket reference."
+        ),
     )
-    cj_fee_relative: str = Field(default="0.001", description="Relative CJ fee (0.001 = 0.1%)")
     cj_fee_absolute: int = Field(default=500, ge=0, description="Absolute CJ fee in satoshis")
     tx_fee_contribution: int = Field(
         default=0, ge=0, description="Transaction fee contribution in satoshis"
