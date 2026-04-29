@@ -359,6 +359,15 @@ compose_cmd() {
 
 # =============================================================================
 # Wait for Bitcoin RPC readiness on a specific port
+#
+# Verifies BOTH:
+#   1. The bitcoind process inside the container is responsive (via bitcoin-cli)
+#   2. The host-mapped RPC port accepts a real RPC over HTTP
+#
+# (1) alone is insufficient because tests connect via the host port, and there
+# is a brief window between bitcoind accepting connections inside the container
+# and Docker fully wiring up the host port forward — under parallel load this
+# race can cause the first few RPC calls from pytest to fail.
 # =============================================================================
 wait_for_bitcoin_rpc() {
     local suite=$1
@@ -366,13 +375,31 @@ wait_for_bitcoin_rpc() {
     local max_attempts=${3:-60}
     local prefix="jm-${suite}"
 
+    # Step 1: bitcoind responsive inside the container
+    local internal_ready=0
     for i in $(seq 1 $max_attempts); do
         if compose_cmd "$suite" exec -T bitcoin \
             bitcoin-cli -chain=regtest -rpcport=18443 \
             -rpcuser=test -rpcpassword=test getblockchaininfo >/dev/null 2>&1; then
-            return 0
+            internal_ready=1
+            break
         fi
         sleep 2
+    done
+    if [[ $internal_ready -ne 1 ]]; then
+        return 1
+    fi
+
+    # Step 2: host port reachable AND HTTP RPC responsive on host
+    for i in $(seq 1 $max_attempts); do
+        if curl -fsS --max-time 2 \
+            --user test:test \
+            -H 'content-type: application/json' \
+            --data '{"jsonrpc":"1.0","id":"wait","method":"getblockchaininfo","params":[]}' \
+            "http://127.0.0.1:${port}" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
     done
     return 1
 }
@@ -598,7 +625,10 @@ run_suite_e2e() {
         cleanup_suite "$suite"
         compose_cmd "$suite" --profile e2e up -d
 
-        wait_for_bitcoin_rpc "$suite" "$btc_rpc"
+        if ! wait_for_bitcoin_rpc "$suite" "$btc_rpc"; then
+            log_error "Bitcoin RPC not ready on host port $btc_rpc for suite $suite"
+            return 1
+        fi
         wait_for_port "$dir_port" "Directory ($suite)"
         wait_for_wallet_funder "$suite"
 
@@ -657,7 +687,10 @@ run_suite_tumbler() {
             bitcoin miner directory directory2 orderbook-watcher tor tor-init wallet-funder \
             jmwalletd maker1 maker2 maker3
 
-        wait_for_bitcoin_rpc "$suite" "$btc_rpc"
+        if ! wait_for_bitcoin_rpc "$suite" "$btc_rpc"; then
+            log_error "Bitcoin RPC not ready on host port $btc_rpc for suite $suite"
+            return 1
+        fi
         wait_for_port "$dir_port" "Directory ($suite)"
         wait_for_wallet_funder "$suite"
 
@@ -719,7 +752,10 @@ run_suite_playwright() {
         cleanup_suite "$suite"
         compose_cmd "$suite" --profile e2e up -d
 
-        wait_for_bitcoin_rpc "$suite" "$btc_rpc"
+        if ! wait_for_bitcoin_rpc "$suite" "$btc_rpc"; then
+            log_error "Bitcoin RPC not ready on host port $btc_rpc for suite $suite"
+            return 1
+        fi
         wait_for_port "$dir_port" "Directory ($suite)"
 
         # Wait for jam-playwright
@@ -762,7 +798,10 @@ run_suite_jmwallet() {
         cleanup_suite "$suite"
         compose_cmd "$suite" up -d bitcoin
 
-        wait_for_bitcoin_rpc "$suite" "$btc_rpc"
+        if ! wait_for_bitcoin_rpc "$suite" "$btc_rpc"; then
+            log_error "Bitcoin RPC not ready on host port $btc_rpc for suite $suite"
+            return 1
+        fi
 
         BITCOIN_RPC_URL="http://127.0.0.1:${btc_rpc}" \
         BITCOIN_RPC_USER=test \
@@ -795,7 +834,10 @@ run_suite_maker() {
         cleanup_suite "$suite"
         compose_cmd "$suite" up -d bitcoin
 
-        wait_for_bitcoin_rpc "$suite" "$btc_rpc"
+        if ! wait_for_bitcoin_rpc "$suite" "$btc_rpc"; then
+            log_error "Bitcoin RPC not ready on host port $btc_rpc for suite $suite"
+            return 1
+        fi
 
         BITCOIN_RPC_URL="http://127.0.0.1:${btc_rpc}" \
         BITCOIN_RPC_USER=test \
@@ -843,7 +885,10 @@ run_suite_reference_interop() {
         cleanup_suite "$suite"
         compose_cmd "$suite" --profile reference up -d
 
-        wait_for_bitcoin_rpc "$suite" "$btc_rpc"
+        if ! wait_for_bitcoin_rpc "$suite" "$btc_rpc"; then
+            log_error "Bitcoin RPC not ready on host port $btc_rpc for suite $suite"
+            return 1
+        fi
         wait_for_port "$dir_port" "Directory ($suite)"
         wait_for_tor "$suite"
         wait_for_jam "$suite"
@@ -881,7 +926,10 @@ run_suite_reference_legacy() {
         cleanup_suite "$suite"
         compose_cmd "$suite" --profile reference up -d
 
-        wait_for_bitcoin_rpc "$suite" "$btc_rpc"
+        if ! wait_for_bitcoin_rpc "$suite" "$btc_rpc"; then
+            log_error "Bitcoin RPC not ready on host port $btc_rpc for suite $suite"
+            return 1
+        fi
         wait_for_port "$dir_port" "Directory ($suite)"
         wait_for_tor "$suite"
         wait_for_jam "$suite"
@@ -920,7 +968,10 @@ run_suite_neutrino_functional() {
         cleanup_suite "$suite"
         compose_cmd "$suite" --profile neutrino up -d
 
-        wait_for_bitcoin_rpc "$suite" "$btc_rpc"
+        if ! wait_for_bitcoin_rpc "$suite" "$btc_rpc"; then
+            log_error "Bitcoin RPC not ready on host port $btc_rpc for suite $suite"
+            return 1
+        fi
         wait_for_port "$dir_port" "Directory ($suite)"
         wait_for_neutrino "$suite" "$neutrino_port"
 
@@ -957,7 +1008,10 @@ run_suite_neutrino_coinjoin() {
         cleanup_suite "$suite"
         compose_cmd "$suite" --profile neutrino up -d
 
-        wait_for_bitcoin_rpc "$suite" "$btc_rpc"
+        if ! wait_for_bitcoin_rpc "$suite" "$btc_rpc"; then
+            log_error "Bitcoin RPC not ready on host port $btc_rpc for suite $suite"
+            return 1
+        fi
         wait_for_port "$dir_port" "Directory ($suite)"
         wait_for_neutrino "$suite" "$neutrino_port"
         wait_for_wallet_funder "$suite"
@@ -997,7 +1051,10 @@ run_suite_neutrino_reference() {
         cleanup_suite "$suite"
         compose_cmd "$suite" --profile reference --profile neutrino up -d
 
-        wait_for_bitcoin_rpc "$suite" "$btc_rpc"
+        if ! wait_for_bitcoin_rpc "$suite" "$btc_rpc"; then
+            log_error "Bitcoin RPC not ready on host port $btc_rpc for suite $suite"
+            return 1
+        fi
         wait_for_port "$dir_port" "Directory ($suite)"
         wait_for_tor "$suite"
         wait_for_jam "$suite"
