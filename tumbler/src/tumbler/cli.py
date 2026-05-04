@@ -40,7 +40,7 @@ from tumbler.persistence import (
 from tumbler.persistence import (
     delete_plan as delete_plan_on_disk,
 )
-from tumbler.plan import MIN_DESTINATIONS, Plan, PlanStatus
+from tumbler.plan import MIN_DESTINATIONS, PhaseStatus, Plan, PlanStatus
 from tumbler.runner import RunnerContext, TumbleRunner
 
 app = typer.Typer(
@@ -63,6 +63,40 @@ def _load_or_error(wallet_name: str, data_dir: Path) -> Plan:
     except PlanCorruptError as exc:
         logger.error(f"Tumbler plan is corrupt: {exc}")
         raise typer.Exit(1)
+
+
+def _reset_plan_for_resume(plan: Plan) -> int:
+    """
+    Reset a terminal-state plan so the runner can pick it up again.
+
+    Completed phases are preserved; FAILED, RUNNING, and CANCELLED phases are
+    rolled back to PENDING with cleared error/timestamp metadata so the
+    runner re-attempts them. ``current_phase`` is moved to the first
+    non-COMPLETED phase, and the plan status is reset to PENDING.
+
+    Returns the number of phases that were rolled back.
+    """
+    rollback_statuses = {PhaseStatus.FAILED, PhaseStatus.RUNNING, PhaseStatus.CANCELLED}
+    rolled_back = 0
+    first_pending: int | None = None
+
+    for phase in plan.phases:
+        if phase.status in rollback_statuses:
+            phase.status = PhaseStatus.PENDING
+            phase.error = None
+            phase.started_at = None
+            phase.finished_at = None
+            # Keep ``attempt_count`` so retry budgets carry across resumes;
+            # otherwise a stuck phase would silently get unlimited retries.
+            rolled_back += 1
+        if first_pending is None and phase.status != PhaseStatus.COMPLETED:
+            first_pending = plan.phases.index(phase)
+
+    plan.current_phase = first_pending if first_pending is not None else len(plan.phases)
+    plan.status = PlanStatus.PENDING
+    plan.error = None
+    plan.touch()
+    return rolled_back
 
 
 def _format_duration(seconds: float) -> str:
@@ -569,6 +603,19 @@ def run_command(
             ),
         ),
     ] = None,
+    resume: Annotated[
+        bool,
+        typer.Option(
+            "--resume",
+            help=(
+                "Resume a plan that ended in a terminal state (FAILED, "
+                "CANCELLED, or stuck-RUNNING). Completed phases are kept; "
+                "all other phases are reset to PENDING and the runner picks "
+                "up at the first non-completed phase. Has no effect on a "
+                "plan that is already PENDING."
+            ),
+        ),
+    ] = False,
     data_dir: Annotated[
         Path | None,
         typer.Option(
@@ -611,18 +658,43 @@ def run_command(
     )
     plan = _load_or_error(effective_wallet, data_dir)
     if plan.status in (PlanStatus.COMPLETED, PlanStatus.FAILED, PlanStatus.CANCELLED):
-        logger.error(
-            f"Plan is in terminal state {plan.status.value}; create a new plan before running."
-        )
-        raise typer.Exit(1)
-    if plan.status == PlanStatus.RUNNING:
-        # A prior process crashed mid-run. Reconcile to FAILED and bail: the
-        # user must inspect and delete before re-planning.
-        plan.status = PlanStatus.FAILED
-        plan.error = plan.error or "previous run crashed"
+        if not resume:
+            logger.error(
+                f"Plan is in terminal state {plan.status.value}; "
+                "pass --resume to retry remaining phases or create a new plan."
+            )
+            raise typer.Exit(1)
+        if plan.status == PlanStatus.COMPLETED:
+            logger.error("Plan is already COMPLETED; nothing to resume.")
+            raise typer.Exit(1)
+        rolled_back = _reset_plan_for_resume(plan)
         save_plan(plan, data_dir)
-        logger.error("Plan was RUNNING on disk but no runner is attached; marked FAILED.")
-        raise typer.Exit(1)
+        logger.warning(
+            f"Resuming plan from terminal state: rolled back {rolled_back} "
+            f"phase(s) to PENDING; restarting at phase {plan.current_phase}."
+        )
+    elif plan.status == PlanStatus.RUNNING:
+        if resume:
+            # Stuck-RUNNING (previous process crashed): resume reconciles
+            # the running phase back to PENDING instead of failing the plan.
+            rolled_back = _reset_plan_for_resume(plan)
+            save_plan(plan, data_dir)
+            logger.warning(
+                "Plan was RUNNING on disk with no attached runner; "
+                f"resumed and rolled back {rolled_back} phase(s) to PENDING."
+            )
+        else:
+            # A prior process crashed mid-run. Reconcile to FAILED and bail:
+            # the user must inspect and pass --resume (or delete) before
+            # re-planning.
+            plan.status = PlanStatus.FAILED
+            plan.error = plan.error or "previous run crashed"
+            save_plan(plan, data_dir)
+            logger.error(
+                "Plan was RUNNING on disk but no runner is attached; marked FAILED. "
+                "Pass --resume to retry."
+            )
+            raise typer.Exit(1)
 
     try:
         asyncio.run(
