@@ -1602,6 +1602,123 @@ class TestDirectConnectionHandshake:
         mock_conn.send.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_try_handle_handshake_accepts_testnet_peer_on_signet(self):
+        """Signet maker must accept peers advertising 'testnet' network.
+
+        The reference JoinMarket implementation sends network='testnet' for
+        both testnet3 and signet because they share the same address encoding
+        (bech32 HRP 'tb', version byte 0x6F).  Rejecting 'testnet' peers
+        while running on signet would break interoperability with all
+        reference-implementation takers on signet.
+        """
+        from unittest.mock import AsyncMock
+
+        from maker.config import MakerConfig
+
+        signet_config = MakerConfig(
+            mnemonic="test " * 12,
+            directory_servers=["localhost:5222"],
+            network=NetworkType.SIGNET,
+        )
+        mock_wallet = MagicMock()
+        mock_wallet.mixdepth_count = 5
+        mock_wallet.utxo_cache = {}
+        mock_wallet.sync_all = AsyncMock()
+        mock_wallet.get_total_balance = AsyncMock(return_value=1_000_000)
+        mock_wallet.get_balance = AsyncMock(return_value=500_000)
+        mock_wallet.get_balance_for_offers = AsyncMock(return_value=500_000)
+        mock_backend = MagicMock()
+        mock_backend.can_provide_neutrino_metadata = MagicMock(return_value=True)
+        mock_backend.get_block_height = AsyncMock(return_value=930000)
+        signet_bot = MakerBot(
+            wallet=mock_wallet,
+            backend=mock_backend,
+            config=signet_config,
+        )
+
+        mock_conn = MagicMock(spec=TCPConnection)
+        mock_conn.send = AsyncMock()
+
+        # Reference implementation peer on signet advertises "testnet"
+        handshake_request = {
+            "type": 793,
+            "line": json.dumps(
+                {
+                    "app-name": "joinmarket",
+                    "directory": False,
+                    "location-string": "NOT-SERVING-ONION",
+                    "proto-ver": 5,
+                    "features": {},
+                    "nick": "J5RefPeer",
+                    "network": "testnet",
+                }
+            ),
+        }
+        data = json.dumps(handshake_request).encode("utf-8")
+
+        result = await signet_bot._try_handle_handshake(mock_conn, data, "test:1234")
+
+        assert result is True
+        # Must respond (not silently drop) — peer is compatible
+        mock_conn.send.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_try_handle_handshake_testnet_maker_accepts_signet_peer(self):
+        """Testnet maker must also accept peers advertising 'signet'.
+
+        Symmetric to the signet case: a testnet maker should accept peers
+        from our implementation which sends 'signet'.
+        """
+        from unittest.mock import AsyncMock
+
+        from maker.config import MakerConfig
+
+        testnet_config = MakerConfig(
+            mnemonic="test " * 12,
+            directory_servers=["localhost:5222"],
+            network=NetworkType.TESTNET,
+        )
+        mock_wallet = MagicMock()
+        mock_wallet.mixdepth_count = 5
+        mock_wallet.utxo_cache = {}
+        mock_wallet.sync_all = AsyncMock()
+        mock_wallet.get_total_balance = AsyncMock(return_value=1_000_000)
+        mock_wallet.get_balance = AsyncMock(return_value=500_000)
+        mock_wallet.get_balance_for_offers = AsyncMock(return_value=500_000)
+        mock_backend = MagicMock()
+        mock_backend.can_provide_neutrino_metadata = MagicMock(return_value=True)
+        mock_backend.get_block_height = AsyncMock(return_value=930000)
+        testnet_bot = MakerBot(
+            wallet=mock_wallet,
+            backend=mock_backend,
+            config=testnet_config,
+        )
+
+        mock_conn = MagicMock(spec=TCPConnection)
+        mock_conn.send = AsyncMock()
+
+        handshake_request = {
+            "type": 793,
+            "line": json.dumps(
+                {
+                    "app-name": "joinmarket",
+                    "directory": False,
+                    "location-string": "NOT-SERVING-ONION",
+                    "proto-ver": 5,
+                    "features": {},
+                    "nick": "J5OurPeer",
+                    "network": "signet",
+                }
+            ),
+        }
+        data = json.dumps(handshake_request).encode("utf-8")
+
+        result = await testnet_bot._try_handle_handshake(mock_conn, data, "test:1234")
+
+        assert result is True
+        mock_conn.send.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_try_handle_handshake_backend_without_neutrino_compat(self, maker_bot):
         """Test that a backend which can't provide metadata doesn't advertise neutrino_compat."""
         mock_conn = MagicMock(spec=TCPConnection)

@@ -198,13 +198,19 @@ class DirectConnectionMixin:
         )
 
         # Validate network
-        if peer_network and peer_network != self.config.network.value:
-            logger.warning(
-                f"Network mismatch from {peer_nick}: "
-                f"{peer_network} != {self.config.network.value}. "
-                f"Not responding to handshake."
-            )
-            return True
+        # testnet and signet share the same address encoding (bech32 HRP "tb",
+        # version byte 0x6F) so the reference implementation advertises "testnet"
+        # for both.  Accept either when we are on signet (or testnet).
+        testnet_family = {"testnet", "signet"}
+        our_net = self.config.network.value
+        if peer_network and peer_network != our_net:
+            if not (peer_network in testnet_family and our_net in testnet_family):
+                logger.warning(
+                    f"Network mismatch from {peer_nick}: "
+                    f"{peer_network} != {our_net}. "
+                    f"Not responding to handshake."
+                )
+                return True
 
         # Build our feature set for the handshake
         features = FeatureSet()
