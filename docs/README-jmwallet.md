@@ -481,7 +481,7 @@ The full CLI reference below is auto-generated from command `--help` output.
 
  REQUIREMENTS:
  - The bond must exist in the registry (created with 'create-bond-address')
- - The bond must be funded (use 'registry-sync' to update UTXO info),
+ - The bond must be funded (use 'jm-wallet list-bonds --mnemonic-file <wallet>' to update UTXO info),
    unless using --test-unfunded for a dry-run signer test
  - The locktime must have expired (or be close enough for your use case)
 

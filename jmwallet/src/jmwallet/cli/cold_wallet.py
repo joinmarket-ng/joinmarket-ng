@@ -1118,8 +1118,8 @@ def spend_bond(
 
     REQUIREMENTS:
     - The bond must exist in the registry (created with 'create-bond-address')
-    - The bond must be funded (use 'registry-sync' to update UTXO info),
-      unless using --test-unfunded for a dry-run signer test
+    - The bond must be funded (use 'jm-wallet list-bonds --mnemonic-file <wallet>'
+      to update UTXO info), unless using --test-unfunded for a dry-run signer test
     - The locktime must have expired (or be close enough for your use case)
 
     SIGNING:
@@ -1173,7 +1173,7 @@ def spend_bond(
     if not bond:
         logger.error(f"Bond not found for address: {bond_address}")
         logger.info("Make sure you have created the bond with 'create-bond-address' first")
-        logger.info("Use 'jm-wallet registry-list' to see all bonds")
+        logger.info("Use 'jm-wallet list-bonds' to see all bonds")
         raise typer.Exit(1)
 
     # Resolve bond UTXO source (real UTXO or synthetic dry-run UTXO)
@@ -1189,8 +1189,8 @@ def spend_bond(
         if not test_unfunded:
             logger.error("Bond is not funded (no UTXO info)")
             logger.info(
-                "Use 'jm-wallet registry-sync' to update UTXO info from the blockchain, "
-                "or manually fund the bond address first"
+                "Use 'jm-wallet list-bonds --mnemonic-file <wallet>' to update UTXO info "
+                "from the blockchain, or manually fund the bond address first"
             )
             logger.info(
                 "If you want to test signer compatibility before funding, rerun with "

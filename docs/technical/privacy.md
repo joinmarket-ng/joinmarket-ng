@@ -105,9 +105,9 @@ Stores bond metadata including:
 - Certificate fields for cold storage bonds
 
 Commands:
-- `jm-wallet registry-list` - List all bonds with status
+- `jm-wallet list-bonds` - List all bonds with status (offline)
+- `jm-wallet list-bonds --mnemonic-file <wallet>` - List bonds and sync UTXO info from blockchain
 - `jm-wallet registry-show <address>` - Show bond details
-- `jm-wallet registry-sync` - Update funding status from blockchain
 
 **Bond Proof Structure (252 bytes):**
 

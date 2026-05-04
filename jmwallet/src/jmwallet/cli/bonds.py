@@ -749,7 +749,7 @@ def import_bond(
     print()
     print(
         "Note: The bond UTXO will be detected on the next wallet sync.\n"
-        "      Run 'jm-wallet balance' to trigger a sync."
+        "      Run 'jm-wallet info' to trigger a sync."
     )
     print("=" * 80 + "\n")
 
