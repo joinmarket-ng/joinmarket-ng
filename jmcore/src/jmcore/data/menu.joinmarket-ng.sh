@@ -546,6 +546,13 @@ post_wallet_create() {
         return 0
     fi
 
+    # Unencrypted wallets have no password to store.
+    jm-wallet verify-password -f "$wallet_path" --no-prompt --password "" \
+        >/dev/null 2>&1
+    if [ $? -eq 2 ]; then
+        return 0
+    fi
+
     # Ask whether to store the encryption password
     if whiptail --title " Store Password " \
         --yesno "Store the wallet password in config.toml?\n\nThis lets all commands (including the maker) work without\nprompting. If you choose No, the maker will ask each time." \
