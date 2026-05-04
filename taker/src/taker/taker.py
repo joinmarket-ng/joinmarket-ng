@@ -1954,6 +1954,7 @@ class Taker(TakerMonitoringMixin):
                         session.supports_neutrino_compat = True
                         logger.debug(f"Maker {nick} sent extended UTXO format (neutrino_compat)")
 
+                    utxo_verification_failed = False
                     for utxo_meta in utxo_metadata_list:
                         txid = utxo_meta.txid
                         vout = utxo_meta.vout
@@ -1982,7 +1983,8 @@ class Taker(TakerMonitoringMixin):
                                         f"Neutrino UTXO verification failed for "
                                         f"{txid}:{vout}: {result.error}"
                                     )
-                                    continue
+                                    utxo_verification_failed = True
+                                    break
                             else:
                                 # Full node: direct UTXO lookup
                                 utxo_info = await self.backend.get_utxo(txid, vout)
@@ -2026,6 +2028,15 @@ class Taker(TakerMonitoringMixin):
                             }
                         )
                         logger.debug(f"Added UTXO from {nick}: {txid}:{vout} = {value} sats")
+
+                    if utxo_verification_failed:
+                        logger.warning(
+                            f"Dropping maker {nick}: one or more UTXOs failed "
+                            "Neutrino verification (likely already spent)"
+                        )
+                        failed_makers.append(nick)
+                        del self.maker_sessions[nick]
+                        continue
 
                     session.cj_address = cj_addr
                     session.change_address = change_addr
