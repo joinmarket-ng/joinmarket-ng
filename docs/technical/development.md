@@ -131,6 +131,7 @@ scripts/update-base-images.sh \
   && scripts/update-deps.sh \
   && scripts/update-flatpak-deps.py \
   && scripts/update_readme_help.py \
+  && scripts/generate_completions.py \
   && prek run --all-files \
   && scripts/run_parallel_tests.sh 2>&1 | tee tmp/run_parallel_tests.log
 ```
