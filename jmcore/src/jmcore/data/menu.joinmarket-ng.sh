@@ -1081,6 +1081,9 @@ CHOICE=$(whiptail --title " JoinMarket-NG Menu " \
               if [ $RESULT -eq 0 ] && [ -f "$WALLET_PATH" ]; then
                   echo ""
                   echo "Wallet saved to: $WALLET_PATH"
+                  echo ""
+                  echo "IMPORTANT: Write down your seed words above before continuing!"
+                  pause
                   # Pass the captured password to post_wallet_create so the
                   # "store in config" branch can reuse it directly.
                   post_wallet_create "$WALLET_PATH" "$NEW_PWD"
@@ -1088,7 +1091,6 @@ CHOICE=$(whiptail --title " JoinMarket-NG Menu " \
                   echo "Wallet creation may have failed. Check output above."
               fi
               unset NEW_PWD
-              pause
               ;;
 
           # --------------------------------------------------------------
@@ -1138,7 +1140,6 @@ CHOICE=$(whiptail --title " JoinMarket-NG Menu " \
                   echo "Import may have failed. Check output above."
               fi
               unset NEW_PWD
-              pause
               ;;
 
           # --------------------------------------------------------------
