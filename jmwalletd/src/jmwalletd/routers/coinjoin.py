@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
 from loguru import logger
 
+from jmcore.paths import remove_nick_state, write_nick_state
 from jmcore.settings import get_settings
 from jmwalletd.deps import get_daemon_state, require_auth, require_wallet_match
 from jmwalletd.errors import (
@@ -257,6 +258,7 @@ async def start_maker(
                 )
                 state._maker_ref = maker
                 state.nickname = maker.nick
+                write_nick_state(state.data_dir, "maker", maker.nick)
 
                 await maker.start()
                 # NOTE: maker.start() blocks until shutdown (it awaits
@@ -271,6 +273,7 @@ async def start_maker(
                 state.nickname = None
                 state._maker_ref = None
                 state._maker_task = None
+                remove_nick_state(state.data_dir, "maker")
 
         state._maker_task = asyncio.create_task(_run_maker())
     except ImportError:

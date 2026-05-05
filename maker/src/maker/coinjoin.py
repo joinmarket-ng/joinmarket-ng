@@ -466,6 +466,7 @@ class CoinJoinSession:
                 return False, {"error": "Session not in correct state for !tx"}
 
             logger.info(f"Received !tx from {self.taker_nick}, verifying...")
+            logger.debug(f"Transaction hex to verify and sign: {tx_hex}")
 
             # Convert network string to NetworkType enum
             network = NetworkType(self.wallet.network)
@@ -588,6 +589,10 @@ class CoinJoinSession:
                 f"(merge_algorithm={self.merge_algorithm}), "
                 f"total value: {sum(u.value for u in selected)} sats"
             )
+            for utxo in selected:
+                logger.debug(
+                    f"  UTXO {utxo.txid}:{utxo.vout} value={utxo.value} sats address={utxo.address}"
+                )
 
             return utxos_dict, cj_address, change_address, max_mixdepth
 

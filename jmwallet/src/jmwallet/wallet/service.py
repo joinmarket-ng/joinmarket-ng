@@ -517,10 +517,7 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin):
         self.reserved_addresses.difference_update(persisted_addresses)
         removed = before - len(self.reserved_addresses)
         if removed > 0:
-            logger.debug(
-                "Pruned %d reserved addresses now covered by persisted history",
-                removed,
-            )
+            logger.debug(f"Pruned {removed} reserved addresses now covered by persisted history")
 
     def reserve_addresses(self, addresses: set[str]) -> None:
         """

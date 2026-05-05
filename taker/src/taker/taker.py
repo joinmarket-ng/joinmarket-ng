@@ -2294,6 +2294,7 @@ class Taker(TakerMonitoringMixin):
             )
 
             logger.info(f"Built unsigned tx: {len(self.unsigned_tx)} bytes")
+            logger.debug(f"Unsigned transaction hex: {self.unsigned_tx.hex()}")
 
             # Log final transaction details
             logger.info(
@@ -2688,6 +2689,11 @@ class Taker(TakerMonitoringMixin):
                             logger.warning(
                                 f"Signature #{sig_idx + 1} from {nick} "
                                 "did not verify against any input"
+                            )
+                            logger.debug(
+                                f"  Unverified sig pubkey={pubkey.hex()[:32]}..., "
+                                f"tried inputs={maker_input_indices}, "
+                                f"already matched={sorted(matched_indices)}"
                             )
 
                     if len(sig_infos) != len(session.utxos):

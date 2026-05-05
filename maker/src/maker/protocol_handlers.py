@@ -739,6 +739,7 @@ class ProtocolHandlersMixin:
                 try:
                     tx_bytes = base64.b64decode(decrypted)
                     tx_hex = tx_bytes.hex()
+                    logger.debug(f"Decoded transaction hex ({len(tx_bytes)} bytes): {tx_hex}")
                 except Exception as e:
                     logger.error(f"Failed to decode transaction: {e}")
                     return

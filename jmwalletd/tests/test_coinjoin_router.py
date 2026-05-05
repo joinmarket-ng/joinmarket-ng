@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -245,6 +246,47 @@ class TestStartMaker:
         assert kwargs["socks_host"] == "127.0.0.1"
         assert kwargs["socks_port"] == 9050
         assert kwargs["stream_isolation"] is False
+
+    @patch("jmwalletd.routers.coinjoin.remove_nick_state")
+    @patch("jmwalletd.routers.coinjoin.write_nick_state")
+    @patch("jmwalletd._backend.get_backend", new_callable=AsyncMock)
+    @patch("maker.bot.MakerBot")
+    @patch("maker.config.MakerConfig")
+    def test_start_maker_writes_nick_state(
+        self,
+        mock_config: Mock,
+        mock_maker_cls: Mock,
+        mock_backend: AsyncMock,
+        mock_write_nick: Mock,
+        mock_remove_nick: Mock,
+        authed_client: tuple[TestClient, str],
+    ) -> None:
+        """Starting the maker via jmwalletd must write the nick state file."""
+        client, token = authed_client
+        state = get_daemon_state()
+        mock_maker = AsyncMock()
+        mock_maker.nick = "J5TestNickWalletd"
+        mock_maker.current_offers = []
+        mock_maker_cls.return_value = mock_maker
+
+        resp = client.post(
+            "/api/v1/wallet/test_wallet.jmdat/maker/start",
+            json={
+                "txfee": "1000",
+                "cjfee_a": "500",
+                "cjfee_r": "0.002",
+                "ordertype": "sw0reloffer",
+                "minsize": "100000",
+            },
+            headers=_auth_headers(token),
+        )
+        assert resp.status_code == 202
+
+        # Allow the background asyncio task to run to completion.
+        time.sleep(0.1)
+
+        mock_write_nick.assert_called_once_with(state.data_dir, "maker", "J5TestNickWalletd")
+        mock_remove_nick.assert_called_once_with(state.data_dir, "maker")
 
 
 class TestStopMaker:
