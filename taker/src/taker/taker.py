@@ -834,6 +834,7 @@ class Taker(TakerMonitoringMixin):
                         destination=destination,
                         mining_fee=estimated_tx_fee,
                         fee_rate=self._fee_rate,
+                        stage="initial",
                     )
                     if not confirmed:
                         logger.info("CoinJoin cancelled by user")
@@ -1367,6 +1368,7 @@ class Taker(TakerMonitoringMixin):
                         destination=destination,
                         mining_fee=actual_mining_fee,
                         fee_rate=actual_fee_rate,
+                        stage="broadcast",
                     )
                     if not confirmed:
                         logger.warning("User declined final broadcast confirmation")

@@ -843,9 +843,9 @@ CHOICE=$(whiptail --title " JoinMarket-NG Menu " \
           echo "Connecting to peers and selecting makers -- this may take"
           echo "up to a minute.  All progress is shown below."
           echo ""
-          echo "Note: if a maker is unreachable a replacement is selected"
-          echo "automatically and you will be asked to confirm the revised"
-          echo "transaction details before it is broadcast."
+          echo "You will be prompted twice:"
+          echo "  1. After makers are selected (fee estimate, confirm the plan)"
+          echo "  2. Before broadcast (final on-chain fees, last chance to cancel)"
           echo ""
 
           TAKER_ARGS=(coinjoin -a "$SEND_AMOUNT" -m "$SEND_MIXDEPTH" -d "$SEND_DEST")

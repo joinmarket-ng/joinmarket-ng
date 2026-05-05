@@ -580,6 +580,7 @@ async def _run_coinjoin(
         destination: str,
         mining_fee: int | None = None,
         fee_rate: float | None = None,
+        stage: str = "",
     ) -> bool:
         """Callback for user confirmation after maker selection."""
         from jmcore.confirmation import confirm_transaction, format_maker_summary
@@ -595,6 +596,7 @@ async def _run_coinjoin(
             mining_fee=mining_fee,
             additional_info=additional_info,
             skip_confirmation=skip_confirmation,
+            stage=stage,
         )
 
     # Create taker

@@ -30,12 +30,18 @@ def _display_coinjoin_confirmation(
     destination: str | None,
     mining_fee: int | None,
     additional_info: dict[str, Any] | None,
+    stage: str = "",
 ) -> None:
     """Display coinjoin confirmation in column format."""
     from jmcore.bitcoin import format_amount
 
     print("\n" + "=" * _COINJOIN_WIDTH)
-    print("Expected COINJOIN Transaction")
+    if stage == "broadcast":
+        print("FINAL COINJOIN Transaction -- ready to broadcast")
+    elif stage == "initial":
+        print("Expected COINJOIN Transaction -- fee estimates, confirm makers")
+    else:
+        print("Expected COINJOIN Transaction")
     print("=" * _COINJOIN_WIDTH)
 
     # Extract info from additional_info
@@ -151,6 +157,7 @@ def confirm_transaction(
     mining_fee: int | None = None,
     additional_info: dict[str, Any] | None = None,
     skip_confirmation: bool = False,
+    stage: str = "",
 ) -> bool:
     """
     Prompt user to confirm a transaction that moves funds.
@@ -163,6 +170,9 @@ def confirm_transaction(
         mining_fee: Mining/transaction fee in satoshis (optional)
         additional_info: Additional details to show (e.g., maker fees, counterparties)
         skip_confirmation: If True, skip prompt (from --yes flag)
+        stage: Prompt stage identifier.  Pass "initial" for the maker-selection
+            estimate and "broadcast" for the final pre-broadcast confirmation.
+            Shown in the section header so users can tell the two prompts apart.
 
     Returns:
         True if user confirms, False otherwise
@@ -188,6 +198,7 @@ def confirm_transaction(
             destination=destination,
             mining_fee=mining_fee,
             additional_info=additional_info,
+            stage=stage,
         )
     else:
         _display_standard_confirmation(
