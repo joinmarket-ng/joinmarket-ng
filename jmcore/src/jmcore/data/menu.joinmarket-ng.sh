@@ -840,12 +840,32 @@ CHOICE=$(whiptail --title " JoinMarket-NG Menu " \
           echo "Counterparties: $SEND_CP"
           echo "Press Ctrl+C to abort."
           echo ""
+          echo "Connecting to peers and selecting makers -- this may take"
+          echo "up to a minute.  All progress is shown below."
+          echo ""
+          echo "Note: if a maker is unreachable a replacement is selected"
+          echo "automatically and you will be asked to confirm the revised"
+          echo "transaction details before it is broadcast."
+          echo ""
 
           TAKER_ARGS=(coinjoin -a "$SEND_AMOUNT" -m "$SEND_MIXDEPTH" -d "$SEND_DEST")
           TAKER_ARGS+=(-n "$SEND_CP")
           [ -n "$SEND_FEE" ] && TAKER_ARGS+=(--fee-rate "$SEND_FEE")
 
           jm-taker "${TAKER_ARGS[@]}"
+          TAKER_EXIT=$?
+
+          echo ""
+          if [ $TAKER_EXIT -eq 0 ]; then
+              echo "================================================"
+              echo " CoinJoin complete.  Check history for the txid."
+              echo "================================================"
+          else
+              echo "================================================"
+              echo " CoinJoin failed or was cancelled."
+              echo " See the log output above for details."
+              echo "================================================"
+          fi
       else
           # Normal transaction via jm-wallet send
           echo "=== Send Bitcoin ==="
@@ -858,6 +878,19 @@ CHOICE=$(whiptail --title " JoinMarket-NG Menu " \
           SEND_ARGS+=("$SEND_DEST")
 
           jm-wallet "${SEND_ARGS[@]}"
+          SEND_EXIT=$?
+
+          echo ""
+          if [ $SEND_EXIT -eq 0 ]; then
+              echo "================================================"
+              echo " Transaction sent successfully."
+              echo "================================================"
+          else
+              echo "================================================"
+              echo " Transaction failed or was cancelled."
+              echo " See the log output above for details."
+              echo "================================================"
+          fi
       fi
       pause
       ;;
