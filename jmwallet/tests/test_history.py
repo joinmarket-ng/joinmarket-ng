@@ -237,6 +237,57 @@ class TestAppendAndReadHistory:
         entries = read_history(temp_data_dir)
         assert entries == []
 
+    def test_on_disk_order_is_chronological_after_update(self, temp_data_dir: Path) -> None:
+        """After an atomic rewrite the CSV rows must be oldest-first.
+
+        Regression test: previously ``_write_history_entries_atomic`` received
+        entries already sorted newest-first by ``read_history`` and wrote them
+        back in that reversed order.  A subsequent ``append_history_entry`` call
+        would then place the new (newest) entry at the *bottom*, making the
+        on-disk file non-chronological and confusing for users inspecting the
+        raw CSV.
+        """
+        import csv as csv_mod
+
+        # Append two entries with increasing timestamps.
+        for i in range(3):
+            entry = TransactionHistoryEntry(
+                timestamp=f"2024-01-0{i + 1}T10:00:00",
+                role="maker",
+                txid=f"{'a' * 60}{i:04d}",
+                cj_amount=1_000_000,
+                failure_reason="Awaiting transaction",
+            )
+            append_history_entry(entry, temp_data_dir)
+
+        # Trigger an atomic rewrite (update_awaiting_transaction_signed reads then rewrites).
+        update_awaiting_transaction_signed(
+            destination_address="",
+            txid=f"{'a' * 60}0000",
+            fee_received=500,
+            txfee_contribution=50,
+            data_dir=temp_data_dir,
+        )
+
+        # Append a new entry after the rewrite.
+        new_entry = TransactionHistoryEntry(
+            timestamp="2024-01-04T10:00:00",
+            role="maker",
+            txid="b" * 64,
+            cj_amount=2_000_000,
+        )
+        append_history_entry(new_entry, temp_data_dir)
+
+        # Read the raw CSV and check rows are in ascending timestamp order.
+        history_path = temp_data_dir / "coinjoin_history.csv"
+        with open(history_path, newline="", encoding="utf-8") as f:
+            reader = csv_mod.DictReader(f)
+            timestamps = [row["timestamp"] for row in reader]
+
+        assert timestamps == sorted(timestamps), (
+            f"On-disk rows are not in chronological order: {timestamps}"
+        )
+
 
 class TestParseUtxos:
     """Tests for _parse_utxos helper."""

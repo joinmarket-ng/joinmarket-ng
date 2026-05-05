@@ -294,9 +294,18 @@ def append_history_entry(
 def _write_history_entries_atomic(
     entries: list[TransactionHistoryEntry], history_path: Path
 ) -> bool:
-    """Rewrite history CSV atomically to avoid partial-file corruption."""
+    """Rewrite history CSV atomically to avoid partial-file corruption.
+
+    Entries are written in chronological order (oldest first) so that the
+    on-disk file is consistently ordered and new entries appended via
+    ``append_history_entry`` maintain that order.
+    """
     fieldnames = _get_fieldnames()
     temp_path: Path | None = None
+
+    # Write oldest-first so the file stays in chronological order and new
+    # appends (which go to the end) remain consistent.
+    sorted_entries = sorted(entries, key=lambda e: e.timestamp)
 
     try:
         with tempfile.NamedTemporaryFile(
@@ -311,7 +320,7 @@ def _write_history_entries_atomic(
             temp_path = Path(temp_file.name)
             writer = csv.DictWriter(temp_file, fieldnames=fieldnames)
             writer.writeheader()
-            for entry in entries:
+            for entry in sorted_entries:
                 row = {f.name: getattr(entry, f.name) for f in fields(entry)}
                 writer.writerow(row)
             temp_file.flush()
