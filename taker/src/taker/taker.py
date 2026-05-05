@@ -419,6 +419,21 @@ class Taker(TakerMonitoringMixin):
             # the configured value (which may itself be ``None`` to request a
             # random draw from the upstream-aligned [8, 10] range).
             self.last_failure_reason = None
+
+            # Re-read maker nick state on every coinjoin attempt.  The maker
+            # may have been started *after* this Taker was constructed (common
+            # in tumbler runs), so the nick read at __init__ time would be
+            # stale.  Refreshing here ensures the hard exclusion is always
+            # current regardless of startup order.
+            current_maker_nick = read_nick_state(self.config.data_dir, "maker")
+            if current_maker_nick:
+                if current_maker_nick not in self.orderbook_manager.own_wallet_nicks:
+                    logger.info(
+                        f"Self-CoinJoin protection: adding maker nick {current_maker_nick} "
+                        "to exclusion set (detected after taker init)"
+                    )
+                self.orderbook_manager.own_wallet_nicks.add(current_maker_nick)
+
             requested = (
                 counterparty_count
                 if counterparty_count is not None

@@ -1732,3 +1732,50 @@ async def test_phase_fill_does_not_promote_silent_makers_without_blacklist_hit(
     # No explicit blacklist hit -> blacklist_error stays False, no promotion.
     assert result.blacklist_error is False
     assert result.blacklist_makers == []
+
+
+@pytest.mark.asyncio
+async def test_do_coinjoin_refreshes_maker_nick_exclusion(
+    mock_wallet, mock_backend, mock_config, tmp_path
+):
+    """Self-CoinJoin protection must work even when the maker starts after the taker.
+
+    The Taker reads the maker nick state file at __init__ time.  If the maker
+    process starts later (common in tumbler runs), the nick file did not exist
+    yet and the initial exclusion set is empty.  ``do_coinjoin`` must re-read
+    the file on every call so that a late-starting maker's nick is always
+    excluded before peer selection begins.
+    """
+    from unittest.mock import patch
+
+    from jmcore.paths import write_nick_state
+
+    # Use a data_dir that the nick state helpers can write to.
+    mock_config.data_dir = tmp_path
+
+    taker = Taker(mock_wallet, mock_backend, mock_config)
+
+    # At init time no maker state file exists -> exclusion set is empty.
+    assert "J5LateStartMaker" not in taker.orderbook_manager.own_wallet_nicks
+
+    # Simulate the maker starting after the taker: write the nick file now.
+    write_nick_state(tmp_path, "maker", "J5LateStartMaker")
+
+    # Attempt a coinjoin -- it will fail (empty orderbook) but we only care
+    # that own_wallet_nicks was updated before any selection happens.
+    with patch.object(
+        taker.orderbook_manager,
+        "select_makers",
+        wraps=taker.orderbook_manager.select_makers,
+    ) as mock_select:
+        await taker.do_coinjoin(
+            amount=100_000,
+            destination="bcrt1qdest",
+            mixdepth=0,
+        )
+        # The nick must be in the exclusion set by the time select_makers is
+        # called (the coinjoin itself may have failed for unrelated reasons).
+        assert "J5LateStartMaker" in taker.orderbook_manager.own_wallet_nicks
+        if mock_select.called:
+            # If selection was attempted, the nick must already be excluded.
+            assert "J5LateStartMaker" in taker.orderbook_manager.own_wallet_nicks

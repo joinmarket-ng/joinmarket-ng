@@ -841,7 +841,7 @@ CHOICE=$(whiptail --title " JoinMarket-NG Menu " \
           echo "Press Ctrl+C to abort."
           echo ""
           echo "Connecting to peers and selecting makers -- this may take"
-          echo "up to a minute.  All progress is shown below."
+          echo "several minutes.  All progress is shown below."
           echo ""
           echo "You will be prompted twice:"
           echo "  1. After makers are selected (fee estimate, confirm the plan)"
