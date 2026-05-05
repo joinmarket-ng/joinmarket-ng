@@ -604,6 +604,9 @@ class MultiDirectoryClient:
         responses: dict[str, dict[str, Any]] = {}
         remaining_nicks = set(expected_nicks)
         deduplicator = ResponseDeduplicator()
+        # For !sig accumulation: track seen data per nick to drop cross-directory
+        # duplicates (the same signature relayed by multiple directory servers).
+        seen_sig_data: dict[str, set[str]] = {}
         start_time = asyncio.get_event_loop().time()
 
         def is_complete() -> bool:
@@ -665,7 +668,16 @@ class MultiDirectoryClient:
                     if len(parts) > 1:
                         data = parts[1].strip()
                         if accumulate_responses:
-                            # Accumulate multiple !sig messages
+                            # Accumulate multiple !sig messages, but deduplicate by content
+                            # to avoid counting the same sig relayed via multiple directories.
+                            nick_seen = seen_sig_data.setdefault(nick, set())
+                            if data in nick_seen:
+                                logger.debug(
+                                    f"Duplicate {expected_command} content from {nick} "
+                                    f"via {source} -- dropped"
+                                )
+                                break
+                            nick_seen.add(data)
                             if nick not in responses:
                                 responses[nick] = {"data": []}
                                 remaining_nicks.discard(nick)

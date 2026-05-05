@@ -589,6 +589,44 @@ class TestMultiDirectoryClientDirectConnections:
         mock_peer.disconnect.assert_called_once()
         assert client._peer_connections == {}
 
+    @pytest.mark.asyncio
+    async def test_wait_for_responses_deduplicates_sig_content_across_directories(self):
+        """Cross-directory duplicate !sig messages must be counted only once.
+
+        When two directory servers both relay the same !sig from a maker, the
+        taker should accumulate only one copy.  Previously the deduplication
+        guard was skipped for !sig, causing the second relay to be treated as a
+        second (spurious) signature that then failed to verify any input.
+        """
+
+        client = make_directory_client()
+
+        maker_nick = "J5TestMaker"
+        sig_data = "deadbeefdeadbeef"
+        # Craft two raw message lines that look like they came from different
+        # directory servers but carry identical !sig payload.
+        msg_dir1 = {"line": f"{maker_nick} !sig {sig_data}", "source": "dir1"}
+        msg_dir2 = {"line": f"{maker_nick} !sig {sig_data}", "source": "dir2"}
+
+        # Pre-load both messages into the direct queue so wait_for_responses
+        # drains them without actually opening network connections.
+        await client._direct_message_queue.put(msg_dir1)
+        await client._direct_message_queue.put(msg_dir2)
+
+        # Stub out directory clients so no real listening happens.
+        client.clients = {}
+
+        responses = await client.wait_for_responses(
+            expected_nicks=[maker_nick],
+            expected_command="!sig",
+            timeout=2.0,
+            expected_counts={maker_nick: 1},
+        )
+
+        assert maker_nick in responses
+        assert len(responses[maker_nick]["data"]) == 1
+        assert responses[maker_nick]["data"][0] == sig_data
+
 
 # --- Tests for Sweep Mode CJ Amount Preservation ---
 
