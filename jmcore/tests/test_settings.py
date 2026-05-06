@@ -178,6 +178,55 @@ class TestSettingsDefaults:
         assert settings.taker.max_cj_fee_rel == "0.001"
         assert settings.taker.tx_broadcast == "random-peer"
 
+    def test_default_zkp_settings(self) -> None:
+        """ZKP credential protocol defaults match JMP-0005."""
+        settings = JoinMarketSettings()
+
+        # 2^51 - 1 sat exceeds the 21M BTC supply cap and matches the embedded
+        # range proof's default bit width (51).
+        assert settings.zkp.max_amount == 2**51 - 1
+        assert settings.zkp.range_proof_width == 51
+        assert settings.zkp.credential_number == 2
+
+    def test_default_tx_extension_settings(self) -> None:
+        """Multi-round transaction-extension defaults match JMP-0006."""
+        settings = JoinMarketSettings()
+
+        assert settings.tx_extension.max_rounds == 2
+        assert settings.tx_extension.extension_window_secs == 60
+        assert settings.tx_extension.freeze_grace_secs == 30
+        assert settings.tx_extension.min_bond_attestation_value == 0
+        assert settings.tx_extension.late_join_bond_threshold == 0
+        assert settings.tx_extension.attestation_threshold_K == 3
+
+    def test_zkp_settings_to_config_round_trip(self) -> None:
+        """ZkpSettings.to_config() preserves all fields."""
+        settings = JoinMarketSettings()
+
+        config = settings.zkp.to_config()
+        assert config.max_amount == settings.zkp.max_amount
+        assert config.range_proof_width == settings.zkp.range_proof_width
+        assert config.credential_number == settings.zkp.credential_number
+
+    def test_tx_extension_settings_to_config_round_trip(self) -> None:
+        """TxExtensionSettings.to_config() preserves all fields."""
+        settings = JoinMarketSettings()
+
+        config = settings.tx_extension.to_config()
+        assert config.max_rounds == settings.tx_extension.max_rounds
+        assert config.extension_window_secs == settings.tx_extension.extension_window_secs
+        assert config.freeze_grace_secs == settings.tx_extension.freeze_grace_secs
+        assert config.min_bond_attestation_value == settings.tx_extension.min_bond_attestation_value
+        assert config.late_join_bond_threshold == settings.tx_extension.late_join_bond_threshold
+        assert config.attestation_threshold_K == settings.tx_extension.attestation_threshold_K
+
+    def test_zkp_amount_rejected_when_exceeds_range_width(self) -> None:
+        """ZkpConfig rejects max_amount that doesn't fit in range_proof_width bits."""
+        from jmcore.config import ZkpConfig
+
+        with pytest.raises(ValueError, match="does not fit"):
+            ZkpConfig(max_amount=2**52, range_proof_width=51)
+
 
 class TestSettingsFromEnv:
     """Tests for loading settings from environment variables."""
@@ -245,6 +294,58 @@ class TestSettingsFromEnv:
         assert settings.bitcoin.neutrino_prefetch_filters is True
         assert settings.bitcoin.neutrino_prefetch_lookback_blocks == 50000
         assert settings.bitcoin.neutrino_scan_lookback_blocks == 75000
+
+    def test_env_override_zkp_settings(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """ZKP credential params can be overridden via env vars."""
+        monkeypatch.setenv("ZKP__MAX_AMOUNT", str(2**40 - 1))
+        monkeypatch.setenv("ZKP__RANGE_PROOF_WIDTH", "40")
+        monkeypatch.setenv("ZKP__CREDENTIAL_NUMBER", "4")
+
+        settings = JoinMarketSettings()
+
+        assert settings.zkp.max_amount == 2**40 - 1
+        assert settings.zkp.range_proof_width == 40
+        assert settings.zkp.credential_number == 4
+
+    def test_env_override_tx_extension_settings(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Transaction-extension knobs can be overridden via env vars."""
+        monkeypatch.setenv("TX_EXTENSION__MAX_ROUNDS", "3")
+        monkeypatch.setenv("TX_EXTENSION__EXTENSION_WINDOW_SECS", "120")
+        monkeypatch.setenv("TX_EXTENSION__FREEZE_GRACE_SECS", "45")
+        monkeypatch.setenv("TX_EXTENSION__MIN_BOND_ATTESTATION_VALUE", "1000000")
+        monkeypatch.setenv("TX_EXTENSION__LATE_JOIN_BOND_THRESHOLD", "500000")
+        monkeypatch.setenv("TX_EXTENSION__ATTESTATION_THRESHOLD_K", "5")
+
+        settings = JoinMarketSettings()
+
+        assert settings.tx_extension.max_rounds == 3
+        assert settings.tx_extension.extension_window_secs == 120
+        assert settings.tx_extension.freeze_grace_secs == 45
+        assert settings.tx_extension.min_bond_attestation_value == 1_000_000
+        assert settings.tx_extension.late_join_bond_threshold == 500_000
+        assert settings.tx_extension.attestation_threshold_K == 5
+
+    def test_env_override_maker_zkp_toggles(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Maker-level ZKP/extension opt-ins are env-controllable."""
+        monkeypatch.setenv("MAKER__ENABLE_ZKP", "true")
+        monkeypatch.setenv("MAKER__ENABLE_TX_EXTENSION", "true")
+        monkeypatch.setenv("MAKER__ENABLE_TX_EXTENSION_LATE_JOIN", "true")
+
+        settings = JoinMarketSettings()
+
+        assert settings.maker.enable_zkp is True
+        assert settings.maker.enable_tx_extension is True
+        assert settings.maker.enable_tx_extension_late_join is True
+
+    def test_env_override_taker_zkp_toggles(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Taker-level ZKP/extension opt-ins are env-controllable."""
+        monkeypatch.setenv("TAKER__ENABLE_ZKP", "true")
+        monkeypatch.setenv("TAKER__ENABLE_TX_EXTENSION", "true")
+
+        settings = JoinMarketSettings()
+
+        assert settings.taker.enable_zkp is True
+        assert settings.taker.enable_tx_extension is True
 
 
 class TestSettingsFromToml:

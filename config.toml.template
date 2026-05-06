@@ -255,6 +255,62 @@
 # retry_base_delay = 5.0     # Base delay in seconds, doubles each retry (1-60)
 
 # ============================================================================
+# ZKP Credential Protocol (JMP-0005)
+# ============================================================================
+#
+# These are protocol-wide constants for the WabiSabi-style credential layer.
+# All participants in a ZKP-coordinated CoinJoin MUST agree on these values;
+# they are advertised in the `!zkpparams` handshake.
+
+[zkp]
+# Maximum credential amount in satoshis. Default 2^51-1 exceeds the BTC
+# supply cap. Determines the range-proof upper bound.
+# max_amount = 2251799813685247
+
+# Bit width of the embedded bit-commitment range proof. Must be consistent
+# with max_amount (max_amount < 2^range_proof_width). Default 51 matches
+# max_amount = 2^51-1.
+# range_proof_width = 51
+
+# Number of credentials issued per registration request. Default 2 lets a
+# maker simultaneously register input and output values.
+# credential_number = 2
+
+# ============================================================================
+# Multi-Round Transaction Extension (JMP-0006)
+# ============================================================================
+#
+# Tunes the WabiSabi-style append-only extension phase that follows the
+# initial round-0 CoinJoin. Advertised by the taker in `!cjext`; MUST be
+# consistent across all participants of a run.
+
+[tx_extension]
+# Maximum number of extension rounds (round 0 + extensions). Default 2
+# matches the JMP-0006 reference.
+# max_rounds = 2
+
+# Wall-clock budget in seconds for the entire extension phase. Default 60
+# matches the JMP-0006 reference.
+# extension_window_secs = 60
+
+# Window in seconds for receiving `!sigfinal` after `!txfreeze`. Default 30
+# matches the JMP-0006 reference.
+# freeze_grace_secs = 30
+
+# Minimum aggregate bond value (sats) required across the K round-0
+# attestation signers for a taker to accept a !cjext. 0 disables the
+# per-attestation floor; takers fall back to the median-bond rule.
+# min_bond_attestation_value = 0
+
+# Minimum bond value (sats) a late joiner must have to participate. 0 means
+# takers use the runtime median bond rule (`late_join_bond_threshold = median_bond`).
+# late_join_bond_threshold = 0
+
+# Number of round-0 makers required to co-sign the bond attestation.
+# Default 3 matches JMP-0006. Capped at 255 by the wire format.
+# attestation_threshold_K = 3
+
+# ============================================================================
 # Maker Settings (Yield Generator)
 # ============================================================================
 
@@ -338,6 +394,24 @@
 # Set to 0 to disable the delay. Default: 600 (10 minutes).
 # offer_reannounce_delay_max = 600
 
+# ZKP credential protocol opt-in (JMP-0005). When false (default), this maker
+# advertises only legacy offers. Flip to true to advertise ZKP-only offers.
+# enable_zkp = false
+
+# Multi-round transaction-extension opt-in (JMP-0006). Requires enable_zkp=true.
+# enable_tx_extension = false
+
+# Advertise willingness to be a late-joiner in extension rounds. Requires
+# enable_tx_extension=true.
+# enable_tx_extension_late_join = false
+
+# Per-offer ZKP/extension flags for the legacy single-offer mode (used when
+# the maker has no explicit `offer_configs` block). Ignored when offer_configs
+# is set; in that case configure flags per-entry inside each OfferConfig.
+# offer_enable_zkp = false
+# offer_enable_tx_extension = false
+# offer_enable_tx_extension_late_join = false
+
 # Onion service settings
 # onion_serving_host = "127.0.0.1"
 # onion_serving_port = 5222
@@ -389,6 +463,15 @@
 # Default: 4 (matches the upstream JoinMarket reference POLICY default; using
 # minimum_makers=1 is fingerprintable and degrades the privacy of the join).
 # minimum_makers = 4
+
+# ZKP credential protocol opt-in (JMP-0005). When false (default), the taker
+# uses only legacy registration even when makers advertise ZKP support. Flip
+# to true to use ZKP credentials when all selected makers advertise the
+# feature.
+# enable_zkp = false
+
+# Multi-round transaction-extension opt-in (JMP-0006). Requires enable_zkp=true.
+# enable_tx_extension = false
 
 # ============================================================================
 # Tumbler Settings

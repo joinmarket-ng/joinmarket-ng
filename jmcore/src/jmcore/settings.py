@@ -42,7 +42,10 @@ import os
 import re
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, ClassVar, Self
+from typing import TYPE_CHECKING, Any, ClassVar, Self
+
+if TYPE_CHECKING:
+    from jmcore.config import TxExtensionConfig, ZkpConfig
 
 from loguru import logger
 from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
@@ -650,6 +653,28 @@ class MakerSettings(BaseModel):
             "offer updates."
         ),
     )
+    enable_zkp: bool = Field(
+        default=False,
+        description=(
+            "Advertise support for the ZKP credential protocol (JMP-0005) "
+            "and respond to `!zkpreq`/`!zkpreg` from takers. Off by default "
+            "while the feature is rolling out."
+        ),
+    )
+    enable_tx_extension: bool = Field(
+        default=False,
+        description=(
+            "Advertise support for the multi-round transaction-extension "
+            "protocol (JMP-0006). Requires enable_zkp=true. Off by default."
+        ),
+    )
+    enable_tx_extension_late_join: bool = Field(
+        default=False,
+        description=(
+            "Advertise that this maker is willing to be a late-joiner in "
+            "extension rounds. Requires enable_tx_extension=true."
+        ),
+    )
 
     @field_validator("cj_fee_relative", mode="before")
     @classmethod
@@ -807,6 +832,22 @@ class TakerSettings(BaseModel):
             "Makers can double-spend their inputs at any time, so a CoinJoin that "
             "is not confirmed within a few hours is unlikely to ever confirm. "
             "Default 24 h; Bitcoin's default mempool expiry is 336 h (14 days)."
+        ),
+    )
+    enable_zkp: bool = Field(
+        default=False,
+        description=(
+            "Use the ZKP credential protocol (JMP-0005) for input/output "
+            "registration when all selected makers advertise the feature. "
+            "Off by default while the feature is rolling out."
+        ),
+    )
+    enable_tx_extension: bool = Field(
+        default=False,
+        description=(
+            "Drive multi-round transaction extension (JMP-0006) when enough "
+            "selected makers advertise `tx_extension_v1`. Requires "
+            "enable_zkp=true."
         ),
     )
 
@@ -995,6 +1036,134 @@ class LoggingSettings(BaseModel):
     )
 
 
+class ZkpSettings(BaseModel):
+    """
+    ZKP credential protocol parameters (JMP-0005).
+
+    These are protocol-wide constants negotiated via the `!zkpparams`
+    handshake. Changing them invalidates compatibility with peers using
+    different values, so all participants in a CoinJoin MUST agree.
+    """
+
+    max_amount: int = Field(
+        default=2**51 - 1,
+        ge=1,
+        description=(
+            "Maximum credential amount in satoshis. Default 2^51-1 exceeds "
+            "the BTC supply cap. Determines the range-proof upper bound."
+        ),
+    )
+    range_proof_width: int = Field(
+        default=51,
+        ge=1,
+        le=64,
+        description=(
+            "Bit width of the embedded bit-commitment range proof. Must be "
+            "consistent with max_amount (max_amount < 2^range_proof_width). "
+            "Default 51 matches max_amount = 2^51-1."
+        ),
+    )
+    credential_number: int = Field(
+        default=2,
+        ge=1,
+        le=8,
+        description=(
+            "Number of credentials issued per registration request. Default "
+            "2 lets a maker simultaneously register input and output values."
+        ),
+    )
+
+    def to_config(self) -> ZkpConfig:
+        """Materialize the runtime :class:`jmcore.config.ZkpConfig`."""
+        from jmcore.config import ZkpConfig
+
+        return ZkpConfig(
+            max_amount=self.max_amount,
+            range_proof_width=self.range_proof_width,
+            credential_number=self.credential_number,
+        )
+
+
+class TxExtensionSettings(BaseModel):
+    """
+    Multi-round transaction-extension parameters (JMP-0006).
+
+    These tune the WabiSabi-style append-only extension phase that follows
+    the initial round-0 CoinJoin. They are advertised by the taker in
+    `!cjext` and MUST be consistent across all participants of a run.
+    """
+
+    max_rounds: int = Field(
+        default=2,
+        ge=1,
+        le=8,
+        description=(
+            "Maximum number of extension rounds (round 0 + extensions). "
+            "Default 2 matches the JMP-0006 reference."
+        ),
+    )
+    extension_window_secs: int = Field(
+        default=60,
+        ge=10,
+        le=600,
+        description=(
+            "Wall-clock budget in seconds for the entire extension phase. "
+            "Default 60 matches the JMP-0006 reference."
+        ),
+    )
+    freeze_grace_secs: int = Field(
+        default=30,
+        ge=5,
+        le=300,
+        description=(
+            "Window in seconds for receiving `!sigfinal` after `!txfreeze`. "
+            "Default 30 matches the JMP-0006 reference."
+        ),
+    )
+    min_bond_attestation_value: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Minimum aggregate bond value (sats) required across the K "
+            "round-0 attestation signers for a taker to accept a !cjext. "
+            "0 disables the per-attestation floor; takers fall back to the "
+            "median-bond rule from JMP-0006."
+        ),
+    )
+    late_join_bond_threshold: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Minimum bond value (sats) a late joiner must have to "
+            "participate. 0 means takers use the runtime median bond rule "
+            "from JMP-0006 (`late_join_bond_threshold = median_bond`)."
+        ),
+    )
+    attestation_threshold_K: int = Field(  # noqa: N815
+        default=3,
+        ge=1,
+        le=255,
+        description=(
+            "Number of round-0 makers required to co-sign the bond "
+            "attestation. Default 3 matches JMP-0006. Capped at 255 by the "
+            "wire format (uint8 count prefix)."
+        ),
+    )
+
+    def to_config(self) -> TxExtensionConfig:
+        """Materialize the runtime :class:`jmcore.config.TxExtensionConfig`."""
+        from jmcore.config import TxExtensionConfig
+
+        return TxExtensionConfig(
+            max_rounds=self.max_rounds,
+            extension_window_secs=self.extension_window_secs,
+            freeze_grace_secs=self.freeze_grace_secs,
+            min_bond_attestation_value=self.min_bond_attestation_value,
+            late_join_bond_threshold=self.late_join_bond_threshold,
+            attestation_threshold_K=self.attestation_threshold_K,
+        )
+
+
 class _CommaListEnvSettingsSource(EnvSettingsSource):
     """Custom env source that decodes list[str] fields from comma-separated strings.
 
@@ -1070,6 +1239,8 @@ class JoinMarketSettings(BaseSettings):
     wallet: WalletSettings = Field(default_factory=WalletSettings)
     notifications: NotificationSettings = Field(default_factory=NotificationSettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
+    zkp: ZkpSettings = Field(default_factory=ZkpSettings)
+    tx_extension: TxExtensionSettings = Field(default_factory=TxExtensionSettings)
 
     # Component-specific settings
     maker: MakerSettings = Field(default_factory=MakerSettings)
@@ -1308,6 +1479,8 @@ def generate_config_template() -> str:
     add_section("Wallet Settings", WalletSettings, "wallet")
     add_section("Notification Settings", NotificationSettings, "notifications")
     add_section("Logging Settings", LoggingSettings, "logging")
+    add_section("ZKP Credential Protocol Settings (JMP-0005)", ZkpSettings, "zkp")
+    add_section("Transaction Extension Settings (JMP-0006)", TxExtensionSettings, "tx_extension")
     add_section("Maker Settings", MakerSettings, "maker")
     add_section("Taker Settings", TakerSettings, "taker")
     add_section("Directory Server Settings", DirectoryServerSettings, "directory_server")

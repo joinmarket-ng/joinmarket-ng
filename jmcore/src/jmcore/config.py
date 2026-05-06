@@ -152,6 +152,61 @@ class BackendConfig(BaseModel):
     model_config = {"frozen": False}
 
 
+class ZkpConfig(BaseModel):
+    """
+    Runtime view of the ZKP credential protocol parameters (JMP-0005).
+
+    Mirrors :class:`jmcore.settings.ZkpSettings`. Maker and taker components
+    consume this at runtime; the settings layer is the user-facing API.
+    """
+
+    max_amount: int = Field(
+        default=2**51 - 1,
+        ge=1,
+        description="Maximum credential amount in satoshis.",
+    )
+    range_proof_width: int = Field(
+        default=51,
+        ge=1,
+        le=64,
+        description="Bit width of the embedded range proof.",
+    )
+    credential_number: int = Field(
+        default=2,
+        ge=1,
+        le=8,
+        description="Credentials issued per registration request.",
+    )
+
+    model_config = {"frozen": False}
+
+    @model_validator(mode="after")
+    def validate_amount_fits_width(self) -> ZkpConfig:
+        if self.max_amount >= (1 << self.range_proof_width):
+            raise ValueError(
+                f"max_amount={self.max_amount} does not fit in "
+                f"range_proof_width={self.range_proof_width} bits"
+            )
+        return self
+
+
+class TxExtensionConfig(BaseModel):
+    """
+    Runtime view of the transaction-extension parameters (JMP-0006).
+
+    Mirrors :class:`jmcore.settings.TxExtensionSettings`.
+    """
+
+    max_rounds: int = Field(default=2, ge=1, le=8)
+    extension_window_secs: int = Field(default=60, ge=10, le=600)
+    freeze_grace_secs: int = Field(default=30, ge=5, le=300)
+    min_bond_attestation_value: int = Field(default=0, ge=0)
+    late_join_bond_threshold: int = Field(default=0, ge=0)
+    attestation_threshold_K: int = Field(default=3, ge=1, le=255)  # noqa: N815
+
+    model_config = {"frozen": False}
+
+
 class WalletConfig(BaseModel):
     """
     Base wallet configuration shared by all JoinMarket wallet users.
@@ -350,5 +405,7 @@ __all__ = [
     "detect_tor_cookie_path",
     "BackendConfig",
     "WalletConfig",
+    "ZkpConfig",
+    "TxExtensionConfig",
     "DirectoryServerConfig",
 ]
