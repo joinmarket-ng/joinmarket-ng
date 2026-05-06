@@ -1,4 +1,6 @@
 #!/bin/bash
+# shellcheck disable=SC2071  # Zero-padded date strings (YYYY-MM, MM) compare correctly as strings;
+                             # numeric comparison would fail on "08", "09" (octal interpretation)
 ################################################################################
 # menu.joinmarket-ng.sh
 # TUI Menu for JoinMarket-NG
@@ -87,10 +89,11 @@ export PATH="${HOME_JM}/.local/bin:$PATH"
 # =============================================================================
 # Notes for Contributors
 # =============================================================================
-# 1. Terminal Buffer: Always `clear` before calling prompt_and_store_password()
-#    or any function that opens a whiptail dialog after terminal output (echo,
-#    jm-wallet output, etc.). This prevents stale terminal buffer from flashing
-#    between whiptail dialogs.
+# 1. Terminal Buffer: `clear` before calling whiptail dialogs that follow
+#    terminal output WITHOUT a `pause` in between. When `pause` is used,
+#    the buffer is cleared automatically (see pause() function).
+#    Example: echo "Preparing..." followed by ensure_wallet_password()
+#    needs an explicit `clear` before the whiptail call.
 #
 # 2. Never use whiptail --msgbox after whiptail --passwordbox.
 #    Two passwordbox dialogs back-to-back without an external process
@@ -106,6 +109,7 @@ export PATH="${HOME_JM}/.local/bin:$PATH"
 pause() {
   echo ""
   read -p "Press [Enter] key to continue..." fakeEnterKey
+  clear
 }
 
 # Helper: Get configured mnemonic file from config.toml
@@ -682,6 +686,7 @@ maker_status() {
 # Main Loop
 # =============================================================================
 
+clear
 while true; do
 
   # Get Maker Service Status
@@ -854,7 +859,6 @@ CHOICE=$(whiptail --title " JoinMarket-NG Menu " \
 
           jm-taker "${TAKER_ARGS[@]}"
           TAKER_EXIT=$?
-
           echo ""
           if [ $TAKER_EXIT -eq 0 ]; then
               echo "================================================"
@@ -1406,25 +1410,26 @@ CHOICE=$(whiptail --title " JoinMarket-NG Menu " \
                                 "No wallet configured.\n\nSet up a wallet first (W -> SEL or NEW)." 9 60
                             continue
                         fi
-                        # Capture the output so we can show a clean TUI msgbox
-                        # when there are no bonds (issue #459) instead of leaving
-                        # the user staring at CLI output. The scan touches the
-                        # network and can take several seconds; we run it in a
-                        # subshell that prints a "scanning" notice on the bare
-                        # terminal so the user has feedback during the wait.
                         BONDS_OUT_FILE=$(mktemp)
                         clear
-                        echo "Scanning for fidelity bonds (this may take a moment)..."
+                        echo "=== Fidelity Bonds ==="
+                        echo ""
+                        echo "Active wallet: $(basename "$CURRENT_WALLET")"
+                        echo "Preparing wallet..."
+                        echo ""
                         (
                             ensure_wallet_password "$CURRENT_WALLET" || exit 1
-                            jm-wallet list-bonds 2>&1
-                        ) > "$BONDS_OUT_FILE"
+                            jm-wallet list-bonds > "$BONDS_OUT_FILE" 2>&1 || exit 2
+                        )
                         BONDS_RC=$?
                         BONDS_OUT=$(cat "$BONDS_OUT_FILE")
                         rm -f "$BONDS_OUT_FILE"
-                        if [ "$BONDS_RC" -ne 0 ]; then
-                            # Surface failures as a TUI error rather than
-                            # silently leaving raw stderr behind.
+                        # Strip ANSI escape sequences from output (issue #459)
+                        BONDS_OUT=$(printf '%s' "$BONDS_OUT" | sed 's/\x1b$$[0-9;]*[mK]//g')
+                        if [ "$BONDS_RC" -eq 1 ]; then
+                            # Password failure - "Too many attempts" msgbox already shown
+                            :
+                        elif [ "$BONDS_RC" -ne 0 ]; then
                             whiptail --title " Fidelity Bonds -- Error " --msgbox \
                                 "Failed to list fidelity bonds.\n\n${BONDS_OUT:-(no output)}" \
                                 20 76
@@ -1448,40 +1453,113 @@ CHOICE=$(whiptail --title " JoinMarket-NG Menu " \
                             whiptail --title " Error " --msgbox "No wallet configured.\nSet up a wallet first (W -> NEW or SEL)." 9 50
                             continue
                         fi
-
-                        # Locktime month (required)
-                        LOCKDATE=$(prompt_param "Fidelity Bond Locktime" \
-                          "Enter locktime as YYYY-MM (must be a future month, e.g. 2027-06).\nCoins are NOT spendable until this date." \
-                          "") || continue
-                        if [ -z "$LOCKDATE" ]; then
-                            whiptail --title " Error " --msgbox "No locktime entered." 8 40
-                            continue
-                        fi
-
-                        # Derivation index (default 0)
-                        BOND_INDEX=$(prompt_param "Bond Index" \
-                          "Derivation index (0 for first bond, 1 for second, etc.)." \
-                          "0") || continue
-                        BOND_INDEX=$(to_int "${BOND_INDEX}" "0")
-
-                        # Confirmation summary
-                        show_summary "Confirm Fidelity Bond -- $(basename "$CURRENT_WALLET")" \
-                          "Locktime|<required>|${LOCKDATE}" \
-                          "Derivation index|0|${BOND_INDEX}" || continue
-
                         clear
                         echo "=== Generating Bond Address ==="
                         echo ""
+                        echo "Active wallet: $(basename "$CURRENT_WALLET")"
+                        echo "Preparing wallet..."
+                        echo ""
                         (
                             ensure_wallet_password "$CURRENT_WALLET" || exit 1
+
+                            # Lockdate (required) - validate format and warn on past dates
+                            CURRENT_YM=$(date +%Y-%m)
+                            while true; do
+                                clear
+                                LOCKDATE=$(prompt_param "Fidelity Bond Lockdate" \
+                                  "\n$WALLET_INFO | Maker Bot: $MAKER_STATUS\n\nEnter lockdate as YYYY-MM.\nCoins are NOT spendable until this date!" \
+                                  "") || exit 1
+                                if ! [[ "$LOCKDATE" =~ ^[0-9]{4}-[0-9]{2}$ ]]; then
+                                    whiptail --title " Date Error " --msgbox "Invalid date format.\nUse YYYY-MM (e.g. 2027-06)." 8 50
+                                    continue
+                                fi
+                                # Validate month is in 01..12
+                                LOCKDATE_MONTH="${LOCKDATE:5:2}"
+                                if [[ "$LOCKDATE_MONTH" < "01" || "$LOCKDATE_MONTH" > "12" ]]; then
+                                    whiptail --title " Date Error " --msgbox "Invalid month.\nMonth must be between 01 and 12." 8 50
+                                    continue
+                                fi
+                                # Validate date is not before epoch (2020-01)
+                                if [[ "$LOCKDATE" < "2020-01" ]]; then
+                                    whiptail --title " Date Error " --msgbox "Invalid lockdate.\nMinimum lockdate is 2020-01." 8 50
+                                    continue
+                                fi
+                                # Validate year is not after 2099 (jm-wallet maximum)
+                                if [[ "$LOCKDATE" > "2099-12" ]]; then
+                                    whiptail --title " Date Error " --msgbox "Invalid lockdate.\nMaximum lockdate is 2099-12." 8 50
+                                    continue
+                                fi
+                                if [[ "$LOCKDATE" < "$CURRENT_YM" ]]; then
+                                    if ! whiptail --title " Warning " \
+                                        --yesno "The lockdate ${LOCKDATE} is in the past.\n\nPast dates are only useful for recreating addresses\nfor existing bonds.\n\nContinue anyway?" \
+                                        12 60 --defaultno 3>&1 1>&2 2>&3; then
+                                        continue
+                                    fi
+                                fi
+                                break
+                            done
+
+                            # Confirmation with explicit lock warning
+                            if [[ "$LOCKDATE" < "$CURRENT_YM" ]]; then
+                                # Past date - coins are already spendable
+                                if ! whiptail --title " Confirm Fidelity Bond " \
+                                    --yesno "\n$WALLET_INFO | Maker Bot: $MAKER_STATUS\n\nGenerate a fidelity bond address?\n\nLockdate: ${LOCKDATE} (Date in the past)\n\nNote: This lockdate is in the past.\nAll coins on this address are spendable.\nThis is only useful for recreating existing bond addresses.\n\nProceed?" \
+                                    16 64 --defaultno 3>&1 1>&2 2>&3; then
+                                    exit 1
+                                fi
+                            else
+                                # Future date - coins will be locked
+                                if ! whiptail --title " Confirm Fidelity Bond " \
+                                    --yesno "\n$WALLET_INFO | Maker Bot: $MAKER_STATUS\n\nGenerate a fidelity bond address?\n\nLockdate: ${LOCKDATE}\n\nWARNING: Coins sent to this address will be LOCKED\n         and NOT spendable until ${LOCKDATE}.\n\nProceed?" \
+                                    16 64 --defaultno 3>&1 1>&2 2>&3; then
+                                    exit 1
+                                fi
+                            fi
+
+                            # Generate bond address, capture output for address extraction
+                            BONDS_CREATE_OUT=$(mktemp)
                             jm-wallet generate-bond-address \
-                              --locktime-date "${LOCKDATE}" \
-                              --index "${BOND_INDEX}"
+                              --locktime-date "${LOCKDATE}" > "$BONDS_CREATE_OUT" 2>&1
+                            BONDS_CREATE_RC=$?
+
+                            if [ $BONDS_CREATE_RC -eq 0 ]; then
+                                # Extract the address (bc1... or other bitcoin address format)
+                                BOND_ADDR=$(grep -oE '(bc1|[13])[a-zA-HJ-NP-Z0-9]{25,87}' "$BONDS_CREATE_OUT" | head -1)
+
+                                # Show address prominently in whiptail msgbox
+                                whiptail --title " Fidelity Bond Address " --msgbox \
+                                    "Bond address generated:\n\n${BOND_ADDR}\n\nSend coins to this address to create the fidelity bond.\nFunds will be LOCKED until ${LOCKDATE}." \
+                                    14 70
+
+                                # Show technical details on terminal
+                                clear
+                                echo "=== Fidelity Bond Technical Details ==="
+                                echo ""
+                                echo "The following details are only needed for advanced use"
+                                echo "(e.g. manual recovery or external verification)."
+                                echo ""
+                                cat "$BONDS_CREATE_OUT"
+                                echo ""
+                                echo "Press [Enter] to return to Fidelity Bonds menu"
+                                pause
+                            else
+                                # Show simple error in msgbox
+                                whiptail --title " Error " --msgbox \
+                                    "Failed to generate bond address.\n\nCheck the terminal output for details." \
+                                    10 55
+
+                                # Show technical details on terminal
+                                clear
+                                echo "=== Fidelity Bond Error Details ==="
+                                echo ""
+                                echo "The following error details may help diagnose the problem."
+                                echo ""
+                                cat "$BONDS_CREATE_OUT"
+                                echo ""
+                                pause
+                            fi
+                            rm -f "$BONDS_CREATE_OUT"
                         )
-                        echo ""
-                        echo "Send coins to the address above to create the fidelity bond."
-                        echo "Funds will be locked until the locktime expires."
-                        pause
                         ;;
                     BACK|"")
                         break
@@ -1491,6 +1569,11 @@ CHOICE=$(whiptail --title " JoinMarket-NG Menu " \
               ;;
       esac
       done
+      ;;
+
+    C)
+      nano "$CONFIG_FILE"
+      clear
       ;;
 
     U)
@@ -1664,10 +1747,6 @@ UCHOICE=$(whiptail --title " Update JoinMarket-NG (current: ${CURRENT_LABEL}) " 
         fi
         exit 0
       done
-      ;;
-
-    C)
-      nano "$CONFIG_FILE"
       ;;
 
     I)
