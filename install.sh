@@ -180,18 +180,30 @@ check_system_dependencies() {
         if [[ "$AUTO_YES" == "true" ]]; then
             print_info "Attempting to install dependencies automatically..."
             if [[ "$PKG_MANAGER" == "apt" ]]; then
-                sudo apt update && sudo apt install -y "${missing_deps[@]}"
+                sudo apt update && sudo apt install -y "${missing_deps[@]}" || {
+                    print_error "Failed to install system dependencies. Please install them manually and re-run."
+                    exit 1
+                }
             elif [[ "$PKG_MANAGER" == "brew" ]]; then
-                brew install "${missing_deps[@]}"
+                brew install "${missing_deps[@]}" || {
+                    print_error "Failed to install system dependencies. Please install them manually and re-run."
+                    exit 1
+                }
             fi
         else
             read -p "Do you want to install them now? [Y/n] " -n 1 -r </dev/tty
             echo
             if [[ ! $REPLY =~ ^[Nn]$ ]]; then
                 if [[ "$PKG_MANAGER" == "apt" ]]; then
-                    sudo apt update && sudo apt install -y "${missing_deps[@]}"
+                    sudo apt update && sudo apt install -y "${missing_deps[@]}" || {
+                        print_error "Failed to install system dependencies. Please install them manually and re-run."
+                        exit 1
+                    }
                 elif [[ "$PKG_MANAGER" == "brew" ]]; then
-                    brew install "${missing_deps[@]}"
+                    brew install "${missing_deps[@]}" || {
+                        print_error "Failed to install system dependencies. Please install them manually and re-run."
+                        exit 1
+                    }
                 fi
             else
                 print_error "Cannot continue without required dependencies."
@@ -249,9 +261,15 @@ setup_tor() {
         if [[ ! $REPLY =~ ^[Nn]$ ]]; then
             print_info "Installing Tor..."
             if [[ "$PKG_MANAGER" == "apt" ]]; then
-                sudo apt update && sudo apt install -y tor
+                sudo apt update && sudo apt install -y tor || {
+                    print_error "Failed to install Tor. Please install it manually and re-run."
+                    exit 1
+                }
             elif [[ "$PKG_MANAGER" == "brew" ]]; then
-                brew install tor
+                brew install tor || {
+                    print_error "Failed to install Tor. Please install it manually and re-run."
+                    exit 1
+                }
             else
                 print_warning "Please install Tor manually for your system"
                 return 0
