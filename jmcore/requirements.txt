@@ -346,8 +346,8 @@ markdown==3.10.2 \
     --hash=sha256:994d51325d25ad8aa7ce4ebaec003febcce822c3f8c911e3b17c52f7f589f950 \
     --hash=sha256:e91464b71ae3ee7afd3017d9f358ef0baf158fd9a298db92f1d4761133824c36
     # via apprise
-nwabisabi @ https://github.com/m0wer/NWabiSabi-Rust/archive/6e0e86cdb1eeb912b4fe527e9e9322cacdf76116.zip \
-    --hash=sha256:dba43ead3066ca3512fe52af8ae384fcffc71c6ccebf3c87a8921b10c0db3511
+nwabisabi @ https://github.com/m0wer/NWabiSabi-Rust/archive/580ae61ac32b41cbb8195ebf0843dee48d419458.zip \
+    --hash=sha256:870a07c431b885bf330d51233c40ff9e7b6f37106fd81872cb0819595a6b27b3
     # via jmcore (jmcore/pyproject.toml)
 oauthlib==3.3.1 \
     --hash=sha256:0f0f8aa759826a193cf66c12ea1af1637f87b9b4622d46e866952bb022e538c9 \

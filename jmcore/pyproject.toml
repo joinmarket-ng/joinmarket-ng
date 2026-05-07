@@ -42,7 +42,7 @@ dependencies = [
     # zip archives, which keeps `pip install --require-hashes` happy
     # downstream (same trick the coincurve pin above uses). Bump the
     # sha when the fork advances.
-    "nwabisabi @ https://github.com/m0wer/NWabiSabi-Rust/archive/6e0e86cdb1eeb912b4fe527e9e9322cacdf76116.zip",
+    "nwabisabi @ https://github.com/m0wer/NWabiSabi-Rust/archive/580ae61ac32b41cbb8195ebf0843dee48d419458.zip",
 ]
 
 [project.optional-dependencies]
