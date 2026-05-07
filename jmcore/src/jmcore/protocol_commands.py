@@ -122,17 +122,20 @@ COMMAND_SPECS: Final[dict[Command, CommandSpec]] = {
     Command.ORDERBOOK: CommandSpec(direction=Direction.PUBLIC, broadcast=True),
     # JMP-0005 ZKP credentials. Directions follow the spec arrows in
     # JMP-0005 phases ZK-1 through ZK-3:
-    #   ZK-1: taker -> maker  !zkpparams       (PUBMSG broadcast)
+    #   ZK-1: taker -> maker  !zkpparams       (encrypted PRIVMSG, per session)
     #   ZK-2: maker -> taker  !zkpissue_in     (encrypted PRIVMSG)
     #         taker -> maker  !zkpcred_in      (encrypted PRIVMSG)
     #   ZK-3: maker -> taker  !zkpreq          (encrypted PRIVMSG)
     #         taker -> maker  !zkpcred         (encrypted PRIVMSG)
     # ``!zkpparams`` carries the issuer parameters which are public by
-    # construction (X = x*G plus auxiliary generators), so it travels
-    # unencrypted on the public channel; every other ZKP command rides
-    # the per-session NaCl tunnel established at ``!pubkey``.
+    # construction (X = x*G plus auxiliary generators). Spec wording
+    # ("the taker broadcasts the issuer parameters to each maker") is
+    # ambiguous between PUBMSG and per-session PRIVMSG; we pick PRIVMSG
+    # so non-ZKP peers on the public channel never see the message and
+    # so the taker's existing per-session fan-out applies without a
+    # bespoke broadcaster.
     Command.ZKPPARAMS: CommandSpec(
-        direction=Direction.PUBLIC, broadcast=True, feature=FeatureGate.ZKP
+        direction=Direction.TAKER_TO_MAKER, encrypted=True, feature=FeatureGate.ZKP
     ),
     Command.ZKPISSUE_IN: CommandSpec(
         direction=Direction.MAKER_TO_TAKER, encrypted=True, feature=FeatureGate.ZKP
