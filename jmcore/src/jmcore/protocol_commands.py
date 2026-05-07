@@ -120,22 +120,31 @@ COMMAND_SPECS: Final[dict[Command, CommandSpec]] = {
     # because the maker re-broadcasts publicly to obfuscate the source.
     Command.HP2: CommandSpec(direction=Direction.PUBLIC, broadcast=True),
     Command.ORDERBOOK: CommandSpec(direction=Direction.PUBLIC, broadcast=True),
-    # JMP-0005 ZKP credentials. All taker<->maker, encrypted, and
-    # gated on the ``zkp`` feature flag.
+    # JMP-0005 ZKP credentials. Directions follow the spec arrows in
+    # JMP-0005 phases ZK-1 through ZK-3:
+    #   ZK-1: taker -> maker  !zkpparams       (PUBMSG broadcast)
+    #   ZK-2: maker -> taker  !zkpissue_in     (encrypted PRIVMSG)
+    #         taker -> maker  !zkpcred_in      (encrypted PRIVMSG)
+    #   ZK-3: maker -> taker  !zkpreq          (encrypted PRIVMSG)
+    #         taker -> maker  !zkpcred         (encrypted PRIVMSG)
+    # ``!zkpparams`` carries the issuer parameters which are public by
+    # construction (X = x*G plus auxiliary generators), so it travels
+    # unencrypted on the public channel; every other ZKP command rides
+    # the per-session NaCl tunnel established at ``!pubkey``.
     Command.ZKPPARAMS: CommandSpec(
-        direction=Direction.MAKER_TO_TAKER, encrypted=True, feature=FeatureGate.ZKP
+        direction=Direction.PUBLIC, broadcast=True, feature=FeatureGate.ZKP
     ),
     Command.ZKPISSUE_IN: CommandSpec(
         direction=Direction.MAKER_TO_TAKER, encrypted=True, feature=FeatureGate.ZKP
     ),
     Command.ZKPCRED_IN: CommandSpec(
-        direction=Direction.MAKER_TO_TAKER, encrypted=True, feature=FeatureGate.ZKP
-    ),
-    Command.ZKPREQ: CommandSpec(
         direction=Direction.TAKER_TO_MAKER, encrypted=True, feature=FeatureGate.ZKP
     ),
-    Command.ZKPCRED: CommandSpec(
+    Command.ZKPREQ: CommandSpec(
         direction=Direction.MAKER_TO_TAKER, encrypted=True, feature=FeatureGate.ZKP
+    ),
+    Command.ZKPCRED: CommandSpec(
+        direction=Direction.TAKER_TO_MAKER, encrypted=True, feature=FeatureGate.ZKP
     ),
     # zkpreg is the bond attestation registration broadcast (PRIVMSG-to-onion
     # primary, PUBMSG fallback per spec). PUBMSG variant is handled via
