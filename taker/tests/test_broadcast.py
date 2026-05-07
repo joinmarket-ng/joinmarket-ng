@@ -732,9 +732,39 @@ class TestHasMempoolAccess:
         )
         assert backend.has_mempool_access() is True
 
-    def test_neutrino_no_mempool(self) -> None:
-        """Test NeutrinoBackend has no mempool access."""
+    def test_neutrino_no_mempool_until_capability_detected(self) -> None:
+        """Without server capability detection, NeutrinoBackend reports no mempool.
+
+        ``has_mempool_access`` requires both the operator-side opt-in
+        (``include_mempool=True``, the default) and the server-side
+        capability flag (``mempool_enabled: true`` on ``/v1/status``).
+        Until ``_detect_capabilities`` runs against a live server, the
+        capability remains false so callers conservatively assume no
+        mempool overlay.
+        """
         from jmwallet.backends.neutrino import NeutrinoBackend
 
         backend = NeutrinoBackend(neutrino_url="http://localhost:8080", network="regtest")
+        assert backend.include_mempool is True  # default
+        assert backend._server_capabilities.has_mempool_tracker is False
+        assert backend.has_mempool_access() is False
+
+    def test_neutrino_mempool_enabled_when_server_supports_it(self) -> None:
+        """When the server advertises the tracker, mempool access is on."""
+        from jmwallet.backends.neutrino import NeutrinoBackend
+
+        backend = NeutrinoBackend(neutrino_url="http://localhost:8080", network="regtest")
+        backend._server_capabilities.has_mempool_tracker = True
+        assert backend.has_mempool_access() is True
+
+    def test_neutrino_mempool_disabled_overrides_server_capability(self) -> None:
+        """Operator opt-out (``include_mempool=False``) wins over the server."""
+        from jmwallet.backends.neutrino import NeutrinoBackend
+
+        backend = NeutrinoBackend(
+            neutrino_url="http://localhost:8080",
+            network="regtest",
+            include_mempool=False,
+        )
+        backend._server_capabilities.has_mempool_tracker = True
         assert backend.has_mempool_access() is False
