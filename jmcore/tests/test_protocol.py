@@ -10,6 +10,8 @@ from jmcore.protocol import (
     FEATURE_PEERLIST_FEATURES,
     FEATURE_PING,
     FEATURE_PUSH_ENCRYPTED,
+    FEATURE_TX_EXTENSION_V1,
+    FEATURE_ZKP_CREDENTIALS_V1,
     JM_VERSION,
     JM_VERSION_MIN,
     NOT_SERVING_ONION_HOSTNAME,
@@ -873,3 +875,61 @@ class TestPingFeature:
         """FeatureSet.from_handshake() with ping=False should not include it."""
         fs = FeatureSet.from_handshake({"features": {"ping": False}})
         assert fs.supports_ping() is False
+
+
+class TestZkpAndTxExtensionFeatures:
+    """Tests for JMP-0005 / JMP-0006 feature constants and dependency rules."""
+
+    def test_constants_distinct(self):
+        """Each new feature has a unique stable string identifier."""
+        assert FEATURE_ZKP_CREDENTIALS_V1 == "zkp_credentials_v1"
+        assert FEATURE_TX_EXTENSION_V1 == "tx_extension_v1"
+        assert FEATURE_ZKP_CREDENTIALS_V1 != FEATURE_TX_EXTENSION_V1
+
+    def test_constants_in_all_features(self):
+        """ALL_FEATURES advertises both new flags so handshake validation accepts them."""
+        assert FEATURE_ZKP_CREDENTIALS_V1 in ALL_FEATURES
+        assert FEATURE_TX_EXTENSION_V1 in ALL_FEATURES
+
+    def test_supports_zkp_credentials_v1(self):
+        fs = FeatureSet.from_list([FEATURE_ZKP_CREDENTIALS_V1])
+        assert fs.supports_zkp_credentials_v1()
+        assert not fs.supports_tx_extension_v1()
+
+    def test_supports_tx_extension_v1(self):
+        # Both must be advertised to satisfy the declared dependency.
+        fs = FeatureSet.from_list([FEATURE_ZKP_CREDENTIALS_V1, FEATURE_TX_EXTENSION_V1])
+        assert fs.supports_zkp_credentials_v1()
+        assert fs.supports_tx_extension_v1()
+
+    def test_tx_extension_requires_zkp(self):
+        """tx_extension_v1 advertised without zkp_credentials_v1 is rejected."""
+        fs = FeatureSet.from_list([FEATURE_TX_EXTENSION_V1])
+        ok, msg = fs.validate_dependencies()
+        assert ok is False
+        assert FEATURE_ZKP_CREDENTIALS_V1 in msg
+        assert FEATURE_TX_EXTENSION_V1 in msg
+
+    def test_zkp_alone_is_valid(self):
+        """zkp_credentials_v1 has no dependencies so it stands alone."""
+        fs = FeatureSet.from_list([FEATURE_ZKP_CREDENTIALS_V1])
+        ok, msg = fs.validate_dependencies()
+        assert ok is True, msg
+
+    def test_handshake_roundtrip(self):
+        """Both new features survive a handshake dict round-trip."""
+        fs = FeatureSet.from_list([FEATURE_ZKP_CREDENTIALS_V1, FEATURE_TX_EXTENSION_V1])
+        d = fs.to_dict()
+        assert d[FEATURE_ZKP_CREDENTIALS_V1] is True
+        assert d[FEATURE_TX_EXTENSION_V1] is True
+        recovered = FeatureSet.from_handshake({"features": d})
+        assert recovered.supports_zkp_credentials_v1()
+        assert recovered.supports_tx_extension_v1()
+
+    def test_intersection_with_legacy_peer(self):
+        """A taker that wants tx_extension intersected with a legacy maker yields nothing."""
+        taker = FeatureSet.from_list([FEATURE_ZKP_CREDENTIALS_V1, FEATURE_TX_EXTENSION_V1])
+        legacy = FeatureSet.from_list([FEATURE_NEUTRINO_COMPAT])
+        common = taker.intersection(legacy)
+        assert not common.supports_zkp_credentials_v1()
+        assert not common.supports_tx_extension_v1()

@@ -77,6 +77,18 @@ FEATURE_NEUTRINO_COMPAT = "neutrino_compat"
 FEATURE_PUSH_ENCRYPTED = "push_encrypted"
 FEATURE_PEERLIST_FEATURES = "peerlist_features"  # Supports extended peerlist with F: suffix
 FEATURE_PING = "ping"  # Supports application-level PING/PONG heartbeat
+# JMP-0005 KVAC credentials. Advertised by peers that implement the
+# WabiSabi-style credential exchange (Phases ZK-1 through ZK-5). When
+# both sides advertise this, the taker fires ``!zkpparams`` after
+# ``!pubkey`` and the maker replaces ``cj_address``/``change_address``
+# in ``!ioauth`` with input commitments. Legacy peers (no ZKP support)
+# continue with the JMP-0001 plaintext-address flow.
+FEATURE_ZKP_CREDENTIALS_V1 = "zkp_credentials_v1"
+# JMP-0006 multi-round transaction extension. Advertised by peers that
+# support the CLSAG bond attestation + append-only round flow. Strictly
+# requires ZKP credentials so we can scope late-joiner inputs to the
+# same epoch; declared as a hard dependency below.
+FEATURE_TX_EXTENSION_V1 = "tx_extension_v1"
 
 # Feature dependencies: feature -> list of required features
 FEATURE_DEPENDENCIES: dict[str, list[str]] = {
@@ -84,6 +96,10 @@ FEATURE_DEPENDENCIES: dict[str, list[str]] = {
     FEATURE_PUSH_ENCRYPTED: [],  # Requires NaCl session, but that's implicit
     FEATURE_PEERLIST_FEATURES: [],  # No dependencies
     FEATURE_PING: [],  # No dependencies
+    FEATURE_ZKP_CREDENTIALS_V1: [],
+    # tx_extension reuses the credential epoch to bind late-joiner
+    # input commitments, so it MUST NOT be advertised without ZKP.
+    FEATURE_TX_EXTENSION_V1: [FEATURE_ZKP_CREDENTIALS_V1],
 }
 
 # All known features
@@ -92,6 +108,8 @@ ALL_FEATURES = {
     FEATURE_PUSH_ENCRYPTED,
     FEATURE_PEERLIST_FEATURES,
     FEATURE_PING,
+    FEATURE_ZKP_CREDENTIALS_V1,
+    FEATURE_TX_EXTENSION_V1,
 }
 
 
@@ -165,6 +183,19 @@ class FeatureSet:
     def supports_ping(self) -> bool:
         """Check if peer supports application-level PING/PONG heartbeat."""
         return FEATURE_PING in self.features
+
+    def supports_zkp_credentials_v1(self) -> bool:
+        """Check if peer supports JMP-0005 WabiSabi-style KVAC credentials."""
+        return FEATURE_ZKP_CREDENTIALS_V1 in self.features
+
+    def supports_tx_extension_v1(self) -> bool:
+        """Check if peer supports JMP-0006 multi-round tx-extension flow.
+
+        Note: ``FEATURE_DEPENDENCIES`` declares ZKP as a hard prerequisite,
+        so :meth:`validate_dependencies` will reject any feature set that
+        advertises tx-extension without credentials.
+        """
+        return FEATURE_TX_EXTENSION_V1 in self.features
 
     def validate_dependencies(self) -> tuple[bool, str]:
         """Check that all feature dependencies are satisfied."""

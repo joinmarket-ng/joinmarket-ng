@@ -106,6 +106,8 @@ from jmcore.podle import (
 from jmcore.protocol import (
     FEATURE_NEUTRINO_COMPAT,
     FEATURE_PUSH_ENCRYPTED,
+    FEATURE_TX_EXTENSION_V1,
+    FEATURE_ZKP_CREDENTIALS_V1,
     JM_VERSION,
     JM_VERSION_MIN,
     FeatureSet,
@@ -264,6 +266,8 @@ __all__ = [
     # Protocol
     "FEATURE_NEUTRINO_COMPAT",
     "FEATURE_PUSH_ENCRYPTED",
+    "FEATURE_TX_EXTENSION_V1",
+    "FEATURE_ZKP_CREDENTIALS_V1",
     "FeatureSet",
     "JM_VERSION",
     "JM_VERSION_MIN",
