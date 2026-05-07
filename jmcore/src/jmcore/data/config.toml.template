@@ -116,6 +116,12 @@
 # Useful in Docker environments where the token is generated into a shared volume.
 # Relative paths are resolved against the data directory (see neutrino_tls_cert).
 # neutrino_auth_token_file = "neutrino/auth_token"
+#
+# Include unconfirmed entries from the neutrino-api watched mempool tracker in
+# UTXO listings, and overlay mempool spends on single-UTXO checks. Has no
+# effect against older neutrino-api builds without the tracker. Set to false
+# for chain-only behaviour.
+# neutrino_include_mempool = true
 
 # ============================================================================
 # Network Settings
