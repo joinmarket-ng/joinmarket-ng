@@ -109,16 +109,29 @@ Trade-off: Addresses stored in Core wallet file - never use with third-party nod
 
 **Neutrino Broadcast Strategy:**
 
-Neutrino cannot access the mempool, affecting transaction verification:
+Neutrino's broadcast and verification behavior depends on whether the
+connected `neutrino-api` server exposes the watched-only mempool
+tracker (`mempool_enabled: true` on `/v1/status`).
 
-| Policy | Behavior |
-|--------|----------|
-| `SELF` | Broadcast via own backend (always verifiable) |
-| `RANDOM_PEER` | Try makers sequentially, fall back to self |
-| `MULTIPLE_PEERS` | Broadcast to N makers simultaneously (default) |
-| `NOT_SELF` | Try makers only, no fallback |
+| Policy | With mempool tracker | Without mempool tracker (legacy) |
+|--------|----------------------|---------------------------------|
+| `SELF` | Broadcast via own backend, verify via mempool, then confirmation | Broadcast via own backend (always verifiable on chain) |
+| `RANDOM_PEER` | Try makers sequentially, verify via mempool, fall back to self | Forced to all-makers fan-out (see below) |
+| `MULTIPLE_PEERS` | Broadcast to N makers simultaneously (default), verify via mempool | Forced to all-makers fan-out |
+| `NOT_SELF` | Try makers only, verify via mempool, no fallback | Forced to all-makers fan-out, no fallback |
 
-Confirmation monitoring uses block-based UTXO lookups.
+When mempool access is unavailable (legacy server, or operator opt-out
+via `bitcoin.neutrino_include_mempool = false`), all non-`SELF`
+policies fan out the `!push` to every available maker simultaneously.
+This avoids the privacy-leaking self-broadcast fallback when an
+individual maker is offline (issue #482); confirmation is then
+established via block-based UTXO lookups.
+
+When the tracker is available, neutrino behaves like the descriptor
+wallet backend: it can confirm that a maker actually broadcast the
+transaction and short-circuit the fan-out. `jm-wallet info
+--extended` also annotates addresses with `(unconfirmed)` for
+mempool UTXOs.
 
 ### Periodic Wallet Rescan
 
