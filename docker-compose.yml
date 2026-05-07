@@ -1228,7 +1228,16 @@ services:
   # ============================================================================
 
   neutrino:
-    image: ghcr.io/m0wer/neutrino-api:latest
+    # Default image is the upstream published build. Override
+    # ``NEUTRINO_API_IMAGE`` to test a different tag, e.g. a PR build
+    # produced via:
+    #
+    #   docker build -t neutrino-api:pr3 \
+    #     https://github.com/m0wer/neutrino-api.git#refs/pull/3/head:neutrino_server
+    #   NEUTRINO_API_IMAGE=neutrino-api:pr3 docker compose --profile neutrino up
+    #
+    # CI keeps the default so it tracks ``:latest`` automatically.
+    image: ${NEUTRINO_API_IMAGE:-ghcr.io/m0wer/neutrino-api:latest}
     container_name: jm-neutrino
     restart: unless-stopped
     logging:
