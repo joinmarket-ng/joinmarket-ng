@@ -15,6 +15,7 @@ Reference: Original joinmarket-clientserver/src/jmclient/taker.py
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from typing import Any
 
@@ -24,6 +25,7 @@ from jmcore.btc_script import derive_bond_address
 from jmcore.commitment_blacklist import set_blacklist_path
 from jmcore.crypto import NickIdentity
 from jmcore.encryption import CryptoSession
+from jmcore.models import Offer
 from jmcore.notifications import get_notifier
 from jmcore.paths import read_nick_state
 from jmcore.protocol import FEATURE_NEUTRINO_COMPAT, JM_VERSION, parse_utxo_list
@@ -46,6 +48,11 @@ from jmwallet.wallet.signing import (
 )
 from loguru import logger
 
+from taker.attestation_phase import (
+    AttestationRoundResult,
+    MakerAttestParticipant,
+    run_attestation_round,
+)
 from taker.config import BroadcastPolicy, Schedule, TakerConfig, resolve_counterparty_count
 from taker.models import MakerSession, PhaseResult, TakerState
 from taker.monitoring import TakerMonitoringMixin
@@ -53,6 +60,7 @@ from taker.multi_directory import MultiDirectoryClient
 from taker.orderbook import OrderbookManager, calculate_cj_fee
 from taker.podle import ExtendedPoDLECommitment, get_eligible_podle_utxos
 from taker.podle_manager import PoDLEManager
+from taker.ring_assembly import RingAssembly, RingAssemblyError, assemble_ring
 from taker.tx_builder import CoinJoinTxBuilder, build_coinjoin_tx
 
 # Backward-compatible re-exports: many tests and modules import these from taker.taker
@@ -140,6 +148,11 @@ class Taker(TakerMonitoringMixin):
         self.tx_metadata: dict[str, Any] = {}
         self.final_tx: bytes = b""
         self.txid: str = ""
+        # 32-byte run identifier scoping a single CoinJoin attempt's
+        # tx-extension domain separation (binds CLSAG attestations and
+        # later KVAC issuance to this attempt). Reset on every
+        # ``do_coinjoin`` start; empty until then.
+        self.run_id: bytes = b""
         self.preselected_utxos: list[UTXOInfo] = []  # UTXOs pre-selected for CoinJoin
         self.selected_utxos: list[UTXOInfo] = []  # Taker's final selected UTXOs for signing
         # Counterparty nicks selected for the most recent ``do_coinjoin`` call.
@@ -415,6 +428,10 @@ class Taker(TakerMonitoringMixin):
             # Reset per-call state so callers reading ``last_used_nicks`` after
             # a failure don't pick up nicks from a previous successful round.
             self.last_used_nicks = set()
+            # Reset run_id so a fresh CLSAG attestation domain is in effect for
+            # this attempt; minted lazily on first use by the tx-extension
+            # phase to avoid wasting entropy when extensions are disabled.
+            self.run_id = b""
             # When the caller does not pin a counterparty count, fall back to
             # the configured value (which may itself be ``None`` to request a
             # random draw from the upstream-aligned [8, 10] range).
@@ -2095,6 +2112,139 @@ class Taker(TakerMonitoringMixin):
             except (ValueError, KeyError):
                 continue
         return result
+
+    def _ensure_run_id(self) -> bytes:
+        """Lazily mint a 32-byte run identifier for this CoinJoin attempt.
+
+        Idempotent across the attempt: subsequent calls return the same
+        bytes so every extension round (and later KVAC issuance) shares
+        the same domain-separation tag. Reset by ``do_coinjoin`` at the
+        start of each attempt.
+        """
+        if not self.run_id:
+            self.run_id = os.urandom(32)
+            logger.debug(f"minted run_id={self.run_id.hex()[:16]}.. for tx-extension")
+        return self.run_id
+
+    def _build_attest_participants(
+        self,
+        ring_assembly: RingAssembly,
+    ) -> tuple[list[MakerAttestParticipant], list[str]]:
+        """Translate the round's ring assembly into participant records.
+
+        Returns the list of participants the round can address plus the
+        list of selected nicks that had to be dropped (e.g. their
+        ``MakerSession`` is missing crypto/comm_channel state). Dropped
+        nicks become caller-visible failed-makers without ever issuing
+        a network call for them.
+        """
+        participants: list[MakerAttestParticipant] = []
+        dropped: list[str] = []
+        for nick, signer_idx in ring_assembly.signer_idx_by_nick.items():
+            session = self.maker_sessions.get(nick)
+            if session is None or session.crypto is None or not session.comm_channel:
+                logger.warning(
+                    f"!attestreq skip {nick}: missing session/crypto/comm_channel "
+                    f"(crypto={'set' if session and session.crypto else 'unset'}, "
+                    f"channel={'set' if session and session.comm_channel else 'unset'})"
+                )
+                dropped.append(nick)
+                continue
+            participants.append(
+                MakerAttestParticipant(
+                    nick=nick,
+                    signer_idx=signer_idx,
+                    crypto=session.crypto,
+                    comm_channel=session.comm_channel,
+                )
+            )
+        return participants, dropped
+
+    async def _phase_attest_round(
+        self,
+        round_no: int,
+    ) -> tuple[AttestationRoundResult, RingAssembly] | None:
+        """Run a single CLSAG attestation round across the current sessions.
+
+        Builds a deterministic ring from selected makers + orderbook
+        decoys, fans out !attestreq, awaits !attest replies, and returns
+        the decoded payloads alongside the assembled ring. Returns
+        ``None`` if the orderbook can't supply a viable ring; the caller
+        treats this as an extension-phase abort (taker will fall through
+        to the legacy single-round CoinJoin path).
+
+        Per-maker failures (missing session state, send/encrypt errors,
+        no reply, decode errors, run_id/round mismatch) are funneled
+        into the result's ``failed_makers``; the round always runs to
+        completion before the caller decides whether to abort.
+        """
+        if not self.maker_sessions:
+            logger.warning(f"_phase_attest_round[{round_no}]: no maker sessions")
+            return None
+
+        tx_ext = self.config.tx_extension
+        run_id = self._ensure_run_id()
+
+        # Resolve target ring size. We honour ``target_anonymity_set_size``
+        # whenever the orderbook can support it; the assembler shrinks
+        # toward what's actually available, never below the floor.
+        min_set = tx_ext.min_anonymity_set_size
+        target_set = max(tx_ext.target_anonymity_set_size, min_set)
+
+        selected_offers: dict[str, Offer] = {
+            nick: session.offer for nick, session in self.maker_sessions.items()
+        }
+        decoy_pool = list(self.orderbook_manager.offers)
+
+        try:
+            ring_assembly = assemble_ring(
+                selected_offers=selected_offers,
+                decoy_pool=decoy_pool,
+                target_set_size=target_set,
+                run_id=run_id,
+                min_set_size=min_set,
+            )
+        except RingAssemblyError as e:
+            logger.warning(f"_phase_attest_round[{round_no}]: ring assembly failed: {e}")
+            return None
+
+        participants, pre_dropped = self._build_attest_participants(ring_assembly)
+        if not participants:
+            logger.warning(
+                f"_phase_attest_round[{round_no}]: no addressable participants "
+                f"(dropped={len(pre_dropped)})"
+            )
+            return AttestationRoundResult(
+                decoded={},
+                failed_makers=pre_dropped,
+            ), ring_assembly
+
+        round_result = await run_attestation_round(
+            directory_client=self.directory_client,
+            run_id=run_id,
+            round_no=round_no,
+            ring=ring_assembly.ring,
+            participants=participants,
+            timeout=self.config.maker_timeout_sec,
+        )
+
+        # Merge in the makers we couldn't address at all.
+        failed = list(round_result.failed_makers)
+        for nick in pre_dropped:
+            if nick not in failed and nick not in round_result.decoded:
+                failed.append(nick)
+
+        merged = AttestationRoundResult(
+            decoded=round_result.decoded,
+            failed_makers=failed,
+        )
+        logger.info(
+            f"_phase_attest_round[{round_no}]: "
+            f"set_size={ring_assembly.set_size} "
+            f"attested={len(merged.decoded)}/{len(ring_assembly.signer_idx_by_nick)} "
+            f"failed={len(merged.failed_makers)}"
+        )
+        return merged, ring_assembly
 
     async def _phase_build_tx(self, destination: str, mixdepth: int) -> bool:
         """Build the unsigned CoinJoin transaction."""
