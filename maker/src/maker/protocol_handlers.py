@@ -13,6 +13,7 @@ import json
 import os
 from typing import TYPE_CHECKING, Any
 
+from jmcore.attestation_wire import AttestPayload, AttestWireError, decode_attestreq, encode_attest
 from jmcore.commitment_blacklist import add_commitment, check_commitment, validate_commitment_hex
 from jmcore.crypto import NickIdentity
 from jmcore.deduplication import MessageDeduplicator
@@ -38,6 +39,7 @@ from jmwallet.wallet.service import WalletService
 from loguru import logger
 from pydantic import ValidationError
 
+from maker.attestation_signer import DuplicateAttestationError
 from maker.coinjoin import CoinJoinSession
 from maker.config import MakerConfig
 from maker.fidelity import FidelityBondInfo, create_fidelity_bond_proof
@@ -380,7 +382,8 @@ class ProtocolHandlersMixin:
             Command.TX: self._handle_tx,
             Command.PUSH: self._handle_push,
             Command.HP2: _hp2_adapter,
-            # ZKP / tx-extension handlers land in later phases; commands
+            Command.ATTESTREQ: self._handle_attestreq,
+            # Other ZKP / tx-extension handlers land in later phases; commands
             # are accepted by the registry but routed to no handler yet.
         }
 
@@ -937,6 +940,100 @@ class ProtocolHandlersMixin:
         except Exception as e:
             logger.error(f"Failed to handle !push: {e}")
 
+    async def _handle_attestreq(
+        self: MakerBotProtocol, taker_nick: str, msg: str, source: str = "unknown"
+    ) -> None:
+        """Handle !attestreq from taker (tx-extension bond attestation).
+
+        The plaintext is a single ENCRYPTED token, base64-encoded NaCl
+        ciphertext. After decryption, the wire codec yields the run id,
+        round number, signer index, and the full disclosed ring. The
+        maker signs a CLSAG ring signature over the canonical attestation
+        message and replies with !attest (also encrypted).
+
+        Failures are logged but never raised back over the wire so a
+        malicious taker cannot probe maker internals via crash signals.
+        """
+        if taker_nick not in self.active_sessions:
+            logger.warning(f"No active session for {taker_nick} (attestreq)")
+            return
+        session = self.active_sessions[taker_nick]
+        if not session.validate_channel(source):
+            logger.error(f"Channel consistency violation for !attestreq from {taker_nick}")
+            return
+        if not session.crypto.is_encrypted:
+            logger.error("Encryption not set up for this session (attestreq)")
+            return
+        if self.attestation_signer is None:
+            logger.warning(
+                f"Refusing !attestreq from {taker_nick}: no fidelity-bond signer available"
+            )
+            return
+
+        parts = msg.split()
+        if len(parts) < 2:
+            logger.warning("Invalid !attestreq format")
+            return
+        try:
+            plaintext = session.crypto.decrypt(parts[1])
+        except Exception as e:
+            logger.error(f"Failed to decrypt attestreq from {taker_nick}: {e}")
+            return
+
+        try:
+            req = decode_attestreq(plaintext)
+        except AttestWireError as e:
+            logger.warning(f"Malformed !attestreq from {taker_nick}: {e}")
+            return
+
+        # Only sign if the taker is pointing at *our* ring slot. The
+        # ring member at signer_idx must match this maker's bond outpoint
+        # and x-only pubkey; otherwise we'd happily sign for somebody
+        # else's ring position, which is a protocol violation.
+        if self.fidelity_bond is None:
+            logger.error("attestreq received but no fidelity bond is active")
+            return
+        my_member = req.ring[req.signer_idx]
+        my_xonly = self.attestation_signer.pubkey_xonly
+        # Outpoint encoding: txid (32 B little-endian) || vout (4 B LE).
+        bond_txid = bytes.fromhex(self.fidelity_bond.txid)[::-1]
+        bond_vout = self.fidelity_bond.vout.to_bytes(4, "little")
+        my_outpoint = bond_txid + bond_vout
+        if my_member.pubkey_xonly != my_xonly or my_member.outpoint != my_outpoint:
+            logger.warning(
+                f"!attestreq signer_idx points at a non-matching ring slot "
+                f"(taker={taker_nick}, idx={req.signer_idx}); refusing to sign"
+            )
+            return
+
+        try:
+            sig = self.attestation_signer.sign_attestation(
+                run_id=req.run_id,
+                round_no=req.round_no,
+                ring=req.ring,
+                signer_idx=req.signer_idx,
+            )
+        except DuplicateAttestationError as e:
+            logger.warning(
+                f"Duplicate !attestreq from {taker_nick} for run/round; "
+                f"ignoring (key_image={e.key_image.hex()})"
+            )
+            return
+        except Exception as e:
+            logger.error(f"CLSAG sign failed for !attestreq from {taker_nick}: {e}")
+            return
+
+        await self._send_response(
+            taker_nick,
+            "!attest",
+            {
+                "attest_payload": AttestPayload(
+                    run_id=req.run_id, round_no=req.round_no, signature=sig
+                )
+            },
+        )
+        logger.info(f"Sent !attest reply to {taker_nick} for run/round={req.round_no}")
+
     async def _handle_hp2_pubmsg(self, from_nick: str, msg: str) -> None:
         """Handle !hp2 commitment broadcast seen in public channel.
 
@@ -1207,6 +1304,17 @@ class ProtocolHandlersMixin:
                 session = self.active_sessions[taker_nick]
                 msg_content = session.crypto.encrypt(plaintext)
                 logger.debug(f"Encrypted sig: plaintext_len={len(plaintext)}")
+            elif cmd is Command.ATTEST:
+                # Plaintext format from attestation_wire codec; encrypted
+                # to the taker. Carries (run_id, round_no, CLSAG sig).
+                payload: AttestPayload = data["attest_payload"]
+                plaintext = encode_attest(payload)
+                if taker_nick not in self.active_sessions:
+                    logger.error(f"No active session for {taker_nick} to encrypt attest")
+                    return
+                session = self.active_sessions[taker_nick]
+                msg_content = session.crypto.encrypt(plaintext)
+                logger.debug(f"Encrypted attest, plaintext_len={len(plaintext)}")
             elif spec is not None and spec.encrypted:
                 # Generic encrypted-command path. ZKP / tx-extension stubs
                 # land here in later phases once payload schemas are wired

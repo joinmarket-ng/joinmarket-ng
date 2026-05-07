@@ -36,6 +36,7 @@ from jmwallet.backends.base import BlockchainBackend
 from jmwallet.wallet.service import WalletService
 from loguru import logger
 
+from maker.attestation_signer import AttestationSigner
 from maker.background_tasks import BackgroundTasksMixin
 from maker.coinjoin import CoinJoinSession
 from maker.config import MakerConfig
@@ -82,6 +83,9 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         self.active_sessions: dict[str, CoinJoinSession] = {}
         self.current_offers: list[Offer] = []
         self.fidelity_bond: FidelityBondInfo | None = None
+        # Lazily constructed once a fidelity bond is selected; tx-extension
+        # bond-attestation signer (CLSAG over secp256k1).
+        self.attestation_signer: AttestationSigner | None = None
         self.current_block_height: int = 0  # Cached block height for bond proof generation
 
         self.running = False
@@ -490,6 +494,7 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
             # If a specific bond is selected in config, use it; otherwise use the best one
             if self.config.no_fidelity_bond:
                 self.fidelity_bond = None
+                self.attestation_signer = None
                 logger.warning("Fidelity bond disabled (offers will have no bond proof)")
             elif self.config.selected_fidelity_bond:
                 # User specified a specific bond
@@ -519,6 +524,15 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
                     f"value={self.fidelity_bond.value:,} sats, "
                     f"bond_value={self.fidelity_bond.bond_value:,}"
                 )
+                # Build the tx-extension bond-attestation signer if the bond
+                # has a hot private key. Cold-storage bonds (no private_key)
+                # cannot participate in the tx-extension protocol.
+                if self.fidelity_bond.private_key is not None:
+                    self.attestation_signer = AttestationSigner.from_coincurve_private_key(
+                        self.fidelity_bond.private_key
+                    )
+                else:
+                    self.attestation_signer = None
                 md0_utxos = self.wallet.get_all_utxos(0, include_fidelity_bonds=False)
                 if md0_utxos:
                     total_md0 = sum(u.value for u in md0_utxos)
@@ -533,6 +547,7 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
                     )
             else:
                 logger.warning("No fidelity bond found (offers will have no bond proof)")
+                self.attestation_signer = None
 
             logger.info("Creating offers...")
             self.current_offers = await self.offer_manager.create_offers()

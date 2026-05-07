@@ -25,6 +25,7 @@ from jmcore.rate_limiter import RateLimiter
 from jmwallet.backends.base import BlockchainBackend
 from jmwallet.wallet.service import WalletService
 
+from maker.attestation_signer import AttestationSigner
 from maker.coinjoin import CoinJoinSession
 from maker.config import MakerConfig
 from maker.fidelity import FidelityBondInfo
@@ -48,6 +49,7 @@ class MakerBotProtocol(Protocol):
     nick_identity: NickIdentity
     current_offers: list[Offer]
     fidelity_bond: FidelityBondInfo | None
+    attestation_signer: AttestationSigner | None
     current_block_height: int
     directory_clients: dict[str, DirectoryClient]
     active_sessions: dict[str, CoinJoinSession]
@@ -76,6 +78,10 @@ class MakerBotProtocol(Protocol):
     async def _handle_tx(self, taker_nick: str, msg: str, source: str = "unknown") -> None: ...
 
     async def _handle_push(self, taker_nick: str, msg: str, source: str = "unknown") -> None: ...
+
+    async def _handle_attestreq(
+        self, taker_nick: str, msg: str, source: str = "unknown"
+    ) -> None: ...
 
     async def _send_offers_via_direct_connection(
         self, taker_nick: str, connection: TCPConnection
