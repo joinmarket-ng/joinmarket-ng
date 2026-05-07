@@ -1149,6 +1149,28 @@ class TxExtensionSettings(BaseModel):
             "wire format (uint8 count prefix)."
         ),
     )
+    min_anonymity_set_size: int = Field(
+        default=25,
+        ge=2,
+        le=512,
+        description=(
+            "Hard floor on the CLSAG ring cardinality used in !attestreq. "
+            "Default 25 matches JMP-0006. The taker refuses to assemble "
+            "a smaller ring; on small orderbooks (regtest, signet, "
+            "degraded mainnet) this is the value that bounds usability."
+        ),
+    )
+    target_anonymity_set_size: int = Field(
+        default=64,
+        ge=2,
+        le=512,
+        description=(
+            "Preferred CLSAG ring cardinality. The taker grows the ring "
+            "to this size when the orderbook supplies enough decoys, "
+            "otherwise scales down to whatever's available (>= "
+            "min_anonymity_set_size)."
+        ),
+    )
 
     def to_config(self) -> TxExtensionConfig:
         """Materialize the runtime :class:`jmcore.config.TxExtensionConfig`."""
@@ -1161,6 +1183,8 @@ class TxExtensionSettings(BaseModel):
             min_bond_attestation_value=self.min_bond_attestation_value,
             late_join_bond_threshold=self.late_join_bond_threshold,
             attestation_threshold_K=self.attestation_threshold_K,
+            min_anonymity_set_size=self.min_anonymity_set_size,
+            target_anonymity_set_size=self.target_anonymity_set_size,
         )
 
 

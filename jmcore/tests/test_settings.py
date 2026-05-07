@@ -198,6 +198,8 @@ class TestSettingsDefaults:
         assert settings.tx_extension.min_bond_attestation_value == 0
         assert settings.tx_extension.late_join_bond_threshold == 0
         assert settings.tx_extension.attestation_threshold_K == 3
+        assert settings.tx_extension.min_anonymity_set_size == 25
+        assert settings.tx_extension.target_anonymity_set_size == 64
 
     def test_zkp_settings_to_config_round_trip(self) -> None:
         """ZkpSettings.to_config() preserves all fields."""
@@ -219,6 +221,8 @@ class TestSettingsDefaults:
         assert config.min_bond_attestation_value == settings.tx_extension.min_bond_attestation_value
         assert config.late_join_bond_threshold == settings.tx_extension.late_join_bond_threshold
         assert config.attestation_threshold_K == settings.tx_extension.attestation_threshold_K
+        assert config.min_anonymity_set_size == settings.tx_extension.min_anonymity_set_size
+        assert config.target_anonymity_set_size == settings.tx_extension.target_anonymity_set_size
 
     def test_zkp_amount_rejected_when_exceeds_range_width(self) -> None:
         """ZkpConfig rejects max_amount that doesn't fit in range_proof_width bits."""

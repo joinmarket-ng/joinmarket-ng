@@ -203,6 +203,8 @@ class TxExtensionConfig(BaseModel):
     min_bond_attestation_value: int = Field(default=0, ge=0)
     late_join_bond_threshold: int = Field(default=0, ge=0)
     attestation_threshold_K: int = Field(default=3, ge=1, le=255)  # noqa: N815
+    min_anonymity_set_size: int = Field(default=25, ge=2, le=512)
+    target_anonymity_set_size: int = Field(default=64, ge=2, le=512)
 
     model_config = {"frozen": False}
 
