@@ -20,6 +20,12 @@ from jmcore.directory_client import DirectoryClient
 from jmcore.models import Offer
 from jmcore.notifications import get_notifier
 from jmcore.protocol import COMMAND_PREFIX, JM_VERSION, MessageType, UTXOMetadata
+from jmcore.protocol_commands import (
+    COMMAND_SPECS,
+    Command,
+    is_feature_enabled,
+    parse_command,
+)
 from jmcore.rate_limiter import RateLimitAction, RateLimiter
 from jmcore.tasks import parse_directory_address
 from jmwallet.backends.base import BlockchainBackend
@@ -192,9 +198,20 @@ class ProtocolHandlersMixin:
 
             # Strip leading "!" and get command
             command = rest.strip().lstrip("!")
+            cmd = parse_command(command)
+            if cmd is None:
+                return
+
+            # Feature-flag gating mirrors the PRIVMSG path.
+            if not is_feature_enabled(
+                cmd,
+                zkp_enabled=self.config.enable_zkp,
+                tx_extension_enabled=self.config.enable_tx_extension,
+            ):
+                return
 
             # Respond to orderbook requests with PRIVMSG (including bond if available)
-            if to_nick == "PUBLIC" and command == "orderbook":
+            if to_nick == "PUBLIC" and cmd is Command.ORDERBOOK:
                 # Apply rate limiting to prevent spam attacks
                 if not self._orderbook_rate_limiter.check(from_nick):
                     violations = self._orderbook_rate_limiter.get_violation_count(from_nick)
@@ -228,7 +245,7 @@ class ProtocolHandlersMixin:
                     f"Received !orderbook request from {from_nick}, sending offers via PRIVMSG"
                 )
                 await self._send_offers_to_taker(from_nick)
-            elif to_nick == "PUBLIC" and command.startswith("hp2"):
+            elif to_nick == "PUBLIC" and cmd is Command.HP2:
                 # hp2 via pubmsg = commitment broadcast for blacklisting
                 await self._handle_hp2_pubmsg(from_nick, command)
 
@@ -344,6 +361,29 @@ class ProtocolHandlersMixin:
         except Exception as e:
             logger.error(f"Failed to send offers to {taker_nick} via direct connection: {e}")
 
+    def _privmsg_handlers(
+        self: MakerBotProtocol,
+    ) -> dict[Command, Any]:
+        """Return the PRIVMSG dispatch table for this maker.
+
+        Mapping a command to ``None`` means "feature is gated off / not yet
+        implemented and incoming messages should be silently dropped".
+        New protocol stages (ZKP, tx-extension) extend this table.
+        """
+
+        async def _hp2_adapter(from_nick: str, msg: str, _source: str) -> None:
+            await self._handle_hp2_privmsg(from_nick, msg)
+
+        return {
+            Command.FILL: self._handle_fill,
+            Command.AUTH: self._handle_auth,
+            Command.TX: self._handle_tx,
+            Command.PUSH: self._handle_push,
+            Command.HP2: _hp2_adapter,
+            # ZKP / tx-extension handlers land in later phases; commands
+            # are accepted by the registry but routed to no handler yet.
+        }
+
     async def _handle_privmsg(self: MakerBotProtocol, line: str, source: str = "unknown") -> None:
         """
         Handle private message (CoinJoin protocol).
@@ -367,21 +407,37 @@ class ProtocolHandlersMixin:
             # Strip leading "!" if present (due to !!command message format)
             command = rest.strip().lstrip("!")
 
-            # Note: command prefix already stripped
-            if command.startswith("fill"):
-                await self._handle_fill(from_nick, command, source=source)
-            elif command.startswith("auth"):
-                await self._handle_auth(from_nick, command, source=source)
-            elif command.startswith("tx"):
-                await self._handle_tx(from_nick, command, source=source)
-            elif command.startswith("push"):
-                await self._handle_push(from_nick, command, source=source)
-            elif command.startswith("hp2"):
-                # hp2 via privmsg = commitment transfer request
-                # We should re-broadcast it publicly to obfuscate the source
-                await self._handle_hp2_privmsg(from_nick, command)
-            else:
+            # Look up the command in the central registry. Unknown or
+            # malformed commands are silently dropped (legacy behaviour).
+            cmd = parse_command(command)
+            if cmd is None:
                 logger.debug(f"Unknown command: {command[:20]}...")
+                return
+
+            # Feature-flag gating: drop ZKP / tx-extension commands when
+            # the maker has the corresponding feature disabled. We check
+            # via :func:`is_feature_enabled` so the legacy commands always
+            # pass through.
+            if not is_feature_enabled(
+                cmd,
+                zkp_enabled=self.config.enable_zkp,
+                tx_extension_enabled=self.config.enable_tx_extension,
+            ):
+                logger.debug(
+                    f"Dropping {cmd.value} from {from_nick}: feature disabled "
+                    f"(enable_zkp={self.config.enable_zkp}, "
+                    f"enable_tx_extension={self.config.enable_tx_extension})"
+                )
+                return
+
+            handler = self._privmsg_handlers().get(cmd)
+            if handler is None:
+                # Command is known and feature-enabled, but this maker has
+                # no registered handler yet (e.g. ZKP/extension stubs).
+                logger.debug(f"No PRIVMSG handler for {cmd.value} (stub)")
+                return
+
+            await handler(from_nick, command, source)
 
         except Exception as e:
             logger.error(f"Failed to handle privmsg: {e}")
@@ -1103,18 +1159,24 @@ class ProtocolHandlersMixin:
         The signature is over: <message_content> + hostid (NOT including the command!)
 
         For encrypted commands, the plaintext is space-separated values that get
-        encrypted and base64-encoded before signing.
+        encrypted and base64-encoded before signing. The encryption decision
+        is driven by the central :data:`COMMAND_SPECS` registry.
         """
         try:
+            # Resolve the command in the registry. Unknown commands fall
+            # back to the JSON path used historically.
+            cmd = parse_command(command)
+            spec = COMMAND_SPECS[cmd] if cmd is not None else None
+
             # Format message content based on command type
-            if command == "pubkey":
+            if cmd is Command.PUBKEY:
                 # !pubkey <nacl_pubkey_hex> [features=<comma-separated>] - NOT encrypted
                 # Features are optional and backwards compatible with legacy takers
                 msg_content = data["nacl_pubkey"]
                 features = data.get("features", [])
                 if features:
                     msg_content += f" features={','.join(features)}"
-            elif command == "ioauth":
+            elif cmd is Command.IOAUTH:
                 # Plaintext format: <utxo_list> <auth_pub> <cj_addr> <change_addr> <btc_sig>
                 plaintext = " ".join(
                     [
@@ -1133,7 +1195,7 @@ class ProtocolHandlersMixin:
                 session = self.active_sessions[taker_nick]
                 msg_content = session.crypto.encrypt(plaintext)
                 logger.debug(f"Encrypted ioauth message, plaintext_len={len(plaintext)}")
-            elif command == "sig":
+            elif cmd is Command.SIG:
                 # Plaintext format: <signature_base64>
                 # For multiple signatures, we send them one by one
                 plaintext = data["signature"]
@@ -1145,6 +1207,12 @@ class ProtocolHandlersMixin:
                 session = self.active_sessions[taker_nick]
                 msg_content = session.crypto.encrypt(plaintext)
                 logger.debug(f"Encrypted sig: plaintext_len={len(plaintext)}")
+            elif spec is not None and spec.encrypted:
+                # Generic encrypted-command path. ZKP / tx-extension stubs
+                # land here in later phases once payload schemas are wired
+                # in. Until then, we refuse to send rather than leak data.
+                logger.error(f"No serializer for encrypted command {command}; refusing to send")
+                return
             else:
                 # Fallback to JSON for unknown commands
                 msg_content = json.dumps(data)

@@ -12,6 +12,7 @@ https://mypy.readthedocs.io/en/stable/more_types.html#mixin-classes
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from typing import Any, Protocol
 
 from jmcore.crypto import NickIdentity
@@ -19,6 +20,7 @@ from jmcore.deduplication import MessageDeduplicator
 from jmcore.directory_client import DirectoryClient
 from jmcore.models import Offer
 from jmcore.network import TCPConnection
+from jmcore.protocol_commands import Command
 from jmcore.rate_limiter import RateLimiter
 from jmwallet.backends.base import BlockchainBackend
 from jmwallet.wallet.service import WalletService
@@ -131,5 +133,10 @@ class MakerBotProtocol(Protocol):
     async def _handle_hp2_pubmsg(self, from_nick: str, msg: str) -> None: ...
 
     async def _handle_hp2_privmsg(self, from_nick: str, msg: str) -> None: ...
+
+    # Defined in ProtocolHandlersMixin: command->handler dispatch table.
+    def _privmsg_handlers(
+        self,
+    ) -> dict[Command, Callable[[str, str, str], Awaitable[None]]]: ...
 
     async def _send_offers_to_taker(self, taker_nick: str) -> None: ...

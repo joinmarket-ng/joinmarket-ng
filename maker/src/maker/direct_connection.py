@@ -21,6 +21,7 @@ from jmcore.protocol import (
     MessageType,
     create_handshake_request,
 )
+from jmcore.protocol_commands import Command, is_feature_enabled, parse_command
 from jmwallet.backends.base import BlockchainBackend
 from loguru import logger
 
@@ -376,20 +377,37 @@ class DirectConnectionMixin:
                             )
                         continue
 
-                    # Process the command - reuse existing handlers
-                    # Commands: fill, auth, tx (same as via directory)
+                    # Process the command - reuse existing handlers via the
+                    # central registry. Unknown commands are dropped.
                     full_msg = f"{cmd} {msg_data}" if msg_data else cmd
+                    parsed = parse_command(cmd)
+                    if parsed is None:
+                        logger.debug(f"Unknown direct command from {sender_nick}: {cmd}")
+                        continue
 
-                    if cmd == "fill":
+                    # Feature-flag gating identical to the IRC PRIVMSG path.
+                    if not is_feature_enabled(
+                        parsed,
+                        zkp_enabled=self.config.enable_zkp,
+                        tx_extension_enabled=self.config.enable_tx_extension,
+                    ):
+                        logger.debug(
+                            f"Dropping direct {parsed.value} from {sender_nick}: feature disabled"
+                        )
+                        continue
+
+                    if parsed is Command.FILL:
                         await self._handle_fill(sender_nick, full_msg, source="direct")
-                    elif cmd == "auth":
+                    elif parsed is Command.AUTH:
                         await self._handle_auth(sender_nick, full_msg, source="direct")
-                    elif cmd == "tx":
+                    elif parsed is Command.TX:
                         await self._handle_tx(sender_nick, full_msg, source="direct")
-                    elif cmd == "push":
+                    elif parsed is Command.PUSH:
                         await self._handle_push(sender_nick, full_msg, source="direct")
                     else:
-                        logger.debug(f"Unknown direct command from {sender_nick}: {cmd}")
+                        # Known command (e.g. ZKP / extension stub) but no
+                        # direct-connection handler wired yet.
+                        logger.debug(f"No direct handler for {parsed.value} from {sender_nick}")
 
                 except TimeoutError:
                     # No message received, continue waiting
