@@ -1660,6 +1660,286 @@ class TestNeutrinoBackend:
         env_zero = config_zero.to_env()
         assert "PREFETCH_LOOKBACK" not in env_zero
 
+    # ------------------------------------------------------------------
+    # Mempool tracker integration (neutrino-api 1.3.0+)
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_init_defaults_include_mempool_true(self):
+        """include_mempool defaults to True; has_mempool_access stays False until detect."""
+        backend = NeutrinoBackend(neutrino_url="http://localhost:8334", network="regtest")
+        try:
+            assert backend.include_mempool is True
+            assert backend.has_mempool_access() is False
+        finally:
+            await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_init_include_mempool_false(self):
+        """Operator opt-out is plumbed through the constructor."""
+        backend = NeutrinoBackend(
+            neutrino_url="http://localhost:8334",
+            network="regtest",
+            include_mempool=False,
+        )
+        try:
+            assert backend.include_mempool is False
+            backend._server_capabilities.has_mempool_tracker = True
+            assert backend.has_mempool_access() is False
+        finally:
+            await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_detect_capabilities_sets_mempool_tracker_from_status(self):
+        """A status payload with mempool_enabled=true flips the capability flag."""
+        backend = NeutrinoBackend(neutrino_url="http://localhost:8334", network="regtest")
+        backend._api_call = AsyncMock(
+            side_effect=[
+                {
+                    "synced": True,
+                    "block_height": 800000,
+                    "filter_height": 800000,
+                    "mempool_enabled": True,
+                    "mempool": {"entries": 2, "utxos": 1, "spends": 1, "peers": 8},
+                },
+                {
+                    "in_progress": False,
+                    "last_start_height": 700000,
+                    "last_scanned_tip": 800000,
+                },
+            ]
+        )
+
+        try:
+            await backend._detect_server_capabilities()
+            assert backend.server_capabilities.has_mempool_tracker is True
+            assert backend.has_mempool_access() is True
+        finally:
+            await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_detect_capabilities_no_tracker_when_disabled(self):
+        """A status payload without mempool_enabled keeps the capability flag false."""
+        backend = NeutrinoBackend(neutrino_url="http://localhost:8334", network="regtest")
+        backend._api_call = AsyncMock(
+            side_effect=[
+                {"synced": True, "block_height": 800000, "filter_height": 800000},
+                {"in_progress": False},
+            ]
+        )
+
+        try:
+            await backend._detect_server_capabilities()
+            assert backend.server_capabilities.has_mempool_tracker is False
+            assert backend.has_mempool_access() is False
+        finally:
+            await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_get_utxos_sends_include_mempool_when_capable(self):
+        """get_utxos passes include_mempool=true once the tracker is detected."""
+        backend = NeutrinoBackend(neutrino_url="http://localhost:8334", network="regtest")
+        backend._initial_rescan_done = True
+        backend._server_capabilities.has_mempool_tracker = True
+        backend._watched_addresses = {"bc1qtest"}
+
+        backend._api_call = AsyncMock(
+            return_value={
+                "utxos": [
+                    {
+                        "txid": "a" * 64,
+                        "vout": 0,
+                        "value": 100000,
+                        "address": "bc1qtest",
+                        "scriptpubkey": "0014" + "00" * 20,
+                        "height": 800000,
+                    },
+                    {
+                        "txid": "b" * 64,
+                        "vout": 1,
+                        "value": 50000,
+                        "address": "bc1qtest",
+                        "scriptpubkey": "0014" + "00" * 20,
+                        "height": 0,
+                    },
+                ]
+            }
+        )
+        backend.get_block_height = AsyncMock(return_value=800000)
+
+        try:
+            with patch.object(backend, "wait_for_sync", new_callable=AsyncMock) as ws:
+                ws.return_value = True
+                utxos = await backend.get_utxos(["bc1qtest"])
+
+            utxos_posts = [
+                call
+                for call in backend._api_call.call_args_list
+                if call[0][0] == "POST" and call[0][1] == "v1/utxos"
+            ]
+            assert len(utxos_posts) == 1
+            assert utxos_posts[0][1]["data"]["include_mempool"] is True
+
+            assert len(utxos) == 2
+            confirmed = next(u for u in utxos if u.txid == "a" * 64)
+            mempool = next(u for u in utxos if u.txid == "b" * 64)
+            assert confirmed.confirmations == 1
+            assert confirmed.height == 800000
+            assert mempool.confirmations == 0
+            assert mempool.height is None
+        finally:
+            await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_get_utxos_omits_include_mempool_when_disabled(self):
+        """include_mempool is not sent when the operator disabled it client-side."""
+        backend = NeutrinoBackend(
+            neutrino_url="http://localhost:8334",
+            network="regtest",
+            include_mempool=False,
+        )
+        backend._initial_rescan_done = True
+        backend._server_capabilities.has_mempool_tracker = True
+        backend._watched_addresses = {"bc1qtest"}
+        backend._api_call = AsyncMock(return_value={"utxos": []})
+        backend.get_block_height = AsyncMock(return_value=800000)
+
+        try:
+            with patch.object(backend, "wait_for_sync", new_callable=AsyncMock) as ws:
+                ws.return_value = True
+                await backend.get_utxos(["bc1qtest"])
+
+            utxos_posts = [
+                call
+                for call in backend._api_call.call_args_list
+                if call[0][0] == "POST" and call[0][1] == "v1/utxos"
+            ]
+            assert len(utxos_posts) == 1
+            assert "include_mempool" not in utxos_posts[0][1]["data"]
+        finally:
+            await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_get_transaction_returns_mempool_tx(self):
+        """get_transaction surfaces a watched mempool tx as confirmations=0."""
+        backend = NeutrinoBackend(neutrino_url="http://localhost:8334", network="regtest")
+        backend._api_call = AsyncMock(
+            return_value={"txid": "c" * 64, "hex": "0200000001abcd", "mempool": True}
+        )
+
+        try:
+            tx = await backend.get_transaction("c" * 64)
+            assert tx is not None
+            assert tx.txid == "c" * 64
+            assert tx.raw == "0200000001abcd"
+            assert tx.confirmations == 0
+            assert tx.block_height is None
+            assert tx.block_time is None
+            backend._api_call.assert_called_once_with("GET", f"v1/tx/{'c' * 64}")
+        finally:
+            await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_get_transaction_returns_none_on_404(self):
+        """A 404 from /v1/tx/ is a normal miss, not an error."""
+        import httpx
+
+        backend = NeutrinoBackend(neutrino_url="http://localhost:8334", network="regtest")
+        response = MagicMock()
+        response.status_code = 404
+        backend._api_call = AsyncMock(
+            side_effect=httpx.HTTPStatusError("not found", request=MagicMock(), response=response)
+        )
+
+        try:
+            tx = await backend.get_transaction("d" * 64)
+            assert tx is None
+        finally:
+            await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_get_transaction_returns_none_when_disabled(self):
+        """With include_mempool=False, get_transaction never hits the network."""
+        backend = NeutrinoBackend(
+            neutrino_url="http://localhost:8334",
+            network="regtest",
+            include_mempool=False,
+        )
+        backend._api_call = AsyncMock(side_effect=AssertionError("should not be called"))
+
+        try:
+            assert await backend.get_transaction("e" * 64) is None
+            backend._api_call.assert_not_called()
+        finally:
+            await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_verify_utxo_with_metadata_rejects_mempool_spend(self):
+        """A confirmed UTXO with a pending mempool spend is treated as invalid."""
+        backend = NeutrinoBackend(neutrino_url="http://localhost:8334", network="regtest")
+
+        backend._api_call = AsyncMock(
+            return_value={
+                "unspent": True,
+                "value": 100000,
+                "scriptpubkey": "0014" + "00" * 20,
+                "block_height": 800000,
+                "mempool_spending_txid": "f" * 64,
+                "mempool_spending_input": 0,
+                "mempool_spend_first_seen": 1714501234,
+            }
+        )
+        backend.get_block_height = AsyncMock(return_value=800010)
+
+        try:
+            result = await backend.verify_utxo_with_metadata(
+                txid="a" * 64,
+                vout=0,
+                scriptpubkey="0014" + "00" * 20,
+                blockheight=800000,
+            )
+            assert result.valid is False
+            assert "mempool" in (result.error or "").lower()
+            assert "f" * 64 in (result.error or "")
+        finally:
+            await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_verify_utxo_with_metadata_disables_mempool_overlay(self):
+        """Operator opt-out propagates include_mempool=false to the GET params."""
+        backend = NeutrinoBackend(
+            neutrino_url="http://localhost:8334",
+            network="regtest",
+            include_mempool=False,
+        )
+
+        backend._api_call = AsyncMock(
+            return_value={
+                "unspent": True,
+                "value": 100000,
+                "scriptpubkey": "0014" + "00" * 20,
+                "block_height": 800000,
+            }
+        )
+        backend.get_block_height = AsyncMock(return_value=800010)
+
+        try:
+            await backend.verify_utxo_with_metadata(
+                txid="a" * 64,
+                vout=0,
+                scriptpubkey="0014" + "00" * 20,
+                blockheight=800000,
+            )
+            calls = [
+                call
+                for call in backend._api_call.call_args_list
+                if call[0][0] == "GET" and call[0][1].startswith("v1/utxo/")
+            ]
+            assert len(calls) == 1
+            assert calls[0][1]["params"].get("include_mempool") == "false"
+        finally:
+            await backend.close()
+
 
 @pytest.mark.docker
 @pytest.mark.neutrino
