@@ -250,6 +250,16 @@ class BitcoinSettings(BaseModel):
             "into a shared volume."
         ),
     )
+    neutrino_include_mempool: bool = Field(
+        default=True,
+        description=(
+            "Include unconfirmed entries from the neutrino-api watched "
+            "mempool tracker in UTXO listings, and overlay mempool "
+            "spends on single-UTXO checks. Has no effect when the "
+            "server does not expose the tracker (older neutrino-api or "
+            "operator-disabled). Set to false for chain-only behaviour."
+        ),
+    )
 
     @model_validator(mode="after")
     def _load_rpc_cookie_from_file(self) -> Self:
