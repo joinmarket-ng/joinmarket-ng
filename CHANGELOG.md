@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Surface neutrino-api watched-mempool entries in `get_utxos` and `get_transaction`, with mempool-spend overlay in single-UTXO checks (default on; opt out via `bitcoin.neutrino_include_mempool = false`).
+
 ## [0.28.1] - 2026-05-01
 
 ### Fixed
