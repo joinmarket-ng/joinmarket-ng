@@ -193,11 +193,11 @@ def test_assemble_ring_rejects_empty_selected() -> None:
         )
 
 
-def test_assemble_ring_insufficient_decoys() -> None:
-    # 3 selected + 5 decoys = 8 total, target 25 -> abort.
+def test_assemble_ring_aborts_when_below_min_set_size() -> None:
+    # 3 selected + 5 decoys = 8 total, min_set_size=25 -> abort.
     pool = _orderbook(8)
     selected = {f"m{i}": pool[i] for i in range(3)}
-    with pytest.raises(RingAssemblyError, match="cannot reach target"):
+    with pytest.raises(RingAssemblyError, match="cannot reach min_set_size"):
         assemble_ring(
             selected_offers=selected,
             decoy_pool=pool[3:],
@@ -205,6 +205,49 @@ def test_assemble_ring_insufficient_decoys() -> None:
             run_id=os.urandom(32),
             min_set_size=25,
         )
+
+
+def test_assemble_ring_shrinks_target_to_available_when_above_min() -> None:
+    # 3 selected + 12 decoys = 15 total, target 25, min 10 -> shrink to 15.
+    pool = _orderbook(15)
+    selected = {f"m{i}": pool[i] for i in range(3)}
+    result = assemble_ring(
+        selected_offers=selected,
+        decoy_pool=pool[3:],
+        target_set_size=25,
+        run_id=os.urandom(32),
+        min_set_size=10,
+    )
+    assert result.set_size == 15
+    assert set(result.signer_idx_by_nick.keys()) == {"m0", "m1", "m2"}
+
+
+def test_assemble_ring_shrinks_to_exactly_min_set_size() -> None:
+    # 1 selected + 9 decoys = 10 total, min 10 -> exact min.
+    pool = _orderbook(10)
+    result = assemble_ring(
+        selected_offers={"m0": pool[0]},
+        decoy_pool=pool[1:],
+        target_set_size=25,
+        run_id=os.urandom(32),
+        min_set_size=10,
+    )
+    assert result.set_size == 10
+
+
+def test_assemble_ring_regtest_friendly_min_set_size() -> None:
+    # Tiny regtest orderbook: 2 selected + 2 decoys, min_set_size=4.
+    pool = _orderbook(4)
+    selected = {f"m{i}": pool[i] for i in range(2)}
+    result = assemble_ring(
+        selected_offers=selected,
+        decoy_pool=pool[2:],
+        target_set_size=4,
+        run_id=os.urandom(32),
+        min_set_size=4,
+    )
+    assert result.set_size == 4
+    assert len(result.signer_idx_by_nick) == 2
 
 
 def test_assemble_ring_skips_decoys_with_bad_bond_data() -> None:

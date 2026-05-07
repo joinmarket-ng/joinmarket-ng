@@ -153,17 +153,31 @@ def assemble_ring(
         seen_pubkeys.add(member.pubkey_xonly)
 
     needed_decoys = target_set_size - len(selected_members)
-    if len(decoys) < needed_decoys:
-        # The strict variant: we don't pad with bondless or invented
-        # entries — a small ring is a privacy hazard, so abort and
-        # let the caller widen the orderbook query or lower their
-        # target if policy permits.
-        achievable = len(selected_members) + len(decoys)
+    available = len(selected_members) + len(decoys)
+
+    if available < min_set_size:
+        # Genuinely too few makers in the orderbook to form even a
+        # minimum-size ring. Abort: pretending otherwise would be a
+        # privacy hazard.
         raise RingAssemblyError(
-            f"cannot reach target ring size {target_set_size}: "
-            f"only {achievable} members available "
+            f"cannot reach min_set_size {min_set_size}: "
+            f"only {available} members available "
             f"({len(selected_members)} selected + {len(decoys)} decoys)"
         )
+
+    if len(decoys) < needed_decoys:
+        # Resilience path: scale target down to what's available
+        # rather than aborting outright. This is what makes regtest /
+        # signet runs (and degraded-mainnet conditions) usable. We
+        # log it so operators notice the shrink.
+        effective_target = available
+        logger.warning(
+            f"ring assembly: shrinking target from {target_set_size} to "
+            f"{effective_target} (only {len(decoys)} decoys available, needed "
+            f"{needed_decoys}); still >= min_set_size {min_set_size}"
+        )
+        needed_decoys = len(decoys)
+    # else: full target reachable, keep needed_decoys unchanged.
 
     # Step 3: trim decoys to needed count, deterministically.
     decoys = _seeded_shuffle(decoys, run_id + b"/decoy_pick")[:needed_decoys]
