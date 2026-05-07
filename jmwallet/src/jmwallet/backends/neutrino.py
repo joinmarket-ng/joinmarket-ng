@@ -61,6 +61,12 @@ class ServerCapabilities:
     #: (v0.9.0+ with persistent state).
     has_persistent_rescan_state: bool = False
 
+    #: Server runs the watched-only mempool tracker (neutrino-api 1.3.0+).
+    #: When true, ``/v1/utxos`` accepts ``include_mempool``, the response
+    #: may contain unconfirmed entries with ``height == 0``, and
+    #: ``/v1/tx/{txid}`` is implemented for watched mempool txs.
+    has_mempool_tracker: bool = False
+
     #: Extra fields returned by ``/v1/status`` (informational).
     status_fields: dict[str, Any] = field(default_factory=dict)
 
@@ -91,6 +97,7 @@ class NeutrinoBackend(BlockchainBackend):
         scan_lookback_blocks: int = 105120,
         tls_cert_path: str | None = None,
         auth_token: str | None = None,
+        include_mempool: bool = True,
     ):
         """
         Initialize Neutrino backend.
@@ -111,11 +118,16 @@ class NeutrinoBackend(BlockchainBackend):
                 When set, the client connects over HTTPS and pins the server certificate.
             auth_token: API bearer token for neutrino-api authentication.
                 Sent as ``Authorization: Bearer <token>`` on every request.
+            include_mempool: When true (default), include unconfirmed entries from the
+                neutrino-api watched-mempool tracker in UTXO listings, and overlay
+                mempool spends on single-UTXO checks. Has no effect when the server
+                does not expose the tracker (older neutrino-api or operator-disabled).
         """
         self.neutrino_url = neutrino_url.rstrip("/")
         self.network = network
         self.add_peers = add_peers or []
         self.data_dir = data_dir
+        self.include_mempool = include_mempool
 
         # Store auth settings for client (re-)creation in close().
         self._tls_cert_path = tls_cert_path
@@ -260,11 +272,18 @@ class NeutrinoBackend(BlockchainBackend):
         try:
             status = await self._api_call("GET", "v1/status")
             caps.status_fields = dict(status) if isinstance(status, dict) else {}
+            # neutrino-api 1.3.0+ exposes the watched-only mempool tracker.
+            # We only consider it available when the server explicitly says
+            # mempool_enabled is true; the mere presence of the field means
+            # the server is new enough but the operator may have disabled
+            # the tracker, in which case we fall back to chain-only.
+            caps.has_mempool_tracker = bool(status.get("mempool_enabled", False))
             logger.info(
-                "Neutrino server: block_height={}, filter_height={}, synced={}",
+                "Neutrino server: block_height={}, filter_height={}, synced={}, mempool_tracker={}",
                 status.get("block_height", "?"),
                 status.get("filter_height", "?"),
                 status.get("synced", "?"),
+                caps.has_mempool_tracker,
             )
         except Exception as exc:
             logger.warning(f"Could not probe neutrino-api /v1/status: {exc}")
@@ -310,6 +329,8 @@ class NeutrinoBackend(BlockchainBackend):
             features.append("rescan-status")
         if caps.has_persistent_rescan_state:
             features.append("persistent-state")
+        if caps.has_mempool_tracker:
+            features.append("mempool-tracker")
         if features:
             logger.info(f"Neutrino server capabilities: {', '.join(features)}")
         else:
@@ -792,10 +813,17 @@ class NeutrinoBackend(BlockchainBackend):
             result: dict[str, Any] = {"utxos": []}
 
             for retry in range(max_retries):
+                request_body: dict[str, Any] = {"addresses": addresses}
+                # Only attach include_mempool when the server advertises
+                # the tracker; older servers reject unknown fields silently
+                # but logging stays cleaner if we don't ask for what isn't
+                # there.
+                if self.has_mempool_access():
+                    request_body["include_mempool"] = True
                 result = await self._api_call(
                     "POST",
                     "v1/utxos",
-                    data={"addresses": addresses},
+                    data=request_body,
                 )
 
                 utxo_count = len(result.get("utxos", []))
@@ -878,16 +906,48 @@ class NeutrinoBackend(BlockchainBackend):
         """
         Get transaction by txid.
 
-        Note: Neutrino uses compact block filters (BIP158) and can only fetch
-        transactions for addresses it has rescanned. It cannot fetch arbitrary
-        transactions by txid alone. This method always returns None.
+        Neutrino uses BIP157/158 compact block filters and cannot fetch
+        arbitrary historical transactions by txid alone. The neutrino-api
+        watched-only mempool tracker (v1.3.0+) does, however, expose any
+        transaction it has observed touching a watched script via
+        ``GET /v1/tx/{txid}``. We try that endpoint when the operator has
+        not disabled mempool overlay; on a miss (404 / 501) we fall back
+        to ``None`` to preserve the legacy behaviour.
 
-        For verification after broadcast, rely on UTXO checks with known addresses
-        and block heights instead.
+        Returned transactions are always unconfirmed
+        (``confirmations=0``, ``block_height=None``).
         """
-        # Neutrino doesn't support fetching arbitrary transactions by txid
-        # It can only work with UTXOs for known addresses via compact filters
-        return None
+        if not self.include_mempool:
+            return None
+
+        try:
+            result = await self._api_call("GET", f"v1/tx/{txid}")
+        except httpx.HTTPStatusError as e:
+            # 404 (unknown txid) and 501 (server lacks mempool tracker)
+            # both indicate "we don't have this tx"; treat as miss.
+            if e.response.status_code in (404, 501):
+                logger.debug(f"Mempool tx {txid} not found: HTTP {e.response.status_code}")
+                return None
+            logger.warning(f"Failed to fetch mempool tx {txid}: {e}")
+            return None
+        except Exception as e:
+            logger.warning(f"Failed to fetch mempool tx {txid}: {e}")
+            return None
+
+        if not isinstance(result, dict):
+            return None
+
+        raw_hex = result.get("hex", "")
+        if not raw_hex:
+            return None
+
+        return Transaction(
+            txid=result.get("txid", txid),
+            raw=raw_hex,
+            confirmations=0,
+            block_height=None,
+            block_time=None,
+        )
 
     async def verify_tx_output(
         self,
@@ -916,6 +976,10 @@ class NeutrinoBackend(BlockchainBackend):
             params: dict[str, str | int] = {"address": address}
             if start_height is not None:
                 params["start_height"] = start_height
+            # Honour the client-side opt-out. The server defaults to
+            # include_mempool=true, so we only need to disable explicitly.
+            if not self.include_mempool:
+                params["include_mempool"] = "false"
 
             result = await self._api_call(
                 "GET",
@@ -967,17 +1031,18 @@ class NeutrinoBackend(BlockchainBackend):
         return False
 
     def has_mempool_access(self) -> bool:
-        """Neutrino cannot access mempool - only sees confirmed transactions.
+        """Whether this backend can observe unconfirmed transactions.
 
-        BIP157/158 compact block filters only match confirmed blocks.
-        Unconfirmed transactions in the mempool are not visible to Neutrino.
+        Returns true only when (1) the operator has not disabled mempool
+        overlay client-side via ``include_mempool=False``, and (2) the
+        connected neutrino-api server reports the watched-only mempool
+        tracker is enabled (``mempool_enabled: true`` on ``/v1/status``).
 
-        This means verify_tx_output() will return False for valid transactions
-        that are in the mempool but not yet confirmed. Takers using Neutrino
-        must use alternative verification strategies (e.g., trust maker ACKs,
-        multi-maker broadcast, wait for confirmation).
+        Older neutrino-api builds (pre-1.3.0) lack the tracker and report
+        false here; callers must use chain-only verification (e.g., wait
+        for confirmation, trust maker ACKs, multi-maker broadcast).
         """
-        return False
+        return self.include_mempool and self._server_capabilities.has_mempool_tracker
 
     async def get_block_height(self) -> int:
         """Get current blockchain height from neutrino."""
@@ -1315,7 +1380,14 @@ class NeutrinoBackend(BlockchainBackend):
             result = await self._api_call(
                 "GET",
                 f"v1/utxo/{txid}/{vout}",
-                params={"address": address, "start_height": start_height},
+                params={
+                    "address": address,
+                    "start_height": start_height,
+                    # Mempool overlay matters here: a confirmed UTXO with a
+                    # pending spend is not safe to treat as available, even
+                    # though the chain still reports it unspent.
+                    **({"include_mempool": "false"} if not self.include_mempool else {}),
+                },
             )
 
             # Check if UTXO is unspent
@@ -1325,6 +1397,17 @@ class NeutrinoBackend(BlockchainBackend):
                 return UTXOVerificationResult(
                     valid=False,
                     error=f"UTXO has been spent in tx {spending_txid} at height {spending_height}",
+                )
+
+            # When the watched-mempool tracker reports a pending spend on a
+            # confirmed UTXO, treat verification as failed: the UTXO will
+            # almost certainly be unavailable by the time we'd act on it.
+            mempool_spending_txid = result.get("mempool_spending_txid")
+            if mempool_spending_txid:
+                return UTXOVerificationResult(
+                    valid=False,
+                    value=result.get("value", 0),
+                    error=(f"UTXO has a pending mempool spend in tx {mempool_spending_txid}"),
                 )
 
             # Step 3: Verify scriptPubKey matches
