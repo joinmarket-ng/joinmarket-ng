@@ -244,6 +244,92 @@ newgrp debian-tor
 - Python venv issues: install `python3-venv`
 - RPC failures: verify Bitcoin Core is reachable and credentials in `config.toml` are correct
 
+### Tracking Wallet Sync Progress
+
+After importing a wallet (especially one with a long history), the
+`descriptor_wallet` backend asks Bitcoin Core to scan the chain for the
+imported descriptors. This can take **minutes to several hours** depending
+on the wallet depth and the node hardware -- spinning disks and
+Raspberry Pi-class hosts are at the slow end.
+
+`jm-wallet info` will report only the fidelity bond balance until the
+underlying scan finishes. Before suspecting a bug, check that the scan
+is actually still running.
+
+The descriptor wallet inside Bitcoin Core is named deterministically from
+the mnemonic fingerprint and network, in the form
+`jm_<fingerprint>_<network>` (for example
+`jm_abc12345_mainnet`). List the loaded wallets to find the active one,
+then export it as a shell variable:
+
+```bash
+bitcoin-cli listwallets
+WALLET=jm_abc12345_mainnet            # replace with your actual name
+RPCWALLET="bitcoin-cli -rpcwallet=$WALLET"
+```
+
+**Is the node still scanning?** ``getwalletinfo`` reports a non-null
+``scanning`` object while a scan is in flight, with a ``progress`` field
+between 0.0 and 1.0:
+
+```bash
+$RPCWALLET getwalletinfo | jq '{scanning: .scanning, txcount: .txcount, balance: .balance}'
+```
+
+When ``scanning`` becomes ``false``, the scan is finished -- if balances
+are still missing at that point it is a real problem rather than just
+slowness.
+
+**Are descriptors imported with the expected ranges?** A partially
+imported wallet shows up here as a missing path or a smaller-than-expected
+``range``:
+
+```bash
+$RPCWALLET listdescriptors | jq '.descriptors[] | {desc, range, active, internal}'
+```
+
+Each external/internal mixdepth pair adds two descriptors (`/0/N/*` and
+`/1/N/*`). The ``range`` upper bound should be at least the deepest used
+address index plus the configured gap limit (default ``1000``).
+
+**What is the node itself doing?** Useful when ``scanning`` returns
+``false`` but balances still look wrong:
+
+```bash
+bitcoin-cli getblockchaininfo \
+  | jq '{blocks, headers, verificationprogress, initialblockdownload, pruned}'
+bitcoin-cli getindexinfo            # txindex / coinstatsindex / blockfilterindex
+bitcoin-cli getmempoolinfo
+```
+
+**Force a one-shot rescan** when the descriptors look healthy but the
+node missed transactions (e.g. after a long downtime or a manual
+`importdescriptors` outside JoinMarket NG):
+
+```bash
+$RPCWALLET rescanblockchain $START_HEIGHT
+```
+
+Use the wallet creation height as ``$START_HEIGHT``. ``getwalletinfo``
+shows ``birthtime``; for an imported BIP39 wallet, set this to the
+earliest possible block height that could contain your funds.
+
+**Cross-check balances and UTXOs** without involving JoinMarket NG:
+
+```bash
+$RPCWALLET getbalances
+$RPCWALLET listunspent 0 9999999 '[]' true
+```
+
+If these report the expected funds but `jm-wallet info` does not, the
+issue is on the JoinMarket NG side -- file a bug with the output of
+``jm-wallet debug-info`` (which redacts sensitive data).
+
+For Neutrino backends the equivalent diagnostics live on the
+neutrino-api server itself rather than via `bitcoin-cli`. See
+[Neutrino TLS](technical/neutrino-tls.md) for credentials and the
+neutrino-api project's own `/status` endpoint for sync state.
+
 ## Next Docs
 
 - [Wallet](README-jmwallet.md)
