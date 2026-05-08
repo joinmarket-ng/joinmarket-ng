@@ -692,6 +692,29 @@ class TakerSettings(BaseModel):
         ge=0,
         description="Maximum absolute CoinJoin fee in satoshis",
     )
+    taker_utxo_age: int = Field(
+        default=5,
+        ge=1,
+        description=(
+            "Minimum confirmations required on a UTXO before the taker may use "
+            "it as a PoDLE commitment input. Reference default: 5."
+        ),
+    )
+    taker_utxo_retries: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        description="Maximum PoDLE index retries per UTXO (reference default: 3)",
+    )
+    taker_utxo_amtpercent: int = Field(
+        default=20,
+        ge=1,
+        le=100,
+        description=(
+            "Minimum UTXO value as a percentage of the CoinJoin amount for "
+            "PoDLE commitments (reference default: 20)."
+        ),
+    )
     max_cj_fee_rel: str = Field(
         default="0.001",
         description="Maximum relative CoinJoin fee (0.001 = 0.1%)",

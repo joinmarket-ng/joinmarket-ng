@@ -533,6 +533,50 @@ class TestTakerSettingsMaxCjFeeRelNormalization:
         assert settings.max_cj_fee_rel == "0.001"
 
 
+class TestTakerSettingsPodleFields:
+    """PoDLE commitment knobs must be exposed on TakerSettings.
+
+    Regression test for the wiring gap where ``taker_utxo_age``,
+    ``taker_utxo_retries``, and ``taker_utxo_amtpercent`` were documented
+    on ``TakerConfig`` but never lived on ``TakerSettings`` -- so the
+    corresponding ``[taker]`` config keys were silently ignored.
+    """
+
+    def test_defaults_match_reference(self) -> None:
+        settings = TakerSettings()
+        assert settings.taker_utxo_age == 5
+        assert settings.taker_utxo_retries == 3
+        assert settings.taker_utxo_amtpercent == 20
+
+    def test_overrides_round_trip(self) -> None:
+        settings = TakerSettings(
+            taker_utxo_age=10,
+            taker_utxo_retries=7,
+            taker_utxo_amtpercent=50,
+        )
+        assert settings.taker_utxo_age == 10
+        assert settings.taker_utxo_retries == 7
+        assert settings.taker_utxo_amtpercent == 50
+
+    def test_taker_utxo_age_rejects_zero(self) -> None:
+        """``taker_utxo_age`` must be >= 1; PoDLE commitments require
+        confirmed inputs, otherwise a maker can grind unconfirmed UTXOs."""
+        with pytest.raises(ValueError):
+            TakerSettings(taker_utxo_age=0)
+
+    def test_taker_utxo_amtpercent_bounds(self) -> None:
+        with pytest.raises(ValueError):
+            TakerSettings(taker_utxo_amtpercent=0)
+        with pytest.raises(ValueError):
+            TakerSettings(taker_utxo_amtpercent=101)
+
+    def test_taker_utxo_retries_bounds(self) -> None:
+        with pytest.raises(ValueError):
+            TakerSettings(taker_utxo_retries=0)
+        with pytest.raises(ValueError):
+            TakerSettings(taker_utxo_retries=11)
+
+
 class TestParseDirectoryServers:
     """Tests for NetworkSettings.parse_directory_servers validator."""
 

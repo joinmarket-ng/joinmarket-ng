@@ -71,6 +71,9 @@ class TestBuildTakerConfig:
         settings.taker.maker_timeout_sec = 60
         settings.taker.order_wait_time = 10.0
         settings.taker.rescan_interval_sec = 600
+        settings.taker.taker_utxo_age = 5
+        settings.taker.taker_utxo_retries = 3
+        settings.taker.taker_utxo_amtpercent = 20
 
         # Wallet config
         settings.wallet.mixdepth_count = 5
@@ -353,3 +356,30 @@ class TestBuildTakerConfig:
         )
 
         assert config.data_dir == Path("/tmp/jm-test-data")
+
+    def test_podle_settings_flow_into_config(
+        self, sample_mnemonic: str, mock_settings: MagicMock
+    ) -> None:
+        """PoDLE-related ``[taker]`` settings must reach ``TakerConfig``.
+
+        Regression test: ``taker_utxo_age`` / ``taker_utxo_retries`` /
+        ``taker_utxo_amtpercent`` were defined nowhere in ``TakerSettings``
+        and never threaded into ``TakerConfig``, so the documented config
+        keys were silently ignored and only the hardcoded defaults applied.
+        """
+        mock_settings.taker.taker_utxo_age = 7
+        mock_settings.taker.taker_utxo_retries = 5
+        mock_settings.taker.taker_utxo_amtpercent = 25
+
+        config = build_taker_config(
+            settings=mock_settings,
+            mnemonic=sample_mnemonic,
+            passphrase="",
+            destination="bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+            amount=100000,
+            mixdepth=0,
+        )
+
+        assert config.taker_utxo_age == 7
+        assert config.taker_utxo_retries == 5
+        assert config.taker_utxo_amtpercent == 25

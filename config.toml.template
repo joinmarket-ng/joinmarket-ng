@@ -362,6 +362,13 @@
 # max_cj_fee_abs = 500        # Absolute fee in satoshis per maker
 # max_cj_fee_rel = "0.001"    # Relative fee (0.001 = 0.1%)
 
+# PoDLE commitment requirements (control which UTXOs can be used as PoDLE inputs).
+# These match the reference JoinMarket defaults; loosening them weakens the
+# anti-DoS commitment scheme.
+# taker_utxo_age = 5          # Minimum confirmations on the PoDLE input
+# taker_utxo_retries = 3      # Max PoDLE index retries per UTXO
+# taker_utxo_amtpercent = 20  # Min UTXO value as % of CJ amount
+
 # Network/miner transaction fee settings
 # fee_rate takes precedence over fee_block_target when set
 # fee_rate = 10.0             # Manual fee rate in sat/vB (omit to use estimation)

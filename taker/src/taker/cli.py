@@ -251,6 +251,9 @@ def build_taker_config(
         rescan_interval_sec=settings.taker.rescan_interval_sec,
         pending_tx_abandon_hours=settings.taker.pending_tx_abandon_hours,
         select_utxos=select_utxos,
+        taker_utxo_age=settings.taker.taker_utxo_age,
+        taker_utxo_retries=settings.taker.taker_utxo_retries,
+        taker_utxo_amtpercent=settings.taker.taker_utxo_amtpercent,
     )
 
 
