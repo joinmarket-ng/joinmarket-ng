@@ -150,6 +150,65 @@ class TestSelectUtxos:
         assert len(selected) == 1
         assert all(u.confirmations >= 6 for u in selected)
 
+    def test_select_admits_zero_conf_utxos_when_min_conf_is_zero(
+        self, test_mnemonic: str, mock_backend
+    ):
+        """With ``min_confirmations=0`` an unconfirmed UTXO is selectable.
+
+        Regression coverage for issue #491: a maker that opts in via
+        ``[maker] min_confirmations = 0`` should be able to offer UTXOs
+        from unconfirmed parents. Default behaviour (``>= 1``) must keep
+        excluding them.
+        """
+        ws = WalletService(
+            mnemonic=test_mnemonic,
+            backend=mock_backend,
+            network="regtest",
+            mixdepth_count=5,
+            gap_limit=20,
+        )
+        zero_conf = UTXOInfo(
+            txid="0" * 64,
+            vout=0,
+            value=120_000,
+            address="bcrt1zeroconf",
+            confirmations=0,
+            scriptpubkey="0014" + "00" * 20,
+            path="m/84'/0'/1'/0/9",
+            mixdepth=1,
+        )
+        ws.utxo_cache = {1: [zero_conf]}
+
+        # Default min_confirmations (>=1): unconfirmed parents are filtered out.
+        with pytest.raises(ValueError):
+            ws.select_utxos(1, 100_000, min_confirmations=1)
+
+        # min_confirmations=0: the unconfirmed UTXO is admitted.
+        selected = ws.select_utxos(1, 100_000, min_confirmations=0)
+        assert selected == [zero_conf]
+
+    def test_select_min_conf_zero_still_picks_confirmed_first(self, wallet_service: WalletService):
+        """``min_confirmations=0`` widens the eligible pool but does not
+        reorder it -- selection is value-driven, so a 100k confirmed UTXO
+        still wins over smaller unconfirmed ones."""
+        ws = wallet_service
+        unconfirmed = UTXOInfo(
+            txid="u" * 64,
+            vout=0,
+            value=40_000,
+            address="bcrt1unconf",
+            confirmations=0,
+            scriptpubkey="0014" + "ab" * 20,
+            path="m/84'/0'/1'/0/9",
+            mixdepth=1,
+        )
+        ws.utxo_cache[1].append(unconfirmed)
+
+        selected = ws.select_utxos(1, 80_000, min_confirmations=0)
+        # The 100k confirmed UTXO covers it on its own; unconfirmed is unused.
+        assert len(selected) == 1
+        assert selected[0].value == 100_000
+
     def test_select_insufficient_funds_raises(self, wallet_service: WalletService):
         """Raises ValueError when insufficient funds."""
         with pytest.raises(ValueError, match="Insufficient funds"):
