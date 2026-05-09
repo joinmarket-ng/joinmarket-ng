@@ -22,7 +22,7 @@ If you only want this subset:
 docker compose up -d
 
 # run test module from repository root
-pytest -m docker maker/tests/integration/test_wallet_bitcoin_core.py --fail-on-skip
+pytest -m docker maker/tests/integration/ --fail-on-skip
 
 # cleanup
 docker compose down -v

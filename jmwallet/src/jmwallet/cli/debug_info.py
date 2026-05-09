@@ -391,9 +391,7 @@ def debug_info(
     ] = None,
     backend_type: Annotated[
         str | None,
-        typer.Option(
-            "--backend", "-b", help="Backend: scantxoutset | descriptor_wallet | neutrino"
-        ),
+        typer.Option("--backend", "-b", help="Backend: descriptor_wallet | neutrino"),
     ] = None,
     neutrino_url: Annotated[
         str | None,

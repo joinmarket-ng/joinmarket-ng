@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -14,9 +15,38 @@ import pytest
 import typer
 from typer.testing import CliRunner
 
+from jmwallet.backends.descriptor_wallet import DescriptorWalletBackend
 from jmwallet.cli import app
 
 runner = CliRunner()
+
+
+def _stub_backend_class(mock_obj: MagicMock) -> type:
+    """Build a real subclass of ``DescriptorWalletBackend`` whose instantiation
+    returns ``mock_obj``. Reassigning ``mock_obj.__class__`` to the stub keeps
+    ``isinstance(mock_obj, DescriptorWalletBackend)`` (and ``isinstance`` against
+    the patched name) True without invoking the real ``__init__``."""
+    cls = type(
+        "StubDescriptorWalletBackend",
+        (DescriptorWalletBackend,),
+        {"__new__": staticmethod(lambda *a, **k: mock_obj), "__init__": lambda self, *a, **k: None},
+    )
+    mock_obj.__class__ = cls  # type: ignore[assignment]
+    return cls
+
+
+@contextmanager
+def _patch_wallet_sync_noop():
+    """Short-circuit ``WalletService`` descriptor-wallet sync helpers so CLI
+    tests using a mocked ``DescriptorWalletBackend`` don't exercise the real
+    RPC-backed setup/sync code paths."""
+    from jmwallet.wallet.service import WalletService
+
+    with (
+        patch.object(WalletService, "is_descriptor_wallet_ready", AsyncMock(return_value=True)),
+        patch.object(WalletService, "sync_with_descriptor_wallet", AsyncMock(return_value=[])),
+    ):
+        yield
 
 
 def test_root_help_shows_completion_options() -> None:
@@ -67,16 +97,22 @@ def test_bip39_import_with_passphrase_zpub_and_address():
         assert "Word count: 24" in result.stdout
 
         # Create a mock backend that returns empty UTXOs (no balance)
-        mock_backend = MagicMock()
+        mock_backend = MagicMock(spec=DescriptorWalletBackend)
         mock_backend.get_utxos = AsyncMock(return_value=[])
         mock_backend.close = AsyncMock()
         mock_backend.supports_watch_address = False
         mock_backend.supports_descriptor_scan = False
 
-        # Mock the BitcoinCoreBackend class (imported inside _show_wallet_info)
-        with patch("jmwallet.backends.bitcoin_core.BitcoinCoreBackend", return_value=mock_backend):
+        # Mock the DescriptorWalletBackend class (imported inside _show_wallet_info)
+        with (
+            patch(
+                "jmwallet.backends.descriptor_wallet.DescriptorWalletBackend",
+                _stub_backend_class(mock_backend),
+            ),
+            _patch_wallet_sync_noop(),
+        ):
             # Run 'info --extended' command to see zpub and first address
-            # Note: explicitly use scantxoutset backend since descriptor_wallet is default
+            # Note: explicitly use descriptor_wallet backend since descriptor_wallet is default
             # Use BIP39_PASSPHRASE env var (--bip39-passphrase removed for security)
             result = runner.invoke(
                 app,
@@ -87,7 +123,7 @@ def test_bip39_import_with_passphrase_zpub_and_address():
                     "--network",
                     "mainnet",
                     "--backend",
-                    "scantxoutset",  # Use scantxoutset to match the mocked backend
+                    "descriptor_wallet",  # Use descriptor_wallet to match the mocked backend
                     "--extended",
                     "--gap",
                     "1",  # Only show first address
@@ -243,7 +279,7 @@ def test_bip39_prompt_passphrase():
         mnemonic_file.write_text(mnemonic)
 
         # Create a mock backend that returns empty UTXOs (no balance)
-        mock_backend = MagicMock()
+        mock_backend = MagicMock(spec=DescriptorWalletBackend)
         mock_backend.get_utxos = AsyncMock(return_value=[])
         mock_backend.close = AsyncMock()
         mock_backend.supports_watch_address = False
@@ -251,11 +287,15 @@ def test_bip39_prompt_passphrase():
 
         # Mock typer.prompt to return the passphrase
         with (
-            patch("jmwallet.backends.bitcoin_core.BitcoinCoreBackend", return_value=mock_backend),
+            patch(
+                "jmwallet.backends.descriptor_wallet.DescriptorWalletBackend",
+                _stub_backend_class(mock_backend),
+            ),
             patch.object(typer, "prompt", return_value=passphrase) as mock_prompt,
+            _patch_wallet_sync_noop(),
         ):
             # Run 'info --extended --prompt-bip39-passphrase' command
-            # Note: explicitly use scantxoutset backend since descriptor_wallet is default
+            # Note: explicitly use descriptor_wallet backend since descriptor_wallet is default
             result = runner.invoke(
                 app,
                 [
@@ -266,7 +306,7 @@ def test_bip39_prompt_passphrase():
                     "--network",
                     "mainnet",
                     "--backend",
-                    "scantxoutset",  # Use scantxoutset to match the mocked backend
+                    "descriptor_wallet",  # Use descriptor_wallet to match the mocked backend
                     "--extended",
                     "--gap",
                     "1",  # Only show first address
@@ -316,7 +356,7 @@ def test_send_respects_config_block_target():
     when no --block-target is provided via CLI.
     """
     # Mock backend
-    mock_backend = MagicMock()
+    mock_backend = MagicMock(spec=DescriptorWalletBackend)
     mock_backend.estimate_fee = AsyncMock(return_value=1.0)  # 1 sat/vB
     mock_backend.get_balance = AsyncMock(return_value=100000)
     mock_backend.get_utxos = AsyncMock(return_value=[])  # Empty to stop execution early
@@ -330,7 +370,13 @@ def test_send_respects_config_block_target():
     env["WALLET__DEFAULT_FEE_BLOCK_TARGET"] = str(expected_target)
 
     with patch.dict(os.environ, env):
-        with patch("jmwallet.backends.bitcoin_core.BitcoinCoreBackend", return_value=mock_backend):
+        with (
+            patch(
+                "jmwallet.backends.descriptor_wallet.DescriptorWalletBackend",
+                _stub_backend_class(mock_backend),
+            ),
+            _patch_wallet_sync_noop(),
+        ):
             # Mock WalletService to avoid initialization issues
             mock_wallet = MagicMock()
             mock_wallet.get_balance = AsyncMock(return_value=100000)
@@ -357,7 +403,7 @@ def test_send_respects_config_block_target():
                         "--network",
                         "regtest",
                         "--backend",
-                        "scantxoutset",
+                        "descriptor_wallet",
                     ],
                     env={
                         "MNEMONIC": "abandon abandon abandon abandon abandon abandon "
@@ -392,7 +438,7 @@ def test_send_rejects_excessive_manual_fee_rate():
                 "--network",
                 "regtest",
                 "--backend",
-                "scantxoutset",
+                "descriptor_wallet",
                 "--fee-rate",
                 "2000",
             ],
@@ -419,7 +465,7 @@ def test_send_rejects_zero_manual_fee_rate():
                 "--network",
                 "regtest",
                 "--backend",
-                "scantxoutset",
+                "descriptor_wallet",
                 "--fee-rate",
                 "0",
             ],
@@ -446,7 +492,7 @@ def test_send_rejects_nan_manual_fee_rate():
                 "--network",
                 "regtest",
                 "--backend",
-                "scantxoutset",
+                "descriptor_wallet",
                 "--fee-rate",
                 "nan",
             ],
@@ -472,7 +518,7 @@ async def test_send_fails_when_change_key_unavailable():
         backend_settings = ResolvedBackendSettings(
             network="regtest",
             bitcoin_network="regtest",
-            backend_type="scantxoutset",
+            backend_type="descriptor_wallet",
             rpc_url="http://127.0.0.1:18443",
             rpc_user="user",
             rpc_password="pass",
@@ -482,7 +528,7 @@ async def test_send_fails_when_change_key_unavailable():
             scan_start_height=None,
         )
 
-        mock_backend = MagicMock()
+        mock_backend = MagicMock(spec=DescriptorWalletBackend)
         mock_backend.get_mempool_min_fee = AsyncMock(return_value=None)
         mock_backend.estimate_fee = AsyncMock(return_value=1.0)
 
@@ -501,6 +547,8 @@ async def test_send_fails_when_change_key_unavailable():
 
         mock_wallet = MagicMock()
         mock_wallet.sync_all = AsyncMock()
+        mock_wallet.is_descriptor_wallet_ready = AsyncMock(return_value=True)
+        mock_wallet.sync_with_descriptor_wallet = AsyncMock(return_value=[utxo])
         mock_wallet.get_balance = AsyncMock(return_value=100_000)
         mock_wallet.get_utxos = AsyncMock(return_value=[utxo])
         mock_wallet.close = AsyncMock()
@@ -511,7 +559,10 @@ async def test_send_fails_when_change_key_unavailable():
         )
 
         with (
-            patch("jmwallet.backends.bitcoin_core.BitcoinCoreBackend", return_value=mock_backend),
+            patch(
+                "jmwallet.backends.descriptor_wallet.DescriptorWalletBackend",
+                _stub_backend_class(mock_backend),
+            ),
             patch("jmwallet.wallet.service.WalletService", return_value=mock_wallet),
         ):
             with pytest.raises(typer.Exit) as exc_info:
@@ -779,7 +830,7 @@ def test_info_uses_default_wallet(monkeypatch):
         save_mnemonic_file(mnemonic, default_wallet, None)
 
         # Mock backend
-        mock_backend = MagicMock()
+        mock_backend = MagicMock(spec=DescriptorWalletBackend)
         mock_backend.get_utxos = AsyncMock(return_value=[])
         mock_backend.close = AsyncMock()
         mock_backend.supports_watch_address = False
@@ -788,7 +839,11 @@ def test_info_uses_default_wallet(monkeypatch):
         # Override home directory for this test
         with (
             patch.object(Path, "home", return_value=Path(tmpdir)),
-            patch("jmwallet.backends.bitcoin_core.BitcoinCoreBackend", return_value=mock_backend),
+            patch(
+                "jmwallet.backends.descriptor_wallet.DescriptorWalletBackend",
+                _stub_backend_class(mock_backend),
+            ),
+            _patch_wallet_sync_noop(),
         ):
             # Run info without --mnemonic-file (should use default)
             result = runner.invoke(
@@ -796,7 +851,7 @@ def test_info_uses_default_wallet(monkeypatch):
                 [
                     "info",
                     "--backend",
-                    "scantxoutset",
+                    "descriptor_wallet",
                 ],
             )
 

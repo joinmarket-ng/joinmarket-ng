@@ -117,7 +117,6 @@ pytest tumbler/tests
 │                                            t|signet|regtes                   │
 │                                            t]                                │
 │    --backend        -b                     TEXT             Backend type:    │
-│                                                             scantxoutset |   │
 │                                                             descriptor_wall… │
 │                                                             | neutrino       │
 │    --rpc-url                               TEXT             Bitcoin full     │

@@ -173,7 +173,7 @@ async def get_session(
         # Expose the underlying bitcoind descriptor wallet name for clients
         # (e.g. test setup / debugging tools) that need to query Bitcoin Core
         # directly. Only present when the active backend is a descriptor
-        # wallet — other backends (Neutrino, scantxoutset) leave this unset.
+        # wallet — other backends (Neutrino) leave this unset.
         try:
             backend = state.wallet_service.backend
             wallet_name_attr = getattr(backend, "wallet_name", None)

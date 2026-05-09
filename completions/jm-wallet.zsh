@@ -43,7 +43,7 @@ _jm_wallet() {
             '--mnemonic-file=[]:file:_files' \
             '--prompt-bip39-passphrase[Prompt for BIP39 passphrase]' \
             '--network=[Bitcoin network]: :' \
-            '--backend=[Backend\: scantxoutset | descriptor_wallet | neutrino]: :' \
+            '--backend=[Backend\: descriptor_wallet | neutrino]: :' \
             '--rpc-url=[]: :' \
             '--locktime=[Locktime(s) to scan for]: :' \
             '--data-dir=[Data directory (default\: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)]:file:_files' \
@@ -83,7 +83,7 @@ _jm_wallet() {
             '--mnemonic-file=[]:file:_files' \
             '--prompt-bip39-passphrase[Prompt for BIP39 passphrase]' \
             '--network=[Bitcoin network]: :' \
-            '--backend=[Backend\: scantxoutset | descriptor_wallet | neutrino]: :' \
+            '--backend=[Backend\: descriptor_wallet | neutrino]: :' \
             '--rpc-url=[]: :' \
             '--neutrino-url=[]: :' \
             '--data-dir=[Data directory (default\: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)]:file:_files' \
@@ -113,7 +113,7 @@ _jm_wallet() {
             '--validity-periods=[Certificate validity in 2016-block periods from now (1=~2wk, 52=~2yr)]: :' \
             '--data-dir=[Data directory (default\: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)]:file:_files' \
             '--network=[Bitcoin network]: :' \
-            '--backend=[Backend\: scantxoutset | descriptor_wallet | neutrino]: :' \
+            '--backend=[Backend\: descriptor_wallet | neutrino]: :' \
             '--rpc-url=[]: :' \
             '--neutrino-url=[]: :' \
             '--mempool-api=[Mempool API URL for fetching block height. Only used when no Bitcoin node backend is configured. Example\: http\://localhost\:8999/api]: :' \
@@ -129,7 +129,7 @@ _jm_wallet() {
             '--data-dir=[Data directory (default\: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)]:file:_files' \
             '--skip-verification[Skip signature verification (not recommended)]' \
             '--network=[Bitcoin network]: :' \
-            '--backend=[Backend\: scantxoutset | descriptor_wallet | neutrino]: :' \
+            '--backend=[Backend\: descriptor_wallet | neutrino]: :' \
             '--rpc-url=[]: :' \
             '--neutrino-url=[]: :' \
             '--mempool-api=[Mempool API URL for validating cert expiry. Only used when no Bitcoin node backend is configured. Example\: http\://localhost\:8999/api]: :' \
@@ -152,7 +152,7 @@ _jm_wallet() {
         debug-info)
           _arguments \
             '--network=[Bitcoin network]: :' \
-            '--backend=[Backend\: scantxoutset | descriptor_wallet | neutrino]: :' \
+            '--backend=[Backend\: descriptor_wallet | neutrino]: :' \
             '--neutrino-url=[]: :' \
             '--data-dir=[Data directory (default\: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)]:file:_files' \
             '--log-level=[Log level]: :' \
@@ -163,7 +163,7 @@ _jm_wallet() {
             '--mnemonic-file=[Path to mnemonic file]:file:_files' \
             '--prompt-bip39-passphrase[Prompt for BIP39 passphrase interactively]' \
             '--network=[Bitcoin network]: :' \
-            '--backend=[Backend\: scantxoutset | descriptor_wallet | neutrino]: :' \
+            '--backend=[Backend\: descriptor_wallet | neutrino]: :' \
             '--rpc-url=[]: :' \
             '--neutrino-url=[]: :' \
             '--mixdepth=[Filter to a specific mixdepth (0-4)]: :' \
@@ -199,7 +199,7 @@ _jm_wallet() {
             '--fee-rate=[Manual fee rate in sat/vB (e.g. 1.5). Mutually exclusive with --block-target. Defaults to 3-block estimation.]: :' \
             '--block-target=[Target blocks for fee estimation (1-1008). Defaults to 3.]: :' \
             '--network=[Bitcoin network]: :' \
-            '--backend=[Backend\: scantxoutset | descriptor_wallet | neutrino]: :' \
+            '--backend=[Backend\: descriptor_wallet | neutrino]: :' \
             '--rpc-url=[]: :' \
             '--neutrino-url=[]: :' \
             '--broadcast[Broadcast the transaction]' \
@@ -232,7 +232,7 @@ _jm_wallet() {
             '--mnemonic-file=[Path to mnemonic file]:file:_files' \
             '--prompt-bip39-passphrase[Prompt for BIP39 passphrase interactively]' \
             '--network=[Bitcoin network]: :' \
-            '--backend=[Backend\: scantxoutset | descriptor_wallet | neutrino]: :' \
+            '--backend=[Backend\: descriptor_wallet | neutrino]: :' \
             '--rpc-url=[]: :' \
             '--neutrino-url=[]: :' \
             '--extended[Show detailed address view with derivations]' \

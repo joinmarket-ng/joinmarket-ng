@@ -250,9 +250,7 @@ def plan_command(
     ] = None,
     backend_type: Annotated[
         str | None,
-        typer.Option(
-            "--backend", "-b", help="Backend type: scantxoutset | descriptor_wallet | neutrino"
-        ),
+        typer.Option("--backend", "-b", help="Backend type: descriptor_wallet | neutrino"),
     ] = None,
     rpc_url: Annotated[
         str | None,

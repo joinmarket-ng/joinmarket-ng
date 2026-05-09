@@ -75,14 +75,6 @@ Privacy tradeoff: More inputs = faster consolidation but reveals UTXO clustering
 
 Trade-off: Addresses stored in Core wallet file - never use with third-party node.
 
-**Bitcoin Core Backend (Legacy):**
-
-- Method: `scantxoutset` RPC (no wallet required)
-- Requirements: Bitcoin Core v30+
-- Sync: Slow (~90s per scan on mainnet)
-
-Useful for one-off operations without persistent tracking.
-
 **Neutrino Backend:**
 
 - Method: BIP157/158 compact block filters

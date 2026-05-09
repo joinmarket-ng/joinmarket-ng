@@ -103,7 +103,6 @@ you specifically want isolated config and runtime state.
 │                                                       (defaults to           │
 │                                                       --network)             │
 │ --backend-type                  TEXT                  Backend type:          │
-│                                                       scantxoutset |         │
 │                                                       descriptor_wallet |    │
 │                                                       neutrino               │
 │ --rpc-url                       TEXT                  Bitcoin full node RPC  │

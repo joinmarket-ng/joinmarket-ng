@@ -289,9 +289,7 @@ def info(
     network: Annotated[str | None, typer.Option("--network", "-n", help="Bitcoin network")] = None,
     backend_type: Annotated[
         str | None,
-        typer.Option(
-            "--backend", "-b", help="Backend: scantxoutset | descriptor_wallet | neutrino"
-        ),
+        typer.Option("--backend", "-b", help="Backend: descriptor_wallet | neutrino"),
     ] = None,
     rpc_url: Annotated[str | None, typer.Option("--rpc-url", envvar="BITCOIN_RPC_URL")] = None,
     neutrino_url: Annotated[
@@ -378,7 +376,6 @@ async def _show_wallet_info(
     creation_height: int | None = None,
 ) -> None:
     """Show wallet info implementation."""
-    from jmwallet.backends.bitcoin_core import BitcoinCoreBackend
     from jmwallet.backends.descriptor_wallet import DescriptorWalletBackend
     from jmwallet.backends.neutrino import NeutrinoBackend
     from jmwallet.history import (
@@ -405,7 +402,7 @@ async def _show_wallet_info(
         logger.info(f"Found {len(fidelity_bond_addresses)} fidelity bond(s) in registry")
 
     # Create backend
-    backend: BitcoinCoreBackend | DescriptorWalletBackend | NeutrinoBackend
+    backend: DescriptorWalletBackend | NeutrinoBackend
     if backend_type == "neutrino":
         backend = NeutrinoBackend(
             neutrino_url=backend_settings.neutrino_url,
@@ -433,12 +430,6 @@ async def _show_wallet_info(
             rpc_user=backend_settings.rpc_user,
             rpc_password=backend_settings.rpc_password,
             wallet_name=wallet_name,
-        )
-    elif backend_type == "scantxoutset":
-        backend = BitcoinCoreBackend(
-            rpc_url=backend_settings.rpc_url,
-            rpc_user=backend_settings.rpc_user,
-            rpc_password=backend_settings.rpc_password,
         )
     else:
         raise ValueError(f"Unknown backend type: {backend_type}")
@@ -494,7 +485,7 @@ async def _show_wallet_info(
                     fidelity_bond_addresses=fidelity_bond_addresses if bond_count else None
                 )
         else:
-            # Use standard sync (scantxoutset for scantxoutset, BIP157/158 for neutrino)
+            # Use standard sync (BIP157/158 for neutrino)
             await wallet.sync_all(fidelity_bond_addresses or None)
 
         # Update any pending transaction statuses

@@ -210,7 +210,7 @@ class Taker(TakerMonitoringMixin):
             # Use fast descriptor wallet sync
             await self.wallet.sync_with_descriptor_wallet()
         else:
-            # Use standard sync (scantxoutset for scantxoutset, BIP157/158 for neutrino)
+            # Use standard sync (BIP157/158 for neutrino, mempool API, etc.)
             await self.wallet.sync_all()
 
         total_balance = await self.wallet.get_total_balance()

@@ -19,7 +19,7 @@ import subprocess
 import pytest
 import pytest_asyncio
 from jmcore.models import NetworkType
-from jmwallet.backends.bitcoin_core import BitcoinCoreBackend
+from jmwallet.backends.descriptor_wallet import DescriptorWalletBackend
 from jmwallet.wallet.service import WalletService
 from maker.bot import MakerBot
 from maker.config import MakerConfig
@@ -76,7 +76,7 @@ def _require_docker_container(service: str) -> None:
 @pytest.fixture
 def bitcoin_backend():
     """Bitcoin Core backend for regtest"""
-    return BitcoinCoreBackend(
+    return DescriptorWalletBackend(
         rpc_url="http://127.0.0.1:18443",
         rpc_user="test",
         rpc_password="test",
@@ -84,7 +84,7 @@ def bitcoin_backend():
 
 
 async def _create_funded_wallet(
-    bitcoin_backend: BitcoinCoreBackend,
+    bitcoin_backend: DescriptorWalletBackend,
     mnemonic: str,
     *,
     skip_msg: str = "Wallet has no funds. Auto-funding failed; please fund manually.",
@@ -203,7 +203,7 @@ def maker_config():
         mnemonic=MAKER1_MNEMONIC,
         network=NetworkType.TESTNET,  # Protocol network for directory handshakes
         bitcoin_network=NetworkType.REGTEST,  # Bitcoin network for address generation
-        backend_type="scantxoutset",
+        backend_type="descriptor_wallet",
         backend_config={
             "rpc_url": "http://127.0.0.1:18443",
             "rpc_user": "test",
@@ -228,7 +228,7 @@ def maker2_config():
         mnemonic=MAKER2_MNEMONIC,
         network=NetworkType.TESTNET,  # Protocol network for directory handshakes
         bitcoin_network=NetworkType.REGTEST,  # Bitcoin network for address generation
-        backend_type="scantxoutset",
+        backend_type="descriptor_wallet",
         backend_config={
             "rpc_url": "http://127.0.0.1:18443",
             "rpc_user": "test",
@@ -253,7 +253,7 @@ def taker_config():
         mnemonic=TAKER_MNEMONIC,
         network=NetworkType.TESTNET,  # Protocol network for directory handshakes
         bitcoin_network=NetworkType.REGTEST,  # Bitcoin network for address generation
-        backend_type="scantxoutset",
+        backend_type="descriptor_wallet",
         backend_config={
             "rpc_url": "http://127.0.0.1:18443",
             "rpc_user": "test",

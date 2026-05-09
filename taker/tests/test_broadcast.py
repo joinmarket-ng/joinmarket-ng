@@ -714,10 +714,10 @@ class TestHasMempoolAccess:
     """Tests for the has_mempool_access() backend method."""
 
     def test_bitcoin_core_has_mempool(self) -> None:
-        """Test BitcoinCoreBackend has mempool access."""
-        from jmwallet.backends.bitcoin_core import BitcoinCoreBackend
+        """Test DescriptorWalletBackend has mempool access."""
+        from jmwallet.backends.descriptor_wallet import DescriptorWalletBackend
 
-        backend = BitcoinCoreBackend(
+        backend = DescriptorWalletBackend(
             rpc_url="http://localhost:18443",
             rpc_user="test",
             rpc_password="test",

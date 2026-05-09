@@ -53,9 +53,7 @@ def send(
     network: Annotated[str | None, typer.Option("--network", "-n", help="Bitcoin network")] = None,
     backend_type: Annotated[
         str | None,
-        typer.Option(
-            "--backend", "-b", help="Backend: scantxoutset | descriptor_wallet | neutrino"
-        ),
+        typer.Option("--backend", "-b", help="Backend: descriptor_wallet | neutrino"),
     ] = None,
     rpc_url: Annotated[str | None, typer.Option("--rpc-url", envvar="BITCOIN_RPC_URL")] = None,
     neutrino_url: Annotated[
@@ -169,7 +167,6 @@ async def _send_transaction(
     creation_height: int | None = None,
 ) -> None:
     """Send transaction implementation."""
-    from jmwallet.backends.bitcoin_core import BitcoinCoreBackend
     from jmwallet.backends.descriptor_wallet import (
         DescriptorWalletBackend,
         generate_wallet_name,
@@ -196,7 +193,7 @@ async def _send_transaction(
     ]
 
     # Create backend based on type
-    backend: BitcoinCoreBackend | DescriptorWalletBackend | NeutrinoBackend
+    backend: DescriptorWalletBackend | NeutrinoBackend
     if backend_settings.backend_type == "neutrino":
         backend = NeutrinoBackend(
             neutrino_url=backend_settings.neutrino_url,
@@ -221,11 +218,7 @@ async def _send_transaction(
             wallet_name=wallet_name,
         )
     else:
-        backend = BitcoinCoreBackend(
-            rpc_url=backend_settings.rpc_url,
-            rpc_user=backend_settings.rpc_user,
-            rpc_password=backend_settings.rpc_password,
-        )
+        raise ValueError(f"Unknown backend type: {backend_settings.backend_type}")
 
     if creation_height is not None:
         backend.set_wallet_creation_height(creation_height)

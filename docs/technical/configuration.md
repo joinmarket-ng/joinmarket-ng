@@ -75,7 +75,6 @@ socks_port = 9050
 ## Backend Options
 
 - `descriptor_wallet` (recommended)
-- `scantxoutset`
 - `neutrino`
 
 ## Neutrino TLS Settings

@@ -352,9 +352,7 @@ def prepare_certificate_message(
     network: Annotated[str | None, typer.Option("--network", "-n", help="Bitcoin network")] = None,
     backend_type: Annotated[
         str | None,
-        typer.Option(
-            "--backend", "-b", help="Backend: scantxoutset | descriptor_wallet | neutrino"
-        ),
+        typer.Option("--backend", "-b", help="Backend: descriptor_wallet | neutrino"),
     ] = None,
     rpc_url: Annotated[str | None, typer.Option("--rpc-url", envvar="BITCOIN_RPC_URL")] = None,
     neutrino_url: Annotated[
@@ -464,19 +462,19 @@ def prepare_certificate_message(
         node_available = bool(backend_settings.rpc_url or backend_settings.neutrino_url)
 
         if node_available:
-            from jmwallet.backends.bitcoin_core import BitcoinCoreBackend
+            from jmwallet.backends.descriptor_wallet import DescriptorWalletBackend
             from jmwallet.backends.neutrino import NeutrinoBackend
 
             try:
                 if backend_settings.backend_type == "neutrino":
-                    node_backend: BitcoinCoreBackend | NeutrinoBackend = NeutrinoBackend(
+                    node_backend: DescriptorWalletBackend | NeutrinoBackend = NeutrinoBackend(
                         neutrino_url=backend_settings.neutrino_url,
                         network=backend_settings.network,
                         tls_cert_path=backend_settings.neutrino_tls_cert,
                         auth_token=backend_settings.neutrino_auth_token,
                     )
                 else:
-                    node_backend = BitcoinCoreBackend(
+                    node_backend = DescriptorWalletBackend(
                         rpc_url=backend_settings.rpc_url,
                         rpc_user=backend_settings.rpc_user,
                         rpc_password=backend_settings.rpc_password,
@@ -771,9 +769,7 @@ def import_certificate(
     network: Annotated[str | None, typer.Option("--network", "-n", help="Bitcoin network")] = None,
     backend_type: Annotated[
         str | None,
-        typer.Option(
-            "--backend", "-b", help="Backend: scantxoutset | descriptor_wallet | neutrino"
-        ),
+        typer.Option("--backend", "-b", help="Backend: descriptor_wallet | neutrino"),
     ] = None,
     rpc_url: Annotated[str | None, typer.Option("--rpc-url", envvar="BITCOIN_RPC_URL")] = None,
     neutrino_url: Annotated[
@@ -890,19 +886,19 @@ def import_certificate(
         node_available = bool(backend_settings.rpc_url or backend_settings.neutrino_url)
 
         if node_available:
-            from jmwallet.backends.bitcoin_core import BitcoinCoreBackend
+            from jmwallet.backends.descriptor_wallet import DescriptorWalletBackend
             from jmwallet.backends.neutrino import NeutrinoBackend
 
             try:
                 if backend_settings.backend_type == "neutrino":
-                    node_backend: BitcoinCoreBackend | NeutrinoBackend = NeutrinoBackend(
+                    node_backend: DescriptorWalletBackend | NeutrinoBackend = NeutrinoBackend(
                         neutrino_url=backend_settings.neutrino_url,
                         network=backend_settings.network,
                         tls_cert_path=backend_settings.neutrino_tls_cert,
                         auth_token=backend_settings.neutrino_auth_token,
                     )
                 else:
-                    node_backend = BitcoinCoreBackend(
+                    node_backend = DescriptorWalletBackend(
                         rpc_url=backend_settings.rpc_url,
                         rpc_user=backend_settings.rpc_user,
                         rpc_password=backend_settings.rpc_password,

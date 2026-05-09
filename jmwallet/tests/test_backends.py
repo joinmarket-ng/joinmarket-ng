@@ -1,81 +1,14 @@
 """
-Integration tests for BitcoinCoreBackend and NeutrinoBackend
+Integration tests for DescriptorWalletBackend and NeutrinoBackend
 """
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _jmwallet_test_helpers import TEST_RPC_PASSWORD, TEST_RPC_URL, TEST_RPC_USER
-from jmcore.crypto import KeyPair
 
 from jmwallet.backends.base import BondVerificationRequest
-from jmwallet.backends.bitcoin_core import BitcoinCoreBackend
 from jmwallet.backends.mempool import MempoolBackend
 from jmwallet.backends.neutrino import NeutrinoBackend, NeutrinoConfig
-from jmwallet.wallet.address import pubkey_to_p2wpkh_address
-
-
-@pytest.mark.docker
-@pytest.mark.asyncio
-async def test_bitcoin_core_backend_integration():
-    """Integration test requiring Docker Bitcoin Core service."""
-    # Connect to the regtest node defined in docker-compose
-    backend = BitcoinCoreBackend(
-        rpc_url=TEST_RPC_URL,
-        rpc_user=TEST_RPC_USER,
-        rpc_password=TEST_RPC_PASSWORD,
-    )
-
-    try:
-        # Check connection
-        try:
-            await backend.get_block_height()
-        except Exception:
-            pytest.fail(
-                f"Bitcoin Core not available at {TEST_RPC_URL}. "
-                "Start with: docker compose up -d bitcoin"
-            )
-            return
-
-        # Generate a local address
-        kp = KeyPair()
-        # "regtest" usually implies "bcrt" prefix in our address helper
-        address = pubkey_to_p2wpkh_address(kp.public_key_hex(), network="regtest")
-
-        # Mine to this address
-        try:
-            # generatetoaddress 1 block
-            block_hashes = await backend._rpc_call("generatetoaddress", [1, address])
-        except Exception as e:
-            # If this fails, we can't really test UTXO scanning easily
-            pytest.fail(f"generatetoaddress failed: {e}")
-
-        assert len(block_hashes) == 1
-
-        # Test get_utxos
-        utxos = await backend.get_utxos([address])
-
-        assert len(utxos) > 0
-        assert sum(u.value for u in utxos) > 0
-
-        # Test get_address_balance
-        balance = await backend.get_address_balance(address)
-        assert balance > 0
-
-        # Test get_transaction using the found UTXO
-        txid = utxos[0].txid
-
-        tx = await backend.get_transaction(txid)
-        assert tx is not None
-        assert tx.txid == txid
-
-        # Test estimate_fee returns float
-        fee = await backend.estimate_fee(2)
-        assert isinstance(fee, float)
-        assert fee > 0
-
-    finally:
-        await backend.close()
 
 
 class TestBackendCloseReuse:
@@ -124,24 +57,6 @@ class TestBackendCloseReuse:
 
         assert task.cancelled()
         assert backend._background_rescan_task is None
-
-        await backend.close()
-
-    @pytest.mark.asyncio
-    async def test_bitcoin_core_backend_reusable_after_close(self):
-        """Closing a BitcoinCoreBackend should produce fresh httpx clients."""
-        backend = BitcoinCoreBackend(
-            rpc_url=TEST_RPC_URL, rpc_user=TEST_RPC_USER, rpc_password=TEST_RPC_PASSWORD
-        )
-        original_client = backend.client
-        original_scan_client = backend._scan_client
-
-        await backend.close()
-
-        assert backend.client is not original_client
-        assert backend._scan_client is not original_scan_client
-        assert not backend.client.is_closed
-        assert not backend._scan_client.is_closed
 
         await backend.close()
 
@@ -343,136 +258,6 @@ class TestMempoolBackendUnit:
         assert len(results) == 1
         assert results[0].valid is True
         assert results[0].confirmations == 11
-        await backend.close()
-
-
-class TestBitcoinCoreBackendUnit:
-    """Unit tests for BitcoinCoreBackend (no Docker required)."""
-
-    def test_bitcoin_core_can_estimate_fee(self):
-        """Test that BitcoinCoreBackend reports it can estimate fees."""
-        backend = BitcoinCoreBackend(
-            rpc_url=TEST_RPC_URL, rpc_user=TEST_RPC_USER, rpc_password=TEST_RPC_PASSWORD
-        )
-        assert backend.can_estimate_fee() is True
-
-    def test_bitcoin_core_emits_deprecation_warning(self):
-        """Instantiating BitcoinCoreBackend (scantxoutset) must emit a DeprecationWarning."""
-        import warnings
-
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            BitcoinCoreBackend(
-                rpc_url=TEST_RPC_URL, rpc_user=TEST_RPC_USER, rpc_password=TEST_RPC_PASSWORD
-            )
-
-        deprecations = [w for w in caught if issubclass(w.category, DeprecationWarning)]
-        assert deprecations, "expected a DeprecationWarning when constructing BitcoinCoreBackend"
-        assert any("scantxoutset" in str(w.message) for w in deprecations)
-        assert any("descriptor_wallet" in str(w.message) for w in deprecations)
-
-    @pytest.mark.asyncio
-    async def test_warns_for_remote_non_https_rpc_url(self, monkeypatch):
-        """Remote non-HTTPS RPC URLs should emit a credential exposure warning."""
-        warning_calls: list[str] = []
-
-        def capture_warning(message: str, *args):
-            warning_calls.append(message % args if args else message)
-
-        monkeypatch.setattr("jmwallet.backends.bitcoin_core.logger.warning", capture_warning)
-
-        backend = BitcoinCoreBackend(
-            rpc_url="http://example.org:8332", rpc_user="test", rpc_password="test"
-        )
-        assert any("remote and non-HTTPS" in call for call in warning_calls)
-        await backend.close()
-
-    @pytest.mark.asyncio
-    async def test_bitcoin_core_fee_returns_float(self):
-        """Test that BitcoinCoreBackend fee estimation returns float."""
-        from unittest.mock import AsyncMock
-
-        backend = BitcoinCoreBackend(
-            rpc_url=TEST_RPC_URL, rpc_user=TEST_RPC_USER, rpc_password=TEST_RPC_PASSWORD
-        )
-
-        # Mock the RPC call to return a known fee rate (BTC/kB)
-        # 0.00001 BTC/kB = 1 sat/vB
-        backend._rpc_call = AsyncMock(return_value={"feerate": 0.00001})
-
-        fee = await backend.estimate_fee(3)
-        assert isinstance(fee, float)
-        assert fee == 1.0
-
-        # Test fractional sat/vB rate: 0.000015 BTC/kB = 1.5 sat/vB
-        backend._rpc_call = AsyncMock(return_value={"feerate": 0.000015})
-        fee = await backend.estimate_fee(3)
-        assert isinstance(fee, float)
-        assert fee == 1.5
-
-        # Test sub-1 sat/vB rate: 0.000005 BTC/kB = 0.5 sat/vB
-        backend._rpc_call = AsyncMock(return_value={"feerate": 0.000005})
-        fee = await backend.estimate_fee(6)
-        assert isinstance(fee, float)
-        assert fee == 0.5
-
-    @pytest.mark.asyncio
-    async def test_bitcoin_core_fee_fallback(self):
-        """Test that BitcoinCoreBackend falls back to 1 sat/vB on error."""
-        from unittest.mock import AsyncMock
-
-        backend = BitcoinCoreBackend(
-            rpc_url=TEST_RPC_URL, rpc_user=TEST_RPC_USER, rpc_password=TEST_RPC_PASSWORD
-        )
-
-        # Mock the RPC call to raise an exception
-        backend._rpc_call = AsyncMock(side_effect=Exception("RPC error"))
-
-        fee = await backend.estimate_fee(3)
-        assert isinstance(fee, float)
-        assert fee == 1.0
-
-        # Mock the RPC call to return no feerate (estimation unavailable)
-        backend._rpc_call = AsyncMock(return_value={"errors": ["Insufficient data"]})
-
-        fee = await backend.estimate_fee(3)
-        assert isinstance(fee, float)
-        assert fee == 1.0
-
-    @pytest.mark.asyncio
-    async def test_get_utxos_warns_when_descriptor_address_not_queried(self, monkeypatch):
-        """Defensive warning should trigger for unexpected descriptor addresses."""
-        backend = BitcoinCoreBackend(
-            rpc_url=TEST_RPC_URL, rpc_user=TEST_RPC_USER, rpc_password=TEST_RPC_PASSWORD
-        )
-
-        backend.get_block_height = AsyncMock(return_value=100)
-        backend._scantxoutset_with_retry = AsyncMock(
-            return_value={
-                "unspents": [
-                    {
-                        "txid": "a" * 64,
-                        "vout": 0,
-                        "amount": 0.0001,
-                        "height": 100,
-                        "desc": "addr(bc1qunexpected)#abcd",
-                        "scriptPubKey": "0014" + "00" * 20,
-                    }
-                ]
-            }
-        )
-
-        warning_calls: list[str] = []
-
-        def capture_warning(message: str, *args):
-            warning_calls.append(message % args if args else message)
-
-        monkeypatch.setattr("jmwallet.backends.bitcoin_core.logger.warning", capture_warning)
-
-        utxos = await backend.get_utxos(["bc1qrequested"])
-        assert len(utxos) == 1
-        assert any("address not in query set" in call for call in warning_calls)
-
         await backend.close()
 
 
@@ -1846,13 +1631,6 @@ class TestSupportsDescriptorScan:
         """NeutrinoBackend must report supports_descriptor_scan=False."""
         backend = NeutrinoBackend(neutrino_url="http://localhost:8334")
         assert backend.supports_descriptor_scan is False
-
-    def test_bitcoin_core_supports_descriptor_scan(self):
-        """BitcoinCoreBackend must report supports_descriptor_scan=True."""
-        backend = BitcoinCoreBackend(
-            rpc_url=TEST_RPC_URL, rpc_user=TEST_RPC_USER, rpc_password=TEST_RPC_PASSWORD
-        )
-        assert backend.supports_descriptor_scan is True
 
     def test_descriptor_wallet_supports_descriptor_scan(self):
         """DescriptorWalletBackend must report supports_descriptor_scan=True."""

@@ -136,13 +136,13 @@ class BackendConfig(BaseModel):
     Configuration for Bitcoin backend connection.
 
     Supports different backend types:
-    - scantxoutset: Bitcoin Core RPC with scantxoutset
+    - descriptor_wallet: Bitcoin Core RPC with descriptor wallet
     - neutrino: Light client using BIP 157/158
     """
 
     backend_type: str = Field(
-        default="scantxoutset",
-        description="Backend type: 'scantxoutset' or 'neutrino'",
+        default="descriptor_wallet",
+        description="Backend type: 'descriptor_wallet' or 'neutrino'",
     )
     backend_config: dict[str, Any] = Field(
         default_factory=dict,
@@ -188,8 +188,8 @@ class WalletConfig(BaseModel):
 
     # Backend configuration
     backend_type: str = Field(
-        default="scantxoutset",
-        description="Backend type: 'scantxoutset' or 'neutrino'",
+        default="descriptor_wallet",
+        description="Backend type: 'descriptor_wallet' or 'neutrino'",
     )
     backend_config: dict[str, Any] = Field(
         default_factory=dict,

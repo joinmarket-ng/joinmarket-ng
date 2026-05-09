@@ -32,9 +32,7 @@ def list_bonds(
     network: Annotated[str | None, typer.Option("--network", "-n", help="Bitcoin network")] = None,
     backend_type: Annotated[
         str | None,
-        typer.Option(
-            "--backend", "-b", help="Backend: scantxoutset | descriptor_wallet | neutrino"
-        ),
+        typer.Option("--backend", "-b", help="Backend: descriptor_wallet | neutrino"),
     ] = None,
     rpc_url: Annotated[str | None, typer.Option("--rpc-url", envvar="BITCOIN_RPC_URL")] = None,
     locktimes: Annotated[
@@ -195,7 +193,11 @@ async def _list_fidelity_bonds(
     creation_height: int | None = None,
 ) -> None:
     """List fidelity bonds implementation."""
-    from jmwallet.backends.bitcoin_core import BitcoinCoreBackend
+    from jmwallet.backends.descriptor_wallet import (
+        DescriptorWalletBackend,
+        generate_wallet_name,
+        get_mnemonic_fingerprint,
+    )
     from jmwallet.wallet.bond_registry import (
         FidelityBondInfo as RegistryBondInfo,
     )
@@ -215,10 +217,13 @@ async def _list_fidelity_bonds(
     network = backend_settings.network
     data_dir = backend_settings.data_dir
 
-    backend = BitcoinCoreBackend(
+    fingerprint = get_mnemonic_fingerprint(mnemonic, bip39_passphrase)
+    wallet_name = generate_wallet_name(fingerprint, network)
+    backend = DescriptorWalletBackend(
         rpc_url=backend_settings.rpc_url,
         rpc_user=backend_settings.rpc_user,
         rpc_password=backend_settings.rpc_password,
+        wallet_name=wallet_name,
     )
 
     if creation_height is not None:
@@ -765,9 +770,7 @@ def recover_bonds(
     network: Annotated[str | None, typer.Option("--network", "-n", help="Bitcoin network")] = None,
     backend_type: Annotated[
         str | None,
-        typer.Option(
-            "--backend", "-b", help="Backend: scantxoutset | descriptor_wallet | neutrino"
-        ),
+        typer.Option("--backend", "-b", help="Backend: descriptor_wallet | neutrino"),
     ] = None,
     rpc_url: Annotated[str | None, typer.Option("--rpc-url", envvar="BITCOIN_RPC_URL")] = None,
     neutrino_url: Annotated[
@@ -844,7 +847,6 @@ async def _recover_bonds_async(
     """Async implementation of fidelity bond recovery."""
     from jmcore.timenumber import TIMENUMBER_COUNT
 
-    from jmwallet.backends.bitcoin_core import BitcoinCoreBackend
     from jmwallet.backends.descriptor_wallet import (
         DescriptorWalletBackend,
         generate_wallet_name,
@@ -859,7 +861,7 @@ async def _recover_bonds_async(
     from jmwallet.wallet.service import FIDELITY_BOND_BRANCH, WalletService
 
     # Create backend based on type
-    backend: BitcoinCoreBackend | DescriptorWalletBackend | NeutrinoBackend
+    backend: DescriptorWalletBackend | NeutrinoBackend
     if backend_settings.backend_type == "neutrino":
         backend = NeutrinoBackend(
             neutrino_url=backend_settings.neutrino_url,
@@ -886,11 +888,7 @@ async def _recover_bonds_async(
         # Must create/load wallet before importing descriptors
         await backend.create_wallet()
     else:
-        backend = BitcoinCoreBackend(
-            rpc_url=backend_settings.rpc_url,
-            rpc_user=backend_settings.rpc_user,
-            rpc_password=backend_settings.rpc_password,
-        )
+        raise ValueError(f"Unknown backend type: {backend_settings.backend_type}")
 
     if creation_height is not None:
         backend.set_wallet_creation_height(creation_height)

@@ -16,7 +16,7 @@ from jmcore.notifications import get_notifier
 from jmcore.paths import remove_nick_state, write_nick_state
 from jmcore.protocol import JM_VERSION
 from jmcore.settings import get_settings
-from jmwallet.backends.bitcoin_core import BitcoinCoreBackend
+from jmwallet.backends.descriptor_wallet import DescriptorWalletBackend
 from jmwallet.backends.neutrino import NeutrinoBackend
 from loguru import logger
 
@@ -42,13 +42,13 @@ def setup_logging(level: str) -> None:
 def _create_blockchain_backend(settings: object) -> BlockchainBackend | None:
     """Create a blockchain backend for bond verification if Bitcoin settings are configured.
 
-    Returns a BitcoinCoreBackend for full node configurations, a NeutrinoBackend for
+    Returns a DescriptorWalletBackend for full node configurations, a NeutrinoBackend for
     neutrino configurations, or None to fall back to the mempool API.
     """
     bitcoin_settings = settings.bitcoin  # type: ignore[attr-defined]
     backend_type = bitcoin_settings.backend_type
 
-    if backend_type in ("scantxoutset", "descriptor_wallet"):
+    if backend_type == "descriptor_wallet":
         rpc_url = bitcoin_settings.rpc_url
         rpc_user = bitcoin_settings.rpc_user
         rpc_password = bitcoin_settings.rpc_password.get_secret_value()
@@ -58,7 +58,7 @@ def _create_blockchain_backend(settings: object) -> BlockchainBackend | None:
             return None
 
         logger.info(f"Using Bitcoin Core backend for bond verification (RPC: {rpc_url})")
-        return BitcoinCoreBackend(
+        return DescriptorWalletBackend(
             rpc_url=rpc_url,
             rpc_user=rpc_user,
             rpc_password=rpc_password,

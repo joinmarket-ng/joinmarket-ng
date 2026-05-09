@@ -144,7 +144,7 @@ class BitcoinSettings(BaseModel):
 
     backend_type: str = Field(
         default="descriptor_wallet",
-        description="Backend type: scantxoutset, descriptor_wallet, or neutrino",
+        description="Backend type: descriptor_wallet or neutrino",
     )
     rpc_url: str = Field(
         default="http://127.0.0.1:8332",

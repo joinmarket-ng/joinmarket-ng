@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import pytest
 import pytest_asyncio
-from jmwallet.backends.bitcoin_core import BitcoinCoreBackend
+from jmwallet.backends.descriptor_wallet import DescriptorWalletBackend
 from jmwallet.backends.neutrino import NeutrinoBackend
 from loguru import logger
 
@@ -28,7 +28,7 @@ from loguru import logger
 @pytest_asyncio.fixture
 async def bitcoin_backend(bitcoin_rpc_config: dict[str, str]):
     """Create and verify Bitcoin Core backend connection."""
-    backend = BitcoinCoreBackend(
+    backend = DescriptorWalletBackend(
         rpc_url=bitcoin_rpc_config["rpc_url"],
         rpc_user=bitcoin_rpc_config["rpc_user"],
         rpc_password=bitcoin_rpc_config["rpc_password"],

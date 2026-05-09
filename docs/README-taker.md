@@ -172,7 +172,6 @@ Takers only require Tor SOCKS; no Tor control port is needed.
 │                                            t]               (defaults to     │
 │                                                             --network)       │
 │    --backend        -b                     TEXT             Backend type:    │
-│                                                             scantxoutset |   │
 │                                                             descriptor_wall… │
 │                                                             | neutrino       │
 │    --rpc-url                               TEXT             Bitcoin full     │
@@ -273,7 +272,6 @@ Takers only require Tor SOCKS; no Tor control port is needed.
 │ --network                       [mainnet|testnet|sig  Bitcoin network        │
 │                                 net|regtest]                                 │
 │ --backend               -b      TEXT                  Backend type:          │
-│                                                       scantxoutset |         │
 │                                                       descriptor_wallet |    │
 │                                                       neutrino               │
 │ --rpc-url                       TEXT                  Bitcoin full node RPC  │

@@ -700,7 +700,7 @@ def _build_taker_docker_cmd(
         "--bitcoin-network",
         "regtest",
         "--backend",
-        "scantxoutset",
+        "descriptor_wallet",
         "--max-abs-fee",
         "100000",
         "--max-rel-fee",

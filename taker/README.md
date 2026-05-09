@@ -82,7 +82,6 @@ For full documentation, see [taker Documentation](https://joinmarket-ng.github.i
 │                                            t]               (defaults to     │
 │                                                             --network)       │
 │    --backend        -b                     TEXT             Backend type:    │
-│                                                             scantxoutset |   │
 │                                                             descriptor_wall… │
 │                                                             | neutrino       │
 │    --rpc-url                               TEXT             Bitcoin full     │
@@ -183,7 +182,6 @@ For full documentation, see [taker Documentation](https://joinmarket-ng.github.i
 │ --network                       [mainnet|testnet|sig  Bitcoin network        │
 │                                 net|regtest]                                 │
 │ --backend               -b      TEXT                  Backend type:          │
-│                                                       scantxoutset |         │
 │                                                       descriptor_wallet |    │
 │                                                       neutrino               │
 │ --rpc-url                       TEXT                  Bitcoin full node RPC  │

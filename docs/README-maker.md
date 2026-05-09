@@ -341,7 +341,6 @@ jm-maker start --help
 │                                                       (defaults to           │
 │                                                       --network)             │
 │ --backend-type                  TEXT                  Backend type:          │
-│                                                       scantxoutset |         │
 │                                                       descriptor_wallet |    │
 │                                                       neutrino               │
 │ --rpc-url                       TEXT                  Bitcoin full node RPC  │

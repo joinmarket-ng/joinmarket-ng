@@ -28,7 +28,7 @@ _jm_maker() {
             '--data-dir=[Data directory for JoinMarket files. Defaults to ~/.joinmarket-ng]:file:_files' \
             '--network=[Protocol network (mainnet, testnet, signet, regtest)]:choice:(mainnet testnet signet regtest)' \
             '--bitcoin-network=[Bitcoin network for address generation (defaults to --network)]:choice:(mainnet testnet signet regtest)' \
-            '--backend-type=[Backend type\: scantxoutset | descriptor_wallet | neutrino]: :' \
+            '--backend-type=[Backend type\: descriptor_wallet | neutrino]: :' \
             '--rpc-url=[Bitcoin full node RPC URL]: :' \
             '--neutrino-url=[Neutrino REST API URL]: :' \
             '--min-size=[Minimum CoinJoin size in sats]: :' \

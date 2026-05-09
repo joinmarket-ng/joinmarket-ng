@@ -111,7 +111,7 @@ class BlockchainBackend(ABC):
     """Whether this backend supports efficient descriptor-based UTXO scanning.
 
     Backends that override ``scan_descriptors()`` with a real implementation
-    (e.g. Bitcoin Core's ``scantxoutset``) should set this to ``True``.
+    (e.g. Bitcoin Core's descriptor wallet) should set this to ``True``.
     Light-client backends (Neutrino) leave it at the default ``False`` so that
     ``sync_all()`` does not attempt descriptor scanning and fall back with a
     confusing warning.

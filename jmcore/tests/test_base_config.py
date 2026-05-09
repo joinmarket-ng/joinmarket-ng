@@ -153,7 +153,7 @@ class TestDetectTorCookiePath:
 class TestBackendConfig:
     def test_default_values(self):
         config = BackendConfig()
-        assert config.backend_type == "scantxoutset"
+        assert config.backend_type == "descriptor_wallet"
         assert config.backend_config == {}
 
     def test_custom_config(self):
@@ -163,8 +163,8 @@ class TestBackendConfig:
             "rpc_user": "user",
             "rpc_password": "pass",
         }
-        config = BackendConfig(backend_type="scantxoutset", backend_config=backend_cfg)
-        assert config.backend_type == "scantxoutset"
+        config = BackendConfig(backend_type="descriptor_wallet", backend_config=backend_cfg)
+        assert config.backend_type == "descriptor_wallet"
         assert config.backend_config == backend_cfg
 
 

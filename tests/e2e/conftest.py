@@ -212,9 +212,9 @@ async def bitcoin_core_backend(
     bitcoin_rpc_config: dict[str, str],
 ) -> AsyncGenerator[BlockchainBackend, None]:
     """Create Bitcoin Core backend for tests."""
-    from jmwallet.backends.bitcoin_core import BitcoinCoreBackend
+    from jmwallet.backends.descriptor_wallet import DescriptorWalletBackend
 
-    backend = BitcoinCoreBackend(
+    backend = DescriptorWalletBackend(
         rpc_url=bitcoin_rpc_config["rpc_url"],
         rpc_user=bitcoin_rpc_config["rpc_user"],
         rpc_password=bitcoin_rpc_config["rpc_password"],
@@ -261,9 +261,9 @@ async def blockchain_backend(
     Use this fixture for tests that need Bitcoin Core backend specifically.
     For neutrino tests, use neutrino_backend_fixture.
     """
-    from jmwallet.backends.bitcoin_core import BitcoinCoreBackend
+    from jmwallet.backends.descriptor_wallet import DescriptorWalletBackend
 
-    backend = BitcoinCoreBackend(
+    backend = DescriptorWalletBackend(
         rpc_url=bitcoin_rpc_config["rpc_url"],
         rpc_user=bitcoin_rpc_config["rpc_user"],
         rpc_password=bitcoin_rpc_config["rpc_password"],

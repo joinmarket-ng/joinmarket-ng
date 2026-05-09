@@ -360,8 +360,8 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
             set_blacklist_path(data_dir=self.config.data_dir)
 
             # Load fidelity bond addresses for optimized scanning
-            # We scan wallet + fidelity bonds in a single pass to avoid two separate
-            # scantxoutset calls (which take ~90s each on mainnet)
+            # We scan wallet + fidelity bonds in a single pass to avoid extra
+            # backend round-trips during sync.
             from jmcore.paths import get_default_data_dir
             from jmwallet.wallet.bond_registry import load_registry
 
@@ -447,7 +447,7 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
                 # Use fast descriptor wallet sync
                 await self.wallet.sync_with_descriptor_wallet(fidelity_bond_addresses)
             else:
-                # Use standard sync (scantxoutset for scantxoutset, BIP157/158 for neutrino)
+                # Use standard sync (BIP157/158 for neutrino, mempool API, etc.)
                 await self.wallet.sync_all(fidelity_bond_addresses)
 
             # Update bond registry with UTXO info from the scan (only if using registry)

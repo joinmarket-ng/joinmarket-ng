@@ -113,7 +113,7 @@ def build_taker_config(
 
     # Build backend config
     backend_config: dict[str, Any] = {}
-    if effective_backend_type in ("scantxoutset", "descriptor_wallet"):
+    if effective_backend_type == "descriptor_wallet":
         backend_config = {
             "rpc_url": effective_rpc_url,
             "rpc_user": effective_rpc_user,
@@ -261,7 +261,6 @@ def create_backend(config: TakerConfig) -> Any:
     """Create appropriate backend based on config."""
     bitcoin_network = config.bitcoin_network or config.network
 
-    from jmwallet.backends.bitcoin_core import BitcoinCoreBackend
     from jmwallet.backends.descriptor_wallet import (
         DescriptorWalletBackend,
         generate_wallet_name,
@@ -269,7 +268,7 @@ def create_backend(config: TakerConfig) -> Any:
     )
     from jmwallet.backends.neutrino import NeutrinoBackend
 
-    backend: BitcoinCoreBackend | DescriptorWalletBackend | NeutrinoBackend
+    backend: DescriptorWalletBackend | NeutrinoBackend
     if config.backend_type == "neutrino":
         backend = NeutrinoBackend(
             neutrino_url=config.backend_config.get("neutrino_url", "http://127.0.0.1:8334"),
@@ -290,12 +289,8 @@ def create_backend(config: TakerConfig) -> Any:
             rpc_password=config.backend_config["rpc_password"],
             wallet_name=wallet_name,
         )
-    else:  # scantxoutset
-        backend = BitcoinCoreBackend(
-            rpc_url=config.backend_config["rpc_url"],
-            rpc_user=config.backend_config["rpc_user"],
-            rpc_password=config.backend_config["rpc_password"],
-        )
+    else:
+        raise ValueError(f"Unknown backend type: {config.backend_type}")
 
     if config.creation_height is not None:
         backend.set_wallet_creation_height(config.creation_height)
@@ -342,9 +337,7 @@ def coinjoin(
     ] = None,
     backend_type: Annotated[
         str | None,
-        typer.Option(
-            "--backend", "-b", help="Backend type: scantxoutset | descriptor_wallet | neutrino"
-        ),
+        typer.Option("--backend", "-b", help="Backend type: descriptor_wallet | neutrino"),
     ] = None,
     rpc_url: Annotated[
         str | None,
@@ -680,9 +673,7 @@ def tumble(
     ] = None,
     backend_type: Annotated[
         str | None,
-        typer.Option(
-            "--backend", "-b", help="Backend type: scantxoutset | descriptor_wallet | neutrino"
-        ),
+        typer.Option("--backend", "-b", help="Backend type: descriptor_wallet | neutrino"),
     ] = None,
     rpc_url: Annotated[
         str | None,

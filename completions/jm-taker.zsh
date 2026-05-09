@@ -32,7 +32,7 @@ _jm_taker() {
             '--prompt-bip39-passphrase[Prompt for BIP39 passphrase interactively]' \
             '--network=[Protocol network for handshakes]:choice:(mainnet testnet signet regtest)' \
             '--bitcoin-network=[Bitcoin network for addresses (defaults to --network)]:choice:(mainnet testnet signet regtest)' \
-            '--backend=[Backend type\: scantxoutset | descriptor_wallet | neutrino]: :' \
+            '--backend=[Backend type\: descriptor_wallet | neutrino]: :' \
             '--rpc-url=[Bitcoin full node RPC URL]: :' \
             '--neutrino-url=[Neutrino REST API URL]: :' \
             '--directory=[Directory servers (comma-separated)]: :' \
@@ -56,7 +56,7 @@ _jm_taker() {
             '--mnemonic-file=[Path to mnemonic file]:file:_files' \
             '--prompt-bip39-passphrase[Prompt for BIP39 passphrase interactively]' \
             '--network=[Bitcoin network]:choice:(mainnet testnet signet regtest)' \
-            '--backend=[Backend type\: scantxoutset | descriptor_wallet | neutrino]: :' \
+            '--backend=[Backend type\: descriptor_wallet | neutrino]: :' \
             '--rpc-url=[Bitcoin full node RPC URL]: :' \
             '--neutrino-url=[Neutrino REST API URL]: :' \
             '--directory=[Directory servers (comma-separated)]: :' \

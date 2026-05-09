@@ -23,7 +23,7 @@ import json
 import pytest
 import pytest_asyncio
 from jmcore.models import NetworkType
-from jmwallet.backends.bitcoin_core import BitcoinCoreBackend
+from jmwallet.backends.descriptor_wallet import DescriptorWalletBackend
 from jmwallet.wallet.service import WalletService
 from jmwallet.wallet.utxo_metadata import UTXOMetadataStore
 from maker.config import MakerConfig
@@ -59,7 +59,7 @@ GENERIC_TEST_MNEMONIC = (
 @pytest.fixture
 def bitcoin_backend():
     """Bitcoin Core backend for regtest."""
-    return BitcoinCoreBackend(
+    return DescriptorWalletBackend(
         rpc_url="http://127.0.0.1:18443",
         rpc_user="test",
         rpc_password="test",
@@ -181,7 +181,7 @@ def maker_config_with_datadir(tmp_path):
         mnemonic=MAKER1_MNEMONIC,
         network=NetworkType.TESTNET,
         bitcoin_network=NetworkType.REGTEST,
-        backend_type="scantxoutset",
+        backend_type="descriptor_wallet",
         backend_config={
             "rpc_url": "http://127.0.0.1:18443",
             "rpc_user": "test",
@@ -201,7 +201,7 @@ def taker_config():
         mnemonic=TAKER_MNEMONIC,
         network=NetworkType.TESTNET,
         bitcoin_network=NetworkType.REGTEST,
-        backend_type="scantxoutset",
+        backend_type="descriptor_wallet",
         backend_config={
             "rpc_url": "http://127.0.0.1:18443",
             "rpc_user": "test",
@@ -515,7 +515,7 @@ class TestBIP329Persistence:
         await wallet1.close()
 
         # Create second wallet instance with same mnemonic and data_dir
-        backend2 = BitcoinCoreBackend(
+        backend2 = DescriptorWalletBackend(
             rpc_url="http://127.0.0.1:18443",
             rpc_user="test",
             rpc_password="test",
@@ -1279,7 +1279,7 @@ class TestRealisticScenarios:
             mnemonic=MAKER1_MNEMONIC,
             network=NetworkType.TESTNET,
             bitcoin_network=NetworkType.REGTEST,
-            backend_type="scantxoutset",
+            backend_type="descriptor_wallet",
             backend_config={
                 "rpc_url": "http://127.0.0.1:18443",
                 "rpc_user": "test",

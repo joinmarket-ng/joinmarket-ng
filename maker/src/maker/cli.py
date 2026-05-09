@@ -112,7 +112,7 @@ def build_maker_config(
 
     # Build backend config
     backend_config: dict[str, Any] = {}
-    if effective_backend_type in ("scantxoutset", "descriptor_wallet"):
+    if effective_backend_type == "descriptor_wallet":
         backend_config = {
             "rpc_url": effective_rpc_url,
             "rpc_user": effective_rpc_user,
@@ -372,7 +372,6 @@ def create_wallet_service(config: MakerConfig) -> WalletService:
     # Use bitcoin_network for address generation (bcrt1 vs tb1 vs bc1)
     bitcoin_network = config.bitcoin_network or config.network
 
-    from jmwallet.backends.bitcoin_core import BitcoinCoreBackend
     from jmwallet.backends.descriptor_wallet import (
         DescriptorWalletBackend,
         generate_wallet_name,
@@ -380,7 +379,7 @@ def create_wallet_service(config: MakerConfig) -> WalletService:
     )
     from jmwallet.backends.neutrino import NeutrinoBackend
 
-    backend: BitcoinCoreBackend | DescriptorWalletBackend | NeutrinoBackend
+    backend: DescriptorWalletBackend | NeutrinoBackend
     if backend_type == "descriptor_wallet":
         backend_cfg = config.backend_config
         fingerprint = get_mnemonic_fingerprint(
@@ -396,13 +395,6 @@ def create_wallet_service(config: MakerConfig) -> WalletService:
             rpc_user=backend_cfg.get("rpc_user", ""),
             rpc_password=backend_cfg.get("rpc_password", ""),
             wallet_name=wallet_name,
-        )
-    elif backend_type == "scantxoutset":
-        backend_cfg = config.backend_config
-        backend = BitcoinCoreBackend(
-            rpc_url=backend_cfg.get("rpc_url", "http://127.0.0.1:8332"),
-            rpc_user=backend_cfg.get("rpc_user", ""),
-            rpc_password=backend_cfg.get("rpc_password", ""),
         )
     elif backend_type == "neutrino":
         backend_cfg = config.backend_config
@@ -475,7 +467,7 @@ def start(
     ] = None,
     backend_type: Annotated[
         str | None,
-        typer.Option(help="Backend type: scantxoutset | descriptor_wallet | neutrino"),
+        typer.Option(help="Backend type: descriptor_wallet | neutrino"),
     ] = None,
     rpc_url: Annotated[
         str | None, typer.Option(envvar="BITCOIN_RPC_URL", help="Bitcoin full node RPC URL")

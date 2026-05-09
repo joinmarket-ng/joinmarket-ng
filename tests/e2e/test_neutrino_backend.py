@@ -5,7 +5,7 @@ Tests neutrino light client backend functionality:
 - Basic blockchain operations (height, transactions, fees)
 - UTXO discovery and watching addresses
 - Maker and taker operation with neutrino backend
-- Cross-backend compatibility (scantxoutset + neutrino)
+- Cross-backend compatibility (descriptor_wallet + neutrino)
 - Fidelity bonds with neutrino backend
 
 Requires: docker compose --profile neutrino up -d
@@ -291,9 +291,9 @@ class TestCrossBackendCompatibility:
     @pytest_asyncio.fixture
     async def bitcoin_core_backend(self, bitcoin_rpc_config):
         """Bitcoin Core backend for comparison."""
-        from jmwallet.backends.bitcoin_core import BitcoinCoreBackend
+        from jmwallet.backends.descriptor_wallet import DescriptorWalletBackend
 
-        backend = BitcoinCoreBackend(
+        backend = DescriptorWalletBackend(
             rpc_url=bitcoin_rpc_config["rpc_url"],
             rpc_user=bitcoin_rpc_config["rpc_user"],
             rpc_password=bitcoin_rpc_config["rpc_password"],
@@ -347,7 +347,7 @@ class TestNeutrinoCoinJoin:
         """
         import asyncio
 
-        from jmwallet.backends.bitcoin_core import BitcoinCoreBackend
+        from jmwallet.backends.descriptor_wallet import DescriptorWalletBackend
 
         from tests.e2e.rpc_utils import ensure_wallet_funded, mine_blocks
 
@@ -367,7 +367,7 @@ class TestNeutrinoCoinJoin:
             )
 
         # Create Bitcoin Core backend for taker
-        bitcoin_backend = BitcoinCoreBackend(
+        bitcoin_backend = DescriptorWalletBackend(
             rpc_url=_bitcoin_rpc_url(),
             rpc_user="test",
             rpc_password="test",
@@ -857,9 +857,9 @@ class TestNeutrinoCoinJoin:
                 # Verify transaction using Bitcoin Core to ensure it was actually broadcast
                 # Even though we're testing neutrino taker, Bitcoin Core should see the tx
                 # because the makers broadcast to Bitcoin Core
-                from jmwallet.backends.bitcoin_core import BitcoinCoreBackend
+                from jmwallet.backends.descriptor_wallet import DescriptorWalletBackend
 
-                bitcoin_backend = BitcoinCoreBackend(
+                bitcoin_backend = DescriptorWalletBackend(
                     rpc_url=_bitcoin_rpc_url(),
                     rpc_user="test",
                     rpc_password="test",
@@ -989,7 +989,7 @@ class TestNeutrinoCoinJoin:
                             json={
                                 "jsonrpc": "1.0",
                                 "id": "test",
-                                "method": "scantxoutset",
+                                "method": "descriptor_wallet",
                                 "params": ["start", [f"addr({dest_address})"]],
                             },
                         )

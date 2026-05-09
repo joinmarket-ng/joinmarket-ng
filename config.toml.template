@@ -46,8 +46,6 @@
 
 [bitcoin]
 # Backend type: "descriptor_wallet" (default) or "neutrino".
-# "scantxoutset" is also accepted but deprecated and will be removed in a
-# future release; switch to "descriptor_wallet" for faster, incremental sync.
 # backend_type = "descriptor_wallet"
 
 # Bitcoin Core RPC settings (for all backend types)

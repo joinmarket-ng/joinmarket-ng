@@ -307,7 +307,6 @@ architecture, persistence, retry behavior, and other implementation details.
 │                                            t|signet|regtes                   │
 │                                            t]                                │
 │    --backend        -b                     TEXT             Backend type:    │
-│                                                             scantxoutset |   │
 │                                                             descriptor_wall… │
 │                                                             | neutrino       │
 │    --rpc-url                               TEXT             Bitcoin full     │

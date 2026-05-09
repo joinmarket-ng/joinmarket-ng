@@ -25,7 +25,7 @@ if TYPE_CHECKING:
     from jmwallet.wallet.service import WalletService
 
 # Cache keyed by bitcoind descriptor wallet name.  A None-keyed entry is
-# used for non-descriptor backends (Neutrino, scantxoutset) which do not
+# used for non-descriptor backends (Neutrino) which do not
 # depend on a per-wallet bitcoind descriptor wallet at all.
 _backend_cache: dict[str | None, Any] = {}
 
@@ -138,14 +138,6 @@ async def get_backend(
             rpc_user=rpc_user,
             rpc_password=rpc_password,
             wallet_name=descriptor_wallet_name,
-        )
-    elif backend_type == "scantxoutset":
-        from jmwallet.backends.bitcoin_core import BitcoinCoreBackend
-
-        instance = BitcoinCoreBackend(
-            rpc_url=rpc_url,
-            rpc_user=rpc_user,
-            rpc_password=rpc_password,
         )
     elif backend_type == "neutrino":
         from jmwallet.backends.neutrino import NeutrinoBackend

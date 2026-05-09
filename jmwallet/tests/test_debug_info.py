@@ -277,7 +277,7 @@ class TestDebugInfoCommand:
 
     def test_basic_output(self) -> None:
         """Command runs and outputs expected sections."""
-        result = runner.invoke(app, ["debug-info", "--backend", "scantxoutset"])
+        result = runner.invoke(app, ["debug-info", "--backend", "descriptor_wallet"])
         assert result.exit_code == 0, f"Failed: {result.stdout}"
         assert "JoinMarket NG" in result.stdout
         assert "System" in result.stdout
@@ -286,10 +286,10 @@ class TestDebugInfoCommand:
 
     def test_shows_backend_type(self) -> None:
         result = runner.invoke(
-            app, ["debug-info", "--backend", "scantxoutset", "--network", "signet"]
+            app, ["debug-info", "--backend", "descriptor_wallet", "--network", "signet"]
         )
         assert result.exit_code == 0
-        assert "scantxoutset" in result.stdout
+        assert "descriptor_wallet" in result.stdout
         assert "signet" in result.stdout
 
     def test_neutrino_backend_unreachable(self) -> None:
@@ -345,7 +345,7 @@ class TestDebugInfoCommand:
 
     def test_no_wallet_data_leaked(self) -> None:
         """Ensure no wallet-sensitive data appears in output."""
-        result = runner.invoke(app, ["debug-info", "--backend", "scantxoutset"])
+        result = runner.invoke(app, ["debug-info", "--backend", "descriptor_wallet"])
         assert result.exit_code == 0
         output = result.stdout.lower()
         # Should not contain sensitive wallet material terms.
@@ -362,7 +362,7 @@ class TestDebugInfoCommand:
             assert re.search(pattern, result.stdout) is None
 
     def test_deployment_shown(self) -> None:
-        result = runner.invoke(app, ["debug-info", "--backend", "scantxoutset"])
+        result = runner.invoke(app, ["debug-info", "--backend", "descriptor_wallet"])
         assert result.exit_code == 0
         assert "deployment:" in result.stdout
 

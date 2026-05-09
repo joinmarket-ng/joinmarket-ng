@@ -806,20 +806,19 @@ def create_backend(
         creation_height: Block height at wallet creation time (used as scan start hint)
 
     Returns:
-        Backend instance (BitcoinCoreBackend, DescriptorWalletBackend, or NeutrinoBackend)
+        Backend instance (DescriptorWalletBackend or NeutrinoBackend)
 
     Raises:
         ValueError: If backend type is invalid
         ImportError: If backend module not available
     """
     # Import backends lazily to avoid circular imports
-    from jmwallet.backends import BitcoinCoreBackend
     from jmwallet.backends.descriptor_wallet import DescriptorWalletBackend
     from jmwallet.backends.neutrino import NeutrinoBackend
 
     backend_type = backend_settings.backend_type
 
-    backend: BitcoinCoreBackend | DescriptorWalletBackend | NeutrinoBackend
+    backend: DescriptorWalletBackend | NeutrinoBackend
     if backend_type == "neutrino":
         backend = NeutrinoBackend(
             neutrino_url=backend_settings.neutrino_url,
@@ -838,21 +837,9 @@ def create_backend(
             rpc_password=backend_settings.rpc_password,
             wallet_name=wallet_name,
         )
-    elif backend_type == "scantxoutset":
-        logger.warning(
-            "The 'scantxoutset' backend is deprecated and will be removed in a "
-            "future release. Switch to 'descriptor_wallet' (default) for faster, "
-            "incremental sync. Update [bitcoin].backend_type in config.toml."
-        )
-        backend = BitcoinCoreBackend(
-            rpc_url=backend_settings.rpc_url,
-            rpc_user=backend_settings.rpc_user,
-            rpc_password=backend_settings.rpc_password,
-        )
     else:
         raise ValueError(
-            f"Invalid backend type: {backend_type}. "
-            f"Valid options: scantxoutset, descriptor_wallet, neutrino"
+            f"Invalid backend type: {backend_type}. Valid options: descriptor_wallet, neutrino"
         )
 
     if creation_height is not None:

@@ -91,8 +91,8 @@ For full documentation, see [jmwallet Documentation](https://joinmarket-ng.githu
 │ --mnemonic-file            -f      PATH     [env var: MNEMONIC_FILE]         │
 │ --prompt-bip39-passphrase                   Prompt for BIP39 passphrase      │
 │ --network                  -n      TEXT     Bitcoin network                  │
-│ --backend                  -b      TEXT     Backend: scantxoutset |          │
-│                                             descriptor_wallet | neutrino     │
+│ --backend                  -b      TEXT     Backend: descriptor_wallet |     │
+│                                             neutrino                         │
 │ --rpc-url                          TEXT     [env var: BITCOIN_RPC_URL]       │
 │ --locktime                 -L      INTEGER  Locktime(s) to scan for          │
 │ --data-dir                         PATH     Data directory (default:         │
@@ -204,8 +204,8 @@ For full documentation, see [jmwallet Documentation](https://joinmarket-ng.githu
 │ --mnemonic-file            -f      PATH  [env var: MNEMONIC_FILE]            │
 │ --prompt-bip39-passphrase                Prompt for BIP39 passphrase         │
 │ --network                  -n      TEXT  Bitcoin network                     │
-│ --backend                  -b      TEXT  Backend: scantxoutset |             │
-│                                          descriptor_wallet | neutrino        │
+│ --backend                  -b      TEXT  Backend: descriptor_wallet |        │
+│                                          neutrino                            │
 │ --rpc-url                          TEXT  [env var: BITCOIN_RPC_URL]          │
 │ --neutrino-url                     TEXT  [env var: NEUTRINO_URL]             │
 │ --data-dir                         PATH  Data directory (default:            │
@@ -343,8 +343,7 @@ For full documentation, see [jmwallet Documentation](https://joinmarket-ng.githu
 │                                      $JOINMARKET_DATA_DIR)                   │
 │                                      [env var: JOINMARKET_DATA_DIR]          │
 │ --network           -n      TEXT     Bitcoin network                         │
-│ --backend           -b      TEXT     Backend: scantxoutset |                 │
-│                                      descriptor_wallet | neutrino            │
+│ --backend           -b      TEXT     Backend: descriptor_wallet | neutrino   │
 │ --rpc-url                   TEXT     [env var: BITCOIN_RPC_URL]              │
 │ --neutrino-url              TEXT     [env var: NEUTRINO_URL]                 │
 │ --mempool-api               TEXT     Mempool API URL for fetching block      │
@@ -402,8 +401,7 @@ For full documentation, see [jmwallet Documentation](https://joinmarket-ng.githu
 │ --skip-verification                   Skip signature verification (not       │
 │                                       recommended)                           │
 │ --network            -n      TEXT     Bitcoin network                        │
-│ --backend            -b      TEXT     Backend: scantxoutset |                │
-│                                       descriptor_wallet | neutrino           │
+│ --backend            -b      TEXT     Backend: descriptor_wallet | neutrino  │
 │ --rpc-url                    TEXT     [env var: BITCOIN_RPC_URL]             │
 │ --neutrino-url               TEXT     [env var: NEUTRINO_URL]                │
 │ --mempool-api                TEXT     Mempool API URL for validating cert    │
@@ -516,8 +514,7 @@ For full documentation, see [jmwallet Documentation](https://joinmarket-ng.githu
 
 ╭─ Options ────────────────────────────────────────────────────────────────────╮
 │ --network       -n      TEXT  Bitcoin network                                │
-│ --backend       -b      TEXT  Backend: scantxoutset | descriptor_wallet |    │
-│                               neutrino                                       │
+│ --backend       -b      TEXT  Backend: descriptor_wallet | neutrino          │
 │ --neutrino-url          TEXT  [env var: NEUTRINO_URL]                        │
 │ --data-dir              PATH  Data directory (default: ~/.joinmarket-ng or   │
 │                               $JOINMARKET_DATA_DIR)                          │
@@ -549,8 +546,8 @@ For full documentation, see [jmwallet Documentation](https://joinmarket-ng.githu
 │ --prompt-bip39-passphrase                   Prompt for BIP39 passphrase      │
 │                                             interactively                    │
 │ --network                  -n      TEXT     Bitcoin network                  │
-│ --backend                  -b      TEXT     Backend: scantxoutset |          │
-│                                             descriptor_wallet | neutrino     │
+│ --backend                  -b      TEXT     Backend: descriptor_wallet |     │
+│                                             neutrino                         │
 │ --rpc-url                          TEXT     [env var: BITCOIN_RPC_URL]       │
 │ --neutrino-url                     TEXT     [env var: NEUTRINO_URL]          │
 │ --mixdepth                 -m      INTEGER  Filter to a specific mixdepth    │
@@ -655,8 +652,8 @@ For full documentation, see [jmwallet Documentation](https://joinmarket-ng.githu
 │ --block-target                     INTEGER  Target blocks for fee estimation │
 │                                             (1-1008). Defaults to 3.         │
 │ --network                  -n      TEXT     Bitcoin network                  │
-│ --backend                  -b      TEXT     Backend: scantxoutset |          │
-│                                             descriptor_wallet | neutrino     │
+│ --backend                  -b      TEXT     Backend: descriptor_wallet |     │
+│                                             neutrino                         │
 │ --rpc-url                          TEXT     [env var: BITCOIN_RPC_URL]       │
 │ --neutrino-url                     TEXT     [env var: NEUTRINO_URL]          │
 │ --broadcast                                 Broadcast the transaction        │
@@ -790,8 +787,8 @@ For full documentation, see [jmwallet Documentation](https://joinmarket-ng.githu
 │                                                        passphrase            │
 │                                                        interactively         │
 │ --network              -n                     TEXT     Bitcoin network       │
-│ --backend              -b                     TEXT     Backend: scantxoutset │
-│                                                        | descriptor_wallet | │
+│ --backend              -b                     TEXT     Backend:              │
+│                                                        descriptor_wallet |   │
 │                                                        neutrino              │
 │ --rpc-url                                     TEXT     [env var:             │
 │                                                        BITCOIN_RPC_URL]      │

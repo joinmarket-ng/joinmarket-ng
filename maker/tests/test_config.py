@@ -587,7 +587,7 @@ class TestBuildMakerConfig:
 class TestCreateWalletService:
     """Tests for create_wallet_service function.
 
-    No mocking needed: BitcoinCoreBackend.__init__ only stores params and creates
+    No mocking needed: DescriptorWalletBackend.__init__ only stores params and creates
     httpx clients (no network calls), and WalletService.__init__ only derives keys.
     """
 
@@ -603,7 +603,7 @@ class TestCreateWalletService:
             mnemonic=TEST_MNEMONIC,
             cj_fee_relative="0.001",
             data_dir=tmp_path,
-            backend_type="scantxoutset",
+            backend_type="descriptor_wallet",
             backend_config={
                 "rpc_url": "http://127.0.0.1:18443",
                 "rpc_user": "test",
@@ -624,7 +624,7 @@ class TestCreateWalletService:
             mnemonic=TEST_MNEMONIC,
             cj_fee_relative="0.001",
             data_dir=None,
-            backend_type="scantxoutset",
+            backend_type="descriptor_wallet",
             backend_config={
                 "rpc_url": "http://127.0.0.1:18443",
                 "rpc_user": "test",

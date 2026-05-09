@@ -43,7 +43,7 @@ class TestBuildTakerConfig:
         settings.get_data_dir.return_value = "/tmp/jm-test"
 
         # Bitcoin backend
-        settings.bitcoin.backend_type = "scantxoutset"
+        settings.bitcoin.backend_type = "descriptor_wallet"
         settings.bitcoin.rpc_url = "http://localhost:8332"
         settings.bitcoin.rpc_user = "user"
         settings.bitcoin.rpc_password.get_secret_value.return_value = "password"
