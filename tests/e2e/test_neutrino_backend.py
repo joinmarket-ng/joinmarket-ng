@@ -989,13 +989,15 @@ class TestNeutrinoCoinJoin:
                             json={
                                 "jsonrpc": "1.0",
                                 "id": "test",
-                                "method": "descriptor_wallet",
+                                "method": "scantxoutset",
                                 "params": ["start", [f"addr({dest_address})"]],
                             },
                         )
                         result = response.json()
-                        unspents = result.get("result", {}).get("unspents", [])
-                        total_amount = result.get("result", {}).get("total_amount", 0)
+                        unspents = (result.get("result") or {}).get("unspents", [])
+                        total_amount = (result.get("result") or {}).get(
+                            "total_amount", 0
+                        )
                         logger.info(
                             f"Bitcoin Core scan for {dest_address}: "
                             f"{len(unspents)} UTXO(s), total {total_amount} BTC"

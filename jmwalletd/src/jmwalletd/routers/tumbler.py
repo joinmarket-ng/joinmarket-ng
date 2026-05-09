@@ -506,16 +506,22 @@ async def stop_plan(
     runner = state.tumble_runner
     task = state.tumble_task
     assert runner is not None and task is not None  # noqa: S101  -- invariant
-    try:
-        await runner.stop_and_wait(task)
-    except asyncio.CancelledError:  # pragma: no cover - cooperative path
-        pass
-    except Exception:
-        logger.exception("error while stopping tumbler runner")
-        if not task.done():
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await task
+    # Keep stop responsive: signal cancellation and let the runner finish in
+    # the background. Waiting inline here can exceed client/read timeouts when
+    # the active phase is in network I/O.
+    runner.request_stop()
+
+    async def _finish_stop() -> None:
+        try:
+            await runner.stop_and_wait(task)
+        except Exception:
+            logger.exception("error while stopping tumbler runner")
+            if not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
+
+    asyncio.create_task(_finish_stop())
     return JSONResponse(content={}, status_code=202)
 
 

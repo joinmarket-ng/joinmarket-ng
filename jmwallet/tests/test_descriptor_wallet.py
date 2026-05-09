@@ -3205,7 +3205,16 @@ class TestSyncAllLazyInit:
             passphrase="",
         )
 
+        # Build the expected descriptors for this wallet
+        expected_descriptors = []
+        for mixdepth in range(2):
+            xpub = wallet.get_account_xpub(mixdepth)
+            for branch in [0, 1]:
+                desc = f"wpkh({xpub}/{branch}/*)"
+                expected_descriptors.append({"desc": f"{desc}#xxxxxxxx"})
+
         backend.is_wallet_setup = AsyncMock(return_value=True)
+        backend.list_descriptors = AsyncMock(return_value=expected_descriptors)
         setup_mock = AsyncMock(return_value=True)
         wallet.setup_descriptor_wallet = setup_mock  # type: ignore[method-assign]
         wallet._sync_all_with_descriptors = AsyncMock(return_value={0: [], 1: []})  # type: ignore[method-assign]

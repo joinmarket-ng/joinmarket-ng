@@ -2,9 +2,12 @@
 Tests for descriptor-based wallet scanning.
 """
 
+from unittest.mock import AsyncMock
+
 import pytest
 
 from jmwallet.backends.base import BlockchainBackend
+from jmwallet.backends.descriptor_wallet import DescriptorWalletBackend
 from jmwallet.wallet.service import WalletService
 
 
@@ -114,3 +117,54 @@ async def test_parse_descriptor_path_multiple_mixdepths(test_mnemonic):
     assert mixdepth == test_mixdepth
     assert change == test_change
     assert index == test_index
+
+
+@pytest.mark.asyncio
+async def test_discover_fidelity_bonds_auto_initialises_descriptor_wallet(test_mnemonic):
+    """Bond discovery should set up descriptor wallets when called on a fresh service."""
+    backend = DescriptorWalletBackend(
+        rpc_url="http://127.0.0.1:18443",
+        rpc_user="user",
+        rpc_password="pass",
+        wallet_name="jm_descriptor_wallet_test",
+    )
+    wallet = WalletService(test_mnemonic, backend, network="regtest")
+
+    setup_mock = AsyncMock()
+    wallet.setup_descriptor_wallet = setup_mock  # type: ignore[method-assign]
+    backend.is_wallet_setup = AsyncMock(return_value=False)  # type: ignore[method-assign]
+    wallet.import_fidelity_bond_addresses = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    backend.start_background_rescan = AsyncMock(return_value=None)  # type: ignore[method-assign]
+    backend.wait_for_rescan_complete = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    backend.get_utxos = AsyncMock(return_value=[])  # type: ignore[method-assign]
+
+    discovered = await wallet.discover_fidelity_bonds()
+
+    assert discovered == []
+    setup_mock.assert_awaited_once_with(rescan=False)
+
+
+@pytest.mark.asyncio
+async def test_sync_all_reinitialises_if_wallet_descriptors_do_not_match_seed(test_mnemonic):
+    """sync_all should re-import descriptors when loaded wallet tracks another seed."""
+    backend = DescriptorWalletBackend(
+        rpc_url="http://127.0.0.1:18443",
+        rpc_user="user",
+        rpc_password="pass",
+        wallet_name="jm_descriptor_wallet_test",
+    )
+    wallet = WalletService(test_mnemonic, backend, network="regtest")
+
+    backend.is_wallet_setup = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    backend.list_descriptors = AsyncMock(  # type: ignore[method-assign]
+        return_value=[{"desc": "wpkh(tpubD6NzFakeDescriptor/0/*)#abcd1234"}]
+    )
+    setup_mock = AsyncMock(return_value=True)
+    wallet.setup_descriptor_wallet = setup_mock  # type: ignore[method-assign]
+    wallet._sync_all_with_descriptors = AsyncMock(  # type: ignore[attr-defined,method-assign]
+        return_value={md: [] for md in range(wallet.mixdepth_count)}
+    )
+
+    await wallet.sync_all()
+
+    setup_mock.assert_awaited_once()

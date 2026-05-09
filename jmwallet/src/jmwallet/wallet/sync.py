@@ -283,6 +283,20 @@ class WalletSyncMixin:
         # are imported so Bitcoin Core never rejects a batch with RPC -4
         # "Wallet is currently rescanning".
         if descriptor_backend is not None:
+            # ``discover_fidelity_bonds`` can be called directly on a fresh
+            # ``WalletService`` (without a prior ``sync_all``). Ensure the
+            # descriptor wallet is initialised before importing address
+            # descriptors, otherwise backend calls fail with RPC -18 / "wallet
+            # not loaded".
+            expected_count = self.mixdepth_count * 2
+            if not await descriptor_backend.is_wallet_setup(
+                expected_descriptor_count=expected_count
+            ):
+                logger.info(
+                    "Descriptor wallet not initialised; running setup before bond discovery"
+                )
+                await self.setup_descriptor_wallet(rescan=False)
+
             all_bond_addrs = [
                 (addr, lt, idx) for addr, (lt, idx) in all_address_to_locktime.items()
             ]
@@ -406,11 +420,29 @@ class WalletSyncMixin:
             expected_count = self.mixdepth_count * 2
             if fidelity_bond_addresses:
                 expected_count += len(fidelity_bond_addresses)
-            if not await self.backend.is_wallet_setup(expected_descriptor_count=expected_count):
+            needs_setup = not await self.backend.is_wallet_setup(
+                expected_descriptor_count=expected_count
+            )
+            if not needs_setup:
+                expected_bases: set[str] = set()
+                for mixdepth in range(self.mixdepth_count):
+                    xpub = self.get_account_xpub(mixdepth)
+                    expected_bases.add(f"wpkh({xpub}/0/*)")
+                    expected_bases.add(f"wpkh({xpub}/1/*)")
+                descriptors = await self.backend.list_descriptors()
+                actual_bases = {str(item.get("desc", "")).split("#", 1)[0] for item in descriptors}
+                if not expected_bases.issubset(actual_bases):
+                    logger.info(
+                        "Descriptor wallet loaded but does not contain this wallet's descriptors; "
+                        "running setup before sync"
+                    )
+                    needs_setup = True
+            if needs_setup:
                 logger.info("Descriptor wallet not initialised; running setup before sync")
                 await self.setup_descriptor_wallet(
                     fidelity_bond_addresses=fidelity_bond_addresses,
                     rescan=False,
+                    check_existing=False,
                 )
 
         # Try efficient descriptor-based sync if backend supports it
@@ -576,6 +608,12 @@ class WalletSyncMixin:
             # wpkh([fingerprint/change/index]pubkey)#checksum
             # The fingerprint is the parent xpub's fingerprint
             path_info = self._parse_descriptor_path(desc, desc_to_path)
+            source_address = str(utxo_data.get("address", ""))
+            if path_info is None and source_address:
+                source_address_lower = source_address.lower()
+                path_info = self.address_cache.get(source_address_lower) or self._find_address_path(
+                    source_address_lower
+                )
 
             if path_info is None:
                 logger.warning(f"Could not parse path from descriptor: {desc}")
@@ -590,7 +628,9 @@ class WalletSyncMixin:
                 confirmations = tip_height - utxo_height + 1
 
             # Generate the address and cache it
-            address = self.get_address(mixdepth, change, index)
+            address = (
+                source_address if source_address else self.get_address(mixdepth, change, index)
+            )
 
             # Track that this address has had UTXOs
             self.addresses_with_history.add(address)

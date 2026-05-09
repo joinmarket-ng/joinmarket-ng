@@ -1195,6 +1195,7 @@ class DescriptorWalletBackend(BlockchainBackend):
                                     "amount": txout["value"],
                                     "scriptPubKey": txout["scriptPubKey"]["hex"],
                                     "confirmations": txout["confirmations"],
+                                    "address": txout["scriptPubKey"].get("address", ""),
                                     # We might miss 'desc' here if gettxout doesn't
                                     # provide it (it doesn't).
                                     # However, listunspent provides 'desc'.
@@ -1238,6 +1239,7 @@ class DescriptorWalletBackend(BlockchainBackend):
                         "txid": u["txid"],
                         "vout": u["vout"],
                         "amount": u["amount"],
+                        "address": u.get("address", ""),
                         "scriptPubKey": u.get("scriptPubKey", ""),
                         "height": height,
                         "desc": u.get("desc", ""),
