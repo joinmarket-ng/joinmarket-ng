@@ -113,9 +113,9 @@ Then run marker-specific tests as needed (`-m reference`, `-m reference_maker`).
 
 Reproducible release verification and signing workflows:
 
+- verify: `scripts/verify-release.sh`
 - build locally: `scripts/build-release.sh`
 - sign: `scripts/sign-release.sh`
-- verify: `scripts/verify-release.sh`
 
 See [Signatures](../README-signatures.md) for repository signature layout.
 
@@ -147,7 +147,8 @@ signed manifest.
 
 ```bash
 # 1. Bump version — opens $EDITOR on CHANGELOG.md before committing/tagging
-LEVEL=patch scripts/bump_version.py patch --no-push
+# Select patch/minor/major as appropriate for the release.
+scripts/bump_version.py patch --no-push
 
 # 2. Build release images locally (generates release-manifest-<version>.txt)
 scripts/build-release.sh
