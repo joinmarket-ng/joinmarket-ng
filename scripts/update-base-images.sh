@@ -246,8 +246,12 @@ else
             UPDATES_NEEDED=$((UPDATES_NEEDED + 1))
 
             if [[ "$CHECK_ONLY" == false ]]; then
-                # Escape special regex characters in version strings
-                escaped_current=$(printf '%s' "$current_ver" | sed 's/[.+]/\\&/g')
+                # Escape special regex characters in version strings for sed BRE.
+                # '.' -> '\.'  for literal dot.
+                # '+' -> '[+]' because '\+' in GNU sed BRE is a one-or-more quantifier,
+                #         not a literal '+'.  Using a bracket expression avoids that.
+                escaped_current=$(printf '%s' "$current_ver" | sed 's/\./\\./g; s/+/[+]/g')
+                # Replacement side: only '&', '/', '\' are special in sed replacements.
                 escaped_latest=$(printf '%s' "$latest_ver" | sed 's/[&/\\]/\\&/g')
                 for dockerfile in "${DOCKERFILES[@]}"; do
                     [[ -f "$dockerfile" ]] || continue
