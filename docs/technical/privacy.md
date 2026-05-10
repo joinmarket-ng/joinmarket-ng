@@ -326,7 +326,20 @@ Render the unsigned PSBT as a QR code:
 qrencode -t ANSIUTF8 "$(tr -d '\n' < unsigned-bond.psbt)"
 ```
 
-Scan the QR on Specter DIY, inspect the transaction details, and sign it. Then scan the signed PSBT output back to the online machine, for example with Sparrow's File -> Open transaction -> from QR flow, and finalize or extract the signed transaction hex there.
+Scan the QR on Specter DIY, inspect the transaction details, and sign it. Then scan or copy the signed PSBT output back to the online machine and save it as `signed-bond.psbt`.
+
+Bitcoin Core's `finalizepsbt` may not finalize this custom CLTV P2WSH witness script even when the PSBT contains a valid partial signature. Use the bond finalizer script to build the final witness transaction:
+
+```bash
+python scripts/finalize_bond_psbt.py --file signed-bond.psbt
+```
+
+The script outputs the final raw transaction hex. Inspect it before broadcasting:
+
+```bash
+bitcoin-cli decoderawtransaction <signed_hex>
+bitcoin-cli sendrawtransaction <signed_hex>
+```
 
 **Option C -- Mnemonic signing (works with any device):**
 
