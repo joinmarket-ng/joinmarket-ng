@@ -7,7 +7,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from jmwallet.backends.base import BondVerificationRequest
-from jmwallet.backends.mempool import MempoolBackend
 from jmwallet.backends.neutrino import NeutrinoBackend, NeutrinoConfig
 
 
@@ -81,186 +80,6 @@ class TestBackendCloseReuse:
         await backend.close()
 
 
-class TestMempoolBackendUnit:
-    """Unit tests for MempoolBackend logic."""
-
-    @pytest.mark.asyncio
-    async def test_get_utxos_computes_confirmations_from_tip(self):
-        backend = MempoolBackend(base_url="https://mempool.example", network="mainnet")
-
-        response_1 = MagicMock()
-        response_1.raise_for_status.return_value = None
-        response_1.json.return_value = [
-            {
-                "txid": "a" * 64,
-                "vout": 0,
-                "value": 12345,
-                "status": {"block_height": 700_000},
-            }
-        ]
-
-        response_2 = MagicMock()
-        response_2.raise_for_status.return_value = None
-        response_2.json.return_value = [
-            {
-                "txid": "b" * 64,
-                "vout": 1,
-                "value": 999,
-                "status": {},
-            }
-        ]
-
-        backend.client.get = AsyncMock(side_effect=[response_1, response_2])
-        backend.get_block_height = AsyncMock(return_value=700_010)
-
-        utxos = await backend.get_utxos(["bc1qaddr1", "bc1qaddr2"])
-
-        assert len(utxos) == 2
-        assert utxos[0].confirmations == 11
-        assert utxos[0].height == 700_000
-        assert utxos[1].confirmations == 0
-        assert utxos[1].height is None
-
-        backend.get_block_height.assert_called_once()
-        await backend.close()
-
-    @pytest.mark.asyncio
-    async def test_get_transaction_does_not_fetch_tip_for_unconfirmed(self):
-        backend = MempoolBackend(base_url="https://mempool.example", network="mainnet")
-
-        tx_response = MagicMock()
-        tx_response.raise_for_status.return_value = None
-        tx_response.json.return_value = {
-            "status": {
-                "confirmed": False,
-            }
-        }
-
-        raw_response = MagicMock()
-        raw_response.raise_for_status.return_value = None
-        raw_response.text = "02000000"
-
-        backend.client.get = AsyncMock(side_effect=[tx_response, raw_response])
-        backend.get_block_height = AsyncMock(return_value=700_000)
-
-        tx = await backend.get_transaction("a" * 64)
-
-        assert tx is not None
-        assert tx.confirmations == 0
-        assert tx.block_height is None
-        backend.get_block_height.assert_not_called()
-        await backend.close()
-
-    @pytest.mark.asyncio
-    async def test_get_transaction_handles_genesis_block_height(self):
-        backend = MempoolBackend(base_url="https://mempool.example", network="mainnet")
-
-        tx_response = MagicMock()
-        tx_response.raise_for_status.return_value = None
-        tx_response.json.return_value = {
-            "status": {
-                "confirmed": True,
-                "block_height": 0,
-                "block_time": 123,
-            }
-        }
-
-        raw_response = MagicMock()
-        raw_response.raise_for_status.return_value = None
-        raw_response.text = "02000000"
-
-        backend.client.get = AsyncMock(side_effect=[tx_response, raw_response])
-        backend.get_block_height = AsyncMock(return_value=10)
-
-        tx = await backend.get_transaction("a" * 64)
-
-        assert tx is not None
-        assert tx.confirmations == 11
-        assert tx.block_height == 0
-        backend.get_block_height.assert_called_once()
-        await backend.close()
-
-    @pytest.mark.asyncio
-    async def test_get_utxo_does_not_fetch_tip_for_unconfirmed(self):
-        backend = MempoolBackend(base_url="https://mempool.example", network="mainnet")
-
-        outspend_response = MagicMock()
-        outspend_response.raise_for_status.return_value = None
-        outspend_response.json.return_value = {"spent": False}
-
-        tx_response = MagicMock()
-        tx_response.raise_for_status.return_value = None
-        tx_response.json.return_value = {
-            "vout": [
-                {
-                    "value": 12345,
-                    "scriptpubkey_address": "bc1qtest",
-                    "scriptpubkey": "0014" + "00" * 20,
-                }
-            ],
-            "status": {
-                "confirmed": False,
-            },
-        }
-
-        backend.client.get = AsyncMock(side_effect=[outspend_response, tx_response])
-        backend.get_block_height = AsyncMock(return_value=700_000)
-
-        utxo = await backend.get_utxo("a" * 64, 0)
-
-        assert utxo is not None
-        assert utxo.confirmations == 0
-        assert utxo.height is None
-        backend.get_block_height.assert_not_called()
-        await backend.close()
-
-    @pytest.mark.asyncio
-    async def test_verify_bonds_handles_genesis_block_height(self):
-        backend = MempoolBackend(base_url="https://mempool.example", network="mainnet")
-
-        outspend_response = MagicMock()
-        outspend_response.raise_for_status.return_value = None
-        outspend_response.json.return_value = {"spent": False}
-
-        tx_response = MagicMock()
-        tx_response.raise_for_status.return_value = None
-        tx_response.json.return_value = {
-            "vout": [
-                {
-                    "value": 50_000,
-                    "scriptpubkey": "0014" + "11" * 20,
-                    "scriptpubkey_address": "bc1qbond",
-                }
-            ],
-            "status": {
-                "confirmed": True,
-                "block_height": 0,
-                "block_time": 123,
-            },
-        }
-
-        backend.client.get = AsyncMock(side_effect=[outspend_response, tx_response])
-        backend.get_block_height = AsyncMock(return_value=10)
-
-        bonds = [
-            BondVerificationRequest(
-                txid="a" * 64,
-                vout=0,
-                utxo_pub=b"\x02" + b"\x01" * 32,
-                locktime=1_956_528_000,
-                address="bc1qbond",
-                scriptpubkey="0014" + "11" * 20,
-            )
-        ]
-
-        results = await backend.verify_bonds(bonds)
-
-        assert len(results) == 1
-        assert results[0].valid is True
-        assert results[0].confirmations == 11
-        await backend.close()
-
-
 class TestNeutrinoBackend:
     """Unit tests for NeutrinoBackend (mocked)."""
 
@@ -327,7 +146,7 @@ class TestNeutrinoBackend:
     @pytest.mark.asyncio
     async def test_neutrino_backend_get_utxos_uses_scan_start_height(self):
         """Test that get_utxos uses scan_start_height for initial rescan."""
-        from unittest.mock import AsyncMock, patch
+        from unittest.mock import patch
 
         backend = NeutrinoBackend(
             neutrino_url="http://localhost:8334",
@@ -356,7 +175,6 @@ class TestNeutrinoBackend:
     @pytest.mark.asyncio
     async def test_neutrino_backend_verify_bonds_uses_scan_start_height(self):
         """Test that verify_bonds uses scan_start_height instead of 0."""
-        from unittest.mock import AsyncMock
 
         from jmwallet.backends.base import BondVerificationRequest
 
@@ -396,7 +214,6 @@ class TestNeutrinoBackend:
     @pytest.mark.asyncio
     async def test_neutrino_backend_verify_bonds_resolves_scan_start_height_lazy(self):
         """verify_bonds should resolve scan start when backend wasn't synced yet."""
-        from unittest.mock import AsyncMock
 
         backend = NeutrinoBackend(
             neutrino_url="http://localhost:8334",
@@ -436,7 +253,6 @@ class TestNeutrinoBackend:
     @pytest.mark.asyncio
     async def test_wait_for_rescan_completes_immediately(self):
         """Test _wait_for_rescan returns immediately when in_progress is False."""
-        from unittest.mock import AsyncMock
 
         backend = NeutrinoBackend(neutrino_url="http://localhost:8334")
         backend._api_call = AsyncMock(return_value={"in_progress": False})
@@ -450,7 +266,6 @@ class TestNeutrinoBackend:
     @pytest.mark.asyncio
     async def test_wait_for_rescan_polls_until_done(self):
         """Test _wait_for_rescan polls until in_progress transitions to False."""
-        from unittest.mock import AsyncMock
 
         backend = NeutrinoBackend(neutrino_url="http://localhost:8334")
         # First two calls return in_progress=True, third returns False
@@ -470,7 +285,6 @@ class TestNeutrinoBackend:
     @pytest.mark.asyncio
     async def test_wait_for_rescan_fallback_on_error(self):
         """Test _wait_for_rescan returns gracefully when endpoint is unavailable."""
-        from unittest.mock import AsyncMock
 
         backend = NeutrinoBackend(neutrino_url="http://localhost:8334")
         backend._api_call = AsyncMock(side_effect=Exception("endpoint not found"))
@@ -485,7 +299,6 @@ class TestNeutrinoBackend:
     @pytest.mark.asyncio
     async def test_wait_for_rescan_require_started_rejects_immediate_false(self):
         """When require_started=True, immediate false should be unconfirmed."""
-        from unittest.mock import AsyncMock
 
         backend = NeutrinoBackend(neutrino_url="http://localhost:8334")
         backend._api_call = AsyncMock(return_value={"in_progress": False})
@@ -502,7 +315,6 @@ class TestNeutrinoBackend:
     @pytest.mark.asyncio
     async def test_wait_for_rescan_require_started_accepts_true_then_false(self):
         """When require_started=True, true->false should confirm completion."""
-        from unittest.mock import AsyncMock
 
         backend = NeutrinoBackend(neutrino_url="http://localhost:8334")
         backend._api_call = AsyncMock(
@@ -520,7 +332,7 @@ class TestNeutrinoBackend:
     @pytest.mark.asyncio
     async def test_get_utxos_does_not_restart_initial_rescan_while_pending(self):
         """Once initial rescan starts, later calls should poll instead of restarting."""
-        from unittest.mock import AsyncMock, patch
+        from unittest.mock import patch
 
         backend = NeutrinoBackend(neutrino_url="http://localhost:8334", network="signet")
         backend.get_block_height = AsyncMock(return_value=100)
@@ -552,7 +364,7 @@ class TestNeutrinoBackend:
     @pytest.mark.asyncio
     async def test_get_utxos_marks_initial_rescan_done_when_confirmed(self):
         """Initial rescan state should persist in-process after confirmed completion."""
-        from unittest.mock import AsyncMock, patch
+        from unittest.mock import patch
 
         backend = NeutrinoBackend(neutrino_url="http://localhost:8334", network="signet")
         backend.get_block_height = AsyncMock(return_value=321)
@@ -573,7 +385,7 @@ class TestNeutrinoBackend:
     @pytest.mark.asyncio
     async def test_get_utxos_uses_extended_timeout_for_initial_rescan(self):
         """Initial rescan should wait longer than incremental rescans."""
-        from unittest.mock import AsyncMock, patch
+        from unittest.mock import patch
 
         backend = NeutrinoBackend(neutrino_url="http://localhost:8334", network="signet")
         backend.get_block_height = AsyncMock(return_value=321)
@@ -596,7 +408,7 @@ class TestNeutrinoBackend:
     @pytest.mark.asyncio
     async def test_get_utxos_uses_wait_for_rescan_not_sleep(self):
         """Test that get_utxos calls _wait_for_rescan instead of a fixed sleep."""
-        from unittest.mock import AsyncMock, patch
+        from unittest.mock import patch
 
         backend = NeutrinoBackend(
             neutrino_url="http://localhost:8334",
@@ -759,7 +571,7 @@ class TestNeutrinoBackend:
     @pytest.mark.asyncio
     async def test_get_utxos_calls_wait_for_sync_before_initial_rescan(self):
         """get_utxos must call wait_for_sync before the first rescan."""
-        from unittest.mock import AsyncMock, patch
+        from unittest.mock import patch
 
         backend = NeutrinoBackend(neutrino_url="http://localhost:8334", network="signet")
         backend.get_block_height = AsyncMock(return_value=295000)
@@ -788,7 +600,7 @@ class TestNeutrinoBackend:
     @pytest.mark.asyncio
     async def test_get_utxos_skips_wait_for_sync_when_already_synced(self):
         """If _synced is True, wait_for_sync should not be called again."""
-        from unittest.mock import AsyncMock, patch
+        from unittest.mock import patch
 
         backend = NeutrinoBackend(neutrino_url="http://localhost:8334", network="signet")
         backend._synced = True  # Already synced
@@ -808,7 +620,7 @@ class TestNeutrinoBackend:
     @pytest.mark.asyncio
     async def test_get_utxos_skips_wait_for_sync_after_initial_rescan(self):
         """After initial rescan is done, wait_for_sync should not be called."""
-        from unittest.mock import AsyncMock, patch
+        from unittest.mock import patch
 
         backend = NeutrinoBackend(neutrino_url="http://localhost:8334", network="signet")
         backend._initial_rescan_done = True
@@ -854,8 +666,6 @@ class TestNeutrinoBackend:
         # Test fallback values for different targets (no API call - will fail and use fallback)
         # Can't actually call estimate_fee without mocking, but we can check the type
         # when it returns fallback values
-
-        from unittest.mock import AsyncMock
 
         # Mock _api_call to raise an exception (simulating unavailable API)
         backend._api_call = AsyncMock(side_effect=Exception("API unavailable"))
@@ -916,7 +726,6 @@ class TestNeutrinoBackend:
     @pytest.mark.asyncio
     async def test_neutrino_backend_blockheight_validation(self):
         """Test blockheight validation in verify_utxo_with_metadata."""
-        from unittest.mock import AsyncMock
 
         backend = NeutrinoBackend(neutrino_url="http://localhost:8334", network="mainnet")
         # Mock get_block_height to return a known value
@@ -947,7 +756,6 @@ class TestNeutrinoBackend:
     @pytest.mark.asyncio
     async def test_neutrino_backend_rescan_depth_limit(self):
         """Test that rescan depth is limited to prevent DoS."""
-        from unittest.mock import AsyncMock
 
         backend = NeutrinoBackend(neutrino_url="http://localhost:8334", network="mainnet")
         backend._max_rescan_depth = 1000  # Override for testing
@@ -968,7 +776,6 @@ class TestNeutrinoBackend:
     @pytest.mark.asyncio
     async def test_get_rescan_coverage_returns_metadata(self):
         """_get_rescan_coverage should parse last_start_height and last_scanned_tip."""
-        from unittest.mock import AsyncMock
 
         backend = NeutrinoBackend(neutrino_url="http://localhost:8334", network="mainnet")
         backend._api_call = AsyncMock(
@@ -988,7 +795,6 @@ class TestNeutrinoBackend:
     @pytest.mark.asyncio
     async def test_get_rescan_coverage_returns_zeros_on_error(self):
         """_get_rescan_coverage should return (0, 0) when endpoint is unavailable."""
-        from unittest.mock import AsyncMock
 
         backend = NeutrinoBackend(neutrino_url="http://localhost:8334", network="mainnet")
         backend._api_call = AsyncMock(side_effect=Exception("connection refused"))
@@ -1001,7 +807,7 @@ class TestNeutrinoBackend:
     @pytest.mark.asyncio
     async def test_get_utxos_skips_initial_rescan_when_full_coverage(self):
         """When neutrino-api already has full coverage, skip the initial rescan."""
-        from unittest.mock import AsyncMock, patch
+        from unittest.mock import patch
 
         backend = NeutrinoBackend(
             neutrino_url="http://localhost:8334",
@@ -1044,7 +850,7 @@ class TestNeutrinoBackend:
     @pytest.mark.asyncio
     async def test_get_utxos_no_retries_for_trivial_rescan(self):
         """Trivial rescans (few blocks) should not trigger UTXO retries."""
-        from unittest.mock import AsyncMock, patch
+        from unittest.mock import patch
 
         backend = NeutrinoBackend(
             neutrino_url="http://localhost:8334",
@@ -1080,7 +886,7 @@ class TestNeutrinoBackend:
     @pytest.mark.asyncio
     async def test_get_utxos_retries_for_large_rescan(self):
         """Large rescans should trigger UTXO retries for async indexing."""
-        from unittest.mock import AsyncMock, patch
+        from unittest.mock import patch
 
         backend = NeutrinoBackend(
             neutrino_url="http://localhost:8334",
@@ -1122,7 +928,7 @@ class TestNeutrinoBackend:
     @pytest.mark.asyncio
     async def test_get_utxos_incremental_uses_metadata_tip(self):
         """Incremental rescan should use metadata tip for _last_rescan_height."""
-        from unittest.mock import AsyncMock, patch
+        from unittest.mock import patch
 
         backend = NeutrinoBackend(neutrino_url="http://localhost:8334", network="signet")
         backend._initial_rescan_done = True
@@ -1148,7 +954,6 @@ class TestNeutrinoBackend:
     @pytest.mark.asyncio
     async def test_detect_server_capabilities_full(self):
         """Full capability detection for v0.9.0+ server."""
-        from unittest.mock import AsyncMock
 
         backend = NeutrinoBackend(neutrino_url="http://localhost:8334", network="mainnet")
         backend._api_call = AsyncMock(
@@ -1176,7 +981,6 @@ class TestNeutrinoBackend:
     @pytest.mark.asyncio
     async def test_detect_server_capabilities_v07(self):
         """Capability detection for v0.7.0 server (rescan status, no persistent state)."""
-        from unittest.mock import AsyncMock
 
         backend = NeutrinoBackend(neutrino_url="http://localhost:8334", network="mainnet")
         backend._api_call = AsyncMock(
@@ -1198,7 +1002,6 @@ class TestNeutrinoBackend:
     @pytest.mark.asyncio
     async def test_detect_server_capabilities_old_server(self):
         """Capability detection for pre-v0.7.0 server (no rescan status endpoint)."""
-        from unittest.mock import AsyncMock
 
         import httpx
 
@@ -1226,7 +1029,6 @@ class TestNeutrinoBackend:
     @pytest.mark.asyncio
     async def test_detect_server_capabilities_unreachable(self):
         """Capability detection when server is unreachable."""
-        from unittest.mock import AsyncMock
 
         backend = NeutrinoBackend(neutrino_url="http://localhost:8334", network="mainnet")
         backend._api_call = AsyncMock(side_effect=Exception("connection refused"))
@@ -1243,7 +1045,6 @@ class TestNeutrinoBackend:
     @pytest.mark.asyncio
     async def test_detect_server_capabilities_idempotent(self):
         """Detection runs only once even when called multiple times."""
-        from unittest.mock import AsyncMock
 
         backend = NeutrinoBackend(neutrino_url="http://localhost:8334", network="mainnet")
         backend._api_call = AsyncMock(
@@ -1276,7 +1077,6 @@ class TestNeutrinoBackend:
     @pytest.mark.asyncio
     async def test_get_rescan_coverage_skips_call_without_persistent_state(self):
         """_get_rescan_coverage short-circuits when server lacks persistent state."""
-        from unittest.mock import AsyncMock
 
         backend = NeutrinoBackend(neutrino_url="http://localhost:8334", network="mainnet")
         backend._server_capabilities.detected = True
@@ -1293,7 +1093,6 @@ class TestNeutrinoBackend:
     @pytest.mark.asyncio
     async def test_wait_for_rescan_skips_poll_without_rescan_status(self):
         """_wait_for_rescan returns False immediately when server lacks endpoint."""
-        from unittest.mock import AsyncMock
 
         backend = NeutrinoBackend(neutrino_url="http://localhost:8334", network="mainnet")
         backend._server_capabilities.detected = True
@@ -1649,7 +1448,6 @@ class TestSyncAllAddressPreregistration:
         """sync_all() must register both external AND internal addresses with the
         backend *before* the first get_utxos call so the initial neutrino rescan
         covers change addresses."""
-        from unittest.mock import AsyncMock
 
         from _jmwallet_test_helpers import TEST_MNEMONIC
 

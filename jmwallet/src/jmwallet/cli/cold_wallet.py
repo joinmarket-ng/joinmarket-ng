@@ -358,17 +358,6 @@ def prepare_certificate_message(
     neutrino_url: Annotated[
         str | None, typer.Option("--neutrino-url", envvar="NEUTRINO_URL")
     ] = None,
-    mempool_api: Annotated[
-        str,
-        typer.Option(
-            "--mempool-api",
-            help=(
-                "Mempool API URL for fetching block height. "
-                "Only used when no Bitcoin node backend is configured. "
-                "Example: http://localhost:8999/api"
-            ),
-        ),
-    ] = "",
     current_block: Annotated[
         int | None,
         typer.Option(
@@ -484,22 +473,9 @@ def prepare_certificate_message(
             except Exception as e:
                 logger.error(f"Failed to fetch block height from Bitcoin node: {e}")
                 raise typer.Exit(1)
-        elif mempool_api:
-            from jmwallet.backends.mempool import MempoolBackend
-
-            try:
-                mempool_backend = MempoolBackend(base_url=mempool_api)
-                current_block_height = asyncio.run(mempool_backend.get_block_height())
-                logger.info(f"Current block height: {current_block_height} (from mempool API)")
-            except Exception as e:
-                logger.error(f"Failed to fetch block height from mempool API {mempool_api}: {e}")
-                raise typer.Exit(1)
         else:
             logger.error("No block height source available.")
-            logger.info(
-                "Provide --current-block for offline mode, configure a Bitcoin node, "
-                "or supply --mempool-api <url> as a fallback."
-            )
+            logger.info("Provide --current-block for offline mode or configure a Bitcoin node.")
             raise typer.Exit(1)
 
     # Calculate cert_expiry as ABSOLUTE period number
@@ -775,17 +751,6 @@ def import_certificate(
     neutrino_url: Annotated[
         str | None, typer.Option("--neutrino-url", envvar="NEUTRINO_URL")
     ] = None,
-    mempool_api: Annotated[
-        str,
-        typer.Option(
-            "--mempool-api",
-            help=(
-                "Mempool API URL for validating cert expiry. "
-                "Only used when no Bitcoin node backend is configured. "
-                "Example: http://localhost:8999/api"
-            ),
-        ),
-    ] = "",
     current_block: Annotated[
         int | None,
         typer.Option(
@@ -908,22 +873,9 @@ def import_certificate(
             except Exception as e:
                 logger.warning(f"Failed to fetch block height from Bitcoin node: {e}")
 
-        if current_block_height is None and mempool_api:
-            from jmwallet.backends.mempool import MempoolBackend
-
-            try:
-                mempool_backend = MempoolBackend(base_url=mempool_api)
-                current_block_height = asyncio.run(mempool_backend.get_block_height())
-                logger.debug(f"Current block height: {current_block_height} (from mempool API)")
-            except Exception as e:
-                logger.warning(f"Failed to fetch block height from mempool API {mempool_api}: {e}")
-
         if current_block_height is None:
             logger.error("Cannot determine current block height for certificate expiry validation")
-            logger.info(
-                "Provide --current-block for offline mode, configure a Bitcoin node, "
-                "or set --mempool-api <url>."
-            )
+            logger.info("Provide --current-block for offline mode or configure a Bitcoin node.")
             raise typer.Exit(1)
 
     # Validate cert_expiry is in the future

@@ -4,7 +4,6 @@ Blockchain backend implementations.
 Available backends:
 - DescriptorWalletBackend: Full node with descriptor wallet (uses importdescriptors + listunspent)
 - NeutrinoBackend: Lightweight BIP157/BIP158 SPV client
-- MempoolBackend: Mempool API (third-party, no setup required)
 
 Backend Selection Guide:
 - DescriptorWalletBackend (Recommended): Fastest for ongoing operations. Uses Bitcoin Core's
