@@ -4,9 +4,9 @@
 # Update with: ./scripts/update-base-images.sh
 # =============================================================================
 ARG PYTHON_VERSION=3.14
-ARG PYTHON_SLIM_DIGEST=sha256:5b3879b6f3cb77e712644d50262d05a7c146b7312d784a18eff7ff5462e77033
+ARG PYTHON_SLIM_DIGEST=sha256:1697e8e8d39bf168e177ac6b5fdab6df86d81cfc24dae17dfb96cfc3ef76b4dd
 ARG NODE_VERSION=24
-ARG NODE_SLIM_DIGEST=sha256:03eae3ef7e88a9de535496fb488d67e02b9d96a063a8967bae657744ecd513f2
+ARG NODE_SLIM_DIGEST=sha256:24dc26ef1e3c3690f27ebc4136c9c186c3133b25563ae4d7f0692e4d1fe5db0e
 # JAM frontend is built on a single fixed platform regardless of the target
 # image platform (the build output is static JS that is platform-independent).
 # Pinning JAM_BUILDER_PLATFORM ensures reproducible JS bytes across hosts.
@@ -197,28 +197,28 @@ FROM jmwalletd AS jam-ng
 
 # s6-overlay version (pinned for reproducibility)
 # Update with: ./scripts/update-base-images.sh
-ARG S6_OVERLAY_VERSION=3.2.2.0
+ARG S6_OVERLAY_VERSION=3.2.3.0
 
 # Install xz-utils (for extracting s6-overlay), wget (for downloading s6-overlay), and Tor daemon
 RUN apt-get update && apt-get install -y --no-install-recommends \
     wget=1.25.0-2 \
     xz-utils=5.8.1-1 \
-    tor=0.4.9.6-0+deb13u1 \
+    tor=0.4.9.8-0+deb13u1 \
     && rm -rf /var/lib/apt/lists/* \
     && rm -rf /var/log/dpkg.log /var/log/apt/* /var/cache/ldconfig/aux-cache
 
 # Install s6-overlay (noarch + arch-specific, checksums pinned)
 # noarch tarball is the same for all platforms
-ADD --checksum=sha256:85848f6baab49fb7832a5557644c73c066899ed458dd1601035cf18e7c759f26 \
+ADD --checksum=sha256:b720f9d9340efc8bb07528b9743813c836e4b02f8693d90241f047998b4c53cf \
     https://github.com/just-containers/s6-overlay/releases/download/v${S6_OVERLAY_VERSION}/s6-overlay-noarch.tar.xz /tmp
 # Arch-specific tarball: select based on TARGETARCH/TARGETVARIANT at build time
 ARG TARGETARCH
 ARG TARGETVARIANT
 RUN set -eux; \
     case "${TARGETARCH}/${TARGETVARIANT:-}" in \
-        amd64/)   S6_ARCH=x86_64;  S6_SHA256=5a09e2f1878dc5f7f0211dd7bafed3eee1afe4f813e872fff2ab1957f266c7c0 ;; \
-        arm64/)   S6_ARCH=aarch64; S6_SHA256=50a5d4919e688fafc95ce9cf0055a46f74847517bcf08174bac811de234ec7d2 ;; \
-        arm/v7)   S6_ARCH=armhf;   S6_SHA256=c6a9fa7c41c80d4a285cd5e1fc80ed4bc44b318ac16febffb0788a949aef35d4 ;; \
+        amd64/)   S6_ARCH=x86_64;  S6_SHA256=a93f02882c6ed46b21e7adb5c0add86154f01236c93cd82c7d682722e8840563 ;; \
+        arm64/)   S6_ARCH=aarch64; S6_SHA256=0952056ff913482163cc30e35b2e944b507ba1025d78f5becbb89367bf344581 ;; \
+        arm/v7)   S6_ARCH=armhf;   S6_SHA256=1ff4721b2a51e4f4dd9dbfffa47a994f14dbc3048853a83f7fb1c6ce93d59bf4 ;; \
         *) echo "Unsupported platform: ${TARGETARCH}/${TARGETVARIANT:-}" >&2; exit 1 ;; \
     esac; \
     wget -qO /tmp/s6-overlay-arch.tar.xz \
