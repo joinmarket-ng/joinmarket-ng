@@ -30,13 +30,36 @@ from loguru import logger
 
 from jmwallet.backends.base import UTXO, BlockchainBackend, Transaction
 
-# Timeout for regular RPC calls (seconds)
-DEFAULT_RPC_TIMEOUT = 30.0
+# Timeout policy for regular RPC calls.
+#
+# A short connect timeout still detects a dead/unreachable node quickly,
+# but the read timeout is generous: if Bitcoin Core has accepted the request
+# and is processing it, it is by definition working. Many wallet RPCs
+# (``listdescriptors``, ``listaddressgroupings``, ``listsinceblock``,
+# ``listunspent``) block on internal locks or scale with wallet/chain size
+# and routinely take longer than 30s under load (busy node, slow disk,
+# Raspberry-Pi-class hosts). The previous 30s default produced spurious
+# ``ReadTimeout`` errors that triggered fall-back paths with stale data
+# (e.g. an empty descriptor-range map that caused subsequent
+# ``importdescriptors`` to be rejected with ``new range must include
+# current range``).
+#
+# A 10-minute read budget is generous enough to absorb realistic worst
+# cases without making a truly stuck process appear hung indefinitely;
+# users can still Ctrl-C.
+DEFAULT_RPC_CONNECT_TIMEOUT = 10.0
+DEFAULT_RPC_READ_TIMEOUT = 600.0
+DEFAULT_RPC_TIMEOUT = httpx.Timeout(
+    connect=DEFAULT_RPC_CONNECT_TIMEOUT,
+    read=DEFAULT_RPC_READ_TIMEOUT,
+    write=DEFAULT_RPC_READ_TIMEOUT,
+    pool=DEFAULT_RPC_CONNECT_TIMEOUT,
+)
 
 # Timeout for descriptor import - first-time imports trigger a partial rescan
 # that runs synchronously inside the importdescriptors RPC. On slow hosts
 # (e.g. a Raspberry Pi) the smart-scan window (~1 year) can easily exceed
-# two minutes, so we use a much larger budget here. If the HTTP read still
+# ten minutes, so we use a much larger budget here. If the HTTP read still
 # times out we fall back to polling getwalletinfo for ``scanning`` instead
 # of bubbling up a confusing ReadTimeout (issue #472).
 IMPORT_RPC_TIMEOUT = 1800.0
@@ -569,10 +592,20 @@ class DescriptorWalletBackend(BlockchainBackend):
             isinstance(d, dict) and "range" in d or (isinstance(d, str) and "*" in d)
             for d in descriptors
         ):
+            # Use the long-timeout import client: on deep wallets
+            # ``listdescriptors`` can exceed the 30s default timeout, and
+            # silently falling back to ``{}`` here would lead Bitcoin Core to
+            # reject the import with "new range must include current range".
+            # If even the long-timeout call fails we surface a clear error
+            # rather than emitting a request we know Core will reject.
             try:
-                existing_ranges = await self.get_descriptor_ranges()
+                existing_ranges = await self.get_descriptor_ranges(raise_on_error=True)
             except Exception as e:
-                logger.debug(f"Could not pre-fetch existing descriptor ranges: {e}")
+                raise RuntimeError(
+                    "Failed to fetch existing descriptor ranges before import; "
+                    "cannot safely build a non-shrinking import range. Original "
+                    f"error: {e}"
+                ) from e
 
         def _expanded_range(
             desc_with_checksum: str, requested: list[int] | tuple[int, int]
@@ -1574,9 +1607,19 @@ class DescriptorWalletBackend(BlockchainBackend):
                 mine.add(address)
         return mine
 
-    async def get_descriptor_ranges(self) -> dict[str, tuple[int, int]]:
+    async def get_descriptor_ranges(
+        self, raise_on_error: bool = False
+    ) -> dict[str, tuple[int, int]]:
         """
         Get the current range for each imported descriptor.
+
+        Args:
+            raise_on_error: When True, propagate the underlying RPC error
+                instead of returning ``{}``. Use this in code paths where an
+                empty result would silently corrupt subsequent decisions
+                (e.g. the pre-import range check, where missing data leads
+                Bitcoin Core to reject the request with "new range must
+                include current range").
 
         Returns:
             Dictionary mapping descriptor base (without checksum) to (start, end) range.
@@ -1608,6 +1651,8 @@ class DescriptorWalletBackend(BlockchainBackend):
 
             return ranges
         except Exception as e:
+            if raise_on_error:
+                raise
             logger.warning(f"Failed to get descriptor ranges: {e}")
             return {}
 

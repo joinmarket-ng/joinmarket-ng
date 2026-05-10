@@ -246,6 +246,9 @@ class TestDescriptorWalletBackendUnit:
                 # Return descriptor with checksum
                 desc = params[0]
                 return {"descriptor": f"{desc}#abcd1234"}
+            elif method == "listdescriptors":
+                # Pre-import range check + post-import verification.
+                return {"descriptors": []}
             elif method == "importdescriptors":
                 import_reqs = params[0]
                 # Return success for all
@@ -947,6 +950,119 @@ async def test_descriptor_wallet_service_integration():
         # Verify first address matches expected derivation
         first_addr = wallet.get_receive_address(0, 0)
         assert first_addr.startswith("bcrt1"), f"Expected regtest address, got {first_addr}"
+
+    finally:
+        try:
+            await backend.unload_wallet()
+        except Exception:
+            pass
+        await backend.close()
+
+
+@pytest.mark.docker
+@pytest.mark.asyncio
+async def test_slow_listdescriptors_does_not_break_reimport() -> None:
+    """Reproduce the slow-node timeout bug end-to-end against real Core.
+
+    Production scenario: a busy/slow Bitcoin Core node makes
+    ``listdescriptors`` exceed the previous 30s default RPC timeout. The
+    pre-import range fetch then silently fell back to ``{}``, so a
+    subsequent ``importdescriptors`` was sent with a request range smaller
+    than Core's existing range and rejected with::
+
+        new range must include current range = [0,N]
+
+    We simulate this faithfully by injecting an ``httpx.ReadTimeout`` for
+    the *first* ``listdescriptors`` request -- exactly the failure mode
+    httpx raises after ``client.timeout.read`` elapses without a response.
+    The second import must still succeed: the fix raises a clear error on
+    pre-fetch failure (no silent shrink), then the verification listdescriptors
+    completes normally and the descriptor range is preserved.
+    """
+    import uuid
+
+    wallet_name = f"jm_slow_ld_{uuid.uuid4().hex[:8]}"
+
+    backend = DescriptorWalletBackend(
+        rpc_url=TEST_RPC_URL,
+        rpc_user=TEST_RPC_USER,
+        rpc_password=TEST_RPC_PASSWORD,
+        wallet_name=wallet_name,
+    )
+
+    # Confirm Bitcoin Core is reachable; otherwise skip cleanly.
+    try:
+        await backend.get_block_height()
+    except Exception:
+        await backend.close()
+        pytest.skip("Bitcoin Core not available")
+        return
+
+    test_xpub = (
+        "tpubD6NzVbkrYhZ4XgiXtGrdW5XDAPFCL9h7we1vwNCpn8tGbBcgfVYjXyhWo4E1xkh56hjod1Rh"
+        "GjxbaTLV3X4FyWuejifB9jusQ46QzG87VKp"
+    )
+
+    try:
+        await backend.create_wallet(disable_private_keys=True)
+
+        # First import at a small range to populate Core's tracked range.
+        first = await backend.import_descriptors(
+            [{"desc": f"wpkh({test_xpub}/0/*)", "range": [0, 50], "timestamp": "now"}],
+            rescan=False,
+        )
+        assert first["error_count"] == 0
+        assert first["success_count"] >= 1
+
+        # Now arrange for the *next* listdescriptors HTTP call (the
+        # pre-import range fetch in import_descriptors) to raise
+        # ``httpx.ReadTimeout`` exactly the way a real slow node would after
+        # the read timeout elapses.
+        original_post = backend.client.post
+        injected_timeouts: list[bool] = []
+
+        async def fail_first_listdescriptors(*args: Any, **kwargs: Any) -> Any:
+            payload = kwargs.get("json")
+            if (
+                payload
+                and isinstance(payload, dict)
+                and payload.get("method") == "listdescriptors"
+                and not injected_timeouts
+            ):
+                injected_timeouts.append(True)
+                raise httpx.ReadTimeout("simulated slow node")
+            return await original_post(*args, **kwargs)
+
+        backend.client.post = fail_first_listdescriptors  # type: ignore[method-assign]
+
+        # Re-import at a SMALLER range. Pre-fetch will hit the simulated
+        # timeout. With the fix in place, this surfaces a clear RuntimeError
+        # rather than silently sending a shrinking range that Core would
+        # reject 14 minutes later.
+        with pytest.raises(RuntimeError, match="non-shrinking import range"):
+            await backend.import_descriptors(
+                [{"desc": f"wpkh({test_xpub}/0/*)", "range": [0, 9], "timestamp": "now"}],
+                rescan=False,
+            )
+
+        assert injected_timeouts, "Test setup error: timeout injection never fired"
+
+        # Restore client and verify a follow-up retry (without injection)
+        # succeeds and never shrinks the descriptor range.
+        backend.client.post = original_post  # type: ignore[method-assign]
+
+        retry = await backend.import_descriptors(
+            [{"desc": f"wpkh({test_xpub}/0/*)", "range": [0, 9], "timestamp": "now"}],
+            rescan=False,
+        )
+        assert retry["error_count"] == 0, (
+            f"Retry after transient timeout should succeed. Results: {retry.get('results')}"
+        )
+
+        ranges = await backend.get_descriptor_ranges()
+        assert ranges, "Expected at least one ranged descriptor after re-import"
+        max_end = max(end for _, end in ranges.values())
+        assert max_end >= 50, f"Descriptor range must not shrink, got max end={max_end}"
 
     finally:
         try:
@@ -2265,6 +2381,59 @@ class TestDescriptorRangeUpgrade:
         assert sent[2]["range"] == [0, 1100]
         # Descriptors with no larger existing range keep the requested range.
         assert sent[3]["range"] == [0, 999]
+
+    @pytest.mark.asyncio
+    async def test_default_rpc_client_uses_generous_read_timeout(self) -> None:
+        """Blocking RPCs (``listdescriptors``, ``listaddressgroupings``,
+        ``listsinceblock``) can take far longer than 30s on a busy node or
+        slow host. The default client must use a generous read timeout so
+        these calls complete instead of raising ``ReadTimeout``, which would
+        trigger fallback paths with stale data (e.g. an empty descriptor
+        range map causing Core to later reject the import with "new range
+        must include current range").
+        """
+        backend = DescriptorWalletBackend(wallet_name="test_timeout_policy")
+        try:
+            timeout = backend.client.timeout
+            # Connect timeout stays short so we still detect dead nodes.
+            assert timeout.connect is not None and timeout.connect <= 30.0
+            # Read timeout is generous (much larger than the previous 30s
+            # default) so blocking RPCs do not spuriously time out.
+            assert timeout.read is not None and timeout.read >= 300.0
+        finally:
+            await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_import_descriptors_raises_when_existing_range_fetch_fails(self) -> None:
+        """When ``listdescriptors`` fails before an import we cannot safely
+        build a non-shrinking range. Surface a clear error instead of
+        emitting a request Core will reject 14 minutes later with the cryptic
+        "new range must include current range" message.
+        """
+        backend = DescriptorWalletBackend(wallet_name="test_prefetch_fail")
+        backend._wallet_loaded = True
+
+        async def mock_rpc_call(
+            method: str,
+            params: list | None = None,
+            client: Any = None,
+            use_wallet: bool = True,
+        ) -> Any:
+            if method == "getdescriptorinfo":
+                desc = params[0] if params else ""
+                return {"descriptor": f"{desc}#mockchecksum"}
+            if method == "listdescriptors":
+                raise httpx.ReadTimeout("listdescriptors timed out")
+            if method == "importdescriptors":
+                pytest.fail("importdescriptors must not be called when prefetch fails")
+            raise ValueError(f"Unexpected RPC: {method}")
+
+        backend._rpc_call = mock_rpc_call  # type: ignore[method-assign]
+
+        descriptors = [{"desc": "wpkh(xpub.../0/*)", "range": [0, 999], "internal": False}]
+
+        with pytest.raises(RuntimeError, match="non-shrinking import range"):
+            await backend.import_descriptors(descriptors, rescan=False)
 
     @pytest.mark.asyncio
     async def test_import_descriptors_extends_when_requested_is_larger(self) -> None:
