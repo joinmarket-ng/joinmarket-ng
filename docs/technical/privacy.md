@@ -148,9 +148,9 @@ Allows cold storage of bond private key while hot wallet handles per-session pro
 
 > **IMPORTANT -- HARDWARE WALLET LIMITATIONS:**
 >
-> Most hardware wallets **cannot sign** fidelity bond spending transactions. Bond UTXOs are P2WSH outputs with CLTV timelock witness scripts, and most firmware rejects custom witness scripts. **Only Ledger Nano S/X and Blockstream Jade** support this (see [HWI support matrix](https://hwi.readthedocs.io/en/latest/devices/index.html#support-matrix)). Trezor (all models), Coldcard, BitBox02, and KeepKey **cannot** sign bond redemptions ([Trezor firmware issue #416](https://github.com/trezor/trezor-firmware/issues/416), open since 2019).
+> Most hardware wallets **cannot sign** fidelity bond spending transactions. Bond UTXOs are P2WSH outputs with CLTV timelock witness scripts, and most firmware rejects custom witness scripts. **Ledger Nano S/X and Blockstream Jade** support this through HWI (see [HWI support matrix](https://hwi.readthedocs.io/en/latest/devices/index.html#support-matrix)). **Specter DIY** also provides a hardware-wallet signing path by scanning the PSBT as a QR code and returning a signed PSBT. This Specter DIY flow is QR-based and does not rely on upstream HWI support. Trezor (all models), Coldcard, BitBox02, and KeepKey **cannot** sign bond redemptions ([Trezor firmware issue #416](https://github.com/trezor/trezor-firmware/issues/416), open since 2019).
 >
-> If your hardware wallet cannot sign CLTV scripts, you will need to enter your BIP39 mnemonic into the `sign_bond_mnemonic.py` script to spend the bond. This does not mean funds are lost -- it is an inconvenience that degrades security from "hardware wallet cold storage" to "software signing on a (potentially offline) computer". **Plan ahead**: use a CLTV compatible hardware wallet for full cold storage, or create a dedicated mnemonic/passphrase specifically for the bond so that mnemonic exposure does not risk your main wallet.
+> If your hardware wallet cannot sign CLTV scripts through either HWI or a device-native QR PSBT flow, you will need to enter your BIP39 mnemonic into the `sign_bond_mnemonic.py` script to spend the bond. This does not mean funds are lost -- it is an inconvenience that degrades security from "hardware wallet cold storage" to "software signing on a (potentially offline) computer". **Plan ahead**: use a CLTV compatible hardware wallet for full cold storage, or create a dedicated mnemonic/passphrase specifically for the bond so that mnemonic exposure does not risk your main wallet.
 >
 > **Before locking real funds**, complete the full workflow end-to-end including a test spend (without broadcasting) to confirm your tooling works. See "Test the full flow" below.
 
@@ -222,15 +222,19 @@ For maximum security, keep the bond UTXO private key on a hardware wallet. The b
      --fee-rate 1.0 \
      --test-unfunded \
      --master-fingerprint <fingerprint_from_step_1> \
-     --derivation-path "<path_from_step_1>"
+     --derivation-path "<path_from_step_1>" \
+     --output unsigned-bond-test.psbt
    ```
    Then verify you can sign it:
    ```bash
    # Ledger/Jade users -- test HWI signing:
-   python scripts/sign_bond_psbt.py <psbt_base64>
+   python scripts/sign_bond_psbt.py "$(tr -d '\n' < unsigned-bond-test.psbt)"
+
+   # Specter DIY users -- test QR PSBT signing:
+   qrencode -t ANSIUTF8 "$(tr -d '\n' < unsigned-bond-test.psbt)"
 
    # All other devices -- test mnemonic signing:
-   python scripts/sign_bond_mnemonic.py <psbt_base64>
+   python scripts/sign_bond_mnemonic.py "$(tr -d '\n' < unsigned-bond-test.psbt)"
    ```
    **Do not broadcast** the test transaction -- just confirm that signing succeeds and produces valid output. Use `bitcoin-cli decoderawtransaction <signed_hex>` to inspect. `--test-unfunded` uses a synthetic input so you can validate derivation path, signer compatibility, and the full signing toolchain **before funding**.
 
@@ -243,7 +247,7 @@ For maximum security, keep the bond UTXO private key on a hardware wallet. The b
 
 **Security benefits:**
 - Bond UTXO private key NEVER leaves the hardware wallet (with CLTV compatible devices)
-- No mnemonic exposure to online systems (when using HWI signing on an offline machine)
+- No mnemonic exposure to online systems (when using HWI or QR signing on an offline machine)
 - Certificate expires after configurable period (~2 years default)
 - If hot wallet is compromised, attacker can only impersonate bond until expiry
 - Bond funds remain safe in cold storage
@@ -263,7 +267,7 @@ When your certificate expires, repeat steps 4-6 with a new message. The bond fun
 
 **Spending Bonds:**
 
-> **Tested:** Bond creation verified with Sparrow Wallet and a hardware wallet (HWI >= 3.1.0). Bond redemption verified with `sign_bond_mnemonic.py`. Trezor cannot sign the redemption transaction due to the CLTV firmware limitation.
+> **Tested:** Bond creation verified with Sparrow Wallet and a hardware wallet (HWI >= 3.1.0). Bond redemption verified with `sign_bond_mnemonic.py`. Specter DIY can sign through the QR PSBT workflow; this guide does not claim or require Specter DIY support in upstream HWI. Trezor cannot sign the redemption transaction due to the CLTV firmware limitation.
 
 After locktime expires, generate a PSBT for external signing:
 
@@ -286,6 +290,7 @@ For pre-funding dry-run signer tests, add `--test-unfunded` (optionally `--test-
 |--------|:--------------------:|-------|
 | Ledger Nano S/X | Yes | Bitcoin App 2.1+ requires standard BIP44/49/84/86 derivation for the key |
 | Blockstream Jade | Yes | Fully supported |
+| Specter DIY | Yes | QR PSBT workflow; upstream HWI support is not required or claimed |
 | BitBox01 | Yes | Discontinued; not recommended for new setups |
 | Trezor (all models) | **No** | Firmware rejects non-multisig P2WSH; [issue #416](https://github.com/trezor/trezor-firmware/issues/416) open since 2019 |
 | Coldcard | **No** | Firmware only supports single-key and multisig |
@@ -303,9 +308,29 @@ python scripts/sign_bond_psbt.py <psbt_base64>
 
 Connect and unlock your device first. Close Sparrow or other wallet software that holds the USB connection. The script enumerates devices, signs, and outputs the transaction hex. If your wallet uses a BIP39 passphrase, add `--passphrase` to the script invocation.
 
-**Option B -- Mnemonic signing (works with any device):**
+**Option B -- Specter DIY QR signing:**
 
-For Trezor, Coldcard, BitBox02, KeepKey, or if HWI signing fails:
+Specter DIY can sign the bond PSBT by QR code exchange. Save the PSBT when generating the spend:
+
+```bash
+jm-wallet spend-bond <bond_address> <destination_address> \
+  --fee-rate 1.0 \
+  --master-fingerprint <4_byte_hex> \
+  --derivation-path "m/84'/0'/0'/0/0" \
+  --output unsigned-bond.psbt
+```
+
+Render the unsigned PSBT as a QR code:
+
+```bash
+qrencode -t ANSIUTF8 "$(tr -d '\n' < unsigned-bond.psbt)"
+```
+
+Scan the QR on Specter DIY, inspect the transaction details, and sign it. Then scan the signed PSBT output back to the online machine, for example with Sparrow's File -> Open transaction -> from QR flow, and finalize or extract the signed transaction hex there.
+
+**Option C -- Mnemonic signing (works with any device):**
+
+For Trezor, Coldcard, BitBox02, KeepKey, or if HWI/QR signing fails:
 
 ```bash
 python scripts/sign_bond_mnemonic.py <psbt_base64>
