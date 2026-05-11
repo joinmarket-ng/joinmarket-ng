@@ -1560,6 +1560,23 @@ class DescriptorWalletBackend(BlockchainBackend):
         logger.debug(f"Total addresses with history: {len(addresses)}")
         return addresses
 
+    async def get_address_info(self, address: str) -> dict[str, Any] | None:
+        """
+        Return Bitcoin Core's ``getaddressinfo`` result for an address.
+
+        The result includes ``ismine`` and (for descriptor wallets) ``desc``
+        — the descriptor of the address with its derivation path baked in,
+        which lets callers determine ``(change, index)`` without scanning.
+
+        Returns ``None`` on RPC error so callers can fall back conservatively
+        (e.g., treat as not-ours rather than triggering an expensive scan).
+        """
+        try:
+            return await self._rpc_call("getaddressinfo", [address])
+        except Exception as e:
+            logger.debug(f"getaddressinfo failed for {address[:20]}...: {e}")
+            return None
+
     async def is_address_mine(self, address: str) -> bool:
         """
         Check whether an address belongs to this wallet.
@@ -1579,12 +1596,8 @@ class DescriptorWalletBackend(BlockchainBackend):
             (including on RPC errors, where we conservatively assume it is not
             ours rather than triggering an expensive extended-range scan).
         """
-        try:
-            info = await self._rpc_call("getaddressinfo", [address])
-        except Exception as e:
-            logger.debug(f"getaddressinfo failed for {address[:20]}...: {e}")
-            return False
-        return bool(info.get("ismine", False))
+        info = await self.get_address_info(address)
+        return bool(info.get("ismine", False)) if info else False
 
     async def filter_mine_addresses(self, addresses: Sequence[str]) -> set[str]:
         """

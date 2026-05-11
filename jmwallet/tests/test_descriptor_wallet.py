@@ -7,7 +7,6 @@ Integration tests (marked with @pytest.mark.docker) require a running Bitcoin Co
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
@@ -2141,15 +2140,16 @@ class TestAddressHistory:
             # only own_addr is actually ours.
             return {own_addr, external_addr}
 
-        filter_calls: list[Sequence[str]] = []
+        get_info_calls: list[str] = []
 
-        async def mock_filter_mine_addresses(addresses: Sequence[str]) -> set[str]:
-            filter_calls.append(list(addresses))
-            return {a for a in addresses if a == own_addr}
+        async def mock_get_address_info(address: str) -> dict[str, Any] | None:
+            get_info_calls.append(address)
+            # external address: not ours according to Bitcoin Core
+            return {"ismine": address == own_addr, "address": address}
 
         backend.get_all_utxos = mock_get_all_utxos  # type: ignore[method-assign]
         backend.get_addresses_with_history = mock_get_addresses_with_history  # type: ignore[method-assign]
-        backend.filter_mine_addresses = mock_filter_mine_addresses  # type: ignore[method-assign]
+        backend.get_address_info = mock_get_address_info  # type: ignore[method-assign]
 
         wallet = WalletService(
             mnemonic=TEST_MNEMONIC,
@@ -2169,9 +2169,10 @@ class TestAddressHistory:
 
         await wallet.sync_with_descriptor_wallet()
 
-        # The filter was consulted with the unknown address.
-        assert filter_calls, "filter_mine_addresses should have been called"
-        assert external_addr in filter_calls[0]
+        # get_address_info was consulted for the unknown address.
+        assert external_addr in get_info_calls, (
+            "get_address_info should have been called for the external address"
+        )
 
         # Extended scan must NOT have been called for the external address.
         called_args = [c.args[0] for c in wallet._find_address_path_extended.call_args_list]

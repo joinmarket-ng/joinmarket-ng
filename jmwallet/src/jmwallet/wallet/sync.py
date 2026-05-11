@@ -1100,33 +1100,88 @@ class WalletSyncMixin:
         except Exception as e:
             logger.debug(f"Could not fetch addresses with history: {e}")
 
-        # Search for addresses beyond the current range
-        # This handles wallets previously used with different software (e.g., reference impl)
-        # that may have used addresses at indices beyond our current descriptor range.
+        # Resolve addresses beyond the current descriptor range.
         #
-        # Bitcoin Core's listaddressgroupings (used by get_addresses_with_history) returns
-        # ALL addresses appearing in transactions involving wallet inputs/outputs, including
-        # counterparty addresses from CoinJoin co-spends. Those addresses are not ours and
-        # must NOT trigger _find_address_path_extended (a ~5000-index BIP32 scan per
-        # address, which can take many seconds). Use the backend's authoritative ismine
-        # check (getaddressinfo) to filter them out before scanning.
+        # The Bitcoin Core wallet holds two kinds of descriptors for us:
+        # ranged ``wpkh(xpub/0/*)`` / ``wpkh(xpub/1/*)`` descriptors per
+        # mixdepth, and standalone ``addr(<bech32>)`` descriptors for our
+        # fidelity bond addresses. Any of those addresses can show up in
+        # ``listaddressgroupings`` (used by get_addresses_with_history) once
+        # they have transaction history -- including external counterparties
+        # from CoinJoin co-spends, which are not ours.
+        #
+        # Naively running _find_address_path_extended on each missing address
+        # is a ~50,000-derivation BIP32 scan per address and, for anything not
+        # actually reachable via our wpkh derivation (fidelity bonds, external
+        # counterparties), runs to completion. That easily blocks MakerBot
+        # startup past test timeouts before the bot connects to directories.
+        #
+        # Instead, ask Bitcoin Core via getaddressinfo:
+        #   - ismine=False  -> external (e.g. counterparty); skip.
+        #   - desc is wpkh  -> parse the embedded (change, index) and verify
+        #                      the pubkey derives from this wallet's master
+        #                      key. Match -> exact path in O(mixdepths).
+        #   - desc is addr() or other non-wpkh -> our fidelity bonds and any
+        #                      other non-ranged imports live here. They have
+        #                      no BIP32 path to recover; skip the extended
+        #                      scan rather than spending tens of seconds on
+        #                      it. UTXOs at fidelity bond addresses are still
+        #                      resolved via the bond_address_to_info path
+        #                      above when the caller passes the registry.
+        #   - desc missing  -> queue for the slow BIP32 fallback (older Core,
+        #                      test mocks).
         if addresses_beyond_range:
-            filter_mine = getattr(self.backend, "filter_mine_addresses", None)
-            if filter_mine is not None:
-                try:
-                    mine_addresses = await filter_mine(addresses_beyond_range)
-                except Exception as e:
-                    logger.debug(f"Could not filter ismine addresses, scanning all: {e}")
-                    mine_addresses = set(addresses_beyond_range)
-                external_count = len(addresses_beyond_range) - len(mine_addresses)
-                if external_count:
+            get_address_info = getattr(self.backend, "get_address_info", None)
+            if get_address_info is not None:
+                resolved = 0
+                skipped_external = 0
+                skipped_non_wpkh = 0
+                unresolved: list[str] = []
+                for address in addresses_beyond_range:
+                    try:
+                        info = await get_address_info(address)
+                    except Exception as e:
+                        logger.trace(f"getaddressinfo failed for {address[:20]}...: {e}")
+                        info = None
+                    if info is None:
+                        unresolved.append(address)
+                        continue
+                    if not info.get("ismine"):
+                        skipped_external += 1
+                        continue
+                    desc = info.get("desc", "")
+                    if not desc:
+                        unresolved.append(address)
+                        continue
+                    path_info = self._resolve_descriptor_path(desc)
+                    if path_info is None:
+                        # Descriptor doesn't decode into one of our wpkh
+                        # derivations: typically an addr() import for a
+                        # fidelity bond, or some other non-ranged descriptor.
+                        # Nothing more to do here.
+                        skipped_non_wpkh += 1
+                        continue
+                    self.address_cache[address] = path_info
+                    self.addresses_with_history.add(address)
+                    resolved += 1
+                if skipped_external:
                     logger.debug(
-                        f"Skipping extended-range scan for {external_count} external "
-                        f"address(es) (e.g., CoinJoin counterparties)"
+                        f"Skipped {skipped_external} external address(es) beyond range "
+                        f"(not ismine - e.g., CoinJoin counterparties)"
                     )
-                addresses_beyond_range = sorted(mine_addresses)
+                if skipped_non_wpkh:
+                    logger.debug(
+                        f"Skipped {skipped_non_wpkh} ismine address(es) with non-wpkh "
+                        f"descriptor (e.g., addr() imports for fidelity bonds)"
+                    )
+                if resolved:
+                    logger.debug(f"Resolved {resolved} address(es) beyond range via getaddressinfo")
+                addresses_beyond_range = unresolved
 
         if addresses_beyond_range:
+            # Fallback BIP32 derivation scan. Only reached when the backend
+            # doesn't expose get_address_info or returned no descriptor (older
+            # Core / test mocks).
             extended_addresses_found = 0
             for address in addresses_beyond_range:
                 path_info = self._find_address_path_extended(address)
@@ -1405,6 +1460,37 @@ class WalletSyncMixin:
                         )
                         return (mixdepth, change, index)
 
+        return None
+
+    def _resolve_descriptor_path(self, desc: str) -> tuple[int, int, int] | None:
+        """
+        Parse a ``wpkh`` descriptor and resolve ``(mixdepth, change, index)``.
+
+        Used to translate Bitcoin Core's ``getaddressinfo`` descriptor for an
+        address into a wallet path without scanning derivations. Verifies the
+        descriptor's pubkey against this wallet's master key. Returns ``None``
+        if the descriptor is not a ranged ``wpkh`` (e.g., an ``addr(...)``
+        import for a fidelity bond) or if no mixdepth derives the same pubkey
+        — in either case the address has no BIP32 path here for us to record.
+        """
+        if "#" in desc:
+            desc = desc.split("#")[0]
+        match = re.search(r"wpkh\(\[[\da-f]+/(\d+)/(\d+)\]([\da-f]+)\)", desc, re.I)
+        if not match:
+            return None
+        change_from_desc = int(match.group(1))
+        index = int(match.group(2))
+        pubkey = match.group(3).lower()
+        for mixdepth in range(self.mixdepth_count):
+            try:
+                derived_key = self.master_key.derive(
+                    f"{self.root_path}/{mixdepth}'/{change_from_desc}/{index}"
+                )
+            except Exception:
+                continue
+            derived_pubkey = derived_key.get_public_key_bytes(compressed=True).hex().lower()
+            if derived_pubkey == pubkey:
+                return (mixdepth, change_from_desc, index)
         return None
 
     def _parse_descriptor_path(
