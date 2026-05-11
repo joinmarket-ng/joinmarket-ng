@@ -16,7 +16,7 @@ JoinMarket NG supports the optional BIP39 passphrase ("25th word"):
 
 **Important Distinction:**
 
-- **File encryption password** (`--password`): Encrypts mnemonic file with AES
+- **File encryption password** (`--password`): Encrypts mnemonic file with AES (Fernet, key derived via Argon2id; legacy files using PBKDF2 are still readable)
 - **BIP39 passphrase** (`--bip39-passphrase`): Used in seed derivation per BIP39
 
 The passphrase is provided when **using** the wallet, not when importing:
@@ -36,6 +36,25 @@ BIP39_PASSPHRASE="my phrase" jm-wallet info
 - Empty passphrase (`""`) is valid and different from no passphrase
 - Passphrase is case-sensitive and whitespace-sensitive
 - **Not read from config file** to prevent accidental exposure
+
+### Wallet File Encryption
+
+Encrypted mnemonic files written by `jmwalletd` use a versioned binary format:
+
+```
+[ magic "JMNG" 4B ][ ver 1B ][ kdf_id 1B ][ m_cost u32 BE ][ t_cost u32 BE ][ p_cost u8 ][ salt 16B ][ Fernet token ]
+```
+
+Defaults are Argon2id with OWASP 2024 baseline parameters (memory 19 MiB,
+time cost 2, parallelism 1). KDF parameters are stored per file so they
+can be raised over time without breaking older wallets.
+
+Wallet files written by older builds use a legacy layout with no magic
+header (raw 16-byte salt followed by a Fernet token whose key was
+derived via PBKDF2-HMAC-SHA256 with 600,000 iterations). These files
+remain loadable. They are not silently re-encrypted: to migrate an
+existing wallet to Argon2id, create a new wallet and move funds, or
+trigger a re-save through any future password-change flow.
 
 ### UTXO Selection
 
