@@ -10,6 +10,8 @@ module only wires things together in the way the HTTP daemon needs.
 
 from __future__ import annotations
 
+import base64
+import os
 from pathlib import Path
 from typing import Any
 
@@ -279,25 +281,34 @@ def _save_wallet_file(
 ) -> None:
     """Persist an encrypted wallet file.
 
-    Uses Fernet symmetric encryption (from the ``cryptography`` library)
-    with a key derived from the password via PBKDF2.
+    Uses Fernet symmetric encryption (AES-128-CBC + HMAC-SHA256, from the
+    ``cryptography`` library) with a key derived from the password via
+    Argon2id. Argon2id is memory-hard and significantly more resistant to
+    offline GPU/ASIC cracking than the legacy PBKDF2-HMAC-SHA256 format.
+
+    The on-disk layout is:
+
+    ``[ magic 'JMNG' 4B ][ ver 1B ][ kdf_id 1B ][ m_cost u32 BE ]``
+    ``[ t_cost u32 BE ][ p_cost u8 ][ salt 16B ][ Fernet token ... ]``
+
+    Older PBKDF2 wallet files (which have no magic and start with a raw
+    16-byte salt) are still readable via :func:`_load_wallet_file`. New
+    saves always use the Argon2id format.
     """
-    import base64
     import json
-    import os
 
     from cryptography.fernet import Fernet
-    from cryptography.hazmat.primitives import hashes
-    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
-    salt = os.urandom(16)
-    kdf = PBKDF2HMAC(
-        algorithm=hashes.SHA256(),
-        length=32,
-        salt=salt,
-        iterations=600_000,
+    salt = os.urandom(_SALT_LEN)
+    key = base64.urlsafe_b64encode(
+        _derive_key_argon2id(
+            password=password,
+            salt=salt,
+            memory_cost=_ARGON2ID_MEMORY_COST,
+            time_cost=_ARGON2ID_TIME_COST,
+            parallelism=_ARGON2ID_PARALLELISM,
+        )
     )
-    key = base64.urlsafe_b64encode(kdf.derive(password.encode()))
     fernet = Fernet(key)
 
     wallet_data_dict: dict[str, str | int] = {
@@ -311,41 +322,51 @@ def _save_wallet_file(
 
     encrypted = fernet.encrypt(wallet_data)
 
-    wallet_path.parent.mkdir(parents=True, exist_ok=True)
-    wallet_path.write_bytes(salt + encrypted)
+    header = _pack_argon2id_header(
+        memory_cost=_ARGON2ID_MEMORY_COST,
+        time_cost=_ARGON2ID_TIME_COST,
+        parallelism=_ARGON2ID_PARALLELISM,
+        salt=salt,
+    )
 
-    logger.debug("Saved wallet file: {}", wallet_path)
+    wallet_path.parent.mkdir(parents=True, exist_ok=True)
+    wallet_path.write_bytes(header + encrypted)
+
+    logger.debug("Saved wallet file (argon2id): {}", wallet_path)
 
 
 def _load_wallet_file(*, wallet_path: Path, password: str) -> tuple[str, int | None]:
     """Load and decrypt a wallet file, returning the mnemonic and creation height.
 
+    Auto-detects the on-disk format:
+
+    - New format: ``JMNG`` magic + version + KDF parameters + salt + ciphertext,
+      decrypted with Argon2id.
+    - Legacy format: 16-byte salt + Fernet ciphertext, decrypted with PBKDF2.
+      Kept for backward compatibility with wallet files written before
+      the Argon2id migration. The file is *not* silently re-encrypted on
+      load -- migration requires the caller to re-save through
+      :func:`_save_wallet_file` (for example, on the next password change).
+
     Returns:
         Tuple of (mnemonic, creation_height).  ``creation_height`` is ``None``
-        for wallet files created before this feature was added.
+        for wallet files created before that feature was added.
 
     Raises:
-        ValueError: If the password is incorrect.
+        ValueError: If the password is incorrect or the file is corrupted.
     """
-    import base64
     import json
 
     from cryptography.fernet import Fernet, InvalidToken
-    from cryptography.hazmat.primitives import hashes
-    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
     raw = wallet_path.read_bytes()
-    salt = raw[:16]
-    encrypted = raw[16:]
 
-    kdf = PBKDF2HMAC(
-        algorithm=hashes.SHA256(),
-        length=32,
-        salt=salt,
-        iterations=600_000,
-    )
-    key = base64.urlsafe_b64encode(kdf.derive(password.encode()))
-    fernet = Fernet(key)
+    if raw.startswith(_WALLET_MAGIC):
+        key, encrypted = _derive_key_from_header(raw, password=password)
+    else:
+        key, encrypted = _derive_key_legacy_pbkdf2(raw, password=password)
+
+    fernet = Fernet(base64.urlsafe_b64encode(key))
 
     try:
         decrypted = fernet.decrypt(encrypted)
@@ -363,3 +384,124 @@ def _load_wallet_file(*, wallet_path: Path, password: str) -> tuple[str, int | N
         creation_height = None
 
     return mnemonic, creation_height
+
+
+# ---------------------------------------------------------------------------
+# Wallet file encryption format helpers
+# ---------------------------------------------------------------------------
+
+# Magic prefix marking a versioned wallet file. Legacy PBKDF2 files have no
+# magic and start with a raw 16-byte random salt; that prefix can never
+# coincide with this ASCII tag.
+_WALLET_MAGIC = b"JMNG"
+_WALLET_FORMAT_VERSION = 1
+_KDF_ID_ARGON2ID = 1
+
+_SALT_LEN = 16
+_KEY_LEN = 32
+
+# OWASP 2024 baseline for Argon2id (interactive-resistant settings tuned for
+# file decryption rather than per-request login): m=19 MiB, t=2, p=1.
+# Parameters are stored in the header so they can be raised later without
+# breaking older files.
+_ARGON2ID_MEMORY_COST = 19_456  # KiB (~19 MiB)
+_ARGON2ID_TIME_COST = 2
+_ARGON2ID_PARALLELISM = 1
+
+# Legacy PBKDF2 parameters. Kept fixed; we only need to *read* these files.
+_LEGACY_PBKDF2_ITERATIONS = 600_000
+
+
+def _derive_key_argon2id(
+    *,
+    password: str,
+    salt: bytes,
+    memory_cost: int,
+    time_cost: int,
+    parallelism: int,
+) -> bytes:
+    """Derive a 32-byte key from *password* using Argon2id."""
+    from argon2.low_level import Type, hash_secret_raw
+
+    return hash_secret_raw(
+        secret=password.encode(),
+        salt=salt,
+        time_cost=time_cost,
+        memory_cost=memory_cost,
+        parallelism=parallelism,
+        hash_len=_KEY_LEN,
+        type=Type.ID,
+    )
+
+
+def _pack_argon2id_header(
+    *,
+    memory_cost: int,
+    time_cost: int,
+    parallelism: int,
+    salt: bytes,
+) -> bytes:
+    """Build the binary header for an Argon2id-encrypted wallet file."""
+    if len(salt) != _SALT_LEN:
+        msg = f"salt must be {_SALT_LEN} bytes, got {len(salt)}"
+        raise ValueError(msg)
+    return (
+        _WALLET_MAGIC
+        + bytes([_WALLET_FORMAT_VERSION, _KDF_ID_ARGON2ID])
+        + memory_cost.to_bytes(4, "big")
+        + time_cost.to_bytes(4, "big")
+        + bytes([parallelism])
+        + salt
+    )
+
+
+def _derive_key_from_header(raw: bytes, *, password: str) -> tuple[bytes, bytes]:
+    """Parse a new-format wallet file header and return ``(key, ciphertext)``."""
+    # Layout: magic(4) | version(1) | kdf_id(1) | m_cost(4) | t_cost(4) | p_cost(1) | salt(16)
+    header_len = 4 + 1 + 1 + 4 + 4 + 1 + _SALT_LEN
+    if len(raw) < header_len:
+        raise ValueError("Wallet file is truncated (header too short).")
+
+    version = raw[4]
+    kdf_id = raw[5]
+    if version != _WALLET_FORMAT_VERSION:
+        msg = f"Unsupported wallet file version: {version}"
+        raise ValueError(msg)
+    if kdf_id != _KDF_ID_ARGON2ID:
+        msg = f"Unsupported wallet KDF id: {kdf_id}"
+        raise ValueError(msg)
+
+    memory_cost = int.from_bytes(raw[6:10], "big")
+    time_cost = int.from_bytes(raw[10:14], "big")
+    parallelism = raw[14]
+    salt = raw[15 : 15 + _SALT_LEN]
+    ciphertext = raw[header_len:]
+
+    key = _derive_key_argon2id(
+        password=password,
+        salt=salt,
+        memory_cost=memory_cost,
+        time_cost=time_cost,
+        parallelism=parallelism,
+    )
+    return key, ciphertext
+
+
+def _derive_key_legacy_pbkdf2(raw: bytes, *, password: str) -> tuple[bytes, bytes]:
+    """Parse a legacy PBKDF2 wallet file and return ``(key, ciphertext)``."""
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+
+    if len(raw) < _SALT_LEN:
+        raise ValueError("Wallet file is truncated (legacy salt missing).")
+
+    salt = raw[:_SALT_LEN]
+    ciphertext = raw[_SALT_LEN:]
+
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=_KEY_LEN,
+        salt=salt,
+        iterations=_LEGACY_PBKDF2_ITERATIONS,
+    )
+    return kdf.derive(password.encode()), ciphertext

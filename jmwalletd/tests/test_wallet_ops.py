@@ -81,6 +81,113 @@ class TestWalletFileIO:
         content = wallet_path.read_bytes()
         assert len(content) > 16  # At least the salt
 
+    def test_save_uses_argon2id_format(self, tmp_path: Path) -> None:
+        """New wallet files start with the ``JMNG`` magic + Argon2id header."""
+        wallet_path = tmp_path / "argon.jmdat"
+        _save_wallet_file(
+            wallet_path=wallet_path,
+            mnemonic="abandon " * 11 + "about",
+            password="pw",
+            wallet_type="sw",
+        )
+
+        content = wallet_path.read_bytes()
+        # Magic + version(1) + kdf_id(1) + m_cost(4) + t_cost(4) + p_cost(1) + salt(16)
+        assert content[:4] == b"JMNG"
+        assert content[4] == 1  # format version
+        assert content[5] == 1  # kdf_id = Argon2id
+        # m_cost == 19_456 (KiB)
+        assert int.from_bytes(content[6:10], "big") == 19_456
+        assert int.from_bytes(content[10:14], "big") == 2  # t_cost
+        assert content[14] == 1  # parallelism
+
+    def test_load_legacy_pbkdf2_file(self, tmp_path: Path) -> None:
+        """Wallet files written with the old PBKDF2 format still load (back-compat)."""
+        import base64
+        import json
+        import os
+
+        from cryptography.fernet import Fernet
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+
+        wallet_path = tmp_path / "legacy.jmdat"
+        password = "legacy-password"
+        mnemonic = "abandon " * 11 + "about"
+
+        # Reproduce the pre-Argon2id on-disk format: raw 16-byte salt followed
+        # by a Fernet token whose key is PBKDF2-SHA256(password, 600k iters).
+        salt = os.urandom(16)
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=salt,
+            iterations=600_000,
+        )
+        key = base64.urlsafe_b64encode(kdf.derive(password.encode()))
+        token = Fernet(key).encrypt(
+            json.dumps(
+                {"mnemonic": mnemonic, "wallet_type": "sw", "creation_height": 820_000}
+            ).encode()
+        )
+        wallet_path.write_bytes(salt + token)
+
+        loaded_mnemonic, creation_height = _load_wallet_file(
+            wallet_path=wallet_path, password=password
+        )
+        assert loaded_mnemonic == mnemonic
+        assert creation_height == 820_000
+
+    def test_load_rejects_unknown_version(self, tmp_path: Path) -> None:
+        """A JMNG-prefixed file with an unknown version byte is rejected cleanly."""
+        wallet_path = tmp_path / "future.jmdat"
+        # Magic + version 99 + kdf_id 1 + m(4) + t(4) + p(1) + salt(16) + dummy
+        wallet_path.write_bytes(
+            b"JMNG"
+            + bytes([99, 1])
+            + (19_456).to_bytes(4, "big")
+            + (2).to_bytes(4, "big")
+            + bytes([1])
+            + b"\x00" * 16
+            + b"junk"
+        )
+        with pytest.raises(ValueError, match="version"):
+            _load_wallet_file(wallet_path=wallet_path, password="anything")
+
+    def test_load_rejects_unknown_kdf(self, tmp_path: Path) -> None:
+        """A JMNG-prefixed file with an unknown KDF id is rejected cleanly."""
+        wallet_path = tmp_path / "unknown_kdf.jmdat"
+        wallet_path.write_bytes(
+            b"JMNG"
+            + bytes([1, 99])  # version 1, kdf 99
+            + (19_456).to_bytes(4, "big")
+            + (2).to_bytes(4, "big")
+            + bytes([1])
+            + b"\x00" * 16
+            + b"junk"
+        )
+        with pytest.raises(ValueError, match="KDF"):
+            _load_wallet_file(wallet_path=wallet_path, password="anything")
+
+    def test_load_rejects_truncated_argon2id_header(self, tmp_path: Path) -> None:
+        """A JMNG-prefixed file shorter than the full header is rejected."""
+        wallet_path = tmp_path / "truncated.jmdat"
+        wallet_path.write_bytes(b"JMNG" + bytes([1, 1]) + b"\x00" * 3)
+        with pytest.raises(ValueError, match="truncated"):
+            _load_wallet_file(wallet_path=wallet_path, password="anything")
+
+    def test_load_argon2id_wrong_password(self, tmp_path: Path) -> None:
+        """Argon2id files also raise ValueError on a bad password."""
+        wallet_path = tmp_path / "argon_wrong_pw.jmdat"
+        _save_wallet_file(
+            wallet_path=wallet_path,
+            mnemonic="test mnemonic",
+            password="correct",
+            wallet_type="sw",
+        )
+        with pytest.raises(ValueError, match="[Ww]rong|[Ii]nvalid|[Dd]ecrypt"):
+            _load_wallet_file(wallet_path=wallet_path, password="wrong")
+
 
 class TestCreateWallet:
     @patch("jmwalletd.wallet_ops._get_network", return_value="mainnet")
