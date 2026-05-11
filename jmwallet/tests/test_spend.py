@@ -63,7 +63,7 @@ class TestDecodeBech32Scriptpubkey:
 
     def test_p2wpkh_regtest(self) -> None:
         """Decode a standard P2WPKH regtest address."""
-        script = _decode_bech32_scriptpubkey(REGTEST_P2WPKH_ADDR)
+        script = _decode_bech32_scriptpubkey(REGTEST_P2WPKH_ADDR, network="regtest")
         # P2WPKH: OP_0 PUSH20 <20-byte-hash>
         assert script[0:2] == bytes([0x00, 0x14])
         assert len(script) == 22
@@ -71,16 +71,74 @@ class TestDecodeBech32Scriptpubkey:
     def test_mainnet_p2wpkh(self) -> None:
         """Decode a mainnet P2WPKH address."""
         addr = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
-        script = _decode_bech32_scriptpubkey(addr)
+        script = _decode_bech32_scriptpubkey(addr, network="mainnet")
         assert script[0:2] == bytes([0x00, 0x14])
         assert len(script) == 22
 
     def test_signet_p2wpkh(self) -> None:
         """Decode a signet (tb1) P2WPKH address."""
         addr = "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx"
-        script = _decode_bech32_scriptpubkey(addr)
+        script = _decode_bech32_scriptpubkey(addr, network="signet")
         assert script[0:2] == bytes([0x00, 0x14])
         assert len(script) == 22
+
+    def test_mainnet_p2tr_taproot(self) -> None:
+        """Decode a mainnet P2TR (bech32m) address."""
+        # BIP350 test vector.
+        addr = "bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqzk5jj0"
+        script = _decode_bech32_scriptpubkey(addr, network="mainnet")
+        # P2TR: OP_1 PUSH32 <32-byte-x-only-pubkey>
+        assert script[0:2] == bytes([0x51, 0x20])
+        assert len(script) == 34
+
+    def test_rejects_bad_checksum(self) -> None:
+        """A single-character substitution in the checksum must be rejected."""
+        # Flip the last character of a valid mainnet P2WPKH address.
+        valid = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
+        # 'q' is in the bech32 charset; the surrounding chars remain valid
+        # bech32 chars so the only difference is checksum failure.
+        bad = valid[:-1] + "q"
+        assert bad != valid
+        with pytest.raises(ValueError):
+            _decode_bech32_scriptpubkey(bad, network="mainnet")
+
+    def test_rejects_bad_checksum_one_char_typo(self) -> None:
+        """A single-char typo in the data part must fail the checksum."""
+        valid = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
+        # Flip one data character (not in the HRP).
+        bad = valid[:5] + "p" + valid[6:]
+        assert bad != valid
+        with pytest.raises(ValueError):
+            _decode_bech32_scriptpubkey(bad, network="mainnet")
+
+    def test_rejects_wrong_network_mainnet_on_regtest(self) -> None:
+        """Mainnet address pasted into a regtest wallet must be rejected."""
+        mainnet_addr = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
+        with pytest.raises(ValueError):
+            _decode_bech32_scriptpubkey(mainnet_addr, network="regtest")
+
+    def test_rejects_wrong_network_regtest_on_mainnet(self) -> None:
+        """Regtest address pasted into a mainnet wallet must be rejected."""
+        with pytest.raises(ValueError):
+            _decode_bech32_scriptpubkey(REGTEST_P2WPKH_ADDR, network="mainnet")
+
+    def test_accepts_matching_network(self) -> None:
+        """Network match passes through to validated decoding."""
+        script = _decode_bech32_scriptpubkey(REGTEST_P2WPKH_ADDR, network="regtest")
+        assert script[0:2] == bytes([0x00, 0x14])
+
+    def test_rejects_unknown_network(self) -> None:
+        """An unsupported network name must error rather than silently pass."""
+        with pytest.raises(ValueError, match="Unsupported network"):
+            _decode_bech32_scriptpubkey(REGTEST_P2WPKH_ADDR, network="liquid")
+
+    def test_rejects_p2tr_with_bech32_not_bech32m(self) -> None:
+        """A v1 (taproot) address truncated or with wrong checksum must fail."""
+        # Drop a single char from a valid P2TR address. Result will fail
+        # either the bech32m checksum or the witness-program length check.
+        valid_p2tr = "bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqzk5jj0"
+        with pytest.raises(ValueError):
+            _decode_bech32_scriptpubkey(valid_p2tr[:-1], network="mainnet")
 
 
 # ---------------------------------------------------------------------------
@@ -253,6 +311,7 @@ def _make_mock_key(pubkey_hex: str = "02" + "ab" * 32) -> MagicMock:
 def _make_mock_wallet(utxos: list[UTXOInfo], change_addr: str = REGTEST_P2WPKH_ADDR) -> MagicMock:
     """Create a mock WalletService for direct_send tests."""
     wallet = MagicMock()
+    wallet.network = "regtest"
     wallet.get_utxos = AsyncMock(return_value=utxos)
     # Raise ValueError so direct_send falls back to get_utxos for coin selection
     wallet.select_utxos = MagicMock(side_effect=ValueError("no coin selection in tests"))
@@ -379,6 +438,48 @@ class TestDirectSend:
                 destination="1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa",
                 fee_rate=1.0,
             )
+
+    @pytest.mark.anyio
+    async def test_bad_checksum_address_raises(self) -> None:
+        """Address with a flipped checksum char must be rejected before broadcast."""
+        wallet = _make_mock_wallet([_make_utxo(value=200_000)])
+        backend = _make_mock_backend()
+
+        # Flip the last char of a valid regtest address. Result is still
+        # entirely in the bech32 charset, only the checksum changes.
+        bad = REGTEST_P2WPKH_ADDR[:-1] + ("p" if REGTEST_P2WPKH_ADDR[-1] != "p" else "q")
+        assert bad != REGTEST_P2WPKH_ADDR
+
+        with pytest.raises(ValueError):
+            await direct_send(
+                wallet=wallet,
+                backend=backend,
+                mixdepth=0,
+                amount_sats=50_000,
+                destination=bad,
+                fee_rate=1.0,
+            )
+        # And nothing got broadcast.
+        backend.broadcast_transaction.assert_not_awaited()
+
+    @pytest.mark.anyio
+    async def test_wrong_network_address_raises(self) -> None:
+        """Mainnet address on a regtest wallet must be rejected before broadcast."""
+        wallet = _make_mock_wallet([_make_utxo(value=200_000)])
+        backend = _make_mock_backend()
+
+        mainnet_addr = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
+
+        with pytest.raises(ValueError):
+            await direct_send(
+                wallet=wallet,
+                backend=backend,
+                mixdepth=0,
+                amount_sats=50_000,
+                destination=mainnet_addr,
+                fee_rate=1.0,
+            )
+        backend.broadcast_transaction.assert_not_awaited()
 
     @pytest.mark.anyio
     async def test_uses_backend_fee_estimate_when_no_rate(self) -> None:

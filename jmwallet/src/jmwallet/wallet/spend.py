@@ -11,7 +11,6 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from bech32 import convertbits
 from jmcore.bitcoin import estimate_vsize, get_address_type
 from loguru import logger
 
@@ -50,29 +49,55 @@ class DirectSendResult:
     outputs: list[dict[str, object]] = field(default_factory=list)
 
 
-def _decode_bech32_scriptpubkey(address: str) -> bytes:
-    """Decode a bech32/bech32m address into its scriptPubKey bytes."""
-    hrp = address[: address.index("1")]
-    data_part = address[len(hrp) + 1 :]
-    charset = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
-    data_values = [charset.index(c) for c in data_part]
-    # Remove checksum (last 6 characters)
-    witness_data = data_values[:-6]
-    witness_version = witness_data[0]
-    converted = convertbits(bytes(witness_data[1:]), 5, 8, False)
-    if converted is None:
-        raise ValueError(f"Invalid bech32 witness program in address: {address}")
-    witness_program = bytes(converted)
+# Map of wallet networks to python-bitcointx chain parameter names. Used so
+# CCoinAddress can both verify the bech32/base58 checksum AND reject
+# addresses from a different network than the wallet is configured for.
+_NETWORK_CHAIN_PARAMS: dict[str, str] = {
+    "mainnet": "bitcoin",
+    "testnet": "bitcoin/testnet",
+    "signet": "bitcoin/signet",
+    "regtest": "bitcoin/regtest",
+}
 
-    if witness_version == 0 and len(witness_program) == 20:
-        return bytes([0x00, 0x14]) + witness_program
-    if witness_version == 0 and len(witness_program) == 32:
-        return bytes([0x00, 0x20]) + witness_program
-    if witness_version == 1 and len(witness_program) == 32:
-        return bytes([0x51, 0x20]) + witness_program
 
-    msg = f"Unsupported witness program: version={witness_version}, len={len(witness_program)}"
-    raise ValueError(msg)
+def _decode_bech32_scriptpubkey(address: str, *, network: str | None = None) -> bytes:
+    """Decode a Bitcoin address into its scriptPubKey bytes.
+
+    Delegates to ``python-bitcointx``'s :class:`CCoinAddress`, which
+    verifies the BIP173/BIP350 checksum (bech32 / bech32m), rejects
+    wrong-network addresses under the active :class:`ChainParams`, and
+    supports every standard address type (P2WPKH, P2WSH, P2TR, P2PKH,
+    P2SH).
+
+    Args:
+        address: Destination Bitcoin address as a string.
+        network: Wallet network. When provided, address parsing happens
+            inside :class:`bitcointx.ChainParams` for the matching chain
+            so a mainnet address is rejected on testnet (and vice versa).
+
+    Raises:
+        ValueError: If the address is malformed, has a bad checksum, or
+            does not belong to the requested network.
+    """
+    # Imported lazily to keep test-import cost low and to keep the
+    # bitcointx dependency optional for callers that never touch
+    # direct-send.
+    from bitcointx import ChainParams
+    from bitcointx.wallet import CCoinAddress, CCoinAddressError
+
+    chain = _NETWORK_CHAIN_PARAMS.get(network) if network is not None else None
+    if network is not None and chain is None:
+        msg = f"Unsupported network for address decoding: {network!r}"
+        raise ValueError(msg)
+
+    try:
+        if chain is not None:
+            with ChainParams(chain):
+                return bytes(CCoinAddress(address).to_scriptPubKey())
+        return bytes(CCoinAddress(address).to_scriptPubKey())
+    except CCoinAddressError as exc:
+        msg = f"Invalid destination address {address!r} (bad checksum, format, or wrong network)"
+        raise ValueError(msg) from exc
 
 
 def select_spendable_utxos(
@@ -296,6 +321,12 @@ async def direct_send(
         msg = "Only bech32 addresses are currently supported"
         raise ValueError(msg)
 
+    # Validate the destination address up front (checksum + HRP + network).
+    # We compute the scriptPubKey now so a malformed address fails fast,
+    # before any fee estimation or UTXO selection side effects.
+    network = getattr(wallet, "network", None)
+    dest_script = _decode_bech32_scriptpubkey(destination, network=network)
+
     # --- Fee rate resolution ---
     if fee_rate is None:
         fee_rate = await backend.estimate_fee(target_blocks=fee_target_blocks)
@@ -350,7 +381,7 @@ async def direct_send(
             fee, _vsize = estimate_fee(utxos, destination, fee_rate, has_change=False)
 
     # --- Destination scriptPubKey ---
-    dest_script = _decode_bech32_scriptpubkey(destination)
+    # (already validated and computed at the top of this function)
 
     # --- Change output ---
     change_script: bytes | None = None
