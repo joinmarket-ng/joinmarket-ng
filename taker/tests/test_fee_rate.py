@@ -23,6 +23,7 @@ def _make_taker(
     estimate_fee_return: float = 5.0,
     mempool_min_fee: float | None = None,
     tx_fee_factor: float = 1.0,
+    max_fee_rate_sat_vb: float = 1_000.0,
 ) -> Taker:
     """Create a Taker with mocked internals for _resolve_fee_rate testing.
 
@@ -35,6 +36,7 @@ def _make_taker(
     taker.config.fee_rate = fee_rate
     taker.config.fee_block_target = fee_block_target
     taker.config.tx_fee_factor = tx_fee_factor
+    taker.config.max_fee_rate_sat_vb = max_fee_rate_sat_vb
 
     taker.backend = MagicMock()
     taker.backend.can_estimate_fee = MagicMock(return_value=can_estimate_fee)
@@ -140,3 +142,58 @@ class TestResolveFeeRate:
         taker.backend.get_mempool_min_fee = AsyncMock(side_effect=Exception("unavailable"))
         rate = await taker._resolve_fee_rate()
         assert rate == 3.0
+
+
+# ---------------------------------------------------------------------------
+# Excessive-fee-rate cap
+# ---------------------------------------------------------------------------
+
+
+class TestResolveFeeRateCap:
+    """Tests for the wallet-level fee-rate safety cap on the taker path."""
+
+    @pytest.mark.asyncio
+    async def test_manual_fee_rate_above_cap_rejected(self) -> None:
+        from jmwallet.wallet.spend import ExcessiveFeeRateError
+
+        taker = _make_taker(fee_rate=5_000.0, max_fee_rate_sat_vb=1_000.0)
+        with pytest.raises(ExcessiveFeeRateError, match="exceeds safety cap"):
+            await taker._resolve_fee_rate()
+        # No randomized rate should have been computed.
+        assert taker._randomized_fee_rate is None
+
+    @pytest.mark.asyncio
+    async def test_estimated_fee_rate_above_cap_rejected(self) -> None:
+        """A backend that reports a wildly inflated estimate must not be used."""
+        from jmwallet.wallet.spend import ExcessiveFeeRateError
+
+        taker = _make_taker(
+            fee_block_target=6,
+            can_estimate_fee=True,
+            estimate_fee_return=50_000.0,
+            max_fee_rate_sat_vb=1_000.0,
+        )
+        with pytest.raises(ExcessiveFeeRateError, match="backend estimate"):
+            await taker._resolve_fee_rate()
+        assert taker._randomized_fee_rate is None
+
+    @pytest.mark.asyncio
+    async def test_default_estimation_above_cap_rejected(self) -> None:
+        """The default 3-block estimation path is also bounded."""
+        from jmwallet.wallet.spend import ExcessiveFeeRateError
+
+        taker = _make_taker(
+            can_estimate_fee=True,
+            estimate_fee_return=10_000.0,
+            max_fee_rate_sat_vb=1_000.0,
+        )
+        with pytest.raises(ExcessiveFeeRateError, match="backend estimate"):
+            await taker._resolve_fee_rate()
+        assert taker._randomized_fee_rate is None
+
+    @pytest.mark.asyncio
+    async def test_manual_fee_rate_at_cap_passes(self) -> None:
+        """The cap is inclusive: exactly the cap is acceptable."""
+        taker = _make_taker(fee_rate=1_000.0, max_fee_rate_sat_vb=1_000.0)
+        rate = await taker._resolve_fee_rate()
+        assert rate == 1_000.0

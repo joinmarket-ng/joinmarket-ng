@@ -176,6 +176,12 @@
 # Default fee estimation settings
 # default_fee_block_target = 3  # Block target for wallet transactions
 
+# Safety cap on the fee rate (sat/vB) used for any wallet transaction.
+# Both manual fee rates and backend fee estimates above this cap are rejected
+# to protect against runaway-fee bugs and malicious/misconfigured fee oracles.
+# Increase only if you have a deliberate need to pay fees above 1000 sat/vB.
+# max_fee_rate_sat_vb = 1000
+
 # Mnemonic file settings (optional defaults)
 # mnemonic_file = ""            # Path to mnemonic file
 # mnemonic_password = ""        # Password for encrypted mnemonic

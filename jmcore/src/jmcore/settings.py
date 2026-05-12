@@ -389,6 +389,17 @@ class WalletSettings(BaseModel):
         le=1008,
         description="Default block target for fee estimation in wallet transactions",
     )
+    max_fee_rate_sat_vb: float = Field(
+        default=1_000.0,
+        gt=0.0,
+        description=(
+            "Safety cap on the fee rate (sat/vB) used for any wallet-driven "
+            "transaction (direct send and CoinJoin). Manual rates above this "
+            "value, and backend fee estimates above this value, are rejected "
+            "to prevent runaway-fee bugs and malicious or misconfigured fee "
+            "oracles from draining the wallet."
+        ),
+    )
     mnemonic_file: str | None = Field(
         default=None,
         description="Default path to mnemonic file",

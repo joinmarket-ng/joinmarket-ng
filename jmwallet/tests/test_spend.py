@@ -12,9 +12,11 @@ from jmwallet.wallet.models import UTXOInfo
 from jmwallet.wallet.spend import (
     DUST_THRESHOLD,
     DirectSendResult,
+    ExcessiveFeeRateError,
     _build_unsigned_tx,
     _decode_bech32_scriptpubkey,
     direct_send,
+    enforce_fee_rate_cap,
     estimate_fee,
     select_spendable_utxos,
 )
@@ -559,3 +561,131 @@ class TestDirectSend:
         )
         assert result.num_inputs == 2
         assert result.send_amount == 80_000
+
+
+# ---------------------------------------------------------------------------
+# enforce_fee_rate_cap + direct_send fee-rate cap
+# ---------------------------------------------------------------------------
+
+
+class TestEnforceFeeRateCap:
+    """Direct unit tests for enforce_fee_rate_cap."""
+
+    def test_below_cap_passes(self) -> None:
+        enforce_fee_rate_cap(10.0, 1_000.0, source="manual")
+
+    def test_at_cap_passes(self) -> None:
+        # The cap is inclusive: exactly the cap is still acceptable.
+        enforce_fee_rate_cap(1_000.0, 1_000.0, source="manual")
+
+    def test_above_cap_raises(self) -> None:
+        with pytest.raises(ExcessiveFeeRateError, match="exceeds safety cap"):
+            enforce_fee_rate_cap(1_000.01, 1_000.0, source="manual")
+
+    def test_zero_raises(self) -> None:
+        with pytest.raises(ExcessiveFeeRateError, match="finite positive"):
+            enforce_fee_rate_cap(0.0, 1_000.0, source="manual")
+
+    def test_negative_raises(self) -> None:
+        with pytest.raises(ExcessiveFeeRateError, match="finite positive"):
+            enforce_fee_rate_cap(-1.0, 1_000.0, source="manual")
+
+    def test_nan_raises(self) -> None:
+        with pytest.raises(ExcessiveFeeRateError, match="finite positive"):
+            enforce_fee_rate_cap(math.nan, 1_000.0, source="manual")
+
+    def test_inf_raises(self) -> None:
+        with pytest.raises(ExcessiveFeeRateError, match="finite positive"):
+            enforce_fee_rate_cap(math.inf, 1_000.0, source="manual")
+
+    def test_subclasses_value_error(self) -> None:
+        # Required so existing ``except ValueError`` handlers in CLI / HTTP
+        # code keep refusing the transaction without needing to know about
+        # the new exception type.
+        assert issubclass(ExcessiveFeeRateError, ValueError)
+
+    def test_source_label_in_message(self) -> None:
+        with pytest.raises(ExcessiveFeeRateError, match="backend estimate fee rate"):
+            enforce_fee_rate_cap(2_000.0, 1_000.0, source="backend estimate")
+
+
+class TestDirectSendFeeRateCap:
+    """Integration tests asserting direct_send refuses excessive fee rates
+    *before* signing or broadcasting."""
+
+    @pytest.mark.anyio
+    async def test_manual_fee_rate_above_cap_rejected_before_broadcast(self) -> None:
+        utxos = [_make_utxo(value=1_000_000)]
+        wallet = _make_mock_wallet(utxos)
+        backend = _make_mock_backend()
+
+        with pytest.raises(ExcessiveFeeRateError, match="exceeds safety cap"):
+            await direct_send(
+                wallet=wallet,
+                backend=backend,
+                mixdepth=0,
+                amount_sats=50_000,
+                destination=REGTEST_P2WPKH_ADDR,
+                fee_rate=1_500.0,
+                max_fee_rate_sat_vb=1_000.0,
+            )
+        # The transaction must NOT have been broadcast.
+        backend.broadcast_transaction.assert_not_awaited()
+        # And no UTXO selection / signing should have happened either.
+        wallet.get_utxos.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_estimated_fee_rate_above_cap_rejected_before_broadcast(self) -> None:
+        utxos = [_make_utxo(value=1_000_000)]
+        wallet = _make_mock_wallet(utxos)
+        # Backend reports a wildly inflated estimate (e.g. compromised / buggy).
+        backend = _make_mock_backend(fee_rate=50_000.0)
+
+        with pytest.raises(ExcessiveFeeRateError, match="backend estimate"):
+            await direct_send(
+                wallet=wallet,
+                backend=backend,
+                mixdepth=0,
+                amount_sats=50_000,
+                destination=REGTEST_P2WPKH_ADDR,
+                fee_rate=None,  # force estimation path
+                max_fee_rate_sat_vb=1_000.0,
+            )
+        backend.broadcast_transaction.assert_not_awaited()
+
+    @pytest.mark.anyio
+    async def test_estimated_fee_rate_below_cap_succeeds(self) -> None:
+        utxos = [_make_utxo(value=1_000_000)]
+        wallet = _make_mock_wallet(utxos)
+        backend = _make_mock_backend(fee_rate=5.0)
+
+        result = await direct_send(
+            wallet=wallet,
+            backend=backend,
+            mixdepth=0,
+            amount_sats=50_000,
+            destination=REGTEST_P2WPKH_ADDR,
+            fee_rate=None,
+            max_fee_rate_sat_vb=1_000.0,
+        )
+        assert result.fee_rate == 5.0
+        backend.broadcast_transaction.assert_called_once()
+
+    @pytest.mark.anyio
+    async def test_caller_can_lower_cap(self) -> None:
+        """Callers can tighten the cap below the default."""
+        utxos = [_make_utxo(value=1_000_000)]
+        wallet = _make_mock_wallet(utxos)
+        backend = _make_mock_backend()
+
+        with pytest.raises(ExcessiveFeeRateError, match="exceeds safety cap"):
+            await direct_send(
+                wallet=wallet,
+                backend=backend,
+                mixdepth=0,
+                amount_sats=50_000,
+                destination=REGTEST_P2WPKH_ADDR,
+                fee_rate=20.0,
+                max_fee_rate_sat_vb=10.0,
+            )
+        backend.broadcast_transaction.assert_not_awaited()

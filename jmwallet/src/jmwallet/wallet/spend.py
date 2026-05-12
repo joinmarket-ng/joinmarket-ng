@@ -32,6 +32,64 @@ if TYPE_CHECKING:
 
 DUST_THRESHOLD = 546
 
+# Default safety cap on fee rate (sat/vB) used by direct-send transactions.
+# This is the fallback when callers don't override via the
+# ``max_fee_rate_sat_vb`` parameter (typically wired from
+# ``WalletSettings.max_fee_rate_sat_vb``).  It protects against:
+#
+# * Backends that report wildly inflated fee estimates (RPC bug, hijacked
+#   fee oracle, hostile rogue node).
+# * UI / scripting bugs that pass a fee rate in the wrong unit (BTC/kvB
+#   instead of sat/vB), or with a misplaced decimal point.
+# * Malicious upper-layer code attempting to grief a wallet by burning the
+#   entire balance to fees.
+#
+# Above this cap a transaction is refused with :class:`ExcessiveFeeRateError`
+# rather than silently broadcasting.
+DEFAULT_MAX_FEE_RATE_SAT_VB: float = 1_000.0
+
+
+class ExcessiveFeeRateError(ValueError):
+    """Raised when a resolved fee rate exceeds the configured safety cap.
+
+    Subclasses :class:`ValueError` so existing ``except ValueError`` handlers
+    in the CLI and HTTP layers continue to behave correctly (refuse the
+    transaction with a user-visible error) without needing to know about the
+    new exception type.
+    """
+
+
+def enforce_fee_rate_cap(fee_rate: float, max_fee_rate_sat_vb: float, *, source: str) -> None:
+    """Reject *fee_rate* if it exceeds the configured cap.
+
+    Parameters
+    ----------
+    fee_rate:
+        The candidate fee rate in sat/vB.
+    max_fee_rate_sat_vb:
+        The safety cap.  Must be positive.
+    source:
+        Human-readable description of where the rate came from
+        (``"manual"``, ``"backend estimate"``, ...).  Included verbatim in
+        the error message to make misconfiguration easy to debug.
+
+    Raises
+    ------
+    ExcessiveFeeRateError
+        If ``fee_rate`` exceeds ``max_fee_rate_sat_vb``.
+    """
+    if not math.isfinite(fee_rate) or fee_rate <= 0:
+        msg = f"{source} fee rate must be a finite positive number, got {fee_rate!r}"
+        raise ExcessiveFeeRateError(msg)
+    if fee_rate > max_fee_rate_sat_vb:
+        msg = (
+            f"{source} fee rate {fee_rate:.2f} sat/vB exceeds safety cap "
+            f"{max_fee_rate_sat_vb:.2f} sat/vB. "
+            "Raise the cap explicitly (settings.wallet.max_fee_rate_sat_vb) "
+            "only if you really intend to pay this much."
+        )
+        raise ExcessiveFeeRateError(msg)
+
 
 @dataclass
 class DirectSendResult:
@@ -292,6 +350,7 @@ async def direct_send(
     destination: str,
     fee_rate: float | None = None,
     fee_target_blocks: int = 6,
+    max_fee_rate_sat_vb: float = DEFAULT_MAX_FEE_RATE_SAT_VB,
 ) -> DirectSendResult:
     """Build, sign, and broadcast a direct (non-CoinJoin) transaction.
 
@@ -312,6 +371,12 @@ async def direct_send(
         from the backend using *fee_target_blocks*.
     fee_target_blocks:
         Number of blocks for fee estimation (ignored when *fee_rate* is set).
+    max_fee_rate_sat_vb:
+        Safety cap on the fee rate (sat/vB).  The resolved rate (manual or
+        from backend estimation) is rejected with
+        :class:`ExcessiveFeeRateError` when it exceeds this value.  Defaults
+        to :data:`DEFAULT_MAX_FEE_RATE_SAT_VB`; daemon and CLI callers wire
+        this from ``settings.wallet.max_fee_rate_sat_vb``.
 
     Returns
     -------
@@ -328,9 +393,12 @@ async def direct_send(
     dest_script = _decode_bech32_scriptpubkey(destination, network=network)
 
     # --- Fee rate resolution ---
-    if fee_rate is None:
+    if fee_rate is not None:
+        enforce_fee_rate_cap(fee_rate, max_fee_rate_sat_vb, source="manual")
+    else:
         fee_rate = await backend.estimate_fee(target_blocks=fee_target_blocks)
         logger.debug("Estimated fee rate: {:.2f} sat/vB ({} blocks)", fee_rate, fee_target_blocks)
+        enforce_fee_rate_cap(fee_rate, max_fee_rate_sat_vb, source="backend estimate")
 
     # --- UTXO selection ---
     utxos: list[UTXOInfo]

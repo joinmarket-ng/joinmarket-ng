@@ -11,7 +11,11 @@ from typing import TYPE_CHECKING
 
 from loguru import logger
 
-from jmwallet.wallet.spend import DirectSendResult, direct_send
+from jmwallet.wallet.spend import (
+    DEFAULT_MAX_FEE_RATE_SAT_VB,
+    DirectSendResult,
+    direct_send,
+)
 
 if TYPE_CHECKING:
     from jmwallet.wallet.service import WalletService
@@ -23,10 +27,13 @@ async def do_direct_send(
     mixdepth: int,
     amount_sats: int,
     destination: str,
+    max_fee_rate_sat_vb: float = DEFAULT_MAX_FEE_RATE_SAT_VB,
 ) -> DirectSendResult:
     """Build and broadcast a direct (non-coinjoin) transaction.
 
     Delegates entirely to :func:`jmwallet.wallet.spend.direct_send`.
+    ``max_fee_rate_sat_vb`` is forwarded so the daemon can apply the
+    operator's configured cap (``settings.wallet.max_fee_rate_sat_vb``).
     """
     from jmcore.paths import get_default_data_dir
     from jmwalletd._backend import get_backend
@@ -38,10 +45,11 @@ async def do_direct_send(
     await wallet_service.sync()
 
     logger.info(
-        "Direct send: {} sats from mixdepth {} to {}",
+        "Direct send: {} sats from mixdepth {} to {} (max fee rate {:.2f} sat/vB)",
         amount_sats or "sweep",
         mixdepth,
         destination,
+        max_fee_rate_sat_vb,
     )
 
     return await direct_send(
@@ -50,4 +58,5 @@ async def do_direct_send(
         mixdepth=mixdepth,
         amount_sats=amount_sats,
         destination=destination,
+        max_fee_rate_sat_vb=max_fee_rate_sat_vb,
     )

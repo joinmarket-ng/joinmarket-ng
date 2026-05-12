@@ -83,6 +83,7 @@ class TestBuildTakerConfig:
         settings.wallet.background_full_rescan = False
         settings.wallet.scan_lookback_blocks = 1000
         settings.wallet.default_fee_block_target = 3  # Has a default value
+        settings.wallet.max_fee_rate_sat_vb = 1_000.0  # fee-rate cap
 
         return settings
 

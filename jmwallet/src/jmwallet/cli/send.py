@@ -19,8 +19,13 @@ from jmcore.cli_common import (
 from loguru import logger
 
 from jmwallet.cli import app
-
-MAX_MANUAL_FEE_RATE_SAT_VB = 1_000.0
+from jmwallet.wallet.spend import (
+    DEFAULT_MAX_FEE_RATE_SAT_VB as MAX_MANUAL_FEE_RATE_SAT_VB,
+)
+from jmwallet.wallet.spend import (
+    ExcessiveFeeRateError,
+    enforce_fee_rate_cap,
+)
 
 
 @app.command()
@@ -93,14 +98,20 @@ def send(
         logger.error("Cannot specify both --fee-rate and --block-target")
         raise typer.Exit(1)
 
+    # Effective cap comes from settings (with hard-coded fallback). The same
+    # cap is also enforced after backend fee estimation in _send_transaction
+    # below, so the estimated path is protected too, not just the manual-rate
+    # CLI path.
+    max_fee_rate = settings.wallet.max_fee_rate_sat_vb
+
     if fee_rate is not None:
         if not math.isfinite(fee_rate) or fee_rate <= 0:
             logger.error("--fee-rate must be a finite number greater than 0")
             raise typer.Exit(1)
-        if fee_rate > MAX_MANUAL_FEE_RATE_SAT_VB:
+        if fee_rate > max_fee_rate:
             logger.error(
                 f"--fee-rate {fee_rate:.2f} sat/vB exceeds safety maximum "
-                f"({MAX_MANUAL_FEE_RATE_SAT_VB:.0f} sat/vB)"
+                f"({max_fee_rate:.0f} sat/vB)"
             )
             raise typer.Exit(1)
 
@@ -147,6 +158,7 @@ def send(
             select_utxos,
             resolved_bip39_passphrase,
             creation_height=resolved_creation_height,
+            max_fee_rate_sat_vb=max_fee_rate,
         )
     )
 
@@ -165,6 +177,7 @@ async def _send_transaction(
     bip39_passphrase: str = "",
     *,
     creation_height: int | None = None,
+    max_fee_rate_sat_vb: float = MAX_MANUAL_FEE_RATE_SAT_VB,
 ) -> None:
     """Send transaction implementation."""
     from jmwallet.backends.descriptor_wallet import (
@@ -250,6 +263,13 @@ async def _send_transaction(
         # Use backend fee estimation
         target = block_target if block_target is not None else 3
         resolved_fee_rate = await backend.estimate_fee(target)
+        # Reject estimates that exceed the safety cap *before* clamping to
+        # mempool min, so a pathological backend cannot drain the wallet.
+        try:
+            enforce_fee_rate_cap(resolved_fee_rate, max_fee_rate_sat_vb, source="backend estimate")
+        except ExcessiveFeeRateError as exc:
+            logger.error(str(exc))
+            raise typer.Exit(1) from exc
         # Check against mempool min fee
         if mempool_min_fee is not None and resolved_fee_rate < mempool_min_fee:
             logger.info(

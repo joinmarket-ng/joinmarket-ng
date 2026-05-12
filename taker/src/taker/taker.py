@@ -44,6 +44,7 @@ from jmwallet.wallet.signing import (
     sign_p2wpkh_input,
     verify_p2wpkh_signature,
 )
+from jmwallet.wallet.spend import enforce_fee_rate_cap
 from loguru import logger
 
 from taker.config import BroadcastPolicy, Schedule, TakerConfig, resolve_counterparty_count
@@ -2393,6 +2394,7 @@ class Taker(TakerMonitoringMixin):
                     f"{mempool_min_fee:.2f} sat/vB, using mempool min"
                 )
                 self._fee_rate = mempool_min_fee
+            enforce_fee_rate_cap(self._fee_rate, self.config.max_fee_rate_sat_vb, source="manual")
             logger.info(f"Using manual fee rate: {self._fee_rate:.2f} sat/vB")
             self._apply_fee_randomization()
             return self._fee_rate
@@ -2413,6 +2415,9 @@ class Taker(TakerMonitoringMixin):
                     f"{mempool_min_fee:.2f} sat/vB, using mempool min"
                 )
                 self._fee_rate = mempool_min_fee
+            enforce_fee_rate_cap(
+                self._fee_rate, self.config.max_fee_rate_sat_vb, source="backend estimate"
+            )
             logger.info(
                 f"Fee estimation for {self.config.fee_block_target} blocks: "
                 f"{self._fee_rate:.2f} sat/vB"
@@ -2431,6 +2436,9 @@ class Taker(TakerMonitoringMixin):
                     f"{mempool_min_fee:.2f} sat/vB, using mempool min"
                 )
                 self._fee_rate = mempool_min_fee
+            enforce_fee_rate_cap(
+                self._fee_rate, self.config.max_fee_rate_sat_vb, source="backend estimate"
+            )
             logger.info(
                 f"Fee estimation for {default_target} blocks (default): {self._fee_rate:.2f} sat/vB"
             )

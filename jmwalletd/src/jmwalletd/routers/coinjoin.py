@@ -61,6 +61,7 @@ async def direct_send(
             mixdepth=body.mixdepth,
             amount_sats=body.amount_sats,
             destination=body.destination,
+            max_fee_rate_sat_vb=get_settings().wallet.max_fee_rate_sat_vb,
         )
     except ValueError as exc:
         raise InvalidRequestFormat(str(exc)) from exc

@@ -126,6 +126,16 @@ class TakerConfig(WalletConfig):
         description="Target blocks for fee estimation (mutually exclusive with fee_rate). "
         "Defaults to 3 when connected to full node.",
     )
+    max_fee_rate_sat_vb: float = Field(
+        default=1_000.0,
+        gt=0.0,
+        description=(
+            "Safety cap on the resolved fee rate (sat/vB) for the CoinJoin "
+            "transaction. Manual rates and backend estimates above this cap "
+            "are rejected before any randomization, which protects against "
+            "runaway-fee bugs and malicious fee oracles."
+        ),
+    )
     bondless_makers_allowance: float = Field(
         default=0.2,
         ge=0.0,
