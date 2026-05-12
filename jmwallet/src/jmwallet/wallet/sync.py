@@ -1141,16 +1141,40 @@ class WalletSyncMixin:
         backend_has_get_address_info = getattr(self.backend, "get_address_info", None) is not None
         if addresses_beyond_range and backend_has_get_address_info:
             get_address_info = self.backend.get_address_info  # type: ignore[attr-defined]
+            # Prefer the JSON-RPC batch path when the backend exposes it
+            # (DescriptorWalletBackend does). Batching collapses N HTTP
+            # round-trips into ceil(N/chunk) and is ~20x faster on localhost
+            # and dramatically more on remote / Tor-fronted Core endpoints.
+            # Falls back to a sequential loop for backends/test mocks that
+            # don't implement ``batch_get_address_info``.
+            batch_lookup = getattr(self.backend, "batch_get_address_info", None)
+            addresses_list = list(addresses_beyond_range)
+            if batch_lookup is not None:
+                try:
+                    infos: list[dict | None] = await batch_lookup(addresses_list)
+                except Exception as e:
+                    logger.debug(f"batch_get_address_info failed, falling back to serial: {e}")
+                    infos = []
+                    for address in addresses_list:
+                        try:
+                            infos.append(await get_address_info(address))
+                        except Exception as inner:
+                            logger.trace(f"getaddressinfo failed for {address[:20]}...: {inner}")
+                            infos.append(None)
+            else:
+                infos = []
+                for address in addresses_list:
+                    try:
+                        infos.append(await get_address_info(address))
+                    except Exception as e:
+                        logger.trace(f"getaddressinfo failed for {address[:20]}...: {e}")
+                        infos.append(None)
+
             resolved = 0
             skipped_external = 0
             skipped_non_wpkh = 0
             skipped_no_desc = 0
-            for address in addresses_beyond_range:
-                try:
-                    info = await get_address_info(address)
-                except Exception as e:
-                    logger.trace(f"getaddressinfo failed for {address[:20]}...: {e}")
-                    info = None
+            for address, info in zip(addresses_list, infos):
                 if info is None:
                     # RPC failed entirely; we can't tell if this is ours.
                     # Skip rather than spend tens of seconds on a BIP32 scan

@@ -1748,10 +1748,9 @@ class DescriptorWalletBackend(BlockchainBackend):
         """
         Return the subset of ``addresses`` that belong to this wallet.
 
-        Convenience batch wrapper around :meth:`is_address_mine`. Performs one
-        ``getaddressinfo`` RPC per address. Intended for short candidate lists
-        (e.g., a handful of addresses from history that missed the in-memory
-        cache); not optimized for scanning thousands of addresses.
+        Uses a single JSON-RPC batch under the hood, so this scales to
+        thousands of addresses with one HTTP round-trip per ``chunk_size``
+        block rather than one per address.
 
         Args:
             addresses: Iterable of Bitcoin addresses to check.
@@ -1759,11 +1758,15 @@ class DescriptorWalletBackend(BlockchainBackend):
         Returns:
             Set of addresses for which ``ismine`` is true.
         """
-        mine: set[str] = set()
-        for address in addresses:
-            if await self.is_address_mine(address):
-                mine.add(address)
-        return mine
+        if not addresses:
+            return set()
+        addr_list = list(addresses)
+        infos = await self.batch_get_address_info(addr_list)
+        return {
+            addr
+            for addr, info in zip(addr_list, infos)
+            if info is not None and info.get("ismine", False)
+        }
 
     async def get_descriptor_ranges(
         self, raise_on_error: bool = False
