@@ -606,9 +606,10 @@ maker_prepare_wallet() {
     wallets=$(list_wallets)
 
     if [ -z "$wallets" ]; then
-        whiptail --title " Error " \
-            --msgbox "No wallet files found in $DATA_DIR/wallets/\nCreate or import a wallet first (W -> NEW or IMP)." \
-            9 60
+        # whiptail --title " Error " \
+        #     --msgbox "No wallet files found in $DATA_DIR/wallets/\nCreate or import a wallet first (W -> NEW or IMP)." \
+        #     9 60
+        whiptail --title " Error " --msgbox "No wallet configured.\nSet up a wallet first (W -> NEW or SEL)." 9 50
         return 1
     fi
 
@@ -982,6 +983,8 @@ CHOICE=$(whiptail --title " JoinMarket-NG Menu" \
                               jm-wallet info --extended
                               pause
                           )
+                          ;;
+                      BACK|"")
                           break
                           ;;
                   esac
@@ -1320,13 +1323,12 @@ CHOICE=$(whiptail --title " JoinMarket-NG Menu" \
 
       MCHOICE=$(whiptail --title " Maker Bot Control " \
         --menu "\n$WALLET_INFO | Maker Bot: $MAKER_STATUS" \
-        18 64 7 \
+        18 64 6 \
         "START"   "Start Maker Bot" \
         "STOP"    "Stop Maker Bot" \
         "RESTART" "Restart Maker Bot" \
         "BONDS"   "Fidelity Bond Management" \
         "LOG"     "Follow Maker Logs (Ctrl+C to stop)" \
-        "STATUS"  "Show Service Status" \
         "BACK"    "Back to Main Menu" 3>&1 1>&2 2>&3)
 
       [ $? -ne 0 ] && break
@@ -1335,59 +1337,89 @@ CHOICE=$(whiptail --title " JoinMarket-NG Menu" \
           START)
               clear
               if ! maker_prepare_wallet; then
-                  echo "Maker start cancelled."
-              else
-                  maker_start
-                  sleep 2
-                  echo ""
-                  echo "Service status:"
-                  maker_status
+                  continue
               fi
+              echo "=== Starting Maker Bot ==="
+              echo ""
+              echo "Active wallet: $(basename "$CURRENT_WALLET")"
+              echo "Preparing wallet..."
+              echo ""
+              (
+                  ensure_wallet_password "$CURRENT_WALLET" || exit 1
+                  maker_start
+              )
+              if [ $? -ne 0 ]; then
+                  continue
+              fi
+              sleep 2
+              echo ""
+              echo "Service status:"
+              maker_status
               pause
               ;;
           STOP)
               clear
-              maker_stop
-              pause
+              if [ "$MAKER_STATUS" = "STOPPED" ]; then
+                  # Show info in TUI msgbox
+                  whiptail --title " Maker Bot " --msgbox "Maker Bot is not running." 8 40
+              else
+                  echo "=== Stopping Maker Bot ==="
+                  echo ""
+                  echo "Please wait..."
+                  echo ""
+                  STOP_OUT=$(maker_stop 2>&1)
+                  if [ $? -eq 0 ]; then
+                      # Show success in TUI msgbox
+                      whiptail --title " Maker Bot " --msgbox "Maker Bot stopped successfully." 8 40
+                  else
+                      # Show simple error in msgbox
+                      whiptail --title " Error " --msgbox "Failed to stop Maker Bot.\n\nCheck the terminal for details." 9 50
+
+                      # Show error details on terminal
+                      clear
+                      echo "=== Maker Stop Error Details ==="
+                      echo ""
+                      echo "The following error details may help diagnose the problem."
+                      echo ""
+                      printf '%s\n' "$STOP_OUT"
+                      echo ""
+                      pause
+                  fi
+              fi
               ;;
           RESTART)
               clear
               if ! maker_prepare_wallet; then
-                  echo "Maker restart cancelled."
+                  continue
+              fi
+              if [ "$MAKER_STATUS" = "RUNNING" ]; then
+                  echo "=== Restarting Maker Bot ==="
               else
-                  maker_stop
+                  echo "=== Starting Maker Bot ==="
+              fi
+              echo ""
+              echo "Active wallet: $(basename "$CURRENT_WALLET")"
+              echo "Preparing wallet..."
+              echo ""
+              (
+                  ensure_wallet_password "$CURRENT_WALLET" || exit 1
+                  if [ "$MAKER_STATUS" = "RUNNING" ]; then
+                      echo "Stopping Maker Bot..."
+                      echo "Please wait..."
+                      maker_stop 2>&1 || exit 1
+                  fi
                   maker_start
-                  sleep 2
-                  echo ""
-                  echo "Service status:"
-                  maker_status
-              fi
-              pause
-              ;;
-          LOG)
+              )
+              RESTART_RC=$?
               clear
-              echo "=== Maker Logs ==="
-              echo "Press Ctrl+C to stop following."
-              echo ""
-              LOG_FILE="$LOG_DIR/maker.log"
-              if [ -r "$LOG_FILE" ]; then
-                  tail -n 50 -f "$LOG_FILE"
-              else
-                  echo "No log file found at $LOG_FILE (maker may not have run yet)."
-                  echo "Trying journalctl..."
-                  maker_status
+              if [ $RESTART_RC -ne 0 ]; then
+                  continue
               fi
-              pause
-              ;;
-          STATUS)
-              clear
-              echo "=== Maker Service Status ==="
+              sleep 2
               echo ""
+              echo "Service status:"
               maker_status
               pause
-              ;;
-          BACK)
-              break
               ;;
           BONDS)
               # Fidelity bond submenu
@@ -1562,6 +1594,32 @@ CHOICE=$(whiptail --title " JoinMarket-NG Menu" \
                         ;;
                 esac
               done
+              ;;
+          LOG)
+              clear
+              LOG_FILE="$LOG_DIR/maker.log"
+              if [ -r "$LOG_FILE" ]; then
+                  echo "=== Maker Logs ==="
+                  echo "Press Ctrl+C to stop following."
+                  echo ""
+                  tail -n 50 -f "$LOG_FILE"
+                  pause
+              elif [ "$RASPIBLITZ" = "1" ]; then
+                  # Raspiblitz: try journalctl fallback (untested, needs maintainer review)
+                  echo "=== Maker Logs ==="
+                  echo "Press Ctrl+C to stop following."
+                  echo ""
+                  echo "No log file found at $LOG_FILE (maker may not have run yet)."
+                  echo "Trying journalctl..."
+                  maker_status
+                  pause
+              else
+                  # Standalone: no persistent logs
+                  whiptail --title " Maker Logs " --msgbox "No log file found.\n\nStart the Maker Bot first to generate logs." 9 50
+              fi
+              ;;
+          BACK)
+              break
               ;;
       esac
       done
