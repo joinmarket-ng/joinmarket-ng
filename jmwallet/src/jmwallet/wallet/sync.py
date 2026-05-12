@@ -1106,9 +1106,11 @@ class WalletSyncMixin:
         # ranged ``wpkh(xpub/0/*)`` / ``wpkh(xpub/1/*)`` descriptors per
         # mixdepth, and standalone ``addr(<bech32>)`` descriptors for our
         # fidelity bond addresses. Any of those addresses can show up in
-        # ``listaddressgroupings`` (used by get_addresses_with_history) once
-        # they have transaction history -- including external counterparties
-        # from CoinJoin co-spends, which are not ours.
+        # ``listreceivedbyaddress`` (used by get_addresses_with_history) once
+        # they have transaction history. That RPC is ismine-only by
+        # construction, so external counterparties from CoinJoin co-spends do
+        # not appear; defensive checks below keep the sync robust if a future
+        # backend ever leaks a non-ours address through.
         #
         # Naively running _find_address_path_extended on each missing address
         # is a ~50,000-derivation BIP32 scan per address and, for anything not

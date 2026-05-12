@@ -1812,190 +1812,127 @@ class TestAddressHistory:
 
     @pytest.mark.asyncio
     async def test_get_addresses_with_history(self) -> None:
-        """Test that get_addresses_with_history returns all addresses with transaction history."""
+        """``get_addresses_with_history`` returns every wallet-owned address that
+        has at least one receive, sourced from ``listreceivedbyaddress``."""
         backend = DescriptorWalletBackend(wallet_name="test_addr_history")
         backend._wallet_loaded = True
 
-        # listaddressgroupings returns addresses grouped by common ownership
-        mock_groupings = [
-            [["bc1qtest1", 0.0], ["bc1qtest2", 0.01]],  # Group 1
-            [["bc1qtest3", 0.0]],  # Group 2
-        ]
-
-        mock_transactions = [
+        # listreceivedbyaddress returns one row per owned address with receives
+        mock_lrba = [
             {
                 "address": "bc1qtest1",
-                "category": "receive",
                 "amount": 0.01,
-                "txid": "abc123",
+                "confirmations": 100,
+                "label": "",
+                "txids": ["abc123", "ghi789"],
             },
             {
                 "address": "bc1qtest2",
-                "category": "receive",
                 "amount": 0.02,
-                "txid": "def456",
-            },
-            {
-                "address": "bc1qtest1",  # Same address, second tx
-                "category": "send",
-                "amount": -0.01,
-                "txid": "ghi789",
+                "confirmations": 100,
+                "label": "",
+                "txids": ["def456"],
             },
             {
                 "address": "bc1qtest3",
-                "category": "receive",
                 "amount": 0.03,
-                "txid": "jkl012",
+                "confirmations": 100,
+                "label": "",
+                "txids": ["jkl012"],
             },
         ]
 
         backend._rpc_call = make_mock_rpc(
-            {
-                "listaddressgroupings": mock_groupings,
-                "listsinceblock": {"transactions": mock_transactions, "lastblock": "0" * 64},
-            },
+            {"listreceivedbyaddress": mock_lrba},
             strict=False,
             default={},
         )
 
         addresses = await backend.get_addresses_with_history()
 
-        # Should have 3 unique addresses from both sources
-        assert len(addresses) == 3
-        assert "bc1qtest1" in addresses
-        assert "bc1qtest2" in addresses
-        assert "bc1qtest3" in addresses
+        assert addresses == {"bc1qtest1", "bc1qtest2", "bc1qtest3"}
 
     @pytest.mark.asyncio
     async def test_get_addresses_with_history_empty(self) -> None:
-        """Test get_addresses_with_history with no transactions."""
+        """Empty ``listreceivedbyaddress`` -> empty set."""
         backend = DescriptorWalletBackend(wallet_name="test_empty_history")
         backend._wallet_loaded = True
 
         backend._rpc_call = make_mock_rpc(
-            {
-                "listaddressgroupings": [],
-                "listsinceblock": {"transactions": [], "lastblock": "0" * 64},
-            },
+            {"listreceivedbyaddress": []},
             strict=False,
             default={},
         )
 
         addresses = await backend.get_addresses_with_history()
 
-        assert len(addresses) == 0
+        assert addresses == set()
 
     @pytest.mark.asyncio
-    async def test_get_addresses_with_history_filters_categories(self) -> None:
-        """Test that get_addresses_with_history only includes receive/generate from listsinceblock.
+    async def test_get_addresses_with_history_skips_empty_txids(self) -> None:
+        """Rows without ``txids`` (defensive: shouldn't appear with
+        ``include_empty=False``, but guard anyway) are skipped."""
+        backend = DescriptorWalletBackend(wallet_name="test_skip_empty_txids")
+        backend._wallet_loaded = True
 
-        "send" addresses are counterparty addresses (where we sent to) and should
-        not be included from listsinceblock, since they don't belong to this wallet.
+        mock_lrba = [
+            {"address": "bc1qreal", "amount": 0.01, "txids": ["abc"]},
+            {"address": "bc1qstale", "amount": 0.0, "txids": []},
+            {"address": "bc1qnotxids", "amount": 0.0},  # no txids field
+        ]
 
-        Note: ``listaddressgroupings`` returns addresses involved in transactions
-        with this wallet, including counterparty addresses from CoinJoin co-spends.
-        Filtering of those external addresses happens at sync time via
-        ``filter_mine_addresses`` (``getaddressinfo``-based ``ismine`` check),
-        not in ``get_addresses_with_history`` itself.
+        backend._rpc_call = make_mock_rpc(
+            {"listreceivedbyaddress": mock_lrba},
+            strict=False,
+            default={},
+        )
+
+        addresses = await backend.get_addresses_with_history()
+
+        assert addresses == {"bc1qreal"}
+
+    @pytest.mark.asyncio
+    async def test_get_addresses_with_history_excludes_counterparties(self) -> None:
+        """``listreceivedbyaddress`` is ismine-only by construction, so
+        counterparty addresses (CoinJoin co-spend destinations) never appear.
+
+        Filtering of externals is therefore not needed in this method, in
+        contrast to the previous ``listaddressgroupings``-based implementation.
         """
         backend = DescriptorWalletBackend(wallet_name="test_filter_history")
         backend._wallet_loaded = True
 
-        # Mock returns only our own addresses for this test (sync-layer filtering
-        # of externals is exercised separately).
-        mock_groupings = [
-            [["bc1qreceive", 0.0]],
-            [["bc1qgenerate", 50.0]],
-        ]
-
-        mock_transactions = [
-            {
-                "address": "bc1qreceive",
-                "category": "receive",
-                "amount": 0.01,
-                "txid": "abc",
-            },
-            {
-                "address": "bc1qsend",
-                "category": "send",  # Should be excluded (counterparty address)
-                "amount": -0.01,
-                "txid": "def",
-            },
-            {
-                "address": "bc1qgenerate",
-                "category": "generate",
-                "amount": 50.0,
-                "txid": "ghi",
-            },
-            {
-                "address": "bc1qimmature",
-                "category": "immature",  # Should be excluded
-                "amount": 50.0,
-                "txid": "jkl",
-            },
-            {
-                "category": "orphan",  # No address, should be skipped
-                "amount": 0,
-                "txid": "mno",
-            },
+        # Bitcoin Core never returns counterparty (non-ismine) addresses from
+        # listreceivedbyaddress -- this fixture mirrors that contract.
+        mock_lrba = [
+            {"address": "bc1qreceive", "amount": 0.01, "txids": ["abc"]},
+            {"address": "bc1qgenerate", "amount": 50.0, "txids": ["ghi"]},
         ]
 
         backend._rpc_call = make_mock_rpc(
-            {
-                "listaddressgroupings": mock_groupings,
-                "listsinceblock": {"transactions": mock_transactions, "lastblock": "0" * 64},
-            },
+            {"listreceivedbyaddress": mock_lrba},
             strict=False,
             default={},
         )
 
         addresses = await backend.get_addresses_with_history()
 
-        # Should have 2 addresses (receive, generate) but not send/immature/orphan
-        # "send" addresses are counterparty addresses in CoinJoin transactions
-        assert len(addresses) == 2
-        assert "bc1qreceive" in addresses
-        assert "bc1qsend" not in addresses  # Counterparty addresses excluded
-        assert "bc1qgenerate" in addresses
-        assert "bc1qimmature" not in addresses
+        assert addresses == {"bc1qreceive", "bc1qgenerate"}
+        assert "bc1qsend" not in addresses  # would-be counterparty
 
     @pytest.mark.asyncio
-    async def test_get_addresses_with_history_groupings_only(self) -> None:
-        """Test that addresses found only in listaddressgroupings are included.
-
-        This is the critical fix for the bug where addresses that were used
-        but don't appear in listsinceblock (e.g., after wallet import without
-        proper rescan) are still detected via listaddressgroupings.
-        """
-        backend = DescriptorWalletBackend(wallet_name="test_groupings_only")
+    async def test_get_addresses_with_history_rpc_error(self) -> None:
+        """RPC errors are logged and produce an empty set rather than raising."""
+        backend = DescriptorWalletBackend(wallet_name="test_lrba_error")
         backend._wallet_loaded = True
 
-        # This address appears in listaddressgroupings but NOT in listsinceblock
-        # This happens when the wallet was imported and the transaction details
-        # weren't properly recorded, but Bitcoin Core still knows about the grouping
-        mock_groupings = [
-            [["bc1qusedbutnotintxlist", 0.0]],  # Used address with 0 balance
-            [["bc1qalsoused", 0.0]],
-        ]
+        async def failing_rpc(method: str, *args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("simulated RPC failure")
 
-        # Empty transaction list - simulating missing tx history
-        mock_transactions: list[dict[str, Any]] = []
-
-        backend._rpc_call = make_mock_rpc(
-            {
-                "listaddressgroupings": mock_groupings,
-                "listsinceblock": {"transactions": mock_transactions, "lastblock": "0" * 64},
-            },
-            strict=False,
-            default={},
-        )
+        backend._rpc_call = failing_rpc  # type: ignore[method-assign]
 
         addresses = await backend.get_addresses_with_history()
-
-        # Should find addresses from listaddressgroupings even when listsinceblock is empty
-        assert len(addresses) == 2
-        assert "bc1qusedbutnotintxlist" in addresses
-        assert "bc1qalsoused" in addresses
+        assert addresses == set()
 
     @pytest.mark.asyncio
     async def test_sync_populates_addresses_with_history(self) -> None:
@@ -2104,12 +2041,15 @@ class TestAddressHistory:
 
     @pytest.mark.asyncio
     async def test_sync_skips_extended_scan_for_external_addresses(self) -> None:
-        """Counterparty addresses from listaddressgroupings must NOT trigger extended-range scan.
+        """Counterparty addresses must NOT trigger an extended-range BIP32 scan.
 
-        Regression test for the slow ``jm-wallet info`` issue: external addresses
-        (e.g., CoinJoin counterparties) appearing in ``listaddressgroupings`` were
-        being treated as "ours but beyond range" and triggering a ~5000-index
-        BIP32 derivation scan per address (multiple seconds per call).
+        Defense-in-depth: ``listreceivedbyaddress`` is ismine-only, so under
+        normal operation no counterparty address can reach this code path.
+        This test pins the behavior anyway: if a non-ours address ever leaks
+        into ``addresses_with_history`` (e.g. via a future RPC change or test
+        seam), sync must short-circuit via ``getaddressinfo`` instead of
+        triggering the ~5000-index BIP32 derivation scan that historically
+        caused multi-second-per-address slowdowns in ``jm-wallet info``.
         """
         from unittest.mock import MagicMock
 
@@ -2136,8 +2076,9 @@ class TestAddressHistory:
             ]
 
         async def mock_get_addresses_with_history() -> set[str]:
-            # Bitcoin Core's listaddressgroupings would return both addresses;
-            # only own_addr is actually ours.
+            # Defensive: simulate a future RPC change where a non-ours address
+            # leaks through; ``listreceivedbyaddress`` itself never returns
+            # counterparties, but the sync layer must still cope.
             return {own_addr, external_addr}
 
         get_info_calls: list[str] = []
@@ -2455,8 +2396,8 @@ class TestDescriptorRangeUpgrade:
 
     @pytest.mark.asyncio
     async def test_default_rpc_client_uses_generous_read_timeout(self) -> None:
-        """Blocking RPCs (``listdescriptors``, ``listaddressgroupings``,
-        ``listsinceblock``) can take far longer than 30s on a busy node or
+        """Blocking RPCs (``listdescriptors``, ``listreceivedbyaddress``,
+        ``rescanblockchain``) can take far longer than 30s on a busy node or
         slow host. The default client must use a generous read timeout so
         these calls complete instead of raising ``ReadTimeout``, which would
         trigger fallback paths with stale data (e.g. an empty descriptor
@@ -2731,22 +2672,15 @@ class TestDescriptorRangeUpgrade:
                         {"desc": "wpkh(xpub.../0/*)#abc", "range": [0, 999]},
                     ]
                 }
-            if method == "listaddressgroupings":
-                # Return the spent address in groupings
-                return [[[spent_address, 0.0]]]
-            if method == "listsinceblock":
-                # Return the spent address as having history (listsinceblock format)
-                return {
-                    "transactions": [
-                        {
-                            "address": spent_address,
-                            "category": "receive",
-                            "amount": 0.001,
-                            "confirmations": 100,
-                        }
-                    ],
-                    "lastblock": "0" * 64,
-                }
+            if method == "listreceivedbyaddress":
+                return [
+                    {
+                        "address": spent_address,
+                        "amount": 0.001,
+                        "confirmations": 100,
+                        "txids": ["a" * 64],
+                    }
+                ]
             raise ValueError(f"Unexpected RPC: {method}")
 
         backend._rpc_call = mock_rpc_call  # type: ignore[method-assign]
@@ -2856,18 +2790,16 @@ class TestDescriptorRangeUpgrade:
                         {"desc": "wpkh(xpub.../1/*)#def", "range": [0, current_range - 1]},
                     ]
                 }
-            if method == "listaddressgroupings":
-                # Return addresses at various indices in groupings
-                return [[[addr, 0.0] for addr in high_index_addresses]]
-            if method == "listsinceblock":
-                # Return transactions for multiple addresses at various indices
-                return {
-                    "transactions": [
-                        {"address": addr, "category": "receive", "amount": 0.001}
-                        for addr in high_index_addresses
-                    ],
-                    "lastblock": "0" * 64,
-                }
+            if method == "listreceivedbyaddress":
+                return [
+                    {
+                        "address": addr,
+                        "amount": 0.001,
+                        "confirmations": 10,
+                        "txids": [f"{i:064x}"],
+                    }
+                    for i, addr in enumerate(high_index_addresses)
+                ]
             if method == "getdescriptorinfo":
                 desc = params[0] if params else ""
                 return {"descriptor": f"{desc}#mockchecksum"}
@@ -2976,17 +2908,15 @@ class TestDescriptorRangeUpgrade:
                         {"desc": "wpkh(xpub.../1/*)#def", "range": [0, range_end]},
                     ]
                 }
-            if method == "listaddressgroupings":
-                # Return address at very high index in groupings
-                return [[[high_index_address, 0.0]]]
-            if method == "listsinceblock":
-                # Return transaction for address at very high index
-                return {
-                    "transactions": [
-                        {"address": high_index_address, "category": "receive", "amount": 0.001}
-                    ],
-                    "lastblock": "0" * 64,
-                }
+            if method == "listreceivedbyaddress":
+                return [
+                    {
+                        "address": high_index_address,
+                        "amount": 0.001,
+                        "confirmations": 10,
+                        "txids": ["a" * 64],
+                    }
+                ]
             if method == "getdescriptorinfo":
                 desc = params[0] if params else ""
                 return {"descriptor": f"{desc}#mockchecksum"}

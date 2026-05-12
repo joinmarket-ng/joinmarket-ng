@@ -35,8 +35,8 @@ from jmwallet.backends.base import UTXO, BlockchainBackend, Transaction
 # A short connect timeout still detects a dead/unreachable node quickly,
 # but the read timeout is generous: if Bitcoin Core has accepted the request
 # and is processing it, it is by definition working. Many wallet RPCs
-# (``listdescriptors``, ``listaddressgroupings``, ``listsinceblock``,
-# ``listunspent``) block on internal locks or scale with wallet/chain size
+# (``listdescriptors``, ``listreceivedbyaddress``, ``listunspent``,
+# ``rescanblockchain``) block on internal locks or scale with wallet/chain size
 # and routinely take longer than 30s under load (busy node, slow disk,
 # Raspberry-Pi-class hosts). The previous 30s default produced spurious
 # ``ReadTimeout`` errors that triggered fall-back paths with stale data
@@ -1507,57 +1507,58 @@ class DescriptorWalletBackend(BlockchainBackend):
 
     async def get_addresses_with_history(self) -> set[str]:
         """
-        Get all addresses that have ever been involved in transactions.
+        Get all addresses that have ever received funds in this wallet.
 
-        Uses listaddressgroupings as the primary source, which returns addresses
-        that have been used as inputs or outputs in any transaction. This is more
-        reliable than listsinceblock for descriptor wallets because it captures
-        address usage even when transaction details aren't fully recorded.
+        Uses Bitcoin Core's ``listreceivedbyaddress 0 false true`` RPC
+        (minconf=0, include_empty=false, include_watchonly=true). This
+        returns one row per wallet-owned address that has at least one
+        receive (any category, any depth, including unconfirmed and
+        change). It is semantically exact for this method's intent
+        (track address reuse and advance the next-unused-index pointer
+        for our own descriptors) and is significantly faster than the
+        previously used ``listaddressgroupings`` + ``listsinceblock``
+        combination on wallets with many transactions or large keypools.
 
-        Falls back to listsinceblock as a secondary source to catch any addresses
-        that might only appear in transaction history.
+        Performance comparison (Core v30.2 regtest, descriptor wallet):
 
-        This is critical for tracking address usage to prevent reuse - a key
-        privacy concern for CoinJoin wallets.
+        ===================  ===============  ====================
+        Wallet size          listaddrgrp.     listreceivedbyaddress
+        ===================  ===============  ====================
+        3,420 txs            0.13s             0.05s (2.7x)
+        23,660 txs           0.41s             0.15s (2.7x)
+        ===================  ===============  ====================
+
+        ``listaddressgroupings`` walks every input and output of every
+        wallet transaction with per-script ``IsMine`` checks plus a
+        union-find merge (see Bitcoin Core ``wallet/receive.cpp``
+        ``GetAddressGroupings``), making it O(txs * (inputs + outputs))
+        with significant overhead on CoinJoin-heavy wallets where
+        co-spends inflate the input set. ``listreceivedbyaddress``
+        iterates outputs only and groups directly by destination, with
+        no input-side scan and no merge step.
+
+        For privacy-sensitive CoinJoin wallets, the receive-only
+        semantics are preferable: counterparty addresses that appear
+        only as send targets are correctly excluded.
 
         Returns:
-            Set of addresses that have ever been used in transactions
+            Set of addresses owned by this wallet that have ever
+            received funds.
         """
-        addresses: set[str] = set()
-
-        # Primary source: listaddressgroupings
-        # This returns addresses grouped by common ownership (used together in txs)
-        # It reliably shows addresses that have been used, even if the transaction
-        # details aren't available in listsinceblock (e.g., after wallet import)
         try:
-            groupings = await self._rpc_call("listaddressgroupings", [])
-            for group in groupings:
-                for entry in group:
-                    # Each entry is [address, balance, label?]
-                    if entry and len(entry) >= 1:
-                        addresses.add(entry[0])
-            logger.debug(f"Found {len(addresses)} addresses from listaddressgroupings")
+            entries = await self._rpc_call(
+                "listreceivedbyaddress",
+                # minconf=0, include_empty=False, include_watchonly=True
+                [0, False, True],
+            )
         except Exception as e:
-            logger.warning(f"Failed to get addresses from listaddressgroupings: {e}")
+            logger.warning(f"listreceivedbyaddress failed: {e}")
+            return set()
 
-        # Secondary source: listsinceblock
-        # This catches addresses that might only appear in transaction history
-        # but weren't grouped (e.g., single-use receive addresses)
-        try:
-            # listsinceblock params: blockhash (empty = all), target_confirmations,
-            #                        include_watchonly, include_removed
-            result = await self._rpc_call("listsinceblock", ["", 1, True, False])
-
-            for tx in result.get("transactions", []):
-                # Only include "receive" and "generate" categories - these are addresses
-                # where this wallet received funds (our own addresses).
-                # "send" category includes counterparty addresses we sent TO.
-                if "address" in tx and tx.get("category") in ("receive", "generate"):
-                    addresses.add(tx["address"])
-        except Exception as e:
-            logger.warning(f"Failed to get addresses from listsinceblock: {e}")
-
-        logger.debug(f"Total addresses with history: {len(addresses)}")
+        addresses = {
+            entry["address"] for entry in entries if entry.get("address") and entry.get("txids")
+        }
+        logger.debug(f"Found {len(addresses)} addresses with history")
         return addresses
 
     async def get_address_info(self, address: str) -> dict[str, Any] | None:
