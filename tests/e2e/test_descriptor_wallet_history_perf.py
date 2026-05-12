@@ -23,15 +23,17 @@ scan. On regtest benchmarks, this is 2.7x to 13x faster than
 This test guards against regressions by:
 
   1. Building a descriptor test wallet on a local Bitcoin Core regtest node.
-  2. Generating a meaningful number of receive transactions plus
-     CoinJoin-like co-spend transactions (the worst case for the legacy
-     RPC).
+  2. Generating thousands of history-bearing addresses (via batched
+     ``sendmany`` receives) plus a meaningful number of CoinJoin-like
+     co-spend transactions (the worst case for the legacy RPC).
   3. Calling ``get_addresses_with_history`` and asserting both
      correctness and a generous wall-clock budget that any reasonable
      implementation must satisfy.
 
-The test is deliberately conservative on tx counts so it stays fast in
-CI while still exercising the scaling behavior that motivated the fix.
+The target scale (~3k history-bearing addresses) approximates a heavy
+real-world JoinMarket wallet (~13k addresses) closely enough to surface
+any O(N^2)-ish regression, while keeping CI wall time well under the
+300s per-test budget by using ``sendmany`` to amortize tx count.
 
 Requires: docker compose up -d (the default ``jm-bitcoin`` regtest node).
 """
@@ -50,19 +52,22 @@ from jmwallet.backends.descriptor_wallet import DescriptorWalletBackend
 pytestmark = pytest.mark.e2e
 
 
-# Test parameters. Kept modest so the whole suite stays well under a minute
-# on a developer laptop, while still being large enough that an O(txs^2)
-# regression would blow past the wall-clock budget.
-NUM_RECEIVES = 400
-NUM_COINJOINS = 40
+# Test parameters. We aim to approximate a real-world heavy JoinMarket
+# wallet (~13k addresses with history is not unusual after many mixes)
+# while keeping CI wall time bounded. Receives are batched via ``sendmany``
+# (hundreds of outputs per tx), which lets us build thousands of
+# history-bearing addresses in a small number of txs.
+NUM_RECEIVE_ADDRESSES = 3000
+RECEIVES_PER_BATCH = 500
+NUM_COINJOINS = 100
 COINJOIN_PARTICIPANTS = 5
 
 # Hard upper bound for ``get_addresses_with_history`` wall time. The
 # expected value on a developer machine is well under 1s for this dataset
 # (regtest benchmarks show ~0.05s for 3.4k txs and ~0.15s for 23.7k txs);
-# 5s is generous enough to absorb CI noise without masking real
-# regressions.
-HISTORY_RPC_BUDGET_SECONDS = 5.0
+# 10s is generous enough to absorb CI noise without masking real
+# regressions on a wallet with 3k+ history-bearing addresses.
+HISTORY_RPC_BUDGET_SECONDS = 10.0
 
 
 # Long timeout for the heavy setup RPCs (mining 110 blocks, ``sendmany``
@@ -129,16 +134,31 @@ async def _setup_funded_miner(cfg: dict[str, str], miner_wallet: str) -> str:
 async def _send_many_receives(
     cfg: dict[str, str],
     n: int,
+    batch_size: int,
     miner_addr: str,
     miner_wallet: str,
     test_wallet: str,
 ) -> None:
-    """Send ``n`` distinct payments from miner to the test wallet."""
-    for i in range(n):
-        addr = await _rpc(cfg, "getnewaddress", ["", "bech32"], wallet=test_wallet)
-        await _rpc(cfg, "sendtoaddress", [addr, 0.0001], wallet=miner_wallet)
-        if i % 100 == 99:
-            await _mine(cfg, miner_addr, 1, miner_wallet)
+    """
+    Generate ``n`` distinct history-bearing addresses on the test wallet,
+    funded via batched ``sendmany`` calls from the miner wallet.
+
+    Batching reduces tx count by ``batch_size`` versus a per-address
+    ``sendtoaddress`` loop, which is the difference between a few seconds
+    and many minutes when ``n`` is in the thousands. Each output still
+    lands at a distinct ``getnewaddress`` so the wallet ends up with ``n``
+    addresses that have history; the legacy ``listaddressgroupings`` path
+    would still have to walk every such output.
+    """
+    sent = 0
+    while sent < n:
+        targets: dict[str, float] = {}
+        for _ in range(min(batch_size, n - sent)):
+            addr = await _rpc(cfg, "getnewaddress", ["", "bech32"], wallet=test_wallet)
+            targets[addr] = 0.0001
+        await _rpc(cfg, "sendmany", ["", targets], wallet=miner_wallet)
+        sent += len(targets)
+        await _mine(cfg, miner_addr, 1, miner_wallet)
     await _mine(cfg, miner_addr, 6, miner_wallet)
 
 
@@ -283,7 +303,12 @@ async def test_get_addresses_with_history_scales_on_large_wallet(
     try:
         miner_addr = await _setup_funded_miner(cfg, miner_wallet)
         await _send_many_receives(
-            cfg, NUM_RECEIVES, miner_addr, miner_wallet, test_wallet
+            cfg,
+            NUM_RECEIVE_ADDRESSES,
+            RECEIVES_PER_BATCH,
+            miner_addr,
+            miner_wallet,
+            test_wallet,
         )
         await _ensure_miner_utxos(
             cfg,
@@ -301,10 +326,16 @@ async def test_get_addresses_with_history_scales_on_large_wallet(
         )
 
         info = await _rpc(cfg, "getwalletinfo", wallet=test_wallet)
-        # Sanity: we should have a meaningful number of txs to actually
-        # exercise the scaling behavior.
-        assert info["txcount"] > NUM_RECEIVES, (
-            f"setup did not produce enough txs (got {info['txcount']})"
+        # Sanity: confirm the wallet was actually populated. ``txcount``
+        # only counts txs that touch the test wallet (one per ``sendmany``
+        # batch + per-CoinJoin tx), so the threshold is much smaller than
+        # ``NUM_RECEIVE_ADDRESSES``.
+        expected_min_txs = (NUM_RECEIVE_ADDRESSES // RECEIVES_PER_BATCH) + (
+            NUM_COINJOINS // 4
+        )
+        assert info["txcount"] >= expected_min_txs, (
+            f"setup did not produce enough txs (got {info['txcount']}, "
+            f"expected >= {expected_min_txs})"
         )
 
         backend = DescriptorWalletBackend(
@@ -325,9 +356,9 @@ async def test_get_addresses_with_history_scales_on_large_wallet(
             # Correctness: the wallet generated many fresh receive
             # addresses; we should see at least the receive count back
             # (CoinJoin outputs add more on top, change addresses too).
-            assert len(addresses) >= NUM_RECEIVES, (
-                f"expected at least {NUM_RECEIVES} addresses with history, "
-                f"got {len(addresses)}"
+            assert len(addresses) >= NUM_RECEIVE_ADDRESSES, (
+                f"expected at least {NUM_RECEIVE_ADDRESSES} addresses with "
+                f"history, got {len(addresses)}"
             )
 
             # Performance: hard budget. The current implementation is
