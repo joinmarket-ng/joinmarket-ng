@@ -57,11 +57,19 @@ def sample_offer(maker_bot):
 
 
 @pytest.mark.asyncio
-async def test_reconnect_includes_bond_final(
+async def test_reconnect_does_not_announce_bond_publicly(
     maker_bot, sample_offer, test_private_key, test_pubkey
 ):
     """
-    Test that reconnection announcements include fidelity bonds.
+    Public reconnect re-announcements MUST NOT include the fidelity bond
+    proof. The bond is delivered via privmsg in response to !orderbook,
+    matching the reference protocol
+    (jmdaemon/message_channel.py::MessageChannelCollection.announce_orders,
+    which asserts `fidelity_bond_proof_msg is None` for public broadcasts).
+
+    Regression test against the prior behavior where the reconnect path used
+    include_bond=True, leaking the bond UTXO to every passive observer of
+    the directory pit on every reconnect.
     """
     bot = maker_bot
     bot.current_offers = [sample_offer]
@@ -104,9 +112,16 @@ async def test_reconnect_includes_bond_final(
 
         assert mock_format.called, "_format_offer_announcement was not called during reconnect"
 
-        reconnect_call = next(
-            (c for c in mock_format.call_args_list if c.kwargs.get("include_bond") is True), None
+        # Every call from the reconnect path must use include_bond=False.
+        bond_calls = [c for c in mock_format.call_args_list if c.kwargs.get("include_bond") is True]
+        assert bond_calls == [], (
+            f"Reconnect announcement leaked the fidelity bond proof publicly "
+            f"(include_bond=True in {len(bond_calls)} call(s))."
         )
-        assert reconnect_call is not None, (
-            "Reconnection announcement failed to include bond (include_bond=True missing)"
-        )
+
+        # And no message actually broadcast contained a !tbond tag.
+        for call in mock_client.send_public_message.call_args_list:
+            (msg,) = call.args
+            assert "!tbond" not in msg, (
+                f"Public reconnect message must not contain !tbond, got: {msg!r}"
+            )

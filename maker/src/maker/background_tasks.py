@@ -381,11 +381,18 @@ class BackgroundTasksMixin:
 
                         logger.info(f"Reconnected to directory: {dir_server}")
 
-                        # Announce offers to newly connected directory
+                        # Announce offers to newly connected directory.
+                        # Public broadcasts MUST NOT include the fidelity bond
+                        # proof. Takers receive the bond via privmsg in
+                        # response to !orderbook, matching the reference
+                        # protocol (see jmdaemon/message_channel.py in
+                        # joinmarket-clientserver, which asserts
+                        # `fidelity_bond_proof_msg is None` for public pit
+                        # announcements).
                         for offer in self.current_offers:
                             try:
                                 offer_msg = self._format_offer_announcement(
-                                    offer, include_bond=True
+                                    offer, include_bond=False
                                 )
                                 await client.send_public_message(offer_msg)
                             except Exception as e:
