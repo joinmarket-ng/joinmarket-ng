@@ -98,19 +98,43 @@ class TestBitcoinCoreFeeEstimation:
     async def test_fallback_fee_is_one_sat(self, bitcoin_backend):
         """Test that fallback fee when estimation fails is 1.0 sat/vB.
 
-        On regtest with an empty mempool, estimatesmartfee returns an error.
-        The backend should fall back to 1.0 sat/vB (not the old 10 sat/vB).
-
-        This test verifies the fallback behavior regardless of whether Bitcoin Core
-        can provide actual fee estimates.
+        We monkeypatch the underlying RPC call to deterministically force
+        the failure path (rather than depending on regtest mempool state,
+        which is shared with other e2e tests and may have enough history
+        for ``estimatesmartfee`` to return a real estimate). This keeps
+        the test asserting the fallback contract (1.0 sat/vB, not the
+        old 10 sat/vB) without flaking on CI ordering.
         """
-        # Request fee for very high block target which may not have estimation data
-        fee = await bitcoin_backend.estimate_fee(target_blocks=1008)
 
-        # On regtest with no mempool data, all estimates use the fallback (1.0)
-        # This is expected behavior - the test verifies the fallback value is correct
+        async def failing_rpc(method: str, params=None, **_kwargs):
+            # Simulate the exact shape Core returns when it has no fee
+            # data: result without a 'feerate' key, just 'errors'.
+            if method == "estimatesmartfee":
+                return {"errors": ["Insufficient data or no feerate found"]}
+            raise AssertionError(f"unexpected RPC call in fallback test: {method}")
+
+        original_rpc = bitcoin_backend._rpc_call
+        bitcoin_backend._rpc_call = failing_rpc  # type: ignore[method-assign]
+        try:
+            fee = await bitcoin_backend.estimate_fee(target_blocks=1008)
+        finally:
+            bitcoin_backend._rpc_call = original_rpc  # type: ignore[method-assign]
+
         assert fee == 1.0, f"Expected fallback of 1.0 sat/vB, got {fee}"
         logger.info(f"1008-block fee (fallback): {fee} sat/vB")
+
+        # Also exercise the exception path (RPC raises) to confirm the
+        # ``except`` branch also returns 1.0.
+        async def raising_rpc(method: str, params=None, **_kwargs):
+            raise RuntimeError("simulated RPC failure")
+
+        bitcoin_backend._rpc_call = raising_rpc  # type: ignore[method-assign]
+        try:
+            fee = await bitcoin_backend.estimate_fee(target_blocks=1008)
+        finally:
+            bitcoin_backend._rpc_call = original_rpc  # type: ignore[method-assign]
+
+        assert fee == 1.0, f"Expected fallback of 1.0 sat/vB on RPC error, got {fee}"
 
 
 # ==============================================================================
