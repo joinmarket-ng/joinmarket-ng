@@ -228,6 +228,7 @@ def build_taker_config(
         connection_timeout=settings.tor.connection_timeout,
         mixdepth_count=settings.wallet.mixdepth_count,
         gap_limit=settings.wallet.gap_limit,
+        scan_range=settings.wallet.scan_range,
         dust_threshold=settings.wallet.dust_threshold,
         smart_scan=settings.wallet.smart_scan,
         background_full_rescan=settings.wallet.background_full_rescan,
@@ -566,6 +567,8 @@ async def _run_coinjoin(
         backend=backend,
         network=bitcoin_network.value,
         mixdepth_count=config.mixdepth_count,
+        gap_limit=config.gap_limit,
+        scan_range=config.scan_range,
         data_dir=config.data_dir,
     )
 
@@ -842,6 +845,8 @@ async def _run_tumble(
         backend=backend,
         network=bitcoin_network.value,
         mixdepth_count=config.mixdepth_count,
+        gap_limit=config.gap_limit,
+        scan_range=config.scan_range,
         data_dir=config.data_dir,
     )
 

@@ -168,6 +168,22 @@ class TestTakerConfig:
         with pytest.raises(ValidationError):
             TakerConfig(mnemonic=sample_mnemonic, gap_limit=5)
 
+    def test_scan_range_default_and_minimum(self, sample_mnemonic: str) -> None:
+        """Initial descriptor ``scan_range`` defaults to 1000 (issue #475).
+
+        Independent from ``gap_limit`` after the cleanup that dropped the
+        ``max(1000, gap_limit * 10)`` formula. Minimum enforced at 100 to
+        avoid pathological under-scanning.
+        """
+        config = TakerConfig(mnemonic=sample_mnemonic)
+        assert config.scan_range == 1000
+
+        config = TakerConfig(mnemonic=sample_mnemonic, scan_range=5000)
+        assert config.scan_range == 5000
+
+        with pytest.raises(ValidationError):
+            TakerConfig(mnemonic=sample_mnemonic, scan_range=50)
+
     def test_rescan_interval_default(self, sample_mnemonic: str) -> None:
         """Test default rescan interval is 600 seconds (10 minutes)."""
         config = TakerConfig(mnemonic=sample_mnemonic)

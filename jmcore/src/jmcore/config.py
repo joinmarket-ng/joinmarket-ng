@@ -237,7 +237,23 @@ class WalletConfig(BaseModel):
         le=10,
         description="Number of mixdepths in the wallet (privacy compartments)",
     )
-    gap_limit: int = Field(default=20, ge=6, description="BIP44 gap limit for address scanning")
+    gap_limit: int = Field(
+        default=20,
+        ge=6,
+        description=(
+            "BIP44 gap limit: stop scanning after this many consecutive empty "
+            "trailing addresses past the highest used one."
+        ),
+    )
+    scan_range: int = Field(
+        default=1000,
+        ge=100,
+        description=(
+            "Initial descriptor scan range (max address index per branch) "
+            "imported into Bitcoin Core. Auto-expands during setup when "
+            "highest used index nears the boundary (issue #475)."
+        ),
+    )
 
     # Dust threshold
     dust_threshold: int = Field(

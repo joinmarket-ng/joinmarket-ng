@@ -63,6 +63,7 @@ class WalletSyncMixin:
     network: str
     mixdepth_count: int
     gap_limit: int
+    scan_range: int
     data_dir: Path | None
     address_cache: dict[str, tuple[int, int, int]]
     utxo_cache: dict[int, list[UTXOInfo]]
@@ -499,8 +500,11 @@ class WalletSyncMixin:
         Returns:
             Dictionary mapping mixdepth to list of UTXOInfo, or None on failure
         """
-        # Generate descriptors for all mixdepths and build a lookup table
-        scan_range = max(DEFAULT_SCAN_RANGE, self.gap_limit * 10)
+        # Generate descriptors for all mixdepths and build a lookup table.
+        # ``scan_range`` is the explicit descriptor lookahead set on the
+        # service (default 1000). The old ``max(1000, gap_limit * 10)``
+        # formula was dropped in favor of an explicit setting (issue #475).
+        scan_range = self.scan_range
         descriptors: list[str | dict[str, Any]] = []
         # Map descriptor string (without checksum) -> (mixdepth, change)
         desc_to_path: dict[str, tuple[int, int]] = {}
@@ -675,7 +679,7 @@ class WalletSyncMixin:
 
     async def setup_descriptor_wallet(
         self,
-        scan_range: int = DEFAULT_SCAN_RANGE,
+        scan_range: int | None = None,
         fidelity_bond_addresses: list[tuple[str, int, int]] | None = None,
         rescan: bool = True,
         check_existing: bool = True,
@@ -695,7 +699,12 @@ class WalletSyncMixin:
         Subsequent operations will be much faster.
 
         Args:
-            scan_range: Address index range to import (default 1000)
+            scan_range: Address index range to import. When ``None`` (default),
+                resolves to ``self.scan_range`` (configured via
+                ``[wallet].scan_range``, default 1000). Distinct from
+                ``gap_limit`` which is the BIP44 trailing-empty threshold.
+                The legacy ``max(DEFAULT_SCAN_RANGE, gap_limit * 10)`` formula
+                was removed (issue #475).
             fidelity_bond_addresses: Optional list of (address, locktime, index) tuples
             rescan: Whether to rescan blockchain
             check_existing: If True, checks if wallet is already set up and skips import
@@ -724,6 +733,9 @@ class WalletSyncMixin:
                 "setup_descriptor_wallet() requires DescriptorWalletBackend. "
                 "Current backend does not support descriptor wallets."
             )
+
+        if scan_range is None:
+            scan_range = self.scan_range
 
         # Check if already set up (unless explicitly disabled)
         if check_existing:

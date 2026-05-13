@@ -301,6 +301,33 @@ def info(
     gap: Annotated[
         int, typer.Option("--gap", "-g", help="Max address gap to show in extended view")
     ] = 6,
+    scan_depth: Annotated[
+        int | None,
+        typer.Option(
+            "--scan-depth",
+            help=(
+                "Override the descriptor scan range (max address index per "
+                "branch) for this run. Defaults to the configured "
+                "``[wallet].scan_range`` (1000). Use this together with "
+                "``--rescan-deep`` to force a wider re-import on a wallet "
+                "migrated from legacy joinmarket-clientserver whose addresses "
+                "sit beyond the configured range (issue #475)."
+            ),
+        ),
+    ] = None,
+    rescan_deep: Annotated[
+        bool,
+        typer.Option(
+            "--rescan-deep",
+            help=(
+                "Re-import descriptors with the resolved scan range and "
+                "trigger a full rescan from genesis. Escape hatch for "
+                "wallets where the auto-expanding setup did not find all "
+                "historical activity (issue #475). Slow: a full rescan can "
+                "take 20+ minutes on mainnet."
+            ),
+        ),
+    ] = False,
     show_empty: Annotated[
         bool,
         typer.Option(
@@ -359,7 +386,11 @@ def info(
             backend,
             resolved_bip39_passphrase,
             extended=extended,
-            gap_limit=gap,
+            display_gap=gap,
+            gap_limit=settings.wallet.gap_limit,
+            scan_range=settings.wallet.scan_range,
+            scan_depth=scan_depth,
+            rescan_deep=rescan_deep,
             show_empty=show_empty,
             creation_height=resolved.creation_height if resolved else None,
         )
@@ -371,11 +402,32 @@ async def _show_wallet_info(
     backend_settings: ResolvedBackendSettings,
     bip39_passphrase: str = "",
     extended: bool = False,
-    gap_limit: int = 6,
+    display_gap: int = 6,
+    gap_limit: int = 20,
+    scan_range: int = 1000,
+    scan_depth: int | None = None,
+    rescan_deep: bool = False,
     show_empty: bool = False,
     creation_height: int | None = None,
 ) -> None:
-    """Show wallet info implementation."""
+    """Show wallet info implementation.
+
+    Args:
+        display_gap: Max empty addresses shown beyond last used in extended view.
+        gap_limit: BIP44 gap limit (trailing-empty threshold). Forwarded to
+            ``WalletService`` for sync-time logic.
+        scan_range: Initial descriptor scan range. Forwarded to
+            ``WalletService`` and used by ``setup_descriptor_wallet`` as the
+            initial lookahead window. Auto-expansion (issue #475) handles
+            wallets with deep addresses; ``--scan-depth`` / ``--rescan-deep``
+            remain as explicit escape hatches.
+        scan_depth: Optional explicit override for the descriptor scan range
+            on this invocation. Takes precedence over ``scan_range``.
+        rescan_deep: If True, force re-import of descriptors with the resolved
+            scan range and a full rescan from genesis. Escape hatch for
+            wallets where auto-expansion did not find all historical activity
+            (issue #475).
+    """
     from jmwallet.backends.descriptor_wallet import DescriptorWalletBackend
     from jmwallet.backends.neutrino import NeutrinoBackend
     from jmwallet.history import (
@@ -439,12 +491,19 @@ async def _show_wallet_info(
     if creation_height is not None:
         backend.set_wallet_creation_height(creation_height)
 
-    # Create wallet with data_dir for history lookups
+    # Create wallet with data_dir for history lookups. The ``scan_range``
+    # field on ``WalletService`` is the initial descriptor lookahead window
+    # (default 1000) and ``gap_limit`` is the true BIP44 trailing-empty
+    # threshold. Migrated wallets with deep addresses (issue #475) are
+    # handled by ``setup_descriptor_wallet`` auto-expansion; the
+    # ``--scan-depth`` / ``--rescan-deep`` flags remain as escape hatches.
     wallet = WalletService(
         mnemonic=mnemonic,
         backend=backend,
         network=network,
         mixdepth_count=5,
+        gap_limit=gap_limit,
+        scan_range=scan_range,
         passphrase=bip39_passphrase,
         data_dir=data_dir,
     )
@@ -455,6 +514,11 @@ async def _show_wallet_info(
             from jmwallet.backends.descriptor_wallet import DescriptorWalletBackend
 
             if isinstance(backend, DescriptorWalletBackend):
+                # Resolve the effective descriptor scan range for this run:
+                # an explicit ``--scan-depth`` wins, else fall back to the
+                # configured ``[wallet].scan_range`` (already on ``wallet``).
+                effective_scan_range = scan_depth if scan_depth is not None else wallet.scan_range
+
                 # Check if base wallet is set up (without counting bonds)
                 bond_count = len(fidelity_bond_addresses)
                 base_wallet_ready = await wallet.is_descriptor_wallet_ready(fidelity_bond_count=0)
@@ -462,10 +526,33 @@ async def _show_wallet_info(
                     fidelity_bond_count=bond_count
                 )
 
-                if not base_wallet_ready:
+                if rescan_deep:
+                    # Recovery path for migrated wallets (issue #475): force
+                    # re-import of descriptors with the resolved range and a
+                    # full rescan from genesis. This bypasses the
+                    # ``is_wallet_setup`` short-circuit so an already-set-up
+                    # wallet picks up the deeper range. ``smart_scan=False``
+                    # + ``background_full_rescan=False`` means we scan from
+                    # block 0 synchronously (slow but complete).
+                    logger.info(
+                        f"--rescan-deep: re-importing descriptors with range "
+                        f"[0, {effective_scan_range - 1}] and rescanning from genesis. "
+                        "This may take 20+ minutes on mainnet."
+                    )
+                    await wallet.setup_descriptor_wallet(
+                        scan_range=effective_scan_range,
+                        fidelity_bond_addresses=(fidelity_bond_addresses if bond_count else None),
+                        rescan=True,
+                        check_existing=False,
+                        smart_scan=False,
+                        background_full_rescan=False,
+                    )
+                    logger.info("Deep rescan complete")
+                elif not base_wallet_ready:
                     # First time setup - import everything including bonds
                     logger.info("Descriptor wallet not set up. Setting up...")
                     await wallet.setup_descriptor_wallet(
+                        scan_range=effective_scan_range,
                         rescan=True,
                         fidelity_bond_addresses=fidelity_bond_addresses if bond_count else None,
                     )
@@ -551,7 +638,7 @@ async def _show_wallet_info(
             # Extended view with detailed address information
             print("\nJM wallet")
             _show_extended_wallet_info(
-                wallet, used_addresses, history_addresses, gap_limit, show_empty=show_empty
+                wallet, used_addresses, history_addresses, display_gap, show_empty=show_empty
             )
         else:
             # Simple view - show balance and suggested address per mixdepth

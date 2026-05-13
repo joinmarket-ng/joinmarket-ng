@@ -358,7 +358,24 @@ class WalletSettings(BaseModel):
     gap_limit: int = Field(
         default=20,
         ge=6,
-        description="BIP44 gap limit for address scanning",
+        description=(
+            "BIP44 gap limit: stop address scanning after this many consecutive "
+            "empty trailing addresses past the highest used one. This is the true "
+            "BIP44 gap limit (Electrum convention is 20). Distinct from "
+            "``scan_range``, which controls the descriptor lookahead window "
+            "imported into Bitcoin Core."
+        ),
+    )
+    scan_range: int = Field(
+        default=1000,
+        ge=100,
+        description=(
+            "Initial descriptor scan range (max address index per branch) "
+            "imported into Bitcoin Core's descriptor wallet. Defaults to 1000, "
+            "matching Bitcoin Core's default keypool lookahead. Wallets migrated "
+            "from legacy joinmarket-clientserver may have used addresses beyond "
+            "this; setup auto-expands when needed (issue #475)."
+        ),
     )
     dust_threshold: int = Field(
         default=27300,

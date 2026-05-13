@@ -78,6 +78,7 @@ class TestBuildTakerConfig:
         # Wallet config
         settings.wallet.mixdepth_count = 5
         settings.wallet.gap_limit = 6
+        settings.wallet.scan_range = 1000
         settings.wallet.dust_threshold = 546
         settings.wallet.smart_scan = True
         settings.wallet.background_full_rescan = False
@@ -384,3 +385,23 @@ class TestBuildTakerConfig:
         assert config.taker_utxo_age == 7
         assert config.taker_utxo_retries == 5
         assert config.taker_utxo_amtpercent == 25
+
+    def test_gap_limit_flows_into_config(
+        self, sample_mnemonic: str, mock_settings: MagicMock
+    ) -> None:
+        """``[wallet].gap_limit`` must reach ``TakerConfig`` so it can be
+        forwarded to ``WalletService`` and drive the descriptor scan range
+        (issue #475 recovery for migrated wallets).
+        """
+        mock_settings.wallet.gap_limit = 50
+
+        config = build_taker_config(
+            settings=mock_settings,
+            mnemonic=sample_mnemonic,
+            passphrase="",
+            destination="bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+            amount=100000,
+            mixdepth=0,
+        )
+
+        assert config.gap_limit == 50

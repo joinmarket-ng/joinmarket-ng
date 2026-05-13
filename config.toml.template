@@ -151,8 +151,16 @@
 # Number of mixing depths (1-10)
 # mixdepth_count = 5
 
-# Address gap limit for wallet scanning (minimum: 6)
+# BIP44 gap limit: stop address scanning after this many consecutive empty
+# trailing addresses past the highest used one (minimum: 6, Electrum convention: 20).
+# Distinct from ``scan_range`` below.
 # gap_limit = 20
+
+# Initial descriptor scan range (max address index per branch) imported into
+# Bitcoin Core's descriptor wallet. Defaults to 1000, matching Bitcoin Core's
+# default keypool lookahead. Wallets migrated from legacy joinmarket-clientserver
+# may have used addresses beyond this; setup auto-expands when needed (issue #475).
+# scan_range = 1000
 
 # Dust threshold in satoshis
 # dust_threshold = 27300

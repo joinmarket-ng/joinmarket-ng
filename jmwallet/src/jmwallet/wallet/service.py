@@ -46,13 +46,20 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin):
         network: str = "mainnet",
         mixdepth_count: int = 5,
         gap_limit: int = 20,
+        scan_range: int = DEFAULT_SCAN_RANGE,
         data_dir: Path | None = None,
         passphrase: str = "",
     ):
         self.backend = backend
         self.network = network
         self.mixdepth_count = mixdepth_count
+        # ``gap_limit`` is the BIP44 trailing-empty threshold (default 20).
+        # ``scan_range`` is the descriptor lookahead window imported into
+        # Bitcoin Core (default 1000). The two concepts used to be conflated
+        # via a ``max(1000, gap_limit * 10)`` formula, dropped in favor of
+        # explicit configuration (issue #475).
         self.gap_limit = gap_limit
+        self.scan_range = scan_range
         self.data_dir = data_dir
 
         seed = mnemonic_to_seed(mnemonic, passphrase)
