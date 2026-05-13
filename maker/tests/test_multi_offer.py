@@ -1021,7 +1021,10 @@ class TestDualOfferAutoSplit:
             OfferConfig(offer_type=OfferType.SW0_RELATIVE, cj_fee_relative="0.002"),
         ]
         fees = [("0.001", 0, 0.001), ("500", 0, 500.0), ("0.002", 0, 0.002)]
-        assert manager._compute_dual_offer_size_overrides(configs, fees, 10_000_000) == {}
+        assert manager._compute_dual_offer_size_overrides(configs, fees, 10_000_000) == (
+            {},
+            set(),
+        )
 
     def test_compute_overrides_helper_zero_abs_fee(self, wallet_10m):
         """Zero randomized abs fee disables the auto-split (intersection at 0)."""
@@ -1033,7 +1036,10 @@ class TestDualOfferAutoSplit:
         ]
         # Simulate randomization that produced zero abs fee (e.g. heavy factor)
         fees = [("0.001", 0, 0.001), ("0", 0, 0.0)]
-        assert manager._compute_dual_offer_size_overrides(configs, fees, 10_000_000) == {}
+        assert manager._compute_dual_offer_size_overrides(configs, fees, 10_000_000) == (
+            {},
+            set(),
+        )
 
     @pytest.mark.asyncio
     async def test_seam_exact_with_txfee_deduction(self, wallet_10m):
@@ -1181,3 +1187,79 @@ class TestDualOfferAutoSplit:
             "seam should vary across announcements when cjfee_factor > 0; "
             f"got constant seam at {seam_values}"
         )
+
+    @pytest.mark.asyncio
+    async def test_intersection_inside_dust_band_drops_rel_offer(self):
+        """Regression: intersection in ``(max_available, max_balance]`` drops rel.
+
+        Previously the suppression branch compared the intersection against
+        the gross ``max_balance`` and only fired when the intersection
+        exceeded the full balance.  An intersection that fell strictly
+        inside the band between ``max_balance - dust_threshold`` (the
+        actual ``max_available``) and ``max_balance`` slipped through to
+        the "standard split" branch.  The rel offer then received a
+        ``min_size_override`` larger than its ``max_available`` and was
+        rejected by ``_create_single_offer`` with a confusing
+        "Insufficient balance: max_available=X <= min_size=max_balance"
+        warning instead of being suppressed cleanly.
+
+        Reproduces the bug from the operator report between 0.28.1 and
+        0.29.0: with the default ``dust_threshold = 27300``, a balance
+        whose intersection falls in the dust band must cleanly drop the
+        rel offer rather than emit it with an unfillable min_size.
+        """
+        # Pick a balance where max_available comfortably exceeds the dust
+        # threshold so the abs offer can be created, while still leaving
+        # an intersection that lands in the (max_available, max_balance]
+        # band for the chosen fees.
+        # max_balance = 200_000  ->  max_available = 200_000 - 27_300 = 172_700
+        # intersection = 1000 / 0.005 = 200_000 == max_balance (inside the
+        # band [172_700, 200_000]).  Pre-fix this slipped through to the
+        # standard branch and produced a rel offer with min_size = 200_000.
+        wallet = MagicMock()
+        wallet.mixdepth_count = 5
+        wallet.utxo_cache = {}
+        wallet.get_balance = AsyncMock(return_value=200_000)
+        wallet.get_balance_for_offers = AsyncMock(return_value=200_000)
+
+        cfg = self._dual_config(rel_fee="0.005", abs_fee=1000, rel_min=50_000, abs_min=50_000)
+        manager = OfferManager(wallet, cfg, "J5TestMaker")
+        with patch("maker.offers.get_best_fidelity_bond", new=AsyncMock(return_value=None)):
+            offers = await manager.create_offers()
+
+        # rel offer must be suppressed cleanly: no offer announced with
+        # ``min_size`` at or above the actual max_available.
+        rel_offers = [o for o in offers if o.ordertype == OfferType.SW0_RELATIVE]
+        assert rel_offers == [], (
+            f"rel offer with intersection above max_available must be suppressed, got {rel_offers}"
+        )
+        # abs offer should be created, covering up to the usable balance
+        abs_offers = [o for o in offers if o.ordertype == OfferType.SW0_ABSOLUTE]
+        assert len(abs_offers) == 1
+        # max_available = 200_000 - 27_300 = 172_700
+        assert abs_offers[0].maxsize == 172_700
+        # min_size must stay fillable
+        assert abs_offers[0].minsize < abs_offers[0].maxsize
+
+    @pytest.mark.asyncio
+    async def test_intersection_inside_dust_band_no_offer_minsize_exceeds_balance(self, wallet_10m):
+        """No announced offer may carry a ``min_size`` larger than its ``max_available``.
+
+        General invariant covering the dual-offer auto-split: regardless
+        of where the intersection falls, every offer that
+        ``create_offers`` returns must be fillable (i.e. its ``minsize``
+        must not exceed the wallet's ``max_available``).  This guards
+        against future regressions of the "min_size == max_balance" bug.
+        """
+        # intersection = 1000 / 0.001 = 1_000_000 -- well below 10M balance,
+        # so the standard split applies and both offers should be valid.
+        cfg = self._dual_config(rel_fee="0.001", abs_fee=1000)
+        manager = OfferManager(wallet_10m, cfg, "J5TestMaker")
+        with patch("maker.offers.get_best_fidelity_bond", new=AsyncMock(return_value=None)):
+            offers = await manager.create_offers()
+
+        assert offers, "expected at least one offer for the standard split case"
+        for offer in offers:
+            assert offer.minsize < offer.maxsize, (
+                f"offer {offer.oid} has minsize {offer.minsize} >= maxsize {offer.maxsize}"
+            )

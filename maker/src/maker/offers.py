@@ -119,8 +119,11 @@ class OfferManager:
 
             # Step 2: compute size-range overrides from the *randomized* fees.
             # This means the advertised size boundary reveals nothing about the
-            # unrandomized fee configuration.
-            size_overrides = self._compute_dual_offer_size_overrides(
+            # unrandomized fee configuration.  ``suppressed_indices`` lists
+            # offers that the auto-split has rendered dominated and that must
+            # be skipped entirely (rather than emitted with a degenerate range
+            # that would trip the "Insufficient balance" warning).
+            size_overrides, suppressed_indices = self._compute_dual_offer_size_overrides(
                 offer_configs, randomized_fees, max_balance
             )
 
@@ -138,6 +141,12 @@ class OfferManager:
             # intersection-derived size bounds.
             offers: list[Offer] = []
             for offer_id, offer_cfg in enumerate(offer_configs):
+                if offer_id in suppressed_indices:
+                    logger.info(
+                        f"Offer {offer_id}: suppressed by dual-offer auto-split "
+                        f"(dominated by the companion offer across the usable range)"
+                    )
+                    continue
                 cjfee_str, rand_txfee, numeric_cjfee = randomized_fees[offer_id]
                 min_override, max_override = size_overrides.get(offer_id, (None, None))
                 offer = self._create_single_offer(
@@ -214,29 +223,46 @@ class OfferManager:
         offer_configs: list[OfferConfig],
         randomized_fees: list[tuple[str, int, float]],
         max_balance: int,
-    ) -> dict[int, tuple[int | None, int | None]]:
+    ) -> tuple[dict[int, tuple[int | None, int | None]], set[int]]:
         """Compute per-offer size-range overrides for dual rel+abs offers.
 
         The intersection is computed from the *randomized* fees so that the
         advertised size boundary does not leak information about the
         unrandomized fee configuration.
 
-        Returns a mapping from offer index to ``(min_size_override,
-        max_size_override)``.  When the maker advertises exactly one
-        relative offer and one absolute offer, the absolute offer is
-        capped at the fee intersection ``x = randomized_abs_fee / randomized_rel_fee``
-        and the relative offer is floored at the same point so the two
-        offers cover disjoint, contiguous size ranges:
+        Returns a tuple ``(overrides, suppressed)`` where:
 
-        - abs offer: ``[cfg.min_size, intersection]``
-        - rel offer: ``[intersection, max_available]``
+        - ``overrides`` maps offer index to ``(min_size_override,
+          max_size_override)``.  When the maker advertises exactly one
+          relative offer and one absolute offer, the absolute offer is
+          capped at the fee intersection
+          ``x = randomized_abs_fee / randomized_rel_fee`` and the
+          relative offer is floored at the same point so the two offers
+          cover disjoint, contiguous size ranges:
 
-        Returns an empty dict for any non-dual configuration (single
+          * abs offer: ``[cfg.min_size, intersection]``
+          * rel offer: ``[intersection, max_available]``
+
+        - ``suppressed`` is the set of offer indices that the auto-split
+          has rendered fully dominated and that the caller must skip.
+
+        ``max_balance`` is the gross mixdepth balance.  The actual ceiling
+        that :meth:`_create_single_offer` will enforce as ``max_available``
+        (``max_balance`` minus the dust threshold and the rel offer's
+        randomized tx-fee contribution) is recomputed here so the
+        intersection check uses the same usable balance.  Otherwise an
+        intersection falling in the band ``(max_available, max_balance]``
+        would be treated as "inside the usable range" here but rejected
+        later as "min_size > max_available", producing a misleading
+        "Insufficient balance" warning.
+
+        Returns ``({}, set())`` for any non-dual configuration (single
         offer, two same-type offers, three or more offers, etc.) so
         existing behaviour is preserved.
         """
+        empty: tuple[dict[int, tuple[int | None, int | None]], set[int]] = ({}, set())
         if len(offer_configs) != 2:
-            return {}
+            return empty
 
         # Find which offer is relative and which is absolute.
         rel_idx: int | None = None
@@ -244,17 +270,17 @@ class OfferManager:
         for idx, cfg in enumerate(offer_configs):
             if cfg.offer_type in (OfferType.SW0_RELATIVE, OfferType.SWA_RELATIVE):
                 if rel_idx is not None:
-                    return {}  # two relative offers -> not a dual rel+abs pair
+                    return empty  # two relative offers -> not a dual rel+abs pair
                 rel_idx = idx
             elif cfg.offer_type in (OfferType.SW0_ABSOLUTE, OfferType.SWA_ABSOLUTE):
                 if abs_idx is not None:
-                    return {}  # two absolute offers
+                    return empty  # two absolute offers
                 abs_idx = idx
             else:  # pragma: no cover - guarded by OfferType enum
-                return {}
+                return empty
 
         if rel_idx is None or abs_idx is None:
-            return {}
+            return empty
 
         rel_cfg = offer_configs[rel_idx]
         abs_cfg = offer_configs[abs_idx]
@@ -267,32 +293,50 @@ class OfferManager:
         if randomized_rel_fee <= 0 or randomized_abs_fee <= 0:
             # Pathological values (randomized into non-positive territory or
             # configured as zero); skip the auto-split.
-            return {}
+            return empty
 
         intersection = int(randomized_abs_fee / randomized_rel_fee)
 
         # Lower floor for the abs offer is its own configured min_size.
         abs_min = abs_cfg.min_size
-        # Upper ceiling for the rel offer is the wallet-derived max balance.
-        rel_max_ceiling = max_balance
+        # Upper ceiling for the rel offer is the wallet-derived max_available
+        # for that offer (i.e. after subtracting the dust threshold and the
+        # rel offer's randomized tx-fee contribution).  Using the gross
+        # ``max_balance`` here would let an intersection fall in the band
+        # ``(max_available, max_balance]`` and produce an unfillable rel
+        # offer with ``min_size > max_available``.
+        rel_randomized_txfee = randomized_fees[rel_idx][1]
+        rel_max_ceiling = max_balance - max(self.config.dust_threshold, rel_randomized_txfee)
 
         overrides: dict[int, tuple[int | None, int | None]] = {}
+        suppressed: set[int] = set()
 
         if intersection <= abs_min:
             # The relative offer is cheaper everywhere above ``abs_min``;
             # the absolute offer would never undercut it.  Drop the abs
-            # offer entirely by collapsing its range -- _create_single_offer
-            # will skip it.
-            overrides[abs_idx] = (abs_min, abs_min)
+            # offer entirely so the rel offer covers the full range.
+            logger.info(
+                f"Dual-offer auto-split: intersection ({intersection} sats) "
+                f"is at or below abs.min_size ({abs_min} sats); "
+                f"abs offer suppressed, rel offer covers "
+                f"[{max(rel_cfg.min_size, abs_min)}, {rel_max_ceiling}]"
+            )
+            suppressed.add(abs_idx)
             overrides[rel_idx] = (max(rel_cfg.min_size, abs_min), None)
-            return overrides
+            return overrides, suppressed
 
         if intersection >= rel_max_ceiling:
             # The absolute offer is cheaper across the entire usable range;
             # the relative offer would never beat it.  Drop the rel offer.
-            overrides[rel_idx] = (rel_max_ceiling, rel_max_ceiling)
+            logger.info(
+                f"Dual-offer auto-split: intersection ({intersection} sats) "
+                f"is at or above the usable balance ({rel_max_ceiling} sats, "
+                f"gross={max_balance}); rel offer suppressed, abs offer "
+                f"covers [{abs_min}, {rel_max_ceiling}]"
+            )
+            suppressed.add(rel_idx)
             overrides[abs_idx] = (abs_min, rel_max_ceiling)
-            return overrides
+            return overrides, suppressed
 
         # Standard case: the intersection sits strictly inside the usable
         # range, so each offer covers one side of it.
@@ -304,7 +348,7 @@ class OfferManager:
             f"abs offer covers [{abs_min}, {intersection}], "
             f"rel offer covers [{intersection}, {rel_max_ceiling}]"
         )
-        return overrides
+        return overrides, suppressed
 
     def _create_single_offer(
         self,
