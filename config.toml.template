@@ -159,7 +159,8 @@
 # Initial descriptor scan range (max address index per branch) imported into
 # Bitcoin Core's descriptor wallet. Defaults to 1000, matching Bitcoin Core's
 # default keypool lookahead. Wallets migrated from legacy joinmarket-clientserver
-# may have used addresses beyond this; setup auto-expands when needed (issue #475).
+# may have used addresses beyond this; run ``jmwallet info --scan-depth N`` once
+# with a larger N to re-import descriptors and rescan from genesis (issue #475).
 # scan_range = 1000
 
 # Dust threshold in satoshis

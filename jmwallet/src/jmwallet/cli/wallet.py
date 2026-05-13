@@ -306,28 +306,18 @@ def info(
         typer.Option(
             "--scan-depth",
             help=(
-                "Override the descriptor scan range (max address index per "
-                "branch) for this run. Defaults to the configured "
-                "``[wallet].scan_range`` (1000). Use this together with "
-                "``--rescan-deep`` to force a wider re-import on a wallet "
-                "migrated from legacy joinmarket-clientserver whose addresses "
-                "sit beyond the configured range (issue #475)."
+                "One-shot override of the descriptor scan range (max address "
+                "index per branch). When set, JoinMarket re-imports descriptors "
+                "at the given range and triggers a full rescan from genesis -- "
+                "use this once for a wallet migrated from legacy "
+                "joinmarket-clientserver whose addresses sit beyond the "
+                "default 1000 (issue #475). Without this flag, the configured "
+                "``[wallet].scan_range`` is used and an existing import is "
+                "left alone. Slow: a full rescan can take 20+ minutes on "
+                "mainnet."
             ),
         ),
     ] = None,
-    rescan_deep: Annotated[
-        bool,
-        typer.Option(
-            "--rescan-deep",
-            help=(
-                "Re-import descriptors with the resolved scan range and "
-                "trigger a full rescan from genesis. Escape hatch for "
-                "wallets where the auto-expanding setup did not find all "
-                "historical activity (issue #475). Slow: a full rescan can "
-                "take 20+ minutes on mainnet."
-            ),
-        ),
-    ] = False,
     show_empty: Annotated[
         bool,
         typer.Option(
@@ -390,7 +380,6 @@ def info(
             gap_limit=settings.wallet.gap_limit,
             scan_range=settings.wallet.scan_range,
             scan_depth=scan_depth,
-            rescan_deep=rescan_deep,
             show_empty=show_empty,
             creation_height=resolved.creation_height if resolved else None,
         )
@@ -406,7 +395,6 @@ async def _show_wallet_info(
     gap_limit: int = 20,
     scan_range: int = 1000,
     scan_depth: int | None = None,
-    rescan_deep: bool = False,
     show_empty: bool = False,
     creation_height: int | None = None,
 ) -> None:
@@ -418,15 +406,13 @@ async def _show_wallet_info(
             ``WalletService`` for sync-time logic.
         scan_range: Initial descriptor scan range. Forwarded to
             ``WalletService`` and used by ``setup_descriptor_wallet`` as the
-            initial lookahead window. Auto-expansion (issue #475) handles
-            wallets with deep addresses; ``--scan-depth`` / ``--rescan-deep``
-            remain as explicit escape hatches.
-        scan_depth: Optional explicit override for the descriptor scan range
-            on this invocation. Takes precedence over ``scan_range``.
-        rescan_deep: If True, force re-import of descriptors with the resolved
-            scan range and a full rescan from genesis. Escape hatch for
-            wallets where auto-expansion did not find all historical activity
-            (issue #475).
+            initial lookahead window.
+        scan_depth: Optional one-shot override of the descriptor scan range
+            for this invocation. When provided, forces re-import of
+            descriptors at the given range and a full rescan from genesis --
+            the recovery path for wallets migrated from legacy
+            joinmarket-clientserver whose addresses sit beyond the configured
+            ``scan_range`` (issue #475).
     """
     from jmwallet.backends.descriptor_wallet import DescriptorWalletBackend
     from jmwallet.backends.neutrino import NeutrinoBackend
@@ -495,8 +481,8 @@ async def _show_wallet_info(
     # field on ``WalletService`` is the initial descriptor lookahead window
     # (default 1000) and ``gap_limit`` is the true BIP44 trailing-empty
     # threshold. Migrated wallets with deep addresses (issue #475) are
-    # handled by ``setup_descriptor_wallet`` auto-expansion; the
-    # ``--scan-depth`` / ``--rescan-deep`` flags remain as escape hatches.
+    # handled by passing ``--scan-depth`` once: that forces a descriptor
+    # re-import at the given range and a full rescan from genesis.
     wallet = WalletService(
         mnemonic=mnemonic,
         backend=backend,
@@ -526,16 +512,16 @@ async def _show_wallet_info(
                     fidelity_bond_count=bond_count
                 )
 
-                if rescan_deep:
+                if scan_depth is not None:
                     # Recovery path for migrated wallets (issue #475): force
-                    # re-import of descriptors with the resolved range and a
+                    # re-import of descriptors with the requested range and a
                     # full rescan from genesis. This bypasses the
                     # ``is_wallet_setup`` short-circuit so an already-set-up
                     # wallet picks up the deeper range. ``smart_scan=False``
                     # + ``background_full_rescan=False`` means we scan from
                     # block 0 synchronously (slow but complete).
                     logger.info(
-                        f"--rescan-deep: re-importing descriptors with range "
+                        f"--scan-depth: re-importing descriptors with range "
                         f"[0, {effective_scan_range - 1}] and rescanning from genesis. "
                         "This may take 20+ minutes on mainnet."
                     )

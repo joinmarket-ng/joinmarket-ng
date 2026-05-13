@@ -374,7 +374,8 @@ class WalletSettings(BaseModel):
             "imported into Bitcoin Core's descriptor wallet. Defaults to 1000, "
             "matching Bitcoin Core's default keypool lookahead. Wallets migrated "
             "from legacy joinmarket-clientserver may have used addresses beyond "
-            "this; setup auto-expands when needed (issue #475)."
+            "this; run ``jmwallet info --scan-depth N`` once with a larger N "
+            "to re-import and rescan (issue #475)."
         ),
     )
     dust_threshold: int = Field(

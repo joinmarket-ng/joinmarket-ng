@@ -1728,7 +1728,7 @@ def test_showseed_password_via_env_var() -> None:
 
 
 # ============================================================================
-# Issue #475: scan-depth / rescan-deep recovery for migrated wallets
+# Issue #475: scan-depth recovery for migrated wallets
 # ============================================================================
 
 
@@ -1828,8 +1828,8 @@ def test_info_default_scan_range_uses_wallet_scan_range(monkeypatch) -> None:
         assert kwargs["scan_range"] == 1000
 
 
-def test_info_rescan_deep_bypasses_is_wallet_setup_short_circuit(monkeypatch) -> None:
-    """``info --rescan-deep`` must call ``setup_descriptor_wallet`` even when
+def test_info_scan_depth_bypasses_is_wallet_setup_short_circuit(monkeypatch) -> None:
+    """``info --scan-depth N`` must call ``setup_descriptor_wallet`` even when
     the wallet is already set up, with ``check_existing=False`` and
     ``smart_scan=False`` so the full descriptor re-import + genesis rescan runs
     (recovery path for migrated wallets, issue #475).
@@ -1850,7 +1850,7 @@ def test_info_rescan_deep_bypasses_is_wallet_setup_short_circuit(monkeypatch) ->
                 "jmwallet.backends.descriptor_wallet.DescriptorWalletBackend",
                 _stub_backend_class(mock_backend),
             ),
-            # Wallet is "already set up" - without --rescan-deep, setup would be skipped.
+            # Wallet is "already set up" - without --scan-depth, setup would be skipped.
             patch.object(WalletService, "is_descriptor_wallet_ready", AsyncMock(return_value=True)),
             patch.object(WalletService, "setup_descriptor_wallet", setup_mock),
             patch.object(WalletService, "sync_with_descriptor_wallet", AsyncMock(return_value=[])),
@@ -1861,7 +1861,6 @@ def test_info_rescan_deep_bypasses_is_wallet_setup_short_circuit(monkeypatch) ->
                     "info",
                     "--backend",
                     "descriptor_wallet",
-                    "--rescan-deep",
                     "--scan-depth",
                     "8000",
                 ],
