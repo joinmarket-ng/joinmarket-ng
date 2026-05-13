@@ -17,7 +17,11 @@ from loguru import logger
 from jmwallet.backends.base import BlockchainBackend
 from jmwallet.backends.descriptor_wallet import DescriptorWalletBackend
 from jmwallet.wallet.bip32 import HDKey
-from jmwallet.wallet.constants import DEFAULT_SCAN_RANGE, FIDELITY_BOND_BRANCH
+from jmwallet.wallet.constants import (
+    DEFAULT_SCAN_RANGE,
+    FIDELITY_BOND_BRANCH,
+    MAX_AUTO_SCAN_RANGE,
+)
 from jmwallet.wallet.models import UTXOInfo
 
 
@@ -745,6 +749,16 @@ class WalletSyncMixin:
 
             if await self.backend.is_wallet_setup(expected_descriptor_count=expected_count):
                 logger.info("Descriptor wallet already set up, skipping import")
+                # The wallet is already imported, but its descriptor range
+                # may have been sized before the user grew the wallet (or
+                # migrated from a legacy implementation). Probe used
+                # addresses and expand if needed; no-op when within range.
+                if rescan:
+                    scan_range = await self._auto_expand_scan_range(
+                        scan_range=scan_range,
+                        fidelity_bond_addresses=fidelity_bond_addresses,
+                    )
+                    self.scan_range = scan_range
                 return True
 
         # Generate descriptors for all mixdepths
@@ -773,7 +787,94 @@ class WalletSyncMixin:
             background_full_rescan=background_full_rescan,
         )
         logger.info("Descriptor wallet setup complete")
+
+        # Iterative auto-expansion: a wallet migrated from a legacy
+        # implementation (or one that simply outgrew its lookahead) may have
+        # used addresses past ``scan_range``. Probe Bitcoin Core for used
+        # addresses and, if any sit within ``gap_limit`` of the current range,
+        # double the range and re-import. Bounded by ``MAX_AUTO_SCAN_RANGE``
+        # so a corrupt/adversarial response can't loop forever. Only runs
+        # when a rescan happened (no rescan = no history to probe).
+        if rescan:
+            scan_range = await self._auto_expand_scan_range(
+                scan_range=scan_range,
+                fidelity_bond_addresses=fidelity_bond_addresses,
+            )
+            self.scan_range = scan_range
+
         return True
+
+    async def _auto_expand_scan_range(
+        self,
+        scan_range: int,
+        fidelity_bond_addresses: list[tuple[str, int, int]] | None = None,
+    ) -> int:
+        """Iteratively grow the descriptor scan range to cover all used addresses.
+
+        After an initial rescan, probe ``listreceivedbyaddress`` (via
+        ``backend.get_addresses_with_history``) to find the highest used
+        address index. If it sits within ``gap_limit`` of the current
+        ``scan_range``, double the range, re-import descriptors, rescan,
+        and probe again. Capped at ``MAX_AUTO_SCAN_RANGE``.
+
+        Args:
+            scan_range: Current descriptor lookahead window.
+            fidelity_bond_addresses: Optional bonds to keep included on
+                re-imports so they stay tracked.
+
+        Returns:
+            The final effective ``scan_range`` after any expansions.
+        """
+        assert isinstance(self.backend, DescriptorWalletBackend)
+
+        for _attempt in range(8):  # log2(100_000 / 1_000) ~ 7, plus headroom
+            await self._populate_address_cache(scan_range)
+            used = await self.backend.get_addresses_with_history()
+            highest_used = -1
+            for address in used:
+                cached = self.address_cache.get(address)
+                if cached is None:
+                    continue
+                _, _, index = cached
+                if index > highest_used:
+                    highest_used = index
+
+            if highest_used < scan_range - self.gap_limit:
+                logger.info(
+                    f"Scan range {scan_range} sufficient "
+                    f"(highest used index: {highest_used}, gap_limit: {self.gap_limit})"
+                )
+                return scan_range
+
+            if scan_range >= MAX_AUTO_SCAN_RANGE:
+                logger.warning(
+                    f"Scan range hit upper bound {MAX_AUTO_SCAN_RANGE} with highest used "
+                    f"index {highest_used}; not expanding further. Set [wallet].scan_range "
+                    f"manually or use --scan-depth to override."
+                )
+                return scan_range
+
+            new_range = min(scan_range * 2, MAX_AUTO_SCAN_RANGE)
+            logger.info(
+                f"Expanding scan range {scan_range} -> {new_range} "
+                f"(highest used index {highest_used} within gap_limit {self.gap_limit})"
+            )
+
+            descriptors = self._generate_import_descriptors(new_range)
+            if fidelity_bond_addresses:
+                for address, _locktime, _index in fidelity_bond_addresses:
+                    descriptors.append({"desc": f"addr({address})", "internal": False})
+
+            await self.backend.upgrade_descriptor_ranges(
+                descriptors, new_range_end=new_range - 1, rescan=True
+            )
+            scan_range = new_range
+
+        logger.warning(
+            f"Auto-expansion attempt limit reached at scan_range={scan_range}; "
+            f"continuing with current range."
+        )
+        return scan_range
 
     async def is_descriptor_wallet_ready(self, fidelity_bond_count: int = 0) -> bool:
         """
