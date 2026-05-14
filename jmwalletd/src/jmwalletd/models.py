@@ -260,13 +260,24 @@ class TxInfo(BaseModel):
     nVersion: int = 2
 
 
-class DirectSendRequest(BaseModel):
-    """POST /api/v1/wallet/{walletname}/taker/direct-send request."""
+#: Hard upper bound for satoshi amounts: 21M BTC * 1e8 sat/BTC.
+#: Used to reject impossible amounts at the API boundary so downstream code
+#: (which uses ``int.to_bytes(8, ...)`` for serialization) never crashes on
+#: out-of-range values.
+MAX_MONEY_SATS = 21_000_000 * 100_000_000
 
-    mixdepth: int
-    amount_sats: int
+
+class DirectSendRequest(BaseModel):
+    """POST /api/v1/wallet/{walletname}/taker/direct-send request.
+
+    ``amount_sats`` is the amount to send in satoshis; ``0`` means sweep the
+    entire mixdepth. ``mixdepth`` is the source account index.
+    """
+
+    mixdepth: int = Field(..., ge=0)
+    amount_sats: int = Field(..., ge=0, le=MAX_MONEY_SATS)
     destination: str
-    txfee: int | None = None
+    txfee: int | None = Field(default=None, ge=0)
 
 
 class DirectSendResponse(BaseModel):
@@ -281,13 +292,19 @@ class DirectSendResponse(BaseModel):
 
 
 class DoCoinjoinRequest(BaseModel):
-    """POST /api/v1/wallet/{walletname}/taker/coinjoin request."""
+    """POST /api/v1/wallet/{walletname}/taker/coinjoin request.
 
-    mixdepth: int
-    amount_sats: int
-    counterparties: int
+    ``counterparties`` is the number of makers requested in the coinjoin;
+    the lower bound of 2 matches the minimum the taker protocol can run with,
+    and the upper bound prevents a malformed request from triggering large
+    allocations / long-running RPC under the auth boundary.
+    """
+
+    mixdepth: int = Field(..., ge=0)
+    amount_sats: int = Field(..., ge=0, le=MAX_MONEY_SATS)
+    counterparties: int = Field(..., ge=2, le=20)
     destination: str
-    txfee: int | None = None
+    txfee: int | None = Field(default=None, ge=0)
 
 
 class TumblerPlanRequest(BaseModel):

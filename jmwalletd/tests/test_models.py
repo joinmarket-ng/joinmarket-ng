@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import pytest
+from pydantic import ValidationError
+
 from jmwalletd.models import (
     ConfigGetRequest,
     ConfigSetRequest,
     CreateWalletRequest,
     DirectSendRequest,
+    DoCoinjoinRequest,
     ErrorMessage,
     FreezeRequest,
     GetAddressResponse,
@@ -198,6 +202,73 @@ class TestDirectSendRequest:
             mixdepth=0, amount_sats=100_000, destination="bcrt1qtest", txfee=1000
         )
         assert req.txfee == 1000
+
+    def test_sweep_amount_is_zero(self) -> None:
+        # ``0`` is the sentinel for "sweep the whole mixdepth" and must stay valid.
+        req = DirectSendRequest(mixdepth=0, amount_sats=0, destination="bcrt1qtest")
+        assert req.amount_sats == 0
+
+    def test_negative_amount_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            DirectSendRequest(mixdepth=0, amount_sats=-1, destination="bcrt1qtest")
+
+    def test_negative_mixdepth_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            DirectSendRequest(mixdepth=-1, amount_sats=100, destination="bcrt1qtest")
+
+    def test_negative_txfee_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            DirectSendRequest(mixdepth=0, amount_sats=100, destination="bcrt1qtest", txfee=-1)
+
+    def test_amount_above_money_supply_rejected(self) -> None:
+        # 21M BTC + 1 sat must not be accepted; otherwise downstream
+        # ``int.to_bytes(8, ...)`` for unsigned 64-bit serialization can crash.
+        with pytest.raises(ValidationError):
+            DirectSendRequest(
+                mixdepth=0,
+                amount_sats=21_000_000 * 100_000_000 + 1,
+                destination="bcrt1qtest",
+            )
+
+
+class TestDoCoinjoinRequest:
+    def test_valid(self) -> None:
+        req = DoCoinjoinRequest(
+            mixdepth=0,
+            amount_sats=100_000,
+            counterparties=5,
+            destination="bcrt1qtest",
+        )
+        assert req.counterparties == 5
+
+    def test_counterparties_below_minimum_rejected(self) -> None:
+        # A coinjoin with only 1 counterparty defeats the purpose; the
+        # protocol's effective minimum is 2.
+        with pytest.raises(ValidationError):
+            DoCoinjoinRequest(
+                mixdepth=0,
+                amount_sats=100_000,
+                counterparties=1,
+                destination="bcrt1qtest",
+            )
+
+    def test_counterparties_huge_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            DoCoinjoinRequest(
+                mixdepth=0,
+                amount_sats=100_000,
+                counterparties=10_000_000,
+                destination="bcrt1qtest",
+            )
+
+    def test_negative_amount_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            DoCoinjoinRequest(
+                mixdepth=0,
+                amount_sats=-1,
+                counterparties=5,
+                destination="bcrt1qtest",
+            )
 
 
 class TestFreezeRequest:
