@@ -106,20 +106,31 @@ def _display_standard_send_confirmation(
     mining_fee: int | None,
     additional_info: dict[str, Any] | None,
 ) -> None:
-    """Display standard send transaction confirmation (non-coinjoin)."""
+    """Display standard transaction confirmation (non-coinjoin).
+
+    Layout follows the workflow ordering proposed in issue #107:
+    source mixdepth, destination, amount, change, fee rate, miner fee. Field
+    labels are aligned in a left-aligned column for readability.
+    """
     from jmcore.bitcoin import format_amount
 
     print("\n" + "=" * _SEND_WIDTH)
-    print("Expected SEND Transaction")
+    print(f"Expected {operation.upper()} Transaction")
     print("=" * _SEND_WIDTH)
 
     # Consume known keys from additional_info; any remaining keys are
     # rendered after the known fields to preserve forward compatibility
-    # with callers that pass custom metadata.
+    # with callers that pass custom metadata. We accept both the legacy
+    # "Fee Rate" and the new "Miner Fee Rate" key for the rate field.
     info = dict(additional_info) if additional_info else {}
     source_mixdepth = info.pop("Source Mixdepth", None)
     change = info.pop("Change", None)
     fee_rate = info.pop("Miner Fee Rate", None)
+    if fee_rate is None:
+        fee_rate = info.pop("Fee Rate", None)
+    else:
+        # Drop the legacy alias if both keys were passed, to avoid double rendering.
+        info.pop("Fee Rate", None)
 
     # Source Mixdepth
     if source_mixdepth is not None:
@@ -142,11 +153,12 @@ def _display_standard_send_confirmation(
     if change is not None:
         print(f"{'Change:':<{_LABEL_WIDTH}}  {change}")
 
-    # Miner Fee Rate
+    # Miner Fee Rate (renamed from "Fee Rate" for clarity since SEND has no
+    # maker fees, only network/miner fees)
     if fee_rate is not None:
         print(f"{'Miner Fee Rate:':<{_LABEL_WIDTH}}  {fee_rate}")
 
-    # Miner Fee (use mining_fee if provided, otherwise fall back to fee)
+    # Miner Fee: prefer mining_fee, fall back to the legacy fee argument.
     effective_mining_fee = mining_fee if mining_fee is not None else fee
     if effective_mining_fee is not None:
         print(f"{'Miner Fee:':<{_LABEL_WIDTH}}  {format_amount(effective_mining_fee)}")
