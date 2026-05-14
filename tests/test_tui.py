@@ -127,7 +127,7 @@ def test_tui_script_fidelity_bonds_list_uses_msgbox_when_empty() -> None:
     content = SCRIPT_PATH.read_text()
     list_block = content.split("LIST)", 1)[1].split("CREATE)", 1)[0]
     assert "whiptail" in list_block
-    assert "No fidelity bonds" in list_block
+    assert "No Fidelity Bonds" in list_block
     # Must capture jm-wallet output so it can be inspected before deciding
     # which TUI element to show.
     assert "jm-wallet list-bonds" in list_block
