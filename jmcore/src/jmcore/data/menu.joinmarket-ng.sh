@@ -1620,37 +1620,28 @@ if [ "${RASPIBLITZ}" -eq 1 ]; then
                                     whiptail --title " Date Error " --msgbox "Invalid lockdate.\nMaximum lockdate is 2099-12." 8 50
                                     continue
                                 fi
+
+                                # Final confirmation with explicit lock warning
                                 if [[ "$LOCKDATE" < "$CURRENT_YM" ]]; then
-                                    if ! whiptail --title " Warning " \
-                                        --yesno "The lockdate ${LOCKDATE} is in the past.\n\nPast dates are only useful for recreating addresses\nfor existing bonds.\n\nContinue anyway?" \
-                                        12 60 --defaultno 3>&1 1>&2 2>&3; then
-                                        continue
-                                    fi
+                                    # Past date - coins are already spendable
+                                    CONFIRM_TEXT="\n$WALLET_INFO | Maker Bot: $MAKER_STATUS\n\nGenerate a Fidelity Bond address?\n\nLockdate: ${LOCKDATE} (Date is in the past)\n\nWARNING: This lockdate is in the past.\n         All coins on this address are already SPENDABLE.\n         This is only useful for recreating existing bond addresses.\n\nProceed?"
+                                else
+                                    # Future date - coins will be locked
+                                    CONFIRM_TEXT="\n$WALLET_INFO | Maker Bot: $MAKER_STATUS\n\nGenerate a Fidelity Bond address?\n\nLockdate: ${LOCKDATE}\n\nWARNING: Coins sent to this address will be LOCKED\n         and NOT spendable until ${LOCKDATE}.\n\nProceed?"
                                 fi
-                                break
+
+                                if ! whiptail --title " Confirm Fidelity Bond " \
+                                    --yesno "$CONFIRM_TEXT" \
+                                    16 64 --defaultno 3>&1 1>&2 2>&3; then
+                                    continue  # Back to lockdate prompt
+                                fi
+
+                                break  # Everything confirmed
                             done
 
-                            # Confirmation with explicit lock warning
-                            if [[ "$LOCKDATE" < "$CURRENT_YM" ]]; then
-                                # Past date - coins are already spendable
-                                if ! whiptail --title " Confirm Fidelity Bond " \
-                                    --yesno "\n$WALLET_INFO | Maker Bot: $MAKER_STATUS\n\nGenerate a Fidelity Bond address?\n\nLockdate: ${LOCKDATE} (Date in the past)\n\nNote: This lockdate is in the past.\nAll coins on this address are spendable.\nThis is only useful for recreating existing bond addresses.\n\nProceed?" \
-                                    16 64 --defaultno 3>&1 1>&2 2>&3; then
-                                    exit 1
-                                fi
-                            else
-                                # Future date - coins will be locked
-                                if ! whiptail --title " Confirm Fidelity Bond " \
-                                    --yesno "\n$WALLET_INFO | Maker Bot: $MAKER_STATUS\n\nGenerate a Fidelity Bond address?\n\nLockdate: ${LOCKDATE}\n\nWARNING: Coins sent to this address will be LOCKED\n         and NOT spendable until ${LOCKDATE}.\n\nProceed?" \
-                                    16 64 --defaultno 3>&1 1>&2 2>&3; then
-                                    exit 1
-                                fi
-                            fi
-
                             # Generate bond address, capture output for address extraction
-                            BONDS_CREATE_OUT=$(mktemp)
-                            jm-wallet generate-bond-address \
-                              --locktime-date "${LOCKDATE}" > "$BONDS_CREATE_OUT" 2>&1
+                            BONDS_CREATE_OUT=$(jm-wallet generate-bond-address \
+                              --locktime-date "${LOCKDATE}" 2>&1)
                             BONDS_CREATE_RC=$?
 
                             if [ $BONDS_CREATE_RC -eq 0 ]; then
@@ -1662,41 +1653,35 @@ if [ "${RASPIBLITZ}" -eq 1 ]; then
                                 # accept the inner '1' of "tb1"/"bcrt1" via the
                                 # legacy [13] branch and drop the network HRP
                                 # (e.g. "tb1qvksm..." -> "1qvksm...").
-                                BOND_ADDR=$(grep -oE '(bcrt1|bc1|tb1|[13])[a-zA-HJ-NP-Z0-9]{25,87}' "$BONDS_CREATE_OUT" | head -1)
+                                BOND_ADDR=$(printf '%s' "$BONDS_CREATE_OUT" | grep -oE '(bcrt1|bc1|tb1|[13])[a-zA-HJ-NP-Z0-9]{25,87}' | head -1)
 
                                 # Show address prominently in whiptail msgbox
+                                if [[ "$LOCKDATE" < "$CURRENT_YM" ]]; then
+                                    # Past date - coins are already spendable
+                                    BOND_MSG="Fidelity Bond address generated:\n\n${BOND_ADDR}\n\nFunds are ALREADY SPENDABLE (lockdate is in the past)."
+                                else
+                                    # Future date - funds will be locked
+                                    BOND_MSG="Fidelity Bond address generated:\n\n${BOND_ADDR}\n\nSend coins to this address to create the Fidelity Bond.\nFunds will be LOCKED until ${LOCKDATE}."
+                                fi
                                 whiptail --title " Fidelity Bond Address " --msgbox \
-                                    "Bond address generated:\n\n${BOND_ADDR}\n\nSend coins to this address to create the Fidelity Bond.\nFunds will be LOCKED until ${LOCKDATE}." \
+                                    "$BOND_MSG" \
                                     14 70
-
-                                # Show technical details on terminal
-                                clear
-                                echo "=== Fidelity Bond Technical Details ==="
-                                echo ""
-                                echo "The following details are only needed for advanced use"
-                                echo "(e.g. manual recovery or external verification)."
-                                echo ""
-                                cat "$BONDS_CREATE_OUT"
-                                echo ""
-                                echo "Press [Enter] to return to Fidelity Bonds menu"
-                                pause
                             else
                                 # Show simple error in msgbox
                                 whiptail --title " Error " --msgbox \
-                                    "Failed to generate bond address.\n\nCheck the terminal output for details." \
+                                    "Failed to generate Fidelity Bond address.\n\nCheck the terminal output for details." \
                                     10 55
 
-                                # Show technical details on terminal
+                                # Show error details on terminal
                                 clear
                                 echo "=== Fidelity Bond Error Details ==="
                                 echo ""
                                 echo "The following error details may help diagnose the problem."
                                 echo ""
-                                cat "$BONDS_CREATE_OUT"
+                                printf '%s\n' "$BONDS_CREATE_OUT"
                                 echo ""
                                 pause
                             fi
-                            rm -f "$BONDS_CREATE_OUT"
                         )
                         ;;
                     BACK|"")
