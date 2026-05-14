@@ -578,9 +578,12 @@ async def test_tumbler_stop_mid_run_cancels_remaining_phases(
     # post-stop state is exposed by ``GET /tumbler/status`` below.
     await _post_stop(client, name, token)
 
-    # Give the runner a moment to finalise its CANCELLED persistence.
-    await asyncio.sleep(2.0)
-    final = await _get_status(client, name, token)
+    # Poll until the runner finishes tearing down the in-flight phase and
+    # persists the terminal CANCELLED state. A fixed sleep is too tight: an
+    # in-flight ``do_coinjoin`` may need several seconds to unwind before the
+    # runner observes the stop request and writes the final plan.
+    async with _background_miner():
+        final = await _poll_until_terminal(client, name, token)
     assert final["status"].lower() == "cancelled"
     # Any phase after the one that was running must be PENDING or CANCELLED
     # -- never RUNNING or COMPLETED. At least one phase completed; at least
