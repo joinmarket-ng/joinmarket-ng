@@ -153,6 +153,22 @@ jobs:
             --cov-report=term-missing --cov-report=xml --cov-report=html \
             -v --fail-on-skip
 
+      - name: Run repo-root tests
+        # Tests under the top-level tests/ directory (TUI, release scripts,
+        # changelog/commit helpers, flatpak, finalize-bond-psbt) cannot be
+        # combined into the previous invocation because each component ships
+        # its own tests/ package and the duplicated module names trip
+        # pytest's collector. Run them as a separate invocation. Docker- and
+        # browser-marked tests under tests/e2e and tests/playwright are
+        # excluded by the default '-m "not docker"' filter in pytest.ini.
+        run: |
+          pytest -c pytest.ini tests \
+            --ignore=tests/playwright \
+            --junitxml=junit/root-tests.xml \
+            --cov=scripts --cov=jmcore \
+            --cov-report=term-missing --cov-report=xml:coverage-root.xml \
+            -v --fail-on-skip
+
       - name: Rename coverage file
         if: always()
         run: mv coverage.xml coverage-unit-py${{ matrix.python-version }}.xml
@@ -162,7 +178,9 @@ jobs:
           name: unit-test-results-py${{ matrix.python-version }}
           path: |
             junit/unit-tests.xml
+            junit/root-tests.xml
             coverage-unit-py${{ matrix.python-version }}.xml
+            coverage-root.xml
             htmlcov/
         if: always()
 

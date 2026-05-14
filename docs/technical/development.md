@@ -57,11 +57,18 @@ Changelog entries are generated automatically at release time from these trailer
 
 ## Tests
 
-Fast unit test run:
+Fast unit test run (per-component packages plus the repo-root `tests/`
+directory, which holds the TUI script tests, release/changelog/flatpak
+helper tests, and the finalize-bond-psbt tests):
 
 ```bash
-pytest jmcore directory_server orderbook_watcher maker taker jmwallet
+pytest jmcore directory_server orderbook_watcher maker taker jmwallet jmwalletd tumbler
+pytest --ignore=tests/playwright tests
 ```
+
+The two invocations are required because each component ships its own
+`tests` package and pytest's collector cannot reconcile the duplicated
+top-level module name in a single run.
 
 Full orchestrated suite (unit + Docker-backed phases):
 

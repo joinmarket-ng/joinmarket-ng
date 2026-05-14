@@ -411,6 +411,26 @@ main() {
         --cov-report=html:htmlcov/unit \
         jmcore/ jmwallet/ directory_server/ orderbook_watcher/ maker/ taker/
 
+    # Repo-root tests (TUI launcher script, release/changelog/flatpak helpers,
+    # finalize-bond-psbt). These live under the top-level tests/ directory and
+    # cannot share an invocation with the per-component test packages because
+    # of duplicated 'tests' module names. tests/e2e is excluded because its
+    # docker marker filters it out anyway and tests/playwright is browser-only.
+    COVERAGE_FILE=.coverage.root run_test_suite "Repo-Root Tests" \
+        -lv \
+        --ignore=tests/playwright \
+        --cov=scripts --cov=jmcore \
+        --cov-report=term-missing \
+        --cov-report=html:htmlcov/root \
+        tests/
+
+    if [ -f .coverage.root ]; then
+        COVERAGE_FILES+=(".coverage.root")
+        log_info "Saved repo-root test coverage"
+    else
+        log_warning "No .coverage file found for repo-root tests"
+    fi
+
     # Save unit test coverage
     if [ -f .coverage.unit ]; then
         COVERAGE_FILES+=(".coverage.unit")
