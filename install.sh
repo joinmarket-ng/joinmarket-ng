@@ -363,6 +363,199 @@ resolve_to_commit_hash() {
     echo "$ref"
 }
 
+# Verify that the resolved commit hash for $version is attested by at least
+# one trusted GPG signature stored under signatures/<version>/ in the repo.
+#
+# Returns 0 on success, 1 on failure. Honours $SKIP_VERIFY: when true, prints
+# a warning and returns 0 without verifying. Intended to be called after
+# resolve_to_commit_hash so we have the commit hash the install will pull.
+#
+# We trust the repository's own signatures/trusted-keys.txt and pubkeys
+# directory as ground truth, because the install.sh the user is running was
+# itself fetched from main of the same repository, so an attacker who can
+# rewrite trusted-keys.txt can also rewrite install.sh. The substantive
+# protection here is that an attacker who only controls a release tag (or
+# a CDN edge serving the tarball) cannot bypass GPG verification: they
+# would also have to fake a signature in signatures/<version>/ that
+# verifies against one of the keys committed to main of the source repo.
+verify_release_signature() {
+    local version="$1"
+    local commit_hash="$2"
+
+    if [[ "$SKIP_VERIFY" == "true" ]]; then
+        print_warning "Skipping GPG signature verification (--skip-verify or --dev)"
+        return 0
+    fi
+
+    print_header "Verifying release signatures"
+    print_info "Version: $version"
+    print_info "Commit:  $commit_hash"
+
+    if ! command -v gpg &> /dev/null; then
+        print_error "gpg is required for release verification but was not found."
+        print_error "Install GnuPG (e.g. 'apt install gnupg' / 'brew install gnupg'),"
+        print_error "or rerun with --skip-verify to bypass (NOT recommended)."
+        return 1
+    fi
+
+    if ! command -v curl &> /dev/null; then
+        print_error "curl is required to fetch signatures but was not found."
+        return 1
+    fi
+
+    local raw_base="https://raw.githubusercontent.com/${GITHUB_REPO}/main"
+    local api_base="https://api.github.com/repos/${GITHUB_REPO}/contents/signatures/${version}?ref=main"
+
+    # Ephemeral working dir and GPG home so we don't touch the user's keyring.
+    local work_dir
+    work_dir=$(mktemp -d -t jmng-verify.XXXXXX)
+    if [[ -z "$work_dir" || ! -d "$work_dir" ]]; then
+        print_error "Failed to create temporary directory for verification."
+        return 1
+    fi
+    local gnupg_home="$work_dir/gnupg"
+    mkdir -p "$gnupg_home"
+    chmod 700 "$gnupg_home"
+
+    # Cleanup on every exit path of this function.
+    local rc=1
+    _verify_cleanup() {
+        rm -rf "$work_dir" 2>/dev/null || true
+    }
+
+    # Fetch the trusted-keys list and import the corresponding pubkeys from
+    # the repo's signatures/pubkeys/ directory. We deliberately do NOT use a
+    # keyserver here: the source of truth is the repo itself, which is what
+    # the install.sh the user is running also came from.
+    local trusted_keys_file="$work_dir/trusted-keys.txt"
+    if ! curl -fsSL "$raw_base/signatures/trusted-keys.txt" -o "$trusted_keys_file"; then
+        print_error "Failed to fetch trusted-keys.txt from $raw_base"
+        _verify_cleanup
+        return 1
+    fi
+
+    local imported_fps=()
+    while IFS=' ' read -r fingerprint name || [[ -n "$fingerprint" ]]; do
+        # Skip comments and empty lines
+        [[ "$fingerprint" =~ ^#.*$ || -z "$fingerprint" ]] && continue
+        local pubkey_url="$raw_base/signatures/pubkeys/${fingerprint}.asc"
+        local pubkey_file="$work_dir/${fingerprint}.asc"
+        if curl -fsSL "$pubkey_url" -o "$pubkey_file" 2>/dev/null; then
+            if GNUPGHOME="$gnupg_home" gpg --quiet --batch --import "$pubkey_file" 2>/dev/null; then
+                imported_fps+=("$fingerprint")
+                print_info "Imported trusted key $fingerprint ($name)"
+            else
+                print_warning "Failed to import key $fingerprint ($name)"
+            fi
+        else
+            print_warning "Pubkey not found in repo for $fingerprint ($name)"
+        fi
+    done < "$trusted_keys_file"
+
+    if [[ ${#imported_fps[@]} -eq 0 ]]; then
+        print_error "No trusted GPG keys could be imported. Aborting."
+        _verify_cleanup
+        return 1
+    fi
+
+    # List signatures for this version directory via the GitHub contents API.
+    # We can't 'ls' a remote dir, so the API enumerates the .sig files we
+    # then fetch individually. If the directory is missing, the release was
+    # not signed and we refuse to install (use --skip-verify to bypass).
+    local sigs_listing="$work_dir/sigs-listing.json"
+    if ! curl -fsSL "$api_base" -o "$sigs_listing"; then
+        print_error "No signatures directory for $version on main."
+        print_error "Either the release is unsigned or the version tag is wrong."
+        print_error "Rerun with --skip-verify to bypass (NOT recommended)."
+        _verify_cleanup
+        return 1
+    fi
+
+    # Extract <fp>.sig filenames. Use grep/sed instead of jq to avoid an
+    # extra runtime dependency; the GitHub API JSON keys are stable.
+    local sig_names
+    sig_names=$(grep -oE '"name":[[:space:]]*"[A-F0-9]{40}\.sig"' "$sigs_listing" | sed -E 's/.*"([A-F0-9]{40}\.sig)".*/\1/')
+    if [[ -z "$sig_names" ]]; then
+        print_error "No signature files found under signatures/$version/."
+        print_error "Rerun with --skip-verify to bypass (NOT recommended)."
+        _verify_cleanup
+        return 1
+    fi
+
+    local valid_sigs=0
+    local commit_matched=0
+    local signers=()
+    local sig_name
+    while IFS= read -r sig_name; do
+        [[ -z "$sig_name" ]] && continue
+        local fingerprint="${sig_name%.sig}"
+
+        # Only trust signatures whose fingerprint is in trusted-keys.txt.
+        local trusted=0
+        local imp_fp
+        for imp_fp in "${imported_fps[@]}"; do
+            if [[ "$imp_fp" == "$fingerprint" ]]; then
+                trusted=1
+                break
+            fi
+        done
+        if [[ $trusted -eq 0 ]]; then
+            print_warning "Ignoring signature from untrusted key $fingerprint"
+            continue
+        fi
+
+        local sig_url="$raw_base/signatures/${version}/${fingerprint}.sig"
+        local man_url="$raw_base/signatures/${version}/${fingerprint}-manifest.txt"
+        local sig_file="$work_dir/${fingerprint}.sig"
+        local man_file="$work_dir/${fingerprint}-manifest.txt"
+
+        if ! curl -fsSL "$sig_url" -o "$sig_file"; then
+            print_warning "Failed to fetch signature $sig_name"
+            continue
+        fi
+        if ! curl -fsSL "$man_url" -o "$man_file"; then
+            print_warning "Failed to fetch manifest for $fingerprint"
+            continue
+        fi
+
+        if ! GNUPGHOME="$gnupg_home" gpg --quiet --batch --verify "$sig_file" "$man_file" 2>/dev/null; then
+            print_warning "Bad signature from $fingerprint"
+            continue
+        fi
+
+        # Match the manifest's commit: line against the resolved commit.
+        local manifest_commit
+        manifest_commit=$(awk -F': ' '$1 == "commit" { print $2; exit }' "$man_file" | tr -d '[:space:]')
+        if [[ -z "$manifest_commit" ]]; then
+            print_warning "Manifest from $fingerprint has no 'commit' line; ignoring"
+            continue
+        fi
+
+        if [[ "$manifest_commit" != "$commit_hash" ]]; then
+            print_warning "Signed manifest commit ($manifest_commit) != install commit ($commit_hash) for $fingerprint"
+            continue
+        fi
+
+        valid_sigs=$((valid_sigs + 1))
+        commit_matched=1
+        signers+=("$fingerprint")
+        print_success "Valid signature from $fingerprint"
+    done <<< "$sig_names"
+
+    if [[ $valid_sigs -ge 1 && $commit_matched -eq 1 ]]; then
+        print_success "Release $version verified ($valid_sigs trusted signature(s))"
+        rc=0
+    else
+        print_error "Release $version could not be verified."
+        print_error "No trusted signature attested the install commit $commit_hash."
+        print_error "Rerun with --skip-verify to bypass (NOT recommended)."
+        rc=1
+    fi
+
+    _verify_cleanup
+    return $rc
+}
+
 # Create or update virtual environment
 setup_virtualenv() {
     print_header "Setting Up Virtual Environment"
@@ -426,7 +619,29 @@ install_packages() {
     fi
     export JOINMARKET_BUILD_REF="$VERSION"
 
-    # Always install core libraries
+    # Verify the resolved commit against GPG signatures stored in the repo.
+    # Skipped automatically for branch installs (--dev / main) and when the
+    # user passes --skip-verify. On success we pin the install to the
+    # verified commit hash so a tag that gets repointed after verification
+    # cannot smuggle in a different commit (TOCTOU).
+    if [[ -n "$install_commit" && "$install_commit" != "$VERSION" ]]; then
+        if ! verify_release_signature "$VERSION" "$install_commit"; then
+            exit 1
+        fi
+        if [[ "$SKIP_VERIFY" != "true" ]]; then
+            git_base="git+https://github.com/${GITHUB_REPO}.git@${install_commit}"
+            print_info "Pinned install to verified commit ${install_commit:0:12}"
+        fi
+    else
+        # Could not resolve to a commit (offline / API failure / dev mode).
+        # verify_release_signature requires a commit to compare against, so
+        # we only call it when we have one. In --dev mode SKIP_VERIFY is
+        # already true; otherwise this is best-effort and we fall through.
+        if [[ "$SKIP_VERIFY" != "true" ]]; then
+            print_warning "Could not resolve $VERSION to a commit hash; skipping signature verification."
+            print_warning "Rerun with a tagged --version to enable verification."
+        fi
+    fi
     print_info "Installing jmcore..."
     pip install "${git_base}#subdirectory=jmcore" --quiet
     print_success "jmcore installed"
@@ -475,6 +690,19 @@ update_packages() {
     local commit_hash=$(resolve_to_commit_hash "$VERSION")
     if [ "$commit_hash" != "$VERSION" ]; then
         print_info "Resolved to commit: ${commit_hash:0:8}..."
+    fi
+
+    # Verify the resolved commit against GPG signatures stored in the repo.
+    # See the matching block in install_packages() for design notes.
+    if [[ "$commit_hash" != "$VERSION" ]]; then
+        if ! verify_release_signature "$VERSION" "$commit_hash"; then
+            exit 1
+        fi
+    else
+        if [[ "$SKIP_VERIFY" != "true" ]]; then
+            print_warning "Could not resolve $VERSION to a commit hash; skipping signature verification."
+            print_warning "Rerun with a tagged --version to enable verification."
+        fi
     fi
 
     local git_base="git+https://github.com/${GITHUB_REPO}.git@${commit_hash}"
@@ -860,6 +1088,9 @@ Options:
   --version VERSION   Install specific version (default: latest)
   --dev               Install from main branch (for development)
   --skip-tor          Skip Tor installation and configuration
+  --skip-verify       Skip GPG signature verification of the release
+                      (NOT recommended; auto-enabled with --dev or
+                      --version main since main branch is not signed)
   --venv PATH         Custom virtual environment path
 
 Note: When piped from curl, auto-confirm is enabled by default for Tor
@@ -898,6 +1129,7 @@ parse_args() {
     SKIP_TOR=false
     INSTALL_VERSION=""
     EXPLICIT_COMPONENTS=false
+    SKIP_VERIFY=false
 
     while [[ $# -gt 0 ]]; do
         case $1 in
@@ -929,6 +1161,14 @@ parse_args() {
                 ;;
             --dev)
                 INSTALL_VERSION="main"
+                # No signed releases are produced for the main branch HEAD,
+                # so verification is meaningless here. Operators that pass
+                # --dev are explicitly opting into a moving target.
+                SKIP_VERIFY=true
+                shift
+                ;;
+            --skip-verify)
+                SKIP_VERIFY=true
                 shift
                 ;;
             --skip-tor)
@@ -946,6 +1186,12 @@ parse_args() {
                 ;;
         esac
     done
+
+    # Treat an explicit --version main as a dev install for verification
+    # purposes; the main branch has no release signatures by design.
+    if [[ "$INSTALL_VERSION" == "main" ]]; then
+        SKIP_VERIFY=true
+    fi
 
     # Set defaults if components not explicitly specified
     if [[ "$EXPLICIT_COMPONENTS" == "false" ]]; then
