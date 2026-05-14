@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 from jmcore.crypto import NickIdentity
 from jmcore.notifications import get_notifier
 from jmcore.paths import remove_nick_state, write_nick_state
+from jmcore.process_hardening import harden_current_process
 from jmcore.protocol import JM_VERSION
 from jmcore.settings import get_settings
 from jmwallet.backends.descriptor_wallet import DescriptorWalletBackend
@@ -189,6 +190,9 @@ async def run_watcher(log_level: str | None = None) -> None:
 
 
 def main() -> None:
+    # Disable core dumps and ptrace; the watcher holds NaCl session keys.
+    harden_current_process()
+
     parser = argparse.ArgumentParser(description="JoinMarket Orderbook Watcher")
     parser.add_argument(
         "--log-level",

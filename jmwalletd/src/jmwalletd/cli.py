@@ -41,7 +41,11 @@ def serve(
     from loguru import logger
 
     from jmcore.paths import get_default_data_dir
+    from jmcore.process_hardening import harden_current_process
     from jmwalletd.app import create_app
+
+    # Disable core dumps and ptrace before loading wallet secrets.
+    harden_current_process()
 
     resolved_data_dir = data_dir or get_default_data_dir()
     resolved_data_dir.mkdir(parents=True, exist_ok=True)

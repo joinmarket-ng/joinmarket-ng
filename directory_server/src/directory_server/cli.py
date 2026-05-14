@@ -154,6 +154,11 @@ def health_command(args: argparse.Namespace) -> int:
 
 
 def main() -> None:
+    from jmcore.process_hardening import harden_current_process
+
+    # Disable core dumps and ptrace before loading directory-node keys.
+    harden_current_process()
+
     # Load settings to get defaults from config
     settings = get_settings()
 

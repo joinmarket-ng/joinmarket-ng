@@ -610,6 +610,11 @@ def start(
     Configuration is loaded from ~/.joinmarket-ng/config.toml (or $JOINMARKET_DATA_DIR/config.toml),
     environment variables, and CLI arguments. CLI arguments have the highest priority.
     """
+    from jmcore.process_hardening import harden_current_process
+
+    # Disable core dumps and ptrace before loading wallet secrets.
+    harden_current_process()
+
     # Load settings (log_level=None means use settings.logging.level)
     settings = setup_cli(log_level, data_dir=data_dir)
 
