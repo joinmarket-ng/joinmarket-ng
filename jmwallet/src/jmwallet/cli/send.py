@@ -65,7 +65,11 @@ def send(
         str | None, typer.Option("--neutrino-url", envvar="NEUTRINO_URL")
     ] = None,
     broadcast: Annotated[
-        bool, typer.Option("--broadcast", help="Broadcast the transaction")
+        bool,
+        typer.Option(
+            "--broadcast/--no-broadcast",
+            help="Broadcast the transaction (use --no-broadcast to skip)",
+        ),
     ] = True,
     yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip confirmation prompt")] = False,
     select_utxos: Annotated[
@@ -622,7 +626,7 @@ async def _send_transaction(
             print("\nTransaction broadcast successfully!")
             print(f"TXID: {txid}")
         else:
-            print("\nTransaction NOT broadcast (--broadcast not set)")
+            print("\nTransaction NOT broadcast (--no-broadcast set)")
             print(f"Full hex: {tx_hex}")
 
     finally:

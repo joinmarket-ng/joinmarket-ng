@@ -425,6 +425,17 @@ def test_send_respects_config_block_target():
                     raise e
 
 
+def test_send_help_exposes_no_broadcast_flag() -> None:
+    """``jm-wallet send`` should expose ``--no-broadcast`` so the default-True
+    ``--broadcast`` flag can be negated from the CLI (regression for #28)."""
+    result = runner.invoke(app, ["send", "--help"], prog_name="jm-wallet")
+    output = click.unstyle(result.stdout)
+
+    assert result.exit_code == 0, output
+    assert "--broadcast" in output
+    assert "--no-broadcast" in output
+
+
 def test_send_rejects_excessive_manual_fee_rate():
     """send should fail fast on absurdly high manual fee rate."""
     with patch("jmwallet.cli.send.resolve_mnemonic") as mock_resolve:

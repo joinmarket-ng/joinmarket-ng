@@ -648,8 +648,9 @@ For full documentation, see [jmwallet Documentation](https://joinmarket-ng.githu
 │                                             neutrino                         │
 │ --rpc-url                          TEXT     [env var: BITCOIN_RPC_URL]       │
 │ --neutrino-url                     TEXT     [env var: NEUTRINO_URL]          │
-│ --broadcast                                 Broadcast the transaction        │
-│                                             [default: True]                  │
+│ --broadcast    --no-broadcast               Broadcast the transaction (use   │
+│                                             --no-broadcast to skip)          │
+│                                             [default: broadcast]             │
 │ --yes                      -y               Skip confirmation prompt         │
 │ --select-utxos             -s               Interactively select UTXOs       │
 │                                             (fzf-like TUI)                   │
