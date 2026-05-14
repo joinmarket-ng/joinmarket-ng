@@ -18,6 +18,15 @@ env:
   REGISTRY: ghcr.io
   # Internal CI tag used only to share prebuilt images between CI jobs.
   CI_TAG: ci-unsafe-do-not-run-${{ github.event.pull_request.head.sha || github.sha }}
+  # Buildcache ref used by docker/build-push-action.
+  # For pushes to main and workflow_dispatch/workflow_call (trusted contexts),
+  # read/write the shared ':buildcache' tag.
+  # For pull_request_target (which checks out untrusted PR code), scope the
+  # cache to a per-PR tag so a malicious PR cannot poison the cache that
+  # subsequent builds on main consume. Fork PRs still get cache-from on the
+  # trusted ':buildcache' for speed, but cache-to writes only to the
+  # per-PR scoped tag.
+  BUILDCACHE_SCOPE: ${{ github.event.pull_request.number && format('buildcache-pr-{0}', github.event.pull_request.number) || 'buildcache' }}
 
 jobs:
   # ==========================================================================
@@ -101,7 +110,7 @@ jobs:
           cache-from: |
             type=registry,ref=${{ env.REGISTRY }}/${{ github.repository }}/${{ matrix.image }}:buildcache
             type=registry,ref=${{ env.REGISTRY }}/${{ github.repository }}/${{ matrix.image }}:latest
-          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ github.repository }}/${{ matrix.image }}:buildcache,mode=max
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ github.repository }}/${{ matrix.image }}:${{ env.BUILDCACHE_SCOPE }},mode=max
           build-args: |
             BUILDKIT_INLINE_CACHE=1
             SOURCE_DATE_EPOCH=${{ env.SOURCE_DATE_EPOCH }}
