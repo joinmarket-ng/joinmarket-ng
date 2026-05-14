@@ -613,3 +613,25 @@ tbody tr:hover {
 .feature-legacy {
     background-color: #6e7681;
 }
+
+/* Direct reachability indicator (issue #105) */
+.direct-badge {
+    display: inline-block;
+    margin-left: 6px;
+    padding: 1px 5px;
+    border-radius: 4px;
+    font-size: 0.65rem;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    color: #fff;
+    vertical-align: middle;
+    cursor: help;
+}
+
+.direct-yes {
+    background-color: #3fb950;
+}
+
+.direct-no {
+    background-color: #6e7681;
+}

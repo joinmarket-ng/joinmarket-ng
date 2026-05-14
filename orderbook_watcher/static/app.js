@@ -66,11 +66,20 @@ function updateStats() {
 
     const bondsCount = (orderbookData.fidelitybonds || []).length;
     const uniqueMakers = new Set(orderbookData.offers.map(o => o.counterparty)).size;
+    const directMakers = new Set(
+        orderbookData.offers
+            .filter(o => o.directly_reachable === true)
+            .map(o => o.counterparty),
+    ).size;
 
     document.getElementById('total-offers').textContent = orderbookData.offers.length;
     document.getElementById('directory-nodes').textContent = orderbookData.directory_nodes.length;
     document.getElementById('fidelity-bonds').textContent = bondsCount;
     document.getElementById('unique-makers').textContent = uniqueMakers;
+    const directEl = document.getElementById('direct-makers');
+    if (directEl) {
+        directEl.textContent = `${directMakers} / ${uniqueMakers}`;
+    }
 }
 
 function updateDirectoryBreakdown() {
@@ -600,9 +609,19 @@ function renderTable() {
             }).join('');
         }
 
+        // Direct connection indicator: badge appears when we have successfully
+        // reached this maker's onion address directly (issue #105). null means
+        // not yet checked; false means a check ran and failed.
+        let directBadge = '';
+        if (offer.directly_reachable === true) {
+            directBadge = ' <span class="direct-badge direct-yes" title="Directly reachable via onion address">DIRECT</span>';
+        } else if (offer.directly_reachable === false) {
+            directBadge = ' <span class="direct-badge direct-no" title="Direct connection attempted and failed">NO DIRECT</span>';
+        }
+
         row.innerHTML = `
             <td class="${typeClass}">${OFFER_TYPE_NAMES[offer.ordertype]}</td>
-            <td class="counterparty">${offer.counterparty}</td>
+            <td class="counterparty">${offer.counterparty}${directBadge}</td>
             <td>${offer.oid}</td>
             <td class="${feeClass}">${formatFee(offer)}</td>
             <td>${formatNumber(offer.minsize)}</td>

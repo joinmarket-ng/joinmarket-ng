@@ -122,6 +122,7 @@ class OrderbookServer:
                     "directory_nodes": offer.directory_nodes.copy(),
                     "fidelity_bond_data": offer.fidelity_bond_data,
                     "features": offer.features.copy(),
+                    "directly_reachable": offer.directly_reachable,
                 }
             # Offers are already deduplicated by the aggregator with directory_nodes populated
             # This branch should not be reached, but handle it gracefully just in case
