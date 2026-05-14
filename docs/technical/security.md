@@ -18,7 +18,8 @@ Primary goals:
 
 ## Core Controls
 
-- transaction verification before maker signing
+- transaction verification before maker signing (see
+  [Maker Verification Checklist](maker-verification-checklist.md))
 - PoDLE anti-abuse commitments
 - Tor-based transport and hidden-service support
 - rate limiting and message validation in directory/maker paths
@@ -44,3 +45,5 @@ Primary goals:
 - test operational setup on testnet/signet/regtest before production use
 
 For protocol-level details, see [Protocol](protocol.md) and [Privacy](privacy.md).
+For the maker-side pre-sign checklist, see
+[Maker Verification Checklist](maker-verification-checklist.md).

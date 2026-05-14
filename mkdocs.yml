@@ -270,6 +270,7 @@ nav:
       - Wallet: technical/wallet.md
       - Configuration: technical/configuration.md
       - Security: technical/security.md
+      - Maker Verification Checklist: technical/maker-verification-checklist.md
       - Neutrino TLS: technical/neutrino-tls.md
       - Development: technical/development.md
       - Best Practices: technical/best-practices.md
