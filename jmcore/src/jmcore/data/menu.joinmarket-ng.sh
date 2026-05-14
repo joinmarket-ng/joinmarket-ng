@@ -1425,9 +1425,9 @@ CHOICE=$(whiptail --title " JoinMarket-NG Menu" \
               # Fidelity bond submenu
               while true; do
                 BCHOICE=$(whiptail --title " Fidelity Bonds " \
-                  --menu "\n$WALLET_INFO | Maker Bot: $MAKER_STATUS\n\nFidelity bonds lock coins until a date to boost maker reputation.\nExpired bonds appear in wallet balance and are spendable." \
+                  --menu "\n$WALLET_INFO | Maker Bot: $MAKER_STATUS\n\nFidelity Bonds lock coins until a date to boost maker reputation.\nExpired bonds appear in wallet balance and are spendable." \
                   18 72 3 \
-                  "LIST"   "List existing fidelity bonds" \
+                  "LIST"   "List existing Fidelity Bonds" \
                   "CREATE" "Generate a new bond address (lock coins)" \
                   "BACK"   "Back to Maker Menu" 3>&1 1>&2 2>&3)
                 [ $? -ne 0 ] && break
@@ -1459,11 +1459,11 @@ CHOICE=$(whiptail --title " JoinMarket-NG Menu" \
                             :
                         elif [ "$BONDS_RC" -ne 0 ]; then
                             whiptail --title " Fidelity Bonds -- Error " --msgbox \
-                                "Failed to list fidelity bonds.\n\n${BONDS_OUT:-(no output)}" \
+                                "Failed to list Fidelity Bonds.\n\n${BONDS_OUT:-(no output)}" \
                                 20 76
                         elif printf '%s' "$BONDS_OUT" | grep -qi "No Fidelity Bonds"; then
                             whiptail --title " Fidelity Bonds " --msgbox \
-                                "No fidelity bonds found for this wallet.\n\nUse 'CREATE' to generate a bond address, or send\ncoins to an existing one to fund it." \
+                                "No Fidelity Bonds found for this wallet.\n\nUse 'CREATE' to generate a bond address, or send\ncoins to an existing one to fund it." \
                                 12 64
                         else
                             # Normal listing: keep the tabular output on the
@@ -1531,14 +1531,14 @@ CHOICE=$(whiptail --title " JoinMarket-NG Menu" \
                             if [[ "$LOCKDATE" < "$CURRENT_YM" ]]; then
                                 # Past date - coins are already spendable
                                 if ! whiptail --title " Confirm Fidelity Bond " \
-                                    --yesno "\n$WALLET_INFO | Maker Bot: $MAKER_STATUS\n\nGenerate a fidelity bond address?\n\nLockdate: ${LOCKDATE} (Date in the past)\n\nNote: This lockdate is in the past.\nAll coins on this address are spendable.\nThis is only useful for recreating existing bond addresses.\n\nProceed?" \
+                                    --yesno "\n$WALLET_INFO | Maker Bot: $MAKER_STATUS\n\nGenerate a Fidelity Bond address?\n\nLockdate: ${LOCKDATE} (Date in the past)\n\nNote: This lockdate is in the past.\nAll coins on this address are spendable.\nThis is only useful for recreating existing bond addresses.\n\nProceed?" \
                                     16 64 --defaultno 3>&1 1>&2 2>&3; then
                                     exit 1
                                 fi
                             else
                                 # Future date - coins will be locked
                                 if ! whiptail --title " Confirm Fidelity Bond " \
-                                    --yesno "\n$WALLET_INFO | Maker Bot: $MAKER_STATUS\n\nGenerate a fidelity bond address?\n\nLockdate: ${LOCKDATE}\n\nWARNING: Coins sent to this address will be LOCKED\n         and NOT spendable until ${LOCKDATE}.\n\nProceed?" \
+                                    --yesno "\n$WALLET_INFO | Maker Bot: $MAKER_STATUS\n\nGenerate a Fidelity Bond address?\n\nLockdate: ${LOCKDATE}\n\nWARNING: Coins sent to this address will be LOCKED\n         and NOT spendable until ${LOCKDATE}.\n\nProceed?" \
                                     16 64 --defaultno 3>&1 1>&2 2>&3; then
                                     exit 1
                                 fi
@@ -1556,7 +1556,7 @@ CHOICE=$(whiptail --title " JoinMarket-NG Menu" \
 
                                 # Show address prominently in whiptail msgbox
                                 whiptail --title " Fidelity Bond Address " --msgbox \
-                                    "Bond address generated:\n\n${BOND_ADDR}\n\nSend coins to this address to create the fidelity bond.\nFunds will be LOCKED until ${LOCKDATE}." \
+                                    "Bond address generated:\n\n${BOND_ADDR}\n\nSend coins to this address to create the Fidelity Bond.\nFunds will be LOCKED until ${LOCKDATE}." \
                                     14 70
 
                                 # Show technical details on terminal
@@ -1822,7 +1822,7 @@ CLI tools (from venv):
   jm-wallet history                - CoinJoin history
   jm-wallet send                   - Send bitcoin
   jm-wallet freeze                 - Freeze/unfreeze UTXOs
-  jm-wallet list-bonds             - List fidelity bonds
+  jm-wallet list-bonds             - List Fidelity Bonds
   jm-wallet generate-bond-address  - Create FB address
   jm-maker start                   - Maker bot (earn fees)
   jm-taker coinjoin                - Run a CoinJoin
