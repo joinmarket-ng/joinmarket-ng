@@ -679,6 +679,98 @@ class TestNeutrinoBroadcast:
         assert txid != ""
 
     @pytest.mark.asyncio
+    async def test_neutrino_with_tracker_random_peer_uses_sequential_path(
+        self, neutrino_taker
+    ) -> None:
+        """RANDOM_PEER on Neutrino with the watched-mempool tracker takes the
+        sequential single-maker path (no fan-out).
+
+        When the neutrino-api fork advertises ``mempool_enabled: true`` the
+        backend reports ``has_mempool_access() is True``. The no-mempool
+        early-exit in ``_phase_broadcast`` must NOT trigger; instead the
+        normal RANDOM_PEER loop tries one maker at a time and verifies the
+        broadcast via the (now mempool-aware) backend. This is the
+        behavioral change documented in docs/technical/wallet.md.
+        """
+        neutrino_taker.config.tx_broadcast = BroadcastPolicy.RANDOM_PEER
+        # Tracker enabled: backend now has mempool access.
+        neutrino_taker.backend.has_mempool_access = MagicMock(return_value=True)
+        self._setup_makers(neutrino_taker, ["J5maker1", "J5maker2", "J5maker3"])
+        neutrino_taker._session.tx_metadata["output_owners"].insert(0, ("taker", "cj"))
+
+        # First maker's verification succeeds, so loop exits early.
+        neutrino_taker.backend.verify_tx_output = AsyncMock(return_value=True)
+
+        with patch("random.shuffle", side_effect=lambda x: x.sort()):
+            txid = await neutrino_taker._session._phase_broadcast()
+
+        assert txid != ""
+        # Exactly one maker contacted (sequential, not fan-out).
+        calls = neutrino_taker.directory_client.send_privmsg.call_args_list
+        assert len(calls) == 1
+        assert calls[0][0][0] == "J5maker1"
+        # Mempool verification was performed (proving we took the sequential path).
+        assert neutrino_taker.backend.verify_tx_output.await_count >= 1
+
+    @pytest.mark.asyncio
+    async def test_neutrino_with_tracker_multiple_peers_respects_peer_count_cap(
+        self, neutrino_taker
+    ) -> None:
+        """MULTIPLE_PEERS on Neutrino with the tracker respects ``broadcast_peer_count``.
+
+        With mempool access, ``_phase_broadcast`` falls through to the
+        MULTIPLE_PEERS branch which caps recipients at
+        ``broadcast_peer_count`` instead of fanning out to every maker.
+        """
+        neutrino_taker.config.tx_broadcast = BroadcastPolicy.MULTIPLE_PEERS
+        neutrino_taker.config.broadcast_peer_count = 2
+        neutrino_taker.backend.has_mempool_access = MagicMock(return_value=True)
+        self._setup_makers(neutrino_taker, ["J5maker1", "J5maker2", "J5maker3", "J5maker4"])
+
+        txid = await neutrino_taker._session._phase_broadcast()
+
+        assert txid != ""
+        # Exactly 2 (broadcast_peer_count) makers contacted, not all 4.
+        calls = neutrino_taker.directory_client.send_privmsg.call_args_list
+        assert len(calls) == 2
+        # Self-broadcast must not happen (peers succeeded).
+        neutrino_taker.backend.broadcast_transaction.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_neutrino_operator_optout_fans_out_to_all_makers(self, neutrino_taker) -> None:
+        """Operator opt-out (``neutrino_include_mempool = false``) still fans out.
+
+        Even if the upstream server supports the mempool tracker, an
+        operator who sets ``neutrino_include_mempool = false`` must see the
+        same behavior as the legacy-server case:
+        ``has_mempool_access() is False`` and ``_phase_broadcast`` sends
+        !push to every session maker simultaneously. No self-broadcast,
+        no mempool verification.
+        """
+        # Backend reports no mempool access (operator opt-out path).
+        neutrino_taker.backend.has_mempool_access = MagicMock(return_value=False)
+        neutrino_taker.backend.verify_tx_output = AsyncMock(
+            side_effect=AssertionError("verify_tx_output must not be called when operator opts out")
+        )
+        neutrino_taker.backend.broadcast_transaction = AsyncMock(
+            side_effect=AssertionError("self-broadcast must not be called when operator opts out")
+        )
+        neutrino_taker.config.tx_broadcast = BroadcastPolicy.MULTIPLE_PEERS
+        neutrino_taker.config.broadcast_peer_count = 2
+        self._setup_makers(neutrino_taker, ["J5maker1", "J5maker2", "J5maker3", "J5maker4"])
+
+        txid = await neutrino_taker._session._phase_broadcast()
+
+        assert txid != ""
+        # All 4 makers contacted despite peer_count=2 (no-mempool fan-out wins).
+        calls = neutrino_taker.directory_client.send_privmsg.call_args_list
+        assert len(calls) == 4
+        push_recipients = {call[0][0] for call in calls}
+        assert push_recipients == {"J5maker1", "J5maker2", "J5maker3", "J5maker4"}
+        neutrino_taker.backend.verify_tx_output.assert_not_called()
+        neutrino_taker.backend.broadcast_transaction.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_broadcast_to_all_makers_partial_success(self, neutrino_taker) -> None:
         """Test multi-maker broadcast succeeds even if some makers fail."""
         self._setup_makers(neutrino_taker, ["J5maker1", "J5maker2", "J5maker3"])
