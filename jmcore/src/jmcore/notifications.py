@@ -40,6 +40,8 @@ from __future__ import annotations
 
 import asyncio
 import os
+from collections.abc import Callable
+from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
@@ -57,6 +59,327 @@ class NotificationPriority(StrEnum):
     SUCCESS = "success"
     WARNING = "warning"
     FAILURE = "failure"
+
+
+class NotificationEvent(StrEnum):
+    """
+    Typed event identifiers for the notification registry.
+
+    Each event has an entry in EVENT_TEMPLATES describing its gating flag,
+    title, body builder, and default priority. The public ``notify_*``
+    methods on :class:`Notifier` are thin shims around
+    :meth:`Notifier.emit`, which looks the event up in the registry.
+    """
+
+    SUMMARY = "summary"
+    FILL_REQUEST = "fill_request"
+    REJECTION = "rejection"
+    TX_SIGNED = "tx_signed"
+    MEMPOOL = "mempool"
+    CONFIRMED = "confirmed"
+    NICK_CHANGE = "nick_change"
+    DIRECTORY_DISCONNECT = "directory_disconnect"
+    DIRECTORY_RECONNECT = "directory_reconnect"
+    ALL_DIRECTORIES_DISCONNECTED = "all_directories_disconnected"
+    ALL_DIRECTORIES_RECONNECTED = "all_directories_reconnected"
+    COINJOIN_START = "coinjoin_start"
+    COINJOIN_COMPLETE = "coinjoin_complete"
+    COINJOIN_FAILED = "coinjoin_failed"
+    PEER_CONNECTED = "peer_connected"
+    PEER_DISCONNECTED = "peer_disconnected"
+    PEER_BANNED = "peer_banned"
+    ORDERBOOK_STATUS = "orderbook_status"
+    MAKER_OFFLINE = "maker_offline"
+    STARTUP = "startup"
+
+
+@dataclass(frozen=True)
+class EventTemplate:
+    """
+    Declarative template for a notification event.
+
+    Attributes:
+        gating_attr: Name of the boolean attribute on
+            :class:`NotificationConfig` that gates this event. ``None`` means
+            the event is always emitted (subject only to the master switch
+            in :meth:`Notifier._ensure_initialized`).
+        title_builder: Callable ``(notifier, fields) -> str`` that returns
+            the notification title. Static titles are wrapped via
+            ``lambda _n, _f: "..."``.
+        body_builder: Callable ``(notifier, fields) -> str`` that returns
+            the notification body. The notifier is passed so builders can
+            use the ``_format_amount`` / ``_format_nick`` / ``_format_txid``
+            privacy helpers.
+        priority_builder: Callable ``(fields) -> NotificationPriority`` that
+            returns the priority. Static priorities are wrapped via
+            ``lambda _f: NotificationPriority.INFO``.
+    """
+
+    gating_attr: str | None
+    title_builder: Callable[[Notifier, dict[str, Any]], str]
+    body_builder: Callable[[Notifier, dict[str, Any]], str]
+    priority_builder: Callable[[dict[str, Any]], NotificationPriority]
+
+
+def _summary_body(notifier: Notifier, f: dict[str, Any]) -> str:
+    period_label: str = f["period_label"]
+    total_requests: int = f["total_requests"]
+    if total_requests == 0:
+        body = f"Period: {period_label}\nNo CoinJoin activity in this period."
+    else:
+        successful: int = f["successful"]
+        failed: int = f["failed"]
+        total_earnings: int = f["total_earnings"]
+        total_volume: int = f["total_volume"]
+        successful_volume: int = f.get("successful_volume", 0)
+        utxos_disclosed: int = f.get("utxos_disclosed", 0)
+        success_rate = successful / total_requests * 100 if total_requests > 0 else 0.0
+        body = (
+            f"Period: {period_label}\n"
+            f"Requests: {total_requests}\n"
+            f"Successful: {successful}\n"
+            f"Failed: {failed}\n"
+            f"Success rate: {success_rate:.0f}%\n"
+            f"Earnings: {notifier._format_amount(total_earnings)}\n"
+            f"Volume: {notifier._format_amount(successful_volume)}"
+            f" / {notifier._format_amount(total_volume)}\n"
+            f"UTXOs disclosed: {utxos_disclosed}"
+        )
+    if notifier.config.notify_summary_balance:
+        total_balance = f.get("total_balance")
+        utxo_count = f.get("utxo_count")
+        if total_balance is not None:
+            body += f"\nBalance: {notifier._format_amount(total_balance)}"
+        if utxo_count is not None:
+            body += f"\nUTXOs: {utxo_count}"
+    version = f.get("version")
+    if version:
+        body += f"\nVersion: {version}"
+        update_available = f.get("update_available")
+        if update_available:
+            body += f" (update available: {update_available})"
+    return body
+
+
+def _rejection_body(notifier: Notifier, f: dict[str, Any]) -> str:
+    body = f"Taker: {notifier._format_nick(f['taker_nick'])}\nReason: {f['reason']}"
+    details = f.get("details", "")
+    if details:
+        body += f"\nDetails: {details}"
+    return body
+
+
+def _coinjoin_failed_body(notifier: Notifier, f: dict[str, Any]) -> str:
+    body = f"Reason: {f['reason']}"
+    phase = f.get("phase", "")
+    if phase:
+        body = f"Phase: {phase}\n" + body
+    cj_amount = f.get("cj_amount", 0)
+    if cj_amount > 0:
+        body += f"\nAmount: {notifier._format_amount(cj_amount)}"
+    return body
+
+
+def _directory_disconnect_priority(f: dict[str, Any]) -> NotificationPriority:
+    return (
+        NotificationPriority.FAILURE if f["connected_count"] == 0 else NotificationPriority.WARNING
+    )
+
+
+def _startup_body(notifier: Notifier, f: dict[str, Any]) -> str:
+    body = f"Component: {f['component']}"
+    nick = f.get("nick", "")
+    if nick:
+        body += f"\nNick: {notifier._format_nick(nick)}"
+    version = f.get("version", "")
+    if version:
+        body += f"\nVersion: {version}"
+    network = f.get("network", "")
+    if network:
+        body += f"\nNetwork: {network}"
+    return body
+
+
+# Declarative registry of all notification events. The Notifier.emit() core
+# looks up each event here; the per-event notify_* methods are thin shims.
+EVENT_TEMPLATES: dict[NotificationEvent, EventTemplate] = {
+    NotificationEvent.SUMMARY: EventTemplate(
+        gating_attr="notify_summary",
+        title_builder=lambda _n, f: f"{f['period_label']} Summary",
+        body_builder=_summary_body,
+        priority_builder=lambda _f: NotificationPriority.INFO,
+    ),
+    NotificationEvent.FILL_REQUEST: EventTemplate(
+        gating_attr="notify_fill",
+        title_builder=lambda _n, _f: "Fill Request Received",
+        body_builder=lambda n, f: (
+            f"Taker: {n._format_nick(f['taker_nick'])}\n"
+            f"Amount: {n._format_amount(f['cj_amount'])}\n"
+            f"Offer ID: {f['offer_id']}"
+        ),
+        priority_builder=lambda _f: NotificationPriority.INFO,
+    ),
+    NotificationEvent.REJECTION: EventTemplate(
+        gating_attr="notify_rejection",
+        title_builder=lambda _n, _f: "Request Rejected",
+        body_builder=_rejection_body,
+        priority_builder=lambda _f: NotificationPriority.WARNING,
+    ),
+    NotificationEvent.TX_SIGNED: EventTemplate(
+        gating_attr="notify_signing",
+        title_builder=lambda _n, _f: "Transaction Signed",
+        body_builder=lambda n, f: (
+            f"Taker: {n._format_nick(f['taker_nick'])}\n"
+            f"CJ Amount: {n._format_amount(f['cj_amount'])}\n"
+            f"Inputs signed: {f['num_inputs']}\n"
+            f"Fee earned: {n._format_amount(f['fee_earned'])}"
+        ),
+        priority_builder=lambda _f: NotificationPriority.SUCCESS,
+    ),
+    NotificationEvent.MEMPOOL: EventTemplate(
+        gating_attr="notify_mempool",
+        title_builder=lambda _n, _f: "CoinJoin in Mempool",
+        body_builder=lambda n, f: (
+            f"Role: {f.get('role', 'maker').capitalize()}\n"
+            f"TxID: {n._format_txid(f['txid'])}\n"
+            f"Amount: {n._format_amount(f['cj_amount'])}"
+        ),
+        priority_builder=lambda _f: NotificationPriority.INFO,
+    ),
+    NotificationEvent.CONFIRMED: EventTemplate(
+        gating_attr="notify_confirmed",
+        title_builder=lambda _n, _f: "CoinJoin Confirmed",
+        body_builder=lambda n, f: (
+            f"Role: {f.get('role', 'maker').capitalize()}\n"
+            f"TxID: {n._format_txid(f['txid'])}\n"
+            f"Amount: {n._format_amount(f['cj_amount'])}\n"
+            f"Confirmations: {f['confirmations']}"
+        ),
+        priority_builder=lambda _f: NotificationPriority.SUCCESS,
+    ),
+    NotificationEvent.NICK_CHANGE: EventTemplate(
+        gating_attr="notify_nick_change",
+        title_builder=lambda _n, _f: "Nick Changed",
+        body_builder=lambda n, f: (
+            f"Old: {n._format_nick(f['old_nick'])}\nNew: {n._format_nick(f['new_nick'])}"
+        ),
+        priority_builder=lambda _f: NotificationPriority.INFO,
+    ),
+    NotificationEvent.DIRECTORY_DISCONNECT: EventTemplate(
+        gating_attr="notify_disconnect",
+        title_builder=lambda _n, _f: "Directory Server Disconnected",
+        body_builder=lambda _n, f: (
+            f"Server: {f['server'][:30]}...\n"
+            f"Status: {'reconnecting' if f.get('reconnecting', True) else 'disconnected'}\n"
+            f"Connected: {f['connected_count']}/{f['total_count']}"
+        ),
+        priority_builder=_directory_disconnect_priority,
+    ),
+    NotificationEvent.DIRECTORY_RECONNECT: EventTemplate(
+        gating_attr="notify_disconnect",
+        title_builder=lambda _n, _f: "Directory Server Reconnected",
+        body_builder=lambda _n, f: (
+            f"Server: {f['server'][:30]}...\nConnected: {f['connected_count']}/{f['total_count']}"
+        ),
+        priority_builder=lambda _f: NotificationPriority.SUCCESS,
+    ),
+    NotificationEvent.ALL_DIRECTORIES_DISCONNECTED: EventTemplate(
+        gating_attr="notify_all_disconnect",
+        title_builder=lambda _n, _f: "CRITICAL: All Directories Disconnected",
+        body_builder=lambda _n, _f: (
+            "Lost connection to ALL directory servers.\n"
+            "No CoinJoins possible until reconnected.\n"
+            "Check network connectivity and Tor status."
+        ),
+        priority_builder=lambda _f: NotificationPriority.FAILURE,
+    ),
+    NotificationEvent.ALL_DIRECTORIES_RECONNECTED: EventTemplate(
+        gating_attr="notify_all_disconnect",
+        title_builder=lambda _n, _f: "RESOLVED: Directory Servers Reconnected",
+        body_builder=lambda _n, f: (
+            f"Reconnected to directory servers "
+            f"({f['connected_count']}/{f['total_count']}).\n"
+            "CoinJoins are possible again."
+        ),
+        priority_builder=lambda _f: NotificationPriority.SUCCESS,
+    ),
+    NotificationEvent.COINJOIN_START: EventTemplate(
+        gating_attr="notify_coinjoin_start",
+        title_builder=lambda _n, _f: "CoinJoin Started",
+        body_builder=lambda n, f: (
+            f"Amount: {n._format_amount(f['cj_amount'])}\n"
+            f"Makers: {f['num_makers']}\n"
+            f"Destination: "
+            f"{'internal' if f['destination'] == 'INTERNAL' else f['destination'][:12] + '...'}"
+        ),
+        priority_builder=lambda _f: NotificationPriority.INFO,
+    ),
+    NotificationEvent.COINJOIN_COMPLETE: EventTemplate(
+        gating_attr="notify_coinjoin_complete",
+        title_builder=lambda _n, _f: "CoinJoin Complete",
+        body_builder=lambda n, f: (
+            f"TxID: {n._format_txid(f['txid'])}\n"
+            f"Amount: {n._format_amount(f['cj_amount'])}\n"
+            f"Makers: {f['num_makers']}\n"
+            f"Total fees: {n._format_amount(f['total_fees'])}"
+        ),
+        priority_builder=lambda _f: NotificationPriority.SUCCESS,
+    ),
+    NotificationEvent.COINJOIN_FAILED: EventTemplate(
+        gating_attr="notify_coinjoin_failed",
+        title_builder=lambda _n, _f: "CoinJoin Failed",
+        body_builder=_coinjoin_failed_body,
+        priority_builder=lambda _f: NotificationPriority.FAILURE,
+    ),
+    NotificationEvent.PEER_CONNECTED: EventTemplate(
+        gating_attr="notify_peer_events",
+        title_builder=lambda _n, _f: "Peer Connected",
+        body_builder=lambda n, f: (
+            f"Nick: {n._format_nick(f['nick'])}\n"
+            f"Location: {f['location'][:30]}...\n"
+            f"Total peers: {f['total_peers']}"
+        ),
+        priority_builder=lambda _f: NotificationPriority.INFO,
+    ),
+    NotificationEvent.PEER_DISCONNECTED: EventTemplate(
+        gating_attr="notify_peer_events",
+        title_builder=lambda _n, _f: "Peer Disconnected",
+        body_builder=lambda n, f: (
+            f"Nick: {n._format_nick(f['nick'])}\nRemaining peers: {f['total_peers']}"
+        ),
+        priority_builder=lambda _f: NotificationPriority.INFO,
+    ),
+    NotificationEvent.PEER_BANNED: EventTemplate(
+        gating_attr="notify_rate_limit",
+        title_builder=lambda _n, _f: "Peer Banned",
+        body_builder=lambda n, f: (
+            f"Nick: {n._format_nick(f['nick'])}\nReason: {f['reason']}\nDuration: {f['duration']}s"
+        ),
+        priority_builder=lambda _f: NotificationPriority.WARNING,
+    ),
+    NotificationEvent.ORDERBOOK_STATUS: EventTemplate(
+        gating_attr=None,
+        title_builder=lambda _n, _f: "Orderbook Status",
+        body_builder=lambda _n, f: (
+            f"Directories: {f['connected_directories']}/{f['total_directories']}\n"
+            f"Offers: {f['total_offers']}\n"
+            f"Makers: {f['total_makers']}"
+        ),
+        priority_builder=lambda _f: NotificationPriority.INFO,
+    ),
+    NotificationEvent.MAKER_OFFLINE: EventTemplate(
+        gating_attr=None,
+        title_builder=lambda _n, _f: "Maker Offline",
+        body_builder=lambda n, f: f"Nick: {n._format_nick(f['nick'])}\nLast seen: {f['last_seen']}",
+        priority_builder=lambda _f: NotificationPriority.INFO,
+    ),
+    NotificationEvent.STARTUP: EventTemplate(
+        gating_attr="notify_startup",
+        title_builder=lambda _n, _f: "Component Started",
+        body_builder=_startup_body,
+        priority_builder=lambda _f: NotificationPriority.INFO,
+    ),
+}
 
 
 class NotificationConfig(BaseModel):
@@ -577,6 +900,46 @@ class Notifier:
         return f"{txid[:16]}..."
 
     # =========================================================================
+    # Typed-event seam
+    # =========================================================================
+
+    async def emit(self, event: NotificationEvent, **fields: Any) -> bool:
+        """
+        Emit a typed notification event through the registry.
+
+        This is the single dispatch point shared by every public
+        ``notify_*`` shim. It:
+
+        1. Looks up the :class:`EventTemplate` for ``event``.
+        2. Checks the gating flag on :class:`NotificationConfig` (if any)
+           and short-circuits to ``False`` when the operator has disabled
+           that event class.
+        3. Builds the title, body, and priority through the template's
+           builders, passing ``self`` so they can use privacy helpers.
+        4. Delegates to :meth:`_send`, which handles initialization,
+           Apprise dispatch, and background retries.
+
+        Args:
+            event: The :class:`NotificationEvent` to emit.
+            **fields: Event-specific payload consumed by the template's
+                body / title / priority builders. The accepted keys are
+                documented on the corresponding ``notify_*`` shim.
+
+        Returns:
+            ``True`` if the notification was accepted on the first send
+            attempt; ``False`` otherwise (gated off, never initialized,
+            or first-attempt failure - in which case a background retry
+            may still succeed when ``retry_enabled`` is true).
+        """
+        template = EVENT_TEMPLATES[event]
+        if template.gating_attr is not None and not getattr(self.config, template.gating_attr):
+            return False
+        title = template.title_builder(self, fields)
+        body = template.body_builder(self, fields)
+        priority = template.priority_builder(fields)
+        return await self._send(title=title, body=body, priority=priority)
+
+    # =========================================================================
     # Maker notifications
     # =========================================================================
 
@@ -595,61 +958,21 @@ class Notifier:
         total_balance: int | None = None,
         utxo_count: int | None = None,
     ) -> bool:
-        """
-        Send a periodic summary notification with CoinJoin statistics.
-
-        Args:
-            period_label: Human-readable period (e.g., "Daily", "Weekly")
-            total_requests: Total CoinJoin requests in the period
-            successful: Number of successful CoinJoins
-            failed: Number of failed CoinJoins
-            total_earnings: Total fees earned in sats
-            total_volume: Total CoinJoin volume in sats (all requests)
-            successful_volume: CoinJoin volume in sats (successful only)
-            utxos_disclosed: Number of unique UTXOs disclosed to takers
-            version: Current version string (e.g., "0.15.0"), shown if provided
-            update_available: Latest version string if an update is available, None otherwise
-            total_balance: Total wallet balance in sats (only included when
-                           notify_summary_balance is enabled)
-            utxo_count: Total number of spendable UTXOs (only included when
-                        notify_summary_balance is enabled)
-        """
-        if not self.config.notify_summary:
-            return False
-
-        if total_requests == 0:
-            body = f"Period: {period_label}\nNo CoinJoin activity in this period."
-        else:
-            success_rate = successful / total_requests * 100 if total_requests > 0 else 0.0
-            body = (
-                f"Period: {period_label}\n"
-                f"Requests: {total_requests}\n"
-                f"Successful: {successful}\n"
-                f"Failed: {failed}\n"
-                f"Success rate: {success_rate:.0f}%\n"
-                f"Earnings: {self._format_amount(total_earnings)}\n"
-                f"Volume: {self._format_amount(successful_volume)}"
-                f" / {self._format_amount(total_volume)}\n"
-                f"UTXOs disclosed: {utxos_disclosed}"
-            )
-
-        # Append wallet balance info if enabled and provided
-        if self.config.notify_summary_balance:
-            if total_balance is not None:
-                body += f"\nBalance: {self._format_amount(total_balance)}"
-            if utxo_count is not None:
-                body += f"\nUTXOs: {utxo_count}"
-
-        # Append version info if provided
-        if version:
-            body += f"\nVersion: {version}"
-            if update_available:
-                body += f" (update available: {update_available})"
-
-        return await self._send(
-            title=f"{period_label} Summary",
-            body=body,
-            priority=NotificationPriority.INFO,
+        """Send a periodic summary notification with CoinJoin statistics."""
+        return await self.emit(
+            NotificationEvent.SUMMARY,
+            period_label=period_label,
+            total_requests=total_requests,
+            successful=successful,
+            failed=failed,
+            total_earnings=total_earnings,
+            total_volume=total_volume,
+            successful_volume=successful_volume,
+            utxos_disclosed=utxos_disclosed,
+            version=version,
+            update_available=update_available,
+            total_balance=total_balance,
+            utxo_count=utxo_count,
         )
 
     async def notify_fill_request(
@@ -659,17 +982,11 @@ class Notifier:
         offer_id: int,
     ) -> bool:
         """Notify when a !fill request is received (maker)."""
-        if not self.config.notify_fill:
-            return False
-
-        return await self._send(
-            title="Fill Request Received",
-            body=(
-                f"Taker: {self._format_nick(taker_nick)}\n"
-                f"Amount: {self._format_amount(cj_amount)}\n"
-                f"Offer ID: {offer_id}"
-            ),
-            priority=NotificationPriority.INFO,
+        return await self.emit(
+            NotificationEvent.FILL_REQUEST,
+            taker_nick=taker_nick,
+            cj_amount=cj_amount,
+            offer_id=offer_id,
         )
 
     async def notify_rejection(
@@ -679,17 +996,11 @@ class Notifier:
         details: str = "",
     ) -> bool:
         """Notify when rejecting a taker request (maker)."""
-        if not self.config.notify_rejection:
-            return False
-
-        body = f"Taker: {self._format_nick(taker_nick)}\nReason: {reason}"
-        if details:
-            body += f"\nDetails: {details}"
-
-        return await self._send(
-            title="Request Rejected",
-            body=body,
-            priority=NotificationPriority.WARNING,
+        return await self.emit(
+            NotificationEvent.REJECTION,
+            taker_nick=taker_nick,
+            reason=reason,
+            details=details,
         )
 
     async def notify_tx_signed(
@@ -700,18 +1011,12 @@ class Notifier:
         fee_earned: int,
     ) -> bool:
         """Notify when transaction is signed (maker)."""
-        if not self.config.notify_signing:
-            return False
-
-        return await self._send(
-            title="Transaction Signed",
-            body=(
-                f"Taker: {self._format_nick(taker_nick)}\n"
-                f"CJ Amount: {self._format_amount(cj_amount)}\n"
-                f"Inputs signed: {num_inputs}\n"
-                f"Fee earned: {self._format_amount(fee_earned)}"
-            ),
-            priority=NotificationPriority.SUCCESS,
+        return await self.emit(
+            NotificationEvent.TX_SIGNED,
+            taker_nick=taker_nick,
+            cj_amount=cj_amount,
+            num_inputs=num_inputs,
+            fee_earned=fee_earned,
         )
 
     async def notify_mempool(
@@ -721,17 +1026,11 @@ class Notifier:
         role: str = "maker",
     ) -> bool:
         """Notify when CoinJoin is seen in mempool."""
-        if not self.config.notify_mempool:
-            return False
-
-        return await self._send(
-            title="CoinJoin in Mempool",
-            body=(
-                f"Role: {role.capitalize()}\n"
-                f"TxID: {self._format_txid(txid)}\n"
-                f"Amount: {self._format_amount(cj_amount)}"
-            ),
-            priority=NotificationPriority.INFO,
+        return await self.emit(
+            NotificationEvent.MEMPOOL,
+            txid=txid,
+            cj_amount=cj_amount,
+            role=role,
         )
 
     async def notify_confirmed(
@@ -742,18 +1041,12 @@ class Notifier:
         role: str = "maker",
     ) -> bool:
         """Notify when CoinJoin is confirmed."""
-        if not self.config.notify_confirmed:
-            return False
-
-        return await self._send(
-            title="CoinJoin Confirmed",
-            body=(
-                f"Role: {role.capitalize()}\n"
-                f"TxID: {self._format_txid(txid)}\n"
-                f"Amount: {self._format_amount(cj_amount)}\n"
-                f"Confirmations: {confirmations}"
-            ),
-            priority=NotificationPriority.SUCCESS,
+        return await self.emit(
+            NotificationEvent.CONFIRMED,
+            txid=txid,
+            cj_amount=cj_amount,
+            confirmations=confirmations,
+            role=role,
         )
 
     async def notify_nick_change(
@@ -762,13 +1055,10 @@ class Notifier:
         new_nick: str,
     ) -> bool:
         """Notify when maker nick changes (privacy feature)."""
-        if not self.config.notify_nick_change:
-            return False
-
-        return await self._send(
-            title="Nick Changed",
-            body=(f"Old: {self._format_nick(old_nick)}\nNew: {self._format_nick(new_nick)}"),
-            priority=NotificationPriority.INFO,
+        return await self.emit(
+            NotificationEvent.NICK_CHANGE,
+            old_nick=old_nick,
+            new_nick=new_nick,
         )
 
     async def notify_directory_disconnect(
@@ -779,38 +1069,17 @@ class Notifier:
         reconnecting: bool = True,
     ) -> bool:
         """Notify when disconnected from a directory server."""
-        if not self.config.notify_disconnect:
-            return False
-
-        status = "reconnecting" if reconnecting else "disconnected"
-        priority = NotificationPriority.WARNING
-        if connected_count == 0:
-            priority = NotificationPriority.FAILURE
-
-        return await self._send(
-            title="Directory Server Disconnected",
-            body=(
-                f"Server: {server[:30]}...\n"
-                f"Status: {status}\n"
-                f"Connected: {connected_count}/{total_count}"
-            ),
-            priority=priority,
+        return await self.emit(
+            NotificationEvent.DIRECTORY_DISCONNECT,
+            server=server,
+            connected_count=connected_count,
+            total_count=total_count,
+            reconnecting=reconnecting,
         )
 
     async def notify_all_directories_disconnected(self) -> bool:
         """Notify when disconnected from ALL directory servers (critical)."""
-        if not self.config.notify_all_disconnect:
-            return False
-
-        return await self._send(
-            title="CRITICAL: All Directories Disconnected",
-            body=(
-                "Lost connection to ALL directory servers.\n"
-                "No CoinJoins possible until reconnected.\n"
-                "Check network connectivity and Tor status."
-            ),
-            priority=NotificationPriority.FAILURE,
-        )
+        return await self.emit(NotificationEvent.ALL_DIRECTORIES_DISCONNECTED)
 
     async def notify_all_directories_reconnected(
         self,
@@ -818,16 +1087,10 @@ class Notifier:
         total_count: int,
     ) -> bool:
         """Notify when at least one directory server is reconnected after all were lost (recovery)."""
-        if not self.config.notify_all_disconnect:
-            return False
-
-        return await self._send(
-            title="RESOLVED: Directory Servers Reconnected",
-            body=(
-                f"Reconnected to directory servers ({connected_count}/{total_count}).\n"
-                "CoinJoins are possible again."
-            ),
-            priority=NotificationPriority.SUCCESS,
+        return await self.emit(
+            NotificationEvent.ALL_DIRECTORIES_RECONNECTED,
+            connected_count=connected_count,
+            total_count=total_count,
         )
 
     async def notify_directory_reconnect(
@@ -837,13 +1100,11 @@ class Notifier:
         total_count: int,
     ) -> bool:
         """Notify when successfully reconnected to a directory server."""
-        if not self.config.notify_disconnect:
-            return False
-
-        return await self._send(
-            title="Directory Server Reconnected",
-            body=(f"Server: {server[:30]}...\nConnected: {connected_count}/{total_count}"),
-            priority=NotificationPriority.SUCCESS,
+        return await self.emit(
+            NotificationEvent.DIRECTORY_RECONNECT,
+            server=server,
+            connected_count=connected_count,
+            total_count=total_count,
         )
 
     # =========================================================================
@@ -857,19 +1118,11 @@ class Notifier:
         destination: str,
     ) -> bool:
         """Notify when CoinJoin is initiated (taker)."""
-        if not self.config.notify_coinjoin_start:
-            return False
-
-        dest_display = "internal" if destination == "INTERNAL" else f"{destination[:12]}..."
-
-        return await self._send(
-            title="CoinJoin Started",
-            body=(
-                f"Amount: {self._format_amount(cj_amount)}\n"
-                f"Makers: {num_makers}\n"
-                f"Destination: {dest_display}"
-            ),
-            priority=NotificationPriority.INFO,
+        return await self.emit(
+            NotificationEvent.COINJOIN_START,
+            cj_amount=cj_amount,
+            num_makers=num_makers,
+            destination=destination,
         )
 
     async def notify_coinjoin_complete(
@@ -880,18 +1133,12 @@ class Notifier:
         total_fees: int,
     ) -> bool:
         """Notify when CoinJoin completes successfully (taker)."""
-        if not self.config.notify_coinjoin_complete:
-            return False
-
-        return await self._send(
-            title="CoinJoin Complete",
-            body=(
-                f"TxID: {self._format_txid(txid)}\n"
-                f"Amount: {self._format_amount(cj_amount)}\n"
-                f"Makers: {num_makers}\n"
-                f"Total fees: {self._format_amount(total_fees)}"
-            ),
-            priority=NotificationPriority.SUCCESS,
+        return await self.emit(
+            NotificationEvent.COINJOIN_COMPLETE,
+            txid=txid,
+            cj_amount=cj_amount,
+            num_makers=num_makers,
+            total_fees=total_fees,
         )
 
     async def notify_coinjoin_failed(
@@ -901,19 +1148,11 @@ class Notifier:
         cj_amount: int = 0,
     ) -> bool:
         """Notify when CoinJoin fails (taker)."""
-        if not self.config.notify_coinjoin_failed:
-            return False
-
-        body = f"Reason: {reason}"
-        if phase:
-            body = f"Phase: {phase}\n" + body
-        if cj_amount > 0:
-            body += f"\nAmount: {self._format_amount(cj_amount)}"
-
-        return await self._send(
-            title="CoinJoin Failed",
-            body=body,
-            priority=NotificationPriority.FAILURE,
+        return await self.emit(
+            NotificationEvent.COINJOIN_FAILED,
+            reason=reason,
+            phase=phase,
+            cj_amount=cj_amount,
         )
 
     # =========================================================================
@@ -927,17 +1166,11 @@ class Notifier:
         total_peers: int,
     ) -> bool:
         """Notify when a new peer connects (directory server)."""
-        if not self.config.notify_peer_events:
-            return False
-
-        return await self._send(
-            title="Peer Connected",
-            body=(
-                f"Nick: {self._format_nick(nick)}\n"
-                f"Location: {location[:30]}...\n"
-                f"Total peers: {total_peers}"
-            ),
-            priority=NotificationPriority.INFO,
+        return await self.emit(
+            NotificationEvent.PEER_CONNECTED,
+            nick=nick,
+            location=location,
+            total_peers=total_peers,
         )
 
     async def notify_peer_disconnected(
@@ -946,13 +1179,10 @@ class Notifier:
         total_peers: int,
     ) -> bool:
         """Notify when a peer disconnects (directory server)."""
-        if not self.config.notify_peer_events:
-            return False
-
-        return await self._send(
-            title="Peer Disconnected",
-            body=(f"Nick: {self._format_nick(nick)}\nRemaining peers: {total_peers}"),
-            priority=NotificationPriority.INFO,
+        return await self.emit(
+            NotificationEvent.PEER_DISCONNECTED,
+            nick=nick,
+            total_peers=total_peers,
         )
 
     async def notify_peer_banned(
@@ -962,13 +1192,11 @@ class Notifier:
         duration: int,
     ) -> bool:
         """Notify when a peer is banned for rate limit violations."""
-        if not self.config.notify_rate_limit:
-            return False
-
-        return await self._send(
-            title="Peer Banned",
-            body=(f"Nick: {self._format_nick(nick)}\nReason: {reason}\nDuration: {duration}s"),
-            priority=NotificationPriority.WARNING,
+        return await self.emit(
+            NotificationEvent.PEER_BANNED,
+            nick=nick,
+            reason=reason,
+            duration=duration,
         )
 
     # =========================================================================
@@ -983,14 +1211,12 @@ class Notifier:
         total_makers: int,
     ) -> bool:
         """Notify orderbook status summary."""
-        return await self._send(
-            title="Orderbook Status",
-            body=(
-                f"Directories: {connected_directories}/{total_directories}\n"
-                f"Offers: {total_offers}\n"
-                f"Makers: {total_makers}"
-            ),
-            priority=NotificationPriority.INFO,
+        return await self.emit(
+            NotificationEvent.ORDERBOOK_STATUS,
+            connected_directories=connected_directories,
+            total_directories=total_directories,
+            total_offers=total_offers,
+            total_makers=total_makers,
         )
 
     async def notify_maker_offline(
@@ -999,10 +1225,10 @@ class Notifier:
         last_seen: str,
     ) -> bool:
         """Notify when a maker goes offline."""
-        return await self._send(
-            title="Maker Offline",
-            body=(f"Nick: {self._format_nick(nick)}\nLast seen: {last_seen}"),
-            priority=NotificationPriority.INFO,
+        return await self.emit(
+            NotificationEvent.MAKER_OFFLINE,
+            nick=nick,
+            last_seen=last_seen,
         )
 
     # =========================================================================
@@ -1016,30 +1242,13 @@ class Notifier:
         network: str = "",
         nick: str = "",
     ) -> bool:
-        """
-        Notify when a component starts up.
-
-        Args:
-            component: Component name (e.g., "Maker", "Taker", "Directory", "Orderbook Watcher")
-            version: Optional version string
-            network: Optional network name (e.g., "mainnet", "signet")
-            nick: Optional component nick (e.g., "J5XXXXXXXXX")
-        """
-        if not self.config.notify_startup:
-            return False
-
-        body = f"Component: {component}"
-        if nick:
-            body += f"\nNick: {self._format_nick(nick)}"
-        if version:
-            body += f"\nVersion: {version}"
-        if network:
-            body += f"\nNetwork: {network}"
-
-        return await self._send(
-            title="Component Started",
-            body=body,
-            priority=NotificationPriority.INFO,
+        """Notify when a component starts up."""
+        return await self.emit(
+            NotificationEvent.STARTUP,
+            component=component,
+            version=version,
+            network=network,
+            nick=nick,
         )
 
     async def notify(
@@ -1101,11 +1310,14 @@ def reset_notifier() -> None:
 
 
 __all__ = [
+    "EVENT_TEMPLATES",
+    "EventTemplate",
     "NotificationConfig",
+    "NotificationEvent",
     "NotificationPriority",
     "Notifier",
-    "get_notifier",
-    "reset_notifier",
-    "load_notification_config",
     "convert_settings_to_notification_config",
+    "get_notifier",
+    "load_notification_config",
+    "reset_notifier",
 ]
