@@ -495,3 +495,15 @@
 
 # Uptime tracking
 # uptime_grace_period = 60     # Seconds
+
+# ============================================================================
+# TUI Settings
+# ============================================================================
+
+[tui]
+# Log level for CLI output inside the TUI.
+# "WARNING" = only errors and warnings (default, clean output)
+# "INFO"    = show progress messages (e.g. "Connecting to directory servers...")
+# "DEBUG"   = verbose output for troubleshooting
+# Can be overridden per session: LOGGING__LEVEL=INFO jm-ng
+# log_level = "WARNING"

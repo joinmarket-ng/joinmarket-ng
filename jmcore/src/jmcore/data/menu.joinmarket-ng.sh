@@ -126,13 +126,33 @@ CONFIG_FILE="${DATA_DIR}/config.toml"
 LOG_DIR="${DATA_DIR}/logs"
 MAKER_ENV="${DATA_DIR}/.maker.env"
 
-# ---- Quiet CLI logging inside the TUI ---------------------------------------
-# jm-wallet / jm-* commands use loguru and log INFO-level messages to stderr
-# (e.g. "Loaded config from ..."). In a menu UI those logs pollute the output
-# panes (issue #459). Default to WARNING-only logging for child commands; the
-# user can still override by setting LOGGING__LEVEL before launching jm-ng.
+# ---- CLI logging inside the TUI --------------------------------------------
+# jm-wallet / jm-* commands use loguru and log to stderr.
+# In a menu UI, INFO-level logs pollute the output (issue #459), so the
+# default is WARNING.  Users who want progress messages (e.g. "Connecting
+# to directory servers...") can set [tui] log_level in config.toml or
+# override per session: LOGGING__LEVEL=INFO jm-ng
+#
+# Priority: environment variable > config.toml > built-in default (WARNING)
 if [ -z "${LOGGING__LEVEL:-}" ]; then
-    export LOGGING__LEVEL="WARNING"
+    TUI_LOG_LEVEL=$(python3 - "$CONFIG_FILE" <<'PYEOF' 2>/dev/null
+import sys, pathlib
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib
+path = pathlib.Path(sys.argv[1])
+if path.exists():
+    try:
+        data = tomllib.loads(path.read_text())
+        val = data.get("tui", {}).get("log_level")
+        if val is not None:
+            print(val.upper())
+    except Exception:
+        pass
+PYEOF
+)
+    export LOGGING__LEVEL="${TUI_LOG_LEVEL:-WARNING}"
 fi
 
 # ---- Defaults for send/coinjoin parameters ----------------------------------
