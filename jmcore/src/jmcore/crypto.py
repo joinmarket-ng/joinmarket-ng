@@ -9,13 +9,13 @@ import binascii
 import hashlib
 import secrets
 
+import base58
 from coincurve import PrivateKey, PublicKey
 from coincurve import verify_signature as coincurve_verify
 from mnemonic import Mnemonic
 
 from jmcore.protocol import JM_VERSION
 
-BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 NICK_HASH_LENGTH = 10
 NICK_MAX_ENCODED = 14
 
@@ -25,27 +25,18 @@ class CryptoError(Exception):
 
 
 def base58_encode(data: bytes) -> str:
-    """Encode bytes as Base58 (no checksum)."""
-    num = int.from_bytes(data, "big")
-
-    result = ""
-    while num > 0:
-        num, remainder = divmod(num, 58)
-        result = BASE58_ALPHABET[remainder] + result
-
-    for byte in data:
-        if byte == 0:
-            result = BASE58_ALPHABET[0] + result
-        else:
-            break
-
-    return result
+    """Encode bytes as Base58 (no checksum). Thin wrapper over the
+    audited ``base58`` library; returns ``""`` for empty input to match
+    the historical JoinMarket behavior."""
+    if not data:
+        return ""
+    return base58.b58encode(data).decode("ascii")
 
 
 def base58check_encode(payload: bytes) -> str:
-    """Encode bytes with Base58Check (with double-SHA256 checksum)."""
-    checksum = hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4]
-    return base58_encode(payload + checksum)
+    """Encode bytes with Base58Check (with double-SHA256 checksum).
+    Delegates to the audited ``base58`` library."""
+    return base58.b58encode_check(payload).decode("ascii")
 
 
 def mnemonic_to_seed(mnemonic: str, passphrase: str = "") -> bytes:
