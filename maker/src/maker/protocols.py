@@ -23,10 +23,10 @@ from jmcore.rate_limiter import RateLimiter
 from jmwallet.backends.base import BlockchainBackend
 from jmwallet.wallet.service import WalletService
 
-from maker.coinjoin import CoinJoinSession
 from maker.config import MakerConfig
 from maker.directory_pool import MakerDirectoryPool
 from maker.fidelity import FidelityBondInfo
+from maker.maker_session import MakerSession
 from maker.offers import OfferManager
 from maker.rate_limiting import DirectConnectionRateLimiter, OrderbookRateLimiter
 
@@ -50,7 +50,7 @@ class MakerBotProtocol(Protocol):
     current_block_height: int
     directory_clients: dict[str, DirectoryClient]
     _directory_pool: MakerDirectoryPool
-    active_sessions: dict[str, CoinJoinSession]
+    active_sessions: dict[str, MakerSession]
     offer_manager: OfferManager
     listen_tasks: list[asyncio.Task[None]]
     direct_connections: dict[str, TCPConnection]
@@ -88,12 +88,7 @@ class MakerBotProtocol(Protocol):
 
     def _format_offer_announcement(self, offer: Offer, include_bond: bool = False) -> str: ...
 
-    # Defined in MakerBot, called by ProtocolHandlersMixin
-    def _get_session_lock(self, taker_nick: str) -> asyncio.Lock: ...
-
-    def _cleanup_session_lock(self, taker_nick: str) -> None: ...
-
-    # Defined in BackgroundTasksMixin, called by ProtocolHandlersMixin
+    # Defined in BackgroundTasksMixin, called by ProtocolHandlersMixin and MakerSession
     async def _deferred_wallet_resync(self) -> None: ...
 
     # Defined in MakerBot, called by DirectConnectionMixin

@@ -19,22 +19,17 @@ from jmcore.deduplication import MessageDeduplicator
 from jmcore.directory_client import DirectoryClient
 from jmcore.models import Offer
 from jmcore.notifications import get_notifier
-from jmcore.protocol import COMMAND_PREFIX, JM_VERSION, MessageType, UTXOMetadata
+from jmcore.protocol import COMMAND_PREFIX, JM_VERSION, MessageType
 from jmcore.rate_limiter import RateLimitAction, RateLimiter
 from jmcore.tasks import parse_directory_address
 from jmwallet.backends.base import BlockchainBackend
-from jmwallet.history import (
-    append_history_entry,
-    create_maker_history_entry,
-    update_awaiting_transaction_signed,
-)
 from jmwallet.wallet.service import WalletService
 from loguru import logger
-from pydantic import ValidationError
 
 from maker.coinjoin import CoinJoinSession
 from maker.config import MakerConfig
 from maker.fidelity import FidelityBondInfo, create_fidelity_bond_proof
+from maker.maker_session import MakerSession
 from maker.offers import OfferManager
 from maker.protocols import MakerBotProtocol
 from maker.rate_limiting import DirectConnectionRateLimiter, OrderbookRateLimiter
@@ -60,7 +55,7 @@ class ProtocolHandlersMixin:
     fidelity_bond: FidelityBondInfo | None
     current_block_height: int
     directory_clients: dict[str, DirectoryClient]
-    active_sessions: dict[str, CoinJoinSession]
+    active_sessions: dict[str, MakerSession]
     offer_manager: OfferManager
     _message_deduplicator: MessageDeduplicator
     _message_rate_limiter: RateLimiter
@@ -386,7 +381,9 @@ class ProtocolHandlersMixin:
         except Exception as e:
             logger.error(f"Failed to handle privmsg: {e}")
 
-    async def _handle_fill(self, taker_nick: str, msg: str, source: str = "unknown") -> None:
+    async def _handle_fill(
+        self: MakerBotProtocol, taker_nick: str, msg: str, source: str = "unknown"
+    ) -> None:
         """Handle !fill request from taker.
 
         Fill message format: fill <oid> <amount> <taker_nacl_pk> <commitment> [<signing_pk> <sig>]
@@ -449,7 +446,7 @@ class ProtocolHandlersMixin:
                 logger.warning(f"Invalid fill request for offer {offer_id}: {error}")
                 return
 
-            session = CoinJoinSession(
+            session_inner = CoinJoinSession(
                 taker_nick=taker_nick,
                 offer=offer,
                 wallet=self.wallet,
@@ -458,6 +455,7 @@ class ProtocolHandlersMixin:
                 merge_algorithm=self.config.merge_algorithm.value,
                 restrict_md0=not self.config.allow_mixdepth_zero_merge,
             )
+            session = MakerSession(inner=session_inner)
 
             # Validate channel consistency (first message records the channel)
             if not session.validate_channel(source):
@@ -489,349 +487,38 @@ class ProtocolHandlersMixin:
     async def _handle_auth(
         self: MakerBotProtocol, taker_nick: str, msg: str, source: str = "unknown"
     ) -> None:
-        """Handle !auth request from taker.
+        """Dispatch !auth to the per-taker MakerSession.
 
-        The auth message is ENCRYPTED using NaCl.
-        Format: auth <encrypted_base64> [<signing_pk> <sig>]
-
-        After decryption, the plaintext is pipe-separated:
-        txid:vout|P|P2|sig|e
-
-        Note: The taker sends !auth via all directory servers, so we may receive
-        duplicates. We use a lock per session to ensure only one message is
-        processed at a time, and check state early to reject duplicates.
+        Looks up the session, acquires its lock to serialize duplicate
+        deliveries that arrive via multiple directory servers, and delegates
+        the protocol logic to :meth:`MakerSession.on_auth`. Returning a
+        warning early for unknown nicks preserves the pre-refactor contract
+        where stray !auth messages were ignored gracefully.
         """
-        # Acquire lock for this session to prevent concurrent processing
-        lock = self._get_session_lock(taker_nick)
-        async with lock:
-            try:
-                if taker_nick not in self.active_sessions:
-                    logger.warning(f"No active session for {taker_nick}")
-                    return
+        session = self.active_sessions.get(taker_nick)
+        if session is None:
+            logger.warning(f"No active session for {taker_nick}")
+            return
 
-                session = self.active_sessions[taker_nick]
-
-                # Validate channel consistency before processing
-                if not session.validate_channel(source):
-                    logger.error(f"Channel consistency violation for !auth from {taker_nick}")
-                    del self.active_sessions[taker_nick]
-                    self._cleanup_session_lock(taker_nick)
-                    return
-
-                # Early state check to reject duplicate !auth messages
-                # This happens when taker sends via multiple directory servers
-                from maker.coinjoin import CoinJoinState
-
-                if session.state != CoinJoinState.PUBKEY_SENT:
-                    logger.debug(
-                        f"Ignoring duplicate !auth from {taker_nick} "
-                        f"(state={session.state}, expected=PUBKEY_SENT)"
-                    )
-                    return
-
-                logger.info(f"Received !auth from {taker_nick}, decrypting and verifying PoDLE...")
-
-                # Parse: auth <encrypted_base64> [<signing_pk> <sig>]
-                parts = msg.split()
-                if len(parts) < 2:
-                    logger.error("Invalid !auth format: missing encrypted data")
-                    return
-
-                encrypted_data = parts[1]
-
-                # Decrypt the auth message
-                if not session.crypto.is_encrypted:
-                    logger.error("Encryption not set up for this session")
-                    return
-
-                try:
-                    decrypted = session.crypto.decrypt(encrypted_data)
-                    logger.debug(f"Decrypted auth message length: {len(decrypted)}")
-                except Exception as e:
-                    logger.error(f"Failed to decrypt auth message: {e}")
-                    return
-
-                # Parse the decrypted revelation - pipe-separated format:
-                # txid:vout|P|P2|sig|e
-                try:
-                    revelation_parts = decrypted.split("|")
-                    if len(revelation_parts) != 5:
-                        logger.error(
-                            f"Invalid revelation format: expected 5 parts, "
-                            f"got {len(revelation_parts)}"
-                        )
-                        return
-
-                    utxo_str, p_hex, p2_hex, sig_hex, e_hex = revelation_parts
-
-                    # Validate utxo
-                    if ":" not in utxo_str:
-                        logger.error(f"Invalid utxo format: {utxo_str}")
-                        return
-
-                    if not utxo_str.rsplit(":", 1)[1].isdigit():
-                        logger.error(f"Invalid vout in utxo: {utxo_str}")
-                        return
-
-                    try:
-                        UTXOMetadata.from_str(utxo_str)
-                    except (ValueError, ValidationError) as e:
-                        logger.error(f"Invalid UTXO in PoDLE revelation: {e}")
-                        return
-
-                    # parse_podle_revelation expects hex strings, not bytes
-                    revelation = {
-                        "utxo": utxo_str,
-                        "P": p_hex,
-                        "P2": p2_hex,
-                        "sig": sig_hex,
-                        "e": e_hex,
-                    }
-                    logger.debug(f"Parsed revelation: utxo={utxo_str}, P={p_hex[:16]}...")
-                except Exception as e:
-                    logger.error(f"Failed to parse revelation: {e}")
-                    return
-
-                # The commitment was already stored from the !fill message
-                commitment = self.active_sessions[taker_nick].commitment.hex()
-
-                # kphex is empty for now - we don't use it yet
-                kphex = ""
-
-                success, response = await session.handle_auth(commitment, revelation, kphex)
-
-                if success:
-                    # CRITICAL: Record addresses to history BEFORE revealing them to taker
-                    # This ensures addresses are never reused even if:
-                    # - The taker disappears after receiving !ioauth
-                    # - The program crashes after sending !ioauth
-                    # - The taker sends invalid !tx and we reject it
-                    try:
-                        our_utxos = list(session.our_utxos.keys())
-                        our_input_addresses = [u.address for u in session.our_utxos.values()]
-                        # Use 0 for fees since we haven't signed yet - will be updated
-                        # when transaction is actually signed
-                        history_entry = create_maker_history_entry(
-                            taker_nick=taker_nick,
-                            cj_amount=session.amount,
-                            fee_received=0,  # Unknown until tx is signed
-                            txfee_contribution=0,  # Unknown until tx is signed
-                            cj_address=session.cj_address,
-                            change_address=session.change_address,
-                            our_utxos=our_utxos,
-                            txid=None,  # Unknown until tx is signed
-                            network=self.config.network.value,
-                            wallet_fingerprint=self.wallet.wallet_fingerprint,
-                            source_addresses=our_input_addresses,
-                        )
-                        # Override failure_reason to indicate addresses revealed but awaiting tx
-                        history_entry.failure_reason = "Awaiting transaction"
-                        append_history_entry(history_entry, data_dir=self.config.data_dir)
-                        logger.debug(
-                            f"Recorded revealed addresses for {taker_nick} in history "
-                            f"(cj={session.cj_address[:12]}..., "
-                            f"change={session.change_address[:12]}...)"
-                        )
-                    except Exception as e:
-                        logger.warning(f"Failed to record revealed addresses in history: {e}")
-                        # Continue anyway - better to reveal addresses than fail the CJ
-                        # The addresses should still be tracked via blockchain sync
-
-                    await self._send_response(taker_nick, "ioauth", response)
-
-                    # Broadcast the commitment via hp2 so other makers can blacklist it
-                    # This prevents reuse of commitments in future CoinJoin attempts
-                    await self._broadcast_commitment(commitment)
-                else:
-                    error_msg = response.get("error", "unknown error")
-                    error_code = response.get("error_code", "")
-                    logger.error(f"Auth failed: {error_msg}")
-
-                    # Send !error to taker so they can handle it immediately
-                    # rather than waiting for the ioauth timeout. The reference
-                    # implementation logs the error; our taker can act on it.
-                    try:
-                        for client in self.directory_clients.values():
-                            await client.send_private_message(taker_nick, "error", error_msg)
-                        logger.debug(f"Sent !error to {taker_nick}: {error_msg}")
-                    except Exception as e:
-                        logger.warning(f"Failed to send !error to {taker_nick}: {e}")
-
-                    # Fire-and-forget notification for rejection
-                    asyncio.create_task(
-                        get_notifier().notify_rejection(
-                            taker_nick,
-                            error_code or "PoDLE verification failed",
-                            error_msg,
-                        )
-                    )
-                    del self.active_sessions[taker_nick]
-                    self._cleanup_session_lock(taker_nick)
-
-            except Exception as e:
-                logger.error(f"Failed to handle !auth: {e}")
+        async with session.lock:
+            await session.on_auth(self, msg, source)
 
     async def _handle_tx(
         self: MakerBotProtocol, taker_nick: str, msg: str, source: str = "unknown"
     ) -> None:
-        """Handle !tx request from taker.
+        """Dispatch !tx to the per-taker MakerSession.
 
-        The tx message is ENCRYPTED using NaCl.
-        Format: tx <encrypted_base64> [<signing_pk> <sig>]
-
-        After decryption, the plaintext is base64-encoded transaction bytes.
-
-        Note: The taker sends !tx via all directory servers, so we may receive
-        duplicates. We use a lock per session to ensure only one message is
-        processed at a time, and check state early to reject duplicates.
+        Mirrors :meth:`_handle_auth`: looks the session up, holds its lock for
+        the call, and lets :meth:`MakerSession.on_tx` carry out the signing /
+        history / notifier work.
         """
-        # Acquire lock for this session to prevent concurrent processing
-        lock = self._get_session_lock(taker_nick)
-        async with lock:
-            try:
-                if taker_nick not in self.active_sessions:
-                    logger.warning(f"No active session for {taker_nick}")
-                    return
+        session = self.active_sessions.get(taker_nick)
+        if session is None:
+            logger.warning(f"No active session for {taker_nick}")
+            return
 
-                session = self.active_sessions[taker_nick]
-
-                # Validate channel consistency before processing
-                if not session.validate_channel(source):
-                    logger.error(f"Channel consistency violation for !tx from {taker_nick}")
-                    del self.active_sessions[taker_nick]
-                    self._cleanup_session_lock(taker_nick)
-                    return
-
-                # Early state check to reject duplicate !tx messages
-                # This happens when taker sends via multiple directory servers
-                from maker.coinjoin import CoinJoinState
-
-                if session.state != CoinJoinState.IOAUTH_SENT:
-                    logger.debug(
-                        f"Ignoring duplicate !tx from {taker_nick} "
-                        f"(state={session.state}, expected=IOAUTH_SENT)"
-                    )
-                    return
-
-                logger.info(
-                    f"Received !tx from {taker_nick}, decrypting and verifying transaction..."
-                )
-
-                # Parse: tx <encrypted_base64> [<signing_pk> <sig>]
-                parts = msg.split()
-                if len(parts) < 2:
-                    logger.warning("Invalid !tx format")
-                    return
-
-                encrypted_data = parts[1]
-
-                # Decrypt the tx message
-                if not session.crypto.is_encrypted:
-                    logger.error("Encryption not set up for this session")
-                    return
-
-                try:
-                    decrypted = session.crypto.decrypt(encrypted_data)
-                    logger.debug(f"Decrypted tx message length: {len(decrypted)}")
-                except Exception as e:
-                    logger.error(f"Failed to decrypt tx message: {e}")
-                    return
-
-                # The decrypted content is base64-encoded transaction
-                try:
-                    tx_bytes = base64.b64decode(decrypted)
-                    tx_hex = tx_bytes.hex()
-                    logger.debug(f"Decoded transaction hex ({len(tx_bytes)} bytes): {tx_hex}")
-                except Exception as e:
-                    logger.error(f"Failed to decode transaction: {e}")
-                    return
-
-                success, response = await session.handle_tx(tx_hex)
-
-                if success:
-                    # Send each signature as a separate message
-                    signatures = response.get("signatures", [])
-                    for sig in signatures:
-                        await self._send_response(taker_nick, "sig", {"signature": sig})
-                    logger.info(
-                        f"CoinJoin with {taker_nick} COMPLETE (sent {len(signatures)} sigs)"
-                    )
-
-                    # Calculate fee for history and notification
-                    fee_received = session.offer.calculate_fee(session.amount)
-                    txfee_contribution = session.offer.txfee
-
-                    # Update the history entry that was created during !ioauth
-                    # (when addresses were revealed) with the tx details
-                    try:
-                        txid = response.get("txid", "")
-                        updated = update_awaiting_transaction_signed(
-                            destination_address=session.cj_address,
-                            txid=txid,
-                            fee_received=fee_received,
-                            txfee_contribution=txfee_contribution,
-                            data_dir=self.config.data_dir,
-                            wallet_fingerprint=self.wallet.wallet_fingerprint,
-                        )
-                        net = fee_received - txfee_contribution
-                        if updated:
-                            logger.debug(f"Updated CoinJoin history with txid: net fee {net} sats")
-                        else:
-                            # Fallback: create a new entry if no "Awaiting transaction" entry found
-                            # This can happen if history was cleared or entry was lost
-                            logger.warning(
-                                "No 'Awaiting transaction' entry found, creating new history entry"
-                            )
-                            our_utxos = list(session.our_utxos.keys())
-                            our_input_addresses = [u.address for u in session.our_utxos.values()]
-                            history_entry = create_maker_history_entry(
-                                taker_nick=taker_nick,
-                                cj_amount=session.amount,
-                                fee_received=fee_received,
-                                txfee_contribution=txfee_contribution,
-                                cj_address=session.cj_address,
-                                change_address=session.change_address,
-                                our_utxos=our_utxos,
-                                txid=txid,
-                                network=self.config.network.value,
-                                wallet_fingerprint=self.wallet.wallet_fingerprint,
-                                source_addresses=our_input_addresses,
-                            )
-                            append_history_entry(history_entry, data_dir=self.config.data_dir)
-                            logger.debug(f"Created new CoinJoin history: net fee {net} sats")
-                    except Exception as e:
-                        logger.warning(f"Failed to update CoinJoin history: {e}")
-
-                    # Fire-and-forget notification for successful signing
-                    asyncio.create_task(
-                        get_notifier().notify_tx_signed(
-                            taker_nick,
-                            session.amount,
-                            len(signatures),
-                            fee_received,
-                        )
-                    )
-
-                    del self.active_sessions[taker_nick]
-                    self._cleanup_session_lock(taker_nick)
-
-                    # Nick regeneration disabled - see _regenerate_nick() docstring for rationale
-
-                    # Schedule wallet re-sync in background to avoid blocking !push handling
-                    asyncio.create_task(self._deferred_wallet_resync())
-                else:
-                    logger.error(f"TX verification failed: {response.get('error')}")
-                    # Fire-and-forget notification for TX rejection
-                    asyncio.create_task(
-                        get_notifier().notify_rejection(
-                            taker_nick, "TX verification failed", response.get("error", "")
-                        )
-                    )
-                    del self.active_sessions[taker_nick]
-                    self._cleanup_session_lock(taker_nick)
-
-            except Exception as e:
-                logger.error(f"Failed to handle !tx: {e}")
+        async with session.lock:
+            await session.on_tx(self, msg, source)
 
     async def _handle_push(self, taker_nick: str, msg: str, source: str = "unknown") -> None:
         """Handle !push request from taker.
@@ -1095,22 +782,26 @@ class ProtocolHandlersMixin:
                 except Exception:
                     pass
 
-    async def _send_response(self, taker_nick: str, command: str, data: dict[str, Any]) -> None:
-        """Send signed response to taker.
+    async def _send_response(
+        self: MakerBotProtocol, taker_nick: str, command: str, data: dict[str, Any]
+    ) -> None:
+        """Send a maker -> taker response.
 
-        Different commands have different formats:
-        - !pubkey <nacl_pubkey_hex> - NOT encrypted
-        - !ioauth <encrypted_base64> - ENCRYPTED
-        - !sig <encrypted_base64> - ENCRYPTED
-
-        The signature is appended: <message_content> <signing_pubkey> <sig_b64>
-        The signature is over: <message_content> + hostid (NOT including the command!)
-
-        For encrypted commands, the plaintext is space-separated values that get
-        encrypted and base64-encoded before signing.
+        Only the unencrypted ``!pubkey`` response is built here -- it is sent
+        before a session's NaCl context is available. The encrypted ``!ioauth``
+        and ``!sig`` responses are delegated to
+        :meth:`MakerSession.send_response`, which has access to the session's
+        crypto state.
         """
         try:
-            # Format message content based on command type
+            if command in ("ioauth", "sig"):
+                session = self.active_sessions.get(taker_nick)
+                if session is None:
+                    logger.error(f"No active session for {taker_nick} to encrypt {command}")
+                    return
+                await session.send_response(self, command, data)
+                return
+
             if command == "pubkey":
                 # !pubkey <nacl_pubkey_hex> [features=<comma-separated>] - NOT encrypted
                 # Features are optional and backwards compatible with legacy takers
@@ -1118,42 +809,10 @@ class ProtocolHandlersMixin:
                 features = data.get("features", [])
                 if features:
                     msg_content += f" features={','.join(features)}"
-            elif command == "ioauth":
-                # Plaintext format: <utxo_list> <auth_pub> <cj_addr> <change_addr> <btc_sig>
-                plaintext = " ".join(
-                    [
-                        data["utxo_list"],
-                        data["auth_pub"],
-                        data["cj_addr"],
-                        data["change_addr"],
-                        data["btc_sig"],
-                    ]
-                )
-
-                # Get the session to encrypt the message
-                if taker_nick not in self.active_sessions:
-                    logger.error(f"No active session for {taker_nick} to encrypt ioauth")
-                    return
-                session = self.active_sessions[taker_nick]
-                msg_content = session.crypto.encrypt(plaintext)
-                logger.debug(f"Encrypted ioauth message, plaintext_len={len(plaintext)}")
-            elif command == "sig":
-                # Plaintext format: <signature_base64>
-                # For multiple signatures, we send them one by one
-                plaintext = data["signature"]
-
-                # Get the session to encrypt the message
-                if taker_nick not in self.active_sessions:
-                    logger.error(f"No active session for {taker_nick} to encrypt sig")
-                    return
-                session = self.active_sessions[taker_nick]
-                msg_content = session.crypto.encrypt(plaintext)
-                logger.debug(f"Encrypted sig: plaintext_len={len(plaintext)}")
             else:
                 # Fallback to JSON for unknown commands
                 msg_content = json.dumps(data)
 
-            # Send via directory clients - they will sign the message for us
             for client in self.directory_clients.values():
                 await client.send_private_message(taker_nick, command, msg_content)
 

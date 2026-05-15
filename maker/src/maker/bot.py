@@ -37,7 +37,6 @@ from jmwallet.wallet.service import WalletService
 from loguru import logger
 
 from maker.background_tasks import BackgroundTasksMixin
-from maker.coinjoin import CoinJoinSession
 from maker.config import MakerConfig
 from maker.direct_connection import DirectConnectionMixin
 from maker.directory_pool import MakerDirectoryPool
@@ -47,6 +46,7 @@ from maker.fidelity import (
     find_fidelity_bonds,
     get_best_fidelity_bond,
 )
+from maker.maker_session import MakerSession
 from maker.offers import OfferManager
 from maker.protocol_handlers import ProtocolHandlersMixin
 from maker.rate_limiting import (
@@ -91,7 +91,7 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
             neutrino_compat=backend.can_provide_neutrino_metadata(),
         )
         self._directory_pool.clients = self.directory_clients
-        self.active_sessions: dict[str, CoinJoinSession] = {}
+        self.active_sessions: dict[str, MakerSession] = {}
         self.current_offers: list[Offer] = []
         self.fidelity_bond: FidelityBondInfo | None = None
         self.current_block_height: int = 0  # Cached block height for bond proof generation
@@ -99,11 +99,8 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         self.running = False
         self.listen_tasks: list[asyncio.Task[None]] = []
 
-        # Lock to prevent concurrent processing of the same session
-        # Key: taker_nick, Value: asyncio.Lock
-        # This prevents race conditions when duplicate messages arrive via multiple
-        # directory servers or direct connections
-        self._session_locks: dict[str, asyncio.Lock] = {}
+        # Session locks now live on each `MakerSession` (one asyncio.Lock per
+        # taker_nick) so we no longer keep a parallel dict on the bot.
 
         # Hidden service listener for direct peer connections
         self.hidden_service_listener: HiddenServiceListener | None = None
@@ -711,16 +708,6 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         # await self.wallet.close()
         logger.info("Maker bot stopped")
 
-    def _get_session_lock(self, taker_nick: str) -> asyncio.Lock:
-        """Get or create a lock for a session to prevent concurrent processing."""
-        if taker_nick not in self._session_locks:
-            self._session_locks[taker_nick] = asyncio.Lock()
-        return self._session_locks[taker_nick]
-
-    def _cleanup_session_lock(self, taker_nick: str) -> None:
-        """Clean up session lock when session is removed."""
-        self._session_locks.pop(taker_nick, None)
-
     def _log_rate_limited(
         self, key: str, message: str, level: str = "warning", interval: float = 10.0
     ) -> None:
@@ -757,7 +744,6 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         for sid in dead_sessions:
             logger.debug("Cleaning up timed out session: {}", sid)
             del self.active_sessions[sid]
-            self._cleanup_session_lock(sid)
 
         # Ensure rate limiters are cleaned up periodically
         self._direct_connection_rate_limiter.cleanup_old_entries()
