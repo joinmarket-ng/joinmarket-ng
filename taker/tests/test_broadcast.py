@@ -121,7 +121,7 @@ class TestTakerBroadcast:
         # Version (4 bytes) + marker (1) + flag (1) + input count (1) + input (41) +
         # output count (1) + output (34) + witness count (1) + witness items (1 empty) +
         # locktime (4)
-        taker.final_tx = bytes.fromhex(
+        taker._session.final_tx = bytes.fromhex(
             "02000000"  # version
             "0001"  # marker + flag (SegWit)
             "01"  # 1 input
@@ -141,7 +141,7 @@ class TestTakerBroadcast:
     @pytest.mark.asyncio
     async def test_broadcast_self_success(self, taker) -> None:
         """Test self-broadcast succeeds."""
-        txid = await taker._broadcast_self()
+        txid = await taker._session._broadcast_self()
         assert txid == "txid123"
         taker.backend.broadcast_transaction.assert_called_once()
 
@@ -149,16 +149,16 @@ class TestTakerBroadcast:
     async def test_broadcast_self_failure(self, taker) -> None:
         """Test self-broadcast failure returns empty string."""
         taker.backend.broadcast_transaction = AsyncMock(side_effect=Exception("Network error"))
-        txid = await taker._broadcast_self()
+        txid = await taker._session._broadcast_self()
         assert txid == ""
 
     @pytest.mark.asyncio
     async def test_phase_broadcast_self_policy(self, taker) -> None:
         """Test broadcast with SELF policy uses self-broadcast."""
         taker.config.tx_broadcast = BroadcastPolicy.SELF
-        taker.maker_sessions = {}
+        taker._session.maker_sessions = {}
 
-        txid = await taker._phase_broadcast()
+        txid = await taker._session._phase_broadcast()
         assert txid == "txid123"
         taker.backend.broadcast_transaction.assert_called_once()
 
@@ -166,11 +166,11 @@ class TestTakerBroadcast:
     async def test_phase_broadcast_random_peer_fallback_to_self(self, taker) -> None:
         """Test RANDOM_PEER policy falls back to self if no makers."""
         taker.config.tx_broadcast = BroadcastPolicy.RANDOM_PEER
-        taker.maker_sessions = {}
+        taker._session.maker_sessions = {}
 
         # With no makers, should fall back to self
         with patch("random.shuffle", side_effect=lambda x: x):
-            txid = await taker._phase_broadcast()
+            txid = await taker._session._phase_broadcast()
 
         assert txid == "txid123"
 
@@ -178,9 +178,9 @@ class TestTakerBroadcast:
     async def test_phase_broadcast_not_self_fails_without_makers(self, taker) -> None:
         """Test NOT_SELF policy fails if no makers available."""
         taker.config.tx_broadcast = BroadcastPolicy.NOT_SELF
-        taker.maker_sessions = {}
+        taker._session.maker_sessions = {}
 
-        txid = await taker._phase_broadcast()
+        txid = await taker._session._phase_broadcast()
         assert txid == ""
 
     @pytest.mark.asyncio
@@ -201,15 +201,17 @@ class TestTakerBroadcast:
             cjfee="0.0003",
             fidelity_bond_value=0,
         )
-        taker.maker_sessions = {"J5maker123": MakerSession(nick="J5maker123", offer=mock_offer)}
+        taker._session.maker_sessions = {
+            "J5maker123": MakerSession(nick="J5maker123", offer=mock_offer)
+        }
 
         # Mock directory client
         taker.directory_client = MagicMock()
         taker.directory_client.send_privmsg = AsyncMock()
 
         # Test the push message format
-        tx_b64 = base64.b64encode(taker.final_tx).decode("ascii")
-        await taker._broadcast_via_maker("J5maker123", tx_b64)
+        tx_b64 = base64.b64encode(taker._session.final_tx).decode("ascii")
+        await taker._session._broadcast_via_maker("J5maker123", tx_b64)
 
         # Verify push was sent (without ! prefix - the prefix is only for message routing)
         taker.directory_client.send_privmsg.assert_called_once_with(
@@ -234,24 +236,26 @@ class TestTakerBroadcast:
             cjfee="0.0003",
             fidelity_bond_value=0,
         )
-        taker.maker_sessions = {"J5maker123": MakerSession(nick="J5maker123", offer=mock_offer)}
+        taker._session.maker_sessions = {
+            "J5maker123": MakerSession(nick="J5maker123", offer=mock_offer)
+        }
 
         # Mock directory client
         taker.directory_client = MagicMock()
         taker.directory_client.send_privmsg = AsyncMock()
 
         # Set up tx_metadata with taker's CJ and change outputs (required for verification)
-        taker.tx_metadata = {
+        taker._session.tx_metadata = {
             "output_owners": [("taker", "cj"), ("J5maker123", "cj"), ("taker", "change")]
         }
-        taker.cj_destination = "bcrt1qtest123"
-        taker.taker_change_address = "bcrt1qchange456"
+        taker._session.cj_destination = "bcrt1qtest123"
+        taker._session.taker_change_address = "bcrt1qchange456"
 
         # Mock backend to return verification success for both outputs
         taker.backend.verify_tx_output = AsyncMock(return_value=True)
 
-        tx_b64 = base64.b64encode(taker.final_tx).decode("ascii")
-        txid = await taker._broadcast_via_maker("J5maker123", tx_b64)
+        tx_b64 = base64.b64encode(taker._session.final_tx).decode("ascii")
+        txid = await taker._session._broadcast_via_maker("J5maker123", tx_b64)
 
         # Should detect the transaction
         assert txid != ""
@@ -271,7 +275,7 @@ class TestTakerBroadcast:
         from taker.taker import MakerSession
 
         makers = ["J5maker1", "J5maker2", "J5maker3"]
-        taker.maker_sessions = {}
+        taker._session.maker_sessions = {}
         for nick in makers:
             offer = Offer(
                 counterparty=nick,
@@ -283,13 +287,13 @@ class TestTakerBroadcast:
                 cjfee="0.0003",
                 fidelity_bond_value=0,
             )
-            taker.maker_sessions[nick] = MakerSession(nick=nick, offer=offer)
+            taker._session.maker_sessions[nick] = MakerSession(nick=nick, offer=offer)
 
         taker.directory_client = MagicMock()
         taker.directory_client.send_privmsg = AsyncMock()
-        taker.tx_metadata = {"output_owners": [(n, "cj") for n in makers]}
-        taker.cj_destination = "bcrt1qtest123"
-        taker.taker_change_address = "bcrt1qchange456"
+        taker._session.tx_metadata = {"output_owners": [(n, "cj") for n in makers]}
+        taker._session.cj_destination = "bcrt1qtest123"
+        taker._session.taker_change_address = "bcrt1qchange456"
 
         taker.backend.has_mempool_access = MagicMock(return_value=False)
         taker.backend.verify_tx_output = AsyncMock(
@@ -300,7 +304,7 @@ class TestTakerBroadcast:
         )
         taker.config.tx_broadcast = BroadcastPolicy.RANDOM_PEER
 
-        txid = await taker._phase_broadcast()
+        txid = await taker._session._phase_broadcast()
 
         assert txid != ""
         # All 3 makers must be contacted.
@@ -332,22 +336,24 @@ class TestTakerBroadcast:
             cjfee="0.0003",
             fidelity_bond_value=0,
         )
-        taker.maker_sessions = {"J5maker123": MakerSession(nick="J5maker123", offer=mock_offer)}
+        taker._session.maker_sessions = {
+            "J5maker123": MakerSession(nick="J5maker123", offer=mock_offer)
+        }
 
         # Mock directory client
         taker.directory_client = MagicMock()
         taker.directory_client.send_privmsg = AsyncMock()
 
         # Set up tx_metadata so verification can find output index
-        taker.tx_metadata = {"output_owners": [("taker", "cj"), ("J5maker123", "cj")]}
-        taker.cj_destination = "bcrt1qtest123"
+        taker._session.tx_metadata = {"output_owners": [("taker", "cj"), ("J5maker123", "cj")]}
+        taker._session.cj_destination = "bcrt1qtest123"
 
         # Make maker broadcast "fail" (verification returns False) so we fall back to self
         taker.backend.verify_tx_output = AsyncMock(return_value=False)
 
         # Force deterministic order: maker first
         with patch("random.shuffle", side_effect=lambda x: x.sort()):
-            txid = await taker._phase_broadcast()
+            txid = await taker._session._phase_broadcast()
 
         # Should succeed via self fallback (full node behavior)
         assert txid == "txid123"
@@ -372,20 +378,22 @@ class TestTakerBroadcast:
             cjfee="0.0003",
             fidelity_bond_value=0,
         )
-        taker.maker_sessions = {"J5maker123": MakerSession(nick="J5maker123", offer=mock_offer)}
+        taker._session.maker_sessions = {
+            "J5maker123": MakerSession(nick="J5maker123", offer=mock_offer)
+        }
 
         # Mock directory client
         taker.directory_client = MagicMock()
         taker.directory_client.send_privmsg = AsyncMock()
 
         # Set up tx_metadata so verification can find output index
-        taker.tx_metadata = {"output_owners": [("taker", "cj"), ("J5maker123", "cj")]}
-        taker.cj_destination = "bcrt1qtest123"
+        taker._session.tx_metadata = {"output_owners": [("taker", "cj"), ("J5maker123", "cj")]}
+        taker._session.cj_destination = "bcrt1qtest123"
 
         # Make broadcast fail (verification returns False)
         taker.backend.verify_tx_output = AsyncMock(return_value=False)
 
-        txid = await taker._phase_broadcast()
+        txid = await taker._session._phase_broadcast()
 
         # Should fail
         assert txid == ""
@@ -449,7 +457,7 @@ class TestNeutrinoBroadcast:
             backend=mock_neutrino_backend,
             config=taker_config,
         )
-        taker.final_tx = bytes.fromhex(
+        taker._session.final_tx = bytes.fromhex(
             "02000000"
             "0001"
             "01"
@@ -476,7 +484,7 @@ class TestNeutrinoBroadcast:
             backend=mock_fullnode_backend,
             config=taker_config,
         )
-        taker.final_tx = bytes.fromhex(
+        taker._session.final_tx = bytes.fromhex(
             "02000000"
             "0001"
             "01"
@@ -499,7 +507,7 @@ class TestNeutrinoBroadcast:
 
         from taker.taker import MakerSession
 
-        taker.maker_sessions = {}
+        taker._session.maker_sessions = {}
         for nick in maker_nicks:
             mock_offer = Offer(
                 counterparty=nick,
@@ -511,13 +519,13 @@ class TestNeutrinoBroadcast:
                 cjfee="0.0003",
                 fidelity_bond_value=0,
             )
-            taker.maker_sessions[nick] = MakerSession(nick=nick, offer=mock_offer)
+            taker._session.maker_sessions[nick] = MakerSession(nick=nick, offer=mock_offer)
 
         taker.directory_client = MagicMock()
         taker.directory_client.send_privmsg = AsyncMock()
-        taker.tx_metadata = {"output_owners": [(nick, "cj") for nick in maker_nicks]}
-        taker.cj_destination = "bcrt1qtest123"
-        taker.taker_change_address = "bcrt1qchange456"
+        taker._session.tx_metadata = {"output_owners": [(nick, "cj") for nick in maker_nicks]}
+        taker._session.cj_destination = "bcrt1qtest123"
+        taker._session.taker_change_address = "bcrt1qchange456"
 
     @pytest.mark.asyncio
     async def test_multiple_peers_broadcasts_to_n_makers(self, neutrino_taker) -> None:
@@ -532,7 +540,7 @@ class TestNeutrinoBroadcast:
         neutrino_taker.config.broadcast_peer_count = 3
         self._setup_makers(neutrino_taker, ["J5maker1", "J5maker2", "J5maker3", "J5maker4"])
 
-        txid = await neutrino_taker._phase_broadcast()
+        txid = await neutrino_taker._session._phase_broadcast()
 
         assert txid != ""
 
@@ -556,7 +564,7 @@ class TestNeutrinoBroadcast:
         neutrino_taker.backend.verify_tx_output = AsyncMock(return_value=False)
         neutrino_taker.backend.broadcast_transaction = AsyncMock(return_value="selfbroadcast_txid")
 
-        txid = await neutrino_taker._phase_broadcast()
+        txid = await neutrino_taker._session._phase_broadcast()
 
         # Returns expected txid (not self-broadcast txid).
         assert txid != ""
@@ -579,7 +587,7 @@ class TestNeutrinoBroadcast:
         fullnode_taker.config.broadcast_peer_count = 2
         self._setup_makers(fullnode_taker, ["J5maker1", "J5maker2", "J5maker3"])
 
-        txid = await fullnode_taker._phase_broadcast()
+        txid = await fullnode_taker._session._phase_broadcast()
 
         # Should succeed
         assert txid != ""
@@ -601,7 +609,7 @@ class TestNeutrinoBroadcast:
         neutrino_taker.backend.verify_tx_output = AsyncMock(return_value=False)
         neutrino_taker.backend.broadcast_transaction = AsyncMock(return_value="selfbroadcast_txid")
 
-        txid = await neutrino_taker._phase_broadcast()
+        txid = await neutrino_taker._session._phase_broadcast()
 
         # Non-empty txid, both makers contacted, no self broadcast.
         assert txid != ""
@@ -628,7 +636,7 @@ class TestNeutrinoBroadcast:
         # Mock self-broadcast to succeed
         neutrino_taker.backend.broadcast_transaction = AsyncMock(return_value="selfbroadcast_txid")
 
-        txid = await neutrino_taker._phase_broadcast()
+        txid = await neutrino_taker._session._phase_broadcast()
 
         # Should fall back to self and succeed
         assert txid == "selfbroadcast_txid"
@@ -642,11 +650,11 @@ class TestNeutrinoBroadcast:
         self._setup_makers(fullnode_taker, ["J5maker1", "J5maker2"])
 
         # Add taker's CJ output to metadata so verification can find it
-        fullnode_taker.tx_metadata["output_owners"].insert(0, ("taker", "cj"))
+        fullnode_taker._session.tx_metadata["output_owners"].insert(0, ("taker", "cj"))
 
         # Force deterministic order: maker1 first
         with patch("random.shuffle", side_effect=lambda x: x.sort()):
-            txid = await fullnode_taker._phase_broadcast()
+            txid = await fullnode_taker._session._phase_broadcast()
 
         # Should succeed via first maker (verification returns True)
         assert txid != ""
@@ -665,7 +673,7 @@ class TestNeutrinoBroadcast:
         fullnode_taker.backend.verify_tx_output = AsyncMock(side_effect=[False, False, True, True])
 
         with patch("random.shuffle", side_effect=lambda x: x.sort()):
-            txid = await fullnode_taker._phase_broadcast()
+            txid = await fullnode_taker._session._phase_broadcast()
 
         # Should succeed
         assert txid != ""
@@ -685,7 +693,7 @@ class TestNeutrinoBroadcast:
 
         neutrino_taker.directory_client.send_privmsg = AsyncMock(side_effect=flaky_send)
 
-        success_count = await neutrino_taker._broadcast_to_all_makers(
+        success_count = await neutrino_taker._session._broadcast_to_all_makers(
             ["J5maker1", "J5maker2", "J5maker3"],
             "dHh0ZXN0",  # base64 test data
         )
@@ -702,7 +710,7 @@ class TestNeutrinoBroadcast:
             side_effect=Exception("All connections failed")
         )
 
-        success_count = await neutrino_taker._broadcast_to_all_makers(
+        success_count = await neutrino_taker._session._broadcast_to_all_makers(
             ["J5maker1", "J5maker2"],
             "dHh0ZXN0",
         )

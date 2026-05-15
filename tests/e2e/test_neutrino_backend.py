@@ -546,7 +546,7 @@ class TestNeutrinoCoinJoin:
                     if (
                         not self_broadcast_done
                         and attempt >= self_broadcast_after
-                        and taker.final_tx
+                        and taker._session.final_tx
                     ):
                         logger.info(
                             "Transaction not seen after "
@@ -556,7 +556,7 @@ class TestNeutrinoCoinJoin:
                         try:
                             broadcast_txid = (
                                 await bitcoin_backend.broadcast_transaction(
-                                    taker.final_tx.hex()
+                                    taker._session.final_tx.hex()
                                 )
                             )
                             logger.info(f"Direct broadcast succeeded: {broadcast_txid}")
@@ -932,7 +932,7 @@ class TestNeutrinoCoinJoin:
                         if (
                             not self_broadcast_done
                             and attempt >= self_broadcast_after
-                            and taker.final_tx
+                            and taker._session.final_tx
                         ):
                             logger.info(
                                 "Transaction not seen after "
@@ -942,7 +942,7 @@ class TestNeutrinoCoinJoin:
                             try:
                                 broadcast_txid = (
                                     await bitcoin_backend.broadcast_transaction(
-                                        taker.final_tx.hex()
+                                        taker._session.final_tx.hex()
                                     )
                                 )
                                 logger.info(

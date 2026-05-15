@@ -24,6 +24,7 @@ from jmwallet.wallet.service import WalletService
 from maker.bot import MakerBot
 from maker.config import MakerConfig
 from taker.config import TakerConfig
+from taker.coinjoin_session import CoinJoinSession
 from taker.taker import Taker
 
 # Mark all tests in this module as requiring Docker e2e profile
@@ -793,15 +794,17 @@ async def test_taker_signing_integration(funded_taker_wallet: WalletService):
 
     with patch.object(Taker, "__init__", lambda self, *args, **kwargs: None):
         taker = Taker.__new__(Taker)
+        taker._session = CoinJoinSession()
+        taker._session.attach(taker)
         taker.wallet = funded_taker_wallet
         taker.backend = mock_backend
         taker.config = mock_config
-        taker.unsigned_tx = tx_bytes
-        taker.tx_metadata = metadata
-        taker.selected_utxos = [taker_utxo]
+        taker._session.unsigned_tx = tx_bytes
+        taker._session.tx_metadata = metadata
+        taker._session.selected_utxos = [taker_utxo]
 
         # Sign the inputs
-        signatures = await taker._sign_our_inputs()
+        signatures = await taker._session._sign_our_inputs()
 
         # Verify we got a signature
         assert len(signatures) == 1, f"Expected 1 signature, got {len(signatures)}"

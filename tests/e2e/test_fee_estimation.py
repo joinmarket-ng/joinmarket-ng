@@ -243,13 +243,13 @@ class TestTakerFeeResolution:
         taker = Taker(wallet=wallet, backend=bitcoin_backend, config=config)
 
         # Resolve fee rate
-        fee_rate = await taker._resolve_fee_rate()
+        fee_rate = await taker._session._resolve_fee_rate()
 
         assert isinstance(fee_rate, float), (
             f"Fee rate should be float, got {type(fee_rate)}"
         )
         assert fee_rate > 0, "Fee rate should be positive"
-        assert taker._fee_rate == fee_rate, "Fee rate should be cached"
+        assert taker._session._fee_rate == fee_rate, "Fee rate should be cached"
 
         logger.info(f"Taker resolved fee rate: {fee_rate} sat/vB (default 3-block)")
 
@@ -280,7 +280,7 @@ class TestTakerFeeResolution:
 
         taker = Taker(wallet=wallet, backend=bitcoin_backend, config=config)
 
-        fee_rate = await taker._resolve_fee_rate()
+        fee_rate = await taker._session._resolve_fee_rate()
 
         assert fee_rate == 2.5, f"Expected manual fee rate 2.5, got {fee_rate}"
         logger.info(f"Taker using manual fee rate: {fee_rate} sat/vB")
@@ -312,7 +312,7 @@ class TestTakerFeeResolution:
 
         taker = Taker(wallet=wallet, backend=bitcoin_backend, config=config)
 
-        fee_rate = await taker._resolve_fee_rate()
+        fee_rate = await taker._session._resolve_fee_rate()
 
         assert isinstance(fee_rate, float)
         assert fee_rate > 0
@@ -345,7 +345,7 @@ class TestTakerFeeResolution:
 
         taker = Taker(wallet=wallet, backend=bitcoin_backend, config=config)
 
-        fee_rate = await taker._resolve_fee_rate()
+        fee_rate = await taker._session._resolve_fee_rate()
 
         assert fee_rate == 0.5, f"Expected 0.5 sat/vB, got {fee_rate}"
         logger.info(f"Taker using sub-sat fee rate: {fee_rate} sat/vB")
@@ -354,7 +354,7 @@ class TestTakerFeeResolution:
         # 10 inputs, 10 outputs: vsize = 10*68 + 10*31 + 11 = 1001 vbytes
         # Fee at 0.5 sat/vB * 3.0 factor = 1.5 sat/vB effective
         # 1001 * 1.5 = 1501.5, rounded up = 1502 sats
-        estimated_fee = taker._estimate_tx_fee(num_inputs=10, num_outputs=10)
+        estimated_fee = taker._session._estimate_tx_fee(num_inputs=10, num_outputs=10)
         logger.info(f"Estimated fee for 10in/10out at 0.5 sat/vB: {estimated_fee} sats")
         assert estimated_fee > 0
 
@@ -423,7 +423,7 @@ class TestNeutrinoTakerFeeResolution:
 
         # Should raise ValueError because neutrino cannot estimate fees
         with pytest.raises(ValueError) as excinfo:
-            await taker._resolve_fee_rate()
+            await taker._session._resolve_fee_rate()
 
         assert "Cannot use --block-target with neutrino backend" in str(excinfo.value)
         logger.info("Correctly rejected block-target with neutrino backend")
@@ -455,7 +455,7 @@ class TestNeutrinoTakerFeeResolution:
 
         taker = Taker(wallet=wallet, backend=neutrino_backend, config=config)
 
-        fee_rate = await taker._resolve_fee_rate()
+        fee_rate = await taker._session._resolve_fee_rate()
 
         assert fee_rate == 2.0, f"Expected 2.0 sat/vB, got {fee_rate}"
         logger.info(f"Neutrino taker using manual fee rate: {fee_rate} sat/vB")
@@ -489,7 +489,7 @@ class TestNeutrinoTakerFeeResolution:
 
         taker = Taker(wallet=wallet, backend=neutrino_backend, config=config)
 
-        fee_rate = await taker._resolve_fee_rate()
+        fee_rate = await taker._session._resolve_fee_rate()
 
         # Should use fallback (1.0 sat/vB) since neutrino can't estimate
         assert fee_rate == 1.0, f"Expected fallback 1.0 sat/vB, got {fee_rate}"

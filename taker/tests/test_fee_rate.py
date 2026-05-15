@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from taker.coinjoin_session import CoinJoinSession
 from taker.taker import Taker
 
 
@@ -32,6 +33,11 @@ def _make_taker(
     with patch.object(Taker, "__init__", lambda self, *a, **kw: None):
         taker = Taker.__new__(Taker)
 
+    # Per-CoinJoin state (fee rates, maker sessions, etc.) lives on a
+    # CoinJoinSession; populate it so the @property proxies on Taker resolve.
+    taker._session = CoinJoinSession()
+    taker._session.attach(taker)
+
     taker.config = MagicMock()
     taker.config.fee_rate = fee_rate
     taker.config.fee_block_target = fee_block_target
@@ -44,8 +50,8 @@ def _make_taker(
     taker.backend.get_mempool_min_fee = AsyncMock(return_value=mempool_min_fee)
 
     # Internal state that _resolve_fee_rate relies on
-    taker._fee_rate = None
-    taker._randomized_fee_rate = None
+    taker._session._fee_rate = None
+    taker._session._randomized_fee_rate = None
 
     return taker
 
@@ -57,7 +63,7 @@ class TestResolveFeeRate:
     async def test_manual_fee_rate_takes_priority(self) -> None:
         """Path 1: Manual --fee-rate should be used directly."""
         taker = _make_taker(fee_rate=3.0)
-        rate = await taker._resolve_fee_rate()
+        rate = await taker._session._resolve_fee_rate()
         assert rate == 3.0
         # Backend estimation should NOT be called
         taker.backend.estimate_fee.assert_not_awaited()
@@ -66,7 +72,7 @@ class TestResolveFeeRate:
     async def test_manual_fee_rate_raised_to_mempool_min(self) -> None:
         """Path 1: Manual fee rate below mempool min should be raised."""
         taker = _make_taker(fee_rate=1.0, mempool_min_fee=2.5)
-        rate = await taker._resolve_fee_rate()
+        rate = await taker._session._resolve_fee_rate()
         assert rate == 2.5
 
     @pytest.mark.asyncio
@@ -77,7 +83,7 @@ class TestResolveFeeRate:
             can_estimate_fee=True,
             estimate_fee_return=4.2,
         )
-        rate = await taker._resolve_fee_rate()
+        rate = await taker._session._resolve_fee_rate()
         assert rate == 4.2
         taker.backend.estimate_fee.assert_awaited_once_with(6)
 
@@ -89,7 +95,7 @@ class TestResolveFeeRate:
             can_estimate_fee=False,
         )
         with pytest.raises(ValueError, match="Cannot use --block-target with neutrino"):
-            await taker._resolve_fee_rate()
+            await taker._session._resolve_fee_rate()
 
     @pytest.mark.asyncio
     async def test_default_estimation_with_capable_backend(self) -> None:
@@ -98,7 +104,7 @@ class TestResolveFeeRate:
             can_estimate_fee=True,
             estimate_fee_return=7.5,
         )
-        rate = await taker._resolve_fee_rate()
+        rate = await taker._session._resolve_fee_rate()
         assert rate == 7.5
         taker.backend.estimate_fee.assert_awaited_once_with(3)
 
@@ -110,15 +116,15 @@ class TestResolveFeeRate:
         we fall back to a safe minimum rather than aborting the CoinJoin.
         """
         taker = _make_taker(can_estimate_fee=False)
-        rate = await taker._resolve_fee_rate()
+        rate = await taker._session._resolve_fee_rate()
         assert rate == 1.0
 
     @pytest.mark.asyncio
     async def test_cached_fee_rate_returned_on_second_call(self) -> None:
         """Resolved fee rate should be cached and returned on subsequent calls."""
         taker = _make_taker(fee_rate=2.0)
-        first = await taker._resolve_fee_rate()
-        second = await taker._resolve_fee_rate()
+        first = await taker._session._resolve_fee_rate()
+        second = await taker._session._resolve_fee_rate()
         assert first == second == 2.0
         # get_mempool_min_fee should only be called once (first invocation)
         assert taker.backend.get_mempool_min_fee.await_count == 1
@@ -132,7 +138,7 @@ class TestResolveFeeRate:
             estimate_fee_return=0.5,
             mempool_min_fee=1.5,
         )
-        rate = await taker._resolve_fee_rate()
+        rate = await taker._session._resolve_fee_rate()
         assert rate == 1.5
 
     @pytest.mark.asyncio
@@ -140,7 +146,7 @@ class TestResolveFeeRate:
         """If get_mempool_min_fee raises, fee resolution should continue."""
         taker = _make_taker(fee_rate=3.0)
         taker.backend.get_mempool_min_fee = AsyncMock(side_effect=Exception("unavailable"))
-        rate = await taker._resolve_fee_rate()
+        rate = await taker._session._resolve_fee_rate()
         assert rate == 3.0
 
 
@@ -158,9 +164,9 @@ class TestResolveFeeRateCap:
 
         taker = _make_taker(fee_rate=5_000.0, max_fee_rate_sat_vb=1_000.0)
         with pytest.raises(ExcessiveFeeRateError, match="exceeds safety cap"):
-            await taker._resolve_fee_rate()
+            await taker._session._resolve_fee_rate()
         # No randomized rate should have been computed.
-        assert taker._randomized_fee_rate is None
+        assert taker._session._randomized_fee_rate is None
 
     @pytest.mark.asyncio
     async def test_estimated_fee_rate_above_cap_rejected(self) -> None:
@@ -174,8 +180,8 @@ class TestResolveFeeRateCap:
             max_fee_rate_sat_vb=1_000.0,
         )
         with pytest.raises(ExcessiveFeeRateError, match="backend estimate"):
-            await taker._resolve_fee_rate()
-        assert taker._randomized_fee_rate is None
+            await taker._session._resolve_fee_rate()
+        assert taker._session._randomized_fee_rate is None
 
     @pytest.mark.asyncio
     async def test_default_estimation_above_cap_rejected(self) -> None:
@@ -188,12 +194,12 @@ class TestResolveFeeRateCap:
             max_fee_rate_sat_vb=1_000.0,
         )
         with pytest.raises(ExcessiveFeeRateError, match="backend estimate"):
-            await taker._resolve_fee_rate()
-        assert taker._randomized_fee_rate is None
+            await taker._session._resolve_fee_rate()
+        assert taker._session._randomized_fee_rate is None
 
     @pytest.mark.asyncio
     async def test_manual_fee_rate_at_cap_passes(self) -> None:
         """The cap is inclusive: exactly the cap is acceptable."""
         taker = _make_taker(fee_rate=1_000.0, max_fee_rate_sat_vb=1_000.0)
-        rate = await taker._resolve_fee_rate()
+        rate = await taker._session._resolve_fee_rate()
         assert rate == 1_000.0

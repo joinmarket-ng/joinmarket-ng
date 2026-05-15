@@ -121,7 +121,7 @@ async def test_taker_initialization(mock_wallet, mock_backend, mock_config):
     assert taker.state == TakerState.IDLE
     # v5 nicks for reference implementation compatibility
     assert taker.nick.startswith("J5")
-    assert len(taker.maker_sessions) == 0
+    assert len(taker._session.maker_sessions) == 0
 
 
 @pytest.mark.asyncio
@@ -729,7 +729,7 @@ class TestSweepCjAmountPreservation:
     def _make_single_utxo_maker_session() -> tuple[str, MakerSession]:
         """Create a maker session with a single UTXO for sweep tests.
 
-        Returns (nick, session) tuple ready to assign to taker.maker_sessions.
+        Returns (nick, session) tuple ready to assign to taker._session.maker_sessions.
         """
         nick = "J55Jha4vGPR5fTFv"
         maker_offer = Offer(
@@ -775,35 +775,35 @@ class TestSweepCjAmountPreservation:
         taker = Taker(mock_wallet_for_sweep, mock_backend_for_sweep, taker_config_for_sweep)
 
         # Simulate sweep mode setup
-        taker.is_sweep = True
-        taker.preselected_utxos = mock_wallet_for_sweep.get_all_utxos()
+        taker._session.is_sweep = True
+        taker._session.preselected_utxos = mock_wallet_for_sweep.get_all_utxos()
 
         # Set fee rate (must be done before _phase_build_tx)
-        taker._fee_rate = 1.0
+        taker._session._fee_rate = 1.0
 
         # Total input: 147,483 sats (from mock wallet)
-        total_input = sum(u.value for u in taker.preselected_utxos)
+        total_input = sum(u.value for u in taker._session.preselected_utxos)
 
         # Simulate the budget that was calculated at order selection
         # Conservative estimate: 2 taker + 2 maker + 5 buffer = 9 inputs, 3 outputs
         # vsize = 9*68 + 3*31 + 11 = 716 vbytes at 1 sat/vB = 716 sats
         budget = 716
-        taker._sweep_tx_fee_budget = budget
+        taker._session._sweep_tx_fee_budget = budget
 
         # Initial cj_amount calculated during do_coinjoin (before !fill)
         # This is the amount that will be sent to makers in !fill
         # cj_amount = total_input - budget - maker_fees
         initial_cj_amount = total_input - budget  # 146,767 sats
 
-        taker.cj_amount = initial_cj_amount
+        taker._session.cj_amount = initial_cj_amount
 
         # Set up a mock maker session with offer
         # Simulate !ioauth response - maker has only 1 input (not 2 as estimated)
         nick, maker_session = self._make_single_utxo_maker_session()
-        taker.maker_sessions = {nick: maker_session}
+        taker._session.maker_sessions = {nick: maker_session}
 
         # Call _phase_build_tx - this is where the bug occurred
-        result = await taker._phase_build_tx(
+        result = await taker._session._phase_build_tx(
             destination="bcrt1qqvpsxqcrqvpsxqcrqvpsxqcrqvpsxqcruj60yu",
             mixdepth=3,
         )
@@ -813,8 +813,8 @@ class TestSweepCjAmountPreservation:
 
         # CRITICAL: cj_amount must NOT have changed
         # Before the fix, it would be recalculated to a different value
-        assert taker.cj_amount == initial_cj_amount, (
-            f"cj_amount was modified from {initial_cj_amount} to {taker.cj_amount}. "
+        assert taker._session.cj_amount == initial_cj_amount, (
+            f"cj_amount was modified from {initial_cj_amount} to {taker._session.cj_amount}. "
             "This would cause maker to reject tx with 'wrong change'!"
         )
 
@@ -834,27 +834,27 @@ class TestSweepCjAmountPreservation:
         taker = Taker(mock_wallet_for_sweep, mock_backend_for_sweep, taker_config_for_sweep)
 
         # Simulate sweep mode
-        taker.is_sweep = True
-        taker.preselected_utxos = mock_wallet_for_sweep.get_all_utxos()
-        taker._fee_rate = 1.0
+        taker._session.is_sweep = True
+        taker._session.preselected_utxos = mock_wallet_for_sweep.get_all_utxos()
+        taker._session._fee_rate = 1.0
 
         # Total input: 147,483 sats (from mock wallet)
-        total_input = sum(u.value for u in taker.preselected_utxos)
+        total_input = sum(u.value for u in taker._session.preselected_utxos)
 
         # Set budget that was calculated at order selection time
         # Conservative estimate: 2 taker + 2 maker + 5 buffer = 9 inputs, 3 outputs
         # vsize = 9*68 + 3*31 + 11 = 716 vbytes at 1 sat/vB = 716 sats
         budget = 716
-        taker._sweep_tx_fee_budget = budget
+        taker._session._sweep_tx_fee_budget = budget
 
         # cj_amount calculated from budget: 147,483 - 716 = 146,767
-        taker.cj_amount = total_input - budget
+        taker._session.cj_amount = total_input - budget
 
         # Maker with only 1 input (different from the estimated 2+buffer)
         nick, maker_session = self._make_single_utxo_maker_session()
-        taker.maker_sessions = {nick: maker_session}
+        taker._session.maker_sessions = {nick: maker_session}
 
-        result = await taker._phase_build_tx(
+        result = await taker._session._phase_build_tx(
             destination="bcrt1qqvpsxqcrqvpsxqcrqvpsxqcrqvpsxqcruj60yu",
             mixdepth=3,
         )
@@ -862,7 +862,7 @@ class TestSweepCjAmountPreservation:
         assert result is True
 
         # Verify cj_amount unchanged
-        assert taker.cj_amount == total_input - budget
+        assert taker._session.cj_amount == total_input - budget
 
         # With the new fix, residual should be 0 (or minimal from rounding)
         # because we use the budget as tx_fee, not a recalculated fee
@@ -884,12 +884,12 @@ class TestSweepCjAmountPreservation:
         """
         taker = Taker(mock_wallet_for_sweep, mock_backend_for_sweep, taker_config_for_sweep)
 
-        taker.is_sweep = True
-        taker.preselected_utxos = mock_wallet_for_sweep.get_all_utxos()
-        taker._fee_rate = 1.0
+        taker._session.is_sweep = True
+        taker._session.preselected_utxos = mock_wallet_for_sweep.get_all_utxos()
+        taker._session._fee_rate = 1.0
 
         # Total taker input: 147,483 sats (from mock wallet)
-        total_input = sum(u.value for u in taker.preselected_utxos)
+        total_input = sum(u.value for u in taker._session.preselected_utxos)
         assert total_input == 147_483
 
         # Simulate order selection: budget was calculated conservatively
@@ -900,8 +900,8 @@ class TestSweepCjAmountPreservation:
 
         # cj_amount calculated at order selection = total - budget - maker_fees
         # For this test with 0 maker fees: 147,483 - 716 = 146,767 sats
-        taker.cj_amount = total_input - conservative_budget
-        taker._sweep_tx_fee_budget = conservative_budget
+        taker._session.cj_amount = total_input - conservative_budget
+        taker._session._sweep_tx_fee_budget = conservative_budget
 
         # Maker with MANY UTXOs (6 inputs instead of estimated 7)
         # Actually fewer than estimated, so fee rate will be HIGHER than 1 sat/vB
@@ -962,9 +962,9 @@ class TestSweepCjAmountPreservation:
         maker_session.change_address = "bcrt1qqgpqyqszqgpqyqszqgpqyqszqgpqyqszazmwwa"
         maker_session.crypto = CryptoSession()
 
-        taker.maker_sessions = {"J597qgx3bTJBCAP7": maker_session}
+        taker._session.maker_sessions = {"J597qgx3bTJBCAP7": maker_session}
 
-        result = await taker._phase_build_tx(
+        result = await taker._session._phase_build_tx(
             destination="bcrt1qqvpsxqcrqvpsxqcrqvpsxqcrqvpsxqcruj60yu",
             mixdepth=3,
         )
@@ -973,7 +973,7 @@ class TestSweepCjAmountPreservation:
         assert result is True
 
         # Verify cj_amount unchanged
-        assert taker.cj_amount == total_input - conservative_budget
+        assert taker._session.cj_amount == total_input - conservative_budget
 
         # The tx_fee used should be the budget
         # actual vsize: 8 inputs * 68 + 3 outputs * 31 + 11 = 648 vbytes
@@ -1098,7 +1098,7 @@ async def test_expand_preselected_utxos_same_mixdepth(
     """
     mock_config.data_dir = tmp_path
     taker = Taker(mock_wallet, mock_backend, mock_config)
-    taker.cj_amount = 10_000_000
+    taker._session.cj_amount = 10_000_000
 
     already = make_utxo(txid_char="a", address="bcrt1qtest1")
     candidate = make_utxo(
@@ -1109,21 +1109,23 @@ async def test_expand_preselected_utxos_same_mixdepth(
         path="m/84'/1'/0'/0/1",
     )
 
-    taker.preselected_utxos = [already]
+    taker._session.preselected_utxos = [already]
     # Return both; only the non-preselected one should be added.
     mock_wallet.get_all_utxos = Mock(return_value=[already, candidate])
 
-    added = taker._expand_preselected_utxos_same_mixdepth(mixdepth=0)
+    added = taker._session._expand_preselected_utxos_same_mixdepth(mixdepth=0)
 
     assert added == 1
-    assert len(taker.preselected_utxos) == 2
-    assert (candidate.txid, candidate.vout) in {(u.txid, u.vout) for u in taker.preselected_utxos}
+    assert len(taker._session.preselected_utxos) == 2
+    assert (candidate.txid, candidate.vout) in {
+        (u.txid, u.vout) for u in taker._session.preselected_utxos
+    }
 
     # A second call with no new eligible UTXOs must add nothing and not fail.
     mock_wallet.get_all_utxos = Mock(return_value=[already, candidate])
-    added_again = taker._expand_preselected_utxos_same_mixdepth(mixdepth=0)
+    added_again = taker._session._expand_preselected_utxos_same_mixdepth(mixdepth=0)
     assert added_again == 0
-    assert len(taker.preselected_utxos) == 2
+    assert len(taker._session.preselected_utxos) == 2
 
 
 @pytest.mark.asyncio
@@ -1201,7 +1203,7 @@ def test_drop_neutrino_incompatible_sessions_keeps_unknowns(mock_wallet, mock_ba
             cjfee="0.001",
         )
 
-    taker.maker_sessions = {
+    taker._session.maker_sessions = {
         "J5A": MakerSession(nick="J5A", offer=offer("J5A"), supports_neutrino_compat=False),
         "J5B": MakerSession(nick="J5B", offer=offer("J5B"), supports_neutrino_compat=False),
         "J5C": MakerSession(nick="J5C", offer=offer("J5C"), supports_neutrino_compat=False),
@@ -1214,10 +1216,10 @@ def test_drop_neutrino_incompatible_sessions_keeps_unknowns(mock_wallet, mock_ba
     # J5C has no entry in _peer_connections on purpose.
     taker.directory_client._peer_connections = {"J5A": peer_a, "J5B": peer_b}
 
-    dropped = taker._drop_neutrino_incompatible_sessions()
+    dropped = taker._session._drop_neutrino_incompatible_sessions()
 
     assert dropped == ["J5B"]
-    assert set(taker.maker_sessions.keys()) == {"J5A", "J5C"}
+    assert set(taker._session.maker_sessions.keys()) == {"J5A", "J5C"}
 
 
 def test_drop_neutrino_incompatible_sessions_noop_when_all_compatible(
@@ -1242,7 +1244,7 @@ def test_drop_neutrino_incompatible_sessions_noop_when_all_compatible(
             cjfee="0.001",
         )
 
-    taker.maker_sessions = {
+    taker._session.maker_sessions = {
         "J5A": MakerSession(nick="J5A", offer=offer("J5A"), supports_neutrino_compat=False),
         "J5B": MakerSession(nick="J5B", offer=offer("J5B"), supports_neutrino_compat=False),
     }
@@ -1253,8 +1255,8 @@ def test_drop_neutrino_incompatible_sessions_noop_when_all_compatible(
     peer_b.supports_feature.return_value = None  # unknown -> keep
     taker.directory_client._peer_connections = {"J5A": peer_a, "J5B": peer_b}
 
-    assert taker._drop_neutrino_incompatible_sessions() == []
-    assert set(taker.maker_sessions.keys()) == {"J5A", "J5B"}
+    assert taker._session._drop_neutrino_incompatible_sessions() == []
+    assert set(taker._session.maker_sessions.keys()) == {"J5A", "J5B"}
 
 
 class TestUpdatePendingTransactionNow:
@@ -1606,21 +1608,21 @@ class TestTakerHistoryHardening:
         session = MakerSession(nick=nick, offer=sample_offer)
         session.crypto = AsyncMock()
         session.utxos = [{"txid": "a", "vout": 0, "value": 1_000_000}]
-        taker.maker_sessions = {nick: session}
+        taker._session.maker_sessions = {nick: session}
 
-        taker.unsigned_tx = b"dummy_tx_bytes"
-        taker.cj_amount = 500_000
-        taker.cj_destination = "bcrt1qdest"
-        taker.selected_utxos = [MagicMock(txid="b", vout=0, address="bcrt1qinput")]
-        taker.tx_metadata = {"source_mixdepth": 0}
+        taker._session.unsigned_tx = b"dummy_tx_bytes"
+        taker._session.cj_amount = 500_000
+        taker._session.cj_destination = "bcrt1qdest"
+        taker._session.selected_utxos = [MagicMock(txid="b", vout=0, address="bcrt1qsrc")]
+        taker._session.tx_metadata = {"source_mixdepth": 0}
 
         taker.directory_client = AsyncMock()
 
         with patch(
-            "taker.taker.append_history_entry",
+            "taker.coinjoin_session.append_history_entry",
             side_effect=HistoryWriteError("disk full"),
         ) as mock_append:
-            result = await taker._phase_collect_signatures()
+            result = await taker._session._phase_collect_signatures()
 
             assert result is False
             mock_append.assert_called_once()
@@ -1661,14 +1663,14 @@ async def test_phase_fill_promotes_silent_makers_to_blacklist(
             cjfee="0.001",
         )
 
-    taker.maker_sessions = {
+    taker._session.maker_sessions = {
         "J5Explicit": MakerSession(nick="J5Explicit", offer=_offer("J5Explicit")),
         "J5Silent1": MakerSession(nick="J5Silent1", offer=_offer("J5Silent1")),
         "J5Silent2": MakerSession(nick="J5Silent2", offer=_offer("J5Silent2")),
     }
-    taker.cj_amount = 100_000
-    taker.podle_commitment = Mock()
-    taker.podle_commitment.to_commitment_str = Mock(return_value="bb" * 32)
+    taker._session.cj_amount = 100_000
+    taker._session.podle_commitment = Mock()
+    taker._session.podle_commitment.to_commitment_str = Mock(return_value="bb" * 32)
 
     # Stub the directory client: no direct-connect attempts, send_privmsg
     # returns the channel name we ask it to use, and wait_for_responses
@@ -1708,7 +1710,7 @@ async def test_phase_fill_promotes_silent_makers_to_blacklist(
     # than failing immediately for "not enough makers".
     taker.config.minimum_makers = 1
 
-    result = await taker._phase_fill()
+    result = await taker._session._phase_fill()
 
     # All three failed in this attempt.
     assert set(result.failed_makers) == {"J5Explicit", "J5Silent1", "J5Silent2"}
@@ -1745,13 +1747,13 @@ async def test_phase_fill_does_not_promote_silent_makers_without_blacklist_hit(
             cjfee="0.001",
         )
 
-    taker.maker_sessions = {
+    taker._session.maker_sessions = {
         "J5Silent1": MakerSession(nick="J5Silent1", offer=_offer("J5Silent1")),
         "J5Silent2": MakerSession(nick="J5Silent2", offer=_offer("J5Silent2")),
     }
-    taker.cj_amount = 100_000
-    taker.podle_commitment = Mock()
-    taker.podle_commitment.to_commitment_str = Mock(return_value="bb" * 32)
+    taker._session.cj_amount = 100_000
+    taker._session.podle_commitment = Mock()
+    taker._session.podle_commitment.to_commitment_str = Mock(return_value="bb" * 32)
 
     taker.directory_client = AsyncMock()
     taker.directory_client.prefer_direct_connections = False
@@ -1779,7 +1781,7 @@ async def test_phase_fill_does_not_promote_silent_makers_without_blacklist_hit(
 
     taker.config.minimum_makers = 1
 
-    result = await taker._phase_fill()
+    result = await taker._session._phase_fill()
 
     assert set(result.failed_makers) == {"J5Silent1", "J5Silent2"}
     # No explicit blacklist hit -> blacklist_error stays False, no promotion.

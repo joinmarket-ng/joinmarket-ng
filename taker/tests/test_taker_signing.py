@@ -15,6 +15,7 @@ from jmwallet.wallet.signing import (
     deserialize_transaction,
 )
 
+from taker.coinjoin_session import CoinJoinSession
 from taker.tx_builder import CoinJoinTxBuilder, CoinJoinTxData, TxInput, TxOutput
 
 
@@ -234,19 +235,21 @@ class TestTakerSigning:
         # Create taker instance
         with patch.object(Taker, "__init__", lambda self, *args, **kwargs: None):
             taker = Taker.__new__(Taker)
+            taker._session = CoinJoinSession()
+            taker._session.attach(taker)
             taker.wallet = mock_wallet
             taker.backend = mock_backend
             taker.config = mock_config
-            taker.selected_utxos = taker_utxos
+            taker._session.selected_utxos = taker_utxos
 
             # Build the transaction
             builder = CoinJoinTxBuilder(network="regtest")
             tx_bytes, metadata = builder.build_unsigned_tx(sample_coinjoin_tx_data)
-            taker.unsigned_tx = tx_bytes
-            taker.tx_metadata = metadata
+            taker._session.unsigned_tx = tx_bytes
+            taker._session.tx_metadata = metadata
 
             # Sign the inputs
-            signatures = await taker._sign_our_inputs()
+            signatures = await taker._session._sign_our_inputs()
 
             # Should have 2 signatures (one per taker UTXO)
             assert len(signatures) == 2
@@ -282,17 +285,19 @@ class TestTakerSigning:
 
         with patch.object(Taker, "__init__", lambda self, *args, **kwargs: None):
             taker = Taker.__new__(Taker)
+            taker._session = CoinJoinSession()
+            taker._session.attach(taker)
             taker.wallet = mock_wallet
             taker.backend = mock_backend
             taker.config = mock_config
-            taker.selected_utxos = taker_utxos
+            taker._session.selected_utxos = taker_utxos
 
             builder = CoinJoinTxBuilder(network="regtest")
             tx_bytes, metadata = builder.build_unsigned_tx(sample_coinjoin_tx_data)
-            taker.unsigned_tx = tx_bytes
-            taker.tx_metadata = metadata
+            taker._session.unsigned_tx = tx_bytes
+            taker._session.tx_metadata = metadata
 
-            signatures = await taker._sign_our_inputs()
+            signatures = await taker._session._sign_our_inputs()
 
             # Verify each signature corresponds to a taker UTXO
             signed_utxos = {(s["txid"], s["vout"]) for s in signatures}
@@ -312,13 +317,15 @@ class TestTakerSigning:
 
         with patch.object(Taker, "__init__", lambda self, *args, **kwargs: None):
             taker = Taker.__new__(Taker)
+            taker._session = CoinJoinSession()
+            taker._session.attach(taker)
             taker.wallet = mock_wallet
             taker.backend = mock_backend
             taker.config = mock_config
-            taker.selected_utxos = []
-            taker.unsigned_tx = b"\x02\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+            taker._session.selected_utxos = []
+            taker._session.unsigned_tx = b"\x02\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00"
 
-            signatures = await taker._sign_our_inputs()
+            signatures = await taker._session._sign_our_inputs()
 
             assert signatures == []
 
@@ -335,13 +342,15 @@ class TestTakerSigning:
 
         with patch.object(Taker, "__init__", lambda self, *args, **kwargs: None):
             taker = Taker.__new__(Taker)
+            taker._session = CoinJoinSession()
+            taker._session.attach(taker)
             taker.wallet = mock_wallet
             taker.backend = mock_backend
             taker.config = mock_config
-            taker.selected_utxos = taker_utxos
-            taker.unsigned_tx = b""
+            taker._session.selected_utxos = taker_utxos
+            taker._session.unsigned_tx = b""
 
-            signatures = await taker._sign_our_inputs()
+            signatures = await taker._session._sign_our_inputs()
 
             assert signatures == []
 
@@ -455,18 +464,20 @@ class TestEdgeCases:
 
         with patch.object(Taker, "__init__", lambda self, *args, **kwargs: None):
             taker = Taker.__new__(Taker)
+            taker._session = CoinJoinSession()
+            taker._session.attach(taker)
             taker.wallet = wallet
             taker.backend = mock_backend
             taker.config = mock_config
-            taker.selected_utxos = utxos
+            taker._session.selected_utxos = utxos
 
             builder = CoinJoinTxBuilder(network="regtest")
             tx_bytes, metadata = builder.build_unsigned_tx(sample_coinjoin_tx_data)
-            taker.unsigned_tx = tx_bytes
-            taker.tx_metadata = metadata
+            taker._session.unsigned_tx = tx_bytes
+            taker._session.tx_metadata = metadata
 
             # Should return empty list when key not found (error logged)
-            signatures = await taker._sign_our_inputs()
+            signatures = await taker._session._sign_our_inputs()
 
             # Should return empty due to missing key
             assert signatures == []
@@ -505,18 +516,20 @@ class TestEdgeCases:
 
         with patch.object(Taker, "__init__", lambda self, *args, **kwargs: None):
             taker = Taker.__new__(Taker)
+            taker._session = CoinJoinSession()
+            taker._session.attach(taker)
             taker.wallet = wallet
             taker.backend = mock_backend
             taker.config = mock_config
-            taker.selected_utxos = utxos
+            taker._session.selected_utxos = utxos
 
             builder = CoinJoinTxBuilder(network="regtest")
             tx_bytes, metadata = builder.build_unsigned_tx(sample_coinjoin_tx_data)
-            taker.unsigned_tx = tx_bytes
-            taker.tx_metadata = metadata
+            taker._session.unsigned_tx = tx_bytes
+            taker._session.tx_metadata = metadata
 
             # Should return empty list (UTXO not found in transaction)
-            signatures = await taker._sign_our_inputs()
+            signatures = await taker._session._sign_our_inputs()
 
             assert signatures == []
 
@@ -604,6 +617,8 @@ class TestPhaseCollectSignaturesCompleteness:
 
         with patch.object(Taker, "__init__", lambda self, *args, **kwargs: None):
             taker = Taker.__new__(Taker)
+            taker._session = CoinJoinSession()
+            taker._session.attach(taker)
             taker.wallet = MagicMock()
             taker.wallet.wallet_fingerprint = "deadbeef"
             taker.backend = AsyncMock()
@@ -613,21 +628,21 @@ class TestPhaseCollectSignaturesCompleteness:
             taker.config.maker_timeout_sec = 5
             taker.config.minimum_makers = 1  # Low threshold -- should NOT matter
             taker.config.data_dir = Path("/tmp/test")
-            taker.unsigned_tx = tx_bytes
-            taker.tx_metadata = metadata
-            taker.selected_utxos = []
-            taker.cj_amount = tx_data.cj_amount
-            taker.cj_destination = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"
-            taker.taker_change_address = ""
+            taker._session.unsigned_tx = tx_bytes
+            taker._session.tx_metadata = metadata
+            taker._session.selected_utxos = []
+            taker._session.cj_amount = tx_data.cj_amount
+            taker._session.cj_destination = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"
+            taker._session.taker_change_address = ""
 
             # Set up directory client mock
             taker.directory_client = MagicMock()
             taker.directory_client.send_privmsg = AsyncMock()
 
             if maker_sessions is not None:
-                taker.maker_sessions = maker_sessions
+                taker._session.maker_sessions = maker_sessions
             else:
-                taker.maker_sessions = {}
+                taker._session.maker_sessions = {}
 
             return taker
 
@@ -669,7 +684,7 @@ class TestPhaseCollectSignaturesCompleteness:
         # Neither maker responds
         taker.directory_client.wait_for_responses = AsyncMock(return_value={})
 
-        result = await taker._phase_collect_signatures()
+        result = await taker._session._phase_collect_signatures()
         assert result is False, (
             "_phase_collect_signatures must fail when a maker whose inputs are "
             "in the transaction doesn't respond"
@@ -730,7 +745,7 @@ class TestPhaseCollectSignaturesCompleteness:
             }
         )
 
-        result = await taker._phase_collect_signatures()
+        result = await taker._session._phase_collect_signatures()
         assert result is False, (
             "_phase_collect_signatures must fail when maker signatures "
             "fail cryptographic verification"
@@ -776,7 +791,7 @@ class TestPhaseCollectSignaturesCompleteness:
         # Neither maker responds
         taker.directory_client.wait_for_responses = AsyncMock(return_value={})
 
-        result = await taker._phase_collect_signatures()
+        result = await taker._session._phase_collect_signatures()
         assert result is False, (
             "With minimum_makers=1 and 2 makers in the transaction, "
             "_phase_collect_signatures must still fail when one maker "
