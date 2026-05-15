@@ -13,7 +13,6 @@ from jmcore.crypto import NickIdentity
 from jmcore.directory_client import DirectoryClient, DirectoryClientError
 from jmcore.models import Offer
 from jmcore.notifications import get_notifier
-from jmcore.tasks import parse_directory_address
 from jmwallet.backends.base import BlockchainBackend
 from loguru import logger
 
@@ -154,7 +153,7 @@ class BackgroundTasksMixin:
 
         logger.info("Rate limit status task stopped")
 
-    async def _periodic_directory_connection_status(self) -> None:
+    async def _periodic_directory_connection_status(self: MakerBotProtocol) -> None:
         """Background task to periodically log directory connection status.
 
         This runs every 10 minutes to provide visibility into orderbook
@@ -172,9 +171,7 @@ class BackgroundTasksMixin:
                 connected_servers = list(self.directory_clients.keys())
                 connected_count = len(connected_servers)
                 disconnected_servers = [
-                    server
-                    for server in self.config.directory_servers
-                    if ("{}:{}".format(*parse_directory_address(server)) not in connected_servers)
+                    server for server, _node_id in self._directory_pool.list_disconnected()
                 ]
 
                 if disconnected_servers:
@@ -205,9 +202,17 @@ class BackgroundTasksMixin:
 
         logger.info("Directory connection status task stopped")
 
-    async def _connect_to_directory(self, dir_server: str) -> tuple[str, DirectoryClient] | None:
+    async def _connect_to_directory(
+        self: MakerBotProtocol, dir_server: str
+    ) -> tuple[str, DirectoryClient] | None:
         """
         Connect to a single directory server.
+
+        Thin wrapper over :meth:`MakerDirectoryPool.connect_to_directory`
+        retained for backwards compatibility with tests that mock or call
+        this method directly. The returned client is *not* yet registered
+        in :attr:`directory_clients`; callers are expected to install it
+        themselves (matches the legacy contract).
 
         Args:
             dir_server: Server address in format "host:port" or "host"
@@ -215,112 +220,26 @@ class BackgroundTasksMixin:
         Returns:
             Tuple of (node_id, client) if successful, None on failure
         """
-        try:
-            host, port = parse_directory_address(dir_server)
-            node_id = f"{host}:{port}"
-
-            # Determine location for handshake
-            onion_host = self.config.onion_host
-            if onion_host:
-                location = f"{onion_host}:{self.config.onion_serving_port}"
-            else:
-                location = "NOT-SERVING-ONION"
-
-            # Check neutrino compatibility
-            neutrino_compat = self.backend.can_provide_neutrino_metadata()
-
-            # Create DirectoryClient with SOCKS config for Tor connections
-            dir_username: str | None = None
-            dir_password: str | None = None
-            if self.config.stream_isolation:
-                from jmcore.tor_isolation import IsolationCategory, get_isolation_credentials
-
-                dir_creds = get_isolation_credentials(IsolationCategory.DIRECTORY)
-                dir_username = dir_creds.username
-                dir_password = dir_creds.password
-
-            client = DirectoryClient(
-                host=host,
-                port=port,
-                network=self.config.network.value,
-                nick_identity=self.nick_identity,
-                location=location,
-                socks_host=self.config.socks_host,
-                socks_port=self.config.socks_port,
-                timeout=self.config.connection_timeout,
-                neutrino_compat=neutrino_compat,
-                socks_username=dir_username,
-                socks_password=dir_password,
-            )
-
-            await client.connect()
-            return (node_id, client)
-
-        except Exception as e:
-            logger.debug(f"Failed to connect to {dir_server}: {e}")
-            return None
+        return await self._directory_pool.connect_to_directory(dir_server)
 
     async def _connect_to_directories_with_retry(self: MakerBotProtocol) -> None:
         """
         Connect to all configured directory servers with startup retry logic.
 
-        Tor may still be bootstrapping circuits when the maker starts.  This
-        method retries failed connections with exponential back-off until at
-        least one directory is reachable.  Directories that connect on the
-        first attempt are registered immediately; the retry loop only keeps
-        going while *no* directory is connected.
-
-        The loop is bounded by ``directory_startup_timeout`` seconds (default
-        120 s) so the bot does not wait forever for an unreachable network.
-        On timeout the method returns without raising; the background
-        ``_periodic_directory_reconnect`` task will keep retrying once the bot
-        is running.
+        Tor may still be bootstrapping circuits when the maker starts.
+        This method retries failed connections with exponential back-off
+        until at least one directory is reachable, bounded by
+        ``directory_startup_timeout`` seconds (default 120 s). Successful
+        connections are registered in :attr:`directory_clients` (the pool
+        shares storage with that dict). Listener tasks are started later
+        by :meth:`MakerBot.start` once offer announcement has completed.
         """
-        timeout = self.config.directory_startup_timeout
-        max_delay = 30.0
-        delay = 5.0
-        deadline = asyncio.get_event_loop().time() + timeout
-
-        attempt = 0
-        while True:
-            attempt += 1
-            for dir_server in self.config.directory_servers:
-                node_id_str = dir_server  # for logging before parse
-                try:
-                    host, port = parse_directory_address(dir_server)
-                    node_id_str = f"{host}:{port}"
-                except Exception:
-                    pass
-                if node_id_str in self.directory_clients:
-                    continue  # already connected on a previous attempt
-
-                result = await self._connect_to_directory(dir_server)
-                if result:
-                    node_id, client = result
-                    self.directory_clients[node_id] = client
-                    logger.info(f"Connected to directory: {dir_server}")
-                else:
-                    logger.warning(
-                        f"Could not connect to {dir_server} (attempt {attempt}), "
-                        "Tor may still be bootstrapping"
-                    )
-
-            if self.directory_clients:
-                # At least one directory connected — done.
-                return
-
-            remaining = deadline - asyncio.get_event_loop().time()
-            if remaining <= 0:
-                logger.error(
-                    f"Failed to connect to any directory server after {timeout}s. "
-                    "The bot will continue and retry in the background."
-                )
-                return
-
-            wait = min(delay, remaining)
-            logger.info(f"Retrying directory connections in {wait:.0f}s...")
-            await asyncio.sleep(wait)
-            delay = min(delay * 1.5, max_delay)
+        await self._directory_pool.connect_all_with_retry(
+            timeout=self.config.directory_startup_timeout,
+            initial_delay=5.0,
+            max_delay=30.0,
+            backoff=1.5,
+        )
 
     async def _periodic_directory_reconnect(self: MakerBotProtocol) -> None:
         """
@@ -344,13 +263,7 @@ class BackgroundTasksMixin:
                 await asyncio.sleep(self.config.directory_reconnect_interval)
 
                 # Find disconnected directories
-                connected_servers = set(self.directory_clients.keys())
-                disconnected_servers = []
-                for server in self.config.directory_servers:
-                    host, port = parse_directory_address(server)
-                    node_id = f"{host}:{port}"
-                    if node_id not in connected_servers:
-                        disconnected_servers.append((server, node_id))
+                disconnected_servers = self._directory_pool.list_disconnected()
 
                 if not disconnected_servers:
                     continue

@@ -107,6 +107,14 @@ async def test_bond_sent_only_in_privmsg_response():
     mock_config.orderbook_violation_warning_threshold = 3
     mock_config.orderbook_violation_severe_threshold = 10
     mock_config.orderbook_ban_duration = 3600
+    # Directory pool plumbing
+    mock_config.directory_servers = []
+    mock_config.stream_isolation = False
+    mock_config.socks_host = "127.0.0.1"
+    mock_config.socks_port = 9050
+    mock_config.connection_timeout = 120.0
+    mock_config.onion_host = None
+    mock_config.onion_serving_port = 5222
 
     maker = MakerBot(mock_wallet, mock_backend, mock_config)
 

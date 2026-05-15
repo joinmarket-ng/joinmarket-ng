@@ -25,6 +25,7 @@ from jmwallet.wallet.service import WalletService
 
 from maker.coinjoin import CoinJoinSession
 from maker.config import MakerConfig
+from maker.directory_pool import MakerDirectoryPool
 from maker.fidelity import FidelityBondInfo
 from maker.offers import OfferManager
 from maker.rate_limiting import DirectConnectionRateLimiter, OrderbookRateLimiter
@@ -48,6 +49,7 @@ class MakerBotProtocol(Protocol):
     fidelity_bond: FidelityBondInfo | None
     current_block_height: int
     directory_clients: dict[str, DirectoryClient]
+    _directory_pool: MakerDirectoryPool
     active_sessions: dict[str, CoinJoinSession]
     offer_manager: OfferManager
     listen_tasks: list[asyncio.Task[None]]

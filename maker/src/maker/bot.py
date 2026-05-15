@@ -40,6 +40,7 @@ from maker.background_tasks import BackgroundTasksMixin
 from maker.coinjoin import CoinJoinSession
 from maker.config import MakerConfig
 from maker.direct_connection import DirectConnectionMixin
+from maker.directory_pool import MakerDirectoryPool
 from maker.fidelity import (
     FidelityBondInfo,
     create_fidelity_bond_proof,
@@ -79,6 +80,17 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         self.offer_manager = OfferManager(self.wallet, config, self.nick)
 
         self.directory_clients: dict[str, DirectoryClient] = {}
+        # Shared connection plumbing (parsing, SOCKS isolation creds,
+        # DirectoryClient construction, retry loop). The pool stores its
+        # connected clients in self.directory_clients via the shared-dict
+        # binding below, so tests and existing call sites that mutate
+        # self.directory_clients directly continue to work unchanged.
+        self._directory_pool = MakerDirectoryPool(
+            config=config,
+            nick_identity=self.nick_identity,
+            neutrino_compat=backend.can_provide_neutrino_metadata(),
+        )
+        self._directory_pool.clients = self.directory_clients
         self.active_sessions: dict[str, CoinJoinSession] = {}
         self.current_offers: list[Offer] = []
         self.fidelity_bond: FidelityBondInfo | None = None

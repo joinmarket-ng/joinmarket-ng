@@ -1187,7 +1187,7 @@ class TestDirectoryReconnection:
         mock_client = MagicMock()
         mock_client.connect = AsyncMock()
 
-        with patch("maker.background_tasks.DirectoryClient", return_value=mock_client):
+        with patch("jmcore.directory_pool.DirectoryClient", return_value=mock_client):
             result = await maker_bot._connect_to_directory("test.onion:5222")
 
             assert result is not None
@@ -1204,7 +1204,7 @@ class TestDirectoryReconnection:
         mock_client = MagicMock()
         mock_client.connect = AsyncMock(side_effect=Exception("Connection failed"))
 
-        with patch("maker.background_tasks.DirectoryClient", return_value=mock_client):
+        with patch("jmcore.directory_pool.DirectoryClient", return_value=mock_client):
             result = await maker_bot._connect_to_directory("bad.onion:5222")
 
             assert result is None
@@ -1218,7 +1218,7 @@ class TestDirectoryReconnection:
         mock_client.connect = AsyncMock()
 
         with patch(
-            "maker.background_tasks.DirectoryClient", return_value=mock_client
+            "jmcore.directory_pool.DirectoryClient", return_value=mock_client
         ) as mock_client_class:
             result = await maker_bot._connect_to_directory("test.onion")
 
@@ -1275,7 +1275,7 @@ class TestDirectoryReconnection:
         mock_client = MagicMock()
         mock_client.connect = AsyncMock()
 
-        with patch("maker.background_tasks.DirectoryClient", return_value=mock_client):
+        with patch("jmcore.directory_pool.DirectoryClient", return_value=mock_client):
             await maker_bot._connect_to_directories_with_retry()
 
         assert len(maker_bot.directory_clients) == 3
@@ -1296,7 +1296,7 @@ class TestDirectoryReconnection:
         mock_client = MagicMock()
         mock_client.connect = AsyncMock(side_effect=connect_side_effect)
 
-        with patch("maker.background_tasks.DirectoryClient", return_value=mock_client):
+        with patch("jmcore.directory_pool.DirectoryClient", return_value=mock_client):
             with patch("asyncio.sleep", new_callable=AsyncMock):
                 await maker_bot._connect_to_directories_with_retry()
 
@@ -1316,7 +1316,7 @@ class TestDirectoryReconnection:
         # Very short timeout so the test doesn't take long
         object.__setattr__(maker_bot.config, "directory_startup_timeout", 1)
 
-        with patch("maker.background_tasks.DirectoryClient", return_value=mock_client):
+        with patch("jmcore.directory_pool.DirectoryClient", return_value=mock_client):
             # Should not raise, just return after timeout
             await maker_bot._connect_to_directories_with_retry()
 
@@ -1333,7 +1333,7 @@ class TestDirectoryReconnection:
         # Pre-populate one connected directory
         maker_bot.directory_clients["dir1.onion:5222"] = mock_client
 
-        with patch("maker.background_tasks.DirectoryClient", return_value=mock_client):
+        with patch("jmcore.directory_pool.DirectoryClient", return_value=mock_client):
             await maker_bot._connect_to_directories_with_retry()
 
         # All 3 should be connected now
