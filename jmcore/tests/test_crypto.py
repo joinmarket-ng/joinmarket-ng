@@ -702,6 +702,36 @@ class TestMnemonicToSeed:
         seed2 = mnemonic_to_seed(mnemonic, passphrase="test")
         assert seed1 == seed2
 
+    def test_bip39_trezor_vector(self):
+        """BIP39 spec test vector: 'abandon abandon ... about' / 'TREZOR'.
+        Source: https://github.com/trezor/python-mnemonic/blob/master/vectors.json"""
+        mnemonic = "abandon " * 11 + "about"
+        seed = mnemonic_to_seed(mnemonic, passphrase="TREZOR")
+        expected = bytes.fromhex(
+            "c55257c360c07c72029aebc1b53c05ed0362ada38ead3e3e9efa3708e53495531"
+            "f09a6987599d18264c1e1c92f2cf141630c7a3c4ab7c81b2f001698e7463b04"
+        )
+        assert seed == expected
+
+    def test_nfkd_normalization_on_passphrase(self):
+        """BIP39 requires NFKD normalization of the passphrase before
+        PBKDF2. Two visually identical but differently-composed Unicode
+        passphrases must produce the same seed."""
+        import unicodedata
+
+        mnemonic = "abandon " * 11 + "about"
+        # NFC composed (single codepoint U+00E9)
+        passphrase_nfc = "caf\u00e9"
+        # NFD decomposed (e + combining acute accent)
+        passphrase_nfd = "cafe\u0301"
+        assert passphrase_nfc != passphrase_nfd  # different byte sequences
+        assert unicodedata.normalize("NFKD", passphrase_nfc) == unicodedata.normalize(
+            "NFKD", passphrase_nfd
+        )
+        seed_nfc = mnemonic_to_seed(mnemonic, passphrase=passphrase_nfc)
+        seed_nfd = mnemonic_to_seed(mnemonic, passphrase=passphrase_nfd)
+        assert seed_nfc == seed_nfd
+
 
 class TestStripSignaturePaddingEdgeCases:
     """Additional edge cases for strip_signature_padding."""

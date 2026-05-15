@@ -11,6 +11,7 @@ import secrets
 
 from coincurve import PrivateKey, PublicKey
 from coincurve import verify_signature as coincurve_verify
+from mnemonic import Mnemonic
 
 from jmcore.protocol import JM_VERSION
 
@@ -51,7 +52,14 @@ def mnemonic_to_seed(mnemonic: str, passphrase: str = "") -> bytes:
     """
     Convert BIP39 mnemonic to 64-byte seed using PBKDF2-HMAC-SHA512.
 
-    This follows the BIP39 specification for seed generation.
+    Delegates to the audited ``mnemonic`` library, which applies the
+    NFKD Unicode normalization to both the mnemonic and passphrase
+    before PBKDF2 as required by BIP39. The previous hand-rolled
+    implementation skipped normalization, so non-ASCII passphrases
+    derived seeds that did not match the BIP39 spec (and did not match
+    the legacy joinmarket-clientserver, which also uses this library).
+    For ASCII passphrases (the overwhelmingly common case) the output
+    is bit-identical to the previous implementation.
 
     Args:
         mnemonic: Space-separated mnemonic words
@@ -60,9 +68,7 @@ def mnemonic_to_seed(mnemonic: str, passphrase: str = "") -> bytes:
     Returns:
         64-byte seed
     """
-    mnemonic_bytes = mnemonic.encode("utf-8")
-    salt = ("mnemonic" + passphrase).encode("utf-8")
-    return hashlib.pbkdf2_hmac("sha512", mnemonic_bytes, salt, 2048, dklen=64)
+    return Mnemonic.to_seed(mnemonic, passphrase=passphrase)
 
 
 def generate_jm_nick(version: int = JM_VERSION) -> str:
