@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+from dataclasses import dataclass
 from typing import Any
 
 from jmcore.crypto import NickIdentity
@@ -21,6 +22,36 @@ from jmcore.network import OnionPeer
 from jmcore.protocol import NOT_SERVING_ONION_HOSTNAME
 from jmcore.tasks import parse_directory_address
 from loguru import logger
+
+
+@dataclass(frozen=True)
+class ChannelBinding:
+    """
+    Resolved transport binding for sending privmsgs to a single nick.
+
+    Returned by :meth:`MultiDirectoryClient.bind_session` and consumed as
+    the ``force_channel`` argument of :meth:`send_privmsg`. Callers should
+    cache the binding for the lifetime of a session (one CoinJoin) so all
+    messages to that nick travel the same channel, since makers reject
+    mixed-channel sessions.
+
+    Attributes:
+        nick: The remote nick this binding targets.
+        channel_id: Either ``"direct"`` (use the established onion-to-onion
+            peer connection) or ``"directory:<server>"`` to relay through
+            a specific directory server.
+        peer_location: Optional human-readable onion address of the peer,
+            for logging purposes only.
+    """
+
+    nick: str
+    channel_id: str
+    peer_location: str | None = None
+
+    @property
+    def is_direct(self) -> bool:
+        """True if this binding routes through a direct peer connection."""
+        return self.channel_id == "direct"
 
 
 class MultiDirectoryClient:
@@ -228,6 +259,89 @@ class MultiDirectoryClient:
         if peer and peer.is_connected():
             return peer
         return None
+
+    def bind_session(self, nick: str) -> ChannelBinding | None:
+        """
+        Pick and pin a single transport channel for a session with ``nick``.
+
+        Encapsulates the channel-selection algorithm that callers
+        previously open-coded by reaching into private attributes
+        (``_get_connected_peer``, ``_active_nicks``, ``clients``,
+        ``_active_peers``). The order is:
+
+        1. If a direct peer connection is established and direct
+           connections are preferred, bind to ``"direct"``.
+        2. Otherwise, prefer a directory server that our nick-tracking
+           layer marks as currently carrying ``nick``.
+        3. Otherwise, fall back to any directory whose peerlist lists the
+           nick.
+        4. Otherwise, fall back to an arbitrary connected directory.
+
+        Returns ``None`` only when no directories are connected, in which
+        case the caller cannot send anything anyway.
+
+        The returned :class:`ChannelBinding` should be reused for every
+        subsequent message to ``nick`` in the same session: makers reject
+        sessions whose ``!fill`` and ``!auth`` arrive via different
+        channels.
+        """
+        peer = self._get_connected_peer(nick)
+        peer_location = self._get_peer_location(nick)
+        if peer is not None and self.prefer_direct_connections:
+            return ChannelBinding(
+                nick=nick,
+                channel_id="direct",
+                peer_location=peer_location,
+            )
+
+        # Prefer directories that have explicitly tracked this nick as active.
+        target_directories: list[str] = []
+        if nick in self._active_nicks:
+            for server, is_active in self._active_nicks[nick].items():
+                if is_active and server in self.clients:
+                    target_directories.append(server)
+
+        # Fall back to directories whose peerlist lists this nick.
+        if not target_directories:
+            for server, client in self.clients.items():
+                if nick in client._active_peers:
+                    target_directories.append(server)
+
+        # Last-resort fallback: any connected directory.
+        if not target_directories:
+            target_directories = list(self.clients.keys())
+
+        if not target_directories:
+            return None
+
+        chosen = target_directories[0]
+        return ChannelBinding(
+            nick=nick,
+            channel_id=f"directory:{chosen}",
+            peer_location=peer_location,
+        )
+
+    def try_direct_connect(self, nick: str) -> None:
+        """
+        Public alias for ``_try_direct_connect``.
+
+        Kicks off an opportunistic background connection attempt to
+        ``nick``. Safe to call repeatedly: the underlying method is a
+        no-op when a connection (or pending task) already exists.
+        """
+        self._try_direct_connect(nick)
+
+    def get_peer_location(self, nick: str) -> str | None:
+        """Public alias for ``_get_peer_location``."""
+        return self._get_peer_location(nick)
+
+    def get_connected_peer(self, nick: str) -> OnionPeer | None:
+        """Public alias for ``_get_connected_peer``."""
+        return self._get_connected_peer(nick)
+
+    def get_pending_connect_task(self, nick: str) -> asyncio.Task[bool] | None:
+        """Return the in-flight direct-connect task for ``nick``, if any."""
+        return self._pending_connect_tasks.get(nick)
 
     async def _on_peer_message(self, nick: str, data: bytes) -> None:
         """

@@ -25,6 +25,7 @@ from jmcore.encryption import CryptoSession
 from jmcore.models import Offer, OfferType
 from jmwallet.wallet.models import UTXOInfo
 
+from taker.multi_directory import ChannelBinding
 from taker.podle_manager import PoDLEManager
 from taker.taker import MakerSession, PhaseResult, Taker, TakerState
 
@@ -1679,8 +1680,15 @@ async def test_phase_fill_promotes_silent_makers_to_blacklist(
     _dir_client = Mock()
     _dir_client._active_peers = {}
     taker.directory_client.clients = {"dir1": _dir_client}
-    taker.directory_client._get_peer_location = Mock(return_value=None)
-    taker.directory_client._get_connected_peer = Mock(return_value=None)
+    taker.directory_client.get_peer_location = Mock(return_value=None)
+    taker.directory_client.get_connected_peer = Mock(return_value=None)
+    taker.directory_client.get_pending_connect_task = Mock(return_value=None)
+    taker.directory_client.try_direct_connect = Mock(return_value=None)
+    taker.directory_client.bind_session = Mock(
+        side_effect=lambda nick: ChannelBinding(
+            nick=nick, channel_id="directory:dir1", peer_location=None
+        )
+    )
 
     async def _send_privmsg(nick, command, data, log_routing=False, force_channel=None):
         return force_channel
@@ -1752,8 +1760,15 @@ async def test_phase_fill_does_not_promote_silent_makers_without_blacklist_hit(
     _dir_client2 = Mock()
     _dir_client2._active_peers = {}
     taker.directory_client.clients = {"dir1": _dir_client2}
-    taker.directory_client._get_peer_location = Mock(return_value=None)
-    taker.directory_client._get_connected_peer = Mock(return_value=None)
+    taker.directory_client.get_peer_location = Mock(return_value=None)
+    taker.directory_client.get_connected_peer = Mock(return_value=None)
+    taker.directory_client.get_pending_connect_task = Mock(return_value=None)
+    taker.directory_client.try_direct_connect = Mock(return_value=None)
+    taker.directory_client.bind_session = Mock(
+        side_effect=lambda nick: ChannelBinding(
+            nick=nick, channel_id="directory:dir1", peer_location=None
+        )
+    )
 
     async def _send_privmsg(nick, command, data, log_routing=False, force_channel=None):
         return force_channel

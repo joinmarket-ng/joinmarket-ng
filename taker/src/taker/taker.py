@@ -1214,38 +1214,22 @@ class Taker(TakerMonitoringMixin):
                     taker_pubkey = self.crypto_session.get_pubkey_hex()
 
                     # Establish communication channels for replacement makers
-                    # (Same logic as in _phase_fill)
+                    # (Same logic as in _phase_fill, delegated to the directory layer.)
                     for nick in new_maker_nicks:
-                        peer = self.directory_client._get_connected_peer(nick)
+                        binding = self.directory_client.bind_session(nick)
                         session = self.maker_sessions[nick]
-                        if peer and self.directory_client.prefer_direct_connections:
-                            session.comm_channel = "direct"
+                        if binding is None:
+                            logger.warning(
+                                f"No communication channel available for replacement maker {nick}"
+                            )
+                            continue
+                        session.comm_channel = binding.channel_id
+                        if binding.is_direct:
                             logger.debug(f"Will use DIRECT connection for replacement maker {nick}")
                         else:
-                            # Use directory relay
-                            target_directories = []
-
-                            if nick in self.directory_client._active_nicks:
-                                active_nicks_dict = self.directory_client._active_nicks[nick]
-                                for server, is_active in active_nicks_dict.items():
-                                    if is_active and server in self.directory_client.clients:
-                                        target_directories.append(server)
-
-                            if not target_directories:
-                                for server, client in self.directory_client.clients.items():
-                                    if nick in client._active_peers:
-                                        target_directories.append(server)
-
-                            if not target_directories:
-                                target_directories = list(self.directory_client.clients.keys())
-
-                            if target_directories:
-                                chosen_dir = target_directories[0]
-                                session.comm_channel = f"directory:{chosen_dir}"
-                                logger.debug(
-                                    f"Will use DIRECTORY relay {chosen_dir} "
-                                    f"for replacement maker {nick}"
-                                )
+                            logger.debug(
+                                f"Will use {binding.channel_id} for replacement maker {nick}"
+                            )
 
                     # Send !fill to replacement makers using their designated channels
                     for nick in new_maker_nicks:
@@ -1550,7 +1534,7 @@ class Taker(TakerMonitoringMixin):
         """
         dropped: list[str] = []
         for nick in list(self.maker_sessions.keys()):
-            peer = self.directory_client._peer_connections.get(nick)
+            peer = self.directory_client.get_connected_peer(nick)
             if peer is None:
                 continue
             support = peer.supports_feature(FEATURE_NEUTRINO_COMPAT)
@@ -1591,19 +1575,18 @@ class Taker(TakerMonitoringMixin):
         # Start direct connection attempts for all makers
         if self.directory_client.prefer_direct_connections:
             for nick in self.maker_sessions.keys():
-                maker_location = self.directory_client._get_peer_location(nick)
+                maker_location = self.directory_client.get_peer_location(nick)
                 if maker_location:
-                    self.directory_client._try_direct_connect(nick)
+                    self.directory_client.try_direct_connect(nick)
 
         # Wait up to 5 seconds for direct connections to establish
         # This timeout balances privacy (prefer direct) vs latency (don't wait too long)
         if self.directory_client.prefer_direct_connections:
             pending_tasks = []
             for nick in self.maker_sessions.keys():
-                if nick in self.directory_client._pending_connect_tasks:
-                    task = self.directory_client._pending_connect_tasks[nick]
-                    if not task.done():
-                        pending_tasks.append(task)
+                task = self.directory_client.get_pending_connect_task(nick)
+                if task is not None and not task.done():
+                    pending_tasks.append(task)
 
             if pending_tasks:
                 logger.info(
@@ -1640,45 +1623,23 @@ class Taker(TakerMonitoringMixin):
                     failed_makers=incompatible,
                 )
 
-        # Determine and record communication channel for each maker
+        # Determine and record communication channel for each maker by
+        # delegating to the directory layer. The DTO encapsulates the
+        # "prefer direct, otherwise pick the most relevant directory"
+        # algorithm that used to be open-coded here and in two other sites.
         for nick, session in self.maker_sessions.items():
-            # Check if direct connection is available
-            peer = self.directory_client._get_connected_peer(nick)
-            if peer and self.directory_client.prefer_direct_connections:
-                session.comm_channel = "direct"
+            binding = self.directory_client.bind_session(nick)
+            if binding is None:
+                # No directories connected -- shouldn't happen at this stage.
+                raise RuntimeError(f"No communication channel available for {nick}")
+            session.comm_channel = binding.channel_id
+            if binding.is_direct:
                 logger.debug(f"Will use DIRECT connection for {nick}")
             else:
-                # Use directory relay - pick one directory for this maker
-                maker_location = self.directory_client._get_peer_location(nick)
-                target_directories = []
-
-                # Check active nicks tracking first
-                if nick in self.directory_client._active_nicks:
-                    for server, is_active in self.directory_client._active_nicks[nick].items():
-                        if is_active and server in self.directory_client.clients:
-                            target_directories.append(server)
-
-                # If not found, try all clients that list the peer
-                if not target_directories:
-                    for server, client in self.directory_client.clients.items():
-                        if nick in client._active_peers:
-                            target_directories.append(server)
-
-                # If still not found, use all connected clients
-                if not target_directories:
-                    target_directories = list(self.directory_client.clients.keys())
-
-                # Pick first directory (already shuffled during orderbook fetch)
-                if target_directories:
-                    chosen_dir = target_directories[0]
-                    session.comm_channel = f"directory:{chosen_dir}"
-                    logger.debug(
-                        f"Will use DIRECTORY relay {chosen_dir} for {nick} "
-                        f"(onion: {maker_location or 'unknown'})"
-                    )
-                else:
-                    # This should never happen if we're connected to directories
-                    raise RuntimeError(f"No communication channel available for {nick}")
+                logger.debug(
+                    f"Will use {binding.channel_id} for {nick} "
+                    f"(onion: {binding.peer_location or 'unknown'})"
+                )
 
         # Send !fill to all makers using their designated channels
         # Format: fill <oid> <amount> <taker_pubkey> <commitment>
