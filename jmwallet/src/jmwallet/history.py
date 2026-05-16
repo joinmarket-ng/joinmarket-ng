@@ -441,8 +441,12 @@ def _compute_stats(entries: list[TransactionHistoryEntry]) -> dict[str, int | fl
         - failed_coinjoins: Number of failed CoinJoins
         - total_volume: Total CJ amount in sats (all requests)
         - successful_volume: CJ amount in sats (successful only)
-        - total_fees_earned: Total fees earned as maker
-        - total_fees_paid: Total fees paid as taker
+        - total_fees_earned: Total fees earned as maker (successful CoinJoins only).
+              Failed rows can carry a non-zero ``fee_received`` because the
+              fee is recorded at signing time before broadcast; those amounts
+              are excluded because no coins actually moved.
+        - total_fees_paid: Total fees paid as taker (successful CoinJoins only),
+              for the same reason as ``total_fees_earned``.
         - success_rate: Percentage of successful CoinJoins
         - utxos_disclosed: Number of unique UTXOs disclosed to takers (via !ioauth).
               Deduplicated across entries so the same UTXO disclosed in multiple
@@ -467,6 +471,13 @@ def _compute_stats(entries: list[TransactionHistoryEntry]) -> dict[str, int | fl
     taker_entries = [e for e in entries if e.role == "taker"]
     successful = [e for e in entries if e.success]
     failed = [e for e in entries if not e.success and e.completed_at]
+    # Fees are recorded at signing time (before broadcast), so failed entries
+    # may carry a non-zero ``fee_received`` / ``total_maker_fees_paid`` that
+    # never actually moved coins (for example, when the taker abandons after
+    # collecting signatures and the transaction is never broadcast). Only
+    # count fees from rows whose CoinJoin actually succeeded.
+    successful_maker_entries = [e for e in maker_entries if e.success]
+    successful_taker_entries = [e for e in taker_entries if e.success]
 
     # Collect all unique UTXOs disclosed across all entries.  The same UTXO may
     # appear in multiple CoinJoin attempts; users care about how many distinct
@@ -483,8 +494,10 @@ def _compute_stats(entries: list[TransactionHistoryEntry]) -> dict[str, int | fl
         "failed_coinjoins": len(failed),
         "total_volume": sum(e.cj_amount for e in entries),
         "successful_volume": sum(e.cj_amount for e in successful),
-        "total_fees_earned": sum(e.fee_received for e in maker_entries),
-        "total_fees_paid": sum(e.total_maker_fees_paid + e.mining_fee_paid for e in taker_entries),
+        "total_fees_earned": sum(e.fee_received for e in successful_maker_entries),
+        "total_fees_paid": sum(
+            e.total_maker_fees_paid + e.mining_fee_paid for e in successful_taker_entries
+        ),
         "success_rate": len(successful) / len(entries) * 100 if entries else 0.0,
         "utxos_disclosed": len(all_disclosed),
     }

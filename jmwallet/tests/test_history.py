@@ -367,6 +367,72 @@ class TestHistoryStats:
         assert stats["success_rate"] == 100.0
         assert stats["utxos_disclosed"] == 2  # 2 UTXOs from maker entry
 
+    def test_failed_maker_entry_excluded_from_earnings(self, temp_data_dir: Path) -> None:
+        """Regression: failed maker entries with a signed-but-never-broadcast tx
+        still have ``fee_received`` set, but must not inflate ``total_fees_earned``.
+
+        See the notification bug where a failed + a successful round both showed
+        fee_received=410 and the daily summary reported 820 sats earned instead
+        of 410.
+        """
+        failed_entry = TransactionHistoryEntry(
+            timestamp="2024-01-01T00:00:00",
+            completed_at="2024-01-01T01:00:00",
+            role="maker",
+            success=False,
+            failure_reason="Transaction not found after 60 minutes - likely never broadcast",
+            txid="failed_tx" * 8,
+            cj_amount=1_328_246,
+            fee_received=410,  # recorded at signing time, but never broadcast
+        )
+        success_entry = TransactionHistoryEntry(
+            timestamp="2024-01-01T02:00:00",
+            completed_at="2024-01-01T02:30:00",
+            role="maker",
+            success=True,
+            txid="ok_tx" * 13,
+            cj_amount=1_328_246,
+            fee_received=410,
+        )
+        append_history_entry(failed_entry, temp_data_dir)
+        append_history_entry(success_entry, temp_data_dir)
+
+        stats = get_history_stats(temp_data_dir)
+        assert stats["total_coinjoins"] == 2
+        assert stats["successful_coinjoins"] == 1
+        assert stats["failed_coinjoins"] == 1
+        # Only the successful round's fee should be counted.
+        assert stats["total_fees_earned"] == 410
+
+    def test_failed_taker_entry_excluded_from_fees_paid(self, temp_data_dir: Path) -> None:
+        """Regression: failed taker entries should not contribute to ``total_fees_paid``."""
+        failed_entry = TransactionHistoryEntry(
+            timestamp="2024-01-01T00:00:00",
+            completed_at="2024-01-01T01:00:00",
+            role="taker",
+            success=False,
+            failure_reason="aborted",
+            txid="failed_tk" * 8,
+            cj_amount=2_000_000,
+            total_maker_fees_paid=800,
+            mining_fee_paid=200,
+        )
+        success_entry = TransactionHistoryEntry(
+            timestamp="2024-01-01T02:00:00",
+            completed_at="2024-01-01T02:30:00",
+            role="taker",
+            success=True,
+            txid="ok_tk" * 13,
+            cj_amount=2_000_000,
+            total_maker_fees_paid=800,
+            mining_fee_paid=200,
+        )
+        append_history_entry(failed_entry, temp_data_dir)
+        append_history_entry(success_entry, temp_data_dir)
+
+        stats = get_history_stats(temp_data_dir)
+        assert stats["total_fees_paid"] == 1000  # only the successful round
+
 
 class TestHistoryStatsForPeriod:
     """Tests for time-filtered aggregate statistics."""
