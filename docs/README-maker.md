@@ -106,7 +106,7 @@ same fee models, same fidelity bonds. The main differences:
 - **No `joinmarket.cfg`.** Configuration lives in
   `~/.joinmarket-ng/config.toml` (TOML, sectioned). See
   [Configuration](technical/configuration.md) and
-  [`config.toml.template`](https://github.com/joinmarket-ng/joinmarket-ng/blob/main/config.toml.template).
+  [`config.toml.template`](https://github.com/joinmarket-ng/joinmarket-ng/blob/main/jmcore/src/jmcore/data/config.toml.template).
 - **No IRC.** Transport is Tor onion services to directory nodes. Tor is
   required in production.
 - **Backends:** instead of a Bitcoin Core wallet with manual import, choose

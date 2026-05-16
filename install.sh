@@ -610,14 +610,14 @@ setup_data_directory() {
         # Download config template from repository
         # Use VERSION if available, otherwise use main branch
         local version_tag="${VERSION:-main}"
-        local config_template_url="https://raw.githubusercontent.com/$GITHUB_REPO/${version_tag}/config.toml.template"
+        local config_template_url="https://raw.githubusercontent.com/$GITHUB_REPO/${version_tag}/jmcore/src/jmcore/data/config.toml.template"
         if ! curl -fsSL "$config_template_url" -o "$config_file"; then
             print_warning "Failed to download config template, using fallback..."
             # Fallback: create minimal config if download fails
             cat > "$config_file" << 'EOF'
 # JoinMarket-NG Configuration
 # See: https://joinmarket-ng.github.io/joinmarket-ng/
-# For full template: https://github.com/joinmarket-ng/joinmarket-ng/blob/main/config.toml.template
+# For full template: https://github.com/joinmarket-ng/joinmarket-ng/blob/main/jmcore/src/jmcore/data/config.toml.template
 
 # [bitcoin]
 # rpc_url = "http://127.0.0.1:8332"

@@ -66,7 +66,7 @@ If this is a manual/source install and the file does not exist yet:
 ```bash
 mkdir -p ~/.joinmarket-ng/wallets
 chmod 700 ~/.joinmarket-ng ~/.joinmarket-ng/wallets
-curl -fsSL https://raw.githubusercontent.com/joinmarket-ng/joinmarket-ng/main/config.toml.template -o ~/.joinmarket-ng/config.toml
+curl -fsSL https://raw.githubusercontent.com/joinmarket-ng/joinmarket-ng/main/jmcore/src/jmcore/data/config.toml.template -o ~/.joinmarket-ng/config.toml
 ```
 
 ### Bitcoin Core (`descriptor_wallet`, recommended)

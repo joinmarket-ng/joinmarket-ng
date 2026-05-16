@@ -151,8 +151,17 @@
 # Number of mixing depths (1-10)
 # mixdepth_count = 5
 
-# Address gap limit for wallet scanning (minimum: 6)
+# BIP44 gap limit: stop address scanning after this many consecutive empty
+# trailing addresses past the highest used one (minimum: 6, Electrum convention: 20).
+# Distinct from ``scan_range`` below.
 # gap_limit = 20
+
+# Initial descriptor scan range (max address index per branch) imported into
+# Bitcoin Core's descriptor wallet. Defaults to 1000, matching Bitcoin Core's
+# default keypool lookahead. Wallets migrated from legacy joinmarket-clientserver
+# may have used addresses beyond this; run ``jmwallet info --scan-depth N`` once
+# with a larger N to re-import descriptors and rescan from genesis (issue #475).
+# scan_range = 1000
 
 # Dust threshold in satoshis
 # dust_threshold = 27300
@@ -184,7 +193,13 @@
 
 # Mnemonic file settings (optional defaults)
 # mnemonic_file = ""            # Path to mnemonic file
-# mnemonic_password = ""        # Password for encrypted mnemonic
+#
+# SECURITY WARNING: mnemonic_password is stored IN PLAIN TEXT in this file.
+# Anyone who can read config.toml can decrypt the wallet, which defeats the
+# wallet's encryption. Only set it when you need unattended maker operation
+# and you trust the security of this machine. Prefer leaving it unset and
+# entering the password interactively when prompted by jm-wallet / jm-maker.
+# mnemonic_password = ""        # Password for encrypted mnemonic (plaintext!)
 
 # ============================================================================
 # Logging Settings
@@ -259,12 +274,12 @@
 [maker]
 # Minimum CoinJoin amount (in satoshis) that this maker will offer.
 #
-# There is no protocol-level minimum balance per mixdepth to run a maker;
-# 100000 ("100k sats") is a common orientation value for new users but is
-# not a requirement. Lower min_size lets you serve takers requesting
-# smaller mixes at the cost of producing smaller UTXOs.
+# Lower min_size lets you serve takers requesting smaller mixes at the cost of
+# producing smaller UTXOs. Note: the *advertised* minsize is randomized on each
+# offer announcement (see size_factor below) and clamped to the dust threshold.
 #
-# Default: DUST_THRESHOLD (the reference implementation's dust limit).
+# Default: 100000 (matches the upstream JoinMarket reference; using a different
+# value may make jm-ng makers fingerprintable).
 # min_size = 100000
 
 # IMPORTANT: offer_type determines which fee setting is used.
@@ -279,17 +294,39 @@
 #   cj_fee_absolute = 500
 #
 # To run BOTH offer types simultaneously, use the CLI flag --dual-offers
+# In dual-offer mode the maker advertises one relative and one absolute
+# offer.  Their size ranges are split automatically at the fee
+# intersection x = cj_fee_absolute / cj_fee_relative:
+#   - absolute offer covers small CJs in [min_size, x]
+#     (guarantees a flat minimum profit per join)
+#   - relative offer covers large CJs in [x, max_balance]
+#     (scales fees with size, stays competitive on big mixes)
+# This produces a piecewise fee curve roughly equivalent to a linear
+# offer (min flat fee + proportional component) without breaking the
+# protocol.
 # offer_type = "sw0reloffer"
 
 # Fee settings (only one is used based on offer_type above)
-# cj_fee_relative = "0.001"  # 0.001 = 0.1% relative fee (for sw0reloffer)
-# cj_fee_absolute = 500      # Absolute fee in satoshis (for sw0absoffer)
-# tx_fee_contribution = 0    # Mining fee contribution in satoshis
+# Defaults match the upstream JoinMarket reference (yg-privacyenhanced) so that
+# jm-ng makers are not trivially distinguishable from reference makers.
+# cj_fee_relative = "0.00002"  # 0.00002 = 0.002% relative fee (for sw0reloffer)
+# cj_fee_absolute = 500        # Absolute fee in satoshis (for sw0absoffer)
+# tx_fee_contribution = 0      # Mining fee contribution in satoshis
+
+# Offer randomization factors. Each advertised offer is sampled uniformly from
+# [value*(1-factor), value*(1+factor)] (size is sampled downward only) on every
+# announcement so observers cannot correlate balance changes with exact values.
+# Set any factor to 0 to disable randomization for that field.
+# Defaults match the upstream JoinMarket yg-privacyenhanced reference.
+# cjfee_factor = 0.1
+# txfee_contribution_factor = 0.3
+# size_factor = 0.1
 
 # Minimum confirmations for UTXOs offered into coinjoins.
 # Default 0 lets the maker offer unconfirmed (mempool) UTXOs, which
-# improves liquidity. The PoDLE commitment lives on a separate UTXO
-# and is still gated by taker_utxo_age (taker side, default 5).
+# improves liquidity. The PoDLE commitment lives on a separate UTXO and
+# is still gated by taker_utxo_age (taker side, default 5). Raise this
+# to 1+ if you want to trade liquidity for RBF/eviction/reorg safety.
 # min_confirmations = 0
 
 # UTXO merge algorithm: "default", "gradual", "greedy", "random"
@@ -332,12 +369,22 @@
 # ============================================================================
 
 [taker]
-# Number of counterparty makers to use (1-20)
+# Number of counterparty makers to use (1-20).
+# When unset, a random value in [8, 10] is drawn for every CoinJoin (matches
+# the upstream JoinMarket sendpayment default and avoids fingerprinting via a
+# fixed counterparty count). Set explicitly to override.
 # counterparty_count = 10
 
 # Maximum acceptable coinjoin fees (paid to makers, not network/miner fees)
 # max_cj_fee_abs = 500        # Absolute fee in satoshis per maker
 # max_cj_fee_rel = "0.001"    # Relative fee (0.001 = 0.1%)
+
+# PoDLE commitment requirements (control which UTXOs can be used as PoDLE inputs).
+# These match the reference JoinMarket defaults; loosening them weakens the
+# anti-DoS commitment scheme.
+# taker_utxo_age = 5          # Minimum confirmations on the PoDLE input
+# taker_utxo_retries = 3      # Max PoDLE index retries per UTXO
+# taker_utxo_amtpercent = 20  # Min UTXO value as % of CJ amount
 
 # Network/miner transaction fee settings
 # fee_rate takes precedence over fee_block_target when set
@@ -363,8 +410,32 @@
 # tx_broadcast = "random-peer"
 # broadcast_peer_count = 3
 
-# Minimum number of makers required
-# minimum_makers = 1
+# Minimum number of makers required for a CoinJoin to proceed.
+# Default: 4 (matches the upstream JoinMarket reference POLICY default; using
+# minimum_makers=1 is fingerprintable and degrades the privacy of the join).
+# minimum_makers = 4
+
+# ============================================================================
+# Tumbler Settings
+# ============================================================================
+# These mirror ``tumbler.runner.RunnerContext`` fields that govern
+# inter-phase pacing. Production defaults are intentionally long so the
+# runner waits patiently for blockchain confirmations and UTXO age between
+# CoinJoin phases; tighten via env vars (TUMBLER__RETRY_DELAY_SECONDS, ...)
+# in test environments.
+
+[tumbler]
+# Minimum confirmations on a CoinJoin output before the next tumbler phase
+# may spend it. Set to 0 to disable the gate.
+# min_confirmations_between_phases = 6
+
+# Polling interval (seconds) for the confirmation gate.
+# confirmation_poll_interval = 30.0
+
+# Base delay (seconds) before retrying a failed taker phase. Applied with
+# linear backoff: ``retry_delay_seconds * attempt_count``. Set to 0 to retry
+# immediately.
+# retry_delay_seconds = 1800.0
 
 # ============================================================================
 # Directory Server Settings

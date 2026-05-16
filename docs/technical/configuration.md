@@ -15,14 +15,14 @@ Main config path:
 
 Template/reference:
 
-- `config.toml.template` (repo root)
-- Also bundled inside the `jmcore` package as `jmcore/data/config.toml.template`
+- Bundled inside the `jmcore` package at `jmcore/src/jmcore/data/config.toml.template`
+  (the canonical source, loaded at runtime via `importlib.resources`).
 
 The installer creates a starter config automatically from the bundled template.
 
 ## Config Updates
 
-Your `config.toml` is never modified automatically after creation. When updating via `install.sh --update`, the installer compares your config against the bundled template and prints any new sections or keys that are available but not yet in your file. You can then copy them manually from `config.toml.template`.
+Your `config.toml` is never modified automatically after creation. When updating via `install.sh --update`, the installer compares your config against the bundled template and prints any new sections or keys that are available but not yet in your file. You can then copy them manually from the bundled `config.toml.template`.
 
 If `config.toml` is missing entirely (fresh install), it is created from the template.
 
