@@ -1104,6 +1104,18 @@ class NeutrinoBackend(BlockchainBackend):
                             error="UTXO spent",
                         )
 
+                    actual_spk = response.get("scriptpubkey", "")
+                    if not actual_spk or actual_spk.lower() != bond.scriptpubkey.lower():
+                        return BondVerificationResult(
+                            txid=bond.txid,
+                            vout=bond.vout,
+                            value=response.get("value", 0),
+                            confirmations=0,
+                            block_time=0,
+                            valid=False,
+                            error="ScriptPubKey mismatch",
+                        )
+
                     value = response.get("value", 0)
                     block_height = response.get("block_height", 0)
                     confirmations = (

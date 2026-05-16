@@ -428,6 +428,19 @@ class BlockchainBackend(ABC):
                             valid=False,
                             error="UTXO unconfirmed",
                         )
+                    if (
+                        not utxo.scriptpubkey
+                        or utxo.scriptpubkey.lower() != bond.scriptpubkey.lower()
+                    ):
+                        return BondVerificationResult(
+                            txid=bond.txid,
+                            vout=bond.vout,
+                            value=utxo.value,
+                            confirmations=utxo.confirmations,
+                            block_time=0,
+                            valid=False,
+                            error="ScriptPubKey mismatch",
+                        )
                     # Get the block time for the confirmation block
                     conf_height = current_height - utxo.confirmations + 1
                     block_time = await self.get_block_time(conf_height)
