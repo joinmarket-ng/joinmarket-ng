@@ -132,6 +132,53 @@ class TestBaseVerifyBonds:
         assert "RPC down" in results[0].error
 
     @pytest.mark.asyncio()
+    async def test_scriptpubkey_mismatch(self, mock_backend: BlockchainBackend) -> None:
+        """A confirmed UTXO whose scriptPubKey does not match the bond's
+        derived script must be rejected. This blocks a malicious maker from
+        pointing (txid, vout) at any large confirmed UTXO it does not own."""
+        mock_backend.get_utxo = AsyncMock(
+            return_value=UTXO(
+                txid="a" * 64,
+                vout=0,
+                value=100_000_000,
+                address="bcrt1qfakeaddress",
+                confirmations=1000,
+                # On-chain script differs from the bond request's "cd"*32.
+                scriptpubkey="0020" + "aa" * 32,
+                height=99001,
+            )
+        )
+
+        bonds = [_make_bond_request()]
+        results = await mock_backend.verify_bonds(bonds)
+
+        assert len(results) == 1
+        assert results[0].valid is False
+        assert "scriptpubkey" in results[0].error.lower()
+
+    @pytest.mark.asyncio()
+    async def test_scriptpubkey_missing_fails_closed(self, mock_backend: BlockchainBackend) -> None:
+        """If the backend cannot supply a scriptPubKey, verification must fail
+        closed rather than silently skip the binding check."""
+        mock_backend.get_utxo = AsyncMock(
+            return_value=UTXO(
+                txid="a" * 64,
+                vout=0,
+                value=100_000_000,
+                address="bcrt1qfakeaddress",
+                confirmations=1000,
+                scriptpubkey="",
+                height=99001,
+            )
+        )
+
+        bonds = [_make_bond_request()]
+        results = await mock_backend.verify_bonds(bonds)
+
+        assert len(results) == 1
+        assert results[0].valid is False
+
+    @pytest.mark.asyncio()
     async def test_multiple_bonds(self, mock_backend: BlockchainBackend) -> None:
         """verify_bonds processes multiple bonds concurrently."""
         call_count = 0
@@ -146,7 +193,7 @@ class TestBaseVerifyBonds:
                     value=50_000_000,
                     address="bcrt1q1",
                     confirmations=500,
-                    scriptpubkey="0020" + "aa" * 32,
+                    scriptpubkey="0020" + "cd" * 32,
                     height=99501,
                 )
             return None  # Second bond not found
@@ -175,7 +222,7 @@ class TestBaseVerifyBonds:
                 value=100_000_000,
                 address="bcrt1q1",
                 confirmations=200,
-                scriptpubkey="0020" + "aa" * 32,
+                scriptpubkey="0020" + "cd" * 32,
             )
         )
 

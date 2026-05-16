@@ -189,6 +189,7 @@ class TestNeutrinoBackend:
                 "unspent": True,
                 "value": 100000,
                 "block_height": 760000,
+                "scriptpubkey": "0020" + "00" * 32,
             }
         )
         backend.get_block_time = AsyncMock(return_value=1700000000)
@@ -227,6 +228,7 @@ class TestNeutrinoBackend:
                 "unspent": True,
                 "value": 100000,
                 "block_height": 299000,
+                "scriptpubkey": "0020" + "11" * 32,
             }
         )
         backend.get_block_time = AsyncMock(return_value=1700000000)
