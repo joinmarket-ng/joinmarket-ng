@@ -180,9 +180,13 @@ log_info "Phase 2: Checking pinned apt package versions..."
 
 # Collect all unique pinned packages from all Dockerfiles
 # Matches patterns like: package=version or package=epoch:version
+# For jmwalletd/Dockerfile, skip the jam-builder stage (it uses a different
+# base image, Debian bookworm, and its packages are handled in Phase 2c).
 declare -A CURRENT_VERSIONS
 for dockerfile in "${DOCKERFILES[@]}"; do
     [[ -f "$dockerfile" ]] || continue
+    # Strip the jam-builder stage from jmwalletd/Dockerfile before scanning
+    dockerfile_content=$(awk '/AS jam-builder/{found=1; next} found && /^FROM /{found=0} !found{print}' "$dockerfile")
     while IFS= read -r match; do
         pkg="${match%%=*}"
         ver="${match#*=}"
@@ -190,7 +194,7 @@ for dockerfile in "${DOCKERFILES[@]}"; do
         ver="${ver%% *}"
         ver="${ver%\\}"
         CURRENT_VERSIONS["$pkg"]="$ver"
-    done < <(grep -oP '^\s+\K[a-z][a-z0-9.+-]+=\S+' "$dockerfile" 2>/dev/null | \
+    done < <(echo "$dockerfile_content" | grep -oP '^\s+\K[a-z][a-z0-9.+-]+=\S+' 2>/dev/null | \
         sed 's/ *\\$//' || true)
 done
 
@@ -255,7 +259,33 @@ else
                 escaped_latest=$(printf '%s' "$latest_ver" | sed 's/[&/\\]/\\&/g')
                 for dockerfile in "${DOCKERFILES[@]}"; do
                     [[ -f "$dockerfile" ]] || continue
-                    if grep -q "${pkg}=${current_ver}" "$dockerfile" 2>/dev/null; then
+                    # For jmwalletd/Dockerfile, only replace in non-jam-builder stages.
+                    # The jam-builder stage uses a bookworm-based node image; its packages
+                    # are updated separately in Phase 2c.
+                    if [[ "$dockerfile" == *"jmwalletd/Dockerfile" ]]; then
+                        python3 - "$dockerfile" "$pkg=${current_ver}" "$pkg=${latest_ver}" <<'PYEOF'
+import sys, re
+
+path, old_pin, new_pin = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(path) as f:
+    content = f.read()
+
+in_jam_builder = False
+lines = content.splitlines(keepends=True)
+result = []
+for line in lines:
+    if re.search(r'\bAS jam-builder\b', line):
+        in_jam_builder = True
+    elif re.match(r'^FROM ', line) and in_jam_builder:
+        in_jam_builder = False
+    if not in_jam_builder:
+        line = line.replace(old_pin, new_pin)
+    result.append(line)
+
+with open(path, 'w') as f:
+    f.writelines(result)
+PYEOF
+                    elif grep -q "${pkg}=${current_ver}" "$dockerfile" 2>/dev/null; then
                         sed -i "s|${pkg}=${escaped_current}|${pkg}=${escaped_latest}|g" "$dockerfile"
                     fi
                 done
@@ -303,6 +333,89 @@ else
             log_info "$relative_path: NODE_SLIM_DIGEST up to date"
         fi
     done
+fi
+
+# =============================================================================
+# Phase 2c: Update pinned apt package versions in the jam-builder stage
+#
+# The jam-builder stage uses node:24-slim (Debian bookworm), while all other
+# stages use python:3.14-slim (Debian trixie). Package versions differ between
+# distros, so we query bookworm separately and update only the jam-builder
+# stage packages.
+# =============================================================================
+echo ""
+log_info "Phase 2c: Checking pinned apt package versions in jam-builder stage (bookworm)..."
+
+JMWALLETD_DF="$PROJECT_ROOT/jmwalletd/Dockerfile"
+
+if [[ -f "$JMWALLETD_DF" ]]; then
+    # Extract the jam-builder stage block (from after "AS jam-builder" until next FROM)
+    JAM_BUILDER_BLOCK=$(awk '/AS jam-builder/{found=1; next} found && /^FROM /{found=0} found{print}' "$JMWALLETD_DF")
+
+    declare -A JAM_BUILDER_PKGS=()
+    while IFS= read -r match; do
+        pkg="${match%%=*}"
+        ver="${match#*=}"
+        ver="${ver%% *}"
+        ver="${ver%\\}"
+        JAM_BUILDER_PKGS["$pkg"]="$ver"
+    done < <(echo "$JAM_BUILDER_BLOCK" | grep -oP '^\s+\K[a-z][a-z0-9.+-]+=\S+' | sed 's/ *\\$//' || true)
+
+    if [[ ${#JAM_BUILDER_PKGS[@]} -eq 0 ]]; then
+        log_info "No pinned apt packages found in jam-builder stage"
+    else
+        JAM_PKGS=("${!JAM_BUILDER_PKGS[@]}")
+        log_info "Found ${#JAM_PKGS[@]} pinned packages in jam-builder: ${JAM_PKGS[*]}"
+        log_info "Querying latest versions from node:${NODE_VERSION}-slim (bookworm)..."
+
+        JAM_APT_OUTPUT=$(docker run --rm "node:${NODE_VERSION}-slim" sh -c \
+            "apt-get update -qq 2>/dev/null && apt-cache policy ${JAM_PKGS[*]} 2>/dev/null" 2>/dev/null)
+
+        if [[ -z "$JAM_APT_OUTPUT" ]]; then
+            log_warn "Failed to query apt package versions from node:${NODE_VERSION}-slim, skipping"
+        else
+            declare -A JAM_LATEST=()
+            current_pkg=""
+            while IFS= read -r line; do
+                if [[ "$line" =~ ^([a-z][a-z0-9.+-]*): ]]; then
+                    current_pkg="${BASH_REMATCH[1]}"
+                elif [[ "$line" =~ Candidate:\ (.+) ]]; then
+                    [[ -n "$current_pkg" ]] && JAM_LATEST["$current_pkg"]="${BASH_REMATCH[1]}"
+                fi
+            done <<< "$JAM_APT_OUTPUT"
+
+            for pkg in "${JAM_PKGS[@]}"; do
+                current_ver="${JAM_BUILDER_PKGS[$pkg]}"
+                latest_ver="${JAM_LATEST[$pkg]:-}"
+
+                if [[ -z "$latest_ver" ]]; then
+                    log_warn "$pkg (jam-builder): Could not determine latest version"
+                    continue
+                fi
+
+                if [[ "$current_ver" != "$latest_ver" ]]; then
+                    log_info "$pkg (jam-builder): version update available"
+                    log_info "  Current: $current_ver"
+                    log_info "  Latest:  $latest_ver"
+                    UPDATES_NEEDED=$((UPDATES_NEEDED + 1))
+
+                    if [[ "$CHECK_ONLY" == false ]]; then
+                        escaped_current=$(printf '%s' "$current_ver" | sed 's/\./\\./g; s/+/[+]/g')
+                        escaped_latest=$(printf '%s' "$latest_ver" | sed 's/[&/\\]/\\&/g')
+                        if grep -q "${pkg}=${current_ver}" "$JMWALLETD_DF" 2>/dev/null; then
+                            sed -i "s|${pkg}=${escaped_current}|${pkg}=${escaped_latest}|g" "$JMWALLETD_DF"
+                            UPDATES_MADE=$((UPDATES_MADE + 1))
+                            log_info "$pkg (jam-builder): Updated to $latest_ver"
+                        fi
+                    fi
+                else
+                    log_info "$pkg (jam-builder): Up to date ($current_ver)"
+                fi
+            done
+        fi
+    fi
+else
+    log_warn "jmwalletd/Dockerfile not found, skipping jam-builder apt package check"
 fi
 
 # =============================================================================

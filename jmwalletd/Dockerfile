@@ -174,8 +174,8 @@ ARG JAM_COMMIT
 ARG SOURCE_DATE_EPOCH
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates=20250419 \
-    git=1:2.47.3-0+deb13u1 \
+    ca-certificates=20230311+deb12u1 \
+    git=1:2.39.5-0+deb12u3 \
     && rm -rf /var/lib/apt/lists/*
 
 RUN git clone https://github.com/joinmarket-webui/jam.git /app \
