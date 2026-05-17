@@ -77,14 +77,22 @@ def pytest_collection_modifyitems(
 ) -> None:
     """Auto-add docker marker to tests that have profile-specific markers.
 
-    This ensures that tests marked with e2e, reference, neutrino, or reference_maker
-    are also automatically marked with 'docker', so they get excluded by default.
+    This ensures that tests marked with e2e, reference, neutrino,
+    reference_maker, neutrino_reference, or tumbler_e2e are also
+    automatically marked with 'docker', so they get excluded by default.
     """
     docker_marker = pytest.mark.docker
 
     for item in items:
         # Check if item has any profile-specific marker
-        profile_markers = {"e2e", "reference", "neutrino", "reference_maker"}
+        profile_markers = {
+            "e2e",
+            "reference",
+            "neutrino",
+            "reference_maker",
+            "neutrino_reference",
+            "tumbler_e2e",
+        }
         item_markers = {marker.name for marker in item.iter_markers()}
 
         # If the test has a profile marker but not 'docker', add 'docker'
