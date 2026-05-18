@@ -440,11 +440,11 @@ async def _send_transaction(
                 operation="send",
                 amount=send_amount,
                 destination=destination,
-                fee=estimated_fee,
+                mining_fee=estimated_fee,
                 additional_info={
                     "Source Mixdepth": mixdepth,
                     "Change": format_amount(change_amount) if change_amount > 0 else "None",
-                    "Fee Rate": f"{resolved_fee_rate:.2f} sat/vB",
+                    "Miner Fee Rate": f"{resolved_fee_rate:.2f} sat/vB",
                 },
                 skip_confirmation=skip_confirmation,
             )

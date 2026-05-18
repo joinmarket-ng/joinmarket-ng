@@ -23,9 +23,10 @@ def is_interactive_mode() -> bool:
 # Display width for coinjoin confirmation
 _COINJOIN_WIDTH = 96
 _LABEL_WIDTH = 16  # Width for labels like "CoinJoin Amount:"
+_SEND_WIDTH = 80  # Display width for standard send confirmation
 
 
-def _display_coinjoin_confirmation(
+def _display_coinjoin_send_confirmation(
     amount: int,
     destination: str | None,
     mining_fee: int | None,
@@ -97,7 +98,7 @@ def _display_coinjoin_confirmation(
     print("=" * _COINJOIN_WIDTH)
 
 
-def _display_standard_confirmation(
+def _display_standard_send_confirmation(
     operation: str,
     amount: int,
     destination: str | None,
@@ -105,48 +106,49 @@ def _display_standard_confirmation(
     mining_fee: int | None,
     additional_info: dict[str, Any] | None,
 ) -> None:
-    """Display standard transaction confirmation (non-coinjoin)."""
+    """Display standard send transaction confirmation (non-coinjoin)."""
     from jmcore.bitcoin import format_amount
 
-    print("\n" + "=" * 80)
-    print(f"TRANSACTION CONFIRMATION - {operation.upper()}")
-    print("=" * 80)
+    print("\n" + "=" * _SEND_WIDTH)
+    print("Expected SEND Transaction")
+    print("=" * _SEND_WIDTH)
 
-    # Amount
-    if amount == 0:
-        print("Amount:       SWEEP (all available funds)")
-    else:
-        print(f"Amount:       {format_amount(amount)}")
+    # Extract info from additional_info
+    source_mixdepth = additional_info.get("Source Mixdepth") if additional_info else None
+    change = additional_info.get("Change") if additional_info else None
+    fee_rate = additional_info.get("Miner Fee Rate") if additional_info else None
+
+    # Source Mixdepth
+    if source_mixdepth is not None:
+        print(f"{'Source Mixdepth:':<{_LABEL_WIDTH}}  {source_mixdepth}")
 
     # Destination
     if destination:
         if destination == "INTERNAL":
-            print("Destination:  INTERNAL (next mixdepth)")
+            print(f"{'Destination:':<{_LABEL_WIDTH}}  INTERNAL (next mixdepth)")
         else:
-            print(f"Destination:  {destination}")
+            print(f"{'Destination:':<{_LABEL_WIDTH}}  {destination}")
 
-    # Fee
-    if fee is not None:
-        print(f"Fee:          {format_amount(fee)}")
+    # Amount
+    if amount == 0:
+        print(f"{'Amount:':<{_LABEL_WIDTH}}  SWEEP (all available funds)")
+    else:
+        print(f"{'Amount:':<{_LABEL_WIDTH}}  {format_amount(amount)}")
 
-    # Mining fee (transaction fee)
-    if mining_fee is not None:
-        print(f"Mining Fee:   {format_amount(mining_fee)}")
+    # Change
+    if change is not None:
+        print(f"{'Change:':<{_LABEL_WIDTH}}  {change}")
 
-    # Additional info
-    if additional_info:
-        for key, value in additional_info.items():
-            # Format based on type
-            if isinstance(value, int) and key.lower().endswith(("fee", "amount", "value")):
-                print(f"{key}:  {format_amount(value)}".ljust(80))
-            elif isinstance(value, list):
-                print(f"{key}:  {len(value)} item(s)")
-                for i, item in enumerate(value, 1):
-                    print(f"  {i}. {item}")
-            else:
-                print(f"{key}:  {value}".ljust(80))
+    # Miner Fee Rate
+    if fee_rate is not None:
+        print(f"{'Miner Fee Rate:':<{_LABEL_WIDTH}}  {fee_rate}")
 
-    print("=" * 80)
+    # Miner Fee (use mining_fee if provided, otherwise fall back to fee)
+    effective_mining_fee = mining_fee if mining_fee is not None else fee
+    if effective_mining_fee is not None:
+        print(f"{'Miner Fee:':<{_LABEL_WIDTH}}  {format_amount(effective_mining_fee)}")
+
+    print("=" * _SEND_WIDTH)
 
 
 def confirm_transaction(
@@ -193,7 +195,7 @@ def confirm_transaction(
 
     # Use different display for coinjoin vs regular transactions
     if operation.lower() == "coinjoin":
-        _display_coinjoin_confirmation(
+        _display_coinjoin_send_confirmation(
             amount=amount,
             destination=destination,
             mining_fee=mining_fee,
@@ -201,7 +203,7 @@ def confirm_transaction(
             stage=stage,
         )
     else:
-        _display_standard_confirmation(
+        _display_standard_send_confirmation(
             operation=operation,
             amount=amount,
             destination=destination,
