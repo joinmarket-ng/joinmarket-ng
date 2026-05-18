@@ -7,9 +7,10 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated
+from typing import TYPE_CHECKING, Annotated, Any
 
 import typer
 from jmcore.cli_common import (
@@ -1390,7 +1391,12 @@ async def _run_rescan(
 
         if wait:
             print(f"\nRescanning from height {effective_start}. This can take a while...")
-            await backend.rescan_blockchain(start_height=effective_start)
+            # Use fire-and-forget background rescan + polling instead of a
+            # single blocking RPC. A full mainnet rescan can take well over
+            # an hour and used to time out the HTTP client at exactly 30 min,
+            # crashing the CLI even though Bitcoin Core kept scanning.
+            await backend.start_background_rescan(start_height=effective_start)
+            await _await_rescan_completion(backend)
             post_status = await backend.get_wallet_scan_status()
             print("\nAfter rescan:")
             _print_scan_status(post_status)
@@ -1400,3 +1406,56 @@ async def _run_rescan(
             print("Background rescan started. Check progress with `jm-wallet info --scan-status`.")
     finally:
         await backend.close()
+
+
+async def _await_rescan_completion(
+    backend: Any,
+    poll_interval_seconds: float = 5.0,
+    progress_callback: Callable[[float, float], None] | None = None,
+) -> None:
+    """Poll ``getwalletinfo`` until the in-progress rescan finishes.
+
+    Bitcoin Core's ``rescanblockchain`` runs server-side and is not bound to
+    the lifetime of the originating RPC call: even if our HTTP client times
+    out, the rescan keeps going. By polling ``getwalletinfo.scanning`` we
+    sidestep client-side timeouts entirely while still surfacing live
+    progress to the user.
+
+    Args:
+        backend: ``DescriptorWalletBackend`` with an in-flight rescan.
+        poll_interval_seconds: Sleep between successive status checks.
+        progress_callback: Optional sink for ``(progress_fraction, duration_s)``;
+            primarily a test seam.
+    """
+    last_pct = -1
+    # Brief grace period so Bitcoin Core actually flips ``scanning`` on.
+    await asyncio.sleep(min(poll_interval_seconds, 2.0))
+    while True:
+        try:
+            status = await backend.get_rescan_status()
+        except Exception as exc:
+            logger.warning(f"Failed to poll rescan status: {exc}; retrying...")
+            await asyncio.sleep(poll_interval_seconds)
+            continue
+
+        if not status or not status.get("in_progress"):
+            if progress_callback is not None:
+                progress_callback(1.0, 0.0)
+            print("\nRescan complete.")
+            return
+
+        progress = float(status.get("progress", 0.0) or 0.0)
+        duration = float(status.get("duration", 0) or 0)
+        if progress_callback is not None:
+            progress_callback(progress, duration)
+
+        pct = int(progress * 100)
+        if pct != last_pct:
+            print(
+                f"  Rescan progress: {pct:>3}%  (elapsed {int(duration)}s)",
+                end="\r",
+                flush=True,
+            )
+            last_pct = pct
+
+        await asyncio.sleep(poll_interval_seconds)

@@ -1988,10 +1988,11 @@ def test_info_scan_status_flag_prints_diagnostics_and_exits(monkeypatch) -> None
 
 
 def test_rescan_blocking_invokes_rescan_blockchain(monkeypatch) -> None:
-    """``jm-wallet rescan`` (default --wait) calls
-    ``backend.rescan_blockchain`` with the requested start height (clamped
-    to the wallet's creation height when applicable) and reports scan
-    status before and after."""
+    """``jm-wallet rescan`` (default --wait) drives the rescan via the
+    background path and polls ``get_rescan_status`` until completion.
+
+    This avoids the 30-minute HTTP timeout that used to kill the CLI on
+    long mainnet rescans even though Bitcoin Core kept scanning."""
     monkeypatch.delenv("JOINMARKET_DATA_DIR", raising=False)
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -1999,10 +2000,15 @@ def test_rescan_blocking_invokes_rescan_blockchain(monkeypatch) -> None:
         mock_backend = _make_descriptor_info_mock_backend()
         mock_backend.is_wallet_setup = AsyncMock(return_value=True)
         mock_backend.set_wallet_creation_height = MagicMock()
-        mock_backend.rescan_blockchain = AsyncMock(
-            return_value={"start_height": 0, "stop_height": 1}
-        )
+        mock_backend.rescan_blockchain = AsyncMock()
         mock_backend.start_background_rescan = AsyncMock()
+        mock_backend.get_rescan_status = AsyncMock(
+            side_effect=[
+                {"in_progress": True, "progress": 0.1, "duration": 1},
+                {"in_progress": True, "progress": 0.9, "duration": 5},
+                {"in_progress": False},
+            ]
+        )
         status_seq = [
             {
                 "scanning_in_progress": False,
@@ -2031,15 +2037,18 @@ def test_rescan_blocking_invokes_rescan_blockchain(monkeypatch) -> None:
                 "jmwallet.backends.descriptor_wallet.DescriptorWalletBackend",
                 _stub_backend_class(mock_backend),
             ),
+            patch("jmwallet.cli.wallet.asyncio.sleep", new=AsyncMock()),
         ):
             result = runner.invoke(app, ["rescan", "--start-height", "0"])
 
         assert result.exit_code == 0, f"rescan failed: {result.stdout}"
-        mock_backend.rescan_blockchain.assert_awaited_once()
-        kwargs = mock_backend.rescan_blockchain.await_args.kwargs
+        # Blocking rescan_blockchain is no longer used; we go via the
+        # non-timing-out background path and poll for completion.
+        mock_backend.rescan_blockchain.assert_not_awaited()
+        mock_backend.start_background_rescan.assert_awaited_once()
+        kwargs = mock_backend.start_background_rescan.await_args.kwargs
         assert kwargs.get("start_height") == 0
-        # Should not have used the background path.
-        mock_backend.start_background_rescan.assert_not_called()
+        assert mock_backend.get_rescan_status.await_count >= 2
         assert "Before rescan" in result.stdout
         assert "After rescan" in result.stdout
 
