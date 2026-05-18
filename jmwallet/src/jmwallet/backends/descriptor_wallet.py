@@ -1693,91 +1693,77 @@ class DescriptorWalletBackend(BlockchainBackend):
             raise
 
     async def get_addresses_with_history(self) -> set[str]:
-        """Get all wallet-owned addresses that have ever held funds.
+        """Return every wallet-owned address that has ever received funds.
 
-        Combines two fast Bitcoin Core RPCs:
+        Walks ``listtransactions "*" count skip include_watchonly=true`` in
+        pages and collects the ``address`` field of every entry whose
+        ``category`` indicates funds entering the wallet. Unlike the
+        previous ``listreceivedbyaddress``-based implementation, this picks
+        up addresses on ``internal=True`` (change) descriptors too:
+        ``listreceivedbyaddress`` hard-codes ``fIncludeChange=false`` in
+        Bitcoin Core and silently drops every JoinMarket change address,
+        which is the bug that caused freshly issued deposit addresses to
+        collide with previously funded ones after the funds were spent.
 
-        1. ``listreceivedbyaddress 0 false true`` - one row per wallet-owned
-           address that has at least one receive on an ``internal=False``
-           descriptor (Core's ``ListReceived`` walks outputs and groups by
-           destination with no input-side scan). Critically, Core sets
-           ``fIncludeChange=false`` for this RPC and the flag is not
-           exposed as an argument, so addresses on ``internal=True``
-           descriptors (every JoinMarket /1/* change address) are
-           **unconditionally excluded** from the result, even though they
-           have been used. Verified against Core v30.2 in regtest.
+        ``listtransactions`` is bounded by the wallet's transaction history
+        (one RPC roundtrip per ``page_size`` entries) which on a CoinJoin-
+        heavy wallet is much smaller than the UTXO set ``listunspent`` scans.
+        On a typical Core v30.2 descriptor wallet this is competitive with
+        the previous fast-path and, critically, returns the correct answer.
 
-        2. ``listunspent 0 9999999`` - all currently unspent outputs in
-           the wallet, regardless of descriptor flavor. Used to recover
-           change-address membership that (1) silently drops. Only catches
-           change addresses that still hold a UTXO; historical change
-           addresses that have already been spent cannot be recovered
-           from Core via a fast RPC (``listaddressgroupings`` would, but
-           is O(txs * (inputs + outputs)) and timed out at 10 minutes on
-           CoinJoin-heavy wallets, which is why this method moved away
-           from it; see commit 11b118bd). For those, the wallet relies on
-           its own persisted CoinJoin and send history (see
-           :func:`jmwallet.history.get_used_addresses`).
-
-        Performance comparison (Core v30.2 regtest, descriptor wallet):
-
-        ===================  ===============  ====================
-        Wallet size          listaddrgrp.     listreceivedbyaddress
-        ===================  ===============  ====================
-        3,420 txs            0.13s             0.05s (2.7x)
-        23,660 txs           0.41s             0.15s (2.7x)
-        ===================  ===============  ====================
-
-        ``listunspent`` is similarly cheap (output-only scan over the
-        UTXO set, not the full tx history).
-
-        Returns:
-            Set of addresses owned by this wallet that have ever held
-            funds (external receives via ``listreceivedbyaddress``, plus
-            current change UTXOs via ``listunspent``).
+        Persistence note: the wallet additionally caches every observed
+        address in its BIP-329 metadata store the moment it is seen during
+        sync (see :class:`WalletSyncMixin`). That store is the canonical
+        privacy-critical "do not reissue" set; this backend RPC is only the
+        bulk-rediscovery seed used on first sync and after backend swaps.
         """
         addresses: set[str] = set()
 
-        try:
-            entries = await self._rpc_call(
-                "listreceivedbyaddress",
-                # minconf=0, include_empty=False, include_watchonly=True
-                [0, False, True],
-            )
-        except Exception as e:
-            logger.warning(f"listreceivedbyaddress failed: {e}")
-            entries = []
+        # Wallet may not be loaded yet during initial setup.
+        if not self._wallet_loaded:
+            return addresses
 
-        external_count = 0
-        for entry in entries:
-            addr = entry.get("address")
-            if addr and entry.get("txids"):
-                addresses.add(addr)
-                external_count += 1
+        page_size = 1000
+        skip = 0
+        # Cap defensively: a wallet with > 5M tx-entries would have other
+        # problems first. We stop early on a short page in the common case.
+        max_pages = 50_000
+        scanned_entries = 0
 
-        # Recover current change UTXO addresses (excluded by step 1).
-        # Wallet may not be loaded yet during initial setup; guard against that.
-        change_count = 0
-        if self._wallet_loaded:
+        for _ in range(max_pages):
             try:
-                utxos = await self._rpc_call(
-                    "listunspent",
-                    [0, 9999999],  # minconf, maxconf (no address filter)
+                page = await self._rpc_call(
+                    "listtransactions",
+                    # dummy_label, count, skip, include_watchonly
+                    ["*", page_size, skip, True],
                 )
             except Exception as e:
-                logger.debug(f"listunspent for change-address recovery failed: {e}")
-                utxos = []
-            for u in utxos:
-                addr = u.get("address")
-                if not addr or addr in addresses:
-                    continue
-                addresses.add(addr)
-                change_count += 1
+                logger.warning(f"listtransactions skip={skip} failed: {e}")
+                break
+
+            if not page:
+                break
+
+            for entry in page:
+                cat = entry.get("category")
+                # ``receive`` covers external funding AND change returned to
+                # the wallet on internal descriptors. ``generate``/``immature``
+                # cover mining rewards if the user is also a miner; harmless
+                # to include.
+                if cat in ("receive", "generate", "immature"):
+                    addr = entry.get("address")
+                    if addr:
+                        addresses.add(addr)
+
+            scanned_entries += len(page)
+
+            if len(page) < page_size:
+                break
+            skip += page_size
 
         logger.debug(
             f"Found {len(addresses)} addresses with history "
-            f"(listreceivedbyaddress: {external_count}, "
-            f"+change UTXOs from listunspent: {change_count})"
+            f"(scanned {scanned_entries} listtransactions entries)"
         )
         return addresses
 
