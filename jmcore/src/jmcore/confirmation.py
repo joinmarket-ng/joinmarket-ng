@@ -113,10 +113,13 @@ def _display_standard_send_confirmation(
     print("Expected SEND Transaction")
     print("=" * _SEND_WIDTH)
 
-    # Extract info from additional_info
-    source_mixdepth = additional_info.get("Source Mixdepth") if additional_info else None
-    change = additional_info.get("Change") if additional_info else None
-    fee_rate = additional_info.get("Miner Fee Rate") if additional_info else None
+    # Consume known keys from additional_info; any remaining keys are
+    # rendered after the known fields to preserve forward compatibility
+    # with callers that pass custom metadata.
+    info = dict(additional_info) if additional_info else {}
+    source_mixdepth = info.pop("Source Mixdepth", None)
+    change = info.pop("Change", None)
+    fee_rate = info.pop("Miner Fee Rate", None)
 
     # Source Mixdepth
     if source_mixdepth is not None:
@@ -147,6 +150,17 @@ def _display_standard_send_confirmation(
     effective_mining_fee = mining_fee if mining_fee is not None else fee
     if effective_mining_fee is not None:
         print(f"{'Miner Fee:':<{_LABEL_WIDTH}}  {format_amount(effective_mining_fee)}")
+
+    # Render any remaining custom keys for forward compatibility.
+    for key, value in info.items():
+        if isinstance(value, int) and key.lower().endswith(("fee", "amount", "value")):
+            print(f"{key + ':':<{_LABEL_WIDTH}}  {format_amount(value)}")
+        elif isinstance(value, list):
+            print(f"{key + ':':<{_LABEL_WIDTH}}  {len(value)} item(s)")
+            for i, item in enumerate(value, 1):
+                print(f"  {i}. {item}")
+        else:
+            print(f"{key + ':':<{_LABEL_WIDTH}}  {value}")
 
     print("=" * _SEND_WIDTH)
 
