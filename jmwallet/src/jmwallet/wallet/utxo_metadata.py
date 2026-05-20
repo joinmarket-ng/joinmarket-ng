@@ -503,18 +503,146 @@ class UTXOMetadataStore:
             ) from e
 
 
-def load_metadata_store(data_dir: Path) -> UTXOMetadataStore:
-    """Create and load a UTXOMetadataStore from the default metadata file.
+def load_metadata_store(
+    data_dir: Path,
+    fingerprint: str | None = None,
+    owned_addresses: Iterable[str] | None = None,
+) -> UTXOMetadataStore:
+    """Create and load a UTXOMetadataStore from the wallet's metadata file.
 
     Args:
         data_dir: JoinMarket data directory (e.g., ``~/.joinmarket-ng``).
+        fingerprint: Optional 8-char hex wallet fingerprint. When provided,
+            the per-wallet path ``wallet_metadata_<fp>.jsonl`` is used and a
+            one-shot migration from the legacy shared
+            ``wallet_metadata.jsonl`` is attempted on first open.
+        owned_addresses: Optional iterable of addresses this wallet derives
+            inside its scan range. Used to filter ``addr`` records during
+            migration so we do not import another wallet's used-address set
+            from the shared file. When ``None`` no ``addr`` records are
+            imported (safer default than "all"; the wallet's own sync will
+            re-populate any genuinely-funded addresses).
 
     Returns:
         Loaded UTXOMetadataStore instance.
     """
     from jmcore.paths import get_wallet_metadata_path
 
-    path = get_wallet_metadata_path(data_dir)
+    path = get_wallet_metadata_path(data_dir, fingerprint=fingerprint)
+
+    if fingerprint is not None and not path.exists():
+        legacy_shared = get_wallet_metadata_path(data_dir, fingerprint=None)
+        if legacy_shared.exists() and legacy_shared != path:
+            _migrate_shared_metadata(
+                legacy_shared,
+                path,
+                owned_addresses=owned_addresses,
+            )
+
     store = UTXOMetadataStore(path=path)
     store.load()
     return store
+
+
+def _migrate_shared_metadata(
+    shared_path: Path,
+    per_wallet_path: Path,
+    owned_addresses: Iterable[str] | None,
+) -> None:
+    """Copy wallet-specific records out of the legacy shared metadata file.
+
+    Pre-partition builds wrote a single ``wallet_metadata.jsonl`` per data
+    directory; any wallet opened against that directory would inherit
+    every other wallet's used-address and frozen-UTXO state. This
+    migration runs once, when the per-wallet file does not yet exist:
+
+    - ``addr`` records are filtered by ``owned_addresses``. Records whose
+      ``ref`` address is not derivable by this wallet are skipped so the
+      "previously used" set stays wallet-private.
+    - ``output`` records (``ref="txid:vout"``) carry no wallet linkage in
+      BIP-329, so we copy them all. Records that belong to other wallets
+      remain inert here because they will never match a UTXO this wallet
+      sees during sync. The slight disk overhead is preferable to losing
+      this wallet's frozen-state and labels.
+    - Foreign records (BIP-329 types we do not own) are copied verbatim.
+    - The shared file is left in place so other wallets opened later in
+      the same data dir can run their own migration.
+
+    Best-effort; logs and returns on failure rather than blocking startup.
+    """
+    owned: set[str] | None = None
+    if owned_addresses is not None:
+        owned = {addr for addr in owned_addresses if addr}
+
+    try:
+        text = shared_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        logger.warning(
+            f"Could not read legacy shared metadata {shared_path} for "
+            f"migration into {per_wallet_path.name}: {exc}"
+        )
+        return
+
+    kept_lines: list[str] = []
+    addr_kept = 0
+    addr_skipped = 0
+    output_kept = 0
+    foreign_kept = 0
+
+    for raw in text.splitlines():
+        stripped = raw.strip()
+        if not stripped:
+            continue
+        try:
+            obj = json.loads(stripped)
+        except json.JSONDecodeError:
+            # Preserve unparseable lines verbatim; the loader handles
+            # them as foreign content too.
+            kept_lines.append(raw)
+            continue
+        if not isinstance(obj, dict):
+            kept_lines.append(raw)
+            continue
+        rec_type = obj.get("type")
+        if rec_type == "addr":
+            ref = obj.get("ref")
+            if owned is None:
+                # Caller provided no ownership info: skip to be safe.
+                addr_skipped += 1
+                continue
+            if isinstance(ref, str) and ref in owned:
+                kept_lines.append(raw)
+                addr_kept += 1
+            else:
+                addr_skipped += 1
+        elif rec_type == "output":
+            kept_lines.append(raw)
+            output_kept += 1
+        else:
+            kept_lines.append(raw)
+            foreign_kept += 1
+
+    if not kept_lines:
+        logger.debug(
+            f"Per-wallet metadata migration from {shared_path.name} into "
+            f"{per_wallet_path.name}: no records matched this wallet "
+            f"({addr_skipped} addr record(s) skipped as belonging to "
+            f"other wallets); creating empty store."
+        )
+        return
+
+    try:
+        per_wallet_path.parent.mkdir(parents=True, exist_ok=True)
+        per_wallet_path.write_text("\n".join(kept_lines) + "\n", encoding="utf-8")
+    except OSError as exc:
+        logger.warning(f"Could not write migrated metadata to {per_wallet_path}: {exc}")
+        return
+
+    logger.info(
+        f"Migrated {addr_kept} addr + {output_kept} output + "
+        f"{foreign_kept} other record(s) from shared "
+        f"{shared_path.name} into per-wallet {per_wallet_path.name} "
+        f"(skipped {addr_skipped} addr record(s) belonging to other "
+        f"wallets). The shared file is preserved so other wallets opened "
+        f"in this data directory can run the same migration."
+    )

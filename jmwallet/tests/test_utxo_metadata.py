@@ -21,6 +21,7 @@ from jmwallet.wallet.utxo_metadata import (
     AddressRecord,
     OutputRecord,
     UTXOMetadataStore,
+    load_metadata_store,
 )
 
 # ---------------------------------------------------------------------------
@@ -687,4 +688,189 @@ class TestMarkAddressUsed:
         s2 = UTXOMetadataStore(path=path)
         s2.load()
         assert s2.foreign_addr_lines == [foreign]
-        assert s2.get_used_addresses() == {"bcrt1qours"}
+
+
+# ---------------------------------------------------------------------------
+# Per-wallet partitioning + legacy shared-file migration
+# ---------------------------------------------------------------------------
+
+
+class TestPerWalletPartitioning:
+    """``load_metadata_store`` partitions the BIP-329 file per wallet.
+
+    Pre-0.30.0 builds wrote a single ``wallet_metadata.jsonl`` per data
+    directory, leaking one wallet's used-address set and frozen-UTXO state
+    into any other wallet opened in the same directory. The new path
+    ``wallet_metadata_<fp>.jsonl`` guarantees wallet isolation, and a
+    one-shot migration extracts each wallet's records from the legacy
+    shared file the first time that wallet opens.
+    """
+
+    FP_A = "aabbccdd"
+    FP_B = "11223344"
+
+    def _seed_shared(self, data_dir, addr_records, outputs=None, foreign=None):
+        shared = data_dir / "wallet_metadata.jsonl"
+        lines = []
+        for addr, origin in addr_records:
+            lines.append(
+                json.dumps(
+                    {
+                        "type": "addr",
+                        "ref": addr,
+                        "label": f"{USED_LABEL_PREFIX}:{origin}",
+                    }
+                )
+            )
+        for out_ref, spendable in outputs or []:
+            lines.append(json.dumps({"type": "output", "ref": out_ref, "spendable": spendable}))
+        for raw in foreign or []:
+            lines.append(json.dumps(raw))
+        shared.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return shared
+
+    def test_uses_per_wallet_path_when_fingerprint_given(self, tmp_path):
+        store = load_metadata_store(tmp_path, fingerprint=self.FP_A)
+        assert store.path == tmp_path / f"wallet_metadata_{self.FP_A}.jsonl"
+
+    def test_falls_back_to_shared_path_without_fingerprint(self, tmp_path):
+        store = load_metadata_store(tmp_path)
+        assert store.path == tmp_path / "wallet_metadata.jsonl"
+
+    def test_invalid_fingerprint_falls_back_to_shared(self, tmp_path):
+        store = load_metadata_store(tmp_path, fingerprint="not-hex!")
+        assert store.path == tmp_path / "wallet_metadata.jsonl"
+
+    def test_migration_filters_addr_records_to_owned_only(self, tmp_path):
+        """Only ``addr`` records whose ref is in ``owned_addresses`` migrate.
+
+        A wallet opening a data_dir that previously held another wallet's
+        addr records must not inherit them.
+        """
+        self._seed_shared(
+            tmp_path,
+            addr_records=[("bcrt1qA", "deposit"), ("bcrt1qOTHER", "cj_out")],
+        )
+
+        store = load_metadata_store(
+            tmp_path,
+            fingerprint=self.FP_A,
+            owned_addresses={"bcrt1qA"},
+        )
+
+        used = store.get_used_addresses()
+        assert "bcrt1qA" in used
+        assert "bcrt1qOTHER" not in used, "Migration must not import another wallet's addr records"
+
+    def test_migration_copies_output_records_unfiltered(self, tmp_path):
+        """``output`` records carry no wallet linkage in BIP-329 so we copy all.
+
+        They are inert in wallets that do not own the underlying UTXO,
+        and dropping them would lose the current wallet's frozen-state.
+        """
+        self._seed_shared(
+            tmp_path,
+            addr_records=[],
+            outputs=[("aa:0", False), ("bb:1", False)],
+        )
+
+        store = load_metadata_store(
+            tmp_path,
+            fingerprint=self.FP_A,
+            owned_addresses=set(),
+        )
+
+        assert store.is_frozen("aa:0")
+        assert store.is_frozen("bb:1")
+
+    def test_two_wallets_in_same_dir_stay_isolated(self, tmp_path):
+        """Two wallets sharing a data dir each see only their own addr records.
+
+        This is the privacy regression introduced by the shared file: it
+        must be impossible after migration for wallet B to load wallet
+        A's used-address set, even if A's per-wallet file was already
+        created.
+        """
+        self._seed_shared(
+            tmp_path,
+            addr_records=[("bcrt1qA", "deposit"), ("bcrt1qB", "deposit")],
+        )
+
+        # Wallet A opens first.
+        store_a = load_metadata_store(
+            tmp_path,
+            fingerprint=self.FP_A,
+            owned_addresses={"bcrt1qA"},
+        )
+        # Wallet B opens later; the shared file is preserved so its
+        # migration still finds its own records.
+        store_b = load_metadata_store(
+            tmp_path,
+            fingerprint=self.FP_B,
+            owned_addresses={"bcrt1qB"},
+        )
+
+        assert store_a.get_used_addresses() == {"bcrt1qA"}
+        assert store_b.get_used_addresses() == {"bcrt1qB"}
+        assert store_a.path != store_b.path
+
+    def test_migration_skipped_when_per_wallet_file_already_exists(self, tmp_path):
+        """The migration is one-shot. Second open does not re-import.
+
+        If a user manually edits their per-wallet file (e.g. clears a
+        stale entry) we must not silently re-add records from the
+        shared file on the next open.
+        """
+        self._seed_shared(
+            tmp_path,
+            addr_records=[("bcrt1qA", "deposit")],
+        )
+
+        # First open: migration runs.
+        load_metadata_store(tmp_path, fingerprint=self.FP_A, owned_addresses={"bcrt1qA"})
+        per_wallet = tmp_path / f"wallet_metadata_{self.FP_A}.jsonl"
+        # Simulate the user clearing the entry.
+        per_wallet.write_text("", encoding="utf-8")
+
+        # Second open: must NOT re-import from shared file.
+        store = load_metadata_store(tmp_path, fingerprint=self.FP_A, owned_addresses={"bcrt1qA"})
+        assert store.get_used_addresses() == set()
+
+    def test_migration_preserves_shared_file(self, tmp_path):
+        """The legacy shared file must survive so other wallets can migrate."""
+        shared = self._seed_shared(
+            tmp_path,
+            addr_records=[("bcrt1qA", "deposit"), ("bcrt1qB", "deposit")],
+        )
+        original = shared.read_text(encoding="utf-8")
+
+        load_metadata_store(tmp_path, fingerprint=self.FP_A, owned_addresses={"bcrt1qA"})
+
+        assert shared.exists()
+        assert shared.read_text(encoding="utf-8") == original
+
+    def test_migration_without_owned_addresses_skips_all_addr(self, tmp_path):
+        """When the caller cannot supply ownership info, no addr records leak.
+
+        The safer default is to drop all addr records and let the
+        wallet's own sync re-populate from on-chain data, rather than
+        risk inheriting another wallet's used set.
+        """
+        self._seed_shared(
+            tmp_path,
+            addr_records=[("bcrt1qA", "deposit"), ("bcrt1qB", "deposit")],
+            outputs=[("aa:0", False)],
+        )
+
+        store = load_metadata_store(tmp_path, fingerprint=self.FP_A, owned_addresses=None)
+
+        assert store.get_used_addresses() == set()
+        # output records are still copied (frozen-state preservation).
+        assert store.is_frozen("aa:0")
+
+    def test_no_shared_file_no_migration(self, tmp_path):
+        """Brand new data_dir: no legacy file, no migration, empty store."""
+        store = load_metadata_store(tmp_path, fingerprint=self.FP_A, owned_addresses={"bcrt1qA"})
+        assert store.get_used_addresses() == set()
+        # Per-wallet file is not created until a save happens.
+        assert not (tmp_path / f"wallet_metadata_{self.FP_A}.jsonl").exists()

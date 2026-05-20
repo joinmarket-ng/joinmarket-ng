@@ -181,7 +181,10 @@ def remove_nick_state(data_dir: Path | str | None, component: str) -> bool:
     return False
 
 
-def get_wallet_metadata_path(data_dir: Path | None = None) -> Path:
+def get_wallet_metadata_path(
+    data_dir: Path | None = None,
+    fingerprint: str | None = None,
+) -> Path:
     """
     Get the path to the wallet metadata file (BIP-329 JSONL format).
 
@@ -193,16 +196,42 @@ def get_wallet_metadata_path(data_dir: Path | None = None) -> Path:
     The BIP-329 format enables interoperability with external wallets like
     Sparrow for coin control and labeling.
 
+    When ``fingerprint`` is supplied (the 8-char hex master-key fingerprint
+    exposed as ``WalletService.wallet_fingerprint``) the path is partitioned
+    per wallet as ``wallet_metadata_<fingerprint>.jsonl``. This prevents one
+    wallet's persisted "used addresses" set and frozen-UTXO state from
+    leaking into another wallet that happens to share the same data
+    directory. When ``fingerprint`` is ``None`` the legacy shared
+    ``wallet_metadata.jsonl`` path is returned so callers that genuinely
+    want the shared file (e.g. the one-shot migration that reads the
+    pre-partition file) keep working.
+
     Args:
         data_dir: Optional data directory (defaults to get_default_data_dir())
+        fingerprint: Optional 8-char hex wallet fingerprint. When given the
+            returned path is partitioned per wallet. Only ``[0-9a-f]``
+            characters are accepted; any other value is rejected to keep
+            the filename safe.
 
     Returns:
-        Path to wallet_metadata.jsonl
+        Path to ``wallet_metadata.jsonl`` (or ``wallet_metadata_<fp>.jsonl``).
     """
     if data_dir is None:
         data_dir = get_default_data_dir()
 
-    return data_dir / "wallet_metadata.jsonl"
+    if fingerprint is None:
+        return data_dir / "wallet_metadata.jsonl"
+
+    safe_fp = fingerprint.strip().lower()
+    if not safe_fp or any(c not in "0123456789abcdef" for c in safe_fp):
+        # Refuse to compose an unsafe filename. Fall back to the shared
+        # path so the caller still gets a usable file rather than
+        # crashing; this matches the legacy behavior and is logged at
+        # the call site if it ever happens (the fingerprint comes from
+        # HDKey.fingerprint.hex() which is always lowercase hex).
+        return data_dir / "wallet_metadata.jsonl"
+
+    return data_dir / f"wallet_metadata_{safe_fp}.jsonl"
 
 
 def get_all_nick_states(data_dir: Path | str | None = None) -> dict[str, str]:

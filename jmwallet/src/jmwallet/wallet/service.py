@@ -87,10 +87,39 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin):
 
         # UTXO + address metadata store (BIP-329 JSONL). Frozen UTXO state,
         # output labels, and the persistent "addresses with on-chain history"
-        # set all live in the same wallet_metadata.jsonl file.
+        # set all live in the same per-wallet ``wallet_metadata_<fp>.jsonl``
+        # file. Partitioning by fingerprint is mandatory: pre-0.30.0 builds
+        # used a shared ``wallet_metadata.jsonl`` per data_dir, which leaked
+        # one wallet's used-address set and frozen-UTXO state into any
+        # other wallet opened in the same directory.
         self.metadata_store: UTXOMetadataStore | None = None
         if data_dir is not None:
-            self.metadata_store = load_metadata_store(data_dir)
+            # Only pre-derive owned addresses when the one-shot migration
+            # from the legacy shared file is actually going to run. After
+            # the first open, the per-wallet file exists and the
+            # migration is skipped, so the typical hot path pays nothing.
+            from jmcore.paths import get_wallet_metadata_path
+
+            per_wallet_path = get_wallet_metadata_path(data_dir, fingerprint=fingerprint)
+            shared_path = get_wallet_metadata_path(data_dir, fingerprint=None)
+            owned_addresses: set[str] | None = None
+            if not per_wallet_path.exists() and shared_path.exists():
+                # Derivation is pure compute (no backend RPCs); for the
+                # default scan_range=1000 / mixdepth_count=5 this is
+                # roughly 10k BIP32 derivations and completes in well
+                # under a second. The derived addresses are also seeded
+                # into ``self.address_cache`` so subsequent lookups
+                # skip re-derivation.
+                owned_addresses = set()
+                for mixdepth in range(self.mixdepth_count):
+                    for change in (0, 1):
+                        for index in range(self.scan_range):
+                            owned_addresses.add(self.get_address(mixdepth, change, index))
+            self.metadata_store = load_metadata_store(
+                data_dir,
+                fingerprint=fingerprint,
+                owned_addresses=owned_addresses,
+            )
 
         # Track addresses that have ever had UTXOs (including spent ones).
         # Used to label addresses as "used-empty" vs "new" and, critically,

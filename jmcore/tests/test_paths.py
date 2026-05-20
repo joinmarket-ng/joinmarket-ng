@@ -257,6 +257,26 @@ class TestPathUtilities:
             result = get_wallet_metadata_path(None)
             assert result == tmp_path / "wallet_metadata.jsonl"
 
+    def test_get_wallet_metadata_path_with_fingerprint(self, tmp_path: Path) -> None:
+        """Per-wallet partitioning yields wallet_metadata_<fp>.jsonl."""
+        result = get_wallet_metadata_path(tmp_path, fingerprint="aabbccdd")
+        assert result == tmp_path / "wallet_metadata_aabbccdd.jsonl"
+
+    def test_get_wallet_metadata_path_fingerprint_lowercased(self, tmp_path: Path) -> None:
+        """Fingerprint is normalized to lowercase to keep filename stable."""
+        result = get_wallet_metadata_path(tmp_path, fingerprint="AABBCCDD")
+        assert result == tmp_path / "wallet_metadata_aabbccdd.jsonl"
+
+    def test_get_wallet_metadata_path_rejects_unsafe_fingerprint(self, tmp_path: Path) -> None:
+        """Non-hex fingerprints fall back to the shared path, never compose
+        an unsafe filename (slashes, dots, etc.).
+        """
+        for bad in ["../etc", "ab/cd", "a.b", "abXY", "", "   "]:
+            result = get_wallet_metadata_path(tmp_path, fingerprint=bad)
+            assert result == tmp_path / "wallet_metadata.jsonl", (
+                f"unsafe fingerprint {bad!r} should fall back to shared path"
+            )
+
 
 class TestNickStateStringDataDir:
     """Tests for nick state functions with string data_dir."""
