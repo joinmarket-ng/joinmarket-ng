@@ -26,6 +26,7 @@ _jm_wallet() {
     'verify-password:Verify that a password can decrypt an encrypted mnemonic file.'
     'validate:Validate a mnemonic phrase.'
     'showseed:Display the BIP39 seed words (mnemonic) of an existing wallet.'
+    'rescan:Trigger a Bitcoin Core wallet rescan to repair history coverage.'
   )
 
   _arguments -C \
@@ -200,7 +201,7 @@ _jm_wallet() {
             '--backend=[Backend\: descriptor_wallet | neutrino]: :' \
             '--rpc-url=[]: :' \
             '--neutrino-url=[]: :' \
-            '--broadcast[Broadcast the transaction]' \
+            '--broadcast[Broadcast the transaction (use --no-broadcast to skip)]' \
             '--yes[Skip confirmation prompt]' \
             '--select-utxos[Interactively select UTXOs (fzf-like TUI)]' \
             '--data-dir=[Data directory (default\: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)]:file:_files' \
@@ -235,7 +236,9 @@ _jm_wallet() {
             '--neutrino-url=[]: :' \
             '--extended[Show detailed address view with derivations]' \
             '--gap=[Max address gap to show in extended view]: :' \
+            '--scan-depth=[One-shot override of the descriptor scan range (max address index per branch). When set, JoinMarket re-imports descriptors at the given range and triggers a full rescan from genesis -- use this once for a wallet migrated from legacy joinmarket-clientserver whose addresses sit beyond the default 1000 (issue #475). Without this flag, the configured ``[wallet].scan_range`` is used and an existing import is left alone. Slow\: a full rescan can take 20+ minutes on mainnet.]: :' \
             '--show-empty[In --extended view, show addresses with zero balance. When disabled (default), empty addresses are hidden except for the first unused one per branch so you still have a fresh receive address.]' \
+            '--scan-status[Print Bitcoin Core'\''s wallet scan/coverage diagnostics and exit (descriptor wallet only). Useful when the wallet is proposing already-used addresses\: shows whether a rescan is currently running, the oldest active-descriptor timestamp (i.e., the lower bound of what Core has actually scanned), and the wallet transaction count. If the oldest timestamp is far newer than your wallet'\''s first use, run ``jm-wallet rescan`` to repair coverage.]' \
             '--data-dir=[Data directory (default\: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)]:file:_files' \
             '--log-level=[Log level]: :' \
             '--help[Show this message and exit]'
@@ -258,6 +261,17 @@ _jm_wallet() {
             '--password=[Password for an encrypted mnemonic file. If not given, the MNEMONIC_PASSWORD env var is used, otherwise an interactive prompt is shown.]: :' \
             '--numbered[Print each seed word on its own line, prefixed with its index.]' \
             '--yes[Skip the interactive '\''Are you sure?'\'' confirmation. Use with care.]' \
+            '--help[Show this message and exit]'
+          ;;
+        rescan)
+          _arguments \
+            '--mnemonic-file=[Path to mnemonic file]:file:_files' \
+            '--prompt-bip39-passphrase[Prompt for BIP39 passphrase interactively]' \
+            '--network=[Bitcoin network]: :' \
+            '--rpc-url=[]: :' \
+            '--start-height=[Block height to rescan from (default\: 0 = genesis). The wallet'\''s recorded creation height is used as a floor when available, so values below it are clamped up automatically.]: :' \
+            '--data-dir=[Data directory (default\: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)]:file:_files' \
+            '--log-level=[Log level]: :' \
             '--help[Show this message and exit]'
           ;;
       esac
