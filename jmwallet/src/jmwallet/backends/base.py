@@ -258,6 +258,27 @@ class BlockchainBackend(ABC):
         # Default: not supported
         return None
 
+    async def scan_external_address(self, address: str) -> list[UTXO]:
+        """Return UTXOs sitting at ``address`` without registering it in any wallet.
+
+        Used to monitor third-party addresses (e.g. a swap provider's lockup
+        address) that are *not* owned by the local wallet. Backends should
+        implement this with whatever facility is available to inspect the
+        global UTXO set (e.g. Bitcoin Core's ``scantxoutset``).
+
+        The default implementation returns an empty list, which makes the
+        feature opt-in per backend. Callers that rely on this method should
+        check the backend's capabilities or document the requirement.
+
+        Args:
+            address: A single Bitcoin address to look up in the UTXO set.
+
+        Returns:
+            List of confirmed UTXOs at ``address``. May be empty if the
+            backend cannot scan external addresses.
+        """
+        return []
+
     async def verify_utxo_with_metadata(
         self,
         txid: str,
