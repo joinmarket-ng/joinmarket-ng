@@ -431,3 +431,96 @@ class TestSchedule:
         schedule.advance()
         assert schedule.is_complete()
         assert schedule.current_entry() is None
+
+
+class TestSwapInputSettingsRoundTrip:
+    """Settings -> TakerConfig wiring for the [swap] section."""
+
+    def test_swap_settings_propagate_to_taker_config(self, sample_mnemonic: str) -> None:
+        """All ``[swap]`` keys must surface on ``TakerConfig.swap_input``."""
+        from jmcore.settings import (
+            JoinMarketSettings,
+            NetworkSettings,
+            SwapSettings,
+            TakerSettings,
+            WalletSettings,
+        )
+
+        from taker.cli import build_taker_config
+
+        swap = SwapSettings(
+            enabled=True,
+            provider_offer_id="electrum-swapserver-5",
+            nostr_relays=["ws://relay.example.onion"],
+            max_swap_fee_pct=2.5,
+            fake_fee_min=750,
+            fake_fee_max=4250,
+            lockup_poll_interval=3.5,
+            lockup_timeout=240.0,
+            lnd_rest_url="https://lnd.onion:8080",
+            lnd_cert_path="/tmp/tls.cert",
+            lnd_macaroon_path="/tmp/admin.macaroon",
+        )
+        settings = JoinMarketSettings(
+            wallet=WalletSettings(mnemonic=sample_mnemonic),
+            network=NetworkSettings(network="regtest"),
+            taker=TakerSettings(),
+            swap=swap,
+        )
+
+        config = build_taker_config(
+            settings=settings,
+            mnemonic=sample_mnemonic,
+            passphrase="",
+            mixdepth=0,
+            amount=100_000,
+            destination="bcrt1qxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        )
+
+        si = config.swap_input
+        assert si is not None
+        assert si.enabled is True
+        assert si.provider_offer_id == "electrum-swapserver-5"
+        assert si.nostr_relays == ["ws://relay.example.onion"]
+        assert si.max_swap_fee_pct == 2.5
+        assert si.fake_fee_min == 750
+        assert si.fake_fee_max == 4250
+        assert si.lockup_poll_interval == 3.5
+        assert si.lockup_timeout == 240.0
+        assert si.lnd_rest_url == "https://lnd.onion:8080"
+        assert si.lnd_cert_path == "/tmp/tls.cert"
+        assert si.lnd_macaroon_path == "/tmp/admin.macaroon"
+
+    def test_cli_flag_overrides_swap_settings(self, sample_mnemonic: str) -> None:
+        """``--swap-input`` and ``--swap-provider-offer-id`` win over settings."""
+        from jmcore.settings import (
+            JoinMarketSettings,
+            NetworkSettings,
+            SwapSettings,
+            TakerSettings,
+            WalletSettings,
+        )
+
+        from taker.cli import build_taker_config
+
+        settings = JoinMarketSettings(
+            wallet=WalletSettings(mnemonic=sample_mnemonic),
+            network=NetworkSettings(network="regtest"),
+            taker=TakerSettings(),
+            swap=SwapSettings(enabled=False, provider_offer_id="cfg-offer"),
+        )
+
+        config = build_taker_config(
+            settings=settings,
+            mnemonic=sample_mnemonic,
+            passphrase="",
+            mixdepth=0,
+            amount=100_000,
+            destination="bcrt1qxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            swap_input=True,
+            swap_provider_offer_id="cli-offer",
+        )
+
+        assert config.swap_input is not None
+        assert config.swap_input.enabled is True
+        assert config.swap_input.provider_offer_id == "cli-offer"

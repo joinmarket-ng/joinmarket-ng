@@ -22,6 +22,7 @@ class TakerState(StrEnum):
     IDLE = "idle"
     FETCHING_ORDERBOOK = "fetching_orderbook"
     SELECTING_MAKERS = "selecting_makers"
+    ACQUIRING_SWAP_INPUT = "acquiring_swap_input"
     FILLING = "filling"
     AUTHENTICATING = "authenticating"
     BUILDING_TX = "building_tx"

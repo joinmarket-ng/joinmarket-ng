@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Electrum Swap Providers - JoinMarket NG</title>
+    <link rel="icon" type="image/x-icon" href="/static/favicon.ico">
+    <link rel="stylesheet" href="/static/style.css">
+    <link rel="stylesheet" href="/static/swap_providers.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Electrum Lightning Swap Providers</h1>
+            <div class="header-info">
+                <span id="updated-at">Updated: -</span>
+                <a href="/">Orderbook</a>
+                <a href="https://github.com/joinmarket-ng/joinmarket-ng" target="_blank" rel="noopener noreferrer">GitHub</a>
+            </div>
+        </header>
+
+        <section class="provider-intro">
+            <p>
+                Offers are discovered directly in your browser via WebSocket connections to Nostr relays
+                (kind <code>30315</code>, d-tag <code>electrum-swapserver-5</code>). No external CDN dependencies.
+            </p>
+            <p>
+                Defaults match Electrum relay configuration for plug-and-play discovery.
+            </p>
+        </section>
+
+        <section class="controls">
+            <div class="filter-group">
+                <label>
+                    Search provider:
+                    <input type="text" id="provider-search" placeholder="Pubkey or relay...">
+                </label>
+            </div>
+            <div class="filter-group">
+                <label>
+                    Minimum PoW bits:
+                    <input type="number" id="min-pow" min="0" max="32" value="5">
+                </label>
+            </div>
+            <button id="refresh-offers" class="refresh-button">Refresh</button>
+        </section>
+
+        <section class="stats-grid provider-stats-grid">
+            <div class="stat-card">
+                <div class="stat-label">Mainnet Offers</div>
+                <div class="stat-value" id="mainnet-count">0</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Signet Offers</div>
+                <div class="stat-value" id="signet-count">0</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Connected Relays</div>
+                <div class="stat-value" id="relay-count">0</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Query Window</div>
+                <div class="stat-value" id="time-window">1h</div>
+            </div>
+        </section>
+
+        <section class="network-section">
+            <h2>Mainnet</h2>
+            <div id="mainnet-status" class="network-status">Waiting for relay responses...</div>
+            <div class="table-container">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Provider Pubkey</th>
+                            <th>PoW Bits</th>
+                            <th>Fee %</th>
+                            <th>Mining Fee</th>
+                            <th>Min Amount</th>
+                            <th>Max Reverse</th>
+                            <th>Relays</th>
+                            <th>Updated</th>
+                        </tr>
+                    </thead>
+                    <tbody id="mainnet-tbody"></tbody>
+                </table>
+            </div>
+        </section>
+
+        <section class="network-section">
+            <h2>Signet</h2>
+            <div id="signet-status" class="network-status">Waiting for relay responses...</div>
+            <div class="table-container">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Provider Pubkey</th>
+                            <th>PoW Bits</th>
+                            <th>Fee %</th>
+                            <th>Mining Fee</th>
+                            <th>Min Amount</th>
+                            <th>Max Reverse</th>
+                            <th>Relays</th>
+                            <th>Updated</th>
+                        </tr>
+                    </thead>
+                    <tbody id="signet-tbody"></tbody>
+                </table>
+            </div>
+        </section>
+    </div>
+
+    <script src="/static/swap_providers.js"></script>
+</body>
+</html>
