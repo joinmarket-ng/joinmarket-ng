@@ -44,6 +44,181 @@ def calculate_cj_fee(offer: Offer, cj_amount: int) -> int:
     return _calculate_cj_fee_raw(offer.ordertype, offer.cjfee, cj_amount)
 
 
+# Minimum number of non-selected offers needed to sample a fake fee
+# from the orderbook distribution. Below this, fall back to a range derived
+# from the taker's own fee limits.
+_MIN_OFFERS_FOR_SAMPLING = 3
+
+
+def sample_fake_fee_from_orderbook(
+    offers: list[Offer],
+    cj_amount: int,
+    selected_nicks: set[str],
+    max_cj_fee: MaxCjFee,
+) -> int:
+    """
+    Sample a fake fee by copying the fee of a non-selected orderbook offer,
+    picked weighted by fidelity bond value.
+
+    To make the taker's change output indistinguishable from a maker's change,
+    the "fee earned" by the taker should look like a fee an actual maker in
+    the orderbook would have charged. We achieve this by:
+
+    1. Restricting candidates to offers that (a) cover ``cj_amount`` and
+       (b) belong to makers NOT selected for this round (so the fake fee is
+       independent of the selected set and can't be reverse-engineered from
+       it).
+    2. Picking ONE offer at random, weighted by ``fidelity_bond_value``.
+       This mirrors :func:`fidelity_bond_weighted_choose`: an observer who
+       knows the selection algorithm sees a fee that follows the SAME
+       distribution as the selected makers, removing the role-detection
+       signal. Bondless candidates fall back to uniform weight ``1``.
+    3. Computing that offer's fee at ``cj_amount`` and returning it verbatim.
+       The fake fee therefore equals an actual orderbook fee, eliminating
+       the "non-orderbook fingerprint" risk entirely.
+
+    Fallback: if fewer than ``_MIN_OFFERS_FOR_SAMPLING`` candidate offers are
+    available, draw a uniform fee in ``[1, max_cj_fee.rel_fee * cj_amount]``.
+    The upper bound is the maximum fee the taker would accept from a
+    relative-fee maker, which is a natural proxy for what a plausible maker
+    earns.
+
+    Args:
+        offers: Full orderbook offer list.
+        cj_amount: CoinJoin amount in satoshis.
+        selected_nicks: Nicks of makers already selected for this CoinJoin
+            (their fees are excluded so the fake fee is independent).
+        max_cj_fee: The taker's own fee limits (used to derive the fallback range).
+
+    Returns:
+        A fee in satoshis suitable for use as the taker's fake earned fee.
+    """
+    candidates: list[tuple[Offer, int]] = []
+    for offer in offers:
+        if offer.counterparty in selected_nicks:
+            continue
+        if not (offer.minsize <= cj_amount <= offer.maxsize):
+            continue
+        try:
+            fee = _calculate_cj_fee_raw(offer.ordertype, offer.cjfee, cj_amount)
+        except (ValueError, ZeroDivisionError):
+            continue
+        if fee > 0:
+            candidates.append((offer, fee))
+
+    if len(candidates) < _MIN_OFFERS_FOR_SAMPLING:
+        fallback_max = max(1, int(float(max_cj_fee.rel_fee) * cj_amount))
+        logger.debug(
+            f"Not enough orderbook data for fake fee sampling "
+            f"({len(candidates)} candidates < {_MIN_OFFERS_FOR_SAMPLING}), "
+            f"falling back to uniform [1, {fallback_max}]"
+        )
+        return random.randint(1, fallback_max)
+
+    # Bond-weighted pick: weight = max(fidelity_bond_value, 1). Bondless
+    # offers still have a chance (weight 1) so the distribution mirrors
+    # the full orderbook, not just the bonded subset. This matches the
+    # behaviour of fidelity_bond_weighted_choose's uniform fallback slots.
+    weights = [max(offer.fidelity_bond_value, 1) for offer, _fee in candidates]
+    chosen_offer, chosen_fee = random.choices(candidates, weights=weights, k=1)[0]
+
+    total_bonded_weight = sum(
+        offer.fidelity_bond_value for offer, _ in candidates if offer.fidelity_bond_value > 0
+    )
+    logger.debug(
+        f"Sampled fake fee {chosen_fee:,} sats by copying {chosen_offer.counterparty}'s "
+        f"offer (bond={chosen_offer.fidelity_bond_value:,}, "
+        f"candidates={len(candidates)}, total_bond_weight={total_bonded_weight:,})"
+    )
+    return chosen_fee
+
+
+def equalize_maker_fees(
+    maker_fees: dict[str, int],
+    leftover_sats: int,
+    *,
+    taker_change_exists: bool = False,
+    taker_fake_fee: int = 0,
+) -> tuple[dict[str, int], int]:
+    """Distribute swap leftover sats by topping up fees toward the round max.
+
+    Goal: make every party's "fee receipt" indistinguishable on-chain.
+
+    The taker's change output (when present) acts as the taker's
+    "fake maker fee" -- an outside observer sees one extra equal-amount
+    output sized like a maker's cjfee receipt. By topping up everyone
+    (makers AND taker) toward ``target = max(all_fees_including_taker)``,
+    every fee receipt looks like the same orderbook offer, the maker that
+    quoted the highest fee in the round.
+
+    The algorithm distributes deterministically up to ``target`` for each
+    entry while budget allows. If the budget is not enough to fully reach
+    ``target`` for the last entry processed, the leftover is split
+    proportionally across the remaining entries (rounded down per-entry).
+    Any unallocated sats (rounding remainder) are returned to the caller
+    and added to the transaction fee paid to miners; this is privacy-
+    neutral because the miner fee is computed from inputs minus outputs
+    and reveals nothing about per-party amounts.
+
+    Privacy invariant: ALL leftover sats either reach makers, the taker
+    change, or the on-chain transaction fee. None reach the taker's
+    destination cj_output (cj_amount is fixed at !fill time and cannot
+    be bumped).
+
+    Args:
+        maker_fees: Mapping of maker nick -> current CJ fee in sats.
+        leftover_sats: Extra sats available from swap padding.
+        taker_change_exists: Whether the taker has a change output to bump.
+        taker_fake_fee: Current taker change "fee" sats (= expected change).
+
+    Returns:
+        Tuple of:
+          - new mapping of maker nick -> adjusted CJ fee in sats
+          - taker change bump in sats (added to expected change output)
+        Sum of all bumps + tx_fee_remainder == leftover_sats; caller adds
+        ``leftover_sats - sum(bumps)`` to the on-chain transaction fee.
+    """
+    if leftover_sats <= 0 or not maker_fees:
+        return dict(maker_fees), 0
+
+    # Build virtual map including taker if it has change. The target
+    # is symmetric: it's the max across all entries (makers + taker),
+    # so the taker fee receipt is held to the same standard as makers.
+    virtual: dict[str, int] = dict(maker_fees)
+    if taker_change_exists:
+        virtual["_taker"] = taker_fake_fee
+
+    target = max(virtual.values())
+    budget = leftover_sats
+    bumps: dict[str, int] = {k: 0 for k in virtual}
+
+    # Phase 1: deterministic top-up sorted by current fee ascending so we
+    # lift the lowest fees first (they need the most help and benefit
+    # privacy the most by closing the gap toward the round max).
+    sorted_nicks = sorted(virtual, key=lambda k: virtual[k])
+    for nick in sorted_nicks:
+        if budget <= 0:
+            break
+        gap = target - virtual[nick]
+        if gap <= 0:
+            continue
+        bump = min(gap, budget)
+        bumps[nick] += bump
+        budget -= bump
+
+    new_maker_fees = {nick: maker_fees[nick] + bumps.get(nick, 0) for nick in maker_fees}
+    taker_bump = bumps.get("_taker", 0)
+
+    distributed = sum(bumps.values())
+    tx_fee_remainder = leftover_sats - distributed
+    logger.debug(
+        f"Fee equalization: distributed {distributed:,} of {leftover_sats:,} sats "
+        f"(makers={sum(bumps[k] for k in bumps if k != '_taker'):,}, "
+        f"taker={taker_bump:,}, added_to_tx_fees={tx_fee_remainder:,}, target={target:,})"
+    )
+    return new_maker_fees, taker_bump
+
+
 def is_fee_within_limits(offer: Offer, cj_amount: int, max_cj_fee: MaxCjFee) -> bool:
     """
     Check if an offer's fee is within the configured limits.

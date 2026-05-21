@@ -18,10 +18,12 @@ from taker.orderbook import (
     choose_sweep_orders,
     dedupe_offers_by_bond,
     dedupe_offers_by_maker,
+    equalize_maker_fees,
     fidelity_bond_weighted_choose,
     filter_offers,
     is_fee_within_limits,
     random_order_choose,
+    sample_fake_fee_from_orderbook,
     weighted_order_choose,
 )
 
@@ -1559,3 +1561,269 @@ class TestRequiredFeaturesFiltering:
         )
         assert len(orders) == 2
         assert "J5incompatible1O" not in orders
+
+
+class TestSampleFakeFeeFromOrderbook:
+    """Tests for sample_fake_fee_from_orderbook (bond-weighted fake-fee picker)."""
+
+    def test_returns_actual_orderbook_fee(
+        self, sample_offers: list[Offer], max_cj_fee: MaxCjFee
+    ) -> None:
+        """The sampled fake fee must equal one of the candidate offers' actual fees."""
+        import random
+
+        cj_amount = 200_000
+        # No makers selected: all 4 sample offers are candidates that
+        # cover 200,000 sats; their fees at 200k are deterministic.
+        candidate_fees = {
+            calculate_cj_fee(o, cj_amount)
+            for o in sample_offers
+            if o.minsize <= cj_amount <= o.maxsize
+        }
+        random.seed(42)
+        for _ in range(20):
+            fee = sample_fake_fee_from_orderbook(
+                sample_offers, cj_amount, selected_nicks=set(), max_cj_fee=max_cj_fee
+            )
+            assert fee in candidate_fees, f"fake fee {fee} must match an orderbook offer fee"
+
+    def test_excludes_selected_nicks(
+        self, sample_offers: list[Offer], max_cj_fee: MaxCjFee
+    ) -> None:
+        """Selected makers must never contribute their fee to the sample."""
+        import random
+
+        cj_amount = 200_000
+        selected = {"maker1", "maker2"}
+        excluded_fees = {
+            calculate_cj_fee(o, cj_amount) for o in sample_offers if o.counterparty in selected
+        }
+        eligible_fees = {
+            calculate_cj_fee(o, cj_amount)
+            for o in sample_offers
+            if o.counterparty not in selected and o.minsize <= cj_amount <= o.maxsize
+        }
+        # Ensure exclusion is observable: at least one excluded fee is unique.
+        unique_excluded = excluded_fees - eligible_fees
+        assert unique_excluded, "fixture must give selected makers some unique fees"
+
+        random.seed(0)
+        # Two eligible candidates -> below _MIN_OFFERS_FOR_SAMPLING, falls
+        # back to uniform range. Add extra candidates to force the
+        # weighted-pick branch.
+        extra_offers = [
+            Offer(
+                counterparty=f"makerX{i}",
+                oid=0,
+                ordertype=OfferType.SW0_RELATIVE,
+                minsize=10_000,
+                maxsize=2_000_000,
+                txfee=1000,
+                cjfee="0.001",
+                fidelity_bond_value=1000,
+            )
+            for i in range(3)
+        ]
+        eligible_fees |= {
+            calculate_cj_fee(o, cj_amount) for o in extra_offers if o.counterparty not in selected
+        }
+
+        for _ in range(20):
+            fee = sample_fake_fee_from_orderbook(
+                sample_offers + extra_offers,
+                cj_amount,
+                selected_nicks=selected,
+                max_cj_fee=max_cj_fee,
+            )
+            assert fee not in unique_excluded
+            assert fee in eligible_fees
+
+    def test_bond_weighting_biases_toward_bonded_makers(self, max_cj_fee: MaxCjFee) -> None:
+        """Higher fidelity bond -> higher probability of being picked."""
+        import random
+
+        cj_amount = 100_000
+        # Three candidates: only one has a meaningful bond.
+        offers = [
+            Offer(
+                counterparty="bonded",
+                oid=0,
+                ordertype=OfferType.SW0_ABSOLUTE,
+                minsize=10_000,
+                maxsize=1_000_000,
+                txfee=1000,
+                cjfee=1000,
+                fidelity_bond_value=10_000_000,
+            ),
+            Offer(
+                counterparty="unbonded_a",
+                oid=0,
+                ordertype=OfferType.SW0_ABSOLUTE,
+                minsize=10_000,
+                maxsize=1_000_000,
+                txfee=1000,
+                cjfee=2000,
+                fidelity_bond_value=0,
+            ),
+            Offer(
+                counterparty="unbonded_b",
+                oid=0,
+                ordertype=OfferType.SW0_ABSOLUTE,
+                minsize=10_000,
+                maxsize=1_000_000,
+                txfee=1000,
+                cjfee=3000,
+                fidelity_bond_value=0,
+            ),
+        ]
+        random.seed(1234)
+        counts = {1000: 0, 2000: 0, 3000: 0}
+        for _ in range(2000):
+            fee = sample_fake_fee_from_orderbook(
+                offers, cj_amount, selected_nicks=set(), max_cj_fee=max_cj_fee
+            )
+            counts[fee] += 1
+        # Bonded maker should dominate by an order of magnitude.
+        assert counts[1000] > counts[2000] * 50
+        assert counts[1000] > counts[3000] * 50
+
+    def test_fallback_when_too_few_candidates(self, max_cj_fee: MaxCjFee) -> None:
+        """With <_MIN_OFFERS_FOR_SAMPLING candidates, use uniform fallback range."""
+        import random
+
+        cj_amount = 100_000
+        # One eligible candidate -> falls back.
+        offers = [
+            Offer(
+                counterparty="solo",
+                oid=0,
+                ordertype=OfferType.SW0_RELATIVE,
+                minsize=10_000,
+                maxsize=1_000_000,
+                txfee=1000,
+                cjfee="0.001",
+                fidelity_bond_value=0,
+            ),
+        ]
+        fallback_max = max(1, int(float(max_cj_fee.rel_fee) * cj_amount))
+        random.seed(7)
+        for _ in range(30):
+            fee = sample_fake_fee_from_orderbook(
+                offers, cj_amount, selected_nicks=set(), max_cj_fee=max_cj_fee
+            )
+            assert 1 <= fee <= fallback_max
+
+    def test_excludes_offers_outside_amount_range(self, max_cj_fee: MaxCjFee) -> None:
+        """Offers whose [minsize, maxsize] don't cover cj_amount are skipped."""
+        cj_amount = 50_000
+        offers = [
+            Offer(
+                counterparty=f"too_small_{i}",
+                oid=0,
+                ordertype=OfferType.SW0_ABSOLUTE,
+                minsize=10_000,
+                maxsize=20_000,  # excludes cj_amount=50_000
+                txfee=1000,
+                cjfee=999,
+                fidelity_bond_value=1000,
+            )
+            for i in range(5)
+        ]
+        # All offers are out of range -> 0 candidates -> fallback.
+        fallback_max = max(1, int(float(max_cj_fee.rel_fee) * cj_amount))
+        import random
+
+        random.seed(0)
+        for _ in range(10):
+            fee = sample_fake_fee_from_orderbook(
+                offers, cj_amount, selected_nicks=set(), max_cj_fee=max_cj_fee
+            )
+            assert 1 <= fee <= fallback_max
+            assert fee != 999  # the out-of-range fee must not leak
+
+
+class TestEqualizeMakerFees:
+    """Tests for equalize_maker_fees (swap leftover distribution)."""
+
+    def test_zero_leftover_is_noop(self) -> None:
+        fees = {"a": 100, "b": 200}
+        new, taker_bump = equalize_maker_fees(fees, leftover_sats=0)
+        assert new == fees
+        assert taker_bump == 0
+
+    def test_empty_makers_is_noop(self) -> None:
+        new, taker_bump = equalize_maker_fees({}, leftover_sats=500)
+        assert new == {}
+        assert taker_bump == 0
+
+    def test_full_budget_equalizes_to_target(self) -> None:
+        """Enough budget: all makers end up at max(fees), taker stays."""
+        fees = {"a": 100, "b": 200, "c": 300}
+        # gaps: a=200, b=100, c=0 -> need 300 to equalize
+        new, taker_bump = equalize_maker_fees(fees, leftover_sats=300)
+        assert new == {"a": 300, "b": 300, "c": 300}
+        assert taker_bump == 0
+
+    def test_partial_budget_distributes_to_lowest_first(self) -> None:
+        """Insufficient budget: the lowest fee is bumped first (no all-or-nothing)."""
+        fees = {"a": 100, "b": 200, "c": 300}
+        # target=300, gaps a=200, b=100. Budget=150 -> bump a by 150
+        # (it's processed first as lowest); b and c get 0.
+        new, taker_bump = equalize_maker_fees(fees, leftover_sats=150)
+        assert new == {"a": 250, "b": 200, "c": 300}
+        assert taker_bump == 0
+        # Sum of bumps = budget consumed; the rest (0) would stay on the
+        # taker change or go to tx fees.
+        assert sum(new[k] - fees[k] for k in fees) == 150
+
+    def test_taker_change_held_to_same_target(self) -> None:
+        """When taker has change, the target = max(makers, taker)."""
+        fees = {"a": 100, "b": 200}
+        # taker_fake_fee=500 -> virtual target=500.
+        # gaps a=400, b=300, taker=0. Budget=400 -> bump a fully (400).
+        new, taker_bump = equalize_maker_fees(
+            fees,
+            leftover_sats=400,
+            taker_change_exists=True,
+            taker_fake_fee=500,
+        )
+        assert new == {"a": 500, "b": 200}
+        assert taker_bump == 0
+
+    def test_remainder_returned_via_unspent_budget(self) -> None:
+        """Budget exceeding total gap returns the unallocated portion implicitly.
+
+        The function returns the bumps; caller computes the unallocated
+        remainder as leftover_sats - sum(bumps) and adds it to tx fees.
+        """
+        fees = {"a": 100, "b": 100}
+        # target=100 -> no gap. Budget=500. Nothing distributed.
+        new, taker_bump = equalize_maker_fees(fees, leftover_sats=500)
+        assert new == fees
+        assert taker_bump == 0
+        distributed = sum(new[k] - fees[k] for k in fees) + taker_bump
+        assert distributed == 0  # caller adds 500 to tx fees
+
+    def test_symmetric_target_includes_taker(self) -> None:
+        """If taker's fake fee is the max, makers are bumped toward it."""
+        fees = {"a": 100, "b": 200}
+        # taker_fake_fee=500 is the highest -> target=500.
+        # gaps a=400, b=300. Budget=700 -> fully equalize: a+=400, b+=300.
+        new, taker_bump = equalize_maker_fees(
+            fees,
+            leftover_sats=700,
+            taker_change_exists=True,
+            taker_fake_fee=500,
+        )
+        assert new == {"a": 500, "b": 500}
+        assert taker_bump == 0  # taker is already at target
+
+    def test_partial_bump_now_allowed(self) -> None:
+        """Regression: confirm partial bumps are NOT suppressed."""
+        fees = {"a": 0}
+        # target=0... target is max so 0. To test, give us asymmetry.
+        fees = {"a": 100, "b": 1000}
+        # target=1000, gap a=900. Budget=50 -> partial bump a by 50.
+        new, taker_bump = equalize_maker_fees(fees, leftover_sats=50)
+        assert new == {"a": 150, "b": 1000}
+        assert taker_bump == 0
