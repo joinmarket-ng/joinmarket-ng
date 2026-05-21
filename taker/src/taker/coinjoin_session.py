@@ -1738,9 +1738,15 @@ class CoinJoinSession:
         """
         Send !push to all makers simultaneously for redundant broadcast.
 
-        This is used by Neutrino takers who cannot verify mempool transactions.
-        By broadcasting to all makers, we maximize the chance that at least one
-        will successfully broadcast the transaction to the Bitcoin network.
+        Used in two situations:
+          - ``MULTIPLE_PEERS`` policy with a configured peer count (the
+            normal multi-peer broadcast).
+          - Backends without mempool access (``has_mempool_access() ==
+            False``): we cannot verify that any single maker actually
+            broadcast the tx, so we fan out to every available maker
+            and rely on block-based confirmation. With the m0wer
+            neutrino-api fork's watched mempool tracker enabled this
+            path is no longer the default for neutrino.
 
         Privacy note: All makers already participated in the CoinJoin, so they
         all know the transaction. Sending !push to all of them doesn't reveal
