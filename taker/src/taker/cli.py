@@ -33,6 +33,7 @@ from taker.config import (
     MaxCjFee,
     Schedule,
     ScheduleEntry,
+    SwapInputConfig,
     TakerConfig,
 )
 
@@ -40,6 +41,42 @@ app = typer.Typer(
     name="jm-taker",
     help="JoinMarket Taker - Execute CoinJoin transactions",
 )
+
+
+def _build_confirmation_additional_info(
+    maker_details: list[dict[str, Any]],
+    fee_rate: float | None,
+    mixdepth: int,
+    swap_info: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Build the confirmation details map shown to the user.
+
+    Splits out the maker summary + optional swap-input summary so the same
+    formatting is shared between the interactive CoinJoin command and tests
+    that exercise the swap-info fields without spinning up the full CLI.
+    """
+    from jmcore.confirmation import format_maker_summary
+
+    additional_info: dict[str, Any] = format_maker_summary(maker_details, fee_rate=fee_rate)
+    additional_info["Source Mixdepth"] = mixdepth
+
+    if swap_info:
+        additional_info["Swap Provider Fee"] = (
+            f"{swap_info.get('provider_fee_pct', '?')}% "
+            f"+ {swap_info.get('provider_mining_fee', '?')} sats"
+        )
+        swap_fee = swap_info.get("swap_fee")
+        if isinstance(swap_fee, int):
+            additional_info["Swap Fee"] = f"{swap_fee:,} sats"
+        swap_amount = swap_info.get("actual_swap_amount", 0)
+        if swap_amount:
+            additional_info["Swap Amount"] = f"{swap_amount:,} sats"
+        if swap_info.get("padded"):
+            additional_info["Swap Padded"] = (
+                f"Yes (provider min: {swap_info.get('provider_min_amount', '?'):,} sats)"
+            )
+
+    return additional_info
 
 
 def build_taker_config(
@@ -73,6 +110,9 @@ def build_taker_config(
     bondless_makers_allowance: float | None = None,
     bond_value_exponent: float | None = None,
     bondless_require_zero_fee: bool | None = None,
+    # Swap input options
+    swap_input: bool | None = None,
+    swap_provider_offer_id: str | None = None,
 ) -> TakerConfig:
     """
     Build TakerConfig from unified settings with CLI overrides.
@@ -210,6 +250,39 @@ def build_taker_config(
     except ValueError:
         broadcast_policy = BroadcastPolicy.MULTIPLE_PEERS
 
+    # Build swap input config (CLI flags override config-file values).
+    # Only pull settings if ``settings.swap`` is an actual ``SwapSettings``
+    # instance; otherwise (e.g. tests passing a ``MagicMock``) every attr
+    # access would yield another mock that fails Pydantic string validation.
+    from jmcore.settings import SwapSettings as _SwapSettings  # local to avoid cycles
+
+    swap_config_kwargs: dict[str, Any] = {}
+    swap_settings_obj = getattr(settings, "swap", None)
+    swap_settings = swap_settings_obj if isinstance(swap_settings_obj, _SwapSettings) else None
+    if swap_input is not None:
+        swap_config_kwargs["enabled"] = swap_input
+    elif swap_settings is not None:
+        swap_config_kwargs["enabled"] = swap_settings.enabled
+    if swap_provider_offer_id is not None:
+        swap_config_kwargs["provider_offer_id"] = swap_provider_offer_id
+    elif swap_settings is not None:
+        swap_config_kwargs["provider_offer_id"] = swap_settings.provider_offer_id
+    if swap_settings is not None:
+        for field_name in (
+            "nostr_relays",
+            "max_swap_fee_pct",
+            "fake_fee_min",
+            "fake_fee_max",
+            "lockup_poll_interval",
+            "lockup_timeout",
+            "lnd_rest_url",
+            "lnd_cert_path",
+            "lnd_macaroon_path",
+        ):
+            if field_name not in swap_config_kwargs:
+                swap_config_kwargs[field_name] = getattr(swap_settings, field_name)
+    swap_input_config = SwapInputConfig(**swap_config_kwargs)
+
     # Import SecretStr for wrapping sensitive values
     from pydantic import SecretStr
 
@@ -256,6 +329,7 @@ def build_taker_config(
         taker_utxo_age=settings.taker.taker_utxo_age,
         taker_utxo_retries=settings.taker.taker_utxo_retries,
         taker_utxo_amtpercent=settings.taker.taker_utxo_amtpercent,
+        swap_input=swap_input_config,
     )
 
 
@@ -424,6 +498,21 @@ def coinjoin(
             help="Interactively select UTXOs (fzf-like TUI)",
         ),
     ] = False,
+    swap_input: Annotated[
+        bool | None,
+        typer.Option(
+            "--swap-input/--no-swap-input",
+            help="Acquire submarine-swap UTXO to balance fees and hide taker role",
+        ),
+    ] = None,
+    swap_provider_offer_id: Annotated[
+        str | None,
+        typer.Option(
+            "--swap-provider-offer-id",
+            envvar="SWAP_PROVIDER_OFFER_ID",
+            help="Preferred Nostr swap-provider offer id (kind 30315 d-tag)",
+        ),
+    ] = None,
     yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip confirmation prompt")] = False,
     data_dir: Annotated[
         Path | None,
@@ -490,6 +579,8 @@ def coinjoin(
             bondless_makers_allowance=bondless_makers_allowance,
             bond_value_exponent=bond_value_exponent,
             bondless_require_zero_fee=bondless_require_zero_fee,
+            swap_input=swap_input,
+            swap_provider_offer_id=swap_provider_offer_id,
         )
     except ValueError as e:
         logger.error(str(e))
@@ -502,6 +593,13 @@ def coinjoin(
     logger.info(f"Using network: {config.network.value}")
     logger.info(f"Using backend: {config.backend_type}")
     logger.info(f"Tor SOCKS: {config.socks_host}:{config.socks_port}")
+    if config.swap_input.enabled:
+        provider_suffix = ""
+        if config.swap_input.provider_offer_id:
+            provider_suffix = (
+                f" (preferred offer id: {config.swap_input.provider_offer_id[:16]}...)"
+            )
+        logger.info(f"Swap input: ENABLED (Nostr discovery){provider_suffix}")
 
     try:
         asyncio.run(
@@ -581,12 +679,17 @@ async def _run_coinjoin(
         mining_fee: int | None = None,
         fee_rate: float | None = None,
         stage: str = "",
+        swap_info: dict[str, Any] | None = None,
     ) -> bool:
         """Callback for user confirmation after maker selection."""
-        from jmcore.confirmation import confirm_transaction, format_maker_summary
+        from jmcore.confirmation import confirm_transaction
 
-        additional_info = format_maker_summary(maker_details, fee_rate=fee_rate)
-        additional_info["Source Mixdepth"] = mixdepth
+        additional_info = _build_confirmation_additional_info(
+            maker_details=maker_details,
+            fee_rate=fee_rate,
+            mixdepth=mixdepth,
+            swap_info=swap_info,
+        )
 
         return confirm_transaction(
             operation="coinjoin",
@@ -599,8 +702,33 @@ async def _run_coinjoin(
             stage=stage,
         )
 
+    # Swap-input failure callback. Pre-lockup failure is recoverable: ask the
+    # user how to proceed (retry / fall back to plain coinjoin / abort). In
+    # non-interactive mode (--yes) the safe default is to abort, because
+    # silently downgrading to a non-private flow would violate the user's
+    # privacy expectation.
+    def swap_failure_callback(reason: str) -> str:
+        if skip_confirmation:
+            logger.warning(
+                f"Swap input acquisition failed ({reason}); aborting (non-interactive mode)"
+            )
+            return "abort"
+        typer.echo(f"\nSwap input acquisition failed: {reason}")
+        typer.echo("Options:")
+        typer.echo("  [r]etry      retry swap acquisition")
+        typer.echo("  [p]lain      continue with plain coinjoin (no swap input)")
+        typer.echo("  [a]bort      abort the coinjoin (default)")
+        choice = typer.prompt("Choice", default="a", type=str).strip().lower()[:1]
+        return {"r": "retry", "p": "plain", "a": "abort"}.get(choice, "abort")
+
     # Create taker
-    taker = Taker(wallet, backend, config, confirmation_callback=confirmation_callback)
+    taker = Taker(
+        wallet,
+        backend,
+        config,
+        confirmation_callback=confirmation_callback,
+        swap_failure_callback=swap_failure_callback,
+    )
 
     try:
         # Write nick state file for external tracking and cross-component protection
