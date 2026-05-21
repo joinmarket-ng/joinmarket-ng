@@ -132,6 +132,9 @@ declare -A SVC_SLOT=(
     [jam_pw]=9
     [tor_socks]=10
     [tor_ctrl]=11
+    [nostr]=12
+    [lnd_grpc]=13
+    [lnd_rest]=14
 )
 
 # Compute the host port for a given suite/service in the current instance.
@@ -162,6 +165,9 @@ generate_override() {
     local jam_pw_port=$(host_port "$suite" jam_pw)
     local tor_socks=$(host_port "$suite" tor_socks)
     local tor_ctrl=$(host_port "$suite" tor_ctrl)
+    local nostr_port=$(host_port "$suite" nostr)
+    local lnd_grpc=$(host_port "$suite" lnd_grpc)
+    local lnd_rest=$(host_port "$suite" lnd_rest)
     local shared_dir="${PARALLEL_DIR}/shared/${suite}"
 
     mkdir -p "$shared_dir"
@@ -407,6 +413,56 @@ services:
       jm-network:
         aliases:
           - jm-taker-neutrino
+
+  electrs:
+    container_name: ${prefix}-electrs
+    networks:
+      jm-network:
+        aliases:
+          - jm-electrs
+
+  nostr-relay:
+    container_name: ${prefix}-nostr-relay
+    networks:
+      jm-network:
+        aliases:
+          - jm-nostr-relay
+    ports: !override
+      - "${nostr_port}:7000"
+
+  electrum-swap-server:
+    container_name: ${prefix}-electrum-swap
+    networks:
+      jm-network:
+        aliases:
+          - jm-electrum-swap
+    volumes: !override
+      - electrum-data:/home/electrum/.electrum
+      - "${shared_dir}:/shared"
+
+  lnd-taker:
+    container_name: ${prefix}-lnd-taker
+    networks:
+      jm-network:
+        aliases:
+          - jm-lnd-taker
+    volumes: !override
+      - lnd-taker-data:/root/.lnd
+      - "${shared_dir}:/shared"
+    ports: !override
+      - "${lnd_grpc}:10009"
+      - "${lnd_rest}:8080"
+
+  lnd-setup:
+    container_name: ${prefix}-lnd-setup
+    networks:
+      jm-network:
+        aliases:
+          - jm-lnd-setup
+    volumes: !override
+      - lnd-taker-data:/root/.lnd
+      - electrum-data:/home/electrum/.electrum
+      - "${shared_dir}:/shared"
 YAML
 
     echo "$override_file"
