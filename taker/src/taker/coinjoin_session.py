@@ -146,6 +146,14 @@ class CoinJoinSession:
         self._fee_rate: float | None = None
         self._randomized_fee_rate: float | None = None
 
+        # Swap input state (only populated when config.swap_input.enabled).
+        # ``swap_client`` is the cached SwapClient; ``swap_input`` is the
+        # acquired on-chain SwapInput (lockup UTXO + claim secrets) ready
+        # for inclusion in the CoinJoin and P2WSH claim signing.
+        self.swap_client: Any | None = None
+        self.swap_input: Any | None = None
+        self.swap_input_index: int | None = None
+
     def attach(self, taker: Taker) -> None:
         """Wire the owning ``Taker`` so the session can read persistent deps.
 
@@ -185,6 +193,9 @@ class CoinJoinSession:
         self.crypto_session = None
         self._fee_rate = None
         self._randomized_fee_rate = None
+        self.swap_client = None
+        self.swap_input = None
+        self.swap_input_index = None
 
     def _expand_preselected_utxos_same_mixdepth(self, mixdepth: int) -> int:
         """Add another eligible UTXO from the same mixdepth to ``preselected_utxos``.
@@ -252,6 +263,118 @@ class CoinJoinSession:
             )
             del self.maker_sessions[nick]
         return dropped
+
+    async def _phase_acquire_swap_input(
+        self,
+        *,
+        fake_taker_fee: int,
+    ) -> bool:
+        """Acquire a swap-input UTXO via reverse submarine swap.
+
+        Runs BEFORE ``_phase_fill`` (no maker contact yet). On success, the
+        on-chain lockup UTXO is cached on ``self.swap_input`` and added to
+        the input set during ``_phase_build_tx``.
+
+        Failure modes:
+          - Pre-lockup (Nostr / RPC / LN payment never confirmed): no funds
+            committed yet. Caller decides whether to abort or fall back to
+            plain CoinJoin (interactive prompt vs. non-interactive abort).
+          - Post-lockup: funds locked on-chain, prepay invoice already
+            settled. Caller MUST call ``swap_client.cancel_pending_payment()``
+            to stop the in-flight main payment, then abort the round.
+            Provider self-refunds on-chain after the timelock.
+
+        Args:
+            fake_taker_fee: Sampled "fake maker fee" the taker pays on top
+                of cj_amount. The desired swap amount is cj_amount + this.
+
+        Returns:
+            True on success (``self.swap_input`` populated).
+            False on pre-lockup failure (caller decides next step).
+
+        Raises:
+            Exception: post-lockup failures bubble up; caller must handle
+                via ``cancel_pending_payment()``.
+        """
+        from taker.swap.client import SwapClient
+        from taker.swap.models import SwapState
+
+        cfg = self.config.swap_input
+        if cfg is None or not cfg.enabled:
+            return False
+
+        if not self.backend.has_mempool_access():
+            self.last_failure_reason = (
+                "swap_input requires a backend with mempool access; got "
+                f"{type(self.backend).__name__}"
+            )
+            logger.error(self.last_failure_reason)
+            return False
+
+        desired_amount = self.cj_amount + fake_taker_fee
+        logger.info(
+            f"Acquiring swap input: cj_amount={self.cj_amount:,}, "
+            f"fake_fee={fake_taker_fee:,}, desired={desired_amount:,} sats"
+        )
+
+        try:
+            client = SwapClient(
+                preferred_offer_id=cfg.provider_offer_id,
+                nostr_relays=cfg.nostr_relays,
+                network=self.config.bitcoin_network.value,
+                socks_host=getattr(self.config, "socks_host", None),
+                socks_port=getattr(self.config, "socks_port", 9050),
+                max_swap_fee_pct=cfg.max_swap_fee_pct,
+                lnd_rest_url=cfg.lnd_rest_url,
+                lnd_cert_path=cfg.lnd_cert_path,
+                lnd_macaroon_path=cfg.lnd_macaroon_path,
+                backend=self.backend,
+            )
+            self.swap_client = client
+
+            # Discover provider (pre-lockup, no funds committed).
+            await client.discover_provider(target_amount_sats=desired_amount)
+
+            # Fetch current block height for HTLC timelock checks.
+            current_height = await self.backend.get_block_height()
+
+            # Acquire (LN pay + wait for on-chain lockup).
+            swap_input = await client.acquire_swap_input(
+                desired_amount_sats=desired_amount,
+                current_block_height=current_height,
+                wait_for_lockup=True,
+                lockup_timeout=cfg.lockup_timeout,
+            )
+            self.swap_input = swap_input
+            logger.info(
+                f"Swap input acquired: {swap_input.txid}:{swap_input.vout} "
+                f"value={swap_input.value:,} sats"
+            )
+            return True
+
+        except Exception as exc:
+            # Distinguish pre-lockup vs post-lockup failure by client state.
+            client = self.swap_client
+            post_lockup = client is not None and client.state == SwapState.WAITING_LOCKUP
+            self.last_failure_reason = f"Swap input acquisition failed: {exc}"
+            if post_lockup:
+                # Funds may be locked on-chain. Cancel LN payment and re-raise
+                # so the caller aborts the round without proceeding to !fill.
+                logger.error(
+                    f"{self.last_failure_reason} (post-lockup; "
+                    "cancelling LN payment, prepay forfeit)"
+                )
+                if client is not None:
+                    try:
+                        await client.cancel_pending_payment()
+                    except Exception as cancel_exc:  # noqa: BLE001
+                        logger.warning(f"Failed to cancel LN payment cleanly: {cancel_exc!r}")
+                raise
+
+            logger.warning(f"{self.last_failure_reason} (pre-lockup; no funds committed)")
+            self.swap_client = None
+            self.swap_input = None
+            return False
 
     async def _phase_fill(self) -> PhaseResult:
         """Send !fill to all selected makers and wait for !pubkey responses.
@@ -811,6 +934,14 @@ class CoinJoinSession:
             # Store destination for broadcast verification
             self.cj_destination = destination
 
+            # Swap input is incompatible with sweep mode: sweep computes
+            # cj_amount for zero change, leaving no room for the leftover
+            # distribution that swap-input privacy depends on.
+            if self.swap_input is not None and self.is_sweep:
+                logger.error("Swap input is not supported in sweep mode; aborting")
+                self.last_failure_reason = "swap_input not supported in sweep mode"
+                return False
+
             # Calculate total input needed (now with exact maker UTXOs)
             total_maker_fee = sum(
                 calculate_cj_fee(s.offer, self.cj_amount) for s in self.maker_sessions.values()
@@ -820,6 +951,7 @@ class CoinJoinSession:
             num_taker_inputs = len(self.preselected_utxos)
             num_maker_inputs = sum(len(s.utxos) for s in self.maker_sessions.values())
             num_inputs = num_taker_inputs + num_maker_inputs
+            num_swap_inputs = 1 if self.swap_input is not None else 0
 
             # Output count depends on sweep mode:
             # - Normal: CJ outputs (1 + n_makers) + change outputs (1 + n_makers)
@@ -832,7 +964,9 @@ class CoinJoinSession:
                 num_outputs = 1 + len(self.maker_sessions) + 1 + len(self.maker_sessions)
 
             # Calculate actual tx fee based on real transaction size
-            actual_tx_fee = self._estimate_tx_fee(num_inputs, num_outputs)
+            actual_tx_fee = self._estimate_tx_fee(
+                num_inputs, num_outputs, num_swap_inputs=num_swap_inputs
+            )
 
             preselected_total = sum(u.value for u in self.preselected_utxos)
 
@@ -906,7 +1040,13 @@ class CoinJoinSession:
                 # NORMAL MODE: Use pre-selected UTXOs, add more if needed
                 # For normal mode, we use the actual tx_fee estimate
                 tx_fee = actual_tx_fee
-                required = self.cj_amount + total_maker_fee + tx_fee
+                # When a swap input is present, its value goes toward funding
+                # the cj_amount + fees, so the taker's UTXOs only need to cover
+                # what the swap input doesn't.
+                swap_value = self.swap_input.value if self.swap_input is not None else 0
+                required = self.cj_amount + total_maker_fee + tx_fee - swap_value
+                if required < 0:
+                    required = 0
 
                 # Use pre-selected UTXOs (which include the PoDLE UTXO)
                 # These were selected during PoDLE generation to ensure the commitment
@@ -916,7 +1056,8 @@ class CoinJoinSession:
                     selected_utxos = self.preselected_utxos
                     logger.info(
                         f"Using pre-selected UTXOs: {len(selected_utxos)} UTXOs, "
-                        f"total {preselected_total:,} sats (need {required:,})"
+                        f"total {preselected_total:,} sats (need {required:,}"
+                        f"{f', swap={swap_value:,}' if swap_value else ''})"
                     )
                 else:
                     # Need additional UTXOs beyond pre-selection
@@ -954,11 +1095,62 @@ class CoinJoinSession:
             # Store selected UTXOs for signing later
             self.selected_utxos = selected_utxos
 
-            taker_total = sum(u.value for u in selected_utxos)
+            # The swap input contributes its full value to the taker's funding.
+            swap_value = self.swap_input.value if self.swap_input is not None else 0
+            taker_total = sum(u.value for u in selected_utxos) + swap_value
 
             # Calculate expected change to determine if we need a change address
             # Change = total_input - cj_amount - maker_fees - tx_fee
             expected_change = taker_total - self.cj_amount - total_maker_fee - tx_fee
+
+            # Apply swap-input leftover distribution: top up maker fees toward
+            # max(maker_fee) so every fee receipt looks like the same
+            # orderbook offer. Any remainder stays on the taker change
+            # output (or is added to tx fees if it would be dust).
+            adjusted_maker_fees: dict[str, int] | None = None
+            if self.swap_input is not None and not self.is_sweep:
+                from taker.orderbook import equalize_maker_fees
+
+                base_maker_fees = {
+                    nick: calculate_cj_fee(s.offer, self.cj_amount)
+                    for nick, s in self.maker_sessions.items()
+                }
+                # The "leftover" available for distribution is the surplus of
+                # the swap input over the fake taker fee already implied by
+                # cj_amount + change.
+                taker_fake_fee = max(0, expected_change)
+                taker_change_exists = expected_change > self.config.dust_threshold
+                # Total budget = expected_change (the value that would have
+                # gone to taker change anyway) + 0. The "leftover" is exactly
+                # what would have inflated the taker change beyond the round
+                # max maker fee. We compute leftover as the gap above max
+                # maker fee that the taker change currently has.
+                if base_maker_fees:
+                    target = max(base_maker_fees.values())
+                    leftover = max(0, taker_fake_fee - target)
+                else:
+                    leftover = 0
+
+                if leftover > 0:
+                    adjusted_maker_fees, taker_bump_unused = equalize_maker_fees(
+                        maker_fees=base_maker_fees,
+                        leftover_sats=leftover,
+                        taker_change_exists=taker_change_exists,
+                        taker_fake_fee=target if base_maker_fees else 0,
+                    )
+                    distributed_to_makers = sum(
+                        adjusted_maker_fees[k] - base_maker_fees[k] for k in base_maker_fees
+                    )
+                    # Reduce expected_change (= taker fake fee) by what we
+                    # gave to makers; remainder stays as taker change OR
+                    # goes to miners if it's smaller than the dust threshold.
+                    expected_change -= distributed_to_makers
+                    total_maker_fee = sum(adjusted_maker_fees.values())
+                    logger.info(
+                        f"Swap leftover redistribution: {distributed_to_makers:,} "
+                        f"sats moved from taker change to maker fees "
+                        f"(target={target:,})"
+                    )
 
             # Only generate change address if we'll actually have a change output
             # This avoids recording unused addresses in history
@@ -982,7 +1174,10 @@ class CoinJoinSession:
             # Build maker data
             maker_data = {}
             for nick, session in self.maker_sessions.items():
-                cjfee = calculate_cj_fee(session.offer, self.cj_amount)
+                if adjusted_maker_fees is not None:
+                    cjfee = adjusted_maker_fees[nick]
+                else:
+                    cjfee = calculate_cj_fee(session.offer, self.cj_amount)
                 # JoinMarket protocol: txfee in offer is the total transaction fee
                 # the maker contributes (in satoshis), not a per-input/output fee
                 maker_txfee = session.offer.txfee
@@ -997,6 +1192,14 @@ class CoinJoinSession:
 
             # Build transaction
             network = self.config.network.value
+            swap_utxo_dict: dict[str, Any] | None = None
+            if self.swap_input is not None:
+                swap_utxo_dict = {
+                    "txid": self.swap_input.txid,
+                    "vout": self.swap_input.vout,
+                    "value": self.swap_input.value,
+                    "scriptpubkey": self.swap_input.scriptpubkey_hex,
+                }
             self.unsigned_tx, self.tx_metadata = build_coinjoin_tx(
                 taker_utxos=[
                     {
@@ -1015,7 +1218,10 @@ class CoinJoinSession:
                 tx_fee=tx_fee,
                 network=network,
                 dust_threshold=self.config.dust_threshold,
+                swap_utxo=swap_utxo_dict,
             )
+            # Cache the swap input position for the signing phase.
+            self.swap_input_index = self.tx_metadata.get("swap_input_index")
 
             logger.info(f"Built unsigned tx: {len(self.unsigned_tx)} bytes")
             logger.debug(f"Unsigned transaction hex: {self.unsigned_tx.hex()}")
@@ -1041,7 +1247,12 @@ class CoinJoinSession:
             return False
 
     def _estimate_tx_fee(
-        self, num_inputs: int, num_outputs: int, *, use_base_rate: bool = False
+        self,
+        num_inputs: int,
+        num_outputs: int,
+        *,
+        use_base_rate: bool = False,
+        num_swap_inputs: int = 0,
     ) -> int:
         """Estimate transaction fee.
 
@@ -1051,11 +1262,13 @@ class CoinJoinSession:
         a deterministic estimate.
 
         Args:
-            num_inputs: Number of transaction inputs
+            num_inputs: Number of P2WPKH transaction inputs (taker + maker)
             num_outputs: Number of transaction outputs
             use_base_rate: If True, use the base fee rate instead of the
                           session's randomized rate. Used for sweep cj_amount
                           calculations where determinism is required.
+            num_swap_inputs: Number of P2WSH swap inputs (usually 0 or 1).
+                          Each adds ~165 vbytes to the tx size.
 
         Returns:
             Estimated fee in satoshis
@@ -1063,7 +1276,8 @@ class CoinJoinSession:
         import math
 
         # P2WPKH: ~68 vbytes per input, 31 vbytes per output, ~11 overhead
-        vsize = num_inputs * 68 + num_outputs * 31 + 11
+        # P2WSH HTLC claim: ~165 vbytes per input
+        vsize = num_inputs * 68 + num_swap_inputs * 165 + num_outputs * 31 + 11
 
         # Use base rate for deterministic calculations (sweeps),
         # otherwise use the session's randomized rate for privacy
@@ -1551,7 +1765,50 @@ class CoinJoinSession:
 
                 logger.debug(f"Signed input {input_index} for UTXO {utxo.txid}:{utxo.vout}")
 
-            logger.info(f"Signed {len(signatures_info)} taker inputs")
+            # Sign swap input (P2WSH HTLC claim path) if present.
+            if self.swap_input is not None:
+                from coincurve import PrivateKey
+                from jmwallet.wallet.signing import sign_p2wsh_input
+
+                from taker.swap.script import SwapScript
+
+                swap_key = (self.swap_input.txid, self.swap_input.vout)
+                if swap_key not in input_index_map:
+                    raise TransactionSigningError(
+                        f"Swap UTXO {self.swap_input.txid}:{self.swap_input.vout} "
+                        f"not found in transaction inputs"
+                    )
+                swap_idx = input_index_map[swap_key]
+                ws_bytes = self.swap_input.witness_script
+                claim_key = PrivateKey(self.swap_input.claim_privkey)
+                swap_signature = sign_p2wsh_input(
+                    tx=tx,
+                    input_index=swap_idx,
+                    witness_script=ws_bytes,
+                    value=self.swap_input.value,
+                    private_key=claim_key,
+                )
+                swap_witness = SwapScript.build_claim_witness(
+                    swap_signature, self.swap_input.preimage, ws_bytes
+                )
+                signatures_info.append(
+                    {
+                        "txid": self.swap_input.txid,
+                        "vout": self.swap_input.vout,
+                        "witness": [item.hex() for item in swap_witness],
+                    }
+                )
+                logger.info(
+                    f"Signed swap input {swap_idx} "
+                    f"({self.swap_input.txid[:16]}...:{self.swap_input.vout}) "
+                    "with P2WSH claim witness"
+                )
+
+            swap_count = 1 if self.swap_input is not None else 0
+            logger.info(
+                f"Signed {len(signatures_info)} taker inputs"
+                + (f" (including {swap_count} swap input)" if swap_count else "")
+            )
             return signatures_info
 
         except TransactionSigningError as e:

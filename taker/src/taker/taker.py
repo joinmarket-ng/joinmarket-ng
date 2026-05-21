@@ -99,6 +99,7 @@ class Taker(TakerMonitoringMixin):
         backend: BlockchainBackend,
         config: TakerConfig,
         confirmation_callback: Any | None = None,
+        swap_failure_callback: Any | None = None,
     ):
         """
         Initialize the Taker.
@@ -108,11 +109,16 @@ class Taker(TakerMonitoringMixin):
             backend: Blockchain backend for broadcasting
             config: Taker configuration
             confirmation_callback: Optional callback for user confirmation before proceeding
+            swap_failure_callback: Optional callback invoked when swap-input
+                acquisition fails BEFORE on-chain lockup. Should return one of
+                ``"retry"``, ``"plain"``, or ``"abort"``. When ``None``, the
+                default is to abort (non-interactive safe default).
         """
         self.wallet = wallet
         self.backend = backend
         self.config = config
         self.confirmation_callback = confirmation_callback
+        self.swap_failure_callback = swap_failure_callback
 
         self.nick_identity = NickIdentity(JM_VERSION)
         self.nick = self.nick_identity.nick
@@ -164,10 +170,20 @@ class Taker(TakerMonitoringMixin):
 
         # Schedule for tumbler-style operations
         self.schedule: Schedule | None = None
-
         # Background task tracking
         self.running = False
         self._background_tasks: list[asyncio.Task[None]] = []
+
+    @property
+    def swap_input(self) -> Any | None:
+        """
+        The Lightning swap input acquired for the current CoinJoin round, if any.
+
+        Proxies to the active session. Returns ``None`` when no session has
+        acquired a swap input yet (for example, swaps are disabled in config,
+        the acquisition phase has not run, or it failed and was skipped).
+        """
+        return self._session.swap_input
 
     async def sync_wallet(self) -> int:
         """
@@ -844,6 +860,85 @@ class Taker(TakerMonitoringMixin):
                 f"Selected {len(self._session.maker_sessions)} makers, "
                 f"total fee: {total_fee:,} sats"
             )
+
+            # Phase 0: Acquire swap input (when enabled)
+            #
+            # Runs BEFORE !fill so we have the lockup UTXO ready when we send
+            # the cj_amount-bumping request. Pre-lockup failures fall back to
+            # plain CoinJoin (interactive) or abort (non-interactive). Post-
+            # lockup failures bubble up and abort cleanly with payment cancel.
+            if self.config.swap_input is not None and self.config.swap_input.enabled:
+                self.state = TakerState.ACQUIRING_SWAP_INPUT
+                logger.info("Phase 0: Acquiring swap input...")
+
+                # Sample a fake taker fee from the orderbook to size the swap.
+                # This makes the taker's "fake maker fee" indistinguishable
+                # from real maker fees in the round.
+                from taker.orderbook import sample_fake_fee_from_orderbook
+
+                fake_taker_fee = sample_fake_fee_from_orderbook(
+                    offers=self.orderbook_manager.offers,
+                    cj_amount=self._session.cj_amount,
+                    selected_nicks=set(selected_offers.keys()),
+                    max_cj_fee=self.config.max_cj_fee,
+                )
+                logger.info(
+                    f"Sampled fake taker fee: {fake_taker_fee:,} sats "
+                    f"(swap target = {self._session.cj_amount + fake_taker_fee:,})"
+                )
+
+                try:
+                    acquired = await self._session._phase_acquire_swap_input(
+                        fake_taker_fee=fake_taker_fee,
+                    )
+                except Exception as exc:
+                    # Post-lockup failure (LN payment already cancelled inside
+                    # the phase). Abort the round; provider self-refunds.
+                    reason = (
+                        f"Swap input post-lockup failure: {exc}. "
+                        "LN payment cancelled; prepay invoice forfeit."
+                    )
+                    logger.error(reason)
+                    self._session.last_failure_reason = reason
+                    self.state = TakerState.FAILED
+                    return None
+
+                if not acquired:
+                    # Pre-lockup failure: ask user (or default to abort).
+                    decision = "abort"
+                    if self.swap_failure_callback is not None:
+                        try:
+                            decision = self.swap_failure_callback(
+                                reason=self._session.last_failure_reason or "unknown",
+                            )
+                        except Exception as cb_exc:  # noqa: BLE001
+                            logger.warning(f"swap_failure_callback raised {cb_exc!r}; aborting")
+                            decision = "abort"
+
+                    if decision == "retry":
+                        # Retry once. If it fails again, abort.
+                        logger.info("Retrying swap input acquisition...")
+                        try:
+                            acquired = await self._session._phase_acquire_swap_input(
+                                fake_taker_fee=fake_taker_fee,
+                            )
+                        except Exception as exc:
+                            reason = f"Swap input retry post-lockup failure: {exc}"
+                            logger.error(reason)
+                            self._session.last_failure_reason = reason
+                            self.state = TakerState.FAILED
+                            return None
+                        if not acquired:
+                            logger.error("Swap input retry failed; aborting")
+                            self.state = TakerState.FAILED
+                            return None
+                    elif decision == "plain":
+                        logger.warning("Falling back to plain CoinJoin (no swap input)")
+                        # Continue without swap input; session.swap_input stays None.
+                    else:
+                        logger.error("Swap input acquisition aborted by user/policy")
+                        self.state = TakerState.FAILED
+                        return None
 
             # Log estimated transaction fee before prompting for confirmation
             # Conservative estimate: assume 1 input per maker + 20% buffer, rounded up
