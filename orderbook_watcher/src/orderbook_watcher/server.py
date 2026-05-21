@@ -34,6 +34,7 @@ class OrderbookServer:
 
     def _setup_routes(self) -> None:
         self.app.router.add_get("/", self._handle_index)
+        self.app.router.add_get("/swap-providers", self._handle_swap_providers)
         self.app.router.add_get("/orderbook.json", self._handle_orderbook_json)
         self.app.router.add_get("/health", self._handle_health)
 
@@ -47,6 +48,15 @@ class OrderbookServer:
         if index_file.exists():
             return web.FileResponse(index_file)
         return web.Response(text="Orderbook Watcher", status=200)
+
+    async def _handle_swap_providers(
+        self, _request: web.Request
+    ) -> web.Response | web.FileResponse:
+        static_dir = Path(__file__).parent.parent.parent / "static"
+        swap_providers_file = static_dir / "swap_providers.html"
+        if swap_providers_file.exists():
+            return web.FileResponse(swap_providers_file)
+        return web.Response(text="Swap provider page not found", status=404)
 
     async def _handle_orderbook_json(self, _request: web.Request) -> web.Response:
         async with self._cache_lock:
