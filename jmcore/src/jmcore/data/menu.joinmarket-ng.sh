@@ -702,119 +702,6 @@ maker_start() {
     fi
 }
 
-# Helper: Interactive wallet picker + (optional) password handling for the
-# maker START flow. When multiple wallets exist the user is asked to choose
-# one and the selection is written to config.toml, replacing any stale
-# password entry. This prevents "Decryption failed" errors where the user
-# had no way to tell which wallet the password prompt referred to
-# (issue #454).
-#
-# Usage: maker_prepare_wallet
-# Returns 0 if the caller should proceed with maker start, non-zero to abort.
-maker_prepare_wallet() {
-    local wallets
-    wallets=$(list_wallets)
-
-    if [ -z "$wallets" ]; then
-        # whiptail --title " Error " \
-        #     --msgbox "No wallet files found in $DATA_DIR/wallets/\nCreate or import a wallet first (W -> NEW or IMP)." \
-        #     9 60
-        whiptail --title " Error " --msgbox "No wallet configured.\nSet up a wallet first (W -> NEW or SEL)." 9 50
-        return 1
-    fi
-
-    # Count wallets without relying on subshells preserving state.
-    local wallet_count
-    wallet_count=$(printf '%s\n' "$wallets" | sed '/^$/d' | wc -l)
-
-    # Single wallet: just make sure it's the active one. No prompting needed
-    # beyond what jm-maker itself already does.
-    if [ "$wallet_count" -eq 1 ]; then
-        local only_wallet
-        only_wallet=$(printf '%s\n' "$wallets" | sed -n '1p')
-        local only_path="$DATA_DIR/wallets/$only_wallet"
-        if [ "$CURRENT_WALLET" != "$only_path" ]; then
-            set_config_value "mnemonic_file" "$only_path" "true"
-            clear_config_value "mnemonic_password"
-            CURRENT_WALLET="$only_path"
-        fi
-
-        # Offer password storage for encrypted wallets without stored password.
-        # Abort maker start if password storage fails (3 wrong attempts).
-        jm-wallet verify-password -f "$only_path" --no-prompt --password "" >/dev/null 2>&1
-        if [ $? -ne 2 ]; then
-            local stored_pwd
-            stored_pwd=$(get_stored_mnemonic_password)
-            if [ -z "$stored_pwd" ]; then
-                if whiptail --title " Store Password " \
-                    --yesno "Active wallet set to: $only_wallet\n\nStore this wallet's password in config.toml?\nThis lets the maker start without prompting.\nChoose No to be asked for the password on each use." \
-                    12 64 --defaultno 3>&1 1>&2 2>&3; then
-                    clear
-                    if ! prompt_and_store_password "$only_path"; then
-                        echo "Password not stored. Maker start aborted."
-                        return 1
-                    fi
-                fi
-            fi
-        fi
-
-        return 0
-    fi
-
-    # Multiple wallets: ask the user to explicitly pick one.
-    local menu_items=()
-    while IFS= read -r wf; do
-        [ -z "$wf" ] && continue
-        menu_items+=("$wf" "$wf")
-    done <<< "$wallets"
-
-    local current_display
-    current_display=$(basename "${CURRENT_WALLET:-}" 2>/dev/null)
-    [ -z "$current_display" ] && current_display="(none)"
-
-    local selected
-    selected=$(whiptail --title " Start Maker -- Select Wallet " --notags \
-        --menu "Current active: ${current_display}\n\nChoose the wallet to use for the maker bot:" \
-        18 66 6 \
-        "${menu_items[@]}" 3>&1 1>&2 2>&3) || return 1
-
-    local selected_path="$DATA_DIR/wallets/$selected"
-    if [ ! -f "$selected_path" ]; then
-        whiptail --title " Error " --msgbox "File not found: $selected_path" 8 55
-        return 1
-    fi
-
-    # If the user picked a different wallet than the one in config, update
-    # config and drop the stale password -- this is the root cause of the
-    # #455 mismatch scenarios.
-    if [ "$CURRENT_WALLET" != "$selected_path" ]; then
-        set_config_value "mnemonic_file" "$selected_path" "true"
-        clear_config_value "mnemonic_password"
-        CURRENT_WALLET="$selected_path"
-    fi
-
-    # Offer password storage for encrypted wallets without stored password.
-    # Abort maker start if password storage fails (3 wrong attempts).
-    jm-wallet verify-password -f "$selected_path" --no-prompt --password "" >/dev/null 2>&1
-    if [ $? -ne 2 ]; then
-        local stored_pwd
-        stored_pwd=$(get_stored_mnemonic_password)
-        if [ -z "$stored_pwd" ]; then
-            if whiptail --title " Store Password " \
-                --yesno "Active wallet set to: $selected\n\nStore this wallet's password in config.toml?\nThis lets the maker start without prompting.\nChoose No to be asked for the password on each use." \
-                12 64 --defaultno 3>&1 1>&2 2>&3; then
-                clear
-                if ! prompt_and_store_password "$selected_path"; then
-                    echo "Password not stored. Maker start aborted."
-                    return 1
-                fi
-            fi
-        fi
-    fi
-
-    return 0
-}
-
 # Helper: Stop maker (environment-aware)
 maker_stop() {
     if [ "$RASPIBLITZ" = "1" ]; then
@@ -833,6 +720,188 @@ maker_status() {
     fi
 }
 
+# ---------------------------------------------------------------------------
+# Helper: Stale wallet check for all loops that display WALLET_INFO.
+# Refreshes CURRENT_WALLET from config, checks if the file still exists,
+# and updates WALLET_INFO. Called at the top of every menu loop so the
+# display stays accurate even if the wallet file is deleted externally.
+# ---------------------------------------------------------------------------
+check_stale_wallet() {
+    CURRENT_WALLET=$(get_mnemonic_file)
+    if [ -n "$CURRENT_WALLET" ] && [ ! -f "$CURRENT_WALLET" ]; then
+        whiptail --title " Stale Wallet Config " \
+            --msgbox "The configured wallet file no longer exists:\n\n$CURRENT_WALLET\n\nThis usually means the .mnemonic file was deleted\noutside the TUI. Clearing mnemonic_file and\nmnemonic_password from config.toml.\n\nUse 'Wallet Management' to select or create a\nnew active wallet." \
+            16 70 3>&1 1>&2 2>&3 || true
+        clear_config_value "mnemonic_file"
+        clear_config_value "mnemonic_password"
+        CURRENT_WALLET=""
+    fi
+    if [ -n "$CURRENT_WALLET" ]; then
+        WALLET_INFO="Active Wallet: $(basename "$CURRENT_WALLET")"
+    else
+        WALLET_INFO="Active Wallet: (none configured)"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Helper: Ensure an active wallet is configured and available.
+#
+# WARNING: Do not call from subshells - modifies global CURRENT_WALLET
+# and WALLET_INFO.
+#
+# - Refreshes CURRENT_WALLET from config
+# - Silently cleans up stale config (file no longer exists)
+# - If no wallet configured:
+#   - No wallet files exist → unified error message, return 1
+#   - 1 wallet exists → auto-set as active, offer password storage
+#   - Multiple wallets → picker, offer password storage
+# - Password storage is ONLY offered when wallet just changed
+# - Updates WALLET_INFO whenever CURRENT_WALLET changes
+# Returns 0 if a wallet is ready, 1 to abort.
+# ---------------------------------------------------------------------------
+ensure_active_wallet() {
+    # Refresh from config
+    CURRENT_WALLET=$(get_mnemonic_file)
+
+    # Silently clean up stale config (warning shown by check_stale_wallet
+    # in the loop; this handles the rare case where the file was deleted
+    # between the loop's check and this call).
+    if [ -n "$CURRENT_WALLET" ] && [ ! -f "$CURRENT_WALLET" ]; then
+        clear_config_value "mnemonic_file"
+        clear_config_value "mnemonic_password"
+        CURRENT_WALLET=""
+    fi
+
+    # Already have a valid wallet - no password offer
+    if [ -n "$CURRENT_WALLET" ] && [ -f "$CURRENT_WALLET" ]; then
+        WALLET_INFO="Active Wallet: $(basename "$CURRENT_WALLET")"
+        return 0
+    fi
+
+    # No wallet configured - try to find one
+    local wallet_just_changed="no"
+    local wallets
+    wallets=$(list_wallets)
+
+    if [ -z "$wallets" ]; then
+        whiptail --title " Error " --msgbox \
+            "No wallet configured.\n\nCreate or import a wallet first\n(W → NEW or IMP)." 9 50
+        return 1
+    fi
+
+    local wallet_count
+    wallet_count=$(printf '%s\n' "$wallets" | sed '/^$/d' | wc -l)
+
+    if [ "$wallet_count" -eq 1 ]; then
+        # Single wallet: auto-set as active
+        clear
+        echo "Please wait..."
+
+        local only_wallet
+        only_wallet=$(printf '%s\n' "$wallets" | sed -n '1p')
+        local only_path="$DATA_DIR/wallets/$only_wallet"
+        set_config_value "mnemonic_file" "$only_path" "true"
+        clear_config_value "mnemonic_password"
+        CURRENT_WALLET="$only_path"
+        wallet_just_changed="yes"
+    else
+        # Multiple wallets: picker
+        local menu_items=()
+        while IFS= read -r wf; do
+            [ -z "$wf" ] && continue
+            menu_items+=("$wf" "$wf")
+        done <<< "$wallets"
+
+        local current_display
+        current_display=$(basename "${CURRENT_WALLET:-}" 2>/dev/null)
+        [ -z "$current_display" ] && current_display="(none)"
+
+        local selected
+        selected=$(whiptail --title " Select Active Wallet " --notags \
+            --menu "Current active: ${current_display}\n\nChoose a wallet:" \
+            18 64 6 \
+            "${menu_items[@]}" 3>&1 1>&2 2>&3) || return 1
+
+        clear
+        echo "Please wait..."
+
+        local selected_path="$DATA_DIR/wallets/$selected"
+        if [ ! -f "$selected_path" ]; then
+            whiptail --title " Error " --msgbox "File not found: $selected_path" 8 55
+            return 1
+        fi
+
+        # Update config
+        if [ "$CURRENT_WALLET" != "$selected_path" ]; then
+            set_config_value "mnemonic_file" "$selected_path" "true"
+            clear_config_value "mnemonic_password"
+            CURRENT_WALLET="$selected_path"
+            wallet_just_changed="yes"
+        fi
+    fi
+
+    # Update WALLET_INFO
+    WALLET_INFO="Active Wallet: $(basename "$CURRENT_WALLET")"
+
+    # Offer password storage ONLY when wallet just changed
+    if [ "$wallet_just_changed" = "yes" ]; then
+        jm-wallet verify-password -f "$CURRENT_WALLET" --no-prompt --password "" >/dev/null 2>&1
+        if [ $? -ne 2 ]; then
+            local stored_pwd
+            stored_pwd=$(get_stored_mnemonic_password)
+            if [ -z "$stored_pwd" ]; then
+                if whiptail --title " Store Password " \
+                    --yesno "Active wallet: $(basename "$CURRENT_WALLET")\n\nStore this wallet's password in config.toml?\nThis lets the maker start without prompting.\nChoose No to be asked for the password on each use." \
+                    12 64 --defaultno 3>&1 1>&2 2>&3; then
+                    clear
+                    if ! prompt_and_store_password "$CURRENT_WALLET"; then
+                        echo "Password not stored."
+                    fi
+                fi
+            fi
+        fi
+    fi
+
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Helper: Offer password storage for Maker with context-specific explanation.
+#
+# The Maker needs a stored password for automatic restart after crashes.
+# This helper checks if the active wallet is encrypted and has no stored
+# password, then offers to store it with a Maker-specific explanation.
+# Called after ensure_active_wallet() in Maker START/RESTART.
+# ---------------------------------------------------------------------------
+offer_maker_password_storage() {
+    # Check if wallet is encrypted
+    jm-wallet verify-password -f "$CURRENT_WALLET" --no-prompt --password "" >/dev/null 2>&1
+    if [ $? -eq 2 ]; then
+        return 0  # Unencrypted wallet, no password needed
+    fi
+
+    # Check if password already stored
+    local stored_pwd
+    stored_pwd=$(get_stored_mnemonic_password)
+    if [ -n "$stored_pwd" ]; then
+        return 0  # Already stored
+    fi
+
+    # Offer with Maker-specific explanation
+    if ! whiptail --title " Store Password for Maker " \
+        --yesno "For automatic restart after a crash, the Maker needs\nthe wallet password stored in config.toml.\n\nWithout stored password: If the Maker crashes, you must\nmanually restart it and re-enter the password.\n\nStore password now?" \
+        14 64 --defaultno 3>&1 1>&2 2>&3; then
+        return 0  # User declined
+    fi
+
+    clear
+    if ! prompt_and_store_password "$CURRENT_WALLET"; then
+        echo "Password not stored."
+    fi
+
+    return 0
+}
+
 # =============================================================================
 # Main Loop
 # =============================================================================
@@ -848,24 +917,7 @@ while true; do
   fi
 
   # Check if a wallet is configured
-  CURRENT_WALLET=$(get_mnemonic_file)
-  # If config points at a mnemonic file that no longer exists (e.g. user
-  # deleted it via CLI/file manager), clear the stale entries so the TUI
-  # doesn't keep advertising a broken wallet and every wallet operation
-  # bubbles up a "Mnemonic file not found" traceback (issue #461).
-  if [ -n "$CURRENT_WALLET" ] && [ ! -f "$CURRENT_WALLET" ]; then
-    whiptail --title " Stale Wallet Config " \
-        --msgbox "The configured wallet file no longer exists:\n\n$CURRENT_WALLET\n\nThis usually means the .mnemonic file was deleted\noutside the TUI. Clearing mnemonic_file and\nmnemonic_password from config.toml.\n\nUse 'Wallet Management' to select or create a\nnew active wallet." \
-        16 70 3>&1 1>&2 2>&3 || true
-    clear_config_value "mnemonic_file"
-    clear_config_value "mnemonic_password"
-    CURRENT_WALLET=""
-  fi
-  if [ -n "$CURRENT_WALLET" ]; then
-    WALLET_INFO="Active Wallet: $(basename "$CURRENT_WALLET")"
-  else
-    WALLET_INFO="Active Wallet: (none configured)"
-  fi
+check_stale_wallet
 
 if [ "${RASPIBLITZ}" -eq 1 ]; then
     CHOICE=$(whiptail --title " JoinMarket-NG Menu" \
@@ -902,8 +954,7 @@ if [ "${RASPIBLITZ}" -eq 1 ]; then
     # SEND BITCOIN (unified: normal tx when counterparties=0, coinjoin otherwise)
     # ------------------------------------------------------------------
     S)
-      if [ -z "$CURRENT_WALLET" ]; then
-          whiptail --title " Error " --msgbox "No wallet configured.\nSet up a wallet first (W -> NEW or SEL)." 9 50
+      if ! ensure_active_wallet; then
           continue
       fi
 
@@ -1070,18 +1121,7 @@ if [ "${RASPIBLITZ}" -eq 1 ]; then
       # Wallet Management Submenu - loops until BACK is selected
       while true; do
         # Refresh wallet info at the START of each W submenu iteration
-        CURRENT_WALLET=$(get_mnemonic_file)
-        # Drop stale config if the file is gone (issue #461).
-        if [ -n "$CURRENT_WALLET" ] && [ ! -f "$CURRENT_WALLET" ]; then
-            clear_config_value "mnemonic_file"
-            clear_config_value "mnemonic_password"
-            CURRENT_WALLET=""
-        fi
-        if [ -n "$CURRENT_WALLET" ]; then
-          WALLET_INFO="Active Wallet: $(basename "$CURRENT_WALLET")"
-        else
-          WALLET_INFO="Active Wallet: (none configured)"
-        fi
+        check_stale_wallet
 
         WCHOICE=$(whiptail --title " Wallet Management " \
          --menu "\n$WALLET_INFO | Maker Bot: $MAKER_STATUS" \
@@ -1105,8 +1145,8 @@ if [ "${RASPIBLITZ}" -eq 1 ]; then
           # --------------------------------------------------------------
           BAL)
               while true; do
-                  if [ -z "$CURRENT_WALLET" ]; then
-                      whiptail --title " Error " --msgbox "No wallet configured.\nUse 'Select Active Wallet' or 'Create New Wallet' first." 9 50
+                  check_stale_wallet
+                  if ! ensure_active_wallet; then
                       break
                   fi
 
@@ -1158,93 +1198,93 @@ if [ "${RASPIBLITZ}" -eq 1 ]; then
           # HIST - CoinJoin History
           # --------------------------------------------------------------
           HIST)
-              if [ -z "$CURRENT_WALLET" ]; then
-                  whiptail --title " Error " --msgbox "No wallet configured.\nSet up a wallet first (W -> NEW or SEL)." 9 50
-              else
-                  # Prompt parameters with whiptail
-                  HIST_ROLE=$(prompt_param "Role Filter" \
-                    "Filter by role: maker, taker.\nLeave blank for all." \
-                    "") || continue
-                  # Validate role
-                  if [ -n "$HIST_ROLE" ]; then
-                      case "$HIST_ROLE" in
-                          maker|taker) ;;
-                          *)
-                              whiptail --title " Error " --msgbox "Invalid role '${HIST_ROLE}'.\nAllowed: maker, taker, or blank for all." 9 50
-                              continue
-                              ;;
-                      esac
-                  fi
-
-                  HIST_LIMIT=$(prompt_param "Max Entries" \
-                    "Maximum number of entries to show.\nLeave blank for all." \
-                    "") || continue
-                  # Validate limit is numeric
-                  if [ -n "$HIST_LIMIT" ] && ! [[ "$HIST_LIMIT" =~ ^[0-9]+$ ]]; then
-                      whiptail --title " Error " --msgbox "Limit must be a positive integer." 8 40
-                      continue
-                  fi
-
-                  whiptail --title " Statistics " \
-                    --yesno "Show statistics summary?" \
-                    8 40 --defaultno 3>&1 1>&2 2>&3
-                  HIST_SHOW_STATS=$?
-
-                  # Build summary entries
-                  ROLE_DISPLAY="${HIST_ROLE:-all}"
-                  LIMIT_DISPLAY="${HIST_LIMIT:-all}"
-                  if [ $HIST_SHOW_STATS -eq 0 ]; then
-                      STATS_DISPLAY="yes"
-                  else
-                      STATS_DISPLAY="no"
-                  fi
-
-                  show_summary "Confirm History -- $(basename "$CURRENT_WALLET")" \
-                    "Role filter|all|${ROLE_DISPLAY}" \
-                    "Max entries|all|${LIMIT_DISPLAY}" \
-                    "Show statistics|no|${STATS_DISPLAY}" || continue
-
-                  HIST_ARGS=()
-                  [ -n "$HIST_ROLE" ]  && HIST_ARGS+=(-r "$HIST_ROLE")
-                  [ -n "$HIST_LIMIT" ] && HIST_ARGS+=(-n "$HIST_LIMIT")
-                  [ $HIST_SHOW_STATS -eq 0 ] && HIST_ARGS+=(-s)
-
-                  clear
-                  echo "=== CoinJoin History ==="
-                  echo ""
-                  echo "Active wallet: $(basename "$CURRENT_WALLET")"
-                  echo "Preparing wallet..."
-                  echo ""
-                  (
-                      ensure_wallet_password "$CURRENT_WALLET" || exit 1
-                      jm-wallet history "${HIST_ARGS[@]}"
-                      pause
-                  )
+              if ! ensure_active_wallet; then
+                  continue
               fi
+
+              # Prompt parameters with whiptail
+              HIST_ROLE=$(prompt_param "Role Filter" \
+                "Filter by role: maker, taker.\nLeave blank for all." \
+                "") || continue
+              # Validate role
+              if [ -n "$HIST_ROLE" ]; then
+                  case "$HIST_ROLE" in
+                      maker|taker) ;;
+                      *)
+                          whiptail --title " Error " --msgbox "Invalid role '${HIST_ROLE}'.\nAllowed: maker, taker, or blank for all." 9 50
+                          continue
+                          ;;
+                  esac
+              fi
+
+              HIST_LIMIT=$(prompt_param "Max Entries" \
+                "Maximum number of entries to show.\nLeave blank for all." \
+                "") || continue
+              # Validate limit is numeric
+              if [ -n "$HIST_LIMIT" ] && ! [[ "$HIST_LIMIT" =~ ^[0-9]+$ ]]; then
+                  whiptail --title " Error " --msgbox "Limit must be a positive integer." 8 40
+                  continue
+              fi
+
+              whiptail --title " Statistics " \
+                --yesno "Show statistics summary?" \
+                8 40 --defaultno 3>&1 1>&2 2>&3
+              HIST_SHOW_STATS=$?
+
+              # Build summary entries
+              ROLE_DISPLAY="${HIST_ROLE:-all}"
+              LIMIT_DISPLAY="${HIST_LIMIT:-all}"
+              if [ $HIST_SHOW_STATS -eq 0 ]; then
+                  STATS_DISPLAY="yes"
+              else
+                  STATS_DISPLAY="no"
+              fi
+
+              show_summary "Confirm History -- $(basename "$CURRENT_WALLET")" \
+                "Role filter|all|${ROLE_DISPLAY}" \
+                "Max entries|all|${LIMIT_DISPLAY}" \
+                "Show statistics|no|${STATS_DISPLAY}" || continue
+
+              HIST_ARGS=()
+              [ -n "$HIST_ROLE" ]  && HIST_ARGS+=(-r "$HIST_ROLE")
+              [ -n "$HIST_LIMIT" ] && HIST_ARGS+=(-n "$HIST_LIMIT")
+              [ $HIST_SHOW_STATS -eq 0 ] && HIST_ARGS+=(-s)
+
+              clear
+              echo "=== CoinJoin History ==="
+              echo ""
+              echo "Active wallet: $(basename "$CURRENT_WALLET")"
+              echo "Preparing wallet..."
+              echo ""
+              (
+                  ensure_wallet_password "$CURRENT_WALLET" || exit 1
+                  jm-wallet history "${HIST_ARGS[@]}"
+                  pause
+              )
               ;;
 
           # --------------------------------------------------------------
           # FREEZE - Freeze/Unfreeze UTXOs
           # --------------------------------------------------------------
           FREEZE)
-              if [ -z "$CURRENT_WALLET" ]; then
-                  whiptail --title " Error " --msgbox "No wallet configured.\nSet up a wallet first (W -> NEW or SEL)." 9 50
-              else
-                  clear
-                  echo "=== Freeze / Unfreeze UTXOs ==="
-                  echo ""
-                  echo "Active wallet: $(basename "$CURRENT_WALLET")"
-                  echo "Preparing wallet..."
-                  echo ""
-                  (
-                      ensure_wallet_password "$CURRENT_WALLET" || exit 1
-                      echo "Opening interactive UTXO selector. Use arrow keys to navigate,"
-                      echo "Space to toggle freeze state, Enter to confirm, q to quit."
-                      echo ""
-                      jm-wallet freeze
-                      pause
-                  )
+              if ! ensure_active_wallet; then
+                  continue
               fi
+
+              clear
+              echo "=== Freeze / Unfreeze UTXOs ==="
+              echo ""
+              echo "Active wallet: $(basename "$CURRENT_WALLET")"
+              echo "Preparing wallet..."
+              echo ""
+              (
+                  ensure_wallet_password "$CURRENT_WALLET" || exit 1
+                  echo "Opening interactive UTXO selector. Use arrow keys to navigate,"
+                  echo "Space to toggle freeze state, Enter to confirm, q to quit."
+                  echo ""
+                  jm-wallet freeze
+                  pause
+              )
               ;;
 
           # --------------------------------------------------------------
@@ -1435,39 +1475,39 @@ if [ "${RASPIBLITZ}" -eq 1 ]; then
           # SEED - Show Seed Words
           # --------------------------------------------------------------
           SEED)
-              if [ -z "$CURRENT_WALLET" ]; then
-                  whiptail --title " Error " --msgbox "No wallet configured.\nUse 'Select Active Wallet' or 'Create New Wallet' first." 9 50
-              else
-                  if ! whiptail --title " Security Warning " \
-                      --yesno "\n$WALLET_INFO | Maker Bot: $MAKER_STATUS\n\nYou are about to display your BIP39 seed words.\n\nWARNING: Anyone with these words can spend all your funds.\nDo not share them, photograph them, or paste them into any website.\n\nMake sure you are in a private setting!\n\nContinue?" \
-                      17 78 --defaultno 3>&1 1>&2 2>&3; then
-                      continue
-                  fi
-
-                  clear
-                  echo "=== Seed Words ==="
-                  echo ""
-                  echo "Active wallet: $(basename "$CURRENT_WALLET")"
-                  echo ""
-                  echo "Preparing your wallet, please wait..."
-                  echo ""
-
-                  # Clear any cached password from previous operations
-                  unset MNEMONIC_PASSWORD
-
-                  if ! ensure_wallet_password "$CURRENT_WALLET"; then
-                      clear
-                      continue
-                  fi
-
-                  echo ""
-                  jm-wallet showseed -f "$CURRENT_WALLET"
-                  echo ""
-                  echo ""
-                  echo "Press [Enter] to continue."
-                  read -r _
-                  clear
+              if ! ensure_active_wallet; then
+                  continue
               fi
+
+              if ! whiptail --title " Security Warning " \
+                  --yesno "\n$WALLET_INFO | Maker Bot: $MAKER_STATUS\n\nYou are about to display your BIP39 seed words.\n\nWARNING: Anyone with these words can spend all your funds.\nDo not share them, photograph them, or paste them into any website.\n\nMake sure you are in a private setting!\n\nContinue?" \
+                  17 78 --defaultno 3>&1 1>&2 2>&3; then
+                  continue
+              fi
+
+              clear
+              echo "=== Seed Words ==="
+              echo ""
+              echo "Active wallet: $(basename "$CURRENT_WALLET")"
+              echo ""
+              echo "Preparing your wallet, please wait..."
+              echo ""
+
+              # Clear any cached password from previous operations
+              unset MNEMONIC_PASSWORD
+
+              if ! ensure_wallet_password "$CURRENT_WALLET"; then
+                  clear
+                  continue
+              fi
+
+              echo ""
+              jm-wallet showseed -f "$CURRENT_WALLET"
+              echo ""
+              echo ""
+              echo "Press [Enter] to continue."
+              read -r _
+              clear
               ;;
 
           # --------------------------------------------------------------
@@ -1486,7 +1526,7 @@ if [ "${RASPIBLITZ}" -eq 1 ]; then
     M)
       # Maker submenu
       while true; do
-
+      check_stale_wallet
       if pgrep -f "jm-maker" > /dev/null 2>&1; then
         MAKER_STATUS="RUNNING"
       else
@@ -1508,9 +1548,10 @@ if [ "${RASPIBLITZ}" -eq 1 ]; then
       case $MCHOICE in
           START)
               clear
-              if ! maker_prepare_wallet; then
+              if ! ensure_active_wallet; then
                   continue
               fi
+              offer_maker_password_storage
               echo "=== Starting Maker Bot ==="
               echo ""
               echo "Active wallet: $(basename "$CURRENT_WALLET")"
@@ -1561,9 +1602,10 @@ if [ "${RASPIBLITZ}" -eq 1 ]; then
               ;;
           RESTART)
               clear
-              if ! maker_prepare_wallet; then
+              if ! ensure_active_wallet; then
                   continue
               fi
+              offer_maker_password_storage
               if [ "$MAKER_STATUS" = "RUNNING" ]; then
                   echo "=== Restarting Maker Bot ==="
               else
@@ -1596,6 +1638,7 @@ if [ "${RASPIBLITZ}" -eq 1 ]; then
           BONDS)
               # Fidelity bond submenu
               while true; do
+                check_stale_wallet
                 BCHOICE=$(whiptail --title " Fidelity Bonds " \
                   --menu "\n$WALLET_INFO | Maker Bot: $MAKER_STATUS\n\nFidelity Bonds lock coins until a date to boost maker reputation.\nExpired bonds appear in wallet balance and are spendable." \
                   18 72 3 \
@@ -1605,9 +1648,7 @@ if [ "${RASPIBLITZ}" -eq 1 ]; then
                 [ $? -ne 0 ] && break
                 case $BCHOICE in
                     LIST)
-                        if [ -z "$CURRENT_WALLET" ]; then
-                            whiptail --title " Fidelity Bonds " --msgbox \
-                                "No wallet configured.\n\nSet up a wallet first (W -> SEL or NEW)." 9 60
+                        if ! ensure_active_wallet; then
                             continue
                         fi
                         BONDS_OUT_FILE=$(mktemp)
@@ -1649,8 +1690,7 @@ if [ "${RASPIBLITZ}" -eq 1 ]; then
                         fi
                         ;;
                     CREATE)
-                        if [ -z "$CURRENT_WALLET" ]; then
-                            whiptail --title " Error " --msgbox "No wallet configured.\nSet up a wallet first (W -> NEW or SEL)." 9 50
+                        if ! ensure_active_wallet; then
                             continue
                         fi
                         clear
@@ -1854,6 +1894,7 @@ if [ "${RASPIBLITZ}" -eq 1 ]; then
       # Outer loop so "Cancel" on the confirm dialog returns to this menu
       # instead of the top-level menu (#451 point 6).
       while true; do
+        check_stale_wallet
 UCHOICE=$(whiptail --title " Update JoinMarket-NG (current: ${CURRENT_LABEL}) " \
             --menu "\n$WALLET_INFO | Maker Bot: $MAKER_STATUS\n\nChoose update channel:" \
             16 70 4 \

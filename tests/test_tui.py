@@ -190,11 +190,11 @@ def test_tui_script_fidelity_bond_address_regex_matches_all_networks() -> None:
 
 
 def test_tui_script_maker_start_has_wallet_picker() -> None:
-    """Maker START must offer wallet selection before password prompts
-    when multiple wallets exist (issue #454)."""
+    """Maker START must use ensure_active_wallet for wallet selection
+    before password prompts when multiple wallets exist (issue #454, PR 2)."""
     content = SCRIPT_PATH.read_text()
-    assert "maker_prepare_wallet()" in content
-    assert "Start Maker -- Select Wallet" in content
+    # Old maker_prepare_wallet() replaced by ensure_active_wallet() (PR 2, Step 9)
+    assert "ensure_active_wallet()" in content
 
 
 def test_tui_script_post_wallet_create_warns_plaintext_storage() -> None:
@@ -534,3 +534,461 @@ def test_tui_no_second_password_prompt_when_storing_in_config() -> None:
     assert 'MNEMONIC_PASSWORD="$NEW_PWD" jm-wallet import' in imp_block
     assert "--no-prompt-password" in imp_block
     assert 'post_wallet_create "$WALLET_PATH" "$NEW_PWD"' in imp_block
+
+
+# ---------------------------------------------------------------------------
+# PR 2: Harmonize Wallet Selection - Comprehensive Test Suite
+#
+# These tests verify the refactoring that replaced 9 scattered "No wallet
+# configured" checks with centralized helpers:
+#   - check_stale_wallet(): Detects and cleans up stale config entries
+#   - ensure_active_wallet(): Unified wallet selection with auto-select
+#   - offer_maker_password_storage(): Maker-specific password storage prompt
+#
+# See: GitHub PR #XXX (Harmonize Wallet Selection)
+# ---------------------------------------------------------------------------
+
+
+def test_tui_script_has_check_stale_wallet_helper() -> None:
+    """The script must include check_stale_wallet() helper function (PR 2, Step 1).
+
+    This helper centralizes stale wallet detection that was previously
+    duplicated in the main loop and W submenu. It checks if the configured
+    mnemonic file still exists, and if not, clears both mnemonic_file and
+    mnemonic_password from config to prevent "file not found" errors."""
+    content = SCRIPT_PATH.read_text()
+
+    # Function must exist
+    assert "check_stale_wallet()" in content
+
+    # Must show warning dialog when stale config detected (so user understands
+    # why their active wallet disappeared)
+    assert "Stale Wallet Config" in content
+
+
+def test_tui_script_has_ensure_active_wallet_helper() -> None:
+    """The script must include ensure_active_wallet() helper (PR 2, Step 2).
+
+    This is the core of the harmonization - a single function that handles
+    all wallet selection logic across 9 different call sites. It replaces
+    inconsistent inline checks with unified behavior:
+    - No wallets: Show error
+    - 1 wallet: Auto-select without prompting
+    - Multiple wallets: Show picker dialog
+
+    Critical: Must warn about subshell usage since it modifies globals."""
+    content = SCRIPT_PATH.read_text()
+
+    # Core function must exist
+    assert "ensure_active_wallet()" in content
+
+    # Must include warning comment about subshell usage (modifies CURRENT_WALLET
+    # and WALLET_INFO globals, so calling from subshell loses changes)
+    assert "Do not call from subshells" in content
+
+    # Must track whether wallet was just changed to control password storage
+    # offers (only offer when wallet actually changed, not every time)
+    assert "wallet_just_changed" in content
+
+
+def test_tui_script_has_offer_maker_password_storage_helper() -> None:
+    """The script must include offer_maker_password_storage() helper (PR 2, Step 7).
+
+    Unlike other operations, Maker specifically needs stored password for
+    automatic restart after crashes. This helper provides a context-specific
+    explanation of WHY the password needs to be stored (not just "convenience"
+    but "functionality required for unattended operation")."""
+    content = SCRIPT_PATH.read_text()
+
+    # Function must exist
+    assert "offer_maker_password_storage()" in content
+
+    # Must explain the auto-restart requirement in the dialog text so user
+    # understands the functional necessity, not just convenience
+    maker_block = content.split("offer_maker_password_storage()", 1)[1]
+    assert "automatic restart" in maker_block.lower()
+
+
+def test_tui_script_no_maker_prepare_wallet() -> None:
+    """The old maker_prepare_wallet() function must be completely removed (PR 2, Step 9).
+
+    This function was replaced by the combination of ensure_active_wallet()
+    and offer_maker_password_storage(). Its logic was split: wallet selection
+    went to ensure_active_wallet(), Maker-specific password handling went to
+    offer_maker_password_storage()."""
+    content = SCRIPT_PATH.read_text()
+
+    # Old function must not exist anywhere in the script
+    assert "maker_prepare_wallet()" not in content
+
+
+def test_tui_script_ensure_active_wallet_no_password_when_already_active() -> None:
+    """CRITICAL: When wallet already active, NO password offer (PR 2).
+
+    Regression risk: If ensure_active_wallet offers password storage even when
+    wallet was already active, the user gets nagged on EVERY operation
+    (Send, Balance, History, etc.) until they either store the password
+    or say "No" every single time.
+
+    Expected behavior: If CURRENT_WALLET already valid, return immediately
+    without any password-related dialogs."""
+    content = SCRIPT_PATH.read_text()
+
+    # Extract ensure_active_wallet function body
+    ensure_block = content.split("ensure_active_wallet()", 1)[1]
+    ensure_block = ensure_block.split("offer_maker_password_storage()", 1)[0]
+
+    # Find the early return path when wallet already valid
+    early_path = ensure_block.split("Already have a valid wallet", 1)[1]
+    early_path = early_path.split("return 0", 1)[0]
+
+    # In this early return path, there must be NO password storage offer
+    assert "prompt_and_store_password" not in early_path, (
+        "Password offer should not happen when wallet already active"
+    )
+    assert "Store Password" not in early_path, (
+        "Password dialog should not appear when wallet already active"
+    )
+
+
+def test_tui_script_ensure_active_wallet_offers_password_on_change() -> None:
+    """ensure_active_wallet() must only offer password storage when wallet changed.
+
+    This is the "wallet_just_changed" mechanism: password storage is only
+    appropriate when the user just selected or auto-selected a wallet.
+    If the wallet was already active, offering again would be nagging."""
+    content = SCRIPT_PATH.read_text()
+
+    # Extract ensure_active_wallet function body
+    ensure_block = content.split("ensure_active_wallet()", 1)[1]
+    ensure_block = ensure_block.split("offer_maker_password_storage()", 1)[0]
+
+    # Password offer must be gated by wallet_just_changed flag
+    assert 'if [ "$wallet_just_changed" = "yes" ]' in ensure_block, (
+        "Password offer must be conditional on wallet_just_changed flag"
+    )
+
+    # The actual password prompt function must be called in this branch
+    assert "prompt_and_store_password" in ensure_block, (
+        "Password storage helper must be called when wallet changed"
+    )
+
+
+def test_tui_script_offer_maker_skips_if_already_stored() -> None:
+    """offer_maker_password_storage must skip if password already stored.
+
+    Prevents double-prompt scenario: If ensure_active_wallet just stored
+    the password (because wallet changed), and then Maker START immediately
+    calls offer_maker_password_storage, we must not ask again.
+
+    This is checked by looking up stored password first and returning early."""
+    content = SCRIPT_PATH.read_text()
+
+    # Extract offer_maker_password_storage function body
+    maker_block = content.split("offer_maker_password_storage()", 1)[1]
+    maker_block = maker_block.split("# Helper:", 1)[0]
+
+    # Must check if password already stored in config
+    assert "get_stored_mnemonic_password" in maker_block, (
+        "Must check existing stored password"
+    )
+
+    # Must return early (skip dialog) if already stored
+    assert 'if [ -n "$stored_pwd" ]; then' in maker_block, (
+        "Must check if stored_pwd is non-empty"
+    )
+    assert "return 0" in maker_block, "Must return early if password already stored"
+
+
+def test_tui_script_maker_start_call_order_correct() -> None:
+    """Maker START must call ensure_active_wallet BEFORE offer_maker_password_storage.
+
+    Order matters: ensure_active_wallet may change CURRENT_WALLET and
+    may offer/store password (if wallet changed). After that completes,
+    offer_maker_password_storage checks if password is still missing
+    and offers Maker-specific explanation.
+
+    If order reversed, we'd check for stored password before wallet selection
+    completes, which makes no sense."""
+    content = SCRIPT_PATH.read_text()
+
+    # Extract Maker START case block
+    start_block = content.split("START)", 1)[1].split("STOP)", 1)[0]
+
+    # Find positions of both function calls
+    ensure_pos = start_block.find("ensure_active_wallet")
+    offer_pos = start_block.find("offer_maker_password_storage")
+
+    # Both must exist
+    assert ensure_pos != -1, "ensure_active_wallet must be called in Maker START"
+    assert offer_pos != -1, "offer_maker_password_storage must be called in Maker START"
+
+    # ensure_active_wallet must come FIRST
+    assert ensure_pos < offer_pos, (
+        "Wrong call order: ensure_active_wallet must come before offer_maker_password_storage"
+    )
+
+
+# =============================================================================
+# check_stale_wallet call sites (6 submenu loops)
+# =============================================================================
+
+
+def test_tui_script_main_loop_uses_check_stale_wallet() -> None:
+    """Main menu loop must call check_stale_wallet (PR 2, Step 1).
+
+    Previously had inline stale check code. Now delegates to helper
+    for consistency and maintainability."""
+    content = SCRIPT_PATH.read_text()
+
+    # Extract main loop (from while true to case statement)
+    main_loop = content.split("while true; do", 1)[1]
+    main_loop = main_loop.split("case $CHOICE in", 1)[0]
+
+    # Must call the helper
+    assert "check_stale_wallet" in main_loop, (
+        "Main loop must refresh wallet state via check_stale_wallet"
+    )
+
+
+def test_tui_script_wallet_submenu_uses_check_stale_wallet() -> None:
+    """W submenu loop must call check_stale_wallet (PR 2, Step 1).
+
+    Previously had inline stale check. Now unified with main loop behavior."""
+    content = SCRIPT_PATH.read_text()
+
+    # Extract W submenu block
+    w_block = content.split("W)\n", 1)[1].split("M)\n", 1)[0]
+
+    # Must call the helper to keep WALLET_INFO fresh
+    assert "check_stale_wallet" in w_block, "W submenu must refresh wallet state"
+
+
+def test_tui_script_bal_submenu_uses_check_stale_wallet() -> None:
+    """BAL submenu loop must call check_stale_wallet (PR 2, Step 4).
+
+    New addition - previously had NO stale check, so WALLET_INFO could
+    be stale if user deleted wallet file while in submenu."""
+    content = SCRIPT_PATH.read_text()
+
+    # Extract BAL submenu block
+    bal_block = content.split("BAL)", 1)[1].split("HIST)", 1)[0]
+
+    # Must now call the helper (was missing before PR 2)
+    assert "check_stale_wallet" in bal_block, "BAL submenu must refresh wallet state"
+
+
+def test_tui_script_maker_submenu_uses_check_stale_wallet() -> None:
+    """Maker submenu loop must call check_stale_wallet (PR 2, Step 8).
+
+    New addition - previously had NO stale check."""
+    content = SCRIPT_PATH.read_text()
+
+    # Extract Maker submenu block
+    maker_block = content.split("M)\n", 1)[1].split("C)\n", 1)[0]
+
+    # Must now call the helper
+    assert "check_stale_wallet" in maker_block, (
+        "Maker submenu must refresh wallet state"
+    )
+
+
+def test_tui_script_bonds_submenu_uses_check_stale_wallet() -> None:
+    """Bonds submenu loop must call check_stale_wallet (PR 2, Step 8).
+
+    New addition - previously had NO stale check."""
+    content = SCRIPT_PATH.read_text()
+
+    # Extract Bonds submenu block
+    bonds_block = content.split("BONDS)", 1)[1].split("LOG)", 1)[0]
+
+    # Must now call the helper
+    assert "check_stale_wallet" in bonds_block, (
+        "Bonds submenu must refresh wallet state"
+    )
+
+
+def test_tui_script_update_submenu_uses_check_stale_wallet() -> None:
+    """Update submenu loop must call check_stale_wallet (PR 2, Step 8).
+
+    New addition - previously had NO stale check."""
+    content = SCRIPT_PATH.read_text()
+
+    # Extract Update submenu block
+    update_block = content.split("U)\n", 1)[1].split("I)\n", 1)[0]
+
+    # Must now call the helper
+    assert "check_stale_wallet" in update_block, (
+        "Update submenu must refresh wallet state"
+    )
+
+
+# =============================================================================
+# ensure_active_wallet call sites (9 former "No wallet configured" locations)
+# =============================================================================
+
+
+def test_tui_script_send_uses_ensure_active_wallet() -> None:
+    """S (Send) must use ensure_active_wallet (PR 2, Step 3).
+
+    Replaces inline 'No wallet configured' check with unified helper.
+    Old behavior: 3 different error messages, inconsistent actions.
+    New behavior: Single error message, consistent auto-select/picker logic."""
+    content = SCRIPT_PATH.read_text()
+
+    # Extract Send case block
+    s_block = content.split("S)\n", 1)[1].split("W)\n", 1)[0]
+
+    # Must use unified helper
+    assert "ensure_active_wallet" in s_block, "Send must use unified wallet check"
+
+    # Old inline error message must be GONE (replaced by unified message)
+    assert "Set up a wallet first (W -> NEW or SEL)" not in s_block, (
+        "Old inline error message must be removed"
+    )
+
+
+def test_tui_script_bal_uses_ensure_active_wallet() -> None:
+    """BAL must use ensure_active_wallet (PR 2, Step 4).
+
+    Replaces inline 'No wallet configured' check."""
+    content = SCRIPT_PATH.read_text()
+
+    # Extract BAL case block
+    bal_block = content.split("BAL)", 1)[1].split("HIST)", 1)[0]
+
+    # Must use unified helper
+    assert "ensure_active_wallet" in bal_block, "BAL must use unified wallet check"
+
+
+def test_tui_script_hist_uses_ensure_active_wallet() -> None:
+    """HIST must use ensure_active_wallet (PR 2, Step 5).
+
+    Replaces inline 'No wallet configured' check."""
+    content = SCRIPT_PATH.read_text()
+
+    # Extract HIST case block
+    hist_block = content.split("HIST)", 1)[1].split("FREEZE)", 1)[0]
+
+    # Must use unified helper
+    assert "ensure_active_wallet" in hist_block, "HIST must use unified wallet check"
+
+
+def test_tui_script_freeze_uses_ensure_active_wallet() -> None:
+    """FREEZE must use ensure_active_wallet (PR 2, Step 5).
+
+    Replaces inline 'No wallet configured' check."""
+    content = SCRIPT_PATH.read_text()
+
+    # Extract FREEZE case block
+    freeze_block = content.split("FREEZE)", 1)[1].split("NEW)", 1)[0]
+
+    # Must use unified helper
+    assert "ensure_active_wallet" in freeze_block, (
+        "FREEZE must use unified wallet check"
+    )
+
+
+def test_tui_script_seed_uses_ensure_active_wallet() -> None:
+    """SEED must use ensure_active_wallet (PR 2, Step 5).
+
+    Replaces inline 'No wallet configured' check."""
+    content = SCRIPT_PATH.read_text()
+
+    # Extract SEED case block
+    seed_block = content.split("SEED)", 1)[1].split("BACK)", 1)[0]
+
+    # Must use unified helper
+    assert "ensure_active_wallet" in seed_block, "SEED must use unified wallet check"
+
+
+def test_tui_script_bonds_list_uses_ensure_active_wallet() -> None:
+    """BONDS LIST must use ensure_active_wallet (PR 2, Step 6).
+
+    Replaces inline 'No wallet configured' check."""
+    content = SCRIPT_PATH.read_text()
+
+    # Extract LIST case block
+    list_block = content.split("LIST)", 1)[1].split("CREATE)", 1)[0]
+
+    # Must use unified helper
+    assert "ensure_active_wallet" in list_block, (
+        "BONDS LIST must use unified wallet check"
+    )
+
+
+def test_tui_script_bonds_create_uses_ensure_active_wallet() -> None:
+    """BONDS CREATE must use ensure_active_wallet (PR 2, Step 6).
+
+    Replaces inline 'No wallet configured' check."""
+    content = SCRIPT_PATH.read_text()
+
+    # Extract CREATE case block
+    create_block = content.split("CREATE)", 1)[1].split("BACK)", 1)[0]
+
+    # Must use unified helper
+    assert "ensure_active_wallet" in create_block, (
+        "BONDS CREATE must use unified wallet check"
+    )
+
+
+def test_tui_script_maker_start_uses_both_helpers() -> None:
+    """Maker START must use ensure_active_wallet + offer_maker_password_storage (PR 2, Step 7).
+
+    Two-step process:
+    1. ensure_active_wallet: Select/active wallet, offer password if just changed
+    2. offer_maker_password_storage: Maker-specific password offer with explanation
+
+    This replaces the old maker_prepare_wallet() monolithic function."""
+    content = SCRIPT_PATH.read_text()
+
+    # Extract START case block
+    start_block = content.split("START)", 1)[1].split("STOP)", 1)[0]
+
+    # Must call both helpers in correct order
+    assert "ensure_active_wallet" in start_block, (
+        "Maker START must use ensure_active_wallet"
+    )
+    assert "offer_maker_password_storage" in start_block, (
+        "Maker START must use offer_maker_password_storage"
+    )
+
+
+def test_tui_script_maker_restart_uses_both_helpers() -> None:
+    """Maker RESTART must use ensure_active_wallet + offer_maker_password_storage (PR 2, Step 7).
+
+    Same two-step process as START."""
+    content = SCRIPT_PATH.read_text()
+
+    # Extract RESTART case block
+    restart_block = content.split("RESTART)", 1)[1].split("BONDS)", 1)[0]
+
+    # Must call both helpers
+    assert "ensure_active_wallet" in restart_block, (
+        "Maker RESTART must use ensure_active_wallet"
+    )
+    assert "offer_maker_password_storage" in restart_block, (
+        "Maker RESTART must use offer_maker_password_storage"
+    )
+
+
+def test_tui_script_unified_error_message() -> None:
+    """All "No wallet" errors must use unified message (PR 2).
+
+    Previously 3 different messages:
+    - "W → NEW or SEL"
+    - "Select Active Wallet or Create New Wallet first"
+    - "W → SEL or NEW"
+
+    Now all use: "Create or import a wallet first (W → NEW or IMP)"""
+    content = SCRIPT_PATH.read_text()
+
+    # Extract ensure_active_wallet function body
+    ensure_block = content.split("ensure_active_wallet()", 1)[1]
+    ensure_block = ensure_block.split("offer_maker_password_storage()", 1)[0]
+
+    # Must use unified error message
+    assert "Create or import a wallet first" in ensure_block, (
+        "Must use unified error message part 1"
+    )
+    assert "NEW or IMP" in ensure_block, "Must use unified error message part 2"
