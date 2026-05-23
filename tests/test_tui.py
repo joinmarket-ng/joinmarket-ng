@@ -992,3 +992,167 @@ def test_tui_script_unified_error_message() -> None:
         "Must use unified error message part 1"
     )
     assert "NEW or IMP" in ensure_block, "Must use unified error message part 2"
+
+
+# ---------------------------------------------------------------------------
+# Bug fixes (SEND password handling, SEED "Aborted." handling)
+# ---------------------------------------------------------------------------
+
+
+def test_tui_script_send_ensure_wallet_password_before_clear() -> None:
+    """SEND must call ensure_wallet_password before clear and before
+    jm-wallet/jm-taker execution.
+
+    Bug fix: Previously ensure_wallet_password was inside the subshell,
+    causing terminal/whiptail issues. Now it must be called before clear
+    so the user is prompted via whiptail before any screen clearing."""
+    content = SCRIPT_PATH.read_text()
+
+    # Extract SEND case block
+    s_block = content.split("S)\n", 1)[1].split("W)\n", 1)[0]
+
+    # Find positions of key elements
+    ensure_pos = s_block.find("ensure_wallet_password")
+    clear_pos = s_block.find("clear")
+    wallet_pos = s_block.find("jm-wallet send")
+    taker_pos = s_block.find("jm-taker")
+
+    # ensure_wallet_password must exist
+    assert ensure_pos != -1, "ensure_wallet_password must be called in SEND"
+
+    # ensure_wallet_password must come BEFORE clear
+    assert ensure_pos < clear_pos, "ensure_wallet_password must be called before clear"
+
+    # ensure_wallet_password must come BEFORE jm-wallet and jm-taker
+    assert ensure_pos < wallet_pos, (
+        "ensure_wallet_password must be called before jm-wallet send"
+    )
+    assert ensure_pos < taker_pos, (
+        "ensure_wallet_password must be called before jm-taker coinjoin"
+    )
+
+    # Must have error handling: continue between ensure_wallet_password and clear
+    between_pwd_and_clear = s_block[ensure_pos:clear_pos]
+    assert "continue" in between_pwd_and_clear, (
+        "ensure_wallet_password failure must trigger continue before clear"
+    )
+
+
+def test_tui_script_send_aborts_when_password_cancelled() -> None:
+    """When ensure_wallet_password fails, SEND must not execute any commands.
+
+    Bug fix regression test: If user cancels password prompt, the send
+    operation must abort entirely without calling jm-wallet or jm-taker."""
+    content = SCRIPT_PATH.read_text()
+
+    # Extract SEND case block
+    s_block = content.split("S)\n", 1)[1].split("W)\n", 1)[0]
+
+    # Must have early exit pattern when password fails
+    # The code uses: if ! ensure_wallet_password ...; then continue; fi
+    pwd_section = s_block.split("ensure_wallet_password", 1)[1]
+    assert "continue" in pwd_section.split("clear")[0], (
+        "Must abort SEND when password prompt cancelled"
+    )
+
+    # Verify jm-wallet/jm-taker calls are AFTER the password check
+    # (in the subshell, after clear)
+    subshell_section = s_block.split("(", 1)[1]
+    assert "jm-wallet" in subshell_section or "jm-taker" in subshell_section, (
+        "Send commands must be in subshell after password check"
+    )
+
+
+def test_tui_script_seed_checks_exit_code_after_showseed() -> None:
+    """SEED must check exit code after jm-wallet showseed.
+
+    Bug fix: Previously showed 'Press [Enter] to continue' even when
+    user aborted at CLI prompt (resulting in 'Aborted.' message).
+    Now must skip pause when exit code is non-zero."""
+    content = SCRIPT_PATH.read_text()
+
+    # Extract SEED case block
+    seed_block = content.split("SEED)", 1)[1].split("BACK)", 1)[0]
+
+    # Must capture exit code
+    assert "SEED_EXIT=$?" in seed_block, "Must capture showseed exit code in SEED_EXIT"
+
+    # Must check non-zero exit code
+    assert '[ "$SEED_EXIT" -ne 0 ]' in seed_block, (
+        "Must check SEED_EXIT -ne 0 for abort case"
+    )
+
+    # On non-zero: must clear and continue (skip pause)
+    abort_section = seed_block.split('[ "$SEED_EXIT" -ne 0 ]', 1)[1]
+    assert "clear" in abort_section, "Must clear screen when showseed aborted"
+    assert "continue" in abort_section, (
+        "Must continue (skip pause) when showseed aborted"
+    )
+
+
+def test_tui_script_seed_shows_pause_only_on_success() -> None:
+    """SEED must only show 'Press [Enter]' when showseed succeeds.
+
+    The pause prompt must come AFTER the exit code check and only
+    in the success path (implicitly, not in the abort branch)."""
+    content = SCRIPT_PATH.read_text()
+
+    # Extract SEED case block
+    seed_block = content.split("SEED)", 1)[1].split("BACK)", 1)[0]
+
+    # Find the exit code check
+    exit_check_pos = seed_block.find('[ "$SEED_EXIT" -ne 0 ]')
+
+    # Find the pause prompt
+    pause_pos = seed_block.find("Press [Enter] to continue")
+
+    # Both must exist
+    assert exit_check_pos != -1, "Exit code check must exist"
+    assert pause_pos != -1, "Pause prompt must exist"
+
+    # Pause must come AFTER exit code check
+    assert exit_check_pos < pause_pos, "Pause prompt must come after exit code check"
+
+    # The pause must be in the success path (after the abort branch ends)
+    # We verify this by checking the abort branch ends before pause
+    abort_branch = seed_block[exit_check_pos:pause_pos]
+    assert "continue" in abort_branch, (
+        "Abort branch must end with continue before pause prompt"
+    )
+
+
+def test_tui_script_seed_no_unnecessary_pause_after_abort() -> None:
+    """SEED must not show pause prompt when user aborts.
+
+    Regression test: Previously the code always reached the
+    'Press [Enter] to continue' line even after 'Aborted.' output.
+    Now the abort path must skip this with 'continue'."""
+    content = SCRIPT_PATH.read_text()
+
+    # Extract SEED case block and analyze structure
+    seed_block = content.split("SEED)", 1)[1].split("BACK)", 1)[0]
+
+    # The pattern should be:
+    #   jm-wallet showseed ...
+    #   SEED_EXIT=$?
+    #   if [ "$SEED_EXIT" -ne 0 ]; then
+    #       clear
+    #       continue  <-- This is the fix
+    #   fi
+    #   ... pause prompt here (only reachable on success)
+
+    lines = seed_block.split("\n")
+    in_abort_check = False
+    found_continue_in_abort = False
+
+    for line in lines:
+        if '[ "$SEED_EXIT" -ne 0 ]' in line:
+            in_abort_check = True
+        elif in_abort_check and line.strip().startswith("fi"):
+            in_abort_check = False
+        elif in_abort_check and "continue" in line:
+            found_continue_in_abort = True
+
+    assert found_continue_in_abort, (
+        "Abort branch must have 'continue' to skip pause prompt"
+    )
