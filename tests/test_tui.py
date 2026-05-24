@@ -1040,7 +1040,9 @@ def test_tui_script_seed_uses_subshell_for_password() -> None:
     seed_block = content.split("SEED)", 1)[1].split("BACK)", 1)[0]
 
     # Find the subshell opening parenthesis
-    subshell_open = seed_block.rfind("(\n", 0, seed_block.find("ensure_wallet_password"))
+    subshell_open = seed_block.rfind(
+        "(\n", 0, seed_block.find("ensure_wallet_password")
+    )
 
     # Find ensure_wallet_password position
     ensure_pos = seed_block.find("ensure_wallet_password")
@@ -1059,7 +1061,7 @@ def test_tui_script_send_password_after_clear_in_subshell() -> None:
     """SEND must clear screen first, then run password check in subshell.
 
     Updated test: Previously checked that ensure_wallet_password was called
-    BEFORE clear (outside subshell). Now checks correct order: clear first, 
+    BEFORE clear (outside subshell). Now checks correct order: clear first,
     then subshell containing ensure_wallet_password."""
     content = SCRIPT_PATH.read_text()
     s_block = content.split("S)\n", 1)[1].split("W)\n", 1)[0]
@@ -1069,7 +1071,7 @@ def test_tui_script_send_password_after_clear_in_subshell() -> None:
     ensure_pos = s_block.find("ensure_wallet_password")
 
     assert clear_pos != -1, "clear must exist"
-    assert subshell_pos != -1, "subshell must exist"  
+    assert subshell_pos != -1, "subshell must exist"
     assert ensure_pos != -1, "ensure_wallet_password must exist"
 
     # Order: clear -> subshell -> ensure_wallet_password
@@ -1091,7 +1093,7 @@ def test_tui_script_send_aborts_with_exit_in_subshell() -> None:
     subshell_start = s_block.find("(\n")
     subshell_end = s_block.find(")\n", subshell_start)
     assert subshell_start != -1, "subshell must exist"
-    
+
     subshell_content = s_block[subshell_start:subshell_end]
 
     # Inside subshell: ensure_wallet_password || exit 1
@@ -1131,7 +1133,7 @@ def test_tui_script_seed_pause_inside_subshell() -> None:
     subshell_start = seed_block.find("(\n")
     subshell_end = seed_block.find(")\n", subshell_start)
     assert subshell_start != -1, "subshell must exist"
-    
+
     subshell_content = seed_block[subshell_start:subshell_end]
     after_subshell = seed_block[subshell_end:]
 
