@@ -196,6 +196,24 @@ class DescriptorWalletBackend(BlockchainBackend):
         error_str = str(error).lower()
         return "already loading" in error_str or "wallet is already being loaded" in error_str
 
+    @staticmethod
+    def _is_wallet_disabled_error(error: ValueError | Exception) -> bool:
+        """Detect ``RPC error -32601: Method not found`` on a wallet RPC.
+
+        Bitcoin Core only registers the wallet RPC namespace (``listwallets``,
+        ``loadwallet``, ``createwallet``, ``getaddressinfo``, ...) when wallet
+        support is enabled. If the node is started with ``-disablewallet=1`` or
+        was built without wallet support, every wallet RPC responds with
+        ``-32601 Method not found``. ``bitcoin-cli listwallets`` exhibits the
+        same symptom from outside JoinMarket.
+
+        JoinMarket-NG's descriptor wallet backend cannot operate against such
+        a node, so we detect this case to surface a clear, actionable error
+        instead of a cryptic generic JSON-RPC failure.
+        """
+        error_str = str(error).lower()
+        return "-32601" in error_str or "method not found" in error_str
+
     async def _ensure_wallet_loaded(self) -> bool:
         """
         Ensure the wallet is loaded in Bitcoin Core.
@@ -506,7 +524,21 @@ class DescriptorWalletBackend(BlockchainBackend):
 
         try:
             # First check if wallet already exists
-            wallets = await self._rpc_call("listwallets", use_wallet=False)
+            try:
+                wallets = await self._rpc_call("listwallets", use_wallet=False)
+            except ValueError as e:
+                if self._is_wallet_disabled_error(e):
+                    raise ValueError(
+                        "Bitcoin Core rejected 'listwallets' with "
+                        "'-32601 Method not found'. The node has wallet support "
+                        "disabled (started with '-disablewallet=1' or built "
+                        "without wallet support). JoinMarket-NG needs a Bitcoin "
+                        "Core build with wallet support enabled and the wallet "
+                        "subsystem active. Remove '-disablewallet' (or "
+                        "'disablewallet=1' from bitcoin.conf), restart "
+                        "bitcoind, and verify with 'bitcoin-cli listwallets'."
+                    ) from e
+                raise
             if self.wallet_name in wallets:
                 logger.info(f"Wallet '{self.wallet_name}' already loaded")
                 self._wallet_loaded = True

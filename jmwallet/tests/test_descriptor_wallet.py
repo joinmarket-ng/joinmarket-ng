@@ -231,6 +231,56 @@ class TestDescriptorWalletBackendUnit:
         with pytest.raises(ValueError, match="still loading"):
             await backend.create_wallet()
 
+    # ------------------------------------------------------------------
+    # Regression tests for wallet-subsystem-disabled detection.
+    #
+    # If bitcoind runs with '-disablewallet=1' (or is built without wallet
+    # support), every wallet RPC returns '-32601 Method not found'. The
+    # backend must translate that into a clear, actionable error rather
+    # than leaking the raw JSON-RPC code to the user (which previously
+    # surfaced as 'RPC error -32601: Method not found' deep in a Rich
+    # traceback during 'jm-wallet info').
+    # ------------------------------------------------------------------
+
+    def test_is_wallet_disabled_error_detects_method_not_found(self):
+        """Helper must recognize -32601 'Method not found' from Bitcoin Core."""
+        assert DescriptorWalletBackend._is_wallet_disabled_error(
+            ValueError("RPC error -32601: Method not found")
+        )
+        # Case-insensitive phrasing variants.
+        assert DescriptorWalletBackend._is_wallet_disabled_error(
+            ValueError("rpc error: method not found")
+        )
+        # Unrelated errors must not match.
+        assert not DescriptorWalletBackend._is_wallet_disabled_error(
+            ValueError("RPC error -18: Wallet not found")
+        )
+        assert not DescriptorWalletBackend._is_wallet_disabled_error(
+            ValueError("RPC error -4: Wallet already loading.")
+        )
+
+    @pytest.mark.asyncio
+    async def test_create_wallet_raises_clear_error_when_wallet_subsystem_disabled(self):
+        """When 'listwallets' returns -32601, create_wallet must raise a
+        ValueError that names the wallet subsystem / '-disablewallet' as the
+        root cause, instead of propagating the raw 'Method not found' string.
+        """
+        backend = DescriptorWalletBackend(wallet_name="any_wallet")
+
+        async def mock_rpc(method, params=None, client=None, use_wallet=True):
+            if method == "listwallets":
+                raise ValueError("RPC error -32601: Method not found")
+            raise AssertionError(
+                f"create_wallet must not attempt '{method}' after listwallets fails with -32601"
+            )
+
+        backend._rpc_call = mock_rpc
+
+        with pytest.raises(ValueError, match="disablewallet"):
+            await backend.create_wallet()
+        # Backend must NOT mark itself as loaded after this failure.
+        assert backend._wallet_loaded is False
+
     @pytest.mark.asyncio
     async def test_import_descriptors(self, mock_backend: DescriptorWalletBackend):
         """Test importing descriptors into wallet."""

@@ -243,6 +243,12 @@ newgrp debian-tor
 - build dependency errors on Linux: install `build-essential libffi-dev libsodium-dev pkg-config`
 - Python venv issues: install `python3-venv`
 - RPC failures: verify Bitcoin Core is reachable and credentials in `config.toml` are correct
+- `RPC error -32601: Method not found` on `listwallets` (or any wallet
+  RPC): your Bitcoin Core node has wallet support disabled. Make sure
+  `bitcoind` is started without `-disablewallet=1` and that `disablewallet=1`
+  is not set in `bitcoin.conf` (the descriptor wallet backend cannot work
+  against a wallet-disabled node). Confirm with `bitcoin-cli listwallets`
+  returning a JSON array.
 
 ### Tracking Wallet Sync Progress
 
