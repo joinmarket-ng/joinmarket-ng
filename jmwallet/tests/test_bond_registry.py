@@ -695,3 +695,179 @@ class TestLocktimeFunctions:
         # Should only return the locktime of the active bond
         assert len(locktimes) == 1
         assert now + 86400 * 365 in locktimes
+
+
+class TestPerWalletPartitioning:
+    """Tests for per-wallet registry scoping (issue #492)."""
+
+    @staticmethod
+    def _make_bond(address: str, *, locktime: int | None = None) -> FidelityBondInfo:
+        return FidelityBondInfo(
+            address=address,
+            locktime=locktime or (int(time.time()) + 86400 * 365),
+            locktime_human="2026-01-01 00:00:00",
+            index=0,
+            path="m/84'/0'/0'/2/0",
+            pubkey="02" + "00" * 32,
+            witness_script_hex="00" * 50,
+            network="mainnet",
+            created_at="2025-01-01T00:00:00",
+        )
+
+    def test_registry_path_partitions_by_fingerprint(self, tmp_path: Path) -> None:
+        legacy = get_registry_path(tmp_path)
+        wallet_a = get_registry_path(tmp_path, "deadbeef")
+        wallet_b = get_registry_path(tmp_path, "cafebabe")
+        assert legacy.name == "fidelity_bonds.json"
+        assert wallet_a.name == "fidelity_bonds_deadbeef.json"
+        assert wallet_b.name == "fidelity_bonds_cafebabe.json"
+        assert wallet_a != wallet_b != legacy
+
+    def test_save_and_load_isolated_per_wallet(self, tmp_path: Path) -> None:
+        reg_a = BondRegistry()
+        reg_a.add_bond(self._make_bond("bc1qwalleta"))
+        reg_b = BondRegistry()
+        reg_b.add_bond(self._make_bond("bc1qwalletb1"))
+        reg_b.add_bond(self._make_bond("bc1qwalletb2"))
+
+        save_registry(reg_a, tmp_path, "deadbeef")
+        save_registry(reg_b, tmp_path, "cafebabe")
+
+        # Each wallet sees only its own bonds; no cross-talk.
+        loaded_a = load_registry(tmp_path, "deadbeef")
+        loaded_b = load_registry(tmp_path, "cafebabe")
+        assert [b.address for b in loaded_a.bonds] == ["bc1qwalleta"]
+        assert {b.address for b in loaded_b.bonds} == {"bc1qwalletb1", "bc1qwalletb2"}
+
+    def test_load_falls_back_to_legacy_when_per_wallet_missing(self, tmp_path: Path) -> None:
+        # Pre-existing shared file from an older install.
+        legacy_registry = BondRegistry()
+        legacy_registry.add_bond(self._make_bond("bc1qlegacy"))
+        save_registry(legacy_registry, tmp_path)  # writes shared fidelity_bonds.json
+
+        # No per-wallet file yet -> reading by fingerprint must surface
+        # the legacy bonds so an upgraded user still sees their bonds.
+        loaded = load_registry(tmp_path, "deadbeef")
+        assert [b.address for b in loaded.bonds] == ["bc1qlegacy"]
+
+    def test_invalid_fingerprint_falls_back_to_legacy_path(self, tmp_path: Path) -> None:
+        # Non-hex strings must not be embedded in the filename; they
+        # silently fall back to the legacy shared path to avoid creating
+        # arbitrary attacker-controlled file names.
+        assert get_registry_path(tmp_path, "not-hex!") == get_registry_path(tmp_path)
+        assert get_registry_path(tmp_path, "") == get_registry_path(tmp_path)
+
+
+class TestLegacyRegistryMigration:
+    """Tests for migrate_legacy_registry (issue #492)."""
+
+    @staticmethod
+    def _bond(address: str) -> FidelityBondInfo:
+        return FidelityBondInfo(
+            address=address,
+            locktime=int(time.time()) + 86400 * 365,
+            locktime_human="2026-01-01 00:00:00",
+            index=0,
+            path="m/84'/0'/0'/2/0",
+            pubkey="02" + "00" * 32,
+            witness_script_hex="00" * 50,
+            network="mainnet",
+            created_at="2025-01-01T00:00:00",
+        )
+
+    def test_no_op_when_legacy_missing(self, tmp_path: Path) -> None:
+        from jmwallet.wallet.bond_registry import migrate_legacy_registry
+
+        claimed = migrate_legacy_registry(tmp_path, "deadbeef", lambda _b: True)
+        assert claimed == 0
+        assert not get_registry_path(tmp_path, "deadbeef").exists()
+
+    def test_no_op_when_per_wallet_already_exists(self, tmp_path: Path) -> None:
+        from jmwallet.wallet.bond_registry import migrate_legacy_registry
+
+        # Pre-existing per-wallet file -> migration must not touch it.
+        existing = BondRegistry()
+        existing.add_bond(self._bond("bc1qkeep"))
+        save_registry(existing, tmp_path, "deadbeef")
+
+        # Even with a legacy file present, migration is skipped.
+        legacy = BondRegistry()
+        legacy.add_bond(self._bond("bc1qshouldnotmove"))
+        save_registry(legacy, tmp_path)
+
+        claimed = migrate_legacy_registry(tmp_path, "deadbeef", lambda _b: True)
+        assert claimed == 0
+        # Per-wallet file unchanged.
+        loaded = load_registry(tmp_path, "deadbeef")
+        assert [b.address for b in loaded.bonds] == ["bc1qkeep"]
+        # Legacy file still present.
+        assert get_registry_path(tmp_path).exists()
+
+    def test_partial_claim_leaves_remainder_in_legacy(self, tmp_path: Path) -> None:
+        from jmwallet.wallet.bond_registry import migrate_legacy_registry
+
+        legacy = BondRegistry()
+        legacy.add_bond(self._bond("bc1qmine1"))
+        legacy.add_bond(self._bond("bc1qmine2"))
+        legacy.add_bond(self._bond("bc1qother"))
+        save_registry(legacy, tmp_path)
+
+        mine = {"bc1qmine1", "bc1qmine2"}
+        claimed = migrate_legacy_registry(tmp_path, "deadbeef", lambda b: b.address in mine)
+        assert claimed == 2
+
+        per_wallet = load_registry(tmp_path, "deadbeef")
+        assert {b.address for b in per_wallet.bonds} == mine
+
+        # Remaining bond stays in the legacy file so another wallet can
+        # claim it on its next open.
+        legacy_remaining = load_registry(tmp_path)
+        assert [b.address for b in legacy_remaining.bonds] == ["bc1qother"]
+
+    def test_full_claim_deletes_legacy_file(self, tmp_path: Path) -> None:
+        from jmwallet.wallet.bond_registry import (
+            get_legacy_registry_path,
+            migrate_legacy_registry,
+        )
+
+        legacy = BondRegistry()
+        legacy.add_bond(self._bond("bc1qall1"))
+        legacy.add_bond(self._bond("bc1qall2"))
+        save_registry(legacy, tmp_path)
+
+        claimed = migrate_legacy_registry(tmp_path, "deadbeef", lambda _b: True)
+        assert claimed == 2
+        # Legacy file removed once empty.
+        assert not get_legacy_registry_path(tmp_path).exists()
+
+    def test_migration_is_idempotent(self, tmp_path: Path) -> None:
+        from jmwallet.wallet.bond_registry import migrate_legacy_registry
+
+        legacy = BondRegistry()
+        legacy.add_bond(self._bond("bc1qmine"))
+        save_registry(legacy, tmp_path)
+
+        first = migrate_legacy_registry(tmp_path, "deadbeef", lambda _b: True)
+        second = migrate_legacy_registry(tmp_path, "deadbeef", lambda _b: True)
+        assert first == 1
+        assert second == 0
+        assert [b.address for b in load_registry(tmp_path, "deadbeef").bonds] == ["bc1qmine"]
+
+    def test_predicate_exception_leaves_bond_in_legacy(self, tmp_path: Path) -> None:
+        from jmwallet.wallet.bond_registry import migrate_legacy_registry
+
+        legacy = BondRegistry()
+        legacy.add_bond(self._bond("bc1qok"))
+        legacy.add_bond(self._bond("bc1qboom"))
+        save_registry(legacy, tmp_path)
+
+        def predicate(bond: FidelityBondInfo) -> bool:
+            if bond.address == "bc1qboom":
+                raise RuntimeError("derivation failed")
+            return True
+
+        claimed = migrate_legacy_registry(tmp_path, "deadbeef", predicate)
+        assert claimed == 1
+        # The bond that raised stays in the legacy file untouched.
+        legacy_after = load_registry(tmp_path)
+        assert [b.address for b in legacy_after.bonds] == ["bc1qboom"]

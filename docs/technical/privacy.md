@@ -97,7 +97,19 @@ jm-wallet generate-bond-address \
   --index 0
 ```
 
-**Bond Registry (`fidelity_bonds.json`):**
+**Bond Registry (`fidelity_bonds_<fingerprint>.json`):**
+
+Scoped per wallet to avoid mixing bonds across wallets that share a data
+directory (issue #492). The `<fingerprint>` is the 8-char hex master-key
+fingerprint shown by `jm-wallet info`. Legacy `fidelity_bonds.json` files from
+older installs are migrated on first wallet open: entries whose pubkey can be
+re-derived from the open wallet are moved into the per-wallet file; the rest
+are left for their owning wallets to claim. Cold-wallet (external pubkey) bonds
+are not derivable, so the cold-wallet commands take an explicit
+`--wallet-fingerprint` to select the target registry. Look the value up by
+running `jm-wallet info --mnemonic-file <wallet>` on the hot JoinMarket wallet
+that will operate the bond; the 8-char hex value is printed on the
+`Wallet fingerprint:` line near the top of the output.
 
 Stores bond metadata including:
 - Address, locktime, derivation path
@@ -168,20 +180,23 @@ For maximum security, keep the bond UTXO private key on a hardware wallet. The b
 2. **Create bond address** (on online machine -- NO private keys needed):
    ```bash
    jm-wallet create-bond-address "<pubkey_from_step_1>" \
-     --locktime-date "2026-01"
+     --locktime-date "2026-01" \
+     --wallet-fingerprint <fp_from_jm_wallet_info>
    ```
-   This saves the bond to the registry automatically. The output shows both the bond P2WSH address (for funding) and the P2WPKH "Signing Address" (used later in Sparrow for message signing). Fund the bond P2WSH address with Bitcoin.
+   This saves the bond to the per-wallet registry (`fidelity_bonds_<fp>.json`). Look up `<fp>` with `jm-wallet info --mnemonic-file <wallet>`; it must match the hot wallet that will later advertise the bond. The output shows both the bond P2WSH address (for funding) and the P2WPKH "Signing Address" (used later in Sparrow for message signing). Fund the bond P2WSH address with Bitcoin.
 
 3. **Generate hot wallet keypair** (on online machine):
    ```bash
-   jm-wallet generate-hot-keypair --bond-address <bond_address>
+   jm-wallet generate-hot-keypair --bond-address <bond_address> \
+     --wallet-fingerprint <fp_from_step_2>
    ```
    This creates a random keypair and saves it to the bond registry automatically. The keypair will be loaded automatically in subsequent steps.
 
 4. **Prepare certificate message** (on online machine):
    ```bash
    jm-wallet prepare-certificate-message <bond_address> \
-     --validity-periods 52  # ~2 years
+     --validity-periods 52 \
+     --wallet-fingerprint <fp_from_step_2>  # ~2 years
    ```
    This fetches the current block height and outputs the message to sign. **Important**: Note the `Cert Expiry: period XXX` value shown -- you will need this exact number in step 6.
 
@@ -210,7 +225,8 @@ For maximum security, keep the bond UTXO private key on a hardware wallet. The b
    ```bash
    jm-wallet import-certificate <bond_address> \
      --cert-signature '<base64_signature_from_sparrow>' \
-     --cert-expiry 514   # <-- USE THE PERIOD NUMBER FROM STEP 4!
+     --cert-expiry 514 \
+     --wallet-fingerprint <fp_from_step_2>   # <-- USE THE PERIOD NUMBER FROM STEP 4!
    ```
    **Critical**: The `--cert-expiry` value MUST match the period number shown in step 4. This is an ABSOLUTE period number, not a relative duration. Using the wrong value will cause the certificate to be rejected as expired.
 
@@ -223,6 +239,7 @@ For maximum security, keep the bond UTXO private key on a hardware wallet. The b
      --test-unfunded \
      --master-fingerprint <fingerprint_from_step_1> \
      --derivation-path "<path_from_step_1>" \
+     --wallet-fingerprint <fp_from_step_2> \
      --output unsigned-bond-test.psbt
    ```
    Then verify you can sign it:
@@ -275,10 +292,11 @@ After locktime expires, generate a PSBT for external signing:
 jm-wallet spend-bond <bond_address> <destination_address> \
   --fee-rate 1.0 \
   --master-fingerprint <4_byte_hex> \
-  --derivation-path "m/84'/0'/0'/0/0"
+  --derivation-path "m/84'/0'/0'/0/0" \
+  --wallet-fingerprint <fp_from_jm_wallet_info>
 ```
 
-The `--derivation-path` should match the address whose public key was used in `create-bond-address` (in Sparrow: double-click the address or click the receive arrow to see the path). The `--master-fingerprint` is found in Sparrow under Settings -> Keystores. Both are embedded as BIP32 key origin info in the PSBT, which helps signing tools derive the correct key.
+The `--derivation-path` should match the address whose public key was used in `create-bond-address` (in Sparrow: double-click the address or click the receive arrow to see the path). The `--master-fingerprint` is found in Sparrow under Settings -> Keystores. Both are embedded as BIP32 key origin info in the PSBT, which helps signing tools derive the correct key. The `--wallet-fingerprint` selects which per-wallet registry (`fidelity_bonds_<fp>.json`) to read the bond from.
 
 Use `--output psbt.txt` to save the PSBT to a file for transfer to a signing tool.
 
@@ -317,6 +335,7 @@ jm-wallet spend-bond <bond_address> <destination_address> \
   --fee-rate 1.0 \
   --master-fingerprint <4_byte_hex> \
   --derivation-path "m/84'/0'/0'/0/0" \
+  --wallet-fingerprint <fp_from_jm_wallet_info> \
   --output unsigned-bond.psbt
 ```
 
@@ -411,7 +430,8 @@ The reference implementation uses derivation path `m/84'/0'/0'/2/<timenumber>` f
 
 3. **Create the bond address in joinmarket-ng** using the derived pubkey:
    ```bash
-   jm-wallet create-bond-address <pubkey_hex> --locktime-date YYYY-MM
+   jm-wallet create-bond-address <pubkey_hex> --locktime-date YYYY-MM \
+     --wallet-fingerprint <fp_from_jm_wallet_info>
    ```
    Use the exact command printed by `derive_bond_pubkey.py`. Verify the generated address matches the bond address shown in the reference wallet.
 
@@ -432,7 +452,8 @@ The reference implementation uses derivation path `m/84'/0'/0'/2/<timenumber>` f
    ```bash
    jm-wallet import-certificate <bond_address> \
      --cert-signature '<base64_signature>' \
-     --cert-expiry <period_number>
+     --cert-expiry <period_number> \
+     --wallet-fingerprint <fp_from_jm_wallet_info>
    ```
    The `import-certificate` command automatically handles recoverable-to-DER signature conversion.
 

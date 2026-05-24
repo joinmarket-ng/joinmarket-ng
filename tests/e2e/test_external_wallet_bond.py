@@ -107,7 +107,7 @@ def create_external_wallet_bond(
 
     registry = BondRegistry()
     registry.add_bond(bond_info)
-    save_registry(registry, tmp_data_dir)
+    save_registry(registry, tmp_data_dir, "deadbeef")
     logger.info(f"Saved bond registry to {tmp_data_dir}")
 
     return (
@@ -146,7 +146,7 @@ async def test_external_wallet_bond_creation(tmp_path: Path):
     # Verify the bond was saved correctly
     from jmwallet.wallet.bond_registry import load_registry
 
-    registry = load_registry(tmp_path)
+    registry = load_registry(tmp_path, "deadbeef")
     assert len(registry.bonds) == 1
 
     bond = registry.bonds[0]

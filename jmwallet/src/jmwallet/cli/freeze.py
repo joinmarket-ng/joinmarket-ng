@@ -128,9 +128,11 @@ async def _freeze_utxos(
     data_dir = backend_settings.data_dir
 
     # Load fidelity bond addresses from registry
+    from jmwallet.backends.descriptor_wallet import get_mnemonic_fingerprint
     from jmwallet.wallet.bond_registry import load_registry
 
-    bond_registry = load_registry(data_dir)
+    wallet_fingerprint = get_mnemonic_fingerprint(mnemonic, bip39_passphrase or "")
+    bond_registry = load_registry(data_dir, wallet_fingerprint)
     fidelity_bond_addresses: list[tuple[str, int, int]] = [
         (bond.address, bond.locktime, bond.index)
         for bond in bond_registry.bonds
@@ -154,13 +156,9 @@ async def _freeze_utxos(
             logger.error("Neutrino sync timeout")
             raise typer.Exit(1)
     elif backend_type == "descriptor_wallet":
-        from jmwallet.backends.descriptor_wallet import (
-            generate_wallet_name,
-            get_mnemonic_fingerprint,
-        )
+        from jmwallet.backends.descriptor_wallet import generate_wallet_name
 
-        fingerprint = get_mnemonic_fingerprint(mnemonic, bip39_passphrase or "")
-        wallet_name = generate_wallet_name(fingerprint, network)
+        wallet_name = generate_wallet_name(wallet_fingerprint, network)
         backend = DescriptorWalletBackend(
             rpc_url=backend_settings.rpc_url,
             rpc_user=backend_settings.rpc_user,

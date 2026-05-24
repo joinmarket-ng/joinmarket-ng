@@ -20,6 +20,35 @@ from loguru import logger
 
 from jmwallet.cli import app
 
+_WALLET_FINGERPRINT_HELP = (
+    "8-char hex master key fingerprint of the JoinMarket wallet that will operate "
+    "this bond. Run 'jm-wallet info --mnemonic-file <wallet>' on the hot wallet "
+    "to look it up. Required because each wallet has its own bond registry "
+    "(fidelity_bonds_<fp>.json) under the shared data directory."
+)
+
+
+def _resolve_wallet_fingerprint(wallet_fingerprint: str | None) -> str:
+    """Validate and return the wallet fingerprint, or exit with an error."""
+    if not wallet_fingerprint:
+        logger.error("--wallet-fingerprint is required to select the per-wallet bond registry.")
+        logger.info(
+            "Run 'jm-wallet info --mnemonic-file <wallet>' on the JoinMarket wallet "
+            "that will operate this bond to look up its 8-char hex master fingerprint, "
+            "then pass it via --wallet-fingerprint <fp>."
+        )
+        raise typer.Exit(1)
+    fp = wallet_fingerprint.strip().lower()
+    if len(fp) != 8:
+        logger.error(f"--wallet-fingerprint must be exactly 8 hex chars, got {len(fp)}: {fp!r}")
+        raise typer.Exit(1)
+    try:
+        bytes.fromhex(fp)
+    except ValueError:
+        logger.error(f"--wallet-fingerprint must be valid hex, got {fp!r}")
+        raise typer.Exit(1)
+    return fp
+
 
 @app.command("create-bond-address")
 def create_bond_address(
@@ -46,6 +75,10 @@ def create_bond_address(
         bool,
         typer.Option("--no-save", help="Do not save the bond to the registry"),
     ] = False,
+    wallet_fingerprint: Annotated[
+        str | None,
+        typer.Option("--wallet-fingerprint", help=_WALLET_FINGERPRINT_HELP),
+    ] = None,
     log_level: Annotated[str, typer.Option("--log-level", "-l")] = "INFO",
 ) -> None:
     """
@@ -125,9 +158,15 @@ def create_bond_address(
     from jmwallet.wallet.address import script_to_p2wsh_address
     from jmwallet.wallet.bond_registry import (
         create_bond_info,
+        get_registry_path,
         load_registry,
         save_registry,
     )
+
+    # Resolve wallet fingerprint up front so we fail fast even when --no-save is set,
+    # since cold-wallet bonds are external (path="external") and the fingerprint
+    # cannot be derived later from any key material.
+    resolved_fingerprint = _resolve_wallet_fingerprint(wallet_fingerprint)
 
     # Create the witness script from the public key
     witness_script = mk_freeze_script(pubkey, locktime)
@@ -143,7 +182,7 @@ def create_bond_address(
     saved = False
     existing = False
     if not no_save:
-        registry = load_registry(resolved_data_dir)
+        registry = load_registry(resolved_data_dir, resolved_fingerprint)
         existing_bond = registry.get_bond_by_address(address)
         if existing_bond:
             existing = True
@@ -161,7 +200,7 @@ def create_bond_address(
                 network=network,
             )
             registry.add_bond(bond_info)
-            save_registry(registry, resolved_data_dir)
+            save_registry(registry, resolved_data_dir, resolved_fingerprint)
             saved = True
 
     # Compute the underlying P2WPKH address for the pubkey (for user confirmation)
@@ -186,7 +225,7 @@ def create_bond_address(
     print(f"Disassembled: {disassembled}")
     print("-" * 80)
     if saved:
-        print(f"\nSaved to registry: {resolved_data_dir / 'fidelity_bonds.json'}")
+        print(f"\nSaved to registry: {get_registry_path(resolved_data_dir, resolved_fingerprint)}")
     elif existing:
         print("\nBond already in registry (not updated)")
     elif no_save:
@@ -234,6 +273,10 @@ def generate_hot_keypair(
             help="Data directory (default: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)",
         ),
     ] = None,
+    wallet_fingerprint: Annotated[
+        str | None,
+        typer.Option("--wallet-fingerprint", help=_WALLET_FINGERPRINT_HELP),
+    ] = None,
     log_level: Annotated[str, typer.Option("--log-level")] = "INFO",
 ) -> None:
     """
@@ -271,13 +314,14 @@ def generate_hot_keypair(
     if bond_address:
         from jmwallet.wallet.bond_registry import load_registry, save_registry
 
-        registry = load_registry(resolved_data_dir)
+        resolved_fingerprint = _resolve_wallet_fingerprint(wallet_fingerprint)
+        registry = load_registry(resolved_data_dir, resolved_fingerprint)
         bond = registry.get_bond_by_address(bond_address)
 
         if bond:
             bond.cert_pubkey = pubkey.hex()
             bond.cert_privkey = privkey.secret.hex()
-            save_registry(registry, resolved_data_dir)
+            save_registry(registry, resolved_data_dir, resolved_fingerprint)
             saved_to_registry = True
             logger.info(f"Saved hot keypair to bond registry for {bond_address}")
         else:
@@ -368,6 +412,10 @@ def prepare_certificate_message(
             ),
         ),
     ] = None,
+    wallet_fingerprint: Annotated[
+        str | None,
+        typer.Option("--wallet-fingerprint", help=_WALLET_FINGERPRINT_HELP),
+    ] = None,
     log_level: Annotated[str, typer.Option("--log-level")] = "INFO",
 ) -> None:
     """
@@ -396,7 +444,8 @@ def prepare_certificate_message(
 
     # Resolve data directory
     data_dir = data_dir_opt if data_dir_opt else get_default_data_dir()
-    registry = load_registry(data_dir)
+    resolved_fingerprint = _resolve_wallet_fingerprint(wallet_fingerprint)
+    registry = load_registry(data_dir, resolved_fingerprint)
     bond = registry.get_bond_by_address(bond_address)
 
     if not bond:
@@ -761,6 +810,10 @@ def import_certificate(
             ),
         ),
     ] = None,
+    wallet_fingerprint: Annotated[
+        str | None,
+        typer.Option("--wallet-fingerprint", help=_WALLET_FINGERPRINT_HELP),
+    ] = None,
     log_level: Annotated[str, typer.Option("--log-level")] = "INFO",
 ) -> None:
     """
@@ -784,11 +837,12 @@ def import_certificate(
     from coincurve import PrivateKey
     from jmcore.paths import get_default_data_dir
 
-    from jmwallet.wallet.bond_registry import load_registry, save_registry
+    from jmwallet.wallet.bond_registry import get_registry_path, load_registry, save_registry
 
     # Load registry first to get bond info
     resolved_data_dir = data_dir if data_dir else get_default_data_dir()
-    registry = load_registry(resolved_data_dir)
+    resolved_fingerprint = _resolve_wallet_fingerprint(wallet_fingerprint)
+    registry = load_registry(resolved_data_dir, resolved_fingerprint)
 
     # Find bond by address
     bond = registry.get_bond_by_address(address)
@@ -969,7 +1023,7 @@ def import_certificate(
     bond.cert_signature = der_sig.hex()  # Store as hex DER
     bond.cert_expiry = cert_expiry
 
-    save_registry(registry, resolved_data_dir)
+    save_registry(registry, resolved_data_dir, resolved_fingerprint)
 
     # Calculate expiry info for display
     expiry_block = cert_expiry * retarget_interval
@@ -983,7 +1037,7 @@ def import_certificate(
     print(f"\nBond Address:          {address}")
     print(f"Certificate Pubkey:    {cert_pubkey}")
     print(f"Certificate Expiry:    period {cert_expiry} (block {expiry_block}, {expiry_info})")
-    print(f"\nRegistry updated: {resolved_data_dir / 'fidelity_bonds.json'}")
+    print(f"\nRegistry updated: {get_registry_path(resolved_data_dir, resolved_fingerprint)}")
     print("\n" + "=" * 80)
     print("NEXT STEPS:")
     print("  The maker bot will automatically use this certificate when creating")
@@ -1054,6 +1108,10 @@ def spend_bond(
             help="Data directory (default: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)",
         ),
     ] = None,
+    wallet_fingerprint: Annotated[
+        str | None,
+        typer.Option("--wallet-fingerprint", help=_WALLET_FINGERPRINT_HELP),
+    ] = None,
     log_level: Annotated[str, typer.Option("--log-level", "-l")] = "INFO",
 ) -> None:
     """
@@ -1114,7 +1172,8 @@ def spend_bond(
 
     # Resolve data directory
     resolved_data_dir = data_dir if data_dir else get_default_data_dir()
-    registry = load_registry(resolved_data_dir)
+    resolved_fingerprint = _resolve_wallet_fingerprint(wallet_fingerprint)
+    registry = load_registry(resolved_data_dir, resolved_fingerprint)
 
     # Find bond in registry
     bond = registry.get_bond_by_address(bond_address)

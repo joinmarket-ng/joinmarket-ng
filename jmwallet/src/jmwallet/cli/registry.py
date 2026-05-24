@@ -13,7 +13,8 @@ from pathlib import Path
 from typing import Annotated
 
 import typer
-from jmcore.cli_common import setup_logging
+from jmcore.cli_common import resolve_mnemonic, setup_cli
+from loguru import logger
 
 from jmwallet.cli import app
 
@@ -21,6 +22,12 @@ from jmwallet.cli import app
 @app.command("registry-show")
 def registry_show(
     address: Annotated[str, typer.Argument(help="Bond address to show")],
+    mnemonic_file: Annotated[
+        Path | None, typer.Option("--mnemonic-file", "-f", envvar="MNEMONIC_FILE")
+    ] = None,
+    prompt_bip39_passphrase: Annotated[
+        bool, typer.Option("--prompt-bip39-passphrase", help="Prompt for BIP39 passphrase")
+    ] = False,
     data_dir: Annotated[
         Path | None,
         typer.Option(
@@ -36,20 +43,45 @@ def registry_show(
     log_level: Annotated[str, typer.Option("--log-level", "-l")] = "WARNING",
 ) -> None:
     """Show detailed information about a specific fidelity bond."""
-    setup_logging(log_level)
+    settings = setup_cli(log_level, data_dir=data_dir)
 
     from jmcore.btc_script import disassemble_script
-    from jmcore.paths import get_default_data_dir
 
-    from jmwallet.wallet.bond_registry import load_registry
+    from jmwallet.backends.descriptor_wallet import get_mnemonic_fingerprint
+    from jmwallet.wallet.bond_registry import get_registry_path, load_registry
 
-    resolved_data_dir = data_dir if data_dir else get_default_data_dir()
-    registry = load_registry(resolved_data_dir)
+    # Per-wallet registry scoping (issue #492) requires a wallet identity
+    # to know which file to read.
+    try:
+        resolved = resolve_mnemonic(
+            settings,
+            mnemonic_file=mnemonic_file,
+            prompt_bip39_passphrase=prompt_bip39_passphrase,
+        )
+    except (FileNotFoundError, ValueError) as e:
+        logger.error(str(e))
+        logger.error(
+            "registry-show requires --mnemonic-file (or settings) to select "
+            "the per-wallet bond registry."
+        )
+        raise typer.Exit(1)
+
+    if not resolved:
+        logger.error(
+            "registry-show requires --mnemonic-file (or settings) to select "
+            "the per-wallet bond registry."
+        )
+        raise typer.Exit(1)
+
+    fingerprint = get_mnemonic_fingerprint(resolved.mnemonic, resolved.bip39_passphrase)
+    resolved_data_dir = data_dir if data_dir else settings.get_data_dir()
+    registry = load_registry(resolved_data_dir, fingerprint)
+    registry_path = get_registry_path(resolved_data_dir, fingerprint)
 
     bond = registry.get_bond_by_address(address)
     if not bond:
         print(f"\nBond not found: {address}")
-        print(f"Registry: {resolved_data_dir / 'fidelity_bonds.json'}")
+        print(f"Registry: {registry_path}")
         raise typer.Exit(1)
 
     if json_output:

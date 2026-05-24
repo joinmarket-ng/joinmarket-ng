@@ -73,8 +73,38 @@ def list_bonds(
 
     # If no mnemonic provided, show bonds from registry (offline mode)
     if mnemonic_file is None and not any(v is not None for v in [rpc_url, backend_type]):
+        # Per-wallet registry scoping (issue #492) requires a wallet identity
+        # to know which file to read. Resolve the mnemonic (which may come
+        # from settings) and derive the fingerprint without touching the
+        # backend. If no mnemonic is configured we cannot determine which
+        # wallet's bonds to show and must abort with a clear message.
+        try:
+            resolved = resolve_mnemonic(
+                settings,
+                mnemonic_file=mnemonic_file,
+                prompt_bip39_passphrase=prompt_bip39_passphrase,
+            )
+        except (FileNotFoundError, ValueError) as e:
+            logger.error(str(e))
+            logger.error(
+                "Offline list-bonds now requires a wallet (via --mnemonic-file "
+                "or settings) so the per-wallet registry can be selected."
+            )
+            raise typer.Exit(1)
+
+        if not resolved:
+            logger.error(
+                "No mnemonic available. Pass --mnemonic-file / -f or set MNEMONIC_FILE; "
+                "the per-wallet fidelity bond registry requires a wallet identity."
+            )
+            raise typer.Exit(1)
+
+        from jmwallet.backends.descriptor_wallet import get_mnemonic_fingerprint
+
+        fingerprint = get_mnemonic_fingerprint(resolved.mnemonic, resolved.bip39_passphrase)
         _list_bonds_offline(
             data_dir=data_dir or settings.get_data_dir(),
+            fingerprint=fingerprint,
             funded_only=funded_only,
             active_only=active_only,
             json_output=json_output,
@@ -118,14 +148,16 @@ def list_bonds(
 
 def _list_bonds_offline(
     data_dir: Path,
+    fingerprint: str,
     funded_only: bool = False,
     active_only: bool = False,
     json_output: bool = False,
 ) -> None:
     """List bonds from the local registry without blockchain access."""
-    from jmwallet.wallet.bond_registry import load_registry
+    from jmwallet.wallet.bond_registry import get_registry_path, load_registry
 
-    registry = load_registry(data_dir)
+    registry = load_registry(data_dir, fingerprint)
+    registry_path = get_registry_path(data_dir, fingerprint)
 
     if active_only:
         bonds = registry.get_active_bonds()
@@ -143,7 +175,7 @@ def _list_bonds_offline(
 
     if not bonds:
         print("\nNo fidelity bonds found in registry.")
-        print(f"Registry: {data_dir / 'fidelity_bonds.json'}")
+        print(f"Registry: {registry_path}")
         print(
             "\nTIP: Use --mnemonic-file to scan the blockchain for bonds,\n"
             "     or 'jm-wallet generate-bond-address' to create one."
@@ -202,6 +234,7 @@ async def _list_fidelity_bonds(
         FidelityBondInfo as RegistryBondInfo,
     )
     from jmwallet.wallet.bond_registry import (
+        get_registry_path,
         load_registry,
         save_registry,
     )
@@ -253,7 +286,7 @@ async def _list_fidelity_bonds(
 
     try:
         # Load known bonds from registry for optimized scanning
-        bond_registry = load_registry(data_dir)
+        bond_registry = load_registry(data_dir, wallet.wallet_fingerprint)
         fidelity_bond_addresses: list[tuple[str, int, int]] = []
         network_bonds = [bond for bond in bond_registry.bonds if bond.network == network]
         if network_bonds:
@@ -387,8 +420,8 @@ async def _list_fidelity_bonds(
 
         # Save registry if any updates were made
         if registry_updated:
-            save_registry(bond_registry, data_dir)
-            print(f"\nRegistry updated: {data_dir / 'fidelity_bonds.json'}")
+            save_registry(bond_registry, data_dir, wallet.wallet_fingerprint)
+            print(f"\nRegistry updated: {get_registry_path(data_dir, wallet.wallet_fingerprint)}")
 
     finally:
         await wallet.close()
@@ -491,6 +524,7 @@ def generate_bond_address(
     from jmwallet.wallet.bip32 import HDKey, mnemonic_to_seed
     from jmwallet.wallet.bond_registry import (
         create_bond_info,
+        get_registry_path,
         load_registry,
         save_registry,
     )
@@ -498,6 +532,7 @@ def generate_bond_address(
 
     seed = mnemonic_to_seed(resolved_mnemonic, resolved_bip39_passphrase)
     master_key = HDKey.from_seed(seed)
+    wallet_fingerprint = master_key.derive("m/0").fingerprint.hex()
 
     coin_type = 0 if resolved_network == "mainnet" else 1
 
@@ -520,7 +555,7 @@ def generate_bond_address(
     saved = False
     existing = False
     if not no_save:
-        registry = load_registry(resolved_data_dir)
+        registry = load_registry(resolved_data_dir, wallet_fingerprint)
         existing_bond = registry.get_bond_by_address(address)
         if existing_bond:
             existing = True
@@ -536,7 +571,7 @@ def generate_bond_address(
                 network=resolved_network,
             )
             registry.add_bond(bond_info)
-            save_registry(registry, resolved_data_dir)
+            save_registry(registry, resolved_data_dir, wallet_fingerprint)
             saved = True
 
     print("\n" + "=" * 80)
@@ -555,7 +590,7 @@ def generate_bond_address(
     print(f"Disassembled: {disassembled}")
     print("-" * 80)
     if saved:
-        print(f"\nSaved to registry: {resolved_data_dir / 'fidelity_bonds.json'}")
+        print(f"\nSaved to registry: {get_registry_path(resolved_data_dir, wallet_fingerprint)}")
     elif existing:
         print("\nBond already in registry (not updated)")
     elif no_save:
@@ -703,6 +738,7 @@ def import_bond(
     from jmwallet.wallet.bip32 import HDKey, mnemonic_to_seed
     from jmwallet.wallet.bond_registry import (
         create_bond_info,
+        get_registry_path,
         load_registry,
         save_registry,
     )
@@ -710,6 +746,7 @@ def import_bond(
 
     seed = mnemonic_to_seed(resolved_mnemonic, resolved_bip39_passphrase)
     master_key = HDKey.from_seed(seed)
+    wallet_fingerprint = master_key.derive("m/0").fingerprint.hex()
 
     coin_type = 0 if resolved_network == "mainnet" else 1
     deriv_path = f"m/84'/{coin_type}'/0'/{FIDELITY_BOND_BRANCH}/{timenumber}"
@@ -720,7 +757,7 @@ def import_bond(
     address = script_to_p2wsh_address(witness_script, resolved_network)
 
     # Save to registry
-    registry = load_registry(resolved_data_dir)
+    registry = load_registry(resolved_data_dir, wallet_fingerprint)
     existing = registry.get_bond_by_address(address)
     if existing:
         print(f"\nBond already in registry (created: {existing.created_at})")
@@ -737,7 +774,7 @@ def import_bond(
         network=resolved_network,
     )
     registry.add_bond(bond_info)
-    save_registry(registry, resolved_data_dir)
+    save_registry(registry, resolved_data_dir, wallet_fingerprint)
 
     from jmcore.timenumber import format_locktime_date
 
@@ -750,7 +787,7 @@ def import_bond(
     print(f"Timenumber:   {timenumber}")
     print(f"Path:         {deriv_path}")
     print(f"Network:      {resolved_network}")
-    print(f"\nSaved to: {resolved_data_dir / 'fidelity_bonds.json'}")
+    print(f"\nSaved to: {get_registry_path(resolved_data_dir, wallet_fingerprint)}")
     print()
     print(
         "Note: The bond UTXO will be detected on the next wallet sync.\n"
@@ -855,6 +892,7 @@ async def _recover_bonds_async(
     from jmwallet.backends.neutrino import NeutrinoBackend
     from jmwallet.wallet.bond_registry import (
         create_bond_info,
+        get_registry_path,
         load_registry,
         save_registry,
     )
@@ -945,7 +983,7 @@ async def _recover_bonds_async(
         print()
 
         # Load registry and add discovered bonds
-        registry = load_registry(backend_settings.data_dir)
+        registry = load_registry(backend_settings.data_dir, wallet.wallet_fingerprint)
         new_bonds = 0
 
         from jmcore.bitcoin import format_amount
@@ -1024,12 +1062,15 @@ async def _recover_bonds_async(
                 new_bonds += 1
 
         # Save registry
-        save_registry(registry, backend_settings.data_dir)
+        save_registry(registry, backend_settings.data_dir, wallet.wallet_fingerprint)
 
         print("-" * 60)
         print(f"Added {new_bonds} new bond(s) to registry")
         print(f"Updated {len(utxos_by_address) - new_bonds} existing bond(s)")
-        print(f"Registry saved to: {backend_settings.data_dir / 'fidelity_bonds.json'}")
+        print(
+            f"Registry saved to: "
+            f"{get_registry_path(backend_settings.data_dir, wallet.wallet_fingerprint)}"
+        )
 
     finally:
         await wallet.close()

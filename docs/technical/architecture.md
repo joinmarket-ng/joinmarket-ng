@@ -45,8 +45,17 @@ JoinMarket NG uses a dedicated data directory for persistent files shared across
 │   ├── directory.nick     # Current directory server nick
 │   └── orderbook.nick     # Current orderbook watcher nick
 ├── history.csv            # Transaction history log (CoinJoins + plain sends)
-└── fidelity_bonds.json    # Bond registry
+├── wallet_metadata_<fp>.jsonl  # Per-wallet UTXO/address metadata (fp = master-key fingerprint)
+└── fidelity_bonds_<fp>.json    # Per-wallet fidelity bond registry (fp = master-key fingerprint)
 ```
+
+The `<fp>` placeholder is the 8-char hex fingerprint of the wallet's master key,
+matching `jm-wallet info`. Files with this suffix are scoped to a single wallet
+so different wallets sharing the same data directory do not see each other's
+bonds or address metadata. A pre-partition `fidelity_bonds.json` (without
+fingerprint) is migrated into the per-wallet file automatically the first time
+its owning wallet is opened; entries the migration cannot attribute remain in
+the shared file until claimed.
 
 **Shared Files:**
 

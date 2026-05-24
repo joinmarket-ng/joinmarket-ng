@@ -70,7 +70,7 @@ def test_prepare_certificate_message_accepts_current_block_override():
             created_at="2025-01-01T00:00:00",
             cert_pubkey=cert_key.public_key.format(compressed=True).hex(),
         )
-        save_registry(BondRegistry(bonds=[bond]), data_dir)
+        save_registry(BondRegistry(bonds=[bond]), data_dir, "deadbeef")
 
         result = runner.invoke(
             app,
@@ -79,6 +79,8 @@ def test_prepare_certificate_message_accepts_current_block_override():
                 bond.address,
                 "--data-dir",
                 str(data_dir),
+                "--wallet-fingerprint",
+                "deadbeef",
                 "--current-block",
                 "850000",
             ],
@@ -117,7 +119,7 @@ def test_import_certificate_uses_registry_privkey_with_current_block():
             cert_pubkey=cert_pubkey_hex,
             cert_privkey=cert_key.secret.hex(),
         )
-        save_registry(BondRegistry(bonds=[bond]), data_dir)
+        save_registry(BondRegistry(bonds=[bond]), data_dir, "deadbeef")
 
         result = runner.invoke(
             app,
@@ -126,6 +128,8 @@ def test_import_certificate_uses_registry_privkey_with_current_block():
                 bond.address,
                 "--data-dir",
                 str(data_dir),
+                "--wallet-fingerprint",
+                "deadbeef",
                 "--cert-signature",
                 sig_b64,
                 "--cert-expiry",
@@ -135,7 +139,7 @@ def test_import_certificate_uses_registry_privkey_with_current_block():
             ],
         )
 
-        loaded = load_registry(data_dir)
+        loaded = load_registry(data_dir, "deadbeef")
         loaded_bond = loaded.get_bond_by_address(bond.address)
 
     assert result.exit_code == 0

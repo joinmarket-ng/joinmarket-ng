@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 
@@ -165,24 +166,91 @@ class BondRegistry(BaseModel):
         return False
 
 
-def get_registry_path(data_dir: Path) -> Path:
-    """Get the path to the bond registry file."""
-    return data_dir / "fidelity_bonds.json"
+LEGACY_REGISTRY_FILENAME = "fidelity_bonds.json"
 
 
-def load_registry(data_dir: Path) -> BondRegistry:
+def _safe_fingerprint(fingerprint: str | None) -> str | None:
+    """Normalize a wallet fingerprint to a safe filename component.
+
+    Returns the lowercase hex fingerprint when valid, otherwise ``None``
+    so callers fall back to the legacy shared path. The fingerprint must
+    be non-empty and contain only ``[0-9a-f]``; ``HDKey.fingerprint.hex()``
+    always satisfies this, so an invalid value usually indicates a bug.
+    """
+    if fingerprint is None:
+        return None
+    safe = fingerprint.strip().lower()
+    if not safe or any(c not in "0123456789abcdef" for c in safe):
+        logger.warning(
+            f"Rejecting unsafe fidelity-bond registry fingerprint {fingerprint!r}; "
+            "falling back to legacy shared path"
+        )
+        return None
+    return safe
+
+
+def get_legacy_registry_path(data_dir: Path) -> Path:
+    """Get the path to the legacy (pre per-wallet) shared registry file."""
+    return data_dir / LEGACY_REGISTRY_FILENAME
+
+
+def get_registry_path(data_dir: Path, fingerprint: str | None = None) -> Path:
+    """Get the path to the bond registry file.
+
+    When ``fingerprint`` is supplied (the 8-char hex master-key fingerprint
+    exposed as :attr:`jmwallet.wallet.service.WalletService.wallet_fingerprint`)
+    the path is partitioned per wallet as ``fidelity_bonds_<fingerprint>.json``.
+    This prevents one wallet's persisted bonds from leaking into another
+    wallet that happens to share the same data directory (issue #492).
+
+    When ``fingerprint`` is ``None`` the legacy shared
+    ``fidelity_bonds.json`` path is returned so callers that genuinely
+    want the shared file (e.g. the one-shot migration that reads the
+    pre-partition file) keep working.
+    """
+    safe = _safe_fingerprint(fingerprint)
+    if safe is None:
+        return get_legacy_registry_path(data_dir)
+    return data_dir / f"fidelity_bonds_{safe}.json"
+
+
+def load_registry(data_dir: Path, fingerprint: str | None = None) -> BondRegistry:
     """
     Load the bond registry from disk.
 
     Args:
         data_dir: Data directory path
+        fingerprint: Optional 8-char hex wallet fingerprint. When given the
+            per-wallet ``fidelity_bonds_<fp>.json`` file is read.
+
+    Behavior:
+        If a per-wallet file is requested but does not exist, the legacy
+        shared ``fidelity_bonds.json`` is read as a read-only fallback so
+        upgrading users still see their bonds until the next write (which
+        will partition them per wallet via
+        :func:`migrate_legacy_registry`). The legacy file is **not**
+        filtered here: any bond it contains will appear under every
+        wallet's view. Wallet-aware migration must run before this is
+        relied upon for isolation.
 
     Returns:
-        BondRegistry instance (empty if file doesn't exist)
+        BondRegistry instance (empty if no registry file is found)
     """
-    registry_path = get_registry_path(data_dir)
+    registry_path = get_registry_path(data_dir, fingerprint)
     if not registry_path.exists():
-        return BondRegistry()
+        # Fall back to legacy file when looking up a per-wallet path. This
+        # keeps `list-bonds` etc. working immediately after an upgrade,
+        # before any write has triggered migration. Reads are non-
+        # destructive and only the first save (via migrate_legacy_registry)
+        # actually partitions entries per wallet.
+        if fingerprint is not None:
+            legacy_path = get_legacy_registry_path(data_dir)
+            if legacy_path.exists():
+                registry_path = legacy_path
+            else:
+                return BondRegistry()
+        else:
+            return BondRegistry()
 
     try:
         data = json.loads(registry_path.read_text())
@@ -193,15 +261,18 @@ def load_registry(data_dir: Path) -> BondRegistry:
         return BondRegistry()
 
 
-def save_registry(registry: BondRegistry, data_dir: Path) -> None:
+def save_registry(registry: BondRegistry, data_dir: Path, fingerprint: str | None = None) -> None:
     """
     Save the bond registry to disk.
 
     Args:
         registry: BondRegistry instance
         data_dir: Data directory path
+        fingerprint: Optional 8-char hex wallet fingerprint. When given the
+            registry is written to the per-wallet
+            ``fidelity_bonds_<fp>.json`` file.
     """
-    registry_path = get_registry_path(data_dir)
+    registry_path = get_registry_path(data_dir, fingerprint)
     registry_path.parent.mkdir(parents=True, exist_ok=True)
     temp_path: Path | None = None
 
@@ -234,7 +305,7 @@ def save_registry(registry: BondRegistry, data_dir: Path) -> None:
                 pass
 
 
-def get_active_locktimes(data_dir: Path) -> list[int]:
+def get_active_locktimes(data_dir: Path, fingerprint: str | None = None) -> list[int]:
     """
     Get all locktimes from the bond registry that have funded, active bonds.
 
@@ -244,18 +315,20 @@ def get_active_locktimes(data_dir: Path) -> list[int]:
 
     Args:
         data_dir: Data directory path
+        fingerprint: Optional 8-char hex wallet fingerprint to scope the
+            lookup to a per-wallet registry file.
 
     Returns:
         List of unique locktimes (Unix timestamps) for active bonds
     """
-    registry = load_registry(data_dir)
+    registry = load_registry(data_dir, fingerprint)
     active_bonds = registry.get_active_bonds()
     # Get unique locktimes
     locktimes = list({bond.locktime for bond in active_bonds})
     return sorted(locktimes)
 
 
-def get_all_locktimes(data_dir: Path) -> list[int]:
+def get_all_locktimes(data_dir: Path, fingerprint: str | None = None) -> list[int]:
     """
     Get all locktimes from the bond registry (funded or not).
 
@@ -264,11 +337,13 @@ def get_all_locktimes(data_dir: Path) -> list[int]:
 
     Args:
         data_dir: Data directory path
+        fingerprint: Optional 8-char hex wallet fingerprint to scope the
+            lookup to a per-wallet registry file.
 
     Returns:
         List of unique locktimes (Unix timestamps) for all bonds
     """
-    registry = load_registry(data_dir)
+    registry = load_registry(data_dir, fingerprint)
     # Get unique locktimes from ALL bonds (not just funded ones)
     locktimes = list({bond.locktime for bond in registry.bonds})
     return sorted(locktimes)
@@ -310,3 +385,102 @@ def create_bond_info(
         network=network,
         created_at=datetime.now().isoformat(),
     )
+
+
+def migrate_legacy_registry(
+    data_dir: Path,
+    fingerprint: str,
+    bond_belongs_to_wallet: Callable[[FidelityBondInfo], bool],
+) -> int:
+    """
+    One-shot migration from the legacy shared ``fidelity_bonds.json`` to a
+    per-wallet ``fidelity_bonds_<fingerprint>.json`` file (issue #492).
+
+    Behavior:
+        - If the per-wallet file already exists, no migration is performed
+          (idempotent on repeated wallet opens).
+        - If the legacy file does not exist, no migration is performed.
+        - Otherwise the legacy file is read and each entry is offered to
+          ``bond_belongs_to_wallet``. Matching entries are written to the
+          per-wallet file. The legacy file is rewritten with the remaining
+          (non-matching) entries, or deleted when it becomes empty.
+
+    The caller (typically :class:`WalletService`) is responsible for
+    providing a ``bond_belongs_to_wallet`` predicate that re-derives the
+    expected pubkey for the bond's ``path``/``locktime`` from the open
+    wallet and compares it to ``bond.pubkey``. Bonds that match are owned
+    by the current wallet; the rest are left in the legacy file for other
+    wallets to claim on their next open.
+
+    Args:
+        data_dir: Data directory holding the registry files.
+        fingerprint: 8-char hex wallet fingerprint of the wallet
+            performing the migration. Must be a valid lowercase hex
+            string; an invalid value aborts the migration.
+        bond_belongs_to_wallet: Predicate returning ``True`` when the
+            given bond should be claimed by the current wallet.
+
+    Returns:
+        Number of bonds claimed by the current wallet (>=0). Returns 0
+        when no migration ran for any reason.
+    """
+    safe_fp = _safe_fingerprint(fingerprint)
+    if safe_fp is None:
+        return 0
+
+    per_wallet_path = get_registry_path(data_dir, safe_fp)
+    legacy_path = get_legacy_registry_path(data_dir)
+
+    if per_wallet_path.exists():
+        return 0
+    if not legacy_path.exists():
+        return 0
+
+    try:
+        legacy_data = json.loads(legacy_path.read_text())
+        legacy_registry = BondRegistry.model_validate(legacy_data)
+    except Exception as e:
+        logger.error(f"Failed to read legacy bond registry for migration: {e}")
+        return 0
+
+    claimed: list[FidelityBondInfo] = []
+    remaining: list[FidelityBondInfo] = []
+    for bond in legacy_registry.bonds:
+        try:
+            if bond_belongs_to_wallet(bond):
+                claimed.append(bond)
+            else:
+                remaining.append(bond)
+        except Exception as e:
+            # Failing to verify a single bond must not lose data. Keep it
+            # in the legacy file so a future open can try again.
+            logger.warning(
+                f"Bond {bond.address} verification raised during migration: {e}; "
+                "leaving entry in legacy file"
+            )
+            remaining.append(bond)
+
+    if not claimed:
+        # Nothing to write; leave the legacy file untouched.
+        return 0
+
+    # Persist claimed entries to per-wallet file.
+    save_registry(BondRegistry(version=legacy_registry.version, bonds=claimed), data_dir, safe_fp)
+
+    # Rewrite legacy file with the remaining entries, or delete it when
+    # empty so future wallets do not see a phantom file.
+    if remaining:
+        save_registry(
+            BondRegistry(version=legacy_registry.version, bonds=remaining), data_dir, None
+        )
+    else:
+        try:
+            legacy_path.unlink()
+        except OSError as e:
+            logger.warning(f"Failed to remove empty legacy bond registry {legacy_path}: {e}")
+
+    logger.info(
+        f"Migrated {len(claimed)} bond(s) from legacy registry into "
+        f"{per_wallet_path.name}; {len(remaining)} entry(ies) left in legacy file."
+    )
+    return len(claimed)

@@ -295,16 +295,26 @@ The full CLI reference below is auto-generated from command `--help` output.
 │ *    pubkey      TEXT  Public key (hex, 33 bytes compressed) [required]      │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ╭─ Options ────────────────────────────────────────────────────────────────────╮
-│ --locktime       -L      INTEGER  Locktime as Unix timestamp [default: 0]    │
-│ --locktime-date  -d      TEXT     Locktime as date (YYYY-MM, must be 1st of  │
-│                                   month)                                     │
-│ --network        -n      TEXT     [default: mainnet]                         │
-│ --data-dir               PATH     Data directory (default: ~/.joinmarket-ng  │
-│                                   or $JOINMARKET_DATA_DIR)                   │
-│                                   [env var: JOINMARKET_DATA_DIR]             │
-│ --no-save                         Do not save the bond to the registry       │
-│ --log-level      -l      TEXT     [default: INFO]                            │
-│ --help                            Show this message and exit.                │
+│ --locktime            -L      INTEGER  Locktime as Unix timestamp            │
+│                                        [default: 0]                          │
+│ --locktime-date       -d      TEXT     Locktime as date (YYYY-MM, must be    │
+│                                        1st of month)                         │
+│ --network             -n      TEXT     [default: mainnet]                    │
+│ --data-dir                    PATH     Data directory (default:              │
+│                                        ~/.joinmarket-ng or                   │
+│                                        $JOINMARKET_DATA_DIR)                 │
+│                                        [env var: JOINMARKET_DATA_DIR]        │
+│ --no-save                              Do not save the bond to the registry  │
+│ --wallet-fingerprint          TEXT     8-char hex master key fingerprint of  │
+│                                        the JoinMarket wallet that will       │
+│                                        operate this bond. Run 'jm-wallet     │
+│                                        info --mnemonic-file <wallet>' on the │
+│                                        hot wallet to look it up. Required    │
+│                                        because each wallet has its own bond  │
+│                                        registry (fidelity_bonds_<fp>.json)   │
+│                                        under the shared data directory.      │
+│ --log-level           -l      TEXT     [default: INFO]                       │
+│ --help                                 Show this message and exit.           │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ```
 
@@ -335,13 +345,20 @@ The full CLI reference below is auto-generated from command `--help` output.
  - But they CANNOT spend your bond funds (those remain in cold storage)
 
 ╭─ Options ────────────────────────────────────────────────────────────────────╮
-│ --bond-address        TEXT  Bond address to associate keypair with (saves to │
-│                             registry)                                        │
-│ --data-dir            PATH  Data directory (default: ~/.joinmarket-ng or     │
-│                             $JOINMARKET_DATA_DIR)                            │
-│                             [env var: JOINMARKET_DATA_DIR]                   │
-│ --log-level           TEXT  [default: INFO]                                  │
-│ --help                      Show this message and exit.                      │
+│ --bond-address              TEXT  Bond address to associate keypair with     │
+│                                   (saves to registry)                        │
+│ --data-dir                  PATH  Data directory (default: ~/.joinmarket-ng  │
+│                                   or $JOINMARKET_DATA_DIR)                   │
+│                                   [env var: JOINMARKET_DATA_DIR]             │
+│ --wallet-fingerprint        TEXT  8-char hex master key fingerprint of the   │
+│                                   JoinMarket wallet that will operate this   │
+│                                   bond. Run 'jm-wallet info --mnemonic-file  │
+│                                   <wallet>' on the hot wallet to look it up. │
+│                                   Required because each wallet has its own   │
+│                                   bond registry (fidelity_bonds_<fp>.json)   │
+│                                   under the shared data directory.           │
+│ --log-level                 TEXT  [default: INFO]                            │
+│ --help                            Show this message and exit.                │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ```
 
@@ -380,23 +397,31 @@ The full CLI reference below is auto-generated from command `--help` output.
 │ *    bond_address      TEXT  Bond P2WSH address [required]                   │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ╭─ Options ────────────────────────────────────────────────────────────────────╮
-│ --cert-pubkey               TEXT     Certificate public key (hex)            │
-│ --validity-periods          INTEGER  Certificate validity in 2016-block      │
-│                                      periods from now (1=~2wk, 52=~2yr)      │
-│                                      [default: 52]                           │
-│ --data-dir                  PATH     Data directory (default:                │
-│                                      ~/.joinmarket-ng or                     │
-│                                      $JOINMARKET_DATA_DIR)                   │
-│                                      [env var: JOINMARKET_DATA_DIR]          │
-│ --network           -n      TEXT     Bitcoin network                         │
-│ --backend           -b      TEXT     Backend: descriptor_wallet | neutrino   │
-│ --rpc-url                   TEXT     [env var: BITCOIN_RPC_URL]              │
-│ --neutrino-url              TEXT     [env var: NEUTRINO_URL]                 │
-│ --current-block             INTEGER  Current block height override for       │
-│                                      offline/air-gapped workflows. Skips all │
-│                                      network block-height lookups.           │
-│ --log-level                 TEXT     [default: INFO]                         │
-│ --help                               Show this message and exit.             │
+│ --cert-pubkey                 TEXT     Certificate public key (hex)          │
+│ --validity-periods            INTEGER  Certificate validity in 2016-block    │
+│                                        periods from now (1=~2wk, 52=~2yr)    │
+│                                        [default: 52]                         │
+│ --data-dir                    PATH     Data directory (default:              │
+│                                        ~/.joinmarket-ng or                   │
+│                                        $JOINMARKET_DATA_DIR)                 │
+│                                        [env var: JOINMARKET_DATA_DIR]        │
+│ --network             -n      TEXT     Bitcoin network                       │
+│ --backend             -b      TEXT     Backend: descriptor_wallet | neutrino │
+│ --rpc-url                     TEXT     [env var: BITCOIN_RPC_URL]            │
+│ --neutrino-url                TEXT     [env var: NEUTRINO_URL]               │
+│ --current-block               INTEGER  Current block height override for     │
+│                                        offline/air-gapped workflows. Skips   │
+│                                        all network block-height lookups.     │
+│ --wallet-fingerprint          TEXT     8-char hex master key fingerprint of  │
+│                                        the JoinMarket wallet that will       │
+│                                        operate this bond. Run 'jm-wallet     │
+│                                        info --mnemonic-file <wallet>' on the │
+│                                        hot wallet to look it up. Required    │
+│                                        because each wallet has its own bond  │
+│                                        registry (fidelity_bonds_<fp>.json)   │
+│                                        under the shared data directory.      │
+│ --log-level                   TEXT     [default: INFO]                       │
+│ --help                                 Show this message and exit.           │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ```
 
@@ -430,27 +455,35 @@ The full CLI reference below is auto-generated from command `--help` output.
 │ *    address      TEXT  Bond address [required]                              │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ╭─ Options ────────────────────────────────────────────────────────────────────╮
-│ --cert-pubkey                TEXT     Certificate pubkey (hex)               │
-│ --cert-signature             TEXT     Certificate signature (base64)         │
-│ --cert-expiry                INTEGER  Certificate expiry as ABSOLUTE period  │
-│                                       number (from                           │
-│                                       prepare-certificate-message)           │
-│                                       [default: 0]                           │
-│ --data-dir                   PATH     Data directory (default:               │
-│                                       ~/.joinmarket-ng or                    │
-│                                       $JOINMARKET_DATA_DIR)                  │
-│                                       [env var: JOINMARKET_DATA_DIR]         │
-│ --skip-verification                   Skip signature verification (not       │
-│                                       recommended)                           │
-│ --network            -n      TEXT     Bitcoin network                        │
-│ --backend            -b      TEXT     Backend: descriptor_wallet | neutrino  │
-│ --rpc-url                    TEXT     [env var: BITCOIN_RPC_URL]             │
-│ --neutrino-url               TEXT     [env var: NEUTRINO_URL]                │
-│ --current-block              INTEGER  Current block height override for      │
-│                                       offline/air-gapped workflows. Skips    │
-│                                       all network block-height lookups.      │
-│ --log-level                  TEXT     [default: INFO]                        │
-│ --help                                Show this message and exit.            │
+│ --cert-pubkey                 TEXT     Certificate pubkey (hex)              │
+│ --cert-signature              TEXT     Certificate signature (base64)        │
+│ --cert-expiry                 INTEGER  Certificate expiry as ABSOLUTE period │
+│                                        number (from                          │
+│                                        prepare-certificate-message)          │
+│                                        [default: 0]                          │
+│ --data-dir                    PATH     Data directory (default:              │
+│                                        ~/.joinmarket-ng or                   │
+│                                        $JOINMARKET_DATA_DIR)                 │
+│                                        [env var: JOINMARKET_DATA_DIR]        │
+│ --skip-verification                    Skip signature verification (not      │
+│                                        recommended)                          │
+│ --network             -n      TEXT     Bitcoin network                       │
+│ --backend             -b      TEXT     Backend: descriptor_wallet | neutrino │
+│ --rpc-url                     TEXT     [env var: BITCOIN_RPC_URL]            │
+│ --neutrino-url                TEXT     [env var: NEUTRINO_URL]               │
+│ --current-block               INTEGER  Current block height override for     │
+│                                        offline/air-gapped workflows. Skips   │
+│                                        all network block-height lookups.     │
+│ --wallet-fingerprint          TEXT     8-char hex master key fingerprint of  │
+│                                        the JoinMarket wallet that will       │
+│                                        operate this bond. Run 'jm-wallet     │
+│                                        info --mnemonic-file <wallet>' on the │
+│                                        hot wallet to look it up. Required    │
+│                                        because each wallet has its own bond  │
+│                                        registry (fidelity_bonds_<fp>.json)   │
+│                                        under the shared data directory.      │
+│ --log-level                   TEXT     [default: INFO]                       │
+│ --help                                 Show this message and exit.           │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ```
 
@@ -531,6 +564,14 @@ The full CLI reference below is auto-generated from command `--help` output.
 │                                        ~/.joinmarket-ng or                   │
 │                                        $JOINMARKET_DATA_DIR)                 │
 │                                        [env var: JOINMARKET_DATA_DIR]        │
+│ --wallet-fingerprint          TEXT     8-char hex master key fingerprint of  │
+│                                        the JoinMarket wallet that will       │
+│                                        operate this bond. Run 'jm-wallet     │
+│                                        info --mnemonic-file <wallet>' on the │
+│                                        hot wallet to look it up. Required    │
+│                                        because each wallet has its own bond  │
+│                                        registry (fidelity_bonds_<fp>.json)   │
+│                                        under the shared data directory.      │
 │ --log-level           -l      TEXT     [default: INFO]                       │
 │ --help                                 Show this message and exit.           │
 ╰──────────────────────────────────────────────────────────────────────────────╯
@@ -654,12 +695,15 @@ The full CLI reference below is auto-generated from command `--help` output.
 │ *    address      TEXT  Bond address to show [required]                      │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ╭─ Options ────────────────────────────────────────────────────────────────────╮
-│ --data-dir           PATH  Data directory (default: ~/.joinmarket-ng or      │
-│                            $JOINMARKET_DATA_DIR)                             │
-│                            [env var: JOINMARKET_DATA_DIR]                    │
-│ --json       -j            Output as JSON                                    │
-│ --log-level  -l      TEXT  [default: WARNING]                                │
-│ --help                     Show this message and exit.                       │
+│ --mnemonic-file            -f      PATH  [env var: MNEMONIC_FILE]            │
+│ --prompt-bip39-passphrase                Prompt for BIP39 passphrase         │
+│ --data-dir                         PATH  Data directory (default:            │
+│                                          ~/.joinmarket-ng or                 │
+│                                          $JOINMARKET_DATA_DIR)               │
+│                                          [env var: JOINMARKET_DATA_DIR]      │
+│ --json                     -j            Output as JSON                      │
+│ --log-level                -l      TEXT  [default: WARNING]                  │
+│ --help                                   Show this message and exit.         │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ```
 

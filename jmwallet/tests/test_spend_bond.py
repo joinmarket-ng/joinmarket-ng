@@ -51,7 +51,7 @@ def _create_funded_bond(data_dir: Path) -> str:
     )
 
     registry = BondRegistry(bonds=[bond])
-    save_registry(registry, data_dir)
+    save_registry(registry, data_dir, "deadbeef")
     return address
 
 
@@ -78,7 +78,7 @@ def _create_unfunded_bond(data_dir: Path) -> str:
     )
 
     registry = BondRegistry(bonds=[bond])
-    save_registry(registry, data_dir)
+    save_registry(registry, data_dir, "deadbeef")
     return address
 
 
@@ -103,6 +103,8 @@ class TestSpendBondCommand:
                     DEST_ADDRESS,
                     "--data-dir",
                     str(data_dir),
+                    "--wallet-fingerprint",
+                    "deadbeef",
                     "--fee-rate",
                     "1.0",
                 ],
@@ -135,6 +137,8 @@ class TestSpendBondCommand:
                     DEST_ADDRESS,
                     "--data-dir",
                     str(data_dir),
+                    "--wallet-fingerprint",
+                    "deadbeef",
                     "--output",
                     str(output_file),
                 ],
@@ -161,6 +165,8 @@ class TestSpendBondCommand:
                     DEST_ADDRESS,
                     "--data-dir",
                     str(data_dir),
+                    "--wallet-fingerprint",
+                    "deadbeef",
                 ],
             )
             assert result.exit_code != 0
@@ -179,6 +185,8 @@ class TestSpendBondCommand:
                     DEST_ADDRESS,
                     "--data-dir",
                     str(data_dir),
+                    "--wallet-fingerprint",
+                    "deadbeef",
                 ],
             )
             assert result.exit_code != 0
@@ -197,6 +205,8 @@ class TestSpendBondCommand:
                     DEST_ADDRESS,
                     "--data-dir",
                     str(data_dir),
+                    "--wallet-fingerprint",
+                    "deadbeef",
                     "--test-unfunded",
                 ],
             )
@@ -222,6 +232,8 @@ class TestSpendBondCommand:
                     DEST_ADDRESS,
                     "--data-dir",
                     str(data_dir),
+                    "--wallet-fingerprint",
+                    "deadbeef",
                     "--test-unfunded",
                     "--test-utxo-value",
                     "0",
@@ -244,6 +256,8 @@ class TestSpendBondCommand:
                     "not_a_valid_address",
                     "--data-dir",
                     str(data_dir),
+                    "--wallet-fingerprint",
+                    "deadbeef",
                 ],
             )
             assert result.exit_code != 0
@@ -262,6 +276,8 @@ class TestSpendBondCommand:
                     DEST_ADDRESS,
                     "--data-dir",
                     str(data_dir),
+                    "--wallet-fingerprint",
+                    "deadbeef",
                     "--fee-rate",
                     "0",
                 ],
@@ -282,6 +298,8 @@ class TestSpendBondCommand:
                     DEST_ADDRESS,
                     "--data-dir",
                     str(data_dir),
+                    "--wallet-fingerprint",
+                    "deadbeef",
                     "--fee-rate",
                     "10.0",
                 ],
@@ -337,7 +355,7 @@ class TestSpendBondCommand:
                 confirmations=100,
             )
             registry = BondRegistry(bonds=[bond])
-            save_registry(registry, data_dir)
+            save_registry(registry, data_dir, "deadbeef")
 
             result = runner.invoke(
                 app,
@@ -347,6 +365,8 @@ class TestSpendBondCommand:
                     DEST_ADDRESS,
                     "--data-dir",
                     str(data_dir),
+                    "--wallet-fingerprint",
+                    "deadbeef",
                 ],
             )
             # Should still succeed (creates the PSBT even if locktime not expired)
@@ -369,6 +389,8 @@ class TestSpendBondCommand:
                     DEST_ADDRESS,
                     "--data-dir",
                     str(data_dir),
+                    "--wallet-fingerprint",
+                    "deadbeef",
                 ],
             )
             assert result.exit_code == 0
@@ -401,6 +423,8 @@ class TestSpendBondCommand:
                     DEST_ADDRESS,
                     "--data-dir",
                     str(data_dir),
+                    "--wallet-fingerprint",
+                    "deadbeef",
                 ],
             )
             assert result.exit_code == 0
@@ -440,6 +464,8 @@ class TestSpendBondBIP32Derivation:
                     DEST_ADDRESS,
                     "--data-dir",
                     str(data_dir),
+                    "--wallet-fingerprint",
+                    "deadbeef",
                     "--master-fingerprint",
                     fingerprint,
                     "--derivation-path",
@@ -487,6 +513,8 @@ class TestSpendBondBIP32Derivation:
                     DEST_ADDRESS,
                     "--data-dir",
                     str(data_dir),
+                    "--wallet-fingerprint",
+                    "deadbeef",
                     "--master-fingerprint",
                     "aabbccdd",
                 ],
@@ -508,6 +536,8 @@ class TestSpendBondBIP32Derivation:
                     DEST_ADDRESS,
                     "--data-dir",
                     str(data_dir),
+                    "--wallet-fingerprint",
+                    "deadbeef",
                     "--derivation-path",
                     "m/84'/0'/0'/0/0",
                 ],
@@ -529,6 +559,8 @@ class TestSpendBondBIP32Derivation:
                     DEST_ADDRESS,
                     "--data-dir",
                     str(data_dir),
+                    "--wallet-fingerprint",
+                    "deadbeef",
                     "--master-fingerprint",
                     "not-hex",
                     "--derivation-path",
@@ -552,6 +584,8 @@ class TestSpendBondBIP32Derivation:
                     DEST_ADDRESS,
                     "--data-dir",
                     str(data_dir),
+                    "--wallet-fingerprint",
+                    "deadbeef",
                     "--master-fingerprint",
                     "aabb",  # Only 2 bytes, need 4
                     "--derivation-path",
@@ -575,6 +609,8 @@ class TestSpendBondBIP32Derivation:
                     DEST_ADDRESS,
                     "--data-dir",
                     str(data_dir),
+                    "--wallet-fingerprint",
+                    "deadbeef",
                     "--master-fingerprint",
                     "aabbccdd",
                     "--derivation-path",
@@ -598,6 +634,8 @@ class TestSpendBondBIP32Derivation:
                     DEST_ADDRESS,
                     "--data-dir",
                     str(data_dir),
+                    "--wallet-fingerprint",
+                    "deadbeef",
                     "--master-fingerprint",
                     "aabbccdd",
                     "--derivation-path",
@@ -625,6 +663,8 @@ class TestSpendBondBIP32Derivation:
                     DEST_ADDRESS,
                     "--data-dir",
                     str(data_dir),
+                    "--wallet-fingerprint",
+                    "deadbeef",
                 ],
             )
 

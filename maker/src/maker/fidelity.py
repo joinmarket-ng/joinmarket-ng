@@ -98,14 +98,11 @@ async def find_fidelity_bonds(
 
     registry: BondRegistry | None = None
     try:
-        from pathlib import Path
-
-        from jmcore.paths import get_default_data_dir
         from jmwallet.wallet.bond_registry import load_registry
 
-        data_dir = get_default_data_dir()
-        registry = load_registry(Path(data_dir))
-        logger.debug(f"Loaded bond registry with {len(registry.bonds)} bonds")
+        if wallet.data_dir is not None:
+            registry = load_registry(wallet.data_dir, wallet.wallet_fingerprint)
+            logger.debug(f"Loaded bond registry with {len(registry.bonds)} bonds")
     except Exception as e:
         logger.debug(f"Could not load bond registry: {e}")
 

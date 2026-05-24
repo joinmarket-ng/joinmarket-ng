@@ -143,6 +143,15 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin):
         # Cache for fidelity bond locktimes (address -> locktime)
         self.fidelity_bond_locktime_cache: dict[str, int] = {}
 
+        # One-shot migration of the legacy shared ``fidelity_bonds.json``
+        # registry into a per-wallet ``fidelity_bonds_<fp>.json`` file
+        # (issue #492). Same shape as the metadata-store migration above:
+        # only runs when the per-wallet file is missing AND the legacy
+        # file exists, so the typical hot path is a single ``Path.exists``
+        # check.
+        if data_dir is not None:
+            self._migrate_legacy_bond_registry(data_dir)
+
     def _migrate_legacy_address_history(self, data_dir: Path | None) -> None:
         """Fold a legacy ``address_history_<fingerprint>.jsonl`` file into the
         unified metadata store, then remove it.
@@ -189,6 +198,50 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin):
             legacy_path.unlink()
         except OSError as exc:  # pragma: no cover - defensive
             logger.warning(f"Could not remove legacy {legacy_path.name}: {exc}")
+
+    def _migrate_legacy_bond_registry(self, data_dir: Path) -> None:
+        """Claim entries from the legacy ``fidelity_bonds.json`` into a
+        per-wallet ``fidelity_bonds_<fp>.json`` file (issue #492).
+
+        Pre-0.30.0 builds wrote every wallet's fidelity bonds into a
+        single shared ``fidelity_bonds.json`` under the data directory.
+        A side effect was that ``jm-wallet list-bonds`` (and the maker
+        bot) saw bonds belonging to other wallets opened from the same
+        directory. To restore per-wallet isolation we partition the file
+        per wallet fingerprint, matching the
+        ``wallet_metadata_<fp>.jsonl`` precedent.
+
+        Migration is wallet-aware: for each entry in the legacy file the
+        bond's stored pubkey is compared against the pubkey re-derived
+        from the open wallet at ``bond.path`` (or, when the path is the
+        canonical fidelity-bond branch, from the timenumber derived from
+        ``bond.locktime``). Matching entries are claimed by this wallet
+        and written to the per-wallet file. Non-matching entries are
+        left in the legacy file so other wallets can claim them on their
+        next open. The legacy file is removed once empty.
+        """
+        from jmwallet.wallet.bond_registry import (
+            FidelityBondInfo,
+            migrate_legacy_registry,
+        )
+
+        def _matches(bond: FidelityBondInfo) -> bool:
+            # Prefer re-deriving from the explicit BIP32 path stored on
+            # the bond; this covers cold-wallet/external pubkey entries
+            # that are not on the canonical fidelity-bond branch as well.
+            try:
+                key = self.master_key.derive(bond.path)
+            except Exception:
+                # Path malformed or not derivable; fall back to the
+                # canonical fidelity-bond derivation by locktime.
+                try:
+                    key = self.get_fidelity_bond_key(bond.index, bond.locktime)
+                except Exception:
+                    return False
+            derived_pubkey = key.get_public_key_bytes(compressed=True).hex()
+            return derived_pubkey == bond.pubkey
+
+        migrate_legacy_registry(data_dir, self.wallet_fingerprint, _matches)
 
     # -- Key derivation & address generation (Group A) ----------------------
 

@@ -242,7 +242,7 @@ async def get_timelock_address(
     address = ws.get_fidelity_bond_address(timenumber, locktime)
 
     # Persist the bond to the registry so the maker can pick it up at startup.
-    registry = load_registry(state.data_dir)
+    registry = load_registry(state.data_dir, ws.wallet_fingerprint)
     if not registry.get_bond_by_address(address):
         pubkey_hex = (
             ws.get_fidelity_bond_key(timenumber, locktime)
@@ -261,7 +261,7 @@ async def get_timelock_address(
             network=ws.network,
         )
         registry.add_bond(bond_info)
-        save_registry(registry, state.data_dir)
+        save_registry(registry, state.data_dir, ws.wallet_fingerprint)
         logger.debug(
             "Registered fidelity bond address {} (timenumber={}, locktime={}) in registry",
             address,

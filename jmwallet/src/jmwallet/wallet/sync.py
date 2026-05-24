@@ -66,6 +66,7 @@ class WalletSyncMixin:
     gap_limit: int
     scan_range: int
     data_dir: Path | None
+    wallet_fingerprint: str
     address_cache: dict[str, tuple[int, int, int]]
     utxo_cache: dict[int, list[UTXOInfo]]
     addresses_with_history: set[str]
@@ -1511,7 +1512,7 @@ class WalletSyncMixin:
             try:
                 from jmwallet.wallet.bond_registry import load_registry
 
-                registry = load_registry(self.data_dir)
+                registry = load_registry(self.data_dir, self.wallet_fingerprint)
                 bond = registry.get_bond_by_address(address)
                 if bond is not None:
                     # Found in fidelity bond registry - cache it and return

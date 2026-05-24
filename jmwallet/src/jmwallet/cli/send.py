@@ -202,7 +202,8 @@ async def _send_transaction(
     )
 
     # Load fidelity bond addresses from registry
-    bond_registry = load_registry(backend_settings.data_dir)
+    wallet_fingerprint = get_mnemonic_fingerprint(mnemonic, bip39_passphrase)
+    bond_registry = load_registry(backend_settings.data_dir, wallet_fingerprint)
     fidelity_bond_addresses: list[tuple[str, int, int]] = [
         (bond.address, bond.locktime, bond.index)
         for bond in bond_registry.bonds
@@ -226,8 +227,7 @@ async def _send_transaction(
             logger.error("Neutrino sync timeout")
             return
     elif backend_settings.backend_type == "descriptor_wallet":
-        fingerprint = get_mnemonic_fingerprint(mnemonic, bip39_passphrase)
-        wallet_name = generate_wallet_name(fingerprint, backend_settings.network)
+        wallet_name = generate_wallet_name(wallet_fingerprint, backend_settings.network)
         backend = DescriptorWalletBackend(
             rpc_url=backend_settings.rpc_url,
             rpc_user=backend_settings.rpc_user,
