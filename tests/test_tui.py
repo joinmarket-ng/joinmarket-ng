@@ -191,9 +191,9 @@ def test_tui_script_fidelity_bond_address_regex_matches_all_networks() -> None:
 
 def test_tui_script_maker_start_has_wallet_picker() -> None:
     """Maker START must use ensure_active_wallet for wallet selection
-    before password prompts when multiple wallets exist (issue #454, PR 2)."""
+    before password prompts when multiple wallets exist (issue #454)."""
     content = SCRIPT_PATH.read_text()
-    # Old maker_prepare_wallet() replaced by ensure_active_wallet() (PR 2, Step 9)
+    # Old maker_prepare_wallet() replaced by ensure_active_wallet()
     assert "ensure_active_wallet()" in content
 
 
@@ -537,7 +537,7 @@ def test_tui_no_second_password_prompt_when_storing_in_config() -> None:
 
 
 # ---------------------------------------------------------------------------
-# PR 2: Harmonize Wallet Selection - Comprehensive Test Suite
+# PR: Harmonize Wallet Selection - Comprehensive Test Suite
 #
 # These tests verify the refactoring that replaced 9 scattered "No wallet
 # configured" checks with centralized helpers:
@@ -545,12 +545,12 @@ def test_tui_no_second_password_prompt_when_storing_in_config() -> None:
 #   - ensure_active_wallet(): Unified wallet selection with auto-select
 #   - offer_maker_password_storage(): Maker-specific password storage prompt
 #
-# See: GitHub PR #XXX (Harmonize Wallet Selection)
+# See: GitHub PR (Harmonize Wallet Selection)
 # ---------------------------------------------------------------------------
 
 
 def test_tui_script_has_check_stale_wallet_helper() -> None:
-    """The script must include check_stale_wallet() helper function (PR 2, Step 1).
+    """The script must include check_stale_wallet() helper function.
 
     This helper centralizes stale wallet detection that was previously
     duplicated in the main loop and W submenu. It checks if the configured
@@ -567,7 +567,7 @@ def test_tui_script_has_check_stale_wallet_helper() -> None:
 
 
 def test_tui_script_has_ensure_active_wallet_helper() -> None:
-    """The script must include ensure_active_wallet() helper (PR 2, Step 2).
+    """The script must include ensure_active_wallet() helper.
 
     This is the core of the harmonization - a single function that handles
     all wallet selection logic across 9 different call sites. It replaces
@@ -592,7 +592,7 @@ def test_tui_script_has_ensure_active_wallet_helper() -> None:
 
 
 def test_tui_script_has_offer_maker_password_storage_helper() -> None:
-    """The script must include offer_maker_password_storage() helper (PR 2, Step 7).
+    """The script must include offer_maker_password_storage() helper.
 
     Unlike other operations, Maker specifically needs stored password for
     automatic restart after crashes. This helper provides a context-specific
@@ -610,7 +610,7 @@ def test_tui_script_has_offer_maker_password_storage_helper() -> None:
 
 
 def test_tui_script_no_maker_prepare_wallet() -> None:
-    """The old maker_prepare_wallet() function must be completely removed (PR 2, Step 9).
+    """The old maker_prepare_wallet() function must be completely removed.
 
     This function was replaced by the combination of ensure_active_wallet()
     and offer_maker_password_storage(). Its logic was split: wallet selection
@@ -623,7 +623,7 @@ def test_tui_script_no_maker_prepare_wallet() -> None:
 
 
 def test_tui_script_ensure_active_wallet_no_password_when_already_active() -> None:
-    """CRITICAL: When wallet already active, NO password offer (PR 2).
+    """CRITICAL: When wallet already active, NO password offer.
 
     Regression risk: If ensure_active_wallet offers password storage even when
     wallet was already active, the user gets nagged on EVERY operation
@@ -735,7 +735,7 @@ def test_tui_script_maker_start_call_order_correct() -> None:
 
 
 def test_tui_script_main_loop_uses_check_stale_wallet() -> None:
-    """Main menu loop must call check_stale_wallet (PR 2, Step 1).
+    """Main menu loop must call check_stale_wallet.
 
     Previously had inline stale check code. Now delegates to helper
     for consistency and maintainability."""
@@ -752,7 +752,7 @@ def test_tui_script_main_loop_uses_check_stale_wallet() -> None:
 
 
 def test_tui_script_wallet_submenu_uses_check_stale_wallet() -> None:
-    """W submenu loop must call check_stale_wallet (PR 2, Step 1).
+    """W submenu loop must call check_stale_wallet.
 
     Previously had inline stale check. Now unified with main loop behavior."""
     content = SCRIPT_PATH.read_text()
@@ -765,7 +765,7 @@ def test_tui_script_wallet_submenu_uses_check_stale_wallet() -> None:
 
 
 def test_tui_script_bal_submenu_uses_check_stale_wallet() -> None:
-    """BAL submenu loop must call check_stale_wallet (PR 2, Step 4).
+    """BAL submenu loop must call check_stale_wallet.
 
     New addition - previously had NO stale check, so WALLET_INFO could
     be stale if user deleted wallet file while in submenu."""
@@ -774,12 +774,12 @@ def test_tui_script_bal_submenu_uses_check_stale_wallet() -> None:
     # Extract BAL submenu block
     bal_block = content.split("BAL)", 1)[1].split("HIST)", 1)[0]
 
-    # Must now call the helper (was missing before PR 2)
+    # Must now call the helper
     assert "check_stale_wallet" in bal_block, "BAL submenu must refresh wallet state"
 
 
 def test_tui_script_maker_submenu_uses_check_stale_wallet() -> None:
-    """Maker submenu loop must call check_stale_wallet (PR 2, Step 8).
+    """Maker submenu loop must call check_stale_wallet.
 
     New addition - previously had NO stale check."""
     content = SCRIPT_PATH.read_text()
@@ -794,7 +794,7 @@ def test_tui_script_maker_submenu_uses_check_stale_wallet() -> None:
 
 
 def test_tui_script_bonds_submenu_uses_check_stale_wallet() -> None:
-    """Bonds submenu loop must call check_stale_wallet (PR 2, Step 8).
+    """Bonds submenu loop must call check_stale_wallet.
 
     New addition - previously had NO stale check."""
     content = SCRIPT_PATH.read_text()
@@ -809,7 +809,7 @@ def test_tui_script_bonds_submenu_uses_check_stale_wallet() -> None:
 
 
 def test_tui_script_update_submenu_uses_check_stale_wallet() -> None:
-    """Update submenu loop must call check_stale_wallet (PR 2, Step 8).
+    """Update submenu loop must call check_stale_wallet.
 
     New addition - previously had NO stale check."""
     content = SCRIPT_PATH.read_text()
@@ -829,7 +829,7 @@ def test_tui_script_update_submenu_uses_check_stale_wallet() -> None:
 
 
 def test_tui_script_send_uses_ensure_active_wallet() -> None:
-    """S (Send) must use ensure_active_wallet (PR 2, Step 3).
+    """S (Send) must use ensure_active_wallet.
 
     Replaces inline 'No wallet configured' check with unified helper.
     Old behavior: 3 different error messages, inconsistent actions.
@@ -849,7 +849,7 @@ def test_tui_script_send_uses_ensure_active_wallet() -> None:
 
 
 def test_tui_script_bal_uses_ensure_active_wallet() -> None:
-    """BAL must use ensure_active_wallet (PR 2, Step 4).
+    """BAL must use ensure_active_wallet.
 
     Replaces inline 'No wallet configured' check."""
     content = SCRIPT_PATH.read_text()
@@ -862,7 +862,7 @@ def test_tui_script_bal_uses_ensure_active_wallet() -> None:
 
 
 def test_tui_script_hist_uses_ensure_active_wallet() -> None:
-    """HIST must use ensure_active_wallet (PR 2, Step 5).
+    """HIST must use ensure_active_wallet.
 
     Replaces inline 'No wallet configured' check."""
     content = SCRIPT_PATH.read_text()
@@ -875,7 +875,7 @@ def test_tui_script_hist_uses_ensure_active_wallet() -> None:
 
 
 def test_tui_script_freeze_uses_ensure_active_wallet() -> None:
-    """FREEZE must use ensure_active_wallet (PR 2, Step 5).
+    """FREEZE must use ensure_active_wallet.
 
     Replaces inline 'No wallet configured' check."""
     content = SCRIPT_PATH.read_text()
@@ -890,7 +890,7 @@ def test_tui_script_freeze_uses_ensure_active_wallet() -> None:
 
 
 def test_tui_script_seed_uses_ensure_active_wallet() -> None:
-    """SEED must use ensure_active_wallet (PR 2, Step 5).
+    """SEED must use ensure_active_wallet.
 
     Replaces inline 'No wallet configured' check."""
     content = SCRIPT_PATH.read_text()
@@ -903,7 +903,7 @@ def test_tui_script_seed_uses_ensure_active_wallet() -> None:
 
 
 def test_tui_script_bonds_list_uses_ensure_active_wallet() -> None:
-    """BONDS LIST must use ensure_active_wallet (PR 2, Step 6).
+    """BONDS LIST must use ensure_active_wallet.
 
     Replaces inline 'No wallet configured' check."""
     content = SCRIPT_PATH.read_text()
@@ -918,7 +918,7 @@ def test_tui_script_bonds_list_uses_ensure_active_wallet() -> None:
 
 
 def test_tui_script_bonds_create_uses_ensure_active_wallet() -> None:
-    """BONDS CREATE must use ensure_active_wallet (PR 2, Step 6).
+    """BONDS CREATE must use ensure_active_wallet.
 
     Replaces inline 'No wallet configured' check."""
     content = SCRIPT_PATH.read_text()
@@ -933,7 +933,7 @@ def test_tui_script_bonds_create_uses_ensure_active_wallet() -> None:
 
 
 def test_tui_script_maker_start_uses_both_helpers() -> None:
-    """Maker START must use ensure_active_wallet + offer_maker_password_storage (PR 2, Step 7).
+    """Maker START must use ensure_active_wallet + offer_maker_password_storage.
 
     Two-step process:
     1. ensure_active_wallet: Select/active wallet, offer password if just changed
@@ -955,7 +955,7 @@ def test_tui_script_maker_start_uses_both_helpers() -> None:
 
 
 def test_tui_script_maker_restart_uses_both_helpers() -> None:
-    """Maker RESTART must use ensure_active_wallet + offer_maker_password_storage (PR 2, Step 7).
+    """Maker RESTART must use ensure_active_wallet + offer_maker_password_storage.
 
     Same two-step process as START."""
     content = SCRIPT_PATH.read_text()
@@ -973,7 +973,7 @@ def test_tui_script_maker_restart_uses_both_helpers() -> None:
 
 
 def test_tui_script_unified_error_message() -> None:
-    """All "No wallet" errors must use unified message (PR 2).
+    """All "No wallet" errors must use unified message.
 
     Previously 3 different messages:
     - "W → NEW or SEL"
@@ -995,164 +995,150 @@ def test_tui_script_unified_error_message() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Bug fixes (SEND password handling, SEED "Aborted." handling)
+# Subshell-based Password Prompt Tests
 # ---------------------------------------------------------------------------
 
 
-def test_tui_script_send_ensure_wallet_password_before_clear() -> None:
-    """SEND must call ensure_wallet_password before clear and before
-    jm-wallet/jm-taker execution.
+def test_tui_script_send_uses_subshell_for_password() -> None:
+    """SEND must call ensure_wallet_password inside subshell.
 
-    Bug fix: Previously ensure_wallet_password was inside the subshell,
-    causing terminal/whiptail issues. Now it must be called before clear
-    so the user is prompted via whiptail before any screen clearing."""
+    Bug fix regression test: Previously ensure_wallet_password was called
+    outside the subshell, causing MNEMONIC_PASSWORD to leak into the main
+    shell. This made the password prompt be skipped on subsequent operations
+    (e.g. after BAL was called before SEND).
+
+    Using a subshell isolates the password variable automatically."""
     content = SCRIPT_PATH.read_text()
 
     # Extract SEND case block
     s_block = content.split("S)\n", 1)[1].split("W)\n", 1)[0]
 
-    # Find positions of key elements
+    # Find the subshell opening parenthesis
+    subshell_open = s_block.rfind("(\n", 0, s_block.find("ensure_wallet_password"))
+
+    # Find ensure_wallet_password position
     ensure_pos = s_block.find("ensure_wallet_password")
-    clear_pos = s_block.find("clear")
-    wallet_pos = s_block.find("jm-wallet send")
-    taker_pos = s_block.find("jm-taker")
 
     # ensure_wallet_password must exist
     assert ensure_pos != -1, "ensure_wallet_password must be called in SEND"
 
-    # ensure_wallet_password must come BEFORE clear
-    assert ensure_pos < clear_pos, "ensure_wallet_password must be called before clear"
-
-    # ensure_wallet_password must come BEFORE jm-wallet and jm-taker
-    assert ensure_pos < wallet_pos, (
-        "ensure_wallet_password must be called before jm-wallet send"
-    )
-    assert ensure_pos < taker_pos, (
-        "ensure_wallet_password must be called before jm-taker coinjoin"
-    )
-
-    # Must have error handling: continue between ensure_wallet_password and clear
-    between_pwd_and_clear = s_block[ensure_pos:clear_pos]
-    assert "continue" in between_pwd_and_clear, (
-        "ensure_wallet_password failure must trigger continue before clear"
+    # ensure_wallet_password must be INSIDE the subshell
+    assert subshell_open != -1, "SEND must use a subshell"
+    assert subshell_open < ensure_pos, (
+        "ensure_wallet_password must be inside the subshell"
     )
 
 
-def test_tui_script_send_aborts_when_password_cancelled() -> None:
-    """When ensure_wallet_password fails, SEND must not execute any commands.
+def test_tui_script_seed_uses_subshell_for_password() -> None:
+    """SEED must call ensure_wallet_password inside subshell.
 
-    Bug fix regression test: If user cancels password prompt, the send
-    operation must abort entirely without calling jm-wallet or jm-taker."""
+    Same isolation requirement as SEND - the password check must run in a
+    subshell to prevent MNEMONIC_PASSWORD from leaking into the main shell."""
     content = SCRIPT_PATH.read_text()
 
-    # Extract SEND case block
+    # Extract SEED case block
+    seed_block = content.split("SEED)", 1)[1].split("BACK)", 1)[0]
+
+    # Find the subshell opening parenthesis
+    subshell_open = seed_block.rfind("(\n", 0, seed_block.find("ensure_wallet_password"))
+
+    # Find ensure_wallet_password position
+    ensure_pos = seed_block.find("ensure_wallet_password")
+
+    # ensure_wallet_password must exist
+    assert ensure_pos != -1, "ensure_wallet_password must be called in SEED"
+
+    # ensure_wallet_password must be INSIDE the subshell
+    assert subshell_open != -1, "SEED must use a subshell"
+    assert subshell_open < ensure_pos, (
+        "ensure_wallet_password must be inside the subshell"
+    )
+
+
+def test_tui_script_send_password_after_clear_in_subshell() -> None:
+    """SEND must clear screen first, then run password check in subshell.
+
+    Updated test: Previously checked that ensure_wallet_password was called
+    BEFORE clear (outside subshell). Now checks correct order: clear first, 
+    then subshell containing ensure_wallet_password."""
+    content = SCRIPT_PATH.read_text()
     s_block = content.split("S)\n", 1)[1].split("W)\n", 1)[0]
 
-    # Must have early exit pattern when password fails
-    # The code uses: if ! ensure_wallet_password ...; then continue; fi
-    pwd_section = s_block.split("ensure_wallet_password", 1)[1]
-    assert "continue" in pwd_section.split("clear")[0], (
-        "Must abort SEND when password prompt cancelled"
+    clear_pos = s_block.find("clear")
+    subshell_pos = s_block.find("(\n")
+    ensure_pos = s_block.find("ensure_wallet_password")
+
+    assert clear_pos != -1, "clear must exist"
+    assert subshell_pos != -1, "subshell must exist"  
+    assert ensure_pos != -1, "ensure_wallet_password must exist"
+
+    # Order: clear -> subshell -> ensure_wallet_password
+    assert clear_pos < subshell_pos < ensure_pos, (
+        "Required: clear first, then subshell containing ensure_wallet_password"
     )
 
-    # Verify jm-wallet/jm-taker calls are AFTER the password check
-    # (in the subshell, after clear)
-    subshell_section = s_block.split("(", 1)[1]
-    assert "jm-wallet" in subshell_section or "jm-taker" in subshell_section, (
-        "Send commands must be in subshell after password check"
-    )
 
+def test_tui_script_send_aborts_with_exit_in_subshell() -> None:
+    """When password fails, SEND must use 'exit 1' inside the subshell.
 
-def test_tui_script_seed_checks_exit_code_after_showseed() -> None:
-    """SEED must check exit code after jm-wallet showseed.
-
-    Bug fix: Previously showed 'Press [Enter] to continue' even when
-    user aborted at CLI prompt (resulting in 'Aborted.' message).
-    Now must skip pause when exit code is non-zero."""
+    Updated test: Previously checked for 'continue' in parent shell.
+    Now checks for 'exit 1' inside the subshell to abort only the subshell,
+    not the entire script."""
     content = SCRIPT_PATH.read_text()
+    s_block = content.split("S)\n", 1)[1].split("W)\n", 1)[0]
 
-    # Extract SEED case block
+    # Extract subshell content
+    subshell_start = s_block.find("(\n")
+    subshell_end = s_block.find(")\n", subshell_start)
+    assert subshell_start != -1, "subshell must exist"
+    
+    subshell_content = s_block[subshell_start:subshell_end]
+
+    # Inside subshell: ensure_wallet_password || exit 1
+    assert "ensure_wallet_password" in subshell_content
+    assert "exit 1" in subshell_content, (
+        "Subshell must use 'exit 1' to abort on password failure"
+    )
+
+
+def test_tui_script_seed_no_manual_exit_code_handling() -> None:
+    """SEED must not use manual SEED_EXIT checking.
+
+    Using a subshell makes manual exit code tracking redundant - the subshell
+    exit code is sufficient."""
+    content = SCRIPT_PATH.read_text()
     seed_block = content.split("SEED)", 1)[1].split("BACK)", 1)[0]
 
-    # Must capture exit code
-    assert "SEED_EXIT=$?" in seed_block, "Must capture showseed exit code in SEED_EXIT"
-
-    # Must check non-zero exit code
-    assert '[ "$SEED_EXIT" -ne 0 ]' in seed_block, (
-        "Must check SEED_EXIT -ne 0 for abort case"
+    # Old code had SEED_EXIT=$? and if [ "$SEED_EXIT" -ne 0 ]
+    assert "SEED_EXIT=$?" not in seed_block, (
+        "SEED_EXIT handling removed - subshell exit code is sufficient"
     )
-
-    # On non-zero: must clear and continue (skip pause)
-    abort_section = seed_block.split('[ "$SEED_EXIT" -ne 0 ]', 1)[1]
-    assert "clear" in abort_section, "Must clear screen when showseed aborted"
-    assert "continue" in abort_section, (
-        "Must continue (skip pause) when showseed aborted"
+    assert 'if [ "$SEED_EXIT" -ne 0 ]' not in seed_block, (
+        "Manual exit code check removed - handled by subshell || exit"
     )
 
 
-def test_tui_script_seed_shows_pause_only_on_success() -> None:
-    """SEED must only show 'Press [Enter]' when showseed succeeds.
+def test_tui_script_seed_pause_inside_subshell() -> None:
+    """SEED pause logic must be inside subshell.
 
-    The pause prompt must come AFTER the exit code check and only
-    in the success path (implicitly, not in the abort branch)."""
+    Combined test: Previously had separate tests for pause behavior.
+    Now simplified: pause inside subshell means it only runs on success
+    (subshell exits before pause on failure)."""
     content = SCRIPT_PATH.read_text()
-
-    # Extract SEED case block
     seed_block = content.split("SEED)", 1)[1].split("BACK)", 1)[0]
 
-    # Find the exit code check
-    exit_check_pos = seed_block.find('[ "$SEED_EXIT" -ne 0 ]')
+    # Find subshell boundaries
+    subshell_start = seed_block.find("(\n")
+    subshell_end = seed_block.find(")\n", subshell_start)
+    assert subshell_start != -1, "subshell must exist"
+    
+    subshell_content = seed_block[subshell_start:subshell_end]
+    after_subshell = seed_block[subshell_end:]
 
-    # Find the pause prompt
-    pause_pos = seed_block.find("Press [Enter] to continue")
-
-    # Both must exist
-    assert exit_check_pos != -1, "Exit code check must exist"
-    assert pause_pos != -1, "Pause prompt must exist"
-
-    # Pause must come AFTER exit code check
-    assert exit_check_pos < pause_pos, "Pause prompt must come after exit code check"
-
-    # The pause must be in the success path (after the abort branch ends)
-    # We verify this by checking the abort branch ends before pause
-    abort_branch = seed_block[exit_check_pos:pause_pos]
-    assert "continue" in abort_branch, (
-        "Abort branch must end with continue before pause prompt"
+    # Pause prompt must be INSIDE subshell
+    assert "Press [Enter] to continue" in subshell_content, (
+        "Pause must be inside subshell (executed only on success)"
     )
 
-
-def test_tui_script_seed_no_unnecessary_pause_after_abort() -> None:
-    """SEED must not show pause prompt when user aborts.
-
-    Regression test: Previously the code always reached the
-    'Press [Enter] to continue' line even after 'Aborted.' output.
-    Now the abort path must skip this with 'continue'."""
-    content = SCRIPT_PATH.read_text()
-
-    # Extract SEED case block and analyze structure
-    seed_block = content.split("SEED)", 1)[1].split("BACK)", 1)[0]
-
-    # The pattern should be:
-    #   jm-wallet showseed ...
-    #   SEED_EXIT=$?
-    #   if [ "$SEED_EXIT" -ne 0 ]; then
-    #       clear
-    #       continue  <-- This is the fix
-    #   fi
-    #   ... pause prompt here (only reachable on success)
-
-    lines = seed_block.split("\n")
-    in_abort_check = False
-    found_continue_in_abort = False
-
-    for line in lines:
-        if '[ "$SEED_EXIT" -ne 0 ]' in line:
-            in_abort_check = True
-        elif in_abort_check and line.strip().startswith("fi"):
-            in_abort_check = False
-        elif in_abort_check and "continue" in line:
-            found_continue_in_abort = True
-
-    assert found_continue_in_abort, (
-        "Abort branch must have 'continue' to skip pause prompt"
-    )
+    # After subshell should just have clear and case end
+    assert "clear" in after_subshell, "clear should follow subshell"

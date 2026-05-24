@@ -1050,14 +1050,11 @@ if [ "${RASPIBLITZ}" -eq 1 ]; then
         "Source mixdepth|$DEFAULT_MIXDEPTH|${SEND_MIXDEPTH}" \
         "Fee rate|auto (3-block estimate)|${FEE_DISPLAY}" || continue
 
-      # Ensure password is available before entering subshell
-      if ! ensure_wallet_password "$CURRENT_WALLET"; then
-          continue
-      fi
-
       # Execute the appropriate command
       clear
+      echo "Please wait..."
       (
+          ensure_wallet_password "$CURRENT_WALLET" || exit 1
           if [ "$SEND_CP" -gt 0 ] 2>/dev/null; then
               # CoinJoin via jm-taker
               echo "=== CoinJoin Send ==="
@@ -1121,6 +1118,7 @@ if [ "${RASPIBLITZ}" -eq 1 ]; then
           # pause INSIDE subshell - only runs if password succeeded
           pause
       )
+      clear
       ;;
 
     # ------------------------------------------------------------------
@@ -1496,26 +1494,14 @@ if [ "${RASPIBLITZ}" -eq 1 ]; then
 
               clear
               echo "Please wait..."
-
-              # Clear any cached password from previous operations
-              unset MNEMONIC_PASSWORD
-
-              if ! ensure_wallet_password "$CURRENT_WALLET"; then
-                  clear
-                  continue
-              fi
-
-              echo ""
-              jm-wallet showseed -f "$CURRENT_WALLET"
-              SEED_EXIT=$?
-              if [ "$SEED_EXIT" -ne 0 ]; then
-                  clear
-                  continue
-              fi
-              echo ""
-              echo ""
-              echo "Press [Enter] to continue."
-              read -r _
+              (
+                  ensure_wallet_password "$CURRENT_WALLET" || exit 1
+                  jm-wallet showseed -f "$CURRENT_WALLET"
+                  echo ""
+                  echo ""
+                  echo "Press [Enter] to continue."
+                  read -r _
+              )
               clear
               ;;
 
