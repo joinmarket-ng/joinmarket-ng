@@ -129,14 +129,14 @@ USER jm
 # Make sure scripts are in PATH
 ENV PATH=/app/bin:$PATH
 
-# Make sure packages are in Python PATH
-ENV PYTHONPATH=/app/lib/python${PYTHON_VERSION%.*}/site-packages
-
 # Copy application source and static files from builder (with normalized permissions)
 COPY --from=builder --chown=jm:jm /build/orderbook_watcher/src /app/orderbook_watcher/src
 COPY --from=builder --chown=jm:jm /build/orderbook_watcher/static /app/orderbook_watcher/static
 
-ENV PYTHONPATH=/app/orderbook_watcher/src
+# Make sure both site-packages (jmcore, jmwallet, third-party deps) and the
+# orderbook_watcher source tree are importable. orderbook_watcher is shipped as
+# a source tree rather than an installed package, so it needs its own entry.
+ENV PYTHONPATH=/app/lib/python${PYTHON_VERSION%.*}/site-packages:/app/orderbook_watcher/src
 
 EXPOSE 8000
 
