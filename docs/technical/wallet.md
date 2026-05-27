@@ -35,7 +35,7 @@ BIP39_PASSPHRASE="my phrase" jm-wallet info
 
 - Empty passphrase (`""`) is valid and different from no passphrase
 - Passphrase is case-sensitive and whitespace-sensitive
-- **Not read from config file** to prevent accidental exposure
+- Can be set in `[wallet] bip39_passphrase` in `config.toml`, but this is discouraged because it places the passphrase next to the encrypted mnemonic; prefer `--prompt-bip39-passphrase` or the `BIP39_PASSPHRASE` env variable.
 
 ### Wallet File Encryption
 
@@ -142,6 +142,31 @@ in place on first read). Each row is tagged with
 the BIP32 master fingerprint (`wallet_fingerprint`, first 4 bytes of `m/0`),
 so commands like `jm-wallet history` and `jm-wallet info` filter to the
 correct wallet automatically when a mnemonic is supplied.
+
+The same fingerprint scopes the fidelity bond registry on disk as
+`fidelity_bonds_<fingerprint>.json` (issue #492). Both `jm-wallet
+list-bonds` and `jm-wallet registry-show` read this per-wallet file.
+
+To pick a wallet, the offline commands `history`, `list-bonds` and
+`registry-show` accept the following inputs (in priority order):
+
+1. `--wallet-fingerprint <fp>` (8-char hex, printed by `jm-wallet info`).
+   Use this when you already know the fingerprint and want to skip
+   mnemonic decryption.
+2. `--mnemonic-file <file>` together with `--prompt-bip39-passphrase`
+   (or `BIP39_PASSPHRASE` env / `[wallet] bip39_passphrase` config)
+   when the wallet was created with a BIP39 passphrase. Without the
+   matching passphrase the derived fingerprint will not match any
+   recorded data, so the commands will appear "empty".
+3. Auto-detection when the data directory contains exactly one
+   wallet's data (one fingerprint in `history.csv` for `history`, one
+   `fidelity_bonds_*.json` file for `list-bonds` / `registry-show`).
+   The selected fingerprint is logged.
+
+When several wallets are present and none of the above identifies one,
+the commands abort and list the known fingerprints so the user can
+pick. Pass `--all-wallets` to `jm-wallet history` to disable filtering
+entirely (also surfaces legacy rows written before per-wallet tagging).
 
 Recommended practice is still to give each wallet its own data directory via
 the `JOINMARKET_DATA_DIR` env variable or the `--data-dir` flag. This keeps

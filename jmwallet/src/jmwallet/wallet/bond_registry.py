@@ -194,6 +194,32 @@ def get_legacy_registry_path(data_dir: Path) -> Path:
     return data_dir / LEGACY_REGISTRY_FILENAME
 
 
+def list_registry_fingerprints(data_dir: Path) -> list[str]:
+    """List wallet fingerprints with a per-wallet bond registry on disk.
+
+    Scans ``data_dir`` for files matching ``fidelity_bonds_<fp>.json`` and
+    returns the sorted, lowercased fingerprint components. The legacy
+    shared ``fidelity_bonds.json`` is intentionally excluded because it
+    is not tied to a specific wallet identity.
+
+    This is used by CLI commands that need to operate on the per-wallet
+    registry without forcing the user to provide a mnemonic when only one
+    wallet exists in the directory (or to print the available choices
+    when several do).
+    """
+    if not data_dir.exists():
+        return []
+    fingerprints: list[str] = []
+    for path in data_dir.glob("fidelity_bonds_*.json"):
+        stem = path.stem
+        # ``fidelity_bonds_<fp>``; trim the prefix and validate the
+        # remainder as a hex fingerprint so we never surface stray files.
+        fp = stem[len("fidelity_bonds_") :]
+        if _safe_fingerprint(fp) is not None:
+            fingerprints.append(fp.lower())
+    return sorted(set(fingerprints))
+
+
 def get_registry_path(data_dir: Path, fingerprint: str | None = None) -> Path:
     """Get the path to the bond registry file.
 

@@ -29,6 +29,21 @@ def list_bonds(
     prompt_bip39_passphrase: Annotated[
         bool, typer.Option("--prompt-bip39-passphrase", help="Prompt for BIP39 passphrase")
     ] = False,
+    wallet_fingerprint: Annotated[
+        str | None,
+        typer.Option(
+            "--wallet-fingerprint",
+            help=(
+                "Select the per-wallet bond registry by its 8-char hex BIP32 "
+                "master fingerprint (offline mode only). Use this instead of "
+                "--mnemonic-file when you already know the fingerprint "
+                "(e.g. from 'jm-wallet info'). When neither --mnemonic-file "
+                "nor this flag is provided and exactly one wallet has a "
+                "registry in the data directory, that wallet is selected "
+                "automatically."
+            ),
+        ),
+    ] = None,
     network: Annotated[str | None, typer.Option("--network", "-n", help="Bitcoin network")] = None,
     backend_type: Annotated[
         str | None,
@@ -67,43 +82,36 @@ def list_bonds(
     List all fidelity bonds in the wallet.
 
     Without --mnemonic-file: shows bonds from the local registry (offline, fast).
-    With --mnemonic-file: scans the blockchain for bonds and updates the registry.
+    Online mode (requires --mnemonic-file): scans the blockchain for bonds and
+    updates the registry. The per-wallet registry is selected by fingerprint
+    derived from --mnemonic-file, taken from --wallet-fingerprint, or
+    auto-detected when only one wallet's registry exists in the data dir.
     """
     settings = setup_cli(log_level, data_dir=data_dir)
+    resolved_data_dir = data_dir if data_dir else settings.get_data_dir()
 
     # If no mnemonic provided, show bonds from registry (offline mode)
     if mnemonic_file is None and not any(v is not None for v in [rpc_url, backend_type]):
-        # Per-wallet registry scoping (issue #492) requires a wallet identity
-        # to know which file to read. Resolve the mnemonic (which may come
-        # from settings) and derive the fingerprint without touching the
-        # backend. If no mnemonic is configured we cannot determine which
-        # wallet's bonds to show and must abort with a clear message.
-        try:
-            resolved = resolve_mnemonic(
-                settings,
-                mnemonic_file=mnemonic_file,
-                prompt_bip39_passphrase=prompt_bip39_passphrase,
-            )
-        except (FileNotFoundError, ValueError) as e:
-            logger.error(str(e))
+        from jmwallet.cli._wallet_selection import resolve_wallet_fingerprint
+        from jmwallet.wallet.bond_registry import list_registry_fingerprints
+
+        fingerprint = resolve_wallet_fingerprint(
+            settings,
+            mnemonic_file=mnemonic_file,
+            wallet_fingerprint=wallet_fingerprint,
+            prompt_bip39_passphrase=prompt_bip39_passphrase,
+            list_known_fingerprints=lambda: list_registry_fingerprints(resolved_data_dir),
+            command_label="jm-wallet list-bonds",
+        )
+        if fingerprint is None:
             logger.error(
-                "Offline list-bonds now requires a wallet (via --mnemonic-file "
-                "or settings) so the per-wallet registry can be selected."
+                "No bond registry found in this data directory and no wallet "
+                "identity was provided. Pass --mnemonic-file (with "
+                "--prompt-bip39-passphrase if needed) or --wallet-fingerprint."
             )
             raise typer.Exit(1)
-
-        if not resolved:
-            logger.error(
-                "No mnemonic available. Pass --mnemonic-file / -f or set MNEMONIC_FILE; "
-                "the per-wallet fidelity bond registry requires a wallet identity."
-            )
-            raise typer.Exit(1)
-
-        from jmwallet.backends.descriptor_wallet import get_mnemonic_fingerprint
-
-        fingerprint = get_mnemonic_fingerprint(resolved.mnemonic, resolved.bip39_passphrase)
         _list_bonds_offline(
-            data_dir=data_dir or settings.get_data_dir(),
+            data_dir=resolved_data_dir,
             fingerprint=fingerprint,
             funded_only=funded_only,
             active_only=active_only,

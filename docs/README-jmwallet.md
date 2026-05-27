@@ -131,11 +131,26 @@ The full CLI reference below is auto-generated from command `--help` output.
  List all fidelity bonds in the wallet.
 
  Without --mnemonic-file: shows bonds from the local registry (offline, fast).
- With --mnemonic-file: scans the blockchain for bonds and updates the registry.
+ Online mode (requires --mnemonic-file): scans the blockchain for bonds and
+ updates the registry. The per-wallet registry is selected by fingerprint
+ derived from --mnemonic-file, taken from --wallet-fingerprint, or
+ auto-detected when only one wallet's registry exists in the data dir.
 
 ╭─ Options ────────────────────────────────────────────────────────────────────╮
 │ --mnemonic-file            -f      PATH     [env var: MNEMONIC_FILE]         │
 │ --prompt-bip39-passphrase                   Prompt for BIP39 passphrase      │
+│ --wallet-fingerprint               TEXT     Select the per-wallet bond       │
+│                                             registry by its 8-char hex BIP32 │
+│                                             master fingerprint (offline mode │
+│                                             only). Use this instead of       │
+│                                             --mnemonic-file when you already │
+│                                             know the fingerprint (e.g. from  │
+│                                             'jm-wallet info'). When neither  │
+│                                             --mnemonic-file nor this flag is │
+│                                             provided and exactly one wallet  │
+│                                             has a registry in the data       │
+│                                             directory, that wallet is        │
+│                                             selected automatically.          │
 │ --network                  -n      TEXT     Bitcoin network                  │
 │ --backend                  -b      TEXT     Backend: descriptor_wallet |     │
 │                                             neutrino                         │
@@ -651,32 +666,56 @@ The full CLI reference below is auto-generated from command `--help` output.
 
  View CoinJoin transaction history.
 
- By default, when ``--mnemonic-file`` is provided the output is filtered
- to entries belonging to that wallet only. Without a mnemonic, all entries
- in the data directory are shown (legacy behavior). Pass ``--all-wallets``
- explicitly to override per-wallet filtering when a mnemonic is given.
+ By default the active wallet's entries are shown. The wallet is
+ selected (in priority order) from ``--wallet-fingerprint``,
+ ``--mnemonic-file`` (with optional ``--prompt-bip39-passphrase``),
+ or auto-detected when ``history.csv`` contains exactly one wallet.
+ Pass ``--all-wallets`` to disable per-wallet filtering entirely.
 
 ╭─ Options ────────────────────────────────────────────────────────────────────╮
-│ --limit          -n      INTEGER  Max entries to show                        │
-│ --role           -r      TEXT     Filter by role (maker/taker)               │
-│ --stats          -s               Show statistics only                       │
-│ --csv                             Output as CSV                              │
-│ --data-dir               PATH     Data directory (default: ~/.joinmarket-ng  │
-│                                   or $JOINMARKET_DATA_DIR)                   │
-│                                   [env var: JOINMARKET_DATA_DIR]             │
-│ --mnemonic-file  -f      PATH     Path to mnemonic file. When provided, the  │
-│                                   history is filtered to entries belonging   │
-│                                   to this wallet (matched by BIP32 master    │
-│                                   fingerprint). Required when multiple       │
-│                                   wallets share the same data directory      │
-│                                   (issue #473).                              │
-│                                   [env var: MNEMONIC_FILE]                   │
-│ --all-wallets                     Show entries from all wallets that have    │
-│                                   ever written to this data directory        │
-│                                   (default when no --mnemonic-file is        │
-│                                   given).                                    │
-│ --log-level      -l      TEXT     Log level                                  │
-│ --help                            Show this message and exit.                │
+│ --limit                    -n      INTEGER  Max entries to show              │
+│ --role                     -r      TEXT     Filter by role (maker/taker)     │
+│ --stats                    -s               Show statistics only             │
+│ --csv                                       Output as CSV                    │
+│ --data-dir                         PATH     Data directory (default:         │
+│                                             ~/.joinmarket-ng or              │
+│                                             $JOINMARKET_DATA_DIR)            │
+│                                             [env var: JOINMARKET_DATA_DIR]   │
+│ --mnemonic-file            -f      PATH     Path to mnemonic file. When      │
+│                                             provided, the history is         │
+│                                             filtered to entries belonging to │
+│                                             this wallet (matched by BIP32    │
+│                                             master fingerprint). Required    │
+│                                             when multiple wallets share the  │
+│                                             same data directory (issue #473) │
+│                                             unless --wallet-fingerprint is   │
+│                                             passed instead.                  │
+│                                             [env var: MNEMONIC_FILE]         │
+│ --prompt-bip39-passphrase                   Prompt for the BIP39 passphrase  │
+│                                             when deriving the wallet         │
+│                                             fingerprint from                 │
+│                                             --mnemonic-file. Required when   │
+│                                             the wallet was created with a    │
+│                                             BIP39 passphrase, otherwise the  │
+│                                             derived fingerprint will not     │
+│                                             match any recorded history.      │
+│ --wallet-fingerprint               TEXT     Filter history to this 8-char    │
+│                                             hex BIP32 master fingerprint.    │
+│                                             Use this instead of              │
+│                                             --mnemonic-file when you already │
+│                                             know the fingerprint (e.g.       │
+│                                             printed by 'jm-wallet info').    │
+│                                             When neither this flag nor       │
+│                                             --mnemonic-file is given and     │
+│                                             history contains exactly one     │
+│                                             wallet, that wallet is selected  │
+│                                             automatically.                   │
+│ --all-wallets                               Show entries from all wallets    │
+│                                             that have ever written to this   │
+│                                             data directory, including legacy │
+│                                             rows without a fingerprint.      │
+│ --log-level                -l      TEXT     Log level                        │
+│ --help                                      Show this message and exit.      │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ```
 
@@ -697,6 +736,16 @@ The full CLI reference below is auto-generated from command `--help` output.
 ╭─ Options ────────────────────────────────────────────────────────────────────╮
 │ --mnemonic-file            -f      PATH  [env var: MNEMONIC_FILE]            │
 │ --prompt-bip39-passphrase                Prompt for BIP39 passphrase         │
+│ --wallet-fingerprint               TEXT  Select the per-wallet bond registry │
+│                                          by its 8-char hex BIP32 master      │
+│                                          fingerprint. Use this instead of    │
+│                                          --mnemonic-file when you already    │
+│                                          know the fingerprint (e.g. from     │
+│                                          'jm-wallet info'). When neither is  │
+│                                          provided and exactly one wallet has │
+│                                          a registry in the data directory,   │
+│                                          that wallet is selected             │
+│                                          automatically.                      │
 │ --data-dir                         PATH  Data directory (default:            │
 │                                          ~/.joinmarket-ng or                 │
 │                                          $JOINMARKET_DATA_DIR)               │

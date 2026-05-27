@@ -8,10 +8,11 @@ from pathlib import Path
 from typing import Annotated, Literal
 
 import typer
-from jmcore.cli_common import resolve_mnemonic, setup_cli
+from jmcore.cli_common import setup_cli
 from loguru import logger
 
 from jmwallet.cli import app
+from jmwallet.cli._wallet_selection import resolve_wallet_fingerprint
 
 
 @app.command()
@@ -39,9 +40,35 @@ def history(
                 "Path to mnemonic file. When provided, the history is filtered "
                 "to entries belonging to this wallet (matched by BIP32 master "
                 "fingerprint). Required when multiple wallets share the same "
-                "data directory (issue #473)."
+                "data directory (issue #473) unless --wallet-fingerprint is "
+                "passed instead."
             ),
             envvar="MNEMONIC_FILE",
+        ),
+    ] = None,
+    prompt_bip39_passphrase: Annotated[
+        bool,
+        typer.Option(
+            "--prompt-bip39-passphrase",
+            help=(
+                "Prompt for the BIP39 passphrase when deriving the wallet "
+                "fingerprint from --mnemonic-file. Required when the wallet "
+                "was created with a BIP39 passphrase, otherwise the derived "
+                "fingerprint will not match any recorded history."
+            ),
+        ),
+    ] = False,
+    wallet_fingerprint: Annotated[
+        str | None,
+        typer.Option(
+            "--wallet-fingerprint",
+            help=(
+                "Filter history to this 8-char hex BIP32 master fingerprint. "
+                "Use this instead of --mnemonic-file when you already know the "
+                "fingerprint (e.g. printed by 'jm-wallet info'). When neither "
+                "this flag nor --mnemonic-file is given and history contains "
+                "exactly one wallet, that wallet is selected automatically."
+            ),
         ),
     ] = None,
     all_wallets: Annotated[
@@ -50,7 +77,7 @@ def history(
             "--all-wallets",
             help=(
                 "Show entries from all wallets that have ever written to this "
-                "data directory (default when no --mnemonic-file is given)."
+                "data directory, including legacy rows without a fingerprint."
             ),
         ),
     ] = False,
@@ -61,12 +88,17 @@ def history(
 ) -> None:
     """View CoinJoin transaction history.
 
-    By default, when ``--mnemonic-file`` is provided the output is filtered
-    to entries belonging to that wallet only. Without a mnemonic, all entries
-    in the data directory are shown (legacy behavior). Pass ``--all-wallets``
-    explicitly to override per-wallet filtering when a mnemonic is given.
+    By default the active wallet's entries are shown. The wallet is
+    selected (in priority order) from ``--wallet-fingerprint``,
+    ``--mnemonic-file`` (with optional ``--prompt-bip39-passphrase``),
+    or auto-detected when ``history.csv`` contains exactly one wallet.
+    Pass ``--all-wallets`` to disable per-wallet filtering entirely.
     """
-    from jmwallet.history import get_history_stats, read_history
+    from jmwallet.history import (
+        get_history_stats,
+        list_history_fingerprints,
+        read_history,
+    )
 
     settings = setup_cli(log_level)
 
@@ -79,18 +111,17 @@ def history(
 
     # Resolve the wallet fingerprint to scope the history to (issue #473).
     wallet_fp: str | None = None
-    if mnemonic_file is not None and not all_wallets:
-        try:
-            resolved = resolve_mnemonic(settings, mnemonic_file=mnemonic_file)
-        except (FileNotFoundError, ValueError) as e:
-            logger.error(str(e))
-            raise typer.Exit(1)
-        if resolved is None:
-            logger.error("No mnemonic provided")
-            raise typer.Exit(1)
-        from jmwallet.backends.descriptor_wallet import get_mnemonic_fingerprint
-
-        wallet_fp = get_mnemonic_fingerprint(resolved.mnemonic, resolved.bip39_passphrase or "")
+    if not all_wallets:
+        resolved_data_dir = data_dir if data_dir else settings.get_data_dir()
+        wallet_fp = resolve_wallet_fingerprint(
+            settings,
+            mnemonic_file=mnemonic_file,
+            wallet_fingerprint=wallet_fingerprint,
+            prompt_bip39_passphrase=prompt_bip39_passphrase,
+            list_known_fingerprints=lambda: list_history_fingerprints(resolved_data_dir),
+            command_label="jm-wallet history",
+            allow_all_wallets=True,
+        )
 
     if stats:
         stats_data = get_history_stats(data_dir, wallet_fingerprint=wallet_fp)

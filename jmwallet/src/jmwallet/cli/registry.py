@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Annotated
 
 import typer
-from jmcore.cli_common import resolve_mnemonic, setup_cli
+from jmcore.cli_common import setup_cli
 from loguru import logger
 
 from jmwallet.cli import app
@@ -28,6 +28,20 @@ def registry_show(
     prompt_bip39_passphrase: Annotated[
         bool, typer.Option("--prompt-bip39-passphrase", help="Prompt for BIP39 passphrase")
     ] = False,
+    wallet_fingerprint: Annotated[
+        str | None,
+        typer.Option(
+            "--wallet-fingerprint",
+            help=(
+                "Select the per-wallet bond registry by its 8-char hex BIP32 "
+                "master fingerprint. Use this instead of --mnemonic-file when "
+                "you already know the fingerprint (e.g. from 'jm-wallet info'). "
+                "When neither is provided and exactly one wallet has a "
+                "registry in the data directory, that wallet is selected "
+                "automatically."
+            ),
+        ),
+    ] = None,
     data_dir: Annotated[
         Path | None,
         typer.Option(
@@ -47,34 +61,33 @@ def registry_show(
 
     from jmcore.btc_script import disassemble_script
 
-    from jmwallet.backends.descriptor_wallet import get_mnemonic_fingerprint
-    from jmwallet.wallet.bond_registry import get_registry_path, load_registry
+    from jmwallet.cli._wallet_selection import resolve_wallet_fingerprint
+    from jmwallet.wallet.bond_registry import (
+        get_registry_path,
+        list_registry_fingerprints,
+        load_registry,
+    )
+
+    resolved_data_dir = data_dir if data_dir else settings.get_data_dir()
 
     # Per-wallet registry scoping (issue #492) requires a wallet identity
-    # to know which file to read.
-    try:
-        resolved = resolve_mnemonic(
-            settings,
-            mnemonic_file=mnemonic_file,
-            prompt_bip39_passphrase=prompt_bip39_passphrase,
-        )
-    except (FileNotFoundError, ValueError) as e:
-        logger.error(str(e))
+    # to know which file to read. Accept it via --mnemonic-file,
+    # --wallet-fingerprint, or auto-detect when only one wallet is present.
+    fingerprint = resolve_wallet_fingerprint(
+        settings,
+        mnemonic_file=mnemonic_file,
+        wallet_fingerprint=wallet_fingerprint,
+        prompt_bip39_passphrase=prompt_bip39_passphrase,
+        list_known_fingerprints=lambda: list_registry_fingerprints(resolved_data_dir),
+        command_label="jm-wallet registry-show",
+    )
+    if fingerprint is None:
         logger.error(
-            "registry-show requires --mnemonic-file (or settings) to select "
-            "the per-wallet bond registry."
+            "registry-show requires a wallet identity. Pass --mnemonic-file "
+            "(with --prompt-bip39-passphrase if needed) or --wallet-fingerprint."
         )
         raise typer.Exit(1)
 
-    if not resolved:
-        logger.error(
-            "registry-show requires --mnemonic-file (or settings) to select "
-            "the per-wallet bond registry."
-        )
-        raise typer.Exit(1)
-
-    fingerprint = get_mnemonic_fingerprint(resolved.mnemonic, resolved.bip39_passphrase)
-    resolved_data_dir = data_dir if data_dir else settings.get_data_dir()
     registry = load_registry(resolved_data_dir, fingerprint)
     registry_path = get_registry_path(resolved_data_dir, fingerprint)
 

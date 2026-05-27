@@ -460,6 +460,43 @@ def read_history(
     return entries
 
 
+def list_history_fingerprints(data_dir: Path | None = None) -> list[str]:
+    """List distinct wallet fingerprints recorded in the history CSV.
+
+    Used by ``jm-wallet history`` to auto-select the active wallet when
+    only one is present in the data directory, and to print a helpful
+    error listing the available choices when several are. Empty
+    fingerprints (legacy rows written before issue #473 added the
+    column) are excluded; callers can fall back to ``--all-wallets``
+    if they want to see those rows.
+
+    Args:
+        data_dir: Optional data directory (defaults to
+            ``get_default_data_dir()``).
+
+    Returns:
+        Sorted list of distinct non-empty wallet fingerprints found in
+        ``history.csv``. Returns an empty list when the file is missing
+        or unreadable.
+    """
+    history_path = _get_history_path(data_dir)
+    if not history_path.exists():
+        return []
+
+    fingerprints: set[str] = set()
+    try:
+        with open(history_path, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                fp = (row.get("wallet_fingerprint") or "").strip()
+                if fp:
+                    fingerprints.add(fp)
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning(f"Failed to scan history for wallet fingerprints: {e}")
+        return []
+    return sorted(fingerprints)
+
+
 def _parse_utxos(utxos_used: str) -> set[str]:
     """Parse a comma-separated utxos_used string into a set of UTXO identifiers.
 
