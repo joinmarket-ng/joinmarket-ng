@@ -701,6 +701,8 @@ jobs:
 
       - name: Install Playwright dependencies
         working-directory: tests/playwright
+        env:
+          DEBIAN_FRONTEND: noninteractive
         run: |
           npm ci
           npx playwright install --with-deps chromium
