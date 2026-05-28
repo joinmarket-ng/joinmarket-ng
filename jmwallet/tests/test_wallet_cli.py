@@ -1377,7 +1377,9 @@ def test_password_confirmation_success_first_try():
 
 def test_password_confirmation_fails_after_max_attempts():
     """Test that password confirmation exits after max attempts."""
-    from click.exceptions import Exit
+    # Use typer.Exit (typer 0.26+ vendors click; click.exceptions.Exit is no
+    # longer the class actually raised by typer.Exit).
+    from typer import Exit
 
     from jmwallet.cli import prompt_password_with_confirmation
 
