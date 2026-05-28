@@ -1202,11 +1202,14 @@ def test_tui_pause_before_clear_on_cli_errors() -> None:
     err_block = err_start.split("fi")[0]
     assert "pause" in err_block, "START missing pause"
 
-    # Check Maker RESTART error path
+    # Check Maker RESTART error path: pause must come before clear
     restart = content.split("RESTART)")[1].split("esac")[0]
     err_restart = restart.split("if [ $RESTART_RC -ne 0 ]; then")[1]
     err_block = err_restart.split("fi")[0]
     assert "pause" in err_block, "RESTART missing pause"
+    pause_pos = err_block.index("pause")
+    clear_pos = err_block.index("clear") if "clear" in err_block else len(err_block)
+    assert pause_pos < clear_pos, "RESTART: pause must come before clear in error block"
 
     # Check Wallet NEW error path
     new = content.split("NEW)")[1].split(";;")[0]
@@ -1215,7 +1218,8 @@ def test_tui_pause_before_clear_on_cli_errors() -> None:
     assert "pause" in else_block, "NEW missing pause"
 
     # Check Wallet IMP error path
-    imp = content.split("IMP)")[1].split(";;")[0]
+    # Use "IMP)\n" to match the case label, not the string in a whiptail message
+    imp = content.split("IMP)\n")[1].split(";;")[0]
     after_res = imp.split("RESULT=$?")[1]
     else_block = after_res.split("else")[1].split("fi")[0]
     assert "pause" in else_block, "IMP missing pause"

@@ -1639,11 +1639,12 @@ if [ "${RASPIBLITZ}" -eq 1 ]; then
                   maker_start
               )
               RESTART_RC=$?
-              clear
               if [ $RESTART_RC -ne 0 ]; then
                   pause
+                  clear
                   continue
               fi
+              clear
               sleep 2
               echo ""
               echo "Service status:"
