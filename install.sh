@@ -1328,6 +1328,11 @@ main() {
 
 # Only run main when this file is executed directly, not when sourced.
 # Sourcing is used by tests to call individual helper functions.
-if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
-    main "$@"
-fi
+#
+# We can't compare BASH_SOURCE[0] to $0 here, because when the script is
+# piped (curl ... | bash), BASH_SOURCE[0] is empty while $0 is 'bash',
+# and the comparison fails, silently skipping main and exiting 0.
+# Instead, attempt `return`: it only succeeds inside a sourced file. If
+# the script is executed (directly or via a pipe), `return` fails and
+# main runs.
+(return 0 2>/dev/null) || main "$@"
