@@ -27,6 +27,7 @@ import asyncio
 import logging
 import socket
 import sys
+import time
 from dataclasses import dataclass
 
 from jmcore.crypto import NickIdentity
@@ -134,6 +135,22 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Seconds of silence before early exit (default: 10)",
     )
     parser.add_argument(
+        "--retries",
+        type=int,
+        default=2,
+        help=(
+            "Number of additional attempts when no directory connects "
+            "(default: 2, i.e. up to 3 total tries). "
+            "Each retry pauses --retry-delay seconds before reconnecting."
+        ),
+    )
+    parser.add_argument(
+        "--retry-delay",
+        type=float,
+        default=10.0,
+        help="Seconds to wait between connection retries (default: 10)",
+    )
+    parser.add_argument(
         "--directory",
         action="append",
         default=None,
@@ -162,30 +179,59 @@ def main(argv: list[str] | None = None) -> int:
         print("ERROR: no directory servers configured", file=sys.stderr)
         return 2
 
-    logger.info("Fetching signet orderbook from %d directories", len(directories))
-    try:
-        result = asyncio.run(
-            fetch_offers(
-                directories=directories,
-                socks_host=args.socks_host,
-                socks_port=args.socks_port,
-                min_wait=args.min_wait,
-                max_wait=args.max_wait,
-                quiet_period=args.quiet_period,
+    max_attempts = 1 + args.retries
+    result: OrderbookResult | None = None
+    for attempt in range(1, max_attempts + 1):
+        if attempt > 1:
+            logger.info(
+                "Retrying in %.0f seconds (attempt %d/%d)...",
+                args.retry_delay,
+                attempt,
+                max_attempts,
             )
+            time.sleep(args.retry_delay)
+        logger.info(
+            "Fetching signet orderbook from %d directories (attempt %d/%d)",
+            len(directories),
+            attempt,
+            max_attempts,
         )
-    except Exception as exc:  # noqa: BLE001 -- surface anything to the runner
-        print(f"ERROR: orderbook fetch failed: {exc}", file=sys.stderr)
-        return 1
+        try:
+            result = asyncio.run(
+                fetch_offers(
+                    directories=directories,
+                    socks_host=args.socks_host,
+                    socks_port=args.socks_port,
+                    min_wait=args.min_wait,
+                    max_wait=args.max_wait,
+                    quiet_period=args.quiet_period,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 -- surface anything to the runner
+            print(f"ERROR: orderbook fetch failed: {exc}", file=sys.stderr)
+            return 1
+        if result.connected > 0:
+            break
+        logger.warning(
+            "Attempt %d/%d: connected to 0/%d directories",
+            attempt,
+            max_attempts,
+            result.total_directories,
+        )
+
+    assert result is not None
 
     if result.connected == 0:
+        # Could not connect to any directory. This may mean the signet
+        # directory nodes are temporarily offline (volunteer-operated) rather
+        # than that the install is broken. Emit a clear WARNING but do not
+        # fail CI for something outside our control.
         print(
-            f"ERROR: could not connect to any of {result.total_directories} "
-            "signet directory nodes. Tor is reachable but the JoinMarket "
-            "directory protocol or directory nodes are not responding.",
-            file=sys.stderr,
+            f"WARNING: could not connect to any of {result.total_directories} "
+            "signet directory nodes. Tor is reachable but no directory "
+            "responded. Signet directory nodes may be temporarily offline."
         )
-        return 1
+        return 0
 
     if result.offer_count >= args.min_offers:
         print(

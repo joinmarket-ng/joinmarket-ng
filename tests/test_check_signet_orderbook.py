@@ -179,20 +179,60 @@ def test_main_connected_but_no_offers_is_warning_not_failure(
     assert "0 offers" in out
 
 
-def test_main_no_directories_connected_is_failure(
+def test_main_no_directories_connected_is_warning(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """If no directory could be connected, the install is broken -- hard fail."""
+    """No directories connected should be a WARNING (exit 0), not a hard fail.
+
+    Signet directory nodes are volunteer-operated and may be temporarily
+    offline. We cannot distinguish that from a broken install, so we
+    treat it the same as 'connected but no offers'.
+    """
     monkeypatch.setattr(cso, "_socks_reachable", lambda *_a, **_kw: True)
+    monkeypatch.setattr(cso, "time", MagicMock(sleep=MagicMock()))
 
     async def _fake(**_kw: Any) -> cso.OrderbookResult:
         return _fake_result(connected=0, total=2, offers=0)
 
     monkeypatch.setattr(cso, "fetch_offers", _fake)
-    rc = cso.main(["--directory", "a.onion:5222", "--directory", "b.onion:5222"])
-    assert rc == 1
-    err = capsys.readouterr().err
-    assert "could not connect" in err
+    rc = cso.main(
+        ["--directory", "a.onion:5222", "--directory", "b.onion:5222", "--retries", "0"]
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "WARNING" in out
+    assert "could not connect" in out
+
+
+def test_main_retries_on_no_connection(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """When connected=0, the script retries up to --retries times."""
+    monkeypatch.setattr(cso, "_socks_reachable", lambda *_a, **_kw: True)
+
+    sleep_mock = MagicMock()
+    monkeypatch.setattr(cso.time, "sleep", sleep_mock)
+
+    call_count = 0
+
+    async def _fake(**_kw: Any) -> cso.OrderbookResult:
+        nonlocal call_count
+        call_count += 1
+        # Succeed on the second attempt.
+        if call_count >= 2:
+            return _fake_result(connected=1, total=1, offers=3)
+        return _fake_result(connected=0, total=1, offers=0)
+
+    monkeypatch.setattr(cso, "fetch_offers", _fake)
+    rc = cso.main(
+        ["--directory", "a.onion:5222", "--retries", "2", "--retry-delay", "0"]
+    )
+    assert rc == 0
+    assert call_count == 2, "Should have retried once and succeeded"
+    sleep_mock.assert_called_once_with(0.0)
+    out = capsys.readouterr().out
+    assert "OK" in out
+    assert "3 offers" in out
 
 
 def test_main_no_directories(
