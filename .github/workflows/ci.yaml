@@ -705,7 +705,13 @@ jobs:
           DEBIAN_FRONTEND: noninteractive
         run: |
           npm ci
-          npx playwright install --with-deps chromium
+          # Install the browser binary (no sudo needed).
+          npx playwright install chromium
+          # Install OS-level system dependencies for Chromium. playwright
+          # install-deps calls apt-get internally via sudo; we pass
+          # DEBIAN_FRONTEND=noninteractive explicitly through sudo env so it
+          # is not dropped by sudo's env_reset policy.
+          sudo env DEBIAN_FRONTEND=noninteractive npx playwright install-deps chromium
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
