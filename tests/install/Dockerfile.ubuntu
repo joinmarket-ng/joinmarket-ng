@@ -1,0 +1,30 @@
+# End-to-end install test for Ubuntu (minimal base).
+# See ``Dockerfile.debian`` for design notes - this is the same test
+# with an Ubuntu base image, exercising the same apt code path against
+# a different distribution to catch divergence (different default
+# package sets, different sudo configuration).
+ARG UBUNTU_BASE=ubuntu:24.04
+FROM ${UBUNTU_BASE}
+
+ARG INSTALL_USER=installtest
+
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        bash sudo adduser ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Ubuntu 24.04 ships a default ``ubuntu`` user with UID 1000. Use a
+# different UID to avoid clashes and keep parity with the Debian image.
+RUN adduser --disabled-password --gecos "" --uid 1500 ${INSTALL_USER} \
+    && echo "${INSTALL_USER} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/${INSTALL_USER} \
+    && chmod 0440 /etc/sudoers.d/${INSTALL_USER}
+
+USER ${INSTALL_USER}
+WORKDIR /home/${INSTALL_USER}
+
+COPY --chown=${INSTALL_USER}:${INSTALL_USER} install.sh /home/${INSTALL_USER}/install.sh
+COPY --chown=${INSTALL_USER}:${INSTALL_USER} tests/install/run_install_smoke.sh /home/${INSTALL_USER}/run_install_smoke.sh
+
+RUN chmod +x /home/${INSTALL_USER}/install.sh /home/${INSTALL_USER}/run_install_smoke.sh
+
+CMD ["/home/installtest/run_install_smoke.sh"]

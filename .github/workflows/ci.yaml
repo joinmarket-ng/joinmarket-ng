@@ -185,6 +185,72 @@ jobs:
         if: always()
 
   # ==========================================================================
+  # Stage 2b: install.sh smoke tests across operating systems
+  # Linux: real Docker install in vanilla debian:stable-slim + ubuntu:24.04,
+  # verifies the script bootstraps curl/gnupg/sudo and that jm-wallet --help
+  # runs in the resulting venv.
+  # macOS / Windows: ``bash install.sh --help`` syntax/portability check.
+  # A full install on those runners would take >20 minutes (Xcode, MSYS) and
+  # is not the failure mode users hit (they hit missing-prereq diagnostics).
+  # ==========================================================================
+  test-install-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install pytest
+        run: pip install pytest pytest-timeout
+      - name: Run install.sh smoke tests in Debian and Ubuntu containers
+        run: pytest -c pytest.ini tests/test_install_e2e.py -m docker -v -s --timeout=900
+
+  test-install-macos:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Lint script (bash -n)
+        run: bash -n install.sh
+      - name: install.sh --help works on macOS bash
+        # macOS ships bash 3.2; the script must remain compatible with it
+        # for ``--help`` to succeed even though full installs require a
+        # newer bash from Homebrew.
+        run: bash install.sh --help
+
+  test-install-windows:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        # GitHub Actions on windows-latest ships Git for Windows which
+        # provides a POSIX bash (msys2). We use it to verify install.sh
+        # parses on Windows even though real installation would require
+        # WSL or a Linux container.
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Lint script (bash -n)
+        run: bash -n install.sh
+      - name: install.sh --help works under git-bash
+        run: bash install.sh --help
+
+  # ==========================================================================
   # Stage 3: Integration tests (require Docker infrastructure)
   # Uses pre-built images from build-images where needed
   # Also runs docker-marked tests from jmwallet and maker

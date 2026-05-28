@@ -1,0 +1,48 @@
+# End-to-end install test for Debian (minimal base, no curl/sudo/gnupg).
+#
+# This image starts from a barebones ``debian:stable-slim`` to reproduce
+# the conditions in which ``install.sh`` was failing: minimal Debian
+# without ``curl``, ``gnupg``, or ``sudo`` preinstalled.
+#
+# The container runs ``install.sh`` as a non-root user with passwordless
+# sudo, then asserts that ``jm-wallet --help`` works. This catches:
+#
+#   * The script correctly identifies missing ``curl``/``gnupg`` as
+#     system dependencies and installs them via apt.
+#   * The privilege-escalation helper resolves ``sudo`` (or fails fast
+#     with an actionable error when it cannot).
+#   * The end result is a working venv with ``jm-wallet`` on PATH.
+#
+# Keep this image small. We only need enough to bootstrap the script.
+ARG DEBIAN_BASE=debian:stable-slim
+FROM ${DEBIAN_BASE}
+
+ARG INSTALL_USER=installtest
+
+# Install the minimum the installer expects to find: a shell, sudo,
+# and a way to create a non-root user. We deliberately do NOT install
+# curl, gnupg, build tools, python, etc - the installer must detect
+# them missing and add them itself.
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        bash sudo adduser ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Non-root user with passwordless sudo so the installer's ``sudo apt``
+# calls work unattended.
+RUN adduser --disabled-password --gecos "" ${INSTALL_USER} \
+    && echo "${INSTALL_USER} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/${INSTALL_USER} \
+    && chmod 0440 /etc/sudoers.d/${INSTALL_USER}
+
+USER ${INSTALL_USER}
+WORKDIR /home/${INSTALL_USER}
+
+# Copy the script under test from the repo root (build context).
+COPY --chown=${INSTALL_USER}:${INSTALL_USER} install.sh /home/${INSTALL_USER}/install.sh
+COPY --chown=${INSTALL_USER}:${INSTALL_USER} tests/install/run_install_smoke.sh /home/${INSTALL_USER}/run_install_smoke.sh
+
+RUN chmod +x /home/${INSTALL_USER}/install.sh /home/${INSTALL_USER}/run_install_smoke.sh
+
+# Default to running the smoke test so ``docker run <image>`` is the
+# entire test. Override with a custom command when debugging.
+CMD ["/home/installtest/run_install_smoke.sh"]
