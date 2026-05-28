@@ -1316,6 +1316,15 @@ if [ "${RASPIBLITZ}" -eq 1 ]; then
                   continue
               fi
 
+              # Check if wallet already exists (issue #476)
+              WALLET_PATH="$DATA_DIR/wallets/${WNAME}.mnemonic"
+              if [ -f "$WALLET_PATH" ]; then
+                  if ! whiptail --title " Wallet Already Exists " --defaultno \
+                      --yesno "A wallet named '${WNAME}' already exists.\n\nOverwrite?" 9 55; then
+                      continue
+                  fi
+              fi
+
               # Ask for seed word count (default 24; 12 is also widely supported)
               WORDS_CHOICE=$(whiptail --title " Create New Wallet " --notags \
                   --menu "How many seed words should the new wallet have?" 12 55 2 \
@@ -1324,7 +1333,6 @@ if [ "${RASPIBLITZ}" -eq 1 ]; then
                   3>&1 1>&2 2>&3) || continue
               WORDS="${WORDS_CHOICE:-24}"
 
-              WALLET_PATH="$DATA_DIR/wallets/${WNAME}.mnemonic"
               mkdir -p "$DATA_DIR/wallets"
 
               # Collect the encryption password via whiptail so the user
@@ -1341,7 +1349,7 @@ if [ "${RASPIBLITZ}" -eq 1 ]; then
               echo ""
               echo "Generating wallet..."
               MNEMONIC_PASSWORD="$NEW_PWD" jm-wallet generate \
-                  --words "$WORDS" --no-prompt-password -o "$WALLET_PATH"
+                  --words "$WORDS" --no-prompt-password --force -o "$WALLET_PATH"
               RESULT=$?
 
               if [ $RESULT -eq 0 ] && [ -f "$WALLET_PATH" ]; then

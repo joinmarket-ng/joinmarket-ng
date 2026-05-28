@@ -824,6 +824,32 @@ def test_generate_overwrite_protection():
         assert output_file.read_text() != "existing mnemonic"
 
 
+def test_generate_force_overwrite():
+    """Test that --force flag skips overwrite confirmation on generate."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        output_file = Path(tmpdir) / "existing.mnemonic"
+        output_file.write_text("old content")
+
+        # Generate with --force should overwrite without prompting
+        result = runner.invoke(
+            app,
+            [
+                "generate",
+                "--output",
+                str(output_file),
+                "--no-prompt-password",
+                "--force",
+            ],
+        )
+
+        assert result.exit_code == 0, f"generate --force failed: {result.stdout}"
+        assert "GENERATED MNEMONIC" in result.stdout
+        # File should be overwritten (no longer contains "old content")
+        assert output_file.read_text() != "old content"
+        # Should NOT show overwrite prompt
+        assert "Overwrite existing wallet file?" not in result.stdout
+
+
 def test_info_uses_default_wallet(monkeypatch):
     """Test that info command can use default wallet path."""
     # Ensure no leaked JOINMARKET_DATA_DIR env var overrides Path.home() resolution.

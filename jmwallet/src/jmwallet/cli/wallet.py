@@ -178,6 +178,10 @@ def generate(
             help="Prompt for password interactively (default: prompt)",
         ),
     ] = True,
+    force: Annotated[
+        bool,
+        typer.Option("--force", "-f", help="Overwrite existing file without confirmation"),
+    ] = False,
     data_dir: Annotated[
         Path | None,
         typer.Option(
@@ -212,7 +216,7 @@ def generate(
                 output_file = get_default_data_dir() / "wallets" / "default.mnemonic"
 
             # Check if file already exists BEFORE generating the seed
-            if output_file.exists():
+            if output_file.exists() and not force:
                 logger.warning(f"Wallet file already exists: {output_file}")
                 overwrite = typer.confirm("Overwrite existing wallet file?", default=False)
                 if not overwrite:
