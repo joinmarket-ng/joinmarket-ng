@@ -186,12 +186,15 @@ jobs:
 
   # ==========================================================================
   # Stage 2b: install.sh smoke tests across operating systems
-  # Linux: real Docker install in vanilla debian:stable-slim + ubuntu:24.04,
-  # verifies the script bootstraps curl/gnupg/sudo and that jm-wallet --help
-  # runs in the resulting venv.
-  # macOS / Windows: ``bash install.sh --help`` syntax/portability check.
-  # A full install on those runners would take >20 minutes (Xcode, MSYS) and
-  # is not the failure mode users hit (they hit missing-prereq diagnostics).
+  # Linux (container): real Docker install in vanilla debian:stable-slim +
+  # ubuntu:24.04, verifies the script bootstraps curl/gnupg/sudo and that
+  # jm-wallet --help runs in the resulting venv.
+  # Linux/macOS (native): real install + Tor + signet orderbook fetch over
+  # Tor against the public signet directory nodes, proving the installed
+  # software can speak the JoinMarket protocol end to end.
+  # Windows (native): documented pip-based install + Tor + same signet
+  # orderbook smoke. install.sh itself is only --help/-n linted on Windows
+  # because the script targets POSIX shells with apt/brew.
   # ==========================================================================
   test-install-linux:
     runs-on: ubuntu-latest
@@ -208,13 +211,61 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install pytest
-        run: pip install pytest pytest-timeout
+        run: pip install pytest pytest-timeout pytest-cov
       - name: Run install.sh smoke tests in Debian and Ubuntu containers
-        run: pytest -c pytest.ini tests/test_install_e2e.py -m docker -v -s --timeout=900
+        env:
+          # Install from the workflow ref so the smoke exercises the code
+          # under review. Without this, install.sh would clone main (which
+          # may not contain the proposed changes).
+          JMNG_INSTALL_REF: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: pytest -c pytest.ini tests/test_install_e2e.py -m docker -v -s --timeout=900 --no-cov
+
+  test-install-linux-native:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Real install via install.sh (this branch HEAD, unsigned)
+        # Install from the workflow ref so install-time CI exercises the
+        # exact code under review. The release tarball + GPG verification
+        # path is exercised by manual operator installs at tag time; here
+        # we pass --skip-verify because branch HEAD commits are unsigned.
+        env:
+          JMNG_INSTALL_REF: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: bash install.sh -y --skip-tor --skip-verify --taker --version "$JMNG_INSTALL_REF"
+      - name: Install Tor and start it
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tor
+          sudo systemctl start tor || sudo service tor start
+          for i in $(seq 1 60); do
+            if nc -z 127.0.0.1 9050; then
+              echo "Tor SOCKS5 ready after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Tor SOCKS5 did not become reachable" >&2
+          sudo systemctl status tor || true
+          exit 1
+      - name: Fetch signet orderbook over Tor
+        run: |
+          set -euo pipefail
+          PYBIN="$HOME/.joinmarket-ng/venv/bin/python"
+          if [ ! -x "$PYBIN" ]; then
+            echo "Expected venv python at $PYBIN" >&2
+            ls -la "$HOME/.joinmarket-ng" || true
+            exit 1
+          fi
+          "$PYBIN" scripts/check_signet_orderbook.py --min-offers 1
 
   test-install-macos:
     runs-on: macos-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v6
         with:
@@ -228,16 +279,47 @@ jobs:
         # for ``--help`` to succeed even though full installs require a
         # newer bash from Homebrew.
         run: bash install.sh --help
+      - name: Real install via install.sh (this branch HEAD, unsigned)
+        # Exercises the brew prerequisite path and source install from the
+        # workflow ref so install-time CI runs the code under review. The
+        # release tarball + GPG verification path is exercised by manual
+        # operator installs at tag time; here we pass --skip-verify because
+        # branch HEAD commits are unsigned. macOS ships bash 3.2; install.sh
+        # upgrades itself via brew if needed.
+        env:
+          JMNG_INSTALL_REF: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: bash install.sh -y --skip-tor --skip-verify --taker --version "$JMNG_INSTALL_REF"
+      - name: Install Tor via Homebrew and start it
+        run: |
+          brew install tor
+          brew services start tor
+          # Wait for Tor to bootstrap; SOCKS port becomes reachable when ready.
+          for i in $(seq 1 60); do
+            if nc -z 127.0.0.1 9050; then
+              echo "Tor SOCKS5 ready after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Tor SOCKS5 did not become reachable" >&2
+          brew services list || true
+          exit 1
+      - name: Fetch signet orderbook over Tor
+        run: |
+          set -euo pipefail
+          PYBIN="$HOME/.joinmarket-ng/venv/bin/python"
+          if [ ! -x "$PYBIN" ]; then
+            echo "Expected venv python at $PYBIN" >&2
+            ls -la "$HOME/.joinmarket-ng" || true
+            exit 1
+          fi
+          "$PYBIN" scripts/check_signet_orderbook.py --min-offers 1
 
   test-install-windows:
     runs-on: windows-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     defaults:
       run:
-        # GitHub Actions on windows-latest ships Git for Windows which
-        # provides a POSIX bash (msys2). We use it to verify install.sh
-        # parses on Windows even though real installation would require
-        # WSL or a Linux container.
         shell: bash
     steps:
       - uses: actions/checkout@v6
@@ -249,6 +331,110 @@ jobs:
         run: bash -n install.sh
       - name: install.sh --help works under git-bash
         run: bash install.sh --help
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Manual pip install (Windows has no install.sh path)
+        # Windows users follow docs/install/windows.md: install Python +
+        # tor + pip install joinmarket-ng. This exercises that path.
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          # Install from source in editable mode mirrors the documented
+          # Windows quick start.
+          pip install ./jmcore ./taker ./jmwallet
+      - name: Install Tor, start it, and fetch the signet orderbook
+        shell: pwsh
+        # Chocolatey's tor package is unreliable across runner images, so
+        # we fetch the Tor Project's official Expert Bundle directly. The
+        # bundle ships tor.exe under tor/ and geoip files under data/.
+        # Pass configuration through a torrc file rather than command-line
+        # flags: PowerShell's Start-Process -ArgumentList re-splits string
+        # arguments on spaces (so "--Log","notice file $log" reaches tor
+        # as four tokens and fails with "Unknown option 'file'").
+        #
+        # Tor must run as a child of this same step. GitHub Actions kills
+        # any background processes when a step ends, so we cannot bootstrap
+        # tor in one step and exercise it in the next; macOS/Linux jobs get
+        # around this with systemctl / brew services which detach tor from
+        # the step's process tree, but Windows lacks an equivalent on the
+        # hosted runner without elevation. Keeping the fetch in this step
+        # also matches what a real user would do (launch tor, then taker).
+        run: |
+          $ErrorActionPreference = "Stop"
+          $url = "https://archive.torproject.org/tor-package-archive/torbrowser/13.5.7/tor-expert-bundle-windows-x86_64-13.5.7.tar.gz"
+          $work = Join-Path $env:RUNNER_TEMP "tor"
+          $dataDir = Join-Path $work "datadir"
+          New-Item -ItemType Directory -Force -Path $work | Out-Null
+          New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
+          $archive = Join-Path $work "tor.tar.gz"
+          Invoke-WebRequest -Uri $url -OutFile $archive
+          tar -xzf $archive -C $work
+          $torExe = Get-ChildItem -Path $work -Recurse -Filter "tor.exe" | Select-Object -First 1
+          if (-not $torExe) { throw "tor.exe not found in expert bundle" }
+          $geoip = Get-ChildItem -Path $work -Recurse -Filter "geoip" | Where-Object { -not $_.PSIsContainer } | Select-Object -First 1
+          $geoip6 = Get-ChildItem -Path $work -Recurse -Filter "geoip6" | Where-Object { -not $_.PSIsContainer } | Select-Object -First 1
+          $log = Join-Path $work "tor.log"
+          $stdoutLog = Join-Path $work "tor.stdout.log"
+          $stderrLog = Join-Path $work "tor.stderr.log"
+          $torrc = Join-Path $work "torrc"
+          $torrcLines = @(
+            "SocksPort 9050",
+            "DataDirectory $($dataDir -replace '\\','/')",
+            "Log notice file $($log -replace '\\','/')"
+          )
+          if ($geoip)  { $torrcLines += "GeoIPFile $($geoip.FullName -replace '\\','/')" }
+          if ($geoip6) { $torrcLines += "GeoIPv6File $($geoip6.FullName -replace '\\','/')" }
+          $torrcLines | Set-Content -Path $torrc -Encoding ASCII
+          Write-Host "::group::torrc"
+          Get-Content $torrc | Write-Host
+          Write-Host "::endgroup::"
+          $proc = Start-Process -FilePath $torExe.FullName `
+            -ArgumentList @("-f", $torrc) `
+            -WindowStyle Hidden -PassThru `
+            -RedirectStandardOutput $stdoutLog `
+            -RedirectStandardError  $stderrLog
+          Write-Host "Tor pid: $($proc.Id)"
+          # Wait for tor to write "Bootstrapped 100" to the log; SOCKS
+          # readiness alone is not enough for onion circuits.
+          $deadline = (Get-Date).AddSeconds(180)
+          $bootstrapped = $false
+          while ((Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 3
+            if ($proc.HasExited) {
+              Write-Host "Tor exited early with code $($proc.ExitCode)"
+              break
+            }
+            if (Test-Path $log) {
+              $content = Get-Content $log -Raw -ErrorAction SilentlyContinue
+              if ($content -match "Bootstrapped 100") {
+                $bootstrapped = $true
+                Write-Host "Tor bootstrapped"
+                break
+              }
+            }
+          }
+          if (-not $bootstrapped) {
+            Write-Host "::group::tor.log"
+            if (Test-Path $log) { Get-Content $log } else { Write-Host "(missing)" }
+            Write-Host "::endgroup::"
+            Write-Host "::group::tor.stdout.log"
+            if (Test-Path $stdoutLog) { Get-Content $stdoutLog } else { Write-Host "(missing)" }
+            Write-Host "::endgroup::"
+            Write-Host "::group::tor.stderr.log"
+            if (Test-Path $stderrLog) { Get-Content $stderrLog } else { Write-Host "(missing)" }
+            Write-Host "::endgroup::"
+            Write-Error "Tor did not bootstrap in time"
+            exit 1
+          }
+          try {
+            python scripts/check_signet_orderbook.py --min-offers 1
+          } finally {
+            # Stop tor so the runner cleans up promptly; ignore errors
+            # because the process may already be gone if the script killed
+            # it through some side effect.
+            try { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue } catch { }
+          }
 
   # ==========================================================================
   # Stage 3: Integration tests (require Docker infrastructure)

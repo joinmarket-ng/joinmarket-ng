@@ -64,6 +64,11 @@ def _build_and_run(
     ``COPY tests/install/...`` resolve. The container's default ``CMD``
     runs the smoke script, so ``docker run`` returns when the test is
     done.
+
+    The install ref is taken from ``JMNG_INSTALL_REF`` if set (CI passes
+    the workflow head SHA so the smoke installs the code under review),
+    otherwise defaults to ``main`` for ad-hoc local runs against a
+    checked-out branch.
     """
     tag = f"{_TAG_NS}-{tag_suffix}"
     build = subprocess.run(
@@ -83,9 +88,17 @@ def _build_and_run(
     assert build.returncode == 0, (
         f"docker build failed for {dockerfile}:\n{build.stdout}\n{build.stderr}"
     )
+    install_ref = os.environ.get("JMNG_INSTALL_REF", "main")
     try:
         run = subprocess.run(
-            ["docker", "run", "--rm", tag],
+            [
+                "docker",
+                "run",
+                "--rm",
+                "-e",
+                f"JMNG_INSTALL_REF={install_ref}",
+                tag,
+            ],
             capture_output=True,
             text=True,
             # The full install pulls Python deps from PyPI / git, which

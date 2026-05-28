@@ -2,24 +2,28 @@
 # Run install.sh in the container and verify the result.
 #
 # Steps:
-#   1. Run ``./install.sh -y --skip-tor --taker --version main`` so the
-#      install is unattended, skips the Tor configuration prompt, only
-#      installs the taker component (faster), and uses the main branch
-#      (avoids the need for a tagged release matching the script).
+#   1. Run ``./install.sh -y --skip-tor --taker --version "$JMNG_INSTALL_REF"
+#      --skip-verify`` so the install is unattended, skips the Tor
+#      configuration prompt, only installs the taker component (faster),
+#      and uses whatever ref the caller supplies (defaults to ``main`` so
+#      a manual ``docker run`` against the test image still works).
 #   2. Source the venv it created and run ``jm-wallet --help`` to prove
 #      the entry point is wired up.
 #   3. Print a clear PASS/FAIL marker so the calling pytest can grep
 #      for it without depending on exit codes alone.
 #
-# The script intentionally uses --version main + --skip-verify (implied
-# by --version main per install.sh) so the smoke test does not require
-# a release signature on whatever branch we are testing.
+# The script intentionally passes --skip-verify so the smoke test does
+# not require a release signature on whatever branch / commit we are
+# testing. CI overrides JMNG_INSTALL_REF to the workflow head SHA so the
+# install exercises the exact code under review (otherwise install.sh
+# would pull from ``main`` which would not contain the proposed changes).
 set -euo pipefail
 
-echo "=== running install.sh ==="
+INSTALL_REF="${JMNG_INSTALL_REF:-main}"
+echo "=== running install.sh against ref ${INSTALL_REF} ==="
 # Use ``-x`` only for the install step so failures show the offending
 # line without polluting the rest of the log.
-bash -x ./install.sh -y --skip-tor --taker --version main
+bash -x ./install.sh -y --skip-tor --skip-verify --taker --version "${INSTALL_REF}"
 
 VENV="${HOME}/.joinmarket-ng/venv"
 if [[ ! -f "${VENV}/bin/activate" ]]; then
