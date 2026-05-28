@@ -7,7 +7,7 @@ from __future__ import annotations
 import base64
 
 import pytest
-from libnacl import CryptError
+from nacl.exceptions import CryptoError
 
 from jmcore.encryption import (
     CryptoSession,
@@ -25,11 +25,11 @@ def test_init_keypair():
     """Test creating a new NaCl keypair."""
     keypair = init_keypair()
     assert keypair is not None
-    # Keypair should have public and secret keys
-    assert hasattr(keypair, "pk")
-    assert hasattr(keypair, "sk")
-    assert len(keypair.pk) == 32  # NaCl public keys are 32 bytes
-    assert len(keypair.sk) == 32  # NaCl secret keys are 32 bytes
+    # PyNaCl PrivateKey exposes 32-byte raw private key via bytes(...)
+    # and its matching public key via the .public_key attribute.
+    assert hasattr(keypair, "public_key")
+    assert len(bytes(keypair)) == 32  # NaCl secret keys are 32 bytes
+    assert len(bytes(keypair.public_key)) == 32  # NaCl public keys are 32 bytes
 
 
 def test_get_pubkey_hex():
@@ -67,8 +67,8 @@ def test_init_pubkey():
     # Recreate the public key from hex
     pubkey = init_pubkey(pubkey_hex)
     assert pubkey is not None
-    # PublicKey has a pk attribute that contains the raw bytes
-    assert len(pubkey.pk) == 32
+    # PyNaCl PublicKey exposes the 32 raw bytes via bytes(...).
+    assert len(bytes(pubkey)) == 32
 
 
 def test_init_pubkey_invalid_hex():
@@ -364,7 +364,7 @@ def test_different_keypairs_cannot_decrypt():
     assert bob.decrypt(encrypted) == message
 
     # Eve cannot decrypt (will raise or give garbage)
-    with pytest.raises(CryptError):  # NaCl will raise on invalid decryption
+    with pytest.raises(CryptoError):  # NaCl will raise on invalid decryption
         eve.decrypt(encrypted)
 
 
@@ -387,3 +387,50 @@ def test_crypto_session_reusable():
         encrypted = session1.encrypt(msg)
         decrypted = session2.decrypt(encrypted)
         assert decrypted == msg
+
+
+# Wire-format compatibility test vector.
+#
+# These bytes were generated with the legacy ``libnacl`` backend (which is what
+# the reference JoinMarket implementation uses on the wire) and asserts that
+# our current PyNaCl-based backend decrypts them byte-identically. This guards
+# against any accidental switch to a non-standard format (e.g. detached MAC,
+# different nonce length) that would break interop with reference makers and
+# takers.
+LIBNACL_INTEROP_ALICE_SK_HEX = "01" * 32
+LIBNACL_INTEROP_BOB_SK_HEX = "02" * 32
+LIBNACL_INTEROP_BOB_PK_HEX = "ce8d3ad1ccb633ec7b70c17814a5c76ecd029685050d344745ba05870e587d59"
+LIBNACL_INTEROP_ALICE_PK_HEX = "a4e09292b651c278b9772c569f5fa9bb13d906b46ab68c9df9dc2b4409f8a209"
+LIBNACL_INTEROP_NONCE_HEX = "000102030405060708090a0b0c0d0e0f1011121314151617"
+LIBNACL_INTEROP_PLAINTEXT = b"joinmarket interop test vector v1"
+LIBNACL_INTEROP_CIPHERTEXT_HEX = (
+    "000102030405060708090a0b0c0d0e0f101112131415161736c590463133f68c"
+    "31a400facb0e744388a0eaadf750945ddc2258aea2e8628ab4a35c92c6c4bf52"
+    "772538564f62cccaf7"
+)
+
+
+def test_libnacl_wire_vector_decryptable() -> None:
+    """PyNaCl must decrypt ciphertext produced by libnacl (reference impl)."""
+    from nacl import public
+
+    bob_sk = public.PrivateKey(bytes.fromhex(LIBNACL_INTEROP_BOB_SK_HEX))
+    alice_pk = public.PublicKey(bytes.fromhex(LIBNACL_INTEROP_ALICE_PK_HEX))
+    box = public.Box(bob_sk, alice_pk)
+
+    ct = bytes.fromhex(LIBNACL_INTEROP_CIPHERTEXT_HEX)
+    plaintext = box.decrypt(ct)
+    assert plaintext == LIBNACL_INTEROP_PLAINTEXT
+
+
+def test_pynacl_encryption_matches_libnacl_format() -> None:
+    """Encrypting with a fixed nonce must reproduce the libnacl byte layout."""
+    from nacl import public
+
+    alice_sk = public.PrivateKey(bytes.fromhex(LIBNACL_INTEROP_ALICE_SK_HEX))
+    bob_pk = public.PublicKey(bytes.fromhex(LIBNACL_INTEROP_BOB_PK_HEX))
+    box = public.Box(alice_sk, bob_pk)
+
+    nonce = bytes.fromhex(LIBNACL_INTEROP_NONCE_HEX)
+    encrypted = box.encrypt(LIBNACL_INTEROP_PLAINTEXT, nonce)
+    assert bytes(encrypted).hex() == LIBNACL_INTEROP_CIPHERTEXT_HEX

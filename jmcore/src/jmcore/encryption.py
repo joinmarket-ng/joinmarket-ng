@@ -3,6 +3,11 @@ End-to-end encryption wrapper using NaCl public-key authenticated encryption.
 
 This implements the JoinMarket encryption protocol using Diffie-Hellman
 key exchange to set up symmetric encryption between makers and takers.
+
+Backed by PyNaCl, which ships precompiled wheels with libsodium statically
+linked for Linux, macOS, and Windows. This removes the runtime dependency
+on a system-provided ``libsodium`` shared library that the previous
+``libnacl`` ctypes wrapper required (and that broke Windows installs).
 """
 
 from __future__ import annotations
@@ -11,45 +16,57 @@ import base64
 import binascii
 from typing import TYPE_CHECKING
 
-from libnacl import public
 from loguru import logger
+from nacl import public
+from nacl.exceptions import CryptoError
 
 if TYPE_CHECKING:
-    from libnacl.public import Box, PublicKey, SecretKey
+    from nacl.public import Box, PrivateKey, PublicKey
+
+
+# Public alias for users who previously caught ``libnacl.CryptError``. PyNaCl
+# raises ``nacl.exceptions.CryptoError`` for decryption/MAC failures; we
+# re-export it under the historical name so call sites and tests can simply
+# import from ``jmcore.encryption``.
+NaclCryptError = CryptoError
 
 
 class NaclError(Exception):
-    """Exception for NaCl encryption errors."""
+    """Exception for NaCl key/usage errors raised by this wrapper."""
 
     pass
 
 
-def init_keypair() -> SecretKey:
+def init_keypair() -> PrivateKey:
     """
     Create a new encryption keypair.
 
     Returns:
-        A NaCl SecretKey object containing the keypair.
+        A NaCl ``PrivateKey`` whose ``.public_key`` attribute exposes the
+        matching public half. The returned object is the private key; pass
+        it directly to :func:`create_encryption_box`.
     """
-    return public.SecretKey()
+    return public.PrivateKey.generate()
 
 
-def get_pubkey(keypair: SecretKey, as_hex: bool = False) -> bytes | str:
+def get_pubkey(keypair: PrivateKey, as_hex: bool = False) -> bytes | str:
     """
     Get the public key from a keypair.
 
     Args:
-        keypair: NaCl keypair object.
+        keypair: NaCl private key (the ``PrivateKey`` returned by
+            :func:`init_keypair`).
         as_hex: Return as hex string if True, otherwise raw bytes.
 
     Returns:
-        Public key as hex string or bytes.
+        Public key as hex string or 32 raw bytes.
     """
-    if not isinstance(keypair, public.SecretKey):
+    if not isinstance(keypair, public.PrivateKey):
         raise NaclError("Object is not a nacl keypair")
+    pk_bytes = bytes(keypair.public_key)
     if as_hex:
-        return keypair.hex_pk().decode("ascii")
-    return keypair.pk
+        return pk_bytes.hex()
+    return pk_bytes
 
 
 def init_pubkey(hexpk: str) -> PublicKey:
@@ -71,12 +88,12 @@ def init_pubkey(hexpk: str) -> PublicKey:
     return public.PublicKey(bin_pk)
 
 
-def create_encryption_box(keypair: SecretKey, counterparty_pk: PublicKey) -> Box:
+def create_encryption_box(keypair: PrivateKey, counterparty_pk: PublicKey) -> Box:
     """
     Create an encryption box for communicating with a counterparty.
 
     Args:
-        keypair: Our NaCl keypair.
+        keypair: Our NaCl private key.
         counterparty_pk: Counterparty's public key.
 
     Returns:
@@ -84,9 +101,9 @@ def create_encryption_box(keypair: SecretKey, counterparty_pk: PublicKey) -> Box
     """
     if not isinstance(counterparty_pk, public.PublicKey):
         raise NaclError("Object is not a public key")
-    if not isinstance(keypair, public.SecretKey):
+    if not isinstance(keypair, public.PrivateKey):
         raise NaclError("Object is not a nacl keypair")
-    return public.Box(keypair.sk, counterparty_pk)
+    return public.Box(keypair, counterparty_pk)
 
 
 def encrypt_encode(message: bytes | str, box: Box) -> str:
@@ -98,11 +115,16 @@ def encrypt_encode(message: bytes | str, box: Box) -> str:
         box: NaCl encryption box.
 
     Returns:
-        Base64-encoded ciphertext.
+        Base64-encoded ciphertext in the standard NaCl combined format
+        (24-byte nonce followed by the ``crypto_box`` output), matching
+        the on-the-wire layout used by the reference implementation.
     """
     if isinstance(message, str):
         message = message.encode("utf-8")
-    encrypted = box.encrypt(message)
+    # ``Box.encrypt`` returns an ``EncryptedMessage`` whose ``bytes(...)``
+    # rendering is ``nonce || ciphertext``, byte-identical to what
+    # ``libnacl.public.Box.encrypt`` used to produce.
+    encrypted = bytes(box.encrypt(message))
     return base64.b64encode(encrypted).decode("ascii")
 
 
@@ -128,7 +150,7 @@ class CryptoSession:
 
     def __init__(self) -> None:
         """Initialize a new crypto session with a fresh keypair."""
-        self.keypair: SecretKey = init_keypair()
+        self.keypair: PrivateKey = init_keypair()
         self.box: Box | None = None
         self.counterparty_pubkey: str = ""
 
