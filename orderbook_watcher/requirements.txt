@@ -4,9 +4,9 @@
 #
 #    pip-compile --generate-hashes --output-file=requirements.txt --strip-extras pyproject.toml
 #
-aiohappyeyeballs==2.6.1 \
-    --hash=sha256:c3f9d0113123803ccadfdf3f0faa505bc78e6a72d1cc4806cbd719826e943558 \
-    --hash=sha256:f349ba8f4b75cb25c99c5c2d84e997e485204d2902a9597802b0371f09331fb8
+aiohappyeyeballs==2.6.2 \
+    --hash=sha256:4708045e2d7a6c6bdf8aafa8ed39649eaf926a4543b54560659129e3365953c4 \
+    --hash=sha256:e202810ee718bd01fc6ef49e8ea53d023d5cb6b581076d7925aa499fa55dbe64
     # via aiohttp
 aiohttp==3.13.5 \
     --hash=sha256:019a67772e034a0e6b9b17c13d0a8fe56ad9fb150fc724b7f3ffd3724288d9e5 \
@@ -306,9 +306,9 @@ httpx-socks==0.11.0 \
     --hash=sha256:2e2de097d87dfc228dd36e3c5ae0588c836e48159f5996b33cef540497af9b32 \
     --hash=sha256:8c28ad569ccf681b45437ea8465203cbc082206659b6f623e4ea509b1eb4e8a7
     # via joinmarket-orderbook-watcher (pyproject.toml)
-idna==3.15 \
-    --hash=sha256:048adeaf8c2d788c40fee287673ccaa74c24ffd8dcf09ffa555a2fbb59f10ac8 \
-    --hash=sha256:ca962446ea538f7092a95e057da437618e886f4d349216d2b1e294abfdb65fdc
+idna==3.17 \
+    --hash=sha256:466e48829084efe2548012b855df21540b96f2e20e51bd124c851536556a592c \
+    --hash=sha256:5eb0cb53bc467c12eadcf6de83163ad8527cec9416f44b9b61b19caedad2b87f
     # via
     #   anyio
     #   httpx

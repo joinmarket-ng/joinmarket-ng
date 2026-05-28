@@ -857,6 +857,9 @@ For full documentation, see [jmwallet Documentation](https://joinmarket-ng.githu
 │                                                         (default: prompt)    │
 │                                                         [default:            │
 │                                                         prompt-password]     │
+│ --force            -f                                   Overwrite existing   │
+│                                                         file without         │
+│                                                         confirmation         │
 │ --data-dir                                     PATH     Data directory       │
 │                                                         (default:            │
 │                                                         ~/.joinmarket-ng or  │

@@ -4,9 +4,9 @@
 # Update with: ./scripts/update-base-images.sh
 # =============================================================================
 ARG PYTHON_VERSION=3.14
-ARG PYTHON_SLIM_DIGEST=sha256:a7185a8e40af01bf891414a4df16ef10fc6000cee460a404a13da9029fe41604
+ARG PYTHON_SLIM_DIGEST=sha256:c845af9399020c7e562969a13689e929074a10fd057acd1b1fad06a2fb068e97
 ARG NODE_VERSION=24
-ARG NODE_SLIM_DIGEST=sha256:4e6b70dd6cbfc88c8157ba19aa3d9f9cce6ba4703576d55459e45efcbc9c5f5d
+ARG NODE_SLIM_DIGEST=sha256:242549cd46785b480c832479a730f4f2a20865d61ea2e404fdb2a5c3d3b73ecf
 # JAM frontend is built on a single fixed platform regardless of the target
 # image platform (the build output is static JS that is platform-independent).
 # Pinning JAM_BUILDER_PLATFORM ensures reproducible JS bytes across hosts.

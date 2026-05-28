@@ -901,6 +901,9 @@ The full CLI reference below is auto-generated from command `--help` output.
 │                                                         (default: prompt)    │
 │                                                         [default:            │
 │                                                         prompt-password]     │
+│ --force            -f                                   Overwrite existing   │
+│                                                         file without         │
+│                                                         confirmation         │
 │ --data-dir                                     PATH     Data directory       │
 │                                                         (default:            │
 │                                                         ~/.joinmarket-ng or  │
