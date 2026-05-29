@@ -140,7 +140,7 @@ modules:
 
   # =========================================================================
   # Module 6: Python application
-  # jmcore, jmwallet, maker, taker, jmwalletd, orderbook_watcher
+  # jmcore, jmwallet, maker, taker, tumbler, jmwalletd, orderbook_watcher
   # =========================================================================
   - name: jam-ng
     buildsystem: simple
@@ -166,7 +166,7 @@ modules:
 
       # Install our packages (no-deps since requirements handle dependencies)
       - pip3 install --no-cache-dir --ignore-installed --no-deps --prefix=/app
-          ./jmcore ./jmwallet ./maker ./taker ./orderbook_watcher ./jmwalletd
+          ./jmcore ./jmwallet ./maker ./taker ./tumbler ./orderbook_watcher ./jmwalletd
 
       # Install entrypoint script and stop helper
       - install -Dm755 flatpak/jam-ng-entrypoint.sh /app/bin/jam-ng
