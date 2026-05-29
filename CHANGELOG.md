@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.31.0] - 2026-05-29
+
+More improvements about deep wallet scanning. Also security hardening, TUI improvements, and bug fixes. Automated Win/Mac/Linux install tests.
+
+### Added
+
+- Disable core dumps and ptrace in long-running daemons to keep wallet secrets out of crash dumps ([252e7146](../../commit/252e7146c4ec11a5fcdf5ee571c3498976378bff))
+- Warn when a CoinJoin destination address script type does not match the wallet's native segwit (p2wpkh) script type ([87c57214](../../commit/87c572149bf50823321b3607999b0dc21f07c1af))
+- Add DirectoryClientPool base class in jmcore to share directory connection-management code between maker and taker ([ef861d92](../../commit/ef861d927f44eb52839169f981cdcaafaa7356f7))
+- TUI: Harmonize wallet selection and password storage across all operations ([d27800bd](../../commit/d27800bdc1ed177b21256804985b35c27871be71))
+- Per-wallet fidelity bond registry; legacy fidelity_bonds.json is migrated automatically per wallet, cold-wallet bond commands now take --wallet-fingerprint, and 'jm-wallet info' prints the wallet fingerprint. ([5bd4eaa7](../../commit/5bd4eaa7d9ac716c9fd9ea3877be490f6befece6))
+- Make container images runtime-user flexible by installing Python packages under /app ([3f85c061](../../commit/3f85c061d6fdffb7c5add79dbd53e55d513f073f))
+- jm-wallet history/list-bonds/registry-show now accept a BIP39 passphrase and auto-pick the wallet when only one is present ([08e97c6a](../../commit/08e97c6a453b9f22f526acf91ea1673a3860a83c))
+- Hash-check installer dependencies by default ([5a200a15](../../commit/5a200a1501c4e14c12931b9e045d2800da2da2dd))
+
+### Fixed
+
+- Verify GPG signatures of tagged releases in install.sh and pin the install to the verified commit hash ([8c36a98f](../../commit/8c36a98f56f9718a524a6addec7736cc2fce9ea4))
+- Fix BIP39 NFKD normalization in mnemonic-to-seed derivation, aligning with the spec and the legacy joinmarket-clientserver ([6761ce07](../../commit/6761ce07402894f4eef6c069e0779f70a5d8e800))
+- Fix SEND password handling and SEED abort behavior. ([c5ecf491](../../commit/c5ecf491f3e089e932558b1c90c061c6e412c4eb))
+- Fix MNEMONIC_PASSWORD leak in SEND and SEED. ([362ed3a6](../../commit/362ed3a658d9090224c103308d28a1bf653262fc))
+- Detect Bitcoin Core nodes started with '-disablewallet' and fail with a clear, actionable message instead of a raw 'Method not found' RPC error. ([436166db](../../commit/436166db40416f14f6649dc2b111c36f9599caf5))
+- Fixed terminal flashes between menu operations and unified ([329d9ac3](../../commit/329d9ac398d1e15cfbd1b05b0ff2f8c7eaed97f4))
+- Fix orderbook_watcher container crash-loop caused by a broken PYTHONPATH ([1d524b7b](../../commit/1d524b7b1974c27847b581f85f183ed11a9f3a92))
+- Installer surfaces missing curl/gnupg/sudo with actionable ([80458c3e](../../commit/80458c3ec4232981483bd05615a4588c4961566c))
+- Fix installer no-op when invoked via 'curl ... | bash' ([979245a5](../../commit/979245a5ec72c29c4a797928267a037a1692d77e))
+- install.sh no longer fails when the GitHub API rate-limits the version lookup ([fb1d3a0c](../../commit/fb1d3a0ca5edaef1aa211e2f62970f216230c878))
+- Replace libnacl with PyNaCl so install.sh works on Windows ([783a24fb](../../commit/783a24fb6ea3044bb2f247a7b501b1359f5ebce7))
+- Fix inconsistent file existence handling in NEW wallet creation. ([e1f6a757](../../commit/e1f6a757b8cad5a630c0337fa639c52ddd8b2faa))
+- Fix missing pause in Maker START/RESTART and Wallet NEW/IMP error handling, allowing users to read error messages before screen clear. ([ce68c6e6](../../commit/ce68c6e6c0f24bc29abae7b6ee6f641642247f06))
+- Fix RESTART error path clearing terminal before user can read the error. ([27312fa0](../../commit/27312fa09ee21eeec1b2dba23a250bf3ecb6fd60))
+- Fix ModuleNotFoundError 'nacl' after updating by resolving and installing changed dependencies (PyNaCl) during install.sh --update ([a49ef88a](../../commit/a49ef88a0c9b37033c082f58a1e9e663ca44a23c))
+- Wire [wallet].gap_limit into descriptor range auto-expansion (was hardcoded 100) ([557ed4ea](../../commit/557ed4eaa92afb40438e372e3a832867d836cfc8))
+- Replace `jm-wallet info --scan-depth` with `jm-wallet rescan --scan-depth N` ([557ed4ea](../../commit/557ed4eaa92afb40438e372e3a832867d836cfc8))
+
 ## [0.30.0] - 2026-05-20
 
 Major improvements for wallet performance, specially for exiting old wallets with lots of transactions. Also security hardening, TUI improvements, and bug fixes.
@@ -1401,7 +1436,8 @@ Releases prior to these changes (including 0.13.5, 0.13.6, and 0.13.7) cannot be
 - Pre-built image support for directory server compose.
 - Tor configuration instructions.
 
-[Unreleased]: ../../compare/0.30.0...HEAD
+[Unreleased]: ../../compare/0.31.0...HEAD
+[0.31.0]: ../../compare/0.30.0...0.31.0
 [0.30.0]: ../../compare/0.29.0...0.30.0
 [0.29.0]: ../../compare/0.28.1...0.29.0
 [0.28.1]: ../../compare/0.28.0...0.28.1
