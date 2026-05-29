@@ -48,6 +48,58 @@ curl -sSL https://raw.githubusercontent.com/joinmarket-ng/joinmarket-ng/main/ins
 curl -sSL https://raw.githubusercontent.com/joinmarket-ng/joinmarket-ng/main/install.sh | bash -s -- --update
 ```
 
+## Flatpak
+
+The Flatpak package (`org.joinmarketng.JamNG`) bundles all services
+(jmwalletd + JAM web UI, Tor, neutrino light client, orderbook watcher) in a
+single sandboxed application.
+
+### Build and install
+
+```bash
+flatpak-builder --user --install --force-clean build-dir flatpak/org.joinmarketng.JamNG.yml
+```
+
+### Run
+
+```bash
+flatpak run org.joinmarketng.JamNG                 # mainnet
+flatpak run org.joinmarketng.JamNG --network signet  # signet
+flatpak run org.joinmarketng.JamNG --no-gui          # headless (opens browser instead of GUI)
+```
+
+### Data directory
+
+The Flatpak is sandboxed. All state lives in:
+
+```
+~/.var/app/org.joinmarketng.JamNG/.joinmarket-ng/
+```
+
+This is separate from the standard `~/.joinmarket-ng/` used by a non-Flatpak
+install. Network-specific sub-directories are used automatically:
+
+```
+~/.var/app/org.joinmarketng.JamNG/.joinmarket-ng/          # mainnet
+~/.var/app/org.joinmarketng.JamNG/.joinmarket-ng/signet/   # signet
+~/.var/app/org.joinmarketng.JamNG/.joinmarket-ng/regtest/  # regtest
+```
+
+### Migrating an existing wallet
+
+If you have a wallet from a previous (non-Flatpak) install at
+`~/.joinmarket-ng/wallets/`, copy it to the Flatpak data directory:
+
+```bash
+cp ~/.joinmarket-ng/wallets/default.mnemonic \
+   ~/.var/app/org.joinmarketng.JamNG/.joinmarket-ng/wallets/
+```
+
+The wallet file format (`.mnemonic`) is the same in both installs.
+If the wallet is encrypted you will be prompted for the password when you
+select it in the TUI or use `jm-wallet` CLI commands via
+`flatpak run --command=sh org.joinmarketng.JamNG -c "jm-wallet info"`.
+
 ## Updating
 
 When you run `install.sh --update`, the installer:
