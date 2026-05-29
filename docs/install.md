@@ -53,6 +53,8 @@ curl -sSL https://raw.githubusercontent.com/joinmarket-ng/joinmarket-ng/main/ins
 When you run `install.sh --update`, the installer:
 
 - Upgrades all installed Python packages to the specified (or latest) version
+- Resolves and installs any new or changed dependencies (so a swapped dependency, such as PyNaCl replacing libnacl, is installed rather than leaving the venv missing a module)
+- Verifies the core libraries import cleanly after the update and prints actionable remediation if a runtime module is missing
 - Checks your config for new settings: compares `config.toml` against the latest template and prints any new sections or keys that are available
 - Refreshes shell completions and Tor configuration
 

@@ -726,14 +726,9 @@ install_packages() {
         print_success "Taker installed"
     fi
 
-    # Verify installation
-    print_info "Verifying installation..."
-    if python3 -c "import jmcore; import jmwallet" 2>/dev/null; then
-        print_success "Core libraries verified"
-    else
-        print_error "Installation verification failed"
-        exit 1
-    fi
+    # Verify installation (shared with the update path so a missing
+    # runtime module like ``nacl`` yields the same actionable guidance).
+    verify_update_imports || exit 1
 }
 
 # Update packages
@@ -776,29 +771,49 @@ update_packages() {
     export JOINMARKET_BUILD_COMMIT="${commit_hash:0:7}"
     export JOINMARKET_BUILD_REF="$VERSION"
 
-    # Update core libraries (force reinstall to handle same version, different commit)
+    # The local jmcore/jmwallet URLs. maker/taker declare ``jmcore`` and
+    # ``jmwallet`` as bare dependencies; those names do not exist on
+    # PyPI, so we must hand pip the git URLs explicitly. When a
+    # requirement is given as a direct URL, pip uses it to satisfy the
+    # matching name instead of querying PyPI. This lets us resolve and
+    # install *all other* dependencies (pynacl, mnemonic, etc.) normally
+    # while keeping the JoinMarket-NG packages pinned to git.
+    local core_url="${git_base}#subdirectory=jmcore"
+    local wallet_url="${git_base}#subdirectory=jmwallet"
+
+    # Update core libraries. We force-reinstall the JoinMarket-NG
+    # packages (so a same-version-different-commit update is picked up)
+    # but DO let pip resolve dependencies, so a changed dependency set
+    # (e.g. the libnacl -> PyNaCl swap) is installed instead of leaving
+    # the venv missing a module like ``nacl`` (issue: ModuleNotFoundError
+    # 'nacl' after update). ``--force-reinstall`` is scoped to only the
+    # explicitly named URLs by pip, so third-party deps that are already
+    # satisfied are not needlessly rebuilt.
     print_info "Updating jmcore..."
-    pip install --upgrade --force-reinstall --no-deps "${git_base}#subdirectory=jmcore" --quiet
-    print_success "jmcore updated"
-
+    pip install --upgrade --force-reinstall --no-deps "$core_url" --quiet
     print_info "Updating jmwallet..."
-    pip install --upgrade --force-reinstall --no-deps "${git_base}#subdirectory=jmwallet" --quiet
-    print_success "jmwallet updated"
+    pip install --upgrade --force-reinstall --no-deps "$wallet_url" --quiet
 
-    # Reinstall dependencies to ensure they're satisfied
-    print_info "Updating dependencies..."
-    pip install --upgrade jmcore jmwallet --quiet
+    # Resolve and install any new/changed dependencies for the core
+    # libraries from the git source (not PyPI, which has no jmcore /
+    # jmwallet). This is what pulls in dependencies added or swapped
+    # since the installed version.
+    print_info "Updating jmcore/jmwallet dependencies..."
+    pip install --upgrade "$core_url" "$wallet_url" --quiet
+    print_success "jmcore and jmwallet updated"
 
     # Update/install maker (default: install if not present)
     local should_install_maker="${INSTALL_MAKER:-true}"
     if pip show jm-maker &> /dev/null; then
         print_info "Updating maker..."
         pip install --upgrade --force-reinstall --no-deps "${git_base}#subdirectory=maker" --quiet
-        pip install --upgrade jm-maker --quiet
+        # Resolve maker deps from git so jmcore/jmwallet are not sought
+        # on PyPI and new third-party deps (e.g. pynacl) are installed.
+        pip install --upgrade "${git_base}#subdirectory=maker" "$core_url" "$wallet_url" --quiet
         print_success "Maker updated"
     elif [[ "$should_install_maker" == "true" ]]; then
         print_info "Installing maker..."
-        pip install "${git_base}#subdirectory=maker" --quiet
+        pip install "${git_base}#subdirectory=maker" "$core_url" "$wallet_url" --quiet
         print_success "Maker installed"
     fi
 
@@ -807,15 +822,72 @@ update_packages() {
     if pip show jm-taker &> /dev/null; then
         print_info "Updating taker..."
         pip install --upgrade --force-reinstall --no-deps "${git_base}#subdirectory=taker" --quiet
-        pip install --upgrade jm-taker --quiet
+        pip install --upgrade "${git_base}#subdirectory=taker" "$core_url" "$wallet_url" --quiet
         print_success "Taker updated"
     elif [[ "$should_install_taker" == "true" ]]; then
         print_info "Installing taker..."
-        pip install "${git_base}#subdirectory=taker" --quiet
+        pip install "${git_base}#subdirectory=taker" "$core_url" "$wallet_url" --quiet
         print_success "Taker installed"
     fi
 
+    # Verify the update actually produced an importable install. This
+    # catches the case where a dependency swap left the venv missing a
+    # runtime module (e.g. ``nacl`` after the libnacl -> PyNaCl change)
+    # and gives the user an actionable remediation instead of a cryptic
+    # ModuleNotFoundError the next time they launch the bot.
+    verify_update_imports || exit 1
+
     print_success "Update complete!"
+}
+
+# Verify the venv can import the core modules and their key runtime
+# dependencies. Shared by the fresh-install and update paths. Prints
+# actionable remediation (and returns non-zero) when a module is missing
+# so a stale/incomplete dependency set does not surface later as a
+# cryptic ModuleNotFoundError.
+verify_update_imports() {
+    print_info "Verifying installation..."
+
+    # Capture the import error so we can show the user exactly what is
+    # missing rather than a bare boolean.
+    #
+    # We only import the JoinMarket-NG packages themselves. If they import
+    # cleanly, every runtime dependency they actually need for this version
+    # is present by definition. We must NOT hard-require version-specific
+    # transitive modules like ``nacl`` here: older releases do not use
+    # PyNaCl, so importing ``nacl`` directly would fail and trigger a
+    # misleading "repair" that installs a dependency the release does not
+    # need.
+    local err
+    if err=$(python3 -c "import jmcore, jmwallet" 2>&1); then
+        print_success "Core libraries verified"
+        return 0
+    fi
+
+    print_error "Installation verification failed: $err"
+
+    # A known failure mode after the libnacl -> PyNaCl swap is jmcore/
+    # jmwallet failing to import because ``nacl`` is missing. Only repair
+    # when the failure is actually caused by a missing ``nacl`` module
+    # (i.e. this version needs PyNaCl), then re-verify the packages import.
+    # Keep each step on its own line (not nested ``if``s) so a failing
+    # repair does not interact badly with ``set -e``.
+    if echo "$err" | grep -qi "No module named 'nacl'"; then
+        print_warning "Missing the 'nacl' module (PyNaCl). Attempting to install it..."
+        pip install --upgrade "pynacl>=1.5.0" --quiet || true
+        if python3 -c "import jmcore, jmwallet" 2>/dev/null; then
+            print_success "Installed PyNaCl; core libraries verified"
+            return 0
+        fi
+        print_error "Automatic repair failed."
+    fi
+
+    echo ""
+    print_warning "To fix this manually, activate the virtual environment and install the"
+    print_warning "missing dependency, then re-run the installer:"
+    echo "  source \"$VENV_DIR/bin/activate\""
+    echo "  pip install 'pynacl>=1.5.0'"
+    return 1
 }
 
 # Migrate config file: add new sections and keys from the bundled template
