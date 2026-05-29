@@ -100,6 +100,23 @@ If the wallet is encrypted you will be prompted for the password when you
 select it in the TUI or use `jm-wallet` CLI commands via
 `flatpak run --command=sh org.joinmarketng.JamNG -c "jm-wallet info"`.
 
+### Moving wallets between networks
+
+Wallets are stored under the network-specific data directory. If you created a
+wallet on mainnet (no `--network` flag) and want to use it on signet, copy it
+to the signet wallets directory:
+
+```bash
+# Created on mainnet, want to use on signet
+cp ~/.var/app/org.joinmarketng.JamNG/.joinmarket-ng/wallets/my-wallet.jmdat \
+   ~/.var/app/org.joinmarketng.JamNG/.joinmarket-ng/signet/wallets/
+```
+
+The same applies when moving a wallet the other way (signet to mainnet).
+Note that addresses derived from the same mnemonic are different on mainnet vs
+signet because the coin-type in the BIP32 path differs (`0'` for mainnet,
+`1'` for signet/testnet).
+
 ## Updating
 
 When you run `install.sh --update`, the installer:
