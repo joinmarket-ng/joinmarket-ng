@@ -133,6 +133,10 @@ Both maker and taker support periodic rescanning:
 
 **Taker:** Rescans between schedule entries to track pending confirmations.
 
+For how address-index coverage and block-time coverage interact, and how to
+diagnose and repair missing balances, see
+[Wallet Scanning](wallet-scanning.md).
+
 ### Multiple Wallets in One Data Directory
 
 JoinMarket-NG records every CoinJoin (as taker or maker) in a single

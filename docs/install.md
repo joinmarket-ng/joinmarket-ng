@@ -323,7 +323,13 @@ $RPCWALLET listdescriptors | jq '.descriptors[] | {desc, range, active, internal
 
 Each external/internal mixdepth pair adds two descriptors (`/0/N/*` and
 `/1/N/*`). The ``range`` upper bound should be at least the deepest used
-address index plus the configured gap limit (default ``1000``).
+address index plus the gap-limit buffer. By default the imported range is
+``scan_range`` (1000) and it auto-expands as addresses are used; the buffer
+kept ahead of the highest used index is ``gap_limit`` (20). If used
+addresses sit beyond the imported range (common for wallets migrated from
+legacy joinmarket-clientserver), widen it once with
+``jm-wallet rescan --scan-depth N``. See
+[Wallet Scanning](technical/wallet-scanning.md) for the full model.
 
 **What is the node itself doing?** Useful when ``scanning`` returns
 ``false`` but balances still look wrong:
@@ -356,6 +362,7 @@ jm-wallet info --scan-status      # show current Core scan coverage
 jm-wallet rescan                  # kick off rescan and poll until complete
                                   # (Ctrl-C is safe: the scan keeps running
                                   # server-side; re-check with --scan-status)
+jm-wallet rescan --scan-depth N   # widen the address range to N, then rescan
 ```
 
 **Cross-check balances and UTXOs** without involving JoinMarket NG:

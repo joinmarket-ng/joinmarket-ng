@@ -3101,6 +3101,58 @@ class TestDescriptorRangeUpgrade:
         assert new_range_used >= 1051
 
     @pytest.mark.asyncio
+    async def test_check_and_upgrade_descriptor_range_uses_configured_gap_limit(self) -> None:
+        """The auto-expand buffer must default to the BIP44 gap limit (20),
+        not the legacy hardcoded 100. With a small configured gap_limit the
+        required range is highest_used + gap_limit + 1 (issue #475 wiring)."""
+        from jmwallet.wallet.service import WalletService
+
+        backend = DescriptorWalletBackend(wallet_name="test_gap_limit_buffer")
+        backend._wallet_loaded = True
+        backend._descriptors_imported = True
+
+        new_range_used = -1
+
+        async def mock_rpc_call(
+            method: str,
+            params: list | None = None,
+            client: Any = None,
+            use_wallet: bool = True,
+        ) -> Any:
+            nonlocal new_range_used
+            if method == "listdescriptors":
+                return {"descriptors": [{"desc": "wpkh(xpub.../0/*)#abc", "range": [0, 999]}]}
+            if method == "getdescriptorinfo":
+                desc = params[0] if params else ""
+                return {"descriptor": f"{desc}#mockchecksum"}
+            if method == "importdescriptors":
+                if params and params[0]:
+                    new_range_used = params[0][0].get("range", [0, 0])[1]
+                return [{"success": True} for _ in (params[0] if params else [])]
+            raise ValueError(f"Unexpected RPC: {method}")
+
+        backend._rpc_call = mock_rpc_call  # type: ignore[method-assign]
+
+        # gap_limit=20 (the default); a used index of 1000 needs range
+        # >= 1000 + 20 + 1 = 1021. With the legacy hardcoded 100 buffer the
+        # default would instead be 1101.
+        wallet = WalletService(
+            mnemonic=TEST_MNEMONIC,
+            backend=backend,
+            network="mainnet",
+            mixdepth_count=5,
+            gap_limit=20,
+        )
+        wallet.address_cache["bc1q_high_idx"] = (0, 0, 1000)
+        wallet.addresses_with_history = {"bc1q_high_idx"}
+
+        # Call with the wallet's configured gap_limit, as the sync path does.
+        upgraded = await wallet.check_and_upgrade_descriptor_range(gap_limit=wallet.gap_limit)
+
+        assert upgraded is True
+        assert new_range_used == 1021
+
+    @pytest.mark.asyncio
     async def test_populate_address_cache(self) -> None:
         """Test pre-populating address cache."""
         from jmwallet.wallet.service import WalletService
@@ -3520,8 +3572,9 @@ class TestDescriptorRangeUpgrade:
 
         # Range should have been upgraded to accommodate the high index
         assert upgrade_called, "Descriptor range should have been upgraded"
-        # new range should be at least very_high_index + gap_limit + 1
-        assert new_range_after_upgrade >= very_high_index + 100 + 1
+        # new range should be at least very_high_index + gap_limit + 1, using
+        # the wallet's configured gap_limit (default 20, no longer hardcoded 100).
+        assert new_range_after_upgrade >= very_high_index + wallet.gap_limit + 1
 
         # Performance: should complete in reasonable time
         # This test does two cache populations (initial 1000 + upgrade to 2101)

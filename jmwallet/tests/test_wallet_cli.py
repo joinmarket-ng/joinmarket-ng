@@ -1791,9 +1791,11 @@ def _make_descriptor_info_mock_backend() -> MagicMock:
     return mock_backend
 
 
-def test_info_scan_depth_overrides_default_scan_range(monkeypatch) -> None:
-    """``info --scan-depth N`` must pass ``scan_range=N`` to ``setup_descriptor_wallet``
-    when the wallet is being set up for the first time (base wallet not ready).
+def test_rescan_scan_depth_reimports_at_wider_range(monkeypatch) -> None:
+    """``rescan --scan-depth N`` must re-import descriptors at the wider
+    range via ``setup_descriptor_wallet`` (index-coverage repair), with
+    ``check_existing=False`` and ``smart_scan=False`` so the full re-import +
+    genesis rescan runs even when the wallet is already loaded (issue #475).
     """
     monkeypatch.delenv("JOINMARKET_DATA_DIR", raising=False)
 
@@ -1802,6 +1804,18 @@ def test_info_scan_depth_overrides_default_scan_range(monkeypatch) -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         _make_default_wallet(tmpdir)
         mock_backend = _make_descriptor_info_mock_backend()
+        mock_backend.is_wallet_setup = AsyncMock(return_value=True)
+        mock_backend.set_wallet_creation_height = MagicMock()
+        mock_backend.get_wallet_scan_status = AsyncMock(
+            return_value={
+                "scanning_in_progress": False,
+                "scan_progress": None,
+                "scan_duration_s": None,
+                "oldest_descriptor_timestamp": 1_230_768_000,
+                "birthtime": None,
+                "txcount": 0,
+            }
+        )
 
         from jmwallet.wallet.service import WalletService
 
@@ -1811,29 +1825,27 @@ def test_info_scan_depth_overrides_default_scan_range(monkeypatch) -> None:
                 "jmwallet.backends.descriptor_wallet.DescriptorWalletBackend",
                 _stub_backend_class(mock_backend),
             ),
-            patch.object(
-                WalletService, "is_descriptor_wallet_ready", AsyncMock(return_value=False)
-            ),
             patch.object(WalletService, "setup_descriptor_wallet", setup_mock),
-            patch.object(WalletService, "sync_with_descriptor_wallet", AsyncMock(return_value=[])),
         ):
-            result = runner.invoke(
-                app,
-                ["info", "--backend", "descriptor_wallet", "--scan-depth", "5000"],
-            )
+            result = runner.invoke(app, ["rescan", "--scan-depth", "8000"])
 
-        assert result.exit_code == 0, f"info failed: {result.stdout}"
+        assert result.exit_code == 0, f"rescan failed: {result.stdout}"
         assert setup_mock.await_count == 1
         assert setup_mock.await_args is not None
         kwargs = setup_mock.await_args.kwargs
-        assert kwargs["scan_range"] == 5000
+        assert kwargs["scan_range"] == 8000
+        assert kwargs["rescan"] is True
+        assert kwargs["check_existing"] is False
+        assert kwargs["smart_scan"] is False
+        assert kwargs["background_full_rescan"] is False
+        # Plain block rescan path must not be used when widening the range.
+        mock_backend.start_background_rescan.assert_not_awaited()
 
 
 def test_info_default_scan_range_uses_wallet_scan_range(monkeypatch) -> None:
-    """Without ``--scan-depth``, ``setup_descriptor_wallet`` must be called
-    with ``scan_range`` equal to the configured ``[wallet].scan_range``
-    (default 1000 since the legacy ``gap_limit * 10`` formula was dropped,
-    issue #475).
+    """``setup_descriptor_wallet`` must be called with ``scan_range`` equal
+    to the configured ``[wallet].scan_range`` (default 1000 since the legacy
+    ``gap_limit * 10`` formula was dropped, issue #475).
     """
     monkeypatch.delenv("JOINMARKET_DATA_DIR", raising=False)
 
@@ -1863,16 +1875,14 @@ def test_info_default_scan_range_uses_wallet_scan_range(monkeypatch) -> None:
         assert setup_mock.await_count == 1
         assert setup_mock.await_args is not None
         kwargs = setup_mock.await_args.kwargs
-        # Default [wallet].scan_range is 1000 — no longer derived from gap_limit.
+        # Default [wallet].scan_range is 1000 (no longer derived from gap_limit).
         assert kwargs["scan_range"] == 1000
 
 
-def test_info_scan_depth_bypasses_is_wallet_setup_short_circuit(monkeypatch) -> None:
-    """``info --scan-depth N`` must call ``setup_descriptor_wallet`` even when
-    the wallet is already set up, with ``check_existing=False`` and
-    ``smart_scan=False`` so the full descriptor re-import + genesis rescan runs
-    (recovery path for migrated wallets, issue #475).
-    """
+def test_rescan_without_scan_depth_uses_plain_block_rescan(monkeypatch) -> None:
+    """Without ``--scan-depth``, ``rescan`` must use the plain block-rescan
+    path (``start_background_rescan``) and never re-import descriptors via
+    ``setup_descriptor_wallet`` (time-coverage repair only)."""
     monkeypatch.delenv("JOINMARKET_DATA_DIR", raising=False)
 
     setup_mock = AsyncMock()
@@ -1880,6 +1890,20 @@ def test_info_scan_depth_bypasses_is_wallet_setup_short_circuit(monkeypatch) -> 
     with tempfile.TemporaryDirectory() as tmpdir:
         _make_default_wallet(tmpdir)
         mock_backend = _make_descriptor_info_mock_backend()
+        mock_backend.is_wallet_setup = AsyncMock(return_value=True)
+        mock_backend.set_wallet_creation_height = MagicMock()
+        mock_backend.start_background_rescan = AsyncMock()
+        mock_backend.get_rescan_status = AsyncMock(return_value={"in_progress": False})
+        mock_backend.get_wallet_scan_status = AsyncMock(
+            return_value={
+                "scanning_in_progress": False,
+                "scan_progress": None,
+                "scan_duration_s": None,
+                "oldest_descriptor_timestamp": 1_230_768_000,
+                "birthtime": None,
+                "txcount": 0,
+            }
+        )
 
         from jmwallet.wallet.service import WalletService
 
@@ -1889,31 +1913,14 @@ def test_info_scan_depth_bypasses_is_wallet_setup_short_circuit(monkeypatch) -> 
                 "jmwallet.backends.descriptor_wallet.DescriptorWalletBackend",
                 _stub_backend_class(mock_backend),
             ),
-            # Wallet is "already set up" - without --scan-depth, setup would be skipped.
-            patch.object(WalletService, "is_descriptor_wallet_ready", AsyncMock(return_value=True)),
             patch.object(WalletService, "setup_descriptor_wallet", setup_mock),
-            patch.object(WalletService, "sync_with_descriptor_wallet", AsyncMock(return_value=[])),
+            patch("jmwallet.cli.wallet.asyncio.sleep", new=AsyncMock()),
         ):
-            result = runner.invoke(
-                app,
-                [
-                    "info",
-                    "--backend",
-                    "descriptor_wallet",
-                    "--scan-depth",
-                    "8000",
-                ],
-            )
+            result = runner.invoke(app, ["rescan", "--start-height", "0"])
 
-        assert result.exit_code == 0, f"info failed: {result.stdout}"
-        assert setup_mock.await_count == 1
-        assert setup_mock.await_args is not None
-        kwargs = setup_mock.await_args.kwargs
-        assert kwargs["scan_range"] == 8000
-        assert kwargs["rescan"] is True
-        assert kwargs["check_existing"] is False
-        assert kwargs["smart_scan"] is False
-        assert kwargs["background_full_rescan"] is False
+        assert result.exit_code == 0, f"rescan failed: {result.stdout}"
+        setup_mock.assert_not_awaited()
+        mock_backend.start_background_rescan.assert_awaited_once()
 
 
 def test_print_scan_status_formats_idle_run(capsys: pytest.CaptureFixture) -> None:

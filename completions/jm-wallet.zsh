@@ -26,7 +26,7 @@ _jm_wallet() {
     'verify-password:Verify that a password can decrypt an encrypted mnemonic file.'
     'validate:Validate a mnemonic phrase.'
     'showseed:Display the BIP39 seed words (mnemonic) of an existing wallet.'
-    'rescan:Trigger a Bitcoin Core wallet rescan to repair history coverage.'
+    'rescan:Rescan the blockchain to repair a descriptor wallet'\''s coverage.'
   )
 
   _arguments -C \
@@ -43,6 +43,7 @@ _jm_wallet() {
           _arguments \
             '--mnemonic-file=[]:file:_files' \
             '--prompt-bip39-passphrase[Prompt for BIP39 passphrase]' \
+            '--wallet-fingerprint=[Select the per-wallet bond registry by its 8-char hex BIP32 master fingerprint (offline mode only). Use this instead of --mnemonic-file when you already know the fingerprint (e.g. from '\''jm-wallet info'\''). When neither --mnemonic-file nor this flag is provided and exactly one wallet has a registry in the data directory, that wallet is selected automatically.]: :' \
             '--network=[Bitcoin network]: :' \
             '--backend=[Backend\: descriptor_wallet | neutrino]: :' \
             '--rpc-url=[]: :' \
@@ -98,6 +99,7 @@ _jm_wallet() {
             '--network=[]: :' \
             '--data-dir=[Data directory (default\: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)]:file:_files' \
             '--no-save[Do not save the bond to the registry]' \
+            '--wallet-fingerprint=[8-char hex master key fingerprint of the JoinMarket wallet that will operate this bond. Run '\''jm-wallet info --mnemonic-file <wallet>'\'' on the hot wallet to look it up. Required because each wallet has its own bond registry (fidelity_bonds_<fp>.json) under the shared data directory.]: :' \
             '--log-level=[]: :' \
             '--help[Show this message and exit]'
           ;;
@@ -105,6 +107,7 @@ _jm_wallet() {
           _arguments \
             '--bond-address=[Bond address to associate keypair with (saves to registry)]: :' \
             '--data-dir=[Data directory (default\: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)]:file:_files' \
+            '--wallet-fingerprint=[8-char hex master key fingerprint of the JoinMarket wallet that will operate this bond. Run '\''jm-wallet info --mnemonic-file <wallet>'\'' on the hot wallet to look it up. Required because each wallet has its own bond registry (fidelity_bonds_<fp>.json) under the shared data directory.]: :' \
             '--log-level=[]: :' \
             '--help[Show this message and exit]'
           ;;
@@ -118,6 +121,7 @@ _jm_wallet() {
             '--rpc-url=[]: :' \
             '--neutrino-url=[]: :' \
             '--current-block=[Current block height override for offline/air-gapped workflows. Skips all network block-height lookups.]: :' \
+            '--wallet-fingerprint=[8-char hex master key fingerprint of the JoinMarket wallet that will operate this bond. Run '\''jm-wallet info --mnemonic-file <wallet>'\'' on the hot wallet to look it up. Required because each wallet has its own bond registry (fidelity_bonds_<fp>.json) under the shared data directory.]: :' \
             '--log-level=[]: :' \
             '--help[Show this message and exit]'
           ;;
@@ -133,6 +137,7 @@ _jm_wallet() {
             '--rpc-url=[]: :' \
             '--neutrino-url=[]: :' \
             '--current-block=[Current block height override for offline/air-gapped workflows. Skips all network block-height lookups.]: :' \
+            '--wallet-fingerprint=[8-char hex master key fingerprint of the JoinMarket wallet that will operate this bond. Run '\''jm-wallet info --mnemonic-file <wallet>'\'' on the hot wallet to look it up. Required because each wallet has its own bond registry (fidelity_bonds_<fp>.json) under the shared data directory.]: :' \
             '--log-level=[]: :' \
             '--help[Show this message and exit]'
           ;;
@@ -145,6 +150,7 @@ _jm_wallet() {
             '--test-unfunded[Allow generating a test PSBT even when the bond is unfunded, using a synthetic UTXO for signer compatibility testing.]' \
             '--test-utxo-value=[Synthetic UTXO value in sats when using --test-unfunded (default\: 100000).]: :' \
             '--data-dir=[Data directory (default\: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)]:file:_files' \
+            '--wallet-fingerprint=[8-char hex master key fingerprint of the JoinMarket wallet that will operate this bond. Run '\''jm-wallet info --mnemonic-file <wallet>'\'' on the hot wallet to look it up. Required because each wallet has its own bond registry (fidelity_bonds_<fp>.json) under the shared data directory.]: :' \
             '--log-level=[]: :' \
             '--help[Show this message and exit]'
           ;;
@@ -177,13 +183,18 @@ _jm_wallet() {
             '--stats[Show statistics only]' \
             '--csv[Output as CSV]' \
             '--data-dir=[Data directory (default\: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)]:file:_files' \
-            '--mnemonic-file=[Path to mnemonic file. When provided, the history is filtered to entries belonging to this wallet (matched by BIP32 master fingerprint). Required when multiple wallets share the same data directory (issue #473).]:file:_files' \
-            '--all-wallets[Show entries from all wallets that have ever written to this data directory (default when no --mnemonic-file is given).]' \
+            '--mnemonic-file=[Path to mnemonic file. When provided, the history is filtered to entries belonging to this wallet (matched by BIP32 master fingerprint). Required when multiple wallets share the same data directory (issue #473) unless --wallet-fingerprint is passed instead.]:file:_files' \
+            '--prompt-bip39-passphrase[Prompt for the BIP39 passphrase when deriving the wallet fingerprint from --mnemonic-file. Required when the wallet was created with a BIP39 passphrase, otherwise the derived fingerprint will not match any recorded history.]' \
+            '--wallet-fingerprint=[Filter history to this 8-char hex BIP32 master fingerprint. Use this instead of --mnemonic-file when you already know the fingerprint (e.g. printed by '\''jm-wallet info'\''). When neither this flag nor --mnemonic-file is given and history contains exactly one wallet, that wallet is selected automatically.]: :' \
+            '--all-wallets[Show entries from all wallets that have ever written to this data directory, including legacy rows without a fingerprint.]' \
             '--log-level=[Log level]: :' \
             '--help[Show this message and exit]'
           ;;
         registry-show)
           _arguments \
+            '--mnemonic-file=[]:file:_files' \
+            '--prompt-bip39-passphrase[Prompt for BIP39 passphrase]' \
+            '--wallet-fingerprint=[Select the per-wallet bond registry by its 8-char hex BIP32 master fingerprint. Use this instead of --mnemonic-file when you already know the fingerprint (e.g. from '\''jm-wallet info'\''). When neither is provided and exactly one wallet has a registry in the data directory, that wallet is selected automatically.]: :' \
             '--data-dir=[Data directory (default\: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)]:file:_files' \
             '--json[Output as JSON]' \
             '--log-level=[]: :' \
@@ -223,6 +234,7 @@ _jm_wallet() {
             '--save[Save to file (default\: save)]' \
             '--output=[Output file path]:file:_files' \
             '--prompt-password[Prompt for password interactively (default\: prompt)]' \
+            '--force[Overwrite existing file without confirmation]' \
             '--data-dir=[Data directory (default\: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR). When --output is not given, the wallet is saved under <data-dir>/wallets/default.mnemonic.]:file:_files' \
             '--help[Show this message and exit]'
           ;;
@@ -236,9 +248,8 @@ _jm_wallet() {
             '--neutrino-url=[]: :' \
             '--extended[Show detailed address view with derivations]' \
             '--gap=[Max address gap to show in extended view]: :' \
-            '--scan-depth=[One-shot override of the descriptor scan range (max address index per branch). When set, JoinMarket re-imports descriptors at the given range and triggers a full rescan from genesis -- use this once for a wallet migrated from legacy joinmarket-clientserver whose addresses sit beyond the default 1000 (issue #475). Without this flag, the configured ``[wallet].scan_range`` is used and an existing import is left alone. Slow\: a full rescan can take 20+ minutes on mainnet.]: :' \
             '--show-empty[In --extended view, show addresses with zero balance. When disabled (default), empty addresses are hidden except for the first unused one per branch so you still have a fresh receive address.]' \
-            '--scan-status[Print Bitcoin Core'\''s wallet scan/coverage diagnostics and exit (descriptor wallet only). Useful when the wallet is proposing already-used addresses\: shows whether a rescan is currently running, the oldest active-descriptor timestamp (i.e., the lower bound of what Core has actually scanned), and the wallet transaction count. If the oldest timestamp is far newer than your wallet'\''s first use, run ``jm-wallet rescan`` to repair coverage.]' \
+            '--scan-status[Print Bitcoin Core'\''s wallet scan/coverage diagnostics and exit (descriptor wallet only). Use it when the wallet proposes already-used addresses; if coverage is incomplete, repair it with `jm-wallet rescan`. See the wallet scanning docs.]' \
             '--data-dir=[Data directory (default\: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)]:file:_files' \
             '--log-level=[Log level]: :' \
             '--help[Show this message and exit]'
@@ -270,6 +281,7 @@ _jm_wallet() {
             '--network=[Bitcoin network]: :' \
             '--rpc-url=[]: :' \
             '--start-height=[Block height to rescan from (default\: 0 = genesis). The wallet'\''s recorded creation height is used as a floor when available, so values below it are clamped up automatically.]: :' \
+            '--scan-depth=[Widen the descriptor address-index range to N per branch before rescanning (re-imports descriptors). Use this once for a wallet whose used addresses sit beyond the configured [wallet].scan_range. See the wallet scanning docs.]: :' \
             '--data-dir=[Data directory (default\: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)]:file:_files' \
             '--log-level=[Log level]: :' \
             '--help[Show this message and exit]'

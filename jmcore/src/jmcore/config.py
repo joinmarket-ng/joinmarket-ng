@@ -241,8 +241,9 @@ class WalletConfig(BaseModel):
         default=20,
         ge=6,
         description=(
-            "BIP44 gap limit: stop scanning after this many consecutive empty "
-            "trailing addresses past the highest used one."
+            "BIP44 gap limit: consecutive empty trailing addresses kept beyond "
+            "the highest used one; also the buffer for descriptor range "
+            "auto-expansion. See docs/technical/wallet-scanning.md."
         ),
     )
     scan_range: int = Field(
@@ -250,8 +251,9 @@ class WalletConfig(BaseModel):
         ge=100,
         description=(
             "Initial descriptor scan range (max address index per branch) "
-            "imported into Bitcoin Core. Auto-expands during setup when "
-            "highest used index nears the boundary (issue #475)."
+            "imported into Bitcoin Core. Auto-expands as addresses are used; "
+            "widen an existing import with `jm-wallet rescan --scan-depth N`. "
+            "See docs/technical/wallet-scanning.md."
         ),
     )
 

@@ -359,23 +359,25 @@ class WalletSettings(BaseModel):
         default=20,
         ge=6,
         description=(
-            "BIP44 gap limit: stop address scanning after this many consecutive "
-            "empty trailing addresses past the highest used one. This is the true "
-            "BIP44 gap limit (Electrum convention is 20). Distinct from "
-            "``scan_range``, which controls the descriptor lookahead window "
-            "imported into Bitcoin Core."
+            "BIP44 gap limit: the number of consecutive empty trailing "
+            "addresses kept beyond the highest used one (Electrum convention "
+            "is 20). Also used as the buffer when auto-expanding the Bitcoin "
+            "Core descriptor range as the wallet grows. Distinct from "
+            "``scan_range`` (the initial lookahead window). See "
+            "docs/technical/wallet-scanning.md."
         ),
     )
     scan_range: int = Field(
         default=1000,
         ge=100,
         description=(
-            "Initial descriptor scan range (max address index per branch) "
-            "imported into Bitcoin Core's descriptor wallet. Defaults to 1000, "
-            "matching Bitcoin Core's default keypool lookahead. Wallets migrated "
-            "from legacy joinmarket-clientserver may have used addresses beyond "
-            "this; run ``jmwallet info --scan-depth N`` once with a larger N "
-            "to re-import and rescan (issue #475)."
+            "Initial descriptor scan range: the max address index per branch "
+            "imported into Bitcoin Core's descriptor wallet (default 1000, "
+            "matching Core's keypool lookahead). It auto-expands as addresses "
+            "are used. To widen the range for an already-imported wallet (e.g. "
+            "one migrated from legacy joinmarket-clientserver with deep "
+            "addresses), run ``jm-wallet rescan --scan-depth N`` once. See "
+            "docs/technical/wallet-scanning.md."
         ),
     )
     dust_threshold: int = Field(

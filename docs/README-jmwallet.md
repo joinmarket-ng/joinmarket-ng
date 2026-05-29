@@ -114,8 +114,8 @@ The full CLI reference below is auto-generated from command `--help` output.
 │ validate                     Validate a mnemonic phrase.                     │
 │ showseed                     Display the BIP39 seed words (mnemonic) of an   │
 │                              existing wallet.                                │
-│ rescan                       Trigger a Bitcoin Core wallet rescan to repair  │
-│                              history coverage.                               │
+│ rescan                       Rescan the blockchain to repair a descriptor    │
+│                              wallet's coverage.                              │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ```
 
@@ -950,31 +950,6 @@ The full CLI reference below is auto-generated from command `--help` output.
 │ --gap                  -g                     INTEGER  Max address gap to    │
 │                                                        show in extended view │
 │                                                        [default: 6]          │
-│ --scan-depth                                  INTEGER  One-shot override of  │
-│                                                        the descriptor scan   │
-│                                                        range (max address    │
-│                                                        index per branch).    │
-│                                                        When set, JoinMarket  │
-│                                                        re-imports            │
-│                                                        descriptors at the    │
-│                                                        given range and       │
-│                                                        triggers a full       │
-│                                                        rescan from genesis   │
-│                                                        -- use this once for  │
-│                                                        a wallet migrated     │
-│                                                        from legacy           │
-│                                                        joinmarket-clientser… │
-│                                                        whose addresses sit   │
-│                                                        beyond the default    │
-│                                                        1000 (issue #475).    │
-│                                                        Without this flag,    │
-│                                                        the configured        │
-│                                                        ``.scan_range`` is    │
-│                                                        used and an existing  │
-│                                                        import is left alone. │
-│                                                        Slow: a full rescan   │
-│                                                        can take 20+ minutes  │
-│                                                        on mainnet.           │
 │ --show-empty               --no-show-empty             In --extended view,   │
 │                                                        show addresses with   │
 │                                                        zero balance. When    │
@@ -991,27 +966,15 @@ The full CLI reference below is auto-generated from command `--help` output.
 │                                                        wallet scan/coverage  │
 │                                                        diagnostics and exit  │
 │                                                        (descriptor wallet    │
-│                                                        only). Useful when    │
-│                                                        the wallet is         │
-│                                                        proposing             │
+│                                                        only). Use it when    │
+│                                                        the wallet proposes   │
 │                                                        already-used          │
-│                                                        addresses: shows      │
-│                                                        whether a rescan is   │
-│                                                        currently running,    │
-│                                                        the oldest            │
-│                                                        active-descriptor     │
-│                                                        timestamp (i.e., the  │
-│                                                        lower bound of what   │
-│                                                        Core has actually     │
-│                                                        scanned), and the     │
-│                                                        wallet transaction    │
-│                                                        count. If the oldest  │
-│                                                        timestamp is far      │
-│                                                        newer than your       │
-│                                                        wallet's first use,   │
-│                                                        run ``jm-wallet       │
-│                                                        rescan`` to repair    │
-│                                                        coverage.             │
+│                                                        addresses; if         │
+│                                                        coverage is           │
+│                                                        incomplete, repair it │
+│                                                        with `jm-wallet       │
+│                                                        rescan`. See the      │
+│                                                        wallet scanning docs. │
 │ --data-dir                                    PATH     Data directory        │
 │                                                        (default:             │
 │                                                        ~/.joinmarket-ng or   │
@@ -1127,18 +1090,21 @@ The full CLI reference below is auto-generated from command `--help` output.
 
  Usage: jm-wallet rescan [OPTIONS]
 
- Trigger a Bitcoin Core wallet rescan to repair history coverage.
+ Rescan the blockchain to repair a descriptor wallet's coverage.
 
- Use this when ``jm-wallet info --scan-status`` shows that the oldest
- active descriptor timestamp is newer than your wallet's first use, or
- when the wallet is proposing addresses you remember spending from.
- Rescans are slow (20+ minutes on mainnet from genesis) but read-only;
- no funds are at risk.
+ Two kinds of gap can leave the wallet unaware of its own coins:
 
- The rescan runs server-side in Bitcoin Core: this command blocks while
- polling progress, but interrupting it with Ctrl-C only ends the
- polling, not the rescan itself. Bitcoin Core will keep scanning, and
- you can re-attach later via ``jm-wallet info --scan-status``.
+ - Time coverage: Bitcoin Core has not scanned far enough back. Plain
+   `jm-wallet rescan` (optionally `--start-height H`) re-scans blocks
+   against the current descriptor range.
+ - Index coverage: a used address sits beyond the imported address range
+   (common for wallets migrated from legacy joinmarket-clientserver). Pass
+   `--scan-depth N` to widen the range to N per branch, then rescan.
+
+ Rescans are slow (20+ minutes on mainnet from genesis) but read-only. The
+ scan runs server-side in Bitcoin Core, so Ctrl-C only stops the progress
+ polling, not the scan; re-attach later with `jm-wallet info --scan-status`.
+ See docs/technical/wallet-scanning.md.
 
 ╭─ Options ────────────────────────────────────────────────────────────────────╮
 │ --mnemonic-file            -f      PATH     Path to mnemonic file            │
@@ -1154,6 +1120,14 @@ The full CLI reference below is auto-generated from command `--help` output.
 │                                             available, so values below it    │
 │                                             are clamped up automatically.    │
 │                                             [default: 0]                     │
+│ --scan-depth                       INTEGER  Widen the descriptor             │
+│                                             address-index range to N per     │
+│                                             branch before rescanning         │
+│                                             (re-imports descriptors). Use    │
+│                                             this once for a wallet whose     │
+│                                             used addresses sit beyond the    │
+│                                             configured .scan_range. See the  │
+│                                             wallet scanning docs.            │
 │ --data-dir                         PATH     Data directory (default:         │
 │                                             ~/.joinmarket-ng or              │
 │                                             $JOINMARKET_DATA_DIR)            │

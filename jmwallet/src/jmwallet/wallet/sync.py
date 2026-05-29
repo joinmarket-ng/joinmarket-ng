@@ -1312,10 +1312,12 @@ class WalletSyncMixin:
                     f"Found {extended_addresses_found} address(es) in extended range search"
                 )
 
-        # Check if descriptor range needs to be upgraded
-        # This handles wallets that have grown beyond the initial range
+        # Check if descriptor range needs to be upgraded. This keeps the
+        # descriptor lookahead window ahead of the highest used address as
+        # the wallet grows, using the configured BIP44 ``gap_limit`` as the
+        # trailing buffer (see docs/technical/wallet-scanning.md).
         try:
-            upgraded = await self.check_and_upgrade_descriptor_range(gap_limit=100)
+            upgraded = await self.check_and_upgrade_descriptor_range(gap_limit=self.gap_limit)
             if upgraded:
                 # Re-populate address cache with the new range
                 new_range = await self.backend.get_max_descriptor_range()
@@ -1335,7 +1337,7 @@ class WalletSyncMixin:
 
     async def check_and_upgrade_descriptor_range(
         self,
-        gap_limit: int = 100,
+        gap_limit: int = 20,
     ) -> bool:
         """
         Check if descriptor range needs upgrading and upgrade if necessary.
@@ -1349,7 +1351,8 @@ class WalletSyncMixin:
         3. If highest used index + gap_limit > current range, upgrade
 
         Args:
-            gap_limit: Number of empty addresses to maintain beyond highest used
+            gap_limit: BIP44 trailing-empty buffer to keep beyond the highest
+                used address (defaults to the wallet's configured gap_limit).
 
         Returns:
             True if upgrade was performed, False otherwise

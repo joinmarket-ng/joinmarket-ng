@@ -306,23 +306,6 @@ def info(
     gap: Annotated[
         int, typer.Option("--gap", "-g", help="Max address gap to show in extended view")
     ] = 6,
-    scan_depth: Annotated[
-        int | None,
-        typer.Option(
-            "--scan-depth",
-            help=(
-                "One-shot override of the descriptor scan range (max address "
-                "index per branch). When set, JoinMarket re-imports descriptors "
-                "at the given range and triggers a full rescan from genesis -- "
-                "use this once for a wallet migrated from legacy "
-                "joinmarket-clientserver whose addresses sit beyond the "
-                "default 1000 (issue #475). Without this flag, the configured "
-                "``[wallet].scan_range`` is used and an existing import is "
-                "left alone. Slow: a full rescan can take 20+ minutes on "
-                "mainnet."
-            ),
-        ),
-    ] = None,
     show_empty: Annotated[
         bool,
         typer.Option(
@@ -340,14 +323,10 @@ def info(
         typer.Option(
             "--scan-status",
             help=(
-                "Print Bitcoin Core's wallet scan/coverage diagnostics and "
-                "exit (descriptor wallet only). Useful when the wallet is "
-                "proposing already-used addresses: shows whether a rescan is "
-                "currently running, the oldest active-descriptor timestamp "
-                "(i.e., the lower bound of what Core has actually scanned), "
-                "and the wallet transaction count. If the oldest timestamp "
-                "is far newer than your wallet's first use, run "
-                "``jm-wallet rescan`` to repair coverage."
+                "Print Bitcoin Core's wallet scan/coverage diagnostics and exit "
+                "(descriptor wallet only). Use it when the wallet proposes "
+                "already-used addresses; if coverage is incomplete, repair it "
+                "with `jm-wallet rescan`. See the wallet scanning docs."
             ),
         ),
     ] = False,
@@ -400,7 +379,6 @@ def info(
             display_gap=gap,
             gap_limit=settings.wallet.gap_limit,
             scan_range=settings.wallet.scan_range,
-            scan_depth=scan_depth,
             show_empty=show_empty,
             creation_height=resolved.creation_height if resolved else None,
             scan_status_only=scan_status,
@@ -416,7 +394,6 @@ async def _show_wallet_info(
     display_gap: int = 6,
     gap_limit: int = 20,
     scan_range: int = 1000,
-    scan_depth: int | None = None,
     show_empty: bool = False,
     creation_height: int | None = None,
     scan_status_only: bool = False,
@@ -427,15 +404,12 @@ async def _show_wallet_info(
         display_gap: Max empty addresses shown beyond last used in extended view.
         gap_limit: BIP44 gap limit (trailing-empty threshold). Forwarded to
             ``WalletService`` for sync-time logic.
-        scan_range: Initial descriptor scan range. Forwarded to
-            ``WalletService`` and used by ``setup_descriptor_wallet`` as the
-            initial lookahead window.
-        scan_depth: Optional one-shot override of the descriptor scan range
-            for this invocation. When provided, forces re-import of
-            descriptors at the given range and a full rescan from genesis --
-            the recovery path for wallets migrated from legacy
-            joinmarket-clientserver whose addresses sit beyond the configured
-            ``scan_range`` (issue #475).
+        scan_range: Initial descriptor scan range (the address-index lookahead
+            window imported into Bitcoin Core). Forwarded to ``WalletService``
+            and used by ``setup_descriptor_wallet`` on first-time setup. To
+            widen the range for an already-imported wallet (e.g. one migrated
+            from legacy joinmarket-clientserver), use ``jm-wallet rescan
+            --scan-depth N``. See docs/technical/wallet-scanning.md.
     """
     from jmwallet.backends.descriptor_wallet import DescriptorWalletBackend
     from jmwallet.backends.neutrino import NeutrinoBackend
@@ -513,10 +487,10 @@ async def _show_wallet_info(
 
     # Create wallet with data_dir for history lookups. The ``scan_range``
     # field on ``WalletService`` is the initial descriptor lookahead window
-    # (default 1000) and ``gap_limit`` is the true BIP44 trailing-empty
-    # threshold. Migrated wallets with deep addresses (issue #475) are
-    # handled by passing ``--scan-depth`` once: that forces a descriptor
-    # re-import at the given range and a full rescan from genesis.
+    # (default 1000) and ``gap_limit`` is the BIP44 trailing-empty threshold.
+    # Widening the range for an already-imported wallet (e.g. one migrated
+    # from legacy joinmarket-clientserver) is done with ``jm-wallet rescan
+    # --scan-depth N``. See docs/technical/wallet-scanning.md.
     wallet = WalletService(
         mnemonic=mnemonic,
         backend=backend,
@@ -553,10 +527,10 @@ async def _show_wallet_info(
             from jmwallet.backends.descriptor_wallet import DescriptorWalletBackend
 
             if isinstance(backend, DescriptorWalletBackend):
-                # Resolve the effective descriptor scan range for this run:
-                # an explicit ``--scan-depth`` wins, else fall back to the
-                # configured ``[wallet].scan_range`` (already on ``wallet``).
-                effective_scan_range = scan_depth if scan_depth is not None else wallet.scan_range
+                # First-time setup uses the configured descriptor scan range.
+                # Widening the range for an already-imported wallet is handled
+                # by ``jm-wallet rescan --scan-depth N``, not here.
+                effective_scan_range = wallet.scan_range
 
                 # Check if base wallet is set up (without counting bonds)
                 bond_count = len(fidelity_bond_addresses)
@@ -565,29 +539,7 @@ async def _show_wallet_info(
                     fidelity_bond_count=bond_count
                 )
 
-                if scan_depth is not None:
-                    # Recovery path for migrated wallets (issue #475): force
-                    # re-import of descriptors with the requested range and a
-                    # full rescan from genesis. This bypasses the
-                    # ``is_wallet_setup`` short-circuit so an already-set-up
-                    # wallet picks up the deeper range. ``smart_scan=False``
-                    # + ``background_full_rescan=False`` means we scan from
-                    # block 0 synchronously (slow but complete).
-                    logger.info(
-                        f"--scan-depth: re-importing descriptors with range "
-                        f"[0, {effective_scan_range - 1}] and rescanning from genesis. "
-                        "This may take 20+ minutes on mainnet."
-                    )
-                    await wallet.setup_descriptor_wallet(
-                        scan_range=effective_scan_range,
-                        fidelity_bond_addresses=(fidelity_bond_addresses if bond_count else None),
-                        rescan=True,
-                        check_existing=False,
-                        smart_scan=False,
-                        background_full_rescan=False,
-                    )
-                    logger.info("Deep rescan complete")
-                elif not base_wallet_ready:
+                if not base_wallet_ready:
                     # First time setup - import everything including bonds
                     logger.info("Descriptor wallet not set up. Setting up...")
                     await wallet.setup_descriptor_wallet(
@@ -1294,6 +1246,18 @@ def rescan(
             ),
         ),
     ] = 0,
+    scan_depth: Annotated[
+        int | None,
+        typer.Option(
+            "--scan-depth",
+            help=(
+                "Widen the descriptor address-index range to N per branch "
+                "before rescanning (re-imports descriptors). Use this once for "
+                "a wallet whose used addresses sit beyond the configured "
+                "[wallet].scan_range. See the wallet scanning docs."
+            ),
+        ),
+    ] = None,
     data_dir: Annotated[
         Path | None,
         typer.Option(
@@ -1307,18 +1271,21 @@ def rescan(
         typer.Option("--log-level", "-l", help="Log level"),
     ] = None,
 ) -> None:
-    """Trigger a Bitcoin Core wallet rescan to repair history coverage.
+    """Rescan the blockchain to repair a descriptor wallet's coverage.
 
-    Use this when ``jm-wallet info --scan-status`` shows that the oldest
-    active descriptor timestamp is newer than your wallet's first use, or
-    when the wallet is proposing addresses you remember spending from.
-    Rescans are slow (20+ minutes on mainnet from genesis) but read-only;
-    no funds are at risk.
+    Two kinds of gap can leave the wallet unaware of its own coins:
 
-    The rescan runs server-side in Bitcoin Core: this command blocks while
-    polling progress, but interrupting it with Ctrl-C only ends the
-    polling, not the rescan itself. Bitcoin Core will keep scanning, and
-    you can re-attach later via ``jm-wallet info --scan-status``.
+    - Time coverage: Bitcoin Core has not scanned far enough back. Plain
+      `jm-wallet rescan` (optionally `--start-height H`) re-scans blocks
+      against the current descriptor range.
+    - Index coverage: a used address sits beyond the imported address range
+      (common for wallets migrated from legacy joinmarket-clientserver). Pass
+      `--scan-depth N` to widen the range to N per branch, then rescan.
+
+    Rescans are slow (20+ minutes on mainnet from genesis) but read-only. The
+    scan runs server-side in Bitcoin Core, so Ctrl-C only stops the progress
+    polling, not the scan; re-attach later with `jm-wallet info --scan-status`.
+    See docs/technical/wallet-scanning.md.
     """
     settings = setup_cli(log_level, data_dir=data_dir)
 
@@ -1359,6 +1326,8 @@ def rescan(
             bip39_passphrase=resolved.bip39_passphrase,
             start_height=start_height,
             creation_height=resolved.creation_height,
+            scan_depth=scan_depth,
+            gap_limit=settings.wallet.gap_limit,
         )
     )
 
@@ -1369,8 +1338,18 @@ async def _run_rescan(
     bip39_passphrase: str,
     start_height: int,
     creation_height: int | None,
+    scan_depth: int | None = None,
+    gap_limit: int = 20,
 ) -> None:
-    """Implementation of ``jm-wallet rescan``."""
+    """Implementation of ``jm-wallet rescan``.
+
+    When ``scan_depth`` is set, descriptors are first re-imported at the
+    wider range (index-coverage repair) and a full rescan from genesis is
+    driven by ``setup_descriptor_wallet``; ``start_height`` is ignored in
+    that case because widening the range requires scanning from block 0.
+    Otherwise a plain block rescan from ``start_height`` is run against the
+    current descriptor range (time-coverage repair).
+    """
     from jmwallet.backends.descriptor_wallet import (
         DescriptorWalletBackend,
         generate_wallet_name,
@@ -1402,6 +1381,41 @@ async def _run_rescan(
         pre_status = await backend.get_wallet_scan_status()
         print("Before rescan:")
         _print_scan_status(pre_status)
+
+        if scan_depth is not None:
+            # Index-coverage repair: re-import descriptors at the wider range
+            # and rescan from genesis. This is the path for wallets whose
+            # used addresses sit beyond the imported range (e.g. migrated
+            # from legacy joinmarket-clientserver). smart_scan=False and
+            # background_full_rescan=False force a synchronous scan from
+            # block 0 so coverage is complete when the command returns.
+            from jmwallet.wallet.service import WalletService
+
+            print(
+                f"\nWidening descriptor range to [0, {scan_depth - 1}] per branch "
+                "and rescanning from genesis. This may take 20+ minutes on mainnet."
+            )
+            wallet = WalletService(
+                mnemonic=mnemonic,
+                backend=backend,
+                network=backend_settings.network,
+                mixdepth_count=5,
+                gap_limit=gap_limit,
+                scan_range=scan_depth,
+                passphrase=bip39_passphrase,
+                data_dir=backend_settings.data_dir,
+            )
+            await wallet.setup_descriptor_wallet(
+                scan_range=scan_depth,
+                rescan=True,
+                check_existing=False,
+                smart_scan=False,
+                background_full_rescan=False,
+            )
+            post_status = await backend.get_wallet_scan_status()
+            print("\nAfter rescan:")
+            _print_scan_status(post_status)
+            return
 
         # Clamp to wallet creation height when it is more recent than the
         # requested start, mirroring what setup_descriptor_wallet does.
