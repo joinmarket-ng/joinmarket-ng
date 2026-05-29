@@ -139,6 +139,20 @@ from jmcore.settings import (
     get_settings,
     reset_settings,
 )
+from jmcore.silentpayments import (
+    K_MAX,
+    FoundOutput,
+    SilentPaymentAddress,
+    SilentPaymentError,
+    SilentPaymentInput,
+    create_label_tweak,
+    create_labeled_address,
+    create_outputs,
+    derive_silent_payment_address,
+    extract_input_pubkey,
+    parse_witness,
+    scan_transaction,
+)
 from jmcore.tasks import parse_directory_address, run_periodic_task
 from jmcore.timenumber import (
     TIMELOCK_EPOCH,
@@ -334,6 +348,19 @@ __all__ = [
     # Bond utilities
     "BondAddressInfo",
     "derive_bond_address",
+    # Silent Payments (BIP352)
+    "K_MAX",
+    "FoundOutput",
+    "SilentPaymentAddress",
+    "SilentPaymentError",
+    "SilentPaymentInput",
+    "create_label_tweak",
+    "create_labeled_address",
+    "create_outputs",
+    "derive_silent_payment_address",
+    "extract_input_pubkey",
+    "parse_witness",
+    "scan_transaction",
     # Tasks
     "parse_directory_address",
     "run_periodic_task",
