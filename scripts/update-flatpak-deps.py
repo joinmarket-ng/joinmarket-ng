@@ -146,12 +146,12 @@ def latest_jam_commit() -> str:
             "git",
             "ls-remote",
             "https://github.com/joinmarket-webui/jam.git",
-            "refs/heads/v2",
+            "refs/heads/devel",
         ],
         text=True,
     ).strip()
     if not output:
-        raise UpdateError("Could not fetch latest JAM v2 commit")
+        raise UpdateError("Could not fetch latest JAM devel commit")
     commit = output.split()[0]
     if not re.fullmatch(r"[a-f0-9]{40}", commit):
         raise UpdateError(f"Unexpected JAM commit format: {commit}")

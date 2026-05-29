@@ -557,10 +557,10 @@ else
 fi
 
 # =============================================================================
-# Phase 5: Update JAM commit hash (v2 branch)
+# Phase 5: Update JAM commit hash (devel branch)
 # =============================================================================
 echo ""
-log_info "Phase 5: Checking JAM commit hash (v2 branch)..."
+log_info "Phase 5: Checking JAM commit hash (devel branch)..."
 
 if [[ -f "$JMWALLETD_DOCKERFILE" ]]; then
     current_jam_commit=$(grep -oP 'JAM_COMMIT=\K[a-f0-9]+' "$JMWALLETD_DOCKERFILE" 2>/dev/null | head -1 || echo "")
@@ -568,14 +568,14 @@ if [[ -f "$JMWALLETD_DOCKERFILE" ]]; then
     if [[ -z "$current_jam_commit" ]]; then
         log_warn "JAM_COMMIT not found in jmwalletd/Dockerfile, skipping"
     else
-        latest_jam_commit=$(git ls-remote https://github.com/joinmarket-webui/jam.git refs/heads/v2 2>/dev/null | awk '{print $1}' || echo "")
+        latest_jam_commit=$(git ls-remote https://github.com/joinmarket-webui/jam.git refs/heads/devel 2>/dev/null | awk '{print $1}' || echo "")
 
         if [[ -z "$latest_jam_commit" ]]; then
-            log_warn "Could not fetch latest JAM v2 commit hash from GitHub, skipping"
+            log_warn "Could not fetch latest JAM devel commit hash from GitHub, skipping"
         elif [[ "$current_jam_commit" == "$latest_jam_commit" ]]; then
-            log_info "JAM v2 commit: Up to date ($current_jam_commit)"
+            log_info "JAM devel commit: Up to date ($current_jam_commit)"
         else
-            log_info "JAM v2 commit: update available"
+            log_info "JAM devel commit: update available"
             log_info "  Current: $current_jam_commit"
             log_info "  Latest:  $latest_jam_commit"
             UPDATES_NEEDED=$((UPDATES_NEEDED + 1))
@@ -583,7 +583,7 @@ if [[ -f "$JMWALLETD_DOCKERFILE" ]]; then
             if [[ "$CHECK_ONLY" == false ]]; then
                 sed -i "s|JAM_COMMIT=${current_jam_commit}|JAM_COMMIT=${latest_jam_commit}|g" "$JMWALLETD_DOCKERFILE"
                 UPDATES_MADE=$((UPDATES_MADE + 1))
-                log_info "JAM v2 commit: Updated to $latest_jam_commit"
+                log_info "JAM devel commit: Updated to $latest_jam_commit"
             fi
         fi
     fi

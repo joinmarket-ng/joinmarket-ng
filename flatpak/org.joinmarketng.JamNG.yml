@@ -119,22 +119,24 @@ modules:
     build-options:
       append-path: /usr/lib/sdk/node24/bin
       # Network needed for npm ci to fetch dependencies.
-      # For fully offline builds, generate sources with flatpak-node-generator:
+      # "npm ci" is strict and reproducible; it falls back to "npm install" when
+      # the upstream devel package-lock.json lags package.json (optional platform
+      # deps). For fully offline builds, generate sources with flatpak-node-generator:
       #   flatpak-node-generator npm package-lock.json -o flatpak/jam-npm-sources.json
-      # Then replace npm ci with: npm ci --offline, and add the generated sources file.
+      # Then replace the install command with: npm ci --offline, and add the generated sources file.
       build-args:
         - --share=network
       env:
         GENERATE_SOURCEMAP: 'false'
     build-commands:
-      - npm ci
+      - npm ci || npm install
       - npm run build
       - mkdir -p /app/share/jmwalletd/jam
       - 'if [ -d dist ]; then cp -r dist/* /app/share/jmwalletd/jam/; elif [ -d build ]; then cp -r build/* /app/share/jmwalletd/jam/; else echo "ERROR: no frontend build output (expected dist/ or build/)"; exit 1; fi'
     sources:
       - type: git
         url: https://github.com/joinmarket-webui/jam.git
-        commit: 70fdc264c757011d7b61e08bd8b56d260ceee258
+        commit: 4bbfe95a0b0f7b1c69bd71516f070c6f6a5f366f
 
   # =========================================================================
   # Module 6: Python application

@@ -15,9 +15,9 @@ ARG NODE_SLIM_DIGEST=sha256:242549cd46785b480c832479a730f4f2a20865d61ea2e404fdb2
 # in practice (callers should not override it).
 ARG JAM_BUILDER_PLATFORM=linux/amd64
 
-# JAM frontend: pinned commit hash for reproducible builds
+# JAM frontend: pinned commit hash for reproducible builds (devel branch tip)
 # Update with: ./scripts/update-base-images.sh
-ARG JAM_COMMIT=70fdc264c757011d7b61e08bd8b56d260ceee258
+ARG JAM_COMMIT=4bbfe95a0b0f7b1c69bd71516f070c6f6a5f366f
 
 # Pin build tools for reproducible builds
 # setuptools version is stamped into WHEEL metadata (Generator: setuptools (x.y.z))
@@ -185,9 +185,12 @@ RUN git clone https://github.com/joinmarket-webui/jam.git /app \
     fi
 
 WORKDIR /app
-# GENERATE_SOURCEMAP=false: skip source map generation for smaller output and to
-# avoid any path/metadata variance in source map content across build environments.
-RUN npm ci && GENERATE_SOURCEMAP=false npm run build
+# Prefer the strict, reproducible "npm ci" install. The devel branch's committed
+# package-lock.json occasionally lags package.json for optional platform-specific
+# deps, which makes "npm ci" abort; fall back to "npm install" so the build still
+# succeeds in that case. GENERATE_SOURCEMAP=false skips source map generation
+# (no-op for Vite, kept for older CRA-based JAM revisions).
+RUN (npm ci || npm install) && GENERATE_SOURCEMAP=false npm run build
 
 # =============================================================================
 # Stage 4: jam-ng — self-contained: jmwalletd + JAM frontend + Tor + obwatcher
