@@ -704,19 +704,60 @@ jobs:
         with:
           node-version: "24"
 
-      - name: Install Playwright dependencies
+      # Cache the downloaded Playwright browsers (Chrome, Chrome Headless
+      # Shell, FFmpeg) keyed on the locked Playwright version. The browser
+      # download from cdn.playwright.dev occasionally stalls with no
+      # progress and no built-in per-file timeout, which previously ate the
+      # entire 30-minute job budget. Caching skips the download on cache
+      # hits, and the bounded install step below fails fast on a miss+stall.
+      - name: Cache Playwright browsers
+        id: playwright-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('tests/playwright/package-lock.json') }}
+
+      - name: Install npm dependencies
         working-directory: tests/playwright
+        run: npm ci
+
+      # Bounded so a stalled CDN download fails this step within minutes
+      # instead of hanging until the job-level 30m timeout cancels it.
+      - name: Install Playwright browsers
+        working-directory: tests/playwright
+        timeout-minutes: 10
+        run: |
+          # On a cache hit the binaries already exist; install is then a
+          # fast no-op validation. On a miss this downloads Chrome, the
+          # Chrome Headless Shell and FFmpeg from cdn.playwright.dev, which
+          # can stall mid-download. Wrap each attempt in a hard per-attempt
+          # timeout and retry so a single stalled connection does not hang
+          # the whole job; the partial cache dir is reused across attempts.
+          for attempt in 1 2 3; do
+            echo "Playwright browser install attempt ${attempt}..."
+            if timeout 240 npx playwright install chromium; then
+              echo "Playwright browsers installed."
+              exit 0
+            fi
+            echo "Attempt ${attempt} failed or timed out; retrying..."
+            sleep 5
+          done
+          echo "Playwright browser install failed after 3 attempts." >&2
+          exit 1
+
+
+      - name: Install Playwright OS dependencies
+        working-directory: tests/playwright
+        timeout-minutes: 8
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
-          npm ci
-          # Install the browser binary (no sudo needed).
-          npx playwright install chromium
           # Install OS-level system dependencies for Chromium. playwright
           # install-deps calls apt-get internally via sudo; we pass
           # DEBIAN_FRONTEND=noninteractive explicitly through sudo env so it
           # is not dropped by sudo's env_reset policy.
           sudo env DEBIAN_FRONTEND=noninteractive npx playwright install-deps chromium
+
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
