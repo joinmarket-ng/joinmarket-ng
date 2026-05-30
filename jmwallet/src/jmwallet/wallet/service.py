@@ -5,6 +5,7 @@ JoinMarket wallet service with mixdepth support.
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,7 @@ from jmwallet.wallet.constants import DEFAULT_SCAN_RANGE, FIDELITY_BOND_BRANCH
 from jmwallet.wallet.display import WalletDisplayMixin
 from jmwallet.wallet.models import UTXOInfo
 from jmwallet.wallet.signer import WalletSigningMixin
+from jmwallet.wallet.silent_payment_scan import SilentPaymentReceived
 from jmwallet.wallet.silent_payments import SilentPaymentWallet
 from jmwallet.wallet.sync import WalletSyncMixin
 from jmwallet.wallet.utxo_metadata import (
@@ -272,6 +274,35 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin, Wal
     def get_silent_payment_address(self, label: int | None = None) -> str:
         """Return the wallet's silent payment address (optionally labeled)."""
         return self.get_silent_payments().get_address(label)
+
+    async def scan_silent_payments(
+        self,
+        start_height: int,
+        end_height: int | None = None,
+        labels: Sequence[int] = (),
+    ) -> list[SilentPaymentReceived]:
+        """Scan a block range for incoming BIP352 silent payments.
+
+        Walks blocks ``[start_height, end_height]`` (inclusive), pulling each
+        block with prevout data from the backend and matching outputs against
+        this wallet's silent payment keys. Requires a backend that can serve
+        full blocks with prevouts (Bitcoin Core); light clients raise
+        ``NotImplementedError``.
+
+        Returns the detected, spendable outputs. The change label (m=0) is
+        always scanned for in addition to any explicit labels.
+        """
+        from jmwallet.wallet.silent_payment_scan import scan_block_transactions
+
+        sp_wallet = self.get_silent_payments()
+        if end_height is None:
+            end_height = await self.backend.get_block_height()
+
+        received: list[SilentPaymentReceived] = []
+        for height in range(start_height, end_height + 1):
+            txs = await self.backend.get_block_transactions(height)
+            received.extend(scan_block_transactions(sp_wallet, txs, labels, network=self.network))
+        return received
 
     def get_receive_address(self, mixdepth: int, index: int) -> str:
         """Get external (receive) address"""

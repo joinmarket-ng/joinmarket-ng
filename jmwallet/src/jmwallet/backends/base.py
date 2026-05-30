@@ -226,6 +226,21 @@ class BlockchainBackend(ABC):
         """Get a specific UTXO from the blockchain UTXO set (gettxout).
         Returns None if the UTXO does not exist or has been spent."""
 
+    async def get_block_transactions(self, block_height: int) -> list[dict[str, Any]]:
+        """Return all transactions of a block with prevout data attached.
+
+        The returned dicts follow Bitcoin Core's ``getblock <hash> 3`` schema:
+        each input carries its ``prevout`` so callers can derive input public
+        keys. Used for BIP352 silent payment scanning.
+
+        Raises:
+            NotImplementedError: if the backend cannot supply full blocks with
+                prevouts (e.g. light clients).
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support full-block silent payment scanning"
+        )
+
     async def scan_descriptors(
         self, descriptors: Sequence[str | dict[str, Any]]
     ) -> dict[str, Any] | None:

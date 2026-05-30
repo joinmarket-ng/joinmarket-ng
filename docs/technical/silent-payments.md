@@ -39,6 +39,17 @@ jm-wallet silent-payment-address --network mainnet
 Optionally derive a labeled address (label `m >= 1`) to distinguish payment
 sources. Label `m = 0` is reserved for change and is never published.
 
+Scan a block range for incoming payments (requires the descriptor_wallet
+Bitcoin Core backend, which serves full blocks with prevout data):
+
+```
+jm-wallet scan-silent-payments --start-height 840000
+```
+
+Detected outputs are reported with their `txid:vout`, value, and the unique
+taproot address they landed on. The change label (`m = 0`) is always scanned
+for in addition to any `--labels`.
+
 ## Privacy: why outputs are treated like mixdepth-0 deposits
 
 A received silent payment is a fresh, unlinkable taproot UTXO. From the
@@ -66,6 +77,12 @@ subject to the same mixdepth-0 co-spending warning.
   `jmcore.silentpayments` and validated against the full upstream BIP352 test
   vectors.
 - Address derivation and display are wired into the wallet.
-- Spending detected outputs requires BIP340 taproot key-path signing and
-  on-chain scanning integration with the blockchain backends; see the issue
-  tracker for the current state of those follow-ups.
+- On-chain scanning is wired through the descriptor (Bitcoin Core) backend
+  using `getblock` verbosity 3 (`scan_silent_payments`). Light clients cannot
+  serve the required prevout data and are unsupported for scanning.
+- BIP340 taproot key-path signing is implemented (`sign_p2tr_input`), so
+  detected outputs can be spent: the recovered output key is the final taproot
+  output key and is signed directly.
+- Remaining follow-ups: persisting scan progress / importing detected outputs
+  as first-class wallet UTXOs, and an automatic background coinjoin sweep with
+  randomized timing for received deposits.
