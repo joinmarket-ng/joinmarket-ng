@@ -323,6 +323,46 @@ class MultiDirectoryClient(DirectoryClientPool):
             peer_location=peer_location,
         )
 
+    def upgrade_channel_prefer_direct(self, nick: str, current_channel: str) -> str:
+        """Opportunistically upgrade a session channel to a direct connection.
+
+        A session pins one channel before sending ``!fill`` (see
+        :meth:`bind_session`). When ``!fill`` is sent via a directory while a
+        direct connection is still being established, that connection often
+        finishes handshaking before the taker sends ``!auth``/``!tx``. This
+        mirrors the reference taker, which routes each privmsg
+        opportunistically (``jmdaemon/onionmc.py::_privmsg``): once the direct
+        peer is handshaked, later messages travel directly.
+
+        Makers accept such mid-session directory->direct switches (the signed
+        ``hostid`` is the fixed ``onion-network`` for all onion transports), so
+        upgrading improves privacy and latency without breaking compatibility.
+
+        We only ever upgrade directory->direct, never the reverse: if the
+        session is already direct we keep it, and we never downgrade a direct
+        session to a directory relay here.
+
+        Args:
+            nick: The maker nick whose session channel to re-evaluate.
+            current_channel: The channel currently pinned for the session
+                (``"direct"`` or ``"directory:<server>"``).
+
+        Returns:
+            ``"direct"`` if a handshaked direct connection is now available,
+            otherwise ``current_channel`` unchanged.
+        """
+        if not self.prefer_direct_connections:
+            return current_channel
+        if current_channel == "direct":
+            return current_channel
+        if self._get_connected_peer(nick) is not None:
+            logger.debug(
+                f"Upgrading session channel for {nick} from "
+                f"'{current_channel}' to 'direct' (direct connection now ready)"
+            )
+            return "direct"
+        return current_channel
+
     def try_direct_connect(self, nick: str) -> None:
         """
         Public alias for ``_try_direct_connect``.

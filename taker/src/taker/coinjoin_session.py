@@ -539,7 +539,13 @@ class CoinJoinSession:
             else:
                 logger.debug(f"Sending legacy UTXO format to maker {nick}")
 
-            # Encrypt and send (using same channel as !fill)
+            # Opportunistically upgrade to a direct connection if one has
+            # finished handshaking since !fill (mirrors the reference taker).
+            session.comm_channel = self.directory_client.upgrade_channel_prefer_direct(
+                nick, session.comm_channel
+            )
+
+            # Encrypt and send on the (possibly upgraded) session channel.
             encrypted_revelation = session.crypto.encrypt(revelation_str)
             await self.directory_client.send_privmsg(
                 nick,
@@ -1259,6 +1265,12 @@ class CoinJoinSession:
             if session.crypto is None:
                 logger.error(f"No encryption session for {nick}")
                 continue
+
+            # Opportunistically upgrade to a direct connection if one became
+            # available since the previous phase (mirrors the reference taker).
+            session.comm_channel = self.directory_client.upgrade_channel_prefer_direct(
+                nick, session.comm_channel
+            )
 
             encrypted_tx = session.crypto.encrypt(tx_b64)
             await self.directory_client.send_privmsg(

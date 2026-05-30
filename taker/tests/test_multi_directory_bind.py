@@ -115,3 +115,31 @@ def test_channel_binding_is_frozen():
     cb = ChannelBinding(nick="n", channel_id="direct")
     with pytest.raises((AttributeError, TypeError)):
         cb.nick = "other"  # type: ignore[misc]
+
+
+def test_upgrade_channel_prefers_direct_once_connected():
+    """A directory session upgrades to direct once a peer handshakes."""
+    peer = MagicMock()
+    peer.is_connected.return_value = True
+    mdc = _make_client(peer_connections={"J5x": peer}, prefer_direct=True)
+    assert mdc.upgrade_channel_prefer_direct("J5x", "directory:dir1") == "direct"
+
+
+def test_upgrade_channel_keeps_directory_when_no_peer():
+    """Without a handshaked peer, the directory channel is kept."""
+    mdc = _make_client(prefer_direct=True)
+    assert mdc.upgrade_channel_prefer_direct("J5x", "directory:dir1") == "directory:dir1"
+
+
+def test_upgrade_channel_never_downgrades_direct():
+    """An already-direct session is never downgraded to a directory."""
+    mdc = _make_client(prefer_direct=True)
+    assert mdc.upgrade_channel_prefer_direct("J5x", "direct") == "direct"
+
+
+def test_upgrade_channel_noop_when_direct_disabled():
+    """With direct connections disabled, the channel is left unchanged."""
+    peer = MagicMock()
+    peer.is_connected.return_value = True
+    mdc = _make_client(peer_connections={"J5x": peer}, prefer_direct=False)
+    assert mdc.upgrade_channel_prefer_direct("J5x", "directory:dir1") == "directory:dir1"
