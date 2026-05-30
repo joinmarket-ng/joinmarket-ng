@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.31.1] - 2026-05-30
+
+### Fixed
+
+- Install whiptail in maker and taker images so the jm-ng TUI works out of the box ([72ea101e](../../commit/72ea101ecf7f8665cbbd7e7f2124d61a7fb5138a))
+- Fix jmwalletd crash on startup in Flatpak (ModuleNotFoundError: No module named 'tumbler') ([b4df30ff](../../commit/b4df30ffa5f12bc04e617da540c3f4a7f13c926a))
+- Prevent a Sybil DoS where relayed !hp2 floods starved the maker's own post-ioauth commitment broadcasts and let the burned PoDLE commitment be reused against peers ([0db9050a](../../commit/0db9050a3617ad5b8cd78f740206da2b6a73d028))
+- Clamp descriptor scan ranges to Bitcoin Core's 1,000,000 limit instead of failing the whole import with "Range is too large" ([236ed773](../../commit/236ed773cf10272d8185815da0ac1e0a1ffd6145))
+- Honor --start-height when combined with --scan-depth in jm-wallet rescan ([236ed773](../../commit/236ed773cf10272d8185815da0ac1e0a1ffd6145))
+- Stop aborting CoinJoin sessions when a taker switches between ([220e9c57](../../commit/220e9c579b16a86d529cc8ece8f07c34e4810585))
+
 ## [0.31.0] - 2026-05-29
 
 More improvements about deep wallet scanning. Also security hardening, TUI improvements, and bug fixes. Automated Win/Mac/Linux install tests.
@@ -1436,7 +1447,8 @@ Releases prior to these changes (including 0.13.5, 0.13.6, and 0.13.7) cannot be
 - Pre-built image support for directory server compose.
 - Tor configuration instructions.
 
-[Unreleased]: ../../compare/0.31.0...HEAD
+[Unreleased]: ../../compare/0.31.1...HEAD
+[0.31.1]: ../../compare/0.31.0...0.31.1
 [0.31.0]: ../../compare/0.30.0...0.31.0
 [0.30.0]: ../../compare/0.29.0...0.30.0
 [0.29.0]: ../../compare/0.28.1...0.29.0
