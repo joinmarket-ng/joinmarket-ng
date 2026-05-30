@@ -32,15 +32,33 @@ from jmwallet.wallet.service import WalletService
 _ISOLATED_ENV_VARS = (
     "JOINMARKET_DATA_DIR",
     "MNEMONIC",
+    "MNEMONIC_FILE",
     "MNEMONIC_PASSWORD",
     "BIP39_PASSPHRASE",
+    # Typer picks this up as the `rpc_url` argument for several CLI commands,
+    # so if it is set in the shell (e.g. by a parallel e2e suite) it silently
+    # enables "online mode" and causes offline-mode tests to fail.
+    "BITCOIN_RPC_URL",
 )
 
 
 @pytest.fixture(autouse=True)
 def _isolate_joinmarket_env() -> Generator[None, None, None]:
-    """Snapshot/restore env vars that CLI commands may mutate globally."""
+    """Snapshot/restore env vars that CLI commands may mutate globally.
+
+    Also deletes ``BITCOIN_RPC_URL`` and mnemonic-related vars for the
+    duration of each test. Typer reads ``BITCOIN_RPC_URL`` as the
+    ``rpc_url`` argument for several CLI commands; when the shell-level var
+    is set (e.g. by a parallel e2e/Docker test suite) it silently enables
+    online mode and breaks offline-mode tests. Using ``monkeypatch`` for
+    this would be cleaner, but conftest fixtures cannot accept
+    ``monkeypatch``, so we do it manually.
+    """
     snapshot = {k: os.environ.get(k) for k in _ISOLATED_ENV_VARS}
+    # Remove all tracked vars at test start so no ambient shell values leak
+    # into CLI commands invoked via CliRunner (which runs in-process).
+    for key in _ISOLATED_ENV_VARS:
+        os.environ.pop(key, None)
     try:
         yield
     finally:
