@@ -23,7 +23,7 @@ level keys::
 Privacy note: silent payment outputs always land as fresh, unlinkable taproot
 UTXOs. JoinMarket treats them like mixdepth-0 deposits, which must never be
 co-spent with fidelity bonds or other deposits without first being mixed. See
-``docs/technical/silent_payments.md``.
+``docs/technical/silent-payments.md``.
 """
 
 from __future__ import annotations

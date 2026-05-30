@@ -1141,7 +1141,7 @@ def silent_payment_address(
 
     PRIVACY: Silent payment outputs are treated like mixdepth-0 deposits. Do not
     co-spend them with fidelity bonds or other deposits; mix them first (for
-    example with a sweep tumble). See docs/technical/silent_payments.md.
+    example with a sweep tumble). See docs/technical/silent-payments.md.
     """
     from jmwallet.wallet.bip32 import HDKey, mnemonic_to_seed
     from jmwallet.wallet.silent_payments import SilentPaymentWallet
