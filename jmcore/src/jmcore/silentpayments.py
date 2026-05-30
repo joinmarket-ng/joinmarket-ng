@@ -33,7 +33,7 @@ from bech32 import CHARSET, bech32_hrp_expand, bech32_polymod, convertbits
 from coincurve import PublicKey
 from pydantic import BaseModel, ConfigDict, field_validator
 
-from jmcore.bitcoin import NetworkType, decode_varint
+from jmcore.bitcoin import NetworkType, decode_varint, tagged_hash
 from jmcore.constants import SECP256K1_N
 
 if TYPE_CHECKING:
@@ -146,12 +146,6 @@ def _lift_x(xonly: bytes) -> PublicKey:
     if len(xonly) != 32:
         raise SilentPaymentError("x-only public key must be 32 bytes")
     return PublicKey(b"\x02" + xonly)
-
-
-def tagged_hash(tag: str, data: bytes) -> bytes:
-    """BIP340 tagged hash: SHA256(SHA256(tag) || SHA256(tag) || data)."""
-    tag_hash = hashlib.sha256(tag.encode()).digest()
-    return hashlib.sha256(tag_hash + tag_hash + data).digest()
 
 
 def _ser_uint32(value: int) -> bytes:

@@ -287,6 +287,24 @@ def sha256(data: bytes) -> bytes:
     return hashlib.sha256(data).digest()
 
 
+def tagged_hash(tag: str, data: bytes) -> bytes:
+    """
+    Compute a BIP340 tagged hash: SHA256(SHA256(tag) || SHA256(tag) || data).
+
+    Used by BIP340/BIP341 (Schnorr signatures, Taproot) and BIP352 (Silent
+    Payments).
+
+    Args:
+        tag: The tag string (e.g. "TapSighash", "TapTweak")
+        data: The data to hash
+
+    Returns:
+        32-byte tagged hash
+    """
+    tag_hash = hashlib.sha256(tag.encode("utf-8")).digest()
+    return hashlib.sha256(tag_hash + tag_hash + data).digest()
+
+
 # =============================================================================
 # Varint Encoding/Decoding
 # =============================================================================
@@ -398,6 +416,110 @@ def pubkey_to_p2wpkh_script(pubkey: bytes | str) -> bytes:
     return bytes([0x00, 0x14]) + pubkey_hash
 
 
+# =============================================================================
+# Bech32m (BIP350) and Taproot (BIP341) helpers
+# =============================================================================
+
+BECH32M_CONST = 0x2BC830A3
+
+
+def bech32m_create_checksum(hrp: str, data: list[int]) -> list[int]:
+    """Compute the BIP350 bech32m checksum for the given HRP and 5-bit data."""
+    values = bech32_lib.bech32_hrp_expand(hrp) + data
+    polymod = bech32_lib.bech32_polymod(values + [0, 0, 0, 0, 0, 0]) ^ BECH32M_CONST
+    return [(polymod >> 5 * (5 - i)) & 31 for i in range(6)]
+
+
+def bech32m_encode(hrp: str, witver: int, witprog: bytes) -> str:
+    """Encode a segwit address (witness version >= 1) using bech32m."""
+    converted = bech32_lib.convertbits(witprog, 8, 5)
+    if converted is None:
+        raise ValueError("Failed to convert witness program bits")
+    data = [witver, *converted]
+    checksum = bech32m_create_checksum(hrp, data)
+    return hrp + "1" + "".join([bech32_lib.CHARSET[d] for d in data + checksum])
+
+
+def bech32m_decode(hrp: str, addr: str) -> tuple[int | None, list[int] | None]:
+    """Decode a bech32m segwit address, returning (witver, 5-bit witprog data)."""
+    pos = addr.rfind("1")
+    if pos < 1 or pos + 7 > len(addr) or len(addr) > 90:
+        return None, None
+    if not addr.startswith(hrp + "1"):
+        return None, None
+    data = [bech32_lib.CHARSET.find(x) for x in addr[pos + 1 :]]
+    if any(x == -1 for x in data):
+        return None, None
+    values = bech32_lib.bech32_hrp_expand(hrp) + data
+    if bech32_lib.bech32_polymod(values) != BECH32M_CONST:
+        return None, None
+    return data[0], data[1:-6]
+
+
+@validate_call
+def pubkey_to_p2tr_address(pubkey: bytes | str, network: str | NetworkType = "mainnet") -> str:
+    """Convert a 32-byte x-only public key to a P2TR (Taproot) bech32m address."""
+    if isinstance(pubkey, str):
+        pubkey = bytes.fromhex(pubkey)
+    if len(pubkey) != 32:
+        raise ValueError(f"Invalid x-only pubkey length: {len(pubkey)}")
+    return bech32m_encode(get_hrp(network), 1, pubkey)
+
+
+def create_p2tr_scriptpubkey(pubkey: bytes | str) -> bytes:
+    """Create a P2TR scriptPubKey (OP_1 <32-byte-x-only-key>) from an x-only key."""
+    if isinstance(pubkey, str):
+        pubkey = bytes.fromhex(pubkey)
+    if len(pubkey) != 32:
+        raise ValueError(f"Invalid x-only pubkey length: {len(pubkey)}")
+    return bytes([0x51, 0x20]) + pubkey
+
+
+@validate_call
+def taproot_tweak_pubkey(internal_pubkey: bytes, h: bytes | None = None) -> tuple[int, bytes]:
+    """Tweak an internal x-only key with a BIP341 hash to get the output key.
+
+    Args:
+        internal_pubkey: 32-byte x-only public key
+        h: Optional 32-byte script tree Merkle root (empty for key-path spends)
+
+    Returns:
+        (y_parity, 32-byte x-only tweaked output key)
+    """
+    from coincurve import PublicKey
+
+    if len(internal_pubkey) != 32:
+        raise ValueError(f"internal_pubkey must be 32 bytes, got {len(internal_pubkey)}")
+    try:
+        pub = PublicKey(b"\x02" + internal_pubkey)
+    except ValueError:
+        raise ValueError("Invalid internal public key") from None
+    tweak = tagged_hash("TapTweak", internal_pubkey + (h or b""))
+    tweaked_pub = pub.add(tweak)
+    tweaked_bytes = tweaked_pub.format(compressed=True)
+    return tweaked_bytes[0] - 2, tweaked_bytes[1:]
+
+
+def taproot_tweak_privkey(privkey_bytes: bytes, h: bytes | None = None) -> bytes:
+    """Tweak a private key for Taproot key-path spending (BIP341).
+
+    Negates the scalar first if the internal public key has an odd Y coordinate.
+    """
+    import coincurve
+
+    from jmcore.constants import SECP256K1_N
+
+    priv_key = coincurve.PrivateKey(privkey_bytes)
+    pub = priv_key.public_key
+    internal_pub = pub.format(compressed=True)[1:]
+    d = int.from_bytes(privkey_bytes, "big")
+    if pub.format(compressed=True)[0] == 0x03:
+        d = (SECP256K1_N - d) % SECP256K1_N
+    priv_key_even = coincurve.PrivateKey.from_int(d)
+    tweak = tagged_hash("TapTweak", internal_pub + (h or b""))
+    return priv_key_even.add(tweak).secret
+
+
 @validate_call
 def script_to_p2wsh_address(script: bytes, network: str | NetworkType = "mainnet") -> str:
     """
@@ -456,11 +578,21 @@ def address_to_scriptpubkey(address: str) -> bytes:
         hrp = address[:hrp_end]
 
         bech32_decoded = bech32_lib.decode(hrp, address)
-        if bech32_decoded[0] is None or bech32_decoded[1] is None:
-            raise ValueError(f"Invalid bech32 address: {address}")
-
         witver = bech32_decoded[0]
-        witprog = bytes(bech32_decoded[1])
+
+        if witver is not None and bech32_decoded[1] is not None:
+            # Witness version 0 (bech32): library returns 8-bit witness program.
+            witprog = bytes(bech32_decoded[1])
+        else:
+            # Witness version >= 1 (bech32m), e.g. P2TR.
+            m_witver, m_data = bech32m_decode(hrp, address)
+            if m_witver is None or m_data is None:
+                raise ValueError(f"Invalid bech32/bech32m address: {address}")
+            witver = m_witver
+            converted = bech32_lib.convertbits(m_data, 5, 8, False)
+            if converted is None:
+                raise ValueError(f"Invalid witness program padding: {address}")
+            witprog = bytes(converted)
 
         if witver == 0:
             if len(witprog) == 20:
@@ -525,10 +657,7 @@ def scriptpubkey_to_address(scriptpubkey: bytes, network: str | NetworkType = "m
 
     # P2TR
     if len(scriptpubkey) == 34 and scriptpubkey[0] == 0x51 and scriptpubkey[1] == 0x20:
-        result = bech32_lib.encode(hrp, 1, scriptpubkey[2:])
-        if result is None:
-            raise ValueError(f"Failed to encode P2TR address: {scriptpubkey.hex()}")
-        return result
+        return bech32m_encode(hrp, 1, scriptpubkey[2:])
 
     # P2PKH
     if (
@@ -1095,11 +1224,18 @@ def get_address_type(address: str) -> str:
         hrp = address[:hrp_end]
 
         decoded = bech32_lib.decode(hrp, address)
-        if decoded[0] is None or decoded[1] is None:
-            raise ValueError(f"Invalid bech32 address: {address}")
-
         witver = decoded[0]
-        witprog = bytes(decoded[1])
+        if witver is not None and decoded[1] is not None:
+            witprog = bytes(decoded[1])
+        else:
+            m_witver, m_data = bech32m_decode(hrp, address)
+            if m_witver is None or m_data is None:
+                raise ValueError(f"Invalid bech32/bech32m address: {address}")
+            witver = m_witver
+            converted = bech32_lib.convertbits(m_data, 5, 8, False)
+            if converted is None:
+                raise ValueError(f"Invalid witness program padding: {address}")
+            witprog = bytes(converted)
 
         if witver == 0:
             if len(witprog) == 20:
@@ -1113,8 +1249,8 @@ def get_address_type(address: str) -> str:
 
     # Base58
     try:
-        decoded = base58.b58decode_check(address)
-        version = decoded[0]
+        b58_decoded = base58.b58decode_check(address)
+        version = b58_decoded[0]
         if version in (0x00, 0x6F):  # P2PKH
             return "p2pkh"
         elif version in (0x05, 0xC4):  # P2SH
@@ -1123,6 +1259,21 @@ def get_address_type(address: str) -> str:
         pass
 
     raise ValueError(f"Unknown address type: {address}")
+
+
+def is_p2tr_address(address: str) -> bool:
+    """Return True if ``address`` is a valid P2TR (Taproot) bech32m address."""
+    if not address:
+        return False
+    address_lower = address.lower()
+    for hrp in ("bcrt", "bc", "tb"):
+        if address_lower.startswith(hrp + "1"):
+            witver, witprog_data = bech32m_decode(hrp, address_lower)
+            if witver == 1 and witprog_data is not None:
+                converted = bech32_lib.convertbits(witprog_data, 5, 8, False)
+                return converted is not None and len(converted) == 32
+            return False
+    return False
 
 
 def estimate_vsize(input_types: list[str], output_types: list[str]) -> int:
