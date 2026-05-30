@@ -8,7 +8,8 @@ correlation with the maker's long-lived identity:
 - _broadcast_commitment_ephemeral: fresh connections, pubmsg, close
 - _handle_hp2_privmsg: relay requests from other makers
 - _handle_hp2_pubmsg: public commitment blacklisting
-- _hp2_broadcast_semaphore: concurrency limiting for DoS protection
+- _hp2_own_broadcast_semaphore / _hp2_relay_broadcast_semaphore:
+  separated concurrency pools so relay floods cannot starve own broadcasts
 """
 
 from __future__ import annotations
@@ -79,7 +80,7 @@ class TestBroadcastCommitment:
         # Let the create_task fire
         await asyncio.sleep(0)
 
-        mock_ephemeral.assert_called_once_with(COMMITMENT)
+        mock_ephemeral.assert_called_once_with(COMMITMENT, is_relay=False)
 
     async def test_does_not_use_existing_directory_connections(
         self, maker_bot: MakerBot, mock_directory_client: MagicMock
@@ -249,7 +250,7 @@ class TestHandleHp2Privmsg:
 
         await asyncio.sleep(0)
 
-        mock_ephemeral.assert_called_once_with(COMMITMENT)
+        mock_ephemeral.assert_called_once_with(COMMITMENT, is_relay=True)
 
     async def test_ignores_invalid_format(self, maker_bot: MakerBot) -> None:
         with (
@@ -299,53 +300,81 @@ class TestHandleHp2Pubmsg:
 
 
 @pytest.mark.asyncio
-class TestHp2BroadcastSemaphore:
-    """Tests for the concurrency semaphore protecting ephemeral broadcasts."""
+class TestHp2BroadcastSemaphores:
+    """Tests for the dedicated concurrency pools protecting ephemeral broadcasts."""
 
-    async def test_semaphore_initialized_with_max_2(self, maker_bot: MakerBot) -> None:
-        # Semaphore(2) allows 2 concurrent broadcasts
-        assert not maker_bot._hp2_broadcast_semaphore.locked()
+    async def test_semaphores_initialized_unlocked(self, maker_bot: MakerBot) -> None:
+        assert not maker_bot._hp2_own_broadcast_semaphore.locked()
+        assert not maker_bot._hp2_relay_broadcast_semaphore.locked()
 
-    async def test_concurrent_broadcasts_limited(self, maker_bot: MakerBot) -> None:
-        """When 2 broadcasts are in-flight, a 3rd should be dropped."""
-        # Hold both semaphore slots
-        await maker_bot._hp2_broadcast_semaphore.acquire()
-        await maker_bot._hp2_broadcast_semaphore.acquire()
+    async def test_relay_pool_drops_relays_on_contention(self, maker_bot: MakerBot) -> None:
+        """When the relay pool is busy, additional relayed broadcasts are dropped."""
+        await maker_bot._hp2_relay_broadcast_semaphore.acquire()
 
-        # Now the semaphore is exhausted; ephemeral broadcast should be dropped
         mock_client = MagicMock()
         mock_client.connect = AsyncMock()
         mock_client.send_public_message = AsyncMock()
         mock_client.close = AsyncMock()
 
         with patch("maker.protocol_handlers.DirectoryClient", return_value=mock_client):
-            await maker_bot._broadcast_commitment_ephemeral(COMMITMENT)
+            await maker_bot._broadcast_commitment_ephemeral(COMMITMENT, is_relay=True)
 
-        # Should not have connected or broadcast anything
         mock_client.connect.assert_not_called()
 
-        # Release for cleanup
-        maker_bot._hp2_broadcast_semaphore.release()
-        maker_bot._hp2_broadcast_semaphore.release()
+        maker_bot._hp2_relay_broadcast_semaphore.release()
 
-    async def test_semaphore_released_after_broadcast(self, maker_bot: MakerBot) -> None:
+    async def test_relay_saturation_does_not_starve_own_broadcast(
+        self, maker_bot: MakerBot
+    ) -> None:
+        """Security invariant: a Sybil flood of relayed broadcasts must not block
+        the maker's own post-ioauth commitment broadcast. The two pools are
+        independent, so saturating the relay pool leaves the own pool free."""
+        await maker_bot._hp2_relay_broadcast_semaphore.acquire()
+
         mock_client = MagicMock()
         mock_client.connect = AsyncMock()
         mock_client.send_public_message = AsyncMock()
         mock_client.close = AsyncMock()
 
         with patch("maker.protocol_handlers.DirectoryClient", return_value=mock_client):
-            await maker_bot._broadcast_commitment_ephemeral(COMMITMENT)
+            await maker_bot._broadcast_commitment_ephemeral(COMMITMENT, is_relay=False)
 
-        # Semaphore should be released (not locked)
-        assert not maker_bot._hp2_broadcast_semaphore.locked()
+        # Own broadcast must have reached all configured directories.
+        assert mock_client.connect.call_count == 2
+        assert mock_client.send_public_message.call_count == 2
+        mock_client.send_public_message.assert_has_calls(
+            [call(f"hp2 {COMMITMENT}"), call(f"hp2 {COMMITMENT}")]
+        )
 
-    async def test_semaphore_released_on_failure(self, maker_bot: MakerBot) -> None:
+        maker_bot._hp2_relay_broadcast_semaphore.release()
+
+    async def test_own_pool_released_after_broadcast(self, maker_bot: MakerBot) -> None:
+        mock_client = MagicMock()
+        mock_client.connect = AsyncMock()
+        mock_client.send_public_message = AsyncMock()
+        mock_client.close = AsyncMock()
+
+        with patch("maker.protocol_handlers.DirectoryClient", return_value=mock_client):
+            await maker_bot._broadcast_commitment_ephemeral(COMMITMENT, is_relay=False)
+
+        assert not maker_bot._hp2_own_broadcast_semaphore.locked()
+
+    async def test_relay_pool_released_after_broadcast(self, maker_bot: MakerBot) -> None:
+        mock_client = MagicMock()
+        mock_client.connect = AsyncMock()
+        mock_client.send_public_message = AsyncMock()
+        mock_client.close = AsyncMock()
+
+        with patch("maker.protocol_handlers.DirectoryClient", return_value=mock_client):
+            await maker_bot._broadcast_commitment_ephemeral(COMMITMENT, is_relay=True)
+
+        assert not maker_bot._hp2_relay_broadcast_semaphore.locked()
+
+    async def test_own_pool_released_on_failure(self, maker_bot: MakerBot) -> None:
         with patch("maker.protocol_handlers.DirectoryClient") as mock_cls:
             mock_cls.return_value.connect = AsyncMock(side_effect=ConnectionError("fail"))
             mock_cls.return_value.close = AsyncMock()
 
-            await maker_bot._broadcast_commitment_ephemeral(COMMITMENT)
+            await maker_bot._broadcast_commitment_ephemeral(COMMITMENT, is_relay=False)
 
-        # Semaphore should still be released
-        assert not maker_bot._hp2_broadcast_semaphore.locked()
+        assert not maker_bot._hp2_own_broadcast_semaphore.locked()
