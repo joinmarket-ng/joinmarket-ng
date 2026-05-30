@@ -1109,6 +1109,75 @@ def validate(
         raise typer.Exit(1)
 
 
+@app.command("silent-payment-address")
+def silent_payment_address(
+    mnemonic_file: Annotated[
+        Path | None,
+        typer.Option("--mnemonic-file", "-f", help="Path to mnemonic file", envvar="MNEMONIC_FILE"),
+    ] = None,
+    prompt_bip39_passphrase: Annotated[
+        bool,
+        typer.Option("--prompt-bip39-passphrase", help="Prompt for BIP39 passphrase interactively"),
+    ] = False,
+    network: Annotated[str | None, typer.Option("--network", "-n", help="Bitcoin network")] = None,
+    label: Annotated[
+        int | None,
+        typer.Option(
+            "--label",
+            help="Optional BIP352 label integer (>=1) for a labeled address. m=0 is reserved.",
+        ),
+    ] = None,
+    data_dir: Annotated[
+        Path | None,
+        typer.Option("--data-dir", envvar="JOINMARKET_DATA_DIR", help="Data directory"),
+    ] = None,
+    log_level: Annotated[str | None, typer.Option("--log-level", "-l", help="Log level")] = None,
+) -> None:
+    """Display this wallet's BIP352 silent payment address.
+
+    Publish this static address to receive payments (e.g. anonymous donations
+    to a maker) without revealing on-chain links to your other funds. Each
+    payment lands at a unique, unlinkable taproot output.
+
+    PRIVACY: Silent payment outputs are treated like mixdepth-0 deposits. Do not
+    co-spend them with fidelity bonds or other deposits; mix them first (for
+    example with a sweep tumble). See docs/technical/silent_payments.md.
+    """
+    from jmwallet.wallet.bip32 import HDKey, mnemonic_to_seed
+    from jmwallet.wallet.silent_payments import SilentPaymentWallet
+
+    settings = setup_cli(log_level, data_dir=data_dir)
+
+    try:
+        resolved = resolve_mnemonic(
+            settings,
+            mnemonic_file=mnemonic_file,
+            prompt_bip39_passphrase=prompt_bip39_passphrase,
+        )
+        if not resolved:
+            raise ValueError("No mnemonic provided")
+    except (FileNotFoundError, ValueError) as e:
+        logger.error(str(e))
+        raise typer.Exit(1)
+
+    backend = resolve_backend_settings(settings, network=network, data_dir=data_dir)
+    resolved_network = backend.network
+    seed = mnemonic_to_seed(resolved.mnemonic, resolved.bip39_passphrase)
+    sp_wallet = SilentPaymentWallet(HDKey.from_seed(seed), network=resolved_network)
+
+    try:
+        address = sp_wallet.get_address(label)
+    except ValueError as e:
+        logger.error(str(e))
+        raise typer.Exit(1)
+
+    if label is not None:
+        print(f"Silent payment address (label {label}):")
+    else:
+        print("Silent payment address:")
+    print(address)
+
+
 @app.command()
 def showseed(
     mnemonic_file: Annotated[

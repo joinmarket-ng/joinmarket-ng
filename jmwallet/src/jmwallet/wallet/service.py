@@ -19,6 +19,7 @@ from jmwallet.wallet.constants import DEFAULT_SCAN_RANGE, FIDELITY_BOND_BRANCH
 from jmwallet.wallet.display import WalletDisplayMixin
 from jmwallet.wallet.models import UTXOInfo
 from jmwallet.wallet.signer import WalletSigningMixin
+from jmwallet.wallet.silent_payments import SilentPaymentWallet
 from jmwallet.wallet.sync import WalletSyncMixin
 from jmwallet.wallet.utxo_metadata import (
     DEFAULT_COINJOIN_LOCK_TTL,
@@ -89,6 +90,8 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin, Wal
         self.address_cache: dict[str, tuple[int, int, int]] = {}
         self._path_cache: dict[tuple[int, int, int], str] = {}
         self.utxo_cache: dict[int, list[UTXOInfo]] = {}
+        # Lazily-derived BIP352 silent payment key pair (see get_silent_payments).
+        self._silent_payments: SilentPaymentWallet | None = None
 
         # UTXO + address metadata store (BIP-329 JSONL). Frozen UTXO state,
         # output labels, and the persistent "addresses with on-chain history"
@@ -254,6 +257,21 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin, Wal
         self._path_cache[path_key] = address
 
         return address
+
+    def get_silent_payments(self) -> SilentPaymentWallet:
+        """Return the wallet's BIP352 silent payment key pair (cached).
+
+        Derived from the seed at ``m/352'/coin'/0'/{1',0'}/0``. Used to publish
+        a static silent payment address (e.g. for anonymous donations to a
+        maker) and to scan for / spend incoming silent payments.
+        """
+        if self._silent_payments is None:
+            self._silent_payments = SilentPaymentWallet(self.master_key, self.network)
+        return self._silent_payments
+
+    def get_silent_payment_address(self, label: int | None = None) -> str:
+        """Return the wallet's silent payment address (optionally labeled)."""
+        return self.get_silent_payments().get_address(label)
 
     def get_receive_address(self, mixdepth: int, index: int) -> str:
         """Get external (receive) address"""
