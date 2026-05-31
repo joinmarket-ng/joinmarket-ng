@@ -59,6 +59,7 @@ DIRECTORY_NODES_MAINNET: list[str] = [
 DIRECTORY_NODES_SIGNET: list[str] = [
     "signetvaxgd3ivj4tml4g6ed3samaa2rscre2gyeyohncmwk4fbesiqd.onion:5222",
     "u5oj5etqex3vh7jagljf3e2lo4awmmtcw3klbrlt2fonzyozpn5txrqd.onion:5222",
+    "frqp4m6yveiagow73dplmnyv2abrqhte2grbhgw7hkbkhrv6zagrqbqd.onion:5222",
 ]
 # No default directory nodes for testnet/regtest - must be configured by user
 DIRECTORY_NODES_TESTNET: list[str] = []
