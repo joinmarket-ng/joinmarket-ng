@@ -87,6 +87,10 @@ class MessageRouter:
                     "sw0absoffer",
                     "sw0reloffer",
                     "sw0relorder",
+                    "tr0absorder",
+                    "tr0absoffer",
+                    "tr0reloffer",
+                    "tr0relorder",
                 )
                 and len(message_parts) >= 2
             ):

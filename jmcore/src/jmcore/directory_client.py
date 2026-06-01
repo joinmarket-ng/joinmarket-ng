@@ -1313,7 +1313,8 @@ class DirectoryClient:
         """
         Parse an offer from a message's content part.
 
-        Handles all offer types (sw0reloffer, sw0absoffer, swreloffer, swabsoffer),
+        Handles all offer types (sw0reloffer, sw0absoffer, swreloffer, swabsoffer,
+        tr0reloffer, tr0absoffer),
         optional fidelity bond proof, and the deprecated !neutrino flag.
 
         Args:

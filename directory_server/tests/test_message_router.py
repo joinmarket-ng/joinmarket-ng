@@ -247,6 +247,37 @@ class TestOfferTracking:
         assert stats["peers_with_offers"] == 1
 
     @pytest.mark.anyio
+    async def test_tracks_tr0offer(self, registry):
+        """Should track taproot (tr0) offer messages."""
+        sent_messages = []
+
+        async def mock_send(peer_key: str, data: bytes) -> None:
+            sent_messages.append((peer_key, data))
+
+        router = MessageRouter(
+            peer_registry=registry,
+            send_callback=mock_send,
+        )
+
+        maker = PeerInfo(
+            nick="maker1",
+            onion_address="a" * 56 + ".onion",
+            port=5222,
+            network=NetworkType.MAINNET,
+            status=PeerStatus.HANDSHAKED,
+        )
+        registry.register(maker)
+
+        payload = f"{maker.nick}!PUBLIC!tr0reloffer 0 30000 72590 0 0.001"
+        envelope = MessageEnvelope(message_type=MessageType.PUBMSG, payload=payload)
+
+        await router._handle_public_message(envelope, maker.location_string)
+
+        stats = router.get_offer_stats()
+        assert stats["total_offers"] == 1
+        assert stats["peers_with_offers"] == 1
+
+    @pytest.mark.anyio
     async def test_tracks_multiple_offers_per_peer(self, registry):
         """Should track multiple offers from same peer."""
         sent_messages = []
