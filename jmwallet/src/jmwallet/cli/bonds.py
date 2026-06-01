@@ -86,6 +86,9 @@ def list_bonds(
     updates the registry. The per-wallet registry is selected by fingerprint
     derived from --mnemonic-file, taken from --wallet-fingerprint, or
     auto-detected when only one wallet's registry exists in the data dir.
+
+    Registered-but-unfunded bonds (created with generate-bond-address or
+    import-bond but not yet funded) are shown by default in both modes.
     """
     settings = setup_cli(log_level, data_dir=data_dir)
     resolved_data_dir = data_dir if data_dir else settings.get_data_dir()
@@ -320,16 +323,6 @@ async def _list_fidelity_bonds(
 
         bonds = await find_fidelity_bonds(wallet)
 
-        if not bonds:
-            print("\nNo fidelity bonds found in wallet.")
-            if not locktimes:
-                print("TIP: Use --locktime to specify locktime(s) to scan for undiscovered bonds")
-                print(
-                    "     Or use 'jm-wallet generate-bond-address' to create a new bond "
-                    "and register it"
-                )
-            return
-
         # Group bonds by address to detect multiple UTXOs at the same address.
         # Per the reference implementation, only the single highest-value UTXO
         # at each address is used as a fidelity bond.
@@ -355,7 +348,23 @@ async def _list_fidelity_bonds(
         # Sort by bond value (highest first)
         best_bonds.sort(key=lambda x: x[1].bond_value, reverse=True)
 
-        print(f"\nFound {len(best_bonds)} fidelity bond(s):\n")
+        # Registered bonds that were not discovered as funded UTXOs on-chain.
+        # These are shown by default so users can see bonds they created with
+        # generate-bond-address/import-bond but have not funded yet.
+        funded_addresses = {addr for addr, _, _ in best_bonds}
+        unfunded_bonds = [b for b in network_bonds if b.address not in funded_addresses]
+
+        if not best_bonds and not unfunded_bonds:
+            print("\nNo fidelity bonds found in wallet.")
+            if not locktimes:
+                print("TIP: Use --locktime to specify locktime(s) to scan for undiscovered bonds")
+                print(
+                    "     Or use 'jm-wallet generate-bond-address' to create a new bond "
+                    "and register it"
+                )
+            return
+
+        print(f"\nFound {len(best_bonds)} funded fidelity bond(s):\n")
         print("=" * 120)
 
         from jmcore.bitcoin import format_amount
@@ -430,6 +439,23 @@ async def _list_fidelity_bonds(
                     bond_registry.add_bond(new_bond)
                     registry_updated = True
                     logger.info(f"Added new bond to registry: {addr[:20]}...")
+
+        if not best_bonds:
+            print("No funded fidelity bonds found on-chain.")
+            print("=" * 120)
+
+        # Show registered-but-unfunded bonds so users can see and fund them.
+        if unfunded_bonds:
+            print(f"\nRegistered but unfunded fidelity bond(s): {len(unfunded_bonds)}\n")
+            print("=" * 120)
+            for reg_bond in sorted(unfunded_bonds, key=lambda b: b.locktime):
+                expired = datetime.now().timestamp() > reg_bond.locktime
+                status = "EXPIRED" if expired else "UNFUNDED"
+                print(f"  [{status}]  {reg_bond.address}")
+                print(f"    Locktime: {reg_bond.locktime} ({reg_bond.locktime_human})")
+                print(f"    Path:     {reg_bond.path}")
+                print("-" * 120)
+            print("Fund any of the addresses above to activate the bond.")
 
         # Save registry if any updates were made
         if registry_updated:
