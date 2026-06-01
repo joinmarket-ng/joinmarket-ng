@@ -142,10 +142,18 @@ def _has_even_y(point: PublicKey) -> bool:
 
 
 def _lift_x(xonly: bytes) -> PublicKey:
-    """Lift a 32-byte x-only key to the point with even Y."""
+    """Lift a 32-byte x-only key to the point with even Y.
+
+    Raises ``SilentPaymentError`` (never a bare ``ValueError``) when ``xonly`` is
+    not a valid curve point, so callers scanning attacker-controlled outputs can
+    skip them instead of crashing.
+    """
     if len(xonly) != 32:
         raise SilentPaymentError("x-only public key must be 32 bytes")
-    return PublicKey(b"\x02" + xonly)
+    try:
+        return PublicKey(b"\x02" + xonly)
+    except ValueError as exc:
+        raise SilentPaymentError("x-only key is not a valid curve point") from exc
 
 
 def _ser_uint32(value: int) -> bytes:
@@ -547,7 +555,13 @@ def _match_output(
             return output, FoundOutput(pubkey_xonly=output, tweak=t_k)
         if not labels:
             continue
-        output_point = _lift_x(output)
+        # A non-curve x-only output can never be a (labeled) silent payment
+        # output; skip it instead of letting an attacker-mined output crash the
+        # whole scan (and thus block detection of later blocks).
+        try:
+            output_point = _lift_x(output)
+        except SilentPaymentError:
+            continue
         # label_point = output - P_k, then retry with the negated output (Y parity).
         for candidate_point in (output_point, _negate_point(output_point)):
             label_point = candidate_point.combine([_negate_point(p_k)])

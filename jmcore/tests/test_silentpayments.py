@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -145,3 +146,61 @@ def test_invalid_address_checksum() -> None:
     broken = encoded[:-1] + ("q" if encoded[-1] != "q" else "p")
     with pytest.raises(SilentPaymentError):
         SilentPaymentAddress.decode(broken)
+
+
+def _non_curve_xonly() -> bytes:
+    """An x-only key whose x coordinate is not on the secp256k1 curve."""
+    from jmcore.silentpayments import _lift_x
+
+    for i in range(2, 1000):
+        candidate = i.to_bytes(32, "big")
+        try:
+            _lift_x(candidate)
+        except Exception:  # noqa: BLE001 - any lift failure means off-curve
+            return candidate
+    raise AssertionError("no off-curve x found")
+
+
+def test_scan_skips_non_curve_taproot_output() -> None:
+    """A non-curve taproot output must not crash labeled scanning (DoS regression).
+
+    An attacker can mine a P2TR output whose x coordinate is not a curve point.
+    When the receiver scans with labels, lifting that x-only key used to raise a
+    bare ValueError and abort the whole scan, hiding every later payment.
+    """
+    scan_priv = 0xA1B2C3D4E5F60718293A4B5C6D7E8F90A1B2C3D4E5F60718293A4B5C6D7E8F90
+    spend_priv = 0x0F1E2D3C4B5A69788796A5B4C3D2E1F00F1E2D3C4B5A69788796A5B4C3D2E1F0
+    spend_pub = PublicKey.from_secret(spend_priv.to_bytes(32, "big")).format()
+    scan_pub = PublicKey.from_secret(scan_priv.to_bytes(32, "big")).format()
+
+    m = 7
+    labeled = SilentPaymentAddress.decode(
+        create_labeled_address(scan_priv, spend_pub, m, "mainnet")
+    )[0]
+
+    sender_priv = 0xC0FFEE00C0FFEE00C0FFEE00C0FFEE00C0FFEE00C0FFEE00C0FFEE00C0FFEE01
+    sender_pub = PublicKey.from_secret(sender_priv.to_bytes(32, "big")).format()
+    pubkey_hash = hashlib.new("ripemd160", hashlib.sha256(sender_pub).digest()).digest()
+    vin = SilentPaymentInput(
+        txid="33" * 32,
+        vout=0,
+        scriptpubkey=bytes([0x00, 0x14]) + pubkey_hash,
+        witness=[b"\x00" * 71, sender_pub],
+        private_key=sender_priv,
+    )
+    outputs = create_outputs([(sender_priv, False)], [vin.outpoint()], [labeled])
+    assert len(outputs) == 1
+
+    labels = {
+        PublicKey.from_secret(create_label_tweak(scan_priv, m).to_bytes(32, "big")).format(): (
+            create_label_tweak(scan_priv, m)
+        )
+    }
+
+    # Inject the attacker output before the legitimate one. Without the fix the
+    # call raises ValueError; with it the labeled payment is still detected.
+    poisoned = [_non_curve_xonly(), outputs[0]]
+    found = scan_transaction(scan_priv, spend_pub, [vin], poisoned, labels)
+    assert len(found) == 1
+    assert found[0].pubkey_xonly == outputs[0]
+    assert scan_pub  # silence unused (address derivation parity sanity)
