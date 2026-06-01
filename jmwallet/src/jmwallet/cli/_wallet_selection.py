@@ -62,6 +62,7 @@ def resolve_wallet_fingerprint(
     list_known_fingerprints: Callable[[], list[str]],
     command_label: str,
     allow_all_wallets: bool = False,
+    fall_back_to_configured_mnemonic: bool = False,
 ) -> str | None:
     """Resolve the active wallet fingerprint for an offline read command.
 
@@ -81,6 +82,14 @@ def resolve_wallet_fingerprint(
             e.g. ``"jm-wallet history"``.
         allow_all_wallets: When ``True``, the error message for the
             ambiguous case mentions ``--all-wallets`` as an alternative.
+        fall_back_to_configured_mnemonic: When ``True`` and neither
+            ``--wallet-fingerprint`` nor ``--mnemonic-file`` was given,
+            derive the fingerprint from the mnemonic configured in
+            ``config.toml`` / env / the default wallet path (the same
+            resolution ``jm-wallet info`` uses). This makes per-wallet
+            read commands work out of the box for the configured wallet.
+            It is opt-in because commands that aggregate across wallets
+            (e.g. ``history``) must not silently filter to one wallet.
 
     Returns:
         The resolved 8-char fingerprint, or raises ``typer.Exit(1)``
@@ -116,6 +125,25 @@ def resolve_wallet_fingerprint(
         from jmwallet.backends.descriptor_wallet import get_mnemonic_fingerprint
 
         return get_mnemonic_fingerprint(resolved.mnemonic, resolved.bip39_passphrase or "")
+
+    # 2.5) Opt-in: derive from the configured mnemonic (config.toml / env /
+    # default wallet path), mirroring `jm-wallet info`. Only enabled for
+    # per-wallet read commands where selecting the configured wallet is the
+    # expected behavior (not for cross-wallet aggregates like history).
+    if fall_back_to_configured_mnemonic:
+        try:
+            configured = resolve_mnemonic(
+                settings,
+                prompt_bip39_passphrase=prompt_bip39_passphrase,
+                required=False,
+            )
+        except (FileNotFoundError, ValueError) as e:
+            logger.debug(f"Configured mnemonic not usable for fingerprint resolution: {e}")
+            configured = None
+        if configured is not None:
+            from jmwallet.backends.descriptor_wallet import get_mnemonic_fingerprint
+
+            return get_mnemonic_fingerprint(configured.mnemonic, configured.bip39_passphrase or "")
 
     # 3) Auto-detect when exactly one wallet has ever written here.
     known = list_known_fingerprints()

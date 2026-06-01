@@ -313,6 +313,49 @@ def test_list_bonds_offline_auto_detects_single_wallet() -> None:
         assert any(b["address"] == address for b in bonds)
 
 
+def test_list_bonds_offline_uses_configured_mnemonic_when_no_registry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``list-bonds`` must work for the configured wallet without flags,
+    mirroring ``jm-wallet info`` (which resolves the mnemonic from config /
+    env). Previously it errored when no per-wallet registry file existed yet,
+    even though the wallet identity was determinable from config."""
+    monkeypatch.setenv("MNEMONIC", _MNEMONIC)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        data_dir = Path(tmpdir)  # no registry files at all
+
+        result = runner.invoke(
+            app,
+            ["list-bonds", "--data-dir", str(data_dir)],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "No fidelity bonds found in registry" in result.output
+
+
+def test_list_bonds_offline_uses_configured_mnemonic_to_show_bond(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With a configured mnemonic, ``list-bonds`` (offline) selects that
+    wallet's registry without needing --mnemonic-file/--wallet-fingerprint."""
+    monkeypatch.setenv("MNEMONIC", _MNEMONIC)
+    fingerprint = _fingerprint_for("")
+    address = "bcrt1qconfiguredwalletbond000000000000000000xyz"
+    with tempfile.TemporaryDirectory() as tmpdir:
+        data_dir = Path(tmpdir)
+        _seed_bond_registry(data_dir, fingerprint, address)
+
+        result = runner.invoke(
+            app,
+            ["list-bonds", "--data-dir", str(data_dir), "--json"],
+        )
+
+        assert result.exit_code == 0, result.output
+        json_start = result.stdout.find("[")
+        bonds = json.loads(result.stdout[json_start:])
+        assert any(b["address"] == address for b in bonds)
+
+
 def test_list_bonds_offline_multi_wallet_requires_disambiguation() -> None:
     """Multiple per-wallet registries → error with the fingerprint list."""
     fp_a = _fingerprint_for("")

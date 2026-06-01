@@ -80,6 +80,7 @@ def registry_show(
         prompt_bip39_passphrase=prompt_bip39_passphrase,
         list_known_fingerprints=lambda: list_registry_fingerprints(resolved_data_dir),
         command_label="jm-wallet registry-show",
+        fall_back_to_configured_mnemonic=True,
     )
     if fingerprint is None:
         logger.error(

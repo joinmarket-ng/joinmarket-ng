@@ -105,6 +105,7 @@ def list_bonds(
             prompt_bip39_passphrase=prompt_bip39_passphrase,
             list_known_fingerprints=lambda: list_registry_fingerprints(resolved_data_dir),
             command_label="jm-wallet list-bonds",
+            fall_back_to_configured_mnemonic=True,
         )
         if fingerprint is None:
             logger.error(
