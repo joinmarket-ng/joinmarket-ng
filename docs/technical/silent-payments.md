@@ -67,8 +67,14 @@ a time. Silent payment outputs inherit this protection: before using them, mix
 them, ideally with a sweep tumble that randomizes timing so the donation is not
 trivially correlated with the maker's activity.
 
-A passive taker can also receive silent payments and manually CoinJoin them,
-subject to the same mixdepth-0 co-spending warning.
+A passive taker can also receive silent payments and CoinJoin them. The wallet
+surfaces a detected silent payment output as an ordinary taproot UTXO
+(`register_silent_payment_utxos`) so coin selection can pick it, and recomputes
+its key-path signing key on demand from the stored tweaks
+(`resolve_p2tr_signing_key`). The CoinJoin itself should use a taproot output
+family (`preferred_offer_type = "tr0reloffer"`); see
+[Taproot CoinJoin](taproot-coinjoin.md). The mixdepth-0 co-spending warning
+above still applies.
 
 ## Status and limitations
 
@@ -83,6 +89,8 @@ subject to the same mixdepth-0 co-spending warning.
 - BIP340 taproot key-path signing is implemented (`sign_p2tr_input`), so
   detected outputs can be spent: the recovered output key is the final taproot
   output key and is signed directly.
+- Received outputs can be spent as taproot CoinJoin inputs (see
+  [Taproot CoinJoin](taproot-coinjoin.md)).
 - Remaining follow-ups: persisting scan progress / importing detected outputs
-  as first-class wallet UTXOs, and an automatic background coinjoin sweep with
-  randomized timing for received deposits.
+  as first-class wallet UTXOs across restarts, and an automatic background
+  coinjoin sweep with randomized timing for received deposits.

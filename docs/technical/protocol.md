@@ -66,6 +66,10 @@ Fields are separated by **single whitespace** (multiple spaces not allowed).
 3. Makers respond via PRIVMSG with `!reloffer` or `!absoffer`
 4. Taker collects offers, filters stale/incompatible, selects makers
 
+Offer commands are prefixed by output script family: `sw0reloffer` /
+`sw0absoffer` for native segwit (P2WPKH) and `tr0reloffer` / `tr0absoffer` for
+taproot (P2TR). See [Taproot CoinJoin](taproot-coinjoin.md).
+
 **Phase 2: Fill Request**
 
 1. Taker sends `!fill` with: order ID, amount, NaCl pubkey, PoDLE commitment

@@ -270,6 +270,7 @@ nav:
       - Wallet: technical/wallet.md
       - Wallet Scanning: technical/wallet-scanning.md
       - Silent Payments: technical/silent-payments.md
+      - Taproot CoinJoin: technical/taproot-coinjoin.md
       - Configuration: technical/configuration.md
       - Security: technical/security.md
       - Maker Verification Checklist: technical/maker-verification-checklist.md
