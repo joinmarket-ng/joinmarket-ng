@@ -35,6 +35,15 @@ from loguru import logger
 read_varint = decode_varint
 get_bech32_hrp = get_hrp
 
+# BIP65: nLockTime values below this threshold are block heights, at or above
+# are Unix timestamps.
+LOCKTIME_THRESHOLD = 500_000_000
+
+# Tolerance (seconds) for a time-based nLockTime that sits slightly in the future
+# due to clock skew between the taker and maker. A legitimate fidelity-bond spend
+# always uses an nLockTime in the past (the bond must already be unlocked).
+LOCKTIME_FUTURE_TOLERANCE_SEC = 2 * 60 * 60
+
 
 class TransactionVerificationError(Exception):
     """Raised when transaction verification fails"""
@@ -80,6 +89,10 @@ def verify_unsigned_transaction(
 
         tx_inputs = tx["inputs"]
         tx_outputs = tx["outputs"]
+
+        locktime_ok, locktime_error = _verify_locktime(tx.get("locktime", 0))
+        if not locktime_ok:
+            return False, locktime_error
 
         our_utxo_set = set(our_utxos.keys())
         tx_utxo_set = {(inp["txid"], inp["vout"]) for inp in tx_inputs}
@@ -150,6 +163,44 @@ def verify_unsigned_transaction(
         return False, f"Verification error: {e}"
 
 
+def _verify_locktime(locktime: int, now: int | None = None) -> tuple[bool, str]:
+    """Defense-in-depth check on the transaction-wide nLockTime.
+
+    A CoinJoin only ever needs a non-zero nLockTime to spend an already-unlocked
+    fidelity bond (a time-based CLTV that lies in the past). Rejecting anything
+    else stops a malicious taker from stranding our signed UTXOs behind a
+    far-future or height-based timelock.
+
+    Args:
+        locktime: Transaction nLockTime field.
+        now: Current Unix time (defaults to wall clock); injectable for tests.
+
+    Returns:
+        (is_valid, error_message)
+    """
+    if locktime == 0:
+        return True, ""
+
+    if locktime < LOCKTIME_THRESHOLD:
+        return (
+            False,
+            f"Unexpected block-height nLockTime {locktime}; CoinJoins only use "
+            "time-based locktimes for fidelity-bond spends",
+        )
+
+    import time
+
+    current = int(time.time()) if now is None else now
+    if locktime > current + LOCKTIME_FUTURE_TOLERANCE_SEC:
+        return (
+            False,
+            f"nLockTime {locktime} is in the future (now={current}); refusing to "
+            "lock our inputs behind a future timelock",
+        )
+
+    return True, ""
+
+
 def parse_transaction(
     tx_hex: str, network: NetworkType = NetworkType.MAINNET
 ) -> dict[str, Any] | None:
@@ -189,7 +240,7 @@ def parse_transaction(
         ]
 
         inputs = [{"txid": inp.txid, "vout": inp.vout} for inp in parsed.inputs]
-        return {"inputs": inputs, "outputs": outputs}
+        return {"inputs": inputs, "outputs": outputs, "locktime": parsed.locktime}
 
     except Exception as e:
         logger.error(f"Failed to parse transaction: {e}")
