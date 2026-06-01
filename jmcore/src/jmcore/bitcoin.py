@@ -1308,6 +1308,11 @@ def estimate_vsize(input_types: list[str], output_types: list[str]) -> int:
     input_weights = {
         "p2wpkh": 41 * 4 + 108,
         "p2wsh": 41 * 4 + 118,  # Using 72 byte sig + 43 byte script (fidelity bond)
+        # P2TR key-path (BIP341):
+        #   Non-witness: 41 bytes -> 164 wu
+        #   Witness: 1(stack_len) + 1(sig_len) + 64(schnorr sig) = 66 wu
+        #   Total: 230 wu (57.5 vbytes)
+        "p2tr": 41 * 4 + 66,
     }
 
     # Output sizes (weight units)

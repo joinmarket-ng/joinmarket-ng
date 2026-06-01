@@ -210,11 +210,38 @@ class OfferType(StrEnum):
     SW0_RELATIVE = "sw0reloffer"
     SWA_ABSOLUTE = "swabsoffer"
     SWA_RELATIVE = "swreloffer"
+    # Taproot (P2TR, BIP341 key-path) offers, see JMP-0005.
+    TR0_ABSOLUTE = "tr0absoffer"
+    TR0_RELATIVE = "tr0reloffer"
+
+
+# Offer types that quote fees as absolute satoshi amounts (rest are relative).
+ABSOLUTE_OFFER_TYPES = (
+    OfferType.SW0_ABSOLUTE,
+    OfferType.SWA_ABSOLUTE,
+    OfferType.TR0_ABSOLUTE,
+)
+
+# Offer types whose CoinJoin/change outputs are Taproot (P2TR), see JMP-0005.
+TAPROOT_OFFER_TYPES = (
+    OfferType.TR0_ABSOLUTE,
+    OfferType.TR0_RELATIVE,
+)
 
 
 def is_absolute_offer_type(offer_type: OfferType) -> bool:
     """Check if an offer type uses absolute fees."""
-    return offer_type in (OfferType.SW0_ABSOLUTE, OfferType.SWA_ABSOLUTE)
+    return offer_type in ABSOLUTE_OFFER_TYPES
+
+
+def is_taproot_offer_type(offer_type: OfferType) -> bool:
+    """Check if an offer type uses Taproot (P2TR) outputs (JMP-0005)."""
+    return offer_type in TAPROOT_OFFER_TYPES
+
+
+def offer_output_script_type(offer_type: OfferType) -> str:
+    """Return the wallet script type ("p2tr" or "p2wpkh") for an offer's outputs."""
+    return "p2tr" if is_taproot_offer_type(offer_type) else "p2wpkh"
 
 
 def calculate_cj_fee(offer_type: OfferType, cjfee: str | int, amount: int) -> int:
@@ -271,7 +298,7 @@ class Offer(BaseModel):
         from decimal import Decimal, InvalidOperation
 
         ordertype = info.data.get("ordertype")
-        if ordertype in (OfferType.SW0_ABSOLUTE, OfferType.SWA_ABSOLUTE):
+        if ordertype in ABSOLUTE_OFFER_TYPES:
             # Absolute fees are integer satoshis; reject negatives and absurdly
             # large values that could overflow downstream amount arithmetic.
             iv = int(v)

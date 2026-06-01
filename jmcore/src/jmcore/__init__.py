@@ -80,6 +80,8 @@ from jmcore.models import (
     PeerInfo,
     calculate_cj_fee,
     get_default_directory_nodes,
+    is_taproot_offer_type,
+    offer_output_script_type,
 )
 from jmcore.nick_tracker import NickTracker
 from jmcore.notifications import (
@@ -255,6 +257,8 @@ __all__ = [
     "MessageEnvelope",
     "PeerInfo",
     "calculate_cj_fee",
+    "is_taproot_offer_type",
+    "offer_output_script_type",
     # Nick tracking
     "NickTracker",
     # Notifications
