@@ -646,5 +646,60 @@ async def test_select_our_utxos_declines_on_lock_conflict():
     assert mixdepth == -1
 
 
+@pytest.mark.asyncio
+async def test_requested_cj_script_type_from_fill():
+    """Taker-signalled cjtype is honored; defaults to wallet type otherwise."""
+    from unittest.mock import MagicMock
+
+    from jmcore.models import Offer, OfferType
+
+    from maker.coinjoin import CoinJoinSession
+
+    mock_wallet = MagicMock()
+    mock_wallet.address_type = "p2wpkh"
+    mock_backend = MagicMock()
+    mock_backend.requires_neutrino_metadata.return_value = False
+    offer = Offer(
+        counterparty="J5TypeMaker",
+        ordertype=OfferType.SW0_RELATIVE,
+        oid=0,
+        minsize=10_000,
+        maxsize=100_000_000,
+        txfee=1000,
+        cjfee="0.0003",
+    )
+
+    # Default (legacy taker, no cjtype): falls back to wallet's primary type.
+    session = CoinJoinSession(
+        taker_nick="J5T", offer=offer, wallet=mock_wallet, backend=mock_backend
+    )
+    assert session.requested_cj_script_type == "p2wpkh"
+
+    taker_pk = CryptoSession().get_pubkey_hex()
+    ok, _ = await session.handle_fill(amount=1_000_000, commitment="aa" * 32, taker_pk=taker_pk)
+    assert ok
+    assert session.requested_cj_script_type == "p2wpkh"
+
+    # Taker requests p2tr equal outputs.
+    session2 = CoinJoinSession(
+        taker_nick="J5T", offer=offer, wallet=mock_wallet, backend=mock_backend
+    )
+    ok, _ = await session2.handle_fill(
+        amount=1_000_000, commitment="aa" * 32, taker_pk=taker_pk, cj_script_type="p2tr"
+    )
+    assert ok
+    assert session2.requested_cj_script_type == "p2tr"
+
+    # An unsupported type is rejected.
+    session3 = CoinJoinSession(
+        taker_nick="J5T", offer=offer, wallet=mock_wallet, backend=mock_backend
+    )
+    ok, resp = await session3.handle_fill(
+        amount=1_000_000, commitment="aa" * 32, taker_pk=taker_pk, cj_script_type="p2pkh"
+    )
+    assert not ok
+    assert "error" in resp
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

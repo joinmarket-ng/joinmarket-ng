@@ -85,6 +85,10 @@ class CoinJoinSession:
         self.cj_address = ""
         self.change_address = ""
         self.mixdepth = 0
+        # Uniform equal-output script type requested by the taker (JMP-0005).
+        # Defaults to the maker wallet's primary type for legacy takers that
+        # do not signal a type in !fill.
+        self.requested_cj_script_type = wallet.address_type
         self.commitment = b""
         self.taker_nacl_pk = ""  # Taker's NaCl pubkey (hex) for btc_sig
         self.created_at = time.time()
@@ -173,7 +177,11 @@ class CoinJoinSession:
         return True
 
     async def handle_fill(
-        self, amount: int, commitment: str, taker_pk: str
+        self,
+        amount: int,
+        commitment: str,
+        taker_pk: str,
+        cj_script_type: str | None = None,
     ) -> tuple[bool, dict[str, Any]]:
         """
         Handle !fill message from taker.
@@ -182,6 +190,9 @@ class CoinJoinSession:
             amount: CoinJoin amount requested
             commitment: PoDLE commitment (will be verified later in !auth)
             taker_pk: Taker's NaCl public key for E2E encryption
+            cj_script_type: Uniform equal-output script type the taker requested
+                ("p2tr" or "p2wpkh"), per JMP-0005. ``None`` for legacy takers,
+                in which case the maker's primary wallet type is used.
 
         Returns:
             (success, response_data)
@@ -199,6 +210,11 @@ class CoinJoinSession:
 
             if amount > self.offer.maxsize:
                 return False, {"error": f"Amount too large: {amount} > {self.offer.maxsize}"}
+
+            if cj_script_type is not None:
+                if cj_script_type not in ("p2tr", "p2wpkh"):
+                    return False, {"error": f"Unsupported cj script type: {cj_script_type}"}
+                self.requested_cj_script_type = cj_script_type
 
             self.amount = amount
             self.commitment = bytes.fromhex(commitment)
@@ -648,7 +664,12 @@ class CoinJoinSession:
 
             cj_output_mixdepth = (max_mixdepth + 1) % self.wallet.mixdepth_count
             cj_index = self.wallet.get_next_address_index(cj_output_mixdepth, 1)
-            cj_address = self.wallet.get_change_address(cj_output_mixdepth, cj_index)
+            # The equal-amount CoinJoin output must use the uniform script type
+            # the taker requested (JMP-0005). Change is unrestricted and uses
+            # the wallet's primary type.
+            cj_address = self.wallet.get_change_address(
+                cj_output_mixdepth, cj_index, script_type=self.requested_cj_script_type
+            )
 
             change_index = self.wallet.get_next_address_index(max_mixdepth, 1)
             change_address = self.wallet.get_change_address(max_mixdepth, change_index)
@@ -770,10 +791,7 @@ class CoinJoinSession:
                 # P2TR it is the 32-byte x-only output key and ``signature`` the
                 # 64-byte Schnorr signature.
                 sigmsg = (
-                    bytes([len(signature)])
-                    + signature
-                    + bytes([len(pubkey_bytes)])
-                    + pubkey_bytes
+                    bytes([len(signature)]) + signature + bytes([len(pubkey_bytes)]) + pubkey_bytes
                 )
                 logger.debug(f"Signed input {input_index} for UTXO {txid}:{vout}")
 

@@ -136,9 +136,13 @@ class MakerSession:
     # -- Protocol phase pass-throughs --------------------------------------
 
     async def handle_fill(
-        self, amount: int, commitment: str, taker_pk: str
+        self,
+        amount: int,
+        commitment: str,
+        taker_pk: str,
+        cj_script_type: str | None = None,
     ) -> tuple[bool, dict[str, Any]]:
-        return await self.inner.handle_fill(amount, commitment, taker_pk)
+        return await self.inner.handle_fill(amount, commitment, taker_pk, cj_script_type)
 
     async def handle_auth(
         self,

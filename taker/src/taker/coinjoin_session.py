@@ -21,7 +21,13 @@ import asyncio
 import time
 from typing import TYPE_CHECKING, Any
 
-from jmcore.bitcoin import address_to_scriptpubkey, estimate_vsize, get_txid, parse_transaction
+from jmcore.bitcoin import (
+    address_to_scriptpubkey,
+    estimate_vsize,
+    get_address_type,
+    get_txid,
+    parse_transaction,
+)
 from jmcore.encryption import CryptoSession
 from jmcore.models import offer_output_script_type
 from jmcore.protocol import FEATURE_NEUTRINO_COMPAT, parse_utxo_list
@@ -349,9 +355,15 @@ class CoinJoinSession:
                 )
 
         # Send !fill to all makers using their designated channels
-        # Format: fill <oid> <amount> <taker_pubkey> <commitment>
+        # Format: fill <oid> <amount> <taker_pubkey> <commitment> [cjtype=<type>]
+        # The optional cjtype token signals the uniform equal-output script type
+        # the taker requested (JMP-0005); legacy makers ignore it.
+        cj_script_type = offer_output_script_type(self.config.preferred_offer_type)
         for nick, session in self.maker_sessions.items():
-            fill_data = f"{session.offer.oid} {self.cj_amount} {taker_pubkey} {commitment_hex}"
+            fill_data = (
+                f"{session.offer.oid} {self.cj_amount} {taker_pubkey} "
+                f"{commitment_hex} cjtype={cj_script_type}"
+            )
             channel = await self.directory_client.send_privmsg(
                 nick, "fill", fill_data, log_routing=True, force_channel=session.comm_channel
             )
@@ -766,6 +778,24 @@ class CoinJoinSession:
                         logger.warning(
                             f"Dropping maker {nick}: one or more UTXOs failed "
                             "Neutrino verification (likely already spent)"
+                        )
+                        failed_makers.append(nick)
+                        del self.maker_sessions[nick]
+                        continue
+
+                    # Enforce the uniform equal-output script type (JMP-0005):
+                    # every maker's CoinJoin output must match the type the
+                    # taker requested, otherwise the equal outputs are not
+                    # indistinguishable. Change type is unrestricted.
+                    expected_cj_type = offer_output_script_type(self.config.preferred_offer_type)
+                    try:
+                        maker_cj_type = get_address_type(cj_addr)
+                    except ValueError:
+                        maker_cj_type = ""
+                    if maker_cj_type != expected_cj_type:
+                        logger.warning(
+                            f"Dropping maker {nick}: cj_addr type {maker_cj_type!r} "
+                            f"does not match requested {expected_cj_type!r}"
                         )
                         failed_makers.append(nick)
                         del self.maker_sessions[nick]
