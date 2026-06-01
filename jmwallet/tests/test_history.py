@@ -2881,3 +2881,65 @@ class TestSendHistoryEntry:
         # used-set so a fresh wallet does not re-issue them.
         used = get_used_addresses(temp_data_dir)
         assert pending.destination_address in used
+
+    def test_send_addresses_not_classified_as_coinjoin(self, temp_data_dir: Path) -> None:
+        """Regression for issue #517.
+
+        A plain wallet send (internal mixdepth-to-mixdepth transfer) must not
+        mark its destination as a CoinJoin output or its change as CoinJoin
+        change. Otherwise ``jm-wallet info --extended`` mislabels them as
+        ``cj-out`` / ``cj-change`` and creates false privacy expectations.
+        """
+        dest = "bc1qdest1234567890abcdef1234567890abcdef1234"
+        change = "bc1qchg1234567890abcdef1234567890abcdef1234"
+        send = create_send_history_entry(
+            destination=dest,
+            change_address=change,
+            amount=20_000,
+            mining_fee=200,
+            source_mixdepth=0,
+            selected_utxos=[("aa" * 32, 0)],
+            txid="bb" * 32,
+            success=True,
+        )
+        append_history_entry(send, temp_data_dir)
+
+        types = get_address_history_types(temp_data_dir)
+        assert dest not in types
+        assert change not in types
+
+        # Addresses are still treated as used so they are not re-issued.
+        used = get_used_addresses(temp_data_dir)
+        assert dest in used
+        assert change in used
+
+    def test_real_coinjoin_still_classified_with_send_present(self, temp_data_dir: Path) -> None:
+        """Excluding ``send`` rows must not suppress genuine CoinJoin classification.
+
+        If the same address is later used as a real CoinJoin output, it must
+        still be reported as ``cj_out``.
+        """
+        shared = "bc1qshared1234567890abcdef1234567890abcdef12"
+        send = create_send_history_entry(
+            destination=shared,
+            change_address="",
+            amount=20_000,
+            mining_fee=200,
+            source_mixdepth=0,
+            selected_utxos=[("aa" * 32, 0)],
+            txid="bb" * 32,
+            success=True,
+        )
+        taker = TransactionHistoryEntry(
+            timestamp="2024-01-01T00:00:00",
+            role="taker",
+            success=True,
+            txid="cd" * 32,
+            cj_amount=1_000_000,
+            destination_address=shared,
+        )
+        append_history_entry(send, temp_data_dir)
+        append_history_entry(taker, temp_data_dir)
+
+        types = get_address_history_types(temp_data_dir)
+        assert types.get(shared) == "cj_out"

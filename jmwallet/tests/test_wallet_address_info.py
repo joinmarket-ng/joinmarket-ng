@@ -155,6 +155,57 @@ class TestAddressStatusDetermination:
         )
         assert status == "cj-change"
 
+    def test_internal_transfer_not_labeled_as_coinjoin(self, wallet):
+        """Regression for issue #517.
+
+        An internal wallet transfer (plain ``jm-wallet send`` between
+        mixdepths, recorded as ``role="send"``) must not be surfaced as a
+        CoinJoin. Its destination should be ``deposit`` and its change should
+        be ``non-cj-change``, end-to-end through ``get_address_history_types``.
+        """
+        from jmwallet.history import (
+            append_history_entry,
+            create_send_history_entry,
+        )
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            dest = "bc1qdestmd1xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            change = "bc1qchangemd0xxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            append_history_entry(
+                create_send_history_entry(
+                    destination=dest,
+                    change_address=change,
+                    amount=20_000,
+                    mining_fee=200,
+                    source_mixdepth=0,
+                    selected_utxos=[("aa" * 32, 0)],
+                    txid="bb" * 32,
+                    success=True,
+                ),
+                data_dir,
+            )
+
+            history_addresses = get_address_history_types(data_dir)
+
+            dest_status = wallet._determine_address_status(
+                address=dest,
+                balance=20_000,
+                is_external=True,
+                used_addresses={dest},
+                history_addresses=history_addresses,
+            )
+            change_status = wallet._determine_address_status(
+                address=change,
+                balance=5_000,
+                is_external=False,
+                used_addresses={change},
+                history_addresses=history_addresses,
+            )
+
+            assert dest_status == "deposit"
+            assert change_status == "non-cj-change"
+
     def test_wallet_service_does_not_retain_mnemonic_or_passphrase(
         self, mock_backend, test_mnemonic, test_network
     ):

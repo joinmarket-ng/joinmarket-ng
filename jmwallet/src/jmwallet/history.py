@@ -1519,6 +1519,10 @@ def get_address_history_types(
     - "change": Change address - from successful CJ
     - "flagged": Address was shared but ALL transactions using it failed
 
+    Plain wallet spends (``role="send"``) are intentionally excluded: their
+    destination and change addresses are ordinary deposits/change, not CoinJoin
+    outputs, so classifying them here would mislabel them (issue #517).
+
     Priority: successful transactions take precedence over failed ones.
     Once an address is used in a successful CoinJoin, it remains cj_out/change
     even if later transactions using the same address failed.
@@ -1535,6 +1539,15 @@ def get_address_history_types(
     address_types: dict[str, str] = {}
 
     for entry in entries:
+        # Only CoinJoin participation (maker/taker) produces CoinJoin output and
+        # change addresses. Plain wallet spends (role="send", e.g. internal
+        # mixdepth-to-mixdepth transfers used to reset PoDLE retry counters) are
+        # recorded only to keep their addresses marked as used; classifying their
+        # destination as "cj_out" or change as "change" would mislabel them as
+        # CoinJoin outputs and create false privacy expectations (issue #517).
+        if entry.role == "send":
+            continue
+
         if entry.destination_address:
             # CoinJoin output address
             if entry.success:
