@@ -1111,6 +1111,43 @@ class TestSyncFidelityBondDeduplication:
         ]
         assert outpoints.count(("d" * 64, 0)) == 1
 
+    @pytest.mark.asyncio
+    async def test_sync_discovers_taproot_bond(self, wallet_with_timelocked: WalletService):
+        """sync_fidelity_bonds also scans and records Taproot (P2TR) bonds."""
+        locktime = 1893456000
+        tr_address = wallet_with_timelocked.get_taproot_fidelity_bond_address(locktime)
+        from jmcore.btc_script import derive_taproot_bond_address
+
+        bond_key = wallet_with_timelocked.get_taproot_fidelity_bond_key(locktime)
+        xonly = bond_key.get_public_key_bytes(compressed=True)[1:]
+        bond = derive_taproot_bond_address(xonly, locktime, wallet_with_timelocked.network)
+
+        wallet_with_timelocked.backend.get_utxos = AsyncMock(
+            return_value=[
+                UTXOInfo(
+                    txid="f" * 64,
+                    vout=1,
+                    value=750_000,
+                    address=tr_address,
+                    confirmations=50,
+                    scriptpubkey=bond.scriptpubkey.hex(),
+                    path="",
+                    mixdepth=0,
+                    locktime=locktime,
+                )
+            ]
+        )
+
+        found = await wallet_with_timelocked.sync_fidelity_bonds([locktime])
+
+        assert len(found) == 1
+        tr_bond = found[0]
+        assert tr_bond.address == tr_address
+        assert tr_bond.is_p2tr
+        assert tr_bond.is_fidelity_bond
+        assert tr_bond.locktime == locktime
+        assert tr_bond.path.startswith("m/86'")
+
 
 class TestFreezeUnfreezeGuard:
     """Tests for fidelity-bond guard in bulk unfreeze path."""

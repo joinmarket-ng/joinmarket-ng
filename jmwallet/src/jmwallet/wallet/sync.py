@@ -95,6 +95,9 @@ class WalletSyncMixin:
     def get_fidelity_bond_address(self, index: int, locktime: int) -> str:
         raise NotImplementedError
 
+    def get_taproot_fidelity_bond_address(self, locktime: int) -> str:
+        raise NotImplementedError
+
     def _apply_frozen_state(self) -> None:
         raise NotImplementedError
 
@@ -245,15 +248,23 @@ class WalletSyncMixin:
             logger.debug("No locktimes provided for fidelity bond sync")
             return utxos
 
-        # Each locktime has exactly one address (timenumber = BIP32 child index)
+        # Each locktime has exactly one address per bond type (timenumber =
+        # BIP32 child index). We scan both the legacy P2WSH bond and the
+        # Taproot bond (JMP-0005) so either type is discovered.
         addresses: list[str] = []
-        address_to_info: dict[str, tuple[int, int]] = {}  # addr -> (locktime, timenumber)
+        # addr -> (locktime, timenumber, root_path)
+        address_to_info: dict[str, tuple[int, int, str]] = {}
+        taproot_root = self._root_path_for_type["p2tr"]
 
         for locktime in locktimes:
             timenumber = timestamp_to_timenumber(locktime)
-            address = self.get_fidelity_bond_address(timenumber, locktime)
-            addresses.append(address)
-            address_to_info[address] = (locktime, timenumber)
+            p2wsh_address = self.get_fidelity_bond_address(timenumber, locktime)
+            addresses.append(p2wsh_address)
+            address_to_info[p2wsh_address] = (locktime, timenumber, self.root_path)
+
+            p2tr_address = self.get_taproot_fidelity_bond_address(locktime)
+            addresses.append(p2tr_address)
+            address_to_info[p2tr_address] = (locktime, timenumber, taproot_root)
 
         # Fetch UTXOs for all addresses at once
         backend_utxos = await self.backend.get_utxos(addresses)
@@ -268,10 +279,10 @@ class WalletSyncMixin:
         for address in addresses:
             addr_utxos = utxos_by_address[address]
             if addr_utxos:
-                locktime, timenumber = address_to_info[address]
+                locktime, timenumber, root_path = address_to_info[address]
                 self._record_history_address(address)
                 for utxo in addr_utxos:
-                    path = f"{self.root_path}/0'/{FIDELITY_BOND_BRANCH}/{timenumber}:{locktime}"
+                    path = f"{root_path}/0'/{FIDELITY_BOND_BRANCH}/{timenumber}:{locktime}"
                     utxo_info = _make_utxo_info(
                         txid=utxo.txid,
                         vout=utxo.vout,
@@ -340,12 +351,17 @@ class WalletSyncMixin:
         )
 
         # Build the full address map across all timenumbers.
-        # Each timenumber has exactly one address (timenumber = BIP32 child index).
-        all_address_to_locktime: dict[str, tuple[int, int]] = {}
+        # Each timenumber has exactly one address per bond type (timenumber =
+        # BIP32 child index). Scan both legacy P2WSH and Taproot (JMP-0005) bonds.
+        # addr -> (locktime, timenumber, root_path)
+        all_address_to_locktime: dict[str, tuple[int, int, str]] = {}
+        taproot_root = self._root_path_for_type["p2tr"]
         for timenumber in range(TIMENUMBER_COUNT):
             locktime = timenumber_to_timestamp(timenumber)
-            address = self.get_fidelity_bond_address(timenumber, locktime)
-            all_address_to_locktime[address] = (locktime, timenumber)
+            p2wsh_address = self.get_fidelity_bond_address(timenumber, locktime)
+            all_address_to_locktime[p2wsh_address] = (locktime, timenumber, self.root_path)
+            p2tr_address = self.get_taproot_fidelity_bond_address(locktime)
+            all_address_to_locktime[p2tr_address] = (locktime, timenumber, taproot_root)
 
         # For descriptor wallets, import all addresses in batches WITHOUT triggering
         # a per-batch rescan.  A single blockchain rescan is run after all descriptors
@@ -369,7 +385,7 @@ class WalletSyncMixin:
                 await self.setup_descriptor_wallet(rescan=False)
 
             all_bond_addrs = [
-                (addr, lt, idx) for addr, (lt, idx) in all_address_to_locktime.items()
+                (addr, lt, idx) for addr, (lt, idx, _root) in all_address_to_locktime.items()
             ]
             total_addrs = len(all_bond_addrs)
             for batch_start in range(0, total_addrs, batch_size):
@@ -428,8 +444,8 @@ class WalletSyncMixin:
         # Process found UTXOs
         for utxo in backend_utxos:
             if utxo.address in address_to_locktime:
-                locktime, idx = address_to_locktime[utxo.address]
-                path = f"{self.root_path}/0'/{FIDELITY_BOND_BRANCH}/{idx}:{locktime}"
+                locktime, idx, root_path = address_to_locktime[utxo.address]
+                path = f"{root_path}/0'/{FIDELITY_BOND_BRANCH}/{idx}:{locktime}"
 
                 utxo_info = _make_utxo_info(
                     txid=utxo.txid,
