@@ -21,8 +21,9 @@ import asyncio
 import time
 from typing import TYPE_CHECKING, Any
 
-from jmcore.bitcoin import address_to_scriptpubkey, get_txid, parse_transaction
+from jmcore.bitcoin import address_to_scriptpubkey, estimate_vsize, get_txid, parse_transaction
 from jmcore.encryption import CryptoSession
+from jmcore.models import offer_output_script_type
 from jmcore.protocol import FEATURE_NEUTRINO_COMPAT, parse_utxo_list
 from jmwallet.history import (
     HistoryWriteError,
@@ -1068,8 +1069,13 @@ class CoinJoinSession:
         """
         import math
 
-        # P2WPKH: ~68 vbytes per input, 31 vbytes per output, ~11 overhead
-        vsize = num_inputs * 68 + num_outputs * 31 + 11
+        # Approximate the transaction's script type from the CoinJoin's output
+        # family: taproot (tr0) CoinJoins have larger inputs spent as Schnorr
+        # key-path (~57.5 vbytes) and larger P2TR outputs (43 vbytes) than
+        # native segwit (68 / 31). Using the matching constants keeps the fee
+        # estimate accurate for both families.
+        script_type = offer_output_script_type(self.config.preferred_offer_type)
+        vsize = estimate_vsize([script_type] * num_inputs, [script_type] * num_outputs)
 
         # Use base rate for deterministic calculations (sweeps),
         # otherwise use the session's randomized rate for privacy

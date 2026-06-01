@@ -228,30 +228,30 @@ def calculate_tx_fee(
     num_maker_inputs: int,
     num_outputs: int,
     fee_rate: float,
+    script_type: str = "p2wpkh",
 ) -> int:
     """
     Calculate transaction fee based on estimated vsize.
 
-    SegWit P2WPKH inputs: ~68 vbytes each
-    P2WPKH outputs: 31 vbytes each
-    Overhead: ~11 vbytes
+    Native segwit (p2wpkh) inputs are ~68 vbytes and outputs 31 vbytes;
+    taproot (p2tr) key-path inputs are ~57.5 vbytes and outputs 43 vbytes.
 
     Args:
         fee_rate: Fee rate in sat/vB (can be fractional, e.g. 0.5)
+        script_type: Dominant script type ("p2wpkh" or "p2tr") used to size
+            inputs and outputs.
 
     Returns:
         Fee in satoshis (rounded up to ensure minimum relay fee)
     """
-    # Estimate virtual size
-    input_vsize = (num_taker_inputs + num_maker_inputs) * 68
-    output_vsize = num_outputs * 31
-    overhead = 11
-
-    vsize = input_vsize + output_vsize + overhead
-
-    # Round up to ensure we pay at least the minimum
     import math
 
+    from jmcore.bitcoin import estimate_vsize
+
+    num_inputs = num_taker_inputs + num_maker_inputs
+    vsize = estimate_vsize([script_type] * num_inputs, [script_type] * num_outputs)
+
+    # Round up to ensure we pay at least the minimum
     return math.ceil(vsize * fee_rate)
 
 
