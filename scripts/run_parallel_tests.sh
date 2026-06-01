@@ -373,6 +373,28 @@ services:
       - maker5-data:/home/jm/.joinmarket-ng
       - "${shared_dir}:/shared:ro"
 
+  maker-tr1:
+    container_name: ${prefix}-maker-tr1
+    networks:
+      jm-network:
+        aliases:
+          - jm-maker-tr1
+    volumes: !override
+      - maker-tr1-data:/home/jm/.joinmarket-ng
+      - tor-data:/var/lib/tor:ro
+      - "${shared_dir}:/shared:ro"
+
+  maker-tr2:
+    container_name: ${prefix}-maker-tr2
+    networks:
+      jm-network:
+        aliases:
+          - jm-maker-tr2
+    volumes: !override
+      - maker-tr2-data:/home/jm/.joinmarket-ng
+      - tor-data:/var/lib/tor:ro
+      - "${shared_dir}:/shared:ro"
+
   maker-neutrino:
     container_name: ${prefix}-maker-neutrino
     networks:
@@ -718,6 +740,8 @@ run_suite_e2e() {
 
         sleep 20  # Wait for makers to connect
 
+        local inner_rc=0
+
         # E2E tests
         BITCOIN_RPC_URL="http://127.0.0.1:${btc_rpc}" \
         BITCOIN_RPC_USER=test \
@@ -730,7 +754,7 @@ run_suite_e2e() {
         pytest -c pytest.ini -m "e2e and not tumbler_e2e" --fail-on-skip \
             -lv --timeout=300 --reruns=1 --reruns-delay=10 \
             --cov --cov-report=term-missing \
-            tests/
+            tests/ || inner_rc=$?
 
         # Docker integration tests (maker, jmwallet, directory_server)
         BITCOIN_RPC_URL="http://127.0.0.1:${btc_rpc}" \
@@ -743,7 +767,9 @@ run_suite_e2e() {
         pytest -c pytest.ini -m "docker and not e2e and not reference and not neutrino and not reference_maker" --fail-on-skip \
             -lv --timeout=300 \
             --cov --cov-report=term-missing \
-            maker/tests/integration/ jmwallet/tests/ directory_server/tests/
+            maker/tests/integration/ jmwallet/tests/ directory_server/tests/ || inner_rc=$?
+
+        (exit $inner_rc)
     } > "$log" 2>&1 || rc=$?
     cleanup_suite "$suite"
     return $rc
