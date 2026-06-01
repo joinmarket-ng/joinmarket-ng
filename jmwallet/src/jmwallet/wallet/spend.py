@@ -167,6 +167,10 @@ def select_spendable_utxos(
             continue
         if not include_fidelity_bonds and u.is_fidelity_bond:
             continue
+        # A still-locked bond can never be spent (CLTV not yet satisfiable),
+        # so it must never be auto-selected even when bonds are included.
+        if include_fidelity_bonds and u.is_locked:
+            continue
         result.append(u)
     return result
 

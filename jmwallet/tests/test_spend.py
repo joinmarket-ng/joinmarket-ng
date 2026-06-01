@@ -176,6 +176,13 @@ class TestSelectSpendableUtxos:
         result = select_spendable_utxos(utxos, include_fidelity_bonds=True)
         assert len(result) == 1
 
+    def test_excludes_locked_bond_even_when_requested(self) -> None:
+        # A bond whose timelock has not expired cannot be spent, so it must be
+        # excluded from auto-selection regardless of the include flag.
+        utxos = [_make_utxo(locktime=int(time.time()) + 86_400)]
+        result = select_spendable_utxos(utxos, include_fidelity_bonds=True)
+        assert result == []
+
     def test_empty_input(self) -> None:
         assert select_spendable_utxos([]) == []
 

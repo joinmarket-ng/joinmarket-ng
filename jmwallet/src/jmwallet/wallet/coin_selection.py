@@ -61,8 +61,12 @@ class CoinSelectionMixin:
         if exclude:
             eligible = [utxo for utxo in eligible if (utxo.txid, utxo.vout) not in exclude]
 
-        # Filter out fidelity bond UTXOs by default
-        if not include_fidelity_bonds:
+        # Filter out fidelity bond UTXOs by default. Even when bonds are
+        # explicitly included, a still-locked bond (CLTV not yet expired) can
+        # never be spent, so it must never be auto-selected.
+        if include_fidelity_bonds:
+            eligible = [utxo for utxo in eligible if not utxo.is_locked]
+        else:
             eligible = [utxo for utxo in eligible if not utxo.is_fidelity_bond]
 
         # Filter out included UTXOs from eligible pool to avoid duplicates
@@ -257,8 +261,13 @@ class CoinSelectionMixin:
         if exclude:
             eligible = [utxo for utxo in eligible if (utxo.txid, utxo.vout) not in exclude]
 
-        # Filter out fidelity bond UTXOs by default
-        if not include_fidelity_bonds:
+        # Filter out fidelity bond UTXOs by default. Even when bonds are
+        # explicitly included, a still-locked bond (CLTV not yet expired) can
+        # never be spent, so it must never be auto-selected: doing so would
+        # build a consensus-invalid transaction.
+        if include_fidelity_bonds:
+            eligible = [utxo for utxo in eligible if not utxo.is_locked]
+        else:
             eligible = [utxo for utxo in eligible if not utxo.is_fidelity_bond]
 
         # Sort by value descending for efficient selection
