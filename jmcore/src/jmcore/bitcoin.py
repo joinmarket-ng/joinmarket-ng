@@ -1313,6 +1313,15 @@ def estimate_vsize(input_types: list[str], output_types: list[str]) -> int:
         #   Witness: 1(stack_len) + 1(sig_len) + 64(schnorr sig) = 66 wu
         #   Total: 230 wu (57.5 vbytes)
         "p2tr": 41 * 4 + 66,
+        # P2TR script-path Taproot fidelity bond (JMP-0005): spent via its
+        # single CLTV tapleaf, so the witness carries three items.
+        #   Non-witness: 41 bytes -> 164 wu
+        #   Witness: 1(stack_len) + 1(siglen)+64(schnorr sig)
+        #            + 1(scriptlen)+40(tapleaf: <32B key> CHECKSIGVERIFY
+        #              <5B locktime push> CLTV)
+        #            + 1(cblocklen)+33(control block) = 141 wu
+        #   Total: 305 wu (~77 vbytes)
+        "p2tr_bond": 41 * 4 + 141,
     }
 
     # Output sizes (weight units)

@@ -70,6 +70,21 @@ class TestBuildScriptTypeLists:
         uniform = estimate_vsize(["p2tr", "p2tr"], output_types)
         assert mixed > uniform
 
+    def test_taproot_bond_input_sized_as_script_path(self) -> None:
+        """A taker's own matured taproot bond is spent via its CLTV tapleaf, so
+        it must be sized as the larger script-path spend, not a key-path P2TR."""
+        session = _session(OfferType.TR0_ABSOLUTE)
+        taker_utxos = [
+            SimpleNamespace(scriptpubkey=self._P2TR_SPK),
+            SimpleNamespace(scriptpubkey=self._P2TR_SPK, is_fidelity_bond=True),
+        ]
+        input_types, output_types = session._build_script_type_lists(taker_utxos, 2)
+        assert input_types == ["p2tr", "p2tr_bond"]
+        # The bond input must size larger than an equivalent key-path P2TR.
+        with_bond = estimate_vsize(input_types, output_types)
+        as_keypath = estimate_vsize(["p2tr", "p2tr"], output_types)
+        assert with_bond > as_keypath
+
     def test_segwit_coinjoin_uniform(self) -> None:
         session = _session(OfferType.SW0_ABSOLUTE)
         taker_utxos = [SimpleNamespace(scriptpubkey=self._P2WPKH_SPK)]
