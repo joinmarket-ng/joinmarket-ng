@@ -1041,6 +1041,7 @@ class CoinJoinSession:
                         "vout": u.vout,
                         "value": u.value,
                         "scriptpubkey": u.scriptpubkey,
+                        "locktime": u.locktime,
                     }
                     for u in selected_utxos
                 ],
