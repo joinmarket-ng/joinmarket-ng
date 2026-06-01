@@ -83,6 +83,51 @@ def test_p2tr_address_is_bech32m() -> None:
     # The previous (buggy) bech32 checksum must not validate as bech32m.
 
 
+def test_taproot_sighash_matches_bitcointx() -> None:
+    """Cross-check the in-tree BIP341 sighash against bitcointx (consensus ref).
+
+    The other taproot tests only verify sign/verify self-consistency, which a
+    wrong-but-internally-consistent preimage would still pass. This pins the
+    preimage to an audited implementation across every sighash type, so funds in
+    silent payment (and other P2TR) outputs stay spendable.
+    """
+    import os
+
+    from bitcointx.core import CTransaction, CTxOut
+    from bitcointx.core.script import CScript, SIGHASH_Type, SignatureHashSchnorr
+
+    inputs = []
+    values: list[int] = []
+    scripts: list[bytes] = []
+    for i in range(3):
+        inputs.append(
+            TxInput(txid_le=os.urandom(32), vout=i, scriptsig=b"", sequence=0xFFFFFFF0 + i)
+        )
+        values.append(100_000 * (i + 1))
+        scripts.append(bytes([0x51, 0x20]) + os.urandom(32))
+    outputs = [
+        TxOutput(value=50_000, script=bytes([0x51, 0x20]) + os.urandom(32)),
+        TxOutput(value=120_000, script=bytes([0x00, 0x14]) + os.urandom(20)),
+        TxOutput(value=30_000, script=bytes([0x51, 0x20]) + os.urandom(32)),
+    ]
+    tx = ParsedTransaction(
+        version=2, has_witness=True, inputs=inputs, outputs=outputs, locktime=500, witnesses=[]
+    )
+    from jmcore.bitcoin import serialize_transaction
+
+    ctx = CTransaction.deserialize(
+        serialize_transaction(tx.version, tx.inputs, tx.outputs, tx.locktime)
+    )
+    spent = [CTxOut(v, CScript(s)) for v, s in zip(values, scripts, strict=True)]
+
+    for hashtype in (0x00, 0x01, 0x02, 0x03, 0x81, 0x82, 0x83):
+        ref_type = None if hashtype == 0x00 else SIGHASH_Type(hashtype)
+        for idx in range(len(inputs)):
+            mine = compute_sighash_taproot(tx, idx, values, scripts, hashtype)
+            ref = SignatureHashSchnorr(ctx, idx, spent_outputs=spent, hashtype=ref_type)
+            assert bytes(mine) == bytes(ref), f"mismatch hashtype={hashtype:#04x} idx={idx}"
+
+
 def test_silent_payment_output_is_spendable() -> None:
     """End-to-end: receive a silent payment and sign a spend of it."""
     master = HDKey.from_seed(mnemonic_to_seed(TEST_MNEMONIC, ""))
