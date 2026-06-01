@@ -433,8 +433,16 @@ async def test_maker_bot_connect_directory(
     start_task = asyncio.create_task(bot.start())
 
     try:
-        # Wait for connection to establish (wallet sync takes ~2s, connection ~0.5s)
-        await asyncio.sleep(10)
+        # Poll for the connection to establish instead of sleeping a fixed amount.
+        # First-time descriptor wallet setup triggers a full rescan whose duration
+        # scales with block height, so late in the e2e suite a fixed wait is too
+        # short. Polling stays fast in the common case but tolerates slow rescans;
+        # it still fails if the bot genuinely never connects.
+        deadline = asyncio.get_event_loop().time() + 60
+        while asyncio.get_event_loop().time() < deadline:
+            if bot.directory_clients and bot.running:
+                break
+            await asyncio.sleep(0.5)
 
         # Check that bot connected
         assert len(bot.directory_clients) > 0, (
