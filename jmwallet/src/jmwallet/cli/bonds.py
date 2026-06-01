@@ -7,7 +7,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated
 
 import typer
 from jmcore.cli_common import (
@@ -24,7 +24,18 @@ from jmwallet.cli import app
 @app.command()
 def list_bonds(
     mnemonic_file: Annotated[
-        Path | None, typer.Option("--mnemonic-file", "-f", envvar="MNEMONIC_FILE")
+        Path | None,
+        typer.Option(
+            "--mnemonic-file",
+            "-f",
+            envvar="MNEMONIC_FILE",
+            help=(
+                "Select the per-wallet bond registry by deriving its "
+                "fingerprint from this mnemonic file. This does NOT scan the "
+                "blockchain; use 'jm-wallet recover-bonds' to discover bonds "
+                "on-chain."
+            ),
+        ),
     ] = None,
     prompt_bip39_passphrase: Annotated[
         bool, typer.Option("--prompt-bip39-passphrase", help="Prompt for BIP39 passphrase")
@@ -35,23 +46,13 @@ def list_bonds(
             "--wallet-fingerprint",
             help=(
                 "Select the per-wallet bond registry by its 8-char hex BIP32 "
-                "master fingerprint (offline mode only). Use this instead of "
-                "--mnemonic-file when you already know the fingerprint "
-                "(e.g. from 'jm-wallet info'). When neither --mnemonic-file "
-                "nor this flag is provided and exactly one wallet has a "
-                "registry in the data directory, that wallet is selected "
-                "automatically."
+                "master fingerprint. Use this instead of --mnemonic-file when "
+                "you already know the fingerprint (e.g. from 'jm-wallet info'). "
+                "When neither --mnemonic-file nor this flag is provided and "
+                "exactly one wallet has a registry in the data directory, that "
+                "wallet is selected automatically."
             ),
         ),
-    ] = None,
-    network: Annotated[str | None, typer.Option("--network", "-n", help="Bitcoin network")] = None,
-    backend_type: Annotated[
-        str | None,
-        typer.Option("--backend", "-b", help="Backend: descriptor_wallet | neutrino"),
-    ] = None,
-    rpc_url: Annotated[str | None, typer.Option("--rpc-url", envvar="BITCOIN_RPC_URL")] = None,
-    locktimes: Annotated[
-        list[int] | None, typer.Option("--locktime", "-L", help="Locktime(s) to scan for")
     ] = None,
     data_dir: Annotated[
         Path | None,
@@ -63,15 +64,15 @@ def list_bonds(
     ] = None,
     funded_only: Annotated[
         bool,
-        typer.Option("--funded-only", help="Show only funded bonds (offline mode)"),
+        typer.Option("--funded-only", help="Show only funded bonds"),
     ] = False,
     active_only: Annotated[
         bool,
-        typer.Option("--active-only", help="Show only active bonds (offline mode)"),
+        typer.Option("--active-only", help="Show only active bonds"),
     ] = False,
     json_output: Annotated[
         bool,
-        typer.Option("--json", "-j", help="Output as JSON (offline mode)"),
+        typer.Option("--json", "-j", help="Output as JSON"),
     ] = False,
     log_level: Annotated[
         str | None,
@@ -79,82 +80,47 @@ def list_bonds(
     ] = None,
 ) -> None:
     """
-    List all fidelity bonds in the wallet.
+    List fidelity bonds from the local registry (offline, no blockchain access).
 
-    Without --mnemonic-file: shows bonds from the local registry (offline, fast).
-    Online mode (requires --mnemonic-file): scans the blockchain for bonds and
-    updates the registry. The per-wallet registry is selected by fingerprint
-    derived from --mnemonic-file, taken from --wallet-fingerprint, or
-    auto-detected when only one wallet's registry exists in the data dir.
+    This command only reads the per-wallet registry; it never scans the
+    blockchain. Registered-but-unfunded bonds (created with
+    generate-bond-address or import-bond but not yet funded) are shown with an
+    UNFUNDED status. Funded status and values reflect the last on-chain sync.
 
-    Registered-but-unfunded bonds (created with generate-bond-address or
-    import-bond but not yet funded) are shown by default in both modes.
+    To discover bonds on-chain and refresh the registry, use
+    'jm-wallet recover-bonds'. The per-wallet registry is selected by the
+    fingerprint derived from --mnemonic-file, taken from --wallet-fingerprint,
+    the configured wallet, or auto-detected when only one wallet's registry
+    exists in the data dir.
     """
     settings = setup_cli(log_level, data_dir=data_dir)
     resolved_data_dir = data_dir if data_dir else settings.get_data_dir()
 
-    # If no mnemonic provided, show bonds from registry (offline mode)
-    if mnemonic_file is None and not any(v is not None for v in [rpc_url, backend_type]):
-        from jmwallet.cli._wallet_selection import resolve_wallet_fingerprint
-        from jmwallet.wallet.bond_registry import list_registry_fingerprints
+    from jmwallet.cli._wallet_selection import resolve_wallet_fingerprint
+    from jmwallet.wallet.bond_registry import list_registry_fingerprints
 
-        fingerprint = resolve_wallet_fingerprint(
-            settings,
-            mnemonic_file=mnemonic_file,
-            wallet_fingerprint=wallet_fingerprint,
-            prompt_bip39_passphrase=prompt_bip39_passphrase,
-            list_known_fingerprints=lambda: list_registry_fingerprints(resolved_data_dir),
-            command_label="jm-wallet list-bonds",
-            fall_back_to_configured_mnemonic=True,
-        )
-        if fingerprint is None:
-            logger.error(
-                "No bond registry found in this data directory and no wallet "
-                "identity was provided. Pass --mnemonic-file (with "
-                "--prompt-bip39-passphrase if needed) or --wallet-fingerprint."
-            )
-            raise typer.Exit(1)
-        _list_bonds_offline(
-            data_dir=resolved_data_dir,
-            fingerprint=fingerprint,
-            funded_only=funded_only,
-            active_only=active_only,
-            json_output=json_output,
-        )
-        return
-
-    try:
-        resolved = resolve_mnemonic(
-            settings,
-            mnemonic_file=mnemonic_file,
-            prompt_bip39_passphrase=prompt_bip39_passphrase,
-        )
-        if not resolved:
-            raise ValueError("No mnemonic provided")
-        resolved_mnemonic = resolved.mnemonic
-        resolved_bip39_passphrase = resolved.bip39_passphrase
-        resolved_creation_height = resolved.creation_height
-    except (FileNotFoundError, ValueError) as e:
-        logger.error(str(e))
-        raise typer.Exit(1)
-
-    # Resolve backend settings with CLI overrides taking priority
-    backend = resolve_backend_settings(
+    fingerprint = resolve_wallet_fingerprint(
         settings,
-        network=network,
-        backend_type=backend_type,
-        rpc_url=rpc_url,
-        data_dir=data_dir,
+        mnemonic_file=mnemonic_file,
+        wallet_fingerprint=wallet_fingerprint,
+        prompt_bip39_passphrase=prompt_bip39_passphrase,
+        list_known_fingerprints=lambda: list_registry_fingerprints(resolved_data_dir),
+        command_label="jm-wallet list-bonds",
+        fall_back_to_configured_mnemonic=True,
     )
-
-    asyncio.run(
-        _list_fidelity_bonds(
-            resolved_mnemonic,
-            backend,
-            locktimes or [],
-            resolved_bip39_passphrase,
-            creation_height=resolved_creation_height,
+    if fingerprint is None:
+        logger.error(
+            "No bond registry found in this data directory and no wallet "
+            "identity was provided. Pass --mnemonic-file (with "
+            "--prompt-bip39-passphrase if needed) or --wallet-fingerprint."
         )
+        raise typer.Exit(1)
+    _list_bonds_offline(
+        data_dir=resolved_data_dir,
+        fingerprint=fingerprint,
+        funded_only=funded_only,
+        active_only=active_only,
+        json_output=json_output,
     )
 
 
@@ -189,8 +155,9 @@ def _list_bonds_offline(
         print("\nNo fidelity bonds found in registry.")
         print(f"Registry: {registry_path}")
         print(
-            "\nTIP: Use --mnemonic-file to scan the blockchain for bonds,\n"
-            "     or 'jm-wallet generate-bond-address' to create one."
+            "\nTIP: Use 'jm-wallet generate-bond-address' to create one,\n"
+            "     or 'jm-wallet recover-bonds' to scan the blockchain for "
+            "existing bonds."
         )
         return
 
@@ -225,246 +192,7 @@ def _list_bonds_offline(
         print(f"\nBest bond for advertising: {best.address[:20]}...{best.address[-8:]}")
         print(f"  Value: {best.value:,} sats, Unlock in: {best.time_until_unlock:,}s")
 
-    print("\nNote: Values are from last sync. Use --mnemonic-file to refresh from blockchain.")
-
-
-async def _list_fidelity_bonds(
-    mnemonic: str,
-    backend_settings: ResolvedBackendSettings,
-    locktimes: list[int],
-    bip39_passphrase: str = "",
-    *,
-    creation_height: int | None = None,
-) -> None:
-    """List fidelity bonds implementation."""
-    from jmwallet.backends.descriptor_wallet import (
-        DescriptorWalletBackend,
-        generate_wallet_name,
-        get_mnemonic_fingerprint,
-    )
-    from jmwallet.wallet.bond_registry import (
-        FidelityBondInfo as RegistryBondInfo,
-    )
-    from jmwallet.wallet.bond_registry import (
-        get_registry_path,
-        load_registry,
-        save_registry,
-    )
-    from jmwallet.wallet.service import FIDELITY_BOND_BRANCH, WalletService
-
-    # Import fidelity bond utilities from maker
-    try:
-        from maker.fidelity import find_fidelity_bonds
-    except ImportError:
-        logger.error("Failed to import fidelity bond utilities")
-        raise typer.Exit(1)
-
-    network = backend_settings.network
-    data_dir = backend_settings.data_dir
-
-    fingerprint = get_mnemonic_fingerprint(mnemonic, bip39_passphrase)
-    wallet_name = generate_wallet_name(fingerprint, network)
-    backend = DescriptorWalletBackend(
-        rpc_url=backend_settings.rpc_url,
-        rpc_user=backend_settings.rpc_user,
-        rpc_password=backend_settings.rpc_password,
-        wallet_name=wallet_name,
-    )
-
-    if creation_height is not None:
-        backend.set_wallet_creation_height(creation_height)
-
-    # Use large gap limit (1000) for discovery mode when scanning with --locktime
-    gap_limit = 1000 if locktimes else 20
-    wallet = WalletService(
-        mnemonic=mnemonic,
-        backend=backend,
-        network=network,
-        mixdepth_count=5,
-        passphrase=bip39_passphrase,
-        data_dir=data_dir,
-    )
-
-    # Verify metadata store is writable before syncing (fail fast on read-only mounts)
-    if wallet.metadata_store is not None:
-        try:
-            wallet.metadata_store.verify_writable()
-        except OSError as e:
-            logger.error(f"Cannot run freeze command: {e}")
-            raise typer.Exit(1)
-    else:
-        logger.error("Cannot freeze UTXOs without a data directory")
-        raise typer.Exit(1)
-
-    try:
-        # Load known bonds from registry for optimized scanning. The
-        # WalletService open above already ran the wallet-aware legacy
-        # migration, so the per-wallet file is authoritative; disable the
-        # legacy fallback to avoid copying foreign bonds on save (#492).
-        bond_registry = load_registry(
-            data_dir, wallet.wallet_fingerprint, allow_legacy_fallback=False
-        )
-        fidelity_bond_addresses: list[tuple[str, int, int]] = []
-        network_bonds = [bond for bond in bond_registry.bonds if bond.network == network]
-        if network_bonds:
-            fidelity_bond_addresses = [
-                (bond.address, bond.locktime, bond.index) for bond in network_bonds
-            ]
-            logger.info(
-                f"Loading {len(fidelity_bond_addresses)} known bond(s) from registry for scanning"
-            )
-
-        # Sync wallet + known bonds in single pass
-        await wallet.sync_all(fidelity_bond_addresses)
-
-        # If user provided locktimes, also scan with large gap limit to discover new bonds
-        if locktimes:
-            logger.info(f"Scanning for undiscovered bonds with gap_limit={gap_limit}")
-            await wallet.sync_fidelity_bonds(locktimes)
-
-        bonds = await find_fidelity_bonds(wallet)
-
-        # Group bonds by address to detect multiple UTXOs at the same address.
-        # Per the reference implementation, only the single highest-value UTXO
-        # at each address is used as a fidelity bond.
-        from collections import defaultdict
-
-        bonds_by_address: dict[str, list] = defaultdict(list)
-        utxo_map_by_outpoint: dict[tuple[str, int], Any] = {}
-        for utxos_list in wallet.utxo_cache.values():
-            for utxo in utxos_list:
-                utxo_map_by_outpoint[(utxo.txid, utxo.vout)] = utxo
-
-        for bond in bonds:
-            utxo = utxo_map_by_outpoint.get((bond.txid, bond.vout))
-            addr = utxo.address if utxo else f"unknown-{bond.txid}:{bond.vout}"
-            bonds_by_address[addr].append(bond)
-
-        # For each address, select the best UTXO (highest bond_value)
-        best_bonds: list = []
-        for addr, addr_bonds in bonds_by_address.items():
-            best = max(addr_bonds, key=lambda b: b.bond_value)
-            best_bonds.append((addr, best, addr_bonds))
-
-        # Sort by bond value (highest first)
-        best_bonds.sort(key=lambda x: x[1].bond_value, reverse=True)
-
-        # Registered bonds that were not discovered as funded UTXOs on-chain.
-        # These are shown by default so users can see bonds they created with
-        # generate-bond-address/import-bond but have not funded yet.
-        funded_addresses = {addr for addr, _, _ in best_bonds}
-        unfunded_bonds = [b for b in network_bonds if b.address not in funded_addresses]
-
-        if not best_bonds and not unfunded_bonds:
-            print("\nNo fidelity bonds found in wallet.")
-            if not locktimes:
-                print("TIP: Use --locktime to specify locktime(s) to scan for undiscovered bonds")
-                print(
-                    "     Or use 'jm-wallet generate-bond-address' to create a new bond "
-                    "and register it"
-                )
-            return
-
-        print(f"\nFound {len(best_bonds)} funded fidelity bond(s):\n")
-        print("=" * 120)
-
-        from jmcore.bitcoin import format_amount
-
-        # Track registry updates
-        registry_updated = False
-        coin_type = 0 if network == "mainnet" else 1
-
-        for i, (addr, bond, all_addr_bonds) in enumerate(best_bonds, 1):
-            locktime_dt = datetime.fromtimestamp(bond.locktime)
-            expired = datetime.now().timestamp() > bond.locktime
-            status = "EXPIRED" if expired else "ACTIVE"
-            print(f"Bond #{i}: [{status}]")
-            print(f"  UTXO:        {bond.txid}:{bond.vout}")
-            print(f"  Value:       {format_amount(bond.value)}")
-            print(f"  Locktime:    {bond.locktime} ({locktime_dt.strftime('%Y-%m-%d %H:%M:%S')})")
-            print(f"  Confirms:    {bond.confirmation_time}")
-            print(f"  Bond Value:  {bond.bond_value:,}")
-            if len(all_addr_bonds) > 1:
-                total_sats = sum(b.value for b in all_addr_bonds)
-                print(
-                    f"  WARNING:     {len(all_addr_bonds)} UTXOs at this address "
-                    f"(total {format_amount(total_sats)}). "
-                    f"Only the largest UTXO is used as a fidelity bond."
-                )
-            print("-" * 120)
-
-            # Update registry with the best UTXO for this address
-            utxo_info = utxo_map_by_outpoint.get((bond.txid, bond.vout))
-            if utxo_info:
-                existing_bond = bond_registry.get_bond_by_address(addr)
-                if existing_bond:
-                    if bond_registry.update_utxo_info(
-                        address=addr,
-                        txid=bond.txid,
-                        vout=bond.vout,
-                        value=bond.value,
-                        confirmations=utxo_info.confirmations,
-                    ):
-                        registry_updated = True
-                        logger.debug(f"Updated registry entry for {addr[:20]}...")
-                elif locktimes:
-                    # New bond discovered via --locktime scan, add to registry
-                    path_parts = utxo_info.path.split("/")
-                    index_locktime = path_parts[-1]
-                    idx = int(index_locktime.split(":")[0]) if ":" in index_locktime else 0
-
-                    from jmcore.btc_script import mk_freeze_script
-
-                    key = wallet.get_fidelity_bond_key(idx, bond.locktime)
-                    pubkey_hex = key.get_public_key_bytes(compressed=True).hex()
-                    witness_script = mk_freeze_script(pubkey_hex, bond.locktime)
-                    path = f"m/84'/{coin_type}'/0'/{FIDELITY_BOND_BRANCH}/{idx}"
-
-                    from jmcore.timenumber import format_locktime_date
-
-                    new_bond = RegistryBondInfo(
-                        address=addr,
-                        locktime=bond.locktime,
-                        locktime_human=format_locktime_date(bond.locktime),
-                        index=idx,
-                        path=path,
-                        pubkey=pubkey_hex,
-                        witness_script_hex=witness_script.hex(),
-                        network=network,
-                        created_at=datetime.now().isoformat(),
-                        txid=bond.txid,
-                        vout=bond.vout,
-                        value=bond.value,
-                        confirmations=utxo_info.confirmations,
-                    )
-                    bond_registry.add_bond(new_bond)
-                    registry_updated = True
-                    logger.info(f"Added new bond to registry: {addr[:20]}...")
-
-        if not best_bonds:
-            print("No funded fidelity bonds found on-chain.")
-            print("=" * 120)
-
-        # Show registered-but-unfunded bonds so users can see and fund them.
-        if unfunded_bonds:
-            print(f"\nRegistered but unfunded fidelity bond(s): {len(unfunded_bonds)}\n")
-            print("=" * 120)
-            for reg_bond in sorted(unfunded_bonds, key=lambda b: b.locktime):
-                expired = datetime.now().timestamp() > reg_bond.locktime
-                status = "EXPIRED" if expired else "UNFUNDED"
-                print(f"  [{status}]  {reg_bond.address}")
-                print(f"    Locktime: {reg_bond.locktime} ({reg_bond.locktime_human})")
-                print(f"    Path:     {reg_bond.path}")
-                print("-" * 120)
-            print("Fund any of the addresses above to activate the bond.")
-
-        # Save registry if any updates were made
-        if registry_updated:
-            save_registry(bond_registry, data_dir, wallet.wallet_fingerprint)
-            print(f"\nRegistry updated: {get_registry_path(data_dir, wallet.wallet_fingerprint)}")
-
-    finally:
-        await wallet.close()
+    print("\nNote: Values are from the last sync. Use 'jm-wallet recover-bonds' to refresh.")
 
 
 @app.command("generate-bond-address")

@@ -77,7 +77,8 @@ The full CLI reference below is auto-generated from command `--help` output.
 │ --help                        Show this message and exit.                    │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ╭─ Commands ───────────────────────────────────────────────────────────────────╮
-│ list-bonds                   List all fidelity bonds in the wallet.          │
+│ list-bonds                   List fidelity bonds from the local registry     │
+│                              (offline, no blockchain access).                │
 │ generate-bond-address        Generate a fidelity bond (timelocked P2WSH)     │
 │                              address.                                        │
 │ import-bond                  Manually import a fidelity bond into the        │
@@ -128,45 +129,48 @@ The full CLI reference below is auto-generated from command `--help` output.
 
  Usage: jm-wallet list-bonds [OPTIONS]
 
- List all fidelity bonds in the wallet.
+ List fidelity bonds from the local registry (offline, no blockchain access).
 
- Without --mnemonic-file: shows bonds from the local registry (offline, fast).
- Online mode (requires --mnemonic-file): scans the blockchain for bonds and
- updates the registry. The per-wallet registry is selected by fingerprint
- derived from --mnemonic-file, taken from --wallet-fingerprint, or
- auto-detected when only one wallet's registry exists in the data dir.
+ This command only reads the per-wallet registry; it never scans the
+ blockchain. Registered-but-unfunded bonds (created with
+ generate-bond-address or import-bond but not yet funded) are shown with an
+ UNFUNDED status. Funded status and values reflect the last on-chain sync.
+
+ To discover bonds on-chain and refresh the registry, use
+ 'jm-wallet recover-bonds'. The per-wallet registry is selected by the
+ fingerprint derived from --mnemonic-file, taken from --wallet-fingerprint,
+ the configured wallet, or auto-detected when only one wallet's registry
+ exists in the data dir.
 
 ╭─ Options ────────────────────────────────────────────────────────────────────╮
-│ --mnemonic-file            -f      PATH     [env var: MNEMONIC_FILE]         │
-│ --prompt-bip39-passphrase                   Prompt for BIP39 passphrase      │
-│ --wallet-fingerprint               TEXT     Select the per-wallet bond       │
-│                                             registry by its 8-char hex BIP32 │
-│                                             master fingerprint (offline mode │
-│                                             only). Use this instead of       │
-│                                             --mnemonic-file when you already │
-│                                             know the fingerprint (e.g. from  │
-│                                             'jm-wallet info'). When neither  │
-│                                             --mnemonic-file nor this flag is │
-│                                             provided and exactly one wallet  │
-│                                             has a registry in the data       │
-│                                             directory, that wallet is        │
-│                                             selected automatically.          │
-│ --network                  -n      TEXT     Bitcoin network                  │
-│ --backend                  -b      TEXT     Backend: descriptor_wallet |     │
-│                                             neutrino                         │
-│ --rpc-url                          TEXT     [env var: BITCOIN_RPC_URL]       │
-│ --locktime                 -L      INTEGER  Locktime(s) to scan for          │
-│ --data-dir                         PATH     Data directory (default:         │
-│                                             ~/.joinmarket-ng or              │
-│                                             $JOINMARKET_DATA_DIR)            │
-│                                             [env var: JOINMARKET_DATA_DIR]   │
-│ --funded-only                               Show only funded bonds (offline  │
-│                                             mode)                            │
-│ --active-only                               Show only active bonds (offline  │
-│                                             mode)                            │
-│ --json                     -j               Output as JSON (offline mode)    │
-│ --log-level                -l      TEXT     Log level                        │
-│ --help                                      Show this message and exit.      │
+│ --mnemonic-file            -f      PATH  Select the per-wallet bond registry │
+│                                          by deriving its fingerprint from    │
+│                                          this mnemonic file. This does NOT   │
+│                                          scan the blockchain; use 'jm-wallet │
+│                                          recover-bonds' to discover bonds    │
+│                                          on-chain.                           │
+│                                          [env var: MNEMONIC_FILE]            │
+│ --prompt-bip39-passphrase                Prompt for BIP39 passphrase         │
+│ --wallet-fingerprint               TEXT  Select the per-wallet bond registry │
+│                                          by its 8-char hex BIP32 master      │
+│                                          fingerprint. Use this instead of    │
+│                                          --mnemonic-file when you already    │
+│                                          know the fingerprint (e.g. from     │
+│                                          'jm-wallet info'). When neither     │
+│                                          --mnemonic-file nor this flag is    │
+│                                          provided and exactly one wallet has │
+│                                          a registry in the data directory,   │
+│                                          that wallet is selected             │
+│                                          automatically.                      │
+│ --data-dir                         PATH  Data directory (default:            │
+│                                          ~/.joinmarket-ng or                 │
+│                                          $JOINMARKET_DATA_DIR)               │
+│                                          [env var: JOINMARKET_DATA_DIR]      │
+│ --funded-only                            Show only funded bonds              │
+│ --active-only                            Show only active bonds              │
+│ --json                     -j            Output as JSON                      │
+│ --log-level                -l      TEXT  Log level                           │
+│ --help                                   Show this message and exit.         │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ```
 
@@ -520,7 +524,7 @@ The full CLI reference below is auto-generated from command `--help` output.
 
  REQUIREMENTS:
  - The bond must exist in the registry (created with 'create-bond-address')
- - The bond must be funded (use 'jm-wallet list-bonds --mnemonic-file <wallet>'
+ - The bond must be funded (use 'jm-wallet recover-bonds'
    to update UTXO info), unless using --test-unfunded for a dry-run signer test
  - The locktime must have expired (or be close enough for your use case)
 
@@ -1100,6 +1104,8 @@ The full CLI reference below is auto-generated from command `--help` output.
  - Index coverage: a used address sits beyond the imported address range
    (common for wallets migrated from legacy joinmarket-clientserver). Pass
    `--scan-depth N` to widen the range to N per branch, then rescan.
+   `--scan-depth` can be combined with `--start-height H` to widen the
+   range and only rescan from height H (defaults to genesis).
 
  Rescans are slow (20+ minutes on mainnet from genesis) but read-only. The
  scan runs server-side in Bitcoin Core, so Ctrl-C only stops the progress
@@ -1119,6 +1125,8 @@ The full CLI reference below is auto-generated from command `--help` output.
 │                                             height is used as a floor when   │
 │                                             available, so values below it    │
 │                                             are clamped up automatically.    │
+│                                             Honored both on its own and      │
+│                                             together with --scan-depth.      │
 │                                             [default: 0]                     │
 │ --scan-depth                       INTEGER  Widen the descriptor             │
 │                                             address-index range to N per     │

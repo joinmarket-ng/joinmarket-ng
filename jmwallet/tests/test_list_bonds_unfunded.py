@@ -1,39 +1,29 @@
-"""Online ``list-bonds`` must surface registered-but-unfunded fidelity bonds.
+"""``list-bonds`` must surface registered-but-unfunded fidelity bonds.
 
-The online path (``--mnemonic-file``) only discovers funded UTXOs on-chain.
-Bonds created with ``generate-bond-address`` / ``import-bond`` but not yet
-funded live only in the per-wallet registry, so they must be listed
-separately and shown by default.
+``list-bonds`` is registry-only (offline); it never scans the blockchain
+(use ``recover-bonds`` for that). Bonds created with ``generate-bond-address``
+/ ``import-bond`` but not yet funded live in the per-wallet registry and must
+be shown with an ``UNFUNDED`` status.
 """
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from pathlib import Path
 
 import pytest
 
-from jmwallet.cli.bonds import _list_fidelity_bonds
-from jmwallet.wallet.bond_registry import BondRegistry, FidelityBondInfo
-
-# BIP-39 test vector -- never use on mainnet.
-MNEMONIC = (
-    "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+from jmwallet.cli.bonds import _list_bonds_offline
+from jmwallet.wallet.bond_registry import (
+    BondRegistry,
+    FidelityBondInfo,
+    save_registry,
 )
 
 UNFUNDED_ADDRESS = "bcrt1qunfundedbond00000000000000000000000000xyz"
+FINGERPRINT = "deadbeef"
 
 
-def _backend_settings() -> MagicMock:
-    settings = MagicMock()
-    settings.network = "regtest"
-    settings.data_dir = MagicMock()
-    settings.rpc_url = "http://localhost:18443"
-    settings.rpc_user = "user"
-    settings.rpc_password = "pass"
-    return settings
-
-
-def _unfunded_registry() -> BondRegistry:
+def _seed_unfunded_registry(data_dir: Path) -> None:
     registry = BondRegistry()
     registry.add_bond(
         FidelityBondInfo(
@@ -48,31 +38,16 @@ def _unfunded_registry() -> BondRegistry:
             created_at="2025-01-01T00:00:00",
         )
     )
-    return registry
+    save_registry(registry, data_dir, FINGERPRINT)
 
 
-@pytest.mark.asyncio
-async def test_online_list_bonds_shows_unfunded_registered_bond(capsys) -> None:
-    wallet = MagicMock()
-    wallet.wallet_fingerprint = "deadbeef"
-    wallet.metadata_store = MagicMock()
-    wallet.sync_all = AsyncMock()
-    wallet.sync_fidelity_bonds = AsyncMock()
-    wallet.close = AsyncMock()
-    wallet.utxo_cache = {}
+def test_list_bonds_offline_shows_unfunded_registered_bond(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _seed_unfunded_registry(tmp_path)
 
-    backend = MagicMock()
-
-    with (
-        patch("jmwallet.backends.descriptor_wallet.DescriptorWalletBackend", return_value=backend),
-        patch("jmwallet.wallet.service.WalletService", return_value=wallet),
-        patch("jmwallet.wallet.bond_registry.load_registry", return_value=_unfunded_registry()),
-        # No funded bonds discovered on-chain.
-        patch("maker.fidelity.find_fidelity_bonds", AsyncMock(return_value=[])),
-    ):
-        await _list_fidelity_bonds(MNEMONIC, _backend_settings(), [])
+    _list_bonds_offline(data_dir=tmp_path, fingerprint=FINGERPRINT)
 
     out = capsys.readouterr().out
-    assert "Registered but unfunded fidelity bond(s): 1" in out
     assert UNFUNDED_ADDRESS in out
     assert "UNFUNDED" in out
