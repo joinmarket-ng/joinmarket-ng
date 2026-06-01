@@ -19,7 +19,7 @@ from loguru import logger
 from jmwallet.cli import app
 
 
-@app.command("registry-show")
+@app.command("registry-show", no_args_is_help=True)
 def registry_show(
     address: Annotated[str, typer.Argument(help="Bond address to show")],
     mnemonic_file: Annotated[

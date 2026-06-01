@@ -28,7 +28,7 @@ from jmwallet.wallet.spend import (
 )
 
 
-@app.command()
+@app.command(no_args_is_help=True)
 def send(
     destination: Annotated[str, typer.Argument(help="Destination address")],
     amount: Annotated[int, typer.Option("--amount", "-a", help="Amount in sats (0 for sweep)")] = 0,

@@ -46,6 +46,7 @@ from tumbler.runner import RunnerContext, TumbleRunner
 app = typer.Typer(
     name="jm-tumbler",
     help="JoinMarket tumbler - role-mixed CoinJoin schedules with YAML-persisted state",
+    no_args_is_help=True,
 )
 
 

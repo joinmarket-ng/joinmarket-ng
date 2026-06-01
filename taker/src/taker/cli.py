@@ -39,6 +39,7 @@ from taker.config import (
 app = typer.Typer(
     name="jm-taker",
     help="JoinMarket Taker - Execute CoinJoin transactions",
+    no_args_is_help=True,
 )
 
 
@@ -661,7 +662,7 @@ async def _run_coinjoin(
         await taker.stop()
 
 
-@app.command()
+@app.command(no_args_is_help=True)
 def tumble(
     schedule_file: Annotated[Path, typer.Argument(help="Path to schedule JSON file")],
     mnemonic_file: Annotated[

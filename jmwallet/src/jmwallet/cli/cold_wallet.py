@@ -50,7 +50,7 @@ def _resolve_wallet_fingerprint(wallet_fingerprint: str | None) -> str:
     return fp
 
 
-@app.command("create-bond-address")
+@app.command("create-bond-address", no_args_is_help=True)
 def create_bond_address(
     pubkey: Annotated[str, typer.Argument(help="Public key (hex, 33 bytes compressed)")],
     locktime: Annotated[
@@ -371,7 +371,7 @@ def generate_hot_keypair(
     print("=" * 80 + "\n")
 
 
-@app.command("prepare-certificate-message")
+@app.command("prepare-certificate-message", no_args_is_help=True)
 def prepare_certificate_message(
     bond_address: Annotated[str, typer.Argument(help="Bond P2WSH address")],
     cert_pubkey: Annotated[
@@ -763,7 +763,7 @@ def _recoverable_to_der(sig_bytes: bytes) -> bytes:
     return b"\x30" + bytes([len(sig_body)]) + sig_body
 
 
-@app.command("import-certificate")
+@app.command("import-certificate", no_args_is_help=True)
 def import_certificate(
     address: Annotated[str, typer.Argument(help="Bond address")],
     cert_pubkey: Annotated[
@@ -1045,7 +1045,7 @@ def import_certificate(
     print("=" * 80 + "\n")
 
 
-@app.command("spend-bond")
+@app.command("spend-bond", no_args_is_help=True)
 def spend_bond(
     bond_address: Annotated[str, typer.Argument(help="Bond P2WSH address to spend")],
     destination: Annotated[str, typer.Argument(help="Destination address for the funds")],

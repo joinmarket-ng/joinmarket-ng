@@ -31,7 +31,7 @@ from pydantic import SecretStr
 from maker.bot import MakerBot
 from maker.config import MakerConfig, MergeAlgorithm, OfferConfig
 
-app = typer.Typer()
+app = typer.Typer(no_args_is_help=True)
 
 
 def run_async(coro: Any) -> Any:
