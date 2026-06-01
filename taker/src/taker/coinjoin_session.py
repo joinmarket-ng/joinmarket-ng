@@ -868,8 +868,18 @@ class CoinJoinSession:
                 # Normal mode: include taker change
                 num_outputs = 1 + len(self.maker_sessions) + 1 + len(self.maker_sessions)
 
-            # Calculate actual tx fee based on real transaction size
-            actual_tx_fee = self._estimate_tx_fee(num_inputs, num_outputs)
+            # Calculate actual tx fee based on real transaction size. Classify
+            # the real input/output script types so a taproot CoinJoin that
+            # mixes in a legacy P2WPKH/P2WSH bond input is not under-estimated.
+            est_input_types, est_output_types = self._build_script_type_lists(
+                self.preselected_utxos, num_outputs
+            )
+            actual_tx_fee = self._estimate_tx_fee(
+                num_inputs,
+                num_outputs,
+                input_types=est_input_types,
+                output_types=est_output_types,
+            )
 
             preselected_total = sum(u.value for u in self.preselected_utxos)
 
@@ -1078,8 +1088,77 @@ class CoinJoinSession:
             logger.error(f"Failed to build transaction: {e}")
             return False
 
+    @staticmethod
+    def _classify_scriptpubkey(scriptpubkey: str, default: str) -> str:
+        """Map a hex scriptPubKey to a coarse script type for vsize estimation.
+
+        Falls back to ``default`` (the CoinJoin's output family) for unknown or
+        missing scripts so the estimate stays sensible.
+        """
+        spk = (scriptpubkey or "").lower()
+        if spk.startswith("0014") and len(spk) == 44:
+            return "p2wpkh"
+        if spk.startswith("5120") and len(spk) == 68:
+            return "p2tr"
+        if spk.startswith("0020") and len(spk) == 68:
+            return "p2wsh"
+        if spk.startswith("76a914") and len(spk) == 50:
+            return "p2pkh"
+        if spk.startswith("a914") and len(spk) == 46:
+            return "p2sh"
+        return default
+
+    def _build_script_type_lists(
+        self, selected_utxos: list[Any], num_outputs: int
+    ) -> tuple[list[str], list[str]]:
+        """Derive per-input and per-output script types for fee estimation.
+
+        Inputs are classified from their real scriptPubKeys (taker selected
+        UTXOs and each maker's UTXOs), so a taproot CoinJoin that mixes in a
+        legacy P2WPKH/P2WSH bond input is sized correctly instead of being
+        under-estimated. Equal CoinJoin outputs use the uniform output family;
+        change outputs are classified from their destination addresses.
+        """
+        cj_type = offer_output_script_type(self.config.preferred_offer_type)
+
+        input_types: list[str] = [
+            self._classify_scriptpubkey(getattr(u, "scriptpubkey", "") or "", cj_type)
+            for u in selected_utxos
+        ]
+        for session in self.maker_sessions.values():
+            for utxo in session.utxos:
+                input_types.append(
+                    self._classify_scriptpubkey(utxo.get("scriptpubkey", "") or "", cj_type)
+                )
+
+        # Equal CoinJoin outputs (taker + makers) all use the uniform cj type.
+        output_types: list[str] = [cj_type] * (1 + len(self.maker_sessions))
+        # Change outputs: classify from their addresses when available.
+        change_addrs: list[str] = []
+        if not self.is_sweep and self.taker_change_address:
+            change_addrs.append(self.taker_change_address)
+        for session in self.maker_sessions.values():
+            if session.change_address:
+                change_addrs.append(session.change_address)
+        for addr in change_addrs:
+            try:
+                output_types.append(get_address_type(addr))
+            except ValueError:
+                output_types.append(cj_type)
+
+        # Guard against any count drift: never return mismatched lengths.
+        if len(output_types) != num_outputs:
+            output_types = [cj_type] * num_outputs
+        return input_types, output_types
+
     def _estimate_tx_fee(
-        self, num_inputs: int, num_outputs: int, *, use_base_rate: bool = False
+        self,
+        num_inputs: int,
+        num_outputs: int,
+        *,
+        use_base_rate: bool = False,
+        input_types: list[str] | None = None,
+        output_types: list[str] | None = None,
     ) -> int:
         """Estimate transaction fee.
 
@@ -1094,6 +1173,13 @@ class CoinJoinSession:
             use_base_rate: If True, use the base fee rate instead of the
                           session's randomized rate. Used for sweep cj_amount
                           calculations where determinism is required.
+            input_types: Optional per-input script types. When the CoinJoin
+                mixes script types (for example a taproot CoinJoin that spends
+                a legacy P2WPKH or P2WSH bond input), passing the real types
+                avoids under-estimating vsize and therefore under-paying fees.
+                Defaults to a uniform list of the CoinJoin's output family.
+            output_types: Optional per-output script types. Defaults to a
+                uniform list of the CoinJoin's output family.
 
         Returns:
             Estimated fee in satoshis
@@ -1106,7 +1192,9 @@ class CoinJoinSession:
         # native segwit (68 / 31). Using the matching constants keeps the fee
         # estimate accurate for both families.
         script_type = offer_output_script_type(self.config.preferred_offer_type)
-        vsize = estimate_vsize([script_type] * num_inputs, [script_type] * num_outputs)
+        in_types = input_types if input_types is not None else [script_type] * num_inputs
+        out_types = output_types if output_types is not None else [script_type] * num_outputs
+        vsize = estimate_vsize(in_types, out_types)
 
         # Use base rate for deterministic calculations (sweeps),
         # otherwise use the session's randomized rate for privacy
