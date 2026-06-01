@@ -32,9 +32,7 @@ from jmwallet.history import (
 from jmwallet.wallet.signing import (
     TransactionSigningError,
     create_p2wpkh_script_code,
-    create_witness_stack,
     deserialize_transaction,
-    sign_p2wpkh_input,
     verify_p2wpkh_signature,
 )
 from jmwallet.wallet.spend import enforce_fee_rate_cap
@@ -1537,34 +1535,17 @@ class CoinJoinSession:
                         f"fidelity bond UTXOs cannot be used in CoinJoins"
                     )
 
-                # Get the key for this address
-                key = self.wallet.get_key_for_address(utxo.address)
-                if not key:
-                    raise TransactionSigningError(f"Missing key for address {utxo.address}")
-
-                priv_key = key.private_key
-                pubkey_bytes = key.get_public_key_bytes(compressed=True)
-
-                # Create script code and sign
-                script_code = create_p2wpkh_script_code(pubkey_bytes)
-                signature = sign_p2wpkh_input(
-                    tx=tx,
-                    input_index=input_index,
-                    script_code=script_code,
-                    value=utxo.value,
-                    private_key=priv_key,
-                )
-
-                # Create witness stack
-                witness = create_witness_stack(signature, pubkey_bytes)
+                # Delegate key access and signing to the wallet so private keys
+                # never leave the wallet (issue #518).
+                signed = self.wallet.sign_input(tx, input_index, utxo)
 
                 signatures_info.append(
                     {
                         "txid": utxo.txid,
                         "vout": utxo.vout,
-                        "signature": signature.hex(),
-                        "pubkey": pubkey_bytes.hex(),
-                        "witness": [item.hex() for item in witness],
+                        "signature": signed.signature.hex(),
+                        "pubkey": signed.pubkey.hex(),
+                        "witness": [item.hex() for item in signed.witness],
                     }
                 )
 

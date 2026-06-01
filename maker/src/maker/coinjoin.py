@@ -28,9 +28,7 @@ from jmwallet.wallet.models import UTXOInfo
 from jmwallet.wallet.service import WalletService
 from jmwallet.wallet.signing import (
     TransactionSigningError,
-    create_p2wpkh_script_code,
     deserialize_transaction,
-    sign_p2wpkh_input,
 )
 from loguru import logger
 
@@ -690,26 +688,16 @@ class CoinJoinSession:
                         f"fidelity bond UTXOs cannot be used in CoinJoins"
                     )
 
-                key = self.wallet.get_key_for_address(utxo_info.address)
-                if not key:
-                    raise TransactionSigningError(f"Missing key for address {utxo_info.address}")
-
-                priv_key = key.private_key
-                pubkey_bytes = key.get_public_key_bytes(compressed=True)
+                # Delegate key access and signing to the wallet so private keys
+                # never leave the wallet (issue #518).
+                signed = self.wallet.sign_input(tx, input_index, utxo_info)
+                signature = signed.signature
+                pubkey_bytes = signed.pubkey
 
                 logger.debug(
                     f"Signing UTXO {txid}:{vout} at input_index={input_index}, "
                     f"value={utxo_info.value}, address={utxo_info.address}, "
                     f"pubkey={pubkey_bytes.hex()[:16]}..."
-                )
-
-                script_code = create_p2wpkh_script_code(pubkey_bytes)
-                signature = sign_p2wpkh_input(
-                    tx=tx,
-                    input_index=input_index,
-                    script_code=script_code,
-                    value=utxo_info.value,
-                    private_key=priv_key,
                 )
 
                 # Format as CScript: varint(sig_len) + sig + varint(pub_len) + pub

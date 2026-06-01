@@ -16,12 +16,8 @@ from loguru import logger
 
 from jmwallet.wallet.address import pubkey_to_p2wpkh_script
 from jmwallet.wallet.signing import (
-    create_p2wpkh_script_code,
-    create_p2wsh_witness_stack,
     deserialize_transaction,
     encode_varint,
-    sign_p2wpkh_input,
-    sign_p2wsh_input,
 )
 
 if TYPE_CHECKING:
@@ -270,45 +266,17 @@ def _sign_inputs(
     utxos: list[UTXOInfo],
     wallet: WalletService,
 ) -> list[list[bytes]]:
-    """Sign all inputs and return witness stacks."""
+    """Sign all inputs and return witness stacks.
+
+    Key access and signing are delegated to the wallet (issue #518) so private
+    keys never leave the wallet boundary.
+    """
     tx = deserialize_transaction(unsigned_tx)
     witnesses: list[list[bytes]] = []
 
     for i, utxo in enumerate(utxos):
-        key = wallet.get_key_for_address(utxo.address)
-        if not key:
-            msg = f"Missing signing key for address {utxo.address}"
-            raise ValueError(msg)
-
-        pubkey_bytes = key.get_public_key_bytes(compressed=True)
-
-        if utxo.is_timelocked and utxo.locktime is not None:
-            # P2WSH fidelity bond
-            from jmcore.btc_script import mk_freeze_script
-
-            witness_script = mk_freeze_script(pubkey_bytes.hex(), utxo.locktime)
-            signature = sign_p2wsh_input(
-                tx=tx,
-                input_index=i,
-                witness_script=witness_script,
-                value=utxo.value,
-                private_key=key.private_key,
-            )
-            witnesses.append(create_p2wsh_witness_stack(signature, witness_script))
-        elif utxo.is_p2wsh:
-            msg = f"Cannot sign P2WSH UTXO {utxo.txid}:{utxo.vout} — locktime not available"
-            raise ValueError(msg)
-        else:
-            # P2WPKH
-            script_code = create_p2wpkh_script_code(pubkey_bytes)
-            signature = sign_p2wpkh_input(
-                tx=tx,
-                input_index=i,
-                script_code=script_code,
-                value=utxo.value,
-                private_key=key.private_key,
-            )
-            witnesses.append([signature, pubkey_bytes])
+        signed = wallet.sign_input(tx, i, utxo)
+        witnesses.append(signed.witness)
 
     return witnesses
 
