@@ -6,6 +6,7 @@ import pytest
 
 from jmwallet.wallet.bip32 import HDKey, mnemonic_to_seed
 from jmwallet.wallet.signing import (
+    SIGHASH_DEFAULT,
     Transaction,
     TransactionSigningError,
     TxInput,
@@ -540,3 +541,102 @@ class TestP2WSHSigning:
 
         # Signatures should be different because script_code differs
         assert sig_p2wsh != sig_p2wpkh
+
+
+class TestP2TRScriptPathSigning:
+    """Tests for BIP342 Taproot script-path (Taproot fidelity bond) signing."""
+
+    LOCKTIME = 1700000000
+
+    @pytest.fixture
+    def bond_key(self, test_mnemonic):
+        """Derive a Taproot fidelity bond key: m/86'/0'/0'/2/0."""
+        master = HDKey.from_seed(mnemonic_to_seed(test_mnemonic))
+        return master.derive("m/86'/0'/0'/2/0")
+
+    @pytest.fixture
+    def bond(self, bond_key):
+        from jmcore.btc_script import derive_taproot_bond_address
+
+        xonly = bond_key.get_public_key_bytes(compressed=True)[1:]
+        return derive_taproot_bond_address(xonly, self.LOCKTIME, network="regtest")
+
+    def _spend_tx(self):
+        return Transaction(
+            version=2,
+            has_witness=True,
+            inputs=[
+                TxInput(txid_le=bytes(32), vout=0, scriptsig=b"", sequence=0xFFFFFFFE),
+            ],
+            outputs=[TxOutput(value=90000, script=bytes.fromhex("0014" + "00" * 20))],
+            locktime=self.LOCKTIME,
+            witnesses=[],
+        )
+
+    def test_sign_verify_script_path_roundtrip(self, bond_key, bond):
+        from jmwallet.wallet.signing import (
+            sign_p2tr_script_path_input,
+            verify_p2tr_script_path_signature,
+        )
+
+        tx = self._spend_tx()
+        priv = bond_key.private_key
+        xonly = bond_key.get_public_key_bytes(compressed=True)[1:]
+
+        sig = sign_p2tr_script_path_input(
+            tx, 0, [100000], [bond.scriptpubkey], priv, bond.tapleaf_script
+        )
+        assert len(sig) == 64
+        assert verify_p2tr_script_path_signature(
+            tx, 0, [100000], [bond.scriptpubkey], sig, xonly, bond.tapleaf_script
+        )
+
+    def test_script_path_sighash_differs_from_key_path(self, bond):
+        from jmcore.btc_script import TAPROOT_LEAF_VERSION, tapleaf_hash
+
+        from jmwallet.wallet.signing import compute_sighash_taproot
+
+        tx = self._spend_tx()
+        leaf_hash = tapleaf_hash(bond.tapleaf_script, TAPROOT_LEAF_VERSION)
+        key_path = compute_sighash_taproot(tx, 0, [100000], [bond.scriptpubkey], SIGHASH_DEFAULT)
+        script_path = compute_sighash_taproot(
+            tx, 0, [100000], [bond.scriptpubkey], SIGHASH_DEFAULT, tapleaf_hash=leaf_hash
+        )
+        assert key_path != script_path
+
+    def test_script_path_sighash_matches_bitcointx(self, bond):
+        """Pin the BIP342 script-path preimage to the bitcointx consensus ref."""
+        from bitcointx.core import CTransaction, CTxOut
+        from bitcointx.core.script import (
+            SIGVERSION_TAPSCRIPT,
+            CScript,
+            SIGHASH_Type,
+            SignatureHashSchnorr,
+        )
+        from jmcore.bitcoin import serialize_transaction
+        from jmcore.btc_script import TAPROOT_LEAF_VERSION, tapleaf_hash
+
+        from jmwallet.wallet.signing import compute_sighash_taproot
+
+        tx = self._spend_tx()
+        values = [100000]
+        scripts = [bond.scriptpubkey]
+        leaf_hash = tapleaf_hash(bond.tapleaf_script, TAPROOT_LEAF_VERSION)
+
+        ctx = CTransaction.deserialize(
+            serialize_transaction(tx.version, tx.inputs, tx.outputs, tx.locktime)
+        )
+        spent = [CTxOut(v, CScript(s)) for v, s in zip(values, scripts, strict=True)]
+
+        for hashtype in (0x00, 0x01, 0x02, 0x03, 0x81, 0x82, 0x83):
+            ref_type = None if hashtype == 0x00 else SIGHASH_Type(hashtype)
+            mine = compute_sighash_taproot(tx, 0, values, scripts, hashtype, tapleaf_hash=leaf_hash)
+            ref = SignatureHashSchnorr(
+                ctx,
+                0,
+                spent_outputs=spent,
+                hashtype=ref_type,
+                sigversion=SIGVERSION_TAPSCRIPT,
+                tapleaf_hash=leaf_hash,
+            )
+            assert bytes(mine) == bytes(ref), f"mismatch hashtype={hashtype:#04x}"

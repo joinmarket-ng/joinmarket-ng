@@ -235,10 +235,13 @@ def compute_sighash_taproot(
     prevouts_values: list[int],
     prevouts_scripts: list[bytes],
     sighash_type: int = SIGHASH_DEFAULT,
+    tapleaf_hash: bytes | None = None,
 ) -> bytes:
-    """Compute the BIP341 Taproot sighash for a key-path spend input.
+    """Compute the BIP341 Taproot sighash.
 
-    Only key-path spends are supported (no annex, no script path). All
+    Supports both key-path spends (``tapleaf_hash is None``) and BIP342
+    script-path spends (``tapleaf_hash`` is the 32-byte tapleaf hash of the
+    leaf being executed, used for fidelity-bond CLTV tapleaf spends). All
     prevout values and scriptPubKeys must be provided because Taproot commits
     to every spent output's amount and script.
     """
@@ -279,7 +282,8 @@ def compute_sighash_taproot(
     if (sighash_type & 0x03) not in (SIGHASH_NONE, SIGHASH_SINGLE):
         preimage += hash_outputs
 
-    spend_type = 0x00  # key-path, no annex
+    # spend_type = (ext_flag * 2) + annex_present. ext_flag=1 for script path.
+    spend_type = 0x02 if tapleaf_hash is not None else 0x00
     preimage += bytes([spend_type])
 
     if sighash_type & SIGHASH_ANYONECANPAY:
@@ -301,6 +305,12 @@ def compute_sighash_taproot(
             )
         else:
             preimage += b"\x00" * 32
+
+    if tapleaf_hash is not None:
+        # BIP342 script-path extension: tapleaf_hash || key_version || codesep_pos.
+        preimage += tapleaf_hash
+        preimage += bytes([0x00])  # key version
+        preimage += b"\xff\xff\xff\xff"  # codeseparator position (none)
 
     return tagged_hash("TapSighash", preimage)
 
@@ -354,6 +364,73 @@ def verify_p2tr_signature(
         return False
 
 
+def sign_p2tr_script_path_input(
+    tx: ParsedTransaction,
+    input_index: int,
+    prevouts_values: list[int],
+    prevouts_scripts: list[bytes],
+    private_key: PrivateKey,
+    tapleaf_script: bytes,
+    sighash_type: int = SIGHASH_DEFAULT,
+) -> bytes:
+    """Sign a P2TR BIP342 script-path spend, returning a Schnorr signature.
+
+    Used to spend a Taproot fidelity-bond CLTV tapleaf (JMP-0005). The signing
+    key is the bond's x-only key (no TapTweak is applied for script-path
+    spends). The caller builds the witness stack
+    ``[signature, tapleaf_script, control_block]``.
+    """
+    from jmcore.btc_script import TAPROOT_LEAF_VERSION, tapleaf_hash
+
+    leaf_hash = tapleaf_hash(tapleaf_script, TAPROOT_LEAF_VERSION)
+    sighash = compute_sighash_taproot(
+        tx,
+        input_index,
+        prevouts_values,
+        prevouts_scripts,
+        sighash_type,
+        tapleaf_hash=leaf_hash,
+    )
+    signature = private_key.sign_schnorr(sighash)
+    if sighash_type != SIGHASH_DEFAULT:
+        signature += bytes([sighash_type])
+    return signature
+
+
+def verify_p2tr_script_path_signature(
+    tx: ParsedTransaction,
+    input_index: int,
+    prevouts_values: list[int],
+    prevouts_scripts: list[bytes],
+    signature: bytes,
+    x_only_pubkey: bytes,
+    tapleaf_script: bytes,
+) -> bool:
+    """Verify a BIP342 Taproot script-path (Schnorr) signature."""
+    try:
+        from coincurve import PublicKeyXOnly
+        from jmcore.btc_script import TAPROOT_LEAF_VERSION, tapleaf_hash
+
+        if len(signature) == 65:
+            sighash_type = signature[-1]
+            raw_sig = signature[:64]
+        else:
+            sighash_type = SIGHASH_DEFAULT
+            raw_sig = signature
+        leaf_hash = tapleaf_hash(tapleaf_script, TAPROOT_LEAF_VERSION)
+        sighash = compute_sighash_taproot(
+            tx,
+            input_index,
+            prevouts_values,
+            prevouts_scripts,
+            sighash_type,
+            tapleaf_hash=leaf_hash,
+        )
+        return bool(PublicKeyXOnly(x_only_pubkey).verify(raw_sig, sighash))
+    except Exception:  # noqa: BLE001 - verification must never raise
+        return False
+
+
 # Re-export from jmcore for backward compatibility
 __all__ = [
     "SIGHASH_ALL",
@@ -376,8 +453,10 @@ __all__ = [
     "hash256",
     "read_varint",
     "sign_p2tr_input",
+    "sign_p2tr_script_path_input",
     "sign_p2wpkh_input",
     "sign_p2wsh_input",
+    "verify_p2tr_script_path_signature",
     "verify_p2tr_signature",
     "verify_p2wpkh_signature",
 ]
