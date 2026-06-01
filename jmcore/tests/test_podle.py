@@ -27,6 +27,7 @@ from jmcore.podle import (
     scalar_mult_g,
     serialize_revelation,
     verify_podle,
+    verify_podle_binding,
 )
 
 
@@ -788,3 +789,70 @@ class TestDeserializeRevelationEdgeCases:
         wire = "a|b|c|d|e|f"
         parsed = deserialize_revelation(wire)
         assert parsed is None
+
+
+class TestVerifyPodleBinding:
+    """Tests for binding a PoDLE pubkey P to a UTXO scriptPubKey."""
+
+    @staticmethod
+    def _pubkey(secret: int = 12345) -> bytes:
+        return scalar_mult_g(secret).format(compressed=True)
+
+    def test_p2wpkh_binding_matches(self) -> None:
+        from jmcore.bitcoin import hash160
+
+        p = self._pubkey()
+        spk = b"\x00\x14" + hash160(p)
+        assert verify_podle_binding(p, spk) == (True, "")
+        # hex form is accepted too
+        assert verify_podle_binding(p, spk.hex()) == (True, "")
+
+    def test_p2wpkh_binding_mismatch(self) -> None:
+        p = self._pubkey()
+        spk = b"\x00\x14" + b"\xab" * 20
+        bound, err = verify_podle_binding(p, spk)
+        assert not bound
+        assert "P2WPKH" in err
+
+    def test_p2tr_binding_matches(self) -> None:
+        p = self._pubkey(67890)
+        spk = b"\x51\x20" + p[1:]
+        assert verify_podle_binding(p, spk) == (True, "")
+
+    def test_p2tr_binding_mismatch(self) -> None:
+        p = self._pubkey(67890)
+        spk = b"\x51\x20" + b"\xcd" * 32
+        bound, err = verify_podle_binding(p, spk)
+        assert not bound
+        assert "P2TR" in err
+
+    def test_p2pkh_binding_matches(self) -> None:
+        from jmcore.bitcoin import hash160
+
+        p = self._pubkey(222)
+        spk = b"\x76\xa9\x14" + hash160(p) + b"\x88\xac"
+        assert verify_podle_binding(p, spk) == (True, "")
+
+    def test_p2sh_p2wpkh_binding_matches(self) -> None:
+        from jmcore.bitcoin import hash160
+
+        p = self._pubkey(333)
+        redeem = b"\x00\x14" + hash160(p)
+        spk = b"\xa9\x14" + hash160(redeem) + b"\x87"
+        assert verify_podle_binding(p, spk) == (True, "")
+
+    def test_unsupported_script_type_rejected(self) -> None:
+        p = self._pubkey()
+        bound, err = verify_podle_binding(p, b"\x6a\x04dead")
+        assert not bound
+        assert "Unsupported" in err
+
+    def test_invalid_pubkey_length_rejected(self) -> None:
+        bound, err = verify_podle_binding(b"\x02" * 32, b"\x00\x14" + b"\x00" * 20)
+        assert not bound
+        assert "length" in err
+
+    def test_invalid_hex_scriptpubkey_rejected(self) -> None:
+        bound, err = verify_podle_binding(self._pubkey(), "zz")
+        assert not bound
+        assert "hex" in err

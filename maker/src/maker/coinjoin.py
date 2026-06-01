@@ -18,7 +18,7 @@ from typing import Any
 
 from jmcore.encryption import CryptoSession
 from jmcore.models import NetworkType, Offer
-from jmcore.podle import parse_podle_revelation, verify_podle
+from jmcore.podle import parse_podle_revelation, verify_podle, verify_podle_binding
 from jmcore.protocol import (
     UTXOMetadata,
     format_utxo_list,
@@ -358,6 +358,9 @@ class CoinJoinSession:
 
                 taker_utxo_value = result.value
                 taker_utxo_confirmations = result.confirmations
+                # verify_utxo_with_metadata confirmed this scriptpubkey matches
+                # the on-chain output, so it is authoritative for binding.
+                verified_scriptpubkey: str | None = taker_scriptpubkey
                 logger.debug(f"Neutrino-verified taker's UTXO: {utxo_txid}:{utxo_vout}")
             else:
                 # Full node: direct UTXO lookup
@@ -368,6 +371,28 @@ class CoinJoinSession:
 
                 taker_utxo_value = taker_utxo.value
                 taker_utxo_confirmations = taker_utxo.confirmations
+                verified_scriptpubkey = taker_utxo.scriptpubkey
+
+            # Bind the PoDLE public key P to the UTXO's scriptPubKey. Without
+            # this a taker could present a valid PoDLE for a key it owns while
+            # referencing a stranger's UTXO. The scriptpubkey used here is the
+            # authoritative on-chain value (full node lookup, or neutrino
+            # metadata already confirmed against the chain).
+            if verified_scriptpubkey:
+                bound, bind_err = verify_podle_binding(parsed_rev["P"], verified_scriptpubkey)
+                if not bound:
+                    logger.warning(
+                        f"PoDLE binding failed for {self.taker_nick}: {bind_err} "
+                        f"(utxo={utxo_txid[:16]}...:{utxo_vout})"
+                    )
+                    return False, {"error": f"PoDLE binding failed: {bind_err}"}
+                logger.debug("PoDLE bound to UTXO scriptpubkey ✓")
+            else:
+                logger.warning(
+                    f"No scriptpubkey available to bind PoDLE for "
+                    f"{utxo_txid[:16]}...:{utxo_vout}; rejecting"
+                )
+                return False, {"error": "Could not verify PoDLE binding to UTXO"}
 
             if taker_utxo_confirmations < self.taker_utxo_age:
                 logger.debug(
