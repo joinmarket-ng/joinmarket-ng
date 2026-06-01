@@ -49,6 +49,9 @@ def mock_wallet():
     wallet.get_change_address = Mock(return_value="bcrt1qchange")
     wallet.get_key_for_address = Mock()
     wallet.select_utxos = Mock(return_value=[make_utxo(txid_char="a", address="bcrt1qtest1")])
+    # Synchronous methods: keep them off AsyncMock so they do not leak
+    # unawaited coroutines when called without await in production code.
+    wallet.reserve_coinjoin_inputs = Mock(return_value=True)
     wallet.close = AsyncMock()
     wallet.wallet_fingerprint = "deadbeef"
     return wallet
@@ -65,6 +68,7 @@ def mock_backend():
     backend.broadcast_transaction = AsyncMock(return_value="txid123")
     # can_provide_neutrino_metadata is a synchronous method, not async
     backend.can_provide_neutrino_metadata = Mock(return_value=True)
+    backend.can_estimate_fee = Mock(return_value=True)
     return backend
 
 
@@ -685,6 +689,7 @@ class TestSweepCjAmountPreservation:
         wallet.get_change_address = Mock(return_value="bcrt1qchange")
         wallet.get_key_for_address = Mock()
         wallet.select_utxos = Mock(return_value=sweep_utxos)
+        wallet.reserve_coinjoin_inputs = Mock(return_value=True)
         wallet.close = AsyncMock()
         return wallet
 
@@ -709,6 +714,7 @@ class TestSweepCjAmountPreservation:
         backend.broadcast_transaction = AsyncMock(return_value="txid123")
         backend.can_provide_neutrino_metadata = Mock(return_value=False)
         backend.requires_neutrino_metadata = Mock(return_value=False)
+        backend.can_estimate_fee = Mock(return_value=True)
         return backend
 
     @pytest.fixture
