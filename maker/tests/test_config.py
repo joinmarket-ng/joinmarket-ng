@@ -395,6 +395,36 @@ class TestBuildMakerConfig:
         assert config.offer_type == OfferType.SW0_RELATIVE
         assert config.cj_fee_relative == settings.maker.cj_fee_relative
 
+    def test_segwit_offer_uses_p2wpkh_wallet(self) -> None:
+        """A native segwit offer type produces a p2wpkh wallet."""
+        from jmcore.settings import JoinMarketSettings
+
+        from maker.cli import build_maker_config
+
+        settings = JoinMarketSettings()
+        config = build_maker_config(
+            settings=settings,
+            mnemonic=TEST_MNEMONIC,
+            passphrase="",
+        )
+        assert config.address_type == "p2wpkh"
+
+    def test_taproot_offer_uses_p2tr_wallet(self) -> None:
+        """A tr0 offer type forces a taproot (p2tr) wallet (JMP-0005)."""
+        from jmcore.settings import JoinMarketSettings
+
+        from maker.cli import build_maker_config
+
+        settings = JoinMarketSettings()
+        settings.maker.offer_type = "tr0reloffer"
+        config = build_maker_config(
+            settings=settings,
+            mnemonic=TEST_MNEMONIC,
+            passphrase="",
+        )
+        assert config.offer_type == OfferType.TR0_RELATIVE
+        assert config.address_type == "p2tr"
+
     def test_no_fidelity_bond_sets_flag(self) -> None:
         """Test that no_fidelity_bond=True is stored in the config."""
         from jmcore.settings import JoinMarketSettings

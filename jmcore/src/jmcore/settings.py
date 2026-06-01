@@ -355,6 +355,13 @@ class WalletSettings(BaseModel):
         le=10,
         description="Number of mixdepths (privacy compartments)",
     )
+    address_type: str = Field(
+        default="p2wpkh",
+        description=(
+            "Wallet output script type: 'p2wpkh' (native segwit, BIP84) or "
+            "'p2tr' (taproot, BIP86). Determines deposit and change address format."
+        ),
+    )
     gap_limit: int = Field(
         default=20,
         ge=6,
@@ -437,6 +444,14 @@ class WalletSettings(BaseModel):
         default=None,
         description="BIP39 passphrase (13th/25th word). For security, prefer BIP39_PASSPHRASE env var.",
     )
+
+    @field_validator("address_type")
+    @classmethod
+    def validate_address_type(cls, v: str) -> str:
+        """Only native segwit (p2wpkh) and taproot (p2tr) wallets are supported."""
+        if v not in ("p2wpkh", "p2tr"):
+            raise ValueError(f"Unsupported wallet address_type: {v!r} (use 'p2wpkh' or 'p2tr')")
+        return v
 
 
 class NotificationSettings(BaseModel):
@@ -564,7 +579,10 @@ class MakerSettings(BaseModel):
     )
     offer_type: str = Field(
         default="sw0reloffer",
-        description="Offer type: sw0reloffer (relative) or sw0absoffer (absolute)",
+        description=(
+            "Offer type: sw0reloffer/sw0absoffer (native segwit) or "
+            "tr0reloffer/tr0absoffer (taproot, BIP86; see JMP-0005)"
+        ),
     )
     cj_fee_relative: str = Field(
         default="0.00002",
@@ -721,6 +739,15 @@ class MakerSettings(BaseModel):
 class TakerSettings(BaseModel):
     """Taker-specific settings."""
 
+    preferred_offer_type: str = Field(
+        default="sw0reloffer",
+        description=(
+            "Preferred CoinJoin output type. sw0reloffer/sw0absoffer selects "
+            "native segwit makers; tr0reloffer/tr0absoffer selects taproot "
+            "(BIP86) makers (see JMP-0005). The taker accepts both the absolute "
+            "and relative variants of the chosen output script family."
+        ),
+    )
     counterparty_count: int | None = Field(
         default=None,
         ge=1,

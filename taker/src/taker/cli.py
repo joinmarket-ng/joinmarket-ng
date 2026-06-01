@@ -16,7 +16,7 @@ from typing import Annotated, Any
 
 import typer
 from jmcore.cli_common import resolve_mnemonic, setup_cli
-from jmcore.models import NetworkType
+from jmcore.models import NetworkType, OfferType
 from jmcore.notifications import get_notifier
 from jmcore.paths import remove_nick_state, write_nick_state
 from jmcore.settings import (
@@ -230,6 +230,7 @@ def build_taker_config(
         mixdepth_count=settings.wallet.mixdepth_count,
         gap_limit=settings.wallet.gap_limit,
         scan_range=settings.wallet.scan_range,
+        address_type=settings.wallet.address_type,
         dust_threshold=settings.wallet.dust_threshold,
         smart_scan=settings.wallet.smart_scan,
         background_full_rescan=settings.wallet.background_full_rescan,
@@ -257,6 +258,7 @@ def build_taker_config(
         taker_utxo_age=settings.taker.taker_utxo_age,
         taker_utxo_retries=settings.taker.taker_utxo_retries,
         taker_utxo_amtpercent=settings.taker.taker_utxo_amtpercent,
+        preferred_offer_type=OfferType(settings.taker.preferred_offer_type),
     )
 
 
@@ -571,6 +573,7 @@ async def _run_coinjoin(
         gap_limit=config.gap_limit,
         scan_range=config.scan_range,
         data_dir=config.data_dir,
+        address_type=config.address_type,
     )
 
     # Create confirmation callback
@@ -852,6 +855,7 @@ async def _run_tumble(
         gap_limit=config.gap_limit,
         scan_range=config.scan_range,
         data_dir=config.data_dir,
+        address_type=config.address_type,
     )
 
     # Create taker

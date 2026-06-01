@@ -17,7 +17,7 @@ from typing import Annotated, Any
 import typer
 from jmcore.cli_common import resolve_mnemonic, setup_cli
 from jmcore.config import TorControlConfig, detect_tor_cookie_path
-from jmcore.models import NetworkType, OfferType
+from jmcore.models import NetworkType, OfferType, offer_output_script_type
 from jmcore.notifications import get_notifier
 from jmcore.paths import remove_nick_state, write_nick_state
 from jmcore.settings import (
@@ -265,7 +265,8 @@ def build_maker_config(
         except ValueError:
             raise ValueError(
                 f"Invalid offer_type in config: {settings.maker.offer_type}. "
-                "Must be one of: sw0reloffer, sw0absoffer, swreloffer, swabsoffer"
+                "Must be one of: sw0reloffer, sw0absoffer, swreloffer, swabsoffer, "
+                "tr0reloffer, tr0absoffer"
             )
         actual_cj_fee_relative = settings.maker.cj_fee_relative
         actual_cj_fee_absolute = settings.maker.cj_fee_absolute
@@ -320,6 +321,12 @@ def build_maker_config(
             "--fidelity-bond-locktime"
         )
 
+    # Derive wallet address type from the offer's output script family so a
+    # maker advertising taproot (tr0) offers serves taproot CoinJoin/change
+    # outputs. This overrides the generic wallet.address_type setting to keep
+    # the wallet consistent with the advertised offer type.
+    effective_address_type = offer_output_script_type(parsed_offer_type)
+
     return MakerConfig(
         mnemonic=SecretStr(mnemonic),
         passphrase=SecretStr(passphrase),
@@ -336,6 +343,7 @@ def build_maker_config(
         mixdepth_count=settings.wallet.mixdepth_count,
         gap_limit=settings.wallet.gap_limit,
         scan_range=settings.wallet.scan_range,
+        address_type=effective_address_type,
         dust_threshold=settings.wallet.dust_threshold,
         smart_scan=settings.wallet.smart_scan,
         background_full_rescan=settings.wallet.background_full_rescan,
@@ -423,6 +431,7 @@ def create_wallet_service(config: MakerConfig) -> WalletService:
         scan_range=config.scan_range,
         passphrase=config.passphrase.get_secret_value(),
         data_dir=config.data_dir,
+        address_type=config.address_type,
     )
     return wallet
 
