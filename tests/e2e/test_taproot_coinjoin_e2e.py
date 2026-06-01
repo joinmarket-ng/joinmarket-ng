@@ -269,3 +269,90 @@ async def test_coinjoin_spends_silent_payment_input() -> None:
     await rpc_call("generatetoaddress", [1, _sink_address()])
     confirmed = await rpc_call("getrawtransaction", [txid, True])
     assert confirmed.get("confirmations", 0) >= 1
+
+
+@pytest.mark.asyncio
+async def test_taproot_fidelity_bond_script_path_spend_accepted() -> None:
+    """A Taproot fidelity bond is spendable via its CLTV tapleaf (BIP342).
+
+    Proves the in-tree script-path signer produces a consensus-valid witness
+    ``[signature, tapleaf_script, control_block]`` for a bond whose only spend
+    path is the timelocked tapscript leaf committed under the BIP341 NUMS
+    internal key.
+    """
+    from jmcore.btc_script import derive_taproot_bond_address
+    from jmwallet.wallet.signing import sign_p2tr_script_path_input
+
+    # Bond key at the JMP-0005 taproot bond path m/86'/coin'/0'/2/timenumber.
+    bond_key = HDKey.from_seed(mnemonic_to_seed(_MAKER_MNEMONIC, "")).derive(
+        "m/86'/1'/0'/2/0"
+    )
+    bond_priv = bond_key.private_key
+    bond_xonly = bond_key.get_public_key_bytes(compressed=True)[1:]
+
+    # Locktime safely below the regtest median-time-past so CLTV passes.
+    mtp = (await rpc_call("getblockchaininfo"))["mediantime"]
+    locktime = mtp - 7 * 24 * 3600
+    bond = derive_taproot_bond_address(bond_xonly, locktime, network="regtest")
+
+    # Fund the bond output from a matured coinbase (P2WPKH key-path).
+    funder = PrivateKey((9).to_bytes(32, "big"))
+    funder_pub = funder.public_key.format(compressed=True)
+    cb_txid, cb_value, _ = await _mature_coinbase_to(
+        pubkey_to_p2wpkh_address(funder_pub, "regtest")
+    )
+    bond_value = cb_value - _FEE
+    fund_in = TxInput.from_hex(cb_txid, 0, value=cb_value)
+    fund_out = TxOutput(value=bond_value, script=bond.scriptpubkey)
+    funding_tx = ParsedTransaction(
+        version=2,
+        has_witness=True,
+        inputs=[fund_in],
+        outputs=[fund_out],
+        locktime=0,
+        witnesses=[],
+    )
+    fund_sig = sign_p2wpkh_input(
+        funding_tx, 0, create_p2wpkh_script_code(funder_pub), cb_value, funder, 1
+    )
+    funding_raw = serialize_transaction(
+        2, [fund_in], [fund_out], 0, witnesses=[[fund_sig, funder_pub]]
+    )
+    bond_txid = await rpc_call("sendrawtransaction", [funding_raw.hex()])
+    await rpc_call("generatetoaddress", [1, _sink_address()])
+
+    # Spend the bond. CLTV requires nLockTime >= locktime and a non-final
+    # input sequence.
+    spend_in = TxInput.from_hex(bond_txid, 0, value=bond_value, sequence=0xFFFFFFFE)
+    spend_out = TxOutput(
+        value=bond_value - _FEE,
+        script=create_p2tr_scriptpubkey(bond_key.get_p2tr_output_xonly()),
+    )
+    spend_tx = ParsedTransaction(
+        version=2,
+        has_witness=True,
+        inputs=[spend_in],
+        outputs=[spend_out],
+        locktime=locktime,
+        witnesses=[],
+    )
+    sig = sign_p2tr_script_path_input(
+        spend_tx,
+        0,
+        [bond_value],
+        [bond.scriptpubkey],
+        bond_priv,
+        bond.tapleaf_script,
+        SIGHASH_DEFAULT,
+    )
+    witness = [sig, bond.tapleaf_script, bond.control_block]
+    raw = serialize_transaction(
+        2, [spend_in], [spend_out], locktime, witnesses=[witness]
+    )
+    accept = await rpc_call("testmempoolaccept", [[raw.hex()]])
+    assert accept[0]["allowed"] is True, accept
+
+    txid = await rpc_call("sendrawtransaction", [raw.hex()])
+    await rpc_call("generatetoaddress", [1, _sink_address()])
+    confirmed = await rpc_call("getrawtransaction", [txid, True])
+    assert confirmed.get("confirmations", 0) >= 1
