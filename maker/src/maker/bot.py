@@ -401,7 +401,11 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
                     )
             # Option 2: Load from registry (default)
             else:
-                bond_registry = load_registry(resolved_data_dir, self.wallet.wallet_fingerprint)
+                bond_registry = load_registry(
+                    resolved_data_dir,
+                    self.wallet.wallet_fingerprint,
+                    allow_legacy_fallback=False,
+                )
                 network_bonds = [
                     bond for bond in bond_registry.bonds if bond.network == self.config.network
                 ]
@@ -460,7 +464,11 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
             if self.config.fidelity_bond_index is None and fidelity_bond_addresses:
                 from jmwallet.wallet.bond_registry import save_registry
 
-                bond_registry = load_registry(resolved_data_dir, self.wallet.wallet_fingerprint)
+                bond_registry = load_registry(
+                    resolved_data_dir,
+                    self.wallet.wallet_fingerprint,
+                    allow_legacy_fallback=False,
+                )
                 for bond in bond_registry.bonds:
                     # Find the UTXO for this bond address in mixdepth 0
                     bond_utxo = next(

@@ -226,27 +226,12 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin, Wal
         next open. The legacy file is removed once empty.
         """
         from jmwallet.wallet.bond_registry import (
-            FidelityBondInfo,
+            make_wallet_ownership_predicate,
             migrate_legacy_registry,
         )
 
-        def _matches(bond: FidelityBondInfo) -> bool:
-            # Prefer re-deriving from the explicit BIP32 path stored on
-            # the bond; this covers cold-wallet/external pubkey entries
-            # that are not on the canonical fidelity-bond branch as well.
-            try:
-                key = self.master_key.derive(bond.path)
-            except Exception:
-                # Path malformed or not derivable; fall back to the
-                # canonical fidelity-bond derivation by locktime.
-                try:
-                    key = self.get_fidelity_bond_key(bond.index, bond.locktime)
-                except Exception:
-                    return False
-            derived_pubkey = key.get_public_key_bytes(compressed=True).hex()
-            return derived_pubkey == bond.pubkey
-
-        migrate_legacy_registry(data_dir, self.wallet_fingerprint, _matches)
+        predicate = make_wallet_ownership_predicate(self.master_key, self.root_path)
+        migrate_legacy_registry(data_dir, self.wallet_fingerprint, predicate)
 
     # -- Key derivation & address generation (Group A) ----------------------
 

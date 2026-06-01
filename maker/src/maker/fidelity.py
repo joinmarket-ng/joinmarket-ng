@@ -101,7 +101,9 @@ async def find_fidelity_bonds(
         from jmwallet.wallet.bond_registry import load_registry
 
         if wallet.data_dir is not None:
-            registry = load_registry(wallet.data_dir, wallet.wallet_fingerprint)
+            registry = load_registry(
+                wallet.data_dir, wallet.wallet_fingerprint, allow_legacy_fallback=False
+            )
             logger.debug(f"Loaded bond registry with {len(registry.bonds)} bonds")
     except Exception as e:
         logger.debug(f"Could not load bond registry: {e}")

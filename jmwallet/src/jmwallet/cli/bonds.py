@@ -293,8 +293,13 @@ async def _list_fidelity_bonds(
         raise typer.Exit(1)
 
     try:
-        # Load known bonds from registry for optimized scanning
-        bond_registry = load_registry(data_dir, wallet.wallet_fingerprint)
+        # Load known bonds from registry for optimized scanning. The
+        # WalletService open above already ran the wallet-aware legacy
+        # migration, so the per-wallet file is authoritative; disable the
+        # legacy fallback to avoid copying foreign bonds on save (#492).
+        bond_registry = load_registry(
+            data_dir, wallet.wallet_fingerprint, allow_legacy_fallback=False
+        )
         fidelity_bond_addresses: list[tuple[str, int, int]] = []
         network_bonds = [bond for bond in bond_registry.bonds if bond.network == network]
         if network_bonds:
@@ -534,6 +539,8 @@ def generate_bond_address(
         create_bond_info,
         get_registry_path,
         load_registry,
+        make_wallet_ownership_predicate,
+        migrate_legacy_registry,
         save_registry,
     )
     from jmwallet.wallet.service import FIDELITY_BOND_BRANCH
@@ -543,12 +550,13 @@ def generate_bond_address(
     wallet_fingerprint = master_key.derive("m/0").fingerprint.hex()
 
     coin_type = 0 if resolved_network == "mainnet" else 1
+    root_path = f"m/84'/{coin_type}'"
 
     # Compute the timenumber from the locktime (this is the BIP32 child index)
     from jmcore.timenumber import timestamp_to_timenumber
 
     timenumber = timestamp_to_timenumber(locktime)
-    path = f"m/84'/{coin_type}'/0'/{FIDELITY_BOND_BRANCH}/{timenumber}"
+    path = f"{root_path}/0'/{FIDELITY_BOND_BRANCH}/{timenumber}"
 
     key = master_key.derive(path)
     pubkey_hex = key.get_public_key_bytes(compressed=True).hex()
@@ -563,7 +571,16 @@ def generate_bond_address(
     saved = False
     existing = False
     if not no_save:
-        registry = load_registry(resolved_data_dir, wallet_fingerprint)
+        # This command does not open a WalletService, so run the one-shot
+        # legacy migration here to claim this wallet's own bonds out of the
+        # shared registry. Then load with the legacy fallback disabled so
+        # foreign bonds are never copied into this wallet's file (#492).
+        migrate_legacy_registry(
+            resolved_data_dir,
+            wallet_fingerprint,
+            make_wallet_ownership_predicate(master_key, root_path),
+        )
+        registry = load_registry(resolved_data_dir, wallet_fingerprint, allow_legacy_fallback=False)
         existing_bond = registry.get_bond_by_address(address)
         if existing_bond:
             existing = True
@@ -748,6 +765,8 @@ def import_bond(
         create_bond_info,
         get_registry_path,
         load_registry,
+        make_wallet_ownership_predicate,
+        migrate_legacy_registry,
         save_registry,
     )
     from jmwallet.wallet.service import FIDELITY_BOND_BRANCH
@@ -757,15 +776,23 @@ def import_bond(
     wallet_fingerprint = master_key.derive("m/0").fingerprint.hex()
 
     coin_type = 0 if resolved_network == "mainnet" else 1
-    deriv_path = f"m/84'/{coin_type}'/0'/{FIDELITY_BOND_BRANCH}/{timenumber}"
+    root_path = f"m/84'/{coin_type}'"
+    deriv_path = f"{root_path}/0'/{FIDELITY_BOND_BRANCH}/{timenumber}"
 
     key = master_key.derive(deriv_path)
     pubkey_hex = key.get_public_key_bytes(compressed=True).hex()
     witness_script = mk_freeze_script(pubkey_hex, locktime)
     address = script_to_p2wsh_address(witness_script, resolved_network)
 
-    # Save to registry
-    registry = load_registry(resolved_data_dir, wallet_fingerprint)
+    # Save to registry. This command does not open a WalletService, so run
+    # the one-shot legacy migration here and load with the legacy fallback
+    # disabled to avoid copying foreign bonds into this wallet's file (#492).
+    migrate_legacy_registry(
+        resolved_data_dir,
+        wallet_fingerprint,
+        make_wallet_ownership_predicate(master_key, root_path),
+    )
+    registry = load_registry(resolved_data_dir, wallet_fingerprint, allow_legacy_fallback=False)
     existing = registry.get_bond_by_address(address)
     if existing:
         print(f"\nBond already in registry (created: {existing.created_at})")
@@ -990,8 +1017,12 @@ async def _recover_bonds_async(
         )
         print()
 
-        # Load registry and add discovered bonds
-        registry = load_registry(backend_settings.data_dir, wallet.wallet_fingerprint)
+        # Load registry and add discovered bonds. Migration ran at wallet
+        # open, so disable the legacy fallback to avoid persisting foreign
+        # bonds on save (#492).
+        registry = load_registry(
+            backend_settings.data_dir, wallet.wallet_fingerprint, allow_legacy_fallback=False
+        )
         new_bonds = 0
 
         from jmcore.bitcoin import format_amount

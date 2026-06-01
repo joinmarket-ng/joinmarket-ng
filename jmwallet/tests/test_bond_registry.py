@@ -750,6 +750,42 @@ class TestPerWalletPartitioning:
         loaded = load_registry(tmp_path, "deadbeef")
         assert [b.address for b in loaded.bonds] == ["bc1qlegacy"]
 
+    def test_load_no_legacy_fallback_returns_empty(self, tmp_path: Path) -> None:
+        # Write paths pass allow_legacy_fallback=False so foreign bonds in
+        # the shared legacy file are never copied into a per-wallet file on
+        # a subsequent save (issue #492 regression).
+        legacy_registry = BondRegistry()
+        legacy_registry.add_bond(self._make_bond("bc1qforeign1"))
+        legacy_registry.add_bond(self._make_bond("bc1qforeign2"))
+        save_registry(legacy_registry, tmp_path)
+
+        loaded = load_registry(tmp_path, "deadbeef", allow_legacy_fallback=False)
+        assert loaded.bonds == []
+
+    def test_write_path_does_not_leak_foreign_legacy_bonds(self, tmp_path: Path) -> None:
+        # Reproduces the reported bug: a fresh wallet generating a bond must
+        # not inherit other wallets' bonds from the shared legacy file.
+        legacy_registry = BondRegistry()
+        for addr in ("bc1qforeign1", "bc1qforeign2", "bc1qforeign3"):
+            legacy_registry.add_bond(self._make_bond(addr))
+        save_registry(legacy_registry, tmp_path)
+
+        # Simulate the (fixed) write flow: load with the fallback disabled,
+        # add the new bond, save to the per-wallet file.
+        registry = load_registry(tmp_path, "deadbeef", allow_legacy_fallback=False)
+        registry.add_bond(self._make_bond("bc1qmynewbond"))
+        save_registry(registry, tmp_path, "deadbeef")
+
+        written = load_registry(tmp_path, "deadbeef", allow_legacy_fallback=False)
+        assert [b.address for b in written.bonds] == ["bc1qmynewbond"]
+        # The legacy file is untouched (still owned by the other wallets).
+        legacy_after = load_registry(tmp_path)
+        assert {b.address for b in legacy_after.bonds} == {
+            "bc1qforeign1",
+            "bc1qforeign2",
+            "bc1qforeign3",
+        }
+
     def test_invalid_fingerprint_falls_back_to_legacy_path(self, tmp_path: Path) -> None:
         # Non-hex strings must not be embedded in the filename; they
         # silently fall back to the legacy shared path to avoid creating

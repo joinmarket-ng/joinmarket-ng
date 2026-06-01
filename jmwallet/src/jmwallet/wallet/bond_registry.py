@@ -13,9 +13,13 @@ import tempfile
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from loguru import logger
 from pydantic import BaseModel
+
+if TYPE_CHECKING:
+    from jmwallet.wallet.bip32 import HDKey
 
 
 class FidelityBondInfo(BaseModel):
@@ -240,7 +244,12 @@ def get_registry_path(data_dir: Path, fingerprint: str | None = None) -> Path:
     return data_dir / f"fidelity_bonds_{safe}.json"
 
 
-def load_registry(data_dir: Path, fingerprint: str | None = None) -> BondRegistry:
+def load_registry(
+    data_dir: Path,
+    fingerprint: str | None = None,
+    *,
+    allow_legacy_fallback: bool = True,
+) -> BondRegistry:
     """
     Load the bond registry from disk.
 
@@ -248,16 +257,25 @@ def load_registry(data_dir: Path, fingerprint: str | None = None) -> BondRegistr
         data_dir: Data directory path
         fingerprint: Optional 8-char hex wallet fingerprint. When given the
             per-wallet ``fidelity_bonds_<fp>.json`` file is read.
+        allow_legacy_fallback: When ``True`` (the default) and a per-wallet
+            file is requested but missing, the legacy shared
+            ``fidelity_bonds.json`` is read as a **read-only display**
+            fallback. This MUST be ``False`` on any code path that will
+            subsequently :func:`save_registry` the result back to the
+            per-wallet file: the legacy file is not filtered by ownership,
+            so persisting it would copy *other wallets'* bonds into this
+            wallet's registry (issue #492 regression). Wallet-aware
+            migration via :func:`migrate_legacy_registry` is the only safe
+            way to move legacy entries into a per-wallet file.
 
     Behavior:
-        If a per-wallet file is requested but does not exist, the legacy
-        shared ``fidelity_bonds.json`` is read as a read-only fallback so
-        upgrading users still see their bonds until the next write (which
-        will partition them per wallet via
-        :func:`migrate_legacy_registry`). The legacy file is **not**
-        filtered here: any bond it contains will appear under every
-        wallet's view. Wallet-aware migration must run before this is
-        relied upon for isolation.
+        If a per-wallet file is requested but does not exist and
+        ``allow_legacy_fallback`` is ``True``, the legacy shared
+        ``fidelity_bonds.json`` is read so upgrading users still see their
+        bonds for display until migration partitions them per wallet. The
+        legacy file is **not** filtered here: any bond it contains will
+        appear under every wallet's view, which is why writers must pass
+        ``allow_legacy_fallback=False`` and rely on migration instead.
 
     Returns:
         BondRegistry instance (empty if no registry file is found)
@@ -265,11 +283,12 @@ def load_registry(data_dir: Path, fingerprint: str | None = None) -> BondRegistr
     registry_path = get_registry_path(data_dir, fingerprint)
     if not registry_path.exists():
         # Fall back to legacy file when looking up a per-wallet path. This
-        # keeps `list-bonds` etc. working immediately after an upgrade,
-        # before any write has triggered migration. Reads are non-
-        # destructive and only the first save (via migrate_legacy_registry)
-        # actually partitions entries per wallet.
-        if fingerprint is not None:
+        # keeps read-only display (`registry-show`, offline `list-bonds`)
+        # working immediately after an upgrade, before any wallet open has
+        # triggered migration. It is intentionally suppressed on write
+        # paths (allow_legacy_fallback=False) because the legacy file is
+        # unfiltered and persisting it would leak other wallets' bonds.
+        if fingerprint is not None and allow_legacy_fallback:
             legacy_path = get_legacy_registry_path(data_dir)
             if legacy_path.exists():
                 registry_path = legacy_path
@@ -510,3 +529,44 @@ def migrate_legacy_registry(
         f"{per_wallet_path.name}; {len(remaining)} entry(ies) left in legacy file."
     )
     return len(claimed)
+
+
+def make_wallet_ownership_predicate(
+    master_key: HDKey, root_path: str
+) -> Callable[[FidelityBondInfo], bool]:
+    """Build the ``bond_belongs_to_wallet`` predicate for migration.
+
+    The predicate re-derives the expected compressed pubkey for a bond and
+    compares it to the bond's stored ``pubkey``. It first tries the bond's
+    explicit BIP32 ``path`` (covering external/cold entries that may not be
+    on the canonical fidelity-bond branch); if that path is not derivable it
+    falls back to the canonical fidelity-bond branch derived from the bond's
+    ``locktime`` (timenumber). Only bonds owned by ``master_key`` match, so
+    foreign legacy entries are never claimed.
+
+    This is shared by :class:`jmwallet.wallet.service.WalletService` and the
+    offline ``jm-wallet`` bond commands so both paths use identical
+    ownership rules.
+
+    Args:
+        master_key: The wallet's BIP32 master key.
+        root_path: The wallet's account root path (e.g. ``m/84'/0'``); used
+            to build the canonical fidelity-bond derivation path.
+    """
+    from jmwallet.wallet.constants import FIDELITY_BOND_BRANCH
+
+    def _matches(bond: FidelityBondInfo) -> bool:
+        try:
+            key = master_key.derive(bond.path)
+        except Exception:
+            try:
+                from jmcore.timenumber import timestamp_to_timenumber
+
+                timenumber = timestamp_to_timenumber(bond.locktime)
+                key = master_key.derive(f"{root_path}/0'/{FIDELITY_BOND_BRANCH}/{timenumber}")
+            except Exception:
+                return False
+        derived_pubkey = key.get_public_key_bytes(compressed=True).hex()
+        return derived_pubkey == bond.pubkey
+
+    return _matches

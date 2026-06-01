@@ -16,8 +16,11 @@ from jmwallet.wallet.bip32 import HDKey, mnemonic_to_seed
 from jmwallet.wallet.bond_registry import (
     BondRegistry,
     FidelityBondInfo,
+    create_bond_info,
     get_legacy_registry_path,
     load_registry,
+    make_wallet_ownership_predicate,
+    migrate_legacy_registry,
     save_registry,
 )
 from jmwallet.wallet.service import FIDELITY_BOND_BRANCH, WalletService
@@ -166,3 +169,95 @@ def test_reopening_wallet_is_idempotent(tmp_path: Path) -> None:
     assert svc2.wallet_fingerprint == fp
     second_view = load_registry(tmp_path, fp)
     assert [b.address for b in second_view.bonds] == ["bc1qonly"]
+
+
+def _offline_register_bond(tmp_path: Path, mnemonic: str, *, address: str, timenumber: int) -> str:
+    """Replicate the offline ``generate-bond-address`` / ``import-bond`` write
+    flow: derive the wallet identity, run the wallet-aware legacy migration,
+    load the per-wallet registry with the legacy fallback disabled, append the
+    new bond, and persist it. Returns the wallet fingerprint.
+    """
+    seed = mnemonic_to_seed(mnemonic)
+    master = HDKey.from_seed(seed)
+    fingerprint = master.derive("m/0").fingerprint.hex()
+    root_path = "m/84'/0'"  # mainnet
+
+    migrate_legacy_registry(
+        tmp_path, fingerprint, make_wallet_ownership_predicate(master, root_path)
+    )
+    registry = load_registry(tmp_path, fingerprint, allow_legacy_fallback=False)
+
+    path = f"{root_path}/0'/{FIDELITY_BOND_BRANCH}/{timenumber}"
+    pubkey_hex = master.derive(path).get_public_key_bytes(compressed=True).hex()
+    registry.add_bond(
+        create_bond_info(
+            address=address,
+            locktime=1893456000,
+            index=timenumber,
+            path=path,
+            pubkey_hex=pubkey_hex,
+            witness_script=b"\x00" * 50,
+            network="mainnet",
+        )
+    )
+    save_registry(registry, tmp_path, fingerprint)
+    return fingerprint
+
+
+def test_offline_bond_write_on_fresh_wallet_does_not_leak_foreign_bonds(
+    tmp_path: Path,
+) -> None:
+    """A brand-new wallet registering its first bond must not inherit bonds
+    belonging to other wallets from the shared legacy file (issue #492).
+
+    This is the exact scenario from the bug report: a new wallet creates one
+    fidelity bond yet its ``fidelity_bonds_<fp>.json`` ends up listing many
+    bonds copied from the unpartitioned ``fidelity_bonds.json``.
+    """
+    # Legacy file from older installs holds bonds owned by OTHER wallets.
+    legacy = BondRegistry()
+    legacy.add_bond(_bond_for(MNEMONIC_B, address="bc1qotherwallet", timenumber=0))
+    legacy.add_bond(
+        FidelityBondInfo(
+            address="bc1qexternal",
+            locktime=1893456000,
+            locktime_human="2030-01-01 00:00:00",
+            index=0,
+            path="external",
+            pubkey="02" + "ff" * 32,
+            witness_script_hex="00" * 50,
+            network="mainnet",
+            created_at="2025-01-01T00:00:00",
+        )
+    )
+    save_registry(legacy, tmp_path)
+
+    # Fresh wallet A (owns none of the legacy bonds) registers one bond.
+    fp_a = _offline_register_bond(tmp_path, MNEMONIC_A, address="bc1qnewbond", timenumber=5)
+
+    per_wallet = load_registry(tmp_path, fp_a, allow_legacy_fallback=False)
+    assert [b.address for b in per_wallet.bonds] == ["bc1qnewbond"], (
+        "Fresh wallet must only see the bond it just created, not foreign ones"
+    )
+
+    # Foreign bonds remain untouched in the legacy file.
+    legacy_after = load_registry(tmp_path)
+    assert {b.address for b in legacy_after.bonds} == {"bc1qotherwallet", "bc1qexternal"}
+
+
+def test_offline_bond_write_claims_own_legacy_bonds(tmp_path: Path) -> None:
+    """When the legacy file contains a bond owned by the writing wallet, the
+    offline write flow claims it (via migration) alongside the new bond, while
+    leaving other wallets' bonds behind."""
+    legacy = BondRegistry()
+    legacy.add_bond(_bond_for(MNEMONIC_A, address="bc1qmyoldbond", timenumber=0))
+    legacy.add_bond(_bond_for(MNEMONIC_B, address="bc1qotherwallet", timenumber=0))
+    save_registry(legacy, tmp_path)
+
+    fp_a = _offline_register_bond(tmp_path, MNEMONIC_A, address="bc1qmynewbond", timenumber=5)
+
+    per_wallet = load_registry(tmp_path, fp_a, allow_legacy_fallback=False)
+    assert {b.address for b in per_wallet.bonds} == {"bc1qmyoldbond", "bc1qmynewbond"}
+
+    legacy_after = load_registry(tmp_path)
+    assert [b.address for b in legacy_after.bonds] == ["bc1qotherwallet"]
