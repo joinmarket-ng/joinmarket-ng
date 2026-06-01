@@ -60,8 +60,8 @@ async def test_parse_descriptor_path(test_mnemonic):
         descriptors.append({"desc": desc_ext, "range": [0, 999]})
         descriptors.append({"desc": desc_int, "range": [0, 999]})
 
-        desc_to_path[desc_ext] = (mixdepth, 0)
-        desc_to_path[desc_int] = (mixdepth, 1)
+        desc_to_path[desc_ext] = (mixdepth, 0, "p2wpkh")
+        desc_to_path[desc_int] = (mixdepth, 1, "p2wpkh")
 
     # Get actual address for mixdepth 0, change 0, index 0
     wallet.get_address(0, 0, 0)  # Cache the address
@@ -76,10 +76,11 @@ async def test_parse_descriptor_path(test_mnemonic):
     result = wallet._parse_descriptor_path(simulated_desc, desc_to_path)
 
     assert result is not None, f"Failed to parse descriptor: {simulated_desc}"
-    mixdepth, change, index = result
+    mixdepth, change, index, script_type = result
     assert mixdepth == 0, f"Expected mixdepth 0, got {mixdepth}"
     assert change == 0, f"Expected change 0, got {change}"
     assert index == 0, f"Expected index 0, got {index}"
+    assert script_type == "p2wpkh", f"Expected p2wpkh, got {script_type}"
 
 
 @pytest.mark.asyncio
@@ -94,8 +95,8 @@ async def test_parse_descriptor_path_multiple_mixdepths(test_mnemonic):
         xpub = wallet.get_account_xpub(mixdepth)
         desc_ext = f"wpkh({xpub}/0/*)"
         desc_int = f"wpkh({xpub}/1/*)"
-        desc_to_path[desc_ext] = (mixdepth, 0)
-        desc_to_path[desc_int] = (mixdepth, 1)
+        desc_to_path[desc_ext] = (mixdepth, 0, "p2wpkh")
+        desc_to_path[desc_int] = (mixdepth, 1, "p2wpkh")
 
     # Test mixdepth 2, change 1, index 5
     test_mixdepth = 2
@@ -113,10 +114,11 @@ async def test_parse_descriptor_path_multiple_mixdepths(test_mnemonic):
     result = wallet._parse_descriptor_path(simulated_desc, desc_to_path)
 
     assert result is not None
-    mixdepth, change, index = result
+    mixdepth, change, index, script_type = result
     assert mixdepth == test_mixdepth
     assert change == test_change
     assert index == test_index
+    assert script_type == "p2wpkh"
 
 
 @pytest.mark.asyncio
