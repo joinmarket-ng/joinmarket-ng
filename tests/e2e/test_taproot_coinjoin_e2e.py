@@ -99,7 +99,12 @@ async def test_taproot_coinjoin_multi_party_accepted() -> None:
     )
 
     # CoinJoin shape: equal-value taproot CJ outputs + taproot change for each.
-    cj_amount = 1_000_000
+    # Derive the CJ amount from the actual coinbase values rather than hardcoding
+    # it: this suite shares a regtest node whose block height (and therefore
+    # coinbase subsidy) grows as other tests mine, so a fixed large amount would
+    # eventually exceed the available inputs and produce negative change.
+    cj_amount = (min(taker_val, maker_val) - _FEE) // 2
+    assert cj_amount > 1000, f"coinbase subsidy too small: {taker_val=} {maker_val=}"
     maker_change_xonly = maker.get_p2tr_output_xonly()  # reuse for brevity
     taker_change_xonly = taker.get_p2tr_output_xonly()
     cj_out_xonly = (
@@ -212,7 +217,8 @@ async def test_coinjoin_spends_silent_payment_input() -> None:
         maker.get_p2tr_address("regtest")
     )
 
-    cj_amount = 500_000
+    cj_amount = (min(sp_value, maker_val) - _FEE) // 2
+    assert cj_amount > 1000, f"inputs too small: {sp_value=} {maker_val=}"
     cj_dest_xonly = master.derive("m/86'/1'/0'/0/5").get_p2tr_output_xonly()
     change_xonly = master.derive("m/86'/1'/0'/0/6").get_p2tr_output_xonly()
 
