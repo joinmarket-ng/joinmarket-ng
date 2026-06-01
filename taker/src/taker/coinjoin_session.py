@@ -21,7 +21,7 @@ import asyncio
 import time
 from typing import TYPE_CHECKING, Any
 
-from jmcore.bitcoin import get_txid, parse_transaction
+from jmcore.bitcoin import address_to_scriptpubkey, get_txid, parse_transaction
 from jmcore.encryption import CryptoSession
 from jmcore.protocol import FEATURE_NEUTRINO_COMPAT, parse_utxo_list
 from jmwallet.history import (
@@ -33,6 +33,7 @@ from jmwallet.wallet.signing import (
     TransactionSigningError,
     create_p2wpkh_script_code,
     deserialize_transaction,
+    verify_p2tr_signature,
     verify_p2wpkh_signature,
 )
 from jmwallet.wallet.spend import enforce_fee_rate_cap
@@ -686,6 +687,7 @@ class CoinJoinSession:
                         vout = utxo_meta.vout
 
                         # Verify UTXO and get value/address
+                        scriptpubkey = ""
                         try:
                             if (
                                 self.backend.requires_neutrino_metadata()
@@ -701,6 +703,7 @@ class CoinJoinSession:
                                 if result.valid:
                                     value = result.value
                                     address = ""  # Not available from verification
+                                    scriptpubkey = utxo_meta.scriptpubkey or ""
                                     logger.debug(
                                         f"Neutrino-verified UTXO {txid}:{vout} = {value} sats"
                                     )
@@ -717,6 +720,7 @@ class CoinJoinSession:
                                 if utxo_info:
                                     value = utxo_info.value
                                     address = utxo_info.address
+                                    scriptpubkey = utxo_info.scriptpubkey or ""
                                 else:
                                     # Fallback: get raw transaction and parse it
                                     tx_info = await self.backend.get_transaction(txid)
@@ -724,6 +728,7 @@ class CoinJoinSession:
                                         parsed_tx = parse_transaction(tx_info.raw)
                                         if parsed_tx and len(parsed_tx.outputs) > vout:
                                             value = parsed_tx.outputs[vout].value
+                                            scriptpubkey = parsed_tx.outputs[vout].scriptpubkey
                                             try:
                                                 address = parsed_tx.outputs[vout].address(
                                                     self.config.network
@@ -751,6 +756,7 @@ class CoinJoinSession:
                                 "vout": vout,
                                 "value": value,
                                 "address": address,
+                                "scriptpubkey": scriptpubkey,
                             }
                         )
                         logger.debug(f"Added UTXO from {nick}: {txid}:{vout} = {value} sats")
@@ -1337,6 +1343,16 @@ class CoinJoinSession:
             txid_hex = tx_input.txid_le[::-1].hex()
             input_map[idx] = (txid_hex, tx_input.vout)
 
+        # Assemble the full prevout set (values + scriptPubKeys) for taproot
+        # signature verification. Falls back to empty lists if any prevout is
+        # unknown; taproot verification then simply fails for those inputs.
+        prevout_map = self._build_prevout_map()
+        try:
+            all_prevout_values, all_prevout_scripts = self._assemble_prevouts(tx, prevout_map)
+        except TransactionSigningError as exc:
+            logger.debug(f"Could not assemble full prevout set: {exc}")
+            all_prevout_values, all_prevout_scripts = [], []
+
         # Process responses
         for nick in list(self.maker_sessions.keys()):
             if nick in responses:
@@ -1395,6 +1411,7 @@ class CoinJoinSession:
 
                         # Try to verify against each of maker's inputs
                         matched_input_idx = None
+                        matched_is_taproot = False
 
                         for idx in maker_input_indices:
                             if idx in matched_indices:
@@ -1404,19 +1421,39 @@ class CoinJoinSession:
                             utxo = maker_utxo_map[(txid, vout)]
                             value = utxo["value"]
 
-                            # Create scriptCode for verification
-                            script_code = create_p2wpkh_script_code(pubkey)
+                            is_taproot_input = bool(all_prevout_scripts) and all_prevout_scripts[
+                                idx
+                            ].startswith(b"\x51\x20")
 
-                            if verify_p2wpkh_signature(
-                                tx, idx, script_code, value, signature, pubkey
-                            ):
-                                matched_input_idx = idx
-                                break
+                            if is_taproot_input:
+                                # Schnorr key-path: pubkey carries the 32-byte
+                                # x-only output key; sighash needs all prevouts.
+                                if verify_p2tr_signature(
+                                    tx,
+                                    idx,
+                                    all_prevout_values,
+                                    all_prevout_scripts,
+                                    signature,
+                                    pubkey,
+                                ):
+                                    matched_input_idx = idx
+                                    matched_is_taproot = True
+                                    break
+                            else:
+                                script_code = create_p2wpkh_script_code(pubkey)
+                                if verify_p2wpkh_signature(
+                                    tx, idx, script_code, value, signature, pubkey
+                                ):
+                                    matched_input_idx = idx
+                                    break
 
                         if matched_input_idx is not None:
                             matched_indices.add(matched_input_idx)
                             txid, vout = input_map[matched_input_idx]
-                            witness = [signature.hex(), pubkey.hex()]
+                            if matched_is_taproot:
+                                witness = [signature.hex()]
+                            else:
+                                witness = [signature.hex(), pubkey.hex()]
 
                             sig_infos.append({"txid": txid, "vout": vout, "witness": witness})
                             logger.debug(
@@ -1488,6 +1525,48 @@ class CoinJoinSession:
         logger.info(f"Signed tx: {len(self.final_tx)} bytes")
         return True
 
+    def _build_prevout_map(self) -> dict[tuple[str, int], tuple[int, bytes]]:
+        """Map every CoinJoin input outpoint to its (value, scriptPubKey).
+
+        Taproot (BIP341) sighashes commit to the amounts and scriptPubKeys of
+        ALL inputs, so signing or verifying any taproot input requires the full
+        prevout set. The taker already knows its own UTXOs and every maker UTXO
+        (from the !ioauth phase), so the map is assembled locally without extra
+        chain lookups. Maker entries fall back to deriving the scriptPubKey from
+        the resolved address when an explicit scriptpubkey was not provided.
+        """
+        prevouts: dict[tuple[str, int], tuple[int, bytes]] = {}
+        for utxo in self.selected_utxos:
+            prevouts[(utxo.txid, utxo.vout)] = (utxo.value, bytes.fromhex(utxo.scriptpubkey))
+        for session in self.maker_sessions.values():
+            for u in session.utxos:
+                spk_hex = u.get("scriptpubkey") or ""
+                if spk_hex:
+                    spk = bytes.fromhex(spk_hex)
+                elif u.get("address"):
+                    spk = address_to_scriptpubkey(u["address"])
+                else:
+                    continue
+                prevouts[(u["txid"], u["vout"])] = (u["value"], spk)
+        return prevouts
+
+    def _assemble_prevouts(
+        self, tx: Any, prevout_map: dict[tuple[str, int], tuple[int, bytes]]
+    ) -> tuple[list[int], list[bytes]]:
+        """Return ordered (values, scriptPubKeys) for every input of ``tx``."""
+        values: list[int] = []
+        scripts: list[bytes] = []
+        for tx_input in tx.inputs:
+            txid_hex = tx_input.txid_le[::-1].hex()
+            entry = prevout_map.get((txid_hex, tx_input.vout))
+            if entry is None:
+                raise TransactionSigningError(
+                    f"Missing prevout for {txid_hex}:{tx_input.vout} (required for taproot sighash)"
+                )
+            values.append(entry[0])
+            scripts.append(entry[1])
+        return values, scripts
+
     async def _sign_our_inputs(self) -> list[dict[str, Any]]:
         """
         Sign taker's inputs in the transaction.
@@ -1518,6 +1597,15 @@ class CoinJoinSession:
                 txid_hex = tx_input.txid_le[::-1].hex()
                 input_index_map[(txid_hex, tx_input.vout)] = idx
 
+            # Assemble the full prevout set only if any of our inputs is taproot.
+            need_prevouts = any(u.is_p2tr for u in self.selected_utxos)
+            prevout_values: list[int] = []
+            prevout_scripts: list[bytes] = []
+            if need_prevouts:
+                prevout_values, prevout_scripts = self._assemble_prevouts(
+                    tx, self._build_prevout_map()
+                )
+
             # Sign each of our UTXOs
             for utxo in self.selected_utxos:
                 # Find the input index in the transaction
@@ -1536,8 +1624,15 @@ class CoinJoinSession:
                     )
 
                 # Delegate key access and signing to the wallet so private keys
-                # never leave the wallet (issue #518).
-                signed = self.wallet.sign_input(tx, input_index, utxo)
+                # never leave the wallet (issue #518). Taproot inputs need the
+                # full prevout set for the BIP341 sighash.
+                signed = self.wallet.sign_input(
+                    tx,
+                    input_index,
+                    utxo,
+                    prevout_values=prevout_values if need_prevouts else None,
+                    prevout_scripts=prevout_scripts if need_prevouts else None,
+                )
 
                 signatures_info.append(
                     {
