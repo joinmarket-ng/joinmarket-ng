@@ -9,6 +9,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+from coincurve import PrivateKey
 from jmcore.btc_script import mk_freeze_script
 from loguru import logger
 
@@ -102,6 +103,11 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin, Wal
         self.utxo_cache: dict[int, list[UTXOInfo]] = {}
         # Lazily-derived BIP352 silent payment key pair (see get_silent_payments).
         self._silent_payments: SilentPaymentWallet | None = None
+        # Registered incoming silent payment outputs, keyed by their P2TR
+        # address. Unlike HD-derived coins these have no BIP32 path; the
+        # signing key is recomputed on demand from the stored tweaks via
+        # resolve_p2tr_signing_key(). See register_silent_payment_utxos().
+        self._sp_coins: dict[str, SilentPaymentReceived] = {}
 
         # UTXO + address metadata store (BIP-329 JSONL). Frozen UTXO state,
         # output labels, and the persistent "addresses with on-chain history"
@@ -315,6 +321,73 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin, Wal
             txs = await self.backend.get_block_transactions(height)
             received.extend(scan_block_transactions(sp_wallet, txs, labels, network=self.network))
         return received
+
+    def register_silent_payment_utxos(
+        self,
+        received: Sequence[SilentPaymentReceived],
+        mixdepth: int = 0,
+        confirmations: int = 1,
+    ) -> list[UTXOInfo]:
+        """Make detected silent payment outputs spendable by the wallet.
+
+        Each :class:`SilentPaymentReceived` is recorded in ``_sp_coins`` (keyed
+        by its P2TR address) and surfaced as a :class:`UTXOInfo` in
+        ``utxo_cache[mixdepth]`` so the coin-selection machinery treats it like
+        any other owned coin. These outputs have no BIP32 path; their signing
+        key is recomputed on demand via :meth:`resolve_p2tr_signing_key`.
+
+        Returns the list of injected ``UTXOInfo`` objects.
+        """
+        injected: list[UTXOInfo] = []
+        bucket = self.utxo_cache.setdefault(mixdepth, [])
+        existing = {(u.txid, u.vout) for u in bucket}
+        for r in received:
+            self._sp_coins[r.address] = r
+            if (r.txid, r.vout) in existing:
+                continue
+            utxo = UTXOInfo(
+                txid=r.txid,
+                vout=r.vout,
+                value=r.value,
+                address=r.address,
+                confirmations=confirmations,
+                scriptpubkey="5120" + r.pubkey_xonly.hex(),
+                path="",
+                mixdepth=mixdepth,
+                label="silent-payment",
+            )
+            bucket.append(utxo)
+            existing.add((r.txid, r.vout))
+            injected.append(utxo)
+        return injected
+
+    def resolve_p2tr_signing_key(self, address: str) -> tuple[PrivateKey, bytes] | None:
+        """Resolve the BIP341 key-path signing key for a P2TR ``address``.
+
+        Returns ``(private_key, output_xonly)`` where ``private_key`` is a
+        coincurve :class:`PrivateKey` whose public key is the tweaked taproot
+        output key, and ``output_xonly`` is its 32-byte x-only encoding.
+
+        Handles two sources of taproot coins:
+
+        - Registered silent payment outputs (no taptweak; the recovered scalar
+          ``spend + tweak + label_tweak`` already *is* the output key).
+        - BIP86 HD-derived outputs (key-path spend with the BIP341 taptweak).
+
+        Returns ``None`` if the address is not owned by this wallet.
+        """
+        sp = self._sp_coins.get(address)
+        if sp is not None:
+            spend_privkey = self.get_silent_payments().spend_privkey
+            scalar = sp.output_private_key(spend_privkey)
+            priv = PrivateKey(scalar.to_bytes(32, "big"))
+            return priv, sp.pubkey_xonly
+
+        key = self.get_key_for_address(address)
+        if key is None:
+            return None
+        priv = PrivateKey(key.get_p2tr_private_key())
+        return priv, key.get_p2tr_output_xonly()
 
     def get_receive_address(self, mixdepth: int, index: int) -> str:
         """Get external (receive) address"""

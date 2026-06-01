@@ -34,6 +34,8 @@ from jmwallet.wallet.signing import (
 )
 
 if TYPE_CHECKING:
+    from coincurve import PrivateKey
+
     from jmwallet.wallet.bip32 import HDKey
     from jmwallet.wallet.models import UTXOInfo
 
@@ -63,6 +65,12 @@ class WalletSigningMixin:
 
     # Declared for mypy -- actually provided by the host WalletService.
     def get_key_for_address(self, address: str) -> HDKey | None:  # pragma: no cover
+        raise NotImplementedError
+
+    # Declared for mypy -- actually provided by the host WalletService.
+    def resolve_p2tr_signing_key(  # pragma: no cover
+        self, address: str
+    ) -> tuple[PrivateKey, bytes] | None:
         raise NotImplementedError
 
     def sign_input(
@@ -99,26 +107,33 @@ class WalletSigningMixin:
                 a P2WSH output without an associated locktime, or a taproot
                 input is signed without the full prevout set.
         """
-        key = self.get_key_for_address(utxo.address)
-        if key is None:
-            raise TransactionSigningError(f"Missing key for address {utxo.address}")
-
         if utxo.is_p2tr:
             if prevout_values is None or prevout_scripts is None:
                 raise TransactionSigningError(
                     "Taproot inputs require the full prevout set to sign"
                 )
-            # BIP86 key-path spend: sign with the tweaked output key over the
-            # full prevout set; the witness is the single Schnorr signature.
-            xonly = key.get_p2tr_output_xonly()
+            # Key-path spend over the full prevout set; the witness is the
+            # single 64-byte Schnorr signature. ``resolve_p2tr_signing_key``
+            # returns a coincurve PrivateKey (BIP86 outputs use the taptweak,
+            # received silent payment outputs recompute the key from stored
+            # tweaks and have no HD path), so it must be used instead of the
+            # ``get_key_for_address`` HD lookup below.
+            resolved = self.resolve_p2tr_signing_key(utxo.address)
+            if resolved is None:
+                raise TransactionSigningError(f"Missing key for address {utxo.address}")
+            private_key, xonly = resolved
             signature = sign_p2tr_input(
                 tx=tx,
                 input_index=input_index,
                 prevouts_values=prevout_values,
                 prevouts_scripts=prevout_scripts,
-                private_key=key.get_p2tr_private_key(),
+                private_key=private_key,
             )
             return SignedInput(signature=signature, pubkey=xonly, witness=[signature])
+
+        key = self.get_key_for_address(utxo.address)
+        if key is None:
+            raise TransactionSigningError(f"Missing key for address {utxo.address}")
 
         pubkey_bytes = key.get_public_key_bytes(compressed=True)
         private_key = key.private_key
