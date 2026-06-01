@@ -200,12 +200,15 @@ _LOCKTIME = 1956528000
 
 
 def test_mk_taproot_freeze_tapleaf_structure():
-    """The tapleaf is <locktime> OP_CLTV OP_DROP <32B x-only> OP_CHECKSIG."""
+    """The tapleaf is <32B x-only> OP_CHECKSIGVERIFY <locktime> OP_CLTV."""
     leaf = mk_taproot_freeze_tapleaf(_XONLY, _LOCKTIME)
     disasm = disassemble_script(leaf)
+    assert "OP_CHECKSIGVERIFY" in disasm
     assert "OP_CHECKLOCKTIMEVERIFY" in disasm
-    assert "OP_DROP" in disasm
-    assert "OP_CHECKSIG" in disasm
+    # No OP_DROP: CLTV is last and leaves the locktime as a truthy result.
+    assert "OP_DROP" not in disasm
+    # The x-only key is pushed before OP_CHECKSIGVERIFY.
+    assert disasm.index("OP_CHECKSIGVERIFY") < disasm.index("OP_CHECKLOCKTIMEVERIFY")
     # 32-byte x-only key is pushed with a 0x20 length prefix
     assert (b"\x20" + _XONLY) in leaf
 

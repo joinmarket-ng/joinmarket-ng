@@ -13,6 +13,7 @@ from bitcointx.core.script import (
     OP_0,
     OP_CHECKLOCKTIMEVERIFY,
     OP_CHECKSIG,
+    OP_CHECKSIGVERIFY,
     OP_DROP,
     CScript,
     CScriptOp,
@@ -188,7 +189,11 @@ def mk_taproot_freeze_tapleaf(pubkey_xonly: bytes, locktime: int) -> bytes:
     """
     Build the timelocked tapscript leaf for a Taproot fidelity bond.
 
-    Script format: <locktime> OP_CHECKLOCKTIMEVERIFY OP_DROP <32B x-only> OP_CHECKSIG
+    Script format: <32B x-only> OP_CHECKSIGVERIFY <locktime> OP_CHECKLOCKTIMEVERIFY
+
+    Putting OP_CHECKLOCKTIMEVERIFY last leaves the locktime on the stack as a
+    truthy result, so the OP_DROP needed by the legacy <locktime> CLTV DROP
+    form is unnecessary. This matches the construction used by CoinSwap.
 
     Args:
         pubkey_xonly: 32-byte x-only public key
@@ -200,7 +205,7 @@ def mk_taproot_freeze_tapleaf(pubkey_xonly: bytes, locktime: int) -> bytes:
     if len(pubkey_xonly) != 32:
         raise ValueError(f"Invalid x-only pubkey length: {len(pubkey_xonly)}, expected 32")
 
-    script = CScript([locktime, OP_CHECKLOCKTIMEVERIFY, OP_DROP, pubkey_xonly, OP_CHECKSIG])
+    script = CScript([pubkey_xonly, OP_CHECKSIGVERIFY, locktime, OP_CHECKLOCKTIMEVERIFY])
     return bytes(script)
 
 
@@ -225,7 +230,7 @@ class TaprootBondInfo:
     output_pubkey: bytes
     """32-byte x-only taproot output key"""
     tapleaf_script: bytes
-    """The timelocked tapscript leaf: <locktime> OP_CLTV OP_DROP <xonly> OP_CHECKSIG"""
+    """The timelocked tapscript leaf: <xonly> OP_CHECKSIGVERIFY <locktime> OP_CLTV"""
     control_block: bytes
     """BIP341 control block for a script-path spend of the single leaf"""
 
