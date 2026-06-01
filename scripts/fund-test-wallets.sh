@@ -94,6 +94,18 @@ echo "  Taker:  $TAKER_ADDR"
 echo "  Maker-TR1: $MAKER_TR1_ADDR"
 echo "  Maker-TR2: $MAKER_TR2_ADDR"
 echo "  Taker-TR:  $TAKER_TR_ADDR"
+
+# Create the fidelity-bond funder wallet up front and mine ONE high-subsidy
+# coinbase to it now. At this low block height the regtest subsidy is the full
+# 50 BTC. Funding the bond from a coinbase mined at the END of this script is
+# unreliable: the regtest subsidy halves every 150 blocks, so after mining to
+# all recipients the subsidy collapses far below the 1 BTC bond amount.
+# Parameters: wallet_name, disable_private_keys, blank, passphrase, avoid_reuse, descriptors, load_on_startup
+$CLI createwallet "fidelity_funder" false false "" false true true || true
+MINER_ADDR=$($CLI -rpcwallet=fidelity_funder getnewaddress "" "bech32")
+$CLI generatetoaddress 1 "$MINER_ADDR"
+echo "Mined 1 high-subsidy block to fidelity funder wallet"
+
 # Mine blocks to each address to fund them
 # Each block gives 50 BTC on regtest
 $CLI generatetoaddress $BLOCKS_TO_MINE "$MAKER1_ADDR"
@@ -126,28 +138,15 @@ echo "Mined $BLOCKS_TO_MINE blocks to Maker-TR2"
 $CLI generatetoaddress $BLOCKS_TO_MINE "$TAKER_TR_ADDR"
 echo "Mined $BLOCKS_TO_MINE blocks to Taker-TR"
 
-# Mine some extra blocks for coinbase maturity
-# After this, all wallets should have spendable funds
-$CLI generatetoaddress 10 "$MAKER1_ADDR"
-
-# Create a wallet in Bitcoin Core to fund the fidelity bond address
-# We need to create a transaction from the mined funds
-echo "Creating fidelity bond transaction..."
-
-# Create a temporary descriptor wallet in Bitcoin Core for sending
-# Parameters: wallet_name, disable_private_keys, blank, passphrase, avoid_reuse, descriptors, load_on_startup
-$CLI createwallet "fidelity_funder" false false "" false true true || true
-
-# Get mining reward address to use as source
-MINER_ADDR=$($CLI -rpcwallet=fidelity_funder getnewaddress "" "bech32")
-
-# Mine blocks to the funder wallet - need 101+ to have spendable coinbase
-# First block gives us 50 BTC, but need 100 confirmations to spend
-echo "Mining blocks to funder wallet..."
-$CLI generatetoaddress 1 "$MINER_ADDR"
-
-# Mine 100 more blocks to mature the first coinbase (any address works)
+# Mine extra blocks for coinbase maturity (the last recipients need ~100
+# confirmations before their coinbase outputs become spendable). This also
+# matures the fidelity funder coinbase mined at the start.
 $CLI generatetoaddress 100 "$MAKER1_ADDR"
+
+# Fund the fidelity bond address from the funder wallet. The funder's coinbase
+# was mined at the start of this script (full 50 BTC subsidy) and is now deeply
+# matured, so it has ample spendable balance regardless of the current subsidy.
+echo "Creating fidelity bond transaction..."
 
 # Verify we have spendable funds
 BALANCE=$($CLI -rpcwallet=fidelity_funder getbalance)
