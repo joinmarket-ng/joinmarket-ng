@@ -66,9 +66,16 @@ MAKER5_ADDR="bcrt1qed048vcfagng5k3s257rzx2dr4ckga0fhr5edt"
 
 # Taker address (derived from: burden notable love...)
 TAKER_ADDR="bcrt1q84l5vscg3pvjn6se8jp4ruymtyh393ed5v2d9e"
-
 # Maker-Neutrino address (derived from: ice index boss...)
 MAKER_NEUTRINO_ADDR="bcrt1q6mse43hzgfdqh7fyg05lmd4x2ufhlunn3gw5j3"
+
+# Taproot makers (BIP86, p2tr). Receive address m/86'/1'/0'/0/0.
+# Maker-TR1: "glow wonder zone gospel coin hover dutch knock pause divorce among curtain"
+MAKER_TR1_ADDR="bcrt1p838vnck5qgls4g9c2g85889y97rahxpkw32qukaer089d6q8kzss2u6e97"
+# Maker-TR2: "social spice frost fade ocean fringe disorder amused tortoise fame ghost summer"
+MAKER_TR2_ADDR="bcrt1p6ksedclwjqrp5duqpj3ruhg3j5gu8elj3fkly8cesvk698ffklqsx7ea5r"
+# Taproot taker: same mnemonic as TAKER, p2tr (BIP86) receive m/86'/1'/0'/0/0.
+TAKER_TR_ADDR="bcrt1psldw7rs3gy4jv25nzjdvemez8zah6mcuxtpesr7lr0s028macnvsqpg9n7"
 
 # Fidelity bond P2WSH address for Maker1
 # Path: m/84'/1'/0'/2/0 with locktime 4099766400 (Dec 1, 2099)
@@ -84,7 +91,9 @@ echo "  Maker4: $MAKER4_ADDR"
 echo "  Maker5: $MAKER5_ADDR"
 echo "  Maker-Neutrino: $MAKER_NEUTRINO_ADDR"
 echo "  Taker:  $TAKER_ADDR"
-
+echo "  Maker-TR1: $MAKER_TR1_ADDR"
+echo "  Maker-TR2: $MAKER_TR2_ADDR"
+echo "  Taker-TR:  $TAKER_TR_ADDR"
 # Mine blocks to each address to fund them
 # Each block gives 50 BTC on regtest
 $CLI generatetoaddress $BLOCKS_TO_MINE "$MAKER1_ADDR"
@@ -107,6 +116,15 @@ echo "Mined $BLOCKS_TO_MINE blocks to Taker"
 
 $CLI generatetoaddress $BLOCKS_TO_MINE "$MAKER_NEUTRINO_ADDR"
 echo "Mined $BLOCKS_TO_MINE blocks to Maker-Neutrino"
+
+$CLI generatetoaddress $BLOCKS_TO_MINE "$MAKER_TR1_ADDR"
+echo "Mined $BLOCKS_TO_MINE blocks to Maker-TR1"
+
+$CLI generatetoaddress $BLOCKS_TO_MINE "$MAKER_TR2_ADDR"
+echo "Mined $BLOCKS_TO_MINE blocks to Maker-TR2"
+
+$CLI generatetoaddress $BLOCKS_TO_MINE "$TAKER_TR_ADDR"
+echo "Mined $BLOCKS_TO_MINE blocks to Taker-TR"
 
 # Mine some extra blocks for coinbase maturity
 # After this, all wallets should have spendable funds

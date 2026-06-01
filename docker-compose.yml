@@ -851,6 +851,129 @@ services:
       - neutrino
       - all
 
+  # Taproot makers (BIP86 / tr0 offers) for the taproot CoinJoin e2e test.
+  # MAKER__OFFER_TYPE=tr0reloffer makes the maker advertise taproot offers and
+  # (via build_maker_config) derive a p2tr wallet, so its funding/CJ/change
+  # addresses are all bech32m. Funded by wallet-funder at their BIP86 receive
+  # address (m/86'/1'/0'/0/0).
+  maker-tr1:
+    image: ${MAKER_IMAGE:-}
+    build:
+      context: .
+      dockerfile: maker/Dockerfile
+    container_name: jm-maker-tr1
+    command: ["jm-maker", "start"]
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 512M
+    environment:
+      - MNEMONIC=glow wonder zone gospel coin hover dutch knock pause divorce among curtain
+      - NETWORK_CONFIG__NETWORK=testnet
+      - NETWORK_CONFIG__BITCOIN_NETWORK=regtest
+      - BITCOIN__BACKEND_TYPE=descriptor_wallet
+      - BITCOIN__RPC_URL=http://jm-bitcoin:18443
+      - BITCOIN__RPC_COOKIE_FILE=/shared/.cookie
+      - DIRECTORY_SERVERS=jm-directory:5222,jm-directory2:5223
+      - LOGGING__LEVEL=DEBUG
+      - MAKER__OFFER_TYPE=tr0reloffer
+      - MAKER__MIN_SIZE=10000
+      - MAKER__TX_FEE_CONTRIBUTION=500
+      - MAKER__CJ_FEE_RELATIVE=0.0003
+      - TOR__SOCKS_HOST=jm-tor
+      - TOR__SOCKS_PORT=9050
+      - TOR__CONTROL_HOST=jm-tor
+      - TOR__CONTROL_PORT=9051
+      - TOR__COOKIE_PATH=/var/lib/tor/control_auth_cookie
+      - MAKER__ONION_SERVING_HOST=0.0.0.0
+      - MAKER__ONION_SERVING_PORT=5000
+    volumes:
+      - maker-tr1-data:/home/jm/.joinmarket-ng
+      - tor-data:/var/lib/tor:ro
+      - ./shared:/shared:ro
+    networks:
+      - jm-network
+    depends_on:
+      bitcoin:
+        condition: service_healthy
+      directory:
+        condition: service_healthy
+      directory2:
+        condition: service_healthy
+      tor:
+        condition: service_healthy
+      wallet-funder:
+        condition: service_completed_successfully
+    profiles:
+      - e2e
+      - all
+
+  maker-tr2:
+    image: ${MAKER_IMAGE:-}
+    build:
+      context: .
+      dockerfile: maker/Dockerfile
+    container_name: jm-maker-tr2
+    command: ["jm-maker", "start"]
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 512M
+    environment:
+      - MNEMONIC=social spice frost fade ocean fringe disorder amused tortoise fame ghost summer
+      - NETWORK_CONFIG__NETWORK=testnet
+      - NETWORK_CONFIG__BITCOIN_NETWORK=regtest
+      - BITCOIN__BACKEND_TYPE=descriptor_wallet
+      - BITCOIN__RPC_URL=http://jm-bitcoin:18443
+      - BITCOIN__RPC_COOKIE_FILE=/shared/.cookie
+      - DIRECTORY_SERVERS=jm-directory:5222,jm-directory2:5223
+      - LOGGING__LEVEL=DEBUG
+      - MAKER__OFFER_TYPE=tr0reloffer
+      - MAKER__MIN_SIZE=10000
+      - MAKER__TX_FEE_CONTRIBUTION=500
+      - MAKER__CJ_FEE_RELATIVE=0.00025
+      - TOR__SOCKS_HOST=jm-tor
+      - TOR__SOCKS_PORT=9050
+      - TOR__CONTROL_HOST=jm-tor
+      - TOR__CONTROL_PORT=9051
+      - TOR__COOKIE_PATH=/var/lib/tor/control_auth_cookie
+      - MAKER__ONION_SERVING_HOST=0.0.0.0
+      - MAKER__ONION_SERVING_PORT=5000
+    volumes:
+      - maker-tr2-data:/home/jm/.joinmarket-ng
+      - tor-data:/var/lib/tor:ro
+      - ./shared:/shared:ro
+    networks:
+      - jm-network
+    depends_on:
+      bitcoin:
+        condition: service_healthy
+      directory:
+        condition: service_healthy
+      directory2:
+        condition: service_healthy
+      tor:
+        condition: service_healthy
+      wallet-funder:
+        condition: service_completed_successfully
+    profiles:
+      - e2e
+      - all
+
   # ============================================================================
   # Reference JoinMarket Implementation (profile: reference)
   # For compatibility testing with upstream JAM
@@ -1376,6 +1499,8 @@ volumes:
   maker3-data:
   maker4-data:
   maker5-data:
+  maker-tr1-data:
+  maker-tr2-data:
   maker-neutrino-data:
   taker-data:
   taker-reference-data:
