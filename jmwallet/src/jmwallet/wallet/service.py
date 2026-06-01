@@ -58,6 +58,7 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin, Wal
         scan_range: int = DEFAULT_SCAN_RANGE,
         data_dir: Path | None = None,
         passphrase: str = "",
+        address_type: str = "p2wpkh",
     ):
         self.backend = backend
         self.network = network
@@ -75,7 +76,14 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin, Wal
         self.master_key = HDKey.from_seed(seed)
 
         coin_type = 0 if network == "mainnet" else 1
-        self.root_path = f"m/84'/{coin_type}'"
+        if address_type not in ("p2wpkh", "p2tr"):
+            raise ValueError(f"Unsupported wallet address_type: {address_type!r}")
+        self.address_type = address_type
+        # BIP84 (native segwit, P2WPKH) uses purpose 84'; BIP86 (Taproot,
+        # P2TR key-path) uses purpose 86'. The descriptor function follows.
+        purpose = 86 if address_type == "p2tr" else 84
+        self.descriptor_function = "tr" if address_type == "p2tr" else "wpkh"
+        self.root_path = f"m/{purpose}'/{coin_type}'"
 
         # Log fingerprint for debugging (helps identify passphrase issues)
         fingerprint = self.master_key.derive("m/0").fingerprint.hex()
@@ -253,7 +261,11 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin, Wal
 
         path = f"{self.root_path}/{mixdepth}'/{change}/{index}"
         key = self.master_key.derive(path)
-        address = key.get_address(self.network)
+        address = (
+            key.get_p2tr_address(self.network)
+            if self.address_type == "p2tr"
+            else (key.get_address(self.network))
+        )
 
         self.address_cache[address] = (mixdepth, change, index)
         self._path_cache[path_key] = address
@@ -366,14 +378,15 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin, Wal
         """
         descriptors = []
 
+        fn = self.descriptor_function
         for mixdepth in range(self.mixdepth_count):
             xpub = self.get_account_xpub(mixdepth)
 
             # External (receive) addresses: .../0/*
-            descriptors.append({"desc": f"wpkh({xpub}/0/*)", "range": [0, scan_range - 1]})
+            descriptors.append({"desc": f"{fn}({xpub}/0/*)", "range": [0, scan_range - 1]})
 
             # Internal (change) addresses: .../1/*
-            descriptors.append({"desc": f"wpkh({xpub}/1/*)", "range": [0, scan_range - 1]})
+            descriptors.append({"desc": f"{fn}({xpub}/1/*)", "range": [0, scan_range - 1]})
 
         logger.debug(
             f"Generated {len(descriptors)} descriptors for {self.mixdepth_count} mixdepths "
