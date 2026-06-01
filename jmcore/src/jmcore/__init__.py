@@ -82,6 +82,7 @@ from jmcore.models import (
     get_default_directory_nodes,
     is_taproot_offer_type,
     offer_output_script_type,
+    offer_types_for_family,
 )
 from jmcore.nick_tracker import NickTracker
 from jmcore.notifications import (
@@ -259,6 +260,7 @@ __all__ = [
     "calculate_cj_fee",
     "is_taproot_offer_type",
     "offer_output_script_type",
+    "offer_types_for_family",
     # Nick tracking
     "NickTracker",
     # Notifications

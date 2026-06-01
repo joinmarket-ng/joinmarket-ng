@@ -244,6 +244,18 @@ def offer_output_script_type(offer_type: OfferType) -> str:
     return "p2tr" if is_taproot_offer_type(offer_type) else "p2wpkh"
 
 
+def offer_types_for_family(offer_type: OfferType) -> set[OfferType]:
+    """Return the absolute+relative offer types sharing the output script family.
+
+    A taker that prefers one offer type should accept both the absolute and
+    relative variants of the same output script family (taproot vs segwit),
+    since they produce identical CoinJoin output script types (JMP-0005).
+    """
+    if is_taproot_offer_type(offer_type):
+        return set(TAPROOT_OFFER_TYPES)
+    return {OfferType.SW0_ABSOLUTE, OfferType.SW0_RELATIVE}
+
+
 def calculate_cj_fee(offer_type: OfferType, cjfee: str | int, amount: int) -> int:
     """
     Calculate actual CoinJoin fee based on offer type.

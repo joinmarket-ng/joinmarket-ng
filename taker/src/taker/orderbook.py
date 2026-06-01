@@ -18,7 +18,7 @@ from jmcore.bitcoin import (
     calculate_relative_fee,
     calculate_sweep_amount,
 )
-from jmcore.models import Offer, OfferType
+from jmcore.models import Offer, OfferType, is_absolute_offer_type
 from jmcore.models import calculate_cj_fee as _calculate_cj_fee_raw
 from jmcore.paths import get_ignored_makers_path
 from jmcore.protocol import get_nick_version
@@ -509,6 +509,7 @@ def choose_orders(
     bondless_makers_allowance: float = 0.2,
     bondless_require_zero_fee: bool = True,
     required_features: set[str] | None = None,
+    allowed_types: set[OfferType] | None = None,
 ) -> tuple[dict[str, Offer], int]:
     """
     Choose n orders from the orderbook for a CoinJoin.
@@ -547,6 +548,7 @@ def choose_orders(
         ignored_makers=ignored_makers,
         min_nick_version=min_nick_version,
         required_features=required_features,
+        allowed_types=allowed_types,
     )
 
     # Dedupe by maker (keep cheapest offer per counterparty)
@@ -590,6 +592,7 @@ def choose_sweep_orders(
     bondless_makers_allowance: float = 0.2,
     bondless_require_zero_fee: bool = True,
     required_features: set[str] | None = None,
+    allowed_types: set[OfferType] | None = None,
 ) -> tuple[dict[str, Offer], int, int]:
     """
     Choose n orders for a sweep transaction (no change).
@@ -639,6 +642,7 @@ def choose_sweep_orders(
         ignored_makers=ignored_makers,
         min_nick_version=min_nick_version,
         required_features=required_features,
+        allowed_types=allowed_types,
     )
 
     # Dedupe by maker
@@ -685,7 +689,7 @@ def choose_sweep_orders(
     rel_fees = []
 
     for offer in selected:
-        if offer.ordertype in (OfferType.SW0_ABSOLUTE, OfferType.SWA_ABSOLUTE):
+        if is_absolute_offer_type(offer.ordertype):
             sum_abs_fees += int(offer.cjfee)
         else:
             rel_fees.append(str(offer.cjfee))
@@ -720,10 +724,12 @@ class OrderbookManager:
         bondless_require_zero_fee: bool = True,
         data_dir: Any = None,  # Path | None, but avoid import
         own_wallet_nicks: set[str] | None = None,
+        allowed_types: set[OfferType] | None = None,
     ):
         self.max_cj_fee = max_cj_fee
         self.bondless_makers_allowance = bondless_makers_allowance
         self.bondless_require_zero_fee = bondless_require_zero_fee
+        self.allowed_types = allowed_types
         self.offers: list[Offer] = []
         self.bonds: dict[str, Any] = {}  # maker -> bond info
         self.ignored_makers: set[str] = set()
@@ -890,6 +896,7 @@ class OrderbookManager:
             bondless_makers_allowance=self.bondless_makers_allowance,
             bondless_require_zero_fee=self.bondless_require_zero_fee,
             required_features=required_features,
+            allowed_types=self.allowed_types,
         )
         if len(result) >= n or not soft:
             return result, fee
@@ -916,6 +923,7 @@ class OrderbookManager:
             bondless_makers_allowance=self.bondless_makers_allowance,
             bondless_require_zero_fee=self.bondless_require_zero_fee,
             required_features=required_features,
+            allowed_types=self.allowed_types,
         )
         result.update(topup_result)
         return result, fee + topup_fee
@@ -974,6 +982,7 @@ class OrderbookManager:
             bondless_makers_allowance=self.bondless_makers_allowance,
             bondless_require_zero_fee=self.bondless_require_zero_fee,
             required_features=required_features,
+            allowed_types=self.allowed_types,
         )
         if len(result[0]) >= n or not soft:
             return result
@@ -994,4 +1003,5 @@ class OrderbookManager:
             bondless_makers_allowance=self.bondless_makers_allowance,
             bondless_require_zero_fee=self.bondless_require_zero_fee,
             required_features=required_features,
+            allowed_types=self.allowed_types,
         )
