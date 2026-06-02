@@ -450,6 +450,18 @@ jobs:
     needs: build-images
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    name: test-e2e (${{ matrix.shard }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # test_complete_system.py runs the bulk of the coinjoin flows and
+          # accounts for roughly half of the e2e wall-clock on its own, so it
+          # gets a dedicated shard; everything else (non-tumbler) runs together.
+          - shard: complete-system
+            pytest_args: tests/e2e/test_complete_system.py
+          - shard: rest
+            pytest_args: tests/ --ignore=tests/e2e/test_complete_system.py
     permissions:
       contents: read
       packages: read
@@ -520,7 +532,8 @@ jobs:
           BITCOIN_RPC_USER: test
           BITCOIN_RPC_PASSWORD: test
         run: |
-          pytest -c pytest.ini -m "e2e and not tumbler_e2e" --junitxml=junit/test-results.xml \
+          pytest -c pytest.ini ${{ matrix.pytest_args }} -m "e2e and not tumbler_e2e" \
+            --junitxml=junit/test-results.xml \
             --cov --cov-report=term-missing --cov-report=xml \
             -v -s --timeout=300 --reruns=1 --reruns-delay=10 --fail-on-skip
 
@@ -551,7 +564,7 @@ jobs:
 
       - uses: actions/upload-artifact@v7
         with:
-          name: e2e-results
+          name: e2e-results-${{ matrix.shard }}
           path: |
             junit/test-results.xml
             coverage.xml
