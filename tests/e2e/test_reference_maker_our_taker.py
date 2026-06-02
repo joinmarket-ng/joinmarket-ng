@@ -177,12 +177,24 @@ def ensure_miner_wallet() -> bool:
     if result.returncode == 0:
         wallets = result.stdout.strip()
         if "miner" not in wallets:
-            logger.info("Creating miner wallet...")
-            result = run_bitcoin_cmd(["createwallet", "miner"])
-            if result.returncode != 0:
-                logger.error(f"Failed to create miner wallet: {result.stderr}")
-                return False
-            logger.info("Miner wallet created")
+            # The wallet is not loaded, but its database may still exist on
+            # disk from a previous run. In that case "createwallet" fails with
+            # error -4 ("Database already exists"), so try "loadwallet" first
+            # and only create the wallet when loading fails.
+            logger.info("Loading or creating miner wallet...")
+            load_result = run_bitcoin_cmd(["loadwallet", "miner"])
+            if load_result.returncode == 0:
+                logger.info("Miner wallet loaded")
+            else:
+                create_result = run_bitcoin_cmd(["createwallet", "miner"])
+                if create_result.returncode != 0:
+                    logger.error(
+                        "Failed to load or create miner wallet: "
+                        f"load={load_result.stderr.strip()} "
+                        f"create={create_result.stderr.strip()}"
+                    )
+                    return False
+                logger.info("Miner wallet created")
 
     # Check balance and mine if needed
     result = run_bitcoin_cmd(["-rpcwallet=miner", "getbalance"])
