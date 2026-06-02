@@ -1,8 +1,9 @@
 services:
   taker:
-    build:
-      context: ..
-      dockerfile: taker/Dockerfile
+    image: ghcr.io/joinmarket-ng/joinmarket-ng/taker:main
+    # build:
+    #   context: ..
+    #   dockerfile: taker/Dockerfile
     container_name: joinmarket_taker
     environment:
       - MNEMONIC_FILE=/home/jm/.joinmarket-ng/wallets/taker.mnemonic

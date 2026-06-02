@@ -1,0 +1,12 @@
+# Tor configuration for the JoinMarket NG maker.
+
+# SOCKS proxy for outbound connections (directory servers, peers).
+# Bind to all interfaces so the maker container can reach it.
+SocksPort 0.0.0.0:9050
+
+# Control port used by the maker to create ephemeral hidden services
+# (its serving onion) via ADD_ONION. Cookie auth file lives on the shared
+# tor-data volume so the maker can read it.
+ControlPort 0.0.0.0:9051
+CookieAuthentication 1
+CookieAuthFile /var/lib/tor/control_auth_cookie

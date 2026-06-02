@@ -1,8 +1,9 @@
 services:
   maker:
-    build:
-      context: ..
-      dockerfile: maker/Dockerfile
+    image: ghcr.io/joinmarket-ng/joinmarket-ng/maker:main
+    # build:
+    #   context: ..
+    #   dockerfile: maker/Dockerfile
     container_name: joinmarket_maker
     environment:
       - MNEMONIC_FILE=/home/jm/.joinmarket-ng/wallets/maker.mnemonic

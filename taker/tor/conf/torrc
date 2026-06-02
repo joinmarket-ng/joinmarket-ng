@@ -1,0 +1,6 @@
+# Tor configuration for the JoinMarket NG taker.
+
+# SOCKS proxy for outbound connections (directory servers and maker onions).
+# The taker never serves a hidden service, so no control port is required.
+# Bind to all interfaces so the taker container can reach it.
+SocksPort 0.0.0.0:9050
