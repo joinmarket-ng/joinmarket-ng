@@ -1051,7 +1051,6 @@ class CoinJoinSession:
                         "vout": u.vout,
                         "value": u.value,
                         "scriptpubkey": u.scriptpubkey,
-                        "locktime": u.locktime,
                     }
                     for u in selected_utxos
                 ],
@@ -1115,12 +1114,9 @@ class CoinJoinSession:
 
         Inputs are classified from their real scriptPubKeys (taker selected
         UTXOs and each maker's UTXOs), so a taproot CoinJoin that mixes in a
-        legacy P2WPKH/P2WSH bond input is sized correctly instead of being
-        under-estimated. A taproot fidelity bond among the taker's own inputs is
-        sized as a script-path spend (``p2tr_bond``) rather than a cheaper
-        key-path P2TR, since its witness reveals the CLTV tapleaf and control
-        block. Equal CoinJoin outputs use the uniform output family; change
-        outputs are classified from their destination addresses.
+        legacy P2WPKH/P2WSH input is sized correctly instead of being
+        under-estimated. Equal CoinJoin outputs use the uniform output family;
+        change outputs are classified from their destination addresses.
         """
         cj_type = offer_output_script_type(self.config.preferred_offer_type)
 
@@ -1128,11 +1124,6 @@ class CoinJoinSession:
         for u in selected_utxos:
             spk = getattr(u, "scriptpubkey", "") or ""
             input_type = self._classify_scriptpubkey(spk, cj_type)
-            # A taproot bond is indistinguishable from a key-path P2TR by its
-            # scriptPubKey alone, but the taker knows its own bonds and must
-            # size them as the larger script-path spend.
-            if input_type == "p2tr" and getattr(u, "is_fidelity_bond", False):
-                input_type = "p2tr_bond"
             input_types.append(input_type)
         for session in self.maker_sessions.values():
             for utxo in session.utxos:

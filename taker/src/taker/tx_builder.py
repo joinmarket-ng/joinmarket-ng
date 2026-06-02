@@ -28,10 +28,6 @@ logger = logging.getLogger(__name__)
 # Alias for backward compatibility
 varint = encode_varint
 
-# nSequence value marking an input as non-final (RBF-opted / timelock-enabled).
-# Required on CLTV inputs so the transaction-wide nLockTime is enforced (BIP65).
-NON_FINAL_SEQUENCE = 0xFFFFFFFE
-
 
 @dataclass
 class CoinJoinTxData:
@@ -51,10 +47,6 @@ class CoinJoinTxData:
     cj_amount: int
     total_maker_fee: int
     tx_fee: int
-
-    # Transaction-wide nLockTime. Must be >= the CLTV locktime of any timelocked
-    # input (for example a spent fidelity bond) for the spend to be valid.
-    locktime: int = 0
 
 
 class CoinJoinTxBuilder:
@@ -121,14 +113,11 @@ class CoinJoinTxBuilder:
         tx_bytes = self._serialize_tx(
             inputs=[inp for inp, _ in all_inputs],
             outputs=[out for out, _, _ in all_outputs],
-            locktime=tx_data.locktime,
         )
 
         return tx_bytes, metadata
 
-    def _serialize_tx(
-        self, inputs: list[TxInput], outputs: list[TxOutput], locktime: int = 0
-    ) -> bytes:
+    def _serialize_tx(self, inputs: list[TxInput], outputs: list[TxOutput]) -> bytes:
         """Serialize transaction to bytes.
 
         For unsigned transactions, we use non-SegWit format (no marker/flag/witness).
@@ -138,7 +127,7 @@ class CoinJoinTxBuilder:
             version=2,
             inputs=inputs,
             outputs=outputs,
-            locktime=locktime,
+            locktime=0,
             witnesses=None,
         )
 
@@ -299,24 +288,12 @@ def build_coinjoin_tx(
     """
     builder = CoinJoinTxBuilder(network)
 
-    # Track the maximum CLTV locktime across all timelocked inputs (for example a
-    # spent fidelity bond). The transaction-wide nLockTime must be >= this value.
-    required_locktime = 0
-
     def _make_input(u: dict[str, Any]) -> TxInput:
-        """Build a TxInput, marking timelocked inputs non-final for BIP65."""
-        nonlocal required_locktime
-        utxo_locktime = u.get("locktime")
-        sequence = 0xFFFFFFFF
-        if utxo_locktime:
-            required_locktime = max(required_locktime, int(utxo_locktime))
-            sequence = NON_FINAL_SEQUENCE
         return TxInput.from_hex(
             txid=u["txid"],
             vout=u["vout"],
             value=u["value"],
             scriptpubkey=u.get("scriptpubkey", ""),
-            sequence=sequence,
         )
 
     # Build taker inputs
@@ -399,7 +376,6 @@ def build_coinjoin_tx(
         cj_amount=cj_amount,
         total_maker_fee=total_maker_fee,
         tx_fee=tx_fee,
-        locktime=required_locktime,
     )
 
     return builder.build_unsigned_tx(tx_data)

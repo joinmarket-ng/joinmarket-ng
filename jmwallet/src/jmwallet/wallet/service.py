@@ -590,66 +590,7 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin, Wal
         pubkey_hex = key.get_public_key_bytes(compressed=True).hex()
         return mk_freeze_script(pubkey_hex, locktime)
 
-    def get_taproot_fidelity_bond_key(self, locktime: int) -> HDKey:
-        """Get the HD key for a Taproot fidelity bond (JMP-0005).
-
-        Taproot bond path: ``m/86'/coin'/0'/2/timenumber``. As with the
-        P2WSH bond, the BIP32 child index is the timenumber derived from
-        ``locktime`` (not a separate address index).
-        """
-        from jmcore.timenumber import timestamp_to_timenumber
-
-        timenumber = timestamp_to_timenumber(locktime)
-        root = self._root_path_for_type["p2tr"]
-        path = f"{root}/0'/{FIDELITY_BOND_BRANCH}/{timenumber}"
-        return self.master_key.derive(path)
-
-    def get_taproot_fidelity_bond_address(self, locktime: int) -> str:
-        """Get a Taproot (P2TR) fidelity bond address and register it.
-
-        The bond commits a single CLTV tapscript leaf under the BIP341 NUMS
-        internal key, so the only spend path is the timelocked script path.
-        """
-        from jmcore.btc_script import derive_taproot_bond_address
-        from jmcore.timenumber import timestamp_to_timenumber
-
-        key = self.get_taproot_fidelity_bond_key(locktime)
-        xonly = key.get_public_key_bytes(compressed=True)[1:]
-        bond = derive_taproot_bond_address(xonly, locktime, self.network)
-
-        timenumber = timestamp_to_timenumber(locktime)
-        self.address_cache[bond.address] = (0, FIDELITY_BOND_BRANCH, timenumber)
-        self._address_script_type[bond.address] = "p2tr"
-        self.fidelity_bond_locktime_cache[bond.address] = locktime
-        logger.trace(
-            f"Created taproot fidelity bond address {bond.address} with locktime {locktime}"
-        )
-        return bond.address
-
-    def resolve_taproot_bond(self, address: str, locktime: int) -> tuple[PrivateKey, bytes, bytes]:
-        """Resolve the script-path spend material for a Taproot fidelity bond.
-
-        Returns ``(private_key, tapleaf_script, control_block)`` where
-        ``private_key`` is the raw (untweaked) bond key whose x-only public key
-        is committed in the CLTV tapleaf, and the tapleaf/control block form the
-        rest of the BIP342 witness stack.
-
-        Raises:
-            TransactionSigningError: If the bond key is unknown to this wallet.
-        """
-        from jmcore.btc_script import derive_taproot_bond_address
-
-        from jmwallet.wallet.signing import TransactionSigningError
-
-        key = self.get_taproot_fidelity_bond_key(locktime)
-        xonly = key.get_public_key_bytes(compressed=True)[1:]
-        bond = derive_taproot_bond_address(xonly, locktime, self.network)
-        if bond.address != address:
-            raise TransactionSigningError(
-                f"Taproot bond key mismatch for {address} (locktime {locktime})"
-            )
-        return key.private_key, bond.tapleaf_script, bond.control_block
-
+    def get_locktime_for_address(self, address: str) -> int | None:
         """
         Get the locktime for a fidelity bond address.
 

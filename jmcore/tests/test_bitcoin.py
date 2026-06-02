@@ -245,16 +245,6 @@ class TestEstimateVsize:
         expected = 10 * 68 + 13 * 31 + 11
         assert vsize == expected
 
-    def test_estimate_vsize_taproot_bond_input_larger_than_keypath(self) -> None:
-        """A script-path taproot bond input sizes larger than a key-path P2TR
-        input but smaller than would break consensus (JMP-0005)."""
-        keypath = estimate_vsize(["p2tr"], ["p2tr"])
-        bond = estimate_vsize(["p2tr_bond"], ["p2tr"])
-        # Script-path reveals sig + tapleaf + control block, so it is heavier.
-        assert bond > keypath
-        # 305 wu input + 172 wu output + 42 wu base = 519 wu -> ceil(519/4) = 130
-        assert bond == (41 * 4 + 141 + 43 * 4 + 42 + 3) // 4
-
 
 class TestParseTransactionStrictness:
     """Tests for strict transaction parsing behavior."""

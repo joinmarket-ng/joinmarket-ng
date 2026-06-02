@@ -683,7 +683,7 @@ class TestAddSignaturesValidation:
 
 
 class TestTimelockedInputs:
-    """Tests for nLockTime / nSequence handling of CLTV (fidelity bond) inputs."""
+    """Tests for nLockTime / nSequence handling of transaction inputs."""
 
     _CJ_ADDR = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"
     _CHANGE_ADDR = "bcrt1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qzf4jry"
@@ -716,57 +716,3 @@ class TestTimelockedInputs:
         parsed = parse_transaction_bytes(tx_bytes)
         assert parsed.locktime == 0
         assert all(inp.sequence == 0xFFFFFFFF for inp in parsed.inputs)
-
-    def test_timelocked_taker_input_sets_locktime_and_non_final_sequence(self) -> None:
-        """A spent fidelity bond input must set nLockTime and mark itself non-final."""
-        from jmcore.bitcoin import parse_transaction_bytes
-
-        from taker.tx_builder import NON_FINAL_SEQUENCE
-
-        bond_locktime = 1_900_000_000
-        tx_bytes, _ = build_coinjoin_tx(
-            taker_utxos=[
-                {
-                    "txid": "a" * 64,
-                    "vout": 0,
-                    "value": 2_000_000,
-                    "locktime": bond_locktime,
-                }
-            ],
-            taker_cj_address=self._CJ_ADDR,
-            taker_change_address=self._CHANGE_ADDR,
-            taker_total_input=2_000_000,
-            maker_data=self._maker_data(),
-            cj_amount=1_000_000,
-            tx_fee=5000,
-            network="regtest",
-        )
-
-        parsed = parse_transaction_bytes(tx_bytes)
-        assert parsed.locktime == bond_locktime
-
-        # The bond input is non-final; the regular maker input stays final.
-        sequences = sorted(inp.sequence for inp in parsed.inputs)
-        assert sequences == [NON_FINAL_SEQUENCE, 0xFFFFFFFF]
-
-    def test_locktime_is_max_across_multiple_bonds(self) -> None:
-        """nLockTime must be the maximum CLTV locktime across all timelocked inputs."""
-        from jmcore.bitcoin import parse_transaction_bytes
-
-        low, high = 1_800_000_000, 1_900_000_000
-        tx_bytes, _ = build_coinjoin_tx(
-            taker_utxos=[
-                {"txid": "a" * 64, "vout": 0, "value": 1_200_000, "locktime": low},
-                {"txid": "a" * 64, "vout": 1, "value": 1_200_000, "locktime": high},
-            ],
-            taker_cj_address=self._CJ_ADDR,
-            taker_change_address=self._CHANGE_ADDR,
-            taker_total_input=2_400_000,
-            maker_data=self._maker_data(),
-            cj_amount=1_000_000,
-            tx_fee=5000,
-            network="regtest",
-        )
-
-        parsed = parse_transaction_bytes(tx_bytes)
-        assert parsed.locktime == high

@@ -29,7 +29,6 @@ from jmwallet.wallet.signing import (
     create_p2wsh_witness_stack,
     create_witness_stack,
     sign_p2tr_input,
-    sign_p2tr_script_path_input,
     sign_p2wpkh_input,
     sign_p2wsh_input,
 )
@@ -74,12 +73,6 @@ class WalletSigningMixin:
     ) -> tuple[PrivateKey, bytes] | None:
         raise NotImplementedError
 
-    # Declared for mypy -- actually provided by the host WalletService.
-    def resolve_taproot_bond(  # pragma: no cover
-        self, address: str, locktime: int
-    ) -> tuple[PrivateKey, bytes, bytes]:
-        raise NotImplementedError
-
     def sign_input(
         self,
         tx: ParsedTransaction,
@@ -117,28 +110,6 @@ class WalletSigningMixin:
         if utxo.is_p2tr:
             if prevout_values is None or prevout_scripts is None:
                 raise TransactionSigningError("Taproot inputs require the full prevout set to sign")
-            if utxo.is_timelocked and utxo.locktime is not None:
-                # Taproot fidelity bond (JMP-0005): spend the CLTV tapleaf via
-                # a BIP342 script path. The witness is
-                # ``[signature, tapleaf_script, control_block]`` and the signing
-                # key is the raw (untweaked) bond key.
-                private_key, tapleaf_script, control_block = self.resolve_taproot_bond(
-                    utxo.address, utxo.locktime
-                )
-                signature = sign_p2tr_script_path_input(
-                    tx=tx,
-                    input_index=input_index,
-                    prevouts_values=prevout_values,
-                    prevouts_scripts=prevout_scripts,
-                    private_key=private_key,
-                    tapleaf_script=tapleaf_script,
-                )
-                xonly = private_key.public_key.format(compressed=True)[1:]
-                return SignedInput(
-                    signature=signature,
-                    pubkey=xonly,
-                    witness=[signature, tapleaf_script, control_block],
-                )
             # Key-path spend over the full prevout set; the witness is the
             # single 64-byte Schnorr signature. ``resolve_p2tr_signing_key``
             # returns a coincurve PrivateKey (BIP86 outputs use the taptweak,

@@ -4,21 +4,13 @@ Test Bitcoin script utilities.
 
 import hashlib
 
-import pytest
-
 from jmcore.btc_script import (
-    BIP341_NUMS_H,
-    TAPROOT_LEAF_VERSION,
     BondAddressInfo,
-    TaprootBondInfo,
     _decode_scriptnum,
     derive_bond_address,
-    derive_taproot_bond_address,
     disassemble_script,
     mk_freeze_script,
-    mk_taproot_freeze_tapleaf,
     redeem_script_to_p2wsh_script,
-    tapleaf_hash,
 )
 
 
@@ -191,104 +183,6 @@ def test_derive_bond_address_empty_pubkey():
         raise AssertionError("Should have raised ValueError")
     except ValueError as e:
         assert "Invalid utxo_pub length" in str(e)
-
-
-# ---- Taproot fidelity bond tests ----
-
-_XONLY = bytes.fromhex("a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2")
-_LOCKTIME = 1956528000
-
-
-def test_mk_taproot_freeze_tapleaf_structure():
-    """The tapleaf is <32B x-only> OP_CHECKSIGVERIFY <locktime> OP_CLTV."""
-    leaf = mk_taproot_freeze_tapleaf(_XONLY, _LOCKTIME)
-    disasm = disassemble_script(leaf)
-    assert "OP_CHECKSIGVERIFY" in disasm
-    assert "OP_CHECKLOCKTIMEVERIFY" in disasm
-    # No OP_DROP: CLTV is last and leaves the locktime as a truthy result.
-    assert "OP_DROP" not in disasm
-    # The x-only key is pushed before OP_CHECKSIGVERIFY.
-    assert disasm.index("OP_CHECKSIGVERIFY") < disasm.index("OP_CHECKLOCKTIMEVERIFY")
-    # 32-byte x-only key is pushed with a 0x20 length prefix
-    assert (b"\x20" + _XONLY) in leaf
-
-
-def test_mk_taproot_freeze_tapleaf_rejects_wrong_length():
-    with pytest.raises(ValueError, match="Invalid x-only pubkey length"):
-        mk_taproot_freeze_tapleaf(b"\x02" + _XONLY, _LOCKTIME)  # 33 bytes
-
-
-def test_tapleaf_hash_matches_bip341_definition():
-    """tapleaf_hash == tagged_hash('TapLeaf', version || compact_size || script)."""
-    from jmcore.bitcoin import encode_varint, tagged_hash
-
-    leaf = mk_taproot_freeze_tapleaf(_XONLY, _LOCKTIME)
-    expected = tagged_hash(
-        "TapLeaf", bytes([TAPROOT_LEAF_VERSION]) + encode_varint(len(leaf)) + leaf
-    )
-    assert tapleaf_hash(leaf) == expected
-    assert len(tapleaf_hash(leaf)) == 32
-
-
-def test_derive_taproot_bond_address_structure():
-    info = derive_taproot_bond_address(_XONLY, _LOCKTIME, "regtest")
-    assert isinstance(info, TaprootBondInfo)
-    # P2TR scriptPubKey = OP_1 (0x51) PUSH32 (0x20) <32-byte output key>
-    assert len(info.scriptpubkey) == 34
-    assert info.scriptpubkey[0] == 0x51
-    assert info.scriptpubkey[1] == 0x20
-    assert info.scriptpubkey[2:] == info.output_pubkey
-    assert len(info.output_pubkey) == 32
-    assert info.address.startswith("bcrt1p")
-
-
-def test_derive_taproot_bond_control_block():
-    """Control block is leaf-version|parity followed by the NUMS internal key."""
-    info = derive_taproot_bond_address(_XONLY, _LOCKTIME, "mainnet")
-    assert len(info.control_block) == 33
-    assert info.control_block[0] & 0xFE == TAPROOT_LEAF_VERSION
-    assert info.control_block[1:33] == BIP341_NUMS_H
-
-
-def test_derive_taproot_bond_uses_nums_tweak():
-    """Output key equals NUMS_H tweaked by the single-leaf Merkle root."""
-    from jmcore.bitcoin import taproot_tweak_pubkey
-
-    info = derive_taproot_bond_address(_XONLY, _LOCKTIME, "mainnet")
-    merkle_root = tapleaf_hash(info.tapleaf_script)
-    parity, expected_key = taproot_tweak_pubkey(BIP341_NUMS_H, merkle_root)
-    assert info.output_pubkey == expected_key
-    assert info.control_block[0] == TAPROOT_LEAF_VERSION | parity
-
-
-def test_derive_taproot_bond_deterministic():
-    a = derive_taproot_bond_address(_XONLY, _LOCKTIME, "signet")
-    b = derive_taproot_bond_address(_XONLY, _LOCKTIME, "signet")
-    assert a == b
-
-
-def test_derive_taproot_bond_different_networks():
-    mainnet = derive_taproot_bond_address(_XONLY, _LOCKTIME, "mainnet")
-    regtest = derive_taproot_bond_address(_XONLY, _LOCKTIME, "regtest")
-    signet = derive_taproot_bond_address(_XONLY, _LOCKTIME, "signet")
-    assert mainnet.address.startswith("bc1p")
-    assert regtest.address.startswith("bcrt1p")
-    assert signet.address.startswith("tb1p")
-    # scriptpubkey is network-agnostic
-    assert mainnet.scriptpubkey == regtest.scriptpubkey == signet.scriptpubkey
-
-
-def test_derive_taproot_bond_distinct_params():
-    base = derive_taproot_bond_address(_XONLY, _LOCKTIME, "mainnet")
-    other_time = derive_taproot_bond_address(_XONLY, 1988064000, "mainnet")
-    other_key = derive_taproot_bond_address(bytes(reversed(_XONLY)), _LOCKTIME, "mainnet")
-    assert base.address != other_time.address
-    assert base.address != other_key.address
-
-
-def test_derive_taproot_bond_rejects_wrong_length():
-    with pytest.raises(ValueError, match="Invalid x-only pubkey length"):
-        derive_taproot_bond_address(b"\x02" + _XONLY, _LOCKTIME)
 
 
 # ---- disassemble_script tests ----
