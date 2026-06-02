@@ -157,6 +157,10 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         # send a recovery notification when at least one reconnects
         self._all_directories_disconnected: bool = False
 
+        # Track CoinJoin txids we have already sent a mempool notification for,
+        # so we do not re-notify on every pending-confirmation poll cycle.
+        self._mempool_notified_txids: set[str] = set()
+
         # Track last log time for rate-limited logging
         # Key: log_key, Value: timestamp of last log
         self._rate_limited_log_times: dict[str, float] = {}

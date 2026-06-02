@@ -60,6 +60,7 @@ class MakerBotProtocol(Protocol):
     _direct_connection_rate_limiter: DirectConnectionRateLimiter
     _directory_reconnect_attempts: dict[str, int]
     _all_directories_disconnected: bool
+    _mempool_notified_txids: set[str]
     _own_wallet_nicks: set[str]
     _hp2_own_broadcast_semaphore: asyncio.Semaphore
     _hp2_relay_broadcast_semaphore: asyncio.Semaphore

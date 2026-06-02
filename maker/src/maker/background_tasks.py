@@ -42,6 +42,7 @@ class BackgroundTasksMixin:
     _direct_connection_rate_limiter: DirectConnectionRateLimiter
     _directory_reconnect_attempts: dict[str, int]
     _all_directories_disconnected: bool
+    _mempool_notified_txids: set[str]
 
     def _prune_done_tasks(self) -> None:
         """Remove completed tasks from listen_tasks to prevent unbounded growth."""
@@ -482,6 +483,18 @@ class BackgroundTasksMixin:
 
                 confirmations = tx_info.confirmations
 
+                # First time we observe this CoinJoin in the mempool (still
+                # unconfirmed). Dedupe per-process so we do not re-notify on
+                # every poll while it waits for a block.
+                if confirmations == 0:
+                    mempool_notified = self._mempool_notified_txids
+                    if entry.txid not in mempool_notified:
+                        mempool_notified.add(entry.txid)
+                        await get_notifier().notify_mempool(
+                            txid=entry.txid,
+                            cj_amount=entry.cj_amount,
+                        )
+
                 # Mark as successful once it gets first confirmation
                 if confirmations > 0 and entry.confirmations == 0:
                     logger.info(
@@ -494,6 +507,12 @@ class BackgroundTasksMixin:
                         backend=self.backend,
                         data_dir=self.config.data_dir,
                         wallet_fingerprint=wallet_fp,
+                    )
+                    self._mempool_notified_txids.discard(entry.txid)
+                    await get_notifier().notify_confirmed(
+                        txid=entry.txid,
+                        cj_amount=entry.cj_amount,
+                        confirmations=confirmations,
                     )
 
             except Exception as e:

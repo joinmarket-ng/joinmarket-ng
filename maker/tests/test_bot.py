@@ -1114,6 +1114,115 @@ class TestPeerCountDetection:
             assert entries[0].peer_count == 3
 
 
+class TestPendingConfirmationNotifications:
+    """Maker should emit mempool and confirmed notifications while polling."""
+
+    @pytest.fixture
+    def mock_wallet(self):
+        from unittest.mock import AsyncMock
+
+        wallet = MagicMock()
+        wallet.mixdepth_count = 5
+        wallet.utxo_cache = {}
+        wallet.sync_all = AsyncMock()
+        wallet.get_total_balance = AsyncMock(return_value=1_000_000)
+        wallet.wallet_fingerprint = "deadbeef"
+        return wallet
+
+    @pytest.fixture
+    def config(self, tmp_path):
+        return MakerConfig(
+            mnemonic="test " * 12,
+            directory_servers=["localhost:5222"],
+            network=NetworkType.REGTEST,
+            data_dir=tmp_path,
+        )
+
+    def _make_backend(self, confirmations):
+        from unittest.mock import AsyncMock
+
+        from jmwallet.backends.base import Transaction
+
+        backend = MagicMock()
+        backend.get_block_height = AsyncMock(return_value=930000)
+        backend.get_transaction = AsyncMock(
+            return_value=Transaction(
+                txid="test_txid_123",
+                confirmations=confirmations,
+                raw="01000000...",
+            )
+        )
+        return backend
+
+    def _append_pending(self, tmp_path):
+        from jmwallet.history import append_history_entry, create_maker_history_entry
+
+        entry = create_maker_history_entry(
+            taker_nick="J5TakerNick",
+            cj_amount=91554,
+            fee_received=0,
+            txfee_contribution=0,
+            cj_address="bc1qtest",
+            change_address="bc1qchange",
+            our_utxos=[("abcd1234" * 8, 0)],
+            txid="test_txid_123",
+            network="regtest",
+            wallet_fingerprint="deadbeef",
+        )
+        append_history_entry(entry, data_dir=tmp_path)
+
+    @pytest.mark.asyncio
+    async def test_notify_confirmed_on_first_confirmation(self, mock_wallet, config, tmp_path):
+        from unittest.mock import AsyncMock, patch
+
+        backend = self._make_backend(confirmations=1)
+        bot = MakerBot(wallet=mock_wallet, backend=backend, config=config)
+        self._append_pending(tmp_path)
+
+        notifier = MagicMock()
+        notifier.notify_mempool = AsyncMock()
+        notifier.notify_confirmed = AsyncMock()
+
+        with (
+            patch("maker.background_tasks.get_notifier", return_value=notifier),
+            patch(
+                "jmwallet.history.detect_coinjoin_peer_count",
+                new=AsyncMock(return_value=3),
+            ),
+        ):
+            await bot._update_pending_history()
+
+        notifier.notify_confirmed.assert_awaited_once()
+        kwargs = notifier.notify_confirmed.await_args.kwargs
+        assert kwargs["txid"] == "test_txid_123"
+        assert kwargs["cj_amount"] == 91554
+        assert kwargs["confirmations"] == 1
+        notifier.notify_mempool.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_notify_mempool_once_while_unconfirmed(self, mock_wallet, config, tmp_path):
+        from unittest.mock import AsyncMock, patch
+
+        backend = self._make_backend(confirmations=0)
+        bot = MakerBot(wallet=mock_wallet, backend=backend, config=config)
+        self._append_pending(tmp_path)
+
+        notifier = MagicMock()
+        notifier.notify_mempool = AsyncMock()
+        notifier.notify_confirmed = AsyncMock()
+
+        with patch("maker.background_tasks.get_notifier", return_value=notifier):
+            await bot._update_pending_history()
+            # Second poll while still unconfirmed must not re-notify.
+            await bot._update_pending_history()
+
+        notifier.notify_mempool.assert_awaited_once()
+        kwargs = notifier.notify_mempool.await_args.kwargs
+        assert kwargs["txid"] == "test_txid_123"
+        assert kwargs["cj_amount"] == 91554
+        notifier.notify_confirmed.assert_not_awaited()
+
+
 class TestDirectoryReconnection:
     """Tests for directory server reconnection functionality."""
 
