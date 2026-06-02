@@ -152,6 +152,10 @@ test.describe("Direct Send", () => {
     await collaboratorsInput.fill("4");
     await collaboratorsInput.blur();
 
+    // Dismiss any overlay (e.g. a navigation Sheet whose full-viewport backdrop
+    // would otherwise swallow the force-click on "Send") before submitting.
+    await dismissDialogs(page);
+
     const sendBtn = page
       .getByRole("button", {
         name: /^(Send|Ignore warning\s*&\s*try send)$/i,
