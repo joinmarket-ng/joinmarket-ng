@@ -495,6 +495,44 @@ class TestResolveBackendSettings:
         result = resolve_backend_settings(settings, data_dir=tmp_path)
         assert result.neutrino_auth_token == "supersecret"
 
+    def test_neutrino_url_upgraded_to_https_when_auth_token(self, tmp_path: Path) -> None:
+        """An auth token forces the neutrino URL to HTTPS (auth implies TLS)."""
+        from jmcore.cli_common import resolve_backend_settings
+        from jmcore.settings import JoinMarketSettings
+
+        settings = JoinMarketSettings(
+            bitcoin={
+                "neutrino_url": "http://127.0.0.1:8334",
+                "neutrino_auth_token": "tok",
+            }
+        )
+        result = resolve_backend_settings(settings, data_dir=tmp_path)
+        assert result.neutrino_url == "https://127.0.0.1:8334"
+
+    def test_neutrino_url_kept_http_without_auth_token(self, tmp_path: Path) -> None:
+        """Without an auth token the URL stays HTTP (backwards compatible)."""
+        from jmcore.cli_common import resolve_backend_settings
+        from jmcore.settings import JoinMarketSettings
+
+        settings = JoinMarketSettings(
+            bitcoin={
+                "neutrino_url": "http://127.0.0.1:8334",
+                "neutrino_auth_token_file": "",
+            }
+        )
+        result = resolve_backend_settings(settings, data_dir=tmp_path)
+        assert result.neutrino_url == "http://127.0.0.1:8334"
+
+    def test_neutrino_missing_auth_token_file_is_silent(self, tmp_path: Path) -> None:
+        """A missing default auth-token file leaves the token unset without error."""
+        from jmcore.cli_common import resolve_backend_settings
+        from jmcore.settings import JoinMarketSettings
+
+        settings = JoinMarketSettings(bitcoin={"neutrino_auth_token_file": "neutrino/auth_token"})
+        result = resolve_backend_settings(settings, data_dir=tmp_path)
+        assert result.neutrino_auth_token is None
+        assert result.neutrino_url == "http://127.0.0.1:8334"
+
 
 class TestCreateBackend:
     """Tests for create_backend() passing add_peers to NeutrinoBackend."""

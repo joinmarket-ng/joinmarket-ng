@@ -307,16 +307,36 @@ def resolve_backend_settings(
 
     # If only an auth token *file* is configured, read it now so the backend
     # never has to know where the data dir lives. Relative paths are resolved
-    # against the data directory.
+    # against the data directory. A missing file is not an error: the default
+    # path may simply not exist on insecure/legacy neutrino-api deployments.
     if not resolved_neutrino_auth_token and settings.bitcoin.neutrino_auth_token_file:
         token_path_str = _resolve_data_dir_path(
             settings.bitcoin.neutrino_auth_token_file, resolved_data_dir
         )
         if token_path_str is not None:
-            try:
-                resolved_neutrino_auth_token = Path(token_path_str).read_text().strip() or None
-            except OSError as exc:
-                logger.warning(f"Could not read neutrino auth token from {token_path_str}: {exc}")
+            token_path = Path(token_path_str)
+            if token_path.is_file():
+                try:
+                    resolved_neutrino_auth_token = token_path.read_text().strip() or None
+                except OSError as exc:
+                    logger.warning(
+                        f"Could not read neutrino auth token from {token_path_str}: {exc}"
+                    )
+            else:
+                logger.debug(f"Neutrino auth token file not found at {token_path_str}; skipping")
+
+    # neutrino-api serves HTTPS (with a self-signed certificate) whenever API
+    # authentication is enabled. When a token is present but the URL is still
+    # plain HTTP, upgrade it so requests don't fail with "client sent an HTTP
+    # request to an HTTPS server". The backend pins the certificate on first
+    # use (trust-on-first-use), so no manual cert wiring is required.
+    if resolved_neutrino_auth_token and resolved_neutrino_url.startswith("http://"):
+        upgraded_url = "https://" + resolved_neutrino_url.removeprefix("http://")
+        logger.info(
+            f"Neutrino auth token detected; upgrading URL from "
+            f"{resolved_neutrino_url} to {upgraded_url}"
+        )
+        resolved_neutrino_url = upgraded_url
 
     return ResolvedBackendSettings(
         network=resolved_network,

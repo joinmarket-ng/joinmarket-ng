@@ -305,6 +305,37 @@ class TestBuildTakerConfig:
         assert config.backend_config.get("tls_cert_path") == "/tmp/neutrino/tls.cert"
         assert config.backend_config.get("auth_token") == "token-123"
 
+    def test_neutrino_defaults_resolve_and_upgrade_https(
+        self, sample_mnemonic: str, tmp_path, monkeypatch
+    ) -> None:
+        """Default relative cert/token paths resolve against the data dir, the
+        auth-token file is read, and the URL is upgraded to HTTPS."""
+        from jmcore.settings import JoinMarketSettings
+
+        # Isolate from any real user config so the test relies on defaults.
+        monkeypatch.setenv("JOINMARKET_CONFIG_FILE", str(tmp_path / "missing.toml"))
+
+        token_dir = tmp_path / "neutrino"
+        token_dir.mkdir()
+        (token_dir / "auth_token").write_text("filetoken\n")
+
+        settings = JoinMarketSettings()
+        settings.bitcoin.backend_type = "neutrino"
+
+        config = build_taker_config(
+            settings=settings,
+            mnemonic=sample_mnemonic,
+            passphrase="",
+            destination="bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+            amount=100000,
+            mixdepth=0,
+            data_dir=tmp_path,
+        )
+
+        assert config.backend_config.get("auth_token") == "filetoken"
+        assert config.backend_config.get("neutrino_url") == "https://127.0.0.1:8334"
+        assert config.backend_config.get("tls_cert_path") == str(tmp_path / "neutrino" / "tls.cert")
+
     def test_create_backend_neutrino_passes_tls_and_auth(self, sample_mnemonic: str) -> None:
         """create_backend() passes TLS cert and auth token to NeutrinoBackend."""
         from unittest.mock import MagicMock, patch

@@ -725,10 +725,11 @@ class TestNeutrinoAuthTokenFile:
         assert settings.neutrino_auth_token is None
 
     def test_no_file_no_token(self) -> None:
-        """Without file or token, auth_token stays None."""
+        """Without an explicit token, auth_token stays None and the default
+        token file path is used (read later at backend-resolution time)."""
         settings = BitcoinSettings()
         assert settings.neutrino_auth_token is None
-        assert settings.neutrino_auth_token_file is None
+        assert settings.neutrino_auth_token_file == "neutrino/auth_token"
 
     def test_token_loaded_from_tilde_path(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

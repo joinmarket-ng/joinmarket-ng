@@ -60,6 +60,9 @@
 # rpc_cookie_file = "~/.bitcoin/.cookie"
 
 # Neutrino backend settings (used by all components when backend_type = "neutrino")
+# URL of the neutrino-api server. Defaults to http://127.0.0.1:8334.
+# When an auth token is configured (see below), the URL is automatically
+# upgraded to https:// because neutrino-api serves HTTPS in authenticated mode.
 # neutrino_url = "http://127.0.0.1:8334"
 
 # Preferred neutrino peers (host:port) that should be tried first while still
@@ -98,23 +101,26 @@
 # Neutrino-api security settings (auto-TLS + API token authentication).
 # When neutrino-api starts for the first time it generates a self-signed TLS
 # certificate (tls.cert + tls.key) and a random API token (auth_token) in its
-# data directory.  Set these to enable encrypted, authenticated communication.
-# In Flatpak deployments these are wired automatically from the neutrino data dir.
+# data directory.  Copy (or volume-mount) those into your JoinMarket data
+# directory under "neutrino/" and they are picked up automatically, no need to
+# uncomment anything below. In Flatpak deployments this is wired automatically.
 #
-# Path to the neutrino-api TLS certificate (PEM).  Enables HTTPS with
-# certificate pinning (trust-on-first-use).
-# Relative paths (e.g. "neutrino/tls.cert") are resolved against the data
-# directory ($JOINMARKET_DATA_DIR or --data-dir, default: ~/.joinmarket-ng),
-# so the same config.toml works regardless of where the data dir lives.
-# Absolute paths and paths starting with ~ are used as-is.
+# Path to the neutrino-api TLS certificate (PEM).  Default: "neutrino/tls.cert".
+# When the file exists it is pinned for HTTPS verification. When it is missing
+# but the server is HTTPS, the backend fetches and pins the certificate on first
+# use (trust-on-first-use) and writes it to this path. Relative paths resolve
+# against the data directory ($JOINMARKET_DATA_DIR or --data-dir, default
+# ~/.joinmarket-ng). Absolute paths and ~ paths are used as-is. Set to "" to
+# disable certificate pinning.
 # neutrino_tls_cert = "neutrino/tls.cert"
 #
 # API bearer token for neutrino-api authentication.
 # neutrino_auth_token = ""
 #
 # Path to a file containing the auth token (alternative to neutrino_auth_token).
-# Useful in Docker environments where the token is generated into a shared volume.
-# Relative paths are resolved against the data directory (see neutrino_tls_cert).
+# Default: "neutrino/auth_token". Missing files are ignored. Relative paths
+# resolve against the data directory (see neutrino_tls_cert). Set to "" to
+# disable token authentication.
 # neutrino_auth_token_file = "neutrino/auth_token"
 
 # ============================================================================

@@ -100,17 +100,21 @@ def build_taker_config(
         if rpc_password is not None
         else settings.bitcoin.rpc_password.get_secret_value()
     )
-    effective_neutrino_url = (
-        neutrino_url if neutrino_url is not None else settings.bitcoin.neutrino_url
+    # Resolve neutrino TLS/auth consistently with the jmwallet CLIs: relative
+    # cert/token paths are joined onto the data dir, the auth-token file is read
+    # when present, and the URL is upgraded to HTTPS when auth is enabled.
+    from jmcore.cli_common import resolve_backend_settings
+
+    resolved_backend = resolve_backend_settings(
+        settings,
+        neutrino_url=neutrino_url,
+        neutrino_tls_cert=neutrino_tls_cert,
+        neutrino_auth_token=neutrino_auth_token,
+        data_dir=effective_data_dir,
     )
-    effective_neutrino_tls_cert = (
-        neutrino_tls_cert if neutrino_tls_cert is not None else settings.bitcoin.neutrino_tls_cert
-    )
-    effective_neutrino_auth_token = (
-        neutrino_auth_token
-        if neutrino_auth_token is not None
-        else settings.bitcoin.neutrino_auth_token
-    )
+    effective_neutrino_url = resolved_backend.neutrino_url
+    effective_neutrino_tls_cert = resolved_backend.neutrino_tls_cert
+    effective_neutrino_auth_token = resolved_backend.neutrino_auth_token
 
     # Build backend config
     backend_config: dict[str, Any] = {}

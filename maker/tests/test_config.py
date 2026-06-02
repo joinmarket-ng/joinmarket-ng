@@ -593,6 +593,34 @@ class TestBuildMakerConfig:
         assert config.backend_config.get("tls_cert_path") == "/tmp/neutrino/tls.cert"
         assert config.backend_config.get("auth_token") == "token-123"
 
+    def test_neutrino_defaults_resolve_and_upgrade_https(self, tmp_path: Path, monkeypatch) -> None:
+        """Default relative cert/token paths resolve against the data dir, the
+        auth-token file is read, and the URL is upgraded to HTTPS."""
+        from jmcore.settings import JoinMarketSettings
+
+        from maker.cli import build_maker_config
+
+        # Isolate from any real user config so the test relies on defaults.
+        monkeypatch.setenv("JOINMARKET_CONFIG_FILE", str(tmp_path / "missing.toml"))
+
+        token_dir = tmp_path / "neutrino"
+        token_dir.mkdir()
+        (token_dir / "auth_token").write_text("filetoken\n")
+
+        settings = JoinMarketSettings()
+        settings.bitcoin.backend_type = "neutrino"
+
+        config = build_maker_config(
+            settings=settings,
+            mnemonic=TEST_MNEMONIC,
+            passphrase="",
+            data_dir=tmp_path,
+        )
+
+        assert config.backend_config.get("auth_token") == "filetoken"
+        assert config.backend_config.get("neutrino_url") == "https://127.0.0.1:8334"
+        assert config.backend_config.get("tls_cert_path") == str(tmp_path / "neutrino" / "tls.cert")
+
 
 class TestCreateWalletService:
     """Tests for create_wallet_service function.

@@ -7,7 +7,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from jmwallet.backends.base import BondVerificationRequest
-from jmwallet.backends.neutrino import NeutrinoBackend, NeutrinoConfig
+from jmwallet.backends.neutrino import (
+    GENESIS_BLOCK_HASHES,
+    NeutrinoBackend,
+    NeutrinoConfig,
+    NeutrinoNetworkMismatchError,
+)
 
 
 class TestBackendCloseReuse:
@@ -1294,16 +1299,16 @@ class TestNeutrinoBackendAuth:
         await backend.close()
 
     @pytest.mark.asyncio
-    async def test_tls_cert_path_missing_file_warns(self, tmp_path):
-        """When tls_cert_path points to a nonexistent file, a warning is logged."""
+    async def test_tls_cert_path_missing_file_triggers_tofu(self, tmp_path):
+        """When tls_cert_path is missing and URL is HTTPS, TOFU pinning is pending."""
         missing = str(tmp_path / "nonexistent.cert")
-        with patch("jmwallet.backends.neutrino.logger") as mock_logger:
-            backend = NeutrinoBackend(
-                neutrino_url="https://localhost:8334",
-                tls_cert_path=missing,
-            )
-            mock_logger.warning.assert_called_once()
-            assert "not found" in mock_logger.warning.call_args[0][0]
+        backend = NeutrinoBackend(
+            neutrino_url="https://localhost:8334",
+            tls_cert_path=missing,
+        )
+        # No warning at construction: the cert is fetched and pinned on first use.
+        assert backend._tofu_pending is True
+        assert backend._pinned_cert_pem is None
         await backend.close()
 
     @pytest.mark.asyncio
@@ -1325,7 +1330,7 @@ class TestNeutrinoBackendAuth:
                 neutrino_url="https://localhost:8334",
                 tls_cert_path=str(cert_file),
             )
-            mock_ctx.assert_called_once_with(cafile=str(cert_file))
+            mock_ctx.assert_called_once_with(cafile=str(cert_file), cadata=None)
             # Hostname verification is disabled for pinned certs (TOFU model):
             # the neutrino-api self-signed cert only has SANs for
             # localhost/127.0.0.1/::1, but we may connect via Docker service
@@ -1393,8 +1398,125 @@ class TestNeutrinoBackendAuth:
                 neutrino_url="https://localhost:8334",
                 tls_cert_path="~/.joinmarket-ng/neutrino/tls.cert",
             )
-            mock_ctx.assert_called_once_with(cafile=str(cert_file))
+            mock_ctx.assert_called_once_with(cafile=str(cert_file), cadata=None)
             await backend.close()
+
+
+class TestNeutrinoTofuPinning:
+    """Unit tests for trust-on-first-use TLS certificate pinning."""
+
+    @pytest.mark.asyncio
+    async def test_http_url_never_pins(self):
+        """Plain HTTP URLs do not trigger TOFU pinning."""
+        backend = NeutrinoBackend(neutrino_url="http://localhost:8334")
+        assert backend._is_https is False
+        assert backend._tofu_pending is False
+        await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_tofu_persists_cert_to_path(self, tmp_path):
+        """When tls_cert_path is set, TOFU writes the fetched cert there."""
+        import ssl
+
+        cert_path = tmp_path / "neutrino" / "tls.cert"
+        backend = NeutrinoBackend(
+            neutrino_url="https://localhost:8334",
+            tls_cert_path=str(cert_path),
+        )
+        assert backend._tofu_pending is True
+
+        with (
+            patch(
+                "jmwallet.backends.neutrino.ssl.get_server_certificate",
+                return_value="PEMDATA",
+            ),
+            patch(
+                "jmwallet.backends.neutrino.ssl.create_default_context",
+                return_value=MagicMock(spec=ssl.SSLContext),
+            ),
+        ):
+            await backend._maybe_pin_certificate()
+
+            assert cert_path.is_file()
+            assert cert_path.read_text() == "PEMDATA"
+            assert backend._tofu_pending is False
+            assert backend._pinned_cert_pem is None
+            await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_tofu_pins_in_memory_without_path(self):
+        """Without tls_cert_path, TOFU pins the cert in memory for the session."""
+        import ssl
+
+        backend = NeutrinoBackend(
+            neutrino_url="https://localhost:8334",
+            tls_cert_path="",
+        )
+        assert backend._tofu_pending is True
+
+        with (
+            patch(
+                "jmwallet.backends.neutrino.ssl.get_server_certificate",
+                return_value="MEMPEM",
+            ),
+            patch(
+                "jmwallet.backends.neutrino.ssl.create_default_context",
+                return_value=MagicMock(spec=ssl.SSLContext),
+            ),
+        ):
+            await backend._maybe_pin_certificate()
+
+            assert backend._pinned_cert_pem == "MEMPEM"
+            assert backend._tofu_pending is False
+            await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_tofu_fetch_failure_leaves_pending(self):
+        """If the cert cannot be fetched, TOFU stays pending for a later retry."""
+        backend = NeutrinoBackend(
+            neutrino_url="https://localhost:8334",
+            tls_cert_path="",
+        )
+        with patch(
+            "jmwallet.backends.neutrino.ssl.get_server_certificate",
+            side_effect=OSError("connection refused"),
+        ):
+            await backend._maybe_pin_certificate()
+        assert backend._tofu_pending is True
+        assert backend._pinned_cert_pem is None
+        await backend.close()
+
+
+class TestNeutrinoNetworkVerification:
+    """Unit tests for genesis-hash based network mismatch detection."""
+
+    @pytest.mark.asyncio
+    async def test_matching_network_passes(self):
+        backend = NeutrinoBackend(neutrino_url="http://localhost:8334", network="mainnet")
+        backend.get_block_hash = AsyncMock(return_value=GENESIS_BLOCK_HASHES["mainnet"])
+        await backend._verify_network()
+        assert backend._network_verified is True
+        await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_mismatched_network_raises(self):
+        backend = NeutrinoBackend(neutrino_url="http://localhost:8334", network="mainnet")
+        # Server actually serves signet.
+        backend.get_block_hash = AsyncMock(return_value=GENESIS_BLOCK_HASHES["signet"])
+        with pytest.raises(NeutrinoNetworkMismatchError) as exc:
+            await backend._verify_network()
+        assert "signet" in str(exc.value)
+        assert "mainnet" in str(exc.value)
+        assert backend._network_verified is False
+        await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_genesis_fetch_failure_does_not_block(self):
+        backend = NeutrinoBackend(neutrino_url="http://localhost:8334", network="mainnet")
+        backend.get_block_hash = AsyncMock(side_effect=RuntimeError("server down"))
+        await backend._verify_network()  # best-effort, no raise
+        assert backend._network_verified is False
+        await backend.close()
 
 
 class TestSupportsDescriptorScan:

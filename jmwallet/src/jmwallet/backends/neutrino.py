@@ -27,6 +27,7 @@ import ssl
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 from loguru import logger
@@ -39,6 +40,22 @@ from jmwallet.backends.base import (
     Transaction,
     UTXOVerificationResult,
 )
+
+# Genesis block hashes per Bitcoin network. Used to detect when the neutrino
+# server is serving a different chain than JoinMarket is configured for, which
+# would otherwise silently produce an empty wallet on the wrong network.
+GENESIS_BLOCK_HASHES: dict[str, str] = {
+    "mainnet": "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
+    "testnet": "000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943",
+    "signet": "00000008819873e925422c1ff0f99f7cc9bbb232af63a077a480a3633bee1ef6",
+    "regtest": "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206",
+}
+
+_HASH_TO_NETWORK: dict[str, str] = {h: n for n, h in GENESIS_BLOCK_HASHES.items()}
+
+
+class NeutrinoNetworkMismatchError(Exception):
+    """Raised when the neutrino server is serving a different network."""
 
 
 @dataclass
@@ -120,6 +137,19 @@ class NeutrinoBackend(BlockchainBackend):
         # Store auth settings for client (re-)creation in close().
         self._tls_cert_path = tls_cert_path
         self._auth_token = auth_token
+
+        # TLS trust-on-first-use (TOFU) state.
+        # When the URL is HTTPS but no pinned certificate is available yet, the
+        # backend fetches the server's certificate on the first request and pins
+        # it (persisting to ``tls_cert_path`` when set, otherwise in memory).
+        self._is_https = urlsplit(self.neutrino_url).scheme == "https"
+        self._pinned_cert_pem: str | None = None
+        self._tofu_pending = self._is_https and not self._has_pinned_cert_file()
+        self._tofu_lock = asyncio.Lock()
+
+        # Network verification (genesis hash) runs once on first sync.
+        self._network_verified = False
+
         self.client = self._build_http_client()
 
         # Cache for watched addresses (neutrino needs to know what to scan for)
@@ -174,35 +204,139 @@ class NeutrinoBackend(BlockchainBackend):
         # Server capability detection (populated once on first connection).
         self._server_capabilities = ServerCapabilities()
 
+    def _has_pinned_cert_file(self) -> bool:
+        """Return True when a usable pinned TLS certificate file is configured."""
+        if not self._tls_cert_path:
+            return False
+        return Path(self._tls_cert_path).expanduser().is_file()
+
+    def _build_ssl_context(self) -> ssl.SSLContext | bool:
+        """Build the TLS verification setting for the HTTPS client.
+
+        Returns an ``ssl.SSLContext`` that pins the neutrino-api certificate
+        when pin material is available, or ``False`` (verification disabled)
+        as a placeholder while TOFU pinning is still pending. The placeholder
+        client is never used for a real request: ``_maybe_pin_certificate()``
+        runs before the first call and rebuilds the client with a real pin.
+        """
+        cadata: str | None = None
+        cafile: str | None = None
+        if self._pinned_cert_pem is not None:
+            cadata = self._pinned_cert_pem
+        elif self._has_pinned_cert_file():
+            cafile = str(Path(self._tls_cert_path).expanduser())  # type: ignore[arg-type]
+        else:
+            return False
+
+        ctx = ssl.create_default_context(cafile=cafile, cadata=cadata)
+        # The neutrino-api self-signed certificate only contains SANs for
+        # localhost/127.0.0.1/::1. When connecting via a Docker service name the
+        # hostname won't match. Since we pin the exact certificate (TOFU model,
+        # like SSH), hostname verification is redundant: the certificate itself
+        # is the identity.
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_REQUIRED
+        logger.debug(f"Neutrino HTTPS pinned to {'in-memory cert' if cadata else cafile}")
+        return ctx
+
     def _build_http_client(self) -> httpx.AsyncClient:
         """Create an ``httpx.AsyncClient`` with optional TLS pinning and auth."""
         kwargs: dict[str, Any] = {"timeout": 300.0}
 
-        if self._tls_cert_path:
-            cert_path = Path(self._tls_cert_path).expanduser()
-            if not cert_path.is_file():
-                logger.warning(
-                    f"TLS certificate not found at {cert_path}; "
-                    "falling back to default CA verification"
-                )
-            else:
-                ctx = ssl.create_default_context(cafile=str(cert_path))
-                # The neutrino-api self-signed certificate only contains
-                # SANs for localhost/127.0.0.1/::1.  When connecting via a
-                # Docker service name (e.g. jm-neutrino) the hostname won't
-                # match.  Since we pin the exact certificate file (TOFU
-                # model, like SSH), hostname verification is redundant --
-                # the certificate itself is the identity.
-                ctx.check_hostname = False
-                ctx.verify_mode = ssl.CERT_REQUIRED
-                kwargs["verify"] = ctx
-                logger.debug(f"Neutrino HTTPS pinned to certificate {cert_path}")
+        if self._is_https:
+            kwargs["verify"] = self._build_ssl_context()
 
         if self._auth_token:
             kwargs["headers"] = {"Authorization": f"Bearer {self._auth_token}"}
             logger.debug("Neutrino API authentication enabled (Bearer token)")
 
         return httpx.AsyncClient(**kwargs)
+
+    async def _maybe_pin_certificate(self) -> None:
+        """Fetch and pin the neutrino TLS certificate on first use (TOFU).
+
+        Runs at most once. When ``tls_cert_path`` is configured the fetched
+        certificate is persisted there so future connections verify against it;
+        otherwise it is pinned in memory for the current session only.
+        """
+        if not self._tofu_pending:
+            return
+        async with self._tofu_lock:
+            if not self._tofu_pending:
+                return
+
+            split = urlsplit(self.neutrino_url)
+            host = split.hostname or "127.0.0.1"
+            port = split.port or 443
+            try:
+                pem = await asyncio.to_thread(ssl.get_server_certificate, (host, port), timeout=10)
+            except Exception as exc:
+                logger.warning(
+                    f"Could not fetch neutrino TLS certificate from {host}:{port} "
+                    f"for trust-on-first-use pinning: {exc}"
+                )
+                return
+
+            persisted_to: str | None = None
+            if self._tls_cert_path:
+                cert_path = Path(self._tls_cert_path).expanduser()
+                try:
+                    cert_path.parent.mkdir(parents=True, exist_ok=True)
+                    cert_path.write_text(pem)
+                    persisted_to = str(cert_path)
+                except OSError as exc:
+                    logger.warning(
+                        f"Could not persist pinned neutrino certificate to {cert_path}: {exc}"
+                    )
+
+            if persisted_to is None:
+                self._pinned_cert_pem = pem
+
+            self._tofu_pending = False
+
+            # Rebuild the client so subsequent requests use the pinned cert.
+            old_client = self.client
+            self.client = self._build_http_client()
+            await old_client.aclose()
+
+            if persisted_to:
+                logger.info(
+                    "Pinned neutrino TLS certificate (trust-on-first-use) and saved "
+                    f"it to {persisted_to}. Future connections verify against it."
+                )
+            else:
+                logger.info(
+                    "Pinned neutrino TLS certificate (trust-on-first-use) for this session."
+                )
+
+    async def _verify_network(self) -> None:
+        """Abort if the neutrino server serves a different network (genesis hash).
+
+        Best-effort: when the genesis block hash cannot be fetched (e.g. server
+        not reachable yet) this logs a warning and returns so the caller can
+        retry. A confirmed mismatch raises ``NeutrinoNetworkMismatchError``.
+        """
+        if self._network_verified:
+            return
+        expected = GENESIS_BLOCK_HASHES.get(self.network)
+        if expected is None:
+            self._network_verified = True
+            return
+        try:
+            genesis = await self.get_block_hash(0)
+        except Exception as exc:
+            logger.warning(f"Could not verify neutrino network (genesis fetch failed): {exc}")
+            return
+        if genesis.lower() != expected.lower():
+            actual = _HASH_TO_NETWORK.get(genesis.lower(), "unknown")
+            raise NeutrinoNetworkMismatchError(
+                f"Neutrino server is on the '{actual}' network but JoinMarket is "
+                f"configured for '{self.network}' (genesis {genesis} != {expected}). "
+                f"Point neutrino_url at a '{self.network}' neutrino-api instance or "
+                "set the matching network in your configuration."
+            )
+        self._network_verified = True
+        logger.debug(f"Neutrino network verified: {self.network}")
 
     def set_wallet_creation_height(self, height: int | None) -> None:
         """Use wallet creation height as scan start if no explicit override.
@@ -326,6 +460,9 @@ class NeutrinoBackend(BlockchainBackend):
         data: dict[str, Any] | None = None,
     ) -> Any:
         """Make an API call to the neutrino daemon."""
+        # Pin the TLS certificate on first use before any real request.
+        await self._maybe_pin_certificate()
+
         url = f"{self.neutrino_url}/{endpoint}"
 
         try:
@@ -439,6 +576,11 @@ class NeutrinoBackend(BlockchainBackend):
         while True:
             try:
                 status = await self._api_call("GET", "v1/status")
+
+                # Abort early if the server is on the wrong network. Raised
+                # past the generic handler below so the mismatch is fatal.
+                await self._verify_network()
+
                 synced = status.get("synced", False)
                 block_height = status.get("block_height", 0)
                 filter_height = status.get("filter_height", 0)
@@ -461,6 +603,8 @@ class NeutrinoBackend(BlockchainBackend):
                 else:
                     logger.debug(f"Syncing... blocks: {block_height}, filters: {filter_height}")
 
+            except NeutrinoNetworkMismatchError:
+                raise
             except Exception as e:
                 logger.warning(f"Waiting for neutrino daemon: {e}")
 
