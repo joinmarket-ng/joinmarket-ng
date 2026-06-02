@@ -968,58 +968,99 @@ if [ "${RASPIBLITZ}" -eq 1 ]; then
       SEND_DEST=""
 
       # 1. Source mixdepth
-      SEND_MIXDEPTH=$(prompt_param "Choose a mixdepth to send from" \
-        "$(display_send_status "Source mixdepth (account) to send from.")" \
-        "") || continue
-      SEND_MIXDEPTH=$(to_int "${SEND_MIXDEPTH:-$DEFAULT_MIXDEPTH}" "$DEFAULT_MIXDEPTH")
+      while true; do
+        SEND_MIXDEPTH=$(prompt_param "Choose a mixdepth to send from" \
+          "$(display_send_status "Source mixdepth (account) to send from.")" \
+          "") || continue 2
+        if [ -z "$SEND_MIXDEPTH" ]; then
+          SEND_MIXDEPTH=$DEFAULT_MIXDEPTH
+          break
+        fi
+        if ! [[ "$SEND_MIXDEPTH" =~ ^[0-9]+$ ]]; then
+          whiptail --title " Error " --msgbox "Mixdepth must be a non-negative integer." 8 50
+          continue
+        fi
+        break
+      done
+      SEND_MIXDEPTH=$(to_int "$SEND_MIXDEPTH" "$DEFAULT_MIXDEPTH")
 
       # 2. Amount in satoshis
-      SEND_AMOUNT=$(prompt_param "Send Amount" \
-        "$(display_send_status "Amount in satoshis to send.\n0 = sweep entire mixdepth (best privacy for coinjoin).")" \
-        "") || continue
-      SEND_AMOUNT=$(to_int "${SEND_AMOUNT:-$DEFAULT_AMOUNT}" "$DEFAULT_AMOUNT")
+      while true; do
+        SEND_AMOUNT=$(prompt_param "Send Amount" \
+          "$(display_send_status "Amount in satoshis to send.\n0 = sweep entire mixdepth (best privacy for coinjoin).")" \
+          "") || continue 2
+        if [ -z "$SEND_AMOUNT" ]; then
+          SEND_AMOUNT=$DEFAULT_AMOUNT
+          break
+        fi
+        if ! [[ "$SEND_AMOUNT" =~ ^[0-9]+$ ]]; then
+          whiptail --title " Error " --msgbox "Amount must be a non-negative integer." 8 50
+          continue
+        fi
+        break
+      done
+      SEND_AMOUNT=$(to_int "$SEND_AMOUNT" "$DEFAULT_AMOUNT")
 
       # 3. Counterparties (0 = normal transaction, >0 = coinjoin)
-      SEND_CP=$(prompt_param "Counterparties" \
-        "$(display_send_status "Number of counterparties (makers) for CoinJoin.\n0 = normal transaction (no CoinJoin).\nRecommended for CoinJoin: 4-10.")" \
-        "") || continue
-      SEND_CP=$(to_int "${SEND_CP:-$DEFAULT_COUNTERPARTIES}" "$DEFAULT_COUNTERPARTIES")
+      while true; do
+        SEND_CP=$(prompt_param "Counterparties" \
+          "$(display_send_status "Number of counterparties (makers) for CoinJoin.\n0 = normal transaction (no CoinJoin).\nRecommended for CoinJoin: 4-10.")" \
+          "") || continue 2
+        if [ -z "$SEND_CP" ]; then
+          SEND_CP=$DEFAULT_COUNTERPARTIES
+          break
+        fi
+        if ! [[ "$SEND_CP" =~ ^[0-9]+$ ]]; then
+          whiptail --title " Error " --msgbox "Counterparties must be a non-negative integer." 8 50
+          continue
+        fi
+        break
+      done
+      SEND_CP=$(to_int "$SEND_CP" "$DEFAULT_COUNTERPARTIES")
 
       # 4. Fee rate
-      SEND_FEE=$(prompt_param "Fee Rate" \
-        "$(display_send_status "Fee rate in sat/vB.\nLeave blank for auto (block target in config).")" \
-        "") || continue
-      # Validate fee rate is numeric if provided
-      if [ -n "$SEND_FEE" ] && ! [[ "$SEND_FEE" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
-          whiptail --title " Error " --msgbox "Fee rate must be a numeric value in sat/vB." 8 50
+      while true; do
+        SEND_FEE=$(prompt_param "Fee Rate" \
+          "$(display_send_status "Fee rate in sats/vB.\nLeave blank for auto (block target in config).")" \
+          "") || continue 2
+        if [ -z "$SEND_FEE" ]; then
+          break
+        fi
+        if ! [[ "$SEND_FEE" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+          whiptail --title " Error " --msgbox "Fee rate must be a numeric value in sats/vB." 8 50
           continue
-      fi
+        fi
+        break
+      done
 
       # Set flag to show "auto" instead of "(default: auto)" in next prompts
       SEND_FEE_ENTERED="1"
 
       # 5. Destination address (if empty: INTERNAL coinjoin to next mixdepth)
-      SEND_DEST=$(prompt_param "Destination Address" \
-        "$(display_send_status "Enter destination bitcoin address.\nLeave empty for INTERNAL (next mixdepth, coinjoin only).")" \
-        "") || continue
+      while true; do
+        SEND_DEST=$(prompt_param "Destination Address" \
+          "$(display_send_status "Enter destination bitcoin address.\nLeave empty for INTERNAL (next mixdepth, coinjoin only).")" \
+          "") || continue 2
 
-      # Apply INTERNAL default for coinjoin when destination is empty
-      if [ -z "$SEND_DEST" ] && [ "$SEND_CP" -gt 0 ] 2>/dev/null; then
+        # Apply INTERNAL default for coinjoin when destination is empty
+        if [ -z "$SEND_DEST" ] && [ "$SEND_CP" -gt 0 ] 2>/dev/null; then
           SEND_DEST="INTERNAL"
-      elif [ -z "$SEND_DEST" ]; then
+          break
+        elif [ -z "$SEND_DEST" ]; then
           whiptail --title " Error " --msgbox "Destination address is required for normal transactions." 8 50
           continue
-      fi
+        fi
 
-      # Validate destination looks like a bitcoin address (unless INTERNAL)
-      if [ "$SEND_DEST" != "INTERNAL" ]; then
-          # Accept mainnet (1/3/bc1), testnet (m/n/2/tb1), signet (tb1), regtest (bcrt1)
+        # Validate destination looks like a bitcoin address (unless INTERNAL)
+        if [ "$SEND_DEST" != "INTERNAL" ]; then
           if ! [[ "$SEND_DEST" =~ ^[13mn2][a-km-zA-HJ-NP-Z1-9]{25,40}$ || \
                   "$SEND_DEST" =~ ^(bc|tb|bcrt)1[0-9ac-hj-np-z]{11,71}$ ]]; then
-              whiptail --title " Error " --msgbox "Destination does not look like a valid Bitcoin address." 8 55
-              continue
+            whiptail --title " Error " --msgbox "Destination does not look like a valid Bitcoin address." 8 55
+            continue
           fi
-      fi
+        fi
+        break
+      done
 
       # Determine transaction type label for summary
       if [ "$SEND_CP" -gt 0 ] 2>/dev/null; then
@@ -1030,7 +1071,7 @@ if [ "${RASPIBLITZ}" -eq 1 ]; then
 
       # Fee display
       if [ -n "$SEND_FEE" ]; then
-          FEE_DISPLAY="${SEND_FEE} sat/vB"
+          FEE_DISPLAY="${SEND_FEE} sats/vB"
       else
           FEE_DISPLAY="auto (3-block estimate)"
       fi
@@ -1043,13 +1084,15 @@ if [ "${RASPIBLITZ}" -eq 1 ]; then
       fi
 
       # Show confirmation summary
-      DEFAULT_TX_TYPE="CoinJoin ($DEFAULT_COUNTERPARTIES counterparties)"
-      show_summary "Confirm Send -- $(basename "$CURRENT_WALLET")" \
-        "Type|${DEFAULT_TX_TYPE}|${TX_TYPE}" \
-        "Destination||${SEND_DEST}" \
-        "Amount|$DEFAULT_AMOUNT (sweep)|${AMOUNT_DISPLAY}" \
-        "Source mixdepth|$DEFAULT_MIXDEPTH|${SEND_MIXDEPTH}" \
-        "Fee rate|auto (3-block estimate)|${FEE_DISPLAY}" || continue
+      whiptail --title " Confirm Send " --yesno \
+"  From wallet:     $(basename "$CURRENT_WALLET")
+  Type:            ${TX_TYPE}
+  Source Mixdepth: ${SEND_MIXDEPTH}
+  Amount:          ${AMOUNT_DISPLAY}
+  Fee Rate:        ${FEE_DISPLAY:-auto}
+  Destination:     ${SEND_DEST}
+
+  Proceed with transaction?" 14 65 || continue
 
       # Execute the appropriate command
       clear
