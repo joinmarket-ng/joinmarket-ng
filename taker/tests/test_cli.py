@@ -366,8 +366,44 @@ class TestBuildTakerConfig:
             add_peers=["bitcoin.sgn.space:38333"],
             tls_cert_path="/tmp/neutrino/tls.cert",
             auth_token="token-123",
+            include_mempool=True,
         )
         assert result is mock_backend
+
+    def test_neutrino_include_mempool_flows_to_backend(
+        self, sample_mnemonic: str, tmp_path, monkeypatch
+    ) -> None:
+        """The neutrino_include_mempool toggle reaches NeutrinoBackend so the
+        documented chain-only opt-out is not silently ignored for the taker."""
+        from unittest.mock import MagicMock, patch
+
+        from jmcore.settings import JoinMarketSettings
+
+        monkeypatch.setenv("JOINMARKET_CONFIG_FILE", str(tmp_path / "missing.toml"))
+
+        settings = JoinMarketSettings()
+        settings.bitcoin.backend_type = "neutrino"
+        settings.bitcoin.neutrino_include_mempool = False
+
+        config = build_taker_config(
+            settings=settings,
+            mnemonic=sample_mnemonic,
+            passphrase="",
+            destination="bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+            amount=100000,
+            mixdepth=0,
+            data_dir=tmp_path,
+        )
+        assert config.backend_config.get("include_mempool") is False
+
+        mock_backend = MagicMock()
+        with patch(
+            "jmwallet.backends.neutrino.NeutrinoBackend", return_value=mock_backend
+        ) as mock_cls:
+            create_backend(config)
+
+        _, kwargs = mock_cls.call_args
+        assert kwargs["include_mempool"] is False
 
     def test_data_dir_flows_to_config(self, sample_mnemonic: str, mock_settings: MagicMock) -> None:
         """Verify data_dir from settings flows into TakerConfig.

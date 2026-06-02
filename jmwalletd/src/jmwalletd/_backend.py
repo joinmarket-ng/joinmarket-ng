@@ -159,6 +159,7 @@ async def get_backend(
             add_peers=settings.get_neutrino_add_peers(),
             tls_cert_path=settings.bitcoin.neutrino_tls_cert,
             auth_token=settings.bitcoin.neutrino_auth_token,
+            include_mempool=settings.bitcoin.neutrino_include_mempool,
         )
     else:
         msg = f"Unknown backend type: {backend_type}"

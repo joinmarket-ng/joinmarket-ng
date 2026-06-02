@@ -134,6 +134,7 @@ def build_maker_config(
             "add_peers": settings.get_neutrino_add_peers(),
             "tls_cert_path": effective_neutrino_tls_cert,
             "auth_token": effective_neutrino_auth_token,
+            "include_mempool": settings.bitcoin.neutrino_include_mempool,
         }
 
     # Resolve directory servers
@@ -411,6 +412,7 @@ def create_wallet_service(config: MakerConfig) -> WalletService:
             scan_start_height=backend_cfg.get("scan_start_height"),
             tls_cert_path=backend_cfg.get("tls_cert_path"),
             auth_token=backend_cfg.get("auth_token"),
+            include_mempool=backend_cfg.get("include_mempool", True),
         )
     else:
         raise typer.BadParameter(f"Unsupported backend: {backend_type}")

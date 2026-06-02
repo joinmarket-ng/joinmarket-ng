@@ -136,6 +136,7 @@ def build_taker_config(
             "add_peers": settings.get_neutrino_add_peers(),
             "tls_cert_path": effective_neutrino_tls_cert,
             "auth_token": effective_neutrino_auth_token,
+            "include_mempool": settings.bitcoin.neutrino_include_mempool,
         }
 
     # Resolve directory servers
@@ -284,6 +285,7 @@ def create_backend(config: TakerConfig) -> Any:
             add_peers=config.backend_config.get("add_peers", []),
             tls_cert_path=config.backend_config.get("tls_cert_path"),
             auth_token=config.backend_config.get("auth_token"),
+            include_mempool=config.backend_config.get("include_mempool", True),
         )
     elif config.backend_type == "descriptor_wallet":
         fingerprint = get_mnemonic_fingerprint(

@@ -593,6 +593,38 @@ class TestBuildMakerConfig:
         assert config.backend_config.get("tls_cert_path") == "/tmp/neutrino/tls.cert"
         assert config.backend_config.get("auth_token") == "token-123"
 
+    def test_neutrino_include_mempool_flows_to_backend(self, tmp_path: Path, monkeypatch) -> None:
+        """The neutrino_include_mempool toggle reaches NeutrinoBackend so the
+        documented chain-only opt-out is not silently ignored for the maker."""
+        from unittest.mock import MagicMock, patch
+
+        from jmcore.settings import JoinMarketSettings
+
+        from maker.cli import build_maker_config, create_wallet_service
+
+        monkeypatch.setenv("JOINMARKET_CONFIG_FILE", str(tmp_path / "missing.toml"))
+
+        settings = JoinMarketSettings()
+        settings.bitcoin.backend_type = "neutrino"
+        settings.bitcoin.neutrino_include_mempool = False
+
+        config = build_maker_config(
+            settings=settings,
+            mnemonic=TEST_MNEMONIC,
+            passphrase="",
+            data_dir=tmp_path,
+        )
+        assert config.backend_config.get("include_mempool") is False
+
+        mock_backend = MagicMock()
+        with patch(
+            "jmwallet.backends.neutrino.NeutrinoBackend", return_value=mock_backend
+        ) as mock_cls:
+            create_wallet_service(config)
+
+        _, kwargs = mock_cls.call_args
+        assert kwargs["include_mempool"] is False
+
     def test_neutrino_defaults_resolve_and_upgrade_https(self, tmp_path: Path, monkeypatch) -> None:
         """Default relative cert/token paths resolve against the data dir, the
         auth-token file is read, and the URL is upgraded to HTTPS."""
@@ -709,5 +741,6 @@ class TestCreateWalletService:
             scan_start_height=123,
             tls_cert_path="/tmp/neutrino/tls.cert",
             auth_token="token-123",
+            include_mempool=True,
         )
         assert wallet.backend is mock_backend
