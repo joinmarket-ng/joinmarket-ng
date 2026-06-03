@@ -57,21 +57,23 @@ class OfferConfig(BaseModel):
         ),
     )
     cj_fee_relative: str = Field(
-        default="0.00002",
+        default="0.0005",
         description=(
-            "Relative CJ fee as decimal. Default 0.00002 (0.002%) is exactly the "
-            "lowest taker fee-quantization quantum, so default makers sit on the "
-            "grid and share a homogenized fee with every other default maker, "
-            "maximizing the anonymity set under quantization. It also matches the "
-            "upstream JoinMarket reference. If you deviate to a non-quantized "
-            "value, enable randomization (cjfee_factor=0.1) so your exact policy "
-            "is not a fingerprint."
+            "Relative CJ fee as decimal. Default 0.0005 (0.05%) is the most "
+            "common (mode) maker fee on mainnet and sits exactly on the taker "
+            "fee-quantization grid, so default makers share a homogenized fee "
+            "with the existing mainnet crowd, maximizing the anonymity set. If "
+            "you deviate to an off-grid value, enable randomization "
+            "(cjfee_factor=0.1) so your exact policy is not a fingerprint."
         ),
     )
     cj_fee_absolute: int = Field(
-        default=500,
+        default=100,
         ge=0,
-        description="Absolute CJ fee in satoshis. Used when offer_type is absolute.",
+        description=(
+            "Absolute CJ fee in satoshis. Used when offer_type is absolute. "
+            "Default 100 is the most common (mode) mainnet value and on-grid."
+        ),
     )
     tx_fee_contribution: int = Field(
         default=0,
@@ -232,14 +234,15 @@ class MakerConfig(WalletConfig):
     )
     min_size: int = Field(default=100_000, ge=0, description="Minimum CoinJoin amount in satoshis")
     cj_fee_relative: str = Field(
-        default="0.00002",
+        default="0.0005",
         description=(
-            "Relative CJ fee. Default 0.00002 (0.002%) is exactly the lowest taker "
-            "fee-quantization quantum, so default makers share a homogenized fee "
-            "and a larger anonymity set. See OfferConfig.cj_fee_relative."
+            "Relative CJ fee. Default 0.0005 (0.05%) is the most common (mode) "
+            "mainnet maker fee and sits on the quantization grid, so default "
+            "makers share a homogenized fee and a larger anonymity set. See "
+            "OfferConfig.cj_fee_relative."
         ),
     )
-    cj_fee_absolute: int = Field(default=500, ge=0, description="Absolute CJ fee in satoshis")
+    cj_fee_absolute: int = Field(default=100, ge=0, description="Absolute CJ fee in satoshis")
     tx_fee_contribution: int = Field(
         default=0, ge=0, description="Transaction fee contribution in satoshis"
     )

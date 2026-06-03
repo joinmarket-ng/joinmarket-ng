@@ -158,8 +158,8 @@ class TestSettingsDefaults:
         # to avoid making jm-ng makers fingerprintable. See issue #468.
         assert settings.maker.min_size == 100_000
         assert settings.maker.offer_type == "sw0reloffer"
-        assert settings.maker.cj_fee_relative == "0.00002"
-        assert settings.maker.cj_fee_absolute == 500
+        assert settings.maker.cj_fee_relative == "0.0005"
+        assert settings.maker.cj_fee_absolute == 100
         assert settings.maker.merge_algorithm == "default"
         assert settings.maker.cjfee_factor == 0.0
         assert settings.maker.txfee_contribution_factor == 0.3
@@ -179,7 +179,7 @@ class TestSettingsDefaults:
         # minimum_makers default 4 matches the upstream POLICY default.
         assert settings.taker.minimum_makers == 4
         assert settings.taker.max_cj_fee_abs == 500
-        assert settings.taker.max_cj_fee_rel == "0.001"
+        assert settings.taker.max_cj_fee_rel == "0.0005"
         assert settings.taker.tx_broadcast == "random-peer"
 
 

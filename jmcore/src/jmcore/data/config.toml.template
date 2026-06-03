@@ -310,7 +310,7 @@
 #
 # Example: To use absolute fees, set BOTH:
 #   offer_type = "sw0absoffer"
-#   cj_fee_absolute = 500
+#   cj_fee_absolute = 100
 #
 # To run BOTH offer types simultaneously, use the CLI flag --dual-offers
 # In dual-offer mode the maker advertises one relative and one absolute
@@ -326,14 +326,14 @@
 # offer_type = "sw0reloffer"
 
 # Fee settings (only one is used based on offer_type above)
-# The relative default (0.00002) is exactly the lowest taker fee-quantization
-# quantum, so default makers sit on the grid and share one homogenized fee with
-# every other default maker, maximizing the anonymity set under quantization. It
-# also matches the upstream JoinMarket reference. If you set a non-quantized
+# The relative default (0.0005 = 0.05%) and absolute default (100 sats) are the
+# most common (mode) maker fees on mainnet and both sit on the taker
+# fee-quantization grid, so default makers share one homogenized fee with the
+# existing mainnet crowd, maximizing the anonymity set. If you set an off-grid
 # value, enable cjfee_factor randomization below so your exact fee is not a
 # fingerprint.
-# cj_fee_relative = "0.00002"  # 0.00002 = 0.002% relative fee (for sw0reloffer)
-# cj_fee_absolute = 500        # Absolute fee in satoshis (for sw0absoffer)
+# cj_fee_relative = "0.0005"   # 0.0005 = 0.05% relative fee (for sw0reloffer)
+# cj_fee_absolute = 100        # Absolute fee in satoshis (for sw0absoffer)
 # tx_fee_contribution = 0      # Mining fee contribution in satoshis
 
 # Offer randomization factors. Each advertised offer is sampled uniformly from
@@ -402,8 +402,11 @@
 # counterparty_count = 10
 
 # Maximum acceptable coinjoin fees (paid to makers, not network/miner fees)
+# Defaults sit on the quantization grid; the absolute limit (500) leaves headroom
+# above the common 100 sat maker fee so the homogenized per-slot fee can still
+# land on the crowd's value.
 # max_cj_fee_abs = 500        # Absolute fee in satoshis per maker
-# max_cj_fee_rel = "0.001"    # Relative fee (0.001 = 0.1%)
+# max_cj_fee_rel = "0.0005"   # Relative fee (0.0005 = 0.05%)
 
 # Fee quantization (privacy). When enabled (the default), every selected maker is
 # paid the same homogenized fee, derived from your fee limits above and rounded

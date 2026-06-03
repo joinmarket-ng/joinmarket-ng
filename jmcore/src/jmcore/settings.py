@@ -588,21 +588,24 @@ class MakerSettings(BaseModel):
         description="Offer type: sw0reloffer (relative) or sw0absoffer (absolute)",
     )
     cj_fee_relative: str = Field(
-        default="0.00002",
+        default="0.0005",
         description=(
-            "Relative CoinJoin fee. Default 0.00002 (0.002%) is exactly the "
-            "lowest taker fee-quantization quantum, so default makers sit on the "
-            "grid and share a homogenized fee with every other default maker, "
-            "maximizing the anonymity set under quantization (and matching the "
-            "upstream JoinMarket reference). If you set a non-quantized value, "
-            "enable randomization (cjfee_factor=0.1) so the exact fee is not a "
-            "fingerprint."
+            "Relative CoinJoin fee. Default 0.0005 (0.05%) is the most common "
+            "(mode) maker fee on mainnet and sits exactly on the taker "
+            "fee-quantization grid, so default makers share a homogenized fee "
+            "with the existing mainnet crowd, maximizing the anonymity set. If "
+            "you set an off-grid value, enable randomization (cjfee_factor=0.1) "
+            "so the exact fee is not a fingerprint."
         ),
     )
     cj_fee_absolute: int = Field(
-        default=500,
+        default=100,
         ge=0,
-        description="Absolute CoinJoin fee in satoshis",
+        description=(
+            "Absolute CoinJoin fee in satoshis. Default 100 is the most common "
+            "(mode) absolute maker fee on mainnet and sits on the quantization "
+            "grid."
+        ),
     )
     tx_fee_contribution: int = Field(
         default=0,
@@ -763,7 +766,12 @@ class TakerSettings(BaseModel):
     max_cj_fee_abs: int = Field(
         default=500,
         ge=0,
-        description="Maximum absolute CoinJoin fee in satoshis",
+        description=(
+            "Maximum absolute CoinJoin fee in satoshis. Default 500 gives headroom "
+            "above the common 100 sat maker fee while staying on the quantization "
+            "grid, so the homogenized per-slot fee can still land on the crowd's "
+            "value."
+        ),
     )
     taker_utxo_age: int = Field(
         default=5,
@@ -789,8 +797,11 @@ class TakerSettings(BaseModel):
         ),
     )
     max_cj_fee_rel: str = Field(
-        default="0.001",
-        description="Maximum relative CoinJoin fee (0.001 = 0.1%)",
+        default="0.0005",
+        description=(
+            "Maximum relative CoinJoin fee (0.0005 = 0.05%). Default is the most "
+            "common (mode) mainnet maker fee and on the quantization grid."
+        ),
     )
 
     @field_validator("max_cj_fee_rel", mode="before")

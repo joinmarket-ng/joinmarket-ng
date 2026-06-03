@@ -63,7 +63,7 @@ class MaxCjFee(BaseModel):
     """Maximum CoinJoin fee limits."""
 
     abs_fee: int = Field(default=500, ge=0, description="Maximum absolute fee in sats")
-    rel_fee: str = Field(default="0.001", description="Maximum relative fee (0.001 = 0.1%)")
+    rel_fee: str = Field(default="0.0005", description="Maximum relative fee (0.0005 = 0.05%)")
 
     @field_validator("rel_fee", mode="before")
     @classmethod
