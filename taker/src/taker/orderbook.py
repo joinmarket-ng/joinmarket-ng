@@ -49,6 +49,49 @@ def calculate_cj_fee(offer: Offer, cj_amount: int) -> int:
 # from the taker's own fee limits.
 _MIN_OFFERS_FOR_SAMPLING = 3
 
+# Relative tolerance for grouping near-equal realized fees into one "cluster"
+# when no two offers produce an *exactly* equal fee (the common case for
+# relative-fee makers, whose sat amounts differ slightly). Two fees f1 <= f2
+# are in the same cluster iff f2 <= f1 * (1 + tolerance). 10% mirrors the
+# scale at which makers on nearby offers are effectively indistinguishable
+# (cf. the fee-quantization countermeasure in the mainnet deanonymization
+# analysis: fees that collide on a small grid cannot be told apart).
+_FEE_CLUSTER_REL_TOLERANCE = 0.10
+
+
+def _bond_weight(offer: Offer) -> int:
+    """Selection weight for an offer: its bond value, floored at 1 (bondless)."""
+    return max(offer.fidelity_bond_value, 1)
+
+
+def _bond_weighted_pick(candidates: list[tuple[Offer, int]]) -> tuple[Offer, int]:
+    """Pick one ``(offer, fee)`` weighted by fidelity-bond value (bondless = 1)."""
+    weights = [_bond_weight(offer) for offer, _fee in candidates]
+    return random.choices(candidates, weights=weights, k=1)[0]
+
+
+def _largest_fee_cluster(
+    candidates: list[tuple[Offer, int]], tolerance: float
+) -> list[tuple[Offer, int]]:
+    """Return the densest cluster of near-equal fees (a sliding window).
+
+    Fees are sorted ascending; the returned window is the longest run where
+    ``max_fee <= min_fee * (1 + tolerance)``. Ties on length keep the first
+    (lowest-fee) window. Runs in O(n) over the sorted candidates.
+    """
+    ordered = sorted(candidates, key=lambda c: c[1])
+    best_lo, best_hi = 0, 0  # inclusive [lo, hi]
+    best_count = 0
+    lo = 0
+    for hi, (_, fee_hi) in enumerate(ordered):
+        # Shrink the window from the left until the spread fits the tolerance.
+        while ordered[lo][1] * (1 + tolerance) < fee_hi:
+            lo += 1
+        count = hi - lo + 1
+        if count > best_count:
+            best_count, best_lo, best_hi = count, lo, hi
+    return ordered[best_lo : best_hi + 1]
+
 
 def sample_fake_fee_from_orderbook(
     offers: list[Offer],
@@ -57,31 +100,43 @@ def sample_fake_fee_from_orderbook(
     max_cj_fee: MaxCjFee,
 ) -> int:
     """
-    Sample a fake fee by copying the fee of a non-selected orderbook offer,
-    picked weighted by fidelity bond value.
+    Sample a fake fee that copies an actual non-selected orderbook offer,
+    biased toward the densest cluster of real maker fees.
 
     To make the taker's change output indistinguishable from a maker's change,
     the "fee earned" by the taker should look like a fee an actual maker in
-    the orderbook would have charged. We achieve this by:
+    the orderbook would have charged AND should collide with as many makers as
+    possible, so the change cannot be pinned to one maker's policy. The mainnet
+    deanonymization analysis shows the fee fingerprint (a maker's realized fee
+    is a deterministic function of its offer) is the load-bearing channel, and
+    that the defense is *fee clustering*: a fee shared by many makers carries no
+    attribution. We therefore aim the fake fee at the biggest cluster of real
+    fees, ideally the exact mode. We achieve this by:
 
     1. Restricting candidates to offers that (a) cover ``cj_amount`` and
        (b) belong to makers NOT selected for this round (so the fake fee is
        independent of the selected set and can't be reverse-engineered from
        it).
-    2. Picking ONE offer at random, weighted by ``fidelity_bond_value``.
-       This mirrors :func:`fidelity_bond_weighted_choose`: an observer who
-       knows the selection algorithm sees a fee that follows the SAME
-       distribution as the selected makers, removing the role-detection
-       signal. Bondless candidates fall back to uniform weight ``1``.
-    3. Computing that offer's fee at ``cj_amount`` and returning it verbatim.
-       The fake fee therefore equals an actual orderbook fee, eliminating
-       the "non-orderbook fingerprint" risk entirely.
+    2. If two or more candidates produce the *exact same* fee, returning the
+       **modal** fee (the value the most makers share). Ties between equally
+       popular fees are broken by sampling weighted by each group's total bond
+       value, so the choice tracks the bond-weighted maker distribution rather
+       than always snapping to one deterministic value (which would itself
+       become a fingerprint).
+    3. Otherwise (all fees distinct, typical for relative-fee makers), finding
+       the densest cluster of fees within ``_FEE_CLUSTER_REL_TOLERANCE`` and
+       bond-weighted sampling *inside that cluster*. This lands the fake fee in
+       the most crowded region of the fee distribution while still copying a
+       real offer's fee verbatim.
+    4. If the fees are so spread that no cluster forms (largest cluster is a
+       single offer), falling back to a bond-weighted pick across all
+       candidates (the original behavior).
+
+    In every path the returned value equals an actual orderbook offer's fee, so
+    the fake fee never introduces a "non-orderbook" value of its own.
 
     Fallback: if fewer than ``_MIN_OFFERS_FOR_SAMPLING`` candidate offers are
     available, draw a uniform fee in ``[1, max_cj_fee.rel_fee * cj_amount]``.
-    The upper bound is the maximum fee the taker would accept from a
-    relative-fee maker, which is a natural proxy for what a plausible maker
-    earns.
 
     Args:
         offers: Full orderbook offer list.
@@ -115,20 +170,36 @@ def sample_fake_fee_from_orderbook(
         )
         return random.randint(1, fallback_max)
 
-    # Bond-weighted pick: weight = max(fidelity_bond_value, 1). Bondless
-    # offers still have a chance (weight 1) so the distribution mirrors
-    # the full orderbook, not just the bonded subset. This matches the
-    # behaviour of fidelity_bond_weighted_choose's uniform fallback slots.
-    weights = [max(offer.fidelity_bond_value, 1) for offer, _fee in candidates]
-    chosen_offer, chosen_fee = random.choices(candidates, weights=weights, k=1)[0]
+    # Group candidates by their exact realized fee.
+    by_fee: dict[int, list[Offer]] = {}
+    for offer, fee in candidates:
+        by_fee.setdefault(fee, []).append(offer)
+    mode_count = max(len(group) for group in by_fee.values())
 
-    total_bonded_weight = sum(
-        offer.fidelity_bond_value for offer, _ in candidates if offer.fidelity_bond_value > 0
-    )
+    if mode_count >= 2:
+        # Exact mode exists: aim at the value the most makers share. If several
+        # fees tie for most-popular, pick among them weighted by total bond
+        # value (not deterministically) so we don't manufacture a fingerprint.
+        modal_fees = [fee for fee, group in by_fee.items() if len(group) == mode_count]
+        modal_weights = [sum(_bond_weight(o) for o in by_fee[fee]) for fee in modal_fees]
+        chosen_fee = random.choices(modal_fees, weights=modal_weights, k=1)[0]
+        logger.debug(
+            f"Sampled fake fee {chosen_fee:,} sats from the exact mode "
+            f"(shared by {mode_count} of {len(candidates)} candidate offers, "
+            f"{len(modal_fees)} fee value(s) tied for most popular)"
+        )
+        return chosen_fee
+
+    # All fees distinct: aim at the densest cluster of near-equal fees and
+    # bond-weighted sample inside it. If nothing clusters, fall back to a
+    # bond-weighted pick over all candidates (original behavior).
+    cluster = _largest_fee_cluster(candidates, _FEE_CLUSTER_REL_TOLERANCE)
+    pool = cluster if len(cluster) >= 2 else candidates
+    chosen_offer, chosen_fee = _bond_weighted_pick(pool)
     logger.debug(
         f"Sampled fake fee {chosen_fee:,} sats by copying {chosen_offer.counterparty}'s "
         f"offer (bond={chosen_offer.fidelity_bond_value:,}, "
-        f"candidates={len(candidates)}, total_bond_weight={total_bonded_weight:,})"
+        f"cluster_size={len(cluster)}, candidates={len(candidates)})"
     )
     return chosen_fee
 

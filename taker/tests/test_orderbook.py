@@ -1598,14 +1598,6 @@ class TestSampleFakeFeeFromOrderbook:
         excluded_fees = {
             calculate_cj_fee(o, cj_amount) for o in sample_offers if o.counterparty in selected
         }
-        eligible_fees = {
-            calculate_cj_fee(o, cj_amount)
-            for o in sample_offers
-            if o.counterparty not in selected and o.minsize <= cj_amount <= o.maxsize
-        }
-        # Ensure exclusion is observable: at least one excluded fee is unique.
-        unique_excluded = excluded_fees - eligible_fees
-        assert unique_excluded, "fixture must give selected makers some unique fees"
 
         random.seed(0)
         # Two eligible candidates -> below _MIN_OFFERS_FOR_SAMPLING, falls
@@ -1624,9 +1616,15 @@ class TestSampleFakeFeeFromOrderbook:
             )
             for i in range(3)
         ]
-        eligible_fees |= {
-            calculate_cj_fee(o, cj_amount) for o in extra_offers if o.counterparty not in selected
+        eligible_fees = {
+            calculate_cj_fee(o, cj_amount)
+            for o in sample_offers + extra_offers
+            if o.counterparty not in selected and o.minsize <= cj_amount <= o.maxsize
         }
+        # Ensure exclusion is observable: at least one excluded fee belongs only
+        # to a selected maker (no eligible maker, including the extras, shares it).
+        unique_excluded = excluded_fees - eligible_fees
+        assert unique_excluded, "fixture must give selected makers some unique fees"
 
         for _ in range(20):
             fee = sample_fake_fee_from_orderbook(
@@ -1740,6 +1738,119 @@ class TestSampleFakeFeeFromOrderbook:
             )
             assert 1 <= fee <= fallback_max
             assert fee != 999  # the out-of-range fee must not leak
+
+    def test_prefers_exact_mode_over_high_bond_outlier(self, max_cj_fee: MaxCjFee) -> None:
+        """The modal fee wins even when a lone outlier carries a much bigger bond."""
+        import random
+
+        cj_amount = 100_000
+        # Three makers share the exact same absolute fee (the mode); a single
+        # outlier charges a different fee but holds an enormous bond. The mode
+        # must dominate because clustering, not bond, is what hides the change.
+        offers = [
+            Offer(
+                counterparty=f"clustered_{i}",
+                oid=0,
+                ordertype=OfferType.SW0_ABSOLUTE,
+                minsize=10_000,
+                maxsize=1_000_000,
+                txfee=1000,
+                cjfee=1500,
+                fidelity_bond_value=1000,
+            )
+            for i in range(3)
+        ] + [
+            Offer(
+                counterparty="outlier",
+                oid=0,
+                ordertype=OfferType.SW0_ABSOLUTE,
+                minsize=10_000,
+                maxsize=1_000_000,
+                txfee=1000,
+                cjfee=9999,
+                fidelity_bond_value=10_000_000_000,
+            ),
+        ]
+        random.seed(99)
+        for _ in range(50):
+            fee = sample_fake_fee_from_orderbook(
+                offers, cj_amount, selected_nicks=set(), max_cj_fee=max_cj_fee
+            )
+            assert fee == 1500, "modal fee must beat a high-bond outlier"
+
+    def test_picks_largest_cluster_avoiding_tail_outliers(self, max_cj_fee: MaxCjFee) -> None:
+        """With all-distinct fees, the densest near-equal cluster is chosen."""
+        import random
+
+        cj_amount = 100_000
+        # A tight cluster of four near-equal relative fees plus two far-flung
+        # outliers (distinct from each other and the cluster). No exact mode,
+        # so selection must land inside the dense cluster.
+        cluster_cjfees = ["0.0100", "0.0101", "0.0102", "0.0103"]
+        outlier_cjfees = ["0.0500", "0.0900"]
+        offers = [
+            Offer(
+                counterparty=f"cluster_{i}",
+                oid=0,
+                ordertype=OfferType.SW0_RELATIVE,
+                minsize=10_000,
+                maxsize=1_000_000,
+                txfee=1000,
+                cjfee=cjfee,
+                fidelity_bond_value=1000,
+            )
+            for i, cjfee in enumerate(cluster_cjfees)
+        ] + [
+            Offer(
+                counterparty=f"outlier_{i}",
+                oid=0,
+                ordertype=OfferType.SW0_RELATIVE,
+                minsize=10_000,
+                maxsize=1_000_000,
+                txfee=1000,
+                cjfee=cjfee,
+                # Big bond on the outliers to prove cluster density wins.
+                fidelity_bond_value=10_000_000,
+            )
+            for i, cjfee in enumerate(outlier_cjfees)
+        ]
+        cluster_fees = {calculate_cj_fee(o, cj_amount) for o in offers[:4]}
+        outlier_fees = {calculate_cj_fee(o, cj_amount) for o in offers[4:]}
+        random.seed(2024)
+        for _ in range(50):
+            fee = sample_fake_fee_from_orderbook(
+                offers, cj_amount, selected_nicks=set(), max_cj_fee=max_cj_fee
+            )
+            assert fee in cluster_fees, "fee must fall in the densest cluster"
+            assert fee not in outlier_fees, "tail outliers must not be chosen"
+
+    def test_always_returns_a_real_offer_fee(self, max_cj_fee: MaxCjFee) -> None:
+        """Across mode/cluster/fallback paths the result is always a real fee."""
+        import random
+
+        cj_amount = 123_456
+        offers = [
+            Offer(
+                counterparty=f"m{i}",
+                oid=0,
+                ordertype=OfferType.SW0_RELATIVE,
+                minsize=10_000,
+                maxsize=1_000_000,
+                txfee=1000,
+                cjfee=cjfee,
+                fidelity_bond_value=bond,
+            )
+            for i, (cjfee, bond) in enumerate(
+                [("0.001", 0), ("0.001", 5000), ("0.0011", 200), ("0.05", 9_000_000)]
+            )
+        ]
+        real_fees = {calculate_cj_fee(o, cj_amount) for o in offers}
+        random.seed(11)
+        for _ in range(100):
+            fee = sample_fake_fee_from_orderbook(
+                offers, cj_amount, selected_nicks=set(), max_cj_fee=max_cj_fee
+            )
+            assert fee in real_fees
 
 
 class TestEqualizeMakerFees:
