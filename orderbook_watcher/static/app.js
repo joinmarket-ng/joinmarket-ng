@@ -240,18 +240,26 @@ function formatRelPct(relStr) {
     return (parseFloat(relStr) * 100).toPrecision(2).replace(/\.?0+$/, '') + '%';
 }
 
-// Bucket a value onto the largest grid entry <= value. Returns the grid index,
-// or -1 when the value is below the smallest grid entry.
-function floorGridIndex(value, grid) {
-    let idx = -1;
+// Bucket a fee onto the smallest grid entry >= fee (round up). A maker is
+// selectable by a taker only when the taker's quantized fee is >= the maker's
+// advertised fee, so a maker lands in the smallest quantum that still covers it
+// (its "hide set"). Returns the grid index, or -1 when the fee is above the
+// largest grid entry (no quantum covers it; the maker is effectively
+// unselectable by a quantizing taker).
+function ceilGridIndex(value, grid) {
     for (let i = 0; i < grid.length; i++) {
-        if (grid[i] <= value) {
-            idx = i;
-        } else {
-            break;
+        if (grid[i] >= value) {
+            return i;
         }
     }
-    return idx;
+    return -1;
+}
+
+// A maker counts as bonded when it advertises a fidelity bond, even if the bond
+// value cannot be computed here (no blockchain/mempool backend): the advertised
+// bond is still sybil-resistant. The value only feeds the value-weighted total.
+function hasAdvertisedBond(offer) {
+    return !!offer.fidelity_bond_data || (offer.fidelity_bond_value || 0) > 0;
 }
 
 function renderFeeQuantizationChart() {
@@ -271,10 +279,13 @@ function renderFeeQuantizationChart() {
 
     // Dedupe to one offer per maker for the active offer family. A maker with
     // multiple offers contributes once (its cheapest offer of that family).
+    // Only bonded makers are charted: bondless makers are sybil-cheap and would
+    // let a single operator skew the bands arbitrarily.
     const perMaker = new Map();
     for (const offer of orderbookData.offers) {
         const offerIsAbs = ABS_OFFER_TYPES.has(offer.ordertype);
         if (offerIsAbs !== isAbs) continue;
+        if (!hasAdvertisedBond(offer)) continue;
         const fee = parseFloat(offer.cjfee);
         if (!Number.isFinite(fee)) continue;
         const prev = perMaker.get(offer.counterparty);
@@ -286,20 +297,24 @@ function renderFeeQuantizationChart() {
         }
     }
 
-    // Buckets: index -1 (below grid) plus one per grid entry.
+    if (perMaker.size === 0) {
+        container.innerHTML =
+            '<p class="fee-quant-empty">No bonded makers in the orderbook yet.</p>';
+        return;
+    }
+
+    // Buckets: one per grid entry, plus an "above grid" overflow for makers
+    // whose fee exceeds the largest quantum (unselectable by a quantizing taker).
     const buckets = grid.map(() => ({ count: 0, bond: 0 }));
-    const below = { count: 0, bond: 0 };
+    const above = { count: 0, bond: 0 };
     for (const { fee, bond } of perMaker.values()) {
-        const idx = floorGridIndex(fee, grid);
-        const target = idx === -1 ? below : buckets[idx];
+        const idx = ceilGridIndex(fee, grid);
+        const target = idx === -1 ? above : buckets[idx];
         target.count += 1;
         target.bond += bond;
     }
 
     const rows = [];
-    if (below.count > 0) {
-        rows.push({ label: isAbs ? '< min' : '< min', sub: 'below grid', ...below });
-    }
     grid.forEach((g, i) => {
         rows.push({
             label: isAbs ? g.toLocaleString() : formatRelPct(quant.rel_grid[i]),
@@ -308,6 +323,9 @@ function renderFeeQuantizationChart() {
             ...buckets[i],
         });
     });
+    if (above.count > 0) {
+        rows.push({ label: '> max', sub: 'above grid', ...above });
+    }
 
     const maxCount = Math.max(1, ...rows.map(r => r.count));
 
@@ -325,9 +343,9 @@ function renderFeeQuantizationChart() {
 
         const hint = row.raw !== undefined
             ? (isAbs
-                ? `To be selectable here, set cj_fee_absolute <= ${row.raw} sats (leave headroom for randomization).`
-                : `To be selectable here, set cj_fee_relative <= ${row.sub} (leave headroom for randomization).`)
-            : 'Makers whose fee is below the smallest quantization band.';
+                ? `Makers here advertise <= ${row.raw} sats; a quantizing taker pays them exactly ${row.raw} sats. To land here, set cj_fee_absolute = ${row.raw} with cjfee_factor = 0 (no randomization) so you sit on the quantum.`
+                : `Makers here advertise <= ${row.sub}; a quantizing taker pays them exactly ${row.sub}. To land here, set cj_fee_relative = ${row.sub} with cjfee_factor = 0 (no randomization) so you sit on the quantum.`)
+            : 'Makers whose fee is above the largest quantum: a quantizing taker cannot select them.';
         bar.title = `${row.count} maker(s), ${formatBtc(row.bond)} bonded. ${hint}`;
 
         const countLabel = document.createElement('div');

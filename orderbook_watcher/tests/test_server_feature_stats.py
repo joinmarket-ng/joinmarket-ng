@@ -25,6 +25,7 @@ def _make_offer(
     bond: int = 0,
     features: dict[str, bool] | None = None,
     oid: int = 0,
+    bond_data: dict[str, object] | None = None,
 ) -> Offer:
     return Offer(
         counterparty=nick,
@@ -35,6 +36,7 @@ def _make_offer(
         txfee=1_000,
         cjfee="0.0003",
         fidelity_bond_value=bond,
+        fidelity_bond_data=bond_data,
         features=features if features is not None else {},
     )
 
@@ -115,6 +117,30 @@ def test_feature_stats_counts_each_maker_once() -> None:
             _make_offer("J5bonded", bond=10**14, features={"ping": True}, oid=0),
             _make_offer("J5bonded", bond=10**14, features={"ping": True}, oid=1),
             _make_offer("J5bonded", bond=10**14, features={"ping": True}, oid=2),
+        ],
+    )
+
+    result = server._format_orderbook(orderbook)
+
+    assert result["feature_stats"] == {"ping": 1}
+    assert result["feature_stats_denominator"] == 1
+
+
+def test_feature_stats_counts_advertised_bond_without_value() -> None:
+    """Makers that advertise a bond count as bonded even when the value is 0.
+
+    Without a blockchain/mempool backend the bond value cannot be computed
+    (``fidelity_bond_value == 0``), but the advertised bond is still
+    sybil-resistant and must feed feature stats. See issue #508 follow-up.
+    """
+    server = _make_server()
+    bond_data = {"utxo_txid": "ab" * 32, "utxo_vout": 0}
+    orderbook = OrderBook(
+        timestamp=datetime.now(UTC),
+        offers=[
+            _make_offer("J5advertised", bond=0, features={"ping": True}, bond_data=bond_data),
+            # Truly bondless maker (no value, no advertised bond) stays excluded.
+            _make_offer("J5sybil", bond=0, features={"ping": True}),
         ],
     )
 
