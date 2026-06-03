@@ -32,7 +32,9 @@ class TestGridShape:
         assert QUANT_REL[0] == Decimal("0.00002")
 
     def test_smallest_abs_quantum(self) -> None:
-        assert QUANT_ABS[0] == 100
+        # The grid starts at 0, the free-maker band.
+        assert QUANT_ABS[0] == 0
+        assert QUANT_ABS[1] == 100
 
 
 class TestQuantizeRelDown:
@@ -66,13 +68,15 @@ class TestQuantizeAbsDown:
             (10000, 10000),
             (50000, 10000),
             (100, 100),
+            (0, 0),  # zero lands on the free-maker band
+            (99, 0),  # below the lowest paid quantum floors to 0
         ],
     )
     def test_floor_to_grid(self, abs_fee: int, expected: int) -> None:
         assert quantize_abs_down(abs_fee) == expected
 
-    def test_below_grid_returns_none(self) -> None:
-        assert quantize_abs_down(99) is None
+    def test_negative_returns_none(self) -> None:
+        assert quantize_abs_down(-1) is None
 
 
 class TestQuantizeUp:
@@ -86,6 +90,7 @@ class TestQuantizeUp:
     def test_abs_up_rounds_up(self) -> None:
         assert quantize_abs_up(750) == 1000
         assert quantize_abs_up(500) == 500
+        assert quantize_abs_up(0) == 0  # zero is on the grid
 
     def test_abs_up_above_grid_returns_none(self) -> None:
         assert quantize_abs_up(50000) is None
