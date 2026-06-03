@@ -28,8 +28,37 @@ Per round the taker:
    distributed as a partial top-up to the lowest-fee maker first; any
    remainder is added to the on-chain transaction fee. The fake fee
    itself is sampled by copying the fee of a real, non-selected
-   orderbook offer (picked weighted by fidelity bond value), so it
-   always matches an actual orderbook quote.
+   orderbook offer, so it always matches an actual orderbook quote
+   (see "Fake fee selection" below).
+
+## Fake fee selection
+
+The taker's fake "earned fee" output is what makes its change look like a
+maker fee receipt, so its value matters. The mainnet deanonymization analysis
+shows the *fee fingerprint* is the load-bearing channel: a maker's realized fee
+is a deterministic function of its public offer, so a one-off fee value can pin
+the change output to a single maker's policy. The defense is *fee clustering*: a
+fee shared by many makers carries no attribution.
+
+The fake fee is therefore aimed at the most crowded region of the real,
+non-selected fee distribution rather than at any single offer:
+
+- Candidates are the non-selected offers that cover `cj_amount` (excluding the
+  selected makers keeps the fake fee independent of this round's selection).
+- If two or more candidates produce the *exact same* fee, the **modal** fee
+  wins (the value the most makers share). Ties between equally popular fees are
+  broken by sampling weighted by each group's total fidelity-bond value.
+- Otherwise (all fees distinct, typical for relative-fee makers) the densest
+  cluster of near-equal fees is chosen (fees within a 10% relative tolerance
+  count as one cluster), and a fee is picked inside it weighted by bond value.
+- If the fees are so spread that no cluster forms, it falls back to a
+  bond-weighted pick across all candidates.
+
+In every path the returned value equals an actual orderbook offer's fee, so the
+fake fee maximizes its change output's hide-set while never introducing a
+"non-orderbook" value that would become a fingerprint of its own. When fewer
+than three candidate offers are available, the taker falls back to a uniform
+draw from its own fee-limit range.
 
 ## What does NOT change
 
