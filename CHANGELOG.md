@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.32.0] - 2026-06-03
+
+Neutrino backend now has mempool support. Along with other improvements and bug fixes.
+
+### Added
+
+- Takers now switch to a direct maker connection mid-session once ([a03e2ac5](../../commit/a03e2ac5aa35b0f403608e29a7d2faac6240e005))
+- Show registered but unfunded fidelity bonds in list-bonds ([d193bb15](../../commit/d193bb1599b9743acaa4f1d803c42d7ac2abded7))
+- CLI commands now print help when invoked without required arguments ([e5a23af5](../../commit/e5a23af590cdfe3fc787f80793d0c464b7b9ab5e))
+- Add 'jm-wallet sync-bonds' to quickly refresh funded status of registered fidelity bonds ([ecf396e9](../../commit/ecf396e92d226babac158207df871f5334279fc3))
+- Use the neutrino-api watched mempool tracker when available so neutrino takers verify maker broadcasts and follow the configured broadcast policy, with a neutrino_include_mempool opt-out for chain-only behaviour ([6b913cae](../../commit/6b913caec176a17683eb9b187ccf36d840198e2a))
+
+### Fixed
+
+- Exclude UTXOs locked by other in-flight CoinJoins from ([ee23530f](../../commit/ee23530f7582d27ef9b5fea05510eaa42f393233))
+- Fix jm-wallet info mislabeling plain wallet sends as CoinJoin outputs/change ([6904da14](../../commit/6904da1404814b5f4bacf8a8fc725b40ea07e0fc))
+- Fix fidelity bond registry copying other wallets' bonds into a wallet's own per-wallet registry file ([601ed69b](../../commit/601ed69bf0cfe1ac3def7afe88e54f6ac73484ba))
+- Make offline list-bonds and registry-show use the configured wallet when no flags are given ([691e11ad](../../commit/691e11ada051757c702ea3421814dbbcad8512d7))
+- list-bonds is now offline-only; use recover-bonds to scan the blockchain ([9ef23258](../../commit/9ef23258b9cb85420b2de9ef0317c62bf9e2f573))
+- Fix history CSV corruption from a reordered column header that hid CoinJoin fingerprints and left confirmed rounds stuck pending ([93e8953a](../../commit/93e8953a91ace06726efec3e55bce557dcad2af5))
+- Notifications now include the full txid and an optional block explorer link ([5032750f](../../commit/5032750fa5ccadb1f39bd49d6ee22f217c6378a2))
+- Maker now sends notifications when a CoinJoin enters the mempool and when it confirms ([e4442fc8](../../commit/e4442fc875bb7e8cc51822a013928da2f39f5126))
+- Secure the neutrino backend out-of-the-box with TLS trust-on-first-use pinning, default cert/token paths, automatic HTTPS, and a hard error on network mismatch ([fd3e4d8c](../../commit/fd3e4d8ccc35a03c53ef5e832c011ad2fd921971))
+
 ## [0.31.1] - 2026-05-30
 
 ### Fixed
@@ -1447,7 +1471,8 @@ Releases prior to these changes (including 0.13.5, 0.13.6, and 0.13.7) cannot be
 - Pre-built image support for directory server compose.
 - Tor configuration instructions.
 
-[Unreleased]: ../../compare/0.31.1...HEAD
+[Unreleased]: ../../compare/0.32.0...HEAD
+[0.32.0]: ../../compare/0.31.1...0.32.0
 [0.31.1]: ../../compare/0.31.0...0.31.1
 [0.31.0]: ../../compare/0.30.0...0.31.0
 [0.30.0]: ../../compare/0.29.0...0.30.0
