@@ -720,6 +720,15 @@ tbody tr:hover {
     background: #30363d;
 }
 
+.fq-cum {
+    color: #3fb950;
+    font-size: 0.7rem;
+    font-weight: 600;
+    margin-top: 5px;
+    text-align: center;
+    cursor: help;
+}
+
 .fq-tick {
     color: #8b949e;
     font-size: 0.72rem;
