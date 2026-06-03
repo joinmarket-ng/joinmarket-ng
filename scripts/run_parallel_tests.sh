@@ -831,7 +831,26 @@ run_suite_swap_e2e() {
         wait_for_port "$dir_port" "Directory ($suite)"
         wait_for_wallet_funder "$suite"
 
-        # Swap tests do not need makers; no extra connect wait required.
+        # Swap tests need the Nostr relay and the Electrum swap server, which
+        # are not gated by the directory/wallet-funder waits above. Wait for
+        # the relay port and the swap server's ready file (exported into the
+        # per-suite shared dir) before starting pytest, otherwise the readiness
+        # tests skip (and --fail-on-skip turns that into a failure).
+        wait_for_port "$nostr_port" "Nostr relay ($suite)"
+        local ready_file="${shared_dir}/electrum-swap-ready"
+        local waited=0
+        while [ ! -f "$ready_file" ] && [ "$waited" -lt 180 ]; do
+            sleep 3
+            waited=$((waited + 3))
+        done
+        if [ ! -f "$ready_file" ]; then
+            log_error "Electrum swap server not ready for suite $suite (no $ready_file)"
+            return 1
+        fi
+
+        # One swap test runs a full CoinJoin, so makers must have connected.
+        sleep 20  # Wait for makers to connect
+
         # Endpoints are remapped per suite, so pass overrides via env.
         BITCOIN_RPC_URL="http://127.0.0.1:${btc_rpc}" \
         BITCOIN_RPC_USER=test \

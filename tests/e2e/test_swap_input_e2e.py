@@ -74,7 +74,18 @@ ELECTRUM_SWAP_INFO_PATH = _SHARED_DIR / "electrum" / "swap-server-info.json"
 
 
 def _require_docker_container(name: str) -> None:
-    """Skip the test if a Docker container is not running."""
+    """Skip the test if a Docker container is not running.
+
+    ``name`` is the default-prefixed container name (e.g. ``jm-nostr-relay``).
+    Under the parallel test runner the containers are renamed with a per-suite
+    prefix (``JM_CONTAINER_PREFIX``), so the ``jm-`` prefix is rewritten to the
+    active prefix before inspection.
+    """
+    from tests.e2e.docker_utils import get_container_prefix
+
+    prefix = get_container_prefix()
+    if prefix != "jm" and name.startswith("jm-"):
+        name = f"{prefix}-{name[len('jm-') :]}"
     try:
         result = subprocess.run(
             ["docker", "inspect", "-f", "{{.State.Running}}", name],
