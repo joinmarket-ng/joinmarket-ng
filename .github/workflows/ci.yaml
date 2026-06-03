@@ -509,14 +509,6 @@ jobs:
             "curl -skf https://127.0.0.1:28183/api/v1/getinfo" \
             60 2
 
-          .github/scripts/wait-for-service.sh "Nostr relay" \
-            "python3 -c 'import socket; s=socket.socket(); s.settimeout(2); s.connect((\"127.0.0.1\",7000))'" \
-            30 1
-
-          .github/scripts/wait-for-service.sh "Electrum swap server" \
-            "test -f shared/electrum-swap-ready" \
-            180 3
-
           echo "Waiting for makers to connect..."
           sleep 20
 
@@ -614,7 +606,7 @@ jobs:
           COMPOSE_DOCKER_CLI_BUILD: 1
         run: |
           # Start with pre-built images (env vars override build)
-          docker compose --profile e2e up -d
+          docker compose --profile e2e --profile swap-e2e up -d
 
           .github/scripts/wait-for-service.sh "Bitcoin" \
             "docker compose exec -T bitcoin bitcoin-cli -chain=regtest -rpcport=18443 -rpcuser=test -rpcpassword=test getblockchaininfo" \
@@ -664,7 +656,7 @@ jobs:
         if: always()
         run: |
           echo "=== Docker compose status ==="
-          docker compose --profile e2e ps
+          docker compose --profile e2e --profile swap-e2e ps
           echo ""
           echo "=== Bitcoin logs ==="
           docker compose logs bitcoin --tail=30
@@ -683,7 +675,7 @@ jobs:
 
       - name: Cleanup
         if: always()
-        run: docker compose --profile e2e down -v
+        run: docker compose --profile e2e --profile swap-e2e down -v
 
       - uses: actions/upload-artifact@v7
         with:

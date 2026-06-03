@@ -551,7 +551,7 @@ services:
       bitcoin:
         condition: service_healthy
     profiles:
-      - e2e
+      - swap-e2e
       - all
 
   # Nostr relay: lightweight Rust relay for swap server DM communication
@@ -583,7 +583,7 @@ services:
       start_period: 10s
       retries: 5
     profiles:
-      - e2e
+      - swap-e2e
       - all
 
   # Electrum swap server: runs Electrum daemon with swapserver plugin
@@ -631,7 +631,7 @@ services:
       bitcoin:
         condition: service_healthy
     profiles:
-      - e2e
+      - swap-e2e
       - all
 
   # ============================================================================
@@ -693,7 +693,7 @@ services:
       bitcoin:
         condition: service_healthy
     profiles:
-      - e2e
+      - swap-e2e
       - all
 
   # Lightning channel setup: funds taker LND, opens a cross-implementation channel
@@ -723,7 +723,7 @@ services:
       bitcoin:
         condition: service_healthy
     profiles:
-      - e2e
+      - swap-e2e
       - all
 
   # ============================================================================

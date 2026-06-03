@@ -661,7 +661,7 @@ restart_makers() {
 cleanup_suite() {
     local suite=$1
     log_info "Cleaning up suite: $suite"
-    compose_cmd "$suite" --profile e2e --profile reference --profile neutrino --profile reference-maker down -v 2>/dev/null || true
+    compose_cmd "$suite" --profile e2e --profile swap-e2e --profile reference --profile neutrino --profile reference-maker down -v 2>/dev/null || true
     compose_cmd "$suite" down --remove-orphans -v 2>/dev/null || true
     rm -rf "${PARALLEL_DIR}/shared/${suite}" 2>/dev/null || true
 }
@@ -680,7 +680,7 @@ cleanup_all() {
     # Note: we intentionally do NOT run a global `docker volume prune` here, as
     # that would delete volumes belonging to other concurrently-running
     # instances. Each project's volumes are already removed via `down -v`.
-    docker compose -p "${PROJECT_PREFIX}-default" --profile e2e --profile reference \
+    docker compose -p "${PROJECT_PREFIX}-default" --profile e2e --profile swap-e2e --profile reference \
         --profile neutrino --profile reference-maker down -v 2>/dev/null || true
     docker compose -p "${PROJECT_PREFIX}-default" down --remove-orphans -v 2>/dev/null || true
 
@@ -822,7 +822,7 @@ run_suite_swap_e2e() {
     {
         generate_override "$suite"
         cleanup_suite "$suite"
-        compose_cmd "$suite" --profile e2e up -d
+        compose_cmd "$suite" --profile e2e --profile swap-e2e up -d
 
         if ! wait_for_bitcoin_rpc "$suite" "$btc_rpc"; then
             log_error "Bitcoin RPC not ready on host port $btc_rpc for suite $suite"
