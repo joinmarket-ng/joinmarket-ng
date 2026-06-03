@@ -24,6 +24,7 @@ from taker.swap.persistence import (
 )
 from taker.swap.recovery import (
     DUST_THRESHOLD_SATS,
+    MIN_CLAIM_FEE_SATS,
     RecoveryOutcome,
     SwapRecovery,
     build_claim_transaction,
@@ -147,11 +148,11 @@ def _make_record(
     )
 
 
-def _utxo_for(record: SwapRecord) -> UTXO:
+def _utxo_for(record: SwapRecord, *, value: int | None = None) -> UTXO:
     return UTXO(
         txid=record.txid,
         vout=record.vout,
-        value=record.value,
+        value=record.value if value is None else value,
         address=record.lockup_address,
         confirmations=3,
         scriptpubkey=script_to_p2wsh_scriptpubkey(record.witness_script).hex(),
@@ -425,6 +426,50 @@ class TestRecoverRecord:
         outcomes = {r.swap_id: r.outcome for r in results}
         assert outcomes[live.swap_id] is RecoveryOutcome.CLAIMED
         assert outcomes[gone.swap_id] is RecoveryOutcome.ALREADY_SPENT
+
+    @pytest.mark.asyncio
+    async def test_recover_all_only_consumes_address_for_claims(self, setup) -> None:
+        # One claimable lockup, one already-spent record. Lazy allocation must
+        # consume exactly one fresh address (for the claim), not one per record.
+        ws1, ws2 = _witness_script(), _witness_script()
+        live = _make_record(ws1)
+        gone = _make_record(ws2, coinjoin_txid="dd" * 32)
+        recovery, backend, store = setup(utxos=[_utxo_for(live)])
+        store.save(live)
+        store.save(gone)
+        provider = _FakeKeyProvider(data_dir=None)
+        await recovery.recover_all(address_provider=wallet_address_provider(provider))
+        assert provider._addr_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_dust_lockup_consumes_no_address(self, setup) -> None:
+        ws = _witness_script()
+        record = _make_record(ws)
+        dust_value = MIN_CLAIM_FEE_SATS + DUST_THRESHOLD_SATS - 1
+        recovery, backend, store = setup(utxos=[_utxo_for(record, value=dust_value)])
+        store.save(record)
+        provider = _FakeKeyProvider(data_dir=None)
+        result = await recovery.recover_record(
+            record, address_provider=wallet_address_provider(provider)
+        )
+        assert result.outcome is RecoveryOutcome.DUST
+        assert provider._addr_calls == 0
+        assert not backend.broadcast_calls
+
+    @pytest.mark.asyncio
+    async def test_requires_exactly_one_destination(self, setup) -> None:
+        ws = _witness_script()
+        record = _make_record(ws)
+        recovery, _backend, store = setup(utxos=[_utxo_for(record)])
+        store.save(record)
+        with pytest.raises(ValueError):
+            await recovery.recover_record(record)
+        with pytest.raises(ValueError):
+            await recovery.recover_record(
+                record,
+                destination_address=_p2wpkh_address(),
+                address_provider=wallet_address_provider(_FakeKeyProvider(data_dir=None)),
+            )
 
 
 class TestBuildSwapRecovery:

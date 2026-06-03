@@ -220,7 +220,8 @@ class SwapRecovery:
         self,
         record: SwapRecord,
         *,
-        destination_address: str,
+        destination_address: str | None = None,
+        address_provider: AddressProvider | None = None,
         feerate_sat_vb: float = 2.0,
         broadcast: bool = True,
         force_claim: bool = False,
@@ -230,6 +231,11 @@ class SwapRecovery:
         Args:
             record: The persisted swap record to recover.
             destination_address: Wallet address to sweep recovered funds to.
+                Mutually exclusive with ``address_provider``.
+            address_provider: Async callable yielding a fresh destination
+                address, resolved lazily only when a claim is actually built.
+                Preferred for batch recovery so no address is consumed for
+                records that turn out to be already-spent, dust, or held back.
             feerate_sat_vb: Fee rate for the claim transaction.
             broadcast: If False, build and persist intent but do not broadcast
                 (used by tests and dry-run inspection).
@@ -241,6 +247,9 @@ class SwapRecovery:
             A :class:`RecoveryResult` describing the outcome. The record's
             status is updated and persisted as a side effect.
         """
+        if (destination_address is None) == (address_provider is None):
+            raise ValueError("Provide exactly one of destination_address or address_provider")
+
         if record.is_terminal:
             return RecoveryResult(record.swap_id, RecoveryOutcome.SKIPPED, detail=record.status)
 
@@ -285,6 +294,24 @@ class SwapRecovery:
                 )
 
         fee = self._fee_for(feerate_sat_vb)
+        # Reject dust before consuming a destination address, so a sub-dust
+        # lockup never burns a fresh address from the wallet's gap window.
+        if value - fee < DUST_THRESHOLD_SATS:
+            return RecoveryResult(
+                record.swap_id,
+                RecoveryOutcome.DUST,
+                value=value,
+                fee=fee,
+                detail=(
+                    f"Lockup value {value} minus fee {fee} = {value - fee} "
+                    f"is below dust threshold {DUST_THRESHOLD_SATS}"
+                ),
+            )
+
+        # Resolve the destination only now that a claim is actually warranted.
+        if destination_address is None:
+            assert address_provider is not None  # narrowed by the guard above
+            destination_address = await address_provider()
 
         def witness_builder(
             parsed: ParsedTransaction, input_index: int, ws: bytes, val: int
@@ -359,10 +386,9 @@ class SwapRecovery:
         """
         results: list[RecoveryResult] = []
         for record in self.persistence.list_unresolved():
-            destination = await address_provider()
             result = await self.recover_record(
                 record,
-                destination_address=destination,
+                address_provider=address_provider,
                 feerate_sat_vb=feerate_sat_vb,
                 broadcast=broadcast,
                 force_claim=force_claim,
