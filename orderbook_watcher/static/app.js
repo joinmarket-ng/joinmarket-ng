@@ -307,24 +307,39 @@ function renderFeeQuantizationChart() {
     // whose fee exceeds the largest quantum (unselectable by a quantizing taker).
     const buckets = grid.map(() => ({ count: 0, bond: 0 }));
     const above = { count: 0, bond: 0 };
+    let totalBond = 0;
     for (const { fee, bond } of perMaker.values()) {
         const idx = ceilGridIndex(fee, grid);
         const target = idx === -1 ? above : buckets[idx];
         target.count += 1;
         target.bond += bond;
+        totalBond += bond;
     }
 
+    // Cumulative bond value reachable at each quantum: a taker that sets its fee
+    // limit to grid entry i can select every maker in bands 0..i, so the share of
+    // total bonded value it can reach is the running sum up to that band. This is
+    // the number that matters for sybil resistance: it is the bond weight an
+    // honest taker actually pulls from when it homogenizes its fee at this level.
     const rows = [];
+    let cumBond = 0;
     grid.forEach((g, i) => {
+        cumBond += buckets[i].bond;
         rows.push({
             label: isAbs ? g.toLocaleString() : formatRelPct(quant.rel_grid[i]),
             raw: isAbs ? g : quant.rel_grid[i],
             sub: isAbs ? 'sats' : quant.rel_grid[i],
+            cumBondPct: totalBond > 0 ? (cumBond / totalBond) * 100 : null,
             ...buckets[i],
         });
     });
     if (above.count > 0) {
-        rows.push({ label: '> max', sub: 'above grid', ...above });
+        rows.push({
+            label: '> max',
+            sub: 'above grid',
+            cumBondPct: totalBond > 0 ? 100 : null,
+            ...above,
+        });
     }
 
     const maxCount = Math.max(1, ...rows.map(r => r.count));
@@ -341,12 +356,20 @@ function renderFeeQuantizationChart() {
         bar.className = 'fq-bar' + (row.count === 0 ? ' fq-bar-empty' : '');
         bar.style.height = (row.count / maxCount * 100) + '%';
 
-        const hint = row.raw !== undefined
-            ? (isAbs
-                ? `Makers here advertise <= ${row.raw} sats; a quantizing taker pays them exactly ${row.raw} sats. To land here, set cj_fee_absolute = ${row.raw} with cjfee_factor = 0 (no randomization) so you sit on the quantum.`
-                : `Makers here advertise <= ${row.sub}; a quantizing taker pays them exactly ${row.sub}. To land here, set cj_fee_relative = ${row.sub} with cjfee_factor = 0 (no randomization) so you sit on the quantum.`)
-            : 'Makers whose fee is above the largest quantum: a quantizing taker cannot select them.';
-        bar.title = `${row.count} maker(s), ${formatBtc(row.bond)} bonded. ${hint}`;
+        // Concise tooltip: what sits here, and what a taker at this limit reaches.
+        const feeLabel = isAbs ? `${row.raw} sats` : formatRelPct(row.sub);
+        const pct = row.cumBondPct;
+        const lines = [];
+        if (row.raw !== undefined) {
+            lines.push(`${row.count} maker(s) at ${feeLabel}, ${formatBtc(row.bond)} bonded.`);
+            if (pct !== null) {
+                lines.push(`A taker capped at ${feeLabel} reaches ${pct.toFixed(0)}% of bonded value.`);
+            }
+        } else {
+            lines.push(`${row.count} maker(s) above the grid, ${formatBtc(row.bond)} bonded.`);
+            lines.push('A quantizing taker cannot select these.');
+        }
+        bar.title = lines.join('\n');
 
         const countLabel = document.createElement('div');
         countLabel.className = 'fq-count';
@@ -363,6 +386,14 @@ function renderFeeQuantizationChart() {
         tick.title = row.sub || '';
 
         col.appendChild(barWrap);
+        // Cumulative bond-value-reachable percentage under each band.
+        if (row.cumBondPct !== null) {
+            const cum = document.createElement('div');
+            cum.className = 'fq-cum';
+            cum.textContent = `${row.cumBondPct.toFixed(0)}%`;
+            cum.title = 'Cumulative share of bonded value reachable at this fee';
+            col.appendChild(cum);
+        }
         col.appendChild(tick);
         chart.appendChild(col);
     });
