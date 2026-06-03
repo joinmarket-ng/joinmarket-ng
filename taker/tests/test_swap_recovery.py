@@ -95,6 +95,7 @@ class _FakeBackend:
         self._mempool = mempool
         self._known_txids = known_txids or set()
         self.broadcast_calls: list[str] = []
+        self.block_height = 100
 
     async def scan_external_address(self, address: str) -> list[UTXO]:
         return [u for u in self._utxos if u.address == address]
@@ -112,6 +113,9 @@ class _FakeBackend:
 
     def has_mempool_access(self) -> bool:
         return self._mempool
+
+    async def get_block_height(self) -> int:
+        return self.block_height
 
     def can_provide_neutrino_metadata(self) -> bool:
         return True
@@ -529,6 +533,124 @@ class TestSessionPersistenceHooks:
         session.txid = "cc" * 32
         session._mark_swap_broadcast()
         assert session._swap_store() is None
+
+
+# --------------------------------------------------------------------------- #
+# Pre-broadcast locktime safety guard
+# --------------------------------------------------------------------------- #
+
+
+class TestSwapLocktimeSafety:
+    def _session(self, backend: _FakeBackend, swap_input: Any):
+        from jmcore.models import NetworkType
+
+        from taker.coinjoin_session import CoinJoinSession
+
+        wallet = _FakeKeyProvider(data_dir=None)
+        config = type(
+            "Cfg",
+            (),
+            {"bitcoin_network": NetworkType.REGTEST, "network": NetworkType.REGTEST},
+        )()
+        session = CoinJoinSession()
+        session._taker = _FakeTaker(wallet, config, backend)  # type: ignore[assignment]
+        session.swap_input = swap_input
+        return session
+
+    @pytest.mark.asyncio
+    async def test_safe_when_no_swap_input(self) -> None:
+        backend = _FakeBackend()
+        session = self._session(backend, None)
+        assert await session._swap_locktime_safe_to_broadcast() is True
+
+    @pytest.mark.asyncio
+    async def test_safe_with_ample_margin(self) -> None:
+        backend = _FakeBackend()
+        backend.block_height = 100  # timeout_block_height=200 -> 100 blocks left
+        session = self._session(backend, _swap_input(_witness_script()))
+        assert await session._swap_locktime_safe_to_broadcast() is True
+
+    @pytest.mark.asyncio
+    async def test_aborts_when_inside_safety_margin(self) -> None:
+        from taker.swap.models import BROADCAST_LOCKTIME_SAFETY_MARGIN
+
+        backend = _FakeBackend()
+        # Leave fewer blocks than the required margin before refund (200).
+        backend.block_height = 200 - (BROADCAST_LOCKTIME_SAFETY_MARGIN - 1)
+        session = self._session(backend, _swap_input(_witness_script()))
+        assert await session._swap_locktime_safe_to_broadcast() is False
+        assert session.last_failure_reason
+        assert "Aborting broadcast" in session.last_failure_reason
+
+    @pytest.mark.asyncio
+    async def test_safe_without_mempool_access(self) -> None:
+        backend = _FakeBackend(mempool=False)
+        backend.block_height = 199  # would be unsafe, but height is unverifiable
+        session = self._session(backend, _swap_input(_witness_script()))
+        assert await session._swap_locktime_safe_to_broadcast() is True
+
+
+# --------------------------------------------------------------------------- #
+# Pre-lockup acquisition failure cleanup
+# --------------------------------------------------------------------------- #
+
+
+class TestSwapAcquireFailureCleanup:
+    def _session(self, backend: _FakeBackend):
+        from types import SimpleNamespace
+
+        from jmcore.models import NetworkType
+
+        from taker.coinjoin_session import CoinJoinSession
+
+        wallet = _FakeKeyProvider(data_dir=None)
+        swap_cfg = SimpleNamespace(
+            enabled=True,
+            provider_offer_id=None,
+            nostr_relays=[],
+            max_swap_fee_pct=1.0,
+            lnd_rest_url=None,
+            lnd_cert_path=None,
+            lnd_macaroon_path=None,
+            hold_invoice_timeout=600.0,
+            lockup_poll_interval=5.0,
+            lockup_timeout=300.0,
+        )
+        config = SimpleNamespace(
+            bitcoin_network=NetworkType.REGTEST,
+            network=NetworkType.REGTEST,
+            swap_input=swap_cfg,
+            socks_host=None,
+            socks_port=9050,
+        )
+        session = CoinJoinSession()
+        session._taker = _FakeTaker(wallet, config, backend)  # type: ignore[assignment]
+        session.cj_amount = 100_000
+        return session
+
+    @pytest.mark.asyncio
+    async def test_pre_lockup_failure_cancels_pending_payment(self, monkeypatch) -> None:
+        from unittest.mock import AsyncMock
+
+        from taker.swap.models import SwapState
+
+        backend = _FakeBackend()
+        session = self._session(backend)
+
+        client = AsyncMock()
+        client.state = SwapState.REQUESTING  # pre-lockup: payment may be in flight
+        client.discover_provider = AsyncMock()
+        client.acquire_swap_input = AsyncMock(side_effect=RuntimeError("prepay failed"))
+        client.cancel_pending_payment = AsyncMock()
+
+        monkeypatch.setattr("taker.swap.client.SwapClient", lambda *a, **k: client)
+
+        result = await session._phase_acquire_swap_input(fake_taker_fee=0)
+
+        assert result is False
+        client.cancel_pending_payment.assert_awaited_once()
+        assert session.swap_client is None
+        assert session.swap_input is None
 
 
 # --------------------------------------------------------------------------- #

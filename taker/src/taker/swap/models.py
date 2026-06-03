@@ -207,6 +207,14 @@ SWAP_TX_VSIZE = 150  # Estimated vsize for fee calculation
 MIN_LOCKTIME_DELTA = 60  # Minimum blocks the client needs to claim
 MAX_LOCKTIME_DELTA = 100  # Reject if locktime > current_height + this
 
+# Minimum number of blocks that must remain before the provider's refund
+# (``timeout_block_height``) for it to be safe to broadcast a CoinJoin that
+# spends the lockup. Broadcasting reveals the preimage; if the CoinJoin does
+# not confirm before the provider refunds at the timeout, the taker loses the
+# locked principal. When fewer than this many blocks remain, the taker must
+# abort the broadcast and reclaim the lockup unilaterally via recovery instead.
+BROADCAST_LOCKTIME_SAFETY_MARGIN = 12
+
 # Proof of work
 MIN_POW_BITS = 5  # Minimum PoW bits to accept a provider offer (mainnet providers use 4–8)
 

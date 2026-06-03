@@ -381,6 +381,15 @@ class CoinJoinSession:
                 raise
 
             logger.warning(f"{self.last_failure_reason} (pre-lockup; no funds committed)")
+            # The main hold-invoice payment is fired as a background task before
+            # the lockup is awaited. A pre-lockup failure (e.g. prepay payment
+            # raised) would otherwise orphan that task, leaving an HTLC in
+            # flight. Cancel it so no payment lingers after we drop the client.
+            if client is not None:
+                try:
+                    await client.cancel_pending_payment()
+                except Exception as cancel_exc:  # noqa: BLE001
+                    logger.warning(f"Failed to cancel pending LN payment cleanly: {cancel_exc!r}")
             self.swap_client = None
             self.swap_input = None
             return False
@@ -455,6 +464,56 @@ class CoinJoinSession:
             store.save(record)
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"Failed to mark swap record broadcast: {exc!r}")
+
+    async def _swap_locktime_safe_to_broadcast(self) -> bool:
+        """Return True if it is safe to broadcast a CoinJoin spending the lockup.
+
+        When this round injected a swap input, broadcasting the CoinJoin
+        publishes the HTLC preimage. If the CoinJoin then fails to confirm
+        before the provider's refund height (``timeout_block_height``), the
+        provider can reclaim the lockup and the taker loses the locked
+        principal. We therefore require a safety margin of confirmations to
+        remain before the refund window; otherwise we abort the broadcast so
+        the preimage stays secret and recovery can reclaim the lockup.
+
+        Rounds without a swap input, or backends that cannot report the current
+        height, are always considered safe (nothing to protect / cannot check).
+        """
+        if self.swap_input is None:
+            return True
+        if not self.backend.has_mempool_access():
+            # No reliable height source; the lockup remains claimable via
+            # recovery regardless, so do not block the round here.
+            return True
+
+        from taker.swap.models import BROADCAST_LOCKTIME_SAFETY_MARGIN
+
+        timeout_height = getattr(self.swap_input, "timeout_block_height", 0)
+        if not timeout_height:
+            return True
+
+        try:
+            current_height = await self.backend.get_block_height()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"Could not fetch block height for locktime safety check: {exc!r}")
+            return True
+
+        blocks_remaining = timeout_height - current_height
+        if blocks_remaining < BROADCAST_LOCKTIME_SAFETY_MARGIN:
+            self.last_failure_reason = (
+                "Aborting broadcast: only "
+                f"{blocks_remaining} block(s) remain before the swap refund "
+                f"height {timeout_height} (need >= {BROADCAST_LOCKTIME_SAFETY_MARGIN}). "
+                "Keeping preimage secret so the lockup can be reclaimed."
+            )
+            logger.error(self.last_failure_reason)
+            return False
+
+        logger.debug(
+            f"Locktime safety OK: {blocks_remaining} block(s) before refund height "
+            f"{timeout_height} (margin {BROADCAST_LOCKTIME_SAFETY_MARGIN})"
+        )
+        return True
 
     async def _phase_fill(self) -> PhaseResult:
         """Send !fill to all selected makers and wait for !pubkey responses.
@@ -1964,6 +2023,14 @@ class CoinJoinSession:
         """
         import base64
         import random
+
+        # Refuse to reveal the swap preimage if the provider's refund window is
+        # too close: a CoinJoin that fails to confirm in time would let the
+        # provider refund the lockup, causing total loss of the locked
+        # principal. Aborting here keeps the preimage secret so recovery can
+        # reclaim the lockup unilaterally.
+        if not await self._swap_locktime_safe_to_broadcast():
+            return ""
 
         policy = self.config.tx_broadcast
         has_mempool = self.backend.has_mempool_access()
