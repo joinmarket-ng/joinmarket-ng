@@ -328,6 +328,7 @@ class CoinJoinSession:
                 lnd_rest_url=cfg.lnd_rest_url,
                 lnd_cert_path=cfg.lnd_cert_path,
                 lnd_macaroon_path=cfg.lnd_macaroon_path,
+                hold_invoice_timeout=cfg.hold_invoice_timeout,
                 backend=self.backend,
             )
             self.swap_client = client

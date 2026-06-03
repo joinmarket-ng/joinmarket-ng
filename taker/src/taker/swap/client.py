@@ -71,6 +71,8 @@ class SwapClient:
         lnd_rest_url: str | None = None,
         lnd_cert_path: str | None = None,
         lnd_macaroon_path: str | None = None,
+        # Hold-invoice payment timeout (seconds)
+        hold_invoice_timeout: float = 3600.0,
         # Blockchain backend for trustless lockup detection
         backend: BlockchainBackend | None = None,
     ) -> None:
@@ -87,6 +89,12 @@ class SwapClient:
             lnd_rest_url: LND REST API URL for paying invoices.
             lnd_cert_path: Path to LND TLS certificate.
             lnd_macaroon_path: Path to LND admin macaroon.
+            hold_invoice_timeout: Maximum seconds to keep the main hold-invoice
+                payment in flight. The hold invoice settles only after the
+                CoinJoin is broadcast and the preimage is revealed on-chain, so
+                this must comfortably exceed lockup-confirmation and CoinJoin
+                negotiation time. The prepay (miner-fee) invoice keeps a short
+                fixed timeout since it settles as soon as both HTLCs arrive.
             backend: Blockchain backend for watching the lockup address.
                 When provided, lockup detection is fully trustless — the client
                 watches its own node instead of asking the swap provider.
@@ -103,6 +111,7 @@ class SwapClient:
         self.lnd_rest_url = lnd_rest_url
         self.lnd_cert_path = lnd_cert_path
         self.lnd_macaroon_path = lnd_macaroon_path
+        self.hold_invoice_timeout = hold_invoice_timeout
 
         # Blockchain backend for trustless lockup detection
         self.backend = backend
@@ -282,14 +291,24 @@ class SwapClient:
         if self.lnd_configured:
             # Start the main hold invoice payment as a background task.
             # It will complete only after the CoinJoin is broadcast.
+            #
+            # The hold invoice only settles once the provider sees the preimage
+            # on-chain (from our CoinJoin claim). Lockup confirmation plus
+            # CoinJoin negotiation routinely exceeds a minute on mainnet, so the
+            # payment must stay in flight far longer than the prepay. A short
+            # timeout here would make LND cancel the HTLC before settlement,
+            # forfeiting the provider's lockup.
             self._main_payment_task = asyncio.create_task(
-                self._pay_invoice(swap_response.invoice),
+                self._pay_invoice(
+                    swap_response.invoice,
+                    timeout_seconds=int(self.hold_invoice_timeout),
+                ),
             )
             if swap_response.miner_fee_invoice:
                 logger.info("Paying prepay miner-fee invoice and main invoice concurrently...")
                 # Await prepay — it settles once both HTLCs arrive at the provider.
                 prepay_task = asyncio.create_task(
-                    self._pay_invoice(swap_response.miner_fee_invoice),
+                    self._pay_invoice(swap_response.miner_fee_invoice, timeout_seconds=60),
                 )
                 # Wait for prepay to settle (timeout matches the payment timeout).
                 # The main payment task continues running in the background.
@@ -646,11 +665,15 @@ class SwapClient:
             f"(delta={response.timeout_block_height - current_block_height} blocks)"
         )
 
-    async def _pay_invoice(self, payment_request: str) -> None:
+    async def _pay_invoice(self, payment_request: str, timeout_seconds: int = 60) -> None:
         """Pay a BOLT11 invoice via the taker's LND node.
 
         Args:
             payment_request: BOLT11 invoice string.
+            timeout_seconds: Maximum seconds to keep the payment in flight.
+                The main hold invoice needs a long timeout (it settles only
+                after the CoinJoin reveals the preimage on-chain); the prepay
+                invoice uses a short timeout since it settles immediately.
 
         Raises:
             ValueError: If payment fails.
@@ -683,7 +706,7 @@ class SwapClient:
             # attempts cleanly.
             result = await lnd_client.pay_invoice(
                 payment_request=payment_request,
-                timeout_seconds=60,
+                timeout_seconds=timeout_seconds,
                 fee_limit_sat=1000,
                 enable_mpp=True,
                 max_parts=4,

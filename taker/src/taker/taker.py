@@ -1592,6 +1592,29 @@ class Taker(TakerMonitoringMixin):
             self.state = TakerState.FAILED
             return None
 
+        finally:
+            # If a swap lockup was acquired but the CoinJoin did not complete,
+            # the main hold-invoice payment is still in flight. Leaving it
+            # running would let LND settle it once (if ever) the preimage leaks,
+            # paying the provider for a swap the taker never used. Cancel it on
+            # every non-success exit so the HTLC fails at CLTV expiry instead.
+            # On success the state is COMPLETE and the payment must keep running
+            # so the provider can settle the hold invoice once the broadcast
+            # CoinJoin reveals the preimage on-chain.
+            swap_client = getattr(self._session, "swap_client", None)
+            if (
+                self.state != TakerState.COMPLETE
+                and self._session.swap_input is not None
+                and swap_client is not None
+            ):
+                try:
+                    await swap_client.cancel_pending_payment()
+                except Exception as cancel_exc:  # noqa: BLE001
+                    logger.warning(
+                        f"Failed to cancel in-flight swap payment after CoinJoin "
+                        f"failure: {cancel_exc!r}"
+                    )
+
     async def run_schedule(self, schedule: Schedule) -> bool:
         """
         Run a tumbler-style schedule of CoinJoins.

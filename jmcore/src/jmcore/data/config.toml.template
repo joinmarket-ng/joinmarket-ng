@@ -550,6 +550,9 @@
 # fake_fee_max = 5000              # Fallback ceiling
 # lockup_poll_interval = 2.0
 # lockup_timeout = 300.0
+# hold_invoice_timeout = 3600.0    # Keep main hold-invoice payment in flight this
+                                   # long; must exceed lockup + CoinJoin time or
+                                   # LND cancels the HTLC and forfeits the lockup
 
 # LND REST connection (required for automatic invoice payment; without it the
 # user pays manually). All LND traffic is routed via Tor when the URL is a

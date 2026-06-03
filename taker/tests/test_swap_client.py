@@ -400,3 +400,61 @@ class TestCancelPendingPayment:
 
         # Done tasks are ignored; reference remains untouched.
         assert client._main_payment_task is task
+
+
+class TestHoldInvoiceTimeout:
+    """The main hold invoice must stay in flight far longer than the prepay."""
+
+    def test_default_hold_invoice_timeout(self) -> None:
+        client = SwapClient()
+        # A reverse hold invoice only settles after the CoinJoin reveals the
+        # preimage on-chain, so the default must be much larger than the
+        # 60s prepay timeout.
+        assert client.hold_invoice_timeout == 3600.0
+
+    def test_custom_hold_invoice_timeout_stored(self) -> None:
+        client = SwapClient(hold_invoice_timeout=1800.0)
+        assert client.hold_invoice_timeout == 1800.0
+
+    @pytest.mark.asyncio
+    async def test_pay_invoice_threads_timeout(self) -> None:
+        client = SwapClient(
+            lnd_rest_url="https://lnd.example:8080",
+            lnd_cert_path="/tmp/tls.cert",
+            lnd_macaroon_path="/tmp/admin.macaroon",
+        )
+
+        lnd_client = MagicMock()
+        lnd_client.pay_invoice = AsyncMock(return_value={"payment_preimage_hex": "ab" * 32})
+        lnd_client.close = AsyncMock()
+
+        with (
+            patch("taker.swap.ln_client.LndConnection"),
+            patch("taker.swap.ln_client.LndRestClient", return_value=lnd_client),
+        ):
+            await client._pay_invoice("lnbc1...", timeout_seconds=1800)
+
+        _, kwargs = lnd_client.pay_invoice.call_args
+        assert kwargs["timeout_seconds"] == 1800
+
+    @pytest.mark.asyncio
+    async def test_pay_invoice_default_timeout_is_short(self) -> None:
+        client = SwapClient(
+            lnd_rest_url="https://lnd.example:8080",
+            lnd_cert_path="/tmp/tls.cert",
+            lnd_macaroon_path="/tmp/admin.macaroon",
+        )
+
+        lnd_client = MagicMock()
+        lnd_client.pay_invoice = AsyncMock(return_value={"payment_preimage_hex": "ab" * 32})
+        lnd_client.close = AsyncMock()
+
+        with (
+            patch("taker.swap.ln_client.LndConnection"),
+            patch("taker.swap.ln_client.LndRestClient", return_value=lnd_client),
+        ):
+            await client._pay_invoice("lnbc1...")
+
+        _, kwargs = lnd_client.pay_invoice.call_args
+        # Prepay-style default keeps the short timeout.
+        assert kwargs["timeout_seconds"] == 60

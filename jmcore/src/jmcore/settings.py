@@ -990,6 +990,18 @@ class SwapSettings(BaseModel):
         gt=0.0,
         description="Maximum seconds to wait for swap lockup transaction",
     )
+    hold_invoice_timeout: float = Field(
+        default=3600.0,
+        gt=0.0,
+        description=(
+            "Maximum seconds to keep the main hold-invoice payment in flight. "
+            "The hold invoice settles only after the CoinJoin is broadcast and "
+            "the preimage is revealed on-chain, so this must comfortably exceed "
+            "lockup confirmation plus CoinJoin negotiation time. Too low a value "
+            "makes LND cancel the HTLC before settlement and forfeits the "
+            "provider's lockup."
+        ),
+    )
 
     # LND connection for automatic invoice payment (optional).
     # If unset, the user must pay the invoices manually out-of-band.

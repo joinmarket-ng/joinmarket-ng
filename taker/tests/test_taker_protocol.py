@@ -1834,3 +1834,55 @@ async def test_do_coinjoin_refreshes_maker_nick_exclusion(
         if mock_select.called:
             # If selection was attempted, the nick must already be excluded.
             assert "J5LateStartMaker" in taker.orderbook_manager.own_wallet_nicks
+
+
+@pytest.mark.asyncio
+async def test_do_coinjoin_cancels_swap_payment_on_failure(
+    mock_wallet, mock_backend, mock_config, tmp_path
+):
+    """A post-lockup CoinJoin failure must cancel the in-flight hold payment.
+
+    Once the swap lockup is acquired, the main hold-invoice payment is in
+    flight. If the CoinJoin then fails, the payment must be cancelled so the
+    HTLC fails at CLTV expiry instead of paying the provider for an unused swap.
+    """
+    mock_config.data_dir = tmp_path
+    taker = Taker(mock_wallet, mock_backend, mock_config)
+
+    # Simulate that a swap lockup was acquired earlier in the round.
+    taker._session.swap_input = MagicMock()
+    swap_client = MagicMock()
+    swap_client.cancel_pending_payment = AsyncMock()
+    taker._session.swap_client = swap_client
+
+    # Force an early failure after the swap input is already present.
+    taker._session._resolve_fee_rate = AsyncMock(side_effect=ValueError("boom"))
+
+    result = await taker.do_coinjoin(amount=100_000, destination="bcrt1qdest", mixdepth=0)
+
+    assert result is None
+    assert taker.state == TakerState.FAILED
+    swap_client.cancel_pending_payment.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_do_coinjoin_no_cancel_without_swap_input(
+    mock_wallet, mock_backend, mock_config, tmp_path
+):
+    """Failures without an acquired swap input must not touch the swap client."""
+    mock_config.data_dir = tmp_path
+    taker = Taker(mock_wallet, mock_backend, mock_config)
+
+    # No swap input acquired (the common no-swap path).
+    taker._session.swap_input = None
+    swap_client = MagicMock()
+    swap_client.cancel_pending_payment = AsyncMock()
+    taker._session.swap_client = swap_client
+
+    taker._session._resolve_fee_rate = AsyncMock(side_effect=ValueError("boom"))
+
+    result = await taker.do_coinjoin(amount=100_000, destination="bcrt1qdest", mixdepth=0)
+
+    assert result is None
+    assert taker.state == TakerState.FAILED
+    swap_client.cancel_pending_payment.assert_not_called()

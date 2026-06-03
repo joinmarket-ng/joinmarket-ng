@@ -281,6 +281,7 @@ def build_taker_config(
             "fake_fee_max",
             "lockup_poll_interval",
             "lockup_timeout",
+            "hold_invoice_timeout",
             "lnd_rest_url",
             "lnd_cert_path",
             "lnd_macaroon_path",

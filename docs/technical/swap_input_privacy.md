@@ -106,6 +106,24 @@ The taker:
    the provider broadcast the lockup; the taker cannot reclaim those sats.
    This is the cost of cleanly aborting after lockup.
 
+The cancellation runs in a `finally` block around the whole CoinJoin, so it
+fires on every non-success exit (fill, auth, build, signing, broadcast, or
+an unexpected exception), not just the acquisition phase. On success the
+payment is left running so the provider can settle the hold invoice once the
+broadcast CoinJoin reveals the preimage on-chain.
+
+### Hold-invoice payment timeout
+
+The main payment is a hold invoice: it only settles after the taker reveals
+the preimage by broadcasting the CoinJoin, which the provider observes when
+the lockup UTXO is spent. Lockup confirmation plus CoinJoin negotiation
+routinely exceeds a minute on mainnet, so the in-flight payment must use a
+long client-side timeout (`hold_invoice_timeout`, default 3600s). A short
+timeout would make LND cancel the HTLC before settlement, forfeiting the
+provider's lockup. The prepay (miner-fee) invoice keeps a short timeout since
+it settles as soon as both HTLCs arrive at the provider.
+
+
 ### Post-broadcast failure
 
 If the CoinJoin transaction is on the wire but is later evicted (RBF race,
@@ -115,7 +133,7 @@ preimage; the provider can claim it. No special handling required.
 ## References
 
 - Kappos et al., "An Empirical Analysis of Privacy in the Lightning Network",
-  Financial Cryptography 2021.
+  Financial Cryptography 2021. https://arxiv.org/abs/2003.12470
 - Boltz, "Reverse Submarine Swaps":
   https://docs.boltz.exchange/v/api/lifecycle#reverse-submarine-swaps
 - BOLT12 offers and blinded paths:

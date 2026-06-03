@@ -470,6 +470,7 @@ class TestSwapInputSettingsRoundTrip:
             fake_fee_max=4250,
             lockup_poll_interval=3.5,
             lockup_timeout=240.0,
+            hold_invoice_timeout=2400.0,
             lnd_rest_url="https://lnd.onion:8080",
             lnd_cert_path="/tmp/tls.cert",
             lnd_macaroon_path="/tmp/admin.macaroon",
@@ -500,6 +501,7 @@ class TestSwapInputSettingsRoundTrip:
         assert si.fake_fee_max == 4250
         assert si.lockup_poll_interval == 3.5
         assert si.lockup_timeout == 240.0
+        assert si.hold_invoice_timeout == 2400.0
         assert si.lnd_rest_url == "https://lnd.onion:8080"
         assert si.lnd_cert_path == "/tmp/tls.cert"
         assert si.lnd_macaroon_path == "/tmp/admin.macaroon"
