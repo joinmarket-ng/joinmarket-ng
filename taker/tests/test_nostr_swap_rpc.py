@@ -189,6 +189,28 @@ class TestProxyConnectorNormalization:
 
             mock_from_url.assert_called_once_with("socks5://127.0.0.1:9050", rdns=True)
 
+    def test_build_connector_uses_swap_isolation_category(self) -> None:
+        # Regression: the swap RPC must isolate its Tor circuit under the SWAP
+        # category. A missing IsolationCategory.SWAP member would raise at
+        # connect time only when Tor is enabled, which the e2e suite (no SOCKS)
+        # never exercises.
+        rpc = NostrSwapRPC(
+            provider_pubkey="ab" * 32,
+            relays=["ws://relay.example.onion"],
+            socks_host="127.0.0.1",
+            socks_port=9050,
+        )
+        with patch("taker.swap.nostr.build_isolated_proxy_url") as mock_build:
+            mock_build.return_value = "socks5h://jm-swap:tok@127.0.0.1:9050"
+            with patch("taker.swap.nostr._proxy_connector_from_isolated_url") as mock_conn:
+                mock_conn.return_value = MagicMock()
+                rpc._build_connector("ws://relay.example.onion")
+
+        from jmcore.tor_isolation import IsolationCategory
+
+        mock_build.assert_called_once_with("127.0.0.1", 9050, IsolationCategory.SWAP)
+        assert IsolationCategory.SWAP.value == "jm-swap"
+
 
 # ---------------------------------------------------------------------------
 # Tests: NostrSwapRPC.call()
