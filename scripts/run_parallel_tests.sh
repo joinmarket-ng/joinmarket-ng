@@ -98,9 +98,13 @@ MAX_CONCURRENT="${MAX_CONCURRENT:-$(default_cpu_cap)}"
 # Layout: each instance owns a contiguous band of INSTANCE_STRIDE ports starting
 # at PORT_BAND_BASE; within a band each suite owns SUITE_STRIDE ports; within a
 # suite each service occupies one fixed slot. This keeps every concurrent run on
-# disjoint host ports and scales to ~20 instances under 65535.
+# disjoint host ports and scales to ~15 instances under 65535.
+#
+# The base is 30000 so that no instance band overlaps common local services such
+# as Syncthing (TCP 22000), which the old 20000 base hit on instance 1. Override
+# with JM_TEST_PORT_BASE if 30000+ collides with something on your host.
 # =============================================================================
-PORT_BAND_BASE="${JM_TEST_PORT_BASE:-20000}"
+PORT_BAND_BASE="${JM_TEST_PORT_BASE:-30000}"
 INSTANCE_STRIDE=2000   # host ports reserved per instance
 SUITE_STRIDE=64        # host ports reserved per suite within an instance
 
