@@ -560,6 +560,146 @@ async def test_swap_input_p2wsh_signing(bitcoin_backend):
 
 
 # ==============================================================================
+# Recovery: reclaim a lockup when the CoinJoin never confirms (Scenario 4)
+# ==============================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(360)
+async def test_swap_recovery_reclaims_unconfirmed_lockup(bitcoin_backend, tmp_path):
+    """Reclaim a swap lockup unilaterally when no CoinJoin ever confirms.
+
+    Worst-case privacy/funds scenario: the taker acquires an on-chain lockup
+    but the CoinJoin spending it is never broadcast (or never confirms). The
+    persisted recovery record must let the taker sweep the lockup back to a
+    fresh wallet address via the unilateral claim path, before the provider's
+    refund window, so the locked principal is never lost.
+    """
+    _require_docker_container("jm-electrum-swap")
+    _require_docker_container("jm-nostr-relay")
+    _require_docker_container("jm-lnd-taker")
+    _require_docker_container("jm-bitcoin")
+    _require_lnd_credentials()
+    await _wait_for_nostr_relay(NOSTR_RELAY_URL)
+
+    from tests.e2e.rpc_utils import mine_blocks, rpc_call
+
+    from taker.swap.client import SwapClient
+    from taker.swap.persistence import (
+        SwapRecord,
+        SwapRecordStatus,
+        build_swap_persistence,
+    )
+    from taker.swap.recovery import (
+        RecoveryOutcome,
+        build_swap_recovery,
+    )
+
+    info = await rpc_call("getblockchaininfo")
+    current_height = info["blocks"]
+
+    # Wallet with an on-disk data_dir so recovery records can be persisted.
+    wallet = WalletService(
+        mnemonic=TAKER_MNEMONIC,
+        backend=bitcoin_backend,
+        network="regtest",
+        mixdepth_count=5,
+        data_dir=tmp_path,
+    )
+
+    try:
+        client = SwapClient(
+            nostr_relays=[NOSTR_RELAY_URL],
+            network="regtest",
+            max_swap_fee_pct=2.0,
+            lnd_rest_url=LND_TAKER_REST_URL,
+            lnd_cert_path=LND_TAKER_CERT_PATH,
+            lnd_macaroon_path=LND_TAKER_MACAROON_PATH,
+            backend=bitcoin_backend,
+            key_provider=wallet,
+        )
+
+        # Acquire the lockup, then deliberately never broadcast a CoinJoin.
+        swap_input = await client.acquire_swap_input(
+            desired_amount_sats=50_000,
+            current_block_height=current_height,
+            wait_for_lockup=True,
+            lockup_timeout=90.0,
+        )
+        assert swap_input.txid, "Should have a lockup txid"
+
+        # Persist the record exactly as the live session would on lockup.
+        store = build_swap_persistence(wallet)
+        assert store is not None, "wallet with data_dir must yield a persistence store"
+        record = SwapRecord(
+            swap_id=swap_input.swap_id,
+            network="regtest",
+            swap_index=swap_input.swap_index,
+            redeem_script_hex=swap_input.redeem_script_hex
+            or swap_input.witness_script.hex(),
+            lockup_address=swap_input.lockup_address,
+            timeout_block_height=swap_input.timeout_block_height,
+            txid=swap_input.txid,
+            vout=swap_input.vout,
+            value=swap_input.value,
+            status=SwapRecordStatus.LOCKED,
+        )
+        store.save(record)
+
+        # Confirm the lockup so it is a spendable UTXO for the claim.
+        await mine_blocks(1, MINING_ADDRESS)
+
+        # Run recovery: no CoinJoin was broadcast, so the lockup is unspent and
+        # must be claimed back to a fresh wallet address.
+        recovery = build_swap_recovery(
+            wallet, bitcoin_backend, network="regtest", persistence=store
+        )
+        assert recovery is not None
+
+        claimed_addresses: list[str] = []
+
+        async def _address_provider() -> str:
+            addr = wallet.get_new_address(0)
+            claimed_addresses.append(addr)
+            return addr
+
+        results = await recovery.recover_all(
+            address_provider=_address_provider,
+            feerate_sat_vb=2.0,
+            broadcast=True,
+        )
+
+        assert len(results) == 1, f"expected one recovery result, got {results}"
+        result = results[0]
+        assert result.outcome is RecoveryOutcome.CLAIMED, (
+            f"lockup should be claimed, got {result.outcome}: {result.detail}"
+        )
+        assert result.txid, "claim transaction should have a txid"
+        assert result.value > 0
+
+        # The record must now be terminal (recovered) and hold the claim txid.
+        reloaded = store.load(swap_input.swap_id)
+        assert reloaded is not None
+        assert reloaded.is_terminal, "record should be terminal after recovery"
+        assert reloaded.recovery_txid == result.txid
+
+        # Mine the claim and verify the funds land on the fresh wallet address.
+        await mine_blocks(1, MINING_ADDRESS)
+        assert claimed_addresses, "a destination address should have been used"
+        dest_utxos = await bitcoin_backend.scan_external_address(claimed_addresses[0])
+        assert any(u.txid == result.txid for u in dest_utxos), (
+            "swept funds should appear at the recovery destination address"
+        )
+
+        print(
+            f"Recovered unconfirmed-CoinJoin lockup: claim {result.txid} "
+            f"swept {result.value:,} sats to {claimed_addresses[0]}"
+        )
+    finally:
+        await wallet.close()
+
+
+# ==============================================================================
 # Cross-Compatibility: SwapScript vs Electrum swap server
 # ==============================================================================
 
