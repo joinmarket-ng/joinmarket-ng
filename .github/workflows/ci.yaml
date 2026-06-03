@@ -636,6 +636,15 @@ jobs:
             "test -f shared/electrum-swap-ready" \
             180 3
 
+          # The LND credentials (taker-tls.cert / taker-admin.macaroon) and the
+          # Lightning channel are only ready once lnd-setup finishes opening and
+          # confirming the channel, which happens well after the swap server is
+          # up. Gate the tests on the setup marker so the LND-dependent swap
+          # flows don't race a half-provisioned channel.
+          .github/scripts/wait-for-service.sh "Lightning setup" \
+            "test -f shared/lightning-setup-done" \
+            240 3
+
           echo "Waiting for makers to connect..."
           sleep 20
 
