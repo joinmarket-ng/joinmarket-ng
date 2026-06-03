@@ -53,6 +53,7 @@ async function fetchOrderbook() {
         updateStats();
         updateDirectoryBreakdown();
         updateFeatureBreakdown();
+        renderFeeQuantizationChart();
         updateDirectoryFilter();
         renderTable();
         updateLastUpdate();
@@ -223,6 +224,149 @@ function updateDirectoryBreakdown() {
         item.appendChild(nameContainer);
         item.appendChild(infoContainer);
         breakdown.appendChild(item);
+    });
+}
+
+let feeQuantMode = 'rel';
+
+const ABS_OFFER_TYPES = new Set(['sw0absoffer', 'swabsoffer']);
+
+function formatBtc(sats) {
+    return (sats / 1e8).toFixed(4) + ' BTC';
+}
+
+function formatRelPct(relStr) {
+    // relStr is a decimal fraction like "0.001" -> "0.1%"
+    return (parseFloat(relStr) * 100).toPrecision(2).replace(/\.?0+$/, '') + '%';
+}
+
+// Bucket a value onto the largest grid entry <= value. Returns the grid index,
+// or -1 when the value is below the smallest grid entry.
+function floorGridIndex(value, grid) {
+    let idx = -1;
+    for (let i = 0; i < grid.length; i++) {
+        if (grid[i] <= value) {
+            idx = i;
+        } else {
+            break;
+        }
+    }
+    return idx;
+}
+
+function renderFeeQuantizationChart() {
+    const container = document.getElementById('fee-quant-chart');
+    if (!container || !orderbookData) return;
+
+    const quant = orderbookData.fee_quantization;
+    if (!quant) {
+        container.innerHTML = '<p class="fee-quant-empty">Fee grid unavailable.</p>';
+        return;
+    }
+
+    const isAbs = feeQuantMode === 'abs';
+    const grid = isAbs
+        ? quant.abs_grid.map(Number)
+        : quant.rel_grid.map(Number);
+
+    // Dedupe to one offer per maker for the active offer family. A maker with
+    // multiple offers contributes once (its cheapest offer of that family).
+    const perMaker = new Map();
+    for (const offer of orderbookData.offers) {
+        const offerIsAbs = ABS_OFFER_TYPES.has(offer.ordertype);
+        if (offerIsAbs !== isAbs) continue;
+        const fee = parseFloat(offer.cjfee);
+        if (!Number.isFinite(fee)) continue;
+        const prev = perMaker.get(offer.counterparty);
+        if (prev === undefined || fee < prev.fee) {
+            perMaker.set(offer.counterparty, {
+                fee,
+                bond: offer.fidelity_bond_value || 0,
+            });
+        }
+    }
+
+    // Buckets: index -1 (below grid) plus one per grid entry.
+    const buckets = grid.map(() => ({ count: 0, bond: 0 }));
+    const below = { count: 0, bond: 0 };
+    for (const { fee, bond } of perMaker.values()) {
+        const idx = floorGridIndex(fee, grid);
+        const target = idx === -1 ? below : buckets[idx];
+        target.count += 1;
+        target.bond += bond;
+    }
+
+    const rows = [];
+    if (below.count > 0) {
+        rows.push({ label: isAbs ? '< min' : '< min', sub: 'below grid', ...below });
+    }
+    grid.forEach((g, i) => {
+        rows.push({
+            label: isAbs ? g.toLocaleString() : formatRelPct(quant.rel_grid[i]),
+            raw: isAbs ? g : quant.rel_grid[i],
+            sub: isAbs ? 'sats' : quant.rel_grid[i],
+            ...buckets[i],
+        });
+    });
+
+    const maxCount = Math.max(1, ...rows.map(r => r.count));
+
+    container.innerHTML = '';
+    const chart = document.createElement('div');
+    chart.className = 'fq-bars';
+
+    rows.forEach(row => {
+        const col = document.createElement('div');
+        col.className = 'fq-col';
+
+        const bar = document.createElement('div');
+        bar.className = 'fq-bar' + (row.count === 0 ? ' fq-bar-empty' : '');
+        bar.style.height = (row.count / maxCount * 100) + '%';
+
+        const hint = row.raw !== undefined
+            ? (isAbs
+                ? `To be selectable here, set cj_fee_absolute <= ${row.raw} sats (leave headroom for randomization).`
+                : `To be selectable here, set cj_fee_relative <= ${row.sub} (leave headroom for randomization).`)
+            : 'Makers whose fee is below the smallest quantization band.';
+        bar.title = `${row.count} maker(s), ${formatBtc(row.bond)} bonded. ${hint}`;
+
+        const countLabel = document.createElement('div');
+        countLabel.className = 'fq-count';
+        countLabel.textContent = row.count;
+
+        const barWrap = document.createElement('div');
+        barWrap.className = 'fq-bar-wrap';
+        barWrap.appendChild(countLabel);
+        barWrap.appendChild(bar);
+
+        const tick = document.createElement('div');
+        tick.className = 'fq-tick';
+        tick.textContent = row.label;
+        tick.title = row.sub || '';
+
+        col.appendChild(barWrap);
+        col.appendChild(tick);
+        chart.appendChild(col);
+    });
+
+    container.appendChild(chart);
+}
+
+function setupFeeQuantToggle() {
+    const relBtn = document.getElementById('fee-quant-rel-btn');
+    const absBtn = document.getElementById('fee-quant-abs-btn');
+    if (!relBtn || !absBtn) return;
+    relBtn.addEventListener('click', () => {
+        feeQuantMode = 'rel';
+        relBtn.classList.add('active');
+        absBtn.classList.remove('active');
+        renderFeeQuantizationChart();
+    });
+    absBtn.addEventListener('click', () => {
+        feeQuantMode = 'abs';
+        absBtn.classList.add('active');
+        relBtn.classList.remove('active');
+        renderFeeQuantizationChart();
     });
 }
 
@@ -678,6 +822,8 @@ function setupEventListeners() {
 
     document.getElementById('filter-directory').addEventListener('change', renderTable);
     document.getElementById('search-counterparty').addEventListener('input', renderTable);
+
+    setupFeeQuantToggle();
 
     const closeModal = document.querySelector('.close-modal');
     if (closeModal) {
