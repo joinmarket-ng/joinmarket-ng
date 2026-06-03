@@ -715,7 +715,7 @@ class HTTPSwapTransport:
                 async with session.post(
                     url,
                     json=params,
-                    timeout=timeout,
+                    timeout=aiohttp.ClientTimeout(total=timeout),
                 ) as response:
                     if response.status != 200:
                         error_text = await response.text()
@@ -754,7 +754,7 @@ class HTTPSwapTransport:
             try:
                 async with session.get(
                     url,
-                    timeout=timeout,
+                    timeout=aiohttp.ClientTimeout(total=timeout),
                 ) as response:
                     if response.status != 200:
                         error_text = await response.text()
