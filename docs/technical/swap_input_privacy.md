@@ -94,8 +94,10 @@ unnoticed. Two checks prevent this:
 ### Pre-lockup failure
 
 The taker's swap acquisition fails before the provider broadcasts the lockup.
-No on-chain footprint, no LN payment in flight (or both invoices safely
-cancelled by LND). The taker prompts the user:
+No on-chain footprint. If the failure happens after the main hold-invoice
+payment task was started (for example the prepay payment raised), that task is
+cancelled so no HTLC is orphaned; LND fails any in-flight HTLC at CLTV expiry.
+The taker prompts the user:
 
 - **retry** — re-run swap acquisition once.
 - **plain** — fall back to a plain CoinJoin without the swap input. This is
@@ -143,7 +145,77 @@ it settles as soon as both HTLCs arrive at the provider.
 
 If the CoinJoin transaction is on the wire but is later evicted (RBF race,
 mempool full, etc.), the swap input has already been spent with a revealed
-preimage; the provider can claim it. No special handling required.
+preimage. Two sub-cases matter:
+
+- The CoinJoin (or a conflicting spend of the same lockup) eventually confirms.
+  The provider settles the hold invoice from the on-chain preimage; nothing is
+  owed and recovery marks the record resolved.
+- The CoinJoin never confirms but the preimage is already public. The provider
+  can settle the hold invoice and, after `timeout_block_height`, refund the
+  lockup. To avoid racing that refund, the taker reclaims the still-unspent
+  lockup via the recovery flow below (the unilateral claim path is always
+  available while the output is unspent).
+
+To keep this window from ever opening close to the refund height, the taker
+re-checks the current height immediately before broadcasting. If fewer than
+`BROADCAST_LOCKTIME_SAFETY_MARGIN` blocks remain before `timeout_block_height`,
+it aborts the broadcast, keeps the preimage secret, and reclaims the lockup
+instead, trading the swap fee for the principal.
+
+## Fund recovery and persistence
+
+A reverse swap locks real on-chain funds before the CoinJoin spends them. Any
+crash, abort, or never-confirming CoinJoin between lockup and confirmation must
+never strand those funds. Recovery is built on two facts:
+
+- All swap key material (claim key and preimage) is derived deterministically
+  from the wallet seed via a per-swap BIP-85 index. Given the index, the wallet
+  alone can rebuild the witness and sign the claim; the taker never holds a raw
+  private key.
+- Each lockup is written to an encrypted per-wallet record the moment it is
+  detected, so recovery does not depend on in-memory state surviving a crash.
+
+### Recovery store
+
+Records live under `<data_dir>/swaps/<wallet_fingerprint>/<swap_id>.swap`, one
+file per swap. Each file is encrypted with a key derived from the wallet seed
+(PBKDF2-HMAC-SHA256, 600k iterations, per-file random salt, Fernet). A record
+holds only the BIP-85 `swap_index`, the HTLC script, the lockup outpoint, the
+refund height, and a status; it never stores a private key or preimage. Because
+the encryption key comes from the seed, the store is portable: the same seed on
+another machine can decrypt and act on the records (the design mirrors Boltz's
+seed-derived rescue file, but keeps the per-swap index local for privacy).
+
+Wallets without an on-disk `data_dir` (ephemeral/in-memory) skip persistence;
+their lockups remain claimable from the seed but are not auto-reconciled.
+
+### Reconciliation outcomes
+
+`swap-recover` (and the in-process watcher) scans every non-terminal record and
+reconciles it against the chain:
+
+- Lockup gone, CoinJoin txid known and seen: marked **resolved** (CoinJoin won).
+- Lockup gone, no CoinJoin txid: marked **refunded** (provider self-refunded).
+- Lockup unspent, our CoinJoin still visible in the mempool: held as
+  **pending** so we never double-spend our own in-flight CoinJoin (override with
+  `--force`).
+- Lockup unspent, no CoinJoin in flight: swept by a unilateral claim to a fresh
+  wallet address and marked **recovered**.
+- Lockup below the dust threshold: left unswept (not economical to claim).
+
+On a light client without mempool access, the in-flight check cannot be proven,
+so the taker holds off claiming unless `--force` is passed; the startup sweep
+still runs but the periodic watcher does not.
+
+### Operator usage
+
+- Automatic: on taker startup a one-shot sweep runs, and when the backend has
+  mempool access a background watcher re-checks every
+  `SWAP_RECOVERY_POLL_INTERVAL` seconds.
+- Manual: `jm-taker swap-recover` loads the wallet, reconciles records, and
+  sweeps claimable lockups without connecting to any directory server. Use
+  `--dry-run` to preview and `--force` to claim despite an apparent in-flight
+  CoinJoin.
 
 ## References
 
