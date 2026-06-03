@@ -1225,6 +1225,74 @@ def test_tui_pause_before_clear_on_cli_errors() -> None:
     assert "pause" in else_block, "IMP missing pause"
 
 
+def test_tui_script_send_has_input_validation_loops() -> None:
+    """Send menu must have while loops validating mixdepth, amount, counterparties as integers."""
+    content = SCRIPT_PATH.read_text()
+    s_block = content.split("S)\n", 1)[1].split("W)\n", 1)[0]
+
+    # 5 while loops: mixdepth, amount, counterparties, fee, destination
+    assert s_block.count("while true; do") >= 5
+
+    # Integer validation error messages
+    assert "Mixdepth must be a non-negative integer" in s_block
+    assert "Amount must be a non-negative integer" in s_block
+    assert "Counterparties must be a non-negative integer" in s_block
+
+    # Integer regex pattern
+    assert "^[0-9]+$" in s_block
+
+    # continue 2 to exit outer loop on cancel
+    assert "continue 2" in s_block
+
+
+def test_tui_script_send_fee_rate_validation() -> None:
+    """Fee rate must accept numeric values including decimals, or empty for auto."""
+    content = SCRIPT_PATH.read_text()
+    s_block = content.split("S)\n", 1)[1].split("W)\n", 1)[0]
+
+    # Fee rate numeric regex (allows decimals)
+    assert "^[0-9]+([.][0-9]+)?$" in s_block
+    assert "Fee rate must be a numeric value in sats/vB" in s_block
+
+    # Empty fee rate breaks loop (auto mode)
+    assert 'if [ -z "$SEND_FEE" ]; then' in s_block
+
+
+def test_tui_script_send_destination_validation() -> None:
+    """Destination must be validated as Bitcoin address or INTERNAL."""
+    content = SCRIPT_PATH.read_text()
+    s_block = content.split("S)\n", 1)[1].split("W)\n", 1)[0]
+
+    # Bitcoin address regex patterns (all networks)
+    assert "[13mn2][a-km-zA-HJ-NP-Z1-9]{25,40}" in s_block
+    assert "(bc|tb|bcrt)1[0-9ac-hj-np-z]{11,71}" in s_block
+
+    # Error messages
+    assert "Destination does not look like a valid Bitcoin address" in s_block
+    assert "Destination address is required for normal transactions" in s_block
+
+    # INTERNAL support for coinjoin
+    assert 'SEND_DEST="INTERNAL"' in s_block
+
+
+def test_tui_script_send_uses_whiptail_confirmation() -> None:
+    """Send must use direct whiptail --yesno with formatted summary."""
+    content = SCRIPT_PATH.read_text()
+    s_block = content.split("S)\n", 1)[1].split("W)\n", 1)[0]
+
+    # Direct whiptail confirmation (not show_summary)
+    assert 'whiptail --title " Confirm Send " --yesno' in s_block
+    assert "Proceed with transaction?" in s_block
+
+    # Confirmation shows all fields
+    assert "From wallet:" in s_block
+    assert "Source Mixdepth:" in s_block
+    assert "Destination:" in s_block
+
+    # Old show_summary should NOT be in send block
+    assert "show_summary" not in s_block
+
+
 # ---------------------------------------------------------------------------
 # Docker image tests
 # ---------------------------------------------------------------------------
