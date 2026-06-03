@@ -1559,3 +1559,96 @@ class TestRequiredFeaturesFiltering:
         )
         assert len(orders) == 2
         assert "J5incompatible1O" not in orders
+
+
+class TestFeeQuantization:
+    """Tests for issue #508 fee homogenization in maker selection."""
+
+    @pytest.fixture
+    def quant_offers(self) -> list[Offer]:
+        # A spread of cheap relative offers, all below the 0.001 quantum.
+        return [
+            Offer(
+                counterparty=f"maker{i}",
+                oid=0,
+                ordertype=OfferType.SW0_RELATIVE,
+                minsize=10_000,
+                maxsize=200_000_000,
+                txfee=0,
+                cjfee=fee,
+                fidelity_bond_value=100_000,
+            )
+            for i, fee in enumerate(("0.00002", "0.0001", "0.0002", "0.0005"))
+        ]
+
+    def test_filter_offers_excludes_above_quantum(self, quant_offers: list[Offer]) -> None:
+        from taker.fee_quantization import FeeQuantizer
+
+        # Quantum slot for cj=1M with rel limit 0.0002 -> 0.0002 grid -> 200 sats.
+        quantizer = FeeQuantizer.from_limits(abs_fee=0, rel_fee="0.0002", enabled=True)
+        max_fee = MaxCjFee(abs_fee=0, rel_fee="0.0002")
+        eligible = filter_offers(
+            offers=quant_offers,
+            cj_amount=1_000_000,
+            max_cj_fee=max_fee,
+            fee_quantizer=quantizer,
+        )
+        # 0.0005 offer (500 sats > 200 slot) is excluded; the rest pass.
+        names = {o.counterparty for o in eligible}
+        assert "maker3" not in names
+        assert {"maker0", "maker1", "maker2"} <= names
+
+    def test_choose_orders_homogenizes_total_fee(self, quant_offers: list[Offer]) -> None:
+        from taker.fee_quantization import FeeQuantizer
+
+        quantizer = FeeQuantizer.from_limits(abs_fee=0, rel_fee="0.001", enabled=True)
+        max_fee = MaxCjFee(abs_fee=0, rel_fee="0.001")
+        cj_amount = 1_000_000
+        orders, total_fee = choose_orders(
+            offers=quant_offers,
+            cj_amount=cj_amount,
+            n=4,
+            max_cj_fee=max_fee,
+            fee_quantizer=quantizer,
+        )
+        # Slot fee = 0.001 * 1M = 1000 sats per maker, regardless of advertised.
+        slot = quantizer.slot_fee(cj_amount)
+        assert slot == 1000
+        assert total_fee == slot * len(orders)
+
+    def test_choose_orders_unquantized_uses_advertised(self, quant_offers: list[Offer]) -> None:
+        max_fee = MaxCjFee(abs_fee=0, rel_fee="0.001")
+        cj_amount = 1_000_000
+        orders, total_fee = choose_orders(
+            offers=quant_offers,
+            cj_amount=cj_amount,
+            n=4,
+            max_cj_fee=max_fee,
+            fee_quantizer=None,
+        )
+        expected = sum(calculate_cj_fee(o, cj_amount) for o in orders.values())
+        assert total_fee == expected
+
+    def test_sweep_quantized_pays_equal_fee_and_zeroes_change(
+        self, quant_offers: list[Offer]
+    ) -> None:
+        from taker.fee_quantization import FeeQuantizer
+
+        quantizer = FeeQuantizer.from_limits(abs_fee=0, rel_fee="0.001", enabled=True)
+        max_fee = MaxCjFee(abs_fee=0, rel_fee="0.001")
+        total_input = 100_000_000
+        my_txfee = 10_000
+        orders, cj_amount, total_fee = choose_sweep_orders(
+            offers=quant_offers,
+            total_input_value=total_input,
+            my_txfee=my_txfee,
+            n=4,
+            max_cj_fee=max_fee,
+            fee_quantizer=quantizer,
+        )
+        assert len(orders) == 4
+        slot = quantizer.slot_fee(cj_amount)
+        assert total_fee == slot * len(orders)
+        # Change should be (near) zero: residual under 1 sat per maker from rounding.
+        residual = total_input - my_txfee - cj_amount - total_fee
+        assert abs(residual) <= len(orders)

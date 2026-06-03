@@ -12,6 +12,8 @@ from jmcore.config import WalletConfig
 from jmcore.models import OfferType
 from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
 
+from taker.fee_quantization import FeeQuantizer
+
 # Default counterparty count is randomized per CoinJoin in [MIN, MAX] when no
 # explicit value is configured.  The 8-10 range matches the upstream
 # JoinMarket sendpayment default and avoids fingerprinting jm-ng takers via a
@@ -108,6 +110,16 @@ class TakerConfig(WalletConfig):
     # Fee settings
     max_cj_fee: MaxCjFee = Field(
         default_factory=MaxCjFee, description="Maximum CoinJoin fee limits"
+    )
+    quantize_fees: bool = Field(
+        default=True,
+        description=(
+            "Pay every selected maker the same homogenized fee, derived from the "
+            "configured fee limit rounded down onto a small public grid (issue "
+            "#508). This hides which maker slot is which inside a CoinJoin, at a "
+            "small extra cost. Set to false to pay each maker its exact advertised "
+            "fee (cheaper per round, weaker privacy)."
+        ),
     )
     tx_fee_factor: float = Field(
         default=0.2,
@@ -269,6 +281,14 @@ class TakerConfig(WalletConfig):
                 "Use fee_rate for manual rate, or fee_block_target for estimation."
             )
         return self
+
+    def build_fee_quantizer(self) -> FeeQuantizer:
+        """Resolve the per-round fee quantization policy from this config."""
+        return FeeQuantizer.from_limits(
+            abs_fee=self.max_cj_fee.abs_fee,
+            rel_fee=self.max_cj_fee.rel_fee,
+            enabled=self.quantize_fees,
+        )
 
 
 class ScheduleEntry(BaseModel):

@@ -399,6 +399,15 @@
 # max_cj_fee_abs = 500        # Absolute fee in satoshis per maker
 # max_cj_fee_rel = "0.001"    # Relative fee (0.001 = 0.1%)
 
+# Fee quantization (privacy). When enabled (the default), every selected maker is
+# paid the same homogenized fee, derived from your fee limits above and rounded
+# down onto a shared public grid. This removes the per-maker fee fingerprint that
+# would otherwise let observers link a CoinJoin to your exact fee settings. It may
+# pay slightly more than the cheapest makers advertise, but never more than your
+# configured max_cj_fee_abs / max_cj_fee_rel limits. Set to false (or pass
+# --no-fee-quantize) to pay each maker its exact advertised fee.
+# quantize_fees = true
+
 # PoDLE commitment requirements (control which UTXOs can be used as PoDLE inputs).
 # These match the reference JoinMarket defaults; loosening them weakens the
 # anti-DoS commitment scheme.

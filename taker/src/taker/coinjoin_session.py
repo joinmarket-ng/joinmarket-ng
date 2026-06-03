@@ -40,7 +40,7 @@ from loguru import logger
 
 from taker.config import BroadcastPolicy
 from taker.models import MakerSession, PhaseResult
-from taker.orderbook import calculate_cj_fee
+from taker.orderbook import maker_paid_fee
 from taker.podle import ExtendedPoDLECommitment, get_eligible_podle_utxos
 from taker.tx_builder import CoinJoinTxBuilder, build_coinjoin_tx
 
@@ -86,6 +86,20 @@ class CoinJoinSession:
     @property
     def directory_client(self) -> MultiDirectoryClient:
         return self._taker.directory_client
+
+    def _maker_cjfee(self, offer: Any) -> int:
+        """Fee paid to a maker for ``self.cj_amount`` (quantization-aware).
+
+        Mirrors the orderbook selection: with fee quantization active (issue
+        #508) every maker is paid the same homogenized per-slot fee, which is
+        what must be encoded into each maker's change output for the
+        transaction to validate. Reads the policy from the owning Taker's
+        orderbook manager, tolerating test harnesses that bypass
+        ``Taker.__init__`` (no orderbook manager -> exact advertised fee).
+        """
+        manager = getattr(self._taker, "orderbook_manager", None)
+        quantizer = getattr(manager, "fee_quantizer", None)
+        return maker_paid_fee(offer, self.cj_amount, quantizer)
 
     def __init__(self) -> None:
         # Amount-related state. ``is_sweep`` mirrors ``cj_amount == 0`` at the
@@ -812,9 +826,7 @@ class CoinJoinSession:
             self.cj_destination = destination
 
             # Calculate total input needed (now with exact maker UTXOs)
-            total_maker_fee = sum(
-                calculate_cj_fee(s.offer, self.cj_amount) for s in self.maker_sessions.values()
-            )
+            total_maker_fee = sum(self._maker_cjfee(s.offer) for s in self.maker_sessions.values())
 
             # Estimate tx fee with actual input counts
             num_taker_inputs = len(self.preselected_utxos)
@@ -982,7 +994,7 @@ class CoinJoinSession:
             # Build maker data
             maker_data = {}
             for nick, session in self.maker_sessions.items():
-                cjfee = calculate_cj_fee(session.offer, self.cj_amount)
+                cjfee = self._maker_cjfee(session.offer)
                 # JoinMarket protocol: txfee in offer is the total transaction fee
                 # the maker contributes (in satoshis), not a per-input/output fee
                 maker_txfee = session.offer.txfee
@@ -1257,8 +1269,7 @@ class CoinJoinSession:
         # If we crash after sending !tx but before broadcast, the addresses won't be reused.
         try:
             total_maker_fees = sum(
-                calculate_cj_fee(session.offer, self.cj_amount)
-                for session in self.maker_sessions.values()
+                self._maker_cjfee(session.offer) for session in self.maker_sessions.values()
             )
             maker_nicks = list(self.maker_sessions.keys())
 

@@ -74,6 +74,7 @@ def build_taker_config(
     bondless_makers_allowance: float | None = None,
     bond_value_exponent: float | None = None,
     bondless_require_zero_fee: bool | None = None,
+    quantize_fees: bool | None = None,
 ) -> TakerConfig:
     """
     Build TakerConfig from unified settings with CLI overrides.
@@ -209,6 +210,9 @@ def build_taker_config(
         if bondless_require_zero_fee is not None
         else settings.taker.bondless_require_zero_fee
     )
+    effective_quantize_fees = (
+        quantize_fees if quantize_fees is not None else settings.taker.quantize_fees
+    )
 
     # Parse broadcast policy
     try:
@@ -262,6 +266,7 @@ def build_taker_config(
         taker_utxo_age=settings.taker.taker_utxo_age,
         taker_utxo_retries=settings.taker.taker_utxo_retries,
         taker_utxo_amtpercent=settings.taker.taker_utxo_amtpercent,
+        quantize_fees=effective_quantize_fees,
     )
 
 
@@ -423,6 +428,18 @@ def coinjoin(
             help="For bondless spots, require zero absolute fee",
         ),
     ] = None,
+    quantize_fees: Annotated[
+        bool | None,
+        typer.Option(
+            "--quantize-fees/--no-fee-quantize",
+            envvar="QUANTIZE_FEES",
+            help=(
+                "Pay every maker the same homogenized fee derived from your fee "
+                "limits (on by default, improves privacy). Use --no-fee-quantize "
+                "to pay each maker its exact advertised fee."
+            ),
+        ),
+    ] = None,
     select_utxos: Annotated[
         bool,
         typer.Option(
@@ -497,6 +514,7 @@ def coinjoin(
             bondless_makers_allowance=bondless_makers_allowance,
             bond_value_exponent=bond_value_exponent,
             bondless_require_zero_fee=bondless_require_zero_fee,
+            quantize_fees=quantize_fees,
         )
     except ValueError as e:
         logger.error(str(e))

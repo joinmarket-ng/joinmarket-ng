@@ -826,6 +826,17 @@ class TakerSettings(BaseModel):
         le=1.0,
         description="Per-slot probability of selecting a bondless (zero-fee) maker",
     )
+    quantize_fees: bool = Field(
+        default=True,
+        description=(
+            "Homogenize the fee paid to every selected maker onto a shared public "
+            "grid derived from your fee limits (issue #508). On by default for "
+            "privacy: it removes the per-maker fee fingerprint that would otherwise "
+            "link a CoinJoin to your exact fee settings. May pay slightly more than "
+            "the cheapest makers advertise (never above your configured limits). "
+            "Set to false to pay each maker its exact advertised fee."
+        ),
+    )
     bond_value_exponent: float = Field(
         default=1.3,
         gt=0.0,
