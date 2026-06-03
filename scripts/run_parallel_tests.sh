@@ -461,8 +461,8 @@ services:
         aliases:
           - jm-lnd-setup
     volumes: !override
-      - lnd-taker-data:/root/.lnd
-      - electrum-data:/home/electrum/.electrum
+      - lnd-taker-data:/lnd-taker:ro
+      - "${PROJECT_ROOT}/scripts:/scripts:ro"
       - "${shared_dir}:/shared"
 YAML
 
@@ -845,6 +845,22 @@ run_suite_swap_e2e() {
         done
         if [ ! -f "$ready_file" ]; then
             log_error "Electrum swap server not ready for suite $suite (no $ready_file)"
+            return 1
+        fi
+
+        # The LND credentials and the Lightning channel are only ready once
+        # lnd-setup finishes opening and confirming the channel, which happens
+        # well after the swap server is up. Gate on the setup marker so the
+        # LND-dependent swap tests don't race a half-provisioned channel (which
+        # otherwise skips with --fail-on-skip -> failure).
+        local ln_setup_file="${shared_dir}/lightning-setup-done"
+        waited=0
+        while [ ! -f "$ln_setup_file" ] && [ "$waited" -lt 240 ]; do
+            sleep 3
+            waited=$((waited + 3))
+        done
+        if [ ! -f "$ln_setup_file" ]; then
+            log_error "Lightning setup did not complete for suite $suite (no $ln_setup_file)"
             return 1
         fi
 
