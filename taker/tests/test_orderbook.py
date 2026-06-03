@@ -1567,6 +1567,7 @@ class TestFeeQuantization:
     @pytest.fixture
     def quant_offers(self) -> list[Offer]:
         # A spread of cheap relative offers, all below the 0.001 quantum.
+        # Marked NG (non-empty features) so they are homogenized by the quantizer.
         return [
             Offer(
                 counterparty=f"maker{i}",
@@ -1577,6 +1578,7 @@ class TestFeeQuantization:
                 txfee=0,
                 cjfee=fee,
                 fidelity_bond_value=100_000,
+                features={"neutrino_compat": True},
             )
             for i, fee in enumerate(("0.00002", "0.0001", "0.0002", "0.0005"))
         ]
@@ -1652,3 +1654,95 @@ class TestFeeQuantization:
         # Change should be (near) zero: residual under 1 sat per maker from rounding.
         residual = total_input - my_txfee - cj_amount - total_fee
         assert abs(residual) <= len(orders)
+
+    @pytest.fixture
+    def legacy_offers(self) -> list[Offer]:
+        # Same spread but with NO features: legacy (clientserver) makers that
+        # reject overpayment and must be paid their exact advertised fee.
+        return [
+            Offer(
+                counterparty=f"legacy{i}",
+                oid=0,
+                ordertype=OfferType.SW0_RELATIVE,
+                minsize=10_000,
+                maxsize=200_000_000,
+                txfee=0,
+                cjfee=fee,
+                fidelity_bond_value=100_000,
+            )
+            for i, fee in enumerate(("0.00002", "0.0001", "0.0002", "0.0005"))
+        ]
+
+    def test_maker_paid_fee_legacy_uses_exact(self, legacy_offers: list[Offer]) -> None:
+        from taker.fee_quantization import FeeQuantizer
+        from taker.orderbook import maker_paid_fee, offer_is_ng
+
+        quantizer = FeeQuantizer.from_limits(abs_fee=0, rel_fee="0.001", enabled=True)
+        cj_amount = 1_000_000
+        for offer in legacy_offers:
+            assert not offer_is_ng(offer)
+            # Legacy makers are never overpaid: paid fee equals their exact fee.
+            assert maker_paid_fee(offer, cj_amount, quantizer) == calculate_cj_fee(offer, cj_amount)
+
+    def test_choose_orders_legacy_not_homogenized(self, legacy_offers: list[Offer]) -> None:
+        from taker.fee_quantization import FeeQuantizer
+
+        quantizer = FeeQuantizer.from_limits(abs_fee=0, rel_fee="0.001", enabled=True)
+        max_fee = MaxCjFee(abs_fee=0, rel_fee="0.001")
+        cj_amount = 1_000_000
+        orders, total_fee = choose_orders(
+            offers=legacy_offers,
+            cj_amount=cj_amount,
+            n=4,
+            max_cj_fee=max_fee,
+            fee_quantizer=quantizer,
+        )
+        # Legacy makers are paid exactly their advertised fee, not the slot.
+        expected = sum(calculate_cj_fee(o, cj_amount) for o in orders.values())
+        assert total_fee == expected
+
+    def test_choose_orders_mixed_homogenizes_only_ng(
+        self, quant_offers: list[Offer], legacy_offers: list[Offer]
+    ) -> None:
+        from taker.fee_quantization import FeeQuantizer
+
+        quantizer = FeeQuantizer.from_limits(abs_fee=0, rel_fee="0.001", enabled=True)
+        max_fee = MaxCjFee(abs_fee=0, rel_fee="0.001")
+        cj_amount = 1_000_000
+        orders, total_fee = choose_orders(
+            offers=quant_offers + legacy_offers,
+            cj_amount=cj_amount,
+            n=8,
+            max_cj_fee=max_fee,
+            fee_quantizer=quantizer,
+        )
+        slot = quantizer.slot_fee(cj_amount)
+        expected = sum(
+            slot if o.features else calculate_cj_fee(o, cj_amount) for o in orders.values()
+        )
+        assert total_fee == expected
+
+    def test_sweep_mixed_zeroes_change(
+        self, quant_offers: list[Offer], legacy_offers: list[Offer]
+    ) -> None:
+        from taker.fee_quantization import FeeQuantizer
+        from taker.orderbook import maker_paid_fee
+
+        quantizer = FeeQuantizer.from_limits(abs_fee=0, rel_fee="0.001", enabled=True)
+        max_fee = MaxCjFee(abs_fee=0, rel_fee="0.001")
+        total_input = 100_000_000
+        my_txfee = 10_000
+        orders, cj_amount, total_fee = choose_sweep_orders(
+            offers=quant_offers + legacy_offers,
+            total_input_value=total_input,
+            my_txfee=my_txfee,
+            n=8,
+            max_cj_fee=max_fee,
+            fee_quantizer=quantizer,
+        )
+        # Per-maker fee vector: NG paid slot, legacy paid exact.
+        expected_fee = sum(maker_paid_fee(o, cj_amount, quantizer) for o in orders.values())
+        assert total_fee == expected_fee
+        # No change in a sweep: residual is a few sats from integer rounding.
+        residual = total_input - my_txfee - cj_amount - total_fee
+        assert 0 <= residual <= len(orders)

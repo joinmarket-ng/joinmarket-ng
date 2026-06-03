@@ -45,14 +45,31 @@ def calculate_cj_fee(offer: Offer, cj_amount: int) -> int:
     return _calculate_cj_fee_raw(offer.ordertype, offer.cjfee, cj_amount)
 
 
+def offer_is_ng(offer: Offer) -> bool:
+    """Whether an offer comes from a JoinMarket-NG maker (vs a legacy one).
+
+    NG makers advertise a non-empty feature set during the handshake (e.g.
+    ``neutrino_compat``); legacy JoinMarket clientserver makers advertise none.
+    The distinction matters for fee homogenization: NG makers accept being paid
+    more than their advertised fee (they verify change with ``>=``), while legacy
+    makers reject any overpayment (exact ``!=`` match) and would refuse to sign.
+
+    The predicate is deliberately conservative: a false negative only means we
+    pay an NG maker its exact advertised fee, which it always accepts.
+    """
+    return bool(offer.features) or offer.neutrino_compat
+
+
 def maker_paid_fee(offer: Offer, cj_amount: int, fee_quantizer: FeeQuantizer | None) -> int:
     """Fee the taker actually pays a maker for ``cj_amount``.
 
-    With an active quantizer this is the homogenized per-slot fee; otherwise the
-    maker's exact advertised fee.
+    With an active quantizer, NG makers are paid the homogenized per-slot fee so
+    their per-maker fee fingerprint is removed. Legacy makers are always paid
+    their exact advertised fee: they reject any overpayment, so homogenizing them
+    would make them refuse to sign and abort the whole CoinJoin.
     """
     exact = calculate_cj_fee(offer, cj_amount)
-    if fee_quantizer is None:
+    if fee_quantizer is None or not offer_is_ng(offer):
         return exact
     return fee_quantizer.paid_fee(exact, cj_amount)
 
@@ -620,35 +637,35 @@ def choose_orders(
     return result, total_fee
 
 
-def _solve_sweep_quantized(available: int, n: int, fee_quantizer: FeeQuantizer) -> int:
-    """Solve the sweep cj_amount when every maker is paid the same per-slot fee.
+def _solve_sweep_quantized(
+    available: int, selected: list[Offer], fee_quantizer: FeeQuantizer
+) -> int:
+    """Solve the sweep cj_amount for a (possibly mixed) set of selected makers.
 
-    ``available`` is ``total_input - my_txfee``. With ``n`` makers each paid the
-    homogenized slot fee ``F``, we need ``cj_amount + n*F == available``. ``F``
-    itself depends on ``cj_amount`` (the relative quantum), so we solve both the
-    absolute-dominant and relative-dominant cases and keep the self-consistent
-    one (the one whose resulting slot fee matches the branch assumption).
+    ``available`` is ``total_input - my_txfee``. We need the largest ``cj_amount``
+    such that ``cj_amount + sum(maker_paid_fee(offer, cj_amount)) <= available``,
+    where each maker's paid fee follows the per-maker policy: NG makers are paid
+    the homogenized slot fee, legacy makers their exact advertised fee. Because
+    every per-maker fee is non-decreasing in ``cj_amount`` (relative fees grow,
+    absolute fees stay flat), the left-hand side is strictly increasing, so a
+    binary search finds the unique maximum.
     """
-    rel_q = fee_quantizer.rel_quantum
-    abs_q = fee_quantizer.abs_quantum
 
-    # Absolute-dominant candidate: every maker paid a flat A_q.
-    if abs_q is not None:
-        cj_abs = available - n * abs_q
-        if cj_abs > 0 and fee_quantizer.slot_fee(cj_abs) == abs_q:
-            return cj_abs
+    def total_spent(cj_amount: int) -> int:
+        fees = sum(maker_paid_fee(o, cj_amount, fee_quantizer) for o in selected)
+        return cj_amount + fees
 
-    # Relative-dominant candidate: every maker paid round(L_q * cj_amount).
-    if rel_q is not None:
-        cj_rel = calculate_sweep_amount(available, [str(rel_q)] * n)
-        return cj_rel
+    if available <= 0 or total_spent(1) > available:
+        return 0
 
-    # Only absolute quantum present (rel below grid): fall back to abs solution.
-    if abs_q is not None:
-        return max(available - n * abs_q, 0)
-
-    # Should be unreachable while quantizer.active is True.
-    return calculate_sweep_amount(available, [] * n)
+    lo, hi = 1, available
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if total_spent(mid) <= available:
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo
 
 
 def choose_sweep_orders(
@@ -760,7 +777,7 @@ def choose_sweep_orders(
 
     # Now solve for exact cj_amount
     if fee_quantizer is not None and fee_quantizer.active:
-        cj_amount = _solve_sweep_quantized(total_input_value - my_txfee, n, fee_quantizer)
+        cj_amount = _solve_sweep_quantized(total_input_value - my_txfee, selected, fee_quantizer)
     else:
         sum_abs_fees = 0
         rel_fees = []
