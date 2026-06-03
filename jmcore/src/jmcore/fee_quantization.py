@@ -45,8 +45,10 @@ QUANT_REL: tuple[Decimal, ...] = tuple(
     )
 )
 
-# Absolute-fee grid (satoshis per slot).
-QUANT_ABS: tuple[int, ...] = (100, 200, 500, 1000, 2000, 5000, 10000)
+# Absolute-fee grid (satoshis per slot). The leading 0 is the free-maker band:
+# makers that advertise a zero absolute fee land there and stay distinguishable
+# from (and countable separately to) makers on the paid bands.
+QUANT_ABS: tuple[int, ...] = (0, 100, 200, 500, 1000, 2000, 5000, 10000)
 
 
 def quantize_rel_down(rel_fee: str | float | Decimal) -> Decimal | None:
@@ -68,7 +70,8 @@ def quantize_rel_down(rel_fee: str | float | Decimal) -> Decimal | None:
 def quantize_abs_down(abs_fee: int) -> int | None:
     """Return the largest absolute grid value ``<= abs_fee``.
 
-    Returns ``None`` when ``abs_fee`` is below the smallest grid value.
+    Returns ``None`` only when ``abs_fee`` is negative (no grid value fits);
+    the grid includes ``0`` so any non-negative fee resolves to a quantum.
     """
     best: int | None = None
     for q in QUANT_ABS:

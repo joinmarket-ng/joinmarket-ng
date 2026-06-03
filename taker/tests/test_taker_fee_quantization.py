@@ -26,12 +26,17 @@ class TestFromLimits:
         assert q.rel_quantum == Decimal("0.001")
         assert q.abs_quantum == 500
 
-    def test_enabled_but_below_grid_is_inactive(self) -> None:
+    def test_enabled_subgrid_abs_floors_to_free_band(self) -> None:
+        # An absolute limit below the lowest paid quantum (100) floors to the
+        # free band (0), and a relative limit below the grid yields no rel
+        # quantum. The quantizer stays active and homogenizes every maker to a
+        # zero absolute fee, so only free makers remain eligible.
         q = FeeQuantizer.from_limits(abs_fee=50, rel_fee="0.00001", enabled=True)
         assert q.enabled is True
-        assert q.active is False
+        assert q.active is True
         assert q.rel_quantum is None
-        assert q.abs_quantum is None
+        assert q.abs_quantum == 0
+        assert q.slot_fee(1_000_000) == 0
 
 
 class TestSlotFee:
@@ -49,9 +54,11 @@ class TestSlotFee:
         # 0.1% of 100_000 = 100 < 500 abs
         assert q.slot_fee(100_000) == 500
 
-    def test_only_rel_quantum(self) -> None:
+    def test_rel_dominates_over_free_abs_band(self) -> None:
+        # abs limit below the lowest paid quantum floors to the free band (0),
+        # so the relative quantum dominates the slot fee.
         q = FeeQuantizer.from_limits(abs_fee=50, rel_fee="0.001", enabled=True)
-        assert q.abs_quantum is None
+        assert q.abs_quantum == 0
         assert q.slot_fee(1_000_000) == 1000
 
     def test_only_abs_quantum(self) -> None:
