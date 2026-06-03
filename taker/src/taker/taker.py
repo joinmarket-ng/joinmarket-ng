@@ -62,6 +62,10 @@ __all__ = [
 # the taker output back to its inputs.
 _WALLET_OUTPUT_SCRIPT_TYPE = "p2wpkh"
 
+# How often the in-process watcher reconciles persisted swap lockups so a
+# CoinJoin that never confirms gets reclaimed before the provider's refund.
+SWAP_RECOVERY_POLL_INTERVAL = 60.0
+
 
 def warn_if_destination_script_mismatch(destination: str) -> str | None:
     """
@@ -173,6 +177,9 @@ class Taker(TakerMonitoringMixin):
         # Background task tracking
         self.running = False
         self._background_tasks: list[asyncio.Task[None]] = []
+        # Lazily built swap-recovery engine (None when persistence unavailable).
+        self._swap_recovery_engine: Any | None = None
+        self._swap_recovery_built: bool = False
 
     @property
     def swap_input(self) -> Any | None:
@@ -258,6 +265,16 @@ class Taker(TakerMonitoringMixin):
         conn_status_task = asyncio.create_task(self._periodic_directory_connection_status())
         self._background_tasks.append(conn_status_task)
 
+        # Reconcile any persisted swap lockups (crash recovery) and start the
+        # in-process watcher that claims lockups whose CoinJoin never confirms.
+        try:
+            await self.recover_swaps()
+        except Exception as exc:  # noqa: BLE001 - recovery must not block startup
+            logger.warning(f"Initial swap recovery sweep failed: {exc!r}")
+        if self.backend.has_mempool_access():
+            swap_watch_task = asyncio.create_task(self._swap_recovery_loop())
+            self._background_tasks.append(swap_watch_task)
+
     async def start(self) -> None:
         """
         Start the taker: sync wallet and connect to directory servers.
@@ -267,6 +284,96 @@ class Taker(TakerMonitoringMixin):
         """
         await self.sync_wallet()
         await self.connect()
+
+    def _get_swap_recovery(self) -> Any | None:
+        """Return the lazily built :class:`SwapRecovery`, or None if disabled.
+
+        Disabled when the wallet has no on-disk ``data_dir`` (ephemeral wallets
+        cannot persist recovery records).
+        """
+        if not self._swap_recovery_built:
+            from taker.swap.recovery import build_swap_recovery
+
+            try:
+                self._swap_recovery_engine = build_swap_recovery(
+                    self.wallet, self.backend, network=self.config.network.value
+                )
+            except Exception as exc:  # noqa: BLE001 - never let recovery setup crash the taker
+                logger.warning(f"Could not initialize swap recovery engine: {exc!r}")
+                self._swap_recovery_engine = None
+            self._swap_recovery_built = True
+        return self._swap_recovery_engine
+
+    async def recover_swaps(
+        self, *, broadcast: bool = True, force_claim: bool = False
+    ) -> list[Any]:
+        """Reconcile and, where needed, reclaim persisted swap lockups.
+
+        Resolves records whose CoinJoin confirmed, marks provider refunds, and
+        sweeps lockups whose CoinJoin will not confirm to a fresh wallet
+        address. Safe to call repeatedly; terminal records are skipped.
+
+        Args:
+            broadcast: If False, build claim transactions without broadcasting
+                (dry run for inspection/tests).
+            force_claim: Sweep unspent lockups even when the associated CoinJoin
+                may still be in flight. Use only for manual recovery once the
+                operator knows the round is dead.
+
+        Returns:
+            A list of recovery results (empty when recovery is disabled).
+        """
+        recovery = self._get_swap_recovery()
+        if recovery is None:
+            return []
+        if not recovery.persistence.list_unresolved():
+            return []
+        from taker.swap.recovery import wallet_address_provider
+
+        feerate = await self._recovery_feerate()
+        results = await recovery.recover_all(
+            address_provider=wallet_address_provider(self.wallet),
+            feerate_sat_vb=feerate,
+            broadcast=broadcast,
+            force_claim=force_claim,
+        )
+        for result in results:
+            logger.info(
+                f"Swap recovery {result.swap_id}: {result.outcome.value}"
+                + (f" tx={result.txid}" if result.txid else "")
+                + (f" ({result.detail})" if result.detail else "")
+            )
+        return results
+
+    async def _recovery_feerate(self) -> float:
+        """Best-effort claim feerate (sat/vB), defaulting to a relay-safe floor."""
+        default = 2.0
+        if not self.backend.can_estimate_fee():
+            return default
+        try:
+            estimated = await self.backend.estimate_fee(self.config.fee_block_target or 3)
+        except Exception as exc:  # noqa: BLE001 - estimation failures fall back to default
+            logger.debug(f"Recovery feerate estimation failed: {exc!r}")
+            return default
+        return max(default, float(estimated))
+
+    async def _swap_recovery_loop(self) -> None:
+        """Background watcher reconciling swap lockups while the taker runs.
+
+        Each pass marks confirmed CoinJoins resolved and claims lockups whose
+        CoinJoin has dropped from the mempool. ``force_claim`` stays off so an
+        in-flight round is never double-spent by its own recovery.
+        """
+        while self.running:
+            try:
+                await asyncio.sleep(SWAP_RECOVERY_POLL_INTERVAL)
+                if not self.running:
+                    break
+                await self.recover_swaps()
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:  # noqa: BLE001 - keep the watcher alive on transient errors
+                logger.warning(f"Swap recovery watcher pass failed: {exc!r}")
 
     def release_input_locks(self) -> None:
         """Release persisted CoinJoin locks held on this round's taker inputs.
@@ -1535,6 +1642,11 @@ class Taker(TakerMonitoringMixin):
 
             self.state = TakerState.COMPLETE
             logger.info(f"CoinJoin COMPLETE! txid: {self._session.txid}")
+
+            # Record the broadcast against any swap lockup so recovery can later
+            # distinguish a confirmed CoinJoin from a provider refund.
+            if self._session.swap_input is not None:
+                self._session._mark_swap_broadcast()
 
             # Update the "Awaiting transaction" history entry with txid and mining fee
             # The entry was created before sending !tx to preserve address privacy

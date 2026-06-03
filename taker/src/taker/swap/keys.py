@@ -10,6 +10,7 @@ the wallet.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 from jmcore.bitcoin import ParsedTransaction
@@ -61,4 +62,24 @@ class SwapKeyProvider(Protocol):
         swap_index: int,
     ) -> list[bytes]:
         """Sign and assemble the HTLC claim witness for a lockup output."""
+        ...
+
+
+@runtime_checkable
+class SwapWallet(SwapKeyProvider, Protocol):
+    """Wallet capabilities needed to persist and recover swaps.
+
+    Extends :class:`SwapKeyProvider` with the storage location (so records land
+    in this wallet's per-fingerprint swap directory) and address generation
+    (so recovered funds sweep to a fresh wallet address).
+    """
+
+    @property
+    def data_dir(self) -> Path | None: ...
+
+    @property
+    def wallet_fingerprint(self) -> str: ...
+
+    def get_new_address(self, mixdepth: int) -> str:
+        """Return a fresh receive address in the given mixdepth."""
         ...

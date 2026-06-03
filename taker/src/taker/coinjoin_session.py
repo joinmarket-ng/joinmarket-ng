@@ -51,6 +51,7 @@ if TYPE_CHECKING:
 
     from taker.config import TakerConfig
     from taker.multi_directory import MultiDirectoryClient
+    from taker.swap.persistence import SwapPersistence
     from taker.taker import Taker
 
 
@@ -153,6 +154,10 @@ class CoinJoinSession:
         self.swap_client: Any | None = None
         self.swap_input: Any | None = None
         self.swap_input_index: int | None = None
+        # Lazily built per-wallet encrypted recovery store; None when the
+        # wallet has no on-disk data_dir (recovery persistence unavailable).
+        self._swap_persistence: SwapPersistence | None = None
+        self._swap_persistence_built: bool = False
 
     def attach(self, taker: Taker) -> None:
         """Wire the owning ``Taker`` so the session can read persistent deps.
@@ -353,6 +358,7 @@ class CoinJoinSession:
                 f"Swap input acquired: {swap_input.txid}:{swap_input.vout} "
                 f"value={swap_input.value:,} sats"
             )
+            self._persist_swap_locked(swap_input)
             return True
 
         except Exception as exc:
@@ -378,6 +384,77 @@ class CoinJoinSession:
             self.swap_client = None
             self.swap_input = None
             return False
+
+    def _swap_store(self) -> SwapPersistence | None:
+        """Return the lazily built per-wallet recovery store (or None).
+
+        None means the wallet has no on-disk ``data_dir`` and recovery records
+        cannot be persisted; callers treat persistence as a best-effort no-op.
+        """
+        if not self._swap_persistence_built:
+            from taker.swap.persistence import build_swap_persistence
+
+            try:
+                self._swap_persistence = build_swap_persistence(self.wallet)
+            except Exception as exc:  # noqa: BLE001 - never let persistence abort a round
+                logger.warning(f"Could not initialize swap recovery store: {exc!r}")
+                self._swap_persistence = None
+            self._swap_persistence_built = True
+        return self._swap_persistence
+
+    def _persist_swap_locked(self, swap_input: Any) -> None:
+        """Persist a freshly acquired lockup so it can be recovered after a crash.
+
+        Best-effort: a persistence failure is logged but never aborts the round
+        (the lockup is still claimable from the deterministic wallet seed).
+        """
+        store = self._swap_store()
+        if store is None:
+            return
+        from taker.swap.persistence import SwapRecord, SwapRecordStatus
+
+        network = self.config.bitcoin_network or self.config.network
+        record = SwapRecord(
+            swap_id=swap_input.swap_id,
+            network=str(getattr(network, "value", network)),
+            swap_index=swap_input.swap_index,
+            redeem_script_hex=swap_input.redeem_script_hex or swap_input.witness_script.hex(),
+            lockup_address=swap_input.lockup_address,
+            timeout_block_height=swap_input.timeout_block_height,
+            txid=swap_input.txid,
+            vout=swap_input.vout,
+            value=swap_input.value,
+            status=SwapRecordStatus.LOCKED,
+        )
+        try:
+            store.save(record)
+            logger.info(f"Persisted swap recovery record {record.swap_id} (status=locked)")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"Failed to persist swap recovery record: {exc!r}")
+
+    def _mark_swap_broadcast(self) -> None:
+        """Record that the CoinJoin spending the lockup has been broadcast.
+
+        Stores the CoinJoin txid so recovery can later distinguish a confirmed
+        CoinJoin (resolved) from a provider refund, and avoid claiming a lockup
+        that our own in-flight CoinJoin is about to spend.
+        """
+        if self.swap_input is None:
+            return
+        store = self._swap_store()
+        if store is None:
+            return
+        from taker.swap.persistence import SwapRecordStatus
+
+        try:
+            record = store.load(self.swap_input.swap_id)
+            if record is None or record.is_terminal:
+                return
+            record.status = SwapRecordStatus.BROADCAST
+            record.coinjoin_txid = self.txid
+            store.save(record)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"Failed to mark swap record broadcast: {exc!r}")
 
     async def _phase_fill(self) -> PhaseResult:
         """Send !fill to all selected makers and wait for !pubkey responses.
