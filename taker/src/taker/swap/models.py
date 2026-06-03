@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from enum import StrEnum
 
+from jmcore.swap_script import MAX_LOCKTIME_DELTA as MAX_LOCKTIME_DELTA
+from jmcore.swap_script import MIN_LOCKTIME_DELTA as MIN_LOCKTIME_DELTA
 from pydantic import BaseModel, Field
 from pydantic.dataclasses import dataclass
 
@@ -203,9 +205,9 @@ NOSTR_D_TAG = f"electrum-swapserver-{NOSTR_EVENT_VERSION}"
 # Swap limits (provider's actual min_amount takes precedence at runtime)
 SWAP_TX_VSIZE = 150  # Estimated vsize for fee calculation
 
-# Locktime safety bounds (in blocks)
-MIN_LOCKTIME_DELTA = 60  # Minimum blocks the client needs to claim
-MAX_LOCKTIME_DELTA = 100  # Reject if locktime > current_height + this
+# Locktime safety bounds (in blocks). Defined alongside the swap HTLC script in
+# jmcore.swap_script (the single source of truth) and re-exported from
+# ``taker.swap.models`` (see top-of-module import) for backwards compatibility.
 
 # Minimum number of blocks that must remain before the provider's refund
 # (``timeout_block_height``) for it to be safe to broadcast a CoinJoin that

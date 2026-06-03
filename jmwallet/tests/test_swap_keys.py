@@ -15,9 +15,10 @@ from jmcore.bitcoin import (
     serialize_transaction,
 )
 
-# Reuse the swap HTLC script builder the taker uses, so the witness we build
-# here is exactly what would be spent on-chain.
-from taker.swap.script import SwapScript
+# Reuse the swap HTLC script builder that lives in jmcore, so the witness we
+# build here is exactly what would be spent on-chain. jmcore is a shared
+# dependency, so this avoids a jmwallet -> taker layering dependency.
+from jmcore.swap_script import SwapScript
 
 from jmwallet.wallet.bip32 import HDKey
 from jmwallet.wallet.signing import compute_sighash_segwit
