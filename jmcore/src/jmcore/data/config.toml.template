@@ -326,10 +326,13 @@
 # offer_type = "sw0reloffer"
 
 # Fee settings (only one is used based on offer_type above)
-# The relative default sits just below the lowest taker fee-quantization quantum
-# (0.00002) even after maximum randomization, so default makers stay selectable
-# by quantizing takers while remaining close to the upstream JoinMarket reference.
-# cj_fee_relative = "0.000018"  # 0.000018 = 0.0018% relative fee (for sw0reloffer)
+# The relative default (0.00002) is exactly the lowest taker fee-quantization
+# quantum, so default makers sit on the grid and share one homogenized fee with
+# every other default maker, maximizing the anonymity set under quantization. It
+# also matches the upstream JoinMarket reference. If you set a non-quantized
+# value, enable cjfee_factor randomization below so your exact fee is not a
+# fingerprint.
+# cj_fee_relative = "0.00002"  # 0.00002 = 0.002% relative fee (for sw0reloffer)
 # cj_fee_absolute = 500        # Absolute fee in satoshis (for sw0absoffer)
 # tx_fee_contribution = 0      # Mining fee contribution in satoshis
 
@@ -337,8 +340,11 @@
 # [value*(1-factor), value*(1+factor)] (size is sampled downward only) on every
 # announcement so observers cannot correlate balance changes with exact values.
 # Set any factor to 0 to disable randomization for that field.
-# Defaults match the upstream JoinMarket yg-privacyenhanced reference.
-# cjfee_factor = 0.1
+# cjfee_factor defaults to 0 (no fee randomization) so a default maker stays
+# exactly on its quantization quantum and blends with other default makers. Only
+# enable it (the upstream reference uses 0.1) if you deviate to a non-quantized
+# fee, where an exact value would otherwise be a fingerprint.
+# cjfee_factor = 0
 # txfee_contribution_factor = 0.3
 # size_factor = 0.1
 

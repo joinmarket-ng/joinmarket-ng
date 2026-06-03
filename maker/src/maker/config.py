@@ -57,14 +57,15 @@ class OfferConfig(BaseModel):
         ),
     )
     cj_fee_relative: str = Field(
-        default="0.000018",
+        default="0.00002",
         description=(
-            "Relative CJ fee as decimal. Default 0.000018 (0.0018%) sits just "
-            "below the lowest taker fee-quantization quantum (0.00002) even after "
-            "maximum upward randomization (cjfee_factor=0.1 gives 0.0000198), so "
-            "default makers stay selectable by quantizing takers. Close to the "
-            "upstream JoinMarket reference (0.00002) to avoid fingerprinting "
-            "jm-ng makers via different fee defaults."
+            "Relative CJ fee as decimal. Default 0.00002 (0.002%) is exactly the "
+            "lowest taker fee-quantization quantum, so default makers sit on the "
+            "grid and share a homogenized fee with every other default maker, "
+            "maximizing the anonymity set under quantization. It also matches the "
+            "upstream JoinMarket reference. If you deviate to a non-quantized "
+            "value, enable randomization (cjfee_factor=0.1) so your exact policy "
+            "is not a fingerprint."
         ),
     )
     cj_fee_absolute: int = Field(
@@ -78,13 +79,16 @@ class OfferConfig(BaseModel):
         description="Transaction fee contribution in satoshis",
     )
     cjfee_factor: float = Field(
-        default=0.1,
+        default=0.0,
         ge=0.0,
         description=(
             "Randomization factor applied to the CoinJoin fee on each offer "
             "announcement. The advertised fee is sampled uniformly from "
-            "[cjfee*(1-f), cjfee*(1+f)]. Set to 0 to disable. "
-            "Default 0.1 matches the upstream JoinMarket yg-privacyenhanced."
+            "[cjfee*(1-f), cjfee*(1+f)]. Default 0 (no randomization) keeps a "
+            "default maker exactly on its quantization quantum so it blends with "
+            "other default makers. Only enable randomization (e.g. 0.1) when you "
+            "use a non-quantized fee, where an exact value would otherwise be a "
+            "fingerprint."
         ),
     )
     txfee_contribution_factor: float = Field(
@@ -228,11 +232,11 @@ class MakerConfig(WalletConfig):
     )
     min_size: int = Field(default=100_000, ge=0, description="Minimum CoinJoin amount in satoshis")
     cj_fee_relative: str = Field(
-        default="0.000018",
+        default="0.00002",
         description=(
-            "Relative CJ fee. Default 0.000018 (0.0018%) stays just below the "
-            "lowest taker fee-quantization quantum (0.00002) even after maximum "
-            "randomization, keeping default makers selectable by quantizing takers."
+            "Relative CJ fee. Default 0.00002 (0.002%) is exactly the lowest taker "
+            "fee-quantization quantum, so default makers share a homogenized fee "
+            "and a larger anonymity set. See OfferConfig.cj_fee_relative."
         ),
     )
     cj_fee_absolute: int = Field(default=500, ge=0, description="Absolute CJ fee in satoshis")
@@ -240,10 +244,11 @@ class MakerConfig(WalletConfig):
         default=0, ge=0, description="Transaction fee contribution in satoshis"
     )
     cjfee_factor: float = Field(
-        default=0.1,
+        default=0.0,
         ge=0.0,
         description=(
             "Randomization factor for the CoinJoin fee in legacy single-offer mode. "
+            "Default 0 keeps a default maker exactly on its quantization quantum. "
             "See OfferConfig.cjfee_factor."
         ),
     )
