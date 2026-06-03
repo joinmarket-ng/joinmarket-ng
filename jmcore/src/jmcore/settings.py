@@ -588,10 +588,12 @@ class MakerSettings(BaseModel):
         description="Offer type: sw0reloffer (relative) or sw0absoffer (absolute)",
     )
     cj_fee_relative: str = Field(
-        default="0.00002",
+        default="0.000018",
         description=(
-            "Relative CoinJoin fee. Default 0.00002 (0.002%) matches the "
-            "upstream JoinMarket reference."
+            "Relative CoinJoin fee. Default 0.000018 (0.0018%) stays just below "
+            "the lowest taker fee-quantization quantum (0.00002) even after "
+            "maximum randomization, so default makers remain selectable by "
+            "quantizing takers."
         ),
     )
     cj_fee_absolute: int = Field(

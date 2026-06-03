@@ -57,11 +57,14 @@ class OfferConfig(BaseModel):
         ),
     )
     cj_fee_relative: str = Field(
-        default="0.00002",
+        default="0.000018",
         description=(
-            "Relative CJ fee as decimal. Default 0.00002 (0.002%) matches the "
-            "upstream JoinMarket reference and avoids fingerprinting jm-ng "
-            "makers via different fee defaults."
+            "Relative CJ fee as decimal. Default 0.000018 (0.0018%) sits just "
+            "below the lowest taker fee-quantization quantum (0.00002) even after "
+            "maximum upward randomization (cjfee_factor=0.1 gives 0.0000198), so "
+            "default makers stay selectable by quantizing takers. Close to the "
+            "upstream JoinMarket reference (0.00002) to avoid fingerprinting "
+            "jm-ng makers via different fee defaults."
         ),
     )
     cj_fee_absolute: int = Field(
@@ -225,9 +228,11 @@ class MakerConfig(WalletConfig):
     )
     min_size: int = Field(default=100_000, ge=0, description="Minimum CoinJoin amount in satoshis")
     cj_fee_relative: str = Field(
-        default="0.00002",
+        default="0.000018",
         description=(
-            "Relative CJ fee. Default 0.00002 (0.002%) matches the upstream JoinMarket reference."
+            "Relative CJ fee. Default 0.000018 (0.0018%) stays just below the "
+            "lowest taker fee-quantization quantum (0.00002) even after maximum "
+            "randomization, keeping default makers selectable by quantizing takers."
         ),
     )
     cj_fee_absolute: int = Field(default=500, ge=0, description="Absolute CJ fee in satoshis")
