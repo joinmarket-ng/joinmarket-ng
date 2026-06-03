@@ -76,6 +76,21 @@ and their node; this is out of scope for the swap input feature.
 
 The CoinJoin can fail at three different points relative to the swap state:
 
+### Amount verification (anti-shorting)
+
+The provider controls both the on-chain amount it promises and the amount it
+actually locks, while the taker pays a fixed LN invoice. If the locked output
+were smaller than expected, the CoinJoin would still balance because the taker
+silently tops up the shortfall from its own UTXOs, so the loss would go
+unnoticed. Two checks prevent this:
+
+- Before paying, the promised `onchainAmount` is bounded by the configured
+  `max_swap_fee_pct` (plus the provider's mining fee) relative to the invoice
+  amount; a provider that promises less is rejected with no funds committed.
+- At lockup detection, a UTXO is only accepted if its value is at least the
+  promised on-chain amount; a short lockup is ignored and the round aborts
+  into the post-lockup path (cancel payment, forfeit prepay).
+
 ### Pre-lockup failure
 
 The taker's swap acquisition fails before the provider broadcasts the lockup.

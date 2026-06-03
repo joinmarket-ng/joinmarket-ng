@@ -73,6 +73,8 @@ class SwapClient:
         lnd_macaroon_path: str | None = None,
         # Hold-invoice payment timeout (seconds)
         hold_invoice_timeout: float = 3600.0,
+        # Lockup polling
+        lockup_poll_interval: float = 2.0,
         # Blockchain backend for trustless lockup detection
         backend: BlockchainBackend | None = None,
     ) -> None:
@@ -95,6 +97,7 @@ class SwapClient:
                 this must comfortably exceed lockup-confirmation and CoinJoin
                 negotiation time. The prepay (miner-fee) invoice keeps a short
                 fixed timeout since it settles as soon as both HTLCs arrive.
+            lockup_poll_interval: Seconds between lockup-detection polls.
             backend: Blockchain backend for watching the lockup address.
                 When provided, lockup detection is fully trustless — the client
                 watches its own node instead of asking the swap provider.
@@ -112,6 +115,7 @@ class SwapClient:
         self.lnd_cert_path = lnd_cert_path
         self.lnd_macaroon_path = lnd_macaroon_path
         self.hold_invoice_timeout = hold_invoice_timeout
+        self.lockup_poll_interval = lockup_poll_interval
 
         # Blockchain backend for trustless lockup detection
         self.backend = backend
@@ -266,6 +270,26 @@ class SwapClient:
 
         # Step 4: Verify the redeem script
         self._verify_swap_response(swap_response, current_block_height)
+
+        # Step 4b: Verify the provider is not shorting the on-chain amount.
+        #
+        # The provider sets ``onchain_amount`` itself. A dishonest provider could
+        # advertise a low fee, accept our full ``invoice_amount`` payment, yet
+        # promise a much smaller on-chain output and pocket the difference. The
+        # CoinJoin would still balance (the taker silently tops up the shortfall
+        # from its own UTXOs), so the loss would go unnoticed. Bound the promised
+        # output to the fee the user already agreed to via ``max_swap_fee_pct``.
+        max_fee_sats = invoice_amount * self.max_swap_fee_pct / 100 + provider.mining_fee
+        min_acceptable_onchain = invoice_amount - max_fee_sats
+        if swap_response.onchain_amount < min_acceptable_onchain:
+            raise ValueError(
+                f"Provider shorts the on-chain amount: promised "
+                f"{swap_response.onchain_amount} sats for an invoice of "
+                f"{invoice_amount} sats, but at most {self.max_swap_fee_pct}% fee "
+                f"+ {provider.mining_fee} sats mining "
+                f"({max_fee_sats:.0f} sats total) is allowed "
+                f"(minimum acceptable {min_acceptable_onchain:.0f} sats)."
+            )
 
         logger.info(
             f"Reverse swap created: id={swap_response.id}, "
@@ -764,7 +788,7 @@ class SwapClient:
         lockup_address = response.lockup_address
         expected_spk = self._swap_script.p2wsh_scriptpubkey().hex()
         start_time = time.monotonic()
-        poll_interval = 2.0  # seconds between polls
+        poll_interval = self.lockup_poll_interval  # seconds between polls
 
         logger.info(
             f"Watching lockup address {lockup_address} for incoming UTXO (timeout={timeout}s)..."
@@ -776,24 +800,40 @@ class SwapClient:
 
                 for utxo in utxos:
                     # Verify the scriptPubKey matches what we derived
-                    if utxo.scriptpubkey.lower() == expected_spk.lower():
-                        logger.info(
-                            f"Lockup UTXO detected: {utxo.txid}:{utxo.vout} "
-                            f"({utxo.value:,} sats, "
-                            f"confirmations={utxo.confirmations})"
+                    if utxo.scriptpubkey.lower() != expected_spk.lower():
+                        continue
+
+                    # Verify the provider locked at least the promised amount.
+                    # Accepting a short UTXO would let the taker silently top up
+                    # the shortfall from its own wallet during CoinJoin
+                    # balancing, paying the full LN invoice for less on-chain.
+                    # Skip short UTXOs (e.g. a dust decoy) and keep polling; a
+                    # purely short lockup eventually times out into a safe abort.
+                    if utxo.value < response.onchain_amount:
+                        logger.warning(
+                            f"Ignoring short lockup UTXO {utxo.txid}:{utxo.vout}: "
+                            f"value {utxo.value:,} sats < promised "
+                            f"{response.onchain_amount:,} sats."
                         )
-                        return SwapInput(
-                            txid=utxo.txid,
-                            vout=utxo.vout,
-                            value=utxo.value,
-                            witness_script=self._swap_script.witness_script(),
-                            preimage=self._preimage,
-                            claim_privkey=self._claim_privkey,
-                            lockup_address=lockup_address,
-                            timeout_block_height=response.timeout_block_height,
-                            swap_id=response.id,
-                            redeem_script_hex=response.redeem_script,
-                        )
+                        continue
+
+                    logger.info(
+                        f"Lockup UTXO detected: {utxo.txid}:{utxo.vout} "
+                        f"({utxo.value:,} sats, "
+                        f"confirmations={utxo.confirmations})"
+                    )
+                    return SwapInput(
+                        txid=utxo.txid,
+                        vout=utxo.vout,
+                        value=utxo.value,
+                        witness_script=self._swap_script.witness_script(),
+                        preimage=self._preimage,
+                        claim_privkey=self._claim_privkey,
+                        lockup_address=lockup_address,
+                        timeout_block_height=response.timeout_block_height,
+                        swap_id=response.id,
+                        redeem_script_hex=response.redeem_script,
+                    )
 
             except Exception as e:
                 logger.debug(f"Lockup poll error (will retry): {e}")
