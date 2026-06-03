@@ -456,9 +456,22 @@ main() {
     log_info "Waiting for makers to connect..."
     sleep 20
 
-    # Run e2e tests from tests/ directory
+    # Run the Lightning swap e2e tests FIRST, on the freshly started stack.
+    # They validate HTLC timeouts against the current chain tip, so running
+    # them before the rest of the e2e suite (which mines many blocks) avoids
+    # block-height drift that would otherwise push the swap timeout into the
+    # past.
+    COVERAGE_FILE=.coverage.swap-e2e run_test_suite "Swap E2E Tests" \
+        -lv -m swap_e2e \
+        --timeout=300 --reruns=1 --reruns-delay=10 \
+        --cov=jmcore --cov=jmwallet --cov=taker \
+        --cov-report=term-missing \
+        --cov-report=html:htmlcov/swap-e2e \
+        tests/
+
+    # Run the remaining e2e tests from tests/ directory
     COVERAGE_FILE=.coverage.e2e run_test_suite "E2E Tests" \
-        -lv -m e2e \
+        -lv -m "e2e and not swap_e2e" \
         --timeout=300 \
         --cov=jmcore --cov=jmwallet --cov=directory_server \
         --cov=orderbook_watcher --cov=maker --cov=taker \
@@ -485,6 +498,14 @@ main() {
         log_info "Saved e2e coverage"
     else
         log_warning "No .coverage file found for e2e tests"
+    fi
+
+    # Save swap e2e coverage
+    if [ -f .coverage.swap-e2e ]; then
+        COVERAGE_FILES+=(".coverage.swap-e2e")
+        log_info "Saved swap e2e coverage"
+    else
+        log_warning "No .coverage file found for swap e2e tests"
     fi
 
     # Save docker integration coverage

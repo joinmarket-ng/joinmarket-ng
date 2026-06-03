@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -34,8 +35,12 @@ from jmwallet.wallet.service import WalletService
 from taker.config import SwapInputConfig, TakerConfig
 from taker.taker import Taker
 
-# Mark all tests in this module as requiring Docker e2e profile
-pytestmark = pytest.mark.e2e
+# Mark all tests in this module as Lightning reverse-swap e2e tests. They run
+# in their own CI/parallel job (marker ``swap_e2e``) so the long swap flows do
+# not serialize behind the rest of the e2e suite, and so they get a fresh chain
+# (avoids block-height drift accumulated by other e2e tests). ``e2e`` is kept
+# for backwards compatibility with anyone selecting the whole e2e set.
+pytestmark = [pytest.mark.e2e, pytest.mark.swap_e2e]
 
 # ==============================================================================
 # Test Wallet Mnemonics (same as test_complete_system.py)
@@ -47,19 +52,20 @@ TAKER_MNEMONIC = (
 
 MINING_ADDRESS = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"
 
-# Nostr relay exposed on host port 7000 by docker-compose
-NOSTR_RELAY_URL = "ws://127.0.0.1:7000"
+# Service endpoints. Defaults match the single-stack docker-compose host ports;
+# the parallel test runner remaps these per suite and passes overrides via env.
+NOSTR_RELAY_URL = os.environ.get("SWAP_NOSTR_RELAY_URL", "ws://127.0.0.1:7000")
+LND_TAKER_REST_URL = os.environ.get("SWAP_LND_TAKER_REST_URL", "https://127.0.0.1:8081")
 
-# LND taker REST API (exposed on host port 8081)
-LND_TAKER_REST_URL = "https://127.0.0.1:8081"
-
-# LND credentials are written by lnd-setup into ./shared/lnd/ (host-side bind mount).
+# LND credentials and swap-server info live under a shared bind mount. The
+# parallel runner uses a per-suite shared dir, so allow overriding the base.
 _REPO_ROOT = Path(__file__).parent.parent.parent
-LND_TAKER_CERT_PATH = str(_REPO_ROOT / "shared" / "lnd" / "taker-tls.cert")
-LND_TAKER_MACAROON_PATH = str(_REPO_ROOT / "shared" / "lnd" / "taker-admin.macaroon")
+_SHARED_DIR = Path(os.environ.get("SWAP_SHARED_DIR", str(_REPO_ROOT / "shared")))
+LND_TAKER_CERT_PATH = str(_SHARED_DIR / "lnd" / "taker-tls.cert")
+LND_TAKER_MACAROON_PATH = str(_SHARED_DIR / "lnd" / "taker-admin.macaroon")
 
 # Electrum swap server info (written by entrypoint.sh to /shared/electrum/)
-ELECTRUM_SWAP_INFO_PATH = _REPO_ROOT / "shared" / "electrum" / "swap-server-info.json"
+ELECTRUM_SWAP_INFO_PATH = _SHARED_DIR / "electrum" / "swap-server-info.json"
 
 
 # ==============================================================================

@@ -116,6 +116,7 @@ declare -A SUITE_SLOT=(
     [neutrino-reference]=7
     [reference-maker]=8
     [tumbler]=9
+    [swap-e2e]=10
 )
 
 # Service slot index within a suite's port window.
@@ -783,7 +784,7 @@ run_suite_e2e() {
         JM_CONTAINER_PREFIX="${prefix}" \
         COMPOSE_PROJECT_NAME="${PROJECT_PREFIX}-${suite}" \
         COVERAGE_FILE=".coverage.${suite}" \
-        pytest -c pytest.ini -m "e2e and not tumbler_e2e" --fail-on-skip \
+        pytest -c pytest.ini -m "e2e and not tumbler_e2e and not swap_e2e" --fail-on-skip \
             -lv --timeout=300 --reruns=1 --reruns-delay=10 \
             --cov --cov-report=term-missing \
             tests/
@@ -800,6 +801,53 @@ run_suite_e2e() {
             -lv --timeout=300 \
             --cov --cov-report=term-missing \
             maker/tests/integration/ jmwallet/tests/ directory_server/tests/
+    } > "$log" 2>&1 || rc=$?
+    cleanup_suite "$suite"
+    return $rc
+}
+
+run_suite_swap_e2e() {
+    local suite="swap-e2e"
+    local log="${PARALLEL_DIR}/${suite}.log"
+    local btc_rpc=$(host_port "$suite" btc_rpc)
+    local dir_port=$(host_port "$suite" dir)
+    local walletd_port=$(host_port "$suite" walletd)
+    local nostr_port=$(host_port "$suite" nostr)
+    local lnd_rest=$(host_port "$suite" lnd_rest)
+    local shared_dir="${PARALLEL_DIR}/shared/${suite}"
+    local prefix="${CONTAINER_PREFIX}-${suite}"
+
+    log_suite "Starting: Lightning Swap E2E Tests ($suite)"
+    local rc=0
+    {
+        generate_override "$suite"
+        cleanup_suite "$suite"
+        compose_cmd "$suite" --profile e2e up -d
+
+        if ! wait_for_bitcoin_rpc "$suite" "$btc_rpc"; then
+            log_error "Bitcoin RPC not ready on host port $btc_rpc for suite $suite"
+            return 1
+        fi
+        wait_for_port "$dir_port" "Directory ($suite)"
+        wait_for_wallet_funder "$suite"
+
+        # Swap tests do not need makers; no extra connect wait required.
+        # Endpoints are remapped per suite, so pass overrides via env.
+        BITCOIN_RPC_URL="http://127.0.0.1:${btc_rpc}" \
+        BITCOIN_RPC_USER=test \
+        BITCOIN_RPC_PASSWORD=test \
+        JMWALLETD_URL="https://127.0.0.1:${walletd_port}" \
+        DIRECTORY_PORT="${dir_port}" \
+        JM_CONTAINER_PREFIX="${prefix}" \
+        COMPOSE_PROJECT_NAME="${PROJECT_PREFIX}-${suite}" \
+        SWAP_NOSTR_RELAY_URL="ws://127.0.0.1:${nostr_port}" \
+        SWAP_LND_TAKER_REST_URL="https://127.0.0.1:${lnd_rest}" \
+        SWAP_SHARED_DIR="${shared_dir}" \
+        COVERAGE_FILE=".coverage.${suite}" \
+        pytest -c pytest.ini -m "swap_e2e" --fail-on-skip \
+            -lv --timeout=300 --reruns=1 --reruns-delay=10 \
+            --cov --cov-report=term-missing \
+            tests/
     } > "$log" 2>&1 || rc=$?
     cleanup_suite "$suite"
     return $rc
@@ -1387,6 +1435,7 @@ main() {
 
     # Docker test suites (each with isolated compose project)
     launch_suite "e2e" run_suite_e2e
+    launch_suite "swap-e2e" run_suite_swap_e2e
     launch_suite "jmwallet" run_suite_jmwallet
     launch_suite "reference-interop" run_suite_reference_interop
     launch_suite "reference-legacy" run_suite_reference_legacy
@@ -1505,6 +1554,7 @@ case "${1:-}" in
         case "$suite" in
             unit)                  run_suite_unit ;;
             e2e)                   run_suite_e2e ;;
+            swap-e2e)              run_suite_swap_e2e ;;
             playwright)            run_suite_playwright ;;
             jmwallet)              run_suite_jmwallet ;;
             reference-interop)     run_suite_reference_interop ;;
