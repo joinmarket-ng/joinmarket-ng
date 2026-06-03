@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from aiohttp import web
+from jmcore.fee_quantization import QUANT_ABS, QUANT_REL
 from jmcore.models import OrderBook
 from jmcore.settings import OrderbookWatcherSettings
 from loguru import logger
@@ -177,6 +178,13 @@ class OrderbookServer:
             "directory_stats": directory_stats,
             "feature_stats": feature_stats,
             "feature_stats_denominator": len(bonded_makers),
+            "fee_quantization": {
+                # Public fee-homogenization grid (issue #508). The taker rounds
+                # its fee limits down onto these values; the chart buckets offers
+                # the same way so makers can see which quantum band they land in.
+                "rel_grid": [str(q) for q in QUANT_REL],
+                "abs_grid": list(QUANT_ABS),
+            },
             "mempool_url": self.settings.mempool_web_url
             or (
                 self.settings.mempool_api_url.replace("/api", "")

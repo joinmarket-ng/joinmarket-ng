@@ -635,3 +635,100 @@ tbody tr:hover {
 .direct-no {
     background-color: #6e7681;
 }
+
+/* Fee quantization bands chart (issue #508) */
+.fee-quant-stats {
+    margin-bottom: 30px;
+}
+
+.fee-quant-description {
+    color: #8b949e;
+    font-size: 0.85rem;
+    line-height: 1.5;
+    margin-bottom: 12px;
+}
+
+.fee-quant-toggle {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 16px;
+}
+
+.fee-quant-tab {
+    background: #0d1117;
+    color: #c9d1d9;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    padding: 6px 14px;
+    font-size: 0.85rem;
+    cursor: pointer;
+}
+
+.fee-quant-tab.active {
+    background: #1f6feb;
+    border-color: #1f6feb;
+    color: #fff;
+    font-weight: 600;
+}
+
+.fq-bars {
+    display: flex;
+    align-items: flex-end;
+    gap: 6px;
+    height: 220px;
+    padding: 8px;
+    background: #0d1117;
+    border-radius: 6px;
+    overflow-x: auto;
+}
+
+.fq-col {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    flex: 1 1 0;
+    min-width: 42px;
+    height: 100%;
+}
+
+.fq-bar-wrap {
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-end;
+    align-items: center;
+    width: 100%;
+    height: 180px;
+}
+
+.fq-count {
+    color: #c9d1d9;
+    font-size: 0.8rem;
+    font-weight: 600;
+    margin-bottom: 4px;
+}
+
+.fq-bar {
+    width: 70%;
+    min-height: 2px;
+    background: linear-gradient(180deg, #58a6ff, #1f6feb);
+    border-radius: 3px 3px 0 0;
+    cursor: help;
+    transition: height 0.2s ease;
+}
+
+.fq-bar-empty {
+    background: #30363d;
+}
+
+.fq-tick {
+    color: #8b949e;
+    font-size: 0.72rem;
+    margin-top: 6px;
+    text-align: center;
+    word-break: break-all;
+}
+
+.fee-quant-empty {
+    color: #8b949e;
+    font-size: 0.85rem;
+}
