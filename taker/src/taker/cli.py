@@ -1024,6 +1024,166 @@ async def _run_tumble(
 
 
 @app.command()
+def swap_recover(
+    mnemonic_file: Annotated[
+        Path | None, typer.Option("--mnemonic-file", "-f", help="Path to mnemonic file")
+    ] = None,
+    prompt_bip39_passphrase: Annotated[
+        bool,
+        typer.Option(
+            "--prompt-bip39-passphrase",
+            help="Prompt for BIP39 passphrase interactively",
+        ),
+    ] = False,
+    mixdepth: Annotated[
+        int, typer.Option("--mixdepth", "-m", help="Mixdepth to sweep recovered funds into")
+    ] = 0,
+    force: Annotated[
+        bool,
+        typer.Option(
+            "--force",
+            help=(
+                "Claim lockups even if their CoinJoin may still be in flight. "
+                "Only use when you are certain the round is dead."
+            ),
+        ),
+    ] = False,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Build claim transactions without broadcasting"),
+    ] = False,
+    network: Annotated[
+        NetworkType | None,
+        typer.Option("--network", case_sensitive=False, help="Protocol network"),
+    ] = None,
+    bitcoin_network: Annotated[
+        NetworkType | None,
+        typer.Option("--bitcoin-network", case_sensitive=False, help="Bitcoin network"),
+    ] = None,
+    backend_type: Annotated[
+        str | None,
+        typer.Option("--backend", "-b", help="Backend type: descriptor_wallet | neutrino"),
+    ] = None,
+    rpc_url: Annotated[
+        str | None,
+        typer.Option("--rpc-url", envvar="BITCOIN_RPC_URL", help="Bitcoin full node RPC URL"),
+    ] = None,
+    neutrino_url: Annotated[
+        str | None,
+        typer.Option("--neutrino-url", envvar="NEUTRINO_URL", help="Neutrino REST API URL"),
+    ] = None,
+    data_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--data-dir",
+            envvar="JOINMARKET_DATA_DIR",
+            help="Data directory (default: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)",
+        ),
+    ] = None,
+    log_level: Annotated[
+        str | None,
+        typer.Option("--log-level", "-l", help="Log level"),
+    ] = None,
+) -> None:
+    """Reclaim reverse-swap lockups whose CoinJoin never confirmed.
+
+    Loads the wallet, scans persisted swap-recovery records, and sweeps any
+    lockup output that is still unspent and safe to claim to a fresh wallet
+    address. Records whose CoinJoin confirmed are marked resolved; provider
+    refunds are reconciled. No directory-server connection is made.
+    """
+    settings = setup_cli(log_level, data_dir=data_dir)
+    ensure_config_file(settings.get_data_dir())
+
+    try:
+        resolved = resolve_mnemonic(
+            settings,
+            mnemonic_file=mnemonic_file,
+            prompt_bip39_passphrase=prompt_bip39_passphrase,
+        )
+        resolved_mnemonic = resolved.mnemonic if resolved else ""
+        resolved_passphrase = resolved.bip39_passphrase if resolved else ""
+        resolved_creation_height = resolved.creation_height if resolved else None
+    except (ValueError, FileNotFoundError) as e:
+        logger.error(str(e))
+        raise typer.Exit(1)
+
+    try:
+        config = build_taker_config(
+            settings=settings,
+            mnemonic=resolved_mnemonic,
+            passphrase=resolved_passphrase,
+            mixdepth=mixdepth,
+            network=network,
+            bitcoin_network=bitcoin_network,
+            backend_type=backend_type,
+            rpc_url=rpc_url,
+            neutrino_url=neutrino_url,
+        )
+    except ValueError as e:
+        logger.error(str(e))
+        raise typer.Exit(1)
+
+    if resolved_creation_height is not None:
+        config.creation_height = resolved_creation_height
+
+    try:
+        asyncio.run(_run_swap_recover(config, mixdepth=mixdepth, force=force, dry_run=dry_run))
+    except RuntimeError as e:
+        logger.error(f"Swap recovery failed: {e}")
+        raise typer.Exit(1)
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user")
+        raise typer.Exit(130)
+
+
+async def _run_swap_recover(
+    config: TakerConfig, *, mixdepth: int, force: bool, dry_run: bool
+) -> None:
+    """Build the wallet/backend/taker and run a one-shot recovery sweep."""
+    from taker.taker import Taker
+
+    bitcoin_network = config.bitcoin_network or config.network
+    backend = create_backend(config)
+
+    try:
+        await backend.get_block_height()
+    except Exception as e:
+        logger.error(f"Failed to connect to backend: {e}")
+        raise typer.Exit(1)
+
+    wallet = WalletService(
+        mnemonic=config.mnemonic.get_secret_value(),
+        passphrase=config.passphrase.get_secret_value(),
+        backend=backend,
+        network=bitcoin_network.value,
+        mixdepth_count=config.mixdepth_count,
+        gap_limit=config.gap_limit,
+        scan_range=config.scan_range,
+        data_dir=config.data_dir,
+    )
+
+    taker = Taker(wallet, backend, config)
+    try:
+        await taker.sync_wallet()
+        results = await taker.recover_swaps(broadcast=not dry_run, force_claim=force)
+        if not results:
+            typer.echo("No swap lockups need recovery.")
+            return
+        for r in results:
+            line = f"  {r.swap_id[:16]}...  {r.outcome.value}"
+            if r.txid:
+                line += f"  tx={r.txid}"
+            if r.value:
+                line += f"  value={r.value:,} sats"
+            if r.detail:
+                line += f"  ({r.detail})"
+            typer.echo(line)
+    finally:
+        await taker.stop()
+
+
+@app.command()
 def clear_ignored_makers(
     data_dir: Annotated[
         Path | None,

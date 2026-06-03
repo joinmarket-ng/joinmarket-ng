@@ -472,3 +472,54 @@ class TestBuildTakerConfig:
         )
 
         assert config.gap_limit == 50
+
+
+class TestSwapRecoverCommand:
+    """Tests for the `swap-recover` subcommand."""
+
+    def test_help_lists_command(self) -> None:
+        result = runner.invoke(app, ["--help"], prog_name="jm-taker")
+        assert result.exit_code == 0
+        assert "swap-recover" in click.unstyle(result.stdout)
+
+    def test_command_help(self) -> None:
+        result = runner.invoke(app, ["swap-recover", "--help"], prog_name="jm-taker")
+        assert result.exit_code == 0
+        output = click.unstyle(result.stdout)
+        assert "--force" in output
+        assert "--dry-run" in output
+
+    @pytest.mark.asyncio
+    async def test_run_swap_recover_reports_results(self) -> None:
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from taker.cli import _run_swap_recover
+        from taker.swap.recovery import RecoveryOutcome, RecoveryResult
+
+        config = MagicMock()
+        config.bitcoin_network = NetworkType.REGTEST
+        config.network = NetworkType.REGTEST
+        config.mnemonic.get_secret_value.return_value = "x"
+        config.passphrase.get_secret_value.return_value = ""
+
+        backend = AsyncMock()
+        backend.get_block_height = AsyncMock(return_value=100)
+
+        taker = MagicMock()
+        taker.sync_wallet = AsyncMock()
+        taker.stop = AsyncMock()
+        taker.recover_swaps = AsyncMock(
+            return_value=[
+                RecoveryResult("ab" * 32, RecoveryOutcome.CLAIMED, txid="cc" * 32, value=50_000)
+            ]
+        )
+
+        with (
+            patch("taker.cli.create_backend", return_value=backend),
+            patch("taker.cli.WalletService", return_value=MagicMock()),
+            patch("taker.taker.Taker", return_value=taker),
+        ):
+            await _run_swap_recover(config, mixdepth=0, force=False, dry_run=False)
+
+        taker.recover_swaps.assert_awaited_once_with(broadcast=True, force_claim=False)
+        taker.stop.assert_awaited_once()
