@@ -331,6 +331,7 @@ class CoinJoinSession:
                 hold_invoice_timeout=cfg.hold_invoice_timeout,
                 lockup_poll_interval=cfg.lockup_poll_interval,
                 backend=self.backend,
+                key_provider=self.wallet,
             )
             self.swap_client = client
 
@@ -1769,11 +1770,6 @@ class CoinJoinSession:
 
             # Sign swap input (P2WSH HTLC claim path) if present.
             if self.swap_input is not None:
-                from coincurve import PrivateKey
-                from jmwallet.wallet.signing import sign_p2wsh_input
-
-                from taker.swap.script import SwapScript
-
                 swap_key = (self.swap_input.txid, self.swap_input.vout)
                 if swap_key not in input_index_map:
                     raise TransactionSigningError(
@@ -1782,16 +1778,15 @@ class CoinJoinSession:
                     )
                 swap_idx = input_index_map[swap_key]
                 ws_bytes = self.swap_input.witness_script
-                claim_key = PrivateKey(self.swap_input.claim_privkey)
-                swap_signature = sign_p2wsh_input(
-                    tx=tx,
-                    input_index=swap_idx,
-                    witness_script=ws_bytes,
-                    value=self.swap_input.value,
-                    private_key=claim_key,
-                )
-                swap_witness = SwapScript.build_claim_witness(
-                    swap_signature, self.swap_input.preimage, ws_bytes
+                # The wallet owns the claim private key; it derives it from the
+                # swap index, signs, and returns the finished claim witness so
+                # the taker never handles raw key material.
+                swap_witness = self.wallet.build_swap_claim_witness(
+                    tx,
+                    swap_idx,
+                    ws_bytes,
+                    self.swap_input.value,
+                    self.swap_input.swap_index,
                 )
                 signatures_info.append(
                     {

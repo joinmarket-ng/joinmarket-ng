@@ -21,6 +21,73 @@ def _make_keypair() -> tuple[bytes, bytes]:
     return privkey, pubkey
 
 
+class _FakeKeyMaterial:
+    """Public swap key material, mirroring jmwallet.SwapKeyMaterial."""
+
+    def __init__(self, index: int, preimage: bytes, claim_privkey: bytes) -> None:
+        import hashlib
+
+        from coincurve import PrivateKey
+
+        self.index = index
+        self.preimage = preimage
+        self.preimage_hash = hashlib.sha256(preimage).digest()
+        self.claim_pubkey = PrivateKey(claim_privkey).public_key.format(compressed=True)
+
+
+class FakeKeyProvider:
+    """Deterministic in-test stand-in for the wallet's swap key authority.
+
+    The taker depends only on the SwapKeyProvider protocol, so tests inject
+    this instead of a full WalletService. It keeps the claim private key
+    internal (as the real wallet does) and only exposes public material plus
+    the finished claim witness.
+    """
+
+    def __init__(self) -> None:
+        self._secrets: dict[int, tuple[bytes, bytes]] = {}
+        self._next_index = 1
+
+    def _ensure(self, index: int) -> tuple[bytes, bytes]:
+        if index not in self._secrets:
+            self._secrets[index] = (secrets.token_bytes(32), secrets.token_bytes(32))
+        return self._secrets[index]
+
+    def derive_swap_storage_key(self) -> bytes:
+        return b"\x07" * 32
+
+    def create_swap_key_material(self) -> _FakeKeyMaterial:
+        index = self._next_index
+        self._next_index += 1
+        preimage, claim_privkey = self._ensure(index)
+        return _FakeKeyMaterial(index, preimage, claim_privkey)
+
+    def derive_swap_key_material(self, index: int) -> _FakeKeyMaterial:
+        preimage, claim_privkey = self._ensure(index)
+        return _FakeKeyMaterial(index, preimage, claim_privkey)
+
+    def build_swap_claim_witness(
+        self,
+        tx: Any,
+        input_index: int,
+        witness_script: bytes,
+        value: int,
+        swap_index: int,
+    ) -> list[bytes]:
+        from coincurve import PrivateKey
+        from jmwallet.wallet.signing import sign_p2wsh_input
+
+        preimage, claim_privkey = self._ensure(swap_index)
+        signature = sign_p2wsh_input(
+            tx=tx,
+            input_index=input_index,
+            witness_script=witness_script,
+            value=value,
+            private_key=PrivateKey(claim_privkey),
+        )
+        return [signature, preimage, witness_script]
+
+
 def _make_swap_response(
     preimage_hash: bytes,
     claim_pubkey: bytes,
@@ -297,7 +364,7 @@ class TestSwapClientDiscoverProvider:
 
 class TestSwapClientVerification:
     def test_verify_valid_response(self) -> None:
-        client = SwapClient(network="regtest")
+        client = SwapClient(network="regtest", key_provider=FakeKeyProvider())
         client._generate_swap_secrets()
         current_height = 800_000
         assert client._preimage_hash is not None
@@ -320,32 +387,31 @@ class TestSwapClientGetClaimWitnessData:
     def test_returns_required_fields(self) -> None:
         client = SwapClient()
         preimage = secrets.token_bytes(32)
-        privkey = secrets.token_bytes(32)
         ws = b"\x82" + bytes(100)
 
         swap_input = MagicMock()
         swap_input.witness_script = ws
         swap_input.preimage = preimage
-        swap_input.claim_privkey = privkey
+        swap_input.swap_index = 7
         swap_input.scriptpubkey = b"\x00\x20" + bytes(32)
 
         data = client.get_claim_witness_data(swap_input)
         assert data["witness_script"] == ws
         assert data["preimage"] == preimage
-        assert data["claim_privkey"] == privkey
+        assert data["swap_index"] == 7
 
 
 class TestSwapClientBlockchainWatching:
     def _setup_client_for_lockup(
         self,
         backend: AsyncMock | MagicMock,
-    ) -> tuple[SwapClient, Any, bytes, bytes, str]:
+    ) -> tuple[SwapClient, Any, bytes, int, str]:
         from taker.swap.models import ReverseSwapResponse
 
-        client = SwapClient(network="regtest", backend=backend)
+        client = SwapClient(network="regtest", backend=backend, key_provider=FakeKeyProvider())
         client._generate_swap_secrets()
         assert client._preimage is not None
-        assert client._claim_privkey is not None
+        assert client._swap_index is not None
         assert client._preimage_hash is not None
         assert client._claim_pubkey is not None
 
@@ -371,7 +437,7 @@ class TestSwapClientBlockchainWatching:
             onchain_amount=48_000,
         )
 
-        return client, response, client._preimage, client._claim_privkey, expected_spk_hex
+        return client, response, client._preimage, client._swap_index, expected_spk_hex
 
     @pytest.mark.asyncio
     async def test_lockup_timeout_raises(self) -> None:

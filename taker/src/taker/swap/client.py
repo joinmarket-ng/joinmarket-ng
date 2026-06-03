@@ -21,8 +21,6 @@ and mempool for a payment to the lockup address.
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import secrets
 from typing import TYPE_CHECKING, Any
 
 from loguru import logger
@@ -38,6 +36,8 @@ from taker.swap.script import SwapScript
 
 if TYPE_CHECKING:
     from jmwallet.backends.base import BlockchainBackend
+
+    from taker.swap.keys import SwapKeyMaterialLike, SwapKeyProvider
 
 
 class SwapClient:
@@ -77,6 +77,8 @@ class SwapClient:
         lockup_poll_interval: float = 2.0,
         # Blockchain backend for trustless lockup detection
         backend: BlockchainBackend | None = None,
+        # Wallet-side authority for all swap key material (no raw keys here)
+        key_provider: SwapKeyProvider | None = None,
     ) -> None:
         """Initialize the swap client.
 
@@ -120,11 +122,16 @@ class SwapClient:
         # Blockchain backend for trustless lockup detection
         self.backend = backend
 
+        # Wallet-side key authority. All preimage/claim-key operations are
+        # delegated here so the taker never touches raw private keys.
+        self.key_provider = key_provider
+
         self.state = SwapState.IDLE
+        self._key_material: SwapKeyMaterialLike | None = None
         self._preimage: bytes | None = None
         self._preimage_hash: bytes | None = None
-        self._claim_privkey: bytes | None = None
         self._claim_pubkey: bytes | None = None
+        self._swap_index: int | None = None
         self._provider: SwapProvider | None = None
         self._swap_response: ReverseSwapResponse | None = None
         self._swap_script: SwapScript | None = None
@@ -363,7 +370,7 @@ class SwapClient:
                 value=swap_response.onchain_amount,
                 witness_script=self._swap_script.witness_script() if self._swap_script else b"",
                 preimage=self._preimage or b"",
-                claim_privkey=self._claim_privkey or b"",
+                swap_index=self._swap_index if self._swap_index is not None else -1,
                 lockup_address=swap_response.lockup_address,
                 timeout_block_height=swap_response.timeout_block_height,
                 swap_id=swap_response.id,
@@ -384,59 +391,23 @@ class SwapClient:
         return self._swap_response.id if self._swap_response else None
 
     def _generate_swap_secrets(self) -> None:
-        """Generate preimage and claim keypair for the swap.
+        """Obtain swap key material from the wallet.
 
-        The preimage is 32 random bytes. The claim key is a secp256k1 private key.
+        The wallet owns all key derivation (BIP-85). The taker receives only
+        public material plus the preimage (which is published on-chain when the
+        claim is spent); the claim private key never leaves the wallet.
         """
-        self._preimage = secrets.token_bytes(32)
-        self._preimage_hash = hashlib.sha256(self._preimage).digest()
-
-        # Generate a secp256k1 keypair for the claim path
-        # We use the coincurve library if available, otherwise fall back
-        self._claim_privkey = secrets.token_bytes(32)
-        self._claim_pubkey = self._derive_pubkey(self._claim_privkey)
-
-    @staticmethod
-    def _derive_pubkey(privkey: bytes) -> bytes:
-        """Derive compressed public key from private key.
-
-        Args:
-            privkey: 32-byte private key.
-
-        Returns:
-            33-byte compressed public key.
-        """
-        try:
-            from coincurve import PrivateKey
-
-            pk = PrivateKey(privkey)
-            return pk.public_key.format(compressed=True)
-        except ImportError:
-            pass
-
-        try:
-            # Fallback: use jmcore.crypto if it exposes derive_public_key.
-            import jmcore.crypto as jmcrypto
-
-            derive_public_key = getattr(jmcrypto, "derive_public_key", None)
-            if callable(derive_public_key):
-                return derive_public_key(privkey)
-        except ImportError:
-            pass
-
-        # Last resort: use python-ecdsa
-        try:
-            from ecdsa import SECP256k1, SigningKey
-
-            sk = SigningKey.from_string(privkey, curve=SECP256k1)
-            vk = sk.get_verifying_key()
-            # Compress the public key
-            x = vk.pubkey.point.x()
-            y = vk.pubkey.point.y()
-            prefix = b"\x02" if y % 2 == 0 else b"\x03"
-            return prefix + x.to_bytes(32, "big")
-        except ImportError:
-            raise ImportError("No secp256k1 library available. Install 'coincurve' or 'ecdsa'.")
+        if self.key_provider is None:
+            raise RuntimeError(
+                "No key_provider configured; SwapClient requires a wallet to "
+                "derive swap secrets. Pass key_provider when constructing it."
+            )
+        material = self.key_provider.create_swap_key_material()
+        self._key_material = material
+        self._swap_index = material.index
+        self._preimage = material.preimage
+        self._preimage_hash = material.preimage_hash
+        self._claim_pubkey = material.claim_pubkey
 
     async def _get_provider(
         self,
@@ -776,7 +747,7 @@ class SwapClient:
         import time
 
         assert self._preimage is not None
-        assert self._claim_privkey is not None
+        assert self._swap_index is not None
         assert self._swap_script is not None
 
         if self.backend is None:
@@ -828,7 +799,7 @@ class SwapClient:
                         value=utxo.value,
                         witness_script=self._swap_script.witness_script(),
                         preimage=self._preimage,
-                        claim_privkey=self._claim_privkey,
+                        swap_index=self._swap_index if self._swap_index is not None else -1,
                         lockup_address=lockup_address,
                         timeout_block_height=response.timeout_block_height,
                         swap_id=response.id,
@@ -880,7 +851,9 @@ class SwapClient:
             <signature> <preimage> <witness_script>
 
         The signature must be created over the specific CoinJoin transaction
-        being signed, so we return the components needed for signing.
+        being signed, and is produced by the wallet from ``swap_index`` (the
+        claim private key never leaves the wallet), so we return only the
+        non-secret components plus the index identifying the wallet key.
 
         Args:
             swap_input: The SwapInput to claim.
@@ -889,12 +862,12 @@ class SwapClient:
             Dict with witness construction data:
             - witness_script: bytes
             - preimage: bytes
-            - claim_privkey: bytes
+            - swap_index: int (wallet-derived claim key identifier)
             - scriptpubkey: bytes (for BIP-143 signing)
         """
         return {
             "witness_script": swap_input.witness_script,
             "preimage": swap_input.preimage,
-            "claim_privkey": swap_input.claim_privkey,
+            "swap_index": swap_input.swap_index,
             "scriptpubkey": swap_input.scriptpubkey,
         }

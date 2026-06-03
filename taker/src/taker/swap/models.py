@@ -142,13 +142,19 @@ class SwapInput:
     The witness stack for spending this P2WSH output is:
         <signature> <preimage> <witness_script>
 
+    The claim private key never lives here: it is owned by the wallet and
+    derived on demand from ``swap_index`` via BIP-85, so the taker never holds
+    raw private keys. ``preimage`` is retained because it is published on-chain
+    the moment the claim is spent (it is not a long-term secret) and is needed
+    to assemble the witness.
+
     Attributes:
         txid: Transaction ID of the provider's lockup transaction.
         vout: Output index in the lockup transaction.
         value: Output value in satoshis.
         witness_script: The HTLC witness script (raw bytes).
         preimage: The 32-byte preimage for the HTLC.
-        claim_privkey: Private key for signing the claim (raw 32 bytes).
+        swap_index: BIP-85 index identifying the wallet-derived claim key.
         lockup_address: The P2WSH address (for verification).
         timeout_block_height: Block height after which the provider can refund.
         swap_id: Swap identifier for tracking.
@@ -160,7 +166,7 @@ class SwapInput:
     value: int
     witness_script: bytes
     preimage: bytes
-    claim_privkey: bytes
+    swap_index: int
     lockup_address: str
     timeout_block_height: int
     swap_id: str

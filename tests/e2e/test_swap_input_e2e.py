@@ -412,6 +412,12 @@ async def test_swap_client_acquire_input_ln(bitcoin_backend):
         lnd_cert_path=LND_TAKER_CERT_PATH,
         lnd_macaroon_path=LND_TAKER_MACAROON_PATH,
         backend=bitcoin_backend,
+        key_provider=WalletService(
+            mnemonic=TAKER_MNEMONIC,
+            backend=bitcoin_backend,
+            network="regtest",
+            mixdepth_count=5,
+        ),
     )
 
     assert client.lnd_configured, "SwapClient should have LND configured"
@@ -431,7 +437,7 @@ async def test_swap_client_acquire_input_ln(bitcoin_backend):
     assert swap_input.value > 0
     assert len(swap_input.witness_script) > 0
     assert len(swap_input.preimage) == 32
-    assert len(swap_input.claim_privkey) == 32
+    assert swap_input.swap_index >= 1
     assert swap_input.lockup_address.startswith("bcrt1")
     assert swap_input.timeout_block_height > current_height
 
@@ -468,23 +474,26 @@ async def test_swap_input_p2wsh_signing(bitcoin_backend):
     _require_lnd_credentials()
     await _wait_for_nostr_relay(NOSTR_RELAY_URL)
 
-    from coincurve import PrivateKey
     from jmwallet.wallet.signing import (
         Transaction,
         TxInput,
         TxOutput,
-        sign_p2wsh_input,
     )
     from tests.e2e.rpc_utils import rpc_call
 
     from taker.swap.client import SwapClient
-    from taker.swap.script import SwapScript
 
     # Get current block height
     info = await rpc_call("getblockchaininfo")
     current_height = info["blocks"]
 
     # Acquire swap input via full flow
+    key_provider = WalletService(
+        mnemonic=TAKER_MNEMONIC,
+        backend=bitcoin_backend,
+        network="regtest",
+        mixdepth_count=5,
+    )
     client = SwapClient(
         nostr_relays=[NOSTR_RELAY_URL],
         network="regtest",
@@ -493,6 +502,7 @@ async def test_swap_input_p2wsh_signing(bitcoin_backend):
         lnd_cert_path=LND_TAKER_CERT_PATH,
         lnd_macaroon_path=LND_TAKER_MACAROON_PATH,
         backend=bitcoin_backend,
+        key_provider=key_provider,
     )
     swap_input = await client.acquire_swap_input(
         desired_amount_sats=50_000,
@@ -523,24 +533,19 @@ async def test_swap_input_p2wsh_signing(bitcoin_backend):
         witnesses=[],
     )
 
-    # Sign with P2WSH
-    claim_key = PrivateKey(swap_input.claim_privkey)
-    signature = sign_p2wsh_input(
-        tx=tx,
-        input_index=0,
-        witness_script=swap_input.witness_script,
-        value=swap_input.value,
-        private_key=claim_key,
+    # The wallet signs the claim (the taker never holds the private key) and
+    # returns the finished witness stack [signature, preimage, witness_script].
+    claim_witness = key_provider.build_swap_claim_witness(
+        tx,
+        0,
+        swap_input.witness_script,
+        swap_input.value,
+        swap_input.swap_index,
     )
-
-    # Build claim witness
-    claim_witness = SwapScript.build_claim_witness(
-        signature, swap_input.preimage, swap_input.witness_script
-    )
+    signature = claim_witness[0]
 
     # Verify witness structure: [signature, preimage, witness_script]
     assert len(claim_witness) == 3
-    assert claim_witness[0] == signature
     assert claim_witness[1] == swap_input.preimage
     assert claim_witness[2] == swap_input.witness_script
 
@@ -575,11 +580,6 @@ async def test_swap_script_cross_compatibility(bitcoin_backend):
     4. Reconstructs the script from parsed parameters using our code
     5. Verifies byte-identical witness scripts and matching P2WSH addresses
     """
-    import hashlib
-    import secrets
-
-    from coincurve import PrivateKey
-
     _require_docker_container("jm-electrum-swap")
     _require_docker_container("jm-nostr-relay")
     _require_docker_container("jm-lnd-taker")
@@ -600,23 +600,24 @@ async def test_swap_script_cross_compatibility(bitcoin_backend):
         lnd_cert_path=LND_TAKER_CERT_PATH,
         lnd_macaroon_path=LND_TAKER_MACAROON_PATH,
         backend=bitcoin_backend,
+        key_provider=WalletService(
+            mnemonic=TAKER_MNEMONIC,
+            backend=bitcoin_backend,
+            network="regtest",
+            mixdepth_count=5,
+        ),
     )
 
     # Discover provider first
     provider = await client.discover_provider()
     assert provider is not None, "Should discover the Electrum swap server"
 
-    # Generate test secrets manually so we can verify the script
-    preimage = secrets.token_bytes(32)
-    preimage_hash = hashlib.sha256(preimage).digest()
-    claim_key = PrivateKey(secrets.token_bytes(32))
-    claim_pubkey = claim_key.public_key.format(compressed=True)
-
-    # Manually set the client's secrets (normally done by acquire_swap_input)
-    client._preimage = preimage
-    client._preimage_hash = preimage_hash
-    client._claim_privkey = claim_key.secret
-    client._claim_pubkey = claim_pubkey
+    # Derive swap secrets via the wallet (BIP-85), as acquire_swap_input does.
+    client._generate_swap_secrets()
+    preimage_hash = client._preimage_hash
+    claim_pubkey = client._claim_pubkey
+    assert preimage_hash is not None
+    assert claim_pubkey is not None
 
     # Create a reverse swap via Nostr DM RPC
     invoice_amount = provider.calculate_invoice_amount(100_000)

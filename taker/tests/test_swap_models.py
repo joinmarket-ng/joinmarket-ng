@@ -149,7 +149,6 @@ class TestSwapInput:
     @pytest.fixture
     def swap_input(self) -> SwapInput:
         preimage = secrets.token_bytes(32)
-        privkey = secrets.token_bytes(32)
         # Build a minimal valid witness script for scriptpubkey derivation
         ws = b"\x82\x01\x20\x87\x63\xa9\x14" + b"\x00" * 20 + b"\x88\x21" + b"\x00" * 33
         ws += b"\x67\x75\x03\x80\x35\x0c\xb1\x75\x21" + b"\x00" * 33 + b"\x68\xac"
@@ -159,7 +158,7 @@ class TestSwapInput:
             value=50_000,
             witness_script=ws,
             preimage=preimage,
-            claim_privkey=privkey,
+            swap_index=12345,
             lockup_address="bcrt1qtest",
             timeout_block_height=800_080,
             swap_id="test_swap_id",
@@ -191,7 +190,7 @@ class TestSwapInput:
             value=100_000,
             witness_script=b"\x00" * 34,
             preimage=b"\x00" * 32,
-            claim_privkey=b"\x00" * 32,
+            swap_index=1,
             lockup_address="bcrt1q...",
             timeout_block_height=100,
             swap_id="test",
