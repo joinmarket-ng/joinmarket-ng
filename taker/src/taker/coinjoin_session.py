@@ -326,7 +326,7 @@ class CoinJoinSession:
             client = SwapClient(
                 preferred_offer_id=cfg.provider_offer_id,
                 nostr_relays=cfg.nostr_relays,
-                network=self.config.bitcoin_network.value,
+                network=(self.config.bitcoin_network or self.config.network).value,
                 socks_host=getattr(self.config, "socks_host", None),
                 socks_port=getattr(self.config, "socks_port", 9050),
                 max_swap_fee_pct=cfg.max_swap_fee_pct,
@@ -363,8 +363,10 @@ class CoinJoinSession:
 
         except Exception as exc:
             # Distinguish pre-lockup vs post-lockup failure by client state.
-            client = self.swap_client
-            post_lockup = client is not None and client.state == SwapState.WAITING_LOCKUP
+            active_client = self.swap_client
+            post_lockup = (
+                active_client is not None and active_client.state == SwapState.WAITING_LOCKUP
+            )
             self.last_failure_reason = f"Swap input acquisition failed: {exc}"
             if post_lockup:
                 # Funds may be locked on-chain. Cancel LN payment and re-raise
@@ -373,9 +375,9 @@ class CoinJoinSession:
                     f"{self.last_failure_reason} (post-lockup; "
                     "cancelling LN payment, prepay forfeit)"
                 )
-                if client is not None:
+                if active_client is not None:
                     try:
-                        await client.cancel_pending_payment()
+                        await active_client.cancel_pending_payment()
                     except Exception as cancel_exc:  # noqa: BLE001
                         logger.warning(f"Failed to cancel LN payment cleanly: {cancel_exc!r}")
                 raise
@@ -385,9 +387,9 @@ class CoinJoinSession:
             # the lockup is awaited. A pre-lockup failure (e.g. prepay payment
             # raised) would otherwise orphan that task, leaving an HTLC in
             # flight. Cancel it so no payment lingers after we drop the client.
-            if client is not None:
+            if active_client is not None:
                 try:
-                    await client.cancel_pending_payment()
+                    await active_client.cancel_pending_payment()
                 except Exception as cancel_exc:  # noqa: BLE001
                     logger.warning(f"Failed to cancel pending LN payment cleanly: {cancel_exc!r}")
             self.swap_client = None
