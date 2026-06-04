@@ -581,8 +581,12 @@ def import_bond(
     print(f"\nSaved to: {get_registry_path(resolved_data_dir, wallet_fingerprint)}")
     print()
     print(
-        "Note: The bond UTXO will be detected on the next wallet sync.\n"
-        "      Run 'jm-wallet info' to trigger a sync."
+        "Next steps:\n"
+        "  - If the bond was funded recently, run 'jm-wallet sync-bonds' to\n"
+        "    refresh its on-chain value.\n"
+        "  - If it was funded in an older block the wallet has not scanned yet,\n"
+        "    run 'jm-wallet rescan' first so Bitcoin Core scans historical\n"
+        "    blocks for this address; a plain sync only tracks new activity."
     )
     print("=" * 80 + "\n")
 
