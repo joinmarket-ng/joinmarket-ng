@@ -11,6 +11,9 @@ ARG PYTHON_SLIM_DIGEST=sha256:c845af9399020c7e562969a13689e929074a10fd057acd1b1f
 # Update versions with: ./scripts/update-base-images.sh
 ARG SETUPTOOLS_VERSION=82.0.1
 ARG WHEEL_VERSION=0.47.0
+# hatchling builds coincurve's wheel from source (no cp314 wheel upstream); its
+# version is recorded in WHEEL/RECORD, so pin it for reproducible layer digests.
+ARG HATCHLING_VERSION=1.30.1
 
 FROM python:${PYTHON_VERSION}-slim@${PYTHON_SLIM_DIGEST} AS builder
 
@@ -40,8 +43,10 @@ ENV JOINMARKET_BUILD_REF=${JOINMARKET_BUILD_REF}
 # Pin build tools for reproducible builds (re-declare to inherit global ARGs)
 ARG SETUPTOOLS_VERSION
 ARG WHEEL_VERSION
+ARG HATCHLING_VERSION
 RUN echo "setuptools==${SETUPTOOLS_VERSION}" > /build/constraints.txt && \
-    echo "wheel==${WHEEL_VERSION}" >> /build/constraints.txt
+    echo "wheel==${WHEEL_VERSION}" >> /build/constraints.txt && \
+    echo "hatchling==${HATCHLING_VERSION}" > /build/coincurve-build-constraints.txt
 
 # Install all requirements in a single pip invocation so that pip resolves the
 # dependency graph once instead of re-resolving across three sequential calls.
@@ -51,7 +56,7 @@ COPY orderbook_watcher/requirements.txt /build/orderbook_watcher/
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     if [ -n "$SOURCE_DATE_EPOCH" ]; then export SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH; fi && \
-    pip install --prefix=/app \
+    pip install --prefix=/app --build-constraint /build/coincurve-build-constraints.txt \
         -r /build/jmcore/requirements.txt \
         -r /build/jmwallet/requirements.txt \
         -r /build/orderbook_watcher/requirements.txt
