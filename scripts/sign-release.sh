@@ -403,6 +403,17 @@ if [[ "$REPRODUCE" == true ]]; then
 
     log_info "Commit: $COMMIT"
     log_info "SOURCE_DATE_EPOCH: $SOURCE_DATE_EPOCH"
+
+    # Resolve build ref to mirror CI's ${{ github.ref_name }} (the tag for a
+    # release build). jmcore/setup.py reads JOINMARKET_BUILD_COMMIT/REF and
+    # writes _build_info.py into the wheel; without these args the resulting
+    # /root/.local layer diverges from CI. Prefer a tag pointing at COMMIT
+    # (release case), fall back to VERSION as supplied on the command line.
+    BUILD_REF=$(git -C "$PROJECT_ROOT" tag --points-at "$COMMIT" | head -n 1)
+    if [[ -z "$BUILD_REF" ]]; then
+        BUILD_REF="$VERSION"
+    fi
+    log_info "Build ref: $BUILD_REF"
     log_info "Platform: $PLATFORM"
 
     # Use git worktree from local repo (faster and more secure than cloning)
@@ -454,6 +465,8 @@ if [[ "$REPRODUCE" == true ]]; then
             --file "$dockerfile"
             --build-arg SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH"
             --build-arg VERSION="$VERSION"
+            --build-arg JOINMARKET_BUILD_COMMIT="$COMMIT"
+            --build-arg JOINMARKET_BUILD_REF="$BUILD_REF"
             --platform "$PLATFORM"
             --output "type=oci,dest=${OCI_TAR},rewrite-timestamp=true"
             --no-cache)
