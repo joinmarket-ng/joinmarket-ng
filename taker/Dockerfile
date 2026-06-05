@@ -11,6 +11,9 @@ ARG PYTHON_SLIM_DIGEST=sha256:c845af9399020c7e562969a13689e929074a10fd057acd1b1f
 # Update versions with: ./scripts/update-base-images.sh
 ARG SETUPTOOLS_VERSION=82.0.1
 ARG WHEEL_VERSION=0.47.0
+# hatchling builds coincurve's wheel from source (no cp314 wheel upstream); its
+# version is recorded in WHEEL/RECORD, so pin it for reproducible layer digests.
+ARG HATCHLING_VERSION=1.30.1
 
 FROM python:${PYTHON_VERSION}-slim@${PYTHON_SLIM_DIGEST} AS builder
 
@@ -40,14 +43,16 @@ ENV JOINMARKET_BUILD_REF=${JOINMARKET_BUILD_REF}
 # Pin build tools for reproducible builds (re-declare to inherit global ARGs)
 ARG SETUPTOOLS_VERSION
 ARG WHEEL_VERSION
+ARG HATCHLING_VERSION
 RUN echo "setuptools==${SETUPTOOLS_VERSION}" > /build/constraints.txt && \
-    echo "wheel==${WHEEL_VERSION}" >> /build/constraints.txt
+    echo "wheel==${WHEEL_VERSION}" >> /build/constraints.txt && \
+    echo "hatchling==${HATCHLING_VERSION}" > /build/coincurve-build-constraints.txt
 
 # Install jmcore dependencies (with hash verification)
-# Note: --build-constraint is NOT used here; it is only needed for our own packages below.
-# coincurve (the only source-build in requirements) uses hatchling, not setuptools, so our
-# setuptools constraint does not apply. Using --build-constraint here would conflict with
-# third-party packages that pin their own exact setuptools version (e.g. httptools on armv7).
+# Note: a hatchling-only build constraint pins coincurve's PEP 517 backend (the only
+# source-build in requirements) so its WHEEL/RECORD digests are reproducible. We do NOT
+# apply the full setuptools/wheel constraint here, as that would conflict with third-party
+# packages that pin their own setuptools version (e.g. httptools on armv7).
 # All requirements are installed in a single pip invocation so that pip resolves the
 # dependency graph once instead of re-resolving across four sequential calls.
 COPY jmcore/requirements.txt /build/jmcore/requirements.txt
@@ -57,7 +62,7 @@ COPY maker/requirements.txt /build/maker/requirements.txt
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     if [ -n "$SOURCE_DATE_EPOCH" ]; then export SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH; fi && \
-    pip install --prefix=/app \
+    pip install --prefix=/app --build-constraint /build/coincurve-build-constraints.txt \
         -r /build/jmcore/requirements.txt \
         -r /build/jmwallet/requirements.txt \
         -r /build/taker/requirements.txt \

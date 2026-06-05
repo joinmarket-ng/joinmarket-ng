@@ -12,6 +12,9 @@ ARG PYTHON_FULL_DIGEST=sha256:250e5c97be05e1eb2272fbdbd810dfd638f9012e1e6f65c993
 # Update versions with: ./scripts/update-base-images.sh
 ARG SETUPTOOLS_VERSION=82.0.1
 ARG WHEEL_VERSION=0.47.0
+# hatchling builds coincurve's wheel from source (no cp314 wheel upstream); its
+# version is recorded in WHEEL/RECORD, so pin it for reproducible layer digests.
+ARG HATCHLING_VERSION=1.30.1
 
 FROM python:${PYTHON_VERSION}-slim@${PYTHON_SLIM_DIGEST} AS builder
 
@@ -41,8 +44,10 @@ ENV JOINMARKET_BUILD_REF=${JOINMARKET_BUILD_REF}
 # Pin build tools for reproducible builds (re-declare to inherit global ARGs)
 ARG SETUPTOOLS_VERSION
 ARG WHEEL_VERSION
+ARG HATCHLING_VERSION
 RUN echo "setuptools==${SETUPTOOLS_VERSION}" > /build/constraints.txt && \
-    echo "wheel==${WHEEL_VERSION}" >> /build/constraints.txt
+    echo "wheel==${WHEEL_VERSION}" >> /build/constraints.txt && \
+    echo "hatchling==${HATCHLING_VERSION}" >> /build/constraints.txt
 
 # Install jmcore and directory_server dependencies in a single pip invocation.
 # --build-constraint is included because stem (in directory_server requirements) uses
@@ -151,8 +156,10 @@ ENV JOINMARKET_BUILD_REF=${JOINMARKET_BUILD_REF}
 # Pin build tools for reproducible builds (same versions as main builder)
 ARG SETUPTOOLS_VERSION
 ARG WHEEL_VERSION
+ARG HATCHLING_VERSION
 RUN echo "setuptools==${SETUPTOOLS_VERSION}" > /build/constraints.txt && \
-    echo "wheel==${WHEEL_VERSION}" >> /build/constraints.txt
+    echo "wheel==${WHEEL_VERSION}" >> /build/constraints.txt && \
+    echo "hatchling==${HATCHLING_VERSION}" >> /build/constraints.txt
 
 # Install jmcore and directory_server dependencies in a single pip invocation
 # (debug-builder variant). --build-constraint is included because stem uses legacy
