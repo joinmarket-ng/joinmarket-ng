@@ -47,9 +47,17 @@ taker with a `p2tr` wallet.
 ## Signing
 
 Both maker and taker sign P2TR inputs with a single 64-byte BIP341 key-path
-Schnorr signature. The taproot sighash commits to every input's amount and
-scriptPubKey, so both sides assemble the full prevout set (ordered by input
-index) before signing. The signing key is the tweaked BIP86 output key.
+Schnorr signature. Every CoinJoin input MUST use `SIGHASH_DEFAULT`: a 64-byte
+signature with no trailing sighash byte. Other sighash flags would let a
+participant leave outputs uncommitted and rewrite the transaction after signing,
+so verifiers reject any signature that is not exactly 64 bytes. The taproot
+sighash commits to every input's amount and scriptPubKey, so both sides assemble
+the full prevout set (ordered by input index) before signing. The signing key is
+the tweaked BIP86 output key.
+
+The taker's PoDLE commitment for a taproot UTXO commits to the tweaked BIP86
+output key (the on-chain key), not the raw internal key, so the maker's PoDLE
+binding (`x_only(P) == program`) succeeds.
 
 Received [silent payment](silent-payments.md) outputs are also spendable as
 CoinJoin inputs. They have no BIP32 path, so the wallet recomputes their output

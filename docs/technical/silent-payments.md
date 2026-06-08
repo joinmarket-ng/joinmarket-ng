@@ -91,6 +91,13 @@ above still applies.
   output key and is signed directly.
 - Received outputs can be spent as taproot CoinJoin inputs (see
   [Taproot CoinJoin](taproot-coinjoin.md)).
+- Paying *to* a silent payment address *through* a CoinJoin is not supported and
+  is rejected by the taker. A BIP352 receiver derives the output key from the
+  sum of all of a transaction's inputs, but in a CoinJoin the inputs come from
+  several parties whose private keys no single sender knows, so the taker cannot
+  compute the key the recipient scans for and the payment would be undetectable
+  and unspendable. Receiving silent payments and mixing the resulting ordinary
+  taproot coins is unaffected.
 - Remaining follow-ups: persisting scan progress / importing detected outputs
   as first-class wallet UTXOs across restarts, and an automatic background
   coinjoin sweep with randomized timing for received deposits.
