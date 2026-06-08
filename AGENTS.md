@@ -23,6 +23,8 @@ Change outputs are also included, but they are of different amounts and can be e
 - **Test (unit, repo root)**: `pytest --ignore=tests/playwright tests` (TUI script, release/changelog/flatpak helpers, finalize-bond-psbt; cannot be merged with the per-component invocation because each component ships its own `tests` package and the duplicated module names trip pytest's collector)
 - **Test (full suite, sequential)**: `./scripts/run_all_tests.sh` - Runs all phases with Docker orchestration
 - **Test (full suite, parallel)**: `./scripts/run_parallel_tests.sh` - Runs all suites in parallel via project isolation
+  - Use `--instance N` (or `JM_TEST_INSTANCE=N`) to namespace the compose project (`jmpt-i<N>`) and containers (`jm-i<N>`) so a run does not collide with an already-running stack (e.g. a dev `docker compose up` using the default `jm-*` names). Each instance gets its own ports/volumes.
+  - For ad-hoc compose runs alongside a running stack, pass a distinct project name: `docker compose -p jm-e2e-test --profile e2e up -d` (and `... -p jm-e2e-test --profile e2e down -v` to clean up). The default project reuses the `jm-bitcoin`/`jm-walletd`/... container names and will clash.
 - **Test (specific marker)**: `pytest -m e2e --fail-on-skip` - Uses `--fail-on-skip` to catch missing setup
 - **Lint/Format**: `pre-commit run --all-files` (Recommended).
   - Manual: `ruff check .` / `ruff format .` / `mypy .`
