@@ -134,6 +134,21 @@ class BlockchainBackend(ABC):
         before a rescan).  Full-node backends can ignore this.
         """
 
+    async def ensure_addresses_scanned(self, addresses: list[str]) -> None:
+        """Ensure *addresses* have been scanned over the wallet's full history.
+
+        Light-client backends (Neutrino) only rescan blocks that arrived since
+        their last rescan, and only for addresses that were already watched at
+        that time. An address added *after* the initial sync therefore needs an
+        explicit historical rescan, otherwise outputs paid to it before it was
+        watched (e.g. a fidelity bond funded earlier) are never found.
+
+        The default implementation is a no-op: full-node and descriptor-wallet
+        backends can query any address on demand (and handle fidelity bonds via
+        descriptor import), so they do not need this. Light-client backends
+        override it to trigger a rescan from the wallet's scan start height.
+        """
+
     def set_wallet_creation_height(self, height: int | None) -> None:
         """Provide the block height at which the wallet was created.
 

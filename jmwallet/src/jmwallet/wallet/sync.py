@@ -236,6 +236,13 @@ class WalletSyncMixin:
             addresses.append(address)
             address_to_info[address] = (locktime, timenumber)
 
+        # Ensure these bond addresses are scanned over the wallet's full
+        # history before querying. Light-client backends (Neutrino) only rescan
+        # new blocks for already-watched addresses; a bond address registered
+        # after the initial sync would otherwise miss its (already-confirmed)
+        # funding output. No-op for full-node/descriptor backends.
+        await self.backend.ensure_addresses_scanned(addresses)
+
         # Fetch UTXOs for all addresses at once
         backend_utxos = await self.backend.get_utxos(addresses)
 
@@ -528,9 +535,131 @@ class WalletSyncMixin:
         for mixdepth in range(self.mixdepth_count):
             utxos = await self.sync_mixdepth(mixdepth)
             result[mixdepth] = utxos
+
+        # Scan fidelity bond addresses too. The legacy address-by-address path
+        # (used by light-client backends such as Neutrino) only walks the
+        # regular mixdepth branches, so without this the supplied bond
+        # addresses on the timelock branch (.../2/...) are never queried and
+        # funded bonds stay invisible. ``sync_fidelity_bonds`` derives the same
+        # addresses from the locktimes and appends any found UTXOs to
+        # ``utxo_cache[0]``. ``sync_mixdepth`` returns the very list it stores in
+        # ``utxo_cache``, so ``result[0]`` is that same list and is updated in
+        # place -- no manual mirroring needed.
+        if fidelity_bond_addresses:
+            expected_hrp = get_hrp(self.network)
+            bond_locktimes = sorted(
+                {
+                    locktime
+                    for address, locktime, _ in fidelity_bond_addresses
+                    if (address.split("1")[0].lower() if "1" in address else "") == expected_hrp
+                }
+            )
+            if bond_locktimes:
+                await self.sync_fidelity_bonds(bond_locktimes)
+
         logger.info(f"Sync complete: {sum(len(u) for u in result.values())} total UTXOs")
         self._apply_frozen_state()
         return result
+
+    def load_registered_bond_addresses(self) -> list[tuple[str, int, int]]:
+        """Load this wallet's fidelity bond addresses from the per-wallet registry.
+
+        Reads ``fidelity_bonds_<fingerprint>.json`` (scoped to this wallet) and
+        returns the ``(address, locktime, index)`` tuples for bonds matching the
+        wallet's network, ready to pass into :meth:`sync_all`,
+        :meth:`sync_with_descriptor_wallet`, or :meth:`setup_descriptor_wallet`.
+
+        Returns an empty list when ``data_dir`` is unset (the registry is
+        file-backed) or no matching bonds are recorded. The legacy shared
+        ``fidelity_bonds.json`` fallback is disabled so foreign bonds are never
+        scanned under this wallet (issue #492).
+        """
+        if self.data_dir is None:
+            return []
+
+        from jmwallet.wallet.bond_registry import load_registry
+
+        registry = load_registry(
+            self.data_dir,
+            self.wallet_fingerprint,
+            allow_legacy_fallback=False,
+        )
+        return [
+            (bond.address, bond.locktime, bond.index)
+            for bond in registry.bonds
+            if bond.network == self.network
+        ]
+
+    async def sync_with_registered_bonds(self) -> dict[int, list[UTXOInfo]]:
+        """Sync the wallet including any fidelity bonds from the registry.
+
+        This is the bond-aware counterpart to :meth:`sync`. It loads the
+        wallet's registered fidelity bond addresses (see
+        :meth:`load_registered_bond_addresses`), ensures their watch-only
+        descriptors are imported for descriptor-wallet backends, and then syncs
+        so the bond UTXOs are scanned into ``utxo_cache`` alongside the regular
+        mixdepth UTXOs.
+
+        Callers that surface wallet state to users (the jmwalletd daemon's
+        ``/utxos`` and ``/display`` endpoints) must use this instead of
+        :meth:`sync`; otherwise funded fidelity bonds are invisible because the
+        bond branch (``.../2/...``) is not part of the standard descriptor
+        import (matching legacy joinmarket-clientserver behavior, where bonds
+        appear in the UTXO list).
+
+        Backends that are not descriptor wallets (e.g. neutrino) fall back to
+        :meth:`sync_all`, which already scans the supplied bond addresses.
+        """
+        bond_addresses = self.load_registered_bond_addresses()
+
+        if not isinstance(self.backend, DescriptorWalletBackend):
+            # Non-descriptor backends scan bond addresses directly in sync_all.
+            return await self.sync_all(bond_addresses or None)
+
+        if bond_addresses:
+            # Import only the bond descriptors that are not already present.
+            # We must inspect the actual descriptor set rather than rely on a
+            # descriptor *count* check: the base wallet already imports more
+            # descriptors than ``mixdepth_count * 2`` (Bitcoin Core records
+            # internal/external variants), so a count-based "ready" test would
+            # report the bonds as present and silently skip importing them
+            # (leaving funded bonds invisible).
+            imported = await self._imported_bond_addresses()
+            missing = [b for b in bond_addresses if b[0].lower() not in imported]
+
+            base_ready = await self.is_descriptor_wallet_ready(fidelity_bond_count=0)
+            if not base_ready:
+                await self.setup_descriptor_wallet(
+                    rescan=True,
+                    fidelity_bond_addresses=bond_addresses,
+                )
+            elif missing:
+                await self.import_fidelity_bond_addresses(missing, rescan=True)
+
+        return await self.sync_with_descriptor_wallet(bond_addresses or None)
+
+    async def _imported_bond_addresses(self) -> set[str]:
+        """Return the set of fidelity bond addresses (lowercased) already imported.
+
+        Parses the descriptor wallet's ``addr(<address>)`` descriptors so callers
+        can tell which registered bonds still need importing. Returns an empty set
+        for non-descriptor backends or when listing fails.
+        """
+        if not isinstance(self.backend, DescriptorWalletBackend):
+            return set()
+        try:
+            descriptors = await self.backend.list_descriptors()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(f"Could not list descriptors to check bond imports: {exc}")
+            return set()
+
+        imported: set[str] = set()
+        for item in descriptors:
+            desc = str(item.get("desc", ""))
+            base = desc.split("#", 1)[0]
+            if base.startswith("addr(") and base.endswith(")"):
+                imported.add(base[5:-1].lower())
+        return imported
 
     # -- Descriptor-based sync (Group D) ------------------------------------
 

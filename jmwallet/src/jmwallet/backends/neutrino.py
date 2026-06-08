@@ -1648,6 +1648,73 @@ class NeutrinoBackend(BlockchainBackend):
             logger.warning(f"Failed to fetch peers: {e}")
             return []
 
+    async def ensure_addresses_scanned(self, addresses: list[str]) -> None:
+        """Rescan *addresses* over the wallet's full history.
+
+        Neutrino only rescans new blocks for already-watched addresses, so an
+        address added after the initial sync (e.g. a freshly registered
+        fidelity bond) would miss outputs funded in already-scanned blocks.
+        This forces a rescan that re-covers the historical range for the given
+        addresses, then arms the async-indexing retry so the next
+        :meth:`get_utxos` waits for results.
+
+        neutrino-api skips a requested range when ``start_height`` is within the
+        already-scanned span (``start_height >= last_start_height``), keying off
+        a *global* scanned-tip rather than per-address coverage. To genuinely
+        backfill a newly watched address we must request a start height strictly
+        below the persisted ``last_start_height`` so the skip is bypassed and the
+        old blocks are re-evaluated against the new address' filter.
+        """
+        if not addresses:
+            return
+
+        # Only rescan addresses we are not already covering. ``add_watch_address``
+        # is idempotent; we use the watched set to detect genuinely new ones.
+        new_addresses = [a for a in addresses if a not in self._watched_addresses]
+        for address in addresses:
+            await self.add_watch_address(address)
+        if not new_addresses:
+            return
+
+        tip_height = await self.get_block_height()
+        start_height = await self._resolve_scan_start_height(tip_height)
+
+        # Bypass neutrino-api's "skip already-scanned range" optimisation, which
+        # would otherwise resume from last_scanned_tip+1 and never re-check the
+        # historical blocks where the new address may have been funded. neutrino-api
+        # only skips when start_height >= last_start_height, and persists the
+        # *earliest* start ever scanned, so we must request one block below that
+        # persisted floor to force a genuine re-scan of the old blocks against the
+        # new address' filter.
+        persisted_start, _persisted_tip = await self._get_rescan_coverage()
+        if persisted_start > 0:
+            start_height = min(start_height, persisted_start - 1)
+        start_height = max(start_height, self._min_valid_blockheight)
+
+        logger.info(
+            f"Rescanning {len(new_addresses)} newly watched address(es) "
+            f"(e.g. fidelity bonds) from height {start_height} to backfill history"
+        )
+        try:
+            # Issue the rescan directly rather than via ``rescan_from_height`` so
+            # this deliberate one-time backfill is not rejected by the interactive
+            # depth guard (the already-scanned span can exceed it). neutrino-api
+            # uses compact filters, so even a deep re-scan is bounded and fast.
+            await self._api_call(
+                "POST",
+                "v1/rescan",
+                data={"start_height": start_height, "addresses": new_addresses},
+            )
+            await self._wait_for_rescan(
+                require_started=True, timeout=self._INITIAL_RESCAN_TIMEOUT_SECONDS
+            )
+            _, post_tip = await self._get_rescan_coverage()
+            self._last_rescan_height = max(self._last_rescan_height, post_tip, tip_height)
+            # Force the next get_utxos to retry while async indexing settles.
+            self._just_rescanned = True
+        except Exception as e:
+            logger.warning(f"Failed to rescan newly watched addresses: {e}")
+
     async def rescan_from_height(
         self,
         start_height: int,
