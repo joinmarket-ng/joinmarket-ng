@@ -29,6 +29,8 @@ from jmwallet.wallet.utxo_metadata import UTXOMetadataStore
 from maker.config import MakerConfig
 from taker.config import TakerConfig
 
+from tests.e2e.docker_utils import bitcoin_rpc_url, directory_server
+
 # Mark all tests in this module as requiring Docker e2e profile
 pytestmark = pytest.mark.e2e
 
@@ -60,7 +62,7 @@ GENERIC_TEST_MNEMONIC = (
 def bitcoin_backend():
     """Bitcoin Core backend for regtest."""
     return DescriptorWalletBackend(
-        rpc_url="http://127.0.0.1:18443",
+        rpc_url=bitcoin_rpc_url(),
         rpc_user="test",
         rpc_password="test",
     )
@@ -183,11 +185,11 @@ def maker_config_with_datadir(tmp_path):
         bitcoin_network=NetworkType.REGTEST,
         backend_type="descriptor_wallet",
         backend_config={
-            "rpc_url": "http://127.0.0.1:18443",
+            "rpc_url": bitcoin_rpc_url(),
             "rpc_user": "test",
             "rpc_password": "test",
         },
-        directory_servers=["127.0.0.1:5222"],
+        directory_servers=[directory_server()],
         min_size=100_000,
         cj_fee_relative="0.0003",
         tx_fee_contribution=1_000,
@@ -203,11 +205,11 @@ def taker_config():
         bitcoin_network=NetworkType.REGTEST,
         backend_type="descriptor_wallet",
         backend_config={
-            "rpc_url": "http://127.0.0.1:18443",
+            "rpc_url": bitcoin_rpc_url(),
             "rpc_user": "test",
             "rpc_password": "test",
         },
-        directory_servers=["127.0.0.1:5222"],
+        directory_servers=[directory_server()],
         counterparty_count=2,
         minimum_makers=2,
         maker_timeout_sec=30,
@@ -516,7 +518,7 @@ class TestBIP329Persistence:
 
         # Create second wallet instance with same mnemonic and data_dir
         backend2 = DescriptorWalletBackend(
-            rpc_url="http://127.0.0.1:18443",
+            rpc_url=bitcoin_rpc_url(),
             rpc_user="test",
             rpc_password="test",
         )
@@ -1281,11 +1283,11 @@ class TestRealisticScenarios:
             bitcoin_network=NetworkType.REGTEST,
             backend_type="descriptor_wallet",
             backend_config={
-                "rpc_url": "http://127.0.0.1:18443",
+                "rpc_url": bitcoin_rpc_url(),
                 "rpc_user": "test",
                 "rpc_password": "test",
             },
-            directory_servers=["127.0.0.1:5222"],
+            directory_servers=[directory_server()],
             min_size=100_000,
             cj_fee_relative="0.0003",
             tx_fee_contribution=1_000,

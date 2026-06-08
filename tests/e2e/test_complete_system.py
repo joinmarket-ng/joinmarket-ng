@@ -14,7 +14,6 @@ Requires: docker compose --profile e2e up -d
 """
 
 import asyncio
-import os
 import subprocess
 
 import pytest
@@ -28,23 +27,15 @@ from taker.config import TakerConfig
 from taker.coinjoin_session import CoinJoinSession
 from taker.taker import Taker
 
-# Mark all tests in this module as requiring Docker e2e profile
-pytestmark = pytest.mark.e2e
-
-
 # Endpoints honor the same environment variables as tests/e2e/conftest.py so the
 # suite runs both against the default-port stack (docker compose --profile e2e)
 # and the parallel harness (run_parallel_tests.sh), which remaps host ports.
-def _bitcoin_rpc_url() -> str:
-    return os.environ.get("BITCOIN_RPC_URL", "http://127.0.0.1:18443")
+from tests.e2e.docker_utils import bitcoin_rpc_url as _bitcoin_rpc_url
+from tests.e2e.docker_utils import directory_host_port as _directory_host_port
+from tests.e2e.docker_utils import directory_server as _directory_server
 
-
-def _directory_host_port() -> int:
-    return int(os.environ.get("DIRECTORY_PORT", "5222"))
-
-
-def _directory_server() -> str:
-    return f"127.0.0.1:{_directory_host_port()}"
+# Mark all tests in this module as requiring Docker e2e profile
+pytestmark = pytest.mark.e2e
 
 
 # ==============================================================================

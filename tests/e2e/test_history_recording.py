@@ -21,6 +21,8 @@ from jmwallet.history import (
 )
 from jmwallet.wallet.service import WalletService
 
+from tests.e2e.docker_utils import bitcoin_rpc_url, directory_server
+
 # Mark all tests in this module as requiring Docker e2e profile
 pytestmark = pytest.mark.e2e
 
@@ -155,11 +157,11 @@ async def test_coinjoin_creates_history_entry(
             bitcoin_network=NetworkType.REGTEST,
             backend_type="descriptor_wallet",
             backend_config={
-                "rpc_url": "http://127.0.0.1:18443",
+                "rpc_url": bitcoin_rpc_url(),
                 "rpc_user": "test",
                 "rpc_password": "test",
             },
-            directory_servers=["127.0.0.1:5222"],
+            directory_servers=[directory_server()],
             counterparty_count=2,
             minimum_makers=2,
             data_dir=str(data_dir),

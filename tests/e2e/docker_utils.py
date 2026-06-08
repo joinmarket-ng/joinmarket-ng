@@ -26,6 +26,26 @@ def get_container_prefix() -> str:
     return os.environ.get("JM_CONTAINER_PREFIX", "jm")
 
 
+def bitcoin_rpc_url() -> str:
+    """Bitcoin Core RPC URL, honoring ``BITCOIN_RPC_URL``.
+
+    Defaults to the default-port e2e stack (``http://127.0.0.1:18443``). The
+    parallel harness (run_parallel_tests.sh) remaps host ports and sets this
+    variable, so tests that read it run under both stacks.
+    """
+    return os.environ.get("BITCOIN_RPC_URL", "http://127.0.0.1:18443")
+
+
+def directory_host_port() -> int:
+    """Directory server host port, honoring ``DIRECTORY_PORT`` (default 5222)."""
+    return int(os.environ.get("DIRECTORY_PORT", "5222"))
+
+
+def directory_server() -> str:
+    """Directory server ``host:port`` string for taker/maker configs."""
+    return f"127.0.0.1:{directory_host_port()}"
+
+
 def get_container_name(service: str) -> str:
     """Resolve a Docker container name for *service*.
 
