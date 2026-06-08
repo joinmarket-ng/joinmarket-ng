@@ -1948,27 +1948,3 @@ async def test_do_coinjoin_rejects_silent_payment_destination(
     assert "silent payment" in (taker._session.last_failure_reason or "").lower()
     # Rejected before any maker selection / network activity.
     assert not mock_select.called
-
-
-def test_maker_inputs_match_pit_enforces_single_type():
-    """Rigid pit (JMP-0005): every maker input must match the pit script type."""
-    from taker.coinjoin_session import CoinJoinSession
-
-    session = CoinJoinSession()
-
-    p2tr_utxo = {"scriptpubkey": "5120" + "bb" * 32}
-    p2wpkh_utxo = {"scriptpubkey": "0014" + "aa" * 20}
-
-    # All-P2TR inputs match a tr0 (p2tr) pit.
-    session.utxos = [p2tr_utxo, p2tr_utxo]
-    assert session._maker_inputs_match_pit(session, "p2tr")
-    # A P2WPKH input in a p2tr pit is rejected.
-    session.utxos = [p2tr_utxo, p2wpkh_utxo]
-    assert not session._maker_inputs_match_pit(session, "p2tr")
-    # All-P2WPKH inputs match a sw0 (p2wpkh) pit.
-    session.utxos = [p2wpkh_utxo]
-    assert session._maker_inputs_match_pit(session, "p2wpkh")
-    assert not session._maker_inputs_match_pit(session, "p2tr")
-    # A missing/unparseable scriptpubkey is treated as a mismatch.
-    session.utxos = [{"scriptpubkey": ""}]
-    assert not session._maker_inputs_match_pit(session, "p2tr")

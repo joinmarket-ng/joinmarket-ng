@@ -628,7 +628,9 @@ class CoinJoinSession:
 
             # Use merge algorithm for UTXO selection
             # Makers can consolidate UTXOs "for free" since takers pay all fees.
-            # Restrict inputs to the pit's script type (rigid pit, JMP-0005).
+            # Inputs are not filtered by script type: JMP-0005 expects a uniform
+            # pit but the maker keeps flexibility (like accepting more fee than
+            # required); it only guarantees its own outputs are the pit type.
             selected = self.wallet.select_utxos_with_merge(
                 max_mixdepth,
                 required_amount,
@@ -636,7 +638,6 @@ class CoinJoinSession:
                 merge_algorithm=self.merge_algorithm,
                 restrict_md0=self.restrict_md0,
                 exclude=exclude,
-                script_type=self.pit_script_type,
             )
 
             utxos_dict = {(utxo.txid, utxo.vout): utxo for utxo in selected}

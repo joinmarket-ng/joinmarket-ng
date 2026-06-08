@@ -10,19 +10,21 @@ This builds on the wider taproot specification tracked as JMP-0005.
 
 ## Rigid pit
 
-The `tr0` and `sw0` offer families are independent, rigid "pits". Within one
-CoinJoin every input, every equal-amount output, and every change output shares
-a single script type, fixed by the offer family:
+The `tr0` and `sw0` offer families are independent "pits". JMP-0005 specifies a
+rigid pit in which every input, every equal-amount output, and every change
+output shares a single script type, fixed by the offer family:
 
 - `sw0` -> P2WPKH everywhere.
 - `tr0` -> P2TR everywhere.
 
-There is no per-transaction or taker-chosen output type, and the two pits never
-mix in one transaction. Keeping the whole transaction uniform maximizes the
-anonymity set and avoids fingerprinting participants by script type. A maker MAY
-serve both pits at once (advertising `sw0` and `tr0` offers), but as two separate
-liquidity pools: a `tr0` fill is funded entirely from P2TR coins and pays P2TR
-outputs, a `sw0` fill entirely from P2WPKH.
+There is no per-transaction or taker-chosen output type, and the two pits are
+distinct offer families. The implementation produces uniform outputs by default
+(each participant derives its equal output and change in the offer-family type)
+but does not strictly *enforce* input/output homogeneity on its counterparties:
+a divergence is logged rather than rejected, keeping flexibility for later (much
+like a maker accepting more fee than it requires). A maker MAY serve both pits at
+once (advertising `sw0` and `tr0` offers); each fill produces outputs of that
+offer's type.
 
 ## Offer types
 
@@ -44,9 +46,9 @@ offer_type = "tr0reloffer"
 ```
 
 Setting a `tr0` offer type makes the maker derive a taproot (`p2tr`) wallet for
-its CoinJoin and change outputs, and select only P2TR inputs, regardless of
-`[wallet] address_type`, so the advertised offer and the on-chain scripts always
-agree.
+its CoinJoin and change outputs regardless of `[wallet] address_type`, so the
+maker's own outputs always match the advertised offer. (Input selection is not
+restricted by script type.)
 
 Taker (`[taker]`):
 
@@ -54,11 +56,10 @@ Taker (`[taker]`):
 preferred_offer_type = "tr0reloffer"
 ```
 
-This selects taproot makers and produces a uniformly P2TR transaction: the
-taker's equal output, change, and inputs are all P2TR. Because the pit is rigid,
-run a `p2tr` wallet (`[wallet] address_type = "p2tr"`) so the taker has P2TR
-inputs to spend; a P2WPKH-only wallet has no eligible `tr0` inputs. The payment
-destination may be any P2TR address.
+This selects taproot makers and, by default, produces a uniformly P2TR
+transaction: the taker's equal output and change are P2TR. Run a `p2tr` wallet
+(`[wallet] address_type = "p2tr"`) so the taker has P2TR inputs to spend. The
+payment destination may be any P2TR address.
 
 ## Signing
 

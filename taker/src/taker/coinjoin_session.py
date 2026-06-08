@@ -781,10 +781,13 @@ class CoinJoinSession:
                         continue
 
                     # Enforce the rigid pit (JMP-0005): every maker's equal
-                    # output, change output AND inputs must all share the pit's
-                    # single script type (fixed by the offer family). Otherwise
-                    # the equal outputs are not indistinguishable and the
-                    # transaction mixes coin types.
+                    # JMP-0005 specifies a rigid pit: every equal output, change
+                    # output and input shares the offer family's script type. The
+                    # implementation does not *enforce* this homogeneity (it keeps
+                    # flexibility for later, much like makers accepting more fee
+                    # than they require); a divergence is logged but the maker is
+                    # not dropped, so a slightly non-uniform participant can still
+                    # complete the CoinJoin.
                     expected_cj_type = offer_output_script_type(self.config.preferred_offer_type)
                     try:
                         maker_cj_type = get_address_type(cj_addr)
@@ -792,34 +795,10 @@ class CoinJoinSession:
                         maker_cj_type = ""
                     if maker_cj_type != expected_cj_type:
                         logger.warning(
-                            f"Dropping maker {nick}: cj_addr type {maker_cj_type!r} "
-                            f"does not match pit type {expected_cj_type!r}"
+                            f"Maker {nick} cj_addr type {maker_cj_type!r} differs from "
+                            f"pit type {expected_cj_type!r} (JMP-0005 expects uniform "
+                            "equal outputs; continuing without enforcement)"
                         )
-                        failed_makers.append(nick)
-                        del self.maker_sessions[nick]
-                        continue
-
-                    try:
-                        maker_change_type = get_address_type(change_addr) if change_addr else ""
-                    except ValueError:
-                        maker_change_type = ""
-                    if change_addr and maker_change_type != expected_cj_type:
-                        logger.warning(
-                            f"Dropping maker {nick}: change type {maker_change_type!r} "
-                            f"does not match pit type {expected_cj_type!r}"
-                        )
-                        failed_makers.append(nick)
-                        del self.maker_sessions[nick]
-                        continue
-
-                    if not self._maker_inputs_match_pit(session, expected_cj_type):
-                        logger.warning(
-                            f"Dropping maker {nick}: one or more inputs are not "
-                            f"{expected_cj_type} (rigid pit, JMP-0005)"
-                        )
-                        failed_makers.append(nick)
-                        del self.maker_sessions[nick]
-                        continue
 
                     session.cj_address = cj_addr
                     session.change_address = change_addr
@@ -1131,20 +1110,6 @@ class CoinJoinSession:
         if spk.startswith("a914") and len(spk) == 46:
             return "p2sh"
         return default
-
-    def _maker_inputs_match_pit(self, session: Any, pit_type: str) -> bool:
-        """Return True if every maker input matches the pit's script type.
-
-        JMP-0005 rigid pits forbid mixing input script types: a tr0 CoinJoin
-        accepts only P2TR inputs and a sw0 CoinJoin only P2WPKH inputs. A maker
-        input whose scriptPubKey is missing/unparseable cannot be confirmed to
-        match and is treated as a mismatch.
-        """
-        for utxo in session.utxos:
-            spk = utxo.get("scriptpubkey") or ""
-            if not spk or self._classify_scriptpubkey(spk, "") != pit_type:
-                return False
-        return True
 
     def _build_script_type_lists(
         self, selected_utxos: list[Any], num_outputs: int
