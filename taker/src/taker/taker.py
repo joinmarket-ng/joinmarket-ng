@@ -18,7 +18,7 @@ import asyncio
 import time
 from typing import Any
 
-from jmcore.bitcoin import calculate_tx_vsize, get_address_type
+from jmcore.bitcoin import calculate_tx_vsize, get_address_type, is_p2tr_address
 from jmcore.bond_calc import calculate_timelocked_fidelity_bond_value
 from jmcore.btc_script import derive_bond_address
 from jmcore.commitment_blacklist import set_blacklist_path
@@ -28,6 +28,7 @@ from jmcore.models import offer_output_script_type, offer_types_for_family
 from jmcore.notifications import get_notifier
 from jmcore.paths import read_nick_state
 from jmcore.protocol import FEATURE_NEUTRINO_COMPAT, JM_VERSION
+from jmcore.silentpayments import is_silent_payment_address
 from jmwallet.backends.base import BlockchainBackend, BondVerificationRequest
 from jmwallet.history import (
     update_taker_awaiting_transaction_broadcast,
@@ -466,6 +467,23 @@ class Taker(TakerMonitoringMixin):
                 )
                 logger.info(f"Using internal address: {destination}")
             else:
+                # A silent payment (BIP352) address cannot be paid through a
+                # CoinJoin: the receiver derives the output key from the sum of
+                # all inputs, which in a CoinJoin belong to several parties whose
+                # keys no single sender knows, so the output is undetectable and
+                # unspendable by the recipient (JMP-0005). Reject it explicitly
+                # rather than failing later with an opaque address-parse error.
+                if is_silent_payment_address(destination):
+                    reason = (
+                        "Silent payment (BIP352) addresses cannot be used as a "
+                        "CoinJoin destination: the recipient derives the output "
+                        "key from the sum of all inputs, but CoinJoin inputs come "
+                        "from multiple parties. Use a plain P2TR/P2WPKH address."
+                    )
+                    logger.error(reason)
+                    self._session.last_failure_reason = reason
+                    self.state = TakerState.FAILED
+                    return None
                 # Warn when the user-supplied destination does not match the
                 # wallet's native script type (#113).
                 warn_if_destination_script_mismatch(destination)
@@ -909,6 +927,17 @@ class Taker(TakerMonitoringMixin):
                     return None
 
             def get_private_key(addr: str) -> bytes | None:
+                # Taproot (BIP86 or registered silent-payment) UTXOs must commit
+                # to the *tweaked* output key, not the raw internal key, so that
+                # the maker's PoDLE binding (x_only(P) == program) succeeds. See
+                # JMP-0005 "Taproot PoDLE". resolve_p2tr_signing_key handles both
+                # the BIP86 taptweak and recovered silent-payment scalars.
+                if is_p2tr_address(addr):
+                    resolved = self.wallet.resolve_p2tr_signing_key(addr)
+                    if resolved is None:
+                        return None
+                    private_key, _xonly = resolved
+                    return private_key.secret
                 key = self.wallet.get_key_for_address(addr)
                 if key is None:
                     return None

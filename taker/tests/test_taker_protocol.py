@@ -1910,3 +1910,42 @@ async def test_do_coinjoin_refreshes_maker_nick_exclusion(
         if mock_select.called:
             # If selection was attempted, the nick must already be excluded.
             assert "J5LateStartMaker" in taker.orderbook_manager.own_wallet_nicks
+
+
+@pytest.mark.asyncio
+async def test_do_coinjoin_rejects_silent_payment_destination(
+    mock_wallet, mock_backend, mock_config, tmp_path
+):
+    """A silent payment (BIP352) destination must be rejected up front.
+
+    A BIP352 receiver derives the output key from the sum of all inputs, but in
+    a CoinJoin the inputs belong to several parties, so the payment would be
+    undetectable and unspendable by the recipient (JMP-0005). The taker must
+    fail fast with a clear reason instead of producing a broken transaction.
+    """
+    from coincurve import PrivateKey
+    from jmcore.silentpayments import derive_silent_payment_address
+
+    mock_config.data_dir = tmp_path
+    taker = Taker(mock_wallet, mock_backend, mock_config)
+
+    scan = PrivateKey().public_key.format(compressed=True)
+    spend = PrivateKey().public_key.format(compressed=True)
+    sp_address = derive_silent_payment_address(scan, spend, "regtest")
+
+    with patch.object(
+        taker.orderbook_manager,
+        "select_makers",
+        wraps=taker.orderbook_manager.select_makers,
+    ) as mock_select:
+        result = await taker.do_coinjoin(
+            amount=100_000,
+            destination=sp_address,
+            mixdepth=0,
+        )
+
+    assert result is None
+    assert taker.state == TakerState.FAILED
+    assert "silent payment" in (taker._session.last_failure_reason or "").lower()
+    # Rejected before any maker selection / network activity.
+    assert not mock_select.called
