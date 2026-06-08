@@ -647,8 +647,12 @@ async def test_select_our_utxos_declines_on_lock_conflict():
 
 
 @pytest.mark.asyncio
-async def test_requested_cj_script_type_from_fill():
-    """Taker-signalled cjtype is honored; defaults to wallet type otherwise."""
+async def test_pit_script_type_from_offer_family():
+    """Rigid pit (JMP-0005): the pit's script type is fixed by the offer family.
+
+    sw0 offers produce a P2WPKH pit and tr0 offers a P2TR pit, regardless of the
+    maker's primary wallet type. There is no taker-chosen output type.
+    """
     from unittest.mock import MagicMock
 
     from jmcore.models import Offer, OfferType
@@ -659,46 +663,43 @@ async def test_requested_cj_script_type_from_fill():
     mock_wallet.address_type = "p2wpkh"
     mock_backend = MagicMock()
     mock_backend.requires_neutrino_metadata.return_value = False
-    offer = Offer(
-        counterparty="J5TypeMaker",
-        ordertype=OfferType.SW0_RELATIVE,
-        oid=0,
-        minsize=10_000,
-        maxsize=100_000_000,
-        txfee=1000,
-        cjfee="0.0003",
-    )
 
-    # Default (legacy taker, no cjtype): falls back to wallet's primary type.
-    session = CoinJoinSession(
-        taker_nick="J5T", offer=offer, wallet=mock_wallet, backend=mock_backend
-    )
-    assert session.requested_cj_script_type == "p2wpkh"
+    def _offer(ordertype: OfferType) -> Offer:
+        return Offer(
+            counterparty="J5TypeMaker",
+            ordertype=ordertype,
+            oid=0,
+            minsize=10_000,
+            maxsize=100_000_000,
+            txfee=1000,
+            cjfee="0.0003",
+        )
 
     taker_pk = CryptoSession().get_pubkey_hex()
-    ok, _ = await session.handle_fill(amount=1_000_000, commitment="aa" * 32, taker_pk=taker_pk)
-    assert ok
-    assert session.requested_cj_script_type == "p2wpkh"
 
-    # Taker requests p2tr equal outputs.
-    session2 = CoinJoinSession(
-        taker_nick="J5T", offer=offer, wallet=mock_wallet, backend=mock_backend
+    # sw0 -> p2wpkh pit, even though the maker wallet is p2wpkh anyway.
+    sw0 = CoinJoinSession(
+        taker_nick="J5T",
+        offer=_offer(OfferType.SW0_RELATIVE),
+        wallet=mock_wallet,
+        backend=mock_backend,
     )
-    ok, _ = await session2.handle_fill(
-        amount=1_000_000, commitment="aa" * 32, taker_pk=taker_pk, cj_script_type="p2tr"
-    )
+    assert sw0.pit_script_type == "p2wpkh"
+    ok, _ = await sw0.handle_fill(amount=1_000_000, commitment="aa" * 32, taker_pk=taker_pk)
     assert ok
-    assert session2.requested_cj_script_type == "p2tr"
+    assert sw0.pit_script_type == "p2wpkh"
 
-    # An unsupported type is rejected.
-    session3 = CoinJoinSession(
-        taker_nick="J5T", offer=offer, wallet=mock_wallet, backend=mock_backend
+    # tr0 -> p2tr pit, independent of the maker's primary wallet type.
+    tr0 = CoinJoinSession(
+        taker_nick="J5T",
+        offer=_offer(OfferType.TR0_RELATIVE),
+        wallet=mock_wallet,
+        backend=mock_backend,
     )
-    ok, resp = await session3.handle_fill(
-        amount=1_000_000, commitment="aa" * 32, taker_pk=taker_pk, cj_script_type="p2pkh"
-    )
-    assert not ok
-    assert "error" in resp
+    assert tr0.pit_script_type == "p2tr"
+    ok, _ = await tr0.handle_fill(amount=1_000_000, commitment="aa" * 32, taker_pk=taker_pk)
+    assert ok
+    assert tr0.pit_script_type == "p2tr"
 
 
 if __name__ == "__main__":

@@ -17,7 +17,7 @@ from enum import StrEnum
 from typing import Any
 
 from jmcore.encryption import CryptoSession
-from jmcore.models import NetworkType, Offer
+from jmcore.models import NetworkType, Offer, offer_output_script_type
 from jmcore.podle import parse_podle_revelation, verify_podle, verify_podle_binding
 from jmcore.protocol import (
     UTXOMetadata,
@@ -85,10 +85,10 @@ class CoinJoinSession:
         self.cj_address = ""
         self.change_address = ""
         self.mixdepth = 0
-        # Uniform equal-output script type requested by the taker (JMP-0005).
-        # Defaults to the maker wallet's primary type for legacy takers that
-        # do not signal a type in !fill.
-        self.requested_cj_script_type = wallet.address_type
+        # The pit is rigid (JMP-0005): the equal-output, change and input script
+        # types are all fixed by the offer family (sw0 -> p2wpkh, tr0 -> p2tr).
+        # There is no per-transaction or taker-chosen output type.
+        self.pit_script_type = offer_output_script_type(offer.ordertype)
         self.commitment = b""
         self.taker_nacl_pk = ""  # Taker's NaCl pubkey (hex) for btc_sig
         self.created_at = time.time()
@@ -181,7 +181,6 @@ class CoinJoinSession:
         amount: int,
         commitment: str,
         taker_pk: str,
-        cj_script_type: str | None = None,
     ) -> tuple[bool, dict[str, Any]]:
         """
         Handle !fill message from taker.
@@ -190,9 +189,6 @@ class CoinJoinSession:
             amount: CoinJoin amount requested
             commitment: PoDLE commitment (will be verified later in !auth)
             taker_pk: Taker's NaCl public key for E2E encryption
-            cj_script_type: Uniform equal-output script type the taker requested
-                ("p2tr" or "p2wpkh"), per JMP-0005. ``None`` for legacy takers,
-                in which case the maker's primary wallet type is used.
 
         Returns:
             (success, response_data)
@@ -210,11 +206,6 @@ class CoinJoinSession:
 
             if amount > self.offer.maxsize:
                 return False, {"error": f"Amount too large: {amount} > {self.offer.maxsize}"}
-
-            if cj_script_type is not None:
-                if cj_script_type not in ("p2tr", "p2wpkh"):
-                    return False, {"error": f"Unsupported cj script type: {cj_script_type}"}
-                self.requested_cj_script_type = cj_script_type
 
             self.amount = amount
             self.commitment = bytes.fromhex(commitment)
@@ -636,7 +627,8 @@ class CoinJoinSession:
             exclude |= self.wallet.get_locked_input_outpoints()
 
             # Use merge algorithm for UTXO selection
-            # Makers can consolidate UTXOs "for free" since takers pay all fees
+            # Makers can consolidate UTXOs "for free" since takers pay all fees.
+            # Restrict inputs to the pit's script type (rigid pit, JMP-0005).
             selected = self.wallet.select_utxos_with_merge(
                 max_mixdepth,
                 required_amount,
@@ -644,6 +636,7 @@ class CoinJoinSession:
                 merge_algorithm=self.merge_algorithm,
                 restrict_md0=self.restrict_md0,
                 exclude=exclude,
+                script_type=self.pit_script_type,
             )
 
             utxos_dict = {(utxo.txid, utxo.vout): utxo for utxo in selected}
@@ -664,15 +657,17 @@ class CoinJoinSession:
 
             cj_output_mixdepth = (max_mixdepth + 1) % self.wallet.mixdepth_count
             cj_index = self.wallet.get_next_address_index(cj_output_mixdepth, 1)
-            # The equal-amount CoinJoin output must use the uniform script type
-            # the taker requested (JMP-0005). Change is unrestricted and uses
-            # the wallet's primary type.
+            # Rigid pit (JMP-0005): the equal-amount output AND change both use
+            # the pit's single script type (fixed by the offer family). No
+            # per-transaction mixing of P2WPKH and P2TR.
             cj_address = self.wallet.get_change_address(
-                cj_output_mixdepth, cj_index, script_type=self.requested_cj_script_type
+                cj_output_mixdepth, cj_index, script_type=self.pit_script_type
             )
 
             change_index = self.wallet.get_next_address_index(max_mixdepth, 1)
-            change_address = self.wallet.get_change_address(max_mixdepth, change_index)
+            change_address = self.wallet.get_change_address(
+                max_mixdepth, change_index, script_type=self.pit_script_type
+            )
 
             # Reserve addresses immediately after selection to prevent reuse
             # in concurrent CoinJoin sessions. Once shared with a taker, addresses

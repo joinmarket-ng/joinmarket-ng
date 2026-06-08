@@ -412,15 +412,6 @@ class ProtocolHandlersMixin:
             taker_pk = parts[3]  # Taker's NaCl pubkey for E2E encryption
             commitment = parts[4]  # PoDLE commitment (with prefix like "P")
 
-            # Optional cjtype=<type> token signals the uniform equal-output
-            # script type the taker requested (JMP-0005). Absent for legacy
-            # takers, in which case the session falls back to the wallet type.
-            cj_script_type: str | None = None
-            for token in parts[5:]:
-                if token.startswith("cjtype="):
-                    cj_script_type = token.split("=", 1)[1]
-                    break
-
             # Strip commitment prefix if present (e.g., "P" for standard PoDLE)
             if commitment.startswith("P"):
                 commitment = commitment[1:]
@@ -473,9 +464,7 @@ class ProtocolHandlersMixin:
             session.validate_channel(source)
 
             # Pass the taker's NaCl pubkey for setting up encryption
-            success, response = await session.handle_fill(
-                amount, commitment, taker_pk, cj_script_type
-            )
+            success, response = await session.handle_fill(amount, commitment, taker_pk)
 
             if success:
                 self.active_sessions[taker_nick] = session
