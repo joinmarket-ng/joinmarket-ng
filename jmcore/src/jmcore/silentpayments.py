@@ -381,6 +381,27 @@ def derive_silent_payment_address(
     return SilentPaymentAddress(scan_pubkey=scan_pubkey, spend_pubkey=spend_pubkey).encode(network)
 
 
+def is_silent_payment_address(address: str) -> bool:
+    """Return ``True`` if ``address`` is a well-formed silent payment address.
+
+    Detects ``sp1``/``tsp1`` (BIP352) addresses by decoding them. Used to reject
+    silent payment destinations for CoinJoins: a BIP352 receiver derives the
+    output key from the sum of *all* of a transaction's inputs, but in a CoinJoin
+    the inputs come from several parties whose private keys no single sender
+    knows, so a silent payment cannot be paid through a CoinJoin (see JMP-0005).
+    """
+    if not isinstance(address, str):
+        return False
+    lowered = address.lower()
+    if not (lowered.startswith(f"{_HRP_MAINNET}1") or lowered.startswith(f"{_HRP_TESTNET}1")):
+        return False
+    try:
+        SilentPaymentAddress.decode(address)
+    except (SilentPaymentError, ValueError):
+        return False
+    return True
+
+
 def create_label_tweak(scan_privkey: int, m: int) -> int:
     """Compute the label tweak scalar hash_BIP0352/Label(ser256(b_scan) || ser32(m))."""
     digest = tagged_hash("BIP0352/Label", _scalar_to_bytes(scan_privkey) + _ser_uint32(m))

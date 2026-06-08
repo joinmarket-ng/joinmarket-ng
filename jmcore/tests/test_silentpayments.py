@@ -148,6 +148,27 @@ def test_invalid_address_checksum() -> None:
         SilentPaymentAddress.decode(broken)
 
 
+def test_is_silent_payment_address() -> None:
+    from jmcore.silentpayments import is_silent_payment_address
+
+    scan = PublicKey.from_secret((1).to_bytes(32, "big")).format()
+    spend = PublicKey.from_secret((2).to_bytes(32, "big")).format()
+    addr = SilentPaymentAddress(scan_pubkey=scan, spend_pubkey=spend)
+
+    assert is_silent_payment_address(addr.encode("mainnet"))
+    assert is_silent_payment_address(addr.encode("signet"))
+    # Not silent payment addresses.
+    assert not is_silent_payment_address("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4")
+    assert not is_silent_payment_address(
+        "bc1p5cyxnuxmeuwuvkwfem96lqzszd02n6xdcjrs20cac6yqjjwudpxqkedrcr"
+    )
+    assert not is_silent_payment_address("not an address")
+    assert not is_silent_payment_address("")
+    # Malformed sp1 address (bad checksum) is not accepted.
+    encoded = addr.encode("mainnet")
+    assert not is_silent_payment_address(encoded[:-1] + ("q" if encoded[-1] != "q" else "p"))
+
+
 def _non_curve_xonly() -> bytes:
     """An x-only key whose x coordinate is not on the secp256k1 curve."""
     from jmcore.silentpayments import _lift_x

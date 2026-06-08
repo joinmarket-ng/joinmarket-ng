@@ -160,6 +160,7 @@ from jmcore.silentpayments import (
     create_outputs,
     derive_silent_payment_address,
     extract_input_pubkey,
+    is_silent_payment_address,
     parse_witness,
     scan_transaction,
 )
@@ -379,6 +380,7 @@ __all__ = [
     "create_outputs",
     "derive_silent_payment_address",
     "extract_input_pubkey",
+    "is_silent_payment_address",
     "parse_witness",
     "scan_transaction",
     # Tasks
