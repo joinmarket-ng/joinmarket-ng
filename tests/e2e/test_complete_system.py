@@ -14,6 +14,7 @@ Requires: docker compose --profile e2e up -d
 """
 
 import asyncio
+import os
 import subprocess
 
 import pytest
@@ -29,6 +30,22 @@ from taker.taker import Taker
 
 # Mark all tests in this module as requiring Docker e2e profile
 pytestmark = pytest.mark.e2e
+
+
+# Endpoints honor the same environment variables as tests/e2e/conftest.py so the
+# suite runs both against the default-port stack (docker compose --profile e2e)
+# and the parallel harness (run_parallel_tests.sh), which remaps host ports.
+def _bitcoin_rpc_url() -> str:
+    return os.environ.get("BITCOIN_RPC_URL", "http://127.0.0.1:18443")
+
+
+def _directory_host_port() -> int:
+    return int(os.environ.get("DIRECTORY_PORT", "5222"))
+
+
+def _directory_server() -> str:
+    return f"127.0.0.1:{_directory_host_port()}"
+
 
 # ==============================================================================
 # Test Wallet Mnemonics (used in successful CoinJoin testing)
@@ -78,7 +95,7 @@ def _require_docker_container(service: str) -> None:
 def bitcoin_backend():
     """Bitcoin Core backend for regtest"""
     return DescriptorWalletBackend(
-        rpc_url="http://127.0.0.1:18443",
+        rpc_url=_bitcoin_rpc_url(),
         rpc_user="test",
         rpc_password="test",
     )
@@ -144,10 +161,10 @@ async def directory_server():
     import time
     from pathlib import Path
 
-    # Check if directory server is already running on port 5222
+    # Check if directory server is already running on the directory port
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        result = sock.connect_ex(("127.0.0.1", 5222))
+        result = sock.connect_ex(("127.0.0.1", _directory_host_port()))
         if result == 0:
             # Port is open, assume directory server is running (Docker)
             yield None
@@ -168,7 +185,7 @@ async def directory_server():
             + ":"
             + str(repo_root / "jmcore" / "src"),
             "NETWORK": "testnet",  # Protocol network (not bitcoin network)
-            "PORT": "5222",
+            "PORT": str(_directory_host_port()),
             "LOG_LEVEL": "DEBUG",
         },
         stdout=subprocess.PIPE,
@@ -206,11 +223,11 @@ def maker_config():
         bitcoin_network=NetworkType.REGTEST,  # Bitcoin network for address generation
         backend_type="descriptor_wallet",
         backend_config={
-            "rpc_url": "http://127.0.0.1:18443",
+            "rpc_url": _bitcoin_rpc_url(),
             "rpc_user": "test",
             "rpc_password": "test",
         },
-        directory_servers=["127.0.0.1:5222"],
+        directory_servers=[_directory_server()],
         min_size=100_000,
         cj_fee_relative="0.0003",
         tx_fee_contribution=1_000,
@@ -231,11 +248,11 @@ def maker2_config():
         bitcoin_network=NetworkType.REGTEST,  # Bitcoin network for address generation
         backend_type="descriptor_wallet",
         backend_config={
-            "rpc_url": "http://127.0.0.1:18443",
+            "rpc_url": _bitcoin_rpc_url(),
             "rpc_user": "test",
             "rpc_password": "test",
         },
-        directory_servers=["127.0.0.1:5222"],
+        directory_servers=[_directory_server()],
         min_size=100_000,
         cj_fee_relative="0.00025",
         tx_fee_contribution=1_500,
@@ -256,11 +273,11 @@ def taker_config():
         bitcoin_network=NetworkType.REGTEST,  # Bitcoin network for address generation
         backend_type="descriptor_wallet",
         backend_config={
-            "rpc_url": "http://127.0.0.1:18443",
+            "rpc_url": _bitcoin_rpc_url(),
             "rpc_user": "test",
             "rpc_password": "test",
         },
-        directory_servers=["127.0.0.1:5222"],
+        directory_servers=[_directory_server()],
         counterparty_count=2,
         minimum_makers=2,
         maker_timeout_sec=30,
@@ -282,11 +299,11 @@ def taproot_taker_config():
         bitcoin_network=NetworkType.REGTEST,
         backend_type="descriptor_wallet",
         backend_config={
-            "rpc_url": "http://127.0.0.1:18443",
+            "rpc_url": _bitcoin_rpc_url(),
             "rpc_user": "test",
             "rpc_password": "test",
         },
-        directory_servers=["127.0.0.1:5222"],
+        directory_servers=[_directory_server()],
         counterparty_count=2,
         minimum_makers=2,
         maker_timeout_sec=30,
