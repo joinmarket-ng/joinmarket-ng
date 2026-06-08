@@ -9,6 +9,22 @@ from __future__ import annotations
 from jmwallet.wallet.models import UTXOInfo
 
 
+def utxo_matches_script_type(utxo: UTXOInfo, script_type: str | None) -> bool:
+    """Return True if ``utxo`` belongs to the given pit script type.
+
+    JMP-0005 rigid pits require every input to share the offer family's script
+    type (``"p2tr"`` for tr0, ``"p2wpkh"`` for sw0). ``None`` matches any type
+    (no pit restriction). Received silent payment coins are key-path P2TR.
+    """
+    if script_type is None:
+        return True
+    if script_type == "p2tr":
+        return utxo.is_p2tr
+    if script_type == "p2wpkh":
+        return utxo.is_p2wpkh
+    return True
+
+
 class CoinSelectionMixin:
     """Mixin providing coin selection capabilities.
 
@@ -28,6 +44,7 @@ class CoinSelectionMixin:
         *,
         restrict_md0: bool = True,
         exclude: set[tuple[str, int]] | None = None,
+        script_type: str | None = None,
     ) -> list[UTXOInfo]:
         """
         Select UTXOs for spending from a mixdepth.
@@ -49,6 +66,9 @@ class CoinSelectionMixin:
                      skip inputs already locked by another in-flight CoinJoin round
                      (this or another process) so concurrent rounds never pick the
                      same UTXO and build conflicting transactions.
+            script_type: When set (``"p2tr"``/``"p2wpkh"``), restrict selection to
+                     UTXOs of that script type so a rigid JMP-0005 pit never mixes
+                     input types within one CoinJoin.
         """
         utxos = self.utxo_cache.get(mixdepth, [])
 
@@ -56,6 +76,9 @@ class CoinSelectionMixin:
 
         # Filter out frozen UTXOs (never auto-selected)
         eligible = [utxo for utxo in eligible if not utxo.frozen]
+
+        # Restrict to the pit's script type (JMP-0005 rigid pit).
+        eligible = [utxo for utxo in eligible if utxo_matches_script_type(utxo, script_type)]
 
         # Filter out UTXOs locked by another in-flight CoinJoin round.
         if exclude:
@@ -181,6 +204,8 @@ class CoinSelectionMixin:
         mixdepth: int,
         min_confirmations: int = 1,
         include_fidelity_bonds: bool = False,
+        *,
+        script_type: str | None = None,
     ) -> list[UTXOInfo]:
         """
         Get all UTXOs from a mixdepth for sweep operations.
@@ -194,6 +219,8 @@ class CoinSelectionMixin:
             include_fidelity_bonds: If True, include fidelity bond UTXOs.
                                     Defaults to False to prevent accidentally
                                     spending bonds in sweeps.
+            script_type: When set (``"p2tr"``/``"p2wpkh"``), restrict to UTXOs of
+                                    that script type for a rigid JMP-0005 pit.
 
         Returns:
             List of all eligible UTXOs in the mixdepth
@@ -202,6 +229,8 @@ class CoinSelectionMixin:
         eligible = [utxo for utxo in utxos if utxo.confirmations >= min_confirmations]
         # Filter out frozen UTXOs (never auto-selected)
         eligible = [utxo for utxo in eligible if not utxo.frozen]
+        # Restrict to the pit's script type (JMP-0005 rigid pit).
+        eligible = [utxo for utxo in eligible if utxo_matches_script_type(utxo, script_type)]
         if not include_fidelity_bonds:
             eligible = [utxo for utxo in eligible if not utxo.is_fidelity_bond]
         return eligible
@@ -216,6 +245,7 @@ class CoinSelectionMixin:
         *,
         restrict_md0: bool = True,
         exclude: set[tuple[str, int]] | None = None,
+        script_type: str | None = None,
     ) -> list[UTXOInfo]:
         """
         Select UTXOs with merge algorithm for maker UTXO consolidation.
@@ -256,6 +286,9 @@ class CoinSelectionMixin:
 
         # Filter out frozen UTXOs (never auto-selected)
         eligible = [utxo for utxo in eligible if not utxo.frozen]
+
+        # Restrict to the pit's script type (JMP-0005 rigid pit).
+        eligible = [utxo for utxo in eligible if utxo_matches_script_type(utxo, script_type)]
 
         # Filter out UTXOs already committed to another in-flight session.
         if exclude:

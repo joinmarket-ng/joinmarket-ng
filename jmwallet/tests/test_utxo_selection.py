@@ -1536,3 +1536,80 @@ class TestApplyFrozenStateHotReload:
         # Should not raise
         ws._apply_frozen_state()
         assert not ws.utxo_cache[0][0].frozen
+
+
+class TestRigidPitScriptTypeFilter:
+    """JMP-0005 rigid pit: selection can be restricted to one script type."""
+
+    def _mixed_wallet(self, test_mnemonic: str) -> WalletService:
+        backend = MagicMock()
+        backend.get_utxos = AsyncMock(return_value=[])
+        backend.close = AsyncMock()
+        ws = WalletService(
+            mnemonic=test_mnemonic, backend=backend, network="regtest", mixdepth_count=5
+        )
+        ws.utxo_cache = {
+            0: [
+                UTXOInfo(
+                    txid="a" * 64,
+                    vout=0,
+                    value=100_000,
+                    address="bcrt1qp2wpkh",
+                    confirmations=10,
+                    scriptpubkey="0014" + "aa" * 20,
+                    path="m/84'/1'/0'/0/0",
+                    mixdepth=0,
+                ),
+                UTXOInfo(
+                    txid="b" * 64,
+                    vout=0,
+                    value=120_000,
+                    address="bcrt1pp2tr",
+                    confirmations=10,
+                    scriptpubkey="5120" + "bb" * 32,
+                    path="m/86'/1'/0'/0/0",
+                    mixdepth=0,
+                ),
+            ]
+        }
+        return ws
+
+    def test_select_utxos_p2tr_only(self, test_mnemonic: str) -> None:
+        ws = self._mixed_wallet(test_mnemonic)
+        selected = ws.select_utxos(0, 50_000, min_confirmations=1, script_type="p2tr")
+        assert all(u.is_p2tr for u in selected)
+        assert {u.txid for u in selected} == {"b" * 64}
+
+    def test_select_utxos_p2wpkh_only(self, test_mnemonic: str) -> None:
+        ws = self._mixed_wallet(test_mnemonic)
+        selected = ws.select_utxos(0, 50_000, min_confirmations=1, script_type="p2wpkh")
+        assert all(u.is_p2wpkh for u in selected)
+        assert {u.txid for u in selected} == {"a" * 64}
+
+    def test_select_utxos_no_filter_allows_both(self, test_mnemonic: str) -> None:
+        ws = self._mixed_wallet(test_mnemonic)
+        selected = ws.select_utxos(0, 200_000, min_confirmations=1, restrict_md0=False)
+        assert {u.txid for u in selected} == {"a" * 64, "b" * 64}
+
+    def test_get_all_utxos_filters_type(self, test_mnemonic: str) -> None:
+        ws = self._mixed_wallet(test_mnemonic)
+        p2tr = ws.get_all_utxos(0, 1, script_type="p2tr")
+        assert [u.txid for u in p2tr] == ["b" * 64]
+
+    def test_select_with_merge_filters_type(self, test_mnemonic: str) -> None:
+        ws = self._mixed_wallet(test_mnemonic)
+        selected = ws.select_utxos_with_merge(
+            0,
+            50_000,
+            min_confirmations=1,
+            merge_algorithm="greedy",
+            restrict_md0=False,
+            script_type="p2tr",
+        )
+        assert all(u.is_p2tr for u in selected)
+
+    def test_insufficient_when_type_excludes_funds(self, test_mnemonic: str) -> None:
+        ws = self._mixed_wallet(test_mnemonic)
+        # Only 120k of P2TR exists; asking for 200k P2TR must fail.
+        with pytest.raises(ValueError):
+            ws.select_utxos(0, 200_000, min_confirmations=1, restrict_md0=False, script_type="p2tr")
