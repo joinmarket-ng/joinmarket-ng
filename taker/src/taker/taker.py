@@ -687,9 +687,11 @@ class Taker(TakerMonitoringMixin):
                         f"(--select-utxos was used)"
                     )
                 else:
-                    # Get ALL UTXOs from the mixdepth (default sweep behavior)
+                    # Get ALL UTXOs from the mixdepth (default sweep behavior),
+                    # restricted to the pit's script type (rigid pit, JMP-0005).
+                    pit_script_type = offer_output_script_type(self.config.preferred_offer_type)
                     self._session.preselected_utxos = self.wallet.get_all_utxos(
-                        mixdepth, self.config.taker_utxo_age
+                        mixdepth, self.config.taker_utxo_age, script_type=pit_script_type
                     )
                     logger.info(
                         f"Sweep using all {len(self._session.preselected_utxos)} UTXOs "
@@ -810,13 +812,18 @@ class Taker(TakerMonitoringMixin):
                     # Pre-select UTXOs for the CoinJoin, skipping any inputs
                     # locked by another in-flight round (this or another process
                     # on the same wallet) so we don't build a conflicting tx.
+                    # Restrict inputs to the pit's script type (rigid pit,
+                    # JMP-0005): a tr0 join spends only P2TR, a sw0 join only
+                    # P2WPKH.
                     locked_inputs = self.wallet.get_locked_input_outpoints()
+                    pit_script_type = offer_output_script_type(self.config.preferred_offer_type)
                     try:
                         self._session.preselected_utxos = self.wallet.select_utxos(
                             mixdepth,
                             estimated_required,
                             self.config.taker_utxo_age,
                             exclude=locked_inputs,
+                            script_type=pit_script_type,
                         )
                         preselected = self._session.preselected_utxos
                         logger.info(

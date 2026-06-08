@@ -355,15 +355,12 @@ class CoinJoinSession:
                 )
 
         # Send !fill to all makers using their designated channels
-        # Format: fill <oid> <amount> <taker_pubkey> <commitment> [cjtype=<type>]
-        # The optional cjtype token signals the uniform equal-output script type
-        # the taker requested (JMP-0005); legacy makers ignore it.
-        cj_script_type = offer_output_script_type(self.config.preferred_offer_type)
+        # Format: fill <oid> <amount> <taker_pubkey> <commitment>
+        # The pit is rigid (JMP-0005): the equal-output script type is fixed by
+        # the offer family, so a tr0 taker only ever contacts tr0 makers and no
+        # per-fill type negotiation is needed.
         for nick, session in self.maker_sessions.items():
-            fill_data = (
-                f"{session.offer.oid} {self.cj_amount} {taker_pubkey} "
-                f"{commitment_hex} cjtype={cj_script_type}"
-            )
+            fill_data = f"{session.offer.oid} {self.cj_amount} {taker_pubkey} {commitment_hex}"
             channel = await self.directory_client.send_privmsg(
                 nick, "fill", fill_data, log_routing=True, force_channel=session.comm_channel
             )
@@ -783,10 +780,11 @@ class CoinJoinSession:
                         del self.maker_sessions[nick]
                         continue
 
-                    # Enforce the uniform equal-output script type (JMP-0005):
-                    # every maker's CoinJoin output must match the type the
-                    # taker requested, otherwise the equal outputs are not
-                    # indistinguishable. Change type is unrestricted.
+                    # Enforce the rigid pit (JMP-0005): every maker's equal
+                    # output, change output AND inputs must all share the pit's
+                    # single script type (fixed by the offer family). Otherwise
+                    # the equal outputs are not indistinguishable and the
+                    # transaction mixes coin types.
                     expected_cj_type = offer_output_script_type(self.config.preferred_offer_type)
                     try:
                         maker_cj_type = get_address_type(cj_addr)
@@ -795,7 +793,29 @@ class CoinJoinSession:
                     if maker_cj_type != expected_cj_type:
                         logger.warning(
                             f"Dropping maker {nick}: cj_addr type {maker_cj_type!r} "
-                            f"does not match requested {expected_cj_type!r}"
+                            f"does not match pit type {expected_cj_type!r}"
+                        )
+                        failed_makers.append(nick)
+                        del self.maker_sessions[nick]
+                        continue
+
+                    try:
+                        maker_change_type = get_address_type(change_addr) if change_addr else ""
+                    except ValueError:
+                        maker_change_type = ""
+                    if change_addr and maker_change_type != expected_cj_type:
+                        logger.warning(
+                            f"Dropping maker {nick}: change type {maker_change_type!r} "
+                            f"does not match pit type {expected_cj_type!r}"
+                        )
+                        failed_makers.append(nick)
+                        del self.maker_sessions[nick]
+                        continue
+
+                    if not self._maker_inputs_match_pit(session, expected_cj_type):
+                        logger.warning(
+                            f"Dropping maker {nick}: one or more inputs are not "
+                            f"{expected_cj_type} (rigid pit, JMP-0005)"
                         )
                         failed_makers.append(nick)
                         del self.maker_sessions[nick]
@@ -1011,7 +1031,12 @@ class CoinJoinSession:
             # This avoids recording unused addresses in history
             if expected_change > self.config.dust_threshold:
                 change_index = self.wallet.get_next_address_index(mixdepth, 1)
-                taker_change_address = self.wallet.get_change_address(mixdepth, change_index)
+                # Rigid pit (JMP-0005): the taker's change uses the pit's script
+                # type (fixed by the offer family), not the wallet's primary type.
+                change_script_type = offer_output_script_type(self.config.preferred_offer_type)
+                taker_change_address = self.wallet.get_change_address(
+                    mixdepth, change_index, script_type=change_script_type
+                )
                 self.taker_change_address = taker_change_address
                 logger.debug(f"Generated change address (expected: {expected_change} sats)")
             else:
@@ -1106,6 +1131,20 @@ class CoinJoinSession:
         if spk.startswith("a914") and len(spk) == 46:
             return "p2sh"
         return default
+
+    def _maker_inputs_match_pit(self, session: Any, pit_type: str) -> bool:
+        """Return True if every maker input matches the pit's script type.
+
+        JMP-0005 rigid pits forbid mixing input script types: a tr0 CoinJoin
+        accepts only P2TR inputs and a sw0 CoinJoin only P2WPKH inputs. A maker
+        input whose scriptPubKey is missing/unparseable cannot be confirmed to
+        match and is treated as a mismatch.
+        """
+        for utxo in session.utxos:
+            spk = utxo.get("scriptpubkey") or ""
+            if not spk or self._classify_scriptpubkey(spk, "") != pit_type:
+                return False
+        return True
 
     def _build_script_type_lists(
         self, selected_utxos: list[Any], num_outputs: int

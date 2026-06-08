@@ -1796,16 +1796,13 @@ async def test_phase_fill_does_not_promote_silent_makers_without_blacklist_hit(
 
 
 @pytest.mark.asyncio
-async def test_phase_fill_signals_uniform_cj_script_type(
-    mock_wallet, mock_backend, mock_config, tmp_path
-):
-    """The !fill message must carry the taker's requested equal-output type.
+async def test_phase_fill_omits_cjtype_token(mock_wallet, mock_backend, mock_config, tmp_path):
+    """The !fill message no longer carries a per-fill output type (rigid pit).
 
-    Per JMP-0005 the taker picks a uniform equal-output script type and
-    signals it to every maker via a cjtype=<type> token so dual-type makers
-    derive their CoinJoin output of that type.
+    Per JMP-0005 the equal-output script type is fixed by the offer family, so a
+    tr0 taker only contacts tr0 makers and the !fill carries no cjtype token.
     """
-    from jmcore.models import OfferType, offer_output_script_type
+    from jmcore.models import OfferType
 
     mock_config.data_dir = tmp_path
     mock_config.preferred_offer_type = OfferType.TR0_RELATIVE
@@ -1860,9 +1857,11 @@ async def test_phase_fill_signals_uniform_cj_script_type(
 
     await taker._session._phase_fill()
 
-    expected = offer_output_script_type(OfferType.TR0_RELATIVE)
     assert "J5Maker1" in sent_fills
-    assert f"cjtype={expected}" in sent_fills["J5Maker1"]
+    # No cjtype token: the rigid pit fixes the type by offer family.
+    assert "cjtype=" not in sent_fills["J5Maker1"]
+    # Well-formed: <oid> <amount> <taker_pubkey> <commitment> (4 fields).
+    assert len(sent_fills["J5Maker1"].split()) == 4
 
 
 @pytest.mark.asyncio
@@ -1949,3 +1948,27 @@ async def test_do_coinjoin_rejects_silent_payment_destination(
     assert "silent payment" in (taker._session.last_failure_reason or "").lower()
     # Rejected before any maker selection / network activity.
     assert not mock_select.called
+
+
+def test_maker_inputs_match_pit_enforces_single_type():
+    """Rigid pit (JMP-0005): every maker input must match the pit script type."""
+    from taker.coinjoin_session import CoinJoinSession
+
+    session = CoinJoinSession()
+
+    p2tr_utxo = {"scriptpubkey": "5120" + "bb" * 32}
+    p2wpkh_utxo = {"scriptpubkey": "0014" + "aa" * 20}
+
+    # All-P2TR inputs match a tr0 (p2tr) pit.
+    session.utxos = [p2tr_utxo, p2tr_utxo]
+    assert session._maker_inputs_match_pit(session, "p2tr")
+    # A P2WPKH input in a p2tr pit is rejected.
+    session.utxos = [p2tr_utxo, p2wpkh_utxo]
+    assert not session._maker_inputs_match_pit(session, "p2tr")
+    # All-P2WPKH inputs match a sw0 (p2wpkh) pit.
+    session.utxos = [p2wpkh_utxo]
+    assert session._maker_inputs_match_pit(session, "p2wpkh")
+    assert not session._maker_inputs_match_pit(session, "p2tr")
+    # A missing/unparseable scriptpubkey is treated as a mismatch.
+    session.utxos = [{"scriptpubkey": ""}]
+    assert not session._maker_inputs_match_pit(session, "p2tr")
