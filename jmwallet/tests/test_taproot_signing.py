@@ -29,6 +29,7 @@ from jmwallet.wallet.signing import (
     compute_sighash_taproot,
     sign_p2tr_input,
     verify_p2tr_signature,
+    witness_has_annex,
 )
 from jmwallet.wallet.silent_payments import SilentPaymentWallet
 
@@ -188,3 +189,21 @@ def test_verify_rejects_non_default_sighash() -> None:
     assert not verify_p2tr_signature(tx, 0, [100000], [spk], good + b"\x00", xonly)
     # Truncated / oversized payloads are rejected.
     assert not verify_p2tr_signature(tx, 0, [100000], [spk], good[:63], xonly)
+
+
+def test_witness_has_annex() -> None:
+    """JMP-0005: detect a BIP341 annex (>=2 elements, last starts with 0x50)."""
+    sig = b"\x11" * 64
+    # Key-path witness: single signature element, no annex.
+    assert not witness_has_annex([sig])
+    # P2WPKH-style: [sig, pubkey] (pubkey does not start with 0x50).
+    assert not witness_has_annex([sig, b"\x02" + b"\x03" * 32])
+    # Annex present: last element starts with the 0x50 tag.
+    assert witness_has_annex([sig, b"\x50"])
+    assert witness_has_annex([sig, b"\x50\xde\xad\xbe\xef"])
+    # A lone 0x50 element is not an annex (annex needs the spend item before it).
+    assert not witness_has_annex([b"\x50\xde\xad"])
+    # Empty last element is not an annex.
+    assert not witness_has_annex([sig, b""])
+    # Empty witness is not an annex.
+    assert not witness_has_annex([])

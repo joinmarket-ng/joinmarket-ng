@@ -42,6 +42,7 @@ from jmwallet.wallet.signing import (
     deserialize_transaction,
     verify_p2tr_signature,
     verify_p2wpkh_signature,
+    witness_has_annex,
 )
 from jmwallet.wallet.spend import enforce_fee_rate_cap
 from loguru import logger
@@ -1577,13 +1578,27 @@ class CoinJoinSession:
                                     break
 
                         if matched_input_idx is not None:
-                            matched_indices.add(matched_input_idx)
                             txid, vout = input_map[matched_input_idx]
                             if matched_is_taproot:
                                 witness = [signature.hex()]
+                                witness_bytes = [signature]
                             else:
                                 witness = [signature.hex(), pubkey.hex()]
+                                witness_bytes = [signature, pubkey]
 
+                            # Defense in depth (JMP-0005): a tr0 key-path witness
+                            # is exactly the 64-byte signature; reject any witness
+                            # that carries a BIP341 annex. The strict 64-byte
+                            # signature check already prevents this, so this is a
+                            # belt-and-suspenders guard that can never fire today.
+                            if witness_has_annex(witness_bytes):
+                                logger.warning(
+                                    f"Rejecting signature #{sig_idx + 1} from {nick}: "
+                                    "witness carries a BIP341 annex"
+                                )
+                                continue
+
+                            matched_indices.add(matched_input_idx)
                             sig_infos.append({"txid": txid, "vout": vout, "witness": witness})
                             logger.debug(
                                 f"Verified signature from {nick} matches input {matched_input_idx} "

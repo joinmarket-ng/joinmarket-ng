@@ -338,6 +338,17 @@ def sign_p2tr_input(
     return signature
 
 
+def witness_has_annex(witness: list[bytes]) -> bool:
+    """Return True if a witness stack carries a BIP341 annex.
+
+    Per BIP341 an annex is present when the witness has at least two elements and
+    the last element is non-empty and starts with the annex tag ``0x50``. JMP-0005
+    forbids the annex on tr0 CoinJoin inputs (a key-path witness MUST be the single
+    64-byte signature), so callers reject any input whose witness carries one.
+    """
+    return len(witness) >= 2 and len(witness[-1]) > 0 and witness[-1][0] == 0x50
+
+
 def verify_p2tr_signature(
     tx: ParsedTransaction,
     input_index: int,
@@ -354,6 +365,10 @@ def verify_p2tr_signature(
     participant leave some outputs uncommitted and rewrite the transaction after
     signing, so it is rejected here. A trailing ``0x00`` byte (a 65-byte payload
     whose last byte is ``0x00``) is additionally consensus-invalid for Taproot.
+
+    This checks only the signature element. An annex, if present, is a separate
+    witness element; reject it with :func:`witness_has_annex` where the witness
+    stack is assembled.
     """
     try:
         from coincurve import PublicKeyXOnly
@@ -395,4 +410,5 @@ __all__ = [
     "sign_p2wsh_input",
     "verify_p2tr_signature",
     "verify_p2wpkh_signature",
+    "witness_has_annex",
 ]
