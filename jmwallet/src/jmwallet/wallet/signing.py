@@ -346,20 +346,25 @@ def verify_p2tr_signature(
     signature: bytes,
     x_only_pubkey: bytes,
 ) -> bool:
-    """Verify a BIP341 Taproot (Schnorr) key-path signature."""
+    """Verify a BIP341 Taproot (Schnorr) key-path signature.
+
+    Per JMP-0005, every tr0 CoinJoin input MUST be signed with
+    ``SIGHASH_DEFAULT``: the signature MUST be exactly 64 bytes with no trailing
+    sighash byte. A 65-byte signature (any explicit sighash flag) would let a
+    participant leave some outputs uncommitted and rewrite the transaction after
+    signing, so it is rejected here. A trailing ``0x00`` byte (a 65-byte payload
+    whose last byte is ``0x00``) is additionally consensus-invalid for Taproot.
+    """
     try:
         from coincurve import PublicKeyXOnly
 
-        if len(signature) == 65:
-            sighash_type = signature[-1]
-            raw_sig = signature[:64]
-        else:
-            sighash_type = SIGHASH_DEFAULT
-            raw_sig = signature
+        # Strict: only a bare 64-byte SIGHASH_DEFAULT signature is accepted.
+        if len(signature) != 64:
+            return False
         sighash = compute_sighash_taproot(
-            tx, input_index, prevouts_values, prevouts_scripts, sighash_type
+            tx, input_index, prevouts_values, prevouts_scripts, SIGHASH_DEFAULT
         )
-        return bool(PublicKeyXOnly(x_only_pubkey).verify(raw_sig, sighash))
+        return bool(PublicKeyXOnly(x_only_pubkey).verify(signature, sighash))
     except Exception:  # noqa: BLE001 - verification must never raise
         return False
 

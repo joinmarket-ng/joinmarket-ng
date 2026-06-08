@@ -158,3 +158,33 @@ def test_silent_payment_output_is_spendable() -> None:
     tx = _spend_tx(create_p2tr_scriptpubkey(PrivateKey().public_key.format()[1:]))
     sig = sign_p2tr_input(tx, 0, [120000], [spk], spend_priv, SIGHASH_DEFAULT)
     assert verify_p2tr_signature(tx, 0, [120000], [spk], sig, output_key)
+
+
+def test_verify_rejects_non_default_sighash() -> None:
+    """JMP-0005: tr0 verifiers accept only bare 64-byte SIGHASH_DEFAULT sigs.
+
+    A 65-byte signature carrying an explicit sighash flag (e.g. SIGHASH_SINGLE
+    or ANYONECANPAY) would let a participant leave outputs uncommitted and
+    rewrite the transaction after signing, so it MUST be rejected even when the
+    Schnorr signature itself is otherwise valid for that sighash.
+    """
+    priv = PrivateKey(_find_privkey_with_parity(0x02))
+    xonly = priv.public_key.format(compressed=True)[1:]
+    spk = create_p2tr_scriptpubkey(xonly)
+    tx = _spend_tx(create_p2tr_scriptpubkey(PrivateKey().public_key.format()[1:]))
+
+    # A bare 64-byte SIGHASH_DEFAULT signature verifies.
+    good = sign_p2tr_input(tx, 0, [100000], [spk], priv, SIGHASH_DEFAULT)
+    assert len(good) == 64
+    assert verify_p2tr_signature(tx, 0, [100000], [spk], good, xonly)
+
+    # Each forbidden explicit sighash type produces a 65-byte signature.
+    for hashtype in (0x01, 0x02, 0x03, 0x81, 0x82, 0x83):
+        sig = sign_p2tr_input(tx, 0, [100000], [spk], priv, hashtype)
+        assert len(sig) == 65
+        assert not verify_p2tr_signature(tx, 0, [100000], [spk], sig, xonly)
+
+    # A 65-byte payload with a trailing 0x00 (consensus-invalid) is rejected too.
+    assert not verify_p2tr_signature(tx, 0, [100000], [spk], good + b"\x00", xonly)
+    # Truncated / oversized payloads are rejected.
+    assert not verify_p2tr_signature(tx, 0, [100000], [spk], good[:63], xonly)
