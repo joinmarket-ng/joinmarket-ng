@@ -8,18 +8,32 @@ BIP341 key-path Schnorr signatures.
 
 This builds on the wider taproot specification tracked as JMP-0005.
 
+## Rigid pit
+
+The `tr0` and `sw0` offer families are independent, rigid "pits". Within one
+CoinJoin every input, every equal-amount output, and every change output shares
+a single script type, fixed by the offer family:
+
+- `sw0` -> P2WPKH everywhere.
+- `tr0` -> P2TR everywhere.
+
+There is no per-transaction or taker-chosen output type, and the two pits never
+mix in one transaction. Keeping the whole transaction uniform maximizes the
+anonymity set and avoids fingerprinting participants by script type. A maker MAY
+serve both pits at once (advertising `sw0` and `tr0` offers), but as two separate
+liquidity pools: a `tr0` fill is funded entirely from P2TR coins and pays P2TR
+outputs, a `sw0` fill entirely from P2WPKH.
+
 ## Offer types
 
-The maker advertises one offer family; the taker selects makers by the output
-family it prefers. The relevant `OfferType` values are:
+The maker advertises one offer family per offer; the taker selects makers by the
+pit it wants. The relevant `OfferType` values are:
 
 - `sw0reloffer` / `sw0absoffer`: native segwit (P2WPKH), the default.
 - `tr0reloffer` / `tr0absoffer`: taproot (P2TR).
 
 A taker matches both the relative and absolute variant of its preferred family,
-so a maker may advertise either fee model. Taproot and segwit equal-value
-outputs are never mixed in a single CoinJoin: the anonymity set requires every
-equal output to share one script type.
+so a maker may advertise either fee model.
 
 ## Configuration
 
@@ -30,8 +44,9 @@ offer_type = "tr0reloffer"
 ```
 
 Setting a `tr0` offer type makes the maker derive a taproot (`p2tr`) wallet for
-its CoinJoin and change outputs regardless of `[wallet] address_type`, so the
-advertised offer and the on-chain scripts always agree.
+its CoinJoin and change outputs, and select only P2TR inputs, regardless of
+`[wallet] address_type`, so the advertised offer and the on-chain scripts always
+agree.
 
 Taker (`[taker]`):
 
@@ -39,10 +54,11 @@ Taker (`[taker]`):
 preferred_offer_type = "tr0reloffer"
 ```
 
-This selects taproot makers and builds P2TR CoinJoin outputs. The taker's own
-wallet `address_type` is independent: it governs the taker's change script and
-is set under `[wallet]`. To produce a taproot destination and change, run the
-taker with a `p2tr` wallet.
+This selects taproot makers and produces a uniformly P2TR transaction: the
+taker's equal output, change, and inputs are all P2TR. Because the pit is rigid,
+run a `p2tr` wallet (`[wallet] address_type = "p2tr"`) so the taker has P2TR
+inputs to spend; a P2WPKH-only wallet has no eligible `tr0` inputs. The payment
+destination may be any P2TR address.
 
 ## Signing
 
@@ -59,12 +75,10 @@ The taker's PoDLE commitment for a taproot UTXO commits to the tweaked BIP86
 output key (the on-chain key), not the raw internal key, so the maker's PoDLE
 binding (`x_only(P) == program`) succeeds.
 
-Received [silent payment](silent-payments.md) outputs are also spendable as
-CoinJoin inputs. They have no BIP32 path, so the wallet recomputes their output
-key on demand from the stored tweaks; unlike BIP86 coins this key is the final
-taproot output key and carries no extra taptweak. The output type of a CoinJoin
-is independent of its input types, so taproot inputs (BIP86 or silent payment)
-can fund a CoinJoin of any output family.
+Received [silent payment](silent-payments.md) outputs are ordinary key-path P2TR
+UTXOs, so they fit the rigid `tr0` pit directly. They have no BIP32 path, so the
+wallet recomputes their output key on demand from the stored tweaks; unlike BIP86
+coins this key is the final taproot output key and carries no extra taptweak.
 
 ## Interoperability
 
