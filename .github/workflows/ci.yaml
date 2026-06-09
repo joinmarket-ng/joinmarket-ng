@@ -207,7 +207,7 @@ jobs:
           repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
       - name: Install pytest
@@ -336,7 +336,7 @@ jobs:
         run: bash -n install.sh
       - name: install.sh --help works under git-bash
         run: bash install.sh --help
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
       - name: Manual pip install (Windows has no install.sh path)
