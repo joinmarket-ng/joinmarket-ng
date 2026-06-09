@@ -38,7 +38,9 @@ from loguru import logger
 
 # Timeouts for reference implementation tests
 STARTUP_TIMEOUT = 420  # 7 minutes for all services to start (Tor can be slow in CI)
-COINJOIN_TIMEOUT = 240  # 4 minutes for coinjoin to complete
+COINJOIN_TIMEOUT = (
+    300  # 5 minutes for the reference taker to reach makers over Tor and complete
+)
 WALLET_FUND_TIMEOUT = 300  # 5 minutes for wallet funding
 
 
@@ -672,40 +674,10 @@ async def test_execute_reference_coinjoin(funded_jam_wallet):
 
     logger.info(f"Running sendpayment: {' '.join(cmd)}")
 
-    # Keep this bounded so failures don't stall the suite.
-    try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=COINJOIN_TIMEOUT, check=False
-        )
-    except subprocess.TimeoutExpired as e:
-        logger.error("CoinJoin timed out!")
-        if e.stdout:
-            stdout = (
-                e.stdout.decode(errors="replace")
-                if isinstance(e.stdout, bytes)
-                else e.stdout
-            )
-            logger.info(f"sendpayment stdout (partial):\n{stdout}")
-        if e.stderr:
-            stderr = (
-                e.stderr.decode(errors="replace")
-                if isinstance(e.stderr, bytes)
-                else e.stderr
-            )
-            logger.error(f"sendpayment stderr (partial):\n{stderr}")
-        raise
-
-    logger.info(f"sendpayment stdout:\n{result.stdout}")
-    logger.info(f"sendpayment stderr:\n{result.stderr}")
-
-    # Check for success - look for txid in output which indicates broadcast
-    output_combined = result.stdout + result.stderr
-    output_lower = output_combined.lower()
-
-    # Strong success indicator: txid = <hash> means transaction was broadcast
-    has_txid = "txid = " in output_combined or "txid:" in output_lower
-
-    # Check for explicit failure indicators
+    # The reference taker reaches the makers via the directory over Tor, which is
+    # slow/flaky under load (it can log "failed to connect and handshake with any
+    # directories" and recover, or time out). Retry once with a fresh maker
+    # restart (new Tor circuits) before failing the suite.
     explicit_failures = [
         "not enough counterparties",
         "taker not continuing",
@@ -713,14 +685,69 @@ async def test_execute_reference_coinjoin(funded_jam_wallet):
         "giving up",
         "aborting",
     ]
+    max_attempts = 2
+    cj_result: subprocess.CompletedProcess[str] | None = None
+    has_txid = False
+    for attempt in range(1, max_attempts + 1):
+        cleanup_wallet_lock(wallet_name)
+        try:
+            cj_result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=COINJOIN_TIMEOUT,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as e:
+            stdout = (
+                (e.stdout or b"").decode(errors="replace")
+                if isinstance(e.stdout, bytes)
+                else (e.stdout or "")
+            )
+            stderr = (
+                (e.stderr or b"").decode(errors="replace")
+                if isinstance(e.stderr, bytes)
+                else (e.stderr or "")
+            )
+            logger.error(f"CoinJoin timed out (attempt {attempt}/{max_attempts})!")
+            logger.info(f"sendpayment stdout (partial):\n{stdout}")
+            logger.error(f"sendpayment stderr (partial):\n{stderr}")
+            if attempt < max_attempts:
+                logger.info("Retrying reference CoinJoin with a fresh maker restart...")
+                restart_makers_and_wait(wait_time=120)
+                await asyncio.sleep(15)
+                continue
+            raise
+
+        logger.info(f"sendpayment stdout:\n{cj_result.stdout}")
+        logger.info(f"sendpayment stderr:\n{cj_result.stderr}")
+
+        output_combined = cj_result.stdout + cj_result.stderr
+        output_lower = output_combined.lower()
+        has_txid = "txid = " in output_combined or "txid:" in output_lower
+        has_explicit_failure = any(ind in output_lower for ind in explicit_failures)
+
+        if has_txid:
+            break
+        if attempt < max_attempts:
+            logger.warning(
+                f"Reference CoinJoin produced no txid (attempt {attempt}/{max_attempts}; "
+                f"explicit_failure={has_explicit_failure}); retrying with a fresh maker restart..."
+            )
+            restart_makers_and_wait(wait_time=120)
+            await asyncio.sleep(15)
+
+    assert cj_result is not None
+    output_combined = cj_result.stdout + cj_result.stderr
+    output_lower = output_combined.lower()
     has_explicit_failure = any(ind in output_lower for ind in explicit_failures)
 
     if has_explicit_failure and not has_txid:
         # Only fail if no txid was found - "giving up" might be a non-fatal warning
         pytest.fail(
             f"CoinJoin explicitly failed.\n"
-            f"Exit code: {result.returncode}\n"
-            f"Output: {result.stdout[-3000:]}"
+            f"Exit code: {cj_result.returncode}\n"
+            f"Output: {cj_result.stdout[-3000:]}"
         )
     elif has_explicit_failure and has_txid:
         logger.warning(
@@ -730,8 +757,8 @@ async def test_execute_reference_coinjoin(funded_jam_wallet):
 
     assert has_txid, (
         f"CoinJoin did not broadcast transaction (no txid found).\n"
-        f"Exit code: {result.returncode}\n"
-        f"Output: {result.stdout[-3000:]}"
+        f"Exit code: {cj_result.returncode}\n"
+        f"Output: {cj_result.stdout[-3000:]}"
     )
 
     logger.info("CoinJoin completed successfully!")
