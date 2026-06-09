@@ -180,9 +180,26 @@ def ensure_miner_wallet() -> bool:
             logger.info("Creating miner wallet...")
             result = run_bitcoin_cmd(["createwallet", "miner"])
             if result.returncode != 0:
-                logger.error(f"Failed to create miner wallet: {result.stderr}")
-                return False
-            logger.info("Miner wallet created")
+                # The wallet may already exist on disk but be unloaded (e.g. the
+                # bitcoin node restarted or a previous run left it behind). In
+                # that case createwallet fails with "Database already exists";
+                # load the existing wallet instead of treating it as fatal.
+                stderr = (result.stderr or "") + (result.stdout or "")
+                if "already exists" in stderr.lower():
+                    logger.info("Miner wallet exists on disk; loading it...")
+                    load = run_bitcoin_cmd(["loadwallet", "miner"])
+                    if (
+                        load.returncode != 0
+                        and "already loaded"
+                        not in ((load.stderr or "") + (load.stdout or "")).lower()
+                    ):
+                        logger.error(f"Failed to load miner wallet: {load.stderr}")
+                        return False
+                else:
+                    logger.error(f"Failed to create miner wallet: {result.stderr}")
+                    return False
+            else:
+                logger.info("Miner wallet created")
 
     # Check balance and mine if needed
     result = run_bitcoin_cmd(["-rpcwallet=miner", "getbalance"])
@@ -560,9 +577,15 @@ def start_yieldgenerator_with_retry(
     maker_id: int,
     wallet_name: str,
     password: str,
-    max_attempts: int = 2,
+    max_attempts: int = 3,
 ) -> subprocess.Popen[bytes] | None:
-    """Start a yieldgenerator, retrying once if it does not become ready."""
+    """Start a yieldgenerator, retrying if it does not become ready.
+
+    The reference (upstream JoinMarket) yieldgenerator sets up a Tor onion
+    service on startup, which can be slow or get killed under heavy parallel
+    load (e.g. run_parallel_tests.sh running many docker stacks at once). Retry
+    a few times so a transient slow start does not fail the whole suite.
+    """
     for attempt in range(1, max_attempts + 1):
         process = start_yieldgenerator(maker_id, wallet_name, password)
         if process is None:

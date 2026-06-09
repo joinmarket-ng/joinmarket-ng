@@ -76,8 +76,10 @@ test.describe("Direct Send", () => {
       .getByRole("button", { name: /Send without privacy/i })
       .click({ force: true });
 
-    // A confirmation dialog appears for non-collaborative sends.
-    await expect(page.getByText("Confirm payment")).toBeVisible({ timeout: 10_000 });
+    // A confirmation dialog appears for non-collaborative sends. Allow the full
+    // global expect timeout: under a loaded machine (e.g. the parallel test
+    // harness running many docker stacks) the dialog can take >10s to render.
+    await expect(page.getByText("Confirm payment")).toBeVisible({ timeout: 30_000 });
 
     await page.screenshot({ path: "test-results/send-confirmation.png", fullPage: true });
 
@@ -160,9 +162,9 @@ test.describe("Direct Send", () => {
     await expect(sendBtn).toBeVisible({ timeout: 15_000 });
     await sendBtn.click({ force: true });
 
-    await expect(page.getByText("Confirm payment")).toBeVisible({ timeout: 10_000 });
+    await expect(page.getByText("Confirm payment")).toBeVisible({ timeout: 30_000 });
     await expect(page.getByText(/Payment with privacy improvement/i)).toBeVisible({
-      timeout: 10_000,
+      timeout: 30_000,
     });
     await page.getByRole("button", { name: "Confirm" }).click();
 
