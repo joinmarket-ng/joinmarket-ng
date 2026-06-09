@@ -37,7 +37,9 @@ from tests.e2e.test_reference_coinjoin import (
 )
 
 # Timeouts for reference maker tests
-YIELDGEN_STARTUP_TIMEOUT = 120  # Time for yieldgenerator to start and announce offers
+YIELDGEN_STARTUP_TIMEOUT = (
+    180  # Time for the maker to start, set up its Tor onion and reach the directory
+)
 COINJOIN_TIMEOUT = 300  # Time for CoinJoin to complete
 
 # Directory for yieldgenerator log files
@@ -551,8 +553,12 @@ def wait_for_yieldgenerator_ready(
         "all message channels connected",
         "jm daemon setup complete",
     ]
+    # Only treat a real crash as fatal. The reference maker logs "failed to
+    # connect and handshake with any directories" after its first 60s directory
+    # connection attempt, but the process keeps running and retries over Tor, so
+    # that message is transient under load rather than fatal -- keep polling for
+    # a ready indicator until the timeout instead of giving up immediately.
     fatal_indicators = [
-        "failed to connect and handshake with any directories",
         "traceback (most recent call last)",
     ]
 
