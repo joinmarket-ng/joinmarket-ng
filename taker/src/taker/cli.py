@@ -629,21 +629,17 @@ async def _run_coinjoin(
         # Sync wallet first (before connecting to directory servers)
         await taker.sync_wallet()
 
-        # Early fund validation: check if mixdepth has sufficient funds
-        # This avoids connecting to directory servers when funds are insufficient
-        mixdepth_balance = await wallet.get_balance(mixdepth)
-        if mixdepth_balance == 0:
-            logger.error(f"No funds in mixdepth {mixdepth}")
+        # Early eligibility validation: confirm the mixdepth has spendable,
+        # confirmed, unfrozen, non-bond UTXOs that can fund (and commit to) the
+        # CoinJoin BEFORE connecting to directory servers and fetching the
+        # orderbook. This avoids minutes of network work on a doomed round
+        # (issue #528).
+        eligibility_reason = await taker.check_utxo_eligibility(amount, mixdepth)
+        if eligibility_reason is not None:
+            logger.error(eligibility_reason)
             raise typer.Exit(1)
 
-        if amount > 0 and mixdepth_balance < amount:
-            logger.error(
-                f"Insufficient funds in mixdepth {mixdepth}: "
-                f"have {mixdepth_balance:,} sats, need at least {amount:,} sats"
-            )
-            raise typer.Exit(1)
-
-        # Now connect to directory servers (funds are sufficient)
+        # Now connect to directory servers (UTXOs are eligible)
         await taker.connect()
 
         amount_display = "ALL (sweep)" if amount == 0 else f"{amount:,} sats"

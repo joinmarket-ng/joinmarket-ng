@@ -59,6 +59,10 @@ Fields are separated by **single whitespace** (multiple spaces not allowed).
 
 **Note**: Rules enforced at message_channel layer. All encrypted messages are base64-encoded.
 
+**Phase 0: Pre-flight Eligibility**
+
+Before connecting to any directory server, the taker syncs the wallet and verifies that the chosen mixdepth holds UTXOs that can actually fund the CoinJoin: confirmed enough (`taker_utxo_age`), not frozen, not a fidelity bond, not locked by another in-flight round, large enough for the PoDLE commitment (`taker_utxo_amtpercent`), and sufficient in total for the requested amount. An ineligible wallet fails fast with a clear reason instead of after minutes of network work.
+
 **Phase 1: Orderbook Discovery**
 
 1. Taker connects to directory servers

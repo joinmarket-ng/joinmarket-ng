@@ -49,6 +49,9 @@ def mock_wallet():
     wallet.get_change_address = Mock(return_value="bcrt1qchange")
     wallet.get_key_for_address = Mock()
     wallet.select_utxos = Mock(return_value=[make_utxo(txid_char="a", address="bcrt1qtest1")])
+    # Sync method on the real WalletService; the pre-flight eligibility check
+    # (issue #528) calls it without awaiting, so it must not be an AsyncMock.
+    wallet.get_locked_input_outpoints = Mock(return_value=set())
     wallet.close = AsyncMock()
     wallet.wallet_fingerprint = "deadbeef"
     return wallet

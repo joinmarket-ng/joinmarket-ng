@@ -40,6 +40,11 @@ from loguru import logger
 
 from taker.coinjoin_session import CoinJoinSession
 from taker.config import Schedule, TakerConfig, resolve_counterparty_count
+from taker.eligibility import (
+    classify_utxos,
+    podle_threshold_met,
+    selectable_for_interactive,
+)
 from taker.models import MakerSession, PhaseResult, TakerState
 from taker.monitoring import TakerMonitoringMixin
 from taker.multi_directory import MultiDirectoryClient
@@ -61,6 +66,19 @@ __all__ = [
 # mixes script types in the CoinJoin output and acts as a fingerprint linking
 # the taker output back to its inputs.
 _WALLET_OUTPUT_SCRIPT_TYPE = "p2wpkh"
+
+
+def _append_confirmation_hint(message: str, taker_utxo_age: int) -> str:
+    """Append the standard ``taker_utxo_age`` guidance to a selection error.
+
+    Used so insufficient-funds errors from coin selection consistently tell the
+    user that CoinJoin inputs need confirmations and how to relax the setting.
+    """
+    return (
+        f"{message}. CoinJoin requires UTXOs with at least "
+        f"{taker_utxo_age} confirmation(s) (taker_utxo_age setting). "
+        f"Wait for more confirmations or lower taker_utxo_age in your config."
+    )
 
 
 def warn_if_destination_script_mismatch(destination: str) -> str | None:
@@ -266,6 +284,74 @@ class Taker(TakerMonitoringMixin):
                 logger.debug(f"Failed to release taker input locks: {e}")
             self._session.reserved_inputs = set()
 
+    async def check_utxo_eligibility(self, amount: int, mixdepth: int) -> str | None:
+        """Validate that ``mixdepth`` can fund a CoinJoin of ``amount``.
+
+        Runs the same eligibility filters used later in :meth:`do_coinjoin`
+        (confirmations, frozen, fidelity bonds, in-flight locks, the mixdepth-0
+        merge restriction and the PoDLE size requirement) *before* any network
+        operation, so an ineligible wallet fails fast instead of after a long
+        directory/orderbook/bond cycle (issue #528).
+
+        Args:
+            amount: Target amount in satoshis (``0`` for sweep).
+            mixdepth: Source mixdepth.
+
+        Returns:
+            ``None`` when a CoinJoin can proceed, otherwise a human-readable
+            reason describing why it cannot.
+        """
+        utxos = await self.wallet.get_utxos(mixdepth)
+        min_conf = self.config.taker_utxo_age
+
+        # Interactive selection follows different rules (the user may pick
+        # unlocked fidelity bonds and is not bound to auto-selection), so only
+        # require that *something* is selectable here.
+        if self.config.select_utxos:
+            if not selectable_for_interactive(utxos, min_conf):
+                breakdown = classify_utxos(utxos, mixdepth, min_conf)
+                return breakdown.no_eligible_reason()
+            return None
+
+        reserved = self.wallet.get_locked_input_outpoints()
+        breakdown = classify_utxos(utxos, mixdepth, min_conf, reserved_outpoints=reserved)
+
+        if not breakdown.eligible:
+            return breakdown.no_eligible_reason()
+
+        # Sweep spends every eligible UTXO; a non-empty pool is sufficient.
+        is_sweep = amount == 0
+        if is_sweep:
+            return None
+
+        # PoDLE necessary condition: a commitment needs a UTXO worth at least
+        # ``taker_utxo_amtpercent`` of the amount. Without one the round always
+        # fails at commitment generation, so reject early with a clear message.
+        if not podle_threshold_met(
+            breakdown.eligible, amount, min_conf, self.config.taker_utxo_amtpercent
+        ):
+            min_value = int(amount * self.config.taker_utxo_amtpercent / 100)
+            return (
+                f"No eligible UTXO in mixdepth {mixdepth} is large enough for the "
+                f"PoDLE commitment: need at least {min_value:,} sats "
+                f"({self.config.taker_utxo_amtpercent}% of {amount:,} sats, "
+                f"taker_utxo_amtpercent). Use a larger UTXO or lower the amount."
+            )
+
+        # Amount coverage: dry-run the exact selection used later so the verdict
+        # matches reality (including the mixdepth-0 merge restriction).
+        try:
+            self.wallet.select_utxos(
+                mixdepth,
+                amount,
+                min_conf,
+                exclude=reserved,
+            )
+        except ValueError as exc:
+            return _append_confirmation_hint(str(exc), min_conf)
+
+        return None
+
     async def stop(self, *, close_wallet: bool = True) -> None:
         """Stop the taker and close connections.
 
@@ -448,6 +534,18 @@ class Taker(TakerMonitoringMixin):
                 else self.config.counterparty_count
             )
             n_makers = resolve_counterparty_count(requested)
+
+            # Pre-flight: reject ineligible UTXOs before any orderbook/bond work
+            # so the user is not kept waiting on a doomed round (issue #528).
+            # Callers that already validate (the CLI) will simply re-confirm a
+            # passing verdict; jmwalletd, run_schedule and the tumbler rely on
+            # this check since they go straight to do_coinjoin.
+            eligibility_reason = await self.check_utxo_eligibility(amount, mixdepth)
+            if eligibility_reason is not None:
+                logger.error(eligibility_reason)
+                self._session.last_failure_reason = eligibility_reason
+                self.state = TakerState.FAILED
+                return None
 
             # Determine destination address
             if destination == "INTERNAL":
@@ -799,19 +897,8 @@ class Taker(TakerMonitoringMixin):
                             f"(total: {sum(u.value for u in preselected):,} sats)"
                         )
                     except ValueError as e:
-                        reason = (
-                            f"{e}. CoinJoin requires UTXOs with at least "
-                            f"{self.config.taker_utxo_age} confirmation(s) "
-                            f"(taker_utxo_age setting). Wait for more confirmations or "
-                            f"lower taker_utxo_age in your config."
-                        )
-                        logger.error(str(e))
-                        logger.error(
-                            f"CoinJoin requires UTXOs with at least "
-                            f"{self.config.taker_utxo_age} confirmation(s) "
-                            f"(taker_utxo_age setting). Wait for more confirmations or "
-                            f"lower taker_utxo_age in your config."
-                        )
+                        reason = _append_confirmation_hint(str(e), self.config.taker_utxo_age)
+                        logger.error(reason)
                         self._session.last_failure_reason = reason
                         self.state = TakerState.FAILED
                         return None
