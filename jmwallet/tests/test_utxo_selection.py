@@ -1064,10 +1064,15 @@ class TestFidelityBondUTXOFiltering:
         assert all(not u.is_fidelity_bond for u in selected)
         assert sum(u.value for u in selected) == 250_000
 
-    def test_select_utxos_with_merge_include_fidelity_bonds(
+    def test_select_utxos_with_merge_include_expired_bond(
         self, wallet_with_timelocked: WalletService
     ):
-        """select_utxos_with_merge(include_fidelity_bonds=True) includes fidelity bonds."""
+        """include_fidelity_bonds=True selects an *expired* bond (now spendable)."""
+        # The fixture bond is timelocked to the future; expire it so the CLTV
+        # is satisfiable and the bond becomes a valid CoinJoin input.
+        for u in wallet_with_timelocked.utxo_cache[1]:
+            if u.is_fidelity_bond:
+                u.locktime = 1_577_836_800  # 2020-01-01, in the past
         selected = wallet_with_timelocked.select_utxos_with_merge(
             1, 50_000, min_confirmations=1, merge_algorithm="greedy", include_fidelity_bonds=True
         )
@@ -1075,6 +1080,21 @@ class TestFidelityBondUTXOFiltering:
         assert len(selected) == 3
         assert any(u.is_fidelity_bond for u in selected)
         assert sum(u.value for u in selected) == 750_000
+
+    def test_select_utxos_with_merge_excludes_locked_bond(
+        self, wallet_with_timelocked: WalletService
+    ):
+        """A still-locked bond is never selected, even with the bonds flag set.
+
+        Selecting it would build a consensus-invalid transaction (the CLTV is
+        not yet satisfiable), so it must be excluded from spending selection.
+        """
+        selected = wallet_with_timelocked.select_utxos_with_merge(
+            1, 50_000, min_confirmations=1, merge_algorithm="greedy", include_fidelity_bonds=True
+        )
+        assert len(selected) == 2
+        assert all(not u.is_fidelity_bond for u in selected)
+        assert sum(u.value for u in selected) == 250_000
 
 
 class TestSyncFidelityBondDeduplication:

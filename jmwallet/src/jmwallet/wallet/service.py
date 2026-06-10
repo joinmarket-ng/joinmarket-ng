@@ -5,9 +5,11 @@ JoinMarket wallet service with mixdepth support.
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+from coincurve import PrivateKey
 from jmcore.btc_script import mk_freeze_script
 from loguru import logger
 
@@ -19,6 +21,8 @@ from jmwallet.wallet.constants import DEFAULT_SCAN_RANGE, FIDELITY_BOND_BRANCH
 from jmwallet.wallet.display import WalletDisplayMixin
 from jmwallet.wallet.models import UTXOInfo
 from jmwallet.wallet.signer import WalletSigningMixin
+from jmwallet.wallet.silent_payment_scan import SilentPaymentReceived
+from jmwallet.wallet.silent_payments import SilentPaymentWallet
 from jmwallet.wallet.sync import WalletSyncMixin
 from jmwallet.wallet.utxo_metadata import (
     DEFAULT_COINJOIN_LOCK_TTL,
@@ -55,6 +59,7 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin, Wal
         scan_range: int = DEFAULT_SCAN_RANGE,
         data_dir: Path | None = None,
         passphrase: str = "",
+        address_type: str = "p2wpkh",
     ):
         self.backend = backend
         self.network = network
@@ -72,7 +77,26 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin, Wal
         self.master_key = HDKey.from_seed(seed)
 
         coin_type = 0 if network == "mainnet" else 1
-        self.root_path = f"m/84'/{coin_type}'"
+        if address_type not in ("p2wpkh", "p2tr"):
+            raise ValueError(f"Unsupported wallet address_type: {address_type!r}")
+        self.address_type = address_type
+        # BIP84 (native segwit, P2WPKH) uses purpose 84'; BIP86 (Taproot,
+        # P2TR key-path) uses purpose 86'. The wallet is dual-type: it can
+        # derive, scan and sign coins of *both* families. ``address_type`` is
+        # only the default (primary) type used for receive/change addresses;
+        # the secondary type lets a maker serve and later spend a CoinJoin
+        # output of whichever equal-output type the taker requested.
+        self._purpose_for_type = {"p2wpkh": 84, "p2tr": 86}
+        self._descfn_for_type = {"p2wpkh": "wpkh", "p2tr": "tr"}
+        self._root_path_for_type = {
+            st: f"m/{purpose}'/{coin_type}'" for st, purpose in self._purpose_for_type.items()
+        }
+        self.secondary_address_type = "p2tr" if address_type == "p2wpkh" else "p2wpkh"
+        self.descriptor_function = self._descfn_for_type[address_type]
+        self.root_path = self._root_path_for_type[address_type]
+        # Records the script type of every address handed out by get_address so
+        # key resolution can derive under the correct BIP purpose root.
+        self._address_script_type: dict[str, str] = {}
 
         # Log fingerprint for debugging (helps identify passphrase issues)
         fingerprint = self.master_key.derive("m/0").fingerprint.hex()
@@ -87,8 +111,17 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin, Wal
         )
 
         self.address_cache: dict[str, tuple[int, int, int]] = {}
-        self._path_cache: dict[tuple[int, int, int], str] = {}
+        # Keyed by (mixdepth, change, index, script_type) so the same path can
+        # cache both its P2WPKH and P2TR rendering for a dual-type wallet.
+        self._path_cache: dict[tuple[int, int, int, str], str] = {}
         self.utxo_cache: dict[int, list[UTXOInfo]] = {}
+        # Lazily-derived BIP352 silent payment key pair (see get_silent_payments).
+        self._silent_payments: SilentPaymentWallet | None = None
+        # Registered incoming silent payment outputs, keyed by their P2TR
+        # address. Unlike HD-derived coins these have no BIP32 path; the
+        # signing key is recomputed on demand from the stored tweaks via
+        # resolve_p2tr_signing_key(). See register_silent_payment_utxos().
+        self._sp_coins: dict[str, SilentPaymentReceived] = {}
 
         # UTXO + address metadata store (BIP-329 JSONL). Frozen UTXO state,
         # output labels, and the persistent "addresses with on-chain history"
@@ -235,48 +268,180 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin, Wal
 
     # -- Key derivation & address generation (Group A) ----------------------
 
-    def get_address(self, mixdepth: int, change: int, index: int) -> str:
-        """Get address for given path"""
+    def get_address(
+        self, mixdepth: int, change: int, index: int, script_type: str | None = None
+    ) -> str:
+        """Get address for given path.
+
+        ``script_type`` selects the output family (``"p2wpkh"`` or ``"p2tr"``)
+        and defaults to the wallet's primary ``address_type``. Passing the
+        secondary type lets a maker derive a CoinJoin output of the type the
+        taker requested; the type is recorded so the signing key can later be
+        resolved under the correct BIP purpose root.
+        """
         if mixdepth >= self.mixdepth_count:
             raise ValueError(f"Mixdepth {mixdepth} exceeds maximum {self.mixdepth_count}")
 
-        path_key = (mixdepth, change, index)
+        st = script_type or self.address_type
+        if st not in self._root_path_for_type:
+            raise ValueError(f"Unsupported script_type: {st!r}")
+
+        path_key = (mixdepth, change, index, st)
         cached = self._path_cache.get(path_key)
         if cached is not None:
-            self.address_cache[cached] = path_key
+            self.address_cache[cached] = (mixdepth, change, index)
+            self._address_script_type[cached] = st
             return cached
 
-        path = f"{self.root_path}/{mixdepth}'/{change}/{index}"
+        path = f"{self._root_path_for_type[st]}/{mixdepth}'/{change}/{index}"
         key = self.master_key.derive(path)
-        address = key.get_address(self.network)
+        address = (
+            key.get_p2tr_address(self.network) if st == "p2tr" else (key.get_address(self.network))
+        )
 
         self.address_cache[address] = (mixdepth, change, index)
+        self._address_script_type[address] = st
         self._path_cache[path_key] = address
 
         return address
 
-    def get_receive_address(self, mixdepth: int, index: int) -> str:
+    def get_silent_payments(self) -> SilentPaymentWallet:
+        """Return the wallet's BIP352 silent payment key pair (cached).
+
+        Derived from the seed at ``m/352'/coin'/0'/{1',0'}/0``. Used to publish
+        a static silent payment address (e.g. for anonymous donations to a
+        maker) and to scan for / spend incoming silent payments.
+        """
+        if self._silent_payments is None:
+            self._silent_payments = SilentPaymentWallet(self.master_key, self.network)
+        return self._silent_payments
+
+    def get_silent_payment_address(self, label: int | None = None) -> str:
+        """Return the wallet's silent payment address (optionally labeled)."""
+        return self.get_silent_payments().get_address(label)
+
+    async def scan_silent_payments(
+        self,
+        start_height: int,
+        end_height: int | None = None,
+        labels: Sequence[int] = (),
+    ) -> list[SilentPaymentReceived]:
+        """Scan a block range for incoming BIP352 silent payments.
+
+        Walks blocks ``[start_height, end_height]`` (inclusive), pulling each
+        block with prevout data from the backend and matching outputs against
+        this wallet's silent payment keys. Requires a backend that can serve
+        full blocks with prevouts (Bitcoin Core); light clients raise
+        ``NotImplementedError``.
+
+        Returns the detected, spendable outputs. The change label (m=0) is
+        always scanned for in addition to any explicit labels.
+        """
+        from jmwallet.wallet.silent_payment_scan import scan_block_transactions
+
+        sp_wallet = self.get_silent_payments()
+        if end_height is None:
+            end_height = await self.backend.get_block_height()
+
+        received: list[SilentPaymentReceived] = []
+        for height in range(start_height, end_height + 1):
+            txs = await self.backend.get_block_transactions(height)
+            received.extend(scan_block_transactions(sp_wallet, txs, labels, network=self.network))
+        return received
+
+    def register_silent_payment_utxos(
+        self,
+        received: Sequence[SilentPaymentReceived],
+        mixdepth: int = 0,
+        confirmations: int = 1,
+    ) -> list[UTXOInfo]:
+        """Make detected silent payment outputs spendable by the wallet.
+
+        Each :class:`SilentPaymentReceived` is recorded in ``_sp_coins`` (keyed
+        by its P2TR address) and surfaced as a :class:`UTXOInfo` in
+        ``utxo_cache[mixdepth]`` so the coin-selection machinery treats it like
+        any other owned coin. These outputs have no BIP32 path; their signing
+        key is recomputed on demand via :meth:`resolve_p2tr_signing_key`.
+
+        Returns the list of injected ``UTXOInfo`` objects.
+        """
+        injected: list[UTXOInfo] = []
+        bucket = self.utxo_cache.setdefault(mixdepth, [])
+        existing = {(u.txid, u.vout) for u in bucket}
+        for r in received:
+            self._sp_coins[r.address] = r
+            if (r.txid, r.vout) in existing:
+                continue
+            utxo = UTXOInfo(
+                txid=r.txid,
+                vout=r.vout,
+                value=r.value,
+                address=r.address,
+                confirmations=confirmations,
+                scriptpubkey="5120" + r.pubkey_xonly.hex(),
+                path="",
+                mixdepth=mixdepth,
+                label="silent-payment",
+            )
+            bucket.append(utxo)
+            existing.add((r.txid, r.vout))
+            injected.append(utxo)
+        return injected
+
+    def resolve_p2tr_signing_key(self, address: str) -> tuple[PrivateKey, bytes] | None:
+        """Resolve the BIP341 key-path signing key for a P2TR ``address``.
+
+        Returns ``(private_key, output_xonly)`` where ``private_key`` is a
+        coincurve :class:`PrivateKey` whose public key is the tweaked taproot
+        output key, and ``output_xonly`` is its 32-byte x-only encoding.
+
+        Handles two sources of taproot coins:
+
+        - Registered silent payment outputs (no taptweak; the recovered scalar
+          ``spend + tweak + label_tweak`` already *is* the output key).
+        - BIP86 HD-derived outputs (key-path spend with the BIP341 taptweak).
+
+        Returns ``None`` if the address is not owned by this wallet.
+        """
+        sp = self._sp_coins.get(address)
+        if sp is not None:
+            spend_privkey = self.get_silent_payments().spend_privkey
+            scalar = sp.output_private_key(spend_privkey)
+            priv = PrivateKey(scalar.to_bytes(32, "big"))
+            return priv, sp.pubkey_xonly
+
+        key = self.get_key_for_address(address)
+        if key is None:
+            return None
+        priv = PrivateKey(key.get_p2tr_private_key())
+        return priv, key.get_p2tr_output_xonly()
+
+    def get_receive_address(self, mixdepth: int, index: int, script_type: str | None = None) -> str:
         """Get external (receive) address"""
-        return self.get_address(mixdepth, 0, index)
+        return self.get_address(mixdepth, 0, index, script_type)
 
-    def get_change_address(self, mixdepth: int, index: int) -> str:
+    def get_change_address(self, mixdepth: int, index: int, script_type: str | None = None) -> str:
         """Get internal (change) address"""
-        return self.get_address(mixdepth, 1, index)
+        return self.get_address(mixdepth, 1, index, script_type)
 
-    def get_account_xpub(self, mixdepth: int) -> str:
+    def get_account_xpub(self, mixdepth: int, script_type: str | None = None) -> str:
         """
         Get the extended public key (xpub) for a mixdepth account.
 
-        Derives the key at path m/84'/coin'/mixdepth' and returns its xpub.
+        Derives the key at path m/{84,86}'/coin'/mixdepth' and returns its xpub.
         This xpub can be used in Bitcoin Core descriptors for efficient scanning.
+        ``script_type`` selects the BIP purpose root and defaults to the
+        wallet's primary ``address_type``.
 
         Args:
             mixdepth: The mixdepth (account) number (0-4)
+            script_type: Output family ("p2wpkh" or "p2tr"); default primary.
 
         Returns:
             xpub/tpub string for the account
         """
-        account_path = f"{self.root_path}/{mixdepth}'"
+        root = self._root_path_for_type[script_type or self.address_type]
+        account_path = f"{root}/{mixdepth}'"
         account_key = self.master_key.derive(account_path)
         return account_key.get_xpub(self.network)
 
@@ -297,12 +462,17 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin, Wal
         account_key = self.master_key.derive(account_path)
         return account_key.get_zpub(self.network)
 
-    def get_scan_descriptors(self, scan_range: int = DEFAULT_SCAN_RANGE) -> list[dict[str, Any]]:
+    def get_scan_descriptors(
+        self, scan_range: int = DEFAULT_SCAN_RANGE, dual_type: bool = True
+    ) -> list[dict[str, Any]]:
         """
         Generate descriptors for efficient UTXO scanning with Bitcoin Core.
 
-        Creates wpkh() descriptors with xpub and range for all mixdepths,
-        both external (receive) and internal (change) addresses.
+        Creates ranged descriptors for all mixdepths, both external (receive)
+        and internal (change) chains. When ``dual_type`` is True (default) the
+        wallet emits descriptors for *both* the P2WPKH (``wpkh``) and P2TR
+        (``tr``) families so a maker discovers CoinJoin outputs of whichever
+        equal-output type a taker requested, regardless of its primary type.
 
         Using descriptors with ranges is much more efficient than scanning
         individual addresses, as Bitcoin Core can scan the entire range in
@@ -310,6 +480,7 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin, Wal
 
         Args:
             scan_range: Maximum index to scan (default 1000, Bitcoin Core's default)
+            dual_type: Emit both P2WPKH and P2TR descriptor families.
 
         Returns:
             List of descriptor dicts for use with scantxoutset:
@@ -317,18 +488,19 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin, Wal
         """
         descriptors = []
 
+        script_types = ("p2wpkh", "p2tr") if dual_type else (self.address_type,)
         for mixdepth in range(self.mixdepth_count):
-            xpub = self.get_account_xpub(mixdepth)
-
-            # External (receive) addresses: .../0/*
-            descriptors.append({"desc": f"wpkh({xpub}/0/*)", "range": [0, scan_range - 1]})
-
-            # Internal (change) addresses: .../1/*
-            descriptors.append({"desc": f"wpkh({xpub}/1/*)", "range": [0, scan_range - 1]})
+            for st in script_types:
+                fn = self._descfn_for_type[st]
+                xpub = self.get_account_xpub(mixdepth, st)
+                # External (receive) addresses: .../0/*
+                descriptors.append({"desc": f"{fn}({xpub}/0/*)", "range": [0, scan_range - 1]})
+                # Internal (change) addresses: .../1/*
+                descriptors.append({"desc": f"{fn}({xpub}/1/*)", "range": [0, scan_range - 1]})
 
         logger.debug(
             f"Generated {len(descriptors)} descriptors for {self.mixdepth_count} mixdepths "
-            f"with range [0, {scan_range - 1}]"
+            f"with range [0, {scan_range - 1}] (dual_type={dual_type})"
         )
         return descriptors
 
@@ -442,7 +614,10 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin, Wal
             return None
 
         mixdepth, change, index = self.address_cache[address]
-        path = f"{self.root_path}/{mixdepth}'/{change}/{index}"
+        # Resolve under the BIP purpose root matching the address's script type
+        # (a dual-type wallet may hold both P2WPKH and P2TR coins).
+        st = self._address_script_type.get(address, self.address_type)
+        path = f"{self._root_path_for_type[st]}/{mixdepth}'/{change}/{index}"
         return self.master_key.derive(path)
 
     # -- Balance & UTXO queries (Group G) -----------------------------------

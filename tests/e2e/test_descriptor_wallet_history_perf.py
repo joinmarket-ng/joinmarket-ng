@@ -62,6 +62,19 @@ RECEIVES_PER_BATCH = 500
 NUM_COINJOINS = 100
 COINJOIN_PARTICIPANTS = 5
 
+# Per-output amounts. This test exercises address *count* scaling, not value,
+# so the amounts are kept deliberately small. The regtest subsidy halves every
+# 150 blocks, and accumulating funds via fresh coinbase on the shared e2e node
+# mines many blocks at the heights the suite reaches; a large BTC requirement
+# would push the chain to a height where the subsidy collapses to dust and
+# starves later coinbase-funded tests. Keeping the footprint at well under
+# 1 BTC bounds the mining to roughly one halving window. All values stay
+# comfortably above the dust threshold (~294 sat for bech32).
+_RECEIVE_AMOUNT = 0.00001  # 1000 sat per history-bearing receive
+_UTXO_AMOUNT = 0.001  # miner/test split-output value
+_CJ_AMOUNT = 0.0005  # equal-value CoinJoin output
+_CJ_FEE = 0.00005  # nominal fee reserved per CoinJoin-like tx
+
 # Hard upper bound for ``get_addresses_with_history`` wall time. The
 # expected value on a developer machine is well under 1s for this dataset
 # (regtest benchmarks show ~0.05s for 3.4k txs and ~0.15s for 23.7k txs);
@@ -119,15 +132,53 @@ async def _mine(cfg: dict[str, str], addr: str, n: int, miner_wallet: str) -> No
     await _rpc(cfg, "generatetoaddress", [n, addr], wallet=miner_wallet)
 
 
+# Comfortable spendable-balance target for the miner wallet. With the small
+# per-output amounts this test uses, the total spent is well under 1 BTC, so a
+# 1 BTC target leaves headroom for fees while bounding the mining to roughly a
+# single halving window even at the block heights the e2e suite reaches.
+_MINER_BALANCE_TARGET = 1.0
+
+# Block count mined per funding iteration. One full regtest halving window
+# (150 blocks) means ~50 coinbases mature per iteration (150 minus the 100
+# confirmation maturity), which converges in one or two iterations at the
+# block heights the e2e suite reaches.
+_FUNDING_BLOCK_STEP = 150
+
+# Safety cap on funding iterations. At realistic e2e block heights the target
+# is reached in one or two iterations; the cap only trips on a pathologically
+# high block height (near-zero subsidy) and fails loudly instead of mining
+# indefinitely.
+_MAX_FUNDING_ITERATIONS = 30
+
+
 async def _setup_funded_miner(cfg: dict[str, str], miner_wallet: str) -> str:
-    """Return a freshly generated miner address with mature coinbase funds."""
+    """Return a freshly generated miner address with mature coinbase funds.
+
+    The regtest block subsidy halves every 150 blocks, so on a node that is
+    already at a high block height (the e2e wallet-funder mines well over a
+    thousand blocks) a single mature coinbase can be a small fraction of a
+    BTC. A fixed block count is therefore not enough; mine in batches until
+    the wallet holds comfortably more spendable balance than this test
+    spends. ``getbalance`` returns only mature (spendable) coinbase, so this
+    loop terminates once enough coinbases have matured.
+
+    Note: ``getwalletinfo`` no longer reports a ``balance`` field on Bitcoin
+    Core 30, so the spendable balance must be read via ``getbalance``.
+    """
     miner_addr = await _rpc(cfg, "getnewaddress", ["", "bech32"], wallet=miner_wallet)
-    info = await _rpc(cfg, "getwalletinfo", wallet=miner_wallet)
-    # Each test gets a fresh wallet so we always need to mine coinbase to
-    # it. 110 blocks gives one mature coinbase reward (50 BTC) which is
-    # plenty for the small payments this test makes.
-    if info.get("balance", 0) < 1.0:
-        await _mine(cfg, miner_addr, 110, miner_wallet)
+    balance = await _rpc(cfg, "getbalance", wallet=miner_wallet)
+    iterations = 0
+    while balance < _MINER_BALANCE_TARGET:
+        if iterations >= _MAX_FUNDING_ITERATIONS:
+            raise RuntimeError(
+                f"could not fund miner wallet to {_MINER_BALANCE_TARGET} BTC "
+                f"after {iterations} iterations (balance {balance} BTC); the "
+                "regtest node may be at an extreme block height where the "
+                "subsidy is near zero"
+            )
+        await _mine(cfg, miner_addr, _FUNDING_BLOCK_STEP, miner_wallet)
+        balance = await _rpc(cfg, "getbalance", wallet=miner_wallet)
+        iterations += 1
     return miner_addr
 
 
@@ -155,7 +206,7 @@ async def _send_many_receives(
         targets: dict[str, float] = {}
         for _ in range(min(batch_size, n - sent)):
             addr = await _rpc(cfg, "getnewaddress", ["", "bech32"], wallet=test_wallet)
-            targets[addr] = 0.0001
+            targets[addr] = _RECEIVE_AMOUNT
         await _rpc(cfg, "sendmany", ["", targets], wallet=miner_wallet)
         sent += len(targets)
         await _mine(cfg, miner_addr, 1, miner_wallet)
@@ -167,7 +218,7 @@ async def _ensure_miner_utxos(
     miner_addr: str,
     miner_wallet: str,
     count: int,
-    value: float = 0.01,
+    value: float = _UTXO_AMOUNT,
 ) -> None:
     """Pre-split miner coins so CoinJoin sims have enough small inputs."""
     have = await _rpc(
@@ -212,21 +263,30 @@ async def _make_coinjoin_like(
     targets: dict[str, float] = {}
     for _ in range(n + 10):
         addr = await _rpc(cfg, "getnewaddress", ["", "bech32"], wallet=test_wallet)
-        targets[addr] = 0.01
+        targets[addr] = _UTXO_AMOUNT
     await _rpc(cfg, "sendmany", ["", targets], wallet=miner_wallet)
     await _mine(cfg, miner_addr, 6, miner_wallet)
 
     test_utxos = await _rpc(
         cfg,
         "listunspent",
-        [1, 9999999, [], True, {"minimumAmount": 0.009}],
+        [1, 9999999, [], True, {"minimumAmount": round(_UTXO_AMOUNT * 0.9, 8)}],
         wallet=test_wallet,
     )
-    test_utxos = [u for u in test_utxos if u["amount"] >= 0.009]
+    test_utxos = [u for u in test_utxos if u["amount"] >= _UTXO_AMOUNT * 0.9]
     miner_utxos = await _rpc(
         cfg,
         "listunspent",
-        [1, 9999999, [], True, {"minimumAmount": 0.005, "maximumAmount": 0.02}],
+        [
+            1,
+            9999999,
+            [],
+            True,
+            {
+                "minimumAmount": round(_UTXO_AMOUNT * 0.5, 8),
+                "maximumAmount": round(_UTXO_AMOUNT * 2, 8),
+            },
+        ],
         wallet=miner_wallet,
     )
 
@@ -247,7 +307,7 @@ async def _make_coinjoin_like(
             in_value += miner_utxos[mi]["amount"]
             mi += 1
 
-        cj_amount = 0.005
+        cj_amount = _CJ_AMOUNT
         outputs: dict[str, float] = {}
         for j in range(participants):
             wallet_for_output = test_wallet if j % 2 == 0 else miner_wallet
@@ -255,7 +315,7 @@ async def _make_coinjoin_like(
                 cfg, "getnewaddress", ["", "bech32"], wallet=wallet_for_output
             )
             outputs[addr] = cj_amount
-        change = in_value - cj_amount * participants - 0.00005
+        change = in_value - cj_amount * participants - _CJ_FEE
         if change > 0:
             change_addr = await _rpc(
                 cfg, "getnewaddress", ["", "bech32"], wallet=miner_wallet

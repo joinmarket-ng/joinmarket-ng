@@ -197,8 +197,8 @@ class TestTakerSigning:
         # key lookup so tests exercise WalletService.sign_input behavior.
         from jmwallet.wallet.signer import WalletSigningMixin
 
-        wallet.sign_input = lambda tx, idx, utxo: WalletSigningMixin.sign_input(
-            wallet, tx, idx, utxo
+        wallet.sign_input = lambda tx, idx, utxo, prevout_values=None, prevout_scripts=None: (
+            WalletSigningMixin.sign_input(wallet, tx, idx, utxo, prevout_values, prevout_scripts)
         )
         return wallet
 
@@ -457,8 +457,8 @@ class TestEdgeCases:
         wallet.wallet_fingerprint = "deadbeef"
         from jmwallet.wallet.signer import WalletSigningMixin
 
-        wallet.sign_input = lambda tx, idx, utxo: WalletSigningMixin.sign_input(
-            wallet, tx, idx, utxo
+        wallet.sign_input = lambda tx, idx, utxo, prevout_values=None, prevout_scripts=None: (
+            WalletSigningMixin.sign_input(wallet, tx, idx, utxo, prevout_values, prevout_scripts)
         )
 
         utxos = [

@@ -28,11 +28,14 @@ from jmwallet.wallet.signing import (
     create_p2wpkh_script_code,
     create_p2wsh_witness_stack,
     create_witness_stack,
+    sign_p2tr_input,
     sign_p2wpkh_input,
     sign_p2wsh_input,
 )
 
 if TYPE_CHECKING:
+    from coincurve import PrivateKey
+
     from jmwallet.wallet.bip32 import HDKey
     from jmwallet.wallet.models import UTXOInfo
 
@@ -64,11 +67,19 @@ class WalletSigningMixin:
     def get_key_for_address(self, address: str) -> HDKey | None:  # pragma: no cover
         raise NotImplementedError
 
+    # Declared for mypy -- actually provided by the host WalletService.
+    def resolve_p2tr_signing_key(  # pragma: no cover
+        self, address: str
+    ) -> tuple[PrivateKey, bytes] | None:
+        raise NotImplementedError
+
     def sign_input(
         self,
         tx: ParsedTransaction,
         input_index: int,
         utxo: UTXOInfo,
+        prevout_values: list[int] | None = None,
+        prevout_scripts: list[bytes] | None = None,
     ) -> SignedInput:
         """Sign a single input belonging to this wallet.
 
@@ -80,16 +91,44 @@ class WalletSigningMixin:
             tx: The parsed unsigned transaction being signed.
             input_index: Index of the input to sign within ``tx``.
             utxo: The wallet UTXO being spent at ``input_index``.
+            prevout_values: Amounts of every input in ``tx`` ordered by index.
+                Required only for taproot (P2TR) inputs, whose BIP341 sighash
+                commits to all spent amounts.
+            prevout_scripts: scriptPubKeys of every input in ``tx`` ordered by
+                index. Required only for taproot inputs.
 
         Returns:
             A :class:`SignedInput` with the signature, public key and witness
-            stack.
+            stack. For P2TR the ``pubkey`` is the 32-byte x-only output key and
+            the ``signature`` is a 64-byte BIP340 Schnorr signature.
 
         Raises:
-            TransactionSigningError: If the signing key is unknown, or the UTXO
-                is a P2WSH output without an associated locktime (which would
-                otherwise be impossible to sign).
+            TransactionSigningError: If the signing key is unknown, the UTXO is
+                a P2WSH output without an associated locktime, or a taproot
+                input is signed without the full prevout set.
         """
+        if utxo.is_p2tr:
+            if prevout_values is None or prevout_scripts is None:
+                raise TransactionSigningError("Taproot inputs require the full prevout set to sign")
+            # Key-path spend over the full prevout set; the witness is the
+            # single 64-byte Schnorr signature. ``resolve_p2tr_signing_key``
+            # returns a coincurve PrivateKey (BIP86 outputs use the taptweak,
+            # received silent payment outputs recompute the key from stored
+            # tweaks and have no HD path), so it must be used instead of the
+            # ``get_key_for_address`` HD lookup below.
+            resolved = self.resolve_p2tr_signing_key(utxo.address)
+            if resolved is None:
+                raise TransactionSigningError(f"Missing key for address {utxo.address}")
+            private_key, xonly = resolved
+            signature = sign_p2tr_input(
+                tx=tx,
+                input_index=input_index,
+                prevouts_values=prevout_values,
+                prevouts_scripts=prevout_scripts,
+                private_key=private_key,
+            )
+            return SignedInput(signature=signature, pubkey=xonly, witness=[signature])
+
         key = self.get_key_for_address(utxo.address)
         if key is None:
             raise TransactionSigningError(f"Missing key for address {utxo.address}")

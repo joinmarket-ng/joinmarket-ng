@@ -11,6 +11,8 @@ This section covers protocol behavior, architecture, privacy model, configuratio
 | [Protocol](protocol.md) | Protocol specification and flow |
 | [Privacy Mechanisms](privacy.md) | Privacy features and techniques |
 | [Wallet](wallet.md) | Wallet architecture and management |
+| [Taproot CoinJoin](taproot-coinjoin.md) | Taproot (tr0) offers and signing |
+| [Silent Payments](silent-payments.md) | BIP352 receive and spend support |
 | [Configuration](configuration.md) | Configuration options and settings |
 | [Security](security.md) | Security considerations and best practices |
 | [Development](development.md) | Development guidelines and setup |

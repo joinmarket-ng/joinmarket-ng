@@ -438,7 +438,7 @@ class TestMakerBotMultiOfferFill:
 
         fill_data = None
 
-        async def capture_handle_fill(amount, commitment, taker_pk):
+        async def capture_handle_fill(amount, commitment, taker_pk, cj_script_type=None):
             nonlocal fill_data
             fill_data = {"amount": amount, "commitment": commitment, "taker_pk": taker_pk}
             return True, {"nacl_pubkey": "abc123", "features": ["neutrino_compat"]}
@@ -468,7 +468,7 @@ class TestMakerBotMultiOfferFill:
         """Test !fill for absolute fee offer (oid=1)."""
         mock_backend.requires_neutrino_metadata = MagicMock(return_value=False)
 
-        async def mock_handle_fill(amount, commitment, taker_pk):
+        async def mock_handle_fill(amount, commitment, taker_pk, cj_script_type=None):
             return True, {"nacl_pubkey": "abc123", "features": ["neutrino_compat"]}
 
         with patch("maker.protocol_handlers.CoinJoinSession") as mock_session_class:
@@ -520,7 +520,7 @@ class TestMakerBotMultiOfferFill:
         """Test that amount validation passes when using the right offer."""
         mock_backend.requires_neutrino_metadata = MagicMock(return_value=False)
 
-        async def mock_handle_fill(amount, commitment, taker_pk):
+        async def mock_handle_fill(amount, commitment, taker_pk, cj_script_type=None):
             return True, {"nacl_pubkey": "abc123", "features": ["neutrino_compat"]}
 
         with patch("maker.protocol_handlers.CoinJoinSession") as mock_session_class:

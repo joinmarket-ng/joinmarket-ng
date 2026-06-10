@@ -65,6 +65,8 @@ class WalletSyncMixin:
     backend: BlockchainBackend
     master_key: HDKey
     root_path: str
+    address_type: str
+    descriptor_function: str
     network: str
     mixdepth_count: int
     gap_limit: int
@@ -76,12 +78,18 @@ class WalletSyncMixin:
     addresses_with_history: set[str]
     metadata_store: Any  # UTXOMetadataStore | None (deferred import)
     fidelity_bond_locktime_cache: dict[str, int]
+    # Dual-type (P2WPKH + P2TR) derivation maps, set by the host class
+    _root_path_for_type: dict[str, str]
+    _descfn_for_type: dict[str, str]
+    _address_script_type: dict[str, str]
 
     # Methods provided by the host class
-    def get_address(self, mixdepth: int, change: int, index: int) -> str:
+    def get_address(
+        self, mixdepth: int, change: int, index: int, script_type: str | None = None
+    ) -> str:
         raise NotImplementedError
 
-    def get_account_xpub(self, mixdepth: int) -> str:
+    def get_account_xpub(self, mixdepth: int, script_type: str | None = None) -> str:
         raise NotImplementedError
 
     def get_fidelity_bond_address(self, index: int, locktime: int) -> str:
@@ -146,33 +154,41 @@ class WalletSyncMixin:
             index = 0
 
             while consecutive_empty < self.gap_limit:
-                # Scan in batches of gap_limit size for performance
+                # Scan in batches of gap_limit size for performance. Each index
+                # is queried in both script families (P2WPKH + P2TR) so a
+                # dual-type wallet discovers CoinJoin outputs of either type.
                 batch_size = self.gap_limit
-                addresses = []
+                ordered_addresses: list[str] = []
 
                 for i in range(batch_size):
-                    address = self.get_address(mixdepth, change, index + i)
-                    addresses.append(address)
+                    for script_type in ("p2wpkh", "p2tr"):
+                        ordered_addresses.append(
+                            self.get_address(mixdepth, change, index + i, script_type)
+                        )
 
                 # Fetch UTXOs for the whole batch
-                backend_utxos = await self.backend.get_utxos(addresses)
+                backend_utxos = await self.backend.get_utxos(ordered_addresses)
 
                 # Group results by address
-                utxos_by_address: dict[str, list] = {addr: [] for addr in addresses}
+                utxos_by_address: dict[str, list] = {addr: [] for addr in ordered_addresses}
                 for utxo in backend_utxos:
                     if utxo.address in utxos_by_address:
                         utxos_by_address[utxo.address].append(utxo)
 
-                # Process batch results in order
-                for i, address in enumerate(addresses):
-                    addr_utxos = utxos_by_address[address]
-
-                    if addr_utxos:
-                        consecutive_empty = 0
+                # Process batch results per index, across both script families.
+                for i in range(batch_size):
+                    found_any = False
+                    for script_type in ("p2wpkh", "p2tr"):
+                        address = self.get_address(mixdepth, change, index + i, script_type)
+                        addr_utxos = utxos_by_address.get(address, [])
+                        if not addr_utxos:
+                            continue
+                        found_any = True
                         # Track that this address has had UTXOs
                         self._record_history_address(address)
+                        root = self._root_path_for_type[script_type]
                         for utxo in addr_utxos:
-                            path = f"{self.root_path}/{mixdepth}'/{change}/{index + i}"
+                            path = f"{root}/{mixdepth}'/{change}/{index + i}"
                             utxos.append(
                                 _make_utxo_info(
                                     txid=utxo.txid,
@@ -186,6 +202,9 @@ class WalletSyncMixin:
                                     height=utxo.height,
                                 )
                             )
+
+                    if found_any:
+                        consecutive_empty = 0
                     else:
                         consecutive_empty += 1
 
@@ -226,15 +245,17 @@ class WalletSyncMixin:
             logger.debug("No locktimes provided for fidelity bond sync")
             return utxos
 
-        # Each locktime has exactly one address (timenumber = BIP32 child index)
+        # Each locktime has exactly one bond address (timenumber = BIP32 child
+        # index).
         addresses: list[str] = []
-        address_to_info: dict[str, tuple[int, int]] = {}  # addr -> (locktime, timenumber)
+        # addr -> (locktime, timenumber, root_path)
+        address_to_info: dict[str, tuple[int, int, str]] = {}
 
         for locktime in locktimes:
             timenumber = timestamp_to_timenumber(locktime)
-            address = self.get_fidelity_bond_address(timenumber, locktime)
-            addresses.append(address)
-            address_to_info[address] = (locktime, timenumber)
+            p2wsh_address = self.get_fidelity_bond_address(timenumber, locktime)
+            addresses.append(p2wsh_address)
+            address_to_info[p2wsh_address] = (locktime, timenumber, self.root_path)
 
         # Ensure these bond addresses are scanned over the wallet's full
         # history before querying. Light-client backends (Neutrino) only rescan
@@ -256,10 +277,10 @@ class WalletSyncMixin:
         for address in addresses:
             addr_utxos = utxos_by_address[address]
             if addr_utxos:
-                locktime, timenumber = address_to_info[address]
+                locktime, timenumber, root_path = address_to_info[address]
                 self._record_history_address(address)
                 for utxo in addr_utxos:
-                    path = f"{self.root_path}/0'/{FIDELITY_BOND_BRANCH}/{timenumber}:{locktime}"
+                    path = f"{root_path}/0'/{FIDELITY_BOND_BRANCH}/{timenumber}:{locktime}"
                     utxo_info = _make_utxo_info(
                         txid=utxo.txid,
                         vout=utxo.vout,
@@ -328,12 +349,14 @@ class WalletSyncMixin:
         )
 
         # Build the full address map across all timenumbers.
-        # Each timenumber has exactly one address (timenumber = BIP32 child index).
-        all_address_to_locktime: dict[str, tuple[int, int]] = {}
+        # Each timenumber has exactly one bond address (timenumber = BIP32
+        # child index).
+        # addr -> (locktime, timenumber, root_path)
+        all_address_to_locktime: dict[str, tuple[int, int, str]] = {}
         for timenumber in range(TIMENUMBER_COUNT):
             locktime = timenumber_to_timestamp(timenumber)
-            address = self.get_fidelity_bond_address(timenumber, locktime)
-            all_address_to_locktime[address] = (locktime, timenumber)
+            p2wsh_address = self.get_fidelity_bond_address(timenumber, locktime)
+            all_address_to_locktime[p2wsh_address] = (locktime, timenumber, self.root_path)
 
         # For descriptor wallets, import all addresses in batches WITHOUT triggering
         # a per-batch rescan.  A single blockchain rescan is run after all descriptors
@@ -345,7 +368,9 @@ class WalletSyncMixin:
             # descriptor wallet is initialised before importing address
             # descriptors, otherwise backend calls fail with RPC -18 / "wallet
             # not loaded".
-            expected_count = self.mixdepth_count * 2
+            # external + internal per mixdepth, doubled for dual-type
+            # (P2WPKH + P2TR) descriptor families.
+            expected_count = self.mixdepth_count * 2 * 2
             if not await descriptor_backend.is_wallet_setup(
                 expected_descriptor_count=expected_count
             ):
@@ -355,7 +380,7 @@ class WalletSyncMixin:
                 await self.setup_descriptor_wallet(rescan=False)
 
             all_bond_addrs = [
-                (addr, lt, idx) for addr, (lt, idx) in all_address_to_locktime.items()
+                (addr, lt, idx) for addr, (lt, idx, _root) in all_address_to_locktime.items()
             ]
             total_addrs = len(all_bond_addrs)
             for batch_start in range(0, total_addrs, batch_size):
@@ -417,8 +442,8 @@ class WalletSyncMixin:
         # Process found UTXOs
         for utxo in backend_utxos:
             if utxo.address in address_to_locktime:
-                locktime, idx = address_to_locktime[utxo.address]
-                path = f"{self.root_path}/0'/{FIDELITY_BOND_BRANCH}/{idx}:{locktime}"
+                locktime, idx, root_path = address_to_locktime[utxo.address]
+                path = f"{root_path}/0'/{FIDELITY_BOND_BRANCH}/{idx}:{locktime}"
 
                 utxo_info = _make_utxo_info(
                     txid=utxo.txid,
@@ -477,7 +502,10 @@ class WalletSyncMixin:
         # guard makes ``WalletService(...).sync()`` work directly in tests and
         # ad-hoc usage without each caller having to remember the setup step.
         if isinstance(self.backend, DescriptorWalletBackend):
-            expected_count = self.mixdepth_count * 2
+            # Two chains (external/internal) x two script families (P2WPKH + P2TR)
+            # per mixdepth, since the wallet imports both families for dual-type
+            # CoinJoin output discovery.
+            expected_count = self.mixdepth_count * 2 * 2
             if fidelity_bond_addresses:
                 expected_count += len(fidelity_bond_addresses)
             needs_setup = not await self.backend.is_wallet_setup(
@@ -486,9 +514,11 @@ class WalletSyncMixin:
             if not needs_setup:
                 expected_bases: set[str] = set()
                 for mixdepth in range(self.mixdepth_count):
-                    xpub = self.get_account_xpub(mixdepth)
-                    expected_bases.add(f"wpkh({xpub}/0/*)")
-                    expected_bases.add(f"wpkh({xpub}/1/*)")
+                    for script_type in ("p2wpkh", "p2tr"):
+                        fn = self._descfn_for_type[script_type]
+                        xpub = self.get_account_xpub(mixdepth, script_type)
+                        expected_bases.add(f"{fn}({xpub}/0/*)")
+                        expected_bases.add(f"{fn}({xpub}/1/*)")
                 descriptors = await self.backend.list_descriptors()
                 actual_bases = {str(item.get("desc", "")).split("#", 1)[0] for item in descriptors}
                 if not expected_bases.issubset(actual_bases):
@@ -530,11 +560,12 @@ class WalletSyncMixin:
             for pre_mixdepth in range(self.mixdepth_count):
                 for pre_change in [0, 1]:
                     for pre_index in range(self.gap_limit):
-                        addr = self.get_address(pre_mixdepth, pre_change, pre_index)
-                        await self.backend.add_watch_address(addr)
+                        for pre_type in ("p2wpkh", "p2tr"):
+                            addr = self.get_address(pre_mixdepth, pre_change, pre_index, pre_type)
+                            await self.backend.add_watch_address(addr)
             logger.debug(
-                f"Pre-registered {self.mixdepth_count * 2 * self.gap_limit} addresses "
-                "with backend before initial rescan"
+                f"Pre-registered {self.mixdepth_count * 2 * self.gap_limit * 2} addresses "
+                "(both script families) with backend before initial rescan"
             )
 
         result = {}
@@ -704,23 +735,28 @@ class WalletSyncMixin:
         # formula was dropped in favor of an explicit setting (issue #475).
         scan_range = self.scan_range
         descriptors: list[str | dict[str, Any]] = []
-        # Map descriptor string (without checksum) -> (mixdepth, change)
-        desc_to_path: dict[str, tuple[int, int]] = {}
+        # Map descriptor string (without checksum) -> (mixdepth, change, script_type)
+        desc_to_path: dict[str, tuple[int, int, str]] = {}
         # Map fidelity bond address -> (locktime, index)
         bond_address_to_info: dict[str, tuple[int, int]] = {}
 
+        # Emit both the P2WPKH and P2TR descriptor families so a maker
+        # discovers CoinJoin outputs of whichever equal-output type a taker
+        # requested, regardless of its primary wallet type.
         for mixdepth in range(self.mixdepth_count):
-            xpub = self.get_account_xpub(mixdepth)
+            for fam_type in ("p2wpkh", "p2tr"):
+                fn = self._descfn_for_type[fam_type]
+                xpub = self.get_account_xpub(mixdepth, fam_type)
 
-            # External (receive) addresses: .../0/*
-            desc_ext = f"wpkh({xpub}/0/*)"
-            descriptors.append({"desc": desc_ext, "range": [0, scan_range - 1]})
-            desc_to_path[desc_ext] = (mixdepth, 0)
+                # External (receive) addresses: .../0/*
+                desc_ext = f"{fn}({xpub}/0/*)"
+                descriptors.append({"desc": desc_ext, "range": [0, scan_range - 1]})
+                desc_to_path[desc_ext] = (mixdepth, 0, fam_type)
 
-            # Internal (change) addresses: .../1/*
-            desc_int = f"wpkh({xpub}/1/*)"
-            descriptors.append({"desc": desc_int, "range": [0, scan_range - 1]})
-            desc_to_path[desc_int] = (mixdepth, 1)
+                # Internal (change) addresses: .../1/*
+                desc_int = f"{fn}({xpub}/1/*)"
+                descriptors.append({"desc": desc_int, "range": [0, scan_range - 1]})
+                desc_to_path[desc_int] = (mixdepth, 1, fam_type)
 
         # Add fidelity bond addresses to the scan
         if fidelity_bond_addresses:
@@ -807,21 +843,30 @@ class WalletSyncMixin:
 
             # Parse the descriptor to extract change and index for regular wallet UTXOs
             # Descriptor format from Bitcoin Core when using xpub:
-            # wpkh([fingerprint/change/index]pubkey)#checksum
-            # The fingerprint is the parent xpub's fingerprint
-            path_info = self._parse_descriptor_path(desc, desc_to_path)
+            # wpkh([fingerprint/change/index]pubkey)#checksum or tr([...]xonly)
+            parsed = self._parse_descriptor_path(desc, desc_to_path)
             source_address = str(utxo_data.get("address", ""))
+            script_type: str | None = None
+            if parsed is not None:
+                mixdepth, change, index, script_type = parsed
+                path_info: tuple[int, int, int] | None = (mixdepth, change, index)
+            else:
+                path_info = None
             if path_info is None and source_address:
                 source_address_lower = source_address.lower()
                 path_info = self.address_cache.get(source_address_lower) or self._find_address_path(
                     source_address_lower
                 )
+                if path_info is not None:
+                    script_type = self._address_script_type.get(source_address_lower)
 
             if path_info is None:
                 logger.warning(f"Could not parse path from descriptor: {desc}")
                 continue
 
             mixdepth, change, index = path_info
+            if script_type is None:
+                script_type = self.address_type
 
             # Calculate confirmations
             confirmations = 0
@@ -829,16 +874,19 @@ class WalletSyncMixin:
             if utxo_height > 0:
                 confirmations = tip_height - utxo_height + 1
 
-            # Generate the address and cache it
+            # Generate the address (of the resolved script type) and cache it
             address = (
-                source_address if source_address else self.get_address(mixdepth, change, index)
+                source_address
+                if source_address
+                else self.get_address(mixdepth, change, index, script_type)
             )
+            self._address_script_type.setdefault(address, script_type)
 
             # Track that this address has had UTXOs
             self._record_history_address(address)
 
-            # Build path string
-            path = f"{self.root_path}/{mixdepth}'/{change}/{index}"
+            # Build path string under the resolved type's purpose root
+            path = f"{self._root_path_for_type[script_type]}/{mixdepth}'/{change}/{index}"
 
             utxo_info = _make_utxo_info(
                 txid=utxo_data["txid"],
@@ -937,7 +985,9 @@ class WalletSyncMixin:
 
         # Check if already set up (unless explicitly disabled)
         if check_existing:
-            expected_count = self.mixdepth_count * 2  # external + internal per mixdepth
+            # external + internal per mixdepth, doubled for dual-type
+            # (P2WPKH + P2TR) descriptor families.
+            expected_count = self.mixdepth_count * 2 * 2
             if fidelity_bond_addresses:
                 expected_count += len(fidelity_bond_addresses)
 
@@ -994,7 +1044,9 @@ class WalletSyncMixin:
         if not isinstance(self.backend, DescriptorWalletBackend):
             return False
 
-        expected_count = self.mixdepth_count * 2  # external + internal per mixdepth
+        # external + internal per mixdepth, doubled for dual-type
+        # (P2WPKH + P2TR) descriptor families.
+        expected_count = self.mixdepth_count * 2 * 2
         if fidelity_bond_count > 0:
             expected_count += fidelity_bond_count
 
@@ -1075,29 +1127,32 @@ class WalletSyncMixin:
         descriptors = []
 
         for mixdepth in range(self.mixdepth_count):
-            xpub = self.get_account_xpub(mixdepth)
+            for script_type in ("p2wpkh", "p2tr"):
+                fn = self._descfn_for_type[script_type]
+                xpub = self.get_account_xpub(mixdepth, script_type)
 
-            # External (receive) addresses: .../0/*
-            descriptors.append(
-                {
-                    "desc": f"wpkh({xpub}/0/*)",
-                    "range": [0, scan_range - 1],
-                    "internal": False,
-                }
-            )
+                # External (receive) addresses: .../0/*
+                descriptors.append(
+                    {
+                        "desc": f"{fn}({xpub}/0/*)",
+                        "range": [0, scan_range - 1],
+                        "internal": False,
+                    }
+                )
 
-            # Internal (change) addresses: .../1/*
-            descriptors.append(
-                {
-                    "desc": f"wpkh({xpub}/1/*)",
-                    "range": [0, scan_range - 1],
-                    "internal": True,
-                }
-            )
+                # Internal (change) addresses: .../1/*
+                descriptors.append(
+                    {
+                        "desc": f"{fn}({xpub}/1/*)",
+                        "range": [0, scan_range - 1],
+                        "internal": True,
+                    }
+                )
 
         logger.debug(
             f"Generated {len(descriptors)} import descriptors for "
-            f"{self.mixdepth_count} mixdepths with range [0, {scan_range - 1}]"
+            f"{self.mixdepth_count} mixdepths (both script families) "
+            f"with range [0, {scan_range - 1}]"
         )
         return descriptors
 
@@ -1622,7 +1677,10 @@ class WalletSyncMixin:
 
         # Only populate if we haven't already cached enough addresses
         current_cache_size = len(self.address_cache)
-        expected_size = self.mixdepth_count * 2 * max_index  # mixdepths * branches * indices
+        # mixdepths * branches * indices * script-type families (P2WPKH + P2TR);
+        # a dual-type wallet derives both so secondary-type CoinJoin outputs are
+        # matched during listunspent sync.
+        expected_size = self.mixdepth_count * 2 * max_index * 2
 
         # If cache already has enough entries, skip
         if current_cache_size >= expected_size * 0.9:  # 90% threshold
@@ -1642,9 +1700,10 @@ class WalletSyncMixin:
         for mixdepth in range(self.mixdepth_count):
             for change in [0, 1]:
                 for index in range(max_index):
-                    # get_address automatically caches
-                    self.get_address(mixdepth, change, index)
-                    count += 1
+                    # get_address automatically caches both script families.
+                    for script_type in ("p2wpkh", "p2tr"):
+                        self.get_address(mixdepth, change, index, script_type)
+                        count += 1
 
                     # Log progress every 5 seconds for large caches
                     current_time = time.time()
@@ -1714,13 +1773,15 @@ class WalletSyncMixin:
             max_scan = int(getattr(self, "_current_descriptor_range", DEFAULT_SCAN_RANGE))
 
         # Try to find by deriving addresses (expensive but necessary)
-        # We must scan up to the descriptor range to find all addresses
+        # We must scan up to the descriptor range to find all addresses, in
+        # both script families (a dual-type wallet may own either).
         for mixdepth in range(self.mixdepth_count):
             for change in [0, 1]:
                 for index in range(max_scan):
-                    derived_addr = self.get_address(mixdepth, change, index)
-                    if derived_addr == address:
-                        return (mixdepth, change, index)
+                    for script_type in ("p2wpkh", "p2tr"):
+                        derived_addr = self.get_address(mixdepth, change, index, script_type)
+                        if derived_addr == address:
+                            return (mixdepth, change, index)
 
         return None
 
@@ -1752,13 +1813,14 @@ class WalletSyncMixin:
         for mixdepth in range(self.mixdepth_count):
             for change in [0, 1]:
                 for index in range(current_range, extended_max):
-                    derived_addr = self.get_address(mixdepth, change, index)
-                    if derived_addr == address:
-                        logger.info(
-                            f"Found address at extended index {index} "
-                            f"(beyond current range {current_range})"
-                        )
-                        return (mixdepth, change, index)
+                    for script_type in ("p2wpkh", "p2tr"):
+                        derived_addr = self.get_address(mixdepth, change, index, script_type)
+                        if derived_addr == address:
+                            logger.info(
+                                f"Found address at extended index {index} "
+                                f"(beyond current range {current_range})"
+                            )
+                            return (mixdepth, change, index)
 
         return None
 
@@ -1796,23 +1858,25 @@ class WalletSyncMixin:
     def _parse_descriptor_path(
         self,
         desc: str,
-        desc_to_path: dict[str, tuple[int, int]],
-    ) -> tuple[int, int, int] | None:
+        desc_to_path: dict[str, tuple[int, int, str]],
+    ) -> tuple[int, int, int, str] | None:
         """
-        Parse a descriptor to extract mixdepth, change, and index.
+        Parse a descriptor to extract mixdepth, change, index and script type.
 
         When using xpub descriptors, Bitcoin Core returns a descriptor showing
         the path RELATIVE to the xpub we provided:
-        wpkh([fingerprint/change/index]pubkey)#checksum
+        wpkh([fingerprint/change/index]pubkey)#checksum (or tr(...) for P2TR).
 
-        We need to match this back to the original descriptor to determine mixdepth.
+        We need to match this back to the original descriptor to determine
+        mixdepth and the script family.
 
         Args:
             desc: Descriptor string from scantxoutset result
-            desc_to_path: Mapping of descriptor (without checksum) to (mixdepth, change)
+            desc_to_path: Mapping of descriptor (without checksum) to
+                (mixdepth, change, script_type)
 
         Returns:
-            Tuple of (mixdepth, change, index) or None if parsing fails
+            Tuple of (mixdepth, change, index, script_type) or None if parsing fails
         """
         # Remove checksum
         if "#" in desc:
@@ -1820,28 +1884,38 @@ class WalletSyncMixin:
         else:
             desc_base = desc
 
-        # Extract the relative path [fingerprint/change/index] and pubkey
-        # Pattern: wpkh([fingerprint/change/index]pubkey)
-        match = re.search(r"wpkh\(\[[\da-f]+/(\d+)/(\d+)\]([\da-f]+)\)", desc_base, re.I)
+        # Extract the relative path [fingerprint/change/index] and pubkey for
+        # either descriptor family.
+        match = re.search(
+            r"(wpkh|tr)\(\[[\da-f]+/(\d+)/(\d+)\]([\da-f]+)\)",
+            desc_base,
+            re.I,
+        )
         if not match:
             return None
 
-        change_from_desc = int(match.group(1))
-        index = int(match.group(2))
-        pubkey = match.group(3)
+        fn = match.group(1).lower()
+        change_from_desc = int(match.group(2))
+        index = int(match.group(3))
+        pubkey = match.group(4)
+        desc_script_type = "p2tr" if fn == "tr" else "p2wpkh"
 
         # Find which descriptor this matches by checking all our descriptors
         # We need to derive the key and check if it matches the pubkey
-        for base_desc, (mixdepth, change) in desc_to_path.items():
-            if change == change_from_desc:
+        for base_desc, (mixdepth, change, script_type) in desc_to_path.items():
+            if change == change_from_desc and script_type == desc_script_type:
                 # Verify by deriving the key and comparing pubkeys
                 try:
-                    derived_key = self.master_key.derive(
-                        f"{self.root_path}/{mixdepth}'/{change}/{index}"
-                    )
-                    derived_pubkey = derived_key.get_public_key_bytes(compressed=True).hex()
+                    root = self._root_path_for_type[script_type]
+                    derived_key = self.master_key.derive(f"{root}/{mixdepth}'/{change}/{index}")
+                    if script_type == "p2tr":
+                        # tr() descriptors expose the BIP86 tweaked output key as
+                        # an x-only (32-byte) pubkey.
+                        derived_pubkey = derived_key.get_p2tr_output_xonly().hex()
+                    else:
+                        derived_pubkey = derived_key.get_public_key_bytes(compressed=True).hex()
                     if derived_pubkey == pubkey:
-                        return (mixdepth, change, index)
+                        return (mixdepth, change, index, script_type)
                 except Exception:
                     continue
 

@@ -66,9 +66,16 @@ MAKER5_ADDR="bcrt1qed048vcfagng5k3s257rzx2dr4ckga0fhr5edt"
 
 # Taker address (derived from: burden notable love...)
 TAKER_ADDR="bcrt1q84l5vscg3pvjn6se8jp4ruymtyh393ed5v2d9e"
-
 # Maker-Neutrino address (derived from: ice index boss...)
 MAKER_NEUTRINO_ADDR="bcrt1q6mse43hzgfdqh7fyg05lmd4x2ufhlunn3gw5j3"
+
+# Taproot makers (BIP86, p2tr). Receive address m/86'/1'/0'/0/0.
+# Maker-TR1: "glow wonder zone gospel coin hover dutch knock pause divorce among curtain"
+MAKER_TR1_ADDR="bcrt1p838vnck5qgls4g9c2g85889y97rahxpkw32qukaer089d6q8kzss2u6e97"
+# Maker-TR2: "social spice frost fade ocean fringe disorder amused tortoise fame ghost summer"
+MAKER_TR2_ADDR="bcrt1p6ksedclwjqrp5duqpj3ruhg3j5gu8elj3fkly8cesvk698ffklqsx7ea5r"
+# Taproot taker: same mnemonic as TAKER, p2tr (BIP86) receive m/86'/1'/0'/0/0.
+TAKER_TR_ADDR="bcrt1psldw7rs3gy4jv25nzjdvemez8zah6mcuxtpesr7lr0s028macnvsqpg9n7"
 
 # Fidelity bond P2WSH address for Maker1
 # Path: m/84'/1'/0'/2/0 with locktime 4099766400 (Dec 1, 2099)
@@ -84,6 +91,20 @@ echo "  Maker4: $MAKER4_ADDR"
 echo "  Maker5: $MAKER5_ADDR"
 echo "  Maker-Neutrino: $MAKER_NEUTRINO_ADDR"
 echo "  Taker:  $TAKER_ADDR"
+echo "  Maker-TR1: $MAKER_TR1_ADDR"
+echo "  Maker-TR2: $MAKER_TR2_ADDR"
+echo "  Taker-TR:  $TAKER_TR_ADDR"
+
+# Create the fidelity-bond funder wallet up front and mine ONE high-subsidy
+# coinbase to it now. At this low block height the regtest subsidy is the full
+# 50 BTC. Funding the bond from a coinbase mined at the END of this script is
+# unreliable: the regtest subsidy halves every 150 blocks, so after mining to
+# all recipients the subsidy collapses far below the 1 BTC bond amount.
+# Parameters: wallet_name, disable_private_keys, blank, passphrase, avoid_reuse, descriptors, load_on_startup
+$CLI createwallet "fidelity_funder" false false "" false true true || true
+MINER_ADDR=$($CLI -rpcwallet=fidelity_funder getnewaddress "" "bech32")
+$CLI generatetoaddress 1 "$MINER_ADDR"
+echo "Mined 1 high-subsidy block to fidelity funder wallet"
 
 # Mine blocks to each address to fund them
 # Each block gives 50 BTC on regtest
@@ -108,28 +129,24 @@ echo "Mined $BLOCKS_TO_MINE blocks to Taker"
 $CLI generatetoaddress $BLOCKS_TO_MINE "$MAKER_NEUTRINO_ADDR"
 echo "Mined $BLOCKS_TO_MINE blocks to Maker-Neutrino"
 
-# Mine some extra blocks for coinbase maturity
-# After this, all wallets should have spendable funds
-$CLI generatetoaddress 10 "$MAKER1_ADDR"
+$CLI generatetoaddress $BLOCKS_TO_MINE "$MAKER_TR1_ADDR"
+echo "Mined $BLOCKS_TO_MINE blocks to Maker-TR1"
 
-# Create a wallet in Bitcoin Core to fund the fidelity bond address
-# We need to create a transaction from the mined funds
-echo "Creating fidelity bond transaction..."
+$CLI generatetoaddress $BLOCKS_TO_MINE "$MAKER_TR2_ADDR"
+echo "Mined $BLOCKS_TO_MINE blocks to Maker-TR2"
 
-# Create a temporary descriptor wallet in Bitcoin Core for sending
-# Parameters: wallet_name, disable_private_keys, blank, passphrase, avoid_reuse, descriptors, load_on_startup
-$CLI createwallet "fidelity_funder" false false "" false true true || true
+$CLI generatetoaddress $BLOCKS_TO_MINE "$TAKER_TR_ADDR"
+echo "Mined $BLOCKS_TO_MINE blocks to Taker-TR"
 
-# Get mining reward address to use as source
-MINER_ADDR=$($CLI -rpcwallet=fidelity_funder getnewaddress "" "bech32")
-
-# Mine blocks to the funder wallet - need 101+ to have spendable coinbase
-# First block gives us 50 BTC, but need 100 confirmations to spend
-echo "Mining blocks to funder wallet..."
-$CLI generatetoaddress 1 "$MINER_ADDR"
-
-# Mine 100 more blocks to mature the first coinbase (any address works)
+# Mine extra blocks for coinbase maturity (the last recipients need ~100
+# confirmations before their coinbase outputs become spendable). This also
+# matures the fidelity funder coinbase mined at the start.
 $CLI generatetoaddress 100 "$MAKER1_ADDR"
+
+# Fund the fidelity bond address from the funder wallet. The funder's coinbase
+# was mined at the start of this script (full 50 BTC subsidy) and is now deeply
+# matured, so it has ample spendable balance regardless of the current subsidy.
+echo "Creating fidelity bond transaction..."
 
 # Verify we have spendable funds
 BALANCE=$($CLI -rpcwallet=fidelity_funder getbalance)

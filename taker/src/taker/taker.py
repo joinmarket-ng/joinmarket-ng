@@ -24,6 +24,7 @@ from jmcore.btc_script import derive_bond_address
 from jmcore.commitment_blacklist import set_blacklist_path
 from jmcore.crypto import NickIdentity
 from jmcore.encryption import CryptoSession
+from jmcore.models import offer_output_script_type, offer_types_for_family
 from jmcore.notifications import get_notifier
 from jmcore.paths import read_nick_state
 from jmcore.protocol import FEATURE_NEUTRINO_COMPAT, JM_VERSION
@@ -149,6 +150,7 @@ class Taker(TakerMonitoringMixin):
             bondless_require_zero_fee=config.bondless_makers_allowance_require_zero_fee,
             data_dir=config.data_dir,
             own_wallet_nicks=own_wallet_nicks,
+            allowed_types=offer_types_for_family(config.preferred_offer_type),
         )
 
         # PoDLE manager for commitment tracking
@@ -456,7 +458,12 @@ class Taker(TakerMonitoringMixin):
                 # This matches the reference implementation behavior where all JM-generated
                 # addresses (CJ outputs and change) use the internal branch
                 dest_index = self.wallet.get_next_address_index(dest_mixdepth, 1)
-                destination = self.wallet.get_change_address(dest_mixdepth, dest_index)
+                # The taker's own equal-amount output must use the uniform
+                # equal-output script type all participants share (JMP-0005).
+                cj_script_type = offer_output_script_type(self.config.preferred_offer_type)
+                destination = self.wallet.get_change_address(
+                    dest_mixdepth, dest_index, script_type=cj_script_type
+                )
                 logger.info(f"Using internal address: {destination}")
             else:
                 # Warn when the user-supplied destination does not match the

@@ -163,6 +163,12 @@
 # Number of mixing depths (1-10)
 # mixdepth_count = 5
 
+# Wallet output script type:
+#   "p2wpkh" = native segwit (BIP84), the default
+#   "p2tr"   = taproot (BIP86), required for taproot (tr0) CoinJoins (JMP-0005)
+# Determines the format of deposit and change addresses.
+# address_type = "p2wpkh"
+
 # BIP44 gap limit: consecutive empty trailing addresses kept beyond the highest
 # used one (minimum: 6, Electrum convention: 20). Also the buffer used when the
 # descriptor range auto-expands. Distinct from ``scan_range`` below.
@@ -305,8 +311,12 @@
 # Simply changing cj_fee_absolute will NOT switch to absolute fees - you must set offer_type.
 #
 # Offer type options:
-#   "sw0reloffer" - relative fee (uses cj_fee_relative) [DEFAULT]
-#   "sw0absoffer" - absolute fee (uses cj_fee_absolute)
+#   "sw0reloffer" - native segwit, relative fee (uses cj_fee_relative) [DEFAULT]
+#   "sw0absoffer" - native segwit, absolute fee (uses cj_fee_absolute)
+#   "tr0reloffer" - taproot (BIP86), relative fee (see JMP-0005)
+#   "tr0absoffer" - taproot (BIP86), absolute fee (see JMP-0005)
+# Taproot (tr0) offers automatically use a taproot (p2tr) wallet for the
+# maker's CoinJoin and change outputs, regardless of [wallet] address_type.
 #
 # Example: To use absolute fees, set BOTH:
 #   offer_type = "sw0absoffer"
@@ -388,6 +398,14 @@
 # ============================================================================
 
 [taker]
+# Preferred CoinJoin output type, selects which makers to match:
+#   "sw0reloffer"/"sw0absoffer" - native segwit makers [DEFAULT]
+#   "tr0reloffer"/"tr0absoffer" - taproot (BIP86) makers (see JMP-0005)
+# The taker accepts both the absolute and relative variants of the chosen
+# output script family. Spending taproot inputs (e.g. received Silent Payments)
+# works with any CoinJoin type; this only controls the equal-amount output type.
+# preferred_offer_type = "sw0reloffer"
+
 # Number of counterparty makers to use (1-20).
 # When unset, a random value in [8, 10] is drawn for every CoinJoin (matches
 # the upstream JoinMarket sendpayment default and avoids fingerprinting via a

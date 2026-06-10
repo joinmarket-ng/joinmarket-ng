@@ -872,7 +872,7 @@ class DirectoryClient:
 
         # Offer type prefixes for lightweight detection during listening.
         # Full parsing happens after collection -- this is just for counting.
-        offer_prefixes = ("sw0absoffer", "sw0reloffer", "swabsoffer", "swreloffer")
+        offer_prefixes = tuple(t.value for t in OfferType)
 
         messages: list[dict[str, Any]] = []
         offer_count = 0
@@ -1313,7 +1313,8 @@ class DirectoryClient:
         """
         Parse an offer from a message's content part.
 
-        Handles all offer types (sw0reloffer, sw0absoffer, swreloffer, swabsoffer),
+        Handles all offer types (sw0reloffer, sw0absoffer, swreloffer, swabsoffer,
+        tr0reloffer, tr0absoffer),
         optional fidelity bond proof, and the deprecated !neutrino flag.
 
         Args:
@@ -1327,7 +1328,7 @@ class DirectoryClient:
             bond_data is the parsed fidelity bond dict or None.
             neutrino_compat is True if the deprecated !neutrino flag was present.
         """
-        offer_types = ["sw0absoffer", "sw0reloffer", "swabsoffer", "swreloffer"]
+        offer_types = [t.value for t in OfferType]
         for offer_type in offer_types:
             if not rest.startswith(offer_type):
                 continue
@@ -1378,7 +1379,7 @@ class DirectoryClient:
                 txfee = int(offer_parts[4])
                 cjfee_str = offer_parts[5]
 
-                if offer_type in ["sw0absoffer", "swabsoffer"]:
+                if offer_type in ["sw0absoffer", "swabsoffer", "tr0absoffer"]:
                     cjfee = str(int(cjfee_str))
                 else:
                     # Use fixed-point format to avoid scientific notation

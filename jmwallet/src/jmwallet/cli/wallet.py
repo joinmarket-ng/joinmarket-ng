@@ -1075,6 +1075,192 @@ def validate(
         raise typer.Exit(1)
 
 
+@app.command("silent-payment-address")
+def silent_payment_address(
+    mnemonic_file: Annotated[
+        Path | None,
+        typer.Option("--mnemonic-file", "-f", help="Path to mnemonic file", envvar="MNEMONIC_FILE"),
+    ] = None,
+    prompt_bip39_passphrase: Annotated[
+        bool,
+        typer.Option("--prompt-bip39-passphrase", help="Prompt for BIP39 passphrase interactively"),
+    ] = False,
+    network: Annotated[str | None, typer.Option("--network", "-n", help="Bitcoin network")] = None,
+    label: Annotated[
+        int | None,
+        typer.Option(
+            "--label",
+            help="Optional BIP352 label integer (>=1) for a labeled address. m=0 is reserved.",
+        ),
+    ] = None,
+    data_dir: Annotated[
+        Path | None,
+        typer.Option("--data-dir", envvar="JOINMARKET_DATA_DIR", help="Data directory"),
+    ] = None,
+    log_level: Annotated[str | None, typer.Option("--log-level", "-l", help="Log level")] = None,
+) -> None:
+    """Display this wallet's BIP352 silent payment address.
+
+    Publish this static address to receive payments (e.g. anonymous donations
+    to a maker) without revealing on-chain links to your other funds. Each
+    payment lands at a unique, unlinkable taproot output.
+
+    PRIVACY: Silent payment outputs are treated like mixdepth-0 deposits. Do not
+    co-spend them with fidelity bonds or other deposits; mix them first (for
+    example with a sweep tumble). See docs/technical/silent-payments.md.
+    """
+    from jmwallet.wallet.bip32 import HDKey, mnemonic_to_seed
+    from jmwallet.wallet.silent_payments import SilentPaymentWallet
+
+    settings = setup_cli(log_level, data_dir=data_dir)
+
+    try:
+        resolved = resolve_mnemonic(
+            settings,
+            mnemonic_file=mnemonic_file,
+            prompt_bip39_passphrase=prompt_bip39_passphrase,
+        )
+        if not resolved:
+            raise ValueError("No mnemonic provided")
+    except (FileNotFoundError, ValueError) as e:
+        logger.error(str(e))
+        raise typer.Exit(1)
+
+    backend = resolve_backend_settings(settings, network=network, data_dir=data_dir)
+    resolved_network = backend.network
+    seed = mnemonic_to_seed(resolved.mnemonic, resolved.bip39_passphrase)
+    sp_wallet = SilentPaymentWallet(HDKey.from_seed(seed), network=resolved_network)
+
+    try:
+        address = sp_wallet.get_address(label)
+    except ValueError as e:
+        logger.error(str(e))
+        raise typer.Exit(1)
+
+    if label is not None:
+        print(f"Silent payment address (label {label}):")
+    else:
+        print("Silent payment address:")
+    print(address)
+
+
+@app.command("scan-silent-payments")
+def scan_silent_payments_cmd(
+    start_height: Annotated[
+        int, typer.Option("--start-height", help="First block height to scan (inclusive)")
+    ],
+    end_height: Annotated[
+        int | None,
+        typer.Option("--end-height", help="Last block height to scan (default: chain tip)"),
+    ] = None,
+    labels: Annotated[
+        str | None,
+        typer.Option("--labels", help="Comma-separated label integers to also scan for"),
+    ] = None,
+    mnemonic_file: Annotated[
+        Path | None,
+        typer.Option("--mnemonic-file", "-f", help="Path to mnemonic file", envvar="MNEMONIC_FILE"),
+    ] = None,
+    prompt_bip39_passphrase: Annotated[
+        bool,
+        typer.Option("--prompt-bip39-passphrase", help="Prompt for BIP39 passphrase interactively"),
+    ] = False,
+    network: Annotated[str | None, typer.Option("--network", "-n", help="Bitcoin network")] = None,
+    rpc_url: Annotated[str | None, typer.Option("--rpc-url", envvar="BITCOIN_RPC_URL")] = None,
+    data_dir: Annotated[
+        Path | None,
+        typer.Option("--data-dir", envvar="JOINMARKET_DATA_DIR", help="Data directory"),
+    ] = None,
+    log_level: Annotated[str | None, typer.Option("--log-level", "-l", help="Log level")] = None,
+) -> None:
+    """Scan a block range for incoming BIP352 silent payments.
+
+    Requires the descriptor_wallet (Bitcoin Core) backend, which serves full
+    blocks with prevout data. Detected outputs are printed with the txid:vout,
+    value, and the unique taproot address they landed on.
+
+    PRIVACY: detected outputs are mixdepth-0-style deposits; mix them (e.g. a
+    sweep tumble) before co-spending. See docs/technical/silent-payments.md.
+    """
+    settings = setup_cli(log_level, data_dir=data_dir)
+
+    try:
+        resolved = resolve_mnemonic(
+            settings,
+            mnemonic_file=mnemonic_file,
+            prompt_bip39_passphrase=prompt_bip39_passphrase,
+        )
+        if not resolved:
+            raise ValueError("No mnemonic provided")
+    except (FileNotFoundError, ValueError) as e:
+        logger.error(str(e))
+        raise typer.Exit(1)
+
+    backend_settings = resolve_backend_settings(
+        settings, network=network, rpc_url=rpc_url, data_dir=data_dir
+    )
+    label_list = [int(x) for x in labels.split(",")] if labels else []
+
+    asyncio.run(
+        _run_silent_payment_scan(
+            resolved.mnemonic,
+            backend_settings,
+            resolved.bip39_passphrase,
+            start_height,
+            end_height,
+            label_list,
+        )
+    )
+
+
+async def _run_silent_payment_scan(
+    mnemonic: str,
+    backend_settings: ResolvedBackendSettings,
+    bip39_passphrase: str,
+    start_height: int,
+    end_height: int | None,
+    labels: list[int],
+) -> None:
+    from jmwallet.backends.descriptor_wallet import (
+        DescriptorWalletBackend,
+        generate_wallet_name,
+        get_mnemonic_fingerprint,
+    )
+    from jmwallet.wallet.service import WalletService
+
+    if backend_settings.backend_type != "descriptor_wallet":
+        logger.error(
+            "scan-silent-payments requires the descriptor_wallet backend "
+            f"(configured: {backend_settings.backend_type}). Light clients cannot "
+            "serve full blocks with prevout data needed for BIP352 scanning."
+        )
+        raise typer.Exit(2)
+
+    network = backend_settings.network
+    fingerprint = get_mnemonic_fingerprint(mnemonic, bip39_passphrase or "")
+    backend = DescriptorWalletBackend(
+        rpc_url=backend_settings.rpc_url,
+        rpc_user=backend_settings.rpc_user,
+        rpc_password=backend_settings.rpc_password,
+        wallet_name=generate_wallet_name(fingerprint, network),
+    )
+    wallet = WalletService(
+        mnemonic=mnemonic,
+        backend=backend,
+        network=network,
+        passphrase=bip39_passphrase,
+        data_dir=backend_settings.data_dir,
+    )
+
+    received = await wallet.scan_silent_payments(start_height, end_height, labels)
+    if not received:
+        print("No silent payments found in the scanned range.")
+        return
+    print(f"Found {len(received)} silent payment output(s):")
+    for r in received:
+        print(f"  {r.txid}:{r.vout}  {r.value} sats  {r.address}")
+
+
 @app.command()
 def showseed(
     mnemonic_file: Annotated[

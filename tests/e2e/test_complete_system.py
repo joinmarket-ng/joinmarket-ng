@@ -18,7 +18,7 @@ import subprocess
 
 import pytest
 import pytest_asyncio
-from jmcore.models import NetworkType
+from jmcore.models import NetworkType, OfferType
 from jmwallet.backends.descriptor_wallet import DescriptorWalletBackend
 from jmwallet.wallet.service import WalletService
 from maker.bot import MakerBot
@@ -268,6 +268,33 @@ def taker_config():
     )
 
 
+@pytest.fixture
+def taproot_taker_config():
+    """Taker configuration that prefers taproot (tr0) offers.
+
+    preferred_offer_type=tr0reloffer makes the taker select the taproot maker
+    offers and build p2tr CoinJoin outputs, exercising BIP341 signing end to
+    end against the Docker taproot makers (jm-maker-tr1/jm-maker-tr2).
+    """
+    return TakerConfig(
+        mnemonic=TAKER_MNEMONIC,
+        network=NetworkType.TESTNET,
+        bitcoin_network=NetworkType.REGTEST,
+        backend_type="descriptor_wallet",
+        backend_config={
+            "rpc_url": "http://127.0.0.1:18443",
+            "rpc_user": "test",
+            "rpc_password": "test",
+        },
+        directory_servers=["127.0.0.1:5222"],
+        counterparty_count=2,
+        minimum_makers=2,
+        maker_timeout_sec=30,
+        order_wait_time=10.0,
+        preferred_offer_type=OfferType.TR0_RELATIVE,
+    )
+
+
 @pytest_asyncio.fixture
 async def mined_chain(bitcoin_backend):
     """Ensure blockchain has minimum height."""
@@ -406,8 +433,16 @@ async def test_maker_bot_connect_directory(
     start_task = asyncio.create_task(bot.start())
 
     try:
-        # Wait for connection to establish (wallet sync takes ~2s, connection ~0.5s)
-        await asyncio.sleep(10)
+        # Poll for the connection to establish instead of sleeping a fixed amount.
+        # First-time descriptor wallet setup triggers a full rescan whose duration
+        # scales with block height, so late in the e2e suite a fixed wait is too
+        # short. Polling stays fast in the common case but tolerates slow rescans;
+        # it still fails if the bot genuinely never connects.
+        deadline = asyncio.get_event_loop().time() + 60
+        while asyncio.get_event_loop().time() < deadline:
+            if bot.directory_clients and bot.running:
+                break
+            await asyncio.sleep(0.5)
 
         # Check that bot connected
         assert len(bot.directory_clients) > 0, (
@@ -957,6 +992,97 @@ async def test_complete_coinjoin_two_makers(
     finally:
         # Cleanup
         print("Stopping taker...")
+        await taker.stop()
+        await taker_wallet.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.slow
+async def test_complete_coinjoin_taproot(
+    bitcoin_backend,
+    taproot_taker_config,
+    directory_server,
+):
+    """End-to-end taproot (tr0) CoinJoin with Docker taproot makers.
+
+    Mirrors test_complete_coinjoin_two_makers but drives the taproot path: the
+    taker prefers tr0 offers and uses a p2tr (BIP86) wallet, and the makers
+    (jm-maker-tr1/jm-maker-tr2) advertise tr0reloffer. This exercises BIP341
+    key-path signing on both sides against real Bitcoin Core consensus.
+
+    Requires: docker compose --profile e2e up -d
+    """
+    from tests.e2e.rpc_utils import mine_blocks
+
+    _require_docker_container("maker-tr1")
+    _require_docker_container("maker-tr2")
+
+    await mine_blocks(10, MINING_ADDRESS)
+
+    # Taproot taker wallet (BIP86): its CoinJoin output + change are bech32m,
+    # matching the taproot makers' outputs so all equal outputs share a type.
+    taker_wallet = WalletService(
+        mnemonic=TAKER_MNEMONIC,
+        backend=bitcoin_backend,
+        network="regtest",
+        mixdepth_count=5,
+        address_type="p2tr",
+    )
+
+    await taker_wallet.sync_all()
+    taker_balance = await taker_wallet.get_total_balance()
+    print(f"Taproot taker balance: {taker_balance:,} sats")
+
+    min_balance = 100_000_000  # 1 BTC minimum
+    assert taker_balance >= min_balance, (
+        f"Taproot taker needs at least {min_balance:,} sats; got {taker_balance:,}. "
+        "Ensure wallet-funder funded the p2tr taker address."
+    )
+
+    taker = Taker(taker_wallet, bitcoin_backend, taproot_taker_config)
+
+    try:
+        await taker.start()
+
+        offers = await taker.directory_client.fetch_orderbook(
+            max_wait=15.0, min_wait=15.0, quiet_period=0.0
+        )
+        tr0_offers = [
+            o
+            for o in offers
+            if o.ordertype in (OfferType.TR0_RELATIVE, OfferType.TR0_ABSOLUTE)
+        ]
+        print(f"Found {len(offers)} offers, {len(tr0_offers)} taproot")
+        assert len(tr0_offers) >= 2, (
+            f"Need at least 2 taproot offers, found {len(tr0_offers)}. "
+            "Ensure jm-maker-tr1/jm-maker-tr2 are running and funded."
+        )
+
+        taker.orderbook_manager.update_offers(offers)
+
+        dest_address = taker_wallet.get_receive_address(1, 0)
+        assert dest_address.startswith("bcrt1p"), dest_address
+
+        cj_amount = 50_000_000  # 0.5 BTC
+        print(
+            f"Initiating taproot CoinJoin for {cj_amount:,} sats to {dest_address}..."
+        )
+
+        txid = await taker.do_coinjoin(
+            amount=cj_amount,
+            destination=dest_address,
+            mixdepth=0,
+        )
+
+        assert txid is not None, "Taproot CoinJoin should return a txid"
+        print(f"Taproot CoinJoin successful! txid: {txid}")
+
+        # Confirm and verify the transaction landed on-chain.
+        await mine_blocks(1, MINING_ADDRESS)
+        tx_info = await bitcoin_backend.get_transaction(txid)
+        assert tx_info is not None
+    finally:
+        print("Stopping taproot taker...")
         await taker.stop()
         await taker_wallet.close()
 

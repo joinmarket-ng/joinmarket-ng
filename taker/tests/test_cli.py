@@ -74,11 +74,13 @@ class TestBuildTakerConfig:
         settings.taker.taker_utxo_age = 5
         settings.taker.taker_utxo_retries = 3
         settings.taker.taker_utxo_amtpercent = 20
+        settings.taker.preferred_offer_type = "sw0reloffer"
 
         # Wallet config
         settings.wallet.mixdepth_count = 5
         settings.wallet.gap_limit = 6
         settings.wallet.scan_range = 1000
+        settings.wallet.address_type = "p2wpkh"
         settings.wallet.dust_threshold = 546
         settings.wallet.smart_scan = True
         settings.wallet.background_full_rescan = False
@@ -111,6 +113,42 @@ class TestBuildTakerConfig:
 
         assert config.fee_rate == 5.0
         assert config.fee_block_target is None
+
+    def test_default_preferred_offer_type_is_segwit(
+        self, sample_mnemonic: str, mock_settings: MagicMock
+    ) -> None:
+        """Default preferred_offer_type maps to native segwit and a p2wpkh wallet."""
+        from jmcore.models import OfferType
+
+        config = build_taker_config(
+            settings=mock_settings,
+            mnemonic=sample_mnemonic,
+            passphrase="",
+            destination="bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+            amount=100000,
+            mixdepth=0,
+        )
+        assert config.preferred_offer_type == OfferType.SW0_RELATIVE
+        assert config.address_type == "p2wpkh"
+
+    def test_taproot_preferred_offer_type_round_trip(
+        self, sample_mnemonic: str, mock_settings: MagicMock
+    ) -> None:
+        """A taproot wallet and tr0 preference round-trip from settings to config."""
+        from jmcore.models import OfferType
+
+        mock_settings.taker.preferred_offer_type = "tr0reloffer"
+        mock_settings.wallet.address_type = "p2tr"
+        config = build_taker_config(
+            settings=mock_settings,
+            mnemonic=sample_mnemonic,
+            passphrase="",
+            destination="bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+            amount=100000,
+            mixdepth=0,
+        )
+        assert config.preferred_offer_type == OfferType.TR0_RELATIVE
+        assert config.address_type == "p2tr"
 
     def test_block_target_default_when_no_fee_rate(
         self, sample_mnemonic: str, mock_settings: MagicMock

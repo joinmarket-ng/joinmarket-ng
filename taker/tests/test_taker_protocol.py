@@ -49,6 +49,9 @@ def mock_wallet():
     wallet.get_change_address = Mock(return_value="bcrt1qchange")
     wallet.get_key_for_address = Mock()
     wallet.select_utxos = Mock(return_value=[make_utxo(txid_char="a", address="bcrt1qtest1")])
+    # Synchronous methods: keep them off AsyncMock so they do not leak
+    # unawaited coroutines when called without await in production code.
+    wallet.reserve_coinjoin_inputs = Mock(return_value=True)
     wallet.close = AsyncMock()
     wallet.wallet_fingerprint = "deadbeef"
     return wallet
@@ -65,6 +68,7 @@ def mock_backend():
     backend.broadcast_transaction = AsyncMock(return_value="txid123")
     # can_provide_neutrino_metadata is a synchronous method, not async
     backend.can_provide_neutrino_metadata = Mock(return_value=True)
+    backend.can_estimate_fee = Mock(return_value=True)
     return backend
 
 
@@ -685,6 +689,7 @@ class TestSweepCjAmountPreservation:
         wallet.get_change_address = Mock(return_value="bcrt1qchange")
         wallet.get_key_for_address = Mock()
         wallet.select_utxos = Mock(return_value=sweep_utxos)
+        wallet.reserve_coinjoin_inputs = Mock(return_value=True)
         wallet.close = AsyncMock()
         return wallet
 
@@ -709,6 +714,7 @@ class TestSweepCjAmountPreservation:
         backend.broadcast_transaction = AsyncMock(return_value="txid123")
         backend.can_provide_neutrino_metadata = Mock(return_value=False)
         backend.requires_neutrino_metadata = Mock(return_value=False)
+        backend.can_estimate_fee = Mock(return_value=True)
         return backend
 
     @pytest.fixture
@@ -1787,6 +1793,76 @@ async def test_phase_fill_does_not_promote_silent_makers_without_blacklist_hit(
     # No explicit blacklist hit -> blacklist_error stays False, no promotion.
     assert result.blacklist_error is False
     assert result.blacklist_makers == []
+
+
+@pytest.mark.asyncio
+async def test_phase_fill_signals_uniform_cj_script_type(
+    mock_wallet, mock_backend, mock_config, tmp_path
+):
+    """The !fill message must carry the taker's requested equal-output type.
+
+    Per JMP-0005 the taker picks a uniform equal-output script type and
+    signals it to every maker via a cjtype=<type> token so dual-type makers
+    derive their CoinJoin output of that type.
+    """
+    from jmcore.models import OfferType, offer_output_script_type
+
+    mock_config.data_dir = tmp_path
+    mock_config.preferred_offer_type = OfferType.TR0_RELATIVE
+    taker = Taker(mock_wallet, mock_backend, mock_config)
+    mock_backend.requires_neutrino_metadata = Mock(return_value=False)
+
+    def _offer(nick: str) -> Offer:
+        return Offer(
+            counterparty=nick,
+            oid=0,
+            ordertype=OfferType.TR0_RELATIVE.value,
+            minsize=10_000,
+            maxsize=100_000_000,
+            txfee=500,
+            cjfee="0.001",
+        )
+
+    taker._session.maker_sessions = {
+        "J5Maker1": MakerSession(nick="J5Maker1", offer=_offer("J5Maker1")),
+    }
+    taker._session.cj_amount = 100_000
+    taker._session.podle_commitment = Mock()
+    taker._session.podle_commitment.to_commitment_str = Mock(return_value="bb" * 32)
+
+    taker.directory_client = AsyncMock()
+    taker.directory_client.prefer_direct_connections = False
+    taker.directory_client._pending_connect_tasks = {}
+    taker.directory_client._active_nicks = {}
+    _dir = Mock()
+    _dir._active_peers = {}
+    taker.directory_client.clients = {"dir1": _dir}
+    taker.directory_client.get_peer_location = Mock(return_value=None)
+    taker.directory_client.get_connected_peer = Mock(return_value=None)
+    taker.directory_client.get_pending_connect_task = Mock(return_value=None)
+    taker.directory_client.try_direct_connect = Mock(return_value=None)
+    taker.directory_client.bind_session = Mock(
+        side_effect=lambda nick: ChannelBinding(
+            nick=nick, channel_id="directory:dir1", peer_location=None
+        )
+    )
+
+    sent_fills: dict[str, str] = {}
+
+    async def _send_privmsg(nick, command, data, log_routing=False, force_channel=None):
+        if command == "fill":
+            sent_fills[nick] = data
+        return force_channel
+
+    taker.directory_client.send_privmsg = AsyncMock(side_effect=_send_privmsg)
+    taker.directory_client.wait_for_responses = AsyncMock(return_value={})
+    taker.config.minimum_makers = 1
+
+    await taker._session._phase_fill()
+
+    expected = offer_output_script_type(OfferType.TR0_RELATIVE)
+    assert "J5Maker1" in sent_fills
+    assert f"cjtype={expected}" in sent_fills["J5Maker1"]
 
 
 @pytest.mark.asyncio

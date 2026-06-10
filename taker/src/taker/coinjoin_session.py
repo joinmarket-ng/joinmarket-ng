@@ -21,8 +21,15 @@ import asyncio
 import time
 from typing import TYPE_CHECKING, Any
 
-from jmcore.bitcoin import get_txid, parse_transaction
+from jmcore.bitcoin import (
+    address_to_scriptpubkey,
+    estimate_vsize,
+    get_address_type,
+    get_txid,
+    parse_transaction,
+)
 from jmcore.encryption import CryptoSession
+from jmcore.models import offer_output_script_type
 from jmcore.protocol import FEATURE_NEUTRINO_COMPAT, parse_utxo_list
 from jmwallet.history import (
     HistoryWriteError,
@@ -33,6 +40,7 @@ from jmwallet.wallet.signing import (
     TransactionSigningError,
     create_p2wpkh_script_code,
     deserialize_transaction,
+    verify_p2tr_signature,
     verify_p2wpkh_signature,
 )
 from jmwallet.wallet.spend import enforce_fee_rate_cap
@@ -347,9 +355,15 @@ class CoinJoinSession:
                 )
 
         # Send !fill to all makers using their designated channels
-        # Format: fill <oid> <amount> <taker_pubkey> <commitment>
+        # Format: fill <oid> <amount> <taker_pubkey> <commitment> [cjtype=<type>]
+        # The optional cjtype token signals the uniform equal-output script type
+        # the taker requested (JMP-0005); legacy makers ignore it.
+        cj_script_type = offer_output_script_type(self.config.preferred_offer_type)
         for nick, session in self.maker_sessions.items():
-            fill_data = f"{session.offer.oid} {self.cj_amount} {taker_pubkey} {commitment_hex}"
+            fill_data = (
+                f"{session.offer.oid} {self.cj_amount} {taker_pubkey} "
+                f"{commitment_hex} cjtype={cj_script_type}"
+            )
             channel = await self.directory_client.send_privmsg(
                 nick, "fill", fill_data, log_routing=True, force_channel=session.comm_channel
             )
@@ -686,6 +700,7 @@ class CoinJoinSession:
                         vout = utxo_meta.vout
 
                         # Verify UTXO and get value/address
+                        scriptpubkey = ""
                         try:
                             if (
                                 self.backend.requires_neutrino_metadata()
@@ -701,6 +716,7 @@ class CoinJoinSession:
                                 if result.valid:
                                     value = result.value
                                     address = ""  # Not available from verification
+                                    scriptpubkey = utxo_meta.scriptpubkey or ""
                                     logger.debug(
                                         f"Neutrino-verified UTXO {txid}:{vout} = {value} sats"
                                     )
@@ -717,6 +733,7 @@ class CoinJoinSession:
                                 if utxo_info:
                                     value = utxo_info.value
                                     address = utxo_info.address
+                                    scriptpubkey = utxo_info.scriptpubkey or ""
                                 else:
                                     # Fallback: get raw transaction and parse it
                                     tx_info = await self.backend.get_transaction(txid)
@@ -724,6 +741,7 @@ class CoinJoinSession:
                                         parsed_tx = parse_transaction(tx_info.raw)
                                         if parsed_tx and len(parsed_tx.outputs) > vout:
                                             value = parsed_tx.outputs[vout].value
+                                            scriptpubkey = parsed_tx.outputs[vout].scriptpubkey
                                             try:
                                                 address = parsed_tx.outputs[vout].address(
                                                     self.config.network
@@ -751,6 +769,7 @@ class CoinJoinSession:
                                 "vout": vout,
                                 "value": value,
                                 "address": address,
+                                "scriptpubkey": scriptpubkey,
                             }
                         )
                         logger.debug(f"Added UTXO from {nick}: {txid}:{vout} = {value} sats")
@@ -759,6 +778,24 @@ class CoinJoinSession:
                         logger.warning(
                             f"Dropping maker {nick}: one or more UTXOs failed "
                             "Neutrino verification (likely already spent)"
+                        )
+                        failed_makers.append(nick)
+                        del self.maker_sessions[nick]
+                        continue
+
+                    # Enforce the uniform equal-output script type (JMP-0005):
+                    # every maker's CoinJoin output must match the type the
+                    # taker requested, otherwise the equal outputs are not
+                    # indistinguishable. Change type is unrestricted.
+                    expected_cj_type = offer_output_script_type(self.config.preferred_offer_type)
+                    try:
+                        maker_cj_type = get_address_type(cj_addr)
+                    except ValueError:
+                        maker_cj_type = ""
+                    if maker_cj_type != expected_cj_type:
+                        logger.warning(
+                            f"Dropping maker {nick}: cj_addr type {maker_cj_type!r} "
+                            f"does not match requested {expected_cj_type!r}"
                         )
                         failed_makers.append(nick)
                         del self.maker_sessions[nick]
@@ -831,8 +868,18 @@ class CoinJoinSession:
                 # Normal mode: include taker change
                 num_outputs = 1 + len(self.maker_sessions) + 1 + len(self.maker_sessions)
 
-            # Calculate actual tx fee based on real transaction size
-            actual_tx_fee = self._estimate_tx_fee(num_inputs, num_outputs)
+            # Calculate actual tx fee based on real transaction size. Classify
+            # the real input/output script types so a taproot CoinJoin that
+            # mixes in a legacy P2WPKH/P2WSH bond input is not under-estimated.
+            est_input_types, est_output_types = self._build_script_type_lists(
+                self.preselected_utxos, num_outputs
+            )
+            actual_tx_fee = self._estimate_tx_fee(
+                num_inputs,
+                num_outputs,
+                input_types=est_input_types,
+                output_types=est_output_types,
+            )
 
             preselected_total = sum(u.value for u in self.preselected_utxos)
 
@@ -1040,8 +1087,78 @@ class CoinJoinSession:
             logger.error(f"Failed to build transaction: {e}")
             return False
 
+    @staticmethod
+    def _classify_scriptpubkey(scriptpubkey: str, default: str) -> str:
+        """Map a hex scriptPubKey to a coarse script type for vsize estimation.
+
+        Falls back to ``default`` (the CoinJoin's output family) for unknown or
+        missing scripts so the estimate stays sensible.
+        """
+        spk = (scriptpubkey or "").lower()
+        if spk.startswith("0014") and len(spk) == 44:
+            return "p2wpkh"
+        if spk.startswith("5120") and len(spk) == 68:
+            return "p2tr"
+        if spk.startswith("0020") and len(spk) == 68:
+            return "p2wsh"
+        if spk.startswith("76a914") and len(spk) == 50:
+            return "p2pkh"
+        if spk.startswith("a914") and len(spk) == 46:
+            return "p2sh"
+        return default
+
+    def _build_script_type_lists(
+        self, selected_utxos: list[Any], num_outputs: int
+    ) -> tuple[list[str], list[str]]:
+        """Derive per-input and per-output script types for fee estimation.
+
+        Inputs are classified from their real scriptPubKeys (taker selected
+        UTXOs and each maker's UTXOs), so a taproot CoinJoin that mixes in a
+        legacy P2WPKH/P2WSH input is sized correctly instead of being
+        under-estimated. Equal CoinJoin outputs use the uniform output family;
+        change outputs are classified from their destination addresses.
+        """
+        cj_type = offer_output_script_type(self.config.preferred_offer_type)
+
+        input_types: list[str] = []
+        for u in selected_utxos:
+            spk = getattr(u, "scriptpubkey", "") or ""
+            input_type = self._classify_scriptpubkey(spk, cj_type)
+            input_types.append(input_type)
+        for session in self.maker_sessions.values():
+            for utxo in session.utxos:
+                input_types.append(
+                    self._classify_scriptpubkey(utxo.get("scriptpubkey", "") or "", cj_type)
+                )
+
+        # Equal CoinJoin outputs (taker + makers) all use the uniform cj type.
+        output_types: list[str] = [cj_type] * (1 + len(self.maker_sessions))
+        # Change outputs: classify from their addresses when available.
+        change_addrs: list[str] = []
+        if not self.is_sweep and self.taker_change_address:
+            change_addrs.append(self.taker_change_address)
+        for session in self.maker_sessions.values():
+            if session.change_address:
+                change_addrs.append(session.change_address)
+        for addr in change_addrs:
+            try:
+                output_types.append(get_address_type(addr))
+            except ValueError:
+                output_types.append(cj_type)
+
+        # Guard against any count drift: never return mismatched lengths.
+        if len(output_types) != num_outputs:
+            output_types = [cj_type] * num_outputs
+        return input_types, output_types
+
     def _estimate_tx_fee(
-        self, num_inputs: int, num_outputs: int, *, use_base_rate: bool = False
+        self,
+        num_inputs: int,
+        num_outputs: int,
+        *,
+        use_base_rate: bool = False,
+        input_types: list[str] | None = None,
+        output_types: list[str] | None = None,
     ) -> int:
         """Estimate transaction fee.
 
@@ -1056,14 +1173,28 @@ class CoinJoinSession:
             use_base_rate: If True, use the base fee rate instead of the
                           session's randomized rate. Used for sweep cj_amount
                           calculations where determinism is required.
+            input_types: Optional per-input script types. When the CoinJoin
+                mixes script types (for example a taproot CoinJoin that spends
+                a legacy P2WPKH or P2WSH bond input), passing the real types
+                avoids under-estimating vsize and therefore under-paying fees.
+                Defaults to a uniform list of the CoinJoin's output family.
+            output_types: Optional per-output script types. Defaults to a
+                uniform list of the CoinJoin's output family.
 
         Returns:
             Estimated fee in satoshis
         """
         import math
 
-        # P2WPKH: ~68 vbytes per input, 31 vbytes per output, ~11 overhead
-        vsize = num_inputs * 68 + num_outputs * 31 + 11
+        # Approximate the transaction's script type from the CoinJoin's output
+        # family: taproot (tr0) CoinJoins have larger inputs spent as Schnorr
+        # key-path (~57.5 vbytes) and larger P2TR outputs (43 vbytes) than
+        # native segwit (68 / 31). Using the matching constants keeps the fee
+        # estimate accurate for both families.
+        script_type = offer_output_script_type(self.config.preferred_offer_type)
+        in_types = input_types if input_types is not None else [script_type] * num_inputs
+        out_types = output_types if output_types is not None else [script_type] * num_outputs
+        vsize = estimate_vsize(in_types, out_types)
 
         # Use base rate for deterministic calculations (sweeps),
         # otherwise use the session's randomized rate for privacy
@@ -1337,6 +1468,16 @@ class CoinJoinSession:
             txid_hex = tx_input.txid_le[::-1].hex()
             input_map[idx] = (txid_hex, tx_input.vout)
 
+        # Assemble the full prevout set (values + scriptPubKeys) for taproot
+        # signature verification. Falls back to empty lists if any prevout is
+        # unknown; taproot verification then simply fails for those inputs.
+        prevout_map = self._build_prevout_map()
+        try:
+            all_prevout_values, all_prevout_scripts = self._assemble_prevouts(tx, prevout_map)
+        except TransactionSigningError as exc:
+            logger.debug(f"Could not assemble full prevout set: {exc}")
+            all_prevout_values, all_prevout_scripts = [], []
+
         # Process responses
         for nick in list(self.maker_sessions.keys()):
             if nick in responses:
@@ -1395,6 +1536,7 @@ class CoinJoinSession:
 
                         # Try to verify against each of maker's inputs
                         matched_input_idx = None
+                        matched_is_taproot = False
 
                         for idx in maker_input_indices:
                             if idx in matched_indices:
@@ -1404,19 +1546,39 @@ class CoinJoinSession:
                             utxo = maker_utxo_map[(txid, vout)]
                             value = utxo["value"]
 
-                            # Create scriptCode for verification
-                            script_code = create_p2wpkh_script_code(pubkey)
+                            is_taproot_input = bool(all_prevout_scripts) and all_prevout_scripts[
+                                idx
+                            ].startswith(b"\x51\x20")
 
-                            if verify_p2wpkh_signature(
-                                tx, idx, script_code, value, signature, pubkey
-                            ):
-                                matched_input_idx = idx
-                                break
+                            if is_taproot_input:
+                                # Schnorr key-path: pubkey carries the 32-byte
+                                # x-only output key; sighash needs all prevouts.
+                                if verify_p2tr_signature(
+                                    tx,
+                                    idx,
+                                    all_prevout_values,
+                                    all_prevout_scripts,
+                                    signature,
+                                    pubkey,
+                                ):
+                                    matched_input_idx = idx
+                                    matched_is_taproot = True
+                                    break
+                            else:
+                                script_code = create_p2wpkh_script_code(pubkey)
+                                if verify_p2wpkh_signature(
+                                    tx, idx, script_code, value, signature, pubkey
+                                ):
+                                    matched_input_idx = idx
+                                    break
 
                         if matched_input_idx is not None:
                             matched_indices.add(matched_input_idx)
                             txid, vout = input_map[matched_input_idx]
-                            witness = [signature.hex(), pubkey.hex()]
+                            if matched_is_taproot:
+                                witness = [signature.hex()]
+                            else:
+                                witness = [signature.hex(), pubkey.hex()]
 
                             sig_infos.append({"txid": txid, "vout": vout, "witness": witness})
                             logger.debug(
@@ -1488,6 +1650,48 @@ class CoinJoinSession:
         logger.info(f"Signed tx: {len(self.final_tx)} bytes")
         return True
 
+    def _build_prevout_map(self) -> dict[tuple[str, int], tuple[int, bytes]]:
+        """Map every CoinJoin input outpoint to its (value, scriptPubKey).
+
+        Taproot (BIP341) sighashes commit to the amounts and scriptPubKeys of
+        ALL inputs, so signing or verifying any taproot input requires the full
+        prevout set. The taker already knows its own UTXOs and every maker UTXO
+        (from the !ioauth phase), so the map is assembled locally without extra
+        chain lookups. Maker entries fall back to deriving the scriptPubKey from
+        the resolved address when an explicit scriptpubkey was not provided.
+        """
+        prevouts: dict[tuple[str, int], tuple[int, bytes]] = {}
+        for utxo in self.selected_utxos:
+            prevouts[(utxo.txid, utxo.vout)] = (utxo.value, bytes.fromhex(utxo.scriptpubkey))
+        for session in self.maker_sessions.values():
+            for u in session.utxos:
+                spk_hex = u.get("scriptpubkey") or ""
+                if spk_hex:
+                    spk = bytes.fromhex(spk_hex)
+                elif u.get("address"):
+                    spk = address_to_scriptpubkey(u["address"])
+                else:
+                    continue
+                prevouts[(u["txid"], u["vout"])] = (u["value"], spk)
+        return prevouts
+
+    def _assemble_prevouts(
+        self, tx: Any, prevout_map: dict[tuple[str, int], tuple[int, bytes]]
+    ) -> tuple[list[int], list[bytes]]:
+        """Return ordered (values, scriptPubKeys) for every input of ``tx``."""
+        values: list[int] = []
+        scripts: list[bytes] = []
+        for tx_input in tx.inputs:
+            txid_hex = tx_input.txid_le[::-1].hex()
+            entry = prevout_map.get((txid_hex, tx_input.vout))
+            if entry is None:
+                raise TransactionSigningError(
+                    f"Missing prevout for {txid_hex}:{tx_input.vout} (required for taproot sighash)"
+                )
+            values.append(entry[0])
+            scripts.append(entry[1])
+        return values, scripts
+
     async def _sign_our_inputs(self) -> list[dict[str, Any]]:
         """
         Sign taker's inputs in the transaction.
@@ -1518,6 +1722,15 @@ class CoinJoinSession:
                 txid_hex = tx_input.txid_le[::-1].hex()
                 input_index_map[(txid_hex, tx_input.vout)] = idx
 
+            # Assemble the full prevout set only if any of our inputs is taproot.
+            need_prevouts = any(u.is_p2tr for u in self.selected_utxos)
+            prevout_values: list[int] = []
+            prevout_scripts: list[bytes] = []
+            if need_prevouts:
+                prevout_values, prevout_scripts = self._assemble_prevouts(
+                    tx, self._build_prevout_map()
+                )
+
             # Sign each of our UTXOs
             for utxo in self.selected_utxos:
                 # Find the input index in the transaction
@@ -1536,8 +1749,15 @@ class CoinJoinSession:
                     )
 
                 # Delegate key access and signing to the wallet so private keys
-                # never leave the wallet (issue #518).
-                signed = self.wallet.sign_input(tx, input_index, utxo)
+                # never leave the wallet (issue #518). Taproot inputs need the
+                # full prevout set for the BIP341 sighash.
+                signed = self.wallet.sign_input(
+                    tx,
+                    input_index,
+                    utxo,
+                    prevout_values=prevout_values if need_prevouts else None,
+                    prevout_scripts=prevout_scripts if need_prevouts else None,
+                )
 
                 signatures_info.append(
                     {

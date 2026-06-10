@@ -228,30 +228,30 @@ def calculate_tx_fee(
     num_maker_inputs: int,
     num_outputs: int,
     fee_rate: float,
+    script_type: str = "p2wpkh",
 ) -> int:
     """
     Calculate transaction fee based on estimated vsize.
 
-    SegWit P2WPKH inputs: ~68 vbytes each
-    P2WPKH outputs: 31 vbytes each
-    Overhead: ~11 vbytes
+    Native segwit (p2wpkh) inputs are ~68 vbytes and outputs 31 vbytes;
+    taproot (p2tr) key-path inputs are ~57.5 vbytes and outputs 43 vbytes.
 
     Args:
         fee_rate: Fee rate in sat/vB (can be fractional, e.g. 0.5)
+        script_type: Dominant script type ("p2wpkh" or "p2tr") used to size
+            inputs and outputs.
 
     Returns:
         Fee in satoshis (rounded up to ensure minimum relay fee)
     """
-    # Estimate virtual size
-    input_vsize = (num_taker_inputs + num_maker_inputs) * 68
-    output_vsize = num_outputs * 31
-    overhead = 11
-
-    vsize = input_vsize + output_vsize + overhead
-
-    # Round up to ensure we pay at least the minimum
     import math
 
+    from jmcore.bitcoin import estimate_vsize
+
+    num_inputs = num_taker_inputs + num_maker_inputs
+    vsize = estimate_vsize([script_type] * num_inputs, [script_type] * num_outputs)
+
+    # Round up to ensure we pay at least the minimum
     return math.ceil(vsize * fee_rate)
 
 
@@ -288,16 +288,16 @@ def build_coinjoin_tx(
     """
     builder = CoinJoinTxBuilder(network)
 
-    # Build taker inputs
-    taker_inputs = [
-        TxInput.from_hex(
+    def _make_input(u: dict[str, Any]) -> TxInput:
+        return TxInput.from_hex(
             txid=u["txid"],
             vout=u["vout"],
             value=u["value"],
             scriptpubkey=u.get("scriptpubkey", ""),
         )
-        for u in taker_utxos
-    ]
+
+    # Build taker inputs
+    taker_inputs = [_make_input(u) for u in taker_utxos]
 
     # Calculate taker's fees paid to makers
     total_maker_fee = sum(m["cjfee"] for m in maker_data.values())
@@ -330,15 +330,7 @@ def build_coinjoin_tx(
 
     for nick, data in maker_data.items():
         # Maker inputs
-        maker_inputs[nick] = [
-            TxInput.from_hex(
-                txid=u["txid"],
-                vout=u["vout"],
-                value=u["value"],
-                scriptpubkey=u.get("scriptpubkey", ""),
-            )
-            for u in data["utxos"]
-        ]
+        maker_inputs[nick] = [_make_input(u) for u in data["utxos"]]
 
         # Maker CJ output (cj_amount)
         maker_cj_outputs[nick] = TxOutput.from_address(data["cj_addr"], cj_amount)

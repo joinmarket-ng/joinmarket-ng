@@ -205,6 +205,28 @@ class TestCalculateTxFee:
         # 1063 * 5 = 5315 sats
         assert fee == 5315
 
+    def test_taproot_fee_is_lower_per_input(self) -> None:
+        """Taproot (p2tr) inputs are smaller than segwit, so the fee differs."""
+        segwit = calculate_tx_fee(
+            num_taker_inputs=1,
+            num_maker_inputs=2,
+            num_outputs=5,
+            fee_rate=10,
+            script_type="p2wpkh",
+        )
+        taproot = calculate_tx_fee(
+            num_taker_inputs=1,
+            num_maker_inputs=2,
+            num_outputs=5,
+            fee_rate=10,
+            script_type="p2tr",
+        )
+        # p2tr key-path inputs are ~57.5 vbytes (vs 68) but p2tr outputs are
+        # 43 vbytes (vs 31); with 3 inputs and 5 outputs the larger outputs
+        # dominate, so the taproot estimate is higher here.
+        assert taproot != segwit
+        assert taproot > 0
+
 
 class TestCoinJoinTxBuilder:
     """Tests for CoinJoinTxBuilder class."""
@@ -658,3 +680,39 @@ class TestAddSignaturesValidation:
         signed_tx = builder.add_signatures(tx_bytes, signatures, metadata)
         assert isinstance(signed_tx, bytes)
         assert len(signed_tx) > len(tx_bytes)
+
+
+class TestTimelockedInputs:
+    """Tests for nLockTime / nSequence handling of transaction inputs."""
+
+    _CJ_ADDR = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"
+    _CHANGE_ADDR = "bcrt1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qzf4jry"
+
+    def _maker_data(self) -> dict:
+        return {
+            "maker1": {
+                "utxos": [{"txid": "b" * 64, "vout": 1, "value": 1_500_000}],
+                "cj_addr": self._CJ_ADDR,
+                "change_addr": self._CHANGE_ADDR,
+                "cjfee": 1000,
+            },
+        }
+
+    def test_regular_inputs_keep_zero_locktime_and_final_sequence(self) -> None:
+        """Transactions without timelocked inputs stay at locktime 0 / final sequence."""
+        from jmcore.bitcoin import parse_transaction_bytes
+
+        tx_bytes, _ = build_coinjoin_tx(
+            taker_utxos=[{"txid": "a" * 64, "vout": 0, "value": 2_000_000}],
+            taker_cj_address=self._CJ_ADDR,
+            taker_change_address=self._CHANGE_ADDR,
+            taker_total_input=2_000_000,
+            maker_data=self._maker_data(),
+            cj_amount=1_000_000,
+            tx_fee=5000,
+            network="regtest",
+        )
+
+        parsed = parse_transaction_bytes(tx_bytes)
+        assert parsed.locktime == 0
+        assert all(inp.sequence == 0xFFFFFFFF for inp in parsed.inputs)

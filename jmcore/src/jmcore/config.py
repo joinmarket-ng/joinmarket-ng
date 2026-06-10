@@ -11,7 +11,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field, SecretStr, model_validator
+from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
 
 from jmcore.constants import DUST_THRESHOLD
 from jmcore.models import NetworkType
@@ -237,6 +237,13 @@ class WalletConfig(BaseModel):
         le=10,
         description="Number of mixdepths in the wallet (privacy compartments)",
     )
+    address_type: str = Field(
+        default="p2wpkh",
+        description=(
+            "Wallet output script type: 'p2wpkh' (native segwit, BIP84) or "
+            "'p2tr' (taproot, BIP86). Determines deposit/change address format."
+        ),
+    )
     gap_limit: int = Field(
         default=20,
         ge=6,
@@ -300,6 +307,14 @@ class WalletConfig(BaseModel):
         if self.bitcoin_network is None:
             object.__setattr__(self, "bitcoin_network", self.network)
         return self
+
+    @field_validator("address_type")
+    @classmethod
+    def validate_address_type(cls, v: str) -> str:
+        """Only native segwit and taproot wallets are supported."""
+        if v not in ("p2wpkh", "p2tr"):
+            raise ValueError(f"Unsupported wallet address_type: {v!r} (use 'p2wpkh' or 'p2tr')")
+        return v
 
 
 class DirectoryServerConfig(BaseModel):

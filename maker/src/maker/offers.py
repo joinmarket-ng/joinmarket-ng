@@ -10,7 +10,7 @@ from __future__ import annotations
 import random
 
 from jmcore.constants import DUST_THRESHOLD
-from jmcore.models import Offer, OfferType
+from jmcore.models import Offer, is_absolute_offer_type
 from jmwallet.wallet.service import WalletService
 from loguru import logger
 
@@ -196,7 +196,7 @@ class OfferManager:
             _randomize(offer_cfg.tx_fee_contribution, offer_cfg.txfee_contribution_factor, low=0)
         )
 
-        if offer_cfg.offer_type in (OfferType.SW0_RELATIVE, OfferType.SWA_RELATIVE):
+        if not is_absolute_offer_type(offer_cfg.offer_type):
             cj_fee_float = float(offer_cfg.cj_fee_relative)
             if cj_fee_float <= 0:
                 logger.error(f"Invalid cj_fee_relative: {offer_cfg.cj_fee_relative}. Must be > 0.")
@@ -268,16 +268,14 @@ class OfferManager:
         rel_idx: int | None = None
         abs_idx: int | None = None
         for idx, cfg in enumerate(offer_configs):
-            if cfg.offer_type in (OfferType.SW0_RELATIVE, OfferType.SWA_RELATIVE):
+            if not is_absolute_offer_type(cfg.offer_type):
                 if rel_idx is not None:
                     return empty  # two relative offers -> not a dual rel+abs pair
                 rel_idx = idx
-            elif cfg.offer_type in (OfferType.SW0_ABSOLUTE, OfferType.SWA_ABSOLUTE):
+            else:
                 if abs_idx is not None:
                     return empty  # two absolute offers
                 abs_idx = idx
-            else:  # pragma: no cover - guarded by OfferType enum
-                return empty
 
         if rel_idx is None or abs_idx is None:
             return empty
@@ -410,7 +408,7 @@ class OfferManager:
 
             # Determine base_min_size: for relative offers enforce a
             # profitability floor using the already-randomized fee values.
-            if offer_cfg.offer_type in (OfferType.SW0_RELATIVE, OfferType.SWA_RELATIVE):
+            if not is_absolute_offer_type(offer_cfg.offer_type):
                 min_size_for_profit = (
                     int(1.5 * randomized_txfee / numeric_cjfee) if numeric_cjfee > 0 else 0
                 )

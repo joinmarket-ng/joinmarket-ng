@@ -3341,8 +3341,8 @@ class TestDescriptorRangeUpgrade:
         # Populate for small range
         await wallet._populate_address_cache(10)
 
-        # Should have 5 mixdepths * 2 branches * 10 indices = 100 addresses
-        assert len(wallet.address_cache) == 100
+        # 5 mixdepths * 2 branches * 10 indices * 2 script families (P2WPKH + P2TR)
+        assert len(wallet.address_cache) == 200
 
         # Verify addresses are properly cached
         addr = wallet.get_address(0, 0, 5)
@@ -3503,10 +3503,12 @@ class TestDescriptorRangeUpgrade:
         derivation_count = 0
         original_get_address = wallet.get_address
 
-        def counting_get_address(mixdepth: int, change: int, index: int) -> str:
+        def counting_get_address(
+            mixdepth: int, change: int, index: int, script_type: str | None = None
+        ) -> str:
             nonlocal derivation_count
             derivation_count += 1
-            return original_get_address(mixdepth, change, index)
+            return original_get_address(mixdepth, change, index, script_type)
 
         wallet.get_address = counting_get_address  # type: ignore[method-assign]
 
@@ -3593,9 +3595,9 @@ class TestDescriptorRangeUpgrade:
         assert elapsed < 15.0, f"Sync took too long: {elapsed:.2f}s"
 
         # Log derivation count for debugging
-        # With proper caching, this should be ~= mixdepths * 2 * current_range
-        # NOT mixdepths * 2 * current_range * num_addresses_to_check
-        expected_derivations = 5 * 2 * current_range  # 10,000
+        # With proper caching, this should be ~= mixdepths * 2 * current_range * 2
+        # (two script families, P2WPKH + P2TR), NOT multiplied by num addresses to check
+        expected_derivations = 5 * 2 * current_range * 2  # 20,000
         # Allow some overhead for additional lookups
         assert derivation_count < expected_derivations * 1.5, (
             f"Too many derivations: {derivation_count} (expected ~{expected_derivations})"
@@ -4170,13 +4172,14 @@ class TestSyncAllLazyInit:
             passphrase="",
         )
 
-        # Build the expected descriptors for this wallet
+        # Build the expected descriptors for this wallet (both script families)
         expected_descriptors = []
         for mixdepth in range(2):
-            xpub = wallet.get_account_xpub(mixdepth)
-            for branch in [0, 1]:
-                desc = f"wpkh({xpub}/{branch}/*)"
-                expected_descriptors.append({"desc": f"{desc}#xxxxxxxx"})
+            for script_type, fn in (("p2wpkh", "wpkh"), ("p2tr", "tr")):
+                xpub = wallet.get_account_xpub(mixdepth, script_type)
+                for branch in [0, 1]:
+                    desc = f"{fn}({xpub}/{branch}/*)"
+                    expected_descriptors.append({"desc": f"{desc}#xxxxxxxx"})
 
         backend.is_wallet_setup = AsyncMock(return_value=True)
         backend.list_descriptors = AsyncMock(return_value=expected_descriptors)

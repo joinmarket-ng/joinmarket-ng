@@ -1757,6 +1757,17 @@ class DescriptorWalletBackend(BlockchainBackend):
         """Get block hash for given height."""
         return await self._rpc_call("getblockhash", [block_height], use_wallet=False)
 
+    async def get_block_transactions(self, block_height: int) -> list[dict[str, Any]]:
+        """Return a block's transactions with prevout data (getblock verbosity 3).
+
+        Verbosity 3 attaches each input's ``prevout`` (added in Bitcoin Core
+        25.0), which BIP352 scanning needs to recover input public keys.
+        """
+        block_hash = await self.get_block_hash(block_height)
+        block = await self._rpc_call("getblock", [block_hash, 3], use_wallet=False)
+        txs = block.get("tx", [])
+        return txs if isinstance(txs, list) else []
+
     async def get_utxo(self, txid: str, vout: int) -> UTXO | None:
         """
         Get a specific UTXO.

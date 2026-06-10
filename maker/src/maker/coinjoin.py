@@ -18,7 +18,7 @@ from typing import Any
 
 from jmcore.encryption import CryptoSession
 from jmcore.models import NetworkType, Offer
-from jmcore.podle import parse_podle_revelation, verify_podle
+from jmcore.podle import parse_podle_revelation, verify_podle, verify_podle_binding
 from jmcore.protocol import (
     UTXOMetadata,
     format_utxo_list,
@@ -85,6 +85,10 @@ class CoinJoinSession:
         self.cj_address = ""
         self.change_address = ""
         self.mixdepth = 0
+        # Uniform equal-output script type requested by the taker (JMP-0005).
+        # Defaults to the maker wallet's primary type for legacy takers that
+        # do not signal a type in !fill.
+        self.requested_cj_script_type = wallet.address_type
         self.commitment = b""
         self.taker_nacl_pk = ""  # Taker's NaCl pubkey (hex) for btc_sig
         self.created_at = time.time()
@@ -173,7 +177,11 @@ class CoinJoinSession:
         return True
 
     async def handle_fill(
-        self, amount: int, commitment: str, taker_pk: str
+        self,
+        amount: int,
+        commitment: str,
+        taker_pk: str,
+        cj_script_type: str | None = None,
     ) -> tuple[bool, dict[str, Any]]:
         """
         Handle !fill message from taker.
@@ -182,6 +190,9 @@ class CoinJoinSession:
             amount: CoinJoin amount requested
             commitment: PoDLE commitment (will be verified later in !auth)
             taker_pk: Taker's NaCl public key for E2E encryption
+            cj_script_type: Uniform equal-output script type the taker requested
+                ("p2tr" or "p2wpkh"), per JMP-0005. ``None`` for legacy takers,
+                in which case the maker's primary wallet type is used.
 
         Returns:
             (success, response_data)
@@ -199,6 +210,11 @@ class CoinJoinSession:
 
             if amount > self.offer.maxsize:
                 return False, {"error": f"Amount too large: {amount} > {self.offer.maxsize}"}
+
+            if cj_script_type is not None:
+                if cj_script_type not in ("p2tr", "p2wpkh"):
+                    return False, {"error": f"Unsupported cj script type: {cj_script_type}"}
+                self.requested_cj_script_type = cj_script_type
 
             self.amount = amount
             self.commitment = bytes.fromhex(commitment)
@@ -358,6 +374,9 @@ class CoinJoinSession:
 
                 taker_utxo_value = result.value
                 taker_utxo_confirmations = result.confirmations
+                # verify_utxo_with_metadata confirmed this scriptpubkey matches
+                # the on-chain output, so it is authoritative for binding.
+                verified_scriptpubkey: str | None = taker_scriptpubkey
                 logger.debug(f"Neutrino-verified taker's UTXO: {utxo_txid}:{utxo_vout}")
             else:
                 # Full node: direct UTXO lookup
@@ -368,6 +387,28 @@ class CoinJoinSession:
 
                 taker_utxo_value = taker_utxo.value
                 taker_utxo_confirmations = taker_utxo.confirmations
+                verified_scriptpubkey = taker_utxo.scriptpubkey
+
+            # Bind the PoDLE public key P to the UTXO's scriptPubKey. Without
+            # this a taker could present a valid PoDLE for a key it owns while
+            # referencing a stranger's UTXO. The scriptpubkey used here is the
+            # authoritative on-chain value (full node lookup, or neutrino
+            # metadata already confirmed against the chain).
+            if verified_scriptpubkey:
+                bound, bind_err = verify_podle_binding(parsed_rev["P"], verified_scriptpubkey)
+                if not bound:
+                    logger.warning(
+                        f"PoDLE binding failed for {self.taker_nick}: {bind_err} "
+                        f"(utxo={utxo_txid[:16]}...:{utxo_vout})"
+                    )
+                    return False, {"error": f"PoDLE binding failed: {bind_err}"}
+                logger.debug("PoDLE bound to UTXO scriptpubkey ✓")
+            else:
+                logger.warning(
+                    f"No scriptpubkey available to bind PoDLE for "
+                    f"{utxo_txid[:16]}...:{utxo_vout}; rejecting"
+                )
+                return False, {"error": "Could not verify PoDLE binding to UTXO"}
 
             if taker_utxo_confirmations < self.taker_utxo_age:
                 logger.debug(
@@ -623,7 +664,12 @@ class CoinJoinSession:
 
             cj_output_mixdepth = (max_mixdepth + 1) % self.wallet.mixdepth_count
             cj_index = self.wallet.get_next_address_index(cj_output_mixdepth, 1)
-            cj_address = self.wallet.get_change_address(cj_output_mixdepth, cj_index)
+            # The equal-amount CoinJoin output must use the uniform script type
+            # the taker requested (JMP-0005). Change is unrestricted and uses
+            # the wallet's primary type.
+            cj_address = self.wallet.get_change_address(
+                cj_output_mixdepth, cj_index, script_type=self.requested_cj_script_type
+            )
 
             change_index = self.wallet.get_next_address_index(max_mixdepth, 1)
             change_address = self.wallet.get_change_address(max_mixdepth, change_index)
@@ -649,12 +695,43 @@ class CoinJoinSession:
             logger.error(f"Failed to select UTXOs: {e}")
             return {}, "", "", -1
 
+    async def _assemble_prevouts(self, tx: Any) -> tuple[list[int], list[bytes]]:
+        """Resolve the value and scriptPubKey of every input in ``tx``.
+
+        BIP341 (Taproot) sighashes commit to the amounts and scriptPubKeys of
+        ALL inputs, so to sign even a single taproot input the maker needs the
+        full prevout set. Our own inputs are taken from ``self.our_utxos``; the
+        rest are looked up on-chain (the inputs are not spent yet, so a UTXO-set
+        lookup still resolves them).
+        """
+        values: list[int] = []
+        scripts: list[bytes] = []
+        for tx_input in tx.inputs:
+            txid_hex = tx_input.txid_le[::-1].hex()
+            key = (txid_hex, tx_input.vout)
+            if key in self.our_utxos:
+                ui = self.our_utxos[key]
+                values.append(ui.value)
+                scripts.append(bytes.fromhex(ui.scriptpubkey))
+                continue
+            utxo = await self.backend.get_utxo(txid_hex, tx_input.vout)
+            if utxo is None or not utxo.scriptpubkey:
+                raise TransactionSigningError(
+                    f"Cannot resolve prevout for {txid_hex}:{tx_input.vout} "
+                    "(required for taproot sighash)"
+                )
+            values.append(utxo.value)
+            scripts.append(bytes.fromhex(utxo.scriptpubkey))
+        return values, scripts
+
     async def _sign_transaction(self, tx_hex: str) -> list[str]:
         """Sign our inputs in the transaction.
 
         Returns list of base64-encoded signatures in JM format.
-        Each signature is: base64(varint(sig_len) + sig + varint(pub_len) + pub)
-        This matches the CScript serialization format.
+        Each signature is: base64(varint(sig_len) + sig + varint(pub_len) + pub).
+        For P2WPKH inputs ``sig`` is DER+sighash and ``pub`` the 33-byte
+        compressed key; for P2TR (tr0) inputs ``sig`` is the 64-byte BIP340
+        Schnorr signature and ``pub`` the 32-byte x-only output key.
         """
         import base64
 
@@ -671,6 +748,14 @@ class CoinJoinSession:
                 # Convert little-endian txid bytes to big-endian hex string (RPC format)
                 txid_hex = tx_input.txid_le[::-1].hex()
                 input_index_map[(txid_hex, tx_input.vout)] = idx
+
+            # Taproot sighashes need the full prevout set; only assemble it when
+            # at least one of our inputs is taproot to avoid needless lookups.
+            need_prevouts = any(ui.is_p2tr for ui in self.our_utxos.values())
+            prevout_values: list[int] = []
+            prevout_scripts: list[bytes] = []
+            if need_prevouts:
+                prevout_values, prevout_scripts = await self._assemble_prevouts(tx)
 
             for (txid, vout), utxo_info in self.our_utxos.items():
                 # Find the input index in the transaction
@@ -689,30 +774,30 @@ class CoinJoinSession:
                     )
 
                 # Delegate key access and signing to the wallet so private keys
-                # never leave the wallet (issue #518).
-                signed = self.wallet.sign_input(tx, input_index, utxo_info)
+                # never leave the wallet (issue #518). For taproot (tr0) inputs
+                # the wallet needs the full prevout set for the BIP341 sighash.
+                signed = self.wallet.sign_input(
+                    tx,
+                    input_index,
+                    utxo_info,
+                    prevout_values=prevout_values if need_prevouts else None,
+                    prevout_scripts=prevout_scripts if need_prevouts else None,
+                )
                 signature = signed.signature
                 pubkey_bytes = signed.pubkey
 
-                logger.debug(
-                    f"Signing UTXO {txid}:{vout} at input_index={input_index}, "
-                    f"value={utxo_info.value}, address={utxo_info.address}, "
-                    f"pubkey={pubkey_bytes.hex()[:16]}..."
+                # Format as CScript: varint(sig_len) + sig + varint(pub_len) + pub.
+                # For P2WPKH ``pubkey_bytes`` is the 33-byte compressed key; for
+                # P2TR it is the 32-byte x-only output key and ``signature`` the
+                # 64-byte Schnorr signature.
+                sigmsg = (
+                    bytes([len(signature)]) + signature + bytes([len(pubkey_bytes)]) + pubkey_bytes
                 )
-
-                # Format as CScript: varint(sig_len) + sig + varint(pub_len) + pub
-                # For lengths < 0x4c (76), varint is just the length byte
-                sig_len = len(signature)
-                pub_len = len(pubkey_bytes)
-
-                # Build the sigmsg in JM format
-                sigmsg = bytes([sig_len]) + signature + bytes([pub_len]) + pubkey_bytes
+                logger.debug(f"Signed input {input_index} for UTXO {txid}:{vout}")
 
                 # Base64 encode for transmission
                 sig_b64 = base64.b64encode(sigmsg).decode("ascii")
                 signatures.append(sig_b64)
-
-                logger.debug(f"Signed input {input_index} for UTXO {txid}:{vout}")
 
             return signatures
 

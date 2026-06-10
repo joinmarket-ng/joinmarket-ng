@@ -10,6 +10,15 @@ HD path: `m/84'/coin_type'/mixdepth'/chain/index` (BIP84 P2WPKH)
 - **Chains**: External (0) for receiving, Internal (1) for change
 - **Index**: Sequential address index
 
+The wallet `address_type` selects the script family for derived addresses:
+
+- `p2wpkh` (default): native segwit, BIP84 purpose `84'`, `wpkh` descriptors.
+- `p2tr`: taproot key-path, BIP86 purpose `86'`, `tr` descriptors. Required
+  for taproot (tr0) CoinJoins; see [Taproot CoinJoin](taproot-coinjoin.md).
+
+With `address_type = "p2tr"` the HD path becomes
+`m/86'/coin_type'/mixdepth'/chain/index` and addresses are bech32m (`bc1p…`).
+
 ### BIP39 Passphrase Support
 
 JoinMarket NG supports the optional BIP39 passphrase ("25th word"):
