@@ -199,19 +199,43 @@ async def test_sync_imports_bond_when_base_has_extra_descriptors(tmp_path: Path)
 
 
 @pytest.mark.asyncio
-async def test_sync_with_registered_bonds_no_bonds(tmp_path: Path) -> None:
-    """With no registered bonds, a plain descriptor sync runs (no import work)."""
+async def test_sync_with_registered_bonds_no_bonds_base_ready(tmp_path: Path) -> None:
+    """With no registered bonds and a ready base wallet, a plain sync runs."""
     ws = _make_wallet(tmp_path)  # No registry written.
 
-    ws.is_descriptor_wallet_ready = AsyncMock()
+    ws.is_descriptor_wallet_ready = AsyncMock(return_value=True)
     ws.setup_descriptor_wallet = AsyncMock()
     ws.import_fidelity_bond_addresses = AsyncMock()
     ws.sync_with_descriptor_wallet = AsyncMock(return_value={0: []})
 
     await ws.sync_with_registered_bonds()
 
-    ws.is_descriptor_wallet_ready.assert_not_awaited()
+    # The base wallet is checked but already set up, so no import work happens.
+    ws.is_descriptor_wallet_ready.assert_awaited_once_with(fidelity_bond_count=0)
     ws.setup_descriptor_wallet.assert_not_awaited()
+    ws.import_fidelity_bond_addresses.assert_not_awaited()
+    ws.sync_with_descriptor_wallet.assert_awaited_once_with(None)
+
+
+@pytest.mark.asyncio
+async def test_sync_with_registered_bonds_no_bonds_first_time_setup(tmp_path: Path) -> None:
+    """With no bonds but an un-set-up base wallet, base setup still runs.
+
+    Regression: the CLI paths rely on this method for first-time descriptor
+    setup. If it only set up the base wallet when bonds were present, a
+    brand-new wallet with no bonds would never import its mixdepth descriptors.
+    """
+    ws = _make_wallet(tmp_path)  # No registry written.
+
+    ws.is_descriptor_wallet_ready = AsyncMock(return_value=False)
+    ws.setup_descriptor_wallet = AsyncMock()
+    ws.import_fidelity_bond_addresses = AsyncMock()
+    ws.sync_with_descriptor_wallet = AsyncMock(return_value={0: []})
+
+    await ws.sync_with_registered_bonds()
+
+    # No bonds, so setup imports just the base descriptors (with a rescan).
+    ws.setup_descriptor_wallet.assert_awaited_once_with(rescan=True, fidelity_bond_addresses=None)
     ws.import_fidelity_bond_addresses.assert_not_awaited()
     ws.sync_with_descriptor_wallet.assert_awaited_once_with(None)
 

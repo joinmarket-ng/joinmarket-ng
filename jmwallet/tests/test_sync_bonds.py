@@ -58,7 +58,7 @@ async def test_sync_bonds_updates_registry_with_funded_utxo() -> None:
 
     wallet = MagicMock()
     wallet.wallet_fingerprint = "deadbeef"
-    wallet.sync_all = AsyncMock()
+    wallet.sync_with_registered_bonds = AsyncMock()
     wallet.close = AsyncMock()
     # UTXO discovered on-chain at the registered bond address.
     wallet.utxo_cache = {
@@ -97,10 +97,11 @@ async def test_sync_bonds_updates_registry_with_funded_utxo() -> None:
     ):
         await _sync_bonds_async(MNEMONIC, _backend_settings())
 
-    # Only the known address was synced (no full discovery scan).
-    wallet.sync_all.assert_awaited_once()
-    synced_addresses = wallet.sync_all.await_args.args[0]
-    assert [a for a, _, _ in synced_addresses] == [BOND_ADDRESS]
+    # The bond-aware sync ran (it imports any missing bond ``addr()``
+    # descriptor with a rescan, so a bond funded after the base wallet was set
+    # up is found; a plain ``sync_all`` would import it without a rescan and
+    # miss the already-confirmed UTXO).
+    wallet.sync_with_registered_bonds.assert_awaited_once()
 
     # Registry was updated with the funded UTXO and persisted.
     bond = registry.get_bond_by_address(BOND_ADDRESS)
@@ -115,7 +116,7 @@ async def test_sync_bonds_updates_registry_with_funded_utxo() -> None:
 async def test_sync_bonds_no_bonds_in_registry_does_not_sync() -> None:
     wallet = MagicMock()
     wallet.wallet_fingerprint = "deadbeef"
-    wallet.sync_all = AsyncMock()
+    wallet.sync_with_registered_bonds = AsyncMock()
     wallet.close = AsyncMock()
     wallet.utxo_cache = {}
 
@@ -137,5 +138,5 @@ async def test_sync_bonds_no_bonds_in_registry_does_not_sync() -> None:
     ):
         await _sync_bonds_async(MNEMONIC, _backend_settings())
 
-    wallet.sync_all.assert_not_awaited()
+    wallet.sync_with_registered_bonds.assert_not_awaited()
     wallet.close.assert_awaited_once()

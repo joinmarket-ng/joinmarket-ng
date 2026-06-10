@@ -168,3 +168,102 @@ async def test_sync_all_reinitialises_if_wallet_descriptors_do_not_match_seed(te
     await wallet.sync_all()
 
     setup_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_sync_all_lazy_setup_rescans_when_fidelity_bonds_supplied(test_mnemonic):
+    """``sync_all`` lazy setup must rescan when fidelity bonds are supplied.
+
+    A bond's timelock address may already be funded when sync runs; importing
+    its ``addr()`` descriptor without a rescan tracks it only from "now", so the
+    already-confirmed bond UTXO would be invisible. The lazy setup must
+    therefore pass ``rescan=True`` whenever bonds are present.
+    """
+    backend = DescriptorWalletBackend(
+        rpc_url="http://127.0.0.1:18443",
+        rpc_user="user",
+        rpc_password="pass",
+        wallet_name="jm_descriptor_wallet_test",
+    )
+    wallet = WalletService(test_mnemonic, backend, network="regtest")
+
+    backend.is_wallet_setup = AsyncMock(return_value=False)  # type: ignore[method-assign]
+    setup_mock = AsyncMock(return_value=True)
+    wallet.setup_descriptor_wallet = setup_mock  # type: ignore[method-assign]
+    wallet._sync_all_with_descriptors = AsyncMock(  # type: ignore[attr-defined,method-assign]
+        return_value={md: [] for md in range(wallet.mixdepth_count)}
+    )
+
+    bonds = [("bcrt1qbond", 1893456000, 120)]
+    await wallet.sync_all(bonds)
+
+    setup_mock.assert_awaited_once_with(
+        fidelity_bond_addresses=bonds, rescan=True, check_existing=False
+    )
+
+
+@pytest.mark.asyncio
+async def test_sync_all_lazy_setup_skips_rescan_without_bonds(test_mnemonic):
+    """``sync_all`` lazy setup must not rescan for a fresh wallet with no bonds.
+
+    A brand-new wallet has no prior history, so the fast ``rescan=False`` setup
+    must be preserved when no fidelity bonds are supplied.
+    """
+    backend = DescriptorWalletBackend(
+        rpc_url="http://127.0.0.1:18443",
+        rpc_user="user",
+        rpc_password="pass",
+        wallet_name="jm_descriptor_wallet_test",
+    )
+    wallet = WalletService(test_mnemonic, backend, network="regtest")
+
+    backend.is_wallet_setup = AsyncMock(return_value=False)  # type: ignore[method-assign]
+    setup_mock = AsyncMock(return_value=True)
+    wallet.setup_descriptor_wallet = setup_mock  # type: ignore[method-assign]
+    wallet._sync_all_with_descriptors = AsyncMock(  # type: ignore[attr-defined,method-assign]
+        return_value={md: [] for md in range(wallet.mixdepth_count)}
+    )
+
+    await wallet.sync_all()
+
+    setup_mock.assert_awaited_once_with(
+        fidelity_bond_addresses=None, rescan=False, check_existing=False
+    )
+
+
+@pytest.mark.asyncio
+async def test_setup_descriptor_wallet_defaults_scan_range_to_wallet_scan_range(
+    test_mnemonic,
+):
+    """``setup_descriptor_wallet`` without an explicit ``scan_range`` must use
+    the configured ``[wallet].scan_range``.
+
+    The bond-aware sync (``sync_with_registered_bonds``) and the CLI rely on
+    this default: they call ``setup_descriptor_wallet(rescan=True)`` without a
+    ``scan_range``, so the descriptor import range must come from the wallet's
+    configured ``scan_range`` (default 1000).
+    """
+    backend = DescriptorWalletBackend(
+        rpc_url="http://127.0.0.1:18443",
+        rpc_user="user",
+        rpc_password="pass",
+        wallet_name="jm_descriptor_wallet_test",
+    )
+    wallet = WalletService(
+        test_mnemonic, backend, network="regtest", mixdepth_count=5, scan_range=1000
+    )
+
+    backend.is_wallet_setup = AsyncMock(return_value=False)  # type: ignore[method-assign]
+    setup_wallet_mock = AsyncMock()
+    backend.setup_wallet = setup_wallet_mock  # type: ignore[method-assign]
+
+    # No explicit scan_range -> defaults to wallet.scan_range (1000).
+    await wallet.setup_descriptor_wallet(rescan=True, check_existing=False)
+
+    setup_wallet_mock.assert_awaited_once()
+    assert setup_wallet_mock.await_args is not None
+    imported_descriptors = setup_wallet_mock.await_args.args[0]
+    # Ranged base descriptors must span [0, scan_range - 1] == [0, 999].
+    ranged = [d for d in imported_descriptors if "range" in d]
+    assert ranged, "expected ranged base descriptors"
+    assert all(d["range"] == [0, 999] for d in ranged)

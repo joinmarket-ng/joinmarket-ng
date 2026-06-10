@@ -45,6 +45,7 @@ def _patch_wallet_sync_noop():
     with (
         patch.object(WalletService, "is_descriptor_wallet_ready", AsyncMock(return_value=True)),
         patch.object(WalletService, "sync_with_descriptor_wallet", AsyncMock(return_value=[])),
+        patch.object(WalletService, "sync_with_registered_bonds", AsyncMock(return_value={})),
     ):
         yield
 
@@ -385,6 +386,7 @@ def test_send_respects_config_block_target():
             )  # Return empty to trigger "No UTXOs available" and exit
             mock_wallet.close = AsyncMock()
             mock_wallet.sync_all = AsyncMock()
+            mock_wallet.sync_with_registered_bonds = AsyncMock(return_value={})
             mock_wallet.is_descriptor_wallet_ready = AsyncMock(return_value=True)
 
             # Patch where it is defined, so the local import gets the mock
@@ -558,6 +560,7 @@ async def test_send_fails_when_change_key_unavailable():
 
         mock_wallet = MagicMock()
         mock_wallet.sync_all = AsyncMock()
+        mock_wallet.sync_with_registered_bonds = AsyncMock(return_value={})
         mock_wallet.is_descriptor_wallet_ready = AsyncMock(return_value=True)
         mock_wallet.sync_with_descriptor_wallet = AsyncMock(return_value=[utxo])
         mock_wallet.get_balance = AsyncMock(return_value=100_000)
@@ -1920,10 +1923,14 @@ def test_rescan_scan_depth_capped_at_core_limit(monkeypatch) -> None:
         assert kwargs["scan_range"] == 1_000_000
 
 
-def test_info_default_scan_range_uses_wallet_scan_range(monkeypatch) -> None:
-    """``setup_descriptor_wallet`` must be called with ``scan_range`` equal
-    to the configured ``[wallet].scan_range`` (default 1000 since the legacy
-    ``gap_limit * 10`` formula was dropped, issue #475).
+def test_info_first_time_setup_uses_bond_aware_sync(monkeypatch) -> None:
+    """``info`` first-time setup must go through the bond-aware sync.
+
+    The bond-aware path imports the base descriptors (and any registered
+    fidelity bonds) with a rescan via ``setup_descriptor_wallet``. It does not
+    pass ``scan_range`` explicitly; ``setup_descriptor_wallet`` defaults it to
+    the configured ``[wallet].scan_range`` (covered by
+    ``test_setup_descriptor_wallet_defaults_scan_range_to_wallet_scan_range``).
     """
     monkeypatch.delenv("JOINMARKET_DATA_DIR", raising=False)
 
@@ -1952,9 +1959,10 @@ def test_info_default_scan_range_uses_wallet_scan_range(monkeypatch) -> None:
         assert result.exit_code == 0, f"info failed: {result.stdout}"
         assert setup_mock.await_count == 1
         assert setup_mock.await_args is not None
-        kwargs = setup_mock.await_args.kwargs
-        # Default [wallet].scan_range is 1000 (no longer derived from gap_limit).
-        assert kwargs["scan_range"] == 1000
+        # First-time setup imports with a rescan; no explicit scan_range (the
+        # configured value is applied as setup_descriptor_wallet's default).
+        assert setup_mock.await_args.kwargs.get("rescan") is True
+        assert "scan_range" not in setup_mock.await_args.kwargs
 
 
 def test_rescan_without_scan_depth_uses_plain_block_rescan(monkeypatch) -> None:
