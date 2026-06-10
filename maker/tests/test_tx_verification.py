@@ -857,5 +857,74 @@ class TestParserLeniencyRegression:
         assert result is None
 
 
+class TestVerifyLocktime:
+    """Defense-in-depth checks on the transaction-wide nLockTime."""
+
+    def _our_utxos(self) -> dict:
+        return {
+            ("abc123", 0): UTXOInfo(
+                txid="abc123",
+                vout=0,
+                value=100_000_000,
+                address="bcrt1qtest1",
+                confirmations=10,
+                scriptpubkey="",
+                path="m/84'/0'/0'/0/0",
+                mixdepth=0,
+            )
+        }
+
+    def _parsed(self, locktime: int) -> dict:
+        return {
+            "inputs": [{"txid": "abc123", "vout": 0}],
+            "outputs": [
+                {"value": 50_000_000, "address": "bcrt1qcj"},
+                {"value": 50_002_000, "address": "bcrt1qchange"},
+            ],
+            "locktime": locktime,
+        }
+
+    def _verify(self, locktime: int):
+        with patch(
+            "maker.tx_verification.parse_transaction",
+            return_value=self._parsed(locktime),
+        ):
+            return verify_unsigned_transaction(
+                tx_hex="dummy",
+                our_utxos=self._our_utxos(),
+                cj_address="bcrt1qcj",
+                change_address="bcrt1qchange",
+                amount=50_000_000,
+                cjfee=3000,
+                txfee=1000,
+                offer_type=OfferType.SW0_ABSOLUTE,
+            )
+
+    def test_zero_locktime_passes(self) -> None:
+        is_valid, error = self._verify(0)
+        assert is_valid, error
+
+    def test_past_time_locktime_passes(self) -> None:
+        import time
+
+        # An already-unlocked fidelity-bond spend: locktime well in the past.
+        is_valid, error = self._verify(int(time.time()) - 86_400)
+        assert is_valid, error
+
+    def test_future_time_locktime_rejected(self) -> None:
+        import time
+
+        is_valid, error = self._verify(int(time.time()) + 30 * 86_400)
+        assert not is_valid
+        assert "future" in error
+
+    def test_block_height_locktime_rejected(self) -> None:
+        # Below LOCKTIME_THRESHOLD => interpreted as a block height, never used
+        # by CoinJoins, so it must be rejected.
+        is_valid, error = self._verify(800_000)
+        assert not is_valid
+        assert "block-height" in error
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
