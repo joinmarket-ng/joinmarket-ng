@@ -1209,6 +1209,41 @@ launch_suite() {
     log_info "Launched $suite_name (PID ${SUITE_PIDS[$suite_name]})"
 }
 
+# Map a suite name to its runner function. Echoes the function name on stdout,
+# or returns non-zero for an unknown suite.
+runner_for_suite() {
+    case "$1" in
+        unit)                  echo run_suite_unit ;;
+        e2e)                   echo run_suite_e2e ;;
+        playwright)            echo run_suite_playwright ;;
+        jmwallet)              echo run_suite_jmwallet ;;
+        reference-interop)     echo run_suite_reference_interop ;;
+        reference-legacy)      echo run_suite_reference_legacy ;;
+        neutrino-functional)   echo run_suite_neutrino_functional ;;
+        neutrino-coinjoin)     echo run_suite_neutrino_coinjoin ;;
+        neutrino-reference)    echo run_suite_neutrino_reference ;;
+        reference-maker)       echo run_suite_reference_maker ;;
+        tumbler)               echo run_suite_tumbler ;;
+        *)                     return 1 ;;
+    esac
+}
+
+# Default suite launch order (all suites). Unit first (no Docker), then the
+# Docker-backed suites.
+ALL_SUITES=(
+    unit
+    e2e
+    jmwallet
+    reference-interop
+    reference-legacy
+    neutrino-functional
+    neutrino-coinjoin
+    neutrino-reference
+    reference-maker
+    tumbler
+    playwright
+)
+
 # Block until the number of still-running suite PIDs falls below MAX_CONCURRENT.
 # Reaped suites have their results recorded so the final summary stays accurate
 # regardless of completion order.
@@ -1323,9 +1358,16 @@ print_summary() {
 main() {
     GLOBAL_START_TIME=$(date +%s)
 
+    # Suites to run: the arguments, or all suites when none are given.
+    local suites=("$@")
+    if [ "${#suites[@]}" -eq 0 ]; then
+        suites=("${ALL_SUITES[@]}")
+    fi
+
     log_info "=== JoinMarket Parallel Test Suite ==="
     log_info "Starting at $(date)"
     log_info "Logs directory: ${PARALLEL_DIR}/"
+    log_info "Suites: ${suites[*]}"
     if [ "${MAX_CONCURRENT:-0}" -gt 0 ]; then
         log_info "Concurrency cap: ${MAX_CONCURRENT} suite(s) at a time"
     else
@@ -1348,24 +1390,19 @@ main() {
     # Reference implementation (needed by some suites)
     setup_reference_implementation
 
-    # Phase 1+2: Launch all suites in parallel
+    # Phase 1+2: Launch the selected suites in parallel
     log_info "Launching test suites in parallel..."
     echo
 
-    # Unit tests (no Docker)
-    launch_suite "unit" run_suite_unit
-
-    # Docker test suites (each with isolated compose project)
-    launch_suite "e2e" run_suite_e2e
-    launch_suite "jmwallet" run_suite_jmwallet
-    launch_suite "reference-interop" run_suite_reference_interop
-    launch_suite "reference-legacy" run_suite_reference_legacy
-    launch_suite "neutrino-functional" run_suite_neutrino_functional
-    launch_suite "neutrino-coinjoin" run_suite_neutrino_coinjoin
-    launch_suite "neutrino-reference" run_suite_neutrino_reference
-    launch_suite "reference-maker" run_suite_reference_maker
-    launch_suite "tumbler" run_suite_tumbler
-    launch_suite "playwright" run_suite_playwright
+    local suite runner
+    for suite in "${suites[@]}"; do
+        runner=$(runner_for_suite "$suite") || {
+            log_error "Unknown suite: $suite"
+            log_info "Available suites: ${!SUITE_SLOT[*]}"
+            exit 1
+        }
+        launch_suite "$suite" "$runner"
+    done
 
     echo
     log_info "All suites launched. Waiting for completion..."
@@ -1455,42 +1492,74 @@ case "${1:-}" in
         exit 0
         ;;
     --suite)
-        suite="${2:-}"
-        if [ -z "$suite" ]; then
-            log_error "Usage: $0 --suite <suite-name>"
+        # Collect one or more suites: --suite NAME may be repeated, and a single
+        # --suite may take a comma-separated list (e.g. --suite e2e,playwright).
+        # Global flags (--no-build, --instance, --max-concurrent, --jobs) are
+        # tolerated anywhere among the --suite arguments.
+        selected_suites=()
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                --suite)
+                    if [ -z "${2:-}" ]; then
+                        log_error "Usage: $0 --suite <name> [--suite <name> ...]"
+                        log_info "Available suites: ${!SUITE_SLOT[*]}"
+                        exit 1
+                    fi
+                    IFS=',' read -r -a _names <<< "$2"
+                    selected_suites+=("${_names[@]}")
+                    shift 2
+                    ;;
+                --suite=*)
+                    IFS=',' read -r -a _names <<< "${1#*=}"
+                    selected_suites+=("${_names[@]}")
+                    shift
+                    ;;
+                --no-build)
+                    SKIP_BUILD=1
+                    shift
+                    ;;
+                --max-concurrent|--jobs|-j)
+                    MAX_CONCURRENT="${2:?Option $1 requires an integer argument}"
+                    shift 2
+                    ;;
+                --max-concurrent=*|--jobs=*)
+                    MAX_CONCURRENT="${1#*=}"
+                    shift
+                    ;;
+                --instance|-i)
+                    INSTANCE="${2:?Option $1 requires an integer instance id}"
+                    apply_instance
+                    shift 2
+                    ;;
+                --instance=*)
+                    INSTANCE="${1#*=}"
+                    apply_instance
+                    shift
+                    ;;
+                *)
+                    log_error "Unexpected argument after --suite: $1"
+                    log_info "Available suites: ${!SUITE_SLOT[*]}"
+                    exit 1
+                    ;;
+            esac
+        done
+
+        if [ "${#selected_suites[@]}" -eq 0 ]; then
+            log_error "Usage: $0 --suite <name> [--suite <name> ...]"
             log_info "Available suites: ${!SUITE_SLOT[*]}"
             exit 1
         fi
-        GLOBAL_START_TIME=$(date +%s)
-        export BITCOIN_RPC_URL="http://127.0.0.1:18443"
-        export BITCOIN_RPC_USER="test"
-        export BITCOIN_RPC_PASSWORD="test"
 
-        # Keep single-suite reruns aligned with the full runner so they do not
-        # accidentally exercise stale Docker images.
-        build_images
-        setup_reference_implementation
-
-        # Map suite name to runner function
-        case "$suite" in
-            unit)                  run_suite_unit ;;
-            e2e)                   run_suite_e2e ;;
-            playwright)            run_suite_playwright ;;
-            jmwallet)              run_suite_jmwallet ;;
-            reference-interop)     run_suite_reference_interop ;;
-            reference-legacy)      run_suite_reference_legacy ;;
-            neutrino-functional)   run_suite_neutrino_functional ;;
-            neutrino-coinjoin)     run_suite_neutrino_coinjoin ;;
-            neutrino-reference)    run_suite_neutrino_reference ;;
-            reference-maker)       run_suite_reference_maker ;;
-            tumbler)               run_suite_tumbler ;;
-            *)
-                log_error "Unknown suite: $suite"
+        # Validate every requested suite up front.
+        for _suite in "${selected_suites[@]}"; do
+            if ! runner_for_suite "$_suite" >/dev/null; then
+                log_error "Unknown suite: $_suite"
                 log_info "Available suites: ${!SUITE_SLOT[*]}"
                 exit 1
-                ;;
-        esac
-        exit $?
+            fi
+        done
+
+        main "${selected_suites[@]}"
         ;;
     --help|-h)
         cat <<EOF
@@ -1502,6 +1571,8 @@ Each suite gets its own containers, ports, network, and volumes.
 Usage:
   $0                              Run all suites in parallel
   $0 --suite <name>               Run a single suite
+  $0 --suite <name> --suite <name> ...   Run several suites (repeat --suite, or
+                                  use a comma-separated list: --suite a,b,c)
   $0 --instance <N>               Isolation id for concurrent runs (default 0)
   $0 --no-build                   Reuse existing images (skip the shared build)
   $0 --max-concurrent <N>         Limit concurrent suites (0 = unlimited;
