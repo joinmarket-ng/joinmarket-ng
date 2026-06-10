@@ -284,6 +284,21 @@ class Taker(TakerMonitoringMixin):
                 logger.debug(f"Failed to release taker input locks: {e}")
             self._session.reserved_inputs = set()
 
+    @property
+    def last_failure_reason(self) -> str | None:
+        """Reason the most recent ``do_coinjoin`` call failed (or ``None``).
+
+        Forwarded from the per-round :class:`CoinJoinSession` so external
+        consumers (e.g. the tumbler runner) can surface why a round did not
+        broadcast without reaching into private session state.
+        """
+        return self._session.last_failure_reason
+
+    @property
+    def last_used_nicks(self) -> set[str]:
+        """Maker nicks used by the most recent ``do_coinjoin`` call."""
+        return self._session.last_used_nicks
+
     async def check_utxo_eligibility(self, amount: int, mixdepth: int) -> str | None:
         """Validate that ``mixdepth`` can fund a CoinJoin of ``amount``.
 
