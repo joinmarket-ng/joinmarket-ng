@@ -164,18 +164,22 @@ The same fingerprint scopes the fidelity bond registry on disk as
 `fidelity_bonds_<fingerprint>.json` (issue #492). Both `jm-wallet
 list-bonds` and `jm-wallet registry-show` read this per-wallet file.
 
-`jmwalletd` reads the same registry when serving wallet data. On wallet
-open/recover and on each `/wallet/{name}/utxos` and `/wallet/{name}/display`
-request it runs a bond-aware sync that scans the registered bond addresses on
-the timelock branch (`.../2/...`), which is not part of the standard wallet
-descriptor set. For descriptor-wallet backends it imports the bond `addr()`
-descriptors (rescanning when a bond is newly registered); for light-client
-(Neutrino) backends it forces a historical rescan of the bond addresses so a
-bond funded before the address was watched is still found. Funded bonds are
-then returned by the UTXO API with a `locktime` field (matching legacy
-joinmarket-clientserver) so frontends such as JAM recognize them. Without this
-the bond branch is never queried and funded bonds would be invisible (the coins
-would appear to "disappear").
+Both `jmwalletd` and the `jm-wallet` CLI read this registry and run a
+bond-aware sync that scans the registered bond addresses on the timelock
+branch (`.../2/...`), which is not part of the standard wallet descriptor
+set. `jmwalletd` does this on wallet open/recover and on each
+`/wallet/{name}/utxos` and `/wallet/{name}/display` request; the CLI does it
+for `jm-wallet info`, `send`, `freeze`, and `sync-bonds`. For descriptor-wallet
+backends it imports the bond `addr()` descriptors, detecting which are missing
+by the actual `addr()` descriptor set (not a descriptor count, which
+over-counts the base wallet) and rescanning so an already-funded bond is found.
+For light-client (Neutrino) backends it forces a historical rescan of the bond
+addresses so a bond funded before the address was watched is still found.
+Funded bonds are then returned by the UTXO API with a `locktime` field
+(matching legacy joinmarket-clientserver) so frontends such as JAM recognize
+them. Without this the bond branch is never queried and funded bonds would be
+invisible (the coins would appear to "disappear", or the bond address would
+show as locked with a 0 sat balance).
 
 To pick a wallet, the offline commands `history`, `list-bonds` and
 `registry-show` accept the following inputs (in priority order):

@@ -127,17 +127,12 @@ async def _freeze_utxos(
     backend_type = backend_settings.backend_type
     data_dir = backend_settings.data_dir
 
-    # Load fidelity bond addresses from registry
+    # The wallet name is derived from the master fingerprint. Registered
+    # fidelity bonds are loaded and imported by ``sync_with_registered_bonds``
+    # below, so they do not need to be collected here.
     from jmwallet.backends.descriptor_wallet import get_mnemonic_fingerprint
-    from jmwallet.wallet.bond_registry import load_registry
 
     wallet_fingerprint = get_mnemonic_fingerprint(mnemonic, bip39_passphrase or "")
-    bond_registry = load_registry(data_dir, wallet_fingerprint)
-    fidelity_bond_addresses: list[tuple[str, int, int]] = [
-        (bond.address, bond.locktime, bond.index)
-        for bond in bond_registry.bonds
-        if bond.network == network
-    ]
 
     # Create backend
     backend: DescriptorWalletBackend | NeutrinoBackend
@@ -181,28 +176,14 @@ async def _freeze_utxos(
     )
 
     try:
-        # Sync wallet (same pattern as _show_wallet_info)
-        if backend_type == "descriptor_wallet":
-            if isinstance(backend, DescriptorWalletBackend):
-                bond_count = len(fidelity_bond_addresses)
-                base_ready = await wallet.is_descriptor_wallet_ready(fidelity_bond_count=0)
-                full_ready = await wallet.is_descriptor_wallet_ready(fidelity_bond_count=bond_count)
-                if not base_ready:
-                    logger.info("Descriptor wallet not set up. Setting up...")
-                    await wallet.setup_descriptor_wallet(
-                        rescan=True,
-                        fidelity_bond_addresses=fidelity_bond_addresses if bond_count else None,
-                    )
-                elif not full_ready and bond_count > 0:
-                    logger.info("Importing fidelity bond addresses...")
-                    await wallet.import_fidelity_bond_addresses(
-                        fidelity_bond_addresses, rescan=True
-                    )
-                await wallet.sync_with_descriptor_wallet(
-                    fidelity_bond_addresses=fidelity_bond_addresses if bond_count else None
-                )
-        else:
-            await wallet.sync_all(fidelity_bond_addresses or None)
+        # Bond-aware sync (same path as the daemon and ``jm-wallet info``):
+        # imports any registered fidelity bond's watch-only ``addr()``
+        # descriptor into Bitcoin Core (and rescans) when missing, so a bond
+        # funded after the base wallet was set up is visible (and freezable).
+        # Detection is by the actual ``addr()`` descriptor set, not a
+        # descriptor count. Non-descriptor backends (neutrino) scan the bond
+        # addresses directly inside this call.
+        await wallet.sync_with_registered_bonds()
 
         # Collect all UTXOs (including frozen ones) across requested mixdepths
         all_utxos: list[UTXOInfo] = []

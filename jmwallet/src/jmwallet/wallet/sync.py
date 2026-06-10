@@ -499,9 +499,15 @@ class WalletSyncMixin:
                     needs_setup = True
             if needs_setup:
                 logger.info("Descriptor wallet not initialised; running setup before sync")
+                # Rescan only when fidelity bonds are supplied: a bond's
+                # timelock address may already be funded (the bond was created
+                # and paid before this sync), and importing its ``addr()``
+                # descriptor without a rescan tracks it only from "now", hiding
+                # the already-confirmed UTXO. A brand-new wallet with no bonds
+                # has no prior history, so ``rescan=False`` keeps setup fast.
                 await self.setup_descriptor_wallet(
                     fidelity_bond_addresses=fidelity_bond_addresses,
-                    rescan=False,
+                    rescan=bool(fidelity_bond_addresses),
                     check_existing=False,
                 )
 
@@ -595,20 +601,24 @@ class WalletSyncMixin:
 
         This is the bond-aware counterpart to :meth:`sync`. It loads the
         wallet's registered fidelity bond addresses (see
-        :meth:`load_registered_bond_addresses`), ensures their watch-only
-        descriptors are imported for descriptor-wallet backends, and then syncs
-        so the bond UTXOs are scanned into ``utxo_cache`` alongside the regular
-        mixdepth UTXOs.
+        :meth:`load_registered_bond_addresses`), ensures the base descriptor
+        wallet and the bonds' watch-only descriptors are imported for
+        descriptor-wallet backends, and then syncs so the bond UTXOs are
+        scanned into ``utxo_cache`` alongside the regular mixdepth UTXOs.
 
         Callers that surface wallet state to users (the jmwalletd daemon's
-        ``/utxos`` and ``/display`` endpoints) must use this instead of
-        :meth:`sync`; otherwise funded fidelity bonds are invisible because the
-        bond branch (``.../2/...``) is not part of the standard descriptor
-        import (matching legacy joinmarket-clientserver behavior, where bonds
-        appear in the UTXO list).
+        ``/utxos`` and ``/display`` endpoints, and the ``jm-wallet`` CLI
+        commands ``info``/``send``/``freeze``/``sync-bonds``) must use this
+        instead of :meth:`sync`; otherwise funded fidelity bonds are invisible
+        because the bond branch (``.../2/...``) is not part of the standard
+        descriptor import (matching legacy joinmarket-clientserver behavior,
+        where bonds appear in the UTXO list).
 
-        Backends that are not descriptor wallets (e.g. neutrino) fall back to
-        :meth:`sync_all`, which already scans the supplied bond addresses.
+        The base descriptor wallet is set up on first use (idempotently, so it
+        is a no-op when the daemon has already called
+        :meth:`setup_descriptor_wallet`). Backends that are not descriptor
+        wallets (e.g. neutrino) fall back to :meth:`sync_all`, which already
+        scans the supplied bond addresses.
         """
         bond_addresses = self.load_registered_bond_addresses()
 
@@ -616,24 +626,31 @@ class WalletSyncMixin:
             # Non-descriptor backends scan bond addresses directly in sync_all.
             return await self.sync_all(bond_addresses or None)
 
-        if bond_addresses:
-            # Import only the bond descriptors that are not already present.
-            # We must inspect the actual descriptor set rather than rely on a
-            # descriptor *count* check: the base wallet already imports more
-            # descriptors than ``mixdepth_count * 2`` (Bitcoin Core records
-            # internal/external variants), so a count-based "ready" test would
-            # report the bonds as present and silently skip importing them
-            # (leaving funded bonds invisible).
+        # Ensure the base descriptor wallet exists before scanning. This is a
+        # no-op when it is already set up (``setup_descriptor_wallet`` checks
+        # first), so it is safe even though the daemon also sets it up
+        # explicitly. It is required for the CLI paths, which (unlike the
+        # daemon) rely on this method to perform first-time setup.
+        base_ready = await self.is_descriptor_wallet_ready(fidelity_bond_count=0)
+        if not base_ready:
+            # First-time setup imports the base descriptors and any registered
+            # bonds together (with a rescan), so a wallet restored with bonds
+            # already funded is fully populated in one pass.
+            await self.setup_descriptor_wallet(
+                rescan=True,
+                fidelity_bond_addresses=bond_addresses or None,
+            )
+        elif bond_addresses:
+            # Base wallet already set up: import only the bond descriptors that
+            # are not already present. We inspect the actual descriptor set
+            # rather than rely on a descriptor *count* check, because the base
+            # wallet may import more descriptors than ``mixdepth_count * 2``
+            # (Bitcoin Core records internal/external variants), so a
+            # count-based "ready" test would report the bonds as present and
+            # silently skip importing them (leaving funded bonds invisible).
             imported = await self._imported_bond_addresses()
             missing = [b for b in bond_addresses if b[0].lower() not in imported]
-
-            base_ready = await self.is_descriptor_wallet_ready(fidelity_bond_count=0)
-            if not base_ready:
-                await self.setup_descriptor_wallet(
-                    rescan=True,
-                    fidelity_bond_addresses=bond_addresses,
-                )
-            elif missing:
+            if missing:
                 await self.import_fidelity_bond_addresses(missing, rescan=True)
 
         return await self.sync_with_descriptor_wallet(bond_addresses or None)

@@ -750,7 +750,12 @@ async def _sync_bonds_async(
             (bond.address, bond.locktime, bond.index) for bond in network_bonds
         ]
         print(f"\nSyncing {len(fidelity_bond_addresses)} registered bond address(es)...")
-        await wallet.sync_all(fidelity_bond_addresses)
+        # Use the bond-aware sync so the bond's watch-only ``addr()`` descriptor
+        # is imported into Bitcoin Core (and rescanned) when missing. A plain
+        # ``sync_all`` only scans descriptors already imported, so a bond funded
+        # after the base wallet was set up would never appear (issue: funded
+        # fidelity bond shown as locked with 0 sats).
+        await wallet.sync_with_registered_bonds()
 
         # Map each bond address to its highest-value UTXO. Per the reference
         # implementation only the single largest UTXO at an address is used.

@@ -522,49 +522,15 @@ async def _show_wallet_info(
             _print_scan_status(status)
             return
 
-        # Use descriptor wallet sync if available
-        if backend_type == "descriptor_wallet":
-            from jmwallet.backends.descriptor_wallet import DescriptorWalletBackend
-
-            if isinstance(backend, DescriptorWalletBackend):
-                # First-time setup uses the configured descriptor scan range.
-                # Widening the range for an already-imported wallet is handled
-                # by ``jm-wallet rescan --scan-depth N``, not here.
-                effective_scan_range = wallet.scan_range
-
-                # Check if base wallet is set up (without counting bonds)
-                bond_count = len(fidelity_bond_addresses)
-                base_wallet_ready = await wallet.is_descriptor_wallet_ready(fidelity_bond_count=0)
-                full_wallet_ready = await wallet.is_descriptor_wallet_ready(
-                    fidelity_bond_count=bond_count
-                )
-
-                if not base_wallet_ready:
-                    # First time setup - import everything including bonds
-                    logger.info("Descriptor wallet not set up. Setting up...")
-                    await wallet.setup_descriptor_wallet(
-                        scan_range=effective_scan_range,
-                        rescan=True,
-                        fidelity_bond_addresses=fidelity_bond_addresses if bond_count else None,
-                    )
-                    logger.info("Descriptor wallet setup complete")
-                elif not full_wallet_ready and bond_count > 0:
-                    # Base wallet exists but bonds are missing - import just the bonds
-                    logger.info(
-                        "Descriptor wallet exists but fidelity bond addresses not imported. "
-                        "Importing bond addresses..."
-                    )
-                    await wallet.import_fidelity_bond_addresses(
-                        fidelity_bond_addresses, rescan=True
-                    )
-
-                # Use fast descriptor wallet sync (including fidelity bonds)
-                await wallet.sync_with_descriptor_wallet(
-                    fidelity_bond_addresses=fidelity_bond_addresses if bond_count else None
-                )
-        else:
-            # Use standard sync (BIP157/158 for neutrino)
-            await wallet.sync_all(fidelity_bond_addresses or None)
+        # Bond-aware sync: loads the per-wallet bond registry and ensures each
+        # registered bond's watch-only ``addr()`` descriptor is imported into
+        # Bitcoin Core (and rescanned) before scanning. The previous
+        # descriptor-*count* readiness check over-counted the base wallet
+        # (Bitcoin Core records extra internal/external variants), so a bond
+        # funded after the base wallet was set up was never imported and showed
+        # as locked with 0 sats. Non-descriptor backends (neutrino) scan the
+        # bond addresses directly inside this call.
+        await wallet.sync_with_registered_bonds()
 
         # Update any pending transaction statuses
         # This safeguards against one-shot coinjoins that exited before confirmation
