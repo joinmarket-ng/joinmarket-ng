@@ -98,6 +98,9 @@ above still applies.
   compute the key the recipient scans for and the payment would be undetectable
   and unspendable. Receiving silent payments and mixing the resulting ordinary
   taproot coins is unaffected.
-- Remaining follow-ups: persisting scan progress / importing detected outputs
-  as first-class wallet UTXOs across restarts, and an automatic background
-  coinjoin sweep with randomized timing for received deposits.
+- Detected outputs are persisted: their spend tweaks are stored in the wallet
+  metadata store and re-hydrated on wallet load, so received coins stay spendable
+  across restarts without re-scanning the chain.
+- Remaining follow-ups: persisting incremental scan progress (so a rescan only
+  covers new blocks), and an automatic background coinjoin sweep with randomized
+  timing for received deposits.
