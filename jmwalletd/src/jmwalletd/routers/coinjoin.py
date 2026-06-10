@@ -330,6 +330,10 @@ async def start_maker(
                     socks_host=jm_settings.tor.socks_host,
                     socks_port=jm_settings.tor.socks_port,
                     stream_isolation=jm_settings.tor.stream_isolation,
+                    # Log maker history into the daemon's data dir so the
+                    # yieldgen/report endpoint (which reads from state.data_dir)
+                    # reflects this maker's earnings (#531).
+                    data_dir=state.data_dir,
                 )
                 maker = MakerBot(
                     wallet=ws,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
@@ -654,38 +655,108 @@ class TestRescan:
 
 
 class TestYieldGenReport:
-    def test_no_report_file(self, authed_client: tuple[TestClient, str]) -> None:
+    def _append_maker_entry(
+        self,
+        data_dir: Path,
+        *,
+        cj_amount: int,
+        fee_received: int,
+        txfee_contribution: int,
+        success: bool = True,
+        txid: str = "ab" * 32,
+    ) -> None:
+        """Write a maker row into the daemon data dir's history.csv."""
+        from jmwallet.history import (
+            TransactionHistoryEntry,
+            append_history_entry,
+        )
+
+        entry = TransactionHistoryEntry(
+            timestamp="2024-01-01T10:00:00",
+            completed_at="2024-01-01T10:05:00",
+            confirmed_at="2024-01-01T10:05:00",
+            role="maker",
+            success=success,
+            confirmations=1 if success else 0,
+            txid=txid,
+            cj_amount=cj_amount,
+            counterparty_nicks="J5xtaker",
+            fee_received=fee_received,
+            txfee_contribution=txfee_contribution,
+            net_fee=fee_received - txfee_contribution,
+            utxos_used=f"{txid}:0,{txid}:1",
+            network="regtest",
+            wallet_fingerprint="deadbeef",
+        )
+        append_history_entry(entry, data_dir=data_dir)
+
+    def test_empty_report_returns_header_and_marker(
+        self, authed_client: tuple[TestClient, str]
+    ) -> None:
+        """With no maker history the report is still returned (header + marker)."""
         client, token = authed_client
         resp = client.get(
             "/api/v1/wallet/yieldgen/report",
             headers=_auth_headers(token),
         )
-        # No report file -> 404 YieldGeneratorDataUnreadable
-        assert resp.status_code == 404
+        assert resp.status_code == 200
+        rows = resp.json()["yigen_data"]
+        # Header row + a single "Connected" startup marker, no earnings rows.
+        assert rows[0].startswith("timestamp,cj amount/satoshi,")
+        assert any("Connected" in r for r in rows)
+        assert len(rows) == 2
 
-    def test_with_report_file(self, authed_client: tuple[TestClient, str]) -> None:
+    def test_report_synthesized_from_maker_history(
+        self, authed_client: tuple[TestClient, str], data_dir: Path
+    ) -> None:
+        """A successful maker CoinJoin appears as a reference-format earnings row."""
         client, token = authed_client
-        state = get_daemon_state()
-        report_file = state.data_dir / "yigen-statement.csv"
-        report_file.write_text("timestamp,cjamount,fee\n2024-01-01,100000,250\n")
+        self._append_maker_entry(
+            data_dir, cj_amount=100_000, fee_received=2_680, txfee_contribution=200
+        )
 
         resp = client.get(
             "/api/v1/wallet/yieldgen/report",
             headers=_auth_headers(token),
         )
         assert resp.status_code == 200
-        data = resp.json()
-        assert len(data["yigen_data"]) == 2  # header + data line
+        rows = resp.json()["yigen_data"]
+        # header + Connected marker + one earnings row
+        assert len(rows) == 3
+        earning = rows[-1].split(",")
+        # cj amount, input count, input value, cjfee, earned
+        assert earning[1] == "100000"
+        assert earning[2] == "2"  # two utxos_used
+        assert earning[4] == "2680"  # cjfee = fee_received
+        assert earning[5] == str(2_680 - 200)  # earned = net_fee
+
+    def test_pending_maker_entry_excluded(
+        self, authed_client: tuple[TestClient, str], data_dir: Path
+    ) -> None:
+        """Unconfirmed/failed maker rows are not reported as earnings."""
+        client, token = authed_client
+        self._append_maker_entry(
+            data_dir,
+            cj_amount=50_000,
+            fee_received=0,
+            txfee_contribution=0,
+            success=False,
+            txid="cd" * 32,
+        )
+
+        resp = client.get(
+            "/api/v1/wallet/yieldgen/report",
+            headers=_auth_headers(token),
+        )
+        assert resp.status_code == 200
+        rows = resp.json()["yigen_data"]
+        # Only header + Connected marker (the pending row is excluded).
+        assert len(rows) == 2
 
     def test_requires_auth(self, authed_client: tuple[TestClient, str]) -> None:
-        # Without a bearer token the endpoint must reject the request,
-        # even when the report file exists, to avoid leaking yield-gen
-        # earnings to unauthenticated callers.
+        # Without a bearer token the endpoint must reject the request to avoid
+        # leaking yield-gen earnings to unauthenticated callers.
         client, _ = authed_client
-        state = get_daemon_state()
-        report_file = state.data_dir / "yigen-statement.csv"
-        report_file.write_text("timestamp,cjamount,fee\n2024-01-01,100000,250\n")
-
         resp = client.get("/api/v1/wallet/yieldgen/report")
         assert resp.status_code == 401
 

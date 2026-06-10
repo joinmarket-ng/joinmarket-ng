@@ -569,14 +569,19 @@ async def yieldgen_report(
     _auth: dict[str, Any] = Depends(require_auth),
     state: DaemonState = Depends(get_daemon_state),
 ) -> YieldGenReportResponse:
-    """Return the yield generator CSV report data."""
-    report_path = state.data_dir / "yigen-statement.csv"
+    """Return the yield generator (maker earnings) report.
 
-    if not report_path.exists():
-        raise YieldGeneratorDataUnreadable()
+    The joinmarket-ng maker logs its activity to ``history.csv`` (its single
+    source of truth) rather than the legacy ``yigen-statement.csv`` file, so the
+    report is synthesized from the successful maker rows of ``history.csv`` in
+    the reference comma-separated format the Earn report UI expects (a header
+    row, a ``Connected`` marker row, then one row per CoinJoin).
+    """
+    from jmwallet.history import format_yield_generator_report
 
     try:
-        lines = report_path.read_text().strip().split("\n")
-        return YieldGenReportResponse(yigen_data=lines)
+        rows = format_yield_generator_report(state.data_dir)
     except Exception as exc:
         raise YieldGeneratorDataUnreadable(str(exc)) from exc
+
+    return YieldGenReportResponse(yigen_data=rows)

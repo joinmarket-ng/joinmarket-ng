@@ -14,6 +14,7 @@ import pytest
 
 from jmwallet.backends.base import Transaction
 from jmwallet.history import (
+    YIELD_GENERATOR_REPORT_HEADER,
     HistoryWriteError,
     TransactionHistoryEntry,
     _parse_utxos,
@@ -23,6 +24,7 @@ from jmwallet.history import (
     create_send_history_entry,
     create_taker_history_entry,
     detect_coinjoin_peer_count,
+    format_yield_generator_report,
     get_address_history_types,
     get_history_stats,
     get_history_stats_for_period,
@@ -3056,3 +3058,142 @@ class TestSendHistoryEntry:
 
         types = get_address_history_types(temp_data_dir)
         assert types.get(shared) == "cj_out"
+
+
+class TestYieldGeneratorReport:
+    """``format_yield_generator_report`` synthesizes the reference earn report."""
+
+    def _maker(
+        self,
+        *,
+        cj_amount: int,
+        fee_received: int,
+        txfee_contribution: int,
+        success: bool = True,
+        timestamp: str = "2024-01-01T10:00:00",
+        confirmed_at: str = "2024-01-01T10:06:00",
+        txid: str = "ab",
+        fingerprint: str = "deadbeef",
+    ) -> TransactionHistoryEntry:
+        return TransactionHistoryEntry(
+            timestamp=timestamp,
+            confirmed_at=confirmed_at,
+            role="maker",
+            success=success,
+            confirmations=1 if success else 0,
+            txid=txid * 32,
+            cj_amount=cj_amount,
+            counterparty_nicks="J5xtaker",
+            fee_received=fee_received,
+            txfee_contribution=txfee_contribution,
+            net_fee=fee_received - txfee_contribution,
+            utxos_used=f"{txid * 32}:0,{txid * 32}:1",
+            network="regtest",
+            wallet_fingerprint=fingerprint,
+        )
+
+    def test_empty_history_returns_header_and_marker(self, temp_data_dir: Path) -> None:
+        rows = format_yield_generator_report(temp_data_dir)
+        assert rows[0] == ",".join(YIELD_GENERATOR_REPORT_HEADER)
+        assert rows[1].endswith(",Connected")
+        assert len(rows) == 2
+
+    def test_successful_maker_row_mapped_to_reference_format(self, temp_data_dir: Path) -> None:
+        append_history_entry(
+            self._maker(cj_amount=100_000, fee_received=2_680, txfee_contribution=200),
+            temp_data_dir,
+        )
+        rows = format_yield_generator_report(temp_data_dir)
+        assert len(rows) == 3
+        cols = rows[-1].split(",")
+        assert cols[0] == "2024/01/01 10:00:00"  # reference timestamp format
+        assert cols[1] == "100000"  # cj amount
+        assert cols[2] == "2"  # input count from utxos_used
+        assert cols[3] == "0"  # input value not retained
+        assert cols[4] == "2680"  # cjfee == fee_received
+        assert cols[5] == str(2_680 - 200)  # earned == net_fee
+        assert cols[6] == "6.0"  # confirm minutes (10:00 -> 10:06)
+        assert cols[7] == ""  # notes
+
+    def test_pending_or_failed_maker_rows_excluded(self, temp_data_dir: Path) -> None:
+        append_history_entry(
+            self._maker(
+                cj_amount=50_000,
+                fee_received=0,
+                txfee_contribution=0,
+                success=False,
+                txid="cd",
+            ),
+            temp_data_dir,
+        )
+        rows = format_yield_generator_report(temp_data_dir)
+        assert len(rows) == 2  # header + marker only
+
+    def test_taker_rows_excluded(self, temp_data_dir: Path) -> None:
+        taker = create_taker_history_entry(
+            maker_nicks=["J5maker"],
+            cj_amount=100_000,
+            total_maker_fees=300,
+            mining_fee=200,
+            destination="bcrt1qdest",
+            change_address="bcrt1qchange",
+            source_mixdepth=0,
+            selected_utxos=[("ee" * 32, 0)],
+            network="regtest",
+            wallet_fingerprint="deadbeef",
+        )
+        append_history_entry(taker, temp_data_dir)
+        rows = format_yield_generator_report(temp_data_dir)
+        assert len(rows) == 2  # no maker earnings
+
+    def test_multiple_rows_sorted_chronologically(self, temp_data_dir: Path) -> None:
+        append_history_entry(
+            self._maker(
+                cj_amount=2,
+                fee_received=20,
+                txfee_contribution=1,
+                timestamp="2024-02-01T10:00:00",
+                txid="22",
+            ),
+            temp_data_dir,
+        )
+        append_history_entry(
+            self._maker(
+                cj_amount=1,
+                fee_received=10,
+                txfee_contribution=1,
+                timestamp="2024-01-01T10:00:00",
+                txid="11",
+            ),
+            temp_data_dir,
+        )
+        rows = format_yield_generator_report(temp_data_dir)
+        # header + marker + 2 earnings, oldest first
+        assert len(rows) == 4
+        assert rows[2].split(",")[1] == "1"  # Jan row first
+        assert rows[3].split(",")[1] == "2"  # Feb row second
+
+    def test_wallet_fingerprint_filter(self, temp_data_dir: Path) -> None:
+        append_history_entry(
+            self._maker(
+                cj_amount=1,
+                fee_received=10,
+                txfee_contribution=1,
+                fingerprint="aaaaaaaa",
+                txid="aa",
+            ),
+            temp_data_dir,
+        )
+        append_history_entry(
+            self._maker(
+                cj_amount=2,
+                fee_received=20,
+                txfee_contribution=1,
+                fingerprint="bbbbbbbb",
+                txid="bb",
+            ),
+            temp_data_dir,
+        )
+        rows = format_yield_generator_report(temp_data_dir, wallet_fingerprint="aaaaaaaa")
+        assert len(rows) == 3  # only wallet aaaaaaaa's row
+        assert rows[-1].split(",")[1] == "1"

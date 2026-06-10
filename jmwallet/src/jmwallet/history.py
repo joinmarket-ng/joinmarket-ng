@@ -561,6 +561,104 @@ def read_history(
     return entries
 
 
+# Reference joinmarket-clientserver yield-generator statement format. The Earn
+# report (e.g. JAM) consumes the ``/wallet/yieldgen/report`` API as a list of
+# comma-separated rows in exactly this 8-column shape, so we synthesize them
+# from the maker rows of ``history.csv`` (joinmarket-ng's single source of
+# truth) instead of maintaining a separate ``yigen-statement.csv`` file.
+YIELD_GENERATOR_REPORT_HEADER: list[str] = [
+    "timestamp",
+    "cj amount/satoshi",
+    "my input count",
+    "my input value/satoshi",
+    "cjfee/satoshi",
+    "earned/satoshi",
+    "confirm time/min",
+    "notes",
+]
+
+# Reference timestamp format used in yigen-statement.csv rows.
+_YIELD_GENERATOR_TIMESTAMP_FORMAT = "%Y/%m/%d %H:%M:%S"
+
+
+def _format_yield_generator_timestamp(iso_timestamp: str) -> str:
+    """Reformat an ISO timestamp to the reference ``%Y/%m/%d %H:%M:%S`` form."""
+    try:
+        return datetime.fromisoformat(iso_timestamp).strftime(_YIELD_GENERATOR_TIMESTAMP_FORMAT)
+    except (ValueError, TypeError):
+        return iso_timestamp
+
+
+def _yield_generator_confirm_minutes(entry: TransactionHistoryEntry) -> str:
+    """Return confirm time in minutes (rounded) for a maker entry, or ``""``.
+
+    Computed from the broadcast (``timestamp``) and first-confirmation
+    (``confirmed_at``) times when both are present.
+    """
+    if not entry.confirmed_at or not entry.timestamp:
+        return ""
+    try:
+        start = datetime.fromisoformat(entry.timestamp)
+        confirmed = datetime.fromisoformat(entry.confirmed_at)
+    except (ValueError, TypeError):
+        return ""
+    minutes = (confirmed - start).total_seconds() / 60.0
+    if minutes < 0:
+        return ""
+    return str(round(minutes, 2))
+
+
+def format_yield_generator_report(
+    data_dir: Path | None = None,
+    wallet_fingerprint: str | None = None,
+) -> list[str]:
+    """Build the yield-generator earnings report as reference-format CSV rows.
+
+    Returns a list of comma-separated strings: a header row, an initial
+    ``Connected`` marker row (kept for parity with the reference, which the
+    Earn report UI discards), and one row per *successful* maker CoinJoin from
+    ``history.csv`` (the row's ``fee_received`` is the cjfee earned, and
+    ``net_fee`` is the amount earned after the mining-fee contribution).
+
+    The ``my input value/satoshi`` column is reported as ``0`` because the
+    per-input values are not retained in the history log; the earnings columns
+    (``cjfee``/``earned``) are exact.
+
+    Args:
+        data_dir: Data directory holding ``history.csv``.
+        wallet_fingerprint: When set, restrict to one wallet's maker rows.
+    """
+    rows: list[str] = [",".join(YIELD_GENERATOR_REPORT_HEADER)]
+    # A startup marker keeps the response shape identical to the reference,
+    # whose clients filter out rows whose notes contain "Connected".
+    marker_ts = datetime.now().strftime(_YIELD_GENERATOR_TIMESTAMP_FORMAT)
+    rows.append(f"{marker_ts},,,,,,,Connected")
+
+    entries = read_history(
+        data_dir,
+        role_filter="maker",
+        wallet_fingerprint=wallet_fingerprint,
+    )
+    # read_history returns most-recent-first; the statement reads chronologically.
+    for entry in sorted(entries, key=lambda e: e.timestamp):
+        if not entry.success:
+            continue
+        input_count = len(_parse_utxos(entry.utxos_used))
+        row = [
+            _format_yield_generator_timestamp(entry.timestamp),
+            str(entry.cj_amount),
+            str(input_count),
+            "0",  # per-input values are not retained in history.csv
+            str(entry.fee_received),
+            str(entry.net_fee),
+            _yield_generator_confirm_minutes(entry),
+            "",  # notes
+        ]
+        rows.append(",".join(row))
+
+    return rows
+
+
 def list_history_fingerprints(data_dir: Path | None = None) -> list[str]:
     """List distinct wallet fingerprints recorded in the history CSV.
 
