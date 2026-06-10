@@ -26,6 +26,7 @@ from jmwallet.wallet.silent_payments import SilentPaymentWallet
 from jmwallet.wallet.sync import WalletSyncMixin
 from jmwallet.wallet.utxo_metadata import (
     DEFAULT_COINJOIN_LOCK_TTL,
+    SPCoinRecord,
     UTXOMetadataStore,
     load_metadata_store,
 )
@@ -170,6 +171,9 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin, Wal
         if self.metadata_store is not None:
             self.addresses_with_history.update(self.metadata_store.get_used_addresses())
             self._migrate_legacy_address_history(data_dir)
+            # Re-hydrate previously-detected silent payment coins so the wallet
+            # can spend them after a restart without a full re-scan.
+            self._load_persisted_sp_coins()
 
         # Track addresses currently reserved for in-progress CoinJoin sessions
         # These addresses have been shared with a taker but the CoinJoin hasn't
@@ -354,6 +358,7 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin, Wal
         received: Sequence[SilentPaymentReceived],
         mixdepth: int = 0,
         confirmations: int = 1,
+        persist: bool = True,
     ) -> list[UTXOInfo]:
         """Make detected silent payment outputs spendable by the wallet.
 
@@ -362,6 +367,11 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin, Wal
         ``utxo_cache[mixdepth]`` so the coin-selection machinery treats it like
         any other owned coin. These outputs have no BIP32 path; their signing
         key is recomputed on demand via :meth:`resolve_p2tr_signing_key`.
+
+        When ``persist`` is True (the default) the per-output spend tweaks are
+        written to the wallet metadata store so the coins remain spendable after
+        a restart without re-scanning. ``persist=False`` is used when re-hydrating
+        from disk, to avoid rewriting what was just read.
 
         Returns the list of injected ``UTXOInfo`` objects.
         """
@@ -386,7 +396,56 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin, Wal
             bucket.append(utxo)
             existing.add((r.txid, r.vout))
             injected.append(utxo)
+
+        if persist and self.metadata_store is not None and received:
+            self.metadata_store.add_sp_coins(
+                SPCoinRecord(
+                    ref=f"{r.txid}:{r.vout}",
+                    value=r.value,
+                    address=r.address,
+                    pubkey_xonly=r.pubkey_xonly.hex(),
+                    tweak=r.tweak.to_bytes(32, "big").hex(),
+                    label_tweak=r.label_tweak.to_bytes(32, "big").hex(),
+                    mixdepth=mixdepth,
+                )
+                for r in received
+            )
+
         return injected
+
+    def _load_persisted_sp_coins(self) -> None:
+        """Re-hydrate persisted silent payment coins from the metadata store.
+
+        Groups stored records by mixdepth and re-injects them through
+        :meth:`register_silent_payment_utxos` (with ``persist=False``) so the
+        in-memory ``_sp_coins`` map and ``utxo_cache`` match the on-disk state.
+        """
+        if self.metadata_store is None:
+            return
+        records = self.metadata_store.get_sp_coins()
+        if not records:
+            return
+        by_mixdepth: dict[int, list[SilentPaymentReceived]] = {}
+        for rec in records:
+            try:
+                txid, vout_str = rec.ref.rsplit(":", 1)
+                received = SilentPaymentReceived(
+                    txid=txid,
+                    vout=int(vout_str),
+                    value=rec.value,
+                    address=rec.address,
+                    pubkey_xonly=bytes.fromhex(rec.pubkey_xonly),
+                    tweak=int.from_bytes(bytes.fromhex(rec.tweak), "big"),
+                    label_tweak=int.from_bytes(bytes.fromhex(rec.label_tweak), "big"),
+                )
+            except (ValueError, TypeError) as exc:
+                logger.warning(f"Skipping malformed persisted SP coin {rec.ref}: {exc}")
+                continue
+            by_mixdepth.setdefault(rec.mixdepth, []).append(received)
+        total = sum(len(v) for v in by_mixdepth.values())
+        for mixdepth, received_list in by_mixdepth.items():
+            self.register_silent_payment_utxos(received_list, mixdepth=mixdepth, persist=False)
+        logger.info(f"Re-hydrated {total} persisted silent payment coin(s) from metadata store")
 
     def resolve_p2tr_signing_key(self, address: str) -> tuple[PrivateKey, bytes] | None:
         """Resolve the BIP341 key-path signing key for a P2TR ``address``.

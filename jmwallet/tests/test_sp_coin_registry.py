@@ -113,3 +113,41 @@ def test_resolve_p2tr_signing_key_unknown_address(wallet_service: WalletService)
     # A taproot address the wallet has never seen resolves to None.
     unknown = "bc1p" + "q" * 58
     assert wallet_service.resolve_p2tr_signing_key(unknown) is None
+
+
+def test_sp_coins_persist_across_restart(test_mnemonic, mock_backend_imported, tmp_path) -> None:
+    """A detected SP coin must survive a restart so it stays spendable.
+
+    Registering writes the per-output tweaks to the metadata store; a fresh
+    WalletService on the same data_dir re-hydrates them and can recompute the
+    key-path signing key without re-scanning the chain.
+    """
+    wallet = WalletService(
+        mnemonic=test_mnemonic,
+        backend=mock_backend_imported,
+        network="mainnet",
+        mixdepth_count=5,
+        data_dir=tmp_path,
+    )
+    received = _receive_silent_payment(wallet)
+    wallet.register_silent_payment_utxos([received], mixdepth=2)
+
+    # Reopen the wallet from the same data dir -> the coin comes back.
+    reopened = WalletService(
+        mnemonic=test_mnemonic,
+        backend=mock_backend_imported,
+        network="mainnet",
+        mixdepth_count=5,
+        data_dir=tmp_path,
+    )
+
+    bucket = reopened.utxo_cache.get(2, [])
+    assert any(u.txid == received.txid and u.vout == received.vout for u in bucket)
+
+    # And it must still be spendable: the signing key is recomputed from the
+    # persisted tweaks alone.
+    resolved = reopened.resolve_p2tr_signing_key(received.address)
+    assert resolved is not None
+    priv_key, output_xonly = resolved
+    assert output_xonly == received.pubkey_xonly
+    assert priv_key.public_key.format(compressed=True)[1:] == received.pubkey_xonly

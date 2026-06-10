@@ -201,6 +201,84 @@ class AddressRecord:
 
 
 @dataclass
+class SPCoinRecord:
+    """Persisted spend material for a received BIP352 silent payment output.
+
+    Unlike HD-derived coins, a silent payment output has no BIP32 path: its
+    signing key is recomputed as ``spend_privkey + tweak + label_tweak`` (mod n)
+    from the seed-derived spend key plus the per-output ``tweak``/``label_tweak``
+    recovered at scan time. Those tweaks must therefore survive a restart, or the
+    wallet forgets how to spend coins it already detected. Stored as a custom
+    ``sp_coin`` BIP-329-style record (other consumers ignore the unknown type).
+
+    Attributes:
+        ref: Outpoint ``txid:vout``.
+        value: Output amount in satoshis.
+        address: The output's P2TR (bech32m) address.
+        pubkey_xonly: 32-byte x-only output key, hex.
+        tweak: Per-output shared-secret tweak scalar, 32-byte hex.
+        label_tweak: Label tweak scalar (0 for the unlabeled case), 32-byte hex.
+        mixdepth: Mixdepth the coin was registered into (default 0).
+    """
+
+    ref: str
+    value: int
+    address: str
+    pubkey_xonly: str
+    tweak: str
+    label_tweak: str = "00" * 32
+    mixdepth: int = 0
+
+    def to_dict(self) -> dict[str, str | int]:
+        """Serialize to a JSON dict (custom ``sp_coin`` record)."""
+        return {
+            "type": "sp_coin",
+            "ref": self.ref,
+            "value": self.value,
+            "address": self.address,
+            "pubkey_xonly": self.pubkey_xonly,
+            "tweak": self.tweak,
+            "label_tweak": self.label_tweak,
+            "mixdepth": self.mixdepth,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, str | bool | int | float]) -> SPCoinRecord | None:
+        """Deserialize from a ``type=sp_coin`` JSON dict; ``None`` if malformed."""
+        if d.get("type") != "sp_coin":
+            return None
+        ref = d.get("ref")
+        address = d.get("address")
+        pubkey_xonly = d.get("pubkey_xonly")
+        tweak = d.get("tweak")
+        if not (
+            isinstance(ref, str)
+            and ref
+            and isinstance(address, str)
+            and address
+            and isinstance(pubkey_xonly, str)
+            and isinstance(tweak, str)
+        ):
+            return None
+        value = d.get("value", 0)
+        label_tweak = d.get("label_tweak", "00" * 32)
+        mixdepth = d.get("mixdepth", 0)
+        if not isinstance(value, int) or not isinstance(mixdepth, int):
+            return None
+        if not isinstance(label_tweak, str):
+            return None
+        return cls(
+            ref=ref,
+            value=value,
+            address=address,
+            pubkey_xonly=pubkey_xonly,
+            tweak=tweak,
+            label_tweak=label_tweak,
+            mixdepth=mixdepth,
+        )
+
+
+@dataclass
 class UTXOMetadataStore:
     """In-memory store for UTXO + address metadata backed by a BIP-329 JSONL file.
 
@@ -220,6 +298,7 @@ class UTXOMetadataStore:
     path: Path
     records: dict[str, OutputRecord] = field(default_factory=dict)
     address_records: dict[str, AddressRecord] = field(default_factory=dict)
+    sp_coins: dict[str, SPCoinRecord] = field(default_factory=dict)
     foreign_addr_lines: list[dict[str, str | bool]] = field(default_factory=list)
 
     def load(self) -> None:
@@ -230,6 +309,7 @@ class UTXOMetadataStore:
         """
         self.records.clear()
         self.address_records.clear()
+        self.sp_coins.clear()
         self.foreign_addr_lines.clear()
 
         if not self.path.exists():
@@ -269,6 +349,10 @@ class UTXOMetadataStore:
                 else:
                     if isinstance(data, dict):
                         self.foreign_addr_lines.append(data)
+            elif record_type == "sp_coin":
+                sp_record = SPCoinRecord.from_dict(data)
+                if sp_record is not None:
+                    self.sp_coins[sp_record.ref] = sp_record
             else:
                 # BIP-329 says ignore unknown types -- but preserve them so we
                 # do not silently drop interoperable data.
@@ -312,8 +396,14 @@ class UTXOMetadataStore:
         outputs_to_write.sort(key=lambda r: r.ref)
 
         addr_records_to_write = sorted(self.address_records.values(), key=lambda r: r.ref)
+        sp_coins_to_write = sorted(self.sp_coins.values(), key=lambda r: r.ref)
 
-        if not outputs_to_write and not addr_records_to_write and not self.foreign_addr_lines:
+        if (
+            not outputs_to_write
+            and not addr_records_to_write
+            and not sp_coins_to_write
+            and not self.foreign_addr_lines
+        ):
             if self.path.exists():
                 try:
                     self.path.unlink()
@@ -326,6 +416,7 @@ class UTXOMetadataStore:
         lines: list[str] = []
         lines.extend(json.dumps(r.to_dict(), separators=(",", ":")) for r in outputs_to_write)
         lines.extend(json.dumps(r.to_dict(), separators=(",", ":")) for r in addr_records_to_write)
+        lines.extend(json.dumps(r.to_dict(), separators=(",", ":")) for r in sp_coins_to_write)
         # Foreign records last; sort by (type, ref) for determinism.
         for foreign in sorted(
             self.foreign_addr_lines,
@@ -627,6 +718,27 @@ class UTXOMetadataStore:
         process restarts and backend swaps.
         """
         return set(self.address_records.keys())
+
+    def add_sp_coins(self, records: Iterable[SPCoinRecord]) -> int:
+        """Persist received silent payment coins. Returns the number added/updated.
+
+        Idempotent on the outpoint ``ref``; re-registering the same coin (e.g.
+        after a rescan) overwrites the stored record rather than duplicating it.
+        """
+        changed = 0
+        for record in records:
+            existing = self.sp_coins.get(record.ref)
+            if existing == record:
+                continue
+            self.sp_coins[record.ref] = record
+            changed += 1
+        if changed:
+            self.save()
+        return changed
+
+    def get_sp_coins(self) -> list[SPCoinRecord]:
+        """Return all persisted silent payment coin records."""
+        return list(self.sp_coins.values())
 
     def verify_writable(self) -> None:
         """Verify that the metadata file's directory is writable.

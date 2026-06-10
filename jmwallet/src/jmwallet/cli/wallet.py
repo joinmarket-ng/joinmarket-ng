@@ -1290,6 +1290,10 @@ async def _run_silent_payment_scan(
     if not received:
         print("No silent payments found in the scanned range.")
         return
+    # Register the detected outputs so their spend tweaks are persisted to the
+    # wallet metadata store and the coins stay spendable across restarts without
+    # re-scanning the chain.
+    wallet.register_silent_payment_utxos(received, mixdepth=0)
     print(f"Found {len(received)} silent payment output(s):")
     for r in received:
         print(f"  {r.txid}:{r.vout}  {r.value} sats  {r.address}")
