@@ -730,33 +730,36 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin, Wal
         self,
         prior_used_addresses: set[str],
         prior_known_outpoints: set[str],
+        prior_funded_addresses: set[str],
     ) -> int:
-        """Auto-freeze UTXOs that landed on an already-used wallet address.
+        """Auto-freeze UTXOs that landed on an already-spent (empty) used address.
 
-        Defends against forced address-reuse (dust) attacks: an adversary pays
-        a small amount to an address the wallet already used, hoping it gets
-        co-spent and linked via the common-input-ownership heuristic. Per
-        https://en.bitcoin.it/wiki/Privacy#Forced_address_reuse the correct
-        behavior is to never spend such coins, which we achieve by freezing
-        them (the user can still ``unfreeze`` and fully spend the address).
+        Defends against forced address-reuse (dust) attacks: an adversary pays a
+        small amount to an address the wallet has already used and emptied,
+        hoping the new coin gets co-spent and links the wallet's coins via the
+        common-input-ownership heuristic. Per
+        https://en.bitcoin.it/wiki/Privacy#Forced_address_reuse, coins that land
+        on an already-used *empty* address should never be spent (we freeze
+        them); coins on an address that still holds funds should instead be
+        fully spent together, so those are left untouched.
 
-        Mirrors legacy joinmarket-clientserver's ``check_for_reuse``: only a
-        *newly arrived* UTXO to an *already-used* address is frozen, so the
-        original deposit at that address stays spendable.
+        A UTXO is auto-frozen only when ALL of the following hold:
 
-        * ``prior_used_addresses`` is the wallet's used-address set captured
-          *before* this sync recorded the current UTXOs' addresses, so a UTXO
-          counts as reuse only when its address was used by an earlier
-          transaction (not merely by itself in this same sync).
-        * ``prior_known_outpoints`` is the set of UTXO outpoints the wallet
-          already had before this sync; UTXOs in it are pre-existing (the
-          original deposit, or coins discovered at startup) and are never
-          auto-frozen. This is why the first sync of a freshly opened wallet
-          freezes nothing: every UTXO is either new on a not-yet-used address
-          or pre-existing.
-        * A UTXO is frozen when ``max_sats_freeze_reuse == -1`` (freeze all
-          reuse) or its value is ``<= max_sats_freeze_reuse``. ``0`` disables
-          the behavior entirely.
+        * Its address is in ``prior_used_addresses`` -- the address was used by
+          an earlier transaction (snapshot taken before this sync recorded the
+          current UTXOs' addresses).
+        * Its address is NOT in ``prior_funded_addresses`` -- the address held
+          no UTXO before this arrival, i.e. it was previously spent empty. This
+          is the key difference from legacy joinmarket-clientserver, which froze
+          reuse on any used address; we only freeze re-funding of a spent-empty
+          address and leave the "address still holds the original deposit" case
+          to be fully spent together.
+        * Its outpoint is NOT in ``prior_known_outpoints`` -- it is freshly
+          arrived this sync, never a pre-existing coin. (Implied by the
+          empty-address check, kept for clarity.)
+        * It passes the value filter: ``max_sats_freeze_reuse == -1`` freezes
+          all such reuse, a positive ``N`` freezes only ``value <= N`` sats, and
+          ``0`` disables the behavior entirely.
 
         A UTXO that already has a metadata record (e.g. one the user
         deliberately unfroze, which keeps a labeled record) is left untouched,
@@ -783,7 +786,13 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin, Wal
                 # startup) are never auto-frozen -- only freshly arrived ones.
                 if outpoint in prior_known_outpoints:
                     continue
+                # Only freeze re-funding of an already-used address that was
+                # *empty* before this arrival. If the address still held funds,
+                # the privacy-correct action is to fully spend them together,
+                # not to freeze, so we skip it.
                 if utxo.address not in prior_used_addresses:
+                    continue
+                if utxo.address in prior_funded_addresses:
                     continue
                 if threshold != -1 and utxo.value > threshold:
                     continue
@@ -803,7 +812,7 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin, Wal
 
         if frozen_now:
             logger.warning(
-                f"Auto-froze {frozen_now} UTXO(s) on reused addresses "
+                f"Auto-froze {frozen_now} UTXO(s) on reused empty addresses "
                 "(forced-address-reuse defense)."
             )
         return frozen_now

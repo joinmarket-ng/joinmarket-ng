@@ -406,14 +406,17 @@ class WalletSettings(BaseModel):
         default=-1,
         ge=-1,
         description=(
-            "Threshold (in satoshis) below which an incoming UTXO landing on an "
-            "already-used wallet address is AUTOMATICALLY frozen, to defend "
-            "against forced address-reuse (dust) attacks that try to coerce "
-            "linkage via the common-input-ownership heuristic "
-            "(https://en.bitcoin.it/wiki/Privacy#Forced_address_reuse). "
+            "Threshold (in satoshis) below which an incoming UTXO landing on a "
+            "previously-used wallet address that is now empty is AUTOMATICALLY "
+            "frozen, to defend against forced address-reuse (dust) attacks that "
+            "try to coerce linkage via the common-input-ownership heuristic "
+            "(https://en.bitcoin.it/wiki/Privacy#Forced_address_reuse). Only "
+            "re-funding of an already-spent (empty) used address is frozen; "
+            "coins arriving on an address that still holds funds are left "
+            "spendable so they can be fully spent together. "
             "The default -1 freezes ALL such reuse UTXOs regardless of value; "
             "a positive N freezes only reuse UTXOs with value <= N sats; "
-            "0 effectively disables auto-freezing. Frozen UTXOs can be released "
+            "0 disables auto-freezing. Frozen UTXOs can be released "
             "with ``jm-wallet unfreeze``."
         ),
     )

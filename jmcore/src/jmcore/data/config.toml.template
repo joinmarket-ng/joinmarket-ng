@@ -181,11 +181,13 @@
 # Dust threshold in satoshis
 # dust_threshold = 27300
 
-# Forced address-reuse defense (privacy). When a UTXO arrives on an address the
-# wallet has already used, it is AUTOMATICALLY frozen so it is never co-spent in
-# a CoinJoin (which would link your coins via the common-input-ownership
-# heuristic). See https://en.bitcoin.it/wiki/Privacy#Forced_address_reuse.
-#   -1  (default) freeze ALL reuse UTXOs, whatever the value
+# Forced address-reuse defense (privacy). When a UTXO arrives on a wallet
+# address that was previously used and is now empty, it is AUTOMATICALLY frozen
+# so it is never co-spent in a CoinJoin (which would link your coins via the
+# common-input-ownership heuristic). Coins arriving on an address that still
+# holds funds are left spendable (so they can be fully spent together). See
+# https://en.bitcoin.it/wiki/Privacy#Forced_address_reuse.
+#   -1  (default) freeze ALL such reuse UTXOs, whatever the value
 #    N  (positive) freeze only reuse UTXOs with value <= N sats
 #    0  disable auto-freezing
 # Release a frozen UTXO with `jm-wallet unfreeze`.

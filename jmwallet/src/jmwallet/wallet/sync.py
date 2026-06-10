@@ -92,21 +92,38 @@ class WalletSyncMixin:
         raise NotImplementedError
 
     def _auto_freeze_reused_address_utxos(
-        self, prior_used_addresses: set[str], prior_known_outpoints: set[str]
+        self,
+        prior_used_addresses: set[str],
+        prior_known_outpoints: set[str],
+        prior_funded_addresses: set[str],
     ) -> int:
         raise NotImplementedError
 
     # -- Persistent address-history tracking --------------------------------
 
-    def _known_outpoints_snapshot(self) -> set[str]:
-        """Return the set of UTXO outpoints currently in ``utxo_cache``.
+    def _pre_sync_freeze_snapshot(self) -> tuple[set[str], set[str]]:
+        """Snapshot UTXO state needed by the forced-address-reuse auto-freeze.
 
-        Captured at the start of a sync so the forced-address-reuse auto-freeze
-        (issue #529) can tell which UTXOs are pre-existing (the original
-        deposit, or coins discovered at startup) and therefore never auto-frozen
-        -- only freshly arrived UTXOs to an already-used address are frozen.
+        Returns ``(prior_known_outpoints, prior_funded_addresses)`` captured at
+        the start of a sync (before ``utxo_cache`` is rebuilt):
+
+        * ``prior_known_outpoints`` - outpoints the wallet already held, so
+          pre-existing coins (the original deposit, or coins present at startup)
+          are never auto-frozen; only freshly arrived UTXOs are considered.
+        * ``prior_funded_addresses`` - addresses that already held a UTXO, used
+          to require that a reuse address was *empty* before the new arrival.
+          Per https://en.bitcoin.it/wiki/Privacy#Forced_address_reuse, a forced
+          payment to an already-spent (empty) used address should be frozen,
+          whereas coins arriving on an address that still holds funds should be
+          fully spent together (so we do not freeze those).
         """
-        return {utxo.outpoint for utxos in self.utxo_cache.values() for utxo in utxos}
+        prior_known_outpoints: set[str] = set()
+        prior_funded_addresses: set[str] = set()
+        for utxos in self.utxo_cache.values():
+            for utxo in utxos:
+                prior_known_outpoints.add(utxo.outpoint)
+                prior_funded_addresses.add(utxo.address)
+        return prior_known_outpoints, prior_funded_addresses
 
     def _record_history_address(self, address: str, origin: str | None = None) -> None:
         """Mark ``address`` as having on-chain history (current or spent).
@@ -494,7 +511,7 @@ class WalletSyncMixin:
         # transaction, leaving the original deposit (and any coins present at
         # startup) spendable.
         prior_used_addresses = set(self.addresses_with_history)
-        prior_known_outpoints = self._known_outpoints_snapshot()
+        prior_known_outpoints, prior_funded_addresses = self._pre_sync_freeze_snapshot()
 
         # Lazy-init: ensure descriptor wallet is loaded and seeded with our
         # descriptors before scanning. Production paths call
@@ -540,7 +557,9 @@ class WalletSyncMixin:
         if self.backend.supports_descriptor_scan:
             result = await self._sync_all_with_descriptors(fidelity_bond_addresses)
             if result is not None:
-                self._auto_freeze_reused_address_utxos(prior_used_addresses, prior_known_outpoints)
+                self._auto_freeze_reused_address_utxos(
+                    prior_used_addresses, prior_known_outpoints, prior_funded_addresses
+                )
                 self._apply_frozen_state()
                 return result
             # Fall back to address-by-address sync on failure
@@ -590,7 +609,9 @@ class WalletSyncMixin:
                 await self.sync_fidelity_bonds(bond_locktimes)
 
         logger.info(f"Sync complete: {sum(len(u) for u in result.values())} total UTXOs")
-        self._auto_freeze_reused_address_utxos(prior_used_addresses, prior_known_outpoints)
+        self._auto_freeze_reused_address_utxos(
+            prior_used_addresses, prior_known_outpoints, prior_funded_addresses
+        )
         self._apply_frozen_state()
         return result
 
@@ -1157,7 +1178,7 @@ class WalletSyncMixin:
         # Snapshot used addresses and known outpoints before this sync rebuilds
         # the cache, for the forced-address-reuse auto-freeze (issue #529).
         prior_used_addresses = set(self.addresses_with_history)
-        prior_known_outpoints = self._known_outpoints_snapshot()
+        prior_known_outpoints, prior_funded_addresses = self._pre_sync_freeze_snapshot()
 
         # Get the current descriptor range from Bitcoin Core and cache it
         # This is used by _find_address_path to know how far to scan
@@ -1527,7 +1548,9 @@ class WalletSyncMixin:
             f"{format_amount(total_value)} total"
         )
 
-        self._auto_freeze_reused_address_utxos(prior_used_addresses, prior_known_outpoints)
+        self._auto_freeze_reused_address_utxos(
+            prior_used_addresses, prior_known_outpoints, prior_funded_addresses
+        )
         self._apply_frozen_state()
         return result
 

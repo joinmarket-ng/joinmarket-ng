@@ -1,198 +1,290 @@
 """E2E test for the forced-address-reuse auto-freeze (issue #529).
 
-Funds a wallet's deposit address, syncs (recording it as used), then funds the
-*same* address again to simulate a forced address-reuse (dust) attack, and
-asserts that the second arrival is automatically frozen after the next sync so
-it is excluded from coin selection (and therefore never co-spent in a CoinJoin,
-which would link the wallet's coins via the common-input-ownership heuristic).
+Per https://en.bitcoin.it/wiki/Privacy#Forced_address_reuse, a forced payment
+to an already-used *empty* address must never be spent (we freeze it), whereas
+coins arriving on an address that still holds funds should be fully spent
+together (so we do not freeze those). This drives the real sync path against a
+regtest bitcoind and asserts both behaviors, plus that an explicit unfreeze is
+not overridden by a later sync.
 
-Prerequisites:
-- Docker and Docker Compose installed
-- Run: docker compose --profile e2e up -d
-
-Usage:
-    pytest tests/e2e/test_address_reuse_freeze_e2e.py -v -s --timeout=120 -m e2e
+Requires: ``docker compose --profile e2e up -d`` (or the default regtest
+bitcoind). Run with: ``pytest tests/e2e/test_address_reuse_freeze_e2e.py -m e2e``.
 """
 
 from __future__ import annotations
 
+import secrets
+from collections.abc import AsyncGenerator
 from pathlib import Path
+from tempfile import TemporaryDirectory
+from typing import Any
 
+import httpx
 import pytest
 import pytest_asyncio
 from loguru import logger
 
-from jmwallet.backends.descriptor_wallet import DescriptorWalletBackend
+from jmwallet.backends.descriptor_wallet import (
+    DescriptorWalletBackend,
+    generate_wallet_name,
+    get_mnemonic_fingerprint,
+)
+from jmwallet.cli.mnemonic import generate_mnemonic_secure
 from jmwallet.wallet.service import WalletService
+from jmwallet.wallet.spend import direct_send
 from jmwallet.wallet.utxo_metadata import AUTO_FREEZE_REUSE_LABEL
 
 pytestmark = pytest.mark.e2e
 
-# Standard test mnemonic (12 words). Never a real-funds wallet.
-TEST_MNEMONIC = (
-    "abandon abandon abandon abandon abandon abandon "
-    "abandon abandon abandon abandon abandon about"
-)
+_RPC_TIMEOUT = 120.0
 
 
-@pytest.fixture
-def bitcoin_backend() -> DescriptorWalletBackend:
-    return DescriptorWalletBackend(
-        rpc_url="http://127.0.0.1:18443",
-        rpc_user="test",
-        rpc_password="test",
-    )
+async def _rpc(
+    cfg: dict[str, str],
+    method: str,
+    params: list[Any] | None = None,
+    wallet: str | None = None,
+) -> Any:
+    url = cfg["rpc_url"].rstrip("/")
+    if wallet:
+        url = f"{url}/wallet/{wallet}"
+    payload = {
+        "jsonrpc": "1.0",
+        "id": "jmng-529",
+        "method": method,
+        "params": params or [],
+    }
+    async with httpx.AsyncClient(timeout=_RPC_TIMEOUT) as client:
+        response = await client.post(
+            url, auth=(cfg["rpc_user"], cfg["rpc_password"]), json=payload
+        )
+    data = response.json()
+    if data.get("error"):
+        raise RuntimeError(f"{method} RPC error: {data['error']}")
+    return data.get("result")
 
 
 @pytest_asyncio.fixture
-async def reuse_wallet(bitcoin_backend, tmp_path: Path):
-    """A wallet with auto-freeze-all-reuse enabled and a fresh Core wallet."""
-    from jmwallet.backends.descriptor_wallet import (
-        generate_wallet_name,
-        get_mnemonic_fingerprint,
-    )
+async def funded_miner(
+    bitcoin_rpc_config: dict[str, str],
+) -> AsyncGenerator[tuple[str, str], None]:
+    """Per-test miner wallet on Core; returns ``(wallet_name, miner_addr)``."""
+    name = f"miner_{secrets.token_hex(4)}"
+    await _rpc(bitcoin_rpc_config, "createwallet", [name])
+    addr = await _rpc(bitcoin_rpc_config, "getnewaddress", ["", "bech32"], wallet=name)
+    await _rpc(bitcoin_rpc_config, "generatetoaddress", [110, addr], wallet=name)
+    yield name, addr
 
-    from tests.e2e.rpc_utils import rpc_call
 
-    fingerprint = get_mnemonic_fingerprint(TEST_MNEMONIC, "")
-    wallet_name = generate_wallet_name(fingerprint, "regtest")
-    # Start from a clean Core wallet so funding history is isolated per run.
-    try:
-        await rpc_call("unloadwallet", [wallet_name])
-    except Exception:
-        pass
-
-    wallet = WalletService(
-        mnemonic=TEST_MNEMONIC,
-        backend=bitcoin_backend,
-        network="regtest",
-        mixdepth_count=5,
-        data_dir=tmp_path,
-        max_sats_freeze_reuse=-1,  # freeze ALL reuse
-    )
-    try:
-        yield wallet
-    finally:
-        await wallet.close()
+async def _fund(
+    cfg: dict[str, str], miner: str, miner_addr: str, address: str, btc: float
+) -> None:
+    await _rpc(cfg, "sendtoaddress", [address, btc], wallet=miner)
+    await _rpc(cfg, "generatetoaddress", [1, miner_addr], wallet=miner)
 
 
 @pytest.mark.asyncio
-async def test_forced_address_reuse_utxo_is_auto_frozen(
-    reuse_wallet: WalletService,
-    ensure_blockchain_ready,
+async def test_reuse_on_spent_empty_address_is_auto_frozen(
+    bitcoin_rpc_config: dict[str, str],
+    ensure_blockchain_ready: None,
+    funded_miner: tuple[str, str],
 ) -> None:
-    """A second UTXO on an already-used deposit address is auto-frozen.
+    """A new payment to a used address that was emptied is auto-frozen."""
+    miner, miner_addr = funded_miner
+    mnemonic = generate_mnemonic_secure(word_count=12)
+    fingerprint = get_mnemonic_fingerprint(mnemonic, "")
+    wallet_name = generate_wallet_name(fingerprint, "regtest")
 
-    Assertions are delta-based (not absolute counts) so the test is robust on a
-    reused regtest node where the deterministic deposit address may already
-    carry coinbase UTXOs from earlier runs.
+    with TemporaryDirectory() as tmp:
+        data_dir = Path(tmp)
+        backend = DescriptorWalletBackend(
+            rpc_url=bitcoin_rpc_config["rpc_url"],
+            rpc_user=bitcoin_rpc_config["rpc_user"],
+            rpc_password=bitcoin_rpc_config["rpc_password"],
+            wallet_name=wallet_name,
+        )
+        wallet = WalletService(
+            mnemonic=mnemonic,
+            backend=backend,
+            network="regtest",
+            mixdepth_count=5,
+            scan_range=1000,
+            data_dir=data_dir,
+            max_sats_freeze_reuse=-1,
+        )
+        try:
+            deposit = wallet.get_receive_address(mixdepth=0, index=0)
+            await _fund(bitcoin_rpc_config, miner, miner_addr, deposit, 0.01)
+            await wallet.setup_descriptor_wallet(scan_range=1000, rescan=True)
+            await wallet.sync_with_descriptor_wallet()
+            assert await wallet.get_balance(mixdepth=0) == 1_000_000
+
+            # Spend everything out of mixdepth 0 to empty the deposit address.
+            sweep_dest = wallet.get_receive_address(mixdepth=1, index=0)
+            await direct_send(
+                wallet=wallet,
+                backend=backend,
+                mixdepth=0,
+                amount_sats=0,  # sweep
+                destination=sweep_dest,
+                fee_rate=2.0,
+            )
+            await _rpc(
+                bitcoin_rpc_config, "generatetoaddress", [1, miner_addr], wallet=miner
+            )
+            await wallet.sync_with_descriptor_wallet()
+            # The deposit address is now used-but-empty.
+            assert not any(
+                u.address == deposit for u in wallet.utxo_cache.get(0, [])
+            ), "deposit address should be spent empty"
+            assert deposit in wallet.addresses_with_history
+
+            # Forced reuse: pay the now-empty used deposit address again.
+            await _fund(bitcoin_rpc_config, miner, miner_addr, deposit, 0.005)
+            await wallet.sync_with_descriptor_wallet()
+
+            reuse = [u for u in wallet.utxo_cache.get(0, []) if u.address == deposit]
+            assert len(reuse) == 1, f"expected the reuse UTXO, got {reuse}"
+            assert reuse[0].frozen is True, (
+                "reuse on a spent-empty address must be auto-frozen"
+            )
+
+            assert wallet.metadata_store is not None
+            assert wallet.metadata_store.is_frozen(reuse[0].outpoint)
+            record = wallet.metadata_store.records[reuse[0].outpoint]
+            assert record.label == AUTO_FREEZE_REUSE_LABEL
+
+            # Frozen reuse UTXO excluded from spendable balance.
+            assert await wallet.get_balance(mixdepth=0) == 0
+            logger.info(f"Auto-froze spent-empty reuse UTXO {reuse[0].outpoint}")
+        finally:
+            await wallet.close()
+
+
+@pytest.mark.asyncio
+async def test_reuse_while_address_still_funded_is_not_frozen(
+    bitcoin_rpc_config: dict[str, str],
+    ensure_blockchain_ready: None,
+    funded_miner: tuple[str, str],
+) -> None:
+    """Coins arriving on an address that still holds funds are not frozen.
+
+    The privacy-correct action there is to fully spend the address together, so
+    neither the original nor the new arrival is auto-frozen.
     """
-    from tests.e2e.rpc_utils import mine_blocks
+    miner, miner_addr = funded_miner
+    mnemonic = generate_mnemonic_secure(word_count=12)
+    fingerprint = get_mnemonic_fingerprint(mnemonic, "")
+    wallet_name = generate_wallet_name(fingerprint, "regtest")
 
-    wallet = reuse_wallet
+    with TemporaryDirectory() as tmp:
+        data_dir = Path(tmp)
+        backend = DescriptorWalletBackend(
+            rpc_url=bitcoin_rpc_config["rpc_url"],
+            rpc_user=bitcoin_rpc_config["rpc_user"],
+            rpc_password=bitcoin_rpc_config["rpc_password"],
+            wallet_name=wallet_name,
+        )
+        wallet = WalletService(
+            mnemonic=mnemonic,
+            backend=backend,
+            network="regtest",
+            mixdepth_count=5,
+            scan_range=1000,
+            data_dir=data_dir,
+            max_sats_freeze_reuse=-1,
+        )
+        try:
+            deposit = wallet.get_receive_address(mixdepth=0, index=0)
+            await _fund(bitcoin_rpc_config, miner, miner_addr, deposit, 0.01)
+            await wallet.setup_descriptor_wallet(scan_range=1000, rescan=True)
+            await wallet.sync_with_descriptor_wallet()
 
-    # First-time descriptor setup (no rescan needed for a fresh wallet).
-    await wallet.setup_descriptor_wallet(rescan=False, fidelity_bond_addresses=None)
+            # Pay the SAME address again without spending the first UTXO.
+            await _fund(bitcoin_rpc_config, miner, miner_addr, deposit, 0.005)
+            await wallet.sync_with_descriptor_wallet()
 
-    deposit_address = wallet.get_receive_address(0, 0)
-    logger.info(f"Deposit address: {deposit_address}")
-
-    # 1) Initial funding + sync. On a fresh node this is a single UTXO; on a
-    #    reused node there may be several. None are frozen, because on the very
-    #    first sight of the address it is recorded as used only AFTER scanning
-    #    (so an address is "reuse" only on a later sync).
-    await mine_blocks(1, deposit_address)
-    await mine_blocks(110, "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080")
-
-    await wallet.sync_with_descriptor_wallet()
-    before = [u for u in wallet.utxo_cache.get(0, []) if u.address == deposit_address]
-    assert before, "expected at least one deposit UTXO after funding"
-    assert all(not u.frozen for u in before), (
-        "initial deposits on a freshly-recorded address must stay spendable"
-    )
-    spendable_before = {u.outpoint for u in before if not u.frozen}
-    assert deposit_address in wallet.addresses_with_history
-
-    # 2) Forced reuse: a second coinbase to the SAME address, then mature.
-    await mine_blocks(1, deposit_address)
-    await mine_blocks(110, "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080")
-
-    await wallet.sync_with_descriptor_wallet()
-    after = [u for u in wallet.utxo_cache.get(0, []) if u.address == deposit_address]
-    new_utxos = [u for u in after if u.outpoint not in spendable_before]
-    assert len(new_utxos) == 1, (
-        f"expected exactly one new reuse UTXO, got {len(new_utxos)}"
-    )
-    reuse_utxo = new_utxos[0]
-
-    # The newly arrived reuse UTXO is auto-frozen; previously-spendable UTXOs
-    # are untouched.
-    assert reuse_utxo.frozen is True, "the reuse UTXO must be auto-frozen"
-    still_spendable = {
-        u.outpoint for u in after if not u.frozen and u.outpoint in spendable_before
-    }
-    assert still_spendable == spendable_before, (
-        "previously-spendable UTXOs must remain spendable"
-    )
-
-    # The freeze is persisted and labeled as an automatic reuse freeze.
-    assert wallet.metadata_store is not None
-    assert wallet.metadata_store.is_frozen(reuse_utxo.outpoint)
-    record = wallet.metadata_store.records[reuse_utxo.outpoint]
-    assert record.label == AUTO_FREEZE_REUSE_LABEL
-
-    # The frozen reuse UTXO is excluded from the spendable balance.
-    spendable_balance = await wallet.get_balance(0)
-    expected_spendable = sum(u.value for u in after if not u.frozen)
-    assert spendable_balance == expected_spendable, (
-        "frozen reuse UTXO must be excluded from the spendable balance"
-    )
-
-    logger.info(
-        f"Auto-froze reuse UTXO {reuse_utxo.outpoint} ({reuse_utxo.value} sats); "
-        f"{len(spendable_before)} earlier UTXO(s) stay spendable."
-    )
+            utxos = [u for u in wallet.utxo_cache.get(0, []) if u.address == deposit]
+            assert len(utxos) == 2, (
+                f"expected two UTXOs on the address, got {len(utxos)}"
+            )
+            assert all(not u.frozen for u in utxos), (
+                "reuse on an address that still holds funds must not be auto-frozen"
+            )
+            # Full balance remains spendable.
+            assert await wallet.get_balance(mixdepth=0) == 1_500_000
+        finally:
+            await wallet.close()
 
 
 @pytest.mark.asyncio
 async def test_unfrozen_reuse_utxo_is_not_refrozen(
-    reuse_wallet: WalletService,
-    ensure_blockchain_ready,
+    bitcoin_rpc_config: dict[str, str],
+    ensure_blockchain_ready: None,
+    funded_miner: tuple[str, str],
 ) -> None:
     """An explicitly unfrozen reuse UTXO stays spendable across later syncs."""
-    from tests.e2e.rpc_utils import mine_blocks
+    miner, miner_addr = funded_miner
+    mnemonic = generate_mnemonic_secure(word_count=12)
+    fingerprint = get_mnemonic_fingerprint(mnemonic, "")
+    wallet_name = generate_wallet_name(fingerprint, "regtest")
 
-    wallet = reuse_wallet
-    await wallet.setup_descriptor_wallet(rescan=False, fidelity_bond_addresses=None)
-    deposit_address = wallet.get_receive_address(0, 0)
+    with TemporaryDirectory() as tmp:
+        data_dir = Path(tmp)
+        backend = DescriptorWalletBackend(
+            rpc_url=bitcoin_rpc_config["rpc_url"],
+            rpc_user=bitcoin_rpc_config["rpc_user"],
+            rpc_password=bitcoin_rpc_config["rpc_password"],
+            wallet_name=wallet_name,
+        )
+        wallet = WalletService(
+            mnemonic=mnemonic,
+            backend=backend,
+            network="regtest",
+            mixdepth_count=5,
+            scan_range=1000,
+            data_dir=data_dir,
+            max_sats_freeze_reuse=-1,
+        )
+        try:
+            deposit = wallet.get_receive_address(mixdepth=0, index=0)
+            await _fund(bitcoin_rpc_config, miner, miner_addr, deposit, 0.01)
+            await wallet.setup_descriptor_wallet(scan_range=1000, rescan=True)
+            await wallet.sync_with_descriptor_wallet()
 
-    await mine_blocks(1, deposit_address)
-    await mine_blocks(110, "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080")
-    await wallet.sync_with_descriptor_wallet()
-    before = {
-        u.outpoint
-        for u in wallet.utxo_cache.get(0, [])
-        if u.address == deposit_address and not u.frozen
-    }
+            sweep_dest = wallet.get_receive_address(mixdepth=1, index=0)
+            await direct_send(
+                wallet=wallet,
+                backend=backend,
+                mixdepth=0,
+                amount_sats=0,
+                destination=sweep_dest,
+                fee_rate=2.0,
+            )
+            await _rpc(
+                bitcoin_rpc_config, "generatetoaddress", [1, miner_addr], wallet=miner
+            )
+            await wallet.sync_with_descriptor_wallet()
 
-    await mine_blocks(1, deposit_address)
-    await mine_blocks(110, "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080")
-    await wallet.sync_with_descriptor_wallet()
+            await _fund(bitcoin_rpc_config, miner, miner_addr, deposit, 0.005)
+            await wallet.sync_with_descriptor_wallet()
+            reuse = [u for u in wallet.utxo_cache.get(0, []) if u.address == deposit]
+            assert len(reuse) == 1 and reuse[0].frozen is True
+            frozen_outpoint = reuse[0].outpoint
 
-    after = [u for u in wallet.utxo_cache.get(0, []) if u.address == deposit_address]
-    new_frozen = [u for u in after if u.frozen and u.outpoint not in before]
-    assert len(new_frozen) == 1, "exactly one new reuse UTXO must be auto-frozen"
-    frozen_outpoint = new_frozen[0].outpoint
+            # User deliberately unfreezes it.
+            wallet.unfreeze_utxo(frozen_outpoint)
+            assert wallet.metadata_store is not None
+            assert not wallet.metadata_store.is_frozen(frozen_outpoint)
 
-    # User deliberately unfreezes the reuse UTXO.
-    wallet.unfreeze_utxo(frozen_outpoint)
-    assert wallet.metadata_store is not None
-    assert not wallet.metadata_store.is_frozen(frozen_outpoint)
-
-    # A subsequent sync must NOT re-freeze it.
-    await wallet.sync_with_descriptor_wallet()
-    again = [u for u in wallet.utxo_cache.get(0, []) if u.outpoint == frozen_outpoint]
-    assert len(again) == 1
-    assert again[0].frozen is False, (
-        "an explicitly unfrozen reuse UTXO must stay spendable"
-    )
+            # A later sync must NOT re-freeze it.
+            await wallet.sync_with_descriptor_wallet()
+            again = [
+                u for u in wallet.utxo_cache.get(0, []) if u.outpoint == frozen_outpoint
+            ]
+            assert len(again) == 1
+            assert again[0].frozen is False, (
+                "an explicitly unfrozen reuse UTXO must stay spendable"
+            )
+        finally:
+            await wallet.close()

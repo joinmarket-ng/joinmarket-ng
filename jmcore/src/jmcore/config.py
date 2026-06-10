@@ -273,11 +273,14 @@ class WalletConfig(BaseModel):
         default=-1,
         ge=-1,
         description=(
-            "Threshold (sats) below which an incoming UTXO on an already-used "
-            "wallet address is automatically frozen, to defend against forced "
-            "address-reuse attacks. -1 freezes all such reuse UTXOs (default); "
-            "a positive N freezes only those with value <= N sats; 0 disables "
-            "auto-freezing. See https://en.bitcoin.it/wiki/Privacy#Forced_address_reuse."
+            "Threshold (sats) below which an incoming UTXO on a previously-used "
+            "wallet address that is now empty is automatically frozen, to defend "
+            "against forced address-reuse attacks. Only re-funding of an "
+            "already-spent (empty) used address is frozen; coins on an address "
+            "that still holds funds are left spendable. -1 freezes all such "
+            "reuse UTXOs (default); a positive N freezes only those with value "
+            "<= N sats; 0 disables auto-freezing. See "
+            "https://en.bitcoin.it/wiki/Privacy#Forced_address_reuse."
         ),
     )
 
