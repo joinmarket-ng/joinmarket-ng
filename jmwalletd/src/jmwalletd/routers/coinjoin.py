@@ -36,6 +36,90 @@ from jmwalletd.state import CoinjoinState, DaemonState
 router = APIRouter()
 
 
+def build_coinjoin_taker_config(
+    *,
+    body: Any,
+    mnemonic: Any,
+    jm_settings: Any,
+    taker_config_cls: Any,
+) -> Any:
+    """Build a ``TakerConfig`` for a one-shot ``do_coinjoin`` request.
+
+    Mirrors ``taker.cli.build_taker_config`` so a CoinJoin started through the
+    daemon honors the same ``[taker]`` policy settings (passed via config or
+    ``TAKER__*`` env) as the CLI taker. Previously this endpoint set only the
+    network/Tor/directory fields, so every other taker policy silently fell
+    back to ``TakerConfig`` defaults.
+
+    In particular ``minimum_makers`` is capped against the requested
+    ``counterparties`` (as ``build_taker_config`` and
+    ``build_tumbler_taker_config`` do): a request for fewer makers than the
+    policy ``minimum_makers`` (default 4) would otherwise select a valid
+    N-maker CoinJoin and then reject it with ``Not enough makers selected: N``.
+    """
+    from taker.config import BroadcastPolicy, MaxCjFee
+
+    counterparties = int(body.counterparties)
+    effective_minimum_makers = min(jm_settings.taker.minimum_makers, counterparties)
+
+    # Resolve fee settings: config fee_rate takes precedence over a block
+    # target, falling back to the wallet's default block target.
+    effective_fee_rate: float | None = None
+    effective_block_target: int | None = None
+    if jm_settings.taker.fee_rate is not None:
+        effective_fee_rate = jm_settings.taker.fee_rate
+    else:
+        effective_block_target = (
+            jm_settings.taker.fee_block_target
+            if jm_settings.taker.fee_block_target is not None
+            else jm_settings.wallet.default_fee_block_target
+        )
+
+    try:
+        broadcast_policy = BroadcastPolicy(jm_settings.taker.tx_broadcast)
+    except ValueError:
+        broadcast_policy = BroadcastPolicy.MULTIPLE_PEERS
+
+    return taker_config_cls(
+        mnemonic=mnemonic,
+        mixdepth=body.mixdepth,
+        amount=body.amount_sats,
+        destination_address=body.destination,
+        counterparty_count=counterparties,
+        network=jm_settings.network_config.network,
+        directory_servers=jm_settings.get_directory_servers(),
+        socks_host=jm_settings.tor.socks_host,
+        socks_port=jm_settings.tor.socks_port,
+        stream_isolation=jm_settings.tor.stream_isolation,
+        connection_timeout=jm_settings.tor.connection_timeout,
+        mixdepth_count=jm_settings.wallet.mixdepth_count,
+        gap_limit=jm_settings.wallet.gap_limit,
+        scan_range=jm_settings.wallet.scan_range,
+        dust_threshold=jm_settings.wallet.dust_threshold,
+        max_cj_fee=MaxCjFee(
+            abs_fee=jm_settings.taker.max_cj_fee_abs,
+            rel_fee=jm_settings.taker.max_cj_fee_rel,
+        ),
+        tx_fee_factor=jm_settings.taker.tx_fee_factor,
+        fee_rate=effective_fee_rate,
+        fee_block_target=effective_block_target,
+        max_fee_rate_sat_vb=jm_settings.wallet.max_fee_rate_sat_vb,
+        bondless_makers_allowance=jm_settings.taker.bondless_makers_allowance,
+        bond_value_exponent=jm_settings.taker.bond_value_exponent,
+        bondless_makers_allowance_require_zero_fee=jm_settings.taker.bondless_require_zero_fee,
+        maker_timeout_sec=jm_settings.taker.maker_timeout_sec,
+        order_wait_time=jm_settings.taker.order_wait_time,
+        tx_broadcast=broadcast_policy,
+        broadcast_peer_count=jm_settings.taker.broadcast_peer_count,
+        minimum_makers=effective_minimum_makers,
+        rescan_interval_sec=jm_settings.taker.rescan_interval_sec,
+        pending_tx_abandon_hours=jm_settings.taker.pending_tx_abandon_hours,
+        taker_utxo_age=jm_settings.taker.taker_utxo_age,
+        taker_utxo_retries=jm_settings.taker.taker_utxo_retries,
+        taker_utxo_amtpercent=jm_settings.taker.taker_utxo_amtpercent,
+    )
+
+
 # ---------------------------------------------------------------------------
 # POST /api/v1/wallet/{walletname}/taker/direct-send
 # ---------------------------------------------------------------------------
@@ -112,17 +196,11 @@ async def do_coinjoin(
                     network=get_settings().network_config.network.value,
                 )
                 jm_settings = get_settings()
-                config = TakerConfig(
+                config = build_coinjoin_taker_config(
+                    body=body,
                     mnemonic=state.wallet_mnemonic,
-                    mixdepth=body.mixdepth,
-                    amount=body.amount_sats,
-                    destination_address=body.destination,  # type: ignore[arg-type]
-                    counterparty_count=body.counterparties,
-                    network=jm_settings.network_config.network,
-                    directory_servers=jm_settings.get_directory_servers(),
-                    socks_host=jm_settings.tor.socks_host,
-                    socks_port=jm_settings.tor.socks_port,
-                    stream_isolation=jm_settings.tor.stream_isolation,
+                    jm_settings=jm_settings,
+                    taker_config_cls=TakerConfig,
                 )
                 taker = Taker(
                     wallet=ws,
