@@ -325,6 +325,34 @@ class TestBuildMakerConfig:
         assert config.offer_type == OfferType.SW0_RELATIVE
         assert config.cj_fee_relative == "0.002"
 
+    def test_max_sats_freeze_reuse_forwarded(self) -> None:
+        """``wallet.max_sats_freeze_reuse`` must reach the MakerConfig (#529)."""
+        from jmcore.settings import JoinMarketSettings
+
+        from maker.cli import build_maker_config
+
+        settings = JoinMarketSettings()
+        settings.wallet.max_sats_freeze_reuse = 9_999
+        config = build_maker_config(
+            settings=settings,
+            mnemonic=TEST_MNEMONIC,
+            passphrase="",
+        )
+        assert config.max_sats_freeze_reuse == 9_999
+
+    def test_max_sats_freeze_reuse_defaults_to_freeze_all(self) -> None:
+        """Default ``max_sats_freeze_reuse`` is -1 (freeze all reuse)."""
+        from jmcore.settings import JoinMarketSettings
+
+        from maker.cli import build_maker_config
+
+        config = build_maker_config(
+            settings=JoinMarketSettings(),
+            mnemonic=TEST_MNEMONIC,
+            passphrase="",
+        )
+        assert config.max_sats_freeze_reuse == -1
+
     def test_dual_offers_creates_two_configs(self) -> None:
         """Test that --dual-offers creates both relative and absolute offer configs."""
         from jmcore.settings import JoinMarketSettings

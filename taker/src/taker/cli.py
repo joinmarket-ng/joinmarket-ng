@@ -236,6 +236,7 @@ def build_taker_config(
         gap_limit=settings.wallet.gap_limit,
         scan_range=settings.wallet.scan_range,
         dust_threshold=settings.wallet.dust_threshold,
+        max_sats_freeze_reuse=settings.wallet.max_sats_freeze_reuse,
         smart_scan=settings.wallet.smart_scan,
         background_full_rescan=settings.wallet.background_full_rescan,
         scan_lookback_blocks=settings.wallet.scan_lookback_blocks,
@@ -577,6 +578,7 @@ async def _run_coinjoin(
         gap_limit=config.gap_limit,
         scan_range=config.scan_range,
         data_dir=config.data_dir,
+        max_sats_freeze_reuse=config.max_sats_freeze_reuse,
     )
 
     # Create confirmation callback
@@ -858,6 +860,7 @@ async def _run_tumble(
         gap_limit=config.gap_limit,
         scan_range=config.scan_range,
         data_dir=config.data_dir,
+        max_sats_freeze_reuse=config.max_sats_freeze_reuse,
     )
 
     # Create taker

@@ -82,6 +82,26 @@ jm-maker start --merge-algorithm=greedy
 
 Privacy tradeoff: More inputs = faster consolidation but reveals UTXO clustering.
 
+### Forced Address-Reuse Auto-Freeze
+
+When a UTXO arrives on an address the wallet has already used, it is
+automatically frozen during sync so it is never co-spent in a CoinJoin (which
+would link the wallet's coins via the common-input-ownership heuristic). This
+defends against forced address-reuse (dust) attacks, where an adversary sends a
+small payment to a used address hoping it gets merged into a later transaction.
+See https://en.bitcoin.it/wiki/Privacy#Forced_address_reuse.
+
+Only a *newly arrived* UTXO to an *already-used* address is frozen; the original
+deposit at that address stays spendable, and the very first arrival on a fresh
+address is never frozen. Frozen reuse UTXOs are labeled in the metadata store
+and can be released with `jm-wallet unfreeze` (an explicit unfreeze is never
+overridden by a later sync). Fidelity bonds are exempt.
+
+The `[wallet] max_sats_freeze_reuse` setting controls the threshold: `-1`
+(default) freezes all reuse UTXOs, a positive `N` freezes only those with value
+`<= N` sats, and `0` disables the behavior. This mirrors the legacy
+joinmarket-clientserver `POLICY.max_sats_freeze_reuse` option.
+
 ### Backend Systems
 
 **Descriptor Wallet Backend (Recommended):**

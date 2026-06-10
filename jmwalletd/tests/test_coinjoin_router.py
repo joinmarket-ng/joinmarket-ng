@@ -144,6 +144,7 @@ class TestDoCoinjoin:
         mock_settings.wallet.gap_limit = 20
         mock_settings.wallet.scan_range = 1000
         mock_settings.wallet.dust_threshold = 27300
+        mock_settings.wallet.max_sats_freeze_reuse = -1
         mock_settings.wallet.max_fee_rate_sat_vb = 1000.0
         mock_settings.wallet.default_fee_block_target = 3
         mock_get_settings.return_value = mock_settings
@@ -222,6 +223,7 @@ class TestBuildCoinjoinTakerConfig:
                 gap_limit=20,
                 scan_range=1000,
                 dust_threshold=27300,
+                max_sats_freeze_reuse=-1,
                 max_fee_rate_sat_vb=1000.0,
                 default_fee_block_target=3,
             ),

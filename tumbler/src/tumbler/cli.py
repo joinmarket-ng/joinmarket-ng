@@ -801,6 +801,7 @@ async def _balances_for_mnemonic(
         network=(config.bitcoin_network or config.network).value,
         mixdepth_count=config.mixdepth_count,
         data_dir=config.data_dir,
+        max_sats_freeze_reuse=config.max_sats_freeze_reuse,
     )
     try:
         await wallet.sync()
@@ -904,6 +905,7 @@ async def _run_plan(
         network=bitcoin_network.value,
         mixdepth_count=taker_config.mixdepth_count,
         data_dir=taker_config.data_dir,
+        max_sats_freeze_reuse=taker_config.max_sats_freeze_reuse,
     )
     try:
         await wallet.sync()

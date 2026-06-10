@@ -41,6 +41,18 @@ def _get_network() -> str:
     return network_config.network.value
 
 
+def _get_max_sats_freeze_reuse() -> int:
+    """Return the configured forced-address-reuse auto-freeze threshold.
+
+    See ``WalletSettings.max_sats_freeze_reuse`` (issue #529): -1 freezes all
+    reuse UTXOs (default), a positive N freezes only those <= N sats, 0
+    disables the behavior.
+    """
+    from jmcore.settings import get_settings
+
+    return get_settings().wallet.max_sats_freeze_reuse
+
+
 async def create_wallet(
     *,
     wallet_path: Path,
@@ -100,6 +112,7 @@ async def create_wallet(
         backend=backend,
         data_dir=data_dir,
         network=_get_network(),
+        max_sats_freeze_reuse=_get_max_sats_freeze_reuse(),
     )
 
     # Persist the wallet file (encrypted with the password).
@@ -170,6 +183,7 @@ async def recover_wallet(
         backend=backend,
         data_dir=data_dir,
         network=_get_network(),
+        max_sats_freeze_reuse=_get_max_sats_freeze_reuse(),
     )
 
     _save_wallet_file(
@@ -234,6 +248,7 @@ async def open_wallet_with_mnemonic(
         backend=backend,
         data_dir=data_dir,
         network=_get_network(),
+        max_sats_freeze_reuse=_get_max_sats_freeze_reuse(),
     )
 
     # Ensure the watch-only descriptor wallet is loaded in Bitcoin Core

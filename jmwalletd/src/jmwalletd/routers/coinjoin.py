@@ -96,6 +96,7 @@ def build_coinjoin_taker_config(
         gap_limit=jm_settings.wallet.gap_limit,
         scan_range=jm_settings.wallet.scan_range,
         dust_threshold=jm_settings.wallet.dust_threshold,
+        max_sats_freeze_reuse=jm_settings.wallet.max_sats_freeze_reuse,
         max_cj_fee=MaxCjFee(
             abs_fee=jm_settings.taker.max_cj_fee_abs,
             rel_fee=jm_settings.taker.max_cj_fee_rel,

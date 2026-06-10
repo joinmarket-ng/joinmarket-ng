@@ -21,6 +21,7 @@ from jmwallet.wallet.models import UTXOInfo
 from jmwallet.wallet.signer import WalletSigningMixin
 from jmwallet.wallet.sync import WalletSyncMixin
 from jmwallet.wallet.utxo_metadata import (
+    AUTO_FREEZE_REUSE_LABEL,
     DEFAULT_COINJOIN_LOCK_TTL,
     UTXOMetadataStore,
     load_metadata_store,
@@ -55,6 +56,7 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin, Wal
         scan_range: int = DEFAULT_SCAN_RANGE,
         data_dir: Path | None = None,
         passphrase: str = "",
+        max_sats_freeze_reuse: int = -1,
     ):
         self.backend = backend
         self.network = network
@@ -67,6 +69,12 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin, Wal
         self.gap_limit = gap_limit
         self.scan_range = scan_range
         self.data_dir = data_dir
+        # Forced address-reuse defense (issue #529): a UTXO that lands on an
+        # already-used wallet address is auto-frozen during sync when its value
+        # is <= ``max_sats_freeze_reuse`` (or always, when it is -1). 0 disables
+        # the behavior. Matches legacy joinmarket-clientserver's
+        # ``POLICY.max_sats_freeze_reuse``.
+        self.max_sats_freeze_reuse = max_sats_freeze_reuse
 
         seed = mnemonic_to_seed(mnemonic, passphrase)
         self.master_key = HDKey.from_seed(seed)
@@ -717,6 +725,88 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin, Wal
         await self.backend.close()
 
     # -- UTXO metadata (Group J) -------------------------------------------
+
+    def _auto_freeze_reused_address_utxos(
+        self,
+        prior_used_addresses: set[str],
+        prior_known_outpoints: set[str],
+    ) -> int:
+        """Auto-freeze UTXOs that landed on an already-used wallet address.
+
+        Defends against forced address-reuse (dust) attacks: an adversary pays
+        a small amount to an address the wallet already used, hoping it gets
+        co-spent and linked via the common-input-ownership heuristic. Per
+        https://en.bitcoin.it/wiki/Privacy#Forced_address_reuse the correct
+        behavior is to never spend such coins, which we achieve by freezing
+        them (the user can still ``unfreeze`` and fully spend the address).
+
+        Mirrors legacy joinmarket-clientserver's ``check_for_reuse``: only a
+        *newly arrived* UTXO to an *already-used* address is frozen, so the
+        original deposit at that address stays spendable.
+
+        * ``prior_used_addresses`` is the wallet's used-address set captured
+          *before* this sync recorded the current UTXOs' addresses, so a UTXO
+          counts as reuse only when its address was used by an earlier
+          transaction (not merely by itself in this same sync).
+        * ``prior_known_outpoints`` is the set of UTXO outpoints the wallet
+          already had before this sync; UTXOs in it are pre-existing (the
+          original deposit, or coins discovered at startup) and are never
+          auto-frozen. This is why the first sync of a freshly opened wallet
+          freezes nothing: every UTXO is either new on a not-yet-used address
+          or pre-existing.
+        * A UTXO is frozen when ``max_sats_freeze_reuse == -1`` (freeze all
+          reuse) or its value is ``<= max_sats_freeze_reuse``. ``0`` disables
+          the behavior entirely.
+
+        A UTXO that already has a metadata record (e.g. one the user
+        deliberately unfroze, which keeps a labeled record) is left untouched,
+        so an explicit unfreeze is never overridden. Fidelity bonds (timelocked,
+        on the dedicated bond branch) are skipped.
+
+        Returns the number of UTXOs newly frozen.
+        """
+        if self.metadata_store is None:
+            return 0
+        threshold = self.max_sats_freeze_reuse
+        if threshold == 0:
+            return 0
+        if not prior_used_addresses:
+            return 0
+
+        frozen_now = 0
+        for utxos in self.utxo_cache.values():
+            for utxo in utxos:
+                if utxo.is_fidelity_bond:
+                    continue
+                outpoint = utxo.outpoint
+                # Pre-existing UTXOs (the original deposit, or coins present at
+                # startup) are never auto-frozen -- only freshly arrived ones.
+                if outpoint in prior_known_outpoints:
+                    continue
+                if utxo.address not in prior_used_addresses:
+                    continue
+                if threshold != -1 and utxo.value > threshold:
+                    continue
+                # Skip UTXOs the wallet already tracks (already frozen, labeled,
+                # locked, or previously evaluated): never override a user's
+                # explicit unfreeze of a reuse UTXO.
+                if self.metadata_store.has_record(outpoint):
+                    continue
+                self.metadata_store.freeze(outpoint, label=AUTO_FREEZE_REUSE_LABEL)
+                utxo.frozen = True
+                frozen_now += 1
+                logger.warning(
+                    "Auto-froze UTXO to prevent forced address reuse: "
+                    f"{outpoint} ({utxo.value} sats at {utxo.address[:16]}...). "
+                    "Unfreeze with 'jm-wallet unfreeze' if intentional."
+                )
+
+        if frozen_now:
+            logger.warning(
+                f"Auto-froze {frozen_now} UTXO(s) on reused addresses "
+                "(forced-address-reuse defense)."
+            )
+        return frozen_now
 
     def _apply_frozen_state(self) -> None:
         """Apply frozen state from metadata store to all cached UTXOs.

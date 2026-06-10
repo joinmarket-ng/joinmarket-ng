@@ -76,6 +76,7 @@ class WalletSyncMixin:
     addresses_with_history: set[str]
     metadata_store: Any  # UTXOMetadataStore | None (deferred import)
     fidelity_bond_locktime_cache: dict[str, int]
+    max_sats_freeze_reuse: int
 
     # Methods provided by the host class
     def get_address(self, mixdepth: int, change: int, index: int) -> str:
@@ -90,7 +91,22 @@ class WalletSyncMixin:
     def _apply_frozen_state(self) -> None:
         raise NotImplementedError
 
+    def _auto_freeze_reused_address_utxos(
+        self, prior_used_addresses: set[str], prior_known_outpoints: set[str]
+    ) -> int:
+        raise NotImplementedError
+
     # -- Persistent address-history tracking --------------------------------
+
+    def _known_outpoints_snapshot(self) -> set[str]:
+        """Return the set of UTXO outpoints currently in ``utxo_cache``.
+
+        Captured at the start of a sync so the forced-address-reuse auto-freeze
+        (issue #529) can tell which UTXOs are pre-existing (the original
+        deposit, or coins discovered at startup) and therefore never auto-frozen
+        -- only freshly arrived UTXOs to an already-used address are frozen.
+        """
+        return {utxo.outpoint for utxos in self.utxo_cache.values() for utxo in utxos}
 
     def _record_history_address(self, address: str, origin: str | None = None) -> None:
         """Mark ``address`` as having on-chain history (current or spent).
@@ -471,6 +487,15 @@ class WalletSyncMixin:
         """
         logger.info("Syncing all mixdepths...")
 
+        # Snapshot the wallet's used-address set and the already-known UTXO
+        # outpoints *before* this sync rebuilds the cache, for the
+        # forced-address-reuse auto-freeze (issue #529): it freezes only a
+        # *newly arrived* UTXO whose address was already used by an earlier
+        # transaction, leaving the original deposit (and any coins present at
+        # startup) spendable.
+        prior_used_addresses = set(self.addresses_with_history)
+        prior_known_outpoints = self._known_outpoints_snapshot()
+
         # Lazy-init: ensure descriptor wallet is loaded and seeded with our
         # descriptors before scanning. Production paths call
         # ``setup_descriptor_wallet`` explicitly (jmwalletd.wallet_ops); this
@@ -515,6 +540,7 @@ class WalletSyncMixin:
         if self.backend.supports_descriptor_scan:
             result = await self._sync_all_with_descriptors(fidelity_bond_addresses)
             if result is not None:
+                self._auto_freeze_reused_address_utxos(prior_used_addresses, prior_known_outpoints)
                 self._apply_frozen_state()
                 return result
             # Fall back to address-by-address sync on failure
@@ -564,6 +590,7 @@ class WalletSyncMixin:
                 await self.sync_fidelity_bonds(bond_locktimes)
 
         logger.info(f"Sync complete: {sum(len(u) for u in result.values())} total UTXOs")
+        self._auto_freeze_reused_address_utxos(prior_used_addresses, prior_known_outpoints)
         self._apply_frozen_state()
         return result
 
@@ -1127,6 +1154,11 @@ class WalletSyncMixin:
 
         logger.info("Syncing via descriptor wallet (listunspent)...")
 
+        # Snapshot used addresses and known outpoints before this sync rebuilds
+        # the cache, for the forced-address-reuse auto-freeze (issue #529).
+        prior_used_addresses = set(self.addresses_with_history)
+        prior_known_outpoints = self._known_outpoints_snapshot()
+
         # Get the current descriptor range from Bitcoin Core and cache it
         # This is used by _find_address_path to know how far to scan
         current_range = await self.backend.get_max_descriptor_range()
@@ -1495,6 +1527,7 @@ class WalletSyncMixin:
             f"{format_amount(total_value)} total"
         )
 
+        self._auto_freeze_reused_address_utxos(prior_used_addresses, prior_known_outpoints)
         self._apply_frozen_state()
         return result
 

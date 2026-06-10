@@ -663,6 +663,7 @@ def sync_bonds(
             backend_settings,
             resolved_bip39_passphrase,
             creation_height=resolved_creation_height,
+            max_sats_freeze_reuse=settings.wallet.max_sats_freeze_reuse,
         )
     )
 
@@ -673,6 +674,7 @@ async def _sync_bonds_async(
     bip39_passphrase: str = "",
     *,
     creation_height: int | None = None,
+    max_sats_freeze_reuse: int = -1,
 ) -> None:
     """Sync only the bond addresses already present in the registry."""
     from jmcore.bitcoin import format_amount
@@ -732,6 +734,7 @@ async def _sync_bonds_async(
         mixdepth_count=5,
         passphrase=bip39_passphrase,
         data_dir=data_dir,
+        max_sats_freeze_reuse=max_sats_freeze_reuse,
     )
 
     try:
@@ -870,6 +873,7 @@ def recover_bonds(
             backend_settings,
             resolved_bip39_passphrase,
             creation_height=resolved_creation_height,
+            max_sats_freeze_reuse=settings.wallet.max_sats_freeze_reuse,
         )
     )
 
@@ -880,6 +884,7 @@ async def _recover_bonds_async(
     bip39_passphrase: str = "",
     *,
     creation_height: int | None = None,
+    max_sats_freeze_reuse: int = -1,
 ) -> None:
     """Async implementation of fidelity bond recovery."""
     from jmcore.timenumber import TIMENUMBER_COUNT
@@ -938,6 +943,7 @@ async def _recover_bonds_async(
         mixdepth_count=5,
         passphrase=bip39_passphrase,
         data_dir=backend_settings.data_dir,
+        max_sats_freeze_reuse=max_sats_freeze_reuse,
     )
 
     print("\nScanning for fidelity bonds...")

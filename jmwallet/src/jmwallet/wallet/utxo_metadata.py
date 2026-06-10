@@ -51,6 +51,11 @@ except ImportError:  # pragma: no cover - non-POSIX platforms
 
 USED_LABEL_PREFIX = "jm:used"
 
+# Label applied to UTXOs frozen automatically by the forced-address-reuse
+# defense (issue #529). The label keeps the record around after a user
+# ``unfreeze`` so the same UTXO is never silently re-frozen on the next sync.
+AUTO_FREEZE_REUSE_LABEL = "jm:autofrozen:reuse"
+
 # Default lifetime of a temporary CoinJoin UTXO lock. A round that fails,
 # crashes, or is killed without releasing its locks will have them auto-expire
 # after this many seconds, so funds are never blocked permanently.
@@ -365,16 +370,29 @@ class UTXOMetadataStore:
         """
         return {ref for ref, record in self.records.items() if record.is_frozen}
 
-    def freeze(self, outpoint: str) -> None:
+    def has_record(self, outpoint: str) -> bool:
+        """Whether any metadata record exists for ``outpoint``.
+
+        Used by the forced-address-reuse auto-freeze to skip UTXOs the wallet
+        already tracks (frozen, labeled, locked, or previously auto-evaluated),
+        so a user's explicit unfreeze of a reuse UTXO is never overridden.
+        """
+        return outpoint in self.records
+
+    def freeze(self, outpoint: str, label: str | None = None) -> None:
         """Freeze a UTXO (set spendable to False) and persist.
 
         Args:
             outpoint: Outpoint string in ``txid:vout`` format.
+            label: Optional label to attach (only set when the record has no
+                label yet), e.g. to mark an automatic forced-reuse freeze.
         """
         if outpoint in self.records:
             self.records[outpoint].spendable = False
+            if label is not None and self.records[outpoint].label is None:
+                self.records[outpoint].label = label
         else:
-            self.records[outpoint] = OutputRecord(ref=outpoint, spendable=False)
+            self.records[outpoint] = OutputRecord(ref=outpoint, spendable=False, label=label)
         self.save()
         logger.info(f"Frozen UTXO: {outpoint}")
 

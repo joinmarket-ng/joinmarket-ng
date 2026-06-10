@@ -402,6 +402,21 @@ class WalletSettings(BaseModel):
         ge=0,
         description="Dust threshold in satoshis",
     )
+    max_sats_freeze_reuse: int = Field(
+        default=-1,
+        ge=-1,
+        description=(
+            "Threshold (in satoshis) below which an incoming UTXO landing on an "
+            "already-used wallet address is AUTOMATICALLY frozen, to defend "
+            "against forced address-reuse (dust) attacks that try to coerce "
+            "linkage via the common-input-ownership heuristic "
+            "(https://en.bitcoin.it/wiki/Privacy#Forced_address_reuse). "
+            "The default -1 freezes ALL such reuse UTXOs regardless of value; "
+            "a positive N freezes only reuse UTXOs with value <= N sats; "
+            "0 effectively disables auto-freezing. Frozen UTXOs can be released "
+            "with ``jm-wallet unfreeze``."
+        ),
+    )
     smart_scan: bool = Field(
         default=True,
         description="Use smart scan for fast startup",

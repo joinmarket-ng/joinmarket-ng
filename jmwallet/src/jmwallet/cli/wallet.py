@@ -379,6 +379,7 @@ def info(
             display_gap=gap,
             gap_limit=settings.wallet.gap_limit,
             scan_range=settings.wallet.scan_range,
+            max_sats_freeze_reuse=settings.wallet.max_sats_freeze_reuse,
             show_empty=show_empty,
             creation_height=resolved.creation_height if resolved else None,
             scan_status_only=scan_status,
@@ -394,6 +395,7 @@ async def _show_wallet_info(
     display_gap: int = 6,
     gap_limit: int = 20,
     scan_range: int = 1000,
+    max_sats_freeze_reuse: int = -1,
     show_empty: bool = False,
     creation_height: int | None = None,
     scan_status_only: bool = False,
@@ -500,6 +502,7 @@ async def _show_wallet_info(
         scan_range=scan_range,
         passphrase=bip39_passphrase,
         data_dir=data_dir,
+        max_sats_freeze_reuse=max_sats_freeze_reuse,
     )
 
     try:
@@ -1297,6 +1300,7 @@ def rescan(
             creation_height=resolved.creation_height,
             scan_depth=scan_depth,
             gap_limit=settings.wallet.gap_limit,
+            max_sats_freeze_reuse=settings.wallet.max_sats_freeze_reuse,
         )
     )
 
@@ -1309,6 +1313,7 @@ async def _run_rescan(
     creation_height: int | None,
     scan_depth: int | None = None,
     gap_limit: int = 20,
+    max_sats_freeze_reuse: int = -1,
 ) -> None:
     """Implementation of ``jm-wallet rescan``.
 
@@ -1404,6 +1409,7 @@ async def _run_rescan(
                 scan_range=scan_depth,
                 passphrase=bip39_passphrase,
                 data_dir=backend_settings.data_dir,
+                max_sats_freeze_reuse=max_sats_freeze_reuse,
             )
             # Register the wider range without scanning (rescan=False), then
             # run an explicit block rescan from the requested height below.

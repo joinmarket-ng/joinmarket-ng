@@ -268,6 +268,19 @@ class WalletConfig(BaseModel):
         description="Dust threshold in satoshis for change outputs (default: 27300)",
     )
 
+    # Forced address-reuse defense
+    max_sats_freeze_reuse: int = Field(
+        default=-1,
+        ge=-1,
+        description=(
+            "Threshold (sats) below which an incoming UTXO on an already-used "
+            "wallet address is automatically frozen, to defend against forced "
+            "address-reuse attacks. -1 freezes all such reuse UTXOs (default); "
+            "a positive N freezes only those with value <= N sats; 0 disables "
+            "auto-freezing. See https://en.bitcoin.it/wiki/Privacy#Forced_address_reuse."
+        ),
+    )
+
     # Descriptor wallet scan configuration
     smart_scan: bool = Field(
         default=True,

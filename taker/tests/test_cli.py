@@ -80,6 +80,7 @@ class TestBuildTakerConfig:
         settings.wallet.gap_limit = 6
         settings.wallet.scan_range = 1000
         settings.wallet.dust_threshold = 546
+        settings.wallet.max_sats_freeze_reuse = -1
         settings.wallet.smart_scan = True
         settings.wallet.background_full_rescan = False
         settings.wallet.scan_lookback_blocks = 1000
@@ -128,6 +129,21 @@ class TestBuildTakerConfig:
 
         assert config.fee_rate is None
         assert config.fee_block_target == 3  # From wallet.default_fee_block_target
+
+    def test_max_sats_freeze_reuse_forwarded(
+        self, sample_mnemonic: str, mock_settings: MagicMock
+    ) -> None:
+        """``wallet.max_sats_freeze_reuse`` must reach the TakerConfig (#529)."""
+        mock_settings.wallet.max_sats_freeze_reuse = 12_345
+        config = build_taker_config(
+            settings=mock_settings,
+            mnemonic=sample_mnemonic,
+            passphrase="",
+            destination="bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+            amount=100000,
+            mixdepth=0,
+        )
+        assert config.max_sats_freeze_reuse == 12_345
 
     def test_explicit_block_target_overrides_default(
         self, sample_mnemonic: str, mock_settings: MagicMock
