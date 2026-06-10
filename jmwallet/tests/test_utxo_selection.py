@@ -1114,13 +1114,19 @@ class TestSyncFidelityBondDeduplication:
 
 
 class TestFreezeUnfreezeGuard:
-    """Tests for fidelity-bond guard in bulk unfreeze path."""
+    """Tests for the locked-fidelity-bond guard in the bulk unfreeze path.
 
-    def test_unfreeze_non_fidelity_bonds_skips_fidelity_bonds(self) -> None:
-        from jmwallet.cli.freeze import _unfreeze_non_fidelity_bonds
+    "Unfreeze all" must skip *still-locked* fidelity bonds (unfreezing them has
+    no effect until the timelock expires) but unfreeze *expired* fidelity bonds
+    like any other UTXO (they are spendable again).
+    """
 
-        wallet = MagicMock()
-        utxos = [
+    def _utxos(self) -> list[UTXOInfo]:
+        import time
+
+        future = int(time.time()) + 10 * 365 * 24 * 3600  # ~10 years out
+        return [
+            # Frozen regular UTXO -> unfreeze.
             UTXOInfo(
                 txid="e" * 64,
                 vout=0,
@@ -1132,18 +1138,33 @@ class TestFreezeUnfreezeGuard:
                 mixdepth=0,
                 frozen=True,
             ),
+            # Frozen LOCKED fidelity bond (locktime far in the future) -> skip.
             UTXOInfo(
                 txid="f" * 64,
                 vout=1,
                 value=500_000,
-                address="bc1qbond",
+                address="bc1qlockedbond",
                 confirmations=100,
                 scriptpubkey="0020" + "22" * 32,
                 path="m/84'/0'/0'/2/0",
                 mixdepth=0,
-                locktime=0,
+                locktime=future,
                 frozen=True,
             ),
+            # Frozen EXPIRED fidelity bond (locktime in the past) -> unfreeze.
+            UTXOInfo(
+                txid="b" * 64,
+                vout=0,
+                value=300_000,
+                address="bc1qexpiredbond",
+                confirmations=100,
+                scriptpubkey="0020" + "44" * 32,
+                path="m/84'/0'/0'/2/1",
+                mixdepth=0,
+                locktime=1,  # 1970, expired
+                frozen=True,
+            ),
+            # Unfrozen regular UTXO -> ignored.
             UTXOInfo(
                 txid="a" * 64,
                 vout=2,
@@ -1157,11 +1178,35 @@ class TestFreezeUnfreezeGuard:
             ),
         ]
 
-        unfrozen_count, skipped_count = _unfreeze_non_fidelity_bonds(wallet, utxos)
+    def test_unfreeze_skips_locked_bonds_but_unfreezes_expired(self) -> None:
+        from jmwallet.cli.freeze import _unfreeze_non_locked_utxos
 
-        assert unfrozen_count == 1
-        assert skipped_count == 1
-        wallet.toggle_freeze_utxo.assert_called_once_with(utxos[0].outpoint)
+        wallet = MagicMock()
+        utxos = self._utxos()
+
+        unfrozen_count, skipped_locked_bonds = _unfreeze_non_locked_utxos(wallet, utxos)
+
+        # The regular frozen UTXO and the EXPIRED bond are unfrozen; the LOCKED
+        # bond is skipped.
+        assert unfrozen_count == 2
+        assert skipped_locked_bonds == 1
+        unfrozen_outpoints = {call.args[0] for call in wallet.toggle_freeze_utxo.call_args_list}
+        assert unfrozen_outpoints == {utxos[0].outpoint, utxos[2].outpoint}
+        # The locked bond was never toggled.
+        assert utxos[1].outpoint not in unfrozen_outpoints
+
+    def test_is_freeze_toggleable(self) -> None:
+        from jmwallet.cli.freeze import _is_freeze_toggleable
+
+        regular, locked_bond, expired_bond, _unfrozen = self._utxos()
+        # Regular UTXO: toggleable.
+        assert _is_freeze_toggleable(regular) is True
+        # Locked fidelity bond: NOT toggleable (timelocked, freezing is a no-op).
+        assert locked_bond.is_locked is True
+        assert _is_freeze_toggleable(locked_bond) is False
+        # Expired fidelity bond: toggleable (spendable again, behaves like a UTXO).
+        assert expired_bond.is_locked is False
+        assert _is_freeze_toggleable(expired_bond) is True
 
 
 # ---------------------------------------------------------------------------

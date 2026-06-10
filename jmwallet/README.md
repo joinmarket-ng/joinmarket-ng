@@ -631,6 +631,11 @@ For full documentation, see [jmwallet Documentation](https://joinmarket-ng.githu
  automatic coin selection (taker, maker, and sweep operations).
  Changes take effect immediately on each toggle.
 
+ Still-locked fidelity bonds are shown as [FB-LOCKED] and cannot be toggled
+ (they are already unspendable until their timelock expires). Expired
+ fidelity bonds behave like regular UTXOs: they can be frozen/unfrozen, and
+ "unfreeze all" will unfreeze them.
+
 ╭─ Options ────────────────────────────────────────────────────────────────────╮
 │ --mnemonic-file            -f      PATH     Path to mnemonic file            │
 │                                             [env var: MNEMONIC_FILE]         │

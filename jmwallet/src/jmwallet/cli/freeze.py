@@ -72,6 +72,11 @@ def freeze(
     Frozen UTXOs are persisted in BIP-329 format and excluded from all
     automatic coin selection (taker, maker, and sweep operations).
     Changes take effect immediately on each toggle.
+
+    Still-locked fidelity bonds are shown as [FB-LOCKED] and cannot be toggled
+    (they are already unspendable until their timelock expires). Expired
+    fidelity bonds behave like regular UTXOs: they can be frozen/unfrozen, and
+    "unfreeze all" will unfreeze them.
     """
     settings = setup_cli(log_level, data_dir=data_dir)
 
@@ -250,25 +255,40 @@ def _show_freeze_status(utxos: list[UTXOInfo]) -> None:
         )
 
 
-def _unfreeze_non_fidelity_bonds(wallet: WalletService, utxos: list[UTXOInfo]) -> tuple[int, int]:
-    """Unfreeze only non-fidelity-bond UTXOs.
+def _is_freeze_toggleable(utxo: UTXOInfo) -> bool:
+    """Whether the user may toggle a UTXO's frozen flag in the freeze manager.
+
+    Still-locked fidelity bonds are not toggleable: they cannot be spent until
+    their timelock expires, so flipping their frozen flag is a confusing no-op.
+    Everything else (regular UTXOs and *expired* fidelity bonds) is toggleable.
+    """
+    return not (utxo.is_fidelity_bond and utxo.is_locked)
+
+
+def _unfreeze_non_locked_utxos(wallet: WalletService, utxos: list[UTXOInfo]) -> tuple[int, int]:
+    """Unfreeze every frozen UTXO except still-locked fidelity bonds.
+
+    A still-locked fidelity bond (``is_locked``) cannot be spent until its
+    timelock expires, so unfreezing it has no effect and is skipped. An
+    *expired* fidelity bond (timelock passed) is treated like a regular UTXO and
+    unfrozen, so "unfreeze all" actually makes it spendable again.
 
     Returns:
-        Tuple of (unfrozen_count, skipped_fidelity_bond_count)
+        Tuple of (unfrozen_count, skipped_locked_bond_count).
     """
     unfrozen_count = 0
-    skipped_fidelity_bonds = 0
+    skipped_locked_bonds = 0
 
     for utxo in utxos:
         if not utxo.frozen:
             continue
-        if utxo.is_fidelity_bond:
-            skipped_fidelity_bonds += 1
+        if not _is_freeze_toggleable(utxo):
+            skipped_locked_bonds += 1
             continue
         wallet.toggle_freeze_utxo(utxo.outpoint)
         unfrozen_count += 1
 
-    return unfrozen_count, skipped_fidelity_bonds
+    return unfrozen_count, skipped_locked_bonds
 
 
 def _run_freeze_tui(
@@ -427,12 +447,19 @@ def _run_freeze_tui(
 
         elif key == ord(" ") or key == ord("\t"):  # Space or Tab: toggle
             utxo = utxos[cursor_pos]
-            try:
-                wallet.toggle_freeze_utxo(utxo.outpoint)
-            except OSError as e:
-                error_message = f"Failed to persist freeze state: {e}"
+            # A still-locked fidelity bond cannot be spent until its timelock
+            # expires, so toggling its frozen flag is a confusing no-op; skip it.
+            # Expired fidelity bonds and regular UTXOs toggle normally.
+            if not _is_freeze_toggleable(utxo):
+                error_message = "Locked fidelity bond cannot be (un)frozen; it is timelocked"
                 error_display_until = time.monotonic() + 5.0
-            # Move cursor down after toggle
+            else:
+                try:
+                    wallet.toggle_freeze_utxo(utxo.outpoint)
+                except OSError as e:
+                    error_message = f"Failed to persist freeze state: {e}"
+                    error_display_until = time.monotonic() + 5.0
+            # Move cursor down after the action
             if cursor_pos < len(utxos) - 1:
                 cursor_pos += 1
 
@@ -457,6 +484,11 @@ def _run_freeze_tui(
         elif key == ord("a"):  # Freeze all
             try:
                 for utxo in utxos:
+                    # Skip still-locked fidelity bonds (freezing is a no-op for
+                    # them: they are already unspendable until the timelock
+                    # expires).
+                    if not _is_freeze_toggleable(utxo):
+                        continue
                     if not utxo.frozen:
                         wallet.toggle_freeze_utxo(utxo.outpoint)
             except OSError as e:
@@ -465,10 +497,11 @@ def _run_freeze_tui(
 
         elif key == ord("n"):  # Unfreeze all
             try:
-                _, skipped_fidelity_bonds = _unfreeze_non_fidelity_bonds(wallet, utxos)
-                if skipped_fidelity_bonds > 0:
+                _, skipped_locked_bonds = _unfreeze_non_locked_utxos(wallet, utxos)
+                if skipped_locked_bonds > 0:
                     error_message = (
-                        f"Skipped {skipped_fidelity_bonds} fidelity bond UTXO(s); kept frozen"
+                        f"Skipped {skipped_locked_bonds} locked fidelity bond UTXO(s); "
+                        "kept frozen until timelock expires"
                     )
                     error_display_until = time.monotonic() + 5.0
             except OSError as e:
