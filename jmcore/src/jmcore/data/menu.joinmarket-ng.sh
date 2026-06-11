@@ -1092,7 +1092,7 @@ if [ "${RASPIBLITZ}" -eq 1 ]; then
   Fee Rate:        ${FEE_DISPLAY:-auto}
   Destination:     ${SEND_DEST}
 
-  Proceed with transaction?" 14 65 || continue
+  Proceed with transaction?" 14 66 || continue
 
       # Execute the appropriate command
       clear
@@ -1329,13 +1329,10 @@ if [ "${RASPIBLITZ}" -eq 1 ]; then
               echo "=== Freeze / Unfreeze UTXOs ==="
               echo ""
               echo "Active wallet: $(basename "$CURRENT_WALLET")"
-              echo "Preparing wallet..."
+              echo "Opening interactive UTXO Freeze Manager...."
               echo ""
               (
                   ensure_wallet_password "$CURRENT_WALLET" || exit 1
-                  echo "Opening interactive UTXO selector. Use arrow keys to navigate,"
-                  echo "Space to toggle freeze state, Enter to confirm, q to quit."
-                  echo ""
                   jm-wallet freeze
                   pause
               )

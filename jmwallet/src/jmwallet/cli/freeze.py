@@ -204,13 +204,28 @@ async def _freeze_utxos(
             for md in range(wallet.mixdepth_count):
                 all_utxos.extend(wallet.utxo_cache.get(md, []))
 
+        # Treat locked FBs as frozen regardless of explicit flag
+        for utxo in all_utxos:
+            if utxo.is_fidelity_bond and utxo.is_locked and not utxo.frozen:
+                utxo.frozen = True
+
         if not all_utxos:
             md_msg = f" in mixdepth {mixdepth_filter}" if mixdepth_filter is not None else ""
             print(f"No UTXOs found{md_msg}.")
             return
 
-        # Sort by mixdepth, then value descending
-        all_utxos.sort(key=lambda u: (u.mixdepth, -u.value))
+        # Sort by derivation path (same order as wallet info extended)
+        all_utxos.sort(key=lambda u: u.path)
+
+        # Create display list with blank lines between mixdepths
+        display_items: list[UTXOInfo | None] = []
+        current_md = -1
+        for utxo in all_utxos:
+            if utxo.mixdepth != current_md:
+                current_md = utxo.mixdepth
+                if display_items:
+                    display_items.append(None)
+            display_items.append(utxo)
 
         # Check terminal
         if not sys.stdin.isatty() or not sys.stdout.isatty():
@@ -221,7 +236,7 @@ async def _freeze_utxos(
         # Launch interactive TUI
         import curses
 
-        curses.wrapper(_run_freeze_tui, all_utxos, wallet)
+        curses.wrapper(_run_freeze_tui, display_items, wallet)
 
         # Show summary after TUI exit
         frozen_count = sum(1 for u in all_utxos if u.frozen)
@@ -293,7 +308,7 @@ def _unfreeze_non_locked_utxos(wallet: WalletService, utxos: list[UTXOInfo]) -> 
 
 def _run_freeze_tui(
     stdscr: curses.window,
-    utxos: list[UTXOInfo],
+    display_items: list[UTXOInfo | None],
     wallet: WalletService,
 ) -> None:
     """Run the curses-based UTXO freeze/unfreeze TUI.
@@ -302,12 +317,10 @@ def _run_freeze_tui(
 
     Args:
         stdscr: The curses window.
-        utxos: All UTXOs to display (including already-frozen ones).
+        display_items: All UTXOs to display with blank lines between mixdepths.
         wallet: WalletService instance for persisting freeze state.
     """
     import curses
-
-    from jmcore.bitcoin import format_amount
 
     curses.curs_set(0)
     curses.use_default_colors()
@@ -329,18 +342,25 @@ def _run_freeze_tui(
         height, width = stdscr.getmaxyx()
 
         # Header
-        header = " UTXO Freeze Manager - Space: toggle freeze, q: exit "
+        header = " — UTXO Freeze Manager —"
         stdscr.attron(curses.color_pair(1) | curses.A_BOLD)
-        stdscr.addstr(0, 0, header.center(width)[:width])
+        stdscr.addstr(1, 0, header.center(width)[:width])
         stdscr.attroff(curses.color_pair(1) | curses.A_BOLD)
 
+        # Blank line under header
+
         # Column headers
-        col_header = " St  MD |             Amount |   Confs   | Outpoint"
-        stdscr.addstr(1, 0, col_header[: width - 1])
-        stdscr.addstr(2, 0, "-" * min(len(col_header) + 20, width - 1))
+
+        col_header = (
+            "  F  | MD | Address                                    "
+            "|      Amount     | Confirmations | Outpoint"
+        )
+
+        stdscr.addstr(3, 0, col_header[: width - 1])
+        stdscr.addstr(4, 0, "-" * min(len(col_header) + 5, width - 1))
 
         # Calculate visible area
-        list_start = 3
+        list_start = 5  # Data starts at line 4 (was 3, +1 for blank line)
         list_height = height - 6
 
         # Adjust scroll
@@ -349,8 +369,9 @@ def _run_freeze_tui(
         elif cursor_pos >= scroll_offset + list_height:
             scroll_offset = cursor_pos - list_height + 1
 
-        # Display UTXOs
-        for i, utxo in enumerate(utxos):
+        # Display UTXOs (with blank lines between mixdepths)
+        prev_address = ""  # Track previous address for duplicate detection
+        for i, item in enumerate(display_items):
             if i < scroll_offset or i >= scroll_offset + list_height:
                 continue
 
@@ -358,6 +379,21 @@ def _run_freeze_tui(
             if display_row >= height - 3:
                 break
 
+            # Line between mixdepths
+            if item is None:
+                try:
+                    stdscr.addstr(
+                        display_row,
+                        0,
+                        "-" * min(len(col_header) + 5, width - 1),
+                        curses.color_pair(1) | curses.A_DIM,
+                    )
+                except curses.error:
+                    pass
+                prev_address = ""  # Reset on mixdepth change
+                continue
+
+            utxo = item
             is_cursor = i == cursor_pos
 
             # Status indicator
@@ -366,8 +402,8 @@ def _run_freeze_tui(
             else:
                 status = "[ ]"
 
-            amount_str = format_amount(utxo.value)
-            conf_str = f"{utxo.confirmations:>6} conf"
+            amount_str = f"{utxo.value:,} sats"
+            conf_str = f"{utxo.confirmations:>8,} conf"
             md_str = f"m{utxo.mixdepth}"
 
             # Fidelity bond indicator
@@ -378,9 +414,20 @@ def _run_freeze_tui(
             # Label
             label_str = f" ({utxo.label})" if utxo.label else ""
 
+            # Address: show full address or spaces if duplicate, truncate FB addresses
+            if utxo.address == prev_address:
+                addr_str = " " * 42  # Spaces for alignment
+            else:
+                addr_str = (
+                    (utxo.address[:20] + "..." + utxo.address[-19:])
+                    if len(utxo.address) > 42
+                    else utxo.address
+                )
+            prev_address = utxo.address  # Remember current address
+
             outpoint = f"{utxo.txid[:8]}...:{utxo.vout}"
             line = (
-                f" {status} {md_str:>3} | {amount_str:>18} | "
+                f" {status} | {md_str:>2} | {addr_str:<42} | {amount_str:>15} | "
                 f"{conf_str} | {outpoint}{fb_indicator}{label_str}"
             )
 
@@ -391,7 +438,7 @@ def _run_freeze_tui(
             if is_cursor:
                 attr = curses.color_pair(2) | curses.A_REVERSE
             elif utxo.frozen:
-                attr = curses.color_pair(3) | curses.A_DIM
+                attr = curses.color_pair(3)
             elif utxo.is_fidelity_bond:
                 attr = curses.color_pair(5)
             else:
@@ -403,19 +450,22 @@ def _run_freeze_tui(
                 pass
 
         # Footer
-        frozen_count = sum(1 for u in utxos if u.frozen)
-        total_frozen_value = sum(u.value for u in utxos if u.frozen)
-        total_spendable_value = sum(u.value for u in utxos if not u.frozen)
+        utxo_items = [u for u in display_items if u is not None]
+        frozen_count = sum(1 for u in utxo_items if u.frozen)
+        total_frozen_value = sum(u.value for u in utxo_items if u.frozen)
+        total_spendable_value = sum(u.value for u in utxo_items if not u.frozen)
 
-        stdscr.addstr(height - 3, 0, "-" * min(width - 1, 80))
+        stdscr.addstr(height - 4, 0, "-" * min(len(col_header) + 5, width - 1))
 
         # Show error message if any (displayed for 3 seconds)
         import time
 
+        # Show error message if any (displayed for 3 seconds) - at the very bottom
+
         if error_message and time.monotonic() < error_display_until:
             try:
                 stdscr.addstr(
-                    height - 4, 0, f" ERROR: {error_message}"[: width - 1], curses.color_pair(3)
+                    height - 1, 0, f" ERROR: {error_message}"[: width - 1], curses.color_pair(3)
                 )
             except curses.error:
                 pass
@@ -423,16 +473,17 @@ def _run_freeze_tui(
             error_message = None
 
         footer1 = (
-            f" Frozen: {frozen_count}/{len(utxos)} UTXOs | "
-            f"Frozen value: {format_amount(total_frozen_value)} | "
-            f"Spendable: {format_amount(total_spendable_value)}"
+            f" Frozen: {frozen_count}/{len(utxo_items)} UTXOs | "
+            f"Frozen: {total_frozen_value:,} sats | "
+            f"Spendable: {total_spendable_value:,} sats"
         )
+
         footer2 = " Space/Tab: toggle | j/k: navigate | a: freeze all | n: unfreeze all | q: exit"
 
         stdscr.attron(curses.A_BOLD)
         try:
-            stdscr.addstr(height - 2, 0, footer1[: width - 1])
-            stdscr.addstr(height - 1, 0, footer2[: width - 1])
+            stdscr.addstr(height - 3, 0, footer1[: width - 1])
+            stdscr.addstr(height - 2, 0, footer2[: width - 1])
         except curses.error:
             pass
         stdscr.attroff(curses.A_BOLD)
@@ -446,7 +497,9 @@ def _run_freeze_tui(
             return
 
         elif key == ord(" ") or key == ord("\t"):  # Space or Tab: toggle
-            utxo = utxos[cursor_pos]
+            if display_items[cursor_pos] is None:
+                continue
+            utxo = display_items[cursor_pos]
             # A still-locked fidelity bond cannot be spent until its timelock
             # expires, so toggling its frozen flag is a confusing no-op; skip it.
             # Expired fidelity bonds and regular UTXOs toggle normally.
@@ -454,50 +507,79 @@ def _run_freeze_tui(
                 error_message = "Locked fidelity bond cannot be (un)frozen; it is timelocked"
                 error_display_until = time.monotonic() + 5.0
             else:
+                assert utxo is not None  # for mypy
+                # Toggle freeze state
                 try:
                     wallet.toggle_freeze_utxo(utxo.outpoint)
                 except OSError as e:
                     error_message = f"Failed to persist freeze state: {e}"
                     error_display_until = time.monotonic() + 5.0
-            # Move cursor down after the action
-            if cursor_pos < len(utxos) - 1:
-                cursor_pos += 1
+            # Move cursor down after the action (always)
+            if cursor_pos < len(display_items) - 1:
+                new_pos = cursor_pos + 1
+                while new_pos < len(display_items) and display_items[new_pos] is None:
+                    new_pos += 1
+                if new_pos < len(display_items):
+                    cursor_pos = new_pos
 
         elif key == curses.KEY_UP or key == ord("k"):
-            cursor_pos = max(0, cursor_pos - 1)
+            new_pos = cursor_pos - 1
+            while new_pos >= 0 and display_items[new_pos] is None:
+                new_pos -= 1
+            if new_pos >= 0:
+                cursor_pos = new_pos
 
         elif key == curses.KEY_DOWN or key == ord("j"):
-            cursor_pos = min(len(utxos) - 1, cursor_pos + 1)
+            new_pos = cursor_pos + 1
+            while new_pos < len(display_items) and display_items[new_pos] is None:
+                new_pos += 1
+            if new_pos < len(display_items):
+                cursor_pos = new_pos
 
         elif key == curses.KEY_PPAGE:  # Page Up
-            cursor_pos = max(0, cursor_pos - list_height)
+            new_pos = max(0, cursor_pos - list_height)
+            while new_pos >= 0 and display_items[new_pos] is None:
+                new_pos -= 1
+            if new_pos >= 0:
+                cursor_pos = new_pos
 
         elif key == curses.KEY_NPAGE:  # Page Down
-            cursor_pos = min(len(utxos) - 1, cursor_pos + list_height)
+            new_pos = min(len(display_items) - 1, cursor_pos + list_height)
+            while new_pos < len(display_items) and display_items[new_pos] is None:
+                new_pos += 1
+            if new_pos < len(display_items):
+                cursor_pos = new_pos
 
         elif key == ord("g"):  # Go to top
             cursor_pos = 0
+            while cursor_pos < len(display_items) and display_items[cursor_pos] is None:
+                cursor_pos += 1
 
         elif key == ord("G"):  # Go to bottom
-            cursor_pos = len(utxos) - 1
+            cursor_pos = len(display_items) - 1
+            while cursor_pos >= 0 and display_items[cursor_pos] is None:
+                cursor_pos -= 1
 
         elif key == ord("a"):  # Freeze all
             try:
-                for utxo in utxos:
+                for item in display_items:
                     # Skip still-locked fidelity bonds (freezing is a no-op for
                     # them: they are already unspendable until the timelock
                     # expires).
-                    if not _is_freeze_toggleable(utxo):
+                    if item is None:
                         continue
-                    if not utxo.frozen:
-                        wallet.toggle_freeze_utxo(utxo.outpoint)
+                    if not _is_freeze_toggleable(item):
+                        continue
+                    if not item.frozen:
+                        wallet.toggle_freeze_utxo(item.outpoint)
             except OSError as e:
                 error_message = f"Failed to persist freeze state: {e}"
                 error_display_until = time.monotonic() + 5.0
 
         elif key == ord("n"):  # Unfreeze all
             try:
-                _, skipped_locked_bonds = _unfreeze_non_locked_utxos(wallet, utxos)
+                utxo_items = [u for u in display_items if u is not None]
+                _, skipped_locked_bonds = _unfreeze_non_locked_utxos(wallet, utxo_items)
                 if skipped_locked_bonds > 0:
                     error_message = (
                         f"Skipped {skipped_locked_bonds} locked fidelity bond UTXO(s); "

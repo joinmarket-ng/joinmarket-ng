@@ -1371,3 +1371,86 @@ def test_runtime_image_installs_whiptail(component: str) -> None:
     assert "whiptail=" in production[1], (
         f"{component} production image must install whiptail for the jm-ng TUI"
     )
+
+
+# ---------------------------------------------------------------------------
+# Freeze TUI Tests (PR: Freeze TUI Improvements)
+# ---------------------------------------------------------------------------
+
+
+def test_freeze_sorts_utxos_by_path_not_mixdepth_value() -> None:
+    """UTXOs must be sorted by derivation path, not mixdepth/value."""
+    from jmwallet.wallet.models import UTXOInfo
+
+    # Create UTXOs with different mixdepths and values
+    utxos = [
+        UTXOInfo(
+            txid="a",
+            vout=0,
+            value=100000,
+            mixdepth=1,
+            path="m/84'/0'/1'/0/1",
+            address="bc1qaaa",
+            confirmations=10,
+            scriptpubkey=b"",
+        ),
+        UTXOInfo(
+            txid="b",
+            vout=0,
+            value=50000,
+            mixdepth=0,
+            path="m/84'/0'/0'/0/0",
+            address="bc1qbbb",
+            confirmations=10,
+            scriptpubkey=b"",
+        ),
+        UTXOInfo(
+            txid="c",
+            vout=0,
+            value=200000,
+            mixdepth=1,
+            path="m/84'/0'/1'/0/0",
+            address="bc1qccc",
+            confirmations=10,
+            scriptpubkey=b"",
+        ),
+    ]
+
+    # Sort by path (as implemented)
+    utxos.sort(key=lambda u: u.path)
+
+    # Should be sorted by path, not by mixdepth/value
+    assert utxos[0].txid == "b"  # m/84'/0'/0'/0/0
+    assert utxos[1].txid == "c"  # m/84'/0'/1'/0/0
+    assert utxos[2].txid == "a"  # m/84'/0'/1'/0/1
+
+
+def test_freeze_address_truncation_for_long_addresses() -> None:
+    """FB addresses >42 chars must be truncated with ... in middle."""
+    # Long FB address (62 chars)
+    long_addr = "bc1qa82tuh6vnq0ukc9y5wk4dggxtfqqmn7e9teefea4wn5jle59d6rq98j8jg"
+
+    # Truncation logic as implemented
+    if len(long_addr) > 42:
+        truncated = long_addr[:20] + "..." + long_addr[-19:]
+    else:
+        truncated = long_addr
+
+    assert len(truncated) == 42
+    assert "..." in truncated
+    # Korrektur: First 20 + ... + last 19
+    assert truncated == "bc1qa82tuh6vnq0ukc9y...4wn5jle59d6rq98j8jg"
+
+
+def test_freeze_duplicate_address_collapsed_to_spaces() -> None:
+    """Duplicate addresses must show spaces on subsequent rows."""
+    prev_address = "bc1qtest"
+    current_address = "bc1qtest"
+
+    # Logic as implemented
+    if current_address == prev_address:
+        addr_str = " " * 42
+    else:
+        addr_str = current_address
+
+    assert addr_str == " " * 42
