@@ -15,6 +15,7 @@ from jmwalletd.models import (
     FreezeRequest,
     GetAddressResponse,
     GetInfoResponse,
+    HistoryEntry,
     ListUtxosResponse,
     ListWalletsResponse,
     LockWalletResponse,
@@ -34,6 +35,7 @@ from jmwalletd.models import (
     WalletDisplayBranch,
     WalletDisplayEntry,
     WalletDisplayResponse,
+    WalletHistoryResponse,
     WalletInfo,
     YieldGenReportResponse,
 )
@@ -372,3 +374,20 @@ class TestMiscModels:
     def test_yieldgen_report(self) -> None:
         resp = YieldGenReportResponse(yigen_data=["line1", "line2"])
         assert len(resp.yigen_data) == 2
+
+    def test_wallet_history_response(self) -> None:
+        entry = HistoryEntry(
+            timestamp="2024-01-01T10:00:00",
+            role="maker",
+            cj_amount=100_000,
+            fee_received=2_500,
+            txid="ab" * 32,
+        )
+        resp = WalletHistoryResponse(history=[entry])
+        assert len(resp.history) == 1
+        assert resp.history[0].role == "maker"
+        assert resp.history[0].fee_received == 2_500
+
+    def test_wallet_history_response_defaults_empty(self) -> None:
+        resp = WalletHistoryResponse()
+        assert resp.history == []

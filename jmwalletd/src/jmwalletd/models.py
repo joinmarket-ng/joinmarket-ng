@@ -222,6 +222,51 @@ class ListUtxosResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Transaction history
+# ---------------------------------------------------------------------------
+
+
+class HistoryEntry(BaseModel):
+    """A single CoinJoin/spend record from the wallet history (history.csv).
+
+    Mirrors ``jmwallet.history.TransactionHistoryEntry``; surfaced read-only so
+    frontends can display past activity (maker earnings, taker spends, sends).
+    """
+
+    timestamp: str
+    completed_at: str = ""
+    confirmed_at: str = ""
+    role: str = "taker"  # "maker" | "taker" | "send"
+    success: bool = True
+    failure_reason: str = ""
+    confirmations: int = 0
+    txid: str = ""
+    cj_amount: int = 0
+    peer_count: int | None = None
+    counterparty_nicks: str = ""
+    fee_received: int = 0
+    txfee_contribution: int = 0
+    total_maker_fees_paid: int = 0
+    mining_fee_paid: int = 0
+    net_fee: int = 0
+    source_mixdepth: int = 0
+    destination_address: str = ""
+    change_address: str = ""
+    utxos_used: str = ""
+    broadcast_method: str = ""
+    network: str = ""
+
+
+class WalletHistoryResponse(BaseModel):
+    """Response for GET /api/v1/wallet/{walletname}/history.
+
+    ``history`` is ordered most-recent first.
+    """
+
+    history: list[HistoryEntry] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
 # Seed
 # ---------------------------------------------------------------------------
 

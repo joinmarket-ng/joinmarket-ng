@@ -26,6 +26,7 @@ from jmwalletd.models import (
     FreezeRequest,
     GetAddressResponse,
     GetSeedResponse,
+    HistoryEntry,
     ListUtxosResponse,
     RescanBlockchainResponse,
     RescanInfoResponse,
@@ -36,6 +37,7 @@ from jmwalletd.models import (
     WalletDisplayBranch,
     WalletDisplayEntry,
     WalletDisplayResponse,
+    WalletHistoryResponse,
     WalletInfo,
     YieldGenReportResponse,
 )
@@ -184,6 +186,63 @@ async def list_utxos(
             )
 
     return ListUtxosResponse(utxos=utxo_entries)
+
+
+# ---------------------------------------------------------------------------
+# GET /api/v1/wallet/{walletname}/history
+# ---------------------------------------------------------------------------
+@router.get("/wallet/{walletname}/history", operation_id="wallethistory")
+async def wallet_history(
+    walletname: str,
+    limit: int | None = None,
+    _auth: dict[str, Any] = Depends(require_auth),
+    _wallet: None = Depends(require_wallet_match),
+    state: DaemonState = Depends(get_daemon_state),
+) -> WalletHistoryResponse:
+    """Return the active wallet's CoinJoin/spend history (from history.csv).
+
+    Entries are scoped to the active wallet's master fingerprint and returned
+    most-recent first. Pass ``?limit=N`` to cap the number of entries. This is
+    the same data the ``jm-wallet history`` CLI reads; it is read-only.
+    """
+    from jmwallet.history import read_history
+
+    ws = state.wallet_service
+
+    entries = read_history(
+        state.data_dir,
+        limit=limit,
+        wallet_fingerprint=ws.wallet_fingerprint,
+    )
+
+    history = [
+        HistoryEntry(
+            timestamp=e.timestamp,
+            completed_at=e.completed_at,
+            confirmed_at=e.confirmed_at,
+            role=e.role,
+            success=e.success,
+            failure_reason=e.failure_reason,
+            confirmations=e.confirmations,
+            txid=e.txid,
+            cj_amount=e.cj_amount,
+            peer_count=e.peer_count,
+            counterparty_nicks=e.counterparty_nicks,
+            fee_received=e.fee_received,
+            txfee_contribution=e.txfee_contribution,
+            total_maker_fees_paid=e.total_maker_fees_paid,
+            mining_fee_paid=e.mining_fee_paid,
+            net_fee=e.net_fee,
+            source_mixdepth=e.source_mixdepth,
+            destination_address=e.destination_address,
+            change_address=e.change_address,
+            utxos_used=e.utxos_used,
+            broadcast_method=e.broadcast_method,
+            network=e.network,
+        )
+        for e in entries
+    ]
+    return WalletHistoryResponse(history=history)
 
 
 # ---------------------------------------------------------------------------

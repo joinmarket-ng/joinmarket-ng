@@ -31,6 +31,7 @@ EXPECTED_OPERATION_IDS: dict[tuple[str, str], str] = {
     # wallet_data.py
     ("get", "/api/v1/wallet/{walletname}/display"): "displaywallet",
     ("get", "/api/v1/wallet/{walletname}/utxos"): "listutxos",
+    ("get", "/api/v1/wallet/{walletname}/history"): "wallethistory",
     ("get", "/api/v1/wallet/{walletname}/address/new/{mixdepth}"): "getaddress",
     (
         "get",

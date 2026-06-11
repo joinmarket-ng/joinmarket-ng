@@ -767,3 +767,102 @@ class TestYieldGenReport:
             headers=_auth_headers("not-a-real-token"),
         )
         assert resp.status_code == 401
+
+
+class TestWalletHistory:
+    """GET /wallet/{walletname}/history returns the wallet's history.csv rows."""
+
+    def _append(
+        self,
+        data_dir: Path,
+        *,
+        role: str = "maker",
+        cj_amount: int = 100_000,
+        fee_received: int = 0,
+        fingerprint: str = "deadbeef",
+        txid: str = "ab" * 32,
+        timestamp: str = "2024-01-01T10:00:00",
+    ) -> None:
+        from jmwallet.history import TransactionHistoryEntry, append_history_entry
+
+        append_history_entry(
+            TransactionHistoryEntry(
+                timestamp=timestamp,
+                role=role,  # type: ignore[arg-type]
+                success=True,
+                confirmations=1,
+                txid=txid,
+                cj_amount=cj_amount,
+                counterparty_nicks="J5peer",
+                fee_received=fee_received,
+                network="regtest",
+                wallet_fingerprint=fingerprint,
+            ),
+            data_dir=data_dir,
+        )
+
+    def test_empty_history(self, authed_client: tuple[TestClient, str]) -> None:
+        client, token = authed_client
+        # Active wallet fingerprint must be a concrete value for read_history.
+        get_daemon_state().wallet_service.wallet_fingerprint = "deadbeef"
+        resp = client.get("/api/v1/wallet/test_wallet.jmdat/history", headers=_auth_headers(token))
+        assert resp.status_code == 200
+        assert resp.json()["history"] == []
+
+    def test_returns_wallet_history_entries(
+        self, authed_client: tuple[TestClient, str], data_dir: Path
+    ) -> None:
+        client, token = authed_client
+        get_daemon_state().wallet_service.wallet_fingerprint = "deadbeef"
+        self._append(data_dir, role="maker", cj_amount=100_000, fee_received=2_500)
+
+        resp = client.get("/api/v1/wallet/test_wallet.jmdat/history", headers=_auth_headers(token))
+        assert resp.status_code == 200
+        history = resp.json()["history"]
+        assert len(history) == 1
+        assert history[0]["role"] == "maker"
+        assert history[0]["cj_amount"] == 100_000
+        assert history[0]["fee_received"] == 2_500
+        assert history[0]["txid"] == "ab" * 32
+
+    def test_scoped_to_active_wallet_fingerprint(
+        self, authed_client: tuple[TestClient, str], data_dir: Path
+    ) -> None:
+        client, token = authed_client
+        get_daemon_state().wallet_service.wallet_fingerprint = "deadbeef"
+        # One entry for the active wallet, one for a different wallet.
+        self._append(data_dir, fingerprint="deadbeef", txid="aa" * 32)
+        self._append(data_dir, fingerprint="cafebabe", txid="bb" * 32)
+
+        resp = client.get("/api/v1/wallet/test_wallet.jmdat/history", headers=_auth_headers(token))
+        assert resp.status_code == 200
+        history = resp.json()["history"]
+        assert len(history) == 1
+        assert history[0]["txid"] == "aa" * 32
+
+    def test_limit_param(self, authed_client: tuple[TestClient, str], data_dir: Path) -> None:
+        client, token = authed_client
+        get_daemon_state().wallet_service.wallet_fingerprint = "deadbeef"
+        self._append(data_dir, txid="11" * 32, timestamp="2024-01-01T10:00:00")
+        self._append(data_dir, txid="22" * 32, timestamp="2024-02-01T10:00:00")
+
+        resp = client.get(
+            "/api/v1/wallet/test_wallet.jmdat/history?limit=1",
+            headers=_auth_headers(token),
+        )
+        assert resp.status_code == 200
+        history = resp.json()["history"]
+        assert len(history) == 1
+        # Most-recent first -> the February row.
+        assert history[0]["txid"] == "22" * 32
+
+    def test_requires_auth(self, authed_client: tuple[TestClient, str]) -> None:
+        client, _ = authed_client
+        resp = client.get("/api/v1/wallet/test_wallet.jmdat/history")
+        assert resp.status_code == 401
+
+    def test_rejects_wrong_wallet_name(self, authed_client: tuple[TestClient, str]) -> None:
+        # IDOR guard: the path walletname must match the loaded wallet.
+        client, token = authed_client
+        resp = client.get("/api/v1/wallet/other_wallet.jmdat/history", headers=_auth_headers(token))
+        assert resp.status_code in (401, 404)
