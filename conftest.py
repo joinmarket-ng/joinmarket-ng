@@ -7,11 +7,55 @@ all tests across the project.
 
 from __future__ import annotations
 
+import os
+from collections.abc import Iterator
+
 import pytest
 from pytest import StashKey
 
 # Define a StashKey for fail_on_skip option
 _fail_on_skip_key: StashKey[bool] = StashKey[bool]()
+
+# Proxy environment variables that jmcore's notification layer writes into
+# ``os.environ`` (via ``Notifier._ensure_initialized`` when Tor is enabled).
+# These are process-global and, if left set, make any later test that uses
+# ``urllib`` (notably the directory-server CLI tests, which connect to a local
+# mock HTTP server) fail with ``unknown url type: socks5h``. The autouse
+# fixture below snapshots and restores them around every test so a notifier
+# created in one component's tests cannot leak its proxy into another's.
+_PROXY_ENV_VARS = ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_proxy_env_and_notifier() -> Iterator[None]:
+    """Restore proxy env vars and the global notifier singleton around each test.
+
+    The JoinMarket notifier is a process-global singleton (``jmcore.notifications``)
+    and, when Tor is enabled, it sets ``HTTP_PROXY``/``HTTPS_PROXY`` in the
+    environment. Without this isolation a Tor-configured notifier created by one
+    test (or component) leaks both the singleton and the proxy env into
+    unrelated tests, breaking ``urllib``-based tests in other components.
+    """
+    saved_env = {name: os.environ.get(name) for name in _PROXY_ENV_VARS}
+
+    try:
+        from jmcore.notifications import reset_notifier
+    except Exception:  # pragma: no cover - jmcore always importable in tests
+        reset_notifier = None  # type: ignore[assignment]
+
+    if reset_notifier is not None:
+        reset_notifier()
+
+    yield
+
+    if reset_notifier is not None:
+        reset_notifier()
+
+    for name, value in saved_env.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
