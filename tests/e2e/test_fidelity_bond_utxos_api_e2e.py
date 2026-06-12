@@ -90,8 +90,6 @@ async def test_funded_fidelity_bond_appears_in_utxos(
     ensure_blockchain_ready: None,
 ) -> None:
     """A funded fidelity bond is returned by /utxos with a locktime field."""
-    from tests.e2e.rpc_utils import mine_blocks
-
     await _wait_for_jmwalletd()
     lockdate, locktime = _next_year_lockdate()
 
@@ -110,10 +108,16 @@ async def test_funded_fidelity_bond_appears_in_utxos(
             bond_address = r.json()["address"]
             logger.info(f"Fidelity bond address ({lockdate}): {bond_address}")
 
-            # 2) Fund the bond address on-chain: coinbase to the bond, then
-            #    mature it with additional blocks.
-            await mine_blocks(1, bond_address)
-            await mine_blocks(110, "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080")
+            # 2) Fund the bond address on-chain.
+            #    Prefer sendtoaddress from test-funder (subsidy-independent),
+            #    fall back to coinbase mining when test-funder is unavailable.
+            from tests.e2e.rpc_utils import mine_blocks, send_from_test_funder
+
+            dummy = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"
+            funded = await send_from_test_funder(bond_address, 0.01, confirmations=1)
+            if not funded:
+                await mine_blocks(1, bond_address)
+                await mine_blocks(110, dummy)
 
             # 3) The bond UTXO must now appear in /utxos, carrying a locktime.
             #    Retry briefly to allow the rescan-on-sync to settle.

@@ -15,6 +15,11 @@ BITCOIN_RPC_URL = os.getenv("BITCOIN_RPC_URL", "http://127.0.0.1:18443")
 BITCOIN_RPC_USER = os.getenv("BITCOIN_RPC_USER", "test")
 BITCOIN_RPC_PASSWORD = os.getenv("BITCOIN_RPC_PASSWORD", "test")
 
+# Name of the pre-funded Bitcoin Core wallet created by fund-test-wallets.sh.
+# Test fixtures use it to send BTC via sendtoaddress instead of mining
+# coinbases, avoiding the cascading halving problem on long-running chains.
+TEST_FUNDER_WALLET = "test-funder"
+
 
 class BitcoinRPCError(Exception):
     pass
@@ -55,21 +60,66 @@ async def mine_blocks(blocks: int, address: str) -> None:
     logger.info(f"Mined {blocks} blocks to {address}")
 
 
+async def send_from_test_funder(
+    target_address: str,
+    amount_btc: float,
+    confirmations: int = 1,
+) -> bool:
+    """Send ``amount_btc`` BTC from the pre-funded ``test-funder`` Core wallet.
+
+    The ``test-funder`` wallet is created by ``scripts/fund-test-wallets.sh``
+    during Docker setup with a large coinbase balance (≈6 000 BTC).  Using it
+    for individual test wallet funding avoids mining coinbases per test, which
+    would advance the chain height and eventually push the regtest coinbase
+    subsidy to zero.
+
+    After sending, mines ``confirmations`` blocks so the recipient's UTXO is
+    confirmed and immediately spendable.
+
+    Returns True on success, False when the wallet is unavailable or has
+    insufficient funds (callers should fall back to coinbase mining).
+    """
+    try:
+        info = await rpc_call("getwalletinfo", wallet=TEST_FUNDER_WALLET)
+        balance = float(info.get("balance", 0))
+        if balance < amount_btc:
+            logger.warning(
+                f"test-funder balance ({balance:.4f} BTC) < {amount_btc:.4f} BTC required"
+            )
+            return False
+
+        await rpc_call(
+            "sendtoaddress", [target_address, amount_btc], wallet=TEST_FUNDER_WALLET
+        )
+        # Mine confirmation blocks to any valid address (coinbase reward is
+        # zero at deep heights but the block confirms the send transaction).
+        miner_addr = await rpc_call(
+            "getnewaddress", ["", "bech32"], wallet=TEST_FUNDER_WALLET
+        )
+        await rpc_call("generatetoaddress", [confirmations, miner_addr])
+        logger.info(
+            f"Funded {target_address} with {amount_btc} BTC from test-funder "
+            f"({confirmations} confirmation block(s) mined)"
+        )
+        return True
+    except BitcoinRPCError as exc:
+        logger.debug(f"test-funder unavailable: {exc}")
+        return False
+    except Exception as exc:
+        logger.debug(f"Unexpected error using test-funder: {exc}")
+        return False
+
+
 async def ensure_wallet_funded(
     target_address: str, amount_btc: float = 1.0, confirmations: int = 1
 ) -> bool:
     """
-    Fund a wallet address by mining blocks directly to it.
+    Fund a wallet address by sending BTC to it.
 
-    We avoid wallet RPC completely - Bitcoin Core is just a source of truth,
-    not for managing funds. The wallet is completely external.
-
-    The block subsidy is NOT assumed to be 50 BTC: these tests share a
-    long-running regtest chain whose subsidy halves every 150 blocks, so a
-    fixed 110-block mine can deliver far less than ``amount_btc`` and starve
-    downstream operations (under-funded takers fail CoinJoins or time out).
-    Instead we read the current subsidy and mine enough mature coinbases
-    (depth >= 100) to cover ``amount_btc`` plus a fee buffer.
+    First tries to send from the pre-funded ``test-funder`` Core wallet
+    (subsidy-independent, mines only 1 confirmation block per call).
+    Falls back to coinbase mining for backwards compatibility with
+    environments that do not have the test-funder wallet.
 
     Args:
         target_address: Address to fund
@@ -79,6 +129,12 @@ async def ensure_wallet_funded(
     Returns:
         True if successful, False otherwise
     """
+    # Fast path: use the dedicated test-funder wallet (1 confirmation block).
+    if await send_from_test_funder(target_address, amount_btc + 0.1, confirmations):
+        return True
+
+    # Fallback: mine coinbases directly to the address (legacy path for
+    # environments without the test-funder wallet).
     try:
         info = await rpc_call("getblockchaininfo")
         height = int(info["blocks"])
@@ -117,3 +173,70 @@ async def ensure_wallet_funded(
     except Exception as exc:
         logger.error(f"Unexpected error during auto-funding: {exc}")
         return False
+
+
+async def fund_core_wallet(
+    wallet: str,
+    miner_address: str,
+    target_btc: float = 1.0,
+    *,
+    max_rounds: int = 20,
+) -> bool:
+    """Mine enough mature coinbases into a Core ``wallet`` to reach a balance.
+
+    First tries to send from the pre-funded ``test-funder`` wallet
+    (subsidy-independent, mines only 1 confirmation block). Falls back to
+    coinbase mining if test-funder is unavailable.
+
+    Args:
+        wallet: Loaded Core wallet name to fund.
+        miner_address: Address in that wallet to receive the funds.
+        target_btc: Minimum spendable balance to reach.
+        max_rounds: Safety cap on coinbase mining rounds.
+
+    Returns:
+        True once the wallet's spendable balance is >= ``target_btc``.
+    """
+    info = await rpc_call("getwalletinfo", wallet=wallet)
+    balance = float(info.get("balance", 0))
+    if balance >= target_btc:
+        return True
+
+    # Try test-funder first.
+    deficit = target_btc - balance
+    if await send_from_test_funder(miner_address, deficit + 0.1, 1):
+        return True
+
+    # Fallback: coinbase mining.
+    for _ in range(max_rounds):
+        info = await rpc_call("getwalletinfo", wallet=wallet)
+        balance = float(info.get("balance", 0))
+        if balance >= target_btc:
+            return True
+
+        chain = await rpc_call("getblockchaininfo")
+        height = int(chain["blocks"])
+        stats = await rpc_call("getblockstats", [height, ["subsidy"]])
+        subsidy_btc = float(stats["subsidy"]) / 1e8
+        if subsidy_btc <= 0:
+            logger.error(
+                f"Block subsidy is zero at height {height}; cannot fund wallet "
+                f"{wallet}. Recreate the chain with `docker compose down -v`."
+            )
+            return False
+
+        deficit = target_btc - balance
+        # Mine the coinbases needed to cover the deficit, plus 100 for maturity.
+        needed_mature = max(1, math.ceil(deficit / subsidy_btc))
+        await rpc_call(
+            "generatetoaddress", [needed_mature + 100, miner_address], wallet=wallet
+        )
+
+    info = await rpc_call("getwalletinfo", wallet=wallet)
+    funded = float(info.get("balance", 0)) >= target_btc
+    if not funded:
+        logger.error(
+            f"Could not fund Core wallet {wallet} to {target_btc} BTC after "
+            f"{max_rounds} rounds (balance={info.get('balance', 0)})"
+        )
+    return funded

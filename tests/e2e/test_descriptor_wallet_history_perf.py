@@ -122,21 +122,25 @@ async def _mine(cfg: dict[str, str], addr: str, n: int, miner_wallet: str) -> No
 async def _setup_funded_miner(
     cfg: dict[str, str], miner_wallet: str, target_btc: float = 8.0
 ) -> str:
-    """Return a freshly generated miner address with mature coinbase funds.
+    """Return a freshly generated miner address with mature funds.
 
-    Mines in 100-block batches until the wallet's spendable balance reaches
-    ``target_btc``. A fixed block count is not safe here: this test shares the
-    long-running e2e regtest chain, where the coinbase subsidy has halved many
-    times (regtest halves every 150 blocks), so a fixed 110 blocks can yield
-    far less than the test needs and fail later with "Insufficient funds".
-    Mining 100-block batches both matures the previous batch's coinbases (100
-    confirmations) and adds new ones, so the balance grows until it clears the
-    target regardless of the current subsidy.
+    Tries to send from the pre-funded ``test-funder`` Core wallet first
+    (mines only 1 confirmation block).  Falls back to coinbase mining in
+    batches of 100 blocks when test-funder is not available.
     """
     miner_addr = await _rpc(cfg, "getnewaddress", ["", "bech32"], wallet=miner_wallet)
-    # Safety cap keeps this bounded even at a near-zero subsidy; for the
-    # heights this suite reaches, the balance clears the target in a handful
-    # of iterations.
+
+    # Fast path: fund from test-funder (1 confirmation block).
+    try:
+        await _rpc(
+            cfg, "sendtoaddress", [miner_addr, target_btc + 1.0], wallet="test-funder"
+        )
+        await _mine(cfg, miner_addr, 1, miner_wallet)
+        return miner_addr
+    except Exception:
+        pass
+
+    # Fallback: coinbase mining in 100-block batches.
     for _ in range(50):
         info = await _rpc(cfg, "getwalletinfo", wallet=miner_wallet)
         if info.get("balance", 0) >= target_btc:

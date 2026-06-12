@@ -106,11 +106,15 @@ async def test_sync_bonds_updates_registry_after_funding(
     assert bond_before is not None
     assert not bond_before.is_funded, "Bond should be unfunded before sync"
 
-    # Fund the bond address on-chain (coinbase to the bond, then maturity blocks).
+    # Fund the bond address on-chain.
     logger.info("Funding bond address...")
-    await mine_blocks(1, bond_address)
+    from tests.e2e.rpc_utils import send_from_test_funder
+
     dummy_addr = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"
-    await mine_blocks(110, dummy_addr)
+    funded = await send_from_test_funder(bond_address, 0.01, confirmations=1)
+    if not funded:
+        await mine_blocks(1, bond_address)
+        await mine_blocks(110, dummy_addr)
 
     scan = await rpc_call("scantxoutset", ["start", [f"addr({bond_address})"]])
     utxos = scan.get("unspents", [])
@@ -181,7 +185,7 @@ async def test_sync_bonds_finds_bond_when_base_wallet_already_set_up(
         generate_wallet_name,
     )
 
-    from tests.e2e.rpc_utils import mine_blocks, rpc_call
+    from tests.e2e.rpc_utils import mine_blocks, rpc_call, send_from_test_funder
 
     network = "regtest"
     # Use a distinct (past) timenumber so this test's bond does not collide with
@@ -248,10 +252,14 @@ async def test_sync_bonds_finds_bond_when_base_wallet_already_set_up(
     )
     save_registry(registry, tmp_path, fingerprint)
 
-    # 3) Fund the bond on-chain AFTER base setup (coinbase + maturity blocks).
+    # 3) Fund the bond on-chain AFTER base setup.
     logger.info("Funding bond address...")
-    await mine_blocks(1, bond_address)
-    await mine_blocks(110, "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080")
+    from tests.e2e.rpc_utils import rpc_call
+
+    funded = await send_from_test_funder(bond_address, 0.01, confirmations=1)
+    if not funded:
+        await mine_blocks(1, bond_address)
+        await mine_blocks(110, "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080")
 
     scan = await rpc_call("scantxoutset", ["start", [f"addr({bond_address})"]])
     unspents = scan.get("unspents", [])

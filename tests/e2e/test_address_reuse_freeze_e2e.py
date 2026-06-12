@@ -68,11 +68,56 @@ async def _rpc(
 async def funded_miner(
     bitcoin_rpc_config: dict[str, str],
 ) -> AsyncGenerator[tuple[str, str], None]:
-    """Per-test miner wallet on Core; returns ``(wallet_name, miner_addr)``."""
+    """Per-test miner wallet on Core; returns ``(wallet_name, miner_addr)``.
+
+    Funds the wallet from the pre-funded ``test-funder`` Core wallet (created
+    by ``scripts/fund-test-wallets.sh``) via ``sendtoaddress``, which mines
+    only 1 confirmation block instead of 100+ coinbase blocks.  This avoids
+    the cascading halving problem where repeated coinbase mining pushes the
+    regtest subsidy to zero.  Falls back to coinbase mining when test-funder
+    is not available.
+    """
     name = f"miner_{secrets.token_hex(4)}"
     await _rpc(bitcoin_rpc_config, "createwallet", [name])
     addr = await _rpc(bitcoin_rpc_config, "getnewaddress", ["", "bech32"], wallet=name)
-    await _rpc(bitcoin_rpc_config, "generatetoaddress", [110, addr], wallet=name)
+
+    funded = False
+    try:
+        await _rpc(
+            bitcoin_rpc_config, "sendtoaddress", [addr, 2.0], wallet="test-funder"
+        )
+        await _rpc(bitcoin_rpc_config, "generatetoaddress", [1, addr])
+        funded = True
+    except Exception:
+        pass
+
+    if not funded:
+        import math
+
+        target_btc = 1.0
+        for _ in range(20):
+            info = await _rpc(bitcoin_rpc_config, "getwalletinfo", wallet=name)
+            if float(info.get("balance", 0)) >= target_btc:
+                break
+            chain = await _rpc(bitcoin_rpc_config, "getblockchaininfo")
+            height = int(chain["blocks"])
+            stats = await _rpc(
+                bitcoin_rpc_config, "getblockstats", [height, ["subsidy"]]
+            )
+            subsidy_btc = float(stats["subsidy"]) / 1e8
+            if subsidy_btc <= 0:
+                raise RuntimeError(
+                    f"Block subsidy is zero at height {height}; test-funder also "
+                    "unavailable. Recreate the chain with `docker compose down -v`."
+                )
+            deficit = target_btc - float(info.get("balance", 0))
+            needed_mature = max(1, math.ceil(deficit / subsidy_btc))
+            await _rpc(
+                bitcoin_rpc_config,
+                "generatetoaddress",
+                [needed_mature + 100, addr],
+                wallet=name,
+            )
     yield name, addr
 
 
