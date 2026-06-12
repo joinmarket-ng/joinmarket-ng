@@ -1,0 +1,7 @@
+# Runtime files regenerated on every test run — do not commit
+lightning-setup-done
+lnd/*.cert
+lnd/*.macaroon
+lnd/connection-info.json
+electrum-swap-ready
+electrum/

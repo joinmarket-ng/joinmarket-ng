@@ -44,6 +44,252 @@ def calculate_cj_fee(offer: Offer, cj_amount: int) -> int:
     return _calculate_cj_fee_raw(offer.ordertype, offer.cjfee, cj_amount)
 
 
+# Minimum number of non-selected offers needed to sample a fake fee
+# from the orderbook distribution. Below this, fall back to a range derived
+# from the taker's own fee limits.
+_MIN_OFFERS_FOR_SAMPLING = 3
+
+# Relative tolerance for grouping near-equal realized fees into one "cluster"
+# when no two offers produce an *exactly* equal fee (the common case for
+# relative-fee makers, whose sat amounts differ slightly). Two fees f1 <= f2
+# are in the same cluster iff f2 <= f1 * (1 + tolerance). 10% mirrors the
+# scale at which makers on nearby offers are effectively indistinguishable
+# (cf. the fee-quantization countermeasure in the mainnet deanonymization
+# analysis: fees that collide on a small grid cannot be told apart).
+_FEE_CLUSTER_REL_TOLERANCE = 0.10
+
+
+def _bond_weight(offer: Offer) -> int:
+    """Selection weight for an offer: its bond value, floored at 1 (bondless)."""
+    return max(offer.fidelity_bond_value, 1)
+
+
+def _bond_weighted_pick(candidates: list[tuple[Offer, int]]) -> tuple[Offer, int]:
+    """Pick one ``(offer, fee)`` weighted by fidelity-bond value (bondless = 1)."""
+    weights = [_bond_weight(offer) for offer, _fee in candidates]
+    return random.choices(candidates, weights=weights, k=1)[0]
+
+
+def _largest_fee_cluster(
+    candidates: list[tuple[Offer, int]], tolerance: float
+) -> list[tuple[Offer, int]]:
+    """Return the densest cluster of near-equal fees (a sliding window).
+
+    Fees are sorted ascending; the returned window is the longest run where
+    ``max_fee <= min_fee * (1 + tolerance)``. Ties on length keep the first
+    (lowest-fee) window. Runs in O(n) over the sorted candidates.
+    """
+    ordered = sorted(candidates, key=lambda c: c[1])
+    best_lo, best_hi = 0, 0  # inclusive [lo, hi]
+    best_count = 0
+    lo = 0
+    for hi, (_, fee_hi) in enumerate(ordered):
+        # Shrink the window from the left until the spread fits the tolerance.
+        while ordered[lo][1] * (1 + tolerance) < fee_hi:
+            lo += 1
+        count = hi - lo + 1
+        if count > best_count:
+            best_count, best_lo, best_hi = count, lo, hi
+    return ordered[best_lo : best_hi + 1]
+
+
+def sample_fake_fee_from_orderbook(
+    offers: list[Offer],
+    cj_amount: int,
+    selected_nicks: set[str],
+    max_cj_fee: MaxCjFee,
+) -> int:
+    """
+    Sample a fake fee that copies an actual non-selected orderbook offer,
+    biased toward the densest cluster of real maker fees.
+
+    To make the taker's change output indistinguishable from a maker's change,
+    the "fee earned" by the taker should look like a fee an actual maker in
+    the orderbook would have charged AND should collide with as many makers as
+    possible, so the change cannot be pinned to one maker's policy. The mainnet
+    deanonymization analysis shows the fee fingerprint (a maker's realized fee
+    is a deterministic function of its offer) is the load-bearing channel, and
+    that the defense is *fee clustering*: a fee shared by many makers carries no
+    attribution. We therefore aim the fake fee at the biggest cluster of real
+    fees, ideally the exact mode. We achieve this by:
+
+    1. Restricting candidates to offers that (a) cover ``cj_amount`` and
+       (b) belong to makers NOT selected for this round (so the fake fee is
+       independent of the selected set and can't be reverse-engineered from
+       it).
+    2. If two or more candidates produce the *exact same* fee, returning the
+       **modal** fee (the value the most makers share). Ties between equally
+       popular fees are broken by sampling weighted by each group's total bond
+       value, so the choice tracks the bond-weighted maker distribution rather
+       than always snapping to one deterministic value (which would itself
+       become a fingerprint).
+    3. Otherwise (all fees distinct, typical for relative-fee makers), finding
+       the densest cluster of fees within ``_FEE_CLUSTER_REL_TOLERANCE`` and
+       bond-weighted sampling *inside that cluster*. This lands the fake fee in
+       the most crowded region of the fee distribution while still copying a
+       real offer's fee verbatim.
+    4. If the fees are so spread that no cluster forms (largest cluster is a
+       single offer), falling back to a bond-weighted pick across all
+       candidates (the original behavior).
+
+    In every path the returned value equals an actual orderbook offer's fee, so
+    the fake fee never introduces a "non-orderbook" value of its own.
+
+    Fallback: if fewer than ``_MIN_OFFERS_FOR_SAMPLING`` candidate offers are
+    available, draw a uniform fee in ``[1, max_cj_fee.rel_fee * cj_amount]``.
+
+    Args:
+        offers: Full orderbook offer list.
+        cj_amount: CoinJoin amount in satoshis.
+        selected_nicks: Nicks of makers already selected for this CoinJoin
+            (their fees are excluded so the fake fee is independent).
+        max_cj_fee: The taker's own fee limits (used to derive the fallback range).
+
+    Returns:
+        A fee in satoshis suitable for use as the taker's fake earned fee.
+    """
+    candidates: list[tuple[Offer, int]] = []
+    for offer in offers:
+        if offer.counterparty in selected_nicks:
+            continue
+        if not (offer.minsize <= cj_amount <= offer.maxsize):
+            continue
+        try:
+            fee = _calculate_cj_fee_raw(offer.ordertype, offer.cjfee, cj_amount)
+        except (ValueError, ZeroDivisionError):
+            continue
+        if fee > 0:
+            candidates.append((offer, fee))
+
+    if len(candidates) < _MIN_OFFERS_FOR_SAMPLING:
+        fallback_max = max(1, int(float(max_cj_fee.rel_fee) * cj_amount))
+        logger.debug(
+            f"Not enough orderbook data for fake fee sampling "
+            f"({len(candidates)} candidates < {_MIN_OFFERS_FOR_SAMPLING}), "
+            f"falling back to uniform [1, {fallback_max}]"
+        )
+        return random.randint(1, fallback_max)
+
+    # Group candidates by their exact realized fee.
+    by_fee: dict[int, list[Offer]] = {}
+    for offer, fee in candidates:
+        by_fee.setdefault(fee, []).append(offer)
+    mode_count = max(len(group) for group in by_fee.values())
+
+    if mode_count >= 2:
+        # Exact mode exists: aim at the value the most makers share. If several
+        # fees tie for most-popular, pick among them weighted by total bond
+        # value (not deterministically) so we don't manufacture a fingerprint.
+        modal_fees = [fee for fee, group in by_fee.items() if len(group) == mode_count]
+        modal_weights = [sum(_bond_weight(o) for o in by_fee[fee]) for fee in modal_fees]
+        chosen_fee = random.choices(modal_fees, weights=modal_weights, k=1)[0]
+        logger.debug(
+            f"Sampled fake fee {chosen_fee:,} sats from the exact mode "
+            f"(shared by {mode_count} of {len(candidates)} candidate offers, "
+            f"{len(modal_fees)} fee value(s) tied for most popular)"
+        )
+        return chosen_fee
+
+    # All fees distinct: aim at the densest cluster of near-equal fees and
+    # bond-weighted sample inside it. If nothing clusters, fall back to a
+    # bond-weighted pick over all candidates (original behavior).
+    cluster = _largest_fee_cluster(candidates, _FEE_CLUSTER_REL_TOLERANCE)
+    pool = cluster if len(cluster) >= 2 else candidates
+    chosen_offer, chosen_fee = _bond_weighted_pick(pool)
+    logger.debug(
+        f"Sampled fake fee {chosen_fee:,} sats by copying {chosen_offer.counterparty}'s "
+        f"offer (bond={chosen_offer.fidelity_bond_value:,}, "
+        f"cluster_size={len(cluster)}, candidates={len(candidates)})"
+    )
+    return chosen_fee
+
+
+def equalize_maker_fees(
+    maker_fees: dict[str, int],
+    leftover_sats: int,
+    *,
+    taker_change_exists: bool = False,
+    taker_fake_fee: int = 0,
+) -> tuple[dict[str, int], int]:
+    """Distribute swap leftover sats by topping up fees toward the round max.
+
+    Goal: make every party's "fee receipt" indistinguishable on-chain.
+
+    The taker's change output (when present) acts as the taker's
+    "fake maker fee" -- an outside observer sees one extra equal-amount
+    output sized like a maker's cjfee receipt. By topping up everyone
+    (makers AND taker) toward ``target = max(all_fees_including_taker)``,
+    every fee receipt looks like the same orderbook offer, the maker that
+    quoted the highest fee in the round.
+
+    The algorithm distributes deterministically up to ``target`` for each
+    entry while budget allows. If the budget is not enough to fully reach
+    ``target`` for the last entry processed, the leftover is split
+    proportionally across the remaining entries (rounded down per-entry).
+    Any unallocated sats (rounding remainder) are returned to the caller
+    and added to the transaction fee paid to miners; this is privacy-
+    neutral because the miner fee is computed from inputs minus outputs
+    and reveals nothing about per-party amounts.
+
+    Privacy invariant: ALL leftover sats either reach makers, the taker
+    change, or the on-chain transaction fee. None reach the taker's
+    destination cj_output (cj_amount is fixed at !fill time and cannot
+    be bumped).
+
+    Args:
+        maker_fees: Mapping of maker nick -> current CJ fee in sats.
+        leftover_sats: Extra sats available from swap padding.
+        taker_change_exists: Whether the taker has a change output to bump.
+        taker_fake_fee: Current taker change "fee" sats (= expected change).
+
+    Returns:
+        Tuple of:
+          - new mapping of maker nick -> adjusted CJ fee in sats
+          - taker change bump in sats (added to expected change output)
+        Sum of all bumps + tx_fee_remainder == leftover_sats; caller adds
+        ``leftover_sats - sum(bumps)`` to the on-chain transaction fee.
+    """
+    if leftover_sats <= 0 or not maker_fees:
+        return dict(maker_fees), 0
+
+    # Build virtual map including taker if it has change. The target
+    # is symmetric: it's the max across all entries (makers + taker),
+    # so the taker fee receipt is held to the same standard as makers.
+    virtual: dict[str, int] = dict(maker_fees)
+    if taker_change_exists:
+        virtual["_taker"] = taker_fake_fee
+
+    target = max(virtual.values())
+    budget = leftover_sats
+    bumps: dict[str, int] = {k: 0 for k in virtual}
+
+    # Phase 1: deterministic top-up sorted by current fee ascending so we
+    # lift the lowest fees first (they need the most help and benefit
+    # privacy the most by closing the gap toward the round max).
+    sorted_nicks = sorted(virtual, key=lambda k: virtual[k])
+    for nick in sorted_nicks:
+        if budget <= 0:
+            break
+        gap = target - virtual[nick]
+        if gap <= 0:
+            continue
+        bump = min(gap, budget)
+        bumps[nick] += bump
+        budget -= bump
+
+    new_maker_fees = {nick: maker_fees[nick] + bumps.get(nick, 0) for nick in maker_fees}
+    taker_bump = bumps.get("_taker", 0)
+
+    distributed = sum(bumps.values())
+    tx_fee_remainder = leftover_sats - distributed
+    logger.debug(
+        f"Fee equalization: distributed {distributed:,} of {leftover_sats:,} sats "
+        f"(makers={sum(bumps[k] for k in bumps if k != '_taker'):,}, "
+        f"taker={taker_bump:,}, added_to_tx_fees={tx_fee_remainder:,}, target={target:,})"
+    )
+    return new_maker_fees, taker_bump
+
+
 def is_fee_within_limits(offer: Offer, cj_amount: int, max_cj_fee: MaxCjFee) -> bool:
     """
     Check if an offer's fee is within the configured limits.

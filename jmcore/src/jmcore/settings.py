@@ -954,6 +954,93 @@ class TumblerSettings(BaseModel):
     )
 
 
+class SwapSettings(BaseModel):
+    """Settings for the optional swap input feature (submarine swaps).
+
+    The swap input feature lets a taker bring a P2WSH HTLC UTXO obtained from a
+    submarine-swap provider into the CoinJoin transaction. The extra input
+    balances out unequal change amounts, making the taker's role harder to
+    distinguish from makers' on-chain.
+
+    See docs/technical/swap_input_privacy.md for the LN-privacy caveats
+    (Kappos-style payment-fingerprinting risk, prepay loss on coinjoin failure,
+    Tor-only LND traffic, BOLT12/MPP recommendations).
+    """
+
+    enabled: bool = Field(
+        default=False,
+        description="Enable swap input for CoinJoin fee/change balancing",
+    )
+    provider_offer_id: str = Field(
+        default="",
+        description="Preferred swap offer id (Nostr kind 30315 d-tag); empty = auto-select",
+    )
+    nostr_relays: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Nostr relay URLs for swap provider discovery. "
+            "All connections SHOULD be .onion to preserve taker privacy."
+        ),
+    )
+    max_swap_fee_pct: float = Field(
+        default=1.0,
+        gt=0.0,
+        le=10.0,
+        description="Maximum acceptable swap fee as percentage of swap amount",
+    )
+    fake_fee_min: int = Field(
+        default=500,
+        ge=0,
+        description="Minimum fake fee (sats) the taker appears to earn",
+    )
+    fake_fee_max: int = Field(
+        default=5000,
+        ge=0,
+        description="Maximum fake fee (sats) the taker appears to earn",
+    )
+    lockup_poll_interval: float = Field(
+        default=2.0,
+        gt=0.0,
+        description="Seconds between lockup transaction poll attempts",
+    )
+    lockup_timeout: float = Field(
+        default=300.0,
+        gt=0.0,
+        description="Maximum seconds to wait for swap lockup transaction",
+    )
+    hold_invoice_timeout: float = Field(
+        default=3600.0,
+        gt=0.0,
+        description=(
+            "Maximum seconds to keep the main hold-invoice payment in flight. "
+            "The hold invoice settles only after the CoinJoin is broadcast and "
+            "the preimage is revealed on-chain, so this must comfortably exceed "
+            "lockup confirmation plus CoinJoin negotiation time. Too low a value "
+            "makes LND cancel the HTLC before settlement and forfeits the "
+            "provider's lockup."
+        ),
+    )
+
+    # LND connection for automatic invoice payment (optional).
+    # If unset, the user must pay the invoices manually out-of-band.
+    # All LND traffic is routed via Tor by default; see docs.
+    lnd_rest_url: str = Field(
+        default="",
+        description=(
+            "LND REST API URL for paying invoices (e.g. https://localhost:8080). "
+            "Should be a .onion URL when LND is run remotely."
+        ),
+    )
+    lnd_cert_path: str = Field(
+        default="",
+        description="Path to LND TLS certificate file",
+    )
+    lnd_macaroon_path: str = Field(
+        default="",
+        description="Path to LND admin macaroon file (read-only invoice.macaroon preferred)",
+    )
+
+
 class DirectoryServerSettings(BaseModel):
     """Directory server specific settings."""
 
@@ -1184,6 +1271,7 @@ class JoinMarketSettings(BaseSettings):
     tumbler: TumblerSettings = Field(default_factory=TumblerSettings)
     directory_server: DirectoryServerSettings = Field(default_factory=DirectoryServerSettings)
     orderbook_watcher: OrderbookWatcherSettings = Field(default_factory=OrderbookWatcherSettings)
+    swap: SwapSettings = Field(default_factory=SwapSettings)
 
     @classmethod
     def settings_customise_sources(

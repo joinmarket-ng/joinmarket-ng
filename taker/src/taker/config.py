@@ -77,6 +77,115 @@ class MaxCjFee(BaseModel):
         return v
 
 
+class SwapInputConfig(BaseModel):
+    """Configuration for the optional swap input feature.
+
+    When enabled, the taker acquires an additional UTXO via a Lightning Network
+    reverse submarine swap. This extra input covers all fees (maker fees, tx fee)
+    plus a fake "fee earned" amount, making the taker's on-chain footprint
+    indistinguishable from a maker's.
+
+    LND connection fields (lnd_rest_url, lnd_cert_path, lnd_macaroon_path) are
+    optional. When configured, the taker automatically pays LN invoices via its
+    own LND node. When not configured, the swap client still works but the user
+    must pay invoices manually (or use a mock provider that doesn't require LN).
+
+    Privacy caveat: how you fund the LN side matters. Linkable LN payments
+    (e.g. from a single-channel node with predictable invoice amounts/timing)
+    can re-introduce taker fingerprinting at the LN layer. See
+    docs/technical/privacy.md for the threat model and mitigations.
+    """
+
+    enabled: bool = Field(
+        default=False,
+        description="Enable swap input for CoinJoin fee/change balancing",
+    )
+    provider_offer_id: str = Field(
+        default="",
+        description="Preferred swap offer id (optional, from Nostr offers)",
+    )
+    nostr_relays: list[str] = Field(
+        default_factory=list,
+        description="Nostr relay URLs for swap provider discovery (empty = use defaults)",
+    )
+    max_swap_fee_pct: float = Field(
+        default=1.0,
+        gt=0.0,
+        le=10.0,
+        description="Maximum acceptable swap fee as percentage of swap amount",
+    )
+    fake_fee_min: int = Field(
+        default=500,
+        ge=0,
+        description=(
+            "Minimum fake fee (sats) the taker appears to earn. Acts as a "
+            "fallback floor when the orderbook does not have enough offers "
+            "for distribution sampling."
+        ),
+    )
+    fake_fee_max: int = Field(
+        default=5000,
+        ge=0,
+        description=(
+            "Maximum fake fee (sats) the taker appears to earn (fallback "
+            "ceiling, see fake_fee_min)."
+        ),
+    )
+    lockup_poll_interval: float = Field(
+        default=2.0,
+        gt=0.0,
+        description="Seconds between lockup transaction poll attempts",
+    )
+    lockup_timeout: float = Field(
+        default=300.0,
+        gt=0.0,
+        description="Maximum seconds to wait for swap lockup transaction",
+    )
+    hold_invoice_timeout: float = Field(
+        default=3600.0,
+        gt=0.0,
+        description=(
+            "Maximum seconds to keep the main hold-invoice payment in flight. "
+            "The hold invoice settles only after the CoinJoin is broadcast and "
+            "the preimage is revealed on-chain, so this must comfortably exceed "
+            "lockup confirmation plus CoinJoin negotiation time. Too low a value "
+            "makes LND cancel the HTLC before settlement and forfeits the "
+            "provider's lockup."
+        ),
+    )
+
+    # LND connection for automatic invoice payment (optional)
+    lnd_rest_url: str = Field(
+        default="",
+        description="LND REST API URL for paying invoices (e.g. https://localhost:8080)",
+    )
+    lnd_cert_path: str = Field(
+        default="",
+        description="Path to LND TLS certificate file",
+    )
+    lnd_macaroon_path: str = Field(
+        default="",
+        description="Path to LND admin macaroon file",
+    )
+
+    # Swap leftover handling (deprecated: leftover sats are ALWAYS distributed
+    # to makers for privacy -- see issue #114).
+    equalize_fees: bool = Field(
+        default=True,
+        description=(
+            "DEPRECATED: leftover sats are always distributed to maker fees "
+            "regardless of this setting. Sending leftovers to taker change "
+            "would defeat the purpose of swap input by making the taker's "
+            "change output identifiable via surplus analysis."
+        ),
+    )
+
+    @property
+    def lnd_configured(self) -> bool:
+        """Check if all LND connection fields are set."""
+        return bool(self.lnd_rest_url and self.lnd_cert_path and self.lnd_macaroon_path)
+
+
 class TakerConfig(WalletConfig):
     """
     Configuration for taker bot.
@@ -207,6 +316,12 @@ class TakerConfig(WalletConfig):
         default=3,
         ge=1,
         description="Number of random peers to use for MULTIPLE_PEERS policy",
+    )
+
+    # Swap input (optional: hide taker role via submarine swap)
+    swap_input: SwapInputConfig = Field(
+        default_factory=SwapInputConfig,
+        description="Optional swap input for fee/change balancing (hides taker role)",
     )
 
     # Advanced options

@@ -538,3 +538,37 @@
 # "DEBUG"   = verbose output for troubleshooting
 # Can be overridden per session: LOGGING__LEVEL=INFO jm-ng
 # log_level = "WARNING"
+
+
+# ============================================================================
+# Swap Input Settings (Optional)
+# ============================================================================
+# Acquire an extra UTXO via a Lightning reverse submarine swap and add it to
+# the CoinJoin transaction so the taker's on-chain footprint matches a maker's
+# (input + cj output + fee output). Disabled by default; enable per-run with
+# --swap-input on the taker CLI, or set enabled = true here.
+#
+# WARNING: Lightning is NOT private. See
+# docs/technical/swap_input_privacy.md for the side-channel discussion
+# (Kappos et al. 2021), the prepay-loss-on-failure trade-off, and the
+# recommended mitigations (Tor + MPP applied by default).
+
+[swap]
+# enabled = false
+# provider_offer_id = ""           # Pin a specific Nostr offer (kind 30315 d-tag); empty = auto
+# nostr_relays = []                # Override default Nostr relays; .onion only
+# max_swap_fee_pct = 1.0           # Reject providers above this percentage
+# fake_fee_min = 500               # Fallback floor when orderbook sampling fails
+# fake_fee_max = 5000              # Fallback ceiling
+# lockup_poll_interval = 2.0
+# lockup_timeout = 300.0
+# hold_invoice_timeout = 3600.0    # Keep main hold-invoice payment in flight this
+                                   # long; must exceed lockup + CoinJoin time or
+                                   # LND cancels the HTLC and forfeits the lockup
+
+# LND REST connection (required for automatic invoice payment; without it the
+# user pays manually). All LND traffic is routed via Tor when the URL is a
+# .onion and a SOCKS proxy is configured in [tor].
+# lnd_rest_url = ""                # e.g. "https://lnd.someonionhost.onion:8080"
+# lnd_cert_path = ""               # /path/to/lnd/tls.cert
+# lnd_macaroon_path = ""           # /path/to/lnd/data/chain/bitcoin/.../invoice.macaroon

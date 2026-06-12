@@ -19,6 +19,7 @@ from jmwallet.wallet.constants import DEFAULT_SCAN_RANGE, FIDELITY_BOND_BRANCH
 from jmwallet.wallet.display import WalletDisplayMixin
 from jmwallet.wallet.models import UTXOInfo
 from jmwallet.wallet.signer import WalletSigningMixin
+from jmwallet.wallet.swap_keys import WalletSwapKeysMixin
 from jmwallet.wallet.sync import WalletSyncMixin
 from jmwallet.wallet.utxo_metadata import (
     AUTO_FREEZE_REUSE_LABEL,
@@ -35,7 +36,13 @@ __all__ = [
 ]
 
 
-class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin, WalletSigningMixin):
+class WalletService(
+    WalletSyncMixin,
+    CoinSelectionMixin,
+    WalletDisplayMixin,
+    WalletSigningMixin,
+    WalletSwapKeysMixin,
+):
     """
     JoinMarket wallet service.
     Manages BIP84 hierarchical deterministic wallet with mixdepths.

@@ -1518,6 +1518,44 @@ class DescriptorWalletBackend(BlockchainBackend):
         """
         return await self.get_utxos([])
 
+    async def scan_external_address(self, address: str) -> list[UTXO]:
+        """Look up UTXOs at an address not owned by this wallet.
+
+        Uses Bitcoin Core's ``scantxoutset`` so the address does not need to
+        be imported. The cost is O(UTXO set), but this method is intended
+        for short-lived polling of specific foreign addresses (such as a
+        swap provider's lockup address), not for routine wallet operation.
+        """
+        scan_arg = [{"desc": f"addr({address})"}]
+        try:
+            result = await self._rpc_call("scantxoutset", ["start", scan_arg], use_wallet=False)
+        except Exception as e:
+            logger.warning(f"scan_external_address: scantxoutset failed for {address}: {e}")
+            return []
+
+        if not result or not result.get("success"):
+            return []
+
+        tip_height = result.get("height")
+        utxos: list[UTXO] = []
+        for entry in result.get("unspents", []):
+            height = entry.get("height")
+            confirmations = 0
+            if isinstance(tip_height, int) and isinstance(height, int) and height > 0:
+                confirmations = max(0, tip_height - height + 1)
+            utxos.append(
+                UTXO(
+                    txid=entry["txid"],
+                    vout=entry["vout"],
+                    value=btc_to_sats(entry["amount"]),
+                    address=address,
+                    confirmations=confirmations,
+                    scriptpubkey=entry.get("scriptPubKey", ""),
+                    height=height if isinstance(height, int) and height > 0 else None,
+                )
+            )
+        return utxos
+
     async def scan_descriptors(self, _descriptors: list[Any]) -> dict[str, Any] | None:
         """
         Return all wallet UTXOs in the format expected by ``_sync_all_with_descriptors``.

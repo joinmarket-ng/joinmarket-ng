@@ -116,6 +116,7 @@ declare -A SUITE_SLOT=(
     [neutrino-reference]=7
     [reference-maker]=8
     [tumbler]=9
+    [swap-e2e]=10
 )
 
 # Service slot index within a suite's port window.
@@ -132,6 +133,9 @@ declare -A SVC_SLOT=(
     [jam_pw]=9
     [tor_socks]=10
     [tor_ctrl]=11
+    [nostr]=12
+    [lnd_grpc]=13
+    [lnd_rest]=14
 )
 
 # Compute the host port for a given suite/service in the current instance.
@@ -162,6 +166,9 @@ generate_override() {
     local jam_pw_port=$(host_port "$suite" jam_pw)
     local tor_socks=$(host_port "$suite" tor_socks)
     local tor_ctrl=$(host_port "$suite" tor_ctrl)
+    local nostr_port=$(host_port "$suite" nostr)
+    local lnd_grpc=$(host_port "$suite" lnd_grpc)
+    local lnd_rest=$(host_port "$suite" lnd_rest)
     local shared_dir="${PARALLEL_DIR}/shared/${suite}"
 
     mkdir -p "$shared_dir"
@@ -407,6 +414,56 @@ services:
       jm-network:
         aliases:
           - jm-taker-neutrino
+
+  electrs:
+    container_name: ${prefix}-electrs
+    networks:
+      jm-network:
+        aliases:
+          - jm-electrs
+
+  nostr-relay:
+    container_name: ${prefix}-nostr-relay
+    networks:
+      jm-network:
+        aliases:
+          - jm-nostr-relay
+    ports: !override
+      - "${nostr_port}:7000"
+
+  electrum-swap-server:
+    container_name: ${prefix}-electrum-swap
+    networks:
+      jm-network:
+        aliases:
+          - jm-electrum-swap
+    volumes: !override
+      - electrum-data:/home/electrum/.electrum
+      - "${shared_dir}:/shared"
+
+  lnd-taker:
+    container_name: ${prefix}-lnd-taker
+    networks:
+      jm-network:
+        aliases:
+          - jm-lnd-taker
+    volumes: !override
+      - lnd-taker-data:/root/.lnd
+      - "${shared_dir}:/shared"
+    ports: !override
+      - "${lnd_grpc}:10009"
+      - "${lnd_rest}:8080"
+
+  lnd-setup:
+    container_name: ${prefix}-lnd-setup
+    networks:
+      jm-network:
+        aliases:
+          - jm-lnd-setup
+    volumes: !override
+      - lnd-taker-data:/lnd-taker:ro
+      - "${PROJECT_ROOT}/scripts:/scripts:ro"
+      - "${shared_dir}:/shared"
 YAML
 
     echo "$override_file"
@@ -604,7 +661,7 @@ restart_makers() {
 cleanup_suite() {
     local suite=$1
     log_info "Cleaning up suite: $suite"
-    compose_cmd "$suite" --profile e2e --profile reference --profile neutrino --profile reference-maker down -v 2>/dev/null || true
+    compose_cmd "$suite" --profile e2e --profile swap-e2e --profile reference --profile neutrino --profile reference-maker down -v 2>/dev/null || true
     compose_cmd "$suite" down --remove-orphans -v 2>/dev/null || true
     rm -rf "${PARALLEL_DIR}/shared/${suite}" 2>/dev/null || true
 }
@@ -623,7 +680,7 @@ cleanup_all() {
     # Note: we intentionally do NOT run a global `docker volume prune` here, as
     # that would delete volumes belonging to other concurrently-running
     # instances. Each project's volumes are already removed via `down -v`.
-    docker compose -p "${PROJECT_PREFIX}-default" --profile e2e --profile reference \
+    docker compose -p "${PROJECT_PREFIX}-default" --profile e2e --profile swap-e2e --profile reference \
         --profile neutrino --profile reference-maker down -v 2>/dev/null || true
     docker compose -p "${PROJECT_PREFIX}-default" down --remove-orphans -v 2>/dev/null || true
 
@@ -727,7 +784,7 @@ run_suite_e2e() {
         JM_CONTAINER_PREFIX="${prefix}" \
         COMPOSE_PROJECT_NAME="${PROJECT_PREFIX}-${suite}" \
         COVERAGE_FILE=".coverage.${suite}" \
-        pytest -c pytest.ini -m "e2e and not tumbler_e2e" --fail-on-skip \
+        pytest -c pytest.ini -m "e2e and not tumbler_e2e and not swap_e2e" --fail-on-skip \
             -lv --timeout=300 --reruns=1 --reruns-delay=10 \
             --cov --cov-report=term-missing \
             tests/
@@ -744,6 +801,88 @@ run_suite_e2e() {
             -lv --timeout=300 \
             --cov --cov-report=term-missing \
             maker/tests/integration/ jmwallet/tests/ directory_server/tests/
+    } > "$log" 2>&1 || rc=$?
+    cleanup_suite "$suite"
+    return $rc
+}
+
+run_suite_swap_e2e() {
+    local suite="swap-e2e"
+    local log="${PARALLEL_DIR}/${suite}.log"
+    local btc_rpc=$(host_port "$suite" btc_rpc)
+    local dir_port=$(host_port "$suite" dir)
+    local walletd_port=$(host_port "$suite" walletd)
+    local nostr_port=$(host_port "$suite" nostr)
+    local lnd_rest=$(host_port "$suite" lnd_rest)
+    local shared_dir="${PARALLEL_DIR}/shared/${suite}"
+    local prefix="${CONTAINER_PREFIX}-${suite}"
+
+    log_suite "Starting: Lightning Swap E2E Tests ($suite)"
+    local rc=0
+    {
+        generate_override "$suite"
+        cleanup_suite "$suite"
+        compose_cmd "$suite" --profile e2e --profile swap-e2e up -d
+
+        if ! wait_for_bitcoin_rpc "$suite" "$btc_rpc"; then
+            log_error "Bitcoin RPC not ready on host port $btc_rpc for suite $suite"
+            return 1
+        fi
+        wait_for_port "$dir_port" "Directory ($suite)"
+        wait_for_wallet_funder "$suite"
+
+        # Swap tests need the Nostr relay and the Electrum swap server, which
+        # are not gated by the directory/wallet-funder waits above. Wait for
+        # the relay port and the swap server's ready file (exported into the
+        # per-suite shared dir) before starting pytest, otherwise the readiness
+        # tests skip (and --fail-on-skip turns that into a failure).
+        wait_for_port "$nostr_port" "Nostr relay ($suite)"
+        local ready_file="${shared_dir}/electrum-swap-ready"
+        local waited=0
+        while [ ! -f "$ready_file" ] && [ "$waited" -lt 180 ]; do
+            sleep 3
+            waited=$((waited + 3))
+        done
+        if [ ! -f "$ready_file" ]; then
+            log_error "Electrum swap server not ready for suite $suite (no $ready_file)"
+            return 1
+        fi
+
+        # The LND credentials and the Lightning channel are only ready once
+        # lnd-setup finishes opening and confirming the channel, which happens
+        # well after the swap server is up. Gate on the setup marker so the
+        # LND-dependent swap tests don't race a half-provisioned channel (which
+        # otherwise skips with --fail-on-skip -> failure).
+        local ln_setup_file="${shared_dir}/lightning-setup-done"
+        waited=0
+        while [ ! -f "$ln_setup_file" ] && [ "$waited" -lt 240 ]; do
+            sleep 3
+            waited=$((waited + 3))
+        done
+        if [ ! -f "$ln_setup_file" ]; then
+            log_error "Lightning setup did not complete for suite $suite (no $ln_setup_file)"
+            return 1
+        fi
+
+        # One swap test runs a full CoinJoin, so makers must have connected.
+        sleep 20  # Wait for makers to connect
+
+        # Endpoints are remapped per suite, so pass overrides via env.
+        BITCOIN_RPC_URL="http://127.0.0.1:${btc_rpc}" \
+        BITCOIN_RPC_USER=test \
+        BITCOIN_RPC_PASSWORD=test \
+        JMWALLETD_URL="https://127.0.0.1:${walletd_port}" \
+        DIRECTORY_PORT="${dir_port}" \
+        JM_CONTAINER_PREFIX="${prefix}" \
+        COMPOSE_PROJECT_NAME="${PROJECT_PREFIX}-${suite}" \
+        SWAP_NOSTR_RELAY_URL="ws://127.0.0.1:${nostr_port}" \
+        SWAP_LND_TAKER_REST_URL="https://127.0.0.1:${lnd_rest}" \
+        SWAP_SHARED_DIR="${shared_dir}" \
+        COVERAGE_FILE=".coverage.${suite}" \
+        pytest -c pytest.ini -m "swap_e2e" --fail-on-skip \
+            -lv --timeout=300 --reruns=1 --reruns-delay=10 \
+            --cov --cov-report=term-missing \
+            tests/
     } > "$log" 2>&1 || rc=$?
     cleanup_suite "$suite"
     return $rc
@@ -1331,6 +1470,7 @@ main() {
 
     # Docker test suites (each with isolated compose project)
     launch_suite "e2e" run_suite_e2e
+    launch_suite "swap-e2e" run_suite_swap_e2e
     launch_suite "jmwallet" run_suite_jmwallet
     launch_suite "reference-interop" run_suite_reference_interop
     launch_suite "reference-legacy" run_suite_reference_legacy
@@ -1449,6 +1589,7 @@ case "${1:-}" in
         case "$suite" in
             unit)                  run_suite_unit ;;
             e2e)                   run_suite_e2e ;;
+            swap-e2e)              run_suite_swap_e2e ;;
             playwright)            run_suite_playwright ;;
             jmwallet)              run_suite_jmwallet ;;
             reference-interop)     run_suite_reference_interop ;;

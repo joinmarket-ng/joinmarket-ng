@@ -234,6 +234,47 @@ def get_wallet_metadata_path(
     return data_dir / f"wallet_metadata_{safe_fp}.jsonl"
 
 
+def get_swaps_dir(
+    data_dir: Path | str | None = None,
+    fingerprint: str | None = None,
+) -> Path:
+    """
+    Get the directory holding persisted swap-recovery records.
+
+    Swap records hold the metadata (BIP-85 swap index, HTLC script, lockup
+    outpoint) needed to re-derive the claim secrets and unilaterally sweep a
+    reverse-submarine-swap lockup output. They are stored encrypted, one file
+    per swap, partitioned per wallet so metadata from one wallet never leaks
+    into another sharing the same data directory.
+
+    Args:
+        data_dir: Optional data directory (defaults to get_default_data_dir()).
+        fingerprint: Optional 8-char hex wallet fingerprint. When given the
+            returned directory is partitioned per wallet as
+            ``swaps/<fingerprint>``. Only ``[0-9a-f]`` characters are accepted;
+            any other value falls back to the shared ``swaps`` directory to
+            keep the path safe.
+
+    Returns:
+        Path to ``swaps`` (or ``swaps/<fingerprint>``). The directory is
+        created if it does not exist.
+    """
+    if data_dir is None:
+        data_dir = get_default_data_dir()
+    elif isinstance(data_dir, str):
+        data_dir = Path(data_dir)
+
+    swaps_dir = data_dir / "swaps"
+
+    if fingerprint is not None:
+        safe_fp = fingerprint.strip().lower()
+        if safe_fp and all(c in "0123456789abcdef" for c in safe_fp):
+            swaps_dir = swaps_dir / safe_fp
+
+    swaps_dir.mkdir(parents=True, exist_ok=True)
+    return swaps_dir
+
+
 def get_all_nick_states(data_dir: Path | str | None = None) -> dict[str, str]:
     """
     Read all component nick state files from the data directory.

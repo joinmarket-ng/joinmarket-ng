@@ -67,6 +67,10 @@ __all__ = [
 # the taker output back to its inputs.
 _WALLET_OUTPUT_SCRIPT_TYPE = "p2wpkh"
 
+# How often the in-process watcher reconciles persisted swap lockups so a
+# CoinJoin that never confirms gets reclaimed before the provider's refund.
+SWAP_RECOVERY_POLL_INTERVAL = 60.0
+
 
 def _append_confirmation_hint(message: str, taker_utxo_age: int) -> str:
     """Append the standard ``taker_utxo_age`` guidance to a selection error.
@@ -117,6 +121,7 @@ class Taker(TakerMonitoringMixin):
         backend: BlockchainBackend,
         config: TakerConfig,
         confirmation_callback: Any | None = None,
+        swap_failure_callback: Any | None = None,
     ):
         """
         Initialize the Taker.
@@ -126,11 +131,16 @@ class Taker(TakerMonitoringMixin):
             backend: Blockchain backend for broadcasting
             config: Taker configuration
             confirmation_callback: Optional callback for user confirmation before proceeding
+            swap_failure_callback: Optional callback invoked when swap-input
+                acquisition fails BEFORE on-chain lockup. Should return one of
+                ``"retry"``, ``"plain"``, or ``"abort"``. When ``None``, the
+                default is to abort (non-interactive safe default).
         """
         self.wallet = wallet
         self.backend = backend
         self.config = config
         self.confirmation_callback = confirmation_callback
+        self.swap_failure_callback = swap_failure_callback
 
         self.nick_identity = NickIdentity(JM_VERSION)
         self.nick = self.nick_identity.nick
@@ -182,10 +192,23 @@ class Taker(TakerMonitoringMixin):
 
         # Schedule for tumbler-style operations
         self.schedule: Schedule | None = None
-
         # Background task tracking
         self.running = False
         self._background_tasks: list[asyncio.Task[None]] = []
+        # Lazily built swap-recovery engine (None when persistence unavailable).
+        self._swap_recovery_engine: Any | None = None
+        self._swap_recovery_built: bool = False
+
+    @property
+    def swap_input(self) -> Any | None:
+        """
+        The Lightning swap input acquired for the current CoinJoin round, if any.
+
+        Proxies to the active session. Returns ``None`` when no session has
+        acquired a swap input yet (for example, swaps are disabled in config,
+        the acquisition phase has not run, or it failed and was skipped).
+        """
+        return self._session.swap_input
 
     async def sync_wallet(self) -> int:
         """
@@ -260,6 +283,16 @@ class Taker(TakerMonitoringMixin):
         conn_status_task = asyncio.create_task(self._periodic_directory_connection_status())
         self._background_tasks.append(conn_status_task)
 
+        # Reconcile any persisted swap lockups (crash recovery) and start the
+        # in-process watcher that claims lockups whose CoinJoin never confirms.
+        try:
+            await self.recover_swaps()
+        except Exception as exc:  # noqa: BLE001 - recovery must not block startup
+            logger.warning(f"Initial swap recovery sweep failed: {exc!r}")
+        if self.backend.has_mempool_access():
+            swap_watch_task = asyncio.create_task(self._swap_recovery_loop())
+            self._background_tasks.append(swap_watch_task)
+
     async def start(self) -> None:
         """
         Start the taker: sync wallet and connect to directory servers.
@@ -269,6 +302,96 @@ class Taker(TakerMonitoringMixin):
         """
         await self.sync_wallet()
         await self.connect()
+
+    def _get_swap_recovery(self) -> Any | None:
+        """Return the lazily built :class:`SwapRecovery`, or None if disabled.
+
+        Disabled when the wallet has no on-disk ``data_dir`` (ephemeral wallets
+        cannot persist recovery records).
+        """
+        if not self._swap_recovery_built:
+            from taker.swap.recovery import build_swap_recovery
+
+            try:
+                self._swap_recovery_engine = build_swap_recovery(
+                    self.wallet, self.backend, network=self.config.network.value
+                )
+            except Exception as exc:  # noqa: BLE001 - never let recovery setup crash the taker
+                logger.warning(f"Could not initialize swap recovery engine: {exc!r}")
+                self._swap_recovery_engine = None
+            self._swap_recovery_built = True
+        return self._swap_recovery_engine
+
+    async def recover_swaps(
+        self, *, broadcast: bool = True, force_claim: bool = False
+    ) -> list[Any]:
+        """Reconcile and, where needed, reclaim persisted swap lockups.
+
+        Resolves records whose CoinJoin confirmed, marks provider refunds, and
+        sweeps lockups whose CoinJoin will not confirm to a fresh wallet
+        address. Safe to call repeatedly; terminal records are skipped.
+
+        Args:
+            broadcast: If False, build claim transactions without broadcasting
+                (dry run for inspection/tests).
+            force_claim: Sweep unspent lockups even when the associated CoinJoin
+                may still be in flight. Use only for manual recovery once the
+                operator knows the round is dead.
+
+        Returns:
+            A list of recovery results (empty when recovery is disabled).
+        """
+        recovery = self._get_swap_recovery()
+        if recovery is None:
+            return []
+        if not recovery.persistence.list_unresolved():
+            return []
+        from taker.swap.recovery import wallet_address_provider
+
+        feerate = await self._recovery_feerate()
+        results = await recovery.recover_all(
+            address_provider=wallet_address_provider(self.wallet),
+            feerate_sat_vb=feerate,
+            broadcast=broadcast,
+            force_claim=force_claim,
+        )
+        for result in results:
+            logger.info(
+                f"Swap recovery {result.swap_id}: {result.outcome.value}"
+                + (f" tx={result.txid}" if result.txid else "")
+                + (f" ({result.detail})" if result.detail else "")
+            )
+        return results
+
+    async def _recovery_feerate(self) -> float:
+        """Best-effort claim feerate (sat/vB), defaulting to a relay-safe floor."""
+        default = 2.0
+        if not self.backend.can_estimate_fee():
+            return default
+        try:
+            estimated = await self.backend.estimate_fee(self.config.fee_block_target or 3)
+        except Exception as exc:  # noqa: BLE001 - estimation failures fall back to default
+            logger.debug(f"Recovery feerate estimation failed: {exc!r}")
+            return default
+        return max(default, float(estimated))
+
+    async def _swap_recovery_loop(self) -> None:
+        """Background watcher reconciling swap lockups while the taker runs.
+
+        Each pass marks confirmed CoinJoins resolved and claims lockups whose
+        CoinJoin has dropped from the mempool. ``force_claim`` stays off so an
+        in-flight round is never double-spent by its own recovery.
+        """
+        while self.running:
+            try:
+                await asyncio.sleep(SWAP_RECOVERY_POLL_INTERVAL)
+                if not self.running:
+                    break
+                await self.recover_swaps()
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:  # noqa: BLE001 - keep the watcher alive on transient errors
+                logger.warning(f"Swap recovery watcher pass failed: {exc!r}")
 
     def release_input_locks(self) -> None:
         """Release persisted CoinJoin locks held on this round's taker inputs.
@@ -947,6 +1070,85 @@ class Taker(TakerMonitoringMixin):
                 f"total fee: {total_fee:,} sats"
             )
 
+            # Phase 0: Acquire swap input (when enabled)
+            #
+            # Runs BEFORE !fill so we have the lockup UTXO ready when we send
+            # the cj_amount-bumping request. Pre-lockup failures fall back to
+            # plain CoinJoin (interactive) or abort (non-interactive). Post-
+            # lockup failures bubble up and abort cleanly with payment cancel.
+            if self.config.swap_input is not None and self.config.swap_input.enabled:
+                self.state = TakerState.ACQUIRING_SWAP_INPUT
+                logger.info("Phase 0: Acquiring swap input...")
+
+                # Sample a fake taker fee from the orderbook to size the swap.
+                # This makes the taker's "fake maker fee" indistinguishable
+                # from real maker fees in the round.
+                from taker.orderbook import sample_fake_fee_from_orderbook
+
+                fake_taker_fee = sample_fake_fee_from_orderbook(
+                    offers=self.orderbook_manager.offers,
+                    cj_amount=self._session.cj_amount,
+                    selected_nicks=set(selected_offers.keys()),
+                    max_cj_fee=self.config.max_cj_fee,
+                )
+                logger.info(
+                    f"Sampled fake taker fee: {fake_taker_fee:,} sats "
+                    f"(swap target = {self._session.cj_amount + fake_taker_fee:,})"
+                )
+
+                try:
+                    acquired = await self._session._phase_acquire_swap_input(
+                        fake_taker_fee=fake_taker_fee,
+                    )
+                except Exception as exc:
+                    # Post-lockup failure (LN payment already cancelled inside
+                    # the phase). Abort the round; provider self-refunds.
+                    reason = (
+                        f"Swap input post-lockup failure: {exc}. "
+                        "LN payment cancelled; prepay invoice forfeit."
+                    )
+                    logger.error(reason)
+                    self._session.last_failure_reason = reason
+                    self.state = TakerState.FAILED
+                    return None
+
+                if not acquired:
+                    # Pre-lockup failure: ask user (or default to abort).
+                    decision = "abort"
+                    if self.swap_failure_callback is not None:
+                        try:
+                            decision = self.swap_failure_callback(
+                                reason=self._session.last_failure_reason or "unknown",
+                            )
+                        except Exception as cb_exc:  # noqa: BLE001
+                            logger.warning(f"swap_failure_callback raised {cb_exc!r}; aborting")
+                            decision = "abort"
+
+                    if decision == "retry":
+                        # Retry once. If it fails again, abort.
+                        logger.info("Retrying swap input acquisition...")
+                        try:
+                            acquired = await self._session._phase_acquire_swap_input(
+                                fake_taker_fee=fake_taker_fee,
+                            )
+                        except Exception as exc:
+                            reason = f"Swap input retry post-lockup failure: {exc}"
+                            logger.error(reason)
+                            self._session.last_failure_reason = reason
+                            self.state = TakerState.FAILED
+                            return None
+                        if not acquired:
+                            logger.error("Swap input retry failed; aborting")
+                            self.state = TakerState.FAILED
+                            return None
+                    elif decision == "plain":
+                        logger.warning("Falling back to plain CoinJoin (no swap input)")
+                        # Continue without swap input; session.swap_input stays None.
+                    else:
+                        logger.error("Swap input acquisition aborted by user/policy")
+                        self.state = TakerState.FAILED
+                        return None
+
             # Log estimated transaction fee before prompting for confirmation
             # Conservative estimate: assume 1 input per maker + 20% buffer, rounded up
             import math
@@ -1543,6 +1745,11 @@ class Taker(TakerMonitoringMixin):
             self.state = TakerState.COMPLETE
             logger.info(f"CoinJoin COMPLETE! txid: {self._session.txid}")
 
+            # Record the broadcast against any swap lockup so recovery can later
+            # distinguish a confirmed CoinJoin from a provider refund.
+            if self._session.swap_input is not None:
+                self._session._mark_swap_broadcast()
+
             # Update the "Awaiting transaction" history entry with txid and mining fee
             # The entry was created before sending !tx to preserve address privacy
             try:
@@ -1598,6 +1805,29 @@ class Taker(TakerMonitoringMixin):
             asyncio.create_task(get_notifier().notify_coinjoin_failed(str(e), phase, amount))
             self.state = TakerState.FAILED
             return None
+
+        finally:
+            # If a swap lockup was acquired but the CoinJoin did not complete,
+            # the main hold-invoice payment is still in flight. Leaving it
+            # running would let LND settle it once (if ever) the preimage leaks,
+            # paying the provider for a swap the taker never used. Cancel it on
+            # every non-success exit so the HTLC fails at CLTV expiry instead.
+            # On success the state is COMPLETE and the payment must keep running
+            # so the provider can settle the hold invoice once the broadcast
+            # CoinJoin reveals the preimage on-chain.
+            swap_client = getattr(self._session, "swap_client", None)
+            if (
+                self.state != TakerState.COMPLETE
+                and self._session.swap_input is not None
+                and swap_client is not None
+            ):
+                try:
+                    await swap_client.cancel_pending_payment()
+                except Exception as cancel_exc:  # noqa: BLE001
+                    logger.warning(
+                        f"Failed to cancel in-flight swap payment after CoinJoin "
+                        f"failure: {cancel_exc!r}"
+                    )
 
     async def run_schedule(self, schedule: Schedule) -> bool:
         """
