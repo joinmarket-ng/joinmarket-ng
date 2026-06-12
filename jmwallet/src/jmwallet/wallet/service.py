@@ -97,6 +97,14 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin, Wal
         self.address_cache: dict[str, tuple[int, int, int]] = {}
         self._path_cache: dict[tuple[int, int, int], str] = {}
         self.utxo_cache: dict[int, list[UTXOInfo]] = {}
+        # Flag set on construction and cleared after the first successful sync.
+        # Used by _auto_freeze_reused_address_utxos to suppress false-positive
+        # auto-freezes on the very first sync after a process restart: when the
+        # process just started, utxo_cache is empty so prior_known_outpoints is
+        # empty, but addresses_with_history is populated from the persisted
+        # metadata store.  Without this guard every UTXO on a "used" address
+        # would look like a "freshly arrived coin at an empty used address".
+        self._just_initialized: bool = True
 
         # UTXO + address metadata store (BIP-329 JSONL). Frozen UTXO state,
         # output labels, and the persistent "addresses with on-chain history"
@@ -774,17 +782,6 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin, Wal
         if threshold == 0:
             return 0
         if not prior_used_addresses:
-            return 0
-        # Skip auto-freeze when the wallet cache was empty at the start of this
-        # sync (prior_known_outpoints is empty).  An empty cache means the
-        # wallet just started or restarted: addresses_with_history is populated
-        # from the persistent metadata store but utxo_cache is not (it starts
-        # empty in __init__).  We cannot distinguish between a UTXO that was
-        # "already present when the wallet last ran" and a "genuinely new coin
-        # at an empty used address", so we skip the auto-freeze entirely.
-        # The next sync (after utxo_cache is primed) will correctly evaluate
-        # only incremental arrivals.
-        if not prior_known_outpoints:
             return 0
 
         frozen_now = 0
