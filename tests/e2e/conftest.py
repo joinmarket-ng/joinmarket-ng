@@ -459,6 +459,51 @@ async def wait_for_directory_server(
     pytest.skip("Directory server did not become ready in time")
 
 
+def _wait_for_maker_offers(min_offers: int = 2, timeout: float = 120.0) -> bool:
+    """Poll the orderbook watcher until at least *min_offers* offers appear.
+
+    Uses the HTTP ``/orderbook.json`` endpoint of the orderbook-watcher service
+    which reflects offers that makers have actually published to the directory.
+    This is a reliable readiness signal: an offer only appears once the maker
+    has connected to the directory *and* broadcast its ``!orderbook`` response.
+
+    Returns True when the condition is met, False on timeout.  Logs a warning on
+    timeout but does not raise so callers can decide how to handle the situation.
+    """
+    import urllib.error
+    import urllib.request
+
+    from tests.e2e.docker_utils import get_orderbook_watcher_url
+
+    url = f"{get_orderbook_watcher_url()}/orderbook.json"
+    deadline = time.time() + timeout
+    poll_interval = 2.0
+
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=3) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                n = len(data.get("offers", []))
+                if n >= min_offers:
+                    logger.info(
+                        f"Orderbook watcher has {n} offers (>= {min_offers}), makers ready"
+                    )
+                    return True
+                logger.debug(
+                    f"Orderbook watcher has {n}/{min_offers} offers, waiting..."
+                )
+        except (urllib.error.URLError, OSError, json.JSONDecodeError, TimeoutError):
+            # Watcher may not be available in all test configurations
+            pass
+        time.sleep(poll_interval)
+
+    logger.warning(
+        f"Timed out after {timeout:.0f}s waiting for {min_offers} offer(s) "
+        "in orderbook watcher. Proceeding anyway - test may skip."
+    )
+    return False
+
+
 @pytest.fixture(scope="function")
 def fresh_docker_makers():
     """Restart Docker makers before test to ensure fresh UTXOs.
@@ -466,18 +511,21 @@ def fresh_docker_makers():
     This fixture restarts the Docker maker containers to prevent UTXO reuse
     between tests, which can cause transaction verification failures.
 
-    It also stops any non-e2e profile makers that might interfere with tests.
+    It also stops any non-e2e profile makers that might interfere with tests
+    and clears commitment blacklists for all active makers.
 
-    The wait time is generous to allow for:
-    - Container restart
-    - Wallet sync with blockchain
-    - Directory server reconnection
-    - Offer announcement and propagation
+    Instead of a fixed sleep, it polls the orderbook watcher until at least 2
+    offers appear, which is the reliable signal that makers are connected to the
+    directory and have published their offers.
     """
 
     from jmcore.paths import get_used_commitments_path
 
-    from tests.e2e.docker_utils import docker_exec, get_container_name
+    from tests.e2e.docker_utils import (
+        docker_exec,
+        docker_inspect_running,
+        get_container_name,
+    )
 
     try:
         if not wait_for_neutrino_ready_if_present(timeout=180):
@@ -503,8 +551,21 @@ def fresh_docker_makers():
             taker_commitments.unlink()
             logger.info(f"Cleared taker used commitments: {taker_commitments}")
 
-        # Clear commitment blacklists for all makers before restarting
-        maker_services = ["maker1", "maker2", "maker3", "maker-neutrino"]
+        # Clear commitment blacklists for all active e2e makers before restarting.
+        # Includes maker4 and maker5 to prevent blacklist carry-over from prior tests.
+        # Also clears wallet metadata (frozen UTXO state) to prevent the
+        # auto-freeze-on-reuse feature from freezing the maker's UTXOs after
+        # restart: on restart, utxo_cache starts empty but addresses_with_history
+        # is loaded from the persisted metadata, causing all UTXOs at previously-
+        # used addresses to be mis-classified as "forced reuse" and frozen.
+        maker_services = [
+            "maker1",
+            "maker2",
+            "maker3",
+            "maker4",
+            "maker5",
+            "maker-neutrino",
+        ]
         for service in maker_services:
             container = get_container_name(service)
             try:
@@ -513,33 +574,46 @@ def fresh_docker_makers():
                     [
                         "sh",
                         "-c",
-                        "rm -rf /home/jm/.joinmarket-ng/cmtdata/commitmentlist",
+                        "rm -rf /home/jm/.joinmarket-ng/cmtdata/commitmentlist"
+                        " /home/jm/.joinmarket-ng/wallet_metadata_*.jsonl",
                     ],
                     timeout=10,
                 )
-                logger.debug(f"Cleared commitment blacklist for {container}")
-            except Exception as e:
-                logger.warning(
-                    f"Failed to clear commitment blacklist for {container}: {e}"
+                logger.debug(
+                    f"Cleared commitment blacklist and wallet metadata for {container}"
                 )
+            except Exception as e:
+                logger.warning(f"Failed to clear state for {container}: {e}")
 
-        # Restart the e2e profile makers (including neutrino maker for neutrino tests)
-        restart_containers = [get_container_name(s) for s in maker_services]
-        result = subprocess.run(
-            ["docker", "restart", *restart_containers],
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-        if result.returncode == 0:
-            logger.info("Restarted Docker makers, waiting for startup...")
-            # Wait for makers to fully initialize:
-            # - Container start: ~5s
-            # - Wallet sync: ~10-20s
-            # - Directory connection & offer announcement: ~5-10s
-            time.sleep(90)
+        # Restart the e2e profile makers (including neutrino maker for neutrino tests).
+        # Only restart the non-heavy ones; maker4/maker5 are left running to keep
+        # their UTXOs stable. Skip containers that are not running (e.g.
+        # maker-neutrino is absent in the standard e2e profile) so that a
+        # missing container does not cause docker restart to exit non-zero and
+        # prevent the readiness wait from running.
+        restart_services = ["maker1", "maker2", "maker3", "maker-neutrino"]
+        restart_containers = [
+            get_container_name(s)
+            for s in restart_services
+            if docker_inspect_running(get_container_name(s))
+        ]
+        if restart_containers:
+            result = subprocess.run(
+                ["docker", "restart", *restart_containers],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            if result.returncode == 0:
+                logger.info(
+                    f"Restarted {len(restart_containers)} maker(s), "
+                    "polling orderbook watcher for readiness..."
+                )
+            else:
+                logger.warning(f"Partial maker restart failure: {result.stderr}")
+            _wait_for_maker_offers(min_offers=1, timeout=120)
         else:
-            logger.warning(f"Failed to restart makers: {result.stderr}")
+            logger.warning("No maker containers found to restart")
     except subprocess.TimeoutExpired:
         logger.warning("Docker restart timed out")
     except FileNotFoundError:

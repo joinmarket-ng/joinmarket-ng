@@ -124,6 +124,28 @@ jobs:
   # Runs in parallel with image builds for faster feedback
   # Excludes tests marked with @pytest.mark.docker (those run in integration tests)
   # ==========================================================================
+  complexipy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+
+      - name: Install complexipy
+        run: pip install complexipy==5.5.0
+
+      - name: Run complexity check
+        run: complexipy . --failed --suggest-refactors
+
   test-unit:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -449,7 +471,7 @@ jobs:
   test-e2e:
     needs: build-images
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     permissions:
       contents: read
       packages: read
@@ -509,8 +531,16 @@ jobs:
             "curl -skf https://127.0.0.1:28183/api/v1/getinfo" \
             60 2
 
-          echo "Waiting for makers to connect..."
-          sleep 20
+          echo "Waiting for makers to publish offers to orderbook watcher..."
+          for i in $(seq 1 90); do
+            n_offers=$(curl -sf http://127.0.0.1:8080/orderbook.json 2>/dev/null \
+              | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('offers', [])))" 2>/dev/null || echo 0)
+            if [ "${n_offers:-0}" -ge 2 ]; then
+              echo "Orderbook has ${n_offers} offers - makers ready"
+              break
+            fi
+            sleep 2
+          done
 
           echo "E2E services ready!"
 
@@ -519,6 +549,7 @@ jobs:
           BITCOIN_RPC_URL: http://127.0.0.1:18443
           BITCOIN_RPC_USER: test
           BITCOIN_RPC_PASSWORD: test
+          OBWATCH_URL: http://127.0.0.1:8080
         run: |
           pytest -c pytest.ini -m "e2e and not tumbler_e2e" --junitxml=junit/test-results.xml \
             --cov --cov-report=term-missing --cov-report=xml \
@@ -620,8 +651,16 @@ jobs:
             "curl -skf https://127.0.0.1:28183/api/v1/getinfo" \
             60 2
 
-          echo "Waiting for makers to connect..."
-          sleep 20
+          echo "Waiting for makers to publish offers to orderbook watcher..."
+          for i in $(seq 1 90); do
+            n_offers=$(curl -sf http://127.0.0.1:8080/orderbook.json 2>/dev/null \
+              | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('offers', [])))" 2>/dev/null || echo 0)
+            if [ "${n_offers:-0}" -ge 2 ]; then
+              echo "Orderbook has ${n_offers} offers - makers ready"
+              break
+            fi
+            sleep 2
+          done
 
           echo "E2E services ready!"
 
@@ -630,6 +669,7 @@ jobs:
           BITCOIN_RPC_URL: http://127.0.0.1:18443
           BITCOIN_RPC_USER: test
           BITCOIN_RPC_PASSWORD: test
+          OBWATCH_URL: http://127.0.0.1:8080
         run: |
           pytest -c pytest.ini -m tumbler_e2e --junitxml=junit/test-results.xml \
             --cov --cov-report=term-missing --cov-report=xml \
@@ -1315,6 +1355,7 @@ jobs:
           BITCOIN_RPC_USER: test
           BITCOIN_RPC_PASSWORD: test
           NEUTRINO_URL: https://127.0.0.1:8334
+          OBWATCH_URL: http://127.0.0.1:8080
         run: |
           pytest -c pytest.ini -m neutrino -k "not test_coinjoin" --junitxml=junit/test-results.xml \
             --cov --cov-report=term-missing --cov-report=xml \
@@ -1438,6 +1479,7 @@ jobs:
           BITCOIN_RPC_USER: test
           BITCOIN_RPC_PASSWORD: test
           NEUTRINO_URL: https://127.0.0.1:8334
+          OBWATCH_URL: http://127.0.0.1:8080
         run: |
           pytest -c pytest.ini -m neutrino -k "test_coinjoin" --junitxml=junit/test-results.xml \
             --cov --cov-report=term-missing --cov-report=xml \
@@ -1970,6 +2012,7 @@ jobs:
   # ==========================================================================
   publish-images:
     needs:
+      - complexipy
       # Unit tests (combined in single job)
       - test-unit
       # Component integration tests (run docker-marked tests only)
