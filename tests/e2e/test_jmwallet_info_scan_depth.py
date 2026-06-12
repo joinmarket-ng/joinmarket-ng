@@ -100,14 +100,48 @@ async def _ensure_wallet(cfg: dict[str, str], name: str) -> None:
 
 
 async def _setup_funded_miner(cfg: dict[str, str], miner_wallet: str) -> str:
-    """Return a freshly generated miner address with mature coinbase funds."""
+    """Return a freshly generated miner address with mature funds.
+
+    Tries to send from the pre-funded ``test-funder`` Core wallet first
+    (mines only 1 confirmation block).  Falls back to subsidy-aware coinbase
+    mining when test-funder is not available.
+    """
     await _ensure_wallet(cfg, miner_wallet)
     miner_addr = await _rpc(cfg, "getnewaddress", ["", "bech32"], wallet=miner_wallet)
-    info = await _rpc(cfg, "getwalletinfo", wallet=miner_wallet)
-    if info.get("balance", 0) < 1.0:
-        # 110 blocks gives one mature coinbase reward (50 BTC), plenty for
-        # the small sends this test makes.
-        await _rpc(cfg, "generatetoaddress", [110, miner_addr], wallet=miner_wallet)
+
+    # Fast path: fund from test-funder (1 confirmation block).
+    try:
+        await _rpc(cfg, "sendtoaddress", [miner_addr, 2.0], wallet="test-funder")
+        await _rpc(cfg, "generatetoaddress", [1, miner_addr], wallet=miner_wallet)
+        return miner_addr
+    except Exception:
+        pass
+
+    # Fallback: coinbase mining.
+    import math
+
+    target_btc = 1.0
+    for _ in range(20):
+        info = await _rpc(cfg, "getwalletinfo", wallet=miner_wallet)
+        if float(info.get("balance", 0)) >= target_btc:
+            break
+        chain = await _rpc(cfg, "getblockchaininfo")
+        height = int(chain["blocks"])
+        stats = await _rpc(cfg, "getblockstats", [height, ["subsidy"]])
+        subsidy_btc = float(stats["subsidy"]) / 1e8
+        if subsidy_btc <= 0:
+            raise RuntimeError(
+                f"Block subsidy is zero at height {height}; recreate the chain "
+                "with `docker compose down -v`."
+            )
+        deficit = target_btc - float(info.get("balance", 0))
+        needed_mature = max(1, math.ceil(deficit / subsidy_btc))
+        await _rpc(
+            cfg,
+            "generatetoaddress",
+            [needed_mature + 100, miner_addr],
+            wallet=miner_wallet,
+        )
     return miner_addr
 
 

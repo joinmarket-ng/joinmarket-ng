@@ -1,0 +1,7 @@
+max-complexity-allowed = 108
+exclude = [
+    "joinmarket-clientserver",
+    "jmvenv",
+    ".venv",
+    "tmp",
+]

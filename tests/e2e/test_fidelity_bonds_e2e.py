@@ -16,6 +16,8 @@ import pytest
 from jmcore.directory_client import DirectoryClient
 from loguru import logger
 
+from tests.e2e.docker_utils import get_directory_port
+
 # Mark all tests in this module as requiring Docker e2e profile
 pytestmark = pytest.mark.e2e
 
@@ -34,7 +36,7 @@ async def test_orderbook_watcher_receives_bonds(wait_for_directory_server):
     # Connect as orderbook watcher
     watcher = DirectoryClient(
         host="127.0.0.1",
-        port=5222,
+        port=get_directory_port(),
         network="testnet",
     )
     await watcher.connect()
@@ -80,7 +82,7 @@ async def test_new_peer_triggers_orderbook_request(wait_for_directory_server):
     # Connect as orderbook watcher
     watcher = DirectoryClient(
         host="127.0.0.1",
-        port=5222,
+        port=get_directory_port(),
         network="testnet",
     )
     await watcher.connect()
@@ -148,7 +150,7 @@ async def test_bond_appears_in_privmsg_not_public(wait_for_directory_server):
     """
     watcher = DirectoryClient(
         host="127.0.0.1",
-        port=5222,
+        port=get_directory_port(),
         network="testnet",
     )
     await watcher.connect()

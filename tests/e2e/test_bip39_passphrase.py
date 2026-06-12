@@ -175,7 +175,7 @@ class TestBIP39PassphraseWallet:
         4. Create a NEW wallet instance with same mnemonic+passphrase
         5. Verify the bond is discovered during recovery scan
         """
-        from tests.e2e.rpc_utils import mine_blocks, rpc_call
+        from tests.e2e.rpc_utils import mine_blocks, rpc_call, send_from_test_funder
 
         from jmwallet.wallet.service import WalletService
 
@@ -195,14 +195,16 @@ class TestBIP39PassphraseWallet:
         bond_address = wallet.get_fidelity_bond_address(0, locktime)
         logger.info(f"Created fidelity bond address: {bond_address}")
 
-        # Step 2: Fund the bond address
-        # Mine blocks directly to the bond address
-        logger.info("Funding bond address with coinbase reward...")
-        await mine_blocks(1, bond_address)
-
-        # Mine additional blocks for maturity
+        # Step 2: Fund the bond address.
+        # Prefer sendtoaddress from test-funder (subsidy-independent: mines
+        # only 1 confirmation block). Fall back to mining a coinbase directly.
         dummy_addr = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"
-        await mine_blocks(110, dummy_addr)
+        logger.info("Funding bond address...")
+        funded = await send_from_test_funder(bond_address, 0.01, confirmations=1)
+        if not funded:
+            # Fallback: mine 1 coinbase to bond address + 110 for maturity.
+            await mine_blocks(1, bond_address)
+            await mine_blocks(110, dummy_addr)
 
         # Verify the UTXO exists
         result = await rpc_call("scantxoutset", ["start", [f"addr({bond_address})"]])
