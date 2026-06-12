@@ -775,6 +775,17 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin, Wal
             return 0
         if not prior_used_addresses:
             return 0
+        # Skip auto-freeze when the wallet cache was empty at the start of this
+        # sync (prior_known_outpoints is empty).  An empty cache means the
+        # wallet just started or restarted: addresses_with_history is populated
+        # from the persistent metadata store but utxo_cache is not (it starts
+        # empty in __init__).  We cannot distinguish between a UTXO that was
+        # "already present when the wallet last ran" and a "genuinely new coin
+        # at an empty used address", so we skip the auto-freeze entirely.
+        # The next sync (after utxo_cache is primed) will correctly evaluate
+        # only incremental arrivals.
+        if not prior_known_outpoints:
+            return 0
 
         frozen_now = 0
         for utxos in self.utxo_cache.values():
