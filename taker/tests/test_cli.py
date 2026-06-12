@@ -64,6 +64,7 @@ class TestBuildTakerConfig:
         settings.taker.bondless_makers_allowance = 0.1
         settings.taker.bond_value_exponent = 1.3
         settings.taker.bondless_require_zero_fee = True
+        settings.taker.quantize_fees = True
         settings.taker.tx_broadcast = "MULTIPLE_PEERS"
         settings.taker.broadcast_peer_count = 4
         settings.taker.minimum_makers = 4
@@ -161,6 +162,39 @@ class TestBuildTakerConfig:
 
         assert config.fee_rate is None
         assert config.fee_block_target == 6
+
+    def test_quantize_fees_default_from_settings(
+        self, sample_mnemonic: str, mock_settings: MagicMock
+    ) -> None:
+        """quantize_fees defaults to the settings value when no CLI flag is given."""
+        config = build_taker_config(
+            settings=mock_settings,
+            mnemonic=sample_mnemonic,
+            passphrase="",
+            destination="bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+            amount=100000,
+            mixdepth=0,
+        )
+
+        assert config.quantize_fees is True
+        assert config.build_fee_quantizer().active is True
+
+    def test_no_fee_quantize_cli_overrides_settings(
+        self, sample_mnemonic: str, mock_settings: MagicMock
+    ) -> None:
+        """--no-fee-quantize (quantize_fees=False) overrides the settings default."""
+        config = build_taker_config(
+            settings=mock_settings,
+            mnemonic=sample_mnemonic,
+            passphrase="",
+            destination="bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+            amount=100000,
+            mixdepth=0,
+            quantize_fees=False,
+        )
+
+        assert config.quantize_fees is False
+        assert config.build_fee_quantizer().active is False
 
     def test_counterparties_override_caps_minimum_makers(
         self, sample_mnemonic: str, mock_settings: MagicMock

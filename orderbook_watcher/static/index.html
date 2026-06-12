@@ -55,6 +55,22 @@
             <div id="directory-breakdown"></div>
         </div>
 
+        <div class="fee-quant-stats">
+            <h2>Fee Quantization Bands</h2>
+            <p class="fee-quant-description">
+                Privacy-preserving takers (<a href="https://github.com/joinmarket-ng/joinmarket-ng/issues/508" target="_blank" rel="noopener noreferrer">issue #508</a>)
+                homogenize the fee paid to every maker by rounding their fee limit down onto a shared public grid.
+                Each maker is grouped into the band its advertised fee floors to. To be selectable by takers
+                quantizing at a given band, set your fee at or below that band (allow headroom for fee randomization).
+                Bars show maker count; hover for the total fidelity bond value backing each band.
+            </p>
+            <div class="fee-quant-toggle">
+                <button id="fee-quant-rel-btn" class="fee-quant-tab active" data-mode="rel">Relative offers</button>
+                <button id="fee-quant-abs-btn" class="fee-quant-tab" data-mode="abs">Absolute offers</button>
+            </div>
+            <div id="fee-quant-chart"></div>
+        </div>
+
         <div class="controls">
             <div class="filter-group">
                 <label>

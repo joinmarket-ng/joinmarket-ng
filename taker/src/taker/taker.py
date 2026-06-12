@@ -48,7 +48,7 @@ from taker.eligibility import (
 from taker.models import MakerSession, PhaseResult, TakerState
 from taker.monitoring import TakerMonitoringMixin
 from taker.multi_directory import MultiDirectoryClient
-from taker.orderbook import OrderbookManager, calculate_cj_fee
+from taker.orderbook import OrderbookManager, calculate_cj_fee, maker_paid_fee
 from taker.podle_manager import PoDLEManager
 
 # Backward-compatible re-exports: many tests and modules import these from taker.taker
@@ -167,6 +167,7 @@ class Taker(TakerMonitoringMixin):
             bondless_require_zero_fee=config.bondless_makers_allowance_require_zero_fee,
             data_dir=config.data_dir,
             own_wallet_nicks=own_wallet_nicks,
+            fee_quantizer=config.build_fee_quantizer(),
         )
 
         # PoDLE manager for commitment tracking
@@ -1447,9 +1448,18 @@ class Taker(TakerMonitoringMixin):
             # Calculate actual mining fee from the transaction (includes any residual/dust)
             actual_mining_fee = total_input_value - total_output_value
 
-            # Calculate maker fees
-            total_maker_fees = sum(
+            # Calculate maker fees. With fee quantization active (issue #508) the
+            # taker pays every maker the same homogenized per-slot fee, which may
+            # exceed each maker's advertised (required) fee. The transaction is
+            # built with the paid fee, so report that as the cost while also
+            # surfacing the advertised total for transparency.
+            fee_quantizer = self.orderbook_manager.fee_quantizer
+            total_required_fees = sum(
                 calculate_cj_fee(session.offer, self._session.cj_amount)
+                for session in self._session.maker_sessions.values()
+            )
+            total_maker_fees = sum(
+                maker_paid_fee(session.offer, self._session.cj_amount, fee_quantizer)
                 for session in self._session.maker_sessions.values()
             )
             total_cost = total_maker_fees + actual_mining_fee
@@ -1473,6 +1483,12 @@ class Taker(TakerMonitoringMixin):
             )
             logger.info(f"Transaction outputs:  {total_outputs}")
             logger.info(f"Maker fees:           {total_maker_fees:,} sats")
+            if fee_quantizer is not None and fee_quantizer.active:
+                slot_fee = fee_quantizer.slot_fee(self._session.cj_amount)
+                logger.info(
+                    f"  Fee quantization:   ON (per-maker slot fee {slot_fee:,} sats; "
+                    f"makers required {total_required_fees:,} sats total)"
+                )
             logger.info(
                 f"Mining fee:           {actual_mining_fee:,} sats ({actual_fee_rate:.2f} sat/vB)"
             )
@@ -1491,7 +1507,7 @@ class Taker(TakerMonitoringMixin):
                     # Build maker details for final confirmation
                     maker_details = []
                     for nick, session in self._session.maker_sessions.items():
-                        fee = calculate_cj_fee(session.offer, self._session.cj_amount)
+                        fee = maker_paid_fee(session.offer, self._session.cj_amount, fee_quantizer)
                         bond_value = session.offer.fidelity_bond_value
                         # Get maker's location from any connected directory
                         location = None

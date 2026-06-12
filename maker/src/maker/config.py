@@ -57,17 +57,23 @@ class OfferConfig(BaseModel):
         ),
     )
     cj_fee_relative: str = Field(
-        default="0.00002",
+        default="0.0005",
         description=(
-            "Relative CJ fee as decimal. Default 0.00002 (0.002%) matches the "
-            "upstream JoinMarket reference and avoids fingerprinting jm-ng "
-            "makers via different fee defaults."
+            "Relative CJ fee as decimal. Default 0.0005 (0.05%) is the most "
+            "common (mode) maker fee on mainnet and sits exactly on the taker "
+            "fee-quantization grid, so default makers share a homogenized fee "
+            "with the existing mainnet crowd, maximizing the anonymity set. If "
+            "you deviate to an off-grid value, enable randomization "
+            "(cjfee_factor=0.1) so your exact policy is not a fingerprint."
         ),
     )
     cj_fee_absolute: int = Field(
-        default=500,
+        default=100,
         ge=0,
-        description="Absolute CJ fee in satoshis. Used when offer_type is absolute.",
+        description=(
+            "Absolute CJ fee in satoshis. Used when offer_type is absolute. "
+            "Default 100 is the most common (mode) mainnet value and on-grid."
+        ),
     )
     tx_fee_contribution: int = Field(
         default=0,
@@ -75,13 +81,16 @@ class OfferConfig(BaseModel):
         description="Transaction fee contribution in satoshis",
     )
     cjfee_factor: float = Field(
-        default=0.1,
+        default=0.0,
         ge=0.0,
         description=(
             "Randomization factor applied to the CoinJoin fee on each offer "
             "announcement. The advertised fee is sampled uniformly from "
-            "[cjfee*(1-f), cjfee*(1+f)]. Set to 0 to disable. "
-            "Default 0.1 matches the upstream JoinMarket yg-privacyenhanced."
+            "[cjfee*(1-f), cjfee*(1+f)]. Default 0 (no randomization) keeps a "
+            "default maker exactly on its quantization quantum so it blends with "
+            "other default makers. Only enable randomization (e.g. 0.1) when you "
+            "use a non-quantized fee, where an exact value would otherwise be a "
+            "fingerprint."
         ),
     )
     txfee_contribution_factor: float = Field(
@@ -225,20 +234,24 @@ class MakerConfig(WalletConfig):
     )
     min_size: int = Field(default=100_000, ge=0, description="Minimum CoinJoin amount in satoshis")
     cj_fee_relative: str = Field(
-        default="0.00002",
+        default="0.0005",
         description=(
-            "Relative CJ fee. Default 0.00002 (0.002%) matches the upstream JoinMarket reference."
+            "Relative CJ fee. Default 0.0005 (0.05%) is the most common (mode) "
+            "mainnet maker fee and sits on the quantization grid, so default "
+            "makers share a homogenized fee and a larger anonymity set. See "
+            "OfferConfig.cj_fee_relative."
         ),
     )
-    cj_fee_absolute: int = Field(default=500, ge=0, description="Absolute CJ fee in satoshis")
+    cj_fee_absolute: int = Field(default=100, ge=0, description="Absolute CJ fee in satoshis")
     tx_fee_contribution: int = Field(
         default=0, ge=0, description="Transaction fee contribution in satoshis"
     )
     cjfee_factor: float = Field(
-        default=0.1,
+        default=0.0,
         ge=0.0,
         description=(
             "Randomization factor for the CoinJoin fee in legacy single-offer mode. "
+            "Default 0 keeps a default maker exactly on its quantization quantum. "
             "See OfferConfig.cjfee_factor."
         ),
     )

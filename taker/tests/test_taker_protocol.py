@@ -716,7 +716,13 @@ class TestSweepCjAmountPreservation:
 
     @pytest.fixture
     def taker_config_for_sweep(self):
-        """Taker config for sweep mode test."""
+        """Taker config for sweep mode test.
+
+        Fee quantization is disabled here: these tests inject a precomputed
+        sweep cj_amount that assumes the zero-fee maker is paid exactly its
+        advertised fee. They verify cj_amount preservation, not fee
+        homogenization (covered by test_orderbook.TestFeeQuantization).
+        """
         return make_taker_config(
             counterparty_count=1,
             minimum_makers=1,
@@ -726,6 +732,7 @@ class TestSweepCjAmountPreservation:
             maker_timeout_sec=30.0,
             order_wait_time=10.0,
             fee_rate=1.0,  # 1 sat/vB
+            quantize_fees=False,
         )
 
     @staticmethod

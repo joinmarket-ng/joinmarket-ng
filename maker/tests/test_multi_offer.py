@@ -26,10 +26,10 @@ class TestOfferConfig:
         assert cfg.offer_type == OfferType.SW0_RELATIVE
         # Defaults aligned with upstream yg-privacyenhanced (issue #468)
         assert cfg.min_size == 100_000
-        assert cfg.cj_fee_relative == "0.00002"
-        assert cfg.cj_fee_absolute == 500
+        assert cfg.cj_fee_relative == "0.0005"
+        assert cfg.cj_fee_absolute == 100
         assert cfg.tx_fee_contribution == 0
-        assert cfg.cjfee_factor == 0.1
+        assert cfg.cjfee_factor == 0.0
         assert cfg.txfee_contribution_factor == 0.3
         assert cfg.size_factor == 0.1
 

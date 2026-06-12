@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from aiohttp import web
+from jmcore.fee_quantization import QUANT_ABS, QUANT_REL
 from jmcore.models import OrderBook
 from jmcore.settings import OrderbookWatcherSettings
 from loguru import logger
@@ -132,9 +133,13 @@ class OrderbookServer:
         # Bondless makers are sybil-cheap: a single operator can announce an
         # unbounded number of them and skew "% of makers supporting feature X"
         # arbitrarily. Restricting both numerator and denominator to makers
-        # with a fidelity bond (``fidelity_bond_value > 0``) yields a
-        # sybil-resistant share that reflects committed capital, not raw
-        # nick count. See issue #483.
+        # that advertise a fidelity bond yields a sybil-resistant share that
+        # reflects committed capital, not raw nick count. See issue #483.
+        #
+        # A maker counts as bonded when it advertises a bond
+        # (``fidelity_bond_data``) even if the bond *value* cannot be computed
+        # (no blockchain/mempool backend configured): the advertised bond is
+        # still sybil-resistant, and the value only gates value-weighted views.
         feature_stats: dict[str, int] = {}
         unique_makers: set[str] = set()
         bonded_makers: set[str] = set()
@@ -143,7 +148,11 @@ class OrderbookServer:
             if counterparty in unique_makers:
                 continue
             unique_makers.add(counterparty)
-            if offer_data.get("fidelity_bond_value", 0) <= 0:
+            has_bond = (
+                offer_data.get("fidelity_bond_value", 0) > 0
+                or offer_data.get("fidelity_bond_data") is not None
+            )
+            if not has_bond:
                 continue
             bonded_makers.add(counterparty)
             features = offer_data.get("features", {})
@@ -177,6 +186,13 @@ class OrderbookServer:
             "directory_stats": directory_stats,
             "feature_stats": feature_stats,
             "feature_stats_denominator": len(bonded_makers),
+            "fee_quantization": {
+                # Public fee-homogenization grid (issue #508). The taker rounds
+                # its fee limits down onto these values; the chart buckets offers
+                # the same way so makers can see which quantum band they land in.
+                "rel_grid": [str(q) for q in QUANT_REL],
+                "abs_grid": list(QUANT_ABS),
+            },
             "mempool_url": self.settings.mempool_web_url
             or (
                 self.settings.mempool_api_url.replace("/api", "")

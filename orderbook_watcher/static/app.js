@@ -53,6 +53,7 @@ async function fetchOrderbook() {
         updateStats();
         updateDirectoryBreakdown();
         updateFeatureBreakdown();
+        renderFeeQuantizationChart();
         updateDirectoryFilter();
         renderTable();
         updateLastUpdate();
@@ -223,6 +224,198 @@ function updateDirectoryBreakdown() {
         item.appendChild(nameContainer);
         item.appendChild(infoContainer);
         breakdown.appendChild(item);
+    });
+}
+
+let feeQuantMode = 'rel';
+
+const ABS_OFFER_TYPES = new Set(['sw0absoffer', 'swabsoffer']);
+
+function formatBtc(sats) {
+    return (sats / 1e8).toFixed(4) + ' BTC';
+}
+
+function formatRelPct(relStr) {
+    // relStr is a decimal fraction like "0.001" -> "0.1%"
+    return (parseFloat(relStr) * 100).toPrecision(2).replace(/\.?0+$/, '') + '%';
+}
+
+// Bucket a fee onto the smallest grid entry >= fee (round up). A maker is
+// selectable by a taker only when the taker's quantized fee is >= the maker's
+// advertised fee, so a maker lands in the smallest quantum that still covers it
+// (its "hide set"). Returns the grid index, or -1 when the fee is above the
+// largest grid entry (no quantum covers it; the maker is effectively
+// unselectable by a quantizing taker).
+function ceilGridIndex(value, grid) {
+    for (let i = 0; i < grid.length; i++) {
+        if (grid[i] >= value) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+// A maker counts as bonded when it advertises a fidelity bond, even if the bond
+// value cannot be computed here (no blockchain/mempool backend): the advertised
+// bond is still sybil-resistant. The value only feeds the value-weighted total.
+function hasAdvertisedBond(offer) {
+    return !!offer.fidelity_bond_data || (offer.fidelity_bond_value || 0) > 0;
+}
+
+function renderFeeQuantizationChart() {
+    const container = document.getElementById('fee-quant-chart');
+    if (!container || !orderbookData) return;
+
+    const quant = orderbookData.fee_quantization;
+    if (!quant) {
+        container.innerHTML = '<p class="fee-quant-empty">Fee grid unavailable.</p>';
+        return;
+    }
+
+    const isAbs = feeQuantMode === 'abs';
+    const grid = isAbs
+        ? quant.abs_grid.map(Number)
+        : quant.rel_grid.map(Number);
+
+    // Dedupe to one offer per maker for the active offer family. A maker with
+    // multiple offers contributes once (its cheapest offer of that family).
+    // Only bonded makers are charted: bondless makers are sybil-cheap and would
+    // let a single operator skew the bands arbitrarily.
+    const perMaker = new Map();
+    for (const offer of orderbookData.offers) {
+        const offerIsAbs = ABS_OFFER_TYPES.has(offer.ordertype);
+        if (offerIsAbs !== isAbs) continue;
+        if (!hasAdvertisedBond(offer)) continue;
+        const fee = parseFloat(offer.cjfee);
+        if (!Number.isFinite(fee)) continue;
+        const prev = perMaker.get(offer.counterparty);
+        if (prev === undefined || fee < prev.fee) {
+            perMaker.set(offer.counterparty, {
+                fee,
+                bond: offer.fidelity_bond_value || 0,
+            });
+        }
+    }
+
+    if (perMaker.size === 0) {
+        container.innerHTML =
+            '<p class="fee-quant-empty">No bonded makers in the orderbook yet.</p>';
+        return;
+    }
+
+    // Buckets: one per grid entry, plus an "above grid" overflow for makers
+    // whose fee exceeds the largest quantum (unselectable by a quantizing taker).
+    const buckets = grid.map(() => ({ count: 0, bond: 0 }));
+    const above = { count: 0, bond: 0 };
+    let totalBond = 0;
+    for (const { fee, bond } of perMaker.values()) {
+        const idx = ceilGridIndex(fee, grid);
+        const target = idx === -1 ? above : buckets[idx];
+        target.count += 1;
+        target.bond += bond;
+        totalBond += bond;
+    }
+
+    // Cumulative bond value reachable at each quantum: a taker that sets its fee
+    // limit to grid entry i can select every maker in bands 0..i, so the share of
+    // total bonded value it can reach is the running sum up to that band. This is
+    // the number that matters for sybil resistance: it is the bond weight an
+    // honest taker actually pulls from when it homogenizes its fee at this level.
+    const rows = [];
+    let cumBond = 0;
+    grid.forEach((g, i) => {
+        cumBond += buckets[i].bond;
+        rows.push({
+            label: isAbs ? g.toLocaleString() : formatRelPct(quant.rel_grid[i]),
+            raw: isAbs ? g : quant.rel_grid[i],
+            sub: isAbs ? 'sats' : quant.rel_grid[i],
+            cumBondPct: totalBond > 0 ? (cumBond / totalBond) * 100 : null,
+            ...buckets[i],
+        });
+    });
+    if (above.count > 0) {
+        rows.push({
+            label: '> max',
+            sub: 'above grid',
+            cumBondPct: totalBond > 0 ? 100 : null,
+            ...above,
+        });
+    }
+
+    const maxCount = Math.max(1, ...rows.map(r => r.count));
+
+    container.innerHTML = '';
+    const chart = document.createElement('div');
+    chart.className = 'fq-bars';
+
+    rows.forEach(row => {
+        const col = document.createElement('div');
+        col.className = 'fq-col';
+
+        const bar = document.createElement('div');
+        bar.className = 'fq-bar' + (row.count === 0 ? ' fq-bar-empty' : '');
+        bar.style.height = (row.count / maxCount * 100) + '%';
+
+        // Concise tooltip: what sits here, and what a taker at this limit reaches.
+        const feeLabel = isAbs ? `${row.raw} sats` : formatRelPct(row.sub);
+        const pct = row.cumBondPct;
+        const lines = [];
+        if (row.raw !== undefined) {
+            lines.push(`${row.count} maker(s) at ${feeLabel}, ${formatBtc(row.bond)} bonded.`);
+            if (pct !== null) {
+                lines.push(`A taker capped at ${feeLabel} reaches ${pct.toFixed(0)}% of bonded value.`);
+            }
+        } else {
+            lines.push(`${row.count} maker(s) above the grid, ${formatBtc(row.bond)} bonded.`);
+            lines.push('A quantizing taker cannot select these.');
+        }
+        bar.title = lines.join('\n');
+
+        const countLabel = document.createElement('div');
+        countLabel.className = 'fq-count';
+        countLabel.textContent = row.count;
+
+        const barWrap = document.createElement('div');
+        barWrap.className = 'fq-bar-wrap';
+        barWrap.appendChild(countLabel);
+        barWrap.appendChild(bar);
+
+        const tick = document.createElement('div');
+        tick.className = 'fq-tick';
+        tick.textContent = row.label;
+        tick.title = row.sub || '';
+
+        col.appendChild(barWrap);
+        // Cumulative bond-value-reachable percentage under each band.
+        if (row.cumBondPct !== null) {
+            const cum = document.createElement('div');
+            cum.className = 'fq-cum';
+            cum.textContent = `${row.cumBondPct.toFixed(0)}%`;
+            cum.title = 'Cumulative share of bonded value reachable at this fee';
+            col.appendChild(cum);
+        }
+        col.appendChild(tick);
+        chart.appendChild(col);
+    });
+
+    container.appendChild(chart);
+}
+
+function setupFeeQuantToggle() {
+    const relBtn = document.getElementById('fee-quant-rel-btn');
+    const absBtn = document.getElementById('fee-quant-abs-btn');
+    if (!relBtn || !absBtn) return;
+    relBtn.addEventListener('click', () => {
+        feeQuantMode = 'rel';
+        relBtn.classList.add('active');
+        absBtn.classList.remove('active');
+        renderFeeQuantizationChart();
+    });
+    absBtn.addEventListener('click', () => {
+        feeQuantMode = 'abs';
+        absBtn.classList.add('active');
+        relBtn.classList.remove('active');
+        renderFeeQuantizationChart();
     });
 }
 
@@ -678,6 +871,8 @@ function setupEventListeners() {
 
     document.getElementById('filter-directory').addEventListener('change', renderTable);
     document.getElementById('search-counterparty').addEventListener('input', renderTable);
+
+    setupFeeQuantToggle();
 
     const closeModal = document.querySelector('.close-modal');
     if (closeModal) {

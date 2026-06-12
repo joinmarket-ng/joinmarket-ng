@@ -25,6 +25,7 @@ from jmcore.protocol import get_nick_version
 from loguru import logger
 
 from taker.config import MaxCjFee
+from taker.fee_quantization import FeeQuantizer
 
 
 def calculate_cj_fee(offer: Offer, cj_amount: int) -> int:
@@ -44,10 +45,56 @@ def calculate_cj_fee(offer: Offer, cj_amount: int) -> int:
     return _calculate_cj_fee_raw(offer.ordertype, offer.cjfee, cj_amount)
 
 
-def is_fee_within_limits(offer: Offer, cj_amount: int, max_cj_fee: MaxCjFee) -> bool:
+def offer_is_ng(offer: Offer) -> bool:
+    """Whether an offer comes from a JoinMarket-NG maker (vs a legacy one).
+
+    NG makers advertise a non-empty feature set during the handshake (e.g.
+    ``neutrino_compat``); legacy JoinMarket clientserver makers advertise none.
+    The distinction matters for fee homogenization: NG makers accept being paid
+    more than their advertised fee (they verify change with ``>=``), while legacy
+    makers reject any overpayment (exact ``!=`` match) and would refuse to sign.
+
+    The predicate is deliberately conservative: a false negative only means we
+    pay an NG maker its exact advertised fee, which it always accepts.
+    """
+    return bool(offer.features) or offer.neutrino_compat
+
+
+def maker_paid_fee(offer: Offer, cj_amount: int, fee_quantizer: FeeQuantizer | None) -> int:
+    """Fee the taker actually pays a maker for ``cj_amount``.
+
+    With an active quantizer, NG makers are paid the homogenized per-slot fee so
+    their per-maker fee fingerprint is removed. Legacy makers are always paid
+    their exact advertised fee: they reject any overpayment, so homogenizing them
+    would make them refuse to sign and abort the whole CoinJoin.
+    """
+    exact = calculate_cj_fee(offer, cj_amount)
+    if fee_quantizer is None or not offer_is_ng(offer):
+        return exact
+    return fee_quantizer.paid_fee(exact, cj_amount)
+
+
+def _selected_total_fee(
+    selected: list[Offer], cj_amount: int, fee_quantizer: FeeQuantizer | None
+) -> int:
+    """Total maker fee for a set of selected offers (quantization-aware)."""
+    return sum(maker_paid_fee(o, cj_amount, fee_quantizer) for o in selected)
+
+
+def is_fee_within_limits(
+    offer: Offer,
+    cj_amount: int,
+    max_cj_fee: MaxCjFee,
+    fee_quantizer: FeeQuantizer | None = None,
+) -> bool:
     """
     Check if an offer's fee is within the configured limits.
 
+    When ``fee_quantizer`` is active (issue #508), eligibility is stricter: the
+    maker's advertised fee at ``cj_amount`` must be at or below the homogenized
+    per-slot quantum, so that every selected maker can be paid the same fee.
+
+    Otherwise the legacy per-type limit check applies:
     For absolute offers: check cjfee <= abs_fee
     For relative offers: check cjfee <= rel_fee
 
@@ -55,12 +102,18 @@ def is_fee_within_limits(offer: Offer, cj_amount: int, max_cj_fee: MaxCjFee) -> 
 
     Args:
         offer: The maker's offer
-        cj_amount: The CoinJoin amount (not used in the new logic)
+        cj_amount: The CoinJoin amount (used for quantized eligibility)
         max_cj_fee: Fee limits configuration
+        fee_quantizer: Optional quantization policy
 
     Returns:
         True if fee is acceptable
     """
+    if fee_quantizer is not None and fee_quantizer.active:
+        slot_fee = fee_quantizer.slot_fee(cj_amount)
+        if slot_fee is not None:
+            return calculate_cj_fee(offer, cj_amount) <= slot_fee
+
     if offer.ordertype in (OfferType.SW0_ABSOLUTE, OfferType.SWA_ABSOLUTE):
         # For absolute offers, check against absolute limit directly
         return int(offer.cjfee) <= max_cj_fee.abs_fee
@@ -81,6 +134,7 @@ def filter_offers(
     allowed_types: set[OfferType] | None = None,
     min_nick_version: int | None = None,
     required_features: set[str] | None = None,
+    fee_quantizer: FeeQuantizer | None = None,
 ) -> list[Offer]:
     """
     Filter offers based on amount range, fee limits, and other criteria.
@@ -168,7 +222,7 @@ def filter_offers(
             continue
 
         # Filter by fee limits
-        if not is_fee_within_limits(offer, cj_amount, max_cj_fee):
+        if not is_fee_within_limits(offer, cj_amount, max_cj_fee, fee_quantizer):
             fee = calculate_cj_fee(offer, cj_amount)
             logger.trace(f"Ignoring offer from {offer.counterparty}: fee {fee} exceeds limits")
             continue
@@ -509,6 +563,7 @@ def choose_orders(
     bondless_makers_allowance: float = 0.2,
     bondless_require_zero_fee: bool = True,
     required_features: set[str] | None = None,
+    fee_quantizer: FeeQuantizer | None = None,
 ) -> tuple[dict[str, Offer], int]:
     """
     Choose n orders from the orderbook for a CoinJoin.
@@ -524,6 +579,9 @@ def choose_orders(
         bondless_makers_allowance: Probability of random selection vs fidelity bond weighting
         bondless_require_zero_fee: If True, bondless spots only select zero absolute fee offers
         required_features: Feature names that makers must support (passed to filter_offers)
+        fee_quantizer: Optional fee homogenization policy (issue #508). When active,
+            offers are filtered against the per-slot quantum and the returned total
+            fee reflects the homogenized fee actually paid to each maker.
 
     Returns:
         (dict of counterparty -> offer, total_cj_fee)
@@ -547,6 +605,7 @@ def choose_orders(
         ignored_makers=ignored_makers,
         min_nick_version=min_nick_version,
         required_features=required_features,
+        fee_quantizer=fee_quantizer,
     )
 
     # Dedupe by maker (keep cheapest offer per counterparty)
@@ -568,14 +627,45 @@ def choose_orders(
     # Build result
     result = {offer.counterparty: offer for offer in selected}
 
-    # Calculate total fee
-    total_fee = sum(calculate_cj_fee(offer, cj_amount) for offer in selected)
+    # Calculate total fee (homogenized when quantization is active)
+    total_fee = _selected_total_fee(selected, cj_amount, fee_quantizer)
 
     logger.info(
         f"Selected {len(result)} makers from {len(offers)} offers, total fee: {total_fee} sats"
     )
 
     return result, total_fee
+
+
+def _solve_sweep_quantized(
+    available: int, selected: list[Offer], fee_quantizer: FeeQuantizer
+) -> int:
+    """Solve the sweep cj_amount for a (possibly mixed) set of selected makers.
+
+    ``available`` is ``total_input - my_txfee``. We need the largest ``cj_amount``
+    such that ``cj_amount + sum(maker_paid_fee(offer, cj_amount)) <= available``,
+    where each maker's paid fee follows the per-maker policy: NG makers are paid
+    the homogenized slot fee, legacy makers their exact advertised fee. Because
+    every per-maker fee is non-decreasing in ``cj_amount`` (relative fees grow,
+    absolute fees stay flat), the left-hand side is strictly increasing, so a
+    binary search finds the unique maximum.
+    """
+
+    def total_spent(cj_amount: int) -> int:
+        fees = sum(maker_paid_fee(o, cj_amount, fee_quantizer) for o in selected)
+        return cj_amount + fees
+
+    if available <= 0 or total_spent(1) > available:
+        return 0
+
+    lo, hi = 1, available
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if total_spent(mid) <= available:
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo
 
 
 def choose_sweep_orders(
@@ -590,6 +680,7 @@ def choose_sweep_orders(
     bondless_makers_allowance: float = 0.2,
     bondless_require_zero_fee: bool = True,
     required_features: set[str] | None = None,
+    fee_quantizer: FeeQuantizer | None = None,
 ) -> tuple[dict[str, Offer], int, int]:
     """
     Choose n orders for a sweep transaction (no change).
@@ -609,6 +700,9 @@ def choose_sweep_orders(
         bondless_makers_allowance: Probability of random selection vs fidelity bond weighting
         bondless_require_zero_fee: If True, bondless spots only select zero absolute fee offers
         required_features: Feature names that makers must support (passed to filter_offers)
+        fee_quantizer: Optional fee homogenization policy (issue #508). When active,
+            the sweep amount is solved against the per-slot quantum so every maker
+            is paid the same homogenized fee.
 
     Returns:
         (dict of counterparty -> offer, cj_amount, total_cj_fee)
@@ -639,6 +733,7 @@ def choose_sweep_orders(
         ignored_makers=ignored_makers,
         min_nick_version=min_nick_version,
         required_features=required_features,
+        fee_quantizer=fee_quantizer,
     )
 
     # Dedupe by maker
@@ -681,17 +776,20 @@ def choose_sweep_orders(
     selected = choose_fn(deduped, n)
 
     # Now solve for exact cj_amount
-    sum_abs_fees = 0
-    rel_fees = []
+    if fee_quantizer is not None and fee_quantizer.active:
+        cj_amount = _solve_sweep_quantized(total_input_value - my_txfee, selected, fee_quantizer)
+    else:
+        sum_abs_fees = 0
+        rel_fees = []
 
-    for offer in selected:
-        if offer.ordertype in (OfferType.SW0_ABSOLUTE, OfferType.SWA_ABSOLUTE):
-            sum_abs_fees += int(offer.cjfee)
-        else:
-            rel_fees.append(str(offer.cjfee))
+        for offer in selected:
+            if offer.ordertype in (OfferType.SW0_ABSOLUTE, OfferType.SWA_ABSOLUTE):
+                sum_abs_fees += int(offer.cjfee)
+            else:
+                rel_fees.append(str(offer.cjfee))
 
-    available = total_input_value - my_txfee - sum_abs_fees
-    cj_amount = calculate_sweep_amount(available, rel_fees)
+        available = total_input_value - my_txfee - sum_abs_fees
+        cj_amount = calculate_sweep_amount(available, rel_fees)
 
     # Verify this works for all selected offers
     for offer in selected:
@@ -703,7 +801,7 @@ def choose_sweep_orders(
             # Could retry with fewer makers here
 
     result = {offer.counterparty: offer for offer in selected}
-    total_fee = sum(calculate_cj_fee(offer, cj_amount) for offer in selected)
+    total_fee = _selected_total_fee(selected, cj_amount, fee_quantizer)
 
     logger.info(f"Sweep: selected {len(result)} makers, cj_amount={cj_amount}, fee={total_fee}")
 
@@ -720,10 +818,12 @@ class OrderbookManager:
         bondless_require_zero_fee: bool = True,
         data_dir: Any = None,  # Path | None, but avoid import
         own_wallet_nicks: set[str] | None = None,
+        fee_quantizer: FeeQuantizer | None = None,
     ):
         self.max_cj_fee = max_cj_fee
         self.bondless_makers_allowance = bondless_makers_allowance
         self.bondless_require_zero_fee = bondless_require_zero_fee
+        self.fee_quantizer = fee_quantizer
         self.offers: list[Offer] = []
         self.bonds: dict[str, Any] = {}  # maker -> bond info
         self.ignored_makers: set[str] = set()
@@ -890,6 +990,7 @@ class OrderbookManager:
             bondless_makers_allowance=self.bondless_makers_allowance,
             bondless_require_zero_fee=self.bondless_require_zero_fee,
             required_features=required_features,
+            fee_quantizer=self.fee_quantizer,
         )
         if len(result) >= n or not soft:
             return result, fee
@@ -916,6 +1017,7 @@ class OrderbookManager:
             bondless_makers_allowance=self.bondless_makers_allowance,
             bondless_require_zero_fee=self.bondless_require_zero_fee,
             required_features=required_features,
+            fee_quantizer=self.fee_quantizer,
         )
         result.update(topup_result)
         return result, fee + topup_fee
@@ -974,6 +1076,7 @@ class OrderbookManager:
             bondless_makers_allowance=self.bondless_makers_allowance,
             bondless_require_zero_fee=self.bondless_require_zero_fee,
             required_features=required_features,
+            fee_quantizer=self.fee_quantizer,
         )
         if len(result[0]) >= n or not soft:
             return result
@@ -994,4 +1097,5 @@ class OrderbookManager:
             bondless_makers_allowance=self.bondless_makers_allowance,
             bondless_require_zero_fee=self.bondless_require_zero_fee,
             required_features=required_features,
+            fee_quantizer=self.fee_quantizer,
         )
