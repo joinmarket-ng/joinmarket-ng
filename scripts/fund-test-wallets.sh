@@ -75,6 +75,35 @@ MAKER_NEUTRINO_ADDR="bcrt1q6mse43hzgfdqh7fyg05lmd4x2ufhlunn3gw5j3"
 # Generated with: python -m jmwallet generate-bond-address --mnemonic "avoid whisper..." --locktime 4099766400 --network regtest
 MAKER1_FIDELITY_BOND_ADDR="bcrt1q7yv9xfz7vt5nn3nmpnrh899sxs5s9jnlqe94e8xx4jxc55xhtxcq0dgjy6"
 
+# Create a test-funder wallet with a large initial balance.
+# Do this BEFORE funding the maker/taker wallets so the coinbase subsidy is
+# still near its maximum.  The wallet is used by e2e test fixtures to send
+# BTC to per-test wallets via ``sendtoaddress`` instead of mining coinbases.
+# Mining coinbases to fund individual test wallets advances the chain height
+# and eventually pushes the regtest subsidy to zero, breaking all fixtures
+# that rely on coinbase rewards.
+echo "Setting up test-funder wallet..."
+$CLI createwallet "test-funder" false false "" false true true || true
+TEST_FUNDER_ADDR=$($CLI -rpcwallet=test-funder getnewaddress "" "bech32")
+# Mine 200 blocks to test-funder while the subsidy is still near its peak
+# (heights 1-150: 50 BTC; 151-300: 25 BTC).  200 blocks ≈ 6 000-7 500 BTC –
+# enough for hundreds of test fixtures even if each needs 10 BTC.
+$CLI generatetoaddress 200 "$TEST_FUNDER_ADDR"
+# Mine 100 maturity blocks to MAKER1_ADDR so the test-funder coinbases all
+# have at least 100 confirmations and are immediately spendable.
+$CLI generatetoaddress 100 "$MAKER1_ADDR"
+TEST_FUNDER_BALANCE=$($CLI -rpcwallet=test-funder getbalance)
+echo "Test-funder wallet funded: $TEST_FUNDER_BALANCE BTC spendable"
+
+# Create and pre-fund the fidelity_funder wallet from test-funder.
+# This avoids relying on late-stage coinbase rewards after many halvings.
+echo "Setting up fidelity_funder wallet..."
+$CLI createwallet "fidelity_funder" false false "" false true true || true
+FIDELITY_FUNDER_ADDR=$($CLI -rpcwallet=fidelity_funder getnewaddress "" "bech32")
+echo "Sending 5 BTC from test-funder to fidelity_funder..."
+$CLI -rpcwallet=test-funder sendtoaddress "$FIDELITY_FUNDER_ADDR" 5.0
+$CLI generatetoaddress 6 "$MAKER1_ADDR"
+
 echo "Funding maker and taker wallets..."
 echo "  Maker1: $MAKER1_ADDR"
 echo "  Maker1 Fidelity Bond: $MAKER1_FIDELITY_BOND_ADDR"
@@ -112,24 +141,8 @@ echo "Mined $BLOCKS_TO_MINE blocks to Maker-Neutrino"
 # After this, all wallets should have spendable funds
 $CLI generatetoaddress 10 "$MAKER1_ADDR"
 
-# Create a wallet in Bitcoin Core to fund the fidelity bond address
-# We need to create a transaction from the mined funds
+# Create a transaction from fidelity_funder to the fidelity bond address.
 echo "Creating fidelity bond transaction..."
-
-# Create a temporary descriptor wallet in Bitcoin Core for sending
-# Parameters: wallet_name, disable_private_keys, blank, passphrase, avoid_reuse, descriptors, load_on_startup
-$CLI createwallet "fidelity_funder" false false "" false true true || true
-
-# Get mining reward address to use as source
-MINER_ADDR=$($CLI -rpcwallet=fidelity_funder getnewaddress "" "bech32")
-
-# Mine blocks to the funder wallet - need 101+ to have spendable coinbase
-# First block gives us 50 BTC, but need 100 confirmations to spend
-echo "Mining blocks to funder wallet..."
-$CLI generatetoaddress 1 "$MINER_ADDR"
-
-# Mine 100 more blocks to mature the first coinbase (any address works)
-$CLI generatetoaddress 100 "$MAKER1_ADDR"
 
 # Verify we have spendable funds
 BALANCE=$($CLI -rpcwallet=fidelity_funder getbalance)

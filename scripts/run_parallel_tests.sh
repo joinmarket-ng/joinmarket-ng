@@ -499,15 +499,27 @@ wait_for_port() {
 wait_for_wallet_funder() {
     local suite=$1
     for i in $(seq 1 60); do
-        local status
-        status=$(compose_cmd "$suite" ps -a wallet-funder --format '{{.Status}}' 2>/dev/null || echo "")
-        if echo "$status" | grep -qi "exited\|completed"; then
-            return 0
+        local container_id
+        container_id=$(compose_cmd "$suite" ps -q wallet-funder 2>/dev/null | tail -n1 || true)
+        if [ -n "${container_id}" ]; then
+            local state
+            state=$(docker inspect -f '{{.State.Status}} {{.State.ExitCode}}' "${container_id}" 2>/dev/null | head -n1 || true)
+            case "${state}" in
+                "exited 0")
+                    return 0
+                    ;;
+                exited\ *|dead\ *)
+                    log_error "[$suite] wallet-funder failed (${state})"
+                    compose_cmd "$suite" logs --tail=120 wallet-funder >&2 || true
+                    return 1
+                    ;;
+            esac
         fi
         sleep 5
     done
-    log_warning "[$suite] Could not confirm wallet-funder completion, continuing..."
-    return 0
+    log_error "[$suite] wallet-funder did not complete successfully in time"
+    compose_cmd "$suite" logs --tail=120 wallet-funder >&2 || true
+    return 1
 }
 
 # =============================================================================
@@ -839,6 +851,7 @@ run_suite_playwright() {
             return 1
         fi
         wait_for_port "$dir_port" "Directory ($suite)"
+        wait_for_wallet_funder "$suite"
 
         # Wait for jam-playwright (HTTPS, self-signed cert)
         for i in $(seq 1 60); do
@@ -937,6 +950,7 @@ run_suite_reference_interop() {
             return 1
         fi
         wait_for_port "$dir_port" "Directory ($suite)"
+        wait_for_wallet_funder "$suite"
         wait_for_tor "$suite"
         wait_for_jam "$suite"
 
@@ -977,6 +991,7 @@ run_suite_reference_legacy() {
             return 1
         fi
         wait_for_port "$dir_port" "Directory ($suite)"
+        wait_for_wallet_funder "$suite"
         wait_for_tor "$suite"
         wait_for_jam "$suite"
 
@@ -1099,6 +1114,7 @@ run_suite_neutrino_reference() {
             return 1
         fi
         wait_for_port "$dir_port" "Directory ($suite)"
+        wait_for_wallet_funder "$suite"
         wait_for_tor "$suite"
         wait_for_jam "$suite"
         wait_for_neutrino "$suite" "$neutrino_port"
