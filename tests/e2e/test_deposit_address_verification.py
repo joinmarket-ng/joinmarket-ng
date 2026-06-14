@@ -108,13 +108,25 @@ async def test_address_has_history_against_real_bitcoind(
     await _ensure_wallet(cfg, test_wallet)
 
     try:
-        # Mature coinbase so the miner can pay.
+        # Fund the miner wallet so it can pay.
         miner_addr = await _rpc(
             cfg, "getnewaddress", ["", "bech32"], wallet=miner_wallet
         )
         info = await _rpc(cfg, "getwalletinfo", wallet=miner_wallet)
         if info.get("balance", 0) < 1.0:
-            await _rpc(cfg, "generatetoaddress", [110, miner_addr], wallet=miner_wallet)
+            try:
+                # Preferred: fund from test-funder (no coinbase mining needed).
+                await _rpc(
+                    cfg, "sendtoaddress", [miner_addr, 2.0], wallet="test-funder"
+                )
+                await _rpc(
+                    cfg, "generatetoaddress", [1, miner_addr], wallet=miner_wallet
+                )
+            except Exception:
+                # Fallback: mine 110 coinbase blocks (may yield 0 BTC at zero subsidy).
+                await _rpc(
+                    cfg, "generatetoaddress", [110, miner_addr], wallet=miner_wallet
+                )
 
         # Three test addresses from the test wallet (so Core tracks
         # them under that wallet and getreceivedbyaddress works).

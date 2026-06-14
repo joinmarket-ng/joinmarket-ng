@@ -119,15 +119,33 @@ async def _mine(cfg: dict[str, str], addr: str, n: int, miner_wallet: str) -> No
     await _rpc(cfg, "generatetoaddress", [n, addr], wallet=miner_wallet)
 
 
-async def _setup_funded_miner(cfg: dict[str, str], miner_wallet: str) -> str:
-    """Return a freshly generated miner address with mature coinbase funds."""
+async def _setup_funded_miner(
+    cfg: dict[str, str], miner_wallet: str, target_btc: float = 8.0
+) -> str:
+    """Return a freshly generated miner address with mature funds.
+
+    Tries to send from the pre-funded ``test-funder`` Core wallet first
+    (mines only 1 confirmation block).  Falls back to coinbase mining in
+    batches of 100 blocks when test-funder is not available.
+    """
     miner_addr = await _rpc(cfg, "getnewaddress", ["", "bech32"], wallet=miner_wallet)
-    info = await _rpc(cfg, "getwalletinfo", wallet=miner_wallet)
-    # Each test gets a fresh wallet so we always need to mine coinbase to
-    # it. 110 blocks gives one mature coinbase reward (50 BTC) which is
-    # plenty for the small payments this test makes.
-    if info.get("balance", 0) < 1.0:
-        await _mine(cfg, miner_addr, 110, miner_wallet)
+
+    # Fast path: fund from test-funder (1 confirmation block).
+    try:
+        await _rpc(
+            cfg, "sendtoaddress", [miner_addr, target_btc + 1.0], wallet="test-funder"
+        )
+        await _mine(cfg, miner_addr, 1, miner_wallet)
+        return miner_addr
+    except Exception:
+        pass
+
+    # Fallback: coinbase mining in 100-block batches.
+    for _ in range(50):
+        info = await _rpc(cfg, "getwalletinfo", wallet=miner_wallet)
+        if info.get("balance", 0) >= target_btc:
+            break
+        await _mine(cfg, miner_addr, 100, miner_wallet)
     return miner_addr
 
 

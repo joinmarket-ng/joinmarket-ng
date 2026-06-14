@@ -198,3 +198,17 @@ def get_bitcoin_rpc_port() -> int:
         except Exception:
             pass
     return 18443
+
+
+def get_orderbook_watcher_url() -> str:
+    """Return the orderbook-watcher HTTP URL.
+
+    Reads ``OBWATCH_URL`` from the environment.  When running in parallel
+    mode the port is already embedded in the URL by the suite runner.
+    Falls back to the default single-suite host port 8080 (docker-compose.yml
+    maps the orderbook-watcher container port 8000 to host port 8080).
+    """
+    url = os.environ.get("OBWATCH_URL", "")
+    if url:
+        return url.rstrip("/")
+    return "http://127.0.0.1:8080"

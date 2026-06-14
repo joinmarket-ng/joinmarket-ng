@@ -10,6 +10,7 @@ Requires: docker compose --profile e2e up -d
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 
 import pytest
@@ -23,6 +24,13 @@ from jmwallet.wallet.service import WalletService
 
 # Mark all tests in this module as requiring Docker e2e profile
 pytestmark = pytest.mark.e2e
+
+# Endpoints from the environment so the suite works on both the default-port
+# stack (CI) and the parallel runner, which remaps host ports per suite.
+_RPC_URL = os.environ.get("BITCOIN_RPC_URL", "http://127.0.0.1:18443")
+_RPC_USER = os.environ.get("BITCOIN_RPC_USER", "test")
+_RPC_PASSWORD = os.environ.get("BITCOIN_RPC_PASSWORD", "test")
+_DIRECTORY_SERVER = f"127.0.0.1:{os.environ.get('DIRECTORY_PORT', '5222')}"
 
 TAKER_MNEMONIC = (
     "burden notable love elephant orbit couch message galaxy elevator exile drop toilet"
@@ -155,11 +163,11 @@ async def test_coinjoin_creates_history_entry(
             bitcoin_network=NetworkType.REGTEST,
             backend_type="descriptor_wallet",
             backend_config={
-                "rpc_url": "http://127.0.0.1:18443",
-                "rpc_user": "test",
-                "rpc_password": "test",
+                "rpc_url": _RPC_URL,
+                "rpc_user": _RPC_USER,
+                "rpc_password": _RPC_PASSWORD,
             },
-            directory_servers=["127.0.0.1:5222"],
+            directory_servers=[_DIRECTORY_SERVER],
             counterparty_count=2,
             minimum_makers=2,
             data_dir=str(data_dir),
@@ -191,23 +199,15 @@ async def test_coinjoin_creates_history_entry(
             # Start taker
             await taker.start()
 
-            # Fetch orderbook
-            offers = await taker.directory_client.fetch_orderbook(
-                max_wait=15.0, min_wait=15.0, quiet_period=0.0
-            )
-            if len(offers) < 2:
-                pytest.skip(f"Need at least 2 offers, found {len(offers)}")
-
-            taker.orderbook_manager.update_offers(offers)
-
             # Get destination address
             dest_address = taker_wallet.get_receive_address(1, 0)
 
-            # Perform CoinJoin
+            # Perform CoinJoin. do_coinjoin fetches the orderbook internally;
+            # a pre-check fetch is omitted to avoid triggering the maker's
+            # rate limiter (two rapid !orderbook requests cause the second one
+            # to be silently rate-limited, returning 0 offers).
             cj_amount = 50_000_000
             print(f"Initiating CoinJoin for {cj_amount:,} sats...")
-            print(f"Taker balance: {taker_balance:,} sats")
-            print(f"Available offers: {len(offers)}")
 
             txid = await taker.do_coinjoin(
                 amount=cj_amount,

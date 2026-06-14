@@ -591,86 +591,12 @@ class Taker(TakerMonitoringMixin):
             # Select UTXOs from wallet BEFORE fetching orderbook to avoid wasting user's time
             logger.info(f"Selecting UTXOs from mixdepth {mixdepth}...")
 
-            # Interactive UTXO selection if requested
-            manually_selected_utxos: list[UTXOInfo] | None = None
-            if self.config.select_utxos:
-                from jmwallet.history import get_utxo_label
-                from jmwallet.utxo_selector import select_utxos_interactive
-
-                try:
-                    # Get ALL UTXOs including frozen ones for display in the
-                    # interactive selector.  Frozen/locked UTXOs are shown but
-                    # rendered as unselectable ([-]) so the user sees the full
-                    # picture of their wallet.
-                    available_utxos = await self.wallet.get_utxos(mixdepth)
-                    # Also filter by minimum age (confirmations) -- but keep
-                    # frozen ones regardless so they're visible in the TUI.
-                    min_age = self.config.taker_utxo_age
-                    available_utxos = [
-                        u for u in available_utxos if u.confirmations >= min_age or u.frozen
-                    ]
-                    if not available_utxos:
-                        reason = f"No UTXOs in mixdepth {mixdepth}"
-                        logger.error(reason)
-                        self._session.last_failure_reason = reason
-                        self.state = TakerState.FAILED
-                        return None
-
-                    # Check that at least some UTXOs are selectable (not frozen/locked)
-                    selectable = [
-                        u
-                        for u in available_utxos
-                        if not u.frozen and not (u.is_fidelity_bond and u.is_locked)
-                    ]
-                    if not selectable:
-                        reason = (
-                            f"No eligible UTXOs in mixdepth {mixdepth} "
-                            f"(all {len(available_utxos)} UTXOs are frozen or locked)"
-                        )
-                        logger.error(reason)
-                        self._session.last_failure_reason = reason
-                        self.state = TakerState.FAILED
-                        return None
-
-                    # Populate labels for each UTXO based on history
-                    for utxo in available_utxos:
-                        utxo.label = get_utxo_label(
-                            utxo.address,
-                            self.config.data_dir,
-                            wallet_fingerprint=self.wallet.wallet_fingerprint,
-                        )
-
-                    logger.info(
-                        f"Launching interactive UTXO selector ({len(available_utxos)} available, "
-                        f"target amount: {amount} sats, sweep: {amount == 0})..."
-                    )
-                    manually_selected_utxos = select_utxos_interactive(available_utxos, amount)
-
-                    if not manually_selected_utxos:
-                        logger.info("UTXO selection cancelled by user")
-                        self.state = TakerState.CANCELLED
-                        return None
-
-                    total_selected = sum(u.value for u in manually_selected_utxos)
-                    logger.info(
-                        f"Manually selected {len(manually_selected_utxos)} UTXOs "
-                        f"(total: {total_selected:,} sats)"
-                    )
-
-                    # Validate selected UTXOs have sufficient funds (for non-sweep)
-                    if amount > 0 and total_selected < amount:
-                        logger.error(
-                            f"Insufficient funds in selected UTXOs: "
-                            f"have {total_selected:,} sats, need at least {amount:,} sats"
-                        )
-                        self.state = TakerState.FAILED
-                        return None
-                except RuntimeError as e:
-                    logger.error(f"Interactive UTXO selection failed: {e}")
-                    self.state = TakerState.FAILED
-                    return None
-            else:
-                logger.debug("Interactive UTXO selection not requested (--select-utxos not set)")
+            manually_selected_utxos = await self._maybe_select_utxos_interactively(
+                amount=amount,
+                mixdepth=mixdepth,
+            )
+            if self.config.select_utxos and self.state in (TakerState.CANCELLED, TakerState.FAILED):
+                return None
 
             # Now fetch orderbook after UTXO selection is done
             self.state = TakerState.FETCHING_ORDERBOOK
@@ -1027,378 +953,21 @@ class Taker(TakerMonitoringMixin):
                 self.state = TakerState.FAILED
                 return None
 
-            # Phase 1: Fill orders (with retry logic for blacklisted commitments)
-            self.state = TakerState.FILLING
-            logger.info("Phase 1: Sending !fill to makers...")
-            # Log directory routing info
-            directory_count = len(self.directory_client.clients)
-            directories = [
-                f"{client.host}:{client.port}" for client in self.directory_client.clients.values()
-            ]
-            logger.info(
-                f"Routing via {directory_count} director{'y' if directory_count == 1 else 'ies'}: "
-                f"{', '.join(directories)}"
-            )
-            if self.directory_client.prefer_direct_connections:
-                logger.debug(
-                    "Direct connections preferred - will attempt to connect directly to makers"
-                )
-            else:
-                logger.debug(
-                    "Direct connections disabled - all messages relayed through directories"
-                )
-
-            # Fire-and-forget notification for CoinJoin start
-            asyncio.create_task(
-                get_notifier().notify_coinjoin_start(
-                    self._session.cj_amount, len(self._session.maker_sessions), destination
-                )
-            )
-
-            # Retry loop for blacklisted commitments and maker replacement
-            max_podle_retries = self.config.taker_utxo_retries
             max_replacement_attempts = self.config.max_maker_replacement_attempts
-            replacement_attempt = 0
-            # Minority threshold: if strictly fewer than half of the asked makers
-            # reject with "blacklist", treat those as lying/out-of-sync makers and
-            # ignore them (replace via the normal path), keeping our current
-            # commitment for the remaining makers. This prevents a single maker
-            # from forcing us to burn a commitment / UTXO by always claiming
-            # "blacklisted" (anti-DoS, per user guidance: "if only one is
-            # rejecting everything we could replace it or untrust it; if all or
-            # most say the same then it might be on us").
-
-            for podle_retry in range(max_podle_retries):
-                session_size_before_fill = len(self._session.maker_sessions)
-                fill_result = await self._session._phase_fill()
-
-                if fill_result.success:
-                    break  # Success, proceed to next phase
-
-                # Persist remotely-reported blacklisted commitments to our local
-                # blacklist so we don't try the same commitment again on future
-                # sessions (including after a fresh install). We do this whether
-                # it's minority or majority: at worst a malicious maker "burns"
-                # that one commitment, which we'd re-derive from the same UTXO
-                # at a different NUMS index on the next attempt.
-                if fill_result.blacklist_makers and self._session.podle_commitment is not None:
-                    commitment_hex = self._session.podle_commitment.commitment.commitment.hex()
-                    try:
-                        from jmcore.commitment_blacklist import add_commitment
-
-                        add_commitment(commitment_hex)
-                    except Exception as exc:  # pragma: no cover - defensive
-                        logger.warning(
-                            f"Could not persist remotely-reported blacklisted commitment: {exc}"
-                        )
-
-                # Classify "blacklist" errors as minority vs majority.
-                # Denominator is the session size just before this fill attempt.
-                n_blacklisted = len(fill_result.blacklist_makers)
-                majority_blacklist = (
-                    fill_result.blacklist_error
-                    and session_size_before_fill > 0
-                    and n_blacklisted * 2 >= session_size_before_fill
-                )
-
-                if fill_result.blacklist_error and not majority_blacklist:
-                    # Minority report: trust the majority (the others, or our
-                    # local state) over the rejecting maker(s). Treat them as
-                    # regular failed makers and try maker replacement.
-                    logger.warning(
-                        f"Minority blacklist rejection from {fill_result.blacklist_makers} "
-                        f"({n_blacklisted}/{session_size_before_fill}). Ignoring those makers "
-                        "and trying replacement with the same commitment."
-                    )
-                    for failed_nick in fill_result.failed_makers:
-                        self.orderbook_manager.add_ignored_maker(failed_nick)
-                        logger.debug(f"Added {failed_nick} to ignored makers (minority blacklist)")
-                    # Fall through to the maker-replacement block below.
-                elif fill_result.blacklist_error:
-                    # Majority blacklist: trust the signal, rotate commitment.
-                    # Don't ignore the makers themselves.
-                    logger.warning(
-                        f"Majority blacklist rejection ({n_blacklisted}/"
-                        f"{session_size_before_fill}) from {fill_result.blacklist_makers}. "
-                        "Rotating commitment and retrying."
-                    )
-                elif fill_result.failed_makers:
-                    # Add failed makers to ignore list for non-blacklist failures
-                    for failed_nick in fill_result.failed_makers:
-                        self.orderbook_manager.add_ignored_maker(failed_nick)
-                        logger.debug(f"Added {failed_nick} to ignored makers (failed fill)")
-
-                if majority_blacklist:
-                    # Commitment was blacklisted - try with a new commitment
-                    if podle_retry < max_podle_retries - 1:
-                        logger.warning(
-                            f"Commitment blacklisted, retrying with new NUMS index "
-                            f"(attempt {podle_retry + 2}/{max_podle_retries})..."
-                        )
-
-                        # The current commitment is already marked as used.
-                        # Try to generate a new one from the current preselected
-                        # UTXOs. If that's exhausted, expand preselected_utxos
-                        # with another eligible UTXO from the SAME mixdepth (to
-                        # preserve mixdepth isolation). The extra UTXO will also
-                        # be spent in the CoinJoin -- slightly higher miner fee,
-                        # but strictly better than failing.
-                        new_commitment = self.podle_manager.generate_fresh_commitment(
-                            wallet_utxos=self._session.preselected_utxos,
-                            cj_amount=self._session.cj_amount,
-                            private_key_getter=get_private_key,
-                            min_confirmations=self.config.taker_utxo_age,
-                            min_percent=self.config.taker_utxo_amtpercent,
-                            max_retries=self.config.taker_utxo_retries,
-                        )
-
-                        if new_commitment is None:
-                            added = self._session._expand_preselected_utxos_same_mixdepth(mixdepth)
-                            if added > 0:
-                                logger.info(
-                                    f"Preselected UTXOs exhausted for PoDLE; added {added} "
-                                    f"additional UTXO(s) from mixdepth {mixdepth}, which will "
-                                    "also be spent in the CoinJoin."
-                                )
-                                new_commitment = self.podle_manager.generate_fresh_commitment(
-                                    wallet_utxos=self._session.preselected_utxos,
-                                    cj_amount=self._session.cj_amount,
-                                    private_key_getter=get_private_key,
-                                    min_confirmations=self.config.taker_utxo_age,
-                                    min_percent=self.config.taker_utxo_amtpercent,
-                                    max_retries=self.config.taker_utxo_retries,
-                                )
-
-                        if new_commitment is None:
-                            logger.error(
-                                "No more PoDLE commitments available: all indices exhausted "
-                                f"across all eligible UTXOs in mixdepth {mixdepth}"
-                            )
-                            self.state = TakerState.FAILED
-                            return None
-
-                        self._session.podle_commitment = new_commitment
-
-                        # Reset maker sessions for retry (excluding ignored makers)
-                        self._session.maker_sessions = {
-                            nick: MakerSession(
-                                nick=nick, offer=offer, supports_neutrino_compat=False
-                            )
-                            for nick, offer in selected_offers.items()
-                            if nick not in self.orderbook_manager.ignored_makers
-                        }
-                        continue
-                    else:
-                        logger.error(
-                            f"Fill phase failed after {max_podle_retries} PoDLE commitment attempts"
-                        )
-                        self.state = TakerState.FAILED
-                        return None
-
-                # Not a blacklist error - try maker replacement if enabled
-                if fill_result.needs_replacement and replacement_attempt < max_replacement_attempts:
-                    replacement_attempt += 1
-                    needed = self.config.minimum_makers - len(self._session.maker_sessions)
-                    logger.info(
-                        f"Attempting maker replacement (attempt {replacement_attempt}/"
-                        f"{max_replacement_attempts}): need {needed} more makers"
-                    )
-
-                    # Select replacement makers from orderbook.
-                    # Hard-exclude makers already in the current session (can't
-                    # have the same nick twice) and makers that just rejected
-                    # us in this very attempt (they would just fail again).
-                    # The orderbook's persistent ignore list and the tumbler's
-                    # exclude_nicks are soft preferences -- if there aren't
-                    # enough fresh makers we'd rather pick a previously-used
-                    # one than fail the whole CoinJoin.
-                    current_session_nicks = set(self._session.maker_sessions.keys())
-                    hard_excludes = current_session_nicks | set(fill_result.failed_makers)
-                    replacement_offers, _ = self.orderbook_manager.select_makers(
-                        cj_amount=self._session.cj_amount,
-                        n=needed,
-                        hard_exclude_nicks=hard_excludes,
-                        required_features=required_features,
-                    )
-
-                    if len(replacement_offers) < needed:
-                        logger.error(
-                            f"Not enough replacement makers available: "
-                            f"found {len(replacement_offers)}, need {needed}"
-                        )
-                        self.state = TakerState.FAILED
-                        return None
-
-                    # Add replacement makers to session
-                    for nick, offer in replacement_offers.items():
-                        self._session.maker_sessions[nick] = MakerSession(
-                            nick=nick, offer=offer, supports_neutrino_compat=False
-                        )
-                        logger.info(f"Added replacement maker: {nick}")
-
-                    # Update selected_offers for potential future retries
-                    selected_offers.update(replacement_offers)
-                    # Track replacements too so the tumbler's exclusion set
-                    # reflects every nick that actually entered the tx.
-                    self._session.last_used_nicks.update(replacement_offers.keys())
-                    continue
-
-                # Failed and no replacement possible
-                logger.error("Fill phase failed")
-                self.state = TakerState.FAILED
+            if not await self._run_fill_with_replacements(
+                destination=destination,
+                selected_offers=selected_offers,
+                required_features=required_features,
+                mixdepth=mixdepth,
+                get_private_key=get_private_key,
+                max_replacement_attempts=max_replacement_attempts,
+            ):
                 return None
 
-            # Phase 2: Auth and get maker UTXOs (with maker replacement)
-            self.state = TakerState.AUTHENTICATING
-            logger.info("Phase 2: Sending !auth and receiving !ioauth...")
-
-            auth_replacement_attempt = 0
-            while True:
-                auth_result = await self._session._phase_auth()
-
-                if auth_result.success:
-                    break  # Success, proceed to next phase
-
-                # Add failed makers to ignore list
-                for failed_nick in auth_result.failed_makers:
-                    self.orderbook_manager.add_ignored_maker(failed_nick)
-                    logger.debug(f"Added {failed_nick} to ignored makers (failed auth)")
-
-                # Try maker replacement if enabled
-                if (
-                    auth_result.needs_replacement
-                    and auth_replacement_attempt < max_replacement_attempts
-                ):
-                    auth_replacement_attempt += 1
-                    needed = self.config.minimum_makers - len(self._session.maker_sessions)
-                    logger.info(
-                        f"Attempting maker replacement in auth phase "
-                        f"(attempt {auth_replacement_attempt}/{max_replacement_attempts}): "
-                        f"need {needed} more makers"
-                    )
-
-                    # Select replacement makers.
-                    # Hard-exclude the current session's nicks (no duplicates)
-                    # and the makers that just failed auth in this attempt.
-                    # Soft-excluded makers are best-effort -- see select_makers
-                    # docstring for the fallback semantics.
-                    current_session_nicks = set(self._session.maker_sessions.keys())
-                    hard_excludes = current_session_nicks | set(auth_result.failed_makers)
-                    replacement_offers, _ = self.orderbook_manager.select_makers(
-                        cj_amount=self._session.cj_amount,
-                        n=needed,
-                        hard_exclude_nicks=hard_excludes,
-                        required_features=required_features,
-                    )
-
-                    if len(replacement_offers) < needed:
-                        logger.error(
-                            f"Not enough replacement makers for auth phase: "
-                            f"found {len(replacement_offers)}, need {needed}"
-                        )
-                        self.state = TakerState.FAILED
-                        return None
-
-                    # Add replacement makers - they need to go through fill first
-                    for nick, offer in replacement_offers.items():
-                        self._session.maker_sessions[nick] = MakerSession(
-                            nick=nick, offer=offer, supports_neutrino_compat=False
-                        )
-                        logger.info(f"Added replacement maker for auth: {nick}")
-
-                    # Run fill phase for new makers only
-                    logger.info("Running fill phase for replacement makers...")
-                    new_maker_nicks = list(replacement_offers.keys())
-
-                    # Send !fill to new makers
-                    if not self._session.podle_commitment or not self._session.crypto_session:
-                        logger.error("Missing commitment or crypto session for replacement")
-                        self.state = TakerState.FAILED
-                        return None
-
-                    commitment_hex = self._session.podle_commitment.to_commitment_str()
-                    taker_pubkey = self._session.crypto_session.get_pubkey_hex()
-
-                    # Establish communication channels for replacement makers
-                    # (Same logic as in _phase_fill, delegated to the directory layer.)
-                    for nick in new_maker_nicks:
-                        binding = self.directory_client.bind_session(nick)
-                        session = self._session.maker_sessions[nick]
-                        if binding is None:
-                            logger.warning(
-                                f"No communication channel available for replacement maker {nick}"
-                            )
-                            continue
-                        session.comm_channel = binding.channel_id
-                        if binding.is_direct:
-                            logger.debug(f"Will use DIRECT connection for replacement maker {nick}")
-                        else:
-                            logger.debug(
-                                f"Will use {binding.channel_id} for replacement maker {nick}"
-                            )
-
-                    # Send !fill to replacement makers using their designated channels
-                    for nick in new_maker_nicks:
-                        session = self._session.maker_sessions[nick]
-                        fill_data = (
-                            f"{session.offer.oid} {self._session.cj_amount} "
-                            f"{taker_pubkey} {commitment_hex}"
-                        )
-                        await self.directory_client.send_privmsg(
-                            nick,
-                            "fill",
-                            fill_data,
-                            log_routing=True,
-                            force_channel=session.comm_channel,
-                        )
-
-                    # Wait for !pubkey responses from new makers
-                    responses = await self.directory_client.wait_for_responses(
-                        expected_nicks=new_maker_nicks,
-                        expected_command="!pubkey",
-                        timeout=self.config.maker_timeout_sec,
-                    )
-
-                    # Process responses for new makers
-                    new_makers_ready = 0
-                    for nick in new_maker_nicks:
-                        if nick in responses and not responses[nick].get("error"):
-                            try:
-                                response_data = responses[nick]["data"].strip()
-                                parts = response_data.split()
-                                if parts:
-                                    nacl_pubkey = parts[0]
-                                    self._session.maker_sessions[nick].pubkey = nacl_pubkey
-                                    self._session.maker_sessions[nick].responded_fill = True
-
-                                    # Set up encryption (reuse taker keypair)
-                                    crypto = CryptoSession.__new__(CryptoSession)
-                                    crypto.keypair = self._session.crypto_session.keypair
-                                    crypto.box = None
-                                    crypto.counterparty_pubkey = ""
-                                    crypto.setup_encryption(nacl_pubkey)
-                                    self._session.maker_sessions[nick].crypto = crypto
-                                    new_makers_ready += 1
-                                    logger.debug(f"Replacement maker {nick} ready")
-                            except Exception as e:
-                                logger.warning(f"Failed to process {nick}: {e}")
-                                del self._session.maker_sessions[nick]
-                        else:
-                            logger.warning(f"Replacement maker {nick} didn't respond")
-                            if nick in self._session.maker_sessions:
-                                del self._session.maker_sessions[nick]
-
-                    if new_makers_ready == 0:
-                        logger.error("No replacement makers responded to fill")
-                        self.state = TakerState.FAILED
-                        return None
-
-                    # Continue to retry auth with all makers
-                    continue
-
-                # Failed and no replacement possible
-                logger.error("Auth phase failed")
-                self.state = TakerState.FAILED
+            if not await self._run_auth_with_replacements(
+                required_features=required_features,
+                max_replacement_attempts=max_replacement_attempts,
+            ):
                 return None
 
             # Phase 3: Build transaction
@@ -1424,171 +993,7 @@ class Taker(TakerMonitoringMixin):
                 self.state = TakerState.FAILED
                 return None
 
-            # Final confirmation before broadcast
-            # Calculate exact transaction details
-            num_taker_inputs = len(self._session.selected_utxos)
-            num_maker_inputs = sum(len(s.utxos) for s in self._session.maker_sessions.values())
-            total_inputs = num_taker_inputs + num_maker_inputs
-
-            # Parse transaction to count outputs and sum output values
-            tx = deserialize_transaction(self._session.final_tx)
-            total_outputs = len(tx.outputs)
-            total_output_value = sum(out.value for out in tx.outputs)
-
-            # Calculate total input value (taker + maker UTXOs)
-            taker_input_value = sum(utxo.value for utxo in self._session.selected_utxos)
-            maker_input_value = sum(
-                utxo["value"]
-                for session in self._session.maker_sessions.values()
-                for utxo in session.utxos
-            )
-            total_input_value = taker_input_value + maker_input_value
-
-            # Calculate actual mining fee from the transaction (includes any residual/dust)
-            actual_mining_fee = total_input_value - total_output_value
-
-            # Calculate maker fees
-            total_maker_fees = sum(
-                calculate_cj_fee(session.offer, self._session.cj_amount)
-                for session in self._session.maker_sessions.values()
-            )
-            total_cost = total_maker_fees + actual_mining_fee
-
-            # Calculate actual fee rate from the final signed transaction
-            actual_vsize = calculate_tx_vsize(self._session.final_tx)
-            actual_fee_rate = actual_mining_fee / actual_vsize if actual_vsize > 0 else 0.0
-
-            # Log final transaction details
-            logger.info("=" * 70)
-            logger.info("FINAL TRANSACTION SUMMARY - Ready to broadcast")
-            logger.info("=" * 70)
-            logger.info(f"CoinJoin amount:      {self._session.cj_amount:,} sats")
-            logger.info(f"Makers participating: {len(self._session.maker_sessions)}")
-            logger.info(
-                f"  Makers: {', '.join(nick[:10] + '...' for nick in self._session.maker_sessions)}"
-            )
-            logger.info(
-                f"Transaction inputs:   {total_inputs} ({num_taker_inputs} yours, "
-                f"{num_maker_inputs} makers)"
-            )
-            logger.info(f"Transaction outputs:  {total_outputs}")
-            logger.info(f"Maker fees:           {total_maker_fees:,} sats")
-            logger.info(
-                f"Mining fee:           {actual_mining_fee:,} sats ({actual_fee_rate:.2f} sat/vB)"
-            )
-            logger.info(f"Total cost:           {total_cost:,} sats")
-            logger.info(
-                f"Transaction size:     {actual_vsize} vbytes ({len(self._session.final_tx)} bytes)"
-            )
-            logger.info("-" * 70)
-            logger.info("Transaction hex (for manual verification/broadcast):")
-            logger.info(self._session.final_tx.hex())
-            logger.info("=" * 70)
-
-            # Prompt for final confirmation if callback is set
-            if hasattr(self, "confirmation_callback") and self.confirmation_callback:
-                try:
-                    # Build maker details for final confirmation
-                    maker_details = []
-                    for nick, session in self._session.maker_sessions.items():
-                        fee = calculate_cj_fee(session.offer, self._session.cj_amount)
-                        bond_value = session.offer.fidelity_bond_value
-                        # Get maker's location from any connected directory
-                        location = None
-                        for client in self.directory_client.clients.values():
-                            location = client._active_peers.get(nick)
-                            if location and location != "NOT-SERVING-ONION":
-                                break
-                        maker_details.append(
-                            {
-                                "nick": nick,
-                                "fee": fee,
-                                "bond_value": bond_value,
-                                "location": location,
-                            }
-                        )
-
-                    confirmed = self.confirmation_callback(
-                        maker_details=maker_details,
-                        cj_amount=self._session.cj_amount,
-                        total_fee=total_cost,
-                        destination=destination,
-                        mining_fee=actual_mining_fee,
-                        fee_rate=actual_fee_rate,
-                        stage="broadcast",
-                    )
-                    if not confirmed:
-                        logger.warning("User declined final broadcast confirmation")
-                        # Log CSV entry for manual tracking/broadcast
-                        self._session._log_manual_csv_entry(
-                            total_maker_fees, actual_mining_fee, destination
-                        )
-                        self.state = TakerState.FAILED
-                        return None
-                except Exception as e:
-                    logger.error(f"Final confirmation callback failed: {e}")
-                    self.state = TakerState.FAILED
-                    return None
-
-            # Phase 5: Broadcast
-            self.state = TakerState.BROADCASTING
-            logger.info("Phase 5: Broadcasting transaction...")
-
-            self._session.txid = await self._session._phase_broadcast()
-            if not self._session.txid:
-                logger.error("Broadcast failed")
-                self.state = TakerState.FAILED
-                return None
-
-            self.state = TakerState.COMPLETE
-            logger.info(f"CoinJoin COMPLETE! txid: {self._session.txid}")
-
-            # Update the "Awaiting transaction" history entry with txid and mining fee
-            # The entry was created before sending !tx to preserve address privacy
-            try:
-                # Use actual_mining_fee (total_inputs - total_outputs) computed from the
-                # signed transaction, NOT tx_metadata["fee"] which is just the estimated
-                # fee used during transaction construction. The actual fee includes any
-                # residual from sweep rounding and reflects the real cost to the taker.
-                updated = update_taker_awaiting_transaction_broadcast(
-                    destination_address=self._session.cj_destination,
-                    change_address=self._session.taker_change_address,  # Empty string if no change
-                    txid=self._session.txid,
-                    mining_fee=actual_mining_fee,
-                    data_dir=self.config.data_dir,
-                    wallet_fingerprint=self.wallet.wallet_fingerprint,
-                )
-                if updated:
-                    logger.debug(
-                        f"Updated history entry for CJ txid {self._session.txid[:16]}..., "
-                        f"mining_fee={actual_mining_fee} sats"
-                    )
-                else:
-                    logger.warning(
-                        f"No matching 'Awaiting transaction' entry found for "
-                        f"{self._session.cj_destination[:20]}... - history may be inconsistent"
-                    )
-
-                # Immediately check if tx is confirmed/in mempool and update history
-                # This is important for one-shot coinjoin CLI calls that exit immediately
-                await self._update_pending_transaction_now(
-                    self._session.txid, self._session.cj_destination
-                )
-            except Exception as e:
-                logger.warning(f"Failed to update CoinJoin history: {e}")
-
-            # Fire-and-forget notification for successful CoinJoin
-            total_fees = total_maker_fees + actual_mining_fee
-            asyncio.create_task(
-                get_notifier().notify_coinjoin_complete(
-                    self._session.txid,
-                    self._session.cj_amount,
-                    len(self._session.maker_sessions),
-                    total_fees,
-                )
-            )
-
-            return self._session.txid
+            return await self._finalize_and_broadcast(destination)
 
         except Exception as e:
             logger.error(f"CoinJoin failed: {e}")
@@ -1598,6 +1003,539 @@ class Taker(TakerMonitoringMixin):
             asyncio.create_task(get_notifier().notify_coinjoin_failed(str(e), phase, amount))
             self.state = TakerState.FAILED
             return None
+
+    async def _maybe_select_utxos_interactively(
+        self, amount: int, mixdepth: int
+    ) -> list[UTXOInfo] | None:
+        if not self.config.select_utxos:
+            logger.debug("Interactive UTXO selection not requested (--select-utxos not set)")
+            return None
+
+        from jmwallet.history import get_utxo_label
+        from jmwallet.utxo_selector import select_utxos_interactive
+
+        try:
+            # Get ALL UTXOs including frozen ones for display in the
+            # interactive selector. Frozen/locked UTXOs are shown but
+            # rendered as unselectable ([-]) so the user sees the full
+            # picture of their wallet.
+            available_utxos = await self.wallet.get_utxos(mixdepth)
+            # Also filter by minimum age (confirmations) -- but keep
+            # frozen ones regardless so they're visible in the TUI.
+            min_age = self.config.taker_utxo_age
+            available_utxos = [u for u in available_utxos if u.confirmations >= min_age or u.frozen]
+            if not available_utxos:
+                reason = f"No UTXOs in mixdepth {mixdepth}"
+                logger.error(reason)
+                self._session.last_failure_reason = reason
+                self.state = TakerState.FAILED
+                return None
+
+            # Check that at least some UTXOs are selectable (not frozen/locked)
+            selectable = [
+                u
+                for u in available_utxos
+                if not u.frozen and not (u.is_fidelity_bond and u.is_locked)
+            ]
+            if not selectable:
+                reason = (
+                    f"No eligible UTXOs in mixdepth {mixdepth} "
+                    f"(all {len(available_utxos)} UTXOs are frozen or locked)"
+                )
+                logger.error(reason)
+                self._session.last_failure_reason = reason
+                self.state = TakerState.FAILED
+                return None
+
+            # Populate labels for each UTXO based on history
+            for utxo in available_utxos:
+                utxo.label = get_utxo_label(
+                    utxo.address,
+                    self.config.data_dir,
+                    wallet_fingerprint=self.wallet.wallet_fingerprint,
+                )
+
+            logger.info(
+                f"Launching interactive UTXO selector ({len(available_utxos)} available, "
+                f"target amount: {amount} sats, sweep: {amount == 0})..."
+            )
+            manually_selected_utxos = select_utxos_interactive(available_utxos, amount)
+
+            if not manually_selected_utxos:
+                logger.info("UTXO selection cancelled by user")
+                self.state = TakerState.CANCELLED
+                return None
+
+            total_selected = sum(u.value for u in manually_selected_utxos)
+            logger.info(
+                f"Manually selected {len(manually_selected_utxos)} UTXOs "
+                f"(total: {total_selected:,} sats)"
+            )
+
+            # Validate selected UTXOs have sufficient funds (for non-sweep)
+            if amount > 0 and total_selected < amount:
+                logger.error(
+                    f"Insufficient funds in selected UTXOs: "
+                    f"have {total_selected:,} sats, need at least {amount:,} sats"
+                )
+                self.state = TakerState.FAILED
+                return None
+        except RuntimeError as e:
+            logger.error(f"Interactive UTXO selection failed: {e}")
+            self.state = TakerState.FAILED
+            return None
+
+        return manually_selected_utxos
+
+    async def _run_auth_with_replacements(
+        self, required_features: set[str] | None, max_replacement_attempts: int
+    ) -> bool:
+        self.state = TakerState.AUTHENTICATING
+        logger.info("Phase 2: Sending !auth and receiving !ioauth...")
+
+        auth_replacement_attempt = 0
+        while True:
+            auth_result = await self._session._phase_auth()
+
+            if auth_result.success:
+                return True
+
+            for failed_nick in auth_result.failed_makers:
+                self.orderbook_manager.add_ignored_maker(failed_nick)
+                logger.debug(f"Added {failed_nick} to ignored makers (failed auth)")
+
+            if (
+                auth_result.needs_replacement
+                and auth_replacement_attempt < max_replacement_attempts
+            ):
+                auth_replacement_attempt += 1
+                needed = self.config.minimum_makers - len(self._session.maker_sessions)
+                logger.info(
+                    f"Attempting maker replacement in auth phase "
+                    f"(attempt {auth_replacement_attempt}/{max_replacement_attempts}): "
+                    f"need {needed} more makers"
+                )
+
+                current_session_nicks = set(self._session.maker_sessions.keys())
+                hard_excludes = current_session_nicks | set(auth_result.failed_makers)
+                replacement_offers, _ = self.orderbook_manager.select_makers(
+                    cj_amount=self._session.cj_amount,
+                    n=needed,
+                    hard_exclude_nicks=hard_excludes,
+                    required_features=required_features,
+                )
+
+                if len(replacement_offers) < needed:
+                    logger.error(
+                        f"Not enough replacement makers for auth phase: "
+                        f"found {len(replacement_offers)}, need {needed}"
+                    )
+                    self.state = TakerState.FAILED
+                    return False
+
+                for nick, offer in replacement_offers.items():
+                    self._session.maker_sessions[nick] = MakerSession(
+                        nick=nick, offer=offer, supports_neutrino_compat=False
+                    )
+                    logger.info(f"Added replacement maker for auth: {nick}")
+
+                logger.info("Running fill phase for replacement makers...")
+                new_maker_nicks = list(replacement_offers.keys())
+
+                if not self._session.podle_commitment or not self._session.crypto_session:
+                    logger.error("Missing commitment or crypto session for replacement")
+                    self.state = TakerState.FAILED
+                    return False
+
+                commitment_hex = self._session.podle_commitment.to_commitment_str()
+                taker_pubkey = self._session.crypto_session.get_pubkey_hex()
+
+                for nick in new_maker_nicks:
+                    binding = self.directory_client.bind_session(nick)
+                    session = self._session.maker_sessions[nick]
+                    if binding is None:
+                        logger.warning(
+                            f"No communication channel available for replacement maker {nick}"
+                        )
+                        continue
+                    session.comm_channel = binding.channel_id
+                    if binding.is_direct:
+                        logger.debug(f"Will use DIRECT connection for replacement maker {nick}")
+                    else:
+                        logger.debug(f"Will use {binding.channel_id} for replacement maker {nick}")
+
+                for nick in new_maker_nicks:
+                    session = self._session.maker_sessions[nick]
+                    fill_data = (
+                        f"{session.offer.oid} {self._session.cj_amount} "
+                        f"{taker_pubkey} {commitment_hex}"
+                    )
+                    await self.directory_client.send_privmsg(
+                        nick,
+                        "fill",
+                        fill_data,
+                        log_routing=True,
+                        force_channel=session.comm_channel,
+                    )
+
+                responses = await self.directory_client.wait_for_responses(
+                    expected_nicks=new_maker_nicks,
+                    expected_command="!pubkey",
+                    timeout=self.config.maker_timeout_sec,
+                )
+
+                new_makers_ready = 0
+                for nick in new_maker_nicks:
+                    if nick in responses and not responses[nick].get("error"):
+                        try:
+                            response_data = responses[nick]["data"].strip()
+                            parts = response_data.split()
+                            if parts:
+                                nacl_pubkey = parts[0]
+                                self._session.maker_sessions[nick].pubkey = nacl_pubkey
+                                self._session.maker_sessions[nick].responded_fill = True
+
+                                crypto = CryptoSession.__new__(CryptoSession)
+                                crypto.keypair = self._session.crypto_session.keypair
+                                crypto.box = None
+                                crypto.counterparty_pubkey = ""
+                                crypto.setup_encryption(nacl_pubkey)
+                                self._session.maker_sessions[nick].crypto = crypto
+                                new_makers_ready += 1
+                                logger.debug(f"Replacement maker {nick} ready")
+                        except Exception as e:
+                            logger.warning(f"Failed to process {nick}: {e}")
+                            del self._session.maker_sessions[nick]
+                    else:
+                        logger.warning(f"Replacement maker {nick} didn't respond")
+                        if nick in self._session.maker_sessions:
+                            del self._session.maker_sessions[nick]
+
+                if new_makers_ready == 0:
+                    logger.error("No replacement makers responded to fill")
+                    self.state = TakerState.FAILED
+                    return False
+
+                continue
+
+            logger.error("Auth phase failed")
+            self.state = TakerState.FAILED
+            return False
+
+    async def _run_fill_with_replacements(
+        self,
+        destination: str,
+        selected_offers: dict[str, Any],
+        required_features: set[str] | None,
+        mixdepth: int,
+        get_private_key: Any,
+        max_replacement_attempts: int,
+    ) -> bool:
+        self.state = TakerState.FILLING
+        logger.info("Phase 1: Sending !fill to makers...")
+        directory_count = len(self.directory_client.clients)
+        directories = [
+            f"{client.host}:{client.port}" for client in self.directory_client.clients.values()
+        ]
+        logger.info(
+            f"Routing via {directory_count} director{'y' if directory_count == 1 else 'ies'}: "
+            f"{', '.join(directories)}"
+        )
+        if self.directory_client.prefer_direct_connections:
+            logger.debug(
+                "Direct connections preferred - will attempt to connect directly to makers"
+            )
+        else:
+            logger.debug("Direct connections disabled - all messages relayed through directories")
+
+        asyncio.create_task(
+            get_notifier().notify_coinjoin_start(
+                self._session.cj_amount, len(self._session.maker_sessions), destination
+            )
+        )
+
+        max_podle_retries = self.config.taker_utxo_retries
+        replacement_attempt = 0
+        for podle_retry in range(max_podle_retries):
+            session_size_before_fill = len(self._session.maker_sessions)
+            fill_result = await self._session._phase_fill()
+            if fill_result.success:
+                return True
+
+            if fill_result.blacklist_makers and self._session.podle_commitment is not None:
+                commitment_hex = self._session.podle_commitment.commitment.commitment.hex()
+                try:
+                    from jmcore.commitment_blacklist import add_commitment
+
+                    add_commitment(commitment_hex)
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.warning(
+                        f"Could not persist remotely-reported blacklisted commitment: {exc}"
+                    )
+
+            n_blacklisted = len(fill_result.blacklist_makers)
+            majority_blacklist = (
+                fill_result.blacklist_error
+                and session_size_before_fill > 0
+                and n_blacklisted * 2 >= session_size_before_fill
+            )
+
+            if fill_result.blacklist_error and not majority_blacklist:
+                logger.warning(
+                    f"Minority blacklist rejection from {fill_result.blacklist_makers} "
+                    f"({n_blacklisted}/{session_size_before_fill}). Ignoring those makers "
+                    "and trying replacement with the same commitment."
+                )
+                for failed_nick in fill_result.failed_makers:
+                    self.orderbook_manager.add_ignored_maker(failed_nick)
+                    logger.debug(f"Added {failed_nick} to ignored makers (minority blacklist)")
+            elif fill_result.blacklist_error:
+                logger.warning(
+                    f"Majority blacklist rejection ({n_blacklisted}/{session_size_before_fill}) "
+                    f"from {fill_result.blacklist_makers}. Rotating commitment and retrying."
+                )
+            elif fill_result.failed_makers:
+                for failed_nick in fill_result.failed_makers:
+                    self.orderbook_manager.add_ignored_maker(failed_nick)
+                    logger.debug(f"Added {failed_nick} to ignored makers (failed fill)")
+
+            if majority_blacklist:
+                if podle_retry < max_podle_retries - 1:
+                    logger.warning(
+                        f"Commitment blacklisted, retrying with new NUMS index "
+                        f"(attempt {podle_retry + 2}/{max_podle_retries})..."
+                    )
+                    new_commitment = self.podle_manager.generate_fresh_commitment(
+                        wallet_utxos=self._session.preselected_utxos,
+                        cj_amount=self._session.cj_amount,
+                        private_key_getter=get_private_key,
+                        min_confirmations=self.config.taker_utxo_age,
+                        min_percent=self.config.taker_utxo_amtpercent,
+                        max_retries=self.config.taker_utxo_retries,
+                    )
+                    if new_commitment is None:
+                        added = self._session._expand_preselected_utxos_same_mixdepth(mixdepth)
+                        if added > 0:
+                            logger.info(
+                                f"Preselected UTXOs exhausted for PoDLE; added {added} "
+                                f"additional UTXO(s) from mixdepth {mixdepth}, which will "
+                                "also be spent in the CoinJoin."
+                            )
+                            new_commitment = self.podle_manager.generate_fresh_commitment(
+                                wallet_utxos=self._session.preselected_utxos,
+                                cj_amount=self._session.cj_amount,
+                                private_key_getter=get_private_key,
+                                min_confirmations=self.config.taker_utxo_age,
+                                min_percent=self.config.taker_utxo_amtpercent,
+                                max_retries=self.config.taker_utxo_retries,
+                            )
+                    if new_commitment is None:
+                        logger.error(
+                            "No more PoDLE commitments available: all indices exhausted "
+                            f"across all eligible UTXOs in mixdepth {mixdepth}"
+                        )
+                        self.state = TakerState.FAILED
+                        return False
+
+                    self._session.podle_commitment = new_commitment
+                    self._session.maker_sessions = {
+                        nick: MakerSession(nick=nick, offer=offer, supports_neutrino_compat=False)
+                        for nick, offer in selected_offers.items()
+                        if nick not in self.orderbook_manager.ignored_makers
+                    }
+                    continue
+
+                logger.error(
+                    f"Fill phase failed after {max_podle_retries} PoDLE commitment attempts"
+                )
+                self.state = TakerState.FAILED
+                return False
+
+            if fill_result.needs_replacement and replacement_attempt < max_replacement_attempts:
+                replacement_attempt += 1
+                needed = self.config.minimum_makers - len(self._session.maker_sessions)
+                logger.info(
+                    f"Attempting maker replacement (attempt {replacement_attempt}/"
+                    f"{max_replacement_attempts}): need {needed} more makers"
+                )
+
+                current_session_nicks = set(self._session.maker_sessions.keys())
+                hard_excludes = current_session_nicks | set(fill_result.failed_makers)
+                replacement_offers, _ = self.orderbook_manager.select_makers(
+                    cj_amount=self._session.cj_amount,
+                    n=needed,
+                    hard_exclude_nicks=hard_excludes,
+                    required_features=required_features,
+                )
+
+                if len(replacement_offers) < needed:
+                    logger.error(
+                        "Not enough replacement makers available: "
+                        f"found {len(replacement_offers)}, need {needed}"
+                    )
+                    self.state = TakerState.FAILED
+                    return False
+
+                for nick, offer in replacement_offers.items():
+                    self._session.maker_sessions[nick] = MakerSession(
+                        nick=nick, offer=offer, supports_neutrino_compat=False
+                    )
+                    logger.info(f"Added replacement maker: {nick}")
+                selected_offers.update(replacement_offers)
+                self._session.last_used_nicks.update(replacement_offers.keys())
+                continue
+
+            logger.error("Fill phase failed")
+            self.state = TakerState.FAILED
+            return False
+
+        logger.error("Fill phase failed")
+        self.state = TakerState.FAILED
+        return False
+
+    async def _finalize_and_broadcast(self, destination: str) -> str | None:
+        # Final confirmation before broadcast
+        num_taker_inputs = len(self._session.selected_utxos)
+        num_maker_inputs = sum(len(s.utxos) for s in self._session.maker_sessions.values())
+        total_inputs = num_taker_inputs + num_maker_inputs
+
+        tx = deserialize_transaction(self._session.final_tx)
+        total_outputs = len(tx.outputs)
+        total_output_value = sum(out.value for out in tx.outputs)
+
+        taker_input_value = sum(utxo.value for utxo in self._session.selected_utxos)
+        maker_input_value = sum(
+            utxo["value"]
+            for session in self._session.maker_sessions.values()
+            for utxo in session.utxos
+        )
+        total_input_value = taker_input_value + maker_input_value
+        actual_mining_fee = total_input_value - total_output_value
+
+        total_maker_fees = sum(
+            calculate_cj_fee(session.offer, self._session.cj_amount)
+            for session in self._session.maker_sessions.values()
+        )
+        total_cost = total_maker_fees + actual_mining_fee
+        actual_vsize = calculate_tx_vsize(self._session.final_tx)
+        actual_fee_rate = actual_mining_fee / actual_vsize if actual_vsize > 0 else 0.0
+
+        logger.info("=" * 70)
+        logger.info("FINAL TRANSACTION SUMMARY - Ready to broadcast")
+        logger.info("=" * 70)
+        logger.info(f"CoinJoin amount:      {self._session.cj_amount:,} sats")
+        logger.info(f"Makers participating: {len(self._session.maker_sessions)}")
+        logger.info(
+            f"  Makers: {', '.join(nick[:10] + '...' for nick in self._session.maker_sessions)}"
+        )
+        logger.info(
+            f"Transaction inputs:   {total_inputs} ({num_taker_inputs} yours, "
+            f"{num_maker_inputs} makers)"
+        )
+        logger.info(f"Transaction outputs:  {total_outputs}")
+        logger.info(f"Maker fees:           {total_maker_fees:,} sats")
+        logger.info(
+            f"Mining fee:           {actual_mining_fee:,} sats ({actual_fee_rate:.2f} sat/vB)"
+        )
+        logger.info(f"Total cost:           {total_cost:,} sats")
+        logger.info(
+            f"Transaction size:     {actual_vsize} vbytes ({len(self._session.final_tx)} bytes)"
+        )
+        logger.info("-" * 70)
+        logger.info("Transaction hex (for manual verification/broadcast):")
+        logger.info(self._session.final_tx.hex())
+        logger.info("=" * 70)
+
+        if hasattr(self, "confirmation_callback") and self.confirmation_callback:
+            try:
+                maker_details = []
+                for nick, session in self._session.maker_sessions.items():
+                    fee = calculate_cj_fee(session.offer, self._session.cj_amount)
+                    bond_value = session.offer.fidelity_bond_value
+                    location = None
+                    for client in self.directory_client.clients.values():
+                        location = client._active_peers.get(nick)
+                        if location and location != "NOT-SERVING-ONION":
+                            break
+                    maker_details.append(
+                        {
+                            "nick": nick,
+                            "fee": fee,
+                            "bond_value": bond_value,
+                            "location": location,
+                        }
+                    )
+
+                confirmed = self.confirmation_callback(
+                    maker_details=maker_details,
+                    cj_amount=self._session.cj_amount,
+                    total_fee=total_cost,
+                    destination=destination,
+                    mining_fee=actual_mining_fee,
+                    fee_rate=actual_fee_rate,
+                    stage="broadcast",
+                )
+                if not confirmed:
+                    logger.warning("User declined final broadcast confirmation")
+                    self._session._log_manual_csv_entry(
+                        total_maker_fees, actual_mining_fee, destination
+                    )
+                    self.state = TakerState.FAILED
+                    return None
+            except Exception as e:
+                logger.error(f"Final confirmation callback failed: {e}")
+                self.state = TakerState.FAILED
+                return None
+
+        self.state = TakerState.BROADCASTING
+        logger.info("Phase 5: Broadcasting transaction...")
+
+        self._session.txid = await self._session._phase_broadcast()
+        if not self._session.txid:
+            logger.error("Broadcast failed")
+            self.state = TakerState.FAILED
+            return None
+
+        self.state = TakerState.COMPLETE
+        logger.info(f"CoinJoin COMPLETE! txid: {self._session.txid}")
+
+        try:
+            updated = update_taker_awaiting_transaction_broadcast(
+                destination_address=self._session.cj_destination,
+                change_address=self._session.taker_change_address,  # Empty string if no change
+                txid=self._session.txid,
+                mining_fee=actual_mining_fee,
+                data_dir=self.config.data_dir,
+                wallet_fingerprint=self.wallet.wallet_fingerprint,
+            )
+            if updated:
+                logger.debug(
+                    f"Updated history entry for CJ txid {self._session.txid[:16]}..., "
+                    f"mining_fee={actual_mining_fee} sats"
+                )
+            else:
+                logger.warning(
+                    f"No matching 'Awaiting transaction' entry found for "
+                    f"{self._session.cj_destination[:20]}... - history may be inconsistent"
+                )
+
+            await self._update_pending_transaction_now(
+                self._session.txid, self._session.cj_destination
+            )
+        except Exception as e:
+            logger.warning(f"Failed to update CoinJoin history: {e}")
+
+        total_fees = total_maker_fees + actual_mining_fee
+        asyncio.create_task(
+            get_notifier().notify_coinjoin_complete(
+                self._session.txid,
+                self._session.cj_amount,
+                len(self._session.maker_sessions),
+                total_fees,
+            )
+        )
+
+        return self._session.txid
 
     async def run_schedule(self, schedule: Schedule) -> bool:
         """

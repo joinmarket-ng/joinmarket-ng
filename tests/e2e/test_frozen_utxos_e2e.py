@@ -19,6 +19,7 @@ Requires: docker compose --profile e2e up -d
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 import pytest_asyncio
@@ -28,6 +29,14 @@ from jmwallet.wallet.service import WalletService
 from jmwallet.wallet.utxo_metadata import UTXOMetadataStore
 from maker.config import MakerConfig
 from taker.config import TakerConfig
+
+# Bitcoin RPC and directory endpoints come from the environment so the suite
+# works on both the default-port stack (CI) and the parallel runner, which
+# remaps host ports per suite.
+_RPC_URL = os.environ.get("BITCOIN_RPC_URL", "http://127.0.0.1:18443")
+_RPC_USER = os.environ.get("BITCOIN_RPC_USER", "test")
+_RPC_PASSWORD = os.environ.get("BITCOIN_RPC_PASSWORD", "test")
+_DIRECTORY_SERVER = f"127.0.0.1:{os.environ.get('DIRECTORY_PORT', '5222')}"
 
 # Mark all tests in this module as requiring Docker e2e profile
 pytestmark = pytest.mark.e2e
@@ -60,9 +69,9 @@ GENERIC_TEST_MNEMONIC = (
 def bitcoin_backend():
     """Bitcoin Core backend for regtest."""
     return DescriptorWalletBackend(
-        rpc_url="http://127.0.0.1:18443",
-        rpc_user="test",
-        rpc_password="test",
+        rpc_url=_RPC_URL,
+        rpc_user=_RPC_USER,
+        rpc_password=_RPC_PASSWORD,
     )
 
 
@@ -183,11 +192,11 @@ def maker_config_with_datadir(tmp_path):
         bitcoin_network=NetworkType.REGTEST,
         backend_type="descriptor_wallet",
         backend_config={
-            "rpc_url": "http://127.0.0.1:18443",
-            "rpc_user": "test",
-            "rpc_password": "test",
+            "rpc_url": _RPC_URL,
+            "rpc_user": _RPC_USER,
+            "rpc_password": _RPC_PASSWORD,
         },
-        directory_servers=["127.0.0.1:5222"],
+        directory_servers=[_DIRECTORY_SERVER],
         min_size=100_000,
         cj_fee_relative="0.0003",
         tx_fee_contribution=1_000,
@@ -203,15 +212,15 @@ def taker_config():
         bitcoin_network=NetworkType.REGTEST,
         backend_type="descriptor_wallet",
         backend_config={
-            "rpc_url": "http://127.0.0.1:18443",
-            "rpc_user": "test",
-            "rpc_password": "test",
+            "rpc_url": _RPC_URL,
+            "rpc_user": _RPC_USER,
+            "rpc_password": _RPC_PASSWORD,
         },
-        directory_servers=["127.0.0.1:5222"],
+        directory_servers=[_DIRECTORY_SERVER],
         counterparty_count=2,
         minimum_makers=2,
-        maker_timeout_sec=30,
-        order_wait_time=10.0,
+        maker_timeout_sec=60,
+        order_wait_time=60.0,
     )
 
 
@@ -516,9 +525,9 @@ class TestBIP329Persistence:
 
         # Create second wallet instance with same mnemonic and data_dir
         backend2 = DescriptorWalletBackend(
-            rpc_url="http://127.0.0.1:18443",
-            rpc_user="test",
-            rpc_password="test",
+            rpc_url=_RPC_URL,
+            rpc_user=_RPC_USER,
+            rpc_password=_RPC_PASSWORD,
         )
         wallet2 = WalletService(
             mnemonic=GENERIC_TEST_MNEMONIC,
@@ -1281,11 +1290,11 @@ class TestRealisticScenarios:
             bitcoin_network=NetworkType.REGTEST,
             backend_type="descriptor_wallet",
             backend_config={
-                "rpc_url": "http://127.0.0.1:18443",
-                "rpc_user": "test",
-                "rpc_password": "test",
+                "rpc_url": _RPC_URL,
+                "rpc_user": _RPC_USER,
+                "rpc_password": _RPC_PASSWORD,
             },
-            directory_servers=["127.0.0.1:5222"],
+            directory_servers=[_DIRECTORY_SERVER],
             min_size=100_000,
             cj_fee_relative="0.0003",
             tx_fee_contribution=1_000,
