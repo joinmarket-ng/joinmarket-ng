@@ -541,11 +541,9 @@ async def _show_wallet_info(
             backend, data_dir, wallet_fingerprint=wallet.wallet_fingerprint
         )
 
-        from jmcore.bitcoin import format_amount
-
         # Show the wallet master fingerprint so users can pass it via
         # --wallet-fingerprint to cold-wallet bond commands.
-        print(f"Wallet fingerprint: {wallet.wallet_fingerprint}")
+        print(f"\nWallet fingerprint: {wallet.wallet_fingerprint}")
 
         # Get total balance, separating FB balance
         total_balance = await wallet.get_total_balance(include_fidelity_bonds=False)
@@ -557,17 +555,16 @@ async def _show_wallet_info(
             for u in utxos_list
             if u.frozen and not u.is_fidelity_bond
         )
+
+        # Calculate formatting width for branch balances
+        balance_width = len(f"{total_balance + total_frozen:,}")
+
         # Build Total Balance display with optional FB and frozen suffixes
         suffix_parts: list[str] = []
         if fb_balance > 0:
-            suffix_parts.append(f"{format_amount(fb_balance)} FB")
+            suffix_parts.append(f"{fb_balance:,} sats FB")
         if total_frozen > 0:
-            suffix_parts.append(f"{format_amount(total_frozen)} frozen")
-        display_balance = total_balance + fb_balance
-        if suffix_parts:
-            print(f"\nTotal Balance: {format_amount(display_balance)} ({', '.join(suffix_parts)})")
-        else:
-            print(f"\nTotal Balance: {format_amount(total_balance)}")
+            suffix_parts.append(f"{total_frozen:,} sats frozen")
 
         # Show pending transactions if any
         from jmwallet.history import cleanup_stale_pending_transactions, get_pending_transactions
@@ -600,9 +597,13 @@ async def _show_wallet_info(
 
         if extended:
             # Extended view with detailed address information
-            print("\nJM wallet")
             _show_extended_wallet_info(
-                wallet, used_addresses, history_addresses, display_gap, show_empty=show_empty
+                wallet,
+                used_addresses,
+                history_addresses,
+                display_gap,
+                show_empty=show_empty,
+                balance_width=balance_width,
             )
         else:
             # Simple view - show balance and suggested address per mixdepth
@@ -639,6 +640,26 @@ async def _show_wallet_info(
                 # for the real-world failure trace that motivated it.
                 addr, _ = await wallet.get_next_safe_deposit_address(md, used_addresses)
                 print(f"  Mixdepth {md}: {addr}")
+
+        # Show Total Balance with aligned columns
+        unit_suffix = " sats"
+        unit_suffix_width = len(unit_suffix)
+
+        total_str = f"{total_balance + total_frozen + fb_balance:,}{unit_suffix}"
+        print(f"\n{'Total Wallet Balance:':<35}{total_str:>{balance_width + unit_suffix_width}}")
+
+        if total_frozen > 0:
+            frozen_str = f"{total_frozen:,}{unit_suffix}"
+            print(f"{'Frozen UTXOs:':<35}{frozen_str:>{balance_width + unit_suffix_width}}")
+
+        if fb_balance > 0:
+            fb_str = f"{fb_balance:,}{unit_suffix}"
+            print(f"{'Fidelity Bonds:':<35}{fb_str:>{balance_width + unit_suffix_width}}")
+
+        spendable_str = f"{total_balance:,}{unit_suffix}"
+        print(
+            f"{'Total Spendable Balance:':<35}{spendable_str:>{balance_width + unit_suffix_width}}"
+        )
 
     finally:
         await wallet.close()
@@ -725,6 +746,7 @@ def _print_branch_addresses(
     frozen_addresses: set[str],
     show_empty: bool = False,
     new_address_limit: int = 6,
+    balance_width: int = 10,
 ) -> tuple[int, int]:
     """Print addresses for one wallet branch and return (total_balance, hidden_count).
 
@@ -741,7 +763,6 @@ def _print_branch_addresses(
     balance display remains accurate. ``hidden_count`` counts addresses
     that were omitted from the output because they were empty.
     """
-    from jmcore.bitcoin import sats_to_btc
 
     total_balance = 0
     hidden = 0
@@ -767,7 +788,6 @@ def _print_branch_addresses(
                 hidden += 1
                 continue
 
-        btc_balance = sats_to_btc(addr_info.balance)
         status_display: str = addr_info.status
         if addr_info.address in pending_addresses:
             status_display += " (pending)"
@@ -785,7 +805,14 @@ def _print_branch_addresses(
                 confs_display = f"{min_confs} conf"
             status_display += f" ({confs_display})"
 
-        print(f"{addr_info.path:<24}{addr_info.address}\t{btc_balance:.8f}\t{status_display}")
+        unit_suffix = " sats"
+        unit_suffix_width = len(unit_suffix)
+        balance_unit = f"{addr_info.balance:,}{unit_suffix}"
+
+        print(
+            f"{addr_info.path:<24}{addr_info.address:<44}"
+            f"{balance_unit:>{balance_width + unit_suffix_width}}  {status_display}"
+        )
 
     return total_balance, hidden
 
@@ -796,6 +823,7 @@ def _show_extended_wallet_info(
     history_addresses: dict[str, str],
     gap_limit: int,
     show_empty: bool = False,
+    balance_width: int = 10,
 ) -> None:
     """
     Display extended wallet information with detailed address listings.
@@ -812,7 +840,6 @@ def _show_extended_wallet_info(
     user has a fresh receive address at a glance, and the number of
     hidden entries is printed as a summary line.
     """
-    from jmcore.bitcoin import sats_to_btc
 
     from jmwallet.history import get_pending_transactions
     from jmwallet.wallet.service import FIDELITY_BOND_BRANCH
@@ -825,14 +852,14 @@ def _show_extended_wallet_info(
                 frozen_addresses.add(utxo.address)
 
     # Print legend for address statuses
-    print("Address status legend:")
-    print("  new         - Unused, safe for receiving")
-    print("  deposit     - External address with funds")
-    print("  cj-out      - CoinJoin output (mixed funds)")
-    print("  cj-change   - Change output from a CoinJoin (deanonymising, keep separate)")
+    print("\nAddress status legend:")
+    print("  new           - Unused, safe for receiving")
+    print("  deposit       - Address with funds from internal or external sources")
+    print("  cj-out        - CoinJoin output (mixed funds)")
+    print("  cj-change     - Change output from a CoinJoin (deanonymising, keep separate)")
     print("  non-cj-change - Regular change (not from CoinJoin)")
-    print("  used-empty  - Previously used, now empty (do not reuse)")
-    print("  flagged     - Shared with peers but tx failed (do not reuse)")
+    print("  used-empty    - Previously used, now empty (do not reuse)")
+    print("  flagged       - Shared with peers but tx failed (do not reuse)")
     print()
 
     # Get pending transactions to mark addresses (scoped to active wallet, #473)
@@ -850,7 +877,10 @@ def _show_extended_wallet_info(
         # Get account zpub (BIP84 format for native segwit)
         zpub = wallet.get_account_zpub(md)
 
-        print(f"mixdepth\t{md}\t{zpub}")
+        if md > 0:
+            print()  # Visual separator before mixdepths 1-4
+
+        print(f"Mixdepth {md}\t{zpub}")
 
         # External addresses (receive / deposit)
         ext_addresses = wallet.get_address_info_for_mixdepth(
@@ -866,11 +896,15 @@ def _show_extended_wallet_info(
             pending_addresses,
             frozen_addresses,
             show_empty=show_empty,
+            balance_width=balance_width,
         )
 
         if ext_hidden:
-            print(f"\t\t\t({ext_hidden} empty addresses hidden; pass --show-empty to display)")
-        print(f"Balance:\t{sats_to_btc(ext_balance):.8f}")
+            print(
+                f"\t\t\t({ext_hidden} empty addresses hidden; "
+                f"to display use CLI and pass --show-empty)"
+            )
+        print(f"Balance: {ext_balance:,} sats")
 
         # Internal addresses (change / CJ output)
         int_addresses = wallet.get_address_info_for_mixdepth(
@@ -884,11 +918,15 @@ def _show_extended_wallet_info(
             pending_addresses,
             frozen_addresses,
             show_empty=show_empty,
+            balance_width=balance_width,
         )
 
         if int_hidden:
-            print(f"\t\t\t({int_hidden} empty addresses hidden; pass --show-empty to display)")
-        print(f"Balance:\t{sats_to_btc(int_balance):.8f}")
+            print(
+                f"\t\t\t({ext_hidden} empty addresses hidden; "
+                f"to display use CLI and pass --show-empty)"
+            )
+        print(f"Balance: {int_balance:,} sats")
 
         # Fidelity bond branch (only for mixdepth 0)
         bond_addresses: list = []  # Initialize for type checker
@@ -907,7 +945,6 @@ def _show_extended_wallet_info(
                 current_time = int(time.time())
 
                 for addr_info in bond_addresses:
-                    btc_balance = sats_to_btc(addr_info.balance)
                     bond_balance += addr_info.balance
                     is_locked = addr_info.locktime and addr_info.locktime > current_time
                     if is_locked:
@@ -920,6 +957,8 @@ def _show_extended_wallet_info(
                         locktime_str = dt.strftime("%Y-%m-%d")
                         if is_locked:
                             locktime_str += " [LOCKED]"
+                        else:
+                            locktime_str += " [FB EXPIRED]"
 
                     # Show unconfirmed status if applicable
                     if addr_info.has_unconfirmed:
@@ -927,17 +966,18 @@ def _show_extended_wallet_info(
 
                     # Pad path to ensure consistent alignment regardless of index digits
                     print(
-                        f"{addr_info.path:<24}{addr_info.address}\t{btc_balance:.8f}\t{locktime_str}"
+                        f"{addr_info.path:<24}{addr_info.address}\t"
+                        f"{addr_info.balance:,} sats\t{locktime_str}"
                     )
 
                 # Show bond balance with locked amount in parentheses
                 if bond_locked > 0:
                     print(
-                        f"Balance:\t{sats_to_btc(bond_balance - bond_locked):.8f} "
-                        f"({sats_to_btc(bond_locked):.8f})"
+                        f"Balance:\t{bond_balance - bond_locked:,} sats "
+                        f"({bond_locked:,} sats locked)"
                     )
                 else:
-                    print(f"Balance:\t{sats_to_btc(bond_balance):.8f}")
+                    print(f"Balance:\t{bond_balance:,} sats")
 
         # Total balance for mixdepth
         total_md_balance = ext_balance + int_balance
@@ -946,13 +986,13 @@ def _show_extended_wallet_info(
             bond_balance = sum(addr_info.balance for addr_info in bond_addresses)
             if bond_balance > 0:
                 print(
-                    f"Balance for mixdepth {md}:\t{sats_to_btc(total_md_balance):.8f} "
-                    f"(+{sats_to_btc(bond_balance):.8f} FB)"
+                    f"Balance for mixdepth {md}:\t{total_md_balance:,} sats "
+                    f"(+{bond_balance:,} sats FB)"
                 )
             else:
-                print(f"Balance for mixdepth {md}:\t{sats_to_btc(total_md_balance):.8f}")
+                print(f"Balance for mixdepth {md}:\t{total_md_balance:,} sats")
         else:
-            print(f"Balance for mixdepth {md}:\t{sats_to_btc(total_md_balance):.8f}")
+            print(f"Balance for mixdepth {md}:\t{total_md_balance:,} sats")
 
 
 @app.command("verify-password")
