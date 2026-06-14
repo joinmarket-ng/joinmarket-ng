@@ -703,6 +703,10 @@ class MakerSettings(BaseModel):
         description="Interval for periodic wallet rescans",
     )
     # Hidden service settings
+    onion_host: str | None = Field(
+        default=None,
+        description="Static hidden service address (e.g., 'mymaker...onion'). When not set, Tor control auto-generates one.",
+    )
     onion_serving_host: str = Field(
         default="127.0.0.1",
         description="Bind address for incoming connections",
