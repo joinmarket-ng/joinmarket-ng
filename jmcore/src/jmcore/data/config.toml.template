@@ -387,6 +387,7 @@
 # offer_reannounce_delay_max = 600
 
 # Onion service settings
+# onion_host = ""  # Static hidden service address (e.g., 'mymaker...onion'). When not set, Tor control auto-generates one.
 # onion_serving_host = "127.0.0.1"
 # onion_serving_port = 5222
 # tor_target_host = "127.0.0.1"
