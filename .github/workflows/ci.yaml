@@ -1471,6 +1471,17 @@ jobs:
             sleep 2
           done
 
+          echo "Waiting for makers to publish offers to orderbook watcher..."
+          for i in $(seq 1 90); do
+            n_offers=$(curl -sf http://127.0.0.1:8080/orderbook.json 2>/dev/null \
+              | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('offers', [])))" 2>/dev/null || echo 0)
+            if [ "${n_offers:-0}" -ge 2 ]; then
+              echo "Orderbook has ${n_offers} offers - makers ready"
+              break
+            fi
+            sleep 2
+          done
+
           echo "Neutrino services ready!"
 
       - name: Run neutrino backend tests

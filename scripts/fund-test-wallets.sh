@@ -122,10 +122,13 @@ for wallet_addr in "$MAKER1_ADDR" "$MAKER2_ADDR" "$MAKER3_ADDR" \
     echo "Sent ${SENDS_PER_WALLET}x${AMOUNT_PER_SEND} BTC to $wallet_addr"
 done
 
-# Mine 6 blocks to confirm all the sendtoaddress transactions.
-# Mine to test-funder so no extra UTXOs land on maker/taker addresses.
-$CLI generatetoaddress 6 "$TEST_FUNDER_ADDR"
-echo "Mined 6 confirmation blocks"
+# Confirm the sendtoaddress transactions with 110 blocks so every maker/taker
+# UTXO reaches >= 100 confirmations. Some tests (e.g. the neutrino maker
+# CoinJoin) require taker_utxo_age=100, which a shallow 6-block confirmation
+# would not satisfy. Mine to test-funder so no extra UTXOs land on maker/taker
+# addresses (which would trigger address-reuse auto-freeze).
+$CLI generatetoaddress 110 "$TEST_FUNDER_ADDR"
+echo "Mined 110 confirmation blocks (maker/taker UTXOs now have >= 100 confirmations)"
 
 # =============================================================================
 # Phase 3: Set up fidelity bond wallet and create fidelity bond for Maker1

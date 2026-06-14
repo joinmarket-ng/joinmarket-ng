@@ -459,49 +459,92 @@ async def wait_for_directory_server(
     pytest.skip("Directory server did not become ready in time")
 
 
+def _poll_orderbook_offer_count(url: str) -> int | None:
+    """Return the current offer count from the orderbook watcher, or None on error."""
+    import urllib.error
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(url, timeout=3) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return len(data.get("offers", []))
+    except (urllib.error.URLError, OSError, json.JSONDecodeError, TimeoutError):
+        return None
+
+
 def _wait_for_maker_offers(min_offers: int = 2, timeout: float = 120.0) -> bool:
     """Poll the orderbook watcher until at least *min_offers* offers appear.
 
     Uses the HTTP ``/orderbook.json`` endpoint of the orderbook-watcher service
     which reflects offers that makers have actually published to the directory.
-    This is a reliable readiness signal: an offer only appears once the maker
-    has connected to the directory *and* broadcast its ``!orderbook`` response.
 
-    Returns True when the condition is met, False on timeout.  Logs a warning on
-    timeout but does not raise so callers can decide how to handle the situation.
+    Returns True when the condition is met, False on timeout.
     """
-    import urllib.error
-    import urllib.request
-
     from tests.e2e.docker_utils import get_orderbook_watcher_url
 
     url = f"{get_orderbook_watcher_url()}/orderbook.json"
     deadline = time.time() + timeout
-    poll_interval = 2.0
 
     while time.time() < deadline:
-        try:
-            with urllib.request.urlopen(url, timeout=3) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                n = len(data.get("offers", []))
-                if n >= min_offers:
-                    logger.info(
-                        f"Orderbook watcher has {n} offers (>= {min_offers}), makers ready"
-                    )
-                    return True
-                logger.debug(
-                    f"Orderbook watcher has {n}/{min_offers} offers, waiting..."
-                )
-        except (urllib.error.URLError, OSError, json.JSONDecodeError, TimeoutError):
-            # Watcher may not be available in all test configurations
-            pass
-        time.sleep(poll_interval)
+        n = _poll_orderbook_offer_count(url)
+        if n is not None and n >= min_offers:
+            logger.info(
+                f"Orderbook watcher has {n} offers (>= {min_offers}), makers ready"
+            )
+            return True
+        if n is not None:
+            logger.debug(f"Orderbook watcher has {n}/{min_offers} offers, waiting...")
+        time.sleep(2.0)
 
     logger.warning(
         f"Timed out after {timeout:.0f}s waiting for {min_offers} offer(s) "
         "in orderbook watcher. Proceeding anyway - test may skip."
     )
     return False
+
+
+def _wait_for_makers_restart(
+    min_offers: int = 2,
+    settle_timeout: float = 30.0,
+    ready_timeout: float = 150.0,
+) -> bool:
+    """Wait for freshly restarted makers to (re)publish offers.
+
+    Restarting maker containers means their offers must disappear from the
+    directory (on disconnect) and reappear (on reconnect + re-announce).  A
+    naive "wait for N offers" check can return immediately on STALE offers that
+    the directory has not yet pruned, so this helper runs two phases:
+
+    1. Settle: wait until the offer count drops below *min_offers*, confirming
+       the directory pruned the restarted makers' stale offers.  Bounded by
+       *settle_timeout*; if the directory is slow to prune we proceed anyway.
+    2. Ready: wait until at least *min_offers* offers reappear (fresh
+       re-announcement), bounded by *ready_timeout*.
+
+    Returns True when *min_offers* fresh offers are observed, False on timeout.
+    """
+    from tests.e2e.docker_utils import get_orderbook_watcher_url
+
+    url = f"{get_orderbook_watcher_url()}/orderbook.json"
+
+    # Phase 1: wait for stale offers to be pruned after the restart.
+    settle_deadline = time.time() + settle_timeout
+    while time.time() < settle_deadline:
+        n = _poll_orderbook_offer_count(url)
+        if n is not None and n < min_offers:
+            logger.info(
+                f"Orderbook drained to {n} offers after restart; awaiting re-announce"
+            )
+            break
+        time.sleep(1.0)
+    else:
+        logger.debug(
+            "Orderbook did not visibly drain within settle window; "
+            "proceeding to readiness wait"
+        )
+
+    # Phase 2: wait for makers to re-announce fresh offers.
+    return _wait_for_maker_offers(min_offers=min_offers, timeout=ready_timeout)
 
 
 @pytest.fixture(scope="function")
@@ -514,9 +557,10 @@ def fresh_docker_makers():
     It also stops any non-e2e profile makers that might interfere with tests
     and clears commitment blacklists for all active makers.
 
-    Instead of a fixed sleep, it polls the orderbook watcher until at least 2
-    offers appear, which is the reliable signal that makers are connected to the
-    directory and have published their offers.
+    Instead of a fixed sleep, it restarts every maker and then waits for the
+    orderbook watcher to drain (stale offers pruned) and refill with fresh
+    offers, which is the reliable signal that the restarted makers reconnected
+    to the directory and re-published their offers.
     """
 
     from jmcore.paths import get_used_commitments_path
@@ -585,13 +629,27 @@ def fresh_docker_makers():
             except Exception as e:
                 logger.warning(f"Failed to clear state for {container}: {e}")
 
-        # Restart the e2e profile makers (including neutrino maker for neutrino tests).
-        # Only restart the non-heavy ones; maker4/maker5 are left running to keep
-        # their UTXOs stable. Skip containers that are not running (e.g.
-        # maker-neutrino is absent in the standard e2e profile) so that a
-        # missing container does not cause docker restart to exit non-zero and
-        # prevent the readiness wait from running.
-        restart_services = ["maker1", "maker2", "maker3", "maker-neutrino"]
+        # Restart ALL running e2e/neutrino makers. Restarting every maker (rather
+        # than leaving maker4/maker5 up) is what makes the readiness gate
+        # meaningful: if some makers stay connected they keep publishing stale
+        # offers, so a "wait for N offers" check would pass immediately without
+        # confirming the restarted makers actually came back. With every maker
+        # restarted, the orderbook fully drains and then refills with fresh
+        # offers, which _wait_for_makers_restart verifies (drop-then-rise).
+        #
+        # Restarting is required to clear each maker's in-memory PoDLE commitment
+        # blacklist (loaded only at startup); deleting the on-disk file alone
+        # would not take effect until the next restart. Skip containers that are
+        # not running (e.g. maker-neutrino is absent in the standard e2e profile)
+        # so a missing container does not make docker restart exit non-zero.
+        restart_services = [
+            "maker1",
+            "maker2",
+            "maker3",
+            "maker4",
+            "maker5",
+            "maker-neutrino",
+        ]
         restart_containers = [
             get_container_name(s)
             for s in restart_services
@@ -602,16 +660,19 @@ def fresh_docker_makers():
                 ["docker", "restart", *restart_containers],
                 capture_output=True,
                 text=True,
-                timeout=60,
+                timeout=90,
             )
             if result.returncode == 0:
                 logger.info(
                     f"Restarted {len(restart_containers)} maker(s), "
-                    "polling orderbook watcher for readiness..."
+                    "waiting for fresh offers to re-appear..."
                 )
             else:
                 logger.warning(f"Partial maker restart failure: {result.stderr}")
-            _wait_for_maker_offers(min_offers=1, timeout=120)
+            # Require at least 2 fresh offers: the marquee CoinJoin tests use
+            # counterparty_count=2, and every profile that uses this fixture runs
+            # at least two regular makers.
+            _wait_for_makers_restart(min_offers=2)
         else:
             logger.warning("No maker containers found to restart")
     except subprocess.TimeoutExpired:
