@@ -296,6 +296,26 @@ cj_fee_absolute = 1000
         assert settings.maker.offer_type == "sw0absoffer"
         assert settings.maker.cj_fee_absolute == 1000
 
+    def test_toml_maker_onion_host(
+        self, temp_data_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``onion_host`` must be readable from the [maker] TOML section (#535)."""
+        config_path = temp_data_dir / "config.toml"
+        config_path.write_text("""
+[maker]
+onion_host = "mymakerabcdef.onion"
+""")
+
+        settings = JoinMarketSettings()
+
+        assert settings.maker.onion_host == "mymakerabcdef.onion"
+
+    def test_maker_onion_host_defaults_to_none(self) -> None:
+        """Without configuration ``onion_host`` defaults to None."""
+        settings = JoinMarketSettings()
+
+        assert settings.maker.onion_host is None
+
     def test_toml_neutrino_settings(
         self, temp_data_dir: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

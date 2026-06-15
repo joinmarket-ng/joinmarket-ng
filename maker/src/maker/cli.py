@@ -347,6 +347,7 @@ def build_maker_config(
         background_full_rescan=settings.wallet.background_full_rescan,
         scan_lookback_blocks=settings.wallet.scan_lookback_blocks,
         tor_control=tor_control_cfg,
+        onion_host=settings.maker.onion_host,
         onion_serving_host=effective_onion_host,
         onion_serving_port=effective_onion_port,
         tor_target_host=effective_target_host,

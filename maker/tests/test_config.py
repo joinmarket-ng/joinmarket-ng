@@ -353,6 +353,38 @@ class TestBuildMakerConfig:
         )
         assert config.max_sats_freeze_reuse == -1
 
+    def test_onion_host_forwarded(self) -> None:
+        """``maker.onion_host`` from settings must reach the MakerConfig (#535).
+
+        Otherwise the documented ``onion_host`` config key is silently ignored
+        and the maker never advertises the configured static .onion address.
+        """
+        from jmcore.settings import JoinMarketSettings
+
+        from maker.cli import build_maker_config
+
+        settings = JoinMarketSettings()
+        settings.maker.onion_host = "mymakerabcdef.onion"
+        config = build_maker_config(
+            settings=settings,
+            mnemonic=TEST_MNEMONIC,
+            passphrase="",
+        )
+        assert config.onion_host == "mymakerabcdef.onion"
+
+    def test_onion_host_defaults_to_none(self) -> None:
+        """Without configuration ``onion_host`` stays None (auto-generated)."""
+        from jmcore.settings import JoinMarketSettings
+
+        from maker.cli import build_maker_config
+
+        config = build_maker_config(
+            settings=JoinMarketSettings(),
+            mnemonic=TEST_MNEMONIC,
+            passphrase="",
+        )
+        assert config.onion_host is None
+
     def test_dual_offers_creates_two_configs(self) -> None:
         """Test that --dual-offers creates both relative and absolute offer configs."""
         from jmcore.settings import JoinMarketSettings
