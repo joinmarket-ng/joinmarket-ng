@@ -136,7 +136,7 @@ modules:
     sources:
       - type: git
         url: https://github.com/joinmarket-webui/jam.git
-        commit: d2fe8f180dbef073cfa3389641359e88f91c27ab
+        commit: 7fccc46b1c7f91a0726c1d5fc783299d572c5ab5
 
   # =========================================================================
   # Module 6: Python application

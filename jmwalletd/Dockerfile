@@ -4,9 +4,9 @@
 # Update with: ./scripts/update-base-images.sh
 # =============================================================================
 ARG PYTHON_VERSION=3.14
-ARG PYTHON_SLIM_DIGEST=sha256:c845af9399020c7e562969a13689e929074a10fd057acd1b1fad06a2fb068e97
+ARG PYTHON_SLIM_DIGEST=sha256:44dd04494ee8f3b538294360e7c4b3acb87c8268e4d0a4828a6500b1eff50061
 ARG NODE_VERSION=24
-ARG NODE_SLIM_DIGEST=sha256:242549cd46785b480c832479a730f4f2a20865d61ea2e404fdb2a5c3d3b73ecf
+ARG NODE_SLIM_DIGEST=sha256:2c87ef9bd3c6a3bd4b472b4bec2ce9d16354b0c574f736c476489d09f560a203
 # JAM frontend is built on a single fixed platform regardless of the target
 # image platform (the build output is static JS that is platform-independent).
 # Pinning JAM_BUILDER_PLATFORM ensures reproducible JS bytes across hosts.
@@ -17,7 +17,7 @@ ARG JAM_BUILDER_PLATFORM=linux/amd64
 
 # JAM frontend: pinned commit hash for reproducible builds (devel branch tip)
 # Update with: ./scripts/update-base-images.sh
-ARG JAM_COMMIT=d2fe8f180dbef073cfa3389641359e88f91c27ab
+ARG JAM_COMMIT=7fccc46b1c7f91a0726c1d5fc783299d572c5ab5
 
 # Pin build tools for reproducible builds
 # setuptools version is stamped into WHEEL metadata (Generator: setuptools (x.y.z))
