@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
+from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 import pytest
+
+if TYPE_CHECKING:
+    from jmwallet.wallet.models import UTXOInfo
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -1378,79 +1382,135 @@ def test_runtime_image_installs_whiptail(component: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_freeze_sorts_utxos_by_path_not_mixdepth_value() -> None:
-    """UTXOs must be sorted by derivation path, not mixdepth/value."""
+def _make_freeze_utxo(
+    txid: str,
+    mixdepth: int,
+    path: str,
+    address: str = "bc1qaddr",
+    value: int = 100000,
+    frozen: bool = False,
+) -> "UTXOInfo":
     from jmwallet.wallet.models import UTXOInfo
 
-    # Create UTXOs with different mixdepths and values
+    return UTXOInfo(
+        txid=txid,
+        vout=0,
+        value=value,
+        mixdepth=mixdepth,
+        path=path,
+        address=address,
+        confirmations=10,
+        scriptpubkey="0014" + "00" * 20,
+        frozen=frozen,
+    )
+
+
+def test_freeze_sorts_utxos_by_path_not_mixdepth_value() -> None:
+    """UTXOs must be sorted by derivation path, not mixdepth/value."""
     utxos = [
-        UTXOInfo(
-            txid="a",
-            vout=0,
-            value=100000,
-            mixdepth=1,
-            path="m/84'/0'/1'/0/1",
-            address="bc1qaaa",
-            confirmations=10,
-            scriptpubkey=b"",
-        ),
-        UTXOInfo(
-            txid="b",
-            vout=0,
-            value=50000,
-            mixdepth=0,
-            path="m/84'/0'/0'/0/0",
-            address="bc1qbbb",
-            confirmations=10,
-            scriptpubkey=b"",
-        ),
-        UTXOInfo(
-            txid="c",
-            vout=0,
-            value=200000,
-            mixdepth=1,
-            path="m/84'/0'/1'/0/0",
-            address="bc1qccc",
-            confirmations=10,
-            scriptpubkey=b"",
-        ),
+        _make_freeze_utxo("a", mixdepth=1, path="m/84'/0'/1'/0/1", value=100000),
+        _make_freeze_utxo("b", mixdepth=0, path="m/84'/0'/0'/0/0", value=50000),
+        _make_freeze_utxo("c", mixdepth=1, path="m/84'/0'/1'/0/0", value=200000),
     ]
 
-    # Sort by path (as implemented)
+    # Sort by path (as the freeze command does before building display items).
     utxos.sort(key=lambda u: u.path)
 
-    # Should be sorted by path, not by mixdepth/value
-    assert utxos[0].txid == "b"  # m/84'/0'/0'/0/0
-    assert utxos[1].txid == "c"  # m/84'/0'/1'/0/0
-    assert utxos[2].txid == "a"  # m/84'/0'/1'/0/1
+    assert [u.txid for u in utxos] == ["b", "c", "a"]
 
 
 def test_freeze_address_truncation_for_long_addresses() -> None:
     """FB addresses >42 chars must be truncated with ... in middle."""
-    # Long FB address (62 chars)
+    from jmwallet.cli.freeze import _format_freeze_address
+
+    # Long FB address (62 chars).
     long_addr = "bc1qa82tuh6vnq0ukc9y5wk4dggxtfqqmn7e9teefea4wn5jle59d6rq98j8jg"
 
-    # Truncation logic as implemented
-    if len(long_addr) > 42:
-        truncated = long_addr[:20] + "..." + long_addr[-19:]
-    else:
-        truncated = long_addr
+    truncated = _format_freeze_address(long_addr, prev_address="")
 
     assert len(truncated) == 42
     assert "..." in truncated
-    # Korrektur: First 20 + ... + last 19
     assert truncated == "bc1qa82tuh6vnq0ukc9y...4wn5jle59d6rq98j8jg"
+
+
+def test_freeze_short_address_not_truncated() -> None:
+    """Short addresses (<=42 chars) must be shown verbatim."""
+    from jmwallet.cli.freeze import _format_freeze_address
+
+    addr = "bc1qshortaddress"
+    assert _format_freeze_address(addr, prev_address="") == addr
 
 
 def test_freeze_duplicate_address_collapsed_to_spaces() -> None:
     """Duplicate addresses must show spaces on subsequent rows."""
-    prev_address = "bc1qtest"
-    current_address = "bc1qtest"
+    from jmwallet.cli.freeze import _format_freeze_address
 
-    # Logic as implemented
-    if current_address == prev_address:
-        addr_str = " " * 42
-    else:
-        addr_str = current_address
-
+    addr_str = _format_freeze_address("bc1qtest", prev_address="bc1qtest")
     assert addr_str == " " * 42
+
+
+def test_freeze_build_display_items_inserts_separators() -> None:
+    """A None separator is inserted between mixdepths, never at the edges."""
+    from jmwallet.cli.freeze import _build_display_items
+
+    utxos = [
+        _make_freeze_utxo("a", mixdepth=0, path="m/84'/0'/0'/0/0"),
+        _make_freeze_utxo("b", mixdepth=0, path="m/84'/0'/0'/0/1"),
+        _make_freeze_utxo("c", mixdepth=2, path="m/84'/0'/2'/0/0"),
+    ]
+
+    items = _build_display_items(utxos)
+
+    # One separator between the md0 group and the md2 group.
+    assert items == [utxos[0], utxos[1], None, utxos[2]]
+    # Never starts or ends with a separator.
+    assert items[0] is not None
+    assert items[-1] is not None
+
+
+def test_freeze_seek_selectable_skips_separators() -> None:
+    """Navigation must skip None separators in both directions."""
+    from jmwallet.cli.freeze import _seek_selectable
+
+    u0 = _make_freeze_utxo("a", mixdepth=0, path="m/84'/0'/0'/0/0")
+    u1 = _make_freeze_utxo("b", mixdepth=1, path="m/84'/0'/1'/0/0")
+    items: list = [u0, None, u1]
+
+    # Moving down from index 0 lands past the separator on index 2.
+    assert _seek_selectable(items, 1, 1) == 2
+    # Moving up from index 2 lands past the separator on index 0.
+    assert _seek_selectable(items, 1, -1) == 0
+
+
+def test_freeze_seek_selectable_returns_start_when_no_selectable() -> None:
+    """If no selectable item exists in the search direction, stay put."""
+    from jmwallet.cli.freeze import _seek_selectable
+
+    u0 = _make_freeze_utxo("a", mixdepth=0, path="m/84'/0'/0'/0/0")
+    items: list = [u0, None]
+
+    # Walking down off the end finds nothing; keep the original index.
+    assert _seek_selectable(items, 1, 1) == 1
+
+
+def test_freeze_build_utxo_line_contains_address_and_amount() -> None:
+    """The rendered line must include the address, amount, and outpoint."""
+    from jmwallet.cli.freeze import _build_utxo_line
+
+    utxo = _make_freeze_utxo(
+        "deadbeefcafe",
+        mixdepth=3,
+        path="m/84'/0'/3'/0/0",
+        address="bc1qexample",
+        value=123456,
+    )
+
+    line = _build_utxo_line(utxo, prev_address="")
+
+    assert "bc1qexample" in line
+    assert "123,456 sats" in line
+    assert "m3" in line
+    assert "deadbeef...:0" in line
+    # A second row with the same address collapses the address column.
+    repeated = _build_utxo_line(utxo, prev_address="bc1qexample")
+    assert "bc1qexample" not in repeated

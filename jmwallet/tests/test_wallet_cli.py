@@ -159,7 +159,7 @@ def test_bip39_import_with_passphrase_zpub_and_address():
             )
 
             # Verify it shows mixdepth 0
-            assert "mixdepth\t0" in result.stdout, "mixdepth 0 header not found"
+            assert "Mixdepth 0\t" in result.stdout, "mixdepth 0 header not found"
 
             # Verify external addresses section
             assert "external addresses\tm/84'/0'/0'/0" in result.stdout, "external path not found"
@@ -896,7 +896,8 @@ def test_info_uses_default_wallet(monkeypatch):
             )
 
             assert result.exit_code == 0, f"info command failed: {result.stdout}"
-            assert "Total Balance:" in result.stdout
+            assert "Total Wallet Balance:" in result.stdout
+            assert "Total Spendable Balance:" in result.stdout
 
 
 # ============================================================================
