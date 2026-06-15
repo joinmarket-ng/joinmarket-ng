@@ -443,30 +443,13 @@ class TestNeutrinoCoinJoin:
             logger.info("Starting taker with Bitcoin Core backend...")
             await taker.start()
 
-            # Wait for directory server and makers to be ready
-            await asyncio.sleep(15)
-
-            # Fetch orderbook
-            logger.info("Fetching orderbook...")
-            offers = await taker.directory_client.fetch_orderbook(
-                max_wait=15.0, min_wait=15.0, quiet_period=0.0
-            )
-            logger.info(f"Found {len(offers)} offers in orderbook")
-
-            if len(offers) < 1:
-                logger.warning("No offers found from neutrino maker")
-                pytest.skip(
-                    "No offers available. Ensure jm-maker-neutrino container is running "
-                    "and has funds"
-                )
-
-            # Filter for neutrino maker offers (if we can identify them)
-            logger.info(f"Available offers: {[o.counterparty for o in offers]}")
-
-            # Update orderbook
-            taker.orderbook_manager.update_offers(offers)
-
-            # Get destination address
+            # Get destination address. do_coinjoin fetches the orderbook
+            # internally; a pre-check fetch is intentionally omitted because two
+            # !orderbook requests in quick succession trigger the maker's per-nick
+            # rate limiter, causing the second (internal) fetch to return zero
+            # offers. With counterparty_count=1 that single dropped response is
+            # fatal. The fresh_docker_makers fixture already gates on makers
+            # having published offers.
             dest_address = taker_wallet.get_new_address(mixdepth=1)
             logger.info(f"Destination address: {dest_address}")
 
@@ -812,29 +795,13 @@ class TestNeutrinoCoinJoin:
             logger.info("Starting taker with neutrino backend...")
             await taker.start()
 
-            # Wait for directory server and makers to be ready
-            await asyncio.sleep(15)
-
-            # Fetch orderbook
-            logger.info("Fetching orderbook...")
-            offers = await taker.directory_client.fetch_orderbook(
-                max_wait=15.0, min_wait=15.0, quiet_period=0.0
-            )
-            logger.info(f"Found {len(offers)} offers in orderbook")
-
-            if len(offers) < 1:
-                logger.warning("No offers found from makers")
-                pytest.skip(
-                    "No offers available. Ensure Docker makers are running and have funds"
-                )
-
-            # Log available offers
-            logger.info(f"Available offers: {[o.counterparty for o in offers]}")
-
-            # Update orderbook
-            taker.orderbook_manager.update_offers(offers)
-
-            # Get destination address (using neutrino backend)
+            # Get destination address (using neutrino backend). do_coinjoin
+            # fetches the orderbook internally; a pre-check fetch is intentionally
+            # omitted because two !orderbook requests in quick succession trigger
+            # the maker's per-nick rate limiter, causing the second (internal)
+            # fetch to return zero offers. With counterparty_count=1 that single
+            # dropped response is fatal. The fresh_docker_makers fixture already
+            # gates on makers having published offers.
             dest_address = taker_wallet.get_new_address(mixdepth=1)
             logger.info(f"Destination address (neutrino): {dest_address}")
 

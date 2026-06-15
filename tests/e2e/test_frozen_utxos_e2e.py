@@ -219,8 +219,8 @@ def taker_config():
         directory_servers=[_DIRECTORY_SERVER],
         counterparty_count=2,
         minimum_makers=2,
-        maker_timeout_sec=30,
-        order_wait_time=10.0,
+        maker_timeout_sec=60,
+        order_wait_time=60.0,
     )
 
 

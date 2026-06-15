@@ -211,7 +211,11 @@ class TestBIP39PassphraseWallet:
         utxos = result.get("unspents", [])
         assert len(utxos) >= 1, f"Bond address should have UTXOs, got: {utxos}"
 
-        bond_value = int(utxos[0]["amount"] * 100_000_000)
+        # The bond address is deterministic (mnemonic + timenumber); on a reused
+        # regtest node it may carry coinbase UTXOs from earlier runs at different
+        # subsidy levels. Compare against the max (the registry and sync-bonds
+        # also pick the highest-value UTXO, so the two sides must agree).
+        bond_value = max(int(u["amount"] * 100_000_000) for u in utxos)
         logger.info(f"Bond funded with {bond_value:,} sats")
 
         # Step 3: Create a NEW wallet instance (simulating recovery)
@@ -239,16 +243,14 @@ class TestBIP39PassphraseWallet:
             f"Should discover at least 1 fidelity bond, found {len(discovered)}"
         )
 
-        # Find our specific bond
-        found_bond = None
-        for utxo in discovered:
-            if utxo.address == bond_address:
-                found_bond = utxo
-                break
-
-        assert found_bond is not None, (
+        # Find our specific bond: pick the highest-value UTXOInfo at the
+        # address, matching the registry's behaviour. On a reused regtest node
+        # there may be multiple UTXOs at this address from earlier test runs.
+        bond_utxos = [u for u in discovered if u.address == bond_address]
+        assert len(bond_utxos) >= 1, (
             f"Should find bond at {bond_address}, found: {[u.address for u in discovered]}"
         )
+        found_bond = max(bond_utxos, key=lambda u: u.value)
 
         assert found_bond.value == bond_value, (
             f"Bond value should be {bond_value}, got {found_bond.value}"
