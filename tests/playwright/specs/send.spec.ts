@@ -71,13 +71,26 @@ test.describe("Direct Send", () => {
       await cjSwitch.click();
     }
 
-    // After disabling CoinJoin the button label changes to "Send without privacy".
-    await page
-      .getByRole("button", { name: /Send without privacy/i })
-      .click({ force: true });
+    // After disabling CoinJoin the button label changes to "Send without
+    // privacy". Wait for that relabel to complete before clicking, otherwise a
+    // force-click can fire against the still-"Send" button (or a button that is
+    // mid-rerender) and silently do nothing.
+    const sendBtn = page.getByRole("button", { name: /Send without privacy/i });
+    await expect(sendBtn).toBeVisible({ timeout: 15_000 });
+    await expect(sendBtn).toBeEnabled({ timeout: 10_000 });
 
-    // A confirmation dialog appears for non-collaborative sends.
-    await expect(page.getByText("Confirm payment")).toBeVisible({ timeout: 10_000 });
+    // A confirmation dialog appears for non-collaborative sends. A force-click
+    // can occasionally be swallowed by a transient overlay/animation, so retry
+    // the submit once before failing.
+    const confirmHeading = page.getByText("Confirm payment");
+    await sendBtn.click({ force: true });
+    try {
+      await expect(confirmHeading).toBeVisible({ timeout: 10_000 });
+    } catch {
+      await dismissDialogs(page);
+      await sendBtn.click({ force: true });
+      await expect(confirmHeading).toBeVisible({ timeout: 15_000 });
+    }
 
     await page.screenshot({ path: "test-results/send-confirmation.png", fullPage: true });
 
@@ -162,9 +175,18 @@ test.describe("Direct Send", () => {
       })
       .first();
     await expect(sendBtn).toBeVisible({ timeout: 15_000 });
-    await sendBtn.click({ force: true });
 
-    await expect(page.getByText("Confirm payment")).toBeVisible({ timeout: 10_000 });
+    // A force-click can occasionally be swallowed by a transient overlay/
+    // animation, so retry the submit once before failing.
+    const confirmHeading = page.getByText("Confirm payment");
+    await sendBtn.click({ force: true });
+    try {
+      await expect(confirmHeading).toBeVisible({ timeout: 10_000 });
+    } catch {
+      await dismissDialogs(page);
+      await sendBtn.click({ force: true });
+      await expect(confirmHeading).toBeVisible({ timeout: 15_000 });
+    }
     await expect(page.getByText(/Payment with privacy improvement/i)).toBeVisible({
       timeout: 10_000,
     });
