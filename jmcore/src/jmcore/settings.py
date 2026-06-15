@@ -1273,11 +1273,13 @@ class TomlConfigSettingsSource(PydanticBaseSettingsSource):
         # Check for explicit config path in environment
         env_path = os.environ.get("JOINMARKET_CONFIG_FILE")
         if env_path:
-            return Path(env_path)
+            return Path(env_path).expanduser()
 
         # Use data directory
         data_dir_env = os.environ.get("JOINMARKET_DATA_DIR")
-        data_dir = Path(data_dir_env) if data_dir_env else Path.home() / ".joinmarket-ng"
+        data_dir = (
+            Path(data_dir_env).expanduser() if data_dir_env else Path.home() / ".joinmarket-ng"
+        )
 
         return data_dir / "config.toml"
 
@@ -1325,9 +1327,22 @@ class TomlConfigSettingsSource(PydanticBaseSettingsSource):
 
 
 def get_config_path() -> Path:
-    """Get the path to the config file."""
+    """Get the path to the config file.
+
+    Resolution order (highest priority first):
+    1. ``JOINMARKET_CONFIG_FILE`` (explicit config file, decoupled from data dir)
+    2. ``$JOINMARKET_DATA_DIR/config.toml``
+    3. ``~/.joinmarket-ng/config.toml``
+
+    ``~`` is expanded so a configured tilde path never becomes a literal
+    ``./~`` segment (see issue #536).
+    """
+    config_file_env = os.environ.get("JOINMARKET_CONFIG_FILE")
+    if config_file_env:
+        return Path(config_file_env).expanduser()
+
     data_dir_env = os.environ.get("JOINMARKET_DATA_DIR")
-    data_dir = Path(data_dir_env) if data_dir_env else Path.home() / ".joinmarket-ng"
+    data_dir = Path(data_dir_env).expanduser() if data_dir_env else Path.home() / ".joinmarket-ng"
     return data_dir / "config.toml"
 
 
@@ -1645,22 +1660,41 @@ def migrate_config(
     return []
 
 
-def ensure_config_file(data_dir: Path | None = None) -> Path:
+def ensure_config_file(
+    data_dir: Path | None = None,
+    config_file: Path | None = None,
+) -> Path:
     """Ensure the config file exists.
 
     On first run the config file is created from the bundled template.
     Existing config files are never modified.
 
+    The config file location is resolved with this priority:
+    1. ``config_file`` argument (explicit override).
+    2. ``JOINMARKET_CONFIG_FILE`` environment variable (set e.g. by the
+       ``--config-file`` CLI flag) so config can live outside the data dir
+       for FHS-style deployments (issue #537).
+    3. ``<data_dir>/config.toml`` (the default, backwards-compatible behaviour).
+
     Args:
         data_dir: Optional data directory path. Uses default if not provided.
+        config_file: Optional explicit config file path that decouples the
+            config location from ``data_dir``.
 
     Returns:
         Path to the config file.
     """
-    if data_dir is None:
-        data_dir = get_default_data_dir()
+    if config_file is not None:
+        config_path = Path(config_file).expanduser()
+    elif os.environ.get("JOINMARKET_CONFIG_FILE"):
+        # An explicit config file was requested via env (e.g. --config-file);
+        # create/read it there rather than under the data dir.
+        config_path = get_config_path()
+    else:
+        if data_dir is None:
+            data_dir = get_default_data_dir()
+        config_path = data_dir / "config.toml"
 
-    config_path = data_dir / "config.toml"
     migrate_config(config_path)
     return config_path
 

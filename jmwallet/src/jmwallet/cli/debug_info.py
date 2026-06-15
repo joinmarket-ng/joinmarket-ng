@@ -405,6 +405,14 @@ def debug_info(
             help="Data directory (default: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)",
         ),
     ] = None,
+    config_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--config-file",
+            envvar="JOINMARKET_CONFIG_FILE",
+            help="Config file path (decoupled from data dir). Defaults to <data-dir>/config.toml",
+        ),
+    ] = None,
     log_level: Annotated[
         str | None,
         typer.Option("--log-level", "-l", help="Log level"),
@@ -415,7 +423,7 @@ def debug_info(
     Outputs system details, package versions, and backend status.
     No wallet keys, addresses, balances, or transaction data is included.
     """
-    settings = setup_cli(log_level, data_dir=data_dir)
+    settings = setup_cli(log_level, data_dir=data_dir, config_file=config_file)
 
     backend = resolve_backend_settings(
         settings,

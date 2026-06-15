@@ -211,6 +211,32 @@ by the Raspiblitz integration.
 On Raspiblitz, the bonus script manages the systemd unit for you; see the
 [TUI guide](README-tui.md).
 
+#### FHS layout: separate config and data directories
+
+By default the config file lives at `<data-dir>/config.toml`. To follow the
+Linux Filesystem Hierarchy Standard (config under `/etc`, state under
+`/var/lib`) pass `--config-file` to decouple the two paths. This pairs well
+with systemd's `ConfigurationDirectory` and `StateDirectory` directives:
+
+```ini
+[Service]
+Type=simple
+DynamicUser=yes
+ConfigurationDirectory=joinmarket
+StateDirectory=joinmarket
+ExecStart=/opt/joinmarket-ng/venv/bin/jm-maker start \
+    --config-file /etc/joinmarket/config.toml \
+    --data-dir /var/lib/joinmarket \
+    --mnemonic-file /var/lib/joinmarket/wallets/default.mnemonic
+```
+
+`--config-file` accepts a path anywhere on disk (the equivalent
+`JOINMARKET_CONFIG_FILE` environment variable also works, and is honored by
+the components that do not take a `--data-dir` flag, such as the directory
+server and orderbook watcher). On first run the config template is created at
+that path; the data directory is used only for wallet state, history, and
+runtime files.
+
 ### Docker
 
 The bundled `docker-compose.yml` uses `restart: unless-stopped` and is the

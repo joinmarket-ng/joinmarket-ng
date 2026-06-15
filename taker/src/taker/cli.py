@@ -441,6 +441,14 @@ def coinjoin(
             help="Data directory (default: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)",
         ),
     ] = None,
+    config_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--config-file",
+            envvar="JOINMARKET_CONFIG_FILE",
+            help="Config file path (decoupled from data dir). Defaults to <data-dir>/config.toml",
+        ),
+    ] = None,
     log_level: Annotated[
         str | None,
         typer.Option("--log-level", "-l", help="Log level"),
@@ -453,7 +461,7 @@ def coinjoin(
     environment variables, and CLI arguments. CLI arguments have the highest priority.
     """
     # Load settings (log_level=None means use settings.logging.level)
-    settings = setup_cli(log_level, data_dir=data_dir)
+    settings = setup_cli(log_level, data_dir=data_dir, config_file=config_file)
 
     # Ensure config file exists
     ensure_config_file(settings.get_data_dir())
@@ -726,6 +734,14 @@ def tumble(
             help="Data directory (default: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)",
         ),
     ] = None,
+    config_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--config-file",
+            envvar="JOINMARKET_CONFIG_FILE",
+            help="Config file path (decoupled from data dir). Defaults to <data-dir>/config.toml",
+        ),
+    ] = None,
     log_level: Annotated[
         str | None,
         typer.Option("--log-level", "-l", help="Log level"),
@@ -738,7 +754,7 @@ def tumble(
     and CLI arguments. CLI arguments have the highest priority.
     """
     # Load settings (log_level=None means use settings.logging.level)
-    settings = setup_cli(log_level, data_dir=data_dir)
+    settings = setup_cli(log_level, data_dir=data_dir, config_file=config_file)
 
     # Ensure config file exists
     ensure_config_file(settings.get_data_dir())
@@ -904,14 +920,22 @@ def clear_ignored_makers(
             help="Data directory for JoinMarket files",
         ),
     ] = None,
+    config_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--config-file",
+            envvar="JOINMARKET_CONFIG_FILE",
+            help="Config file path (decoupled from data dir). Defaults to <data-dir>/config.toml",
+        ),
+    ] = None,
 ) -> None:
     """Clear the list of ignored makers."""
     from jmcore.paths import get_ignored_makers_path
-    from jmcore.settings import get_settings
 
-    # Load settings to get data_dir from config if not provided
+    # Load settings so a config file (possibly decoupled via --config-file)
+    # that sets data_dir is honored when no explicit --data-dir is given.
     if data_dir is None:
-        settings = get_settings()
+        settings = setup_cli(None, config_file=config_file)
         data_dir = settings.get_data_dir()
 
     ignored_makers_path = get_ignored_makers_path(data_dir)
@@ -953,6 +977,14 @@ def config_init(
             help="Data directory for JoinMarket files",
         ),
     ] = None,
+    config_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--config-file",
+            envvar="JOINMARKET_CONFIG_FILE",
+            help="Config file path (decoupled from data dir). Defaults to <data-dir>/config.toml",
+        ),
+    ] = None,
 ) -> None:
     """Initialize the config file with default settings."""
     from jmcore.paths import get_default_data_dir
@@ -960,7 +992,7 @@ def config_init(
     if data_dir is None:
         data_dir = get_default_data_dir()
 
-    config_path = ensure_config_file(data_dir)
+    config_path = ensure_config_file(data_dir, config_file=config_file)
     typer.echo(f"Config file created at: {config_path}")
     typer.echo("\nAll settings are commented out by default.")
     typer.echo("Edit the file to customize your configuration.")

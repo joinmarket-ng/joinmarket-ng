@@ -462,6 +462,14 @@ def start(
             help="Data directory for JoinMarket files. Defaults to ~/.joinmarket-ng",
         ),
     ] = None,
+    config_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--config-file",
+            envvar="JOINMARKET_CONFIG_FILE",
+            help="Config file path (decoupled from data dir). Defaults to <data-dir>/config.toml",
+        ),
+    ] = None,
     network: Annotated[
         NetworkType | None,
         typer.Option(
@@ -625,7 +633,7 @@ def start(
     harden_current_process()
 
     # Load settings (log_level=None means use settings.logging.level)
-    settings = setup_cli(log_level, data_dir=data_dir)
+    settings = setup_cli(log_level, data_dir=data_dir, config_file=config_file)
 
     # Ensure config file exists (creates template if not)
     ensure_config_file(settings.get_data_dir())
@@ -772,6 +780,14 @@ def generate_address(
             help="Data directory (default: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)",
         ),
     ] = None,
+    config_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--config-file",
+            envvar="JOINMARKET_CONFIG_FILE",
+            help="Config file path (decoupled from data dir). Defaults to <data-dir>/config.toml",
+        ),
+    ] = None,
     log_level: Annotated[
         str | None,
         typer.Option("--log-level", "-l", help="Log level"),
@@ -779,7 +795,7 @@ def generate_address(
 ) -> None:
     """Generate a new receive address."""
     # Load settings (log_level=None means use settings.logging.level)
-    settings = setup_cli(log_level, data_dir=data_dir)
+    settings = setup_cli(log_level, data_dir=data_dir, config_file=config_file)
 
     # Load mnemonic using unified resolver
     try:
@@ -828,6 +844,14 @@ def config_init(
             help="Data directory for JoinMarket files",
         ),
     ] = None,
+    config_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--config-file",
+            envvar="JOINMARKET_CONFIG_FILE",
+            help="Config file path (decoupled from data dir). Defaults to <data-dir>/config.toml",
+        ),
+    ] = None,
 ) -> None:
     """Initialize the config file with default settings."""
     # Determine data directory
@@ -839,7 +863,7 @@ def config_init(
     if data_dir is None:
         data_dir = get_default_data_dir()
 
-    config_path = ensure_config_file(data_dir)
+    config_path = ensure_config_file(data_dir, config_file=config_file)
     typer.echo(f"Config file created at: {config_path}")
     typer.echo("\nAll settings are commented out by default.")
     typer.echo("Edit the file to customize your configuration.")

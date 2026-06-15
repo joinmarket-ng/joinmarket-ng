@@ -40,6 +40,10 @@ def reset_settings_fixture(
     empty_data_dir = tmp_path / ".joinmarket-ng-defaults"
     empty_data_dir.mkdir(parents=True)
     monkeypatch.setenv("JOINMARKET_DATA_DIR", str(empty_data_dir))
+    # Never let a leaked JOINMARKET_CONFIG_FILE (from another test or the
+    # developer's environment) redirect config reads/writes; tests opt in
+    # explicitly when they need it.
+    monkeypatch.delenv("JOINMARKET_CONFIG_FILE", raising=False)
     reset_settings()
     yield
     reset_settings()
@@ -460,6 +464,21 @@ class TestConfigPath:
 
         config_path = get_config_path()
         assert config_path == Path("/custom/data/config.toml")
+
+    def test_config_file_env_overrides_data_dir(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """JOINMARKET_CONFIG_FILE wins over JOINMARKET_DATA_DIR (#537)."""
+        monkeypatch.setenv("JOINMARKET_DATA_DIR", "/var/lib/joinmarket")
+        monkeypatch.setenv("JOINMARKET_CONFIG_FILE", "/etc/joinmarket/config.toml")
+
+        assert get_config_path() == Path("/etc/joinmarket/config.toml")
+
+    def test_config_path_expands_tilde(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A tilde in JOINMARKET_CONFIG_FILE is expanded (#536)."""
+        fake_home = Path("/home/cfguser")
+        monkeypatch.setenv("HOME", str(fake_home))
+        monkeypatch.setenv("JOINMARKET_CONFIG_FILE", "~/conf/jm.toml")
+
+        assert get_config_path() == fake_home / "conf" / "jm.toml"
 
 
 class TestMakerSettingsCjFeeNormalization:
@@ -1143,3 +1162,35 @@ class TestEnsureConfigFile:
 
         assert result == config_path
         assert config_path.read_text() == original
+
+    def test_explicit_config_file_decouples_from_data_dir(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An explicit config_file is created outside the data dir (#537)."""
+        monkeypatch.delenv("JOINMARKET_CONFIG_FILE", raising=False)
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        config_file = tmp_path / "etc" / "joinmarket" / "config.toml"
+
+        result = ensure_config_file(data_dir, config_file=config_file)
+
+        assert result == config_file
+        assert config_file.exists()
+        assert "[tor]" in config_file.read_text()
+        # The data dir must NOT get its own config.toml.
+        assert not (data_dir / "config.toml").exists()
+
+    def test_config_file_env_var_decouples_from_data_dir(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """JOINMARKET_CONFIG_FILE redirects the created config (#537)."""
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        config_file = tmp_path / "etc" / "config.toml"
+        monkeypatch.setenv("JOINMARKET_CONFIG_FILE", str(config_file))
+
+        result = ensure_config_file(data_dir)
+
+        assert result == config_file
+        assert config_file.exists()
+        assert not (data_dir / "config.toml").exists()

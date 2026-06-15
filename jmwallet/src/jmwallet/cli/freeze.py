@@ -62,6 +62,14 @@ def freeze(
             help="Data directory (default: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)",
         ),
     ] = None,
+    config_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--config-file",
+            envvar="JOINMARKET_CONFIG_FILE",
+            help="Config file path (decoupled from data dir). Defaults to <data-dir>/config.toml",
+        ),
+    ] = None,
     log_level: Annotated[
         str | None,
         typer.Option("--log-level", "-l", help="Log level"),
@@ -79,7 +87,7 @@ def freeze(
     fidelity bonds behave like regular UTXOs: they can be frozen/unfrozen, and
     "unfreeze all" will unfreeze them.
     """
-    settings = setup_cli(log_level, data_dir=data_dir)
+    settings = setup_cli(log_level, data_dir=data_dir, config_file=config_file)
 
     try:
         resolved = resolve_mnemonic(

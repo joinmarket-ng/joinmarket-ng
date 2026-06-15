@@ -63,6 +63,14 @@ def list_bonds(
             help="Data directory (default: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)",
         ),
     ] = None,
+    config_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--config-file",
+            envvar="JOINMARKET_CONFIG_FILE",
+            help="Config file path (decoupled from data dir). Defaults to <data-dir>/config.toml",
+        ),
+    ] = None,
     funded_only: Annotated[
         bool,
         typer.Option("--funded-only", help="Show only funded bonds"),
@@ -94,7 +102,7 @@ def list_bonds(
     --mnemonic-file, taken from --wallet-fingerprint, the configured wallet, or
     auto-detected when only one wallet's registry exists in the data dir.
     """
-    settings = setup_cli(log_level, data_dir=data_dir)
+    settings = setup_cli(log_level, data_dir=data_dir, config_file=config_file)
     resolved_data_dir = data_dir if data_dir else settings.get_data_dir()
 
     from jmwallet.cli._wallet_selection import resolve_wallet_fingerprint
@@ -220,6 +228,14 @@ def generate_bond_address(
             help="Data directory (default: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)",
         ),
     ] = None,
+    config_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--config-file",
+            envvar="JOINMARKET_CONFIG_FILE",
+            help="Config file path (decoupled from data dir). Defaults to <data-dir>/config.toml",
+        ),
+    ] = None,
     no_save: Annotated[
         bool,
         typer.Option("--no-save", help="Do not save the bond to the registry"),
@@ -230,7 +246,7 @@ def generate_bond_address(
     ] = None,
 ) -> None:
     """Generate a fidelity bond (timelocked P2WSH) address."""
-    settings = setup_cli(log_level, data_dir=data_dir)
+    settings = setup_cli(log_level, data_dir=data_dir, config_file=config_file)
 
     try:
         resolved = resolve_mnemonic(
@@ -423,6 +439,14 @@ def import_bond(
             help="Data directory (default: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)",
         ),
     ] = None,
+    config_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--config-file",
+            envvar="JOINMARKET_CONFIG_FILE",
+            help="Config file path (decoupled from data dir). Defaults to <data-dir>/config.toml",
+        ),
+    ] = None,
     log_level: Annotated[
         str | None,
         typer.Option("--log-level", "-l", help="Log level"),
@@ -440,7 +464,7 @@ def import_bond(
         jm-wallet import-bond --path "m/84'/0'/0'/2/73:1740787200"
         jm-wallet import-bond --timenumber 73
     """
-    settings = setup_cli(log_level, data_dir=data_dir)
+    settings = setup_cli(log_level, data_dir=data_dir, config_file=config_file)
 
     try:
         resolved = resolve_mnemonic(
@@ -616,6 +640,14 @@ def sync_bonds(
             help="Data directory (default: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)",
         ),
     ] = None,
+    config_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--config-file",
+            envvar="JOINMARKET_CONFIG_FILE",
+            help="Config file path (decoupled from data dir). Defaults to <data-dir>/config.toml",
+        ),
+    ] = None,
     log_level: Annotated[
         str | None,
         typer.Option("--log-level", "-l", help="Log level"),
@@ -631,7 +663,7 @@ def sync_bonds(
     generate-bond-address. Use recover-bonds instead when you need to discover
     bonds whose addresses are not yet in the registry.
     """
-    settings = setup_cli(log_level, data_dir=data_dir)
+    settings = setup_cli(log_level, data_dir=data_dir, config_file=config_file)
 
     try:
         resolved = resolve_mnemonic(
@@ -824,6 +856,14 @@ def recover_bonds(
             help="Data directory (default: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)",
         ),
     ] = None,
+    config_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--config-file",
+            envvar="JOINMARKET_CONFIG_FILE",
+            help="Config file path (decoupled from data dir). Defaults to <data-dir>/config.toml",
+        ),
+    ] = None,
     log_level: Annotated[
         str | None,
         typer.Option("--log-level", "-l", help="Log level"),
@@ -840,7 +880,7 @@ def recover_bonds(
     Each timenumber (0-959) maps to exactly one address, matching the
     reference JoinMarket implementation.
     """
-    settings = setup_cli(log_level, data_dir=data_dir)
+    settings = setup_cli(log_level, data_dir=data_dir, config_file=config_file)
 
     try:
         resolved = resolve_mnemonic(

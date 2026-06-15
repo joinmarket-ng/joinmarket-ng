@@ -50,6 +50,14 @@ def registry_show(
             help="Data directory (default: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)",
         ),
     ] = None,
+    config_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--config-file",
+            envvar="JOINMARKET_CONFIG_FILE",
+            help="Config file path (decoupled from data dir). Defaults to <data-dir>/config.toml",
+        ),
+    ] = None,
     json_output: Annotated[
         bool,
         typer.Option("--json", "-j", help="Output as JSON"),
@@ -57,7 +65,7 @@ def registry_show(
     log_level: Annotated[str, typer.Option("--log-level", "-l")] = "WARNING",
 ) -> None:
     """Show detailed information about a specific fidelity bond."""
-    settings = setup_cli(log_level, data_dir=data_dir)
+    settings = setup_cli(log_level, data_dir=data_dir, config_file=config_file)
 
     from jmcore.btc_script import disassemble_script
 

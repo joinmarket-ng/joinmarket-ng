@@ -31,6 +31,9 @@ def reset_settings_fixture(
     monkeypatch.delenv("JOINMARKET_CONFIG_FILE", raising=False)
     reset_settings()
     yield
+    # setup_cli() mutates os.environ directly (not via monkeypatch), so clear
+    # JOINMARKET_CONFIG_FILE on teardown to avoid leaking into other tests.
+    os.environ.pop("JOINMARKET_CONFIG_FILE", None)
     reset_settings()
 
 
@@ -161,6 +164,51 @@ class TestSetupCli:
 
         assert os.environ["JOINMARKET_DATA_DIR"] == str(env_dir)
         assert settings.get_data_dir() == env_dir
+
+    def test_setup_cli_config_file_sets_env_var(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """CLI --config-file should set JOINMARKET_CONFIG_FILE before settings load (#537)."""
+        config_file = tmp_path / "etc" / "config.toml"
+        config_file.parent.mkdir()
+        config_file.write_text("[tor]\nsocks_port = 9555\n")
+        monkeypatch.delenv("JOINMARKET_CONFIG_FILE", raising=False)
+
+        settings = setup_cli(config_file=config_file)
+
+        assert os.environ["JOINMARKET_CONFIG_FILE"] == str(config_file)
+        # The decoupled config file is actually read.
+        assert settings.tor.socks_port == 9555
+
+    def test_setup_cli_config_file_decoupled_from_data_dir(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """--config-file and --data-dir resolve independently (FHS layout, #537)."""
+        config_file = tmp_path / "etc" / "joinmarket" / "config.toml"
+        config_file.parent.mkdir(parents=True)
+        config_file.write_text("[maker]\nmin_size = 222222\n")
+        data_dir = tmp_path / "var" / "lib" / "joinmarket"
+        data_dir.mkdir(parents=True)
+        monkeypatch.delenv("JOINMARKET_CONFIG_FILE", raising=False)
+
+        settings = setup_cli(data_dir=data_dir, config_file=config_file)
+
+        assert settings.get_data_dir() == data_dir
+        assert settings.maker.min_size == 222222
+
+    def test_setup_cli_config_file_expands_tilde(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A ``~`` in --config-file is expanded before being exported."""
+        fake_home = tmp_path / "home"
+        fake_home.mkdir()
+        monkeypatch.setenv("HOME", str(fake_home))
+        monkeypatch.delenv("JOINMARKET_CONFIG_FILE", raising=False)
+
+        setup_cli(config_file=Path("~/custom.toml"))
+
+        assert os.environ["JOINMARKET_CONFIG_FILE"] == str(fake_home / "custom.toml")
+        assert "~" not in os.environ["JOINMARKET_CONFIG_FILE"]
 
 
 class TestLoadMnemonicFromFile:

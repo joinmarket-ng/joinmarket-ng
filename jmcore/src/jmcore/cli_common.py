@@ -125,6 +125,7 @@ def setup_logging(level: str = "INFO") -> None:
 def setup_cli(
     log_level: str | None = None,
     data_dir: Path | None = None,
+    config_file: Path | None = None,
 ) -> JoinMarketSettings:
     """
     Common CLI setup: reset settings cache, configure logging, return settings.
@@ -138,12 +139,22 @@ def setup_cli(
     directory, and that any other env-driven defaults (paths, etc.) point at
     the user-specified data directory.
 
+    When ``config_file`` is provided (typically from a CLI ``--config-file``
+    flag), the ``JOINMARKET_CONFIG_FILE`` environment variable is set so that
+    the config is read from (and created at) that explicit path instead of
+    ``<data_dir>/config.toml``. This decouples the configuration file location
+    from the data directory for FHS-style deployments (e.g. ``/etc/joinmarket``
+    config with ``/var/lib/joinmarket`` data); see issue #537.
+
     Args:
         log_level: Log level override from CLI (None means use settings)
         data_dir: Optional CLI override for data directory. When provided,
             ``JOINMARKET_DATA_DIR`` is set in ``os.environ`` so that all
             subsequent settings-loading code paths agree on the same data
             directory.
+        config_file: Optional CLI override for the config file path. When
+            provided, ``JOINMARKET_CONFIG_FILE`` is set in ``os.environ`` so
+            that settings are read from and created at that explicit path.
 
     Returns:
         JoinMarketSettings instance with all sources loaded
@@ -152,6 +163,11 @@ def setup_cli(
         # Honour the user's CLI choice across every code path that reads
         # JOINMARKET_DATA_DIR (settings, paths, subprocesses, etc.).
         os.environ["JOINMARKET_DATA_DIR"] = str(data_dir)
+
+    if config_file is not None:
+        # Decouple the config file from the data dir. Expand ``~`` so a
+        # ``--config-file ~/foo.toml`` does not become a literal path.
+        os.environ["JOINMARKET_CONFIG_FILE"] = str(Path(config_file).expanduser())
 
     # Apply an early logging configuration before loading settings so that
     # informational messages emitted while parsing config.toml (e.g.

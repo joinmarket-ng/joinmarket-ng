@@ -30,11 +30,20 @@ def serve(
             help="Data directory (default: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)",
         ),
     ] = None,
+    config_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--config-file",
+            envvar="JOINMARKET_CONFIG_FILE",
+            help="Config file path (decoupled from data dir). Defaults to <data-dir>/config.toml",
+        ),
+    ] = None,
     no_tls: Annotated[
         bool, typer.Option(envvar="JMWALLETD_NO_TLS", help="Disable TLS (plain HTTP)")
     ] = False,
 ) -> None:
     """Start the wallet daemon HTTP/WebSocket server."""
+    import os
     import ssl
 
     import uvicorn
@@ -46,6 +55,11 @@ def serve(
 
     # Disable core dumps and ptrace before loading wallet secrets.
     harden_current_process()
+
+    # Honour an explicit --config-file so the daemon reads (and creates) its
+    # config outside the data dir when requested (FHS deployments, issue #537).
+    if config_file is not None:
+        os.environ["JOINMARKET_CONFIG_FILE"] = str(Path(config_file).expanduser())
 
     resolved_data_dir = data_dir or get_default_data_dir()
     resolved_data_dir.mkdir(parents=True, exist_ok=True)

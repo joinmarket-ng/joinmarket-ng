@@ -393,6 +393,14 @@ def prepare_certificate_message(
             help="Data directory (default: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)",
         ),
     ] = None,
+    config_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--config-file",
+            envvar="JOINMARKET_CONFIG_FILE",
+            help="Config file path (decoupled from data dir). Defaults to <data-dir>/config.toml",
+        ),
+    ] = None,
     network: Annotated[str | None, typer.Option("--network", "-n", help="Bitcoin network")] = None,
     backend_type: Annotated[
         str | None,
@@ -436,7 +444,7 @@ def prepare_certificate_message(
     Where cert_expiry is the ABSOLUTE period number (current_period + validity_periods).
     The reference implementation validates that current_block < cert_expiry * 2016.
     """
-    settings = setup_cli(log_level, data_dir=data_dir_opt)
+    settings = setup_cli(log_level, data_dir=data_dir_opt, config_file=config_file)
 
     from jmcore.paths import get_default_data_dir
 
@@ -787,6 +795,14 @@ def import_certificate(
             help="Data directory (default: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)",
         ),
     ] = None,
+    config_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--config-file",
+            envvar="JOINMARKET_CONFIG_FILE",
+            help="Config file path (decoupled from data dir). Defaults to <data-dir>/config.toml",
+        ),
+    ] = None,
     skip_verification: Annotated[
         bool,
         typer.Option("--skip-verification", help="Skip signature verification (not recommended)"),
@@ -832,7 +848,7 @@ def import_certificate(
     The signature should be the base64 output from Sparrow's message signing tool,
     using the 'Standard (Electrum)' format.
     """
-    settings = setup_cli(log_level, data_dir=data_dir)
+    settings = setup_cli(log_level, data_dir=data_dir, config_file=config_file)
 
     from coincurve import PrivateKey
     from jmcore.paths import get_default_data_dir

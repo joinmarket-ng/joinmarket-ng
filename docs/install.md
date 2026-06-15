@@ -429,6 +429,11 @@ via `$JOINMARKET_DATA_DIR`. It contains:
 - `wallets/` (encrypted seeds and the fidelity-bond registry)
 - Tor state, log files, and per-wallet caches
 
+The config file normally lives at `<data-dir>/config.toml`, but it can be
+relocated independently of the data directory with the `--config-file` flag
+(or `$JOINMARKET_CONFIG_FILE`). This allows FHS-style deployments such as
+`--config-file /etc/joinmarket/config.toml --data-dir /var/lib/joinmarket`.
+
 ```bash
 rm -rf "${JOINMARKET_DATA_DIR:-$HOME/.joinmarket-ng}"
 ```
