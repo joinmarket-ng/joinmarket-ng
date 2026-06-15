@@ -559,13 +559,6 @@ async def _show_wallet_info(
         # Calculate formatting width for branch balances
         balance_width = len(f"{total_balance + total_frozen:,}")
 
-        # Build Total Balance display with optional FB and frozen suffixes
-        suffix_parts: list[str] = []
-        if fb_balance > 0:
-            suffix_parts.append(f"{fb_balance:,} sats FB")
-        if total_frozen > 0:
-            suffix_parts.append(f"{total_frozen:,} sats frozen")
-
         # Show pending transactions if any
         from jmwallet.history import cleanup_stale_pending_transactions, get_pending_transactions
 
@@ -923,7 +916,7 @@ def _show_extended_wallet_info(
 
         if int_hidden:
             print(
-                f"\t\t\t({ext_hidden} empty addresses hidden; "
+                f"\t\t\t({int_hidden} empty addresses hidden; "
                 f"to display use CLI and pass --show-empty)"
             )
         print(f"Balance: {int_balance:,} sats")
