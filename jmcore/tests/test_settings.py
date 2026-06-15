@@ -657,6 +657,46 @@ class TestJoinMarketSettingsHelpers:
         peers = settings.get_neutrino_add_peers()
         assert isinstance(peers, list)
 
+    def test_data_dir_expands_tilde(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """``data_dir`` with a leading ``~`` is expanded to home (#536)."""
+        fake_home = tmp_path / "home"
+        fake_home.mkdir()
+        monkeypatch.setenv("HOME", str(fake_home))
+
+        settings = JoinMarketSettings(data_dir="~/.joinmarket-ng")
+
+        assert settings.data_dir == fake_home / ".joinmarket-ng"
+        assert not str(settings.data_dir).startswith("~")
+        assert settings.get_data_dir() == fake_home / ".joinmarket-ng"
+
+    def test_data_dir_expands_tilde_from_toml(
+        self, temp_data_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A tilde ``data_dir`` loaded from config.toml is expanded (#536)."""
+        fake_home = temp_data_dir / "home"
+        fake_home.mkdir()
+        monkeypatch.setenv("HOME", str(fake_home))
+        (temp_data_dir / "config.toml").write_text('data_dir = "~/.joinmarket-ng"\n')
+
+        settings = JoinMarketSettings()
+
+        assert settings.data_dir == fake_home / ".joinmarket-ng"
+
+    def test_data_dir_none_stays_none(self) -> None:
+        """An unset ``data_dir`` is left as None (default resolution applies)."""
+        settings = JoinMarketSettings(data_dir=None)
+        assert settings.data_dir is None
+
+    def test_data_dir_empty_string_becomes_none(self) -> None:
+        """An empty/whitespace ``data_dir`` is treated as unset."""
+        settings = JoinMarketSettings(data_dir="   ")
+        assert settings.data_dir is None
+
+    def test_data_dir_absolute_path_unchanged(self) -> None:
+        """An absolute ``data_dir`` is preserved as-is."""
+        settings = JoinMarketSettings(data_dir="/var/lib/joinmarket")
+        assert settings.data_dir == Path("/var/lib/joinmarket")
+
 
 class TestConfigPathEnvVar:
     """Tests for JOINMARKET_CONFIG_FILE environment variable."""
@@ -953,6 +993,26 @@ class TestMigrateConfig:
         result = migrate_config(config_path, template_text="")
 
         assert result == []
+
+    def test_expands_tilde_instead_of_creating_literal_dir(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A ``~`` config path must expand to home, not create ``./~`` (#536)."""
+        fake_home = tmp_path / "home"
+        fake_home.mkdir()
+        monkeypatch.setenv("HOME", str(fake_home))
+        # Run from a separate working directory to detect any stray ``./~``.
+        cwd = tmp_path / "cwd"
+        cwd.mkdir()
+        monkeypatch.chdir(cwd)
+
+        migrate_config(Path("~/.joinmarket-ng/config.toml"), template_text=MINI_TEMPLATE)
+
+        # The file is created under the expanded home directory ...
+        assert (fake_home / ".joinmarket-ng" / "config.toml").exists()
+        # ... and no literal "~" directory is left in the working directory.
+        assert not (cwd / "~").exists()
+        assert list(cwd.iterdir()) == []
 
 
 class TestConfigDiff:

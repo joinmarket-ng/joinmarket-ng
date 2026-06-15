@@ -1174,6 +1174,28 @@ class JoinMarketSettings(BaseSettings):
         description="Data directory (defaults to ~/.joinmarket-ng)",
     )
 
+    @field_validator("data_dir", mode="before")
+    @classmethod
+    def _expand_data_dir(cls, v: Any) -> Any:
+        """Expand ``~``/``~user`` in ``data_dir`` from any source.
+
+        Users frequently write ``data_dir = "~/.joinmarket-ng"`` in
+        ``config.toml`` (or pass it via env). Without expansion pydantic
+        stores it as a literal ``Path("~/.joinmarket-ng")``, which later makes
+        ``migrate_config()`` create a bogus ``./~`` directory and causes the
+        real config to be ignored (issue #536). Expand the home directory here
+        so every consumer of ``data_dir`` sees an absolute path.
+        """
+        if v is None:
+            return v
+        if isinstance(v, str):
+            v = v.strip()
+            if not v:
+                return None
+        if isinstance(v, (str, Path)):
+            return Path(v).expanduser()
+        return v
+
     # Nested settings groups
     tor: TorSettings = Field(default_factory=TorSettings)
     bitcoin: BitcoinSettings = Field(default_factory=BitcoinSettings)
@@ -1602,6 +1624,11 @@ def migrate_config(
     Returns:
         Empty list (kept for backward compatibility).
     """
+    # Defensive expansion: a caller may still pass an un-expanded path (e.g.
+    # ``~/.joinmarket-ng/config.toml``). Expanding here ensures we never create
+    # a literal ``./~`` directory regardless of how data_dir was resolved (#536).
+    config_path = config_path.expanduser()
+
     if template_text is None:
         template_text = _get_bundled_template()
     if template_text is None:
