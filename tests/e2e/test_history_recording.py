@@ -199,23 +199,15 @@ async def test_coinjoin_creates_history_entry(
             # Start taker
             await taker.start()
 
-            # Fetch orderbook
-            offers = await taker.directory_client.fetch_orderbook(
-                max_wait=15.0, min_wait=15.0, quiet_period=0.0
-            )
-            if len(offers) < 2:
-                pytest.skip(f"Need at least 2 offers, found {len(offers)}")
-
-            taker.orderbook_manager.update_offers(offers)
-
             # Get destination address
             dest_address = taker_wallet.get_receive_address(1, 0)
 
-            # Perform CoinJoin
+            # Perform CoinJoin. do_coinjoin fetches the orderbook internally;
+            # a pre-check fetch is omitted to avoid triggering the maker's
+            # rate limiter (two rapid !orderbook requests cause the second one
+            # to be silently rate-limited, returning 0 offers).
             cj_amount = 50_000_000
             print(f"Initiating CoinJoin for {cj_amount:,} sats...")
-            print(f"Taker balance: {taker_balance:,} sats")
-            print(f"Available offers: {len(offers)}")
 
             txid = await taker.do_coinjoin(
                 amount=cj_amount,

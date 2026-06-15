@@ -227,13 +227,31 @@ async def test_sync_bonds_finds_bond_when_base_wallet_already_set_up(
         data_dir=tmp_path,
     )
     await setup_backend.create_wallet()
+    # Snapshot addr() descriptors already in the wallet before this setup
+    # call. On a shared regtest node the wallet file persists across test
+    # runs: unloadwallet only removes it from memory, and create_wallet()
+    # reloads the on-disk file (which may still carry the bond's addr()
+    # descriptor from a previous run of this test). We only care that the
+    # setup call itself does not introduce new bond descriptors.
+    pre_setup_addr_descs = {
+        str(d.get("desc", "")).split("#", 1)[0]
+        for d in await setup_backend.list_descriptors()
+        if str(d.get("desc", "")).split("#", 1)[0].startswith("addr(")
+    }
     await setup_wallet.setup_descriptor_wallet(
         rescan=False, fidelity_bond_addresses=None
     )
     base_descriptors = await setup_backend.list_descriptors()
-    # The bond's addr() descriptor must NOT be present yet.
+    # The bond's addr() descriptor must NOT have been newly added by this
+    # base setup call. Pre-existing descriptors (from a previous run on a
+    # reused regtest node) are excluded from the check.
+    newly_added_addr_descs = {
+        str(d.get("desc", "")).split("#", 1)[0]
+        for d in base_descriptors
+        if str(d.get("desc", "")).split("#", 1)[0].startswith("addr(")
+    } - pre_setup_addr_descs
     assert not any(
-        f"addr({bond_address})" in str(d.get("desc", "")) for d in base_descriptors
+        f"addr({bond_address})" in desc for desc in newly_added_addr_descs
     ), "Bond descriptor should not be imported during base setup"
     await setup_wallet.close()
 
