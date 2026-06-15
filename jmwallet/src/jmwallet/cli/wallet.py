@@ -545,8 +545,12 @@ async def _show_wallet_info(
         # --wallet-fingerprint to cold-wallet bond commands.
         print(f"\nWallet fingerprint: {wallet.wallet_fingerprint}")
 
-        # Get total balance, separating FB balance
-        total_balance = await wallet.get_total_balance(include_fidelity_bonds=False)
+        # Spendable balance: get_total_balance() excludes frozen UTXOs (and,
+        # with include_fidelity_bonds=False, fidelity bonds). It is therefore
+        # the *spendable* total, not the grand total; frozen and FB amounts are
+        # added back explicitly below for the wallet-wide summary and for the
+        # column width.
+        spendable_balance = await wallet.get_total_balance(include_fidelity_bonds=False)
         fb_balance = await wallet.get_fidelity_bond_balance(0)  # FB only in mixdepth 0
         # Calculate total frozen balance across all mixdepths (excluding FB)
         total_frozen = sum(
@@ -557,7 +561,7 @@ async def _show_wallet_info(
         )
 
         # Calculate formatting width for branch balances
-        balance_width = len(f"{total_balance + total_frozen:,}")
+        balance_width = len(f"{spendable_balance + total_frozen:,}")
 
         # Show pending transactions if any
         from jmwallet.history import cleanup_stale_pending_transactions, get_pending_transactions
@@ -638,7 +642,7 @@ async def _show_wallet_info(
         unit_suffix = " sats"
         unit_suffix_width = len(unit_suffix)
 
-        total_str = f"{total_balance + total_frozen + fb_balance:,}{unit_suffix}"
+        total_str = f"{spendable_balance + total_frozen + fb_balance:,}{unit_suffix}"
         print(f"\n{'Total Wallet Balance:':<35}{total_str:>{balance_width + unit_suffix_width}}")
 
         if total_frozen > 0:
@@ -649,7 +653,7 @@ async def _show_wallet_info(
             fb_str = f"{fb_balance:,}{unit_suffix}"
             print(f"{'Fidelity Bonds:':<35}{fb_str:>{balance_width + unit_suffix_width}}")
 
-        spendable_str = f"{total_balance:,}{unit_suffix}"
+        spendable_str = f"{spendable_balance:,}{unit_suffix}"
         print(
             f"{'Total Spendable Balance:':<35}{spendable_str:>{balance_width + unit_suffix_width}}"
         )

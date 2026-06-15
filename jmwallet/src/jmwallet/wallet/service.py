@@ -559,7 +559,12 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin, Wal
     async def get_total_balance(
         self, include_fidelity_bonds: bool = True, min_confirmations: int = 0
     ) -> int:
-        """Get total balance across all mixdepths.
+        """Get the spendable balance across all mixdepths.
+
+        Despite the name, this is the *spendable* total: frozen UTXOs are
+        always excluded, and fidelity bonds are excluded when
+        ``include_fidelity_bonds`` is False. Callers that need the grand total
+        (including frozen funds) must add the frozen amount back themselves.
 
         Args:
             include_fidelity_bonds: If True (default), include fidelity bond UTXOs.
