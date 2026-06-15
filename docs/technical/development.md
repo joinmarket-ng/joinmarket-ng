@@ -27,6 +27,12 @@ Run all checks manually:
 prek run --all-files
 ```
 
+The complexity gate uses `complexipy`:
+
+```bash
+complexipy . --failed --suggest-refactors
+```
+
 Fallback (if prek is unavailable):
 
 ```bash

@@ -810,11 +810,25 @@ class OrderbookAggregator:
             OrderBook with deduplicated offers and calculated bond values
         """
         orderbook = OrderBook(timestamp=datetime.now(UTC))
+        all_offers_with_timestamps = self._collect_live_offers_and_bonds(orderbook)
+        deduplicated_offers = self._deduplicate_bond_backed_offers(all_offers_with_timestamps)
+        self._merge_offers_into_orderbook(orderbook, deduplicated_offers)
+        self._deduplicate_bonds(orderbook)
 
-        # Collect all offers with timestamps from all connected clients
-        # We'll use timestamp to determine which nick's offer to keep when same bond is used
+        if calculate_bonds:
+            self._apply_bond_cache(orderbook)
+            await self._calculate_bond_values(orderbook)
+            self._update_bond_cache(orderbook)
+            self._link_bonds_to_offers(orderbook)
+
+        self._populate_bond_directory_nodes(orderbook)
+        self._enrich_offers_with_health_status(orderbook)
+        return orderbook
+
+    def _collect_live_offers_and_bonds(
+        self, orderbook: OrderBook
+    ) -> list[tuple[Offer, float, str | None, str]]:
         all_offers_with_timestamps: list[tuple[Offer, float, str | None, str]] = []
-
         total_offers_from_directories = 0
         total_bonds_from_directories = 0
 
@@ -824,8 +838,9 @@ class OrderbookAggregator:
             total_offers_from_directories += len(offers_with_ts)
             total_bonds_from_directories += len(bonds)
 
-            # Log detailed info about offers from this directory
-            offers_with_bonds_count = sum(1 for o in offers_with_ts if o.bond_utxo_key)
+            offers_with_bonds_count = sum(
+                1 for offer_ts in offers_with_ts if offer_ts.bond_utxo_key
+            )
             logger.debug(
                 f"Directory {node_id}: {len(offers_with_ts)} offers "
                 f"({offers_with_bonds_count} with bonds), {len(bonds)} bonds"
@@ -846,112 +861,89 @@ class OrderbookAggregator:
             f"Collected {total_offers_from_directories} offers and "
             f"{total_bonds_from_directories} bonds from {len(self.clients)} directories"
         )
+        return all_offers_with_timestamps
 
-        # Deduplicate offers by (bond UTXO, counterparty, oid)
-        # A maker can have multiple offers (different oids) backed by the same bond - we keep all of them
-        # For different makers using the same bond UTXO, keep only the most recent one per oid
-        # This handles the case where a maker restarts with a new nick but same bond
-        # We also track all directory_nodes that announced each offer for statistics
-        #
-        # Key: (bond_utxo_key, oid) - allows multiple oids per bond from same maker
-        # Value: (offer, timestamp, directory_nodes, counterparty) - track counterparty for restart detection
-        bond_oid_to_best_offer: dict[
-            tuple[str, int], tuple[Offer, float, list[str], str]
-        ] = {}  # (bond_utxo, oid) -> (offer, timestamp, directory_nodes, counterparty)
+    def _deduplicate_bond_backed_offers(
+        self, all_offers_with_timestamps: list[tuple[Offer, float, str | None, str]]
+    ) -> list[Offer]:
+        bond_oid_to_best_offer: dict[tuple[str, int], tuple[Offer, float, list[str], str]] = {}
         offers_without_bond: list[Offer] = []
 
-        # Track statistics for logging
         total_offers_processed = len(all_offers_with_timestamps)
         offers_with_bonds = 0
         offers_without_bonds = 0
         bond_replacements = 0
 
         for offer, timestamp, bond_utxo_key, _node_id in all_offers_with_timestamps:
-            if bond_utxo_key:
-                # Offer has a fidelity bond - key by (bond_utxo, oid) to preserve multiple offers
-                offers_with_bonds += 1
-                dedup_key = (bond_utxo_key, offer.oid)
-                existing = bond_oid_to_best_offer.get(dedup_key)
-                if existing is None:
-                    # First offer for this (bond, oid) combination
-                    directory_nodes = [offer.directory_node] if offer.directory_node else []
-                    logger.debug(
-                        f"Bond deduplication: First offer for bond {bond_utxo_key[:20]}... "
-                        f"from {offer.counterparty} (oid={offer.oid})"
-                    )
-                    bond_oid_to_best_offer[dedup_key] = (
-                        offer,
-                        timestamp,
-                        directory_nodes,
-                        offer.counterparty,
-                    )
-                else:
-                    old_offer, old_timestamp, directory_nodes, old_counterparty = existing
-                    # Check if this is the same maker
-                    is_same_maker = old_counterparty == offer.counterparty
-
-                    if is_same_maker:
-                        # Same maker from different directory - merge directory_nodes
-                        if offer.directory_node and offer.directory_node not in directory_nodes:
-                            directory_nodes.append(offer.directory_node)
-                        # Keep newer timestamp but preserve accumulated directory_nodes
-                        if timestamp > old_timestamp:
-                            bond_oid_to_best_offer[dedup_key] = (
-                                offer,
-                                timestamp,
-                                directory_nodes,
-                                offer.counterparty,
-                            )
-                        logger.debug(
-                            f"Bond deduplication: Same maker {offer.counterparty} (oid={offer.oid}) "
-                            f"seen on {len(directory_nodes)} directories for bond {bond_utxo_key[:20]}..."
-                        )
-                    else:
-                        # Different maker using same bond UTXO with same oid
-                        # This is the "maker restart with new nick" scenario
-                        # Only replace if timestamp difference suggests legitimate restart (>60s)
-                        # Otherwise it might be clock skew between directories
-                        time_diff = timestamp - old_timestamp
-
-                        if abs(time_diff) < 60:
-                            # Likely clock skew between directories, not a real restart
-                            # Keep the older one (more stable) and log warning
-                            logger.warning(
-                                f"Bond deduplication: Ignoring potential duplicate from {offer.counterparty} "
-                                f"(oid={offer.oid}) - same bond as {old_offer.counterparty} "
-                                f"(oid={old_offer.oid}) with only {abs(time_diff):.1f}s difference "
-                                f"[bond UTXO: {bond_utxo_key[:20]}...]. Likely clock skew."
-                            )
-                        elif time_diff > 0:
-                            # Newer offer, likely legitimate maker restart
-                            bond_replacements += 1
-                            logger.info(
-                                f"Bond deduplication: Replacing offer from {old_offer.counterparty} "
-                                f"(oid={old_offer.oid}) with {offer.counterparty} (oid={offer.oid}) "
-                                f"[same bond UTXO: {bond_utxo_key[:20]}..., "
-                                f"age_diff={time_diff:.1f}s]"
-                            )
-                            # Reset directory_nodes for the new maker's offer
-                            new_directory_nodes = (
-                                [offer.directory_node] if offer.directory_node else []
-                            )
-                            bond_oid_to_best_offer[dedup_key] = (
-                                offer,
-                                timestamp,
-                                new_directory_nodes,
-                                offer.counterparty,
-                            )
-                        # else: older offer from different maker, ignore
-            else:
-                # Offer without bond
+            if not bond_utxo_key:
                 offers_without_bonds += 1
                 logger.debug(
                     f"Offer without bond from {offer.counterparty} (oid={offer.oid}, "
                     f"ordertype={offer.ordertype.value})"
                 )
                 offers_without_bond.append(offer)
+                continue
 
-        # Only log summary if there's something interesting (replacements or at debug level)
+            offers_with_bonds += 1
+            dedup_key = (bond_utxo_key, offer.oid)
+            existing = bond_oid_to_best_offer.get(dedup_key)
+            if existing is None:
+                directory_nodes = [offer.directory_node] if offer.directory_node else []
+                logger.debug(
+                    f"Bond deduplication: First offer for bond {bond_utxo_key[:20]}... "
+                    f"from {offer.counterparty} (oid={offer.oid})"
+                )
+                bond_oid_to_best_offer[dedup_key] = (
+                    offer,
+                    timestamp,
+                    directory_nodes,
+                    offer.counterparty,
+                )
+                continue
+
+            old_offer, old_timestamp, directory_nodes, old_counterparty = existing
+            if old_counterparty == offer.counterparty:
+                if offer.directory_node and offer.directory_node not in directory_nodes:
+                    directory_nodes.append(offer.directory_node)
+                if timestamp > old_timestamp:
+                    bond_oid_to_best_offer[dedup_key] = (
+                        offer,
+                        timestamp,
+                        directory_nodes,
+                        offer.counterparty,
+                    )
+                logger.debug(
+                    f"Bond deduplication: Same maker {offer.counterparty} (oid={offer.oid}) "
+                    f"seen on {len(directory_nodes)} directories for bond {bond_utxo_key[:20]}..."
+                )
+                continue
+
+            time_diff = timestamp - old_timestamp
+            if abs(time_diff) < 60:
+                logger.warning(
+                    f"Bond deduplication: Ignoring potential duplicate from {offer.counterparty} "
+                    f"(oid={offer.oid}) - same bond as {old_offer.counterparty} "
+                    f"(oid={old_offer.oid}) with only {abs(time_diff):.1f}s difference "
+                    f"[bond UTXO: {bond_utxo_key[:20]}...]. Likely clock skew."
+                )
+                continue
+            if time_diff <= 0:
+                continue
+
+            bond_replacements += 1
+            logger.info(
+                f"Bond deduplication: Replacing offer from {old_offer.counterparty} "
+                f"(oid={old_offer.oid}) with {offer.counterparty} (oid={offer.oid}) "
+                f"[same bond UTXO: {bond_utxo_key[:20]}..., age_diff={time_diff:.1f}s]"
+            )
+            new_directory_nodes = [offer.directory_node] if offer.directory_node else []
+            bond_oid_to_best_offer[dedup_key] = (
+                offer,
+                timestamp,
+                new_directory_nodes,
+                offer.counterparty,
+            )
+
         if bond_replacements > 0:
             logger.info(
                 f"Bond deduplication: Replaced {bond_replacements} offers from makers who "
@@ -966,165 +958,145 @@ class OrderbookAggregator:
                 f"{len(offers_without_bond)} non-bond offers"
             )
 
-        # Build final offers list - set directory_nodes from the accumulated list during bond dedup
         deduplicated_offers: list[Offer] = []
         for offer, _ts, directory_nodes, _counterparty in bond_oid_to_best_offer.values():
             offer.directory_nodes = directory_nodes
             deduplicated_offers.append(offer)
         deduplicated_offers.extend(offers_without_bond)
+        return deduplicated_offers
 
-        # Group offers by (counterparty, oid) to merge across directories
-        # Track all directory_nodes that announced each offer for statistics
-        # NOTE: Bond offers already have directory_nodes populated from bond deduplication
+    def _merge_offers_into_orderbook(
+        self, orderbook: OrderBook, deduplicated_offers: list[Offer]
+    ) -> None:
         offer_key_to_offer: dict[tuple[str, int], Offer] = {}
         for offer in deduplicated_offers:
             key = (offer.counterparty, offer.oid)
             if key not in offer_key_to_offer:
-                # First time seeing this offer
-                # Preserve existing directory_nodes (from bond deduplication) or initialize
                 if not offer.directory_nodes and offer.directory_node:
                     offer.directory_nodes = [offer.directory_node]
                 offer_key_to_offer[key] = offer
-            else:
-                # Duplicate from another directory - merge directory_nodes
-                existing_offer = offer_key_to_offer[key]
-                if (
-                    offer.directory_node
-                    and offer.directory_node not in existing_offer.directory_nodes
-                ):
-                    existing_offer.directory_nodes.append(offer.directory_node)
-                # Merge features from multiple directories
-                for feature, value in offer.features.items():
-                    if value and not existing_offer.features.get(feature):
-                        existing_offer.features[feature] = value
+                continue
 
-        # Add deduplicated offers to orderbook
+            existing_offer = offer_key_to_offer[key]
+            if offer.directory_node and offer.directory_node not in existing_offer.directory_nodes:
+                existing_offer.directory_nodes.append(offer.directory_node)
+            for feature, value in offer.features.items():
+                if value and not existing_offer.features.get(feature):
+                    existing_offer.features[feature] = value
+
         for offer in offer_key_to_offer.values():
             orderbook.offers.append(offer)
-            # Track all unique directory nodes in the orderbook
             for node in offer.directory_nodes:
                 if node not in orderbook.directory_nodes:
                     orderbook.directory_nodes.append(node)
 
-        # Deduplicate bonds by UTXO key while tracking all directories that announced them
+    def _deduplicate_bonds(self, orderbook: OrderBook) -> None:
         unique_bonds: dict[str, FidelityBond] = {}
         for bond in orderbook.fidelity_bonds:
             cache_key = f"{bond.utxo_txid}:{bond.utxo_vout}"
             if cache_key not in unique_bonds:
-                # First time seeing this bond - initialize directory_nodes
                 if bond.directory_node:
                     bond.directory_nodes = [bond.directory_node]
                 unique_bonds[cache_key] = bond
-            else:
-                # Same bond from different directory - merge directory_nodes
-                existing_bond = unique_bonds[cache_key]
-                if bond.directory_node and bond.directory_node not in existing_bond.directory_nodes:
-                    existing_bond.directory_nodes.append(bond.directory_node)
+                continue
+            existing_bond = unique_bonds[cache_key]
+            if bond.directory_node and bond.directory_node not in existing_bond.directory_nodes:
+                existing_bond.directory_nodes.append(bond.directory_node)
         orderbook.fidelity_bonds = list(unique_bonds.values())
 
-        if calculate_bonds:
-            cached_count = 0
-            for bond in orderbook.fidelity_bonds:
-                cache_key = f"{bond.utxo_txid}:{bond.utxo_vout}"
-                if cache_key in self._bond_cache:
-                    cached_bond = self._bond_cache[cache_key]
-                    bond.bond_value = cached_bond.bond_value
-                    bond.amount = cached_bond.amount
-                    bond.utxo_confirmation_timestamp = cached_bond.utxo_confirmation_timestamp
-                    cached_count += 1
-
-            if cached_count > 0:
-                logger.debug(
-                    f"Loaded {cached_count}/{len(orderbook.fidelity_bonds)} bonds from cache"
-                )
-
-            await self._calculate_bond_values(orderbook)
-
-            for bond in orderbook.fidelity_bonds:
-                if bond.bond_value is not None:
-                    cache_key = f"{bond.utxo_txid}:{bond.utxo_vout}"
-                    self._bond_cache[cache_key] = bond
-
-            # Link fidelity bonds to offers
-            # First pass: Link bonds that are already attached to offers (via fidelity_bond_data)
-            for offer in orderbook.offers:
-                if offer.fidelity_bond_data:
-                    matching_bonds = [
-                        b
-                        for b in orderbook.fidelity_bonds
-                        if b.counterparty == offer.counterparty
-                        and b.utxo_txid == offer.fidelity_bond_data.get("utxo_txid")
-                    ]
-                    if matching_bonds and matching_bonds[0].bond_value is not None:
-                        offer.fidelity_bond_value = matching_bonds[0].bond_value
-
-            # Second pass: Link standalone bonds to offers that don't have bond data yet
-            # This handles cases where the bond announcement arrived separately from the offer
-            # (e.g., reference implementation makers responding to !orderbook requests)
-            for offer in orderbook.offers:
-                if not offer.fidelity_bond_data:
-                    # Find any bonds from this counterparty
-                    matching_bonds = [
-                        b for b in orderbook.fidelity_bonds if b.counterparty == offer.counterparty
-                    ]
-                    if matching_bonds:
-                        # Use the bond with highest value (or first if values not calculated)
-                        bond = max(
-                            matching_bonds,
-                            key=lambda b: b.bond_value if b.bond_value is not None else 0,
-                        )
-                        # Attach bond data to offer
-                        if bond.fidelity_bond_data:
-                            offer.fidelity_bond_data = bond.fidelity_bond_data
-                            if bond.bond_value is not None:
-                                offer.fidelity_bond_value = bond.bond_value
-                        logger.debug(
-                            f"Linked standalone bond from {bond.counterparty} "
-                            f"(txid={bond.utxo_txid[:16]}...) to offer oid={offer.oid}"
-                        )
-
-        # Populate bond directory_nodes from linked offers
-        # Bonds are counted in all directories where:
-        # 1. They were directly announced (already in directory_nodes from deduplication)
-        # 2. Their associated offers appeared (merged here)
+    def _apply_bond_cache(self, orderbook: OrderBook) -> None:
+        cached_count = 0
         for bond in orderbook.fidelity_bonds:
-            # Find all offers from this counterparty and collect their directory_nodes
-            maker_offers = [o for o in orderbook.offers if o.counterparty == bond.counterparty]
-            if maker_offers:
-                # Merge offer directory_nodes with bond's existing directory_nodes
-                all_directories: set[str] = set(bond.directory_nodes)  # Start with bond's own
-                for offer in maker_offers:
-                    all_directories.update(offer.directory_nodes)
-                bond.directory_nodes = sorted(all_directories)
-            # else: No offers, keep bond's directory_nodes from deduplication (if any)
+            cache_key = f"{bond.utxo_txid}:{bond.utxo_vout}"
+            if cache_key not in self._bond_cache:
+                continue
+            cached_bond = self._bond_cache[cache_key]
+            bond.bond_value = cached_bond.bond_value
+            bond.amount = cached_bond.amount
+            bond.utxo_confirmation_timestamp = cached_bond.utxo_confirmation_timestamp
+            cached_count += 1
+        if cached_count > 0:
+            logger.debug(f"Loaded {cached_count}/{len(orderbook.fidelity_bonds)} bonds from cache")
 
-        # Populate direct reachability and features from health check cache
-        # This provides valuable information about whether makers are reachable beyond
-        # what the directory server reports, and extracts features from handshake
+    def _update_bond_cache(self, orderbook: OrderBook) -> None:
+        for bond in orderbook.fidelity_bonds:
+            if bond.bond_value is not None:
+                cache_key = f"{bond.utxo_txid}:{bond.utxo_vout}"
+                self._bond_cache[cache_key] = bond
+
+    def _link_bonds_to_offers(self, orderbook: OrderBook) -> None:
         for offer in orderbook.offers:
-            # Try to find the maker's location from any directory client
-            location = None
+            if offer.fidelity_bond_data:
+                matching_bonds = [
+                    bond
+                    for bond in orderbook.fidelity_bonds
+                    if bond.counterparty == offer.counterparty
+                    and bond.utxo_txid == offer.fidelity_bond_data.get("utxo_txid")
+                ]
+                if matching_bonds and matching_bonds[0].bond_value is not None:
+                    offer.fidelity_bond_value = matching_bonds[0].bond_value
+                continue
+
+            matching_bonds = [
+                bond for bond in orderbook.fidelity_bonds if bond.counterparty == offer.counterparty
+            ]
+            if not matching_bonds:
+                continue
+
+            bond = max(
+                matching_bonds,
+                key=lambda candidate: (
+                    candidate.bond_value if candidate.bond_value is not None else 0
+                ),
+            )
+            if bond.fidelity_bond_data:
+                offer.fidelity_bond_data = bond.fidelity_bond_data
+                if bond.bond_value is not None:
+                    offer.fidelity_bond_value = bond.bond_value
+            logger.debug(
+                f"Linked standalone bond from {bond.counterparty} "
+                f"(txid={bond.utxo_txid[:16]}...) to offer oid={offer.oid}"
+            )
+
+    def _populate_bond_directory_nodes(self, orderbook: OrderBook) -> None:
+        offers_by_counterparty: dict[str, list[Offer]] = {}
+        for offer in orderbook.offers:
+            offers_by_counterparty.setdefault(offer.counterparty, []).append(offer)
+
+        for bond in orderbook.fidelity_bonds:
+            maker_offers = offers_by_counterparty.get(bond.counterparty)
+            if not maker_offers:
+                continue
+            all_directories: set[str] = set(bond.directory_nodes)
+            for offer in maker_offers:
+                all_directories.update(offer.directory_nodes)
+            bond.directory_nodes = sorted(all_directories)
+
+    def _enrich_offers_with_health_status(self, orderbook: OrderBook) -> None:
+        location_by_counterparty: dict[str, str] = {}
+        for offer in orderbook.offers:
             for client in self.clients.values():
                 location = client._active_peers.get(offer.counterparty)
                 if location and location != "NOT-SERVING-ONION":
+                    location_by_counterparty[offer.counterparty] = location
                     break
 
-            if location and location != "NOT-SERVING-ONION":
-                # Check if we have health status for this location
-                health_status = self.health_checker.health_status.get(location)
-                if health_status:
-                    offer.directly_reachable = health_status.reachable
-                    # Merge features from handshake if available
-                    # Health check provides authoritative features from direct connection
-                    if health_status.features:
-                        # Merge health check features with existing features
-                        # Health check features take precedence (most recent/direct)
-                        health_features = health_status.features.to_dict()
-                        for feature, value in health_features.items():
-                            if value:  # Only merge true features
-                                offer.features[feature] = value
+        for offer in orderbook.offers:
+            location = location_by_counterparty.get(offer.counterparty)
+            if not location:
+                continue
+            health_status = self.health_checker.health_status.get(location)
+            if health_status is None:
+                continue
 
-        return orderbook
+            offer.directly_reachable = health_status.reachable
+            if not health_status.features:
+                continue
+
+            health_features = health_status.features.to_dict()
+            for feature, value in health_features.items():
+                if value:
+                    offer.features[feature] = value
 
     async def _calculate_bond_value_single(
         self, bond: FidelityBond, current_time: int

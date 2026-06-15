@@ -523,6 +523,37 @@ wait_for_wallet_funder() {
 }
 
 # =============================================================================
+# Wait for makers to publish offers to orderbook watcher
+#
+# Polls the orderbook-watcher HTTP endpoint until at least min_offers offers
+# appear.  This is the definitive signal that makers are connected to the
+# directory and have published their !orderbook responses.  Unlike a fixed
+# sleep, this exits as soon as the condition is met (typically 20-40s) and
+# gives up after max_attempts * 2s = 180s with a non-fatal warning.
+# =============================================================================
+wait_for_maker_offers() {
+    local suite=$1
+    local obwatch_port=$2
+    local min_offers=${3:-2}
+    local max_attempts=${4:-90}
+
+    log_info "[$suite] Waiting for orderbook watcher to have >= ${min_offers} offer(s)..."
+    for i in $(seq 1 $max_attempts); do
+        local n_offers
+        n_offers=$(curl -sf "http://127.0.0.1:${obwatch_port}/orderbook.json" 2>/dev/null \
+            | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('offers', [])))" 2>/dev/null \
+            || echo 0)
+        if [ "${n_offers:-0}" -ge "$min_offers" ]; then
+            log_info "[$suite] Orderbook has ${n_offers} offers (>= ${min_offers}), makers ready"
+            return 0
+        fi
+        sleep 2
+    done
+    log_warning "[$suite] Timed out waiting for ${min_offers} offer(s) in orderbook watcher; proceeding anyway"
+    return 0
+}
+
+# =============================================================================
 # Wait for Tor hidden service
 # =============================================================================
 wait_for_tor() {
@@ -696,7 +727,21 @@ run_suite_unit() {
     local log="${PARALLEL_DIR}/unit.log"
     log_suite "Starting: Unit Tests"
     {
-        COVERAGE_FILE=.coverage.unit pytest -c pytest.ini --fail-on-skip \
+        local pythonpath_components=(
+            "${PROJECT_ROOT}"
+            "${PROJECT_ROOT}/jmcore/src"
+            "${PROJECT_ROOT}/jmwallet/src"
+            "${PROJECT_ROOT}/directory_server/src"
+            "${PROJECT_ROOT}/jmwalletd/src"
+            "${PROJECT_ROOT}/tumbler/src"
+            "${PROJECT_ROOT}/orderbook_watcher/src"
+            "${PROJECT_ROOT}/maker/src"
+            "${PROJECT_ROOT}/taker/src"
+        )
+        local pythonpath
+        pythonpath=$(IFS=:; echo "${pythonpath_components[*]}")
+
+        PYTHONPATH="${pythonpath}" COVERAGE_FILE=.coverage.unit pytest -c pytest.ini --fail-on-skip \
             -lv \
             --cov=jmcore --cov=jmwallet --cov=directory_server --cov=jmwalletd \
             --cov=tumbler \
@@ -712,6 +757,7 @@ run_suite_e2e() {
     local btc_rpc=$(host_port "$suite" btc_rpc)
     local dir_port=$(host_port "$suite" dir)
     local walletd_port=$(host_port "$suite" walletd)
+    local obwatch_port=$(host_port "$suite" obwatch)
     local prefix="${CONTAINER_PREFIX}-${suite}"
 
     log_suite "Starting: E2E Tests ($suite)"
@@ -727,8 +773,7 @@ run_suite_e2e() {
         fi
         wait_for_port "$dir_port" "Directory ($suite)"
         wait_for_wallet_funder "$suite"
-
-        sleep 20  # Wait for makers to connect
+        wait_for_maker_offers "$suite" "$obwatch_port" 2
 
         # E2E tests
         BITCOIN_RPC_URL="http://127.0.0.1:${btc_rpc}" \
@@ -736,6 +781,7 @@ run_suite_e2e() {
         BITCOIN_RPC_PASSWORD=test \
         JMWALLETD_URL="https://127.0.0.1:${walletd_port}" \
         DIRECTORY_PORT="${dir_port}" \
+        OBWATCH_URL="http://127.0.0.1:${obwatch_port}" \
         JM_CONTAINER_PREFIX="${prefix}" \
         COMPOSE_PROJECT_NAME="${PROJECT_PREFIX}-${suite}" \
         COVERAGE_FILE=".coverage.${suite}" \
@@ -749,6 +795,7 @@ run_suite_e2e() {
         BITCOIN_RPC_USER=test \
         BITCOIN_RPC_PASSWORD=test \
         DIRECTORY_PORT="${dir_port}" \
+        OBWATCH_URL="http://127.0.0.1:${obwatch_port}" \
         JM_CONTAINER_PREFIX="${prefix}" \
         COMPOSE_PROJECT_NAME="${PROJECT_PREFIX}-${suite}" \
         COVERAGE_FILE=".coverage.${suite}-docker" \
@@ -767,6 +814,7 @@ run_suite_tumbler() {
     local btc_rpc=$(host_port "$suite" btc_rpc)
     local dir_port=$(host_port "$suite" dir)
     local walletd_port=$(host_port "$suite" walletd)
+    local obwatch_port=$(host_port "$suite" obwatch)
     local prefix="${CONTAINER_PREFIX}-${suite}"
 
     log_suite "Starting: Tumbler E2E Tests ($suite)"
@@ -788,14 +836,14 @@ run_suite_tumbler() {
         fi
         wait_for_port "$dir_port" "Directory ($suite)"
         wait_for_wallet_funder "$suite"
-
-        sleep 20
+        wait_for_maker_offers "$suite" "$obwatch_port" 2
 
         BITCOIN_RPC_URL="http://127.0.0.1:${btc_rpc}" \
         BITCOIN_RPC_USER=test \
         BITCOIN_RPC_PASSWORD=test \
         JMWALLETD_URL="https://127.0.0.1:${walletd_port}" \
         DIRECTORY_PORT="${dir_port}" \
+        OBWATCH_URL="http://127.0.0.1:${obwatch_port}" \
         JM_CONTAINER_PREFIX="${prefix}" \
         COMPOSE_PROJECT_NAME="${PROJECT_PREFIX}-${suite}" \
         COVERAGE_FILE=".coverage.${suite}" \
