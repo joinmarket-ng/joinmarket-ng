@@ -99,6 +99,27 @@ On Raspiblitz, maker control uses systemd via the bonus script. On standalone sy
 | **STATUS** | Display current service status |
 | **BACK** | Return to the main menu |
 
+### Encrypted wallet password handling
+
+If the active wallet is encrypted you are asked for the password **once** when
+starting the maker. How that password is handled depends on your choice:
+
+- If you decline to store the password (the default), it is kept only for the
+  running maker. On Raspiblitz it is staged in a `chmod 600` file
+  (`~/.joinmarket-ng/.maker.env`) that systemd reads via its `EnvironmentFile`
+  directive, and it is removed when the maker stops. It is **never written to
+  `config.toml`**, so the cleartext password is not left on disk. While the
+  maker runs, other wallet commands (info, history, seed, bonds) reuse this
+  staged password and do not prompt again.
+- If you explicitly choose "Store password", it is written to
+  `config.toml` in plain text so the maker can auto-start unattended (including
+  at boot). This is the only path that persists the password on disk.
+
+Note: a temporary (declined) password is not retained across a maker crash. The
+systemd unit restarts the maker on failure, but only a permanently stored
+password lets it decrypt the wallet unattended after a crash or reboot. Use
+"Store password" if you want crash/boot auto-restart.
+
 ## Fidelity Bonds
 
 ![Fidelity Bonds](./media/fidelity-bond-menu.png)

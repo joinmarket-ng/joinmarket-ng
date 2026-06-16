@@ -236,6 +236,40 @@ get_stored_mnemonic_password() {
     echo "$val"
 }
 
+# Helper: Read the temporary wallet password from .maker.env (empty if absent).
+#
+# On Raspiblitz the wallet password (when NOT permanently stored in
+# config.toml) is delivered to the maker process via the systemd
+# EnvironmentFile (.maker.env -> MNEMONIC_PASSWORD). It is intentionally kept
+# out of config.toml so the secret is never left in cleartext on disk after
+# the maker stops. The file uses systemd's double-quoted form with C-style
+# escapes, so we strip the quotes and reverse the \" and \\ escapes here.
+get_maker_env_password() {
+    [ -f "$MAKER_ENV" ] || return 1
+    local line val
+    line=$(grep -m1 '^MNEMONIC_PASSWORD=' "$MAKER_ENV" 2>/dev/null) || return 1
+    val=${line#MNEMONIC_PASSWORD=}
+    # Strip surrounding double quotes and reverse systemd's C-style escapes.
+    if [ "${val#\"}" != "$val" ]; then
+        val=${val#\"}
+        val=${val%\"}
+        val=$(printf '%s' "$val" | sed -e 's/\\"/"/g' -e 's/\\\\/\\/g')
+    fi
+    printf '%s' "$val"
+}
+
+# Helper: Write the wallet password to .maker.env for the systemd
+# EnvironmentFile, using systemd's double-quoted C-escape format so special
+# characters survive. chmod 600. The password is NEVER written to config.toml
+# (no cleartext leak); .maker.env is removed when the maker stops.
+write_maker_env() {
+    local password="$1"
+    local escaped
+    escaped=$(printf '%s' "$password" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+    printf 'MNEMONIC_PASSWORD="%s"\n' "$escaped" > "$MAKER_ENV"
+    chmod 600 "$MAKER_ENV"
+}
+
 # Helper: Comment out (clear) a value in config.toml
 clear_config_value() {
     local key=$1
@@ -541,6 +575,19 @@ ensure_wallet_password() {
         return 0
     fi
 
+    # Temporary password from a running maker (Raspiblitz delivers it via
+    # .maker.env for the systemd EnvironmentFile, never via config.toml).
+    # Reuse it so wallet operations do not prompt while the maker is running.
+    # Verify it first in case the file is stale or belongs to another wallet.
+    local maker_env_pwd
+    maker_env_pwd=$(get_maker_env_password)
+    if [ -n "$maker_env_pwd" ] && verify_wallet_password "$wallet_path" "$maker_env_pwd"; then
+        export MNEMONIC_PASSWORD="$maker_env_pwd"
+        unset maker_env_pwd
+        return 0
+    fi
+    unset maker_env_pwd
+
     # NOTE: Previous version used whiptail --msgbox after whiptail --passwordbox
     # for the mismatch message. This appeared to work because verify_wallet_password()
     # calls jm-wallet (an external process) which refreshes the terminal buffer
@@ -719,6 +766,48 @@ maker_status() {
     else
         echo "Maker Bot: ($MAKER_STATUS)"
     fi
+}
+
+# Helper (Raspiblitz): make the wallet password available to the maker start
+# without prompting twice and without writing the password to config.toml.
+#
+# The Raspiblitz maker runs as a systemd service that cannot prompt, so it
+# reads the password from the .maker.env EnvironmentFile (MNEMONIC_PASSWORD).
+# We prompt ONCE here via whiptail and stage the password into .maker.env so
+# the bonus 'maker-start' does not prompt again (issue: maker asks 2x).
+#
+# Behaviour:
+#   - Unencrypted wallet: nothing to stage.
+#   - Password permanently stored in config.toml: the bonus script / systemd
+#     read it directly, nothing to stage.
+#   - Otherwise: prompt once (reusing an existing .maker.env if a maker is
+#     already running) and write .maker.env (chmod 600). Returns 1 if the
+#     user cancels.
+#
+# IMPORTANT: call inside a subshell so the MNEMONIC_PASSWORD exported by
+# ensure_wallet_password does not leak into the rest of the TUI session:
+#   ( stage_maker_password "$CURRENT_WALLET" ) || ...
+stage_maker_password() {
+    local wallet_path="$1"
+
+    # Unencrypted wallet -- verify-password exits 2 when not encrypted.
+    jm-wallet verify-password -f "$wallet_path" --no-prompt --password "" >/dev/null 2>&1
+    if [ $? -eq 2 ]; then
+        return 0
+    fi
+
+    # Permanently stored in config.toml -- read directly downstream.
+    if [ -n "$(get_stored_mnemonic_password)" ]; then
+        return 0
+    fi
+
+    # Prompt once (ensure_wallet_password also reuses a running maker's
+    # .maker.env) and stage the verified password for the systemd unit.
+    if ! ensure_wallet_password "$wallet_path"; then
+        return 1
+    fi
+    write_maker_env "${MNEMONIC_PASSWORD}"
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -1610,10 +1699,22 @@ if [ "${RASPIBLITZ}" -eq 1 ]; then
                   continue
               fi
               offer_maker_password_storage
-              (
-                  ensure_wallet_password "$CURRENT_WALLET" || exit 1
+              if [ "$RASPIBLITZ" = "1" ]; then
+                  # Raspiblitz: the maker runs under systemd and reads the
+                  # password from .maker.env. Prompt once here and stage it so
+                  # the bonus 'maker-start' does not prompt again. The subshell
+                  # keeps MNEMONIC_PASSWORD out of the rest of the session.
+                  if ! ( stage_maker_password "$CURRENT_WALLET" ); then
+                      pause
+                      continue
+                  fi
                   maker_start
-              )
+              else
+                  (
+                      ensure_wallet_password "$CURRENT_WALLET" || exit 1
+                      maker_start
+                  )
+              fi
               if [ $? -ne 0 ]; then
                   pause
                   continue
@@ -1669,16 +1770,34 @@ if [ "${RASPIBLITZ}" -eq 1 ]; then
               echo "Active wallet: $(basename "$CURRENT_WALLET")"
               echo "Preparing wallet..."
               echo ""
-              (
-                  ensure_wallet_password "$CURRENT_WALLET" || exit 1
+              if [ "$RASPIBLITZ" = "1" ]; then
+                  # Stop first so the bonus script clears the old .maker.env,
+                  # then stage the password once and start. The maker reads it
+                  # from .maker.env (never from config.toml).
                   if [ "$MAKER_STATUS" = "RUNNING" ]; then
                       echo "Stopping Maker Bot..."
                       echo "Please wait..."
-                      maker_stop 2>&1 || exit 1
+                      maker_stop 2>&1
+                  fi
+                  if ! ( stage_maker_password "$CURRENT_WALLET" ); then
+                      pause
+                      clear
+                      continue
                   fi
                   maker_start
-              )
-              RESTART_RC=$?
+                  RESTART_RC=$?
+              else
+                  (
+                      ensure_wallet_password "$CURRENT_WALLET" || exit 1
+                      if [ "$MAKER_STATUS" = "RUNNING" ]; then
+                          echo "Stopping Maker Bot..."
+                          echo "Please wait..."
+                          maker_stop 2>&1 || exit 1
+                      fi
+                      maker_start
+                  )
+                  RESTART_RC=$?
+              fi
               if [ $RESTART_RC -ne 0 ]; then
                   pause
                   clear

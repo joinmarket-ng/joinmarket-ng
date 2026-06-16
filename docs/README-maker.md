@@ -205,8 +205,22 @@ If your mnemonic file is encrypted, the bot needs the password at startup
 and cannot prompt under systemd. Set `mnemonic_password` (the encryption
 password) and/or `bip39_passphrase` (BIP39 25th word) in the `[wallet]`
 section of `~/.joinmarket-ng/config.toml`. Make sure that file is
-`chmod 600` and owned by the service user. This is the same approach used
-by the Raspiblitz integration.
+`chmod 600` and owned by the service user.
+
+To avoid keeping the encryption password in `config.toml`, you can instead
+deliver it to the service environment via the `MNEMONIC_PASSWORD` variable in
+a `chmod 600` `EnvironmentFile` (the maker reads `MNEMONIC_PASSWORD` from the
+environment):
+
+```ini
+[Service]
+EnvironmentFile=-/home/youruser/.joinmarket-ng/.maker.env
+```
+
+This is the approach the Raspiblitz integration uses for passwords the user
+declines to store permanently: the password lives only in `.maker.env` (mode
+600) while the maker runs and is removed on stop, so it is never written to
+`config.toml`.
 
 On Raspiblitz, the bonus script manages the systemd unit for you; see the
 [TUI guide](README-tui.md).

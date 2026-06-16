@@ -976,6 +976,84 @@ def test_tui_script_maker_restart_uses_both_helpers() -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# Raspiblitz single-prompt / no-config-leak maker password handling
+# ---------------------------------------------------------------------------
+
+
+def test_tui_script_defines_maker_env_helpers() -> None:
+    """The script must define the .maker.env password helpers.
+
+    On Raspiblitz the temporary wallet password is delivered to the maker via
+    the systemd EnvironmentFile (.maker.env), NOT config.toml. The TUI needs
+    helpers to write and read it."""
+    content = SCRIPT_PATH.read_text()
+    assert "get_maker_env_password()" in content
+    assert "write_maker_env()" in content
+    assert "stage_maker_password()" in content
+
+
+def test_tui_script_write_maker_env_targets_maker_env_not_config() -> None:
+    """write_maker_env must write MNEMONIC_PASSWORD to .maker.env, never config.
+
+    Regression for the bug where the cleartext password kept reappearing in
+    config.toml: the TUI must stage the password in .maker.env (chmod 600)
+    only."""
+    content = SCRIPT_PATH.read_text()
+    block = content.split("write_maker_env()", 1)[1].split("\n}", 1)[0]
+    assert 'MNEMONIC_PASSWORD="' in block, "must write the env var to .maker.env"
+    assert '"$MAKER_ENV"' in block, "must target the .maker.env file"
+    assert "chmod 600" in block, "must restrict .maker.env permissions"
+    assert "CONFIG_FILE" not in block, "must never touch config.toml"
+    assert "set_config_value" not in block, "must never write config.toml"
+
+
+def test_tui_script_ensure_wallet_password_reads_maker_env() -> None:
+    """ensure_wallet_password must reuse a running maker's .maker.env password.
+
+    After the password is no longer injected into config.toml, wallet queries
+    while the maker runs must still be prompt-free by reading .maker.env."""
+    content = SCRIPT_PATH.read_text()
+    # Anchor on the function definition (the name also appears in comments).
+    block = content.split("ensure_wallet_password() {", 1)[1]
+    block = block.split("\n}", 1)[0]
+    assert "get_maker_env_password" in block, (
+        "ensure_wallet_password must consult .maker.env"
+    )
+    # Must verify the staged password before trusting it.
+    assert "verify_wallet_password" in block
+
+
+def test_tui_script_stage_maker_password_does_not_write_config() -> None:
+    """stage_maker_password must not persist the password to config.toml."""
+    content = SCRIPT_PATH.read_text()
+    block = content.split("stage_maker_password()", 1)[1].split("\n}", 1)[0]
+    assert "write_maker_env" in block, "must stage into .maker.env"
+    assert "set_config_value" not in block, "must never write config.toml"
+    assert "store_password" not in block, "must not store the password permanently"
+
+
+def test_tui_script_maker_start_raspiblitz_uses_stage_not_double_prompt() -> None:
+    """Maker START/RESTART must stage the password once on Raspiblitz.
+
+    Regression for "maker asks for the password 2x": on Raspiblitz the TUI must
+    NOT run ensure_wallet_password before `sudo bonus maker-start` (sudo strips
+    the env, so the bonus script would prompt again). Instead it stages the
+    password via stage_maker_password and lets the bonus script reuse it."""
+    content = SCRIPT_PATH.read_text()
+
+    start_block = content.split("START)", 1)[1].split("STOP)", 1)[0]
+    assert 'RASPIBLITZ" = "1"' in start_block, "START must branch on Raspiblitz"
+    assert "stage_maker_password" in start_block, (
+        "START must stage the password on Raspiblitz"
+    )
+
+    restart_block = content.split("RESTART)", 1)[1].split("BONDS)", 1)[0]
+    assert "stage_maker_password" in restart_block, (
+        "RESTART must stage the password on Raspiblitz"
+    )
+
+
 def test_tui_script_unified_error_message() -> None:
     """All "No wallet" errors must use unified message.
 
