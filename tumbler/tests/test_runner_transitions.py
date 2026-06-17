@@ -33,19 +33,27 @@ from tumbler.runner import RunnerContext, TumbleRunner
 class FakeWalletService:
     name = "TestWallet"
 
-    def __init__(self, balance_sats: int = 5_000_000) -> None:
+    def __init__(self, balance_sats: int = 5_000_000, mixdepth_count: int = 5) -> None:
         self._counter = 0
+        self.mixdepth_count = mixdepth_count
         # Per-(mixdepth, change) index counters mirror WalletService behaviour.
         self._next_index: dict[tuple[int, int], int] = {}
         # Per-mixdepth balance used by the runner's amount_fraction resolver.
-        self._balances: dict[int, int] = {m: balance_sats for m in range(5)}
+        self._balances: dict[int, int] = {m: balance_sats for m in range(mixdepth_count)}
+
+    def _check_mixdepth(self, mixdepth: int) -> None:
+        # Mirror WalletService.get_address: out-of-range mixdepth is an error.
+        if mixdepth >= self.mixdepth_count:
+            raise ValueError(f"Mixdepth {mixdepth} exceeds maximum {self.mixdepth_count}")
 
     def get_next_address_index(self, mixdepth: int, change: int) -> int:
+        self._check_mixdepth(mixdepth)
         idx = self._next_index.get((mixdepth, change), 0)
         self._next_index[(mixdepth, change)] = idx + 1
         return idx
 
     def get_change_address(self, mixdepth: int, index: int) -> str:
+        self._check_mixdepth(mixdepth)
         self._counter += 1
         return f"bcrt1qfake{mixdepth}{index}{self._counter:04d}"
 
@@ -1406,3 +1414,30 @@ class TestInterPhaseWaitLogging:
         assert "sleeping 600s" in wait_logs[0]
         assert "until " in wait_logs[0]
         assert "+" in wait_logs[0] or "-" in wait_logs[0], wait_logs[0]
+
+
+class TestInternalDestinationMixdepth:
+    async def test_internal_wraps_using_wallet_mixdepth_count(self, tmp_path: Path) -> None:
+        async def make_taker(phase: Any) -> FakeTaker:
+            return FakeTaker(phase)
+
+        # (mixdepth_count, current mixdepth, expected next mixdepth after wrap).
+        # The buggy hardcoded "% 5" would request mixdepth 3 (raises), 1 and 0.
+        cases = [(3, 2, 0), (6, 5, 0), (8, 4, 5)]
+        for mixdepth_count, mixdepth, expected_next in cases:
+            ctx = RunnerContext(
+                wallet_service=FakeWalletService(mixdepth_count=mixdepth_count),  # type: ignore[arg-type]
+                wallet_name="RunnerTest",
+                data_dir=tmp_path,
+                taker_factory=make_taker,
+            )
+            runner = TumbleRunner(_plan(tmp_path), ctx)
+            phase = TakerCoinjoinPhase(
+                index=0,
+                mixdepth=mixdepth,
+                amount=100_000,
+                counterparty_count=2,
+                destination="INTERNAL",
+            )
+            address = await runner._resolve_destination(phase)
+            assert address.startswith(f"bcrt1qfake{expected_next}")
