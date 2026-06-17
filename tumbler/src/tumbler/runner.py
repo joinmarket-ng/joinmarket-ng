@@ -435,7 +435,7 @@ class TumbleRunner:
         """Resolve the 'INTERNAL' sentinel to a concrete next-mixdepth address."""
         if phase.destination != "INTERNAL":
             return phase.destination
-        next_mixdepth = (phase.mixdepth + 1) % 5
+        next_mixdepth = (phase.mixdepth + 1) % self.ctx.wallet_service.mixdepth_count
         return self._get_internal_address(next_mixdepth)
 
     def _get_internal_address(self, mixdepth: int) -> str:
