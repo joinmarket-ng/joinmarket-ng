@@ -1114,11 +1114,11 @@ class TestSyncFidelityBondDeduplication:
 
 
 class TestFreezeUnfreezeGuard:
-    """Tests for the locked-fidelity-bond guard in the bulk unfreeze path.
+    """Tests for the fidelity-bond guard in the bulk unfreeze path.
 
-    "Unfreeze all" must skip *still-locked* fidelity bonds (unfreezing them has
-    no effect until the timelock expires) but unfreeze *expired* fidelity bonds
-    like any other UTXO (they are spendable again).
+    Fidelity bonds are managed via the dedicated bond commands, not the freeze
+    manager, so "unfreeze all" must skip *every* fidelity bond (both still-locked
+    and expired) and only unfreeze regular UTXOs.
     """
 
     def _utxos(self) -> list[UTXOInfo]:
@@ -1151,7 +1151,7 @@ class TestFreezeUnfreezeGuard:
                 locktime=future,
                 frozen=True,
             ),
-            # Frozen EXPIRED fidelity bond (locktime in the past) -> unfreeze.
+            # Frozen EXPIRED fidelity bond (locktime in the past) -> skip too.
             UTXOInfo(
                 txid="b" * 64,
                 vout=0,
@@ -1178,22 +1178,23 @@ class TestFreezeUnfreezeGuard:
             ),
         ]
 
-    def test_unfreeze_skips_locked_bonds_but_unfreezes_expired(self) -> None:
-        from jmwallet.cli.freeze import _unfreeze_non_locked_utxos
+    def test_unfreeze_skips_all_bonds_but_unfreezes_regular(self) -> None:
+        from jmwallet.cli.freeze import _unfreeze_regular_utxos
 
         wallet = MagicMock()
         utxos = self._utxos()
 
-        unfrozen_count, skipped_locked_bonds = _unfreeze_non_locked_utxos(wallet, utxos)
+        unfrozen_count, skipped_bonds = _unfreeze_regular_utxos(wallet, utxos)
 
-        # The regular frozen UTXO and the EXPIRED bond are unfrozen; the LOCKED
-        # bond is skipped.
-        assert unfrozen_count == 2
-        assert skipped_locked_bonds == 1
+        # Only the regular frozen UTXO is unfrozen; both bonds (locked AND
+        # expired) are skipped.
+        assert unfrozen_count == 1
+        assert skipped_bonds == 2
         unfrozen_outpoints = {call.args[0] for call in wallet.toggle_freeze_utxo.call_args_list}
-        assert unfrozen_outpoints == {utxos[0].outpoint, utxos[2].outpoint}
-        # The locked bond was never toggled.
+        assert unfrozen_outpoints == {utxos[0].outpoint}
+        # Neither bond was toggled.
         assert utxos[1].outpoint not in unfrozen_outpoints
+        assert utxos[2].outpoint not in unfrozen_outpoints
 
     def test_is_freeze_toggleable(self) -> None:
         from jmwallet.cli.freeze import _is_freeze_toggleable
@@ -1201,12 +1202,88 @@ class TestFreezeUnfreezeGuard:
         regular, locked_bond, expired_bond, _unfrozen = self._utxos()
         # Regular UTXO: toggleable.
         assert _is_freeze_toggleable(regular) is True
-        # Locked fidelity bond: NOT toggleable (timelocked, freezing is a no-op).
+        # Locked fidelity bond: NOT toggleable.
         assert locked_bond.is_locked is True
         assert _is_freeze_toggleable(locked_bond) is False
-        # Expired fidelity bond: toggleable (spendable again, behaves like a UTXO).
+        # Expired fidelity bond: also NOT toggleable (managed via bond commands).
         assert expired_bond.is_locked is False
-        assert _is_freeze_toggleable(expired_bond) is True
+        assert _is_freeze_toggleable(expired_bond) is False
+
+
+class TestFreezeCursorNavigation:
+    """Tests for freeze-TUI cursor navigation skipping bonds and separators."""
+
+    def _items(self) -> list[UTXOInfo | None]:
+        from jmwallet.cli.freeze import _build_display_items
+
+        # mixdepth 0: one bond only; mixdepth 1: one regular UTXO. After sorting
+        # by path the bond (branch 2) sorts after any md0 regular, but here md0
+        # has *only* a bond so index 0 is a non-toggleable bond.
+        utxos = [
+            UTXOInfo(
+                txid="b" * 64,
+                vout=0,
+                value=500_000,
+                address="bc1qbond",
+                confirmations=100,
+                scriptpubkey="0020" + "22" * 32,
+                path="m/84'/0'/0'/2/0:1893456000",
+                mixdepth=0,
+                locktime=1893456000,
+            ),
+            UTXOInfo(
+                txid="a" * 64,
+                vout=0,
+                value=100_000,
+                address="bc1qregular",
+                confirmations=10,
+                scriptpubkey="0014" + "11" * 20,
+                path="m/84'/0'/1'/0/0",
+                mixdepth=1,
+            ),
+        ]
+        return _build_display_items(utxos)
+
+    def test_seek_skips_separators_and_bonds(self) -> None:
+        from jmwallet.cli.freeze import _seek_selectable
+
+        items = self._items()
+        # Layout: [bond(0), None(1), regular(2)].
+        assert items[1] is None
+        # Seeking forward from 0 must skip the bond and the separator and land
+        # on the regular UTXO at index 2.
+        assert _seek_selectable(items, 0, 1) == 2
+
+    def test_seek_falls_back_to_opposite_direction(self) -> None:
+        from jmwallet.cli.freeze import _seek_selectable
+
+        items = self._items()
+        last = len(items) - 1  # the regular UTXO
+        # Seeking *forward* from the last selectable item finds nothing ahead,
+        # so it falls back and stays on a selectable item rather than running
+        # off the end.
+        assert _seek_selectable(items, last, 1) == last
+
+    def test_seek_all_bonds_returns_start(self) -> None:
+        from jmwallet.cli.freeze import _build_display_items, _seek_selectable
+
+        only_bond = _build_display_items(
+            [
+                UTXOInfo(
+                    txid="b" * 64,
+                    vout=0,
+                    value=500_000,
+                    address="bc1qbond",
+                    confirmations=100,
+                    scriptpubkey="0020" + "22" * 32,
+                    path="m/84'/0'/0'/2/0:1893456000",
+                    mixdepth=0,
+                    locktime=1893456000,
+                )
+            ]
+        )
+        # No toggleable item exists; the cursor stays put at the start.
+        assert _seek_selectable(only_bond, 0, 1) == 0
 
 
 # ---------------------------------------------------------------------------

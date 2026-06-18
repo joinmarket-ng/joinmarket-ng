@@ -276,30 +276,30 @@ def _is_freeze_toggleable(utxo: UTXOInfo) -> bool:
     return not utxo.is_fidelity_bond
 
 
-def _unfreeze_non_locked_utxos(wallet: WalletService, utxos: list[UTXOInfo]) -> tuple[int, int]:
-    """Unfreeze every frozen UTXO except still-locked fidelity bonds.
+def _unfreeze_regular_utxos(wallet: WalletService, utxos: list[UTXOInfo]) -> tuple[int, int]:
+    """Unfreeze every frozen regular UTXO, skipping all fidelity bonds.
 
-    A still-locked fidelity bond (``is_locked``) cannot be spent until its
-    timelock expires, so unfreezing it has no effect and is skipped. An
-    *expired* fidelity bond (timelock passed) is treated like a regular UTXO and
-    unfrozen, so "unfreeze all" actually makes it spendable again.
+    Fidelity bonds (both still-locked and expired) are not managed in the
+    freeze manager; they are handled via the dedicated bond commands. So
+    "unfreeze all" only affects regular UTXOs and leaves every bond untouched,
+    regardless of its frozen flag.
 
     Returns:
-        Tuple of (unfrozen_count, skipped_locked_bond_count).
+        Tuple of (unfrozen_count, skipped_bond_count).
     """
     unfrozen_count = 0
-    skipped_locked_bonds = 0
+    skipped_bonds = 0
 
     for utxo in utxos:
         if not utxo.frozen:
             continue
         if not _is_freeze_toggleable(utxo):
-            skipped_locked_bonds += 1
+            skipped_bonds += 1
             continue
         wallet.toggle_freeze_utxo(utxo.outpoint)
         unfrozen_count += 1
 
-    return unfrozen_count, skipped_locked_bonds
+    return unfrozen_count, skipped_bonds
 
 
 def _build_display_items(utxos: list[UTXOInfo]) -> list[UTXOInfo | None]:
@@ -581,9 +581,9 @@ def _toggle_selected_utxo(
     if utxo is None:
         return
 
-    # A still-locked fidelity bond cannot be spent until its timelock expires,
-    # so toggling its frozen flag is a confusing no-op; skip it. Expired
-    # fidelity bonds and regular UTXOs toggle normally.
+    # Fidelity bonds (locked or expired) are managed via the bond commands,
+    # not here, so toggling their frozen flag is disallowed. Regular UTXOs
+    # toggle normally.
     if not _is_freeze_toggleable(utxo):
         state.set_error("Fidelity bond cannot be (un)frozen; use bond commands instead")
     else:
@@ -600,7 +600,7 @@ def _toggle_selected_utxo(
 def _freeze_all_utxos(
     state: _FreezeTUIState, display_items: list[UTXOInfo | None], wallet: WalletService
 ) -> None:
-    """Freeze every toggleable UTXO (skipping still-locked fidelity bonds)."""
+    """Freeze every toggleable UTXO (skipping all fidelity bonds)."""
     try:
         for item in display_items:
             if item is None or not _is_freeze_toggleable(item):
@@ -614,14 +614,13 @@ def _freeze_all_utxos(
 def _unfreeze_all_utxos(
     state: _FreezeTUIState, display_items: list[UTXOInfo | None], wallet: WalletService
 ) -> None:
-    """Unfreeze every non-locked UTXO, reporting skipped locked bonds."""
+    """Unfreeze every frozen regular UTXO, reporting skipped fidelity bonds."""
     try:
         utxo_items = [u for u in display_items if u is not None]
-        _, skipped_locked_bonds = _unfreeze_non_locked_utxos(wallet, utxo_items)
-        if skipped_locked_bonds > 0:
+        _, skipped_bonds = _unfreeze_regular_utxos(wallet, utxo_items)
+        if skipped_bonds > 0:
             state.set_error(
-                f"Skipped {skipped_locked_bonds} locked fidelity bond UTXO(s); "
-                "kept frozen until timelock expires"
+                f"Skipped {skipped_bonds} fidelity bond UTXO(s); manage them with bond commands"
             )
     except OSError as e:
         state.set_error(f"Failed to persist freeze state: {e}")
@@ -698,6 +697,10 @@ def _run_freeze_tui(
     curses.init_pair(5, curses.COLOR_MAGENTA, -1)  # Fidelity bond UTXOs
 
     state = _FreezeTUIState()
+    # Land the cursor on the first selectable (toggleable, non-separator) item
+    # so it never starts on a mixdepth separator or a non-toggleable fidelity
+    # bond (e.g. when mixdepth 0 holds only a bond).
+    state.cursor_pos = _seek_selectable(display_items, 0, 1)
 
     while True:
         error_active = bool(state.error_message) and time.monotonic() < state.error_display_until

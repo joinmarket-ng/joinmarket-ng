@@ -1560,15 +1560,31 @@ def test_freeze_seek_selectable_skips_separators() -> None:
     assert _seek_selectable(items, 1, -1) == 0
 
 
-def test_freeze_seek_selectable_returns_start_when_no_selectable() -> None:
-    """If no selectable item exists in the search direction, stay put."""
+def test_freeze_seek_selectable_falls_back_to_opposite_direction() -> None:
+    """If nothing is selectable ahead, fall back to the opposite direction.
+
+    The cursor must never be stranded on a None separator: when the requested
+    direction has no selectable item, the nearest one behind it is chosen.
+    """
     from jmwallet.cli.freeze import _seek_selectable
 
     u0 = _make_freeze_utxo("a", mixdepth=0, path="m/84'/0'/0'/0/0")
     items: list = [u0, None]
 
-    # Walking down off the end finds nothing; keep the original index.
-    assert _seek_selectable(items, 1, 1) == 1
+    # Walking down off the end from the trailing separator finds nothing ahead,
+    # so it falls back to the selectable UTXO at index 0 instead of staying on
+    # the separator.
+    assert _seek_selectable(items, 1, 1) == 0
+
+
+def test_freeze_seek_selectable_returns_start_when_nothing_selectable() -> None:
+    """With no selectable item in either direction, the index is unchanged."""
+    from jmwallet.cli.freeze import _seek_selectable
+
+    # Only separators: nothing is ever selectable.
+    items: list = [None, None]
+
+    assert _seek_selectable(items, 0, 1) == 0
 
 
 def test_freeze_build_utxo_line_contains_address_and_amount() -> None:
