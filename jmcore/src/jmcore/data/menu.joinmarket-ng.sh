@@ -1268,7 +1268,7 @@ if [ "${RASPIBLITZ}" -eq 1 ]; then
          20 64 9 \
           "BAL"      "View Wallet Info / Balance" \
           "HIST"     "CoinJoin History" \
-          "FREEZE"   "Freeze / Unfreeze UTXOs" \
+          "FREEZE"   "UTXO Freeze Manager" \
           "NEW"      "Create New Wallet (12 or 24-word seed)" \
           "IMP"      "Import Existing Wallet (from seed)" \
           "SEL"      "Select Active Wallet" \

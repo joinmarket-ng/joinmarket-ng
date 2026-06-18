@@ -213,11 +213,6 @@ async def _freeze_utxos(
             for md in range(wallet.mixdepth_count):
                 all_utxos.extend(wallet.utxo_cache.get(md, []))
 
-        # Treat locked FBs as frozen regardless of explicit flag
-        for utxo in all_utxos:
-            if utxo.is_fidelity_bond and utxo.is_locked and not utxo.frozen:
-                utxo.frozen = True
-
         if not all_utxos:
             md_msg = f" in mixdepth {mixdepth_filter}" if mixdepth_filter is not None else ""
             print(f"No UTXOs found{md_msg}.")
@@ -275,11 +270,10 @@ def _show_freeze_status(utxos: list[UTXOInfo]) -> None:
 def _is_freeze_toggleable(utxo: UTXOInfo) -> bool:
     """Whether the user may toggle a UTXO's frozen flag in the freeze manager.
 
-    Still-locked fidelity bonds are not toggleable: they cannot be spent until
-    their timelock expires, so flipping their frozen flag is a confusing no-op.
-    Everything else (regular UTXOs and *expired* fidelity bonds) is toggleable.
+    Fidelity bonds cannot be toggled: they are managed separately via the
+    bond commands and should not be modified in the freeze manager.
     """
-    return not (utxo.is_fidelity_bond and utxo.is_locked)
+    return not utxo.is_fidelity_bond
 
 
 def _unfreeze_non_locked_utxos(wallet: WalletService, utxos: list[UTXOInfo]) -> tuple[int, int]:
@@ -339,20 +333,28 @@ _FREEZE_ADDR_WIDTH = 42
 
 
 def _seek_selectable(display_items: list[UTXOInfo | None], start: int, direction: int) -> int:
-    """Return the nearest selectable (non-``None``) index from ``start``.
+    """Return the nearest selectable index from ``start``.
 
-    ``display_items`` contains ``None`` separators between mixdepths that must
-    never be selectable. Starting at ``start`` (already clamped to a valid
-    range by the caller) this walks in ``direction`` (``+1``/``-1``) skipping
-    separators. If no selectable item is found in that direction, ``start`` is
-    returned unchanged so the cursor stays put rather than landing on a
-    separator.
+    Skips ``None`` separators and non-toggleable UTXOs (fidelity bonds).
     """
     pos = start
-    while 0 <= pos < len(display_items) and display_items[pos] is None:
+
+    # Search in the requested direction
+    while 0 <= pos < len(display_items):
+        item = display_items[pos]
+        if item is not None and _is_freeze_toggleable(item):
+            return pos
         pos += direction
-    if 0 <= pos < len(display_items):
-        return pos
+
+    # If not found, search in the opposite direction from start
+    opposite = -direction
+    pos = start + opposite
+    while 0 <= pos < len(display_items):
+        item = display_items[pos]
+        if item is not None and _is_freeze_toggleable(item):
+            return pos
+        pos += opposite
+
     return start
 
 
@@ -372,14 +374,19 @@ def _format_freeze_address(address: str, prev_address: str) -> str:
 
 def _build_utxo_line(utxo: UTXOInfo, prev_address: str) -> str:
     """Build the single-row text for a UTXO in the freeze TUI."""
-    status = "[F]" if utxo.frozen else "[ ]"
+    # FBs show [!] to indicate special status, regular UTXOs show [F] or [ ]
+    if utxo.is_fidelity_bond:
+        status = "[!]"
+    else:
+        status = "[F]" if utxo.frozen else "[ ]"
+
     amount_str = f"{utxo.value:,} sats"
     conf_str = f"{utxo.confirmations:>8,} conf"
     md_str = f"m{utxo.mixdepth}"
 
     fb_indicator = ""
     if utxo.is_fidelity_bond:
-        fb_indicator = " [FB-LOCKED]" if utxo.is_locked else " [FB]"
+        fb_indicator = " [FB-LOCKED]" if utxo.is_locked else " [FB-EXPIRED]"
 
     label_str = f" ({utxo.label})" if utxo.label else ""
     addr_str = _format_freeze_address(utxo.address, prev_address)
@@ -455,9 +462,30 @@ def _draw_freeze_footer(
     """Draw the separator, optional error line, and footer help lines."""
     import curses
 
-    frozen_count = sum(1 for u in utxo_items if u.frozen)
-    total_frozen_value = sum(u.value for u in utxo_items if u.frozen)
-    total_spendable_value = sum(u.value for u in utxo_items if not u.frozen)
+    def _utxo_word(count: int) -> str:
+        return "UTXOs" if count != 1 else "UTXO"
+
+    def _format_category(value: int, count: int) -> str:
+        """Format category with value and optional UTXO count in parentheses."""
+        if value == 0:
+            return f"{value:,} sats"
+        return f"{value:,} sats ({count} {_utxo_word(count)})"
+
+    # Calculate statistics
+    total_count = len(utxo_items)
+    total_value = sum(u.value for u in utxo_items)
+
+    # FBs (all fidelity bonds, both locked and expired)
+    fb_count = sum(1 for u in utxo_items if u.is_fidelity_bond)
+    fb_value = sum(u.value for u in utxo_items if u.is_fidelity_bond)
+
+    # Frozen (only non-FB UTXOs that are frozen)
+    frozen_count = sum(1 for u in utxo_items if u.frozen and not u.is_fidelity_bond)
+    frozen_value = sum(u.value for u in utxo_items if u.frozen and not u.is_fidelity_bond)
+
+    # Spendable (only non-FB UTXOs that are not frozen)
+    spendable_count = sum(1 for u in utxo_items if not u.frozen and not u.is_fidelity_bond)
+    spendable_value = sum(u.value for u in utxo_items if not u.frozen and not u.is_fidelity_bond)
 
     stdscr.addstr(height - 4, 0, "-" * min(len(_FREEZE_COL_HEADER) + 5, width - 1))
 
@@ -469,10 +497,12 @@ def _draw_freeze_footer(
         except curses.error:
             pass
 
+    # New footer line with clear separation
     footer1 = (
-        f" Frozen: {frozen_count}/{len(utxo_items)} UTXOs | "
-        f"Frozen: {total_frozen_value:,} sats | "
-        f"Spendable: {total_spendable_value:,} sats"
+        f" Total: {_format_category(total_value, total_count)} | "
+        f"FBs: {_format_category(fb_value, fb_count)} | "
+        f"Frozen: {_format_category(frozen_value, frozen_count)} | "
+        f"Spendable: {_format_category(spendable_value, spendable_count)}"
     )
     footer2 = " Space/Tab: toggle | j/k: navigate | a: freeze all | n: unfreeze all | q: exit"
 
@@ -555,7 +585,7 @@ def _toggle_selected_utxo(
     # so toggling its frozen flag is a confusing no-op; skip it. Expired
     # fidelity bonds and regular UTXOs toggle normally.
     if not _is_freeze_toggleable(utxo):
-        state.set_error("Locked fidelity bond cannot be (un)frozen; it is timelocked")
+        state.set_error("Fidelity bond cannot be (un)frozen; use bond commands instead")
     else:
         try:
             wallet.toggle_freeze_utxo(utxo.outpoint)
