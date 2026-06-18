@@ -60,6 +60,43 @@ def test_root_help_shows_completion_options() -> None:
     assert "--show-completion" in output
 
 
+class TestExtendedInfoColorGating:
+    """The extended wallet-info view must only emit ANSI colors on a TTY.
+
+    Regression guard: emitting raw escape codes unconditionally corrupts
+    piped/redirected output (e.g. ``jm-wallet info --extended > file`` or in CI
+    logs) and broke the plain-text ``Mixdepth 0\\t`` contract that downstream
+    consumers and tests rely on.
+    """
+
+    def test_colorize_suppressed_when_not_a_tty(self) -> None:
+        from jmwallet.cli import wallet as wallet_cli
+
+        with patch("sys.stdout.isatty", return_value=False):
+            out = wallet_cli._colorize("Mixdepth 0", wallet_cli._ANSI_BOLD_CYAN)
+        assert out == "Mixdepth 0"
+        assert "\033[" not in out
+
+    def test_colorize_emitted_on_a_tty(self) -> None:
+        from jmwallet.cli import wallet as wallet_cli
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("NO_COLOR", None)
+            with patch("sys.stdout.isatty", return_value=True):
+                out = wallet_cli._colorize("Mixdepth 0", wallet_cli._ANSI_BOLD_CYAN)
+        assert out.startswith(wallet_cli._ANSI_BOLD_CYAN)
+        assert out.endswith(wallet_cli._ANSI_RESET)
+        assert "Mixdepth 0" in out
+
+    def test_no_color_env_disables_colors_even_on_tty(self) -> None:
+        from jmwallet.cli import wallet as wallet_cli
+
+        with patch.dict(os.environ, {"NO_COLOR": "1"}, clear=False):
+            with patch("sys.stdout.isatty", return_value=True):
+                out = wallet_cli._colorize("Mixdepth 0", wallet_cli._ANSI_BOLD_CYAN)
+        assert out == "Mixdepth 0"
+
+
 def test_bip39_import_with_passphrase_zpub_and_address():
     """
     E2E test: Import a BIP39 mnemonic with passphrase via CLI and verify zpub and address.

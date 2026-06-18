@@ -37,6 +37,38 @@ if TYPE_CHECKING:
     from jmwallet.wallet.service import WalletService
 
 
+# ANSI SGR codes used by the extended wallet-info view. Kept as named
+# constants so the call sites stay readable and the escape sequences are not
+# scattered as raw literals.
+_ANSI_RESET = "\033[0m"
+_ANSI_BOLD_YELLOW = "\033[1;33m"
+_ANSI_BOLD_WHITE = "\033[1;37m"
+_ANSI_BOLD_CYAN = "\033[1;36m"
+_ANSI_CYAN = "\033[0;36m"
+
+
+def _color_enabled() -> bool:
+    """Whether ANSI colors should be emitted to stdout.
+
+    Colors are only safe on an interactive terminal. When stdout is piped or
+    redirected (``jm-wallet info --extended > file`` / ``| less`` / CI logs),
+    raw escape codes corrupt the output and break downstream parsing, so they
+    are suppressed. The ``NO_COLOR`` convention (https://no-color.org) is also
+    honored. This mirrors the TTY guards already used elsewhere in the CLI
+    (e.g. the freeze manager and the interactive UTXO selector).
+    """
+    if os.environ.get("NO_COLOR") is not None:
+        return False
+    return sys.stdout.isatty()
+
+
+def _colorize(text: str, code: str) -> str:
+    """Wrap ``text`` in an ANSI ``code`` when colors are enabled, else return it unchanged."""
+    if not _color_enabled():
+        return text
+    return f"{code}{text}{_ANSI_RESET}"
+
+
 @app.command("import")
 def import_mnemonic(
     word_count: Annotated[
@@ -653,7 +685,7 @@ async def _show_wallet_info(
         # Calculate total: spendable + frozen + all FBs (locked + expired)
         total_balance = spendable_balance + total_frozen + fb_balance
         total_str = f"{total_balance:,}{unit_suffix}"
-        header = f"\033[1;33m{'Total Wallet Balance:':<35}\033[0m"
+        header = _colorize(f"{'Total Wallet Balance:':<35}", _ANSI_BOLD_YELLOW)
         print(f"\n{header}{total_str:>{balance_width + unit_suffix_width}}")
 
         # Subtract frozen UTXOs (not spendable)
@@ -895,7 +927,7 @@ def _show_extended_wallet_info(
                 frozen_addresses.add(utxo.address)
 
     # Print legend for address statuses
-    print("\n\033[1;37mAddress status legend:\033[0m")
+    print(f"\n{_colorize('Address status legend:', _ANSI_BOLD_WHITE)}")
     print("  new           - Unused, safe for receiving")
     print("  deposit       - Address with funds from internal or external sources")
     print("  cj-out        - CoinJoin output (mixed funds)")
@@ -923,7 +955,7 @@ def _show_extended_wallet_info(
 
         print()  # Visual separator before mixdepths 0-4
 
-        print(f"\033[1;36mMixdepth {md}\033[0m\t{zpub}")
+        print(f"{_colorize(f'Mixdepth {md}', _ANSI_BOLD_CYAN)}\t{zpub}")
 
         # External addresses (receive / deposit)
         ext_addresses = wallet.get_address_info_for_mixdepth(
@@ -931,7 +963,7 @@ def _show_extended_wallet_info(
         )
         # Get the external branch zpub path
         ext_path = f"m/84'/{0 if wallet.network == 'mainnet' else 1}'/{md}'/0"
-        print(f"\033[0;36mexternal addresses\033[0m\t{ext_path}\t{zpub}")
+        print(f"{_colorize('external addresses', _ANSI_CYAN)}\t{ext_path}\t{zpub}")
 
         ext_balance = 0
         ext_balance, ext_hidden = _print_branch_addresses(
@@ -963,7 +995,7 @@ def _show_extended_wallet_info(
             md, 1, gap_limit, used_addresses, history_addresses
         )
         int_path = f"m/84'/{0 if wallet.network == 'mainnet' else 1}'/{md}'/1"
-        print(f"\033[0;36minternal addresses\033[0m\t{int_path}")
+        print(f"{_colorize('internal addresses', _ANSI_CYAN)}\t{int_path}")
 
         int_balance, int_hidden = _print_branch_addresses(
             int_addresses,
@@ -997,7 +1029,7 @@ def _show_extended_wallet_info(
                 bond_path = (
                     f"m/84'/{0 if wallet.network == 'mainnet' else 1}'/0'/{FIDELITY_BOND_BRANCH}"
                 )
-                print(f"\033[0;36mfidelity bond addresses\033[0m\t{bond_path}\t{zpub}")
+                print(f"{_colorize('fidelity bond addresses', _ANSI_CYAN)}\t{bond_path}\t{zpub}")
 
                 bond_balance = 0
                 bond_locked = 0  # Locked balance (not yet expired)
@@ -1058,17 +1090,10 @@ def _show_extended_wallet_info(
 
         # For mixdepth 0, add FB balance to total (FBs are not spendable)
         if md == 0 and bond_addresses:
-            bond_balance = sum(addr_info.balance for addr_info in bond_addresses)
-            total_md_balance += bond_balance
-            print(
-                f"\033[0;36mBalance for mixdepth {md}:\033[0m\t{total_md_balance:,} sats "
-                f"(spendable: {spendable_md:,} sats)"
-            )
-        else:
-            print(
-                f"\033[0;36mBalance for mixdepth {md}:\033[0m\t{total_md_balance:,} sats "
-                f"(spendable: {spendable_md:,} sats)"
-            )
+            total_md_balance += sum(addr_info.balance for addr_info in bond_addresses)
+
+        md_label = _colorize(f"Balance for mixdepth {md}:", _ANSI_CYAN)
+        print(f"{md_label}\t{total_md_balance:,} sats (spendable: {spendable_md:,} sats)")
         print("-" * 89)
 
 
