@@ -168,6 +168,10 @@ The full CLI reference below is auto-generated from command `--help` output.
 │                                          ~/.joinmarket-ng or                 │
 │                                          $JOINMARKET_DATA_DIR)               │
 │                                          [env var: JOINMARKET_DATA_DIR]      │
+│ --config-file                      PATH  Config file path (decoupled from    │
+│                                          data dir). Defaults to              │
+│                                          <data-dir>/config.toml              │
+│                                          [env var: JOINMARKET_CONFIG_FILE]   │
 │ --funded-only                            Show only funded bonds              │
 │ --active-only                            Show only active bonds              │
 │ --json                     -j            Output as JSON                      │
@@ -199,6 +203,11 @@ The full CLI reference below is auto-generated from command `--help` output.
 │                                             ~/.joinmarket-ng or              │
 │                                             $JOINMARKET_DATA_DIR)            │
 │                                             [env var: JOINMARKET_DATA_DIR]   │
+│ --config-file                      PATH     Config file path (decoupled from │
+│                                             data dir). Defaults to           │
+│                                             <data-dir>/config.toml           │
+│                                             [env var:                        │
+│                                             JOINMARKET_CONFIG_FILE]          │
 │ --no-save                                   Do not save the bond to the      │
 │                                             registry                         │
 │ --log-level                -l      TEXT     Log level                        │
@@ -243,6 +252,11 @@ The full CLI reference below is auto-generated from command `--help` output.
 │                                             ~/.joinmarket-ng or              │
 │                                             $JOINMARKET_DATA_DIR)            │
 │                                             [env var: JOINMARKET_DATA_DIR]   │
+│ --config-file                      PATH     Config file path (decoupled from │
+│                                             data dir). Defaults to           │
+│                                             <data-dir>/config.toml           │
+│                                             [env var:                        │
+│                                             JOINMARKET_CONFIG_FILE]          │
 │ --log-level                -l      TEXT     Log level                        │
 │ --help                                      Show this message and exit.      │
 ╰──────────────────────────────────────────────────────────────────────────────╯
@@ -278,6 +292,10 @@ The full CLI reference below is auto-generated from command `--help` output.
 │                                          ~/.joinmarket-ng or                 │
 │                                          $JOINMARKET_DATA_DIR)               │
 │                                          [env var: JOINMARKET_DATA_DIR]      │
+│ --config-file                      PATH  Config file path (decoupled from    │
+│                                          data dir). Defaults to              │
+│                                          <data-dir>/config.toml              │
+│                                          [env var: JOINMARKET_CONFIG_FILE]   │
 │ --log-level                -l      TEXT  Log level                           │
 │ --help                                   Show this message and exit.         │
 ╰──────────────────────────────────────────────────────────────────────────────╯
@@ -314,6 +332,10 @@ The full CLI reference below is auto-generated from command `--help` output.
 │                                          ~/.joinmarket-ng or                 │
 │                                          $JOINMARKET_DATA_DIR)               │
 │                                          [env var: JOINMARKET_DATA_DIR]      │
+│ --config-file                      PATH  Config file path (decoupled from    │
+│                                          data dir). Defaults to              │
+│                                          <data-dir>/config.toml              │
+│                                          [env var: JOINMARKET_CONFIG_FILE]   │
 │ --log-level                -l      TEXT  Log level                           │
 │ --help                                   Show this message and exit.         │
 ╰──────────────────────────────────────────────────────────────────────────────╯
@@ -461,6 +483,10 @@ The full CLI reference below is auto-generated from command `--help` output.
 │                                        ~/.joinmarket-ng or                   │
 │                                        $JOINMARKET_DATA_DIR)                 │
 │                                        [env var: JOINMARKET_DATA_DIR]        │
+│ --config-file                 PATH     Config file path (decoupled from data │
+│                                        dir). Defaults to                     │
+│                                        <data-dir>/config.toml                │
+│                                        [env var: JOINMARKET_CONFIG_FILE]     │
 │ --network             -n      TEXT     Bitcoin network                       │
 │ --backend             -b      TEXT     Backend: descriptor_wallet | neutrino │
 │ --rpc-url                     TEXT     [env var: BITCOIN_RPC_URL]            │
@@ -521,6 +547,10 @@ The full CLI reference below is auto-generated from command `--help` output.
 │                                        ~/.joinmarket-ng or                   │
 │                                        $JOINMARKET_DATA_DIR)                 │
 │                                        [env var: JOINMARKET_DATA_DIR]        │
+│ --config-file                 PATH     Config file path (decoupled from data │
+│                                        dir). Defaults to                     │
+│                                        <data-dir>/config.toml                │
+│                                        [env var: JOINMARKET_CONFIG_FILE]     │
 │ --skip-verification                    Skip signature verification (not      │
 │                                        recommended)                          │
 │ --network             -n      TEXT     Bitcoin network                       │
@@ -654,6 +684,9 @@ The full CLI reference below is auto-generated from command `--help` output.
 │ --data-dir              PATH  Data directory (default: ~/.joinmarket-ng or   │
 │                               $JOINMARKET_DATA_DIR)                          │
 │                               [env var: JOINMARKET_DATA_DIR]                 │
+│ --config-file           PATH  Config file path (decoupled from data dir).    │
+│                               Defaults to <data-dir>/config.toml             │
+│                               [env var: JOINMARKET_CONFIG_FILE]              │
 │ --log-level     -l      TEXT  Log level                                      │
 │ --help                        Show this message and exit.                    │
 ╰──────────────────────────────────────────────────────────────────────────────╯
@@ -696,6 +729,11 @@ The full CLI reference below is auto-generated from command `--help` output.
 │                                             ~/.joinmarket-ng or              │
 │                                             $JOINMARKET_DATA_DIR)            │
 │                                             [env var: JOINMARKET_DATA_DIR]   │
+│ --config-file                      PATH     Config file path (decoupled from │
+│                                             data dir). Defaults to           │
+│                                             <data-dir>/config.toml           │
+│                                             [env var:                        │
+│                                             JOINMARKET_CONFIG_FILE]          │
 │ --log-level                -l      TEXT     Log level                        │
 │ --help                                      Show this message and exit.      │
 ╰──────────────────────────────────────────────────────────────────────────────╯
@@ -727,6 +765,11 @@ The full CLI reference below is auto-generated from command `--help` output.
 │                                             ~/.joinmarket-ng or              │
 │                                             $JOINMARKET_DATA_DIR)            │
 │                                             [env var: JOINMARKET_DATA_DIR]   │
+│ --config-file                      PATH     Config file path (decoupled from │
+│                                             data dir). Defaults to           │
+│                                             <data-dir>/config.toml           │
+│                                             [env var:                        │
+│                                             JOINMARKET_CONFIG_FILE]          │
 │ --mnemonic-file            -f      PATH     Path to mnemonic file. When      │
 │                                             provided, the history is         │
 │                                             filtered to entries belonging to │
@@ -796,6 +839,10 @@ The full CLI reference below is auto-generated from command `--help` output.
 │                                          ~/.joinmarket-ng or                 │
 │                                          $JOINMARKET_DATA_DIR)               │
 │                                          [env var: JOINMARKET_DATA_DIR]      │
+│ --config-file                      PATH  Config file path (decoupled from    │
+│                                          data dir). Defaults to              │
+│                                          <data-dir>/config.toml              │
+│                                          [env var: JOINMARKET_CONFIG_FILE]   │
 │ --json                     -j            Output as JSON                      │
 │ --log-level                -l      TEXT  [default: WARNING]                  │
 │ --help                                   Show this message and exit.         │
@@ -858,6 +905,12 @@ The full CLI reference below is auto-generated from command `--help` output.
 │                                                       $JOINMARKET_DATA_DIR)  │
 │                                                       [env var:              │
 │                                                       JOINMARKET_DATA_DIR]   │
+│ --config-file                                PATH     Config file path       │
+│                                                       (decoupled from data   │
+│                                                       dir). Defaults to      │
+│                                                       <data-dir>/config.toml │
+│                                                       [env var:              │
+│                                                       JOINMARKET_CONFIG_FIL… │
 │ --log-level            -l                    TEXT     Log level              │
 │ --help                                                Show this message and  │
 │                                                       exit.                  │
@@ -1027,6 +1080,12 @@ The full CLI reference below is auto-generated from command `--help` output.
 │                                                        $JOINMARKET_DATA_DIR) │
 │                                                        [env var:             │
 │                                                        JOINMARKET_DATA_DIR]  │
+│ --config-file                                 PATH     Config file path      │
+│                                                        (decoupled from data  │
+│                                                        dir). Defaults to     │
+│                                                        <data-dir>/config.to… │
+│                                                        [env var:             │
+│                                                        JOINMARKET_CONFIG_FI… │
 │ --log-level            -l                     TEXT     Log level             │
 │ --help                                                 Show this message and │
 │                                                        exit.                 │
@@ -1182,6 +1241,11 @@ The full CLI reference below is auto-generated from command `--help` output.
 │                                             ~/.joinmarket-ng or              │
 │                                             $JOINMARKET_DATA_DIR)            │
 │                                             [env var: JOINMARKET_DATA_DIR]   │
+│ --config-file                      PATH     Config file path (decoupled from │
+│                                             data dir). Defaults to           │
+│                                             <data-dir>/config.toml           │
+│                                             [env var:                        │
+│                                             JOINMARKET_CONFIG_FILE]          │
 │ --log-level                -l      TEXT     Log level                        │
 │ --help                                      Show this message and exit.      │
 ╰──────────────────────────────────────────────────────────────────────────────╯

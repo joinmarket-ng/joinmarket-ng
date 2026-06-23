@@ -361,6 +361,13 @@ architecture, persistence, retry behavior, and other implementation details.
 │                                                             $JOINMARKET_DAT… │
 │                                                             [env var:        │
 │                                                             JOINMARKET_DATA… │
+│    --config-file                           PATH             Config file path │
+│                                                             (decoupled from  │
+│                                                             data dir).       │
+│                                                             Defaults to      │
+│                                                             <data-dir>/conf… │
+│                                                             [env var:        │
+│                                                             JOINMARKET_CONF… │
 │    --log-level      -l                     TEXT                              │
 │    --help                                                   Show this        │
 │                                                             message and      │
@@ -389,6 +396,10 @@ architecture, persistence, retry behavior, and other implementation details.
 │                                          ~/.joinmarket-ng or                 │
 │                                          $JOINMARKET_DATA_DIR)               │
 │                                          [env var: JOINMARKET_DATA_DIR]      │
+│ --config-file                      PATH  Config file path (decoupled from    │
+│                                          data dir). Defaults to              │
+│                                          <data-dir>/config.toml              │
+│                                          [env var: JOINMARKET_CONFIG_FILE]   │
 │ --log-level                -l      TEXT                                      │
 │ --help                                   Show this message and exit.         │
 ╰──────────────────────────────────────────────────────────────────────────────╯
@@ -416,6 +427,10 @@ architecture, persistence, retry behavior, and other implementation details.
 │                                          ~/.joinmarket-ng or                 │
 │                                          $JOINMARKET_DATA_DIR)               │
 │                                          [env var: JOINMARKET_DATA_DIR]      │
+│ --config-file                      PATH  Config file path (decoupled from    │
+│                                          data dir). Defaults to              │
+│                                          <data-dir>/config.toml              │
+│                                          [env var: JOINMARKET_CONFIG_FILE]   │
 │ --log-level                -l      TEXT                                      │
 │ --help                                   Show this message and exit.         │
 ╰──────────────────────────────────────────────────────────────────────────────╯
@@ -497,6 +512,12 @@ architecture, persistence, retry behavior, and other implementation details.
 │                                                       $JOINMARKET_DATA_DIR)  │
 │                                                       [env var:              │
 │                                                       JOINMARKET_DATA_DIR]   │
+│ --config-file                   PATH                  Config file path       │
+│                                                       (decoupled from data   │
+│                                                       dir). Defaults to      │
+│                                                       <data-dir>/config.toml │
+│                                                       [env var:              │
+│                                                       JOINMARKET_CONFIG_FIL… │
 │ --log-level             -l      TEXT                                         │
 │ --help                                                Show this message and  │
 │                                                       exit.                  │
@@ -515,9 +536,12 @@ architecture, persistence, retry behavior, and other implementation details.
  Initialize the config file with default settings.
 
 ╭─ Options ────────────────────────────────────────────────────────────────────╮
-│ --data-dir  -d      PATH  Data directory for JoinMarket files                │
-│                           [env var: JOINMARKET_DATA_DIR]                     │
-│ --help                    Show this message and exit.                        │
+│ --data-dir     -d      PATH  Data directory for JoinMarket files             │
+│                              [env var: JOINMARKET_DATA_DIR]                  │
+│ --config-file          PATH  Config file path (decoupled from data dir).     │
+│                              Defaults to <data-dir>/config.toml              │
+│                              [env var: JOINMARKET_CONFIG_FILE]               │
+│ --help                       Show this message and exit.                     │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ```
 

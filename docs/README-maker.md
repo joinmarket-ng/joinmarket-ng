@@ -385,6 +385,12 @@ jm-maker start --help
 │                                                       ~/.joinmarket-ng       │
 │                                                       [env var:              │
 │                                                       JOINMARKET_DATA_DIR]   │
+│ --config-file                   PATH                  Config file path       │
+│                                                       (decoupled from data   │
+│                                                       dir). Defaults to      │
+│                                                       <data-dir>/config.toml │
+│                                                       [env var:              │
+│                                                       JOINMARKET_CONFIG_FIL… │
 │ --network                       [mainnet|testnet|sig  Protocol network       │
 │                                 net|regtest]          (mainnet, testnet,     │
 │                                                       signet, regtest)       │
@@ -516,6 +522,12 @@ jm-maker start --help
 │                                                       $JOINMARKET_DATA_DIR)  │
 │                                                       [env var:              │
 │                                                       JOINMARKET_DATA_DIR]   │
+│ --config-file                   PATH                  Config file path       │
+│                                                       (decoupled from data   │
+│                                                       dir). Defaults to      │
+│                                                       <data-dir>/config.toml │
+│                                                       [env var:              │
+│                                                       JOINMARKET_CONFIG_FIL… │
 │ --log-level             -l      TEXT                  Log level              │
 │ --help                                                Show this message and  │
 │                                                       exit.                  │
@@ -534,9 +546,12 @@ jm-maker start --help
  Initialize the config file with default settings.
 
 ╭─ Options ────────────────────────────────────────────────────────────────────╮
-│ --data-dir  -d      PATH  Data directory for JoinMarket files                │
-│                           [env var: JOINMARKET_DATA_DIR]                     │
-│ --help                    Show this message and exit.                        │
+│ --data-dir     -d      PATH  Data directory for JoinMarket files             │
+│                              [env var: JOINMARKET_DATA_DIR]                  │
+│ --config-file          PATH  Config file path (decoupled from data dir).     │
+│                              Defaults to <data-dir>/config.toml              │
+│                              [env var: JOINMARKET_CONFIG_FILE]               │
+│ --help                       Show this message and exit.                     │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ```
 
