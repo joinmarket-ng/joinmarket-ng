@@ -7,13 +7,20 @@ ARG PYTHON_VERSION=3.14
 ARG PYTHON_SLIM_DIGEST=sha256:44dd04494ee8f3b538294360e7c4b3acb87c8268e4d0a4828a6500b1eff50061
 ARG NODE_VERSION=24
 ARG NODE_SLIM_DIGEST=sha256:c2d5ade763cacfb03fe9cb8e8af5d1be5041ff331921fa26a9b231ca3a4f780a
-# JAM frontend is built on a single fixed platform regardless of the target
-# image platform (the build output is static JS that is platform-independent).
-# Pinning JAM_BUILDER_PLATFORM ensures reproducible JS bytes across hosts.
-# It is exposed as an ARG (not a constant) to silence the
-# FromPlatformFlagConstDisallowed lint warning while keeping the value fixed
-# in practice (callers should not override it).
-ARG JAM_BUILDER_PLATFORM=linux/amd64
+# JAM frontend build platform. The build output is static JS that is
+# platform-independent, so the frontend is compiled on the native build host
+# (BUILDPLATFORM) rather than the target image platform. Building it natively
+# avoids running the Node.js toolchain under QEMU emulation, which segfaults
+# (exit code 139) when an amd64 toolchain is emulated on a native arm64 builder
+# (and is prohibitively slow on armv7). node:24-slim only publishes amd64/arm64
+# images, and the armv7 image is always built on an amd64 host, so BUILDPLATFORM
+# always resolves to an available Node image.
+# It is exposed as an overridable ARG (not a constant) to silence the
+# FromPlatformFlagConstDisallowed lint warning; callers may pin it to a fixed
+# platform if byte-identical JS is required. The jam-ng frontend layers are
+# already excluded from strict reproducibility checks because the bundle build
+# is non-deterministic across environments (see docs/technical/development.md).
+ARG JAM_BUILDER_PLATFORM=${BUILDPLATFORM}
 
 # JAM frontend: pinned commit hash for reproducible builds (devel branch tip)
 # Update with: ./scripts/update-base-images.sh
@@ -157,8 +164,12 @@ CMD ["jmwalletd"]
 
 # =============================================================================
 # Stage 3: Build JAM frontend (cloned from GitHub, no submodule required)
-# Always built for amd64: the output is static JS that runs in the browser,
-# so the build platform doesn't matter. node:24-slim has no linux/arm/v7 image.
+# Built on the native build host (BUILDPLATFORM) since the output is static JS
+# that runs in the browser, so the build CPU architecture doesn't matter.
+# Building natively avoids emulating the Node.js toolchain under QEMU, which
+# segfaults on native arm64 builders. node:24-slim has no linux/arm/v7 image,
+# but armv7 targets are always built on an amd64 host, so BUILDPLATFORM resolves
+# to an available image.
 # Pinned to a specific commit for reproducible builds.
 # Update JAM_COMMIT with: ./scripts/update-base-images.sh
 #
