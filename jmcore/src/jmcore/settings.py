@@ -738,6 +738,65 @@ class MakerSettings(BaseModel):
             "offer updates."
         ),
     )
+    # Directory reconnection
+    directory_reconnect_interval: int = Field(
+        default=300,
+        ge=60,
+        description="Interval in seconds between reconnection attempts for failed directories",
+    )
+    directory_reconnect_max_retries: int = Field(
+        default=0,
+        ge=0,
+        description="Maximum reconnection attempts per directory (0 = unlimited)",
+    )
+    directory_startup_timeout: int = Field(
+        default=120,
+        ge=10,
+        description=(
+            "Seconds to keep retrying directory connections at startup before giving up "
+            "and letting the background reconnect task take over"
+        ),
+    )
+    # Orderbook rate limiting
+    orderbook_rate_limit: int = Field(
+        default=1,
+        ge=1,
+        description="Maximum orderbook responses per peer per interval",
+    )
+    orderbook_rate_interval: float = Field(
+        default=10.0,
+        ge=1.0,
+        description="Interval in seconds for orderbook rate limiting",
+    )
+    orderbook_violation_ban_threshold: int = Field(
+        default=100,
+        ge=1,
+        description="Ban peer after this many rate limit violations",
+    )
+    orderbook_violation_warning_threshold: int = Field(
+        default=10,
+        ge=1,
+        description="Start exponential backoff after this many violations",
+    )
+    orderbook_violation_severe_threshold: int = Field(
+        default=50,
+        ge=1,
+        description="Severe backoff threshold (higher penalty)",
+    )
+    orderbook_ban_duration: float = Field(
+        default=3600.0,
+        ge=60.0,
+        description="Ban duration in seconds (default: 1 hour)",
+    )
+    # Dual-offer mode
+    dual_offers: bool = Field(
+        default=False,
+        description=(
+            "Advertise both a relative and an absolute fee offer simultaneously. "
+            "Uses cj_fee_relative and cj_fee_absolute for the respective offer. "
+            "The CLI flag --dual-offers overrides this setting."
+        ),
+    )
 
     @field_validator("cj_fee_relative", mode="before")
     @classmethod

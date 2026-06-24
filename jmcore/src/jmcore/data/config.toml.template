@@ -144,17 +144,6 @@
 # Override with a custom list if needed:
 # directory_servers = ["custom1.onion:5222", "custom2.onion:5222"]
 
-# How long to keep retrying directory connections at startup (Tor may still be
-# bootstrapping when the maker starts).  After this timeout, the background
-# reconnect task takes over.  Defaults to 120 seconds.
-# directory_startup_timeout = 120
-
-# Background reconnect interval in seconds (default: 300)
-# directory_reconnect_interval = 300
-
-# Max reconnection attempts per directory (0 = unlimited, default: 0)
-# directory_reconnect_max_retries = 0
-
 # ============================================================================
 # Wallet Settings
 # ============================================================================
@@ -379,7 +368,8 @@
 # Timeouts and intervals
 # session_timeout_sec = 300
 # rescan_interval_sec = 600
-# pending_tx_timeout_min = 60  # Minutes before marking unbroadcast CoinJoins as failed
+# pending_tx_timeout_min = 60   # Minutes before marking unbroadcast CoinJoins as failed
+# pending_tx_abandon_hours = 72  # Hours before abandoning a broadcast but unconfirmed tx
 
 # Privacy: random delay (seconds) before re-announcing offers after a balance change.
 # Prevents observers from correlating block confirmations with offer updates.
@@ -392,9 +382,32 @@
 # onion_serving_port = 5222
 # tor_target_host = "127.0.0.1"
 
-# Rate limiting
-# message_rate_limit = 10   # Messages per second
-# message_burst_limit = 100
+# Message rate limiting (protects against spam/DoS from peers)
+# message_rate_limit = 10   # Messages per second per peer (sustained)
+# message_burst_limit = 100 # Max burst messages per peer
+
+# Orderbook rate limiting (protects against orderbook spam attacks)
+# orderbook_rate_limit = 1                  # Max responses per peer per interval
+# orderbook_rate_interval = 10.0            # Interval in seconds
+# orderbook_violation_warning_threshold = 10 # Start exponential backoff after N violations
+# orderbook_violation_severe_threshold = 50  # Severe backoff threshold
+# orderbook_violation_ban_threshold = 100    # Ban peer after N violations
+# orderbook_ban_duration = 3600.0            # Ban duration in seconds (1 hour)
+
+# Directory server reconnection settings
+# How long to keep retrying directory connections at startup (Tor may still be
+# bootstrapping when the maker starts). After this timeout, the background
+# reconnect task takes over. Default: 120 seconds.
+# directory_startup_timeout = 120
+# Background reconnect interval in seconds. Default: 300 (5 minutes).
+# directory_reconnect_interval = 300
+# Max reconnection attempts per directory (0 = unlimited). Default: 0.
+# directory_reconnect_max_retries = 0
+
+# Dual-offer mode: advertise both a relative and an absolute fee offer simultaneously.
+# Equivalent to passing --dual-offers on the CLI. The CLI flag takes precedence
+# when both are set. Default: false (single offer determined by offer_type above).
+# dual_offers = false
 
 # ============================================================================
 # Taker Settings (CoinJoin Client)

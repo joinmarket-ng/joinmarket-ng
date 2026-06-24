@@ -71,7 +71,7 @@ def build_maker_config(
     fidelity_bond_locktimes: list[int] | None = None,
     fidelity_bond_index: int | None = None,
     no_fidelity_bond: bool = False,
-    dual_offers: bool = False,
+    dual_offers: bool | None = None,
 ) -> MakerConfig:
     """
     Build MakerConfig from unified settings with CLI overrides.
@@ -209,7 +209,10 @@ def build_maker_config(
     # CLI explicit values take precedence
     offer_configs: list[OfferConfig] = []
 
-    if dual_offers:
+    # Resolve dual_offers: CLI bool (True/False) overrides settings when explicitly passed
+    effective_dual_offers = dual_offers if dual_offers is not None else settings.maker.dual_offers
+
+    if effective_dual_offers:
         # Create both relative and absolute offers
         # Use CLI values if provided, otherwise use settings
         rel_fee = cj_fee_relative if cj_fee_relative is not None else settings.maker.cj_fee_relative
@@ -362,6 +365,7 @@ def build_maker_config(
         min_confirmations=settings.maker.min_confirmations,
         session_timeout_sec=settings.maker.session_timeout_sec,
         pending_tx_timeout_min=settings.maker.pending_tx_timeout_min,
+        pending_tx_abandon_hours=settings.maker.pending_tx_abandon_hours,
         rescan_interval_sec=settings.maker.rescan_interval_sec,
         message_rate_limit=settings.maker.message_rate_limit,
         message_burst_limit=settings.maker.message_burst_limit,
@@ -372,6 +376,15 @@ def build_maker_config(
         merge_algorithm=parsed_merge_algorithm,
         offer_configs=offer_configs,
         allow_mixdepth_zero_merge=settings.maker.allow_mixdepth_zero_merge,
+        directory_reconnect_interval=settings.maker.directory_reconnect_interval,
+        directory_reconnect_max_retries=settings.maker.directory_reconnect_max_retries,
+        directory_startup_timeout=settings.maker.directory_startup_timeout,
+        orderbook_rate_limit=settings.maker.orderbook_rate_limit,
+        orderbook_rate_interval=settings.maker.orderbook_rate_interval,
+        orderbook_violation_ban_threshold=settings.maker.orderbook_violation_ban_threshold,
+        orderbook_violation_warning_threshold=settings.maker.orderbook_violation_warning_threshold,
+        orderbook_violation_severe_threshold=settings.maker.orderbook_violation_severe_threshold,
+        orderbook_ban_duration=settings.maker.orderbook_ban_duration,
     )
 
 
@@ -682,7 +695,9 @@ def start(
             fidelity_bond_locktimes=fidelity_bond_locktimes if fidelity_bond_locktimes else None,
             fidelity_bond_index=fidelity_bond_index,
             no_fidelity_bond=no_fidelity_bond,
-            dual_offers=dual_offers,
+            # Pass True only when the flag was explicitly given; False means "not given",
+            # so we pass None to let build_maker_config fall back to settings.
+            dual_offers=True if dual_offers else None,
         )
     except ValueError as e:
         logger.error(str(e))

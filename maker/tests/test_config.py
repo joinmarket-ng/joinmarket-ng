@@ -804,3 +804,141 @@ class TestCreateWalletService:
             include_mempool=True,
         )
         assert wallet.backend is mock_backend
+
+
+class TestNewSettingsWiring:
+    """Round-trip tests for settings that were previously silently ignored.
+
+    Each test verifies that a setting defined in MakerSettings reaches the
+    runtime MakerConfig produced by build_maker_config.
+    """
+
+    def test_directory_reconnect_interval_passed_from_settings(self) -> None:
+        """maker.directory_reconnect_interval in config.toml must reach MakerConfig."""
+        from jmcore.settings import JoinMarketSettings
+
+        from maker.cli import build_maker_config
+
+        settings = JoinMarketSettings()
+        settings.maker.directory_reconnect_interval = 120
+        config = build_maker_config(settings=settings, mnemonic=TEST_MNEMONIC, passphrase="")
+        assert config.directory_reconnect_interval == 120
+
+    def test_directory_reconnect_max_retries_passed_from_settings(self) -> None:
+        """maker.directory_reconnect_max_retries in config.toml must reach MakerConfig."""
+        from jmcore.settings import JoinMarketSettings
+
+        from maker.cli import build_maker_config
+
+        settings = JoinMarketSettings()
+        settings.maker.directory_reconnect_max_retries = 5
+        config = build_maker_config(settings=settings, mnemonic=TEST_MNEMONIC, passphrase="")
+        assert config.directory_reconnect_max_retries == 5
+
+    def test_directory_startup_timeout_passed_from_settings(self) -> None:
+        """maker.directory_startup_timeout in config.toml must reach MakerConfig."""
+        from jmcore.settings import JoinMarketSettings
+
+        from maker.cli import build_maker_config
+
+        settings = JoinMarketSettings()
+        settings.maker.directory_startup_timeout = 60
+        config = build_maker_config(settings=settings, mnemonic=TEST_MNEMONIC, passphrase="")
+        assert config.directory_startup_timeout == 60
+
+    def test_orderbook_rate_limit_passed_from_settings(self) -> None:
+        """maker.orderbook_rate_limit in config.toml must reach MakerConfig."""
+        from jmcore.settings import JoinMarketSettings
+
+        from maker.cli import build_maker_config
+
+        settings = JoinMarketSettings()
+        settings.maker.orderbook_rate_limit = 3
+        config = build_maker_config(settings=settings, mnemonic=TEST_MNEMONIC, passphrase="")
+        assert config.orderbook_rate_limit == 3
+
+    def test_orderbook_rate_interval_passed_from_settings(self) -> None:
+        """maker.orderbook_rate_interval in config.toml must reach MakerConfig."""
+        from jmcore.settings import JoinMarketSettings
+
+        from maker.cli import build_maker_config
+
+        settings = JoinMarketSettings()
+        settings.maker.orderbook_rate_interval = 30.0
+        config = build_maker_config(settings=settings, mnemonic=TEST_MNEMONIC, passphrase="")
+        assert config.orderbook_rate_interval == 30.0
+
+    def test_orderbook_ban_duration_passed_from_settings(self) -> None:
+        """maker.orderbook_ban_duration in config.toml must reach MakerConfig."""
+        from jmcore.settings import JoinMarketSettings
+
+        from maker.cli import build_maker_config
+
+        settings = JoinMarketSettings()
+        settings.maker.orderbook_ban_duration = 7200.0
+        config = build_maker_config(settings=settings, mnemonic=TEST_MNEMONIC, passphrase="")
+        assert config.orderbook_ban_duration == 7200.0
+
+    def test_orderbook_violation_thresholds_passed_from_settings(self) -> None:
+        """All three orderbook violation thresholds must reach MakerConfig."""
+        from jmcore.settings import JoinMarketSettings
+
+        from maker.cli import build_maker_config
+
+        settings = JoinMarketSettings()
+        settings.maker.orderbook_violation_ban_threshold = 50
+        settings.maker.orderbook_violation_warning_threshold = 5
+        settings.maker.orderbook_violation_severe_threshold = 25
+        config = build_maker_config(settings=settings, mnemonic=TEST_MNEMONIC, passphrase="")
+        assert config.orderbook_violation_ban_threshold == 50
+        assert config.orderbook_violation_warning_threshold == 5
+        assert config.orderbook_violation_severe_threshold == 25
+
+    def test_pending_tx_abandon_hours_passed_from_settings(self) -> None:
+        """maker.pending_tx_abandon_hours in config.toml must reach MakerConfig."""
+        from jmcore.settings import JoinMarketSettings
+
+        from maker.cli import build_maker_config
+
+        settings = JoinMarketSettings()
+        settings.maker.pending_tx_abandon_hours = 48
+        config = build_maker_config(settings=settings, mnemonic=TEST_MNEMONIC, passphrase="")
+        assert config.pending_tx_abandon_hours == 48
+
+    def test_dual_offers_from_settings(self) -> None:
+        """maker.dual_offers = true in config.toml must enable dual-offer mode."""
+        from jmcore.settings import JoinMarketSettings
+
+        from maker.cli import build_maker_config
+
+        settings = JoinMarketSettings()
+        settings.maker.dual_offers = True
+        config = build_maker_config(settings=settings, mnemonic=TEST_MNEMONIC, passphrase="")
+        assert len(config.offer_configs) == 2
+
+    def test_dual_offers_cli_overrides_settings_false(self) -> None:
+        """CLI dual_offers=True overrides settings.maker.dual_offers=False."""
+        from jmcore.settings import JoinMarketSettings
+
+        from maker.cli import build_maker_config
+
+        settings = JoinMarketSettings()
+        settings.maker.dual_offers = False
+        config = build_maker_config(
+            settings=settings, mnemonic=TEST_MNEMONIC, passphrase="", dual_offers=True
+        )
+        assert len(config.offer_configs) == 2
+
+    def test_dual_offers_not_set_uses_settings_default(self) -> None:
+        """When dual_offers=None (not given on CLI), settings default (False) is used."""
+        from jmcore.settings import JoinMarketSettings
+
+        from maker.cli import build_maker_config
+
+        settings = JoinMarketSettings()
+        assert settings.maker.dual_offers is False
+        config = build_maker_config(
+            settings=settings, mnemonic=TEST_MNEMONIC, passphrase="", dual_offers=None
+        )
+        # No explicit dual_offers -> single offer mode
+        assert len(config.offer_configs) == 0

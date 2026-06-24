@@ -172,6 +172,17 @@ class TestSettingsDefaults:
         # default to maximize liquidity. PoDLE commitments live on a separate
         # UTXO and are still gated by taker_utxo_age (see issue #491).
         assert settings.maker.min_confirmations == 0
+        # Defaults for newly-added fields
+        assert settings.maker.dual_offers is False
+        assert settings.maker.directory_reconnect_interval == 300
+        assert settings.maker.directory_reconnect_max_retries == 0
+        assert settings.maker.directory_startup_timeout == 120
+        assert settings.maker.orderbook_rate_limit == 1
+        assert settings.maker.orderbook_rate_interval == 10.0
+        assert settings.maker.orderbook_violation_ban_threshold == 100
+        assert settings.maker.orderbook_violation_warning_threshold == 10
+        assert settings.maker.orderbook_violation_severe_threshold == 50
+        assert settings.maker.orderbook_ban_duration == 3600.0
 
     def test_default_taker_settings(self) -> None:
         """Test default taker settings."""

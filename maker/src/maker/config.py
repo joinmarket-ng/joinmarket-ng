@@ -306,6 +306,17 @@ class MakerConfig(WalletConfig):
             "within this time, we assume it was abandoned."
         ),
     )
+    pending_tx_abandon_hours: int = Field(
+        default=72,
+        ge=1,
+        le=8760,
+        description=(
+            "Hours after which a broadcast but unconfirmed transaction is "
+            "marked as abandoned and removed from the pending-monitoring list. "
+            "Bitcoin transactions not confirmed within ~3 days are typically "
+            "dropped from mempools."
+        ),
+    )
 
     # Wallet rescan configuration
     post_coinjoin_rescan_delay: int = Field(
