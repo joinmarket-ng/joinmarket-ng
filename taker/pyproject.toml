@@ -1,6 +1,6 @@
 [project]
 name = "jm-taker"
-version = "0.32.0"
+version = "0.33.0"
 description = "JoinMarket Taker Client"
 requires-python = ">=3.11"
 dependencies = [

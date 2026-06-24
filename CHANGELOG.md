@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.33.0] - 2026-06-24
+
+### Added
+
+- TUI: Send dialog validates all inputs with retry loops. ([0cd043aa](../../commit/0cd043aa7b854399d30bbf2d842bb774d3756e0f))
+- New Config Center consolidates all config operations. ([4820d95b](../../commit/4820d95b42d883193c5bf25c81c68499d49626f2))
+- Auto-freeze coins sent to already-used addresses (forced address-reuse defense) ([03a5cef7](../../commit/03a5cef73533004f422e9b527844efaab8439d57))
+- Auto-freeze forced address reuse only on already-spent (empty) addresses ([703f327c](../../commit/703f327c30591472cf8a2737dcb5c2ff7660be08))
+- Add a wallet history API endpoint to jmwalletd ([ea80be1d](../../commit/ea80be1de4bc2035bf57102d9ade0e54c2bd13cf))
+- Add address column to freeze TUI with FB truncation and ([ff721955](../../commit/ff721955cccd7c8409b2de6414da6baa47ce3075))
+- Add a `--config-file` option (and honor `JOINMARKET_CONFIG_FILE` ([80b31f3d](../../commit/80b31f3dd786ddfd283c6177d7d758ceb106b84e))
+- Extended wallet info now shows colored headers, better visual structure, and clearer balance breakdown. ([ef2b8240](../../commit/ef2b8240bc3e0d08f2c738bf285be959fc6069c0))
+- Extended wallet info now shows individual UTXOs per address ([9866afa0](../../commit/9866afa0cb3055572b45fae8e0f32c4a35f4ae88))
+
+### Fixed
+
+- Rescans and fidelity-bond recovery now start from the wallet creation height instead of always scanning from genesis ([788e334b](../../commit/788e334ba72fc45e099f2c0aa9dc685ea22975e0))
+- import-bond now explains that bonds funded in older blocks need a rescan to be detected ([bd3000d3](../../commit/bd3000d301ce0c9b7ed1d4101f968f9841a55a9b))
+- Fix funded fidelity bonds being missing from wallet UTXOs ([4db9b1e3](../../commit/4db9b1e3506b6264a65e56710fd5ec16ffa8487c))
+- Surface funded fidelity bonds in the jmwalletd UTXO API ([c76c1275](../../commit/c76c1275ae0a68ccf08295e4163b086a085d0917))
+- Show funded fidelity bonds in jm-wallet info/sync-bonds instead of locked with 0 sats ([461fd66a](../../commit/461fd66add5673e624aa4a42020db9fd7d9141d5))
+- Honor taker policy settings (minimum_makers, bondless fee policy) for CoinJoins started via jmwalletd ([f46905f7](../../commit/f46905f7e5f9489515133f2dbc184ed888ee25d0))
+- Show maker earnings in the yield generator report (Earn) again ([a6f23c15](../../commit/a6f23c15cb5b6a2e8e4c9f1bf375a0fb4a6f6005))
+- Fix fidelity bond freeze/unfreeze handling in the jm-wallet freeze manager ([6841a371](../../commit/6841a3716986e038d5b23d32e596370ad5e184ec))
+- Validate taker UTXO eligibility before connecting so ineligible coins fail fast ([4c7d9af1](../../commit/4c7d9af1fc5d4635ca512f28a6e53c6039959767))
+- Surface taker failure reason and used makers so the tumbler can retry intelligently ([ce4409c7](../../commit/ce4409c7eb04b7a52ba54a1a2a22a83076c6760b))
+- Fix maker UTXO auto-freeze false positives after container restart ([9644d8a2](../../commit/9644d8a28943459201b6687e9b3e68f96253d1b2))
+- Fix wrong hidden-address count for internal addresses in ([35aed040](../../commit/35aed040696ef1ac6953cfd727b1426932f807fb))
+- Honor the maker `onion_host` config key so a configured static ([ae022c39](../../commit/ae022c39f1a272a8db09a68afda5cee005d51481))
+- Expand `~` in the `data_dir` config key so JoinMarket-NG no ([abfe57ce](../../commit/abfe57cef957a848f9689427d272b22011089284))
+- TUI: maker asks for the wallet password only once on Raspiblitz ([cc42290a](../../commit/cc42290aecbef3db3314f219c70e1d355af95a38))
+- TUI: do not write the wallet password to config.toml when declined ([cc42290a](../../commit/cc42290aecbef3db3314f219c70e1d355af95a38))
+- jm-wallet history now shows only the active wallet's CoinJoins (#523) ([08fd5ade](../../commit/08fd5adeff61d17b01eb7c9aa0318c3cc16ea910))
+- Tumbler now resolves the internal next-mixdepth using the wallet's configured mixdepth_count instead of assuming 5, fixing stuck or misrouted tumbles on wallets with a mixdepth_count other than 5. ([75a4658b](../../commit/75a4658ba2be17556ccd4b3a664e5152a0a69a24))
+- Show frozen fidelity bonds in the basic 'jm-wallet info' view again ([17b8625f](../../commit/17b8625f42c9abaec8c7eee7422c9912b109f979))
+- Freeze manager now correctly handles fidelity bonds as separate ([a3a3d7e3](../../commit/a3a3d7e38af891d01100f1779b7e3f62ba4a5d90))
+- Suppress ANSI colors in 'jm-wallet info --extended' when output is piped or redirected ([90e51786](../../commit/90e51786c1c86746ecf42d78b8ff45b4b7c5f204))
+- Freeze manager no longer starts the cursor on a fidelity bond and reports skipped bonds accurately ([45f90582](../../commit/45f90582684bdb189efd724916f2277d7c5bd076))
+
 ## [0.32.0] - 2026-06-03
 
 Neutrino backend now has mempool support. Along with other improvements and bug fixes.
@@ -1471,7 +1510,8 @@ Releases prior to these changes (including 0.13.5, 0.13.6, and 0.13.7) cannot be
 - Pre-built image support for directory server compose.
 - Tor configuration instructions.
 
-[Unreleased]: ../../compare/0.32.0...HEAD
+[Unreleased]: ../../compare/0.33.0...HEAD
+[0.33.0]: ../../compare/0.32.0...0.33.0
 [0.32.0]: ../../compare/0.31.1...0.32.0
 [0.31.1]: ../../compare/0.31.0...0.31.1
 [0.31.0]: ../../compare/0.30.0...0.31.0
