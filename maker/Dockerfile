@@ -62,7 +62,7 @@ COPY jmcore/requirements.txt /build/jmcore/requirements.txt
 COPY jmwallet/requirements.txt /build/jmwallet/requirements.txt
 COPY maker/requirements.txt /build/maker/requirements.txt
 
-RUN --mount=type=cache,target=/root/.cache/pip \
+RUN --mount=type=cache,target=/root/.cache/pip,id=jmng-pip-${HATCHLING_VERSION} \
     if [ -n "$SOURCE_DATE_EPOCH" ]; then export SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH; fi && \
     pip install --prefix=/app --build-constraint /build/coincurve-build-constraints.txt \
         -r /build/jmcore/requirements.txt \
@@ -80,7 +80,7 @@ COPY jmwallet/pyproject.toml /build/jmwallet/
 COPY maker/src /build/maker/src
 COPY maker/pyproject.toml /build/maker/
 
-RUN --mount=type=cache,target=/root/.cache/pip \
+RUN --mount=type=cache,target=/root/.cache/pip,id=jmng-pip-${HATCHLING_VERSION} \
     if [ -n "$SOURCE_DATE_EPOCH" ]; then export SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH; fi && \
     pip install --no-deps --prefix=/app --build-constraint /build/constraints.txt \
         /build/jmcore \

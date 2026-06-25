@@ -55,7 +55,7 @@ RUN echo "setuptools==${SETUPTOOLS_VERSION}" > /build/constraints.txt && \
 COPY jmcore/requirements.txt /build/jmcore/requirements.txt
 COPY directory_server/requirements.txt /build/directory_server/requirements.txt
 
-RUN --mount=type=cache,target=/root/.cache/pip \
+RUN --mount=type=cache,target=/root/.cache/pip,id=jmng-pip-${HATCHLING_VERSION} \
     if [ -n "$SOURCE_DATE_EPOCH" ]; then export SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH; fi && \
     pip install --prefix=/app --build-constraint /build/constraints.txt \
         -r /build/jmcore/requirements.txt \
@@ -68,7 +68,7 @@ COPY jmcore/setup.py /build/jmcore/
 COPY directory_server/src /build/directory_server/src
 COPY directory_server/pyproject.toml /build/directory_server/
 
-RUN --mount=type=cache,target=/root/.cache/pip \
+RUN --mount=type=cache,target=/root/.cache/pip,id=jmng-pip-${HATCHLING_VERSION} \
     if [ -n "$SOURCE_DATE_EPOCH" ]; then export SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH; fi && \
     pip install --no-deps --prefix=/app --build-constraint /build/constraints.txt \
         /build/jmcore \
@@ -167,7 +167,7 @@ RUN echo "setuptools==${SETUPTOOLS_VERSION}" > /build/constraints.txt && \
 COPY jmcore/requirements.txt /build/jmcore/requirements.txt
 COPY directory_server/requirements.txt /build/directory_server/requirements.txt
 
-RUN --mount=type=cache,target=/root/.cache/pip \
+RUN --mount=type=cache,target=/root/.cache/pip,id=jmng-pip-${HATCHLING_VERSION} \
     if [ -n "$SOURCE_DATE_EPOCH" ]; then export SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH; fi && \
     pip install --prefix=/app --build-constraint /build/constraints.txt \
         -r /build/jmcore/requirements.txt \
@@ -180,7 +180,7 @@ COPY jmcore/setup.py /build/jmcore/
 COPY directory_server/src /build/directory_server/src
 COPY directory_server/pyproject.toml /build/directory_server/
 
-RUN --mount=type=cache,target=/root/.cache/pip \
+RUN --mount=type=cache,target=/root/.cache/pip,id=jmng-pip-${HATCHLING_VERSION} \
     if [ -n "$SOURCE_DATE_EPOCH" ]; then export SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH; fi && \
     pip install --no-deps --prefix=/app --build-constraint /build/constraints.txt \
         /build/jmcore \

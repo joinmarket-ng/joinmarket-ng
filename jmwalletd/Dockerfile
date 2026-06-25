@@ -90,7 +90,7 @@ COPY taker/requirements.txt /build/requirements-taker.txt
 COPY orderbook_watcher/requirements.txt /build/requirements-obwatcher.txt
 COPY jmwalletd/requirements.txt /build/requirements-jmwalletd.txt
 
-RUN --mount=type=cache,target=/root/.cache/pip \
+RUN --mount=type=cache,target=/root/.cache/pip,id=jmng-pip-${HATCHLING_VERSION} \
     if [ -n "$SOURCE_DATE_EPOCH" ]; then export SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH; fi && \
     pip install --build-constraint /build/coincurve-build-constraints.txt \
         -r /build/requirements-jmcore.txt \
