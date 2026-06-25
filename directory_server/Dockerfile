@@ -70,7 +70,7 @@ COPY directory_server/pyproject.toml /build/directory_server/
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     if [ -n "$SOURCE_DATE_EPOCH" ]; then export SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH; fi && \
-    pip install --prefix=/app --build-constraint /build/constraints.txt \
+    pip install --no-deps --prefix=/app --build-constraint /build/constraints.txt \
         /build/jmcore \
         /build/directory_server
 
@@ -182,7 +182,7 @@ COPY directory_server/pyproject.toml /build/directory_server/
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     if [ -n "$SOURCE_DATE_EPOCH" ]; then export SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH; fi && \
-    pip install --prefix=/app --build-constraint /build/constraints.txt \
+    pip install --no-deps --prefix=/app --build-constraint /build/constraints.txt \
         /build/jmcore \
         /build/directory_server
 
