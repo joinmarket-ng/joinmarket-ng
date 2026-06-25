@@ -13,6 +13,7 @@ joinmarket-clientserver's ``POLICY.max_sats_freeze_reuse`` behavior:
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -264,3 +265,35 @@ def test_default_threshold_is_freeze_all(tmp_path: Path) -> None:
     ws = WalletService(mnemonic=MNEMONIC, backend=backend, network="regtest")
     # Matches legacy default: -1 freezes all reuse.
     assert ws.max_sats_freeze_reuse == -1
+
+
+async def test_first_sync_after_restart_keeps_existing_coins_spendable(
+    tmp_path: Path,
+) -> None:
+    """sync_all on the first sync after init must not freeze existing coins.
+
+    On restart utxo_cache is empty when the pre-sync snapshot is taken while
+    addresses_with_history is restored from the metadata store, so without the
+    first-sync guard every coin on a used address looks like fresh reuse on an
+    empty address and is wrongly frozen.
+    """
+    ws = _make_wallet(tmp_path, max_sats_freeze_reuse=-1)
+    # Restart state: the address is known-used and its coin is still present.
+    ws.addresses_with_history = {REUSED_ADDRESS}
+    utxo = _utxo(txid="d4" * 32, address=REUSED_ADDRESS, value=10_000)
+
+    async def fake_descriptor_sync(_bonds=None):
+        ws.utxo_cache = {0: [utxo]}
+        return ws.utxo_cache
+
+    ws.backend.is_wallet_setup = AsyncMock(return_value=True)
+    ws.backend.list_descriptors = AsyncMock(return_value=[])
+    ws.setup_descriptor_wallet = AsyncMock(return_value=True)
+    ws._sync_all_with_descriptors = fake_descriptor_sync
+
+    assert ws._just_initialized is True
+    await ws.sync_all()
+
+    assert utxo.frozen is False
+    assert not ws.metadata_store.is_frozen(utxo.outpoint)
+    assert ws._just_initialized is False
