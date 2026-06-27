@@ -18,6 +18,7 @@ JoinMarket. The public surface:
 
 from __future__ import annotations
 
+from jmswap.bond import select_bonded_providers, verify_provider_bond
 from jmswap.chain import ChainBackend, FakeChainBackend
 from jmswap.channel import (
     ChangeSplit,
@@ -100,6 +101,8 @@ __all__ = [
     "cooperative_close",
     "plan_combined_channel",
     "request_external_channel_funding",
+    "select_bonded_providers",
+    "verify_provider_bond",
     "is_refundable",
     "refund",
     "split_change",

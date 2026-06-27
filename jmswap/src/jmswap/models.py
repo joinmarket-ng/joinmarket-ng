@@ -105,13 +105,23 @@ class ProviderTerms(BaseModel):
     cltv_delta: int = 144  # refund timelock distance in blocks
     accepts_whole_coin: bool = False  # third-role: absorb a whole UTXO, no change
     # JoinMarket-symmetric sybil resistance: a provider advertises a timelocked
-    # fidelity bond; clients can require a minimum bond value before swapping.
+    # fidelity bond; clients verify it on-chain (see jmswap.bond) before swapping.
     bond_value: int = 0  # advertised fidelity-bond value in sats (0 = none)
-    bond_proof: str | None = None  # opaque bond certificate/proof for verification
+    bond_utxo_pub: str | None = None  # 33-byte hex timelocked bond pubkey
+    bond_locktime: int = 0  # bond locktime (unix seconds)
+    bond_txid: str | None = None  # the bond UTXO
+    bond_vout: int = 0
+    bond_confirmation_time: int = 0  # UTXO confirmation timestamp (for value calc)
+    bond_cert_sig: str | None = None  # bond key's sig over the identity cert (base64)
+    bond_cert_expiry: int = 0
     name: str | None = None
 
     def meets_bond(self, min_bond_value: int) -> bool:
         return self.bond_value >= min_bond_value
+
+    @property
+    def has_bond_proof(self) -> bool:
+        return bool(self.bond_utxo_pub and self.bond_txid and self.bond_cert_sig)
 
     @field_validator("provider_pubkey")
     @classmethod
