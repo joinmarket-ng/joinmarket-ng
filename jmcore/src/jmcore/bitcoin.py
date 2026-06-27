@@ -289,6 +289,24 @@ def sha256(data: bytes) -> bytes:
     return hashlib.sha256(data).digest()
 
 
+def tagged_hash(tag: str, data: bytes) -> bytes:
+    """
+    Compute a BIP340 tagged hash: SHA256(SHA256(tag) || SHA256(tag) || data).
+
+    Used by BIP340/BIP341/BIP342 (Schnorr signatures, Taproot), BIP327
+    (MuSig2) and BIP352 (Silent Payments).
+
+    Args:
+        tag: The tag string (e.g. "TapSighash", "TapTweak", "TapLeaf").
+        data: The data to hash.
+
+    Returns:
+        32-byte tagged hash.
+    """
+    tag_hash = hashlib.sha256(tag.encode("utf-8")).digest()
+    return hashlib.sha256(tag_hash + tag_hash + data).digest()
+
+
 # =============================================================================
 # Varint Encoding/Decoding
 # =============================================================================
@@ -435,6 +453,116 @@ def script_to_p2wsh_scriptpubkey(script: bytes) -> bytes:
     return bytes([0x00, 0x20]) + script_hash
 
 
+# BIP350 bech32m checksum constant.
+BECH32M_CONST = 0x2BC830A3
+
+
+def bech32m_create_checksum(hrp: str, data: list[int]) -> list[int]:
+    """Compute the BIP350 bech32m checksum for the given HRP and 5-bit data."""
+    values = bech32_lib.bech32_hrp_expand(hrp) + data
+    polymod = bech32_lib.bech32_polymod(values + [0, 0, 0, 0, 0, 0]) ^ BECH32M_CONST
+    return [(polymod >> 5 * (5 - i)) & 31 for i in range(6)]
+
+
+def bech32m_encode(hrp: str, witver: int, witprog: bytes) -> str:
+    """Encode a segwit address (witness version >= 1) using bech32m (BIP350)."""
+    converted = bech32_lib.convertbits(witprog, 8, 5)
+    if converted is None:
+        raise ValueError("Failed to convert witness program bits")
+    data = [witver, *converted]
+    checksum = bech32m_create_checksum(hrp, data)
+    return hrp + "1" + "".join([bech32_lib.CHARSET[d] for d in data + checksum])
+
+
+def bech32m_decode(hrp: str, addr: str) -> tuple[int | None, list[int] | None]:
+    """Decode a bech32m segwit address, returning (witver, 5-bit witprog data)."""
+    pos = addr.rfind("1")
+    if pos < 1 or pos + 7 > len(addr) or len(addr) > 90:
+        return None, None
+    if not addr.lower().startswith(hrp + "1"):
+        return None, None
+    data = [bech32_lib.CHARSET.find(x) for x in addr.lower()[pos + 1 :]]
+    if any(x == -1 for x in data):
+        return None, None
+    values = bech32_lib.bech32_hrp_expand(hrp) + data
+    if bech32_lib.bech32_polymod(values) != BECH32M_CONST:
+        return None, None
+    return data[0], data[1:-6]
+
+
+def create_p2tr_scriptpubkey(output_xonly_pubkey: bytes) -> bytes:
+    """
+    Create a witness-v1 (P2TR) scriptPubKey from a 32-byte x-only output key.
+
+    Args:
+        output_xonly_pubkey: 32-byte x-only taproot output key (already tweaked).
+
+    Returns:
+        34-byte P2TR scriptPubKey (OP_1 <32-byte-key>).
+    """
+    if len(output_xonly_pubkey) != 32:
+        raise ValueError(f"output_xonly_pubkey must be 32 bytes, got {len(output_xonly_pubkey)}")
+    return bytes([0x51, 0x20]) + output_xonly_pubkey
+
+
+def taproot_tweak_pubkey(
+    internal_pubkey: bytes, merkle_root: bytes | None = None
+) -> tuple[int, bytes]:
+    """
+    Tweak an internal x-only key with a BIP341 hash to get the output key.
+
+    Args:
+        internal_pubkey: 32-byte x-only internal public key.
+        merkle_root: Optional 32-byte script tree Merkle root (empty/None for a
+            key-path-only output).
+
+    Returns:
+        ``(output_y_parity, 32-byte x-only tweaked output key)`` where
+        ``output_y_parity`` is 0 (even) or 1 (odd), needed for the control block.
+    """
+    from coincurve import PublicKey
+
+    if len(internal_pubkey) != 32:
+        raise ValueError(f"internal_pubkey must be 32 bytes, got {len(internal_pubkey)}")
+    try:
+        pub = PublicKey(b"\x02" + internal_pubkey)
+    except ValueError:
+        raise ValueError("Invalid internal public key") from None
+    tweak = tagged_hash("TapTweak", internal_pubkey + (merkle_root or b""))
+    tweaked_pub = pub.add(tweak)
+    tweaked_bytes = tweaked_pub.format(compressed=True)
+    return tweaked_bytes[0] - 2, tweaked_bytes[1:]
+
+
+def taproot_tweak_privkey(privkey_bytes: bytes, merkle_root: bytes | None = None) -> bytes:
+    """
+    Tweak a private key for Taproot key-path spending (BIP341).
+
+    Negates the scalar first if the internal public key has an odd Y coordinate,
+    so the resulting key matches the even-Y output key.
+
+    Args:
+        privkey_bytes: 32-byte internal private key.
+        merkle_root: Optional 32-byte script tree Merkle root.
+
+    Returns:
+        32-byte tweaked private key (the key-path signing key for the output).
+    """
+    import coincurve
+
+    from jmcore.constants import SECP256K1_N
+
+    priv_key = coincurve.PrivateKey(privkey_bytes)
+    pub = priv_key.public_key
+    internal_pub = pub.format(compressed=True)[1:]
+    d = int.from_bytes(privkey_bytes, "big")
+    if pub.format(compressed=True)[0] == 0x03:
+        d = (SECP256K1_N - d) % SECP256K1_N
+    priv_key_even = coincurve.PrivateKey.from_int(d)
+    tweak = tagged_hash("TapTweak", internal_pub + (merkle_root or b""))
+    return priv_key_even.add(tweak).secret
+
+
 def address_to_scriptpubkey(address: str) -> bytes:
     """
     Convert Bitcoin address to scriptPubKey.
@@ -458,11 +586,19 @@ def address_to_scriptpubkey(address: str) -> bytes:
         hrp = address[:hrp_end]
 
         bech32_decoded = bech32_lib.decode(hrp, address)
-        if bech32_decoded[0] is None or bech32_decoded[1] is None:
-            raise ValueError(f"Invalid bech32 address: {address}")
-
         witver = bech32_decoded[0]
-        witprog = bytes(bech32_decoded[1])
+        if witver is not None and bech32_decoded[1] is not None:
+            witprog = bytes(bech32_decoded[1])
+        else:
+            # Witness v1+ (P2TR) uses bech32m, which the bech32 decoder rejects.
+            m_witver, m_data = bech32m_decode(hrp, address)
+            if m_witver is None or m_data is None:
+                raise ValueError(f"Invalid bech32/bech32m address: {address}")
+            converted = bech32_lib.convertbits(m_data, 5, 8, False)
+            if converted is None:
+                raise ValueError(f"Invalid witness program padding: {address}")
+            witver = m_witver
+            witprog = bytes(converted)
 
         if witver == 0:
             if len(witprog) == 20:
@@ -525,12 +661,9 @@ def scriptpubkey_to_address(scriptpubkey: bytes, network: str | NetworkType = "m
             raise ValueError(f"Failed to encode P2WSH address: {scriptpubkey.hex()}")
         return result
 
-    # P2TR
+    # P2TR (witness v1) - must use bech32m (BIP350), not bech32.
     if len(scriptpubkey) == 34 and scriptpubkey[0] == 0x51 and scriptpubkey[1] == 0x20:
-        result = bech32_lib.encode(hrp, 1, scriptpubkey[2:])
-        if result is None:
-            raise ValueError(f"Failed to encode P2TR address: {scriptpubkey.hex()}")
-        return result
+        return bech32m_encode(hrp, 1, scriptpubkey[2:])
 
     # P2PKH
     if (
@@ -1155,11 +1288,19 @@ def get_address_type(address: str) -> str:
         hrp = address[:hrp_end]
 
         decoded = bech32_lib.decode(hrp, address)
-        if decoded[0] is None or decoded[1] is None:
-            raise ValueError(f"Invalid bech32 address: {address}")
-
         witver = decoded[0]
-        witprog = bytes(decoded[1])
+        if witver is not None and decoded[1] is not None:
+            witprog = bytes(decoded[1])
+        else:
+            # Witness v1+ (P2TR) uses bech32m, which the bech32 decoder rejects.
+            m_witver, m_data = bech32m_decode(hrp, address)
+            if m_witver is None or m_data is None:
+                raise ValueError(f"Invalid bech32/bech32m address: {address}")
+            converted = bech32_lib.convertbits(m_data, 5, 8, False)
+            if converted is None:
+                raise ValueError(f"Invalid witness program padding: {address}")
+            witver = m_witver
+            witprog = bytes(converted)
 
         if witver == 0:
             if len(witprog) == 20:
