@@ -137,6 +137,31 @@ class OfferConfig(BaseModel):
     model_config = {"frozen": False}
 
 
+class SwapProviderConfig(BaseModel):
+    """Runtime configuration for the maker's bidirectional swap-provider role.
+
+    Mirrors :class:`jmcore.settings.SwapProviderSettings`; the runtime builds a
+    :class:`jmswap.ProviderTerms` and a :class:`jmswap.LdkServerBackend` from it
+    when ``enabled`` is set.
+    """
+
+    enabled: bool = False
+    directions: list[str] = Field(default_factory=lambda: ["swapin", "swapout"])
+    nostr_relays: list[str] = Field(default_factory=lambda: ["ws://localhost:7000"])
+    min_amount: int = Field(default=50_000, ge=0)
+    max_amount: int = Field(default=25_000_000, ge=0)
+    percentage_fee: str = Field(default="0.1")
+    base_fee: int = Field(default=500, ge=0)
+    cltv_delta: int = Field(default=144, ge=1)
+    accepts_whole_coin: bool = False
+    channel_change: bool = False
+    ldk_grpc_url: str | None = None
+    ldk_api_key: str | None = None
+    ldk_api_key_path: str | None = None
+
+    model_config = {"frozen": False}
+
+
 class MergeAlgorithm(StrEnum):
     """
     UTXO selection algorithm for makers.
@@ -422,6 +447,12 @@ class MakerConfig(WalletConfig):
             "Seconds to keep retrying directory connections at startup before giving up "
             "and letting the background reconnect task take over (default: 120s)"
         ),
+    )
+
+    # Bidirectional Lightning swap-provider role (see jmswap).
+    swap_provider: SwapProviderConfig = Field(
+        default_factory=lambda: SwapProviderConfig(),
+        description="Runtime configuration for the maker's swap-provider role.",
     )
 
     model_config = {"frozen": False}

@@ -29,7 +29,7 @@ from loguru import logger
 from pydantic import SecretStr
 
 from maker.bot import MakerBot
-from maker.config import MakerConfig, MergeAlgorithm, OfferConfig
+from maker.config import MakerConfig, MergeAlgorithm, OfferConfig, SwapProviderConfig
 
 app = typer.Typer(no_args_is_help=True)
 
@@ -385,6 +385,21 @@ def build_maker_config(
         orderbook_violation_warning_threshold=settings.maker.orderbook_violation_warning_threshold,
         orderbook_violation_severe_threshold=settings.maker.orderbook_violation_severe_threshold,
         orderbook_ban_duration=settings.maker.orderbook_ban_duration,
+        swap_provider=SwapProviderConfig(
+            enabled=settings.maker.swap_provider.enabled,
+            directions=settings.maker.swap_provider.directions,
+            nostr_relays=settings.maker.swap_provider.nostr_relays,
+            min_amount=settings.maker.swap_provider.min_amount,
+            max_amount=settings.maker.swap_provider.max_amount,
+            percentage_fee=settings.maker.swap_provider.percentage_fee,
+            base_fee=settings.maker.swap_provider.base_fee,
+            cltv_delta=settings.maker.swap_provider.cltv_delta,
+            accepts_whole_coin=settings.maker.swap_provider.accepts_whole_coin,
+            channel_change=settings.maker.swap_provider.channel_change,
+            ldk_grpc_url=settings.maker.swap_provider.ldk_grpc_url,
+            ldk_api_key=settings.maker.swap_provider.ldk_api_key,
+            ldk_api_key_path=settings.maker.swap_provider.ldk_api_key_path,
+        ),
     )
 
 

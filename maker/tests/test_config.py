@@ -325,6 +325,57 @@ class TestBuildMakerConfig:
         assert config.offer_type == OfferType.SW0_RELATIVE
         assert config.cj_fee_relative == "0.002"
 
+    def test_swap_provider_settings_forwarded(self) -> None:
+        """SwapProviderSettings must round-trip into MakerConfig.swap_provider."""
+        from jmcore.settings import JoinMarketSettings
+
+        from maker.cli import build_maker_config
+
+        settings = JoinMarketSettings()
+        settings.maker.swap_provider.enabled = True
+        settings.maker.swap_provider.directions = ["swapout"]
+        settings.maker.swap_provider.nostr_relays = ["ws://relay.example:7000"]
+        settings.maker.swap_provider.min_amount = 70_000
+        settings.maker.swap_provider.max_amount = 1_000_000
+        settings.maker.swap_provider.percentage_fee = "0.25"
+        settings.maker.swap_provider.base_fee = 321
+        settings.maker.swap_provider.cltv_delta = 200
+        settings.maker.swap_provider.accepts_whole_coin = True
+        settings.maker.swap_provider.channel_change = True
+        settings.maker.swap_provider.ldk_grpc_url = "https://ldk:3536"
+        settings.maker.swap_provider.ldk_api_key = "deadbeef"
+
+        config = build_maker_config(
+            settings=settings,
+            mnemonic=TEST_MNEMONIC,
+            passphrase="",
+        )
+        sp = config.swap_provider
+        assert sp.enabled is True
+        assert sp.directions == ["swapout"]
+        assert sp.nostr_relays == ["ws://relay.example:7000"]
+        assert sp.min_amount == 70_000
+        assert sp.max_amount == 1_000_000
+        assert sp.percentage_fee == "0.25"
+        assert sp.base_fee == 321
+        assert sp.cltv_delta == 200
+        assert sp.accepts_whole_coin is True
+        assert sp.channel_change is True
+        assert sp.ldk_grpc_url == "https://ldk:3536"
+        assert sp.ldk_api_key == "deadbeef"
+
+    def test_swap_provider_defaults_disabled(self) -> None:
+        """The swap-provider role is off by default and round-trips cleanly."""
+        from jmcore.settings import JoinMarketSettings
+
+        from maker.cli import build_maker_config
+
+        config = build_maker_config(
+            settings=JoinMarketSettings(), mnemonic=TEST_MNEMONIC, passphrase=""
+        )
+        assert config.swap_provider.enabled is False
+        assert config.swap_provider.directions == ["swapin", "swapout"]
+
     def test_max_sats_freeze_reuse_forwarded(self) -> None:
         """``wallet.max_sats_freeze_reuse`` must reach the MakerConfig (#529)."""
         from jmcore.settings import JoinMarketSettings

@@ -622,6 +622,72 @@ class NotificationSettings(BaseModel):
         return v
 
 
+class SwapProviderSettings(BaseModel):
+    """Settings for the maker's bidirectional Lightning swap-provider role.
+
+    When ``enabled``, the maker also runs a :class:`jmswap.SwapServer`: it
+    advertises swap terms over Nostr and clears Lightning swaps in both
+    directions from its existing wallet, breaking the cross-slot peel chain
+    while earning swap fees (see docs/technical/swap-provider.md).
+    """
+
+    enabled: bool = Field(
+        default=False,
+        description="Run a bidirectional Lightning swap provider alongside the maker.",
+    )
+    directions: list[str] = Field(
+        default_factory=lambda: ["swapin", "swapout"],
+        description="Swap directions to offer: 'swapin' and/or 'swapout'.",
+    )
+    nostr_relays: list[str] = Field(
+        default_factory=lambda: ["ws://localhost:7000"],
+        description="Nostr relay URLs for advertising terms and serving swap RPCs.",
+    )
+    min_amount: int = Field(default=50_000, ge=0, description="Minimum swap amount in satoshis.")
+    max_amount: int = Field(
+        default=25_000_000, ge=0, description="Maximum swap amount in satoshis."
+    )
+    percentage_fee: str = Field(
+        default="0.1",
+        description="Swap fee as a percentage of the swapped amount (e.g. '0.1' = 0.1%).",
+    )
+    base_fee: int = Field(
+        default=500,
+        ge=0,
+        description="Flat swap fee in satoshis covering the provider's on-chain footprint.",
+    )
+    cltv_delta: int = Field(
+        default=144,
+        ge=1,
+        description="Refund timelock distance in blocks for the swap HTLC.",
+    )
+    accepts_whole_coin: bool = Field(
+        default=False,
+        description="Third role: accept a client's whole UTXO at base fee (no client change).",
+    )
+    channel_change: bool = Field(
+        default=False,
+        description=(
+            "Experimental: emit CoinJoin change as a Taproot channel-funding "
+            "output (no chaining successor) instead of a plain change output. "
+            "Requires P2TR wallet tracking and Lightning dual-funding to be "
+            "production-ready; OFF by default."
+        ),
+    )
+    ldk_grpc_url: str | None = Field(
+        default=None,
+        description="LDK Server gRPC base URL (e.g. 'https://jm-ldk-provider:3536').",
+    )
+    ldk_api_key: str | None = Field(
+        default=None,
+        description="LDK Server API key (hex). Prefer ldk_api_key_path in production.",
+    )
+    ldk_api_key_path: str | None = Field(
+        default=None,
+        description="Path to the LDK Server API key file (raw bytes; hex-encoded on read).",
+    )
+
+
 class MakerSettings(BaseModel):
     """Maker-specific settings."""
 
@@ -829,6 +895,11 @@ class MakerSettings(BaseModel):
             "Uses cj_fee_relative and cj_fee_absolute for the respective offer. "
             "The CLI flag --dual-offers overrides this setting."
         ),
+    )
+    # Bidirectional Lightning swap-provider role.
+    swap_provider: SwapProviderSettings = Field(
+        default_factory=SwapProviderSettings,
+        description="Bidirectional Lightning swap-provider settings.",
     )
 
     @field_validator("cj_fee_relative", mode="before")

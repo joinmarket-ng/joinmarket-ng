@@ -671,12 +671,109 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
             else:
                 logger.info("Periodic summary notifications disabled (notify_summary=false)")
 
+            # Start the bidirectional Lightning swap provider (if enabled)
+            if getattr(self.config, "swap_provider", None) and self.config.swap_provider.enabled:
+                swap_task = asyncio.create_task(self._run_swap_server())
+                self.listen_tasks.append(swap_task)
+
             # Wait for all listening tasks to complete
             await asyncio.gather(*self.listen_tasks, return_exceptions=True)
 
         except Exception as e:
             logger.error(f"Failed to start maker bot: {e}")
             raise
+
+    def _build_swap_server(self) -> tuple[object, object, str]:
+        """Construct the SwapServer, SwapNostrNode and provider terms.
+
+        Returns ``(swap_server, nostr_node, identity_pubkey_hex)``. Split out so
+        it can be unit-tested without starting the serve loop.
+        """
+        from decimal import Decimal
+
+        from jmswap.ldk import HttpxLdkTransport, LdkServerBackend
+        from jmswap.lightning import FakeLightningBackend, FakeLightningNetwork
+        from jmswap.models import ProviderTerms, SwapDirection
+        from jmswap.nostr import RelayTransport, SwapNostrNode
+        from jmswap.server import SwapServer
+
+        from maker.swap_adapter import SWAP_ACCOUNT, WalletChainBackend, WalletSwapWallet
+
+        sp = self.config.swap_provider
+        coin = 0 if self.wallet.network == "mainnet" else 1
+        # Deterministic identity + Nostr keys derived from the wallet seed.
+        identity_key = self.wallet.master_key.derive(f"m/84'/{coin}'/{SWAP_ACCOUNT}'/2/0")
+        nostr_key = self.wallet.master_key.derive(f"m/84'/{coin}'/{SWAP_ACCOUNT}'/2/1")
+        identity_pubkey = identity_key.get_public_key_bytes(compressed=True).hex()
+
+        # Lightning backend: LDK Server if configured, else an isolated fake.
+        lightning: object
+        if sp.ldk_grpc_url:
+            api_key = sp.ldk_api_key
+            if api_key is None and sp.ldk_api_key_path:
+                api_key = open(sp.ldk_api_key_path, "rb").read().hex()
+            lightning = LdkServerBackend(HttpxLdkTransport(sp.ldk_grpc_url), api_key or "")
+        else:
+            logger.warning("swap provider enabled without ldk_grpc_url; using a fake LN backend")
+            lightning = FakeLightningBackend(FakeLightningNetwork())
+
+        terms = ProviderTerms(
+            provider_id=identity_pubkey,
+            provider_pubkey=identity_pubkey,
+            network=self.wallet.network,
+            directions=[SwapDirection(d) for d in sp.directions],
+            min_amount=sp.min_amount,
+            max_amount=sp.max_amount,
+            percentage_fee=Decimal(sp.percentage_fee),
+            base_fee=sp.base_fee,
+            cltv_delta=sp.cltv_delta,
+            accepts_whole_coin=sp.accepts_whole_coin,
+            name=f"jm-maker-{identity_pubkey[:8]}",
+        )
+        chain = WalletChainBackend(self.backend)
+        swap_wallet = WalletSwapWallet(self.wallet)
+
+        # Crash-safe persistence of in-flight swaps under the data dir.
+        store = None
+        data_dir = getattr(self.config, "data_dir", None)
+        if data_dir:
+            from pathlib import Path
+
+            from jmswap.persistence import SwapStore
+
+            store = SwapStore(Path(data_dir) / "swaps")
+        server = SwapServer(terms, lightning, chain, swap_wallet, store=store)  # type: ignore[arg-type]
+
+        transport = RelayTransport(tuple(sp.nostr_relays))
+        nostr_node = SwapNostrNode(nostr_key.get_private_key_bytes(), transport)
+        return server, nostr_node, identity_pubkey
+
+    async def _run_swap_server(self) -> None:
+        """Advertise swap terms, serve swap RPCs and refund expired swaps."""
+        try:
+            server, nostr_node, identity = self._build_swap_server()
+            logger.info("starting swap provider (identity {})", identity[:16])
+            await nostr_node.advertise(server.terms)  # type: ignore[attr-defined]
+            refund_task = asyncio.create_task(self._swap_refund_loop(server))
+            try:
+                await nostr_node.serve(server.rpc_handler)  # type: ignore[attr-defined]
+            finally:
+                refund_task.cancel()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - keep the maker running if swaps fail
+            logger.error("swap provider stopped: {}", exc)
+
+    async def _swap_refund_loop(self, server: object, interval: float = 60.0) -> None:
+        """Periodically refund swap-out HTLCs whose timelock has expired."""
+        while self.running:
+            try:
+                await server.refund_expired()  # type: ignore[attr-defined]
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - never let the loop die
+                logger.warning("swap refund sweep failed: {}", exc)
+            await asyncio.sleep(interval)
 
     async def stop(self) -> None:
         """Stop the maker bot"""

@@ -455,6 +455,8 @@ class ProtocolHandlersMixin:
                 session_timeout_sec=self.config.session_timeout_sec,
                 merge_algorithm=self.config.merge_algorithm.value,
                 restrict_md0=not self.config.allow_mixdepth_zero_merge,
+                channel_change=getattr(self.config, "swap_provider", None) is not None
+                and self.config.swap_provider.channel_change,
             )
             session = MakerSession(inner=session_inner)
 

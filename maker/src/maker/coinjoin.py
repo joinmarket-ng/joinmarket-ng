@@ -67,6 +67,7 @@ class CoinJoinSession:
         session_timeout_sec: int = 300,
         merge_algorithm: str = "default",
         restrict_md0: bool = True,
+        channel_change: bool = False,
     ):
         self.taker_nick = taker_nick
         self.offer = offer
@@ -78,6 +79,8 @@ class CoinJoinSession:
         self.taker_utxo_amtpercent = taker_utxo_amtpercent
         self.merge_algorithm = merge_algorithm  # UTXO selection strategy
         self.restrict_md0 = restrict_md0  # Mixdepth 0 UTXO merge restriction
+        # Experimental: emit change as a Taproot channel-funding output.
+        self.channel_change = channel_change
 
         self.state = CoinJoinState.IDLE
         self.amount = 0
@@ -625,8 +628,7 @@ class CoinJoinSession:
             cj_index = self.wallet.get_next_address_index(cj_output_mixdepth, 1)
             cj_address = self.wallet.get_change_address(cj_output_mixdepth, cj_index)
 
-            change_index = self.wallet.get_next_address_index(max_mixdepth, 1)
-            change_address = self.wallet.get_change_address(max_mixdepth, change_index)
+            change_address = self._build_change_address(max_mixdepth)
 
             # Reserve addresses immediately after selection to prevent reuse
             # in concurrent CoinJoin sessions. Once shared with a taker, addresses
@@ -648,6 +650,41 @@ class CoinJoinSession:
         except Exception as e:
             logger.error(f"Failed to select UTXOs: {e}")
             return {}, "", "", -1
+
+    def _build_change_address(self, max_mixdepth: int) -> str:
+        """Return the change address, optionally a Taproot channel-funding output.
+
+        With ``channel_change`` enabled, the change is emitted as a recoverable
+        simple-taproot 2-of-2 funding output (no chaining successor in the
+        wallet); otherwise a plain change address at ``max_mixdepth``.
+        """
+        if self.channel_change:
+            data_dir = getattr(self.wallet, "data_dir", None)
+            if data_dir:
+                try:
+                    from pathlib import Path
+
+                    from maker.channel_change import (
+                        ChannelChangeStore,
+                        emit_channel_change_address,
+                    )
+
+                    store = ChannelChangeStore(Path(data_dir) / "channel_changes")
+                    address = emit_channel_change_address(self.wallet, store)
+                    logger.warning(
+                        "emitting CoinJoin change as a Taproot channel-funding "
+                        "output {} (experimental; not tracked by the P2WPKH wallet)",
+                        address,
+                    )
+                    return address
+                except Exception as exc:  # noqa: BLE001 - never block a CoinJoin
+                    logger.error("channel-change emission failed, using plain change: {}", exc)
+            else:
+                logger.warning(
+                    "channel_change enabled but wallet has no data_dir; using plain change"
+                )
+        change_index = self.wallet.get_next_address_index(max_mixdepth, 1)
+        return self.wallet.get_change_address(max_mixdepth, change_index)
 
     async def _sign_transaction(self, tx_hex: str) -> list[str]:
         """Sign our inputs in the transaction.
