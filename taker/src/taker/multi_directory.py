@@ -14,13 +14,13 @@ import random
 from dataclasses import dataclass
 from typing import Any
 
-from jmcore.crypto import NickIdentity
+from jmcore.crypto import NickIdentity, verify_signed_privmsg
 from jmcore.deduplication import ResponseDeduplicator
 from jmcore.directory_client import DirectoryClient
 from jmcore.directory_pool import DirectoryClientPool
 from jmcore.models import Offer
-from jmcore.network import OnionPeer
-from jmcore.protocol import NOT_SERVING_ONION_HOSTNAME
+from jmcore.network import ONION_HOSTID, OnionPeer
+from jmcore.protocol import NOT_SERVING_ONION_HOSTNAME, parse_jm_message
 from loguru import logger
 
 
@@ -754,68 +754,56 @@ class MultiDirectoryClient(DirectoryClientPool):
             if not line:
                 return
 
-            # Check for !error messages from any of our expected nicks
-            if "!error" in line:
-                for nick in list(remaining_nicks):
-                    if nick in line:
-                        # Deduplicate error responses too
-                        if not deduplicator.add_response(nick, "error", line, source):
-                            logger.debug(f"Duplicate !error from {nick} via {source}")
-                            break
-                        # Extract error message after !error
-                        parts = line.split("!error", 1)
-                        error_msg = parts[1].strip() if len(parts) > 1 else "Unknown error"
-                        responses[nick] = {"error": True, "data": error_msg}
-                        remaining_nicks.discard(nick)
-                        logger.warning(f"Received !error from {nick}: {error_msg}")
-                        break
+            # Attribute strictly to the authenticated sender. Substring matching
+            # let any peer claim another maker's nick by embedding it in payload.
+            parsed = parse_jm_message(line)
+            if parsed is None:
+                return
+            from_nick = parsed[0]
+            if from_nick not in expected_nicks:
                 return
 
-            # Parse the message to find sender and command
-            if expected_command not in line:
+            ok, command, _data = verify_signed_privmsg(from_nick, parsed[2], ONION_HOSTID)
+            if not ok:
+                logger.warning(f"Dropping unverified message from {from_nick} via {source}")
                 return
 
-            # Match against expected nicks (not just remaining)
-            for nick in expected_nicks:
-                if nick in line:
-                    # For accumulating responses (like !sig), skip deduplication
-                    # since we expect multiple messages from the same maker
-                    if not accumulate_responses:
-                        # Check for duplicate response from another directory
-                        if not deduplicator.add_response(nick, expected_command, line, source):
-                            logger.debug(f"Duplicate {expected_command} from {nick} via {source}")
-                            break
+            # Preserve the downstream payload contract (data plus pubkey/sig suffix).
+            payload = parsed[2].split(" ", 1)[1].strip() if " " in parsed[2] else ""
 
-                    # Extract data after the command
-                    parts = line.split(expected_command, 1)
-                    if len(parts) > 1:
-                        data = parts[1].strip()
-                        if accumulate_responses:
-                            # Accumulate multiple !sig messages, but deduplicate by content
-                            # to avoid counting the same sig relayed via multiple directories.
-                            nick_seen = seen_sig_data.setdefault(nick, set())
-                            if data in nick_seen:
-                                logger.debug(
-                                    f"Duplicate {expected_command} content from {nick} "
-                                    f"via {source} -- dropped"
-                                )
-                                break
-                            nick_seen.add(data)
-                            if nick not in responses:
-                                responses[nick] = {"data": []}
-                                remaining_nicks.discard(nick)
-                            responses[nick]["data"].append(data)
-                            logger.debug(
-                                f"Received {expected_command} "
-                                f"#{len(responses[nick]['data'])} "
-                                f"from {nick} via {source}"
-                            )
-                        else:
-                            # Single response (original behavior)
-                            responses[nick] = {"data": data}
-                            remaining_nicks.discard(nick)
-                            logger.debug(f"Received {expected_command} from {nick} via {source}")
-                    break
+            if command == "error":
+                if not deduplicator.add_response(from_nick, "error", line, source):
+                    return
+                responses[from_nick] = {"error": True, "data": _data or "Unknown error"}
+                remaining_nicks.discard(from_nick)
+                logger.warning(f"Received error from {from_nick}: {_data}")
+                return
+
+            if command != expected_command.lstrip("!"):
+                return
+
+            if not accumulate_responses:
+                if not deduplicator.add_response(from_nick, expected_command, line, source):
+                    logger.debug(f"Duplicate {expected_command} from {from_nick} via {source}")
+                    return
+                responses[from_nick] = {"data": payload}
+                remaining_nicks.discard(from_nick)
+                logger.debug(f"Received {expected_command} from {from_nick} via {source}")
+            else:
+                # Accumulate !sig messages, deduplicating identical content relayed
+                # by multiple directories.
+                nick_seen = seen_sig_data.setdefault(from_nick, set())
+                if payload in nick_seen:
+                    return
+                nick_seen.add(payload)
+                if from_nick not in responses:
+                    responses[from_nick] = {"data": []}
+                    remaining_nicks.discard(from_nick)
+                responses[from_nick]["data"].append(payload)
+                logger.debug(
+                    f"Received {expected_command} #{len(responses[from_nick]['data'])} "
+                    f"from {from_nick} via {source}"
+                )
 
         while not is_complete():
             elapsed = asyncio.get_event_loop().time() - start_time

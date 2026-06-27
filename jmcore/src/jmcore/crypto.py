@@ -14,7 +14,7 @@ from coincurve import PrivateKey, PublicKey
 from coincurve import verify_signature as coincurve_verify
 from mnemonic import Mnemonic
 
-from jmcore.protocol import JM_VERSION
+from jmcore.protocol import JM_VERSION, get_nick_version
 
 NICK_HASH_LENGTH = 10
 NICK_MAX_ENCODED = 14
@@ -296,6 +296,42 @@ def verify_signature(public_key_hex: str, message: bytes, signature: bytes) -> b
         return coincurve_verify(signature, message, public_key_bytes)
     except Exception:
         return False
+
+
+def nick_from_pubkey_hex(pubkey_hex: str, version: int = JM_VERSION) -> str:
+    """Derive the JoinMarket nick a compressed pubkey maps to (J{version}{hash})."""
+    pubkey_bytes = bytes.fromhex(pubkey_hex)
+    nick_pkh_raw = hashlib.sha256(binascii.hexlify(pubkey_bytes)).digest()[:NICK_HASH_LENGTH]
+    nick_pkh = base58_encode(nick_pkh_raw)
+    nick_pkh += "O" * (NICK_MAX_ENCODED - len(nick_pkh))
+    return f"J{version}{nick_pkh}"
+
+
+def verify_signed_privmsg(
+    from_nick: str, rest: str, hostid: str = "onion-network"
+) -> tuple[bool, str, str]:
+    """Authenticate a relayed private message.
+
+    ``rest`` is ``"<command> <data...> <pubkey_hex> <sig_b64>"``. Returns
+    ``(ok, command, data)``; ``ok`` is True only when the appended pubkey hashes
+    to ``from_nick`` and the signature over ``data + hostid`` verifies. This binds
+    the message to its claimed sender so callers must never attribute by substring.
+    """
+    tokens = rest.split(" ")
+    if len(tokens) < 3:
+        return False, "", ""
+    command = tokens[0]
+    pubkey_hex = tokens[-2]
+    sig_b64 = tokens[-1]
+    data = " ".join(tokens[1:-2])
+    try:
+        if nick_from_pubkey_hex(pubkey_hex, get_nick_version(from_nick)) != from_nick:
+            return False, command, data
+        if not ecdsa_verify(data + hostid, sig_b64, bytes.fromhex(pubkey_hex)):
+            return False, command, data
+    except Exception:
+        return False, command, data
+    return True, command, data
 
 
 def strip_signature_padding(signature: bytes) -> bytes:
