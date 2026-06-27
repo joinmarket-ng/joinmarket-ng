@@ -22,7 +22,7 @@ import uuid
 from collections.abc import AsyncIterator, Callable, Coroutine
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from jmswap.errors import SwapProtocolError
 from jmswap.models import ProviderTerms
@@ -35,6 +35,9 @@ from jmswap.nip04 import (
     sign_event,
     verify_event,
 )
+
+if TYPE_CHECKING:
+    from jmswap.chain import ChainBackend
 
 SWAP_ADVERT_KIND = 31000
 SWAP_RPC_KIND = 25582
@@ -149,10 +152,16 @@ class RelayTransport(NostrTransport):
 
 @dataclass
 class SwapAdvert:
-    """A discovered provider advert: the terms plus the advertising Nostr key."""
+    """A discovered provider advert: the terms plus the advertising Nostr key.
+
+    ``verified_bond_value`` is set when discovery verified the provider's fidelity
+    bond on-chain (``None`` means "not verified, trust the advertised value at your
+    own risk").
+    """
 
     nostr_pubkey: str
     terms: ProviderTerms
+    verified_bond_value: int | None = None
 
 
 class SwapNostrNode:
@@ -202,12 +211,25 @@ class SwapNostrNode:
 
     # -- client side ----------------------------------------------------------
 
-    async def discover(self, timeout: float = 5.0, *, min_bond_value: int = 0) -> list[SwapAdvert]:
+    async def discover(
+        self,
+        timeout: float = 5.0,
+        *,
+        min_bond_value: int = 0,
+        chain: ChainBackend | None = None,
+    ) -> list[SwapAdvert]:
         """Collect provider adverts seen within ``timeout`` seconds.
 
-        ``min_bond_value`` filters out providers advertising a fidelity bond
-        below the threshold, raising the cost of a sybil flooding the market
+        ``min_bond_value`` filters out providers whose fidelity bond is below the
+        threshold, raising the cost of a sybil flooding the market
         (JoinMarket-symmetric bond verification).
+
+        If ``chain`` is given, each provider's bond is **verified on-chain** and
+        the advert keeps only providers whose *verified* bond meets
+        ``min_bond_value`` (sorted by verified bond, descending), with
+        ``verified_bond_value`` populated. Without ``chain``, filtering falls back
+        to the self-advertised ``bond_value``, which a sybil can forge - so a
+        client that can reach a chain backend should always pass one.
         """
         filters = [{"kinds": [SWAP_ADVERT_KIND], "#d": [ADVERT_D_TAG]}]
         adverts: dict[str, SwapAdvert] = {}
@@ -218,13 +240,30 @@ class SwapNostrNode:
                     continue
                 with suppress(Exception):
                     terms = ProviderTerms.model_validate_json(event["content"])
-                    if not terms.meets_bond(min_bond_value):
+                    # Without a chain backend, filter advisorily on the advertised
+                    # value; with one, defer filtering to on-chain verification.
+                    if chain is None and not terms.meets_bond(min_bond_value):
                         continue
                     adverts[event["pubkey"]] = SwapAdvert(event["pubkey"], terms)
 
         with suppress(TimeoutError):
             await asyncio.wait_for(_collect(), timeout=timeout)
-        return list(adverts.values())
+
+        if chain is None:
+            return list(adverts.values())
+
+        # Verify bonds on-chain and keep only those meeting the threshold.
+        from jmswap.bond import select_bonded_providers
+
+        verified = await select_bonded_providers(
+            [a.terms for a in adverts.values()], chain, min_bond_value
+        )
+        by_pubkey = {a.terms.provider_pubkey: a.nostr_pubkey for a in adverts.values()}
+        return [
+            SwapAdvert(by_pubkey[terms.provider_pubkey], terms, verified_bond_value=value)
+            for terms, value in verified
+            if terms.provider_pubkey in by_pubkey
+        ]
 
     async def call(
         self, provider_pubkey: str, method: str, params: dict[str, Any], timeout: float = 30.0
