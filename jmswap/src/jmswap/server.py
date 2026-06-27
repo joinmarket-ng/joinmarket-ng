@@ -101,7 +101,62 @@ class SwapServer:
             if contract is None:
                 raise SwapProtocolError("unknown swap_id")
             return {"swap_id": swap_id, "state": contract.state.value}
+        if method == "coopclaim":
+            return await self._cooperative_claim(params)
         raise SwapProtocolError(f"unknown method {method!r}")
+
+    async def _cooperative_claim(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Co-sign a swap-out cooperative (key-path) claim and settle the invoice.
+
+        The client reveals the preimage here (so the provider settles its hold
+        invoice off-chain), then both co-sign the key-path spend; nothing is
+        revealed on-chain. Falls back to the script path if the client never
+        calls this.
+        """
+        from jmcore.bitcoin import sha256
+
+        from jmswap.cooperative import server_cosign_claim
+
+        swap_id = params["swap_id"]
+        contract = self.contracts.get(swap_id)
+        tree = self._trees.get(swap_id)
+        server_priv = self._privkeys.get(swap_id)
+        if contract is None or tree is None or server_priv is None:
+            raise SwapProtocolError("unknown swap_id")
+        if contract.direction != SwapDirection.SWAP_OUT:
+            raise SwapProtocolError("cooperative claim is only for swap-out")
+        if contract.lockup_txid is None or contract.lockup_vout is None:
+            raise SwapProtocolError("swap funding not yet on-chain")
+
+        preimage = bytes.fromhex(params["preimage"])
+        if sha256(preimage).hex() != contract.preimage_hash:
+            raise SwapVerificationError("preimage does not match the swap")
+
+        # Settle the hold invoice off-chain with the revealed preimage.
+        if contract.preimage is None:
+            await self._ln.settle_hold_invoice(contract.preimage_hash, params["preimage"])
+            contract.preimage = params["preimage"]
+        outpoint = SwapOutpoint(
+            txid=contract.lockup_txid,
+            vout=contract.lockup_vout,
+            value=contract.onchain_amount,
+            scriptpubkey=tree.funding_output_script(),
+        )
+        server_pubnonce, server_partial = server_cosign_claim(
+            tree,
+            outpoint,
+            bytes.fromhex(params["destination_spk"]),
+            int(params["fee"]),
+            server_priv,
+            bytes.fromhex(params["client_pubnonce"]),
+        )
+        if not contract.state.is_terminal:
+            contract.advance(SwapState.CLAIMED)
+        self._persist(contract)
+        return {
+            "server_pubnonce": server_pubnonce.hex(),
+            "server_partial": server_partial.hex(),
+        }
 
     # -- Swap creation --------------------------------------------------------
 
@@ -255,15 +310,18 @@ class SwapServer:
         contract.advance(SwapState.LOCKUP_SEEN)
         contract.advance(SwapState.LOCKUP_CONFIRMED)
 
-        # Watch for the client's claim, which reveals the preimage.
-        preimage = await self._await_claim_preimage(outpoint, contract)
-        contract.preimage = preimage.hex()
+        # The client either claims cooperatively (key-path; it reveals the
+        # preimage via the coopclaim RPC, which settles the invoice and advances
+        # to CLAIMED), or falls back to a script-path on-chain claim that we
+        # watch for here and settle from.
+        cooperative = await self._await_claim_preimage(outpoint, contract)
+        if cooperative is None:
+            return  # the cooperative RPC already settled and advanced the swap
+        contract.preimage = cooperative.hex()
         contract.advance(SwapState.CLAIMED)
-
-        # Settle the hold invoice with the revealed preimage.
-        await self._ln.settle_hold_invoice(contract.preimage_hash, preimage.hex())
+        await self._ln.settle_hold_invoice(contract.preimage_hash, cooperative.hex())
         self._persist(contract)
-        logger.info("swap-out {} settled on Lightning", swap_id)
+        logger.info("swap-out {} settled on Lightning (script-path claim)", swap_id)
 
     async def refund_expired(self) -> list[str]:
         """Refund any swap-out funding outputs whose timelock has expired.
@@ -317,12 +375,18 @@ class SwapServer:
             await asyncio.sleep(self._poll)
         raise SwapProtocolError("timed out waiting for the client's Lightning payment")
 
-    async def _await_claim_preimage(self, outpoint: SwapOutpoint, contract: SwapContract) -> bytes:
+    async def _await_claim_preimage(
+        self, outpoint: SwapOutpoint, contract: SwapContract
+    ) -> bytes | None:
+        """Preimage from a script-path on-chain claim, or ``None`` if the swap was
+        already settled cooperatively (key-path) via the coopclaim RPC."""
         for _ in range(MAX_POLLS):
+            if contract.preimage is not None or contract.state.is_terminal:
+                return None
             raw = await self._chain.find_spending_tx(outpoint.txid, outpoint.vout)
             if raw is not None:
                 preimage = extract_preimage_from_claim(raw)
                 if preimage is not None:
                     return preimage
             await asyncio.sleep(self._poll)
-        raise SwapProtocolError("timed out waiting for the client's on-chain claim")
+        raise SwapProtocolError("timed out waiting for the client's claim")

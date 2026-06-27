@@ -23,6 +23,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from jmcore.bitcoin import sha256
+from jmcore.taproot import TaprootTx
 from loguru import logger
 
 from jmswap.chain import ChainBackend
@@ -37,7 +38,7 @@ from jmswap.models import (
     SwapState,
 )
 from jmswap.spend import SwapOutpoint, build_claim_tx, estimate_fee
-from jmswap.swap_tree import verify_swap_tree
+from jmswap.swap_tree import SwapTree, verify_swap_tree
 from jmswap.wallet import SwapWallet
 
 Rpc = Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]]
@@ -142,12 +143,17 @@ class SwapClient:
             contract.advance(SwapState.LOCKUP_CONFIRMED)
 
             dest = await self._wallet.destination_scriptpubkey()
-            fee = estimate_fee(150, self._feerate)
-            claim_tx = build_claim_tx(tree, outpoint, preimage, priv, dest, fee)
+            # Prefer the cooperative MuSig2 key-path claim: an ordinary P2TR
+            # spend that reveals neither the preimage nor the swap script
+            # on-chain. Fall back to the trustless script-path claim if the
+            # provider does not cooperate.
+            claim_tx = await self._claim_swap_out(
+                rpc, contract, tree, outpoint, dest, preimage, priv
+            )
             contract.spend_txid = await self._chain.broadcast(claim_tx.serialize().hex())
             contract.advance(SwapState.CLAIMED)
 
-            result = await pay_task  # settles once the provider claims with our preimage
+            result = await pay_task  # settles once the provider has our preimage
             if result.status.value != "succeeded":
                 raise SwapProtocolError("hold invoice did not settle after claim")
         finally:
@@ -155,6 +161,44 @@ class SwapClient:
                 pay_task.cancel()
         logger.info("swap-out {} complete; received on-chain", contract.swap_id)
         return contract
+
+    async def _claim_swap_out(
+        self,
+        rpc: Rpc,
+        contract: SwapContract,
+        tree: SwapTree,
+        outpoint: SwapOutpoint,
+        dest: bytes,
+        preimage: bytes,
+        priv: bytes,
+    ) -> TaprootTx:
+        """Claim a swap-out, preferring the cooperative key-path spend."""
+        from jmswap.cooperative import cooperative_claim_client
+
+        fee = estimate_fee(110, self._feerate)  # cooperative (key-path) is smaller
+
+        async def cosign(client_pubnonce_hex: str) -> tuple[str, str]:
+            reply = await rpc(
+                "coopclaim",
+                {
+                    "swap_id": contract.swap_id,
+                    "destination_spk": dest.hex(),
+                    "fee": fee,
+                    "client_pubnonce": client_pubnonce_hex,
+                    "preimage": preimage.hex(),
+                },
+            )
+            return reply["server_pubnonce"], reply["server_partial"]
+
+        try:
+            tx = await cooperative_claim_client(tree, outpoint, dest, fee, priv, cosign)
+            logger.info("swap-out {} claimed cooperatively (key-path)", contract.swap_id)
+            return tx
+        except Exception as exc:  # noqa: BLE001 - fall back to the trustless script path
+            logger.warning("cooperative claim failed ({}); using script-path", exc)
+            return build_claim_tx(
+                tree, outpoint, preimage, priv, dest, estimate_fee(150, self._feerate)
+            )  # type: ignore[arg-type]
 
     # -- helpers --------------------------------------------------------------
 
