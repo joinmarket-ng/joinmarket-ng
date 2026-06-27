@@ -46,9 +46,16 @@ The provider is always the swap "server" and never pays a swap fee:
   ``complete_external_channel_funding`` (the maker uses the returned funding
   address as its CoinJoin change output, then supplies the resulting outpoint).
   This is validated live: a channel opens with its funding output supplied by an
-  external transaction. The open design item that remains is the maker-to-maker
-  negotiation of *who* opens the channel and the in-CoinJoin coordination of the
-  channel amount.
+  external transaction. The model is **taker-driven and needs no maker-to-maker
+  coordination**: makers do not know which other makers are in a round, so a
+  maker simply channelizes *its own* change. It opens an externally-funded
+  channel to an LN peer of its own choosing for its (deterministically computed)
+  change amount and hands the taker the channel's funding address as an ordinary
+  change address; the taker builds and broadcasts the CoinJoin as usual, and the
+  maker supplies the resulting outpoint once it has co-signed the transaction.
+  The remaining open item is purely operational: makers signalling their
+  channel-as-change preference and the exact-change-amount bookkeeping in the
+  live CoinJoin, which is a follow-up.
 
 Discovery and signalling run over **Nostr**: the provider advertises its terms
 as an addressable event and answers swap RPCs sent as NIP-04 encrypted DMs; the
