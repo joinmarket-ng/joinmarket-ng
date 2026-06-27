@@ -113,10 +113,12 @@ def sample_coinjoin_tx_data(
             ),
         },
         maker_change_outputs={
-            "maker1": TxOutput.from_address(
-                "bcrt1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qzf4jry",
-                990_000,
-            ),
+            "maker1": [
+                TxOutput.from_address(
+                    "bcrt1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qzf4jry",
+                    990_000,
+                )
+            ],
         },
         cj_amount=1_000_000,
         total_maker_fee=10_000,
@@ -583,14 +585,18 @@ class TestPhaseCollectSignaturesCompleteness:
                 ),
             },
             maker_change_outputs={
-                "maker1": TxOutput.from_address(
-                    "bcrt1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qzf4jry",
-                    501_000,
-                ),
-                "maker2": TxOutput.from_address(
-                    "bcrt1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qzf4jry",
-                    201_000,
-                ),
+                "maker1": [
+                    TxOutput.from_address(
+                        "bcrt1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qzf4jry",
+                        501_000,
+                    )
+                ],
+                "maker2": [
+                    TxOutput.from_address(
+                        "bcrt1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qzf4jry",
+                        201_000,
+                    )
+                ],
             },
             cj_amount=1_000_000,
             total_maker_fee=2_000,

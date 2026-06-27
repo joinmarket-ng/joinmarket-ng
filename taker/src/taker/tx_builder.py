@@ -41,7 +41,7 @@ class CoinJoinTxData:
     # Maker data (by nick)
     maker_inputs: dict[str, list[TxInput]]
     maker_cj_outputs: dict[str, TxOutput]
-    maker_change_outputs: dict[str, TxOutput]
+    maker_change_outputs: dict[str, list[TxOutput]]  # >1 per maker = split change
 
     # Amounts
     cj_amount: int
@@ -94,8 +94,9 @@ class CoinJoinTxBuilder:
         # Change outputs
         if tx_data.taker_change_output:
             all_outputs.append((tx_data.taker_change_output, "taker", "change"))
-        for nick, out in tx_data.maker_change_outputs.items():
-            all_outputs.append((out, nick, "change"))
+        for nick, outs in tx_data.maker_change_outputs.items():
+            for out in outs:
+                all_outputs.append((out, nick, "change"))
 
         # Shuffle for privacy
         random.shuffle(all_inputs)
@@ -327,7 +328,7 @@ def build_coinjoin_tx(
     # Build maker data
     maker_inputs: dict[str, list[TxInput]] = {}
     maker_cj_outputs: dict[str, TxOutput] = {}
-    maker_change_outputs: dict[str, TxOutput] = {}
+    maker_change_outputs: dict[str, list[TxOutput]] = {}
 
     combine_groups = combine_groups or {}
     maker_changes: dict[str, int] = {}
@@ -373,10 +374,29 @@ def build_coinjoin_tx(
             # Folder: its change is pooled into the funder's output below.
             continue
         total_change = maker_change + funder_extra.get(nick, 0)
+
+        # Split channel-as-change: a maker may emit its change across several
+        # funding outputs (each a channel it opened), so no single output equals
+        # its exact residual (subset-sum resistance). It supplies the explicit
+        # (address, amount) pieces, which must sum to its change.
+        pieces = maker_data[nick].get("change_outputs")
+        if pieces:
+            if sum(amt for _, amt in pieces) != total_change:
+                raise ValueError(
+                    f"Maker {nick} change_outputs sum {sum(a for _, a in pieces)} "
+                    f"!= computed change {total_change}"
+                )
+            outs = [
+                TxOutput.from_address(addr, amt) for addr, amt in pieces if amt > dust_threshold
+            ]
+            if outs:
+                maker_change_outputs[nick] = outs
+            continue
+
         if total_change > dust_threshold:
-            maker_change_outputs[nick] = TxOutput.from_address(
-                maker_data[nick]["change_addr"], total_change
-            )
+            maker_change_outputs[nick] = [
+                TxOutput.from_address(maker_data[nick]["change_addr"], total_change)
+            ]
         else:
             logger.warning(
                 f"Maker {nick} change {total_change} sats is below dust threshold "

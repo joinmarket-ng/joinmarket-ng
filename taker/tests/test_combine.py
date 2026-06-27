@@ -106,3 +106,35 @@ def test_build_coinjoin_combined_pools_change_into_one_output() -> None:
     combined_hex = tx_combined.hex()
     assert _count_outputs_to(combined_hex, A_CHG) == [501_000 + 401_000]  # pooled
     assert _count_outputs_to(combined_hex, B_CHG) == []  # folder has no change output
+
+
+def test_build_coinjoin_split_change_into_several_outputs() -> None:
+    """A maker can split its change across several funding outputs (subset-sum)."""
+    taker_utxos = [{"txid": "c" * 64, "vout": 0, "value": 5_000_000}]
+    cj_amount = 1_000_000
+    split_a = _addr(0x11)
+    split_b = _addr(0x12)
+    data = _maker_data()
+    # A's change is 501_000; split it into two funding outputs that sum to it.
+    data["A"]["change_outputs"] = [(split_a, 250_000), (split_b, 251_000)]
+
+    tx, _ = build_coinjoin_tx(
+        taker_utxos, TAKER_CJ, TAKER_CHG, 5_000_000, data, cj_amount, 2000, "regtest"
+    )
+    tx_hex = tx.hex()
+    assert _count_outputs_to(tx_hex, split_a) == [250_000]
+    assert _count_outputs_to(tx_hex, split_b) == [251_000]
+    # no single output equals A's exact residual (501_000)
+    assert _count_outputs_to(tx_hex, A_CHG) == []
+
+
+def test_split_change_must_sum_to_change() -> None:
+    import pytest
+
+    taker_utxos = [{"txid": "c" * 64, "vout": 0, "value": 5_000_000}]
+    data = _maker_data()
+    data["A"]["change_outputs"] = [(_addr(0x11), 100_000), (_addr(0x12), 100_000)]  # wrong sum
+    with pytest.raises(ValueError, match="!= computed change"):
+        build_coinjoin_tx(
+            taker_utxos, TAKER_CJ, TAKER_CHG, 5_000_000, data, 1_000_000, 2000, "regtest"
+        )
