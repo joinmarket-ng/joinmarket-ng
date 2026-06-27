@@ -41,6 +41,7 @@ from jmswap.models import (
 from jmswap.persistence import SwapStore
 from jmswap.recovery import is_refundable, refund
 from jmswap.spend import (
+    COOPERATIVE_TX_VBYTES,
     SwapOutpoint,
     build_claim_tx,
     estimate_fee,
@@ -68,6 +69,7 @@ class SwapServer:
         poll_interval: float = POLL_INTERVAL,
         store: SwapStore | None = None,
         min_confirmations: int = 1,
+        coop_claim_window_polls: int = 40,
     ) -> None:
         self.terms = terms
         self._ln = lightning
@@ -77,6 +79,7 @@ class SwapServer:
         self._poll = poll_interval
         self._store = store
         self._min_conf = max(min_confirmations, 1)
+        self._coop_window = max(coop_claim_window_polls, 0)
         self.contracts: dict[str, SwapContract] = {}
         self._trees: dict[str, SwapTree] = {}
         self._privkeys: dict[str, bytes] = {}
@@ -103,6 +106,8 @@ class SwapServer:
             return {"swap_id": swap_id, "state": contract.state.value}
         if method == "coopclaim":
             return await self._cooperative_claim(params)
+        if method == "coopclaim_in":
+            return await self._cooperative_claim_in(params)
         raise SwapProtocolError(f"unknown method {method!r}")
 
     async def _cooperative_claim(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -156,6 +161,53 @@ class SwapServer:
         return {
             "server_pubnonce": server_pubnonce.hex(),
             "server_partial": server_partial.hex(),
+        }
+
+    async def _cooperative_claim_in(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Co-sign a swap-in cooperative (key-path) claim of *our* on-chain coins.
+
+        On a swap-in the provider receives the on-chain HTLC, so it chooses the
+        destination and fee and co-signs the client's key-path spend to that
+        destination; the client finalizes and broadcasts it. We only co-sign
+        after having paid the client's invoice (``INVOICE_PAID``), so the client
+        cannot make us claim coins before we have paid for them. Nothing is
+        revealed on-chain (no preimage, no script).
+        """
+        from jmswap.cooperative import server_cosign_claim
+
+        swap_id = params["swap_id"]
+        contract = self.contracts.get(swap_id)
+        tree = self._trees.get(swap_id)
+        server_priv = self._privkeys.get(swap_id)
+        if contract is None or tree is None or server_priv is None:
+            raise SwapProtocolError("unknown swap_id")
+        if contract.direction != SwapDirection.SWAP_IN:
+            raise SwapProtocolError("coopclaim_in is only for swap-in")
+        if contract.lockup_txid is None or contract.lockup_vout is None:
+            raise SwapProtocolError("swap funding not yet on-chain")
+        if contract.preimage is None:
+            # We have not paid the client's invoice yet; refuse to give up coins.
+            raise SwapProtocolError("provider has not yet paid the invoice")
+        if contract.spend_txid is not None:
+            # Already swept via the script path; no cooperative claim needed.
+            raise SwapProtocolError("swap funding already claimed")
+
+        dest = await self._wallet.destination_scriptpubkey()
+        fee = estimate_fee(COOPERATIVE_TX_VBYTES, self._feerate)
+        outpoint = SwapOutpoint(
+            txid=contract.lockup_txid,
+            vout=contract.lockup_vout,
+            value=contract.onchain_amount,
+            scriptpubkey=tree.funding_output_script(),
+        )
+        server_pubnonce, server_partial = server_cosign_claim(
+            tree, outpoint, dest, fee, server_priv, bytes.fromhex(params["client_pubnonce"])
+        )
+        return {
+            "server_pubnonce": server_pubnonce.hex(),
+            "server_partial": server_partial.hex(),
+            "destination_spk": dest.hex(),
+            "fee": fee,
         }
 
     # -- Swap creation --------------------------------------------------------
@@ -286,6 +338,18 @@ class SwapServer:
             raise InsufficientLiquidityError("could not pay client's invoice; client may refund")
         contract.preimage = result.preimage
         contract.advance(SwapState.INVOICE_PAID)
+        self._persist(contract)
+
+        # Prefer the cooperative key-path claim: now that we have paid, the client
+        # co-signs (coopclaim_in) and broadcasts an ordinary P2TR spend to our
+        # address, revealing no preimage or script on-chain. Wait briefly for it;
+        # otherwise claim via the script path ourselves (the trustless fallback).
+        if await self._await_cooperative_in_spend(outpoint):
+            if not contract.state.is_terminal:
+                contract.advance(SwapState.CLAIMED)
+            self._persist(contract)
+            logger.info("swap-in {} claimed cooperatively (key-path)", swap_id)
+            return
 
         dest = await self._wallet.destination_scriptpubkey()
         fee = estimate_fee(150, self._feerate)
@@ -295,7 +359,7 @@ class SwapServer:
         contract.spend_txid = await self._chain.broadcast(claim_tx.serialize().hex())
         contract.advance(SwapState.CLAIMED)
         self._persist(contract)
-        logger.info("swap-in {} claimed on-chain", swap_id)
+        logger.info("swap-in {} claimed on-chain (script-path)", swap_id)
 
     async def _run_swap_out(self, swap_id: str) -> None:
         contract = self.contracts[swap_id]
@@ -364,6 +428,20 @@ class SwapServer:
                     )
             await asyncio.sleep(self._poll)
         raise SwapProtocolError("timed out waiting for the client's funding transaction")
+
+    async def _await_cooperative_in_spend(self, outpoint: SwapOutpoint) -> bool:
+        """Wait up to the cooperative window for the client to broadcast the
+        key-path claim of our swap-in coins. Returns ``True`` if the funding
+        output was spent (cooperatively), ``False`` on timeout (script-path
+        fallback). Safe to wait: only we (preimage) or the cooperative key-path
+        can spend before the far-future refund locktime.
+        """
+        for _ in range(self._coop_window):
+            raw = await self._chain.find_spending_tx(outpoint.txid, outpoint.vout)
+            if raw is not None:
+                return True
+            await asyncio.sleep(self._poll)
+        return False
 
     async def _await_inbound_held(self, contract: SwapContract) -> None:
         for _ in range(MAX_POLLS):

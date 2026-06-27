@@ -37,6 +37,11 @@ from jmswap.swap_tree import SwapTree
 # counterparty's ``(public_nonce_hex, partial_signature_hex)``.
 Cosigner = Callable[[str], Awaitable[tuple[str, str]]]
 
+# A swap-in cosign request: the *provider* is the claimer and chooses its own
+# destination + fee. Given the client's public nonce (hex), return the provider's
+# ``(public_nonce_hex, partial_signature_hex, destination_spk_hex, fee)``.
+CosignerIn = Callable[[str], Awaitable[tuple[str, str, str, int]]]
+
 
 def server_cosign_claim(
     tree: SwapTree,
@@ -77,6 +82,36 @@ async def cooperative_claim_client(
     server_pubnonce = bytes.fromhex(server_pubnonce_hex)
     server_partial = bytes.fromhex(server_partial_hex)
 
+    aggnonce = nonce_agg([server_pubnonce, client_pubnonce])
+    session = cooperative_session(tree, aggnonce, spend.sighash)
+    client_partial = sign_partial(client_secnonce, client_privkey, session)
+    return finalize_cooperative(
+        tree, spend, server_pubnonce, client_pubnonce, server_partial, client_partial
+    )
+
+
+async def cooperative_claim_swap_in(
+    tree: SwapTree,
+    outpoint: SwapOutpoint,
+    client_privkey: bytes,
+    cosign: CosignerIn,
+) -> TaprootTx:
+    """Swap-in helper: the client co-signs the *provider's* key-path claim.
+
+    On a swap-in the provider receives the on-chain coins, so it chooses the
+    destination and fee. ``cosign(client_pubnonce_hex)`` performs the single
+    round-trip and returns ``(server_pubnonce_hex, server_partial_hex,
+    destination_spk_hex, fee)``. The client finalizes the fully-signed key-path
+    transaction (which it then broadcasts on the provider's behalf), revealing no
+    preimage or script on-chain.
+    """
+    client_secnonce, client_pubnonce = cooperative_nonce(tree.client_pubkey)
+    server_pubnonce_hex, server_partial_hex, dest_hex, fee = await cosign(client_pubnonce.hex())
+    server_pubnonce = bytes.fromhex(server_pubnonce_hex)
+    server_partial = bytes.fromhex(server_partial_hex)
+    destination_spk = bytes.fromhex(dest_hex)
+
+    spend = build_cooperative_spend(tree, outpoint, destination_spk, int(fee))
     aggnonce = nonce_agg([server_pubnonce, client_pubnonce])
     session = cooperative_session(tree, aggnonce, spend.sighash)
     client_partial = sign_partial(client_secnonce, client_privkey, session)

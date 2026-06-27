@@ -113,12 +113,14 @@ itself (`jmswap`) is standalone and depends only on `jmcore`.
 A privacy audit of the code against the design surfaced four points; three are
 now addressed and one remains a deployment discipline:
 
-- **Cooperative key-path swap claim (addressed for swap-out).** The swap-out
-  happy path now settles with a 2-of-2 MuSig2 key-path spend (an ordinary P2TR
+- **Cooperative key-path swap claim (addressed for both directions).** Both swap
+  directions now settle with a 2-of-2 MuSig2 key-path spend (an ordinary P2TR
   signature, no preimage or tapscript on-chain), falling back to the script path
-  only if the counterparty does not cooperate; validated live. Swap-in still uses
-  the script path (the provider claims, and the client-initiated transport does
-  not yet let it solicit the client's cooperation) - a documented follow-up.
+  only if the counterparty does not cooperate. For swap-out the client claims and
+  the provider co-signs (`coopclaim`); for swap-in the provider receives the coins
+  and chooses the destination, the client co-signs and broadcasts on the
+  provider's behalf (`coopclaim_in`) after the provider has paid the invoice. The
+  swap-out path is validated live; both fall back trustlessly to the script path.
 - **Split / combined channel-as-change (addressed).** A maker can now emit its
   change as several funding outputs (`build_coinjoin_tx`'s `change_outputs`) so no
   single output equals its exact residual, and two makers can pool their change

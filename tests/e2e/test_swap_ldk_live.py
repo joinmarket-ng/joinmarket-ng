@@ -244,15 +244,22 @@ async def test_live_swap_in_over_ldk_and_bitcoind() -> None:
         miner_task.cancel()
 
     assert contract.state == SwapState.CLAIMED
-    # the provider's on-chain claim was accepted by bitcoind
     server_contract = next(iter(server.contracts.values()))
     for _ in range(30):
-        if server_contract.state == SwapState.CLAIMED and server_contract.spend_txid:
+        if server_contract.state == SwapState.CLAIMED:
             break
         await asyncio.sleep(2)
-    assert server_contract.spend_txid is not None
-    # bitcoind knows the claim transaction
-    assert rpc.call("getrawtransaction", [server_contract.spend_txid]) is not None
+    assert server_contract.state == SwapState.CLAIMED
+    # The happy path settles cooperatively: the client co-signed and broadcast an
+    # ordinary key-path spend to the provider; bitcoind accepted it and the
+    # funding output is spent.
+    assert contract.spend_txid is not None
+    claim = rpc.call("getrawtransaction", [contract.spend_txid, True])
+    assert claim is not None
+    # a cooperative key-path spend has a single-element witness (just the sig),
+    # revealing neither the preimage nor the swap script on-chain
+    assert len(claim["vin"][0]["txinwitness"]) == 1
+    assert rpc.call("gettxout", [contract.lockup_txid, contract.lockup_vout]) is None
 
     # 3) swap-out: the client now has outbound liquidity from the swap-in, so it
     # can pay the provider; the provider funds the on-chain HTLC and the client

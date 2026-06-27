@@ -95,7 +95,8 @@ class SwapClient:
         contract = self._contract(response, payment_hash, pub, priv)
         contract.advance(SwapState.AWAITING_LOCKUP)
 
-        await self._wallet.fund_swap(response.funding_address, response.onchain_amount)
+        outpoint = await self._wallet.fund_swap(response.funding_address, response.onchain_amount)
+        contract.lockup_txid, contract.lockup_vout = outpoint.txid, outpoint.vout
         contract.advance(SwapState.LOCKUP_SEEN)
         contract.advance(SwapState.LOCKUP_CONFIRMED)
 
@@ -103,8 +104,52 @@ class SwapClient:
         await self._await_invoice_settled(payment_hash)
         contract.advance(SwapState.CLAIMED)
         logger.info("swap-in {} complete; received Lightning", contract.swap_id)
-        _ = tree
+
+        # Best-effort: help the provider claim its coins via the cooperative
+        # key-path spend (an ordinary P2TR signature, no preimage or script
+        # on-chain), improving the on-chain privacy of the whole swap. If the
+        # provider declines or anything fails, it falls back to its own
+        # script-path claim, so we never block the completed swap on this.
+        await self._offer_cooperative_swap_in(rpc, contract, tree, outpoint, priv)
         return contract
+
+    async def _offer_cooperative_swap_in(
+        self,
+        rpc: Rpc,
+        contract: SwapContract,
+        tree: SwapTree,
+        outpoint: SwapOutpoint,
+        client_priv: bytes,
+    ) -> None:
+        """Co-sign and broadcast the provider's cooperative key-path claim."""
+        from jmswap.cooperative import cooperative_claim_swap_in
+
+        async def cosign(client_pubnonce_hex: str) -> tuple[str, str, str, int]:
+            reply = await rpc(
+                "coopclaim_in",
+                {"swap_id": contract.swap_id, "client_pubnonce": client_pubnonce_hex},
+            )
+            return (
+                reply["server_pubnonce"],
+                reply["server_partial"],
+                reply["destination_spk"],
+                int(reply["fee"]),
+            )
+
+        # The provider only co-signs once it has recorded paying our invoice;
+        # retry briefly to ride out the settle/pay ordering race.
+        for attempt in range(20):
+            try:
+                tx = await cooperative_claim_swap_in(tree, outpoint, client_priv, cosign)
+                contract.spend_txid = await self._chain.broadcast(tx.serialize().hex())
+                logger.info("swap-in {} provider claim co-signed (key-path)", contract.swap_id)
+                return
+            except Exception as exc:  # noqa: BLE001 - provider falls back to script-path
+                if "not yet paid" in str(exc) and attempt < 19:
+                    await asyncio.sleep(self._poll)
+                    continue
+                logger.debug("cooperative swap-in claim skipped ({})", exc)
+                return
 
     async def swap_out(self, rpc: Rpc, terms: ProviderTerms, amount: int) -> SwapContract:
         """Receive ``amount`` sats on-chain by paying a Lightning hold invoice."""

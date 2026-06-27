@@ -30,7 +30,9 @@ from jmswap.wallet import FakeSwapWallet
 PROVIDER_SWAP_PUBKEY = PrivateKey().public_key.format(compressed=True).hex()
 
 
-def _build_world() -> tuple[SwapServer, SwapClient, ProviderTerms]:
+def _build_world(
+    *, coop_claim_window_polls: int = 40
+) -> tuple[SwapServer, SwapClient, ProviderTerms, FakeChainBackend]:
     chain = FakeChainBackend(height=500)
     net = FakeLightningNetwork()
     provider_ln = FakeLightningBackend(net, "aa" * 33)
@@ -48,9 +50,16 @@ def _build_world() -> tuple[SwapServer, SwapClient, ProviderTerms]:
         cltv_delta=144,
         accepts_whole_coin=True,
     )
-    server = SwapServer(terms, provider_ln, chain, provider_wallet, poll_interval=0.01)
+    server = SwapServer(
+        terms,
+        provider_ln,
+        chain,
+        provider_wallet,
+        poll_interval=0.01,
+        coop_claim_window_polls=coop_claim_window_polls,
+    )
     client = SwapClient(client_ln, chain, client_wallet, poll_interval=0.01)
-    return server, client, terms
+    return server, client, terms, chain
 
 
 def _direct_rpc(server: SwapServer):
@@ -61,22 +70,49 @@ def _direct_rpc(server: SwapServer):
 
 
 async def test_swap_in_end_to_end() -> None:
-    """Client funds on-chain, provider pays Lightning and claims the HTLC."""
-    server, client, terms = _build_world()
+    """Client funds on-chain, provider pays Lightning and claims the HTLC.
+
+    The happy path now settles via the cooperative key-path: the client co-signs
+    and broadcasts an ordinary P2TR spend to the provider, revealing no preimage
+    or script on-chain.
+    """
+    from jmswap.spend import extract_preimage_from_claim
+
+    server, client, terms, chain = _build_world()
     rpc = _direct_rpc(server)
     contract = await asyncio.wait_for(client.swap_in(rpc, terms, amount=200_000), timeout=10)
     assert contract.direction == SwapDirection.SWAP_IN
     assert contract.state == SwapState.CLAIMED
-    # the provider's side also reached CLAIMED and recorded its on-chain claim
     server_contract = next(iter(server.contracts.values()))
     await _wait_state(server_contract, SwapState.CLAIMED)
-    assert server_contract.spend_txid is not None
+    # The provider learned the preimage off-chain (paying the invoice), but the
+    # on-chain spend is a key-path spend that reveals neither preimage nor script.
     assert server_contract.preimage is not None
+    raw = await chain.find_spending_tx(server_contract.lockup_txid, server_contract.lockup_vout)
+    assert raw is not None
+    assert extract_preimage_from_claim(raw) is None  # cooperative key-path, no preimage
+
+
+async def test_swap_in_script_path_fallback() -> None:
+    """With no cooperative window, the provider claims via the script path."""
+    from jmswap.spend import extract_preimage_from_claim
+
+    server, client, terms, chain = _build_world(coop_claim_window_polls=0)
+    rpc = _direct_rpc(server)
+    contract = await asyncio.wait_for(client.swap_in(rpc, terms, amount=200_000), timeout=10)
+    assert contract.state == SwapState.CLAIMED
+    server_contract = next(iter(server.contracts.values()))
+    await _wait_state(server_contract, SwapState.CLAIMED)
+    # The provider swept on-chain itself, revealing the preimage in the witness.
+    assert server_contract.spend_txid is not None
+    raw = await chain.get_transaction(server_contract.spend_txid)
+    assert raw is not None
+    assert extract_preimage_from_claim(raw) is not None
 
 
 async def test_swap_out_end_to_end() -> None:
     """Client pays Lightning, provider funds on-chain, client claims it."""
-    server, client, terms = _build_world()
+    server, client, terms, _chain = _build_world()
     rpc = _direct_rpc(server)
     contract = await asyncio.wait_for(client.swap_out(rpc, terms, amount=150_000), timeout=10)
     assert contract.direction == SwapDirection.SWAP_OUT
@@ -90,7 +126,7 @@ async def test_swap_out_end_to_end() -> None:
 
 async def test_whole_coin_swap_in() -> None:
     """Third-role style: a whole-coin swap-in charges only the base fee."""
-    server, client, terms = _build_world()
+    server, client, terms, _chain = _build_world()
     rpc = _direct_rpc(server)
     contract = await asyncio.wait_for(
         client.swap_in(rpc, terms, amount=500_000, whole_coin=True), timeout=10
@@ -101,7 +137,7 @@ async def test_whole_coin_swap_in() -> None:
 
 
 async def test_swap_rejects_out_of_limits() -> None:
-    server, client, terms = _build_world()
+    server, client, terms, _chain = _build_world()
     rpc = _direct_rpc(server)
     with pytest.raises(SwapProtocolError):
         await client.swap_in(rpc, terms, amount=5_000)  # below min_amount
@@ -109,7 +145,7 @@ async def test_swap_rejects_out_of_limits() -> None:
 
 async def test_swap_in_over_nostr() -> None:
     """The full advertise/discover/RPC path over the in-process Nostr relay."""
-    server, client, terms = _build_world()
+    server, client, terms, _chain = _build_world()
     relay = LoopbackRelay()
     provider_node = SwapNostrNode(PrivateKey().secret, relay)
     client_node = SwapNostrNode(PrivateKey().secret, relay)
