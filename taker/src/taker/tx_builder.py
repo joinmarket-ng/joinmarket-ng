@@ -268,6 +268,7 @@ def build_coinjoin_tx(
     tx_fee: int,
     network: str = "mainnet",
     dust_threshold: int = 27300,  # Default to DUST_THRESHOLD from jmcore.constants
+    combine_groups: dict[str, str] | None = None,  # folder_nick -> funder_nick
 ) -> tuple[bytes, dict[str, Any]]:
     """
     Build a complete CoinJoin transaction.
@@ -328,6 +329,9 @@ def build_coinjoin_tx(
     maker_cj_outputs: dict[str, TxOutput] = {}
     maker_change_outputs: dict[str, TxOutput] = {}
 
+    combine_groups = combine_groups or {}
+    maker_changes: dict[str, int] = {}
+
     for nick, data in maker_data.items():
         # Maker inputs
         maker_inputs[nick] = [
@@ -343,35 +347,40 @@ def build_coinjoin_tx(
         # Maker CJ output (cj_amount)
         maker_cj_outputs[nick] = TxOutput.from_address(data["cj_addr"], cj_amount)
 
-        # Maker change output
+        # Maker change
         # Formula: change = inputs - cj_amount - txfee + cjfee
         # (Maker pays txfee, receives cjfee from taker)
         maker_total_input = sum(u["value"] for u in data["utxos"])
         maker_txfee = data.get("txfee", 0)
         maker_change = maker_total_input - cj_amount - maker_txfee + data["cjfee"]
 
-        logger.debug(
-            f"Maker {nick} change calculation: "
-            f"inputs={maker_total_input}, cj_amount={cj_amount}, "
-            f"cjfee={data['cjfee']}, txfee={maker_txfee}, change={maker_change}, "
-            f"dust_threshold={dust_threshold}"
-        )
-
         if maker_change < 0:
-            # Negative change means maker's UTXOs are insufficient
-            # This can happen if UTXO verification failed (value=0) or if UTXOs were spent
             raise ValueError(
                 f"Maker {nick} has insufficient funds: inputs={maker_total_input} sats, "
                 f"required={cj_amount + maker_txfee - data['cjfee']} sats, "
                 f"change={maker_change} sats. Maker's UTXOs may have been spent."
             )
-        elif maker_change > dust_threshold:
-            maker_change_outputs[nick] = TxOutput.from_address(data["change_addr"], maker_change)
+        maker_changes[nick] = maker_change
+
+    # Combined channel-as-change: a "folder" maker's change folds into its
+    # "funder" maker's single shared funding output (no separate folder change).
+    funder_extra: dict[str, int] = {}
+    for folder, funder in combine_groups.items():
+        funder_extra[funder] = funder_extra.get(funder, 0) + maker_changes.get(folder, 0)
+
+    for nick, maker_change in maker_changes.items():
+        if nick in combine_groups:
+            # Folder: its change is pooled into the funder's output below.
+            continue
+        total_change = maker_change + funder_extra.get(nick, 0)
+        if total_change > dust_threshold:
+            maker_change_outputs[nick] = TxOutput.from_address(
+                maker_data[nick]["change_addr"], total_change
+            )
         else:
             logger.warning(
-                f"Maker {nick} change {maker_change} sats is below dust threshold "
-                f"({dust_threshold}), "
-                "no change output will be created"
+                f"Maker {nick} change {total_change} sats is below dust threshold "
+                f"({dust_threshold}), no change output will be created"
             )
 
     tx_data = CoinJoinTxData(
