@@ -108,6 +108,35 @@ docker-compose profile brings up a Nostr relay and two LDK Server nodes
 (`ldk-provider`, `ldk-client`) on regtest for end-to-end testing. The library
 itself (`jmswap`) is standalone and depends only on `jmcore`.
 
+## Privacy fidelity (what is actually achieved)
+
+A privacy audit of the code against the design surfaced four points where the
+deployed behaviour is weaker than the ideal, and they are the honest caveats:
+
+- **Swaps settle via the revealing script path, not the cooperative key path.**
+  The MuSig2 cooperative-spend machinery exists but is not wired into the swap
+  happy path, so claims publish the swap tapscript *and the preimage* on-chain:
+  every swap is on-chain-identifiable and the preimage cross-correlates with the
+  Lightning HTLC. Wiring the MuSig2 key-path claim (script path as the fallback)
+  is the top hardening step to reach the "indistinguishable from ordinary P2TR"
+  property.
+- **A single per-maker channel-as-change output equals the maker's exact
+  change/residual**, so it breaks the cross-slot peel chain but does *not* escape
+  per-round subset-sum change-matching; only the split and combined variants
+  defeat value attribution.
+- **The self-2-of-2 channel-change recovery sweep re-links the funds** (it spends
+  the funding output back into the wallet). The privacy holds only if the output
+  is used as a real channel and cooperatively closed (a decorrelated balance);
+  the sweep is a recovery tool, not the privacy path.
+- **Fidelity bonds are advertised and client-filtered but not verified on-chain**,
+  so sybil resistance is assumed, not enforced, until bond verification lands.
+
+What *is* achieved as implemented: the cross-slot peel-chain break (the deployable
+~100-effective-wallets win), per-swap key isolation, a swap-in coin whose only
+on-chain parent is the funder's transaction (a 1-in/1-out claim, no co-spend),
+combined funding that defeats the single-owner partition, and cooperative
+sweeps/closes that are themselves ordinary P2TR key-path spends.
+
 ## Limitations
 
 The break is structural and on-chain, not perfection. A force close re-exposes
