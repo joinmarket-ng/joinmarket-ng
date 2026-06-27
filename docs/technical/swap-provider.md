@@ -110,26 +110,28 @@ itself (`jmswap`) is standalone and depends only on `jmcore`.
 
 ## Privacy fidelity (what is actually achieved)
 
-A privacy audit of the code against the design surfaced four points where the
-deployed behaviour is weaker than the ideal, and they are the honest caveats:
+A privacy audit of the code against the design surfaced four points; three are
+now addressed and one remains a deployment discipline:
 
-- **Swaps settle via the revealing script path, not the cooperative key path.**
-  The MuSig2 cooperative-spend machinery exists but is not wired into the swap
-  happy path, so claims publish the swap tapscript *and the preimage* on-chain:
-  every swap is on-chain-identifiable and the preimage cross-correlates with the
-  Lightning HTLC. Wiring the MuSig2 key-path claim (script path as the fallback)
-  is the top hardening step to reach the "indistinguishable from ordinary P2TR"
-  property.
-- **A single per-maker channel-as-change output equals the maker's exact
-  change/residual**, so it breaks the cross-slot peel chain but does *not* escape
-  per-round subset-sum change-matching; only the split and combined variants
-  defeat value attribution.
+- **Cooperative key-path swap claim (addressed for swap-out).** The swap-out
+  happy path now settles with a 2-of-2 MuSig2 key-path spend (an ordinary P2TR
+  signature, no preimage or tapscript on-chain), falling back to the script path
+  only if the counterparty does not cooperate; validated live. Swap-in still uses
+  the script path (the provider claims, and the client-initiated transport does
+  not yet let it solicit the client's cooperation) - a documented follow-up.
+- **Split / combined channel-as-change (addressed).** A maker can now emit its
+  change as several funding outputs (`build_coinjoin_tx`'s `change_outputs`) so no
+  single output equals its exact residual, and two makers can pool their change
+  into one shared output; both defeat the per-output change-match a single
+  per-maker output is vulnerable to.
+- **On-chain fidelity-bond verification (addressed).** Providers advertise a real
+  timelocked bond and clients verify it on-chain (`jmswap.verify_provider_bond` /
+  `select_bonded_providers`): a sybil that merely sets `bond_value` is filtered
+  out.
 - **The self-2-of-2 channel-change recovery sweep re-links the funds** (it spends
   the funding output back into the wallet). The privacy holds only if the output
-  is used as a real channel and cooperatively closed (a decorrelated balance);
+  is used as a *real* channel and cooperatively closed (a decorrelated balance);
   the sweep is a recovery tool, not the privacy path.
-- **Fidelity bonds are advertised and client-filtered but not verified on-chain**,
-  so sybil resistance is assumed, not enforced, until bond verification lands.
 
 What *is* achieved as implemented: the cross-slot peel-chain break (the deployable
 ~100-effective-wallets win), per-swap key isolation, a swap-in coin whose only
