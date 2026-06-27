@@ -457,6 +457,17 @@ class ProtocolHandlersMixin:
                 restrict_md0=not self.config.allow_mixdepth_zero_merge,
                 channel_change=getattr(self.config, "swap_provider", None) is not None
                 and self.config.swap_provider.channel_change,
+                ldk=(
+                    self.ldk_backend()
+                    if getattr(self.config, "swap_provider", None) is not None
+                    and self.config.swap_provider.channel_change
+                    else None
+                ),
+                channel_peer=(
+                    self.config.swap_provider.channel_peer
+                    if getattr(self.config, "swap_provider", None) is not None
+                    else None
+                ),
             )
             session = MakerSession(inner=session_inner)
 

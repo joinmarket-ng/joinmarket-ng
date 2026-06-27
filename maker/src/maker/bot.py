@@ -683,6 +683,27 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
             logger.error(f"Failed to start maker bot: {e}")
             raise
 
+    def ldk_backend(self) -> object | None:
+        """Build (and cache) an LdkServerBackend from config, or None if unset.
+
+        Shared by the swap-provider role and channel-as-change.
+        """
+        cached = getattr(self, "_ldk_backend_cache", "unset")
+        if cached != "unset":
+            return cached
+        sp = getattr(self.config, "swap_provider", None)
+        backend: object | None = None
+        if sp is not None and sp.ldk_grpc_url:
+            from jmswap.ldk import HttpxLdkTransport, LdkServerBackend
+
+            api_key = sp.ldk_api_key
+            if api_key is None and sp.ldk_api_key_path:
+                with open(sp.ldk_api_key_path, "rb") as fh:
+                    api_key = fh.read().hex()
+            backend = LdkServerBackend(HttpxLdkTransport(sp.ldk_grpc_url), api_key or "")
+        self._ldk_backend_cache = backend
+        return backend
+
     def _build_swap_server(self) -> tuple[object, object, str]:
         """Construct the SwapServer, SwapNostrNode and provider terms.
 
@@ -691,7 +712,6 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         """
         from decimal import Decimal
 
-        from jmswap.ldk import HttpxLdkTransport, LdkServerBackend
         from jmswap.lightning import FakeLightningBackend, FakeLightningNetwork
         from jmswap.models import ProviderTerms, SwapDirection
         from jmswap.nostr import RelayTransport, SwapNostrNode
@@ -707,13 +727,8 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         identity_pubkey = identity_key.get_public_key_bytes(compressed=True).hex()
 
         # Lightning backend: LDK Server if configured, else an isolated fake.
-        lightning: object
-        if sp.ldk_grpc_url:
-            api_key = sp.ldk_api_key
-            if api_key is None and sp.ldk_api_key_path:
-                api_key = open(sp.ldk_api_key_path, "rb").read().hex()
-            lightning = LdkServerBackend(HttpxLdkTransport(sp.ldk_grpc_url), api_key or "")
-        else:
+        lightning: object = self.ldk_backend()
+        if lightning is None:
             logger.warning("swap provider enabled without ldk_grpc_url; using a fake LN backend")
             lightning = FakeLightningBackend(FakeLightningNetwork())
 

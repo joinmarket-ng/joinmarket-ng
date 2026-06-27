@@ -107,7 +107,12 @@ def test_build_swap_server_wires_terms(wallet: WalletService) -> None:
             nostr_relays=["ws://localhost:7000"],
         ),
     )
-    bot = SimpleNamespace(config=config, wallet=wallet, backend=wallet.backend)
+    bot = SimpleNamespace(
+        config=config,
+        wallet=wallet,
+        backend=wallet.backend,
+        ldk_backend=lambda: None,
+    )
     server, nostr_node, identity = MakerBot._build_swap_server(bot)  # type: ignore[arg-type]
     assert server.terms.network == "regtest"
     assert server.terms.min_amount == 40_000

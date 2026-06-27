@@ -68,6 +68,8 @@ class CoinJoinSession:
         merge_algorithm: str = "default",
         restrict_md0: bool = True,
         channel_change: bool = False,
+        ldk: object | None = None,
+        channel_peer: str | None = None,
     ):
         self.taker_nick = taker_nick
         self.offer = offer
@@ -79,8 +81,14 @@ class CoinJoinSession:
         self.taker_utxo_amtpercent = taker_utxo_amtpercent
         self.merge_algorithm = merge_algorithm  # UTXO selection strategy
         self.restrict_md0 = restrict_md0  # Mixdepth 0 UTXO merge restriction
-        # Experimental: emit change as a Taproot channel-funding output.
+        # Experimental: emit change as a Taproot channel-funding output. When an
+        # LDK Server backend and an LN peer are configured, channelize the change
+        # into a real externally-funded Lightning channel.
         self.channel_change = channel_change
+        self.ldk = ldk
+        self.channel_peer = channel_peer
+        self._channel_user_id: str | None = None
+        self._channel_funding_spk: bytes | None = None
 
         self.state = CoinJoinState.IDLE
         self.amount = 0
@@ -517,6 +525,11 @@ class CoinJoinSession:
             if not signatures:
                 return False, {"error": "Failed to sign transaction"}
 
+            # Channel-as-change: now that we have co-signed the final transaction,
+            # supply the channel funding outpoint so the channel can complete once
+            # the taker broadcasts the round.
+            await self._complete_channel_change(tx_hex)
+
             # Compute txid from the unsigned transaction for history tracking
             # The txid is computed from the non-witness data so we can calculate it now
             from jmcore.bitcoin import get_txid
@@ -628,7 +641,14 @@ class CoinJoinSession:
             cj_index = self.wallet.get_next_address_index(cj_output_mixdepth, 1)
             cj_address = self.wallet.get_change_address(cj_output_mixdepth, cj_index)
 
-            change_address = self._build_change_address(max_mixdepth)
+            # The maker's change is deterministic and must match the taker's
+            # computation exactly (taker/tx_builder.py): inputs - cj_amount -
+            # txfee + cjfee. This is the value channelled when channel-as-change
+            # with a real Lightning channel is enabled.
+            change_amount = (
+                sum(u.value for u in selected) - self.amount - self.offer.txfee + real_cjfee
+            )
+            change_address = await self._build_change_address(max_mixdepth, change_amount)
 
             # Reserve addresses immediately after selection to prevent reuse
             # in concurrent CoinJoin sessions. Once shared with a taker, addresses
@@ -651,14 +671,22 @@ class CoinJoinSession:
             logger.error(f"Failed to select UTXOs: {e}")
             return {}, "", "", -1
 
-    def _build_change_address(self, max_mixdepth: int) -> str:
+    async def _build_change_address(self, max_mixdepth: int, change_amount: int) -> str:
         """Return the change address, optionally a Taproot channel-funding output.
 
-        With ``channel_change`` enabled, the change is emitted as a recoverable
-        simple-taproot 2-of-2 funding output (no chaining successor in the
-        wallet); otherwise a plain change address at ``max_mixdepth``.
+        With ``channel_change`` enabled the change is emitted as a Taproot
+        channel-funding output (no chaining successor). When a Lightning backend
+        (``self.ldk``) and a channel peer are configured, it opens a *real*
+        externally-funded Lightning channel for the exact change amount and uses
+        the channel's funding address (taker-driven: the maker channelizes only
+        its own change). Otherwise it falls back to a recoverable self-2-of-2
+        funding output, then a plain change address.
         """
-        if self.channel_change:
+        if self.channel_change and change_amount > 0:
+            address = await self._open_channel_change(change_amount)
+            if address is not None:
+                return address
+            # fall back to a self-2-of-2 funding output (tracked + sweepable)
             data_dir = getattr(self.wallet, "data_dir", None)
             if data_dir:
                 try:
@@ -672,19 +700,71 @@ class CoinJoinSession:
                     store = ChannelChangeStore(Path(data_dir) / "channel_changes")
                     address = emit_channel_change_address(self.wallet, store)
                     logger.warning(
-                        "emitting CoinJoin change as a Taproot channel-funding "
-                        "output {} (experimental; not tracked by the P2WPKH wallet)",
+                        "emitting CoinJoin change as a self-funded Taproot output {} "
+                        "(no Lightning peer configured)",
                         address,
                     )
                     return address
                 except Exception as exc:  # noqa: BLE001 - never block a CoinJoin
                     logger.error("channel-change emission failed, using plain change: {}", exc)
-            else:
-                logger.warning(
-                    "channel_change enabled but wallet has no data_dir; using plain change"
-                )
         change_index = self.wallet.get_next_address_index(max_mixdepth, 1)
         return self.wallet.get_change_address(max_mixdepth, change_index)
+
+    async def _open_channel_change(self, change_amount: int) -> str | None:
+        """Open a real externally-funded Lightning channel for the change amount.
+
+        Returns the channel funding address (to use as the CoinJoin change), or
+        ``None`` if no Lightning backend/peer is configured or the open fails.
+        The funding outpoint is supplied later from :meth:`handle_tx`.
+        """
+        ldk = getattr(self, "ldk", None)
+        peer = getattr(self, "channel_peer", None)
+        if ldk is None or not peer or "@" not in peer:
+            return None
+        try:
+            from jmcore.bitcoin import address_to_scriptpubkey
+            from jmswap.channel_funding import request_external_channel_funding
+
+            peer_node_id, peer_address = peer.split("@", 1)
+            user_channel_id, funding_address = await request_external_channel_funding(
+                ldk,
+                peer_node_id,
+                peer_address,
+                change_amount,
+                self.wallet.network,
+                timeout=float(getattr(self, "channel_open_timeout", 45.0)),
+            )
+            self._channel_user_id = user_channel_id
+            self._channel_funding_spk = address_to_scriptpubkey(funding_address)
+            logger.info(
+                "channel-as-change: opened channel {} funding {} sats at {}",
+                user_channel_id,
+                change_amount,
+                funding_address,
+            )
+            return funding_address
+        except Exception as exc:  # noqa: BLE001 - never block a CoinJoin
+            logger.error("channel-as-change open failed, falling back: {}", exc)
+            return None
+
+    async def _complete_channel_change(self, tx_hex: str) -> None:
+        """Supply the CoinJoin funding outpoint to LDK after co-signing the tx."""
+        user_id = getattr(self, "_channel_user_id", None)
+        spk = getattr(self, "_channel_funding_spk", None)
+        ldk = getattr(self, "ldk", None)
+        if not user_id or spk is None or ldk is None:
+            return
+        try:
+            from jmcore.bitcoin import get_txid, parse_transaction
+            from jmswap.channel_funding import complete_external_channel_funding
+
+            tx = parse_transaction(tx_hex)
+            vout = next(i for i, o in enumerate(tx.outputs) if o.script == spk)
+            txid = get_txid(tx_hex)
+            await complete_external_channel_funding(ldk, user_id, txid, vout)
+            logger.info("channel-as-change: provided funding outpoint {}:{}", txid, vout)
+        except Exception as exc:  # noqa: BLE001 - the maker still co-signs the round
+            logger.error("channel-as-change outpoint provision failed: {}", exc)
 
     async def _sign_transaction(self, tx_hex: str) -> list[str]:
         """Sign our inputs in the transaction.

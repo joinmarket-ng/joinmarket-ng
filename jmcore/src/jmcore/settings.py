@@ -680,8 +680,16 @@ class SwapProviderSettings(BaseModel):
         description=(
             "Experimental: emit CoinJoin change as a Taproot channel-funding "
             "output (no chaining successor) instead of a plain change output. "
-            "Requires P2TR wallet tracking and Lightning dual-funding to be "
-            "production-ready; OFF by default."
+            "When channel_peer and an LDK Server are set, opens a real "
+            "externally-funded Lightning channel for the change; otherwise a "
+            "recoverable self-2-of-2 funding output. OFF by default."
+        ),
+    )
+    channel_peer: str | None = Field(
+        default=None,
+        description=(
+            "Lightning peer 'node_id@host:port' to open channel-as-change "
+            "channels to (the maker channelizes its own change to this peer)."
         ),
     )
     ldk_grpc_url: str | None = Field(

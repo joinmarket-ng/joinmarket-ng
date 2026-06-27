@@ -435,6 +435,7 @@
 # bond_value = 0              # advertised fidelity-bond value in sats (sybil resistance)
 # accepts_whole_coin = false  # third role: absorb a client's whole UTXO, no change
 # channel_change = false      # experimental: emit change as a Taproot channel-funding output
+# channel_peer = "node_id@host:port"  # LN peer to open channel-as-change channels to
 # ldk_grpc_url = "https://jm-ldk-provider:3536"
 # ldk_api_key_path = "/data/bitcoin/api_key"
 

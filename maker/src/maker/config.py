@@ -157,6 +157,7 @@ class SwapProviderConfig(BaseModel):
     bond_value: int = Field(default=0, ge=0)
     accepts_whole_coin: bool = False
     channel_change: bool = False
+    channel_peer: str | None = None
     ldk_grpc_url: str | None = None
     ldk_api_key: str | None = None
     ldk_api_key_path: str | None = None

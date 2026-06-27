@@ -398,6 +398,7 @@ def build_maker_config(
             bond_value=settings.maker.swap_provider.bond_value,
             accepts_whole_coin=settings.maker.swap_provider.accepts_whole_coin,
             channel_change=settings.maker.swap_provider.channel_change,
+            channel_peer=settings.maker.swap_provider.channel_peer,
             ldk_grpc_url=settings.maker.swap_provider.ldk_grpc_url,
             ldk_api_key=settings.maker.swap_provider.ldk_api_key,
             ldk_api_key_path=settings.maker.swap_provider.ldk_api_key_path,
