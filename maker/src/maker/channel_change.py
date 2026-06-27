@@ -12,13 +12,12 @@ cooperatively swept back into the wallet (:func:`sweep_channel_change`, an
 ordinary P2TR key-path spend), with each emitted output persisted so the funds
 are always recoverable from the seed plus the record's key index.
 
-The remaining production step is the real Lightning dual-funding negotiation: a
-node opening a channel whose funding output *is* this CoinJoin output, via an
-externally-assembled-PSBT funding flow (LND's ``PsbtShim`` / ``skip_finalize``).
-LDK Server does not expose externally-funded channel opens, so the live
-integration targets LND; the on-chain shape and its cooperative close are
-implemented and validated here. The feature stays OFF by default until that
-LN-side negotiation lands.
+Opening a *real Lightning channel* whose funding output is this CoinJoin output
+is supported via a forked LDK Server (see ``ldk_server/patches/``) and the
+``jmswap.channel_funding`` helpers; the maker uses the channel's funding address
+as its CoinJoin change output and then provides the resulting outpoint. The
+feature stays OFF by default until the maker-to-maker negotiation of who opens
+the channel (and the in-CoinJoin coordination of the channel amount) lands.
 """
 
 from __future__ import annotations

@@ -37,11 +37,18 @@ The provider is always the swap "server" and never pays a swap fee:
   so the change has no chaining successor in the wallet. Today both funding keys
   are derived from the maker's seed, so the output is tracked on-chain and
   cooperatively swept back with ``jm-maker swap-channel-sweep`` (an ordinary
-  P2TR key-path spend, validated against bitcoind). The remaining production
-  step is opening a real Lightning channel whose funding output *is* this
-  CoinJoin output, via an externally-assembled-PSBT funding flow (LND's
-  ``PsbtShim``/``skip_finalize``); LDK Server does not expose externally-funded
-  opens, so that integration targets LND.
+  P2TR key-path spend, validated against bitcoind). Opening a *real Lightning
+  channel* whose funding output is the CoinJoin output is also supported: a
+  forked LDK Server (built from the patches in ``ldk_server/patches/``) exposes
+  externally-funded channel opens via LDK's
+  ``unsafe_manual_funding_transaction_generated``, driven by
+  ``jmswap.request_external_channel_funding`` /
+  ``complete_external_channel_funding`` (the maker uses the returned funding
+  address as its CoinJoin change output, then supplies the resulting outpoint).
+  This is validated live: a channel opens with its funding output supplied by an
+  external transaction. The open design item that remains is the maker-to-maker
+  negotiation of *who* opens the channel and the in-CoinJoin coordination of the
+  channel amount.
 
 Discovery and signalling run over **Nostr**: the provider advertises its terms
 as an addressable event and answers swap RPCs sent as NIP-04 encrypted DMs; the
