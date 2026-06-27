@@ -164,14 +164,14 @@ jobs:
       - uses: ./.github/actions/setup-python-deps
         with:
           python-version: ${{ matrix.python-version }}
-          components: jmcore,jmwallet,directory_server,orderbook_watcher,maker,taker,jmwalletd,tumbler
+          components: jmcore,jmwallet,directory_server,orderbook_watcher,maker,taker,jmwalletd,tumbler,jmswap
           install-dev: 'true'
 
       - name: Run unit tests
         run: |
-          pytest -c pytest.ini jmcore jmwallet directory_server orderbook_watcher maker taker jmwalletd tumbler \
+          pytest -c pytest.ini jmcore jmwallet directory_server orderbook_watcher maker taker jmwalletd tumbler jmswap \
             --junitxml=junit/unit-tests.xml \
-            --cov=jmcore --cov=jmwallet --cov=directory_server --cov=orderbook_watcher --cov=maker --cov=taker --cov=jmwalletd --cov=tumbler \
+            --cov=jmcore --cov=jmwallet --cov=directory_server --cov=orderbook_watcher --cov=maker --cov=taker --cov=jmwalletd --cov=tumbler --cov=jmswap \
             --cov-report=term-missing --cov-report=xml --cov-report=html \
             -v --fail-on-skip
 
