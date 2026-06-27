@@ -57,6 +57,21 @@ The provider is always the swap "server" and never pays a swap fee:
   channel-as-change preference and the exact-change-amount bookkeeping in the
   live CoinJoin, which is a follow-up.
 
+### Why Boltz v2 (not papa-swap)
+
+A more on-chain-efficient design exists (supertestnet's *papa-swap*: one funding
+transaction plus pre-signed spends, roughly halving footprint and latency). We
+chose the Boltz v2 HTLC instead for the first implementation because: it is a
+**deployed standard** (Boltz, Electrum, many wallets), so a maker can clear
+swaps against the existing market; its claim/refund are **signed at spend time**,
+so fees track the market and can be RBF-bumped (papa-swap pre-signs spends at
+fixed fees, which is risky on the timelock-bounded refund path); and its
+**MuSig2 2-of-2 cooperative close** reuses exactly the same Taproot/MuSig2
+machinery as the channel-as-change funding output, rather than papa-swap's
+separate pre-signed tx0-tx3 state machine (with its two race conditions and a
+two-week recovery window). papa-swap's single-transaction efficiency is an
+attractive future optimization, but Boltz v2 is the better v1 trade-off.
+
 Discovery and signalling run over **Nostr**: the provider advertises its terms
 as an addressable event and answers swap RPCs sent as NIP-04 encrypted DMs; the
 client discovers providers and calls those RPCs. The client always recomputes
