@@ -1,0 +1,321 @@
+diff --git a/src/builder.rs b/src/builder.rs
+index c88c867..8ed0044 100644
+--- a/src/builder.rs
++++ b/src/builder.rs
+@@ -2179,6 +2179,7 @@ fn build_with_store_internal(
+ 		scorer,
+ 		peer_store,
+ 		payment_store,
++		external_funding: crate::external_funding::new_external_funding_map(),
+ 		lnurl_auth,
+ 		is_running,
+ 		node_metrics,
+diff --git a/src/event.rs b/src/event.rs
+index 86ee7bb..2c1a96d 100644
+--- a/src/event.rs
++++ b/src/event.rs
+@@ -35,6 +35,7 @@ use lightning_types::payment::{PaymentHash, PaymentPreimage};
+ 
+ use crate::config::{may_announce_channel, Config};
+ use crate::connection::ConnectionManager;
++use crate::external_funding::{ExternalFundingMap, ExternalFundingState};
+ use crate::data_store::DataStoreUpdateResult;
+ use crate::fee_estimator::ConfirmationTarget;
+ #[cfg(feature = "uniffi")]
+@@ -543,6 +544,7 @@ where
+ 	static_invoice_store: Option<StaticInvoiceStore>,
+ 	onion_messenger: Arc<OnionMessenger>,
+ 	om_mailbox: Option<Arc<OnionMessageMailbox>>,
++	external_funding: ExternalFundingMap,
+ }
+ 
+ impl<L: Deref + Clone + Sync + Send + 'static> EventHandler<L>
+@@ -559,6 +561,7 @@ where
+ 		keys_manager: Arc<KeysManager>, static_invoice_store: Option<StaticInvoiceStore>,
+ 		onion_messenger: Arc<OnionMessenger>, om_mailbox: Option<Arc<OnionMessageMailbox>>,
+ 		runtime: Arc<Runtime>, logger: L, config: Arc<Config>,
++		external_funding: ExternalFundingMap,
+ 	) -> Self {
+ 		Self {
+ 			event_queue,
+@@ -578,6 +581,7 @@ where
+ 			static_invoice_store,
+ 			onion_messenger,
+ 			om_mailbox,
++			external_funding,
+ 		}
+ 	}
+ 
+@@ -620,6 +624,30 @@ where
+ 				output_script,
+ 				user_channel_id,
+ 			} => {
++				// Externally-funded channel (e.g. funded from a CoinJoin): record the
++				// funding output for the caller to place in its own transaction, and do
++				// NOT fund or broadcast from our wallet.
++				{
++					let mut ext = self.external_funding.lock().unwrap();
++					if ext.contains_key(&user_channel_id) {
++						log_info!(
++							self.logger,
++							"FundingGenerationReady for externally-funded channel {}; awaiting outpoint",
++							user_channel_id
++						);
++						ext.insert(
++							user_channel_id,
++							ExternalFundingState::Ready {
++								temporary_channel_id,
++								counterparty_node_id,
++								output_script: output_script.clone(),
++								channel_value_satoshis,
++							},
++						);
++						return Ok(());
++					}
++				}
++
+ 				// Construct the raw transaction with the output that is paid the amount of the
+ 				// channel.
+ 				let confirmation_target = ConfirmationTarget::ChannelFunding;
+diff --git a/src/external_funding.rs b/src/external_funding.rs
+new file mode 100644
+index 0000000..b826261
+--- /dev/null
++++ b/src/external_funding.rs
+@@ -0,0 +1,40 @@
++// External channel funding (e.g. funding a channel from a JoinMarket CoinJoin
++// output) instead of funding it from this node's on-chain wallet.
++//
++// The application opens a channel with `Node::open_channel_external_funding`,
++// waits (via `Node::get_external_funding_output`) for the channel handshake to
++// reach `FundingGenerationReady`, places the returned funding output in its own
++// transaction (the CoinJoin), broadcasts it, and then calls
++// `Node::provide_funding_outpoint` with the resulting outpoint. Internally this
++// uses LDK's `unsafe_manual_funding_transaction_generated`, so LDK never funds
++// or broadcasts the funding transaction itself.
++
++use std::collections::HashMap;
++use std::sync::{Arc, Mutex};
++
++use bitcoin::secp256k1::PublicKey;
++use bitcoin::ScriptBuf;
++use lightning::ln::types::ChannelId;
++
++/// Per-channel state for an externally-funded channel open.
++#[derive(Clone)]
++pub(crate) enum ExternalFundingState {
++	/// Open initiated; awaiting the `FundingGenerationReady` event.
++	Pending,
++	/// `FundingGenerationReady` fired: the caller may now place `output_script`
++	/// (worth `channel_value_satoshis`) in an external transaction and then
++	/// provide the resulting outpoint via `Node::provide_funding_outpoint`.
++	Ready {
++		temporary_channel_id: ChannelId,
++		counterparty_node_id: PublicKey,
++		output_script: ScriptBuf,
++		channel_value_satoshis: u64,
++	},
++}
++
++/// Map of `UserChannelId` (u128) -> external funding state.
++pub(crate) type ExternalFundingMap = Arc<Mutex<HashMap<u128, ExternalFundingState>>>;
++
++pub(crate) fn new_external_funding_map() -> ExternalFundingMap {
++	Arc::new(Mutex::new(HashMap::new()))
++}
+diff --git a/src/lib.rs b/src/lib.rs
+index 7465dfa..051e680 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -89,6 +89,7 @@ mod data_store;
+ pub mod entropy;
+ mod error;
+ mod event;
++mod external_funding;
+ mod fee_estimator;
+ mod ffi;
+ mod gossip;
+@@ -118,6 +119,9 @@ pub use balance::{BalanceDetails, LightningBalance, PendingSweepBalance};
+ pub use bip39;
+ pub use bitcoin;
+ use bitcoin::secp256k1::PublicKey;
++use bitcoin::{ScriptBuf, Txid};
++
++use crate::external_funding::{ExternalFundingMap, ExternalFundingState};
+ #[cfg(feature = "uniffi")]
+ pub use bitcoin::FeeRate;
+ #[cfg(not(feature = "uniffi"))]
+@@ -241,6 +245,7 @@ pub struct Node {
+ 	scorer: Arc<Mutex<Scorer>>,
+ 	peer_store: Arc<PeerStore<Arc<Logger>>>,
+ 	payment_store: Arc<PaymentStore>,
++	external_funding: ExternalFundingMap,
+ 	lnurl_auth: Arc<LnurlAuth>,
+ 	is_running: Arc<RwLock<bool>>,
+ 	node_metrics: Arc<PersistedNodeMetrics>,
+@@ -608,6 +613,7 @@ impl Node {
+ 			Arc::clone(&self.runtime),
+ 			Arc::clone(&self.logger),
+ 			Arc::clone(&self.config),
++			Arc::clone(&self.external_funding),
+ 		));
+ 
+ 		// Setup background processing
+@@ -1157,7 +1163,7 @@ impl Node {
+ 	fn open_channel_inner(
+ 		&self, node_id: PublicKey, address: SocketAddress, channel_amount_sats: FundingAmount,
+ 		push_to_counterparty_msat: Option<u64>, channel_config: Option<ChannelConfig>,
+-		announce_for_forwarding: bool, disable_counterparty_reserve: bool,
++		announce_for_forwarding: bool, disable_counterparty_reserve: bool, external_funding: bool,
+ 	) -> Result<UserChannelId, Error> {
+ 		if !*self.is_running.read().expect("lock") {
+ 			return Err(Error::NotRunning);
+@@ -1178,8 +1184,11 @@ impl Node {
+ 		let channel_amount_sats = match channel_amount_sats {
+ 			FundingAmount::Exact { amount_sats } => {
+ 				// Check funds availability after connection (includes anchor reserve
+-				// calculation).
+-				self.check_sufficient_funds_for_channel(amount_sats, &peer_info.node_id)?;
++				// calculation). Externally-funded channels are funded from another
++				// transaction (e.g. a CoinJoin), so skip the on-chain balance check.
++				if !external_funding {
++					self.check_sufficient_funds_for_channel(amount_sats, &peer_info.node_id)?;
++				}
+ 				amount_sats
+ 			},
+ 			FundingAmount::Max => {
+@@ -1261,6 +1270,12 @@ impl Node {
+ 					peer_info.node_id
+ 				);
+ 				self.runtime.block_on(self.peer_store.add_peer(peer_info))?;
++				if external_funding {
++					self.external_funding
++						.lock()
++						.unwrap()
++						.insert(user_channel_id, ExternalFundingState::Pending);
++				}
+ 				Ok(UserChannelId(user_channel_id))
+ 			},
+ 			Err(e) => {
+@@ -1346,9 +1361,81 @@ impl Node {
+ 			channel_config,
+ 			false,
+ 			false,
++			false,
+ 		)
+ 	}
+ 
++	/// Connect to a node and open a channel whose funding output is provided
++	/// *externally* (e.g. as an output of a JoinMarket CoinJoin) rather than
++	/// funded from this node's on-chain wallet.
++	///
++	/// After this returns, poll [`Node::get_external_funding_output`] until it
++	/// yields the funding `scriptPubKey` and value; place that output in your
++	/// own transaction, broadcast it, and then call
++	/// [`Node::provide_funding_outpoint`] with the resulting outpoint. This node
++	/// never funds or broadcasts the funding transaction.
++	pub fn open_channel_external_funding(
++		&self, node_id: PublicKey, address: SocketAddress, channel_amount_sats: u64,
++		push_to_counterparty_msat: Option<u64>, channel_config: Option<ChannelConfig>,
++	) -> Result<UserChannelId, Error> {
++		self.open_channel_inner(
++			node_id,
++			address,
++			FundingAmount::Exact { amount_sats: channel_amount_sats },
++			push_to_counterparty_msat,
++			channel_config,
++			false,
++			false,
++			true,
++		)
++	}
++
++	/// For a channel opened with [`Node::open_channel_external_funding`], return
++	/// the funding output `(scriptPubKey, value_sats)` once the channel handshake
++	/// has reached `FundingGenerationReady`, or `None` if it is not ready yet.
++	pub fn get_external_funding_output(
++		&self, user_channel_id: &UserChannelId,
++	) -> Option<(ScriptBuf, u64)> {
++		match self.external_funding.lock().unwrap().get(&user_channel_id.0) {
++			Some(ExternalFundingState::Ready {
++				output_script, channel_value_satoshis, ..
++			}) => Some((output_script.clone(), *channel_value_satoshis)),
++			_ => None,
++		}
++	}
++
++	/// For a channel opened with [`Node::open_channel_external_funding`], provide
++	/// the outpoint of the (externally broadcast) funding transaction. This drives
++	/// the channel to completion via LDK's manual funding flow.
++	pub fn provide_funding_outpoint(
++		&self, user_channel_id: &UserChannelId, funding_txid: Txid, funding_vout: u32,
++	) -> Result<(), Error> {
++		let entry = self.external_funding.lock().unwrap().get(&user_channel_id.0).cloned();
++		match entry {
++			Some(ExternalFundingState::Ready {
++				temporary_channel_id, counterparty_node_id, ..
++			}) => {
++				let funding = lightning::chain::transaction::OutPoint {
++					txid: funding_txid,
++					index: funding_vout as u16,
++				};
++				self.channel_manager
++					.unsafe_manual_funding_transaction_generated(
++						temporary_channel_id,
++						counterparty_node_id,
++						funding,
++					)
++					.map_err(|e| {
++						log_error!(self.logger, "Manual funding failed: {:?}", e);
++						Error::ChannelCreationFailed
++					})?;
++				self.external_funding.lock().unwrap().remove(&user_channel_id.0);
++				Ok(())
++			},
++			_ => Err(Error::ChannelCreationFailed),
++		}
++	}
++
+ 	/// Connect to a node and open a new announced channel.
+ 	///
+ 	/// This will return an error if the node has not been sufficiently configured to operate as a
+@@ -1387,6 +1474,7 @@ impl Node {
+ 			channel_config,
+ 			true,
+ 			false,
++			false,
+ 		)
+ 	}
+ 
+@@ -1416,6 +1504,7 @@ impl Node {
+ 			channel_config,
+ 			false,
+ 			false,
++			false,
+ 		)
+ 	}
+ 
+@@ -1454,6 +1543,7 @@ impl Node {
+ 			channel_config,
+ 			true,
+ 			false,
++			false,
+ 		)
+ 	}
+ 
+@@ -1488,6 +1578,7 @@ impl Node {
+ 			channel_config,
+ 			false,
+ 			true,
++			false,
+ 		)
+ 	}
+ 
+@@ -1517,6 +1608,7 @@ impl Node {
+ 			channel_config,
+ 			false,
+ 			true,
++			false,
+ 		)
+ 	}
+ 

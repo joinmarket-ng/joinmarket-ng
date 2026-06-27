@@ -27,6 +27,10 @@ from jmswap.channel import (
     cooperative_close,
     split_change,
 )
+from jmswap.channel_funding import (
+    complete_external_channel_funding,
+    request_external_channel_funding,
+)
 from jmswap.client import SwapClient
 from jmswap.errors import (
     ChainError,
@@ -87,7 +91,9 @@ __all__ = [
     "SwapWallet",
     "channel_funding_address",
     "channel_funding_output",
+    "complete_external_channel_funding",
     "cooperative_close",
+    "request_external_channel_funding",
     "is_refundable",
     "refund",
     "split_change",

@@ -319,6 +319,42 @@ class LdkServerBackend(LightningBackend):
     async def cancel_hold_invoice(self, payment_hash: str) -> None:
         await self._call("Bolt11FailForHash", f_str(1, payment_hash))
 
+    # -- External (CoinJoin) channel funding (forked LDK Server) --------------
+
+    async def open_channel_external_funding(
+        self,
+        node_pubkey: str,
+        address: str,
+        channel_amount_sats: int,
+        push_to_counterparty_msat: int | None = None,
+    ) -> str:
+        """Open a channel whose funding output is provided externally.
+
+        Returns the ``user_channel_id`` to track the open. Requires the LDK
+        Server fork that exposes the external-funding RPCs.
+        """
+        req = f_str(1, node_pubkey) + f_str(2, address) + f_uint(3, channel_amount_sats)
+        if push_to_counterparty_msat is not None:
+            req += f_uint(4, push_to_counterparty_msat)
+        parsed = await self._call("OpenChannelExternalFunding", req)
+        ucid = _first_str(parsed, 1)
+        if ucid is None:
+            raise LightningError("OpenChannelExternalFunding returned no user_channel_id")
+        return ucid
+
+    async def get_funding_output(self, user_channel_id: str) -> tuple[bool, str, int]:
+        """Poll for the funding output. Returns ``(ready, script_pubkey_hex, value_sats)``."""
+        parsed = await self._call("GetFundingOutput", f_str(1, user_channel_id))
+        ready = bool(_first_int(parsed, 1))
+        return ready, _first_str(parsed, 2) or "", _first_int(parsed, 3) or 0
+
+    async def provide_funding_outpoint(
+        self, user_channel_id: str, funding_txid: str, funding_vout: int
+    ) -> None:
+        """Provide the outpoint of the externally-broadcast funding transaction."""
+        req = f_str(1, user_channel_id) + f_str(2, funding_txid) + f_uint(3, funding_vout)
+        await self._call("ProvideFundingOutpoint", req)
+
     async def decode_invoice(self, invoice: str) -> DecodedInvoice:
         parsed = await self._call("DecodeInvoice", f_str(1, invoice))
         payment_hash = _first_str(parsed, 2)

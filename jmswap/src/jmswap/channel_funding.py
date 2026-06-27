@@ -1,0 +1,84 @@
+"""
+Externally-funded Lightning channel opens (channel-as-change endgame).
+
+These helpers drive the forked LDK Server's external-funding RPCs so a channel's
+funding output can come from a JoinMarket CoinJoin instead of the node's own
+on-chain wallet:
+
+1. :func:`request_external_channel_funding` opens the channel and returns the
+   funding *address* (and the channel's ``user_channel_id``); the caller places
+   an output paying that address (worth the channel amount) in its CoinJoin and
+   broadcasts it;
+2. :func:`complete_external_channel_funding` supplies the resulting outpoint,
+   driving the channel to ready.
+
+The ``ldk`` argument is any object exposing the external-funding methods of
+:class:`jmswap.ldk.LdkServerBackend`.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from typing import Protocol
+
+from jmcore.bitcoin import scriptpubkey_to_address
+
+from jmswap.errors import LightningError
+
+
+class ExternalFundingLightning(Protocol):
+    async def open_channel_external_funding(
+        self,
+        node_pubkey: str,
+        address: str,
+        channel_amount_sats: int,
+        push_to_counterparty_msat: int | None = None,
+    ) -> str: ...
+
+    async def get_funding_output(self, user_channel_id: str) -> tuple[bool, str, int]: ...
+
+    async def provide_funding_outpoint(
+        self, user_channel_id: str, funding_txid: str, funding_vout: int
+    ) -> None: ...
+
+
+async def request_external_channel_funding(
+    ldk: ExternalFundingLightning,
+    peer_node_id: str,
+    peer_address: str,
+    amount_sats: int,
+    network: str = "mainnet",
+    *,
+    poll_interval: float = 1.0,
+    timeout: float = 60.0,
+) -> tuple[str, str]:
+    """Open an externally-funded channel and return ``(user_channel_id, address)``.
+
+    Place an output paying ``address`` (worth exactly ``amount_sats``) in the
+    CoinJoin, broadcast it, then call :func:`complete_external_channel_funding`.
+    """
+    user_channel_id = await ldk.open_channel_external_funding(
+        peer_node_id, peer_address, amount_sats
+    )
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        ready, script_hex, value = await ldk.get_funding_output(user_channel_id)
+        if ready:
+            if value != amount_sats:
+                raise LightningError(
+                    f"channel funding value {value} != requested amount {amount_sats}"
+                )
+            address = scriptpubkey_to_address(bytes.fromhex(script_hex), network)
+            return user_channel_id, address
+        await asyncio.sleep(poll_interval)
+    raise LightningError("timed out waiting for the channel funding output")
+
+
+async def complete_external_channel_funding(
+    ldk: ExternalFundingLightning,
+    user_channel_id: str,
+    funding_txid: str,
+    funding_vout: int,
+) -> None:
+    """Supply the CoinJoin funding outpoint, driving the channel to ready."""
+    await ldk.provide_funding_outpoint(user_channel_id, funding_txid, funding_vout)
