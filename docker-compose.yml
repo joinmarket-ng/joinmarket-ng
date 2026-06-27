@@ -1363,9 +1363,103 @@ services:
       - neutrino
       - all
 
+  # ======================================================================
+  # Swap ecosystem (profile: swap)
+  # A Nostr relay plus two LDK Server Lightning nodes (provider + client)
+  # for the bidirectional Taproot Lightning swap protocol (jmswap). The
+  # provider node is the maker's Lightning node; the client node lets the
+  # swap e2e tests swap between two real LDK nodes on regtest.
+  # ======================================================================
+
+  # Nostr relay carrying swap adverts (kind 31000) and RPC DMs (kind 25582).
+  nostr-relay:
+    image: scsibug/nostr-rs-relay:latest
+    container_name: jm-nostr-relay
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128M
+    ports:
+      - "7000:7000"
+    volumes:
+      - ./nostr_relay/config.toml:/usr/src/app/config.toml:ro
+      - nostr-relay-data:/usr/src/app/db
+    networks:
+      - jm-network
+    healthcheck:
+      test: ["CMD", "bash", "-c", "(echo > /dev/tcp/localhost/7000) 2>/dev/null"]
+      interval: 10s
+      timeout: 5s
+      start_period: 10s
+      retries: 5
+    profiles:
+      - swap
+      - all
+
+  # LDK Server node for the swap provider (the maker's Lightning node).
+  # Image: build from https://github.com/lightningdevkit/ldk-server (Dockerfile
+  # at the repo root) or use a published image; it speaks the gRPC API the
+  # jmswap LdkServerBackend targets.
+  ldk-provider:
+    image: ${LDK_SERVER_IMAGE:-jm-ldk-server:local}
+    build:
+      context: ./ldk_server
+      dockerfile: Dockerfile
+    container_name: jm-ldk-provider
+    restart: unless-stopped
+    command: ["/config/provider.toml"]
+    depends_on:
+      bitcoin:
+        condition: service_healthy
+    ports:
+      - "3536:3536"
+      - "9735:9735"
+    volumes:
+      - ./ldk_server/provider.toml:/config/provider.toml:ro
+      - ldk-provider-data:/data
+    networks:
+      - jm-network
+    profiles:
+      - swap
+      - all
+
+  # LDK Server node for the swap client (used by the swap e2e tests).
+  ldk-client:
+    image: ${LDK_SERVER_IMAGE:-jm-ldk-server:local}
+    build:
+      context: ./ldk_server
+      dockerfile: Dockerfile
+    container_name: jm-ldk-client
+    restart: unless-stopped
+    command: ["/config/client.toml"]
+    depends_on:
+      bitcoin:
+        condition: service_healthy
+    ports:
+      - "3537:3536"
+      - "9736:9735"
+    volumes:
+      - ./ldk_server/client.toml:/config/client.toml:ro
+      - ldk-client-data:/data
+    networks:
+      - jm-network
+    profiles:
+      - swap
+      - all
+
 volumes:
   bitcoin-data:
   bitcoin-jam-data:
+  nostr-relay-data:
+  ldk-provider-data:
+  ldk-client-data:
   neutrino-data:
   jam-data:
   jam-maker1-data:

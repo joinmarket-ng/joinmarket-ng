@@ -1,0 +1,32 @@
+# Nostr relay configuration for regtest swap e2e testing.
+# Used by scsibug/nostr-rs-relay.
+#
+# This relay carries the JoinMarket swap protocol traffic:
+# - Kind 31000: swap-provider advertisements (addressable events).
+# - Kind 25582: NIP-04 encrypted DM RPCs for swap operations.
+
+[info]
+relay_url = "ws://jm-nostr-relay:7000/"
+name = "JoinMarket Swap Relay"
+description = "Nostr relay for the JoinMarket bidirectional swap provider"
+
+[database]
+data_directory = "/usr/src/app/db"
+
+[network]
+port = 7000
+address = "0.0.0.0"
+
+[limits]
+messages_per_sec = 100
+max_event_bytes = 131072
+max_ws_message_bytes = 131072
+max_ws_frame_bytes = 131072
+broadcast_buffer = 16384
+event_persist_buffer = 4096
+
+[verified_users]
+mode = "disabled"
+
+[pay_to_relay]
+enabled = false

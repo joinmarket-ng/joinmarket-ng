@@ -1,0 +1,21 @@
+# LDK Server config for the swap *client* node (the swap user's Lightning node).
+# Used by the swap e2e tests so a client and provider can swap between two real
+# LDK nodes. Backed by the regtest `bitcoin` service in docker-compose.yml.
+
+[node]
+network = "regtest"
+listening_addresses = ["0.0.0.0:9735"]
+grpc_service_address = "0.0.0.0:3536"
+alias = "jm-swap-client"
+
+[storage.disk]
+dir_path = "/data"
+
+[log]
+level = "Info"
+log_to_file = false
+
+[bitcoind]
+rpc_address = "jm-bitcoin:18443"
+rpc_user = "test"
+rpc_password = "test"
