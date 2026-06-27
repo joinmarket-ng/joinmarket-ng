@@ -135,6 +135,23 @@ def parse_fidelity_bond_proof(
         return None
 
 
+def normalize_relative_cjfee(cjfee_str: str) -> str:
+    """Validate and fixed-point format a peer-supplied relative cjfee.
+
+    Relative fees are small non-negative fractions. Reject pathological Decimals
+    before ``format(value, "f")``, which would otherwise expand a tiny string
+    like ``"1E-9999999999"`` into gigabytes and OOM the orderbook parser.
+    """
+    value = Decimal(cjfee_str)
+    if not value.is_finite():
+        raise ValueError(f"Non-finite cjfee: {cjfee_str}")
+    sign, digits, exp = value.as_tuple()
+    # exp is an int for finite Decimals (the str sentinels only occur for NaN/Inf).
+    if sign or len(digits) > 32 or not isinstance(exp, int) or not (-32 <= exp <= 32):
+        raise ValueError(f"Unreasonable cjfee: {cjfee_str}")
+    return format(value, "f")
+
+
 class DirectoryClient:
     """
     Client for connecting to JoinMarket directory servers.
@@ -1381,10 +1398,7 @@ class DirectoryClient:
                 if offer_type in ["sw0absoffer", "swabsoffer"]:
                     cjfee = str(int(cjfee_str))
                 else:
-                    # Use fixed-point format to avoid scientific notation
-                    # (e.g., Decimal("0.000000001") -> "1E-9" with str(),
-                    # but "0.000000001" with format(..., "f"))
-                    cjfee = format(Decimal(cjfee_str), "f")
+                    cjfee = normalize_relative_cjfee(cjfee_str)
 
                 offer = Offer(
                     counterparty=from_nick,
