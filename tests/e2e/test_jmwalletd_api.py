@@ -185,6 +185,7 @@ async def test_getinfo(client: httpx.AsyncClient) -> None:
     assert r.status_code == 200
     body = r.json()
     assert "version" in body
+    assert body["backend"] == "joinmarket-ng"
 
 
 @pytest.mark.asyncio

@@ -115,6 +115,7 @@ class GetInfoResponse(BaseModel):
     """Response for GET /api/v1/getinfo."""
 
     version: str
+    backend: str
 
 
 class SessionResponse(BaseModel):

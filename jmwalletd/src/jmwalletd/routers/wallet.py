@@ -115,10 +115,10 @@ async def _background_wallet_sync(state: DaemonState, walletname: str) -> None:
 # ---------------------------------------------------------------------------
 @router.get("/getinfo", operation_id="version")
 async def get_info() -> GetInfoResponse:
-    """Return backend version information."""
+    """Return backend information."""
     from jmcore.version import __version__
 
-    return GetInfoResponse(version=__version__)
+    return GetInfoResponse(version=__version__, backend="joinmarket-ng")
 
 
 # ---------------------------------------------------------------------------

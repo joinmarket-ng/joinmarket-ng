@@ -352,8 +352,9 @@ class TestSessionResponse:
 
 class TestMiscModels:
     def test_getinfo(self) -> None:
-        resp = GetInfoResponse(version="0.17.0")
+        resp = GetInfoResponse(version="0.17.0", backend="joinmarket-ng")
         assert resp.version == "0.17.0"
+        assert resp.backend == "joinmarket-ng"
 
     def test_list_wallets(self) -> None:
         resp = ListWalletsResponse(wallets=["a.jmdat", "b.jmdat"])

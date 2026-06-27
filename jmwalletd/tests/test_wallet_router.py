@@ -33,11 +33,12 @@ def authed_client(
 
 
 class TestGetInfo:
-    def test_returns_version(self, client: TestClient) -> None:
+    def test_returns_version_and_backend(self, client: TestClient) -> None:
         resp = client.get("/api/v1/getinfo")
         assert resp.status_code == 200
         data = resp.json()
         assert "version" in data
+        assert data["backend"] == "joinmarket-ng"
 
 
 class TestGetSession:
