@@ -153,6 +153,8 @@ class SwapProviderConfig(BaseModel):
     percentage_fee: str = Field(default="0.1")
     base_fee: int = Field(default=500, ge=0)
     cltv_delta: int = Field(default=144, ge=1)
+    min_confirmations: int = Field(default=1, ge=1)
+    bond_value: int = Field(default=0, ge=0)
     accepts_whole_coin: bool = False
     channel_change: bool = False
     ldk_grpc_url: str | None = None

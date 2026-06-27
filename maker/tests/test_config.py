@@ -340,6 +340,8 @@ class TestBuildMakerConfig:
         settings.maker.swap_provider.percentage_fee = "0.25"
         settings.maker.swap_provider.base_fee = 321
         settings.maker.swap_provider.cltv_delta = 200
+        settings.maker.swap_provider.min_confirmations = 2
+        settings.maker.swap_provider.bond_value = 7_000_000
         settings.maker.swap_provider.accepts_whole_coin = True
         settings.maker.swap_provider.channel_change = True
         settings.maker.swap_provider.ldk_grpc_url = "https://ldk:3536"
@@ -359,6 +361,8 @@ class TestBuildMakerConfig:
         assert sp.percentage_fee == "0.25"
         assert sp.base_fee == 321
         assert sp.cltv_delta == 200
+        assert sp.min_confirmations == 2
+        assert sp.bond_value == 7_000_000
         assert sp.accepts_whole_coin is True
         assert sp.channel_change is True
         assert sp.ldk_grpc_url == "https://ldk:3536"

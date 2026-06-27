@@ -202,8 +202,13 @@ class SwapNostrNode:
 
     # -- client side ----------------------------------------------------------
 
-    async def discover(self, timeout: float = 5.0) -> list[SwapAdvert]:
-        """Collect provider adverts seen within ``timeout`` seconds."""
+    async def discover(self, timeout: float = 5.0, *, min_bond_value: int = 0) -> list[SwapAdvert]:
+        """Collect provider adverts seen within ``timeout`` seconds.
+
+        ``min_bond_value`` filters out providers advertising a fidelity bond
+        below the threshold, raising the cost of a sybil flooding the market
+        (JoinMarket-symmetric bond verification).
+        """
         filters = [{"kinds": [SWAP_ADVERT_KIND], "#d": [ADVERT_D_TAG]}]
         adverts: dict[str, SwapAdvert] = {}
 
@@ -213,9 +218,11 @@ class SwapNostrNode:
                     continue
                 with suppress(Exception):
                     terms = ProviderTerms.model_validate_json(event["content"])
+                    if not terms.meets_bond(min_bond_value):
+                        continue
                     adverts[event["pubkey"]] = SwapAdvert(event["pubkey"], terms)
 
-        with suppress(asyncio.TimeoutError):
+        with suppress(TimeoutError):
             await asyncio.wait_for(_collect(), timeout=timeout)
         return list(adverts.values())
 

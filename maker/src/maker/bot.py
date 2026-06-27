@@ -728,6 +728,7 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
             base_fee=sp.base_fee,
             cltv_delta=sp.cltv_delta,
             accepts_whole_coin=sp.accepts_whole_coin,
+            bond_value=sp.bond_value,
             name=f"jm-maker-{identity_pubkey[:8]}",
         )
         chain = WalletChainBackend(self.backend)
@@ -742,7 +743,14 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
             from jmswap.persistence import SwapStore
 
             store = SwapStore(Path(data_dir) / "swaps")
-        server = SwapServer(terms, lightning, chain, swap_wallet, store=store)  # type: ignore[arg-type]
+        server = SwapServer(
+            terms,
+            lightning,  # type: ignore[arg-type]
+            chain,
+            swap_wallet,
+            store=store,
+            min_confirmations=sp.min_confirmations,
+        )
 
         transport = RelayTransport(tuple(sp.nostr_relays))
         nostr_node = SwapNostrNode(nostr_key.get_private_key_bytes(), transport)

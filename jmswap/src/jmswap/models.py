@@ -104,7 +104,14 @@ class ProviderTerms(BaseModel):
     base_fee: int = 500  # flat sats, covers the provider's on-chain footprint
     cltv_delta: int = 144  # refund timelock distance in blocks
     accepts_whole_coin: bool = False  # third-role: absorb a whole UTXO, no change
+    # JoinMarket-symmetric sybil resistance: a provider advertises a timelocked
+    # fidelity bond; clients can require a minimum bond value before swapping.
+    bond_value: int = 0  # advertised fidelity-bond value in sats (0 = none)
+    bond_proof: str | None = None  # opaque bond certificate/proof for verification
     name: str | None = None
+
+    def meets_bond(self, min_bond_value: int) -> bool:
+        return self.bond_value >= min_bond_value
 
     @field_validator("provider_pubkey")
     @classmethod

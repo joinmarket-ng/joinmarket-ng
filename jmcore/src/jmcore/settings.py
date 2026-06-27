@@ -661,6 +661,16 @@ class SwapProviderSettings(BaseModel):
         ge=1,
         description="Refund timelock distance in blocks for the swap HTLC.",
     )
+    min_confirmations: int = Field(
+        default=1,
+        ge=1,
+        description="Confirmations required on a swap funding output before acting (reorg safety).",
+    )
+    bond_value: int = Field(
+        default=0,
+        ge=0,
+        description="Advertised fidelity-bond value in sats for sybil resistance (0 = none).",
+    )
     accepts_whole_coin: bool = Field(
         default=False,
         description="Third role: accept a client's whole UTXO at base fee (no client change).",

@@ -431,6 +431,8 @@
 # percentage_fee = "0.1"      # percent of the swapped amount
 # base_fee = 500              # flat sats covering the on-chain footprint
 # cltv_delta = 144            # refund timelock distance in blocks
+# min_confirmations = 1       # confirmations on a swap funding output before acting (reorg safety)
+# bond_value = 0              # advertised fidelity-bond value in sats (sybil resistance)
 # accepts_whole_coin = false  # third role: absorb a client's whole UTXO, no change
 # channel_change = false      # experimental: emit change as a Taproot channel-funding output
 # ldk_grpc_url = "https://jm-ldk-provider:3536"

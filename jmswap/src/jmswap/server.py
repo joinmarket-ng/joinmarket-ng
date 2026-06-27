@@ -67,6 +67,7 @@ class SwapServer:
         feerate_sat_vb: float = 2.0,
         poll_interval: float = POLL_INTERVAL,
         store: SwapStore | None = None,
+        min_confirmations: int = 1,
     ) -> None:
         self.terms = terms
         self._ln = lightning
@@ -75,6 +76,7 @@ class SwapServer:
         self._feerate = feerate_sat_vb
         self._poll = poll_interval
         self._store = store
+        self._min_conf = max(min_confirmations, 1)
         self.contracts: dict[str, SwapContract] = {}
         self._trees: dict[str, SwapTree] = {}
         self._privkeys: dict[str, bytes] = {}
@@ -295,7 +297,7 @@ class SwapServer:
         for _ in range(MAX_POLLS):
             utxos = await self._chain.get_address_utxos(contract.funding_address)
             for utxo in utxos:
-                if utxo.value >= contract.onchain_amount and utxo.confirmations >= 1:
+                if utxo.value >= contract.onchain_amount and utxo.confirmations >= self._min_conf:
                     return SwapOutpoint(
                         txid=utxo.txid,
                         vout=utxo.vout,

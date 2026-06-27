@@ -90,7 +90,7 @@ def test_refund_sets_locktime_and_sequence() -> None:
     # swap-in refund is by the client (funder)
     tx = build_refund_tx(tree, outpoint, client.secret, DEST_SPK, fee=200)
     assert tx.locktime == 800_000
-    assert tx.inputs[0].sequence == 0xFFFFFFFE
+    assert tx.inputs[0].sequence == 0xFFFFFFFD  # BIP125 RBF + enables CLTV
     wit = tx.witnesses[0]
     assert wit[1] == tree.refund_leaf
     lh = tapleaf_hash(tree.refund_leaf)

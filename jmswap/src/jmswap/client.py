@@ -57,12 +57,14 @@ class SwapClient:
         *,
         feerate_sat_vb: float = 2.0,
         poll_interval: float = POLL_INTERVAL,
+        min_confirmations: int = 1,
     ) -> None:
         self._ln = lightning
         self._chain = chain
         self._wallet = wallet
         self._feerate = feerate_sat_vb
         self._poll = poll_interval
+        self._min_conf = max(min_confirmations, 1)
 
     async def swap_in(
         self, rpc: Rpc, terms: ProviderTerms, amount: int, *, whole_coin: bool = False
@@ -185,7 +187,7 @@ class SwapClient:
     async def _await_funding(self, address: str, min_amount: int) -> SwapOutpoint:
         for _ in range(MAX_POLLS):
             for utxo in await self._chain.get_address_utxos(address):
-                if utxo.value >= min_amount and utxo.confirmations >= 1:
+                if utxo.value >= min_amount and utxo.confirmations >= self._min_conf:
                     return SwapOutpoint(
                         txid=utxo.txid,
                         vout=utxo.vout,

@@ -60,6 +60,21 @@ def estimate_fee(vbytes: int, feerate_sat_vb: float) -> int:
     return int(vbytes * feerate_sat_vb + 0.999)
 
 
+def bump_fee(
+    current_fee: int, vbytes: int = CLAIM_TX_VBYTES, min_increment_sat_vb: float = 1.0
+) -> int:
+    """Return a higher fee for a BIP125 replacement (raises the rate by >= 1 sat/vB).
+
+    A claim/refund built with ``enable_rbf`` can be replaced by rebuilding it with
+    this fee; the replacement satisfies BIP125's higher-absolute-fee rule.
+    """
+    return max(current_fee + int(vbytes * min_increment_sat_vb + 0.999), current_fee + 1)
+
+
+# BIP125 opt-in replace-by-fee signalling sequence (also enables nLockTime/CLTV).
+RBF_SEQUENCE = 0xFFFFFFFD
+
+
 def _build_spend_tx(
     outpoint: SwapOutpoint,
     destination_spk: bytes,
@@ -88,11 +103,18 @@ def build_claim_tx(
     claim_privkey: bytes,
     destination_spk: bytes,
     fee: int,
+    *,
+    enable_rbf: bool = True,
 ) -> TaprootTx:
-    """Build and sign a script-path claim transaction (reveals ``preimage``)."""
+    """Build and sign a script-path claim transaction (reveals ``preimage``).
+
+    With ``enable_rbf`` the input signals BIP125 opt-in RBF so a stuck claim can
+    be fee-bumped by rebuilding with a higher fee (see :func:`bump_fee`).
+    """
     if len(preimage) != 32:
         raise ValueError("preimage must be 32 bytes")
-    tx = _build_spend_tx(outpoint, destination_spk, fee)
+    sequence = RBF_SEQUENCE if enable_rbf else 0xFFFFFFFF
+    tx = _build_spend_tx(outpoint, destination_spk, fee, sequence=sequence)
     script, cb = tree.claim_control_block()
     sig = sign_taproot_scriptpath(
         tx, 0, [outpoint.value], [outpoint.scriptpubkey], script, claim_privkey
@@ -117,7 +139,7 @@ def build_refund_tx(
         destination_spk,
         fee,
         locktime=tree.locktime,
-        sequence=0xFFFFFFFE,  # enables nLockTime / CLTV
+        sequence=RBF_SEQUENCE,  # enables nLockTime/CLTV and signals BIP125 RBF
     )
     script, cb = tree.refund_control_block()
     sig = sign_taproot_scriptpath(
