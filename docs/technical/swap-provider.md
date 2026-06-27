@@ -68,9 +68,15 @@ own change, so each maker keeps its balance behind one on-chain output (no
 per-maker change to subset-sum against, and the counterparty stays in-family).
 The on-chain primitive (`combined_funding_output`), the push economics
 (`plan_combined_channel`) and the in-family cooperative close are implemented and
-the combined channel-open-with-push is validated live; the remaining work is the
-taker protocol wiring (maker combine-preference signalling and the taker pairing
-plus shared-output construction).
+the combined channel-open-with-push is validated live; the taker-side pairing
+(`taker.combine.pair_combine_makers`) and the shared-output construction
+(`build_coinjoin_tx`'s `combine_groups`, which folds the folder maker's change
+into the funder's single output) are implemented and unit-tested. The remaining
+work is the protocol-message round that carries the pairing at runtime: a maker
+advertising combine-capability and its Lightning node, and the extra taker->funder
+"open a channel to the folder and push it its change" exchange (after `!ioauth`,
+once the taker knows the change amounts) that yields the funder's funding
+address.
 
 ### Why Boltz v2 (not papa-swap)
 
