@@ -588,6 +588,90 @@ jobs:
             coverage.xml
         if: always()
 
+  # ==========================================================================
+  # Swap e2e tests (profile: swap): the bidirectional Taproot Lightning swap
+  # protocol (jmswap) against a real bitcoind and two forked LDK Server nodes.
+  # The forked LDK image (externally-funded channels) is built here with a
+  # cached Rust build; the tests run host-side and orchestrate the LDK nodes
+  # over docker exec.
+  # ==========================================================================
+  test-swap:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/setup-python-deps
+        with:
+          components: jmcore,jmwallet,directory_server,orderbook_watcher,maker,taker,jmwalletd,tumbler,jmswap
+          install-dev: 'true'
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build the forked LDK Server image
+        uses: docker/build-push-action@v7
+        with:
+          context: ./ldk_server
+          file: ./ldk_server/Dockerfile
+          load: true
+          tags: jm-ldk-server:local
+          cache-from: type=gha,scope=ldk-server
+          cache-to: type=gha,mode=max,scope=ldk-server
+
+      - name: Start swap services
+        run: |
+          docker compose --profile swap up -d bitcoin miner nostr-relay ldk-provider ldk-client
+
+          .github/scripts/wait-for-service.sh "Bitcoin" \
+            "docker compose exec -T bitcoin bitcoin-cli -chain=regtest -rpcport=18443 -rpcuser=test -rpcpassword=test getblockchaininfo" \
+            60 1
+          .github/scripts/wait-for-service.sh "LDK provider" "nc -z localhost 3536" 90 2
+          .github/scripts/wait-for-service.sh "LDK client" "nc -z localhost 3537" 90 2
+          .github/scripts/wait-for-service.sh "Nostr relay" "nc -z localhost 7000" 30 1
+
+          # Prime the miner wallet with mature coins so the tests can fund the
+          # LDK nodes on-chain (the auto-miner also creates it; idempotent here).
+          BCLI="docker compose exec -T bitcoin bitcoin-cli -chain=regtest -rpcport=18443 -rpcuser=test -rpcpassword=test"
+          $BCLI createwallet miner 2>/dev/null || $BCLI loadwallet miner 2>/dev/null || true
+          ADDR=$($BCLI -rpcwallet=miner getnewaddress)
+          $BCLI -rpcwallet=miner generatetoaddress 101 "$ADDR"
+
+      - name: Run swap e2e tests
+        run: |
+          pytest -c pytest.ini -m swap tests/e2e \
+            --junitxml=junit/test-results.xml \
+            -v -s --timeout=900 --reruns=1 --reruns-delay=10 --fail-on-skip --no-cov
+
+      - name: Show logs
+        if: always()
+        run: |
+          echo "=== Swap services ==="
+          docker compose --profile swap ps
+          echo "=== bitcoin ==="
+          docker compose logs bitcoin --tail=50
+          echo "=== ldk-provider ==="
+          docker compose logs ldk-provider --tail=80
+          echo "=== ldk-client ==="
+          docker compose logs ldk-client --tail=80
+          echo "=== nostr-relay ==="
+          docker compose logs nostr-relay --tail=30
+
+      - name: Cleanup
+        if: always()
+        run: docker compose --profile swap down -v
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: swap-results
+          path: junit/test-results.xml
+        if: always()
+
   test-tumbler:
     needs: build-images
     runs-on: ubuntu-latest
@@ -2030,6 +2114,7 @@ jobs:
       - test-jmwallet
       # Integration tests (depend on build-images)
       - test-e2e
+      - test-swap
       - test-tumbler
       - test-playwright
       - test-reference-interop
