@@ -21,10 +21,13 @@ from __future__ import annotations
 from jmswap.chain import ChainBackend, FakeChainBackend
 from jmswap.channel import (
     ChangeSplit,
+    CombinedChannelPlan,
     CombinedFunding,
     channel_funding_address,
     channel_funding_output,
+    combined_funding_output,
     cooperative_close,
+    plan_combined_channel,
     split_change,
 )
 from jmswap.channel_funding import (
@@ -65,6 +68,7 @@ __all__ = [
     "ChainBackend",
     "ChainError",
     "ChangeSplit",
+    "CombinedChannelPlan",
     "CombinedFunding",
     "FakeChainBackend",
     "FakeLightningBackend",
@@ -91,8 +95,10 @@ __all__ = [
     "SwapWallet",
     "channel_funding_address",
     "channel_funding_output",
+    "combined_funding_output",
     "complete_external_channel_funding",
     "cooperative_close",
+    "plan_combined_channel",
     "request_external_channel_funding",
     "is_refundable",
     "refund",

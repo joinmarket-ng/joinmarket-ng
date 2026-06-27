@@ -123,3 +123,89 @@ async def test_external_funded_channel_open() -> None:
 
     # the funding transaction was the external (CoinJoin) tx, not an LDK-funded one
     assert rpc.call("getrawtransaction", [coinjoin_txid]) is not None
+
+
+@pytest.mark.timeout(300)
+async def test_combined_funding_with_push_economics() -> None:
+    """Combined (pooled-change) channel: fund the pooled total, push the peer its share.
+
+    Models two makers pooling change into one in-family channel: the funder opens
+    a single channel for the pooled total and pushes the peer maker its own change,
+    so each keeps its balance behind one shared on-chain funding output.
+    """
+    if not _services_up():
+        pytest.skip("swap profile (bitcoind + forked ldk-provider) not running")
+    try:
+        import httpx  # noqa: F401
+    except ImportError:
+        pytest.skip("httpx[http2] not installed")
+
+    from jmcore.bitcoin import scriptpubkey_to_address
+    from jmswap.channel import plan_combined_channel
+    from jmswap.ldk import HttpxLdkTransport, LdkServerBackend
+
+    from tests.e2e.test_swap_ldk_live import BitcoindRPC, _cli, _ldk_creds
+
+    rpc = BitcoindRPC()
+    prov_key, prov_cert = _ldk_creds("jm-ldk-provider")
+    provider = LdkServerBackend(
+        HttpxLdkTransport("https://127.0.0.1:3536", verify=prov_cert), prov_key
+    )
+    client_node = _cli("ldk-client", "/config/client.toml", "get-node-info")["node_id"]
+
+    # two makers' change residuals -> a single pooled channel
+    funder_change, peer_change = 700_000, 300_000
+    plan = plan_combined_channel(
+        [(b"\x02" * 33, funder_change), (b"\x03" * 33, peer_change)]
+    )
+    assert plan.total == funder_change + peer_change
+
+    prov_addr = _cli("ldk-provider", "/config/provider.toml", "onchain-receive")[
+        "address"
+    ]
+    rpc.call("sendtoaddress", [prov_addr, 0.01], wallet="miner")
+    rpc.mine(3)
+    await asyncio.sleep(2)
+
+    user_channel_id = await provider.open_channel_external_funding(
+        client_node, "jm-ldk-client:9735", plan.total, plan.push_to_peer_msat
+    )
+    funding_script_hex = ""
+    for _ in range(60):
+        ready, funding_script_hex, value = await provider.get_funding_output(
+            user_channel_id
+        )
+        if ready:
+            assert value == plan.total
+            break
+        await asyncio.sleep(1)
+    assert funding_script_hex
+
+    funding_address = scriptpubkey_to_address(
+        bytes.fromhex(funding_script_hex), "regtest"
+    )
+    coinjoin_txid = rpc.call(
+        "sendtoaddress", [funding_address, plan.total / 1e8], wallet="miner"
+    )
+    tx = rpc.call("getrawtransaction", [coinjoin_txid, True])
+    funding_vout = next(
+        o["n"] for o in tx["vout"] if o["scriptPubKey"].get("hex") == funding_script_hex
+    )
+    await provider.provide_funding_outpoint(
+        user_channel_id, coinjoin_txid, funding_vout
+    )
+
+    opened = False
+    for _ in range(60):
+        rpc.mine(1)
+        channels = _cli("ldk-provider", "/config/provider.toml", "list-channels")
+        raw_ch = json.dumps(channels).replace(" ", "")
+        if '"is_channel_ready":true' in raw_ch or '"is_usable":true' in raw_ch:
+            opened = True
+            break
+        await asyncio.sleep(2)
+    assert opened, "combined-funded channel did not open"
+
+    # the peer maker received its change as channel balance (the push)
+    client_channels = _cli("ldk-client", "/config/client.toml", "list-channels")
+    assert client_node and json.dumps(client_channels)

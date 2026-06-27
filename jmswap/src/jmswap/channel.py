@@ -183,3 +183,81 @@ class CombinedFunding:
     def verify(self, observed_amount: int) -> bool:
         """A peer that knows the residuals verifies the shared output's value."""
         return observed_amount == self.total and self.total > 0
+
+
+# --- Combined (multi-maker) channel funding --------------------------------
+
+
+def combined_funding_output(pubkeys: list[bytes]) -> tuple[bytes, bytes]:
+    """Return ``(scriptpubkey, internal_xonly)`` for an N-of-N shared output.
+
+    A single key-path-only P2TR keyed by the MuSig2 aggregate of all makers'
+    (sorted) funding keys, used as the *combined* channel funding output pooling
+    several makers' change (paper Section 4.7). With two makers this is the
+    in-family dual-funded channel (the counterparty is a fellow maker).
+    """
+    if len(pubkeys) < 2:
+        raise ValueError("combined funding needs at least two makers")
+    for key in pubkeys:
+        if len(key) != 33 or key[0] not in (0x02, 0x03):
+            raise ValueError("funding keys must be 33-byte compressed")
+    internal = key_agg(sorted(pubkeys)).aggregate_xonly()
+    return taproot_output_script(internal, None), internal
+
+
+@dataclass(frozen=True)
+class CombinedChannelPlan:
+    """A taker-computed plan for a combined (pooled-change) channel.
+
+    The funder opens a single channel for the pooled total and *pushes* every
+    other maker its own change, so each maker keeps its balance while a single
+    shared funding output appears on-chain (no per-maker change to subset-sum
+    against). Makers never talk to each other: the taker pairs them and relays
+    the funding pubkeys and amounts.
+    """
+
+    funder_pubkey: bytes
+    peer_pubkey: bytes  # the channel counterparty (a fellow maker)
+    contributions: tuple[tuple[bytes, int], ...]  # (maker_pubkey, change) for all makers
+    fee: int = 0
+
+    @property
+    def total(self) -> int:
+        return sum(change for _, change in self.contributions) - self.fee
+
+    @property
+    def push_to_peer_msat(self) -> int:
+        """Amount the funder pushes to the (single) peer: the peer's own change."""
+        for pubkey, change in self.contributions:
+            if pubkey == self.peer_pubkey:
+                return change * 1000
+        raise ValueError("peer is not among the contributions")
+
+    def funder_balance(self) -> int:
+        """The funder's retained balance (its own change)."""
+        for pubkey, change in self.contributions:
+            if pubkey == self.funder_pubkey:
+                return change
+        raise ValueError("funder is not among the contributions")
+
+
+def plan_combined_channel(
+    contributions: list[tuple[bytes, int]], fee: int = 0
+) -> CombinedChannelPlan:
+    """Pair two makers' change into one channel (the taker's coordination step).
+
+    Picks the first maker as the funder and the second as the in-family channel
+    peer; the funder opens a channel for the pooled total and pushes the peer its
+    change. Currently supports pools of two (the paper's set-divisible point);
+    larger pools are an N-party interactive-funding extension.
+    """
+    if len(contributions) != 2:
+        raise ValueError("combined channel currently pools exactly two makers")
+    funder_pubkey = contributions[0][0]
+    peer_pubkey = contributions[1][0]
+    return CombinedChannelPlan(
+        funder_pubkey=funder_pubkey,
+        peer_pubkey=peer_pubkey,
+        contributions=tuple(contributions),
+        fee=fee,
+    )

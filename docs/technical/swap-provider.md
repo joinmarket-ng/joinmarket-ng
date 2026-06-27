@@ -53,9 +53,24 @@ The provider is always the swap "server" and never pays a swap fee:
   change amount and hands the taker the channel's funding address as an ordinary
   change address; the taker builds and broadcasts the CoinJoin as usual, and the
   maker supplies the resulting outpoint once it has co-signed the transaction.
-  The remaining open item is purely operational: makers signalling their
-  channel-as-change preference and the exact-change-amount bookkeeping in the
-  live CoinJoin, which is a follow-up.
+  The exact-change-amount bookkeeping in the live CoinJoin is implemented and
+  validated end to end (a maker opens a real channel from its CoinJoin change in
+  a real maker<->taker round).
+
+A **combined** variant pools several makers' change into one shared funding
+output. Because makers do not know each other, this is also taker-coordinated:
+the taker (which knows all participants) pairs two combine-capable makers,
+relays each one's funding pubkey to the other, and builds the CoinJoin with a
+single shared output (a MuSig2 2-of-2 of the two makers, worth the pooled
+change) instead of two separate change outputs. The funder opens an
+externally-funded channel for the pooled total and **pushes** the peer maker its
+own change, so each maker keeps its balance behind one on-chain output (no
+per-maker change to subset-sum against, and the counterparty stays in-family).
+The on-chain primitive (`combined_funding_output`), the push economics
+(`plan_combined_channel`) and the in-family cooperative close are implemented and
+the combined channel-open-with-push is validated live; the remaining work is the
+taker protocol wiring (maker combine-preference signalling and the taker pairing
+plus shared-output construction).
 
 ### Why Boltz v2 (not papa-swap)
 

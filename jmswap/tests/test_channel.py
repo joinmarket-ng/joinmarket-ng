@@ -15,7 +15,9 @@ from jmswap.channel import (
     channel_funding_address,
     channel_funding_output,
     channel_internal_xonly,
+    combined_funding_output,
     cooperative_close,
+    plan_combined_channel,
     sorted_funding_keys,
     split_change,
 )
@@ -101,3 +103,45 @@ def test_combined_funding_sum_and_verify() -> None:
     assert combined.total == 1_000_000 - 600
     assert combined.verify(999_400)
     assert not combined.verify(1_000_000)
+
+
+def test_combined_funding_output_is_keyspend_p2tr_and_order_independent() -> None:
+    a, b = _keys()
+    ka, kb = a.public_key.format(), b.public_key.format()
+    spk, internal = combined_funding_output([ka, kb])
+    assert spk[:2] == bytes([0x51, 0x20])
+    _, output_key = taproot_tweak_pubkey(internal, None)
+    assert spk[2:] == output_key
+    # order independent, and equals the 2-key channel funding output
+    assert combined_funding_output([kb, ka])[0] == spk
+    assert channel_funding_output(ka, kb)[0] == spk
+
+
+def test_combined_funding_output_rejects_single_maker() -> None:
+    a, _ = _keys()
+    with pytest.raises(ValueError):
+        combined_funding_output([a.public_key.format()])
+
+
+def test_plan_combined_channel_push_economics() -> None:
+    a, b = _keys()
+    ka, kb = a.public_key.format(), b.public_key.format()
+    plan = plan_combined_channel([(ka, 300_000), (kb, 250_000)], fee=400)
+    assert plan.total == 550_000 - 400
+    assert plan.funder_pubkey == ka
+    assert plan.peer_pubkey == kb
+    # the funder pushes the peer its own change; each keeps its balance
+    assert plan.push_to_peer_msat == 250_000 * 1000
+    assert plan.funder_balance() == 300_000
+
+
+def test_combined_output_cooperative_close_verifies() -> None:
+    """Two makers cooperatively close their pooled shared output (in-family)."""
+    a, b = _keys()
+    ka, kb = a.public_key.format(), b.public_key.format()
+    spk, _ = combined_funding_output([ka, kb])
+    funding = SwapOutpoint(txid="ab" * 32, vout=0, value=550_000, scriptpubkey=spk)
+    outs = [TxOut(value=549_500, scriptpubkey=create_p2tr_scriptpubkey(b"\x02" * 32))]
+    tx = cooperative_close(ka, kb, funding, outs, a.secret, b.secret)
+    sighash = taproot_sighash(tx, 0, [funding.value], [funding.scriptpubkey])
+    assert PublicKeyXOnly(spk[2:]).verify(tx.witnesses[0][0], sighash)
