@@ -272,6 +272,7 @@ nav:
       - Wallet Scanning: technical/wallet-scanning.md
       - Configuration: technical/configuration.md
       - Security: technical/security.md
+      - Swap Provider: technical/swap-provider.md
       - Maker Verification Checklist: technical/maker-verification-checklist.md
       - Threat Model: technical/threat-model.md
       - Neutrino TLS: technical/neutrino-tls.md
