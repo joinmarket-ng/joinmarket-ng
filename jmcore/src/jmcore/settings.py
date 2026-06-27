@@ -696,6 +696,10 @@ class SwapProviderSettings(BaseModel):
         default=None,
         description="LDK Server gRPC base URL (e.g. 'https://jm-ldk-provider:3536').",
     )
+    ldk_tls_cert: str | None = Field(
+        default=None,
+        description="Path to the LDK Server self-signed TLS certificate (PEM) to pin.",
+    )
     ldk_api_key: str | None = Field(
         default=None,
         description="LDK Server API key (hex). Prefer ldk_api_key_path in production.",

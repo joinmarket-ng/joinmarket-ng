@@ -159,6 +159,7 @@ class SwapProviderConfig(BaseModel):
     channel_change: bool = False
     channel_peer: str | None = None
     ldk_grpc_url: str | None = None
+    ldk_tls_cert: str | None = None
     ldk_api_key: str | None = None
     ldk_api_key_path: str | None = None
 

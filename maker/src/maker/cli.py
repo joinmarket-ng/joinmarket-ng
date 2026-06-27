@@ -400,6 +400,7 @@ def build_maker_config(
             channel_change=settings.maker.swap_provider.channel_change,
             channel_peer=settings.maker.swap_provider.channel_peer,
             ldk_grpc_url=settings.maker.swap_provider.ldk_grpc_url,
+            ldk_tls_cert=settings.maker.swap_provider.ldk_tls_cert,
             ldk_api_key=settings.maker.swap_provider.ldk_api_key,
             ldk_api_key_path=settings.maker.swap_provider.ldk_api_key_path,
         ),

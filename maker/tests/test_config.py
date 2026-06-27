@@ -345,6 +345,7 @@ class TestBuildMakerConfig:
         settings.maker.swap_provider.accepts_whole_coin = True
         settings.maker.swap_provider.channel_change = True
         settings.maker.swap_provider.channel_peer = "02abc@1.2.3.4:9735"
+        settings.maker.swap_provider.ldk_tls_cert = "/data/tls.crt"
         settings.maker.swap_provider.ldk_grpc_url = "https://ldk:3536"
         settings.maker.swap_provider.ldk_api_key = "deadbeef"
 
@@ -367,6 +368,7 @@ class TestBuildMakerConfig:
         assert sp.accepts_whole_coin is True
         assert sp.channel_change is True
         assert sp.channel_peer == "02abc@1.2.3.4:9735"
+        assert sp.ldk_tls_cert == "/data/tls.crt"
         assert sp.ldk_grpc_url == "https://ldk:3536"
         assert sp.ldk_api_key == "deadbeef"
 

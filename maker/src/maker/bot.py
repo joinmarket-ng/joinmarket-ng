@@ -700,7 +700,8 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
             if api_key is None and sp.ldk_api_key_path:
                 with open(sp.ldk_api_key_path, "rb") as fh:
                     api_key = fh.read().hex()
-            backend = LdkServerBackend(HttpxLdkTransport(sp.ldk_grpc_url), api_key or "")
+            transport = HttpxLdkTransport(sp.ldk_grpc_url, cert=sp.ldk_tls_cert)
+            backend = LdkServerBackend(transport, api_key or "")
         self._ldk_backend_cache = backend
         return backend
 
