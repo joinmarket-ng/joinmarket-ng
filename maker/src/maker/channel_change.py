@@ -6,16 +6,19 @@ output (a simple-taproot 2-of-2 ``P2TR``) instead of a plain change output, so
 the change has no chaining successor in the wallet (paper Sections 4.3/4.7).
 
 For now both funding keys are derived from the maker's own seed (a *self*
-2-of-2), so the maker fully controls and can recover the output (cooperatively
-spend it via :func:`jmswap.channel.cooperative_close`). This realizes the
-on-chain *shape* and its privacy property; the real Lightning dual-funding
-negotiation with a peer (and P2TR balance tracking) is the documented follow-up.
-Each emitted output is persisted so the funds are always recoverable from the
-seed plus the record's key index.
+2-of-2), so the maker fully controls the output: it is tracked on-chain
+(:func:`scan_channel_change_utxos`, :func:`channel_change_balance`) and can be
+cooperatively swept back into the wallet (:func:`sweep_channel_change`, an
+ordinary P2TR key-path spend), with each emitted output persisted so the funds
+are always recoverable from the seed plus the record's key index.
 
-WARNING: the maker's P2WPKH wallet does not yet scan P2TR outputs, so channelled
-change will not show in the standard balance until a recovery sweep. This is why
-the feature is OFF by default.
+The remaining production step is the real Lightning dual-funding negotiation: a
+node opening a channel whose funding output *is* this CoinJoin output, via an
+externally-assembled-PSBT funding flow (LND's ``PsbtShim`` / ``skip_finalize``).
+LDK Server does not expose externally-funded channel opens, so the live
+integration targets LND; the on-chain shape and its cooperative close are
+implemented and validated here. The feature stays OFF by default until that
+LN-side negotiation lands.
 """
 
 from __future__ import annotations
@@ -28,10 +31,14 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from jmcore.bitcoin import scriptpubkey_to_address
-from jmswap.channel import channel_funding_output
+from jmcore.bitcoin import address_to_scriptpubkey, scriptpubkey_to_address
+from jmcore.taproot import TaprootTx, TxOut
+from jmswap.channel import channel_funding_output, cooperative_close
+from jmswap.spend import COOPERATIVE_TX_VBYTES, SwapOutpoint, estimate_fee
+from loguru import logger
 
 if TYPE_CHECKING:
+    from jmwallet.backends.base import BlockchainBackend
     from jmwallet.wallet.service import WalletService
 
 # Reserved swap/channel account (matches maker.swap_adapter.SWAP_ACCOUNT); the
@@ -128,3 +135,103 @@ def emit_channel_change_address(wallet: WalletService, store: ChannelChangeStore
     address, record = derive_channel_change_address(wallet, index)
     store.append(record)
     return address
+
+
+# --- P2TR channel-change tracking and cooperative sweep ---------------------
+
+
+@dataclass(frozen=True)
+class ChannelChangeUtxo:
+    """A confirmed channel-change funding output found on-chain."""
+
+    record: ChannelChangeRecord
+    txid: str
+    vout: int
+    value: int
+
+
+def build_channel_change_sweep(
+    wallet: WalletService,
+    record: ChannelChangeRecord,
+    txid: str,
+    vout: int,
+    value: int,
+    destination: str,
+    feerate_sat_vb: float = 2.0,
+) -> TaprootTx:
+    """Build a signed MuSig2 cooperative-close sweep of a channel-change output.
+
+    The maker holds both funding keys (self 2-of-2), so it can sweep the output
+    back into its wallet with an ordinary P2TR key-path spend.
+    """
+    key_a = wallet.master_key.derive(record.our_key_a_path)
+    key_b = wallet.master_key.derive(record.our_key_b_path)
+    spk, _ = channel_funding_output(
+        key_a.get_public_key_bytes(compressed=True),
+        key_b.get_public_key_bytes(compressed=True),
+    )
+    outpoint = SwapOutpoint(txid=txid, vout=vout, value=value, scriptpubkey=spk)
+    fee = estimate_fee(COOPERATIVE_TX_VBYTES, feerate_sat_vb)
+    dest_spk = address_to_scriptpubkey(destination)
+    return cooperative_close(
+        key_a.get_public_key_bytes(compressed=True),
+        key_b.get_public_key_bytes(compressed=True),
+        outpoint,
+        [TxOut(value=value - fee, scriptpubkey=dest_spk)],
+        key_a.get_private_key_bytes(),
+        key_b.get_private_key_bytes(),
+    )
+
+
+async def _scantxoutset_utxos(
+    backend: BlockchainBackend, address: str
+) -> list[tuple[str, int, int]]:
+    """Return ``(txid, vout, value_sats)`` for an arbitrary address via the Core RPC."""
+    from jmwallet.backends.descriptor_wallet import DescriptorWalletBackend
+
+    if not isinstance(backend, DescriptorWalletBackend):
+        raise TypeError("channel-change scanning requires the descriptor (Core) backend")
+    result = await backend._rpc_call(
+        "scantxoutset", ["start", [{"desc": f"addr({address})"}]], use_wallet=False
+    )
+    return [
+        (u["txid"], int(u["vout"]), int(round(float(u["amount"]) * 1e8)))
+        for u in result.get("unspents", [])
+    ]
+
+
+async def scan_channel_change_utxos(
+    backend: BlockchainBackend, store: ChannelChangeStore
+) -> list[ChannelChangeUtxo]:
+    """Scan the chain for unspent channel-change outputs from persisted records."""
+    found: list[ChannelChangeUtxo] = []
+    for record in store.list():
+        for txid, vout, value in await _scantxoutset_utxos(backend, record.address):
+            found.append(ChannelChangeUtxo(record=record, txid=txid, vout=vout, value=value))
+    return found
+
+
+async def channel_change_balance(backend: BlockchainBackend, store: ChannelChangeStore) -> int:
+    """Total spendable value (sats) currently held in channel-change outputs."""
+    return sum(u.value for u in await scan_channel_change_utxos(backend, store))
+
+
+async def sweep_channel_change(
+    wallet: WalletService,
+    backend: BlockchainBackend,
+    store: ChannelChangeStore,
+    destination: str,
+    feerate_sat_vb: float = 2.0,
+) -> list[str]:
+    """Sweep all unspent channel-change outputs to ``destination``. Returns txids."""
+    txids: list[str] = []
+    for utxo in await scan_channel_change_utxos(backend, store):
+        tx = build_channel_change_sweep(
+            wallet, utxo.record, utxo.txid, utxo.vout, utxo.value, destination, feerate_sat_vb
+        )
+        txid = await backend.broadcast_transaction(tx.serialize().hex())
+        logger.info(
+            "swept channel-change {}:{} -> {} via {}", utxo.txid, utxo.vout, destination, txid
+        )
+        txids.append(txid)
+    return txids

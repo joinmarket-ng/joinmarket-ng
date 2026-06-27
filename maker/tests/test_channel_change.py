@@ -10,6 +10,7 @@ from jmwallet.backends.descriptor_wallet import DescriptorWalletBackend
 from jmwallet.wallet.service import WalletService
 
 from maker.channel_change import (
+    ChannelChangeRecord,
     ChannelChangeStore,
     derive_channel_change_address,
     emit_channel_change_address,
@@ -69,6 +70,38 @@ def test_recoverable_keys_match_funding_output(wallet: WalletService) -> None:
         "regtest",
     )
     assert recomputed == rec.address
+
+
+def test_build_channel_change_sweep_verifies_under_funding_key(wallet: WalletService) -> None:
+    """The cooperative-close sweep is a valid key-path spend of the funding output."""
+    from coincurve import PublicKeyXOnly
+    from jmcore.bitcoin import create_p2tr_scriptpubkey
+    from jmcore.taproot import taproot_sighash
+
+    from maker.channel_change import build_channel_change_sweep, derive_channel_change_address
+
+    _, record = derive_channel_change_address(wallet, 0)
+    dest_spk = create_p2tr_scriptpubkey(b"\x07" * 32)
+    # a P2TR destination address for the sweep
+    from jmcore.bitcoin import scriptpubkey_to_address
+
+    dest = scriptpubkey_to_address(dest_spk, "regtest")
+    tx = build_channel_change_sweep(wallet, record, "ab" * 32, 0, 200_000, dest)
+    assert len(tx.witnesses[0]) == 1  # single key-path signature
+    sighash = taproot_sighash(tx, 0, [200_000], [tx_funding_spk(wallet, record)])
+    assert PublicKeyXOnly(tx_funding_spk(wallet, record)[2:]).verify(tx.witnesses[0][0], sighash)
+
+
+def tx_funding_spk(wallet: WalletService, record: ChannelChangeRecord) -> bytes:
+    from maker.channel_change import channel_funding_output
+
+    key_a = wallet.master_key.derive(record.our_key_a_path)
+    key_b = wallet.master_key.derive(record.our_key_b_path)
+    spk, _ = channel_funding_output(
+        key_a.get_public_key_bytes(compressed=True),
+        key_b.get_public_key_bytes(compressed=True),
+    )
+    return spk
 
 
 def test_session_uses_channel_change_when_enabled(tmp_path: Path, wallet: WalletService) -> None:

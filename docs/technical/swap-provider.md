@@ -32,6 +32,16 @@ The provider is always the swap "server" and never pays a swap fee:
   base fee with no client change, the simplest on-chain shape that severs the
   peel chain (it concentrates linkage onto the provider's own wallet, which it
   manages separately).
+- **Channel-as-change** (experimental, off by default): the maker can emit its
+  CoinJoin change as a Taproot channel-funding output (a simple-taproot 2-of-2),
+  so the change has no chaining successor in the wallet. Today both funding keys
+  are derived from the maker's seed, so the output is tracked on-chain and
+  cooperatively swept back with ``jm-maker swap-channel-sweep`` (an ordinary
+  P2TR key-path spend, validated against bitcoind). The remaining production
+  step is opening a real Lightning channel whose funding output *is* this
+  CoinJoin output, via an externally-assembled-PSBT funding flow (LND's
+  ``PsbtShim``/``skip_finalize``); LDK Server does not expose externally-funded
+  opens, so that integration targets LND.
 
 Discovery and signalling run over **Nostr**: the provider advertises its terms
 as an addressable event and answers swap RPCs sent as NIP-04 encrypted DMs; the

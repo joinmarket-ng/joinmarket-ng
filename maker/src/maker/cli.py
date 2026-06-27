@@ -865,6 +865,68 @@ def generate_address(
     typer.echo(address)
 
 
+@app.command(name="swap-channel-sweep")
+def swap_channel_sweep(
+    destination: Annotated[str, typer.Argument(help="Address to sweep channelled change into")],
+    mnemonic_file: Annotated[
+        Path | None, typer.Option("--mnemonic-file", "-f", help="Path to mnemonic file")
+    ] = None,
+    prompt_bip39_passphrase: Annotated[
+        bool, typer.Option("--prompt-bip39-passphrase", help="Prompt for BIP39 passphrase")
+    ] = False,
+    data_dir: Annotated[
+        Path | None,
+        typer.Option("--data-dir", "-d", envvar="JOINMARKET_DATA_DIR", help="Data directory"),
+    ] = None,
+    config_file: Annotated[
+        Path | None,
+        typer.Option("--config-file", envvar="JOINMARKET_CONFIG_FILE", help="Config file path"),
+    ] = None,
+    log_level: Annotated[str | None, typer.Option("--log-level", "-l")] = None,
+) -> None:
+    """Cooperatively sweep channel-as-change (P2TR) outputs into a wallet address.
+
+    Recovers funds emitted by the experimental [maker.swap_provider] channel_change
+    option; the maker holds both funding keys so the sweep is an ordinary P2TR
+    key-path spend.
+    """
+    from pathlib import Path as _Path
+
+    from maker.channel_change import (
+        ChannelChangeStore,
+        channel_change_balance,
+        sweep_channel_change,
+    )
+
+    settings = setup_cli(log_level, data_dir=data_dir, config_file=config_file)
+    try:
+        resolved = resolve_mnemonic(
+            settings, mnemonic_file=mnemonic_file, prompt_bip39_passphrase=prompt_bip39_passphrase
+        )
+        config = build_maker_config(
+            settings=settings,
+            mnemonic=resolved.mnemonic if resolved else "",
+            passphrase=resolved.bip39_passphrase if resolved else "",
+        )
+    except (ValueError, FileNotFoundError) as e:
+        logger.error(str(e))
+        raise typer.Exit(1)
+
+    wallet = create_wallet_service(config)
+    store = ChannelChangeStore(_Path(config.data_dir) / "channel_changes")
+
+    async def _run() -> None:
+        balance = await channel_change_balance(wallet.backend, store)
+        typer.echo(f"Channel-change balance: {balance} sats")
+        if balance == 0:
+            return
+        txids = await sweep_channel_change(wallet, wallet.backend, store, destination)
+        for txid in txids:
+            typer.echo(f"swept -> {txid}")
+
+    run_async(_run())
+
+
 @app.command()
 def config_init(
     data_dir: Annotated[
