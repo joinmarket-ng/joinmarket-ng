@@ -21,8 +21,10 @@ from _taker_test_helpers import (
     make_taker_config,
     make_utxo,
 )
+from jmcore.crypto import NickIdentity
 from jmcore.encryption import CryptoSession
 from jmcore.models import Offer, OfferType
+from jmcore.network import ONION_HOSTID
 from jmwallet.wallet.models import UTXOInfo
 
 from taker.multi_directory import ChannelBinding
@@ -605,12 +607,15 @@ class TestMultiDirectoryClientDirectConnections:
 
         client = make_directory_client()
 
-        maker_nick = "J5TestMaker"
+        maker = NickIdentity(5)
+        maker_nick = maker.nick
         sig_data = "deadbeefdeadbeef"
-        # Craft two raw message lines that look like they came from different
-        # directory servers but carry identical !sig payload.
-        msg_dir1 = {"line": f"{maker_nick} !sig {sig_data}", "source": "dir1"}
-        msg_dir2 = {"line": f"{maker_nick} !sig {sig_data}", "source": "dir2"}
+        # Two signed lines relayed by different directory servers but carrying
+        # the identical, validly-signed !sig payload from the same maker.
+        signed = maker.sign_message(sig_data, ONION_HOSTID)
+        line = f"{maker_nick}!{client.nick_identity.nick}!sig {signed}"
+        msg_dir1 = {"line": line, "source": "dir1"}
+        msg_dir2 = {"line": line, "source": "dir2"}
 
         # Pre-load both messages into the direct queue so wait_for_responses
         # drains them without actually opening network connections.
@@ -629,7 +634,7 @@ class TestMultiDirectoryClientDirectConnections:
 
         assert maker_nick in responses
         assert len(responses[maker_nick]["data"]) == 1
-        assert responses[maker_nick]["data"][0] == sig_data
+        assert responses[maker_nick]["data"][0].split()[0] == sig_data
 
 
 # --- Tests for Sweep Mode CJ Amount Preservation ---
