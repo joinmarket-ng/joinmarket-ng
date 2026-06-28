@@ -97,14 +97,30 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin, Wal
         self.address_cache: dict[str, tuple[int, int, int]] = {}
         self._path_cache: dict[tuple[int, int, int], str] = {}
         self.utxo_cache: dict[int, list[UTXOInfo]] = {}
-        # Flag set on construction and cleared after the first successful sync.
-        # Used by _auto_freeze_reused_address_utxos to suppress false-positive
-        # auto-freezes on the very first sync after a process restart: when the
-        # process just started, utxo_cache is empty so prior_known_outpoints is
-        # empty, but addresses_with_history is populated from the persisted
-        # metadata store.  Without this guard every UTXO on a "used" address
-        # would look like a "freshly arrived coin at an empty used address".
-        self._just_initialized: bool = True
+        # Forced-address-reuse defense state (issue #529, hardened for #542).
+        #
+        # The auto-freeze must distinguish a *genuine* forced reuse (a new coin
+        # landing on an address we funded and then emptied) from a perfectly
+        # legitimate first-use coin that merely became visible on a later sync
+        # (background descriptor rescan still catching up, a transient RPC
+        # failure on the first sync, or a descriptor-range upgrade). The
+        # persistent ``addresses_with_history`` set is restored at init, so it
+        # cannot be used on its own to decide "this address was emptied": a
+        # still-funded first-use address is in that set too. Relying on it (via
+        # the old one-shot ``_just_initialized`` guard) wrongly froze coins that
+        # the first sync had not yet observed (#542).
+        #
+        # Instead we accumulate, across this process's syncs, the addresses and
+        # outpoints we have *positively observed funded*. A coin is treated as
+        # forced reuse only when its address was seen funded earlier in this
+        # process and is empty again now (see
+        # :meth:`_auto_freeze_reused_address_utxos`). These sets are
+        # intentionally process-local: after a restart nothing is auto-frozen
+        # until we have witnessed a funded -> empty transition ourselves, which
+        # is the safe choice (a late-discovered legitimate coin and an attacker's
+        # dust are indistinguishable without that observation).
+        self._observed_funded_addresses: set[str] = set()
+        self._observed_outpoints: set[str] = set()
         # Guards the once-per-process import-label reconstruction pass (see
         # WalletSyncMixin.reconstruct_imported_labels). Coins received while
         # running are either this wallet's own CoinJoins (recorded in history)
@@ -754,8 +770,8 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin, Wal
 
     def _auto_freeze_reused_address_utxos(
         self,
-        prior_used_addresses: set[str],
-        prior_known_outpoints: set[str],
+        observed_funded_addresses: set[str],
+        observed_outpoints: set[str],
         prior_funded_addresses: set[str],
     ) -> int:
         """Auto-freeze UTXOs that landed on an already-spent (empty) used address.
@@ -771,18 +787,21 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin, Wal
 
         A UTXO is auto-frozen only when ALL of the following hold:
 
-        * Its address is in ``prior_used_addresses`` -- the address was used by
-          an earlier transaction (snapshot taken before this sync recorded the
-          current UTXOs' addresses).
+        * Its outpoint is NOT in ``observed_outpoints`` -- it is a coin this
+          process is seeing for the first time, never one we have already
+          accounted for (this also makes the check robust to a transient sync
+          that momentarily lost and then re-found the same coin).
+        * Its address IS in ``observed_funded_addresses`` -- we positively
+          observed this address holding a coin on an earlier sync. This is the
+          crucial guard against #542: we never freeze a first-use coin that was
+          merely *discovered late* (e.g. by a background rescan), because we
+          would not have seen its address funded before.
         * Its address is NOT in ``prior_funded_addresses`` -- the address held
-          no UTXO before this arrival, i.e. it was previously spent empty. This
-          is the key difference from legacy joinmarket-clientserver, which froze
-          reuse on any used address; we only freeze re-funding of a spent-empty
-          address and leave the "address still holds the original deposit" case
-          to be fully spent together.
-        * Its outpoint is NOT in ``prior_known_outpoints`` -- it is freshly
-          arrived this sync, never a pre-existing coin. (Implied by the
-          empty-address check, kept for clarity.)
+          no UTXO at the start of this sync, i.e. it was emptied before this
+          arrival. If the address still holds funds the privacy-correct action
+          is to fully spend them together, so those are left untouched. This is
+          the key difference from legacy joinmarket-clientserver, which froze
+          reuse on any used address.
         * It passes the value filter: ``max_sats_freeze_reuse == -1`` freezes
           all such reuse, a positive ``N`` freezes only ``value <= N`` sats, and
           ``0`` disables the behavior entirely.
@@ -799,7 +818,7 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin, Wal
         threshold = self.max_sats_freeze_reuse
         if threshold == 0:
             return 0
-        if not prior_used_addresses:
+        if not observed_funded_addresses:
             return 0
 
         frozen_now = 0
@@ -808,15 +827,17 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin, Wal
                 if utxo.is_fidelity_bond:
                     continue
                 outpoint = utxo.outpoint
-                # Pre-existing UTXOs (the original deposit, or coins present at
-                # startup) are never auto-frozen -- only freshly arrived ones.
-                if outpoint in prior_known_outpoints:
+                # Coins we have already observed (the original deposit, coins
+                # present at startup, or a coin transiently lost then re-found)
+                # are never auto-frozen -- only genuinely new arrivals are.
+                if outpoint in observed_outpoints:
                     continue
-                # Only freeze re-funding of an already-used address that was
-                # *empty* before this arrival. If the address still held funds,
-                # the privacy-correct action is to fully spend them together,
-                # not to freeze, so we skip it.
-                if utxo.address not in prior_used_addresses:
+                # Only freeze a new coin on an address we have *positively seen
+                # funded before* and that is empty again now. A first-use coin
+                # surfaced by a later sync (background rescan, transient RPC
+                # failure, descriptor-range upgrade) was never observed funded,
+                # so it is left spendable (issue #542).
+                if utxo.address not in observed_funded_addresses:
                     continue
                 if utxo.address in prior_funded_addresses:
                     continue

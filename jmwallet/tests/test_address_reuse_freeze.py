@@ -75,7 +75,7 @@ def test_freezes_utxo_on_already_used_address(tmp_path: Path) -> None:
     utxo = _utxo(txid="aa" * 32, address=REUSED_ADDRESS, value=10_000)
     ws.utxo_cache = {0: [utxo]}
 
-    # The address was used by a prior transaction.
+    # The address was observed funded on a prior sync and is empty again now.
     frozen = ws._auto_freeze_reused_address_utxos({REUSED_ADDRESS}, set(), set())
 
     assert frozen == 1
@@ -103,7 +103,7 @@ def test_does_not_freeze_reuse_when_address_still_holds_funds(tmp_path: Path) ->
     # new arrival is left spendable.
     frozen = ws._auto_freeze_reused_address_utxos(
         {REUSED_ADDRESS},
-        prior_known_outpoints={original.outpoint},
+        observed_outpoints={original.outpoint},
         prior_funded_addresses={REUSED_ADDRESS},
     )
 
@@ -122,10 +122,10 @@ def test_freezes_reuse_on_spent_empty_used_address(tmp_path: Path) -> None:
     reuse = _utxo(txid="03" * 32, address=REUSED_ADDRESS, value=600, vout=0)
     ws.utxo_cache = {0: [reuse]}
 
-    # Address was used before but is now empty (no prior funded UTXO).
+    # Address was observed funded before but is now empty (no prior funded UTXO).
     frozen = ws._auto_freeze_reused_address_utxos(
         {REUSED_ADDRESS},
-        prior_known_outpoints=set(),
+        observed_outpoints=set(),
         prior_funded_addresses=set(),
     )
 
@@ -272,10 +272,10 @@ async def test_first_sync_after_restart_keeps_existing_coins_spendable(
 ) -> None:
     """sync_all on the first sync after init must not freeze existing coins.
 
-    On restart utxo_cache is empty when the pre-sync snapshot is taken while
-    addresses_with_history is restored from the metadata store, so without the
-    first-sync guard every coin on a used address looks like fresh reuse on an
-    empty address and is wrongly frozen.
+    On restart ``utxo_cache`` is empty while ``addresses_with_history`` is
+    restored from the metadata store, so a coin on a used address must not be
+    mistaken for fresh reuse: the process has not observed the address funded
+    yet, so nothing is frozen.
     """
     ws = _make_wallet(tmp_path, max_sats_freeze_reuse=-1)
     # Restart state: the address is known-used and its coin is still present.
@@ -291,26 +291,73 @@ async def test_first_sync_after_restart_keeps_existing_coins_spendable(
     ws.setup_descriptor_wallet = AsyncMock(return_value=True)
     ws._sync_all_with_descriptors = fake_descriptor_sync
 
-    assert ws._just_initialized is True
     await ws.sync_all()
 
     assert utxo.frozen is False
     assert not ws.metadata_store.is_frozen(utxo.outpoint)
-    assert ws._just_initialized is False
 
 
-async def test_reuse_is_still_frozen_on_sync_after_restart_guard(
+async def test_reuse_is_frozen_after_witnessed_spend(
     tmp_path: Path,
 ) -> None:
-    """The first-sync guard is one-shot: later syncs still freeze forced reuse.
+    """A dust payment on an address the process saw funded then emptied is frozen.
 
-    The restart guard only suppresses false positives on the very first sync
-    after init. Once consumed, a dust payment that lands on a spent-empty used
-    address must still be auto-frozen, otherwise the forced-address-reuse
-    defense would be permanently disabled for the whole process lifetime.
+    The defense keys off an observed funded -> empty transition rather than a
+    one-shot first-sync guard: once we have positively seen an address hold a
+    coin and then go empty, a later arrival on it is treated as forced reuse.
     """
     ws = _make_wallet(tmp_path, max_sats_freeze_reuse=-1)
-    # Restart state: REUSED_ADDRESS is known-used but currently empty.
+
+    scan: dict[int, list[UTXOInfo]] = {0: []}
+
+    async def fake_descriptor_sync(_bonds: object = None) -> dict[int, list[UTXOInfo]]:
+        ws.utxo_cache = {0: list(scan[0])}
+        return ws.utxo_cache
+
+    ws.backend.is_wallet_setup = AsyncMock(return_value=True)
+    ws.backend.list_descriptors = AsyncMock(return_value=[])
+    ws.setup_descriptor_wallet = AsyncMock(return_value=True)
+    ws._sync_all_with_descriptors = fake_descriptor_sync
+
+    # Sync 1: the address is funded with the original coin (observed funded).
+    original = _utxo(txid="d0" * 32, address=REUSED_ADDRESS, value=10_000)
+    scan[0] = [original]
+    await ws.sync_all()
+    assert original.frozen is False
+
+    # Sync 2: the coin is spent, the address goes empty (observed transition).
+    scan[0] = []
+    await ws.sync_all()
+
+    # Sync 3: a forced-reuse dust payment now arrives on the spent-empty address.
+    reuse = _utxo(txid="e5" * 32, address=REUSED_ADDRESS, value=600)
+    scan[0] = [reuse]
+    await ws.sync_all()
+
+    assert reuse.frozen is True
+    assert ws.metadata_store.is_frozen(reuse.outpoint)
+
+
+async def test_incomplete_first_sync_does_not_freeze_late_discovered_coin(
+    tmp_path: Path,
+) -> None:
+    """Regression for #542: a first-use coin discovered by a later sync must
+    not be auto-frozen as forced reuse.
+
+    A long-running process can complete its first sync before a background
+    rescan has surfaced all of the wallet's coins (descriptor smart-scan, a
+    transient RPC hiccup, or a descriptor-range upgrade). The persisted
+    used-address set is restored at init, so on a later sync the just-found,
+    still-funded first-use address looks (to the old one-shot guard) like a
+    fresh arrival on a spent-empty used address and was wrongly frozen.
+
+    The coin here only ever has a single UTXO and the address is used exactly
+    once, so it must stay spendable.
+    """
+    ws = _make_wallet(tmp_path, max_sats_freeze_reuse=-1)
+    # Restart state: the address is already known-used from persisted history,
+    # and its (single, still-unspent) coin exists on-chain but is not yet
+    # visible to the wallet's first sync.
     ws.addresses_with_history = {REUSED_ADDRESS}
 
     scan: dict[int, list[UTXOInfo]] = {0: []}
@@ -324,14 +371,14 @@ async def test_reuse_is_still_frozen_on_sync_after_restart_guard(
     ws.setup_descriptor_wallet = AsyncMock(return_value=True)
     ws._sync_all_with_descriptors = fake_descriptor_sync
 
-    # First sync after restart consumes the guard (no coins present yet).
-    await ws.sync_all()
-    assert ws._just_initialized is False
-
-    # A forced-reuse dust payment now arrives on the spent-empty used address.
-    reuse = _utxo(txid="e5" * 32, address=REUSED_ADDRESS, value=600)
-    scan[0] = [reuse]
+    # First sync finds nothing (background rescan still catching up).
     await ws.sync_all()
 
-    assert reuse.frozen is True
-    assert ws.metadata_store.is_frozen(reuse.outpoint)
+    # The rescan completes and the original first-use coin appears.
+    coin = _utxo(txid="f6" * 32, address=REUSED_ADDRESS, value=1_000_000)
+    scan[0] = [coin]
+    await ws.sync_all()
+
+    assert coin.frozen is False, "a late-discovered first-use coin must not be frozen"
+    assert not ws.metadata_store.is_frozen(coin.outpoint)
+    assert ws.metadata_store.records.get(coin.outpoint) is None

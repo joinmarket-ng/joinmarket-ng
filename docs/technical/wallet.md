@@ -99,6 +99,17 @@ pre-existing UTXO is never auto-frozen. Frozen reuse UTXOs are labeled in the
 metadata store and can be released with `jm-wallet unfreeze` (an explicit
 unfreeze is never overridden by a later sync). Fidelity bonds are exempt.
 
+To decide that an address was "spent empty", the wallet relies on having
+positively observed that address transition from funded to empty during the
+running process, not merely on the persisted used-address set. This avoids a
+false positive where a legitimate first-use coin only becomes visible on a
+later sync (for example while a background descriptor rescan is still catching
+up, after a transient RPC failure, or following a descriptor-range upgrade):
+such a coin is left spendable rather than mistaken for forced reuse. A
+consequence is that after a restart nothing is auto-frozen until the wallet has
+itself witnessed a funded -> empty transition, since a late-discovered genuine
+coin and an attacker's dust are otherwise indistinguishable.
+
 The `[wallet] max_sats_freeze_reuse` setting controls the threshold: `-1`
 (default) freezes all such reuse UTXOs, a positive `N` freezes only those with
 value `<= N` sats, and `0` disables the behavior. This is based on the legacy
