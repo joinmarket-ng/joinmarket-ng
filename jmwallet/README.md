@@ -545,6 +545,10 @@ For full documentation, see [jmwallet Documentation](https://joinmarket-ng.githu
 
  The PSBT includes the witness script (CLTV timelock) needed to spend the bond.
 
+ HOT WALLETS: If the bond was created with 'generate-bond-address' (key derived
+ from this wallet's seed), you do NOT need a PSBT. After it expires, spend it
+ directly with: jm-wallet send <destination> --select-utxos
+
  REQUIREMENTS:
  - The bond must exist in the registry (created with 'create-bond-address')
  - The bond must be funded (use 'jm-wallet sync-bonds'

@@ -125,6 +125,27 @@ Commands:
 - `jm-wallet recover-bonds` - Scan the blockchain to discover bonds and refresh the registry
 - `jm-wallet registry-show <address>` - Show bond details
 
+**Spending an Expired Bond (hot wallet):**
+
+A bond created with `generate-bond-address` is derived from the wallet's own
+seed, so the wallet holds its private key. Once the locktime has passed (the
+bond shows as `Expired` in `jm-wallet list-bonds`), spend it like any other
+UTXO with interactive selection -- no PSBT and no external signing scripts:
+
+```bash
+jm-wallet send <destination_address> --select-utxos
+```
+
+Pick the expired bond UTXO in the selection TUI. The wallet automatically sets
+`nLockTime` to the bond's locktime, uses sequence `0xFFFFFFFE`, derives the key,
+and builds the CLTV P2WSH witness. Still-locked bonds cannot be selected, and
+auto-selection (without `--select-utxos`) always skips bonds so they are never
+spent by accident. Use `--amount 0` to sweep the whole bond.
+
+The PSBT-based `spend-bond` workflow below is **only** needed for cold-storage
+bonds created with `create-bond-address` from an external public key, where the
+private key lives outside this wallet and must sign offline.
+
 **Bond Proof Structure (252 bytes):**
 
 | Field | Size | Description |
@@ -286,7 +307,12 @@ The `cert_expiry` is an **absolute** period number that indicates when the certi
 
 When your certificate expires, repeat steps 4-6 with a new message. The bond funds remain unaffected -- only the certificate needs re-signing.
 
-**Spending Bonds:**
+**Spending Bonds (cold storage / external pubkey):**
+
+This section applies to bonds created with `create-bond-address`, whose private
+key is held outside this wallet. Hot-wallet bonds (from `generate-bond-address`)
+do not need any of this; spend them directly with `jm-wallet send <dest> --select-utxos`
+(see "Spending an Expired Bond" above).
 
 > **Tested:** Bond creation verified with Sparrow Wallet and a hardware wallet (HWI >= 3.1.0). Bond redemption verified with `sign_bond_mnemonic.py`. Specter DIY can sign through the QR PSBT workflow; this guide does not claim or require Specter DIY support in upstream HWI. Trezor cannot sign the redemption transaction due to the CLTV firmware limitation.
 
