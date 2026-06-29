@@ -13,8 +13,12 @@ from collections import Counter
 from taker.combine import CombineMaker
 from taker.knapsack import (
     DEFAULT_GRID_DIV,
+    ExternalChannelError,
+    KnapsackPiece,
     KnapsackPlan,
+    assert_maker_to_maker,
     plan_knapsack,
+    plan_to_change_outputs,
     quantize,
 )
 
@@ -137,3 +141,58 @@ def test_amounts_by_owner_matches_pieces() -> None:
     amounts = plan.amounts_by_owner()
     for m in makers:
         assert sum(amounts[m.nick]) == m.change
+
+
+def test_grid_is_above_dust() -> None:
+    # The grid value must exceed the dust threshold, or grid pieces would be dropped
+    # by build_coinjoin_tx and the maker would lose them.
+    plan = plan_knapsack(_makers(4), denomination=DENOM)
+    assert plan.grid > 27_300
+
+
+def test_plan_to_change_outputs_sums_and_addresses() -> None:
+    makers = _makers(6)
+    plan = plan_knapsack(makers, denomination=DENOM)
+    participants = {m.nick for m in makers}
+
+    def address_for(piece: KnapsackPiece) -> str:
+        # A real caller returns a 2-of-2 for a channel piece; here just a marker.
+        kind = f"chan:{piece.owner}:{piece.counterparty}" if piece.is_channel else "plain"
+        return f"{kind}:{piece.value}"
+
+    change_outputs = plan_to_change_outputs(plan, address_for, participants=participants)
+    for m in makers:
+        assert sum(amt for _addr, amt in change_outputs[m.nick]) == m.change
+
+
+def test_assert_maker_to_maker_rejects_external_counterparty() -> None:
+    plan = KnapsackPlan(
+        pieces=(KnapsackPiece(owner="m1", value=100_000, counterparty="external_node"),),
+        grid=54_600,
+    )
+    try:
+        assert_maker_to_maker(plan, participants={"m1", "m2"})
+    except ExternalChannelError:
+        pass
+    else:
+        raise AssertionError("expected ExternalChannelError for an external counterparty")
+
+
+def test_assert_maker_to_maker_rejects_self_counterparty() -> None:
+    plan = KnapsackPlan(
+        pieces=(KnapsackPiece(owner="m1", value=100_000, counterparty="m1"),),
+        grid=54_600,
+    )
+    try:
+        assert_maker_to_maker(plan, participants={"m1", "m2"})
+    except ExternalChannelError:
+        pass
+    else:
+        raise AssertionError("expected ExternalChannelError for a self counterparty")
+
+
+def test_plan_knapsack_passes_the_maker_to_maker_guard() -> None:
+    makers = _makers(6)
+    plan = plan_knapsack(makers, denomination=DENOM, allowance=2)
+    # A real plan is always maker-to-maker, so the guard accepts it.
+    assert_maker_to_maker(plan, participants={m.nick for m in makers})

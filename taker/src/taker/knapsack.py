@@ -35,9 +35,17 @@ layer from the pairing recorded here.
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
 from taker.combine import CombineMaker
+
+
+class ExternalChannelError(ValueError):
+    """A channel-as-change piece names a counterparty that is not a fellow CoinJoin
+    participant (an external-peer channel), which is not a privacy improvement and is
+    forbidden: a channel-as-change output is always maker-to-maker."""
+
 
 # 10x the standard dust limit, matching jmcore.constants.DUST_THRESHOLD, kept local
 # so this pure planner has no import-time dependency on chain constants.
@@ -169,3 +177,43 @@ def plan_knapsack(
         for value in quantize(m.change, grid, max_pieces=max_pieces, dust=dust):
             pieces.append(KnapsackPiece(owner=m.nick, value=value, counterparty=None))
     return KnapsackPlan(pieces=tuple(pieces), grid=grid)
+
+
+def assert_maker_to_maker(plan: KnapsackPlan, participants: Iterable[str]) -> None:
+    """Raise :class:`ExternalChannelError` unless every channel piece is maker-to-maker.
+
+    A channel piece's counterparty must be a *fellow* CoinJoin participant (in
+    ``participants``) and never the owner itself. Call this at the build boundary so the
+    maker-to-maker-only rule is enforced, not merely assumed.
+    """
+    parts = set(participants)
+    for piece in plan.channel_pieces():
+        cp = piece.counterparty
+        if cp is None or cp == piece.owner or cp not in parts:
+            raise ExternalChannelError(
+                f"channel piece of {piece.owner} names counterparty {cp!r}, "
+                "which is not a fellow CoinJoin participant"
+            )
+
+
+def plan_to_change_outputs(
+    plan: KnapsackPlan,
+    address_for: Callable[[KnapsackPiece], str],
+    *,
+    participants: Iterable[str] | None = None,
+) -> dict[str, list[tuple[str, int]]]:
+    """Turn a plan into per-maker ``change_outputs`` for ``build_coinjoin_tx``.
+
+    ``address_for(piece)`` returns the on-chain address for a piece: a maker-to-maker
+    2-of-2 funding address for a channel piece (from the channel layer), or an ordinary
+    change address for a plain piece. When ``participants`` is given, the
+    maker-to-maker-only rule is enforced first (:func:`assert_maker_to_maker`). The
+    result maps each maker nick to its ``(address, amount)`` pieces, whose amounts sum
+    to that maker's change exactly (as ``build_coinjoin_tx`` requires).
+    """
+    if participants is not None:
+        assert_maker_to_maker(plan, participants)
+    out: dict[str, list[tuple[str, int]]] = {}
+    for piece in plan.pieces:
+        out.setdefault(piece.owner, []).append((address_for(piece), piece.value))
+    return out

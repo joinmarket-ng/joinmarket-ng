@@ -108,9 +108,43 @@ into the same grid pool, so on chain they are indistinguishable from the channel
 makers (their plain pieces still chain across slots, the honest limit). The
 planner is implemented and unit-tested (`taker/tests/test_knapsack.py`); like the
 combined variant its piece *amounts* feed `build_coinjoin_tx`'s per-maker
-`change_outputs` and the maker-to-maker 2-of-2 *addresses* come from the channel
-layer, with the runtime protocol-message round (relaying each piece's pairing) the
-remaining wiring.
+`change_outputs` (via `taker.knapsack.plan_to_change_outputs`, which also enforces
+the maker-to-maker rule with `assert_maker_to_maker`) and the maker-to-maker 2-of-2
+*addresses* come from the channel layer.
+
+#### Runtime protocol wiring (sketch)
+
+The planner and the build helper are pure and tested; the remaining work is the
+protocol-message round that carries the pairing at runtime. The intended flow, all
+feature-flagged so non-participating makers fall back to ordinary plain change:
+
+1. **Advertise.** A knapsack-capable maker adds two fields to its offer (alongside the
+   existing combine signalling): `knapsack_capable` and its Lightning `ln_node`
+   (`node_id@host:port`). A taker that does not understand the fields ignores them; a
+   maker that does not advertise them is treated as plain.
+2. **Plan (after `!ioauth`).** Once the taker knows every maker's UTXOs it computes each
+   maker's change and calls `plan_knapsack(makers, denomination=..., allowance=...)`,
+   yielding the per-maker pieces and, for each channel piece, the fellow-maker
+   counterparty.
+3. **Relay pubkeys.** For each channel piece `(owner, counterparty)` the taker asks each
+   side for a fresh funding pubkey and relays the *counterparty's* pubkey to the owner
+   (and vice versa), exactly as the combined variant relays one pubkey today. Neither
+   maker learns more than the one pubkey it must co-sign with; the taker never holds
+   channel keys.
+4. **Addresses.** Each maker computes its channel pieces' addresses with
+   `jmswap.channel.channel_funding_output(own_key, partner_key)` (a MuSig2 2-of-2) and
+   its plain pieces' addresses ordinarily, and returns the `(address, amount)` list for
+   its pieces (which must sum to its taker-computed change).
+5. **Build and verify.** The taker assembles the per-maker `change_outputs` with
+   `plan_to_change_outputs(plan, address_for, participants=<nicks>)` (the
+   `participants` argument rejects any channel piece whose counterparty is not a fellow
+   participant, i.e. an external-peer channel) and passes them to `build_coinjoin_tx`.
+   Each maker recomputes the plan from the public parameters and checks its own outputs
+   before signing, so the taker cannot pin a maker to a shape it did not agree to.
+6. **Open and push.** After the round confirms, each owner opens its externally-funded
+   channels on the agreed funding outpoints (LDK
+   `unsafe_manual_funding_transaction_generated`, as the per-maker variant already
+   does), pushing the counterparty its share where a piece pools both sides' change.
 
 ### On-chain-only takers: sweep under homogeneous fees
 
