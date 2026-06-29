@@ -205,6 +205,14 @@ def combined_funding_output(pubkeys: list[bytes]) -> tuple[bytes, bytes]:
     return taproot_output_script(internal, None), internal
 
 
+def combined_funding_address(pubkeys: list[bytes], network: str = "mainnet") -> str:
+    """Bech32m address of the combined (maker-to-maker) shared 2-of-2 funding output."""
+    from jmcore.bitcoin import scriptpubkey_to_address
+
+    spk, _ = combined_funding_output(pubkeys)
+    return scriptpubkey_to_address(spk, network)
+
+
 @dataclass(frozen=True)
 class CombinedChannelPlan:
     """A taker-computed plan for a combined (pooled-change) channel.

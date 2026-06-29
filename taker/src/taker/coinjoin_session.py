@@ -164,6 +164,8 @@ class CoinJoinSession:
         self.podle_commitment = None
         self.unsigned_tx = b""
         self.tx_metadata = {}
+        # nick -> CombineRelay for makers paired into shared channel-as-change outputs
+        self._combine_relay: dict[str, Any] = {}
         self.final_tx = b""
         self.txid = ""
         self.preselected_utxos = []
@@ -668,6 +670,15 @@ class CoinJoinSession:
                         else:
                             logger.info(f"BTC signature verified for {nick}")
 
+                    # Optional 6th field: the maker's maker-to-maker channel-as-change
+                    # funding pubkey (backward compatible; absent for plain makers).
+                    if len(ioauth_parts) >= 6:
+                        session.cc_funding_pubkey = ioauth_parts[5]
+                        logger.info(
+                            f"{nick} offered channel-as-change (cc_pubkey "
+                            f"{session.cc_funding_pubkey[:16]}...)"
+                        )
+
                     # Parse utxo_list using protocol helper
                     # (handles both legacy and extended format)
                     # Then verify each UTXO using the appropriate backend method
@@ -995,6 +1006,36 @@ class CoinJoinSession:
                     "txfee": maker_txfee,
                 }
 
+            # Maker-to-maker channel-as-change (opt-in): pair makers that advertised a
+            # channel-as-change funding pubkey into shared 2-of-2 outputs pooling their
+            # change, so no per-maker change output reveals an exact residual.
+            combine_groups: dict[str, str] = {}
+            self._combine_relay = {}
+            if getattr(self.config, "combine_channel_as_change", False):
+                from taker.combine import plan_combine_session
+
+                makers_cc = [
+                    (
+                        nick,
+                        s.cc_funding_pubkey,
+                        sum(int(u["value"]) for u in s.utxos)
+                        - self.cj_amount
+                        - s.offer.txfee
+                        + calculate_cj_fee(s.offer, self.cj_amount),
+                    )
+                    for nick, s in self.maker_sessions.items()
+                ]
+                plan = plan_combine_session(makers_cc, self.config.network.value)
+                combine_groups = plan.combine_groups
+                self._combine_relay = plan.relay
+                for nick, pieces in plan.change_outputs.items():
+                    maker_data[nick]["change_outputs"] = pieces
+                if combine_groups:
+                    logger.info(
+                        f"channel-as-change: pooled {len(combine_groups)} maker change(s) "
+                        f"into {len(plan.change_outputs)} shared 2-of-2 output(s)"
+                    )
+
             # Build transaction
             network = self.config.network.value
             self.unsigned_tx, self.tx_metadata = build_coinjoin_tx(
@@ -1015,6 +1056,7 @@ class CoinJoinSession:
                 tx_fee=tx_fee,
                 network=network,
                 dust_threshold=self.config.dust_threshold,
+                combine_groups=combine_groups,
             )
 
             logger.info(f"Built unsigned tx: {len(self.unsigned_tx)} bytes")
@@ -1300,7 +1342,18 @@ class CoinJoinSession:
                 nick, session.comm_channel
             )
 
-            encrypted_tx = session.crypto.encrypt(tx_b64)
+            # For a maker paired into a shared channel-as-change output, append the
+            # combine info (partner pubkey, partner change, shared address) so it can
+            # recompute and verify the 2-of-2. Inside the per-maker NaCl box, invisible
+            # to other peers; plain makers get the bare tx (byte-identical to today).
+            payload = tx_b64
+            relay = getattr(self, "_combine_relay", {}).get(nick)
+            if relay is not None:
+                payload = (
+                    f"{tx_b64} cc {relay.partner_pubkey} "
+                    f"{relay.partner_change} {relay.shared_address}"
+                )
+            encrypted_tx = session.crypto.encrypt(payload)
             await self.directory_client.send_privmsg(
                 nick, "tx", encrypted_tx, log_routing=True, force_channel=session.comm_channel
             )

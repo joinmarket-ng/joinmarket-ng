@@ -221,6 +221,15 @@ class TakerConfig(WalletConfig):
             "Default 4 matches the upstream JoinMarket POLICY default."
         ),
     )
+
+    combine_channel_as_change: bool = Field(
+        default=False,
+        description=(
+            "Pair makers that advertise a channel-as-change funding pubkey into shared "
+            "maker-to-maker 2-of-2 funding outputs, pooling their change to hide the "
+            "amounts. Off by default (a plain CoinJoin is byte-identical to today)."
+        ),
+    )
     max_maker_replacement_attempts: int = Field(
         default=3,
         ge=0,

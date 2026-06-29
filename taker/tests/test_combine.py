@@ -138,3 +138,42 @@ def test_split_change_must_sum_to_change() -> None:
         build_coinjoin_tx(
             taker_utxos, TAKER_CJ, TAKER_CHG, 5_000_000, data, 1_000_000, 2000, "regtest"
         )
+
+
+def test_plan_combine_session_pools_into_real_shared_2of2() -> None:
+    """The taker plan + builder emit ONE maker-to-maker shared 2-of-2 output."""
+    from coincurve import PrivateKey
+    from jmswap.channel import combined_funding_address
+
+    from taker.combine import plan_combine_session
+
+    a_pub = PrivateKey().public_key.format()
+    b_pub = PrivateKey().public_key.format()
+    # A change = 1.5M - 1M - 0 + 1000 = 501_000 ; B change = 401_000 ; pooled = 902_000
+    plan = plan_combine_session(
+        [("A", a_pub.hex(), 501_000), ("B", b_pub.hex(), 401_000)], "regtest"
+    )
+    shared = combined_funding_address([a_pub, b_pub], "regtest")
+    assert plan.combine_groups == {"B": "A"}
+    assert plan.change_outputs["A"] == [(shared, 902_000)]
+    assert plan.relay["A"].partner_change == 401_000
+    assert plan.relay["B"].shared_address == shared
+
+    data = _maker_data()
+    data["A"]["change_outputs"] = plan.change_outputs["A"]
+    tx, _ = build_coinjoin_tx(
+        [{"txid": "c" * 64, "vout": 0, "value": 5_000_000}],
+        TAKER_CJ,
+        TAKER_CHG,
+        5_000_000,
+        data,
+        1_000_000,
+        2000,
+        "regtest",
+        combine_groups=plan.combine_groups,
+    )
+    tx_hex = tx.hex()
+    # exactly one output to the shared 2-of-2 with the pooled amount, none to plain changes
+    assert _count_outputs_to(tx_hex, shared) == [902_000]
+    assert _count_outputs_to(tx_hex, A_CHG) == []
+    assert _count_outputs_to(tx_hex, B_CHG) == []

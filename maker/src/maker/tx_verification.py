@@ -52,6 +52,8 @@ def verify_unsigned_transaction(
     txfee: int,
     offer_type: OfferType,
     network: NetworkType = NetworkType.MAINNET,
+    combine_address: str | None = None,
+    combine_value: int | None = None,
 ) -> tuple[bool, str]:
     """
     Verify unsigned CoinJoin transaction proposed by taker.
@@ -109,6 +111,7 @@ def verify_unsigned_transaction(
 
         times_seen_cj_addr = 0
         times_seen_change_addr = 0
+        times_seen_combine = 0
 
         for output in tx_outputs:
             output_addr = output["address"]
@@ -130,13 +133,30 @@ def verify_unsigned_transaction(
                         f"Change output value too low: {output_value} < {expected_change_value}",
                     )
 
+            if combine_address is not None and output_addr == combine_address:
+                times_seen_combine += 1
+                if combine_value is not None and output_value < combine_value:
+                    return (
+                        False,
+                        f"Shared channel output too low: {output_value} < {combine_value}",
+                    )
+
         if times_seen_cj_addr != 1:
             return (
                 False,
                 f"CJ address appears {times_seen_cj_addr} times (expected 1)",
             )
 
-        if times_seen_change_addr != 1:
+        # Maker-to-maker channel-as-change: this maker's change is pooled into a shared
+        # 2-of-2 funding output (combine_address) instead of a plain change output, so we
+        # require the shared output (recomputed by us) rather than our own change address.
+        if combine_address is not None:
+            if times_seen_combine != 1:
+                return (
+                    False,
+                    f"Shared channel output appears {times_seen_combine} times (expected 1)",
+                )
+        elif times_seen_change_addr != 1:
             return (
                 False,
                 f"Change address appears {times_seen_change_addr} times (expected 1)",

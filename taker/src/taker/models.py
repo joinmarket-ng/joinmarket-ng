@@ -49,6 +49,9 @@ class MakerSession:
     responded_auth: bool = False
     responded_sig: bool = False
     supports_neutrino_compat: bool = False  # Supports extended UTXO metadata for Neutrino
+    # Maker-to-maker channel-as-change funding pubkey (hex), from the optional 6th
+    # field of !ioauth. Empty unless the maker advertised the combine capability.
+    cc_funding_pubkey: str = ""
     # Communication channel used for this session (must be consistent throughout)
     # "direct" = peer-to-peer onion connection
     # "directory:<host>:<port>" = relayed through specific directory

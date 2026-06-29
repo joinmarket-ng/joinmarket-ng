@@ -74,3 +74,56 @@ def pair_combine_makers(makers: list[CombineMaker]) -> list[CombinePair]:
 def combine_groups_from_pairs(pairs: list[CombinePair]) -> dict[str, str]:
     """Return the ``folder_nick -> funder_nick`` map ``build_coinjoin_tx`` expects."""
     return {p.folder: p.funder for p in pairs}
+
+
+@dataclass(frozen=True)
+class CombineRelay:
+    """What the taker tells each combine maker so it can verify the shared output."""
+
+    partner_pubkey: str  # the fellow maker's funding pubkey (hex)
+    partner_change: int  # the fellow maker's change (so both can size the pool)
+    shared_address: str  # the maker-to-maker 2-of-2 funding address
+
+
+@dataclass(frozen=True)
+class CombineSessionPlan:
+    """A round's maker-to-maker combine plan.
+
+    ``change_outputs`` and ``combine_groups`` feed ``build_coinjoin_tx``; ``relay``
+    is sent per-maker on ``!tx`` so each can recompute and verify the shared 2-of-2.
+    """
+
+    change_outputs: dict[str, list[tuple[str, int]]]
+    combine_groups: dict[str, str]
+    relay: dict[str, CombineRelay]
+
+
+def plan_combine_session(
+    makers: list[tuple[str, str, int]], network: str = "mainnet"
+) -> CombineSessionPlan:
+    """Pair channel-capable makers into shared 2-of-2 outputs pooling their change.
+
+    ``makers`` is ``(nick, cc_pubkey_hex, change_sats)``; a maker with an empty
+    ``cc_pubkey_hex`` is not eligible. Eligible makers are paired two-at-a-time
+    (order-stable); the first of each pair is the *funder* whose single
+    ``change_outputs`` piece is the shared 2-of-2 address worth the *pooled* change,
+    and the second is *folded* into it (no separate change output). An odd maker out
+    keeps a plain change output. Both makers of a pair receive a :class:`CombineRelay`.
+    """
+    from jmswap.channel import combined_funding_address
+
+    eligible = [(n, pk, ch) for (n, pk, ch) in makers if pk]
+    change_outputs: dict[str, list[tuple[str, int]]] = {}
+    combine_groups: dict[str, str] = {}
+    relay: dict[str, CombineRelay] = {}
+    for i in range(0, len(eligible) - 1, 2):
+        (fn, fpk, fch), (dn, dpk, dch) = eligible[i], eligible[i + 1]
+        shared = combined_funding_address([bytes.fromhex(fpk), bytes.fromhex(dpk)], network)
+        pooled = fch + dch
+        change_outputs[fn] = [(shared, pooled)]
+        combine_groups[dn] = fn
+        relay[fn] = CombineRelay(partner_pubkey=dpk, partner_change=dch, shared_address=shared)
+        relay[dn] = CombineRelay(partner_pubkey=fpk, partner_change=fch, shared_address=shared)
+    return CombineSessionPlan(
+        change_outputs=change_outputs, combine_groups=combine_groups, relay=relay
+    )

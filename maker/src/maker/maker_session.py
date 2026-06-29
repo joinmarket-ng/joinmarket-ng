@@ -151,8 +151,10 @@ class MakerSession:
             commitment, revelation, kphex, exclude_utxos=exclude_utxos
         )
 
-    async def handle_tx(self, tx_hex: str) -> tuple[bool, dict[str, Any]]:
-        return await self.inner.handle_tx(tx_hex)
+    async def handle_tx(
+        self, tx_hex: str, combine: dict[str, Any] | None = None
+    ) -> tuple[bool, dict[str, Any]]:
+        return await self.inner.handle_tx(tx_hex, combine=combine)
 
     # -- Per-taker handler bodies (moved from ProtocolHandlersMixin) -------
 
@@ -341,6 +343,21 @@ class MakerSession:
                 return
 
             try:
+                # Optional maker-to-maker channel-as-change suffix appended by the
+                # taker: "<tx_b64> cc <partner_pubkey> <partner_change> <shared_addr>".
+                # Split it off before decoding the base64 tx (backward compatible: a
+                # plain maker just sees the bare tx_b64).
+                combine = None
+                if " cc " in decrypted:
+                    tx_part, _, rest = decrypted.partition(" cc ")
+                    fields = rest.split()
+                    if len(fields) >= 3:
+                        combine = {
+                            "partner_pubkey": fields[0],
+                            "partner_change": int(fields[1]),
+                            "shared_address": fields[2],
+                        }
+                    decrypted = tx_part
                 tx_bytes = base64.b64decode(decrypted)
                 tx_hex = tx_bytes.hex()
                 logger.debug(f"Decoded transaction hex ({len(tx_bytes)} bytes): {tx_hex}")
@@ -348,7 +365,7 @@ class MakerSession:
                 logger.error(f"Failed to decode transaction: {e}")
                 return
 
-            success, response = await self.handle_tx(tx_hex)
+            success, response = await self.handle_tx(tx_hex, combine=combine)
 
             if success:
                 signatures = response.get("signatures", [])
@@ -435,15 +452,19 @@ class MakerSession:
         """
         try:
             if command == "ioauth":
-                plaintext = " ".join(
-                    [
-                        data["utxo_list"],
-                        data["auth_pub"],
-                        data["cj_addr"],
-                        data["change_addr"],
-                        data["btc_sig"],
-                    ]
-                )
+                fields = [
+                    data["utxo_list"],
+                    data["auth_pub"],
+                    data["cj_addr"],
+                    data["change_addr"],
+                    data["btc_sig"],
+                ]
+                # Optional trailing field (backward compatible): the maker-to-maker
+                # channel-as-change funding pubkey. Reference takers ignore extra
+                # positional fields; ours reads index 5 only when present.
+                if data.get("cc_pubkey"):
+                    fields.append(data["cc_pubkey"])
+                plaintext = " ".join(fields)
                 msg_content = self.crypto.encrypt(plaintext)
                 logger.debug(f"Encrypted ioauth message, plaintext_len={len(plaintext)}")
             elif command == "sig":

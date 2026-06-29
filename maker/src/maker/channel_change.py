@@ -44,6 +44,27 @@ if TYPE_CHECKING:
 # channel-change funding keys live on change branch 4.
 SWAP_ACCOUNT = 0x73_77_61_70
 CHANNEL_CHANGE_BRANCH = 4
+# Maker-to-maker combine funding keys (a single key per round, contributed to the
+# shared 2-of-2 with a fellow maker) live on branch 5.
+COMBINE_FUNDING_BRANCH = 5
+
+
+def derive_combine_funding_key(wallet: WalletService, index: int) -> tuple[bytes, bytes, str]:
+    """Derive a recoverable funding keypair for maker-to-maker channel-as-change.
+
+    Returns ``(private_key_bytes, public_key_bytes, path)``. The maker contributes
+    the public key to a shared 2-of-2 with a fellow CoinJoin maker (the taker pairs
+    them and relays pubkeys), and keeps the private key to later cooperatively spend
+    the pooled funding output. Deterministic so it survives a restart.
+    """
+    coin = _coin_type(wallet.network)
+    path = f"m/84'/{coin}'/{SWAP_ACCOUNT}'/{COMBINE_FUNDING_BRANCH}/{index}"
+    key = wallet.master_key.derive(path)
+    return (
+        key.get_private_key_bytes(),
+        key.get_public_key_bytes(compressed=True),
+        path,
+    )
 
 
 @dataclass(frozen=True)

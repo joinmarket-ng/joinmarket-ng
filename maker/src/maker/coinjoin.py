@@ -70,6 +70,7 @@ class CoinJoinSession:
         channel_change: bool = False,
         ldk: object | None = None,
         channel_peer: str | None = None,
+        combine_capable: bool = False,
     ):
         self.taker_nick = taker_nick
         self.offer = offer
@@ -89,6 +90,14 @@ class CoinJoinSession:
         self.channel_peer = channel_peer
         self._channel_user_id: str | None = None
         self._channel_funding_spk: bytes | None = None
+        # Maker-to-maker channel-as-change (combine): the maker contributes a fresh
+        # funding pubkey in !ioauth; the taker pairs two makers into one shared 2-of-2
+        # output pooling their change. Verified on !tx against the relayed partner key.
+        self.combine_capable = combine_capable
+        self._cc_priv: bytes | None = None
+        self._cc_pubkey: bytes | None = None
+        self._combine_shared_spk: bytes | None = None
+        self._combine_pooled_value: int = 0
 
         self.state = CoinJoinState.IDLE
         self.amount = 0
@@ -465,6 +474,19 @@ class CoinJoinSession:
                 "btc_sig": btc_sig,
             }
 
+            # Maker-to-maker channel-as-change: advertise a fresh funding pubkey so
+            # the taker can pair us with a fellow maker into a shared 2-of-2 output.
+            if self.combine_capable:
+                from maker.channel_change import derive_combine_funding_key
+
+                index = self.wallet.get_next_address_index(self.mixdepth, 1)
+                priv, pub, _path = derive_combine_funding_key(self.wallet, index)
+                self._cc_priv, self._cc_pubkey = priv, pub
+                response["cc_pubkey"] = pub.hex()
+                logger.info(
+                    "offering maker-to-maker channel-as-change (cc_pubkey {})", pub.hex()[:16]
+                )
+
             self.state = CoinJoinState.IOAUTH_SENT
             logger.info(f"Sent !ioauth with {len(utxos_dict)} UTXOs")
 
@@ -475,7 +497,47 @@ class CoinJoinSession:
             self.state = CoinJoinState.FAILED
             return False, {"error": str(e)}
 
-    async def handle_tx(self, tx_hex: str) -> tuple[bool, dict[str, Any]]:
+    def _verify_combine(self, combine: dict[str, Any] | None) -> tuple[str | None, int | None]:
+        """Recompute and authorize a maker-to-maker channel-as-change shared output.
+
+        Given the taker-relayed ``partner_pubkey``/``partner_change``, the maker
+        independently recomputes the shared 2-of-2 address from its own funding key
+        (so the taker cannot pin it to an output it did not agree to) and the pooled
+        value. Returns ``(shared_address, pooled_value)`` for the verifier, or
+        ``(None, None)`` when no combine applies. Raises on any mismatch.
+        """
+        if not combine:
+            return None, None
+        if self._cc_pubkey is None:
+            raise ValueError("received combine info but this maker offered no funding key")
+
+        from jmcore.bitcoin import address_to_scriptpubkey
+        from jmcore.models import calculate_cj_fee
+        from jmswap.channel import combined_funding_address
+
+        partner_pub = bytes.fromhex(combine["partner_pubkey"])
+        recomputed = combined_funding_address([self._cc_pubkey, partner_pub], self.wallet.network)
+        if recomputed != combine["shared_address"]:
+            raise ValueError(
+                f"shared channel address mismatch: recomputed {recomputed} "
+                f"!= taker {combine['shared_address']}"
+            )
+        my_total_in = sum(u.value for u in self.our_utxos.values())
+        real_cjfee = calculate_cj_fee(self.offer.ordertype, self.offer.cjfee, self.amount)
+        own_change = my_total_in - self.amount - self.offer.txfee + real_cjfee
+        pooled = own_change + int(combine["partner_change"])
+        self._combine_shared_spk = address_to_scriptpubkey(recomputed)
+        self._combine_pooled_value = pooled
+        logger.info(
+            "maker-to-maker channel-as-change: shared output {} pooling {} sats",
+            recomputed,
+            pooled,
+        )
+        return recomputed, pooled
+
+    async def handle_tx(
+        self, tx_hex: str, combine: dict[str, Any] | None = None
+    ) -> tuple[bool, dict[str, Any]]:
         """
         Handle !tx message from taker.
 
@@ -483,6 +545,10 @@ class CoinJoinSession:
 
         Args:
             tx_hex: Unsigned transaction hex
+            combine: Optional maker-to-maker channel-as-change info from the taker
+                (``partner_pubkey``, ``partner_change``, ``shared_address``). When
+                present, the maker verifies its change went into the shared 2-of-2
+                output instead of a plain change output.
 
         Returns:
             (success, response_data with signatures or error)
@@ -501,6 +567,8 @@ class CoinJoinSession:
             # Convert network string to NetworkType enum
             network = NetworkType(self.wallet.network)
 
+            combine_address, combine_value = self._verify_combine(combine)
+
             is_valid, error = verify_unsigned_transaction(
                 tx_hex=tx_hex,
                 our_utxos=self.our_utxos,
@@ -511,6 +579,8 @@ class CoinJoinSession:
                 txfee=self.offer.txfee,
                 offer_type=self.offer.ordertype,
                 network=network,
+                combine_address=combine_address,
+                combine_value=combine_value,
             )
 
             if not is_valid:
