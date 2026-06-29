@@ -78,12 +78,30 @@ FEATURE_PUSH_ENCRYPTED = "push_encrypted"
 FEATURE_PEERLIST_FEATURES = "peerlist_features"  # Supports extended peerlist with F: suffix
 FEATURE_PING = "ping"  # Supports application-level PING/PONG heartbeat
 
+# Maker-clustering-defense capability flags (the three deployable fixes from the
+# maker-swap-provider study). They are advertised in the handshake feature map so
+# a taker can pick makers by role from the orderbook, distinct from the transport
+# features above. Each is purely additive and defaults off (backward compatible).
+FEATURE_SWAP_PROVIDER = "swap_provider"  # bidirectional Lightning swap provider (fix 1)
+FEATURE_CHANNEL_CHANGE = "channel_change"  # taker-arranged channel-as-change (fix 2)
+FEATURE_WHOLE_COIN = "whole_coin"  # whole-coin liquidity-arbitrage third role (fix 3)
+
 # Feature dependencies: feature -> list of required features
 FEATURE_DEPENDENCIES: dict[str, list[str]] = {
     FEATURE_NEUTRINO_COMPAT: [],
     FEATURE_PUSH_ENCRYPTED: [],  # Requires NaCl session, but that's implicit
     FEATURE_PEERLIST_FEATURES: [],  # No dependencies
     FEATURE_PING: [],  # No dependencies
+    FEATURE_SWAP_PROVIDER: [],
+    FEATURE_CHANNEL_CHANGE: [],
+    FEATURE_WHOLE_COIN: [],
+}
+
+# Capability flags that distinguish a maker's anti-clustering role (the three fixes).
+CAPABILITY_FEATURES = {
+    FEATURE_SWAP_PROVIDER,
+    FEATURE_CHANNEL_CHANGE,
+    FEATURE_WHOLE_COIN,
 }
 
 # All known features
@@ -92,6 +110,9 @@ ALL_FEATURES = {
     FEATURE_PUSH_ENCRYPTED,
     FEATURE_PEERLIST_FEATURES,
     FEATURE_PING,
+    FEATURE_SWAP_PROVIDER,
+    FEATURE_CHANNEL_CHANGE,
+    FEATURE_WHOLE_COIN,
 }
 
 
@@ -165,6 +186,18 @@ class FeatureSet:
     def supports_ping(self) -> bool:
         """Check if peer supports application-level PING/PONG heartbeat."""
         return FEATURE_PING in self.features
+
+    def supports_swap_provider(self) -> bool:
+        """Check if the maker advertises the bidirectional swap-provider role (fix 1)."""
+        return FEATURE_SWAP_PROVIDER in self.features
+
+    def supports_channel_change(self) -> bool:
+        """Check if the maker advertises taker-arranged channel-as-change (fix 2)."""
+        return FEATURE_CHANNEL_CHANGE in self.features
+
+    def supports_whole_coin(self) -> bool:
+        """Check if the maker advertises the whole-coin third role (fix 3)."""
+        return FEATURE_WHOLE_COIN in self.features
 
     def validate_dependencies(self) -> tuple[bool, str]:
         """Check that all feature dependencies are satisfied."""

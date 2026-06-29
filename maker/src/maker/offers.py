@@ -447,6 +447,10 @@ class OfferManager:
                 )
                 return None
 
+            # Knapsack channel-as-change is only advertised when the maker both opts
+            # in and has a Lightning node to pair on (an external-peer channel is never
+            # used, so without a node there is nothing to advertise).
+            knapsack_capable = bool(self.config.knapsack_capable and self.config.ln_node)
             offer = Offer(
                 counterparty=self.maker_nick,
                 oid=offer_id,
@@ -456,6 +460,8 @@ class OfferManager:
                 txfee=randomized_txfee,
                 cjfee=cjfee_str,
                 fidelity_bond_value=fidelity_bond_value,
+                knapsack_capable=knapsack_capable,
+                ln_node=self.config.ln_node if knapsack_capable else None,
             )
 
             logger.info(

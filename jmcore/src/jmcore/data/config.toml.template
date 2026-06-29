@@ -415,6 +415,13 @@
 # when both are set. Default: false (single offer determined by offer_type above).
 # dual_offers = false
 
+# Channel-as-change capability signaling. When knapsack_capable is true and an
+# ln_node is set, the maker advertises the "channel_change" handshake feature so
+# takers can pair it with a fellow maker into knapsack channel-as-change outputs.
+# An external-peer channel is never used, so ln_node is required to advertise.
+# knapsack_capable = false
+# ln_node = "node_id@host:port"
+
 # ----------------------------------------------------------------------------
 # Bidirectional Lightning swap provider (experimental)
 # ----------------------------------------------------------------------------
@@ -422,6 +429,8 @@
 # provider (jmswap): it advertises swap terms over Nostr and clears Lightning
 # swaps in both directions from its existing wallet, breaking the cross-slot
 # peel chain while earning swap fees. Requires an LDK Server Lightning node.
+# Enabling it also advertises the "swap_provider" handshake feature (and
+# "whole_coin" when accepts_whole_coin is set), so takers can see the role.
 [maker.swap_provider]
 # enabled = false
 # directions = ["swapin", "swapout"]

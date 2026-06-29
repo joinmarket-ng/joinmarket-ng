@@ -326,6 +326,48 @@ class TestProtocolVersion:
         assert FEATURE_NEUTRINO_COMPAT == "neutrino_compat"
 
 
+class TestCapabilityFeatures:
+    """The three deployable maker-clustering-defense capability flags."""
+
+    def test_constants_and_membership(self):
+        from jmcore.protocol import (
+            CAPABILITY_FEATURES,
+            FEATURE_CHANNEL_CHANGE,
+            FEATURE_SWAP_PROVIDER,
+            FEATURE_WHOLE_COIN,
+        )
+
+        assert FEATURE_SWAP_PROVIDER == "swap_provider"
+        assert FEATURE_CHANNEL_CHANGE == "channel_change"
+        assert FEATURE_WHOLE_COIN == "whole_coin"
+        assert {
+            FEATURE_SWAP_PROVIDER,
+            FEATURE_CHANNEL_CHANGE,
+            FEATURE_WHOLE_COIN,
+        } == CAPABILITY_FEATURES
+        assert CAPABILITY_FEATURES <= ALL_FEATURES
+
+    def test_supports_helpers_and_roundtrip(self):
+        from jmcore.protocol import (
+            FEATURE_CHANNEL_CHANGE,
+            FEATURE_SWAP_PROVIDER,
+            FEATURE_WHOLE_COIN,
+            FeatureSet,
+        )
+
+        fs = FeatureSet(features={FEATURE_SWAP_PROVIDER, FEATURE_WHOLE_COIN})
+        assert fs.supports_swap_provider() is True
+        assert fs.supports_whole_coin() is True
+        assert fs.supports_channel_change() is False
+        # Round-trips through the handshake dict and back unchanged.
+        again = FeatureSet.from_handshake({"features": fs.to_dict()})
+        assert again.supports_swap_provider() is True
+        assert again.supports_whole_coin() is True
+        ok, _ = fs.validate_dependencies()
+        assert ok
+        assert FEATURE_CHANNEL_CHANGE not in fs.to_dict()
+
+
 class TestHandshakeRequest:
     """Tests for create_handshake_request function."""
 

@@ -260,6 +260,21 @@ class Offer(BaseModel):
         default_factory=dict,
         description="Features supported by this maker (from handshake)",
     )
+    knapsack_capable: bool = Field(
+        default=False,
+        description=(
+            "Whether this maker can take part in taker-arranged knapsack "
+            "channel-as-change (maker-to-maker grid-quantized shared outputs). "
+            "Requires ln_node. Backward-compatible: defaults False."
+        ),
+    )
+    ln_node: str | None = Field(
+        default=None,
+        description=(
+            "The maker's Lightning node 'node_id@host:port', advertised so the taker "
+            "can pair it with a fellow maker for knapsack channel-as-change."
+        ),
+    )
     directly_reachable: bool | None = Field(
         default=None,
         description="Whether maker is directly reachable via their onion address (None = not checked)",
@@ -299,6 +314,10 @@ class Offer(BaseModel):
 
     def is_absolute_fee(self) -> bool:
         return is_absolute_offer_type(self.ordertype)
+
+    def has_feature(self, feature: str) -> bool:
+        """Whether this maker advertises a handshake capability (e.g. swap_provider)."""
+        return bool(self.features.get(feature))
 
     def calculate_fee(self, amount: int) -> int:
         return calculate_cj_fee(self.ordertype, self.cjfee, amount)

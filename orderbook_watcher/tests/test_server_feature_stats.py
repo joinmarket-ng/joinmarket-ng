@@ -121,4 +121,31 @@ def test_feature_stats_counts_each_maker_once() -> None:
     result = server._format_orderbook(orderbook)
 
     assert result["feature_stats"] == {"ping": 1}
-    assert result["feature_stats_denominator"] == 1
+
+
+def test_feature_stats_counts_capability_flags() -> None:
+    """The three deployable-fix capability flags are surfaced and counted per role."""
+    server = _make_server()
+    orderbook = OrderBook(
+        timestamp=datetime.now(UTC),
+        offers=[
+            _make_offer(
+                "J5swap",
+                bond=10**14,
+                features={"swap_provider": True, "whole_coin": True},
+            ),
+            _make_offer("J5chan", bond=10**14, features={"channel_change": True}),
+            _make_offer("J5plain", bond=10**14, features={"ping": True}),
+        ],
+    )
+
+    result = server._format_orderbook(orderbook)
+
+    stats = result["feature_stats"]
+    assert stats["swap_provider"] == 1
+    assert stats["whole_coin"] == 1
+    assert stats["channel_change"] == 1
+    assert result["feature_stats_denominator"] == 3
+    # The roles ride through to the per-offer payload so a taker can pick by role.
+    swap = next(o for o in result["offers"] if o["counterparty"] == "J5swap")
+    assert swap["features"]["swap_provider"] is True

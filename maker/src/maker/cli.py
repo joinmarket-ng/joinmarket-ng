@@ -363,6 +363,8 @@ def build_maker_config(
         txfee_contribution_factor=settings.maker.txfee_contribution_factor,
         size_factor=settings.maker.size_factor,
         min_confirmations=settings.maker.min_confirmations,
+        knapsack_capable=settings.maker.knapsack_capable,
+        ln_node=settings.maker.ln_node,
         session_timeout_sec=settings.maker.session_timeout_sec,
         pending_tx_timeout_min=settings.maker.pending_tx_timeout_min,
         pending_tx_abandon_hours=settings.maker.pending_tx_abandon_hours,

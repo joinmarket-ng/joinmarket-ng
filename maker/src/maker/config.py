@@ -293,6 +293,21 @@ class MakerConfig(WalletConfig):
     # taker_utxo_age confirmations on a separate UTXO.
     min_confirmations: int = Field(default=0, ge=0, description="Minimum confirmations for UTXOs")
 
+    # Knapsack channel-as-change capability (taker-arranged, maker-to-maker). When
+    # enabled and an LN node is configured, the maker advertises that the taker may
+    # pair it with a fellow maker into grid-quantized shared funding outputs.
+    knapsack_capable: bool = Field(
+        default=False,
+        description=(
+            "Advertise that this maker can take part in taker-arranged knapsack "
+            "channel-as-change (maker-to-maker shared outputs). Requires ln_node."
+        ),
+    )
+    ln_node: str | None = Field(
+        default=None,
+        description="The maker's Lightning node 'node_id@host:port' for channel-as-change.",
+    )
+
     # Fidelity bond configuration
     # List of locktimes (Unix timestamps) to scan for fidelity bonds
     # These should match locktimes used when creating bond UTXOs
@@ -523,3 +538,30 @@ class MakerConfig(WalletConfig):
                 size_factor=self.size_factor,
             )
         ]
+
+    def capability_features(self) -> set[str]:
+        """Capability flags this maker advertises in its handshake feature map.
+
+        Maps the three deployable maker-clustering fixes to handshake features so a
+        taker can pick makers by role from the orderbook:
+
+        * ``swap_provider`` when the bidirectional swap-provider role is enabled;
+        * ``whole_coin`` when the provider also accepts a maker's whole coin;
+        * ``channel_change`` when knapsack channel-as-change is enabled with an
+          ``ln_node`` (an external-peer channel is never used, so a node is required).
+        """
+        from jmcore.protocol import (
+            FEATURE_CHANNEL_CHANGE,
+            FEATURE_SWAP_PROVIDER,
+            FEATURE_WHOLE_COIN,
+        )
+
+        features: set[str] = set()
+        sp = self.swap_provider
+        if sp is not None and sp.enabled:
+            features.add(FEATURE_SWAP_PROVIDER)
+            if sp.accepts_whole_coin:
+                features.add(FEATURE_WHOLE_COIN)
+        if self.knapsack_capable and self.ln_node:
+            features.add(FEATURE_CHANNEL_CHANGE)
+        return features

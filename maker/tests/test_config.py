@@ -1001,3 +1001,35 @@ class TestNewSettingsWiring:
         )
         # No explicit dual_offers -> single offer mode
         assert len(config.offer_configs) == 0
+
+    def test_knapsack_capable_ln_node_from_settings(self) -> None:
+        """maker.knapsack_capable + ln_node round-trip into MakerConfig and signaling."""
+        from jmcore.settings import JoinMarketSettings
+
+        from maker.cli import build_maker_config
+
+        settings = JoinMarketSettings()
+        settings.maker.knapsack_capable = True
+        settings.maker.ln_node = "02ab@host:9735"
+        config = build_maker_config(settings=settings, mnemonic=TEST_MNEMONIC, passphrase="")
+        assert config.knapsack_capable is True
+        assert config.ln_node == "02ab@host:9735"
+        assert "channel_change" in config.capability_features()
+
+    def test_capability_features_mapping(self) -> None:
+        """The three fixes map to handshake capability flags only when configured."""
+        from maker.config import MakerConfig, SwapProviderConfig
+
+        assert MakerConfig(mnemonic=TEST_MNEMONIC).capability_features() == set()
+        cfg = MakerConfig(
+            mnemonic=TEST_MNEMONIC,
+            swap_provider=SwapProviderConfig(enabled=True, accepts_whole_coin=True),
+            knapsack_capable=True,
+            ln_node="02ab@host:9735",
+        )
+        assert cfg.capability_features() == {"swap_provider", "whole_coin", "channel_change"}
+        # knapsack without an ln_node does not advertise (external-peer channels are unused)
+        assert (
+            MakerConfig(mnemonic=TEST_MNEMONIC, knapsack_capable=True).capability_features()
+            == set()
+        )

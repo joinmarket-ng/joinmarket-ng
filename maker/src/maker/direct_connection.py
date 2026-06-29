@@ -217,6 +217,7 @@ class DirectConnectionMixin:
         if self.backend.can_provide_neutrino_metadata():
             features.features.add(FEATURE_NEUTRINO_COMPAT)
         features.features.add(FEATURE_PEERLIST_FEATURES)
+        features.features |= self.config.capability_features()
 
         # Determine our location string (onion address or NOT-SERVING-ONION)
         onion_host = self.config.onion_host

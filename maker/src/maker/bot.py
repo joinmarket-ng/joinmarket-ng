@@ -89,6 +89,7 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
             config=config,
             nick_identity=self.nick_identity,
             neutrino_compat=backend.can_provide_neutrino_metadata(),
+            capability_features=config.capability_features(),
         )
         self._directory_pool.clients = self.directory_clients
         self.active_sessions: dict[str, MakerSession] = {}

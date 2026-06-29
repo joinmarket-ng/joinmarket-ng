@@ -785,6 +785,21 @@ class MakerSettings(BaseModel):
             "liquidity."
         ),
     )
+    knapsack_capable: bool = Field(
+        default=False,
+        description=(
+            "Advertise that this maker can take part in taker-arranged knapsack "
+            "channel-as-change (maker-to-maker grid-quantized shared outputs). "
+            "Requires ln_node; defaults False for backward compatibility."
+        ),
+    )
+    ln_node: str | None = Field(
+        default=None,
+        description=(
+            "The maker's Lightning node 'node_id@host:port', advertised for "
+            "maker-to-maker channel-as-change pairing."
+        ),
+    )
     allow_mixdepth_zero_merge: bool = Field(
         default=False,
         description=(

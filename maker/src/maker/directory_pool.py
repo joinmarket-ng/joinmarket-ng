@@ -50,9 +50,11 @@ class MakerDirectoryPool(DirectoryClientPool):
         config: MakerConfig,
         nick_identity: Any,  # NickIdentity, kept Any to avoid import cycle
         neutrino_compat: bool,
+        capability_features: set[str] | None = None,
     ):
         self._config = config
         self._neutrino_compat = neutrino_compat
+        self._capability_features = set(capability_features or set())
         super().__init__(
             directory_servers=list(config.directory_servers),
             network=config.network.value,
@@ -72,6 +74,7 @@ class MakerDirectoryPool(DirectoryClientPool):
             location = "NOT-SERVING-ONION"
         kwargs["location"] = location
         kwargs["neutrino_compat"] = self._neutrino_compat
+        kwargs["capability_features"] = self._capability_features
         return kwargs
 
     def refresh_neutrino_compat(self, neutrino_compat: bool) -> None:

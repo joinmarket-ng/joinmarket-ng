@@ -164,6 +164,7 @@ class DirectoryClient:
         peerlist_timeout: float = 60.0,
         socks_username: str | None = None,
         socks_password: str | None = None,
+        capability_features: set[str] | None = None,
     ) -> None:
         """
         Initialize DirectoryClient.
@@ -183,6 +184,9 @@ class DirectoryClient:
             peerlist_timeout: Timeout for first PEERLIST chunk (default 60s, subsequent chunks use 5s)
             socks_username: SOCKS5 username for Tor stream isolation (optional)
             socks_password: SOCKS5 password for Tor stream isolation (optional)
+            capability_features: Extra capability flags to advertise in the handshake
+                (e.g. swap_provider, channel_change, whole_coin), so makers can signal
+                their anti-clustering role to takers via the orderbook.
         """
         self.host = host
         self.port = port
@@ -216,6 +220,10 @@ class DirectoryClient:
         self.last_orderbook_request_time: float = 0.0
         self.last_offer_received_time: float | None = None
         self.neutrino_compat = neutrino_compat
+
+        # Capability flags advertised in the handshake feature map (swap_provider,
+        # channel_change, whole_coin). Empty by default; backward compatible.
+        self.capability_features: set[str] = set(capability_features or set())
 
         # Version negotiation state (set after handshake)
         self.negotiated_version: int | None = None
@@ -318,6 +326,7 @@ class DirectoryClient:
         our_features: set[str] = {FEATURE_PEERLIST_FEATURES, FEATURE_PING}
         if self.neutrino_compat:
             our_features.add(FEATURE_NEUTRINO_COMPAT)
+        our_features |= self.capability_features
         feature_set = FeatureSet(features=our_features)
 
         # Send our handshake with current version and features
