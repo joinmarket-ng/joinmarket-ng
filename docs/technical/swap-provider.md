@@ -78,6 +78,51 @@ advertising combine-capability and its Lightning node, and the extra taker->fund
 once the taker knows the change amounts) that yields the funder's funding
 address.
 
+### Channel-as-change is maker-to-maker only
+
+A channel funding output reveals its outpoint to the co-signing counterparty, so
+opening a channel-as-change to an **external** peer would hand the maker's
+funding<->wallet link to an outside observer: it is no privacy improvement and is
+never used. A valid channel-as-change always joins two CoinJoin participants; a
+maker that cannot be paired falls back to a plain change output.
+
+### Knapsack pairing (taker-arranged, beats the fixed pool)
+
+A rigid pool of two makers' *exact* change defeats the per-output change-match,
+but a whole-round subset-sum solver that hypothesises group-funded shared outputs
+can uniquely invert a fixed pool whenever the pool size relates simply to the
+participant count (the `coinjoin-simulator` `maker-swap-provider` study measures
+the fixed pool attributed ~1.0 at 4 makers and ~0.94 at 6, an even/odd sawtooth).
+The robust construction is **knapsack** pairing (`taker.knapsack.plan_knapsack`):
+the taker pools *every* change-bearing maker and splits each change into
+grid-quantized pieces that share one round-wide grid value, emitted as
+*overlapping* maker-to-maker 2-of-2 outputs. Because many makers emit an
+equal-valued grid piece, a grid piece of one maker is interchangeable with a grid
+piece of another without changing any output value or any maker's total, so the
+whole-round partition is combinatorially ambiguous (low-density subset-sum
+hardness); the study drives the maximal attacker's attribution to ~0 at *every*
+set size, where the fixed pool fails, at the cost of ~2 channel opens per maker
+(two pieces, the minimum that leaves no single output equal to the residual). An
+**allowance** of makers may open no channel at all: their plain change is diffused
+into the same grid pool, so on chain they are indistinguishable from the channel
+makers (their plain pieces still chain across slots, the honest limit). The
+planner is implemented and unit-tested (`taker/tests/test_knapsack.py`); like the
+combined variant its piece *amounts* feed `build_coinjoin_tx`'s per-maker
+`change_outputs` and the maker-to-maker 2-of-2 *addresses* come from the channel
+layer, with the runtime protocol-message round (relaying each piece's pairing) the
+remaining wiring.
+
+### On-chain-only takers: sweep under homogeneous fees
+
+Once makers are this hard to cluster, a pure on-chain taker (no Lightning, never a
+maker) regains anonymity by **sweeping** its denomination coin
+mixdepth-to-mixdepth (no change, no co-spend) under homogeneous fees: its only
+cross-round edge is the ambiguous reused-equal-output, so a matching attacker
+links none of its tumble hops. Leaving change re-introduces the taker's own change
+peel chain and CIOH, and distinct per-maker fees expose it by fee-fingerprint
+elimination even when sweeping. The taker should therefore sweep and prefer a
+uniform-fee market (the `maker-swap-provider` study Section 4.10).
+
 ### Why Boltz v2 (not papa-swap)
 
 A more on-chain-efficient design exists (supertestnet's *papa-swap*: one funding
@@ -121,11 +166,17 @@ now addressed and one remains a deployment discipline:
   and chooses the destination, the client co-signs and broadcasts on the
   provider's behalf (`coopclaim_in`) after the provider has paid the invoice. The
   swap-out path is validated live; both fall back trustlessly to the script path.
-- **Split / combined channel-as-change (addressed).** A maker can now emit its
-  change as several funding outputs (`build_coinjoin_tx`'s `change_outputs`) so no
-  single output equals its exact residual, and two makers can pool their change
-  into one shared output; both defeat the per-output change-match a single
-  per-maker output is vulnerable to.
+- **Split / combined / knapsack channel-as-change (addressed for the per-output
+  change-match; whole-round hardened by knapsack).** A maker can emit its change as
+  several funding outputs (`build_coinjoin_tx`'s `change_outputs`) so no single
+  output equals its exact residual, and two makers can pool their change into one
+  shared output; both defeat the per-output change-match. A fixed pool is still
+  invertible by the whole-round (CoinJoin-Sudoku) solver at set-divisible sizes, so
+  the robust construction is the taker-arranged **knapsack** pairing
+  (`taker.knapsack.plan_knapsack`): grid-quantized overlapping maker-to-maker pieces
+  that keep the whole-round partition combinatorially ambiguous at every set size,
+  with an allowance of non-channel makers hidden in the same pool. Channel-as-change
+  is maker-to-maker only (an external-peer channel is never used).
 - **On-chain fidelity-bond verification (addressed).** Providers advertise a real
   timelocked bond and clients verify it on-chain (`jmswap.verify_provider_bond` /
   `select_bonded_providers`): a sybil that merely sets `bond_value` is filtered
