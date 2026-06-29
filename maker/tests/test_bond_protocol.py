@@ -115,6 +115,7 @@ async def test_bond_sent_only_in_privmsg_response():
     mock_config.connection_timeout = 120.0
     mock_config.onion_host = None
     mock_config.onion_serving_port = 5222
+    mock_config.capability_features.return_value = set()
 
     maker = MakerBot(mock_wallet, mock_backend, mock_config)
 
