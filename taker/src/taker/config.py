@@ -230,6 +230,16 @@ class TakerConfig(WalletConfig):
             "amounts. Off by default (a plain CoinJoin is byte-identical to today)."
         ),
     )
+
+    combine_mode: str = Field(
+        default="pool",
+        description=(
+            "How to combine maker change when combine_channel_as_change is on: 'pool' "
+            "(two makers' change in one shared 2-of-2) or 'knapsack' (each maker's change "
+            "split into grid-quantized pieces at a 2-of-2 with a round-robin partner, so "
+            "equal-valued pieces collide across makers and the partition is ambiguous)."
+        ),
+    )
     max_maker_replacement_attempts: int = Field(
         default=3,
         ge=0,

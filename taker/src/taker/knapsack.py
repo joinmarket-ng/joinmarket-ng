@@ -217,3 +217,63 @@ def plan_to_change_outputs(
     for piece in plan.pieces:
         out.setdefault(piece.owner, []).append((address_for(piece), piece.value))
     return out
+
+
+def plan_knapsack_session(
+    makers: list[tuple[str, str, int]],
+    *,
+    denomination: int,
+    network: str = "mainnet",
+    allowance: int = 0,
+    grid_div: int = DEFAULT_GRID_DIV,
+    max_pieces: int = DEFAULT_MAX_PIECES,
+):
+    """Plan a live knapsack channel-as-change round from ``(nick, cc_pubkey_hex, change)``.
+
+    Returns a :class:`taker.combine.CombineSessionPlan`: each channel maker's change is
+    split into grid-quantized pieces emitted as maker-to-maker 2-of-2 outputs with its
+    round-robin partner (so many equal-valued pieces collide across makers, making the
+    whole-round partition ambiguous). ``combine_groups`` is empty (each maker keeps its
+    own pieces); ``relay`` tells each maker its partner key and its own change so it can
+    recompute and verify the 2-of-2.
+    """
+    from jmswap.channel import combined_funding_address
+
+    from taker.combine import CombineMaker, CombineRelay, CombineSessionPlan
+
+    pubkey = {n: pk for (n, pk, _ch) in makers}
+    cmakers = [CombineMaker(n, ch, bool(pk), pk or None) for (n, pk, ch) in makers]
+    plan = plan_knapsack(
+        cmakers,
+        denomination=denomination,
+        allowance=allowance,
+        grid_div=grid_div,
+        max_pieces=max_pieces,
+    )
+
+    def addr_for(piece: KnapsackPiece) -> str:
+        if piece.counterparty is None:
+            raise ExternalChannelError("plain piece has no 2-of-2 address in this planner")
+        cp: str = piece.counterparty
+        keys = [bytes.fromhex(pubkey[piece.owner]), bytes.fromhex(pubkey[cp])]
+        return combined_funding_address(keys, network)
+
+    change_outputs: dict[str, list[tuple[str, int]]] = {}
+    relay: dict[str, CombineRelay] = {}
+    for piece in plan.channel_pieces():
+        change_outputs.setdefault(piece.owner, [])
+    # Only channel makers (those that got a counterparty) are pooled; others stay plain.
+    for owner, pieces in plan_to_change_outputs(
+        KnapsackPlan(tuple(p for p in plan.pieces if p.is_channel), plan.grid), addr_for
+    ).items():
+        change_outputs[owner] = pieces
+        own = next(p for p in plan.pieces if p.owner == owner and p.is_channel)
+        partner = own.counterparty
+        assert partner is not None  # is_channel guarantees a counterparty
+        shared = addr_for(own)
+        # Each maker's 2-of-2 holds only its own change (partner_change=0); the partner
+        # co-signs but its change sits in its own 2-of-2 with the next maker.
+        relay[owner] = CombineRelay(
+            partner_pubkey=pubkey[partner], partner_change=0, shared_address=shared
+        )
+    return CombineSessionPlan(change_outputs=change_outputs, combine_groups={}, relay=relay)

@@ -177,3 +177,45 @@ def test_plan_combine_session_pools_into_real_shared_2of2() -> None:
     assert _count_outputs_to(tx_hex, shared) == [902_000]
     assert _count_outputs_to(tx_hex, A_CHG) == []
     assert _count_outputs_to(tx_hex, B_CHG) == []
+
+
+def test_plan_knapsack_session_splits_into_per_maker_2of2_grid_pieces() -> None:
+    """Knapsack: each maker's change becomes grid pieces at its own 2-of-2."""
+    from coincurve import PrivateKey
+    from jmswap.channel import combined_funding_address
+
+    from taker.knapsack import plan_knapsack_session
+
+    a, b = PrivateKey().public_key.format(), PrivateKey().public_key.format()
+    # A change 501_000 (5 grid + 1_000), B change 401_000 (4 grid + 1_000); grid 100_000
+    plan = plan_knapsack_session(
+        [("A", a.hex(), 501_000), ("B", b.hex(), 401_000)],
+        denomination=1_000_000,
+        network="regtest",
+        grid_div=10,
+        max_pieces=12,
+    )
+    assert plan.combine_groups == {}  # no folding; each keeps its own pieces
+    ab = combined_funding_address([a, b], "regtest")
+    # A and B both pair with each other (round-robin of two), same 2-of-2 address
+    assert plan.relay["A"].shared_address == ab and plan.relay["B"].shared_address == ab
+    assert plan.relay["A"].partner_change == 0  # each 2-of-2 holds only its owner's change
+    a_vals = [v for _, v in plan.change_outputs["A"]]
+    assert a_vals == [100_000, 100_000, 100_000, 100_000, 100_000, 1_000]
+    assert sum(a_vals) == 501_000
+
+    data = _maker_data()
+    data["A"]["change_outputs"] = plan.change_outputs["A"]
+    data["B"]["change_outputs"] = plan.change_outputs["B"]
+    tx, _ = build_coinjoin_tx(
+        [{"txid": "c" * 64, "vout": 0, "value": 5_000_000}],
+        TAKER_CJ,
+        TAKER_CHG,
+        5_000_000,
+        data,
+        1_000_000,
+        2000,
+        "regtest",
+    )
+    # equal 100_000 grid pieces from both makers land at the shared 2-of-2 (5 + 4 = 9)
+    assert _count_outputs_to(tx.hex(), ab).count(100_000) == 9

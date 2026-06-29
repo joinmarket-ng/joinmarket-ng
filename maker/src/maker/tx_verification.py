@@ -111,7 +111,7 @@ def verify_unsigned_transaction(
 
         times_seen_cj_addr = 0
         times_seen_change_addr = 0
-        times_seen_combine = 0
+        combine_total = 0
 
         for output in tx_outputs:
             output_addr = output["address"]
@@ -134,12 +134,10 @@ def verify_unsigned_transaction(
                     )
 
             if combine_address is not None and output_addr == combine_address:
-                times_seen_combine += 1
-                if combine_value is not None and output_value < combine_value:
-                    return (
-                        False,
-                        f"Shared channel output too low: {output_value} < {combine_value}",
-                    )
+                # The maker's change goes into a shared maker-to-maker 2-of-2 output.
+                # For pooled combine it is one output; for the knapsack it is several
+                # grid pieces. Sum them and check the total below.
+                combine_total += output_value
 
         if times_seen_cj_addr != 1:
             return (
@@ -147,14 +145,16 @@ def verify_unsigned_transaction(
                 f"CJ address appears {times_seen_cj_addr} times (expected 1)",
             )
 
-        # Maker-to-maker channel-as-change: this maker's change is pooled into a shared
-        # 2-of-2 funding output (combine_address) instead of a plain change output, so we
-        # require the shared output (recomputed by us) rather than our own change address.
+        # Maker-to-maker channel-as-change: this maker's change is in a shared 2-of-2
+        # funding output (one pooled output, or several grid pieces) instead of a plain
+        # change output, so we require the shared total (recomputed by us) to cover at
+        # least our own change.
         if combine_address is not None:
-            if times_seen_combine != 1:
+            if combine_total < (combine_value or expected_change_value):
                 return (
                     False,
-                    f"Shared channel output appears {times_seen_combine} times (expected 1)",
+                    f"Shared channel output total too low: {combine_total} "
+                    f"< {combine_value or expected_change_value}",
                 )
         elif times_seen_change_addr != 1:
             return (

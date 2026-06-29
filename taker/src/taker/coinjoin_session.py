@@ -1025,15 +1025,26 @@ class CoinJoinSession:
                     )
                     for nick, s in self.maker_sessions.items()
                 ]
-                plan = plan_combine_session(makers_cc, self.config.network.value)
+                mode = getattr(self.config, "combine_mode", "pool")
+                if mode == "knapsack":
+                    from taker.knapsack import plan_knapsack_session
+
+                    plan = plan_knapsack_session(
+                        [m for m in makers_cc if m[1]],
+                        denomination=self.cj_amount,
+                        network=self.config.network.value,
+                    )
+                else:
+                    plan = plan_combine_session(makers_cc, self.config.network.value)
                 combine_groups = plan.combine_groups
                 self._combine_relay = plan.relay
                 for nick, pieces in plan.change_outputs.items():
                     maker_data[nick]["change_outputs"] = pieces
-                if combine_groups:
+                if plan.change_outputs:
                     logger.info(
-                        f"channel-as-change: pooled {len(combine_groups)} maker change(s) "
-                        f"into {len(plan.change_outputs)} shared 2-of-2 output(s)"
+                        f"channel-as-change ({mode}): {len(plan.relay)} maker change(s) "
+                        f"into {sum(len(p) for p in plan.change_outputs.values())} shared "
+                        f"2-of-2 piece(s)"
                     )
 
             # Build transaction
