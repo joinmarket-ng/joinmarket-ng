@@ -479,8 +479,20 @@ class NeutrinoBackend(BlockchainBackend):
         endpoint: str,
         params: dict[str, Any] | None = None,
         data: dict[str, Any] | None = None,
+        expected_status_codes: frozenset[int] | None = None,
     ) -> Any:
-        """Make an API call to the neutrino daemon."""
+        """Make an API call to the neutrino daemon.
+
+        Args:
+            expected_status_codes: HTTP status codes the caller handles as a
+                normal "miss" rather than a failure. They are logged at debug
+                instead of error so they do not alarm operators; the exception
+                is still raised for the caller to handle. ``404`` is always
+                treated this way. For example ``GET /v1/tx/{txid}`` returns
+                ``501 Not Implemented`` for any txid that is not a currently
+                watched mempool transaction, which ``get_transaction`` declares
+                as expected.
+        """
         # Pin the TLS certificate on first use before any real request.
         await self._maybe_pin_certificate()
 
@@ -498,10 +510,15 @@ class NeutrinoBackend(BlockchainBackend):
             return response.json()
 
         except httpx.HTTPStatusError as e:
-            # 404 responses are expected during normal operation (unconfirmed txs, spent UTXOs)
-            # Don't log them as errors to avoid confusing users
-            if e.response.status_code == 404:
-                logger.debug(f"Neutrino API returned 404: {endpoint}")
+            # 404 responses are expected during normal operation (unconfirmed
+            # txs, spent UTXOs). Callers may declare additional codes they treat
+            # as a miss (e.g. 501 from /v1/tx/{txid} for a non-watched tx). Log
+            # those at debug to avoid confusing users; the exception is still
+            # raised so the caller can handle the miss.
+            status_code = e.response.status_code
+            expected = expected_status_codes or frozenset()
+            if status_code == 404 or status_code in expected:
+                logger.debug(f"Neutrino API returned {status_code}: {endpoint}")
             else:
                 logger.error(f"Neutrino API call failed: {endpoint} - {e}")
             raise
@@ -1065,9 +1082,15 @@ class NeutrinoBackend(BlockchainBackend):
             return None
 
         try:
-            result = await self._api_call("GET", f"v1/tx/{txid}")
+            # 501 is the documented response for any txid that is not a
+            # currently watched mempool tx (e.g. one that already confirmed, or
+            # when the server has no mempool tracker); declare it expected so it
+            # is not logged as an error.
+            result = await self._api_call(
+                "GET", f"v1/tx/{txid}", expected_status_codes=frozenset({501})
+            )
         except httpx.HTTPStatusError as e:
-            # 404 (unknown txid) and 501 (server lacks mempool tracker)
+            # 404 (unknown txid) and 501 (txid not a watched mempool tx)
             # both indicate "we don't have this tx"; treat as miss.
             if e.response.status_code in (404, 501):
                 logger.debug(f"Mempool tx {txid} not found: HTTP {e.response.status_code}")

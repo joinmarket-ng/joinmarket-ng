@@ -1466,7 +1466,9 @@ class TestNeutrinoBackend:
             assert tx.confirmations == 0
             assert tx.block_height is None
             assert tx.block_time is None
-            backend._api_call.assert_called_once_with("GET", f"v1/tx/{'c' * 64}")
+            backend._api_call.assert_called_once_with(
+                "GET", f"v1/tx/{'c' * 64}", expected_status_codes=frozenset({501})
+            )
         finally:
             await backend.close()
 
@@ -1480,6 +1482,26 @@ class TestNeutrinoBackend:
         response.status_code = 404
         backend._api_call = AsyncMock(
             side_effect=httpx.HTTPStatusError("not found", request=MagicMock(), response=response)
+        )
+
+        try:
+            tx = await backend.get_transaction("d" * 64)
+            assert tx is None
+        finally:
+            await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_get_transaction_returns_none_on_501(self):
+        """A 501 from /v1/tx/ (txid not a watched mempool tx) is a normal miss."""
+        import httpx
+
+        backend = NeutrinoBackend(neutrino_url="http://localhost:8334", network="regtest")
+        response = MagicMock()
+        response.status_code = 501
+        backend._api_call = AsyncMock(
+            side_effect=httpx.HTTPStatusError(
+                "not implemented", request=MagicMock(), response=response
+            )
         )
 
         try:
@@ -1503,6 +1525,89 @@ class TestNeutrinoBackend:
             backend._api_call.assert_not_called()
         finally:
             await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_api_call_expected_status_logged_as_debug(self):
+        """A declared expected status code (501) is logged at debug, not error.
+
+        Regression test: ``GET /v1/tx/{txid}`` returns 501 for any txid that is
+        not a watched mempool tx (e.g. one that already confirmed). That is a
+        normal miss surfaced via ``update_all_pending_transactions`` during
+        ``jm-wallet info`` and must not show up as an alarming ERROR line.
+        """
+        import httpx
+        from loguru import logger
+
+        backend = NeutrinoBackend(neutrino_url="http://localhost:8334", network="regtest")
+        backend._maybe_pin_certificate = AsyncMock()
+
+        response = MagicMock()
+        response.status_code = 501
+        mock_response = MagicMock()
+        mock_response.raise_for_status = MagicMock(
+            side_effect=httpx.HTTPStatusError(
+                "not implemented", request=MagicMock(), response=response
+            )
+        )
+        backend.client.get = AsyncMock(return_value=mock_response)
+
+        records: list[tuple[str, str]] = []
+        sink_id = logger.add(
+            lambda message: records.append(
+                (message.record["level"].name, message.record["message"])
+            ),
+            level="DEBUG",
+        )
+        try:
+            with pytest.raises(httpx.HTTPStatusError):
+                await backend._api_call("GET", "v1/tx/abc", expected_status_codes=frozenset({501}))
+        finally:
+            logger.remove(sink_id)
+            await backend.close()
+
+        assert not any(level == "ERROR" for level, _ in records), (
+            f"Expected 501 must not be logged at ERROR; got: {records}"
+        )
+        assert any(level == "DEBUG" and "501" in msg for level, msg in records), (
+            f"Expected a DEBUG log mentioning 501; got: {records}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_api_call_unexpected_status_logged_as_error(self):
+        """A status code not declared expected still surfaces as an error log."""
+        import httpx
+        from loguru import logger
+
+        backend = NeutrinoBackend(neutrino_url="http://localhost:8334", network="regtest")
+        backend._maybe_pin_certificate = AsyncMock()
+
+        response = MagicMock()
+        response.status_code = 500
+        mock_response = MagicMock()
+        mock_response.raise_for_status = MagicMock(
+            side_effect=httpx.HTTPStatusError(
+                "server error", request=MagicMock(), response=response
+            )
+        )
+        backend.client.get = AsyncMock(return_value=mock_response)
+
+        records: list[tuple[str, str]] = []
+        sink_id = logger.add(
+            lambda message: records.append(
+                (message.record["level"].name, message.record["message"])
+            ),
+            level="DEBUG",
+        )
+        try:
+            with pytest.raises(httpx.HTTPStatusError):
+                await backend._api_call("GET", "v1/status", expected_status_codes=frozenset({501}))
+        finally:
+            logger.remove(sink_id)
+            await backend.close()
+
+        assert any(level == "ERROR" for level, _ in records), (
+            f"Unexpected 500 must be logged at ERROR; got: {records}"
+        )
 
     @pytest.mark.asyncio
     async def test_verify_utxo_with_metadata_rejects_mempool_spend(self):
