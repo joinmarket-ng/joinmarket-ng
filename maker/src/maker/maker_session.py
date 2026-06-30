@@ -467,8 +467,10 @@ class MakerSession:
             else:
                 decrypted = self.crypto.decrypt(parts[1])
                 peer, capacity_str = decrypted.rsplit(" ", 1)
+                logger.info(f"chanreq: opening {capacity_str} sat ring channel to {peer[:24]}")
                 addr = await self.inner.open_external_channel(peer, int(capacity_str))
                 address = addr or ""
+                logger.info(f"chanreq: ring channel funding address = {address or '(failed)'}")
         except Exception as e:  # noqa: BLE001 - never block the round; reply empty
             logger.error(f"chanreq handling failed: {e}")
         await self.send_response(bot, "chanaddr", {"address": address})
