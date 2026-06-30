@@ -978,6 +978,31 @@ class CoinJoinSession:
                 taker_change_address = self.wallet.get_change_address(mixdepth, change_index)
                 self.taker_change_address = taker_change_address
                 logger.debug(f"Generated change address (expected: {expected_change} sats)")
+
+                # Maker-taker channel-as-change: the taker can also channelize its own
+                # change into a 2-of-2 with one of the combine-capable makers, so its
+                # change has no chaining successor either (Section 7 of the writeup).
+                if getattr(self.config, "channelize_taker_change", False):
+                    maker_cc = next(
+                        (
+                            s.cc_funding_pubkey
+                            for s in self.maker_sessions.values()
+                            if s.cc_funding_pubkey
+                        ),
+                        None,
+                    )
+                    if maker_cc:
+                        from jmswap.channel import combined_funding_address
+
+                        tk_key = self.wallet.master_key.derive(
+                            f"m/84'/1'/{0x73_77_61_70}'/6/{change_index}"
+                        )
+                        tk_pub = tk_key.get_public_key_bytes(compressed=True)
+                        taker_change_address = combined_funding_address(
+                            [tk_pub, bytes.fromhex(maker_cc)], self.config.network.value
+                        )
+                        self.taker_change_address = taker_change_address
+                        logger.info("channelizing taker change into a maker-taker 2-of-2 output")
             else:
                 # No change output needed (sweep or change is dust)
                 taker_change_address = ""  # Will be ignored by tx builder

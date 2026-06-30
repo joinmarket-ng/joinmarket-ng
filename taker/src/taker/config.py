@@ -240,6 +240,15 @@ class TakerConfig(WalletConfig):
             "equal-valued pieces collide across makers and the partition is ambiguous)."
         ),
     )
+
+    channelize_taker_change: bool = Field(
+        default=False,
+        description=(
+            "Also emit the taker's own change as a maker-taker 2-of-2 channel-funding "
+            "output (paired with a combine-capable maker), so the taker's change has no "
+            "chaining successor either. Requires combine_channel_as_change."
+        ),
+    )
     max_maker_replacement_attempts: int = Field(
         default=3,
         ge=0,
