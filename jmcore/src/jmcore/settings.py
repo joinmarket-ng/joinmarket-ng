@@ -1146,7 +1146,7 @@ class TakerSettings(BaseModel):
     @classmethod
     def validate_combine_mode(cls, v: str) -> str:
         """Reject unknown combine modes so a config typo never silently disables knapsack."""
-        allowed = {"pool", "knapsack"}
+        allowed = {"pool", "knapsack", "lnd_ring"}
         if v not in allowed:
             raise ValueError(f"combine_mode must be one of {sorted(allowed)}, got {v!r}")
         return v

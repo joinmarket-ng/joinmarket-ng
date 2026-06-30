@@ -71,6 +71,7 @@ class CoinJoinSession:
         ldk: object | None = None,
         channel_peer: str | None = None,
         combine_capable: bool = False,
+        ln_node: str | None = None,
     ):
         self.taker_nick = taker_nick
         self.offer = offer
@@ -88,6 +89,7 @@ class CoinJoinSession:
         self.channel_change = channel_change
         self.ldk = ldk
         self.channel_peer = channel_peer
+        self.ln_node = ln_node
         self._channel_user_id: str | None = None
         self._channel_funding_spk: bytes | None = None
         # Maker-to-maker channel-as-change (combine): the maker contributes a fresh
@@ -483,6 +485,10 @@ class CoinJoinSession:
                 priv, pub, _path = derive_combine_funding_key(self.wallet, index)
                 self._cc_priv, self._cc_pubkey = priv, pub
                 response["cc_pubkey"] = pub.hex()
+                # For the LND true-pooling ring, also advertise our Lightning node so the
+                # taker can assign us a ring partner to open a real taproot channel to.
+                if self.ln_node:
+                    response["ln_node"] = self.ln_node
                 logger.info(
                     "offering maker-to-maker channel-as-change (cc_pubkey {})", pub.hex()[:16]
                 )
@@ -536,7 +542,10 @@ class CoinJoinSession:
         return recomputed, pooled
 
     async def handle_tx(
-        self, tx_hex: str, combine: dict[str, Any] | None = None
+        self,
+        tx_hex: str,
+        combine: dict[str, Any] | None = None,
+        ring: list[tuple[str, int]] | None = None,
     ) -> tuple[bool, dict[str, Any]]:
         """
         Handle !tx message from taker.
@@ -569,6 +578,19 @@ class CoinJoinSession:
 
             combine_address, combine_value = self._verify_combine(combine)
 
+            # True-pooling ring: verify our change went only to the two co-funded shared
+            # outputs the taker relayed, and that we co-control the one we funded.
+            if ring is not None and self._channel_funding_spk is not None:
+                from jmcore.bitcoin import address_to_scriptpubkey
+
+                funded = any(
+                    address_to_scriptpubkey(addr) == self._channel_funding_spk for addr, _ in ring
+                )
+                if not funded:
+                    logger.error("Ring relay does not include the channel we funded; refusing")
+                    self.state = CoinJoinState.FAILED
+                    return False, {"error": "ring relay missing our funded channel"}
+
             is_valid, error = verify_unsigned_transaction(
                 tx_hex=tx_hex,
                 our_utxos=self.our_utxos,
@@ -581,6 +603,7 @@ class CoinJoinSession:
                 network=network,
                 combine_address=combine_address,
                 combine_value=combine_value,
+                ring_outputs=ring,
             )
 
             if not is_valid:

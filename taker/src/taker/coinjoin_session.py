@@ -678,6 +678,9 @@ class CoinJoinSession:
                             f"{nick} offered channel-as-change (cc_pubkey "
                             f"{session.cc_funding_pubkey[:16]}...)"
                         )
+                    # 7th field: the maker's Lightning node, for true-pooling LND ring opens.
+                    if len(ioauth_parts) >= 7:
+                        session.ln_node = ioauth_parts[6]
 
                     # Parse utxo_list using protocol helper
                     # (handles both legacy and extended format)
@@ -1036,41 +1039,48 @@ class CoinJoinSession:
             # change, so no per-maker change output reveals an exact residual.
             combine_groups: dict[str, str] = {}
             self._combine_relay = {}
+            self._ring_relay: dict[str, list[tuple[str, int]]] = {}
+            self._merge_change = False
             if getattr(self.config, "combine_channel_as_change", False):
-                from taker.combine import plan_combine_session
-
-                makers_cc = [
-                    (
-                        nick,
-                        s.cc_funding_pubkey,
-                        sum(int(u["value"]) for u in s.utxos)
-                        - self.cj_amount
-                        - s.offer.txfee
-                        + calculate_cj_fee(s.offer, self.cj_amount),
-                    )
-                    for nick, s in self.maker_sessions.items()
-                ]
                 mode = getattr(self.config, "combine_mode", "pool")
-                if mode == "knapsack":
-                    from taker.knapsack import plan_knapsack_session
-
-                    plan = plan_knapsack_session(
-                        [m for m in makers_cc if m[1]],
-                        denomination=self.cj_amount,
-                        network=self.config.network.value,
-                    )
+                if mode == "lnd_ring":
+                    # True-pooling: open a ring of REAL LND taproot channels, each
+                    # co-funded by two makers, via a chanreq/chanaddr round-trip.
+                    await self._plan_lnd_ring(maker_data)
                 else:
-                    plan = plan_combine_session(makers_cc, self.config.network.value)
-                combine_groups = plan.combine_groups
-                self._combine_relay = plan.relay
-                for nick, pieces in plan.change_outputs.items():
-                    maker_data[nick]["change_outputs"] = pieces
-                if plan.change_outputs:
-                    logger.info(
-                        f"channel-as-change ({mode}): {len(plan.relay)} maker change(s) "
-                        f"into {sum(len(p) for p in plan.change_outputs.values())} shared "
-                        f"2-of-2 piece(s)"
-                    )
+                    from taker.combine import plan_combine_session
+
+                    makers_cc = [
+                        (
+                            nick,
+                            s.cc_funding_pubkey,
+                            sum(int(u["value"]) for u in s.utxos)
+                            - self.cj_amount
+                            - s.offer.txfee
+                            + calculate_cj_fee(s.offer, self.cj_amount),
+                        )
+                        for nick, s in self.maker_sessions.items()
+                    ]
+                    if mode == "knapsack":
+                        from taker.knapsack import plan_knapsack_session
+
+                        plan = plan_knapsack_session(
+                            [m for m in makers_cc if m[1]],
+                            denomination=self.cj_amount,
+                            network=self.config.network.value,
+                        )
+                    else:
+                        plan = plan_combine_session(makers_cc, self.config.network.value)
+                    combine_groups = plan.combine_groups
+                    self._combine_relay = plan.relay
+                    for nick, pieces in plan.change_outputs.items():
+                        maker_data[nick]["change_outputs"] = pieces
+                    if plan.change_outputs:
+                        logger.info(
+                            f"channel-as-change ({mode}): {len(plan.relay)} maker change(s) "
+                            f"into {sum(len(p) for p in plan.change_outputs.values())} shared "
+                            f"2-of-2 piece(s)"
+                        )
 
             # Build transaction
             network = self.config.network.value
@@ -1093,6 +1103,7 @@ class CoinJoinSession:
                 network=network,
                 dust_threshold=self.config.dust_threshold,
                 combine_groups=combine_groups,
+                merge_change_by_address=self._merge_change,
             )
 
             logger.info(f"Built unsigned tx: {len(self.unsigned_tx)} bytes")
@@ -1318,6 +1329,81 @@ class CoinJoinSession:
                 return idx
         return None
 
+    async def _plan_lnd_ring(self, maker_data: dict[str, dict[str, Any]]) -> None:
+        """Open a ring of real LND taproot channels co-funded by the makers' change.
+
+        Plans a true-pooling ring from the makers' changes, then for each ring edge asks
+        the funder maker (via ``chanreq``) to open a real Lightning channel of the
+        taker-determined edge value to its ring partner, collecting the funding addresses
+        (``chanaddr``). Each maker's change is then split into its two contributions, which
+        the builder merges into the shared co-funded outputs. On any failure the round
+        falls back to plain change (no ring).
+        """
+        from taker.knapsack import plan_pooled_knapsack, plan_pooled_session
+
+        parties: list[tuple[str, int]] = []
+        ln_of: dict[str, str] = {}
+        for nick, s in self.maker_sessions.items():
+            if not s.ln_node:
+                continue
+            change = (
+                sum(int(u["value"]) for u in s.utxos)
+                - self.cj_amount
+                - s.offer.txfee
+                + calculate_cj_fee(s.offer, self.cj_amount)
+            )
+            parties.append((nick, change))
+            ln_of[nick] = s.ln_node
+        if len(parties) < 2:
+            logger.warning("LND ring: fewer than 2 ln-capable makers; using plain change")
+            return
+
+        min_channel = int(getattr(self.config, "ring_min_channel_sats", 200_000))
+        plan = plan_pooled_knapsack(parties, min_channel=min_channel)
+        if not plan.channels:
+            logger.warning("LND ring: no feasible ring; using plain change")
+            return
+
+        # Ask each funder (party_a of an edge) to open a channel to its partner (party_b).
+        for ch in plan.channels:
+            funder = self.maker_sessions[ch.party_a]
+            if funder.crypto is None:
+                logger.warning(f"LND ring: no crypto for {ch.party_a}; using plain change")
+                return
+            enc = funder.crypto.encrypt(f"{ln_of[ch.party_b]} {ch.value}")
+            await self.directory_client.send_privmsg(
+                ch.party_a, "chanreq", enc, log_routing=True, force_channel=funder.comm_channel
+            )
+        funders = [ch.party_a for ch in plan.channels]
+        responses = await self.directory_client.wait_for_responses(
+            expected_nicks=funders,
+            expected_command="!chanaddr",
+            timeout=self.config.maker_timeout_sec,
+        )
+
+        edge_addr: dict[tuple[str, str], str] = {}
+        for ch in plan.channels:
+            r = responses.get(ch.party_a)
+            crypto = self.maker_sessions[ch.party_a].crypto
+            if not r or r.get("error") or not r.get("data") or crypto is None:
+                logger.warning(f"LND ring: no chanaddr from {ch.party_a}; using plain change")
+                return
+            addr = crypto.decrypt(r["data"].strip().split()[0])
+            if not addr:
+                logger.warning(f"LND ring: {ch.party_a} failed to open; using plain change")
+                return
+            edge_addr[(ch.party_a, ch.party_b)] = addr
+
+        psession = plan_pooled_session(plan, lambda a, b: edge_addr[(a, b)])
+        for nick, pieces in psession.change_outputs.items():
+            maker_data[nick]["change_outputs"] = pieces
+        self._ring_relay = psession.change_outputs
+        self._merge_change = True
+        logger.info(
+            f"LND ring: {len(plan.channels)} co-funded taproot channel(s) "
+            f"of ~{plan.channels[0].value:,} sats each"
+        )
+
     async def _phase_collect_signatures(self) -> bool:
         """Send !tx and collect !sig responses from makers.
 
@@ -1384,11 +1470,17 @@ class CoinJoinSession:
             # to other peers; plain makers get the bare tx (byte-identical to today).
             payload = tx_b64
             relay = getattr(self, "_combine_relay", {}).get(nick)
+            ring = getattr(self, "_ring_relay", {}).get(nick)
             if relay is not None:
                 payload = (
                     f"{tx_b64} cc {relay.partner_pubkey} "
                     f"{relay.partner_change} {relay.shared_address}"
                 )
+            elif ring is not None:
+                # True-pooling ring: relay this maker's two co-funded shared outputs
+                # (address:contribution) so it can verify its change is fully accounted.
+                pieces = ",".join(f"{addr}:{amt}" for addr, amt in ring)
+                payload = f"{tx_b64} ring {pieces}"
             encrypted_tx = session.crypto.encrypt(payload)
             await self.directory_client.send_privmsg(
                 nick, "tx", encrypted_tx, log_routing=True, force_channel=session.comm_channel

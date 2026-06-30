@@ -152,9 +152,12 @@ class MakerSession:
         )
 
     async def handle_tx(
-        self, tx_hex: str, combine: dict[str, Any] | None = None
+        self,
+        tx_hex: str,
+        combine: dict[str, Any] | None = None,
+        ring: list[tuple[str, int]] | None = None,
     ) -> tuple[bool, dict[str, Any]]:
-        return await self.inner.handle_tx(tx_hex, combine=combine)
+        return await self.inner.handle_tx(tx_hex, combine=combine, ring=ring)
 
     # -- Per-taker handler bodies (moved from ProtocolHandlersMixin) -------
 
@@ -348,6 +351,7 @@ class MakerSession:
                 # Split it off before decoding the base64 tx (backward compatible: a
                 # plain maker just sees the bare tx_b64).
                 combine = None
+                ring = None
                 if " cc " in decrypted:
                     tx_part, _, rest = decrypted.partition(" cc ")
                     fields = rest.split()
@@ -358,6 +362,11 @@ class MakerSession:
                             "shared_address": fields[2],
                         }
                     decrypted = tx_part
+                elif " ring " in decrypted:
+                    # True-pooling ring: "<tx_b64> ring <addr:contrib>,<addr:contrib>".
+                    tx_part, _, rest = decrypted.partition(" ring ")
+                    ring = [(a, int(v)) for a, v in (p.split(":", 1) for p in rest.split(",") if p)]
+                    decrypted = tx_part
                 tx_bytes = base64.b64decode(decrypted)
                 tx_hex = tx_bytes.hex()
                 logger.debug(f"Decoded transaction hex ({len(tx_bytes)} bytes): {tx_hex}")
@@ -365,7 +374,7 @@ class MakerSession:
                 logger.error(f"Failed to decode transaction: {e}")
                 return
 
-            success, response = await self.handle_tx(tx_hex, combine=combine)
+            success, response = await self.handle_tx(tx_hex, combine=combine, ring=ring)
 
             if success:
                 signatures = response.get("signatures", [])
@@ -488,6 +497,11 @@ class MakerSession:
                 # positional fields; ours reads index 5 only when present.
                 if data.get("cc_pubkey"):
                     fields.append(data["cc_pubkey"])
+                    # 7th field (only alongside cc_pubkey): the maker's Lightning node, so
+                    # the taker can assign it a true-pooling ring partner. Reference takers
+                    # ignore trailing fields; ours reads index 6 when present.
+                    if data.get("ln_node"):
+                        fields.append(data["ln_node"])
                 plaintext = " ".join(fields)
                 msg_content = self.crypto.encrypt(plaintext)
                 logger.debug(f"Encrypted ioauth message, plaintext_len={len(plaintext)}")

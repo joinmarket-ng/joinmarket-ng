@@ -474,6 +474,7 @@ class ProtocolHandlersMixin:
                     getattr(self.config, "knapsack_capable", False)
                     and getattr(self.config, "ln_node", None)
                 ),
+                ln_node=getattr(self.config, "ln_node", None),
             )
             session = MakerSession(inner=session_inner)
 

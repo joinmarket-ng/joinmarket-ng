@@ -54,6 +54,7 @@ def verify_unsigned_transaction(
     network: NetworkType = NetworkType.MAINNET,
     combine_address: str | None = None,
     combine_value: int | None = None,
+    ring_outputs: list[tuple[str, int]] | None = None,
 ) -> tuple[bool, str]:
     """
     Verify unsigned CoinJoin transaction proposed by taker.
@@ -149,7 +150,25 @@ def verify_unsigned_transaction(
         # funding output (one pooled output, or several grid pieces) instead of a plain
         # change output, so we require the shared total (recomputed by us) to cover at
         # least our own change.
-        if combine_address is not None:
+        if ring_outputs is not None:
+            # True-pooling ring: this maker's change is split into contributions to two
+            # co-funded shared outputs. Require the contributions to sum to exactly our
+            # change, and each shared output to hold at least our contribution (it also
+            # holds the partner's, so its value is larger).
+            if sum(c for _, c in ring_outputs) != expected_change_value:
+                return (
+                    False,
+                    f"Ring contributions {sum(c for _, c in ring_outputs)} "
+                    f"!= our change {expected_change_value}",
+                )
+            value_at: dict[str, int] = {}
+            for o in tx_outputs:
+                value_at[o["address"]] = value_at.get(o["address"], 0) + o["value"]
+            for addr, contrib in ring_outputs:
+                got = value_at.get(addr, 0)
+                if got < contrib:
+                    return (False, f"Ring output {addr} value {got} < contribution {contrib}")
+        elif combine_address is not None:
             if combine_total < (combine_value or expected_change_value):
                 return (
                     False,
