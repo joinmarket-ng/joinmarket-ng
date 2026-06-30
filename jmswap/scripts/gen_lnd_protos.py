@@ -33,6 +33,7 @@ def main() -> int:
             f"-I{PROTO_DIR}",
             f"--python_out={OUT_DIR}",
             f"--grpc_python_out={OUT_DIR}",
+            f"--mypy_out={OUT_DIR}",  # typed .pyi stubs (mypy-protobuf)
             "lightning.proto",
         ],
         check=True,

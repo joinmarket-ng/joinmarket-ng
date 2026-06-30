@@ -54,6 +54,10 @@ exclude = ['src/jmswap/lndrpc/']
 module = "jmswap.lndrpc.*"
 ignore_errors = true
 
+[[tool.mypy.overrides]]
+module = "grpc.*"
+ignore_missing_imports = true
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"
