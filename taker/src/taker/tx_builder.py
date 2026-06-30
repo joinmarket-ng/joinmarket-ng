@@ -48,6 +48,11 @@ class CoinJoinTxData:
     total_maker_fee: int
     tx_fee: int
 
+    # True-pooling knapsack: merge change pieces paying the same scriptpubkey into one
+    # shared output (co-funded 2-of-2). Off by default so ordinary/per-maker change is
+    # never coalesced.
+    merge_change_by_address: bool = False
+
 
 class CoinJoinTxBuilder:
     """
@@ -91,12 +96,30 @@ class CoinJoinTxBuilder:
         for nick, out in tx_data.maker_cj_outputs.items():
             all_outputs.append((out, nick, "cj"))
 
-        # Change outputs
-        if tx_data.taker_change_output:
-            all_outputs.append((tx_data.taker_change_output, "taker", "change"))
-        for nick, outs in tx_data.maker_change_outputs.items():
-            for out in outs:
-                all_outputs.append((out, nick, "change"))
+        # Change outputs. With merge_change_by_address, pieces paying the SAME
+        # scriptpubkey are merged into one output: this is how a true-pooling (knapsack)
+        # channel co-funded by several parties becomes a single shared 2-of-2 funding
+        # output (each party supplied its own contribution as a change piece). Off by
+        # default, so ordinary/per-maker change is emitted piece-by-piece as before.
+        if tx_data.merge_change_by_address:
+            change_pieces: dict[bytes, list[tuple[int, str]]] = {}
+            if tx_data.taker_change_output:
+                o = tx_data.taker_change_output
+                change_pieces.setdefault(o.script, []).append((o.value, "taker"))
+            for nick, outs in tx_data.maker_change_outputs.items():
+                for out in outs:
+                    change_pieces.setdefault(out.script, []).append((out.value, nick))
+            for script, pieces in change_pieces.items():
+                total = sum(v for v, _ in pieces)
+                owners = [o for _, o in pieces]
+                owner = owners[0] if len(owners) == 1 else "shared"
+                all_outputs.append((TxOutput(value=total, script=script), owner, "change"))
+        else:
+            if tx_data.taker_change_output:
+                all_outputs.append((tx_data.taker_change_output, "taker", "change"))
+            for nick, outs in tx_data.maker_change_outputs.items():
+                for out in outs:
+                    all_outputs.append((out, nick, "change"))
 
         # Shuffle for privacy
         random.shuffle(all_inputs)
@@ -270,6 +293,7 @@ def build_coinjoin_tx(
     network: str = "mainnet",
     dust_threshold: int = 27300,  # Default to DUST_THRESHOLD from jmcore.constants
     combine_groups: dict[str, str] | None = None,  # folder_nick -> funder_nick
+    merge_change_by_address: bool = False,  # merge same-address change into one shared output
 ) -> tuple[bytes, dict[str, Any]]:
     """
     Build a complete CoinJoin transaction.
@@ -386,8 +410,13 @@ def build_coinjoin_tx(
                     f"Maker {nick} change_outputs sum {sum(a for _, a in pieces)} "
                     f"!= computed change {total_change}"
                 )
+            # When merging shared outputs, keep sub-dust contributions: they combine with
+            # other parties' contributions into one non-dust co-funded output. Otherwise a
+            # lone sub-dust piece is dropped as unspendable.
             outs = [
-                TxOutput.from_address(addr, amt) for addr, amt in pieces if amt > dust_threshold
+                TxOutput.from_address(addr, amt)
+                for addr, amt in pieces
+                if merge_change_by_address or amt > dust_threshold
             ]
             if outs:
                 maker_change_outputs[nick] = outs
@@ -413,6 +442,7 @@ def build_coinjoin_tx(
         cj_amount=cj_amount,
         total_maker_fee=total_maker_fee,
         tx_fee=tx_fee,
+        merge_change_by_address=merge_change_by_address,
     )
 
     return builder.build_unsigned_tx(tx_data)

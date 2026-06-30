@@ -247,7 +247,10 @@ def _solve_ring(changes: list[int]) -> list[int] | None:
         lo = max(lo, 1 - q[k], changes[k] - g_prev + 1 - q[k])
         hi = min(hi, grid[k] - 1 - q[k], changes[k] - 1 - q[k])
     a0_lo, a0_hi = int(lo), int(hi)
-    for a0 in (a0_lo, a0_lo + 1, (a0_lo + a0_hi) // 2, a0_hi - 1, a0_hi):
+    # Prefer the midpoint so contributions sit away from 0/grid (balanced co-funding,
+    # no near-dust shares), then fall back to the interval edges.
+    mid = (a0_lo + a0_hi) // 2
+    for a0 in (mid, a0_lo, a0_hi, a0_lo + 1, a0_hi - 1):
         if a0 < a0_lo or a0 > a0_hi:
             continue
         a = [a0 + q[k] for k in range(n)]

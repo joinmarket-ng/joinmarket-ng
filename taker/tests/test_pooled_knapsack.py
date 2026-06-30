@@ -7,10 +7,21 @@ co-funded by two parties (non-zero on both sides).
 
 from __future__ import annotations
 
+from jmcore.bitcoin import (
+    create_p2tr_scriptpubkey,
+    parse_transaction,
+    scriptpubkey_to_address,
+)
+
 from taker.knapsack import (
     PooledPlan,
     plan_pooled_knapsack,
 )
+from taker.tx_builder import build_coinjoin_tx
+
+
+def _addr(byte: int) -> str:
+    return scriptpubkey_to_address(create_p2tr_scriptpubkey(bytes([byte]) * 32), "regtest")
 
 
 def _check_invariants(plan: PooledPlan, parties: dict[str, int], *, min_channel: int) -> None:
@@ -106,3 +117,64 @@ def test_ring_values_sum_to_total_change() -> None:
     channel_total = sum(parties[n] for n in plan.contributions_by_party())
     assert sum(ch.value for ch in plan.channels) == channel_total
     _check_invariants(plan, parties, min_channel=200_000)
+
+
+def test_ring_merges_contributions_into_shared_outputs_in_build() -> None:
+    """Each party supplies its per-channel contributions as change pieces; the builder
+    merges same-address pieces into one shared 2-of-2 output worth the channel value."""
+    # changes: A=501000, B=401000, C=451000 (input - 1_000_000 cj + 1000 cjfee).
+    maker_data = {
+        "A": {
+            "utxos": [{"txid": "a" * 64, "vout": 0, "value": 1_500_000}],
+            "cj_addr": _addr(0x03),
+            "change_addr": _addr(0x04),
+            "cjfee": 1000,
+            "txfee": 0,
+        },
+        "B": {
+            "utxos": [{"txid": "b" * 64, "vout": 0, "value": 1_400_000}],
+            "cj_addr": _addr(0x05),
+            "change_addr": _addr(0x06),
+            "cjfee": 1000,
+            "txfee": 0,
+        },
+        "C": {
+            "utxos": [{"txid": "c" * 64, "vout": 0, "value": 1_450_000}],
+            "cj_addr": _addr(0x07),
+            "change_addr": _addr(0x08),
+            "cjfee": 1000,
+            "txfee": 0,
+        },
+    }
+    plan = plan_pooled_knapsack(
+        [("A", 501_000), ("B", 401_000), ("C", 451_000)], min_channel=200_000
+    )
+    assert len(plan.channels) == 3
+
+    chan_addr = {i: _addr(0x20 + i) for i in range(len(plan.channels))}
+    per_party: dict[str, list[tuple[str, int]]] = {}
+    for i, ch in enumerate(plan.channels):
+        per_party.setdefault(ch.party_a, []).append((chan_addr[i], ch.contrib_a))
+        per_party.setdefault(ch.party_b, []).append((chan_addr[i], ch.contrib_b))
+    for nick, pieces in per_party.items():
+        maker_data[nick]["change_outputs"] = pieces
+
+    tx_bytes, _ = build_coinjoin_tx(
+        [{"txid": "d" * 64, "vout": 0, "value": 5_000_000}],
+        _addr(0x01),
+        _addr(0x02),
+        5_000_000,
+        maker_data,
+        1_000_000,
+        2000,
+        "regtest",
+        merge_change_by_address=True,
+    )
+    tx = parse_transaction(tx_bytes.hex())
+    from jmcore.bitcoin import address_to_scriptpubkey
+
+    for i, ch in enumerate(plan.channels):
+        spk = address_to_scriptpubkey(chan_addr[i])
+        vals = [o.value for o in tx.outputs if o.script == spk]
+        # exactly one merged output per channel, worth the full channel value
+        assert vals == [ch.value], (i, vals, ch.value)
