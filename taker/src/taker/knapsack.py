@@ -179,6 +179,131 @@ def plan_knapsack(
     return KnapsackPlan(pieces=tuple(pieces), grid=grid)
 
 
+# Default minimum size of a pooled channel output, so the ring produces a few large
+# channels rather than many dust-sized ones (cheaper on fees; not every party need hide
+# every round). Tunable per round.
+DEFAULT_MIN_CHANNEL = 200_000
+
+
+@dataclass(frozen=True)
+class PooledChannel:
+    """One shared 2-of-2 channel-funding output co-funded by two parties.
+
+    ``value == contrib_a + contrib_b`` and both contributions are strictly positive, so
+    the output never equals either party's change (the "non-zero on both sides" rule).
+    """
+
+    value: int
+    party_a: str
+    party_b: str
+    contrib_a: int
+    contrib_b: int
+
+
+@dataclass(frozen=True)
+class PooledPlan:
+    """A round's true-pooling (ring) knapsack: equal-valued co-funded channels.
+
+    ``channels`` are the shared outputs (each co-funded by two adjacent ring parties);
+    ``plain`` are parties left with an ordinary change output (too small to reach the
+    minimum, or excluded as outliers so the remaining outputs stay equal-valued).
+    """
+
+    channels: tuple[PooledChannel, ...]
+    plain: tuple[str, ...]
+
+    def contributions_by_party(self) -> dict[str, int]:
+        out: dict[str, int] = {}
+        for ch in self.channels:
+            out[ch.party_a] = out.get(ch.party_a, 0) + ch.contrib_a
+            out[ch.party_b] = out.get(ch.party_b, 0) + ch.contrib_b
+        return out
+
+
+def _solve_ring(changes: list[int]) -> list[int] | None:
+    """Solve the ring: return per-party contribution ``a[k]`` to output ``k``.
+
+    Output ``k`` (value ``G[k] = sum(changes)//N`` give-or-take one sat) sits between
+    party ``k`` and ``k+1`` and is funded by ``a[k]`` (party k) plus ``G[k]-a[k]`` (party
+    k+1). Each party ``k`` spends exactly ``changes[k] = a[k] + b[k]`` where ``b[k]`` is
+    its contribution to the previous output. Returns ``None`` when no all-positive
+    integer solution exists (the spread of the changes exceeds one output value).
+    """
+    n = len(changes)
+    if n < 3:
+        return None
+    total = sum(changes)
+    base, rem = divmod(total, n)
+    grid = [base + (1 if k < rem else 0) for k in range(n)]
+    # a[k] = a0 + Q[k], with Q[0] = 0 and Q[k] = Q[k-1] + changes[k] - grid[k-1].
+    q = [0] * n
+    for k in range(1, n):
+        q[k] = q[k - 1] + changes[k] - grid[k - 1]
+    # a[k] in (0, grid[k]); b[k] = changes[k]-a[k] in (0, grid[k-1]).
+    lo = float("-inf")
+    hi = float("inf")
+    for k in range(n):
+        g_prev = grid[(k - 1) % n]
+        lo = max(lo, 1 - q[k], changes[k] - g_prev + 1 - q[k])
+        hi = min(hi, grid[k] - 1 - q[k], changes[k] - 1 - q[k])
+    a0_lo, a0_hi = int(lo), int(hi)
+    for a0 in (a0_lo, a0_lo + 1, (a0_lo + a0_hi) // 2, a0_hi - 1, a0_hi):
+        if a0 < a0_lo or a0 > a0_hi:
+            continue
+        a = [a0 + q[k] for k in range(n)]
+        ok = all(0 < a[k] < grid[k] and 0 < changes[k] - a[k] < grid[(k - 1) % n] for k in range(n))
+        if ok and all(a[k] + (changes[k] - a[k]) == changes[k] for k in range(n)):
+            return a
+    return None
+
+
+def plan_pooled_knapsack(
+    parties: list[tuple[str, int]], *, min_channel: int = DEFAULT_MIN_CHANNEL
+) -> PooledPlan:
+    """Plan equal-valued, co-funded channel outputs from ``(nick, change)`` parties.
+
+    Parties (makers, and optionally the taker) whose change is below ``min_channel`` keep
+    a plain change output. The rest are arranged in a ring of equal-valued 2-of-2 outputs
+    where every output is co-funded by two adjacent parties; an outlier whose change is
+    too large for the ring to stay equal-valued is dropped to plain (largest first) until
+    the ring is feasible. With two parties the ring degenerates to a single pooled output;
+    with fewer than two, everyone is plain. Order-stable so each party can recompute it.
+    """
+    channel = sorted((n, c) for n, c in parties if c >= min_channel)
+    plain = [n for n, c in parties if c < min_channel]
+
+    while len(channel) >= 3:
+        sol = _solve_ring([c for _, c in channel])
+        if sol is not None:
+            n = len(channel)
+            total = sum(c for _, c in channel)
+            base, rem = divmod(total, n)
+            grid = [base + (1 if k < rem else 0) for k in range(n)]
+            channels = tuple(
+                PooledChannel(
+                    value=grid[k],
+                    party_a=channel[k][0],
+                    party_b=channel[(k + 1) % n][0],
+                    contrib_a=sol[k],
+                    contrib_b=grid[k] - sol[k],
+                )
+                for k in range(n)
+            )
+            return PooledPlan(channels=channels, plain=tuple(plain))
+        idx = max(range(len(channel)), key=lambda i: channel[i][1])
+        plain.append(channel.pop(idx)[0])
+
+    if len(channel) == 2:
+        (na, ca), (nb, cb) = channel
+        return PooledPlan(
+            channels=(
+                PooledChannel(value=ca + cb, party_a=na, party_b=nb, contrib_a=ca, contrib_b=cb),
+            ),
+            plain=tuple(plain),
+        )
+    return PooledPlan(channels=(), plain=tuple(n for n, _ in parties))
+
+
 def assert_maker_to_maker(plan: KnapsackPlan, participants: Iterable[str]) -> None:
     """Raise :class:`ExternalChannelError` unless every channel piece is maker-to-maker.
 
