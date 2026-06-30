@@ -263,6 +263,9 @@ def build_taker_config(
         taker_utxo_age=settings.taker.taker_utxo_age,
         taker_utxo_retries=settings.taker.taker_utxo_retries,
         taker_utxo_amtpercent=settings.taker.taker_utxo_amtpercent,
+        combine_channel_as_change=settings.taker.combine_channel_as_change,
+        combine_mode=settings.taker.combine_mode,
+        channelize_taker_change=settings.taker.channelize_taker_change,
     )
 
 

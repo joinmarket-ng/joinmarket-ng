@@ -1103,6 +1103,39 @@ class TakerSettings(BaseModel):
             "matches the upstream JoinMarket reference (POLICY.n)."
         ),
     )
+    combine_channel_as_change: bool = Field(
+        default=False,
+        description=(
+            "Pair makers that advertise a channel-as-change funding pubkey into shared "
+            "maker-to-maker 2-of-2 funding outputs, pooling their change to hide amounts. "
+            "Off by default (a plain CoinJoin is byte-identical to today)."
+        ),
+    )
+    combine_mode: str = Field(
+        default="pool",
+        description=(
+            "Combine construction when combine_channel_as_change is on: 'pool' (two "
+            "makers' change in one shared 2-of-2) or 'knapsack' (each maker's change "
+            "split into grid-quantized pieces at a 2-of-2 with a round-robin partner)."
+        ),
+    )
+    channelize_taker_change: bool = Field(
+        default=False,
+        description=(
+            "Also emit the taker's own change as a maker-taker 2-of-2 channel-funding "
+            "output, so it has no chaining successor. Requires combine_channel_as_change."
+        ),
+    )
+
+    @field_validator("combine_mode")
+    @classmethod
+    def validate_combine_mode(cls, v: str) -> str:
+        """Reject unknown combine modes so a config typo never silently disables knapsack."""
+        allowed = {"pool", "knapsack"}
+        if v not in allowed:
+            raise ValueError(f"combine_mode must be one of {sorted(allowed)}, got {v!r}")
+        return v
+
     rescan_interval_sec: int = Field(
         default=600,
         ge=60,

@@ -500,6 +500,15 @@
 # minimum_makers=1 is fingerprintable and degrades the privacy of the join).
 # minimum_makers = 4
 
+# Maker-to-maker channel-as-change (experimental, opt-in). When enabled, makers that
+# advertise a channel-as-change funding pubkey are paired into shared 2-of-2 funding
+# outputs that pool their change, so no per-maker change output reveals an exact
+# residual. A plain CoinJoin is byte-identical to today when this is off.
+# combine_channel_as_change = false
+# combine_mode = "pool"            # "pool" (two makers -> one shared 2-of-2) or
+#                                  # "knapsack" (grid-quantized pieces, round-robin)
+# channelize_taker_change = false  # also channelize the taker's own change (maker-taker)
+
 # ============================================================================
 # Tumbler Settings
 # ============================================================================

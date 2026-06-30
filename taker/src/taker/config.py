@@ -281,6 +281,15 @@ class TakerConfig(WalletConfig):
         ),
     )
 
+    @field_validator("combine_mode")
+    @classmethod
+    def validate_combine_mode(cls, v: str) -> str:
+        """Reject unknown combine modes so a typo never silently disables knapsack."""
+        allowed = {"pool", "knapsack"}
+        if v not in allowed:
+            raise ValueError(f"combine_mode must be one of {sorted(allowed)}, got {v!r}")
+        return v
+
     @model_validator(mode="after")
     def set_bitcoin_network_default(self) -> TakerConfig:
         """If bitcoin_network is not set, default to the protocol network."""

@@ -74,6 +74,9 @@ class TestBuildTakerConfig:
         settings.taker.taker_utxo_age = 5
         settings.taker.taker_utxo_retries = 3
         settings.taker.taker_utxo_amtpercent = 20
+        settings.taker.combine_channel_as_change = False
+        settings.taker.combine_mode = "pool"
+        settings.taker.channelize_taker_change = False
 
         # Wallet config
         settings.wallet.mixdepth_count = 5
@@ -184,6 +187,42 @@ class TestBuildTakerConfig:
 
         assert config.counterparty_count == 1
         assert config.minimum_makers == 1
+
+    def test_combine_settings_roundtrip_into_config(self, sample_mnemonic: str) -> None:
+        """taker.combine_* settings must flow through build_taker_config to the config."""
+        from jmcore.settings import JoinMarketSettings
+
+        settings = JoinMarketSettings()
+        # defaults are off
+        cfg = build_taker_config(
+            settings=settings, mnemonic=sample_mnemonic, passphrase="", mixdepth=0
+        )
+        assert cfg.combine_channel_as_change is False
+        assert cfg.combine_mode == "pool"
+        assert cfg.channelize_taker_change is False
+
+        settings.taker.combine_channel_as_change = True
+        settings.taker.combine_mode = "knapsack"
+        settings.taker.channelize_taker_change = True
+        cfg2 = build_taker_config(
+            settings=settings, mnemonic=sample_mnemonic, passphrase="", mixdepth=0
+        )
+        assert cfg2.combine_channel_as_change is True
+        assert cfg2.combine_mode == "knapsack"
+        assert cfg2.channelize_taker_change is True
+
+    def test_combine_mode_rejects_unknown_value(self, sample_mnemonic: str) -> None:
+        """A typo in combine_mode must fail loudly, not silently fall back to pool."""
+        import pytest
+        from jmcore.settings import TakerSettings
+        from pydantic import ValidationError
+
+        from taker.config import TakerConfig
+
+        with pytest.raises(ValidationError, match="combine_mode"):
+            TakerSettings(combine_mode="knpsack")
+        with pytest.raises(ValidationError, match="combine_mode"):
+            TakerConfig(mnemonic=sample_mnemonic, combine_mode="garbage")
 
     def test_taker_fee_rate_setting_honored_without_cli_flag(
         self, sample_mnemonic: str, mock_settings: MagicMock

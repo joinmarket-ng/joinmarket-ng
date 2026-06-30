@@ -263,16 +263,20 @@ class Offer(BaseModel):
     knapsack_capable: bool = Field(
         default=False,
         description=(
-            "Whether this maker can take part in taker-arranged knapsack "
-            "channel-as-change (maker-to-maker grid-quantized shared outputs). "
-            "Requires ln_node. Backward-compatible: defaults False."
+            "Maker-side build hint that this maker enabled knapsack channel-as-change. "
+            "Not sent on the offer line: the wire capability signal is the "
+            "'channel_change' handshake feature (see ``features`` / ``has_feature``), "
+            "and the per-round funding key arrives in the encrypted !ioauth. "
+            "Backward-compatible: defaults False."
         ),
     )
     ln_node: str | None = Field(
         default=None,
         description=(
-            "The maker's Lightning node 'node_id@host:port', advertised so the taker "
-            "can pair it with a fellow maker for knapsack channel-as-change."
+            "The maker's Lightning node 'node_id@host:port'. Maker-local only: it is "
+            "deliberately never broadcast in the public orderbook to avoid linking the "
+            "maker's nick to its LN identity. A taker detects combine capability via the "
+            "'channel_change' feature flag and pairs makers using the per-round !ioauth key."
         ),
     )
     directly_reachable: bool | None = Field(
