@@ -368,6 +368,8 @@ class ProtocolHandlersMixin:
                 await self._handle_fill(from_nick, command, source=source)
             elif command.startswith("auth"):
                 await self._handle_auth(from_nick, command, source=source)
+            elif command.startswith("chanreq"):
+                await self._handle_chanreq(from_nick, command, source=source)
             elif command.startswith("tx"):
                 await self._handle_tx(from_nick, command, source=source)
             elif command.startswith("push"):
@@ -537,6 +539,17 @@ class ProtocolHandlersMixin:
 
         async with session.lock:
             await session.on_tx(self, msg, source)
+
+    async def _handle_chanreq(
+        self: MakerBotProtocol, taker_nick: str, msg: str, source: str = "unknown"
+    ) -> None:
+        """Dispatch a true-pooling ring channel-open request to the per-taker session."""
+        session = self.active_sessions.get(taker_nick)
+        if session is None:
+            logger.warning(f"No active session for {taker_nick}")
+            return
+        async with session.lock:
+            await session.on_chanreq(self, msg, source)
 
     async def _handle_push(self, taker_nick: str, msg: str, source: str = "unknown") -> None:
         """Handle !push request from taker.

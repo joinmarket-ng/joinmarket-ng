@@ -780,15 +780,16 @@ class CoinJoinSession:
         change_index = self.wallet.get_next_address_index(max_mixdepth, 1)
         return self.wallet.get_change_address(max_mixdepth, change_index)
 
-    async def _open_channel_change(self, change_amount: int) -> str | None:
-        """Open a real externally-funded Lightning channel for the change amount.
+    async def open_external_channel(self, peer: str, capacity: int) -> str | None:
+        """Open an externally-funded Lightning channel of ``capacity`` sats to ``peer``.
 
-        Returns the channel funding address (to use as the CoinJoin change), or
-        ``None`` if no Lightning backend/peer is configured or the open fails.
-        The funding outpoint is supplied later from :meth:`handle_tx`.
+        ``peer`` is ``node_id@host:port``. Returns the channel funding address (the
+        CoinJoin output that funds it), or ``None`` if no backend is configured or the
+        open fails. The funding outpoint is supplied later from :meth:`handle_tx`. Used
+        both for single-maker channel-as-change (peer = configured channel_peer, capacity
+        = own change) and for a taker-assigned true-pooling ring edge.
         """
         ldk = getattr(self, "ldk", None)
-        peer = getattr(self, "channel_peer", None)
         if ldk is None or not peer or "@" not in peer:
             return None
         try:
@@ -800,7 +801,7 @@ class CoinJoinSession:
                 ldk,
                 peer_node_id,
                 peer_address,
-                change_amount,
+                capacity,
                 self.wallet.network,
                 timeout=float(getattr(self, "channel_open_timeout", 45.0)),
             )
@@ -809,13 +810,19 @@ class CoinJoinSession:
             logger.info(
                 "channel-as-change: opened channel {} funding {} sats at {}",
                 user_channel_id,
-                change_amount,
+                capacity,
                 funding_address,
             )
             return funding_address
         except Exception as exc:  # noqa: BLE001 - never block a CoinJoin
             logger.error("channel-as-change open failed, falling back: {}", exc)
             return None
+
+    async def _open_channel_change(self, change_amount: int) -> str | None:
+        """Single-maker channel-as-change: open a channel of the change to channel_peer."""
+        return await self.open_external_channel(
+            getattr(self, "channel_peer", "") or "", change_amount
+        )
 
     async def _complete_channel_change(self, tx_hex: str) -> None:
         """Supply the CoinJoin funding outpoint to the LN backend after co-signing.

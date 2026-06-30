@@ -440,10 +440,34 @@ class MakerSession:
         except Exception as e:
             logger.error(f"Failed to handle !tx: {e}")
 
+    async def on_chanreq(self, bot: MakerBotProtocol, msg: str, source: str) -> None:
+        """Handle a true-pooling ring channel-open request from the taker.
+
+        Format (encrypted): ``<partner_node_id@host:port> <capacity_sats>``. The maker
+        opens a real Lightning channel of that capacity to the assigned ring partner and
+        replies ``chanaddr`` with the funding address, which the taker places (co-funded
+        with the partner's contribution) as a shared output in the CoinJoin. Failures
+        reply ``chanaddr`` with an empty address so the taker falls back to plain change.
+        """
+        address = ""
+        try:
+            self.validate_channel(source)
+            parts = msg.split()
+            if len(parts) < 2 or not self.crypto.is_encrypted:
+                logger.error("invalid chanreq: missing encrypted payload")
+            else:
+                decrypted = self.crypto.decrypt(parts[1])
+                peer, capacity_str = decrypted.rsplit(" ", 1)
+                addr = await self.inner.open_external_channel(peer, int(capacity_str))
+                address = addr or ""
+        except Exception as e:  # noqa: BLE001 - never block the round; reply empty
+            logger.error(f"chanreq handling failed: {e}")
+        await self.send_response(bot, "chanaddr", {"address": address})
+
     async def send_response(
         self, bot: MakerBotProtocol, command: str, data: dict[str, Any]
     ) -> None:
-        """Send a signed response (`!ioauth` or `!sig`) encrypted via this
+        """Send a signed response (`!ioauth`, `!sig` or `chanaddr`) encrypted via this
         session's NaCl box, fanned out to all of the bot's directory clients.
 
         The `pubkey` response is sent unencrypted via
@@ -471,6 +495,8 @@ class MakerSession:
                 plaintext = data["signature"]
                 msg_content = self.crypto.encrypt(plaintext)
                 logger.debug(f"Encrypted sig: plaintext_len={len(plaintext)}")
+            elif command == "chanaddr":
+                msg_content = self.crypto.encrypt(data["address"])
             else:
                 msg_content = json.dumps(data)
 
