@@ -365,6 +365,7 @@ def build_maker_config(
         min_confirmations=settings.maker.min_confirmations,
         knapsack_capable=settings.maker.knapsack_capable,
         ln_node=settings.maker.ln_node,
+        taker_utxo_age=settings.maker.taker_utxo_age,
         session_timeout_sec=settings.maker.session_timeout_sec,
         pending_tx_timeout_min=settings.maker.pending_tx_timeout_min,
         pending_tx_abandon_hours=settings.maker.pending_tx_abandon_hours,

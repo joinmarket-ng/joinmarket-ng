@@ -454,6 +454,7 @@ class ProtocolHandlersMixin:
                 offer=offer,
                 wallet=self.wallet,
                 backend=self.backend,
+                taker_utxo_age=getattr(self.config, "taker_utxo_age", 5),
                 session_timeout_sec=self.config.session_timeout_sec,
                 merge_algorithm=self.config.merge_algorithm.value,
                 restrict_md0=not self.config.allow_mixdepth_zero_merge,

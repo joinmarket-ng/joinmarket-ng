@@ -258,6 +258,11 @@ class MakerConfig(WalletConfig):
         default=OfferType.SW0_RELATIVE, description="Offer type (relative/absolute fee)"
     )
     min_size: int = Field(default=100_000, ge=0, description="Minimum CoinJoin amount in satoshis")
+    taker_utxo_age: int = Field(
+        default=5,
+        ge=1,
+        description="Minimum confirmations required on the taker's PoDLE commitment UTXO.",
+    )
     cj_fee_relative: str = Field(
         default="0.00002",
         description=(

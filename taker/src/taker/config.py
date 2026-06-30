@@ -249,6 +249,14 @@ class TakerConfig(WalletConfig):
             "chaining successor either. Requires combine_channel_as_change."
         ),
     )
+    ring_min_channel_sats: int = Field(
+        default=200_000,
+        ge=1,
+        description=(
+            "Minimum size of a pooled channel in combine_mode='lnd_ring'. Makers whose "
+            "change is below this stay plain; the ring uses a few larger channels."
+        ),
+    )
     max_maker_replacement_attempts: int = Field(
         default=3,
         ge=0,

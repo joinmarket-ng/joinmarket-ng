@@ -1022,6 +1022,19 @@ class TestNewSettingsWiring:
         assert config.ln_node == "02ab@host:9735"
         assert "channel_change" in config.capability_features()
 
+    def test_taker_utxo_age_from_settings(self) -> None:
+        """maker.taker_utxo_age round-trips into MakerConfig (default 5)."""
+        from jmcore.settings import JoinMarketSettings
+
+        from maker.cli import build_maker_config
+
+        settings = JoinMarketSettings()
+        base = build_maker_config(settings=settings, mnemonic=TEST_MNEMONIC, passphrase="")
+        assert base.taker_utxo_age == 5
+        settings.maker.taker_utxo_age = 1
+        config = build_maker_config(settings=settings, mnemonic=TEST_MNEMONIC, passphrase="")
+        assert config.taker_utxo_age == 1
+
     def test_capability_features_mapping(self) -> None:
         """The three fixes map to handshake capability flags only when configured."""
         from maker.config import MakerConfig, SwapProviderConfig

@@ -737,6 +737,14 @@ class MakerSettings(BaseModel):
             "makers via different defaults -- see issue #468)."
         ),
     )
+    taker_utxo_age: int = Field(
+        default=5,
+        ge=1,
+        description=(
+            "Minimum confirmations this maker requires on the taker's PoDLE commitment "
+            "UTXO before participating (reference default 5)."
+        ),
+    )
     offer_type: str = Field(
         default="sw0reloffer",
         description="Offer type: sw0reloffer (relative) or sw0absoffer (absolute)",

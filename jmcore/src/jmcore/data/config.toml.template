@@ -308,6 +308,10 @@
 # value may make jm-ng makers fingerprintable).
 # min_size = 100000
 
+# Minimum confirmations this maker requires on the taker's PoDLE commitment UTXO
+# before joining (reference default 5; lower only for testing).
+# taker_utxo_age = 5
+
 # IMPORTANT: offer_type determines which fee setting is used.
 # Simply changing cj_fee_absolute will NOT switch to absolute fees - you must set offer_type.
 #
