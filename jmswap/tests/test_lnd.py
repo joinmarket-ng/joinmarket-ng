@@ -102,7 +102,7 @@ async def test_open_uses_simple_taproot_private_psbt_shim() -> None:
     assert spk_hex  # address converted to a scriptpubkey
 
 
-async def test_provide_funding_outpoint_verifies_then_finalizes() -> None:
+async def test_provide_funding_outpoint_verifies_with_skip_finalize() -> None:
     backend = LndBackend(host="x", tls_cert=b"", macaroon_hex="")
     backend._stub = _FakeStub()
     ucid = await backend.open_channel_external_funding(
@@ -113,12 +113,11 @@ async def test_provide_funding_outpoint_verifies_then_finalizes() -> None:
     await backend.provide_funding_outpoint(ucid, "ab" * 32, 0, tx_hex, iu)
 
     steps = backend._stub.funding_steps
-    assert [s.WhichOneof("trigger") for s in steps] == ["psbt_verify", "psbt_finalize"]
-    pending = bytes.fromhex(ucid)
-    assert steps[0].psbt_verify.pending_chan_id == pending
+    # Only a verify with skip_finalize: LND watches the outpoint, the taker broadcasts.
+    assert [s.WhichOneof("trigger") for s in steps] == ["psbt_verify"]
+    assert steps[0].psbt_verify.pending_chan_id == bytes.fromhex(ucid)
     assert steps[0].psbt_verify.funded_psbt.startswith(_PSBT_MAGIC)
-    assert steps[1].psbt_finalize.pending_chan_id == pending
-    assert steps[1].psbt_finalize.final_raw_tx == bytes.fromhex(tx_hex)
+    assert steps[0].psbt_verify.skip_finalize is True
 
 
 async def test_provide_funding_outpoint_requires_tx_and_utxos() -> None:

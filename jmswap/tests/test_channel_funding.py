@@ -34,7 +34,9 @@ class _FakeLdk:
             return True, FUNDING_SPK.hex(), self.value
         return False, "", 0
 
-    async def provide_funding_outpoint(self, user_channel_id, funding_txid, funding_vout):
+    async def provide_funding_outpoint(
+        self, user_channel_id, funding_txid, funding_vout, raw_tx_hex=None, input_utxos=None
+    ):
         self.completed = (user_channel_id, funding_txid, funding_vout)
 
 

@@ -162,6 +162,11 @@ class SwapProviderConfig(BaseModel):
     ldk_tls_cert: str | None = None
     ldk_api_key: str | None = None
     ldk_api_key_path: str | None = None
+    # LND backend (taproot channel-as-change). When lnd_grpc_url is set it is preferred
+    # over LDK for channel funding, giving a real simple-taproot (P2TR) channel.
+    lnd_grpc_url: str | None = None
+    lnd_tls_cert_path: str | None = None
+    lnd_macaroon_path: str | None = None
 
     model_config = {"frozen": False}
 

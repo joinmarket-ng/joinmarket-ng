@@ -818,7 +818,13 @@ class CoinJoinSession:
             return None
 
     async def _complete_channel_change(self, tx_hex: str) -> None:
-        """Supply the CoinJoin funding outpoint to LDK after co-signing the tx."""
+        """Supply the CoinJoin funding outpoint to the LN backend after co-signing.
+
+        For the LDK backend the ``(txid, vout)`` is enough (it takes the outpoint after
+        broadcast). The LND backend funds via PSBT, so it also needs the assembled tx and
+        every input's prevout ``(value, scriptpubkey)``; these are fetched here while the
+        CoinJoin is still unbroadcast (so the prevouts are unspent and resolvable).
+        """
         user_id = getattr(self, "_channel_user_id", None)
         spk = getattr(self, "_channel_funding_spk", None)
         ldk = getattr(self, "ldk", None)
@@ -831,7 +837,22 @@ class CoinJoinSession:
             tx = parse_transaction(tx_hex)
             vout = next(i for i, o in enumerate(tx.outputs) if o.script == spk)
             txid = get_txid(tx_hex)
-            await complete_external_channel_funding(ldk, user_id, txid, vout)
+            # Per-input prevouts are only needed by the LND (PSBT) backend; gather them
+            # best-effort so the LDK backend (which ignores them) is unaffected.
+            input_utxos: list[tuple[int, bytes]] | None = None
+            try:
+                gathered: list[tuple[int, bytes]] = []
+                for inp in tx.inputs:
+                    prev = await self.backend.get_utxo(inp.txid, inp.vout)
+                    if prev is None:
+                        raise ValueError(f"prevout {inp.txid}:{inp.vout} not resolvable")
+                    gathered.append((prev.value, bytes.fromhex(prev.scriptpubkey)))
+                input_utxos = gathered
+            except Exception as exc:  # noqa: BLE001 - LDK does not need these
+                logger.debug("channel-as-change: input UTXO gather skipped: {}", exc)
+            await complete_external_channel_funding(
+                ldk, user_id, txid, vout, raw_tx_hex=tx_hex, input_utxos=input_utxos
+            )
             logger.info("channel-as-change: provided funding outpoint {}:{}", txid, vout)
         except Exception as exc:  # noqa: BLE001 - the maker still co-signs the round
             logger.error("channel-as-change outpoint provision failed: {}", exc)

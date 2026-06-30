@@ -156,7 +156,9 @@ class _FakeLdk:
         assert self.opened is not None
         return True, self.funding_spk.hex(), self.opened[2]
 
-    async def provide_funding_outpoint(self, user_channel_id, funding_txid, funding_vout):
+    async def provide_funding_outpoint(
+        self, user_channel_id, funding_txid, funding_vout, raw_tx_hex=None, input_utxos=None
+    ):
         self.completed = (user_channel_id, funding_txid, funding_vout)
 
 

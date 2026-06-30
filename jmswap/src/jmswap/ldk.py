@@ -349,9 +349,19 @@ class LdkServerBackend(LightningBackend):
         return ready, _first_str(parsed, 2) or "", _first_int(parsed, 3) or 0
 
     async def provide_funding_outpoint(
-        self, user_channel_id: str, funding_txid: str, funding_vout: int
+        self,
+        user_channel_id: str,
+        funding_txid: str,
+        funding_vout: int,
+        raw_tx_hex: str | None = None,
+        input_utxos: list[tuple[int, bytes]] | None = None,
     ) -> None:
-        """Provide the outpoint of the externally-broadcast funding transaction."""
+        """Provide the outpoint of the externally-broadcast funding transaction.
+
+        ``raw_tx_hex`` / ``input_utxos`` are accepted for interface parity with the LND
+        backend (which needs the PSBT) and ignored here: LDK takes the outpoint after
+        the funding tx is broadcast.
+        """
         req = f_str(1, user_channel_id) + f_str(2, funding_txid) + f_uint(3, funding_vout)
         await self._call("ProvideFundingOutpoint", req)
 

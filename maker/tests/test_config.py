@@ -348,6 +348,9 @@ class TestBuildMakerConfig:
         settings.maker.swap_provider.ldk_tls_cert = "/data/tls.crt"
         settings.maker.swap_provider.ldk_grpc_url = "https://ldk:3536"
         settings.maker.swap_provider.ldk_api_key = "deadbeef"
+        settings.maker.swap_provider.lnd_grpc_url = "127.0.0.1:10009"
+        settings.maker.swap_provider.lnd_tls_cert_path = "/data/lnd/tls.cert"
+        settings.maker.swap_provider.lnd_macaroon_path = "/data/lnd/admin.macaroon"
 
         config = build_maker_config(
             settings=settings,
@@ -371,6 +374,9 @@ class TestBuildMakerConfig:
         assert sp.ldk_tls_cert == "/data/tls.crt"
         assert sp.ldk_grpc_url == "https://ldk:3536"
         assert sp.ldk_api_key == "deadbeef"
+        assert sp.lnd_grpc_url == "127.0.0.1:10009"
+        assert sp.lnd_tls_cert_path == "/data/lnd/tls.cert"
+        assert sp.lnd_macaroon_path == "/data/lnd/admin.macaroon"
 
     def test_swap_provider_defaults_disabled(self) -> None:
         """The swap-provider role is off by default and round-trips cleanly."""

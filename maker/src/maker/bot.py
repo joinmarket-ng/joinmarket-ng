@@ -706,6 +706,32 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         self._ldk_backend_cache = backend
         return backend
 
+    def channel_funding_backend(self) -> object | None:
+        """Build (and cache) the channel-as-change backend (LND if set, else LDK).
+
+        LND gives a real simple-taproot (P2TR) channel funding output; the LDK fork
+        only does P2WSH. The swap-provider role keeps using the LDK/LightningBackend.
+        """
+        cached = getattr(self, "_chan_backend_cache", "unset")
+        if cached != "unset":
+            return cached
+        sp = getattr(self.config, "swap_provider", None)
+        backend: object | None = None
+        if sp is not None and getattr(sp, "lnd_grpc_url", None):
+            from jmswap.lnd import LndBackend
+
+            network = getattr(self.config, "network", "signet")
+            backend = LndBackend.from_paths(
+                sp.lnd_grpc_url,
+                sp.lnd_tls_cert_path or "",
+                sp.lnd_macaroon_path or "",
+                network=str(network),
+            )
+        else:
+            backend = self.ldk_backend()
+        self._chan_backend_cache = backend
+        return backend
+
     def _build_swap_server(self) -> tuple[object, object, str]:
         """Construct the SwapServer, SwapNostrNode and provider terms.
 

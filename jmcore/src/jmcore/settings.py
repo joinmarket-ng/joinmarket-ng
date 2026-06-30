@@ -708,6 +708,21 @@ class SwapProviderSettings(BaseModel):
         default=None,
         description="Path to the LDK Server API key file (raw bytes; hex-encoded on read).",
     )
+    lnd_grpc_url: str | None = Field(
+        default=None,
+        description=(
+            "LND gRPC host:port (e.g. '127.0.0.1:10009'). When set, channel-as-change "
+            "uses LND simple-taproot channels (a P2TR funding output) instead of LDK."
+        ),
+    )
+    lnd_tls_cert_path: str | None = Field(
+        default=None,
+        description="Path to the LND TLS certificate (tls.cert) to pin.",
+    )
+    lnd_macaroon_path: str | None = Field(
+        default=None,
+        description="Path to the LND macaroon (e.g. admin.macaroon) for gRPC auth.",
+    )
 
 
 class MakerSettings(BaseModel):

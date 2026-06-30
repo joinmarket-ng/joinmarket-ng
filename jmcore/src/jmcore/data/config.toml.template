@@ -448,6 +448,12 @@
 # ldk_grpc_url = "https://jm-ldk-provider:3536"
 # ldk_tls_cert = "/data/tls.crt"          # LDK Server self-signed TLS cert to pin
 # ldk_api_key_path = "/data/bitcoin/api_key"
+# LND backend (preferred when set): a real simple-taproot channel whose funding output
+# is a MuSig2 2-of-2 P2TR, so the change blends with Taproot swaps. Mutually exclusive
+# with the LDK keys above for channel-as-change.
+# lnd_grpc_url = "127.0.0.1:10009"
+# lnd_tls_cert_path = "/data/lnd/tls.cert"
+# lnd_macaroon_path = "/data/lnd/admin.macaroon"
 
 # ============================================================================
 # Taker Settings (CoinJoin Client)

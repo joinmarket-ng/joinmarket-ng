@@ -458,7 +458,7 @@ class ProtocolHandlersMixin:
                 channel_change=getattr(self.config, "swap_provider", None) is not None
                 and self.config.swap_provider.channel_change,
                 ldk=(
-                    self.ldk_backend()
+                    self.channel_funding_backend()
                     if getattr(self.config, "swap_provider", None) is not None
                     and self.config.swap_provider.channel_change
                     else None

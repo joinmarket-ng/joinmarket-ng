@@ -217,11 +217,12 @@ class LndBackend:
     ) -> None:
         """Pin the channel point: PsbtVerify (unsigned tx) then PsbtFinalize (final tx).
 
-        ``raw_tx_hex`` is the assembled CoinJoin (final, signed) and ``input_utxos`` the
-        per-input ``(value, scriptpubkey)`` of every spent output (LND checks the input
-        sum). LND derives the channel outpoint from the unsigned form and, with
-        ``no_publish``, records the funding tx without broadcasting (the taker
-        broadcasts the CoinJoin).
+        ``raw_tx_hex`` is the assembled CoinJoin (the unsigned form is enough; witnesses
+        are stripped so the txid matches) and ``input_utxos`` the per-input
+        ``(value, scriptpubkey)`` of every spent output (LND checks the input sum). With
+        ``skip_finalize`` LND derives the channel outpoint from the verified PSBT and
+        waits for it to confirm on chain; the taker broadcasts the CoinJoin, so no
+        signed transaction is handed back to LND.
         """
         if raw_tx_hex is None or input_utxos is None:
             raise ValueError(
@@ -235,18 +236,12 @@ class LndBackend:
         await self._stub.FundingStateStep(
             ln.FundingTransitionMsg(
                 psbt_verify=ln.FundingPsbtVerify(
-                    funded_psbt=psbt, pending_chan_id=p.pending_chan_id
+                    funded_psbt=psbt, pending_chan_id=p.pending_chan_id, skip_finalize=True
                 )
             )
         )
         p.verified = True
-        await self._stub.FundingStateStep(
-            ln.FundingTransitionMsg(
-                psbt_finalize=ln.FundingPsbtFinalize(
-                    final_raw_tx=bytes.fromhex(raw_tx_hex), pending_chan_id=p.pending_chan_id
-                )
-            )
-        )
         logger.info(
-            f"LND channel point pinned at {funding_txid}:{funding_vout} (ucid={user_channel_id[:12]})"
+            f"LND channel point pinned at {funding_txid}:{funding_vout} "
+            f"(ucid={user_channel_id[:12]}); awaiting on-chain confirmation"
         )

@@ -405,6 +405,9 @@ def build_maker_config(
             ldk_tls_cert=settings.maker.swap_provider.ldk_tls_cert,
             ldk_api_key=settings.maker.swap_provider.ldk_api_key,
             ldk_api_key_path=settings.maker.swap_provider.ldk_api_key_path,
+            lnd_grpc_url=settings.maker.swap_provider.lnd_grpc_url,
+            lnd_tls_cert_path=settings.maker.swap_provider.lnd_tls_cert_path,
+            lnd_macaroon_path=settings.maker.swap_provider.lnd_macaroon_path,
         ),
     )
 

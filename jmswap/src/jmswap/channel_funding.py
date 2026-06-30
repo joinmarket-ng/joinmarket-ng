@@ -38,7 +38,12 @@ class ExternalFundingLightning(Protocol):
     async def get_funding_output(self, user_channel_id: str) -> tuple[bool, str, int]: ...
 
     async def provide_funding_outpoint(
-        self, user_channel_id: str, funding_txid: str, funding_vout: int
+        self,
+        user_channel_id: str,
+        funding_txid: str,
+        funding_vout: int,
+        raw_tx_hex: str | None = None,
+        input_utxos: list[tuple[int, bytes]] | None = None,
     ) -> None: ...
 
 
@@ -79,6 +84,15 @@ async def complete_external_channel_funding(
     user_channel_id: str,
     funding_txid: str,
     funding_vout: int,
+    raw_tx_hex: str | None = None,
+    input_utxos: list[tuple[int, bytes]] | None = None,
 ) -> None:
-    """Supply the CoinJoin funding outpoint, driving the channel to ready."""
-    await ldk.provide_funding_outpoint(user_channel_id, funding_txid, funding_vout)
+    """Supply the CoinJoin funding outpoint, driving the channel to ready.
+
+    ``raw_tx_hex`` (the assembled CoinJoin) and ``input_utxos`` (per-input
+    ``(value, scriptpubkey)``) are required by the LND backend's PSBT verify/finalize
+    flow; the LDK backend takes the outpoint after broadcast and ignores them.
+    """
+    await ldk.provide_funding_outpoint(
+        user_channel_id, funding_txid, funding_vout, raw_tx_hex, input_utxos
+    )
