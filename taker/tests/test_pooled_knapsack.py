@@ -16,6 +16,7 @@ from jmcore.bitcoin import (
 from taker.knapsack import (
     PooledPlan,
     plan_pooled_knapsack,
+    plan_pooled_session,
 )
 from taker.tx_builder import build_coinjoin_tx
 
@@ -117,6 +118,28 @@ def test_ring_values_sum_to_total_change() -> None:
     channel_total = sum(parties[n] for n in plan.contributions_by_party())
     assert sum(ch.value for ch in plan.channels) == channel_total
     _check_invariants(plan, parties, min_channel=200_000)
+
+
+def test_pooled_session_relay_matches_change_and_co_control() -> None:
+    parties = {"A": 501_000, "B": 401_000, "C": 451_000}
+    plan = plan_pooled_knapsack(list(parties.items()), min_channel=200_000)
+    # deterministic per-edge address keyed by the sorted pair
+    session = plan_pooled_session(plan, lambda a, b: f"addr-{'-'.join(sorted((a, b)))}")
+
+    for nick, edges in session.relay.items():
+        # each party sits on exactly two ring edges, contributions summing to its change
+        assert len(edges) == 2
+        assert sum(e.contribution for e in edges) == parties[nick]
+        # the relayed address for an edge matches the change piece the party emits
+        pieces = dict(session.change_outputs[nick])
+        for e in edges:
+            assert pieces[e.shared_address] == e.contribution
+            assert e.partner != nick
+    # every edge is symmetric: both endpoints reference the same shared address
+    for nick, edges in session.relay.items():
+        for e in edges:
+            back = [x for x in session.relay[e.partner] if x.partner == nick]
+            assert any(x.shared_address == e.shared_address for x in back)
 
 
 def test_ring_merges_contributions_into_shared_outputs_in_build() -> None:

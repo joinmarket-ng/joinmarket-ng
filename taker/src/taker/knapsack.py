@@ -307,6 +307,52 @@ def plan_pooled_knapsack(
     return PooledPlan(channels=(), plain=tuple(n for n, _ in parties))
 
 
+@dataclass(frozen=True)
+class PooledEdge:
+    """One of a party's ring edges, as relayed to it so it can verify its outputs."""
+
+    partner: str
+    contribution: int
+    shared_address: str
+
+
+@dataclass(frozen=True)
+class PooledSession:
+    """A ring plan resolved to on-chain artifacts the builder and makers consume.
+
+    ``change_outputs`` feeds ``build_coinjoin_tx`` (with ``merge_change_by_address``);
+    ``relay`` tells each party its ring edges (partner, its contribution, the shared
+    funding address) so it can recompute and verify its change went only to outputs it
+    co-controls. ``plain`` lists parties left with an ordinary change output.
+    """
+
+    change_outputs: dict[str, list[tuple[str, int]]]
+    relay: dict[str, list[PooledEdge]]
+    plain: tuple[str, ...]
+
+
+def plan_pooled_session(
+    plan: PooledPlan, address_for_edge: Callable[[str, str], str]
+) -> PooledSession:
+    """Resolve a :class:`PooledPlan` to per-party change pieces and a verification relay.
+
+    ``address_for_edge(party_a, party_b)`` returns the shared 2-of-2 funding address for
+    that ring edge (a MuSig2 P2TR derived from both parties' keys for the on-chain
+    variant, or the LND channel funding address for a real taproot channel). Each party
+    contributes its share to the two edges it sits on; the builder merges the two parties'
+    pieces at each address into one co-funded output.
+    """
+    change_outputs: dict[str, list[tuple[str, int]]] = {}
+    relay: dict[str, list[PooledEdge]] = {}
+    for ch in plan.channels:
+        addr = address_for_edge(ch.party_a, ch.party_b)
+        change_outputs.setdefault(ch.party_a, []).append((addr, ch.contrib_a))
+        change_outputs.setdefault(ch.party_b, []).append((addr, ch.contrib_b))
+        relay.setdefault(ch.party_a, []).append(PooledEdge(ch.party_b, ch.contrib_a, addr))
+        relay.setdefault(ch.party_b, []).append(PooledEdge(ch.party_a, ch.contrib_b, addr))
+    return PooledSession(change_outputs=change_outputs, relay=relay, plain=plan.plain)
+
+
 def assert_maker_to_maker(plan: KnapsackPlan, participants: Iterable[str]) -> None:
     """Raise :class:`ExternalChannelError` unless every channel piece is maker-to-maker.
 
