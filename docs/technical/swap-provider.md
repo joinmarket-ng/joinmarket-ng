@@ -112,23 +112,29 @@ combined variant its piece *amounts* feed `build_coinjoin_tx`'s per-maker
 the maker-to-maker rule with `assert_maker_to_maker`) and the maker-to-maker 2-of-2
 *addresses* come from the channel layer.
 
-#### Runtime protocol wiring (sketch)
+#### Runtime protocol wiring
 
-The planner and the build helper are pure and tested; the remaining work is the
-protocol-message round that carries the pairing at runtime. The intended flow, all
-feature-flagged so non-participating makers fall back to ordinary plain change:
+The planner and build helper are pure and tested, and the protocol-message round
+that carries the pairing at runtime is implemented and feature-flagged (taker
+`combine_channel_as_change`, `combine_mode = "pool" | "knapsack"`, and
+`channelize_taker_change`), so non-participating makers fall back to ordinary plain
+change. The flow:
 
-1. **Advertise.** A knapsack-capable maker adds two fields to its offer (alongside the
-   existing combine signalling): `knapsack_capable` and its Lightning `ln_node`
-   (`node_id@host:port`). A taker that does not understand the fields ignores them; a
-   maker that does not advertise them is treated as plain.
+1. **Advertise.** A knapsack-capable maker (config `knapsack_capable` plus a
+   Lightning `ln_node`) signals the `channel_change` capability in its handshake
+   feature map, which the taker reads from the offer's `features`. The `ln_node`
+   address itself is never broadcast publicly (that would link the maker's nick to
+   its LN identity); it only gates whether the maker emits a per-round funding key in
+   its `!ioauth` response (step 3). A maker that does not signal `channel_change` is
+   treated as plain.
 2. **Plan (after `!ioauth`).** Once the taker knows every maker's UTXOs it computes each
    maker's change and calls `plan_knapsack(makers, denomination=..., allowance=...)`,
    yielding the per-maker pieces and, for each channel piece, the fellow-maker
    counterparty.
-3. **Relay pubkeys.** For each channel piece `(owner, counterparty)` the taker asks each
-   side for a fresh funding pubkey and relays the *counterparty's* pubkey to the owner
-   (and vice versa), exactly as the combined variant relays one pubkey today. Neither
+3. **Relay pubkeys.** Each maker sends a fresh funding pubkey as an optional sixth
+   `!ioauth` field (`cc_pubkey`). For each channel piece `(owner, counterparty)` the
+   taker relays the *counterparty's* pubkey back to the owner in the per-maker `!tx`
+   suffix (and vice versa), exactly as the combined variant relays one pubkey. Neither
    maker learns more than the one pubkey it must co-sign with; the taker never holds
    channel keys.
 4. **Addresses.** Each maker computes its channel pieces' addresses with
