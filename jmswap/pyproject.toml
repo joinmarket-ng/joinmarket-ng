@@ -10,6 +10,8 @@ dependencies = [
     "aiohttp>=3.9.0",
     "websockets>=12.0",
     "coincurve>=21.0.0",
+    "grpcio>=1.60.0",
+    "protobuf>=4.25.0",
 ]
 
 [project.optional-dependencies]
@@ -20,6 +22,7 @@ dev = [
     "pytest-timeout>=2.0.0",
     "mypy>=1.5.0",
     "ruff>=0.1.0",
+    "grpcio-tools>=1.60.0",
 ]
 
 [build-system]
@@ -45,10 +48,16 @@ python_version = "3.11"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true
+exclude = ['src/jmswap/lndrpc/']
+
+[[tool.mypy.overrides]]
+module = "jmswap.lndrpc.*"
+ignore_errors = true
 
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+extend-exclude = ["src/jmswap/lndrpc"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W", "UP", "B", "C4", "SIM"]
