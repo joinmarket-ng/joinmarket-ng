@@ -479,12 +479,21 @@ async def _show_wallet_info(
         )
         raise typer.Exit(2)
 
-    # Load fidelity bond addresses from registry
+    # Report the fidelity bond registry state. Loaded with the legacy
+    # fallback *disabled* so this count matches what
+    # ``wallet.sync_with_registered_bonds()`` (below) actually uses -- that
+    # method always reads the strict per-wallet file. Using the (default)
+    # legacy-fallback-enabled load here would let this log claim bonds that
+    # sync then silently ignores, which is exactly how funded bonds went
+    # missing after the per-wallet registry partition (#492): the legacy
+    # shared file still had entries that were never migrated (pubkey/path
+    # mismatch), so this line kept reporting them as "found" while sync
+    # registered none of them.
     from jmwallet.backends.descriptor_wallet import get_mnemonic_fingerprint
     from jmwallet.wallet.bond_registry import load_registry
 
     wallet_fingerprint = get_mnemonic_fingerprint(mnemonic, bip39_passphrase or "")
-    bond_registry = load_registry(data_dir, wallet_fingerprint)
+    bond_registry = load_registry(data_dir, wallet_fingerprint, allow_legacy_fallback=False)
     fidelity_bond_addresses: list[tuple[str, int, int]] = [
         (bond.address, bond.locktime, bond.index)
         for bond in bond_registry.bonds
@@ -492,6 +501,22 @@ async def _show_wallet_info(
     ]
     if fidelity_bond_addresses:
         logger.info(f"Found {len(fidelity_bond_addresses)} fidelity bond(s) in registry")
+
+    # Surface bonds stuck in the legacy shared file: they display here as
+    # "found" would have, but sync will not use them until they are
+    # migrated (automatic, on WalletService init, if their pubkey matches
+    # this wallet) or manually recovered. This is display-only; it does not
+    # change what gets synced.
+    legacy_registry = load_registry(data_dir, wallet_fingerprint, allow_legacy_fallback=True)
+    unmigrated = len(legacy_registry.bonds) - len(bond_registry.bonds)
+    if unmigrated > 0:
+        logger.warning(
+            f"{unmigrated} bond(s) found only in the legacy shared registry "
+            "(not yet claimed by this wallet); they will not be synced until "
+            "migrated. If they belong to this wallet and are funded, a sync "
+            "still recovers them automatically via canonical derivation; "
+            "otherwise run 'jm-wallet recover-bonds' or 'jm-wallet import-bond'."
+        )
 
     # Create backend
     backend: DescriptorWalletBackend | NeutrinoBackend
