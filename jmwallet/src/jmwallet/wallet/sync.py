@@ -945,22 +945,41 @@ class WalletSyncMixin:
             self._canonical_bond_addresses = mapping
         return self._canonical_bond_addresses
 
-    def _self_register_bond_utxos(self, discovered: list[UTXOInfo]) -> None:
-        """Persist canonically-recognized fidelity bond UTXOs into the registry.
+    def _self_register_bond_utxos(self, bond_utxos: list[UTXOInfo]) -> None:
+        """Persist and refresh recognized fidelity bond UTXOs in the registry.
 
-        ``discovered`` are bond UTXOs that :meth:`sync_with_descriptor_wallet`
-        recognized via :meth:`_canonical_bond_address_map` rather than the
-        bond registry, i.e. Bitcoin Core already tracks them but this
-        wallet's ``fidelity_bonds_<fp>.json`` does not know about them yet.
-        Writing them back means the next sync, ``jm-wallet list-bonds``, and
-        the maker bot see them without the user having to run
-        ``recover-bonds`` or ``import-bond`` again.
+        ``bond_utxos`` are all fidelity bond UTXOs recognized during a sync
+        (whether matched from the registry, the cache, or by canonical
+        derivation). The registry stores a single UTXO per bond, so when an
+        address holds more than one UTXO we must pick one deterministically;
+        we pick the largest, matching the reference implementation,
+        ``recover-bonds`` and ``sync-bonds`` (an address is meant to be funded
+        once and only the biggest UTXO counts as the bond). Choosing by value
+        rather than by scan order is what makes the recorded value stable
+        regardless of the order ``listunspent`` returns the UTXOs. Then:
 
-        Best-effort and non-fatal: a failure here only means this same
-        self-heal is retried on the next sync, never that the (already
-        recognized) UTXO disappears from the current sync's result.
+        * adds a new registry entry when the address is canonically derivable
+          from this wallet's seed but not yet recorded -- so a bond Bitcoin
+          Core already tracks (e.g. from a past ``recover-bonds`` run or a
+          lost/unmigrated registry entry) is self-healed without the user
+          re-running ``recover-bonds`` / ``import-bond``; and
+
+        * refreshes the stored UTXO info (txid/vout/value/confirmations) of an
+          already-registered bond when it no longer matches the chosen UTXO.
+          A registered bond was previously matched via the direct-match path
+          and never reconciled, so whichever UTXO happened to be recorded
+          first (by scan order, or by an older build) stayed frozen in the
+          registry: ``jm-wallet list-bonds`` kept showing that stale UTXO even
+          when a different/larger one was present on-chain. Reconciling here
+          mirrors what the dedicated ``jm-wallet sync-bonds`` command does, so
+          a plain ``info`` sync no longer leaves the registry out of date.
+
+        The registry file is only rewritten when something actually changed,
+        so steady-state syncs do not churn it. Best-effort and non-fatal: a
+        failure here only means the same reconciliation is retried on the next
+        sync, never that a recognized UTXO disappears from the current result.
         """
-        if self.data_dir is None or not discovered:
+        if self.data_dir is None or not bond_utxos:
             return
         try:
             from jmwallet.wallet.bond_registry import (
@@ -976,20 +995,40 @@ class WalletSyncMixin:
             # Multiple UTXOs can land on the same bond address; keep only the
             # largest-value one per address, matching ``recover-bonds``.
             best_by_address: dict[str, UTXOInfo] = {}
-            for utxo in discovered:
+            for utxo in bond_utxos:
                 addr_lower = utxo.address.lower()
                 current = best_by_address.get(addr_lower)
                 if current is None or utxo.value > current.value:
                     best_by_address[addr_lower] = utxo
 
             registered = 0
+            refreshed = 0
             for addr_lower, utxo in best_by_address.items():
-                if registry.get_bond_by_address(utxo.address) is not None:
+                existing = registry.get_bond_by_address(utxo.address)
+                if existing is not None:
+                    # Refresh the stored UTXO info to the current largest UTXO
+                    # at this address; no canonical derivation needed since the
+                    # bond (and its locktime/index) is already recorded. Covers
+                    # external/cold bonds too, exactly like ``sync-bonds``.
+                    if (
+                        existing.txid != utxo.txid
+                        or existing.vout != utxo.vout
+                        or existing.value != utxo.value
+                    ):
+                        registry.update_utxo_info(
+                            address=utxo.address,
+                            txid=utxo.txid,
+                            vout=utxo.vout,
+                            value=utxo.value,
+                            confirmations=utxo.confirmations,
+                        )
+                        refreshed += 1
                     continue
                 canonical = self._canonical_bond_address_map().get(addr_lower)
                 if canonical is None:
                     # Not a canonically-derivable bond (e.g. an external/cold
-                    # bond); those are managed via their own registry flow.
+                    # bond not yet registered); those are managed via their own
+                    # registry flow (cold-wallet commands / recover-bonds).
                     continue
                 locktime, timenumber = canonical
                 key = self.get_fidelity_bond_key(timenumber, locktime)
@@ -1012,14 +1051,15 @@ class WalletSyncMixin:
                 registry.add_bond(bond_info)
                 registered += 1
 
-            if registered:
+            if registered or refreshed:
                 save_registry(registry, self.data_dir, self.wallet_fingerprint)
                 logger.info(
-                    f"Self-registered {registered} fidelity bond address(es), recognized "
-                    "during sync via canonical derivation, into the wallet's bond registry"
+                    f"Reconciled fidelity bond registry during sync: {registered} added "
+                    f"(recognized via canonical derivation), {refreshed} refreshed to the "
+                    "current largest UTXO"
                 )
         except Exception as exc:
-            logger.warning(f"Could not self-register recognized fidelity bond(s): {exc}")
+            logger.warning(f"Could not reconcile recognized fidelity bond(s): {exc}")
 
     # -- Descriptor-based sync (Group D) ------------------------------------
 
@@ -1491,14 +1531,10 @@ class WalletSyncMixin:
         result: dict[int, list[UTXOInfo]] = {md: [] for md in range(self.mixdepth_count)}
         fidelity_bond_utxos: list[UTXOInfo] = []
         # Bond addresses recognized below via canonical timenumber derivation
-        # rather than a registry hit (see ``_canonical_bond_address_map``).
-        # After the loop, every recognized UTXO on these addresses is
-        # persisted into the registry (keeping the largest per address) so
-        # the bonds are not lost again on the next sync. A *set of addresses*
-        # (not a list of the specific canonical-branch UTXOs) is tracked so a
-        # second UTXO on the same address -- recognized via the cache path
-        # once the first populated the cache -- is still considered for
-        # registration and the largest value wins.
+        # (see ``_canonical_bond_address_map``). Tracked only to log the
+        # recognition once per address rather than once per UTXO (a bond
+        # address can hold several UTXOs). Registry reconciliation itself is
+        # driven off ``fidelity_bond_utxos`` after the loop.
         canonically_recognized_bond_addresses: set[str] = set()
         unknown_p2wsh_count = 0
 
@@ -1701,20 +1737,17 @@ class WalletSyncMixin:
         if fidelity_bond_utxos:
             result[0].extend(fidelity_bond_utxos)
 
-        # Persist bonds recognized above via canonical derivation (not a
-        # registry hit) so they are not dropped again on the next sync. Pass
-        # every recognized UTXO on those addresses -- including a second UTXO
-        # on the same address that was matched via the cache path once the
-        # first populated the cache -- so ``_self_register_bond_utxos`` can
-        # keep the largest value per address (matching ``recover-bonds``).
-        if canonically_recognized_bond_addresses:
-            self._self_register_bond_utxos(
-                [
-                    u
-                    for u in fidelity_bond_utxos
-                    if u.address.lower() in canonically_recognized_bond_addresses
-                ]
-            )
+        # Reconcile the bond registry with what this sync recognized: add
+        # canonically-derived bonds that Core tracks but the registry lacks,
+        # and refresh the stored UTXO info of already-registered bonds so a
+        # bond that was recorded from an arbitrary earlier UTXO (by scan order)
+        # is not left showing a stale value in list-bonds. Feed every
+        # recognized bond UTXO (registry-matched, cache-matched, and canonical)
+        # so an address with several UTXOs is reconciled to a single
+        # deterministic one. ``_self_register_bond_utxos`` writes only when
+        # something changed.
+        if fidelity_bond_utxos:
+            self._self_register_bond_utxos(fidelity_bond_utxos)
 
         # Update cache
         self.utxo_cache = result

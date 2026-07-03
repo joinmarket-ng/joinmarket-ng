@@ -367,6 +367,121 @@ async def test_sync_self_registers_all_recognized_bonds_and_max_utxo(
 
 
 @pytest.mark.asyncio
+async def test_sync_refreshes_registered_bond_to_largest_utxo(tmp_path: Path) -> None:
+    """An already-registered bond's stored value must be refreshed to the
+    current largest UTXO when a second, larger UTXO is on the same address.
+
+    Reproduces the reported bug: the bond was first recorded from a 10k UTXO;
+    a larger 20k UTXO later landed on the same address, but a plain ``info``
+    sync (which matches the bond via the registry direct-match path, not the
+    canonical path) never updated the registry, so ``list-bonds`` kept showing
+    10k. The registered-bond UTXO info must be refreshed to the largest UTXO,
+    like ``jm-wallet sync-bonds`` already does.
+    """
+    from jmcore.timenumber import timenumber_to_timestamp
+
+    from jmwallet.wallet.bond_registry import load_registry
+
+    reference = _make_wallet(tmp_path / "reference")
+    timenumber = 78
+    locktime = timenumber_to_timestamp(timenumber)
+    bond_address = reference.get_fidelity_bond_address(timenumber, locktime)
+
+    ws = _make_wallet(tmp_path)
+    # Pre-register the bond with a stale, smaller UTXO (10k).
+    registry = BondRegistry()
+    registry.add_bond(
+        FidelityBondInfo(
+            address=bond_address,
+            locktime=locktime,
+            locktime_human="2026-07-01 00:00:00",
+            index=timenumber,
+            path=f"m/84'/1'/0'/2/{timenumber}",
+            pubkey="02" + "00" * 32,
+            witness_script_hex="00" * 50,
+            network="regtest",
+            created_at="2025-01-01T00:00:00",
+            txid="dd" * 32,
+            vout=0,
+            value=10_000,
+            confirmations=5,
+        )
+    )
+    save_registry(registry, ws.data_dir, ws.wallet_fingerprint)
+
+    # Two UTXOs on the same address: the stale 10k and a larger 20k.
+    utxos = [
+        UTXO("dd" * 32, 0, 10_000, bond_address, 5, "0020" + "11" * 32),
+        UTXO("ee" * 32, 1, 20_000, bond_address, 5, "0020" + "11" * 32),
+    ]
+    ws.backend.get_all_utxos = AsyncMock(return_value=utxos)  # type: ignore[method-assign]
+
+    # Registered-bond direct-match path (the bond is in the registry).
+    result = await ws.sync_with_descriptor_wallet([(bond_address, locktime, timenumber)])
+
+    # Both UTXOs are recognized as fidelity bonds.
+    bond_utxos = [u for u in result.get(0, []) if u.is_fidelity_bond]
+    assert len(bond_utxos) == 2
+
+    # The registry entry is refreshed to the largest UTXO (20k), not the stale 10k.
+    reg = load_registry(ws.data_dir, ws.wallet_fingerprint, allow_legacy_fallback=False)
+    bond = reg.get_bond_by_address(bond_address)
+    assert bond is not None
+    assert bond.value == 20_000
+    assert bond.txid == "ee" * 32
+    assert bond.vout == 1
+
+
+@pytest.mark.asyncio
+async def test_sync_does_not_rewrite_registry_when_bond_unchanged(tmp_path: Path) -> None:
+    """A steady-state sync must not rewrite the registry file when the stored
+    bond already matches the largest on-chain UTXO (avoids needless churn)."""
+    from jmcore.timenumber import timenumber_to_timestamp
+
+    from jmwallet.wallet.bond_registry import get_registry_path, load_registry
+
+    reference = _make_wallet(tmp_path / "reference")
+    timenumber = 78
+    locktime = timenumber_to_timestamp(timenumber)
+    bond_address = reference.get_fidelity_bond_address(timenumber, locktime)
+
+    ws = _make_wallet(tmp_path)
+    registry = BondRegistry()
+    registry.add_bond(
+        FidelityBondInfo(
+            address=bond_address,
+            locktime=locktime,
+            locktime_human="2026-07-01 00:00:00",
+            index=timenumber,
+            path=f"m/84'/1'/0'/2/{timenumber}",
+            pubkey="02" + "00" * 32,
+            witness_script_hex="00" * 50,
+            network="regtest",
+            created_at="2025-01-01T00:00:00",
+            txid="ee" * 32,
+            vout=1,
+            value=20_000,
+            confirmations=5,
+        )
+    )
+    save_registry(registry, ws.data_dir, ws.wallet_fingerprint)
+
+    registry_path = get_registry_path(ws.data_dir, ws.wallet_fingerprint)
+    mtime_before = registry_path.stat().st_mtime_ns
+
+    utxos = [UTXO("ee" * 32, 1, 20_000, bond_address, 5, "0020" + "11" * 32)]
+    ws.backend.get_all_utxos = AsyncMock(return_value=utxos)  # type: ignore[method-assign]
+
+    await ws.sync_with_descriptor_wallet([(bond_address, locktime, timenumber)])
+
+    # Nothing changed, so the file must not have been rewritten.
+    assert registry_path.stat().st_mtime_ns == mtime_before
+    reg = load_registry(ws.data_dir, ws.wallet_fingerprint, allow_legacy_fallback=False)
+    bond = reg.get_bond_by_address(bond_address)
+    assert bond is not None and bond.value == 20_000
+
+
+@pytest.mark.asyncio
 async def test_sync_ignores_unrelated_p2wsh_utxo(tmp_path: Path) -> None:
     """A P2WSH UTXO that is not one of this wallet's canonical bond
     addresses must still be skipped (not misattributed as a bond)."""
