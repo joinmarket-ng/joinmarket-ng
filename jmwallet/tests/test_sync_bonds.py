@@ -113,6 +113,57 @@ async def test_sync_bonds_updates_registry_with_funded_utxo() -> None:
 
 
 @pytest.mark.asyncio
+async def test_sync_bonds_records_extra_utxos_on_same_address() -> None:
+    """sync-bonds must record every UTXO at a bond address: the largest as the
+    announced bond and the rest as locked extras (so list-bonds can show them)."""
+    registry = _registry_with_unfunded_bond()
+
+    wallet = MagicMock()
+    wallet.wallet_fingerprint = "deadbeef"
+    wallet.sync_with_registered_bonds = AsyncMock()
+    wallet.close = AsyncMock()
+    # Two UTXOs on the same bond address (10k seen first, then 20k).
+    wallet.utxo_cache = {
+        0: [
+            SimpleNamespace(
+                address=BOND_ADDRESS, txid="aa" * 32, vout=0, value=10_000, confirmations=5
+            ),
+            SimpleNamespace(
+                address=BOND_ADDRESS, txid="bb" * 32, vout=1, value=20_000, confirmations=5
+            ),
+        ]
+    }
+
+    backend = MagicMock()
+    backend.create_wallet = AsyncMock()
+
+    with (
+        patch(
+            "jmwallet.backends.descriptor_wallet.DescriptorWalletBackend",
+            return_value=backend,
+        ),
+        patch("jmwallet.backends.descriptor_wallet.generate_wallet_name", return_value="w"),
+        patch(
+            "jmwallet.backends.descriptor_wallet.get_mnemonic_fingerprint",
+            return_value="deadbeef",
+        ),
+        patch("jmwallet.wallet.service.WalletService", return_value=wallet),
+        patch("jmwallet.wallet.bond_registry.load_registry", return_value=registry),
+        patch("jmwallet.wallet.bond_registry.save_registry"),
+    ):
+        await _sync_bonds_async(MNEMONIC, _backend_settings())
+
+    bond = registry.get_bond_by_address(BOND_ADDRESS)
+    assert bond is not None
+    # Announced bond is the largest UTXO (order-independent).
+    assert bond.value == 20_000
+    assert bond.txid == "bb" * 32
+    # The smaller UTXO is preserved as a locked extra.
+    assert [(u.txid, u.value) for u in bond.extra_utxos] == [("aa" * 32, 10_000)]
+    assert bond.total_locked_value == 30_000
+
+
+@pytest.mark.asyncio
 async def test_sync_bonds_no_bonds_in_registry_does_not_sync() -> None:
     wallet = MagicMock()
     wallet.wallet_fingerprint = "deadbeef"

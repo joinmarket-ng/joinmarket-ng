@@ -22,6 +22,21 @@ if TYPE_CHECKING:
     from jmwallet.wallet.bip32 import HDKey
 
 
+class BondUtxo(BaseModel):
+    """A single UTXO sitting at a fidelity bond address.
+
+    Used to record UTXOs *beyond* the announced (largest) bond UTXO. A
+    fidelity bond is a single UTXO; coins sent to the same address more than
+    once are locked by the timelock but do NOT increase the bond value, so
+    they are tracked separately for visibility rather than as bonds.
+    """
+
+    txid: str
+    vout: int
+    value: int  # in satoshis
+    confirmations: int
+
+
 class FidelityBondInfo(BaseModel):
     """Information about a single fidelity bond."""
 
@@ -34,11 +49,20 @@ class FidelityBondInfo(BaseModel):
     witness_script_hex: str
     network: str
     created_at: str
-    # UTXO info (populated when bond is funded)
+    # UTXO info (populated when bond is funded). ``txid``/``vout``/``value``
+    # describe the single announced bond UTXO -- the largest one at the
+    # address, matching the reference implementation (only the biggest UTXO
+    # counts as the bond).
     txid: str | None = None
     vout: int | None = None
     value: int | None = None  # in satoshis
     confirmations: int | None = None
+    # Additional UTXOs present at this bond address beyond the announced one
+    # above. These are locked by the same timelock but do NOT add to the bond
+    # value; they are tracked so offline views (``jm-wallet list-bonds``) can
+    # surface locked coins the user may otherwise think are lost. Defaults to
+    # an empty list so registries written by older builds load unchanged.
+    extra_utxos: list[BondUtxo] = []
     # Certificate info (for cold wallet support)
     # Allows keeping bond UTXO private key in cold storage (hardware wallet)
     # while using a hot wallet certificate key for signing nick proofs
@@ -51,6 +75,16 @@ class FidelityBondInfo(BaseModel):
     def is_funded(self) -> bool:
         """Check if this bond has been funded."""
         return self.txid is not None and self.value is not None and self.value > 0
+
+    @property
+    def total_locked_value(self) -> int:
+        """Total sats locked at this bond address (announced UTXO + extras).
+
+        The announced bond value is :attr:`value` (the largest UTXO); this
+        includes the additional locked UTXOs recorded in :attr:`extra_utxos`
+        so callers can show the user everything held at the address.
+        """
+        return (self.value or 0) + sum(u.value for u in self.extra_utxos)
 
     @property
     def is_expired(self) -> bool:
@@ -159,15 +193,48 @@ class BondRegistry(BaseModel):
         value: int,
         confirmations: int,
     ) -> bool:
-        """Update UTXO information for a bond."""
+        """Update the announced UTXO information for a bond.
+
+        Sets only the single announced bond UTXO and clears any recorded
+        extras. Prefer :meth:`set_bond_utxos` when the full set of UTXOs at
+        the address is known so additional locked coins are preserved.
+        """
         bond = self.get_bond_by_address(address)
         if bond:
             bond.txid = txid
             bond.vout = vout
             bond.value = value
             bond.confirmations = confirmations
+            bond.extra_utxos = []
             return True
         return False
+
+    def set_bond_utxos(self, address: str, utxos: list[BondUtxo]) -> bool:
+        """Record every UTXO at a bond address, splitting announced vs extra.
+
+        The largest-value UTXO becomes the announced bond
+        (``txid``/``vout``/``value``/``confirmations``), matching the
+        reference implementation (a bond is a single UTXO; only the biggest
+        counts). Any remaining UTXOs at the address are stored in
+        :attr:`FidelityBondInfo.extra_utxos` so offline views can surface
+        coins locked at the address that do not add to the bond value.
+
+        Selecting the announced UTXO by value (not by scan order) keeps the
+        recorded bond stable regardless of the order UTXOs are supplied.
+
+        Returns ``True`` when the bond exists and ``utxos`` is non-empty.
+        """
+        bond = self.get_bond_by_address(address)
+        if bond is None or not utxos:
+            return False
+        ordered = sorted(utxos, key=lambda u: u.value, reverse=True)
+        main = ordered[0]
+        bond.txid = main.txid
+        bond.vout = main.vout
+        bond.value = main.value
+        bond.confirmations = main.confirmations
+        bond.extra_utxos = list(ordered[1:])
+        return True
 
 
 LEGACY_REGISTRY_FILENAME = "fidelity_bonds.json"

@@ -54,6 +54,22 @@ def _make_utxo_info(
     )
 
 
+def _bond_utxo_signature(bond: Any) -> tuple[Any, ...]:
+    """Return a comparable snapshot of a bond's UTXO state (announced + extras).
+
+    Used to decide whether reconciling a registered bond during sync actually
+    changed anything, so a steady-state sync does not rewrite the registry
+    file. Ignores confirmations (they drift every block and are not
+    identity-relevant for this purpose).
+    """
+    return (
+        bond.txid,
+        bond.vout,
+        bond.value,
+        tuple(sorted((u.txid, u.vout, u.value) for u in bond.extra_utxos)),
+    )
+
+
 class WalletSyncMixin:
     """Mixin providing wallet synchronization capabilities.
 
@@ -983,6 +999,7 @@ class WalletSyncMixin:
             return
         try:
             from jmwallet.wallet.bond_registry import (
+                BondUtxo,
                 create_bond_info,
                 load_registry,
                 save_registry,
@@ -992,36 +1009,37 @@ class WalletSyncMixin:
                 self.data_dir, self.wallet_fingerprint, allow_legacy_fallback=False
             )
 
-            # Multiple UTXOs can land on the same bond address; keep only the
-            # largest-value one per address, matching ``recover-bonds``.
-            best_by_address: dict[str, UTXOInfo] = {}
+            # Group every recognized UTXO by bond address. The registry keeps
+            # the largest as the announced bond and the rest as ``extra_utxos``
+            # (locked, but not part of the bond); ``set_bond_utxos`` does that
+            # split. Grouping all UTXOs (not just the largest) is what lets a
+            # second UTXO on the same address be surfaced by ``list-bonds``.
+            utxos_by_address: dict[str, list[BondUtxo]] = {}
             for utxo in bond_utxos:
-                addr_lower = utxo.address.lower()
-                current = best_by_address.get(addr_lower)
-                if current is None or utxo.value > current.value:
-                    best_by_address[addr_lower] = utxo
+                utxos_by_address.setdefault(utxo.address, []).append(
+                    BondUtxo(
+                        txid=utxo.txid,
+                        vout=utxo.vout,
+                        value=utxo.value,
+                        confirmations=utxo.confirmations,
+                    )
+                )
 
             registered = 0
             refreshed = 0
-            for addr_lower, utxo in best_by_address.items():
-                existing = registry.get_bond_by_address(utxo.address)
+            for address, addr_utxos in utxos_by_address.items():
+                addr_lower = address.lower()
+                existing = registry.get_bond_by_address(address)
                 if existing is not None:
-                    # Refresh the stored UTXO info to the current largest UTXO
-                    # at this address; no canonical derivation needed since the
-                    # bond (and its locktime/index) is already recorded. Covers
-                    # external/cold bonds too, exactly like ``sync-bonds``.
-                    if (
-                        existing.txid != utxo.txid
-                        or existing.vout != utxo.vout
-                        or existing.value != utxo.value
-                    ):
-                        registry.update_utxo_info(
-                            address=utxo.address,
-                            txid=utxo.txid,
-                            vout=utxo.vout,
-                            value=utxo.value,
-                            confirmations=utxo.confirmations,
-                        )
+                    # Refresh the stored UTXO set (announced + extras) to what
+                    # this sync sees; no canonical derivation needed since the
+                    # bond is already recorded. Covers external/cold bonds too,
+                    # exactly like ``sync-bonds``. Only counts as a change when
+                    # the resulting UTXO state actually differs, so steady-state
+                    # syncs do not rewrite the registry file.
+                    before = _bond_utxo_signature(existing)
+                    registry.set_bond_utxos(address, addr_utxos)
+                    if _bond_utxo_signature(existing) != before:
                         refreshed += 1
                     continue
                 canonical = self._canonical_bond_address_map().get(addr_lower)
@@ -1036,7 +1054,7 @@ class WalletSyncMixin:
                 witness_script = self.get_fidelity_bond_script(timenumber, locktime)
                 path = f"{self.root_path}/0'/{FIDELITY_BOND_BRANCH}/{timenumber}"
                 bond_info = create_bond_info(
-                    address=utxo.address,
+                    address=address,
                     locktime=locktime,
                     index=timenumber,
                     path=path,
@@ -1044,11 +1062,8 @@ class WalletSyncMixin:
                     witness_script=witness_script,
                     network=self.network,
                 )
-                bond_info.txid = utxo.txid
-                bond_info.vout = utxo.vout
-                bond_info.value = utxo.value
-                bond_info.confirmations = utxo.confirmations
                 registry.add_bond(bond_info)
+                registry.set_bond_utxos(address, addr_utxos)
                 registered += 1
 
             if registered or refreshed:
@@ -1056,7 +1071,7 @@ class WalletSyncMixin:
                 logger.info(
                     f"Reconciled fidelity bond registry during sync: {registered} added "
                     f"(recognized via canonical derivation), {refreshed} refreshed to the "
-                    "current largest UTXO"
+                    "current UTXO set"
                 )
         except Exception as exc:
             logger.warning(f"Could not reconcile recognized fidelity bond(s): {exc}")

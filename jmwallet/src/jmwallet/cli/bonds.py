@@ -8,7 +8,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated
 
 import typer
 from jmcore.cli_common import (
@@ -192,6 +192,18 @@ def _list_bonds_offline(
             f"{bond.address:<64} {bond.locktime_human:<20} {status:<15} "
             f"{value_str:>15} {bond.index:>6}"
         )
+        # Surface additional UTXOs locked at the same bond address. A bond is
+        # a single UTXO (the largest, shown above); coins sent to the address
+        # again are locked but do not increase the bond value. Showing them
+        # here keeps offline ``list-bonds`` consistent with ``info --extended``
+        # so the user does not think these coins are lost.
+        for extra in bond.extra_utxos:
+            print(
+                f"  + extra locked UTXO (not part of bond): {extra.value:,} sats "
+                f"[{extra.txid}:{extra.vout}]"
+            )
+        if bond.extra_utxos:
+            print(f"  = {bond.total_locked_value:,} sats locked total at this address")
 
     print("=" * 120)
 
@@ -792,26 +804,29 @@ async def _sync_bonds_async(
         # fidelity bond shown as locked with 0 sats).
         await wallet.sync_with_registered_bonds()
 
-        # Map each bond address to its highest-value UTXO. Per the reference
-        # implementation only the single largest UTXO at an address is used.
-        best_utxo_by_address: dict[str, Any] = {}
+        # Group every UTXO by bond address. The largest is the announced bond;
+        # any others at the same address are locked but do not add to the bond
+        # value, so they are recorded as extras for visibility (a bond is a
+        # single UTXO per the reference implementation).
+        from jmwallet.wallet.bond_registry import BondUtxo
+
+        utxos_by_address: dict[str, list[BondUtxo]] = {}
         for utxos_list in wallet.utxo_cache.values():
             for utxo in utxos_list:
-                current = best_utxo_by_address.get(utxo.address)
-                if current is None or utxo.value > current.value:
-                    best_utxo_by_address[utxo.address] = utxo
+                utxos_by_address.setdefault(utxo.address, []).append(
+                    BondUtxo(
+                        txid=utxo.txid,
+                        vout=utxo.vout,
+                        value=utxo.value,
+                        confirmations=utxo.confirmations,
+                    )
+                )
 
         funded = 0
         for bond in network_bonds:
-            bond_utxo = best_utxo_by_address.get(bond.address)
-            if bond_utxo is not None:
-                registry.update_utxo_info(
-                    address=bond.address,
-                    txid=bond_utxo.txid,
-                    vout=bond_utxo.vout,
-                    value=bond_utxo.value,
-                    confirmations=bond_utxo.confirmations,
-                )
+            addr_utxos = utxos_by_address.get(bond.address)
+            if addr_utxos:
+                registry.set_bond_utxos(bond.address, addr_utxos)
                 funded += 1
 
         save_registry(registry, data_dir, wallet.wallet_fingerprint)
@@ -820,8 +835,17 @@ async def _sync_bonds_async(
         print(f"Funded bonds:   {funded}")
         print(f"Unfunded bonds: {len(network_bonds) - funded}")
         for bond in sorted(network_bonds, key=lambda b: b.locktime):
-            bond_utxo = best_utxo_by_address.get(bond.address)
-            status = format_amount(bond_utxo.value) if bond_utxo is not None else "UNFUNDED"
+            addr_utxos = utxos_by_address.get(bond.address)
+            if not addr_utxos:
+                status = "UNFUNDED"
+            else:
+                largest = max(u.value for u in addr_utxos)
+                status = format_amount(largest)
+                if len(addr_utxos) > 1:
+                    total = sum(u.value for u in addr_utxos)
+                    status += (
+                        f" (+{len(addr_utxos) - 1} extra UTXO(s), {format_amount(total)} locked)"
+                    )
             print(f"  {bond.address}  {status}")
         print("-" * 60)
         print(f"Registry updated: {get_registry_path(data_dir, wallet.wallet_fingerprint)}")
@@ -936,6 +960,7 @@ async def _recover_bonds_async(
     )
     from jmwallet.backends.neutrino import NeutrinoBackend
     from jmwallet.wallet.bond_registry import (
+        BondUtxo,
         create_bond_info,
         get_registry_path,
         load_registry,
@@ -1044,6 +1069,17 @@ async def _recover_bonds_async(
         for address, addr_utxos in utxos_by_address.items():
             # Pick the largest UTXO by value
             best_utxo = max(addr_utxos, key=lambda u: u.value)
+            # Every UTXO at the address: the largest becomes the announced
+            # bond, the rest are recorded as locked extras (see set_bond_utxos).
+            bond_utxos = [
+                BondUtxo(
+                    txid=u.txid,
+                    vout=u.vout,
+                    value=u.value,
+                    confirmations=u.confirmations,
+                )
+                for u in addr_utxos
+            ]
 
             # Extract timenumber and locktime from path
             # Path format: m/84'/coin'/0'/2/timenumber:locktime
@@ -1075,14 +1111,8 @@ async def _recover_bonds_async(
             # Check if already in registry
             existing = registry.get_bond_by_address(address)
             if existing:
-                # Update UTXO info with the largest UTXO
-                registry.update_utxo_info(
-                    address=address,
-                    txid=best_utxo.txid,
-                    vout=best_utxo.vout,
-                    value=best_utxo.value,
-                    confirmations=best_utxo.confirmations,
-                )
+                # Refresh UTXO info (announced largest + locked extras).
+                registry.set_bond_utxos(address, bond_utxos)
             else:
                 # Add new bond to registry
                 key = wallet.get_fidelity_bond_key(idx, locktime)
@@ -1102,13 +1132,9 @@ async def _recover_bonds_async(
                     witness_script=witness_script,
                     network=backend_settings.network,
                 )
-                # Set UTXO info
-                bond_info.txid = best_utxo.txid
-                bond_info.vout = best_utxo.vout
-                bond_info.value = best_utxo.value
-                bond_info.confirmations = best_utxo.confirmations
-
                 registry.add_bond(bond_info)
+                # Set UTXO info (announced largest + locked extras).
+                registry.set_bond_utxos(address, bond_utxos)
                 new_bonds += 1
 
         # Save registry

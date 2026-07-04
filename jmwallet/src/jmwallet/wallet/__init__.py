@@ -5,6 +5,7 @@ Wallet functionality for JoinMarket.
 from jmwallet.wallet.bip32 import HDKey
 from jmwallet.wallet.bond_registry import (
     BondRegistry,
+    BondUtxo,
     FidelityBondInfo,
     create_bond_info,
     load_registry,
@@ -21,6 +22,7 @@ __all__ = [
     "UTXOInfo",
     "CoinSelection",
     "BondRegistry",
+    "BondUtxo",
     "FidelityBondInfo",
     "create_bond_info",
     "load_registry",

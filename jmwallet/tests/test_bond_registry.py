@@ -568,6 +568,82 @@ class TestMultiUtxoHandling:
         assert registry.bonds[0].txid == "tx_second"
         assert registry.bonds[0].value == 300_000
 
+    def test_set_bond_utxos_splits_announced_and_extras(self) -> None:
+        """set_bond_utxos records the largest as the bond and the rest as extras."""
+        from jmwallet.wallet.bond_registry import BondUtxo
+
+        registry = BondRegistry()
+        registry.add_bond(self._create_bond(address="bc1qmulti"))
+
+        # Supplied out of value order to prove selection is by value, not order.
+        result = registry.set_bond_utxos(
+            "bc1qmulti",
+            [
+                BondUtxo(txid="tx_small", vout=0, value=10_000, confirmations=5),
+                BondUtxo(txid="tx_large", vout=1, value=20_000, confirmations=5),
+            ],
+        )
+        assert result is True
+
+        bond = registry.get_bond_by_address("bc1qmulti")
+        assert bond is not None
+        # Announced bond is the largest UTXO.
+        assert bond.txid == "tx_large"
+        assert bond.vout == 1
+        assert bond.value == 20_000
+        # The smaller UTXO is retained as a locked extra.
+        assert [(u.txid, u.value) for u in bond.extra_utxos] == [("tx_small", 10_000)]
+        assert bond.total_locked_value == 30_000
+
+    def test_set_bond_utxos_single_utxo_has_no_extras(self) -> None:
+        from jmwallet.wallet.bond_registry import BondUtxo
+
+        registry = BondRegistry()
+        registry.add_bond(self._create_bond(address="bc1qsingle"))
+        registry.set_bond_utxos(
+            "bc1qsingle",
+            [BondUtxo(txid="tx", vout=0, value=42_000, confirmations=3)],
+        )
+        bond = registry.get_bond_by_address("bc1qsingle")
+        assert bond is not None
+        assert bond.value == 42_000
+        assert bond.extra_utxos == []
+        assert bond.total_locked_value == 42_000
+
+    def test_set_bond_utxos_unknown_address_returns_false(self) -> None:
+        from jmwallet.wallet.bond_registry import BondUtxo
+
+        registry = BondRegistry()
+        assert (
+            registry.set_bond_utxos(
+                "bc1qmissing",
+                [BondUtxo(txid="tx", vout=0, value=1, confirmations=0)],
+            )
+            is False
+        )
+
+    def test_update_utxo_info_clears_extras(self) -> None:
+        """update_utxo_info sets only the announced UTXO and drops any extras."""
+        from jmwallet.wallet.bond_registry import BondUtxo
+
+        registry = BondRegistry()
+        registry.add_bond(self._create_bond(address="bc1qclears"))
+        registry.set_bond_utxos(
+            "bc1qclears",
+            [
+                BondUtxo(txid="tx_large", vout=0, value=20_000, confirmations=5),
+                BondUtxo(txid="tx_small", vout=1, value=10_000, confirmations=5),
+            ],
+        )
+        assert registry.get_bond_by_address("bc1qclears").extra_utxos  # sanity
+
+        registry.update_utxo_info(
+            address="bc1qclears", txid="tx_large", vout=0, value=20_000, confirmations=6
+        )
+        bond = registry.get_bond_by_address("bc1qclears")
+        assert bond is not None
+        assert bond.extra_utxos == []
+
 
 class TestLocktimeFunctions:
     """Tests for locktime discovery functions."""

@@ -116,8 +116,16 @@ that will operate the bond; the 8-char hex value is printed on the
 
 Stores bond metadata including:
 - Address, locktime, derivation path
-- UTXO info (txid, vout, value, confirmations)
+- UTXO info of the announced bond: the single largest UTXO at the address
+  (txid, vout, value, confirmations)
+- Any additional UTXOs locked at the same address (`extra_utxos`)
 - Certificate fields for cold storage bonds
+
+A fidelity bond is a single UTXO. Only the largest UTXO at a bond address is
+announced as the bond; sending coins to the address again does not increase
+the bond value. Those extra UTXOs are still recorded (and shown by
+`list-bonds` and `info --extended`) so the locked coins are not invisible,
+but they are clearly marked as not part of the bond.
 
 Entries are not only written by `generate-bond-address`, `import-bond`, and
 `recover-bonds`: a descriptor-wallet sync also self-registers any bond UTXO

@@ -358,8 +358,12 @@ async def test_sync_self_registers_all_recognized_bonds_and_max_utxo(
     reg = load_registry(ws.data_dir, ws.wallet_fingerprint, allow_legacy_fallback=False)
     bond_a = reg.get_bond_by_address(addr_a)
     assert bond_a is not None and bond_a.value == 20_000
+    # The smaller UTXO on addr_a is kept as a locked extra, not discarded.
+    assert [u.value for u in bond_a.extra_utxos] == [10_000]
+    assert bond_a.total_locked_value == 30_000
     bond_b = reg.get_bond_by_address(addr_b)
     assert bond_b is not None and bond_b.value == 5_000
+    assert bond_b.extra_utxos == []
 
     # Caches hold only the two recognized bonds, never all 960 timenumbers.
     assert set(ws.fidelity_bond_locktime_cache) == {addr_a.lower(), addr_b.lower()}
@@ -430,6 +434,9 @@ async def test_sync_refreshes_registered_bond_to_largest_utxo(tmp_path: Path) ->
     assert bond.value == 20_000
     assert bond.txid == "ee" * 32
     assert bond.vout == 1
+    # The smaller UTXO (10k) is preserved as a locked extra, not dropped.
+    assert [u.value for u in bond.extra_utxos] == [10_000]
+    assert bond.total_locked_value == 30_000
 
 
 @pytest.mark.asyncio
