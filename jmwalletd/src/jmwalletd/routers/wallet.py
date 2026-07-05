@@ -144,12 +144,16 @@ async def get_session(
         except pyjwt.InvalidTokenError as exc:
             raise InvalidToken(str(exc)) from exc
 
+    # Bitcoin Core is the source of truth for rescan state: the in-memory
+    # flag can go stale while Core keeps scanning server-side (issue #551).
+    rescanning, _progress = await state.live_rescan_status()
+
     resp = SessionResponse(
         session=state.wallet_loaded,
         maker_running=state.maker_running,
         coinjoin_in_process=state.taker_running,
         wallet_name=state.wallet_name if state.wallet_loaded else "",
-        rescanning=state.rescanning,
+        rescanning=rescanning,
     )
 
     # Populate extra fields only when authenticated.

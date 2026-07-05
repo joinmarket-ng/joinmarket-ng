@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import calendar
 import datetime
 from typing import Any
@@ -72,7 +73,8 @@ async def wallet_display(
 ) -> WalletDisplayResponse:
     """Return full wallet display with accounts, branches, and entries."""
     ws = state.wallet_service
-    if not state.rescanning:
+    rescanning, _progress = await state.live_rescan_status()
+    if not rescanning:
         await ws.sync_with_registered_bonds()
 
     # Load history data so address statuses (cj-out, change, etc.) are
@@ -161,7 +163,8 @@ async def list_utxos(
 ) -> ListUtxosResponse:
     """List all UTXOs in the wallet."""
     ws = state.wallet_service
-    if not state.rescanning:
+    rescanning, _progress = await state.live_rescan_status()
+    if not rescanning:
         await ws.sync_with_registered_bonds()
     utxo_entries: list[UTXOEntry] = []
 
@@ -515,6 +518,45 @@ async def config_set(
 # ---------------------------------------------------------------------------
 # GET /api/v1/wallet/{walletname}/rescanblockchain/{blockheight}
 # ---------------------------------------------------------------------------
+async def _run_rescan(state: DaemonState, blockheight: int) -> None:
+    """Drive a blockchain rescan and keep daemon-side progress up to date.
+
+    Uses the non-blocking ``start_background_rescan`` (the scan runs inside
+    Bitcoin Core) and then polls ``getwalletinfo.scanning`` via
+    ``wait_for_rescan_complete``, mirroring the ``jm-wallet rescan`` CLI.
+    If Core is already rescanning (e.g. after wallet recovery), the existing
+    scan is tracked instead of surfacing RPC error -4.
+    """
+    ws = state.wallet_service
+    backend = ws.backend
+
+    def _on_progress(progress: float) -> None:
+        state.rescan_progress = progress
+
+    try:
+        already = None
+        if hasattr(backend, "get_rescan_status"):
+            already = await backend.get_rescan_status()
+
+        if already is not None and already.get("in_progress"):
+            logger.info("Bitcoin Core is already rescanning; tracking the existing scan")
+            await backend.wait_for_rescan_complete(progress_callback=_on_progress)
+        elif hasattr(backend, "start_background_rescan"):
+            completed = await backend.start_background_rescan(blockheight)
+            if not completed:
+                await backend.wait_for_rescan_complete(progress_callback=_on_progress)
+        else:
+            await backend.rescan_blockchain(blockheight)
+    except Exception:
+        logger.exception("Rescan failed")
+    finally:
+        state.rescanning = False
+        state.rescan_progress = 0.0
+        # A rescan can surface coins the wallet had never seen; allow the
+        # next sync to re-run import-label reconstruction over them.
+        ws._imported_labels_scanned = False
+
+
 @router.get("/wallet/{walletname}/rescanblockchain/{blockheight}", operation_id="rescanblockchain")
 async def rescan_blockchain(
     walletname: str,
@@ -524,30 +566,18 @@ async def rescan_blockchain(
     state: DaemonState = Depends(get_daemon_state),
 ) -> RescanBlockchainResponse:
     """Trigger a blockchain rescan from the given block height."""
-    import asyncio
+    backend = state.wallet_service.backend
 
-    ws = state.wallet_service
-    backend = ws.backend
-
-    # rescan_blockchain is only available on DescriptorWalletBackend.
-    if not hasattr(backend, "rescan_blockchain"):
+    # Rescan support is only available on DescriptorWalletBackend.
+    if not (hasattr(backend, "start_background_rescan") or hasattr(backend, "rescan_blockchain")):
         raise ActionNotAllowed("Rescan not supported by the current backend.")
 
     state.rescanning = True
     state.rescan_progress = 0.0
 
-    async def _do_rescan() -> None:
-        try:
-            await backend.rescan_blockchain(blockheight)
-        except Exception:
-            logger.exception("Rescan failed")
-        finally:
-            state.rescanning = False
-            # A rescan can surface coins the wallet had never seen; allow the
-            # next sync to re-run import-label reconstruction over them.
-            ws._imported_labels_scanned = False
-
-    asyncio.create_task(_do_rescan())
+    # Keep a reference so the task is not garbage-collected mid-flight and
+    # can be cancelled on wallet lock.
+    state._rescan_task = asyncio.create_task(_run_rescan(state, blockheight))
     return RescanBlockchainResponse(walletname=walletname)
 
 
@@ -561,9 +591,10 @@ async def get_rescan_info(
     _wallet: None = Depends(require_wallet_match),
     state: DaemonState = Depends(get_daemon_state),
 ) -> RescanInfoResponse:
-    """Get rescan progress information."""
-    if state.rescanning:
-        return RescanInfoResponse(rescanning=True, progress=state.rescan_progress)
+    """Get rescan progress information (Bitcoin Core is the source of truth)."""
+    rescanning, progress = await state.live_rescan_status()
+    if rescanning:
+        return RescanInfoResponse(rescanning=True, progress=progress)
     return RescanInfoResponse(rescanning=False)
 
 

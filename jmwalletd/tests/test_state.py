@@ -197,6 +197,81 @@ class TestDaemonState:
         assert daemon_state._wallet_sync_task is None
 
     @pytest.mark.asyncio
+    async def test_lock_wallet_stops_rescan_task_and_resets_flags(
+        self, daemon_state: DaemonState, mock_wallet_service: MagicMock
+    ) -> None:
+        """Locking the wallet cancels rescan tracking and clears the flags."""
+        daemon_state.wallet_service = mock_wallet_service
+        daemon_state.wallet_name = "w.jmdat"
+        daemon_state.rescanning = True
+        daemon_state.rescan_progress = 0.5
+
+        async def _rescan() -> None:
+            await asyncio.sleep(10)
+
+        rescan_task = asyncio.create_task(_rescan())
+        daemon_state._rescan_task = rescan_task
+
+        await daemon_state.lock_wallet()
+
+        assert rescan_task.cancelled()
+        assert daemon_state._rescan_task is None
+        assert daemon_state.rescanning is False
+        assert daemon_state.rescan_progress == 0.0
+
+    @pytest.mark.asyncio
+    async def test_live_rescan_status_prefers_core_state(
+        self, daemon_state: DaemonState, mock_wallet_service: MagicMock
+    ) -> None:
+        """Core's getwalletinfo.scanning wins over the stale in-memory flag."""
+        daemon_state.wallet_service = mock_wallet_service
+        mock_wallet_service.backend.get_rescan_status = AsyncMock(
+            return_value={"in_progress": True, "progress": 0.18, "duration": 17}
+        )
+        daemon_state.rescanning = False
+
+        rescanning, progress = await daemon_state.live_rescan_status()
+        assert rescanning is True
+        assert progress == 0.18
+
+    @pytest.mark.asyncio
+    async def test_live_rescan_status_daemon_flag_when_core_idle(
+        self, daemon_state: DaemonState, mock_wallet_service: MagicMock
+    ) -> None:
+        """Wallet-side sync work (not a Core scan) still reports rescanning."""
+        daemon_state.wallet_service = mock_wallet_service
+        mock_wallet_service.backend.get_rescan_status = AsyncMock(
+            return_value={"in_progress": False}
+        )
+        daemon_state.rescanning = True
+        daemon_state.rescan_progress = 0.0
+
+        rescanning, progress = await daemon_state.live_rescan_status()
+        assert rescanning is True
+        assert progress == 0.0
+
+    @pytest.mark.asyncio
+    async def test_live_rescan_status_fallback_on_rpc_error(
+        self, daemon_state: DaemonState, mock_wallet_service: MagicMock
+    ) -> None:
+        daemon_state.wallet_service = mock_wallet_service
+        mock_wallet_service.backend.get_rescan_status = AsyncMock(
+            side_effect=RuntimeError("rpc down")
+        )
+        daemon_state.rescanning = True
+        daemon_state.rescan_progress = 0.3
+
+        rescanning, progress = await daemon_state.live_rescan_status()
+        assert rescanning is True
+        assert progress == 0.3
+
+    @pytest.mark.asyncio
+    async def test_live_rescan_status_no_wallet(self, daemon_state: DaemonState) -> None:
+        rescanning, progress = await daemon_state.live_rescan_status()
+        assert rescanning is False
+        assert progress is None
+
+    @pytest.mark.asyncio
     async def test_lock_wallet_maker_stop_raises(
         self, daemon_state: DaemonState, mock_wallet_service: MagicMock
     ) -> None:

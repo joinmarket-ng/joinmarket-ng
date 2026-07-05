@@ -101,6 +101,32 @@ class TestGetSession:
         data = resp.json()
         assert data.get("descriptor_wallet_name") is None
 
+    def test_rescanning_true_while_core_scans(self, authed_client: tuple[TestClient, str]) -> None:
+        """/session must report rescanning=true while Bitcoin Core is still
+        scanning, even if the daemon-side flag went stale (issue #551)."""
+        client, _ = authed_client
+        state = get_daemon_state()
+        state.rescanning = False
+        state.wallet_service.backend.get_rescan_status = AsyncMock(
+            return_value={"in_progress": True, "progress": 0.5, "duration": 60}
+        )
+
+        resp = client.get("/api/v1/session")
+        assert resp.status_code == 200
+        assert resp.json()["rescanning"] is True
+
+    def test_rescanning_false_when_idle(self, authed_client: tuple[TestClient, str]) -> None:
+        client, _ = authed_client
+        state = get_daemon_state()
+        state.rescanning = False
+        state.wallet_service.backend.get_rescan_status = AsyncMock(
+            return_value={"in_progress": False}
+        )
+
+        resp = client.get("/api/v1/session")
+        assert resp.status_code == 200
+        assert resp.json()["rescanning"] is False
+
 
 class TestListWallets:
     def test_empty(self, client: TestClient, daemon_state: DaemonState) -> None:

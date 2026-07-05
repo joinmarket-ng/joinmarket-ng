@@ -84,9 +84,13 @@ class DaemonState:
         self.tumble_task: asyncio.Task[Any] | None = None
         self.tumble_plan_wallet: str | None = None
 
-        # Rescan state
+        # Rescan state. ``rescanning``/``rescan_progress`` are daemon-side
+        # flags updated by the rescan endpoint and the background wallet sync;
+        # ``live_rescan_status`` combines them with Bitcoin Core's own
+        # ``getwalletinfo.scanning`` state, which is the source of truth.
         self.rescanning: bool = False
         self.rescan_progress: float = 0.0
+        self._rescan_task: asyncio.Task[None] | None = None
 
         # In-memory config overrides (configset values, not persisted)
         self.config_overrides: dict[str, dict[str, str]] = {}
@@ -101,6 +105,35 @@ class DaemonState:
     def wallet_loaded(self) -> bool:
         """Return True if a wallet is currently unlocked."""
         return self.wallet_service is not None
+
+    async def live_rescan_status(self) -> tuple[bool, float | None]:
+        """Return ``(rescanning, progress)`` with Bitcoin Core as source of truth.
+
+        The in-memory ``rescanning`` flag only tracks work started by this
+        daemon and can go stale (e.g. the HTTP call driving the rescan fails
+        while Core keeps scanning server-side, or the scan was triggered by
+        wallet creation/recovery or an external client). When the backend
+        exposes ``get_rescan_status`` (descriptor wallets), query Core's
+        ``getwalletinfo.scanning`` directly so both the flag and the progress
+        fraction reflect reality. Falls back to the in-memory flags for other
+        backends or on RPC errors.
+        """
+        backend = getattr(self.wallet_service, "backend", None)
+        get_status = getattr(backend, "get_rescan_status", None)
+        if get_status is not None:
+            try:
+                status = await get_status()
+            except Exception as exc:
+                logger.debug("Could not query backend rescan status: {}", exc)
+                status = None
+            if status is not None and status.get("in_progress"):
+                progress = status.get("progress")
+                return True, float(progress) if progress is not None else self.rescan_progress
+        # Core is not scanning (or we could not ask). The daemon-side flag
+        # still covers wallet-side sync work that is not a Core scan.
+        if self.rescanning:
+            return True, self.rescan_progress
+        return False, None
 
     @property
     def wallets_dir(self) -> Path:
@@ -161,6 +194,14 @@ class DaemonState:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._wallet_sync_task
 
+        # Stop any background rescan-tracking task. This only stops the
+        # daemon-side progress tracking; a rescan already accepted by Bitcoin
+        # Core keeps running server-side.
+        if self._rescan_task is not None and not self._rescan_task.done():
+            self._rescan_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._rescan_task
+
         self.wallet_service = None
         self.wallet_mnemonic = ""
         self.wallet_name = ""
@@ -176,6 +217,9 @@ class DaemonState:
         self._maker_task = None
         self._taker_task = None
         self._wallet_sync_task = None
+        self._rescan_task = None
+        self.rescanning = False
+        self.rescan_progress = 0.0
         self.tumble_runner = None
         self.tumble_task = None
         self.tumble_plan_wallet = None

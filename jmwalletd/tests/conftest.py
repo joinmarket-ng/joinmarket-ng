@@ -57,6 +57,12 @@ def mock_wallet_service() -> MagicMock:
     ws.get_new_address_verified = AsyncMock(return_value="bcrt1qtest1234567890abcdef")
     ws.backend = MagicMock()
     ws.backend.get_block_count = AsyncMock(return_value=800_000)
+    # Rescan interface (DescriptorWalletBackend). Default: no scan running,
+    # background rescans complete synchronously (fast regtest path).
+    ws.backend.get_rescan_status = AsyncMock(return_value={"in_progress": False})
+    ws.backend.start_background_rescan = AsyncMock(return_value=True)
+    ws.backend.wait_for_rescan_complete = AsyncMock(return_value=True)
+    ws.backend.rescan_blockchain = AsyncMock()
     ws.num_mixdepths = 5
     ws.mixdepth_count = 5
 
