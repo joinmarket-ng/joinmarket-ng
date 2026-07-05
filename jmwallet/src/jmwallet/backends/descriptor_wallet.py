@@ -1025,7 +1025,7 @@ class DescriptorWalletBackend(BlockchainBackend):
             logger.warning(f"Failed to get descriptor checksum: {e}")
             return descriptor
 
-    async def start_background_rescan(self, start_height: int = 0) -> None:
+    async def start_background_rescan(self, start_height: int = 0) -> bool:
         """
         Trigger a server-side blockchain rescan and return once Bitcoin
         Core has actually started it.
@@ -1053,6 +1053,12 @@ class DescriptorWalletBackend(BlockchainBackend):
                 created. This avoids the common surprise of every rescan
                 starting at genesis and scanning years of irrelevant blocks
                 even though a creation height is configured.
+
+        Returns:
+            True if the rescan already completed synchronously (fast
+            regtest / already-synced wallets), False if a background scan
+            is now running server-side and the caller should poll
+            ``get_rescan_status`` / ``wait_for_rescan_complete``.
 
         Raises:
             RuntimeError: If Bitcoin Core does not start scanning within
@@ -1095,10 +1101,21 @@ class DescriptorWalletBackend(BlockchainBackend):
                 # already-synced wallet) that it completed inside 2s. That is
                 # fine, nothing more to do.
                 logger.info("rescanblockchain returned synchronously (fast wallet/regtest)")
-                return
+                return True
             except httpx.TimeoutException:
                 # Expected. Bitcoin Core is now scanning server-side.
                 pass
+            except ValueError as exc:
+                # RPC error -4: "Wallet is currently rescanning. Abort existing
+                # rescan or wait." A scan is already running server-side, so
+                # instead of surfacing a spurious failure, fall through to the
+                # confirmation loop and let the caller track the existing scan.
+                if "-4" not in str(exc) or "rescan" not in str(exc).lower():
+                    raise
+                logger.info(
+                    "Bitcoin Core is already rescanning; tracking the existing "
+                    "scan instead of starting a new one"
+                )
         finally:
             await kick_client.aclose()
 
@@ -1128,7 +1145,7 @@ class DescriptorWalletBackend(BlockchainBackend):
                 logger.info(
                     f"Bitcoin Core confirmed rescan in progress ({progress_str}, {duration_str})"
                 )
-                return
+                return False
             # Some Bitcoin Core versions return scanning=false very briefly
             # right after acceptance; back off a bit and re-check.
             await asyncio.sleep(0.5)

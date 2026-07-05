@@ -1380,9 +1380,10 @@ class TestBackgroundRescan:
 
         backend._rpc_call = mock_rpc  # type: ignore[method-assign]
 
-        await backend.start_background_rescan(start_height=42)
+        completed = await backend.start_background_rescan(start_height=42)
 
         assert observed_kick is True
+        assert completed is False
 
     @pytest.mark.asyncio
     async def test_start_background_rescan_floors_at_creation_height(self) -> None:
@@ -1461,7 +1462,55 @@ class TestBackgroundRescan:
 
         backend._rpc_call = mock_rpc  # type: ignore[method-assign]
 
-        await backend.start_background_rescan(start_height=0)
+        completed = await backend.start_background_rescan(start_height=0)
+        assert completed is True
+
+    @pytest.mark.asyncio
+    async def test_start_background_rescan_tolerates_already_rescanning(self) -> None:
+        """RPC error -4 (wallet already rescanning) must not surface as a
+        failure; the existing server-side scan is tracked instead."""
+        backend = DescriptorWalletBackend(wallet_name="test_rescan_already")
+        backend._wallet_loaded = True
+
+        async def mock_rpc(
+            method: str,
+            params: list[Any] | None = None,
+            client: Any = None,
+            use_wallet: bool = True,
+        ) -> Any:
+            if method == "rescanblockchain":
+                raise ValueError(
+                    "RPC error -4: Wallet is currently rescanning. Abort existing rescan or wait."
+                )
+            if method == "getwalletinfo":
+                return {"scanning": {"progress": 0.5, "duration": 60}}
+            return {}
+
+        backend._rpc_call = mock_rpc  # type: ignore[method-assign]
+
+        completed = await backend.start_background_rescan(start_height=0)
+        assert completed is False
+
+    @pytest.mark.asyncio
+    async def test_start_background_rescan_reraises_other_rpc_errors(self) -> None:
+        """RPC errors other than -4/already-rescanning still propagate."""
+        backend = DescriptorWalletBackend(wallet_name="test_rescan_rpc_err")
+        backend._wallet_loaded = True
+
+        async def mock_rpc(
+            method: str,
+            params: list[Any] | None = None,
+            client: Any = None,
+            use_wallet: bool = True,
+        ) -> Any:
+            if method == "rescanblockchain":
+                raise ValueError("RPC error -8: Invalid start_height")
+            return {}
+
+        backend._rpc_call = mock_rpc  # type: ignore[method-assign]
+
+        with pytest.raises(ValueError, match="RPC error -8"):
+            await backend.start_background_rescan(start_height=99999999)
 
     @pytest.mark.asyncio
     async def test_start_background_rescan_raises_if_never_starts(
