@@ -648,6 +648,8 @@ class TestSpendBondBIP32Derivation:
             assert "CANNOT sign" in result.stdout
             assert "sign_bond_mnemonic.py" in result.stdout
             assert "Sparrow Wallet" in result.stdout
+            # Ledger support depends on the Bitcoin app version (issue #552).
+            assert "legacy Bitcoin app" in result.stdout
 
     def test_no_derivation_shows_hint(self) -> None:
         """Without BIP32 derivation, output should hint to use the flags."""

@@ -559,16 +559,19 @@ For full documentation, see [jmwallet Documentation](https://joinmarket-ng.githu
 
  Most hardware wallets (Trezor, Coldcard, BitBox02, KeepKey) CANNOT sign
  CLTV timelock P2WSH scripts -- their firmware rejects custom witness
- scripts. Ledger and Blockstream Jade DO support arbitrary witness scripts
- and may work via HWI (scripts/sign_bond_psbt.py).
+ scripts. Blockstream Jade DOES support arbitrary witness scripts and may
+ work via HWI (scripts/sign_bond_psbt.py). Ledger only supports this with
+ the legacy Bitcoin app (2.0.x and earlier); the current app (2.1+) has
+ been reported to reject bond PSBTs. Specter DIY signs via QR PSBT
+ exchange instead.
 
  Option A - Mnemonic signing (works with any device):
  1. Run: python scripts/sign_bond_mnemonic.py <psbt_base64>
  2. Enter your BIP39 mnemonic when prompted (hidden input)
  3. Broadcast: bitcoin-cli sendrawtransaction <signed_hex>
 
- Option B - HWI signing (Ledger and Jade only):
- 1. Install HWI: pip install -U hwi
+ Option B - HWI signing (Jade; Ledger legacy app only):
+ 1. Install HWI: pip install -U hwi  (>= 3.1.0 for newer device models)
  2. Connect and unlock your hardware wallet
  3. Run: python scripts/sign_bond_psbt.py <psbt_base64>
 

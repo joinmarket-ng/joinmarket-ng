@@ -1152,16 +1152,19 @@ def spend_bond(
 
     Most hardware wallets (Trezor, Coldcard, BitBox02, KeepKey) CANNOT sign
     CLTV timelock P2WSH scripts -- their firmware rejects custom witness
-    scripts. Ledger and Blockstream Jade DO support arbitrary witness scripts
-    and may work via HWI (scripts/sign_bond_psbt.py).
+    scripts. Blockstream Jade DOES support arbitrary witness scripts and may
+    work via HWI (scripts/sign_bond_psbt.py). Ledger only supports this with
+    the legacy Bitcoin app (2.0.x and earlier); the current app (2.1+) has
+    been reported to reject bond PSBTs. Specter DIY signs via QR PSBT
+    exchange instead.
 
     Option A - Mnemonic signing (works with any device):
     1. Run: python scripts/sign_bond_mnemonic.py <psbt_base64>
     2. Enter your BIP39 mnemonic when prompted (hidden input)
     3. Broadcast: bitcoin-cli sendrawtransaction <signed_hex>
 
-    Option B - HWI signing (Ledger and Jade only):
-    1. Install HWI: pip install -U hwi
+    Option B - HWI signing (Jade; Ledger legacy app only):
+    1. Install HWI: pip install -U hwi  (>= 3.1.0 for newer device models)
     2. Connect and unlock your hardware wallet
     3. Run: python scripts/sign_bond_psbt.py <psbt_base64>
 
@@ -1410,8 +1413,10 @@ def spend_bond(
         print("  Use this only to validate your signing workflow before funding the bond.")
         print()
     print("NOTE: Most hardware wallets (Trezor, Coldcard, BitBox02, KeepKey)")
-    print("  CANNOT sign CLTV timelock P2WSH scripts. Ledger and Blockstream")
-    print("  Jade support arbitrary witness scripts and may work via HWI.")
+    print("  CANNOT sign CLTV timelock P2WSH scripts. Blockstream Jade supports")
+    print("  arbitrary witness scripts and may work via HWI. Ledger only with")
+    print("  the legacy Bitcoin app (2.0.x and earlier); the current app (2.1+)")
+    print("  has been reported to reject bond PSBTs. Specter DIY signs via QR.")
     print()
     print("Option A - Mnemonic signing (works with any device):")
     if bip32_derivations:
@@ -1423,8 +1428,8 @@ def spend_bond(
     print("  3. Broadcast: bitcoin-cli sendrawtransaction <signed_hex>")
     print()
     if bip32_derivations:
-        print("Option B - HWI signing (Ledger and Jade only):")
-        print("  1. Install HWI: pip install -U hwi")
+        print("Option B - HWI signing (Jade; Ledger legacy app only):")
+        print("  1. Install HWI: pip install -U hwi  (>= 3.1.0 for newer devices)")
         print("  2. Connect and unlock your hardware wallet")
         print("  3. Run: python scripts/sign_bond_psbt.py <psbt_base64>")
         print()
