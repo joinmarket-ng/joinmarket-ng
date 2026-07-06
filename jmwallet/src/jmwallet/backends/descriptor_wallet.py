@@ -20,7 +20,9 @@ Trade-offs:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
+import time
 from collections.abc import Callable, Sequence
 from typing import Any
 
@@ -63,6 +65,16 @@ DEFAULT_RPC_TIMEOUT = httpx.Timeout(
 # times out we fall back to polling getwalletinfo for ``scanning`` instead
 # of bubbling up a confusing ReadTimeout (issue #472).
 IMPORT_RPC_TIMEOUT = 1800.0
+
+# How often the concurrent progress monitor polls ``getwalletinfo`` while a
+# blocking ``importdescriptors`` rescan runs. The first import used to appear
+# frozen for 15+ minutes with no feedback at all (issue #472).
+IMPORT_SCAN_PROGRESS_INTERVAL = 10.0
+
+# Import-time rescans whose descriptor timestamp is older than this are
+# announced to the user up front, since Bitcoin Core will scan that whole
+# window synchronously inside the importdescriptors RPC.
+LONG_IMPORT_SCAN_WARNING_AGE = 86_400.0  # 1 day
 
 # Maximum time to wait for a transient "wallet already loading" state to clear.
 # Bitcoin Core keeps a previously issued ``loadwallet``/``createwallet`` running
@@ -779,11 +791,14 @@ class DescriptorWalletBackend(BlockchainBackend):
 
         # Calculate appropriate timestamp
         background_rescan_needed = False
+        used_creation_height = False
         if timestamp is None:
             if not rescan:
                 timestamp = "now"
             elif smart_scan:
-                # Smart scan: start from ~1 year ago for fast startup
+                # Smart scan: start from the wallet's creation height when
+                # known, otherwise from ~1 year ago for fast startup
+                used_creation_height = self._wallet_creation_height is not None
                 timestamp = await self._get_smart_scan_timestamp()
                 background_rescan_needed = background_full_rescan
             else:
@@ -897,8 +912,9 @@ class DescriptorWalletBackend(BlockchainBackend):
             elif timestamp == "now":
                 rescan_info = "no rescan (timestamp='now')"
             elif smart_scan and background_rescan_needed:
+                scan_origin = "wallet creation height" if used_creation_height else "~1 year ago"
                 rescan_info = (
-                    f"smart scan from ~1 year ago (timestamp={timestamp}), "
+                    f"smart scan from {scan_origin} (timestamp={timestamp}), "
                     "full rescan in background"
                 )
             else:
@@ -906,6 +922,28 @@ class DescriptorWalletBackend(BlockchainBackend):
             logger.info(
                 f"Importing {len(import_requests)} descriptor(s) into wallet ({rescan_info})..."
             )
+
+        # Bitcoin Core runs the rescan implied by ``timestamp`` synchronously
+        # inside the importdescriptors RPC: the HTTP call blocks until the
+        # scan is done. Announce long scans up front and report progress from
+        # a concurrent task so first-time setup does not look frozen
+        # (issue #472).
+        progress_task: asyncio.Task[None] | None = None
+        if timestamp != "now":
+            if timestamp == 0 or (
+                isinstance(timestamp, int)
+                and time.time() - timestamp > LONG_IMPORT_SCAN_WARNING_AGE
+            ):
+                logger.info(
+                    "Bitcoin Core is now scanning the blockchain for this "
+                    "wallet's history as part of the descriptor import. This "
+                    "happens once per wallet and can take a long time (15+ "
+                    "minutes on slow hardware); progress is reported below. "
+                    "It is safe to interrupt (Ctrl+C): the scan keeps running "
+                    "inside Bitcoin Core and the next command picks up the "
+                    "result."
+                )
+            progress_task = asyncio.create_task(self._log_import_scan_progress())
 
         try:
             try:
@@ -1012,6 +1050,32 @@ class DescriptorWalletBackend(BlockchainBackend):
         except Exception as e:
             logger.error(f"Failed to import descriptors: {e}")
             raise
+        finally:
+            if progress_task is not None:
+                progress_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await progress_task
+
+    async def _log_import_scan_progress(
+        self, poll_interval: float = IMPORT_SCAN_PROGRESS_INTERVAL
+    ) -> None:
+        """Log wallet scan progress at INFO level while a blocking import runs.
+
+        ``importdescriptors`` holds the HTTP call open while Bitcoin Core
+        rescans the blockchain for the imported descriptors. This helper is
+        run as a concurrent task during that call so users see progress
+        instead of a silent multi-minute hang (issue #472). It never finishes
+        on its own; the caller cancels it once the import returns.
+        """
+        while True:
+            await asyncio.sleep(poll_interval)
+            status = await self.get_rescan_status()
+            if status and status.get("in_progress"):
+                progress = float(status.get("progress") or 0.0)
+                duration = int(status.get("duration") or 0)
+                logger.info(
+                    f"Wallet history scan in progress: {progress * 100:.1f}% (elapsed {duration}s)"
+                )
 
     async def _add_descriptor_checksum(self, descriptor: str) -> str:
         """Add checksum to descriptor if not present."""

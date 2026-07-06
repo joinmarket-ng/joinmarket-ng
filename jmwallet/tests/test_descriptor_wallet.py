@@ -552,6 +552,148 @@ class TestDescriptorWalletBackendUnit:
         assert backend._descriptors_imported is True
 
     @pytest.mark.asyncio
+    async def test_import_descriptors_reports_scan_progress_during_blocking_import(
+        self, mock_backend: DescriptorWalletBackend
+    ) -> None:
+        """Issue #472 (UX): while ``importdescriptors`` blocks on the
+        synchronous rescan Bitcoin Core runs inside the RPC, a concurrent
+        monitor polls ``getwalletinfo`` and logs progress at INFO level so
+        the first-time setup does not look frozen. The monitor must stop
+        once the import returns.
+        """
+        import functools
+
+        from loguru import logger as loguru_logger
+
+        backend = mock_backend
+        progress_polls: list[dict[str, Any]] = []
+
+        async def mock_rpc(method, params=None, client=None, use_wallet=True):
+            if method == "getdescriptorinfo":
+                return {"descriptor": f"{params[0]}#check"}
+            if method == "importdescriptors":
+                # Simulate a long synchronous rescan inside the RPC.
+                await asyncio.sleep(0.2)
+                return [{"success": True}]
+            if method == "getwalletinfo":
+                status = {"scanning": {"duration": 5, "progress": 0.42}}
+                progress_polls.append(status)
+                return status
+            if method == "listdescriptors":
+                return {"descriptors": [{"desc": "wpkh(xpub.../0/*)#check"}]}
+            raise ValueError(f"Unexpected method: {method}")
+
+        backend._rpc_call = mock_rpc
+        # Speed the monitor's poll loop up so the test is quick.
+        backend._log_import_scan_progress = functools.partial(  # type: ignore[method-assign]
+            DescriptorWalletBackend._log_import_scan_progress, backend, poll_interval=0.01
+        )
+
+        messages: list[str] = []
+        sink_id = loguru_logger.add(lambda m: messages.append(str(m)), level="INFO")
+        try:
+            result = await backend.import_descriptors(
+                [{"desc": "wpkh(xpub.../0/*)", "range": [0, 999]}],
+                rescan=True,
+                timestamp=0,  # explicit genesis scan; skips _get_smart_scan_timestamp
+                smart_scan=False,
+                background_full_rescan=False,
+            )
+        finally:
+            loguru_logger.remove(sink_id)
+
+        assert result["success_count"] == 1
+        assert progress_polls, "expected getwalletinfo polls while the import was blocking"
+        assert any("Wallet history scan in progress: 42.0%" in m for m in messages)
+        # The long-scan announcement is logged up front for old timestamps.
+        assert any("scanning the blockchain for this wallet's history" in m for m in messages)
+
+        # The monitor task must be cancelled once the import returns.
+        polls_after_import = len(progress_polls)
+        await asyncio.sleep(0.05)
+        assert len(progress_polls) == polls_after_import, "progress monitor kept polling"
+
+    @pytest.mark.asyncio
+    async def test_import_scan_progress_monitor_cancelled_on_failure(
+        self, mock_backend: DescriptorWalletBackend
+    ) -> None:
+        """The progress monitor must not outlive a failed import."""
+        import functools
+
+        backend = mock_backend
+        progress_polls: list[str] = []
+
+        async def mock_rpc(method, params=None, client=None, use_wallet=True):
+            if method == "getdescriptorinfo":
+                return {"descriptor": f"{params[0]}#check"}
+            if method == "importdescriptors":
+                await asyncio.sleep(0.05)
+                raise RuntimeError("simulated import failure")
+            if method == "getwalletinfo":
+                progress_polls.append(method)
+                return {"scanning": {"duration": 1, "progress": 0.1}}
+            if method == "listdescriptors":
+                return {"descriptors": []}
+            raise ValueError(f"Unexpected method: {method}")
+
+        backend._rpc_call = mock_rpc
+        backend._log_import_scan_progress = functools.partial(  # type: ignore[method-assign]
+            DescriptorWalletBackend._log_import_scan_progress, backend, poll_interval=0.01
+        )
+
+        with pytest.raises(RuntimeError, match="simulated import failure"):
+            await backend.import_descriptors(
+                [{"desc": "wpkh(xpub.../0/*)", "range": [0, 999]}],
+                rescan=True,
+                timestamp=0,
+                smart_scan=False,
+                background_full_rescan=False,
+            )
+
+        polls_after_failure = len(progress_polls)
+        await asyncio.sleep(0.05)
+        assert len(progress_polls) == polls_after_failure, "progress monitor kept polling"
+
+    @pytest.mark.asyncio
+    async def test_import_descriptors_no_progress_monitor_without_rescan(
+        self, mock_backend: DescriptorWalletBackend
+    ) -> None:
+        """``rescan=False`` (timestamp="now") never blocks on a rescan, so no
+        progress monitor task should be started at all."""
+        backend = mock_backend
+
+        async def mock_rpc(method, params=None, client=None, use_wallet=True):
+            if method == "getdescriptorinfo":
+                return {"descriptor": f"{params[0]}#check"}
+            if method == "importdescriptors":
+                return [{"success": True}]
+            if method == "listdescriptors":
+                return {"descriptors": [{"desc": "wpkh(xpub.../0/*)#check"}]}
+            raise ValueError(f"Unexpected method: {method}")
+
+        backend._rpc_call = mock_rpc
+        monitor_started = False
+
+        def recording_monitor(*args, **kwargs):
+            # Record synchronously at call time: asyncio.create_task() calls
+            # the coroutine function eagerly even if the task is cancelled
+            # before it ever runs.
+            nonlocal monitor_started
+            monitor_started = True
+
+            async def _noop() -> None:
+                return None
+
+            return _noop()
+
+        backend._log_import_scan_progress = recording_monitor  # type: ignore[method-assign]
+
+        result = await backend.import_descriptors(["wpkh(xpub.../0/*)"], rescan=False)
+
+        assert result["success_count"] == 1
+        assert monitor_started is False
+
+    @pytest.mark.asyncio
     async def test_get_utxos(self, mock_backend: DescriptorWalletBackend):
         """Test getting UTXOs via listunspent."""
         backend = mock_backend

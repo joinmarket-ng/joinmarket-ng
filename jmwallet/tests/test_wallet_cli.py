@@ -20,6 +20,25 @@ from jmwallet.cli import app
 
 runner = CliRunner()
 
+# Captured before the autouse fixture below replaces the module attribute, so
+# the direct unit test for the tip lookup can call the real implementation.
+from jmwallet.cli.wallet import (  # noqa: E402
+    _fetch_current_block_height as _real_fetch_current_block_height,
+)
+
+
+@pytest.fixture(autouse=True)
+def _offline_creation_height_fetch(monkeypatch):
+    """Keep unit tests hermetic: ``generate`` performs a best-effort chain
+    tip lookup to record the wallet creation height (issue #472). Simulate
+    an unreachable backend by default so no RPC call is ever attempted;
+    tests that exercise the success path re-patch this explicitly."""
+
+    async def _unreachable(*args, **kwargs):
+        raise ConnectionError("test: backend unreachable")
+
+    monkeypatch.setattr("jmwallet.cli.wallet._fetch_current_block_height", _unreachable)
+
 
 def _stub_backend_class(mock_obj: MagicMock) -> type:
     """Build a real subclass of ``DescriptorWalletBackend`` whose instantiation
@@ -898,6 +917,108 @@ def test_generate_force_overwrite():
         assert output_file.read_text() != "old content"
         # Should NOT show overwrite prompt
         assert "Overwrite existing wallet file?" not in result.stdout
+
+
+def test_generate_records_creation_height(monkeypatch):
+    """Issue #472: ``generate`` records the current chain tip height in the
+    ``.meta`` sidecar so the first sync skips blocks that predate the wallet
+    (a brand-new mnemonic cannot have history)."""
+    from jmwallet.cli.mnemonic import load_mnemonic_meta
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        monkeypatch.setenv("JOINMARKET_DATA_DIR", tmpdir)
+        output_file = Path(tmpdir) / "wallets" / "new.mnemonic"
+
+        with patch(
+            "jmwallet.cli.wallet._fetch_current_block_height",
+            AsyncMock(return_value=880_123),
+        ):
+            result = runner.invoke(
+                app,
+                ["generate", "--output", str(output_file), "--no-prompt-password"],
+            )
+
+        assert result.exit_code == 0, f"generate failed: {result.stdout}"
+        assert "Recorded wallet creation height 880123" in result.stdout
+
+        meta = load_mnemonic_meta(output_file)
+        assert meta.get("creation_height") == 880_123
+
+
+def test_generate_succeeds_when_backend_unreachable(monkeypatch):
+    """The creation-height lookup is best-effort: wallet generation must
+    succeed (without metadata) when no backend is reachable."""
+    from jmwallet.cli.mnemonic import load_mnemonic_meta
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        monkeypatch.setenv("JOINMARKET_DATA_DIR", tmpdir)
+        output_file = Path(tmpdir) / "wallets" / "new.mnemonic"
+
+        # The module-level autouse fixture already patches the tip lookup to
+        # raise ConnectionError.
+        result = runner.invoke(
+            app,
+            ["generate", "--output", str(output_file), "--no-prompt-password"],
+        )
+
+        assert result.exit_code == 0, f"generate failed: {result.stdout}"
+        assert output_file.exists()
+        assert "creation_height" not in load_mnemonic_meta(output_file)
+
+
+def test_generate_invalid_height_not_recorded(monkeypatch):
+    """A non-positive tip height (unsynced/broken backend) is not recorded."""
+    from jmwallet.cli.mnemonic import load_mnemonic_meta
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        monkeypatch.setenv("JOINMARKET_DATA_DIR", tmpdir)
+        output_file = Path(tmpdir) / "wallets" / "new.mnemonic"
+
+        with patch(
+            "jmwallet.cli.wallet._fetch_current_block_height",
+            AsyncMock(return_value=0),
+        ):
+            result = runner.invoke(
+                app,
+                ["generate", "--output", str(output_file), "--no-prompt-password"],
+            )
+
+        assert result.exit_code == 0, f"generate failed: {result.stdout}"
+        assert "creation_height" not in load_mnemonic_meta(output_file)
+
+
+def test_fetch_current_block_height_uses_descriptor_backend():
+    """The tip lookup instantiates the configured backend and closes it."""
+    import asyncio as _asyncio
+
+    from jmcore.cli_common import ResolvedBackendSettings
+
+    backend_settings = ResolvedBackendSettings(
+        network="mainnet",
+        bitcoin_network="mainnet",
+        backend_type="descriptor_wallet",
+        rpc_url="http://127.0.0.1:8332",
+        rpc_user="user",
+        rpc_password="pass",
+        neutrino_url="http://127.0.0.1:8334",
+        neutrino_add_peers=[],
+        data_dir=Path("/tmp"),
+        scan_start_height=None,
+        neutrino_tls_cert=None,
+        neutrino_auth_token=None,
+    )
+
+    with (
+        patch.object(
+            DescriptorWalletBackend, "get_block_height", AsyncMock(return_value=900_000)
+        ) as mock_height,
+        patch.object(DescriptorWalletBackend, "close", AsyncMock()) as mock_close,
+    ):
+        height = _asyncio.run(_real_fetch_current_block_height(backend_settings))
+
+    assert height == 900_000
+    mock_height.assert_awaited_once()
+    mock_close.assert_awaited_once()
 
 
 def test_info_uses_default_wallet(monkeypatch):

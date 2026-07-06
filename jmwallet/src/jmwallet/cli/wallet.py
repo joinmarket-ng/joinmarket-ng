@@ -190,6 +190,85 @@ def import_mnemonic(
         typer.echo("WARNING: File is NOT encrypted")
         typer.echo("For production use, consider using a password!")
     typer.echo("\nWallet import complete. You can now use other jm-wallet commands.")
+    typer.echo(
+        "Note: an imported wallet has no recorded creation height, so the "
+        "first sync scans about one year of blockchain history (with a full "
+        "rescan continuing in the background). This can take a while on "
+        "mainnet; progress is reported while it runs."
+    )
+
+
+# Hard cap (seconds) for the best-effort chain tip lookup performed by
+# ``generate``. Wallet generation must never hang on an unreachable node.
+_CREATION_HEIGHT_FETCH_TIMEOUT = 15.0
+
+
+async def _fetch_current_block_height(backend_settings: ResolvedBackendSettings) -> int:
+    """Fetch the current chain tip height from the configured backend."""
+    from jmwallet.backends.descriptor_wallet import DescriptorWalletBackend
+    from jmwallet.backends.neutrino import NeutrinoBackend
+
+    backend: DescriptorWalletBackend | NeutrinoBackend
+    if backend_settings.backend_type == "neutrino":
+        backend = NeutrinoBackend(
+            neutrino_url=backend_settings.neutrino_url,
+            network=backend_settings.network,
+            tls_cert_path=backend_settings.neutrino_tls_cert,
+            auth_token=backend_settings.neutrino_auth_token,
+        )
+    else:
+        backend = DescriptorWalletBackend(
+            rpc_url=backend_settings.rpc_url,
+            rpc_user=backend_settings.rpc_user,
+            rpc_password=backend_settings.rpc_password,
+        )
+    try:
+        return await asyncio.wait_for(
+            backend.get_block_height(), timeout=_CREATION_HEIGHT_FETCH_TIMEOUT
+        )
+    finally:
+        await backend.close()
+
+
+def _record_wallet_creation_height(mnemonic_file: Path) -> None:
+    """Best-effort: record the current chain tip as the new wallet's birthday.
+
+    A freshly generated mnemonic cannot have any transaction history, so
+    storing the current block height in the ``.meta`` sidecar file lets the
+    first sync import descriptors with a timestamp at the wallet's creation
+    instead of the generic ~1 year smart-scan lookback. Without this, the
+    first wallet command triggers a synchronous multi-minute blockchain
+    rescan inside Bitcoin Core's ``importdescriptors`` even though the
+    wallet is seconds old (issue #472).
+
+    Failures are non-fatal: wallet generation must succeed even when no
+    backend is reachable yet. The first sync then falls back to the
+    smart-scan lookback window (with progress reporting).
+    """
+    try:
+        from jmcore.settings import get_settings, reset_settings
+
+        from jmwallet.cli.mnemonic import save_mnemonic_meta
+
+        reset_settings()
+        settings = get_settings()
+        backend_settings = resolve_backend_settings(settings)
+        height = asyncio.run(_fetch_current_block_height(backend_settings))
+        if height <= 0:
+            raise ValueError(f"backend reported invalid block height {height}")
+        save_mnemonic_meta(mnemonic_file, creation_height=height)
+        typer.echo(
+            f"Recorded wallet creation height {height} - the first sync will "
+            "skip blocks that predate this wallet."
+        )
+    except Exception as exc:
+        logger.warning(
+            f"Could not record the wallet creation height ({exc}). "
+            "The first wallet command will scan about one year of blockchain "
+            "history for this (empty) wallet, which can take a long time on "
+            "mainnet. Configure and start your Bitcoin backend before "
+            "generating wallets to avoid this."
+        )
 
 
 @app.command()
@@ -274,6 +353,10 @@ def generate(
         typer.echo("=" * 80 + "\n")
 
         if should_save:
+            # Narrowing for the type checker: the first ``should_save`` block
+            # above always assigns a concrete path.
+            assert output_file is not None
+
             # Prompt for password if requested
             password: str | None = None
             # Allow callers (typically the TUI) to pre-provide the password
@@ -287,6 +370,10 @@ def generate(
                 password = prompt_password_with_confirmation()
 
             save_mnemonic_file(mnemonic, output_file, password)
+
+            # Record the wallet's birthday so the first sync does not rescan
+            # a year of history for a brand-new (empty) wallet (issue #472).
+            _record_wallet_creation_height(output_file)
 
             typer.echo(f"\nMnemonic saved to: {output_file}")
             if password:

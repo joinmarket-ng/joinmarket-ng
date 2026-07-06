@@ -10,11 +10,24 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 from jmwallet.cli import app
 
 runner = CliRunner()
+
+
+@pytest.fixture(autouse=True)
+def _offline_creation_height_fetch(monkeypatch):
+    """Keep tests hermetic: ``generate`` performs a best-effort chain tip
+    lookup to record the wallet creation height (issue #472); simulate an
+    unreachable backend so no RPC call is ever attempted."""
+
+    async def _unreachable(*args, **kwargs):
+        raise ConnectionError("test: backend unreachable")
+
+    monkeypatch.setattr("jmwallet.cli.wallet._fetch_current_block_height", _unreachable)
 
 
 class TestGenerateRespectsMnemonicPasswordEnv:

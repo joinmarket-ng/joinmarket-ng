@@ -99,3 +99,13 @@ wallet, so blocks before the creation height are skipped, which can save
 hours on mainnet. `--start-height` values below the creation height are
 clamped up to it. To deliberately scan earlier blocks (for example, if the
 recorded height is wrong), lower the wallet creation height first.
+
+`jm-wallet generate` records the current chain tip as the creation height in
+the `.mnemonic.meta` sidecar file (best-effort: the configured backend must
+be reachable). This makes the first sync of a freshly generated wallet
+near-instant: the descriptor import scans from the wallet's birthday instead
+of the ~1 year smart-scan lookback. Wallets created via the daemon record
+the creation height inside the wallet file. Imported/recovered mnemonics
+have an unknown birthday, so their first sync scans the full smart-scan
+window; progress is reported while Bitcoin Core runs that scan, and it is
+safe to interrupt (the scan continues server-side).
