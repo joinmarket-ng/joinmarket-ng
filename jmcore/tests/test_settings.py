@@ -165,7 +165,7 @@ class TestSettingsDefaults:
         assert settings.maker.cj_fee_relative == "0.00002"
         assert settings.maker.cj_fee_absolute == 500
         assert settings.maker.merge_algorithm == "default"
-        assert settings.maker.cjfee_factor == 0.1
+        assert settings.maker.cjfee_factor == 0.0
         assert settings.maker.txfee_contribution_factor == 0.3
         assert settings.maker.size_factor == 0.1
         # min_confirmations defaults to 0: makers offer unconfirmed UTXOs by

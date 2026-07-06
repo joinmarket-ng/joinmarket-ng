@@ -637,8 +637,12 @@ class MakerSettings(BaseModel):
     cj_fee_relative: str = Field(
         default="0.00002",
         description=(
-            "Relative CoinJoin fee. Default 0.00002 (0.002%) matches the "
-            "upstream JoinMarket reference."
+            "Relative CoinJoin fee. Default 0.00002 (0.002%) is exactly the "
+            "lowest fee-quantization quantum, so default makers sit on the grid "
+            "and share a homogenized fee with every other default maker, "
+            "maximizing the anonymity set (and matching the upstream JoinMarket "
+            "reference). If you set a non-quantized value, enable randomization "
+            "(cjfee_factor=0.1) so the exact fee is not a fingerprint."
         ),
     )
     cj_fee_absolute: int = Field(
@@ -652,13 +656,15 @@ class MakerSettings(BaseModel):
         description="Transaction fee contribution in satoshis",
     )
     cjfee_factor: float = Field(
-        default=0.1,
+        default=0.0,
         ge=0.0,
         description=(
             "Randomization factor applied to the CoinJoin fee on each offer "
             "announcement. The advertised fee is sampled from "
-            "[cjfee*(1-f), cjfee*(1+f)]. Default 0.1 matches the upstream "
-            "JoinMarket reference (yg-privacyenhanced)."
+            "[cjfee*(1-f), cjfee*(1+f)]. Default 0 (no randomization) keeps a "
+            "default maker exactly on its quantization quantum so it blends with "
+            "other default makers. Enable randomization (e.g. 0.1, the upstream "
+            "yg-privacyenhanced value) only when you use a non-quantized fee."
         ),
     )
     txfee_contribution_factor: float = Field(

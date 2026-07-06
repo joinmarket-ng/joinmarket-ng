@@ -29,7 +29,7 @@ class TestOfferConfig:
         assert cfg.cj_fee_relative == "0.00002"
         assert cfg.cj_fee_absolute == 500
         assert cfg.tx_fee_contribution == 0
-        assert cfg.cjfee_factor == 0.1
+        assert cfg.cjfee_factor == 0.0
         assert cfg.txfee_contribution_factor == 0.3
         assert cfg.size_factor == 0.1
 
