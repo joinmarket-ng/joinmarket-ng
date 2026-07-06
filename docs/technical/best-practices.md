@@ -44,10 +44,12 @@ technical pages for more depth.
   required for the maker operation, since they can sign a delegated certificate.
   It's safer but more complex to setup, see
   ([Privacy: dedicated mnemonic](privacy.md)).
-- **Prefer hardware-wallet-signed bonds when possible.** Ledger Nano S/X,
-  Blockstream Jade, and Specter DIY can sign bond redemptions. Trezor,
-  Coldcard, BitBox02, and KeepKey currently cannot. See the hardware-wallet
-  support notes in [Privacy](privacy.md).
+- **Prefer hardware-wallet-signed bonds when possible.** Blockstream Jade
+  and Specter DIY can sign bond redemptions; Ledger only with the legacy
+  Bitcoin app (2.0.x and earlier -- the current app has been reported to
+  reject bond PSBTs). Trezor, Coldcard, BitBox02, and KeepKey currently
+  cannot. Always test the full create-and-spend flow before funding a bond.
+  See the hardware-wallet support notes in [Privacy](privacy.md).
 
 ## Taker Operation
 

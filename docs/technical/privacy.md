@@ -200,7 +200,7 @@ Allows cold storage of bond private key while hot wallet handles per-session pro
 
 > **IMPORTANT -- HARDWARE WALLET LIMITATIONS:**
 >
-> Most hardware wallets **cannot sign** fidelity bond spending transactions. Bond UTXOs are P2WSH outputs with CLTV timelock witness scripts, and most firmware rejects custom witness scripts. **Ledger Nano S/X and Blockstream Jade** support this through HWI (see [HWI support matrix](https://hwi.readthedocs.io/en/latest/devices/index.html#support-matrix)). **Specter DIY** also provides a hardware-wallet signing path by scanning the PSBT as a QR code and returning a signed PSBT. This Specter DIY flow is QR-based and does not rely on upstream HWI support. Trezor (all models), Coldcard, BitBox02, and KeepKey **cannot** sign bond redemptions ([Trezor firmware issue #416](https://github.com/trezor/trezor-firmware/issues/416), open since 2019).
+> Most hardware wallets **cannot sign** fidelity bond spending transactions. Bond UTXOs are P2WSH outputs with CLTV timelock witness scripts, and most firmware rejects custom witness scripts. **Blockstream Jade** supports this through HWI (see [HWI support matrix](https://hwi.readthedocs.io/en/latest/devices/index.html#support-matrix)). **Ledger** support depends on the installed Bitcoin app: the legacy app (2.0.x and earlier) could sign arbitrary witness scripts, but the current app (2.1+, the only option on newer devices such as Stax and Flex) only signs registered wallet policies and has been reported to reject bond PSBTs with error `0x6a80` ([issue #552](https://github.com/joinmarket-ng/joinmarket-ng/issues/552)). **Specter DIY** also provides a hardware-wallet signing path by scanning the PSBT as a QR code and returning a signed PSBT. This Specter DIY flow is QR-based and does not rely on upstream HWI support. Trezor (all models), Coldcard, BitBox02, and KeepKey **cannot** sign bond redemptions ([Trezor firmware issue #416](https://github.com/trezor/trezor-firmware/issues/416), open since 2019).
 >
 > If your hardware wallet cannot sign CLTV scripts through either HWI or a device-native QR PSBT flow, you will need to enter your BIP39 mnemonic into the `sign_bond_mnemonic.py` script to spend the bond. This does not mean funds are lost -- it is an inconvenience that degrades security from "hardware wallet cold storage" to "software signing on a (potentially offline) computer". **Plan ahead**: use a CLTV compatible hardware wallet for full cold storage, or create a dedicated mnemonic/passphrase specifically for the bond so that mnemonic exposure does not risk your main wallet.
 >
@@ -284,7 +284,7 @@ For maximum security, keep the bond UTXO private key on a hardware wallet. The b
    ```
    Then verify you can sign it:
    ```bash
-   # Ledger/Jade users -- test HWI signing:
+   # Jade (and legacy-app Ledger) users -- test HWI signing (HWI >= 3.1.0):
    python scripts/sign_bond_psbt.py "$(tr -d '\n' < unsigned-bond-test.psbt)"
 
    # Specter DIY users -- test QR PSBT signing:
@@ -329,7 +329,7 @@ key is held outside this wallet. Hot-wallet bonds (from `generate-bond-address`)
 do not need any of this; spend them directly with `jm-wallet send <dest> --select-utxos`
 (see "Spending an Expired Bond" above).
 
-> **Tested:** Bond creation verified with Sparrow Wallet and a hardware wallet (HWI >= 3.1.0). Bond redemption verified with `sign_bond_mnemonic.py`. Specter DIY can sign through the QR PSBT workflow; this guide does not claim or require Specter DIY support in upstream HWI. Trezor cannot sign the redemption transaction due to the CLTV firmware limitation.
+> **Tested:** Bond creation verified with Sparrow Wallet and a hardware wallet (HWI >= 3.1.0). Bond redemption verified with `sign_bond_mnemonic.py`. Specter DIY can sign through the QR PSBT workflow; this guide does not claim or require Specter DIY support in upstream HWI. Trezor cannot sign the redemption transaction due to the CLTV firmware limitation. Ledger redemption is **unverified** on current firmware: a user report indicates the current Bitcoin app (2.1+) rejects the bond PSBT with `0x6a80` ([issue #552](https://github.com/joinmarket-ng/joinmarket-ng/issues/552)). This is why the "test the full flow" step above exists -- verify your signer works **before** funding the bond.
 
 After locktime expires, generate a PSBT for external signing:
 
@@ -351,8 +351,9 @@ For pre-funding dry-run signer tests, add `--test-unfunded` (optionally `--test-
 
 | Device | Can sign CLTV bonds? | Notes |
 |--------|:--------------------:|-------|
-| Ledger Nano S/X | Yes | Bitcoin App 2.1+ requires standard BIP44/49/84/86 derivation for the key |
 | Blockstream Jade | Yes | Fully supported |
+| Ledger (legacy Bitcoin app, 2.0.x and earlier) | Yes | Arbitrary witnessScript signing; no longer available on newer devices |
+| Ledger (Bitcoin app 2.1+, incl. Stax/Flex) | **Reported failing** | App only signs registered wallet policies; rejects the bond PSBT with `0x6a80` ([issue #552](https://github.com/joinmarket-ng/joinmarket-ng/issues/552)). HWI >= 3.1.0 is needed just to detect Stax/Flex. Use the mnemonic signing fallback |
 | Specter DIY | Yes | QR PSBT workflow; upstream HWI support is not required or claimed |
 | BitBox01 | Yes | Discontinued; not recommended for new setups |
 | Trezor (all models) | **No** | Firmware rejects non-multisig P2WSH; [issue #416](https://github.com/trezor/trezor-firmware/issues/416) open since 2019 |
@@ -360,12 +361,12 @@ For pre-funding dry-run signer tests, add `--test-unfunded` (optionally `--test-
 | BitBox02 | **No** | |
 | KeepKey | **No** | |
 
-**Option A -- HWI signing (Ledger and Jade only):**
+**Option A -- HWI signing (Jade, and Ledger with the legacy app):**
 
-Ledger and Blockstream Jade support arbitrary witnessScript inputs, so they can sign CLTV bonds directly via HWI:
+Blockstream Jade supports arbitrary witnessScript inputs, so it can sign CLTV bonds directly via HWI. Ledger devices running the legacy Bitcoin app (2.0.x and earlier) also could; the current Ledger app (2.1+) has been reported to reject bond PSBTs (see the table above).
 
 ```bash
-pip install -U hwi  # >= 3.1.0 for newer device models
+pip install -U hwi  # >= 3.1.0 to detect newer models (Ledger Stax/Flex, Trezor Safe 3/5)
 python scripts/sign_bond_psbt.py <psbt_base64>
 ```
 
@@ -407,7 +408,7 @@ bitcoin-cli sendrawtransaction <signed_hex>
 
 **Option C -- Mnemonic signing (works with any device):**
 
-For Trezor, Coldcard, BitBox02, KeepKey, or if HWI/QR signing fails:
+For Trezor, Coldcard, BitBox02, KeepKey, Ledger devices on the current Bitcoin app, or if HWI/QR signing fails:
 
 ```bash
 python scripts/sign_bond_mnemonic.py <psbt_base64>
