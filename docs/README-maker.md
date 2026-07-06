@@ -66,6 +66,16 @@ jm-maker start --cj-fee-relative 0.002 --min-size 200000
 
 Use exactly one fee model: `--cj-fee-relative` or `--cj-fee-absolute`.
 
+> **Privacy tip: keep your fee on the quantization grid.** A per-maker fee is a
+> near-unique fingerprint that lets a passive observer re-link your equal
+> outputs across CoinJoins. The default fee (`cj_fee_relative = 0.00002`) sits
+> exactly on the lowest quantization quantum, and fee randomization is off by
+> default (`cjfee_factor = 0`), so default makers share one homogenized fee and a
+> larger anonymity set. If you set a custom fee, prefer another on-grid value
+> (relative: `0.00002, 0.00005, 0.0001, 0.0002, 0.0005, 0.001, ...`; absolute:
+> `100, 200, 500, 1000, ...` sats). Only if you insist on an off-grid value,
+> enable `cjfee_factor = 0.1` (+-10%) so the exact value is not a static label.
+
 ### 5) Optional: dual offers (relative + absolute)
 
 Pass `--dual-offers` (or set `dual_offers = true` under `[maker]` in
