@@ -25,6 +25,8 @@ class WalletDisplayMixin:
     utxo_cache: dict[int, list[UTXOInfo]]
     address_cache: dict[str, tuple[int, int, int]]
     addresses_with_history: set[str]
+    reserved_addresses: set[str]
+    issued_receive_addresses: set[str]
     fidelity_bond_locktime_cache: dict[str, int]
     root_path: str
     data_dir: Path | None
@@ -238,8 +240,10 @@ class WalletDisplayMixin:
         Get the next receive address after the last used one for a mixdepth.
 
         This returns the address at (highest used index + 1). The highest used index
-        is determined by checking blockchain history, UTXOs, and CoinJoin history.
-        If no address has been used yet, returns index 0.
+        is determined by checking blockchain history, UTXOs, CoinJoin history,
+        addresses reserved for in-progress CoinJoin sessions, and receive
+        addresses already issued to callers in this runtime (API/CLI). If no
+        address has been used yet, returns index 0.
 
         This is useful for wallet info display, showing the next address to use
         after the last one that was used in any way, ignoring any gaps in the sequence.
@@ -281,6 +285,17 @@ class WalletDisplayMixin:
 
         # Check CoinJoin history for addresses that may have been shared
         for address in used_addresses:
+            if address in self.address_cache:
+                md, ch, idx = self.address_cache[address]
+                if md == mixdepth and ch == change and idx > max_index:
+                    max_index = idx
+
+        # Check addresses reserved for in-progress CoinJoin sessions and
+        # receive addresses already issued to callers in this runtime.
+        # Neither may appear on-chain yet, but reissuing them would cause
+        # address reuse (e.g. repeated GET /address/new/{mixdepth} calls
+        # must not return the same address).
+        for address in self.reserved_addresses | self.issued_receive_addresses:
             if address in self.address_cache:
                 md, ch, idx = self.address_cache[address]
                 if md == mixdepth and ch == change and idx > max_index:

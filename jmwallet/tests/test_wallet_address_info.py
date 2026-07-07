@@ -586,6 +586,31 @@ class TestGetNextAfterLastUsedAddress:
         assert index == 6
         assert address == addr_6
 
+    def test_issued_receive_addresses_advance_index(self, wallet):
+        """Addresses already issued to callers (API/CLI) must not be reissued.
+
+        Regression: the jmwalletd /address/new/{mixdepth} endpoint uses this
+        picker (via get_next_safe_deposit_address); issued-but-unfunded
+        addresses must advance the index.
+        """
+        addr_0 = wallet.get_receive_address(0, 0)
+        addr_1 = wallet.get_receive_address(0, 1)
+        wallet.issued_receive_addresses.add(addr_0)
+
+        address, index = wallet.get_next_after_last_used_address(0, set())
+        assert index == 1
+        assert address == addr_1
+
+    def test_reserved_addresses_advance_index(self, wallet):
+        """Addresses reserved for in-progress CoinJoin sessions are skipped."""
+        addr_0 = wallet.get_receive_address(0, 0)
+        addr_1 = wallet.get_receive_address(0, 1)
+        wallet.reserve_addresses({addr_0})
+
+        address, index = wallet.get_next_after_last_used_address(0, set())
+        assert index == 1
+        assert address == addr_1
+
 
 class TestAddressHistoryTypes:
     """Tests for get_address_history_types function."""
@@ -1276,6 +1301,24 @@ class TestSafeDepositAddress:
         addr, idx = await wallet.get_next_safe_deposit_address(0)
         assert idx == 0
         assert addr == wallet.get_receive_address(0, 0)
+
+    @pytest.mark.asyncio
+    async def test_get_new_address_verified_returns_unique_addresses(self, wallet):
+        """Repeated get_new_address_verified() calls must not return the same
+        address, even when none of the issued addresses is funded yet.
+
+        Regression: jmwalletd GET /address/new/{mixdepth} switched from
+        get_new_address() to get_new_address_verified(), whose picker did not
+        consult issued_receive_addresses, so every call returned index 0.
+        """
+        first = await wallet.get_new_address_verified(0)
+        second = await wallet.get_new_address_verified(0)
+        third = await wallet.get_new_address_verified(0)
+
+        assert len({first, second, third}) == 3
+        assert first == wallet.get_receive_address(0, 0)
+        assert second == wallet.get_receive_address(0, 1)
+        assert third == wallet.get_receive_address(0, 2)
 
     @pytest.mark.asyncio
     async def test_skips_addresses_with_onchain_history(self, wallet, used_set: set[str]):
