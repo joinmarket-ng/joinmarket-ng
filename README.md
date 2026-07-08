@@ -60,6 +60,8 @@ jm-maker start
 - `jmwallet`: https://joinmarket-ng.github.io/joinmarket-ng/README-jmwallet/
 - `taker`: https://joinmarket-ng.github.io/joinmarket-ng/README-taker/
 - `maker`: https://joinmarket-ng.github.io/joinmarket-ng/README-maker/
+- `tumbler`: https://joinmarket-ng.github.io/joinmarket-ng/README-tumbler/
+- `jmwalletd`: https://joinmarket-ng.github.io/joinmarket-ng/README-jmwalletd/
 - `orderbook_watcher`: https://joinmarket-ng.github.io/joinmarket-ng/README-orderbook-watcher/
 - `directory_server`: https://joinmarket-ng.github.io/joinmarket-ng/README-directory-server/
 - `signatures`: https://joinmarket-ng.github.io/joinmarket-ng/README-signatures/

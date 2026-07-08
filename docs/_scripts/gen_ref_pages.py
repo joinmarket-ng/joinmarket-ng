@@ -31,6 +31,8 @@ PACKAGES: dict[str, str] = {
     "maker": "maker/src",
     "directory_server": "directory_server/src",
     "orderbook_watcher": "orderbook_watcher/src",
+    "tumbler": "tumbler/src",
+    "jmwalletd": "jmwalletd/src",
 }
 
 # Human-readable labels for the navigation.
@@ -41,6 +43,8 @@ PACKAGE_LABELS: dict[str, str] = {
     "maker": "maker",
     "directory_server": "directory_server",
     "orderbook_watcher": "orderbook_watcher",
+    "tumbler": "tumbler",
+    "jmwalletd": "jmwalletd",
 }
 
 # Packages ordered as they should appear in the nav.
@@ -49,6 +53,8 @@ PACKAGE_ORDER: list[str] = [
     "jmwallet",
     "taker",
     "maker",
+    "tumbler",
+    "jmwalletd",
     "orderbook_watcher",
     "directory_server",
 ]
@@ -61,6 +67,8 @@ PACKAGE_DESCRIPTIONS: dict[str, str] = {
     "maker": "CoinJoin maker: offers, fidelity bonds, protocol handlers",
     "directory_server": "Peer discovery and message routing server",
     "orderbook_watcher": "Orderbook monitoring and aggregation",
+    "tumbler": "High-level CoinJoin scheduler with YAML-persisted plans",
+    "jmwalletd": "JAM-compatible HTTP/WebSocket wallet daemon",
 }
 
 # Output directory inside docs/ for generated pages.

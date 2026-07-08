@@ -12,8 +12,8 @@ undo much of the privacy gained inside the tumble. The CLI therefore treats
 fewer than three destinations as a development/testing-only mode.
 
 See [Installation](install.md) for backend setup, Tor configuration, and manual
-install. For a short command-oriented guide, see
-[`../tumbler/README.md`](../tumbler/README.md).
+install. For a short command-oriented guide, see the
+[component README](https://github.com/joinmarket-ng/joinmarket-ng/blob/main/tumbler/README.md).
 
 ## Concepts
 

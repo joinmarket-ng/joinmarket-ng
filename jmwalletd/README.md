@@ -7,6 +7,11 @@ JAM-compatible HTTP and WebSocket daemon for JoinMarket NG.
 `jmwalletd` exposes wallet, transaction, and CoinJoin operations over a FastAPI API
 compatible with the reference JoinMarket `jmwalletd`, so JAM can talk to JoinMarket NG.
 
+## Documentation
+
+For full documentation, see
+[jmwalletd Documentation](https://joinmarket-ng.github.io/joinmarket-ng/README-jmwalletd/).
+
 ## What It Provides
 
 - REST API under `/api/v1`
