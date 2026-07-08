@@ -25,6 +25,7 @@ covered separately in ``test_tumbler_reconcile``.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -605,18 +606,21 @@ class TestBuildTumblerTakerConfig:
     """
 
     def _settings(self, *, policy_minimum_makers: int = 4) -> object:
-        from types import SimpleNamespace
+        from jmcore.models import NetworkType
+        from jmcore.settings import JoinMarketSettings
 
-        return SimpleNamespace(
-            taker=SimpleNamespace(minimum_makers=policy_minimum_makers),
-            tor=SimpleNamespace(
-                socks_host="127.0.0.1",
-                socks_port=9050,
-                stream_isolation=True,
-            ),
-            network_config=SimpleNamespace(network="regtest"),
-            get_directory_servers=lambda: [],
-        )
+        # A real settings object so the shared config builder exercises the
+        # same attribute surface (backend, wallet, tor, taker) as production.
+        settings = JoinMarketSettings()
+        settings.data_dir = Path("/tmp/jm-test")
+        settings.network_config.network = NetworkType.REGTEST
+        settings.network_config.directory_servers = []
+        settings.bitcoin.backend_type = "descriptor_wallet"
+        settings.tor.socks_host = "127.0.0.1"
+        settings.tor.socks_port = 9050
+        settings.tor.stream_isolation = True
+        settings.taker.minimum_makers = policy_minimum_makers
+        return settings
 
     def _phase(
         self,
@@ -691,3 +695,40 @@ class TestBuildTumblerTakerConfig:
         # minimum_makers at 1 (matches taker.cli behaviour).
         assert captured["counterparty_count"] == 1
         assert captured["minimum_makers"] == 1
+
+    def test_forwards_taker_policy_settings(self) -> None:
+        """Regression: daemon tumbler phases must honor ``[taker]`` policy.
+
+        The factory used to set only network/Tor/directory fields, so fee
+        limits, timeouts, and the orderbook-wait knobs silently fell back to
+        ``TakerConfig`` defaults for tumbles started through the API.
+        """
+        from jmwalletd.routers.tumbler import build_tumbler_taker_config
+
+        settings: Any = self._settings()
+        settings.taker.max_cj_fee_abs = 777
+        settings.taker.maker_timeout_sec = 90
+        settings.taker.order_wait_time = 60.0
+        settings.taker.orderbook_min_wait = 45.0
+        settings.taker.orderbook_quiet_period = 20.0
+
+        captured: dict[str, Any] = {}
+
+        def fake_taker_config_cls(**kwargs: Any) -> Any:
+            captured.update(kwargs)
+            return MagicMock()
+
+        build_tumbler_taker_config(
+            phase=self._phase(counterparty_count=2),
+            mnemonic="dummy",
+            jm_settings=settings,
+            taker_config_cls=fake_taker_config_cls,
+        )
+
+        assert captured["max_cj_fee"].abs_fee == 777
+        assert captured["maker_timeout_sec"] == 90
+        assert captured["order_wait_time"] == 60.0
+        assert captured["orderbook_min_wait"] == 45.0
+        assert captured["orderbook_quiet_period"] == 20.0
+        # The runner resolves destinations itself; the placeholder stays empty.
+        assert captured["destination_address"].get_secret_value() == ""

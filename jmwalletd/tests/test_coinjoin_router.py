@@ -110,43 +110,23 @@ class TestDoCoinjoin:
         mock_taker = AsyncMock()
         mock_taker_cls.return_value = mock_taker
 
+        from pathlib import Path
+
         from jmcore.models import NetworkType
+        from jmcore.settings import JoinMarketSettings
 
         expected_dirs = ["testdirectoryfakeaddress.onion:5222"]
-        mock_settings = Mock()
-        mock_settings.get_directory_servers.return_value = expected_dirs
+        # A real settings object so the shared config builder exercises the
+        # same attribute surface (backend, wallet, tor, taker) as production.
+        mock_settings = JoinMarketSettings()
+        mock_settings.data_dir = Path("/tmp/jm-test")
         mock_settings.network_config.network = NetworkType.SIGNET
+        mock_settings.network_config.directory_servers = expected_dirs
+        mock_settings.bitcoin.backend_type = "descriptor_wallet"
         mock_settings.tor.socks_host = "127.0.0.1"
         mock_settings.tor.socks_port = 9050
         mock_settings.tor.stream_isolation = False
-        mock_settings.tor.connection_timeout = 120.0
-        # Taker/wallet policy must be real values so the config builder's
-        # ``min(...)`` cap and field mapping do not operate on bare Mocks.
         mock_settings.taker.minimum_makers = 4
-        mock_settings.taker.max_cj_fee_abs = 500
-        mock_settings.taker.max_cj_fee_rel = "0.001"
-        mock_settings.taker.tx_fee_factor = 0.2
-        mock_settings.taker.fee_rate = None
-        mock_settings.taker.fee_block_target = None
-        mock_settings.taker.bondless_makers_allowance = 0.2
-        mock_settings.taker.bond_value_exponent = 1.3
-        mock_settings.taker.bondless_require_zero_fee = True
-        mock_settings.taker.maker_timeout_sec = 60
-        mock_settings.taker.order_wait_time = 120.0
-        mock_settings.taker.tx_broadcast = "random-peer"
-        mock_settings.taker.broadcast_peer_count = 3
-        mock_settings.taker.rescan_interval_sec = 600
-        mock_settings.taker.pending_tx_abandon_hours = 24
-        mock_settings.taker.taker_utxo_age = 5
-        mock_settings.taker.taker_utxo_retries = 3
-        mock_settings.taker.taker_utxo_amtpercent = 20
-        mock_settings.wallet.mixdepth_count = 5
-        mock_settings.wallet.gap_limit = 20
-        mock_settings.wallet.scan_range = 1000
-        mock_settings.wallet.dust_threshold = 27300
-        mock_settings.wallet.max_sats_freeze_reuse = -1
-        mock_settings.wallet.max_fee_rate_sat_vb = 1000.0
-        mock_settings.wallet.default_fee_block_target = 3
         mock_get_settings.return_value = mock_settings
 
         resp = client.post(
@@ -163,7 +143,7 @@ class TestDoCoinjoin:
         assert resp.status_code == 202
 
         _, kwargs = mock_config.call_args
-        assert kwargs["mnemonic"] == state.wallet_mnemonic
+        assert kwargs["mnemonic"].get_secret_value() == state.wallet_mnemonic
         assert kwargs["network"] == NetworkType.SIGNET
         assert kwargs["directory_servers"] == expected_dirs
         assert kwargs["socks_host"] == "127.0.0.1"
@@ -195,49 +175,50 @@ class TestBuildCoinjoinTakerConfig:
         fee_block_target: int | None = None,
         tx_broadcast: str = "random-peer",
     ) -> object:
-        from types import SimpleNamespace
+        from pathlib import Path
 
-        return SimpleNamespace(
-            taker=SimpleNamespace(
-                minimum_makers=minimum_makers,
-                max_cj_fee_abs=500,
-                max_cj_fee_rel="0.001",
-                tx_fee_factor=0.2,
-                fee_rate=fee_rate,
-                fee_block_target=fee_block_target,
-                bondless_makers_allowance=0.2,
-                bond_value_exponent=1.3,
-                bondless_require_zero_fee=bondless_require_zero_fee,
-                maker_timeout_sec=60,
-                order_wait_time=120.0,
-                orderbook_min_wait=45.0,
-                orderbook_quiet_period=20.0,
-                tx_broadcast=tx_broadcast,
-                broadcast_peer_count=3,
-                rescan_interval_sec=600,
-                pending_tx_abandon_hours=24,
-                taker_utxo_age=5,
-                taker_utxo_retries=3,
-                taker_utxo_amtpercent=20,
-            ),
-            wallet=SimpleNamespace(
-                mixdepth_count=5,
-                gap_limit=20,
-                scan_range=1000,
-                dust_threshold=27300,
-                max_sats_freeze_reuse=-1,
-                max_fee_rate_sat_vb=1000.0,
-                default_fee_block_target=3,
-            ),
-            tor=SimpleNamespace(
-                socks_host="127.0.0.1",
-                socks_port=9050,
-                stream_isolation=True,
-                connection_timeout=120.0,
-            ),
-            network_config=SimpleNamespace(network="regtest"),
-            get_directory_servers=lambda: [],
-        )
+        from jmcore.models import NetworkType
+        from jmcore.settings import JoinMarketSettings
+
+        # A real settings object (not a hand-maintained stub) so the shared
+        # kwargs builder exercises the same attribute surface as production.
+        settings = JoinMarketSettings()
+        settings.data_dir = Path("/tmp/jm-test")
+        settings.network_config.network = NetworkType.REGTEST
+        settings.network_config.directory_servers = []
+        settings.bitcoin.backend_type = "descriptor_wallet"
+        settings.tor.socks_host = "127.0.0.1"
+        settings.tor.socks_port = 9050
+        settings.tor.stream_isolation = True
+        settings.tor.connection_timeout = 120.0
+        settings.taker.minimum_makers = minimum_makers
+        settings.taker.max_cj_fee_abs = 500
+        settings.taker.max_cj_fee_rel = "0.001"
+        settings.taker.tx_fee_factor = 0.2
+        settings.taker.fee_rate = fee_rate
+        settings.taker.fee_block_target = fee_block_target
+        settings.taker.bondless_makers_allowance = 0.2
+        settings.taker.bond_value_exponent = 1.3
+        settings.taker.bondless_require_zero_fee = bondless_require_zero_fee
+        settings.taker.maker_timeout_sec = 60
+        settings.taker.order_wait_time = 120.0
+        settings.taker.orderbook_min_wait = 45.0
+        settings.taker.orderbook_quiet_period = 20.0
+        settings.taker.tx_broadcast = tx_broadcast
+        settings.taker.broadcast_peer_count = 3
+        settings.taker.rescan_interval_sec = 600
+        settings.taker.pending_tx_abandon_hours = 24
+        settings.taker.taker_utxo_age = 5
+        settings.taker.taker_utxo_retries = 3
+        settings.taker.taker_utxo_amtpercent = 20
+        settings.wallet.mixdepth_count = 5
+        settings.wallet.gap_limit = 20
+        settings.wallet.scan_range = 1000
+        settings.wallet.dust_threshold = 27300
+        settings.wallet.max_sats_freeze_reuse = -1
+        settings.wallet.max_fee_rate_sat_vb = 1000.0
+        settings.wallet.default_fee_block_target = 3
+        return settings
 
     def _body(
         self,

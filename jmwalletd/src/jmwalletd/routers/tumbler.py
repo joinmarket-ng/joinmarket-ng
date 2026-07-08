@@ -226,34 +226,34 @@ def build_tumbler_taker_config(
 ) -> Any:
     """Build a ``TakerConfig`` for a tumbler taker phase.
 
-    Mirrors the per-phase config that ``taker.cli.build_taker_config`` would
-    produce when a CLI caller lowers ``--counterparties`` below
-    ``settings.taker.minimum_makers``. The tumbler walletd path does not
-    go through that CLI helper, so the cap must be re-applied here.
+    Delegates to :func:`taker.config_builder.build_taker_config_kwargs` (the
+    same mapping the CLI taker and standalone tumbler use) so daemon-run
+    tumbler phases honor every ``[taker]`` policy setting. This factory used
+    to set only the network/Tor/directory fields, so fee limits, timeouts,
+    and the orderbook-wait knobs silently fell back to ``TakerConfig``
+    defaults for tumbles started through the API.
 
-    Without this cap, sweep mode can legitimately select an N-maker
-    CoinJoin (where N == ``phase.counterparty_count``) and then reject
-    it against a higher policy-level ``minimum_makers`` (default 4),
-    failing the phase with ``Not enough makers for sweep: N``.
+    ``minimum_makers`` is capped at the phase's ``counterparty_count`` so a
+    sweep that legitimately selects N makers is not rejected against a
+    higher policy threshold (default 4), which failed phases with
+    ``Not enough makers for sweep: N``.
+
+    ``destination`` is resolved inside the runner (INTERNAL sentinel), so an
+    empty placeholder is passed here; the Taker reads it only when
+    ``do_coinjoin`` is not given one.
     """
-    phase_counterparties = int(getattr(phase, "counterparty_count", 1) or 1)
-    effective_minimum_makers = min(jm_settings.taker.minimum_makers, phase_counterparties)
-    return taker_config_cls(
-        mnemonic=mnemonic,
-        mixdepth=getattr(phase, "mixdepth", 0),
+    from taker.config_builder import build_taker_config_kwargs
+
+    kwargs = build_taker_config_kwargs(
+        jm_settings,
+        mnemonic,
+        "",
         amount=getattr(phase, "amount", 0) or 0,
-        # ``destination`` is resolved inside the runner (INTERNAL sentinel),
-        # so we pass a throwaway here; the Taker reads it only when
-        # ``do_coinjoin`` is not given one.
-        destination_address="",
-        counterparty_count=phase_counterparties,
-        minimum_makers=effective_minimum_makers,
-        network=jm_settings.network_config.network,
-        directory_servers=jm_settings.get_directory_servers(),
-        socks_host=jm_settings.tor.socks_host,
-        socks_port=jm_settings.tor.socks_port,
-        stream_isolation=jm_settings.tor.stream_isolation,
+        destination="",
+        mixdepth=getattr(phase, "mixdepth", 0),
+        counterparties=int(getattr(phase, "counterparty_count", 1) or 1),
     )
+    return taker_config_cls(**kwargs)
 
 
 # ---------------------------------------------------------------------------
