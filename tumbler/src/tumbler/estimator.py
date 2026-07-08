@@ -135,7 +135,7 @@ def estimate_plan_costs(
     max_cj_fee_rel: str | float,
     fee_rate_sat_vb: float | None = None,
     fee_rate_source: str | None = None,
-    confirmation_block_count: int = 5,
+    confirmation_block_count: int = 6,
     block_time_seconds: float = 600.0,
 ) -> PlanEstimate:
     """
@@ -167,7 +167,7 @@ def estimate_plan_costs(
         the caller resolved a ``fee_block_target`` to a concrete rate
         upstream and wants the output labelled accordingly.
     confirmation_block_count
-        ``RunnerContext.min_confirmations_between_phases`` (default 5).
+        ``RunnerContext.min_confirmations_between_phases`` (default 6).
         Plumbed into the duration estimate so the inter-phase wait for
         confirmations is not silently ignored.
     block_time_seconds

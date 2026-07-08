@@ -17,7 +17,7 @@ from __future__ import annotations
 import asyncio
 import signal
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, NamedTuple
 
 import typer
 from jmcore.cli_common import resolve_mnemonic, setup_cli
@@ -53,6 +53,36 @@ app = typer.Typer(
 # ---------------------------------------------------------------------------
 # Shared CLI helpers
 # ---------------------------------------------------------------------------
+
+
+class RunnerPacing(NamedTuple):
+    """Resolved inter-phase pacing knobs for :class:`tumbler.runner.RunnerContext`."""
+
+    min_confirmations_between_phases: int
+    confirmation_poll_interval: float
+    retry_delay_seconds: float
+
+
+def resolve_runner_pacing(settings: Any, min_confirmations_override: int | None) -> RunnerPacing:
+    """Resolve runner pacing from ``[tumbler]`` settings with a CLI override.
+
+    ``--min-confirmations`` (when given) wins over the configured
+    ``min_confirmations_between_phases``. The confirmation poll interval and
+    retry delay always come from settings (``[tumbler]`` config section or
+    ``TUMBLER__*`` env vars); previously they were silently ignored by the
+    standalone CLI and only honored by jmwalletd.
+    """
+    tumbler_settings = settings.tumbler
+    min_confirmations = (
+        min_confirmations_override
+        if min_confirmations_override is not None
+        else tumbler_settings.min_confirmations_between_phases
+    )
+    return RunnerPacing(
+        min_confirmations_between_phases=min_confirmations,
+        confirmation_poll_interval=tumbler_settings.confirmation_poll_interval,
+        retry_delay_seconds=tumbler_settings.retry_delay_seconds,
+    )
 
 
 def _load_or_error(wallet_name: str, data_dir: Path) -> Plan:
@@ -421,6 +451,7 @@ def plan_command(
         max_cj_fee_rel=settings.taker.max_cj_fee_rel,
         fee_rate_sat_vb=fee_rate,
         fee_rate_source=fee_rate_source,
+        confirmation_block_count=settings.tumbler.min_confirmations_between_phases,
     )
     _summarise_plan(plan, estimate=estimate)
 
@@ -608,12 +639,16 @@ def run_command(
         ),
     ] = None,
     min_confirmations_between_phases: Annotated[
-        int,
+        int | None,
         typer.Option(
             "--min-confirmations",
-            help="Confirmations required before the next phase starts (0 disables gating)",
+            help=(
+                "Confirmations required before the next phase starts (0 disables "
+                "gating). Defaults to the tumbler.min_confirmations_between_phases "
+                "setting (6)."
+            ),
         ),
-    ] = 5,
+    ] = None,
     counterparties: Annotated[
         int | None,
         typer.Option(
@@ -907,7 +942,7 @@ async def _run_plan(
     tor_socks_port: int | None,
     fee_rate: float | None,
     block_target: int | None,
-    min_confirmations_between_phases: int,
+    min_confirmations_between_phases: int | None,
     counterparties_override: int | None = None,
 ) -> None:
     """Instantiate backend, wallet, and runner; execute the plan."""
@@ -1015,6 +1050,7 @@ async def _run_plan(
 
         return await resolve_confirmations(txid, shared_backend, data_dir)
 
+    pacing = resolve_runner_pacing(settings, min_confirmations_between_phases)
     ctx = RunnerContext(
         wallet_service=wallet,
         wallet_name=plan.wallet_name,
@@ -1022,7 +1058,9 @@ async def _run_plan(
         taker_factory=_taker_factory,
         maker_factory=_maker_factory,
         get_confirmations=_get_confirmations,
-        min_confirmations_between_phases=min_confirmations_between_phases,
+        min_confirmations_between_phases=pacing.min_confirmations_between_phases,
+        confirmation_poll_interval=pacing.confirmation_poll_interval,
+        retry_delay_seconds=pacing.retry_delay_seconds,
     )
     runner = TumbleRunner(plan, ctx)
 

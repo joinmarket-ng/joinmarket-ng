@@ -15,7 +15,7 @@ from unittest.mock import patch
 from typer.testing import CliRunner
 
 from tumbler.builder import PlanBuilder, TumbleParameters
-from tumbler.cli import app
+from tumbler.cli import app, resolve_runner_pacing
 from tumbler.persistence import save_plan
 from tumbler.plan import Plan
 
@@ -43,7 +43,8 @@ class _FakeSettings:
     """Minimal ``settings`` stand-in for :func:`tumbler.cli._resolve_wallet_name`.
 
     We only touch ``get_data_dir`` and ``network_config.network``; the
-    neutrino-path test additionally touches ``bitcoin.backend_type``.
+    neutrino-path test additionally touches ``bitcoin.backend_type`` and the
+    plan/run paths read the ``[tumbler]`` pacing knobs.
     """
 
     class _Net:
@@ -58,10 +59,16 @@ class _FakeSettings:
         def __init__(self, backend_type: str) -> None:
             self.backend_type = backend_type
 
+    class _Tumbler:
+        min_confirmations_between_phases = 6
+        confirmation_poll_interval = 30.0
+        retry_delay_seconds = 1800.0
+
     def __init__(self, data_dir: Path, network: str = "regtest", backend: str = "") -> None:
         self._data_dir = data_dir
         self.network_config = self._Net(network)
         self.bitcoin = self._Bitcoin(backend)
+        self.tumbler = self._Tumbler()
 
     def get_data_dir(self) -> Path:
         return self._data_dir
@@ -402,3 +409,39 @@ class TestPlanFewDestinationsGate:
         result = self._invoke(tmp_path, ["--allow-few-destinations"])
         assert result.exit_code == 0, result.stdout
         assert "Plan written to" in result.stdout
+
+
+class TestResolveRunnerPacing:
+    """Settings-to-RunnerContext round trip for the ``[tumbler]`` pacing knobs.
+
+    Regression: the standalone CLI built its ``RunnerContext`` with only
+    ``min_confirmations_between_phases`` (from a hardcoded option default),
+    so ``confirmation_poll_interval`` and ``retry_delay_seconds`` from the
+    config file / ``TUMBLER__*`` env vars were silently ignored.
+    """
+
+    def _settings(self, tmp_path: Path) -> _FakeSettings:
+        settings = _FakeSettings(tmp_path)
+        settings.tumbler.min_confirmations_between_phases = 3
+        settings.tumbler.confirmation_poll_interval = 2.5
+        settings.tumbler.retry_delay_seconds = 10.0
+        return settings
+
+    def test_pacing_pulled_from_settings_without_override(self, tmp_path: Path) -> None:
+        pacing = resolve_runner_pacing(self._settings(tmp_path), None)
+        assert pacing.min_confirmations_between_phases == 3
+        assert pacing.confirmation_poll_interval == 2.5
+        assert pacing.retry_delay_seconds == 10.0
+
+    def test_cli_override_wins_for_min_confirmations_only(self, tmp_path: Path) -> None:
+        pacing = resolve_runner_pacing(self._settings(tmp_path), 1)
+        assert pacing.min_confirmations_between_phases == 1
+        # The other pacing knobs still come from settings.
+        assert pacing.confirmation_poll_interval == 2.5
+        assert pacing.retry_delay_seconds == 10.0
+
+    def test_zero_override_disables_gate(self, tmp_path: Path) -> None:
+        # 0 is a meaningful value ("disable the gate") and must not be
+        # confused with "not provided".
+        pacing = resolve_runner_pacing(self._settings(tmp_path), 0)
+        assert pacing.min_confirmations_between_phases == 0
