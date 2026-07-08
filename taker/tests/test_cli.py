@@ -70,6 +70,8 @@ class TestBuildTakerConfig:
         settings.taker.tx_fee_factor = 0.2
         settings.taker.maker_timeout_sec = 60
         settings.taker.order_wait_time = 10.0
+        settings.taker.orderbook_min_wait = 30.0
+        settings.taker.orderbook_quiet_period = 15.0
         settings.taker.rescan_interval_sec = 600
         settings.taker.taker_utxo_age = 5
         settings.taker.taker_utxo_retries = 3
@@ -184,6 +186,27 @@ class TestBuildTakerConfig:
 
         assert config.counterparty_count == 1
         assert config.minimum_makers == 1
+
+    def test_orderbook_wait_settings_forwarded(
+        self, sample_mnemonic: str, mock_settings: MagicMock
+    ) -> None:
+        """Regression: ``taker.orderbook_min_wait`` and ``taker.orderbook_quiet_period``
+        from config.toml must reach the TakerConfig instead of silently falling
+        back to the model defaults."""
+        mock_settings.taker.orderbook_min_wait = 45.0
+        mock_settings.taker.orderbook_quiet_period = 20.0
+
+        config = build_taker_config(
+            settings=mock_settings,
+            mnemonic=sample_mnemonic,
+            passphrase="",
+            destination="bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+            amount=100000,
+            mixdepth=0,
+        )
+
+        assert config.orderbook_min_wait == 45.0
+        assert config.orderbook_quiet_period == 20.0
 
     def test_taker_fee_rate_setting_honored_without_cli_flag(
         self, sample_mnemonic: str, mock_settings: MagicMock

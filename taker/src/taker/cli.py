@@ -254,6 +254,8 @@ def build_taker_config(
         bondless_makers_allowance_require_zero_fee=effective_bondless_zero_fee,
         maker_timeout_sec=settings.taker.maker_timeout_sec,
         order_wait_time=settings.taker.order_wait_time,
+        orderbook_min_wait=settings.taker.orderbook_min_wait,
+        orderbook_quiet_period=settings.taker.orderbook_quiet_period,
         tx_broadcast=broadcast_policy,
         broadcast_peer_count=settings.taker.broadcast_peer_count,
         minimum_makers=effective_minimum_makers,
