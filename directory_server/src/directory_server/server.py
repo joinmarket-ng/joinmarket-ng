@@ -14,6 +14,7 @@ from jmcore.notifications import get_notifier
 from jmcore.protocol import MessageType
 from jmcore.rate_limiter import RateLimitAction, RateLimiter
 from jmcore.settings import DirectoryServerSettings
+from jmcore.tasks import spawn_task
 from jmcore.version import __version__
 from loguru import logger
 
@@ -265,7 +266,7 @@ class DirectoryServer:
 
         # Fire-and-forget notification for peer connect
         total_peers = self.peer_registry.count()
-        asyncio.create_task(
+        spawn_task(
             get_notifier().notify_peer_connected(
                 peer_info.nick, peer_info.location_string, total_peers
             )
@@ -291,7 +292,7 @@ class DirectoryServer:
                         f"{violations} violations, disconnecting"
                     )
                     # Fire-and-forget notification for rate limit ban
-                    asyncio.create_task(
+                    spawn_task(
                         get_notifier().notify_peer_banned(
                             peer_info.nick,
                             "Rate limit exceeded",
@@ -346,9 +347,7 @@ class DirectoryServer:
                     total_peers = (
                         self.peer_registry.count() - 1
                     )  # Minus 1 since we're about to unregister
-                    asyncio.create_task(
-                        get_notifier().notify_peer_disconnected(peer_info.nick, total_peers)
-                    )
+                    spawn_task(get_notifier().notify_peer_disconnected(peer_info.nick, total_peers))
                     await self.message_router.broadcast_peer_disconnect(
                         peer_info.location_string, peer_info.network
                     )
@@ -421,7 +420,7 @@ class DirectoryServer:
 
         # Fire-and-forget notification
         total_peers = self.peer_registry.count() - 1
-        asyncio.create_task(get_notifier().notify_peer_disconnected(peer_info.nick, total_peers))
+        spawn_task(get_notifier().notify_peer_disconnected(peer_info.nick, total_peers))
 
         # Unregister from registry
         self.peer_registry.unregister(peer_key)

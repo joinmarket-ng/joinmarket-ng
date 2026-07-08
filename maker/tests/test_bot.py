@@ -1555,7 +1555,7 @@ class TestDirectoryReconnection:
         recovery_notify = AsyncMock(return_value=True)
         reconnect_notify = AsyncMock(return_value=True)
 
-        def create_task_stub(coro: object) -> MagicMock:
+        def create_task_stub(coro: object, **_kwargs: object) -> MagicMock:
             if asyncio.iscoroutine(coro):
                 coro.close()
             return MagicMock()
@@ -1600,7 +1600,7 @@ class TestDirectoryReconnection:
 
         recovery_notify = AsyncMock(return_value=True)
 
-        def create_task_stub(coro: object) -> MagicMock:
+        def create_task_stub(coro: object, **_kwargs: object) -> MagicMock:
             if asyncio.iscoroutine(coro):
                 coro.close()
             return MagicMock()

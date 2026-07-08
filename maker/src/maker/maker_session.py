@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any
 
 from jmcore.notifications import get_notifier
 from jmcore.protocol import UTXOMetadata
+from jmcore.tasks import spawn_task
 from jmwallet.history import (
     append_history_entry,
     create_maker_history_entry,
@@ -288,7 +289,7 @@ class MakerSession:
                 except Exception as e:
                     logger.warning(f"Failed to send !error to {taker_nick}: {e}")
 
-                asyncio.create_task(
+                spawn_task(
                     get_notifier().notify_rejection(
                         taker_nick,
                         error_code or "PoDLE verification failed",
@@ -396,7 +397,7 @@ class MakerSession:
                 except Exception as e:
                     logger.warning(f"Failed to update CoinJoin history: {e}")
 
-                asyncio.create_task(
+                spawn_task(
                     get_notifier().notify_tx_signed(
                         taker_nick,
                         self.amount,
@@ -408,10 +409,10 @@ class MakerSession:
                 bot.active_sessions.pop(taker_nick, None)
 
                 # Schedule wallet re-sync in background to avoid blocking !push handling
-                asyncio.create_task(bot._deferred_wallet_resync())
+                spawn_task(bot._deferred_wallet_resync())
             else:
                 logger.error(f"TX verification failed: {response.get('error')}")
-                asyncio.create_task(
+                spawn_task(
                     get_notifier().notify_rejection(
                         taker_nick, "TX verification failed", response.get("error", "")
                     )

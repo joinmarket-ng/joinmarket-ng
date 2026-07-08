@@ -141,7 +141,7 @@ from jmcore.settings import (
     get_settings,
     reset_settings,
 )
-from jmcore.tasks import parse_directory_address, run_periodic_task
+from jmcore.tasks import parse_directory_address, run_periodic_task, spawn_task
 from jmcore.timenumber import (
     TIMELOCK_EPOCH,
     TIMELOCK_EPOCH_TIMESTAMP,
@@ -341,6 +341,7 @@ __all__ = [
     # Tasks
     "parse_directory_address",
     "run_periodic_task",
+    "spawn_task",
     # Settings
     "BitcoinSettings",
     "DEFAULT_DIRECTORY_SERVERS",

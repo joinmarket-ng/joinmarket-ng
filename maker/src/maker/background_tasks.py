@@ -14,6 +14,7 @@ from jmcore.crypto import NickIdentity
 from jmcore.directory_client import DirectoryClient, DirectoryClientError
 from jmcore.models import Offer
 from jmcore.notifications import get_notifier
+from jmcore.tasks import spawn_task
 from jmwallet.backends.base import BlockchainBackend
 from loguru import logger
 
@@ -326,7 +327,7 @@ class BackgroundTasksMixin:
                         # Notify reconnection
                         connected_count = len(self.directory_clients)
                         total_count = len(self.config.directory_servers)
-                        asyncio.create_task(
+                        spawn_task(
                             get_notifier().notify_directory_reconnect(
                                 new_node_id, connected_count, total_count
                             )
@@ -335,7 +336,7 @@ class BackgroundTasksMixin:
                         # If all directories were previously disconnected, send a recovery alert
                         if self._all_directories_disconnected:
                             self._all_directories_disconnected = False
-                            asyncio.create_task(
+                            spawn_task(
                                 get_notifier().notify_all_directories_reconnected(
                                     connected_count, total_count
                                 )
@@ -636,14 +637,14 @@ class BackgroundTasksMixin:
                 # Fire-and-forget notification for directory disconnect
                 connected_count = len(self.directory_clients)
                 total_count = len(self.config.directory_servers)
-                asyncio.create_task(
+                spawn_task(
                     get_notifier().notify_directory_disconnect(
                         node_id, connected_count, total_count, reconnecting=True
                     )
                 )
                 if connected_count == 0:
                     self._all_directories_disconnected = True
-                    asyncio.create_task(get_notifier().notify_all_directories_disconnected())
+                    spawn_task(get_notifier().notify_all_directories_disconnected())
                 break
             except Exception as e:
                 consecutive_errors += 1

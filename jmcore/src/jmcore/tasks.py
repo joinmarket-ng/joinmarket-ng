@@ -62,3 +62,49 @@ def parse_directory_address(server: str, default_port: int = 5222) -> tuple[str,
     host = parts[0]
     port = int(parts[1]) if len(parts) > 1 else default_port
     return host, port
+
+
+# ---------------------------------------------------------------------------
+# Supervised fire-and-forget tasks
+# ---------------------------------------------------------------------------
+#
+# ``asyncio`` only keeps a *weak* reference to running tasks: a task that no
+# one references can be garbage-collected mid-flight, silently dropping the
+# coroutine, and an exception it raises is reported (at best) as a cryptic
+# "Task exception was never retrieved" message during interpreter shutdown.
+#
+# ``spawn_task`` centralizes the safe pattern for fire-and-forget work
+# (notifications, commitment broadcasts, deferred resyncs, ...): it keeps a
+# strong reference to the task in a module-level registry until the task
+# finishes, and logs any exception the task raised, since by definition no
+# caller ever awaits the result. Callers that manage task lifecycles
+# explicitly (worker pools, per-client task sets) do not need this helper.
+
+# Strong references to in-flight fire-and-forget tasks. Entries remove
+# themselves on completion via the done callback.
+_BACKGROUND_TASKS: set[asyncio.Task[Any]] = set()
+
+
+def _on_spawned_task_done(task: asyncio.Task[Any]) -> None:
+    _BACKGROUND_TASKS.discard(task)
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.opt(exception=exc).error(f"Background task {task.get_name()!r} failed")
+
+
+def spawn_task(coro: Coroutine[Any, Any, Any], *, name: str | None = None) -> asyncio.Task[Any]:
+    """Run ``coro`` as a supervised fire-and-forget task.
+
+    The task is kept alive (strongly referenced) until it completes and any
+    exception it raises is logged instead of being silently dropped. Must be
+    called from a running event loop, like ``asyncio.create_task``.
+
+    The task is returned so callers *may* additionally await or cancel it,
+    but keeping the returned handle is not required for the task to survive.
+    """
+    task = asyncio.create_task(coro, name=name)
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_on_spawned_task_done)
+    return task

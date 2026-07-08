@@ -27,6 +27,7 @@ from jmcore.encryption import CryptoSession
 from jmcore.notifications import get_notifier
 from jmcore.paths import read_nick_state
 from jmcore.protocol import FEATURE_NEUTRINO_COMPAT, JM_VERSION
+from jmcore.tasks import spawn_task
 from jmwallet.backends.base import BlockchainBackend, BondVerificationRequest
 from jmwallet.history import (
     update_taker_awaiting_transaction_broadcast,
@@ -1000,7 +1001,7 @@ class Taker(TakerMonitoringMixin):
             # Fire-and-forget notification for failed CoinJoin
             phase = self.state.value if hasattr(self, "state") else ""
             amount = self._session.cj_amount
-            asyncio.create_task(get_notifier().notify_coinjoin_failed(str(e), phase, amount))
+            spawn_task(get_notifier().notify_coinjoin_failed(str(e), phase, amount))
             self.state = TakerState.FAILED
             return None
 
@@ -1248,7 +1249,7 @@ class Taker(TakerMonitoringMixin):
         else:
             logger.debug("Direct connections disabled - all messages relayed through directories")
 
-        asyncio.create_task(
+        spawn_task(
             get_notifier().notify_coinjoin_start(
                 self._session.cj_amount, len(self._session.maker_sessions), destination
             )
@@ -1526,7 +1527,7 @@ class Taker(TakerMonitoringMixin):
             logger.warning(f"Failed to update CoinJoin history: {e}")
 
         total_fees = total_maker_fees + actual_mining_fee
-        asyncio.create_task(
+        spawn_task(
             get_notifier().notify_coinjoin_complete(
                 self._session.txid,
                 self._session.cj_amount,

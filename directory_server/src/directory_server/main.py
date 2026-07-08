@@ -10,6 +10,7 @@ from jmcore.crypto import generate_jm_nick
 from jmcore.notifications import get_notifier
 from jmcore.paths import remove_nick_state, write_nick_state
 from jmcore.settings import get_settings
+from jmcore.tasks import spawn_task
 from loguru import logger
 
 from directory_server.server import DirectoryServer
@@ -57,7 +58,7 @@ async def run_server() -> None:
 
     def shutdown_handler() -> None:
         logger.info("Received shutdown signal")
-        asyncio.create_task(server.stop())
+        spawn_task(server.stop())
 
     def status_handler() -> None:
         logger.info("Received status signal")

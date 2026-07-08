@@ -6,7 +6,7 @@ import asyncio
 
 import pytest
 
-from jmcore.tasks import parse_directory_address, run_periodic_task
+from jmcore.tasks import _BACKGROUND_TASKS, parse_directory_address, run_periodic_task, spawn_task
 
 
 class TestRunPeriodicTask:
@@ -143,6 +143,83 @@ class TestRunPeriodicTask:
     @staticmethod
     async def _noop() -> None:
         pass
+
+
+class TestSpawnTask:
+    """Tests for the supervised fire-and-forget ``spawn_task`` helper."""
+
+    @pytest.mark.asyncio
+    async def test_runs_to_completion_and_returns_task(self) -> None:
+        done = asyncio.Event()
+
+        async def work() -> None:
+            done.set()
+
+        task = spawn_task(work(), name="spawn-complete-test")
+        await asyncio.wait_for(done.wait(), timeout=1.0)
+        await task
+        assert task.done()
+        assert task.get_name() == "spawn-complete-test"
+
+    @pytest.mark.asyncio
+    async def test_holds_strong_reference_until_done(self) -> None:
+        """The registry must reference the task while it runs and release it after."""
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def work() -> None:
+            started.set()
+            await release.wait()
+
+        task = spawn_task(work())
+        await asyncio.wait_for(started.wait(), timeout=1.0)
+        assert task in _BACKGROUND_TASKS
+
+        release.set()
+        await task
+        # The done callback runs via call_soon; yield to the loop once.
+        await asyncio.sleep(0)
+        assert task not in _BACKGROUND_TASKS
+
+    @pytest.mark.asyncio
+    async def test_exception_is_logged_not_swallowed(self) -> None:
+        from loguru import logger
+
+        records: list[str] = []
+        sink_id = logger.add(records.append, level="ERROR")
+        try:
+
+            async def boom() -> None:
+                raise ValueError("kaboom")
+
+            task = spawn_task(boom(), name="spawn-error-test")
+            with pytest.raises(ValueError):
+                await task
+            await asyncio.sleep(0)
+        finally:
+            logger.remove(sink_id)
+
+        assert any("spawn-error-test" in line and "kaboom" in line for line in records)
+        assert task not in _BACKGROUND_TASKS
+
+    @pytest.mark.asyncio
+    async def test_cancelled_task_is_released_without_error_log(self) -> None:
+        from loguru import logger
+
+        records: list[str] = []
+        sink_id = logger.add(records.append, level="ERROR")
+        try:
+            task = spawn_task(asyncio.sleep(60), name="spawn-cancel-test")
+            await asyncio.sleep(0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            await asyncio.sleep(0)
+        finally:
+            logger.remove(sink_id)
+
+        assert task not in _BACKGROUND_TASKS
+        assert not any("spawn-cancel-test" in line for line in records)
 
 
 class TestParseDirectoryAddress:

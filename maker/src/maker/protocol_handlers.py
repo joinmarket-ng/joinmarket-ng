@@ -21,7 +21,7 @@ from jmcore.models import Offer
 from jmcore.notifications import get_notifier
 from jmcore.protocol import COMMAND_PREFIX, JM_VERSION, MessageType
 from jmcore.rate_limiter import RateLimitAction, RateLimiter
-from jmcore.tasks import parse_directory_address
+from jmcore.tasks import parse_directory_address, spawn_task
 from jmwallet.backends.base import BlockchainBackend
 from jmwallet.wallet.service import WalletService
 from loguru import logger
@@ -474,9 +474,7 @@ class ProtocolHandlersMixin:
                 )
 
                 # Fire-and-forget notification
-                asyncio.create_task(
-                    get_notifier().notify_fill_request(taker_nick, amount, offer_id)
-                )
+                spawn_task(get_notifier().notify_fill_request(taker_nick, amount, offer_id))
 
                 await self._send_response(taker_nick, "pubkey", response)
             else:
@@ -647,7 +645,7 @@ class ProtocolHandlersMixin:
             add_commitment(commitment)
 
             # Broadcast via ephemeral identity (fire-and-forget)
-            asyncio.create_task(self._broadcast_commitment_ephemeral(commitment, is_relay=True))
+            spawn_task(self._broadcast_commitment_ephemeral(commitment, is_relay=True))
 
         except Exception as e:
             logger.error(f"Failed to handle !hp2 relay request: {e}")
@@ -686,7 +684,7 @@ class ProtocolHandlersMixin:
             add_commitment(commitment)
 
             # Broadcast via ephemeral identity (fire-and-forget)
-            asyncio.create_task(self._broadcast_commitment_ephemeral(commitment, is_relay=False))
+            spawn_task(self._broadcast_commitment_ephemeral(commitment, is_relay=False))
 
             logger.debug(f"Scheduled ephemeral commitment broadcast: {commitment[:16]}...")
 

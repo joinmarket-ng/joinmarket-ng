@@ -50,6 +50,7 @@ from tumbler.plan import (
 from tumbler.runner import RunnerContext, TumbleRunner
 
 from jmcore.settings import get_settings
+from jmcore.tasks import spawn_task
 from jmwalletd.deps import get_daemon_state, require_auth, require_wallet_match
 from jmwalletd.errors import (
     ActionNotAllowed,
@@ -523,7 +524,7 @@ async def stop_plan(
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await task
 
-    asyncio.create_task(_finish_stop())
+    spawn_task(_finish_stop())
     return JSONResponse(content={}, status_code=202)
 
 

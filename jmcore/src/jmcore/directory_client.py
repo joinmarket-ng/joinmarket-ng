@@ -47,6 +47,7 @@ from jmcore.protocol import (
     parse_peerlist_entry,
     peer_supports_neutrino_compat,
 )
+from jmcore.tasks import spawn_task
 
 
 class OfferWithTimestamp:
@@ -1227,9 +1228,7 @@ class DirectoryClient:
                                         try:
                                             # Request peerlist to get features for new peer
                                             # This is a background task - don't block message processing
-                                            asyncio.create_task(
-                                                self._refresh_peerlist_for_new_peer()
-                                            )
+                                            spawn_task(self._refresh_peerlist_for_new_peer())
                                         except Exception as e:
                                             logger.debug(
                                                 f"Failed to request peerlist for new peer: {e}"
