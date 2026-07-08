@@ -58,7 +58,6 @@ class DaemonState:
         self.coinjoin_state = CoinjoinState.NOT_RUNNING
         self.maker_running: bool = False
         self.taker_running: bool = False
-        self.current_schedule: list[list[str | int | float]] | None = None
         self.offer_list: list[dict[str, str | int | float]] | None = None
         self.nickname: str | None = None
 
@@ -209,7 +208,6 @@ class DaemonState:
         self.maker_running = False
         self.taker_running = False
         self.coinjoin_state = CoinjoinState.NOT_RUNNING
-        self.current_schedule = None
         self.offer_list = None
         self.nickname = None
         self._taker_ref = None

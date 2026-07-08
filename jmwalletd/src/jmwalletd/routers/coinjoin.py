@@ -220,7 +220,6 @@ async def stop_coinjoin(
             await state._taker_task
 
     state.activate_coinjoin_state(CoinjoinState.NOT_RUNNING)
-    state.current_schedule = None
     state._taker_ref = None
     state._taker_task = None
     return JSONResponse(content={}, status_code=202)

@@ -29,6 +29,7 @@ from jmwalletd.errors import (
     WalletAlreadyUnlocked,
     WalletNotFound,
 )
+from jmwalletd.legacy_schedule import plan_to_legacy_schedule
 from jmwalletd.models import (
     CreateWalletRequest,
     CreateWalletResponse,
@@ -42,7 +43,7 @@ from jmwalletd.models import (
     UnlockWalletRequest,
     UnlockWalletResponse,
 )
-from jmwalletd.state import DaemonState
+from jmwalletd.state import CoinjoinState, DaemonState
 from jmwalletd.wallet_ops import (
     create_wallet,
     open_wallet_with_mnemonic,
@@ -82,6 +83,24 @@ def _get_offer_list_from_maker(
         }
         for o in offers
     ]
+
+
+def _get_running_tumble_schedule(
+    state: DaemonState,
+) -> list[list[str | int | float]] | None:
+    """Render the live tumbler plan as a legacy schedule, or ``None``.
+
+    Mirrors the reference implementation, where ``/session`` only carries a
+    schedule while a tumble is in progress (single-shot taker coinjoins do
+    not expose one). The plan is read straight from the live runner so
+    completion flags and txids are always current (issue #553).
+    """
+    if state.coinjoin_state != CoinjoinState.TUMBLER_RUNNING:
+        return None
+    runner = state.tumble_runner
+    if runner is None:
+        return None
+    return plan_to_legacy_schedule(runner.plan)
 
 
 router = APIRouter()
@@ -158,7 +177,7 @@ async def get_session(
 
     # Populate extra fields only when authenticated.
     if state.wallet_loaded and token_valid:
-        resp.schedule = state.current_schedule
+        resp.schedule = _get_running_tumble_schedule(state)
         resp.nickname = state.nickname
 
         # Read offer_list directly from the running maker bot so that the

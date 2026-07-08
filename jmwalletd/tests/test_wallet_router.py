@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 
 from jmwalletd.app import create_app
 from jmwalletd.deps import get_daemon_state, set_daemon_state
-from jmwalletd.state import DaemonState
+from jmwalletd.state import CoinjoinState, DaemonState
 
 
 @pytest.fixture
@@ -126,6 +126,88 @@ class TestGetSession:
         resp = client.get("/api/v1/session")
         assert resp.status_code == 200
         assert resp.json()["rescanning"] is False
+
+
+class TestSessionSchedule:
+    """/session must expose the running tumble as a legacy schedule (#553)."""
+
+    DEST = "bcrt1qpnv3nze7u6ecw63mn06ksxh497a3lryagh233q"
+
+    def _install_fake_tumbler(self, state: DaemonState) -> None:
+        from types import SimpleNamespace
+
+        from tumbler.plan import PhaseStatus, Plan, TakerCoinjoinPhase
+
+        plan = Plan(
+            wallet_name="test_wallet.jmdat",
+            destinations=[self.DEST],
+            phases=[
+                TakerCoinjoinPhase(
+                    index=0,
+                    mixdepth=0,
+                    amount_fraction=0.25,
+                    counterparty_count=4,
+                    destination="INTERNAL",
+                    wait_seconds=120.0,
+                    status=PhaseStatus.COMPLETED,
+                    txid="a" * 64,
+                ),
+                TakerCoinjoinPhase(
+                    index=1,
+                    mixdepth=1,
+                    amount_fraction=0.0,
+                    counterparty_count=6,
+                    destination=self.DEST,
+                    status=PhaseStatus.RUNNING,
+                ),
+            ],
+            current_phase=1,
+        )
+        state.tumble_runner = SimpleNamespace(plan=plan)
+        state.tumble_plan_wallet = state.wallet_name
+        state.activate_coinjoin_state(CoinjoinState.TUMBLER_RUNNING)
+
+    def test_schedule_populated_while_tumbler_runs(
+        self, authed_client: tuple[TestClient, str]
+    ) -> None:
+        client, token = authed_client
+        self._install_fake_tumbler(get_daemon_state())
+
+        resp = client.get("/api/v1/session", headers={"Authorization": f"Bearer {token}"})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["coinjoin_in_process"] is True
+        assert data["schedule"] == [
+            [0, 0.25, 4, "INTERNAL", 2.0, 16, 1],
+            [1, 0.0, 6, self.DEST, 0.0, 16, 0],
+        ]
+
+    def test_schedule_hidden_without_token(self, authed_client: tuple[TestClient, str]) -> None:
+        client, _ = authed_client
+        self._install_fake_tumbler(get_daemon_state())
+
+        resp = client.get("/api/v1/session")
+        assert resp.status_code == 200
+        assert resp.json()["schedule"] is None
+
+    def test_schedule_null_when_idle(self, authed_client: tuple[TestClient, str]) -> None:
+        client, token = authed_client
+        resp = client.get("/api/v1/session", headers={"Authorization": f"Bearer {token}"})
+        assert resp.status_code == 200
+        assert resp.json()["schedule"] is None
+
+    def test_schedule_null_for_single_shot_taker(
+        self, authed_client: tuple[TestClient, str]
+    ) -> None:
+        """Direct /taker/coinjoin runs carry no schedule, like the reference."""
+        client, token = authed_client
+        get_daemon_state().activate_coinjoin_state(CoinjoinState.TAKER_RUNNING)
+
+        resp = client.get("/api/v1/session", headers={"Authorization": f"Bearer {token}"})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["coinjoin_in_process"] is True
+        assert data["schedule"] is None
 
 
 class TestListWallets:

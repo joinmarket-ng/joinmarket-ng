@@ -307,6 +307,22 @@ The rounding is sampled at plan-build time and stored on
 `TakerCoinjoinPhase.rounding_sigfigs`, so the persisted plan is
 deterministic given the seed.
 
+## Legacy schedule projection (JAM)
+
+While a plan is running, `GET /api/v1/session` exposes it to
+authenticated clients through the legacy `schedule` field so JAM can
+render its scheduler progress view. `jmwalletd.legacy_schedule`
+projects the live plan into the reference's 7-element entries
+(`[mixdepth, amount, counterparties, destination, wait_minutes,
+rounding, flag]`), where the flag is `0` before broadcast, the txid
+while waiting for confirmations, and `1` once the plan advances past
+the phase. Maker sessions have no legacy equivalent; their expected
+duration and inter-phase wait are folded into the preceding taker
+entry's wait time so JAM's ETA stays meaningful. The schedule is
+computed from the in-memory runner on every request (never cached), and
+is `null` whenever no tumble is running, matching the reference, which
+also returns no schedule for single-shot taker CoinJoins.
+
 ## Maker exclusion across phases
 
 Within a single tumble, the runner remembers which counterparty nicks
