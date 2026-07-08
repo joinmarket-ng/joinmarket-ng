@@ -110,6 +110,8 @@ def build_coinjoin_taker_config(
         bondless_makers_allowance_require_zero_fee=jm_settings.taker.bondless_require_zero_fee,
         maker_timeout_sec=jm_settings.taker.maker_timeout_sec,
         order_wait_time=jm_settings.taker.order_wait_time,
+        orderbook_min_wait=jm_settings.taker.orderbook_min_wait,
+        orderbook_quiet_period=jm_settings.taker.orderbook_quiet_period,
         tx_broadcast=broadcast_policy,
         broadcast_peer_count=jm_settings.taker.broadcast_peer_count,
         minimum_makers=effective_minimum_makers,

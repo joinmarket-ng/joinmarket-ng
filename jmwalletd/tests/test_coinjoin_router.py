@@ -210,6 +210,8 @@ class TestBuildCoinjoinTakerConfig:
                 bondless_require_zero_fee=bondless_require_zero_fee,
                 maker_timeout_sec=60,
                 order_wait_time=120.0,
+                orderbook_min_wait=45.0,
+                orderbook_quiet_period=20.0,
                 tx_broadcast=tx_broadcast,
                 broadcast_peer_count=3,
                 rescan_interval_sec=600,
@@ -304,6 +306,10 @@ class TestBuildCoinjoinTakerConfig:
         assert captured["tx_fee_factor"] == 0.2
         assert captured["maker_timeout_sec"] == 60
         assert captured["order_wait_time"] == 120.0
+        # Regression: the adaptive orderbook-wait knobs must be forwarded too,
+        # not fall back to the TakerConfig defaults (30.0 / 15.0).
+        assert captured["orderbook_min_wait"] == 45.0
+        assert captured["orderbook_quiet_period"] == 20.0
         assert captured["broadcast_peer_count"] == 3
         assert captured["taker_utxo_age"] == 5
 
