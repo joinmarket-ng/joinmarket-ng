@@ -708,10 +708,12 @@ tbody tr:hover {
 }
 
 .fq-bar {
+    display: flex;
+    flex-direction: column;
     width: 70%;
     min-height: 2px;
-    background: linear-gradient(180deg, #58a6ff, #1f6feb);
     border-radius: 3px 3px 0 0;
+    overflow: hidden;
     cursor: help;
     transition: height 0.2s ease;
 }
@@ -720,13 +722,62 @@ tbody tr:hover {
     background: #30363d;
 }
 
-.fq-cum {
-    color: #3fb950;
-    font-size: 0.7rem;
+.fq-seg {
+    width: 100%;
+}
+
+/* Makers advertising exactly the quantum: they share an anonymity set. */
+.fq-seg-exact {
+    background: linear-gradient(180deg, #58a6ff, #1f6feb);
+}
+
+/* Makers below the quantum: unique fee, fingerprintable, rounds up into the band. */
+.fq-seg-near {
+    background: rgba(88, 166, 255, 0.28);
+}
+
+.fq-summary {
+    color: #c9d1d9;
+    font-size: 0.85rem;
     font-weight: 600;
-    margin-top: 5px;
+    margin-bottom: 8px;
+}
+
+.fq-axis-caption {
+    color: #8b949e;
+    font-size: 0.75rem;
     text-align: center;
-    cursor: help;
+    margin-top: 6px;
+}
+
+.fq-legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 18px;
+    margin-top: 8px;
+}
+
+.fq-legend-item {
+    color: #8b949e;
+    font-size: 0.75rem;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.fq-swatch {
+    display: inline-block;
+    width: 12px;
+    height: 12px;
+    border-radius: 3px;
+}
+
+.fq-swatch-exact {
+    background: linear-gradient(180deg, #58a6ff, #1f6feb);
+}
+
+.fq-swatch-near {
+    background: rgba(88, 166, 255, 0.28);
 }
 
 .fq-tick {

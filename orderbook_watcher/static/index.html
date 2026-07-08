@@ -58,11 +58,14 @@
         <div class="fee-quant-stats">
             <h2>Fee Quantization Bands</h2>
             <p class="fee-quant-description">
-                Privacy-preserving takers (<a href="https://github.com/joinmarket-ng/joinmarket-ng/issues/508" target="_blank" rel="noopener noreferrer">issue #508</a>)
-                homogenize the fee paid to every maker by rounding their fee limit down onto a shared public grid.
-                Each maker is grouped into the band its advertised fee floors to. To be selectable by takers
-                quantizing at a given band, set your fee at or below that band (allow headroom for fee randomization).
-                Bars show maker count; hover for the total fidelity bond value backing each band.
+                A maker with a unique fee is fingerprintable on-chain: its outputs can be linked
+                across coinjoins by the fee it was paid
+                (<a href="https://github.com/joinmarket-ng/joinmarket-ng/issues/508" target="_blank" rel="noopener noreferrer">issue #508</a>).
+                Setting your fee to exactly one of the shared grid values below (with fee
+                randomization disabled) puts you in an
+                anonymity set with every other maker on that value; the more makers on a quantum,
+                the better for everyone. Bonded makers only; one bar per grid value, split into
+                makers exactly on it versus makers just below it. Hover a bar for details.
             </p>
             <div class="fee-quant-toggle">
                 <button id="fee-quant-rel-btn" class="fee-quant-tab active" data-mode="rel">Relative offers</button>

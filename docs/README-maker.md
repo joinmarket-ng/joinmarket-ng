@@ -75,6 +75,9 @@ Use exactly one fee model: `--cj-fee-relative` or `--cj-fee-absolute`.
 > (relative: `0.00002, 0.00005, 0.0001, 0.0002, 0.0005, 0.001, ...`; absolute:
 > `100, 200, 500, 1000, ...` sats). Only if you insist on an off-grid value,
 > enable `cjfee_factor = 0.1` (+-10%) so the exact value is not a static label.
+> The orderbook watcher's "Fee Quantization Bands" chart shows how many makers
+> sit exactly on each quantum, so you can pick the one with the largest
+> anonymity set.
 
 ### 5) Optional: dual offers (relative + absolute)
 

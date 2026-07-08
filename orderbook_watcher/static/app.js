@@ -256,6 +256,13 @@ function ceilGridIndex(value, grid) {
     return -1;
 }
 
+function median(values) {
+    if (values.length === 0) return null;
+    const sorted = [...values].sort((a, b) => a - b);
+    const mid = Math.floor(sorted.length / 2);
+    return sorted.length % 2 === 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
 // A maker counts as bonded when it advertises a fidelity bond, even if the bond
 // value cannot be computed here (no blockchain/mempool backend): the advertised
 // bond is still sybil-resistant. The value only feeds the value-weighted total.
@@ -294,6 +301,7 @@ function renderFeeQuantizationChart() {
             perMaker.set(offer.counterparty, {
                 fee,
                 bond: offer.fidelity_bond_value || 0,
+                maxsize: offer.maxsize || 0,
             });
         }
     }
@@ -306,46 +314,62 @@ function renderFeeQuantizationChart() {
 
     // Buckets: one per grid entry, plus an "above grid" overflow for makers
     // whose fee exceeds the largest quantum (unselectable by a quantizing taker).
-    const buckets = grid.map(() => ({ count: 0, bond: 0 }));
-    const above = { count: 0, bond: 0 };
+    // Each band separates makers advertising *exactly* the quantum (they share
+    // an anonymity set: their paid fees are identical and unlinkable) from
+    // makers below it whose unique fee merely rounds up into the band (still
+    // fingerprintable on-chain unless the taker homogenizes fees).
+    const newBucket = () => ({ exact: 0, near: 0, bond: 0, maxsizes: [] });
+    const buckets = grid.map(newBucket);
+    const above = newBucket();
     let totalBond = 0;
-    for (const { fee, bond } of perMaker.values()) {
+    let exactTotal = 0;
+    for (const { fee, bond, maxsize } of perMaker.values()) {
         const idx = ceilGridIndex(fee, grid);
         const target = idx === -1 ? above : buckets[idx];
-        target.count += 1;
+        if (idx !== -1 && fee === grid[idx]) {
+            target.exact += 1;
+            exactTotal += 1;
+        } else {
+            target.near += 1;
+        }
         target.bond += bond;
+        target.maxsizes.push(maxsize);
         totalBond += bond;
     }
 
-    // Cumulative bond value reachable at each quantum: a taker that sets its fee
-    // limit to grid entry i can select every maker in bands 0..i, so the share of
-    // total bonded value it can reach is the running sum up to that band. This is
-    // the number that matters for sybil resistance: it is the bond weight an
-    // honest taker actually pulls from when it homogenizes its fee at this level.
+    // Cumulative bond value reachable at each quantum: a taker that caps its fee
+    // at grid entry i can select every maker in bands 0..i. Shown in the tooltip
+    // only; a second visible data series proved confusing.
     const rows = [];
     let cumBond = 0;
     grid.forEach((g, i) => {
         cumBond += buckets[i].bond;
         rows.push({
-            label: isAbs ? g.toLocaleString() : formatRelPct(quant.rel_grid[i]),
+            label: isAbs ? (g === 0 ? 'free' : g.toLocaleString()) : formatRelPct(quant.rel_grid[i]),
             raw: isAbs ? g : quant.rel_grid[i],
-            sub: isAbs ? 'sats' : quant.rel_grid[i],
             cumBondPct: totalBond > 0 ? (cumBond / totalBond) * 100 : null,
             ...buckets[i],
         });
     });
-    if (above.count > 0) {
+    if (above.exact + above.near > 0) {
         rows.push({
             label: '> max',
-            sub: 'above grid',
-            cumBondPct: totalBond > 0 ? 100 : null,
+            cumBondPct: null,
             ...above,
         });
     }
 
-    const maxCount = Math.max(1, ...rows.map(r => r.count));
+    const maxCount = Math.max(1, ...rows.map(r => r.exact + r.near));
 
     container.innerHTML = '';
+
+    // Summary line: the practical nudge for makers.
+    const summary = document.createElement('p');
+    summary.className = 'fq-summary';
+    summary.textContent =
+        `${exactTotal} of ${perMaker.size} bonded makers advertise an exact grid fee.`;
+    container.appendChild(summary);
+
     const chart = document.createElement('div');
     chart.className = 'fq-bars';
 
@@ -353,28 +377,53 @@ function renderFeeQuantizationChart() {
         const col = document.createElement('div');
         col.className = 'fq-col';
 
-        const bar = document.createElement('div');
-        bar.className = 'fq-bar' + (row.count === 0 ? ' fq-bar-empty' : '');
-        bar.style.height = (row.count / maxCount * 100) + '%';
+        const total = row.exact + row.near;
 
-        // Concise tooltip: what sits here, and what a taker at this limit reaches.
-        const feeLabel = isAbs ? `${row.raw} sats` : formatRelPct(row.sub);
-        const pct = row.cumBondPct;
+        // Tooltip: band composition, liquidity, and what a taker capped here reaches.
+        const feeLabel = row.raw === undefined
+            ? null
+            : (isAbs ? `${row.raw} sats` : formatRelPct(row.raw));
         const lines = [];
-        if (row.raw !== undefined) {
-            lines.push(`${row.count} maker(s) at ${feeLabel}, ${formatBtc(row.bond)} bonded.`);
-            if (pct !== null) {
-                lines.push(`A taker capped at ${feeLabel} reaches ${pct.toFixed(0)}% of bonded value.`);
-            }
+        if (feeLabel !== null) {
+            lines.push(`${row.exact} maker(s) exactly at ${feeLabel} (shared anonymity set).`);
+            lines.push(`${row.near} maker(s) below it with a unique fee.`);
         } else {
-            lines.push(`${row.count} maker(s) above the grid, ${formatBtc(row.bond)} bonded.`);
+            lines.push(`${total} maker(s) above the largest quantum.`);
             lines.push('A quantizing taker cannot select these.');
         }
-        bar.title = lines.join('\n');
+        lines.push(`${formatBtc(row.bond)} bonded in this band.`);
+        const medMax = median(row.maxsizes);
+        if (medMax !== null) {
+            lines.push(`Median max size: ${formatBtc(medMax)}.`);
+        }
+        if (feeLabel !== null && row.cumBondPct !== null) {
+            lines.push(
+                `A taker capped at ${feeLabel} reaches ${row.cumBondPct.toFixed(0)}% of bonded value.`
+            );
+        }
+        const tooltip = lines.join('\n');
+
+        const bar = document.createElement('div');
+        bar.className = 'fq-bar' + (total === 0 ? ' fq-bar-empty' : '');
+        bar.style.height = (total / maxCount * 100) + '%';
+        bar.title = tooltip;
+
+        // Stacked segments: solid (exact) at the bottom, faded (near) on top.
+        if (total > 0) {
+            const nearSeg = document.createElement('div');
+            nearSeg.className = 'fq-seg fq-seg-near';
+            nearSeg.style.height = (row.near / total * 100) + '%';
+            const exactSeg = document.createElement('div');
+            exactSeg.className = 'fq-seg fq-seg-exact';
+            exactSeg.style.height = (row.exact / total * 100) + '%';
+            bar.appendChild(nearSeg);
+            bar.appendChild(exactSeg);
+        }
 
         const countLabel = document.createElement('div');
         countLabel.className = 'fq-count';
-        countLabel.textContent = row.count;
+        countLabel.textContent = total;
+        countLabel.title = tooltip;
 
         const barWrap = document.createElement('div');
         barWrap.className = 'fq-bar-wrap';
@@ -384,22 +433,39 @@ function renderFeeQuantizationChart() {
         const tick = document.createElement('div');
         tick.className = 'fq-tick';
         tick.textContent = row.label;
-        tick.title = row.sub || '';
 
         col.appendChild(barWrap);
-        // Cumulative bond-value-reachable percentage under each band.
-        if (row.cumBondPct !== null) {
-            const cum = document.createElement('div');
-            cum.className = 'fq-cum';
-            cum.textContent = `${row.cumBondPct.toFixed(0)}%`;
-            cum.title = 'Cumulative share of bonded value reachable at this fee';
-            col.appendChild(cum);
-        }
         col.appendChild(tick);
         chart.appendChild(col);
     });
 
     container.appendChild(chart);
+
+    // Unit caption: makes the active mode's unit explicit on the axis itself.
+    const caption = document.createElement('p');
+    caption.className = 'fq-axis-caption';
+    caption.textContent = isAbs
+        ? 'Advertised absolute fee (satoshis per coinjoin)'
+        : 'Advertised relative fee (% of coinjoin amount)';
+    container.appendChild(caption);
+
+    // Legend: names every visual element so the chart is self-explaining.
+    const legend = document.createElement('div');
+    legend.className = 'fq-legend';
+    const legendItems = [
+        ['fq-swatch-exact', 'exactly at the quantum (shared anonymity set)'],
+        ['fq-swatch-near', 'below the quantum (unique fee, rounds up into this band)'],
+    ];
+    for (const [swatchClass, text] of legendItems) {
+        const item = document.createElement('span');
+        item.className = 'fq-legend-item';
+        const swatch = document.createElement('span');
+        swatch.className = 'fq-swatch ' + swatchClass;
+        item.appendChild(swatch);
+        item.appendChild(document.createTextNode(text));
+        legend.appendChild(item);
+    }
+    container.appendChild(legend);
 }
 
 function setupFeeQuantToggle() {
