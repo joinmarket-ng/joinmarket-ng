@@ -236,8 +236,9 @@ function formatBtc(sats) {
 }
 
 function formatRelPct(relStr) {
-    // relStr is a decimal fraction like "0.001" -> "0.1%"
-    return (parseFloat(relStr) * 100).toPrecision(2).replace(/\.?0+$/, '') + '%';
+    // relStr is a decimal fraction like "0.001" -> "0.1%". parseFloat drops
+    // trailing decimal zeros without truncating integers ("10" stays 10%).
+    return parseFloat((parseFloat(relStr) * 100).toPrecision(2)) + '%';
 }
 
 // Bucket a fee onto the smallest grid entry >= fee (round up). A maker is
