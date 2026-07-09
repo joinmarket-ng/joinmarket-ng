@@ -920,7 +920,11 @@ class OrderbookAggregator:
 
             time_diff = timestamp - old_timestamp
             if abs(time_diff) < 60:
-                logger.warning(
+                # Routine and self-healing: the same bond seen under two nicks
+                # within the skew window keeps the existing offer. This recurs
+                # on every aggregation cycle for as long as both nicks are
+                # announced, so it is diagnostic detail, not a warning.
+                logger.debug(
                     f"Bond deduplication: Ignoring potential duplicate from {offer.counterparty} "
                     f"(oid={offer.oid}) - same bond as {old_offer.counterparty} "
                     f"(oid={old_offer.oid}) with only {abs(time_diff):.1f}s difference "
@@ -931,7 +935,7 @@ class OrderbookAggregator:
                 continue
 
             bond_replacements += 1
-            logger.info(
+            logger.debug(
                 f"Bond deduplication: Replacing offer from {old_offer.counterparty} "
                 f"(oid={old_offer.oid}) with {offer.counterparty} (oid={offer.oid}) "
                 f"[same bond UTXO: {bond_utxo_key[:20]}..., age_diff={time_diff:.1f}s]"

@@ -241,7 +241,9 @@ class MakerHealthChecker:
                 error=None,
             )
             self.health_status[location] = status
-            logger.info(
+            # DEBUG: with hundreds of makers this fires constantly; the
+            # interesting transitions are failures (logged at WARNING below).
+            logger.debug(
                 f"Health check: {nick} at {location} is REACHABLE "
                 f"(features: {features.to_comma_string() or 'none'})"
             )
