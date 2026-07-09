@@ -1852,7 +1852,9 @@ class TestPhaseAuthMakerAuthentication:
     """
 
     @staticmethod
-    async def _drive_phase_auth(*, auth_owns_utxo: bool, valid_btc_sig: bool):
+    async def _drive_phase_auth(
+        *, auth_owns_utxo: bool, valid_btc_sig: bool, spk_upper: bool = False
+    ):
         from coincurve import PrivateKey
         from jmcore.bitcoin import pubkey_to_p2wpkh_script
         from jmcore.crypto import ecdsa_sign
@@ -1881,6 +1883,10 @@ class TestPhaseAuthMakerAuthentication:
         # The UTXO's real scriptPubKey is owned by auth_key, or by an unrelated key.
         owner_pub = auth_pub if auth_owns_utxo else PrivateKey().public_key.format(compressed=True)
         stored_spk = pubkey_to_p2wpkh_script(owner_pub).hex()
+        if spk_upper:
+            # Neutrino peers supply the scriptPubKey hex verbatim; its case is
+            # not normalized, so the auth binding must be case-insensitive.
+            stored_spk = stored_spk.upper()
 
         # btc_sig over the maker's NaCl pubkey, by auth_key (valid) or a wrong key.
         signer = auth_key if valid_btc_sig else PrivateKey()
@@ -1959,3 +1965,17 @@ class TestPhaseAuthMakerAuthentication:
         )
         assert result.success is False
         assert nick not in session_state.maker_sessions
+
+    @pytest.mark.asyncio
+    async def test_accepts_authenticated_maker_with_uppercase_scriptpubkey(self):
+        """The auth binding must be case-insensitive.
+
+        Neutrino peers supply the UTXO scriptPubKey as unnormalized hex, so an
+        uppercase (but otherwise correct) scriptPubKey must still authenticate.
+        """
+        result, session_state, nick = await self._drive_phase_auth(
+            auth_owns_utxo=True, valid_btc_sig=True, spk_upper=True
+        )
+        assert result.success is True
+        assert nick in session_state.maker_sessions
+        assert session_state.maker_sessions[nick].responded_auth is True

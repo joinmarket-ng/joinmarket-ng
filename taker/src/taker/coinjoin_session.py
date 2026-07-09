@@ -756,9 +756,14 @@ class CoinJoinSession:
                         continue
 
                     # Tie the authenticated session to on-chain ownership: the auth
-                    # pubkey must own one of the maker's declared UTXOs.
+                    # pubkey must own one of the maker's declared UTXOs. Compare
+                    # case-insensitively: for neutrino peers the scriptPubKey is
+                    # peer-supplied hex whose case is not normalized (matching the
+                    # case-insensitive signing-phase check via bytes.fromhex).
                     auth_spk = pubkey_to_p2wpkh_script(bytes.fromhex(auth_pub)).hex()
-                    if not any(u.get("scriptpubkey", "") == auth_spk for u in session.utxos):
+                    if not any(
+                        u.get("scriptpubkey", "").lower() == auth_spk for u in session.utxos
+                    ):
                         logger.warning(f"auth_pub from {nick} matches no declared UTXO, dropping")
                         failed_makers.append(nick)
                         del self.maker_sessions[nick]
