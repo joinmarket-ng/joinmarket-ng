@@ -1842,3 +1842,120 @@ async def test_do_coinjoin_refreshes_maker_nick_exclusion(
         if mock_select.called:
             # If selection was attempted, the nick must already be excluded.
             assert "J5LateStartMaker" in taker.orderbook_manager.own_wallet_nicks
+
+
+class TestPhaseAuthMakerAuthentication:
+    """_phase_auth must authenticate the maker's !ioauth: a valid btc_sig over its
+    NaCl pubkey by an auth key that owns one of its declared UTXOs. Otherwise a
+    malicious directory could substitute the maker's encryption key and MITM the
+    channel, or a maker could authenticate with a UTXO it does not control.
+    """
+
+    @staticmethod
+    async def _drive_phase_auth(*, auth_owns_utxo: bool, valid_btc_sig: bool):
+        from coincurve import PrivateKey
+        from jmcore.bitcoin import pubkey_to_p2wpkh_script
+        from jmcore.crypto import ecdsa_sign
+        from jmwallet.backends.base import UTXO
+
+        from taker.coinjoin_session import CoinJoinSession
+
+        offer = Offer(
+            counterparty="J5maker",
+            oid=0,
+            ordertype=OfferType.SW0_RELATIVE,
+            minsize=100_000,
+            maxsize=10_000_000,
+            txfee=0,
+            cjfee="0.001",
+            fidelity_bond_value=0,
+        )
+
+        taker_crypto, maker_crypto = make_crypto_pair()
+        maker_nacl_pk_hex = maker_crypto.get_pubkey_hex()
+
+        auth_key = PrivateKey()
+        auth_pub = auth_key.public_key.format(compressed=True)
+        txid, vout, value = "b" * 64, 0, 1_500_000
+
+        # The UTXO's real scriptPubKey is owned by auth_key, or by an unrelated key.
+        owner_pub = auth_pub if auth_owns_utxo else PrivateKey().public_key.format(compressed=True)
+        stored_spk = pubkey_to_p2wpkh_script(owner_pub).hex()
+
+        # btc_sig over the maker's NaCl pubkey, by auth_key (valid) or a wrong key.
+        signer = auth_key if valid_btc_sig else PrivateKey()
+        btc_sig = ecdsa_sign(maker_nacl_pk_hex, signer.secret)
+
+        ioauth = f"{txid}:{vout} {auth_pub.hex()} bcrt1qcj bcrt1qchange {btc_sig}"
+        encrypted = maker_crypto.encrypt(ioauth)
+
+        nick = "J5maker"
+        session = MakerSession(nick=nick, offer=offer, pubkey=maker_nacl_pk_hex)
+        object.__setattr__(session, "crypto", taker_crypto)
+
+        with patch.object(Taker, "__init__", lambda self, *a, **k: None):
+            taker = Taker.__new__(Taker)
+            taker._session = CoinJoinSession()
+            taker._session.attach(taker)
+            taker.wallet = MagicMock()
+            taker.backend = AsyncMock()
+            taker.backend.requires_neutrino_metadata = MagicMock(return_value=False)
+            taker.backend.get_utxo = AsyncMock(
+                return_value=UTXO(
+                    txid=txid,
+                    vout=vout,
+                    value=value,
+                    address="bcrt1qtest",
+                    confirmations=3,
+                    scriptpubkey=stored_spk,
+                )
+            )
+            taker.config = MagicMock()
+            taker.config.minimum_makers = 1
+            taker.config.maker_timeout_sec = 5
+
+            dc = MagicMock()
+            dc.send_privmsg = AsyncMock()
+            dc.upgrade_channel_prefer_direct = MagicMock(side_effect=lambda n, ch: ch)
+            dc.wait_for_responses = AsyncMock(return_value={nick: {"data": encrypted}})
+            taker.directory_client = dc
+
+            commitment = MagicMock()
+            commitment.has_neutrino_metadata.return_value = False
+            commitment.to_revelation.return_value = {
+                "utxo": f"{txid}:{vout}",
+                "P": "00",
+                "P2": "00",
+                "sig": "00",
+                "e": "00",
+            }
+            taker._session.podle_commitment = commitment
+            taker._session.maker_sessions = {nick: session}
+
+            result = await taker._session._phase_auth()
+            return result, taker._session, nick
+
+    @pytest.mark.asyncio
+    async def test_accepts_authenticated_maker(self):
+        result, session_state, nick = await self._drive_phase_auth(
+            auth_owns_utxo=True, valid_btc_sig=True
+        )
+        assert result.success is True
+        assert nick in session_state.maker_sessions
+        assert session_state.maker_sessions[nick].responded_auth is True
+
+    @pytest.mark.asyncio
+    async def test_rejects_maker_with_invalid_btc_sig(self):
+        result, session_state, nick = await self._drive_phase_auth(
+            auth_owns_utxo=True, valid_btc_sig=False
+        )
+        assert result.success is False
+        assert nick not in session_state.maker_sessions
+
+    @pytest.mark.asyncio
+    async def test_rejects_maker_whose_auth_pub_owns_no_declared_utxo(self):
+        result, session_state, nick = await self._drive_phase_auth(
+            auth_owns_utxo=False, valid_btc_sig=True
+        )
+        assert result.success is False
+        assert nick not in session_state.maker_sessions
