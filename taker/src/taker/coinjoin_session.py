@@ -21,7 +21,7 @@ import asyncio
 import time
 from typing import TYPE_CHECKING, Any
 
-from jmcore.bitcoin import get_txid, parse_transaction
+from jmcore.bitcoin import get_txid, parse_transaction, pubkey_to_p2wpkh_script
 from jmcore.encryption import CryptoSession
 from jmcore.protocol import FEATURE_NEUTRINO_COMPAT, parse_utxo_list
 from jmwallet.history import (
@@ -684,6 +684,7 @@ class CoinJoinSession:
                     for utxo_meta in utxo_metadata_list:
                         txid = utxo_meta.txid
                         vout = utxo_meta.vout
+                        scriptpubkey = ""
 
                         # Verify UTXO and get value/address
                         try:
@@ -701,6 +702,7 @@ class CoinJoinSession:
                                 if result.valid:
                                     value = result.value
                                     address = ""  # Not available from verification
+                                    scriptpubkey = utxo_meta.scriptpubkey or ""
                                     logger.debug(
                                         f"Neutrino-verified UTXO {txid}:{vout} = {value} sats"
                                     )
@@ -717,6 +719,7 @@ class CoinJoinSession:
                                 if utxo_info:
                                     value = utxo_info.value
                                     address = utxo_info.address
+                                    scriptpubkey = utxo_info.scriptpubkey or ""
                                 else:
                                     # Fallback: get raw transaction and parse it
                                     tx_info = await self.backend.get_transaction(txid)
@@ -724,6 +727,7 @@ class CoinJoinSession:
                                         parsed_tx = parse_transaction(tx_info.raw)
                                         if parsed_tx and len(parsed_tx.outputs) > vout:
                                             value = parsed_tx.outputs[vout].value
+                                            scriptpubkey = parsed_tx.outputs[vout].script.hex()
                                             try:
                                                 address = parsed_tx.outputs[vout].address(
                                                     self.config.network
@@ -751,6 +755,7 @@ class CoinJoinSession:
                                 "vout": vout,
                                 "value": value,
                                 "address": address,
+                                "scriptpubkey": scriptpubkey,
                             }
                         )
                         logger.debug(f"Added UTXO from {nick}: {txid}:{vout} = {value} sats")
@@ -1403,6 +1408,16 @@ class CoinJoinSession:
                             txid, vout = input_map[idx]
                             utxo = maker_utxo_map[(txid, vout)]
                             value = utxo["value"]
+
+                            # Bind the maker-supplied pubkey to this UTXO's own
+                            # scriptPubKey. Without this a signature by any key
+                            # verifies for a UTXO the maker does not control,
+                            # yielding a consensus-invalid coinjoin.
+                            utxo_spk = utxo.get("scriptpubkey", "")
+                            if not utxo_spk or bytes.fromhex(utxo_spk) != pubkey_to_p2wpkh_script(
+                                pubkey
+                            ):
+                                continue
 
                             # Create scriptCode for verification
                             script_code = create_p2wpkh_script_code(pubkey)
