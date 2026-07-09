@@ -1089,6 +1089,47 @@ class DescriptorWalletBackend(BlockchainBackend):
             logger.warning(f"Failed to get descriptor checksum: {e}")
             return descriptor
 
+    async def _effective_rescan_height(self, start_height: int) -> int:
+        """
+        Normalize a requested rescan start height into one Bitcoin Core accepts.
+
+        Applied rules, in order:
+
+        1. Negative heights are clamped to 0.
+        2. When a wallet creation height hint is set (via
+           ``set_wallet_creation_height``), the height is floored up to it,
+           since the wallet cannot hold coins from before it was created.
+        3. Heights beyond the current chain tip are clamped down to the tip.
+           Callers using mainnet-derived constants (e.g. SegWit activation
+           height 481824, which JAM sends by default) would otherwise be
+           rejected by Core with ``RPC error -8: Invalid start_height`` on
+           signet/testnet/regtest where the tip is much lower.
+        """
+        effective_height = max(0, start_height)
+        if effective_height != start_height:
+            logger.warning(f"Requested rescan height {start_height} is negative; clamping to 0")
+
+        if (
+            self._wallet_creation_height is not None
+            and effective_height < self._wallet_creation_height
+        ):
+            logger.info(
+                f"Flooring rescan start height {effective_height} to wallet creation "
+                f"height {self._wallet_creation_height}; coins cannot predate it. "
+                "Adjust the wallet creation height to scan earlier blocks."
+            )
+            effective_height = self._wallet_creation_height
+
+        chain_tip = await self.get_block_height()
+        if effective_height > chain_tip:
+            logger.warning(
+                f"Requested rescan height {effective_height} is beyond the chain "
+                f"tip {chain_tip}; clamping to the tip"
+            )
+            effective_height = chain_tip
+
+        return effective_height
+
     async def start_background_rescan(self, start_height: int = 0) -> bool:
         """
         Trigger a server-side blockchain rescan and return once Bitcoin
@@ -1111,12 +1152,12 @@ class DescriptorWalletBackend(BlockchainBackend):
 
         Args:
             start_height: Block height to start rescan from (default: 0 = genesis).
-                When a wallet creation height hint is set (via
-                ``set_wallet_creation_height``), the effective start is floored
-                to it, since the wallet cannot hold coins from before it was
-                created. This avoids the common surprise of every rescan
-                starting at genesis and scanning years of irrelevant blocks
-                even though a creation height is configured.
+                The value is normalized via ``_effective_rescan_height``:
+                floored up to the wallet creation height when one is set (the
+                wallet cannot hold coins from before it was created, so
+                scanning earlier blocks only wastes time) and clamped into
+                ``[0, chain tip]`` so out-of-range requests do not make
+                Bitcoin Core reject the rescan outright.
 
         Returns:
             True if the rescan already completed synchronously (fast
@@ -1131,19 +1172,7 @@ class DescriptorWalletBackend(BlockchainBackend):
         if not self._wallet_loaded:
             raise RuntimeError("Wallet not loaded. Call create_wallet() first.")
 
-        # Floor the rescan at the known wallet creation height. Coins cannot
-        # predate the wallet, so scanning earlier blocks only wastes time
-        # (potentially hours on mainnet). This mirrors the ``jm-wallet rescan``
-        # CLI, which already clamps ``--start-height`` up to the creation
-        # height, and makes recover-bonds / background rescans honor the
-        # configured height instead of always starting from genesis.
-        if self._wallet_creation_height is not None and start_height < self._wallet_creation_height:
-            logger.info(
-                f"Flooring rescan start height {start_height} to wallet creation "
-                f"height {self._wallet_creation_height}; coins cannot predate it. "
-                "Adjust the wallet creation height to scan earlier blocks."
-            )
-            start_height = self._wallet_creation_height
+        start_height = await self._effective_rescan_height(start_height)
 
         logger.info(
             f"Triggering blockchain rescan from height {start_height}. "
@@ -1932,22 +1961,18 @@ class DescriptorWalletBackend(BlockchainBackend):
         Useful after importing new descriptors or recovering wallet.
 
         Args:
-            start_height: Block height to start rescan from.  Values beyond the
-                current chain tip are clamped to the tip so that callers using
-                mainnet-derived constants (e.g. SegWit activation height 481824)
-                work correctly on signet/testnet where the tip is much lower.
+            start_height: Block height to start rescan from.  Normalized via
+                ``_effective_rescan_height``: floored up to the wallet creation
+                height when one is set and clamped into ``[0, chain tip]`` so
+                that callers using mainnet-derived constants (e.g. SegWit
+                activation height 481824) work correctly on signet/testnet
+                where the tip is much lower.
 
         Returns:
             Rescan result
         """
         try:
-            chain_tip = await self.get_block_height()
-            effective_height = min(max(0, start_height), chain_tip)
-            if effective_height != start_height:
-                logger.warning(
-                    f"Requested rescan height {start_height} is out of range "
-                    f"[0, {chain_tip}]; clamping to {effective_height}"
-                )
+            effective_height = await self._effective_rescan_height(start_height)
             logger.info(f"Starting blockchain rescan from height {effective_height}...")
             result = await self._rpc_call(
                 "rescanblockchain",

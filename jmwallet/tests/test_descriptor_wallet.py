@@ -904,6 +904,29 @@ class TestDescriptorWalletBackendUnit:
 
         assert result["start_height"] == 0
 
+    @pytest.mark.asyncio
+    async def test_rescan_blockchain_floors_at_creation_height(
+        self, mock_backend: DescriptorWalletBackend
+    ):
+        """Rescan height below the wallet creation height is floored up to it,
+        matching start_background_rescan behavior."""
+        backend = mock_backend
+        chain_tip = 900000
+        creation_height = 800000
+        backend.set_wallet_creation_height(creation_height)
+
+        async def mock_rpc(method, params=None, client=None, use_wallet=True):
+            if method == "getblockchaininfo":
+                return {"blocks": chain_tip}
+            assert params == [creation_height], f"Expected [{creation_height}], got {params}"
+            return {"start_height": creation_height, "stop_height": chain_tip}
+
+        backend._rpc_call = AsyncMock(side_effect=mock_rpc)
+
+        result = await backend.rescan_blockchain(start_height=0)
+
+        assert result["start_height"] == creation_height
+
     def test_can_provide_neutrino_metadata(self):
         """Test that backend can provide Neutrino metadata."""
         backend = DescriptorWalletBackend()
@@ -1512,6 +1535,8 @@ class TestBackgroundRescan:
             use_wallet: bool = True,
         ) -> Any:
             nonlocal observed_kick
+            if method == "getblockchaininfo":
+                return {"blocks": 100}
             if method == "rescanblockchain":
                 observed_kick = True
                 # Simulate the long-running RPC by raising TimeoutException.
@@ -1544,6 +1569,8 @@ class TestBackgroundRescan:
             use_wallet: bool = True,
         ) -> Any:
             nonlocal captured_height
+            if method == "getblockchaininfo":
+                return {"blocks": 900000}
             if method == "rescanblockchain":
                 captured_height = (params or [None])[0]
                 raise httpx.TimeoutException("simulated long-running rescan")
@@ -1573,6 +1600,8 @@ class TestBackgroundRescan:
             use_wallet: bool = True,
         ) -> Any:
             nonlocal captured_height
+            if method == "getblockchaininfo":
+                return {"blocks": 900000}
             if method == "rescanblockchain":
                 captured_height = (params or [None])[0]
                 raise httpx.TimeoutException("simulated long-running rescan")
@@ -1598,6 +1627,8 @@ class TestBackgroundRescan:
             client: Any = None,
             use_wallet: bool = True,
         ) -> Any:
+            if method == "getblockchaininfo":
+                return {"blocks": 100}
             if method == "rescanblockchain":
                 return {"start_height": 0, "stop_height": 100}
             raise AssertionError(f"unexpected RPC after fast return: {method}")
@@ -1620,6 +1651,8 @@ class TestBackgroundRescan:
             client: Any = None,
             use_wallet: bool = True,
         ) -> Any:
+            if method == "getblockchaininfo":
+                return {"blocks": 100}
             if method == "rescanblockchain":
                 raise ValueError(
                     "RPC error -4: Wallet is currently rescanning. Abort existing rescan or wait."
@@ -1645,14 +1678,80 @@ class TestBackgroundRescan:
             client: Any = None,
             use_wallet: bool = True,
         ) -> Any:
+            if method == "getblockchaininfo":
+                return {"blocks": 100}
             if method == "rescanblockchain":
-                raise ValueError("RPC error -8: Invalid start_height")
+                raise ValueError("RPC error -1: Block index out of range")
             return {}
 
         backend._rpc_call = mock_rpc  # type: ignore[method-assign]
 
-        with pytest.raises(ValueError, match="RPC error -8"):
-            await backend.start_background_rescan(start_height=99999999)
+        with pytest.raises(ValueError, match="RPC error -1"):
+            await backend.start_background_rescan(start_height=50)
+
+    @pytest.mark.asyncio
+    async def test_start_background_rescan_clamps_above_tip(self) -> None:
+        """A start height beyond the chain tip is clamped to the tip instead of
+        letting Bitcoin Core reject the rescan with RPC error -8 (issue #556).
+
+        481824 is the mainnet SegWit activation height; JAM sends this by
+        default, which exceeds the tip on signet/testnet/regtest.
+        """
+        backend = DescriptorWalletBackend(wallet_name="test_rescan_clamp_tip")
+        backend._wallet_loaded = True
+        chain_tip = 50000
+
+        captured_height: int | None = None
+
+        async def mock_rpc(
+            method: str,
+            params: list[Any] | None = None,
+            client: Any = None,
+            use_wallet: bool = True,
+        ) -> Any:
+            nonlocal captured_height
+            if method == "getblockchaininfo":
+                return {"blocks": chain_tip}
+            if method == "rescanblockchain":
+                captured_height = (params or [None])[0]
+                raise httpx.TimeoutException("simulated long-running rescan")
+            if method == "getwalletinfo":
+                return {"scanning": {"progress": 0.01, "duration": 1}}
+            return {}
+
+        backend._rpc_call = mock_rpc  # type: ignore[method-assign]
+
+        await backend.start_background_rescan(start_height=481824)
+        assert captured_height == chain_tip
+
+    @pytest.mark.asyncio
+    async def test_start_background_rescan_clamps_negative(self) -> None:
+        """A negative start height is clamped to 0."""
+        backend = DescriptorWalletBackend(wallet_name="test_rescan_clamp_neg")
+        backend._wallet_loaded = True
+
+        captured_height: int | None = None
+
+        async def mock_rpc(
+            method: str,
+            params: list[Any] | None = None,
+            client: Any = None,
+            use_wallet: bool = True,
+        ) -> Any:
+            nonlocal captured_height
+            if method == "getblockchaininfo":
+                return {"blocks": 100}
+            if method == "rescanblockchain":
+                captured_height = (params or [None])[0]
+                raise httpx.TimeoutException("simulated long-running rescan")
+            if method == "getwalletinfo":
+                return {"scanning": {"progress": 0.01, "duration": 1}}
+            return {}
+
+        backend._rpc_call = mock_rpc  # type: ignore[method-assign]
+
+        await backend.start_background_rescan(start_height=-1)
+        assert captured_height == 0
 
     @pytest.mark.asyncio
     async def test_start_background_rescan_raises_if_never_starts(
