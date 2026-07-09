@@ -148,12 +148,12 @@ async def connect_direct(
 ) -> TCPConnection:
     """Connect directly via TCP without Tor (for local development/testing)."""
     try:
-        logger.info(f"Connecting directly to {host}:{port}")
+        logger.debug(f"Connecting directly to {host}:{port}")
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(host, port, limit=max_message_size),
             timeout=timeout,
         )
-        logger.info(f"Connected to {host}:{port}")
+        logger.debug(f"Connected to {host}:{port}")
         return TCPConnection(reader, writer, max_message_size)
     except Exception as e:
         logger.error(f"Failed to connect to {host}:{port}: {e}")
@@ -202,13 +202,17 @@ async def connect_via_tor(
         )
         sock.settimeout(timeout)
 
-        logger.info(f"Connecting to {onion_address}:{port} via Tor ({socks_host}:{socks_port})")
+        # Transport-level dial logs stay at DEBUG: callers that care (directory
+        # pool, aggregator) log the meaningful connection events at INFO, and
+        # bulk users like the orderbook watcher's maker health checker would
+        # otherwise flood INFO with hundreds of dial lines per sweep.
+        logger.debug(f"Connecting to {onion_address}:{port} via Tor ({socks_host}:{socks_port})")
         await asyncio.get_event_loop().run_in_executor(None, sock.connect, (onion_address, port))
 
         sock.setblocking(False)
         reader, writer = await asyncio.open_connection(sock=sock, limit=max_message_size)
 
-        logger.info(f"Connected to {onion_address}:{port}")
+        logger.debug(f"Connected to {onion_address}:{port}")
         return TCPConnection(reader, writer, max_message_size)
 
     except Exception as e:
