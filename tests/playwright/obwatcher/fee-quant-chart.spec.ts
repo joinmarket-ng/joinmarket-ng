@@ -150,11 +150,16 @@ test.describe("fee quantization chart", () => {
     const tooltip = await band.locator(".fq-bar").getAttribute("title");
     expect(tooltip).toContain("2 maker(s) exactly at 0.02% (shared anonymity set).");
     expect(tooltip).toContain("1 maker(s) below it with a unique fee.");
-    expect(tooltip).toContain("0.8000 BTC bonded in this band.");
-    // Median max size across m1 (1.0), m2 (0.5), m3 (0.2) BTC.
-    expect(tooltip).toContain("Median max size: 0.5000 BTC.");
-    // Cumulative reach: (9 + 8) / 21.1 of total bonded value.
-    expect(tooltip).toMatch(/A taker capped at 0\.02% reaches \d+% of bonded value\./);
+    // Cumulative bond share reachable at or under 0.02%: (m4 + m10 + m1 + m2 + m3)
+    // = 170,000,000 / 174,000,000 total bonded across all rel makers.
+    expect(tooltip).toContain("98% of total bonded value is reachable at or under this fee.");
+    // Max coinjoin size with 10 makers: only 5 makers are at or under 0.02%
+    // (m4, m10, m1, m2, m3), so the bound is the smallest of those five
+    // (m10's 1,000,000 sats) and the tooltip notes the shortfall.
+    expect(tooltip).toContain(
+      "Max coinjoin size with 10 makers at or under this fee: 1,000,000 sats (0.0100 BTC) " +
+        "(only 5 maker(s) at or under this fee).",
+    );
 
     // Exact and near segments split the bar by maker count (2/3 vs 1/3).
     const exactHeight = await band
@@ -211,6 +216,29 @@ test.describe("fee quantization chart", () => {
     // Only the cheapest offer counts: the 0.02% band has it, 0.1% has none.
     await expect(page.locator(".fq-col").nth(3).locator(".fq-count")).toHaveText("1");
     await expect(page.locator(".fq-col").nth(5).locator(".fq-count")).toHaveText("0");
+
+    server.close();
+  });
+
+  test("max coinjoin size stat omits the shortfall note with >=10 makers", async ({ page }) => {
+    const offers: FixtureOffer[] = Array.from({ length: 10 }, (_, i) => ({
+      counterparty: `bulk${i}`,
+      ordertype: "sw0reloffer",
+      cjfee: "0.0001",
+      maxsize: (i + 1) * 1_000_000,
+      fidelity_bond_value: 1e7,
+    }));
+    const server = await openChart(page, payload(offers));
+
+    // 10 makers exactly at 0.01%: the bound is the smallest maxsize among
+    // them (1,000,000 sats), and with exactly 10 available there is no
+    // shortfall note.
+    const band = page.locator(".fq-col").nth(2);
+    const tooltip = await band.locator(".fq-bar").getAttribute("title");
+    expect(tooltip).toContain(
+      "Max coinjoin size with 10 makers at or under this fee: 1,000,000 sats (0.0100 BTC).",
+    );
+    expect(tooltip).not.toContain("only");
 
     server.close();
   });

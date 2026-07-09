@@ -231,8 +231,18 @@ let feeQuantMode = 'rel';
 
 const ABS_OFFER_TYPES = new Set(['sw0absoffer', 'swabsoffer']);
 
+// Reference counterparty count for the "max coinjoin size" tooltip stat.
+// Matches the common default taker counterparty count; purely informational.
+const NEEDED_COUNTERPARTIES = 10;
+
 function formatBtc(sats) {
     return (sats / 1e8).toFixed(4) + ' BTC';
+}
+
+// Satoshis are the practical unit for a taker sizing a coinjoin; BTC is shown
+// alongside only as a human-scale cross-check.
+function formatSats(sats) {
+    return `${Math.round(sats).toLocaleString()} sats (${formatBtc(sats)})`;
 }
 
 function formatRelPct(relStr) {
@@ -256,11 +266,16 @@ function ceilGridIndex(value, grid) {
     return -1;
 }
 
-function median(values) {
+// The maximum coinjoin size achievable with `n` counterparties is bounded by
+// the smallest maxsize among the `n` makers with the largest maxsize: picking
+// any larger set only lowers that bound. So the practical "how big a coinjoin
+// can I do with N makers" number is the Nth-largest maxsize in the pool (or,
+// with fewer than N makers available, the smallest of whatever is available).
+function maxsizeForCounterparties(values, n) {
     if (values.length === 0) return null;
-    const sorted = [...values].sort((a, b) => a - b);
-    const mid = Math.floor(sorted.length / 2);
-    return sorted.length % 2 === 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+    const sorted = [...values].sort((a, b) => b - a);
+    const idx = Math.min(n, sorted.length) - 1;
+    return { value: sorted[idx], available: sorted.length };
 }
 
 // A maker counts as bonded when it advertises a fidelity bond, even if the bond
@@ -331,17 +346,24 @@ function renderFeeQuantizationChart() {
         totalBond += bond;
     }
 
-    // Cumulative bond value reachable at each quantum: a taker that caps its fee
-    // at grid entry i can select every maker in bands 0..i. Shown in the tooltip
-    // only; a second visible data series proved confusing.
+    // Cumulative stats reachable at each quantum: a taker that caps its fee at
+    // grid entry i can select every maker in bands 0..i. Both the bond-value
+    // share and the maxsize pool accumulate across bands for that reason, and
+    // are shown in the tooltip only; a second visible data series proved
+    // confusing.
     const rows = [];
     let cumBond = 0;
+    let cumMaxsizes = [];
     grid.forEach((g, i) => {
         cumBond += buckets[i].bond;
+        // concat() returns a fresh array each time, so this row keeps its own
+        // stable snapshot even as later iterations keep extending the pool.
+        cumMaxsizes = cumMaxsizes.concat(buckets[i].maxsizes);
         rows.push({
             label: isAbs ? (g === 0 ? 'free' : g.toLocaleString()) : formatRelPct(quant.rel_grid[i]),
             raw: isAbs ? g : quant.rel_grid[i],
             cumBondPct: totalBond > 0 ? (cumBond / totalBond) * 100 : null,
+            cumMaxsizes,
             ...buckets[i],
         });
     });
@@ -349,6 +371,7 @@ function renderFeeQuantizationChart() {
         rows.push({
             label: '> max',
             cumBondPct: null,
+            cumMaxsizes: [],
             ...above,
         });
     }
@@ -384,19 +407,26 @@ function renderFeeQuantizationChart() {
         if (feeLabel !== null) {
             lines.push(`${row.exact} maker(s) exactly at ${feeLabel} (shared anonymity set).`);
             lines.push(`${row.near} maker(s) below it with a unique fee.`);
+            if (row.cumBondPct !== null) {
+                lines.push(
+                    `${row.cumBondPct.toFixed(0)}% of total bonded value is reachable at or under this fee.`
+                );
+            }
+            // Practical for takers: how large a coinjoin they could actually
+            // join with NEEDED_COUNTERPARTIES makers if they cap their fee here.
+            const mc = maxsizeForCounterparties(row.cumMaxsizes, NEEDED_COUNTERPARTIES);
+            if (mc !== null) {
+                const avail = mc.available < NEEDED_COUNTERPARTIES
+                    ? ` (only ${mc.available} maker(s) at or under this fee)`
+                    : '';
+                lines.push(
+                    `Max coinjoin size with ${NEEDED_COUNTERPARTIES} makers at or under this fee: `
+                    + `${formatSats(mc.value)}${avail}.`
+                );
+            }
         } else {
             lines.push(`${total} maker(s) above the largest quantum.`);
             lines.push('A quantizing taker cannot select these.');
-        }
-        lines.push(`${formatBtc(row.bond)} bonded in this band.`);
-        const medMax = median(row.maxsizes);
-        if (medMax !== null) {
-            lines.push(`Median max size: ${formatBtc(medMax)}.`);
-        }
-        if (feeLabel !== null && row.cumBondPct !== null) {
-            lines.push(
-                `A taker capped at ${feeLabel} reaches ${row.cumBondPct.toFixed(0)}% of bonded value.`
-            );
         }
         const tooltip = lines.join('\n');
 
