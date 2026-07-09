@@ -299,18 +299,35 @@ run_playwright_tests() {
         return 0
     fi
 
-    wait_for_jam_playwright || {
-        log_error "jam-playwright container not ready — skipping Playwright tests"
-        FAILED_TESTS+=("Playwright Tests")
-        FAILED_TEST_DETAILS+=("Playwright Tests:|jam-playwright container failed to start on port 29183")
-        return 0
-    }
-
     log_info "Installing Playwright dependencies..."
     (cd "${PW_DIR}" && npm install && npx playwright install chromium) || {
         log_error "Playwright install failed"
         FAILED_TESTS+=("Playwright Tests")
         FAILED_TEST_DETAILS+=("Playwright Tests:|npm install or playwright install chromium failed")
+        return 0
+    }
+
+    # Orderbook watcher frontend tests: self-contained (in-process HTTP server
+    # serving the static frontend plus fixture payloads), no Docker needed.
+    log_info "Running orderbook watcher frontend tests..."
+    local ow_output_file="${TEMP_TEST_OUTPUT}.obwatcher-frontend"
+    if (cd "${PW_DIR}" && npx playwright test -c playwright.obwatcher.config.ts) 2>&1 \
+        | tee "$ow_output_file"; then
+        log_success "Orderbook Watcher Frontend Tests passed"
+        rm -f "$ow_output_file"
+    else
+        log_error "Orderbook Watcher Frontend Tests failed"
+        FAILED_TESTS+=("Orderbook Watcher Frontend Tests")
+        local ow_failed_details
+        ow_failed_details=$(grep -E "failed|Error|Timeout" "$ow_output_file" | head -10 \
+            || echo "See full output for details")
+        FAILED_TEST_DETAILS+=("Orderbook Watcher Frontend Tests:|$ow_failed_details")
+    fi
+
+    wait_for_jam_playwright || {
+        log_error "jam-playwright container not ready — skipping Playwright tests"
+        FAILED_TESTS+=("Playwright Tests")
+        FAILED_TEST_DETAILS+=("Playwright Tests:|jam-playwright container failed to start on port 29183")
         return 0
     }
 

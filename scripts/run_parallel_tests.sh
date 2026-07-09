@@ -929,6 +929,11 @@ run_suite_playwright() {
         local PW_DIR="${PROJECT_ROOT}/tests/playwright"
         (cd "$PW_DIR" && npm install && npx playwright install chromium)
 
+        # Orderbook watcher frontend tests: self-contained (in-process HTTP
+        # server serving the static frontend plus fixture payloads), so they
+        # need none of the Docker services or port mappings above.
+        bash -c "cd '${PW_DIR}' && npx playwright test -c playwright.obwatcher.config.ts"
+
         JAM_URL="https://localhost:${jam_pw_port}" \
         JMWALLETD_URL="https://localhost:${jam_pw_port}" \
         BITCOIN_RPC_URL="http://localhost:${btc_rpc}" \

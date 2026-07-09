@@ -805,6 +805,14 @@ jobs:
           # is not dropped by sudo's env_reset policy.
           sudo env DEBIAN_FRONTEND=noninteractive npx playwright install-deps chromium
 
+      # Orderbook watcher frontend tests: self-contained (each spec serves the
+      # real static frontend plus a fixture orderbook.json from an in-process
+      # HTTP server), so they run before the Docker E2E stack is brought up.
+      - name: Run orderbook watcher frontend tests
+        working-directory: tests/playwright
+        env:
+          CI: "true"
+        run: npx playwright test -c playwright.obwatcher.config.ts
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4

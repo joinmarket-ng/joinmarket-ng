@@ -7,6 +7,7 @@
     "test:headed": "playwright test --headed",
     "test:ui": "playwright test --ui",
     "test:debug": "playwright test --debug",
+    "test:obwatcher": "playwright test -c playwright.obwatcher.config.ts",
     "install-browsers": "playwright install chromium"
   },
   "devDependencies": {

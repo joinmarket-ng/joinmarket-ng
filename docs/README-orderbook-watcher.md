@@ -58,6 +58,26 @@ UI is exposed on `http://localhost:8000` by default.
 - `GET /orderbook.json` aggregated offers
 - `GET /health` healthcheck
 
+## Testing
+
+Backend unit tests:
+
+```bash
+pytest orderbook_watcher
+```
+
+Frontend (web UI) tests run the real static files in a headless browser with
+fixture payloads; they need Node.js but no Docker stack:
+
+```bash
+cd tests/playwright
+npm install && npx playwright install chromium
+npm run test:obwatcher
+```
+
+They also run in CI (`test-playwright` job) and as part of
+`scripts/run_all_tests.sh` and `scripts/run_parallel_tests.sh`.
+
 ## Related Docs
 
 - [Directory Server](README-directory-server.md)
