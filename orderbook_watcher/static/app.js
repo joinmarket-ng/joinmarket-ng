@@ -306,12 +306,6 @@ function renderFeeQuantizationChart() {
         }
     }
 
-    if (perMaker.size === 0) {
-        container.innerHTML =
-            '<p class="fee-quant-empty">No bonded makers in the orderbook yet.</p>';
-        return;
-    }
-
     // Buckets: one per grid entry, plus an "above grid" overflow for makers
     // whose fee exceeds the largest quantum (unselectable by a quantizing taker).
     // Each band separates makers advertising *exactly* the quantum (they share
@@ -363,11 +357,14 @@ function renderFeeQuantizationChart() {
 
     container.innerHTML = '';
 
-    // Summary line: the practical nudge for makers.
+    // Summary line: the practical nudge for makers. With no data yet (startup,
+    // or an empty orderbook) the grid still renders with zero bars so the
+    // section never looks broken.
     const summary = document.createElement('p');
     summary.className = 'fq-summary';
-    summary.textContent =
-        `${exactTotal} of ${perMaker.size} bonded makers advertise an exact grid fee.`;
+    summary.textContent = perMaker.size === 0
+        ? 'No bonded makers in the orderbook yet.'
+        : `${exactTotal} of ${perMaker.size} bonded makers advertise an exact grid fee.`;
     container.appendChild(summary);
 
     const chart = document.createElement('div');
