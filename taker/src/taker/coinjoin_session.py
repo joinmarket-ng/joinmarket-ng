@@ -627,7 +627,7 @@ class CoinJoinSession:
 
                     # Parse: <utxo_list> <auth_pub> <cj_addr> <change_addr> <btc_sig>
                     ioauth_parts = decrypted.split()
-                    if len(ioauth_parts) < 4:
+                    if len(ioauth_parts) < 5:
                         logger.warning(
                             f"Invalid !ioauth format from {nick}: expected 5 parts, "
                             f"got {len(ioauth_parts)}"
@@ -641,32 +641,18 @@ class CoinJoinSession:
                     cj_addr = ioauth_parts[2]
                     change_addr = ioauth_parts[3]
 
-                    # Verify btc_sig if present - proves maker owns the UTXO
-                    # NOTE: BTC sig verification is OPTIONAL per JoinMarket protocol
-                    # It provides additional security by proving maker controls the UTXO
-                    # but not all makers may provide it
-                    if len(ioauth_parts) >= 5:
-                        btc_sig = ioauth_parts[4]
-                        # The signature is over the maker's NaCl pubkey
-                        from jmcore.crypto import ecdsa_verify
+                    # The maker must prove control of its auth key by signing its
+                    # NaCl pubkey with it. An unauthenticated session lets a
+                    # malicious directory substitute the maker's encryption key and
+                    # MITM the channel, so a failing btc_sig is fatal.
+                    btc_sig = ioauth_parts[4]
+                    from jmcore.crypto import ecdsa_verify
 
-                        maker_nacl_pk = session.pubkey  # Maker's NaCl pubkey from !pubkey
-                        auth_pub_bytes = bytes.fromhex(auth_pub)
-                        logger.debug(
-                            f"Verifying BTC sig from {nick}: "
-                            f"message={maker_nacl_pk[:32]}..., "
-                            f"sig={btc_sig[:32]}..., "
-                            f"pubkey={auth_pub[:16]}..."
-                        )
-                        if not ecdsa_verify(maker_nacl_pk, btc_sig, auth_pub_bytes):
-                            logger.warning(
-                                f"BTC signature verification failed from {nick} - "
-                                f"continuing anyway (optional security feature)"
-                            )
-                            # NOTE: We don't delete the session here - BTC sig is optional
-                            # The transaction verification will still protect against fraud
-                        else:
-                            logger.info(f"BTC signature verified for {nick}")
+                    if not ecdsa_verify(session.pubkey, btc_sig, bytes.fromhex(auth_pub)):
+                        logger.warning(f"btc_sig verification failed from {nick}, dropping")
+                        failed_makers.append(nick)
+                        del self.maker_sessions[nick]
+                        continue
 
                     # Parse utxo_list using protocol helper
                     # (handles both legacy and extended format)
@@ -765,6 +751,15 @@ class CoinJoinSession:
                             f"Dropping maker {nick}: one or more UTXOs failed "
                             "Neutrino verification (likely already spent)"
                         )
+                        failed_makers.append(nick)
+                        del self.maker_sessions[nick]
+                        continue
+
+                    # Tie the authenticated session to on-chain ownership: the auth
+                    # pubkey must own one of the maker's declared UTXOs.
+                    auth_spk = pubkey_to_p2wpkh_script(bytes.fromhex(auth_pub)).hex()
+                    if not any(u.get("scriptpubkey", "") == auth_spk for u in session.utxos):
+                        logger.warning(f"auth_pub from {nick} matches no declared UTXO, dropping")
                         failed_makers.append(nick)
                         del self.maker_sessions[nick]
                         continue
