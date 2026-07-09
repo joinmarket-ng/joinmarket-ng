@@ -37,6 +37,48 @@ jm-wallet send <destination_address> --amount 100000
 
 Use `--select-utxos` on `jm-wallet send` for manual coin control.
 
+## Reserving deposit addresses
+
+When you hand out a deposit address (via `jm-wallet address new`, the
+jmwalletd `/address/new` endpoint, or Jam), the wallet remembers it so the
+same address is never handed out again, even after a restart. This prevents
+accidental address reuse, which links payments together and harms privacy.
+
+You can also set an address aside with a label. A reserved address is:
+
+- never proposed again as the next deposit address,
+- hidden from the concise `jm-wallet info` view,
+- shown as `reserved` with its label in `jm-wallet info --extended`.
+
+Reserving does not affect coin control: if funds later arrive, the coins are
+spendable as usual (freeze the UTXO with `jm-wallet freeze` if you want to
+exclude it).
+
+### Example: collect payments from several people
+
+```bash
+# Hand out one labeled address per payer (each is persisted and never reused)
+jm-wallet address new 0 --label "Alice - rent"
+jm-wallet address new 0 --label "Bob - dinner"
+jm-wallet address new 0 --label "Carol - gift"
+
+# Review what you have set aside
+jm-wallet address list
+
+# See them (with labels) alongside the rest of the wallet
+jm-wallet info --extended
+
+# Give an existing address a label after the fact
+jm-wallet address label bcrt1q... "Dave - loan"
+
+# Stop setting an address aside (it may be reused again)
+jm-wallet address release bcrt1q...
+```
+
+The concise `jm-wallet info` keeps showing a fresh, never-handed-out deposit
+address per mixdepth, so you will not accidentally reuse any of the reserved
+ones.
+
 ## Backends
 
 Configure backend in `~/.joinmarket-ng/config.toml` (details in [Installation](install.md#configure-backend)).

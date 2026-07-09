@@ -105,6 +105,9 @@ legacy `.jmdat` model). The split was chosen deliberately:
 - **Interoperability:** UTXO/label/freeze state is stored as BIP-329
   JSON Lines, importable by other wallets; UTXO state itself lives in the
   external Bitcoin Core descriptor wallet rather than being duplicated.
+  Handed-out and user-reserved deposit addresses are recorded in the same
+  file (`jm:reserved` address labels) so they are never reissued across
+  restarts.
 
 Active-wallet identity is resolved uniformly for all per-wallet read
 commands (see `wallet.md`): explicit fingerprint, then `--mnemonic-file`,
