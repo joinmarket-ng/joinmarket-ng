@@ -4,11 +4,13 @@ Tests for taker transaction signing functionality.
 
 from __future__ import annotations
 
+import base64
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from jmcore.bitcoin import pubkey_to_p2wpkh_script
 from jmwallet.wallet.bip32 import HDKey, mnemonic_to_seed
 from jmwallet.wallet.models import UTXOInfo
 from jmwallet.wallet.signing import (
@@ -810,6 +812,106 @@ class TestPhaseCollectSignaturesCompleteness:
             "doesn't respond. The old minimum_makers check would have "
             "incorrectly allowed this."
         )
+
+    def _maker1_sig_response(self, tx_bytes: bytes, privkey: Any) -> str:
+        """Build a valid base64 !sig payload for maker1's input signed by ``privkey``."""
+        from jmwallet.wallet.signing import (
+            create_p2wpkh_script_code,
+            sign_p2wpkh_input,
+        )
+
+        tx = deserialize_transaction(tx_bytes)
+        index_map = {(ti.txid_le[::-1].hex(), ti.vout): idx for idx, ti in enumerate(tx.inputs)}
+        idx = index_map[("b" * 64, 0)]
+        pub = privkey.public_key.format(compressed=True)
+        sig = sign_p2wpkh_input(tx, idx, create_p2wpkh_script_code(pub), 1_500_000, privkey)
+        payload = bytes([len(sig)]) + sig + bytes([len(pub)]) + pub
+        return base64.b64encode(payload).decode()
+
+    def _collect_with_maker1(
+        self, two_maker_tx_data: CoinJoinTxData, maker1_scriptpubkey: str, privkey: Any
+    ) -> Any:
+        """Drive a round where only maker1 responds (with a real signature).
+
+        maker2 stays silent, so the round always fails; whether maker1's signature
+        is accepted is isolated in maker1's own session state.
+        """
+        from jmcore.models import Offer, OfferType
+
+        offer = Offer(
+            counterparty="maker1",
+            oid=0,
+            ordertype=OfferType.SW0_RELATIVE,
+            minsize=100_000,
+            maxsize=10_000_000,
+            txfee=0,
+            cjfee="0.001",
+            fidelity_bond_value=0,
+        )
+        maker_sessions = {
+            "maker1": self._make_maker_session(
+                "maker1",
+                offer,
+                [
+                    {
+                        "txid": "b" * 64,
+                        "vout": 0,
+                        "value": 1_500_000,
+                        "scriptpubkey": maker1_scriptpubkey,
+                    }
+                ],
+            ),
+            "maker2": self._make_maker_session(
+                "maker2", offer, [{"txid": "c" * 64, "vout": 0, "value": 1_200_000}]
+            ),
+        }
+        taker = self._build_taker_with_tx(two_maker_tx_data, maker_sessions=maker_sessions)
+        sig_b64 = self._maker1_sig_response(taker._session.unsigned_tx, privkey)
+        maker_sessions["maker1"].crypto.decrypt = MagicMock(return_value=sig_b64)
+        taker.directory_client.wait_for_responses = AsyncMock(
+            return_value={"maker1": {"data": [sig_b64]}}
+        )
+        return taker
+
+    @pytest.mark.asyncio
+    async def test_accepts_maker_signature_bound_to_its_utxo(
+        self, two_maker_tx_data: CoinJoinTxData
+    ) -> None:
+        """A valid signature whose pubkey owns the UTXO scriptPubKey is accepted."""
+        from coincurve import PrivateKey
+
+        maker1_key = PrivateKey()
+        spk = pubkey_to_p2wpkh_script(maker1_key.public_key.format(compressed=True)).hex()
+        taker = self._collect_with_maker1(two_maker_tx_data, spk, maker1_key)
+
+        result = await taker._session._phase_collect_signatures()
+
+        assert result is False  # maker2 stayed silent
+        assert taker._session.maker_sessions["maker1"].responded_sig is True
+
+    @pytest.mark.asyncio
+    async def test_rejects_maker_signature_not_bound_to_its_utxo(
+        self, two_maker_tx_data: CoinJoinTxData
+    ) -> None:
+        """A valid signature whose pubkey does not own the UTXO must be rejected.
+
+        Regression test: the taker previously derived the verification scriptCode
+        from the maker-supplied pubkey without checking that the pubkey controls
+        the UTXO, so a maker could pass verification with a key it does not own,
+        producing a consensus-invalid coinjoin.
+        """
+        from coincurve import PrivateKey
+
+        maker1_key = PrivateKey()
+        other_key = PrivateKey()
+        # The UTXO is owned by other_key, but maker1 signs with maker1_key.
+        spk = pubkey_to_p2wpkh_script(other_key.public_key.format(compressed=True)).hex()
+        taker = self._collect_with_maker1(two_maker_tx_data, spk, maker1_key)
+
+        result = await taker._session._phase_collect_signatures()
+
+        assert result is False
+        assert "maker1" not in taker._session.maker_sessions
 
 
 # Re-export fixtures for use in conftest
