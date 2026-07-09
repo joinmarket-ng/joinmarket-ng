@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from aiohttp import web
+from aiohttp.typedefs import Handler
 from jmcore.fee_quantization import QUANT_ABS, QUANT_REL
 from jmcore.models import OrderBook
 from jmcore.settings import OrderbookWatcherSettings
@@ -19,11 +20,28 @@ from loguru import logger
 from orderbook_watcher.aggregator import OrderbookAggregator
 
 
+@web.middleware
+async def _no_store_ui_middleware(request: web.Request, handler: Handler) -> web.StreamResponse:
+    """Disable browser caching for the UI and its static assets.
+
+    Release images normalize file mtimes for reproducible builds, so
+    ``Last-Modified``/``ETag`` validators never change across releases and a
+    browser that cached ``app.js`` once would keep revalidating into ``304``s
+    forever, serving a stale frontend. The assets are small and the page polls
+    the API anyway, so ``no-store`` is the simple, correct choice. Per RFC
+    9111 the header also updates already-stored responses on ``304``.
+    """
+    response: web.StreamResponse = await handler(request)
+    if request.path == "/" or request.path.startswith("/static/"):
+        response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 class OrderbookServer:
     def __init__(self, settings: OrderbookWatcherSettings, aggregator: OrderbookAggregator) -> None:
         self.settings = settings
         self.aggregator = aggregator
-        self.app = web.Application()
+        self.app = web.Application(middlewares=[_no_store_ui_middleware])
         self.runner: web.AppRunner | None = None
         self.site: web.TCPSite | None = None
         self._update_task: asyncio.Task[Any] | None = None
