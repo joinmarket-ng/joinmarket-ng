@@ -1405,3 +1405,86 @@ class TestSafeDepositAddress:
 
         with pytest.raises(RuntimeError, match="could not find an unused"):
             await wallet.get_next_safe_deposit_address(0, max_attempts=5)
+
+
+class TestReservedAddressPersistence:
+    """Reserved/issued deposit addresses persist across wallet restarts."""
+
+    @pytest.fixture
+    def mock_backend(self):
+        backend = Mock()
+        backend.get_utxos = AsyncMock(return_value=[])
+        backend.close = AsyncMock()
+
+        async def address_has_history(addr: str) -> bool:
+            return False
+
+        backend.address_has_history = address_has_history
+        return backend
+
+    def _make_wallet(self, backend, data_dir, mnemonic, network):
+        wallet = WalletService(
+            mnemonic=mnemonic,
+            backend=backend,
+            network=network,
+            mixdepth_count=5,
+            scan_range=20,
+            data_dir=data_dir,
+        )
+        wallet.utxo_cache = {i: [] for i in range(5)}
+        return wallet
+
+    @pytest.mark.asyncio
+    async def test_issued_address_not_reissued_after_restart(
+        self, mock_backend, temp_data_dir, test_mnemonic, test_network
+    ):
+        """Regression: /address/new must advance the index across a restart.
+
+        Previously issued addresses were tracked only in memory, so a fresh
+        process handed out the same address again until it was funded.
+        """
+        wallet = self._make_wallet(mock_backend, temp_data_dir, test_mnemonic, test_network)
+        first = await wallet.get_new_address_verified(0)
+        assert first == wallet.get_receive_address(0, 0)
+
+        # Simulate a restart: brand-new WalletService over the same data_dir.
+        wallet2 = self._make_wallet(mock_backend, temp_data_dir, test_mnemonic, test_network)
+        assert first in wallet2.get_reserved_addresses()
+        second = await wallet2.get_new_address_verified(0)
+        assert second != first
+        assert second == wallet2.get_receive_address(0, 1)
+
+    @pytest.mark.asyncio
+    async def test_reserve_and_release_roundtrip(
+        self, mock_backend, temp_data_dir, test_mnemonic, test_network
+    ):
+        wallet = self._make_wallet(mock_backend, temp_data_dir, test_mnemonic, test_network)
+        addr = wallet.get_receive_address(0, 3)
+        wallet.reserve_address(addr, "Alice")
+        assert wallet.is_address_reserved(addr)
+        assert wallet.get_reserved_addresses()[addr] == "Alice"
+
+        # Label survives a restart.
+        wallet2 = self._make_wallet(mock_backend, temp_data_dir, test_mnemonic, test_network)
+        assert wallet2.get_reserved_addresses().get(addr) == "Alice"
+        # And a reserved address is skipped by the deposit picker.
+        picked, index = wallet2.get_next_after_last_used_address(0, set())
+        assert index == 4
+
+        # Releasing clears it durably.
+        assert wallet2.unreserve_address(addr) is True
+        wallet3 = self._make_wallet(mock_backend, temp_data_dir, test_mnemonic, test_network)
+        assert addr not in wallet3.get_reserved_addresses()
+
+    def test_reserved_empty_address_status_and_label(
+        self, mock_backend, temp_data_dir, test_mnemonic, test_network
+    ):
+        """A reserved, unfunded address shows as 'reserved' with its label."""
+        wallet = self._make_wallet(mock_backend, temp_data_dir, test_mnemonic, test_network)
+        addr = wallet.get_receive_address(0, 0)
+        wallet.reserve_address(addr, "Bob")
+
+        infos = wallet.get_address_info_for_mixdepth(0, 0, gap_limit=6, used_addresses=set())
+        info = next(i for i in infos if i.address == addr)
+        assert info.status == "reserved"
+        assert info.label == "Bob"

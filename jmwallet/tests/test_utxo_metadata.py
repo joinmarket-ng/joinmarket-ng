@@ -20,6 +20,7 @@ from jmwallet.wallet.utxo_metadata import (
     USED_LABEL_PREFIX,
     AddressRecord,
     OutputRecord,
+    ReservedAddressRecord,
     UTXOMetadataStore,
     load_metadata_store,
 )
@@ -622,6 +623,36 @@ class TestAddressRecord:
         assert rec is None
 
 
+class TestReservedAddressRecord:
+    """Tests for the ReservedAddressRecord dataclass."""
+
+    def test_no_label_serializes_to_bare_prefix(self):
+        rec = ReservedAddressRecord(ref="bcrt1qa")
+        assert rec.label == "jm:reserved"
+        assert rec.to_dict() == {"type": "addr", "ref": "bcrt1qa", "label": "jm:reserved"}
+
+    def test_label_round_trip(self):
+        rec = ReservedAddressRecord(ref="bcrt1qa", user_label="Alice")
+        data = rec.to_dict()
+        assert data == {"type": "addr", "ref": "bcrt1qa", "label": "jm:reserved:Alice"}
+        assert ReservedAddressRecord.from_dict(data) == rec
+
+    def test_from_dict_preserves_colons_in_label(self):
+        rec = ReservedAddressRecord.from_dict(
+            {"type": "addr", "ref": "bcrt1qa", "label": "jm:reserved:rent: March"}
+        )
+        assert rec is not None
+        assert rec.user_label == "rent: March"
+
+    def test_from_dict_rejects_non_reserved_label(self):
+        assert (
+            ReservedAddressRecord.from_dict(
+                {"type": "addr", "ref": "bcrt1qa", "label": "jm:used:deposit"}
+            )
+            is None
+        )
+
+
 class TestMarkAddressUsed:
     """Tests for mark_address_used / mark_addresses_used / get_used_addresses."""
 
@@ -688,6 +719,80 @@ class TestMarkAddressUsed:
         s2 = UTXOMetadataStore(path=path)
         s2.load()
         assert s2.foreign_addr_lines == [foreign]
+
+
+class TestReservedAddresses:
+    """Tests for reserved (set-aside) deposit addresses."""
+
+    def test_reserve_and_persist(self, tmp_path):
+        path = tmp_path / "m.jsonl"
+        s = UTXOMetadataStore(path=path)
+        s.load()
+        assert s.reserve_address("bcrt1qa", "Alice") is True
+        # Idempotent: same label -> no disk write.
+        assert s.reserve_address("bcrt1qa", "Alice") is False
+        # Changing the label updates the record.
+        assert s.reserve_address("bcrt1qa", "Bob") is True
+
+        s2 = UTXOMetadataStore(path=path)
+        s2.load()
+        assert s2.get_reserved_addresses() == {"bcrt1qa"}
+        assert s2.get_reserved_labels() == {"bcrt1qa": "Bob"}
+        assert s2.is_address_reserved("bcrt1qa")
+        assert not s2.is_address_reserved("bcrt1qother")
+
+    def test_reserve_without_label(self, tmp_path):
+        path = tmp_path / "m.jsonl"
+        s = UTXOMetadataStore(path=path)
+        s.load()
+        s.reserve_address("bcrt1qa")
+        s2 = UTXOMetadataStore(path=path)
+        s2.load()
+        assert s2.get_reserved_labels() == {"bcrt1qa": ""}
+        # The on-disk label is the bare prefix (no trailing colon).
+        assert s2.reserved_records["bcrt1qa"].label == "jm:reserved"
+
+    def test_unreserve(self, tmp_path):
+        path = tmp_path / "m.jsonl"
+        s = UTXOMetadataStore(path=path)
+        s.load()
+        s.reserve_address("bcrt1qa", "Alice")
+        assert s.unreserve_address("bcrt1qa") is True
+        assert s.unreserve_address("bcrt1qa") is False
+        s2 = UTXOMetadataStore(path=path)
+        s2.load()
+        assert s2.get_reserved_addresses() == set()
+
+    def test_label_with_special_characters_round_trip(self, tmp_path):
+        path = tmp_path / "m.jsonl"
+        s = UTXOMetadataStore(path=path)
+        s.load()
+        s.reserve_address("bcrt1qa", "Alice: rent, March")
+        s2 = UTXOMetadataStore(path=path)
+        s2.load()
+        assert s2.get_reserved_labels() == {"bcrt1qa": "Alice: rent, March"}
+
+    def test_reserved_and_used_coexist(self, tmp_path):
+        """An address may be both reserved and (later) on-chain used."""
+        path = tmp_path / "m.jsonl"
+        s = UTXOMetadataStore(path=path)
+        s.load()
+        s.reserve_address("bcrt1qa", "Alice")
+        s.mark_address_used("bcrt1qa", "deposit")
+        s2 = UTXOMetadataStore(path=path)
+        s2.load()
+        assert s2.get_reserved_labels() == {"bcrt1qa": "Alice"}
+        assert s2.get_used_addresses() == {"bcrt1qa"}
+
+    def test_reserved_not_treated_as_used_or_foreign(self, tmp_path):
+        path = tmp_path / "m.jsonl"
+        s = UTXOMetadataStore(path=path)
+        s.load()
+        s.reserve_address("bcrt1qa", "Alice")
+        s2 = UTXOMetadataStore(path=path)
+        s2.load()
+        assert s2.get_used_addresses() == set()
+        assert s2.foreign_addr_lines == []
 
 
 class TestCoinjoinAddressTypes:

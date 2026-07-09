@@ -51,6 +51,15 @@ except ImportError:  # pragma: no cover - non-POSIX platforms
 
 USED_LABEL_PREFIX = "jm:used"
 
+# Label prefix for addresses the user has set aside ("reserved"). Unlike
+# ``jm:used`` markers (which mean the address has on-chain history), a
+# ``jm:reserved`` marker means the address was handed out or manually
+# reserved by the user: it must not be reissued as a "next unused" deposit
+# address and is hidden from the concise ``jm-wallet info`` view, but it does
+# NOT imply the address has ever held funds. An optional free-form user label
+# follows the prefix: ``jm:reserved`` or ``jm:reserved:<label>``.
+RESERVED_LABEL_PREFIX = "jm:reserved"
+
 # Label applied to UTXOs frozen automatically by the forced-address-reuse
 # defense (issue #529). The label keeps the record around after a user
 # ``unfreeze`` so the same UTXO is never silently re-frozen on the next sync.
@@ -206,6 +215,57 @@ class AddressRecord:
 
 
 @dataclass
+class ReservedAddressRecord:
+    """A BIP-329 ``addr`` record marking an address the user has set aside.
+
+    The presence of a record means: this deposit address was handed out or
+    manually reserved and must not be reissued as the next unused address.
+    It carries an optional free-form ``user_label`` (e.g. ``"Alice"``) for
+    display. Unlike :class:`AddressRecord` (``jm:used``) it does not imply the
+    address has on-chain history, so the wallet still shows it distinctly
+    ("reserved") rather than as "used-empty".
+
+    Attributes:
+        ref: Bitcoin address.
+        user_label: Optional human-readable label; empty string if none.
+    """
+
+    ref: str
+    user_label: str = ""
+
+    @property
+    def label(self) -> str:
+        """The BIP-329 label string (``jm:reserved`` or ``jm:reserved:<label>``)."""
+        if self.user_label:
+            return f"{RESERVED_LABEL_PREFIX}:{self.user_label}"
+        return RESERVED_LABEL_PREFIX
+
+    def to_dict(self) -> dict[str, str]:
+        """Serialize to a BIP-329 JSON dict."""
+        return {"type": "addr", "ref": self.ref, "label": self.label}
+
+    @classmethod
+    def from_dict(cls, d: dict[str, str | bool]) -> ReservedAddressRecord | None:
+        """Deserialize from a BIP-329 ``addr`` record bearing ``jm:reserved``.
+
+        Returns ``None`` for records that are not ours. Everything after the
+        ``jm:reserved:`` prefix is treated as the raw user label (so labels
+        may contain colons and commas).
+        """
+        if d.get("type") != "addr":
+            return None
+        ref = d.get("ref")
+        label = d.get("label", RESERVED_LABEL_PREFIX)
+        if not isinstance(ref, str) or not ref:
+            return None
+        if not isinstance(label, str) or not label.startswith(RESERVED_LABEL_PREFIX):
+            return None
+        rest = label[len(RESERVED_LABEL_PREFIX) :]
+        user_label = rest[1:] if rest.startswith(":") else ""
+        return cls(ref=ref, user_label=user_label)
+
+
+@dataclass
 class UTXOMetadataStore:
     """In-memory store for UTXO + address metadata backed by a BIP-329 JSONL file.
 
@@ -225,6 +285,7 @@ class UTXOMetadataStore:
     path: Path
     records: dict[str, OutputRecord] = field(default_factory=dict)
     address_records: dict[str, AddressRecord] = field(default_factory=dict)
+    reserved_records: dict[str, ReservedAddressRecord] = field(default_factory=dict)
     foreign_addr_lines: list[dict[str, str | bool]] = field(default_factory=list)
 
     def load(self) -> None:
@@ -235,6 +296,7 @@ class UTXOMetadataStore:
         """
         self.records.clear()
         self.address_records.clear()
+        self.reserved_records.clear()
         self.foreign_addr_lines.clear()
 
         if not self.path.exists():
@@ -271,6 +333,10 @@ class UTXOMetadataStore:
                     rec = AddressRecord.from_dict(data)
                     if rec is not None:
                         self.address_records[rec.ref] = rec
+                elif isinstance(label, str) and label.startswith(RESERVED_LABEL_PREFIX):
+                    reserved = ReservedAddressRecord.from_dict(data)
+                    if reserved is not None:
+                        self.reserved_records[reserved.ref] = reserved
                 else:
                     if isinstance(data, dict):
                         self.foreign_addr_lines.append(data)
@@ -317,8 +383,14 @@ class UTXOMetadataStore:
         outputs_to_write.sort(key=lambda r: r.ref)
 
         addr_records_to_write = sorted(self.address_records.values(), key=lambda r: r.ref)
+        reserved_records_to_write = sorted(self.reserved_records.values(), key=lambda r: r.ref)
 
-        if not outputs_to_write and not addr_records_to_write and not self.foreign_addr_lines:
+        if (
+            not outputs_to_write
+            and not addr_records_to_write
+            and not reserved_records_to_write
+            and not self.foreign_addr_lines
+        ):
             if self.path.exists():
                 try:
                     self.path.unlink()
@@ -331,6 +403,9 @@ class UTXOMetadataStore:
         lines: list[str] = []
         lines.extend(json.dumps(r.to_dict(), separators=(",", ":")) for r in outputs_to_write)
         lines.extend(json.dumps(r.to_dict(), separators=(",", ":")) for r in addr_records_to_write)
+        lines.extend(
+            json.dumps(r.to_dict(), separators=(",", ":")) for r in reserved_records_to_write
+        )
         # Foreign records last; sort by (type, ref) for determinism.
         for foreign in sorted(
             self.foreign_addr_lines,
@@ -671,6 +746,44 @@ class UTXOMetadataStore:
             elif "cj_change" in origins:
                 result[address] = "change"
         return result
+
+    # -- Reserved addresses (BIP-329 ``addr`` records with ``jm:reserved``) --
+
+    def reserve_address(self, address: str, label: str = "") -> bool:
+        """Mark ``address`` as reserved (set aside) with an optional label.
+
+        Idempotent: re-reserving with the same label is a no-op. Changing the
+        label updates the record. Returns ``True`` if disk state changed.
+        """
+        if not address:
+            return False
+        user_label = label or ""
+        existing = self.reserved_records.get(address)
+        if existing is not None and existing.user_label == user_label:
+            return False
+        self.reserved_records[address] = ReservedAddressRecord(ref=address, user_label=user_label)
+        self.save()
+        return True
+
+    def unreserve_address(self, address: str) -> bool:
+        """Remove any reservation for ``address``. Returns ``True`` if changed."""
+        if address in self.reserved_records:
+            del self.reserved_records[address]
+            self.save()
+            return True
+        return False
+
+    def is_address_reserved(self, address: str) -> bool:
+        """Return True if ``address`` is currently reserved."""
+        return address in self.reserved_records
+
+    def get_reserved_addresses(self) -> set[str]:
+        """Return the set of reserved addresses."""
+        return set(self.reserved_records.keys())
+
+    def get_reserved_labels(self) -> dict[str, str]:
+        """Return a mapping of reserved address -> user label (may be empty)."""
+        return {ref: rec.user_label for ref, rec in self.reserved_records.items()}
 
     def verify_writable(self) -> None:
         """Verify that the metadata file's directory is writable.

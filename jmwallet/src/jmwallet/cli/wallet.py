@@ -942,8 +942,11 @@ def _print_branch_addresses(
     * Up to ``new_address_limit`` unused ``new`` addresses are displayed so
       users (especially in the TUI) can pick multiple fresh receive
       addresses without dropping to ``--show-empty`` (see issue #463).
-    * ``used-empty`` and ``flagged`` entries are always hidden in this mode
-      because they are not safe to reuse and only add noise.
+    * ``reserved`` (set-aside/handed-out) addresses are always shown, with
+      their label, so the user can see what they gave out.
+
+    ``used-empty`` and ``flagged`` empty entries are always hidden in this
+    mode because they are not safe to reuse and only add noise.
 
     Total balance is computed over all addresses (even skipped ones) so
     balance display remains accurate. ``hidden_count`` counts addresses
@@ -956,28 +959,30 @@ def _print_branch_addresses(
     total_balance = 0
     hidden = 0
     empty_new_shown = 0
-    # Statuses that are unsafe to reuse; hide them entirely when not in
-    # show-empty mode to keep the output actionable.
-    _always_hide_when_empty = {"used-empty", "flagged"}
 
     for addr_info in addresses:
         total_balance += addr_info.balance
 
         # Filter empty addresses unless explicitly requested.
         if not show_empty and addr_info.balance == 0:
-            if addr_info.status == "new" and empty_new_shown < new_address_limit:
+            if addr_info.status == "reserved":
+                # Set-aside/handed-out addresses are always shown (with their
+                # label) even when empty, so the user can see what they gave
+                # out and never accidentally reuse it.
+                pass
+            elif addr_info.status == "new" and empty_new_shown < new_address_limit:
                 empty_new_shown += 1
-            elif addr_info.status in _always_hide_when_empty:
-                # Unsafe-to-reuse empty addresses are never surfaced in the
-                # default view; still count them so the "hidden" summary
-                # stays accurate.
-                hidden += 1
-                continue
             else:
+                # Unsafe-to-reuse (used-empty/flagged) and surplus empty
+                # addresses are omitted from the default view; still count
+                # them so the "hidden" summary stays accurate.
                 hidden += 1
                 continue
 
         status_display: str = addr_info.status
+        label = getattr(addr_info, "label", "")
+        if label:
+            status_display += f' "{label}"'
         if addr_info.address in pending_addresses:
             status_display += " (pending)"
         elif addr_info.has_unconfirmed:
@@ -1074,6 +1079,7 @@ def _show_extended_wallet_info(
     print("  cj-out        - CoinJoin output (mixed funds)")
     print("  cj-change     - Change output from a CoinJoin (deanonymising, keep separate)")
     print("  non-cj-change - Regular change (not from CoinJoin)")
+    print('  reserved      - Set aside/handed out by you (label in "quotes"); do not reuse')
     print("  used-empty    - Previously used, now empty (do not reuse)")
     print("  flagged       - Shared with peers but tx failed (do not reuse)")
     print()

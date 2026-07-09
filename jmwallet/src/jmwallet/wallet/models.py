@@ -17,6 +17,7 @@ AddressStatus = Literal[
     "non-cj-change",  # Internal address - regular change (not from CJ)
     "new",  # Unused address (no funds, never used)
     "reused",  # Address that was used and reused (privacy warning)
+    "reserved",  # Set aside/handed out by the user; do not reuse (may be labeled)
     "used-empty",  # Address that had funds but is now empty
     "bond",  # Fidelity bond address
     "flagged",  # Address flagged/shared but tx failed (should not reuse)
@@ -101,6 +102,7 @@ class AddressInfo:
     locktime: int | None = None  # For fidelity bond addresses
     has_unconfirmed: bool = False  # True if any UTXOs at this address are unconfirmed
     utxos: list[UTXOInfo] = field(default_factory=list)  # UTXOs at this address
+    label: str = ""  # User label for a reserved/set-aside address ("" if none)
 
     @property
     def short_path(self) -> str:

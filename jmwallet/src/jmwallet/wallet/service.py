@@ -182,6 +182,16 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin, Wal
         # Track receive addresses that were already handed out via API/CLI.
         # Even if they do not appear on-chain yet, we should not reissue them.
         self.issued_receive_addresses: set[str] = set()
+        # Reserved (set-aside) deposit addresses -> optional user label.
+        # Persisted in the metadata store (``jm:reserved`` records) so handed-out
+        # and user-labeled deposit addresses survive restarts, are never
+        # reissued, and can be shown with their label in the extended view.
+        self.reserved_address_labels: dict[str, str] = {}
+        if self.metadata_store is not None:
+            self.reserved_address_labels.update(self.metadata_store.get_reserved_labels())
+            # Feed the in-memory picker skip-set so reserved addresses are not
+            # reissued as the next unused deposit address after a restart.
+            self.issued_receive_addresses.update(self.reserved_address_labels.keys())
         # Cache for fidelity bond locktimes (address -> locktime)
         self.fidelity_bond_locktime_cache: dict[str, int] = {}
         # Lazily-built cache of every canonical fidelity-bond address (all
@@ -201,6 +211,20 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin, Wal
         # check.
         if data_dir is not None:
             self._migrate_legacy_bond_registry(data_dir)
+
+        # Resolve reserved deposit addresses to their derivation path and seed
+        # the address cache. The deposit-address pickers key on the cache to
+        # map an address to its index, so this lets them advance past a
+        # reserved address even before a full sync has populated the cache
+        # (after a restart the reservation is loaded from disk, but the
+        # address itself has not been derived yet). Reserved addresses are few
+        # and typically at low indices, so this is cheap.
+        for reserved_addr in list(self.reserved_address_labels):
+            if reserved_addr not in self.address_cache:
+                try:
+                    self._find_address_path(reserved_addr, max_scan=self.scan_range)
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.debug(f"Could not resolve reserved address {reserved_addr}: {exc}")
 
     def _migrate_legacy_address_history(self, data_dir: Path | None) -> None:
         """Fold a legacy ``address_history_<fingerprint>.jsonl`` file into the
@@ -753,22 +777,68 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin, Wal
         """
         next_index = self.get_next_address_index(mixdepth, 0)
         address = self.get_receive_address(mixdepth, next_index)
-        self.issued_receive_addresses.add(address)
+        self.reserve_address(address)
         return address
 
     async def get_new_address_verified(self, mixdepth: int) -> str:
         """Async deposit-address picker with on-chain verification.
 
-        Wraps :meth:`get_next_safe_deposit_address` and registers the
-        chosen address in ``issued_receive_addresses`` (matching the
-        side effect of :meth:`get_new_address`). Use this from any
-        async code path that exposes a deposit address to users or
-        peers (``jm-wallet info``, jmwalletd ``/wallet/address/new``,
-        maker/taker deposit prompts).
+        Wraps :meth:`get_next_safe_deposit_address` and reserves the chosen
+        address (persisted when a ``data_dir`` is configured) so it is never
+        reissued, even across restarts. Use this from any async code path that
+        exposes a deposit address to users or peers (``jm-wallet info``,
+        jmwalletd ``/wallet/address/new``, maker/taker deposit prompts).
         """
         address, _ = await self.get_next_safe_deposit_address(mixdepth)
-        self.issued_receive_addresses.add(address)
+        self.reserve_address(address)
         return address
+
+    def reserve_address(self, address: str, label: str = "") -> None:
+        """Reserve (set aside) a deposit address so it is never reissued.
+
+        Records the address in the in-memory skip-set consulted by the
+        deposit-address pickers and, when a ``data_dir`` is configured,
+        persists a ``jm:reserved`` record (with the optional user label) to the
+        metadata store so the reservation survives restarts. Reserved addresses
+        are hidden from the concise ``jm-wallet info`` view and shown with their
+        label in the extended view.
+        """
+        if not address:
+            return
+        self.issued_receive_addresses.add(address)
+        self.reserved_address_labels[address] = label or ""
+        store = getattr(self, "metadata_store", None)
+        if store is not None:
+            try:
+                store.reserve_address(address, label or "")
+            except Exception as exc:  # pragma: no cover - disk failures are rare
+                logger.warning(f"Failed to persist reserved address {address}: {exc}")
+
+    def unreserve_address(self, address: str) -> bool:
+        """Remove a reservation so the address may be reissued.
+
+        Note: an address that has real on-chain history is still never
+        reissued (the pickers also consult ``addresses_with_history``); this
+        only clears the "set aside" marker and its label.
+        """
+        changed = self.reserved_address_labels.pop(address, None) is not None
+        self.issued_receive_addresses.discard(address)
+        store = getattr(self, "metadata_store", None)
+        if store is not None:
+            try:
+                if store.unreserve_address(address):
+                    changed = True
+            except Exception as exc:  # pragma: no cover - disk failures are rare
+                logger.warning(f"Failed to remove reserved address {address}: {exc}")
+        return changed
+
+    def is_address_reserved(self, address: str) -> bool:
+        """Return True if ``address`` has been reserved/set aside by the user."""
+        return address in self.reserved_address_labels
+
+    def get_reserved_addresses(self) -> dict[str, str]:
+        """Return a copy of the reserved address -> user label mapping."""
+        return dict(self.reserved_address_labels)
 
     async def close(self) -> None:
         """Close backend connection"""

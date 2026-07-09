@@ -27,6 +27,7 @@ class WalletDisplayMixin:
     addresses_with_history: set[str]
     reserved_addresses: set[str]
     issued_receive_addresses: set[str]
+    reserved_address_labels: dict[str, str]
     fidelity_bond_locktime_cache: dict[str, int]
     root_path: str
     data_dir: Path | None
@@ -154,6 +155,7 @@ class WalletDisplayMixin:
                     is_external=is_external,
                     has_unconfirmed=address_unconfirmed.get(address, False),
                     utxos=address_utxos.get(address, []),
+                    label=self.reserved_address_labels.get(address, ""),
                 )
             )
 
@@ -228,6 +230,11 @@ class WalletDisplayMixin:
                     return "flagged"  # Shared but tx failed
                 else:
                     return "used-empty"
+            elif address in self.reserved_address_labels:
+                # Handed out / set aside by the user but never funded. Not
+                # reissued, hidden from the concise view, shown with its label
+                # in the extended view.
+                return "reserved"
             else:
                 return "new"
 
