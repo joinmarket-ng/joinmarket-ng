@@ -48,6 +48,7 @@ from jmwallet.cli.mnemonic import (  # noqa: E402, F401, I001
 # These imports MUST come after ``app`` is defined above.
 # ---------------------------------------------------------------------------
 from jmwallet.cli import (  # noqa: E402, F401
+    address,
     bonds,
     cold_wallet,
     debug_info,

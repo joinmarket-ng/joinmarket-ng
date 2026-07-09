@@ -6,6 +6,7 @@ Modern HD wallet for JoinMarket with support for Bitcoin Core nodes and lightwei
 
 - **Wallet Creation**: Generate wallets from mnemonic seed phrases
 - **Address Management**: Derive and track addresses across mixdepths
+- **Reserved Addresses**: Set aside and label deposit addresses (`jm-wallet address`) so handed-out addresses are never reissued and are shown with their label in `jm-wallet info --extended`
 - **Transaction Building**: Construct and sign Bitcoin transactions
 - **Coin Selection**: Privacy-preserving coin selection algorithms
 - **Fidelity Bonds**: Create and manage fidelity bonds for maker reputation
@@ -75,6 +76,8 @@ For full documentation, see [jmwallet Documentation](https://joinmarket-ng.githu
 │                              existing wallet.                                │
 │ rescan                       Rescan the blockchain to repair a descriptor    │
 │                              wallet's coverage.                              │
+│ address                      Manage deposit addresses: reserve, label,       │
+│                              release, and list.                              │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ```
 
@@ -1211,6 +1214,46 @@ For full documentation, see [jmwallet Documentation](https://joinmarket-ng.githu
 │                                             JOINMARKET_CONFIG_FILE]          │
 │ --log-level                -l      TEXT     Log level                        │
 │ --help                                      Show this message and exit.      │
+╰──────────────────────────────────────────────────────────────────────────────╯
+```
+
+</details>
+
+<details>
+<summary><code>jm-wallet address --help</code></summary>
+
+```
+
+ Usage: jm-wallet address [OPTIONS] COMMAND [ARGS]...
+
+ Manage deposit addresses: reserve, label, release, and list.
+
+╭─ Options ────────────────────────────────────────────────────────────────────╮
+│ --mnemonic-file            -f      PATH  Path to mnemonic file               │
+│                                          [env var: MNEMONIC_FILE]            │
+│ --prompt-bip39-passphrase                Prompt for BIP39 passphrase         │
+│                                          interactively                       │
+│ --network                  -n      TEXT  Bitcoin network                     │
+│ --backend                  -b      TEXT  Backend: descriptor_wallet |        │
+│                                          neutrino                            │
+│ --rpc-url                          TEXT  [env var: BITCOIN_RPC_URL]          │
+│ --neutrino-url                     TEXT  [env var: NEUTRINO_URL]             │
+│ --data-dir                         PATH  Data directory (default:            │
+│                                          ~/.joinmarket-ng or                 │
+│                                          $JOINMARKET_DATA_DIR)               │
+│                                          [env var: JOINMARKET_DATA_DIR]      │
+│ --config-file                      PATH  Config file path (defaults to       │
+│                                          <data-dir>/config.toml)             │
+│                                          [env var: JOINMARKET_CONFIG_FILE]   │
+│ --log-level                -l      TEXT  Log level                           │
+│ --help                                   Show this message and exit.         │
+╰──────────────────────────────────────────────────────────────────────────────╯
+╭─ Commands ───────────────────────────────────────────────────────────────────╮
+│ new      Generate a fresh deposit address, reserve it, and optionally label  │
+│          it.                                                                 │
+│ label    Reserve an existing deposit address and attach a label to it.       │
+│ release  Remove a reservation/label so the address is no longer set aside.   │
+│ list     List reserved deposit addresses with their mixdepth and label.      │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ```
 
