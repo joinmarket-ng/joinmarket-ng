@@ -353,6 +353,55 @@ async def _post_stop(
     return dict(r.json()) if r.content else {}
 
 
+async def _get_session(client: httpx.AsyncClient, token: str) -> dict[str, Any]:
+    r = await client.get(f"{API}/session", headers=_auth(token))
+    assert r.status_code == 200, f"session failed: {r.status_code} {r.text}"
+    return dict(r.json())
+
+
+def _assert_legacy_schedule_shape(schedule: Any, *, expected_len: int) -> None:
+    """Assert JAM's ``isScheduleValue`` contract (``scheduleUtils.ts``).
+
+    Entries are ``[mixdepth, amount, counterparties, destination,
+    wait_minutes, rounding, flag]`` with numbers at 0/1/2/4/5, a string at 3,
+    and a number-or-txid at 6. JAM silently ignores the schedule (and renders
+    a running tumble as a plain single CoinJoin) if any entry deviates.
+    """
+    assert isinstance(schedule, list), f"schedule not a list: {schedule!r}"
+    assert len(schedule) == expected_len, schedule
+    for entry in schedule:
+        assert isinstance(entry, list) and len(entry) == 7, entry
+        mixdepth, amount, counterparties, destination, wait_minutes, rounding, flag = (
+            entry
+        )
+        assert isinstance(mixdepth, int | float), entry
+        assert isinstance(amount, int | float), entry
+        assert isinstance(counterparties, int | float), entry
+        assert isinstance(destination, str), entry
+        assert isinstance(wait_minutes, int | float), entry
+        assert isinstance(rounding, int | float), entry
+        assert isinstance(flag, int | float | str), entry
+
+
+async def _poll_until_session_schedule_cleared(
+    client: httpx.AsyncClient, token: str, *, timeout: float = 15.0
+) -> None:
+    """Poll ``/session`` until ``schedule`` reverts to ``null``.
+
+    The runner's terminal plan state is persisted slightly before the daemon
+    clears its in-memory tumbler references, so a single read right after the
+    status poll can still see the schedule.
+    """
+    deadline = asyncio.get_event_loop().time() + timeout
+    last: dict[str, Any] = {}
+    while asyncio.get_event_loop().time() < deadline:
+        last = await _get_session(client, token)
+        if last.get("schedule") is None:
+            return
+        await asyncio.sleep(0.5)
+    pytest.fail(f"session.schedule never cleared after plan terminated; last: {last}")
+
+
 async def _get_status(
     client: httpx.AsyncClient, name: str, token: str
 ) -> dict[str, Any]:
@@ -528,8 +577,19 @@ async def test_tumbler_happy_path_runs_three_coinjoins_and_pays_destination(
     assert all(p["kind"] == "taker_coinjoin" for p in plan["phases"])
 
     await _post_start(client, name, token)
+
+    # While the tumble runs, /session must expose the plan as a legacy
+    # schedule so JAM can render scheduler progress (issue #553).
+    session = await _get_session(client, token)
+    assert session["coinjoin_in_process"] is True, session
+    _assert_legacy_schedule_shape(session["schedule"], expected_len=len(plan["phases"]))
+
     async with _background_miner():
         final = await _poll_until_terminal(client, name, token)
+
+    # Once the plan terminates, the schedule must revert to null (JAM treats
+    # coinjoin_in_process without a schedule as a single collaborative tx).
+    await _poll_until_session_schedule_cleared(client, token)
 
     assert final["status"].lower() == "completed", (
         f"plan did not complete: status={final['status']} error={final.get('error')}"
