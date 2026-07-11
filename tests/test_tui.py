@@ -1455,6 +1455,18 @@ def test_runtime_image_installs_whiptail(component: str) -> None:
     )
 
 
+def test_tui_script_has_exit_handler_edge_case() -> None:
+    """The script must handle the edge case when user presses 'B' in TUI but is already in JM-NG shell."""
+    content = SCRIPT_PATH.read_text()
+    # Check for the edge case comment and handling
+    assert (
+        "EDGE CASE: When user presses 'B' in the TUI but the TUI was launched"
+        in content
+    )
+    assert 'if [ "${JM_NG_SHELL_ACTIVE}" = "1" ]; then' in content
+    assert "You are already in the JM-NG shell." in content
+
+
 # ---------------------------------------------------------------------------
 # Freeze TUI Tests (PR: Freeze TUI Improvements)
 # ---------------------------------------------------------------------------

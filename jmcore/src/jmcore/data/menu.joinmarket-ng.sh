@@ -65,8 +65,8 @@ fi
 #   - RASPIBLITZ=0 otherwise
 #
 # Technical notes:
-#   - Uses bash --init-file with process substitution instead of exec --rcfile:
-#     * No temp file to manage (process substitution cleans up automatically)
+#   - Uses bash --init-file with a temp file instead of exec --rcfile:
+#     * Temp file ensures variables are reliably set in the new shell
 #     * No exec (avoids unreliable exit behavior in some environments)
 #     * exit 0 after bash ensures jm-ng terminates when the shell exits
 #   - JM_NG_SHELL_ACTIVE=1 is exported in the subshell to prevent nesting
@@ -92,27 +92,62 @@ exit_jm_ng() {
 
         if [ "${exit_mode}" = "menu" ]; then
             # Exit directly to RaspiBlitz menu
-            if [ -n "${JM_SHELL_PID:-}" ]; then
-                kill "${JM_SHELL_PID}" 2>/dev/null
+            #
+            # EDGE CASE: When user presses 'B' in the TUI but the TUI was launched
+            # from the JM-NG shell (not from the RaspiBlitz menu):
+            #
+            # Ideally we would need: exit TUI → exit shell → return to RaspiBlitz menu
+            # This would require complex parent process tracking and double-exit logic.
+            # Instead, we just show an info message and stay in the shell.
+            # The user can then type 'exit' manually to return to the menu.
+            #
+            # Check if we're already in JM-NG shell - if so, just show info message
+            if [ "${JM_NG_SHELL_ACTIVE}" = "1" ]; then
+                echo ""
+                echo "========================================"
+                echo "  JoinMarket-NG CLI Shell"
+                echo "========================================"
+                echo "  You are already in the JM-NG shell."
+                echo ""
+                echo "  jm-ng       → JoinMarket-NG TUI"
+                echo "  exit        → Exit to RaspiBlitz menu"
+                echo "========================================"
+                echo ""
             fi
             exit 0
         fi
 
         # Show JM shell message
+        echo ""
         echo "========================================"
         echo "  JoinMarket-NG CLI Shell"
         echo "========================================"
         echo "  jm-ng       → JoinMarket-NG TUI"
         echo "  exit        → Exit to RaspiBlitz menu"
         echo "========================================"
+        echo ""
 
         # Check if we're already in JM-NG shell (avoid nesting)
         if [ "${JM_NG_SHELL_ACTIVE}" = "1" ]; then
             exit 0
         fi
 
-        # Start a new bash shell with venv activated and marker set
-        bash --init-file <(echo "export JM_NG_SHELL_ACTIVE=1; export JM_SHELL_PID=\$\$; source /home/joinmarketng/venv/bin/activate; export PS1=\"(jmshell) \u@\h:\w\$ \"")
+        # Start a new bash shell with venv activated and marker set.
+        # This runs when user explicitly selects 'X' (Exit to Shell) from the menu.
+        # ESC is handled by the auto-detection logic above (returns to wherever
+        # the user came from - shell or RaspiBlitz menu).
+        #
+        # Create a temp init file that exports the marker variables and activates venv.
+        # Using a real file instead of process substitution <(echo ...) ensures
+        # the variables are reliably set in the new shell.
+        INIT_FILE=$(mktemp)
+        cat > "$INIT_FILE" << 'INITEOF'
+export JM_NG_SHELL_ACTIVE=1
+source /home/joinmarketng/venv/bin/activate
+export PS1="(jmshell) \u@\h:\w\$ "
+INITEOF
+        bash --init-file "$INIT_FILE"
+        rm -f "$INIT_FILE"
         exit 0
     else
         # Standalone: normal exit
@@ -2030,7 +2065,7 @@ if [ "${RASPIBLITZ}" -eq 1 ]; then
 
             LOG_CHOICE=$(whiptail --title " Log Level " --notags \
               --menu "\n$WALLET_INFO | Maker Bot: $MAKER_STATUS\n\nSelect log level:\n\nCurrent: ${CURRENT_LOG}" \
-              17 50 4 \
+              18 64 4 \
               "DEBUG"   "DEBUG   - Detailed debugging information" \
               "INFO"    "INFO    - General information messages" \
               "WARNING" "WARNING - Warning messages only (default)" \
