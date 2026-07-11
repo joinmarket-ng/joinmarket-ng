@@ -2079,7 +2079,14 @@ if [ "${RASPIBLITZ}" -eq 1 ]; then
             ;;
 
           REST)
-            BACKUPS=$(find "${DATA_DIR}" -maxdepth 1 -name 'config.toml.backup.*' -type f -printf '%f\n' 2>/dev/null | sort -r)
+            # Use bash glob instead of find for portability (BusyBox compatibility)
+            BACKUPS=
+            for _f in "${DATA_DIR}"/config.toml.backup.*; do
+              [ -f "$_f" ] || continue
+              bf=$(basename "$_f")
+              BACKUPS="${BACKUPS}${bf}"$'\n'
+            done
+            BACKUPS=$(echo "$BACKUPS" | sort -r)
 
             if [ -z "$BACKUPS" ]; then
               whiptail --title " Restore Config " --msgbox "No backups found." 8 40

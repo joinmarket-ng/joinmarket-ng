@@ -1608,3 +1608,36 @@ def test_freeze_build_utxo_line_contains_address_and_amount() -> None:
     # A second row with the same address collapses the address column.
     repeated = _build_utxo_line(utxo, prev_address="bc1qexample")
     assert "bc1qexample" not in repeated
+
+
+def test_tui_script_uses_portable_backup_detection() -> None:
+    """Backup detection must use portable Bash glob instead of GNU find -printf.
+
+    On RaspiBlitz (BusyBox), 'find -printf' is not supported and would
+    fail to detect backup files. The portable glob loop works on all
+    POSIX shells including BusyBox ash."""
+    content = SCRIPT_PATH.read_text()
+
+    # Must use bash glob loop for backup detection
+    assert 'for _f in "${DATA_DIR}"/config.toml.backup.*' in content, (
+        "Must use portable bash glob for backup detection"
+    )
+
+    # Must NOT use GNU-specific find -printf in the REST block (backup detection)
+    # Note: list_wallets() uses find -printf but works on Raspiblitz
+    rest_block = content.split("REST)", 1)[1].split(";;", 1)[0]
+    assert "-printf" not in rest_block, (
+        "Must not use GNU find -printf in backup detection (not supported on BusyBox)"
+    )
+
+    # Must have BusyBox compatibility comment
+    assert "BusyBox compatibility" in content, (
+        "Must document BusyBox compatibility requirement"
+    )
+
+    # Must filter for regular files (-f check)
+    glob_block = content.split('for _f in "${DATA_DIR}"/config.toml.backup.*', 1)[1]
+    glob_block = glob_block.split("done", 1)[0]
+    assert '[ -f "$_f" ] || continue' in glob_block, (
+        "Must filter for regular files to exclude non-matching globs"
+    )
