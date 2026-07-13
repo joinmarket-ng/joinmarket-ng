@@ -62,9 +62,9 @@ jobs:
       - name: Install SDK and runtime
         run: |
           flatpak install --user --noninteractive flathub \
-            org.freedesktop.Platform//24.08 \
-            org.freedesktop.Sdk//24.08 \
-            org.freedesktop.Sdk.Extension.node24//24.08
+            org.freedesktop.Platform//25.08 \
+            org.freedesktop.Sdk//25.08 \
+            org.freedesktop.Sdk.Extension.node26//25.08
 
       # aarch64 cross-compilation setup (only for aarch64 matrix entry)
       - name: Set up QEMU for aarch64

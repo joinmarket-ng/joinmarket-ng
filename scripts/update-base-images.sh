@@ -181,7 +181,7 @@ log_info "Phase 2: Checking pinned apt package versions..."
 # Collect all unique pinned packages from all Dockerfiles
 # Matches patterns like: package=version or package=epoch:version
 # For jmwalletd/Dockerfile, skip the jam-builder stage (it uses a different
-# base image, Debian bookworm, and its packages are handled in Phase 2c).
+# base image, Debian trixie via node-slim, handled in Phase 2c).
 declare -A CURRENT_VERSIONS
 for dockerfile in "${DOCKERFILES[@]}"; do
     [[ -f "$dockerfile" ]] || continue
@@ -260,7 +260,7 @@ else
                 for dockerfile in "${DOCKERFILES[@]}"; do
                     [[ -f "$dockerfile" ]] || continue
                     # For jmwalletd/Dockerfile, only replace in non-jam-builder stages.
-                    # The jam-builder stage uses a bookworm-based node image; its packages
+                    # The jam-builder stage uses the node-slim base image; its packages
                     # are updated separately in Phase 2c.
                     if [[ "$dockerfile" == *"jmwalletd/Dockerfile" ]]; then
                         python3 - "$dockerfile" "$pkg=${current_ver}" "$pkg=${latest_ver}" <<'PYEOF'
@@ -304,7 +304,7 @@ fi
 echo ""
 log_info "Phase 2b: Checking node base image digest..."
 
-NODE_VERSION="24"
+NODE_VERSION="26"
 NODE_SLIM_DIGEST=$(docker buildx imagetools inspect "node:${NODE_VERSION}-slim" --raw 2>/dev/null | \
     sha256sum | awk '{print "sha256:" $1}')
 
@@ -338,13 +338,13 @@ fi
 # =============================================================================
 # Phase 2c: Update pinned apt package versions in the jam-builder stage
 #
-# The jam-builder stage uses node:24-slim (Debian bookworm), while all other
-# stages use python:3.14-slim (Debian trixie). Package versions differ between
-# distros, so we query bookworm separately and update only the jam-builder
-# stage packages.
+# The jam-builder stage uses node:26-slim, whose Debian release may differ
+# from the python:3.14-slim base used by all other stages. Package versions
+# can differ between the two bases, so we query the node image separately and
+# update only the jam-builder stage packages.
 # =============================================================================
 echo ""
-log_info "Phase 2c: Checking pinned apt package versions in jam-builder stage (bookworm)..."
+log_info "Phase 2c: Checking pinned apt package versions in jam-builder stage (node-slim)..."
 
 JMWALLETD_DF="$PROJECT_ROOT/jmwalletd/Dockerfile"
 
@@ -366,7 +366,7 @@ if [[ -f "$JMWALLETD_DF" ]]; then
     else
         JAM_PKGS=("${!JAM_BUILDER_PKGS[@]}")
         log_info "Found ${#JAM_PKGS[@]} pinned packages in jam-builder: ${JAM_PKGS[*]}"
-        log_info "Querying latest versions from node:${NODE_VERSION}-slim (bookworm)..."
+        log_info "Querying latest versions from node:${NODE_VERSION}-slim..."
 
         JAM_APT_OUTPUT=$(docker run --rm "node:${NODE_VERSION}-slim" sh -c \
             "apt-get update -qq 2>/dev/null && apt-cache policy ${JAM_PKGS[*]} 2>/dev/null" 2>/dev/null)
@@ -400,10 +400,31 @@ if [[ -f "$JMWALLETD_DF" ]]; then
                     UPDATES_NEEDED=$((UPDATES_NEEDED + 1))
 
                     if [[ "$CHECK_ONLY" == false ]]; then
-                        escaped_current=$(printf '%s' "$current_ver" | sed 's/\./\\./g; s/+/[+]/g')
-                        escaped_latest=$(printf '%s' "$latest_ver" | sed 's/[&/\\]/\\&/g')
-                        if grep -q "${pkg}=${current_ver}" "$JMWALLETD_DF" 2>/dev/null; then
-                            sed -i "s|${pkg}=${escaped_current}|${pkg}=${escaped_latest}|g" "$JMWALLETD_DF"
+                        if python3 - "$JMWALLETD_DF" "$pkg=${current_ver}" "$pkg=${latest_ver}" <<'PYEOF'
+import re
+import sys
+
+path, old_pin, new_pin = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(path) as f:
+    lines = f.readlines()
+
+in_jam_builder = False
+replaced = False
+for index, line in enumerate(lines):
+    if re.search(r"\bAS jam-builder\b", line):
+        in_jam_builder = True
+    elif re.match(r"^FROM ", line) and in_jam_builder:
+        in_jam_builder = False
+    if in_jam_builder and old_pin in line:
+        lines[index] = line.replace(old_pin, new_pin)
+        replaced = True
+
+if not replaced:
+    raise SystemExit(1)
+with open(path, "w") as f:
+    f.writelines(lines)
+PYEOF
+                        then
                             UPDATES_MADE=$((UPDATES_MADE + 1))
                             log_info "$pkg (jam-builder): Updated to $latest_ver"
                         fi

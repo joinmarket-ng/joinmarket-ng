@@ -4,15 +4,15 @@
 # Update with: ./scripts/update-base-images.sh
 # =============================================================================
 ARG PYTHON_VERSION=3.14
-ARG PYTHON_SLIM_DIGEST=sha256:44dd04494ee8f3b538294360e7c4b3acb87c8268e4d0a4828a6500b1eff50061
-ARG NODE_VERSION=24
-ARG NODE_SLIM_DIGEST=sha256:c2d5ade763cacfb03fe9cb8e8af5d1be5041ff331921fa26a9b231ca3a4f780a
+ARG PYTHON_SLIM_DIGEST=sha256:b877e50bd90de10af8d82c57a022fc2e0dc731c5320d762a27986facfc3355c1
+ARG NODE_VERSION=26
+ARG NODE_SLIM_DIGEST=sha256:ffc78385a788964bb3cbab5e434ff79a10bdc25b8ae6db03fe5fe6cb14053c09
 # JAM frontend build platform. The build output is static JS that is
 # platform-independent, so the frontend is compiled on the native build host
 # (BUILDPLATFORM) rather than the target image platform. Building it natively
 # avoids running the Node.js toolchain under QEMU emulation, which segfaults
 # (exit code 139) when an amd64 toolchain is emulated on a native arm64 builder
-# (and is prohibitively slow on armv7). node:24-slim only publishes amd64/arm64
+# (and is prohibitively slow on armv7). node:26-slim only publishes amd64/arm64
 # images, and the armv7 image is always built on an amd64 host, so BUILDPLATFORM
 # always resolves to an available Node image.
 # It is exposed as an overridable ARG (not a constant) to silence the
@@ -24,13 +24,13 @@ ARG JAM_BUILDER_PLATFORM=${BUILDPLATFORM}
 
 # JAM frontend: pinned commit hash for reproducible builds (devel branch tip)
 # Update with: ./scripts/update-base-images.sh
-ARG JAM_COMMIT=3fc3ff3d58e37ef5889b1ceb8d48de08868f5ee9
+ARG JAM_COMMIT=b0b3a7d2841b94e7afc3fbd6563a72b056bddac6
 
 # Pin build tools for reproducible builds
 # setuptools version is stamped into WHEEL metadata (Generator: setuptools (x.y.z))
 # Different versions produce different WHEEL/RECORD files, breaking layer reproducibility
 # Update versions with: ./scripts/update-base-images.sh
-ARG SETUPTOOLS_VERSION=82.0.1
+ARG SETUPTOOLS_VERSION=83.0.0
 ARG WHEEL_VERSION=0.47.0
 # hatchling builds coincurve's wheel from source (no cp314 wheel upstream); its
 # version is recorded in WHEEL/RECORD, so pin it for reproducible layer digests.
@@ -167,7 +167,7 @@ CMD ["jmwalletd"]
 # Built on the native build host (BUILDPLATFORM) since the output is static JS
 # that runs in the browser, so the build CPU architecture doesn't matter.
 # Building natively avoids emulating the Node.js toolchain under QEMU, which
-# segfaults on native arm64 builders. node:24-slim has no linux/arm/v7 image,
+# segfaults on native arm64 builders. node:26-slim has no linux/arm/v7 image,
 # but armv7 targets are always built on an amd64 host, so BUILDPLATFORM resolves
 # to an available image.
 # Pinned to a specific commit for reproducible builds.
@@ -189,8 +189,8 @@ ARG JAM_COMMIT
 ARG SOURCE_DATE_EPOCH
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates=20230311+deb12u1 \
-    git=1:2.39.5-0+deb12u3 \
+    ca-certificates=20250419 \
+    git=1:2.47.3-0+deb13u1 \
     && rm -rf /var/lib/apt/lists/*
 
 RUN git clone https://github.com/joinmarket-webui/jam.git /app \
@@ -220,8 +220,8 @@ ARG S6_OVERLAY_VERSION=3.2.3.0
 # Install xz-utils (for extracting s6-overlay), wget (for downloading s6-overlay), and Tor daemon
 RUN apt-get update && apt-get install -y --no-install-recommends \
     wget=1.25.0-2 \
-    xz-utils=5.8.1-1 \
-    tor=0.4.9.8-0+deb13u1 \
+    xz-utils=5.8.1-1+deb13u1 \
+    tor=0.4.9.11-0+deb13u1 \
     && rm -rf /var/lib/apt/lists/* \
     && rm -rf /var/log/dpkg.log /var/log/apt/* /var/cache/ldconfig/aux-cache
 
