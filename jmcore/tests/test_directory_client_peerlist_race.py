@@ -20,7 +20,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from jmcore.directory_client import DirectoryClient, MessageType
+from jmcore.directory_client import DirectoryClient, DirectoryClientError, MessageType
+from jmcore.network import ConnectionError as NetworkConnectionError
 from jmcore.protocol import FEATURE_PEERLIST_FEATURES
 
 
@@ -177,3 +178,67 @@ async def test_listen_loop_forwards_peerlist_to_inflight_sink() -> None:
     # And a subsequent fetcher would pull that payload.
     chunk = await asyncio.wait_for(client._peerlist_inflight.get(), timeout=0.1)
     assert chunk == "nick-z;loc-z"
+
+
+@pytest.mark.asyncio
+async def test_fetch_peerlist_aborts_immediately_on_connection_loss() -> None:
+    """Issue #557: when the connection is closed under us (e.g. a concurrent
+    stop()), ``receive()`` raises synchronously with no I/O wait. The fetch
+    must abort with ``DirectoryClientError`` after a single receive, not
+    busy-loop logging warnings until ``first_response_timeout``."""
+
+    client = _make_client()
+    client.running = False
+    # Long timeout: if the loop retried, it would spin here for 60s.
+    client._peerlist_timeout = 60.0
+
+    receive_mock = AsyncMock(side_effect=NetworkConnectionError("Connection closed"))
+    client.connection.receive = receive_mock  # type: ignore[union-attr]
+
+    with pytest.raises(DirectoryClientError, match="Connection lost while waiting for PEERLIST"):
+        await client.get_peerlist_with_features()
+
+    # Exactly one receive attempt -- proves there is no retry/busy-loop.
+    assert receive_mock.await_count == 1
+    assert client._peerlist_inflight is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_peerlist_aborts_on_oserror_connection_loss() -> None:
+    """A system-level OSError bypassing our network layer must also abort
+    immediately rather than retry."""
+
+    client = _make_client()
+    client.running = False
+    client._peerlist_timeout = 60.0
+
+    receive_mock = AsyncMock(side_effect=ConnectionResetError("reset by peer"))
+    client.connection.receive = receive_mock  # type: ignore[union-attr]
+
+    with pytest.raises(DirectoryClientError, match="Connection lost while waiting for PEERLIST"):
+        await client.get_peerlist_with_features()
+
+    assert receive_mock.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_fetch_peerlist_caps_repeated_generic_errors() -> None:
+    """Defense in depth: a directory that keeps sending malformed (non-JSON)
+    payloads must not spin the loop forever. After max_consecutive_errors the
+    fetch aborts with ``DirectoryClientError`` rather than looping until the
+    first-response timeout."""
+
+    client = _make_client()
+    client.running = False
+    client._peerlist_timeout = 60.0
+
+    # Each receive returns garbage bytes -> json.loads raises (a non-connection
+    # error routed to the capped generic handler).
+    receive_mock = AsyncMock(return_value=b"not-json")
+    client.connection.receive = receive_mock  # type: ignore[union-attr]
+
+    with pytest.raises(DirectoryClientError, match="Too many consecutive errors"):
+        await client.get_peerlist_with_features()
+
+    # Bounded by max_consecutive_errors (5), not the 60s timeout.
+    assert receive_mock.await_count == 5

@@ -523,6 +523,13 @@ class DirectoryClient:
         chunks_received = 0
         got_first_response = False
 
+        # Bound non-connection errors (e.g. malformed payloads) so a
+        # persistently misbehaving directory cannot spin this loop. Mirrors
+        # ``listen_for_messages``. Connection-loss errors abort immediately
+        # (see the dedicated handlers below); this only guards the generic path.
+        consecutive_errors = 0
+        max_consecutive_errors = 5
+
         try:
             while True:
                 elapsed = asyncio.get_event_loop().time() - start_time
@@ -548,6 +555,7 @@ class DirectoryClient:
                         peerlist_str = await asyncio.wait_for(
                             self._peerlist_inflight.get(), timeout=receive_timeout
                         )
+                        consecutive_errors = 0
                         got_first_response = True
                         chunks_received += 1
                         chunk_peers = self._handle_peerlist_response(peerlist_str)
@@ -563,6 +571,7 @@ class DirectoryClient:
                     )
                     response = json.loads(response_data.decode("utf-8"))
                     msg_type = response.get("type")
+                    consecutive_errors = 0
 
                     if msg_type == MessageType.PEERLIST.value:
                         got_first_response = True
@@ -600,10 +609,34 @@ class DirectoryClient:
                     )
                     break
 
+                except NetworkConnectionError as e:
+                    # Connection-level error from our network layer (e.g. the
+                    # connection was closed under us by a concurrent stop()).
+                    # ``receive()`` then raises synchronously with no I/O wait,
+                    # so retrying would busy-loop until first_response_timeout
+                    # (issue #557). Abort immediately, matching
+                    # ``listen_for_messages``.
+                    raise DirectoryClientError(
+                        f"Connection lost while waiting for PEERLIST: {e}"
+                    ) from e
+                except (ConnectionResetError, BrokenPipeError, OSError) as e:
+                    # System-level connection errors that bypassed our network layer.
+                    raise DirectoryClientError(
+                        f"Connection lost while waiting for PEERLIST: {e}"
+                    ) from e
+
                 except Exception as e:
+                    consecutive_errors += 1
                     logger.warning(
                         f"Error receiving/parsing message while waiting for PEERLIST: {e}"
                     )
+                    if consecutive_errors >= max_consecutive_errors:
+                        # Defense in depth: never let a repeatedly-failing,
+                        # non-connection error (e.g. malformed payloads) spin.
+                        raise DirectoryClientError(
+                            f"Too many consecutive errors while waiting for PEERLIST "
+                            f"({consecutive_errors}), last error: {e}"
+                        ) from e
                     elapsed = asyncio.get_event_loop().time() - start_time
                     if not got_first_response and elapsed > first_response_timeout:
                         self._handle_peerlist_timeout()
