@@ -30,7 +30,7 @@ import httpx
 from jmcore.bitcoin import btc_to_sats
 from loguru import logger
 
-from jmwallet.backends.base import UTXO, BlockchainBackend, Transaction
+from jmwallet.backends.base import UTXO, BlockchainBackend, Transaction, WalletTxEntry
 
 # Timeout policy for regular RPC calls.
 #
@@ -129,6 +129,7 @@ def clamp_descriptor_range(low: int, high: int) -> tuple[int, int]:
 
 class DescriptorWalletBackend(BlockchainBackend):
     supports_descriptor_scan: bool = True
+    supports_tx_enumeration: bool = True
     """
     Blockchain backend using Bitcoin Core descriptor wallets.
 
@@ -2084,6 +2085,65 @@ class DescriptorWalletBackend(BlockchainBackend):
             f"(scanned {len(transactions)} listsinceblock entries)"
         )
         return addresses
+
+    async def list_wallet_transactions_since(
+        self, cursor: str | None
+    ) -> tuple[list[WalletTxEntry], str | None]:
+        """Incrementally enumerate wallet transactions via ``listsinceblock``.
+
+        Passing the previous call's ``lastblock`` as ``cursor`` returns only
+        transactions in blocks after it, plus all current mempool transactions
+        (which reappear each call until they confirm past the cursor). One
+        server-side pass, no ``listtransactions`` pagination (see
+        :meth:`get_addresses_with_history` for that rationale).
+        """
+        if not self._wallet_loaded:
+            return [], cursor
+
+        try:
+            result = await self._rpc_call(
+                "listsinceblock",
+                # blockhash, target_confirmations, include_watchonly,
+                # include_removed, include_change
+                [cursor or "", 1, True, True, True],
+            )
+        except Exception:
+            logger.exception("listsinceblock failed; cannot enumerate wallet transactions")
+            raise
+
+        if not isinstance(result, dict):
+            return [], cursor
+
+        transactions = result.get("transactions", [])
+        new_cursor = result.get("lastblock") or cursor
+
+        # A tx appears once per wallet-relevant entry (receive/change/send).
+        # Deduplicate by txid, keeping the highest confirmation count seen.
+        by_txid: dict[str, WalletTxEntry] = {}
+        for entry in transactions:
+            txid = entry.get("txid")
+            if not txid:
+                continue
+            confirmations = int(entry.get("confirmations", 0) or 0)
+            # A negative confirmation count means a conflicted/orphaned tx.
+            if confirmations < 0:
+                continue
+            height = entry.get("blockheight")
+            category = entry.get("category", "") or ""
+            existing = by_txid.get(txid)
+            if existing is None:
+                by_txid[txid] = WalletTxEntry(
+                    txid=txid,
+                    confirmations=confirmations,
+                    block_height=height if isinstance(height, int) else None,
+                    category=category,
+                )
+            elif confirmations > existing.confirmations:
+                existing.confirmations = confirmations
+                if isinstance(height, int):
+                    existing.block_height = height
+
+        return list(by_txid.values()), new_cursor
 
     async def address_has_history(self, address: str) -> bool | None:
         """Return True if ``address`` has ever received funds on-chain.

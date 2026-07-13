@@ -89,6 +89,116 @@ class TestNeutrinoBackend:
         await backend.close()
 
     @pytest.mark.asyncio
+    async def test_list_wallet_transactions_since_maps_records(self):
+        """/v1/transactions records map to WalletTxEntry with inline raw hex."""
+        from unittest.mock import AsyncMock
+
+        backend = NeutrinoBackend(neutrino_url="http://localhost:8334", network="regtest")
+        backend._server_capabilities.detected = True
+        backend._server_capabilities.has_tx_enumeration = True
+        backend._api_call = AsyncMock(  # type: ignore[method-assign]
+            return_value={
+                "transactions": [
+                    {
+                        "txid": "aa",
+                        "hex": "0200",
+                        "height": 205,
+                        "confirmed": True,
+                        "direction": "receive",
+                    },
+                    {
+                        "txid": "bb",
+                        "hex": "0201",
+                        "height": 0,
+                        "confirmed": False,
+                        "direction": "spend",
+                    },
+                ],
+                "cursor": 205,
+            }
+        )
+
+        entries, cursor = await backend.list_wallet_transactions_since("200")
+
+        backend._api_call.assert_awaited_once_with(
+            "GET", "v1/transactions", params={"since_height": 200}
+        )
+        assert cursor == "205"
+        assert len(entries) == 2
+        confirmed = entries[0]
+        assert confirmed.txid == "aa" and confirmed.confirmations == 1
+        assert confirmed.raw == "0200" and confirmed.block_height == 205
+        mempool = entries[1]
+        assert mempool.txid == "bb" and mempool.confirmations == 0
+        assert mempool.raw == "0201"
+        await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_list_wallet_transactions_since_old_server_idle(self):
+        """When the server lacks tx-history support, return empty and warn once."""
+        from unittest.mock import AsyncMock
+
+        backend = NeutrinoBackend(neutrino_url="http://localhost:8334", network="regtest")
+        backend._server_capabilities.detected = True
+        backend._server_capabilities.has_tx_enumeration = False
+        backend._api_call = AsyncMock()  # type: ignore[method-assign]
+
+        entries, cursor = await backend.list_wallet_transactions_since(None)
+        assert entries == []
+        assert cursor == "unsupported"
+        backend._api_call.assert_not_awaited()
+        assert backend._warned_no_tx_enumeration is True
+        await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_detect_capabilities_reads_tx_history_flag(self):
+        """_detect_server_capabilities sets has_tx_enumeration from status."""
+        from unittest.mock import AsyncMock
+
+        backend = NeutrinoBackend(neutrino_url="http://localhost:8334", network="regtest")
+
+        async def fake_api(method, endpoint, *args, **kwargs):
+            if endpoint == "v1/status":
+                return {"tx_history_enabled": True, "mempool_enabled": False}
+            # Any other probe (e.g. rescan/status) may fail; detection still
+            # completes and the tx-history flag is recorded from /v1/status.
+            raise RuntimeError("probe unavailable")
+
+        backend._api_call = AsyncMock(side_effect=fake_api)  # type: ignore[method-assign]
+        await backend._detect_server_capabilities()
+        assert backend._server_capabilities.has_tx_enumeration is True
+        await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_tx_enumeration_retries_transient_capability_probe(self):
+        """A failed status request must not permanently disable enumeration."""
+        from unittest.mock import AsyncMock
+
+        backend = NeutrinoBackend(neutrino_url="http://localhost:8334", network="regtest")
+        status_attempts = 0
+
+        async def fake_api(method, endpoint, *args, **kwargs):
+            nonlocal status_attempts
+            if endpoint == "v1/status":
+                status_attempts += 1
+                if status_attempts == 1:
+                    raise RuntimeError("temporary outage")
+                return {"tx_history_enabled": True, "mempool_enabled": False}
+            if endpoint == "v1/rescan/status":
+                return {}
+            if endpoint == "v1/transactions":
+                return {"transactions": [], "cursor": 12}
+            raise AssertionError(endpoint)
+
+        backend._api_call = AsyncMock(side_effect=fake_api)  # type: ignore[method-assign]
+
+        assert await backend.list_wallet_transactions_since(None) == ([], None)
+        assert backend._server_capabilities.detected is False
+        assert await backend.list_wallet_transactions_since(None) == ([], "12")
+        assert status_attempts == 2
+        await backend.close()
+
+    @pytest.mark.asyncio
     async def test_neutrino_backend_scan_start_height_default(self):
         """Test that scan_start_height defaults to _min_valid_blockheight per network."""
         # Mainnet: defaults to SegWit activation height
@@ -1075,7 +1185,7 @@ class TestNeutrinoBackend:
 
     @pytest.mark.asyncio
     async def test_detect_server_capabilities_unreachable(self):
-        """Capability detection when server is unreachable."""
+        """A transient status failure leaves capability detection retryable."""
 
         backend = NeutrinoBackend(neutrino_url="http://localhost:8334", network="mainnet")
         backend._api_call = AsyncMock(side_effect=Exception("connection refused"))
@@ -1083,7 +1193,7 @@ class TestNeutrinoBackend:
         await backend._detect_server_capabilities()
 
         caps = backend.server_capabilities
-        assert caps.detected is True
+        assert caps.detected is False
         assert caps.has_rescan_status is False
         assert caps.has_persistent_rescan_state is False
         assert caps.status_fields == {}

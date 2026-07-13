@@ -39,6 +39,7 @@ from jmwallet.backends.base import (
     BondVerificationResult,
     Transaction,
     UTXOVerificationResult,
+    WalletTxEntry,
 )
 
 # Genesis block hashes per Bitcoin network. Used to detect when the neutrino
@@ -84,6 +85,12 @@ class ServerCapabilities:
     #: ``/v1/tx/{txid}`` is implemented for watched mempool txs.
     has_mempool_tracker: bool = False
 
+    #: Server persists confirmed transaction history and serves
+    #: ``GET /v1/transactions`` (neutrino-api 1.4.0+). When true, the daemon
+    #: transaction monitor can enumerate wallet transactions for WebSocket
+    #: notifications; otherwise it stays idle for this backend.
+    has_tx_enumeration: bool = False
+
     #: Extra fields returned by ``/v1/status`` (informational).
     status_fields: dict[str, Any] = field(default_factory=dict)
 
@@ -100,6 +107,11 @@ class NeutrinoBackend(BlockchainBackend):
     """
 
     supports_watch_address: bool = True
+    # The client implements the enumeration protocol; whether the *connected*
+    # server actually supports it (neutrino-api 1.4.0+, tx_history_enabled) is
+    # resolved at call time in ``list_wallet_transactions_since``, which
+    # degrades to an empty result with a one-time warning against old servers.
+    supports_tx_enumeration: bool = True
     _INITIAL_RESCAN_TIMEOUT_SECONDS: float = 1800.0
     _ONGOING_INITIAL_RESCAN_CHECK_TIMEOUT_SECONDS: float = 30.0
     _TRIVIAL_RESCAN_BLOCKS: int = 1000
@@ -215,6 +227,8 @@ class NeutrinoBackend(BlockchainBackend):
 
         # Server capability detection (populated once on first connection).
         self._server_capabilities = ServerCapabilities()
+        # One-time warning guard when the server lacks tx-history support.
+        self._warned_no_tx_enumeration = False
 
     def _has_pinned_cert_file(self) -> bool:
         """Return True when a usable pinned TLS certificate file is configured."""
@@ -412,16 +426,20 @@ class NeutrinoBackend(BlockchainBackend):
             # the server is new enough but the operator may have disabled
             # the tracker, in which case we fall back to chain-only.
             caps.has_mempool_tracker = bool(status.get("mempool_enabled", False))
+            # neutrino-api 1.4.0+ persists confirmed tx history and serves
+            # GET /v1/transactions.
+            caps.has_tx_enumeration = bool(status.get("tx_history_enabled", False))
             logger.info(
-                "Neutrino server: block_height={}, filter_height={}, synced={}, mempool_tracker={}",
+                "Neutrino server: block_height={}, filter_height={}, synced={}, "
+                "mempool_tracker={}, tx_history={}",
                 status.get("block_height", "?"),
                 status.get("filter_height", "?"),
                 status.get("synced", "?"),
                 caps.has_mempool_tracker,
+                caps.has_tx_enumeration,
             )
         except Exception as exc:
             logger.warning(f"Could not probe neutrino-api /v1/status: {exc}")
-            caps.detected = True
             return
 
         # --- Probe /v1/rescan/status (v0.7.0+) ---
@@ -465,6 +483,8 @@ class NeutrinoBackend(BlockchainBackend):
             features.append("persistent-state")
         if caps.has_mempool_tracker:
             features.append("mempool-tracker")
+        if caps.has_tx_enumeration:
+            features.append("tx-history")
         if features:
             logger.info(f"Neutrino server capabilities: {', '.join(features)}")
         else:
@@ -472,6 +492,81 @@ class NeutrinoBackend(BlockchainBackend):
                 "Neutrino server has no detected advanced capabilities. "
                 "Upgrade to neutrino-api v0.9.0+ for best performance."
             )
+
+    async def list_wallet_transactions_since(
+        self, cursor: str | None
+    ) -> tuple[list[WalletTxEntry], str | None]:
+        """Enumerate watched transactions via ``GET /v1/transactions``.
+
+        The cursor is the ``since_height`` as a decimal string; ``None`` starts
+        from height 0. Confirmed records include raw hex inline (so the tx
+        monitor need not fetch them separately, which neutrino cannot do for
+        confirmed txs). Returns an empty result -- with a one-time warning --
+        when the connected server predates neutrino-api 1.4.0 and does not
+        advertise ``tx_history_enabled``.
+        """
+        if not self._server_capabilities.detected:
+            await self._detect_server_capabilities()
+        if not self._server_capabilities.detected:
+            # A transient status failure must not permanently cache the server
+            # as incapable. The monitor will retry capability detection on its
+            # next poll.
+            return [], cursor
+        if not self._server_capabilities.has_tx_enumeration:
+            if not self._warned_no_tx_enumeration:
+                logger.warning(
+                    "Neutrino server does not support transaction history "
+                    "(GET /v1/transactions); upgrade to neutrino-api 1.4.0+ for "
+                    "WebSocket transaction notifications. Monitoring stays idle."
+                )
+                self._warned_no_tx_enumeration = True
+            # A successful capability probe is a complete baseline even when
+            # this server cannot enumerate transactions. Return a stable
+            # sentinel so lifecycle callers do not wait for readiness forever.
+            return [], cursor or "unsupported"
+
+        since_height = 0
+        if cursor:
+            try:
+                since_height = int(cursor)
+            except ValueError:
+                since_height = 0
+
+        try:
+            result = await self._api_call(
+                "GET", "v1/transactions", params={"since_height": since_height}
+            )
+        except Exception as exc:
+            logger.debug(f"Neutrino /v1/transactions failed: {exc}")
+            return [], cursor
+
+        if not isinstance(result, dict):
+            return [], cursor
+
+        entries: list[WalletTxEntry] = []
+        for rec in result.get("transactions", []):
+            if not isinstance(rec, dict):
+                continue
+            txid = rec.get("txid")
+            if not txid:
+                continue
+            confirmed = bool(rec.get("confirmed", False))
+            height = int(rec.get("height", 0) or 0)
+            entries.append(
+                WalletTxEntry(
+                    txid=txid,
+                    # Confirmations are not reported per-record; 1 is enough for
+                    # the monitor to distinguish confirmed from mempool (0).
+                    confirmations=1 if confirmed else 0,
+                    block_height=height if confirmed else None,
+                    category=str(rec.get("direction", "")),
+                    raw=str(rec.get("hex", "")),
+                )
+            )
+
+        new_cursor = result.get("cursor")
+        cursor_str = str(new_cursor) if isinstance(new_cursor, int) else cursor
+        return entries, cursor_str
 
     async def _api_call(
         self,

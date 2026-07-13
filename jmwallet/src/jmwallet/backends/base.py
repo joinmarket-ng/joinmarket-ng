@@ -44,6 +44,24 @@ class Transaction:
 
 
 @dataclass
+class WalletTxEntry:
+    """A wallet transaction observed by incremental enumeration.
+
+    ``confirmations`` is 0 while the tx is still in the mempool. ``category``
+    is Bitcoin Core's classification (``receive`` / ``send`` / ``generate`` /
+    ...), best-effort and informational. ``raw`` is the raw transaction hex
+    when the backend can supply it inline (avoiding a follow-up
+    ``get_transaction`` round-trip); empty when the caller should fetch it.
+    """
+
+    txid: str
+    confirmations: int = 0
+    block_height: int | None = None
+    category: str = ""
+    raw: str = ""
+
+
+@dataclass
 class UTXOVerificationResult:
     """
     Result of UTXO verification with metadata.
@@ -124,6 +142,17 @@ class BlockchainBackend(ABC):
     a rescan.  Full-node backends (Bitcoin Core, descriptor wallet) can query any
     address on demand and do not need pre-registration.
     Set to ``True`` only in backends that implement ``add_watch_address()``.
+    """
+
+    supports_tx_enumeration: bool = False
+    """Whether this backend can incrementally enumerate wallet transactions.
+
+    Backends that override ``list_wallet_transactions_since()`` with a real
+    implementation (e.g. Bitcoin Core's ``listsinceblock``) set this to
+    ``True``. The jmwalletd transaction monitor uses it to push WebSocket
+    notifications for every wallet transaction (deposits, coinjoins, sends).
+    Light clients without cheap tx enumeration leave it ``False`` and the
+    monitor stays idle for that backend.
     """
 
     async def add_watch_address(self, address: str) -> None:
@@ -240,6 +269,22 @@ class BlockchainBackend(ABC):
             True if ``get_transaction()`` reports confirmation depth by txid.
         """
         return True
+
+    async def list_wallet_transactions_since(
+        self, cursor: str | None
+    ) -> tuple[list[WalletTxEntry], str | None]:
+        """Incrementally enumerate wallet transactions since ``cursor``.
+
+        ``cursor`` is an opaque backend token (a block hash for Bitcoin Core's
+        ``listsinceblock``); pass ``None`` to enumerate from the beginning.
+        Returns the (deduplicated) transactions plus a new cursor to pass on
+        the next call. Includes mempool (unconfirmed) transactions on every
+        call until they confirm past the cursor.
+
+        Default: unsupported (returns nothing and no cursor). Only backends
+        with ``supports_tx_enumeration = True`` override this.
+        """
+        return [], cursor
 
     @abstractmethod
     async def get_block_height(self) -> int:
