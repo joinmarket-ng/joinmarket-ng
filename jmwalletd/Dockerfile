@@ -24,7 +24,7 @@ ARG JAM_BUILDER_PLATFORM=${BUILDPLATFORM}
 
 # JAM frontend: pinned commit hash for reproducible builds (devel branch tip)
 # Update with: ./scripts/update-base-images.sh
-ARG JAM_COMMIT=b0b3a7d2841b94e7afc3fbd6563a72b056bddac6
+ARG JAM_COMMIT=a21857946bf859f5de6dd732689411c7e25c0c11
 
 # Pin build tools for reproducible builds
 # setuptools version is stamped into WHEEL metadata (Generator: setuptools (x.y.z))

@@ -293,8 +293,10 @@ pytest tumbler/tests
 │ --min-confirmations             INTEGER               Confirmations required │
 │                                                       before the next phase  │
 │                                                       starts (0 disables     │
-│                                                       gating)                │
-│                                                       [default: 5]           │
+│                                                       gating). Defaults to   │
+│                                                       the                    │
+│                                                       tumbler.min_confirmat… │
+│                                                       setting (6).           │
 │ --counterparties                INTEGER RANGE         Override the           │
 │                                 [1<=x<=20]            counterparty count for │
 │                                                       every phase at         │
