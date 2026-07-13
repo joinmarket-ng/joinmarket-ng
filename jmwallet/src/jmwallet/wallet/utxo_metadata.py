@@ -49,6 +49,11 @@ try:
 except ImportError:  # pragma: no cover - non-POSIX platforms
     fcntl = None  # type: ignore[assignment]
 
+try:
+    import msvcrt  # Windows file locking; absent on POSIX.
+except ImportError:  # pragma: no cover - POSIX platforms
+    msvcrt = None  # type: ignore[assignment]
+
 USED_LABEL_PREFIX = "jm:used"
 
 # Label prefix for addresses the user has set aside ("reserved"). Unlike
@@ -59,6 +64,13 @@ USED_LABEL_PREFIX = "jm:used"
 # NOT imply the address has ever held funds. An optional free-form user label
 # follows the prefix: ``jm:reserved`` or ``jm:reserved:<label>``.
 RESERVED_LABEL_PREFIX = "jm:reserved"
+
+# Label for addresses this wallet has positively observed holding a coin.
+# Distinct from ``jm:used`` (which also covers addresses recorded via
+# on-chain verification that were never *observed* funded by this process).
+# Persisted so the forced-address-reuse defense keeps its "seen funded before"
+# knowledge across restarts. A JoinMarket extension; ignored by other consumers.
+FUNDED_LABEL_PREFIX = "jm:funded"
 
 # Label applied to UTXOs frozen automatically by the forced-address-reuse
 # defense (issue #529). The label keeps the record around after a user
@@ -86,6 +98,11 @@ class OutputRecord:
     spendable: bool | None = None
     label: str | None = None
     lock_until: float | None = None
+    # JoinMarket extension: this process/wallet has positively observed this
+    # outpoint as an unspent coin. Persisted (``jm_seen``) so the
+    # forced-address-reuse defense can tell a coin that predates a restart from
+    # a genuinely new arrival. Ignored by other BIP-329 consumers.
+    seen: bool = False
 
     @property
     def is_frozen(self) -> bool:
@@ -107,13 +124,19 @@ class OutputRecord:
     @property
     def has_metadata(self) -> bool:
         """Whether this record carries any state worth persisting."""
-        return self.spendable is not None or self.label is not None or self.lock_until is not None
+        return (
+            self.spendable is not None
+            or self.label is not None
+            or self.lock_until is not None
+            or self.seen
+        )
 
     def to_dict(self) -> dict[str, str | bool | float]:
         """Serialize to a BIP-329 JSON dict.
 
-        ``jm_lock_until`` is a JoinMarket extension (other BIP-329 consumers
-        ignore unknown keys); it carries the temporary CoinJoin lock expiry.
+        ``jm_lock_until`` and ``jm_seen`` are JoinMarket extensions (other
+        BIP-329 consumers ignore unknown keys); they carry the temporary
+        CoinJoin lock expiry and the observed-outpoint marker respectively.
         """
         d: dict[str, str | bool | float] = {"type": "output", "ref": self.ref}
         if self.spendable is not None:
@@ -122,6 +145,8 @@ class OutputRecord:
             d["label"] = self.label
         if self.lock_until is not None:
             d["jm_lock_until"] = self.lock_until
+        if self.seen:
+            d["jm_seen"] = True
         return d
 
     @classmethod
@@ -147,7 +172,8 @@ class OutputRecord:
             lock_until = float(lock_until_raw)
         else:
             lock_until = None
-        return cls(ref=ref, spendable=spendable, label=label, lock_until=lock_until)
+        seen = d.get("jm_seen") is True
+        return cls(ref=ref, spendable=spendable, label=label, lock_until=lock_until, seen=seen)
 
 
 @dataclass
@@ -286,6 +312,7 @@ class UTXOMetadataStore:
     records: dict[str, OutputRecord] = field(default_factory=dict)
     address_records: dict[str, AddressRecord] = field(default_factory=dict)
     reserved_records: dict[str, ReservedAddressRecord] = field(default_factory=dict)
+    funded_addresses: set[str] = field(default_factory=set)
     foreign_addr_lines: list[dict[str, str | bool]] = field(default_factory=list)
 
     def load(self) -> None:
@@ -297,6 +324,7 @@ class UTXOMetadataStore:
         self.records.clear()
         self.address_records.clear()
         self.reserved_records.clear()
+        self.funded_addresses.clear()
         self.foreign_addr_lines.clear()
 
         if not self.path.exists():
@@ -337,6 +365,10 @@ class UTXOMetadataStore:
                     reserved = ReservedAddressRecord.from_dict(data)
                     if reserved is not None:
                         self.reserved_records[reserved.ref] = reserved
+                elif isinstance(label, str) and label.startswith(FUNDED_LABEL_PREFIX):
+                    ref = data.get("ref")
+                    if isinstance(ref, str) and ref:
+                        self.funded_addresses.add(ref)
                 else:
                     if isinstance(data, dict):
                         self.foreign_addr_lines.append(data)
@@ -384,11 +416,13 @@ class UTXOMetadataStore:
 
         addr_records_to_write = sorted(self.address_records.values(), key=lambda r: r.ref)
         reserved_records_to_write = sorted(self.reserved_records.values(), key=lambda r: r.ref)
+        funded_addresses_to_write = sorted(self.funded_addresses)
 
         if (
             not outputs_to_write
             and not addr_records_to_write
             and not reserved_records_to_write
+            and not funded_addresses_to_write
             and not self.foreign_addr_lines
         ):
             if self.path.exists():
@@ -405,6 +439,13 @@ class UTXOMetadataStore:
         lines.extend(json.dumps(r.to_dict(), separators=(",", ":")) for r in addr_records_to_write)
         lines.extend(
             json.dumps(r.to_dict(), separators=(",", ":")) for r in reserved_records_to_write
+        )
+        lines.extend(
+            json.dumps(
+                {"type": "addr", "ref": ref, "label": FUNDED_LABEL_PREFIX},
+                separators=(",", ":"),
+            )
+            for ref in funded_addresses_to_write
         )
         # Foreign records last; sort by (type, ref) for determinism.
         for foreign in sorted(
@@ -462,13 +503,15 @@ class UTXOMetadataStore:
             label: Optional label to attach (only set when the record has no
                 label yet), e.g. to mark an automatic forced-reuse freeze.
         """
-        if outpoint in self.records:
-            self.records[outpoint].spendable = False
-            if label is not None and self.records[outpoint].label is None:
-                self.records[outpoint].label = label
-        else:
-            self.records[outpoint] = OutputRecord(ref=outpoint, spendable=False, label=label)
-        self.save()
+        with self._exclusive_file_lock():
+            self.load()
+            if outpoint in self.records:
+                self.records[outpoint].spendable = False
+                if label is not None and self.records[outpoint].label is None:
+                    self.records[outpoint].label = label
+            else:
+                self.records[outpoint] = OutputRecord(ref=outpoint, spendable=False, label=label)
+            self.save()
         logger.info(f"Frozen UTXO: {outpoint}")
 
     def unfreeze(self, outpoint: str) -> None:
@@ -480,19 +523,21 @@ class UTXOMetadataStore:
         Args:
             outpoint: Outpoint string in ``txid:vout`` format.
         """
-        record = self.records.get(outpoint)
-        if record is None:
-            # Already unfrozen (no record means spendable)
-            return
+        with self._exclusive_file_lock():
+            self.load()
+            record = self.records.get(outpoint)
+            if record is None:
+                # Already unfrozen (no record means spendable)
+                return
 
-        if record.label is not None or record.lock_until is not None:
-            # Keep the record for the label / active CoinJoin lock.
-            record.spendable = True
-        else:
-            # No other metadata -- remove entirely
-            del self.records[outpoint]
+            if record.label is not None or record.lock_until is not None or record.seen:
+                # Keep the record for labels, locks, and reuse observations.
+                record.spendable = True
+            else:
+                # No other metadata -- remove entirely
+                del self.records[outpoint]
 
-        self.save()
+            self.save()
         logger.info(f"Unfrozen UTXO: {outpoint}")
 
     def toggle_freeze(self, outpoint: str) -> bool:
@@ -504,12 +549,24 @@ class UTXOMetadataStore:
         Returns:
             True if the UTXO is now frozen, False if now unfrozen.
         """
-        if self.is_frozen(outpoint):
-            self.unfreeze(outpoint)
-            return False
-        else:
-            self.freeze(outpoint)
-            return True
+        with self._exclusive_file_lock():
+            self.load()
+            record = self.records.get(outpoint)
+            if record is not None and record.is_frozen:
+                if record.label is not None or record.lock_until is not None or record.seen:
+                    record.spendable = True
+                else:
+                    del self.records[outpoint]
+                frozen = False
+            else:
+                if record is None:
+                    self.records[outpoint] = OutputRecord(ref=outpoint, spendable=False)
+                else:
+                    record.spendable = False
+                frozen = True
+            self.save()
+        logger.info(f"{'Frozen' if frozen else 'Unfrozen'} UTXO: {outpoint}")
+        return frozen
 
     # -- Temporary CoinJoin locks --------------------------------------------
     #
@@ -532,22 +589,34 @@ class UTXOMetadataStore:
     def _exclusive_file_lock(self) -> Iterator[None]:
         """Serialize lock acquisition/release across processes.
 
-        Uses a POSIX advisory lock on a sidecar ``.lock`` file. The metadata
+        Uses an advisory lock on a sidecar ``.lock`` file. The metadata
         file itself is replaced via rename on every save, which would break a
-        lock held on its inode, so we lock a stable sidecar path instead. On
-        platforms without ``fcntl`` this degrades to a no-op (atomic rename
-        still prevents corruption; only the rare lost-update race remains).
+        lock held on its inode, so we lock a stable sidecar path instead.
+        Windows uses ``msvcrt.locking`` over the same stable file.
         """
-        if fcntl is None:  # pragma: no cover - non-POSIX platforms
+        if fcntl is None and msvcrt is None:  # pragma: no cover - unknown platform
             yield
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self._flock_path, "w", encoding="utf-8") as handle:
-            fcntl.flock(handle, fcntl.LOCK_EX)
+        with open(self._flock_path, "a+b") as handle:
+            if fcntl is not None:
+                fcntl.flock(handle, fcntl.LOCK_EX)
+            else:  # pragma: no cover - Windows
+                assert msvcrt is not None
+                if handle.tell() == 0:
+                    handle.write(b"\0")
+                    handle.flush()
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
             try:
                 yield
             finally:
-                fcntl.flock(handle, fcntl.LOCK_UN)
+                if fcntl is not None:
+                    fcntl.flock(handle, fcntl.LOCK_UN)
+                else:  # pragma: no cover - Windows
+                    assert msvcrt is not None
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
 
     def _prune_expired_locks(self, now: float) -> None:
         """Clear expired ``lock_until`` markers and drop now-empty records."""
@@ -627,19 +696,21 @@ class UTXOMetadataStore:
             outpoint: Outpoint string in ``txid:vout`` format.
             label: Label string, or None to clear.
         """
-        if outpoint in self.records:
-            self.records[outpoint].label = label
-        elif label is not None:
-            self.records[outpoint] = OutputRecord(ref=outpoint, label=label)
-        else:
-            return  # Nothing to do
+        with self._exclusive_file_lock():
+            self.load()
+            if outpoint in self.records:
+                self.records[outpoint].label = label
+            elif label is not None:
+                self.records[outpoint] = OutputRecord(ref=outpoint, label=label)
+            else:
+                return  # Nothing to do
 
-        # Clean up record if it has no useful metadata
-        record = self.records.get(outpoint)
-        if record and record.spendable is None and record.label is None:
-            del self.records[outpoint]
+            # Clean up record if it has no useful metadata
+            record = self.records.get(outpoint)
+            if record and not record.has_metadata:
+                del self.records[outpoint]
 
-        self.save()
+            self.save()
 
     def get_label(self, outpoint: str) -> str | None:
         """Get the label for an outpoint.
@@ -664,20 +735,22 @@ class UTXOMetadataStore:
         """
         if not address:
             return False
-        existing = self.address_records.get(address)
-        if existing is None:
-            self.address_records[address] = AddressRecord(
-                ref=address,
-                label=f"{USED_LABEL_PREFIX}:{origin}" if origin else USED_LABEL_PREFIX,
-            )
+        with self._exclusive_file_lock():
+            self.load()
+            existing = self.address_records.get(address)
+            if existing is None:
+                self.address_records[address] = AddressRecord(
+                    ref=address,
+                    label=f"{USED_LABEL_PREFIX}:{origin}" if origin else USED_LABEL_PREFIX,
+                )
+                self.save()
+                return True
+            updated = existing.with_added_origin(origin)
+            if updated.label == existing.label:
+                return False
+            self.address_records[address] = updated
             self.save()
             return True
-        updated = existing.with_added_origin(origin)
-        if updated.label == existing.label:
-            return False
-        self.address_records[address] = updated
-        self.save()
-        return True
 
     def mark_addresses_used(
         self,
@@ -689,25 +762,27 @@ class UTXOMetadataStore:
         Performs a single ``save()`` for many addresses; returns the count of
         records that were created or had their origin extended.
         """
-        changed = 0
-        for address in addresses:
-            if not address:
-                continue
-            existing = self.address_records.get(address)
-            if existing is None:
-                self.address_records[address] = AddressRecord(
-                    ref=address,
-                    label=f"{USED_LABEL_PREFIX}:{origin}" if origin else USED_LABEL_PREFIX,
-                )
-                changed += 1
-                continue
-            updated = existing.with_added_origin(origin)
-            if updated.label != existing.label:
-                self.address_records[address] = updated
-                changed += 1
-        if changed:
-            self.save()
-        return changed
+        with self._exclusive_file_lock():
+            self.load()
+            changed = 0
+            for address in addresses:
+                if not address:
+                    continue
+                existing = self.address_records.get(address)
+                if existing is None:
+                    self.address_records[address] = AddressRecord(
+                        ref=address,
+                        label=f"{USED_LABEL_PREFIX}:{origin}" if origin else USED_LABEL_PREFIX,
+                    )
+                    changed += 1
+                    continue
+                updated = existing.with_added_origin(origin)
+                if updated.label != existing.label:
+                    self.address_records[address] = updated
+                    changed += 1
+            if changed:
+                self.save()
+            return changed
 
     def is_address_used(self, address: str) -> bool:
         """Return True if ``address`` has been recorded as having history."""
@@ -758,20 +833,26 @@ class UTXOMetadataStore:
         if not address:
             return False
         user_label = label or ""
-        existing = self.reserved_records.get(address)
-        if existing is not None and existing.user_label == user_label:
-            return False
-        self.reserved_records[address] = ReservedAddressRecord(ref=address, user_label=user_label)
-        self.save()
-        return True
+        with self._exclusive_file_lock():
+            self.load()
+            existing = self.reserved_records.get(address)
+            if existing is not None and existing.user_label == user_label:
+                return False
+            self.reserved_records[address] = ReservedAddressRecord(
+                ref=address, user_label=user_label
+            )
+            self.save()
+            return True
 
     def unreserve_address(self, address: str) -> bool:
         """Remove any reservation for ``address``. Returns ``True`` if changed."""
-        if address in self.reserved_records:
-            del self.reserved_records[address]
-            self.save()
-            return True
-        return False
+        with self._exclusive_file_lock():
+            self.load()
+            if address in self.reserved_records:
+                del self.reserved_records[address]
+                self.save()
+                return True
+            return False
 
     def is_address_reserved(self, address: str) -> bool:
         """Return True if ``address`` is currently reserved."""
@@ -784,6 +865,53 @@ class UTXOMetadataStore:
     def get_reserved_labels(self) -> dict[str, str]:
         """Return a mapping of reserved address -> user label (may be empty)."""
         return {ref: rec.user_label for ref, rec in self.reserved_records.items()}
+
+    # -- Forced-address-reuse observation state (persisted across restarts) --
+
+    def record_reuse_observations(
+        self, funded_addresses: Iterable[str], seen_outpoints: Iterable[str]
+    ) -> bool:
+        """Persist observed funded addresses and seen outpoints in one write.
+
+        Funded addresses become ``jm:funded`` ``addr`` records; seen outpoints
+        set a ``jm_seen`` flag on the outpoint's ``output`` record (without
+        affecting freeze/label state). Both markers survive restarts so the
+        forced-address-reuse defense can distinguish a coin that predates a
+        restart from a genuinely new arrival. Idempotent; returns True if disk
+        state changed.
+        """
+        funded = {address for address in funded_addresses if address}
+        seen = {outpoint for outpoint in seen_outpoints if outpoint}
+        changed = False
+        with self._exclusive_file_lock():
+            # Observation writes happen during background sync while maker,
+            # taker, or CLI processes may update the same file. Reload under
+            # the sidecar lock so those freezes, labels, and locks are merged
+            # instead of overwritten by this store's stale snapshot.
+            self.load()
+            for address in funded:
+                if address not in self.funded_addresses:
+                    self.funded_addresses.add(address)
+                    changed = True
+            for outpoint in seen:
+                record = self.records.get(outpoint)
+                if record is None:
+                    self.records[outpoint] = OutputRecord(ref=outpoint, seen=True)
+                    changed = True
+                elif not record.seen:
+                    record.seen = True
+                    changed = True
+            if changed:
+                self.save()
+        return changed
+
+    def get_observed_funded_addresses(self) -> set[str]:
+        """Return addresses this wallet has observed funded (across restarts)."""
+        return set(self.funded_addresses)
+
+    def get_seen_outpoints(self) -> set[str]:
+        """Return outpoints this wallet has observed unspent (across restarts)."""
+        return {ref for ref, record in self.records.items() if record.seen}
 
     def verify_writable(self) -> None:
         """Verify that the metadata file's directory is writable.

@@ -110,15 +110,15 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin, Wal
         # the old one-shot ``_just_initialized`` guard) wrongly froze coins that
         # the first sync had not yet observed (#542).
         #
-        # Instead we accumulate, across this process's syncs, the addresses and
-        # outpoints we have *positively observed funded*. A coin is treated as
-        # forced reuse only when its address was seen funded earlier in this
-        # process and is empty again now (see
-        # :meth:`_auto_freeze_reused_address_utxos`). These sets are
-        # intentionally process-local: after a restart nothing is auto-frozen
-        # until we have witnessed a funded -> empty transition ourselves, which
-        # is the safe choice (a late-discovered legitimate coin and an attacker's
-        # dust are indistinguishable without that observation).
+        # Instead we accumulate the addresses and outpoints we have *positively
+        # observed funded*. A coin is treated as forced reuse only when its
+        # address was seen funded earlier and is empty again now (see
+        # :meth:`_auto_freeze_reused_address_utxos`). These sets are persisted
+        # in the metadata store and reseeded below, so the knowledge survives
+        # restarts: an address emptied before a restart and refunded after it is
+        # still frozen, while coins that predate the restart (in the persisted
+        # seen-outpoint set) and late-discovered first-use coins (never
+        # persisted as observed-funded) are left spendable.
         self._observed_funded_addresses: set[str] = set()
         self._observed_outpoints: set[str] = set()
         # Guards the once-per-process import-label reconstruction pass (see
@@ -174,6 +174,12 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin, Wal
         if self.metadata_store is not None:
             self.addresses_with_history.update(self.metadata_store.get_used_addresses())
             self._migrate_legacy_address_history(data_dir)
+            # Reseed the forced-address-reuse observation sets so the defense
+            # survives restarts (issue #559).
+            self._observed_funded_addresses.update(
+                self.metadata_store.get_observed_funded_addresses()
+            )
+            self._observed_outpoints.update(self.metadata_store.get_seen_outpoints())
 
         # Track addresses currently reserved for in-progress CoinJoin sessions
         # These addresses have been shared with a taker but the CoinJoin hasn't

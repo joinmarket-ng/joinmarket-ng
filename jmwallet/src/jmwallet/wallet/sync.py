@@ -153,20 +153,44 @@ class WalletSyncMixin:
         after the freeze decision), so a coin discovered for the first time on
         this sync is never mistaken for forced reuse (issue #542).
         """
+        # On the first sync after a restart ``utxo_cache`` had no pre-sync
+        # snapshot. A persisted seen outpoint that is still present proves its
+        # address never became empty, so a second payment must remain spendable
+        # with the original coin.
+        effective_prior_funded = prior_funded_addresses | {
+            utxo.address
+            for utxos in self.utxo_cache.values()
+            for utxo in utxos
+            if utxo.outpoint in self._observed_outpoints
+        }
         self._auto_freeze_reused_address_utxos(
             self._observed_funded_addresses,
             self._observed_outpoints,
-            prior_funded_addresses,
+            effective_prior_funded,
         )
         # Accumulate this sync's observations so the next sync can tell a
         # genuine forced-reuse arrival (new outpoint on a previously funded,
         # now-empty address) from a first-use or late-discovered coin.
+        newly_funded: set[str] = set()
+        newly_seen: set[str] = set()
         for utxos in self.utxo_cache.values():
             for utxo in utxos:
                 if utxo.is_fidelity_bond:
                     continue
                 self._observed_outpoints.add(utxo.outpoint)
                 self._observed_funded_addresses.add(utxo.address)
+                newly_seen.add(utxo.outpoint)
+                newly_funded.add(utxo.address)
+        # Persist the observations so the defense survives restarts (issue
+        # #559): an address emptied before a restart and refunded after it is
+        # still recognized as reuse. The store dedupes and writes only when
+        # something changed.
+        store = getattr(self, "metadata_store", None)
+        if store is not None:
+            try:
+                store.record_reuse_observations(newly_funded, newly_seen)
+            except Exception as exc:  # pragma: no cover - disk failures are rare
+                logger.warning(f"Failed to persist reuse-freeze observations: {exc}")
 
     def _record_history_address(self, address: str, origin: str | None = None) -> None:
         """Mark ``address`` as having on-chain history (current or spent).

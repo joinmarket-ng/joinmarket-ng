@@ -150,7 +150,7 @@ test.describe("CoinJoin History Classification", () => {
       if (externalBranch) {
         for (const entry of externalBranch.entries) {
           if (parseFloat(entry.amount) > 0) {
-            expect(["deposit", "cj-out"]).toContain(entry.status);
+            expect(["deposit", "cj-out", "reused"]).toContain(entry.status);
           }
         }
       }

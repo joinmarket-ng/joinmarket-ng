@@ -259,16 +259,18 @@ class TestFreezeBasics:
         lines = [line for line in content.strip().splitlines() if line]
         assert len(lines) >= 1
 
-        record = json.loads(lines[0])
+        record = next(
+            item for item in map(json.loads, lines) if item.get("ref") == outpoint
+        )
         assert record["type"] == "output"
         assert record["ref"] == outpoint
         assert record["spendable"] is False
 
     @pytest.mark.asyncio
-    async def test_unfreeze_removes_record_if_no_label(
+    async def test_unfreeze_preserves_reuse_observation(
         self, funded_wallet_with_metadata: WalletService
     ):
-        """Unfreezing a UTXO with no label removes the record entirely."""
+        """Unfreezing keeps the persisted seen marker used across restarts."""
         wallet = funded_wallet_with_metadata
         utxos = await wallet.get_utxos(0)
         target = utxos[0]
@@ -280,9 +282,12 @@ class TestFreezeBasics:
         wallet.unfreeze_utxo(outpoint)
         assert target.frozen is False
 
-        # Record should be removed (no label, spendable=True is default)
+        # The freeze is cleared, but sync recorded this outpoint as observed.
         assert wallet.metadata_store is not None
-        assert outpoint not in wallet.metadata_store.records
+        record = wallet.metadata_store.records[outpoint]
+        assert record.spendable is True
+        assert record.label is None
+        assert record.seen is True
 
     @pytest.mark.asyncio
     async def test_toggle_freeze_round_trip(

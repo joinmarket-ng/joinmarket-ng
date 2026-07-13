@@ -381,4 +381,104 @@ async def test_incomplete_first_sync_does_not_freeze_late_discovered_coin(
 
     assert coin.frozen is False, "a late-discovered first-use coin must not be frozen"
     assert not ws.metadata_store.is_frozen(coin.outpoint)
-    assert ws.metadata_store.records.get(coin.outpoint) is None
+    # The coin is now recorded as observed (``jm_seen``) so the reuse defense
+    # survives restarts, but that marker must not freeze or label it.
+    record = ws.metadata_store.records.get(coin.outpoint)
+    assert record is None or (record.spendable is None and record.label is None)
+
+
+# --------------------------------------------------------------------------- #
+# Restart persistence (issue #559): the observation sets are persisted in the
+# metadata store and reseeded at init, so the defense works across restarts.
+# These use the *natural* per-wallet metadata path (not the fixed override in
+# ``_make_wallet``) so a second instance over the same data dir exercises the
+# real init-time reseeding.
+# --------------------------------------------------------------------------- #
+
+
+def _reopen_natural_wallet(tmp_path: Path, *, max_sats_freeze_reuse: int = -1) -> WalletService:
+    backend = DescriptorWalletBackend(wallet_name="test_wallet")
+    backend._wallet_loaded = True
+    return WalletService(
+        mnemonic=MNEMONIC,
+        backend=backend,
+        network="regtest",
+        data_dir=tmp_path,
+        max_sats_freeze_reuse=max_sats_freeze_reuse,
+    )
+
+
+def test_reuse_freeze_survives_restart(tmp_path: Path) -> None:
+    """A dust payment to an address emptied *before* a restart is still frozen."""
+    # Process A: observe the address funded (recorded + persisted), then emptied.
+    ws1 = _reopen_natural_wallet(tmp_path)
+    original = _utxo(txid="d0" * 32, address=REUSED_ADDRESS, value=10_000)
+    ws1.utxo_cache = {0: [original]}
+    ws1._freeze_reused_after_sync(prior_funded_addresses=set())
+    assert original.frozen is False
+    ws1.utxo_cache = {0: []}  # spent empty
+
+    # Restart: a fresh WalletService reseeds the observation sets from disk.
+    ws2 = _reopen_natural_wallet(tmp_path)
+    assert REUSED_ADDRESS in ws2._observed_funded_addresses
+    assert original.outpoint in ws2._observed_outpoints
+
+    # Forced-reuse dust now lands on the spent-empty address after the restart.
+    reuse = _utxo(txid="e5" * 32, address=REUSED_ADDRESS, value=600)
+    ws2.utxo_cache = {0: [reuse]}
+    ws2._freeze_reused_after_sync(prior_funded_addresses=set())
+    assert reuse.frozen is True
+    assert ws2.metadata_store.is_frozen(reuse.outpoint)
+
+
+def test_coin_present_before_restart_not_frozen(tmp_path: Path) -> None:
+    """A coin that predates the restart (persisted as seen) must stay spendable
+    on the first post-restart sync, even though its address is known-funded."""
+    ws1 = _reopen_natural_wallet(tmp_path)
+    coin = _utxo(txid="d0" * 32, address=REUSED_ADDRESS, value=10_000)
+    ws1.utxo_cache = {0: [coin]}
+    ws1._freeze_reused_after_sync(prior_funded_addresses=set())
+    assert coin.frozen is False
+
+    # Restart with the same coin still unspent.
+    ws2 = _reopen_natural_wallet(tmp_path)
+    same_coin = _utxo(txid="d0" * 32, address=REUSED_ADDRESS, value=10_000)
+    ws2.utxo_cache = {0: [same_coin]}
+    ws2._freeze_reused_after_sync(prior_funded_addresses=set())
+    assert same_coin.frozen is False, "a coin present before restart must not be frozen"
+    assert not ws2.metadata_store.is_frozen(same_coin.outpoint)
+
+
+def test_second_payment_to_still_funded_address_after_restart_not_frozen(tmp_path: Path) -> None:
+    """A restart must not erase proof that the address still held its first coin."""
+    ws1 = _reopen_natural_wallet(tmp_path)
+    original = _utxo(txid="a7" * 32, address=REUSED_ADDRESS, value=50_000)
+    ws1.utxo_cache = {0: [original]}
+    ws1._freeze_reused_after_sync(prior_funded_addresses=set())
+
+    ws2 = _reopen_natural_wallet(tmp_path)
+    second = _utxo(txid="b8" * 32, address=REUSED_ADDRESS, value=600, vout=1)
+    ws2.utxo_cache = {0: [original, second]}
+    ws2._freeze_reused_after_sync(prior_funded_addresses=set())
+
+    assert original.frozen is False
+    assert second.frozen is False
+    assert not ws2.metadata_store.is_frozen(second.outpoint)
+
+
+def test_late_first_use_across_restart_not_frozen(tmp_path: Path) -> None:
+    """The #542 guard survives restarts: a first-use coin on an address never
+    observed funded (no persisted ``jm:funded`` record) is left spendable."""
+    # Process A observes only REUSED_ADDRESS; FRESH_ADDRESS is never seen funded.
+    ws1 = _reopen_natural_wallet(tmp_path)
+    ws1.utxo_cache = {0: [_utxo(txid="d0" * 32, address=REUSED_ADDRESS, value=10_000)]}
+    ws1._freeze_reused_after_sync(prior_funded_addresses=set())
+
+    ws2 = _reopen_natural_wallet(tmp_path)
+    assert FRESH_ADDRESS not in ws2._observed_funded_addresses
+
+    coin = _utxo(txid="f6" * 32, address=FRESH_ADDRESS, value=1_000_000)
+    ws2.utxo_cache = {0: [coin]}
+    ws2._freeze_reused_after_sync(prior_funded_addresses=set())
+    assert coin.frozen is False
+    assert not ws2.metadata_store.is_frozen(coin.outpoint)

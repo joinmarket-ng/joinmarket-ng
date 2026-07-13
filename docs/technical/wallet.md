@@ -100,15 +100,22 @@ metadata store and can be released with `jm-wallet unfreeze` (an explicit
 unfreeze is never overridden by a later sync). Fidelity bonds are exempt.
 
 To decide that an address was "spent empty", the wallet relies on having
-positively observed that address transition from funded to empty during the
-running process, not merely on the persisted used-address set. This avoids a
-false positive where a legitimate first-use coin only becomes visible on a
-later sync (for example while a background descriptor rescan is still catching
-up, after a transient RPC failure, or following a descriptor-range upgrade):
-such a coin is left spendable rather than mistaken for forced reuse. A
-consequence is that after a restart nothing is auto-frozen until the wallet has
-itself witnessed a funded -> empty transition, since a late-discovered genuine
-coin and an attacker's dust are otherwise indistinguishable.
+positively observed that address holding a coin, not merely on the persisted
+used-address set. This avoids a false positive where a legitimate first-use coin
+only becomes visible on a later sync (for example while a background descriptor
+rescan is still catching up, after a transient RPC failure, or following a
+descriptor-range upgrade): such a coin is left spendable rather than mistaken
+for forced reuse.
+
+These observations (the set of addresses seen funded and the set of outpoints
+seen unspent) are persisted in the BIP-329 metadata store as JoinMarket
+extensions (`jm:funded` address records and a `jm_seen` flag on output records,
+both ignored by other consumers) and reseeded at startup, so the defense
+survives restarts: an address emptied before a restart and refunded after it is
+still frozen. The persisted seen-outpoint set also keeps the guarantees intact
+across restarts, namely that coins which predate the restart are left spendable
+(they are in the seen set) and that a genuinely late-discovered first-use coin
+is not frozen (its address was never persisted as observed-funded).
 
 The `[wallet] max_sats_freeze_reuse` setting controls the threshold: `-1`
 (default) freezes all such reuse UTXOs, a positive `N` freezes only those with

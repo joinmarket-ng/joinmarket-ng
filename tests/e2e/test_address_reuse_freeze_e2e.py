@@ -333,3 +333,87 @@ async def test_unfrozen_reuse_utxo_is_not_refrozen(
             )
         finally:
             await wallet.close()
+
+
+def _build_wallet(
+    cfg: dict[str, str], mnemonic: str, wallet_name: str, data_dir: Path
+) -> WalletService:
+    backend = DescriptorWalletBackend(
+        rpc_url=cfg["rpc_url"],
+        rpc_user=cfg["rpc_user"],
+        rpc_password=cfg["rpc_password"],
+        wallet_name=wallet_name,
+    )
+    return WalletService(
+        mnemonic=mnemonic,
+        backend=backend,
+        network="regtest",
+        mixdepth_count=5,
+        scan_range=1000,
+        data_dir=data_dir,
+        max_sats_freeze_reuse=-1,
+    )
+
+
+@pytest.mark.asyncio
+async def test_reuse_freeze_survives_wallet_restart(
+    bitcoin_rpc_config: dict[str, str],
+    ensure_blockchain_ready: None,
+    funded_miner: tuple[str, str],
+) -> None:
+    """Issue #559: a dust payment to an address emptied before a restart is
+    still auto-frozen after the wallet process is recreated on the same data
+    dir, because the reuse-observation sets are persisted and reseeded."""
+    miner, miner_addr = funded_miner
+    mnemonic = generate_mnemonic_secure(word_count=12)
+    fingerprint = get_mnemonic_fingerprint(mnemonic, "")
+    wallet_name = generate_wallet_name(fingerprint, "regtest")
+
+    with TemporaryDirectory() as tmp:
+        data_dir = Path(tmp)
+
+        # --- Process A: fund the deposit address, then sweep it empty. ---
+        wallet = _build_wallet(bitcoin_rpc_config, mnemonic, wallet_name, data_dir)
+        try:
+            deposit = wallet.get_receive_address(mixdepth=0, index=0)
+            await _fund(bitcoin_rpc_config, miner, miner_addr, deposit, 0.01)
+            await wallet.setup_descriptor_wallet(scan_range=1000, rescan=True)
+            await wallet.sync_with_descriptor_wallet()
+            assert await wallet.get_balance(mixdepth=0) == 1_000_000
+
+            sweep_dest = wallet.get_receive_address(mixdepth=1, index=0)
+            await direct_send(
+                wallet=wallet,
+                backend=wallet.backend,
+                mixdepth=0,
+                amount_sats=0,  # sweep
+                destination=sweep_dest,
+                fee_rate=2.0,
+            )
+            await _rpc(
+                bitcoin_rpc_config, "generatetoaddress", [1, miner_addr], wallet=miner
+            )
+            await wallet.sync_with_descriptor_wallet()
+            assert not any(u.address == deposit for u in wallet.utxo_cache.get(0, []))
+        finally:
+            await wallet.close()
+
+        # --- Restart: forced-reuse dust arrives while "process B" starts. ---
+        await _fund(bitcoin_rpc_config, miner, miner_addr, deposit, 0.005)
+
+        wallet2 = _build_wallet(bitcoin_rpc_config, mnemonic, wallet_name, data_dir)
+        try:
+            # The observation sets must have been reseeded from disk.
+            assert deposit in wallet2._observed_funded_addresses
+            await wallet2.setup_descriptor_wallet(scan_range=1000, rescan=False)
+            await wallet2.sync_with_descriptor_wallet()
+
+            reuse = [u for u in wallet2.utxo_cache.get(0, []) if u.address == deposit]
+            assert len(reuse) == 1, f"expected the reuse UTXO, got {reuse}"
+            assert reuse[0].frozen is True, (
+                "reuse on a spent-empty address must be auto-frozen even across a restart"
+            )
+            assert wallet2.metadata_store is not None
+            assert wallet2.metadata_store.is_frozen(reuse[0].outpoint)
+        finally:
+            await wallet2.close()

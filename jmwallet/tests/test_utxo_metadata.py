@@ -13,6 +13,8 @@ Tests cover:
 from __future__ import annotations
 
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -793,6 +795,150 @@ class TestReservedAddresses:
         s2.load()
         assert s2.get_used_addresses() == set()
         assert s2.foreign_addr_lines == []
+
+
+class TestReuseObservations:
+    """Tests for persisted forced-address-reuse observation state (issue #559)."""
+
+    def test_round_trip(self, tmp_path):
+        path = tmp_path / "m.jsonl"
+        s = UTXOMetadataStore(path=path)
+        s.load()
+        changed = s.record_reuse_observations({"bcrt1qa", "bcrt1qb"}, {"aa:0", "bb:1"})
+        assert changed is True
+        # Idempotent: re-recording the same observations does not rewrite.
+        assert s.record_reuse_observations({"bcrt1qa"}, {"aa:0"}) is False
+
+        s2 = UTXOMetadataStore(path=path)
+        s2.load()
+        assert s2.get_observed_funded_addresses() == {"bcrt1qa", "bcrt1qb"}
+        assert s2.get_seen_outpoints() == {"aa:0", "bb:1"}
+
+    def test_seen_marker_does_not_freeze_or_label(self, tmp_path):
+        path = tmp_path / "m.jsonl"
+        s = UTXOMetadataStore(path=path)
+        s.load()
+        s.record_reuse_observations(set(), {"aa:0"})
+
+        s2 = UTXOMetadataStore(path=path)
+        s2.load()
+        # A seen-only outpoint is tracked but is neither frozen nor labeled.
+        assert "aa:0" in s2.get_seen_outpoints()
+        assert not s2.is_frozen("aa:0")
+        assert s2.get_label("aa:0") is None
+        assert "aa:0" not in s2.get_frozen_outpoints()
+
+    def test_seen_and_frozen_coexist(self, tmp_path):
+        path = tmp_path / "m.jsonl"
+        s = UTXOMetadataStore(path=path)
+        s.load()
+        s.record_reuse_observations(set(), {"aa:0"})
+        s.freeze("aa:0", label="cold")
+
+        s2 = UTXOMetadataStore(path=path)
+        s2.load()
+        assert "aa:0" in s2.get_seen_outpoints()
+        assert s2.is_frozen("aa:0")
+        assert s2.get_label("aa:0") == "cold"
+
+    def test_unfreeze_preserves_seen_marker(self, tmp_path):
+        path = tmp_path / "m.jsonl"
+        s = UTXOMetadataStore(path=path)
+        s.record_reuse_observations(set(), {"aa:0"})
+        s.freeze("aa:0")
+        s.unfreeze("aa:0")
+
+        s2 = UTXOMetadataStore(path=path)
+        s2.load()
+        assert s2.get_seen_outpoints() == {"aa:0"}
+        assert not s2.is_frozen("aa:0")
+
+    def test_clearing_label_preserves_seen_marker(self, tmp_path):
+        path = tmp_path / "m.jsonl"
+        s = UTXOMetadataStore(path=path)
+        s.record_reuse_observations(set(), {"aa:0"})
+        s.set_label("aa:0", "temporary")
+        s.set_label("aa:0", None)
+
+        s2 = UTXOMetadataStore(path=path)
+        s2.load()
+        assert s2.get_seen_outpoints() == {"aa:0"}
+        assert s2.get_label("aa:0") is None
+
+    def test_observation_write_merges_concurrent_freeze(self, tmp_path):
+        path = tmp_path / "m.jsonl"
+        stale = UTXOMetadataStore(path=path)
+        stale.load()
+        concurrent = UTXOMetadataStore(path=path)
+        concurrent.freeze("locked:0", label="reserved")
+
+        stale.record_reuse_observations({"bcrt1qa"}, {"seen:0"})
+
+        merged = UTXOMetadataStore(path=path)
+        merged.load()
+        assert merged.is_frozen("locked:0")
+        assert merged.get_label("locked:0") == "reserved"
+        assert merged.get_seen_outpoints() == {"seen:0"}
+        assert merged.get_observed_funded_addresses() == {"bcrt1qa"}
+
+    def test_overlapping_observation_and_freeze_preserve_both(self, tmp_path, monkeypatch):
+        path = tmp_path / "m.jsonl"
+        observer = UTXOMetadataStore(path=path)
+        observer.load()
+        freezer = UTXOMetadataStore(path=path)
+        freezer.load()
+
+        save_started = threading.Event()
+        allow_save = threading.Event()
+        original_save = observer.save
+
+        def delayed_save() -> None:
+            save_started.set()
+            assert allow_save.wait(timeout=2)
+            original_save()
+
+        monkeypatch.setattr(observer, "save", delayed_save)
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            observation = executor.submit(
+                observer.record_reuse_observations, {"bcrt1qa"}, {"seen:0"}
+            )
+            assert save_started.wait(timeout=2)
+            freeze = executor.submit(freezer.freeze, "locked:0", "reserved")
+            allow_save.set()
+            assert observation.result(timeout=2) is True
+            freeze.result(timeout=2)
+
+        merged = UTXOMetadataStore(path=path)
+        merged.load()
+        assert merged.is_frozen("locked:0")
+        assert merged.get_label("locked:0") == "reserved"
+        assert merged.get_seen_outpoints() == {"seen:0"}
+        assert merged.get_observed_funded_addresses() == {"bcrt1qa"}
+
+    def test_toggle_reloads_concurrent_freeze(self, tmp_path):
+        path = tmp_path / "m.jsonl"
+        stale = UTXOMetadataStore(path=path)
+        stale.load()
+        concurrent = UTXOMetadataStore(path=path)
+        concurrent.freeze("locked:0")
+
+        assert stale.toggle_freeze("locked:0") is False
+
+        reloaded = UTXOMetadataStore(path=path)
+        reloaded.load()
+        assert not reloaded.is_frozen("locked:0")
+
+    def test_funded_records_not_treated_as_used_or_foreign(self, tmp_path):
+        path = tmp_path / "m.jsonl"
+        s = UTXOMetadataStore(path=path)
+        s.load()
+        s.record_reuse_observations({"bcrt1qa"}, set())
+
+        s2 = UTXOMetadataStore(path=path)
+        s2.load()
+        assert s2.get_used_addresses() == set()
+        assert s2.foreign_addr_lines == []
+        assert s2.get_observed_funded_addresses() == {"bcrt1qa"}
 
 
 class TestCoinjoinAddressTypes:
