@@ -498,9 +498,12 @@ wait_for_port() {
 # =============================================================================
 wait_for_wallet_funder() {
     local suite=$1
-    for i in $(seq 1 60); do
+    # Eight concurrent stacks can make the initial 445-block funding job take
+    # more than five minutes on a loaded host. Keep the readiness check bounded
+    # but allow ten minutes before declaring infrastructure failure.
+    for i in $(seq 1 120); do
         local container_id
-        container_id=$(compose_cmd "$suite" ps -q wallet-funder 2>/dev/null | tail -n1 || true)
+        container_id=$(compose_cmd "$suite" ps -aq wallet-funder 2>/dev/null | tail -n1 || true)
         if [ -n "${container_id}" ]; then
             local state
             state=$(docker inspect -f '{{.State.Status}} {{.State.ExitCode}}' "${container_id}" 2>/dev/null | head -n1 || true)
@@ -591,11 +594,13 @@ wait_for_jam_makers() {
     for i in $(seq 1 30); do
         if compose_cmd "$suite" exec -T jam-maker1 \
             sh -c "timeout 5 bash -c '</dev/tcp/127.0.0.1/80'" 2>/dev/null; then
-            break
+            sleep 30
+            return 0
         fi
         sleep 5
     done
-    sleep 30
+    log_error "[$suite] JAM makers did not become ready"
+    return 1
 }
 
 # =============================================================================
@@ -762,7 +767,9 @@ run_suite_e2e() {
 
     log_suite "Starting: E2E Tests ($suite)"
     local rc=0
-    {
+    set +e
+    (
+        set -e
         generate_override "$suite"
         cleanup_suite "$suite"
         compose_cmd "$suite" --profile e2e up -d
@@ -803,7 +810,9 @@ run_suite_e2e() {
             -lv --timeout=300 \
             --cov --cov-report=term-missing \
             maker/tests/integration/ jmwallet/tests/ directory_server/tests/
-    } > "$log" 2>&1 || rc=$?
+    ) > "$log" 2>&1
+    rc=$?
+    set -e
     cleanup_suite "$suite"
     return $rc
 }
@@ -819,7 +828,9 @@ run_suite_tumbler() {
 
     log_suite "Starting: Tumbler E2E Tests ($suite)"
     local rc=0
-    {
+    set +e
+    (
+        set -e
         generate_override "$suite"
         cleanup_suite "$suite"
         JMWALLETD_IMAGE="joinmarket-ng-jmwalletd:latest" \
@@ -852,7 +863,9 @@ run_suite_tumbler() {
             --tb=long -rA \
             --cov --cov-report=term-missing \
             tests/e2e/test_tumbler_*.py
-    } > "$log" 2>&1 || rc=$?
+    ) > "$log" 2>&1
+    rc=$?
+    set -e
     if [ "$rc" -ne 0 ]; then
         # On failure, dump container logs for the most relevant services
         # (walletd + makers + bitcoin) so we can diagnose tumbler stalls
@@ -884,7 +897,9 @@ run_suite_playwright() {
 
     log_suite "Starting: Playwright Tests ($suite)"
     local rc=0
-    {
+    set +e
+    (
+        set -e
         if ! command -v node >/dev/null 2>&1; then
             log_warning "Node.js not found -- skipping Playwright tests"
             exit 0
@@ -902,18 +917,25 @@ run_suite_playwright() {
         wait_for_wallet_funder "$suite"
 
         # Wait for jam-playwright (HTTPS, self-signed cert)
+        local jam_playwright_ready=0
         for i in $(seq 1 60); do
             if curl -skf "https://127.0.0.1:${jam_pw_port}/api/v1/session" >/dev/null 2>&1; then
+                jam_playwright_ready=1
                 break
             fi
             sleep 2
         done
+        if [ "$jam_playwright_ready" -ne 1 ]; then
+            log_error "JAM Playwright API not ready on port ${jam_pw_port}"
+            return 1
+        fi
 
         # Wait for at least 4 maker offers to appear in the orderbook so that
         # the collaborative-send playwright tests have enough counterparties.
         # The maker minimum the JAM UI accepts is 4. We poll the orderbook
         # watcher and time out after ~3 minutes.
         local obwatch_port=$(host_port "$suite" obwatch)
+        local makers_ready=0
         for i in $(seq 1 90); do
             local n_offers
             n_offers=$(curl -sf "http://127.0.0.1:${obwatch_port}/orderbook.json" 2>/dev/null \
@@ -921,10 +943,15 @@ run_suite_playwright() {
                 || echo 0)
             if [ "${n_offers:-0}" -ge 4 ]; then
                 log_info "Orderbook has ${n_offers} offers (>=4), proceeding"
+                makers_ready=1
                 break
             fi
             sleep 2
         done
+        if [ "$makers_ready" -ne 1 ]; then
+            log_error "Orderbook did not reach 4 offers on port ${obwatch_port}"
+            return 1
+        fi
 
         local PW_DIR="${PROJECT_ROOT}/tests/playwright"
         (cd "$PW_DIR" && npm install && npx playwright install chromium)
@@ -944,7 +971,9 @@ run_suite_playwright() {
         COMPOSE_PROJECT_NAME="${PROJECT_PREFIX}-${suite}" \
         NODE_TLS_REJECT_UNAUTHORIZED=0 \
         bash -c "cd '${PW_DIR}' && npx playwright test"
-    } > "$log" 2>&1 || rc=$?
+    ) > "$log" 2>&1
+    rc=$?
+    set -e
     cleanup_suite "$suite"
     return $rc
 }
@@ -958,7 +987,9 @@ run_suite_jmwallet() {
 
     log_suite "Starting: jmwallet Docker Tests ($suite)"
     local rc=0
-    {
+    set +e
+    (
+        set -e
         generate_override "$suite"
         cleanup_suite "$suite"
         compose_cmd "$suite" up -d bitcoin
@@ -979,7 +1010,9 @@ run_suite_jmwallet() {
             -lv --timeout=300 \
             --cov=jmwallet --cov-report=term-missing \
             jmwallet/tests/
-    } > "$log" 2>&1 || rc=$?
+    ) > "$log" 2>&1
+    rc=$?
+    set -e
     cleanup_suite "$suite"
     return $rc
 }
@@ -993,7 +1026,9 @@ run_suite_reference_interop() {
 
     log_suite "Starting: Reference Interop Tests ($suite)"
     local rc=0
-    {
+    set +e
+    (
+        set -e
         generate_override "$suite"
         cleanup_suite "$suite"
         compose_cmd "$suite" --profile reference up -d
@@ -1020,7 +1055,9 @@ run_suite_reference_interop() {
             -lv --timeout=300 --reruns=1 --reruns-delay=10 \
             --cov --cov-report=term-missing \
             tests/e2e/test_our_maker_reference_taker.py
-    } > "$log" 2>&1 || rc=$?
+    ) > "$log" 2>&1
+    rc=$?
+    set -e
     cleanup_suite "$suite"
     return $rc
 }
@@ -1034,7 +1071,9 @@ run_suite_reference_legacy() {
 
     log_suite "Starting: Reference Legacy Tests ($suite)"
     local rc=0
-    {
+    set +e
+    (
+        set -e
         generate_override "$suite"
         cleanup_suite "$suite"
         compose_cmd "$suite" --profile reference up -d
@@ -1061,7 +1100,9 @@ run_suite_reference_legacy() {
             -lv --timeout=300 --reruns=1 --reruns-delay=10 \
             --cov --cov-report=term-missing \
             tests/e2e/test_reference_coinjoin.py tests/e2e/test_reference_bond_import.py
-    } > "$log" 2>&1 || rc=$?
+    ) > "$log" 2>&1
+    rc=$?
+    set -e
     cleanup_suite "$suite"
     return $rc
 }
@@ -1076,7 +1117,9 @@ run_suite_neutrino_functional() {
 
     log_suite "Starting: Neutrino Functional Tests ($suite)"
     local rc=0
-    {
+    set +e
+    (
+        set -e
         generate_override "$suite"
         cleanup_suite "$suite"
         compose_cmd "$suite" --profile neutrino up -d
@@ -1100,7 +1143,9 @@ run_suite_neutrino_functional() {
             -lv --timeout=300 --reruns=1 --reruns-delay=10 \
             --cov --cov-report=term-missing \
             tests/
-    } > "$log" 2>&1 || rc=$?
+    ) > "$log" 2>&1
+    rc=$?
+    set -e
     cleanup_suite "$suite"
     return $rc
 }
@@ -1115,7 +1160,9 @@ run_suite_neutrino_coinjoin() {
 
     log_suite "Starting: Neutrino CoinJoin Tests ($suite)"
     local rc=0
-    {
+    set +e
+    (
+        set -e
         generate_override "$suite"
         cleanup_suite "$suite"
         compose_cmd "$suite" --profile neutrino up -d
@@ -1142,7 +1189,9 @@ run_suite_neutrino_coinjoin() {
             -lv --timeout=300 --reruns=2 --reruns-delay=15 \
             --cov --cov-report=term-missing \
             tests/
-    } > "$log" 2>&1 || rc=$?
+    ) > "$log" 2>&1
+    rc=$?
+    set -e
     cleanup_suite "$suite"
     return $rc
 }
@@ -1157,7 +1206,9 @@ run_suite_neutrino_reference() {
 
     log_suite "Starting: Neutrino Reference Tests ($suite)"
     local rc=0
-    {
+    set +e
+    (
+        set -e
         generate_override "$suite"
         cleanup_suite "$suite"
         compose_cmd "$suite" --profile reference --profile neutrino up -d
@@ -1186,7 +1237,9 @@ run_suite_neutrino_reference() {
             -lv --timeout=900 --reruns=1 --reruns-delay=10 \
             --cov --cov-report=term-missing \
             tests/
-    } > "$log" 2>&1 || rc=$?
+    ) > "$log" 2>&1
+    rc=$?
+    set -e
     cleanup_suite "$suite"
     return $rc
 }
@@ -1200,20 +1253,28 @@ run_suite_reference_maker() {
 
     log_suite "Starting: Reference Maker Tests ($suite)"
     local rc=0
-    {
+    set +e
+    (
+        set -e
         generate_override "$suite"
         cleanup_suite "$suite"
         compose_cmd "$suite" --profile reference-maker up -d
 
         # reference-maker uses bitcoin-jam on port 18445
+        local bitcoin_jam_ready=0
         for i in $(seq 1 60); do
             if compose_cmd "$suite" exec -T bitcoin-jam \
                 bitcoin-cli -chain=regtest -rpcport=18445 \
                 -rpcuser=test -rpcpassword=test getblockchaininfo >/dev/null 2>&1; then
+                bitcoin_jam_ready=1
                 break
             fi
             sleep 2
         done
+        if [ "$bitcoin_jam_ready" -ne 1 ]; then
+            log_error "Bitcoin JAM RPC did not become ready for suite ${suite}"
+            return 1
+        fi
 
         wait_for_port "$dir_port" "Directory ($suite)"
         wait_for_tor "$suite"
@@ -1230,7 +1291,9 @@ run_suite_reference_maker() {
             -lv --timeout=300 --reruns=1 --reruns-delay=10 \
             --cov --cov-report=term-missing \
             tests/
-    } > "$log" 2>&1 || rc=$?
+    ) > "$log" 2>&1
+    rc=$?
+    set -e
     cleanup_suite "$suite"
     return $rc
 }

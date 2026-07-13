@@ -52,8 +52,9 @@ def get_compose_override_file() -> Path | None:
 
     Resolution order:
     1. ``JM_COMPOSE_OVERRIDE_FILE`` environment variable
-    2. Derived from ``COMPOSE_PROJECT_NAME=jmpt-<suite>`` as
-       ``tmp/parallel-tests/docker-compose.<suite>.override.yml``
+    2. Derived from ``COMPOSE_PROJECT_NAME=jmpt-i<instance>-<suite>`` as
+       ``tmp/parallel-tests/i<instance>/docker-compose.<suite>.override.yml``
+    3. Legacy ``COMPOSE_PROJECT_NAME=jmpt-<suite>`` layout
 
     Returns ``None`` when no valid override file is found.
     """
@@ -64,6 +65,19 @@ def get_compose_override_file() -> Path | None:
             return override_path
 
     project = os.environ.get("COMPOSE_PROJECT_NAME", "")
+    if project.startswith("jmpt-i"):
+        instance_and_suite = project.removeprefix("jmpt-i")
+        instance, separator, suite = instance_and_suite.partition("-")
+        if separator and instance.isdigit() and suite:
+            derived_override = (
+                get_compose_file().parent
+                / "tmp"
+                / "parallel-tests"
+                / f"i{instance}"
+                / f"docker-compose.{suite}.override.yml"
+            )
+            if derived_override.exists():
+                return derived_override
     if project.startswith("jmpt-"):
         suite = project.removeprefix("jmpt-")
         derived_override = (
