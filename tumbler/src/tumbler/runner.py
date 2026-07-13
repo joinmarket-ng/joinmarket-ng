@@ -77,7 +77,7 @@ class RunnerContext:
     taker_factory: _TakerFactory
     maker_factory: _MakerFactory | None = None
     # Callback invoked right after ``save_plan`` so the daemon can push
-    # websocket updates to the UI. Not called for cancellation-only saves.
+    # websocket updates to the UI.
     on_state_changed: Callable[[Plan], None] | None = None
     # Override for tests: replacement for ``asyncio.sleep``.
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
@@ -240,33 +240,69 @@ class TumbleRunner:
         force-cancelled so ``/stop`` cannot hang indefinitely.
         """
         self.request_stop()
-        await self._teardown_active()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(grace_period, 0.0)
+        teardown_task = asyncio.create_task(self._teardown_active())
 
         try:
-            # Shield so a grace-period timeout cancels only the wait, not the
-            # task; we then cancel the task explicitly for predictable control.
-            return await asyncio.wait_for(asyncio.shield(task), timeout=grace_period)
+            remaining = max(0.0, deadline - loop.time())
+            await asyncio.wait_for(asyncio.shield(teardown_task), timeout=remaining)
+            remaining = max(0.0, deadline - loop.time())
+            return await asyncio.wait_for(asyncio.shield(task), timeout=remaining)
         except TimeoutError:
             logger.warning(
                 "tumble task did not stop within {}s grace period; force-cancelling",
                 grace_period,
             )
+        except asyncio.CancelledError:
+            # The stop caller may disappear while shutdown is in progress.
+            # Cancel both child operations, briefly reap them, and persist a
+            # terminal state only when the actual runner has stopped.
+            teardown_task.cancel()
             task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await task
-        except (asyncio.CancelledError, Exception):
-            # Task ended with a cancellation/error; fall through and normalize
-            # the plan's terminal status below.
+            cancel_timeout = max(min(grace_period, 5.0), 0.1)
+            await asyncio.wait({teardown_task, task}, timeout=cancel_timeout)
+            if task.done():
+                self._record_cancelled_plan()
+            raise
+        except Exception:
+            # The runner ended with an error. Normalize its plan below.
             pass
 
-        # The task was force-cancelled or errored without setting a terminal
-        # plan status (``_run_one_phase`` only marks the *phase* CANCELLED on
-        # cancellation). Record the plan as CANCELLED unless it already reached
-        # a terminal state.
+        teardown_task.cancel()
+        task.cancel()
+        # A task can suppress cancellation. Bound this second wait as well so
+        # the stop endpoint never hangs after issuing force-cancel.
+        cancel_timeout = max(min(grace_period, 5.0), 0.1)
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=cancel_timeout)
+        except asyncio.CancelledError:
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                task.cancel()
+                await asyncio.wait({task}, timeout=cancel_timeout)
+                if task.done():
+                    self._record_cancelled_plan()
+                raise
+        except TimeoutError as exc:
+            raise RuntimeError("tumble task ignored force-cancellation") from exc
+        except Exception:
+            pass
+
+        if not task.done():
+            raise RuntimeError("tumble task did not terminate after cancellation")
+        self._record_cancelled_plan()
+        return self.plan
+
+    def _record_cancelled_plan(self) -> None:
+        """Persist cancellation after the underlying runner has terminated."""
         if self.plan.status not in (PlanStatus.COMPLETED, PlanStatus.FAILED):
+            current = self.plan.current()
+            if current is not None and current.status == PhaseStatus.RUNNING:
+                current.status = PhaseStatus.CANCELLED
+                current.finished_at = datetime.now(UTC)
             self.plan.status = PlanStatus.CANCELLED
             self._persist()
-        return self.plan
 
     # ------------------------------------------------------------ phase impl
 

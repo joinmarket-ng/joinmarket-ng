@@ -477,11 +477,12 @@ async def start_plan(
     state.tumble_plan_wallet = state.wallet_name
     state.activate_coinjoin_state(CoinjoinState.TUMBLER_RUNNING)
 
-    async def _run() -> None:
+    async def _run() -> Plan:
         try:
-            await runner.run()
+            return await runner.run()
         except Exception:
             logger.exception("tumbler runner crashed")
+            raise
         finally:
             state.activate_coinjoin_state(CoinjoinState.NOT_RUNNING)
             state.tumble_runner = None

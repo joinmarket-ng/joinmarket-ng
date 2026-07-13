@@ -13,6 +13,7 @@ machine deterministically, focusing on:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from pathlib import Path
 from typing import Any
 
@@ -707,6 +708,109 @@ class TestRunnerCancellation:
 
         result = await asyncio.wait_for(runner.stop_and_wait(task), timeout=2.0)
         assert result.status == PlanStatus.COMPLETED
+
+    async def test_stop_grace_period_includes_hanging_teardown(self, tmp_path: Path) -> None:
+        plan = _plan(tmp_path)
+        started = asyncio.Event()
+
+        class HangingStopTaker(FakeTaker):
+            async def do_coinjoin(self, *args: Any, **kwargs: Any) -> str | None:
+                started.set()
+                await asyncio.sleep(3600)
+                return None
+
+            async def stop(self, close_wallet: bool = True) -> None:
+                await asyncio.sleep(3600)
+
+        async def make_taker(phase: Any) -> HangingStopTaker:
+            return HangingStopTaker(phase)
+
+        runner = TumbleRunner(plan, _ctx(tmp_path, taker_factory=make_taker))
+        task = asyncio.create_task(runner.run())
+        await asyncio.wait_for(started.wait(), timeout=1.0)
+
+        result = await asyncio.wait_for(runner.stop_and_wait(task, grace_period=0.1), timeout=1.0)
+
+        assert result.status == PlanStatus.CANCELLED
+        assert task.done()
+        assert load_plan("RunnerTest", tmp_path).status == PlanStatus.CANCELLED
+
+    async def test_cancelling_stop_persists_cancelled_after_runner_stops(
+        self, tmp_path: Path
+    ) -> None:
+        plan = _plan(tmp_path)
+        started = asyncio.Event()
+
+        async def make_taker(phase: Any) -> FakeTaker:
+            t = FakeTaker(phase)
+
+            async def hang(*args: Any, **kwargs: Any) -> str | None:
+                started.set()
+                await asyncio.sleep(3600)
+                return None
+
+            t.do_coinjoin = hang  # type: ignore[assignment]
+            return t
+
+        runner = TumbleRunner(plan, _ctx(tmp_path, taker_factory=make_taker))
+        task = asyncio.create_task(runner.run())
+        await asyncio.wait_for(started.wait(), timeout=1.0)
+        stop_task = asyncio.create_task(runner.stop_and_wait(task, grace_period=30.0))
+        await asyncio.sleep(0)
+        stop_task.cancel()
+
+        with contextlib.suppress(asyncio.CancelledError):
+            await stop_task
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+        persisted = load_plan("RunnerTest", tmp_path)
+        assert persisted.status == PlanStatus.CANCELLED
+        assert persisted.phases[0].status == PhaseStatus.CANCELLED
+
+    async def test_cancelling_stop_keeps_running_state_if_runner_ignores_cancel(
+        self, tmp_path: Path
+    ) -> None:
+        plan = _plan(tmp_path)
+
+        async def make_taker(phase: Any) -> FakeTaker:
+            return FakeTaker(phase)
+
+        runner = TumbleRunner(plan, _ctx(tmp_path, taker_factory=make_taker))
+        plan.status = PlanStatus.RUNNING
+        runner._persist()
+        started = asyncio.Event()
+        cancellation_seen = asyncio.Event()
+        release = asyncio.Event()
+
+        async def stubborn_runner() -> Plan:
+            started.set()
+            while not release.is_set():
+                try:
+                    await asyncio.sleep(3600)
+                except asyncio.CancelledError:
+                    cancellation_seen.set()
+            return plan
+
+        task = asyncio.create_task(stubborn_runner())
+        await started.wait()
+        stop_task = asyncio.create_task(runner.stop_and_wait(task, grace_period=1.0))
+        await asyncio.wait_for(cancellation_seen.wait(), timeout=2.0)
+        stop_task.cancel()
+
+        try:
+            try:
+                await stop_task
+            except asyncio.CancelledError:
+                pass
+            else:
+                raise AssertionError("stop cancellation was not propagated")
+            assert not task.done()
+            assert load_plan("RunnerTest", tmp_path).status == PlanStatus.RUNNING
+        finally:
+            release.set()
+            task.cancel()
+            await asyncio.wait_for(task, timeout=1.0)
 
 
 class TestRunnerMakerPhase:
