@@ -229,12 +229,43 @@ class TumbleRunner:
         """Signal the runner to stop between phases (and interrupt the active one)."""
         self._stop_requested.set()
 
-    async def stop_and_wait(self, task: asyncio.Task[Plan]) -> Plan:
-        """Request a stop and await the underlying task's completion."""
+    async def stop_and_wait(self, task: asyncio.Task[Plan], grace_period: float = 30.0) -> Plan:
+        """Request a stop and await the underlying task's completion.
+
+        Signals the cooperative stop and tears down active taker/maker
+        resources (closing directory connections, which unblocks most in-flight
+        network I/O). Then waits up to ``grace_period`` seconds for the task to
+        wind down on its own. If it does not -- e.g. a phase is stuck deep in a
+        network exchange that does not poll the stop event -- the task is
+        force-cancelled so ``/stop`` cannot hang indefinitely.
+        """
         self.request_stop()
         await self._teardown_active()
-        with contextlib.suppress(asyncio.CancelledError, Exception):
-            return await task
+
+        try:
+            # Shield so a grace-period timeout cancels only the wait, not the
+            # task; we then cancel the task explicitly for predictable control.
+            return await asyncio.wait_for(asyncio.shield(task), timeout=grace_period)
+        except TimeoutError:
+            logger.warning(
+                "tumble task did not stop within {}s grace period; force-cancelling",
+                grace_period,
+            )
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+        except (asyncio.CancelledError, Exception):
+            # Task ended with a cancellation/error; fall through and normalize
+            # the plan's terminal status below.
+            pass
+
+        # The task was force-cancelled or errored without setting a terminal
+        # plan status (``_run_one_phase`` only marks the *phase* CANCELLED on
+        # cancellation). Record the plan as CANCELLED unless it already reached
+        # a terminal state.
+        if self.plan.status not in (PlanStatus.COMPLETED, PlanStatus.FAILED):
+            self.plan.status = PlanStatus.CANCELLED
+            self._persist()
         return self.plan
 
     # ------------------------------------------------------------ phase impl

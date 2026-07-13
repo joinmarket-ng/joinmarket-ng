@@ -655,6 +655,59 @@ class TestRunnerCancellation:
         assert result.status == PlanStatus.CANCELLED
         assert result.phases[0].status == PhaseStatus.CANCELLED
 
+    async def test_stop_and_wait_force_cancels_stuck_phase(self, tmp_path: Path) -> None:
+        """``stop_and_wait`` must not hang when a phase is stuck deep in a
+        network exchange that never polls the stop event. After the grace
+        period it force-cancels the task and marks the plan CANCELLED.
+        """
+        plan = _plan(tmp_path)
+        started = asyncio.Event()
+
+        async def make_taker(phase: Any) -> FakeTaker:
+            t = FakeTaker(phase)
+
+            async def hang(
+                amount: int,
+                destination: str,
+                mixdepth: int = 0,
+                counterparty_count: int | None = None,
+                exclude_nicks: set[str] | None = None,
+            ) -> str | None:
+                started.set()
+                # Stuck forever; does not observe the cooperative stop event.
+                await asyncio.sleep(3600)
+                return None
+
+            t.do_coinjoin = hang  # type: ignore[assignment]
+            return t
+
+        runner = TumbleRunner(plan, _ctx(tmp_path, taker_factory=make_taker))
+        task = asyncio.create_task(runner.run())
+        await asyncio.wait_for(started.wait(), timeout=1.0)
+
+        result = await asyncio.wait_for(runner.stop_and_wait(task, grace_period=0.1), timeout=2.0)
+
+        assert result.status == PlanStatus.CANCELLED
+        assert task.done()
+        # The stuck phase is recorded as cancelled, not left RUNNING.
+        assert plan.phases[0].status == PhaseStatus.CANCELLED
+
+    async def test_stop_and_wait_returns_plan_when_task_already_done(self, tmp_path: Path) -> None:
+        """If the task already finished, ``stop_and_wait`` returns its plan
+        as-is without forcing a status change."""
+        plan = _plan(tmp_path)
+
+        async def make_taker(phase: Any) -> FakeTaker:
+            return FakeTaker(phase)
+
+        runner = TumbleRunner(plan, _ctx(tmp_path, taker_factory=make_taker))
+        task = asyncio.create_task(runner.run())
+        await asyncio.wait_for(task, timeout=2.0)
+        assert task.result().status == PlanStatus.COMPLETED
+
+        result = await asyncio.wait_for(runner.stop_and_wait(task), timeout=2.0)
+        assert result.status == PlanStatus.COMPLETED
+
 
 class TestRunnerMakerPhase:
     async def test_maker_phase_runs_until_duration(self, tmp_path: Path) -> None:
