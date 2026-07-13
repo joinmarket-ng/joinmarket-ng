@@ -1627,7 +1627,7 @@ def test_tui_script_uses_portable_backup_detection() -> None:
 
     On RaspiBlitz (BusyBox), 'find -printf' is not supported and would
     fail to detect backup files. The portable glob loop works on all
-    POSIX shells including BusyBox ash."""
+    Bash environments that use BusyBox utilities."""
     content = SCRIPT_PATH.read_text()
 
     # Must use bash glob loop for backup detection
@@ -1635,11 +1635,22 @@ def test_tui_script_uses_portable_backup_detection() -> None:
         "Must use portable bash glob for backup detection"
     )
 
-    # Must NOT use GNU-specific find -printf in the REST block (backup detection)
-    # Note: list_wallets() uses find -printf but works on Raspiblitz
-    rest_block = content.split("REST)", 1)[1].split(";;", 1)[0]
-    assert "-printf" not in rest_block, (
-        "Must not use GNU find -printf in backup detection (not supported on BusyBox)"
+    # Must NOT use GNU-specific find -printf anywhere in the script
+    # (wallet listing had the same bug pattern as backup detection).
+    # Comment lines are excluded so the fix can be documented in-line.
+    code_lines = [
+        line for line in content.splitlines() if not line.lstrip().startswith("#")
+    ]
+    assert not any("-printf" in line for line in code_lines), (
+        "Must not use GNU find -printf (not supported on BusyBox)"
+    )
+
+    # Wallet listing must use the same portable glob approach
+    assert 'for _f in "$DATA_DIR"/wallets/*.mnemonic' in content, (
+        "Must use portable bash glob for wallet listing"
+    )
+    assert "shopt -s nullglob dotglob" in content, (
+        "Wallet glob must include dot-prefixed names and handle no matches"
     )
 
     # Must have BusyBox compatibility comment

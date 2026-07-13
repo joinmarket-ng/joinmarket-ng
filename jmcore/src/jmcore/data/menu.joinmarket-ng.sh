@@ -52,7 +52,9 @@ fi
 #   - Shell nesting is prevented via JM_NG_SHELL_ACTIVE environment variable:
 #     When the user exits jm-ng while already inside the JM-NG shell
 #     (e.g. ESC from a restarted TUI), the variable is already set and we
-#     exit directly to the Raspiblitz menu instead of starting another shell.
+#     return to the existing JM-NG shell instead of starting another one.
+#     Pressing 'B' (Exit to RaspiBlitz Menu) in that situation shows an
+#     info message; the user types 'exit' to reach the RaspiBlitz menu.
 #
 # On Standalone:
 #   - We exit normally to the shell, as the user typically launches jm-ng
@@ -338,9 +340,18 @@ set_config_value() {
 }
 
 # Helper: List .mnemonic files in wallets dir
-list_wallets() {
-    find "$DATA_DIR/wallets" -maxdepth 1 -name '*.mnemonic' -type f -printf '%f\n' 2>/dev/null | sort
-}
+# Uses a bash glob instead of GNU 'find -printf' for portability
+# (BusyBox compatibility, see issue #558).
+list_wallets() (
+    local _f _names=
+    # Preserve find's handling of dot-prefixed wallet names without leaking
+    # shell options into callers.
+    shopt -s nullglob dotglob
+    for _f in "$DATA_DIR"/wallets/*.mnemonic; do
+        _names="${_names}$(basename "$_f")"$'\n'
+    done
+    printf '%s' "$_names" | sort
+)
 
 # Helper: Prompt for a parameter using whiptail inputbox.
 # Usage: prompt_param "Title" "Prompt text" "default_value"
