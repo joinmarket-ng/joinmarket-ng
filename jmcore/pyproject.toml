@@ -47,6 +47,11 @@ dev = [
     "pytest-rerunfailures>=14.0",
     "ruff>=0.1.0",
     "mypy>=1.7.0",
+    # Client used by tests/e2e/test_tx_monitor_e2e.py. jmcore is installed in
+    # every CI job's dev extras, so this guarantees the dependency is present
+    # regardless of which other components a job scopes itself to; the test
+    # file is always collected via the shared root tests/ testpath.
+    "websockets>=14.0",
 ]
 
 [project.scripts]
