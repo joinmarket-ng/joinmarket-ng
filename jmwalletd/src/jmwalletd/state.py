@@ -70,6 +70,15 @@ class DaemonState:
         self._taker_task: asyncio.Task[None] | None = None
         self._wallet_sync_task: asyncio.Task[None] | None = None
 
+        # Background transaction monitor: pushes a WebSocket notification for
+        # every wallet transaction (deposits, coinjoins, sends), not just
+        # direct-send (issue #560). ``_tx_broadcast_notified`` records txids
+        # whose first-seen (mempool) notification was already emitted -- by the
+        # direct-send path or the monitor -- so the two never duplicate it.
+        self._tx_monitor_task: asyncio.Task[None] | None = None
+        self._tx_monitor_ready: asyncio.Event | None = None
+        self._tx_broadcast_notified: set[str] = set()
+
         # Tumbler runtime. ``tumble_runner`` is a ``tumbler.runner.TumbleRunner``
         # and ``tumble_task`` is the task running ``runner.run()``. They are kept
         # as dedicated fields (rather than reusing ``_taker_ref`` / ``_taker_task``)
@@ -165,16 +174,16 @@ class DaemonState:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._maker_task
 
-        # Stop any in-flight tumbler (cooperative, then hard-cancel the task).
-        if self.tumble_runner is not None:
+        # Stop any in-flight tumbler through the runner's bounded lifecycle so
+        # the persisted plan reaches a truthful terminal state before the
+        # wallet service is discarded.
+        if self.tumble_runner is not None and self.tumble_task is not None:
             try:
-                self.tumble_runner.request_stop()
+                await self.tumble_runner.stop_and_wait(self.tumble_task)
             except Exception:
-                logger.exception("Error requesting tumbler stop during wallet lock")
-        if self.tumble_task is not None and not self.tumble_task.done():
-            self.tumble_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await self.tumble_task
+                logger.exception("Error stopping tumbler during wallet lock")
+                if not self.tumble_task.done():
+                    raise
 
         # Stop the taker if running.
         if self._taker_ref is not None:
@@ -192,6 +201,12 @@ class DaemonState:
             self._wallet_sync_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._wallet_sync_task
+
+        # Stop the background transaction monitor.
+        if self._tx_monitor_task is not None and not self._tx_monitor_task.done():
+            self._tx_monitor_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._tx_monitor_task
 
         # Stop any background rescan-tracking task. This only stops the
         # daemon-side progress tracking; a rescan already accepted by Bitcoin
@@ -216,6 +231,9 @@ class DaemonState:
         self._taker_task = None
         self._wallet_sync_task = None
         self._rescan_task = None
+        self._tx_monitor_task = None
+        self._tx_monitor_ready = None
+        self._tx_broadcast_notified.clear()
         self.rescanning = False
         self.rescan_progress = 0.0
         self.tumble_runner = None
@@ -254,6 +272,88 @@ class DaemonState:
             except asyncio.QueueFull:
                 dead.add(q)
         self._ws_clients -= dead
+
+    def mark_tx_broadcast(self, txid: str) -> None:
+        """Record that a first-seen WebSocket notification was emitted for ``txid``.
+
+        Lets the direct-send path and the background monitor cooperate so a
+        transaction is announced at most once when it first appears.
+        """
+        if txid:
+            self._tx_broadcast_notified.add(txid)
+
+    def start_tx_monitor(self, *, baseline_existing: bool = True) -> None:
+        """Start the background transaction monitor for the loaded wallet.
+
+        Idempotent (a running monitor is left in place). Does nothing when no
+        wallet is loaded or the backend cannot enumerate transactions (e.g. a
+        light client without that capability), in which case WebSocket tx
+        notifications are limited to the inline direct-send broadcast.
+        """
+        ws = self.wallet_service
+        if ws is None:
+            return
+        if not getattr(ws.backend, "supports_tx_enumeration", False):
+            logger.info(
+                "Backend does not support transaction enumeration; "
+                "WebSocket transaction notifications are limited to direct-send."
+            )
+            return
+        if self._tx_monitor_task is not None and not self._tx_monitor_task.done():
+            return
+
+        from jmwalletd.tx_monitor import run_tx_monitor
+
+        self._tx_broadcast_notified.clear()
+        self._tx_monitor_ready = asyncio.Event()
+        self._tx_monitor_task = asyncio.create_task(
+            run_tx_monitor(
+                self,
+                ready=self._tx_monitor_ready,
+                initialization_task=self._wallet_sync_task,
+                baseline_existing=baseline_existing,
+            )
+        )
+
+    async def wait_tx_monitor_ready(self, timeout: float = 30.0) -> bool:
+        """Wait briefly for the monitor's silent history baseline.
+
+        Lifecycle endpoints call this before returning so activity initiated by
+        the client cannot land in the baseline window. A backend outage is
+        bounded by ``timeout`` and reported to the caller as not ready.
+        """
+        ready = self._tx_monitor_ready
+        if ready is None:
+            return True
+        ready_wait = asyncio.create_task(ready.wait())
+        wait_for: set[asyncio.Future[Any]] = {ready_wait}
+        monitor_task = self._tx_monitor_task
+        if monitor_task is not None:
+            wait_for.add(monitor_task)
+        try:
+            done, _pending = await asyncio.wait(
+                wait_for,
+                timeout=timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            if not ready_wait.done():
+                ready_wait.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await ready_wait
+
+        if ready.is_set():
+            return True
+        if monitor_task is not None and monitor_task in done:
+            with contextlib.suppress(asyncio.CancelledError):
+                exc = monitor_task.exception()
+                if exc is not None:
+                    logger.warning("Transaction monitor stopped before baseline: {}", exc)
+            return False
+        if not done:
+            logger.warning("Transaction monitor baseline was not ready within {}s", timeout)
+            return False
+        return ready.is_set()
 
     def register_ws_client(self) -> asyncio.Queue[str]:
         """Register a new WebSocket client and return its message queue."""

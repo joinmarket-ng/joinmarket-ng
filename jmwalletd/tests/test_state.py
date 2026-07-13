@@ -178,6 +178,25 @@ class TestDaemonState:
         assert daemon_state.coinjoin_state == CoinjoinState.NOT_RUNNING
 
     @pytest.mark.asyncio
+    async def test_lock_wallet_uses_tumbler_stop_lifecycle(
+        self, daemon_state: DaemonState, mock_wallet_service: MagicMock
+    ) -> None:
+        daemon_state.wallet_service = mock_wallet_service
+        daemon_state.wallet_name = "w.jmdat"
+        runner = MagicMock()
+        runner.stop_and_wait = AsyncMock()
+        task = MagicMock()
+        task.done.return_value = True
+        daemon_state.tumble_runner = runner
+        daemon_state.tumble_task = task
+
+        await daemon_state.lock_wallet()
+
+        runner.stop_and_wait.assert_awaited_once_with(task)
+        assert daemon_state.tumble_runner is None
+        assert daemon_state.tumble_task is None
+
+    @pytest.mark.asyncio
     async def test_lock_wallet_stops_wallet_sync_task(
         self, daemon_state: DaemonState, mock_wallet_service: MagicMock
     ) -> None:

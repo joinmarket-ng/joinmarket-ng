@@ -107,7 +107,10 @@ async def direct_send(
     # Build the txinfo response.
     txinfo = _build_txinfo(tx_result)
 
-    # Notify WebSocket clients about the transaction.
+    # Notify WebSocket clients about the transaction immediately, and mark it
+    # so the background transaction monitor does not emit a duplicate
+    # first-seen notification for the same txid (it still reports confirmation).
+    state.mark_tx_broadcast(txinfo.txid)
     state.broadcast_ws({"txid": txinfo.txid, "txdetails": txinfo.model_dump()})
 
     return DirectSendResponse(txinfo=txinfo)
@@ -359,7 +362,26 @@ async def stop_maker(
 
 
 def _build_txinfo(tx_result: Any) -> TxInfo:
-    """Convert a transaction result from jmwallet into a TxInfo response model."""
+    """Convert a transaction result from jmwallet into a TxInfo response model.
+
+    Prefers the shared hex-based builder (single source of truth for the
+    ``txdetails`` shape, also used by the transaction monitor); falls back to
+    the result's structured inputs/outputs when no tx hex is available.
+    """
+    # DirectSendResult uses ``tx_hex``; fall back to ``hex`` for compat.
+    tx_hex = getattr(tx_result, "tx_hex", None) or getattr(tx_result, "hex", "")
+    if tx_hex:
+        try:
+            from jmwalletd.txinfo import build_txinfo_from_hex
+            from jmwalletd.wallet_ops import _get_network
+
+            network = _get_network()
+            return build_txinfo_from_hex(
+                tx_hex, network, txid=getattr(tx_result, "txid", None) or None
+            )
+        except Exception:
+            logger.debug("Falling back to structured txinfo build", exc_info=True)
+
     inputs = [
         TxInput(
             outpoint=inp.get("outpoint", ""),
@@ -378,9 +400,6 @@ def _build_txinfo(tx_result: Any) -> TxInfo:
         )
         for out in getattr(tx_result, "outputs", [])
     ]
-
-    # DirectSendResult uses ``tx_hex``; fall back to ``hex`` for compat.
-    tx_hex = getattr(tx_result, "tx_hex", None) or getattr(tx_result, "hex", "")
 
     return TxInfo(
         hex=tx_hex,

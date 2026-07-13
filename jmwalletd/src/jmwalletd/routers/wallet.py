@@ -21,6 +21,7 @@ from jmwalletd.deps import (
     require_wallet_match,
 )
 from jmwalletd.errors import (
+    BackendNotReady,
     InvalidCredentials,
     InvalidRequestFormat,
     InvalidToken,
@@ -106,6 +107,14 @@ def _get_running_tumble_schedule(
 router = APIRouter()
 
 
+async def _require_tx_monitor_ready(state: DaemonState, *, lock_on_failure: bool = False) -> None:
+    """Reject lifecycle completion while transaction history is unbaselined."""
+    if not await state.wait_tx_monitor_ready():
+        if lock_on_failure:
+            await state.lock_wallet()
+        raise BackendNotReady("Transaction monitor baseline is not ready.")
+
+
 async def _background_wallet_sync(state: DaemonState, walletname: str) -> None:
     """Run wallet sync in the background after unlock.
 
@@ -124,6 +133,7 @@ async def _background_wallet_sync(state: DaemonState, walletname: str) -> None:
         logger.info("Background wallet sync completed for {}", walletname)
     except Exception:
         logger.exception("Background wallet sync failed for {}", walletname)
+        raise
     finally:
         state.rescanning = False
         state.rescan_progress = 0.0
@@ -254,6 +264,11 @@ async def wallet_create(
     state.wallet_name = body.walletname
     state.wallet_password = body.password
 
+    # A generated wallet has no pre-existing history to suppress, so monitoring
+    # can become live without risking a readiness error after seed generation.
+    state.start_tx_monitor(baseline_existing=False)
+    await _require_tx_monitor_ready(state)
+
     tokens = state.token_authority.issue(body.walletname)
 
     return CreateWalletResponse(
@@ -303,6 +318,18 @@ async def wallet_recover(
     state.wallet_name = body.walletname
     state.wallet_password = body.password
 
+    state.start_tx_monitor()
+    try:
+        await _require_tx_monitor_ready(state, lock_on_failure=True)
+    except BackendNotReady:
+        # Recovery is a create operation. Remove the encrypted file so the
+        # caller can retry the same request after a transient backend outage.
+        try:
+            wallet_path.unlink(missing_ok=True)
+        except OSError:
+            logger.exception("Failed to roll back wallet recovery for {}", body.walletname)
+        raise
+
     tokens = state.token_authority.issue(body.walletname)
 
     return CreateWalletResponse(
@@ -334,6 +361,7 @@ async def wallet_unlock(
     if state.wallet_loaded and state.wallet_name == walletname:
         if body.password != state.wallet_password:
             raise InvalidCredentials()
+        await _require_tx_monitor_ready(state, lock_on_failure=True)
         tokens = state.token_authority.issue(walletname)
         return UnlockWalletResponse(
             walletname=walletname,
@@ -369,6 +397,10 @@ async def wallet_unlock(
     if state._wallet_sync_task is not None and not state._wallet_sync_task.done():
         state._wallet_sync_task.cancel()
     state._wallet_sync_task = asyncio.create_task(_background_wallet_sync(state, walletname))
+
+    # Start pushing WebSocket notifications for wallet transactions (issue #560).
+    state.start_tx_monitor()
+    await _require_tx_monitor_ready(state, lock_on_failure=True)
 
     tokens = state.token_authority.issue(walletname)
 

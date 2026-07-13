@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -232,7 +233,9 @@ class TestWalletCreate:
         self, mock_create: AsyncMock, client: TestClient, daemon_state: DaemonState
     ) -> None:
         mock_ws = MagicMock()
+        mock_ws.backend.supports_tx_enumeration = False
         mock_create.return_value = (mock_ws, "abandon " * 11 + "about")
+        daemon_state.start_tx_monitor = MagicMock(wraps=daemon_state.start_tx_monitor)
 
         resp = client.post(
             "/api/v1/wallet/create",
@@ -244,6 +247,7 @@ class TestWalletCreate:
         assert "token" in data
         assert "seedphrase" in data
         assert daemon_state.wallet_mnemonic == data["seedphrase"]
+        daemon_state.start_tx_monitor.assert_called_once_with(baseline_existing=False)
 
     @patch("jmwalletd.routers.wallet.create_wallet", new_callable=AsyncMock)
     def test_already_loaded_returns_401(
@@ -274,6 +278,7 @@ class TestWalletRecover:
         self, mock_recover: AsyncMock, client: TestClient, daemon_state: DaemonState
     ) -> None:
         mock_ws = MagicMock()
+        mock_ws.backend.supports_tx_enumeration = False
         seedphrase = "abandon " * 11 + "about"
         mock_recover.return_value = mock_ws
 
@@ -292,6 +297,36 @@ class TestWalletRecover:
         assert data["seedphrase"] == seedphrase
         assert daemon_state.wallet_mnemonic == seedphrase
 
+    @patch("jmwalletd.routers.wallet.recover_wallet", new_callable=AsyncMock)
+    def test_monitor_failure_rolls_back_wallet_file(
+        self, mock_recover: AsyncMock, client: TestClient, daemon_state: DaemonState
+    ) -> None:
+        wallet_path = daemon_state.wallets_dir / "retry.jmdat"
+        mock_ws = MagicMock()
+
+        async def recover(**_kwargs: Any) -> MagicMock:
+            wallet_path.touch()
+            return mock_ws
+
+        mock_recover.side_effect = recover
+        daemon_state.start_tx_monitor = MagicMock()
+        daemon_state.wait_tx_monitor_ready = AsyncMock(return_value=False)
+        seedphrase = "abandon " * 11 + "about"
+
+        resp = client.post(
+            "/api/v1/wallet/recover",
+            json={
+                "walletname": wallet_path.name,
+                "password": "pass",
+                "wallettype": "sw",
+                "seedphrase": seedphrase,
+            },
+        )
+
+        assert resp.status_code == 503
+        assert not wallet_path.exists()
+        assert daemon_state.wallet_loaded is False
+
 
 class TestWalletUnlock:
     @patch("jmwalletd.routers.wallet.open_wallet_with_mnemonic", new_callable=AsyncMock)
@@ -299,7 +334,9 @@ class TestWalletUnlock:
         self, mock_open_with_mnemonic: AsyncMock, client: TestClient, daemon_state: DaemonState
     ) -> None:
         (daemon_state.wallets_dir / "w.jmdat").touch()
-        mock_open_with_mnemonic.return_value = (MagicMock(), "abandon " * 11 + "about")
+        mock_ws = MagicMock()
+        mock_ws.backend.supports_tx_enumeration = False
+        mock_open_with_mnemonic.return_value = (mock_ws, "abandon " * 11 + "about")
 
         resp = client.post(
             "/api/v1/wallet/w.jmdat/unlock",
@@ -345,6 +382,27 @@ class TestWalletUnlock:
             json={"password": "wrong"},
         )
         assert resp.status_code == 401  # InvalidCredentials
+
+    def test_same_wallet_waits_for_monitor_baseline(
+        self, authed_client: tuple[TestClient, str]
+    ) -> None:
+        client, _ = authed_client
+        state = get_daemon_state()
+        state.wallet_password = "secret"
+        (state.wallets_dir / state.wallet_name).touch()
+
+        with patch.object(
+            state, "wait_tx_monitor_ready", AsyncMock(return_value=False)
+        ) as wait_ready:
+            resp = client.post(
+                f"/api/v1/wallet/{state.wallet_name}/unlock",
+                json={"password": "secret"},
+            )
+
+        assert resp.status_code == 503
+        assert resp.json()["message"] == "Transaction monitor baseline is not ready."
+        wait_ready.assert_awaited_once()
+        assert state.wallet_loaded is False
 
 
 class TestWalletLock:

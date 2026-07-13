@@ -9,7 +9,11 @@ Implements the reference JoinMarket WebSocket protocol:
 
 Notification types:
 - ``{"coinjoin_state": <int>}`` -- coinjoin state change.
-- ``{"txid": "...", "txdetails": {...}}`` -- new transaction.
+- ``{"txid": "...", "txdetails": {...}}`` -- a wallet transaction. Emitted for
+  every transaction that affects the wallet (external deposits, maker/taker
+  coinjoins, and sends), once when first seen in the mempool and again when it
+  first confirms (``txdetails.confirmations`` carries the count). Clients should
+  treat it as a signal to reload balances/UTXOs.
 """
 
 from __future__ import annotations

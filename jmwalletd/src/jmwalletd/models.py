@@ -309,6 +309,9 @@ class TxInfo(BaseModel):
     txid: str
     nLockTime: int = 0
     nVersion: int = 2
+    # Confirmation count when known (set by the transaction monitor: ``0`` while
+    # in the mempool, >=1 once mined). ``None`` for a freshly broadcast tx.
+    confirmations: int | None = None
 
 
 #: Hard upper bound for satoshi amounts: 21M BTC * 1e8 sat/BTC.
