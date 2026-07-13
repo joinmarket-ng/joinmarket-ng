@@ -274,7 +274,7 @@ class DirectoryClient:
         # itself. This prevents a race where _fetch_peerlist() and listen()
         # both read from self.connection concurrently and the listener
         # "steals" the response (see issue #259).
-        self._peerlist_inflight: asyncio.Queue[str] | None = None
+        self._peerlist_inflight: asyncio.Queue[str | None] | None = None
 
         # True only while listen_continuously()'s receive loop is actively
         # reading from the connection. _fetch_peerlist() uses this to decide
@@ -555,6 +555,8 @@ class DirectoryClient:
                         peerlist_str = await asyncio.wait_for(
                             self._peerlist_inflight.get(), timeout=receive_timeout
                         )
+                        if peerlist_str is None:
+                            raise DirectoryClientError("Connection lost while waiting for PEERLIST")
                         consecutive_errors = 0
                         got_first_response = True
                         chunks_received += 1
@@ -624,6 +626,8 @@ class DirectoryClient:
                     raise DirectoryClientError(
                         f"Connection lost while waiting for PEERLIST: {e}"
                     ) from e
+                except DirectoryClientError:
+                    raise
 
                 except Exception as e:
                     consecutive_errors += 1
@@ -1128,7 +1132,26 @@ class DirectoryClient:
 
     def stop(self) -> None:
         """Stop continuous listening."""
+        self._wake_peerlist_sink()
         self.running = False
+
+    def _wake_peerlist_sink(self) -> None:
+        """Wake a peerlist fetch whose receive path belongs to the listener."""
+        # Wake an in-flight sink-mode peerlist fetch immediately. Otherwise it
+        # has no reader on the raw connection and waits for its full timeout
+        # after this listener detects the disconnect.
+        peerlist_sink = self._peerlist_inflight
+        if peerlist_sink is not None:
+            peerlist_sink.put_nowait(None)
+
+    def _notify_disconnect(self) -> None:
+        """Run the optional disconnect callback without breaking cleanup."""
+        if self.on_disconnect is None:
+            return
+        try:
+            self.on_disconnect()
+        except Exception:
+            logger.exception("Directory disconnect callback failed")
 
     async def listen_continuously(self, request_orderbook: bool = True) -> None:
         """
@@ -1344,10 +1367,10 @@ class DirectoryClient:
                 break
             except Exception as e:
                 logger.error(f"Error in continuous listening: {e}")
-                if self.on_disconnect:
-                    self.on_disconnect()
+                self._notify_disconnect()
                 break
 
+        self._wake_peerlist_sink()
         self.running = False
         self._listen_loop_active = False
         logger.info(f"Stopped continuous listening on {self.host}:{self.port}")

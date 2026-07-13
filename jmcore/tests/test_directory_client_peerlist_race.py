@@ -204,6 +204,34 @@ async def test_fetch_peerlist_aborts_immediately_on_connection_loss() -> None:
 
 
 @pytest.mark.asyncio
+async def test_fetch_peerlist_sink_aborts_when_listener_disconnects() -> None:
+    """Sink mode must be woken when the listener that owns receive() exits."""
+    client = _make_client()
+    client._peerlist_timeout = 60.0
+    client.get_peerlist_with_features = AsyncMock(return_value=[])  # type: ignore[method-assign]
+    close_connection = asyncio.Event()
+
+    async def receive_eof() -> bytes:
+        await close_connection.wait()
+        return b""
+
+    client.connection.receive = AsyncMock(side_effect=receive_eof)  # type: ignore[union-attr]
+    listen_task = asyncio.create_task(client.listen_continuously(request_orderbook=False))
+    while not client._listen_loop_active:
+        await asyncio.sleep(0)
+
+    fetch_task = asyncio.create_task(client._fetch_peerlist())
+    while client._peerlist_inflight is None:
+        await asyncio.sleep(0)
+    close_connection.set()
+
+    await asyncio.wait_for(listen_task, timeout=1.0)
+    with pytest.raises(DirectoryClientError, match="Connection lost while waiting for PEERLIST"):
+        await asyncio.wait_for(fetch_task, timeout=1.0)
+    assert client._peerlist_inflight is None
+
+
+@pytest.mark.asyncio
 async def test_fetch_peerlist_aborts_on_oserror_connection_loss() -> None:
     """A system-level OSError bypassing our network layer must also abort
     immediately rather than retry."""
