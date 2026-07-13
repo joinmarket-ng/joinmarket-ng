@@ -34,6 +34,11 @@ then push the tag to trigger CI. CI verifies its builds match the signed manifes
 
 **CI-first** (for additional signers): Wait for CI to complete, then run
 `sign-release.sh` which downloads the manifest, reproduces locally, and signs.
+CI-first signatures sign the shared GitHub Release asset named
+`release-manifest-<version>.txt`; they do not need a per-signer manifest in the
+repository. The installer tries that shared manifest first, then falls back to
+`<fingerprint>-manifest.txt` for local-first and historical releases. In both
+cases it requires the signed `commit:` value to match the commit it installs.
 
 ## For Signers
 
@@ -48,6 +53,7 @@ See [Verify](technical/development.md#verify-a-release) for instructions on how 
 | Fingerprint | Name | Since |
 |-------------|------|-------|
 | 1C53A412D11EF3051704419C44912E1E03005B31 | m0wer | 2026-01-17 |
+| 9253062A4F92D63459085CA62D230520212A5901 | /dev/fd0 | 2026-07-13 |
 
 Note: The list of trusted keys is maintained in `trusted-keys.txt` for automated verification.
 

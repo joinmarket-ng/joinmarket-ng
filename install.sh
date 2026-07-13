@@ -545,8 +545,53 @@ verify_release_signature() {
         return 1
     fi
 
+    # CI-first signers sign the release asset shared by all signers. Local-first
+    # signers commit an individual manifest next to their signature instead.
+    # Fetch the release asset once, then fall back per signer when needed.
+    local shared_manifest="$work_dir/release-manifest-${version}.txt"
+    local shared_manifest_url="https://github.com/${GITHUB_REPO}/releases/download/${version}/release-manifest-${version}.txt"
+    local shared_manifest_available=0
+    if curl -fsSL "$shared_manifest_url" -o "$shared_manifest" 2>/dev/null; then
+        shared_manifest_available=1
+    else
+        print_warning "Shared release manifest unavailable; trying local signer manifests."
+    fi
+
+    # Verify a signature, ensure GnuPG identifies the expected trusted signer,
+    # and bind the selected manifest to the exact commit being installed.
+    local verified_signer=""
+    verify_signed_manifest() {
+        local expected_fingerprint="$1"
+        local signature_file="$2"
+        local manifest_file="$3"
+        local status_file="$work_dir/${expected_fingerprint}.status"
+
+        if ! GNUPGHOME="$gnupg_home" gpg --quiet --batch --status-fd 1 --verify \
+            "$signature_file" "$manifest_file" > "$status_file" 2>/dev/null; then
+            return 1
+        fi
+
+        verified_signer=$(awk '$1 == "[GNUPG:]" && $2 == "VALIDSIG" { print $3; exit }' \
+            "$status_file")
+        if [[ "$verified_signer" != "$expected_fingerprint" ]]; then
+            print_warning "Signature for $expected_fingerprint was made by $verified_signer; ignoring"
+            return 1
+        fi
+
+        local manifest_commit
+        manifest_commit=$(awk -F': ' '$1 == "commit" { print $2; exit }' "$manifest_file" | tr -d '[:space:]')
+        if [[ -z "$manifest_commit" ]]; then
+            print_warning "Signed manifest from $expected_fingerprint has no 'commit' line; ignoring"
+            return 1
+        fi
+        if [[ "$manifest_commit" != "$commit_hash" ]]; then
+            print_warning "Signed manifest commit ($manifest_commit) != install commit ($commit_hash) for $expected_fingerprint"
+            return 1
+        fi
+        return 0
+    }
+
     local valid_sigs=0
-    local commit_matched=0
     local signers=()
     local sig_name
     while IFS= read -r sig_name; do
@@ -568,44 +613,40 @@ verify_release_signature() {
         fi
 
         local sig_url="$raw_base/signatures/${version}/${fingerprint}.sig"
-        local man_url="$raw_base/signatures/${version}/${fingerprint}-manifest.txt"
         local sig_file="$work_dir/${fingerprint}.sig"
-        local man_file="$work_dir/${fingerprint}-manifest.txt"
 
         if ! curl -fsSL "$sig_url" -o "$sig_file"; then
             print_warning "Failed to fetch signature $sig_name"
             continue
         fi
-        if ! curl -fsSL "$man_url" -o "$man_file"; then
-            print_warning "Failed to fetch manifest for $fingerprint"
-            continue
+
+        local verified=0
+        if [[ $shared_manifest_available -eq 1 ]] && \
+            verify_signed_manifest "$fingerprint" "$sig_file" "$shared_manifest"; then
+            verified=1
+        else
+            local local_manifest_url="$raw_base/signatures/${version}/${fingerprint}-manifest.txt"
+            local local_manifest="$work_dir/${fingerprint}-manifest.txt"
+            if curl -fsSL "$local_manifest_url" -o "$local_manifest" 2>/dev/null && \
+                verify_signed_manifest "$fingerprint" "$sig_file" "$local_manifest"; then
+                verified=1
+            elif [[ $shared_manifest_available -eq 1 ]]; then
+                print_warning "No valid shared or local manifest for $fingerprint"
+            else
+                print_warning "No valid local manifest for $fingerprint"
+            fi
         fi
 
-        if ! GNUPGHOME="$gnupg_home" gpg --quiet --batch --verify "$sig_file" "$man_file" 2>/dev/null; then
-            print_warning "Bad signature from $fingerprint"
-            continue
-        fi
-
-        # Match the manifest's commit: line against the resolved commit.
-        local manifest_commit
-        manifest_commit=$(awk -F': ' '$1 == "commit" { print $2; exit }' "$man_file" | tr -d '[:space:]')
-        if [[ -z "$manifest_commit" ]]; then
-            print_warning "Manifest from $fingerprint has no 'commit' line; ignoring"
-            continue
-        fi
-
-        if [[ "$manifest_commit" != "$commit_hash" ]]; then
-            print_warning "Signed manifest commit ($manifest_commit) != install commit ($commit_hash) for $fingerprint"
+        if [[ $verified -eq 0 ]]; then
             continue
         fi
 
         valid_sigs=$((valid_sigs + 1))
-        commit_matched=1
         signers+=("$fingerprint")
         print_success "Valid signature from $fingerprint"
     done <<< "$sig_names"
 
-    if [[ $valid_sigs -ge 1 && $commit_matched -eq 1 ]]; then
+    if [[ $valid_sigs -ge 1 ]]; then
         print_success "Release $version verified ($valid_sigs trusted signature(s))"
         rc=0
     else
