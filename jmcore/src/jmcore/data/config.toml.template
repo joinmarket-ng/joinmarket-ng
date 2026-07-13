@@ -545,6 +545,7 @@
 
 # Mempool API settings
 # mempool_api_url = ""  # Disabled by default for privacy (no external API calls)
+# mempool_api_use_tor = true  # Set false only for direct access, which exposes your IP and bond queries
 # mempool_web_url = ""  # Optional explorer URL for UI links
 
 # Connection settings

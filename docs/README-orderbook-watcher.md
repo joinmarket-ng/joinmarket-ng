@@ -30,6 +30,14 @@ Important settings:
 - `TOR__SOCKS_HOST`, `TOR__SOCKS_PORT`
 - `ORDERBOOK_WATCHER__HTTP_HOST`, `ORDERBOOK_WATCHER__HTTP_PORT`
 - `ORDERBOOK_WATCHER__UPDATE_INTERVAL`
+- `ORDERBOOK_WATCHER__MEMPOOL_API_URL`
+- `ORDERBOOK_WATCHER__MEMPOOL_API_USE_TOR` (defaults to `true`)
+
+Mempool API lookups are disabled by default. When enabled, the watcher routes
+them through Tor by default. Set `mempool_api_use_tor = false` only when a
+direct endpoint is intentional, such as a local service. Direct access exposes
+the watcher's source IP and the bond transactions it queries; it also ignores
+`HTTP_PROXY` and `HTTPS_PROXY` inherited by the process.
 
 ## Docker
 

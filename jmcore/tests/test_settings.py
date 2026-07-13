@@ -367,6 +367,21 @@ fee_rate = 1.1
 
         assert settings.taker.fee_rate == 1.1
 
+    def test_mempool_tor_setting_from_toml_and_environment(
+        self, temp_data_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The watcher uses Tor by default and supports explicit TOML/env overrides."""
+        config_path = temp_data_dir / "config.toml"
+        config_path.write_text("""
+[orderbook_watcher]
+mempool_api_use_tor = false
+""")
+
+        assert JoinMarketSettings().orderbook_watcher.mempool_api_use_tor is False
+
+        monkeypatch.setenv("ORDERBOOK_WATCHER__MEMPOOL_API_USE_TOR", "true")
+        assert JoinMarketSettings().orderbook_watcher.mempool_api_use_tor is True
+
     def test_env_overrides_toml(self, temp_data_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Test that environment variables override TOML config."""
         config_path = temp_data_dir / "config.toml"

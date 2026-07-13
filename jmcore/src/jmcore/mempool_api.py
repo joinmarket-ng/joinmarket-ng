@@ -71,15 +71,16 @@ class MempoolAPI:
         base_url: str,
         timeout: float = 30.0,
         socks_proxy: str | None = None,
-    ):
+        trust_env: bool = True,
+    ) -> None:
         self.base_url = base_url.rstrip("/") if base_url else ""
         self.timeout = timeout
         self.socks_proxy = socks_proxy
+        self.trust_env = trust_env
 
-        client_kwargs: dict[str, Any] = {}
+        client_kwargs: dict[str, Any] = {"trust_env": trust_env}
         if socks_proxy:
             try:
-                logger.info(f"Attempting to configure SOCKS proxy: {socks_proxy}")
                 from httpx_socks import AsyncProxyTransport
 
                 from jmcore.tor_isolation import normalize_proxy_url
@@ -89,20 +90,14 @@ class MempoolAPI:
                 # so that .onion addresses are resolved by Tor.
                 normalized = normalize_proxy_url(socks_proxy)
 
-                logger.debug("httpx_socks imported successfully")
                 transport = AsyncProxyTransport.from_url(normalized.url, rdns=normalized.rdns)
-                logger.debug(f"Created SOCKS transport: {transport} (rdns={normalized.rdns})")
                 client_kwargs["transport"] = transport
-                logger.info(f"MempoolAPI configured to use SOCKS proxy: {socks_proxy}")
             except ImportError as e:
-                logger.error(f"httpx-socks not available: {e}")
-                logger.warning("httpx-socks is required for SOCKS proxy support")
-                logger.warning("Install with: pip install httpx-socks")
+                raise MempoolAPIError(
+                    "Tor-routed mempool access requires httpx-socks; install httpx-socks and retry"
+                ) from e
             except Exception as e:
-                logger.error(f"Failed to configure SOCKS proxy {socks_proxy}: {e}")
-                import traceback
-
-                logger.debug(f"SOCKS proxy configuration traceback: {traceback.format_exc()}")
+                raise MempoolAPIError("Failed to configure Tor transport for mempool access") from e
 
         self.client = httpx.AsyncClient(timeout=timeout, follow_redirects=True, **client_kwargs)
 
@@ -141,7 +136,8 @@ class MempoolAPI:
         url = f"{self.base_url}/{endpoint}"
         try:
             logger.debug(f"MempoolAPI request: GET {url}")
-            logger.debug(f"MempoolAPI using SOCKS proxy: {self.socks_proxy}")
+            transport = "Tor" if self.socks_proxy else "direct"
+            logger.debug(f"MempoolAPI request transport configured: {transport}")
             response = await self.client.get(url)
             response.raise_for_status()
             return response.json()

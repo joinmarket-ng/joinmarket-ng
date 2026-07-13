@@ -111,7 +111,10 @@ async def run_watcher(log_level: str | None = None) -> None:
     logger.info(f"HTTP server: {watcher_settings.http_host}:{watcher_settings.http_port}")
     logger.info(f"Update interval: {watcher_settings.update_interval}s")
     if watcher_settings.mempool_api_url:
-        logger.info(f"Mempool API: {watcher_settings.mempool_api_url}")
+        if watcher_settings.mempool_api_use_tor:
+            logger.info("Mempool API enabled with Tor routing")
+        else:
+            logger.info("Mempool API enabled with direct access")
     else:
         logger.info("Mempool API disabled; bond lookups use local backend only")
 
@@ -150,6 +153,7 @@ async def run_watcher(log_level: str | None = None) -> None:
         socks_port=settings.tor.socks_port,
         timeout=watcher_settings.connection_timeout,
         mempool_api_url=watcher_settings.mempool_api_url,
+        mempool_api_use_tor=watcher_settings.mempool_api_use_tor,
         max_message_size=watcher_settings.max_message_size,
         uptime_grace_period=watcher_settings.uptime_grace_period,
         stream_isolation=settings.tor.stream_isolation,

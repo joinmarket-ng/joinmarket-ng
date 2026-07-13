@@ -43,6 +43,10 @@ def test_mempool_urls() -> None:
     assert settings.mempool_web_url == "https://web.example.com"
 
 
+def test_mempool_api_uses_tor_by_default() -> None:
+    assert OrderbookWatcherSettings().mempool_api_use_tor is True
+
+
 class TestCreateBlockchainBackend:
     """Tests for _create_blockchain_backend() passing add_peers to NeutrinoBackend."""
 

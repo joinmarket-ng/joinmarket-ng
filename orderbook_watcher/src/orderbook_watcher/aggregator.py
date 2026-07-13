@@ -137,6 +137,7 @@ class OrderbookAggregator:
         directory_nodes: list[tuple[str, int]],
         network: str,
         mempool_api_url: str,
+        mempool_api_use_tor: bool = True,
         socks_host: str = "127.0.0.1",
         socks_port: int = 9050,
         timeout: float = 30.0,
@@ -154,17 +155,19 @@ class OrderbookAggregator:
         self.stream_isolation = stream_isolation
         self.timeout = timeout
         self.mempool_api_url = mempool_api_url
+        self.mempool_api_use_tor = mempool_api_use_tor
         self.max_retry_attempts = max_retry_attempts
         self.retry_delay = retry_delay
         self.max_message_size = max_message_size
         self.uptime_grace_period = uptime_grace_period
         self.blockchain_backend = blockchain_backend
 
-        # Build mempool proxy URL and pre-compute isolation credentials
+        # Build the optional mempool proxy URL and pre-compute isolation credentials.
         self._dir_username: str | None = None
         self._dir_password: str | None = None
         self._hc_username: str | None = None
         self._hc_password: str | None = None
+        socks_proxy: str | None = None
         if stream_isolation:
             from jmcore.tor_isolation import (  # noqa: PLC0415
                 IsolationCategory,
@@ -172,26 +175,33 @@ class OrderbookAggregator:
                 get_isolation_credentials,
             )
 
-            socks_proxy = build_isolated_proxy_url(
-                socks_host, socks_port, IsolationCategory.MEMPOOL
-            )
+            if mempool_api_use_tor:
+                socks_proxy = build_isolated_proxy_url(
+                    socks_host, socks_port, IsolationCategory.MEMPOOL
+                )
             dir_c = get_isolation_credentials(IsolationCategory.DIRECTORY)
             self._dir_username = dir_c.username
             self._dir_password = dir_c.password
             hc_c = get_isolation_credentials(IsolationCategory.HEALTH_CHECK)
             self._hc_username = hc_c.username
             self._hc_password = hc_c.password
-        else:
+        elif mempool_api_use_tor:
             socks_proxy = f"socks5h://{socks_host}:{socks_port}"
         self.mempool_api: MempoolAPI | None = None
-        self._socks_test_task: asyncio.Task[Any] | None = None
+        self._mempool_test_task: asyncio.Task[Any] | None = None
         if mempool_api_url:
-            logger.info(f"Configuring MempoolAPI with SOCKS proxy: {socks_proxy}")
             mempool_timeout = 60.0
+            if mempool_api_use_tor:
+                logger.info("Mempool API configured with Tor routing")
+            else:
+                logger.info("Mempool API configured for direct access")
             self.mempool_api = MempoolAPI(
-                base_url=mempool_api_url, socks_proxy=socks_proxy, timeout=mempool_timeout
+                base_url=mempool_api_url,
+                socks_proxy=socks_proxy,
+                timeout=mempool_timeout,
+                trust_env=False,
             )
-            self._socks_test_task = asyncio.create_task(self._test_socks_connection())
+            self._mempool_test_task = asyncio.create_task(self._test_mempool_connection())
         else:
             logger.info("Mempool API disabled by configuration; external mempool lookups are off")
         self.current_orderbook: OrderBook = OrderBook()
@@ -1260,19 +1270,19 @@ class OrderbookAggregator:
         ]
         await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def _test_socks_connection(self) -> None:
-        """Test SOCKS proxy connection on startup."""
+    async def _test_mempool_connection(self) -> None:
+        """Test the configured mempool connection on startup."""
         if self.mempool_api is None:
             return
 
         try:
             success = await self.mempool_api.test_connection()
             if success:
-                logger.info("SOCKS proxy connection test successful")
+                logger.info("Mempool API connection test successful")
             else:
                 logger.warning(
-                    "SOCKS proxy connection test failed - bond value calculation may not work"
+                    "Mempool API connection test failed - bond value calculation may not work"
                 )
         except Exception as e:
-            logger.error(f"SOCKS proxy connection test error: {e}")
-            logger.warning("Bond value calculation may not work without SOCKS proxy")
+            logger.error(f"Mempool API connection test error: {e}")
+            logger.warning("Bond value calculation may not work without mempool API access")

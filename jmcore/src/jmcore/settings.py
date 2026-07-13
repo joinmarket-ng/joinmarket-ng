@@ -1163,6 +1163,10 @@ class OrderbookWatcherSettings(BaseModel):
         default="",
         description="Mempool API URL for transaction lookups",
     )
+    mempool_api_use_tor: bool = Field(
+        default=True,
+        description="Route mempool API requests through Tor SOCKS",
+    )
     mempool_web_url: str | None = Field(
         default=None,
         description="Mempool web URL for human-readable links",
