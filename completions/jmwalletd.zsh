@@ -9,6 +9,7 @@ _jmwalletd() {
     '--port=[HTTPS/HTTP port]: :' \
     '--ws-port=[WebSocket port (0 = same as HTTP)]: :' \
     '--data-dir=[Data directory (default\: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)]:file:_files' \
+    '--config-file=[Config file path (decoupled from data dir). Defaults to <data-dir>/config.toml]:file:_files' \
     '--no-tls[Disable TLS (plain HTTP)]' \
     '--help[Show this message and exit]'
 }

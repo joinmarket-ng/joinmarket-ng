@@ -22,7 +22,7 @@ run_pip_compile() {
     fi
 }
 
-PACKAGES="jmcore directory_server orderbook_watcher jmwallet maker taker jmwalletd"
+PACKAGES="${JMNG_PACKAGES:-jmcore directory_server orderbook_watcher jmwallet maker taker tumbler jmwalletd}"
 UPDATE_PROD=true
 UPDATE_DEV=true
 
@@ -66,10 +66,12 @@ if [ "$UPDATE_PROD" = true ]; then
             # from pyproject.toml because pip-compile can't resolve them from PyPI.
             cp pyproject.toml pyproject.toml.bak
 
-            # Remove jmcore and jmwallet lines
+            # Remove local package references.
             # REQUIRE INDENTATION to avoid removing 'name = "jmwallet"'
             sed -i '/^[[:space:]][[:space:]]*"jmcore"/d' pyproject.toml
             sed -i '/^[[:space:]][[:space:]]*"jmwallet"/d' pyproject.toml
+            sed -i '/^[[:space:]][[:space:]]*"jm-maker"/d' pyproject.toml
+            sed -i '/^[[:space:]][[:space:]]*"jm-taker"/d' pyproject.toml
 
             # Compile
             run_pip_compile -U --strip-extras --generate-hashes pyproject.toml -o requirements.txt
@@ -97,6 +99,8 @@ if [ "$UPDATE_DEV" = true ]; then
             cp pyproject.toml pyproject.toml.bak
             sed -i '/^[[:space:]][[:space:]]*"jmcore"/d' pyproject.toml
             sed -i '/^[[:space:]][[:space:]]*"jmwallet"/d' pyproject.toml
+            sed -i '/^[[:space:]][[:space:]]*"jm-maker"/d' pyproject.toml
+            sed -i '/^[[:space:]][[:space:]]*"jm-taker"/d' pyproject.toml
 
             # Compile dev deps
             run_pip_compile -U --strip-extras --generate-hashes --extra dev pyproject.toml -o requirements-dev.txt

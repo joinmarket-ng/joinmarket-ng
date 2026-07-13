@@ -15,13 +15,13 @@ _jm_maker_completion() {
     subcmd="${COMP_WORDS[1]}"
     case "$subcmd" in
       start)
-        COMPREPLY=( $(compgen -W "--help --mnemonic-file -f --prompt-bip39-passphrase --data-dir -d --network --bitcoin-network --backend-type --rpc-url --neutrino-url --min-size --cj-fee-relative --cj-fee-absolute --tx-fee-contribution --directory -D --tor-socks-host --tor-socks-port --tor-control-host --tor-control-port --tor-cookie-path --disable-tor-control --onion-serving-host --onion-serving-port --tor-target-host --fidelity-bond-locktime -L --fidelity-bond-index -I --fidelity-bond -B --no-fidelity-bond --merge-algorithm -M --dual-offers --log-level -l" -- "$cur") )
+        COMPREPLY=( $(compgen -W "--help --mnemonic-file -f --prompt-bip39-passphrase --data-dir -d --config-file --network --bitcoin-network --backend-type --rpc-url --neutrino-url --min-size --cj-fee-relative --cj-fee-absolute --tx-fee-contribution --directory -D --tor-socks-host --tor-socks-port --tor-control-host --tor-control-port --tor-cookie-path --disable-tor-control --onion-serving-host --onion-serving-port --tor-target-host --fidelity-bond-locktime -L --fidelity-bond-index -I --fidelity-bond -B --no-fidelity-bond --merge-algorithm -M --dual-offers --log-level -l" -- "$cur") )
         ;;
       generate-address)
-        COMPREPLY=( $(compgen -W "--help --mnemonic-file -f --prompt-bip39-passphrase --network --bitcoin-network --backend-type --data-dir --log-level -l" -- "$cur") )
+        COMPREPLY=( $(compgen -W "--help --mnemonic-file -f --prompt-bip39-passphrase --network --bitcoin-network --backend-type --data-dir --config-file --log-level -l" -- "$cur") )
         ;;
       config-init)
-        COMPREPLY=( $(compgen -W "--help --data-dir -d" -- "$cur") )
+        COMPREPLY=( $(compgen -W "--help --data-dir -d --config-file" -- "$cur") )
         ;;
     esac
     return 0

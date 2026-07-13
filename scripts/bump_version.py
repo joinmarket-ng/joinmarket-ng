@@ -55,6 +55,7 @@ PYPROJECT_FILES = [
     PROJECT_ROOT / "jmwallet" / "pyproject.toml",
     PROJECT_ROOT / "maker" / "pyproject.toml",
     PROJECT_ROOT / "taker" / "pyproject.toml",
+    PROJECT_ROOT / "tumbler" / "pyproject.toml",
     PROJECT_ROOT / "directory_server" / "pyproject.toml",
     PROJECT_ROOT / "orderbook_watcher" / "pyproject.toml",
 ]

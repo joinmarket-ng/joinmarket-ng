@@ -15,16 +15,16 @@ _jm_taker_completion() {
     subcmd="${COMP_WORDS[1]}"
     case "$subcmd" in
       coinjoin)
-        COMPREPLY=( $(compgen -W "--help --amount -a --destination -d --mixdepth -m --counterparties -n --mnemonic-file -f --prompt-bip39-passphrase --network --bitcoin-network --backend -b --rpc-url --neutrino-url --directory -D --tor-socks-host --tor-socks-port --max-abs-fee --max-rel-fee --fee-rate --block-target --bondless-allowance --bond-exponent --bondless-zero-fee --select-utxos -s --yes -y --data-dir --log-level -l" -- "$cur") )
+        COMPREPLY=( $(compgen -W "--help --amount -a --destination -d --mixdepth -m --counterparties -n --mnemonic-file -f --prompt-bip39-passphrase --network --bitcoin-network --backend -b --rpc-url --neutrino-url --directory -D --tor-socks-host --tor-socks-port --max-abs-fee --max-rel-fee --fee-rate --block-target --bondless-allowance --bond-exponent --bondless-zero-fee --select-utxos -s --yes -y --data-dir --config-file --log-level -l" -- "$cur") )
         ;;
       tumble)
-        COMPREPLY=( $(compgen -W "--help --mnemonic-file -f --prompt-bip39-passphrase --network --backend -b --rpc-url --neutrino-url --directory -D --tor-socks-host --tor-socks-port --data-dir --log-level -l" -- "$cur") )
+        COMPREPLY=( $(compgen -W "--help --mnemonic-file -f --prompt-bip39-passphrase --network --backend -b --rpc-url --neutrino-url --directory -D --tor-socks-host --tor-socks-port --data-dir --config-file --log-level -l" -- "$cur") )
         ;;
       clear-ignored-makers)
-        COMPREPLY=( $(compgen -W "--help --data-dir -d" -- "$cur") )
+        COMPREPLY=( $(compgen -W "--help --data-dir -d --config-file" -- "$cur") )
         ;;
       config-init)
-        COMPREPLY=( $(compgen -W "--help --data-dir -d" -- "$cur") )
+        COMPREPLY=( $(compgen -W "--help --data-dir -d --config-file" -- "$cur") )
         ;;
     esac
     return 0

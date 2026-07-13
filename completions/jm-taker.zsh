@@ -48,6 +48,7 @@ _jm_taker() {
             '--select-utxos[Interactively select UTXOs (fzf-like TUI)]' \
             '--yes[Skip confirmation prompt]' \
             '--data-dir=[Data directory (default\: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)]:file:_files' \
+            '--config-file=[Config file path (decoupled from data dir). Defaults to <data-dir>/config.toml]:file:_files' \
             '--log-level=[Log level]: :' \
             '--help[Show this message and exit]'
           ;;
@@ -63,17 +64,20 @@ _jm_taker() {
             '--tor-socks-host=[Tor SOCKS proxy host (overrides TOR__SOCKS_HOST)]: :' \
             '--tor-socks-port=[Tor SOCKS proxy port (overrides TOR__SOCKS_PORT)]: :' \
             '--data-dir=[Data directory (default\: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)]:file:_files' \
+            '--config-file=[Config file path (decoupled from data dir). Defaults to <data-dir>/config.toml]:file:_files' \
             '--log-level=[Log level]: :' \
             '--help[Show this message and exit]'
           ;;
         clear-ignored-makers)
           _arguments \
             '--data-dir=[Data directory for JoinMarket files]:file:_files' \
+            '--config-file=[Config file path (decoupled from data dir). Defaults to <data-dir>/config.toml]:file:_files' \
             '--help[Show this message and exit]'
           ;;
         config-init)
           _arguments \
             '--data-dir=[Data directory for JoinMarket files]:file:_files' \
+            '--config-file=[Config file path (decoupled from data dir). Defaults to <data-dir>/config.toml]:file:_files' \
             '--help[Show this message and exit]'
           ;;
       esac

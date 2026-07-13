@@ -747,10 +747,11 @@ prepare_dep_pinning() {
     }
 
     # Only the components being installed contribute their locks. jmcore and
-    # jmwallet are always installed; maker/taker are conditional.
+    # jmwallet are always installed; maker/taker/tumbler are conditional.
     local pkgs=("jmcore" "jmwallet")
     [[ "${INSTALL_MAKER:-true}" == "true" ]] && pkgs+=("maker")
     [[ "${INSTALL_TAKER:-true}" == "true" ]] && pkgs+=("taker")
+    [[ "${INSTALL_TUMBLER:-false}" == "true" ]] && pkgs+=("tumbler")
 
     local fetched=0
     local pkg
@@ -923,6 +924,14 @@ install_packages() {
         print_success "Taker installed"
     fi
 
+    if [[ "${INSTALL_TUMBLER:-false}" == "true" ]]; then
+        print_info "Installing tumbler..."
+        pip install "${git_base}#subdirectory=tumbler" \
+            "${git_base}#subdirectory=maker" "${git_base}#subdirectory=taker" \
+            "${pkg_extra[@]}" --quiet
+        print_success "Tumbler installed"
+    fi
+
     cleanup_dep_pinning
 
     # Verify installation (shared with the update path so a missing
@@ -979,6 +988,9 @@ update_packages() {
     # while keeping the JoinMarket-NG packages pinned to git.
     local core_url="${git_base}#subdirectory=jmcore"
     local wallet_url="${git_base}#subdirectory=jmwallet"
+    local maker_url="${git_base}#subdirectory=maker"
+    local taker_url="${git_base}#subdirectory=taker"
+    local tumbler_url="${git_base}#subdirectory=tumbler"
 
     # Prepare dependency pinning anchored to the verified commit, then
     # decide how to pin: hash-checked by default (installing verified deps
@@ -1014,14 +1026,14 @@ update_packages() {
     local should_install_maker="${INSTALL_MAKER:-true}"
     if pip show jm-maker &> /dev/null; then
         print_info "Updating maker..."
-        pip install --upgrade --force-reinstall --no-deps "${git_base}#subdirectory=maker" --quiet
+        pip install --upgrade --force-reinstall --no-deps "$maker_url" --quiet
         # Resolve maker deps from git so jmcore/jmwallet are not sought
         # on PyPI and new third-party deps (e.g. pynacl) are installed.
-        pip install --upgrade "${git_base}#subdirectory=maker" "$core_url" "$wallet_url" "${dep_extra[@]}" --quiet
+        pip install --upgrade "$maker_url" "$core_url" "$wallet_url" "${dep_extra[@]}" --quiet
         print_success "Maker updated"
     elif [[ "$should_install_maker" == "true" ]]; then
         print_info "Installing maker..."
-        pip install "${git_base}#subdirectory=maker" "$core_url" "$wallet_url" "${dep_extra[@]}" --quiet
+        pip install "$maker_url" "$core_url" "$wallet_url" "${dep_extra[@]}" --quiet
         print_success "Maker installed"
     fi
 
@@ -1029,13 +1041,29 @@ update_packages() {
     local should_install_taker="${INSTALL_TAKER:-true}"
     if pip show jm-taker &> /dev/null; then
         print_info "Updating taker..."
-        pip install --upgrade --force-reinstall --no-deps "${git_base}#subdirectory=taker" --quiet
-        pip install --upgrade "${git_base}#subdirectory=taker" "$core_url" "$wallet_url" "${dep_extra[@]}" --quiet
+        pip install --upgrade --force-reinstall --no-deps "$taker_url" --quiet
+        pip install --upgrade "$taker_url" "$core_url" "$wallet_url" "${dep_extra[@]}" --quiet
         print_success "Taker updated"
     elif [[ "$should_install_taker" == "true" ]]; then
         print_info "Installing taker..."
-        pip install "${git_base}#subdirectory=taker" "$core_url" "$wallet_url" "${dep_extra[@]}" --quiet
+        pip install "$taker_url" "$core_url" "$wallet_url" "${dep_extra[@]}" --quiet
         print_success "Taker installed"
+    fi
+
+    # Preserve an existing tumbler during a minimal-profile update, while a
+    # maker+taker profile installs it when it was not present before.
+    local should_install_tumbler="${INSTALL_TUMBLER:-false}"
+    if pip show jm-tumbler &> /dev/null; then
+        print_info "Updating tumbler..."
+        pip install --upgrade --force-reinstall --no-deps "$tumbler_url" --quiet
+        pip install --upgrade "$tumbler_url" "$core_url" "$wallet_url" "$maker_url" "$taker_url" \
+            "${dep_extra[@]}" --quiet
+        print_success "Tumbler updated"
+    elif [[ "$should_install_tumbler" == "true" ]]; then
+        print_info "Installing tumbler..."
+        pip install "$tumbler_url" "$core_url" "$wallet_url" "$maker_url" "$taker_url" \
+            "${dep_extra[@]}" --quiet
+        print_success "Tumbler installed"
     fi
 
     cleanup_dep_pinning
@@ -1227,6 +1255,9 @@ setup_cli_completion() {
     if [[ "$INSTALL_TAKER" == "true" ]]; then
         commands+=("jm-taker")
     fi
+    if [[ "${INSTALL_TUMBLER:-false}" == "true" ]]; then
+        commands+=("jm-tumbler")
+    fi
 
     local installed_count=0
     local raw_base="https://raw.githubusercontent.com/${GITHUB_REPO}/${VERSION:-main}/completions"
@@ -1322,6 +1353,16 @@ EOF
     fi
 }
 
+# Tumbler combines taker CoinJoin rounds with maker sessions. It is available
+# in complete maker+taker profiles, while individual roles remain minimal.
+derive_install_tumbler() {
+    if [[ "$INSTALL_MAKER" == "true" ]] && [[ "$INSTALL_TAKER" == "true" ]]; then
+        INSTALL_TUMBLER=true
+    else
+        INSTALL_TUMBLER=false
+    fi
+}
+
 # Ask user for component selection
 ask_components() {
     if [[ "$AUTO_YES" == "true" ]]; then
@@ -1360,6 +1401,8 @@ ask_components() {
                 ;;
         esac
     fi
+
+    derive_install_tumbler
 }
 
 # Print completion message
@@ -1398,6 +1441,9 @@ print_completion() {
     fi
     if [[ "$INSTALL_TAKER" == "true" ]]; then
         echo "  4. Run CoinJoin: jm-taker coinjoin -f $DATA_DIR/wallets/wallet.mnemonic --amount 1000000"
+    fi
+    if [[ "${INSTALL_TUMBLER:-false}" == "true" ]]; then
+        echo "  4. Build a mixing plan: jm-tumbler plan -f $DATA_DIR/wallets/wallet.mnemonic"
     fi
 
     echo ""
@@ -1561,6 +1607,8 @@ parse_args() {
         INSTALL_MAKER=${INSTALL_MAKER:-false}
         INSTALL_TAKER=${INSTALL_TAKER:-false}
     fi
+
+    derive_install_tumbler
 }
 
 # Main

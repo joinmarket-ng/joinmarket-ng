@@ -27,7 +27,7 @@ source ~/.joinmarket-ng/activate.sh
 What this does:
 
 - creates `~/.joinmarket-ng/venv`
-- installs `jmcore`, `jmwallet`, `jm-maker`, and `jm-taker`
+- installs `jmcore`, `jmwallet`, `jm-maker`, `jm-taker`, and `jm-tumbler`
 - creates `~/.joinmarket-ng/config.toml`
 - installs/configures Tor unless you pass `--skip-tor`
 - installs static shell completion scripts for bash and zsh (near-instant tab completion)
@@ -47,6 +47,9 @@ curl -sSL https://raw.githubusercontent.com/joinmarket-ng/joinmarket-ng/main/ins
 # update existing installation
 curl -sSL https://raw.githubusercontent.com/joinmarket-ng/joinmarket-ng/main/install.sh | bash -s -- --update
 ```
+
+The default complete profile includes `jm-tumbler` because it needs both maker
+and taker. Single-role installs do not include it.
 
 ## Flatpak
 
@@ -490,10 +493,16 @@ cd joinmarket-ng
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-pip install .\jmcore .\taker .\jmwallet
+pip install .\jmcore .\jmwallet .\taker
 ```
 
-Add `--maker` (`pip install .\maker`) if you want to run as a maker.
+To match the recommended complete profile, also install the maker and tumbler:
+
+```powershell
+pip install .\maker .\tumbler
+```
+
+Taker-only and maker-only installations can omit `tumbler`.
 
 ### 2. Install and start Tor
 

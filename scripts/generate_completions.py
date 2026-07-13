@@ -67,6 +67,7 @@ class CLIInfo:
 CLI_APPS: dict[str, str] = {
     "jm-maker": "maker.cli:app",
     "jm-taker": "taker.cli:app",
+    "jm-tumbler": "tumbler.cli:app",
     "jm-wallet": "jmwallet.cli:app",
     "jmwalletd": "jmwalletd.cli:app",
 }

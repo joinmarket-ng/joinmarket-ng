@@ -56,7 +56,7 @@ pytestmark = [
 
 
 def _build_and_run(
-    dockerfile: str, tag_suffix: str
+    dockerfile: str, tag_suffix: str, install_profile: str
 ) -> subprocess.CompletedProcess[str]:
     """Build the named Dockerfile and run the container.
 
@@ -97,6 +97,8 @@ def _build_and_run(
                 "--rm",
                 "-e",
                 f"JMNG_INSTALL_REF={install_ref}",
+                "-e",
+                f"JMNG_INSTALL_PROFILE={install_profile}",
                 tag,
             ],
             capture_output=True,
@@ -131,13 +133,13 @@ def _assert_install_succeeded(result: subprocess.CompletedProcess[str]) -> None:
 
 @pytest.mark.timeout(900)
 def test_install_on_debian_stable() -> None:
-    """``install.sh`` produces a working ``jm-wallet`` on Debian stable."""
-    result = _build_and_run("Dockerfile.debian", "debian")
+    """The default Debian install includes a working ``jm-tumbler``."""
+    result = _build_and_run("Dockerfile.debian", "debian", "default")
     _assert_install_succeeded(result)
 
 
 @pytest.mark.timeout(900)
 def test_install_on_ubuntu_2404() -> None:
-    """``install.sh`` produces a working ``jm-wallet`` on Ubuntu 24.04."""
-    result = _build_and_run("Dockerfile.ubuntu", "ubuntu")
+    """The Ubuntu taker-only install stays a minimal single-role profile."""
+    result = _build_and_run("Dockerfile.ubuntu", "ubuntu", "taker")
     _assert_install_succeeded(result)

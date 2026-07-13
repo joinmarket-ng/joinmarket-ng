@@ -8,26 +8,26 @@ _jm_wallet_completion() {
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
     if [ "$COMP_CWORD" -eq 1 ]; then
-        COMPREPLY=( $(compgen -W "list-bonds generate-bond-address import-bond sync-bonds recover-bonds create-bond-address generate-hot-keypair prepare-certificate-message import-certificate spend-bond debug-info freeze history registry-show send import generate info verify-password validate showseed rescan" -- "$cur") )
+        COMPREPLY=( $(compgen -W "list-bonds generate-bond-address import-bond sync-bonds recover-bonds create-bond-address generate-hot-keypair prepare-certificate-message import-certificate spend-bond debug-info freeze history registry-show send import generate info verify-password validate showseed rescan address" -- "$cur") )
         return 0
     fi
 
     subcmd="${COMP_WORDS[1]}"
     case "$subcmd" in
       list-bonds)
-        COMPREPLY=( $(compgen -W "--help --mnemonic-file -f --prompt-bip39-passphrase --wallet-fingerprint --data-dir --funded-only --active-only --json -j --log-level -l" -- "$cur") )
+        COMPREPLY=( $(compgen -W "--help --mnemonic-file -f --prompt-bip39-passphrase --wallet-fingerprint --data-dir --config-file --funded-only --active-only --json -j --log-level -l" -- "$cur") )
         ;;
       generate-bond-address)
-        COMPREPLY=( $(compgen -W "--help --mnemonic-file -f --prompt-bip39-passphrase --locktime -L --locktime-date -d --network -n --data-dir --no-save --log-level -l" -- "$cur") )
+        COMPREPLY=( $(compgen -W "--help --mnemonic-file -f --prompt-bip39-passphrase --locktime -L --locktime-date -d --network -n --data-dir --config-file --no-save --log-level -l" -- "$cur") )
         ;;
       import-bond)
-        COMPREPLY=( $(compgen -W "--help --mnemonic-file -f --prompt-bip39-passphrase --locktime -L --locktime-date -d --timenumber -t --path -p --network -n --data-dir --log-level -l" -- "$cur") )
+        COMPREPLY=( $(compgen -W "--help --mnemonic-file -f --prompt-bip39-passphrase --locktime -L --locktime-date -d --timenumber -t --path -p --network -n --data-dir --config-file --log-level -l" -- "$cur") )
         ;;
       sync-bonds)
-        COMPREPLY=( $(compgen -W "--help --mnemonic-file -f --prompt-bip39-passphrase --network -n --backend -b --rpc-url --neutrino-url --data-dir --log-level -l" -- "$cur") )
+        COMPREPLY=( $(compgen -W "--help --mnemonic-file -f --prompt-bip39-passphrase --network -n --backend -b --rpc-url --neutrino-url --data-dir --config-file --log-level -l" -- "$cur") )
         ;;
       recover-bonds)
-        COMPREPLY=( $(compgen -W "--help --mnemonic-file -f --prompt-bip39-passphrase --network -n --backend -b --rpc-url --neutrino-url --data-dir --log-level -l" -- "$cur") )
+        COMPREPLY=( $(compgen -W "--help --mnemonic-file -f --prompt-bip39-passphrase --network -n --backend -b --rpc-url --neutrino-url --data-dir --config-file --log-level -l" -- "$cur") )
         ;;
       create-bond-address)
         COMPREPLY=( $(compgen -W "--help --locktime -L --locktime-date -d --network -n --data-dir --no-save --wallet-fingerprint --log-level -l" -- "$cur") )
@@ -36,28 +36,28 @@ _jm_wallet_completion() {
         COMPREPLY=( $(compgen -W "--help --bond-address --data-dir --wallet-fingerprint --log-level" -- "$cur") )
         ;;
       prepare-certificate-message)
-        COMPREPLY=( $(compgen -W "--help --cert-pubkey --validity-periods --data-dir --network -n --backend -b --rpc-url --neutrino-url --current-block --wallet-fingerprint --log-level" -- "$cur") )
+        COMPREPLY=( $(compgen -W "--help --cert-pubkey --validity-periods --data-dir --config-file --network -n --backend -b --rpc-url --neutrino-url --current-block --wallet-fingerprint --log-level" -- "$cur") )
         ;;
       import-certificate)
-        COMPREPLY=( $(compgen -W "--help --cert-pubkey --cert-signature --cert-expiry --data-dir --skip-verification --network -n --backend -b --rpc-url --neutrino-url --current-block --wallet-fingerprint --log-level" -- "$cur") )
+        COMPREPLY=( $(compgen -W "--help --cert-pubkey --cert-signature --cert-expiry --data-dir --config-file --skip-verification --network -n --backend -b --rpc-url --neutrino-url --current-block --wallet-fingerprint --log-level" -- "$cur") )
         ;;
       spend-bond)
         COMPREPLY=( $(compgen -W "--help --fee-rate -f --master-fingerprint -m --derivation-path -p --output -o --test-unfunded --test-utxo-value --data-dir --wallet-fingerprint --log-level -l" -- "$cur") )
         ;;
       debug-info)
-        COMPREPLY=( $(compgen -W "--help --network -n --backend -b --neutrino-url --data-dir --log-level -l" -- "$cur") )
+        COMPREPLY=( $(compgen -W "--help --network -n --backend -b --neutrino-url --data-dir --config-file --log-level -l" -- "$cur") )
         ;;
       freeze)
-        COMPREPLY=( $(compgen -W "--help --mnemonic-file -f --prompt-bip39-passphrase --network -n --backend -b --rpc-url --neutrino-url --mixdepth -m --data-dir --log-level -l" -- "$cur") )
+        COMPREPLY=( $(compgen -W "--help --mnemonic-file -f --prompt-bip39-passphrase --network -n --backend -b --rpc-url --neutrino-url --mixdepth -m --data-dir --config-file --log-level -l" -- "$cur") )
         ;;
       history)
-        COMPREPLY=( $(compgen -W "--help --limit -n --role -r --stats -s --csv --data-dir --mnemonic-file -f --prompt-bip39-passphrase --wallet-fingerprint --all-wallets --log-level -l" -- "$cur") )
+        COMPREPLY=( $(compgen -W "--help --limit -n --role -r --stats -s --csv --data-dir --config-file --mnemonic-file -f --prompt-bip39-passphrase --wallet-fingerprint --all-wallets --log-level -l" -- "$cur") )
         ;;
       registry-show)
-        COMPREPLY=( $(compgen -W "--help --mnemonic-file -f --prompt-bip39-passphrase --wallet-fingerprint --data-dir --json -j --log-level -l" -- "$cur") )
+        COMPREPLY=( $(compgen -W "--help --mnemonic-file -f --prompt-bip39-passphrase --wallet-fingerprint --data-dir --config-file --json -j --log-level -l" -- "$cur") )
         ;;
       send)
-        COMPREPLY=( $(compgen -W "--help --amount -a --mnemonic-file -f --prompt-bip39-passphrase --mixdepth -m --fee-rate --block-target --network -n --backend -b --rpc-url --neutrino-url --broadcast --yes -y --select-utxos -s --data-dir --log-level -l" -- "$cur") )
+        COMPREPLY=( $(compgen -W "--help --amount -a --mnemonic-file -f --prompt-bip39-passphrase --mixdepth -m --fee-rate --block-target --network -n --backend -b --rpc-url --neutrino-url --broadcast --yes -y --select-utxos -s --data-dir --config-file --log-level -l" -- "$cur") )
         ;;
       import)
         COMPREPLY=( $(compgen -W "--help --words -w --output -o --prompt-password --force -f --data-dir" -- "$cur") )
@@ -66,7 +66,7 @@ _jm_wallet_completion() {
         COMPREPLY=( $(compgen -W "--help --words -w --save --output -o --prompt-password --force -f --data-dir" -- "$cur") )
         ;;
       info)
-        COMPREPLY=( $(compgen -W "--help --mnemonic-file -f --prompt-bip39-passphrase --network -n --backend -b --rpc-url --neutrino-url --extended -e --gap -g --show-empty --scan-status --data-dir --log-level -l" -- "$cur") )
+        COMPREPLY=( $(compgen -W "--help --mnemonic-file -f --prompt-bip39-passphrase --network -n --backend -b --rpc-url --neutrino-url --extended -e --gap -g --show-empty --scan-status --data-dir --config-file --log-level -l" -- "$cur") )
         ;;
       verify-password)
         COMPREPLY=( $(compgen -W "--help --mnemonic-file -f --password -p --prompt" -- "$cur") )
@@ -78,7 +78,10 @@ _jm_wallet_completion() {
         COMPREPLY=( $(compgen -W "--help --mnemonic-file -f --password -p --numbered --yes -y" -- "$cur") )
         ;;
       rescan)
-        COMPREPLY=( $(compgen -W "--help --mnemonic-file -f --prompt-bip39-passphrase --network -n --rpc-url --start-height --scan-depth --data-dir --log-level -l" -- "$cur") )
+        COMPREPLY=( $(compgen -W "--help --mnemonic-file -f --prompt-bip39-passphrase --network -n --rpc-url --start-height --scan-depth --data-dir --config-file --log-level -l" -- "$cur") )
+        ;;
+      address)
+        COMPREPLY=( $(compgen -W "--help --mnemonic-file -f --prompt-bip39-passphrase --network -n --backend -b --rpc-url --neutrino-url --data-dir --config-file --log-level -l" -- "$cur") )
         ;;
     esac
     return 0

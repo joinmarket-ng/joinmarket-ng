@@ -28,6 +28,7 @@ _jm_wallet() {
     'validate:Validate a mnemonic phrase.'
     'showseed:Display the BIP39 seed words (mnemonic) of an existing wallet.'
     'rescan:Rescan the blockchain to repair a descriptor wallet'\''s coverage.'
+    'address:Manage deposit addresses\: reserve, label, release, and list.'
   )
 
   _arguments -C \
@@ -46,6 +47,7 @@ _jm_wallet() {
             '--prompt-bip39-passphrase[Prompt for BIP39 passphrase]' \
             '--wallet-fingerprint=[Select the per-wallet bond registry by its 8-char hex BIP32 master fingerprint. Use this instead of --mnemonic-file when you already know the fingerprint (e.g. from '\''jm-wallet info'\''). When neither --mnemonic-file nor this flag is provided and exactly one wallet has a registry in the data directory, that wallet is selected automatically.]: :' \
             '--data-dir=[Data directory (default\: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)]:file:_files' \
+            '--config-file=[Config file path (decoupled from data dir). Defaults to <data-dir>/config.toml]:file:_files' \
             '--funded-only[Show only funded bonds]' \
             '--active-only[Show only active bonds]' \
             '--json[Output as JSON]' \
@@ -60,6 +62,7 @@ _jm_wallet() {
             '--locktime-date=[Locktime as YYYY-MM (must be 1st of month)]: :' \
             '--network=[]: :' \
             '--data-dir=[Data directory (default\: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)]:file:_files' \
+            '--config-file=[Config file path (decoupled from data dir). Defaults to <data-dir>/config.toml]:file:_files' \
             '--no-save[Do not save the bond to the registry]' \
             '--log-level=[Log level]: :' \
             '--help[Show this message and exit]'
@@ -74,6 +77,7 @@ _jm_wallet() {
             '--path=[Full derivation path with locktime, e.g. m/84'\''/0'\''/0'\''/2/73\:1740787200]: :' \
             '--network=[]: :' \
             '--data-dir=[Data directory (default\: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)]:file:_files' \
+            '--config-file=[Config file path (decoupled from data dir). Defaults to <data-dir>/config.toml]:file:_files' \
             '--log-level=[Log level]: :' \
             '--help[Show this message and exit]'
           ;;
@@ -86,6 +90,7 @@ _jm_wallet() {
             '--rpc-url=[]: :' \
             '--neutrino-url=[]: :' \
             '--data-dir=[Data directory (default\: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)]:file:_files' \
+            '--config-file=[Config file path (decoupled from data dir). Defaults to <data-dir>/config.toml]:file:_files' \
             '--log-level=[Log level]: :' \
             '--help[Show this message and exit]'
           ;;
@@ -98,6 +103,7 @@ _jm_wallet() {
             '--rpc-url=[]: :' \
             '--neutrino-url=[]: :' \
             '--data-dir=[Data directory (default\: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)]:file:_files' \
+            '--config-file=[Config file path (decoupled from data dir). Defaults to <data-dir>/config.toml]:file:_files' \
             '--log-level=[Log level]: :' \
             '--help[Show this message and exit]'
           ;;
@@ -125,6 +131,7 @@ _jm_wallet() {
             '--cert-pubkey=[Certificate public key (hex)]: :' \
             '--validity-periods=[Certificate validity in 2016-block periods from now (1=~2wk, 52=~2yr)]: :' \
             '--data-dir=[Data directory (default\: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)]:file:_files' \
+            '--config-file=[Config file path (decoupled from data dir). Defaults to <data-dir>/config.toml]:file:_files' \
             '--network=[Bitcoin network]: :' \
             '--backend=[Backend\: descriptor_wallet | neutrino]: :' \
             '--rpc-url=[]: :' \
@@ -140,6 +147,7 @@ _jm_wallet() {
             '--cert-signature=[Certificate signature (base64)]: :' \
             '--cert-expiry=[Certificate expiry as ABSOLUTE period number (from prepare-certificate-message)]: :' \
             '--data-dir=[Data directory (default\: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)]:file:_files' \
+            '--config-file=[Config file path (decoupled from data dir). Defaults to <data-dir>/config.toml]:file:_files' \
             '--skip-verification[Skip signature verification (not recommended)]' \
             '--network=[Bitcoin network]: :' \
             '--backend=[Backend\: descriptor_wallet | neutrino]: :' \
@@ -169,6 +177,7 @@ _jm_wallet() {
             '--backend=[Backend\: descriptor_wallet | neutrino]: :' \
             '--neutrino-url=[]: :' \
             '--data-dir=[Data directory (default\: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)]:file:_files' \
+            '--config-file=[Config file path (decoupled from data dir). Defaults to <data-dir>/config.toml]:file:_files' \
             '--log-level=[Log level]: :' \
             '--help[Show this message and exit]'
           ;;
@@ -182,6 +191,7 @@ _jm_wallet() {
             '--neutrino-url=[]: :' \
             '--mixdepth=[Filter to a specific mixdepth (0-4)]: :' \
             '--data-dir=[Data directory (default\: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)]:file:_files' \
+            '--config-file=[Config file path (decoupled from data dir). Defaults to <data-dir>/config.toml]:file:_files' \
             '--log-level=[Log level]: :' \
             '--help[Show this message and exit]'
           ;;
@@ -192,6 +202,7 @@ _jm_wallet() {
             '--stats[Show statistics only]' \
             '--csv[Output as CSV]' \
             '--data-dir=[Data directory (default\: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)]:file:_files' \
+            '--config-file=[Config file path (decoupled from data dir). Defaults to <data-dir>/config.toml]:file:_files' \
             '--mnemonic-file=[Path to mnemonic file. When provided, the history is filtered to entries belonging to this wallet (matched by BIP32 master fingerprint). Required when multiple wallets share the same data directory (issue #473) unless --wallet-fingerprint is passed instead.]:file:_files' \
             '--prompt-bip39-passphrase[Prompt for the BIP39 passphrase when deriving the wallet fingerprint from --mnemonic-file. Required when the wallet was created with a BIP39 passphrase, otherwise the derived fingerprint will not match any recorded history.]' \
             '--wallet-fingerprint=[Filter history to this 8-char hex BIP32 master fingerprint. Use this instead of --mnemonic-file when you already know the fingerprint (e.g. printed by '\''jm-wallet info'\''). When neither this flag nor --mnemonic-file is given and history contains exactly one wallet, that wallet is selected automatically.]: :' \
@@ -205,6 +216,7 @@ _jm_wallet() {
             '--prompt-bip39-passphrase[Prompt for BIP39 passphrase]' \
             '--wallet-fingerprint=[Select the per-wallet bond registry by its 8-char hex BIP32 master fingerprint. Use this instead of --mnemonic-file when you already know the fingerprint (e.g. from '\''jm-wallet info'\''). When neither is provided and exactly one wallet has a registry in the data directory, that wallet is selected automatically.]: :' \
             '--data-dir=[Data directory (default\: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)]:file:_files' \
+            '--config-file=[Config file path (decoupled from data dir). Defaults to <data-dir>/config.toml]:file:_files' \
             '--json[Output as JSON]' \
             '--log-level=[]: :' \
             '--help[Show this message and exit]'
@@ -225,6 +237,7 @@ _jm_wallet() {
             '--yes[Skip confirmation prompt]' \
             '--select-utxos[Interactively select UTXOs (fzf-like TUI)]' \
             '--data-dir=[Data directory (default\: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)]:file:_files' \
+            '--config-file=[Config file path (decoupled from data dir). Defaults to <data-dir>/config.toml]:file:_files' \
             '--log-level=[Log level]: :' \
             '--help[Show this message and exit]'
           ;;
@@ -260,6 +273,7 @@ _jm_wallet() {
             '--show-empty[In --extended view, show addresses with zero balance. When disabled (default), empty addresses are hidden except for the first unused one per branch so you still have a fresh receive address.]' \
             '--scan-status[Print Bitcoin Core'\''s wallet scan/coverage diagnostics and exit (descriptor wallet only). Use it when the wallet proposes already-used addresses; if coverage is incomplete, repair it with `jm-wallet rescan`. See the wallet scanning docs.]' \
             '--data-dir=[Data directory (default\: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)]:file:_files' \
+            '--config-file=[Config file path (decoupled from data dir). Defaults to <data-dir>/config.toml]:file:_files' \
             '--log-level=[Log level]: :' \
             '--help[Show this message and exit]'
           ;;
@@ -292,6 +306,20 @@ _jm_wallet() {
             '--start-height=[Block height to rescan from (default\: 0 = genesis). The wallet'\''s recorded creation height is used as a floor when available, so values below it are clamped up automatically. Honored both on its own and together with --scan-depth.]: :' \
             '--scan-depth=[Widen the descriptor address-index range to N per branch before rescanning (re-imports descriptors). Use this once for a wallet whose used addresses sit beyond the configured [wallet].scan_range. See the wallet scanning docs.]: :' \
             '--data-dir=[Data directory (default\: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)]:file:_files' \
+            '--config-file=[Config file path (decoupled from data dir). Defaults to <data-dir>/config.toml]:file:_files' \
+            '--log-level=[Log level]: :' \
+            '--help[Show this message and exit]'
+          ;;
+        address)
+          _arguments \
+            '--mnemonic-file=[Path to mnemonic file]:file:_files' \
+            '--prompt-bip39-passphrase[Prompt for BIP39 passphrase interactively]' \
+            '--network=[Bitcoin network]: :' \
+            '--backend=[Backend\: descriptor_wallet | neutrino]: :' \
+            '--rpc-url=[]: :' \
+            '--neutrino-url=[]: :' \
+            '--data-dir=[Data directory (default\: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)]:file:_files' \
+            '--config-file=[Config file path (defaults to <data-dir>/config.toml)]:file:_files' \
             '--log-level=[Log level]: :' \
             '--help[Show this message and exit]'
           ;;
