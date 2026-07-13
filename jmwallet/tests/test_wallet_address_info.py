@@ -155,6 +155,100 @@ class TestAddressStatusDetermination:
         )
         assert status == "cj-change"
 
+    def test_determine_status_reused_multiple_utxos(self, wallet):
+        """An address holding more than one UTXO has been paid to more than
+        once and must be flagged 'reused' (legacy wallet parity), taking
+        precedence over deposit/cj-out."""
+        from jmwallet.wallet.models import UTXOInfo
+
+        def _utxo(vout: int, label: str | None = None) -> UTXOInfo:
+            return UTXOInfo(
+                txid="a" * 64,
+                vout=vout,
+                value=100000,
+                address="bc1q_reused",
+                confirmations=3,
+                scriptpubkey="0014" + "00" * 20,
+                path="m/84'/1'/0'/0/0",
+                mixdepth=0,
+                label=label,
+            )
+
+        # Two UTXOs on a deposit address -> reused (overrides "deposit").
+        status = wallet._determine_address_status(
+            address="bc1q_reused",
+            balance=200000,
+            is_external=True,
+            used_addresses=set(),
+            history_addresses={},
+            utxos=[_utxo(0), _utxo(1)],
+        )
+        assert status == "reused"
+
+        # Two UTXOs on a cj-out address -> reused (overrides "cj-out").
+        status = wallet._determine_address_status(
+            address="bc1q_reused",
+            balance=200000,
+            is_external=False,
+            used_addresses={"bc1q_reused"},
+            history_addresses={"bc1q_reused": "cj_out"},
+            utxos=[_utxo(0), _utxo(1)],
+        )
+        assert status == "reused"
+
+    def test_determine_status_reused_autofrozen_single_utxo(self, wallet):
+        """A single UTXO carrying the forced-address-reuse auto-freeze label
+        means funds landed on an already-used-then-emptied address; surface it
+        as 'reused' even though only one UTXO remains."""
+        from jmwallet.wallet.models import UTXOInfo
+        from jmwallet.wallet.utxo_metadata import AUTO_FREEZE_REUSE_LABEL
+
+        utxo = UTXOInfo(
+            txid="a" * 64,
+            vout=0,
+            value=50000,
+            address="bc1q_refunded",
+            confirmations=1,
+            scriptpubkey="0014" + "00" * 20,
+            path="m/84'/1'/0'/0/0",
+            mixdepth=0,
+            label=AUTO_FREEZE_REUSE_LABEL,
+        )
+        status = wallet._determine_address_status(
+            address="bc1q_refunded",
+            balance=50000,
+            is_external=True,
+            used_addresses={"bc1q_refunded"},
+            history_addresses={},
+            utxos=[utxo],
+        )
+        assert status == "reused"
+
+    def test_determine_status_single_utxo_not_reused(self, wallet):
+        """A single, normally-labeled UTXO must keep its usual status."""
+        from jmwallet.wallet.models import UTXOInfo
+
+        utxo = UTXOInfo(
+            txid="a" * 64,
+            vout=0,
+            value=100000,
+            address="bc1q_external",
+            confirmations=3,
+            scriptpubkey="0014" + "00" * 20,
+            path="m/84'/1'/0'/0/0",
+            mixdepth=0,
+            label="deposit",
+        )
+        status = wallet._determine_address_status(
+            address="bc1q_external",
+            balance=100000,
+            is_external=True,
+            used_addresses=set(),
+            history_addresses={},
+            utxos=[utxo],
+        )
+        assert status == "deposit"
+
     def test_internal_transfer_not_labeled_as_coinjoin(self, wallet):
         """Regression for issue #517.
 
@@ -843,6 +937,36 @@ class TestAddressInfoForMixdepth:
         # Earlier addresses should be "new"
         assert addresses[0].status == "new"
         assert addresses[0].balance == 0
+
+    def test_multiply_funded_address_is_reused(self, wallet):
+        """End-to-end (through get_address_info_for_mixdepth): an address with
+        two UTXOs is surfaced as 'reused', with its combined balance."""
+        addr_2 = wallet.get_receive_address(0, 2)
+        wallet.utxo_cache[0] = [
+            UTXOInfo(
+                txid=c * 64,
+                vout=0,
+                value=100000,
+                address=addr_2,
+                confirmations=6,
+                scriptpubkey="0014" + "00" * 20,
+                path=f"{wallet.root_path}/0'/0/2",
+                mixdepth=0,
+            )
+            for c in ("0", "1")
+        ]
+
+        addresses = wallet.get_address_info_for_mixdepth(
+            mixdepth=0,
+            change=0,
+            gap_limit=2,
+            used_addresses=set(),
+            history_addresses={},
+        )
+        addr_2_info = addresses[2]
+        assert addr_2_info.balance == 200000
+        assert len(addr_2_info.utxos) == 2
+        assert addr_2_info.status == "reused"
 
     def test_internal_addresses(self, wallet):
         """Test getting internal (change) addresses."""

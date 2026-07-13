@@ -1079,6 +1079,7 @@ def _show_extended_wallet_info(
     print("  cj-out        - CoinJoin output (mixed funds)")
     print("  cj-change     - Change output from a CoinJoin (deanonymising, keep separate)")
     print("  non-cj-change - Regular change (not from CoinJoin)")
+    print("  reused        - Paid to more than once (privacy warning; avoid reuse)")
     print('  reserved      - Set aside/handed out by you (label in "quotes"); do not reuse')
     print("  used-empty    - Previously used, now empty (do not reuse)")
     print("  flagged       - Shared with peers but tx failed (do not reuse)")

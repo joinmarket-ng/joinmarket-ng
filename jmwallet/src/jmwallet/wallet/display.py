@@ -12,6 +12,7 @@ from typing import Any
 
 from jmwallet.wallet.constants import FIDELITY_BOND_BRANCH
 from jmwallet.wallet.models import AddressInfo, AddressStatus, UTXOInfo
+from jmwallet.wallet.utxo_metadata import AUTO_FREEZE_REUSE_LABEL
 
 
 class WalletDisplayMixin:
@@ -143,6 +144,7 @@ class WalletDisplayMixin:
                 is_external=is_external,
                 used_addresses=used_addresses,
                 history_addresses=history_addresses,
+                utxos=address_utxos.get(address, []),
             )
 
             addresses.append(
@@ -168,6 +170,7 @@ class WalletDisplayMixin:
         is_external: bool,
         used_addresses: set[str],
         history_addresses: dict[str, str],
+        utxos: list[UTXOInfo] | None = None,
     ) -> AddressStatus:
         """
         Determine the status label for an address.
@@ -178,6 +181,9 @@ class WalletDisplayMixin:
             is_external: True if external (receive) address
             used_addresses: Set of addresses used in CoinJoin history
             history_addresses: Dict mapping address -> type (cj_out, change, etc.)
+            utxos: The UTXOs currently held at this address (used to detect
+                address reuse: more than one UTXO, or a UTXO auto-frozen by the
+                forced-address-reuse defense).
 
         Returns:
             Status string for display
@@ -186,7 +192,18 @@ class WalletDisplayMixin:
         history_type = history_addresses.get(address)
 
         if balance > 0:
-            # Has funds
+            # Has funds. Address reuse takes precedence over every other funded
+            # status: a receive address holding more than one UTXO has been paid
+            # to more than once (matching the legacy wallet's ``reused`` label,
+            # jmclient/wallet_utils.py), and a single UTXO auto-frozen by the
+            # forced-address-reuse defense means funds landed on an
+            # already-used-then-emptied address. Both are privacy-relevant and
+            # must be surfaced distinctly.
+            address_utxos = utxos or []
+            if len(address_utxos) > 1 or any(
+                u.label == AUTO_FREEZE_REUSE_LABEL for u in address_utxos
+            ):
+                return "reused"
             if history_type == "cj_out":
                 return "cj-out"
             elif history_type == "change":
