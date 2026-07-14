@@ -48,6 +48,18 @@ class TestWebSocketAuth:
             # Should get disconnected
             ws.receive_text()
 
+    def test_invalid_token_cannot_receive_queued_notification(
+        self, ws_client: tuple[TestClient, str]
+    ) -> None:
+        client, _ = ws_client
+        state = get_daemon_state()
+
+        with pytest.raises(WebSocketDisconnect), client.websocket_connect("/api/v1/ws") as ws:
+            state.broadcast_ws({"txid": "private", "txdetails": {}})
+            ws.send_text("invalid_token_here")
+            ws.receive_text()
+        assert not state._ws_clients
+
 
 class TestWebSocketNotifications:
     def test_receives_coinjoin_state(self, ws_client: tuple[TestClient, str]) -> None:
@@ -76,6 +88,20 @@ class TestWebSocketNotifications:
             msg = ws.receive_text()
             data = json.loads(msg)
             assert data["txid"] == "abc123"
+
+    def test_queues_notification_before_auth_is_processed(
+        self, ws_client: tuple[TestClient, str]
+    ) -> None:
+        """A notification after handshake completion is retained during auth."""
+        client, token = ws_client
+        state = get_daemon_state()
+
+        with client.websocket_connect("/api/v1/ws") as ws:
+            assert len(state._ws_clients) == 1
+            state.broadcast_ws({"txid": "during-auth", "txdetails": {"amount": 1}})
+            ws.send_text(token)
+
+            assert json.loads(ws.receive_text())["txid"] == "during-auth"
 
 
 class TestWebSocketPaths:

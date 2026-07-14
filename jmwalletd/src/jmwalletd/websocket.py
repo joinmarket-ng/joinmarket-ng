@@ -35,12 +35,15 @@ _WS_PATH = ""
 @router.websocket(_WS_PATH)
 async def websocket_endpoint(websocket: WebSocket) -> None:
     """Handle a WebSocket connection with token-based authentication."""
-    await websocket.accept()
-
     state = get_daemon_state()
-    queue: asyncio.Queue[str] | None = None
+    # Register before accepting so notifications cannot be lost between the
+    # client completing the handshake and the server processing its token.
+    # The writer is started only after authentication succeeds.
+    queue = state.register_ws_client()
 
     try:
+        await websocket.accept()
+
         # Wait for the auth token (first message).
         token_msg = await asyncio.wait_for(websocket.receive_text(), timeout=30.0)
 
@@ -51,9 +54,6 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             logger.debug("WebSocket auth failed: {}", exc)
             await websocket.close(code=4001, reason="Invalid token")
             return
-
-        # Register for notifications.
-        queue = state.register_ws_client()
 
         # Run two tasks concurrently:
         # 1. Read incoming messages (heartbeat tokens or close).
@@ -76,7 +76,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         async def _writer() -> None:
             """Send queued notifications to the client."""
             while True:
-                msg = await queue.get()  # type: ignore[union-attr]
+                msg = await queue.get()
                 try:
                     await websocket.send_text(msg)
                 except Exception:
@@ -102,5 +102,4 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     except Exception:
         logger.exception("WebSocket error")
     finally:
-        if queue is not None:
-            state.unregister_ws_client(queue)
+        state.unregister_ws_client(queue)
