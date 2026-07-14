@@ -1,6 +1,6 @@
 [project]
 name = "jm-tumbler"
-version = "0.33.0"
+version = "0.34.0"
 description = "JoinMarket tumbler: role-mixing CoinJoin schedules with YAML-persisted state"
 requires-python = ">=3.11"
 dependencies = [

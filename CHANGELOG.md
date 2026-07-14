@@ -7,6 +7,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.34.0] - 2026-07-14
+
+Automatic history import for existing wallets, fee quantization defaults for better privacy, coin control labels, local mempool API support, bug fixes, and security hardening.
+
+### Added
+
+- Detect CoinJoin transactions from their output structure ([3ec85e3d](../../commit/3ec85e3d5f0ad18c210e6fae367c7cf13f7402f9))
+- Show cj-out/cj-change for imported wallets by reconstructing CoinJoin labels from on-chain data ([ea805be6](../../commit/ea805be6cc4b4d56e2672b636ef0c138aa1a52db))
+- Show fidelity bond addresses that hold more than one UTXO in list-bonds, including the extra locked coins and the total locked at the address ([63ef4778](../../commit/63ef4778e51cae2fec0b468fbba3c6b9cbf18c67))
+- Add shared fee-quantization grid primitives in jmcore ([52702271](../../commit/52702271eaa907c1c79dcd02f2a8c94b0291e6c4))
+- Show a fee-quantization bands chart in the orderbook watcher ([d60612a7](../../commit/d60612a7446b7119501549fc8795df122dac064c))
+- Add a zero (free-maker) band to the absolute fee quantization grid ([527329c2](../../commit/527329c28213172a36a3b361805ef0c4496d575f))
+- Count advertised bonds without a backend and chart makers in their rounded-up fee band ([276c7c03](../../commit/276c7c03c2ac4a1106414d2b4e7a0ea050b6a652))
+- Fee quantization chart shows cumulative reachable bond share per band ([864e93e1](../../commit/864e93e1dcdb7b1bbfb51b3d3b355c473850c3d6))
+- Default maker fee sits on a quantization quantum with randomization disabled ([9134c0c6](../../commit/9134c0c6f489e7c3845104dceed8e00c3b33a8fd))
+- Redesign the fee quantization chart to show which makers share an exact-fee anonymity set, with a legend, unit captions, and per-band median max size ([8a1afa30](../../commit/8a1afa30773317fe5ef2755e6816cc152550c949))
+- Fee quantization chart tooltip now shows cumulative bond share and max coinjoin size for 10 makers, in sats ([939fd698](../../commit/939fd698ea7b50e34b219a4378ffc83dd89f2de8))
+- Persist handed-out deposit addresses so /address/new never reissues one after a restart ([dc5ae6c9](../../commit/dc5ae6c95fed98f61ad3c0d5e078446bbac7f3f4))
+- Let deposit addresses be set aside with a label, shown in jm-wallet info --extended ([dc5ae6c9](../../commit/dc5ae6c95fed98f61ad3c0d5e078446bbac7f3f4))
+- Add 'jm-wallet address' commands to reserve, label, release, and list deposit addresses ([d5a736db](../../commit/d5a736dbdd4bc2ce4fcfdd46f7fde86e960730ce))
+- Add incremental wallet transaction enumeration for descriptor and Neutrino backends ([9500de04](../../commit/9500de04f57276bb0e3a58062e5ba12a37e0169e))
+- Notify websocket clients about deposits, CoinJoins, sends, and later confirmations for descriptor and Neutrino wallets ([e7cbccd3](../../commit/e7cbccd3084cd8d0abe5c75060ac4be8a296ba1f))
+- Allow explicit direct access to a configured mempool API ([602be73d](../../commit/602be73df41f6caa7ca37dc5e5105c9db674bb70))
+
+### Fixed
+
+- All maker settings are now configurable from config.toml, including dual_offers, directory reconnection tuning, and orderbook rate limiter knobs. ([af8fd720](../../commit/af8fd720aafab45c4fcc4f5874cf2fae45b83c4c))
+- Existing coins on reused addresses are no longer auto-frozen on the first sync after a wallet restart or unlock. ([84ab95b0](../../commit/84ab95b042db8d47b942f52deab91b41488ea57f))
+- Accept a single-string notifications url and show a clear message for invalid config values instead of crashing at startup ([64767960](../../commit/6476796078f238c3a69817f4e0124eb53693041d))
+- Verify the appended nick signature on relayed maker responses and attribute them to the signed sender instead of matching nicks by substring, preventing a malicious maker from hijacking another maker's encrypted session or forging error responses ([e0af9a15](../../commit/e0af9a15ba38da2ce2cd4f6faac5140fafd26662))
+- Validate a peer-supplied relative cjfee before fixed-point formatting so a crafted offer can no longer expand to gigabytes and exhaust memory in every peer parsing the orderbook ([f2efe3c7](../../commit/f2efe3c7717c83a4fa109d5301355ebb68097fe2))
+- Stop auto-freezing legitimate first-use coins discovered by a ([29595ef0](../../commit/29595ef0903202b06371d878b3ce3ec61bf8ca8b))
+- Wait out Bitcoin Core's transient wallet-loading state on all wallet load paths instead of triggering a redundant rescan or failing ([45346eaa](../../commit/45346eaa852efd0a2e189fa017e386342d654395))
+- Stop surfacing the expected neutrino 501 from /v1/tx as an error during wallet info ([8bb4a7ba](../../commit/8bb4a7ba4bf3d88e60702bf56ca256ac7dbaf739))
+- Detect confirmation of neutrino pending coinjoins via chain lookups so they are no longer marked failed once they confirm ([006593a8](../../commit/006593a8ed6abce53ae2a551b6857f74ff2f1a7f))
+- Fix fidelity bond UTXOs disappearing from wallet balance when the local bond registry has no matching entry but Bitcoin Core already tracks the bond address ([b7030c7d](../../commit/b7030c7d3fcb293636dc0b70dd3bb571c93f7867))
+- Fix fidelity bond registry migration failing to claim legacy entries with a stale or inconsistent path/pubkey ([edb1fd52](../../commit/edb1fd526fa05208b1130d725491a7eabc62fb9c))
+- Fix wallet-info reporting fidelity bonds as found when the bond-aware sync would not actually register them ([2379a9c1](../../commit/2379a9c17f441e7dce7eb7d39d785b00fbf33f16))
+- Fix fidelity bond sync listing all 960 timenumber addresses and registering only one bond at the wrong value ([4877e743](../../commit/4877e74370c84c464947558e130f7565da74dd75))
+- Fix fidelity bond value in list-bonds not refreshing after a plain wallet sync when the bond address has multiple UTXOs ([d2d1b1b2](../../commit/d2d1b1b28a50f60cfc983724f5f49f3f4b470ef0))
+- Starting a wallet rescan while Bitcoin Core is already rescanning no longer fails with RPC error -4; the existing scan is tracked instead ([7537e7e7](../../commit/7537e7e7053199126fed4bbfdfd0548498600a73))
+- getrescaninfo now reports real rescan progress from Bitcoin Core instead of always 0.0 ([7351e296](../../commit/7351e296cd72af9c295e279f12ecff4065869263))
+- getrescaninfo and /session keep reporting rescanning=true while Bitcoin Core is still scanning ([7351e296](../../commit/7351e296cd72af9c295e279f12ecff4065869263))
+- sign_bond_psbt.py now reports the installed HWI version and hints that HWI >= 3.1.0 is required to detect newer devices (Ledger Stax/Flex, Trezor Safe 3/5) when no hardware wallet is found. ([606841c0](../../commit/606841c044da93d77e74b39cb21a0228a370ff81))
+- spend-bond guidance no longer claims current Ledger firmware can sign bond PSBTs via HWI; it explains the legacy-app caveat and points to the mnemonic and Specter DIY QR fallbacks. ([49f5b5a8](../../commit/49f5b5a8e87f0104a7b976714f34f3bc7fb47d97))
+- Make the first wallet command after `jm-wallet generate` near-instant by recording the wallet creation height, and report scan progress during first-time wallet setup instead of appearing frozen ([0d341e59](../../commit/0d341e59d8b36dc949971809f55d7ae71ee8b649))
+- Fix /address/new/{mixdepth} returning the same address on repeated calls ([bb4e8f1a](../../commit/bb4e8f1a188aad162fb5df84e412493bdcf434ed))
+- Honor the documented orderbook_min_wait and orderbook_quiet_period config keys in the taker CLI instead of silently using defaults ([68483c64](../../commit/68483c644b87e580c2d016a7c76016cb20f2f08b))
+- Honor orderbook_min_wait and orderbook_quiet_period for CoinJoins started through the jmwalletd API ([9ecda897](../../commit/9ecda897bebb985977ae3c85a4bc0f1393071d04))
+- Honor the [tumbler] pacing settings (retry delay, confirmation poll interval, min confirmations) in the standalone tumbler CLI, not just jmwalletd ([6b001d03](../../commit/6b001d0375d3a3ef3d1f6e2d1dcd9ea3c0e5b09f))
+- Honor all [taker] policy settings for tumbler phases and CoinJoins started through the jmwalletd API ([7e6a220b](../../commit/7e6a220bfbf0a9fd1f2a300207311d714597f95f))
+- Prevent background work (commitment broadcasts, wallet resyncs, notifications) from being garbage-collected mid-flight and log its failures ([e2b0e370](../../commit/e2b0e3706f16968a7ed151a89941e9b85e564b92))
+- Fix the session endpoint always reporting a null schedule while a tumbler is running, so JAM can render scheduler progress again ([8fb33ad6](../../commit/8fb33ad640d661bf255ee0906342ce4bab9aa433))
+- Fix the fee quantization chart labeling the 10% relative quantum as 1% ([880d3e40](../../commit/880d3e40be6198aa2a0112a6fd827fe9bcfaf349))
+- Fee quantization chart renders the grid even while the orderbook is still empty ([66d5b730](../../commit/66d5b73090c7a57816f415ba07e0c2574ea58430))
+- Browsers no longer serve a stale web UI after the orderbook watcher is upgraded ([16d47fc3](../../commit/16d47fc3b69dfce83ebf3666ddfd8811643fbc21))
+- Per-connection Tor/TCP dial logs moved from INFO to DEBUG ([bda6ddd3](../../commit/bda6ddd3d8e036ef088fdd3e8f44e2373617d73d))
+- Reduce orderbook watcher log noise from bond deduplication and maker health checks ([faf643a4](../../commit/faf643a4108b80c489203981fc852ed5cb062369))
+- Verify that a maker's signing pubkey owns the UTXO it signs before accepting the signature, so a maker can no longer pass verification with a key it does not control and make the taker assemble and broadcast a consensus-invalid coinjoin ([5591ccca](../../commit/5591ccca9d0a530279d4c7dc7157227faa52df9b))
+- Require the maker's !ioauth btc_sig to verify and bind the auth pubkey to one of its declared UTXOs, dropping the maker otherwise, so a malicious directory can no longer substitute a maker's encryption key to MITM the session and a maker can no longer authenticate with a UTXO it does not control ([80d60717](../../commit/80d6071799229693f731e0aabbeb252046d295d3))
+- Accept honest makers whose declared UTXO scriptPubKey hex is uppercase ([6a354843](../../commit/6a354843c4d4c7cd730cd35f04e4149cb275eefa))
+- Rescans requested above the chain tip (e.g. JAM's default mainnet SegWit height on signet/regtest) are clamped to the tip instead of failing server-side after a 200 OK response ([c1384d3a](../../commit/c1384d3acc35e766c82fb156e15a1b22341c57f9))
+- Stop peerlist-fetch log spam and abort immediately when the directory connection drops ([04477a3a](../../commit/04477a3ab2f9683e6d43b4a67bf9266e635dc033))
+- Tumbler stop now terminates a stuck phase after a grace period instead of hanging ([f251697f](../../commit/f251697f4382bca547882717c7dea67af025ed58))
+- Show a 'reused' privacy warning for deposit addresses paid to more than once ([56fbedf6](../../commit/56fbedf6e7a647567f63f59b1c703566b36131b6))
+- Fix backup detection on Raspiblitz by using portable bash glob ([b9b9a221](../../commit/b9b9a221f0beabb61f49acddd3c30f02a361ba6d))
+- Fixed exit behavior when pressing 'B' while already in JM-NG shell on RaspiBlitz ([c9054d99](../../commit/c9054d9954e07e25dfda23c63814e393030924c1))
+- Abort in-flight peerlist requests immediately when their continuous listener disconnects ([5d98fa14](../../commit/5d98fa14ec98e8e8c58382c9769c3f56b39e4329))
+- Keep tumbler shutdown bounded while recording cancellation only after the runner actually stops ([d6bc39e7](../../commit/d6bc39e7675f5d0f6b864f23ccd5a9acd8c7a81b))
+- Make wallet discovery portable on BusyBox and include hidden wallet files without changing caller shell options ([75a6e9e7](../../commit/75a6e9e720ea7db30fdea7bdd03b451703f83795))
+- Preserve forced-address-reuse protection and explicit metadata changes across restarts and concurrent wallet processes ([a7443611](../../commit/a7443611249940f4f9680ecf1203dd6d3bdcfcb3))
+- Verify CI-first release signatures without requiring local manifests ([a0f2979f](../../commit/a0f2979f27fbce3a446f40a38731d9f9d96b3abe))
+- Install the tumbler with complete maker and taker profiles ([648768d0](../../commit/648768d0c20fd46d285d044de82e2f0182a5b9e4))
+- Prevent wallet notifications from being missed immediately after WebSocket connection ([28d3a84e](../../commit/28d3a84ef3b4c5d1b4aa956af1bd77443f913196))
+
 ## [0.33.0] - 2026-06-24
 
 ### Added
@@ -1510,7 +1585,8 @@ Releases prior to these changes (including 0.13.5, 0.13.6, and 0.13.7) cannot be
 - Pre-built image support for directory server compose.
 - Tor configuration instructions.
 
-[Unreleased]: ../../compare/0.33.0...HEAD
+[Unreleased]: ../../compare/0.34.0...HEAD
+[0.34.0]: ../../compare/0.33.0...0.34.0
 [0.33.0]: ../../compare/0.32.0...0.33.0
 [0.32.0]: ../../compare/0.31.1...0.32.0
 [0.31.1]: ../../compare/0.31.0...0.31.1
