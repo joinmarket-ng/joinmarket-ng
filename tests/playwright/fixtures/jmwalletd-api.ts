@@ -41,7 +41,7 @@ async function apiFetch(
   const { token, ...fetchOptions } = options;
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
-    ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    ...(token ? { "x-jm-authorization": `Bearer ${token}` } : {}),
     ...((fetchOptions.headers as Record<string, string>) || {}),
   };
   return fetch(`${JMWALLETD_URL}${path}`, { ...fetchOptions, headers });

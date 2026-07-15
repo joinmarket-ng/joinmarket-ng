@@ -25,6 +25,36 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_ROOT"
 
+default_shared_image_project() {
+    local name
+    name=$(printf '%s' "$(basename "$PROJECT_ROOT")" \
+        | LC_ALL=C tr '[:upper:]' '[:lower:]' \
+        | LC_ALL=C tr -cs 'a-z0-9_-' '-')
+    # Compose project names must start with an alphanumeric character.
+    name="${name#"${name%%[a-z0-9]*}"}"
+    printf '%s' "${name:-joinmarket-ng}"
+}
+
+SHARED_IMAGE_PROJECT="${JM_SHARED_IMAGE_PROJECT:-$(default_shared_image_project)}"
+if [[ ! "$SHARED_IMAGE_PROJECT" =~ ^[a-z0-9][a-z0-9_-]*$ ]]; then
+    printf 'Invalid JM_SHARED_IMAGE_PROJECT: %s\n' "$SHARED_IMAGE_PROJECT" >&2
+    exit 2
+fi
+
+# Always import packages from this worktree. Editable installs may point at a
+# different checkout, which mixes class identities and invalidates test results.
+PROJECT_PYTHONPATH=$(printf '%s:' \
+    "$PROJECT_ROOT" \
+    "$PROJECT_ROOT/jmcore/src" \
+    "$PROJECT_ROOT/jmwallet/src" \
+    "$PROJECT_ROOT/directory_server/src" \
+    "$PROJECT_ROOT/jmwalletd/src" \
+    "$PROJECT_ROOT/tumbler/src" \
+    "$PROJECT_ROOT/orderbook_watcher/src" \
+    "$PROJECT_ROOT/maker/src" \
+    "$PROJECT_ROOT/taker/src")
+export PYTHONPATH="${PROJECT_PYTHONPATH%:}${PYTHONPATH:+:$PYTHONPATH}"
+
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -708,19 +738,57 @@ setup_reference_implementation() {
 # =============================================================================
 # Build Docker images (shared across all suites)
 # =============================================================================
+compose_environment_value() {
+    local variable=$1
+    local compose_environment=$2
+    local line
+    while IFS= read -r line; do
+        if [[ "$line" == "$variable="* ]]; then
+            printf '%s' "${line#*=}"
+            return 0
+        fi
+    done <<< "$compose_environment"
+}
+
+configure_shared_images() {
+    # Compose otherwise derives image names from each isolated project and may
+    # silently reuse a stale per-suite image instead of the shared build above.
+    # Resolve through Compose so overrides in .env have the same precedence as
+    # they did during the build, then export them for every isolated project.
+    local compose_environment
+    compose_environment=$(COMPOSE_PROJECT_NAME="$SHARED_IMAGE_PROJECT" \
+        docker compose config --environment)
+
+    local directory_server_image orderbook_watcher_image maker_image taker_image jmwalletd_image
+    directory_server_image=$(compose_environment_value DIRECTORY_SERVER_IMAGE "$compose_environment")
+    orderbook_watcher_image=$(compose_environment_value ORDERBOOK_WATCHER_IMAGE "$compose_environment")
+    maker_image=$(compose_environment_value MAKER_IMAGE "$compose_environment")
+    taker_image=$(compose_environment_value TAKER_IMAGE "$compose_environment")
+    jmwalletd_image=$(compose_environment_value JMWALLETD_IMAGE "$compose_environment")
+
+    export DIRECTORY_SERVER_IMAGE="${directory_server_image:-${SHARED_IMAGE_PROJECT}-directory:latest}"
+    export ORDERBOOK_WATCHER_IMAGE="${orderbook_watcher_image:-${SHARED_IMAGE_PROJECT}-orderbook-watcher:latest}"
+    export MAKER_IMAGE="${maker_image:-${SHARED_IMAGE_PROJECT}-maker:latest}"
+    export TAKER_IMAGE="${taker_image:-${SHARED_IMAGE_PROJECT}-taker:latest}"
+    export JMWALLETD_IMAGE="${jmwalletd_image:-${SHARED_IMAGE_PROJECT}-jmwalletd:latest}"
+}
+
 build_images() {
     if [ "${SKIP_BUILD:-0}" = "1" ]; then
         log_info "Skipping image build (SKIP_BUILD/--no-build); reusing existing images"
+        configure_shared_images
         return 0
     fi
     log_info "Building Docker images (shared across suites)..."
     # Use --profile all so profile-gated services (e.g. jam-playwright,
     # neutrino*, reference, maker) are built too. Without this, profile
     # services keep stale images from previous runs.
-    docker compose --profile all --profile e2e --profile maker \
+    COMPOSE_PROJECT_NAME="$SHARED_IMAGE_PROJECT" docker compose \
+        --profile all --profile e2e --profile maker \
         --profile neutrino --profile reference --profile reference-maker \
         --profile taker \
         build --parallel 2>&1 | tee "${PARALLEL_DIR}/build.log"
+    configure_shared_images
     log_success "Docker images built"
 }
 
@@ -732,21 +800,7 @@ run_suite_unit() {
     local log="${PARALLEL_DIR}/unit.log"
     log_suite "Starting: Unit Tests"
     {
-        local pythonpath_components=(
-            "${PROJECT_ROOT}"
-            "${PROJECT_ROOT}/jmcore/src"
-            "${PROJECT_ROOT}/jmwallet/src"
-            "${PROJECT_ROOT}/directory_server/src"
-            "${PROJECT_ROOT}/jmwalletd/src"
-            "${PROJECT_ROOT}/tumbler/src"
-            "${PROJECT_ROOT}/orderbook_watcher/src"
-            "${PROJECT_ROOT}/maker/src"
-            "${PROJECT_ROOT}/taker/src"
-        )
-        local pythonpath
-        pythonpath=$(IFS=:; echo "${pythonpath_components[*]}")
-
-        PYTHONPATH="${pythonpath}" COVERAGE_FILE=.coverage.unit pytest -c pytest.ini --fail-on-skip \
+        COVERAGE_FILE=.coverage.unit pytest -c pytest.ini --fail-on-skip \
             -lv \
             --cov=jmcore --cov=jmwallet --cov=directory_server --cov=jmwalletd \
             --cov=tumbler \
@@ -833,10 +887,6 @@ run_suite_tumbler() {
         set -e
         generate_override "$suite"
         cleanup_suite "$suite"
-        JMWALLETD_IMAGE="joinmarket-ng-jmwalletd:latest" \
-        MAKER_IMAGE="joinmarket-ng-maker1:latest" \
-        DIRECTORY_IMAGE="joinmarket-ng-directory:latest" \
-        ORDERBOOK_WATCHER_IMAGE="joinmarket-ng-orderbook-watcher:latest" \
         compose_cmd "$suite" --profile e2e up -d \
             bitcoin miner directory directory2 orderbook-watcher tor tor-init wallet-funder \
             jmwalletd maker1 maker2 maker3 maker4 maker5
@@ -1620,6 +1670,7 @@ Environment:
   MAX_CONCURRENT=<N>              Same as --max-concurrent
   JM_TEST_INSTANCE=<N>            Same as --instance
   JM_TEST_PORT_BASE=<port>        First host port of instance 0 (default 20000)
+  JM_SHARED_IMAGE_PROJECT=<name>  Compose project used for shared image tags
   SKIP_BUILD=1                    Same as --no-build
 
 Running two suites at once:

@@ -47,7 +47,7 @@ async function waitForJmwalletd(timeoutMs = 120_000): Promise<void> {
 
 async function getBalance(token: string): Promise<number> {
   const res = await fetch(`${JMWALLETD_URL}/api/v1/wallet/${WALLET_NAME}/display`, {
-    headers: { Authorization: `Bearer ${token}` },
+    headers: { "x-jm-authorization": `Bearer ${token}` },
   });
   const data = await res.json();
   return parseFloat(data?.walletinfo?.total_balance ?? "0");
@@ -57,7 +57,7 @@ async function triggerUtxoRefresh(token: string): Promise<void> {
   // GET /utxos triggers an automatic descriptor wallet refresh in jmwalletd,
   // making any newly received UTXOs visible without an explicit rescan.
   await fetch(`${JMWALLETD_URL}/api/v1/wallet/${WALLET_NAME}/utxos`, {
-    headers: { Authorization: `Bearer ${token}` },
+    headers: { "x-jm-authorization": `Bearer ${token}` },
   });
 }
 
@@ -79,7 +79,7 @@ async function waitForRescan(token: string, timeoutMs = 600_000): Promise<void> 
   while (Date.now() - start < timeoutMs) {
     try {
       const res = await fetch(`${JMWALLETD_URL}/api/v1/session`, {
-        headers: { Authorization: `Bearer ${token}` },
+        headers: { "x-jm-authorization": `Bearer ${token}` },
       });
       const data = await res.json();
       if (data?.rescanning === false) {
@@ -103,7 +103,7 @@ async function waitForRescan(token: string, timeoutMs = 600_000): Promise<void> 
  */
 async function getDescriptorWalletName(token: string): Promise<string> {
   const res = await fetch(`${JMWALLETD_URL}/api/v1/session`, {
-    headers: { Authorization: `Bearer ${token}` },
+    headers: { "x-jm-authorization": `Bearer ${token}` },
   });
   const data = await res.json();
   const name = data?.descriptor_wallet_name;
@@ -220,7 +220,7 @@ export default async function globalSetup(): Promise<void> {
     try {
       const res = await api.unlockWallet(session.wallet_name, PASSWORD);
       await fetch(`${JMWALLETD_URL}/api/v1/wallet/${session.wallet_name}/lock`, {
-        headers: { Authorization: `Bearer ${res.token}` },
+        headers: { "x-jm-authorization": `Bearer ${res.token}` },
       });
     } catch {
       // Unknown password — force-lock by restarting or just proceed.
