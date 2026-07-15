@@ -117,3 +117,20 @@ JoinMarket NG builds on the work of the original JoinMarket project. Special tha
 Thanks to @1440000bytes (Floppy) for the ongoing external audit, and to @L3ftBlank for beta testing and contributions. And to everyone who has opened an issue, submitted a PR, or joined a discussion. You're part of this too!
 
 Sustained by grants from [OpenSats](https://opensats.org/) and the [HRF Bitcoin Development Fund](https://hrf.org/program/financial-freedom/bitcoin-development-fund/). Keeping this project free, open, and independent.
+
+## Donations
+
+JoinMarket NG accepts Bitcoin onchain donations through [Silent Payments](https://bips.dev/352/).
+Many wallets can send to Silent Payment addresses; see the current
+[wallet support list](https://silentpayments.xyz/docs/wallets/). [Sparrow Wallet](https://sparrowwallet.com/)
+is a good option.
+
+```text
+sp1qqt3jvfalrvtjksvmul943cpt3vvx0aydg0fegz4kzagu2dw9zp2x2qjyydsrdzmcf5ltr973zsadcktyqdfzrzkmml2guta6p664fu8e4uvmvmq4
+```
+
+For Lightning Network donations, uset his BOLT12 invoice:
+
+```text
+lno1pgx55mmfdexkzuntv46zqnj8zcssyy55ll6edeyh455s9n2lr9nnaypqj57eqcjadrpzayd4rfzuqvkn
+```
