@@ -6,7 +6,41 @@
 
 JoinMarket NG is a modern implementation of the JoinMarket CoinJoin protocol for Bitcoin privacy.
 
-It is wire-compatible with the reference JoinMarket network and supports both liquidity taking (`jm-taker`) and liquidity making (`jm-maker`).
+Bitcoin's public ledger makes every transaction visible. Without careful privacy practices, payments
+can expose a user's transaction history, balance, and financial relationships. CoinJoin improves
+privacy by combining inputs from several users into one transaction with equal-value outputs. An
+observer can see the transaction, but cannot reliably determine which participant owns which
+equal-value output.
+
+## Why JoinMarket
+
+JoinMarket organizes CoinJoins as an open market instead of relying on a central coordinator:
+
+- **Makers** offer bitcoin liquidity and earn fees for participating in CoinJoins.
+- **Takers** choose offers, build a CoinJoin, and pay the makers they select.
+
+Participants discover each other through redundant directory servers, then exchange sensitive
+transaction data through end-to-end encrypted messages, either over direct peer-to-peer connections
+or directory relays. Each taker coordinates its own CoinJoin, and every participant keeps control of
+their keys. There is no single service that schedules every round, selects every participant, or
+holds users' funds.
+
+The market gives makers an economic reason to keep liquidity available. Takers can initiate a
+CoinJoin when they need one instead of waiting for rounds run by a central service. This combination
+of decentralization and persistent, incentivized liquidity is what makes JoinMarket an important
+part of Bitcoin's privacy infrastructure.
+
+## Why JoinMarket NG
+
+JoinMarket NG is an independent implementation built for maintainability, auditability, and modern
+Bitcoin infrastructure. Its modular, strictly typed Python codebase supports Bitcoin Core and a
+lightweight Neutrino backend, with Tor integrated throughout the network architecture.
+
+Most importantly, JoinMarket NG is wire-compatible with the reference JoinMarket implementation.
+Makers and takers from both implementations participate in the same market, so a new codebase does
+not fragment existing liquidity. Independent implementations reduce reliance on any one codebase,
+make protocol assumptions easier to test, and help the JoinMarket network remain adaptable over
+time.
 
 ## Start Here
 
