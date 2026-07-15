@@ -26,6 +26,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from changelog_commit_utils import ParsedCommit, parse_commit
+from config_changelog import (
+    CONFIG_HEADING,
+    ConfigChangelogError,
+    generate_config_changes_section,
+    replace_config_section,
+)
 
 PROJECT_ROOT = Path(__file__).parent.parent
 CHANGELOG = PROJECT_ROOT / "CHANGELOG.md"
@@ -186,11 +192,20 @@ def update_changelog(new_content: str) -> None:
 
     section_body = section_body.strip("\n")
     generated = new_content.strip("\n")
-
-    if section_body:
-        merged_body = f"{section_body}\n\n{generated}\n"
+    config_index = generated.find(CONFIG_HEADING)
+    if config_index == -1:
+        generated_entries = generated
+        config_section = ""
     else:
-        merged_body = f"{generated}\n"
+        generated_entries = generated[:config_index].rstrip()
+        config_section = generated[config_index:].strip()
+
+    merged_body = "\n\n".join(
+        part for part in (section_body, generated_entries) if part
+    )
+    if config_section:
+        merged_body = replace_config_section(merged_body, config_section).rstrip()
+    merged_body += "\n"
 
     new_changelog = content[:start] + "\n\n" + merged_body + tail
 
@@ -226,6 +241,10 @@ def main() -> None:
         action="store_true",
         help="Do not fail when feat/fix commits are missing Changelog trailers",
     )
+    parser.add_argument(
+        "--config-to-label",
+        help="Label for the later configuration diff (normally the new version)",
+    )
 
     args = parser.parse_args()
 
@@ -238,10 +257,6 @@ def main() -> None:
             print("No tags found, generating changelog from all commits")
 
     commits = get_commits_since(since_ref)
-    if not commits:
-        print("No conventional commits found")
-        return
-
     relevant_commits = [c for c in commits if c.type in TYPE_TO_CATEGORY]
     print(
         f"Found {len(commits)} commits, {len(relevant_commits)} relevant for changelog"
@@ -258,8 +273,22 @@ def main() -> None:
             print(f"- {error}")
         sys.exit(1)
 
+    if since_ref:
+        try:
+            config_section = generate_config_changes_section(
+                since_ref,
+                "HEAD",
+                to_label=args.config_to_label or "Unreleased",
+            )
+        except ConfigChangelogError as exc:
+            print(f"Error: {exc}")
+            sys.exit(1)
+        changelog_section = "\n\n".join(
+            part for part in (changelog_section, config_section) if part.strip()
+        )
+
     if not changelog_section.strip():
-        print("No changelog entries generated (all commits may be skipped types)")
+        print("No changelog entries generated")
         return
 
     print("\n" + "=" * 60)

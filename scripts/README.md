@@ -12,6 +12,8 @@ Utility scripts for JoinMarket NG development and operations.
 - **fidelity_bond_tool.py** - Fetch, parse, and analyze fidelity bond proofs from mainnet makers
 - **fund-test-wallets.sh** - Fund regtest wallets for testing
 - **generate_changelog.py** - Generate changelog entries from git history
+- **config_changelog.py** - Generate or backfill per-release configuration template changes
+- **sync_github_release_notes.py** - Preview or apply GitHub release-note updates from `CHANGELOG.md`
 - **validate_commit_message.py** - Validate Conventional Commit messages and require `Changelog:` trailers for `feat`/`fix`
 - **generate_tor_keys.py** - Generate Tor hidden service keys
 - **regtest-miner-jam.sh** - Run Bitcoin Core regtest miner for JAM compatibility testing

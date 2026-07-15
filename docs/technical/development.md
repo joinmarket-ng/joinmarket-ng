@@ -180,6 +180,28 @@ CI will build the same images independently and verify its layer digests
 match your signed local manifest. The release is confirmed reproducible
 when CI passes.
 
+The version bump also compares the bundled `config.toml.template` with the
+previous release. It adds the complete commented diff to the changelog, or an
+explicit unchanged notice, so the same configuration guidance is included in
+the GitHub release notes. Existing user configuration files are never modified.
+
+To preview GitHub release-note synchronization from the committed changelog:
+
+```bash
+scripts/sync_github_release_notes.py
+```
+
+Review the listed tags, then apply all published release updates or selected
+ones:
+
+```bash
+scripts/sync_github_release_notes.py --apply
+scripts/sync_github_release_notes.py 0.34.0 0.33.0 --apply
+```
+
+This requires an authenticated GitHub CLI session with permission to edit
+releases in `joinmarket-ng/joinmarket-ng`.
+
 `release-manifest-<version>.txt` is gitignored — it is a build artefact
 and is not committed to the repository.
 

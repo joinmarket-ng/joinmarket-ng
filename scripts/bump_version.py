@@ -240,7 +240,10 @@ def run_command(
 
 
 def generate_changelog_entries(
-    current_version: str, dry_run: bool = False, allow_missing_trailers: bool = False
+    current_version: str,
+    new_version: str,
+    dry_run: bool = False,
+    allow_missing_trailers: bool = False,
 ) -> None:
     """Generate changelog entries from commit trailers since the current version tag."""
     cmd = [
@@ -248,6 +251,8 @@ def generate_changelog_entries(
         "scripts/generate_changelog.py",
         "--since",
         current_version,
+        "--config-to-label",
+        new_version,
     ]
     if dry_run:
         cmd.append("--preview")
@@ -257,7 +262,8 @@ def generate_changelog_entries(
     if allow_missing_trailers:
         cmd.append("--allow-missing-trailers")
 
-    run_command(cmd, dry_run=dry_run)
+    # The preview command only reads Git history, so execute it during a dry run.
+    run_command(cmd, dry_run=False)
 
 
 def open_editor_for_changelog(dry_run: bool = False) -> None:
@@ -400,6 +406,7 @@ def main() -> None:
     print("Updating files...")
     generate_changelog_entries(
         current_version,
+        new_version,
         dry_run=args.dry_run,
         allow_missing_trailers=args.allow_missing_trailers,
     )

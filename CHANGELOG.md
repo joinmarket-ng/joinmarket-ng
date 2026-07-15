@@ -82,6 +82,148 @@ Automatic history import for existing wallets, fee quantization defaults for bet
 - Install the tumbler with complete maker and taker profiles ([648768d0](../../commit/648768d0c20fd46d285d044de82e2f0182a5b9e4))
 - Prevent wallet notifications from being missed immediately after WebSocket connection ([28d3a84e](../../commit/28d3a84ef3b4c5d1b4aa956af1bd77443f913196))
 
+### Configuration Changes
+
+Existing `config.toml` files are not updated automatically. Review the bundled template changes below and apply the relevant options manually.
+
+````diff
+--- config.toml.template (0.33.0)
++++ config.toml.template (0.34.0)
+@@ -143,17 +143,6 @@
+ # Directory servers (leave empty to use network defaults)
+ # Override with a custom list if needed:
+ # directory_servers = ["custom1.onion:5222", "custom2.onion:5222"]
+-
+-# How long to keep retrying directory connections at startup (Tor may still be
+-# bootstrapping when the maker starts).  After this timeout, the background
+-# reconnect task takes over.  Defaults to 120 seconds.
+-# directory_startup_timeout = 120
+-
+-# Background reconnect interval in seconds (default: 300)
+-# directory_reconnect_interval = 300
+-
+-# Max reconnection attempts per directory (0 = unlimited, default: 0)
+-# directory_reconnect_max_retries = 0
+
+ # ============================================================================
+ # Wallet Settings
+@@ -205,7 +194,8 @@
+
+ # Explicit start height for initial scan (overrides scan_lookback_blocks if set)
+ # Useful when you know when the wallet was first used. Set to 0 for full scan.
+-# Note: wallets created via the daemon automatically record a creation height,
++# Note: wallets created via `jm-wallet generate` or the daemon automatically
++# record a creation height (when the backend is reachable at creation time),
+ # which is used as the scan start when this setting is not explicitly set.
+ # scan_start_height = 0
+
+@@ -247,11 +237,17 @@
+ # Enable notifications
+ # enabled = false
+
+-# Apprise notification URLs
+-# Examples:
+-#   Telegram: "tgram://bottoken/ChatID"
+-#   Gotify: "gotify://hostname/token"
+-# See: https://github.com/caronc/apprise
++# Apprise notification URLs. This MUST be a TOML array (square brackets) with
++# each URL quoted, even when you only configure a single service:
++#   urls = ["tgram://bottoken/ChatID"]
++# Multiple services (a trailing comma is allowed):
++#   urls = [
++#       "tgram://bottoken/ChatID",
++#       "gotify://hostname/token",
++#   ]
++# A bare string (urls = "tgram://bottoken/ChatID") is also accepted and wrapped
++# into a single-element list, but the array form above is preferred.
++# See https://github.com/caronc/apprise for each service's URL format.
+ # urls = []
+
+ # Notification preferences
+@@ -338,8 +334,11 @@
+ # offer_type = "sw0reloffer"
+
+ # Fee settings (only one is used based on offer_type above)
+-# Defaults match the upstream JoinMarket reference (yg-privacyenhanced) so that
+-# jm-ng makers are not trivially distinguishable from reference makers.
++# The relative default (0.00002) is exactly the lowest fee-quantization quantum,
++# so default makers sit on the grid and share one homogenized fee with every
++# other default maker, maximizing the anonymity set. It also matches the upstream
++# JoinMarket reference. If you set a non-quantized value, enable cjfee_factor
++# randomization below so your exact fee is not a fingerprint.
+ # cj_fee_relative = "0.00002"  # 0.00002 = 0.002% relative fee (for sw0reloffer)
+ # cj_fee_absolute = 500        # Absolute fee in satoshis (for sw0absoffer)
+ # tx_fee_contribution = 0      # Mining fee contribution in satoshis
+@@ -348,8 +347,11 @@
+ # [value*(1-factor), value*(1+factor)] (size is sampled downward only) on every
+ # announcement so observers cannot correlate balance changes with exact values.
+ # Set any factor to 0 to disable randomization for that field.
+-# Defaults match the upstream JoinMarket yg-privacyenhanced reference.
+-# cjfee_factor = 0.1
++# cjfee_factor defaults to 0 (no fee randomization) so a default maker stays
++# exactly on its quantization quantum and blends with other default makers. Only
++# enable it (the upstream reference uses 0.1, i.e. +-10%) if you deviate to a
++# non-quantized fee, where an exact value would otherwise be a fingerprint.
++# cjfee_factor = 0
+ # txfee_contribution_factor = 0.3
+ # size_factor = 0.1
+
+@@ -379,7 +381,8 @@
+ # Timeouts and intervals
+ # session_timeout_sec = 300
+ # rescan_interval_sec = 600
+-# pending_tx_timeout_min = 60  # Minutes before marking unbroadcast CoinJoins as failed
++# pending_tx_timeout_min = 60   # Minutes before marking unbroadcast CoinJoins as failed
++# pending_tx_abandon_hours = 72  # Hours before abandoning a broadcast but unconfirmed tx
+
+ # Privacy: random delay (seconds) before re-announcing offers after a balance change.
+ # Prevents observers from correlating block confirmations with offer updates.
+@@ -392,9 +395,32 @@
+ # onion_serving_port = 5222
+ # tor_target_host = "127.0.0.1"
+
+-# Rate limiting
+-# message_rate_limit = 10   # Messages per second
+-# message_burst_limit = 100
++# Message rate limiting (protects against spam/DoS from peers)
++# message_rate_limit = 10   # Messages per second per peer (sustained)
++# message_burst_limit = 100 # Max burst messages per peer
++
++# Orderbook rate limiting (protects against orderbook spam attacks)
++# orderbook_rate_limit = 1                  # Max responses per peer per interval
++# orderbook_rate_interval = 10.0            # Interval in seconds
++# orderbook_violation_warning_threshold = 10 # Start exponential backoff after N violations
++# orderbook_violation_severe_threshold = 50  # Severe backoff threshold
++# orderbook_violation_ban_threshold = 100    # Ban peer after N violations
++# orderbook_ban_duration = 3600.0            # Ban duration in seconds (1 hour)
++
++# Directory server reconnection settings
++# How long to keep retrying directory connections at startup (Tor may still be
++# bootstrapping when the maker starts). After this timeout, the background
++# reconnect task takes over. Default: 120 seconds.
++# directory_startup_timeout = 120
++# Background reconnect interval in seconds. Default: 300 (5 minutes).
++# directory_reconnect_interval = 300
++# Max reconnection attempts per directory (0 = unlimited). Default: 0.
++# directory_reconnect_max_retries = 0
++
++# Dual-offer mode: advertise both a relative and an absolute fee offer simultaneously.
++# Equivalent to passing --dual-offers on the CLI. The CLI flag takes precedence
++# when both are set. Default: false (single offer determined by offer_type above).
++# dual_offers = false
+
+ # ============================================================================
+ # Taker Settings (CoinJoin Client)
+@@ -519,6 +545,7 @@
+
+ # Mempool API settings
+ # mempool_api_url = ""  # Disabled by default for privacy (no external API calls)
++# mempool_api_use_tor = true  # Set false only for direct access, which exposes your IP and bond queries
+ # mempool_web_url = ""  # Optional explorer URL for UI links
+
+ # Connection settings
+````
+
 ## [0.33.0] - 2026-06-24
 
 ### Added
@@ -121,6 +263,42 @@ Automatic history import for existing wallets, fee quantization defaults for bet
 - Suppress ANSI colors in 'jm-wallet info --extended' when output is piped or redirected ([90e51786](../../commit/90e51786c1c86746ecf42d78b8ff45b4b7c5f204))
 - Freeze manager no longer starts the cursor on a fidelity bond and reports skipped bonds accurately ([45f90582](../../commit/45f90582684bdb189efd724916f2277d7c5bd076))
 
+### Configuration Changes
+
+Existing `config.toml` files are not updated automatically. Review the bundled template changes below and apply the relevant options manually.
+
+````diff
+--- config.toml.template (0.32.0)
++++ config.toml.template (0.33.0)
+@@ -180,6 +180,18 @@
+
+ # Dust threshold in satoshis
+ # dust_threshold = 27300
++
++# Forced address-reuse defense (privacy). When a UTXO arrives on a wallet
++# address that was previously used and is now empty, it is AUTOMATICALLY frozen
++# so it is never co-spent in a CoinJoin (which would link your coins via the
++# common-input-ownership heuristic). Coins arriving on an address that still
++# holds funds are left spendable (so they can be fully spent together). See
++# https://en.bitcoin.it/wiki/Privacy#Forced_address_reuse.
++#   -1  (default) freeze ALL such reuse UTXOs, whatever the value
++#    N  (positive) freeze only reuse UTXOs with value <= N sats
++#    0  disable auto-freezing
++# Release a frozen UTXO with `jm-wallet unfreeze`.
++# max_sats_freeze_reuse = -1
+
+ # Smart wallet scanning optimizations
+ # When importing an existing wallet, initial sync scans recent blocks for fast startup.
+@@ -375,6 +387,7 @@
+ # offer_reannounce_delay_max = 600
+
+ # Onion service settings
++# onion_host = ""  # Static hidden service address (e.g., 'mymaker...onion'). When not set, Tor control auto-generates one.
+ # onion_serving_host = "127.0.0.1"
+ # onion_serving_port = 5222
+ # tor_target_host = "127.0.0.1"
+````
+
 ## [0.32.0] - 2026-06-03
 
 Neutrino backend now has mempool support. Along with other improvements and bug fixes.
@@ -145,6 +323,81 @@ Neutrino backend now has mempool support. Along with other improvements and bug 
 - Maker now sends notifications when a CoinJoin enters the mempool and when it confirms ([e4442fc8](../../commit/e4442fc875bb7e8cc51822a013928da2f39f5126))
 - Secure the neutrino backend out-of-the-box with TLS trust-on-first-use pinning, default cert/token paths, automatic HTTPS, and a hard error on network mismatch ([fd3e4d8c](../../commit/fd3e4d8ccc35a03c53ef5e832c011ad2fd921971))
 
+### Configuration Changes
+
+Existing `config.toml` files are not updated automatically. Review the bundled template changes below and apply the relevant options manually.
+
+````diff
+--- config.toml.template (0.31.1)
++++ config.toml.template (0.32.0)
+@@ -60,6 +60,9 @@
+ # rpc_cookie_file = "~/.bitcoin/.cookie"
+
+ # Neutrino backend settings (used by all components when backend_type = "neutrino")
++# URL of the neutrino-api server. Defaults to http://127.0.0.1:8334.
++# When an auth token is configured (see below), the URL is automatically
++# upgraded to https:// because neutrino-api serves HTTPS in authenticated mode.
+ # neutrino_url = "http://127.0.0.1:8334"
+
+ # Preferred neutrino peers (host:port) that should be tried first while still
+@@ -98,24 +101,33 @@
+ # Neutrino-api security settings (auto-TLS + API token authentication).
+ # When neutrino-api starts for the first time it generates a self-signed TLS
+ # certificate (tls.cert + tls.key) and a random API token (auth_token) in its
+-# data directory.  Set these to enable encrypted, authenticated communication.
+-# In Flatpak deployments these are wired automatically from the neutrino data dir.
+-#
+-# Path to the neutrino-api TLS certificate (PEM).  Enables HTTPS with
+-# certificate pinning (trust-on-first-use).
+-# Relative paths (e.g. "neutrino/tls.cert") are resolved against the data
+-# directory ($JOINMARKET_DATA_DIR or --data-dir, default: ~/.joinmarket-ng),
+-# so the same config.toml works regardless of where the data dir lives.
+-# Absolute paths and paths starting with ~ are used as-is.
++# data directory.  Copy (or volume-mount) those into your JoinMarket data
++# directory under "neutrino/" and they are picked up automatically, no need to
++# uncomment anything below. In Flatpak deployments this is wired automatically.
++#
++# Path to the neutrino-api TLS certificate (PEM).  Default: "neutrino/tls.cert".
++# When the file exists it is pinned for HTTPS verification. When it is missing
++# but the server is HTTPS, the backend fetches and pins the certificate on first
++# use (trust-on-first-use) and writes it to this path. Relative paths resolve
++# against the data directory ($JOINMARKET_DATA_DIR or --data-dir, default
++# ~/.joinmarket-ng). Absolute paths and ~ paths are used as-is. Set to "" to
++# disable certificate pinning.
+ # neutrino_tls_cert = "neutrino/tls.cert"
+ #
+ # API bearer token for neutrino-api authentication.
+ # neutrino_auth_token = ""
+ #
+ # Path to a file containing the auth token (alternative to neutrino_auth_token).
+-# Useful in Docker environments where the token is generated into a shared volume.
+-# Relative paths are resolved against the data directory (see neutrino_tls_cert).
++# Default: "neutrino/auth_token". Missing files are ignored. Relative paths
++# resolve against the data directory (see neutrino_tls_cert). Set to "" to
++# disable token authentication.
+ # neutrino_auth_token_file = "neutrino/auth_token"
++#
++# Include unconfirmed entries from the neutrino-api watched mempool tracker in
++# UTXO listings, and overlay mempool spends on single-UTXO checks. Has no
++# effect against older neutrino-api builds without the tracker. Set to false
++# for chain-only behaviour.
++# neutrino_include_mempool = true
+
+ # ============================================================================
+ # Network Settings
+@@ -235,6 +247,10 @@
+ # component_name is set automatically by each component (Maker, Taker, etc.)
+ # include_amounts = true
+ # include_txids = false
++# When include_txids is enabled, set a block explorer base URL to turn txids
++# into clickable links (e.g. "https://mempool.space/signet" -> ".../tx/<txid>").
++# Leave empty to show the bare txid instead.
++# mempool_url = ""
+ # include_nick = true
+ # use_tor = true
+
+````
+
 ## [0.31.1] - 2026-05-30
 
 ### Fixed
@@ -155,6 +408,30 @@ Neutrino backend now has mempool support. Along with other improvements and bug 
 - Clamp descriptor scan ranges to Bitcoin Core's 1,000,000 limit instead of failing the whole import with "Range is too large" ([236ed773](../../commit/236ed773cf10272d8185815da0ac1e0a1ffd6145))
 - Honor --start-height when combined with --scan-depth in jm-wallet rescan ([236ed773](../../commit/236ed773cf10272d8185815da0ac1e0a1ffd6145))
 - Stop aborting CoinJoin sessions when a taker switches between ([220e9c57](../../commit/220e9c579b16a86d529cc8ece8f07c34e4810585))
+
+### Configuration Changes
+
+Existing `config.toml` files are not updated automatically. Review the bundled template changes below and apply the relevant options manually.
+
+````diff
+--- config.toml.template (0.31.0)
++++ config.toml.template (0.31.1)
+@@ -159,9 +159,11 @@
+
+ # Initial descriptor scan range (max address index per branch) imported into
+ # Bitcoin Core's descriptor wallet. Defaults to 1000 and auto-expands as
+-# addresses are used. To widen the range for an already-imported wallet (e.g.
+-# migrated from legacy joinmarket-clientserver), run `jm-wallet rescan
+-# --scan-depth N` once. See docs/technical/wallet-scanning.md.
++# addresses are used. Capped at 1000000, which is Bitcoin Core's per-descriptor
++# range limit (larger values are rejected with "Range is too large"). To widen
++# the range for an already-imported wallet (e.g. migrated from legacy
++# joinmarket-clientserver), run `jm-wallet rescan --scan-depth N` once.
++# See docs/technical/wallet-scanning.md.
+ # scan_range = 1000
+
+ # Dust threshold in satoshis
+````
 
 ## [0.31.0] - 2026-05-29
 
@@ -190,6 +467,40 @@ More improvements about deep wallet scanning. Also security hardening, TUI impro
 - Fix ModuleNotFoundError 'nacl' after updating by resolving and installing changed dependencies (PyNaCl) during install.sh --update ([a49ef88a](../../commit/a49ef88a0c9b37033c082f58a1e9e663ca44a23c))
 - Wire [wallet].gap_limit into descriptor range auto-expansion (was hardcoded 100) ([557ed4ea](../../commit/557ed4eaa92afb40438e372e3a832867d836cfc8))
 - Replace `jm-wallet info --scan-depth` with `jm-wallet rescan --scan-depth N` ([557ed4ea](../../commit/557ed4eaa92afb40438e372e3a832867d836cfc8))
+
+### Configuration Changes
+
+Existing `config.toml` files are not updated automatically. Review the bundled template changes below and apply the relevant options manually.
+
+````diff
+--- config.toml.template (0.30.0)
++++ config.toml.template (0.31.0)
+@@ -151,16 +151,17 @@
+ # Number of mixing depths (1-10)
+ # mixdepth_count = 5
+
+-# BIP44 gap limit: stop address scanning after this many consecutive empty
+-# trailing addresses past the highest used one (minimum: 6, Electrum convention: 20).
+-# Distinct from ``scan_range`` below.
++# BIP44 gap limit: consecutive empty trailing addresses kept beyond the highest
++# used one (minimum: 6, Electrum convention: 20). Also the buffer used when the
++# descriptor range auto-expands. Distinct from ``scan_range`` below.
++# See docs/technical/wallet-scanning.md.
+ # gap_limit = 20
+
+ # Initial descriptor scan range (max address index per branch) imported into
+-# Bitcoin Core's descriptor wallet. Defaults to 1000, matching Bitcoin Core's
+-# default keypool lookahead. Wallets migrated from legacy joinmarket-clientserver
+-# may have used addresses beyond this; run ``jmwallet info --scan-depth N`` once
+-# with a larger N to re-import descriptors and rescan from genesis (issue #475).
++# Bitcoin Core's descriptor wallet. Defaults to 1000 and auto-expands as
++# addresses are used. To widen the range for an already-imported wallet (e.g.
++# migrated from legacy joinmarket-clientserver), run `jm-wallet rescan
++# --scan-depth N` once. See docs/technical/wallet-scanning.md.
+ # scan_range = 1000
+
+ # Dust threshold in satoshis
+````
 
 ## [0.30.0] - 2026-05-20
 
@@ -236,6 +547,196 @@ Major improvements for wallet performance, specially for exiting old wallets wit
 - Persist spent input addresses on transaction history rows to prevent deposit-address reuse across restarts ([f98ffc5b](../../commit/f98ffc5b8f64f296bd5456b3258e65a280843690))
 - TUI: Check for duplicate wallet name before import prompts ([50d84ec1](../../commit/50d84ec1671aa385c26fadaae14ad2c4f7e1edc0))
 
+### Configuration Changes
+
+Existing `config.toml` files are not updated automatically. Review the bundled template changes below and apply the relevant options manually.
+
+````diff
+--- config.toml.template (0.29.0)
++++ config.toml.template (0.30.0)
+@@ -151,8 +151,17 @@
+ # Number of mixing depths (1-10)
+ # mixdepth_count = 5
+
+-# Address gap limit for wallet scanning (minimum: 6)
++# BIP44 gap limit: stop address scanning after this many consecutive empty
++# trailing addresses past the highest used one (minimum: 6, Electrum convention: 20).
++# Distinct from ``scan_range`` below.
+ # gap_limit = 20
++
++# Initial descriptor scan range (max address index per branch) imported into
++# Bitcoin Core's descriptor wallet. Defaults to 1000, matching Bitcoin Core's
++# default keypool lookahead. Wallets migrated from legacy joinmarket-clientserver
++# may have used addresses beyond this; run ``jmwallet info --scan-depth N`` once
++# with a larger N to re-import descriptors and rescan from genesis (issue #475).
++# scan_range = 1000
+
+ # Dust threshold in satoshis
+ # dust_threshold = 27300
+@@ -176,9 +185,21 @@
+ # Default fee estimation settings
+ # default_fee_block_target = 3  # Block target for wallet transactions
+
++# Safety cap on the fee rate (sat/vB) used for any wallet transaction.
++# Both manual fee rates and backend fee estimates above this cap are rejected
++# to protect against runaway-fee bugs and malicious/misconfigured fee oracles.
++# Increase only if you have a deliberate need to pay fees above 1000 sat/vB.
++# max_fee_rate_sat_vb = 1000
++
+ # Mnemonic file settings (optional defaults)
+ # mnemonic_file = ""            # Path to mnemonic file
+-# mnemonic_password = ""        # Password for encrypted mnemonic
++#
++# SECURITY WARNING: mnemonic_password is stored IN PLAIN TEXT in this file.
++# Anyone who can read config.toml can decrypt the wallet, which defeats the
++# wallet's encryption. Only set it when you need unattended maker operation
++# and you trust the security of this machine. Prefer leaving it unset and
++# entering the password interactively when prompted by jm-wallet / jm-maker.
++# mnemonic_password = ""        # Password for encrypted mnemonic (plaintext!)
+
+ # ============================================================================
+ # Logging Settings
+@@ -253,12 +274,12 @@
+ [maker]
+ # Minimum CoinJoin amount (in satoshis) that this maker will offer.
+ #
+-# There is no protocol-level minimum balance per mixdepth to run a maker;
+-# 100000 ("100k sats") is a common orientation value for new users but is
+-# not a requirement. Lower min_size lets you serve takers requesting
+-# smaller mixes at the cost of producing smaller UTXOs.
+-#
+-# Default: DUST_THRESHOLD (the reference implementation's dust limit).
++# Lower min_size lets you serve takers requesting smaller mixes at the cost of
++# producing smaller UTXOs. Note: the *advertised* minsize is randomized on each
++# offer announcement (see size_factor below) and clamped to the dust threshold.
++#
++# Default: 100000 (matches the upstream JoinMarket reference; using a different
++# value may make jm-ng makers fingerprintable).
+ # min_size = 100000
+
+ # IMPORTANT: offer_type determines which fee setting is used.
+@@ -273,17 +294,39 @@
+ #   cj_fee_absolute = 500
+ #
+ # To run BOTH offer types simultaneously, use the CLI flag --dual-offers
++# In dual-offer mode the maker advertises one relative and one absolute
++# offer.  Their size ranges are split automatically at the fee
++# intersection x = cj_fee_absolute / cj_fee_relative:
++#   - absolute offer covers small CJs in [min_size, x]
++#     (guarantees a flat minimum profit per join)
++#   - relative offer covers large CJs in [x, max_balance]
++#     (scales fees with size, stays competitive on big mixes)
++# This produces a piecewise fee curve roughly equivalent to a linear
++# offer (min flat fee + proportional component) without breaking the
++# protocol.
+ # offer_type = "sw0reloffer"
+
+ # Fee settings (only one is used based on offer_type above)
+-# cj_fee_relative = "0.001"  # 0.001 = 0.1% relative fee (for sw0reloffer)
+-# cj_fee_absolute = 500      # Absolute fee in satoshis (for sw0absoffer)
+-# tx_fee_contribution = 0    # Mining fee contribution in satoshis
++# Defaults match the upstream JoinMarket reference (yg-privacyenhanced) so that
++# jm-ng makers are not trivially distinguishable from reference makers.
++# cj_fee_relative = "0.00002"  # 0.00002 = 0.002% relative fee (for sw0reloffer)
++# cj_fee_absolute = 500        # Absolute fee in satoshis (for sw0absoffer)
++# tx_fee_contribution = 0      # Mining fee contribution in satoshis
++
++# Offer randomization factors. Each advertised offer is sampled uniformly from
++# [value*(1-factor), value*(1+factor)] (size is sampled downward only) on every
++# announcement so observers cannot correlate balance changes with exact values.
++# Set any factor to 0 to disable randomization for that field.
++# Defaults match the upstream JoinMarket yg-privacyenhanced reference.
++# cjfee_factor = 0.1
++# txfee_contribution_factor = 0.3
++# size_factor = 0.1
+
+ # Minimum confirmations for UTXOs offered into coinjoins.
+ # Default 0 lets the maker offer unconfirmed (mempool) UTXOs, which
+-# improves liquidity. The PoDLE commitment lives on a separate UTXO
+-# and is still gated by taker_utxo_age (taker side, default 5).
++# improves liquidity. The PoDLE commitment lives on a separate UTXO and
++# is still gated by taker_utxo_age (taker side, default 5). Raise this
++# to 1+ if you want to trade liquidity for RBF/eviction/reorg safety.
+ # min_confirmations = 0
+
+ # UTXO merge algorithm: "default", "gradual", "greedy", "random"
+@@ -326,12 +369,22 @@
+ # ============================================================================
+
+ [taker]
+-# Number of counterparty makers to use (1-20)
++# Number of counterparty makers to use (1-20).
++# When unset, a random value in [8, 10] is drawn for every CoinJoin (matches
++# the upstream JoinMarket sendpayment default and avoids fingerprinting via a
++# fixed counterparty count). Set explicitly to override.
+ # counterparty_count = 10
+
+ # Maximum acceptable coinjoin fees (paid to makers, not network/miner fees)
+ # max_cj_fee_abs = 500        # Absolute fee in satoshis per maker
+ # max_cj_fee_rel = "0.001"    # Relative fee (0.001 = 0.1%)
++
++# PoDLE commitment requirements (control which UTXOs can be used as PoDLE inputs).
++# These match the reference JoinMarket defaults; loosening them weakens the
++# anti-DoS commitment scheme.
++# taker_utxo_age = 5          # Minimum confirmations on the PoDLE input
++# taker_utxo_retries = 3      # Max PoDLE index retries per UTXO
++# taker_utxo_amtpercent = 20  # Min UTXO value as % of CJ amount
+
+ # Network/miner transaction fee settings
+ # fee_rate takes precedence over fee_block_target when set
+@@ -357,8 +410,32 @@
+ # tx_broadcast = "random-peer"
+ # broadcast_peer_count = 3
+
+-# Minimum number of makers required
+-# minimum_makers = 1
++# Minimum number of makers required for a CoinJoin to proceed.
++# Default: 4 (matches the upstream JoinMarket reference POLICY default; using
++# minimum_makers=1 is fingerprintable and degrades the privacy of the join).
++# minimum_makers = 4
++
++# ============================================================================
++# Tumbler Settings
++# ============================================================================
++# These mirror ``tumbler.runner.RunnerContext`` fields that govern
++# inter-phase pacing. Production defaults are intentionally long so the
++# runner waits patiently for blockchain confirmations and UTXO age between
++# CoinJoin phases; tighten via env vars (TUMBLER__RETRY_DELAY_SECONDS, ...)
++# in test environments.
++
++[tumbler]
++# Minimum confirmations on a CoinJoin output before the next tumbler phase
++# may spend it. Set to 0 to disable the gate.
++# min_confirmations_between_phases = 6
++
++# Polling interval (seconds) for the confirmation gate.
++# confirmation_poll_interval = 30.0
++
++# Base delay (seconds) before retrying a failed taker phase. Applied with
++# linear backoff: ``retry_delay_seconds * attempt_count``. Set to 0 to retry
++# immediately.
++# retry_delay_seconds = 1800.0
+
+ # ============================================================================
+ # Directory Server Settings
+@@ -418,3 +495,15 @@
+
+ # Uptime tracking
+ # uptime_grace_period = 60     # Seconds
++
++# ============================================================================
++# TUI Settings
++# ============================================================================
++
++[tui]
++# Log level for CLI output inside the TUI.
++# "WARNING" = only errors and warnings (default, clean output)
++# "INFO"    = show progress messages (e.g. "Connecting to directory servers...")
++# "DEBUG"   = verbose output for troubleshooting
++# Can be overridden per session: LOGGING__LEVEL=INFO jm-ng
++# log_level = "WARNING"
+````
+
 ## [0.29.0] - 2026-05-12
 
 ### Added
@@ -278,12 +779,56 @@ Major improvements for wallet performance, specially for exiting old wallets wit
 - Avoid multi-second descriptor wallet sync delays when listaddressgroupings returns addresses imported as non-ranged descriptors (e.g., addr() imports for fidelity bonds), unblocking MakerBot startup. ([c71977ad](../../commit/c71977ad8bedf4b97100d41dbd835faa34764855))
 - Fix MakerBot startup hang caused by BIP32 derivation scan when Bitcoin Core's getaddressinfo returns ismine without a descriptor ([6dd2ba09](../../commit/6dd2ba09cd28ce19599283dd1c61c43f11e3306f))
 
+### Configuration Changes
+
+Existing `config.toml` files are not updated automatically. Review the bundled template changes below and apply the relevant options manually.
+
+````diff
+--- config.toml.template (0.28.1)
++++ config.toml.template (0.29.0)
+@@ -46,8 +46,6 @@
+
+ [bitcoin]
+ # Backend type: "descriptor_wallet" (default) or "neutrino".
+-# "scantxoutset" is also accepted but deprecated and will be removed in a
+-# future release; switch to "descriptor_wallet" for faster, incremental sync.
+ # backend_type = "descriptor_wallet"
+
+ # Bitcoin Core RPC settings (for all backend types)
+@@ -282,8 +280,11 @@
+ # cj_fee_absolute = 500      # Absolute fee in satoshis (for sw0absoffer)
+ # tx_fee_contribution = 0    # Mining fee contribution in satoshis
+
+-# Minimum confirmations for UTXOs
+-# min_confirmations = 1
++# Minimum confirmations for UTXOs offered into coinjoins.
++# Default 0 lets the maker offer unconfirmed (mempool) UTXOs, which
++# improves liquidity. The PoDLE commitment lives on a separate UTXO
++# and is still gated by taker_utxo_age (taker side, default 5).
++# min_confirmations = 0
+
+ # UTXO merge algorithm: "default", "gradual", "greedy", "random"
+ # merge_algorithm = "default"
+@@ -349,6 +350,7 @@
+ # orderbook_min_wait = 30.0      # Min seconds before early exit is allowed
+ # orderbook_quiet_period = 15.0  # Seconds of silence to trigger early exit
+ # rescan_interval_sec = 600
++# pending_tx_abandon_hours = 24  # Hours before abandoning unconfirmed CoinJoin (makers can double-spend)
+
+ # Transaction broadcast settings
+ # Options: "self", "random-peer", "multiple-peers", "not-self"
+````
+
 ## [0.28.1] - 2026-05-01
 
 ### Fixed
 
 - Fix orderbook watcher reporting stale offers from disconnected makers ([57d41a35](../../commit/57d41a35d391002d415c0d1cc9f1d702dcbc6fbf))
 - Fix local release builds to match CI digests for reproducibility verification ([3d95088b](../../commit/3d95088bcf4ca1e15b8f33a80030fd578342089b))
+
+### Configuration Changes
+
+This release did not change the bundled `config.toml.template`.
 
 ## [0.28.0] - 2026-04-30
 
@@ -383,6 +928,102 @@ Major improvements for wallet performance, specially for exiting old wallets wit
 - Fix slow `jm-wallet info` on full-node wallets caused by extended-range scans for CoinJoin counterparty addresses ([ad7c5170](../../commit/ad7c5170aefdb6a2c9aa8b87cc4623b444d5968b))
 - Deprecate the scantxoutset (BitcoinCoreBackend) full-node backend; use descriptor_wallet instead ([64ace9d8](../../commit/64ace9d8dc1ef8a2f6c6706baf2e70f248720e3d))
 
+### Configuration Changes
+
+Existing `config.toml` files are not updated automatically. Review the bundled template changes below and apply the relevant options manually.
+
+````diff
+--- config.toml.template (0.27.0)
++++ config.toml.template (0.28.0)
+@@ -45,7 +45,9 @@
+ # ============================================================================
+
+ [bitcoin]
+-# Backend type: "descriptor_wallet" (default), "scantxoutset", or "neutrino"
++# Backend type: "descriptor_wallet" (default) or "neutrino".
++# "scantxoutset" is also accepted but deprecated and will be removed in a
++# future release; switch to "descriptor_wallet" for faster, incremental sync.
+ # backend_type = "descriptor_wallet"
+
+ # Bitcoin Core RPC settings (for all backend types)
+@@ -103,14 +105,19 @@
+ #
+ # Path to the neutrino-api TLS certificate (PEM).  Enables HTTPS with
+ # certificate pinning (trust-on-first-use).
+-# neutrino_tls_cert = "~/.joinmarket-ng/neutrino/tls.cert"
++# Relative paths (e.g. "neutrino/tls.cert") are resolved against the data
++# directory ($JOINMARKET_DATA_DIR or --data-dir, default: ~/.joinmarket-ng),
++# so the same config.toml works regardless of where the data dir lives.
++# Absolute paths and paths starting with ~ are used as-is.
++# neutrino_tls_cert = "neutrino/tls.cert"
+ #
+ # API bearer token for neutrino-api authentication.
+ # neutrino_auth_token = ""
+ #
+ # Path to a file containing the auth token (alternative to neutrino_auth_token).
+ # Useful in Docker environments where the token is generated into a shared volume.
+-# neutrino_auth_token_file = "~/.joinmarket-ng/neutrino/auth_token"
++# Relative paths are resolved against the data directory (see neutrino_tls_cert).
++# neutrino_auth_token_file = "neutrino/auth_token"
+
+ # ============================================================================
+ # Network Settings
+@@ -124,21 +131,8 @@
+ # bitcoin_network = "mainnet"
+
+ # Directory servers (leave empty to use network defaults)
+-# Mainnet defaults (leave empty to use automatically):
+-# directory_servers = [
+-#   "satoshi2vcg5e2ept7tjkzlkpomkobqmgtsjzegg6wipnoajadissead.onion:5222",
+-#   "coinjointovy3eq5fjygdwpkbcdx63d7vd4g32mw7y553uj3kjjzkiqd.onion:5222",
+-#   "nakamotourflxwjnjpnrk7yc2nhkf6r62ed4gdfxmmn5f4saw5q5qoyd.onion:5222",
+-#   "odpwaf67rs5226uabcamvypg3y4bngzmfk7255flcdodesqhsvkptaid.onion:5222",
+-#   "jmarketxf5wc4aldf3slm5u6726zsky52bqnfv6qyxe5hnafgly6yuyd.onion:5222",
+-#   "jmrust7bgdbdl6skkvuzhqost4jkikrluj6alemspeifm5hvgqz2qaad.onion:5222",
+-# ]
+-#
+-# Signet defaults:
+-# directory_servers = [
+-#   "signetvaxgd3ivj4tml4g6ed3samaa2rscre2gyeyohncmwk4fbesiqd.onion:5222",
+-#   "u5oj5etqex3vh7jagljf3e2lo4awmmtcw3klbrlt2fonzyozpn5txrqd.onion:5222",
+-# ]
++# Override with a custom list if needed:
++# directory_servers = ["custom1.onion:5222", "custom2.onion:5222"]
+
+ # How long to keep retrying directory connections at startup (Tor may still be
+ # bootstrapping when the maker starts).  After this timeout, the background
+@@ -259,7 +253,14 @@
+ # ============================================================================
+
+ [maker]
+-# Minimum CoinJoin amount in satoshis
++# Minimum CoinJoin amount (in satoshis) that this maker will offer.
++#
++# There is no protocol-level minimum balance per mixdepth to run a maker;
++# 100000 ("100k sats") is a common orientation value for new users but is
++# not a requirement. Lower min_size lets you serve takers requesting
++# smaller mixes at the cost of producing smaller UTXOs.
++#
++# Default: DUST_THRESHOLD (the reference implementation's dust limit).
+ # min_size = 100000
+
+ # IMPORTANT: offer_type determines which fee setting is used.
+@@ -334,11 +335,11 @@
+ # Network/miner transaction fee settings
+ # fee_rate takes precedence over fee_block_target when set
+ # fee_rate = 10.0             # Manual fee rate in sat/vB (omit to use estimation)
+-# tx_fee_factor = 3.0         # Fee estimation multiplier (minimum: 1.0)
++# tx_fee_factor = 0.2         # Fee randomization factor (0 disables; 0.2 = up to +20%)
+ # fee_block_target = 6        # Target blocks for fee estimation (1-1008, omit to use default)
+
+ # Fidelity bond settings
+-# bondless_makers_allowance = 0.0  # 0.0-1.0 (0 = require bonds, 1 = allow all)
++# bondless_makers_allowance = 0.2  # 0.0-1.0: per-slot probability of picking a bondless maker
+ # bond_value_exponent = 1.3
+ # bondless_require_zero_fee = true
+
+````
+
 ## [0.27.0] - 2026-04-17
 
 ### Added
@@ -401,7 +1042,35 @@ Major improvements for wallet performance, specially for exiting old wallets wit
 - Abort CoinJoin if destination or change addresses cannot be successfully persisted to history ([479aab62](../../commit/479aab62f4ae1d6a723c49b5e27b9ac97d2972d7))
 - Fix fidelity bond recovery by deriving bond addresses from timenumber locktime paths and add manual import support. ([2c0a9b63](../../commit/2c0a9b63a49957e3dcecd215b113cb513122128c))
 
+### Configuration Changes
+
+Existing `config.toml` files are not updated automatically. Review the bundled template changes below and apply the relevant options manually.
+
+````diff
+--- config.toml.template (0.26.1)
++++ config.toml.template (0.27.0)
+@@ -52,6 +52,12 @@
+ # rpc_url = "http://127.0.0.1:8332"
+ # rpc_user = ""
+ # rpc_password = ""
++
++# Cookie-based RPC authentication (alternative to rpc_user/rpc_password).
++# When set, the cookie file is read at startup and credentials are populated
++# automatically. This is the default auth method for Bitcoin Core when no
++# rpcuser/rpcpassword is configured. Mutually exclusive with rpc_user/rpc_password.
++# rpc_cookie_file = "~/.bitcoin/.cookie"
+
+ # Neutrino backend settings (used by all components when backend_type = "neutrino")
+ # neutrino_url = "http://127.0.0.1:8334"
+````
+
 ## [0.26.1] - 2026-04-12
+
+
+
+### Configuration Changes
+
+This release did not change the bundled `config.toml.template`.
 
 ## [0.26.0] - 2026-04-11
 
@@ -418,6 +1087,10 @@ Major improvements for wallet performance, specially for exiting old wallets wit
 - Deduplicate UTXOs in summary disclosure count so repeated disclosures of the same UTXO are only counted once ([b7fd0a5a](../../commit/b7fd0a5a2efad4c3e753c588e67787e24608d891))
 - Fix release reproduction by removing Dockerfile overlay that broke pinned base-image digests ([aeec3752](../../commit/aeec3752ea89466dc3d98b2a75e7c191ec9ee2ff))
 
+### Configuration Changes
+
+This release did not change the bundled `config.toml.template`.
+
 ## [0.25.0] - 2026-04-09
 
 ### Changed
@@ -432,6 +1105,44 @@ Major improvements for wallet performance, specially for exiting old wallets wit
 
 - Propagate neutrino TLS/auth settings across all CLI backend codepaths and reduce duplicate pinning logs ([e5d5ca1a](../../commit/e5d5ca1aa2aa676c22b2fa4075278c5f06768c94))
 - Fix TLS hostname mismatch when connecting to neutrino via Docker service names ([31740b71](../../commit/31740b71a5176ee6da32752680b47adbd073707c))
+
+### Configuration Changes
+
+Existing `config.toml` files are not updated automatically. Review the bundled template changes below and apply the relevant options manually.
+
+````diff
+--- config.toml.template (0.24.0)
++++ config.toml.template (0.25.0)
+@@ -97,10 +97,14 @@
+ #
+ # Path to the neutrino-api TLS certificate (PEM).  Enables HTTPS with
+ # certificate pinning (trust-on-first-use).
+-# neutrino_tls_cert = "/data/neutrino/tls.cert"
++# neutrino_tls_cert = "~/.joinmarket-ng/neutrino/tls.cert"
+ #
+ # API bearer token for neutrino-api authentication.
+ # neutrino_auth_token = ""
++#
++# Path to a file containing the auth token (alternative to neutrino_auth_token).
++# Useful in Docker environments where the token is generated into a shared volume.
++# neutrino_auth_token_file = "~/.joinmarket-ng/neutrino/auth_token"
+
+ # ============================================================================
+ # Network Settings
+@@ -377,6 +381,12 @@
+ # Message of the day
+ # motd = "JoinMarket NG Directory Server https://github.com/joinmarket-ng/joinmarket-ng/"
+
++# Heartbeat liveness detection (PING/PONG protocol, compatible with joinmarket-rs)
++# heartbeat_sweep_interval = 60.0    # Seconds between heartbeat sweeps
++# heartbeat_idle_threshold = 600.0   # Seconds idle before probing (10 min)
++# heartbeat_hard_evict = 1500.0      # Seconds idle before unconditional eviction (25 min)
++# heartbeat_pong_wait = 30.0         # Seconds to wait for PONG after PING
++
+ # ============================================================================
+ # Orderbook Watcher Settings
+ # ============================================================================
+````
 
 ## [0.24.0] - 2026-04-08
 
@@ -465,12 +1176,115 @@ Major improvements for wallet performance, specially for exiting old wallets wit
 - Remove incorrect cold storage labels from fidelity bond details in the orderbook ([d17ab75f](../../commit/d17ab75f6644e664903368c307ed44e7730de462))
 - Use ephemeral cert keypairs for hot wallet fidelity bonds to match reference implementation ([a826959f](../../commit/a826959fe0d066916806caa2b44570f96305b04a))
 
+### Configuration Changes
+
+Existing `config.toml` files are not updated automatically. Review the bundled template changes below and apply the relevant options manually.
+
+````diff
+--- config.toml.template (0.23.1)
++++ config.toml.template (0.24.0)
+@@ -1,6 +1,6 @@
+ # JoinMarket-NG Configuration
+ # Uncomment and modify settings as needed. Defaults are sensible for most users.
+-# See: https://github.com/joinmarket-ng/joinmarket-ng/blob/main/DOCS.md
++# See documentation: https://joinmarket-ng.github.io/joinmarket-ng/
+
+ # ============================================================================
+ # Core Settings
+@@ -45,7 +45,7 @@
+ # ============================================================================
+
+ [bitcoin]
+-# Backend type: "descriptor_wallet" (default), "full_node", or "neutrino"
++# Backend type: "descriptor_wallet" (default), "scantxoutset", or "neutrino"
+ # backend_type = "descriptor_wallet"
+
+ # Bitcoin Core RPC settings (for all backend types)
+@@ -58,9 +58,49 @@
+
+ # Preferred neutrino peers (host:port) that should be tried first while still
+ # allowing DNS/discovery peers.
++# NOTE: Only takes effect when JoinMarket manages the neutrino process (e.g.,
++# flatpak deployment). When neutrino-api runs as a standalone service,
++# configure peers directly via its ADD_PEERS env var or --addpeer flag.
+ # neutrino_add_peers = [
+ #   "your-filter-peer:38333",
+ # ]
++
++# Sync block headers over clearnet before switching to Tor for ongoing
++# operations. Headers are public deterministic data identical for all nodes,
++# so downloading them over clearnet does not reveal watched addresses.
++# Typically around 2x faster than doing the full initial header sync via Tor.
++# Default: true.
++# neutrino_clearnet_initial_sync = true
++
++# Enable background prefetch of compact block filters.
++# Enabled by default because jm-wallet info scans these filters anyway, so
++# prefetching saves time on the initial scan. With the default lookback of
++# ~2 years, this takes ~3 hours on clearnet and ~3GB disk on mainnet.
++# Disable to fetch filters strictly on-demand.
++# When false, neutrino_prefetch_lookback_blocks is ignored.
++# neutrino_prefetch_filters = true
++
++# When prefetch is enabled, only prefetch filters for this many recent blocks.
++# Default: 105120 (~2 years). Set to 0 to prefetch from genesis (~15GB).
++# Ignored when neutrino_prefetch_filters = false.
++# neutrino_prefetch_lookback_blocks = 105120
++
++# Number of blocks to look back from tip for neutrino wallet rescans.
++# Default: 105120 (~2 years). Only used when scan_start_height is not set.
++# neutrino_scan_lookback_blocks = 105120
++
++# Neutrino-api security settings (auto-TLS + API token authentication).
++# When neutrino-api starts for the first time it generates a self-signed TLS
++# certificate (tls.cert + tls.key) and a random API token (auth_token) in its
++# data directory.  Set these to enable encrypted, authenticated communication.
++# In Flatpak deployments these are wired automatically from the neutrino data dir.
++#
++# Path to the neutrino-api TLS certificate (PEM).  Enables HTTPS with
++# certificate pinning (trust-on-first-use).
++# neutrino_tls_cert = "/data/neutrino/tls.cert"
++#
++# API bearer token for neutrino-api authentication.
++# neutrino_auth_token = ""
+
+ # ============================================================================
+ # Network Settings
+@@ -81,11 +121,13 @@
+ #   "nakamotourflxwjnjpnrk7yc2nhkf6r62ed4gdfxmmn5f4saw5q5qoyd.onion:5222",
+ #   "odpwaf67rs5226uabcamvypg3y4bngzmfk7255flcdodesqhsvkptaid.onion:5222",
+ #   "jmarketxf5wc4aldf3slm5u6726zsky52bqnfv6qyxe5hnafgly6yuyd.onion:5222",
++#   "jmrust7bgdbdl6skkvuzhqost4jkikrluj6alemspeifm5hvgqz2qaad.onion:5222",
+ # ]
+ #
+ # Signet defaults:
+ # directory_servers = [
+ #   "signetvaxgd3ivj4tml4g6ed3samaa2rscre2gyeyohncmwk4fbesiqd.onion:5222",
++#   "u5oj5etqex3vh7jagljf3e2lo4awmmtcw3klbrlt2fonzyozpn5txrqd.onion:5222",
+ # ]
+
+ # How long to keep retrying directory connections at startup (Tor may still be
+@@ -125,6 +167,8 @@
+
+ # Explicit start height for initial scan (overrides scan_lookback_blocks if set)
+ # Useful when you know when the wallet was first used. Set to 0 for full scan.
++# Note: wallets created via the daemon automatically record a creation height,
++# which is used as the scan start when this setting is not explicitly set.
+ # scan_start_height = 0
+
+ # Default fee estimation settings
+````
+
 ## [0.23.1] - 2026-04-04
 
 ### Fixed
 
 - Fix memory leak in MakerBot by bounding rate-limited log timestamps ([66cd3d59](../../commit/66cd3d59e5af27a10eb33f555d73199aa491134d))
 - Fix allow_mixdepth_zero_merge config not being read from settings file ([912a6c49](../../commit/912a6c4955db7d8c45f31e34b7f0bd78bebe9fc8))
+
+### Configuration Changes
+
+This release did not change the bundled `config.toml.template`.
 
 ## [0.23.0] - 2026-04-04
 
@@ -499,6 +1313,38 @@ Major improvements for wallet performance, specially for exiting old wallets wit
 - Reject transactions with output values exceeding the total possible Bitcoin supply (2.1 quadrillion sats) ([de79981d](../../commit/de79981dd92edeb959ae31a78fcc1606cd1e85db))
 - Enforce MAX_MONEY output value validation in shared transaction parser ([d2229365](../../commit/d22293658aef9629845eaf5d7cf299b1d2bf8abe))
 
+### Configuration Changes
+
+Existing `config.toml` files are not updated automatically. Review the bundled template changes below and apply the relevant options manually.
+
+````diff
+--- config.toml.template (0.22.0)
++++ config.toml.template (0.23.0)
+@@ -186,6 +186,7 @@
+
+ # Periodic summary notifications (enabled by default)
+ # notify_summary = true  # Send periodic CoinJoin stats summary (set to false to disable)
++# notify_summary_balance = false  # Include total balance and UTXO count in summary (privacy risk)
+ # summary_interval_hours = 24  # Interval: 24 (daily), 168 (weekly), or custom (1-168)
+
+ # Update checks (opt-in, disabled by default)
+@@ -232,6 +233,14 @@
+ # UTXO merge algorithm: "default", "gradual", "greedy", "random"
+ # merge_algorithm = "default"
+
++# Mixdepth 0 privacy restriction.
++# By default, UTXOs in mixdepth 0 are restricted to a single UTXO per CoinJoin
++# to prevent linking deposits and fidelity bonds.  CoinJoin outputs (cj-out)
++# are always exempt from this restriction because they already have CoinJoin
++# privacy.  Set to true to disable the restriction entirely and allow merging
++# all md0 UTXOs (experienced makers only -- reduces privacy).
++# allow_mixdepth_zero_merge = false
++
+ # Fidelity bond settings
+ # Set to true to run without a fidelity bond even if bonds exist in the registry.
+ # This can be useful for privacy - bonds are public and linkable to your offers.
+````
+
 ## [0.22.0] - 2026-03-29
 
 ### Fixed
@@ -520,6 +1366,42 @@ Major improvements for wallet performance, specially for exiting old wallets wit
 - Add menu.joinmarket-ng.sh - an interactive text-based menu for joinmarket-ng operations, designed for Raspiblitz users. This script provides a user-friendly interface to manage wallets, send bitcoin (including CoinJoin), control the maker bot, and view information, all without needing to remember CLI commands. (2462834f)
 - Add Jam-NG Flatpak packaging with GTK control panel, multi-network support, and managed service startup (48ca761b)
 - Add neutrino_connect_peers configuration support across CLI tools and Flatpak wiring (525146b5)
+
+### Configuration Changes
+
+Existing `config.toml` files are not updated automatically. Review the bundled template changes below and apply the relevant options manually.
+
+````diff
+--- config.toml.template (0.21.0)
++++ config.toml.template (0.22.0)
+@@ -53,8 +53,14 @@
+ # rpc_user = ""
+ # rpc_password = ""
+
+-# Neutrino backend settings (only used when backend_type = "neutrino")
++# Neutrino backend settings (used by all components when backend_type = "neutrino")
+ # neutrino_url = "http://127.0.0.1:8334"
++
++# Preferred neutrino peers (host:port) that should be tried first while still
++# allowing DNS/discovery peers.
++# neutrino_add_peers = [
++#   "your-filter-peer:38333",
++# ]
+
+ # ============================================================================
+ # Network Settings
+@@ -331,8 +337,8 @@
+ # update_interval = 60
+
+ # Mempool API settings
+-# mempool_api_url = "http://mempopwcaqoi7z5xj5zplfdwk5bgzyl3hemx725d4a3agado6xtk3kqd.onion/api"
+-# mempool_web_url = "https://mempool.sgn.space"
++# mempool_api_url = ""  # Disabled by default for privacy (no external API calls)
++# mempool_web_url = ""  # Optional explorer URL for UI links
+
+ # Connection settings
+ # max_message_size = 2097152   # 2MB
+````
 
 ## [0.21.0] - 2026-03-15
 
@@ -548,6 +1430,38 @@ Major improvements for wallet performance, specially for exiting old wallets wit
 
 - **Adaptive orderbook listening**: `fetch_orderbooks()` no longer waits a fixed duration for offer responses. Instead, it listens in 1-second chunks and exits early when no new offers have arrived for a configurable quiet period, but only after a minimum wait. The hard ceiling is still respected. On responsive networks (e.g., regtest without Tor), this reduces orderbook fetch time from the full wait to just a few seconds. Three new config fields control the behaviour: `order_wait_time` (max/hard ceiling, default 120s), `orderbook_min_wait` (minimum wait before early exit is allowed, default 30s), `orderbook_quiet_period` (seconds of silence that triggers early exit, default 15s). The `order_wait_time` config is also now properly forwarded from `MultiDirectoryClient` to `DirectoryClient.fetch_orderbooks()`.
 
+### Configuration Changes
+
+Existing `config.toml` files are not updated automatically. Review the bundled template changes below and apply the relevant options manually.
+
+````diff
+--- config.toml.template (0.20.0)
++++ config.toml.template (0.21.0)
+@@ -236,6 +236,11 @@
+ # rescan_interval_sec = 600
+ # pending_tx_timeout_min = 60  # Minutes before marking unbroadcast CoinJoins as failed
+
++# Privacy: random delay (seconds) before re-announcing offers after a balance change.
++# Prevents observers from correlating block confirmations with offer updates.
++# Set to 0 to disable the delay. Default: 600 (10 minutes).
++# offer_reannounce_delay_max = 600
++
+ # Onion service settings
+ # onion_serving_host = "127.0.0.1"
+ # onion_serving_port = 5222
+@@ -270,7 +275,9 @@
+
+ # Timeouts and intervals
+ # maker_timeout_sec = 60
+-# order_wait_time = 10.0
++# order_wait_time = 120.0        # Max seconds to wait (hard ceiling)
++# orderbook_min_wait = 30.0      # Min seconds before early exit is allowed
++# orderbook_quiet_period = 15.0  # Seconds of silence to trigger early exit
+ # rescan_interval_sec = 600
+
+ # Transaction broadcast settings
+````
+
 ## [0.20.0] - 2026-03-11
 
 ### Fixed
@@ -569,17 +1483,29 @@ Major improvements for wallet performance, specially for exiting old wallets wit
 
 - **Ephemeral-identity PoDLE commitment broadcast**: Commitment broadcasts (`!hp2`) are now sent from a fresh random nick on a separate Tor circuit, rather than from the maker's long-lived identity. After verifying a taker's PoDLE proof, the maker opens ephemeral connections to all directory servers using unique SOCKS5 credentials (forcing stream isolation) and a random nick identity, broadcasts the commitment, then tears down the connections. This prevents any party from correlating the `!hp2` broadcast with the maker that participated in the CoinJoin. The same ephemeral approach is used when relaying `!hp2` requests from other makers. Concurrent ephemeral broadcasts are capped at 2 via a semaphore to prevent Sybil DoS attacks.
 
+### Configuration Changes
+
+This release did not change the bundled `config.toml.template`.
+
 ## [0.19.3] - 2026-03-05
 
 ### Added
 
 - **Recovery notification after all directory servers reconnect**: After the critical "All Directories Disconnected" alert, a follow-up "RESOLVED: Directory Servers Reconnected" notification is now sent as soon as at least one directory server reconnects. This uses the same `notify_all_disconnect` toggle (enabled by default) so operators are automatically informed when the issue is resolved.
 
+### Configuration Changes
+
+This release did not change the bundled `config.toml.template`.
+
 ## [0.19.2] - 2026-03-04
 
 ### Fixed
 
 - **`orderbook_watcher` Docker container fails to start**: The `orderbook_watcher` Dockerfile was missing the `jmwallet` installation step. Since `orderbook_watcher/main.py` imports `BitcoinCoreBackend` and `NeutrinoBackend` from `jmwallet`, the container would crash with `ModuleNotFoundError: No module named 'jmwallet'`. Added `jmwallet` requirements and package installation to the Dockerfile and declared `jmwallet` as a dependency in `pyproject.toml`.
+
+### Configuration Changes
+
+This release did not change the bundled `config.toml.template`.
 
 ## [0.19.1] - 2026-03-04
 
@@ -588,6 +1514,10 @@ Major improvements for wallet performance, specially for exiting old wallets wit
 - **`jam-ng` armv7 Docker build**: Fixed two issues that prevented `linux/arm/v7` builds from succeeding.
   - `node:24-slim` does not publish a `linux/arm/v7` image. The `jam-builder` stage is now pinned to `--platform=linux/amd64` — the output is static browser JS so the build platform is irrelevant.
   - s6-overlay was hardcoded to the `x86_64` tarball with a pinned checksum. The install step now selects the correct arch-specific tarball (`x86_64`, `aarch64`, or `armhf`) and verifies its checksum at build time using `TARGETARCH`/`TARGETVARIANT`.
+
+### Configuration Changes
+
+This release did not change the bundled `config.toml.template`.
 
 ## [0.19.0] - 2026-03-04
 
@@ -621,6 +1551,33 @@ Major improvements for wallet performance, specially for exiting old wallets wit
   - Backend factory supporting multiple wallet backends (descriptor, bitcoin-core, neutrino, mempool).
   - 161 unit tests with full coverage of auth, models, state, dependencies, routers, wallet operations, and WebSocket.
 
+### Configuration Changes
+
+Existing `config.toml` files are not updated automatically. Review the bundled template changes below and apply the relevant options manually.
+
+````diff
+--- config.toml.template (0.18.0)
++++ config.toml.template (0.19.0)
+@@ -81,6 +81,17 @@
+ # directory_servers = [
+ #   "signetvaxgd3ivj4tml4g6ed3samaa2rscre2gyeyohncmwk4fbesiqd.onion:5222",
+ # ]
++
++# How long to keep retrying directory connections at startup (Tor may still be
++# bootstrapping when the maker starts).  After this timeout, the background
++# reconnect task takes over.  Defaults to 120 seconds.
++# directory_startup_timeout = 120
++
++# Background reconnect interval in seconds (default: 300)
++# directory_reconnect_interval = 300
++
++# Max reconnection attempts per directory (0 = unlimited, default: 0)
++# directory_reconnect_max_retries = 0
+
+ # ============================================================================
+ # Wallet Settings
+````
+
 ## [0.18.0] - 2026-03-02
 
 ### Breaking Changes
@@ -649,6 +1606,45 @@ For unattended/automated operation, set `MNEMONIC_PASSWORD` (or `wallet.mnemonic
 - **Remove sensitive credentials from CLI arguments** (#130, #132, #133, #136): The removed options appeared in shell history, `/proc/PID/cmdline`, `ps aux`, and audit logs. Secrets are now supplied via environment variables, config file, or interactive prompt. Added `MNEMONIC_PASSWORD` env var support for unattended decryption of encrypted mnemonic files.
 - **Fix bech32 checksum bypass in send command (SND-1)**: The hand-rolled bech32 decoder in `_send_transaction` stripped the 6-character checksum without verifying it, meaning a single-character typo in a destination address would silently send funds to a permanently unspendable output. Replaced with the `bech32` library which properly validates checksums per BIP173. Also fixed: unhandled `ValueError` on non-bech32 characters (e.g. uppercase from QR decoders), and `IndexError` on truncated addresses. The same hand-rolled encoder in the neutrino backend was replaced with `bech32.encode()`.
 
+### Configuration Changes
+
+Existing `config.toml` files are not updated automatically. Review the bundled template changes below and apply the relevant options manually.
+
+````diff
+--- config.toml.template (0.17.0)
++++ config.toml.template (0.18.0)
+@@ -1,6 +1,6 @@
+ # JoinMarket-NG Configuration
+ # Uncomment and modify settings as needed. Defaults are sensible for most users.
+-# See: https://github.com/joinmarket-ng/joinmarket-ng/blob/master/DOCS.md
++# See: https://github.com/joinmarket-ng/joinmarket-ng/blob/main/DOCS.md
+
+ # ============================================================================
+ # Core Settings
+@@ -68,8 +68,19 @@
+ # bitcoin_network = "mainnet"
+
+ # Directory servers (leave empty to use network defaults)
+-# Mainnet defaults (uncomment and modify to override):
+-# directory_servers = ["satoshi2vcg5e2ept7tjkzlkpomkobqmgtsjzegg6wipnoajadissead.onion:5222", "coinjointovy3eq5fjygdwpkbcdx63d7vd4g32mw7y553uj3kjjzkiqd.onion:5222", "nakamotourflxwjnjpnrk7yc2nhkf6r62ed4gdfxmmn5f4saw5q5qoyd.onion:5222", "shssats5ucnwdpbticbb4dymjzf2o27tdecpes35ededagjpdmpxm6yd.onion:5222", "odpwaf67rs5226uabcamvypg3y4bngzmfk7255flcdodesqhsvkptaid.onion:5222", "jmv2dirze66rwxsq7xv7frhmaufyicd3yz5if6obtavsskczjkndn6yd.onion:5222", "jmarketxf5wc4aldf3slm5u6726zsky52bqnfv6qyxe5hnafgly6yuyd.onion:5222"]
++# Mainnet defaults (leave empty to use automatically):
++# directory_servers = [
++#   "satoshi2vcg5e2ept7tjkzlkpomkobqmgtsjzegg6wipnoajadissead.onion:5222",
++#   "coinjointovy3eq5fjygdwpkbcdx63d7vd4g32mw7y553uj3kjjzkiqd.onion:5222",
++#   "nakamotourflxwjnjpnrk7yc2nhkf6r62ed4gdfxmmn5f4saw5q5qoyd.onion:5222",
++#   "odpwaf67rs5226uabcamvypg3y4bngzmfk7255flcdodesqhsvkptaid.onion:5222",
++#   "jmarketxf5wc4aldf3slm5u6726zsky52bqnfv6qyxe5hnafgly6yuyd.onion:5222",
++# ]
++#
++# Signet defaults:
++# directory_servers = [
++#   "signetvaxgd3ivj4tml4g6ed3samaa2rscre2gyeyohncmwk4fbesiqd.onion:5222",
++# ]
+
+ # ============================================================================
+ # Wallet Settings
+````
+
 ## [0.17.0] - 2026-02-25
 
 ### Added
@@ -658,6 +1654,27 @@ For unattended/automated operation, set `MNEMONIC_PASSWORD` (or `wallet.mnemonic
 ### Fixed
 
 - **SOCKS5h Proxy Incompatibility with httpx-socks**: The `python-socks` library (used by `httpx-socks`) does not recognise the `socks5h://` URL scheme and raises `ValueError`, which was silently caught. This caused `MempoolAPI` and the GitHub update checker to fall back to direct connections without any proxy, failing with DNS resolution errors on `.onion` addresses ("Temporary failure in name resolution"). Added `normalize_proxy_url()` helper in `tor_isolation` that converts `socks5h://` to `socks5://` + `rdns=True`, enabling remote DNS resolution through the Tor SOCKS proxy. Applied to both `MempoolAPI` and `check_for_updates_from_github`.
+
+### Configuration Changes
+
+Existing `config.toml` files are not updated automatically. Review the bundled template changes below and apply the relevant options manually.
+
+````diff
+--- config.toml.template (0.16.0)
++++ config.toml.template (0.17.0)
+@@ -204,6 +204,11 @@
+ # UTXO merge algorithm: "default", "gradual", "greedy", "random"
+ # merge_algorithm = "default"
+
++# Fidelity bond settings
++# Set to true to run without a fidelity bond even if bonds exist in the registry.
++# This can be useful for privacy - bonds are public and linkable to your offers.
++# no_fidelity_bond = false
++
+ # Timeouts and intervals
+ # session_timeout_sec = 300
+ # rescan_interval_sec = 600
+````
 
 ## [0.16.0] - 2026-02-24
 
@@ -680,6 +1697,59 @@ For unattended/automated operation, set `MNEMONIC_PASSWORD` (or `wallet.mnemonic
 - **BIP32 Key Origin in Bond PSBTs**: The `spend-bond` command now accepts `--master-fingerprint` and `--derivation-path` to embed `PSBT_IN_BIP32_DERIVATION` (BIP-174 key type 0x06) in the PSBT. This allows HWI to automatically identify the signing key on the hardware wallet.
 - **HWI Bond Signing Script**: New standalone `scripts/sign_bond_psbt.py` script for signing bond spending PSBTs via HWI (Hardware Wallet Interface). Supports Trezor, Coldcard, Ledger, and other HW wallets. No seed phrase required. Install with `pip install hwi`.
 - **Mnemonic Bond Signing Script**: New standalone `scripts/sign_bond_mnemonic.py` script for signing bond spending PSBTs with a BIP39 mnemonic. Fully self-contained (no project dependencies beyond `coincurve`). Derives the private key from the mnemonic + BIP32 path, verifies it matches the PSBT, and outputs a signed transaction. Mnemonic is read via hidden input and cleared after use.
+
+### Configuration Changes
+
+Existing `config.toml` files are not updated automatically. Review the bundled template changes below and apply the relevant options manually.
+
+````diff
+--- config.toml.template (0.15.0)
++++ config.toml.template (0.16.0)
+@@ -1,6 +1,6 @@
+ # JoinMarket-NG Configuration
+ # Uncomment and modify settings as needed. Defaults are sensible for most users.
+-# See: https://github.com/m0wer/joinmarket-ng/blob/master/DOCS.md
++# See: https://github.com/joinmarket-ng/joinmarket-ng/blob/master/DOCS.md
+
+ # ============================================================================
+ # Core Settings
+@@ -17,6 +17,13 @@
+ # SOCKS proxy settings
+ # socks_host = "127.0.0.1"
+ # socks_port = 9050
++
++# Stream isolation uses SOCKS5 auth credentials to place different connection
++# types (directory, peer, notification, update-check, etc.) on separate Tor
++# circuits.  This prevents an observer who controls both a directory server and
++# a notification endpoint from correlating the traffic.  Requires
++# IsolateSOCKSAuth on the Tor SocksPort (enabled by default).
++# stream_isolation = true
+
+ # Connection timeout for Tor SOCKS5 connections (seconds).
+ # Covers TCP handshake, SOCKS5 negotiation, Tor circuit building, and PoW solving.
+@@ -153,6 +160,12 @@
+ # notify_summary = true  # Send periodic CoinJoin stats summary (set to false to disable)
+ # summary_interval_hours = 24  # Interval: 24 (daily), 168 (weekly), or custom (1-168)
+
++# Update checks (opt-in, disabled by default)
++# PRIVACY WARNING: When enabled, this polls api.github.com each summary interval
++# to check for new releases. The request is routed through Tor when use_tor = true,
++# but GitHub will still see the Tor exit node IP.
++# check_for_updates = false
++
+ # Retry failed notifications in the background (recommended for Tor)
+ # retry_enabled = true       # Retry with exponential backoff (default: true)
+ # retry_max_attempts = 3     # Max retries per notification (1-10)
+@@ -269,7 +282,7 @@
+ # health_check_port = 8080
+
+ # Message of the day
+-# motd = "JoinMarket NG Directory Server https://github.com/m0wer/joinmarket-ng/"
++# motd = "JoinMarket NG Directory Server https://github.com/joinmarket-ng/joinmarket-ng/"
+
+ # ============================================================================
+ # Orderbook Watcher Settings
+````
 
 ## [0.15.0] - 2026-02-14
 
@@ -712,6 +1782,54 @@ For unattended/automated operation, set `MNEMONIC_PASSWORD` (or `wallet.mnemonic
 
 - **Taker History: Zero Mining Fee Recorded**: Fixed a bug where taker transaction history recorded `mining_fee=0` despite the taker paying the full mining fee. The history update after broadcast used `tx_metadata["fee"]` (the estimated fee from transaction construction) instead of `actual_mining_fee` (total inputs minus total outputs from the signed transaction). In sweep mode, these values diverge because the residual from integer rounding goes to miners. This caused the `Net Fee` column in `jm-wallet history` to show only maker fees, understating the taker's total cost.
 
+### Configuration Changes
+
+Existing `config.toml` files are not updated automatically. Review the bundled template changes below and apply the relevant options manually.
+
+````diff
+--- config.toml.template (0.14.0)
++++ config.toml.template (0.15.0)
+@@ -17,6 +17,13 @@
+ # SOCKS proxy settings
+ # socks_host = "127.0.0.1"
+ # socks_port = 9050
++
++# Connection timeout for Tor SOCKS5 connections (seconds).
++# Covers TCP handshake, SOCKS5 negotiation, Tor circuit building, and PoW solving.
++# Under PoW defense (DoS attack), Tor clients solve proof-of-work challenges that
++# can take significantly longer than normal circuit establishment (~5-15s).
++# Default 120s matches Tor's internal circuit timeout.
++# connection_timeout = 120.0
+
+ # Control port settings (for hidden services)
+ # control_enabled = true
+@@ -142,6 +149,15 @@
+ # notify_rate_limit = true
+ # notify_startup = true
+
++# Periodic summary notifications (enabled by default)
++# notify_summary = true  # Send periodic CoinJoin stats summary (set to false to disable)
++# summary_interval_hours = 24  # Interval: 24 (daily), 168 (weekly), or custom (1-168)
++
++# Retry failed notifications in the background (recommended for Tor)
++# retry_enabled = true       # Retry with exponential backoff (default: true)
++# retry_max_attempts = 3     # Max retries per notification (1-10)
++# retry_base_delay = 5.0     # Base delay in seconds, doubles each retry (1-60)
++
+ # ============================================================================
+ # Maker Settings (Yield Generator)
+ # ============================================================================
+@@ -273,7 +289,7 @@
+
+ # Connection settings
+ # max_message_size = 2097152   # 2MB
+-# connection_timeout = 30.0     # Seconds
++# connection_timeout = 120.0   # Seconds (covers Tor circuit + PoW solving)
+
+ # Uptime tracking
+ # uptime_grace_period = 60     # Seconds
+````
+
 ## [0.14.0] - 2026-02-12
 
 ### Fixed
@@ -732,6 +1850,25 @@ For unattended/automated operation, set `MNEMONIC_PASSWORD` (or `wallet.mnemonic
 
 - **Directory Disconnect Notification Defaults**: Changed `notify_disconnect` default to `false` (was `true`). Individual directory server disconnect/reconnect notifications are noisy and not actionable. Added new `notify_all_disconnect` setting (default `true`) that fires only when ALL directory servers are disconnected, which is the critical event users need to know about. The `notify_all_directories_disconnected()` method now respects this toggle.
 
+### Configuration Changes
+
+Existing `config.toml` files are not updated automatically. Review the bundled template changes below and apply the relevant options manually.
+
+````diff
+--- config.toml.template (0.13.12)
++++ config.toml.template (0.14.0)
+@@ -133,7 +133,8 @@
+ # notify_mempool = true
+ # notify_confirmed = true
+ # notify_nick_change = true
+-# notify_disconnect = true
++# notify_disconnect = false  # Individual directory disconnect/reconnect (noisy)
++# notify_all_disconnect = true  # All directories disconnected (critical)
+ # notify_coinjoin_start = true
+ # notify_coinjoin_complete = true
+ # notify_coinjoin_failed = true
+````
+
 ## [0.13.12] - 2026-02-09
 
 ### Fixed
@@ -746,6 +1883,10 @@ For unattended/automated operation, set `MNEMONIC_PASSWORD` (or `wallet.mnemonic
 
 - **Docker Resource Limits for Test Environment**: Added deploy resource limits (1 CPU, 512MB memory) to all services in the root `docker-compose.yml` (test environment) to prevent runaway resource consumption from bugs like the infinite loop above. Component-specific docker-compose files (`maker/`, `taker/`, etc.) already had resource limits configured.
 
+### Configuration Changes
+
+This release did not change the bundled `config.toml.template`.
+
 ## [0.13.11] - 2026-02-08
 
 ### Fixed
@@ -758,6 +1899,10 @@ For unattended/automated operation, set `MNEMONIC_PASSWORD` (or `wallet.mnemonic
 
 - **update-base-images.sh Now Updates Apt Versions**: The `./scripts/update-base-images.sh` script now also resolves the latest available apt package versions from the base image and updates pinned versions in all Dockerfiles. This ensures that running the script before a release picks up both base image security patches and apt package updates in a single step.
 
+### Configuration Changes
+
+This release did not change the bundled `config.toml.template`.
+
 ## [0.13.10] - 2026-02-06
 
 ### Fixed
@@ -766,6 +1911,10 @@ For unattended/automated operation, set `MNEMONIC_PASSWORD` (or `wallet.mnemonic
 
 - **Source File Timestamp Normalization**: Fixed reproducible builds for orderbook-watcher by normalizing source file timestamps to `SOURCE_DATE_EPOCH` in the builder stage. BuildKit's `rewrite-timestamp=true` only modifies the OCI tar output, not layer content hashes. Layer digests are computed before rewriting, so files must have identical timestamps during the build. Without normalization, local files (with old modification times) differ from CI (fresh git clone with recent times).
 
+### Configuration Changes
+
+This release did not change the bundled `config.toml.template`.
+
 ## [0.13.9] - 2026-02-05
 
 ### Fixed
@@ -773,6 +1922,10 @@ For unattended/automated operation, set `MNEMONIC_PASSWORD` (or `wallet.mnemonic
 - **Orderbook-Watcher Reproducibility via Builder Stage**: Fixed reproducible builds for orderbook-watcher by copying source and static files through the builder stage with permission normalization. Previously, files were copied directly to the production stage, preserving local filesystem permissions (based on umask), and the post-copy chmod ran as user `jm` which couldn't fix permissions on directories with restrictive modes. Now, files are copied to builder, normalized to 644/755 as root, then copied to production with `--from=builder`.
 
 - **Root .dockerignore**: Added a root-level `.dockerignore` file to exclude development artifacts (`*.egg-info/`, `__pycache__/`, `*.pyc`, etc.) from Docker build context. These files don't exist in CI (fresh git clone) but accumulate locally during development, causing COPY layer mismatches.
+
+### Configuration Changes
+
+This release did not change the bundled `config.toml.template`.
 
 ## [0.13.8] - 2026-02-05
 
@@ -790,6 +1943,10 @@ For unattended/automated operation, set `MNEMONIC_PASSWORD` (or `wallet.mnemonic
 
 - **Skip Signature Verification Option**: Added `--skip-signatures` flag to `verify-release.sh` for testing reproducibility without requiring GPG signatures.
 
+### Configuration Changes
+
+This release did not change the bundled `config.toml.template`.
+
 ## [0.13.7] - 2026-02-05
 
 ### Fixed
@@ -801,6 +1958,10 @@ For unattended/automated operation, set `MNEMONIC_PASSWORD` (or `wallet.mnemonic
 ### Note
 
 Releases prior to these changes (including 0.13.5, 0.13.6, and 0.13.7) cannot be fully reproduced locally for the orderbook-watcher image due to file permission differences. Files copied directly to the production stage in orderbook-watcher preserved local filesystem permissions, which vary based on umask settings. CI runners typically use umask 0022 (resulting in 644 files), while developer machines often use umask 0002 (resulting in 664 files). Only releases built with the permission normalization fix will have fully reproducible orderbook-watcher images.
+
+### Configuration Changes
+
+This release did not change the bundled `config.toml.template`.
 
 ## [0.13.6] - 2026-02-05
 
@@ -816,6 +1977,10 @@ Releases prior to these changes (including 0.13.5, 0.13.6, and 0.13.7) cannot be
 
 - **Base Image Update Script**: New `scripts/update-base-images.sh` script to update Python base image digests in all Dockerfiles. Run periodically to get security updates while maintaining reproducibility. Use `--check` to verify if updates are needed.
 
+### Configuration Changes
+
+This release did not change the bundled `config.toml.template`.
+
 ## [0.13.5] - 2026-02-05
 
 ### Changed
@@ -825,6 +1990,10 @@ Releases prior to these changes (including 0.13.5, 0.13.6, and 0.13.7) cannot be
 - **Simplified CI Release Workflow**: Removed the slow OCI tar rebuild step from the CI release workflow. Previously, after pushing to the registry, CI would rebuild each platform as an OCI tar to extract digests - this caused timeouts (30+ minutes per image). The new approach extracts layer digests directly from the pushed images using `docker buildx imagetools inspect`, which is fast and reliable.
 
 - **Updated Release Manifest Format**: The release manifest now contains per-platform layer digests in addition to manifest digests. Layer digests are listed under `### <image>-<arch>-layers` sections, enabling local verification to compare the actual image content rather than manifest metadata.
+
+### Configuration Changes
+
+This release did not change the bundled `config.toml.template`.
 
 ## [0.13.4] - 2026-02-05
 
@@ -838,11 +2007,19 @@ Releases prior to these changes (including 0.13.5, 0.13.6, and 0.13.7) cannot be
 
 - **Docker Image Reproducibility (ldconfig cache)**: Added deletion of `/var/cache/ldconfig/aux-cache` after apt-get install in all Dockerfiles. This binary cache file contains non-deterministic data that caused builds to differ even with the same inputs.
 
+### Configuration Changes
+
+This release did not change the bundled `config.toml.template`.
+
 ## [0.13.3] - 2026-02-05
 
 ### Changed
 
 - **Disabled Docker Attestations for Reproducible Builds**: Disabled provenance and SBOM attestations in the CI release workflow (`provenance: false`, `sbom: false`). These attestations include timestamps and environment-specific data that made builds non-reproducible across different build environments. While this removes supply chain metadata from images, it enables true reproducibility verification where anyone can build the same image and get the exact same digest.
+
+### Configuration Changes
+
+This release did not change the bundled `config.toml.template`.
 
 ## [0.13.2] - 2026-02-04
 
@@ -858,6 +2035,10 @@ Releases prior to these changes (including 0.13.5, 0.13.6, and 0.13.7) cannot be
 
 - **Docker Image Reproducibility**: Fixed Dockerfiles to delete apt/dpkg log files (`/var/log/dpkg.log`, `/var/log/apt/*`) after package installation. These logs contain timestamps that made builds non-reproducible across different build times. This affects all four images: maker, taker, directory-server, and orderbook-watcher.
 
+### Configuration Changes
+
+This release did not change the bundled `config.toml.template`.
+
 ## [0.13.1] - 2026-02-04
 
 ### Fixed
@@ -871,6 +2052,10 @@ Releases prior to these changes (including 0.13.5, 0.13.6, and 0.13.7) cannot be
 - **Per-Platform Digests in Release Manifest**: The release manifest now stores individual digests for each platform (`maker-amd64`, `maker-arm64`, `maker-arm-v7`) in addition to the manifest list digest (`maker-manifest`). This enables faster verification by building only the current architecture while keeping provenance/SBOM attestations enabled for supply chain security.
 
 - **All Signers Must Reproduce Builds**: The `sign-release.sh` script now enables `--reproduce` by default for all signers. Multiple signatures only add value if each signer independently verifies reproducibility. Use `--no-reproduce` to skip verification (not recommended).
+
+### Configuration Changes
+
+This release did not change the bundled `config.toml.template`.
 
 ## [0.13.0] - 2026-02-04
 
@@ -907,6 +2092,10 @@ Releases prior to these changes (including 0.13.5, 0.13.6, and 0.13.7) cannot be
   - Maker list now shows right-aligned fee and bond values for easier comparison
   - Removed redundant "Counterparties" field (count now shown inline as "Makers (N):")
 
+### Configuration Changes
+
+This release did not change the bundled `config.toml.template`.
+
 ## [0.11.6] - 2026-02-03
 
 ### Fixed
@@ -920,6 +2109,10 @@ Releases prior to these changes (including 0.13.5, 0.13.6, and 0.13.7) cannot be
   - The `create_taker_history_entry()` function now requires a `change_address` parameter to ensure taker change addresses are also tracked and blacklisted.
   - Addresses are persisted before being revealed to prevent reuse even in failure scenarios.
 
+### Configuration Changes
+
+This release did not change the bundled `config.toml.template`.
+
 ## [0.11.5] - 2026-01-24
 
 ### Fixed
@@ -928,11 +2121,19 @@ Releases prior to these changes (including 0.13.5, 0.13.6, and 0.13.7) cannot be
 
 - **External Fidelity Bonds Not Recognized During Sync**: Fixed a bug where external fidelity bonds (cold storage bonds with `index=-1`) were not being properly recognized during wallet sync. These UTXOs were incorrectly treated as regular spendable funds instead of fidelity bonds, causing them to be included in offer balances and potentially leading to failed CoinJoins. The fix adds additional checks in `sync_with_descriptor_wallet()` to recognize fidelity bond addresses from the registry even when they don't match through the primary lookup path.
 
+### Configuration Changes
+
+This release did not change the bundled `config.toml.template`.
+
 ## [0.11.4] - 2026-01-23
 
 ### Fixed
 
 - **Address Reuse Bug for Used-but-Empty Addresses**: Fixed a critical privacy bug where addresses that had been used (received and spent funds) would incorrectly show as "new" instead of "used-empty". This could lead to address reuse, a serious privacy concern for CoinJoin wallets. The root cause was that `listsinceblock` and `listtransactions` RPCs don't reliably return transaction details for addresses in descriptor wallets, especially after wallet import. The fix uses `listaddressgroupings` RPC as the primary source for detecting used addresses, which reliably returns all addresses that have been involved in any transaction (as inputs or outputs). This is combined with `listsinceblock` as a secondary source for completeness.
+
+### Configuration Changes
+
+This release did not change the bundled `config.toml.template`.
 
 ## [0.11.3] - 2026-01-22
 
@@ -946,6 +2147,10 @@ Releases prior to these changes (including 0.13.5, 0.13.6, and 0.13.7) cannot be
   - Added logging to track addresses found beyond the current range
 
 - **Extended Address Search for Non-Wallet Addresses**: Fixed a performance issue where the extended address range search would unnecessarily search for counterparty addresses from CoinJoin transactions. The `get_addresses_with_history()` method now excludes "send" category addresses (addresses we sent to, not our own) which don't belong to this wallet. This prevents slow extended searches after CoinJoin transactions and ensures makers restart quickly between transactions.
+
+### Configuration Changes
+
+This release did not change the bundled `config.toml.template`.
 
 ## [0.11.2] - 2026-01-21
 
@@ -1001,6 +2206,38 @@ Releases prior to these changes (including 0.13.5, 0.13.6, and 0.13.7) cannot be
   - Added CSV entry logging when users decline to broadcast, allowing manual transaction tracking and later broadcast via the transaction hex
 
 - **Improved Fidelity Bond Recovery Documentation**: Enhanced maker/README.md with detailed fidelity bond recovery workflow including BIP39 passphrase handling. Added note in DOCS.md clarifying that BIP39 passphrases are intentionally not read from config.toml for security reasons.
+
+### Configuration Changes
+
+This release did not change the bundled `config.toml.template`.
+
+## [0.11.1] - 2026-01-20
+
+### Fixed
+
+- **Descriptor Wallet Gap Limit Bug**: Fixed a critical bug where wallets with more than 1000 addresses would show 0 balance in `jm-wallet info` despite having funds. The issue was threefold:
+  1. `_find_address_path()` only scanned up to index 100, so addresses beyond that were marked "unknown"
+  2. `DEFAULT_SCAN_RANGE` (1000) was used as a max index rather than a true gap limit
+  3. No mechanism existed to upgrade descriptor ranges when wallets grew beyond the initial range
+
+  The fix includes:
+  - `_find_address_path()` now scans up to the full descriptor range (retrieved from Bitcoin Core)
+  - Pre-populate address cache during sync for O(1) lookups
+  - Automatic detection and upgrade of descriptor ranges when highest used index approaches the limit
+  - Added `get_descriptor_ranges()`, `get_max_descriptor_range()`, and `upgrade_descriptor_ranges()` methods to DescriptorWalletBackend
+  - Added `check_and_upgrade_descriptor_range()` method to WalletService that automatically expands ranges as needed
+
+- **recover-bonds Now Waits for Wallet Rescan**: Fixed a bug where `jm-wallet recover-bonds` would attempt to query UTXOs before the wallet rescan completed, causing "Wallet is currently rescanning" errors or missing bond discovery. The command now properly waits for each batch of descriptor imports to finish rescanning before querying for UTXOs. Added `wait_for_rescan_complete()` method to the descriptor wallet backend.
+
+- **list-bonds Now Updates Registry with Discovered Bonds**: Fixed a bug where `jm-wallet list-bonds --locktime` would find bonds on the blockchain but not save them to `fidelity_bonds.json`. Now when bonds are discovered via `--locktime` scanning, they are automatically added to the registry with full UTXO information (txid, vout, value, confirmations). Existing registry entries also get their UTXO info updated.
+
+### Changed
+
+- **Improved Fidelity Bond Recovery Documentation**: Enhanced maker/README.md with detailed fidelity bond recovery workflow including BIP39 passphrase handling. Added note in DOCS.md clarifying that BIP39 passphrases are intentionally not read from config.toml for security reasons.
+
+### Configuration Changes
+
+This release did not change the bundled `config.toml.template`.
 
 ## [0.11.0] - 2026-01-20
 
@@ -1190,6 +2427,125 @@ Releases prior to these changes (including 0.13.5, 0.13.6, and 0.13.7) cannot be
 
 - **Improved direct message parse failure logging**: Parse failures now log the full message content at DEBUG level (in addition to the rate-limited WARNING with truncated preview). This helps diagnose protocol issues without flooding logs.
 
+### Configuration Changes
+
+Existing `config.toml` files are not updated automatically. Review the bundled template changes below and apply the relevant options manually.
+
+````diff
+--- config.toml.template (0.10.0)
++++ config.toml.template (0.11.0)
+@@ -22,7 +22,7 @@
+ # control_enabled = true
+ # control_host = "127.0.0.1"  # Defaults to socks_host if not set
+ # control_port = 9051
+-# cookie_path = "/var/run/tor/control.authcookie"  # Auto-detected if not set
++# cookie_path = "/run/tor/control.authcookie"  # Auto-detected if not set
+ # password = ""  # Use cookie auth by default
+ # target_host = "127.0.0.1"  # Target host for hidden service mapping
+
+@@ -72,11 +72,18 @@
+ # dust_threshold = 27300
+
+ # Smart wallet scanning optimizations
+-# smart_scan = true
+-# background_full_rescan = true
+-
+-# Blocks to look back during wallet scan (~1 year)
++# When importing an existing wallet, initial sync scans recent blocks for fast startup.
++# A full background rescan runs afterward to ensure no transactions are missed.
++# smart_scan = true                  # Enable smart scan for fast startup
++# background_full_rescan = true      # Run full rescan in background after smart scan
++
++# Blocks to look back during initial smart scan (~1 year default)
++# For faster initial sync of newer wallets, set lower (e.g., 12960 for ~3 months)
+ # scan_lookback_blocks = 52560
++
++# Explicit start height for initial scan (overrides scan_lookback_blocks if set)
++# Useful when you know when the wallet was first used. Set to 0 for full scan.
++# scan_start_height = 0
+
+ # Default fee estimation settings
+ # default_fee_block_target = 3  # Block target for wallet transactions
+@@ -90,7 +97,7 @@
+ # ============================================================================
+
+ [logging]
+-# Log level: "DEBUG", "INFO", "WARNING", "ERROR"
++# Log level: "TRACE", "DEBUG", "INFO", "WARNING", "ERROR"
+ # level = "INFO"
+
+ # Log sensitive information (private keys, mnemonics, etc.)
+@@ -113,6 +120,7 @@
+
+ # Notification preferences
+ # title_prefix = "JoinMarket NG"
++# component_name is set automatically by each component (Maker, Taker, etc.)
+ # include_amounts = true
+ # include_txids = false
+ # include_nick = true
+@@ -141,9 +149,23 @@
+ # Minimum CoinJoin amount in satoshis
+ # min_size = 100000
+
+-# Fee settings
+-# cj_fee_relative = "0.001"  # 0.001 = 0.1% relative fee
+-# cj_fee_absolute = 500      # Absolute fee in satoshis
++# IMPORTANT: offer_type determines which fee setting is used.
++# Simply changing cj_fee_absolute will NOT switch to absolute fees - you must set offer_type.
++#
++# Offer type options:
++#   "sw0reloffer" - relative fee (uses cj_fee_relative) [DEFAULT]
++#   "sw0absoffer" - absolute fee (uses cj_fee_absolute)
++#
++# Example: To use absolute fees, set BOTH:
++#   offer_type = "sw0absoffer"
++#   cj_fee_absolute = 500
++#
++# To run BOTH offer types simultaneously, use the CLI flag --dual-offers
++# offer_type = "sw0reloffer"
++
++# Fee settings (only one is used based on offer_type above)
++# cj_fee_relative = "0.001"  # 0.001 = 0.1% relative fee (for sw0reloffer)
++# cj_fee_absolute = 500      # Absolute fee in satoshis (for sw0absoffer)
+ # tx_fee_contribution = 0    # Mining fee contribution in satoshis
+
+ # Minimum confirmations for UTXOs
+@@ -155,6 +177,7 @@
+ # Timeouts and intervals
+ # session_timeout_sec = 300
+ # rescan_interval_sec = 600
++# pending_tx_timeout_min = 60  # Minutes before marking unbroadcast CoinJoins as failed
+
+ # Onion service settings
+ # onion_serving_host = "127.0.0.1"
+@@ -173,11 +196,13 @@
+ # Number of counterparty makers to use (1-20)
+ # counterparty_count = 10
+
+-# Maximum acceptable fees
+-# max_cj_fee_abs = 500        # Absolute fee in satoshis
++# Maximum acceptable coinjoin fees (paid to makers, not network/miner fees)
++# max_cj_fee_abs = 500        # Absolute fee in satoshis per maker
+ # max_cj_fee_rel = "0.001"    # Relative fee (0.001 = 0.1%)
+
+-# Transaction fee settings
++# Network/miner transaction fee settings
++# fee_rate takes precedence over fee_block_target when set
++# fee_rate = 10.0             # Manual fee rate in sat/vB (omit to use estimation)
+ # tx_fee_factor = 3.0         # Fee estimation multiplier (minimum: 1.0)
+ # fee_block_target = 6        # Target blocks for fee estimation (1-1008, omit to use default)
+
+@@ -227,7 +252,7 @@
+ # health_check_port = 8080
+
+ # Message of the day
+-# motd = "JoinMarket NG Directory Server https://github.com/m0wer/joinmarket-ng/tree/master"
++# motd = "JoinMarket NG Directory Server https://github.com/m0wer/joinmarket-ng/"
+
+ # ============================================================================
+ # Orderbook Watcher Settings
+````
+
 ## [0.10.0] - 2026-01-15
 
 ### Security
@@ -1314,6 +2670,269 @@ Releases prior to these changes (including 0.13.5, 0.13.6, and 0.13.7) cannot be
   - Previously, a blacklisted commitment would cause the entire CoinJoin to fail.
   - Now retries up to `taker_utxo_retries` times (default 3) with different commitment indices.
 
+### Configuration Changes
+
+Existing `config.toml` files are not updated automatically. Review the bundled template changes below and apply the relevant options manually.
+
+````diff
+--- config.toml.template (0.9.0)
++++ config.toml.template (0.10.0)
+@@ -0,0 +1,253 @@
++# JoinMarket-NG Configuration
++# Uncomment and modify settings as needed. Defaults are sensible for most users.
++# See: https://github.com/m0wer/joinmarket-ng/blob/master/DOCS.md
++
++# ============================================================================
++# Core Settings
++# ============================================================================
++
++# [core]
++# data_dir = "~/.joinmarket-ng"  # Default data directory
++
++# ============================================================================
++# Tor Settings
++# ============================================================================
++
++[tor]
++# SOCKS proxy settings
++# socks_host = "127.0.0.1"
++# socks_port = 9050
++
++# Control port settings (for hidden services)
++# control_enabled = true
++# control_host = "127.0.0.1"  # Defaults to socks_host if not set
++# control_port = 9051
++# cookie_path = "/var/run/tor/control.authcookie"  # Auto-detected if not set
++# password = ""  # Use cookie auth by default
++# target_host = "127.0.0.1"  # Target host for hidden service mapping
++
++# ============================================================================
++# Bitcoin Backend Settings
++# ============================================================================
++
++[bitcoin]
++# Backend type: "descriptor_wallet" (default), "full_node", or "neutrino"
++# backend_type = "descriptor_wallet"
++
++# Bitcoin Core RPC settings (for all backend types)
++# rpc_url = "http://127.0.0.1:8332"
++# rpc_user = ""
++# rpc_password = ""
++
++# Neutrino backend settings (only used when backend_type = "neutrino")
++# neutrino_url = "http://127.0.0.1:8334"
++
++# ============================================================================
++# Network Settings
++# ============================================================================
++
++[network_config]
++# Network: "mainnet", "testnet", "signet", or "regtest"
++# network = "mainnet"
++
++# Optional: Override Bitcoin network (usually same as network)
++# bitcoin_network = "mainnet"
++
++# Directory servers (leave empty to use network defaults)
++# Mainnet defaults (uncomment and modify to override):
++# directory_servers = ["satoshi2vcg5e2ept7tjkzlkpomkobqmgtsjzegg6wipnoajadissead.onion:5222", "coinjointovy3eq5fjygdwpkbcdx63d7vd4g32mw7y553uj3kjjzkiqd.onion:5222", "nakamotourflxwjnjpnrk7yc2nhkf6r62ed4gdfxmmn5f4saw5q5qoyd.onion:5222", "shssats5ucnwdpbticbb4dymjzf2o27tdecpes35ededagjpdmpxm6yd.onion:5222", "odpwaf67rs5226uabcamvypg3y4bngzmfk7255flcdodesqhsvkptaid.onion:5222", "jmv2dirze66rwxsq7xv7frhmaufyicd3yz5if6obtavsskczjkndn6yd.onion:5222", "jmarketxf5wc4aldf3slm5u6726zsky52bqnfv6qyxe5hnafgly6yuyd.onion:5222"]
++
++# ============================================================================
++# Wallet Settings
++# ============================================================================
++
++[wallet]
++# Number of mixing depths (1-10)
++# mixdepth_count = 5
++
++# Address gap limit for wallet scanning (minimum: 6)
++# gap_limit = 20
++
++# Dust threshold in satoshis
++# dust_threshold = 27300
++
++# Smart wallet scanning optimizations
++# smart_scan = true
++# background_full_rescan = true
++
++# Blocks to look back during wallet scan (~1 year)
++# scan_lookback_blocks = 52560
++
++# Default fee estimation settings
++# default_fee_block_target = 3  # Block target for wallet transactions
++
++# Mnemonic file settings (optional defaults)
++# mnemonic_file = ""            # Path to mnemonic file
++# mnemonic_password = ""        # Password for encrypted mnemonic
++
++# ============================================================================
++# Logging Settings
++# ============================================================================
++
++[logging]
++# Log level: "DEBUG", "INFO", "WARNING", "ERROR"
++# level = "INFO"
++
++# Log sensitive information (private keys, mnemonics, etc.)
++# sensitive = false
++
++# ============================================================================
++# Notification Settings (Apprise integration)
++# ============================================================================
++
++[notifications]
++# Enable notifications
++# enabled = false
++
++# Apprise notification URLs
++# Examples:
++#   Telegram: "tgram://bottoken/ChatID"
++#   Gotify: "gotify://hostname/token"
++# See: https://github.com/caronc/apprise
++# urls = []
++
++# Notification preferences
++# title_prefix = "JoinMarket NG"
++# include_amounts = true
++# include_txids = false
++# include_nick = true
++# use_tor = true
++
++# Event notifications
++# notify_fill = true
++# notify_rejection = true
++# notify_signing = true
++# notify_mempool = true
++# notify_confirmed = true
++# notify_nick_change = true
++# notify_disconnect = true
++# notify_coinjoin_start = true
++# notify_coinjoin_complete = true
++# notify_coinjoin_failed = true
++# notify_peer_events = false
++# notify_rate_limit = true
++# notify_startup = true
++
++# ============================================================================
++# Maker Settings (Yield Generator)
++# ============================================================================
++
++[maker]
++# Minimum CoinJoin amount in satoshis
++# min_size = 100000
++
++# Fee settings
++# cj_fee_relative = "0.001"  # 0.001 = 0.1% relative fee
++# cj_fee_absolute = 500      # Absolute fee in satoshis
++# tx_fee_contribution = 0    # Mining fee contribution in satoshis
++
++# Minimum confirmations for UTXOs
++# min_confirmations = 1
++
++# UTXO merge algorithm: "default", "gradual", "greedy", "random"
++# merge_algorithm = "default"
++
++# Timeouts and intervals
++# session_timeout_sec = 300
++# rescan_interval_sec = 600
++
++# Onion service settings
++# onion_serving_host = "127.0.0.1"
++# onion_serving_port = 5222
++# tor_target_host = "127.0.0.1"
++
++# Rate limiting
++# message_rate_limit = 10   # Messages per second
++# message_burst_limit = 100
++
++# ============================================================================
++# Taker Settings (CoinJoin Client)
++# ============================================================================
++
++[taker]
++# Number of counterparty makers to use (1-20)
++# counterparty_count = 10
++
++# Maximum acceptable fees
++# max_cj_fee_abs = 500        # Absolute fee in satoshis
++# max_cj_fee_rel = "0.001"    # Relative fee (0.001 = 0.1%)
++
++# Transaction fee settings
++# tx_fee_factor = 3.0         # Fee estimation multiplier (minimum: 1.0)
++# fee_block_target = 6        # Target blocks for fee estimation (1-1008, omit to use default)
++
++# Fidelity bond settings
++# bondless_makers_allowance = 0.0  # 0.0-1.0 (0 = require bonds, 1 = allow all)
++# bond_value_exponent = 1.3
++# bondless_require_zero_fee = true
++
++# Timeouts and intervals
++# maker_timeout_sec = 60
++# order_wait_time = 10.0
++# rescan_interval_sec = 600
++
++# Transaction broadcast settings
++# Options: "self", "random-peer", "multiple-peers", "not-self"
++# tx_broadcast = "random-peer"
++# broadcast_peer_count = 3
++
++# Minimum number of makers required
++# minimum_makers = 1
++
++# ============================================================================
++# Directory Server Settings
++# ============================================================================
++
++[directory_server]
++# Server listening address
++# host = "127.0.0.1"
++# port = 5222
++
++# Limits
++# max_peers = 10000
++# max_message_size = 2097152  # 2MB
++# max_line_length = 65536      # 64KB max JSON-line length
++# max_json_nesting_depth = 10
++
++# Rate limiting
++# message_rate_limit = 500     # Messages per second
++# message_burst_limit = 1000
++# rate_limit_disconnect_threshold = 0  # 0 = never disconnect
++
++# Broadcast settings
++# broadcast_batch_size = 50
++
++# Health check endpoint
++# health_check_host = "127.0.0.1"
++# health_check_port = 8080
++
++# Message of the day
++# motd = "JoinMarket NG Directory Server https://github.com/m0wer/joinmarket-ng/tree/master"
++
++# ============================================================================
++# Orderbook Watcher Settings
++# ============================================================================
++
++[orderbook_watcher]
++# HTTP API settings
++# http_host = "0.0.0.0"
++# http_port = 8000
++
++# Update interval in seconds
++# update_interval = 60
++
++# Mempool API settings
++# mempool_api_url = "http://mempopwcaqoi7z5xj5zplfdwk5bgzyl3hemx725d4a3agado6xtk3kqd.onion/api"
++# mempool_web_url = "https://mempool.sgn.space"
++
++# Connection settings
++# max_message_size = 2097152   # 2MB
++# connection_timeout = 30.0     # Seconds
++
++# Uptime tracking
++# uptime_grace_period = 60     # Seconds
+````
+
 ## [0.9.0] - 2026-01-12
 
 ### Added
@@ -1423,6 +3042,10 @@ Releases prior to these changes (including 0.13.5, 0.13.6, and 0.13.7) cannot be
   - Fixed misalignment when address indices transition from single to double digits (e.g., 9 to 10).
   - Derivation paths now use fixed-width padding (24 characters) for consistent column alignment.
 
+### Configuration Changes
+
+This release did not change the bundled `config.toml.template`.
+
 ## [0.8.0] - 2026-01-08
 
 ### Added
@@ -1439,6 +3062,10 @@ Releases prior to these changes (including 0.13.5, 0.13.6, and 0.13.7) cannot be
 
 - Flaky E2E tests regarding taker commitment clearing and neutrino blacklist resetting.
 - Detection of peer count after CoinJoin confirmation in Maker bot.
+
+### Configuration Changes
+
+This release did not change the bundled `config.toml.template`.
 
 ## [0.7.0] - 2026-01-03
 
@@ -1467,6 +3094,10 @@ Releases prior to these changes (including 0.13.5, 0.13.6, and 0.13.7) cannot be
 - Maker orderbook rate limit logging.
 - Docker layer caching for ARM builds.
 
+### Configuration Changes
+
+This release did not change the bundled `config.toml.template`.
+
 ## [0.6.0] - 2025-12-28
 
 ### Added
@@ -1493,6 +3124,10 @@ Releases prior to these changes (including 0.13.5, 0.13.6, and 0.13.7) cannot be
 - Fee estimation and Bitcoin units display format.
 - Maker sending fidelity bonds via PRIVMSG.
 
+### Configuration Changes
+
+This release did not change the bundled `config.toml.template`.
+
 ## [0.5.0] - 2025-12-21
 
 ### Added
@@ -1517,6 +3152,10 @@ Releases prior to these changes (including 0.13.5, 0.13.6, and 0.13.7) cannot be
 - Fidelity bond proof verification and generation.
 - Reference implementation compatibility.
 
+### Configuration Changes
+
+This release did not change the bundled `config.toml.template`.
+
 ## [0.4.0] - 2025-12-14
 
 ### Added
@@ -1536,6 +3175,10 @@ Releases prior to these changes (including 0.13.5, 0.13.6, and 0.13.7) cannot be
 
 - Blockchain height consistency in E2E tests.
 - GitHub Actions workflow to start Bitcoin Regtest node properly.
+
+### Configuration Changes
+
+This release did not change the bundled `config.toml.template`.
 
 ## [0.3.0] - 2025-12-07
 
@@ -1558,6 +3201,10 @@ Releases prior to these changes (including 0.13.5, 0.13.6, and 0.13.7) cannot be
 - Directory Server file-based logging removal.
 - Handling of failed peer mappings on send failures.
 
+### Configuration Changes
+
+This release did not change the bundled `config.toml.template`.
+
 ## [0.2.0] - 2025-11-20
 
 ### Added
@@ -1574,6 +3221,10 @@ Releases prior to these changes (including 0.13.5, 0.13.6, and 0.13.7) cannot be
 - Fidelity bond handling for new offers.
 - Orderbook request logic improvements.
 - Connection handling and UI status indicators.
+
+### Configuration Changes
+
+This release did not change the bundled `config.toml.template`.
 
 ## [0.1.0] - 2025-11-16
 
@@ -1632,6 +3283,7 @@ Releases prior to these changes (including 0.13.5, 0.13.6, and 0.13.7) cannot be
 [0.11.4]: ../../compare/0.11.3...0.11.4
 [0.11.3]: ../../compare/0.11.2...0.11.3
 [0.11.2]: ../../compare/0.11.1...0.11.2
+[0.11.1]: ../../compare/0.11.0...0.11.1
 [0.11.0]: ../../compare/0.10.0...0.11.0
 [0.10.0]: ../../compare/0.9.0...0.10.0
 [0.9.0]: ../../compare/0.8.0...0.9.0

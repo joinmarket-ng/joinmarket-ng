@@ -4,6 +4,8 @@ import sys
 from pathlib import Path
 import importlib
 
+import pytest
+
 
 SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
@@ -16,6 +18,7 @@ validate_commit_message = importlib.import_module("validate_commit_message")
 parse_changelog_trailers = changelog_commit_utils.parse_changelog_trailers
 Commit = generate_changelog.Commit
 generate_changelog_section = generate_changelog.generate_changelog_section
+update_changelog = generate_changelog.update_changelog
 validate_message = validate_commit_message.validate_message
 
 
@@ -94,3 +97,40 @@ def test_generate_changelog_section_uses_trailers() -> None:
         "- Fix changelog merge conflict workflow "
         "([bbbb2222](../../commit/bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222))" in section
     )
+
+
+def test_update_changelog_replaces_generated_config_section(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    changelog = tmp_path / "CHANGELOG.md"
+    changelog.write_text(
+        """# Changelog
+
+## [Unreleased]
+
+### Configuration Changes
+
+Old configuration notes.
+
+## [1.0.0] - 2026-01-01
+
+- Initial release.
+"""
+    )
+    monkeypatch.setattr(generate_changelog, "CHANGELOG", changelog)
+
+    update_changelog(
+        """### Added
+
+- New feature.
+
+### Configuration Changes
+
+New configuration notes."""
+    )
+
+    content = changelog.read_text()
+    assert content.count("### Configuration Changes") == 1
+    assert "Old configuration notes." not in content
+    assert "New configuration notes." in content
+    assert "- New feature." in content
