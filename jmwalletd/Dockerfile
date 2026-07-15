@@ -5,26 +5,6 @@
 # =============================================================================
 ARG PYTHON_VERSION=3.14
 ARG PYTHON_SLIM_DIGEST=sha256:b877e50bd90de10af8d82c57a022fc2e0dc731c5320d762a27986facfc3355c1
-ARG NODE_VERSION=26
-ARG NODE_SLIM_DIGEST=sha256:ffc78385a788964bb3cbab5e434ff79a10bdc25b8ae6db03fe5fe6cb14053c09
-# JAM frontend build platform. The build output is static JS that is
-# platform-independent, so the frontend is compiled on the native build host
-# (BUILDPLATFORM) rather than the target image platform. Building it natively
-# avoids running the Node.js toolchain under QEMU emulation, which segfaults
-# (exit code 139) when an amd64 toolchain is emulated on a native arm64 builder
-# (and is prohibitively slow on armv7). node:26-slim only publishes amd64/arm64
-# images, and the armv7 image is always built on an amd64 host, so BUILDPLATFORM
-# always resolves to an available Node image.
-# It is exposed as an overridable ARG (not a constant) to silence the
-# FromPlatformFlagConstDisallowed lint warning; callers may pin it to a fixed
-# platform if byte-identical JS is required. The jam-ng frontend layers are
-# already excluded from strict reproducibility checks because the bundle build
-# is non-deterministic across environments (see docs/technical/development.md).
-ARG JAM_BUILDER_PLATFORM=${BUILDPLATFORM}
-
-# JAM frontend: pinned commit hash for reproducible builds (devel branch tip)
-# Update with: ./scripts/update-base-images.sh
-ARG JAM_COMMIT=a21857946bf859f5de6dd732689411c7e25c0c11
 
 # Pin build tools for reproducible builds
 # setuptools version is stamped into WHEEL metadata (Generator: setuptools (x.y.z))
@@ -137,7 +117,7 @@ RUN if [ -n "$SOURCE_DATE_EPOCH" ]; then export SOURCE_DATE_EPOCH=$SOURCE_DATE_E
         /build/jmwalletd
 
 # =============================================================================
-# Stage 2: jmwalletd — standalone API daemon (default target)
+# Stage 2: jmwalletd standalone API daemon (default target)
 # =============================================================================
 FROM python:${PYTHON_VERSION}-slim@${PYTHON_SLIM_DIGEST} AS jmwalletd
 WORKDIR /app
@@ -161,113 +141,3 @@ EXPOSE 28183
 
 ENTRYPOINT ["tini", "--"]
 CMD ["jmwalletd"]
-
-# =============================================================================
-# Stage 3: Build JAM frontend (cloned from GitHub, no submodule required)
-# Built on the native build host (BUILDPLATFORM) since the output is static JS
-# that runs in the browser, so the build CPU architecture doesn't matter.
-# Building natively avoids emulating the Node.js toolchain under QEMU, which
-# segfaults on native arm64 builders. node:26-slim has no linux/arm/v7 image,
-# but armv7 targets are always built on an amd64 host, so BUILDPLATFORM resolves
-# to an available image.
-# Pinned to a specific commit for reproducible builds.
-# Update JAM_COMMIT with: ./scripts/update-base-images.sh
-#
-# Reproducibility notes for this stage:
-# - webpack 5 (used by CRA/react-scripts) hashes outputs using [contenthash],
-#   which is derived purely from file content, not timestamps.
-# - GENERATE_SOURCEMAP=false eliminates source map files from the output, which
-#   removes any risk from path or metadata variance in source map generation.
-# - git clone sets all file mtimes to the current wall-clock time. We normalize
-#   them to SOURCE_DATE_EPOCH before building so babel-loader cache keys are
-#   deterministic across builds (even though cache misses don't affect output
-#   content, identical cache keys prevent any mtime-driven divergence).
-# - npm ci is deterministic from a pinned package-lock.json with integrity hashes.
-# =============================================================================
-FROM --platform=${JAM_BUILDER_PLATFORM} node:${NODE_VERSION}-slim@${NODE_SLIM_DIGEST} AS jam-builder
-ARG JAM_COMMIT
-ARG SOURCE_DATE_EPOCH
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates=20250419 \
-    git=1:2.47.3-0+deb13u1 \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN git clone https://github.com/joinmarket-webui/jam.git /app \
-    && git -C /app checkout "${JAM_COMMIT}" \
-    && if [ -n "$SOURCE_DATE_EPOCH" ]; then \
-        find /app -exec touch -d "@${SOURCE_DATE_EPOCH}" {} +; \
-    fi
-
-WORKDIR /app
-# Prefer the strict, reproducible "npm ci" install. The devel branch's committed
-# package-lock.json occasionally lags package.json for optional platform-specific
-# deps, which makes "npm ci" abort; fall back to "npm install" so the build still
-# succeeds in that case. GENERATE_SOURCEMAP=false skips source map generation
-# (no-op for Vite, kept for older CRA-based JAM revisions).
-RUN (npm ci || npm install) && GENERATE_SOURCEMAP=false npm run build
-
-# =============================================================================
-# Stage 4: jam-ng — self-contained: jmwalletd + JAM frontend + Tor + obwatcher
-# Managed by s6-overlay for multi-process supervision
-# =============================================================================
-FROM jmwalletd AS jam-ng
-
-# s6-overlay version (pinned for reproducibility)
-# Update with: ./scripts/update-base-images.sh
-ARG S6_OVERLAY_VERSION=3.2.3.0
-
-# Install xz-utils (for extracting s6-overlay), wget (for downloading s6-overlay), and Tor daemon
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    wget=1.25.0-2 \
-    xz-utils=5.8.1-1+deb13u1 \
-    tor=0.4.9.11-0+deb13u1 \
-    && rm -rf /var/lib/apt/lists/* \
-    && rm -rf /var/log/dpkg.log /var/log/apt/* /var/cache/ldconfig/aux-cache
-
-# Install s6-overlay (noarch + arch-specific, checksums pinned)
-# noarch tarball is the same for all platforms
-ADD --checksum=sha256:b720f9d9340efc8bb07528b9743813c836e4b02f8693d90241f047998b4c53cf \
-    https://github.com/just-containers/s6-overlay/releases/download/v${S6_OVERLAY_VERSION}/s6-overlay-noarch.tar.xz /tmp
-# Arch-specific tarball: select based on TARGETARCH/TARGETVARIANT at build time
-ARG TARGETARCH
-ARG TARGETVARIANT
-RUN set -eux; \
-    case "${TARGETARCH}/${TARGETVARIANT:-}" in \
-        amd64/)   S6_ARCH=x86_64;  S6_SHA256=a93f02882c6ed46b21e7adb5c0add86154f01236c93cd82c7d682722e8840563 ;; \
-        arm64/)   S6_ARCH=aarch64; S6_SHA256=0952056ff913482163cc30e35b2e944b507ba1025d78f5becbb89367bf344581 ;; \
-        arm/v7)   S6_ARCH=armhf;   S6_SHA256=1ff4721b2a51e4f4dd9dbfffa47a994f14dbc3048853a83f7fb1c6ce93d59bf4 ;; \
-        *) echo "Unsupported platform: ${TARGETARCH}/${TARGETVARIANT:-}" >&2; exit 1 ;; \
-    esac; \
-    wget -qO /tmp/s6-overlay-arch.tar.xz \
-        "https://github.com/just-containers/s6-overlay/releases/download/v${S6_OVERLAY_VERSION}/s6-overlay-${S6_ARCH}.tar.xz"; \
-    echo "${S6_SHA256}  /tmp/s6-overlay-arch.tar.xz" | sha256sum -c -; \
-    tar -C / -Jxpf /tmp/s6-overlay-noarch.tar.xz; \
-    tar -C / -Jxpf /tmp/s6-overlay-arch.tar.xz; \
-    rm -f /tmp/s6-overlay-*.tar.xz
-
-# Copy s6 service definitions and torrc
-COPY jmwalletd/rootfs/ /
-
-# Ensure run scripts are executable
-RUN chmod +x /etc/s6-overlay/s6-rc.d/tor/run \
-    && chmod +x /etc/s6-overlay/s6-rc.d/tor-ready/up \
-    && chmod +x /etc/s6-overlay/s6-rc.d/obwatcher/run \
-    && chmod +x /etc/s6-overlay/s6-rc.d/jmwalletd-svc/run
-
-# Tor data directory (writable at runtime)
-RUN mkdir -p /var/lib/tor && chown root:root /var/lib/tor && chmod 700 /var/lib/tor
-
-# Copy JAM frontend
-COPY --from=jam-builder /app/dist /usr/share/jmwalletd/jam
-
-# Default env: point services at the local Tor and obwatcher
-ENV TOR__SOCKS_HOST=127.0.0.1
-ENV TOR__SOCKS_PORT=9050
-ENV TOR__CONTROL_HOST=127.0.0.1
-ENV TOR__CONTROL_PORT=9051
-ENV OBWATCH_URL=http://127.0.0.1:8000
-
-# s6-overlay init replaces tini as PID 1
-ENTRYPOINT ["/init"]
-# No CMD — s6-overlay starts all services via s6-rc

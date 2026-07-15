@@ -31,6 +31,7 @@
 #   - MAKER_IMAGE=ghcr.io/org/repo/maker:tag
 #   - TAKER_IMAGE=ghcr.io/org/repo/taker:tag
 #   - JMWALLETD_IMAGE=ghcr.io/org/repo/jmwalletd:tag
+#   - JAM_NG_IMAGE=ghcr.io/joinmarket-webui/jam-dev-standalone-ng:master
 
 services:
   # ============================================================================
@@ -299,17 +300,22 @@ services:
 
   # ============================================================================
   # JAM Frontend for Playwright E2E tests (profile: e2e, all)
-  # Uses the jam-ng image (jmwalletd + JAM UI) on a separate port so
+  # Uses jam-docker's standalone-ng image on a separate port so
   # Playwright tests can interact with a real browser UI without
   # interfering with the Python e2e tests that use the jmwalletd above.
+  # The published image is used by default. CI, the full suite, and the local
+  # Playwright runner build standalone-ng from JAM_DOCKER_CONTEXT instead.
   # ============================================================================
 
   jam-playwright:
-    image: ${JAM_NG_IMAGE:-}
+    image: ${JAM_NG_IMAGE:-ghcr.io/joinmarket-webui/jam-dev-standalone-ng:master}
     build:
-      context: .
-      dockerfile: jmwalletd/Dockerfile
-      target: jam-ng
+      context: ${JAM_DOCKER_CONTEXT:-https://github.com/joinmarket-webui/jam-docker.git#master:standalone-ng}
+      args:
+        JM_NG_REPO: ${JM_NG_REPO:-https://github.com/joinmarket-ng/joinmarket-ng}
+        JM_NG_REPO_REF: ${JM_NG_REPO_REF:-main}
+        # Development branches are not guaranteed to have signed tip commits.
+        SKIP_RELEASE_VERIFICATION: ${SKIP_RELEASE_VERIFICATION:-true}
     container_name: jm-jam-playwright
     restart: "no"
     logging:
@@ -326,16 +332,13 @@ services:
       # (the reference JoinMarket implementation uses "testnet" for regtest networks)
       - NETWORK_CONFIG__NETWORK=testnet
       - NETWORK_CONFIG__BITCOIN_NETWORK=regtest
-      - JMWALLETD_HOST=0.0.0.0
+      - NETWORK_CONFIG__DIRECTORY_SERVERS=jm-directory:5222,jm-directory2:5223
       - LOGGING__LEVEL=DEBUG
-      - OBWATCH_URL=http://jm-orderbook-watcher:8000
-      - TOR__SOCKS_HOST=jm-tor
-      - TOR__SOCKS_PORT=9050
-      - TOR__CONTROL_HOST=jm-tor
-      - TOR__CONTROL_PORT=9051
+      # standalone-ng supervises its own Tor and orderbook watcher. Keep their
+      # loopback defaults so the Tor control cookie and nginx upstreams match.
       - DIRECTORY_NODES=jm-directory:5222
     ports:
-      - "29183:28183"
+      - "29183:80"
     volumes:
       - jam-playwright-data:/root/.joinmarket-ng
       - ./shared:/shared:ro

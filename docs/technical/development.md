@@ -214,8 +214,11 @@ LEVEL=minor  # or patch / major
 scripts/bump_version.py "$LEVEL" --no-push
 ```
 
-Note: strict layer-digest matching is currently skipped for `jam-ng` because
-the CRA/webpack frontend build is non-deterministic across environments.
+The JAM standalone image is built and published by
+[`jam-docker`](https://github.com/joinmarket-webui/jam-docker/tree/master/standalone-ng),
+so it is not included in JoinMarket NG release manifests. Historical manifests
+that included `jam-ng` still skip its non-deterministic frontend layers during
+verification.
 
 #### How reproducibility is achieved
 
@@ -247,8 +250,7 @@ VERSION=<version>
 scripts/sign-release.sh "$VERSION" --key <fingerprint>
 ```
 
-This downloads the CI manifest, rebuilds locally, and signs if digests
-match. The same `jam-ng` skip rule applies for strict layer matching.
+This downloads the CI manifest, rebuilds locally, and signs if digests match.
 
 ## Verify a Release
 

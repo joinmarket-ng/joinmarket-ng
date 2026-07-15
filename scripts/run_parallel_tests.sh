@@ -249,7 +249,7 @@ services:
       - jam-playwright-data:/root/.joinmarket-ng
       - "${shared_dir}:/shared:ro"
     ports: !override
-      - "${jam_pw_port}:28183"
+      - "${jam_pw_port}:80"
 
   bitcoin-jam:
     container_name: ${prefix}-bitcoin-jam
@@ -916,10 +916,10 @@ run_suite_playwright() {
         wait_for_port "$dir_port" "Directory ($suite)"
         wait_for_wallet_funder "$suite"
 
-        # Wait for jam-playwright (HTTPS, self-signed cert)
+        # standalone-ng terminates jmwalletd's self-signed TLS behind HTTP nginx.
         local jam_playwright_ready=0
         for i in $(seq 1 60); do
-            if curl -skf "https://127.0.0.1:${jam_pw_port}/api/v1/session" >/dev/null 2>&1; then
+            if curl -sf "http://127.0.0.1:${jam_pw_port}/api/v1/session" >/dev/null 2>&1; then
                 jam_playwright_ready=1
                 break
             fi
@@ -961,15 +961,14 @@ run_suite_playwright() {
         # need none of the Docker services or port mappings above.
         bash -c "cd '${PW_DIR}' && npx playwright test -c playwright.obwatcher.config.ts"
 
-        JAM_URL="https://localhost:${jam_pw_port}" \
-        JMWALLETD_URL="https://localhost:${jam_pw_port}" \
+        JAM_URL="http://localhost:${jam_pw_port}" \
+        JMWALLETD_URL="http://localhost:${jam_pw_port}" \
         BITCOIN_RPC_URL="http://localhost:${btc_rpc}" \
         BITCOIN_RPC_USER=test \
         BITCOIN_RPC_PASS=test \
         DIRECTORY_PORT="${dir_port}" \
         JM_CONTAINER_PREFIX="${prefix}" \
         COMPOSE_PROJECT_NAME="${PROJECT_PREFIX}-${suite}" \
-        NODE_TLS_REJECT_UNAUTHORIZED=0 \
         bash -c "cd '${PW_DIR}' && npx playwright test"
     ) > "$log" 2>&1
     rc=$?

@@ -1,10 +1,8 @@
 services:
   jam:
-    image: jam-ng
+    image: ${JAM_NG_IMAGE:-ghcr.io/joinmarket-webui/jam-dev-standalone-ng:master}
     environment:
       # jmwalletd
-      - JMWALLETD_HOST=0.0.0.0
-      - JMWALLETD_NO_TLS=true
       - JOINMARKET_DATA_DIR=/root/.joinmarket-ng
       # Bitcoin Core
       - BITCOIN__RPC_URL=http://bitcoind-signet:38332
@@ -44,9 +42,9 @@ services:
       - "traefik.http.routers.jam-ng-signet.entrypoints=websecure"
       - "traefik.http.routers.jam-ng-signet.middlewares=jam-ng-signet-ipallowlist"
       - "traefik.http.middlewares.jam-ng-signet-ipallowlist.ipallowlist.sourcerange=192.168.1.0/24,172.16.0.0/16"
-      - "traefik.http.services.jam-ng-signet.loadbalancer.server.port=28183"
+      - "traefik.http.services.jam-ng-signet.loadbalancer.server.port=80"
     healthcheck:
-      test: ["CMD", "python", "-c", "import socket; s=socket.create_connection(('127.0.0.1',28183),5); s.close()"]
+      test: ["CMD", "python", "-c", "import socket; s=socket.create_connection(('127.0.0.1',80),5); s.close()"]
       interval: 30s
       timeout: 10s
       retries: 3

@@ -68,11 +68,6 @@ jobs:
             image: taker
             target: ""
             tag_suffix: ""
-          - name: jam-ng
-            dockerfile: ./jmwalletd/Dockerfile
-            image: jam-ng
-            target: "jam-ng"
-            tag_suffix: ""
           - name: jmwalletd
             dockerfile: ./jmwalletd/Dockerfile
             image: jmwalletd
@@ -729,8 +724,9 @@ jobs:
       packages: read
     env:
       MAKER_IMAGE: ghcr.io/${{ github.repository }}/maker:ci-unsafe-do-not-run-${{ github.event.pull_request.head.sha || github.sha }}
-      JAM_NG_IMAGE: ghcr.io/${{ github.repository }}/jam-ng:ci-unsafe-do-not-run-${{ github.event.pull_request.head.sha || github.sha }}
       DIRECTORY_SERVER_IMAGE: ghcr.io/${{ github.repository }}/directory-server:ci-unsafe-do-not-run-${{ github.event.pull_request.head.sha || github.sha }}
+      JM_NG_REPO: ${{ github.server_url }}/${{ github.event.pull_request.head.repo.full_name || github.repository }}
+      JM_NG_REPO_REF: ${{ github.event.pull_request.head.ref || github.ref_name }}
 
     steps:
       - uses: actions/checkout@v6
@@ -827,9 +823,11 @@ jobs:
       - name: Pull pre-built images
         run: |
           docker pull $MAKER_IMAGE &
-          docker pull $JAM_NG_IMAGE &
           docker pull $DIRECTORY_SERVER_IMAGE &
           wait
+
+      - name: Build JAM standalone image
+        run: docker compose build jam-playwright
 
       - name: Start e2e services
         run: |
@@ -844,7 +842,7 @@ jobs:
             30 1
 
           .github/scripts/wait-for-service.sh "jam-playwright" \
-            "curl -skf https://127.0.0.1:29183/api/v1/session" \
+            "curl -sf http://127.0.0.1:29183/api/v1/session" \
             90 2
 
           # Wait for at least 4 maker offers to appear in the orderbook so
@@ -860,10 +858,8 @@ jobs:
         working-directory: tests/playwright
         env:
           CI: "true"
-          JAM_URL: https://localhost:29183
-          JMWALLETD_URL: https://localhost:29183
-          # jmwalletd serves a self-signed cert in the e2e stack; accept it for test-only traffic.
-          NODE_TLS_REJECT_UNAUTHORIZED: "0"
+          JAM_URL: http://localhost:29183
+          JMWALLETD_URL: http://localhost:29183
         run: npx playwright test
 
       - name: Show Docker logs on failure
@@ -1878,11 +1874,6 @@ jobs:
             image: taker
             target: ""
             tag_suffix: ""
-          - name: jam-ng
-            dockerfile: ./jmwalletd/Dockerfile
-            image: jam-ng
-            target: "jam-ng"
-            tag_suffix: ""
           - name: jmwalletd
             dockerfile: ./jmwalletd/Dockerfile
             image: jmwalletd
@@ -1968,11 +1959,6 @@ jobs:
             dockerfile: ./taker/Dockerfile
             image: taker
             target: ""
-            tag_suffix: ""
-          - name: jam-ng
-            dockerfile: ./jmwalletd/Dockerfile
-            image: jam-ng
-            target: "jam-ng"
             tag_suffix: ""
           - name: jmwalletd
             dockerfile: ./jmwalletd/Dockerfile
@@ -2073,9 +2059,6 @@ jobs:
             tag_suffix: ""
           - name: taker
             image: taker
-            tag_suffix: ""
-          - name: jam-ng
-            image: jam-ng
             tag_suffix: ""
           - name: jmwalletd
             image: jmwalletd

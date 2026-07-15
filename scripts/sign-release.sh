@@ -34,8 +34,8 @@ log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
 log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
-# Images currently excluded from strict layer reproducibility checks.
-# jam-ng: frontend bundle build (CRA/webpack) is non-deterministic across environments.
+# Historical images excluded from strict layer reproducibility checks.
+# Releases before jam-ng moved to jam-docker included a non-deterministic frontend bundle.
 SKIP_VERIFY_IMAGES=("jam-ng")
 
 usage() {
@@ -438,9 +438,9 @@ if [[ "$REPRODUCE" == true ]]; then
 
     # Build images for current architecture only
     # Images and their corresponding targets (must match CI workflow matrix)
-    IMAGES=("directory-server" "maker" "taker" "orderbook-watcher" "jmwalletd" "jam-ng")
-    DOCKERFILES=("./directory_server/Dockerfile" "./maker/Dockerfile" "./taker/Dockerfile" "./orderbook_watcher/Dockerfile" "./jmwalletd/Dockerfile" "./jmwalletd/Dockerfile")
-    TARGETS=("production" "" "" "" "jmwalletd" "jam-ng")  # Empty string means no --target (uses default)
+    IMAGES=("directory-server" "maker" "taker" "orderbook-watcher" "jmwalletd")
+    DOCKERFILES=("./directory_server/Dockerfile" "./maker/Dockerfile" "./taker/Dockerfile" "./orderbook_watcher/Dockerfile" "./jmwalletd/Dockerfile")
+    TARGETS=("production" "" "" "" "jmwalletd")  # Empty string means no --target (uses default)
 
     # Create OCI output directory
     OCI_DIR="$WORK_DIR/oci"

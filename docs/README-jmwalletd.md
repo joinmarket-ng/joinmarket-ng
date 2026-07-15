@@ -69,6 +69,13 @@ The `JMWALLETD_HOST`, `JMWALLETD_NO_TLS`, `JOINMARKET_DATA_DIR`, and
 Point JAM at the daemon URL (default `https://127.0.0.1:28183`). With the
 default self-signed certificate your browser asks for a one-time exception.
 
+For a combined Docker deployment, use the `standalone-ng` image maintained by
+[`joinmarket-webui/jam-docker`](https://github.com/joinmarket-webui/jam-docker/tree/master/standalone-ng).
+It runs JAM, jmwalletd, Tor, and the orderbook watcher behind plain HTTP nginx
+on container port `80`; jmwalletd remains on its TLS-enabled loopback port
+inside the container. The JoinMarket NG repository only publishes the
+standalone `jmwalletd` image.
+
 If a JAM build is present in `<data-dir>/jam` (or the system paths
 `/usr/share/jmwalletd/jam` and `/app/share/jmwalletd/jam` used by packaged
 installs), the daemon serves the UI itself, so opening the daemon URL in a

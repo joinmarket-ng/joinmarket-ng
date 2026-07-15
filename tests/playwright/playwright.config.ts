@@ -8,11 +8,11 @@ import path from "path";
  *   docker compose --profile e2e up -d
  *
  * The jam-playwright container serves both the JAM frontend and the
- * jmwalletd API on port 29183 (mapped from internal 28183).
+ * jmwalletd API on port 29183 (mapped from standalone-ng's nginx port 80).
  *
  * Environment variables:
- *   JAM_URL          - Frontend URL  (default: https://localhost:29183)
- *   JMWALLETD_URL    - Backend URL   (default: https://localhost:29183)
+ *   JAM_URL          - Frontend URL  (default: http://localhost:29183)
+ *   JMWALLETD_URL    - Backend URL   (default: http://localhost:29183)
  *   BITCOIN_RPC_URL  - Bitcoin RPC   (default: http://localhost:18443)
  *   BITCOIN_RPC_USER - RPC user      (default: test)
  *   BITCOIN_RPC_PASS - RPC password  (default: test)
@@ -36,8 +36,7 @@ export default defineConfig({
     : [["list"], ["html", { open: "on-failure" }]],
 
   use: {
-    baseURL: process.env.JAM_URL || "https://localhost:29183",
-    ignoreHTTPSErrors: true, // self-signed cert on jmwalletd
+    baseURL: process.env.JAM_URL || "http://localhost:29183",
     trace: isCI ? "on" : "on",
     screenshot: isCI ? "on" : "on",
     video: isCI ? "on" : "on",
