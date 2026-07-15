@@ -34,6 +34,7 @@ from loguru import logger
 from pydantic import ValidationError
 from pydantic.dataclasses import dataclass
 
+from jmcore.bitcoin import hash160
 from jmcore.constants import SECP256K1_N
 from jmcore.protocol import UTXOMetadata
 
@@ -302,6 +303,69 @@ def generate_podle(
 # ==============================================================================
 # PoDLE Verification (Maker side)
 # ==============================================================================
+
+
+def verify_podle_binding(p: bytes, scriptpubkey: bytes | str) -> tuple[bool, str]:
+    """
+    Verify that a PoDLE public key ``P`` actually controls a given UTXO.
+
+    The PoDLE proof on its own only shows that ``P`` and ``P2`` share a
+    discrete log; it does NOT tie ``P`` to the UTXO the taker claims to be
+    spending. Without this binding a taker could replay a stranger's UTXO as
+    its anti-snooping commitment. This helper closes that gap by reconstructing
+    the scriptPubKey that ``P`` would produce for each supported output type and
+    comparing it against the UTXO's on-chain scriptPubKey.
+
+    Supported script types: P2PKH, P2SH-P2WPKH, and P2WPKH (all using the
+    33-byte compressed ``P``).
+
+    Args:
+        p: PoDLE public key ``P`` (33-byte compressed SEC1 encoding).
+        scriptpubkey: UTXO scriptPubKey as raw bytes or a hex string.
+
+    Returns:
+        (is_bound, error_message)
+    """
+    if isinstance(scriptpubkey, str):
+        try:
+            spk = bytes.fromhex(scriptpubkey)
+        except ValueError:
+            return False, "scriptpubkey is not valid hex"
+    else:
+        spk = scriptpubkey
+
+    if len(p) != 33:
+        return False, f"Invalid P length: {len(p)}, expected 33 (compressed)"
+
+    h160 = hash160(p)
+
+    # P2WPKH: OP_0 <20-byte hash160(P)>
+    if len(spk) == 22 and spk[0] == 0x00 and spk[1] == 0x14:
+        if spk[2:] == h160:
+            return True, ""
+        return False, "P does not match P2WPKH scriptpubkey"
+
+    # P2PKH: OP_DUP OP_HASH160 <20-byte hash160(P)> OP_EQUALVERIFY OP_CHECKSIG
+    if (
+        len(spk) == 25
+        and spk[0] == 0x76
+        and spk[1] == 0xA9
+        and spk[2] == 0x14
+        and spk[23] == 0x88
+        and spk[24] == 0xAC
+    ):
+        if spk[3:23] == h160:
+            return True, ""
+        return False, "P does not match P2PKH scriptpubkey"
+
+    # P2SH-P2WPKH: OP_HASH160 <hash160(0x0014||hash160(P))> OP_EQUAL
+    if len(spk) == 23 and spk[0] == 0xA9 and spk[1] == 0x14 and spk[22] == 0x87:
+        redeem_script = b"\x00\x14" + h160
+        if spk[2:22] == hash160(redeem_script):
+            return True, ""
+        return False, "P does not match P2SH-P2WPKH scriptpubkey"
+
+    return False, f"Unsupported scriptpubkey type for PoDLE binding ({len(spk)} bytes)"
 
 
 def verify_podle(

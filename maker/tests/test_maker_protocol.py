@@ -476,6 +476,7 @@ async def test_neutrino_maker_accepts_neutrino_compat_taker_auth():
 
     with (
         patch("maker.coinjoin.verify_podle", return_value=(True, None)),
+        patch("maker.coinjoin.verify_podle_binding", return_value=(True, "")),
         patch("maker.coinjoin.parse_podle_revelation") as mock_parse,
         patch.object(
             session,
