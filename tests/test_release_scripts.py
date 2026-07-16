@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import stat
 import subprocess
 import textwrap
@@ -387,6 +388,74 @@ exit 0
     # _build_info.py contents into the wheels regardless of build environment.
     assert f"JOINMARKET_BUILD_COMMIT={expected_commit}" in log, log
     assert "JOINMARKET_BUILD_REF=v9.9.9" in log, log
+    assert "--bootstrap" in log, log
+
+
+def test_build_release_retains_postprocessing_failure_logs(tmp_path: Path) -> None:
+    repo_dir = tmp_path / "repo"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (repo_dir / "scripts").mkdir(parents=True)
+    (repo_dir / "scripts" / "build-release.sh").write_text(
+        (SCRIPTS_DIR / "build-release.sh").read_text()
+    )
+    (repo_dir / "scripts" / "build-release.sh").chmod(0o755)
+    (repo_dir / "jmcore" / "src" / "jmcore").mkdir(parents=True)
+    (repo_dir / "jmcore" / "src" / "jmcore" / "version.py").write_text(
+        '__version__ = "9.9.9"\n'
+    )
+
+    write_executable(
+        bin_dir / "docker",
+        textwrap.dedent(
+            """#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$1" == "buildx" && "$2" == "inspect" ]]; then
+    printf 'Driver: docker-container\n'
+    exit 0
+fi
+if [[ "$1" == "buildx" && "$2" == "build" ]]; then
+    printf 'successful build output\n' >&2
+    exit 0
+fi
+exit 1
+"""
+        ),
+    )
+    write_executable(bin_dir / "jq", "#!/usr/bin/env bash\nexit 0\n")
+    write_executable(
+        bin_dir / "tar",
+        "#!/usr/bin/env bash\nprintf 'intentional extraction failure\\n' >&2\nexit 42\n",
+    )
+
+    run_git(repo_dir, "init", "--initial-branch=main")
+    run_git(repo_dir, "add", ".")
+    run_git(repo_dir, "commit", "-m", "init")
+
+    result = subprocess.run(
+        [
+            "bash",
+            str(repo_dir / "scripts" / "build-release.sh"),
+            "9.9.9",
+            "--jobs",
+            "1",
+        ],
+        cwd=repo_dir,
+        text=True,
+        capture_output=True,
+        env=make_env(bin_dir),
+        check=False,
+    )
+
+    assert result.returncode != 0
+    log_paths = re.findall(r"\(log: ([^)]+)\)", result.stdout)
+    assert len(log_paths) == 6, result.stdout
+    for log_path in log_paths:
+        retained_log = Path(log_path)
+        assert retained_log.is_file()
+        log_contents = retained_log.read_text()
+        assert "successful build output" in log_contents
+        assert "intentional extraction failure" in log_contents
 
 
 def test_verify_release_reproduce_passes_commit_and_ref_build_args() -> None:

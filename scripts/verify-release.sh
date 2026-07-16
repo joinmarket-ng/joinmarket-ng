@@ -165,35 +165,31 @@ setup_buildx_builder() {
     # First, check if we already have a working builder by checking the driver
     # Use awk for compatibility (grep -oP not available everywhere)
     local current_driver
-    current_driver=$(docker buildx inspect 2>/dev/null | awk '/^Driver:/{print $2}')
+    current_driver=$(docker buildx inspect 2>/dev/null | awk '/^Driver:/{print $2}' || true)
 
-    if [[ "$current_driver" == "docker-container" ]]; then
-        # Current builder already supports OCI export
-        return 0
-    fi
-
-    # Check if our custom builder already exists
-    if docker buildx inspect "$builder_name" &>/dev/null; then
+    if [[ "$current_driver" != "docker-container" ]] && \
+       docker buildx inspect "$builder_name" &>/dev/null; then
         docker buildx use "$builder_name" >/dev/null 2>&1
         log_info "Using buildx builder: $builder_name"
-        return 0
+    elif [[ "$current_driver" != "docker-container" ]]; then
+        log_info "Creating buildx builder with docker-container driver..."
+        log_info "The default 'docker' driver doesn't support OCI export format."
+        if ! docker buildx create --name "$builder_name" --driver docker-container --use; then
+            log_error "Failed to create buildx builder."
+            log_error "You can manually create one with:"
+            log_error "  docker buildx create --name $builder_name --driver docker-container --use"
+            log_error "Or enable the containerd image store in Docker Desktop settings."
+            return 1
+        fi
+        log_info "Created and activated buildx builder: $builder_name"
     fi
 
-    # Need to create a new builder
-    log_info "Creating buildx builder with docker-container driver..."
-    log_info "The default 'docker' driver doesn't support OCI export format."
-
-    if docker buildx create --name "$builder_name" --driver docker-container --bootstrap; then
-        docker buildx use "$builder_name"
-        log_info "Created and activated buildx builder: $builder_name"
-        return 0
-    else
-        log_error "Failed to create buildx builder."
-        log_error "You can manually create one with:"
-        log_error "  docker buildx create --name $builder_name --driver docker-container --use"
-        log_error "Or enable the containerd image store in Docker Desktop settings."
+    if ! docker buildx inspect --bootstrap >/dev/null; then
+        log_error "Failed to start buildx builder."
         return 1
     fi
+
+    return 0
 }
 
 # Create temp directory for verification

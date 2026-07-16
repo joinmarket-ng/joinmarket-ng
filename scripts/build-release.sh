@@ -20,6 +20,7 @@
 #
 # Output:
 #   release-manifest-<version>.txt in the project root directory
+#   build logs under tmp/release-build-<version>.*
 # =============================================================================
 
 set -euo pipefail
@@ -107,29 +108,31 @@ setup_buildx_builder() {
     local builder_name="jmng-verify"
 
     local current_driver
-    current_driver=$(docker buildx inspect 2>/dev/null | awk '/^Driver:/{print $2}')
+    current_driver=$(docker buildx inspect 2>/dev/null | awk '/^Driver:/{print $2}' || true)
 
-    if [[ "$current_driver" == "docker-container" ]]; then
-        return 0
-    fi
-
-    if docker buildx inspect "$builder_name" &>/dev/null; then
+    if [[ "$current_driver" != "docker-container" ]] && \
+       docker buildx inspect "$builder_name" &>/dev/null; then
         docker buildx use "$builder_name" >/dev/null 2>&1
         log_info "Using buildx builder: $builder_name"
-        return 0
+    elif [[ "$current_driver" != "docker-container" ]]; then
+        log_info "Creating buildx builder with docker-container driver..."
+        if ! docker buildx create --name "$builder_name" --driver docker-container --use; then
+            log_error "Failed to create buildx builder."
+            log_error "You can manually create one with:"
+            log_error "  docker buildx create --name $builder_name --driver docker-container --use"
+            return 1
+        fi
+        log_info "Created and activated buildx builder: $builder_name"
     fi
 
-    log_info "Creating buildx builder with docker-container driver..."
-    if docker buildx create --name "$builder_name" --driver docker-container --bootstrap; then
-        docker buildx use "$builder_name"
-        log_info "Created and activated buildx builder: $builder_name"
-        return 0
-    else
-        log_error "Failed to create buildx builder."
-        log_error "You can manually create one with:"
-        log_error "  docker buildx create --name $builder_name --driver docker-container --use"
+    # An existing docker-container builder can be stopped. Bootstrap it before
+    # launching parallel builds so they do not race to start the same daemon.
+    if ! docker buildx inspect --bootstrap >/dev/null; then
+        log_error "Failed to start buildx builder."
         return 1
     fi
+
+    return 0
 }
 
 # Parse arguments
@@ -247,8 +250,12 @@ log_info "Parallel jobs: $BUILD_JOBS"
 echo ""
 
 # Create temp directory for build artifacts
+mkdir -p "$PROJECT_ROOT/tmp"
+LOG_DIR=$(mktemp -d "$PROJECT_ROOT/tmp/release-build-${VERSION}.XXXXXX")
 WORK_DIR=$(mktemp -d)
 trap "rm -rf '$WORK_DIR'" EXIT
+log_info "Build logs: $LOG_DIR"
+echo ""
 
 # Images and their corresponding targets (must match CI workflow matrix)
 IMAGES=("directory-server" "directory-server-debug" "maker" "taker" "orderbook-watcher" "jmwalletd")
@@ -292,8 +299,7 @@ build_image() {
         build_cmd+=(--target "$target")
     fi
 
-    if ! SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" "${build_cmd[@]}" \
-        "$PROJECT_ROOT" > "$WORK_DIR/${image}-build.log" 2>&1; then
+    if ! SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" "${build_cmd[@]}" "$PROJECT_ROOT"; then
         return 1
     fi
 
@@ -337,7 +343,7 @@ collect_build_result() {
         layer_count=$(wc -l < "$DIGEST_DIR/${image}-${CURRENT_ARCH}-layers.txt")
         log_info "  $image built successfully ($layer_count layers)"
     else
-        log_error "  Build failed for $image (log: $WORK_DIR/${image}-build.log)"
+        log_error "  Build failed for $image (log: $LOG_DIR/${image}-build.log)"
         BUILD_ERRORS=$((BUILD_ERRORS + 1))
     fi
 
@@ -370,7 +376,8 @@ for i in "${!IMAGES[@]}"; do
     target="${TARGETS[$i]}"
 
     log_info "Building $image for $PLATFORM in parallel..."
-    build_image "$image" "$dockerfile" "$target" &
+    build_image "$image" "$dockerfile" "$target" \
+        > "$LOG_DIR/${image}-build.log" 2>&1 &
     pid=$!
     BUILD_PIDS+=("$pid")
     PID_TO_IMAGE["$pid"]="$image"
@@ -392,6 +399,7 @@ if [[ $BUILD_ERRORS -gt 0 ]]; then
 fi
 
 log_info "All images built successfully!"
+log_info "Build logs retained in: $LOG_DIR"
 
 # =============================================================================
 # Generate release manifest (same format as CI)

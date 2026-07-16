@@ -205,6 +205,11 @@ releases in `joinmarket-ng/joinmarket-ng`.
 `release-manifest-<version>.txt` is gitignored — it is a build artefact
 and is not committed to the repository.
 
+`build-release.sh` starts its BuildKit builder before launching parallel
+builds. It retains each run's output under
+`tmp/release-build-<version>.*`; use the reported per-image log path to
+diagnose a failed build. OCI export intermediates are still removed on exit.
+
 **LEVEL**: `bump_version.py` accepts `patch`, `minor`, or `major` as its
 positional argument. Set `LEVEL` as a shell variable if you want to
 parameterise it:
