@@ -1,6 +1,6 @@
 [project]
 name = "jm-maker"
-version = "0.34.0"
+version = "0.34.1"
 description = "JoinMarket Yield Generator (Maker Bot)"
 requires-python = ">=3.11"
 dependencies = [

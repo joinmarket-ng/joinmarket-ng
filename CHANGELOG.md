@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.34.1] - 2026-07-16
+
+Security fix.
+
+### Fixed
+
+- Bind taker PoDLE proofs to the committed UTXO scriptpubkey ([84dbfa9d](../../commit/84dbfa9d07eaa94aecfe21cf8ef0a50ac544fe66))
+
+### Configuration Changes
+
+This release did not change the bundled `config.toml.template`.
+
 ## [0.34.0] - 2026-07-14
 
 Automatic history import for existing wallets, fee quantization defaults for better privacy, coin control labels, local mempool API support, bug fixes, and security hardening.
@@ -3236,7 +3248,8 @@ This release did not change the bundled `config.toml.template`.
 - Pre-built image support for directory server compose.
 - Tor configuration instructions.
 
-[Unreleased]: ../../compare/0.34.0...HEAD
+[Unreleased]: ../../compare/0.34.1...HEAD
+[0.34.1]: ../../compare/0.34.0...0.34.1
 [0.34.0]: ../../compare/0.33.0...0.34.0
 [0.33.0]: ../../compare/0.32.0...0.33.0
 [0.32.0]: ../../compare/0.31.1...0.32.0
