@@ -19,6 +19,7 @@ from jmwallet.backends.descriptor_wallet import DescriptorWalletBackend
 from jmwallet.wallet.bond_registry import (
     BondRegistry,
     FidelityBondInfo,
+    load_registry,
     save_registry,
 )
 from jmwallet.wallet.service import WalletService
@@ -83,6 +84,21 @@ def test_load_registered_bond_addresses_empty_without_data_dir() -> None:
     backend._wallet_loaded = True
     ws = WalletService(mnemonic=MNEMONIC, backend=backend, network="regtest")
     assert ws.load_registered_bond_addresses() == []
+
+
+def test_complete_bond_scan_clears_spent_registry_utxo(tmp_path: Path) -> None:
+    ws = _make_wallet(tmp_path)
+    _write_bond_registry(ws)
+    registry = load_registry(tmp_path, ws.wallet_fingerprint, allow_legacy_fallback=False)
+    assert registry.update_utxo_info(BOND_ADDRESS, "aa" * 32, 0, 20_000, 5)
+    save_registry(registry, tmp_path, ws.wallet_fingerprint)
+
+    ws._self_register_bond_utxos([], scanned_addresses={BOND_ADDRESS.lower()})
+
+    refreshed = load_registry(tmp_path, ws.wallet_fingerprint, allow_legacy_fallback=False)
+    bond = refreshed.get_bond_by_address(BOND_ADDRESS)
+    assert bond is not None
+    assert bond.is_funded is False
 
 
 @pytest.mark.asyncio
@@ -551,7 +567,9 @@ class _FakeLightClientBackend(BlockchainBackend):
         self._scanned.update(addresses)
 
     async def get_utxos(self, addresses: list[str]) -> list[UTXO]:
-        if self._bond_address in addresses and self._bond_address in self._scanned:
+        requested = {address.lower() for address in addresses}
+        scanned = {address.lower() for address in self._scanned}
+        if self._bond_address.lower() in requested and self._bond_address.lower() in scanned:
             return [self._bond_utxo]
         return []
 
@@ -630,6 +648,47 @@ async def test_sync_all_scans_bonds_on_light_client_backend(tmp_path: Path) -> N
     assert bond.is_fidelity_bond
     assert bond.path.endswith(f":{locktime}")
     assert any(u.address == bond_address for u in ws.utxo_cache.get(0, []))
+
+
+@pytest.mark.asyncio
+async def test_light_client_scans_exact_registered_address_case_insensitively(
+    tmp_path: Path,
+) -> None:
+    """External registry entries must not be replaced by a hot-wallet derivation."""
+    backend = _FakeLightClientBackend(
+        bond_address=BOND_ADDRESS.upper(),
+        bond_utxo=UTXO(
+            txid="dd" * 32,
+            vout=1,
+            value=234_567,
+            address=BOND_ADDRESS.upper(),
+            confirmations=7,
+            scriptpubkey="0020" + "44" * 32,
+            height=990,
+        ),
+    )
+    ws = WalletService(
+        mnemonic=MNEMONIC,
+        backend=backend,
+        network="regtest",
+        data_dir=tmp_path,
+    )
+    _write_bond_registry(ws)
+    registry = load_registry(tmp_path, ws.wallet_fingerprint, allow_legacy_fallback=False)
+    assert registry.update_utxo_info(BOND_ADDRESS, "aa" * 32, 0, 20_000, 1)
+    save_registry(registry, tmp_path, ws.wallet_fingerprint)
+
+    result = await ws.sync_all([(BOND_ADDRESS, BOND_LOCKTIME, BOND_INDEX)])
+
+    assert BOND_ADDRESS in backend.ensure_calls[0]
+    bonds = [u for u in result[0] if u.address.lower() == BOND_ADDRESS.lower()]
+    assert len(bonds) == 1
+    assert bonds[0].txid == "dd" * 32
+    refreshed = load_registry(tmp_path, ws.wallet_fingerprint, allow_legacy_fallback=False)
+    registered = refreshed.get_bond_by_address(BOND_ADDRESS.upper())
+    assert registered is not None
+    assert registered.txid == "dd" * 32
+    assert registered.value == 234_567
 
 
 # ---------------------------------------------------------------------------

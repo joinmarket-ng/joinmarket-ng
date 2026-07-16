@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import math
 import time
+from hashlib import sha256
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from jmcore.btc_script import mk_freeze_script
 
+from jmwallet.backends.base import BlockchainBackend
 from jmwallet.wallet.models import UTXOInfo
 from jmwallet.wallet.spend import (
     DUST_THRESHOLD,
@@ -54,6 +57,24 @@ def _make_utxo(
 
 
 REGTEST_P2WPKH_ADDR = "bcrt1qq6hag67dl53wl99vzg42z8eyzfz2xlkvwk6f7m"
+
+# ---------------------------------------------------------------------------
+# BlockchainBackend.get_median_time_past
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_get_median_time_past_uses_last_eleven_blocks() -> None:
+    backend = MagicMock(spec=BlockchainBackend)
+    backend.get_block_height = AsyncMock(return_value=20)
+    timestamps = [500, 100, 900, 300, 700, 200, 600, 400, 1_000, 800, 1_100]
+    backend.get_block_time = AsyncMock(side_effect=lambda height: timestamps[height - 10])
+
+    median = await BlockchainBackend.get_median_time_past(backend)
+
+    assert median == 600
+    assert [call.args[0] for call in backend.get_block_time.await_args_list] == list(range(10, 21))
+
 
 # ---------------------------------------------------------------------------
 # _decode_bech32_scriptpubkey
@@ -171,19 +192,31 @@ class TestSelectSpendableUtxos:
         assert len(result) == 1
         assert result[0].vout == 0
 
-    def test_includes_expired_fidelity_bonds(self) -> None:
-        """An expired bond is spendable like a regular coin (sweep/move flows)."""
+    def test_excludes_expired_fidelity_bonds_by_default(self) -> None:
         utxos = [
             _make_utxo(),
             _make_utxo(locktime=int(time.time()) - 1000, vout=1),
         ]
         result = select_spendable_utxos(utxos)
-        assert len(result) == 2
+        assert len(result) == 1
+        assert result[0].vout == 0
 
-    def test_includes_locked_fidelity_bonds_when_requested(self) -> None:
+    def test_includes_expired_fidelity_bonds_when_requested(self) -> None:
+        cutoff = int(time.time())
+        utxos = [_make_utxo(locktime=cutoff - 1)]
+        result = select_spendable_utxos(utxos, include_fidelity_bonds=True, locktime_cutoff=cutoff)
+        assert len(result) == 1
+
+    def test_excludes_locked_fidelity_bonds_when_requested(self) -> None:
         utxos = [_make_utxo(locktime=int(time.time()) + 100_000)]
         result = select_spendable_utxos(utxos, include_fidelity_bonds=True)
-        assert len(result) == 1
+        assert result == []
+
+    def test_excludes_bond_at_chain_time_cutoff(self) -> None:
+        cutoff = int(time.time()) - 1000
+        utxos = [_make_utxo(locktime=cutoff)]
+        result = select_spendable_utxos(utxos, include_fidelity_bonds=True, locktime_cutoff=cutoff)
+        assert result == []
 
     def test_excludes_frozen_expired_fidelity_bond(self) -> None:
         """Frozen wins: even an expired bond stays excluded while frozen."""
@@ -232,6 +265,13 @@ class TestEstimateFee:
         fee_1, _ = estimate_fee(utxos_1, REGTEST_P2WPKH_ADDR, 1.0, has_change=False)
         fee_3, _ = estimate_fee(utxos_3, REGTEST_P2WPKH_ADDR, 1.0, has_change=False)
         assert fee_3 > fee_1
+
+    def test_p2wsh_input_has_higher_fee_than_p2wpkh(self) -> None:
+        p2wpkh = _make_utxo()
+        p2wsh = _make_utxo(scriptpubkey="0020" + "cc" * 32)
+        p2wpkh_fee, _ = estimate_fee([p2wpkh], REGTEST_P2WPKH_ADDR, 1.0, has_change=False)
+        p2wsh_fee, _ = estimate_fee([p2wsh], REGTEST_P2WPKH_ADDR, 1.0, has_change=False)
+        assert p2wsh_fee > p2wpkh_fee
 
 
 # ---------------------------------------------------------------------------
@@ -287,8 +327,22 @@ class TestBuildUnsignedTx:
         future_time = int(time.time()) + 100_000
         utxos = [_make_utxo(value=100_000, locktime=future_time)]
         dest_script = bytes([0x00, 0x14]) + b"\xaa" * 20
-        with pytest.raises(ValueError, match="in the future"):
+        with pytest.raises(ValueError, match="has not passed chain time"):
             _build_unsigned_tx(utxos, dest_script, 99_000, None, 0)
+
+    def test_locktime_equal_to_chain_time_raises(self) -> None:
+        cutoff = int(time.time()) - 1000
+        utxos = [_make_utxo(value=100_000, locktime=cutoff)]
+        dest_script = bytes([0x00, 0x14]) + b"\xaa" * 20
+        with pytest.raises(ValueError, match="has not passed chain time"):
+            _build_unsigned_tx(
+                utxos,
+                dest_script,
+                99_000,
+                None,
+                0,
+                locktime_cutoff=cutoff,
+            )
 
     def test_sequence_fffffffe_when_timelocked(self) -> None:
         past_time = int(time.time()) - 10_000
@@ -337,11 +391,21 @@ def _make_mock_wallet(utxos: list[UTXOInfo], change_addr: str = REGTEST_P2WPKH_A
     return wallet
 
 
-def _make_mock_backend(fee_rate: float = 1.0, txid: str = "cc" * 32) -> MagicMock:
+def _bond_scriptpubkey(locktime: int, pubkey_hex: str = "02" + "ab" * 32) -> str:
+    witness_script = mk_freeze_script(pubkey_hex, locktime)
+    return (b"\x00\x20" + sha256(witness_script).digest()).hex()
+
+
+def _make_mock_backend(
+    fee_rate: float = 1.0,
+    txid: str = "cc" * 32,
+    median_time_past: int | None = None,
+) -> MagicMock:
     """Create a mock BlockchainBackend."""
     backend = MagicMock()
     backend.estimate_fee = AsyncMock(return_value=fee_rate)
     backend.broadcast_transaction = AsyncMock(return_value=txid)
+    backend.get_median_time_past = AsyncMock(return_value=median_time_past or int(time.time()))
     return backend
 
 
@@ -401,11 +465,11 @@ class TestDirectSend:
         bond = _make_utxo(
             value=500_000,
             vout=1,
-            scriptpubkey="0020" + "cc" * 32,
+            scriptpubkey=_bond_scriptpubkey(past_locktime),
             locktime=past_locktime,
             path=f"m/84'/0'/0'/2/12:{past_locktime}",
         )
-        utxos = [_make_utxo(value=100_000), bond]
+        utxos = [_make_utxo(value=100_000, frozen=True), bond]
         wallet = _make_mock_wallet(utxos)
         backend = _make_mock_backend()
 
@@ -417,11 +481,78 @@ class TestDirectSend:
             destination=REGTEST_P2WPKH_ADDR,
             fee_rate=1.0,
         )
-        assert result.num_inputs == 2
-        assert result.send_amount == 600_000 - result.fee
+        assert result.num_inputs == 1
+        assert result.send_amount == 500_000 - result.fee
         # nLockTime (last 4 bytes) must equal the bond's script locktime.
         tx_bytes = bytes.fromhex(result.tx_hex)
         assert int.from_bytes(tx_bytes[-4:], "little") == past_locktime
+
+    @pytest.mark.anyio
+    async def test_sweep_does_not_merge_expired_bond_with_regular_coin(self) -> None:
+        past_locktime = int(time.time()) - 100_000
+        bond = _make_utxo(
+            value=500_000,
+            vout=1,
+            scriptpubkey=_bond_scriptpubkey(past_locktime),
+            locktime=past_locktime,
+        )
+        wallet = _make_mock_wallet([_make_utxo(value=100_000), bond])
+        backend = _make_mock_backend()
+
+        result = await direct_send(
+            wallet=wallet,
+            backend=backend,
+            mixdepth=0,
+            amount_sats=0,
+            destination=REGTEST_P2WPKH_ADDR,
+            fee_rate=1.0,
+        )
+
+        assert result.num_inputs == 1
+        assert result.send_amount == 100_000 - result.fee
+        assert int.from_bytes(bytes.fromhex(result.tx_hex)[-4:], "little") == 0
+        backend.get_median_time_past.assert_not_awaited()
+
+    @pytest.mark.anyio
+    async def test_sweep_rejects_bond_at_chain_time_cutoff(self) -> None:
+        locktime = int(time.time()) - 100_000
+        bond = _make_utxo(
+            value=500_000,
+            scriptpubkey=_bond_scriptpubkey(locktime),
+            locktime=locktime,
+        )
+        wallet = _make_mock_wallet([bond])
+        backend = _make_mock_backend(median_time_past=locktime)
+
+        with pytest.raises(ValueError, match="No spendable UTXOs"):
+            await direct_send(
+                wallet=wallet,
+                backend=backend,
+                mixdepth=0,
+                amount_sats=0,
+                destination=REGTEST_P2WPKH_ADDR,
+                fee_rate=1.0,
+            )
+
+    @pytest.mark.anyio
+    async def test_sweep_rejects_bond_with_mismatched_wallet_key(self) -> None:
+        locktime = int(time.time()) - 100_000
+        bond = _make_utxo(
+            value=500_000,
+            scriptpubkey="0020" + "cc" * 32,
+            locktime=locktime,
+        )
+        wallet = _make_mock_wallet([bond])
+
+        with pytest.raises(ValueError, match="No spendable UTXOs"):
+            await direct_send(
+                wallet=wallet,
+                backend=_make_mock_backend(),
+                mixdepth=0,
+                amount_sats=0,
+                destination=REGTEST_P2WPKH_ADDR,
+                fee_rate=1.0,
+            )
 
     @pytest.mark.anyio
     async def test_sweep_excludes_locked_fidelity_bond(self) -> None:
@@ -468,8 +599,8 @@ class TestDirectSend:
             fee_rate=1.0,
         )
         assert result.change_amount == 0
-        # Fee absorbs the dust
-        assert result.fee > 0
+        # Fee absorbs the dust and reports the transaction's actual value delta.
+        assert result.fee == utxos[0].value - result.send_amount
 
     @pytest.mark.anyio
     async def test_insufficient_funds_raises(self) -> None:

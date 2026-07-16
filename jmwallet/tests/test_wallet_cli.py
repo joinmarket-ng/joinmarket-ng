@@ -654,6 +654,81 @@ async def test_send_fails_when_change_key_unavailable():
         mock_wallet.close.assert_awaited_once()
 
 
+@pytest.mark.asyncio
+async def test_send_reports_dust_change_as_actual_fee():
+    """The displayed fee must equal inputs minus outputs when change is omitted."""
+    from jmcore.cli_common import ResolvedBackendSettings
+
+    from jmwallet.cli.send import _send_transaction
+    from jmwallet.wallet.models import UTXOInfo
+
+    class StopAfterConfirmationError(Exception):
+        pass
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        backend_settings = ResolvedBackendSettings(
+            network="regtest",
+            bitcoin_network="regtest",
+            backend_type="descriptor_wallet",
+            rpc_url="http://127.0.0.1:18443",
+            rpc_user="user",
+            rpc_password="pass",
+            neutrino_url="",
+            neutrino_add_peers=[],
+            data_dir=Path(tmpdir),
+            scan_start_height=None,
+        )
+        mock_backend = MagicMock(spec=DescriptorWalletBackend)
+        mock_backend.get_mempool_min_fee = AsyncMock(return_value=None)
+        utxo = UTXOInfo(
+            txid="a" * 64,
+            vout=0,
+            value=10_500,
+            address="bcrt1qq6hag67dl53wl99vzg42z8eyzfz2xlkvwk6f7m",
+            confirmations=6,
+            scriptpubkey="0014" + "11" * 20,
+            path="m/84'/1'/0'/0/0",
+            mixdepth=0,
+        )
+        mock_wallet = MagicMock()
+        mock_wallet.sync_with_registered_bonds = AsyncMock(return_value={})
+        mock_wallet.get_balance = AsyncMock(return_value=utxo.value)
+        mock_wallet.get_utxos = AsyncMock(return_value=[utxo])
+        mock_wallet.close = AsyncMock()
+
+        def assert_confirmation_fee(*args: object, **kwargs: object) -> None:
+            assert kwargs["mining_fee"] == 500
+            raise StopAfterConfirmationError
+
+        with (
+            patch(
+                "jmwallet.backends.descriptor_wallet.DescriptorWalletBackend",
+                _stub_backend_class(mock_backend),
+            ),
+            patch("jmwallet.wallet.service.WalletService", return_value=mock_wallet),
+            patch("jmwallet.cli.send.estimate_fee", return_value=(200, 200)),
+            patch(
+                "jmcore.confirmation.confirm_transaction",
+                side_effect=assert_confirmation_fee,
+            ),
+            pytest.raises(StopAfterConfirmationError),
+        ):
+            await _send_transaction(
+                mnemonic="abandon " * 11 + "about",
+                destination="bcrt1qq6hag67dl53wl99vzg42z8eyzfz2xlkvwk6f7m",
+                amount=10_000,
+                mixdepth=0,
+                fee_rate=1.0,
+                block_target=None,
+                backend_settings=backend_settings,
+                broadcast=False,
+                skip_confirmation=True,
+                interactive_utxo_selection=False,
+            )
+
+        mock_wallet.close.assert_awaited_once()
+
+
 def test_history_command_status_display(monkeypatch):
     """Test that history command displays correct status for pending, failed, and successful txs."""
     from jmwallet.history import append_history_entry, create_taker_history_entry

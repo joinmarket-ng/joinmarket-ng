@@ -294,6 +294,23 @@ class BlockchainBackend(ABC):
     async def get_block_time(self, block_height: int) -> int:
         """Get block time (unix timestamp) for given height"""
 
+    async def get_median_time_past(self) -> int:
+        """Return the median timestamp of the last 11 blocks.
+
+        Bitcoin evaluates time-based transaction locktimes against the median
+        time past of the current chain tip, not the local host clock (BIP 113).
+        Backends may override this with a native endpoint when available.
+        """
+        height = await self.get_block_height()
+        first_height = max(0, height - 10)
+        block_times = await asyncio.gather(
+            *(self.get_block_time(block_height) for block_height in range(first_height, height + 1))
+        )
+        if not block_times:
+            msg = "Cannot determine median time past without block timestamps"
+            raise RuntimeError(msg)
+        return sorted(block_times)[len(block_times) // 2]
+
     @abstractmethod
     async def get_block_hash(self, block_height: int) -> str:
         """Get block hash for given height"""

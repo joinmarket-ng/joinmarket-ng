@@ -184,6 +184,14 @@ class TestBondRegistry:
         assert len(registry.bonds) == 1
         assert registry.bonds[0].value == 200
 
+    def test_add_bond_duplicate_is_case_insensitive(self) -> None:
+        registry = BondRegistry()
+        registry.add_bond(self._create_bond(address="bc1qsame", value=100))
+        registry.add_bond(self._create_bond(address="BC1QSAME", value=200))
+
+        assert len(registry.bonds) == 1
+        assert registry.bonds[0].value == 200
+
     def test_get_bond_by_address(self) -> None:
         """Test finding a bond by address."""
         registry = BondRegistry()
@@ -196,6 +204,12 @@ class TestBondRegistry:
 
         not_found = registry.get_bond_by_address("bc1qnotfound")
         assert not_found is None
+
+    def test_get_bond_by_address_is_case_insensitive(self) -> None:
+        registry = BondRegistry()
+        registry.add_bond(self._create_bond(address="bc1qbond"))
+
+        assert registry.get_bond_by_address("BC1QBOND") is not None
 
     def test_get_bond_by_index(self) -> None:
         """Test finding a bond by index and locktime."""
@@ -621,6 +635,26 @@ class TestMultiUtxoHandling:
             )
             is False
         )
+
+    def test_set_bond_utxos_empty_clears_funding_metadata(self) -> None:
+        from jmwallet.wallet.bond_registry import BondUtxo
+
+        registry = BondRegistry()
+        registry.add_bond(self._create_bond(address="bc1qspent"))
+        registry.set_bond_utxos(
+            "bc1qspent",
+            [BondUtxo(txid="tx", vout=0, value=42_000, confirmations=3)],
+        )
+
+        assert registry.set_bond_utxos("bc1qspent", []) is True
+        bond = registry.get_bond_by_address("bc1qspent")
+        assert bond is not None
+        assert bond.is_funded is False
+        assert bond.txid is None
+        assert bond.vout is None
+        assert bond.value is None
+        assert bond.confirmations is None
+        assert bond.extra_utxos == []
 
     def test_update_utxo_info_clears_extras(self) -> None:
         """update_utxo_info sets only the announced UTXO and drops any extras."""

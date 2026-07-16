@@ -7,6 +7,8 @@ regular P2WPKH inputs and timelocked P2WSH fidelity bonds.
 
 from __future__ import annotations
 
+from hashlib import sha256
+
 import pytest
 from jmcore.bitcoin import TxInput, TxOutput
 from jmcore.btc_script import mk_freeze_script
@@ -110,7 +112,7 @@ class TestSignInputFidelityBond:
             value=200_000,
             address=address,
             confirmations=10,
-            scriptpubkey="0020" + "ff" * 32,
+            scriptpubkey=(b"\x00\x20" + sha256(script).digest()).hex(),
             path="m/84'/0'/0'/2/0",
             mixdepth=0,
             locktime=BOND_LOCKTIME,
@@ -130,3 +132,39 @@ class TestSignInputFidelityBond:
             bond_key.get_public_key_bytes(compressed=True).hex(), BOND_LOCKTIME
         )
         assert signed.witness[1] == expected_script
+
+    def test_mismatched_script_raises(self, wallet_service):
+        address = wallet_service.get_fidelity_bond_address(0, BOND_LOCKTIME)
+        utxo = UTXOInfo(
+            txid="ee" * 32,
+            vout=0,
+            value=200_000,
+            address=address,
+            confirmations=10,
+            scriptpubkey="0020" + "ff" * 32,
+            path="m/84'/0'/0'/2/0",
+            mixdepth=0,
+            locktime=BOND_LOCKTIME,
+        )
+
+        with pytest.raises(TransactionSigningError, match="does not match wallet key"):
+            wallet_service.sign_input(_single_input_tx(), 0, utxo)
+
+    def test_uppercase_bond_address_uses_lowercase_cache(self, wallet_service):
+        address = wallet_service.get_fidelity_bond_address(0, BOND_LOCKTIME)
+        script = wallet_service.get_fidelity_bond_script(0, BOND_LOCKTIME)
+        utxo = UTXOInfo(
+            txid="ee" * 32,
+            vout=0,
+            value=200_000,
+            address=address.upper(),
+            confirmations=10,
+            scriptpubkey=(b"\x00\x20" + sha256(script).digest()).hex(),
+            path="m/84'/0'/0'/2/0",
+            mixdepth=0,
+            locktime=BOND_LOCKTIME,
+        )
+
+        signed = wallet_service.sign_input(_single_input_tx(), 0, utxo)
+
+        assert signed.witness[1] == script

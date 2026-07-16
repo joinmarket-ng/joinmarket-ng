@@ -9,9 +9,11 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import dataclass, field
+from hashlib import sha256
 from typing import TYPE_CHECKING
 
 from jmcore.bitcoin import estimate_vsize, get_address_type
+from jmcore.btc_script import mk_freeze_script
 from loguru import logger
 
 from jmwallet.wallet.address import pubkey_to_p2wpkh_script
@@ -159,26 +161,45 @@ def select_spendable_utxos(
     *,
     include_frozen: bool = False,
     include_fidelity_bonds: bool = False,
+    locktime_cutoff: int | None = None,
 ) -> list[UTXOInfo]:
     """Filter UTXOs to only those safe for auto-spending.
 
-    Frozen UTXOs are excluded unless ``include_frozen`` is set. Fidelity bond
-    UTXOs whose timelock has **not** yet expired are excluded unless
-    ``include_fidelity_bonds`` is set (they are consensus-unspendable anyway,
-    so including them only ever makes sense for display purposes). *Expired*
-    fidelity bonds are spendable like any regular coin, matching the taker's
-    coin eligibility and the reference implementation; this is what allows
-    sweeping an expired bond out of a mixdepth (e.g. JAM's
-    "move bond to jar" flow, which freezes everything else and sweeps).
+    Frozen UTXOs and all fidelity bonds are excluded by default. Setting
+    ``include_fidelity_bonds`` admits only bonds whose locktime is strictly
+    below ``locktime_cutoff``. The cutoff should be chain median-time-past for
+    transaction construction; it defaults to the host time for display-only
+    callers.
     """
+    cutoff = int(time.time()) if locktime_cutoff is None else locktime_cutoff
     result = []
     for u in utxos:
         if not include_frozen and u.frozen:
             continue
-        if not include_fidelity_bonds and u.is_fidelity_bond and u.is_locked:
-            continue
+        if u.is_fidelity_bond:
+            if not include_fidelity_bonds:
+                continue
+            if u.locktime is None or u.locktime >= cutoff:
+                continue
         result.append(u)
     return result
+
+
+def _is_signable_fidelity_bond(wallet: WalletService, utxo: UTXOInfo) -> bool:
+    """Return whether this wallet derives the script key for a bond UTXO."""
+    if not utxo.is_fidelity_bond or utxo.locktime is None or not utxo.is_p2wsh:
+        return False
+    try:
+        key = wallet.get_key_for_address(utxo.address)
+    except Exception:
+        return False
+    if key is None:
+        return False
+    witness_script = mk_freeze_script(
+        key.get_public_key_bytes(compressed=True).hex(), utxo.locktime
+    )
+    expected_scriptpubkey = b"\x00\x20" + sha256(witness_script).digest()
+    return utxo.scriptpubkey.lower() == expected_scriptpubkey.hex()
 
 
 def estimate_fee(
@@ -217,6 +238,8 @@ def _build_unsigned_tx(
     send_amount: int,
     change_script: bytes | None,
     change_amount: int,
+    *,
+    locktime_cutoff: int | None = None,
 ) -> tuple[bytes, bytes, bytes, bytes, int]:
     """Build an unsigned raw transaction.
 
@@ -227,16 +250,16 @@ def _build_unsigned_tx(
     # Determine locktime from timelocked UTXOs
     max_locktime = 0
     has_timelocked = False
-    current_time = int(time.time())
+    cutoff = int(time.time()) if locktime_cutoff is None else locktime_cutoff
     for utxo in utxos:
         if utxo.is_timelocked and utxo.locktime is not None:
             has_timelocked = True
             if utxo.locktime > max_locktime:
                 max_locktime = utxo.locktime
-            if utxo.locktime > current_time:
+            if utxo.locktime >= cutoff:
                 msg = (
-                    f"Cannot spend timelocked UTXO {utxo.txid}:{utxo.vout} — "
-                    f"locktime {utxo.locktime} is in the future (now: {current_time})"
+                    f"Cannot spend timelocked UTXO {utxo.txid}:{utxo.vout}: "
+                    f"locktime {utxo.locktime} has not passed chain time {cutoff}"
                 )
                 raise ValueError(msg)
 
@@ -385,10 +408,22 @@ async def direct_send(
 
     # --- UTXO selection ---
     utxos: list[UTXOInfo]
+    locktime_cutoff: int | None = None
     if amount_sats == 0:
-        # Sweep: use all spendable UTXOs.
+        # Sweep regular coins by default. If there are none, admit expired
+        # hot-wallet bonds. This supports explicit bond-redemption flows that
+        # freeze every other coin without making bonds part of normal
+        # auto-selection or linking them to unrelated funds.
         raw_utxos = await wallet.get_utxos(mixdepth)
         utxos = select_spendable_utxos(raw_utxos)
+        if not utxos and any(u.is_fidelity_bond and not u.frozen for u in raw_utxos):
+            locktime_cutoff = await backend.get_median_time_past()
+            bond_candidates = select_spendable_utxos(
+                raw_utxos,
+                include_fidelity_bonds=True,
+                locktime_cutoff=locktime_cutoff,
+            )
+            utxos = [u for u in bond_candidates if _is_signable_fidelity_bond(wallet, u)]
     else:
         # Non-sweep: use greedy coin selection to pick the minimum UTXOs needed.
         # This avoids building oversized transactions when the wallet has many UTXOs.
@@ -426,10 +461,10 @@ async def direct_send(
             msg = f"Insufficient funds: need {send_amount + fee}, have {total_input}"
             raise ValueError(msg)
         if change_amount < DUST_THRESHOLD:
-            fee += change_amount
+            # With no change output, every satoshi not sent is the actual fee.
+            # Keep the reported fee consistent with the serialized transaction.
+            fee = total_input - send_amount
             change_amount = 0
-            # Re-estimate without change output
-            fee, _vsize = estimate_fee(utxos, destination, fee_rate, has_change=False)
 
     # --- Destination scriptPubKey ---
     # (already validated and computed at the top of this function)
@@ -449,7 +484,12 @@ async def direct_send(
 
     # --- Build unsigned tx ---
     unsigned_tx, version, inputs_data, outputs_data, num_outputs = _build_unsigned_tx(
-        utxos, dest_script, send_amount, change_script, change_amount
+        utxos,
+        dest_script,
+        send_amount,
+        change_script,
+        change_amount,
+        locktime_cutoff=locktime_cutoff,
     )
 
     # --- Sign ---

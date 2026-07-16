@@ -513,10 +513,13 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin, Wal
 
     def get_key_for_address(self, address: str) -> HDKey | None:
         """Get HD key for a known address"""
-        if address not in self.address_cache:
+        path_info = self.address_cache.get(address)
+        if path_info is None:
+            path_info = self.address_cache.get(address.lower())
+        if path_info is None:
             return None
 
-        mixdepth, change, index = self.address_cache[address]
+        mixdepth, change, index = path_info
         path = f"{self.root_path}/{mixdepth}'/{change}/{index}"
         return self.master_key.derive(path)
 

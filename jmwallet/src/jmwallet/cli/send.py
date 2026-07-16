@@ -23,8 +23,10 @@ from jmwallet.wallet.spend import (
     DEFAULT_MAX_FEE_RATE_SAT_VB as MAX_MANUAL_FEE_RATE_SAT_VB,
 )
 from jmwallet.wallet.spend import (
+    DUST_THRESHOLD,
     ExcessiveFeeRateError,
     enforce_fee_rate_cap,
+    estimate_fee,
 )
 
 
@@ -355,7 +357,6 @@ async def _send_transaction(
 
         # Calculate totals based on selected UTXOs
         total_input = sum(u.value for u in utxos)
-        num_inputs = len(utxos)
 
         if amount == 0:
             # Sweep selected UTXOs
@@ -367,24 +368,14 @@ async def _send_transaction(
             logger.error(f"Insufficient funds: need {send_amount:,}, have {total_input:,}")
             raise typer.Exit(1)
 
-        # Estimate transaction size
-        from jmcore.bitcoin import estimate_vsize, get_address_type
-
-        try:
-            dest_type = get_address_type(destination)
-        except ValueError:
-            logger.warning(f"Could not determine address type for {destination}, assuming P2WPKH")
-            dest_type = "p2wpkh"
-
-        input_types = ["p2wpkh"] * num_inputs
-        output_types = [dest_type]
-
-        # Initial assumption: we have change if not sweeping
-        if amount > 0:
-            output_types.append("p2wpkh")  # Change is always P2WPKH
-
-        estimated_vsize = estimate_vsize(input_types, output_types)
-        estimated_fee = math.ceil(estimated_vsize * resolved_fee_rate)
+        # Size each selected input by script type. Expired fidelity bonds are
+        # P2WSH and have a larger witness than regular P2WPKH inputs.
+        estimated_fee, _ = estimate_fee(
+            utxos,
+            destination,
+            resolved_fee_rate,
+            has_change=amount > 0,
+        )
 
         if amount == 0:
             # Sweep: subtract fee from send amount
@@ -398,16 +389,12 @@ async def _send_transaction(
             if change_amount < 0:
                 logger.error(f"Insufficient funds after fee: need {send_amount + estimated_fee:,}")
                 raise typer.Exit(1)
-            if change_amount < 546:  # Dust threshold
-                # Add to fee instead
-                estimated_fee += change_amount
+            if change_amount < DUST_THRESHOLD:
+                # With no change output, every satoshi not sent is the actual fee.
+                estimated_fee = total_input - send_amount
                 change_amount = 0
-                # Re-estimate without change output
-                output_types.pop()  # Remove change output
-                estimated_vsize = estimate_vsize(input_types, output_types)
-                estimated_fee = math.ceil(estimated_vsize * resolved_fee_rate)
 
-        num_outputs = len(output_types)
+        num_outputs = 1 + int(change_amount > 0)
 
         # Use new format_amount for display
         from jmcore.bitcoin import format_amount
@@ -467,21 +454,21 @@ async def _send_transaction(
         version = (2).to_bytes(4, "little")
 
         # Determine transaction locktime - must be >= max CLTV locktime if spending timelocked UTXOs
-        import time
-
         max_locktime = 0
         has_timelocked = False
-        current_time = int(time.time())
+        locktime_cutoff = 0
+        if any(utxo.is_timelocked for utxo in utxos):
+            locktime_cutoff = await backend.get_median_time_past()
         for utxo in utxos:
             if utxo.is_timelocked and utxo.locktime is not None:
                 has_timelocked = True
                 if utxo.locktime > max_locktime:
                     max_locktime = utxo.locktime
-                if utxo.locktime > current_time:
+                if utxo.locktime >= locktime_cutoff:
                     logger.error(
                         f"Cannot spend timelocked UTXO {utxo.txid}:{utxo.vout} - "
-                        f"locktime {utxo.locktime} is in the future "
-                        f"(current time: {current_time})"
+                        f"locktime {utxo.locktime} has not passed chain time "
+                        f"{locktime_cutoff}"
                     )
                     raise typer.Exit(1)
 

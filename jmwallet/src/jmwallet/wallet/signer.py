@@ -18,6 +18,7 @@ key material.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from hashlib import sha256
 from typing import TYPE_CHECKING
 
 from jmcore.btc_script import mk_freeze_script
@@ -90,7 +91,10 @@ class WalletSigningMixin:
                 is a P2WSH output without an associated locktime (which would
                 otherwise be impossible to sign).
         """
-        key = self.get_key_for_address(utxo.address)
+        try:
+            key = self.get_key_for_address(utxo.address)
+        except Exception as exc:
+            raise TransactionSigningError(f"Missing key for address {utxo.address}") from exc
         if key is None:
             raise TransactionSigningError(f"Missing key for address {utxo.address}")
 
@@ -99,7 +103,16 @@ class WalletSigningMixin:
 
         if utxo.is_timelocked and utxo.locktime is not None:
             # Timelocked P2WSH fidelity bond.
+            if not utxo.is_p2wsh:
+                raise TransactionSigningError(
+                    f"Fidelity bond UTXO {utxo.txid}:{utxo.vout} is not P2WSH"
+                )
             witness_script = mk_freeze_script(pubkey_bytes.hex(), utxo.locktime)
+            expected_scriptpubkey = b"\x00\x20" + sha256(witness_script).digest()
+            if utxo.scriptpubkey.lower() != expected_scriptpubkey.hex():
+                raise TransactionSigningError(
+                    f"Fidelity bond script does not match wallet key for {utxo.txid}:{utxo.vout}"
+                )
             signature = sign_p2wsh_input(
                 tx=tx,
                 input_index=input_index,

@@ -195,6 +195,11 @@ async def test_expired_bond_lifecycle_create_sync_spend(
         await mine_blocks(1, DUMMY_MINER_ADDR)
         await ws.sync_with_registered_bonds()
         assert not _bond_utxos(ws, bond_address), "Bond UTXO still unspent after sweep"
+        registry = load_registry(
+            ws.data_dir, ws.wallet_fingerprint, allow_legacy_fallback=False
+        )
+        spent_bond = registry.get_bond_by_address(bond_address)
+        assert spent_bond is not None and not spent_bond.is_funded
         md1_values = [
             u.value for u in ws.utxo_cache.get(1, []) if u.address == destination
         ]

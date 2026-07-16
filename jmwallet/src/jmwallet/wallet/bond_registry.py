@@ -138,8 +138,9 @@ class BondRegistry(BaseModel):
     def add_bond(self, bond: FidelityBondInfo) -> None:
         """Add a new bond to the registry."""
         # Check for duplicate address
+        address_lower = bond.address.lower()
         for existing in self.bonds:
-            if existing.address == bond.address:
+            if existing.address.lower() == address_lower:
                 logger.warning(f"Bond with address {bond.address} already exists, updating")
                 self.bonds.remove(existing)
                 break
@@ -147,8 +148,9 @@ class BondRegistry(BaseModel):
 
     def get_bond_by_address(self, address: str) -> FidelityBondInfo | None:
         """Get a bond by its address."""
+        address_lower = address.lower()
         for bond in self.bonds:
-            if bond.address == address:
+            if bond.address.lower() == address_lower:
                 return bond
         return None
 
@@ -222,11 +224,21 @@ class BondRegistry(BaseModel):
         Selecting the announced UTXO by value (not by scan order) keeps the
         recorded bond stable regardless of the order UTXOs are supplied.
 
-        Returns ``True`` when the bond exists and ``utxos`` is non-empty.
+        An empty list clears stale funding metadata after the final UTXO at a
+        registered bond address is spent.
+
+        Returns ``True`` when the bond exists.
         """
         bond = self.get_bond_by_address(address)
-        if bond is None or not utxos:
+        if bond is None:
             return False
+        if not utxos:
+            bond.txid = None
+            bond.vout = None
+            bond.value = None
+            bond.confirmations = None
+            bond.extra_utxos = []
+            return True
         ordered = sorted(utxos, key=lambda u: u.value, reverse=True)
         main = ordered[0]
         bond.txid = main.txid

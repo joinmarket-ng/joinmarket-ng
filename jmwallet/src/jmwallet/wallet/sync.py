@@ -451,7 +451,12 @@ class WalletSyncMixin:
         self.utxo_cache[mixdepth] = utxos
         return utxos
 
-    async def sync_fidelity_bonds(self, locktimes: list[int]) -> list[UTXOInfo]:
+    async def sync_fidelity_bonds(
+        self,
+        locktimes: list[int],
+        *,
+        bond_addresses: list[tuple[str, int, int]] | None = None,
+    ) -> list[UTXOInfo]:
         """
         Sync fidelity bond UTXOs with specific locktimes.
 
@@ -461,7 +466,11 @@ class WalletSyncMixin:
         Each locktime maps to exactly one timenumber (BIP32 child index).
 
         Args:
-            locktimes: List of Unix timestamps to scan for
+            locktimes: List of Unix timestamps to scan for when explicit bond
+                addresses are not supplied.
+            bond_addresses: Exact ``(address, locktime, index)`` entries to scan.
+                This is required for externally registered bonds whose address
+                cannot be derived from this wallet's seed.
 
         Returns:
             List of fidelity bond UTXOs found
@@ -470,7 +479,7 @@ class WalletSyncMixin:
 
         utxos: list[UTXOInfo] = []
 
-        if not locktimes:
+        if not locktimes and not bond_addresses:
             logger.debug("No locktimes provided for fidelity bond sync")
             return utxos
 
@@ -478,11 +487,16 @@ class WalletSyncMixin:
         addresses: list[str] = []
         address_to_info: dict[str, tuple[int, int]] = {}  # addr -> (locktime, timenumber)
 
-        for locktime in locktimes:
-            timenumber = timestamp_to_timenumber(locktime)
-            address = self.get_fidelity_bond_address(timenumber, locktime)
-            addresses.append(address)
-            address_to_info[address] = (locktime, timenumber)
+        if bond_addresses is not None:
+            for address, locktime, index in bond_addresses:
+                addresses.append(address)
+                address_to_info[address.lower()] = (locktime, index)
+        else:
+            for locktime in locktimes:
+                timenumber = timestamp_to_timenumber(locktime)
+                address = self.get_fidelity_bond_address(timenumber, locktime)
+                addresses.append(address)
+                address_to_info[address.lower()] = (locktime, timenumber)
 
         # Ensure these bond addresses are scanned over the wallet's full
         # history before querying. Light-client backends (Neutrino) only rescan
@@ -495,16 +509,18 @@ class WalletSyncMixin:
         backend_utxos = await self.backend.get_utxos(addresses)
 
         # Group by address
-        utxos_by_address: dict[str, list] = {addr: [] for addr in addresses}
+        utxos_by_address: dict[str, list] = {addr.lower(): [] for addr in addresses}
         for utxo in backend_utxos:
-            if utxo.address in utxos_by_address:
-                utxos_by_address[utxo.address].append(utxo)
+            address_lower = utxo.address.lower()
+            if address_lower in utxos_by_address:
+                utxos_by_address[address_lower].append(utxo)
 
         # Process results
         for address in addresses:
-            addr_utxos = utxos_by_address[address]
+            address_lower = address.lower()
+            addr_utxos = utxos_by_address[address_lower]
             if addr_utxos:
-                locktime, timenumber = address_to_info[address]
+                locktime, timenumber = address_to_info[address_lower]
                 self._record_history_address(address)
                 for utxo in addr_utxos:
                     path = f"{self.root_path}/0'/{FIDELITY_BOND_BRANCH}/{timenumber}:{locktime}"
@@ -537,6 +553,11 @@ class WalletSyncMixin:
                     self.utxo_cache[0].append(utxo_info)
                     existing_outpoints.add(outpoint)
             logger.info(f"Found {len(utxos)} fidelity bond UTXOs")
+
+        self._self_register_bond_utxos(
+            utxos,
+            scanned_addresses={address.lower() for address in addresses},
+        )
 
         return utxos
 
@@ -809,15 +830,16 @@ class WalletSyncMixin:
         # place -- no manual mirroring needed.
         if fidelity_bond_addresses:
             expected_hrp = get_hrp(self.network)
-            bond_locktimes = sorted(
-                {
-                    locktime
-                    for address, locktime, _ in fidelity_bond_addresses
-                    if (address.split("1")[0].lower() if "1" in address else "") == expected_hrp
-                }
-            )
-            if bond_locktimes:
-                await self.sync_fidelity_bonds(bond_locktimes)
+            valid_bonds = [
+                (address, locktime, index)
+                for address, locktime, index in fidelity_bond_addresses
+                if (address.split("1")[0].lower() if "1" in address else "") == expected_hrp
+            ]
+            if valid_bonds:
+                await self.sync_fidelity_bonds(
+                    sorted({locktime for _, locktime, _ in valid_bonds}),
+                    bond_addresses=valid_bonds,
+                )
 
         logger.info(f"Sync complete: {sum(len(u) for u in result.values())} total UTXOs")
         self._freeze_reused_after_sync(prior_funded_addresses)
@@ -1017,7 +1039,12 @@ class WalletSyncMixin:
             return locktime, -1
         return None
 
-    def _self_register_bond_utxos(self, bond_utxos: list[UTXOInfo]) -> None:
+    def _self_register_bond_utxos(
+        self,
+        bond_utxos: list[UTXOInfo],
+        *,
+        scanned_addresses: set[str] | None = None,
+    ) -> None:
         """Persist and refresh recognized fidelity bond UTXOs in the registry.
 
         ``bond_utxos`` are all fidelity bond UTXOs recognized during a sync
@@ -1051,7 +1078,7 @@ class WalletSyncMixin:
         failure here only means the same reconciliation is retried on the next
         sync, never that a recognized UTXO disappears from the current result.
         """
-        if self.data_dir is None or not bond_utxos:
+        if self.data_dir is None or (not bond_utxos and not scanned_addresses):
             return
         try:
             from jmwallet.wallet.bond_registry import (
@@ -1121,6 +1148,23 @@ class WalletSyncMixin:
                 registry.add_bond(bond_info)
                 registry.set_bond_utxos(address, addr_utxos)
                 registered += 1
+
+            # A complete bond-aware scan also proves which registered
+            # addresses are now empty. Clear stale funding metadata after a
+            # redemption instead of leaving offline list-bonds views funded.
+            found_addresses = {address.lower() for address in utxos_by_address}
+            for existing in registry.bonds:
+                address_lower = existing.address.lower()
+                if (
+                    scanned_addresses is None
+                    or address_lower not in scanned_addresses
+                    or address_lower in found_addresses
+                ):
+                    continue
+                before = _bond_utxo_signature(existing)
+                registry.set_bond_utxos(existing.address, [])
+                if _bond_utxo_signature(existing) != before:
+                    refreshed += 1
 
             if registered or refreshed:
                 save_registry(registry, self.data_dir, self.wallet_fingerprint)
@@ -1357,6 +1401,12 @@ class WalletSyncMixin:
         # Add fidelity bond UTXOs to mixdepth 0
         if fidelity_bond_utxos:
             result[0].extend(fidelity_bond_utxos)
+
+        if fidelity_bond_addresses:
+            self._self_register_bond_utxos(
+                fidelity_bond_utxos,
+                scanned_addresses=set(bond_address_to_info),
+            )
 
         # Update cache
         self.utxo_cache = result
@@ -1864,7 +1914,12 @@ class WalletSyncMixin:
         # so an address with several UTXOs is reconciled to a single
         # deterministic one. ``_self_register_bond_utxos`` writes only when
         # something changed.
-        if fidelity_bond_utxos:
+        if fidelity_bond_addresses:
+            self._self_register_bond_utxos(
+                fidelity_bond_utxos,
+                scanned_addresses={address.lower() for address, _, _ in fidelity_bond_addresses},
+            )
+        elif fidelity_bond_utxos:
             self._self_register_bond_utxos(fidelity_bond_utxos)
 
         # Update cache

@@ -41,8 +41,10 @@ async def do_direct_send(
     data_dir: Path = wallet_service.data_dir or get_default_data_dir()
     backend = await get_backend(data_dir, wallet_service=wallet_service)
 
-    # Ensure the wallet is synced before sending.
-    await wallet_service.sync()
+    # Preserve fidelity bond UTXOs on every backend. Plain sync omits branch 2
+    # on address-scanning backends and can drop the bond immediately before an
+    # expired-bond sweep.
+    await wallet_service.sync_with_registered_bonds()
 
     logger.info(
         "Direct send: {} sats from mixdepth {} to {} (max fee rate {:.2f} sat/vB)",
