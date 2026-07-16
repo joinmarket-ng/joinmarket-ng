@@ -985,6 +985,38 @@ class WalletSyncMixin:
             self._canonical_bond_addresses = mapping
         return self._canonical_bond_addresses
 
+    def _resolve_bond_locktime(self, address_lower: str) -> tuple[int, int] | None:
+        """Resolve ``(locktime, index)`` for one of this wallet's bond addresses.
+
+        Checks the in-memory ``fidelity_bond_locktime_cache`` first (populated
+        by registry-aware syncs and bond address generation), then falls back
+        to the canonical timenumber-derived address map (see
+        :meth:`_canonical_bond_address_map`). A canonical match is cached so
+        subsequent lookups and displays recognize the address directly.
+
+        Returns ``None`` when the address is not a fidelity bond address of
+        this wallet. ``address_lower`` must already be lowercased (bech32 is
+        case-insensitive, the caches are keyed lowercase).
+        """
+        locktime = self.fidelity_bond_locktime_cache.get(address_lower)
+        if locktime is not None:
+            cached = self.address_cache.get(address_lower)
+            if cached is not None:
+                return locktime, cached[2]
+        canonical = self._canonical_bond_address_map().get(address_lower)
+        if canonical is not None:
+            canonical_locktime, timenumber = canonical
+            self.address_cache[address_lower] = (0, FIDELITY_BOND_BRANCH, timenumber)
+            self.fidelity_bond_locktime_cache[address_lower] = canonical_locktime
+            return canonical_locktime, timenumber
+        if locktime is not None:
+            # Known locktime but no cached index (and not canonically
+            # derivable, e.g. an imported external bond). The index is only
+            # cosmetic (used in the display path string); signing needs the
+            # locktime.
+            return locktime, -1
+        return None
+
     def _self_register_bond_utxos(self, bond_utxos: list[UTXOInfo]) -> None:
         """Persist and refresh recognized fidelity bond UTXOs in the registry.
 
@@ -1164,10 +1196,13 @@ class WalletSyncMixin:
                 logger.info(f"Including {len(valid_bonds)} fidelity bond address(es) in scan")
             for address, locktime, index in valid_bonds:
                 descriptors.append(f"addr({address})")
-                bond_address_to_info[address] = (locktime, index)
+                # Keyed lowercase: bech32 is case-insensitive but Python
+                # string comparison is not.
+                addr_lower = address.lower()
+                bond_address_to_info[addr_lower] = (locktime, index)
                 # Cache the address with the correct index from registry
-                self.address_cache[address] = (0, FIDELITY_BOND_BRANCH, index)
-                self.fidelity_bond_locktime_cache[address] = locktime
+                self.address_cache[addr_lower] = (0, FIDELITY_BOND_BRANCH, index)
+                self.fidelity_bond_locktime_cache[addr_lower] = locktime
 
         # Get current block height for confirmation calculation
         try:
@@ -1197,9 +1232,21 @@ class WalletSyncMixin:
 
             if desc_base.startswith("addr(") and desc_base.endswith(")"):
                 bond_address = desc_base[5:-1]
-                if bond_address in bond_address_to_info:
+                # Resolve the bond's locktime: from the supplied bond
+                # addresses when given, otherwise from the locktime cache or
+                # the canonical timenumber derivation. The fallback matters
+                # because plain ``sync()`` / ``sync_all()`` calls (e.g. the
+                # daemon's direct-send refresh) pass no bond addresses, yet
+                # the descriptor wallet still returns the imported bond
+                # UTXOs; without the locktime the bond would be treated as a
+                # regular spendable UTXO and then fail to sign (P2WSH needs
+                # its witness script, which embeds the locktime).
+                bond_info = bond_address_to_info.get(
+                    bond_address.lower()
+                ) or self._resolve_bond_locktime(bond_address.lower())
+                if bond_info is not None:
                     # This is a fidelity bond UTXO
-                    locktime, index = bond_address_to_info[bond_address]
+                    locktime, index = bond_info
                     confirmations = 0
                     utxo_height = utxo_data.get("height", 0)
                     if utxo_height > 0:
@@ -1250,6 +1297,38 @@ class WalletSyncMixin:
             utxo_height = utxo_data.get("height", 0)
             if utxo_height > 0:
                 confirmations = tip_height - utxo_height + 1
+
+            # An address-cache hit can resolve to the fidelity bond branch
+            # (e.g. a bond descriptor without the ``addr(...)`` form). Such a
+            # UTXO must carry its locktime; emitting it as a regular UTXO
+            # would let coin selection auto-spend it and then fail to sign
+            # the P2WSH input.
+            if change == FIDELITY_BOND_BRANCH and source_address:
+                bond_info = self._resolve_bond_locktime(source_address.lower())
+                if bond_info is None:
+                    logger.warning(
+                        f"Fidelity bond address {source_address[:20]}... found without "
+                        "locktime, skipping"
+                    )
+                    continue
+                locktime, bond_index = bond_info
+                path = f"{self.root_path}/0'/{FIDELITY_BOND_BRANCH}/{bond_index}:{locktime}"
+                self._record_history_address(source_address)
+                fidelity_bond_utxos.append(
+                    _make_utxo_info(
+                        txid=utxo_data["txid"],
+                        vout=utxo_data["vout"],
+                        value=btc_to_sats(utxo_data["amount"]),
+                        address=source_address,
+                        confirmations=confirmations,
+                        scriptpubkey=utxo_data.get("scriptPubKey", ""),
+                        path=path,
+                        mixdepth=0,
+                        height=utxo_height if utxo_height > 0 else None,
+                        locktime=locktime,
+                    )
+                )
+                continue
 
             # Generate the address and cache it
             address = (

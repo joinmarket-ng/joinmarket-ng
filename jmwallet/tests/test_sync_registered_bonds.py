@@ -630,3 +630,119 @@ async def test_sync_all_scans_bonds_on_light_client_backend(tmp_path: Path) -> N
     assert bond.is_fidelity_bond
     assert bond.path.endswith(f":{locktime}")
     assert any(u.address == bond_address for u in ws.utxo_cache.get(0, []))
+
+
+# ---------------------------------------------------------------------------
+# Plain sync must not lose bond locktimes (_sync_all_with_descriptors)
+# ---------------------------------------------------------------------------
+#
+# Regression for the JAM "move bond to jar" failure: jmwalletd's direct-send
+# refresh calls plain ``sync()`` (no bond addresses). The descriptor wallet
+# still returns the imported bond UTXO, and the sync must attach its
+# locktime; a bond cached with ``locktime=None`` bypasses the fidelity-bond
+# exclusion in coin selection and then fails to sign with
+# "Cannot sign P2WSH UTXO ... locktime not available".
+
+
+def _bond_scan_result(bond_address: str, *, desc: str) -> dict[str, object]:
+    """A scan_descriptors result containing a single funded bond UTXO."""
+    return {
+        "success": True,
+        "unspents": [
+            {
+                "txid": "ee" * 32,
+                "vout": 0,
+                "amount": 0.0002,  # BTC -> 20_000 sats
+                "height": 100,
+                "desc": desc,
+                "scriptPubKey": "0020" + "cc" * 32,
+                "address": bond_address,
+            }
+        ],
+    }
+
+
+def _assert_recognized_bond(result: dict[int, list], bond_address: str, locktime: int) -> None:
+    bond_in_result = [u for u in result.get(0, []) if u.address == bond_address]
+    assert len(bond_in_result) == 1, "Bond UTXO missing from mixdepth 0"
+    bond = bond_in_result[0]
+    assert bond.is_fidelity_bond, "Bond UTXO lost its locktime (treated as regular UTXO)"
+    assert bond.locktime == locktime
+    assert bond.path.endswith(f":{locktime}")
+    assert bond.value == 20_000
+
+
+@pytest.mark.asyncio
+async def test_plain_descriptor_sync_keeps_bond_locktime_from_cache(tmp_path: Path) -> None:
+    """Daemon scenario: caches were warmed by an earlier bond-aware sync,
+    then a plain sync (no bond addresses) runs. The bond UTXO returned via
+    its ``addr(...)`` descriptor must keep its locktime."""
+    from jmcore.timenumber import timenumber_to_timestamp
+
+    ws = _make_wallet(tmp_path)
+    timenumber = 12  # 2021-01: an already-expired locktime
+    locktime = timenumber_to_timestamp(timenumber)
+    # Warms address_cache and fidelity_bond_locktime_cache, exactly like the
+    # daemon's open-time sync_with_registered_bonds does.
+    bond_address = ws.get_fidelity_bond_address(timenumber, locktime)
+
+    ws.backend.get_block_height = AsyncMock(return_value=110)  # type: ignore[method-assign]
+    ws.backend.scan_descriptors = AsyncMock(  # type: ignore[method-assign]
+        return_value=_bond_scan_result(bond_address, desc=f"addr({bond_address})#abcd1234")
+    )
+
+    result = await ws._sync_all_with_descriptors(None)
+
+    assert result is not None
+    _assert_recognized_bond(result, bond_address, locktime)
+
+
+@pytest.mark.asyncio
+async def test_plain_descriptor_sync_recognizes_bond_via_canonical_derivation(
+    tmp_path: Path,
+) -> None:
+    """Cold caches: a fresh process syncing without bond addresses must still
+    recognize the bond by re-deriving the canonical timenumber address
+    instead of dropping the UTXO or emitting it without a locktime."""
+    from jmcore.timenumber import timenumber_to_timestamp
+
+    # Derive the address with an independent wallet so the wallet under test
+    # starts with empty caches.
+    reference = _make_wallet(tmp_path / "reference")
+    timenumber = 12
+    locktime = timenumber_to_timestamp(timenumber)
+    bond_address = reference.get_fidelity_bond_address(timenumber, locktime)
+
+    ws = _make_wallet(tmp_path)
+    ws.backend.get_block_height = AsyncMock(return_value=110)  # type: ignore[method-assign]
+    ws.backend.scan_descriptors = AsyncMock(  # type: ignore[method-assign]
+        return_value=_bond_scan_result(bond_address, desc=f"addr({bond_address})#abcd1234")
+    )
+
+    result = await ws._sync_all_with_descriptors(None)
+
+    assert result is not None
+    _assert_recognized_bond(result, bond_address, locktime)
+
+
+@pytest.mark.asyncio
+async def test_plain_descriptor_sync_bond_via_address_cache_path(tmp_path: Path) -> None:
+    """A bond UTXO without a parseable descriptor that resolves through the
+    address cache to the fidelity bond branch must carry its locktime too."""
+    from jmcore.timenumber import timenumber_to_timestamp
+
+    ws = _make_wallet(tmp_path)
+    timenumber = 12
+    locktime = timenumber_to_timestamp(timenumber)
+    bond_address = ws.get_fidelity_bond_address(timenumber, locktime)
+
+    ws.backend.get_block_height = AsyncMock(return_value=110)  # type: ignore[method-assign]
+    # No usable desc: forces the source-address / address_cache fallback.
+    ws.backend.scan_descriptors = AsyncMock(  # type: ignore[method-assign]
+        return_value=_bond_scan_result(bond_address, desc="")
+    )
+
+    result = await ws._sync_all_with_descriptors(None)
+
+    assert result is not None
+    _assert_recognized_bond(result, bond_address, locktime)

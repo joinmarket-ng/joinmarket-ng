@@ -162,19 +162,33 @@ class TestSelectSpendableUtxos:
         result = select_spendable_utxos(utxos, include_frozen=True)
         assert len(result) == 1
 
-    def test_excludes_fidelity_bonds(self) -> None:
+    def test_excludes_locked_fidelity_bonds(self) -> None:
         utxos = [
             _make_utxo(),
-            _make_utxo(locktime=int(time.time()) - 1000, vout=1),
+            _make_utxo(locktime=int(time.time()) + 100_000, vout=1),
         ]
         result = select_spendable_utxos(utxos)
         assert len(result) == 1
         assert result[0].vout == 0
 
-    def test_includes_fidelity_bonds_when_requested(self) -> None:
-        utxos = [_make_utxo(locktime=int(time.time()) - 1000)]
+    def test_includes_expired_fidelity_bonds(self) -> None:
+        """An expired bond is spendable like a regular coin (sweep/move flows)."""
+        utxos = [
+            _make_utxo(),
+            _make_utxo(locktime=int(time.time()) - 1000, vout=1),
+        ]
+        result = select_spendable_utxos(utxos)
+        assert len(result) == 2
+
+    def test_includes_locked_fidelity_bonds_when_requested(self) -> None:
+        utxos = [_make_utxo(locktime=int(time.time()) + 100_000)]
         result = select_spendable_utxos(utxos, include_fidelity_bonds=True)
         assert len(result) == 1
+
+    def test_excludes_frozen_expired_fidelity_bond(self) -> None:
+        """Frozen wins: even an expired bond stays excluded while frozen."""
+        utxos = [_make_utxo(locktime=int(time.time()) - 1000, frozen=True)]
+        assert select_spendable_utxos(utxos) == []
 
     def test_empty_input(self) -> None:
         assert select_spendable_utxos([]) == []
@@ -373,6 +387,68 @@ class TestDirectSend:
         assert result.change_amount == 0
         assert result.send_amount == 100_000 - result.fee
         assert result.num_outputs == 1
+
+    @pytest.mark.anyio
+    async def test_sweep_includes_expired_fidelity_bond(self) -> None:
+        """Regression: an expired bond must be spendable via sweep.
+
+        This is the JAM "move bond to jar" flow: all other UTXOs are frozen
+        and the mixdepth is swept, so the expired bond has to be included.
+        The resulting transaction must carry the bond's locktime as
+        nLockTime so OP_CLTV validates.
+        """
+        past_locktime = int(time.time()) - 100_000
+        bond = _make_utxo(
+            value=500_000,
+            vout=1,
+            scriptpubkey="0020" + "cc" * 32,
+            locktime=past_locktime,
+            path=f"m/84'/0'/0'/2/12:{past_locktime}",
+        )
+        utxos = [_make_utxo(value=100_000), bond]
+        wallet = _make_mock_wallet(utxos)
+        backend = _make_mock_backend()
+
+        result = await direct_send(
+            wallet=wallet,
+            backend=backend,
+            mixdepth=0,
+            amount_sats=0,
+            destination=REGTEST_P2WPKH_ADDR,
+            fee_rate=1.0,
+        )
+        assert result.num_inputs == 2
+        assert result.send_amount == 600_000 - result.fee
+        # nLockTime (last 4 bytes) must equal the bond's script locktime.
+        tx_bytes = bytes.fromhex(result.tx_hex)
+        assert int.from_bytes(tx_bytes[-4:], "little") == past_locktime
+
+    @pytest.mark.anyio
+    async def test_sweep_excludes_locked_fidelity_bond(self) -> None:
+        """A bond whose timelock has not expired must never be swept."""
+        future_locktime = int(time.time()) + 100_000
+        bond = _make_utxo(
+            value=500_000,
+            vout=1,
+            scriptpubkey="0020" + "cc" * 32,
+            locktime=future_locktime,
+        )
+        utxos = [_make_utxo(value=100_000), bond]
+        wallet = _make_mock_wallet(utxos)
+        backend = _make_mock_backend()
+
+        result = await direct_send(
+            wallet=wallet,
+            backend=backend,
+            mixdepth=0,
+            amount_sats=0,
+            destination=REGTEST_P2WPKH_ADDR,
+            fee_rate=1.0,
+        )
+        assert result.num_inputs == 1
+        assert result.send_amount == 100_000 - result.fee
+        tx_bytes = bytes.fromhex(result.tx_hex)
+        assert int.from_bytes(tx_bytes[-4:], "little") == 0
 
     @pytest.mark.anyio
     async def test_change_below_dust_added_to_fee(self) -> None:

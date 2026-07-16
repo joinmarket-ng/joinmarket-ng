@@ -160,12 +160,22 @@ def select_spendable_utxos(
     include_frozen: bool = False,
     include_fidelity_bonds: bool = False,
 ) -> list[UTXOInfo]:
-    """Filter UTXOs to only those safe for auto-spending."""
+    """Filter UTXOs to only those safe for auto-spending.
+
+    Frozen UTXOs are excluded unless ``include_frozen`` is set. Fidelity bond
+    UTXOs whose timelock has **not** yet expired are excluded unless
+    ``include_fidelity_bonds`` is set (they are consensus-unspendable anyway,
+    so including them only ever makes sense for display purposes). *Expired*
+    fidelity bonds are spendable like any regular coin, matching the taker's
+    coin eligibility and the reference implementation; this is what allows
+    sweeping an expired bond out of a mixdepth (e.g. JAM's
+    "move bond to jar" flow, which freezes everything else and sweeps).
+    """
     result = []
     for u in utxos:
         if not include_frozen and u.frozen:
             continue
-        if not include_fidelity_bonds and u.is_fidelity_bond:
+        if not include_fidelity_bonds and u.is_fidelity_bond and u.is_locked:
             continue
         result.append(u)
     return result
@@ -180,9 +190,14 @@ def estimate_fee(
 ) -> tuple[int, int]:
     """Estimate the transaction fee and vsize.
 
+    P2WSH inputs (expired fidelity bonds being swept) are larger than P2WPKH
+    inputs (their witness carries the timelock script), so size them as such
+    or the resulting fee rate falls below the requested one (and potentially
+    below the relay floor).
+
     Returns ``(fee, vsize)``.
     """
-    input_types = ["p2wpkh"] * len(utxos)
+    input_types = ["p2wsh" if u.is_p2wsh else "p2wpkh" for u in utxos]
     try:
         dest_type = get_address_type(destination)
     except ValueError:
