@@ -286,3 +286,117 @@ async def test_status_endpoint_exposes_attempt_count(
         pass
     # Avoid a tight loop in fixtures by giving the daemon a tick to settle.
     await asyncio.sleep(STATUS_POLL_INTERVAL_SEC)
+
+
+# ---------------------------------------------------------------------------
+# Frozen / unfunded mixdepth regressions.
+# ---------------------------------------------------------------------------
+
+
+async def _list_utxos(
+    client: httpx.AsyncClient, name: str, token: str
+) -> list[dict[str, Any]]:
+    r = await client.get(f"{API}/wallet/{name}/utxos", headers=_auth(token))
+    assert r.status_code == 200, f"utxos: {r.status_code} {r.text}"
+    return list(r.json().get("utxos", []))
+
+
+async def _freeze_all_utxos(client: httpx.AsyncClient, name: str, token: str) -> int:
+    """Freeze every currently-unfrozen UTXO in the wallet; return the count."""
+    frozen = 0
+    for utxo in await _list_utxos(client, name, token):
+        if utxo.get("frozen"):
+            continue
+        r = await client.post(
+            f"{API}/wallet/{name}/freeze",
+            json={"utxo-string": utxo["utxo"], "freeze": True},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, f"freeze: {r.status_code} {r.text}"
+        frozen += 1
+    return frozen
+
+
+@pytest.mark.asyncio
+async def test_plan_rejects_wallet_with_only_frozen_funds(
+    client: httpx.AsyncClient,
+    funded_wallet: tuple[str, str, str],
+) -> None:
+    """Regression: with every UTXO frozen the wallet has nothing to tumble,
+    so plan creation must be rejected instead of scheduling a stage-1 sweep
+    of the frozen mixdepth (which used to stall the whole run)."""
+    name, token, destination = funded_wallet
+    frozen = await _freeze_all_utxos(client, name, token)
+    assert frozen > 0, "expected the funded wallet to have unfrozen UTXOs"
+
+    r = await client.post(
+        f"{API}/wallet/{name}/tumbler/plan",
+        json={
+            "destinations": [destination],
+            "parameters": {
+                "maker_count_min": 2,
+                "maker_count_max": 2,
+                "include_maker_sessions": False,
+                "mintxcount": 2,
+                "time_lambda_seconds": 0.1,
+                "seed": 29,
+            },
+        },
+        headers=_auth(token),
+    )
+    assert r.status_code == 400, f"expected rejection, got {r.status_code}: {r.text}"
+    assert "no confirmed coins" in r.text.lower(), r.text
+
+
+@pytest.mark.asyncio
+async def test_started_plan_skips_phases_when_funds_frozen_after_planning(
+    client: httpx.AsyncClient,
+    funded_wallet: tuple[str, str, str],
+) -> None:
+    """Regression coverage for two field reports:
+
+    1. Funds frozen *after* the plan was built: the stage-1 sweep of
+       mixdepth 0 can never succeed and used to burn the retry budget
+       (with hours of back-off) before failing the whole plan.
+    2. Sweeps of empty mixdepths: the stage-2 chain visits mixdepths that
+       never received coins (here md1-md4, since the md0 sweep is skipped).
+
+    Both cases must now be SKIPPED so the plan terminates as COMPLETED
+    with zero retries consumed instead of stalling or failing.
+    """
+    name, token, destination = funded_wallet
+    plan = await _post_plan_with(
+        client,
+        name,
+        token,
+        destination,
+        parameters={
+            "maker_count_min": 2,
+            "maker_count_max": 2,
+            "include_maker_sessions": False,
+            "mintxcount": 2,
+            "time_lambda_seconds": 0.1,
+            "max_phase_retries": 1,
+            "seed": 31,
+        },
+    )
+    assert plan["status"].lower() == "pending"
+    assert any(p.get("mixdepth") == 0 for p in plan["phases"]), plan["phases"]
+
+    frozen = await _freeze_all_utxos(client, name, token)
+    assert frozen > 0, "expected the funded wallet to have unfrozen UTXOs"
+
+    await _post_start(client, name, token)
+    async with _background_miner():
+        final = await _poll_until_terminal(client, name, token, timeout=600.0)
+
+    assert final["status"].lower() == "completed", final
+    taker_phases = [p for p in final["phases"] if p["kind"] == "taker_coinjoin"]
+    assert taker_phases, final["phases"]
+    assert all(p["status"].lower() == "skipped" for p in taker_phases), final["phases"]
+    # Skipping must not consume the retry budget.
+    assert all(int(p.get("attempt_count", 0)) == 0 for p in taker_phases), final[
+        "phases"
+    ]
+    # No transaction may have been broadcast from frozen/empty mixdepths.
+    assert all(not p.get("txid") for p in taker_phases), final["phases"]
