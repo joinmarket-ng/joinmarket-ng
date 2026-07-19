@@ -22,6 +22,13 @@ import jwt
 ACCESS_TOKEN_EXPIRY_SECONDS = 1800  # 30 minutes
 REFRESH_TOKEN_EXPIRY_SECONDS = 14400  # 4 hours
 LEEWAY_SECONDS = 10
+# After the refresh key rotates, the previous key stays acceptable for this
+# long. Without a grace window, two clients refreshing near-simultaneously
+# (or a browser retrying a refresh request) race each other: the first
+# refresh rotates the key and the second fails with "Signature verification
+# failed" even though its token was perfectly legitimate, spuriously logging
+# the user out while the websocket (bound to the access key) keeps working.
+REFRESH_ROTATION_GRACE_SECONDS = 120.0
 
 
 @dataclass
@@ -43,10 +50,24 @@ class JMTokenAuthority:
     - Access and refresh tokens use separate signing keys.
     - Refresh key is rotated on every token refresh.
     - All keys are regenerated on reset (wallet lock/unlock cycle).
+
+    Two deliberate extensions over the reference behaviour make the refresh
+    flow robust against legitimate concurrency without weakening the
+    lock-invalidates-everything guarantee:
+
+    - After a rotation, the previous refresh key remains acceptable for
+      :data:`REFRESH_ROTATION_GRACE_SECONDS` so concurrent/retried refresh
+      requests do not spuriously log the client out.
+    - Re-issuing tokens for an already-unlocked wallet (a second client or a
+      repeated unlock call) can skip the rotation entirely via
+      ``issue(..., rotate_refresh=False)`` so it does not invalidate the
+      refresh token held by the first client.
     """
 
     _access_key: str = field(default_factory=lambda: secrets.token_hex(32))
     _refresh_key: str = field(default_factory=lambda: secrets.token_hex(32))
+    _previous_refresh_key: str | None = field(default=None)
+    _previous_refresh_key_expiry: float = 0.0
     _wallet_name: str = ""
 
     @property
@@ -61,16 +82,25 @@ class JMTokenAuthority:
         """Regenerate all signing keys, invalidating all existing tokens."""
         self._access_key = secrets.token_hex(32)
         self._refresh_key = secrets.token_hex(32)
+        self._previous_refresh_key = None
+        self._previous_refresh_key_expiry = 0.0
         self._wallet_name = ""
 
-    def issue(self, wallet_name: str) -> TokenPair:
+    def issue(self, wallet_name: str, *, rotate_refresh: bool = True) -> TokenPair:
         """Issue a new access + refresh token pair for the given wallet.
 
-        The refresh signing key is rotated on each call, invalidating any
-        previously issued refresh token.
+        By default the refresh signing key is rotated, invalidating any
+        previously issued refresh token (the previous key stays valid for
+        :data:`REFRESH_ROTATION_GRACE_SECONDS` to tolerate concurrent
+        refreshes). Pass ``rotate_refresh=False`` when re-issuing tokens for
+        an already-authenticated session (e.g. a repeated unlock of the same
+        wallet) so outstanding refresh tokens stay usable.
         """
         self._wallet_name = wallet_name
-        self._refresh_key = secrets.token_hex(32)
+        if rotate_refresh:
+            self._previous_refresh_key = self._refresh_key
+            self._previous_refresh_key_expiry = time.time() + REFRESH_ROTATION_GRACE_SECONDS
+            self._refresh_key = secrets.token_hex(32)
 
         now = time.time()
         scope = self.scope
@@ -132,15 +162,33 @@ class JMTokenAuthority:
     def verify_refresh(self, token: str) -> dict[str, str]:
         """Verify a refresh token and return the decoded payload.
 
+        Tokens signed with the immediately-previous refresh key are accepted
+        within :data:`REFRESH_ROTATION_GRACE_SECONDS` of the last rotation,
+        so a concurrent second refresh (browser retry, second tab) does not
+        spuriously fail. ``reset()`` still invalidates everything at once.
+
         Raises:
             jwt.InvalidTokenError: On any verification failure.
         """
-        payload: dict[str, str] = jwt.decode(
-            token,
-            self._refresh_key,
-            algorithms=["HS256"],
-            leeway=LEEWAY_SECONDS,
-        )
+        try:
+            payload: dict[str, str] = jwt.decode(
+                token,
+                self._refresh_key,
+                algorithms=["HS256"],
+                leeway=LEEWAY_SECONDS,
+            )
+        except jwt.InvalidSignatureError:
+            if (
+                self._previous_refresh_key is None
+                or time.time() > self._previous_refresh_key_expiry
+            ):
+                raise
+            payload = jwt.decode(
+                token,
+                self._previous_refresh_key,
+                algorithms=["HS256"],
+                leeway=LEEWAY_SECONDS,
+            )
 
         token_scope = payload.get("scope", "")
         if self.scope:

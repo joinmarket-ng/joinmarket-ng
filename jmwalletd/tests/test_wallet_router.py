@@ -439,6 +439,61 @@ class TestTokenRefresh:
         assert "refresh_token" in data
         assert data["walletname"] == state.wallet_name
 
+    def test_reunlock_does_not_invalidate_existing_refresh_token(
+        self, authed_client: tuple[TestClient, str]
+    ) -> None:
+        """Regression: a second unlock of the already-unlocked wallet (another
+        tab/device) used to rotate the refresh key, so the first client's next
+        refresh failed with "Signature verification failed" while its
+        websocket (access token) kept working."""
+        client, _ = authed_client
+        state = get_daemon_state()
+        state.wallet_password = "secret"
+        (state.wallets_dir / state.wallet_name).touch()
+        pair = state.token_authority.issue(state.wallet_name)
+
+        # Second client unlocks the same, already-unlocked wallet.
+        resp = client.post(
+            f"/api/v1/wallet/{state.wallet_name}/unlock",
+            json={"password": "secret"},
+        )
+        assert resp.status_code == 200
+
+        # Make sure we are past any rotation grace: the first client's
+        # refresh token must be valid via the live key, not the grace window.
+        state.token_authority._previous_refresh_key_expiry = 0.0
+
+        resp = client.post(
+            "/api/v1/token",
+            json={"grant_type": "refresh_token", "refresh_token": pair.refresh_token},
+            headers={"Authorization": f"Bearer {pair.token}"},
+        )
+        assert resp.status_code == 200, resp.text
+
+    def test_concurrent_refresh_within_grace_succeeds(
+        self, authed_client: tuple[TestClient, str]
+    ) -> None:
+        """Regression: two near-simultaneous refreshes with the same token
+        (browser retry / second tab) must both succeed within the rotation
+        grace window instead of logging the client out."""
+        client, _ = authed_client
+        state = get_daemon_state()
+        pair = state.token_authority.issue(state.wallet_name)
+
+        first = client.post(
+            "/api/v1/token",
+            json={"grant_type": "refresh_token", "refresh_token": pair.refresh_token},
+            headers={"Authorization": f"Bearer {pair.token}"},
+        )
+        assert first.status_code == 200
+        # The same (now-rotated-away) refresh token is retried immediately.
+        second = client.post(
+            "/api/v1/token",
+            json={"grant_type": "refresh_token", "refresh_token": pair.refresh_token},
+            headers={"Authorization": f"Bearer {pair.token}"},
+        )
+        assert second.status_code == 200, second.text
+
     def test_wrong_grant_type(self, authed_client: tuple[TestClient, str]) -> None:
         client, token = authed_client
         state = get_daemon_state()

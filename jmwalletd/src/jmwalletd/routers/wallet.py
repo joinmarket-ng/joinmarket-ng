@@ -362,7 +362,10 @@ async def wallet_unlock(
         if body.password != state.wallet_password:
             raise InvalidCredentials()
         await _require_tx_monitor_ready(state, lock_on_failure=True)
-        tokens = state.token_authority.issue(walletname)
+        # ``rotate_refresh=False``: a second unlock of the same wallet (another
+        # tab/device, or a client re-running its unlock flow) must not
+        # invalidate the refresh token already held by the first client.
+        tokens = state.token_authority.issue(walletname, rotate_refresh=False)
         return UnlockWalletResponse(
             walletname=walletname,
             token=tokens.token,

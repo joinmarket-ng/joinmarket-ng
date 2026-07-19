@@ -92,12 +92,41 @@ class TestJMTokenAuthority:
         payload = token_authority.verify_refresh(pair.refresh_token)
         assert "scope" in payload
 
-    def test_verify_refresh_wrong_key_raises(self, token_authority: JMTokenAuthority) -> None:
+    def test_verify_refresh_wrong_key_raises_after_grace(
+        self, token_authority: JMTokenAuthority
+    ) -> None:
         pair = token_authority.issue("w.jmdat")
-        # Issue again rotates refresh key, invalidating the old refresh token
+        # Issue again rotates the refresh key; once the grace window for the
+        # previous key has elapsed, the old refresh token is invalid.
         token_authority.issue("w.jmdat")
+        token_authority._previous_refresh_key_expiry = time.time() - 1
         with pytest.raises(jwt.InvalidTokenError):
             token_authority.verify_refresh(pair.refresh_token)
+
+    def test_verify_refresh_accepts_previous_key_within_grace(
+        self, token_authority: JMTokenAuthority
+    ) -> None:
+        """Regression: two clients refreshing near-simultaneously must not
+        spuriously log each other out. The token signed with the
+        immediately-previous key stays valid for the rotation grace window."""
+        pair = token_authority.issue("w.jmdat")
+        token_authority.issue("w.jmdat")  # rotates; previous key in grace
+        payload = token_authority.verify_refresh(pair.refresh_token)
+        assert "scope" in payload
+
+    def test_issue_without_rotation_keeps_outstanding_refresh_tokens(
+        self, token_authority: JMTokenAuthority
+    ) -> None:
+        """Regression: a second unlock of an already-unlocked wallet re-issues
+        tokens with ``rotate_refresh=False`` so the first client's refresh
+        token stays valid indefinitely (until expiry or wallet lock)."""
+        pair1 = token_authority.issue("w.jmdat")
+        pair2 = token_authority.issue("w.jmdat", rotate_refresh=False)
+        # Simulate the grace window having elapsed; without rotation there is
+        # no previous key to depend on, both tokens verify with the live key.
+        token_authority._previous_refresh_key_expiry = time.time() - 1
+        token_authority.verify_refresh(pair1.refresh_token)
+        token_authority.verify_refresh(pair2.refresh_token)
 
     def test_verify_access_token_as_refresh_fails(self, token_authority: JMTokenAuthority) -> None:
         pair = token_authority.issue("w.jmdat")
@@ -124,14 +153,26 @@ class TestJMTokenAuthority:
         with pytest.raises(jwt.InvalidTokenError):
             token_authority.verify_refresh(pair.refresh_token)
 
+    def test_reset_clears_rotation_grace(self, token_authority: JMTokenAuthority) -> None:
+        """Locking the wallet (reset) must invalidate refresh tokens even if
+        a rotation grace window would otherwise still cover them."""
+        pair = token_authority.issue("w.jmdat")
+        token_authority.issue("w.jmdat")  # previous key now inside grace
+        token_authority.reset()
+        with pytest.raises(jwt.InvalidTokenError):
+            token_authority.verify_refresh(pair.refresh_token)
+
     def test_multiple_issues_same_wallet(self, token_authority: JMTokenAuthority) -> None:
         pair1 = token_authority.issue("w.jmdat")
         pair2 = token_authority.issue("w.jmdat")
         # Both access tokens should still be valid (same access key)
         token_authority.verify_access(pair1.token)
         token_authority.verify_access(pair2.token)
-        # Only the latest refresh token is valid
+        # The latest refresh token is valid; the previous one only survives
+        # inside the rotation grace window.
         token_authority.verify_refresh(pair2.refresh_token)
+        token_authority.verify_refresh(pair1.refresh_token)
+        token_authority._previous_refresh_key_expiry = time.time() - 1
         with pytest.raises(jwt.InvalidTokenError):
             token_authority.verify_refresh(pair1.refresh_token)
 
