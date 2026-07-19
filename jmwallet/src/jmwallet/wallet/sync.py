@@ -449,6 +449,12 @@ class WalletSyncMixin:
             )
 
         self.utxo_cache[mixdepth] = utxos
+        # Apply frozen metadata so per-mixdepth (cold-cache) syncs report the
+        # same spendable set as the full-sync paths. Without this, callers
+        # like ``get_balance`` count frozen UTXOs as spendable until the next
+        # full sync runs, which made the tumbler plan sweeps of mixdepths
+        # whose funds were entirely frozen.
+        self._apply_frozen_state()
         return utxos
 
     async def sync_fidelity_bonds(
