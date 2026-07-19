@@ -282,12 +282,18 @@ class DescriptorWalletBackend(BlockchainBackend):
         would cause early returns in get_utxos/get_descriptor_ranges that
         silently skip all RPC, preventing recovery on the next rescan cycle.
 
+        On success the flag IS set to True: a wallet confirmed loaded in
+        Bitcoin Core is usable by every wallet-scoped helper, including on
+        backend instances that were constructed without running
+        ``setup_wallet`` in this process (e.g. per-phase taker backends).
+
         Returns:
             True if the wallet is loaded (or was successfully reloaded)
         """
         try:
             wallets = await self._rpc_call("listwallets", use_wallet=False)
             if self.wallet_name in wallets:
+                self._wallet_loaded = True
                 return True
 
             # Wallet not in list -- attempt to load it
@@ -302,9 +308,16 @@ class DescriptorWalletBackend(BlockchainBackend):
                     return True
                 raise
             logger.info(f"Reloaded wallet '{self.wallet_name}' after Bitcoin Core restart")
+            self._wallet_loaded = True
             return True
         except Exception as e:
-            logger.error(f"Failed to reload wallet '{self.wallet_name}': {e}")
+            if self._wallet_loaded:
+                logger.error(f"Failed to reload wallet '{self.wallet_name}': {e}")
+            else:
+                # On-demand load for a backend that was never set up in this
+                # session (e.g. a bond-verification-only backend); the caller
+                # falls back to node-level RPC, so keep the noise down.
+                logger.debug(f"Could not load wallet '{self.wallet_name}' on demand: {e}")
             return False
 
     async def _rpc_call(
@@ -371,7 +384,13 @@ class DescriptorWalletBackend(BlockchainBackend):
         }
 
         use_client = client or self.client
-        url = self._get_wallet_url() if use_wallet and self._wallet_loaded else self.rpc_url
+        # Wallet-scoped calls must ALWAYS target the /wallet/<name> endpoint.
+        # Falling back to the base RPC URL (as this used to do while
+        # ``_wallet_loaded`` was False) only worked by accident on nodes with
+        # exactly one loaded wallet; with several wallets loaded Bitcoin Core
+        # answers ``RPC error -19: Multiple wallets are loaded`` (or worse,
+        # silently serves the wrong wallet's data on single-wallet nodes).
+        url = self._get_wallet_url() if use_wallet else self.rpc_url
 
         try:
             response = await use_client.post(url, json=payload)
@@ -410,17 +429,21 @@ class DescriptorWalletBackend(BlockchainBackend):
             raise
         except ValueError as e:
             # If this is a wallet-not-loaded error on a wallet-scoped call,
-            # try to reload the wallet and retry once
-            if (
-                use_wallet
-                and self._wallet_loaded
-                and not _retried
-                and self._is_wallet_not_loaded_error(e)
-            ):
-                logger.warning(
-                    f"Wallet '{self.wallet_name}' not loaded in Bitcoin Core "
-                    f"(detected during '{method}' call), attempting to reload..."
-                )
+            # try to (re)load the wallet and retry once. This also covers
+            # backend instances that were constructed without going through
+            # ``setup_wallet`` (e.g. per-phase taker backends in jmwalletd):
+            # their first wallet call loads the wallet on demand.
+            if use_wallet and not _retried and self._is_wallet_not_loaded_error(e):
+                if self._wallet_loaded:
+                    logger.warning(
+                        f"Wallet '{self.wallet_name}' not loaded in Bitcoin Core "
+                        f"(detected during '{method}' call), attempting to reload..."
+                    )
+                else:
+                    logger.debug(
+                        f"Wallet '{self.wallet_name}' not yet loaded in Bitcoin Core "
+                        f"(detected during '{method}' call), attempting to load..."
+                    )
                 if await self._ensure_wallet_loaded():
                     return await self._rpc_call_inner(
                         method, params, client, use_wallet, _retried=True
@@ -478,7 +501,9 @@ class DescriptorWalletBackend(BlockchainBackend):
             return []
 
         use_client = client or self.client
-        url = self._get_wallet_url() if use_wallet and self._wallet_loaded else self.rpc_url
+        # See _rpc_call_inner: wallet-scoped batches must always use the
+        # /wallet/<name> endpoint, never the base URL.
+        url = self._get_wallet_url() if use_wallet else self.rpc_url
 
         missing = object()
         results: list[Any] = [missing] * len(calls)

@@ -4564,3 +4564,130 @@ class TestSyncAllLazyInit:
         await wallet.sync_all()
 
         setup_mock.assert_not_awaited()
+
+
+class _FakeRpcResponse:
+    """Minimal httpx.Response stand-in for _rpc_call_inner tests."""
+
+    def __init__(self, payload: Any, status_code: int = 200) -> None:
+        self._payload = payload
+        self.status_code = status_code
+
+    def json(self) -> Any:
+        return self._payload
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise httpx.HTTPStatusError("error", request=None, response=None)  # type: ignore[arg-type]
+
+
+class TestWalletScopedRpcRouting:
+    """Regression tests: wallet-scoped RPCs must always target /wallet/<name>.
+
+    The old code fell back to the base RPC URL whenever ``_wallet_loaded``
+    was False (fresh backend instances that never ran ``setup_wallet``).
+    On nodes with multiple loaded wallets Bitcoin Core answers
+    ``RPC error -19: Multiple wallets are loaded``; on single-wallet nodes it
+    silently serves the *wrong* wallet's data. Both broke ``get_transaction``
+    (falling through to ``getrawtransaction``, which needs -txindex once the
+    tx confirms) and stalled the tumbler's confirmation gate for 30 minutes
+    per phase.
+    """
+
+    def _backend(self) -> DescriptorWalletBackend:
+        return DescriptorWalletBackend(
+            rpc_url=TEST_RPC_URL,
+            rpc_user=TEST_RPC_USER,
+            rpc_password=TEST_RPC_PASSWORD,
+            wallet_name="routing_wallet",
+        )
+
+    @pytest.mark.asyncio
+    async def test_wallet_scoped_call_targets_wallet_url_before_setup(self) -> None:
+        backend = self._backend()
+        assert backend._wallet_loaded is False
+        backend.client.post = AsyncMock(  # type: ignore[method-assign]
+            return_value=_FakeRpcResponse({"result": [], "error": None, "id": 1})
+        )
+
+        result = await backend._rpc_call("listunspent", [0, 9999999])
+
+        assert result == []
+        called_url = backend.client.post.await_args.args[0]
+        assert called_url == f"{TEST_RPC_URL}/wallet/routing_wallet"
+
+    @pytest.mark.asyncio
+    async def test_node_scoped_call_targets_base_url(self) -> None:
+        backend = self._backend()
+        backend.client.post = AsyncMock(  # type: ignore[method-assign]
+            return_value=_FakeRpcResponse({"result": 100, "error": None, "id": 1})
+        )
+
+        result = await backend._rpc_call("getblockcount", use_wallet=False)
+
+        assert result == 100
+        called_url = backend.client.post.await_args.args[0]
+        assert called_url == TEST_RPC_URL
+
+    @pytest.mark.asyncio
+    async def test_wallet_not_loaded_triggers_on_demand_load_and_retry(self) -> None:
+        """A -18 on a wallet-scoped call must attempt a load-on-demand and
+        retry once, even when the backend never ran ``setup_wallet``."""
+        backend = self._backend()
+        responses = [
+            _FakeRpcResponse(
+                {
+                    "result": None,
+                    "error": {"code": -18, "message": "Requested wallet does not exist"},
+                    "id": 1,
+                }
+            ),
+            _FakeRpcResponse({"result": ["utxo"], "error": None, "id": 2}),
+        ]
+        backend.client.post = AsyncMock(side_effect=responses)  # type: ignore[method-assign]
+        backend._ensure_wallet_loaded = AsyncMock(return_value=True)  # type: ignore[method-assign]
+
+        result = await backend._rpc_call("listunspent")
+
+        assert result == ["utxo"]
+        backend._ensure_wallet_loaded.assert_awaited_once()
+        # Both attempts targeted the wallet URL, never the base URL.
+        urls = [call.args[0] for call in backend.client.post.await_args_list]
+        assert urls == [f"{TEST_RPC_URL}/wallet/routing_wallet"] * 2
+
+    @pytest.mark.asyncio
+    async def test_batch_call_targets_wallet_url_before_setup(self) -> None:
+        backend = self._backend()
+        backend.client.post = AsyncMock(  # type: ignore[method-assign]
+            return_value=_FakeRpcResponse([{"result": {}, "error": None, "id": 0}])
+        )
+
+        results = await backend._rpc_batch_call([("getaddressinfo", ["bcrt1qxyz"])])
+
+        assert results == [{}]
+        called_url = backend.client.post.await_args.args[0]
+        assert called_url == f"{TEST_RPC_URL}/wallet/routing_wallet"
+
+    @pytest.mark.asyncio
+    async def test_ensure_wallet_loaded_marks_backend_loaded(self) -> None:
+        """A wallet confirmed loaded in Core flips ``_wallet_loaded`` so
+        wallet-scoped helpers stop early-returning on fresh instances."""
+        backend = self._backend()
+        backend._rpc_call = AsyncMock(return_value=["routing_wallet"])  # type: ignore[method-assign]
+
+        assert await backend._ensure_wallet_loaded() is True
+        assert backend._wallet_loaded is True
+
+    @pytest.mark.asyncio
+    async def test_ensure_wallet_loaded_failure_keeps_flag_false(self) -> None:
+        backend = self._backend()
+
+        async def rpc(method: str, params: list | None = None, **kwargs: Any) -> Any:
+            if method == "listwallets":
+                return []
+            raise ValueError("RPC error -18: Wallet file not found")
+
+        backend._rpc_call = AsyncMock(side_effect=rpc)  # type: ignore[method-assign]
+
+        assert await backend._ensure_wallet_loaded() is False
+        assert backend._wallet_loaded is False
