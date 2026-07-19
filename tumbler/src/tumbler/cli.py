@@ -238,10 +238,18 @@ def _resolve_wallet_name(
 
 
 async def _collect_balances(wallet: WalletService, mixdepth_count: int) -> dict[int, int]:
+    """Collect the tumble-spendable balance per mixdepth.
+
+    Frozen UTXOs are excluded by ``get_balance`` itself; fidelity bonds are
+    excluded explicitly because the taker never auto-spends them, so a plan
+    built on bond-inflated balances would schedule sweeps it cannot fund.
+    """
     balances: dict[int, int] = {}
     for mixdepth in range(mixdepth_count):
         try:
-            balances[mixdepth] = int(await wallet.get_balance(mixdepth))
+            balances[mixdepth] = int(
+                await wallet.get_balance(mixdepth, include_fidelity_bonds=False)
+            )
         except Exception:
             logger.exception(f"failed to read balance for mixdepth {mixdepth}")
             balances[mixdepth] = 0

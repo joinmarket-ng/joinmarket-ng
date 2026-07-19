@@ -165,15 +165,20 @@ def _plan_to_response(plan: Plan, *, stale: bool = False) -> TumblerPlanResponse
 
 
 async def _mixdepth_balances(wallet_service: Any, num_mixdepths: int = 5) -> dict[int, int]:
-    """Return confirmed balance per mixdepth in satoshis.
+    """Return the tumble-spendable balance per mixdepth in satoshis.
 
     :class:`WalletService.get_balance` is ``async`` and returns an ``int`` of
-    sats that already excludes frozen UTXOs.
+    sats that already excludes frozen UTXOs. Fidelity bonds are excluded too:
+    the taker never auto-spends them, so counting them here would schedule
+    sweeps of mixdepths the taker cannot actually fund (the plan would then
+    stall and fail at execution time).
     """
     balances: dict[int, int] = {}
     for mixdepth in range(num_mixdepths):
         try:
-            balances[mixdepth] = int(await wallet_service.get_balance(mixdepth))
+            balances[mixdepth] = int(
+                await wallet_service.get_balance(mixdepth, include_fidelity_bonds=False)
+            )
         except Exception:
             logger.exception("failed to read balance for mixdepth {}", mixdepth)
             balances[mixdepth] = 0

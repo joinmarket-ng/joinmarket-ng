@@ -12,10 +12,11 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
+import pytest
 from typer.testing import CliRunner
 
 from tumbler.builder import PlanBuilder, TumbleParameters
-from tumbler.cli import app, resolve_runner_pacing
+from tumbler.cli import _collect_balances, app, resolve_runner_pacing
 from tumbler.persistence import save_plan
 from tumbler.plan import Plan
 
@@ -445,3 +446,28 @@ class TestResolveRunnerPacing:
         # confused with "not provided".
         pacing = resolve_runner_pacing(self._settings(tmp_path), 0)
         assert pacing.min_confirmations_between_phases == 0
+
+
+class TestCollectBalances:
+    @pytest.mark.asyncio
+    async def test_excludes_fidelity_bonds(self) -> None:
+        """Plan-time balances must exclude fidelity bonds: the taker never
+        auto-spends them, so a bond-inflated balance schedules sweeps the
+        taker cannot fund (regression: bond-only md0 stalled the tumble)."""
+        calls: list[tuple[int, bool]] = []
+
+        class _FakeWallet:
+            async def get_balance(
+                self,
+                mixdepth: int,
+                include_fidelity_bonds: bool = True,
+                min_confirmations: int = 0,
+            ) -> int:
+                calls.append((mixdepth, include_fidelity_bonds))
+                return 1_000
+
+        balances = await _collect_balances(_FakeWallet(), 3)  # type: ignore[arg-type]
+
+        assert balances == {0: 1_000, 1: 1_000, 2: 1_000}
+        assert calls, "get_balance was never called"
+        assert all(flag is False for _, flag in calls)

@@ -240,6 +240,28 @@ class TestCreatePlan:
         assert resp.status_code == 400
         assert "no confirmed coins" in resp.json()["message"]
 
+    def test_create_plan_excludes_fidelity_bonds_from_balances(
+        self,
+        app_with_wallet: TestClient,
+        auth_token: str,
+    ) -> None:
+        """Plan-time balances must exclude fidelity bonds: the taker never
+        auto-spends bonds, so counting them would schedule sweeps of
+        mixdepths the taker cannot fund (regression: bond-only/frozen md0
+        was planned for a stage-1 sweep and stalled the whole tumble)."""
+        ws = get_daemon_state().wallet_service
+        ws.get_balance.reset_mock()
+        ws.get_balance.return_value = 50_000_000
+        resp = app_with_wallet.post(
+            f"/api/v1/wallet/{WALLET}/tumbler/plan",
+            json={"destinations": ["bcrt1qdestAaaaaa", "bcrt1qdestBbbbbb"], "force": True},
+            headers=_auth(auth_token),
+        )
+        assert resp.status_code == 201, resp.text
+        assert ws.get_balance.await_args_list
+        for call in ws.get_balance.await_args_list:
+            assert call.kwargs.get("include_fidelity_bonds") is False, call
+
     def test_create_plan_accepts_legacy_jam_parameters(
         self,
         app_with_wallet: TestClient,
