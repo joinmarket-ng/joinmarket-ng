@@ -29,13 +29,20 @@ class PhaseKind(StrEnum):
 
 
 class PhaseStatus(StrEnum):
-    """Lifecycle of an individual phase."""
+    """Lifecycle of an individual phase.
+
+    ``SKIPPED`` marks a taker phase whose source mixdepth had no spendable
+    funds at execution time (for example, all UTXOs were frozen after the
+    plan was built, or the mixdepth never received coins). Skipped phases
+    are terminal like ``COMPLETED`` and do not fail the plan.
+    """
 
     PENDING = "pending"
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    SKIPPED = "skipped"
 
 
 class PlanStatus(StrEnum):

@@ -206,9 +206,10 @@ error: null
 ```
 
 Phase `status` is one of `pending | running | completed | failed |
-cancelled`. On startup the runner reloads the file: if `current_phase`
-points to a `running` phase it resumes that phase, otherwise it
-continues with the next `pending` one.
+cancelled | skipped`. On startup the runner reloads the file: if
+`current_phase` points to a `running` phase it resumes that phase,
+otherwise it continues with the next `pending` one. `skipped` is
+terminal like `completed`: a resume never re-runs a skipped phase.
 
 YAML is chosen over JSON for legibility — operators open this file with
 an editor during support — and over TOML for clean nesting of phase
@@ -236,6 +237,17 @@ Current retry behavior is intentionally narrow:
 When `attempt_count` reaches `max_phase_retries` the phase remains
 `failed` and the whole plan transitions to `failed`. A failed maker
 session is not retried; the runner proceeds to the next phase.
+
+One class of failure bypasses the retry budget entirely: a taker phase
+that fails with `No eligible UTXOs in mixdepth` while the mixdepth's
+spendable (unfrozen, non-bond) balance is zero is marked `skipped` and
+the plan advances immediately. Retrying cannot help — there is nothing
+to mix — and this situation arises legitimately when the operator
+freezes funds after the plan was built, or when the stage-2 chain visits
+a mixdepth the actual coin flow never reached. Unconfirmed funds still
+count as spendable, so confirmation-age failures keep the ordinary retry
+behavior. Plan-time balances already exclude frozen UTXOs and fidelity
+bonds, so `skipped` phases are the runtime safety net, not the norm.
 
 A crashed `jmwalletd` resumes from the persisted plan. Worst case a
 single phase is attempted twice, which for a taker phase means a

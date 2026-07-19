@@ -42,6 +42,11 @@ _LOW_CONFIRMATION_HINTS = (
     "confirmation(s)",
 )
 
+# Failure prefix emitted by the taker's pre-flight eligibility check (see
+# ``taker.eligibility.NO_ELIGIBLE_PREFIX``). Combined with a zero spendable
+# balance it identifies a phase that can never succeed and should be skipped.
+_UNFUNDED_HINT = "No eligible UTXOs in mixdepth"
+
 
 class _BackendFactory(Protocol):
     """Awaitable that returns a fresh blockchain backend."""
@@ -159,6 +164,13 @@ class TumbleRunner:
                     return self.plan
                 await self._run_one_phase(phase)
                 if phase.status == PhaseStatus.FAILED:
+                    if await self._mark_skipped_if_unfunded(phase):
+                        # Nothing to mix in that mixdepth: advance without
+                        # retries, confirmation gate (no txid was broadcast)
+                        # or inter-phase wait.
+                        self.plan.current_phase += 1
+                        self._persist()
+                        continue
                     try:
                         retry = await self._try_tweak_for_retry(phase)
                     except _StopRequestedError:
@@ -409,6 +421,61 @@ class TumbleRunner:
                 )
             await self._wait_interruptibly(wait_seconds)
         return True
+
+    # ------------------------------------------- skip unfunded (taker) ------
+
+    async def _mark_skipped_if_unfunded(self, phase: Phase) -> bool:
+        """Convert a failed taker phase into ``SKIPPED`` when its source
+        mixdepth has no spendable funds.
+
+        A taker phase that fails with "No eligible UTXOs" after the taker's
+        own wallet sync, on a mixdepth whose spendable (unfrozen, non-bond)
+        balance is zero, can never succeed no matter how often it is
+        retried: there is nothing to mix there. This happens when funds are
+        frozen after the plan was built, or when the plan's stage-2 chain
+        visits a mixdepth the actual coin flow never reached. Skipping keeps
+        the rest of the plan alive instead of burning hours of retry
+        back-off and then failing the whole tumble.
+
+        Unconfirmed funds still count towards the spendable balance, so a
+        phase that merely awaits confirmations is retried, not skipped.
+        """
+        if not isinstance(phase, TakerCoinjoinPhase):
+            return False
+        if _UNFUNDED_HINT not in (phase.error or ""):
+            return False
+        balance = await self._spendable_balance(phase.mixdepth)
+        if balance is None or balance > 0:
+            return False
+        logger.warning(
+            "tumbler phase {}: mixdepth {} has no spendable funds; skipping phase ({})",
+            phase.index,
+            phase.mixdepth,
+            phase.error,
+        )
+        phase.status = PhaseStatus.SKIPPED
+        phase.finished_at = datetime.now(UTC)
+        return True
+
+    async def _spendable_balance(self, mixdepth: int) -> int | None:
+        """Spendable (unfrozen, non-bond) balance of ``mixdepth`` in sats.
+
+        Returns ``None`` when the balance cannot be determined; callers must
+        treat that as "unknown" and keep the ordinary retry behaviour.
+        """
+        get_balance = self.ctx.wallet_service.get_balance
+        try:
+            return int(await get_balance(mixdepth, include_fidelity_bonds=False))
+        except TypeError:
+            # Back-compat with wallet fakes lacking the kwarg.
+            try:
+                return int(await get_balance(mixdepth))
+            except Exception:
+                logger.exception("spendable balance check failed for mixdepth {}", mixdepth)
+                return None
+        except Exception:
+            logger.exception("spendable balance check failed for mixdepth {}", mixdepth)
+            return None
 
     # -------------------------------------- taker (single CJ) ---------------
 

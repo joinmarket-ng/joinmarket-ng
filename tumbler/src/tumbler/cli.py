@@ -100,10 +100,11 @@ def _reset_plan_for_resume(plan: Plan) -> int:
     """
     Reset a terminal-state plan so the runner can pick it up again.
 
-    Completed phases are preserved; FAILED, RUNNING, and CANCELLED phases are
-    rolled back to PENDING with cleared error/timestamp metadata so the
-    runner re-attempts them. ``current_phase`` is moved to the first
-    non-COMPLETED phase, and the plan status is reset to PENDING.
+    Completed and skipped phases are preserved; FAILED, RUNNING, and
+    CANCELLED phases are rolled back to PENDING with cleared error/timestamp
+    metadata so the runner re-attempts them. ``current_phase`` is moved to
+    the first phase that is neither COMPLETED nor SKIPPED, and the plan
+    status is reset to PENDING.
 
     Returns the number of phases that were rolled back.
     """
@@ -120,7 +121,10 @@ def _reset_plan_for_resume(plan: Plan) -> int:
             # Keep ``attempt_count`` so retry budgets carry across resumes;
             # otherwise a stuck phase would silently get unlimited retries.
             rolled_back += 1
-        if first_pending is None and phase.status != PhaseStatus.COMPLETED:
+        if first_pending is None and phase.status not in (
+            PhaseStatus.COMPLETED,
+            PhaseStatus.SKIPPED,
+        ):
             first_pending = plan.phases.index(phase)
 
     plan.current_phase = first_pending if first_pending is not None else len(plan.phases)

@@ -120,6 +120,26 @@ class TestResetPlanForResume:
         assert plan.error is None
         assert plan.current_phase == 2
 
+    def test_skipped_phases_are_preserved_like_completed(self) -> None:
+        """SKIPPED phases are terminal: a resume must not re-run them, and
+        ``current_phase`` must advance past leading COMPLETED/SKIPPED phases."""
+        plan = _build_plan()
+        assert len(plan.phases) >= 3, "test setup expects >=3 phases"
+
+        plan.phases[0].status = PhaseStatus.COMPLETED
+        plan.phases[1].status = PhaseStatus.SKIPPED
+        plan.phases[1].error = "No eligible UTXOs in mixdepth 1 (2 UTXOs: 2 frozen)"
+        plan.phases[2].status = PhaseStatus.FAILED
+        plan.status = PlanStatus.FAILED
+        plan.current_phase = 2
+
+        rolled = _reset_plan_for_resume(plan)
+
+        assert rolled == 1  # only the FAILED phase
+        assert plan.phases[1].status == PhaseStatus.SKIPPED
+        assert plan.phases[2].status == PhaseStatus.PENDING
+        assert plan.current_phase == 2
+
     def test_all_completed_advances_current_phase_past_end(self) -> None:
         """If every phase is already completed, ``_reset_plan_for_resume``
         should park ``current_phase`` past the end so the runner immediately

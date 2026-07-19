@@ -1598,3 +1598,136 @@ class TestInternalDestinationMixdepth:
             )
             address = await runner._resolve_destination(phase)
             assert address.startswith(f"bcrt1qfake{expected_next}")
+
+
+class TestRunnerSkipsUnfundedPhases:
+    """Regression coverage: taker phases against mixdepths with no spendable
+    funds must be SKIPPED, not retried into a plan-wide failure.
+
+    Two field reports drove this: (1) all funds of a mixdepth were frozen
+    after the plan was built, and (2) the plan's stage-2 chain visited a
+    mixdepth that never received coins. In both cases the taker fails with
+    "No eligible UTXOs in mixdepth ..." forever, and before this fix the
+    runner burned the whole retry budget (with hours of back-off) and then
+    failed the entire tumble.
+    """
+
+    @staticmethod
+    def _unfunded_taker_factory(
+        unfunded_mixdepths: set[int],
+        reason_by_mixdepth: dict[int, str] | None = None,
+    ) -> Any:
+        async def make_taker(phase: Any) -> FakeTaker:
+            t = FakeTaker(phase)
+
+            async def do_cj(
+                amount: int,
+                destination: str,
+                mixdepth: int = 0,
+                counterparty_count: int | None = None,
+                exclude_nicks: set[str] | None = None,
+            ) -> str | None:
+                if mixdepth in unfunded_mixdepths:
+                    t.state = "failed"
+                    reasons = reason_by_mixdepth or {}
+                    t.last_failure_reason = reasons.get(
+                        mixdepth,
+                        f"No eligible UTXOs in mixdepth {mixdepth} (no UTXOs present)",
+                    )
+                    return None
+                return f"txid-{phase.index}"
+
+            t.do_coinjoin = do_cj  # type: ignore[assignment]
+            return t
+
+        return make_taker
+
+    async def test_frozen_mixdepth_phases_are_skipped_and_plan_completes(
+        self, tmp_path: Path
+    ) -> None:
+        plan = _plan(tmp_path)
+        ctx = _ctx(
+            tmp_path,
+            taker_factory=self._unfunded_taker_factory(
+                {1},
+                {1: "No eligible UTXOs in mixdepth 1 (2 UTXOs: 2 frozen)"},
+            ),
+        )
+        # Mixdepth 1 lost its funds after planning (e.g. the user froze them).
+        ctx.wallet_service._balances[1] = 0  # type: ignore[attr-defined]
+
+        result = await TumbleRunner(plan, ctx).run()
+
+        assert result.status == PlanStatus.COMPLETED
+        md1_phases = [
+            p for p in result.phases if isinstance(p, TakerCoinjoinPhase) and p.mixdepth == 1
+        ]
+        other_phases = [
+            p for p in result.phases if isinstance(p, TakerCoinjoinPhase) and p.mixdepth != 1
+        ]
+        assert md1_phases, "plan unexpectedly contains no mixdepth-1 phases"
+        assert all(p.status == PhaseStatus.SKIPPED for p in md1_phases)
+        # Skipping consumes no retry budget.
+        assert all(p.attempt_count == 0 for p in md1_phases)
+        assert all(p.status == PhaseStatus.COMPLETED for p in other_phases)
+        # Persistence: skipped statuses survive the YAML round-trip.
+        on_disk = load_plan("RunnerTest", tmp_path)
+        assert [str(p.status) for p in on_disk.phases] == [str(p.status) for p in result.phases]
+
+    async def test_entirely_unfunded_plan_completes_with_all_phases_skipped(
+        self, tmp_path: Path
+    ) -> None:
+        plan = _plan(tmp_path)
+        ctx = _ctx(
+            tmp_path,
+            taker_factory=self._unfunded_taker_factory({0, 1, 2, 3, 4}),
+        )
+        ctx.wallet_service._balances = dict.fromkeys(range(5), 0)  # type: ignore[attr-defined]
+
+        result = await TumbleRunner(plan, ctx).run()
+
+        assert result.status == PlanStatus.COMPLETED
+        assert all(p.status == PhaseStatus.SKIPPED for p in result.phases)
+
+    async def test_unfunded_hint_with_spendable_balance_still_retries(self, tmp_path: Path) -> None:
+        """A "No eligible UTXOs" failure on a mixdepth that *does* have a
+        spendable balance (e.g. UTXOs merely lack confirmations) keeps the
+        ordinary retry behaviour and eventually fails the plan."""
+        plan = _plan(tmp_path)
+        plan.parameters.max_phase_retries = 1
+        ctx = _ctx(
+            tmp_path,
+            taker_factory=self._unfunded_taker_factory(
+                {0},
+                {0: "No eligible UTXOs in mixdepth 0 (1 UTXOs: 1 below 5 confirmation(s))"},
+            ),
+        )
+        # Balance stays at the FakeWalletService default (> 0).
+
+        result = await TumbleRunner(plan, ctx).run()
+
+        assert result.status == PlanStatus.FAILED
+        assert result.phases[0].status == PhaseStatus.FAILED
+        assert result.phases[0].attempt_count == 1
+
+    async def test_skip_check_tolerates_wallet_without_bond_kwarg(self, tmp_path: Path) -> None:
+        """Wallet fakes (and older wallet services) without the
+        ``include_fidelity_bonds`` kwarg must not break the skip check."""
+
+        class LegacyWallet(FakeWalletService):
+            async def get_balance(self, mixdepth: int) -> int:  # type: ignore[override]
+                return self._balances.get(mixdepth, 0)
+
+        plan = _plan(tmp_path)
+        ctx = _ctx(
+            tmp_path,
+            taker_factory=self._unfunded_taker_factory({0, 1, 2, 3, 4}),
+        )
+        wallet = LegacyWallet()
+        wallet._balances = dict.fromkeys(range(5), 0)
+        ctx.wallet_service = wallet  # type: ignore[assignment]
+
+        result = await TumbleRunner(plan, ctx).run()
+
+        assert result.status == PlanStatus.COMPLETED
+        assert all(p.status == PhaseStatus.SKIPPED for p in result.phases)
