@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.34.2] - 2026-07-20
+
+### Fixed
+
+- Fix spending expired fidelity bonds ([1a22b792](../../commit/1a22b792435634dcbf4825768f9427687313bfd3))
+- Redeem expired fidelity bonds safely across wallet backends ([4ef3f41f](../../commit/4ef3f41fbd86c032d1b51bb3f405a172d0402c67))
+- Report frozen UTXOs correctly in per-mixdepth (cold-cache) balance queries ([a083088f](../../commit/a083088f331da7a7b8b4f4e24e008e2af5b64177))
+- Exclude fidelity bonds from tumbler plan balances so bond-only mixdepths are not scheduled ([3cfce4ac](../../commit/3cfce4ac07ee5c3747ae27f2b4b6f5b6c2bcd75c))
+- Skip tumbler phases whose mixdepth has no spendable funds instead of failing the plan ([a1655b3b](../../commit/a1655b3be31339a76ba7f3587bc991c6dd21e82b))
+- Fix wallet RPC routing on multi-wallet nodes (RPC error -19) and the resulting tumbler confirmation stalls ([9b8aa8ad](../../commit/9b8aa8ad56e1d86d28f2d62a647884cf944dd700))
+- Stop spurious logouts caused by refresh token failures on re-unlock or concurrent refreshes ([c5f8cee0](../../commit/c5f8cee0f91c484cc0071ef3cd83cbf3730c571f))
+- Fix the Flatpak GUI control panel failing to launch since the 25.08 runtime update ([20b1deea](../../commit/20b1deeac95340ce1ec3083381a640ee25b3b4fe))
+- Show the underlying UTXO label next to the reused warning in extended wallet info (e.g. 'deposit (reused)') ([5af0c80d](../../commit/5af0c80deb01b88a2f60db36474d4bbef656e70a))
+
+### Configuration Changes
+
+This release did not change the bundled `config.toml.template`.
+
 ## [0.34.1] - 2026-07-16
 
 Security fix.
@@ -3248,7 +3266,8 @@ This release did not change the bundled `config.toml.template`.
 - Pre-built image support for directory server compose.
 - Tor configuration instructions.
 
-[Unreleased]: ../../compare/0.34.1...HEAD
+[Unreleased]: ../../compare/0.34.2...HEAD
+[0.34.2]: ../../compare/0.34.1...0.34.2
 [0.34.1]: ../../compare/0.34.0...0.34.1
 [0.34.0]: ../../compare/0.33.0...0.34.0
 [0.33.0]: ../../compare/0.32.0...0.33.0
