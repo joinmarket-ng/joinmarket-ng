@@ -147,6 +147,17 @@ class WalletDisplayMixin:
                 utxos=address_utxos.get(address, []),
             )
 
+            # When reuse overrides the funded status, keep the underlying
+            # classification (deposit/cj-out/...) so displays can show both
+            # (e.g. ``deposit (reused)``) instead of losing the information.
+            base_status: AddressStatus | None = None
+            if status == "reused":
+                base_status = self._classify_funded_status(
+                    address=address,
+                    is_external=is_external,
+                    history_addresses=history_addresses,
+                )
+
             addresses.append(
                 AddressInfo(
                     address=address,
@@ -158,6 +169,7 @@ class WalletDisplayMixin:
                     has_unconfirmed=address_unconfirmed.get(address, False),
                     utxos=address_utxos.get(address, []),
                     label=self.reserved_address_labels.get(address, ""),
+                    base_status=base_status,
                 )
             )
 
@@ -198,39 +210,19 @@ class WalletDisplayMixin:
             # jmclient/wallet_utils.py), and a single UTXO auto-frozen by the
             # forced-address-reuse defense means funds landed on an
             # already-used-then-emptied address. Both are privacy-relevant and
-            # must be surfaced distinctly.
+            # must be surfaced distinctly. The underlying classification is
+            # still available via :meth:`_classify_funded_status` (surfaced as
+            # ``AddressInfo.base_status``) so displays can show both.
             address_utxos = utxos or []
             if len(address_utxos) > 1 or any(
                 u.label == AUTO_FREEZE_REUSE_LABEL for u in address_utxos
             ):
                 return "reused"
-            if history_type == "cj_out":
-                return "cj-out"
-            elif history_type == "change":
-                # Change output from a CoinJoin transaction we created.
-                # NOTE: unlike "cj-out" (an equal-amount output which can
-                # plausibly belong to any participant), "cj-change" is
-                # deanonymising — it ties this address back to our
-                # specific CoinJoin — so we label it distinctly from
-                # ordinary "non-cj-change" outputs.
-                return "cj-change"
-            elif history_type == "flagged":
-                # Address was shared as part of a CoinJoin we initiated
-                # (recorded in history), and now has funds at that address.
-                # This is our pending CJ output (not yet confirmed: the
-                # monitor will flip entry.success=True and the history_type
-                # to cj_out/change after first confirmation). Treat it as
-                # the CJ output it is rather than mislabeling it "deposit"
-                # (external) or "non-cj-change" (internal).
-                if is_external:
-                    return "cj-out"
-                else:
-                    return "cj-change"
-            elif is_external:
-                return "deposit"
-            else:
-                # Internal address with funds but not from CJ
-                return "non-cj-change"
+            return self._classify_funded_status(
+                address=address,
+                is_external=is_external,
+                history_addresses=history_addresses,
+            )
         else:
             # No funds
             # Check if address was used in CoinJoin history OR had blockchain activity
@@ -254,6 +246,57 @@ class WalletDisplayMixin:
                 return "reserved"
             else:
                 return "new"
+
+    def _classify_funded_status(
+        self,
+        address: str,
+        is_external: bool,
+        history_addresses: dict[str, str],
+    ) -> AddressStatus:
+        """Classify a funded address from its CoinJoin history, ignoring reuse.
+
+        This is the underlying label (``deposit``, ``cj-out``, ``cj-change``,
+        ``non-cj-change``) that an address would carry if it were not reused.
+        It is exposed as ``AddressInfo.base_status`` when the final status is
+        ``reused`` so displays can keep both pieces of information
+        (issue #564: showing only ``reused`` lost the UTXO type).
+
+        Args:
+            address: The funded address to classify
+            is_external: True if external (receive) address
+            history_addresses: Dict mapping address -> type (cj_out, change, etc.)
+
+        Returns:
+            The funded status ignoring address reuse
+        """
+        history_type = history_addresses.get(address)
+        if history_type == "cj_out":
+            return "cj-out"
+        elif history_type == "change":
+            # Change output from a CoinJoin transaction we created.
+            # NOTE: unlike "cj-out" (an equal-amount output which can
+            # plausibly belong to any participant), "cj-change" is
+            # deanonymising — it ties this address back to our
+            # specific CoinJoin — so we label it distinctly from
+            # ordinary "non-cj-change" outputs.
+            return "cj-change"
+        elif history_type == "flagged":
+            # Address was shared as part of a CoinJoin we initiated
+            # (recorded in history), and now has funds at that address.
+            # This is our pending CJ output (not yet confirmed: the
+            # monitor will flip entry.success=True and the history_type
+            # to cj_out/change after first confirmation). Treat it as
+            # the CJ output it is rather than mislabeling it "deposit"
+            # (external) or "non-cj-change" (internal).
+            if is_external:
+                return "cj-out"
+            else:
+                return "cj-change"
+        elif is_external:
+            return "deposit"
+        else:
+            # Internal address with funds but not from CJ
+            return "non-cj-change"
 
     def get_next_after_last_used_address(
         self,

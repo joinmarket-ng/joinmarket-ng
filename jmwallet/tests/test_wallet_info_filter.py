@@ -234,3 +234,66 @@ class TestPrintBranchAddressesConfirmations:
         with redirect_stdout(buf):
             _print_branch_addresses([ai], pending_addresses=set(), show_empty=True)
         assert "conf" not in buf.getvalue()
+
+
+class TestPrintBranchAddressesReused:
+    """Reused addresses keep the underlying UTXO label visible (issue #564)."""
+
+    def test_reused_shows_base_status_on_every_utxo_line(self) -> None:
+        addr = "bc1qtest0004"
+        utxos = [_mk_utxo(addr, confirmations=6), _mk_utxo(addr, confirmations=6)]
+        ai = AddressInfo(
+            address=addr,
+            index=0,
+            balance=200_000,
+            status="reused",
+            path="m/84'/0'/3'/1/1",
+            is_external=False,
+            utxos=utxos,
+            base_status="non-cj-change",
+        )
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            _print_branch_addresses([ai], pending_addresses=set())
+        output = buf.getvalue()
+        # Both UTXO lines carry the combined label, not a bare "reused".
+        assert output.count("non-cj-change (reused)") == 2
+
+    def test_reused_single_utxo_shows_base_status(self) -> None:
+        """Single auto-frozen UTXO on a reused deposit address."""
+        addr = "bc1qtest0005"
+        utxo = _mk_utxo(addr, confirmations=2)
+        ai = AddressInfo(
+            address=addr,
+            index=0,
+            balance=100_000,
+            status="reused",
+            path="m/84'/0'/0'/0/1",
+            is_external=True,
+            utxos=[utxo],
+            base_status="deposit",
+        )
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            _print_branch_addresses([ai], pending_addresses=set())
+        assert "deposit (reused)" in buf.getvalue()
+
+    def test_reused_without_base_status_falls_back_to_plain_label(self) -> None:
+        """Callers that do not populate base_status still get the old label."""
+        addr = "bc1qtest0006"
+        utxos = [_mk_utxo(addr, confirmations=6), _mk_utxo(addr, confirmations=6)]
+        ai = AddressInfo(
+            address=addr,
+            index=0,
+            balance=200_000,
+            status="reused",
+            path="m/84'/0'/0'/0/2",
+            is_external=True,
+            utxos=utxos,
+        )
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            _print_branch_addresses([ai], pending_addresses=set())
+        output = buf.getvalue()
+        assert "reused" in output
+        assert "(reused)" not in output

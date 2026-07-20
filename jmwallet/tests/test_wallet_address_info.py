@@ -967,6 +967,65 @@ class TestAddressInfoForMixdepth:
         assert addr_2_info.balance == 200000
         assert len(addr_2_info.utxos) == 2
         assert addr_2_info.status == "reused"
+        # The underlying classification is preserved (issue #564): the CLI
+        # renders it as "deposit (reused)" instead of losing the UTXO type.
+        assert addr_2_info.base_status == "deposit"
+
+    def test_reused_address_keeps_cj_out_base_status(self, wallet):
+        """A reused CoinJoin output address keeps its cj-out classification in
+        base_status while status is 'reused' (issue #564)."""
+        addr_3 = wallet.get_receive_address(0, 3)
+        wallet.utxo_cache[0] = [
+            UTXOInfo(
+                txid=c * 64,
+                vout=0,
+                value=100000,
+                address=addr_3,
+                confirmations=6,
+                scriptpubkey="0014" + "00" * 20,
+                path=f"{wallet.root_path}/0'/0/3",
+                mixdepth=0,
+            )
+            for c in ("2", "3")
+        ]
+
+        addresses = wallet.get_address_info_for_mixdepth(
+            mixdepth=0,
+            change=0,
+            gap_limit=2,
+            used_addresses={addr_3},
+            history_addresses={addr_3: "cj_out"},
+        )
+        addr_3_info = addresses[3]
+        assert addr_3_info.status == "reused"
+        assert addr_3_info.base_status == "cj-out"
+
+    def test_non_reused_address_has_no_base_status(self, wallet):
+        """base_status stays None for addresses that are not reused."""
+        addr_5 = wallet.get_receive_address(0, 5)
+        utxo = UTXOInfo(
+            txid="0" * 64,
+            vout=0,
+            value=100000,
+            address=addr_5,
+            confirmations=6,
+            scriptpubkey="0014" + "00" * 20,
+            path=f"{wallet.root_path}/0'/0/5",
+            mixdepth=0,
+        )
+        wallet.utxo_cache[0] = [utxo]
+
+        addresses = wallet.get_address_info_for_mixdepth(
+            mixdepth=0,
+            change=0,
+            gap_limit=3,
+            used_addresses=set(),
+            history_addresses={},
+        )
+        assert addresses[5].status == "deposit"
+        assert addresses[5].base_status is None
+        assert addresses[0].status == "new"
+        assert addresses[0].base_status is None
 
     def test_internal_addresses(self, wallet):
         """Test getting internal (change) addresses."""

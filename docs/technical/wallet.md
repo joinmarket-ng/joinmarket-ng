@@ -133,12 +133,15 @@ are derived primarily from the per-wallet CoinJoin history file, which records
 the output and change addresses of every CoinJoin this wallet performed as
 maker or taker.
 
-A funded address is instead labeled `reused` (a privacy warning that takes
-precedence over the labels above) when it has been paid to more than once:
-either it currently holds more than one UTXO, or it holds a single UTXO that the
-forced-address-reuse defense auto-froze (funds that landed on an
-already-used-then-emptied address). This mirrors the legacy
-joinmarket-clientserver `reused` status.
+A funded address additionally carries a `reused` privacy warning when it has
+been paid to more than once: either it currently holds more than one UTXO, or
+it holds a single UTXO that the forced-address-reuse defense auto-froze (funds
+that landed on an already-used-then-emptied address). This mirrors the legacy
+joinmarket-clientserver `reused` status. The CLI keeps the underlying
+classification visible by appending the warning to it (for example
+`deposit (reused)` or `non-cj-change (reused)`); the JAM-compatible API keeps
+reporting the plain `reused` status for backward compatibility, with the
+underlying label exposed as `base_status` on `AddressInfo`.
 
 A wallet imported or recovered from seed has no such history file, so every
 coin would otherwise fall back to `deposit` (external branch) or

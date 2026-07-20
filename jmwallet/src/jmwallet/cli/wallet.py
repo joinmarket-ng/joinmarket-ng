@@ -980,6 +980,11 @@ def _print_branch_addresses(
                 continue
 
         status_display: str = addr_info.status
+        # For reused addresses keep the underlying UTXO classification visible
+        # (issue #564): show e.g. "deposit (reused)" instead of just "reused".
+        base_status = getattr(addr_info, "base_status", None)
+        if addr_info.status == "reused" and base_status:
+            status_display = f"{base_status} (reused)"
         label = getattr(addr_info, "label", "")
         if label:
             status_display += f' "{label}"'
@@ -1079,7 +1084,7 @@ def _show_extended_wallet_info(
     print("  cj-out        - CoinJoin output (mixed funds)")
     print("  cj-change     - Change output from a CoinJoin (deanonymising, keep separate)")
     print("  non-cj-change - Regular change (not from CoinJoin)")
-    print("  reused        - Paid to more than once (privacy warning; avoid reuse)")
+    print("  (reused)      - Appended when paid to more than once (privacy warning; avoid reuse)")
     print('  reserved      - Set aside/handed out by you (label in "quotes"); do not reuse')
     print("  used-empty    - Previously used, now empty (do not reuse)")
     print("  flagged       - Shared with peers but tx failed (do not reuse)")

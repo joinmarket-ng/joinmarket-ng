@@ -103,6 +103,9 @@ class AddressInfo:
     has_unconfirmed: bool = False  # True if any UTXOs at this address are unconfirmed
     utxos: list[UTXOInfo] = field(default_factory=list)  # UTXOs at this address
     label: str = ""  # User label for a reserved/set-aside address ("" if none)
+    # Underlying funded classification (deposit/cj-out/cj-change/non-cj-change)
+    # when status is "reused", so displays can show both (e.g. "deposit (reused)").
+    base_status: AddressStatus | None = None
 
     @property
     def short_path(self) -> str:

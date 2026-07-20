@@ -79,7 +79,7 @@ Manage wallets through this submenu. Create new wallets, import from seed, valid
 | **BACK** | Return to Wallet Management |
 
 **BASIC** shows total balance and individual balance per mixdepth.
-**EXT** shows all addresses with derivation paths, status labels (`new`, `deposit`, `cj-out`, `non-cj-change`, `reused`, `reserved`, `used-empty`, `flagged`), individual balances, and mixdepth totals.
+**EXT** shows all addresses with derivation paths, status labels (`new`, `deposit`, `cj-out`, `non-cj-change`, `reserved`, `used-empty`, `flagged`, with a `(reused)` suffix on addresses paid to more than once), individual balances, and mixdepth totals.
 
 ## Maker Bot Control
 
