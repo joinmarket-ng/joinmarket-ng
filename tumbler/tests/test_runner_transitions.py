@@ -157,9 +157,11 @@ class FakeMaker:
 # --------------------------------------------------------------------------- helpers
 
 
-def _plan(tmp_path: Path, *, include_maker: bool = False) -> Plan:
+def _plan(tmp_path: Path, *, include_maker: bool = False, n_destinations: int = 1) -> Plan:
     params = TumbleParameters(
-        destinations=["bcrt1qdest0000000000000000000000000000000000zzz"],
+        destinations=[
+            f"bcrt1qdest{i}000000000000000000000000000000000zzz" for i in range(n_destinations)
+        ],
         mixdepth_balances={0: 5_000_000, 1: 0, 2: 0, 3: 0, 4: 0},
         seed=1,
         include_maker_sessions=include_maker,
@@ -341,8 +343,12 @@ class TestRunnerRetry:
         assert len(phase_0_attempts) == 2
 
     async def test_retry_swaps_external_destination_to_internal(self, tmp_path: Path) -> None:
-        plan = _plan(tmp_path)
-        # Find a phase that targets an external destination (not INTERNAL).
+        # Two destinations so the plan contains a non-terminal external sweep
+        # (the terminal sweep never swaps; see the dedicated test below).
+        plan = _plan(tmp_path, n_destinations=2)
+        # Find the first phase that targets an external destination: with two
+        # destinations this is a non-terminal sweep whose INTERNAL deposit is
+        # spent again by a later phase, so the swap is allowed.
         target = next(
             p
             for p in plan.phases
@@ -385,6 +391,54 @@ class TestRunnerRetry:
         assert observed[1].startswith("bcrt1qfake")
         # The phase record itself now carries the INTERNAL sentinel.
         assert result.phases[target_index].destination == "INTERNAL"
+
+    async def test_retry_keeps_terminal_external_destination(self, tmp_path: Path) -> None:
+        """The plan's final external sweep must never swap to INTERNAL.
+
+        No later phase spends from the mixdepth INTERNAL would deposit into,
+        so swapping would strand the whole last-mixdepth balance in the
+        wallet and leave the destination unpaid.
+        """
+        plan = _plan(tmp_path)
+        # With one destination the only external phase is the terminal sweep.
+        target = next(
+            p
+            for p in plan.phases
+            if isinstance(p, TakerCoinjoinPhase) and p.destination != "INTERNAL"
+        )
+        assert target.index == plan.phases[-1].index
+        target_index = target.index
+        original_destination = target.destination
+
+        observed: list[str] = []
+
+        async def make_taker(phase: Any) -> FakeTaker:
+            t = FakeTaker(phase)
+
+            async def flaky(
+                amount: int,
+                destination: str,
+                mixdepth: int = 0,
+                counterparty_count: int | None = None,
+            ) -> str | None:
+                if phase.index == target_index:
+                    observed.append(destination)
+                    if phase.attempt_count == 0:
+                        t.state = "failed"
+                        t.last_failure_reason = "maker negotiation failed"
+                        return None
+                return f"txid-{phase.index}"
+
+            t.do_coinjoin = flaky  # type: ignore[assignment]
+            return t
+
+        runner = TumbleRunner(plan, _ctx(tmp_path, taker_factory=make_taker))
+        result = await runner.run()
+
+        assert result.status == PlanStatus.COMPLETED
+        # Both attempts targeted the external address; no INTERNAL swap.
+        assert observed == [original_destination, original_destination]
+        assert result.phases[target_index].destination == original_destination
 
     async def test_retry_keeps_counterparty_count_unchanged(self, tmp_path: Path) -> None:
         plan = _plan(tmp_path)

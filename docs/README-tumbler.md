@@ -176,11 +176,14 @@ roughly like this:
 | 9 | taker | 3 | INTERNAL | Fractional payout |
 | 10 | taker | 3 | bc1qdest2... | Final payout |
 | 11 | maker | 4 | n/a | Role mixing |
-| 12 | taker | 4 | INTERNAL | Fractional payout |
-| 13 | taker | 4 | bc1qdest3... | Final payout |
+| 12 | taker | 4 | bc1qdest3... | Final payout (full sweep) |
 
 The exact shape varies with wallet balances, destination count, seed, and
-whether maker sessions are enabled.
+whether maker sessions are enabled. Note that the terminal mixdepth (4 here)
+emits no fractional INTERNAL CoinJoin: a fraction sent onward from the last
+mixdepth would land in a mixdepth no later phase sweeps, stranding funds in
+the wallet. Its external sweep is the only spend, so the plan always empties
+the wallet.
 
 ## Example payout shape
 

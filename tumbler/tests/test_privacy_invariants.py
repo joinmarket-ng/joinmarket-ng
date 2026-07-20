@@ -219,6 +219,45 @@ class TestNoFundLoss:
         )
 
     @pytest.mark.parametrize("seed", _SEEDS)
+    @pytest.mark.parametrize("balances", _BALANCE_SCENARIOS)
+    @pytest.mark.parametrize("n_destinations", [1, 2, 3])
+    def test_simulated_flow_empties_the_wallet(
+        self, seed: int, balances: dict[int, int], n_destinations: int
+    ) -> None:
+        """Classic tumbler semantics: at plan end all funds are external.
+
+        Simulates the phase flow (ignoring fees): sweeps move the whole
+        mixdepth balance, fractional phases move a fraction of it. INTERNAL
+        spends land in the next mixdepth; external spends leave the wallet.
+        Any satoshi left in the wallet afterward means the plan strands funds
+        (regression: fractional INTERNAL phases from the terminal chain
+        mixdepth fed a mixdepth that no later phase swept).
+        """
+        _, _, plan = _build_plan(seed, balances, destinations=_DESTINATIONS[:n_destinations])
+        mixdepth_count = max(balances) + 1
+        running: dict[int, int] = dict(balances)
+        external = 0
+        for phase in plan.phases:
+            if not isinstance(phase, TakerCoinjoinPhase):
+                continue
+            balance = running.get(phase.mixdepth, 0)
+            if phase.amount is not None:
+                spent = balance if phase.amount == 0 else min(phase.amount, balance)
+            else:
+                spent = int(balance * (phase.amount_fraction or 0.0))
+            running[phase.mixdepth] = balance - spent
+            if phase.destination == INTERNAL_DESTINATION:
+                next_md = (phase.mixdepth + 1) % mixdepth_count
+                running[next_md] = running.get(next_md, 0) + spent
+            else:
+                external += spent
+        assert all(v == 0 for v in running.values()), (
+            f"funds stranded in wallet after simulated tumble: {running} "
+            f"(seed={seed}, destinations={n_destinations})"
+        )
+        assert external == sum(balances.values())
+
+    @pytest.mark.parametrize("seed", _SEEDS)
     def test_phase_count_matches_taker_plus_maker(self, seed: int) -> None:
         _, _, plan = _build_plan(seed, _BALANCE_SCENARIOS[2])
         taker = sum(1 for p in plan.phases if isinstance(p, TakerCoinjoinPhase))

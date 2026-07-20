@@ -384,15 +384,27 @@ class TumbleRunner:
         # If the destination is an externally-supplied address, swap it
         # to the INTERNAL sentinel for the retry. The operator can still
         # retarget a later phase to that address once the coins have
-        # progressed through the mixdepth chain.
+        # progressed through the mixdepth chain. Never swap when no later
+        # taker phase spends from the mixdepth INTERNAL would deposit into:
+        # the diverted funds would be stranded in the wallet and the external
+        # destination would never be paid (e.g. the plan's final sweep).
         if phase.destination != "INTERNAL":
-            logger.info(
-                "tumbler phase {} retry {}: swapping destination {!r} -> 'INTERNAL'",
-                phase.index,
-                phase.attempt_count,
-                phase.destination,
-            )
-            phase.destination = "INTERNAL"
+            if self._later_phase_spends_internal_deposit(phase):
+                logger.info(
+                    "tumbler phase {} retry {}: swapping destination {!r} -> 'INTERNAL'",
+                    phase.index,
+                    phase.attempt_count,
+                    phase.destination,
+                )
+                phase.destination = "INTERNAL"
+            else:
+                logger.info(
+                    "tumbler phase {} retry {}: keeping external destination {!r} "
+                    "(no later phase would spend internally diverted funds)",
+                    phase.index,
+                    phase.attempt_count,
+                    phase.destination,
+                )
 
         # Rearm the phase: clear terminal state so ``_run_one_phase``
         # can run it again cleanly.
@@ -421,6 +433,19 @@ class TumbleRunner:
                 )
             await self._wait_interruptibly(wait_seconds)
         return True
+
+    def _later_phase_spends_internal_deposit(self, phase: TakerCoinjoinPhase) -> bool:
+        """Return True when a later pending taker phase spends from the
+        mixdepth that an ``INTERNAL`` destination for ``phase`` would deposit
+        into, so funds diverted there are picked up again by the plan."""
+        next_mixdepth = (phase.mixdepth + 1) % self.ctx.wallet_service.mixdepth_count
+        return any(
+            isinstance(p, TakerCoinjoinPhase)
+            and p.index > phase.index
+            and p.status == PhaseStatus.PENDING
+            and p.mixdepth == next_mixdepth
+            for p in self.plan.phases
+        )
 
     # ------------------------------------------- skip unfunded (taker) ------
 

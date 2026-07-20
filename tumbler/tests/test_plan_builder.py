@@ -168,3 +168,30 @@ class TestPlanBuilder:
     def test_last_phase_has_zero_wait(self) -> None:
         plan = PlanBuilder("w", _params()).build()
         assert plan.phases[-1].wait_seconds == 0.0
+
+    @pytest.mark.parametrize("seed", [1, 7, 13, 42])
+    @pytest.mark.parametrize("n_destinations", [1, 2, 3])
+    def test_terminal_mixdepth_emits_no_fractional_phases(
+        self, seed: int, n_destinations: int
+    ) -> None:
+        """The last chain mixdepth must be spent only by its external sweep.
+
+        A fractional INTERNAL CoinJoin from the terminal mixdepth would send
+        funds to a mixdepth outside the stage-2 chain that no later phase
+        sweeps, stranding them in the wallet after a "successful" tumble.
+        """
+        params = _params(destinations=_DEFAULT_DESTINATIONS[:n_destinations], seed=seed)
+        plan = PlanBuilder("w", params).build()
+
+        last = plan.phases[-1]
+        assert isinstance(last, TakerCoinjoinPhase)
+        # The plan ends with a full sweep to an external destination.
+        assert last.is_sweep
+        assert last.destination != INTERNAL_DESTINATION
+        # No fractional phase spends from the terminal mixdepth.
+        fractional_mixdepths = {
+            p.mixdepth
+            for p in plan.phases
+            if isinstance(p, TakerCoinjoinPhase) and p.amount_fraction is not None
+        }
+        assert last.mixdepth not in fractional_mixdepths

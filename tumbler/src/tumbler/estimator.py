@@ -277,10 +277,11 @@ def estimate_plan_costs(
             # Move the spent value forward in the running balance map, so
             # the next sweep on this mixdepth sees a reduced amount.
             running[mixdepth] = max(balance - spent, 0)
-            # Sweeps go to the next mixdepth (INTERNAL). Track that so a
-            # later phase on (mixdepth + 1) sees the inflow. We don't model
-            # destination payouts; those leave the wallet entirely.
-            if amount == 0 and phase.amount is not None and destination == "INTERNAL":
+            # INTERNAL spends (sweeps and fractional CJs alike) go to the
+            # next mixdepth. Track that so a later phase on (mixdepth + 1)
+            # sees the inflow. We don't model destination payouts; those
+            # leave the wallet entirely.
+            if destination == "INTERNAL":
                 next_md = (mixdepth + 1) % max(len(running) or 5, 5)
                 running[next_md] = running.get(next_md, 0) + spent
 

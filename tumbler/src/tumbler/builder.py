@@ -172,9 +172,11 @@ class PlanBuilder:
         stage-2 block per mixdepth.
 
         This mirrors the reference tumbler's structure: every stage-2
-        mixdepth gets maker and fractional activity, intermediate final
-        sweeps advance to ``INTERNAL``, and only the last N mixdepths in the
-        chain sweep to the user-supplied external destinations.
+        mixdepth except the terminal one gets maker and fractional activity,
+        intermediate final sweeps advance to ``INTERNAL``, and only the last
+        N mixdepths in the chain sweep to the user-supplied external
+        destinations. The terminal mixdepth is spent by a single external
+        sweep so the plan leaves no funds behind in the wallet.
         """
         phases: list[Phase] = []
         chain = self._stage2_mixdepth_chain()
@@ -182,6 +184,7 @@ class PlanBuilder:
             zip(chain[-self.params.num_destinations :], self.params.destinations)
         )
         for chain_index, mixdepth in enumerate(chain):
+            is_last = chain_index == len(chain) - 1
             if self.params.include_maker_sessions:
                 phases.append(
                     self._new_phase(
@@ -192,23 +195,29 @@ class PlanBuilder:
                         wait_seconds=self._sample_wait(rng),
                     )
                 )
-            # Fractional destination CJs (at least mintxcount-1 before the sweep).
-            fractions = self._destination_fractions(self.params.mintxcount, rng)
-            for fraction in fractions:
-                phases.append(
-                    self._new_phase(
-                        TakerCoinjoinPhase,
-                        mixdepth=mixdepth,
-                        amount_fraction=fraction,
-                        counterparty_count=self._sample_counterparty_count(rng),
-                        destination=INTERNAL_DESTINATION,
-                        wait_seconds=self._sample_wait(rng),
-                        rounding_sigfigs=self._sample_rounding_sigfigs(rng),
+            # Fractional destination CJs (at least mintxcount-1 before the
+            # sweep). Never emitted from the terminal chain mixdepth: an
+            # INTERNAL fraction there would land in a mixdepth outside the
+            # chain that no later phase sweeps, stranding funds in the wallet.
+            # The reference tumbler applies the same cleanup in
+            # ``get_tumble_schedule`` (the ``mix_offset == 0`` block), leaving
+            # the external sweep as the only spend from the ending mixdepth.
+            if not is_last:
+                fractions = self._destination_fractions(self.params.mintxcount, rng)
+                for fraction in fractions:
+                    phases.append(
+                        self._new_phase(
+                            TakerCoinjoinPhase,
+                            mixdepth=mixdepth,
+                            amount_fraction=fraction,
+                            counterparty_count=self._sample_counterparty_count(rng),
+                            destination=INTERNAL_DESTINATION,
+                            wait_seconds=self._sample_wait(rng),
+                            rounding_sigfigs=self._sample_rounding_sigfigs(rng),
+                        )
                     )
-                )
             # Final sweep of the mixdepth: advance internally until the last
             # destination-bearing mixdepths, then sweep externally.
-            is_last = chain_index == len(chain) - 1
             phases.append(
                 self._new_phase(
                     TakerCoinjoinPhase,

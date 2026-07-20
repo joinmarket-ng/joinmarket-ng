@@ -93,8 +93,14 @@ A typical plan has two stages:
 - **Stage 2 — role-mixed body.** For each mixdepth on the way to the
   external destination, optionally insert a `maker_session`, then
   append `mintxcount - 1` fractional taker CoinJoins, then a final
-  taker sweep. The very last sweep in stage 2 targets the user's
-  destination address; every other sweep targets `INTERNAL`.
+  taker sweep. Only the last N chain mixdepths' sweeps target the user's
+  destination addresses; every other sweep targets `INTERNAL`. The
+  terminal chain mixdepth emits no fractional CoinJoins: an `INTERNAL`
+  fraction from it would land in a mixdepth outside the chain that no
+  later phase sweeps, stranding funds in the wallet (the reference
+  tumbler applies the same cleanup in `get_tumble_schedule`). Its
+  external sweep is therefore its only spend, guaranteeing the plan
+  fully empties the wallet minus fees.
 
 Maker sessions are inserted only when `include_maker_sessions=True`.
 Without them the plan reduces to a pure taker chain similar in spirit to the
@@ -228,7 +234,11 @@ Current retry behavior is intentionally narrow:
   taker against the live orderbook.
 - If the phase originally targeted an external destination, the destination is
   rewritten to `"INTERNAL"`. The retry still happens at the same mixdepth and a
-  later phase is responsible for actually paying the external address.
+  later phase is responsible for actually paying the external address. The
+  rewrite is skipped when no later pending taker phase spends from the mixdepth
+  the `INTERNAL` deposit would land in (notably the plan's final external
+  sweep): diverting there would strand the funds in the wallet and leave the
+  destination unpaid.
 - A configurable retry delay is applied before the next attempt. Confirmation-
   age style failures such as `No eligible UTXOs in mixdepth` and PoDLE age
   failures are surfaced through taker failure text so the operator can tell the
