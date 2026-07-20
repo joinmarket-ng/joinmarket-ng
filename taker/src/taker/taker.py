@@ -1004,6 +1004,15 @@ class Taker(TakerMonitoringMixin):
             spawn_task(get_notifier().notify_coinjoin_failed(str(e), phase, amount))
             self.state = TakerState.FAILED
             return None
+        finally:
+            # Input locks are persisted to the wallet metadata file, so a
+            # failed round that returned without releasing them would keep its
+            # inputs "locked by another in-flight CoinJoin" for the whole lock
+            # TTL, blocking retries even from fresh Taker instances (which
+            # discard the in-memory reservation but not the on-disk lock).
+            # On success the inputs are spent, so locks are left to expire.
+            if self.state != TakerState.COMPLETE:
+                self.release_input_locks()
 
     async def _maybe_select_utxos_interactively(
         self, amount: int, mixdepth: int
