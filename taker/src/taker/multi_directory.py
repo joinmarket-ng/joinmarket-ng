@@ -730,7 +730,11 @@ class MultiDirectoryClient(DirectoryClientPool):
         # For !sig accumulation: track seen data per nick to drop cross-directory
         # duplicates (the same signature relayed by multiple directory servers).
         seen_sig_data: dict[str, set[str]] = {}
-        start_time = asyncio.get_event_loop().time()
+        loop = asyncio.get_event_loop()
+        start_time = loop.time()
+        # Servers whose listen failures were already reported at warning level;
+        # subsequent failures are logged at debug to avoid flooding the log.
+        listen_errors_reported: set[str] = set()
 
         def is_complete() -> bool:
             """Check if we have all expected responses."""
@@ -806,7 +810,7 @@ class MultiDirectoryClient(DirectoryClientPool):
                 )
 
         while not is_complete():
-            elapsed = asyncio.get_event_loop().time() - start_time
+            elapsed = loop.time() - start_time
             if elapsed >= timeout:
                 if not accumulate_responses:
                     logger.warning(
@@ -845,16 +849,30 @@ class MultiDirectoryClient(DirectoryClientPool):
                     messages = await client.listen_for_messages(duration=listen_duration)
                     return [(server, msg) for msg in messages]
                 except Exception as e:
-                    logger.debug(f"Error listening to {server}: {e}")
+                    if server not in listen_errors_reported:
+                        listen_errors_reported.add(server)
+                        logger.warning(f"Error listening to {server}: {e}")
+                    else:
+                        logger.debug(f"Error listening to {server}: {e}")
                     return []
 
             # Gather messages from all directories concurrently
+            listen_started = loop.time()
             results = await asyncio.gather(
                 *[listen_to_client(s, c) for s, c in self.clients.items()]
             )
             for result_list in results:
                 for server, msg in result_list:
                     process_message(msg, f"directory:{server}")
+
+            # Pace the loop: when every directory listen fails immediately
+            # (e.g. all connections closed) or there are no directory clients
+            # at all, the gather above returns in microseconds. Without a
+            # sleep this degenerates into a busy loop that spins thousands of
+            # iterations per second until the timeout, flooding the log.
+            listen_elapsed = loop.time() - listen_started
+            if listen_elapsed < listen_duration and not is_complete():
+                await asyncio.sleep(listen_duration - listen_elapsed)
 
         # Log deduplication stats if there were duplicates
         stats = deduplicator.stats
