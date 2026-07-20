@@ -626,6 +626,66 @@ class TestRunnerRetry:
         assert result.phases[0].attempt_count == 0
 
 
+class TestTeardownReleasesInputLocks:
+    """Persisted input locks from a failed round must not leak across phases.
+
+    Locks live in the wallet metadata file with a multi-minute TTL, so a
+    leaked lock surfaces on the next attempt as "No eligible UTXOs ... locked
+    by another in-flight CoinJoin" until the TTL expires.
+    """
+
+    async def test_failed_taker_releases_locks_on_teardown(self, tmp_path: Path) -> None:
+        plan = _plan(tmp_path)
+        plan.parameters = plan.parameters.model_copy(update={"max_phase_retries": 0})
+        released: list[FakeTaker] = []
+
+        async def make_taker(phase: Any) -> FakeTaker:
+            t = FakeTaker(phase)
+
+            async def always_fail(
+                amount: int,
+                destination: str,
+                mixdepth: int = 0,
+                counterparty_count: int | None = None,
+            ) -> str | None:
+                t.state = "failed"
+                t.last_failure_reason = "persistent failure"
+                return None
+
+            t.do_coinjoin = always_fail  # type: ignore[assignment]
+            t.release_input_locks = lambda: released.append(t)  # type: ignore[attr-defined]
+            return t
+
+        runner = TumbleRunner(plan, _ctx(tmp_path, taker_factory=make_taker))
+        result = await runner.run()
+
+        assert result.status == PlanStatus.FAILED
+        assert len(released) == 1
+
+    async def test_completed_taker_keeps_locks(self, tmp_path: Path) -> None:
+        plan = _plan(tmp_path)
+        released: list[FakeTaker] = []
+
+        async def make_taker(phase: Any) -> FakeTaker:
+            t = FakeTaker(phase)
+            original = t.do_coinjoin
+
+            async def succeed(*args: Any, **kwargs: Any) -> str | None:
+                t.state = "complete"
+                return await original(*args, **kwargs)
+
+            t.do_coinjoin = succeed  # type: ignore[assignment]
+            t.release_input_locks = lambda: released.append(t)  # type: ignore[attr-defined]
+            return t
+
+        runner = TumbleRunner(plan, _ctx(tmp_path, taker_factory=make_taker))
+        result = await runner.run()
+
+        assert result.status == PlanStatus.COMPLETED
+        # Inputs are spent on success; locks are left to expire on their own.
+        assert released == []
+
+
 class TestRunnerCancellation:
     async def test_request_stop_between_phases(self, tmp_path: Path) -> None:
         plan = _plan(tmp_path)

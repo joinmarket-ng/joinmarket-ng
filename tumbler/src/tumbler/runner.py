@@ -614,6 +614,16 @@ class TumbleRunner:
         self._active_taker = None
         if taker is None:
             return
+        # Defense in depth: make sure any persisted input locks from a failed
+        # round are released before the next attempt builds a fresh Taker.
+        # A leaked lock would otherwise surface as "No eligible UTXOs ...
+        # locked by another in-flight CoinJoin" until the lock TTL expires.
+        with contextlib.suppress(Exception):
+            release = getattr(taker, "release_input_locks", None)
+            # ``TakerState`` is a StrEnum; compare by value so this module
+            # stays decoupled from the taker package (mock takers included).
+            if callable(release) and getattr(taker, "state", None) != "complete":
+                release()
         try:
             # Prefer ``stop(close_wallet=False)`` when the taker supports it,
             # so we leave the shared wallet open for the next phase.
