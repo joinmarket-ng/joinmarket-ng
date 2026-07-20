@@ -164,6 +164,12 @@ modules:
       - pip3 install --no-cache-dir --ignore-installed --prefix=/app -r orderbook_watcher/requirements.txt
       - pip3 install --no-cache-dir --ignore-installed --prefix=/app -r jmwalletd/requirements.txt
 
+      # PyGObject for the GTK3 control panel (jam-ng-gui.py).
+      # freedesktop-sdk 25.08 dropped pygobject from the Platform runtime
+      # (it shipped in <= 24.08), so it must be installed into /app.
+      # The GTK3 typelibs (Gtk-3.0, Gdk-3.0, ...) are still in the runtime.
+      - pip3 install --no-cache-dir --ignore-installed --prefix=/app pycairo PyGObject
+
       # Install our packages (no-deps since requirements handle dependencies)
       - pip3 install --no-cache-dir --ignore-installed --no-deps --prefix=/app
           ./jmcore ./jmwallet ./maker ./taker ./tumbler ./orderbook_watcher ./jmwalletd
