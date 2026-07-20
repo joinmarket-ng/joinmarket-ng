@@ -515,6 +515,9 @@ class TestDeletePlan:
             headers=_auth(auth_token),
         )
         assert resp.status_code == 204
+        # 204 must carry an empty body; a non-empty body (e.g. ``b"null"``)
+        # makes uvicorn raise "Response content longer than Content-Length".
+        assert resp.content == b""
         assert not plan_path(WALLET, state.data_dir).exists()
 
     def test_delete_refuses_while_runner_alive(

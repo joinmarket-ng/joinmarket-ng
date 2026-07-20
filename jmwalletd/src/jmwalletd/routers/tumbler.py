@@ -29,7 +29,7 @@ import asyncio
 import contextlib
 from typing import Any
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Response
 from fastapi.responses import JSONResponse
 from loguru import logger
 from tumbler.builder import PlanBuilder, TumbleParameters
@@ -538,14 +538,17 @@ async def stop_plan(
 # DELETE /api/v1/wallet/{walletname}/tumbler/plan
 # ---------------------------------------------------------------------------
 @router.delete(
-    "/wallet/{walletname}/tumbler/plan", status_code=204, operation_id="tumblerplandelete"
+    "/wallet/{walletname}/tumbler/plan",
+    status_code=204,
+    operation_id="tumblerplandelete",
+    response_class=Response,
 )
 async def delete_plan_endpoint(
     walletname: str,
     _auth: dict[str, Any] = Depends(require_auth),
     _wallet: None = Depends(require_wallet_match),
     state: DaemonState = Depends(get_daemon_state),
-) -> JSONResponse:
+) -> Response:
     """Remove a non-running plan from disk."""
     if _runner_alive_for(state, state.wallet_name):
         raise ActionNotAllowed("A tumbler is running; stop it before deleting the plan.")
@@ -558,7 +561,10 @@ async def delete_plan_endpoint(
     if not removed:
         raise NoWalletFound("No tumbler plan exists for this wallet.")
     state.broadcast_ws({"tumbler": {"event": "plan_deleted", "wallet_name": state.wallet_name}})
-    return JSONResponse(content=None, status_code=204)
+    # A 204 must have an empty body: returning ``JSONResponse(None)`` would
+    # render ``b"null"`` while starlette omits Content-Length for 204, which
+    # makes uvicorn raise "Response content longer than Content-Length".
+    return Response(status_code=204)
 
 
 # The ``plan_path`` import is kept public here so tests that want to assert
