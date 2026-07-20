@@ -10,10 +10,12 @@ polls ``GET /tumbler/status`` until the plan terminates.
 Scope: smallest plan that still exercises stage-1 sweep and stage-2
 sweep+fractional logic (``mintxcount=2``, ``include_maker_sessions=False``).
 With one funded mixdepth on a 5-mixdepth wallet and one destination, the
-builder emits 1 stage-1 sweep + 4 stage-2 blocks of (1 fractional + 1
-sweep) = 9 CoinJoin phases. ``maker_count_min`` and ``maker_count_max``
-are both ``2`` to keep the plan small and fast; the ``e2e`` profile
-provides five makers (maker1..maker5).
+builder emits 1 stage-1 sweep + 3 stage-2 blocks of (1 fractional + 1
+sweep) + 1 terminal external sweep = 8 CoinJoin phases (the terminal
+mixdepth emits no fractional so the wallet is fully emptied).
+``maker_count_min`` and ``maker_count_max`` are both ``2`` to keep the
+plan small and fast; the ``e2e`` profile provides five makers
+(maker1..maker5).
 
 Requires ``docker compose --profile e2e up -d`` and Bitcoin Core RPC
 reachable on ``127.0.0.1:18443`` (the default for the e2e profile).
@@ -569,9 +571,11 @@ async def test_tumbler_happy_path_runs_three_coinjoins_and_pays_destination(
 
     plan = await _post_plan(client, name, token, destination)
     assert plan["status"].lower() == "pending"
-    # 1 stage-1 sweep + 4 stage-2 blocks of (mintxcount-1=1 fractional + 1 sweep) = 9.
-    assert len(plan["phases"]) == 9, (
-        f"minimal plan should have nine CJ phases; got: "
+    # 1 stage-1 sweep + 3 stage-2 blocks of (mintxcount-1=1 fractional + 1
+    # sweep) + 1 terminal external sweep = 8. The terminal mixdepth emits no
+    # fractional phase so the external sweep empties the wallet.
+    assert len(plan["phases"]) == 8, (
+        f"minimal plan should have eight CJ phases; got: "
         f"{[p['kind'] for p in plan['phases']]}"
     )
     assert all(p["kind"] == "taker_coinjoin" for p in plan["phases"])
@@ -601,17 +605,13 @@ async def test_tumbler_happy_path_runs_three_coinjoins_and_pays_destination(
         assert phase.get("txid"), f"phase {idx} has no txid: {phase}"
 
     # Destination (external) must have received funds from the final stage-2
-    # sweep. With the seeded 9-phase plan above, the last mixdepth first sends
-    # a large fractional CoinJoin internally, so the external sweep only pays
-    # out the remaining material balance rather than most of the original
-    # deposit.
+    # sweep. The terminal mixdepth is spent only by its external sweep, so
+    # the plan empties the wallet: the destination receives essentially the
+    # whole deposit minus CoinJoin and miner fees.
     received_btc = await rpc_call(
         "getreceivedbyaddress", [destination, 1], wallet="fidelity_funder"
     )
-    # The deterministic seed keeps the final external payout near 45% of the
-    # original deposit. Assert a generous lower bound that still catches a
-    # misrouted or near-empty final sweep while tolerating realistic fees.
-    assert float(received_btc) >= FUND_AMOUNT_BTC * 0.4, (
+    assert float(received_btc) >= FUND_AMOUNT_BTC * 0.9, (
         f"destination only received {received_btc} BTC"
     )
 
