@@ -21,10 +21,12 @@ For full documentation, see
 
 ## Run
 
-Install in a virtualenv from repo root:
+Install in a virtualenv from repo root (jmwalletd uses the maker, taker, and
+tumbler components at runtime):
 
 ```bash
-python -m pip install -e ./jmwalletd
+python -m pip install -e ./jmcore -e ./jmwallet -e ./maker -e ./taker \
+    -e ./tumbler -e ./jmwalletd
 ```
 
 Start the daemon:

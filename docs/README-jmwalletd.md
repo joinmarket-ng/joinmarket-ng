@@ -18,16 +18,21 @@ can talk to JoinMarket NG without modification.
 
 ## Installation
 
-Install JoinMarket-NG with the `jmwalletd` component:
+`jmwalletd` is not installed by the `install.sh` installer. Install it from a
+clone of the repository in a virtualenv. It uses the maker, taker, and tumbler
+components at runtime, so install those too:
 
 ```bash
-curl -fsSL https://joinmarket-ng.github.io/joinmarket-ng/install.sh | bash
+python -m venv jmvenv
+source jmvenv/bin/activate
+python -m pip install -e ./jmcore -e ./jmwallet -e ./maker -e ./taker \
+    -e ./tumbler -e ./jmwalletd
 ```
 
-or manually in a virtualenv from the repo root:
+Alternatively, use the standalone Docker image published by this repository:
 
 ```bash
-python -m pip install -e ./jmwalletd
+docker pull ghcr.io/joinmarket-ng/joinmarket-ng/jmwalletd:latest
 ```
 
 For a single-application install that bundles the JAM web UI, jmwalletd, Tor,
