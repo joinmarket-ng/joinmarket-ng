@@ -757,3 +757,27 @@ class TestBuildTumblerTakerConfig:
         assert captured["orderbook_quiet_period"] == 20.0
         # The runner resolves destinations itself; the placeholder stays empty.
         assert captured["destination_address"].get_secret_value() == ""
+
+    def test_applies_configset_fee_policy_overrides(self) -> None:
+        """Regression (issue #566): fee policy set via configset (JAM's fee
+        modal) must reach tumbler phase configs so a sat/vB rate works on
+        backends without fee estimation (neutrino)."""
+        from jmwalletd.routers.tumbler import build_tumbler_taker_config
+
+        captured: dict[str, Any] = {}
+
+        def fake_taker_config_cls(**kwargs: Any) -> Any:
+            captured.update(kwargs)
+            return MagicMock()
+
+        build_tumbler_taker_config(
+            phase=self._phase(counterparty_count=2),
+            mnemonic="dummy",
+            jm_settings=self._settings(),
+            taker_config_cls=fake_taker_config_cls,
+            config_overrides={"POLICY": {"tx_fees": "5000", "max_cj_fee_abs": "30000"}},
+        )
+
+        assert captured["fee_rate"] == 5.0
+        assert captured["fee_block_target"] is None
+        assert captured["max_cj_fee"].abs_fee == 30000

@@ -42,6 +42,7 @@ def build_coinjoin_taker_config(
     mnemonic: Any,
     jm_settings: Any,
     taker_config_cls: Any,
+    config_overrides: dict[str, dict[str, str]] | None = None,
 ) -> Any:
     """Build a ``TakerConfig`` for a one-shot ``do_coinjoin`` request.
 
@@ -56,9 +57,15 @@ def build_coinjoin_taker_config(
     ``counterparties``: a request for fewer makers than the policy
     ``minimum_makers`` (default 4) would otherwise select a valid N-maker
     CoinJoin and then reject it with ``Not enough makers selected: N``.
+
+    ``config_overrides`` is the daemon's in-memory ``configset`` store; the
+    fee policy JAM writes there (``[POLICY] tx_fees`` etc.) is applied on top
+    of the settings so a sat/vB rate chosen in the UI is honored (issue #566).
     """
+    from jmwalletd.fee_policy import resolve_policy_fee_overrides
     from taker.config_builder import build_taker_config_kwargs
 
+    fee_overrides = resolve_policy_fee_overrides(config_overrides)
     kwargs = build_taker_config_kwargs(
         jm_settings,
         mnemonic,
@@ -67,6 +74,11 @@ def build_coinjoin_taker_config(
         destination=body.destination,
         mixdepth=body.mixdepth,
         counterparties=int(body.counterparties),
+        max_abs_fee=fee_overrides.max_cj_fee_abs,
+        max_rel_fee=fee_overrides.max_cj_fee_rel,
+        fee_rate=fee_overrides.fee_rate,
+        block_target=fee_overrides.block_target,
+        tx_fee_factor=fee_overrides.tx_fee_factor,
     )
     return taker_config_cls(**kwargs)
 
@@ -89,13 +101,20 @@ async def direct_send(
     ws = state.wallet_service
 
     try:
+        from jmwalletd.fee_policy import resolve_policy_fee_overrides
         from jmwalletd.send import do_direct_send
 
+        # Honor the fee policy JAM stores via configset ([POLICY] tx_fees):
+        # a manual sat/vB rate or block target set in the UI applies to
+        # direct sends too (issue #566).
+        fee_overrides = resolve_policy_fee_overrides(state.config_overrides)
         tx_result = await do_direct_send(
             wallet_service=ws,
             mixdepth=body.mixdepth,
             amount_sats=body.amount_sats,
             destination=body.destination,
+            fee_rate=fee_overrides.fee_rate,
+            fee_target_blocks=fee_overrides.block_target,
             max_fee_rate_sat_vb=get_settings().wallet.max_fee_rate_sat_vb,
         )
     except ValueError as exc:
@@ -155,6 +174,7 @@ async def do_coinjoin(
                     mnemonic=state.wallet_mnemonic,
                     jm_settings=jm_settings,
                     taker_config_cls=TakerConfig,
+                    config_overrides=state.config_overrides,
                 )
                 taker = Taker(
                     wallet=ws,

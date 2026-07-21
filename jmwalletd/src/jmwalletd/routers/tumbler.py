@@ -229,6 +229,7 @@ def build_tumbler_taker_config(
     mnemonic: Any,
     jm_settings: Any,
     taker_config_cls: Any,
+    config_overrides: dict[str, dict[str, str]] | None = None,
 ) -> Any:
     """Build a ``TakerConfig`` for a tumbler taker phase.
 
@@ -247,9 +248,15 @@ def build_tumbler_taker_config(
     ``destination`` is resolved inside the runner (INTERNAL sentinel), so an
     empty placeholder is passed here; the Taker reads it only when
     ``do_coinjoin`` is not given one.
+
+    ``config_overrides`` is the daemon's in-memory ``configset`` store; the
+    fee policy JAM writes there (``[POLICY] tx_fees`` etc.) is applied on top
+    of the settings so a sat/vB rate chosen in the UI is honored (issue #566).
     """
+    from jmwalletd.fee_policy import resolve_policy_fee_overrides
     from taker.config_builder import build_taker_config_kwargs
 
+    fee_overrides = resolve_policy_fee_overrides(config_overrides)
     kwargs = build_taker_config_kwargs(
         jm_settings,
         mnemonic,
@@ -258,6 +265,11 @@ def build_tumbler_taker_config(
         destination="",
         mixdepth=getattr(phase, "mixdepth", 0),
         counterparties=int(getattr(phase, "counterparty_count", 1) or 1),
+        max_abs_fee=fee_overrides.max_cj_fee_abs,
+        max_rel_fee=fee_overrides.max_cj_fee_rel,
+        fee_rate=fee_overrides.fee_rate,
+        block_target=fee_overrides.block_target,
+        tx_fee_factor=fee_overrides.tx_fee_factor,
     )
     return taker_config_cls(**kwargs)
 
@@ -406,6 +418,7 @@ async def start_plan(
             mnemonic=state.wallet_mnemonic,
             jm_settings=jm_settings,
             taker_config_cls=TakerConfig,
+            config_overrides=state.config_overrides,
         )
         return Taker(wallet=ws, backend=backend, config=config)
 

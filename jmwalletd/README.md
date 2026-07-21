@@ -65,6 +65,14 @@ Important settings usually come from these sections:
 - `[bitcoin]` for backend config (`descriptor_wallet` or `neutrino`)
 - `[tor]` for SOCKS and control settings
 
+Fee policy set at runtime through the API (`POST /configset`, as done by JAM's
+fee settings modal) takes precedence over the config file for direct sends,
+coinjoins, and tumbles. The reference `[POLICY] tx_fees` semantics apply:
+values from 1 to 1000 are a block confirmation target, values above 1000 are a
+fee rate in sat/kvB (for example `5000` means 5 sat/vB). These overrides are
+in-memory only and are cleared when the wallet is locked. On the neutrino
+backend, block-target estimation is not available, so set a sat/kvB value.
+
 Orderbook proxy target resolution is:
 
 1. `OBWATCH_URL` env var

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from typing import Any
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -58,6 +59,46 @@ class TestDirectSend:
         assert resp.status_code == 200
         assert resp.json()["txinfo"]["txid"] == "txid123"
         mock_send.assert_awaited_once()
+
+    @patch("jmwalletd.send.do_direct_send")
+    def test_direct_send_honors_configset_fee_rate(
+        self,
+        mock_send: AsyncMock,
+        authed_client: tuple[TestClient, str],
+    ) -> None:
+        """Regression (issue #566): a sat/vB rate set via configset (JAM fee
+        modal) must be forwarded to the direct-send path instead of being
+        silently ignored."""
+        client, token = authed_client
+        state = get_daemon_state()
+        state.config_overrides["POLICY"] = {"tx_fees": "5000"}
+
+        mock_result = Mock()
+        mock_result.txid = "txid123"
+        mock_result.tx_hex = "rawhex"
+        mock_result.hex = "rawhex"
+        mock_result.model_dump.return_value = {}
+        mock_result.inputs = []
+        mock_result.outputs = []
+        mock_result.locktime = 0
+        mock_result.version = 2
+        mock_send.return_value = mock_result
+
+        resp = client.post(
+            "/api/v1/wallet/test_wallet.jmdat/taker/direct-send",
+            json={
+                "mixdepth": 0,
+                "amount_sats": 1000,
+                "destination": "bcrt1qdest",
+                "txfee": 0,
+            },
+            headers=_auth_headers(token),
+        )
+        assert resp.status_code == 200
+
+        _, kwargs = mock_send.call_args
+        assert kwargs["fee_rate"] == 5.0
+        assert kwargs["fee_target_blocks"] is None
 
     def test_direct_send_while_taker_running(self, authed_client: tuple[TestClient, str]) -> None:
         client, token = authed_client
@@ -237,7 +278,13 @@ class TestBuildCoinjoinTakerConfig:
             destination=destination,
         )
 
-    def _build(self, *, body: object, jm_settings: object) -> dict[str, object]:
+    def _build(
+        self,
+        *,
+        body: object,
+        jm_settings: object,
+        config_overrides: dict[str, dict[str, str]] | None = None,
+    ) -> dict[str, object]:
         from jmwalletd.routers.coinjoin import build_coinjoin_taker_config
 
         captured: dict[str, object] = {}
@@ -251,6 +298,7 @@ class TestBuildCoinjoinTakerConfig:
             mnemonic="dummy",
             jm_settings=jm_settings,
             taker_config_cls=fake_taker_config_cls,
+            config_overrides=config_overrides,
         )
         return captured
 
@@ -319,6 +367,64 @@ class TestBuildCoinjoinTakerConfig:
             jm_settings=self._settings(tx_broadcast="not-a-policy"),
         )
         assert captured["tx_broadcast"] == BroadcastPolicy.MULTIPLE_PEERS
+
+    # Regression (issue #566): fee policy set via configset (JAM's fee modal)
+    # must reach the taker config; it used to be stored but never applied, so
+    # neutrino users hit "Cannot use --block-target with neutrino backend"
+    # even after choosing a sat/vB rate in the UI.
+
+    def test_configset_tx_fees_rate_overrides_default_block_target(self) -> None:
+        captured = self._build(
+            body=self._body(),
+            jm_settings=self._settings(fee_rate=None, fee_block_target=None),
+            config_overrides={"POLICY": {"tx_fees": "5000"}},
+        )
+        assert captured["fee_rate"] == 5.0
+        assert captured["fee_block_target"] is None
+
+    def test_configset_tx_fees_rate_overrides_settings_fee_rate(self) -> None:
+        captured = self._build(
+            body=self._body(),
+            jm_settings=self._settings(fee_rate=12.5),
+            config_overrides={"POLICY": {"tx_fees": "2000"}},
+        )
+        assert captured["fee_rate"] == 2.0
+        assert captured["fee_block_target"] is None
+
+    def test_configset_tx_fees_block_target(self) -> None:
+        captured = self._build(
+            body=self._body(),
+            jm_settings=self._settings(fee_rate=None, fee_block_target=None),
+            config_overrides={"POLICY": {"tx_fees": "6"}},
+        )
+        assert captured["fee_rate"] is None
+        assert captured["fee_block_target"] == 6
+
+    def test_configset_max_cj_fee_and_factor_overrides(self) -> None:
+        captured = self._build(
+            body=self._body(),
+            jm_settings=self._settings(),
+            config_overrides={
+                "POLICY": {
+                    "max_cj_fee_abs": "30000",
+                    "max_cj_fee_rel": "0.0003",
+                    "tx_fees_factor": "0.5",
+                }
+            },
+        )
+        max_cj_fee: Any = captured["max_cj_fee"]
+        assert max_cj_fee.abs_fee == 30000
+        assert max_cj_fee.rel_fee == "0.0003"
+        assert captured["tx_fee_factor"] == 0.5
+
+    def test_invalid_configset_values_fall_back_to_settings(self) -> None:
+        captured = self._build(
+            body=self._body(),
+            jm_settings=self._settings(fee_rate=None, fee_block_target=None),
+            config_overrides={"POLICY": {"tx_fees": "garbage"}},
+        )
+        assert captured["fee_rate"] is None
+        assert captured["fee_block_target"] == 3
 
 
 class TestStartMaker:

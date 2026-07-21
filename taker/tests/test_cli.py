@@ -132,6 +132,32 @@ class TestBuildTakerConfig:
         assert config.fee_rate is None
         assert config.fee_block_target == 3  # From wallet.default_fee_block_target
 
+    def test_tx_fee_factor_override(self, sample_mnemonic: str, mock_settings: MagicMock) -> None:
+        """A caller-supplied ``tx_fee_factor`` override wins over settings."""
+        config = build_taker_config(
+            settings=mock_settings,
+            mnemonic=sample_mnemonic,
+            passphrase="",
+            destination="bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+            amount=100000,
+            mixdepth=0,
+            tx_fee_factor=0.5,
+        )
+        assert config.tx_fee_factor == 0.5
+
+    def test_tx_fee_factor_defaults_to_settings(
+        self, sample_mnemonic: str, mock_settings: MagicMock
+    ) -> None:
+        config = build_taker_config(
+            settings=mock_settings,
+            mnemonic=sample_mnemonic,
+            passphrase="",
+            destination="bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+            amount=100000,
+            mixdepth=0,
+        )
+        assert config.tx_fee_factor == 0.2
+
     def test_max_sats_freeze_reuse_forwarded(
         self, sample_mnemonic: str, mock_settings: MagicMock
     ) -> None:
