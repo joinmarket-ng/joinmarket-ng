@@ -127,6 +127,8 @@ class NeutrinoBackend(BlockchainBackend):
         tls_cert_path: str | None = None,
         auth_token: str | None = None,
         include_mempool: bool = True,
+        fee_estimate_url: str | None = None,
+        fee_estimate_proxy: str | None = None,
     ):
         """
         Initialize Neutrino backend.
@@ -151,6 +153,15 @@ class NeutrinoBackend(BlockchainBackend):
                 neutrino-api watched-mempool tracker in UTXO listings, and overlay
                 mempool spends on single-UTXO checks. Has no effect when the server
                 does not expose the tracker (older neutrino-api or operator-disabled).
+            fee_estimate_url: External HTTP fee estimate source (mempool.space
+                recommended, Esplora /fee-estimates, or LND fee.url JSON format).
+                Several comma-separated URLs are tried in order. ``None`` selects
+                the network's onion-first fallback chain, but only when
+                ``fee_estimate_proxy`` is available, so no third-party clearnet
+                request happens by default. ``"off"`` (or empty) disables external
+                fee estimation entirely.
+            fee_estimate_proxy: SOCKS proxy URL (``socks5h://host:port``) used for
+                fee source requests, typically the Tor SOCKS port.
         """
         self.neutrino_url = neutrino_url.rstrip("/")
         self.network = network
@@ -214,6 +225,15 @@ class NeutrinoBackend(BlockchainBackend):
         # Store the explicit user override (may be None).
         self._explicit_scan_start_height: int | None = scan_start_height
         self._scan_lookback_blocks: int = scan_lookback_blocks
+
+        # External fee estimation (issue #566 follow-up). Resolved once here;
+        # an empty list means disabled and estimate_fee() falls back to
+        # conservative static defaults.
+        self._fee_estimate_proxy = fee_estimate_proxy
+        self._fee_estimate_urls = self._resolve_fee_estimate_urls(fee_estimate_url)
+        self._fee_estimates_cache: dict[int, float] | None = None
+        self._fee_estimates_fetched_at: float = 0.0
+        self._fee_estimates_ttl_seconds: float = 300.0
 
         # Wallet creation height hint (set later via set_wallet_creation_height).
         self._wallet_creation_height: int | None = None
@@ -1271,14 +1291,50 @@ class NeutrinoBackend(BlockchainBackend):
             logger.warning(f"Error verifying tx output {txid}:{vout}: {e}")
             return False
 
+    def _resolve_fee_estimate_urls(self, fee_estimate_url: str | None) -> list[str]:
+        """Resolve the effective external fee source URLs (empty = disabled).
+
+        An explicit value is always honored and may contain several URLs
+        separated by commas (tried in order). ``None`` selects the network's
+        default fallback chain (provider onion services, then clearnet over Tor),
+        but only when a SOCKS proxy is available so that no clearnet request
+        to a third party happens by default. Explicit disable sentinels
+        ("off", "none", "") turn it off.
+        """
+        from jmcore.fee_source import default_fee_source_urls, is_fee_source_disabled
+
+        if is_fee_source_disabled(fee_estimate_url):
+            return []
+        if fee_estimate_url is not None:
+            return [u.strip() for u in fee_estimate_url.split(",") if u.strip()]
+        if self._fee_estimate_proxy:
+            return default_fee_source_urls(self.network)
+        return []
+
     async def estimate_fee(self, target_blocks: int) -> float:
         """
         Estimate fee in sat/vbyte for target confirmation blocks.
 
-        Neutrino does not support fee estimation - returns conservative defaults.
-        Use can_estimate_fee() to check if reliable estimation is available.
+        Neutrino itself cannot estimate fees (no mempool, no full node).
+        When an external fee source is configured (``fee_estimate_url``),
+        estimates are fetched from it (over Tor when a proxy is set) and
+        cached briefly. Without a fee source, conservative static defaults
+        are returned; use can_estimate_fee() to check whether reliable
+        estimation is available.
+
+        Note: callers (taker, direct send) additionally enforce the wallet's
+        ``max_fee_rate_sat_vb`` cap on the returned rate, so a compromised
+        fee source cannot push spending beyond the configured maximum.
         """
-        # Neutrino cannot estimate fees - return conservative defaults
+        if self._fee_estimate_urls:
+            estimates = await self._get_fee_estimates()
+            from jmcore.fee_source import pick_fee_rate
+
+            rate = pick_fee_rate(estimates, target_blocks)
+            logger.debug(f"External fee estimate for {target_blocks} blocks: {rate:.2f} sat/vB")
+            return rate
+
+        # No fee source configured - return conservative defaults
         if target_blocks <= 1:
             return 5.0
         elif target_blocks <= 3:
@@ -1288,9 +1344,34 @@ class NeutrinoBackend(BlockchainBackend):
         else:
             return 1.0
 
+    async def _get_fee_estimates(self) -> dict[int, float]:
+        """Return cached external fee estimates, refreshing when stale."""
+        import time as _time
+
+        from jmcore.fee_source import fetch_fee_estimates_with_fallback
+
+        now = _time.monotonic()
+        if (
+            self._fee_estimates_cache is not None
+            and now - self._fee_estimates_fetched_at < self._fee_estimates_ttl_seconds
+        ):
+            return self._fee_estimates_cache
+
+        result = await fetch_fee_estimates_with_fallback(
+            self._fee_estimate_urls,
+            socks_proxy=self._fee_estimate_proxy,
+        )
+        self._fee_estimates_cache = result.estimates
+        self._fee_estimates_fetched_at = now
+        return result.estimates
+
     def can_estimate_fee(self) -> bool:
-        """Neutrino cannot reliably estimate fees - requires full node."""
-        return False
+        """Whether reliable fee estimation is available.
+
+        True only when an external fee source is configured; neutrino itself
+        cannot estimate fees (requires a full node).
+        """
+        return bool(self._fee_estimate_urls)
 
     def has_mempool_access(self) -> bool:
         """Whether this backend can observe unconfirmed transactions.

@@ -42,6 +42,7 @@ async def test_direct_send_refreshes_registered_bonds(
         amount_sats=0,
         destination="bcrt1qdestination",
         fee_rate=None,
+        tx_fee_factor=0.0,
         max_fee_rate_sat_vb=1_000.0,
     )
 
@@ -66,8 +67,10 @@ async def test_direct_send_forwards_fee_overrides(
         amount_sats=5000,
         destination="bcrt1qdestination",
         fee_rate=2.5,
+        tx_fee_factor=0.4,
     )
     assert mock_direct_send.call_args.kwargs["fee_rate"] == 2.5
+    assert mock_direct_send.call_args.kwargs["tx_fee_factor"] == 0.4
     assert "fee_target_blocks" not in mock_direct_send.call_args.kwargs
 
     await do_direct_send(

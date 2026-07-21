@@ -785,6 +785,128 @@ class TestNeutrinoBackend:
         await backend.close()
 
     @pytest.mark.asyncio
+    async def test_neutrino_backend_external_fee_source_enables_estimation(self):
+        """An explicit fee_estimate_url enables reliable fee estimation."""
+        from jmcore.fee_source import FeeEstimateResult
+
+        backend = NeutrinoBackend(
+            neutrino_url="http://localhost:8334",
+            fee_estimate_url="https://example.com/api/v1/fees/recommended",
+        )
+        assert backend.can_estimate_fee() is True
+
+        with patch(
+            "jmcore.fee_source.fetch_fee_estimates_with_fallback",
+            new_callable=AsyncMock,
+            return_value=FeeEstimateResult(
+                estimates={1: 10.0, 3: 5.0, 6: 3.0, 144: 1.0},
+                source_url="https://example.com/api/v1/fees/recommended",
+            ),
+        ) as mock_fetch:
+            assert await backend.estimate_fee(1) == 10.0
+            assert await backend.estimate_fee(6) == 3.0
+            assert await backend.estimate_fee(1000) == 1.0
+            # Cached: a single HTTP fetch serves all lookups within the TTL.
+            mock_fetch.assert_awaited_once_with(
+                ["https://example.com/api/v1/fees/recommended"],
+                socks_proxy=None,
+            )
+
+        await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_neutrino_backend_fee_source_failure_propagates(self):
+        """A failing fee source raises instead of silently using stale defaults."""
+        from jmcore.fee_source import FeeSourceError
+
+        backend = NeutrinoBackend(
+            neutrino_url="http://localhost:8334",
+            fee_estimate_url="https://example.com/fees",
+        )
+        with patch(
+            "jmcore.fee_source.fetch_fee_estimates_with_fallback",
+            new_callable=AsyncMock,
+            side_effect=FeeSourceError("boom"),
+        ):
+            with pytest.raises(FeeSourceError):
+                await backend.estimate_fee(3)
+        await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_neutrino_backend_default_fee_source_requires_proxy(self):
+        """The third-party default is only auto-enabled over a SOCKS proxy."""
+        # No proxy: auto default stays disabled (no clearnet leak by default).
+        no_proxy = NeutrinoBackend(neutrino_url="http://localhost:8334", network="mainnet")
+        assert no_proxy.can_estimate_fee() is False
+        await no_proxy.close()
+
+        # With proxy: mainnet default (mempool.space over Tor) is enabled.
+        with_proxy = NeutrinoBackend(
+            neutrino_url="http://localhost:8334",
+            network="mainnet",
+            fee_estimate_proxy="socks5h://127.0.0.1:9050",
+        )
+        assert with_proxy.can_estimate_fee() is True
+        assert with_proxy._fee_estimate_urls[0].startswith("http://mempoolhqx4isw62")
+        assert "https://mempool.space/api/v1/fees/recommended" in with_proxy._fee_estimate_urls
+        await with_proxy.close()
+
+        # Regtest has no default source even with a proxy.
+        regtest = NeutrinoBackend(
+            neutrino_url="http://localhost:8334",
+            network="regtest",
+            fee_estimate_proxy="socks5h://127.0.0.1:9050",
+        )
+        assert regtest.can_estimate_fee() is False
+        await regtest.close()
+
+    @pytest.mark.asyncio
+    async def test_neutrino_backend_fee_source_disabled_sentinel(self):
+        """fee_estimate_url='off' disables external estimation even with a proxy."""
+        backend = NeutrinoBackend(
+            neutrino_url="http://localhost:8334",
+            network="mainnet",
+            fee_estimate_url="off",
+            fee_estimate_proxy="socks5h://127.0.0.1:9050",
+        )
+        assert backend.can_estimate_fee() is False
+        # Falls back to the conservative static defaults.
+        assert await backend.estimate_fee(3) == 2.0
+        await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_neutrino_backend_accepts_comma_separated_fee_sources(self):
+        backend = NeutrinoBackend(
+            neutrino_url="http://localhost:8334",
+            fee_estimate_url="https://one.example/fees, https://two.example/fees",
+        )
+        assert backend._fee_estimate_urls == [
+            "https://one.example/fees",
+            "https://two.example/fees",
+        ]
+        await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_neutrino_backend_uses_working_fallback(self):
+        """The backend consumes estimates returned by a fallback source."""
+        from jmcore.fee_source import FeeEstimateResult
+
+        backend = NeutrinoBackend(
+            neutrino_url="http://localhost:8334",
+            fee_estimate_url="https://down.example/fees,https://working.example/fees",
+        )
+        with patch(
+            "jmcore.fee_source.fetch_fee_estimates_with_fallback",
+            new_callable=AsyncMock,
+            return_value=FeeEstimateResult(
+                estimates={3: 5.0},
+                source_url="https://working.example/fees",
+            ),
+        ):
+            assert await backend.estimate_fee(3) == 5.0
+        await backend.close()
+
+    @pytest.mark.asyncio
     async def test_neutrino_backend_add_watch_address(self):
         """Test adding addresses to watch list.
 

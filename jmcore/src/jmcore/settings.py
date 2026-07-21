@@ -258,6 +258,20 @@ class BitcoinSettings(BaseModel):
             "operator-disabled). Set to false for chain-only behaviour."
         ),
     )
+    fee_estimate_url: str | None = Field(
+        default=None,
+        description=(
+            "External HTTP fee estimate source used when the backend cannot "
+            "estimate fees itself (neutrino). Supports mempool.space "
+            "recommended-fees, Esplora /fee-estimates, and LND fee.url JSON "
+            "formats. Multiple comma-separated URLs are tried in order. "
+            "Leave unset for the onion-first default fallback chain for the "
+            "current network, fetched over Tor; disabled on regtest or when "
+            "no Tor proxy is available. Set to 'off' to disable external "
+            "fee estimation entirely. Resolved estimates remain subject to "
+            "wallet.max_fee_rate_sat_vb."
+        ),
+    )
 
     @model_validator(mode="after")
     def _load_rpc_cookie_from_file(self) -> Self:

@@ -928,11 +928,18 @@ async def _resolve_fee_rate(settings: Any, backend: Any) -> tuple[float | None, 
     if estimate is None:
         return None, "fallback"
     try:
-        # Backends return BTC/kvB by convention; convert to sat/vB.
-        btc_per_kvb = await estimate(int(target))
-        if btc_per_kvb is None or btc_per_kvb <= 0:
+        # BlockchainBackend.estimate_fee() returns sat/vB for every backend.
+        sat_per_vb = await estimate(int(target))
+        if sat_per_vb is None or sat_per_vb <= 0:
             return None, "fallback"
-        sat_per_vb = float(btc_per_kvb) * 1e8 / 1000.0
+        sat_per_vb = float(sat_per_vb)
+        from jmwallet.wallet.spend import enforce_fee_rate_cap
+
+        enforce_fee_rate_cap(
+            sat_per_vb,
+            settings.wallet.max_fee_rate_sat_vb,
+            source="backend estimate",
+        )
         return sat_per_vb, "estimated"
     except Exception:  # pragma: no cover - best effort: fall through to default
         logger.exception("fee rate estimation failed; falling back to built-in default")

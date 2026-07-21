@@ -41,7 +41,7 @@ class TestResolvePolicyFeeOverrides:
         assert boundary.block_target == 1000
 
     def test_invalid_tx_fees_values_are_ignored(self) -> None:
-        for bad in ("abc", "", "0", "-5", "1.5"):
+        for bad in ("abc", "", "0", "-5", "1.5", "9" * 1000):
             result = resolve_policy_fee_overrides({"POLICY": {"tx_fees": bad}})
             assert result.fee_rate is None
             assert result.block_target is None
@@ -55,7 +55,7 @@ class TestResolvePolicyFeeOverrides:
         assert result.tx_fee_factor == 0.0
 
     def test_invalid_tx_fees_factor_is_ignored(self) -> None:
-        for bad in ("nope", "-0.2"):
+        for bad in ("nope", "-0.2", "nan", "inf"):
             result = resolve_policy_fee_overrides({"POLICY": {"tx_fees_factor": bad}})
             assert result.tx_fee_factor is None
 
@@ -72,6 +72,10 @@ class TestResolvePolicyFeeOverrides:
         )
         assert result.max_cj_fee_abs is None
         assert result.max_cj_fee_rel is None
+
+        for bad in ("nan", "inf"):
+            result = resolve_policy_fee_overrides({"POLICY": {"max_cj_fee_rel": bad}})
+            assert result.max_cj_fee_rel is None
 
     def test_combined_jam_fee_settings(self) -> None:
         """The full set JAM's fee modal writes in one save."""

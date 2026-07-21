@@ -129,6 +129,22 @@
 # for chain-only behaviour.
 # neutrino_include_mempool = true
 
+# External HTTP fee estimate source, used when the backend cannot estimate
+# fees itself (neutrino; the descriptor_wallet backend always uses Bitcoin
+# Core's estimatesmartfee). Fetched over the Tor SOCKS proxy configured in
+# [tor]. Accepted response formats: mempool.space recommended fees
+# (/api/v1/fees/recommended), Esplora /fee-estimates, and LND fee.url JSON.
+# Unset (default): over Tor, try the mempool.space onion service first, then
+# Blockstream's Esplora onion, then both providers' clearnet endpoints through
+# Tor. Failed sources are deprioritized for 10 minutes before being retried.
+# This is disabled on regtest or when no Tor proxy is available. Set to "off"
+# to disable external estimation (a manual fee rate
+# is then required with neutrino). A comma-separated list supplies a custom
+# fallback order. Self-hosting a mempool/Esplora instance is the most private
+# option. Every resolved estimate is still subject to the hard
+# wallet.max_fee_rate_sat_vb safety cap above (default 1000 sat/vB).
+# fee_estimate_url = "http://your-esplora.onion/api/fee-estimates,https://backup.example/fee-estimates"
+
 # ============================================================================
 # Network Settings
 # ============================================================================

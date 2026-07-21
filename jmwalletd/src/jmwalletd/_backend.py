@@ -156,6 +156,8 @@ async def get_backend(
             settings.wallet.scan_lookback_blocks,
         )
 
+        from jmcore.fee_source import build_fee_source_proxy
+
         instance = NeutrinoBackend(
             neutrino_url=neutrino_url,
             network=resolved_network,
@@ -165,6 +167,12 @@ async def get_backend(
             tls_cert_path=settings.bitcoin.neutrino_tls_cert,
             auth_token=settings.bitcoin.neutrino_auth_token,
             include_mempool=settings.bitcoin.neutrino_include_mempool,
+            fee_estimate_url=settings.bitcoin.fee_estimate_url,
+            fee_estimate_proxy=build_fee_source_proxy(
+                settings.tor.socks_host,
+                settings.tor.socks_port,
+                settings.tor.stream_isolation,
+            ),
         )
     else:
         msg = f"Unknown backend type: {backend_type}"

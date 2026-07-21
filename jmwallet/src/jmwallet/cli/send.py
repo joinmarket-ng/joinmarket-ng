@@ -226,6 +226,8 @@ async def _send_transaction(
             add_peers=backend_settings.neutrino_add_peers,
             tls_cert_path=backend_settings.neutrino_tls_cert,
             auth_token=backend_settings.neutrino_auth_token,
+            fee_estimate_url=backend_settings.fee_estimate_url,
+            fee_estimate_proxy=backend_settings.fee_estimate_proxy,
         )
         logger.info("Waiting for neutrino to sync...")
         synced = await backend.wait_for_sync(timeout=300.0)
@@ -273,13 +275,6 @@ async def _send_transaction(
         # Use backend fee estimation
         target = block_target if block_target is not None else 3
         resolved_fee_rate = await backend.estimate_fee(target)
-        # Reject estimates that exceed the safety cap *before* clamping to
-        # mempool min, so a pathological backend cannot drain the wallet.
-        try:
-            enforce_fee_rate_cap(resolved_fee_rate, max_fee_rate_sat_vb, source="backend estimate")
-        except ExcessiveFeeRateError as exc:
-            logger.error(str(exc))
-            raise typer.Exit(1) from exc
         # Check against mempool min fee
         if mempool_min_fee is not None and resolved_fee_rate < mempool_min_fee:
             logger.info(
@@ -288,6 +283,13 @@ async def _send_transaction(
             )
             resolved_fee_rate = mempool_min_fee
         logger.info(f"Fee estimation for {target} blocks: {resolved_fee_rate:.2f} sat/vB")
+
+    # Enforce the cap on the final rate, including any mempool-minimum floor.
+    try:
+        enforce_fee_rate_cap(resolved_fee_rate, max_fee_rate_sat_vb, source="resolved")
+    except ExcessiveFeeRateError as exc:
+        logger.error(str(exc))
+        raise typer.Exit(1) from exc
 
     wallet = WalletService(
         mnemonic=mnemonic,

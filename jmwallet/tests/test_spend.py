@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import time
 from hashlib import sha256
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from jmcore.btc_script import mk_freeze_script
@@ -896,3 +896,23 @@ class TestDirectSendFeeRateCap:
                 max_fee_rate_sat_vb=10.0,
             )
         backend.broadcast_transaction.assert_not_awaited()
+
+    @pytest.mark.anyio
+    async def test_randomized_rate_is_limited_by_cap(self) -> None:
+        utxos = [_make_utxo(value=1_000_000)]
+        wallet = _make_mock_wallet(utxos)
+        backend = _make_mock_backend()
+
+        with patch("jmwallet.wallet.spend.random.uniform", side_effect=lambda _low, high: high):
+            result = await direct_send(
+                wallet=wallet,
+                backend=backend,
+                mixdepth=0,
+                amount_sats=50_000,
+                destination=REGTEST_P2WPKH_ADDR,
+                fee_rate=900.0,
+                tx_fee_factor=1.0,
+                max_fee_rate_sat_vb=1_000.0,
+            )
+
+        assert result.fee_rate == 1_000.0

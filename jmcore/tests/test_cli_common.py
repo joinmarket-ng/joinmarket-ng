@@ -537,6 +537,20 @@ class TestResolveBackendSettings:
         result = resolve_backend_settings(settings)
         assert result.neutrino_add_peers == []
 
+    def test_fee_estimate_settings_resolved(self) -> None:
+        """resolve_backend_settings() carries fee_estimate_url and builds the
+        Tor fee proxy from [tor] settings (settings -> config round-trip)."""
+        from jmcore.cli_common import resolve_backend_settings
+        from jmcore.settings import JoinMarketSettings
+
+        settings = JoinMarketSettings(
+            bitcoin={"fee_estimate_url": "https://example.com/fee-estimates"},
+            tor={"socks_host": "127.0.0.1", "socks_port": 9050, "stream_isolation": False},
+        )
+        result = resolve_backend_settings(settings)
+        assert result.fee_estimate_url == "https://example.com/fee-estimates"
+        assert result.fee_estimate_proxy == "socks5h://127.0.0.1:9050"
+
     def test_neutrino_tls_cert_relative_resolved_against_data_dir(self, tmp_path: Path) -> None:
         """Relative TLS cert paths in config join onto the resolved data dir."""
         from jmcore.cli_common import resolve_backend_settings
@@ -653,6 +667,8 @@ class TestCreateBackend:
             add_peers=peers,
             tls_cert_path=None,
             auth_token=None,
+            fee_estimate_url=None,
+            fee_estimate_proxy=None,
         )
         assert result is mock_backend
 
@@ -688,6 +704,8 @@ class TestCreateBackend:
             add_peers=[],
             tls_cert_path=None,
             auth_token=None,
+            fee_estimate_url=None,
+            fee_estimate_proxy=None,
         )
 
 

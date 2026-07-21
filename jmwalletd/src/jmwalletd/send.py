@@ -29,6 +29,7 @@ async def do_direct_send(
     destination: str,
     fee_rate: float | None = None,
     fee_target_blocks: int | None = None,
+    tx_fee_factor: float = 0.0,
     max_fee_rate_sat_vb: float = DEFAULT_MAX_FEE_RATE_SAT_VB,
 ) -> DirectSendResult:
     """Build and broadcast a direct (non-coinjoin) transaction.
@@ -36,8 +37,8 @@ async def do_direct_send(
     Delegates entirely to :func:`jmwallet.wallet.spend.direct_send`.
     ``fee_rate`` (sat/vB) takes priority; otherwise ``fee_target_blocks``
     drives backend estimation (``None`` keeps the spend module's default
-    target). ``max_fee_rate_sat_vb`` is forwarded so the daemon can apply the
-    operator's configured cap (``settings.wallet.max_fee_rate_sat_vb``).
+    target). ``tx_fee_factor`` applies the reference fee-rate randomization,
+    and ``max_fee_rate_sat_vb`` applies the operator's configured hard cap.
     """
     from jmcore.paths import get_default_data_dir
     from jmwalletd._backend import get_backend
@@ -69,6 +70,7 @@ async def do_direct_send(
         amount_sats=amount_sats,
         destination=destination,
         fee_rate=fee_rate,
+        tx_fee_factor=tx_fee_factor,
         max_fee_rate_sat_vb=max_fee_rate_sat_vb,
         **extra_kwargs,
     )

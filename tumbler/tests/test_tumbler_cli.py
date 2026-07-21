@@ -16,7 +16,7 @@ import pytest
 from typer.testing import CliRunner
 
 from tumbler.builder import PlanBuilder, TumbleParameters
-from tumbler.cli import _collect_balances, app, resolve_runner_pacing
+from tumbler.cli import _collect_balances, _resolve_fee_rate, app, resolve_runner_pacing
 from tumbler.persistence import save_plan
 from tumbler.plan import Plan
 
@@ -38,6 +38,27 @@ def _build_plan(wallet_name: str) -> Plan:
         seed=1,
     )
     return PlanBuilder(wallet_name, params).build()
+
+
+@pytest.mark.asyncio
+async def test_fee_preview_uses_backend_sat_vb_units() -> None:
+    class _Taker:
+        fee_rate = None
+        fee_block_target = 6
+
+    class _Wallet:
+        max_fee_rate_sat_vb = 1_000.0
+
+    class _Settings:
+        taker = _Taker()
+        wallet = _Wallet()
+
+    class _Backend:
+        async def estimate_fee(self, target_blocks: int) -> float:
+            assert target_blocks == 6
+            return 3.5
+
+    assert await _resolve_fee_rate(_Settings(), _Backend()) == (3.5, "estimated")
 
 
 class _FakeSettings:

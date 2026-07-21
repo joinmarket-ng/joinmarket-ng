@@ -106,6 +106,10 @@ def build_taker_config_kwargs(
     effective_neutrino_tls_cert = resolved_backend.neutrino_tls_cert
     effective_neutrino_auth_token = resolved_backend.neutrino_auth_token
 
+    # Resolve Tor settings (also needed for the neutrino fee-source proxy)
+    effective_socks_host = tor_socks_host if tor_socks_host is not None else settings.tor.socks_host
+    effective_socks_port = tor_socks_port if tor_socks_port is not None else settings.tor.socks_port
+
     # Build backend config
     backend_config: dict[str, Any] = {}
     if effective_backend_type == "descriptor_wallet":
@@ -115,6 +119,8 @@ def build_taker_config_kwargs(
             "rpc_password": effective_rpc_password,
         }
     elif effective_backend_type == "neutrino":
+        from jmcore.fee_source import build_fee_source_proxy
+
         backend_config = {
             "neutrino_url": effective_neutrino_url,
             "network": (
@@ -127,6 +133,12 @@ def build_taker_config_kwargs(
             "tls_cert_path": effective_neutrino_tls_cert,
             "auth_token": effective_neutrino_auth_token,
             "include_mempool": settings.bitcoin.neutrino_include_mempool,
+            "fee_estimate_url": settings.bitcoin.fee_estimate_url,
+            "fee_estimate_proxy": build_fee_source_proxy(
+                effective_socks_host,
+                effective_socks_port,
+                settings.tor.stream_isolation,
+            ),
         }
 
     # Resolve directory servers
@@ -139,10 +151,6 @@ def build_taker_config_kwargs(
         dir_servers = DEFAULT_DIRECTORY_SERVERS.get(effective_network.value, [])
     else:
         dir_servers = settings.get_directory_servers()
-
-    # Resolve Tor settings
-    effective_socks_host = tor_socks_host if tor_socks_host is not None else settings.tor.socks_host
-    effective_socks_port = tor_socks_port if tor_socks_port is not None else settings.tor.socks_port
 
     # Resolve taker-specific settings
     effective_counterparties = (

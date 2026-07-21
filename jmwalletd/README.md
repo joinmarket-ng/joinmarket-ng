@@ -71,7 +71,11 @@ coinjoins, and tumbles. The reference `[POLICY] tx_fees` semantics apply:
 values from 1 to 1000 are a block confirmation target, values above 1000 are a
 fee rate in sat/kvB (for example `5000` means 5 sat/vB). These overrides are
 in-memory only and are cleared when the wallet is locked. On the neutrino
-backend, block-target estimation is not available, so set a sat/kvB value.
+backend, block-target estimation uses the external fee source configured via
+`bitcoin.fee_estimate_url` (an onion-first fallback chain over Tor by default).
+Multiple comma-separated URLs are tried in order. When external estimation is
+disabled and no Tor proxy is available, set a sat/kvB value instead. External
+estimates remain subject to `wallet.max_fee_rate_sat_vb` (default 1000 sat/vB).
 
 Orderbook proxy target resolution is:
 

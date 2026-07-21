@@ -4,7 +4,7 @@ Tests for taker CLI module.
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import click
 import pytest
@@ -364,6 +364,60 @@ class TestBuildTakerConfig:
 
         assert config.backend_config.get("add_peers") == []
 
+    def test_neutrino_fee_source_in_backend_config(
+        self, sample_mnemonic: str, mock_settings: MagicMock
+    ) -> None:
+        """``bitcoin.fee_estimate_url`` and the Tor fee proxy must flow into
+        backend_config so neutrino can estimate fees without a full node."""
+        mock_settings.bitcoin.backend_type = "neutrino"
+        mock_settings.get_neutrino_add_peers.return_value = []
+        mock_settings.bitcoin.fee_estimate_url = "https://example.com/fee-estimates"
+        mock_settings.tor.socks_host = "127.0.0.1"
+        mock_settings.tor.socks_port = 9050
+        mock_settings.tor.stream_isolation = False
+
+        config = build_taker_config(
+            settings=mock_settings,
+            mnemonic=sample_mnemonic,
+            passphrase="",
+            destination="bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+            amount=100000,
+            mixdepth=0,
+        )
+
+        assert config.backend_config.get("fee_estimate_url") == "https://example.com/fee-estimates"
+        assert config.backend_config.get("fee_estimate_proxy") == "socks5h://127.0.0.1:9050"
+
+    def test_neutrino_fee_source_kwargs_reach_backend(
+        self, sample_mnemonic: str, mock_settings: MagicMock
+    ) -> None:
+        """create_backend must forward the fee source kwargs to NeutrinoBackend."""
+        mock_settings.bitcoin.backend_type = "neutrino"
+        mock_settings.get_neutrino_add_peers.return_value = []
+        mock_settings.bitcoin.fee_estimate_url = None
+        mock_settings.tor.socks_host = "127.0.0.1"
+        mock_settings.tor.socks_port = 9050
+        mock_settings.tor.stream_isolation = False
+
+        config = build_taker_config(
+            settings=mock_settings,
+            mnemonic=sample_mnemonic,
+            passphrase="",
+            destination="bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+            amount=100000,
+            mixdepth=0,
+        )
+
+        mock_backend = MagicMock()
+        with patch(
+            "jmwallet.backends.neutrino.NeutrinoBackend", return_value=mock_backend
+        ) as mock_cls:
+            create_backend(config)
+
+        _, kwargs = mock_cls.call_args
+        assert kwargs["fee_estimate_url"] is None
+        assert kwargs["fee_estimate_proxy"] == "socks5h://127.0.0.1:9050"
+
     def test_neutrino_tls_and_auth_in_backend_config(
         self, sample_mnemonic: str, mock_settings: MagicMock
     ) -> None:
@@ -447,6 +501,8 @@ class TestBuildTakerConfig:
             tls_cert_path="/tmp/neutrino/tls.cert",
             auth_token="token-123",
             include_mempool=True,
+            fee_estimate_url=None,
+            fee_estimate_proxy=None,
         )
         assert result is mock_backend
 

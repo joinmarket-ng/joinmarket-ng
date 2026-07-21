@@ -71,7 +71,10 @@ class TestDirectSend:
         silently ignored."""
         client, token = authed_client
         state = get_daemon_state()
-        state.config_overrides["POLICY"] = {"tx_fees": "5000"}
+        state.config_overrides["POLICY"] = {
+            "tx_fees": "5000",
+            "tx_fees_factor": "0.4",
+        }
 
         mock_result = Mock()
         mock_result.txid = "txid123"
@@ -99,6 +102,35 @@ class TestDirectSend:
         _, kwargs = mock_send.call_args
         assert kwargs["fee_rate"] == 5.0
         assert kwargs["fee_target_blocks"] is None
+        assert kwargs["tx_fee_factor"] == 0.4
+
+    @patch("jmwalletd.send.do_direct_send")
+    def test_direct_send_uses_configured_fee_defaults(
+        self,
+        mock_send: AsyncMock,
+        authed_client: tuple[TestClient, str],
+    ) -> None:
+        client, token = authed_client
+        mock_send.return_value = Mock(
+            txid="txid123",
+            tx_hex="rawhex",
+            hex="rawhex",
+            inputs=[],
+            outputs=[],
+            locktime=0,
+            version=2,
+        )
+
+        resp = client.post(
+            "/api/v1/wallet/test_wallet.jmdat/taker/direct-send",
+            json={"mixdepth": 0, "amount_sats": 1000, "destination": "bcrt1qdest"},
+            headers=_auth_headers(token),
+        )
+
+        assert resp.status_code == 200
+        kwargs = mock_send.call_args.kwargs
+        assert kwargs["fee_target_blocks"] == 3
+        assert kwargs["tx_fee_factor"] == 0.2
 
     def test_direct_send_while_taker_running(self, authed_client: tuple[TestClient, str]) -> None:
         client, token = authed_client

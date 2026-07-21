@@ -7,6 +7,7 @@ the CLI and the ``jmwalletd`` HTTP daemon can share it without duplication.
 from __future__ import annotations
 
 import math
+import random
 import time
 from dataclasses import dataclass, field
 from hashlib import sha256
@@ -356,6 +357,7 @@ async def direct_send(
     destination: str,
     fee_rate: float | None = None,
     fee_target_blocks: int = 6,
+    tx_fee_factor: float = 0.0,
     max_fee_rate_sat_vb: float = DEFAULT_MAX_FEE_RATE_SAT_VB,
 ) -> DirectSendResult:
     """Build, sign, and broadcast a direct (non-CoinJoin) transaction.
@@ -377,6 +379,10 @@ async def direct_send(
         from the backend using *fee_target_blocks*.
     fee_target_blocks:
         Number of blocks for fee estimation (ignored when *fee_rate* is set).
+    tx_fee_factor:
+        Privacy randomization factor. The final rate is selected between the
+        resolved rate and that rate multiplied by ``1 + tx_fee_factor``, with
+        the upper end limited by *max_fee_rate_sat_vb*.
     max_fee_rate_sat_vb:
         Safety cap on the fee rate (sat/vB).  The resolved rate (manual or
         from backend estimation) is rejected with
@@ -399,12 +405,21 @@ async def direct_send(
     dest_script = _decode_bech32_scriptpubkey(destination, network=network)
 
     # --- Fee rate resolution ---
-    if fee_rate is not None:
-        enforce_fee_rate_cap(fee_rate, max_fee_rate_sat_vb, source="manual")
-    else:
+    fee_source = "manual"
+    if fee_rate is None:
         fee_rate = await backend.estimate_fee(target_blocks=fee_target_blocks)
         logger.debug("Estimated fee rate: {:.2f} sat/vB ({} blocks)", fee_rate, fee_target_blocks)
-        enforce_fee_rate_cap(fee_rate, max_fee_rate_sat_vb, source="backend estimate")
+        fee_source = "backend estimate"
+
+    enforce_fee_rate_cap(fee_rate, max_fee_rate_sat_vb, source=fee_source)
+    if not math.isfinite(tx_fee_factor) or tx_fee_factor < 0:
+        msg = f"tx_fee_factor must be a finite non-negative number, got {tx_fee_factor!r}"
+        raise ValueError(msg)
+    if tx_fee_factor > 0:
+        upper_rate = min(fee_rate * (1 + tx_fee_factor), max_fee_rate_sat_vb)
+        fee_rate = random.uniform(fee_rate, upper_rate)
+        logger.debug("Randomized direct-send fee rate: {:.2f} sat/vB", fee_rate)
+    enforce_fee_rate_cap(fee_rate, max_fee_rate_sat_vb, source="final")
 
     # --- UTXO selection ---
     utxos: list[UTXOInfo]

@@ -1131,9 +1131,10 @@ class CoinJoinSession:
         if self.config.fee_block_target is not None:
             if not self.backend.can_estimate_fee():
                 raise ValueError(
-                    "Cannot use --block-target with neutrino backend. "
-                    "Fee estimation requires a full node. "
-                    "Use --fee-rate to specify a manual rate instead."
+                    "Cannot use --block-target with neutrino backend without an "
+                    "external fee source. Use --fee-rate to specify a manual rate, "
+                    "or configure bitcoin.fee_estimate_url (external estimates are "
+                    "enabled by default when a Tor proxy is available)."
                 )
             self._fee_rate = await self.backend.estimate_fee(self.config.fee_block_target)
             # Check against mempool min fee
@@ -1180,6 +1181,7 @@ class CoinJoinSession:
             f"was specified. Falling back to {fallback_rate} sat/vB."
         )
         self._fee_rate = fallback_rate
+        enforce_fee_rate_cap(self._fee_rate, self.config.max_fee_rate_sat_vb, source="fallback")
         self._apply_fee_randomization()
         return self._fee_rate
 
@@ -1202,8 +1204,18 @@ class CoinJoinSession:
 
         if self.config.tx_fee_factor > 0:
             # Randomize between base and base * (1 + factor)
+            upper_rate = min(
+                base_rate * (1 + self.config.tx_fee_factor),
+                self.config.max_fee_rate_sat_vb,
+            )
             self._randomized_fee_rate = random.uniform(
-                base_rate, base_rate * (1 + self.config.tx_fee_factor)
+                base_rate,
+                upper_rate,
+            )
+            enforce_fee_rate_cap(
+                self._randomized_fee_rate,
+                self.config.max_fee_rate_sat_vb,
+                source="randomized",
             )
             logger.info(
                 f"Randomized fee rate: {self._randomized_fee_rate:.2f} sat/vB "

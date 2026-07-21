@@ -68,6 +68,8 @@ class ResolvedBackendSettings:
     scan_start_height: int | None = None
     neutrino_tls_cert: str | None = None
     neutrino_auth_token: str | None = None
+    fee_estimate_url: str | None = None
+    fee_estimate_proxy: str | None = None
 
 
 @dataclass
@@ -381,6 +383,15 @@ def resolve_backend_settings(
         )
         resolved_neutrino_url = upgraded_url
 
+    # External fee source for backends without native estimation (neutrino).
+    from jmcore.fee_source import build_fee_source_proxy
+
+    resolved_fee_estimate_proxy = build_fee_source_proxy(
+        settings.tor.socks_host,
+        settings.tor.socks_port,
+        settings.tor.stream_isolation,
+    )
+
     return ResolvedBackendSettings(
         network=resolved_network,
         bitcoin_network=resolved_bitcoin_network,
@@ -394,6 +405,8 @@ def resolve_backend_settings(
         scan_start_height=settings.wallet.scan_start_height,
         neutrino_tls_cert=resolved_neutrino_tls_cert,
         neutrino_auth_token=resolved_neutrino_auth_token,
+        fee_estimate_url=settings.bitcoin.fee_estimate_url,
+        fee_estimate_proxy=resolved_fee_estimate_proxy,
     )
 
 
@@ -920,6 +933,8 @@ def create_backend(
             add_peers=backend_settings.neutrino_add_peers,
             tls_cert_path=backend_settings.neutrino_tls_cert,
             auth_token=backend_settings.neutrino_auth_token,
+            fee_estimate_url=backend_settings.fee_estimate_url,
+            fee_estimate_proxy=backend_settings.fee_estimate_proxy,
         )
     elif backend_type == "descriptor_wallet":
         if not wallet_name:

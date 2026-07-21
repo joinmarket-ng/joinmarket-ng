@@ -576,6 +576,53 @@ def test_send_rejects_nan_manual_fee_rate():
 
 
 @pytest.mark.asyncio
+async def test_send_rejects_mempool_floor_above_fee_cap():
+    from jmcore.cli_common import ResolvedBackendSettings
+
+    from jmwallet.cli.send import _send_transaction
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        backend_settings = ResolvedBackendSettings(
+            network="regtest",
+            bitcoin_network="regtest",
+            backend_type="descriptor_wallet",
+            rpc_url="http://127.0.0.1:18443",
+            rpc_user="user",
+            rpc_password="pass",
+            neutrino_url="",
+            neutrino_add_peers=[],
+            data_dir=Path(tmpdir),
+        )
+        mock_backend = MagicMock(spec=DescriptorWalletBackend)
+        mock_backend.get_mempool_min_fee = AsyncMock(return_value=2_000.0)
+
+        with (
+            patch(
+                "jmwallet.backends.descriptor_wallet.DescriptorWalletBackend",
+                _stub_backend_class(mock_backend),
+            ),
+            patch("jmwallet.wallet.service.WalletService") as mock_wallet_service,
+            pytest.raises(typer.Exit) as exc_info,
+        ):
+            await _send_transaction(
+                mnemonic="abandon " * 11 + "about",
+                destination="bcrt1qq6hag67dl53wl99vzg42z8eyzfz2xlkvwk6f7m",
+                amount=10_000,
+                mixdepth=0,
+                fee_rate=1.0,
+                block_target=None,
+                backend_settings=backend_settings,
+                broadcast=False,
+                skip_confirmation=True,
+                interactive_utxo_selection=False,
+                max_fee_rate_sat_vb=1_000.0,
+            )
+
+        assert exc_info.value.exit_code == 1
+        mock_wallet_service.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_send_fails_when_change_key_unavailable():
     """_send_transaction should fail fast when change key derivation fails."""
     from jmcore.cli_common import ResolvedBackendSettings

@@ -25,6 +25,7 @@ operation.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from typing import NamedTuple
 
@@ -89,7 +90,15 @@ def _parse_tx_fees(raw: str | None) -> tuple[float | None, int | None]:
         return None, None
     if value > TX_FEES_BLOCK_TARGET_MAX:
         # sat/kvB -> sat/vB (reference semantics).
-        return value / 1000.0, None
+        try:
+            fee_rate = value / 1000.0
+        except OverflowError:
+            logger.warning("Ignoring out-of-range [POLICY] tx_fees override: {}", value)
+            return None, None
+        if not math.isfinite(fee_rate):
+            logger.warning("Ignoring out-of-range [POLICY] tx_fees override: {}", value)
+            return None, None
+        return fee_rate, None
     return None, value
 
 
@@ -101,8 +110,8 @@ def _parse_positive_float(raw: str | None, field: str) -> float | None:
     except ValueError:
         logger.warning("Ignoring invalid [POLICY] {} override: {!r}", field, raw)
         return None
-    if value < 0:
-        logger.warning("Ignoring negative [POLICY] {} override: {}", field, value)
+    if not math.isfinite(value) or value < 0:
+        logger.warning("Ignoring out-of-range [POLICY] {} override: {}", field, value)
         return None
     return value
 
@@ -131,7 +140,7 @@ def _parse_rel_fee(raw: str | None) -> str | None:
     except ValueError:
         logger.warning("Ignoring invalid [POLICY] max_cj_fee_rel override: {!r}", raw)
         return None
-    if value <= 0:
-        logger.warning("Ignoring non-positive [POLICY] max_cj_fee_rel override: {}", value)
+    if not math.isfinite(value) or value <= 0:
+        logger.warning("Ignoring out-of-range [POLICY] max_cj_fee_rel override: {}", value)
         return None
     return text

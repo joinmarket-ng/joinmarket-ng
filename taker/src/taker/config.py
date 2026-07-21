@@ -132,7 +132,7 @@ class TakerConfig(WalletConfig):
         description=(
             "Safety cap on the resolved fee rate (sat/vB) for the CoinJoin "
             "transaction. Manual rates and backend estimates above this cap "
-            "are rejected before any randomization, which protects against "
+            "are rejected, and randomization is limited to this cap, protecting against "
             "runaway-fee bugs and malicious fee oracles."
         ),
     )

@@ -56,6 +56,8 @@ def create_backend(config: TakerConfig) -> Any:
             tls_cert_path=config.backend_config.get("tls_cert_path"),
             auth_token=config.backend_config.get("auth_token"),
             include_mempool=config.backend_config.get("include_mempool", True),
+            fee_estimate_url=config.backend_config.get("fee_estimate_url"),
+            fee_estimate_proxy=config.backend_config.get("fee_estimate_proxy"),
         )
     elif config.backend_type == "descriptor_wallet":
         fingerprint = get_mnemonic_fingerprint(

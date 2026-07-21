@@ -108,14 +108,23 @@ async def direct_send(
         # a manual sat/vB rate or block target set in the UI applies to
         # direct sends too (issue #566).
         fee_overrides = resolve_policy_fee_overrides(state.config_overrides)
+        settings = get_settings()
+        fee_target_blocks = fee_overrides.block_target
+        if fee_overrides.fee_rate is None and fee_target_blocks is None:
+            fee_target_blocks = settings.wallet.default_fee_block_target
         tx_result = await do_direct_send(
             wallet_service=ws,
             mixdepth=body.mixdepth,
             amount_sats=body.amount_sats,
             destination=body.destination,
             fee_rate=fee_overrides.fee_rate,
-            fee_target_blocks=fee_overrides.block_target,
-            max_fee_rate_sat_vb=get_settings().wallet.max_fee_rate_sat_vb,
+            fee_target_blocks=fee_target_blocks,
+            tx_fee_factor=(
+                fee_overrides.tx_fee_factor
+                if fee_overrides.tx_fee_factor is not None
+                else settings.taker.tx_fee_factor
+            ),
+            max_fee_rate_sat_vb=settings.wallet.max_fee_rate_sat_vb,
         )
     except ValueError as exc:
         raise InvalidRequestFormat(str(exc)) from exc
