@@ -53,6 +53,18 @@ def _get_max_sats_freeze_reuse() -> int:
     return get_settings().wallet.max_sats_freeze_reuse
 
 
+def _get_reconstruct_history() -> bool:
+    """Return the configured on-chain history reconstruction toggle.
+
+    See ``WalletSettings.reconstruct_history``: when True (default), a wallet
+    with no recorded history has its CoinJoin/send/deposit history
+    reconstructed from chain data after sync (seed-import backfill).
+    """
+    from jmcore.settings import get_settings
+
+    return get_settings().wallet.reconstruct_history
+
+
 async def create_wallet(
     *,
     wallet_path: Path,
@@ -113,6 +125,7 @@ async def create_wallet(
         data_dir=data_dir,
         network=_get_network(),
         max_sats_freeze_reuse=_get_max_sats_freeze_reuse(),
+        reconstruct_history=_get_reconstruct_history(),
     )
 
     # Persist the wallet file (encrypted with the password).
@@ -184,6 +197,7 @@ async def recover_wallet(
         data_dir=data_dir,
         network=_get_network(),
         max_sats_freeze_reuse=_get_max_sats_freeze_reuse(),
+        reconstruct_history=_get_reconstruct_history(),
     )
 
     _save_wallet_file(
@@ -249,6 +263,7 @@ async def open_wallet_with_mnemonic(
         data_dir=data_dir,
         network=_get_network(),
         max_sats_freeze_reuse=_get_max_sats_freeze_reuse(),
+        reconstruct_history=_get_reconstruct_history(),
     )
 
     # Ensure the watch-only descriptor wallet is loaded in Bitcoin Core

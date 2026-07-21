@@ -927,6 +927,7 @@ class TestWalletHistory:
         fingerprint: str = "deadbeef",
         txid: str = "ab" * 32,
         timestamp: str = "2024-01-01T10:00:00",
+        source: str = "protocol",
     ) -> None:
         from jmwallet.history import TransactionHistoryEntry, append_history_entry
 
@@ -942,6 +943,7 @@ class TestWalletHistory:
                 fee_received=fee_received,
                 network="regtest",
                 wallet_fingerprint=fingerprint,
+                source=source,  # type: ignore[arg-type]
             ),
             data_dir=data_dir,
         )
@@ -959,7 +961,13 @@ class TestWalletHistory:
     ) -> None:
         client, token = authed_client
         get_daemon_state().wallet_service.wallet_fingerprint = "deadbeef"
-        self._append(data_dir, role="maker", cj_amount=100_000, fee_received=2_500)
+        self._append(
+            data_dir,
+            role="maker",
+            cj_amount=100_000,
+            fee_received=2_500,
+            source="onchain",
+        )
 
         resp = client.get("/api/v1/wallet/test_wallet.jmdat/history", headers=_auth_headers(token))
         assert resp.status_code == 200
@@ -969,6 +977,7 @@ class TestWalletHistory:
         assert history[0]["cj_amount"] == 100_000
         assert history[0]["fee_received"] == 2_500
         assert history[0]["txid"] == "ab" * 32
+        assert history[0]["source"] == "onchain"
 
     def test_scoped_to_active_wallet_fingerprint(
         self, authed_client: tuple[TestClient, str], data_dir: Path

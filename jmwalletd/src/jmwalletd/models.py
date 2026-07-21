@@ -6,6 +6,8 @@ All models match the schemas defined in the reference JoinMarket OpenAPI spec
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 # ---------------------------------------------------------------------------
@@ -237,7 +239,7 @@ class HistoryEntry(BaseModel):
     timestamp: str
     completed_at: str = ""
     confirmed_at: str = ""
-    role: str = "taker"  # "maker" | "taker" | "send"
+    role: Literal["maker", "taker", "send", "deposit"] = "taker"
     success: bool = True
     failure_reason: str = ""
     confirmations: int = 0
@@ -256,6 +258,10 @@ class HistoryEntry(BaseModel):
     utxos_used: str = ""
     broadcast_method: str = ""
     network: str = ""
+    # "protocol" for rows recorded at protocol time (authoritative);
+    # "onchain" for rows reconstructed from blockchain data after a seed
+    # import (best-effort guesses).
+    source: Literal["protocol", "onchain"] = "protocol"
 
 
 class WalletHistoryResponse(BaseModel):

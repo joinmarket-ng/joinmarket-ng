@@ -242,6 +242,7 @@ async def wallet_history(
             utxos_used=e.utxos_used,
             broadcast_method=e.broadcast_method,
             network=e.network,
+            source=e.source,
         )
         for e in entries
     ]

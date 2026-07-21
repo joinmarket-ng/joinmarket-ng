@@ -816,6 +816,34 @@ def test_history_command_status_display(monkeypatch):
         assert failed_line and "[FAILED]" in failed_line, "Failed tx should have [FAILED]"
 
 
+def test_history_stats_marks_reconstructed_estimates() -> None:
+    """Aggregate output must not present inferred on-chain fees as exact."""
+    from jmwallet.history import TransactionHistoryEntry, append_history_entry
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        data_dir = Path(tmpdir)
+        append_history_entry(
+            TransactionHistoryEntry(
+                timestamp="2024-01-01T00:00:00",
+                role="maker",
+                txid="ab" * 32,
+                cj_amount=100_000,
+                fee_received=500,
+                net_fee=450,
+                source="onchain",
+            ),
+            data_dir,
+        )
+
+        result = runner.invoke(
+            app,
+            ["history", "--stats", "--all-wallets", "--data-dir", str(data_dir)],
+        )
+
+        assert result.exit_code == 0, result.stdout
+        assert "Statistics include reconstructed role and fee estimates" in result.stdout
+
+
 def test_history_command_renders_in_chronological_order(monkeypatch):
     """The rendered history table must show entries oldest-first.
 

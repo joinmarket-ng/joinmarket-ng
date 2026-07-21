@@ -237,7 +237,7 @@ class TestReconstructImportedLabels:
         ws.utxo_cache = {0: [_utxo(txid="cjtx", value=CJ_AMOUNT, address="bcrt1qcjout")]}
 
         # Must never raise: a labeling failure cannot break sync.
-        await ws._reconstruct_imported_labels_safe()
+        await ws.reconstruct_imported_state_safe()
 
 
 class TestImportedLabelDisplayIntegration:

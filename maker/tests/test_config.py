@@ -353,6 +353,21 @@ class TestBuildMakerConfig:
         )
         assert config.max_sats_freeze_reuse == -1
 
+    def test_reconstruct_history_forwarded(self) -> None:
+        """The wallet history-reconstruction toggle must reach MakerConfig."""
+        from jmcore.settings import JoinMarketSettings
+
+        from maker.cli import build_maker_config
+
+        settings = JoinMarketSettings()
+        settings.wallet.reconstruct_history = False
+        config = build_maker_config(
+            settings=settings,
+            mnemonic=TEST_MNEMONIC,
+            passphrase="",
+        )
+        assert config.reconstruct_history is False
+
     def test_onion_host_forwarded(self) -> None:
         """``maker.onion_host`` from settings must reach the MakerConfig (#535).
 

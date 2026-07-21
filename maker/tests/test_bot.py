@@ -575,6 +575,7 @@ class TestWalletRescanAndOfferUpdate:
         wallet.mixdepth_count = 5
         wallet.utxo_cache = {}
         wallet.sync_all = AsyncMock()
+        wallet.reconstruct_imported_state_safe = AsyncMock()
         wallet.get_total_balance = AsyncMock(return_value=1_000_000)
         wallet.get_balance = AsyncMock(return_value=500_000)
         wallet.get_balance_for_offers = AsyncMock(return_value=500_000)
@@ -654,6 +655,7 @@ class TestWalletRescanAndOfferUpdate:
 
         # Wallet should have been synced
         mock_wallet.sync_all.assert_called_once()
+        mock_wallet.reconstruct_imported_state_safe.assert_awaited_once()
 
         # Offers should have been updated (balance changed)
         maker_bot.offer_manager.create_offers.assert_called_once()

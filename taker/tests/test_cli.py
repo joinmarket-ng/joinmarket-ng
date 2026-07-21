@@ -147,6 +147,21 @@ class TestBuildTakerConfig:
         )
         assert config.max_sats_freeze_reuse == 12_345
 
+    def test_reconstruct_history_forwarded(
+        self, sample_mnemonic: str, mock_settings: MagicMock
+    ) -> None:
+        """The wallet history-reconstruction toggle must reach TakerConfig."""
+        mock_settings.wallet.reconstruct_history = False
+        config = build_taker_config(
+            settings=mock_settings,
+            mnemonic=sample_mnemonic,
+            passphrase="",
+            destination="bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+            amount=100000,
+            mixdepth=0,
+        )
+        assert config.reconstruct_history is False
+
     def test_explicit_block_target_overrides_default(
         self, sample_mnemonic: str, mock_settings: MagicMock
     ) -> None:

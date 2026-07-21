@@ -50,6 +50,7 @@ class _AddressContext:
     backend_settings: ResolvedBackendSettings
     creation_height: int | None
     max_sats_freeze_reuse: int
+    reconstruct_history: bool
 
 
 @address_app.callback()
@@ -120,6 +121,7 @@ def _address_main(
         backend_settings=backend_settings,
         creation_height=resolved.creation_height,
         max_sats_freeze_reuse=settings.wallet.max_sats_freeze_reuse,
+        reconstruct_history=settings.wallet.reconstruct_history,
     )
 
 
@@ -167,6 +169,7 @@ async def _build_wallet(c: _AddressContext) -> tuple[WalletService, str]:
         passphrase=c.bip39_passphrase,
         data_dir=bs.data_dir,
         max_sats_freeze_reuse=c.max_sats_freeze_reuse,
+        reconstruct_history=c.reconstruct_history,
     )
     return wallet, bs.backend_type
 

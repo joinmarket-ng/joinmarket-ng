@@ -226,6 +226,7 @@ def build_taker_config_kwargs(
         "scan_range": settings.wallet.scan_range,
         "dust_threshold": settings.wallet.dust_threshold,
         "max_sats_freeze_reuse": settings.wallet.max_sats_freeze_reuse,
+        "reconstruct_history": settings.wallet.reconstruct_history,
         "smart_scan": settings.wallet.smart_scan,
         "background_full_rescan": settings.wallet.background_full_rescan,
         "scan_lookback_blocks": settings.wallet.scan_lookback_blocks,

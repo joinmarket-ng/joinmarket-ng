@@ -416,6 +416,17 @@ class WalletSettings(BaseModel):
             "with ``jm-wallet unfreeze``."
         ),
     )
+    reconstruct_history: bool = Field(
+        default=True,
+        description=(
+            "Automatically reconstruct CoinJoin/send/deposit history from "
+            "on-chain data for wallets imported from seed (wallets with no "
+            "recorded history). Reconstructed rows are tagged as on-chain "
+            "guesses and never override protocol-time history. Disable to "
+            "keep history.csv strictly protocol-recorded; "
+            "`jm-wallet reconstruct-history` remains available for manual runs."
+        ),
+    )
     smart_scan: bool = Field(
         default=True,
         description="Use smart scan for fast startup",

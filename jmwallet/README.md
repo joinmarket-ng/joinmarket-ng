@@ -11,6 +11,31 @@ Modern HD wallet for JoinMarket with support for Bitcoin Core nodes and lightwei
 - **Coin Selection**: Privacy-preserving coin selection algorithms
 - **Fidelity Bonds**: Create and manage fidelity bonds for maker reputation
 - **Balance Tracking**: Monitor balances across multiple mixdepths
+- **History Recovery**: Reconstruct and persist best-effort CoinJoin, send, and deposit
+  history from on-chain data when importing a wallet from seed
+
+## Imported Wallet History
+
+After a seed import, `jm-wallet` reconstructs confirmed transaction history once
+the backend's historical scan is complete. Reconstructed rows are persisted in
+`history.csv` with `source=onchain`; rows recorded by live maker, taker, and send
+flows use `source=protocol` and always take precedence for the same transaction.
+
+Run `jm-wallet reconstruct-history` to rebuild the guessed rows explicitly. The
+command preserves protocol-recorded rows and marks reconstructed entries with `*`
+in `jm-wallet history` output. Set `wallet.reconstruct_history = false` to disable
+automatic reconstruction.
+
+CoinJoin detection, amount, and peer count come from the repeated equal-output
+structure. Maker/taker role and fees cannot be proven from public chain data, so
+those values are best-effort guesses. Counterparty nicknames and the split between
+taker maker-fees and mining fees cannot be recovered.
+
+The explicit rebuild waits for any active Bitcoin Core full rescan before changing
+the CSV. Reconstructed maker guesses are not included in the legacy yield-generator
+earnings report because that format cannot carry provenance and expects exact fees.
+`jm-wallet history --stats` does include reconstructed rows and marks its totals as
+containing estimates.
 
 ## Documentation
 
@@ -59,6 +84,8 @@ For full documentation, see [jmwallet Documentation](https://joinmarket-ng.githu
 │ freeze                       Interactively freeze/unfreeze UTXOs to exclude  │
 │                              them from coin selection.                       │
 │ history                      View CoinJoin transaction history.              │
+│ reconstruct-history          Rebuild guessed CoinJoin/send/deposit history   │
+│                              from on-chain data.                             │
 │ registry-show                Show detailed information about a specific      │
 │                              fidelity bond.                                  │
 │ send                         Send a simple transaction from wallet to an     │
@@ -724,7 +751,8 @@ For full documentation, see [jmwallet Documentation](https://joinmarket-ng.githu
 
 ╭─ Options ────────────────────────────────────────────────────────────────────╮
 │ --limit                    -n      INTEGER  Max entries to show              │
-│ --role                     -r      TEXT     Filter by role (maker/taker)     │
+│ --role                     -r      TEXT     Filter by role                   │
+│                                             (maker/taker/send/deposit)       │
 │ --stats                    -s               Show statistics only             │
 │ --csv                                       Output as CSV                    │
 │ --data-dir                         PATH     Data directory (default:         │
@@ -771,6 +799,74 @@ For full documentation, see [jmwallet Documentation](https://joinmarket-ng.githu
 │                                             rows without a fingerprint.      │
 │ --log-level                -l      TEXT     Log level                        │
 │ --help                                      Show this message and exit.      │
+╰──────────────────────────────────────────────────────────────────────────────╯
+```
+
+</details>
+
+<details>
+<summary><code>jm-wallet reconstruct-history --help</code></summary>
+
+```
+
+ Usage: jm-wallet reconstruct-history [OPTIONS]
+
+ Rebuild guessed CoinJoin/send/deposit history from on-chain data.
+
+ Enumerates the wallet's confirmed transactions, classifies each with the
+ equal-output CoinJoin heuristic (guessing role, fees, and peer count),
+ and stores the result as history rows tagged ``source="onchain"``. Rows
+ recorded at protocol time are never modified; transactions they already
+ cover are skipped. By default previously reconstructed rows are purged
+ first so the guessed portion is rebuilt from scratch.
+
+╭─ Options ────────────────────────────────────────────────────────────────────╮
+│ --mnemonic-file    -f                     PATH              [env var:        │
+│                                                             MNEMONIC_FILE]   │
+│ --prompt-bip39-p…                                           Prompt for BIP39 │
+│                                                             passphrase       │
+│ --max-transactio…                         INTEGER RANGE     Safety cap on    │
+│                                           [x>=1]            transactions     │
+│                                                             classified in    │
+│                                                             one pass         │
+│                                                             [default: 1000]  │
+│ --keep-existing        --purge-existi…                      Keep previously  │
+│                                                             reconstructed    │
+│                                                             (on-chain) rows  │
+│                                                             instead of       │
+│                                                             purging and      │
+│                                                             rebuilding them. │
+│                                                             Protocol-record… │
+│                                                             rows are always  │
+│                                                             kept either way. │
+│                                                             [default:        │
+│                                                             purge-existing]  │
+│ --network          -n                     TEXT              Bitcoin network  │
+│ --backend          -b                     TEXT              Backend:         │
+│                                                             descriptor_wall… │
+│                                                             | neutrino       │
+│ --rpc-url                                 TEXT              [env var:        │
+│                                                             BITCOIN_RPC_URL] │
+│ --neutrino-url                            TEXT              [env var:        │
+│                                                             NEUTRINO_URL]    │
+│ --data-dir                                PATH              Data directory   │
+│                                                             (default:        │
+│                                                             ~/.joinmarket-ng │
+│                                                             or               │
+│                                                             $JOINMARKET_DAT… │
+│                                                             [env var:        │
+│                                                             JOINMARKET_DATA… │
+│ --config-file                             PATH              Config file path │
+│                                                             (decoupled from  │
+│                                                             data dir).       │
+│                                                             Defaults to      │
+│                                                             <data-dir>/conf… │
+│                                                             [env var:        │
+│                                                             JOINMARKET_CONF… │
+│ --log-level        -l                     TEXT              Log level        │
+│ --help                                                      Show this        │
+│                                                             message and      │
+│                                                             exit.            │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ```
 

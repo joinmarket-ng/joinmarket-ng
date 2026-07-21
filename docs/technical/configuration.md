@@ -77,6 +77,29 @@ socks_port = 9050
 - `descriptor_wallet` (recommended)
 - `neutrino`
 
+## Wallet History Reconstruction
+
+`[wallet].reconstruct_history` defaults to `true`. When a wallet with no local
+protocol history is imported from seed, JoinMarket NG defers while a Bitcoin
+Core rescan is active, then enumerates confirmed wallet transactions on the
+next wallet sync and persists guessed `maker`, `taker`, `send`, and `deposit`
+rows in `history.csv`.
+These rows have `source=onchain`; live protocol rows have `source=protocol` and
+are never overwritten.
+
+Set `reconstruct_history = false` to disable the automatic pass. The explicit
+`jm-wallet reconstruct-history` command remains available and preserves all
+protocol-recorded rows.
+
+The reconstruction uses JoinMarket's equal-output CoinJoin heuristic. The
+CoinJoin amount and equal-output count are observable, but maker/taker role and
+fees are not unambiguous on-chain. Reconstructed role and fee fields are
+therefore estimates, and counterparty nicknames cannot be recovered.
+The manual command waits for an active Bitcoin Core rescan before purging or
+rebuilding rows. Reconstructed maker guesses are excluded from the legacy
+yield-generator earnings report, whose fee fields are authoritative. History
+statistics include reconstructed rows and are labeled as estimates when present.
+
 ## Neutrino TLS Settings
 
 When using the `neutrino` backend with TLS enabled (default), set:

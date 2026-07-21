@@ -17,7 +17,7 @@ from collections.abc import Mapping
 from dataclasses import fields
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from jmcore.paths import get_default_data_dir
 from loguru import logger
@@ -42,6 +42,20 @@ class HistoryWriteError(Exception):
     """Raised when a history entry cannot be persisted to disk."""
 
 
+# Role a history row records. "maker" / "taker" denote CoinJoin participation;
+# "send" a plain wallet spend; "deposit" an incoming payment (only written by
+# on-chain history reconstruction for imported wallets, never by live flows).
+HistoryRole = Literal["maker", "taker", "send", "deposit"]
+
+# Provenance of a history row. "protocol" rows are written at protocol time by
+# this wallet's own maker/taker/send activity and are authoritative.
+# "onchain" rows are best-effort guesses reconstructed from blockchain data
+# for a wallet imported from seed (see ``jmwallet.history_reconstruction``).
+HistorySource = Literal["protocol", "onchain"]
+
+VALID_HISTORY_SOURCES: frozenset[str] = frozenset({"protocol", "onchain"})
+
+
 @dataclass
 class TransactionHistoryEntry:
     """A single CoinJoin transaction record."""
@@ -56,8 +70,10 @@ class TransactionHistoryEntry:
     # addresses are persistently marked as used, even if Bitcoin Core's
     # transaction history later loses sight of them (for example, after an
     # interrupted full rescan or when the smart-scan window does not cover
-    # the spend).
-    role: Literal["maker", "taker", "send"] = "taker"
+    # the spend). "deposit" denotes an incoming payment; live flows never
+    # write deposits (they are only reconstructed from chain data for
+    # imported wallets).
+    role: HistoryRole = "taker"
     success: bool = True
     failure_reason: str = ""
 
@@ -115,6 +131,14 @@ class TransactionHistoryEntry:
     # (which assigns trailing legacy cells positionally to appended columns)
     # continues to work for files written by older releases.
     source_addresses: str = ""
+
+    # Provenance of this row (see ``HistorySource``): "protocol" for rows
+    # written by live maker/taker/send flows (authoritative), "onchain" for
+    # rows reconstructed from blockchain data after a seed import (best-effort
+    # guesses: role and fees are inferred from the transaction structure).
+    # Appended after ``source_addresses`` so the positional trailing-cell
+    # migration for legacy headers keeps working.
+    source: HistorySource = "protocol"
 
 
 HISTORY_FILENAME = "history.csv"
@@ -294,6 +318,22 @@ def _ensure_history_header_current(history_path: Path) -> None:
         return
 
     missing = [name for name in expected if name not in actual]
+    expected_existing = [name for name in expected if name in actual]
+    if missing and set(actual) == set(expected_existing) and actual != expected_existing:
+        # The file is both missing newly-appended columns and using an older
+        # reordered layout. This occurs when ``source`` is introduced on top of
+        # a pre-existing file whose ``source_addresses`` column was in the old
+        # position. The generic missing-column migration maps cells by the
+        # stale header and cannot recover rows a newer writer already appended
+        # in canonical order against that header. Reconcile each row against
+        # both interpretations first; _row_to_entry supplies defaults for the
+        # genuinely missing appended columns.
+        logger.info(
+            "Migrating history CSV: normalizing reordered legacy header and "
+            f"adding columns {missing}"
+        )
+        _rewrite_reordered_history(history_path, actual, expected)
+        return
     if not missing:
         # Same columns, different order. This happens when a field is moved
         # in the dataclass declaration (e.g. ``source_addresses`` relocated to
@@ -372,7 +412,7 @@ def _row_to_entry(row: Mapping[str, str | None]) -> TransactionHistoryEntry | No
         return TransactionHistoryEntry(
             timestamp=_get("timestamp"),
             completed_at=_get("completed_at"),
-            role=_get("role", "taker"),  # type: ignore[arg-type]
+            role=cast(HistoryRole, _get("role", "taker")),
             success=_get("success", "True").lower() == "true",
             failure_reason=_get("failure_reason"),
             confirmations=int(_get("confirmations", "0") or 0),
@@ -398,6 +438,14 @@ def _row_to_entry(row: Mapping[str, str | None]) -> TransactionHistoryEntry | No
             broadcast_method=_get("broadcast_method"),
             network=_get("network", "mainnet"),
             wallet_fingerprint=_get("wallet_fingerprint"),
+            # Rows written before the column existed (or by a corrupted
+            # writer) default to the authoritative "protocol" provenance.
+            source=cast(
+                HistorySource,
+                _get("source", "protocol")
+                if _get("source", "protocol") in VALID_HISTORY_SOURCES
+                else "protocol",
+            ),
         )
     except (ValueError, KeyError) as e:
         logger.warning(f"Skipping malformed history row: {e}")
@@ -494,7 +542,7 @@ def _write_history_entries_atomic(
 def read_history(
     data_dir: Path | None = None,
     limit: int | None = None,
-    role_filter: Literal["maker", "taker", "send"] | None = None,
+    role_filter: HistoryRole | None = None,
     wallet_fingerprint: str | None = None,
 ) -> list[TransactionHistoryEntry]:
     """
@@ -621,6 +669,9 @@ def format_yield_generator_report(
     Earn report UI discards), and one row per *successful* maker CoinJoin from
     ``history.csv`` (the row's ``fee_received`` is the cjfee earned, and
     ``net_fee`` is the amount earned after the mining-fee contribution).
+    Reconstructed on-chain guesses are excluded because their maker role and
+    gross cjfee cannot be established from public transaction data, while this
+    compatibility report has no provenance field and promises exact earnings.
 
     The ``my input value/satoshi`` column is reported as ``0`` because the
     per-input values are not retained in the history log; the earnings columns
@@ -643,7 +694,7 @@ def format_yield_generator_report(
     )
     # read_history returns most-recent-first; the statement reads chronologically.
     for entry in sorted(entries, key=lambda e: e.timestamp):
-        if not entry.success:
+        if not entry.success or entry.source != "protocol":
             continue
         input_count = len(_parse_utxos(entry.utxos_used))
         row = [
@@ -664,7 +715,7 @@ def format_yield_generator_report(
 def count_other_wallet_entries(
     data_dir: Path | None = None,
     wallet_fingerprint: str | None = None,
-    role_filter: Literal["maker", "taker", "send"] | None = None,
+    role_filter: HistoryRole | None = None,
 ) -> int:
     """Count history rows that a per-wallet view hides for ``wallet_fingerprint``.
 
@@ -697,6 +748,45 @@ def count_other_wallet_entries(
         logger.warning(f"Failed to count other-wallet history entries: {e}")
         return 0
     return hidden
+
+
+def purge_reconstructed_entries(
+    data_dir: Path | None = None,
+    wallet_fingerprint: str | None = None,
+) -> int:
+    """Remove on-chain-reconstructed rows (``source="onchain"``) from history.
+
+    Used by ``jm-wallet reconstruct-history`` to rebuild the guessed portion
+    of a wallet's history from scratch without touching authoritative
+    protocol-time rows. When ``wallet_fingerprint`` is given, only that
+    wallet's reconstructed rows are removed.
+
+    Returns:
+        The number of rows removed.
+
+    Raises:
+        HistoryWriteError: If the pruned file cannot be written back.
+    """
+    history_path = _get_history_path(data_dir)
+    if not history_path.exists():
+        return 0
+
+    entries = read_history(data_dir)
+    kept = [
+        e
+        for e in entries
+        if not (
+            e.source == "onchain"
+            and (wallet_fingerprint is None or e.wallet_fingerprint == wallet_fingerprint)
+        )
+    ]
+    removed = len(entries) - len(kept)
+    if removed == 0:
+        return 0
+    if not _write_history_entries_atomic(kept, history_path):
+        raise HistoryWriteError(f"Failed to rewrite {history_path} after purging entries")
+    logger.info(f"Purged {removed} reconstructed history entries")
+    return removed
 
 
 def list_history_fingerprints(data_dir: Path | None = None) -> list[str]:
@@ -855,7 +945,7 @@ def get_history_stats(
 
 def get_history_stats_for_period(
     hours: float,
-    role_filter: Literal["maker", "taker", "send"] | None = None,
+    role_filter: HistoryRole | None = None,
     data_dir: Path | None = None,
     wallet_fingerprint: str | None = None,
 ) -> dict[str, int | float]:
@@ -1784,7 +1874,9 @@ def get_address_history_types(
         # recorded only to keep their addresses marked as used; classifying their
         # destination as "cj_out" or change as "change" would mislabel them as
         # CoinJoin outputs and create false privacy expectations (issue #517).
-        if entry.role == "send":
+        # Reconstructed deposits are likewise ordinary receives, not CoinJoin
+        # outputs.
+        if entry.role in ("send", "deposit"):
             continue
 
         if entry.destination_address:

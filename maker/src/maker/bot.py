@@ -463,6 +463,7 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
             else:
                 # Use standard sync (BIP157/158 for neutrino, mempool API, etc.)
                 await self.wallet.sync_all(fidelity_bond_addresses)
+            await self.wallet.reconstruct_imported_state_safe()
 
             # Update bond registry with UTXO info from the scan (only if using registry)
             if self.config.fidelity_bond_index is None and fidelity_bond_addresses:
@@ -573,6 +574,7 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
                     await self.wallet.sync_with_descriptor_wallet()
                 else:
                     await self.wallet.sync_all()
+                await self.wallet.reconstruct_imported_state_safe()
                 total_balance = await self.wallet.get_total_balance()
                 logger.info(f"Wallet re-synced. Total balance: {total_balance:,} sats")
 
@@ -787,6 +789,7 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
             await self.wallet.sync_with_descriptor_wallet(self._fidelity_bond_addresses)
         else:
             await self.wallet.sync_all(self._fidelity_bond_addresses)
+        await self.wallet.reconstruct_imported_state_safe()
 
         # Update current block height
         self.current_block_height = await self.backend.get_block_height()

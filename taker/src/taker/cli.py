@@ -356,6 +356,7 @@ async def _run_coinjoin(
         scan_range=config.scan_range,
         data_dir=config.data_dir,
         max_sats_freeze_reuse=config.max_sats_freeze_reuse,
+        reconstruct_history=config.reconstruct_history,
     )
 
     # Create confirmation callback
@@ -642,6 +643,7 @@ async def _run_tumble(
         scan_range=config.scan_range,
         data_dir=config.data_dir,
         max_sats_freeze_reuse=config.max_sats_freeze_reuse,
+        reconstruct_history=config.reconstruct_history,
     )
 
     # Create taker

@@ -98,6 +98,13 @@ class WalletSyncMixin:
     _canonical_bond_addresses: dict[str, tuple[int, int]] | None
     # Guards the once-per-process import-label reconstruction pass.
     _imported_labels_scanned: bool
+    # Guards the once-per-process import-history reconstruction pass.
+    _imported_history_scanned: bool
+    # Tracks a deferred/capped imported backfill within this process.
+    _imported_history_started: bool
+    # Config toggle ([wallet] reconstruct_history): when False, no on-chain
+    # history rows are ever reconstructed automatically.
+    reconstruct_history_enabled: bool
     # Forced-address-reuse defense state (see WalletService.__init__): addresses
     # and outpoints this process has positively observed funded across syncs.
     _observed_funded_addresses: set[str]
@@ -244,12 +251,108 @@ class WalletSyncMixin:
         parts = path.split("/")
         return len(parts) >= 2 and parts[-2] == "0"
 
-    async def _reconstruct_imported_labels_safe(self) -> None:
-        """Best-effort wrapper: label reconstruction must never break a sync."""
+    async def reconstruct_imported_state_safe(self) -> None:
+        """Best-effort wrapper: history/label reconstruction must never break a sync."""
+        try:
+            await self.reconstruct_imported_history()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug(f"Import history reconstruction skipped: {exc}")
         try:
             await self.reconstruct_imported_labels()
         except Exception as exc:  # pragma: no cover - defensive
             logger.debug(f"Import label reconstruction skipped: {exc}")
+
+    async def reconstruct_imported_history(
+        self,
+        *,
+        force: bool = False,
+        max_transactions: int = 1000,
+    ) -> int:
+        """Reconstruct CoinJoin/send/deposit history rows from chain data.
+
+        A wallet recovered from seed has no ``history.csv`` rows, so past
+        CoinJoins (role, fees, peers), sends, and deposits are invisible.
+        This pass enumerates the wallet's confirmed on-chain transactions,
+        classifies each with the same equal-output heuristic the legacy
+        client uses, and persists best-effort rows tagged ``source="onchain"``
+        (see :mod:`jmwallet.history_reconstruction`).
+
+        The automatic pass (run after every bond-aware sync) is conservative:
+        it starts only when the wallet has no history, but can continue when
+        earlier capped passes already wrote on-chain rows. It runs at most once
+        per process after completing the backlog and never touches existing
+        rows. The ``jm-wallet reconstruct-history`` CLI uses ``force=True`` to
+        re-run after purging previous on-chain rows.
+
+        Args:
+            force: Re-run even if the wallet already has history rows or a
+                pass already completed in this process.
+            max_transactions: Safety cap on transactions classified per pass.
+
+        Returns:
+            The number of history rows created.
+        """
+        if self.data_dir is None:
+            return 0
+        if not force:
+            if not getattr(self, "reconstruct_history_enabled", True):
+                return 0
+            if getattr(self, "_imported_history_scanned", False):
+                return 0
+        if not getattr(self.backend, "supports_tx_enumeration", False):
+            self._imported_history_scanned = True
+            return 0
+
+        from jmwallet.history import read_history
+        from jmwallet.history_reconstruction import reconstruct_history_from_chain
+
+        existing = read_history(self.data_dir, wallet_fingerprint=self.wallet_fingerprint)
+        if not existing:
+            self._imported_history_started = True
+        elif (
+            not force
+            and not self._imported_history_started
+            and not any(entry.source == "onchain" for entry in existing)
+        ):
+            # A wallet whose history is entirely protocol-recorded is not an
+            # imported-history backfill. Once an empty wallet has entered the
+            # workflow, however, protocol activity must not cancel a pass that
+            # was deferred while Core completed its background rescan.
+            self._imported_history_scanned = True
+            return 0
+
+        # Bitcoin Core's default recovery path starts with a recent smart scan
+        # and continues with a full rescan in the background. Reconstructing
+        # while that rescan is active would persist a partial history and make
+        # the result look complete. Leave the process guard unset so the next
+        # sync retries after Core finishes.
+        if not force and isinstance(self.backend, DescriptorWalletBackend):
+            status = await self.backend.get_rescan_status()
+            if not isinstance(status, dict):
+                logger.info(
+                    "Deferring imported history reconstruction because Bitcoin Core "
+                    "rescan status is unavailable"
+                )
+                return 0
+            if status.get("in_progress"):
+                logger.info(
+                    "Deferring imported history reconstruction until the active "
+                    "Bitcoin Core rescan completes"
+                )
+                return 0
+
+        result = await reconstruct_history_from_chain(
+            self.backend,
+            address_paths=self.address_cache,
+            network=self.network,
+            wallet_fingerprint=self.wallet_fingerprint,
+            data_dir=self.data_dir,
+            max_transactions=max_transactions,
+        )
+        # A capped pass has more backlog. Keep the guard unset so a later sync
+        # in this process continues after the already-persisted txids.
+        self._imported_history_scanned = not result.capped
+        return result.created
 
     async def reconstruct_imported_labels(
         self,
@@ -910,7 +1013,7 @@ class WalletSyncMixin:
         if not isinstance(self.backend, DescriptorWalletBackend):
             # Non-descriptor backends scan bond addresses directly in sync_all.
             result = await self.sync_all(bond_addresses or None)
-            await self._reconstruct_imported_labels_safe()
+            await self.reconstruct_imported_state_safe()
             return result
 
         # Ensure the base descriptor wallet exists before scanning. This is a
@@ -941,7 +1044,7 @@ class WalletSyncMixin:
                 await self.import_fidelity_bond_addresses(missing, rescan=True)
 
         result = await self.sync_with_descriptor_wallet(bond_addresses or None)
-        await self._reconstruct_imported_labels_safe()
+        await self.reconstruct_imported_state_safe()
         return result
 
     async def _imported_bond_addresses(self) -> set[str]:

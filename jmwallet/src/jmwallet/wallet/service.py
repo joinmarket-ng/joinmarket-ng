@@ -57,6 +57,7 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin, Wal
         data_dir: Path | None = None,
         passphrase: str = "",
         max_sats_freeze_reuse: int = -1,
+        reconstruct_history: bool = True,
     ):
         self.backend = backend
         self.network = network
@@ -126,6 +127,18 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin, Wal
         # running are either this wallet's own CoinJoins (recorded in history)
         # or genuine deposits, so only the imported backlog needs scanning.
         self._imported_labels_scanned: bool = False
+        # Guards the once-per-process import-history reconstruction pass (see
+        # WalletSyncMixin.reconstruct_imported_history). The automatic pass
+        # only fires for wallets with no recorded history (seed imports);
+        # ``reconstruct_history`` maps the [wallet] reconstruct_history config
+        # toggle.
+        self._imported_history_scanned: bool = False
+        # True once an empty-history wallet has entered the imported-history
+        # workflow, even if reconstruction was deferred for a Core rescan.
+        # This keeps a protocol row written during that rescan from cancelling
+        # the pending backfill later in the same process.
+        self._imported_history_started: bool = False
+        self.reconstruct_history_enabled: bool = reconstruct_history
 
         # UTXO + address metadata store (BIP-329 JSONL). Frozen UTXO state,
         # output labels, and the persistent "addresses with on-chain history"

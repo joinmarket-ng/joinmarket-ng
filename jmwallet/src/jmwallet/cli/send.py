@@ -174,6 +174,7 @@ def send(
             creation_height=resolved_creation_height,
             max_fee_rate_sat_vb=max_fee_rate,
             max_sats_freeze_reuse=settings.wallet.max_sats_freeze_reuse,
+            reconstruct_history=settings.wallet.reconstruct_history,
         )
     )
 
@@ -194,6 +195,7 @@ async def _send_transaction(
     creation_height: int | None = None,
     max_fee_rate_sat_vb: float = MAX_MANUAL_FEE_RATE_SAT_VB,
     max_sats_freeze_reuse: int = -1,
+    reconstruct_history: bool = True,
 ) -> None:
     """Send transaction implementation."""
     from jmwallet.backends.descriptor_wallet import (
@@ -295,6 +297,7 @@ async def _send_transaction(
         passphrase=bip39_passphrase,
         data_dir=backend_settings.data_dir,
         max_sats_freeze_reuse=max_sats_freeze_reuse,
+        reconstruct_history=reconstruct_history,
     )
 
     try:

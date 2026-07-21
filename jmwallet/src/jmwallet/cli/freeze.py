@@ -121,6 +121,7 @@ def freeze(
             mixdepth_filter=mixdepth,
             creation_height=resolved_creation_height,
             max_sats_freeze_reuse=settings.wallet.max_sats_freeze_reuse,
+            reconstruct_history=settings.wallet.reconstruct_history,
         )
     )
 
@@ -133,6 +134,7 @@ async def _freeze_utxos(
     *,
     creation_height: int | None = None,
     max_sats_freeze_reuse: int = -1,
+    reconstruct_history: bool = True,
 ) -> None:
     """Interactive UTXO freeze/unfreeze implementation."""
     from jmwallet.backends.descriptor_wallet import DescriptorWalletBackend
@@ -190,6 +192,7 @@ async def _freeze_utxos(
         passphrase=bip39_passphrase,
         data_dir=data_dir,
         max_sats_freeze_reuse=max_sats_freeze_reuse,
+        reconstruct_history=reconstruct_history,
     )
 
     try:

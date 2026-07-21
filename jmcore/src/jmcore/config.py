@@ -284,6 +284,17 @@ class WalletConfig(BaseModel):
         ),
     )
 
+    # On-chain history reconstruction for imported wallets
+    reconstruct_history: bool = Field(
+        default=True,
+        description=(
+            "Automatically reconstruct CoinJoin/send/deposit history from "
+            "on-chain data for wallets imported from seed (wallets with no "
+            "recorded history). Reconstructed rows are tagged as on-chain "
+            "guesses and never override protocol-time history."
+        ),
+    )
+
     # Descriptor wallet scan configuration
     smart_scan: bool = Field(
         default=True,

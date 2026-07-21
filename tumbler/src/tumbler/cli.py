@@ -889,9 +889,10 @@ async def _balances_for_mnemonic(
         mixdepth_count=config.mixdepth_count,
         data_dir=config.data_dir,
         max_sats_freeze_reuse=config.max_sats_freeze_reuse,
+        reconstruct_history=config.reconstruct_history,
     )
     try:
-        await wallet.sync()
+        await wallet.sync_with_registered_bonds()
     except AttributeError:
         # Older WalletService revisions sync lazily; balances will still work.
         pass
@@ -993,9 +994,10 @@ async def _run_plan(
         mixdepth_count=taker_config.mixdepth_count,
         data_dir=taker_config.data_dir,
         max_sats_freeze_reuse=taker_config.max_sats_freeze_reuse,
+        reconstruct_history=taker_config.reconstruct_history,
     )
     try:
-        await wallet.sync()
+        await wallet.sync_with_registered_bonds()
     except AttributeError:
         pass
 

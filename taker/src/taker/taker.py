@@ -225,6 +225,7 @@ class Taker(TakerMonitoringMixin):
         else:
             # Use standard sync (BIP157/158 for neutrino, mempool API, etc.)
             await self.wallet.sync_all()
+        await self.wallet.reconstruct_imported_state_safe()
 
         total_balance = await self.wallet.get_total_balance()
         logger.info(f"Wallet synced. Total balance: {total_balance:,} sats")

@@ -182,6 +182,14 @@
 # Release a frozen UTXO with `jm-wallet unfreeze`.
 # max_sats_freeze_reuse = -1
 
+# Automatically reconstruct CoinJoin/send/deposit history from on-chain data
+# for wallets imported from seed (wallets with no recorded history). Uses the
+# same equal-output CoinJoin heuristic as the legacy client to guess each
+# transaction's role (maker/taker/send/deposit) and fees. Reconstructed rows
+# are tagged as on-chain guesses and never override protocol-recorded history.
+# Manual control: `jm-wallet reconstruct-history`.
+# reconstruct_history = true
+
 # Smart wallet scanning optimizations
 # When importing an existing wallet, initial sync scans recent blocks for fast startup.
 # A full background rescan runs afterward to ensure no transactions are missed.
