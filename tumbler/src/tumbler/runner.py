@@ -164,6 +164,22 @@ class TumbleRunner:
                     return self.plan
                 await self._run_one_phase(phase)
                 if phase.status == PhaseStatus.FAILED:
+                    if isinstance(phase, MakerSessionPhase):
+                        # Maker sessions are optional privacy enhancers: a
+                        # failed session (e.g. transient Tor trouble) must not
+                        # kill the whole tumble. Per the documented design a
+                        # failed maker session is not retried; mark it SKIPPED
+                        # (keeping the error text for operators) and proceed.
+                        logger.warning(
+                            "tumbler phase {}: maker session failed ({}); "
+                            "continuing with the next phase",
+                            phase.index,
+                            phase.error,
+                        )
+                        phase.status = PhaseStatus.SKIPPED
+                        self.plan.current_phase += 1
+                        self._persist()
+                        continue
                     if await self._mark_skipped_if_unfunded(phase):
                         # Nothing to mix in that mixdepth: advance without
                         # retries, confirmation gate (no txid was broadcast)

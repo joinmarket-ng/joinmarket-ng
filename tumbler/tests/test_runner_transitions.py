@@ -996,6 +996,46 @@ class TestRunnerMakerPhase:
         for mp in maker_phases:
             assert mp.cj_served == 0
 
+    async def test_failed_maker_session_is_skipped_not_fatal(self, tmp_path: Path) -> None:
+        """A crashing maker session must not fail the whole plan.
+
+        Maker sessions are optional privacy enhancers; per the documented
+        design a failed session is not retried and the runner proceeds with
+        the next phase (marking the session SKIPPED, error preserved).
+        """
+        plan = _plan(tmp_path, include_maker=True)
+        maker_phases = [p for p in plan.phases if isinstance(p, MakerSessionPhase)]
+        assert maker_phases, "expected at least one maker session"
+        for mp in maker_phases:
+            mp.duration_seconds = 0.05
+
+        class CrashingMaker(FakeMaker):
+            async def start(self) -> None:
+                raise RuntimeError("tor unavailable")
+
+        async def make_taker(phase: Any) -> FakeTaker:
+            return FakeTaker(phase)
+
+        async def make_maker(phase: MakerSessionPhase) -> CrashingMaker:
+            return CrashingMaker(phase)
+
+        ctx = RunnerContext(
+            wallet_service=FakeWalletService(),  # type: ignore[arg-type]
+            wallet_name="RunnerTest",
+            data_dir=tmp_path,
+            taker_factory=make_taker,
+            maker_factory=make_maker,
+        )
+        result = await TumbleRunner(plan, ctx).run()
+
+        assert result.status == PlanStatus.COMPLETED
+        for mp in maker_phases:
+            assert mp.status == PhaseStatus.SKIPPED
+            assert mp.error is not None and "tor unavailable" in mp.error
+        # All taker phases still ran to completion.
+        taker_phases = [p for p in result.phases if isinstance(p, TakerCoinjoinPhase)]
+        assert all(p.status == PhaseStatus.COMPLETED for p in taker_phases)
+
 
 # --------------------------------------------------------------- taker-interop
 
