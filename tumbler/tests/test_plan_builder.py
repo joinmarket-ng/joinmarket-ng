@@ -195,3 +195,27 @@ class TestPlanBuilder:
             if isinstance(p, TakerCoinjoinPhase) and p.amount_fraction is not None
         }
         assert last.mixdepth not in fractional_mixdepths
+
+    @pytest.mark.parametrize("mintxcount", [1, 2, 3, 5])
+    def test_mintxcount_counts_include_the_sweep(self, mintxcount: int) -> None:
+        """``mintxcount`` includes the trailing sweep (reference semantics).
+
+        Each non-terminal stage-2 mixdepth gets ``mintxcount - 1`` fractional
+        CJs before its sweep, so e.g. ``mintxcount=3`` yields 2 fractional
+        CJs + 1 sweep. Values below 2 behave as 2: at least one fractional CJ
+        is always emitted. Pins the semantics documented on
+        :attr:`TumbleParameters.mintxcount`.
+        """
+        plan = PlanBuilder("w", _params(mintxcount=mintxcount)).build()
+        per_mixdepth: dict[int, int] = {}
+        for p in plan.phases:
+            if isinstance(p, TakerCoinjoinPhase) and p.amount_fraction is not None:
+                per_mixdepth[p.mixdepth] = per_mixdepth.get(p.mixdepth, 0) + 1
+        expected = max(mintxcount - 1, 1)
+        # Only non-terminal chain mixdepths carry fractional phases; the
+        # terminal mixdepth is sweep-only (covered by the test above).
+        assert per_mixdepth, "plan has no fractional phases"
+        assert all(count == expected for count in per_mixdepth.values()), (
+            f"expected {expected} fractional CJs per mixdepth "
+            f"(mintxcount={mintxcount} includes the sweep); got {per_mixdepth}"
+        )
