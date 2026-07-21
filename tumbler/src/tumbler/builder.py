@@ -81,7 +81,14 @@ class TumbleParameters:
     within this many seconds. Useful as a safety fallback when the wallet is
     never selected as a counterparty."""
     mintxcount: int = 2
-    """Minimum number of destination-bearing taker CJs per mixdepth (excluding sweep)."""
+    """Taker CJs per stage-2 mixdepth, including the final sweep.
+
+    Each non-terminal chain mixdepth gets ``mintxcount - 1`` fractional CJs
+    followed by one sweep, so the count matches the reference tumbler's
+    ``mintxcount`` (which also counts the sweep). Values below 2 behave as 2:
+    at least one fractional CJ is always emitted before the sweep. The
+    terminal chain mixdepth is always sweep-only regardless of this value.
+    """
     max_phase_retries: int = 3
     """Maximum re-tries per failed taker CoinJoin phase before the plan fails."""
     rounding_chance: float = 0.25
