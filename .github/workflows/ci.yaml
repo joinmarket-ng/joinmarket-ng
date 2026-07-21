@@ -8,6 +8,16 @@ on:
     # Fork PRs are gated by GitHub's fork-workflow approval before this starts.
     # Run from the base repository context, then explicitly check out the PR head
     # so the shared-image CI pipeline exercises the contributor's code.
+    #
+    # Since June 2026, actions/checkout refuses fork-head checkouts under
+    # pull_request_target by default (pwn-request hardening), so every such
+    # checkout step opts out via `allow-unsafe-pr-checkout: true`. This is a
+    # deliberate decision: fork runs require maintainer approval, checkouts use
+    # `persist-credentials: false`, the GITHUB_TOKEN is limited to
+    # `contents: read` plus `packages: write` for CI-scoped image tags, build
+    # caches are per-PR scoped, and CI images are quarantined under
+    # `ci-unsafe-do-not-run-*` tags. See
+    # https://gh.io/securely-using-pull_request_target
   workflow_dispatch:
   workflow_call:
 
@@ -80,6 +90,8 @@ jobs:
           repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+          # Intentional fork checkout; see the pull_request_target note at the top.
+          allow-unsafe-pr-checkout: true
 
       - name: Get Git commit timestamp for reproducible builds
         run: echo "SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)" >> $GITHUB_ENV
@@ -130,6 +142,8 @@ jobs:
           repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+          # Intentional fork checkout; see the pull_request_target note at the top.
+          allow-unsafe-pr-checkout: true
 
       - uses: actions/setup-python@v6
         with:
@@ -156,6 +170,8 @@ jobs:
           repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+          # Intentional fork checkout; see the pull_request_target note at the top.
+          allow-unsafe-pr-checkout: true
       - uses: ./.github/actions/setup-python-deps
         with:
           python-version: ${{ matrix.python-version }}
@@ -224,6 +240,8 @@ jobs:
           repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+          # Intentional fork checkout; see the pull_request_target note at the top.
+          allow-unsafe-pr-checkout: true
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
@@ -246,6 +264,8 @@ jobs:
           repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+          # Intentional fork checkout; see the pull_request_target note at the top.
+          allow-unsafe-pr-checkout: true
       - name: Real install via install.sh (this branch HEAD, unsigned)
         # Install from the workflow ref so install-time CI exercises the
         # exact code under review. The release tarball + GPG verification
@@ -294,6 +314,8 @@ jobs:
           repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+          # Intentional fork checkout; see the pull_request_target note at the top.
+          allow-unsafe-pr-checkout: true
       - name: Lint script (bash -n)
         run: bash -n install.sh
       - name: install.sh --help works on macOS bash
@@ -349,6 +371,8 @@ jobs:
           repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+          # Intentional fork checkout; see the pull_request_target note at the top.
+          allow-unsafe-pr-checkout: true
       - name: Lint script (bash -n)
         run: bash -n install.sh
       - name: install.sh --help works under git-bash
@@ -483,6 +507,8 @@ jobs:
           repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+          # Intentional fork checkout; see the pull_request_target note at the top.
+          allow-unsafe-pr-checkout: true
       - uses: ./.github/actions/setup-python-deps
         with:
           components: jmcore,jmwallet,directory_server,orderbook_watcher,maker,taker,jmwalletd,tumbler
@@ -603,6 +629,8 @@ jobs:
           repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+          # Intentional fork checkout; see the pull_request_target note at the top.
+          allow-unsafe-pr-checkout: true
       - uses: ./.github/actions/setup-python-deps
         with:
           components: jmcore,jmwallet,directory_server,orderbook_watcher,maker,taker,jmwalletd,tumbler
@@ -734,6 +762,8 @@ jobs:
           repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+          # Intentional fork checkout; see the pull_request_target note at the top.
+          allow-unsafe-pr-checkout: true
 
       - name: Set up Node.js
         uses: actions/setup-node@v6
@@ -897,6 +927,8 @@ jobs:
           repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+          # Intentional fork checkout; see the pull_request_target note at the top.
+          allow-unsafe-pr-checkout: true
       - uses: ./.github/actions/setup-python-deps
         with:
           components: jmcore,jmwallet
@@ -970,6 +1002,8 @@ jobs:
           repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+          # Intentional fork checkout; see the pull_request_target note at the top.
+          allow-unsafe-pr-checkout: true
       - uses: ./.github/actions/setup-python-deps
         with:
           components: jmcore,jmwallet,directory_server,orderbook_watcher,maker,taker
@@ -1128,6 +1162,8 @@ jobs:
           repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+          # Intentional fork checkout; see the pull_request_target note at the top.
+          allow-unsafe-pr-checkout: true
       - uses: ./.github/actions/setup-python-deps
         with:
           components: jmcore,jmwallet,directory_server,orderbook_watcher,maker,taker
@@ -1286,6 +1322,8 @@ jobs:
           repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+          # Intentional fork checkout; see the pull_request_target note at the top.
+          allow-unsafe-pr-checkout: true
       - uses: ./.github/actions/setup-python-deps
         with:
           components: jmcore,jmwallet,directory_server,orderbook_watcher,maker,taker
@@ -1410,6 +1448,8 @@ jobs:
           repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+          # Intentional fork checkout; see the pull_request_target note at the top.
+          allow-unsafe-pr-checkout: true
       - uses: ./.github/actions/setup-python-deps
         with:
           components: jmcore,jmwallet,directory_server,orderbook_watcher,maker,taker
@@ -1545,6 +1585,8 @@ jobs:
           repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+          # Intentional fork checkout; see the pull_request_target note at the top.
+          allow-unsafe-pr-checkout: true
       - uses: ./.github/actions/setup-python-deps
         with:
           components: jmcore,jmwallet,directory_server,orderbook_watcher,maker,taker
@@ -1715,6 +1757,8 @@ jobs:
           repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+          # Intentional fork checkout; see the pull_request_target note at the top.
+          allow-unsafe-pr-checkout: true
       - uses: ./.github/actions/setup-python-deps
         with:
           components: jmcore,jmwallet,directory_server,orderbook_watcher,maker,taker
