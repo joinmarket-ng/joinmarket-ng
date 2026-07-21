@@ -199,3 +199,11 @@ modules:
     sources:
       - type: dir
         path: ..
+        # Directory sources do not honor Git ignore rules. Exclude local state
+        # that is unnecessary for the build and may be owned by containers.
+        skip:
+          - .git
+          - .flatpak-builder
+          - build-dir
+          - flatpak-repo
+          - tmp
