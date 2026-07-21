@@ -7,9 +7,10 @@ This script automates the release process by:
 2. Generating changelog entries from commit trailers (feat/fix only)
 3. Updating the CHANGELOG.md with version and date
 4. Updating install.sh DEFAULT_VERSION
-5. Creating a git commit with a standard message
-6. Creating a git tag
-7. Pushing the changes and tag (default, use --no-push to skip)
+5. Updating the Flatpak AppStream release metadata
+6. Creating a git commit with a standard message
+7. Creating a git tag
+8. Pushing the changes and tag (default, use --no-push to skip)
 
 Usage:
     python scripts/bump_version.py patch          # 0.10.0 -> 0.10.1
@@ -23,6 +24,7 @@ The script will:
 - Update jmcore/src/jmcore/version.py
 - Update all pyproject.toml files
 - Update install.sh DEFAULT_VERSION
+- Update flatpak/org.joinmarketng.JamNG.metainfo.xml
 - Update CHANGELOG.md (change [Unreleased] to [X.Y.Z] - YYYY-MM-DD)
 - Add diff link at the bottom of CHANGELOG.md
 - Commit with message "release: X.Y.Z"
@@ -37,6 +39,7 @@ import os
 import re
 import subprocess
 import sys
+import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
 from typing import Literal
@@ -48,6 +51,7 @@ PROJECT_ROOT = Path(__file__).parent.parent
 VERSION_FILE = PROJECT_ROOT / "jmcore" / "src" / "jmcore" / "version.py"
 INSTALL_SCRIPT = PROJECT_ROOT / "install.sh"
 CHANGELOG = PROJECT_ROOT / "CHANGELOG.md"
+FLATPAK_METAINFO = PROJECT_ROOT / "flatpak" / "org.joinmarketng.JamNG.metainfo.xml"
 
 # All pyproject.toml files to update
 PYPROJECT_FILES = [
@@ -176,6 +180,54 @@ def update_install_script(new_version: str, dry_run: bool = False) -> None:
         print(f"Updated {INSTALL_SCRIPT}")
 
 
+def update_flatpak_metainfo(
+    new_version: str,
+    dry_run: bool = False,
+    release_date: str | None = None,
+) -> None:
+    """Prepend the release to the Flatpak AppStream metadata."""
+    content = FLATPAK_METAINFO.read_text(encoding="utf-8")
+    root = ET.fromstring(content)
+    releases = root.find("releases")
+    if releases is None:
+        raise RuntimeError(f"No <releases> element in {FLATPAK_METAINFO}")
+
+    release_date = release_date or datetime.now().strftime("%Y-%m-%d")
+    matching_release = next(
+        (
+            release
+            for release in releases.findall("release")
+            if release.get("version") == new_version
+        ),
+        None,
+    )
+    if matching_release is None:
+        marker = "  <releases>\n"
+        if marker not in content:
+            raise RuntimeError(
+                f"Could not locate <releases> insertion point in {FLATPAK_METAINFO}"
+            )
+        release = f'    <release version="{new_version}" date="{release_date}"/>\n'
+        new_content = content.replace(marker, marker + release, 1)
+    else:
+        current_date = matching_release.get("date")
+        if current_date is None:
+            raise RuntimeError(
+                f"Flatpak release {new_version} has no date in {FLATPAK_METAINFO}"
+            )
+        old_attributes = f'version="{new_version}" date="{current_date}"'
+        new_attributes = f'version="{new_version}" date="{release_date}"'
+        new_content = content.replace(old_attributes, new_attributes, 1)
+
+    ET.fromstring(new_content)
+    if dry_run:
+        print(f"Would update {FLATPAK_METAINFO}")
+        print(f'  <release version="{new_version}" date="{release_date}"/>')
+    else:
+        FLATPAK_METAINFO.write_text(new_content, encoding="utf-8")
+        print(f"Updated {FLATPAK_METAINFO}")
+
+
 def update_changelog(
     new_version: str, current_version: str, dry_run: bool = False
 ) -> None:
@@ -285,6 +337,7 @@ def git_commit_and_tag(
         str(VERSION_FILE.relative_to(PROJECT_ROOT)),
         str(INSTALL_SCRIPT.relative_to(PROJECT_ROOT)),
         str(CHANGELOG.relative_to(PROJECT_ROOT)),
+        str(FLATPAK_METAINFO.relative_to(PROJECT_ROOT)),
     ]
     files_to_stage.extend(str(f.relative_to(PROJECT_ROOT)) for f in PYPROJECT_FILES)
 
@@ -413,6 +466,7 @@ def main() -> None:
     update_version_file(new_version, dry_run=args.dry_run)
     update_pyproject_files(new_version, dry_run=args.dry_run)
     update_install_script(new_version, dry_run=args.dry_run)
+    update_flatpak_metainfo(new_version, dry_run=args.dry_run)
     update_changelog(new_version, current_version, dry_run=args.dry_run)
     open_editor_for_changelog(dry_run=args.dry_run)
     print()
