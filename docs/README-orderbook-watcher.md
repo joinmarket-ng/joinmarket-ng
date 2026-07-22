@@ -15,8 +15,11 @@ python -m pip install -e ./orderbook_watcher
 Run:
 
 ```bash
-orderbook-watcher
+jm-orderbook-watcher
 ```
+
+The former `orderbook-watcher` command still works but is deprecated and
+will be removed in a future release.
 
 ## Configuration
 

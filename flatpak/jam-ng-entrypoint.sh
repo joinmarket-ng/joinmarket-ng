@@ -141,7 +141,7 @@ CLI commands (pass-through to installed tools):
   jam-ng cli jm-wallet balance <wallet>       Show wallet balance
   jam-ng cli jm-taker coinjoin [args...]      Run a CoinJoin as taker
   jam-ng cli jm-maker [args...]               Run the yield generator
-  jam-ng cli orderbook-watcher                Start the orderbook watcher
+  jam-ng cli jm-orderbook-watcher             Start the orderbook watcher
   jam-ng cli jmwalletd [args...]              Start the wallet daemon
 
 Environment variables set for CLI commands:

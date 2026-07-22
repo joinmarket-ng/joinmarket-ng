@@ -36,7 +36,9 @@ dev = [
 ]
 
 [project.scripts]
-orderbook-watcher = "orderbook_watcher.main:main"
+jm-orderbook-watcher = "orderbook_watcher.main:main"
+# Deprecated alias, kept for backwards compatibility; warns and forwards.
+orderbook-watcher = "orderbook_watcher.main:main_deprecated"
 
 [tool.setuptools.packages.find]
 where = ["src"]

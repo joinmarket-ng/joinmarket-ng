@@ -219,5 +219,20 @@ def main() -> None:
         sys.exit(1)
 
 
+def main_deprecated() -> None:
+    """Entry point for the deprecated ``orderbook-watcher`` console script.
+
+    The command was renamed to ``jm-orderbook-watcher`` for consistency with
+    the other JoinMarket NG CLIs. This alias keeps existing setups working
+    but warns so users migrate before it is removed in a future release.
+    """
+    print(
+        "Warning: the 'orderbook-watcher' command is deprecated and will be "
+        "removed in a future release; use 'jm-orderbook-watcher' instead.",
+        file=sys.stderr,
+    )
+    main()
+
+
 if __name__ == "__main__":
     main()
