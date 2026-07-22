@@ -12,7 +12,9 @@ from typing import Annotated
 
 import typer
 
-app = typer.Typer(
+from jmcore.cli_help import SortedTyper
+
+app = SortedTyper(
     name="jmwalletd",
     help="JoinMarket wallet daemon - JAM-compatible HTTP/WebSocket API.",
 )

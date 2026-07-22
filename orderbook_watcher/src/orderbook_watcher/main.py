@@ -11,6 +11,7 @@ import signal
 import sys
 from typing import TYPE_CHECKING
 
+from jmcore.cli_common import SortedHelpFormatter
 from jmcore.crypto import NickIdentity
 from jmcore.notifications import get_notifier
 from jmcore.paths import remove_nick_state, write_nick_state
@@ -197,7 +198,10 @@ def main() -> None:
     # Disable core dumps and ptrace; the watcher holds NaCl session keys.
     harden_current_process()
 
-    parser = argparse.ArgumentParser(description="JoinMarket Orderbook Watcher")
+    parser = argparse.ArgumentParser(
+        description="JoinMarket Orderbook Watcher",
+        formatter_class=SortedHelpFormatter,
+    )
     parser.add_argument(
         "--log-level",
         "-l",

@@ -26,6 +26,7 @@ from jmcore.cli_common import (
     resolve_mnemonic,
     setup_cli,
 )
+from jmcore.cli_help import SortedTyper
 from loguru import logger
 
 from jmwallet.cli import app
@@ -33,7 +34,7 @@ from jmwallet.cli import app
 if TYPE_CHECKING:
     from jmwallet.wallet.service import WalletService
 
-address_app = typer.Typer(
+address_app = SortedTyper(
     name="address",
     help="Manage deposit addresses: reserve, label, release, and list.",
     no_args_is_help=True,

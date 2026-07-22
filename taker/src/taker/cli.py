@@ -16,6 +16,7 @@ from typing import Annotated, Any
 
 import typer
 from jmcore.cli_common import resolve_mnemonic, setup_cli
+from jmcore.cli_help import SortedTyper
 from jmcore.models import NetworkType
 from jmcore.notifications import get_notifier
 from jmcore.paths import remove_nick_state, write_nick_state
@@ -28,7 +29,7 @@ from taker.config_builder import build_taker_config
 
 __all__ = ["app", "build_taker_config", "create_backend"]
 
-app = typer.Typer(
+app = SortedTyper(
     name="jm-taker",
     help="JoinMarket Taker - Execute CoinJoin transactions",
     no_args_is_help=True,

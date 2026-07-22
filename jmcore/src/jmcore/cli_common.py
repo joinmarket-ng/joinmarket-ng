@@ -35,8 +35,10 @@ Usage:
 
 from __future__ import annotations
 
+import argparse
 import os
 import sys
+from collections.abc import Callable, Generator, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NoReturn
@@ -96,6 +98,72 @@ class ResolvedMnemonic:
     bip39_passphrase: str
     source: str  # Where the mnemonic came from (for logging)
     creation_height: int | None = None  # Block height at wallet creation time
+
+
+# =============================================================================
+# Help Formatting
+# =============================================================================
+
+
+class SortedHelpFormatter(argparse.HelpFormatter):
+    """Argparse help formatter that lists options and subcommands alphabetically.
+
+    - Optional arguments are sorted by their first long name (fallback: first
+      short name), case-insensitively, both in the options list and in the
+      usage synopsis.
+    - Positional arguments keep their declared order (it defines call syntax)
+      and stay ahead of the sorted options within mixed groups.
+    - Subcommand listings (from ``add_subparsers``) are sorted by name.
+
+    Typer-based CLIs get the same behavior from :mod:`jmcore.cli_help`.
+    """
+
+    @staticmethod
+    def _sort_key(action: argparse.Action) -> tuple[int, str]:
+        if not action.option_strings:
+            # Stable sort keeps positionals in declaration order, first.
+            return (0, "")
+        long_opts = [opt for opt in action.option_strings if opt.startswith("--")]
+        name = long_opts[0] if long_opts else action.option_strings[0]
+        return (1, name.lstrip("-").casefold())
+
+    def add_usage(
+        self,
+        usage: str | None,
+        actions: Iterable[argparse.Action],
+        groups: Iterable[Any],
+        prefix: str | None = None,
+    ) -> None:
+        super().add_usage(usage, sorted(actions, key=self._sort_key), groups, prefix)
+
+    def add_arguments(self, actions: Iterable[argparse.Action]) -> None:
+        super().add_arguments(sorted(actions, key=self._sort_key))
+
+    def _metavar_formatter(
+        self, action: argparse.Action, default_metavar: str
+    ) -> Callable[[int], tuple[str, ...]]:
+        if (
+            isinstance(action, argparse._SubParsersAction)  # noqa: SLF001
+            and action.metavar is None
+            and action.choices is not None
+        ):
+            # Sort the "{cmd1,cmd2,...}" usage metavar. Regular choices (e.g.
+            # log levels) keep their declared, often meaningful, order.
+            choices = ",".join(sorted(str(choice) for choice in action.choices))
+            result = f"{{{choices}}}"
+            return lambda tuple_size: (result,) * tuple_size
+        return super()._metavar_formatter(action, default_metavar)
+
+    def _iter_indented_subactions(
+        self, action: argparse.Action
+    ) -> Generator[argparse.Action, None, None]:
+        try:
+            get_subactions = action._get_subactions  # type: ignore[attr-defined]
+        except AttributeError:
+            return
+        self._indent()
+        yield from sorted(get_subactions(), key=lambda subaction: subaction.dest)
+        self._dedent()
 
 
 # =============================================================================

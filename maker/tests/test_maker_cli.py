@@ -23,6 +23,13 @@ def test_root_help_shows_completion_options() -> None:
     assert "--show-completion" in output
 
 
+def test_help_output_is_alphabetically_sorted() -> None:
+    """Subcommands and options must be listed alphabetically in --help."""
+    from jmcore.cli_help import find_unsorted_help
+
+    assert find_unsorted_help(app) == []
+
+
 def test_build_maker_config_auto_detects_tor_cookie() -> None:
     """``build_maker_config`` must call ``detect_tor_cookie_path`` when no
     explicit cookie was provided so the maker authenticates to Tor on hosts

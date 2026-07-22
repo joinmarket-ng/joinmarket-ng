@@ -16,6 +16,7 @@ from typing import Annotated, Any
 
 import typer
 from jmcore.cli_common import resolve_mnemonic, setup_cli
+from jmcore.cli_help import SortedTyper
 from jmcore.config import TorControlConfig, detect_tor_cookie_path
 from jmcore.models import NetworkType, OfferType
 from jmcore.notifications import get_notifier
@@ -31,7 +32,7 @@ from pydantic import SecretStr
 from maker.bot import MakerBot
 from maker.config import MakerConfig, MergeAlgorithm, OfferConfig
 
-app = typer.Typer(no_args_is_help=True)
+app = SortedTyper(no_args_is_help=True)
 
 
 def run_async(coro: Any) -> Any:

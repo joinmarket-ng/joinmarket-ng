@@ -4,6 +4,7 @@ Tests for the CLI common module.
 
 from __future__ import annotations
 
+import argparse
 import base64
 import os
 import tempfile
@@ -17,7 +18,12 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from loguru import logger
 
-from jmcore.cli_common import load_mnemonic_from_file, setup_cli, setup_logging
+from jmcore.cli_common import (
+    SortedHelpFormatter,
+    load_mnemonic_from_file,
+    setup_cli,
+    setup_logging,
+)
 from jmcore.settings import reset_settings
 
 
@@ -1149,3 +1155,57 @@ class TestResolveMnemonicCreationHeight:
         result = resolve_mnemonic(settings)
         assert result is not None
         assert result.creation_height is None
+
+
+class TestSortedHelpFormatter:
+    """SortedHelpFormatter must list options and subcommands alphabetically."""
+
+    @staticmethod
+    def _build_parser() -> argparse.ArgumentParser:
+        parser = argparse.ArgumentParser(prog="demo", formatter_class=SortedHelpFormatter)
+        parser.add_argument("--zulu")
+        parser.add_argument("--alpha")
+        parser.add_argument("-b", "--bravo")
+        subparsers = parser.add_subparsers(dest="command", help="Available commands")
+        subparsers.add_parser("status", help="Get status", formatter_class=SortedHelpFormatter)
+        subparsers.add_parser("health", help="Check health", formatter_class=SortedHelpFormatter)
+        return parser
+
+    def test_options_sorted_in_help_listing(self) -> None:
+        help_text = self._build_parser().format_help()
+        # Match listing lines (indented) so the usage synopsis is not counted.
+        listing_entries = ("\n  --alpha", "\n  -b, --bravo", "\n  -h, --help", "\n  --zulu")
+        positions = [help_text.index(entry) for entry in listing_entries]
+        assert positions == sorted(positions)
+
+    def test_options_sorted_in_usage_line(self) -> None:
+        usage = self._build_parser().format_usage()
+        positions = [usage.index(opt) for opt in ("[--alpha", "[-b", "[-h]", "[--zulu")]
+        assert positions == sorted(positions)
+
+    def test_subcommand_listing_sorted(self) -> None:
+        help_text = self._build_parser().format_help()
+        # Usage metavar is sorted even though "status" was registered first.
+        assert "{health,status}" in help_text
+        assert help_text.index("Check health") < help_text.index("Get status")
+
+    def test_positionals_keep_declared_order(self) -> None:
+        parser = argparse.ArgumentParser(prog="demo", formatter_class=SortedHelpFormatter)
+        parser.add_argument("source")
+        parser.add_argument("dest")
+        parser.add_argument("--zulu")
+        parser.add_argument("--alpha")
+
+        usage = parser.format_usage()
+        # Positional order defines call syntax; alphabetical would swap them.
+        assert usage.index("source") < usage.index("dest")
+
+        help_text = parser.format_help()
+        assert help_text.index("source") < help_text.index("dest")
+
+    def test_parsing_unaffected(self) -> None:
+        parser = self._build_parser()
+        args = parser.parse_args(["--alpha", "1", "--zulu", "2", "health"])
+        assert args.alpha == "1"
+        assert args.zulu == "2"
+        assert args.command == "health"

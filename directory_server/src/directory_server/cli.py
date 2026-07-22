@@ -8,7 +8,7 @@ import sys
 from urllib.error import URLError
 from urllib.request import urlopen
 
-from jmcore.cli_common import setup_logging
+from jmcore.cli_common import SortedHelpFormatter, setup_logging
 from jmcore.settings import get_settings
 
 
@@ -162,7 +162,10 @@ def main() -> None:
     # Load settings to get defaults from config
     settings = get_settings()
 
-    parser = argparse.ArgumentParser(description="JoinMarket Directory Server CLI")
+    parser = argparse.ArgumentParser(
+        description="JoinMarket Directory Server CLI",
+        formatter_class=SortedHelpFormatter,
+    )
     parser.add_argument(
         "--host",
         default=settings.directory_server.health_check_host,
@@ -183,13 +186,18 @@ def main() -> None:
 
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
-    status_parser = subparsers.add_parser("status", help="Get server status")
-    status_parser.add_argument("--json", action="store_true", help="Output as JSON")
-    status_parser.set_defaults(func=status_command)
-
-    health_parser = subparsers.add_parser("health", help="Check server health")
+    # Register subcommands alphabetically so the usage metavar is sorted too.
+    health_parser = subparsers.add_parser(
+        "health", help="Check server health", formatter_class=SortedHelpFormatter
+    )
     health_parser.add_argument("--json", action="store_true", help="Output as JSON")
     health_parser.set_defaults(func=health_command)
+
+    status_parser = subparsers.add_parser(
+        "status", help="Get server status", formatter_class=SortedHelpFormatter
+    )
+    status_parser.add_argument("--json", action="store_true", help="Output as JSON")
+    status_parser.set_defaults(func=status_command)
 
     args = parser.parse_args()
 

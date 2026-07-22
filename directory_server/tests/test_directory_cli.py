@@ -11,6 +11,35 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from directory_server.cli import format_status_output, health_command, status_command
+from directory_server.cli import main as cli_main
+
+
+def test_help_output_is_alphabetically_sorted(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """Options and subcommands must be listed alphabetically in --help."""
+    from jmcore.settings import reset_settings
+
+    monkeypatch.setenv("JOINMARKET_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr("sys.argv", ["jm-directory-ctl", "--help"])
+    reset_settings()
+    try:
+        with pytest.raises(SystemExit) as exc_info:
+            cli_main()
+    finally:
+        reset_settings()
+    assert exc_info.value.code == 0
+
+    output = capsys.readouterr().out
+    # Match listing lines (indented) so the usage synopsis is not counted.
+    listing_entries = ("\n  -h, --help", "\n  --host", "\n  --log-level", "\n  --port")
+    positions = [output.index(entry) for entry in listing_entries]
+    assert positions == sorted(positions)
+    # Subcommands sorted in both the usage metavar and the listing.
+    assert "{health,status}" in output
+    assert output.index("Check server health") < output.index("Get server status")
 
 
 class MockHTTPHandler(BaseHTTPRequestHandler):
