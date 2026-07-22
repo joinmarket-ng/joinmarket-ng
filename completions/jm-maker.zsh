@@ -6,9 +6,9 @@
 _jm_maker() {
   local -a commands
   commands=(
-    'start:Start the maker bot.'
-    'generate-address:Generate a new receive address.'
     'config-init:Initialize the config file with default settings.'
+    'generate-address:Generate a new receive address.'
+    'start:Start the maker bot.'
   )
 
   _arguments -C \
@@ -21,6 +21,24 @@ _jm_maker() {
       ;;
     args)
       case $words[1] in
+        config-init)
+          _arguments \
+            '--data-dir=[Data directory for JoinMarket files]:file:_files' \
+            '--config-file=[Config file path (decoupled from data dir). Defaults to <data-dir>/config.toml]:file:_files' \
+            '--help[Show this message and exit]'
+          ;;
+        generate-address)
+          _arguments \
+            '--mnemonic-file=[Path to mnemonic file]:file:_files' \
+            '--prompt-bip39-passphrase[Prompt for BIP39 passphrase interactively]' \
+            '--network=[Protocol network]:choice:(mainnet testnet signet regtest)' \
+            '--bitcoin-network=[Bitcoin network for address generation (defaults to --network)]:choice:(mainnet testnet signet regtest)' \
+            '--backend-type=[Backend type]: :' \
+            '--data-dir=[Data directory (default\: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)]:file:_files' \
+            '--config-file=[Config file path (decoupled from data dir). Defaults to <data-dir>/config.toml]:file:_files' \
+            '--log-level=[Log level]: :' \
+            '--help[Show this message and exit]'
+          ;;
         start)
           _arguments \
             '--mnemonic-file=[Path to mnemonic file]:file:_files' \
@@ -53,24 +71,6 @@ _jm_maker() {
             '--merge-algorithm=[UTXO selection strategy\: default, gradual, greedy, random]: :' \
             '--dual-offers[Create both relative and absolute fee offers simultaneously. Each offer gets a unique ID (0 for relative, 1 for absolute). Use with --cj-fee-relative and --cj-fee-absolute to set fees for each.]' \
             '--log-level=[Log level]: :' \
-            '--help[Show this message and exit]'
-          ;;
-        generate-address)
-          _arguments \
-            '--mnemonic-file=[Path to mnemonic file]:file:_files' \
-            '--prompt-bip39-passphrase[Prompt for BIP39 passphrase interactively]' \
-            '--network=[Protocol network]:choice:(mainnet testnet signet regtest)' \
-            '--bitcoin-network=[Bitcoin network for address generation (defaults to --network)]:choice:(mainnet testnet signet regtest)' \
-            '--backend-type=[Backend type]: :' \
-            '--data-dir=[Data directory (default\: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)]:file:_files' \
-            '--config-file=[Config file path (decoupled from data dir). Defaults to <data-dir>/config.toml]:file:_files' \
-            '--log-level=[Log level]: :' \
-            '--help[Show this message and exit]'
-          ;;
-        config-init)
-          _arguments \
-            '--data-dir=[Data directory for JoinMarket files]:file:_files' \
-            '--config-file=[Config file path (decoupled from data dir). Defaults to <data-dir>/config.toml]:file:_files' \
             '--help[Show this message and exit]'
           ;;
       esac

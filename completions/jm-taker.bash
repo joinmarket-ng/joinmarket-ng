@@ -8,23 +8,23 @@ _jm_taker_completion() {
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
     if [ "$COMP_CWORD" -eq 1 ]; then
-        COMPREPLY=( $(compgen -W "coinjoin tumble clear-ignored-makers config-init" -- "$cur") )
+        COMPREPLY=( $(compgen -W "clear-ignored-makers coinjoin config-init tumble" -- "$cur") )
         return 0
     fi
 
     subcmd="${COMP_WORDS[1]}"
     case "$subcmd" in
-      coinjoin)
-        COMPREPLY=( $(compgen -W "--help --amount -a --destination -d --mixdepth -m --counterparties -n --mnemonic-file -f --prompt-bip39-passphrase --network --bitcoin-network --backend -b --rpc-url --neutrino-url --directory -D --tor-socks-host --tor-socks-port --max-abs-fee --max-rel-fee --fee-rate --block-target --bondless-allowance --bond-exponent --bondless-zero-fee --select-utxos -s --yes -y --data-dir --config-file --log-level -l" -- "$cur") )
-        ;;
-      tumble)
-        COMPREPLY=( $(compgen -W "--help --mnemonic-file -f --prompt-bip39-passphrase --network --backend -b --rpc-url --neutrino-url --directory -D --tor-socks-host --tor-socks-port --data-dir --config-file --log-level -l" -- "$cur") )
-        ;;
       clear-ignored-makers)
         COMPREPLY=( $(compgen -W "--help --data-dir -d --config-file" -- "$cur") )
         ;;
+      coinjoin)
+        COMPREPLY=( $(compgen -W "--help --amount -a --destination -d --mixdepth -m --counterparties -n --mnemonic-file -f --prompt-bip39-passphrase --network --bitcoin-network --backend -b --rpc-url --neutrino-url --directory -D --tor-socks-host --tor-socks-port --max-abs-fee --max-rel-fee --fee-rate --block-target --bondless-allowance --bond-exponent --bondless-zero-fee --select-utxos -s --yes -y --data-dir --config-file --log-level -l" -- "$cur") )
+        ;;
       config-init)
         COMPREPLY=( $(compgen -W "--help --data-dir -d --config-file" -- "$cur") )
+        ;;
+      tumble)
+        COMPREPLY=( $(compgen -W "--help --mnemonic-file -f --prompt-bip39-passphrase --network --backend -b --rpc-url --neutrino-url --directory -D --tor-socks-host --tor-socks-port --data-dir --config-file --log-level -l" -- "$cur") )
         ;;
     esac
     return 0

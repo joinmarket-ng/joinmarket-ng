@@ -6,11 +6,11 @@
 _jm_tumbler() {
   local -a commands
   commands=(
-    'plan:Build a tumbler plan for the given destinations and persist it.'
-    'status:Print the current plan for the given wallet.'
-    'delete:Delete the on-disk plan for ``wallet_name``.'
-    'run:Execute the saved plan for a wallet to completion.'
     'config-init:Initialize the config file with default settings.'
+    'delete:Delete the on-disk plan for ``wallet_name``.'
+    'plan:Build a tumbler plan for the given destinations and persist it.'
+    'run:Execute the saved plan for a wallet to completion.'
+    'status:Print the current plan for the given wallet.'
   )
 
   _arguments -C \
@@ -23,6 +23,23 @@ _jm_tumbler() {
       ;;
     args)
       case $words[1] in
+        config-init)
+          _arguments \
+            '--data-dir=[Data directory for JoinMarket files]:file:_files' \
+            '--config-file=[Config file path (decoupled from data dir). Defaults to <data-dir>/config.toml]:file:_files' \
+            '--help[Show this message and exit]'
+          ;;
+        delete)
+          _arguments \
+            '--wallet-name=[Wallet identifier; defaults to the mnemonic fingerprint]: :' \
+            '--mnemonic-file=[Path to mnemonic file]:file:_files' \
+            '--prompt-bip39-passphrase[Prompt for BIP39 passphrase interactively]' \
+            '--yes[Skip confirmation prompt]' \
+            '--data-dir=[Data directory (default\: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)]:file:_files' \
+            '--config-file=[Config file path (decoupled from data dir). Defaults to <data-dir>/config.toml]:file:_files' \
+            '--log-level=[]: :' \
+            '--help[Show this message and exit]'
+          ;;
         plan)
           _arguments \
             '--destination=[External destination address (repeatable)]: :' \
@@ -40,27 +57,6 @@ _jm_tumbler() {
             '--mincjamount-sats=[Minimum CJ amount in sats]: :' \
             '--maker-sessions[]' \
             '--allow-few-destinations[Override the recommended minimum of 3 destinations. Intended for development and automated testing only\: fewer destinations expose users to pairwise re-aggregation heuristics.]' \
-            '--data-dir=[Data directory (default\: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)]:file:_files' \
-            '--config-file=[Config file path (decoupled from data dir). Defaults to <data-dir>/config.toml]:file:_files' \
-            '--log-level=[]: :' \
-            '--help[Show this message and exit]'
-          ;;
-        status)
-          _arguments \
-            '--wallet-name=[Wallet identifier; defaults to the mnemonic fingerprint]: :' \
-            '--mnemonic-file=[Path to mnemonic file]:file:_files' \
-            '--prompt-bip39-passphrase[Prompt for BIP39 passphrase interactively]' \
-            '--data-dir=[Data directory (default\: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)]:file:_files' \
-            '--config-file=[Config file path (decoupled from data dir). Defaults to <data-dir>/config.toml]:file:_files' \
-            '--log-level=[]: :' \
-            '--help[Show this message and exit]'
-          ;;
-        delete)
-          _arguments \
-            '--wallet-name=[Wallet identifier; defaults to the mnemonic fingerprint]: :' \
-            '--mnemonic-file=[Path to mnemonic file]:file:_files' \
-            '--prompt-bip39-passphrase[Prompt for BIP39 passphrase interactively]' \
-            '--yes[Skip confirmation prompt]' \
             '--data-dir=[Data directory (default\: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)]:file:_files' \
             '--config-file=[Config file path (decoupled from data dir). Defaults to <data-dir>/config.toml]:file:_files' \
             '--log-level=[]: :' \
@@ -88,10 +84,14 @@ _jm_tumbler() {
             '--log-level=[]: :' \
             '--help[Show this message and exit]'
           ;;
-        config-init)
+        status)
           _arguments \
-            '--data-dir=[Data directory for JoinMarket files]:file:_files' \
+            '--wallet-name=[Wallet identifier; defaults to the mnemonic fingerprint]: :' \
+            '--mnemonic-file=[Path to mnemonic file]:file:_files' \
+            '--prompt-bip39-passphrase[Prompt for BIP39 passphrase interactively]' \
+            '--data-dir=[Data directory (default\: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)]:file:_files' \
             '--config-file=[Config file path (decoupled from data dir). Defaults to <data-dir>/config.toml]:file:_files' \
+            '--log-level=[]: :' \
             '--help[Show this message and exit]'
           ;;
       esac

@@ -258,36 +258,23 @@ docker inspect joinmarket_directory_server | grep -A 10 Health
 <summary><code>jm-directory-ctl --help</code></summary>
 
 ```
-usage: jm-directory-ctl [-h] [--host HOST] [--port PORT]
-                        [--log-level LOG_LEVEL]
-                        {status,health} ...
+usage: jm-directory-ctl [-h] [--host HOST] [--log-level LOG_LEVEL]
+                        [--port PORT]
+                        {health,status} ...
 
 JoinMarket Directory Server CLI
 
 positional arguments:
-  {status,health}       Available commands
-    status              Get server status
+  {health,status}       Available commands
     health              Check server health
+    status              Get server status
 
 options:
   -h, --help            show this help message and exit
   --host HOST           Health check server host (default: 127.0.0.1)
-  --port PORT           Health check server port (default: 8080)
   --log-level, -l LOG_LEVEL
                         Log level (default: INFO)
-```
-
-</details>
-
-<details>
-<summary><code>jm-directory-ctl status --help</code></summary>
-
-```
-usage: jm-directory-ctl status [-h] [--json]
-
-options:
-  -h, --help  show this help message and exit
-  --json      Output as JSON
+  --port PORT           Health check server port (default: 8080)
 ```
 
 </details>
@@ -297,6 +284,19 @@ options:
 
 ```
 usage: jm-directory-ctl health [-h] [--json]
+
+options:
+  -h, --help  show this help message and exit
+  --json      Output as JSON
+```
+
+</details>
+
+<details>
+<summary><code>jm-directory-ctl status --help</code></summary>
+
+```
+usage: jm-directory-ctl status [-h] [--json]
 
 options:
   -h, --help  show this help message and exit

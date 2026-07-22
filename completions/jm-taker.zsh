@@ -6,10 +6,10 @@
 _jm_taker() {
   local -a commands
   commands=(
-    'coinjoin:Execute a single CoinJoin transaction.'
-    'tumble:Run a tumbler schedule of CoinJoins.'
     'clear-ignored-makers:Clear the list of ignored makers.'
+    'coinjoin:Execute a single CoinJoin transaction.'
     'config-init:Initialize the config file with default settings.'
+    'tumble:Run a tumbler schedule of CoinJoins.'
   )
 
   _arguments -C \
@@ -22,6 +22,12 @@ _jm_taker() {
       ;;
     args)
       case $words[1] in
+        clear-ignored-makers)
+          _arguments \
+            '--data-dir=[Data directory for JoinMarket files]:file:_files' \
+            '--config-file=[Config file path (decoupled from data dir). Defaults to <data-dir>/config.toml]:file:_files' \
+            '--help[Show this message and exit]'
+          ;;
         coinjoin)
           _arguments \
             '--amount=[Amount in sats (0 for sweep)]: :' \
@@ -52,6 +58,12 @@ _jm_taker() {
             '--log-level=[Log level]: :' \
             '--help[Show this message and exit]'
           ;;
+        config-init)
+          _arguments \
+            '--data-dir=[Data directory for JoinMarket files]:file:_files' \
+            '--config-file=[Config file path (decoupled from data dir). Defaults to <data-dir>/config.toml]:file:_files' \
+            '--help[Show this message and exit]'
+          ;;
         tumble)
           _arguments \
             '--mnemonic-file=[Path to mnemonic file]:file:_files' \
@@ -66,18 +78,6 @@ _jm_taker() {
             '--data-dir=[Data directory (default\: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)]:file:_files' \
             '--config-file=[Config file path (decoupled from data dir). Defaults to <data-dir>/config.toml]:file:_files' \
             '--log-level=[Log level]: :' \
-            '--help[Show this message and exit]'
-          ;;
-        clear-ignored-makers)
-          _arguments \
-            '--data-dir=[Data directory for JoinMarket files]:file:_files' \
-            '--config-file=[Config file path (decoupled from data dir). Defaults to <data-dir>/config.toml]:file:_files' \
-            '--help[Show this message and exit]'
-          ;;
-        config-init)
-          _arguments \
-            '--data-dir=[Data directory for JoinMarket files]:file:_files' \
-            '--config-file=[Config file path (decoupled from data dir). Defaults to <data-dir>/config.toml]:file:_files' \
             '--help[Show this message and exit]'
           ;;
       esac

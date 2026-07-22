@@ -8,26 +8,26 @@ _jm_tumbler_completion() {
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
     if [ "$COMP_CWORD" -eq 1 ]; then
-        COMPREPLY=( $(compgen -W "plan status delete run config-init" -- "$cur") )
+        COMPREPLY=( $(compgen -W "config-init delete plan run status" -- "$cur") )
         return 0
     fi
 
     subcmd="${COMP_WORDS[1]}"
     case "$subcmd" in
-      plan)
-        COMPREPLY=( $(compgen -W "--help --destination -d --mnemonic-file -f --prompt-bip39-passphrase --wallet-name -w --network --backend -b --rpc-url --neutrino-url --force --seed --maker-count-min --maker-count-max --mincjamount-sats --maker-sessions --allow-few-destinations --data-dir --config-file --log-level -l" -- "$cur") )
-        ;;
-      status)
-        COMPREPLY=( $(compgen -W "--help --wallet-name -w --mnemonic-file -f --prompt-bip39-passphrase --data-dir --config-file --log-level -l" -- "$cur") )
+      config-init)
+        COMPREPLY=( $(compgen -W "--help --data-dir -d --config-file" -- "$cur") )
         ;;
       delete)
         COMPREPLY=( $(compgen -W "--help --wallet-name -w --mnemonic-file -f --prompt-bip39-passphrase --yes -y --data-dir --config-file --log-level -l" -- "$cur") )
         ;;
+      plan)
+        COMPREPLY=( $(compgen -W "--help --destination -d --mnemonic-file -f --prompt-bip39-passphrase --wallet-name -w --network --backend -b --rpc-url --neutrino-url --force --seed --maker-count-min --maker-count-max --mincjamount-sats --maker-sessions --allow-few-destinations --data-dir --config-file --log-level -l" -- "$cur") )
+        ;;
       run)
         COMPREPLY=( $(compgen -W "--help --mnemonic-file -f --prompt-bip39-passphrase --wallet-name -w --network --backend -b --rpc-url --neutrino-url --directory -D --tor-socks-host --tor-socks-port --fee-rate --block-target --min-confirmations --counterparties --resume --data-dir --config-file --log-level -l" -- "$cur") )
         ;;
-      config-init)
-        COMPREPLY=( $(compgen -W "--help --data-dir -d --config-file" -- "$cur") )
+      status)
+        COMPREPLY=( $(compgen -W "--help --wallet-name -w --mnemonic-file -f --prompt-bip39-passphrase --data-dir --config-file --log-level -l" -- "$cur") )
         ;;
     esac
     return 0
