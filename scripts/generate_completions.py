@@ -20,7 +20,6 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import click
 import typer
 
 
@@ -80,11 +79,16 @@ def _import_app(import_path: str) -> typer.Typer:
     return getattr(mod, attr)
 
 
-def _extract_params(params: list[click.Parameter]) -> list[ParamInfo]:
-    """Extract parameter metadata from Click parameter list."""
+def _extract_params(params: list) -> list[ParamInfo]:
+    """Extract parameter metadata from Click parameter list.
+
+    Note: typer >= 0.16 vendors click as ``typer._click``, so ``isinstance``
+    checks against the installed ``click`` package fail. Use the stable
+    ``param_type_name`` attribute instead (present in both click flavors).
+    """
     result: list[ParamInfo] = []
     for p in params:
-        if not isinstance(p, click.Option):
+        if getattr(p, "param_type_name", "") != "option":
             continue
         # Skip typer's built-in completion options
         if p.name in ("install_completion", "show_completion"):
@@ -124,9 +128,10 @@ def introspect_cli(name: str, import_path: str) -> CLIInfo:
 
     app_help = click_app.help or ""
 
-    if isinstance(click_app, click.Group):
-        # Group with subcommands
-        ctx = click.Context(click_app)
+    if hasattr(click_app, "list_commands"):
+        # Group with subcommands (use the app's own context class: the click
+        # flavor may be typer's vendored copy rather than the installed click)
+        ctx = click_app.context_class(click_app)
         commands: list[CommandInfo] = []
         for cmd_name in click_app.list_commands(ctx):
             cmd = click_app.get_command(ctx, cmd_name)
