@@ -278,6 +278,12 @@ async def fetch_fee_estimates(
         raise FeeSourceError(f"Fee source request failed: {exc}") from exc
     except ValueError as exc:
         raise FeeSourceError(f"Fee source returned invalid JSON: {exc}") from exc
+    except Exception as exc:
+        # httpx-socks/python-socks proxy failures (for example ProxyTimeoutError
+        # while connecting to an unreachable onion service) do not derive from
+        # httpx.HTTPError. They must also become FeeSourceError so the caller's
+        # fallback chain can try the next source instead of aborting the send.
+        raise FeeSourceError(f"Fee source connection failed: {exc}") from exc
 
     estimates = parse_fee_estimates(data)
     logger.debug("Fetched fee estimates from {}: {}", url, estimates)

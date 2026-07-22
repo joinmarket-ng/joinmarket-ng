@@ -183,6 +183,44 @@ class TestFetchFeeEstimates:
             )
 
     @pytest.mark.asyncio
+    async def test_proxy_errors_become_fee_source_errors(self) -> None:
+        """python-socks proxy failures (dead onion) do not derive from
+        httpx.HTTPError; they must still surface as FeeSourceError."""
+
+        class FakeProxyTimeoutError(Exception):
+            """Stands in for python_socks._errors.ProxyTimeoutError."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise FakeProxyTimeoutError("Proxy connection timed out: 20.0")
+
+        with pytest.raises(FeeSourceError, match="connection failed"):
+            await fetch_fee_estimates(
+                "http://deadonion.example/fees", transport=httpx.MockTransport(handler)
+            )
+
+    @pytest.mark.asyncio
+    async def test_fallback_survives_proxy_errors(self) -> None:
+        """Regression (signet Flatpak): a proxy timeout on the first onion
+        source must trigger the fallback chain, not abort the send."""
+
+        class FakeProxyTimeoutError(Exception):
+            pass
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.host == "onion-down.example":
+                raise FakeProxyTimeoutError("Proxy connection timed out: 20.0")
+            return httpx.Response(
+                200, json={"fastestFee": 3, "halfHourFee": 2, "hourFee": 1, "economyFee": 1}
+            )
+
+        result = await fetch_fee_estimates_with_fallback(
+            ["http://onion-down.example/fees", "https://clearnet-ok.example/fees"],
+            transport=httpx.MockTransport(handler),
+        )
+        assert result.source_url == "https://clearnet-ok.example/fees"
+        assert result.estimates[1] == 3.0
+
+    @pytest.mark.asyncio
     async def test_fetch_and_parse(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
             assert request.url.path.endswith("/fees/recommended")
