@@ -242,7 +242,23 @@ def calculate_sweep_amount(available_sats: int, relative_fees: list[str]) -> int
     # cj_amount = available / (1 + sum_rel_fees)
     #           = available / ((denominator + sum_numerators) / denominator)
     #           = (available * denominator) / (denominator + sum_numerators)
-    return (available_sats * denominator) // (denominator + sum_numerators)
+    cj_amount = (available_sats * denominator) // (denominator + sum_numerators)
+
+    # The floor division above guarantees cj_amount + fees <= available only in
+    # exact arithmetic. Actual maker fees are computed with
+    # calculate_relative_fee, which rounds half-even and can round each maker's
+    # fee UP by up to 0.5 sat. With multiple relative-fee makers the summed
+    # rounded fees can exceed the remaining slack, leaving the sweep underfunded
+    # by a sat or two (negative residual). Since cj_amount + fees(cj_amount) is
+    # strictly increasing in cj_amount, decrement until the actually-charged
+    # fees fit within the available balance.
+    while cj_amount > 0:
+        total_fee = sum(calculate_relative_fee(cj_amount, fee) for fee in relative_fees)
+        if cj_amount + total_fee <= available_sats:
+            break
+        cj_amount -= 1
+
+    return cj_amount
 
 
 # =============================================================================

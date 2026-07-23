@@ -897,6 +897,45 @@ class TestCalculateSweepAmount:
         expected = calculate_sweep_amount(1_000_000, ["0.00001", "0.001"])
         assert result == expected
 
+    def test_rounded_fees_never_exceed_available(self) -> None:
+        """Regression: cj_amount + actually-charged fees must fit in available.
+
+        Floor division alone guaranteed solvency only in exact arithmetic.
+        calculate_relative_fee rounds half-even (can round up ~0.5 sat per
+        maker), so with 2+ relative-fee makers the summed fees could exceed
+        the slack, causing a negative residual (underfunded sweep) at build
+        time. Example: available=1503, two makers at 0.1% gave cj=1500 with
+        fees round(1.5)=2 each, and 1500 + 4 > 1503.
+        """
+        rates = ["0.001", "0.001"]
+        available = 1503
+        cj = calculate_sweep_amount(available, rates)
+        fees = sum(calculate_relative_fee(cj, r) for r in rates)
+        assert cj + fees <= available
+        assert cj == 1499  # 1500 would be underfunded by 1 sat
+
+    def test_solvency_scan_with_bounded_slack(self) -> None:
+        """Rounded fees always fit in available, with only a tiny residual.
+
+        The residual (available - cj_amount - fees) becomes extra miner fee in
+        a sweep, so it must be non-negative and stay within a few sats
+        (bounded by ~0.5 sat rounding per maker plus the floor division
+        remainder).
+        """
+        rate_sets = [["0.001", "0.001"], ["0.0015", "0.0025"], ["0.001", "0.002", "0.003"]]
+        for rates in rate_sets:
+            for available in range(1_000, 6_000):
+                cj = calculate_sweep_amount(available, rates)
+                fees = sum(calculate_relative_fee(cj, r) for r in rates)
+                residual = available - cj - fees
+                assert residual >= 0, (
+                    f"underfunded: rates={rates} available={available} cj={cj} fees={fees}"
+                )
+                assert residual <= len(rates) + 1, (
+                    f"excessive slack: rates={rates} available={available} "
+                    f"cj={cj} residual={residual}"
+                )
+
 
 # =============================================================================
 # Address / scriptPubKey tests
