@@ -286,6 +286,13 @@
 # include_nick = true
 # use_tor = true
 
+# Verify TLS certificates of notification servers. Set to false when your
+# notification server (e.g. Gotify) uses a self-signed certificate or a
+# private CA that Python's bundled certifi store does not trust. To keep
+# verification enabled instead, point the REQUESTS_CA_BUNDLE environment
+# variable at your CA bundle (e.g. /etc/ssl/certs/ca-certificates.crt).
+# verify_tls = true
+
 # Event notifications
 # notify_fill = true
 # notify_rejection = true

@@ -334,6 +334,76 @@ class TestNotifier:
 
         assert result is False
 
+    def test_prepare_url_plain(self) -> None:
+        """No parameters are added with default (direct, verified) config."""
+        config = NotificationConfig(use_tor=False)
+        notifier = Notifier(config)
+
+        url = "gotify://host/token"
+        assert notifier._prepare_url(url) == url
+
+    def test_prepare_url_tor_timeouts(self) -> None:
+        """Tor routing extends Apprise's connection/read timeouts."""
+        config = NotificationConfig(use_tor=True)
+        notifier = Notifier(config)
+
+        assert notifier._prepare_url("gotify://host/token") == "gotify://host/token?cto=30&rto=30"
+        # Existing query strings are extended, not clobbered
+        assert (
+            notifier._prepare_url("gotify://host/token?priority=5")
+            == "gotify://host/token?priority=5&cto=30&rto=30"
+        )
+
+    def test_prepare_url_verify_tls_disabled(self) -> None:
+        """verify_tls=False appends Apprise's verify=no parameter."""
+        config = NotificationConfig(use_tor=False, verify_tls=False)
+        notifier = Notifier(config)
+
+        assert notifier._prepare_url("gotify://host/token") == "gotify://host/token?verify=no"
+
+    def test_prepare_url_verify_tls_disabled_with_tor(self) -> None:
+        """Both timeout and verify parameters combine on one URL."""
+        config = NotificationConfig(use_tor=True, verify_tls=False)
+        notifier = Notifier(config)
+
+        assert (
+            notifier._prepare_url("gotify://host/token")
+            == "gotify://host/token?cto=30&rto=30&verify=no"
+        )
+
+    def test_prepare_url_respects_existing_verify_param(self) -> None:
+        """A per-URL verify parameter wins over the global verify_tls."""
+        config = NotificationConfig(use_tor=False, verify_tls=False)
+        notifier = Notifier(config)
+
+        url = "gotify://host/token?verify=yes"
+        assert notifier._prepare_url(url) == url
+
+    def test_apprise_log_bridge_forwards_to_loguru(self) -> None:
+        """Apprise's stdlib logging must surface through loguru.
+
+        Apprise reports the real cause of delivery failures (e.g. TLS
+        verification errors) via logging.getLogger('apprise'); without the
+        bridge those records were dropped and users only saw a generic
+        failure message (user report: original error was never shown).
+        """
+        import logging
+
+        from loguru import logger as loguru_logger
+
+        from jmcore.notifications import install_apprise_log_bridge
+
+        install_apprise_log_bridge()
+
+        captured: list[str] = []
+        sink_id = loguru_logger.add(lambda msg: captured.append(str(msg)), level="WARNING")
+        try:
+            logging.getLogger("apprise").warning("certificate verify failed: self-signed")
+        finally:
+            loguru_logger.remove(sink_id)
+
+        assert any("certificate verify failed: self-signed" in line for line in captured)
+
     def test_format_amount(self) -> None:
         """Test amount formatting."""
         config = NotificationConfig(include_amounts=True)
@@ -1535,6 +1605,25 @@ class TestConvertSettingsToNotificationConfig:
         config = convert_settings_to_notification_config(settings)
 
         assert config.component_name == ""
+
+    def test_convert_verify_tls_setting(self) -> None:
+        """verify_tls must flow from settings into the config (round-trip)."""
+        from jmcore.settings import JoinMarketSettings, NotificationSettings
+
+        # Default: verification enabled
+        settings = JoinMarketSettings(
+            notifications=NotificationSettings(urls=["gotify://host/token"])
+        )
+        assert convert_settings_to_notification_config(settings).verify_tls is True
+
+        # Explicitly disabled (self-signed / private CA servers)
+        settings = JoinMarketSettings(
+            notifications=NotificationSettings(
+                urls=["gotify://host/token"],
+                verify_tls=False,
+            )
+        )
+        assert convert_settings_to_notification_config(settings).verify_tls is False
 
     def test_convert_summary_settings(self) -> None:
         """Test that summary notification settings are converted correctly."""

@@ -39,6 +39,7 @@ The module is designed to be:
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -452,6 +453,16 @@ class NotificationConfig(BaseModel):
         ),
     )
 
+    # TLS settings
+    verify_tls: bool = Field(
+        default=True,
+        description=(
+            "Verify TLS certificates of notification servers. Set to False for "
+            "servers using self-signed certificates or a private CA that is not "
+            "in the certifi bundle."
+        ),
+    )
+
     # Retry settings for failed notifications (Tor is unreliable)
     retry_enabled: bool = Field(
         default=True,
@@ -597,6 +608,7 @@ def convert_settings_to_notification_config(
         tor_socks_host=settings.tor.socks_host,
         tor_socks_port=settings.tor.socks_port,
         stream_isolation=settings.tor.stream_isolation,
+        verify_tls=ns.verify_tls,
         notify_fill=ns.notify_fill,
         notify_rejection=ns.notify_rejection,
         notify_signing=ns.notify_signing,
@@ -619,6 +631,41 @@ def convert_settings_to_notification_config(
         retry_max_attempts=ns.retry_max_attempts,
         retry_base_delay=ns.retry_base_delay,
     )
+
+
+_apprise_log_bridge_installed = False
+
+
+class _AppriseLogHandler(logging.Handler):
+    """Forward Apprise's stdlib logging records to loguru.
+
+    Apprise reports the real cause of delivery failures (TLS verification
+    errors, connection refusals, HTTP status codes, ...) through the standard
+    ``logging`` module, which this project does not configure. Without this
+    bridge those records are silently dropped and the operator only sees a
+    generic "Notification failed" line. Warnings and errors surface at the
+    default log level; the underlying exception text (e.g. the SSL error) is
+    logged by Apprise at DEBUG, so run with DEBUG logging to see it.
+    """
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            level: str | int = logger.level(record.levelname).name
+        except ValueError:
+            level = record.levelno
+        logger.opt(depth=6, exception=record.exc_info).log(level, record.getMessage())
+
+
+def install_apprise_log_bridge() -> None:
+    """Route the ``apprise`` stdlib logger into loguru (idempotent)."""
+    global _apprise_log_bridge_installed
+    if _apprise_log_bridge_installed:
+        return
+    apprise_logger = logging.getLogger("apprise")
+    apprise_logger.addHandler(_AppriseLogHandler())
+    # Let all records reach the handler; loguru sinks apply their own level.
+    apprise_logger.setLevel(logging.DEBUG)
+    _apprise_log_bridge_installed = True
 
 
 class Notifier:
@@ -647,6 +694,27 @@ class Notifier:
         self._lock = asyncio.Lock()
         self._retry_tasks: set[asyncio.Task[None]] = set()
 
+    def _prepare_url(self, url: str) -> str:
+        """Apply global Apprise URL parameters derived from the configuration.
+
+        - ``cto``/``rto`` (connection/read timeout): Apprise's 4s default is
+          too short for Tor, where circuit establishment alone can take
+          10-30 seconds. Applied when ``use_tor`` is enabled.
+        - ``verify=no``: disables TLS certificate verification for servers
+          using self-signed certificates or a private CA. Applied when
+          ``verify_tls`` is disabled, unless the URL already carries its own
+          ``verify`` parameter (the explicit per-URL choice wins).
+        """
+        params: list[str] = []
+        if self.config.use_tor:
+            params.append("cto=30&rto=30")
+        if not self.config.verify_tls and "verify=" not in url:
+            params.append("verify=no")
+        if not params:
+            return url
+        separator = "&" if "?" in url else "?"
+        return f"{url}{separator}{'&'.join(params)}"
+
     async def _ensure_initialized(self) -> bool:
         """Lazily initialize Apprise. Returns True if ready to send."""
         if not self.config.enabled or not self.config.urls:
@@ -661,6 +729,10 @@ class Notifier:
 
             try:
                 import apprise
+
+                # Surface Apprise's own error reporting (TLS failures, HTTP
+                # errors, ...) instead of dropping it on the floor.
+                install_apprise_log_bridge()
 
                 # Configure proxy environment variables if Tor is enabled
                 if self.config.use_tor:
@@ -691,25 +763,11 @@ class Notifier:
 
                 self._apprise = apprise.Apprise()
 
-                # Use longer timeout for Tor connections (default is 4s, too short for Tor)
-                # Tor circuit establishment can take 10-30 seconds
-                # Use Apprise's cto (connection timeout) and rto (read timeout) URL parameters
                 for secret_url in self.config.urls:
                     # Get the actual URL string from SecretStr
                     url = secret_url.get_secret_value()
 
-                    if self.config.use_tor:
-                        # Append timeout parameters to URL for Tor connections
-                        # cto = connection timeout, rto = read timeout (both in seconds)
-                        timeout_params = "cto=30&rto=30"
-                        if "?" in url:
-                            url_with_timeout = f"{url}&{timeout_params}"
-                        else:
-                            url_with_timeout = f"{url}?{timeout_params}"
-                    else:
-                        url_with_timeout = url
-
-                    if not self._apprise.add(url_with_timeout):
+                    if not self._apprise.add(self._prepare_url(url)):
                         logger.warning(f"Failed to add notification URL: {url[:30]}...")
 
                 if len(self._apprise) == 0:
@@ -821,10 +879,21 @@ class Notifier:
                 )
 
             if not result:
+                if self.config.use_tor:
+                    hint = (
+                        "Check Tor connectivity and the notification service URL. "
+                        "Ensure PySocks is installed for SOCKS proxy support."
+                    )
+                else:
+                    hint = (
+                        "Check the notification service URL and its TLS certificate. "
+                        "For servers with a self-signed certificate or private CA, "
+                        "set verify_tls = false in [notifications] or point the "
+                        "REQUESTS_CA_BUNDLE environment variable at your CA bundle."
+                    )
                 logger.warning(
-                    f"Notification failed: {title}. "
-                    "Check Tor connectivity and notification service URL. "
-                    "Ensure PySocks is installed for SOCKS proxy support."
+                    f"Notification failed: {title}. {hint} "
+                    "Run with DEBUG logging to see the underlying error from Apprise."
                 )
             else:
                 logger.debug(f"Notification sent: {title}")

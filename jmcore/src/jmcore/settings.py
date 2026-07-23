@@ -535,6 +535,15 @@ class NotificationSettings(BaseModel):
         default=True,
         description="Route notifications through Tor SOCKS proxy",
     )
+    verify_tls: bool = Field(
+        default=True,
+        description=(
+            "Verify TLS certificates of notification servers. Set to false for "
+            "servers using self-signed certificates or a private CA that is not "
+            "in the certifi bundle (alternatively, point the REQUESTS_CA_BUNDLE "
+            "environment variable at your CA bundle to keep verification on)."
+        ),
+    )
     # Event type toggles
     notify_fill: bool = Field(default=True, description="Notify on !fill requests")
     notify_rejection: bool = Field(default=True, description="Notify on rejections")
