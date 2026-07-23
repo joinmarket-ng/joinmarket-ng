@@ -671,3 +671,222 @@ class TestOnionPeerBackoff:
             network="regtest",
         )
         assert task is None  # Gave up
+
+
+class FakeSocks5Server:
+    """Minimal in-process SOCKS5 server for testing connect_via_tor.
+
+    Performs the SOCKS5 greeting, optional username/password authentication
+    (RFC 1929), and the CONNECT request, then echoes back a canned line so the
+    resulting TCPConnection can be exercised end to end. Records the
+    destination host/port and credentials it received.
+    """
+
+    def __init__(self, require_auth: bool = False) -> None:
+        self.require_auth = require_auth
+        self.server: asyncio.Server | None = None
+        self.port: int = 0
+        self.dest_host: str | None = None
+        self.dest_port: int | None = None
+        self.username: str | None = None
+        self.password: str | None = None
+
+    async def start(self) -> None:
+        self.server = await asyncio.start_server(self._handle, "127.0.0.1", 0)
+        self.port = self.server.sockets[0].getsockname()[1]
+
+    async def stop(self) -> None:
+        if self.server:
+            self.server.close()
+            await self.server.wait_closed()
+
+    async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            # Greeting: VER NMETHODS METHODS...
+            ver, nmethods = await reader.readexactly(2)
+            assert ver == 5
+            await reader.readexactly(nmethods)
+
+            if self.require_auth:
+                writer.write(b"\x05\x02")  # username/password
+                await writer.drain()
+                auth_ver = (await reader.readexactly(1))[0]
+                assert auth_ver == 1
+                ulen = (await reader.readexactly(1))[0]
+                self.username = (await reader.readexactly(ulen)).decode()
+                plen = (await reader.readexactly(1))[0]
+                self.password = (await reader.readexactly(plen)).decode()
+                writer.write(b"\x01\x00")  # auth success
+            else:
+                writer.write(b"\x05\x00")  # no auth
+            await writer.drain()
+
+            # CONNECT request: VER CMD RSV ATYP ...
+            ver, cmd, _rsv, atyp = await reader.readexactly(4)
+            assert ver == 5 and cmd == 1
+            assert atyp == 3, "expected domain address type (rdns)"
+            domain_len = (await reader.readexactly(1))[0]
+            self.dest_host = (await reader.readexactly(domain_len)).decode()
+            port_bytes = await reader.readexactly(2)
+            self.dest_port = int.from_bytes(port_bytes, "big")
+
+            # Success reply with a zero bind address
+            writer.write(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
+            await writer.drain()
+
+            # Behave like the destination: echo one line prefixed with "echo:"
+            line = await reader.readuntil(b"\n")
+            writer.write(b"echo:" + line)
+            await writer.drain()
+        except (asyncio.IncompleteReadError, ConnectionResetError, AssertionError):
+            pass
+        finally:
+            writer.close()
+
+
+class TestConnectViaTor:
+    """Tests for the async SOCKS5 dialer used for all Tor connections."""
+
+    @pytest.mark.asyncio
+    async def test_connect_and_roundtrip(self):
+        from jmcore.network import connect_via_tor
+
+        proxy = FakeSocks5Server()
+        await proxy.start()
+        try:
+            conn = await connect_via_tor(
+                "test.onion",
+                5222,
+                socks_host="127.0.0.1",
+                socks_port=proxy.port,
+                timeout=5.0,
+            )
+            await conn.send(b"hello")
+            reply = await asyncio.wait_for(conn.receive(), timeout=5.0)
+            assert reply == b"echo:hello"
+            await conn.close()
+
+            # The onion hostname must be resolved by the proxy (rdns), never
+            # locally: local resolution would leak the destination to DNS.
+            assert proxy.dest_host == "test.onion"
+            assert proxy.dest_port == 5222
+        finally:
+            await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_connect_with_stream_isolation_credentials(self):
+        from jmcore.network import connect_via_tor
+
+        proxy = FakeSocks5Server(require_auth=True)
+        await proxy.start()
+        try:
+            conn = await connect_via_tor(
+                "test.onion",
+                5222,
+                socks_host="127.0.0.1",
+                socks_port=proxy.port,
+                timeout=5.0,
+                socks_username="jm-peer",
+                socks_password="isolation",
+            )
+            await conn.close()
+            assert proxy.username == "jm-peer"
+            assert proxy.password == "isolation"
+        finally:
+            await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_cancellation_is_prompt_and_threadless(self):
+        """Cancelling a pending dial must complete immediately.
+
+        Regression test for the shutdown hang: the old implementation ran a
+        blocking PySocks connect in the default thread-pool executor, so
+        cancelled dials kept non-daemon threads alive that blocked
+        ``asyncio.run`` teardown and interpreter exit for up to the SOCKS
+        timeout per dial (or forever on Python 3.11).
+        """
+        import contextlib
+        import threading
+
+        from jmcore.network import connect_via_tor
+
+        # A proxy that accepts the TCP connection but never answers the
+        # SOCKS5 greeting, like Tor building a circuit for a slow onion.
+        # It exits on client EOF so server.wait_closed() does not linger.
+        async def silent_handler(
+            reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+        ) -> None:
+            with contextlib.suppress(Exception):
+                await reader.read(-1)
+            writer.close()
+
+        server = await asyncio.start_server(silent_handler, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        threads_before = threading.active_count()
+        try:
+            task = asyncio.create_task(
+                connect_via_tor(
+                    "test.onion",
+                    5222,
+                    socks_host="127.0.0.1",
+                    socks_port=port,
+                    timeout=120.0,
+                )
+            )
+            await asyncio.sleep(0.2)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=2.0)
+
+            # No executor threads may linger from the dial.
+            assert threading.active_count() <= threads_before
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_timeout_raises_connection_error(self):
+        from jmcore.network import connect_via_tor
+
+        async def silent_handler(
+            reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+        ) -> None:
+            import contextlib
+
+            with contextlib.suppress(Exception):
+                await reader.read(-1)
+            writer.close()
+
+        server = await asyncio.start_server(silent_handler, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        try:
+            with pytest.raises(ConnectionError):
+                await connect_via_tor(
+                    "test.onion",
+                    5222,
+                    socks_host="127.0.0.1",
+                    socks_port=port,
+                    timeout=0.3,
+                )
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_proxy_refused_raises_connection_error(self):
+        from jmcore.network import connect_via_tor
+
+        # Bind and close a socket to get a port with nothing listening.
+        server = await asyncio.start_server(lambda r, w: None, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        server.close()
+        await server.wait_closed()
+
+        with pytest.raises(ConnectionError):
+            await connect_via_tor(
+                "test.onion",
+                5222,
+                socks_host="127.0.0.1",
+                socks_port=port,
+                timeout=2.0,
+            )

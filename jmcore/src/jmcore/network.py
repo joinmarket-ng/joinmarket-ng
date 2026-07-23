@@ -186,35 +186,42 @@ async def connect_via_tor(
     sent during SOCKS5 authentication.  Tor's ``IsolateSOCKSAuth`` (enabled
     by default) uses these to assign the connection to a distinct circuit,
     enabling stream isolation between different connection categories.
+
+    The SOCKS5 negotiation is fully asynchronous (python-socks): dials never
+    occupy threads in the event loop's default executor. Blocking connects in
+    executor threads used to keep the process alive on shutdown, because
+    ``asyncio.run`` (and the interpreter) join those non-daemon threads before
+    exiting; a batch of slow onion dials could delay exit by minutes or hang
+    it entirely.
     """
     try:
-        import socket
+        from python_socks import ProxyType
+        from python_socks.async_.asyncio import Proxy
 
-        import socks
-
-        sock = socks.socksocket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.set_proxy(
-            socks.SOCKS5,
-            socks_host,
-            socks_port,
+        proxy = Proxy.create(
+            proxy_type=ProxyType.SOCKS5,
+            host=socks_host,
+            port=socks_port,
             username=socks_username,
             password=socks_password,
+            # Resolve hostnames through the proxy (required for .onion).
+            rdns=True,
         )
-        sock.settimeout(timeout)
 
         # Transport-level dial logs stay at DEBUG: callers that care (directory
         # pool, aggregator) log the meaningful connection events at INFO, and
         # bulk users like the orderbook watcher's maker health checker would
         # otherwise flood INFO with hundreds of dial lines per sweep.
         logger.debug(f"Connecting to {onion_address}:{port} via Tor ({socks_host}:{socks_port})")
-        await asyncio.get_event_loop().run_in_executor(None, sock.connect, (onion_address, port))
+        sock = await proxy.connect(dest_host=onion_address, dest_port=port, timeout=timeout)
 
-        sock.setblocking(False)
         reader, writer = await asyncio.open_connection(sock=sock, limit=max_message_size)
 
         logger.debug(f"Connected to {onion_address}:{port}")
         return TCPConnection(reader, writer, max_message_size)
 
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         logger.error(f"Failed to connect to {onion_address}:{port} via Tor: {e}")
         raise ConnectionError(f"Tor connection failed: {e}") from e

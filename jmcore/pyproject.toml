@@ -24,6 +24,9 @@ dependencies = [
     "coincurve @ https://github.com/ofek/coincurve/archive/7829b29c08ebb1cc80386a1cdaf8c2243c4ef5c5.zip#sha256=623b363c1e39977255d9222351e211a96dc5884aebb28e8a23d85bfef0dec37e",
     "httpx[socks]>=0.27.0",
     "httpx-socks>=0.9.0",
+    # Async SOCKS5 client used by jmcore.network.connect_via_tor
+    "python-socks>=2.0.0",
+    # requests[socks] backend so Apprise notifications can use socks5h:// proxies
     "PySocks>=1.7.1",
     "sniffio>=1.3.0",
     "pynacl>=1.5.0",
