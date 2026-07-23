@@ -66,14 +66,25 @@ class TestSortedTyper:
         assert positions == sorted(positions)
 
     def test_arguments_keep_declared_order(self) -> None:
-        """Positional order defines call syntax and must not be re-sorted."""
-        app = _build_app(SortedTyper(name="demo", no_args_is_help=True))
-        result = runner.invoke(app, ["alpha", "--help"], prog_name="demo")
-        output = click.unstyle(result.stdout)
+        """Positional order defines call syntax and must not be re-sorted.
 
-        assert result.exit_code == 0
-        # VALUE was declared before SECOND; alphabetical would swap them.
-        assert output.index("VALUE") < output.index("SECOND")
+        Checked structurally on the resolved click command instead of the
+        rendered help text: argument metavar rendering differs across typer
+        versions (e.g. ``VALUE`` in 0.26 vs ``{value}`` in 0.27).
+        """
+        app = _build_app(SortedTyper(name="demo", no_args_is_help=True))
+        root = typer.main.get_command(app)
+        ctx = root.context_class(root)
+        alpha_cmd = root.get_command(ctx, "alpha")
+        assert alpha_cmd is not None
+
+        argument_names = [
+            p.name
+            for p in alpha_cmd.get_params(ctx)
+            if getattr(p, "param_type_name", "") == "argument"
+        ]
+        # "value" was declared before "second"; alphabetical would swap them.
+        assert argument_names == ["value", "second"]
 
     def test_parsing_is_unaffected_by_sorting(self) -> None:
         app = _build_app(SortedTyper(name="demo", no_args_is_help=True))

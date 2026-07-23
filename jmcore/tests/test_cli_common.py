@@ -1174,7 +1174,9 @@ class TestSortedHelpFormatter:
     def test_options_sorted_in_help_listing(self) -> None:
         help_text = self._build_parser().format_help()
         # Match listing lines (indented) so the usage synopsis is not counted.
-        listing_entries = ("\n  --alpha", "\n  -b, --bravo", "\n  -h, --help", "\n  --zulu")
+        # Keep entries prefix-only: Python < 3.13 renders "-b BRAVO, --bravo
+        # BRAVO" while 3.13+ renders "-b, --bravo BRAVO".
+        listing_entries = ("\n  --alpha", "\n  -b", "\n  -h", "\n  --zulu")
         positions = [help_text.index(entry) for entry in listing_entries]
         assert positions == sorted(positions)
 
