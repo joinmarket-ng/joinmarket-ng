@@ -73,6 +73,7 @@ OUR_DEPOSIT = 0x11  # m/.../0'/0/0 (mixdepth 0, external)
 OUR_CJ_OUT = 0x22  # m/.../1'/0/0 (mixdepth 1, external)
 OUR_CHANGE = 0x33  # m/.../0'/1/0 (mixdepth 0, internal)
 OUR_CHANGE_2 = 0x34  # m/.../0'/1/1 (mixdepth 0, internal)
+OUR_M1_INTERNAL = 0x35  # m/.../1'/1/0 (mixdepth 1, internal)
 FOREIGN_A = 0x44
 FOREIGN_B = 0x55
 FOREIGN_C = 0x66
@@ -83,6 +84,7 @@ ADDRESS_PATHS: dict[str, tuple[int, int, int]] = {
     _addr(OUR_CJ_OUT): (1, 0, 0),
     _addr(OUR_CHANGE): (0, 1, 0),
     _addr(OUR_CHANGE_2): (0, 1, 1),
+    _addr(OUR_M1_INTERNAL): (1, 1, 0),
 }
 
 
@@ -230,7 +232,8 @@ class TestClassifyWalletTransaction:
         # cost = 52_000 - 50_200 = 1_800 (maker fees + mining share, inseparable)
         assert result.total_maker_fees_paid == 1_800
         assert result.net_fee == -1_800
-        assert result.peer_count == 3
+        # 3 equal outputs, one of them ours -> 2 makers (protocol convention).
+        assert result.peer_count == 2
         assert result.destination_address == _addr(OUR_CJ_OUT)
 
     def test_taker_sweep_to_external_destination(self) -> None:
@@ -244,6 +247,7 @@ class TestClassifyWalletTransaction:
         # cost = 32_000 - 0 - cj_amount = 2_000 in fees
         assert result.total_maker_fees_paid == 2_000
         assert result.net_fee == -2_000
+        assert result.peer_count == 2
         assert result.destination_address == ""  # unknown which equal output is ours
         assert result.source_mixdepth == 2
 
@@ -286,6 +290,45 @@ class TestClassifyWalletTransaction:
         assert result.cj_amount == 40_000
         assert result.destination_address == _addr(OUR_DEPOSIT)
         assert result.mining_fee_paid == 500
+
+    def test_internal_sweep_to_own_internal_address(self) -> None:
+        """A 1-in/1-out sweep to our own internal-branch address is the amount.
+
+        Regression: such sweeps were reported with amount 0 because only
+        external-branch outputs were considered as destinations.
+        """
+        raw = _raw_tx([("aa" * 32, 0)], [(24_890, OUR_M1_INTERNAL)])
+        parsed = parse_transaction(raw)
+        owned_inputs = [OwnedInput("ff" * 32, 0, 25_000, _addr(OUR_DEPOSIT), 0)]
+        owned_outputs = [OwnedOutput(0, 24_890, _addr(OUR_M1_INTERNAL), 1, False)]
+        result = classify_wallet_transaction(parsed, owned_inputs, owned_outputs, True, NETWORK)
+        assert result is not None
+        assert result.role == "send"
+        assert result.cj_amount == 24_890
+        assert result.destination_address == _addr(OUR_M1_INTERNAL)
+        assert result.change_address == ""
+        assert result.mining_fee_paid == 110
+
+    def test_internal_transfer_to_internal_branch_of_other_mixdepth(self) -> None:
+        """Cross-mixdepth transfer: the other-mixdepth output is the amount.
+
+        Regression: with the destination on an internal branch, the change
+        output must not shadow it and the amount must not read 0.
+        """
+        raw = _raw_tx([("aa" * 32, 0)], [(20_000, OUR_M1_INTERNAL), (20_777, OUR_CHANGE)])
+        parsed = parse_transaction(raw)
+        owned_inputs = [OwnedInput("ff" * 32, 0, 41_236, _addr(OUR_CHANGE_2), 0)]
+        owned_outputs = [
+            OwnedOutput(0, 20_000, _addr(OUR_M1_INTERNAL), 1, False),
+            OwnedOutput(1, 20_777, _addr(OUR_CHANGE), 0, False),
+        ]
+        result = classify_wallet_transaction(parsed, owned_inputs, owned_outputs, True, NETWORK)
+        assert result is not None
+        assert result.role == "send"
+        assert result.cj_amount == 20_000
+        assert result.destination_address == _addr(OUR_M1_INTERNAL)
+        assert result.change_address == _addr(OUR_CHANGE)
+        assert result.mining_fee_paid == 459
 
     def test_deposit(self) -> None:
         raw = _raw_tx([("aa" * 32, 0)], [(100_000, OUR_DEPOSIT)])
@@ -334,7 +377,8 @@ class TestReconstructHistoryFromChain:
         cj = entries[txids["cj"]]
         assert cj.role == "taker"
         assert cj.cj_amount == CJ_AMOUNT
-        assert cj.peer_count == 3
+        # 3 equal outputs, one ours -> 2 makers (protocol taker convention).
+        assert cj.peer_count == 2
         assert cj.total_maker_fees_paid == 1_500
         assert cj.net_fee == -1_500
         assert cj.destination_address == _addr(OUR_CJ_OUT)

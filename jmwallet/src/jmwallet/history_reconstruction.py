@@ -19,6 +19,9 @@ Heuristics (all pure functions of on-chain data):
   contribution; the two cannot be separated on-chain).
 - Taker fees lump maker fees and our mining-fee share together in
   ``total_maker_fees_paid`` (again inseparable on-chain).
+- Peer counts follow the protocol-row conventions: taker rows count the
+  makers (equal outputs minus our own), maker rows count all equal outputs
+  (matching ``detect_coinjoin_peer_count``).
 - Non-CoinJoin transactions become ``send`` (we funded inputs) or
   ``deposit`` (we only received) rows.
 
@@ -176,6 +179,8 @@ def classify_wallet_transaction(
             return ClassifiedTransaction(
                 role="maker",
                 cj_amount=analysis.cj_amount,
+                # Matches the equal-output count that the maker confirmation
+                # monitor backfills via ``detect_coinjoin_peer_count``.
                 peer_count=analysis.cj_count,
                 fee_received=net,
                 total_maker_fees_paid=0,
@@ -202,7 +207,9 @@ def classify_wallet_transaction(
         return ClassifiedTransaction(
             role="taker",
             cj_amount=analysis.cj_amount,
-            peer_count=analysis.cj_count,
+            # Protocol taker rows record the number of *makers*; one of the
+            # equal outputs is our own, so exclude it from the count.
+            peer_count=max(0, analysis.cj_count - 1),
             fee_received=0,
             total_maker_fees_paid=cost,
             mining_fee_paid=0,
@@ -228,15 +235,33 @@ def classify_wallet_transaction(
             destination = scriptpubkey_to_address(bytes(largest.script), network)
         except ValueError:
             destination = ""
+        change_address = next((o.address for o in owned_outputs if not o.is_external), "")
     else:
-        # Internal transfer: every output is ours. Report the external-branch
-        # output as the destination (matches how live sends record internal
-        # mixdepth-to-mixdepth transfers).
-        dest_out = next((o for o in owned_outputs if o.is_external), None)
-        destination = dest_out.address if dest_out else ""
-        amount = dest_out.value if dest_out else 0
-
-    change_address = next((o.address for o in owned_outputs if not o.is_external), "")
+        # Internal transfer: every output is ours. A single output is a sweep
+        # to ourselves. With several outputs, the change returns to the source
+        # mixdepth, so an output on a *different* mixdepth is the transfer
+        # destination (JoinMarket internal transfers move coins across
+        # mixdepths, typically to the internal branch, so branch alone cannot
+        # identify the destination). External-branch and largest-value are
+        # fallbacks for the ambiguous same-mixdepth case.
+        if len(owned_outputs) == 1:
+            dest_out = owned_outputs[0]
+        else:
+            cross_mixdepth = [o for o in owned_outputs if o.mixdepth != source_mixdepth]
+            if cross_mixdepth:
+                dest_out = max(cross_mixdepth, key=lambda o: o.value)
+            else:
+                dest_out = next(
+                    (o for o in owned_outputs if o.is_external),
+                    max(owned_outputs, key=lambda o: o.value),
+                )
+        destination = dest_out.address
+        amount = dest_out.value
+        change_candidates = [o for o in owned_outputs if o is not dest_out]
+        change_address = next(
+            (o.address for o in change_candidates if not o.is_external),
+            change_candidates[0].address if change_candidates else "",
+        )
     return ClassifiedTransaction(
         role="send",
         cj_amount=amount,
