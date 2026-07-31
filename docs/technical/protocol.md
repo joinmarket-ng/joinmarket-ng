@@ -305,6 +305,7 @@ This implementation uses feature flags instead of protocol version bumps to enab
 | Feature | Description |
 |---------|-------------|
 | `peerlist_features` | Supports extended peerlist format with feature flags in `F:` field |
+| `cofunded_channel_ring_v1` | Backend-validated co-funded private Taproot channel ring support |
 | `ping` | Supports application-level PING/PONG heartbeat liveness checks |
 | `neutrino_compat` | Can provide extended UTXO format with scriptPubKey and blockheight for own UTXOs |
 
@@ -326,6 +327,21 @@ Extended UTXO format includes scriptPubKey + block height for verification:
 | Extended | `txid:vout:scriptpubkey:height` |
 
 Both full-node and neutrino joinmarket-ng makers advertise `neutrino_compat` because both can provide metadata for their own wallet UTXOs. Neutrino takers require this feature to verify maker UTXOs via compact block filters. Reference implementation makers do not advertise features, so neutrino takers avoid them at selection time when possible (preferring makers with confirmed `neutrino_compat` if enough exist to fill all slots), and otherwise drop and replace them during the auth phase when the missing feature is detected in the `!pubkey` handshake.
+
+**Co-funded Channel Ring Participant:**
+
+`cofunded_channel_ring_v1` is accepted only for an authenticated `tr0` session after
+`!ioauth`. Ring envelopes are canonical JSON carried inside the existing encrypted
+session as `!ring <type> <base64url>`. The maker implements
+`ring_invite -> ring_plan -> ring_open -> ring_unsigned -> ring_ready_set -> ring_sign`.
+The taker is the durable coordinator and a full ring participant: it contributes one
+equal output, opens one outgoing channel, and accepts one incoming channel. `ring_open`
+starts the two exact backend attempts only after all plans have been acknowledged.
+Every participant durably acknowledges the complete readiness set and signing boundary.
+Ordinary `!tx` verification is replaced by the manifest/readiness verifier only for a
+session durably bound to a ring revision. Cancellation is allowed before `ring_sign` and
+requires exact backend and chain absence evidence after PSBT verification. Once signing
+authorization is sent, unresolved state is retained for reconciliation instead of canceled.
 
 **Handshake Integration:**
 

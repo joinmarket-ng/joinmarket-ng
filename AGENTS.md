@@ -19,10 +19,11 @@ Change outputs are also included, but they are of different amounts and can be e
 
 ## Commands
 
-- **Test (unit, per-component)**: `pytest jmcore directory_server orderbook_watcher maker taker jmwallet jmwalletd tumbler` (excludes Docker tests by default)
+- **Test (unit, per-component)**: `pytest jmcore directory_server orderbook_watcher maker taker jmwallet jmwalletd tumbler jmswap` (excludes Docker tests by default)
 - **Test (unit, repo root)**: `pytest --ignore=tests/playwright tests` (TUI script, release/changelog/flatpak helpers, finalize-bond-psbt; cannot be merged with the per-component invocation because each component ships its own `tests` package and the duplicated module names trip pytest's collector)
 - **Test (frontend, orderbook watcher UI)**: `cd tests/playwright && npm run test:obwatcher` - Headless browser tests for the static web UI, no Docker needed
 - **Test (full suite)**: `./scripts/run_parallel_tests.sh` - Runs all suites (unit + Docker) in parallel via Compose project isolation; `--suite <name>` runs a single suite
+- **Test (channel ring)**: `./scripts/run_parallel_tests.sh --suite ring-e2e` - Runs the isolated four-node co-funded channel-ring test with fresh state
 - **Test (specific marker)**: `pytest -m e2e --fail-on-skip` - Uses `--fail-on-skip` to catch missing setup
 - **Lint/Format**: `pre-commit run --all-files` (Recommended).
   - Manual: `ruff check .` / `ruff format .` / `mypy .`
@@ -36,6 +37,7 @@ Tests use pytest markers to organize by Docker profile:
 - `reference`: JAM compatibility tests
 - `neutrino`: Light client tests
 - `reference_maker`: JAM makers + our taker
+- `ring_e2e`: Four-node co-funded channel-ring test; excluded from default E2E and run in its isolated profile
 - `docker`: Base marker for any Docker test
 
 **Important:** CI and `run_parallel_tests.sh` use `--fail-on-skip` to fail instead of skip when setup is missing.
@@ -76,7 +78,7 @@ Tests use pytest markers to organize by Docker profile:
 
 ## Project Structure
 Monorepo with `src/` layout. Root `pytest.ini` handles global tests.
-Components: `jmcore` (Lib), `directory_server`, `jmwallet`, `maker`, `taker`, `orderbook_watcher`.
+Components: `jmcore` (Lib), `directory_server`, `jmwallet`, `maker`, `taker`, `orderbook_watcher`, `jmswap`.
 
 ## Documentation
 

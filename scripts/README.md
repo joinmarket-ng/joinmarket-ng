@@ -10,6 +10,7 @@ Utility scripts for JoinMarket NG development and operations.
 - **bump_version.py** - Bump the project version across all components
 - **coinjoin_notifier.py** - Monitor and notify about CoinJoin events
 - **diagnose_maker.py** - Discover a maker's onion endpoint, compare directory and direct offers, and analyze any fidelity bond proofs
+- **fund-ring-e2e-wallets.sh** - Create and fund fresh regtest wallets for the channel-ring E2E profile
 - **fund-test-wallets.sh** - Fund regtest wallets for testing
 - **generate_changelog.py** - Generate changelog entries from git history
 - **config_changelog.py** - Generate or backfill per-release configuration template changes
@@ -18,7 +19,9 @@ Utility scripts for JoinMarket NG development and operations.
 - **generate_tor_keys.py** - Generate Tor hidden service keys
 - **regtest-miner-jam.sh** - Run Bitcoin Core regtest miner for JAM compatibility testing
 - **regtest-miner.sh** - Run Bitcoin Core regtest miner
-- **run_parallel_tests.sh** - Execute all test suites (including Docker-based e2e tests) in parallel using Docker Compose project isolation
+- **ring-e2e-lnd.sh** - Start one stock LND node for the isolated channel-ring profile
+- **ring-e2e-maker.sh** - Start one configured maker for the isolated channel-ring profile
+- **run_parallel_tests.sh** - Execute all test suites, including `--suite ring-e2e` and `--suite swap-provider-e2e`, using Docker Compose project isolation
 - **sign-release.sh** - Sign a release manifest (supports local-first and CI-first workflows)
 - **update_readme_help.py** - Update generated CLI help in component READMEs (run manually when CLI changes; user guides link to this reference)
 - **update-base-images.sh** - Update Docker base image digests

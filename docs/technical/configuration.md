@@ -86,6 +86,8 @@ Nested fields use double underscores:
 - `NETWORK_CONFIG__NETWORK`
 - `MAKER__MIN_SIZE`
 - `TAKER__COUNTERPARTY_COUNT`
+- `MAKER__CHANNEL_RING__ENABLED`
+- `MAKER__SWAP_PROVIDER__ENABLED`
 
 Some CLI flags still support legacy env var names (for compatibility), but config/env should prefer the canonical section-based names above.
 
@@ -208,6 +210,65 @@ The `[directory_server]` section supports heartbeat liveness controls:
 - `heartbeat_pong_wait` (default `30.0`): seconds to wait for PONG reply
 
 These values are tuned to match joinmarket-rs defaults for interoperability.
+
+## Co-Funded Channel Ring
+
+The nested `[maker.channel_ring]` and `[taker.channel_ring]` sections are disabled by
+default. Enabling either requires a `p2tr` wallet, a `tr0` offer family, a local
+TLS-authenticated LND gRPC endpoint, and a v3 onion `host:port` advertised by that
+LND node identity. Remote or shared LND gRPC endpoints are rejected.
+
+The runtime checks final Taproot channel support and the live-validated safe
+verified-channel retirement path before advertising or selecting
+`cofunded_channel_ring_v1`.
+Participant state is stored in atomic mode-0600 JSON files under a mode-0700
+directory. The macaroon and TLS certificate contents are never persisted there.
+
+Ring-enabled takers require a full backend that can prove transaction absence in
+both the mempool and chain. They select an exact, uniformly capable maker set and
+run a strict all-party round. A failed ring round is aborted without ordinary
+change outputs, fallback CoinJoin construction, or a smaller ring.
+
+### Live Validation
+
+The isolated Docker test uses three makers, four stock LND v0.21.1 nodes, and
+fresh regtest wallets. It intentionally rejects one revision before completing a
+four-party ring, paying every directed channel edge, and restarting the taker to
+verify persisted reconciliation. Remove the bind-mounted test state before each
+run:
+
+```bash
+rm -rf tmp/ring-e2e
+docker compose -f jmswap/docker-compose.ring-e2e.yml --profile ring-e2e up -d
+RING_E2E=1 pytest -c pytest.ini tests/e2e/test_cofunded_ring_e2e.py \
+  -m ring_e2e --fail-on-skip --no-cov -v -s --timeout=900
+docker compose -f jmswap/docker-compose.ring-e2e.yml --profile ring-e2e down -v
+```
+
+The parallel runner provides the same test with isolated ports and automatic
+state cleanup via `./scripts/run_parallel_tests.sh --suite ring-e2e`.
+
+## Maker Swap Provider
+
+`[maker.swap_provider]` is disabled by default. Enabling it requires
+`bitcoin.backend_type = "descriptor_wallet"`, `wallet.address_type = "p2tr"`, one
+or more `ws://` or `wss://` Nostr relays, an HTTPS LND REST URL, and pinned LND TLS
+and macaroon paths. Nostr always uses `[tor]` SOCKS settings. Direct onion serving
+also requires a static maker onion host or enabled Tor control.
+
+The nested section controls offered directions, percentage and mining fees, amount
+limits, confirmation depth, invoice/swap timeout, polling, offer refresh, request
+limits, and the mode-0700 persistence directory. Forward requests that do not register
+an invoice expire separately, concurrent nonterminal swaps are globally capped, and only
+the configured number of newest terminal records are retained. `use_channel_ring_lnd = true` is
+an explicit privacy tradeoff: it reuses the channel-ring LND credentials and is
+rejected unless that backend is enabled. The separate REST URL is still required.
+
+The isolated Docker profile exercises Tor-routed Nostr discovery/RPC, authenticated
+direct onion RPC, both swap directions, provider restart, cooperative MuSig2 spend,
+and script-path settlement. Run it with
+`./scripts/run_parallel_tests.sh --suite swap-provider-e2e`, or use the manual
+commands in `jmswap/README.md`.
 
 ## Notes
 

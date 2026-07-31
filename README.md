@@ -54,6 +54,7 @@ time.
   commands, settings, specialized operations, and protocol details.
 - [Contribute](https://joinmarket-ng.github.io/joinmarket-ng/technical/development/):
   development setup, tests, and documentation preview.
+- [Channel backend](jmswap/README.md): experimental co-funded channel operations.
 
 CoinJoin does not guarantee anonymity. Before using funds, read the
 [privacy practices](https://joinmarket-ng.github.io/joinmarket-ng/technical/best-practices/)

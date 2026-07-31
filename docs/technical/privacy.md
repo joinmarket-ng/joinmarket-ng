@@ -4,6 +4,47 @@ For practical guidance, start with [privacy practices](best-practices.md).
 [Collaborative Transaction Privacy](https://gist.github.com/nothingmuch/d84ba390d89b5b08897af2d95009c2a1)
 examines broader transaction-graph attacks and what privacy claims need to establish.
 
+## Co-funded Channel Rings
+
+A co-funded channel-ring round has two separate privacy products. First, every
+participant receives one equal-value `tr0` CoinJoin output. Second, each
+participant's finalized residual funds one outgoing and one incoming private
+Taproot Lightning channel. The equal output remains an ordinary wallet output:
+the taker can keep it in the destination mixdepth, use it in a later CoinJoin or
+tumbler schedule, or spend it to an unrelated destination. It does not have to
+be merged with a channel close, and doing so would undo much of the separation
+the round created.
+
+The shared funding transaction is public. An observer can see its equal outputs
+and four or more funding-sized P2TR outputs, and can later recognize a funding
+output when its channel closes. Private channels are absent from the public
+Lightning graph, but this does not hide their funding transaction or guarantee
+that endpoints, routing peers, chain observers, or a compromised LND cannot
+correlate them. The channel layer improves the residual path only after real
+off-chain balance movement makes the opening allocation stale.
+
+For useful balance movement, route actual payments over each edge and avoid
+immediately reversing them. The implementation's live test pays every directed
+edge, but that is a correctness test, not a sufficient production privacy
+schedule. Amounts, timing, destinations, and routes need independent variation.
+Do not treat self-payments around a short cycle as anonymous: adjacent peers can
+observe their channel traffic, and a sufficiently broad observer can correlate
+the cycle.
+
+Channel exits should not recreate the opening cohort:
+
+- Keep the equal output and channel balances on independent wallet paths.
+- Prefer ordinary Lightning payments to unrelated recipients while channels
+  remain useful.
+- For an on-chain exit, use a fresh destination and stagger cooperative closes
+  across unrelated block heights. LND can deliver a cooperative close directly
+  to a validated destination when its close API supports that option.
+- Avoid closing all ring channels together or consolidating their close outputs.
+- Reserve force close for unavailable or adversarial peers. Commitment
+  transactions, anchor outputs, CSV delays, and clustered timing create a much
+  stronger fingerprint than a cooperative close. A simultaneous force-close
+  cohort can reveal the whole ring even though the channels were private.
+
 ## Mixdepths
 
 Mixdepths are isolated wallet accounts. Inputs for one CoinJoin come from one
