@@ -115,8 +115,6 @@ services:
       - -rpcbind=0.0.0.0
       - -zmqpubrawblock=tcp://0.0.0.0:28332
       - -zmqpubrawtx=tcp://0.0.0.0:28333
-    ports:
-      - "${RING_E2E_BITCOIN_PORT:-20443}:18443"
     volumes:
       - ring-bitcoin-data:/data/.bitcoin
     networks: [ring-network]
@@ -148,8 +146,6 @@ services:
       DIRECTORY_SERVER__HOST: 0.0.0.0
       DIRECTORY_SERVER__PORT: 5222
       LOGGING__LEVEL: DEBUG
-    ports:
-      - "${RING_E2E_DIRECTORY_PORT:-25222}:5222"
     networks: [ring-network]
     healthcheck:
       test: ["CMD", "jm-directory-ctl", "health"]
@@ -170,8 +166,6 @@ services:
       NETWORK_CONFIG__NETWORK: regtest
       DIRECTORY_NODES: ring-directory:5222
       LOGGING__LEVEL: DEBUG
-    ports:
-      - "${RING_E2E_ORDERBOOK_PORT:-28080}:8000"
     networks: [ring-network]
     depends_on:
       ring-directory:
@@ -187,10 +181,10 @@ services:
 
   ring-tor:
     image: ghcr.io/m0wer/docker-tor@sha256:d149ac54a54cd4dd3b4e2e7322efbe0f86b91dd41fc5e851ae87aa2761296065
-    ports:
-      - "127.0.0.1:${RING_E2E_TOR_SOCKS_PORT:-29050}:9050"
     volumes:
       - ../tests/e2e/ring-e2e-torrc:/etc/tor/torrc:ro
+      - ../scripts/ring-e2e-tor-health.sh:/scripts/ring-e2e-tor-health.sh:ro
+      - ../scripts/tor-bootstrap-health.sh:/scripts/tor-bootstrap-health.sh:ro
       - ${RING_E2E_DATA_DIR:-../tmp/ring-e2e}/tor:/var/lib/tor
     networks: [ring-network]
     depends_on:
@@ -205,18 +199,25 @@ services:
       ring-onion-taker:
         condition: service_started
     healthcheck:
-      test:
-        - CMD-SHELL
-        - >-
-          test -s /var/lib/tor/lnd-maker1/hostname &&
-          test -s /var/lib/tor/lnd-maker2/hostname &&
-          test -s /var/lib/tor/lnd-maker3/hostname &&
-          test -s /var/lib/tor/lnd-taker/hostname &&
-          test -s /var/lib/tor/swap-nostr/hostname
+      test: ["CMD", "/bin/bash", "/scripts/ring-e2e-tor-health.sh"]
       interval: 2s
       timeout: 2s
       retries: 120
     profiles: [ring-e2e]
+
+  ring-tor-client:
+    image: ghcr.io/m0wer/docker-tor@sha256:d149ac54a54cd4dd3b4e2e7322efbe0f86b91dd41fc5e851ae87aa2761296065
+    volumes:
+      - ../tests/e2e/ring-e2e-client-torrc:/etc/tor/torrc:ro
+      - ../scripts/tor-bootstrap-health.sh:/scripts/tor-bootstrap-health.sh:ro
+      - ring-tor-client-data:/var/lib/tor
+    networks: [ring-network]
+    healthcheck:
+      test: ["CMD", "/bin/bash", "/scripts/tor-bootstrap-health.sh"]
+      interval: 2s
+      timeout: 3s
+      retries: 120
+    profiles: [swap-provider-e2e]
 
   ring-onion-maker1:
     image: alpine/socat:1.8.0.3
@@ -246,9 +247,6 @@ services:
     <<: *lnd
     environment:
       LND_NODE: lnd-maker1
-    ports:
-      - "${RING_E2E_MAKER1_GRPC_PORT:-21009}:10009"
-      - "${SWAP_PROVIDER_E2E_MAKER_REST_PORT:-28081}:8080"
     volumes:
       - ../scripts:/scripts:ro
       - ${RING_E2E_DATA_DIR:-../tmp/ring-e2e}/tor:/tor:ro
@@ -258,8 +256,6 @@ services:
     <<: *lnd
     environment:
       LND_NODE: lnd-maker2
-    ports:
-      - "${RING_E2E_MAKER2_GRPC_PORT:-22009}:10009"
     volumes:
       - ../scripts:/scripts:ro
       - ${RING_E2E_DATA_DIR:-../tmp/ring-e2e}/tor:/tor:ro
@@ -269,8 +265,6 @@ services:
     <<: *lnd
     environment:
       LND_NODE: lnd-maker3
-    ports:
-      - "${RING_E2E_MAKER3_GRPC_PORT:-23009}:10009"
     volumes:
       - ../scripts:/scripts:ro
       - ${RING_E2E_DATA_DIR:-../tmp/ring-e2e}/tor:/tor:ro
@@ -280,9 +274,6 @@ services:
     <<: *lnd
     environment:
       LND_NODE: lnd-taker
-    ports:
-      - "${RING_E2E_TAKER_GRPC_PORT:-24009}:10009"
-      - "${SWAP_PROVIDER_E2E_CLIENT_REST_PORT:-28082}:8080"
     volumes:
       - ../scripts:/scripts:ro
       - ${RING_E2E_DATA_DIR:-../tmp/ring-e2e}/tor:/tor:ro
@@ -296,6 +287,7 @@ services:
       LND_NODE: lnd-maker1
       MNEMONIC: avoid whisper mesh corn already blur sudden fine planet chicken hover sniff
       TOR__TARGET_HOST: lnd-maker1
+      TOR__SOCKS_HOST: ${SWAP_PROVIDER_TOR_SOCKS_HOST:-ring-tor}
       MAKER__SWAP_PROVIDER__ENABLED: ${SWAP_PROVIDER_E2E:-false}
       MAKER__SWAP_PROVIDER__DIRECTIONS: '["forward", "reverse"]'
       MAKER__SWAP_PROVIDER__PERCENTAGE_FEE: "0.1"
@@ -366,8 +358,41 @@ services:
       ring-wallet-funder:
         condition: service_completed_successfully
 
+  swap-provider-test-runner:
+    image: ${SWAP_PROVIDER_TEST_IMAGE:-ring-e2e-swap-provider-test:latest}
+    build:
+      context: ..
+      dockerfile: tests/e2e/Dockerfile.swap-provider
+      args:
+        MAKER_IMAGE: ${MAKER_IMAGE:-ring-e2e-maker:latest}
+    environment:
+      SWAP_PROVIDER_E2E: "1"
+      SWAP_PROVIDER_E2E_PROJECT: ${SWAP_PROVIDER_E2E_PROJECT:-jm-swap-provider-e2e}
+      RING_E2E_DATA_DIR: /ring-data
+      RING_E2E_BITCOIN_RPC_URL: http://ring-bitcoin:18443
+      RING_E2E_TOR_SOCKS_HOST: ring-tor-client
+      RING_E2E_TOR_SOCKS_PORT: 9050
+      SWAP_PROVIDER_E2E_CLIENT_REST_URL: https://lnd-taker:8080
+    volumes:
+      - ${RING_E2E_DATA_DIR:-../tmp/ring-e2e}:/ring-data
+      - ${SWAP_PROVIDER_E2E_JUNIT_DIR:-../junit}:/workspace/junit
+    networks: [ring-network]
+    depends_on:
+      ring-bitcoin:
+        condition: service_healthy
+      ring-maker1:
+        condition: service_started
+      ring-nostr:
+        condition: service_started
+      ring-tor-client:
+        condition: service_healthy
+      lnd-taker:
+        condition: service_healthy
+    profiles: [swap-provider-test]
+
 networks:
   ring-network:
 
 volumes:
   ring-bitcoin-data:
+  ring-tor-client-data:

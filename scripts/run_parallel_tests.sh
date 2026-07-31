@@ -492,6 +492,7 @@ ring_compose_cmd() {
         docker compose \
             -p "${PROJECT_PREFIX}-${suite}" \
             -f "${PROJECT_ROOT}/jmswap/docker-compose.ring-e2e.yml" \
+            -f "${PROJECT_ROOT}/jmswap/docker-compose.ring-e2e.host.yml" \
             --profile ring-e2e \
             "$@"
 }
@@ -499,16 +500,9 @@ ring_compose_cmd() {
 swap_provider_compose_cmd() {
     local suite="swap-provider-e2e"
     RING_E2E_DATA_DIR="${PARALLEL_DIR}/shared/${suite}" \
-    RING_E2E_BITCOIN_PORT="$(host_port "$suite" btc_rpc)" \
-    RING_E2E_DIRECTORY_PORT="$(host_port "$suite" dir)" \
-    RING_E2E_ORDERBOOK_PORT="$(host_port "$suite" obwatch)" \
-    RING_E2E_TOR_SOCKS_PORT="$(host_port "$suite" tor_socks)" \
-    RING_E2E_MAKER1_GRPC_PORT="$(host_port "$suite" lnd_maker1)" \
-    RING_E2E_MAKER2_GRPC_PORT="$(host_port "$suite" lnd_maker2)" \
-    RING_E2E_MAKER3_GRPC_PORT="$(host_port "$suite" lnd_maker3)" \
-    RING_E2E_TAKER_GRPC_PORT="$(host_port "$suite" lnd_taker)" \
-    SWAP_PROVIDER_E2E_MAKER_REST_PORT="$(host_port "$suite" lnd_maker1_rest)" \
-    SWAP_PROVIDER_E2E_CLIENT_REST_PORT="$(host_port "$suite" lnd_taker_rest)" \
+    SWAP_PROVIDER_E2E_PROJECT="${PROJECT_PREFIX}-${suite}" \
+    SWAP_PROVIDER_E2E_JUNIT_DIR="${PARALLEL_DIR}/junit/${suite}" \
+    SWAP_PROVIDER_TOR_SOCKS_HOST=ring-tor-client \
     SWAP_PROVIDER_E2E=true \
         docker compose \
             -p "${PROJECT_PREFIX}-${suite}" \
@@ -516,6 +510,16 @@ swap_provider_compose_cmd() {
             --profile ring-e2e \
             --profile swap-provider-e2e \
             "$@"
+}
+
+run_swap_provider_test() {
+    local suite="swap-provider-e2e"
+    RING_E2E_DATA_DIR="${PARALLEL_DIR}/shared/${suite}" \
+    SWAP_PROVIDER_E2E_PROJECT="${PROJECT_PREFIX}-${suite}" \
+    SWAP_PROVIDER_E2E_JUNIT_DIR="${PARALLEL_DIR}/junit/${suite}" \
+    SWAP_PROVIDER_TOR_SOCKS_HOST=ring-tor-client \
+    SWAP_PROVIDER_E2E=true \
+        "${PROJECT_ROOT}/scripts/run-swap-provider-e2e.sh"
 }
 
 # =============================================================================
@@ -922,6 +926,7 @@ configure_shared_images() {
     export JMWALLETD_IMAGE="${jmwalletd_image:-${SHARED_IMAGE_PROJECT}-jmwalletd:latest}"
     export JAM_NG_BASE_IMAGE="${jam_ng_base_image:-${SHARED_IMAGE_PROJECT}-jam-playwright-base:latest}"
     export JAM_NG_IMAGE="${jam_ng_image:-${SHARED_IMAGE_PROJECT}-jam-playwright:latest}"
+    export SWAP_PROVIDER_TEST_IMAGE="${SHARED_IMAGE_PROJECT}-swap-provider-test:latest"
 }
 
 build_images() {
@@ -942,6 +947,7 @@ build_images() {
         --profile taker \
         build --parallel 2>&1 | tee "${PARALLEL_DIR}/build.log"
     configure_shared_images
+    swap_provider_compose_cmd build swap-provider-test-runner
     log_success "Docker images built"
 }
 
@@ -1083,7 +1089,6 @@ run_suite_swap_provider_e2e() {
     local suite="swap-provider-e2e"
     local log="${PARALLEL_DIR}/${suite}.log"
     local data_dir="${PARALLEL_DIR}/shared/${suite}"
-    local project="${PROJECT_PREFIX}-${suite}"
 
     log_suite "Starting: Maker Swap Provider E2E Tests ($suite)"
     local rc=0
@@ -1092,18 +1097,10 @@ run_suite_swap_provider_e2e() {
         set -e
         cleanup_suite "$suite"
         mkdir -p "$data_dir"
+        mkdir -p "${PARALLEL_DIR}/junit/${suite}"
         swap_provider_compose_cmd up -d
 
-        SWAP_PROVIDER_E2E=1 \
-        SWAP_PROVIDER_E2E_PROJECT="$project" \
-        RING_E2E_DATA_DIR="$data_dir" \
-        RING_E2E_BITCOIN_PORT="$(host_port "$suite" btc_rpc)" \
-        RING_E2E_TOR_SOCKS_PORT="$(host_port "$suite" tor_socks)" \
-        SWAP_PROVIDER_E2E_MAKER_REST_PORT="$(host_port "$suite" lnd_maker1_rest)" \
-        SWAP_PROVIDER_E2E_CLIENT_REST_PORT="$(host_port "$suite" lnd_taker_rest)" \
-        COVERAGE_FILE=".coverage.${suite}" \
-            pytest -c pytest.ini tests/e2e/test_swap_provider_e2e.py \
-                -m swap_provider_e2e --fail-on-skip --no-cov -lv --timeout=900
+        run_swap_provider_test
     ) > "$log" 2>&1
     rc=$?
     set -e

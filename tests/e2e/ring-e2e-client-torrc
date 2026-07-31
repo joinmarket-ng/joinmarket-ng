@@ -1,0 +1,6 @@
+DataDirectory /var/lib/tor
+Log notice stdout
+SocksPort 0.0.0.0:9050
+ControlPort 0.0.0.0:9051
+CookieAuthentication 0
+HashedControlPassword 16:B71AF1358BECFE1A608ED040AB0857A7598DCD6F452513F9DBB9851032

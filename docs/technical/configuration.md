@@ -239,10 +239,15 @@ run:
 
 ```bash
 rm -rf tmp/ring-e2e
-docker compose -f jmswap/docker-compose.ring-e2e.yml --profile ring-e2e up -d
+export RING_E2E_PROJECT=jm-ring-e2e
+docker compose -p "$RING_E2E_PROJECT" \
+  -f jmswap/docker-compose.ring-e2e.yml \
+  -f jmswap/docker-compose.ring-e2e.host.yml --profile ring-e2e up -d
 RING_E2E=1 pytest -c pytest.ini tests/e2e/test_cofunded_ring_e2e.py \
   -m ring_e2e --fail-on-skip --no-cov -v -s --timeout=900
-docker compose -f jmswap/docker-compose.ring-e2e.yml --profile ring-e2e down -v
+docker compose -p "$RING_E2E_PROJECT" \
+  -f jmswap/docker-compose.ring-e2e.yml \
+  -f jmswap/docker-compose.ring-e2e.host.yml --profile ring-e2e down -v
 ```
 
 The parallel runner provides the same test with isolated ports and automatic

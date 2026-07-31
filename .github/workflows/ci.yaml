@@ -693,6 +693,7 @@ jobs:
       ORDERBOOK_WATCHER_IMAGE: ghcr.io/${{ github.repository }}/orderbook-watcher:ci-unsafe-do-not-run-${{ github.event.pull_request.head.sha || github.sha }}
       MAKER_IMAGE: ghcr.io/${{ github.repository }}/maker:ci-unsafe-do-not-run-${{ github.event.pull_request.head.sha || github.sha }}
       RING_E2E_DATA_DIR: ${{ runner.temp }}/ring-e2e
+      RING_E2E_PROJECT: jm-ring-e2e
     steps:
       - uses: actions/checkout@v6
         with:
@@ -722,7 +723,9 @@ jobs:
 
       - name: Start isolated channel-ring profile
         run: |
-          docker compose -f jmswap/docker-compose.ring-e2e.yml \
+          docker compose -p "$RING_E2E_PROJECT" \
+            -f jmswap/docker-compose.ring-e2e.yml \
+            -f jmswap/docker-compose.ring-e2e.host.yml \
             --profile ring-e2e up -d
 
       - name: Run co-funded channel-ring E2E test
@@ -736,15 +739,21 @@ jobs:
       - name: Show channel-ring logs
         if: always()
         run: |
-          docker compose -f jmswap/docker-compose.ring-e2e.yml \
+          docker compose -p "$RING_E2E_PROJECT" \
+            -f jmswap/docker-compose.ring-e2e.yml \
+            -f jmswap/docker-compose.ring-e2e.host.yml \
             --profile ring-e2e ps
-          docker compose -f jmswap/docker-compose.ring-e2e.yml \
+          docker compose -p "$RING_E2E_PROJECT" \
+            -f jmswap/docker-compose.ring-e2e.yml \
+            -f jmswap/docker-compose.ring-e2e.host.yml \
             --profile ring-e2e logs --tail=200
 
       - name: Cleanup
         if: always()
         run: |
-          docker compose -f jmswap/docker-compose.ring-e2e.yml \
+          docker compose -p "$RING_E2E_PROJECT" \
+            -f jmswap/docker-compose.ring-e2e.yml \
+            -f jmswap/docker-compose.ring-e2e.host.yml \
             --profile ring-e2e down -v
 
       - uses: actions/upload-artifact@v7
@@ -767,6 +776,7 @@ jobs:
       RING_E2E_DATA_DIR: ${{ runner.temp }}/swap-provider-e2e
       SWAP_PROVIDER_E2E: 'true'
       SWAP_PROVIDER_E2E_PROJECT: jm-swap-provider-e2e
+      SWAP_PROVIDER_TOR_SOCKS_HOST: ring-tor-client
     steps:
       - uses: actions/checkout@v6
         with:
@@ -774,12 +784,6 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
           allow-unsafe-pr-checkout: true
-
-      - uses: ./.github/actions/setup-python-deps
-        with:
-          python-version: '3.14'
-          components: jmcore,jmwallet,jmswap,maker
-          install-dev: 'true'
 
       - name: Log in to GHCR
         uses: docker/login-action@v4
@@ -796,17 +800,17 @@ jobs:
 
       - name: Start isolated swap-provider profile
         run: |
+          mkdir -p junit
+          docker compose -p "$SWAP_PROVIDER_E2E_PROJECT" \
+            -f jmswap/docker-compose.ring-e2e.yml \
+            --profile ring-e2e --profile swap-provider-e2e \
+            build swap-provider-test-runner
           docker compose -p "$SWAP_PROVIDER_E2E_PROJECT" \
             -f jmswap/docker-compose.ring-e2e.yml \
             --profile ring-e2e --profile swap-provider-e2e up -d
 
       - name: Run live Electrum maker swap provider E2E
-        env:
-          SWAP_PROVIDER_E2E: '1'
-        run: |
-          pytest -c pytest.ini tests/e2e/test_swap_provider_e2e.py \
-            -m swap_provider_e2e --fail-on-skip --no-cov -v -s --timeout=900 \
-            --junitxml=junit/swap-provider-e2e.xml
+        run: ./scripts/run-swap-provider-e2e.sh
 
       - name: Show swap-provider logs
         if: always()

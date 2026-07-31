@@ -21,82 +21,61 @@ from jmswap.direct import DirectOnionClientAdapter
 from jmswap.fees import forward_onchain_amount, reverse_onchain_amount
 from jmswap.lnd_lightning import LndRestLightningBackend
 from jmswap.models import FundingOutput, InvoiceState, ProviderSwapState
-from jmswap.nostr import ElectrumNostrAdapter, RelayEventTransport
+from jmswap.nostr import (
+    DISCOVERY_D_TAG,
+    SWAP_DISCOVERY_KIND,
+    ElectrumNostrAdapter,
+    RelayEventTransport,
+)
+from jmswap.nip04 import verify_event
 
 pytestmark = [pytest.mark.docker, pytest.mark.swap_provider_e2e]
 
-ROOT = Path(__file__).resolve().parents[2]
-COMPOSE_FILE = ROOT / "jmswap" / "docker-compose.ring-e2e.yml"
-DATA_DIR = Path(os.getenv("RING_E2E_DATA_DIR", ROOT / "tmp" / "swap-provider-e2e"))
-PROJECT = os.getenv("SWAP_PROVIDER_E2E_PROJECT", "jm-swap-provider-e2e")
-BITCOIN_PORT = os.getenv("RING_E2E_BITCOIN_PORT", "20443")
+DATA_DIR = Path(os.getenv("RING_E2E_DATA_DIR", "/ring-data"))
+BITCOIN_RPC_URL = os.getenv("RING_E2E_BITCOIN_RPC_URL", "http://ring-bitcoin:18443")
+TOR_HOST = os.getenv("RING_E2E_TOR_SOCKS_HOST", "ring-tor")
 TOR_PORT = int(os.getenv("RING_E2E_TOR_SOCKS_PORT", "29050"))
-MAKER_REST_PORT = os.getenv("SWAP_PROVIDER_E2E_MAKER_REST_PORT", "28081")
-CLIENT_REST_PORT = os.getenv("SWAP_PROVIDER_E2E_CLIENT_REST_PORT", "28082")
-
-
-def compose(*args: str) -> subprocess.CompletedProcess[str]:
-    environment = os.environ.copy()
-    environment["SWAP_PROVIDER_E2E"] = "true"
-    environment["RING_E2E_DATA_DIR"] = str(DATA_DIR)
-    return subprocess.run(
-        [
-            "docker",
-            "compose",
-            "-p",
-            PROJECT,
-            "-f",
-            str(COMPOSE_FILE),
-            "--profile",
-            "ring-e2e",
-            "--profile",
-            "swap-provider-e2e",
-            *args,
-        ],
-        cwd=ROOT,
-        env=environment,
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=180,
-    )
+CLIENT_REST_URL = os.getenv(
+    "SWAP_PROVIDER_E2E_CLIENT_REST_URL", "https://lnd-taker:8080"
+)
+RESTART_REQUEST = DATA_DIR / "restart-provider.request"
+RESTART_COMPLETE = DATA_DIR / "restart-provider.complete"
 
 
 def lncli(service: str, *args: str) -> dict[str, Any]:
-    result = compose(
-        "exec",
-        "-T",
-        service,
-        "lncli",
-        "--network=regtest",
-        "--tlscertpath=/root/.lnd/tls.cert",
-        "--macaroonpath=/root/.lnd/admin.macaroon",
-        *args,
+    result = subprocess.run(
+        [
+            "lncli",
+            f"--rpcserver={service}:10009",
+            "--network=regtest",
+            f"--tlscertpath={DATA_DIR / service / 'tls.cert'}",
+            f"--macaroonpath={DATA_DIR / service / 'admin.macaroon'}",
+            *args,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=60,
     )
     return json.loads(result.stdout)
 
 
+async def restart_provider() -> None:
+    RESTART_REQUEST.write_text("restart\n")
+    deadline = asyncio.get_running_loop().time() + 120
+    while not RESTART_COMPLETE.is_file():
+        if asyncio.get_running_loop().time() >= deadline:
+            raise RuntimeError("timed out waiting for provider restart")
+        await asyncio.sleep(0.25)
+
+
 def onion_hostname(service: str) -> str:
-    return compose(
-        "exec", "-T", "ring-tor", "cat", f"/var/lib/tor/{service}/hostname"
-    ).stdout.strip()
+    return (DATA_DIR / "tor" / service / "hostname").read_text().strip()
 
 
 def provider_state(swap_id: str) -> dict[str, Any] | None:
-    result = compose(
-        "exec",
-        "-T",
-        "ring-maker1",
-        "python",
-        "-c",
-        (
-            "from pathlib import Path; import sys; "
-            "path = Path('/home/jm/.joinmarket-ng/swap-provider') / f'{sys.argv[1]}.json'; "
-            "print(path.read_text() if path.is_file() else '')"
-        ),
-        swap_id,
-    )
-    return json.loads(result.stdout) if result.stdout.strip() else None
+    path = DATA_DIR / "maker1" / "swap-provider" / f"{swap_id}.json"
+    return json.loads(path.read_text()) if path.is_file() else None
 
 
 async def bitcoin_rpc(
@@ -105,7 +84,7 @@ async def bitcoin_rpc(
     suffix = f"/wallet/{wallet}" if wallet else ""
     async with httpx.AsyncClient(timeout=30) as client:
         response = await client.post(
-            f"http://127.0.0.1:{BITCOIN_PORT}{suffix}",
+            f"{BITCOIN_RPC_URL}{suffix}",
             auth=("test", "test"),
             json={
                 "jsonrpc": "2.0",
@@ -137,6 +116,19 @@ async def wait_until(predicate: Any, *, timeout: float = 90.0) -> Any:
         await asyncio.sleep(0.25)
 
 
+async def wait_for_bitcoin_rpc(*, timeout: float = 60.0) -> None:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        try:
+            await bitcoin_rpc("getblockchaininfo")
+        except httpx.HTTPError:
+            if asyncio.get_running_loop().time() >= deadline:
+                raise RuntimeError("timed out waiting for Bitcoin RPC") from None
+            await asyncio.sleep(0.25)
+        else:
+            return
+
+
 async def setup_bidirectional_liquidity() -> None:
     if lncli("lnd-maker1", "listchannels").get("channels"):
         return
@@ -157,21 +149,32 @@ async def setup_bidirectional_liquidity() -> None:
                 f"{taker_id}@{taker_onion}:9735",
                 "--timeout=30s",
             )
-        except subprocess.CalledProcessError:
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
             return False
         return True
 
-    await wait_until(connect_taker, timeout=180)
-    lncli(
-        "lnd-maker1",
-        "openchannel",
-        "--private",
-        "--min_confs=1",
-        "--sat_per_vbyte=1",
-        taker_id,
-        "3000000",
-        "1500000",
-    )
+    async def open_channel() -> bool:
+        pending = lncli("lnd-maker1", "pendingchannels")
+        if pending.get("pending_open_channels"):
+            return True
+        if not await connect_taker():
+            return False
+        try:
+            lncli(
+                "lnd-maker1",
+                "openchannel",
+                "--private",
+                "--min_confs=1",
+                "--sat_per_vbyte=1",
+                taker_id,
+                "3000000",
+                "1500000",
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            return False
+        return True
+
+    await wait_until(open_channel, timeout=180)
     await mine(6)
 
     async def active() -> bool:
@@ -180,23 +183,76 @@ async def setup_bidirectional_liquidity() -> None:
     await wait_until(active)
 
 
-async def discover_provider() -> tuple[ElectrumNostrAdapter, Any]:
+async def discover_provider() -> tuple[
+    ElectrumNostrAdapter, Any, str, RelayEventTransport
+]:
     relay_host = onion_hostname("swap-nostr")
     transport = RelayEventTransport(
         (f"ws://{relay_host}",),
-        socks_host="127.0.0.1",
+        socks_host=TOR_HOST,
         socks_port=TOR_PORT,
         stream_isolation=True,
     )
     adapter = ElectrumNostrAdapter(PrivateKey.from_int(101).secret, transport)
 
     async def found() -> Any:
-        offers = await adapter.discover(network="regtest", timeout=1.0)
+        offers = await adapter.discover(network="regtest", timeout=10.0)
         return offers[0] if offers else None
 
-    pubkey, offer = await wait_until(found)
+    pubkey, offer = await wait_until(found, timeout=180)
     adapter.select_provider(pubkey)
-    return adapter, offer
+    return adapter, offer, pubkey, transport
+
+
+def provider_offer_filters(provider_pubkey: str) -> list[dict[str, Any]]:
+    return [
+        {
+            "kinds": [SWAP_DISCOVERY_KIND],
+            "authors": [provider_pubkey],
+            "#d": [DISCOVERY_D_TAG],
+            "#r": ["net:regtest"],
+        }
+    ]
+
+
+async def provider_offer_ids(
+    transport: RelayEventTransport, provider_pubkey: str
+) -> set[str]:
+    ready = asyncio.Event()
+    identifiers: set[str] = set()
+
+    async def collect() -> None:
+        async for event in transport.subscribe_ready(
+            provider_offer_filters(provider_pubkey), ready
+        ):
+            if verify_event(event) and isinstance(event.get("id"), str):
+                identifiers.add(event["id"])
+
+    task = asyncio.create_task(collect())
+    try:
+        await asyncio.wait_for(ready.wait(), 30)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    return identifiers
+
+
+async def wait_for_provider_republish(
+    transport: RelayEventTransport, provider_pubkey: str, *, previous_ids: set[str]
+) -> None:
+    async def wait() -> None:
+        async for event in transport.subscribe(provider_offer_filters(provider_pubkey)):
+            if (
+                verify_event(event)
+                and isinstance(event.get("id"), str)
+                and event["id"] not in previous_ids
+            ):
+                return
+
+    try:
+        await asyncio.wait_for(wait(), 90)
+    except TimeoutError as exc:
+        raise RuntimeError("provider did not republish after restart") from exc
 
 
 async def find_output(address: str) -> FundingOutput | None:
@@ -233,6 +289,7 @@ async def direct_forward_swap(offer: Any, client_lnd: LndRestLightningBackend) -
     connection = await connect_via_tor(
         host,
         int(port),
+        socks_host=TOR_HOST,
         socks_port=TOR_PORT,
         socks_username="swap-e2e-direct",
         socks_password=os.urandom(16).hex(),
@@ -307,10 +364,11 @@ async def test_live_maker_swap_provider_both_directions_and_restart() -> None:
             "start the swap-provider-e2e Compose profile and set SWAP_PROVIDER_E2E=1"
         )
 
+    await wait_for_bitcoin_rpc()
     await setup_bidirectional_liquidity()
-    adapter, offer = await discover_provider()
+    adapter, offer, provider_pubkey, transport = await discover_provider()
     client_lnd = LndRestLightningBackend(
-        f"https://localhost:{CLIENT_REST_PORT}",
+        CLIENT_REST_URL,
         tls_cert_path=DATA_DIR / "lnd-taker" / "tls.cert",
         macaroon_path=DATA_DIR / "lnd-taker" / "admin.macaroon",
     )
@@ -378,8 +436,11 @@ async def test_live_maker_swap_provider_both_directions_and_restart() -> None:
     confirmed = await wait_until(lambda: find_output(reverse.address))
     assert confirmed.confirmations >= 1
 
-    compose("restart", "ring-maker1")
-    await asyncio.sleep(5)
+    published_offer_ids = await provider_offer_ids(transport, provider_pubkey)
+    await restart_provider()
+    await wait_for_provider_republish(
+        transport, provider_pubkey, previous_ids=published_offer_ids
+    )
     destination = await bitcoin_rpc(
         "getnewaddress", ["", "bech32m"], wallet="ring-funder"
     )

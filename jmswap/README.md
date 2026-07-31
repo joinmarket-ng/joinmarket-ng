@@ -51,14 +51,24 @@ cooperation fails.
 
 Run the isolated live provider test with:
 
+The restart handshake uses a bind-mounted state directory and therefore requires
+a local Docker daemon exposed through a Unix socket context.
+
 ```bash
 rm -rf tmp/swap-provider-e2e
-SWAP_PROVIDER_E2E=true docker compose \
+mkdir -p tmp/swap-provider-e2e junit
+export RING_E2E_DATA_DIR="$PWD/tmp/swap-provider-e2e"
+export SWAP_PROVIDER_E2E_PROJECT=jm-swap-provider-e2e
+export SWAP_PROVIDER_E2E=true
+docker compose -p "$SWAP_PROVIDER_E2E_PROJECT" \
+  -f jmswap/docker-compose.ring-e2e.yml \
+  --profile ring-e2e --profile swap-provider-e2e \
+  build swap-provider-test-runner
+docker compose -p "$SWAP_PROVIDER_E2E_PROJECT" \
   -f jmswap/docker-compose.ring-e2e.yml \
   --profile ring-e2e --profile swap-provider-e2e up -d
-SWAP_PROVIDER_E2E=1 pytest -c pytest.ini tests/e2e/test_swap_provider_e2e.py \
-  -m swap_provider_e2e --fail-on-skip --no-cov -v -s --timeout=900
-SWAP_PROVIDER_E2E=true docker compose \
+./scripts/run-swap-provider-e2e.sh
+docker compose -p "$SWAP_PROVIDER_E2E_PROJECT" \
   -f jmswap/docker-compose.ring-e2e.yml \
   --profile ring-e2e --profile swap-provider-e2e down -v
 ```

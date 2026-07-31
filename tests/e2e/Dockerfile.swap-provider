@@ -1,0 +1,24 @@
+ARG LND_IMAGE=lightninglabs/lnd:v0.21.1-beta
+ARG MAKER_IMAGE=ring-e2e-maker:latest
+
+FROM ${LND_IMAGE} AS lnd
+
+FROM ${MAKER_IMAGE}
+
+USER root
+WORKDIR /workspace
+
+COPY maker/requirements-dev.txt /tmp/maker-requirements-dev.txt
+RUN --mount=type=cache,target=/root/.cache/pip,id=jmng-pip-swap-provider-test \
+    pip install --require-hashes -r /tmp/maker-requirements-dev.txt && \
+    rm /tmp/maker-requirements-dev.txt
+
+COPY --from=lnd /bin/lncli /usr/local/bin/lncli
+COPY pytest.ini /workspace/pytest.ini
+COPY conftest.py /workspace/conftest.py
+COPY tests/e2e/test_swap_provider_e2e.py /workspace/tests/e2e/test_swap_provider_e2e.py
+
+CMD ["python", "-m", "pytest", "-c", "pytest.ini", \
+     "tests/e2e/test_swap_provider_e2e.py", "-m", "swap_provider_e2e", \
+     "--fail-on-skip", "--no-cov", "-lv", "--timeout=900", \
+     "--junitxml=/workspace/junit/swap-provider-e2e.xml"]

@@ -23,6 +23,7 @@ exec lnd \
     --adminmacaroonpath=/root/.lnd/admin.macaroon \
     --tlsextraip=127.0.0.1 \
     --tlsextradomain=localhost \
+    --tlsextradomain="${LND_NODE}" \
     --externalip="${onion_host}:9735" \
     --tor.active \
     --tor.socks=ring-tor:9050 \
