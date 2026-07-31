@@ -56,6 +56,28 @@ class TestPlanBuilder:
     def test_unseeded_plan_uses_operating_system_rng(self) -> None:
         assert isinstance(_params(seed=None).rng, random.SystemRandom)
 
+    def test_unseeded_plan_rng_cannot_be_reseeded(self) -> None:
+        """Behavioural complement to the type check above.
+
+        ``random.Random(None)`` also seeds itself from the operating system, so
+        two unseeded plans differ either way and only this reseeding asymmetry
+        separates the two. ``SystemRandom.seed`` is a no-op, while a Mersenne
+        Twister replays its stream.
+        """
+        rng = _params(seed=None).rng
+
+        rng.seed(7)
+        first = [rng.random() for _ in range(8)]
+        rng.seed(7)
+        second = [rng.random() for _ in range(8)]
+
+        assert first != second
+
+    def test_unseeded_plans_are_not_identical(self) -> None:
+        plans = [PlanBuilder("w", _params(seed=None)).build() for _ in range(4)]
+        waits = {tuple(phase.wait_seconds for phase in plan.phases) for plan in plans}
+        assert len(waits) > 1
+
     def test_destinations_land_in_distinct_mixdepths(self) -> None:
         params = _params(
             destinations=[

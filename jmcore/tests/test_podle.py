@@ -975,3 +975,126 @@ class TestVerifyPodleBinding:
         bound, err = verify_podle_binding(self._pubkey(), "zz")
         assert not bound
         assert "hex" in err
+
+
+class TestPoDLENonceSecurity:
+    """Security properties of the deterministic nonce derivation (ff157b24).
+
+    A deterministic nonce in a Schnorr-style proof is only safe while it stays
+    bound to every field the challenge depends on. If two proofs over different
+    challenges ever share a nonce, the UTXO private key falls out of the pair.
+    """
+
+    PRIVATE_KEY = hashlib.sha256(b"podle-nonce-security").digest()
+
+    @staticmethod
+    def _recover_nonce(commitment: PoDLECommitment, private_key: bytes) -> int:
+        """Recover k_proof from a proof, given the private key.
+
+        s = k_proof + e * k (mod n), so k_proof = s - e * k (mod n).
+        """
+        k = int.from_bytes(private_key, "big")
+        e = int.from_bytes(commitment.e, "big")
+        s = int.from_bytes(commitment.sig, "big")
+        return (s - e * k) % SECP256K1_N
+
+    @pytest.mark.parametrize(
+        ("message", "expected_nonce"),
+        [
+            (
+                b"sample",
+                0xA6E3C57DD01ABE90086538398355DD4C3B17AA873382B0F24D6129493D8AAD60,
+            ),
+            (
+                b"test",
+                0xD16B6AE827F17175E040871A1C7EC3500192C4C92677336EC2537ACAEE0008E0,
+            ),
+        ],
+    )
+    def test_rfc6979_matches_published_vectors(self, message: bytes, expected_nonce: int) -> None:
+        """The HMAC ladder must match RFC 6979, not merely be self-consistent.
+
+        Vectors are RFC 6979 appendix A.2.5 (secp256k1, SHA-256). Without this,
+        a transposed HMAC step still produces stable, unique-looking nonces and
+        every other test in this file keeps passing.
+        """
+        private_key = (0xC9AFA9D845BA75166B5C215767B1D6934E50C3DB36E89B127B8A622B120F6721).to_bytes(
+            32, "big"
+        )
+
+        nonce = next(podle._rfc6979_nonce_candidates(private_key, hashlib.sha256(message).digest()))
+
+        assert nonce == expected_nonce
+
+    def test_nonce_is_bound_to_nums_index(self) -> None:
+        """Two indices reuse one key over different J points, so the nonce must differ.
+
+        This is the key-recovery case. Both proofs share P, and each NUMS index
+        yields a different P2 and therefore a different challenge.
+        """
+        utxo_str = "a" * 64 + ":0"
+
+        first = generate_podle(self.PRIVATE_KEY, utxo_str, index=0)
+        second = generate_podle(self.PRIVATE_KEY, utxo_str, index=1)
+
+        assert first.p == second.p
+        assert first.p2 != second.p2
+        assert self._recover_nonce(first, self.PRIVATE_KEY) != self._recover_nonce(
+            second, self.PRIVATE_KEY
+        )
+
+    def test_private_key_is_not_recoverable_from_two_proofs(self) -> None:
+        """Spell out the attack that nonce reuse would enable.
+
+        Given s1 = k1 + e1*x and s2 = k2 + e2*x, an attacker who knows k1 == k2
+        computes x = (s1 - s2) / (e1 - e2) mod n. Assert that solving for x this
+        way does not return the real private key.
+        """
+        utxo_str = "b" * 64 + ":1"
+        first = generate_podle(self.PRIVATE_KEY, utxo_str, index=0)
+        second = generate_podle(self.PRIVATE_KEY, utxo_str, index=1)
+
+        e1 = int.from_bytes(first.e, "big")
+        e2 = int.from_bytes(second.e, "big")
+        s1 = int.from_bytes(first.sig, "big")
+        s2 = int.from_bytes(second.sig, "big")
+        assert e1 != e2, "challenges must differ or the recovery below is undefined"
+
+        recovered = ((s1 - s2) * pow(e1 - e2, -1, SECP256K1_N)) % SECP256K1_N
+
+        assert recovered != int.from_bytes(self.PRIVATE_KEY, "big")
+
+    def test_nonces_are_unique_across_every_transcript(self) -> None:
+        """Sweep the realistic transcript space for a single key and find no repeats."""
+        nonces: dict[int, tuple[str, int]] = {}
+
+        for utxo_str in ("c" * 64 + ":0", "c" * 64 + ":1", "d" * 64 + ":0"):
+            for index in range(10):
+                commitment = generate_podle(self.PRIVATE_KEY, utxo_str, index=index)
+                nonce = self._recover_nonce(commitment, self.PRIVATE_KEY)
+                assert nonce not in nonces, (
+                    f"nonce reused between {nonces.get(nonce)} and {(utxo_str, index)}"
+                )
+                nonces[nonce] = (utxo_str, index)
+
+        assert len(nonces) == 30
+
+    def test_nonce_depends_on_every_transcript_field(self) -> None:
+        """Each field in the transcript must change the nonce on its own."""
+        p_bytes = b"\x02" + bytes([0x11]) * 32
+        p2_bytes = b"\x02" + bytes([0x22]) * 32
+        baseline_args = (self.PRIVATE_KEY, "e" * 64 + ":0", 0, p_bytes, p2_bytes)
+        baseline = next(podle._podle_nonce_candidates(*baseline_args))
+
+        variants = {
+            "utxo": (self.PRIVATE_KEY, "e" * 64 + ":1", 0, p_bytes, p2_bytes),
+            "index": (self.PRIVATE_KEY, "e" * 64 + ":0", 1, p_bytes, p2_bytes),
+            "p": (self.PRIVATE_KEY, "e" * 64 + ":0", 0, b"\x02" + bytes([0x33]) * 32, p2_bytes),
+            "p2": (self.PRIVATE_KEY, "e" * 64 + ":0", 0, p_bytes, b"\x02" + bytes([0x44]) * 32),
+            "key": (bytes([7] * 32), "e" * 64 + ":0", 0, p_bytes, p2_bytes),
+        }
+
+        for field, args in variants.items():
+            assert next(podle._podle_nonce_candidates(*args)) != baseline, (
+                f"nonce ignores the {field} field"
+            )
