@@ -43,7 +43,7 @@ import re
 from decimal import Decimal, InvalidOperation
 from io import BytesIO
 from pathlib import Path
-from typing import Any, ClassVar, Self
+from typing import Any, ClassVar, Literal, Self
 
 from loguru import logger
 from pydantic import AliasChoices, BaseModel, Field, SecretStr, field_validator, model_validator
@@ -60,6 +60,7 @@ from jmcore.models import (
     DIRECTORY_NODES_SIGNET,
     DIRECTORY_NODES_TESTNET,
     NetworkType,
+    OfferType,
 )
 from jmcore.nick_auth import NickAuthMode, validate_directory_endpoint, validate_directory_id
 from jmcore.paths import get_default_data_dir
@@ -402,6 +403,14 @@ class NetworkSettings(BaseModel):
 class WalletSettings(BaseModel):
     """Wallet configuration."""
 
+    address_type: Literal["p2wpkh", "p2tr"] = Field(
+        default="p2wpkh",
+        description=(
+            "Wallet address type: 'p2wpkh' (BIP84 native segwit, the default) or "
+            "'p2tr' (BIP86 Taproot key-path). A p2tr wallet participates in tr0 "
+            "Taproot CoinJoins (JMP-0005)."
+        ),
+    )
     mixdepth_count: int = Field(
         default=5,
         ge=1,
@@ -1189,6 +1198,15 @@ class TakerSettings(BaseModel):
         description=(
             "Maximum fill/auth replacement attempts to restore counterparty_count "
             "before proceeding at minimum_makers (0 = disabled)."
+        ),
+    )
+    preferred_offer_type: OfferType = Field(
+        default=OfferType.SW0_RELATIVE,
+        description=(
+            "Preferred offer family (rigid pit, JMP-0005). 'sw0reloffer'/'sw0absoffer' "
+            "select a native-segwit (P2WPKH) pit; 'tr0reloffer'/'tr0absoffer' a Taproot "
+            "(P2TR) pit. The taker only joins makers of this family and its own outputs "
+            "use this type, so it must match wallet.address_type."
         ),
     )
     rescan_interval_sec: int = Field(

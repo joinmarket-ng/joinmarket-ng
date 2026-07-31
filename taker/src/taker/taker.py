@@ -28,7 +28,7 @@ from jmcore.commitment_blacklist import set_blacklist_path
 from jmcore.crypto import NickIdentity
 from jmcore.fee_policy import fee_rate_meets_minimum
 from jmcore.logging_context import coinjoin_id_from_commitment, coinjoin_log_context
-from jmcore.models import Offer
+from jmcore.models import Offer, offer_output_script_type, offer_types_for_family
 from jmcore.notifications import get_notifier
 from jmcore.paths import read_nick_state
 from jmcore.protocol import FEATURE_NEUTRINO_COMPAT, JM_VERSION
@@ -190,6 +190,16 @@ class Taker(TakerMonitoringMixin):
         self.config = config
         self.confirmation_callback = confirmation_callback
 
+        pit_script_type = offer_output_script_type(config.preferred_offer_type)
+        wallet_type = getattr(wallet, "address_type", None)
+        if wallet_type in ("p2wpkh", "p2tr") and pit_script_type != wallet_type:
+            raise ValueError(
+                f"preferred_offer_type {config.preferred_offer_type.value!r} implies a "
+                f"{pit_script_type!r} pit but the wallet is {wallet_type!r}; a rigid "
+                f"JMP-0005 pit requires them to match (use a {pit_script_type!r} wallet or a "
+                f"matching offer family)."
+            )
+
         self.nick_identity = NickIdentity(JM_VERSION)
         self.nick = self.nick_identity.nick
         self.state = TakerState.IDLE
@@ -235,6 +245,7 @@ class Taker(TakerMonitoringMixin):
             require_quantized_cj_fees=config.require_quantized_cj_fees,
             round_up_cj_fees=config.round_up_cj_fees,
             equalize_cj_fees=config.equalize_cj_fees,
+            allowed_types=offer_types_for_family(config.preferred_offer_type),
         )
 
         # PoDLE manager for commitment tracking

@@ -475,6 +475,30 @@ class TestBuildMakerConfig:
         assert config.offer_type == OfferType.SW0_RELATIVE
         assert config.cj_fee_relative == "0.002"
 
+    def test_tr0_relative_offer_logs_relative_fee(self) -> None:
+        """A tr0 relative offer must not be logged as an absolute fee."""
+        from jmcore.settings import JoinMarketSettings
+        from loguru import logger
+
+        from maker.cli import build_maker_config
+
+        settings = JoinMarketSettings()
+        settings.maker.offer_type = "tr0reloffer"
+
+        records: list[str] = []
+        sink_id = logger.add(
+            lambda message: records.append(message.record["message"]), level="INFO"
+        )
+        try:
+            build_maker_config(settings=settings, mnemonic=TEST_MNEMONIC, passphrase="")
+        finally:
+            logger.remove(sink_id)
+
+        offer_messages = [message for message in records if message.startswith("Offer config:")]
+        assert len(offer_messages) == 1
+        assert "relative fee=" in offer_messages[0]
+        assert "absolute fee=" not in offer_messages[0]
+
     def test_max_sats_freeze_reuse_forwarded(self) -> None:
         """``wallet.max_sats_freeze_reuse`` must reach the MakerConfig (#529)."""
         from jmcore.settings import JoinMarketSettings
@@ -489,6 +513,29 @@ class TestBuildMakerConfig:
             passphrase="",
         )
         assert config.max_sats_freeze_reuse == 9_999
+
+    def test_wallet_address_type_forwarded(self) -> None:
+        """wallet.address_type must reach the MakerConfig."""
+        from jmcore.settings import JoinMarketSettings
+
+        from maker.cli import build_maker_config
+
+        settings = JoinMarketSettings()
+        assert settings.wallet.address_type == "p2wpkh"
+        config = build_maker_config(
+            settings=settings,
+            mnemonic=TEST_MNEMONIC,
+            passphrase="",
+        )
+        assert config.address_type == "p2wpkh"
+
+        settings.wallet.address_type = "p2tr"
+        config = build_maker_config(
+            settings=settings,
+            mnemonic=TEST_MNEMONIC,
+            passphrase="",
+        )
+        assert config.address_type == "p2tr"
 
     def test_max_sats_freeze_reuse_defaults_to_freeze_all(self) -> None:
         """Default ``max_sats_freeze_reuse`` is -1 (freeze all reuse)."""

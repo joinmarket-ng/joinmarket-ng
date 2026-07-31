@@ -8,7 +8,7 @@ from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 
 from jmcore.config import TorControlConfig, WalletConfig, create_tor_control_config_from_env
-from jmcore.models import OfferType
+from jmcore.models import OfferType, is_absolute_offer_type
 from jmcore.tor_control import HiddenServiceDoSConfig
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -147,13 +147,13 @@ class OfferConfig(BaseModel):
             raise ValueError(
                 "Wrapped SegWit maker offers are not supported by the P2WPKH wallet signer"
             )
-        if self.offer_type in (OfferType.SW0_RELATIVE, OfferType.SWA_RELATIVE):
+        if not is_absolute_offer_type(self.offer_type):
             validate_relative_cj_fee(self.cj_fee_relative, self.cjfee_factor)
         return self
 
     def get_cjfee(self) -> str | int:
         """Get the appropriate cjfee value based on offer type."""
-        if self.offer_type in (OfferType.SW0_ABSOLUTE, OfferType.SWA_ABSOLUTE):
+        if is_absolute_offer_type(self.offer_type):
             return self.cj_fee_absolute
         return self.cj_fee_relative
 
@@ -540,7 +540,7 @@ class MakerConfig(WalletConfig):
                     "Wrapped SegWit maker offers are not supported by the P2WPKH wallet signer"
                 )
             # Validate cj_fee_relative for relative offer types
-            if self.offer_type in (OfferType.SW0_RELATIVE, OfferType.SWA_RELATIVE):
+            if not is_absolute_offer_type(self.offer_type):
                 validate_relative_cj_fee(self.cj_fee_relative, self.cjfee_factor)
 
         return self

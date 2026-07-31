@@ -2626,7 +2626,9 @@ class TestPhaseAuthMakerAuthentication:
         else:
             extra = ",".join(f"{i:064x}:{vout}" for i in range(declared_utxos - 1))
             utxo_list = f"{txid}:{vout}" + (f",{extra}" if extra else "")
-        ioauth = f"{utxo_list} {auth_pub.hex()} bcrt1qcj bcrt1qchange {btc_sig}"
+        cj_addr = "bcrt1ql3e9pgs3mmwuwrh95fecme0s0qtn2880hlwwpw"
+        change_addr = "bcrt1q2vfxp232rx0z9rzn0hay9jptagk8c86ddphpjv"
+        ioauth = f"{utxo_list} {auth_pub.hex()} {cj_addr} {change_addr} {btc_sig}"
         encrypted = maker_crypto.encrypt(ioauth)
 
         nick = "J5maker"

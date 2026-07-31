@@ -18,7 +18,7 @@ import typer
 from jmcore.cli_common import resolve_mnemonic, setup_cli
 from jmcore.cli_help import SortedTyper
 from jmcore.config import TorControlConfig, detect_tor_cookie_path
-from jmcore.models import NetworkType, OfferType
+from jmcore.models import NetworkType, OfferType, is_absolute_offer_type
 from jmcore.notifications import get_notifier
 from jmcore.paths import remove_nick_state, write_nick_state
 from jmcore.settings import (
@@ -315,17 +315,18 @@ def build_maker_config(
         logger.info(f"Dual offers mode: creating {len(offer_configs)} offers")
         for i, oc in enumerate(offer_configs):
             fee_str = (
-                f"rel={oc.cj_fee_relative}"
-                if oc.offer_type in (OfferType.SW0_RELATIVE, OfferType.SWA_RELATIVE)
-                else f"abs={oc.cj_fee_absolute} sats"
+                f"abs={oc.cj_fee_absolute} sats"
+                if is_absolute_offer_type(oc.offer_type)
+                else f"rel={oc.cj_fee_relative}"
             )
             logger.info(f"  Offer {i}: type={oc.offer_type.value}, {fee_str}")
     else:
         # Single offer mode
+        rel_pct = float(actual_cj_fee_relative) * 100
         fee_str = (
-            f"relative fee={actual_cj_fee_relative} ({float(actual_cj_fee_relative) * 100:.4f}%)"
-            if parsed_offer_type in (OfferType.SW0_RELATIVE, OfferType.SWA_RELATIVE)
-            else f"absolute fee={actual_cj_fee_absolute} sats"
+            f"absolute fee={actual_cj_fee_absolute} sats"
+            if is_absolute_offer_type(parsed_offer_type)
+            else f"relative fee={actual_cj_fee_relative} ({rel_pct:.4f}%)"
         )
         logger.info(f"Offer config: type={parsed_offer_type.value}, {fee_str}")
 
@@ -365,6 +366,7 @@ def build_maker_config(
         connection_timeout=settings.tor.connection_timeout,
         mixdepth_count=settings.wallet.mixdepth_count,
         gap_limit=settings.wallet.gap_limit,
+        address_type=settings.wallet.address_type,
         scan_range=settings.wallet.scan_range,
         dust_threshold=settings.wallet.dust_threshold,
         max_sats_freeze_reuse=settings.wallet.max_sats_freeze_reuse,
@@ -482,6 +484,7 @@ def create_wallet_service(config: MakerConfig) -> WalletService:
         max_sats_freeze_reuse=config.max_sats_freeze_reuse,
         reconstruct_history=config.reconstruct_history,
         mnemonic_file=config.mnemonic_file,
+        address_type=config.address_type,
     )
     return wallet
 

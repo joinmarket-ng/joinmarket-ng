@@ -437,6 +437,7 @@ async def _run_coinjoin(
         max_sats_freeze_reuse=config.max_sats_freeze_reuse,
         reconstruct_history=config.reconstruct_history,
         mnemonic_file=config.mnemonic_file,
+        address_type=config.address_type,
     )
 
     # Create confirmation callback

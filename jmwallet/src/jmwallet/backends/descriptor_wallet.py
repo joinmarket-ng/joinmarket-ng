@@ -2808,6 +2808,10 @@ class DescriptorWalletBackend(BlockchainBackend):
         """Bitcoin Core can provide Neutrino-compatible metadata."""
         return True
 
+    def can_resolve_foreign_prevouts(self) -> bool:
+        """Bitcoin Core can resolve arbitrary prevouts via RPC (needed for tr0)."""
+        return True
+
     async def close(self) -> None:
         """Close backend connections and reset clients so the backend can be reused."""
         await self.client.aclose()
