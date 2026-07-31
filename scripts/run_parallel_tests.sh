@@ -50,6 +50,7 @@ PROJECT_PYTHONPATH=$(printf '%s:' \
     "$PROJECT_ROOT/directory_server/src" \
     "$PROJECT_ROOT/jmwalletd/src" \
     "$PROJECT_ROOT/tumbler/src" \
+    "$PROJECT_ROOT/jmswap/src" \
     "$PROJECT_ROOT/orderbook_watcher/src" \
     "$PROJECT_ROOT/maker/src" \
     "$PROJECT_ROOT/taker/src")
@@ -147,6 +148,8 @@ declare -A SUITE_SLOT=(
     [reference-maker]=8
     [tumbler]=9
     [reference-migration]=10
+    [ring-e2e]=11
+    [swap-provider-e2e]=12
 )
 
 # Service slot index within a suite's port window.
@@ -163,6 +166,12 @@ declare -A SVC_SLOT=(
     [jam_pw]=9
     [tor_socks]=10
     [tor_ctrl]=11
+    [lnd_maker1]=12
+    [lnd_maker2]=13
+    [lnd_maker3]=14
+    [lnd_taker]=15
+    [lnd_maker1_rest]=16
+    [lnd_taker_rest]=17
 )
 
 # Compute the host port for a given suite/service in the current instance.
@@ -469,6 +478,46 @@ compose_cmd() {
         "$@"
 }
 
+ring_compose_cmd() {
+    local suite="ring-e2e"
+    RING_E2E_DATA_DIR="${PARALLEL_DIR}/shared/${suite}" \
+    RING_E2E_BITCOIN_PORT="$(host_port "$suite" btc_rpc)" \
+    RING_E2E_DIRECTORY_PORT="$(host_port "$suite" dir)" \
+    RING_E2E_ORDERBOOK_PORT="$(host_port "$suite" obwatch)" \
+    RING_E2E_TOR_SOCKS_PORT="$(host_port "$suite" tor_socks)" \
+    RING_E2E_MAKER1_GRPC_PORT="$(host_port "$suite" lnd_maker1)" \
+    RING_E2E_MAKER2_GRPC_PORT="$(host_port "$suite" lnd_maker2)" \
+    RING_E2E_MAKER3_GRPC_PORT="$(host_port "$suite" lnd_maker3)" \
+    RING_E2E_TAKER_GRPC_PORT="$(host_port "$suite" lnd_taker)" \
+        docker compose \
+            -p "${PROJECT_PREFIX}-${suite}" \
+            -f "${PROJECT_ROOT}/jmswap/docker-compose.ring-e2e.yml" \
+            --profile ring-e2e \
+            "$@"
+}
+
+swap_provider_compose_cmd() {
+    local suite="swap-provider-e2e"
+    RING_E2E_DATA_DIR="${PARALLEL_DIR}/shared/${suite}" \
+    RING_E2E_BITCOIN_PORT="$(host_port "$suite" btc_rpc)" \
+    RING_E2E_DIRECTORY_PORT="$(host_port "$suite" dir)" \
+    RING_E2E_ORDERBOOK_PORT="$(host_port "$suite" obwatch)" \
+    RING_E2E_TOR_SOCKS_PORT="$(host_port "$suite" tor_socks)" \
+    RING_E2E_MAKER1_GRPC_PORT="$(host_port "$suite" lnd_maker1)" \
+    RING_E2E_MAKER2_GRPC_PORT="$(host_port "$suite" lnd_maker2)" \
+    RING_E2E_MAKER3_GRPC_PORT="$(host_port "$suite" lnd_maker3)" \
+    RING_E2E_TAKER_GRPC_PORT="$(host_port "$suite" lnd_taker)" \
+    SWAP_PROVIDER_E2E_MAKER_REST_PORT="$(host_port "$suite" lnd_maker1_rest)" \
+    SWAP_PROVIDER_E2E_CLIENT_REST_PORT="$(host_port "$suite" lnd_taker_rest)" \
+    SWAP_PROVIDER_E2E=true \
+        docker compose \
+            -p "${PROJECT_PREFIX}-${suite}" \
+            -f "${PROJECT_ROOT}/jmswap/docker-compose.ring-e2e.yml" \
+            --profile ring-e2e \
+            --profile swap-provider-e2e \
+            "$@"
+}
+
 # =============================================================================
 # Wait for Bitcoin RPC readiness on a specific port
 #
@@ -770,6 +819,16 @@ restart_makers() {
 cleanup_suite() {
     local suite=$1
     log_info "Cleaning up suite: $suite"
+    if [ "$suite" = "ring-e2e" ]; then
+        ring_compose_cmd down --remove-orphans -v 2>/dev/null || true
+        rm -rf "${PARALLEL_DIR}/shared/${suite}" 2>/dev/null || true
+        return
+    fi
+    if [ "$suite" = "swap-provider-e2e" ]; then
+        swap_provider_compose_cmd down --remove-orphans -v 2>/dev/null || true
+        rm -rf "${PARALLEL_DIR}/shared/${suite}" 2>/dev/null || true
+        return
+    fi
     compose_cmd "$suite" --profile e2e --profile reference --profile neutrino --profile reference-maker --profile reference-migration down -v 2>/dev/null || true
     compose_cmd "$suite" down --remove-orphans -v 2>/dev/null || true
     rm -rf "${PARALLEL_DIR}/shared/${suite}" 2>/dev/null || true
@@ -897,10 +956,10 @@ run_suite_unit() {
         COVERAGE_FILE=.coverage.unit pytest -c pytest.ini --fail-on-skip \
             -lv \
             --cov=jmcore --cov=jmwallet --cov=directory_server --cov=jmwalletd \
-            --cov=tumbler \
+            --cov=tumbler --cov=jmswap \
             --cov=orderbook_watcher --cov=maker --cov=taker \
             --cov-report=term-missing \
-            jmcore/ jmwallet/ directory_server/ jmwalletd/ tumbler/ orderbook_watcher/ maker/ taker/
+            jmcore/ jmwallet/ directory_server/ jmwalletd/ tumbler/ jmswap/ orderbook_watcher/ maker/ taker/
 
         # Repo-root tests use a separate invocation because component packages
         # each expose a top-level tests module that conflicts during collection.
@@ -972,6 +1031,90 @@ run_suite_e2e() {
     ) > "$log" 2>&1
     rc=$?
     set -e
+    cleanup_suite "$suite"
+    return $rc
+}
+
+run_suite_ring_e2e() {
+    local suite="ring-e2e"
+    local log="${PARALLEL_DIR}/${suite}.log"
+    local data_dir="${PARALLEL_DIR}/shared/${suite}"
+    local project="${PROJECT_PREFIX}-${suite}"
+
+    log_suite "Starting: Co-funded Channel Ring E2E Tests ($suite)"
+    local rc=0
+    set +e
+    (
+        set -e
+        cleanup_suite "$suite"
+        mkdir -p "$data_dir"
+        ring_compose_cmd up -d
+
+        RING_E2E=1 \
+        RING_E2E_PROJECT="$project" \
+        RING_E2E_DATA_DIR="$data_dir" \
+        RING_E2E_BITCOIN_PORT="$(host_port "$suite" btc_rpc)" \
+        RING_E2E_DIRECTORY_PORT="$(host_port "$suite" dir)" \
+        RING_E2E_ORDERBOOK_PORT="$(host_port "$suite" obwatch)" \
+        RING_E2E_TOR_SOCKS_PORT="$(host_port "$suite" tor_socks)" \
+        RING_E2E_MAKER1_GRPC_PORT="$(host_port "$suite" lnd_maker1)" \
+        RING_E2E_MAKER2_GRPC_PORT="$(host_port "$suite" lnd_maker2)" \
+        RING_E2E_MAKER3_GRPC_PORT="$(host_port "$suite" lnd_maker3)" \
+        RING_E2E_TAKER_GRPC_PORT="$(host_port "$suite" lnd_taker)" \
+        COVERAGE_FILE=".coverage.${suite}" \
+            pytest -c pytest.ini tests/e2e/test_cofunded_ring_e2e.py \
+                -m ring_e2e --fail-on-skip --no-cov -lv --timeout=900
+    ) > "$log" 2>&1
+    rc=$?
+    set -e
+    if [ "$rc" -ne 0 ]; then
+        {
+            echo
+            echo "Channel-ring container diagnostics (suite=${suite}, rc=${rc})"
+            ring_compose_cmd ps
+            ring_compose_cmd logs --tail=200
+        } >> "$log" 2>&1 || true
+    fi
+    cleanup_suite "$suite"
+    return $rc
+}
+
+run_suite_swap_provider_e2e() {
+    local suite="swap-provider-e2e"
+    local log="${PARALLEL_DIR}/${suite}.log"
+    local data_dir="${PARALLEL_DIR}/shared/${suite}"
+    local project="${PROJECT_PREFIX}-${suite}"
+
+    log_suite "Starting: Maker Swap Provider E2E Tests ($suite)"
+    local rc=0
+    set +e
+    (
+        set -e
+        cleanup_suite "$suite"
+        mkdir -p "$data_dir"
+        swap_provider_compose_cmd up -d
+
+        SWAP_PROVIDER_E2E=1 \
+        SWAP_PROVIDER_E2E_PROJECT="$project" \
+        RING_E2E_DATA_DIR="$data_dir" \
+        RING_E2E_BITCOIN_PORT="$(host_port "$suite" btc_rpc)" \
+        RING_E2E_TOR_SOCKS_PORT="$(host_port "$suite" tor_socks)" \
+        SWAP_PROVIDER_E2E_MAKER_REST_PORT="$(host_port "$suite" lnd_maker1_rest)" \
+        SWAP_PROVIDER_E2E_CLIENT_REST_PORT="$(host_port "$suite" lnd_taker_rest)" \
+        COVERAGE_FILE=".coverage.${suite}" \
+            pytest -c pytest.ini tests/e2e/test_swap_provider_e2e.py \
+                -m swap_provider_e2e --fail-on-skip --no-cov -lv --timeout=900
+    ) > "$log" 2>&1
+    rc=$?
+    set -e
+    if [ "$rc" -ne 0 ]; then
+        {
+            echo
+            echo "Swap-provider container diagnostics (suite=${suite}, rc=${rc})"
+            swap_provider_compose_cmd ps
+            swap_provider_compose_cmd logs --tail=200
+        } >> "$log" 2>&1 || true
+    fi
     cleanup_suite "$suite"
     return $rc
 }
@@ -1717,6 +1860,8 @@ main() {
 
     # Docker test suites (each with isolated compose project)
     launch_suite "e2e" run_suite_e2e
+    launch_suite "ring-e2e" run_suite_ring_e2e
+    launch_suite "swap-provider-e2e" run_suite_swap_provider_e2e
     launch_suite "jmwallet" run_suite_jmwallet
     launch_suite "reference-interop" run_suite_reference_interop
     launch_suite "reference-legacy" run_suite_reference_legacy
@@ -1836,6 +1981,8 @@ case "${1:-}" in
         case "$suite" in
             unit)                  run_suite_unit ;;
             e2e)                   run_suite_e2e ;;
+            ring-e2e)              run_suite_ring_e2e ;;
+            swap-provider-e2e)     run_suite_swap_provider_e2e ;;
             playwright)            run_suite_playwright ;;
             jmwallet)              run_suite_jmwallet ;;
             reference-interop)     run_suite_reference_interop ;;
@@ -1889,6 +2036,8 @@ Running two suites at once:
 Available suites:
   unit                  Unit tests (no Docker)
   e2e                   E2E + Docker integration tests
+  ring-e2e              Four-node co-funded channel-ring E2E test
+  swap-provider-e2e     Electrum-compatible maker swap-provider E2E test
   playwright            Playwright browser tests
   jmwallet              jmwallet Docker tests
   reference-interop     Reference interop tests (our maker + JAM taker)

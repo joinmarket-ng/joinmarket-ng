@@ -179,14 +179,14 @@ jobs:
       - uses: ./.github/actions/setup-python-deps
         with:
           python-version: ${{ matrix.python-version }}
-          components: jmcore,jmwallet,directory_server,orderbook_watcher,maker,taker,jmwalletd,tumbler
+          components: jmcore,jmwallet,directory_server,orderbook_watcher,maker,taker,jmwalletd,tumbler,jmswap
           install-dev: 'true'
 
       - name: Run unit tests
         run: |
-          pytest -c pytest.ini jmcore jmwallet directory_server orderbook_watcher maker taker jmwalletd tumbler \
+          pytest -c pytest.ini jmcore jmwallet directory_server orderbook_watcher maker taker jmwalletd tumbler jmswap \
             --junitxml=junit/unit-tests.xml \
-            --cov=jmcore --cov=jmwallet --cov=directory_server --cov=orderbook_watcher --cov=maker --cov=taker --cov=jmwalletd --cov=tumbler \
+            --cov=jmcore --cov=jmwallet --cov=directory_server --cov=orderbook_watcher --cov=maker --cov=taker --cov=jmwalletd --cov=tumbler --cov=jmswap \
             --cov-report=term-missing --cov-report=xml --cov-report=html \
             -v --fail-on-skip
 
@@ -635,6 +635,201 @@ jobs:
             junit/test-results.xml
             coverage.xml
         if: always()
+
+  test-lnd-external:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+          allow-unsafe-pr-checkout: true
+
+      - uses: ./.github/actions/setup-python-deps
+        with:
+          python-version: '3.14'
+          components: jmcore,jmswap
+          install-dev: 'true'
+
+      - name: Start isolated LND external funding profile
+        run: |
+          docker compose -f jmswap/docker-compose.lnd-external.yml \
+            --profile lnd_external up -d
+
+      - name: Run LND external funding spike
+        env:
+          LND_EXTERNAL_E2E: '1'
+        run: |
+          pytest -c pytest.ini tests/e2e/test_lnd_external_channel_e2e.py \
+            -m lnd_external --fail-on-skip --no-cov -v -s --timeout=180
+
+      - name: Show LND logs
+        if: always()
+        run: |
+          docker compose -f jmswap/docker-compose.lnd-external.yml \
+            --profile lnd_external ps
+          docker compose -f jmswap/docker-compose.lnd-external.yml \
+            logs --tail=100 lnd-opener lnd-fundee lnd-bitcoin
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker compose -f jmswap/docker-compose.lnd-external.yml \
+            --profile lnd_external down -v
+
+  test-ring-e2e:
+    needs: build-images
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read
+    env:
+      DIRECTORY_SERVER_IMAGE: ghcr.io/${{ github.repository }}/directory-server:ci-unsafe-do-not-run-${{ github.event.pull_request.head.sha || github.sha }}
+      ORDERBOOK_WATCHER_IMAGE: ghcr.io/${{ github.repository }}/orderbook-watcher:ci-unsafe-do-not-run-${{ github.event.pull_request.head.sha || github.sha }}
+      MAKER_IMAGE: ghcr.io/${{ github.repository }}/maker:ci-unsafe-do-not-run-${{ github.event.pull_request.head.sha || github.sha }}
+      RING_E2E_DATA_DIR: ${{ runner.temp }}/ring-e2e
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+          allow-unsafe-pr-checkout: true
+
+      - uses: ./.github/actions/setup-python-deps
+        with:
+          python-version: '3.14'
+          components: jmcore,jmwallet,jmswap,maker,taker
+          install-dev: 'true'
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull pre-built images
+        run: |
+          docker pull "$DIRECTORY_SERVER_IMAGE"
+          docker pull "$ORDERBOOK_WATCHER_IMAGE"
+          docker pull "$MAKER_IMAGE"
+
+      - name: Start isolated channel-ring profile
+        run: |
+          docker compose -f jmswap/docker-compose.ring-e2e.yml \
+            --profile ring-e2e up -d
+
+      - name: Run co-funded channel-ring E2E test
+        env:
+          RING_E2E: '1'
+        run: |
+          pytest -c pytest.ini tests/e2e/test_cofunded_ring_e2e.py \
+            -m ring_e2e --fail-on-skip --no-cov -v -s --timeout=900 \
+            --junitxml=junit/ring-e2e.xml
+
+      - name: Show channel-ring logs
+        if: always()
+        run: |
+          docker compose -f jmswap/docker-compose.ring-e2e.yml \
+            --profile ring-e2e ps
+          docker compose -f jmswap/docker-compose.ring-e2e.yml \
+            --profile ring-e2e logs --tail=200
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker compose -f jmswap/docker-compose.ring-e2e.yml \
+            --profile ring-e2e down -v
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: ring-e2e-results
+          path: junit/ring-e2e.xml
+
+  test-swap-provider-e2e:
+    needs: build-images
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read
+    env:
+      DIRECTORY_SERVER_IMAGE: ghcr.io/${{ github.repository }}/directory-server:ci-unsafe-do-not-run-${{ github.event.pull_request.head.sha || github.sha }}
+      ORDERBOOK_WATCHER_IMAGE: ghcr.io/${{ github.repository }}/orderbook-watcher:ci-unsafe-do-not-run-${{ github.event.pull_request.head.sha || github.sha }}
+      MAKER_IMAGE: ghcr.io/${{ github.repository }}/maker:ci-unsafe-do-not-run-${{ github.event.pull_request.head.sha || github.sha }}
+      RING_E2E_DATA_DIR: ${{ runner.temp }}/swap-provider-e2e
+      SWAP_PROVIDER_E2E: 'true'
+      SWAP_PROVIDER_E2E_PROJECT: jm-swap-provider-e2e
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+          allow-unsafe-pr-checkout: true
+
+      - uses: ./.github/actions/setup-python-deps
+        with:
+          python-version: '3.14'
+          components: jmcore,jmwallet,jmswap,maker
+          install-dev: 'true'
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull pre-built images
+        run: |
+          docker pull "$DIRECTORY_SERVER_IMAGE"
+          docker pull "$ORDERBOOK_WATCHER_IMAGE"
+          docker pull "$MAKER_IMAGE"
+
+      - name: Start isolated swap-provider profile
+        run: |
+          docker compose -p "$SWAP_PROVIDER_E2E_PROJECT" \
+            -f jmswap/docker-compose.ring-e2e.yml \
+            --profile ring-e2e --profile swap-provider-e2e up -d
+
+      - name: Run live Electrum maker swap provider E2E
+        env:
+          SWAP_PROVIDER_E2E: '1'
+        run: |
+          pytest -c pytest.ini tests/e2e/test_swap_provider_e2e.py \
+            -m swap_provider_e2e --fail-on-skip --no-cov -v -s --timeout=900 \
+            --junitxml=junit/swap-provider-e2e.xml
+
+      - name: Show swap-provider logs
+        if: always()
+        run: |
+          docker compose -p "$SWAP_PROVIDER_E2E_PROJECT" \
+            -f jmswap/docker-compose.ring-e2e.yml \
+            --profile ring-e2e --profile swap-provider-e2e ps
+          docker compose -p "$SWAP_PROVIDER_E2E_PROJECT" \
+            -f jmswap/docker-compose.ring-e2e.yml \
+            --profile ring-e2e --profile swap-provider-e2e logs --tail=200
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker compose -p "$SWAP_PROVIDER_E2E_PROJECT" \
+            -f jmswap/docker-compose.ring-e2e.yml \
+            --profile ring-e2e --profile swap-provider-e2e down -v
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: swap-provider-e2e-results
+          path: junit/swap-provider-e2e.xml
 
   test-tumbler:
     needs: build-images
@@ -2221,6 +2416,7 @@ jobs:
       - test-jmwallet
       # Integration tests (depend on build-images)
       - test-e2e
+      - test-lnd-external
       - test-tumbler
       - test-playwright
       - test-reference-interop
