@@ -11,6 +11,7 @@ ARG PYTHON_SLIM_DIGEST=sha256:cad9a2c871761c413caa6fdd6441c783451e740a48aaeba60a
 # Update versions with: ./scripts/update-base-images.sh
 ARG SETUPTOOLS_VERSION=84.0.0
 ARG WHEEL_VERSION=0.48.0
+ARG ELECTRUM_ECC_COMMIT=c143ab969e2eedcb9520a2e0b42a53a8ccf1eea7
 
 FROM python:${PYTHON_VERSION}-slim@${PYTHON_SLIM_DIGEST} AS builder
 
@@ -19,10 +20,13 @@ WORKDIR /build
 # Install build dependencies (sorted alphabetically, versions pinned for reproducibility)
 # Update versions with: ./scripts/update-base-images.sh
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    autoconf=2.72-3.1 \
+    automake=1:1.17-4 \
     build-essential=12.12 \
     git=1:2.47.3-0+deb13u1 \
     libffi-dev=3.4.8-2 \
     libsodium-dev=1.0.18-1+deb13u1 \
+    libtool=2.5.4-4 \
     pkg-config=1.8.1-4 \
     && rm -rf /var/lib/apt/lists/*
 
@@ -43,21 +47,32 @@ ENV JOINMARKET_BUILD_REF=${JOINMARKET_BUILD_REF}
 # Pin build tools for reproducible builds (re-declare to inherit global ARGs)
 ARG SETUPTOOLS_VERSION
 ARG WHEEL_VERSION
+ARG ELECTRUM_ECC_COMMIT
 RUN echo "setuptools==${SETUPTOOLS_VERSION}" > /build/constraints.txt && \
     echo "wheel==${WHEEL_VERSION}" >> /build/constraints.txt
 
+# This pinned repository includes a required git submodule, so it cannot be
+# represented by a hashable GitHub source archive in pip-compile output.
+RUN --mount=type=cache,target=/root/.cache/pip,id=jmng-pip-electrum-ecc \
+    pip install --prefix=/app --no-deps \
+        "electrum-ecc @ git+https://github.com/m0wer/electrum-ecc@${ELECTRUM_ECC_COMMIT}"
+
 # Install jmcore dependencies (with hash verification)
 # All requirements are installed in a single pip invocation so that pip resolves the
-# dependency graph once instead of re-resolving across three sequential calls.
+# dependency graph once instead of re-resolving across four sequential calls.
 COPY jmcore/requirements.txt /build/jmcore/requirements.txt
 COPY jmwallet/requirements.txt /build/jmwallet/requirements.txt
+COPY jmswap/requirements.txt /build/jmswap/requirements.txt
 COPY maker/requirements.txt /build/maker/requirements.txt
+RUN grep -v '^electrum-ecc @ git+' /build/jmswap/requirements.txt \
+        > /build/jmswap/requirements-hashed.txt
 
 RUN --mount=type=cache,target=/root/.cache/pip,id=jmng-pip-${SETUPTOOLS_VERSION} \
     if [ -n "$SOURCE_DATE_EPOCH" ]; then export SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH; fi && \
     pip install --prefix=/app \
         -r /build/jmcore/requirements.txt \
         -r /build/jmwallet/requirements.txt \
+        -r /build/jmswap/requirements-hashed.txt \
         -r /build/maker/requirements.txt
 
 # Copy all source packages and install in a single pip invocation so that pip resolves
@@ -68,6 +83,8 @@ COPY jmcore/pyproject.toml /build/jmcore/
 COPY jmcore/setup.py /build/jmcore/
 COPY jmwallet/src /build/jmwallet/src
 COPY jmwallet/pyproject.toml /build/jmwallet/
+COPY jmswap/src /build/jmswap/src
+COPY jmswap/pyproject.toml /build/jmswap/
 COPY maker/src /build/maker/src
 COPY maker/pyproject.toml /build/maker/
 
@@ -76,6 +93,7 @@ RUN --mount=type=cache,target=/root/.cache/pip,id=jmng-pip-${SETUPTOOLS_VERSION}
     pip install --no-deps --prefix=/app --build-constraint /build/constraints.txt \
         /build/jmcore \
         /build/jmwallet \
+        /build/jmswap \
         /build/maker
 
 # Normalize installed Python environment mtimes for reproducible COPY layer digests

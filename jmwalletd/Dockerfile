@@ -12,6 +12,7 @@ ARG PYTHON_SLIM_DIGEST=sha256:cad9a2c871761c413caa6fdd6441c783451e740a48aaeba60a
 # Update versions with: ./scripts/update-base-images.sh
 ARG SETUPTOOLS_VERSION=84.0.0
 ARG WHEEL_VERSION=0.48.0
+ARG ELECTRUM_ECC_COMMIT=c143ab969e2eedcb9520a2e0b42a53a8ccf1eea7
 
 # =============================================================================
 # Stage 1: Build Python environment
@@ -22,6 +23,10 @@ WORKDIR /build
 # Build dependencies for Python packages without platform wheels.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential=12.12 \
+    autoconf=2.72-3.1 \
+    automake=1:1.17-4 \
+    git=1:2.47.3-0+deb13u1 \
+    libtool=2.5.4-4 \
     pkg-config=1.8.1-4 \
     libffi-dev=3.4.8-2 \
     libsodium-dev=1.0.18-1+deb13u1 \
@@ -42,6 +47,7 @@ ENV JOINMARKET_BUILD_REF=${JOINMARKET_BUILD_REF}
 # Pin build tools for reproducible builds (re-declare to inherit global ARGs)
 ARG SETUPTOOLS_VERSION
 ARG WHEEL_VERSION
+ARG ELECTRUM_ECC_COMMIT
 RUN echo "setuptools==${SETUPTOOLS_VERSION}" > /build/constraints.txt && \
     echo "wheel==${WHEEL_VERSION}" >> /build/constraints.txt
 # Note: the full setuptools/wheel build constraint is applied only to our own package
@@ -51,22 +57,32 @@ RUN echo "setuptools==${SETUPTOOLS_VERSION}" > /build/constraints.txt && \
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
+# This pinned repository includes a required git submodule, so install it
+# separately from the hash-checked requirements set.
+RUN --mount=type=cache,target=/root/.cache/pip,id=jmng-pip-electrum-ecc \
+    pip install --no-deps \
+        "electrum-ecc @ git+https://github.com/m0wer/electrum-ecc@${ELECTRUM_ECC_COMMIT}"
+
 # All requirements are installed in a single pip invocation so that pip resolves the
-# dependency graph once instead of re-resolving and re-verifying hashes across six
+# dependency graph once instead of re-resolving and re-verifying hashes across seven
 # sequential calls. BuildKit cache mount avoids re-downloading packages on rebuilds
 # while keeping the image layer small (the cache lives on the host, not in the image).
 COPY jmcore/requirements.txt /build/requirements-jmcore.txt
 COPY jmwallet/requirements.txt /build/requirements-jmwallet.txt
+COPY jmswap/requirements.txt /build/requirements-jmswap.txt
 COPY maker/requirements.txt /build/requirements-maker.txt
 COPY taker/requirements.txt /build/requirements-taker.txt
 COPY orderbook_watcher/requirements.txt /build/requirements-obwatcher.txt
 COPY jmwalletd/requirements.txt /build/requirements-jmwalletd.txt
+RUN grep -v '^electrum-ecc @ git+' /build/requirements-jmswap.txt \
+        > /build/requirements-jmswap-hashed.txt
 
 RUN --mount=type=cache,target=/root/.cache/pip,id=jmng-pip-${SETUPTOOLS_VERSION} \
     if [ -n "$SOURCE_DATE_EPOCH" ]; then export SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH; fi && \
     pip install \
         -r /build/requirements-jmcore.txt \
         -r /build/requirements-jmwallet.txt \
+        -r /build/requirements-jmswap-hashed.txt \
         -r /build/requirements-maker.txt \
         -r /build/requirements-taker.txt \
         -r /build/requirements-obwatcher.txt \
@@ -78,6 +94,8 @@ COPY jmcore/pyproject.toml /build/jmcore/
 COPY jmcore/setup.py /build/jmcore/
 COPY jmwallet/src /build/jmwallet/src
 COPY jmwallet/pyproject.toml /build/jmwallet/
+COPY jmswap/src /build/jmswap/src
+COPY jmswap/pyproject.toml /build/jmswap/
 COPY maker/src /build/maker/src
 COPY maker/pyproject.toml /build/maker/
 COPY taker/src /build/taker/src
@@ -93,7 +111,7 @@ COPY tumbler/pyproject.toml /build/tumbler/
 
 # Normalize file timestamps so local working-copy mtimes don't differ from CI clone
 RUN if [ -n "$SOURCE_DATE_EPOCH" ]; then \
-        find /build/jmcore /build/jmwallet /build/maker /build/taker \
+        find /build/jmcore /build/jmwallet /build/jmswap /build/maker /build/taker \
              /build/orderbook_watcher /build/jmwalletd /build/tumbler \
              -exec touch -d @${SOURCE_DATE_EPOCH} {} +; \
     fi
@@ -102,6 +120,7 @@ RUN if [ -n "$SOURCE_DATE_EPOCH" ]; then export SOURCE_DATE_EPOCH=$SOURCE_DATE_E
     pip install --no-cache-dir --no-deps --build-constraint /build/constraints.txt \
         /build/jmcore \
         /build/jmwallet \
+        /build/jmswap \
         /build/maker \
         /build/taker \
         /build/orderbook_watcher \
