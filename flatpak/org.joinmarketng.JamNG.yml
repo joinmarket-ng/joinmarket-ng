@@ -100,14 +100,14 @@ modules:
       - type: file
         only-arches:
           - x86_64
-        url: https://github.com/m0wer/neutrino-api/releases/download/v1.4.0/neutrinod-linux-amd64
-        sha256: 1e8088c8154bdab1d5a2e85bd9ba23b94524bbdc17e3f11d5990593f36944966
+        url: https://github.com/m0wer/neutrino-api/releases/download/v1.5.0/neutrinod-linux-amd64
+        sha256: 6efc140495987286eb3ad9cf7dc17a45615c2a75d86b18cbe1db3cab1a693fcb
         dest-filename: neutrinod
       - type: file
         only-arches:
           - aarch64
-        url: https://github.com/m0wer/neutrino-api/releases/download/v1.4.0/neutrinod-linux-arm64
-        sha256: 757079f87591a203c476d5186d0daecc59a91ca777a20e75b7f0fd3e0ab444bd
+        url: https://github.com/m0wer/neutrino-api/releases/download/v1.5.0/neutrinod-linux-arm64
+        sha256: d0ee01e699401ac4a78580eeefc0ab9be0f1fe535be13c579617d5560e0be634
         dest-filename: neutrinod
 
   # =========================================================================
@@ -136,7 +136,7 @@ modules:
     sources:
       - type: git
         url: https://github.com/joinmarket-webui/jam.git
-        commit: 01a952ff63598c8fab00c851bdb1e1ebcf9141aa
+        commit: e0d747971190a984bf20b9338c9f2c139aeda9b7
 
   # =========================================================================
   # Module 6: Python application
