@@ -1104,6 +1104,22 @@ class TestVerifyPodleBinding:
         assert not bound
         assert "P2WPKH" in err
 
+    def test_bip86_p2tr_binding_matches(self) -> None:
+        from jmcore.bitcoin import taproot_tweak_pubkey
+
+        p = self._pubkey(444)
+        _, output_key = taproot_tweak_pubkey(p[1:])
+        spk = b"\x51\x20" + output_key
+        assert verify_podle_binding(p, spk) == (True, "")
+        assert verify_podle_binding(p, spk.hex()) == (True, "")
+
+    def test_bip86_p2tr_binding_mismatch(self) -> None:
+        p = self._pubkey(555)
+        spk = b"\x51\x20" + b"\xab" * 32
+        bound, err = verify_podle_binding(p, spk)
+        assert not bound
+        assert "P2TR" in err
+
     def test_p2pkh_binding_matches(self) -> None:
         from jmcore.bitcoin import hash160
 

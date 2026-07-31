@@ -14,7 +14,10 @@ import asyncio
 import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import TYPE_CHECKING
 
+from jmcore.channel_ring import ChannelRingConfig
+from jmcore.channel_ring_store import RingParticipantStore
 from jmcore.commitment_blacklist import set_blacklist_path
 from jmcore.crypto import NickIdentity
 from jmcore.deduplication import MessageDeduplicator
@@ -23,7 +26,7 @@ from jmcore.fee_policy import resolve_min_fee_rate
 from jmcore.models import Offer
 from jmcore.network import HiddenServiceListener, TCPConnection
 from jmcore.notifications import get_notifier
-from jmcore.paths import read_nick_state
+from jmcore.paths import get_default_data_dir, read_nick_state
 from jmcore.protocol import (
     JM_VERSION,
 )
@@ -72,6 +75,9 @@ from maker.rate_limiting import (
     OrderbookRateLimiter,
     ProcessWideTokenBucket,
 )
+
+if TYPE_CHECKING:
+    from jmswap.channel_ring import InitializedChannelRingBackend
 
 # Approximately 64MB of memory for str->float mapping (including overhead)
 MAX_LOG_RATE_LIMIT_ENTRIES = 200000
@@ -145,6 +151,17 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
             nick_identity=self.nick_identity,
             neutrino_compat=backend.can_provide_neutrino_metadata(),
         )
+        self.channel_ring_capability_validated = False
+        self._channel_ring_backend: InitializedChannelRingBackend | None = None
+        self._channel_ring_store: RingParticipantStore | None = None
+        self._channel_ring_recovery_tasks: dict[str, asyncio.Task[object]] = {}
+        if isinstance(config.channel_ring, ChannelRingConfig) and config.channel_ring.enabled:
+            data_directory = config.data_dir or get_default_data_dir()
+            self._channel_ring_store = RingParticipantStore(
+                config.channel_ring.persistence_path(data_directory),
+                max_active_sessions=config.channel_ring.max_active_sessions,
+                max_verified_sessions=config.channel_ring.max_verified_sessions,
+            )
         self._directory_pool.clients = self.directory_clients
         self.offer_manager = OfferManager(self.wallet, config, self.nick)
         self.active_sessions: dict[tuple[int, str], MakerSession] = {}
@@ -620,6 +637,7 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
                 # This is the peer-visible virtual onion port. Tor maps it
                 # independently to listener_port above.
                 onion_serving_port=self.config.onion_serving_port,
+                cofunded_channel_ring_v1=self.channel_ring_capability_validated,
             )
             generation = MakerGeneration(
                 generation_id=generation_id,
@@ -1205,6 +1223,42 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
             # Determine the onion address to advertise
             onion_host = self.config.onion_host
 
+            if self.config.channel_ring.enabled:
+                from jmswap.channel_ring import initialize_channel_ring_backend
+
+                offer_type = self.config.get_effective_offer_configs()[0].offer_type.value
+                self._channel_ring_backend = await initialize_channel_ring_backend(
+                    self.config.channel_ring,
+                    network=self.config.network.value,
+                    offer_type=offer_type,
+                )
+                assert self._channel_ring_store is not None
+                from maker.channel_ring import reconcile_ring_records
+
+                await reconcile_ring_records(
+                    self._channel_ring_store,
+                    self._channel_ring_backend,
+                    self.backend,
+                    self._channel_ring_recovery_tasks,
+                )
+                report = self._channel_ring_store.load_all()
+                active = sum(record.active for record in report.records)
+                verified = sum(record.verified_unresolved for record in report.records)
+                capacity_available = (
+                    not report.corruptions
+                    and active < self.config.channel_ring.max_active_sessions
+                    and verified < self.config.channel_ring.max_verified_sessions
+                )
+                if capacity_available:
+                    self.channel_ring_capability_validated = True
+                    self._directory_pool.enable_cofunded_channel_ring_v1()
+                    logger.info("Validated co-funded channel-ring LND backend")
+                else:
+                    logger.warning(
+                        "Co-funded channel ring is not advertised: durable participant "
+                        "capacity is exhausted or records are corrupt"
+                    )
+
             logger.info("Connecting to directory servers...")
             await self._connect_to_directories_with_retry()
 
@@ -1268,6 +1322,10 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
                 self._identity_renewal_scheduler(), name="maker-identity-renewal"
             )
             self.listen_tasks.append(self._identity_renewal_task)
+
+            if self._channel_ring_backend is not None and self._channel_ring_store is not None:
+                ring_task = asyncio.create_task(self._periodic_channel_ring_reconciliation())
+                self.listen_tasks.append(ring_task)
 
             # Start periodic summary notification task (if enabled)
             notifier = get_notifier()
@@ -1335,6 +1393,8 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         # their directory dispatchers.
         for listener_task in self.listen_tasks:
             listener_task.cancel()
+        for recovery_task in self._channel_ring_recovery_tasks.values():
+            recovery_task.cancel()
 
         if self.listen_tasks:
             _, pending_listeners = await asyncio.wait(set(self.listen_tasks), timeout=2.0)
@@ -1342,6 +1402,11 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
                 listener_task.cancel()
         self.listen_tasks.clear()
         self._session_cleanup_task = None
+        if self._channel_ring_recovery_tasks:
+            await asyncio.gather(
+                *self._channel_ring_recovery_tasks.values(), return_exceptions=True
+            )
+            self._channel_ring_recovery_tasks.clear()
 
         # Close every generation. The compatibility aliases point at the
         # current record, so generation-owned cleanup also handles replacement
@@ -1349,6 +1414,11 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         for generation in list(self.generations.values()):
             await self._close_generation(generation)
         self.generations.clear()
+
+        if self._channel_ring_backend is not None:
+            await self._channel_ring_backend.backend.close()
+            self._channel_ring_backend = None
+            self.channel_ring_capability_validated = False
 
         # Do not close the wallet here as it might be shared (e.g. in jmwalletd)
         # The caller is responsible for managing the wallet lifecycle.
@@ -1374,6 +1444,20 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         for listener_task in self.listen_tasks:
             if listener_task is not current_task:
                 listener_task.cancel()
+
+    async def _periodic_channel_ring_reconciliation(self) -> None:
+        from maker.channel_ring import reconcile_ring_records
+
+        while self.running:
+            assert self._channel_ring_store is not None
+            assert self._channel_ring_backend is not None
+            await reconcile_ring_records(
+                self._channel_ring_store,
+                self._channel_ring_backend,
+                self.backend,
+                self._channel_ring_recovery_tasks,
+            )
+            await asyncio.sleep(self.config.channel_ring.phase_timeout_seconds)
 
     def _log_rate_limited(
         self, key: str, message: str, level: str = "warning", interval: float = 10.0

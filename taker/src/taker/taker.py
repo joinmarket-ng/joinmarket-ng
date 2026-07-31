@@ -17,21 +17,24 @@ from __future__ import annotations
 import asyncio
 import inspect
 import math
+import secrets
 import time
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Any, cast
 
 from jmcore.bitcoin import calculate_tx_vsize, get_address_type
 from jmcore.bond_calc import calculate_timelocked_fidelity_bond_value
 from jmcore.btc_script import derive_bond_address
+from jmcore.channel_ring_store import RingParticipantStore
 from jmcore.commitment_blacklist import set_blacklist_path
 from jmcore.crypto import NickIdentity
 from jmcore.fee_policy import fee_rate_meets_minimum
 from jmcore.logging_context import coinjoin_id_from_commitment, coinjoin_log_context
 from jmcore.models import Offer, offer_output_script_type, offer_types_for_family
 from jmcore.notifications import get_notifier
-from jmcore.paths import read_nick_state
-from jmcore.protocol import FEATURE_NEUTRINO_COMPAT, JM_VERSION
+from jmcore.paths import get_default_data_dir, read_nick_state
+from jmcore.protocol import FEATURE_COFUNDED_CHANNEL_RING_V1, FEATURE_NEUTRINO_COMPAT, JM_VERSION
 from jmcore.tasks import spawn_task
 from jmwallet.backends.base import BlockchainBackend, BondVerificationRequest
 from jmwallet.history import (
@@ -59,6 +62,7 @@ from taker.orderbook import (
     OrderbookManager,
     calculate_cj_fee,
     maker_selection_keys,
+    offer_supports_cofunded_channel_ring_v1,
 )
 from taker.podle_manager import PoDLEManager
 
@@ -267,6 +271,16 @@ class Taker(TakerMonitoringMixin):
         # Background task tracking
         self.running = False
         self._background_tasks: list[asyncio.Task[None]] = []
+        self._channel_ring_backend: Any | None = None
+        self._channel_ring_store: RingParticipantStore | None = None
+        self._channel_ring_recovery_tasks: dict[str, asyncio.Task[object]] = {}
+        if config.channel_ring.enabled:
+            data_directory = Path(config.data_dir or get_default_data_dir())
+            self._channel_ring_store = RingParticipantStore(
+                config.channel_ring.persistence_path(data_directory),
+                max_active_sessions=config.channel_ring.max_active_sessions,
+                max_verified_sessions=config.channel_ring.max_verified_sessions,
+            )
 
     async def _request_confirmation(
         self,
@@ -389,6 +403,44 @@ class Taker(TakerMonitoringMixin):
 
         This should be called after sync_wallet() and any fund validation.
         """
+        if self.config.channel_ring.enabled:
+            if not self.backend.has_mempool_access() or not (
+                self.backend.can_get_confirmations_by_txid()
+            ):
+                raise RuntimeError(
+                    "Channel-ring taker requires a full backend that can prove mempool "
+                    "and chain absence"
+                )
+            from jmswap.channel_ring import initialize_channel_ring_backend
+
+            self._channel_ring_backend = await initialize_channel_ring_backend(
+                self.config.channel_ring,
+                network=self.config.network.value,
+                offer_type=self.config.preferred_offer_type.value,
+            )
+            assert self._channel_ring_store is not None
+            from taker.channel_ring import reconcile_taker_ring_records
+
+            await reconcile_taker_ring_records(
+                self._channel_ring_store,
+                self._channel_ring_backend,
+                self.backend,
+                self._channel_ring_recovery_tasks,
+            )
+            if not self._renew_channel_ring_input_locks():
+                raise RuntimeError("could not restore an active channel-ring input reservation")
+            report = self._channel_ring_store.load_all()
+            active = sum(record.active for record in report.records)
+            verified = sum(record.verified_unresolved for record in report.records)
+            if (
+                report.corruptions
+                or active >= self.config.channel_ring.max_active_sessions
+                or verified >= self.config.channel_ring.max_verified_sessions
+            ):
+                raise RuntimeError(
+                    "Channel-ring durable capacity is exhausted or contains corrupt records"
+                )
+
         # Connect to directory servers
         logger.info("Connecting to directory servers...")
         connected = await self.directory_client.connect_all()
@@ -423,6 +475,9 @@ class Taker(TakerMonitoringMixin):
         # Start periodic directory connection status logging task
         conn_status_task = asyncio.create_task(self._periodic_directory_connection_status())
         self._background_tasks.append(conn_status_task)
+        if self._channel_ring_backend is not None:
+            ring_task = asyncio.create_task(self._periodic_channel_ring_reconciliation())
+            self._background_tasks.append(ring_task)
 
     async def start(self) -> None:
         """
@@ -446,6 +501,18 @@ class Taker(TakerMonitoringMixin):
             return
         if self._session and self._session.reserved_inputs:
             try:
+                coordinator = self._session.ring_coordinator
+                if coordinator is not None:
+                    try:
+                        if coordinator._record().active:
+                            logger.warning(
+                                "Retaining taker input locks for an active channel-ring record"
+                            )
+                            return
+                    except Exception:
+                        logger.debug(
+                            "Channel-ring record was not created; releasing taker input locks"
+                        )
                 self.wallet.release_coinjoin_inputs(
                     self._session.reserved_inputs,
                     owner=self._session.input_lock_owner,
@@ -454,6 +521,13 @@ class Taker(TakerMonitoringMixin):
                 logger.bind(sensitive=True).debug("Failed to release taker input locks: {}", e)
             else:
                 self._session.reserved_inputs = set()
+
+    def _begin_input_lock_round(self) -> None:
+        """Detach any prior reservation and create a unique owner for this round."""
+        self.release_input_locks()
+        self._session.reserved_inputs = set()
+        self._session.input_lock_owner = secrets.token_hex(32)
+        self._session.ring_coordinator = None
 
     @property
     def last_failure_reason(self) -> str | None:
@@ -797,15 +871,65 @@ class Taker(TakerMonitoringMixin):
         # Cancel all background tasks
         for task in self._background_tasks:
             task.cancel()
+        recovery_tasks = getattr(self, "_channel_ring_recovery_tasks", {})
+        for task in recovery_tasks.values():
+            task.cancel()
 
         if self._background_tasks:
             await asyncio.gather(*self._background_tasks, return_exceptions=True)
         self._background_tasks.clear()
+        if recovery_tasks:
+            await asyncio.gather(*recovery_tasks.values(), return_exceptions=True)
+            recovery_tasks.clear()
 
         await self.directory_client.close_all()
+        if self._channel_ring_backend is not None:
+            await self._channel_ring_backend.backend.close()
+            self._channel_ring_backend = None
         if close_wallet:
             await self.wallet.close()
         logger.info("Taker stopped")
+
+    async def _periodic_channel_ring_reconciliation(self) -> None:
+        from taker.channel_ring import reconcile_taker_ring_records
+
+        while self.running:
+            assert self._channel_ring_store is not None
+            assert self._channel_ring_backend is not None
+            await reconcile_taker_ring_records(
+                self._channel_ring_store,
+                self._channel_ring_backend,
+                self.backend,
+                self._channel_ring_recovery_tasks,
+            )
+            if not self._renew_channel_ring_input_locks():
+                logger.error(
+                    "Stopped channel-ring reconciliation because an active input "
+                    "reservation could not be renewed"
+                )
+                return
+            await asyncio.sleep(self.config.channel_ring.phase_timeout_seconds)
+
+    def _renew_channel_ring_input_locks(self) -> bool:
+        if self._channel_ring_store is None:
+            return True
+        report = self._channel_ring_store.load_all()
+        if report.corruptions:
+            return False
+        ttl = self.config.pending_tx_abandon_hours * 3600
+        for record in report.records:
+            if not record.active or not record.local_input_outpoints:
+                continue
+            if record.input_lock_owner is None:
+                return False
+            outpoints = {(item.txid, item.vout) for item in record.local_input_outpoints}
+            if not self.wallet.reserve_coinjoin_inputs(
+                outpoints,
+                ttl=ttl,
+                owner=record.input_lock_owner,
+            ):
+                return False
+        return True
 
     async def _update_offers_with_bond_values(self, offers: list[Offer]) -> None:
         """
@@ -977,6 +1101,99 @@ class Taker(TakerMonitoringMixin):
             f"{bumped_count}/{len(fee_plan)} maker payments increased"
         )
 
+    def _ring_request_error(self, amount: int, maker_count: int) -> str | None:
+        if not self.config.channel_ring.enabled:
+            return None
+        self._session.strict_maker_count = maker_count
+        minimum = max(self.config.minimum_makers, self.config.channel_ring.minimum_makers)
+        if amount == 0:
+            return "Channel-ring mode rejects sweep/no-change CoinJoins"
+        if maker_count < minimum:
+            return f"Channel-ring mode requires at least {minimum} selected makers"
+        return None
+
+    def _enforce_ring_request(self, amount: int, maker_count: int) -> None:
+        error = self._ring_request_error(amount, maker_count)
+        if error is None:
+            return
+        self._session.last_failure_reason = error
+        raise ValueError(error)
+
+    def _ring_filter_offers(
+        self, offers: list[Any], maker_count: int
+    ) -> tuple[list[Any], str | None]:
+        if not self.config.channel_ring.enabled:
+            return offers, None
+        filtered = [
+            offer
+            for offer in offers
+            if offer_supports_cofunded_channel_ring_v1(offer)
+            and offer.ordertype is self.config.preferred_offer_type
+        ]
+        if len(filtered) < maker_count:
+            return filtered, (
+                "Not enough makers explicitly advertise the exact configured "
+                "cofunded_channel_ring_v1 tr0 offer"
+            )
+        return filtered, None
+
+    def _ring_selection_error(self, selected_count: int, requested_count: int) -> str | None:
+        if self.config.channel_ring.enabled and selected_count != requested_count:
+            return "Channel-ring selection did not return the exact requested maker set"
+        return None
+
+    def _prepare_ring_offer_selection(
+        self,
+        offers: list[Any],
+        required_features: set[str] | None,
+        maker_count: int,
+    ) -> tuple[list[Any], set[str] | None]:
+        if self.config.channel_ring.enabled:
+            required_features = set(required_features or ())
+            required_features.add(FEATURE_COFUNDED_CHANNEL_RING_V1)
+        filtered, error = self._ring_filter_offers(offers, maker_count)
+        if error is not None:
+            self._session.last_failure_reason = error
+            raise ValueError(error)
+        return filtered, required_features
+
+    def _enforce_ring_selection(self, selected_count: int, requested_count: int) -> None:
+        error = self._ring_selection_error(selected_count, requested_count)
+        if error is None:
+            return
+        self._session.last_failure_reason = error
+        raise ValueError(error)
+
+    async def _prepare_channel_ring(self, destination: str, mixdepth: int) -> bool:
+        if self._channel_ring_backend is None or self._channel_ring_store is None:
+            self._session.last_failure_reason = "Channel-ring backend was not safely initialized"
+            logger.error(self._session.last_failure_reason)
+            return False
+        from taker.channel_ring import TakerRingCoordinator
+
+        self.state = TakerState.RING_INVITING
+        assert self._session.podle_commitment is not None
+        coordinator = TakerRingCoordinator(
+            self._session,
+            config=self.config.channel_ring,
+            store=self._channel_ring_store,
+            initialized_backend=self._channel_ring_backend,
+            chain_backend=self.backend,
+            session_identity=f"{self.nick}:{self._session.podle_commitment.to_commitment_str()}",
+        )
+        self._session.ring_coordinator = coordinator
+        if await coordinator.prepare(destination, mixdepth):
+            return True
+        self._session.last_failure_reason = "Strict channel-ring negotiation aborted"
+        return False
+
+    async def _build_transaction_phase(self, destination: str, mixdepth: int) -> bool:
+        if self.config.channel_ring.enabled:
+            return await self._prepare_channel_ring(destination, mixdepth)
+        self.state = TakerState.BUILDING_TX
+        logger.debug("Phase 3: Building transaction...")
+        return await self._session._phase_build_tx(destination=destination, mixdepth=mixdepth)
+
     async def do_coinjoin(
         self,
         amount: int,
@@ -1041,6 +1258,7 @@ class Taker(TakerMonitoringMixin):
             Transaction ID if successful, None otherwise
         """
         try:
+            self._begin_input_lock_round()
             # Reset per-call state so callers reading ``last_used_nicks`` after
             # a failure don't pick up nicks from a previous successful round.
             self._session.last_used_nicks = set()
@@ -1070,6 +1288,8 @@ class Taker(TakerMonitoringMixin):
                 else self.config.counterparty_count
             )
             n_makers = resolve_counterparty_count(requested)
+            self._session.maker_target_count = n_makers
+            self._enforce_ring_request(amount, n_makers)
             self._session.maker_target_count = n_makers
 
             # Resolve explicit or interactive input requests before orderbook
@@ -1127,6 +1347,9 @@ class Taker(TakerMonitoringMixin):
             required_features: set[str] | None = None
             if self.backend.requires_neutrino_metadata():
                 required_features = {FEATURE_NEUTRINO_COMPAT}
+            offers, required_features = self._prepare_ring_offer_selection(
+                offers, required_features, n_makers
+            )
 
             # Early compatibility pre-check for neutrino takers: count how many offers
             # are from makers known to support neutrino_compat (via peerlist_features or
@@ -1140,7 +1363,7 @@ class Taker(TakerMonitoringMixin):
             # Offers with empty features dicts (unknown status) are NOT rejected here --
             # they pass through and will be verified during _phase_auth(). Only offers
             # where we KNOW the maker lacks the feature are filtered out.
-            if required_features:
+            if self.backend.requires_neutrino_metadata():
                 known_compatible = sum(
                     1
                     for o in offers
@@ -1195,7 +1418,7 @@ class Taker(TakerMonitoringMixin):
                 self.state = TakerState.FAILED
                 return None
 
-            if required_features:
+            if self.backend.requires_neutrino_metadata():
                 logger.info(
                     "Neutrino backend: requiring neutrino_compat in offer filtering, "
                     "will also negotiate during handshake"
@@ -1327,6 +1550,7 @@ class Taker(TakerMonitoringMixin):
                     self._session.last_failure_reason = reason
                     self.state = TakerState.FAILED
                     return None
+                self._enforce_ring_selection(len(selected_offers), n_makers)
 
                 # Pre-select UTXOs for CoinJoin, then generate PoDLE from one of them
                 # This ensures the PoDLE UTXO is one we'll actually use in the transaction
@@ -1537,15 +1761,8 @@ class Taker(TakerMonitoringMixin):
                 return None
 
             # Phase 3: Build transaction
-            self.state = TakerState.BUILDING_TX
-            logger.debug("Phase 3: Building transaction...")
-
-            tx_success = await self._session._phase_build_tx(
-                destination=destination,
-                mixdepth=mixdepth,
-            )
-            if not tx_success:
-                logger.error("Transaction build failed")
+            if not await self._build_transaction_phase(destination, mixdepth):
+                logger.error("Transaction build or channel-ring preparation failed")
                 self.state = TakerState.FAILED
                 return None
 
@@ -1715,7 +1932,7 @@ class Taker(TakerMonitoringMixin):
         # Nicks that failed or could not be verified during this auth stage are
         # hard-excluded from re-selection so no auth session or PoDLE proof is replayed.
         failed_nicks: set[str] = set()
-        target_makers = max(self._session.maker_target_count, self.config.minimum_makers)
+        target_makers = max(self._session.maker_target_count, self._session.required_maker_count)
         while True:
             auth_result = await self._session._phase_auth()
 
@@ -1795,17 +2012,17 @@ class Taker(TakerMonitoringMixin):
             if added_replacements:
                 continue
 
-            if auth_result.success and current_makers >= self.config.minimum_makers:
+            if auth_result.success and current_makers >= self._session.required_maker_count:
                 logger.warning(
                     f"Auth replacement attempts exhausted or no candidates remain; proceeding "
                     f"with {current_makers}/{target_makers} makers "
-                    f"(minimum {self.config.minimum_makers})"
+                    f"(minimum {self._session.required_maker_count})"
                 )
                 return True
 
             reason = (
                 f"Auth phase failed: only {current_makers} authenticated makers remain, "
-                f"below minimum {self.config.minimum_makers}"
+                f"below minimum {self._session.required_maker_count}"
             )
             logger.error(reason)
             self._session.last_failure_reason = reason
@@ -1961,7 +2178,7 @@ class Taker(TakerMonitoringMixin):
         replacement_attempt = 0
         podle_retry = 0
         failed_nicks: set[str] = set()
-        target_makers = max(self._session.maker_target_count, self.config.minimum_makers)
+        target_makers = max(self._session.maker_target_count, self._session.required_maker_count)
         while True:
             session_size_before_fill = len(self._session.maker_sessions)
             fill_result = await self._session._phase_fill()
@@ -2086,15 +2303,15 @@ class Taker(TakerMonitoringMixin):
 
             needed = target_makers - current_makers
             if replacement_attempt >= max_replacement_attempts:
-                if fill_result.success and current_makers >= self.config.minimum_makers:
+                if fill_result.success and current_makers >= self._session.required_maker_count:
                     logger.warning(
                         f"Fill replacement attempts exhausted; proceeding with {current_makers}/"
-                        f"{target_makers} makers (minimum {self.config.minimum_makers})"
+                        f"{target_makers} makers (minimum {self._session.required_maker_count})"
                     )
                     return True
                 reason = (
                     f"Fill phase failed: only {current_makers} responding makers remain, "
-                    f"below minimum {self.config.minimum_makers}"
+                    f"below minimum {self._session.required_maker_count}"
                 )
                 logger.error(reason)
                 self._session.last_failure_reason = reason
@@ -2117,15 +2334,15 @@ class Taker(TakerMonitoringMixin):
             )
 
             if not replacement_offers:
-                if fill_result.success and current_makers >= self.config.minimum_makers:
+                if fill_result.success and current_makers >= self._session.required_maker_count:
                     logger.warning(
                         f"No fill replacements available; proceeding with {current_makers}/"
-                        f"{target_makers} makers (minimum {self.config.minimum_makers})"
+                        f"{target_makers} makers (minimum {self._session.required_maker_count})"
                     )
                     return True
                 reason = (
                     f"Fill phase failed: no replacements available and only {current_makers} "
-                    f"makers remain (minimum {self.config.minimum_makers})"
+                    f"makers remain (minimum {self._session.required_maker_count})"
                 )
                 logger.error(reason)
                 self._session.last_failure_reason = reason

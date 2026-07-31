@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from copy import deepcopy
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 from jmcore.bitcoin import (
@@ -20,6 +21,7 @@ from jmswap.lnd import (
     AcceptorBounds,
     EndpointRole,
     ExternalChannelRequest,
+    FundingNegotiation,
     FundingTransactionChainStatus,
     InboundChannelExpectation,
     LndBackend,
@@ -98,6 +100,7 @@ class FakeStub:
         self.open_delay = 0.0
         self.acceptor_requests: list[Any] = []
         self.acceptor_call: FakeAcceptorCall | None = None
+        self.acceptor_calls: list[FakeAcceptorCall] = []
         self.abandon_requests: list[Any] = []
         self.abandon_error: Exception | None = None
         self.keep_pending_after_abandon = False
@@ -109,6 +112,7 @@ class FakeStub:
             synced_to_chain=True,
             wallet_synced=True,
             chains=[ln.Chain(chain="bitcoin", network="regtest")],
+            uris=[f"{OPENER_ID}@{'a' * 56}.onion:9735"],
             features={
                 81: ln.Feature(name="simple-taproot-chans", is_required=False, is_known=True)
             },
@@ -120,6 +124,7 @@ class FakeStub:
 
     def ChannelAcceptor(self) -> FakeAcceptorCall:  # noqa: N802
         self.acceptor_call = FakeAcceptorCall(self.acceptor_requests)
+        self.acceptor_calls.append(self.acceptor_call)
         return self.acceptor_call
 
     def OpenChannel(self, request: Any) -> FakeStream:  # noqa: N802
@@ -203,6 +208,33 @@ def inbound_expectation() -> InboundChannelExpectation:
     )
 
 
+def test_retained_channel_contracts_resume_idempotently_and_reject_conflicts() -> None:
+    backend = LndBackend("unused", b"cert", "00")
+    negotiation = FundingNegotiation(
+        pending_channel_id=PENDING_ID,
+        peer_node_id=FUNDEE_ID,
+        funding_address="bcrt1ptest",
+        funding_script_pubkey=FUNDING_SCRIPT,
+        capacity_sat=CAPACITY,
+        push_sat=PUSH,
+        opener_reserve_sat=OPENER_RESERVE,
+        fundee_reserve_sat=FUNDEE_RESERVE,
+        opener_csv_delay=144,
+        fundee_csv_delay=288,
+        min_depth=3,
+    )
+    backend.resume_external_channel(negotiation)
+    backend.resume_external_channel(negotiation)
+    backend.resume_inbound_channel(inbound_expectation())
+    backend.resume_inbound_channel(inbound_expectation())
+    assert backend._pending[PENDING_ID].negotiation == negotiation
+    assert backend._accepted[PENDING_ID] == inbound_expectation()
+
+    changed = negotiation.model_copy(update={"capacity_sat": CAPACITY + 1})
+    with pytest.raises(LndValidationError, match="conflicts"):
+        backend.resume_external_channel(changed)
+
+
 def valid_accept_request() -> Any:
     return ln.ChannelAcceptRequest(
         pending_chan_id=PENDING_ID,
@@ -253,6 +285,27 @@ async def test_node_info_checks_identity_version_network_sync_and_capability() -
     assert info.identity_pubkey == OPENER_ID
     assert info.version.startswith("0.21.1")
     assert info.feature_bits == frozenset({81})
+    assert info.advertised_uris == (f"{OPENER_ID}@{'a' * 56}.onion:9735",)
+
+
+async def test_production_capability_binds_onion_endpoint_to_getinfo_identity() -> None:
+    target = backend()
+    endpoint = "a" * 56 + ".onion:9735"
+    info = await target.check_production_cofunded_channel_ring_v1(endpoint)
+    assert info.identity_pubkey == OPENER_ID
+    with pytest.raises(LndCapabilityError, match="not advertised"):
+        await target.check_production_cofunded_channel_ring_v1("b" * 56 + ".onion:9735")
+
+
+def test_lnd_credentials_are_redacted_from_repr() -> None:
+    target = LndBackend(
+        host="localhost:10009",
+        tls_cert=b"private-tls-material",
+        macaroon_hex="private-macaroon-material",
+    )
+    rendered = repr(target)
+    assert "private-tls-material" not in rendered
+    assert "private-macaroon-material" not in rendered
 
 
 @pytest.mark.parametrize(
@@ -340,6 +393,44 @@ async def test_open_uses_caller_id_exact_push_private_final_taproot_and_no_publi
         await target.start_external_channel(external_request())
 
 
+async def test_open_allows_tor_peer_connection_to_use_full_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = backend()
+    connect_peer = AsyncMock()
+    monkeypatch.setattr(target, "connect_peer", connect_peer)
+
+    await target.start_external_channel(external_request(timeout_seconds=90.0))
+
+    assert connect_peer.await_args is not None
+    assert connect_peer.await_args.kwargs["timeout_seconds"] > 89.0
+
+
+async def test_open_retries_transient_onion_peer_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = backend()
+    connect_peer = AsyncMock(side_effect=[RuntimeError("TTL expired"), None])
+    monkeypatch.setattr(target, "connect_peer", connect_peer)
+
+    await target.start_external_channel(external_request(peer_host=f"{'a' * 56}.onion:9735"))
+
+    assert connect_peer.await_count == 2
+
+
+async def test_open_does_not_retry_non_onion_peer_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = backend()
+    connect_peer = AsyncMock(side_effect=RuntimeError("connection refused"))
+    monkeypatch.setattr(target, "connect_peer", connect_peer)
+
+    with pytest.raises(RuntimeError, match="connection refused"):
+        await target.start_external_channel(external_request())
+
+    connect_peer.assert_awaited_once()
+
+
 async def test_open_retries_peer_not_online_without_changing_pending_id() -> None:
     stub = FakeStub()
     stub.open_errors = [RuntimeError("peer is not online"), RuntimeError("peer not online")]
@@ -408,6 +499,40 @@ async def test_acceptor_returns_exact_opener_csv_and_confirmation_policy() -> No
     assert response.csv_delay == 144
     assert response.reserve_sat == OPENER_RESERVE
     assert response.min_accept_depth == 3
+
+
+async def test_acceptor_shares_one_stream_for_duplicate_expectation() -> None:
+    stub = FakeStub()
+    stub.acceptor_requests = [valid_accept_request()]
+    target = backend(stub)
+
+    first, second = await asyncio.gather(
+        target.run_channel_acceptor(inbound_expectation(), AcceptorBounds(), timeout_seconds=1),
+        target.run_channel_acceptor(inbound_expectation(), AcceptorBounds(), timeout_seconds=1),
+    )
+
+    assert first == second
+    assert len(stub.acceptor_calls) == 1
+
+
+async def test_acceptor_routes_multiple_expected_pending_ids_on_one_stream() -> None:
+    other_id = b"\x22" * 32
+    other_request = valid_accept_request()
+    other_request.pending_chan_id = other_id
+    stub = FakeStub()
+    stub.acceptor_requests = [valid_accept_request(), other_request]
+    target = backend(stub)
+    other_expected = inbound_expectation().model_copy(update={"pending_channel_id": other_id})
+
+    first, second = await asyncio.gather(
+        target.run_channel_acceptor(inbound_expectation(), AcceptorBounds(), timeout_seconds=1),
+        target.run_channel_acceptor(other_expected, AcceptorBounds(), timeout_seconds=1),
+    )
+
+    assert {first.pending_channel_id, second.pending_channel_id} == {PENDING_ID, other_id}
+    assert len(stub.acceptor_calls) == 1
+    assert stub.acceptor_call is not None
+    assert all(response.accept for response in stub.acceptor_call.responses)
 
 
 def test_psbt_preserves_txid_and_contains_every_v0_v1_witness_utxo() -> None:

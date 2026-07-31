@@ -12,7 +12,8 @@ from __future__ import annotations
 
 import asyncio
 import time
-from unittest.mock import AsyncMock, Mock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from _taker_test_helpers import make_taker_config, make_utxo
@@ -206,3 +207,100 @@ async def test_new_round_does_not_release_prior_post_sign_lease() -> None:
     wallet.release_coinjoin_inputs.assert_not_called()
     wallet.renew_coinjoin_inputs.assert_not_called()
     assert taker._session.reserved_inputs == set()
+
+
+def test_active_ring_lock_is_retained_when_round_cleanup_runs() -> None:
+    wallet = _make_wallet([])
+    taker = Taker(wallet, _backend(), make_taker_config())
+    reserved = {("c" * 64, 2)}
+    taker._session.reserved_inputs = set(reserved)
+    taker._session.ring_coordinator = SimpleNamespace(_record=lambda: SimpleNamespace(active=True))
+
+    taker.release_input_locks()
+
+    wallet.release_coinjoin_inputs.assert_not_called()
+    assert taker._session.reserved_inputs == reserved
+
+
+def test_inactive_ring_lock_is_released_when_round_cleanup_runs() -> None:
+    wallet = _make_wallet([])
+    taker = Taker(wallet, _backend(), make_taker_config())
+    reserved = {("c" * 64, 2)}
+    taker._session.reserved_inputs = set(reserved)
+    taker._session.ring_coordinator = SimpleNamespace(_record=lambda: SimpleNamespace(active=False))
+
+    taker.release_input_locks()
+
+    wallet.release_coinjoin_inputs.assert_called_once_with(
+        reserved, owner=taker._session.input_lock_owner
+    )
+    assert taker._session.reserved_inputs == set()
+
+
+def test_new_round_detaches_active_ring_lock_and_rotates_owner() -> None:
+    wallet = _make_wallet([])
+    taker = Taker(wallet, _backend(), make_taker_config())
+    previous_owner = taker._session.input_lock_owner
+    taker._session.reserved_inputs = {("d" * 64, 3)}
+    taker._session.ring_coordinator = SimpleNamespace(_record=lambda: SimpleNamespace(active=True))
+
+    taker._begin_input_lock_round()
+
+    wallet.release_coinjoin_inputs.assert_not_called()
+    assert taker._session.reserved_inputs == set()
+    assert taker._session.input_lock_owner != previous_owner
+    assert taker._session.ring_coordinator is None
+
+
+def test_restart_renews_active_ring_lock_with_persisted_owner() -> None:
+    wallet = _make_wallet([])
+    config = make_taker_config(pending_tx_abandon_hours=7)
+    taker = Taker(wallet, _backend(), config)
+    outpoint = SimpleNamespace(txid="e" * 64, vout=4)
+    taker._channel_ring_store = SimpleNamespace(
+        load_all=lambda: SimpleNamespace(
+            records=(
+                SimpleNamespace(
+                    active=True,
+                    local_input_outpoints=(outpoint,),
+                    input_lock_owner="taker:persisted-owner",
+                ),
+            ),
+            corruptions=(),
+        )
+    )
+
+    assert taker._renew_channel_ring_input_locks()
+    wallet.reserve_coinjoin_inputs.assert_called_once_with(
+        {(outpoint.txid, outpoint.vout)},
+        ttl=7 * 3600,
+        owner="taker:persisted-owner",
+    )
+
+
+@pytest.mark.asyncio
+async def test_fee_growth_reserves_extra_inputs_with_round_owner() -> None:
+    initial = make_utxo(txid_char="f", value=1_000)
+    extra = make_utxo(txid_char="0", value=1_000, vout=1)
+    wallet = _make_wallet([initial, extra])
+    wallet.select_utxos = Mock(return_value=[initial, extra])
+    wallet.get_change_address = Mock(return_value="bcrt1qchange")
+    wallet.get_next_address_index = Mock(return_value=0)
+    config = make_taker_config(pending_tx_abandon_hours=9)
+    taker = Taker(wallet, _backend(), config)
+    session = taker._session
+    session.cj_amount = 1_500
+    session.preselected_utxos = [initial]
+    session.reserved_inputs = {(initial.txid, initial.vout)}
+    session._fee_rate = 1.0
+    session._randomized_fee_rate = 1.0
+    session._estimate_tx_fee = Mock(return_value=100)  # type: ignore[method-assign]
+
+    with patch("taker.coinjoin_session.build_coinjoin_tx", return_value=(b"\x00", {})):
+        assert await session._phase_build_tx("bcrt1qdestination", 0)
+
+    wallet.reserve_coinjoin_inputs.assert_called_once_with(
+        {(extra.txid, extra.vout)},
+        ttl=session.input_lock_ttl_sec(),
+        owner=session.input_lock_owner,
+    )

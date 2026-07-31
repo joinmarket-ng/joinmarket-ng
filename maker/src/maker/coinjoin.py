@@ -13,7 +13,6 @@ Manages the maker side of the CoinJoin protocol:
 from __future__ import annotations
 
 import asyncio
-import secrets
 import time
 from collections.abc import Callable
 from enum import StrEnum
@@ -130,7 +129,6 @@ class CoinJoinSession:
         # deadline. It is renewed for the longer pending-broadcast window
         # immediately before a signature can be produced.
         self.pending_broadcast_ttl_sec = float(input_lock_ttl_sec)
-        self.input_lock_owner = secrets.token_hex(32)
         self.signing_boundary_crossed = False
         self.comm_channel = ""  # Track communication channel ("direct" or "dir:<node_id>")
 
@@ -145,6 +143,14 @@ class CoinJoinSession:
     def is_timed_out(self) -> bool:
         """Check if the session has exceeded the timeout."""
         return time.monotonic() >= self.deadline
+
+    @property
+    def input_lock_owner(self) -> str:
+        if not self.commitment:
+            # Internal selection callers may exercise this helper before !fill.
+            # Production selection occurs after the commitment is bound.
+            return f"maker:{self.taker_nick}:uninitialized"
+        return f"maker:{self.taker_nick}:{self.commitment.hex()}"
 
     def _get_channel_type(self, source: str) -> str:
         """Extract channel type from source string.

@@ -44,6 +44,7 @@ MIN_FINAL_TAPROOT_LND_VERSION = (0, 21, 0)
 _PSBT_MAGIC = b"\x70\x73\x62\x74\xff"
 _PSBT_GLOBAL_UNSIGNED_TX = 0x00
 _PSBT_IN_WITNESS_UTXO = 0x01
+_ONION_CONNECT_ATTEMPT_SECONDS = 125.0
 
 Hex32 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 NodeId = Annotated[str, StringConstraints(pattern=r"^(02|03)[0-9a-f]{64}$")]
@@ -86,6 +87,7 @@ class LndNodeInfo(StrictModel):
     synced_to_chain: bool
     wallet_synced: bool
     feature_bits: frozenset[int]
+    advertised_uris: tuple[str, ...]
 
 
 class WitnessUtxo(StrictModel):
@@ -355,6 +357,13 @@ class _PendingOpen:
     verified: VerifiedFunding | None = None
 
 
+@dataclass
+class _InboundAcceptorRegistration:
+    expected: InboundChannelExpectation
+    bounds: AcceptorBounds
+    future: asyncio.Future[AcceptorObservation]
+
+
 def _psbt_kv(key_type: int, value: bytes) -> bytes:
     key = bytes([key_type])
     return encode_varint(1) + key + encode_varint(len(value)) + value
@@ -514,8 +523,8 @@ def validate_endpoint_readiness(
 @dataclass
 class LndBackend:
     host: str
-    tls_cert: bytes
-    macaroon_hex: str
+    tls_cert: bytes = field(repr=False)
+    macaroon_hex: str = field(repr=False)
     network: str = "regtest"
     _channel: Any = field(default=None, repr=False)
     _stub: Any = field(default=None, repr=False)
@@ -523,6 +532,11 @@ class LndBackend:
     _seen_pending_ids: set[bytes] = field(default_factory=set, repr=False)
     _accepted: dict[bytes, InboundChannelExpectation] = field(default_factory=dict, repr=False)
     _observed_verified_points: dict[bytes, str] = field(default_factory=dict, repr=False)
+    _acceptor_registrations: dict[bytes, _InboundAcceptorRegistration] = field(
+        default_factory=dict, repr=False
+    )
+    _acceptor_call: Any = field(default=None, repr=False)
+    _acceptor_task: asyncio.Task[None] | None = field(default=None, repr=False)
 
     @classmethod
     def from_paths(
@@ -542,7 +556,7 @@ class LndBackend:
     def _ensure(self) -> None:
         if self._stub is not None:
             return
-        import grpc
+        import grpc  # type: ignore[import-untyped]
 
         from jmswap.lndrpc import lightning_pb2_grpc
 
@@ -560,6 +574,12 @@ class LndBackend:
         )
 
     async def close(self) -> None:
+        if self._acceptor_task is not None:
+            self._acceptor_task.cancel()
+            await asyncio.gather(self._acceptor_task, return_exceptions=True)
+        self._acceptor_task = None
+        self._acceptor_call = None
+        self._acceptor_registrations.clear()
         if self._channel is not None:
             await self._channel.close()
         self._channel = None
@@ -596,6 +616,7 @@ class LndBackend:
             synced_to_chain=bool(response.synced_to_chain),
             wallet_synced=bool(response.wallet_synced),
             feature_bits=feature_bits,
+            advertised_uris=tuple(str(uri) for uri in response.uris),
         )
         version_match = re.match(r"^v?(\d+)\.(\d+)\.(\d+)", info.version)
         version = tuple(int(part) for part in version_match.groups()) if version_match else ()
@@ -607,6 +628,25 @@ class LndBackend:
             raise LndCapabilityError("LND chain wallet is not fully synced")
         if not final_features:
             raise LndCapabilityError("LND does not advertise final Taproot feature bit 80/81")
+        return info
+
+    async def check_production_cofunded_channel_ring_v1(
+        self,
+        onion_endpoint: str,
+        *,
+        timeout_seconds: float = 10.0,
+    ) -> LndNodeInfo:
+        """Validate the complete production backend and bind its onion URI to GetInfo."""
+        info = await self.node_info(timeout_seconds=timeout_seconds)
+        if not COFUNDED_CHANNEL_RING_V1_SAFE_RETIREMENT_LIVE_VALIDATED:
+            raise LndCapabilityError("safe verified-channel retirement is not live validated")
+        if not COFUNDED_CHANNEL_RING_V1_CAPABLE:
+            raise LndCapabilityError("co-funded channel ring lifecycle is incomplete")
+        expected_uri = f"{info.identity_pubkey}@{onion_endpoint}"
+        if expected_uri not in info.advertised_uris:
+            raise LndCapabilityError(
+                "configured onion endpoint is not advertised by the GetInfo node identity"
+            )
         return info
 
     async def connect_peer(
@@ -633,11 +673,19 @@ class LndBackend:
             raise LndValidationError("pending channel ID was already used by this backend")
         self._seen_pending_ids.add(pending_id)
         deadline = time.monotonic() + request.timeout_seconds
-        await self.connect_peer(
-            request.peer_node_id,
-            request.peer_host,
-            timeout_seconds=min(10.0, request.timeout_seconds),
-        )
+        while True:
+            remaining = deadline - time.monotonic()
+            try:
+                await self.connect_peer(
+                    request.peer_node_id,
+                    request.peer_host,
+                    timeout_seconds=max(0.1, min(_ONION_CONNECT_ATTEMPT_SECONDS, remaining)),
+                )
+                break
+            except Exception:
+                if ".onion" not in request.peer_host or deadline <= time.monotonic():
+                    raise
+                await asyncio.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
         open_request = ln.OpenChannelRequest(
             node_pubkey=bytes.fromhex(request.peer_node_id),
             local_funding_amount=request.capacity_sat,
@@ -771,6 +819,25 @@ class LndBackend:
         pending.verified = verified
         return verified
 
+    def resume_external_channel(self, negotiation: FundingNegotiation) -> None:
+        """Restore an exact retained PSBT shim after the participant process restarts."""
+        pending_id = bytes(negotiation.pending_channel_id)
+        existing = self._pending.get(pending_id)
+        if existing is not None:
+            if existing.negotiation != negotiation:
+                raise LndValidationError("retained outgoing negotiation conflicts with memory")
+            return
+        self._seen_pending_ids.add(pending_id)
+        self._pending[pending_id] = _PendingOpen(negotiation=negotiation, stream=None)
+
+    def resume_inbound_channel(self, expected: InboundChannelExpectation) -> None:
+        """Restore the exact accepted inbound contract used to validate retained state."""
+        pending_id = bytes(expected.pending_channel_id)
+        existing = self._accepted.get(pending_id)
+        if existing is not None and existing != expected:
+            raise LndValidationError("retained inbound expectation conflicts with memory")
+        self._accepted[pending_id] = expected
+
     async def _cancel_pending_id(self, pending_id: bytes, *, timeout_seconds: float) -> None:
         self._ensure()
         transition = ln.FundingTransitionMsg(
@@ -817,13 +884,54 @@ class LndBackend:
         ready: asyncio.Event | None = None,
     ) -> AcceptorObservation:
         self._ensure()
-        call = self._stub.ChannelAcceptor()
+        pending_id = bytes(expected.pending_channel_id)
+        registration = self._acceptor_registrations.get(pending_id)
+        if registration is None:
+            registration = _InboundAcceptorRegistration(
+                expected=expected,
+                bounds=bounds,
+                future=asyncio.get_running_loop().create_future(),
+            )
+            self._acceptor_registrations[pending_id] = registration
+        elif registration.expected != expected or registration.bounds != bounds:
+            raise LndValidationError("conflicting inbound channel expectation")
+
+        if self._acceptor_task is None or self._acceptor_task.done():
+            self._acceptor_task = asyncio.create_task(self._dispatch_channel_acceptor())
         if ready is not None:
             ready.set()
 
-        async def handle() -> AcceptorObservation:
+        try:
+            return await asyncio.wait_for(registration.future, timeout_seconds)
+        except TimeoutError as exc:
+            raise LndTimeoutError(
+                "expected inbound channel was not accepted before timeout"
+            ) from exc
+        finally:
+            if registration.future.done():
+                current = self._acceptor_registrations.get(pending_id)
+                if current is registration:
+                    self._acceptor_registrations.pop(pending_id, None)
+
+    async def _dispatch_channel_acceptor(self) -> None:
+        call = self._stub.ChannelAcceptor()
+        self._acceptor_call = call
+        try:
             async for request in call:
-                decision = evaluate_channel_accept_request(request, expected, bounds)
+                pending_id = bytes(request.pending_chan_id)
+                registration = self._acceptor_registrations.get(pending_id)
+                if registration is None:
+                    await call.write(
+                        ln.ChannelAcceptResponse(
+                            accept=False,
+                            pending_chan_id=request.pending_chan_id,
+                            error="co-funded channel rejected: pending channel ID",
+                        )
+                    )
+                    continue
+
+                expected = registration.expected
+                decision = evaluate_channel_accept_request(request, expected, registration.bounds)
                 await call.write(
                     ln.ChannelAcceptResponse(
                         accept=decision.accept,
@@ -835,25 +943,31 @@ class LndBackend:
                         zero_conf=False,
                     )
                 )
-                if decision.accept:
-                    observation = AcceptorObservation(
-                        pending_channel_id=bytes(request.pending_chan_id),
-                        opener_node_id=request.node_pubkey.hex(),
-                        capacity_sat=int(request.funding_amt),
-                        push_msat=int(request.push_amt),
-                    )
-                    self._accepted[observation.pending_channel_id] = expected
-                    return observation
-            raise LndValidationError("ChannelAcceptor stream ended before the expected channel")
-
-        try:
-            return await asyncio.wait_for(handle(), timeout_seconds)
-        except TimeoutError as exc:
-            raise LndTimeoutError(
-                "expected inbound channel was not accepted before timeout"
-            ) from exc
+                if registration.future.done():
+                    continue
+                if not decision.accept:
+                    registration.future.set_exception(LndValidationError(decision.error))
+                    continue
+                observation = AcceptorObservation(
+                    pending_channel_id=pending_id,
+                    opener_node_id=request.node_pubkey.hex(),
+                    capacity_sat=int(request.funding_amt),
+                    push_msat=int(request.push_amt),
+                )
+                self._accepted[pending_id] = expected
+                registration.future.set_result(observation)
+        except asyncio.CancelledError:
+            for registration in self._acceptor_registrations.values():
+                if not registration.future.done():
+                    registration.future.cancel()
+        except Exception as exc:
+            for registration in self._acceptor_registrations.values():
+                if not registration.future.done():
+                    registration.future.set_exception(exc)
         finally:
             call.cancel()
+            self._acceptor_call = None
+            self._acceptor_task = None
 
     async def pending_channel_observation(
         self,

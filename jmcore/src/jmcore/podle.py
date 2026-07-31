@@ -34,7 +34,7 @@ from loguru import logger
 from pydantic import ValidationError
 from pydantic.dataclasses import dataclass
 
-from jmcore.bitcoin import hash160
+from jmcore.bitcoin import hash160, taproot_tweak_pubkey
 from jmcore.constants import SECP256K1_N
 from jmcore.protocol import UTXOMetadata
 
@@ -439,8 +439,8 @@ def verify_podle_binding(p: bytes, scriptpubkey: bytes | str) -> tuple[bool, str
     the scriptPubKey that ``P`` would produce for each supported output type and
     comparing it against the UTXO's on-chain scriptPubKey.
 
-    Supported script types: P2PKH, P2SH-P2WPKH, and P2WPKH (all using the
-    33-byte compressed ``P``).
+    Supported script types: P2PKH, P2SH-P2WPKH, P2WPKH, and BIP86 P2TR (all
+    using the 33-byte compressed ``P``).
 
     Args:
         p: PoDLE public key ``P`` (33-byte compressed SEC1 encoding).
@@ -459,6 +459,16 @@ def verify_podle_binding(p: bytes, scriptpubkey: bytes | str) -> tuple[bool, str
 
     if len(p) != 33:
         return False, f"Invalid P length: {len(p)}, expected 33 (compressed)"
+
+    # BIP86 P2TR: OP_1 <32-byte TapTweak(xonly(P))>
+    if len(spk) == 34 and spk[0] == 0x51 and spk[1] == 0x20:
+        try:
+            _, output_key = taproot_tweak_pubkey(p[1:])
+        except ValueError:
+            return False, "P is not a valid compressed secp256k1 public key"
+        if spk[2:] == output_key:
+            return True, ""
+        return False, "P does not match BIP86 P2TR scriptpubkey"
 
     h160 = hash160(p)
 

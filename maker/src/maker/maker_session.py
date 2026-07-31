@@ -26,10 +26,18 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from jmcore.cofunded_ring import (
+    MAX_RING_CIPHERTEXT_BYTES,
+    RingCancelPayload,
+    decode_ring_message,
+    encode_ring_message,
+)
+from jmcore.crypto import verify_signed_privmsg
 from jmcore.fee_policy import format_low_fee_error, parse_low_fee_error
 from jmcore.logging_context import coinjoin_id_from_commitment, coinjoin_log_context
+from jmcore.network import ONION_HOSTID
 from jmcore.notifications import get_notifier
-from jmcore.protocol import MakerError, UTXOMetadata
+from jmcore.protocol import MakerError, MessageType, UTXOMetadata, format_jm_message
 from jmcore.tasks import spawn_task
 from jmwallet.history import (
     HistoryWriteError,
@@ -49,6 +57,7 @@ if TYPE_CHECKING:
     from jmcore.models import Offer
     from jmwallet.wallet.models import UTXOInfo
 
+    from maker.channel_ring import MakerRingParticipant
     from maker.protocols import MakerBotProtocol
 
 
@@ -105,6 +114,7 @@ class MakerSession:
         self.detached = False
         self.cleanup_started = False
         self.detached_event = asyncio.Event()
+        self.ring_participant: MakerRingParticipant | None = None
 
     # -- Identity -----------------------------------------------------------
 
@@ -173,9 +183,20 @@ class MakerSession:
         the broadcast propagates. Safe to call when nothing was reserved.
         """
         try:
-            self.inner.wallet.release_coinjoin_inputs(
-                set(self.our_utxos.keys()), owner=self.inner.input_lock_owner
-            )
+            record_loader = getattr(self.ring_participant, "_record", None)
+            if record_loader is not None:
+                record = record_loader()
+                if record.active:
+                    logger.warning("Retaining input locks for active ring record")
+                    logger.bind(sensitive=True).warning(
+                        f"Retaining input locks for active ring record {record.key.filename}"
+                    )
+                    return
+            owner = getattr(self.inner, "input_lock_owner", None)
+            if owner is None:
+                self.inner.wallet.release_coinjoin_inputs(set(self.our_utxos.keys()))
+            else:
+                self.inner.wallet.release_coinjoin_inputs(set(self.our_utxos.keys()), owner=owner)
         except Exception as e:  # pragma: no cover - best-effort cleanup
             logger.debug("Failed to release input locks")
             logger.bind(sensitive=True).debug(
@@ -596,9 +617,45 @@ class MakerSession:
                 logger.bind(sensitive=True).error(f"Failed to decode transaction: {e}")
                 return
 
-            success, response = await self.handle_tx(
-                tx_hex, active_check=lambda: self.is_active(bot)
-            )
+            if self.ring_participant is None:
+                success, response = await self.handle_tx(
+                    tx_hex, active_check=lambda: self.is_active(bot)
+                )
+            else:
+                try:
+                    if not self.is_active(bot):
+                        return
+                    if (
+                        self.inner.backend.can_lookup_arbitrary_utxos()
+                        and self.inner.minimum_fee_rate_sat_vb is not None
+                    ):
+                        fee_policy_error = await self.inner._verify_minimum_miner_fee(
+                            tx_hex, lambda: self.is_active(bot)
+                        )
+                        if fee_policy_error is not None:
+                            raise ValueError(fee_policy_error)
+                    if not self.inner.wallet.renew_coinjoin_inputs(
+                        set(self.our_utxos),
+                        owner=self.inner.input_lock_owner,
+                        ttl=self.inner.pending_broadcast_ttl_sec,
+                    ):
+                        raise ValueError("Maker input lock ownership was lost before ring signing")
+                    self.ring_participant.prepare_coinjoin_signing(tx_hex)
+                    self.inner.signing_boundary_crossed = True
+                    self.state = CoinJoinState.SIG_SENT
+                    signatures = await self.inner._sign_transaction(
+                        tx_hex, active_check=lambda: self.is_active(bot)
+                    )
+                    if not signatures:
+                        raise ValueError("Failed to sign exact ring transaction")
+                    self.ring_participant.mark_signatures_sent(signatures)
+                    from jmcore.bitcoin import get_txid
+
+                    success = True
+                    response = {"signatures": signatures, "txid": get_txid(tx_hex)}
+                except Exception as exc:
+                    success = False
+                    response = {"error": str(exc)}
             if not self.is_active(bot):
                 return
 
@@ -685,8 +742,9 @@ class MakerSession:
 
                 if bot.active_sessions.get((self.generation_id, taker_nick)) is self:
                     self.state = CoinJoinState.COMPLETE
-                    bot.active_sessions.pop((self.generation_id, taker_nick))
-                    bot._release_podle_outpoint(self)
+                    if self.ring_participant is None:
+                        bot.active_sessions.pop((self.generation_id, taker_nick))
+                        bot._release_podle_outpoint(self)
 
                 # Schedule wallet re-sync in background to avoid blocking !push handling
                 spawn_task(bot._deferred_wallet_resync())
@@ -747,6 +805,101 @@ class MakerSession:
         except Exception as e:
             logger.error("Failed to handle !tx")
             logger.bind(sensitive=True).error(f"Failed to handle !tx: {e}")
+
+    async def on_ring(self, bot: MakerBotProtocol, msg: str, source: str) -> None:
+        """Decrypt, authenticate, and dispatch one canonical JMP-0010 envelope."""
+
+        self.validate_channel(source)
+        if self.state != CoinJoinState.IOAUTH_SENT:
+            logger.warning("Rejecting !ring before CoinJoin authentication is complete")
+            logger.bind(sensitive=True).warning(
+                f"Rejecting !ring from {self.taker_nick}: PoDLE/!ioauth not complete"
+            )
+            return
+        if (
+            not bot.config.channel_ring.enabled
+            or not bot.channel_ring_capability_validated
+            or bot._channel_ring_backend is None
+            or bot._channel_ring_store is None
+        ):
+            logger.warning("Rejecting !ring because the feature is unavailable")
+            logger.bind(sensitive=True).warning(
+                f"Rejecting !ring from {self.taker_nick}: feature is unavailable"
+            )
+            return
+        if not self.crypto.is_encrypted:
+            logger.warning("Rejecting !ring because encryption is unavailable")
+            logger.bind(sensitive=True).warning(
+                f"Rejecting !ring from {self.taker_nick}: encryption is unavailable"
+            )
+            return
+        parts = msg.split()
+        if len(parts) != 4 or len(parts[1]) > MAX_RING_CIPHERTEXT_BYTES:
+            logger.warning("Rejecting malformed encrypted !ring")
+            logger.bind(sensitive=True).warning(
+                f"Rejecting malformed encrypted !ring from {self.taker_nick}"
+            )
+            return
+        try:
+            verified, command, encrypted = verify_signed_privmsg(self.taker_nick, msg, ONION_HOSTID)
+            if not verified or command != "ring" or encrypted != parts[1]:
+                raise ValueError("invalid signed ring envelope")
+            plaintext = self.crypto.decrypt(encrypted)
+            payload = decode_ring_message(plaintext)
+            if self.ring_participant is None:
+                from maker.channel_ring import MakerRingParticipant
+
+                self.ring_participant = MakerRingParticipant(
+                    self,
+                    config=bot.config.channel_ring,
+                    store=bot._channel_ring_store,
+                    initialized_backend=bot._channel_ring_backend,
+                    chain_backend=bot.backend,
+                )
+            responses = await self.ring_participant.handle(payload)
+            if isinstance(payload, RingCancelPayload):
+                self.release_input_locks()
+            for response in responses:
+                encrypted = self.crypto.encrypt(encode_ring_message(response))
+                await self._send_ring_response(bot, encrypted, source)
+        except Exception as exc:
+            logger.warning("Rejected invalid or out-of-order !ring")
+            logger.bind(sensitive=True).warning(
+                f"Rejected invalid or out-of-order !ring from {self.taker_nick} "
+                f"({type(exc).__name__})"
+            )
+
+    async def _send_ring_response(self, bot: MakerBotProtocol, encrypted: str, source: str) -> None:
+        """Return a ring response only through the authenticated request channel."""
+
+        generation_resolver = getattr(bot, "_generation", None)
+        generation = (
+            generation_resolver(self.generation_id) if callable(generation_resolver) else None
+        )
+        if source == "direct":
+            direct_connections = (
+                generation.direct_connections if generation is not None else bot.direct_connections
+            )
+            connection = direct_connections.get(self.taker_nick)
+            if connection is None:
+                raise RuntimeError("direct ring response channel is unavailable")
+            identity = generation.nick_identity if generation is not None else bot.nick_identity
+            signed = identity.sign_message(encrypted, ONION_HOSTID)
+            line = format_jm_message(identity.nick, self.taker_nick, "ring", signed)
+            await connection.send(
+                json.dumps({"type": MessageType.PRIVMSG.value, "line": line}).encode("utf-8")
+            )
+            return
+        if source.startswith("dir:"):
+            directory_clients = (
+                generation.directory_clients if generation is not None else bot.directory_clients
+            )
+            client = directory_clients.get(source[4:])
+            if client is None:
+                raise RuntimeError("directory ring response channel is unavailable")
+            await client.send_private_message(self.taker_nick, "ring", encrypted)
+            return
+        raise RuntimeError("ring request has no authenticated response channel")
 
     async def send_response(
         self, bot: MakerBotProtocol, command: str, data: dict[str, Any]

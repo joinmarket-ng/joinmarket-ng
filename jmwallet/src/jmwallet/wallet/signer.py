@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from hashlib import sha256
 from typing import TYPE_CHECKING
 
+from coincurve import PrivateKey
 from jmcore.bitcoin import pubkey_to_p2wpkh_script
 from jmcore.btc_script import mk_freeze_script
 
@@ -127,7 +128,7 @@ class WalletSigningMixin:
                 input_index=input_index,
                 prevouts_values=prevout_values,
                 prevouts_scripts=prevout_scripts,
-                private_key=key.get_p2tr_private_key(),
+                private_key=PrivateKey(key.get_p2tr_private_key()),
             )
             return SignedInput(signature=signature, pubkey=xonly, witness=[signature])
 

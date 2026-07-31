@@ -54,6 +54,7 @@ from pydantic_settings import (
     SettingsConfigDict,
 )
 
+from jmcore.channel_ring import ChannelRingSettings
 from jmcore.constants import DUST_THRESHOLD
 from jmcore.models import (
     DIRECTORY_NODES_MAINNET,
@@ -961,6 +962,7 @@ class MakerSettings(BaseModel):
             "The CLI flag --dual-offers overrides this setting."
         ),
     )
+    channel_ring: ChannelRingSettings = Field(default_factory=ChannelRingSettings)
 
     @field_validator("cj_fee_relative", mode="before")
     @classmethod
@@ -998,6 +1000,7 @@ class MakerSettings(BaseModel):
 class TakerSettings(BaseModel):
     """Taker-specific settings."""
 
+    channel_ring: ChannelRingSettings = Field(default_factory=ChannelRingSettings)
     counterparty_count: int | None = Field(
         default=None,
         ge=1,
@@ -1851,7 +1854,7 @@ def _get_user_sections(user_text: str) -> set[str]:
         Set of section names found in the user config.
     """
     commented_sections = {
-        m.group(1) for m in re.finditer(r"^\s*#\s*\[(\w+)]\s*$", user_text, re.MULTILINE)
+        m.group(1) for m in re.finditer(r"^\s*#\s*\[([\w.]+)]\s*$", user_text, re.MULTILINE)
     }
 
     import tomlkit
@@ -1862,7 +1865,7 @@ def _get_user_sections(user_text: str) -> set[str]:
     except Exception:
         # If parsing fails, fall back to regex for uncommented headers.
         active_sections = {
-            m.group(1) for m in re.finditer(r"^\s*\[(\w+)]\s*$", user_text, re.MULTILINE)
+            m.group(1) for m in re.finditer(r"^\s*\[([\w.]+)]\s*$", user_text, re.MULTILINE)
         }
         return active_sections | commented_sections
 
@@ -1880,7 +1883,7 @@ def _get_template_section_keys(template_text: str) -> dict[str, set[str]]:
     Returns:
         Mapping of section name to set of key names defined in that section.
     """
-    section_re = re.compile(r"^\[(\w+)]", re.MULTILINE)
+    section_re = re.compile(r"^\[([\w.]+)]", re.MULTILINE)
     matches = list(section_re.finditer(template_text))
     result: dict[str, set[str]] = {}
     for idx, match in enumerate(matches):
@@ -1903,8 +1906,8 @@ def _get_user_section_keys(user_text: str) -> dict[str, set[str]]:
     Returns:
         Mapping of uncommented section name to set of key names found.
     """
-    boundary_re = re.compile(r"^(?:#\s*)?\[(\w+)]", re.MULTILINE)
-    uncommented_re = re.compile(r"^\[(\w+)]", re.MULTILINE)
+    boundary_re = re.compile(r"^(?:#\s*)?\[([\w.]+)]", re.MULTILINE)
+    uncommented_re = re.compile(r"^\[([\w.]+)]", re.MULTILINE)
     all_boundaries = list(boundary_re.finditer(user_text))
     uncommented = list(uncommented_re.finditer(user_text))
 
@@ -1958,7 +1961,7 @@ def config_diff(
     user_sections = _get_user_sections(user_text)
 
     # Extract template section names.
-    template_section_re = re.compile(r"^\[(\w+)]", re.MULTILINE)
+    template_section_re = re.compile(r"^\[([\w.]+)]", re.MULTILINE)
     template_section_names = [m.group(1) for m in template_section_re.finditer(template_text)]
 
     diffs: list[str] = []

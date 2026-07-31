@@ -7,8 +7,9 @@ from __future__ import annotations
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 
+from jmcore.channel_ring import ChannelRingConfig
 from jmcore.config import TorControlConfig, WalletConfig, create_tor_control_config_from_env
-from jmcore.models import OfferType, is_absolute_offer_type
+from jmcore.models import OfferType, is_absolute_offer_type, is_taproot_offer_type
 from jmcore.tor_control import HiddenServiceDoSConfig
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -260,6 +261,7 @@ class MakerConfig(WalletConfig):
             "Allows running multiple offers (e.g., relative + absolute) simultaneously."
         ),
     )
+    channel_ring: ChannelRingConfig = Field(default_factory=ChannelRingConfig)
 
     # Single offer configuration (legacy, used when offer_configs is empty)
     offer_type: OfferType = Field(
@@ -542,6 +544,15 @@ class MakerConfig(WalletConfig):
             # Validate cj_fee_relative for relative offer types
             if not is_absolute_offer_type(self.offer_type):
                 validate_relative_cj_fee(self.cj_fee_relative, self.cjfee_factor)
+
+        if self.channel_ring.enabled:
+            if self.address_type != "p2tr":
+                raise ValueError("enabled channel ring requires a p2tr wallet")
+            if any(
+                not is_taproot_offer_type(offer.offer_type)
+                for offer in self.get_effective_offer_configs()
+            ):
+                raise ValueError("enabled channel ring requires only tr0 maker offers")
 
         return self
 

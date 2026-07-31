@@ -31,7 +31,12 @@ from jmcore.logging_context import coinjoin_id_from_commitment, coinjoin_log_con
 from jmcore.models import Offer
 from jmcore.network import ONION_HOSTID
 from jmcore.notifications import get_notifier
-from jmcore.protocol import COMMAND_PREFIX, JM_VERSION, MessageType
+from jmcore.protocol import (
+    COMMAND_PREFIX,
+    FEATURE_COFUNDED_CHANNEL_RING_V1,
+    JM_VERSION,
+    MessageType,
+)
 from jmcore.rate_limiter import RateLimitAction, RateLimiter
 from jmcore.tasks import parse_directory_address, spawn_task
 from jmwallet.backends.base import BlockchainBackend
@@ -536,6 +541,10 @@ class ProtocolHandlersMixin:
                 await self._handle_tx(
                     from_nick, command, source=source, generation_id=generation_id
                 )
+            elif command.startswith("ring"):
+                await self._handle_ring(
+                    from_nick, command, source=source, generation_id=generation_id
+                )
             elif command.startswith("push"):
                 await self._handle_push(
                     from_nick, command, source=source, generation_id=generation_id
@@ -738,6 +747,8 @@ class ProtocolHandlersMixin:
                     self._release_podle_outpoint(previous_session)
                     self._release_commitment_reservation(previous_session.commitment.hex())
 
+                if self.channel_ring_capability_validated:
+                    response.setdefault("features", []).append(FEATURE_COFUNDED_CHANNEL_RING_V1)
                 self.active_sessions[session_key] = session
                 logger.info(
                     f"Created CoinJoin session with {taker_nick} "
@@ -1026,6 +1037,26 @@ class ProtocolHandlersMixin:
                     f"Pending signed-round input ownership was lost for {record.taker_nick}"
                 )
 
+    async def _handle_ring(
+        self: MakerBotProtocol,
+        taker_nick: str,
+        msg: str,
+        source: str = "unknown",
+        generation_id: int | None = None,
+    ) -> None:
+        if generation_id is None:
+            generation_id = self.current_generation_id
+        session = self.active_sessions.get((generation_id, taker_nick))
+        if session is None:
+            logger.warning("No active session for !ring")
+            logger.bind(sensitive=True).warning(f"No active session for !ring from {taker_nick}")
+            return
+        await self._dispatch_session_handler(
+            session,
+            lambda: session.on_ring(self, msg, source),
+            name=f"maker-ring-{taker_nick}",
+        )
+
     async def _handle_push(
         self: MakerBotProtocol,
         taker_nick: str,
@@ -1130,6 +1161,13 @@ class ProtocolHandlersMixin:
                 self._pending_signed_rounds.pop(key, None)
 
             logger.info(f"Received matched !push from {taker_nick}, broadcasting transaction...")
+            session = self.active_sessions.get(taker_nick)
+            if session is not None and session.ring_participant is not None:
+                try:
+                    await session.ring_participant.observe_final_transaction(tx_hex)
+                except Exception as e:
+                    logger.error(f"Rejected substituted ring !push transaction: {e}")
+                    return
 
             try:
                 txid = await self.backend.broadcast_transaction(tx_hex)
