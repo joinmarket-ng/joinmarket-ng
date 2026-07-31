@@ -50,7 +50,7 @@ dev = [
     # every CI job's dev extras, so this guarantees the dependency is present
     # regardless of which other components a job scopes itself to; the test
     # file is always collected via the shared root tests/ testpath.
-    "websockets>=14.0",
+    "websockets>=14.0,<17",
 ]
 
 [project.scripts]

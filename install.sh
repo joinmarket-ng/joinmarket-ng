@@ -1040,6 +1040,9 @@ prepare_dep_pinning() {
     # Only the components being installed contribute their locks. jmcore and
     # jmwallet are always installed; the remaining components are conditional.
     local pkgs=("jmcore" "jmwallet")
+    if [[ "${INSTALL_MAKER:-true}" == "true" || "${INSTALL_TUMBLER:-false}" == "true" ]]; then
+        pkgs+=("jmswap")
+    fi
     [[ "${INSTALL_MAKER:-true}" == "true" ]] && pkgs+=("maker")
     [[ "${INSTALL_TAKER:-true}" == "true" ]] && pkgs+=("taker")
     [[ "${INSTALL_TUMBLER:-false}" == "true" ]] && pkgs+=("tumbler")
@@ -1200,6 +1203,8 @@ install_packages() {
 
     # Install selected components
     if [[ "$INSTALL_MAKER" == "true" ]]; then
+        print_info "Installing jmswap channel backend..."
+        pip install "${git_base}#subdirectory=jmswap" "${pkg_extra[@]}" --quiet
         print_info "Installing maker..."
         pip install "${git_base}#subdirectory=maker" "${pkg_extra[@]}" --quiet
         print_success "Maker installed"
@@ -1214,6 +1219,7 @@ install_packages() {
     if [[ "${INSTALL_TUMBLER:-false}" == "true" ]]; then
         print_info "Installing tumbler..."
         pip install "${git_base}#subdirectory=tumbler" \
+            "${git_base}#subdirectory=jmswap" \
             "${git_base}#subdirectory=maker" "${git_base}#subdirectory=taker" \
             "${pkg_extra[@]}" --quiet
         print_success "Tumbler installed"
@@ -1268,8 +1274,7 @@ update_packages() {
     export JOINMARKET_BUILD_COMMIT="${commit_hash:0:7}"
     export JOINMARKET_BUILD_REF="$VERSION"
 
-    # The local jmcore/jmwallet URLs. maker/taker declare ``jmcore`` and
-    # ``jmwallet`` as bare dependencies; those names do not exist on
+    # The local JoinMarket-NG package URLs. These names do not exist on
     # PyPI, so we must hand pip the git URLs explicitly. When a
     # requirement is given as a direct URL, pip uses it to satisfy the
     # matching name instead of querying PyPI. This lets us resolve and
@@ -1277,6 +1282,7 @@ update_packages() {
     # while keeping the JoinMarket-NG packages pinned to git.
     local core_url="${git_base}#subdirectory=jmcore"
     local wallet_url="${git_base}#subdirectory=jmwallet"
+    local swap_url="${git_base}#subdirectory=jmswap"
     local maker_url="${git_base}#subdirectory=maker"
     local taker_url="${git_base}#subdirectory=taker"
     local tumbler_url="${git_base}#subdirectory=tumbler"
@@ -1315,14 +1321,17 @@ update_packages() {
     local should_install_maker="${INSTALL_MAKER:-true}"
     if pip show jm-maker &> /dev/null; then
         print_info "Updating maker..."
+        pip install --upgrade --force-reinstall --no-deps "$swap_url" --quiet
         pip install --upgrade --force-reinstall --no-deps "$maker_url" --quiet
-        # Resolve maker deps from git so jmcore/jmwallet are not sought
+        # Resolve maker deps from git so local packages are not sought
         # on PyPI and new third-party deps (e.g. pynacl) are installed.
-        pip install --upgrade "$maker_url" "$core_url" "$wallet_url" "${dep_extra[@]}" --quiet
+        pip install --upgrade "$maker_url" "$core_url" "$wallet_url" "$swap_url" \
+            "${dep_extra[@]}" --quiet
         print_success "Maker updated"
     elif [[ "$should_install_maker" == "true" ]]; then
         print_info "Installing maker..."
-        pip install "$maker_url" "$core_url" "$wallet_url" "${dep_extra[@]}" --quiet
+        pip install "$maker_url" "$core_url" "$wallet_url" "$swap_url" \
+            "${dep_extra[@]}" --quiet
         print_success "Maker installed"
     fi
 
@@ -1345,13 +1354,13 @@ update_packages() {
     if pip show jm-tumbler &> /dev/null; then
         print_info "Updating tumbler..."
         pip install --upgrade --force-reinstall --no-deps "$tumbler_url" --quiet
-        pip install --upgrade "$tumbler_url" "$core_url" "$wallet_url" "$maker_url" "$taker_url" \
-            "${dep_extra[@]}" --quiet
+        pip install --upgrade "$tumbler_url" "$core_url" "$wallet_url" "$swap_url" \
+            "$maker_url" "$taker_url" "${dep_extra[@]}" --quiet
         print_success "Tumbler updated"
     elif [[ "$should_install_tumbler" == "true" ]]; then
         print_info "Installing tumbler..."
-        pip install "$tumbler_url" "$core_url" "$wallet_url" "$maker_url" "$taker_url" \
-            "${dep_extra[@]}" --quiet
+        pip install "$tumbler_url" "$core_url" "$wallet_url" "$swap_url" "$maker_url" \
+            "$taker_url" "${dep_extra[@]}" --quiet
         print_success "Tumbler installed"
     fi
 

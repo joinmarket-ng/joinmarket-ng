@@ -1,0 +1,83 @@
+[project]
+name = "jmswap"
+version = "0.1.0"
+description = "Standalone Electrum-compatible Taproot Lightning swap library"
+requires-python = ">=3.11"
+dependencies = [
+    "jmcore",
+    "pydantic>=2.5.0",
+    "cryptography>=46.0.0,<50",
+    # Keep the Python 3.14-compatible JoinMarket pin used by jmcore.
+    "coincurve @ https://github.com/ofek/coincurve/archive/7829b29c08ebb1cc80386a1cdaf8c2243c4ef5c5.zip#sha256=623b363c1e39977255d9222351e211a96dc5884aebb28e8a23d85bfef0dec37e",
+    # Combined runtime images install the independently generated jmwalletd lock too.
+    "websockets>=14.0,<17",
+    "aiohttp>=3.10.0",
+    "python-socks[asyncio]>=2.5.0",
+    "grpcio==1.81.1",
+    "protobuf==6.33.6",
+    # Temporary Electrum WIP pin. This commit wraps libsecp256k1's MuSig module.
+    "electrum-ecc @ git+https://github.com/m0wer/electrum-ecc@c143ab969e2eedcb9520a2e0b42a53a8ccf1eea7",
+    # Docker builds install this VCS dependency before hash-checked lock files.
+]
+
+[project.optional-dependencies]
+dev = [
+    "build==1.5.0",
+    "grpcio-tools==1.81.1",
+    "mypy>=1.7.0",
+    "mypy-protobuf==5.1.0",
+    "pip-tools==7.5.3",
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-cov>=4.1.0",
+    "pytest-timeout>=2.0.0",
+    "ruff>=0.1.0",
+]
+
+[build-system]
+requires = ["setuptools>=68.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+jmswap = ["py.typed", "lndrpc/*.pyi"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["src", "../jmcore/src"]
+addopts = "-v --cov=jmswap --cov-report=term --timeout=60"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+
+[[tool.mypy.overrides]]
+module = "electrum_ecc.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "grpc.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "jmswap.lndrpc.*"
+ignore_errors = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["src/jmswap/lndrpc"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP", "B", "C4", "SIM"]
+ignore = ["E501"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
