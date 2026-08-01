@@ -797,7 +797,12 @@ class TestNeutrinoCoinJoin:
             counterparty_count=1,  # Only need 1 maker for this test
             minimum_makers=1,  # Allow single maker CoinJoin
             taker_utxo_age=required_utxo_confirmations,
-            tx_broadcast=BroadcastPolicy.RANDOM_PEER,
+            # NOT_SELF is the policy this test actually asserts: a neutrino taker
+            # must never reveal itself by broadcasting locally. RANDOM_PEER is
+            # documented to fall back to self, so it contradicts the assertion
+            # below and turned maker-side broadcast problems into a confusing
+            # "mock was awaited" failure.
+            tx_broadcast=BroadcastPolicy.NOT_SELF,
             data_dir=tmp_path,
         )
         assert taker_config.data_dir == taker_wallet.data_dir
