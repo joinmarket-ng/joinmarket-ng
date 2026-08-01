@@ -12,3 +12,6 @@ USER root
 RUN apt-get update \
     && apt-get install -y --no-install-recommends expect \
     && rm -rf /var/lib/apt/lists/*
+
+COPY tests/e2e/reference/check_directory_onion.py /usr/local/bin/check-directory-onion
+RUN chmod 755 /usr/local/bin/check-directory-onion

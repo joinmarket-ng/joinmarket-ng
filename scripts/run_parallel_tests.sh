@@ -634,6 +634,75 @@ wait_for_jam_makers() {
 }
 
 # =============================================================================
+# Wait for the directory hidden service to be reachable end to end
+#
+# `wait_for_tor` only proves that Tor wrote a hostname file. That happens long
+# before the descriptor is published, so the reference client could still fail
+# every connection attempt. This probe runs inside a reference container and
+# fails unless a SOCKS CONNECT to the onion succeeds AND the directory answers
+# a v5 handshake, which is exactly what the reference taker needs.
+# =============================================================================
+wait_for_directory_onion() {
+    local suite=$1
+    local service=${2:-jam}
+    local onion=""
+
+    for i in $(seq 1 30); do
+        onion=$(compose_cmd "$suite" exec -T tor \
+            sh -c "tr -d '[:space:]' < /var/lib/tor/directory/hostname" 2>/dev/null || true)
+        if [ -n "$onion" ]; then
+            break
+        fi
+        sleep 2
+    done
+    if [ -z "$onion" ]; then
+        log_error "[$suite] Tor did not publish a directory hostname"
+        return 1
+    fi
+
+    # Descriptor upload plus first circuit typically needs well under a minute;
+    # allow five so a loaded host does not fail an otherwise healthy stack.
+    for i in $(seq 1 60); do
+        if compose_cmd "$suite" exec -T "$service" \
+            check-directory-onion "$onion" --timeout 20 >/dev/null 2>&1; then
+            log_info "[$suite] Directory onion reachable from ${service}: ${onion}"
+            return 0
+        fi
+        sleep 5
+    done
+
+    log_error "[$suite] Directory onion ${onion} never became reachable from ${service}"
+    compose_cmd "$suite" exec -T "$service" \
+        check-directory-onion "$onion" --timeout 20 >&2 || true
+    return 1
+}
+
+# =============================================================================
+# Dump container logs for post-mortem diagnosis
+#
+# cleanup_suite runs `down -v`, so anything not captured here is lost. Suites
+# that depend on cross-container protocol flows append logs before teardown.
+# =============================================================================
+dump_suite_logs() {
+    local suite=$1
+    local rc=$2
+    local log=$3
+    shift 3
+
+    {
+        echo
+        echo "=========================================================="
+        echo "Container logs for diagnostics (suite=${suite}, rc=${rc})"
+        echo "=========================================================="
+        for svc in "$@"; do
+            echo
+            echo "----- ${svc} -----"
+            compose_cmd "$suite" logs --tail=400 "$svc" 2>&1 || true
+        done
+    } >> "$log" 2>&1 || true
+}
+
+# =============================================================================
 # Wait for Neutrino sync
 # =============================================================================
 wait_for_neutrino() {
@@ -1090,6 +1159,9 @@ run_suite_reference_interop() {
         wait_for_wallet_funder "$suite"
         wait_for_tor "$suite"
         wait_for_jam "$suite"
+        if ! wait_for_directory_onion "$suite"; then
+            return 1
+        fi
 
         sleep 30  # Wait for makers
 
@@ -1107,6 +1179,9 @@ run_suite_reference_interop() {
     ) > "$log" 2>&1
     rc=$?
     set -e
+    if [ "$rc" -ne 0 ]; then
+        dump_suite_logs "$suite" "$rc" "$log" tor directory jam maker1 maker2
+    fi
     cleanup_suite "$suite"
     return $rc
 }
@@ -1135,6 +1210,9 @@ run_suite_reference_legacy() {
         wait_for_wallet_funder "$suite"
         wait_for_tor "$suite"
         wait_for_jam "$suite"
+        if ! wait_for_directory_onion "$suite"; then
+            return 1
+        fi
 
         sleep 30  # Wait for makers
 
@@ -1152,6 +1230,9 @@ run_suite_reference_legacy() {
     ) > "$log" 2>&1
     rc=$?
     set -e
+    if [ "$rc" -ne 0 ]; then
+        dump_suite_logs "$suite" "$rc" "$log" tor directory jam maker1 maker2
+    fi
     cleanup_suite "$suite"
     return $rc
 }
@@ -1205,6 +1286,7 @@ run_suite_neutrino_coinjoin() {
     local btc_rpc=$(host_port "$suite" btc_rpc)
     local dir_port=$(host_port "$suite" dir)
     local neutrino_port=$(host_port "$suite" neutrino)
+    local obwatch_port=$(host_port "$suite" obwatch)
     local prefix="${CONTAINER_PREFIX}-${suite}"
 
     log_suite "Starting: Neutrino CoinJoin Tests ($suite)"
@@ -1223,14 +1305,14 @@ run_suite_neutrino_coinjoin() {
         wait_for_port "$dir_port" "Directory ($suite)"
         wait_for_neutrino "$suite" "$neutrino_port"
         wait_for_wallet_funder "$suite"
-
-        sleep 20
+        wait_for_maker_offers "$suite" "$obwatch_port" 2
 
         BITCOIN_RPC_URL="http://127.0.0.1:${btc_rpc}" \
         BITCOIN_RPC_USER=test \
         BITCOIN_RPC_PASSWORD=test \
         NEUTRINO_URL="https://127.0.0.1:${neutrino_port}" \
         DIRECTORY_PORT="${dir_port}" \
+        OBWATCH_URL="http://127.0.0.1:${obwatch_port}" \
         JM_CONTAINER_PREFIX="${prefix}" \
         COMPOSE_PROJECT_NAME="${PROJECT_PREFIX}-${suite}" \
         COVERAGE_FILE=".coverage.${suite}" \
@@ -1241,6 +1323,10 @@ run_suite_neutrino_coinjoin() {
     ) > "$log" 2>&1
     rc=$?
     set -e
+    if [ "$rc" -ne 0 ]; then
+        dump_suite_logs "$suite" "$rc" "$log" \
+            directory maker1 maker2 maker3 maker4 maker5 maker-neutrino neutrino bitcoin
+    fi
     cleanup_suite "$suite"
     return $rc
 }
@@ -1271,6 +1357,9 @@ run_suite_neutrino_reference() {
         wait_for_tor "$suite"
         wait_for_jam "$suite"
         wait_for_neutrino "$suite" "$neutrino_port"
+        if ! wait_for_directory_onion "$suite"; then
+            return 1
+        fi
 
         sleep 60  # Wait for makers to connect and announce offers
 
@@ -1328,6 +1417,9 @@ run_suite_reference_maker() {
         wait_for_port "$dir_port" "Directory ($suite)"
         wait_for_tor "$suite"
         wait_for_jam_makers "$suite"
+        if ! wait_for_directory_onion "$suite" jam-maker1; then
+            return 1
+        fi
 
         BITCOIN_RPC_URL="http://127.0.0.1:${btc_jam_rpc}" \
         BITCOIN_RPC_USER=test \

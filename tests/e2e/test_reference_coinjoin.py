@@ -42,6 +42,28 @@ COINJOIN_TIMEOUT = 240  # 4 minutes for coinjoin to complete
 WALLET_FUND_TIMEOUT = 300  # 5 minutes for wallet funding
 
 
+def _kill_sendpayment_in_jam() -> None:
+    """Terminate orphaned reference taker processes inside the JAM container.
+
+    ``subprocess.run(timeout=...)`` only kills the local ``docker compose exec``
+    process. Without this, ``sendpayment.py`` survives the timeout, keeps the
+    wallet lock and its daemon port, and makes the retry unreliable.
+    """
+    from tests.e2e.docker_utils import run_container_cmd as _run_container_cmd
+
+    result = _run_container_cmd(
+        "jam",
+        ["bash", "-c", "pkill -f sendpayment.py || true"],
+        timeout=15,
+    )
+    if result.returncode == 0:
+        logger.debug("Killed orphaned sendpayment.py inside JAM container")
+    else:
+        logger.warning(
+            f"Could not kill orphaned sendpayment.py: {result.stderr.strip()}"
+        )
+
+
 def get_directory_onion() -> str | None:
     """
     Get the directory server onion address from the Tor container.
@@ -679,6 +701,10 @@ async def test_execute_reference_coinjoin(funded_jam_wallet):
         )
     except subprocess.TimeoutExpired as e:
         logger.error("CoinJoin timed out!")
+        # subprocess only kills the host-side `docker compose exec`; sendpayment
+        # keeps running inside the container, holds the wallet lock and its
+        # daemon port, and then corrupts the pytest rerun.
+        _kill_sendpayment_in_jam()
         if e.stdout:
             stdout = (
                 e.stdout.decode(errors="replace")
