@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import os
 import secrets
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -12,16 +14,17 @@ from typing import Any
 import httpx
 import pytest
 from jmcore.bitcoin import get_txid, parse_transaction
-
 from jmswap.lnd import (
     AcceptorBounds,
     EndpointRole,
     ExternalChannelRequest,
     FundingTransactionChainStatus,
     InboundChannelExpectation,
+    LndAmbiguousShimError,
     LndBackend,
     LndCapabilityError,
     LndNodeInfo,
+    LndValidationError,
     PendingChannelExpectation,
     TransactionPresence,
     VerifiedChannelRetirementAuthorization,
@@ -290,24 +293,29 @@ async def retire_from_both_endpoints(
     assert final_status.chain is TransactionPresence.ABSENT
 
 
-@pytest.mark.asyncio
-async def test_verified_external_channels_can_be_retired_and_reopened() -> None:
-    if os.getenv("LND_EXTERNAL_E2E") != "1":
-        pytest.skip("start the lnd_external Compose profile and set LND_EXTERNAL_E2E=1")
-
-    opener_cert = DATA_DIR / "opener" / "tls.cert"
-    opener_mac = DATA_DIR / "opener" / "data/chain/bitcoin/regtest/admin.macaroon"
-    fundee_cert = DATA_DIR / "fundee" / "tls.cert"
-    fundee_mac = DATA_DIR / "fundee" / "data/chain/bitcoin/regtest/admin.macaroon"
-    await asyncio.gather(
-        *(
-            wait_for_file(path)
-            for path in (opener_cert, opener_mac, fundee_cert, fundee_mac)
-        )
+def opener_credentials() -> tuple[Path, Path]:
+    return (
+        DATA_DIR / "opener" / "tls.cert",
+        DATA_DIR / "opener" / "data/chain/bitcoin/regtest/admin.macaroon",
     )
 
-    opener = LndBackend.from_paths(OPENER_GRPC, opener_cert, opener_mac)
-    fundee = LndBackend.from_paths(FUNDEE_GRPC, fundee_cert, fundee_mac)
+
+def fundee_credentials() -> tuple[Path, Path]:
+    return (
+        DATA_DIR / "fundee" / "tls.cert",
+        DATA_DIR / "fundee" / "data/chain/bitcoin/regtest/admin.macaroon",
+    )
+
+
+@asynccontextmanager
+async def lnd_endpoints() -> AsyncIterator[
+    tuple[LndBackend, LndBackend, LndNodeInfo, LndNodeInfo, str, bytes]
+]:
+    """Two funded, synced stock LND nodes plus the regtest wallet and chain hash."""
+    credentials = (*opener_credentials(), *fundee_credentials())
+    await asyncio.gather(*(wait_for_file(path) for path in credentials))
+    opener = LndBackend.from_paths(OPENER_GRPC, *opener_credentials())
+    fundee = LndBackend.from_paths(FUNDEE_GRPC, *fundee_credentials())
     try:
         wallet = await core_wallet()
         mining_address = await bitcoin_rpc(
@@ -318,7 +326,198 @@ async def test_verified_external_channels_can_be_retired_and_reopened() -> None:
             wait_for_node(opener), wait_for_node(fundee)
         )
         genesis = str(await bitcoin_rpc("getblockhash", [0]))
-        chain_hash = bytes.fromhex(genesis)[::-1]
+        yield (
+            opener,
+            fundee,
+            opener_info,
+            fundee_info,
+            wallet,
+            bytes.fromhex(genesis)[::-1],
+        )
+    finally:
+        await asyncio.gather(opener.close(), fundee.close(), return_exceptions=True)
+
+
+def inbound_expectation(
+    pending_id: bytes,
+    opener_info: LndNodeInfo,
+    chain_hash: bytes,
+    capacity: int,
+    push: int,
+) -> InboundChannelExpectation:
+    return InboundChannelExpectation(
+        pending_channel_id=pending_id,
+        opener_node_id=opener_info.identity_pubkey,
+        chain_hash=chain_hash,
+        capacity_sat=capacity,
+        push_msat=push * 1000,
+        opener_reserve_sat=10_000,
+        fundee_reserve_sat=15_000,
+        opener_csv_delay=144,
+        fundee_csv_delay=144,
+        min_depth=3,
+    )
+
+
+def open_request(
+    pending_id: bytes, fundee_info: LndNodeInfo, capacity: int, push: int
+) -> ExternalChannelRequest:
+    return ExternalChannelRequest(
+        pending_channel_id=pending_id,
+        peer_node_id=fundee_info.identity_pubkey,
+        peer_host="lnd-fundee:9735",
+        capacity_sat=capacity,
+        push_sat=push,
+        opener_reserve_sat=10_000,
+        fundee_reserve_sat=15_000,
+        opener_csv_delay=144,
+        fundee_csv_delay=144,
+        min_depth=3,
+        timeout_seconds=60,
+    )
+
+
+async def arm_acceptor(
+    fundee: LndBackend, expected: InboundChannelExpectation
+) -> asyncio.Task[Any]:
+    ready = asyncio.Event()
+    acceptor = asyncio.create_task(
+        fundee.run_channel_acceptor(
+            expected, AcceptorBounds(), timeout_seconds=60, ready=ready
+        )
+    )
+    await ready.wait()
+    return acceptor
+
+
+@pytest.mark.asyncio
+async def test_acceptor_rejects_an_open_that_breaks_the_negotiated_contract() -> None:
+    if os.getenv("LND_EXTERNAL_E2E") != "1":
+        pytest.skip("start the lnd_external Compose profile and set LND_EXTERNAL_E2E=1")
+
+    async with lnd_endpoints() as (
+        opener,
+        fundee,
+        opener_info,
+        fundee_info,
+        _,
+        chain_hash,
+    ):
+        pending_id = secrets.token_bytes(32)
+        acceptor = await arm_acceptor(
+            fundee,
+            inbound_expectation(
+                pending_id, opener_info, chain_hash, 1_500_000, 600_000
+            ),
+        )
+
+        # The opener asks for a capacity the fundee never agreed to fund. LND relays
+        # the acceptor's own rejection reason back to the opener, which surfaces it as
+        # the underlying gRPC error rather than wrapping it.
+        with pytest.raises(Exception, match="co-funded channel rejected: capacity"):
+            await opener.start_external_channel(
+                open_request(pending_id, fundee_info, 1_400_000, 600_000)
+            )
+        with pytest.raises(LndValidationError, match="capacity"):
+            await acceptor
+
+        # A contract breach must leave nothing behind on either node.
+        assert await opener._list_pending_channel_points(timeout_seconds=10) == set()
+        assert await fundee._list_pending_channel_points(timeout_seconds=10) == set()
+
+
+@pytest.mark.asyncio
+async def test_cancel_before_verification_releases_the_funding_shim() -> None:
+    if os.getenv("LND_EXTERNAL_E2E") != "1":
+        pytest.skip("start the lnd_external Compose profile and set LND_EXTERNAL_E2E=1")
+
+    async with lnd_endpoints() as (
+        opener,
+        fundee,
+        opener_info,
+        fundee_info,
+        wallet,
+        chain_hash,
+    ):
+        pending_id = secrets.token_bytes(32)
+        acceptor = await arm_acceptor(
+            fundee,
+            inbound_expectation(
+                pending_id, opener_info, chain_hash, 1_500_000, 600_000
+            ),
+        )
+        await opener.start_external_channel(
+            open_request(pending_id, fundee_info, 1_500_000, 600_000)
+        )
+        assert (await acceptor).pending_channel_id == pending_id
+
+        await opener.cancel_external_channel(pending_id, input_signatures_added=False)
+        assert await opener._list_pending_channel_points(timeout_seconds=10) == set()
+
+        # The endpoints stay usable for a fresh ring revision afterwards.
+        verified = await open_and_verify_channel(
+            opener, fundee, opener_info, fundee_info, wallet, chain_hash
+        )
+        await retire_from_both_endpoints(opener, fundee, verified)
+
+
+@pytest.mark.asyncio
+async def test_restart_cannot_report_a_consumed_shim_as_canceled() -> None:
+    if os.getenv("LND_EXTERNAL_E2E") != "1":
+        pytest.skip("start the lnd_external Compose profile and set LND_EXTERNAL_E2E=1")
+
+    async with lnd_endpoints() as (
+        opener,
+        fundee,
+        opener_info,
+        fundee_info,
+        wallet,
+        chain_hash,
+    ):
+        verified = await open_and_verify_channel(
+            opener, fundee, opener_info, fundee_info, wallet, chain_hash
+        )
+        negotiation = opener._pending[bytes(verified.pending_channel_id)].negotiation
+        await opener.close()
+
+        # Restart with no durable evidence: LND answers a consumed shim exactly as it
+        # answers an absent one, so cancellation must never be reported as success.
+        blind = LndBackend.from_paths(OPENER_GRPC, *opener_credentials())
+        blind.resume_external_channel(negotiation)
+        with pytest.raises(LndAmbiguousShimError):
+            await blind.cancel_external_channel(
+                verified.pending_channel_id, input_signatures_added=False
+            )
+        assert await blind.pending_channel_present(verified.channel_point) is True
+        await blind.close()
+
+        # Restart with the durable evidence the participant persisted before it
+        # attested readiness: the endpoint stays eligible for guarded retirement.
+        restarted = LndBackend.from_paths(OPENER_GRPC, *opener_credentials())
+        restarted.resume_external_channel(
+            negotiation,
+            verified=verified,
+            observed_channel_point=verified.channel_point,
+        )
+        try:
+            await retire_from_both_endpoints(restarted, fundee, verified)
+        finally:
+            await restarted.close()
+
+
+@pytest.mark.asyncio
+async def test_verified_external_channels_can_be_retired_and_reopened() -> None:
+    if os.getenv("LND_EXTERNAL_E2E") != "1":
+        pytest.skip("start the lnd_external Compose profile and set LND_EXTERNAL_E2E=1")
+
+    async with lnd_endpoints() as (
+        opener,
+        fundee,
+        opener_info,
+        fundee_info,
+        wallet,
+        chain_hash,
+    ):
         mempool_before = await bitcoin_rpc("getrawmempool")
         first = await open_and_verify_channel(
             opener, fundee, opener_info, fundee_info, wallet, chain_hash
@@ -332,5 +531,3 @@ async def test_verified_external_channels_can_be_retired_and_reopened() -> None:
         assert second.channel_point != first.channel_point
         await retire_from_both_endpoints(opener, fundee, second)
         assert await bitcoin_rpc("getrawmempool") == mempool_before
-    finally:
-        await asyncio.gather(opener.close(), fundee.close())
