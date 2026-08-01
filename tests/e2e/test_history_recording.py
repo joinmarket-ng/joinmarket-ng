@@ -183,7 +183,10 @@ async def test_coinjoin_creates_history_entry(
             backend=bitcoin_core_backend,
             network="regtest",
             mixdepth_count=5,
+            data_dir=data_dir,
         )
+        assert taker_wallet.metadata_store is not None
+        assert config.data_dir == taker_wallet.data_dir
 
         await taker_wallet.sync_all()
         taker_balance = await taker_wallet.get_total_balance()

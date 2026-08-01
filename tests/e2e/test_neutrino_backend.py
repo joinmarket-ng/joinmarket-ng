@@ -331,7 +331,10 @@ class TestNeutrinoCoinJoin:
 
     @pytest.mark.slow
     async def test_coinjoin_with_neutrino_maker(
-        self, neutrino_backend, fresh_docker_makers
+        self,
+        neutrino_backend,
+        fresh_docker_makers,
+        tmp_path,
     ):
         """Test that a maker using neutrino can participate in CoinJoin.
 
@@ -388,7 +391,9 @@ class TestNeutrinoCoinJoin:
             mnemonic=TAKER_MNEMONIC,
             backend=bitcoin_backend,
             network=NetworkType.REGTEST,
+            data_dir=tmp_path,
         )
+        assert taker_wallet.metadata_store is not None
 
         # Sync taker wallet
         logger.info("Syncing taker wallet (bitcoin core)...")
@@ -431,7 +436,9 @@ class TestNeutrinoCoinJoin:
             counterparty_count=1,  # Only need 1 maker for this test
             minimum_makers=1,  # Allow single maker CoinJoin
             taker_utxo_age=COINBASE_MATURITY_CONFIRMATIONS,
+            data_dir=tmp_path,
         )
+        assert taker_config.data_dir == taker_wallet.data_dir
 
         taker = Taker(
             wallet=taker_wallet,
@@ -577,7 +584,10 @@ class TestNeutrinoCoinJoin:
 
     @pytest.mark.slow
     async def test_coinjoin_with_neutrino_taker(
-        self, neutrino_backend, fresh_docker_makers
+        self,
+        neutrino_backend,
+        fresh_docker_makers,
+        tmp_path,
     ):
         """Test that a taker using neutrino can initiate CoinJoin.
 
@@ -627,7 +637,9 @@ class TestNeutrinoCoinJoin:
             mnemonic=TAKER_MNEMONIC,
             backend=neutrino_backend,
             network=NetworkType.REGTEST,
+            data_dir=tmp_path,
         )
+        assert taker_wallet.metadata_store is not None
 
         # Sync taker wallet
         logger.info("Syncing taker wallet (neutrino)...")
@@ -786,7 +798,9 @@ class TestNeutrinoCoinJoin:
             minimum_makers=1,  # Allow single maker CoinJoin
             taker_utxo_age=required_utxo_confirmations,
             tx_broadcast=BroadcastPolicy.RANDOM_PEER,
+            data_dir=tmp_path,
         )
+        assert taker_config.data_dir == taker_wallet.data_dir
 
         taker = Taker(
             wallet=taker_wallet,

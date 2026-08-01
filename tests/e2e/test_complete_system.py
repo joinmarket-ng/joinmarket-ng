@@ -16,6 +16,7 @@ Requires: docker compose --profile e2e up -d
 import asyncio
 import os
 import subprocess
+from pathlib import Path
 
 import pytest
 import pytest_asyncio
@@ -39,6 +40,14 @@ _RPC_URL = os.environ.get("BITCOIN_RPC_URL", "http://127.0.0.1:18443")
 _RPC_USER = os.environ.get("BITCOIN_RPC_USER", "test")
 _RPC_PASSWORD = os.environ.get("BITCOIN_RPC_PASSWORD", "test")
 _DIRECTORY_SERVER = f"127.0.0.1:{os.environ.get('DIRECTORY_PORT', '5222')}"
+
+
+def _suite_data_dir() -> Path:
+    """Return the data directory isolated by the E2E test configuration."""
+    data_dir = os.environ.get("JOINMARKET_DATA_DIR")
+    assert data_dir is not None, "E2E tests require an isolated JOINMARKET_DATA_DIR"
+    return Path(data_dir)
+
 
 # ==============================================================================
 # Test Wallet Mnemonics (used in successful CoinJoin testing)
@@ -111,6 +120,7 @@ async def _create_funded_wallet(
         backend=bitcoin_backend,
         network="regtest",
         mixdepth_count=5,
+        data_dir=_suite_data_dir(),
     )
 
     await wallet.sync_all()
@@ -284,6 +294,7 @@ def taker_config():
         minimum_makers=2,
         maker_timeout_sec=60,
         order_wait_time=60.0,
+        data_dir=_suite_data_dir(),
     )
 
 
@@ -492,6 +503,7 @@ async def test_taker_initialization(bitcoin_backend, taker_config):
         mnemonic=taker_config.mnemonic.get_secret_value(),
         backend=bitcoin_backend,
         network="regtest",
+        data_dir=_suite_data_dir(),
     )
 
     taker = Taker(wallet, bitcoin_backend, taker_config)
@@ -515,6 +527,7 @@ async def test_taker_connect_directory(bitcoin_backend, taker_config, directory_
         mnemonic=taker_config.mnemonic.get_secret_value(),
         backend=bitcoin_backend,
         network="regtest",
+        data_dir=_suite_data_dir(),
     )
 
     taker = Taker(wallet, bitcoin_backend, taker_config)
@@ -547,6 +560,7 @@ async def test_taker_orderbook_fetch(bitcoin_backend, taker_config, directory_se
         mnemonic=taker_config.mnemonic.get_secret_value(),
         backend=bitcoin_backend,
         network="regtest",
+        data_dir=_suite_data_dir(),
     )
 
     taker = Taker(wallet, bitcoin_backend, taker_config)
@@ -745,9 +759,7 @@ async def test_taker_signing_integration(funded_taker_wallet: WalletService):
     print(f"Using UTXO: {taker_utxo.txid}:{taker_utxo.vout} = {taker_utxo.value} sats")
 
     # Create mock maker UTXOs
-    maker_utxos = [
-        {"txid": "c" * 64, "vout": 0, "value": 1_200_000},
-    ]
+    maker_utxos = [("c" * 64, 0, 1_200_000)]
 
     cj_amount = min(taker_utxo.value // 2, 500_000)
 
@@ -770,8 +782,8 @@ async def test_taker_signing_integration(funded_taker_wallet: WalletService):
         ),
         maker_inputs={
             "maker1": [
-                TxInput.from_hex(txid=u["txid"], vout=u["vout"], value=u["value"])
-                for u in maker_utxos
+                TxInput.from_hex(txid=txid, vout=vout, value=value)
+                for txid, vout, value in maker_utxos
             ],
         },
         maker_cj_outputs={
@@ -802,13 +814,17 @@ async def test_taker_signing_integration(funded_taker_wallet: WalletService):
     tx = deserialize_transaction(tx_bytes)
     assert len(tx.inputs) == 2  # 1 taker + 1 maker
 
-    # Create a mock taker object to test signing
+    # Create a taker object to test signing
     from unittest.mock import MagicMock, patch
 
     from taker.taker import Taker
 
-    mock_config = MagicMock()
-    mock_config.network.value = "regtest"
+    config = TakerConfig(
+        mnemonic=TAKER_MNEMONIC,
+        network=NetworkType.REGTEST,
+        bitcoin_network=NetworkType.REGTEST,
+        data_dir=_suite_data_dir(),
+    )
     mock_backend = MagicMock()
 
     with patch.object(Taker, "__init__", lambda self, *args, **kwargs: None):
@@ -817,46 +833,61 @@ async def test_taker_signing_integration(funded_taker_wallet: WalletService):
         taker._session.attach(taker)
         taker.wallet = funded_taker_wallet
         taker.backend = mock_backend
-        taker.config = mock_config
+        taker.config = config
         taker._session.unsigned_tx = tx_bytes
         taker._session.tx_metadata = metadata
         taker._session.selected_utxos = [taker_utxo]
+        outpoint = (taker_utxo.txid, taker_utxo.vout)
+        acquired = funded_taker_wallet.reserve_coinjoin_inputs(
+            {outpoint},
+            ttl=taker._session.input_lock_ttl_sec(),
+            owner=taker._session.input_lock_owner,
+        )
+        assert acquired, "Synthetic signing test must acquire its selected input lease"
+        taker._session.reserved_inputs = {outpoint}
 
-        # Sign the inputs
-        signatures = await taker._session._sign_our_inputs()
+        try:
+            # Sign the inputs
+            signatures = await taker._session._sign_our_inputs()
 
-        # Verify we got a signature
-        assert len(signatures) == 1, f"Expected 1 signature, got {len(signatures)}"
+            # Verify we got a signature
+            assert len(signatures) == 1, f"Expected 1 signature, got {len(signatures)}"
 
-        sig_info = signatures[0]
-        print(f"Signature for {sig_info['txid']}:{sig_info['vout']}")
-        print(f"  Pubkey: {sig_info['pubkey'][:16]}...")
-        print(f"  Signature length: {len(sig_info['signature']) // 2} bytes")
+            sig_info = signatures[0]
+            print(f"Signature for {sig_info['txid']}:{sig_info['vout']}")
+            print(f"  Pubkey: {sig_info['pubkey'][:16]}...")
+            print(f"  Signature length: {len(sig_info['signature']) // 2} bytes")
 
-        # Verify signature structure
-        assert sig_info["txid"] == taker_utxo.txid
-        assert sig_info["vout"] == taker_utxo.vout
-        assert len(sig_info["witness"]) == 2
+            # Verify signature structure
+            assert sig_info["txid"] == taker_utxo.txid
+            assert sig_info["vout"] == taker_utxo.vout
+            assert len(sig_info["witness"]) == 2
 
-        # Verify signature is valid DER + sighash
-        sig_bytes = bytes.fromhex(sig_info["signature"])
-        assert len(sig_bytes) > 64  # DER signatures are variable length
-        assert sig_bytes[-1] == 1  # SIGHASH_ALL
+            # Verify signature is valid DER + sighash
+            sig_bytes = bytes.fromhex(sig_info["signature"])
+            assert len(sig_bytes) > 64  # DER signatures are variable length
+            assert sig_bytes[-1] == 1  # SIGHASH_ALL
 
-        # Test that add_signatures rejects incomplete signatures.
-        # A CoinJoin transaction is invalid unless every input is signed,
-        # so providing only the taker's signature while maker signatures
-        # are missing must raise ValueError.
-        all_signatures = {
-            "taker": signatures,
-            "maker1": [],  # Missing maker signature
-        }
+            # Test that add_signatures rejects incomplete signatures.
+            # A CoinJoin transaction is invalid unless every input is signed,
+            # so providing only the taker's signature while maker signatures
+            # are missing must raise ValueError.
+            all_signatures = {
+                "taker": signatures,
+                "maker1": [],  # Missing maker signature
+            }
 
-        with pytest.raises(ValueError, match="missing signatures"):
-            builder.add_signatures(tx_bytes, all_signatures, metadata)
+            with pytest.raises(ValueError, match="missing signatures"):
+                builder.add_signatures(tx_bytes, all_signatures, metadata)
 
-        print("Correctly rejected incomplete signatures")
-        print("Taker signing integration test PASSED")
+            print("Correctly rejected incomplete signatures")
+            print("Taker signing integration test PASSED")
+        finally:
+            funded_taker_wallet.release_coinjoin_inputs(
+                taker._session.reserved_inputs,
+                owner=taker._session.input_lock_owner,
+            )
+            taker._session.reserved_inputs.clear()
 
 
 # ==============================================================================
@@ -903,7 +934,10 @@ async def test_complete_coinjoin_two_makers(
         backend=bitcoin_backend,
         network="regtest",
         mixdepth_count=5,
+        data_dir=_suite_data_dir(),
     )
+    assert taker_wallet.metadata_store is not None
+    assert taker_config.data_dir == taker_wallet.data_dir
 
     # Sync wallet
     await taker_wallet.sync_all()
@@ -1010,7 +1044,10 @@ async def test_coinjoin_with_multi_utxo_maker(
         backend=bitcoin_backend,
         network="regtest",
         mixdepth_count=5,
+        data_dir=_suite_data_dir(),
     )
+    assert taker_wallet.metadata_store is not None
+    assert taker_config.data_dir == taker_wallet.data_dir
 
     # Sync wallet
     await taker_wallet.sync_all()
