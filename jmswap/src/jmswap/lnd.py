@@ -80,6 +80,10 @@ class LndAmbiguousShimError(LndError):
     """A resumed funding shim cannot be proven absent rather than already consumed."""
 
 
+class LndRpcError(LndError):
+    """An LND RPC failed; the message carries the reason LND reported."""
+
+
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
@@ -554,6 +558,7 @@ class LndBackend:
     )
     _acceptor_call: Any = field(default=None, repr=False)
     _acceptor_task: asyncio.Task[None] | None = field(default=None, repr=False)
+    _acceptor_started: asyncio.Future[None] | None = field(default=None, repr=False)
 
     @classmethod
     def from_paths(
@@ -595,6 +600,7 @@ class LndBackend:
             self._acceptor_task.cancel()
             await asyncio.gather(self._acceptor_task, return_exceptions=True)
         self._acceptor_task = None
+        self._acceptor_started = None
         self._acceptor_call = None
         self._acceptor_registrations.clear()
         if self._channel is not None:
@@ -684,6 +690,23 @@ class LndBackend:
                 raise
 
     async def start_external_channel(self, request: ExternalChannelRequest) -> FundingNegotiation:
+        """Negotiate one externally funded channel, reporting failures as backend errors.
+
+        A rejected open is normal in a ring: the peer's acceptor refuses anything
+        outside the negotiated contract, and LND relays that reason back here as a
+        transport error. Callers get it as an ``LndError`` carrying the reason rather
+        than a bare gRPC exception they would have to recognise themselves.
+        """
+        try:
+            return await self._negotiate_external_channel(request)
+        except LndError:
+            raise
+        except Exception as exc:
+            raise LndRpcError(f"OpenChannel failed: {exc}") from exc
+
+    async def _negotiate_external_channel(
+        self, request: ExternalChannelRequest
+    ) -> FundingNegotiation:
         self._ensure()
         pending_id = bytes(request.pending_channel_id)
         if pending_id in self._seen_pending_ids:
@@ -827,6 +850,10 @@ class LndBackend:
             await asyncio.wait_for(self._stub.FundingStateStep(transition), timeout_seconds)
         except TimeoutError as exc:
             raise LndTimeoutError("FundingStateStep PsbtVerify timed out") from exc
+        except LndError:
+            raise
+        except Exception as exc:
+            raise LndRpcError(f"FundingStateStep PsbtVerify failed: {exc}") from exc
         verified = VerifiedFunding(
             pending_channel_id=negotiation.pending_channel_id,
             funding_txid=funding_txid,
@@ -862,6 +889,8 @@ class LndBackend:
         if existing is not None:
             if existing.negotiation != negotiation:
                 raise LndValidationError("retained outgoing negotiation conflicts with memory")
+            if verified is not None and existing.verified not in {None, verified}:
+                raise LndValidationError("retained verified funding conflicts with memory")
             if verified is not None and existing.verified is None:
                 existing.verified = verified
                 existing.shim_state_known = True
@@ -874,7 +903,7 @@ class LndBackend:
                 shim_state_known=verified is not None,
             )
         if observed_channel_point is not None:
-            self._observed_verified_points[pending_id] = observed_channel_point
+            self._restore_observed_verified_point(pending_id, observed_channel_point)
 
     def resume_inbound_channel(
         self,
@@ -894,9 +923,15 @@ class LndBackend:
             raise LndValidationError("retained inbound expectation conflicts with memory")
         self._accepted[pending_id] = expected
         if observed_channel_point is not None:
-            if re.fullmatch(r"[0-9a-f]{64}:[0-9]+", observed_channel_point) is None:
-                raise LndValidationError("invalid retained inbound channel point")
-            self._observed_verified_points[pending_id] = observed_channel_point
+            self._restore_observed_verified_point(pending_id, observed_channel_point)
+
+    def _restore_observed_verified_point(self, pending_id: bytes, channel_point: str) -> None:
+        if re.fullmatch(r"[0-9a-f]{64}:[0-9]+", channel_point) is None:
+            raise LndValidationError("invalid retained channel point")
+        existing = self._observed_verified_points.get(pending_id)
+        if existing is not None and existing != channel_point:
+            raise LndValidationError("retained channel point conflicts with memory")
+        self._observed_verified_points[pending_id] = channel_point
 
     async def _cancel_pending_id(self, pending_id: bytes, *, timeout_seconds: float) -> None:
         self._ensure()
@@ -923,6 +958,8 @@ class LndBackend:
             )
         try:
             await self._cancel_pending_id(pending_id, timeout_seconds=timeout_seconds)
+        except TimeoutError as exc:
+            raise LndTimeoutError("FundingStateStep shim_cancel timed out") from exc
         except Exception as exc:
             markers = (
                 "not found",
@@ -932,16 +969,23 @@ class LndBackend:
                 "already cancelled",
             )
             if not any(marker in str(exc).lower() for marker in markers):
-                raise
+                if isinstance(exc, LndError):
+                    raise
+                raise LndRpcError(f"FundingStateStep shim_cancel failed: {exc}") from exc
             # LND reports the same absence whether the shim never existed or a
             # previous PsbtVerify consumed it. That is only safe to treat as a
             # successful cancellation when this process created the shim and knows
             # verification never ran; a shim restored after a restart is ambiguous,
             # so the caller must reconcile instead of recording a clean retirement.
-            if pending is not None and not pending.shim_state_known:
+            shim_state_known = (
+                pending.shim_state_known
+                if pending is not None
+                else pending_id in self._seen_pending_ids
+            )
+            if not shim_state_known:
                 raise LndAmbiguousShimError(
-                    "resumed funding shim is absent from LND, which cannot distinguish a "
-                    "canceled shim from one consumed by PsbtVerify; reconcile instead"
+                    "unknown or resumed funding shim is absent from LND, which cannot distinguish "
+                    "a canceled shim from one consumed by PsbtVerify; reconcile instead"
                 ) from exc
         self._pending.pop(pending_id, None)
 
@@ -967,22 +1011,39 @@ class LndBackend:
             raise LndValidationError("conflicting inbound channel expectation")
 
         if self._acceptor_task is None or self._acceptor_task.done():
-            started = asyncio.Event()
+            started: asyncio.Future[None] = asyncio.get_running_loop().create_future()
             task = asyncio.create_task(self._dispatch_channel_acceptor(started))
             self._acceptor_task = task
-            try:
-                await asyncio.wait_for(started.wait(), timeout_seconds)
-            except TimeoutError as exc:
-                task.cancel()
+            self._acceptor_started = started
+        task = self._acceptor_task
+        startup = self._acceptor_started
+        if task is None or startup is None:
+            self._discard_registration(pending_id, registration)
+            raise LndRpcError("ChannelAcceptor startup state is inconsistent")
+        try:
+            await asyncio.wait_for(asyncio.shield(startup), timeout_seconds)
+        except TimeoutError as exc:
+            task.cancel()
+            self._discard_registration(pending_id, registration)
+            raise LndTimeoutError("ChannelAcceptor stream did not start before timeout") from exc
+        except BaseException:
+            self._discard_registration(pending_id, registration)
+            raise
+        if task.done():
+            error = task.exception()
+            if error is not None:
                 self._discard_registration(pending_id, registration)
-                raise LndTimeoutError(
-                    "ChannelAcceptor stream did not start before timeout"
-                ) from exc
-            if task.done():
-                error = task.exception()
-                if error is not None:
-                    self._discard_registration(pending_id, registration)
-                    raise error
+                raise error
+            if not registration.future.done():
+                self._discard_registration(pending_id, registration)
+                raise LndRpcError("ChannelAcceptor stream closed during startup")
+            if registration.future.cancelled():
+                self._discard_registration(pending_id, registration)
+                raise LndRpcError("ChannelAcceptor stream was canceled during startup")
+            registration_error = registration.future.exception()
+            if registration_error is not None:
+                self._discard_registration(pending_id, registration)
+                raise registration_error
         if ready is not None:
             ready.set()
 
@@ -1002,24 +1063,21 @@ class LndBackend:
         if self._acceptor_registrations.get(pending_id) is registration:
             self._acceptor_registrations.pop(pending_id, None)
 
-    async def _dispatch_channel_acceptor(self, started: asyncio.Event | None = None) -> None:
+    async def _dispatch_channel_acceptor(self, started: asyncio.Future[None] | None = None) -> None:
         try:
             call = self._stub.ChannelAcceptor()
-        except BaseException:
-            if started is not None:
-                started.set()
+        except BaseException as exc:
+            if started is not None and not started.done():
+                started.set_exception(exc)
             raise
         self._acceptor_call = call
         try:
-            # grpc.aio initiates the stream when the call object is created, so yielding
-            # once here lets it put the request headers on the wire before a caller is
-            # told its endpoint is armed. Signalling from the caller instead left a
-            # window in which this coroutine had not run at all, during which LND would
-            # have judged an inbound open with its default policy rather than the
-            # negotiated ring contract.
-            await asyncio.sleep(0)
-            if started is not None:
-                started.set()
+            # Creating a grpc.aio call only schedules connection setup. Wait for the
+            # RPC to connect before allowing the participant to tell its predecessor
+            # to open, otherwise LND may still apply its default acceptance policy.
+            await call.wait_for_connection()
+            if started is not None and not started.done():
+                started.set_result(None)
             async for request in call:
                 pending_id = bytes(request.pending_chan_id)
                 registration = self._acceptor_registrations.get(pending_id)
@@ -1060,10 +1118,14 @@ class LndBackend:
                 self._accepted[pending_id] = expected
                 registration.future.set_result(observation)
         except asyncio.CancelledError:
+            if started is not None and not started.done():
+                started.cancel()
             for registration in self._acceptor_registrations.values():
                 if not registration.future.done():
                     registration.future.cancel()
         except Exception as exc:
+            if started is not None and not started.done():
+                started.set_exception(exc)
             for registration in self._acceptor_registrations.values():
                 if not registration.future.done():
                     registration.future.set_exception(exc)
@@ -1071,6 +1133,7 @@ class LndBackend:
             call.cancel()
             self._acceptor_call = None
             self._acceptor_task = None
+            self._acceptor_started = None
 
     async def pending_channel_observation(
         self,

@@ -24,6 +24,7 @@ from jmswap.lnd import (
     LndBackend,
     LndCapabilityError,
     LndNodeInfo,
+    LndRpcError,
     LndValidationError,
     PendingChannelExpectation,
     TransactionPresence,
@@ -412,9 +413,9 @@ async def test_acceptor_rejects_an_open_that_breaks_the_negotiated_contract() ->
         )
 
         # The opener asks for a capacity the fundee never agreed to fund. LND relays
-        # the acceptor's own rejection reason back to the opener, which surfaces it as
-        # the underlying gRPC error rather than wrapping it.
-        with pytest.raises(Exception, match="co-funded channel rejected: capacity"):
+        # the acceptor's own rejection reason back to the opener, which surfaces as a
+        # backend error carrying that reason.
+        with pytest.raises(LndRpcError, match="co-funded channel rejected: capacity"):
             await opener.start_external_channel(
                 open_request(pending_id, fundee_info, 1_400_000, 600_000)
             )

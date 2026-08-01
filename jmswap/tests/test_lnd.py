@@ -29,6 +29,7 @@ from jmswap.lnd import (
     LndCapabilityError,
     LndRetirementPostconditionError,
     LndRetirementRpcError,
+    LndRpcError,
     LndTimeoutError,
     LndValidationError,
     PendingChannelExpectation,
@@ -71,9 +72,14 @@ class FakeStream:
 
 
 class FakeAcceptorCall:
-    def __init__(self, requests: list[Any]) -> None:
+    def __init__(self, requests: list[Any], connection_gate: asyncio.Event | None = None) -> None:
         self.requests = iter(requests)
         self.responses: list[Any] = []
+        self.connection_gate = connection_gate
+
+    async def wait_for_connection(self) -> None:
+        if self.connection_gate is not None:
+            await self.connection_gate.wait()
 
     def __aiter__(self) -> FakeAcceptorCall:
         return self
@@ -102,6 +108,7 @@ class FakeStub:
         self.acceptor_requests: list[Any] = []
         self.acceptor_call: FakeAcceptorCall | None = None
         self.acceptor_calls: list[FakeAcceptorCall] = []
+        self.acceptor_connection_gate: asyncio.Event | None = None
         self.abandon_requests: list[Any] = []
         self.abandon_error: Exception | None = None
         self.keep_pending_after_abandon = False
@@ -124,7 +131,7 @@ class FakeStub:
         return ln.ConnectPeerResponse()
 
     def ChannelAcceptor(self) -> FakeAcceptorCall:  # noqa: N802
-        self.acceptor_call = FakeAcceptorCall(self.acceptor_requests)
+        self.acceptor_call = FakeAcceptorCall(self.acceptor_requests, self.acceptor_connection_gate)
         self.acceptor_calls.append(self.acceptor_call)
         return self.acceptor_call
 
@@ -426,10 +433,20 @@ async def test_open_does_not_retry_non_onion_peer_connection(
     connect_peer = AsyncMock(side_effect=RuntimeError("connection refused"))
     monkeypatch.setattr(target, "connect_peer", connect_peer)
 
-    with pytest.raises(RuntimeError, match="connection refused"):
+    # Reported as a backend error that still carries LND's own reason.
+    with pytest.raises(LndRpcError, match="connection refused"):
         await target.start_external_channel(external_request())
 
     connect_peer.assert_awaited_once()
+
+
+async def test_open_reports_a_rejected_channel_as_a_backend_error() -> None:
+    stub = FakeStub()
+    stub.open_errors = [RuntimeError("co-funded channel rejected: capacity")]
+    target = backend(stub)
+
+    with pytest.raises(LndRpcError, match="co-funded channel rejected: capacity"):
+        await target.start_external_channel(external_request())
 
 
 async def test_open_retries_peer_not_online_without_changing_pending_id() -> None:
@@ -527,13 +544,27 @@ async def test_acceptor_routes_multiple_expected_pending_ids_on_one_stream() -> 
     other_request.pending_chan_id = other_id
     stub = FakeStub()
     stub.acceptor_requests = [valid_accept_request(), other_request]
+    stub.acceptor_connection_gate = asyncio.Event()
     target = backend(stub)
     other_expected = inbound_expectation().model_copy(update={"pending_channel_id": other_id})
+    first_ready = asyncio.Event()
+    second_ready = asyncio.Event()
 
-    first, second = await asyncio.gather(
-        target.run_channel_acceptor(inbound_expectation(), AcceptorBounds(), timeout_seconds=1),
-        target.run_channel_acceptor(other_expected, AcceptorBounds(), timeout_seconds=1),
+    observations = asyncio.gather(
+        target.run_channel_acceptor(
+            inbound_expectation(), AcceptorBounds(), timeout_seconds=1, ready=first_ready
+        ),
+        target.run_channel_acceptor(
+            other_expected, AcceptorBounds(), timeout_seconds=1, ready=second_ready
+        ),
     )
+    while not stub.acceptor_calls:
+        await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert not first_ready.is_set()
+    assert not second_ready.is_set()
+    stub.acceptor_connection_gate.set()
+    first, second = await observations
 
     assert {first.pending_channel_id, second.pending_channel_id} == {PENDING_ID, other_id}
     assert len(stub.acceptor_calls) == 1
@@ -544,6 +575,7 @@ async def test_acceptor_routes_multiple_expected_pending_ids_on_one_stream() -> 
 async def test_acceptor_opens_the_stream_before_signalling_ready() -> None:
     stub = FakeStub()
     stub.acceptor_requests = [valid_accept_request()]
+    stub.acceptor_connection_gate = asyncio.Event()
     target = backend(stub)
     ready = asyncio.Event()
     ready_when_opened: list[bool] = []
@@ -560,6 +592,10 @@ async def test_acceptor_opens_the_stream_before_signalling_ready() -> None:
             inbound_expectation(), AcceptorBounds(), timeout_seconds=1, ready=ready
         )
     )
+    while not stub.acceptor_calls:
+        await asyncio.sleep(0)
+    assert not ready.is_set()
+    stub.acceptor_connection_gate.set()
     await asyncio.wait_for(ready.wait(), 1)
 
     # The ring tells its predecessor to open only after this event, so LND must
@@ -1043,6 +1079,15 @@ async def test_cancel_of_a_resumed_shim_never_reports_success_when_absent() -> N
         await restarted.cancel_external_channel(PENDING_ID, input_signatures_added=False)
 
 
+async def test_cancel_of_an_unknown_absent_shim_is_ambiguous() -> None:
+    stub = FakeStub()
+    absent_funding_intent(stub)
+    target = backend(stub)
+
+    with pytest.raises(LndAmbiguousShimError, match="unknown or resumed"):
+        await target.cancel_external_channel(PENDING_ID, input_signatures_added=False)
+
+
 async def test_resumed_verified_shim_refuses_cancel_and_allows_guarded_retirement() -> None:
     negotiated = await negotiate(backend())
     raw, utxos = funding_tx()
@@ -1081,6 +1126,42 @@ async def test_resumed_evidence_must_match_its_shim_and_verified_point() -> None
         restarted.resume_external_channel(negotiated, verified=verified)
     with pytest.raises(LndValidationError, match="does not match the verified point"):
         restarted.resume_external_channel(negotiated, observed_channel_point=f"{get_txid(raw)}:0")
+
+
+def test_resumed_evidence_must_not_conflict_with_memory() -> None:
+    negotiated = FundingNegotiation(
+        pending_channel_id=PENDING_ID,
+        peer_node_id=FUNDEE_ID,
+        funding_address=FUNDING_ADDRESS,
+        funding_script_pubkey=FUNDING_SCRIPT,
+        capacity_sat=CAPACITY,
+        push_sat=PUSH,
+        opener_reserve_sat=OPENER_RESERVE,
+        fundee_reserve_sat=FUNDEE_RESERVE,
+        opener_csv_delay=144,
+        fundee_csv_delay=288,
+        min_depth=3,
+    )
+    raw, utxos = funding_tx()
+    verified = VerifiedFunding(
+        pending_channel_id=PENDING_ID,
+        funding_txid=get_txid(raw),
+        funding_vout=0,
+        unsigned_psbt=build_unsigned_psbt(raw, utxos)[0],
+    )
+    restarted = backend()
+    restarted.resume_external_channel(
+        negotiated, verified=verified, observed_channel_point=verified.channel_point
+    )
+
+    with pytest.raises(LndValidationError, match="verified funding conflicts"):
+        restarted.resume_external_channel(
+            negotiated, verified=verified.model_copy(update={"funding_vout": 1})
+        )
+    with pytest.raises(LndValidationError, match="channel point conflicts"):
+        restarted.resume_inbound_channel(
+            inbound_expectation(), observed_channel_point=f"{'99' * 32}:1"
+        )
 
 
 def readiness_statement(raw: str) -> ReadinessStatement:
