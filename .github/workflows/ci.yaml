@@ -1092,6 +1092,23 @@ jobs:
             sleep 5
           done
 
+          echo "Verifying the directory onion is reachable from JAM..."
+          ONION=$(docker compose exec -T tor sh -c "tr -d '[:space:]' < /var/lib/tor/directory/hostname")
+          onion_ready=0
+          for i in {1..60}; do
+            if docker compose exec -T jam check-directory-onion "$ONION" --timeout 20; then
+              echo "Directory onion reachable: $ONION"
+              onion_ready=1
+              break
+            fi
+            echo "Attempt $i/60: onion $ONION not reachable yet..."
+            sleep 5
+          done
+          if [ "$onion_ready" -ne 1 ]; then
+            echo "Directory onion $ONION never became reachable from JAM"
+            exit 1
+          fi
+
           echo "Waiting for makers to connect..."
           sleep 30
 
@@ -1251,6 +1268,23 @@ jobs:
             fi
             sleep 5
           done
+
+          echo "Verifying the directory onion is reachable from JAM..."
+          ONION=$(docker compose exec -T tor sh -c "tr -d '[:space:]' < /var/lib/tor/directory/hostname")
+          onion_ready=0
+          for i in {1..60}; do
+            if docker compose exec -T jam check-directory-onion "$ONION" --timeout 20; then
+              echo "Directory onion reachable: $ONION"
+              onion_ready=1
+              break
+            fi
+            echo "Attempt $i/60: onion $ONION not reachable yet..."
+            sleep 5
+          done
+          if [ "$onion_ready" -ne 1 ]; then
+            echo "Directory onion $ONION never became reachable from JAM"
+            exit 1
+          fi
 
           echo "Waiting for makers to connect..."
           sleep 30
@@ -1667,6 +1701,23 @@ jobs:
             sleep 5
           done
 
+          echo "Verifying the directory onion is reachable from JAM..."
+          ONION=$(docker compose exec -T tor sh -c "tr -d '[:space:]' < /var/lib/tor/directory/hostname")
+          onion_ready=0
+          for i in {1..60}; do
+            if docker compose exec -T jam check-directory-onion "$ONION" --timeout 20; then
+              echo "Directory onion reachable: $ONION"
+              onion_ready=1
+              break
+            fi
+            echo "Attempt $i/60: onion $ONION not reachable yet..."
+            sleep 5
+          done
+          if [ "$onion_ready" -ne 1 ]; then
+            echo "Directory onion $ONION never became reachable from JAM"
+            exit 1
+          fi
+
           echo "Waiting for Neutrino..."
           for i in {1..30}; do
             TOKEN=$(docker compose exec -T neutrino cat /data/neutrino/auth_token 2>/dev/null || true)
@@ -1828,6 +1879,23 @@ jobs:
             fi
             sleep 5
           done
+
+          echo "Verifying the directory onion is reachable from jam-maker1..."
+          ONION=$(docker compose exec -T tor sh -c "tr -d '[:space:]' < /var/lib/tor/directory/hostname")
+          onion_ready=0
+          for i in {1..60}; do
+            if docker compose exec -T jam-maker1 check-directory-onion "$ONION" --timeout 20; then
+              echo "Directory onion reachable: $ONION"
+              onion_ready=1
+              break
+            fi
+            echo "Attempt $i/60: onion $ONION not reachable yet..."
+            sleep 5
+          done
+          if [ "$onion_ready" -ne 1 ]; then
+            echo "Directory onion $ONION never became reachable from jam-maker1"
+            exit 1
+          fi
 
           echo "Waiting for reference makers to connect..."
           sleep 30
