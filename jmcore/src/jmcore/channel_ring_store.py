@@ -284,6 +284,7 @@ class RingParticipantRecord(StrictStoreModel):
     input_lock_owner: str | None = Field(default=None, min_length=1, max_length=256)
     incoming_edge: FundingEdgeRecord | None = None
     outgoing_edge: FundingEdgeRecord | None = None
+    outgoing_open_started: bool = False
     prepared_outgoing: PreparedOutgoingState | None = None
     prepared_incoming: PreparedIncomingState | None = None
     outgoing_funding_address: str | None = Field(default=None, max_length=200)

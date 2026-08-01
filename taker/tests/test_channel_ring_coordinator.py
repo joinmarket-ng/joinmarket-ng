@@ -682,6 +682,21 @@ async def test_preverify_cancel_only_cancels_local_outgoing_shim(tmp_path: Path)
     assert cast(FakeLnd, coordinator.lnd).canceled == [local_plan.outgoing_edge.pending_channel_id]
 
 
+async def test_cancel_before_ring_open_never_invents_a_shim(tmp_path: Path) -> None:
+    coordinator = _harness(tmp_path)
+    coordinator._preconditions()
+    tx_fee, residuals = coordinator._finalize_fees_and_inputs(0)
+    await coordinator._invite(tx_fee, residuals)
+    await coordinator._plan()
+
+    await coordinator.cancel("before_open")
+
+    record = coordinator._record()
+    assert record.state is RingLifecycleState.RETIRED
+    assert record.outgoing_open_started is False
+    assert cast(FakeLnd, coordinator.lnd).canceled == []
+
+
 async def test_partial_psbt_verification_uses_verified_retirement(tmp_path: Path) -> None:
     coordinator = _harness(tmp_path)
     lnd = cast(FakeLnd, coordinator.lnd)

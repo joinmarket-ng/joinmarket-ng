@@ -781,6 +781,24 @@ async def test_cancel_before_verify_after_verify_and_after_sign_boundaries(tmp_p
     assert invited.record().state is RingLifecycleState.RETIRED
     assert await invited.machine.handle(cancel) == response
 
+    planned = Harness(tmp_path / "planned")
+    await planned.machine.handle(planned.invite())
+    await planned.machine.handle(planned.plan())
+    planned_cancel = planned.signed(
+        RingCancelPayload(
+            round_nonce="aa" * 32,
+            revision=0,
+            signer_key=planned.taker_key,
+            reason_code="before_open",
+            canceled_pending_ids=["11" * 32, "12" * 32],
+        )
+    )
+    planned_response = await planned.machine.handle(planned_cancel)
+    assert planned.record().state is RingLifecycleState.RETIRED
+    assert planned.record().outgoing_open_started is False
+    assert planned.lnd.canceled == []
+    assert planned_response[0].canceled_pending_ids == []
+
     prepared = Harness(tmp_path / "prepared")
     await prepared.through_open()
     prepared_cancel = prepared.signed(

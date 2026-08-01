@@ -160,12 +160,21 @@ def _retained_verified_funding(
 
 
 def _retained_observed_point(
-    pending_state: ReadinessState | None, verified: VerifiedFunding | None
+    pending_state: ReadinessState | None,
+    verified: VerifiedFunding | None,
+    expected_role: EndpointRole,
 ) -> str | None:
     """Return the point this participant durably attested observing, if any."""
     if pending_state is None or verified is None:
         return None
-    return verified.channel_point
+    if (
+        pending_state.role is not expected_role
+        or pending_state.pending_channel_id != verified.pending_channel_id.hex()
+        or pending_state.unsigned_txid != verified.funding_txid
+        or pending_state.output_index != verified.funding_vout
+    ):
+        raise TakerRingError("retained readiness does not match verified funding")
+    return f"{pending_state.unsigned_txid}:{pending_state.output_index}"
 
 
 class TakerRingCoordinator:
@@ -619,6 +628,12 @@ class TakerRingCoordinator:
             fundee_csv_delay=edge.policy.fundee_csv_delay,
             min_depth=edge.policy.min_depth,
             timeout_seconds=self.config.open_timeout_seconds,
+        )
+        record = self._record()
+        self.store.transition(
+            record.key,
+            RingLifecycleState.ACCEPTOR_ARMED,
+            updates={"outgoing_open_started": True},
         )
         outgoing, incoming = await asyncio.gather(
             self.lnd.start_external_channel(request), self.acceptor_task
@@ -1293,8 +1308,9 @@ class TakerRingCoordinator:
     async def _retire_local(self, record: RingParticipantRecord) -> None:
         action = record.retirement_action()
         if action is RingRetirementAction.SHIM_CANCEL:
+            cancel_outgoing = record.outgoing_open_started or record.prepared_outgoing is not None
             record = self.store.transition(record.key, RingLifecycleState.RETIRING)
-            if record.outgoing_edge is not None:
+            if cancel_outgoing and record.outgoing_edge is not None:
                 pending_id = record.outgoing_edge.plan.pending_channel_id
                 await self.lnd.cancel_external_channel(
                     bytes.fromhex(pending_id), input_signatures_added=False
@@ -1517,6 +1533,7 @@ async def reconcile_taker_ring_records(
                     observed_channel_point=_retained_observed_point(
                         record.incoming_pending_state,
                         _retained_verified_funding(record, record.incoming_edge),
+                        EndpointRole.FUNDEE,
                     ),
                 )
                 if record.prepared_outgoing is not None and record.outgoing_funding_address:
@@ -1538,7 +1555,9 @@ async def reconcile_taker_ring_records(
                         ),
                         verified=outgoing_verified,
                         observed_channel_point=_retained_observed_point(
-                            record.outgoing_pending_state, outgoing_verified
+                            record.outgoing_pending_state,
+                            outgoing_verified,
+                            EndpointRole.OPENER,
                         ),
                     )
             if stranded:
