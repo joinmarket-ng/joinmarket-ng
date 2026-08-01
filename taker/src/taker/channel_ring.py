@@ -132,6 +132,42 @@ def _signed(payload: RingPayloadType, secret_hex: str) -> RingPayloadType:
     return sign_payload(payload, bytes.fromhex(secret_hex))
 
 
+# Negotiation states that only a live in-process round can advance: the taker drives
+# every phase, so a restart leaves them permanently stuck rather than resumable.
+_UNRESUMABLE_NEGOTIATION_STATES = frozenset(
+    {
+        RingLifecycleState.ACCEPTOR_ARMED,
+        RingLifecycleState.PREPARED,
+        RingLifecycleState.PSBT_VERIFIED,
+        RingLifecycleState.READY,
+        RingLifecycleState.SIGNING,
+    }
+)
+
+
+def _retained_verified_funding(
+    record: RingParticipantRecord, edge: FundingEdgeRecord | None
+) -> VerifiedFunding | None:
+    """Rebuild the durable proof that PsbtVerify already ran for one local edge."""
+    if record.unsigned_psbt is None or edge is None or edge.funding_outpoint is None:
+        return None
+    return VerifiedFunding(
+        pending_channel_id=bytes.fromhex(edge.plan.pending_channel_id),
+        funding_txid=edge.funding_outpoint.txid,
+        funding_vout=edge.funding_outpoint.vout,
+        unsigned_psbt=bytes.fromhex(record.unsigned_psbt),
+    )
+
+
+def _retained_observed_point(
+    pending_state: ReadinessState | None, verified: VerifiedFunding | None
+) -> str | None:
+    """Return the point this participant durably attested observing, if any."""
+    if pending_state is None or verified is None:
+        return None
+    return verified.channel_point
+
+
 class TakerRingCoordinator:
     """Coordinate one all-party ring revision and act as the local taker participant."""
 
@@ -1405,8 +1441,15 @@ async def reconcile_taker_ring_records(
     acceptor_tasks: dict[str, asyncio.Task[object]] | None = None,
     *,
     acceptor_timeout_seconds: float = 600.0,
+    active_session_identities: frozenset[str] = frozenset(),
 ) -> None:
-    """Resume retained taker channels and rebroadcast only exact durable final transactions."""
+    """Resume retained taker channels and rebroadcast only exact durable final transactions.
+
+    A negotiation that is no longer live in this process cannot be resumed: the taker
+    drives the round, and its peers' sessions are gone. Such records are restored into
+    the backend so recovery tooling can act on them, then escalated so they are visible
+    instead of silently holding ring capacity forever.
+    """
 
     report = store.load_all()
     if report.corruptions:
@@ -1414,8 +1457,17 @@ async def reconcile_taker_ring_records(
     for record in report.records:
         if not record.active:
             continue
+        stranded = (
+            record.taker_session_identity not in active_session_identities
+            and record.state in _UNRESUMABLE_NEGOTIATION_STATES
+            and not record.local_signatures
+        )
         try:
-            if record.plan is not None and record.state is RingLifecycleState.ACCEPTOR_ARMED:
+            if (
+                record.plan is not None
+                and record.state is RingLifecycleState.ACCEPTOR_ARMED
+                and not stranded
+            ):
                 plan = record.plan
                 task_key = record.key.filename
                 existing = None if acceptor_tasks is None else acceptor_tasks.get(task_key)
@@ -1461,10 +1513,15 @@ async def reconcile_taker_ring_records(
                         opener_csv_delay=plan.incoming_edge.policy.opener_csv_delay,
                         fundee_csv_delay=plan.incoming_edge.policy.fundee_csv_delay,
                         min_depth=plan.incoming_edge.policy.min_depth,
-                    )
+                    ),
+                    observed_channel_point=_retained_observed_point(
+                        record.incoming_pending_state,
+                        _retained_verified_funding(record, record.incoming_edge),
+                    ),
                 )
                 if record.prepared_outgoing is not None and record.outgoing_funding_address:
                     prepared = record.prepared_outgoing
+                    outgoing_verified = _retained_verified_funding(record, record.outgoing_edge)
                     initialized_backend.backend.resume_external_channel(
                         FundingNegotiation(
                             pending_channel_id=bytes.fromhex(prepared.pending_channel_id),
@@ -1478,8 +1535,28 @@ async def reconcile_taker_ring_records(
                             opener_csv_delay=prepared.policy.opener_csv_delay,
                             fundee_csv_delay=prepared.policy.fundee_csv_delay,
                             min_depth=prepared.policy.min_depth,
-                        )
+                        ),
+                        verified=outgoing_verified,
+                        observed_channel_point=_retained_observed_point(
+                            record.outgoing_pending_state, outgoing_verified
+                        ),
                     )
+            if stranded:
+                store.transition(
+                    record.key,
+                    RingLifecycleState.RECOVERY_REQUIRED,
+                    updates={
+                        "retry": record.retry.model_copy(
+                            update={
+                                "last_error": (
+                                    "interrupted ring negotiation cannot be resumed by the "
+                                    "taker; operator recovery is required"
+                                )
+                            }
+                        )
+                    },
+                )
+                continue
             if record.state in {RingLifecycleState.SIGNED, RingLifecycleState.BROADCAST}:
                 exact = None
                 if record.manifest is not None:

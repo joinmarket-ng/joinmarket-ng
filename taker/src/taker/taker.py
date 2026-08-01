@@ -903,6 +903,7 @@ class Taker(TakerMonitoringMixin):
                 self.backend,
                 self._channel_ring_recovery_tasks,
                 acceptor_timeout_seconds=self.config.channel_ring.phase_timeout_seconds,
+                active_session_identities=self._active_ring_session_identities(),
             )
             if not self._renew_channel_ring_input_locks():
                 logger.error(
@@ -911,6 +912,17 @@ class Taker(TakerMonitoringMixin):
                 )
                 return
             await asyncio.sleep(self.config.channel_ring.phase_timeout_seconds)
+
+    def _active_ring_session_identities(self) -> frozenset[str]:
+        """Identify the ring round this process is still driving, if any.
+
+        Reconciliation must never escalate a record that a live round still owns.
+        """
+        session = getattr(self, "_session", None)
+        coordinator = None if session is None else session.ring_coordinator
+        if coordinator is None:
+            return frozenset()
+        return frozenset({coordinator.session_identity})
 
     def _renew_channel_ring_input_locks(self) -> bool:
         if self._channel_ring_store is None:

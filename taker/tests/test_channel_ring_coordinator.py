@@ -192,6 +192,8 @@ class FakeLnd:
         self.canceled: list[str] = []
         self.retired: list[str] = []
         self.fail_pending_observation = False
+        self.resumed_verified: list[tuple[Any, str | None]] = []
+        self.resumed_incoming_points: list[str | None] = []
         self.unsigned_distributed = asyncio.Event()
 
     async def run_channel_acceptor(
@@ -295,11 +297,21 @@ class FakeLnd:
             unsigned_txid=authorization.unsigned_txid,
         )
 
-    def resume_inbound_channel(self, expected: Any) -> None:
+    def resume_inbound_channel(
+        self, expected: Any, *, observed_channel_point: str | None = None
+    ) -> None:
         del expected
+        self.resumed_incoming_points.append(observed_channel_point)
 
-    def resume_external_channel(self, negotiation: Any) -> None:
+    def resume_external_channel(
+        self,
+        negotiation: Any,
+        *,
+        verified: Any | None = None,
+        observed_channel_point: str | None = None,
+    ) -> None:
         del negotiation
+        self.resumed_verified.append((verified, observed_channel_point))
 
 
 class MockCoordinator(TakerRingCoordinator):
@@ -691,6 +703,33 @@ async def test_missing_sign_ack_is_retained_without_cancellation(tmp_path: Path)
     assert record.state is RingLifecycleState.READY
     assert record.coordinator_sign_authorization_sent
     assert not cast(FakeLnd, coordinator.lnd).canceled
+
+
+async def test_stranded_negotiation_escalates_only_without_a_live_round(tmp_path: Path) -> None:
+    coordinator = _harness(tmp_path, missing_sign_ack=True)
+    assert not await coordinator.prepare(_address(300), 0)
+    record = coordinator._record()
+    assert record.state is RingLifecycleState.READY
+
+    # A live round still owns this record, so reconciliation must not disturb it.
+    await reconcile_taker_ring_records(
+        coordinator.store,
+        coordinator.initialized_backend,
+        cast(Any, coordinator.chain_backend),
+        active_session_identities=frozenset({record.taker_session_identity}),
+    )
+    assert coordinator._record().state is RingLifecycleState.READY
+
+    # With no live round the taker can never drive this negotiation again, so it is
+    # escalated for the operator instead of holding ring capacity silently.
+    await reconcile_taker_ring_records(
+        coordinator.store,
+        coordinator.initialized_backend,
+        cast(Any, coordinator.chain_backend),
+    )
+    escalated = coordinator._record()
+    assert escalated.state is RingLifecycleState.RECOVERY_REQUIRED
+    assert "cannot be resumed" in escalated.retry.last_error
 
 
 async def test_restart_rebroadcasts_and_confirms_exact_final_transaction(tmp_path: Path) -> None:
