@@ -24,6 +24,7 @@ from jmswap.lnd import (
     FundingNegotiation,
     FundingTransactionChainStatus,
     InboundChannelExpectation,
+    LndAmbiguousShimError,
     LndBackend,
     LndCapabilityError,
     LndRetirementPostconditionError,
@@ -535,6 +536,54 @@ async def test_acceptor_routes_multiple_expected_pending_ids_on_one_stream() -> 
     assert all(response.accept for response in stub.acceptor_call.responses)
 
 
+async def test_acceptor_opens_the_stream_before_signalling_ready() -> None:
+    stub = FakeStub()
+    stub.acceptor_requests = [valid_accept_request()]
+    target = backend(stub)
+    ready = asyncio.Event()
+    ready_when_opened: list[bool] = []
+    open_stream = stub.ChannelAcceptor
+
+    def recording_acceptor() -> Any:
+        ready_when_opened.append(ready.is_set())
+        return open_stream()
+
+    stub.ChannelAcceptor = recording_acceptor  # type: ignore[method-assign]
+
+    task = asyncio.create_task(
+        target.run_channel_acceptor(
+            inbound_expectation(), AcceptorBounds(), timeout_seconds=1, ready=ready
+        )
+    )
+    await asyncio.wait_for(ready.wait(), 1)
+
+    # The ring tells its predecessor to open only after this event, so LND must
+    # already hold the acceptor stream; otherwise an inbound open is judged by
+    # LND's default policy instead of the negotiated contract.
+    assert ready_when_opened == [False]
+    assert len(stub.acceptor_calls) == 1
+    await asyncio.wait_for(task, 1)
+
+
+async def test_acceptor_stream_failure_is_raised_and_never_reports_ready() -> None:
+    stub = FakeStub()
+
+    def failing_acceptor() -> Any:
+        raise RuntimeError("acceptor stream unavailable")
+
+    stub.ChannelAcceptor = failing_acceptor  # type: ignore[method-assign]
+    target = backend(stub)
+    ready = asyncio.Event()
+
+    with pytest.raises(RuntimeError, match="acceptor stream unavailable"):
+        await target.run_channel_acceptor(
+            inbound_expectation(), AcceptorBounds(), timeout_seconds=1, ready=ready
+        )
+
+    assert not ready.is_set()
+    assert not target._acceptor_registrations
+
+
 def test_psbt_preserves_txid_and_contains_every_v0_v1_witness_utxo() -> None:
     raw, utxos = funding_tx()
     psbt, txid = build_unsigned_psbt(raw, utxos)
@@ -951,6 +1000,82 @@ async def test_cancel_refuses_to_claim_success_after_psbt_verify() -> None:
     await target.verify_external_funding(negotiated, raw, get_txid(raw), 0, utxos)
     with pytest.raises(LndValidationError, match="cancel before verification"):
         await target.cancel_external_channel(PENDING_ID, input_signatures_added=False)
+
+
+def absent_funding_intent(stub: FakeStub) -> None:
+    """Make LND answer shim_cancel the way it does for an absent funding intent."""
+
+    async def missing_intent(request: Any) -> Any:
+        stub.funding_steps.append(request)
+        raise RuntimeError("no funding intent found for pending_chan_id")
+
+    stub.FundingStateStep = missing_intent  # type: ignore[method-assign]
+
+
+async def test_cancel_tolerates_absent_intent_for_a_locally_created_shim() -> None:
+    stub = FakeStub()
+    target = backend(stub)
+    await negotiate(target)
+    absent_funding_intent(stub)
+
+    # This process created the shim and knows PsbtVerify never ran, so LND
+    # reporting no intent means the shim is genuinely gone.
+    await target.cancel_external_channel(PENDING_ID, input_signatures_added=False)
+    assert PENDING_ID not in target._pending
+
+
+async def test_cancel_of_a_resumed_shim_never_reports_success_when_absent() -> None:
+    negotiated = await negotiate(backend())
+    stub = FakeStub()
+    absent_funding_intent(stub)
+    restarted = backend(stub)
+    restarted.resume_external_channel(negotiated)
+
+    # After a restart the shim may have been consumed by a PsbtVerify whose result
+    # was never persisted, and LND cannot distinguish that from a canceled shim, so
+    # the caller must reconcile rather than record a clean retirement.
+    with pytest.raises(LndAmbiguousShimError, match="reconcile instead"):
+        await restarted.cancel_external_channel(PENDING_ID, input_signatures_added=False)
+
+
+async def test_resumed_verified_shim_refuses_cancel_and_allows_guarded_retirement() -> None:
+    negotiated = await negotiate(backend())
+    raw, utxos = funding_tx()
+    verified = VerifiedFunding(
+        pending_channel_id=PENDING_ID,
+        funding_txid=get_txid(raw),
+        funding_vout=0,
+        unsigned_psbt=build_unsigned_psbt(raw, utxos)[0],
+    )
+    stub = FakeStub()
+    stub.pending_responses = [pending_response(pending_expectation(raw), EndpointRole.OPENER)]
+    restarted = backend(stub)
+    restarted.resume_external_channel(
+        negotiated, verified=verified, observed_channel_point=verified.channel_point
+    )
+
+    with pytest.raises(LndValidationError, match="cancel before verification"):
+        await restarted.cancel_external_channel(PENDING_ID, input_signatures_added=False)
+
+    outcome = await restarted.retire_verified_external_channel(retirement_authorization(verified))
+    assert outcome.status is VerifiedChannelRetirementStatus.ABANDONED
+    assert stub.abandon_requests[0].i_know_what_i_am_doing is True
+
+
+async def test_resumed_evidence_must_match_its_shim_and_verified_point() -> None:
+    negotiated = await negotiate(backend())
+    raw, utxos = funding_tx()
+    verified = VerifiedFunding(
+        pending_channel_id=b"\x33" * 32,
+        funding_txid=get_txid(raw),
+        funding_vout=0,
+        unsigned_psbt=build_unsigned_psbt(raw, utxos)[0],
+    )
+    restarted = backend()
+    with pytest.raises(LndValidationError, match="another shim"):
+        restarted.resume_external_channel(negotiated, verified=verified)
+    with pytest.raises(LndValidationError, match="does not match the verified point"):
+        restarted.resume_external_channel(negotiated, observed_channel_point=f"{get_txid(raw)}:0")
 
 
 def readiness_statement(raw: str) -> ReadinessStatement:
