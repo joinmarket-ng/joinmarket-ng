@@ -1403,6 +1403,8 @@ async def reconcile_taker_ring_records(
     initialized_backend: InitializedChannelRingBackend,
     chain_backend: BlockchainBackend,
     acceptor_tasks: dict[str, asyncio.Task[object]] | None = None,
+    *,
+    acceptor_timeout_seconds: float = 600.0,
 ) -> None:
     """Resume retained taker channels and rebroadcast only exact durable final transactions."""
 
@@ -1435,7 +1437,7 @@ async def reconcile_taker_ring_records(
                                 min_depth=plan.incoming_edge.policy.min_depth,
                             ),
                             AcceptorBounds(),
-                            timeout_seconds=600.0,
+                            timeout_seconds=acceptor_timeout_seconds,
                         )
                     )
                     if acceptor_tasks is not None:

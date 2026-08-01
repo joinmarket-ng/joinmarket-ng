@@ -426,6 +426,7 @@ class Taker(TakerMonitoringMixin):
                 self._channel_ring_backend,
                 self.backend,
                 self._channel_ring_recovery_tasks,
+                acceptor_timeout_seconds=self.config.channel_ring.phase_timeout_seconds,
             )
             if not self._renew_channel_ring_input_locks():
                 raise RuntimeError("could not restore an active channel-ring input reservation")
@@ -901,6 +902,7 @@ class Taker(TakerMonitoringMixin):
                 self._channel_ring_backend,
                 self.backend,
                 self._channel_ring_recovery_tasks,
+                acceptor_timeout_seconds=self.config.channel_ring.phase_timeout_seconds,
             )
             if not self._renew_channel_ring_input_locks():
                 logger.error(
