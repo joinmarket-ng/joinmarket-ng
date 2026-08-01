@@ -35,7 +35,8 @@ Start the app first, then in another terminal:
 flatpak run org.joinmarketng.JamNG cli <command> [args...]
 
 # Wallet info / balance
-flatpak run org.joinmarketng.JamNG cli jm-wallet info default.jmdat
+flatpak run org.joinmarketng.JamNG cli jm-wallet info \
+  --mnemonic-file ~/.joinmarket-ng/wallets/default.mnemonic
 
 # Fidelity bonds: refresh a registered bond's on-chain UTXO info
 flatpak run org.joinmarketng.JamNG cli jm-wallet sync-bonds
@@ -60,16 +61,25 @@ The Flatpak is sandboxed. All state lives in:
 ```
 
 This is separate from the standard `~/.joinmarket-ng/` used by a non-Flatpak
-install. The wallet file format (`.jmdat`) is the same in both, so you can copy
-a wallet from a previous install into the Flatpak data directory:
+install. Native `jm-wallet`, maker, and taker commands use `.mnemonic` files.
+To use an existing JoinMarket NG CLI wallet in the Flatpak, copy it into the
+Flatpak data directory:
 
 ```bash
-cp ~/.joinmarket-ng/wallets/default.jmdat \
+cp ~/.joinmarket-ng/wallets/default.mnemonic \
    ~/.var/app/org.joinmarketng.JamNG/.joinmarket-ng/wallets/
 ```
 
-If the wallet is encrypted you are prompted for the password when you select it
-in the UI or run a `jm-wallet` CLI command.
+JAM uses `jmwalletd`, whose encrypted `JMNG` container currently has a `.jmdat`
+filename for JAM/API compatibility. That file is distinct from both the native
+CLI `.mnemonic` file and joinmarket-clientserver's JMDAT format. A
+joinmarket-clientserver `.jmdat` wallet cannot be copied in and opened by JAM or
+passed to `jm-wallet`. JoinMarket NG daemon wallet files can be copied between
+Flatpak and non-Flatpak `jmwalletd` installations without changing their names.
+
+If a wallet is encrypted, you are prompted for its password when you select a
+daemon wallet in the UI or use an encrypted mnemonic with a `jm-wallet` CLI
+command.
 
 ## Other networks
 

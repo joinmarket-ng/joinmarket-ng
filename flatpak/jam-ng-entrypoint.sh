@@ -137,8 +137,7 @@ Options:
   -h, --help        Show this help message
 
 CLI commands (pass-through to installed tools):
-  jam-ng cli jm-wallet info <wallet>          Show wallet info
-  jam-ng cli jm-wallet balance <wallet>       Show wallet balance
+  jam-ng cli jm-wallet info [--mnemonic-file <path>]  Show wallet info and balances
   jam-ng cli jm-taker coinjoin [args...]      Run a CoinJoin as taker
   jam-ng cli jm-maker [args...]               Run the yield generator
   jam-ng cli jm-orderbook-watcher             Start the orderbook watcher
@@ -151,7 +150,8 @@ Environment variables set for CLI commands:
 Examples:
   flatpak run org.joinmarketng.JamNG
   flatpak run org.joinmarketng.JamNG --network signet
-  flatpak run org.joinmarketng.JamNG cli jm-wallet info wallet.jmdat
+  flatpak run org.joinmarketng.JamNG cli jm-wallet info \
+    --mnemonic-file ~/.joinmarket-ng/wallets/default.mnemonic
 HELP
 }
 

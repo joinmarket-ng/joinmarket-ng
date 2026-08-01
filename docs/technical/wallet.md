@@ -39,7 +39,8 @@ BIP39_PASSPHRASE="my phrase" jm-wallet info
 
 ### Wallet File Encryption
 
-Encrypted mnemonic files written by `jmwalletd` use a versioned binary format:
+Encrypted wallet containers written by `jmwalletd` use the versioned `JMNG`
+binary format:
 
 ```
 [ magic "JMNG" 4B ][ ver 1B ][ kdf_id 1B ][ m_cost u32 BE ][ t_cost u32 BE ][ p_cost u8 ][ salt 16B ][ Fernet token ]

@@ -86,17 +86,39 @@ Records all CoinJoin transactions with:
 - Address blacklisting for privacy (addresses recorded before being shared with peers)
 - CSV format for analysis: `jm-wallet history --stats`
 
+## Wallet File Formats
+
+Three wallet persistence formats with overlapping terminology are not
+interoperable:
+
+- **joinmarket-clientserver JMDAT:** the reference implementation stores wallet
+  state in its JMDAT format, conventionally named `wallet.jmdat`. JoinMarket NG
+  does not read that format.
+- **JoinMarket NG native CLI:** `jm-wallet`, `jm-maker`, and `jm-taker` use an
+  encrypted BIP39 mnemonic file conventionally named `*.mnemonic`, with state in
+  fingerprint-keyed sidecars. Select a non-default file with `--mnemonic-file`.
+- **JoinMarket NG daemon/JAM:** `jmwalletd` writes a versioned encrypted container
+  identified by the `JMNG` magic bytes. JAM v1 currently uses `.jmdat` filenames
+  for API compatibility, but these files do not contain JMDAT and cannot be
+  opened by joinmarket-clientserver; `jmwalletd` likewise cannot open a reference
+  JMDAT wallet.
+
+The intended future native suffix for the daemon container is `.jmng`. Version 1
+continues to use `.jmdat` naming for JAM compatibility until wallet-name aliases
+or capability support exists. No suffix alias or migration is currently
+implemented.
+
 ## Wallet Persistence Design (issue #524)
 
 Per-wallet state is split across several files keyed by the 8-char BIP32
 `m/0` fingerprint rather than packed into one encrypted container (the
-legacy `.jmdat` model). The split was chosen deliberately:
+reference implementation's JMDAT model). The split was chosen deliberately:
 
 - **Concurrency:** a running maker, a CLI command, and `jmwalletd` can
   touch wallet state at the same time. Independent files with atomic
   per-file writes (and a flock sidecar for the metadata store) avoid the
   single-file lock contention and stale PID-lock recovery that the
-  reference `.jmdat` format suffers from.
+  reference JMDAT format suffers from.
 - **Passwordless reads:** the mnemonic password guards spending, not
   inspection. History, bond listing, and labels live outside the
   encrypted mnemonic so they can be read without decryption. The
@@ -108,6 +130,13 @@ legacy `.jmdat` model). The split was chosen deliberately:
   Handed-out and user-reserved deposit addresses are recorded in the same
   file (`jm:reserved` address labels) so they are never reissued across
   restarts.
+
+The metadata file also carries owner-qualified, temporary CoinJoin input
+leases. All concurrently running JoinMarket NG processes that share a wallet
+metadata file must be upgraded together when the lease format or semantics
+change. An older binary cannot enforce ownership fields it does not understand,
+so mixed-version concurrent access is unsupported; advisory locking alone
+cannot make an old process apply new lease rules.
 
 Active-wallet identity is resolved uniformly for all per-wallet read
 commands (see `wallet.md`): explicit fingerprint, then `--mnemonic-file`,

@@ -113,9 +113,15 @@ If you ran a maker on the legacy
 (now archived), most operational concepts carry over: same wire protocol,
 same fee models, same fidelity bonds. The main differences:
 
-- **Wallets are mnemonic-based.** No BerkeleyDB, no `wallet.jmdat`. Import
-  your existing 12-word seed into a JoinMarket-NG mnemonic file. The same
-  addresses and bonds derive from the same seed.
+- **Wallet formats are not interchangeable.** The reference implementation's
+  `wallet.jmdat` uses its JMDAT format. Native `jm-wallet` and `jm-maker`
+  commands instead use an encrypted BIP39 `*.mnemonic` file. Export or recover
+  the seed with the appropriate tooling, then import it with `jm-wallet import`;
+  do not pass the reference wallet file to `--mnemonic-file`.
+- **JAM daemon naming is compatibility-only.** `jmwalletd` uses its own encrypted
+  `JMNG` container, which may currently have a `.jmdat` filename for JAM/API
+  compatibility. It is not the reference JMDAT format and is not a native CLI
+  `.mnemonic` file. See [Wallet File Formats](technical/architecture.md#wallet-file-formats).
 - **No `joinmarket.cfg`.** Configuration lives in
   `~/.joinmarket-ng/config.toml` (TOML, sectioned). See
   [Configuration](technical/configuration.md) and
