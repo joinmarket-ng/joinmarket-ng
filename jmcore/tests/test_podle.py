@@ -307,6 +307,23 @@ class TestGeneratePoDLE:
 
         assert actual == expected
 
+    def test_rfc6979_secp256k1_bits2octets_vector(self) -> None:
+        """Cover RFC 6979 bits2octets with the secp256k1 group order.
+
+        This vector applies RFC 6979 Sections 2.3.4 and 3.2 to an all-ones hash and
+        the SEC 2 v2 Section 2.7.1 secp256k1 order. The expected candidate was
+        independently cross-checked with python-ecdsa 0.19.1 ``generate_k``.
+        """
+        private_key = (1).to_bytes(32, "big")
+        message_hash = b"\xff" * 32
+        assert int.from_bytes(message_hash, "big") >= SECP256K1_N
+
+        candidate = next(podle._rfc6979_nonce_candidates(private_key, message_hash))
+
+        assert candidate == int(
+            "71139aac71b52f7d5961915af1b30f94baf35e39b0043c33d41a57d476a8905c", 16
+        )
+
     def test_deterministic_proof_vector(self) -> None:
         commitment = generate_podle(bytes.fromhex("01" * 32), "00" * 32 + ":0", index=0)
 
@@ -1011,12 +1028,13 @@ class TestPoDLENonceSecurity:
             ),
         ],
     )
-    def test_rfc6979_matches_published_vectors(self, message: bytes, expected_nonce: int) -> None:
-        """The HMAC ladder must match RFC 6979, not merely be self-consistent.
+    def test_rfc6979_p256_vectors_validate_shared_hmac_ladder(
+        self, message: bytes, expected_nonce: int
+    ) -> None:
+        """Validate the HMAC ladder against RFC 6979 Appendix A.2.5 NIST P-256 vectors.
 
-        Vectors are RFC 6979 appendix A.2.5 (secp256k1, SHA-256). Without this,
-        a transposed HMAC step still produces stable, unique-looking nonces and
-        every other test in this file keeps passing.
+        The private scalar, SHA-256 hashes, and candidates are below both the P-256 and
+        secp256k1 orders, so these unreduced inputs validate the shared 256-bit ladder.
         """
         private_key = (0xC9AFA9D845BA75166B5C215767B1D6934E50C3DB36E89B127B8A622B120F6721).to_bytes(
             32, "big"
