@@ -839,14 +839,18 @@ class TestNeutrinoCoinJoin:
                 )
             )
             tracked_lookup = AsyncMock(wraps=neutrino_backend.get_transaction)
-            confirmed_output_miss = AsyncMock(return_value=False)
+            tracked_output_check = AsyncMock(wraps=neutrino_backend.verify_tx_output)
+            # Both verification paths stay live. Neutrino only reports mempool
+            # transactions for scripts it already watches, so a freshly derived
+            # destination can legitimately miss the mempool lookup; on-chain
+            # output verification is the documented fallback for exactly that
+            # case. Forcing it to fail made maker broadcasts look like taker
+            # failures whenever the watch registration lagged.
             with (
                 patch.object(neutrino_backend, "broadcast_transaction", self_broadcast),
                 patch.object(neutrino_backend, "get_transaction", tracked_lookup),
                 patch.object(
-                    neutrino_backend,
-                    "verify_tx_output",
-                    confirmed_output_miss,
+                    neutrino_backend, "verify_tx_output", tracked_output_check
                 ),
             ):
                 txid = await taker.do_coinjoin(
@@ -857,6 +861,11 @@ class TestNeutrinoCoinJoin:
                 )
             self_broadcast.assert_not_awaited()
             assert txid, "CoinJoin failed to return a txid"
+            # The taker must confirm a maker's broadcast through the neutrino
+            # backend rather than assuming delivery.
+            assert (
+                tracked_lookup.await_count > 0 or tracked_output_check.await_count > 0
+            ), "neutrino taker verified the broadcast through neither path"
             tracked_lookup.assert_any_await(txid)
 
             # Verify success
