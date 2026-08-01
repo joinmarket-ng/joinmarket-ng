@@ -173,7 +173,9 @@ class FakeLnd:
         self.canceled: list[str] = []
         self.retired: list[str] = []
         self.resumed_outgoing: list[FundingNegotiation] = []
+        self.resumed_verified: list[tuple[VerifiedFunding | None, str | None]] = []
         self.resumed_incoming: list[object] = []
+        self.resumed_incoming_points: list[str | None] = []
         self.pending_points: list[str] = []
         self.verified: VerifiedFunding | None = None
         self.acceptor_timeouts: list[float] = []
@@ -281,11 +283,21 @@ class FakeLnd:
             unsigned_txid=authorization.unsigned_txid,
         )
 
-    def resume_external_channel(self, negotiation: FundingNegotiation) -> None:
+    def resume_external_channel(
+        self,
+        negotiation: FundingNegotiation,
+        *,
+        verified: VerifiedFunding | None = None,
+        observed_channel_point: str | None = None,
+    ) -> None:
         self.resumed_outgoing.append(negotiation)
+        self.resumed_verified.append((verified, observed_channel_point))
 
-    def resume_inbound_channel(self, expected: object) -> None:
+    def resume_inbound_channel(
+        self, expected: object, *, observed_channel_point: str | None = None
+    ) -> None:
         self.resumed_incoming.append(expected)
+        self.resumed_incoming_points.append(observed_channel_point)
 
     async def pending_channel_present(self, channel_point: str) -> bool:
         self.pending_points.append(channel_point)

@@ -119,6 +119,29 @@ def _signed(payload: RingPayloadType, secret_hex: str) -> RingPayloadType:
     return sign_payload(payload, bytes.fromhex(secret_hex))
 
 
+def _retained_verified_funding(
+    record: RingParticipantRecord, edge: FundingEdgeRecord | None
+) -> VerifiedFunding | None:
+    """Rebuild the durable proof that PsbtVerify already ran for one local edge."""
+    if record.unsigned_psbt is None or edge is None or edge.funding_outpoint is None:
+        return None
+    return VerifiedFunding(
+        pending_channel_id=bytes.fromhex(edge.plan.pending_channel_id),
+        funding_txid=edge.funding_outpoint.txid,
+        funding_vout=edge.funding_outpoint.vout,
+        unsigned_psbt=bytes.fromhex(record.unsigned_psbt),
+    )
+
+
+def _retained_observed_point(
+    pending_state: ReadinessState | None, verified: VerifiedFunding | None
+) -> str | None:
+    """Return the point this participant durably attested observing, if any."""
+    if pending_state is None or verified is None:
+        return None
+    return verified.channel_point
+
+
 def _funding_negotiation(record: RingParticipantRecord) -> FundingNegotiation:
     prepared = record.prepared_outgoing
     plan = record.plan
@@ -1115,9 +1138,20 @@ async def reconcile_ring_records(
                         if acceptor_tasks is not None:
                             acceptor_tasks[task_key] = task
                 else:
-                    initialized_backend.backend.resume_inbound_channel(incoming)
+                    outgoing_verified = _retained_verified_funding(record, record.outgoing_edge)
+                    initialized_backend.backend.resume_inbound_channel(
+                        incoming,
+                        observed_channel_point=_retained_observed_point(
+                            record.incoming_pending_state,
+                            _retained_verified_funding(record, record.incoming_edge),
+                        ),
+                    )
                     initialized_backend.backend.resume_external_channel(
-                        _funding_negotiation(record)
+                        _funding_negotiation(record),
+                        verified=outgoing_verified,
+                        observed_channel_point=_retained_observed_point(
+                            record.outgoing_pending_state, outgoing_verified
+                        ),
                     )
             if record.state in {RingLifecycleState.SIGNED, RingLifecycleState.BROADCAST}:
                 transaction = None
