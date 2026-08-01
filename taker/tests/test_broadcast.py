@@ -85,6 +85,7 @@ class TestTakerBroadcast:
         wallet.network = "regtest"
         wallet.sync_all = AsyncMock()
         wallet.close = AsyncMock()
+        wallet.renew_coinjoin_inputs = MagicMock(return_value=True)
         return wallet
 
     @pytest.fixture
@@ -139,6 +140,7 @@ class TestTakerBroadcast:
             "00"  # witness - 0 items for this input (empty)
             "00000000"  # locktime
         )
+        taker._session.reserved_inputs = {("f" * 64, 0)}
         return taker
 
     @pytest.mark.asyncio
@@ -152,8 +154,21 @@ class TestTakerBroadcast:
     async def test_broadcast_self_failure(self, taker) -> None:
         """Test self-broadcast failure returns empty string."""
         taker.backend.broadcast_transaction = AsyncMock(side_effect=Exception("Network error"))
+        taker._session.signing_boundary_crossed = True
         txid = await taker._session._broadcast_self()
+        taker.release_input_locks()
         assert txid == ""
+        taker.wallet.release_coinjoin_inputs.assert_not_called()
+        assert taker.wallet.renew_coinjoin_inputs.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_broadcast_aborts_when_input_owner_is_lost(self, taker) -> None:
+        taker.wallet.renew_coinjoin_inputs.return_value = False
+
+        txid = await taker._session._broadcast_self()
+
+        assert txid == ""
+        taker.backend.broadcast_transaction.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_phase_broadcast_self_policy(self, taker) -> None:
@@ -566,6 +581,26 @@ class TestTakerBroadcast:
             await task
 
         taker.backend.get_transaction.assert_not_awaited()
+        taker._session.signing_boundary_crossed = True
+        taker.release_input_locks()
+        taker.wallet.release_coinjoin_inputs.assert_not_called()
+        assert taker.wallet.renew_coinjoin_inputs.call_count >= 2
+
+    @pytest.mark.asyncio
+    async def test_final_confirmation_decline_retains_signed_input_lease(self, taker) -> None:
+        taker.confirmation_callback = MagicMock(return_value=False)
+        taker._session.signing_boundary_crossed = True
+        taker._session.selected_utxos = []
+        taker._session.maker_sessions = {}
+
+        result = await taker._finalize_and_broadcast("bcrt1qdestination")
+        taker.release_input_locks()
+
+        assert result is None
+        assert taker.state.value == "failed"
+        taker.backend.broadcast_transaction.assert_not_awaited()
+        taker.wallet.release_coinjoin_inputs.assert_not_called()
+        taker.wallet.renew_coinjoin_inputs.assert_called()
 
     @pytest.mark.asyncio
     async def test_phase_broadcast_sends_to_all_makers_without_mempool_access(self, taker) -> None:
@@ -715,6 +750,7 @@ class TestNeutrinoBroadcast:
         wallet.network = "regtest"
         wallet.sync_all = AsyncMock()
         wallet.close = AsyncMock()
+        wallet.renew_coinjoin_inputs = MagicMock(return_value=True)
         return wallet
 
     @pytest.fixture
@@ -777,6 +813,7 @@ class TestNeutrinoBroadcast:
             "00"
             "00000000"
         )
+        taker._session.reserved_inputs = {("f" * 64, 0)}
         return taker
 
     @pytest.fixture
@@ -804,6 +841,7 @@ class TestNeutrinoBroadcast:
             "00"
             "00000000"
         )
+        taker._session.reserved_inputs = {("f" * 64, 0)}
         return taker
 
     def _setup_makers(self, taker, maker_nicks: list[str]) -> None:

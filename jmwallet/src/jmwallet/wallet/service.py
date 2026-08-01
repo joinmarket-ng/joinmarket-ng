@@ -1081,24 +1081,44 @@ class WalletService(WalletSyncMixin, CoinSelectionMixin, WalletDisplayMixin, Wal
         self,
         outpoints: set[tuple[str, int]],
         ttl: float = DEFAULT_COINJOIN_LOCK_TTL,
+        owner: str | None = None,
     ) -> bool:
         """Atomically lock ``outpoints`` for an in-flight CoinJoin.
 
         Returns True if all were locked, False on conflict (another round
-        already holds one of them). When no metadata store is configured the
-        call is a no-op that returns True (locking is best-effort persistence).
+        already holds one of them). Without a metadata store, legacy ownerless
+        calls remain best-effort no-ops; owned sessions fail closed because
+        their ownership could not be persisted.
         """
-        if self.metadata_store is None or not outpoints:
+        if not outpoints:
             return True
+        if self.metadata_store is None:
+            return owner is None
         refs = [f"{txid}:{vout}" for txid, vout in outpoints]
-        return self.metadata_store.try_lock_outpoints(refs, ttl=ttl)
+        return self.metadata_store.try_lock_outpoints(refs, ttl=ttl, owner=owner)
 
-    def release_coinjoin_inputs(self, outpoints: set[tuple[str, int]]) -> None:
-        """Release CoinJoin locks held on ``outpoints`` (no-op if none)."""
+    def renew_coinjoin_inputs(
+        self,
+        outpoints: set[tuple[str, int]],
+        owner: str,
+        ttl: float = DEFAULT_COINJOIN_LOCK_TTL,
+    ) -> bool:
+        """Atomically verify and renew session-owned CoinJoin input locks."""
+        if not outpoints:
+            return True
+        if self.metadata_store is None:
+            return False
+        refs = [f"{txid}:{vout}" for txid, vout in outpoints]
+        return self.metadata_store.renew_outpoints(refs, owner=owner, ttl=ttl)
+
+    def release_coinjoin_inputs(
+        self, outpoints: set[tuple[str, int]], owner: str | None = None
+    ) -> None:
+        """Compare-and-release CoinJoin locks held on ``outpoints``."""
         if self.metadata_store is None or not outpoints:
             return
         refs = [f"{txid}:{vout}" for txid, vout in outpoints]
-        self.metadata_store.release_outpoints(refs)
+        self.metadata_store.release_outpoints(refs, owner=owner)
 
     def toggle_freeze_utxo(self, outpoint: str) -> bool:
         """Toggle frozen state of a UTXO by outpoint (persisted to disk).

@@ -89,6 +89,44 @@ class TestTakerConfig:
         # minimum_makers default 4 matches upstream POLICY default.
         assert config.minimum_makers == 4
 
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("maker_timeout_sec", 3601),
+            ("order_wait_time", 3600.1),
+            ("broadcast_timeout_sec", 3601),
+        ],
+    )
+    def test_derived_lock_timeout_inputs_have_upper_bounds(
+        self, sample_mnemonic: str, field: str, value: float
+    ) -> None:
+        with pytest.raises(ValidationError):
+            TakerConfig(mnemonic=sample_mnemonic, **{field: value})
+
+    def test_default_and_maximum_derived_lock_ttls(self, sample_mnemonic: str) -> None:
+        from unittest.mock import MagicMock
+
+        from jmwallet.wallet.utxo_metadata import MAX_COINJOIN_LOCK_TTL
+
+        from taker.coinjoin_session import CoinJoinSession
+
+        session = CoinJoinSession()
+        session.attach(MagicMock(config=TakerConfig(mnemonic=sample_mnemonic)))
+        assert session.input_lock_ttl_sec() == 87_870
+
+        max_config = TakerConfig(
+            mnemonic=sample_mnemonic,
+            maker_timeout_sec=3600,
+            order_wait_time=3600,
+            broadcast_timeout_sec=3600,
+            taker_utxo_retries=10,
+            max_maker_replacement_attempts=10,
+            pending_tx_abandon_hours=336,
+        )
+        session.attach(MagicMock(config=max_config))
+        assert session.input_lock_ttl_sec() == 1_407_600
+        assert session.input_lock_ttl_sec() <= MAX_COINJOIN_LOCK_TTL
+
     def test_full_config(self, sample_mnemonic: str) -> None:
         """Test full configuration with all options."""
         config = TakerConfig(

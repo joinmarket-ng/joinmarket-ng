@@ -18,6 +18,7 @@ keeps ``Taker`` focused on lifecycle (start/stop/sync_wallet/run_schedule).
 from __future__ import annotations
 
 import asyncio
+import secrets
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -121,6 +122,11 @@ class CoinJoinSession:
         # them and build a conflicting transaction. Released on failure; left to
         # auto-expire on success (the inputs are then spent).
         self.reserved_inputs: set[tuple[str, int]] = set()
+        self.input_lock_owner = secrets.token_hex(32)
+        # Once !tx can reach a maker, partial signatures may exist even if this
+        # process is cancelled or never reaches its own signer. From that point
+        # onward input locks are retained and renewed instead of released.
+        self.signing_boundary_crossed = False
 
         # Counterparty nicks selected during this call (initial + replacements).
         # Tumbler reads this on the Taker to exclude reused makers across phases.
@@ -162,6 +168,8 @@ class CoinJoinSession:
 
     def reset(self) -> None:
         """Reset transient session state to a fresh state."""
+        if self.reserved_inputs:
+            raise RuntimeError("Cannot reset a CoinJoin session while it owns input leases")
         self.cj_amount = 0
         self.is_sweep = False
         self.maker_sessions = {}
@@ -172,15 +180,9 @@ class CoinJoinSession:
         self.txid = ""
         self.preselected_utxos = []
         self.selected_utxos = []
-        # Defensively release any locks left over from a prior round before
-        # starting a new one (normal paths release on failure / let them expire
-        # on success; this guards against an orphaned lock).
-        if self.reserved_inputs:
-            try:
-                self.wallet.release_coinjoin_inputs(self.reserved_inputs)
-            except Exception:
-                pass
-            self.reserved_inputs = set()
+        self.reserved_inputs = set()
+        self.input_lock_owner = secrets.token_hex(32)
+        self.signing_boundary_crossed = False
         self.last_used_nicks = set()
         self.last_failure_reason = None
         self.cj_destination = ""
@@ -190,6 +192,46 @@ class CoinJoinSession:
         self._fee_rate = None
         self._randomized_fee_rate = None
         self._mempool_min_fee = None
+
+    def input_lock_ttl_sec(self) -> float:
+        """Cover the remaining protocol plus the pending-broadcast window."""
+        protocol_window = (
+            float(self.config.order_wait_time)
+            + float(self.config.maker_timeout_sec)
+            * (self.config.taker_utxo_retries + 2 * self.config.max_maker_replacement_attempts + 3)
+            + float(self.config.broadcast_timeout_sec) * 21
+        )
+        pending_window = float(self.config.pending_tx_abandon_hours) * 3600
+        return protocol_window + pending_window
+
+    def renew_input_locks(self, operation: str) -> bool:
+        """Atomically verify ownership and extend this round's input leases."""
+        if not self.reserved_inputs:
+            logger.error(f"Cannot {operation}: this round has no reserved taker inputs")
+            return False
+        try:
+            renewed = self.wallet.renew_coinjoin_inputs(
+                self.reserved_inputs,
+                owner=self.input_lock_owner,
+                ttl=self.input_lock_ttl_sec(),
+            )
+        except Exception as exc:
+            logger.error(f"Cannot {operation}: failed to renew taker input locks: {exc}")
+            return False
+        if not renewed:
+            logger.error(f"Cannot {operation}: taker input lock ownership was lost")
+            return False
+        return True
+
+    def retain_input_locks(self) -> None:
+        """Best-effort renewal after signatures may exist or broadcast is uncertain."""
+        if not self.reserved_inputs:
+            return
+        if not self.renew_input_locks("retain signed-round input locks"):
+            logger.error(
+                "Signed-round input locks could not be renewed; the owner-qualified "
+                "leases were left untouched"
+            )
 
     def _expand_preselected_utxos_same_mixdepth(self, mixdepth: int) -> int:
         """Add another eligible UTXO from the same mixdepth to ``preselected_utxos``.
@@ -222,14 +264,23 @@ class CoinJoinSession:
 
         # Sorted by (confirmations, value) DESC from get_eligible_podle_utxos;
         # add just one UTXO at a time to minimise bloating the transaction.
-        new_utxo = candidates[0]
-        self.preselected_utxos.append(new_utxo)
-        logger.info(
-            f"Expanded preselected UTXOs with {new_utxo.txid}:{new_utxo.vout} "
-            f"(value={new_utxo.value}, confs={new_utxo.confirmations}) from mixdepth "
-            f"{mixdepth} to enable a fresh PoDLE commitment."
-        )
-        return 1
+        for new_utxo in candidates:
+            outpoint = (new_utxo.txid, new_utxo.vout)
+            if not self.wallet.reserve_coinjoin_inputs(
+                {outpoint},
+                ttl=self.input_lock_ttl_sec(),
+                owner=self.input_lock_owner,
+            ):
+                continue
+            self.reserved_inputs.add(outpoint)
+            self.preselected_utxos.append(new_utxo)
+            logger.info(
+                f"Expanded preselected UTXOs with {new_utxo.txid}:{new_utxo.vout} "
+                f"(value={new_utxo.value}, confs={new_utxo.confirmations}) from mixdepth "
+                f"{mixdepth} to enable a fresh PoDLE commitment."
+            )
+            return 1
+        return 0
 
     def _drop_neutrino_incompatible_sessions(self) -> list[str]:
         """Drop sessions for makers whose handshake explicitly lacks neutrino_compat.
@@ -1085,7 +1136,11 @@ class CoinJoinSession:
             # Lock any inputs added beyond the already-reserved preselection so a
             # concurrent round can't grab them; on conflict, fail this round.
             extra_inputs = {(u.txid, u.vout) for u in selected_utxos} - self.reserved_inputs
-            if extra_inputs and not self.wallet.reserve_coinjoin_inputs(extra_inputs):
+            if extra_inputs and not self.wallet.reserve_coinjoin_inputs(
+                extra_inputs,
+                ttl=self.input_lock_ttl_sec(),
+                owner=self.input_lock_owner,
+            ):
                 logger.error(
                     "Additional UTXOs are locked by another in-flight CoinJoin; "
                     "aborting to avoid a conflicting transaction"
@@ -1453,6 +1508,12 @@ class CoinJoinSession:
             )
 
             encrypted_tx = session.crypto.encrypt(tx_b64)
+            # Verify ownership immediately before every delivery. Once any
+            # !tx can reach a maker, partial signatures may exist and every
+            # later exit must retain the input leases.
+            if not self.renew_input_locks(f"send !tx to maker {nick}"):
+                return False
+            self.signing_boundary_crossed = True
             await self.directory_client.send_privmsg(
                 nick, "tx", encrypted_tx, log_routing=True, force_channel=session.comm_channel
             )
@@ -1680,6 +1741,13 @@ class CoinJoinSession:
                 txid_hex = tx_input.txid_le[::-1].hex()
                 input_index_map[(txid_hex, tx_input.vout)] = idx
 
+            # This is the explicit local signing boundary. The earlier !tx
+            # boundary normally already applies, but the defensive assignment
+            # keeps direct callers of this method safe as well.
+            if not self.renew_input_locks("sign taker inputs"):
+                return []
+            self.signing_boundary_crossed = True
+
             # Sign each of our UTXOs
             for utxo in self.selected_utxos:
                 # Find the input index in the transaction
@@ -1839,6 +1907,8 @@ class CoinJoinSession:
         if not inputs_valid:
             logger.error(f"Refusing to broadcast after input revalidation: {validation_error}")
             return ""
+        if not self.renew_input_locks("broadcast transaction"):
+            return ""
 
         policy = self.config.tx_broadcast
         has_mempool = self.backend.has_mempool_access()
@@ -1992,6 +2062,8 @@ class CoinJoinSession:
         async def send_push(nick: str) -> bool:
             """Send !push to a single maker, return True if no exception."""
             try:
+                if not self.renew_input_locks(f"broadcast through maker {nick}"):
+                    return False
                 # Get the comm_channel from maker_sessions if available
                 session = self.maker_sessions.get(nick)
                 force_channel = session.comm_channel if session else None
@@ -2020,6 +2092,8 @@ class CoinJoinSession:
         "already in mempool". In these cases, we verify the transaction exists
         and treat it as success.
         """
+        if not self.renew_input_locks("broadcast through the local backend"):
+            return ""
         try:
             txid = await self.backend.broadcast_transaction(self.final_tx.hex())
             logger.info(f"Broadcast via self successful: {txid}")
@@ -2115,6 +2189,9 @@ class CoinJoinSession:
             start_time = time.monotonic()
             deadline = start_time + self.config.broadcast_timeout_sec
             logger.info(f"Requesting broadcast via maker: {maker_nick}")
+
+            if not self.renew_input_locks(f"broadcast through maker {maker_nick}"):
+                return ""
 
             # Send !push to the maker (unencrypted, like reference implementation)
             # Use the same comm_channel as the rest of the session

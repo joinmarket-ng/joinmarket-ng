@@ -650,6 +650,15 @@ cj_fee_relative = 0.00001
         assert settings.cj_fee_relative == "not_a_number_e5"
 
 
+def test_settings_bound_fields_used_by_derived_lock_ttls() -> None:
+    with pytest.raises(ValueError):
+        MakerSettings(session_timeout_sec=86_401)
+    with pytest.raises(ValueError):
+        TakerSettings(maker_timeout_sec=3601)
+    with pytest.raises(ValueError):
+        TakerSettings(order_wait_time=3600.1)
+
+
 class TestTakerSettingsMaxCjFeeRelNormalization:
     """Tests for TakerSettings max_cj_fee_rel scientific notation normalization."""
 

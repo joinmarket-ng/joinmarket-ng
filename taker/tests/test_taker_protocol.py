@@ -69,6 +69,9 @@ def mock_backend():
     backend.broadcast_transaction = AsyncMock(return_value="txid123")
     # can_provide_neutrino_metadata is a synchronous method, not async
     backend.can_provide_neutrino_metadata = Mock(return_value=True)
+    backend.requires_neutrino_metadata = Mock(return_value=False)
+    backend.can_estimate_fee = Mock(return_value=False)
+    backend.get_mempool_min_fee = AsyncMock(return_value=None)
     return backend
 
 
@@ -1243,6 +1246,7 @@ async def test_expand_preselected_utxos_same_mixdepth(
     taker._session.preselected_utxos = [already]
     # Return both; only the non-preselected one should be added.
     mock_wallet.get_all_utxos = Mock(return_value=[already, candidate])
+    mock_wallet.reserve_coinjoin_inputs = Mock(return_value=True)
 
     added = taker._session._expand_preselected_utxos_same_mixdepth(mixdepth=0)
 
@@ -1251,6 +1255,12 @@ async def test_expand_preselected_utxos_same_mixdepth(
     assert (candidate.txid, candidate.vout) in {
         (u.txid, u.vout) for u in taker._session.preselected_utxos
     }
+    mock_wallet.reserve_coinjoin_inputs.assert_called_once_with(
+        {(candidate.txid, candidate.vout)},
+        ttl=taker._session.input_lock_ttl_sec(),
+        owner=taker._session.input_lock_owner,
+    )
+    assert (candidate.txid, candidate.vout) in taker._session.reserved_inputs
 
     # A second call with no new eligible UTXOs must add nothing and not fail.
     mock_wallet.get_all_utxos = Mock(return_value=[already, candidate])

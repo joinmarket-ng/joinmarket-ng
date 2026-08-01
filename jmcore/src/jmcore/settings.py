@@ -744,6 +744,7 @@ class MakerSettings(BaseModel):
     session_timeout_sec: int = Field(
         default=300,
         ge=60,
+        le=86_400,
         description="Maximum time for a CoinJoin session",
     )
     pending_tx_timeout_min: int = Field(
@@ -994,11 +995,13 @@ class TakerSettings(BaseModel):
     maker_timeout_sec: int = Field(
         default=60,
         ge=10,
+        le=3600,
         description="Timeout for maker responses",
     )
     order_wait_time: float = Field(
         default=120.0,
         ge=1.0,
+        le=3600.0,
         description=(
             "Maximum seconds to wait for orderbook responses (hard ceiling). "
             "Empirical testing shows 95th percentile response time over Tor is ~101s. "

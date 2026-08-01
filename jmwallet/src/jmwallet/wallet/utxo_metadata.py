@@ -35,6 +35,7 @@ Reference: https://github.com/bitcoin/bips/blob/master/bip-0329.mediawiki
 from __future__ import annotations
 
 import json
+import math
 import tempfile
 import time
 from collections.abc import Iterable, Iterator
@@ -81,6 +82,24 @@ AUTO_FREEZE_REUSE_LABEL = "jm:autofrozen:reuse"
 # crashes, or is killed without releasing its locks will have them auto-expire
 # after this many seconds, so funds are never blocked permanently.
 DEFAULT_COINJOIN_LOCK_TTL = 600.0
+# Internal safety ceiling for persisted leases. Current maker and taker
+# defaults and their maximum derived pending windows fit within 31 days.
+MAX_COINJOIN_LOCK_TTL = 31 * 24 * 60 * 60.0
+
+
+def _validate_lock_ttl(ttl: float) -> float:
+    """Return a finite, positive lease TTL within the internal safety cap."""
+    if isinstance(ttl, bool):
+        raise ValueError("CoinJoin lock TTL must be a finite positive number")
+    try:
+        validated = float(ttl)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("CoinJoin lock TTL must be a finite positive number") from exc
+    if not math.isfinite(validated) or validated <= 0:
+        raise ValueError("CoinJoin lock TTL must be a finite positive number")
+    if validated > MAX_COINJOIN_LOCK_TTL:
+        raise ValueError(f"CoinJoin lock TTL must not exceed {MAX_COINJOIN_LOCK_TTL:.0f} seconds")
+    return validated
 
 
 @dataclass
@@ -92,12 +111,15 @@ class OutputRecord:
         spendable: Whether the UTXO is spendable. ``False`` means frozen.
             ``None`` means no opinion (importing wallet should not alter state).
         label: Optional human-readable label.
+        lock_until: Optional temporary CoinJoin lock expiry timestamp.
+        lock_owner: Optional opaque owner token for compare-and-release.
     """
 
     ref: str
     spendable: bool | None = None
     label: str | None = None
     lock_until: float | None = None
+    lock_owner: str | None = None
     # JoinMarket extension: this process/wallet has positively observed this
     # outpoint as an unspent coin. Persisted (``jm_seen``) so the
     # forced-address-reuse defense can tell a coin that predates a restart from
@@ -134,9 +156,9 @@ class OutputRecord:
     def to_dict(self) -> dict[str, str | bool | float]:
         """Serialize to a BIP-329 JSON dict.
 
-        ``jm_lock_until`` and ``jm_seen`` are JoinMarket extensions (other
-        BIP-329 consumers ignore unknown keys); they carry the temporary
-        CoinJoin lock expiry and the observed-outpoint marker respectively.
+        ``jm_lock_until``, ``jm_lock_owner``, and ``jm_seen`` are JoinMarket
+        extensions (other BIP-329 consumers ignore unknown keys). The owner is
+        an opaque generation token used for compare-and-release semantics.
         """
         d: dict[str, str | bool | float] = {"type": "output", "ref": self.ref}
         if self.spendable is not None:
@@ -145,6 +167,8 @@ class OutputRecord:
             d["label"] = self.label
         if self.lock_until is not None:
             d["jm_lock_until"] = self.lock_until
+            if self.lock_owner is not None:
+                d["jm_lock_owner"] = self.lock_owner
         if self.seen:
             d["jm_seen"] = True
         return d
@@ -172,8 +196,21 @@ class OutputRecord:
             lock_until = float(lock_until_raw)
         else:
             lock_until = None
+        lock_owner_raw = d.get("jm_lock_owner")
+        lock_owner = (
+            lock_owner_raw
+            if lock_until is not None and isinstance(lock_owner_raw, str) and lock_owner_raw
+            else None
+        )
         seen = d.get("jm_seen") is True
-        return cls(ref=ref, spendable=spendable, label=label, lock_until=lock_until, seen=seen)
+        return cls(
+            ref=ref,
+            spendable=spendable,
+            label=label,
+            lock_until=lock_until,
+            lock_owner=lock_owner,
+            seen=seen,
+        )
 
 
 @dataclass
@@ -580,6 +617,9 @@ class UTXOMetadataStore:
     # auto-expire (``lock_until``) so a crashed or killed round cannot block
     # funds forever, and acquisition is serialized across processes with an
     # advisory file lock so two processes cannot both win the same UTXO.
+    # Every concurrent process sharing this file must run a version that
+    # understands ``jm_lock_owner``; mixed old/new binaries are unsupported
+    # because an old writer cannot be made to enforce new ownership semantics.
 
     @property
     def _flock_path(self) -> Path:
@@ -624,6 +664,7 @@ class UTXOMetadataStore:
             record = self.records[ref]
             if record.lock_until is not None and record.lock_until <= now:
                 record.lock_until = None
+                record.lock_owner = None
                 if not record.has_metadata:
                     del self.records[ref]
 
@@ -638,7 +679,10 @@ class UTXOMetadataStore:
         return {ref for ref, record in self.records.items() if record.is_locked(now)}
 
     def try_lock_outpoints(
-        self, outpoints: Iterable[str], ttl: float = DEFAULT_COINJOIN_LOCK_TTL
+        self,
+        outpoints: Iterable[str],
+        ttl: float = DEFAULT_COINJOIN_LOCK_TTL,
+        owner: str | None = None,
     ) -> bool:
         """Atomically lock ``outpoints`` for ``ttl`` seconds.
 
@@ -650,6 +694,7 @@ class UTXOMetadataStore:
         Returns:
             True if all outpoints were locked; False on conflict.
         """
+        validated_ttl = _validate_lock_ttl(ttl)
         wanted = set(outpoints)
         if not wanted:
             return True
@@ -666,12 +711,53 @@ class UTXOMetadataStore:
                 if record is None:
                     record = OutputRecord(ref=ref)
                     self.records[ref] = record
-                record.lock_until = now + ttl
+                record.lock_until = now + validated_ttl
+                record.lock_owner = owner
             self.save()
         return True
 
-    def release_outpoints(self, outpoints: Iterable[str]) -> None:
-        """Clear CoinJoin locks on ``outpoints`` (no-op for unlocked ones)."""
+    def renew_outpoints(
+        self,
+        outpoints: Iterable[str],
+        owner: str,
+        ttl: float = DEFAULT_COINJOIN_LOCK_TTL,
+    ) -> bool:
+        """Atomically verify and renew every owned, non-expired lock.
+
+        Returns ``False`` without changing any record when an outpoint is
+        unlocked, expired, frozen, ownerless, or owned by another generation.
+        """
+        validated_ttl = _validate_lock_ttl(ttl)
+        wanted = set(outpoints)
+        if not wanted:
+            return True
+        if not owner:
+            return False
+        with self._exclusive_file_lock():
+            self.load()
+            now = time.time()
+            for ref in wanted:
+                record = self.records.get(ref)
+                if (
+                    record is None
+                    or record.is_frozen
+                    or not record.is_locked(now)
+                    or record.lock_owner != owner
+                ):
+                    return False
+            lock_until = now + validated_ttl
+            for ref in wanted:
+                self.records[ref].lock_until = lock_until
+            self.save()
+        return True
+
+    def release_outpoints(self, outpoints: Iterable[str], owner: str | None = None) -> None:
+        """Compare-and-release CoinJoin locks on ``outpoints``.
+
+        An owned caller clears only locks with the same owner token. An
+        ownerless caller retains the legacy API behavior for ownerless records,
+        but cannot clear locks created by an owned session.
+        """
         wanted = set(outpoints)
         if not wanted:
             return
@@ -680,8 +766,13 @@ class UTXOMetadataStore:
             changed = False
             for ref in wanted:
                 record = self.records.get(ref)
-                if record is not None and record.lock_until is not None:
+                if (
+                    record is not None
+                    and record.lock_until is not None
+                    and record.lock_owner == owner
+                ):
                     record.lock_until = None
+                    record.lock_owner = None
                     changed = True
                     if not record.has_metadata:
                         del self.records[ref]

@@ -26,6 +26,7 @@ def _make_wallet(utxos: list) -> AsyncMock:
     wallet.get_locked_input_outpoints = Mock(return_value=set())
     wallet.select_utxos = Mock(return_value=list(utxos))
     wallet.reserve_coinjoin_inputs = Mock(return_value=True)
+    wallet.renew_coinjoin_inputs = Mock(return_value=True)
     wallet.release_coinjoin_inputs = Mock()
     return wallet
 
@@ -34,6 +35,8 @@ def _backend() -> AsyncMock:
     backend = AsyncMock()
     backend.can_provide_neutrino_metadata = Mock(return_value=False)
     backend.requires_neutrino_metadata = Mock(return_value=False)
+    backend.can_estimate_fee = Mock(return_value=False)
+    backend.get_mempool_min_fee = AsyncMock(return_value=None)
     return backend
 
 
@@ -59,6 +62,7 @@ async def test_failure_after_reservation_releases_persisted_locks() -> None:
         minimum_makers=2,
         taker_utxo_age=5,
         taker_utxo_amtpercent=20,
+        fee_rate=1.0,
     )
     taker = Taker(wallet, _backend(), config)
 
@@ -69,7 +73,6 @@ async def test_failure_after_reservation_releases_persisted_locks() -> None:
     taker.orderbook_manager.select_makers = Mock(  # type: ignore[method-assign]
         return_value=({o.counterparty: o for o in offers}, 1_000)
     )
-    taker._session._fee_rate = 1.0
     # Fail the round right after the reservation: no PoDLE commitment.
     taker.podle_manager.generate_fresh_commitment = Mock(return_value=None)  # type: ignore[method-assign]
 
@@ -81,23 +84,35 @@ async def test_failure_after_reservation_releases_persisted_locks() -> None:
 
     assert result is None
     assert taker.state == TakerState.FAILED
-    wallet.reserve_coinjoin_inputs.assert_called_once_with({(utxo.txid, utxo.vout)})
-    wallet.release_coinjoin_inputs.assert_called_once_with({(utxo.txid, utxo.vout)})
+    wallet.reserve_coinjoin_inputs.assert_called_once_with(
+        {(utxo.txid, utxo.vout)},
+        ttl=taker._session.input_lock_ttl_sec(),
+        owner=taker._session.input_lock_owner,
+    )
+    wallet.release_coinjoin_inputs.assert_called_once_with(
+        {(utxo.txid, utxo.vout)}, owner=taker._session.input_lock_owner
+    )
     assert taker._session.reserved_inputs == set()
 
 
 @pytest.mark.asyncio
-async def test_early_failure_releases_leftover_locks() -> None:
-    """Even a pre-flight failure must release any leftover reservation."""
+async def test_new_round_does_not_release_prior_post_sign_lease() -> None:
+    """Fresh round state must not compare-and-release an earlier signed lease."""
     utxo = make_utxo(txid_char="a", value=25_000_000, confirmations=1)  # immature
     wallet = _make_wallet([utxo])
     wallet.select_utxos = Mock(side_effect=ValueError("Insufficient funds"))
     taker = Taker(wallet, _backend(), make_taker_config(taker_utxo_age=5))
     leftover = {("b" * 64, 1)}
-    taker._session.reserved_inputs = set(leftover)
+    prior_session = taker._session
+    prior_owner = prior_session.input_lock_owner
+    prior_session.reserved_inputs = set(leftover)
+    prior_session.signing_boundary_crossed = True
 
     result = await taker.do_coinjoin(amount=5_000_000, destination="INTERNAL", mixdepth=0)
 
     assert result is None
-    wallet.release_coinjoin_inputs.assert_called_once_with(leftover)
+    assert taker._session is not prior_session
+    assert taker._session.input_lock_owner != prior_owner
+    wallet.release_coinjoin_inputs.assert_not_called()
+    wallet.renew_coinjoin_inputs.assert_not_called()
     assert taker._session.reserved_inputs == set()

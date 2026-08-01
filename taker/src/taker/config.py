@@ -176,10 +176,13 @@ class TakerConfig(WalletConfig):
     )
 
     # Timeouts
-    maker_timeout_sec: int = Field(default=60, ge=10, description="Timeout for maker responses")
+    maker_timeout_sec: int = Field(
+        default=60, ge=10, le=3600, description="Timeout for maker responses"
+    )
     order_wait_time: float = Field(
         default=120.0,
         ge=1.0,
+        le=3600.0,
         description=(
             "Maximum seconds to wait for orderbook responses (hard ceiling). "
             "Empirical testing shows 95th percentile response time over Tor is ~101s. "
@@ -212,6 +215,7 @@ class TakerConfig(WalletConfig):
     broadcast_timeout_sec: int = Field(
         default=30,
         ge=5,
+        le=3600,
         description="Timeout waiting for maker to broadcast when delegating",
     )
     broadcast_peer_count: int = Field(

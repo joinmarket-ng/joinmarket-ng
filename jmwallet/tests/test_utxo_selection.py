@@ -332,10 +332,30 @@ class TestServiceCoinJoinLocks:
         wallet_service.release_coinjoin_inputs({("f" * 64, 0)})
         assert wallet_service.get_locked_input_outpoints() == {("g" * 64, 0)}
 
+    def test_owned_reserve_renew_and_compare_release(self, wallet_service, tmp_path):
+        self._attach_store(wallet_service, tmp_path)
+        outpoint = ("f" * 64, 0)
+        assert wallet_service.reserve_coinjoin_inputs({outpoint}, owner="session-a") is True
+        assert wallet_service.renew_coinjoin_inputs({outpoint}, owner="session-a") is True
+
+        wallet_service.release_coinjoin_inputs({outpoint}, owner="session-b")
+        assert wallet_service.get_locked_input_outpoints() == {outpoint}
+
+        wallet_service.release_coinjoin_inputs({outpoint}, owner="session-a")
+        assert wallet_service.get_locked_input_outpoints() == set()
+
     def test_no_store_is_noop(self, wallet_service):
         # No metadata store (no data dir): locking is best-effort, returns True.
         wallet_service.metadata_store = None
         assert wallet_service.reserve_coinjoin_inputs({("f" * 64, 0)}) is True
+        assert (
+            wallet_service.reserve_coinjoin_inputs({("f" * 64, 0)}, owner="persisted-session")
+            is False
+        )
+        assert (
+            wallet_service.renew_coinjoin_inputs({("f" * 64, 0)}, owner="persisted-session")
+            is False
+        )
         assert wallet_service.get_locked_input_outpoints() == set()
         wallet_service.release_coinjoin_inputs({("f" * 64, 0)})  # no raise
 

@@ -183,6 +183,7 @@ class Taker(TakerMonitoringMixin):
         # session, which is reset at the start of each ``do_coinjoin`` call.
         self._session = CoinJoinSession()
         self._session.attach(self)
+        self._round_lock = asyncio.Lock()
 
         # Schedule for tumbler-style operations
         self.schedule: Schedule | None = None
@@ -276,15 +277,20 @@ class Taker(TakerMonitoringMixin):
         await self.connect()
 
     def release_input_locks(self) -> None:
-        """Release persisted CoinJoin locks held on this round's taker inputs.
+        """Clean up persisted CoinJoin locks held on this round's taker inputs.
 
-        Call on failure so the inputs become selectable again immediately
-        instead of waiting for the lock TTL. On success the inputs are spent,
-        so locks are left to auto-expire. Safe to call when nothing is reserved.
+        Pre-sign failures release immediately. Once signatures may exist, the
+        owner-qualified leases are renewed through the pending window instead.
         """
+        if self._session and self._session.signing_boundary_crossed:
+            self._session.retain_input_locks()
+            return
         if self._session and self._session.reserved_inputs:
             try:
-                self.wallet.release_coinjoin_inputs(self._session.reserved_inputs)
+                self.wallet.release_coinjoin_inputs(
+                    self._session.reserved_inputs,
+                    owner=self._session.input_lock_owner,
+                )
             except Exception as e:  # pragma: no cover - best-effort cleanup
                 logger.debug(f"Failed to release taker input locks: {e}")
             self._session.reserved_inputs = set()
@@ -518,6 +524,32 @@ class Taker(TakerMonitoringMixin):
         logger.info(f"Updated {updated_count} offers with verified fidelity bond values")
 
     async def do_coinjoin(
+        self,
+        amount: int,
+        destination: str,
+        mixdepth: int | None = None,
+        counterparty_count: int | None = None,
+        exclude_nicks: set[str] | None = None,
+    ) -> str | None:
+        """Run one CoinJoin with fresh, non-reusable per-round state."""
+        if self._round_lock.locked():
+            logger.error("A CoinJoin round is already active on this Taker instance")
+            return None
+
+        async with self._round_lock:
+            session = CoinJoinSession()
+            session.attach(self)
+            self._session = session
+            self.state = TakerState.IDLE
+            return await self._do_coinjoin(
+                amount=amount,
+                destination=destination,
+                mixdepth=mixdepth,
+                counterparty_count=counterparty_count,
+                exclude_nicks=exclude_nicks,
+            )
+
+    async def _do_coinjoin(
         self,
         amount: int,
         destination: str,
@@ -884,7 +916,11 @@ class Taker(TakerMonitoringMixin):
             # transaction. The lock auto-expires (and is released on failure),
             # so a crash never blocks these funds permanently.
             to_reserve = {(u.txid, u.vout) for u in self._session.preselected_utxos}
-            if not self.wallet.reserve_coinjoin_inputs(to_reserve):
+            if not self.wallet.reserve_coinjoin_inputs(
+                to_reserve,
+                ttl=self._session.input_lock_ttl_sec(),
+                owner=self._session.input_lock_owner,
+            ):
                 reason = (
                     "Selected UTXOs are locked by another in-flight CoinJoin on "
                     "this wallet (avoid running concurrent rounds on one wallet)."
@@ -1038,12 +1074,10 @@ class Taker(TakerMonitoringMixin):
             self.state = TakerState.FAILED
             return None
         finally:
-            # Input locks are persisted to the wallet metadata file, so a
-            # failed round that returned without releasing them would keep its
-            # inputs "locked by another in-flight CoinJoin" for the whole lock
-            # TTL, blocking retries even from fresh Taker instances (which
-            # discard the in-memory reservation but not the on-disk lock).
-            # On success the inputs are spent, so locks are left to expire.
+            # Before !tx, failure is known not to have produced signatures and
+            # locks can be released. At or after the signing boundary, renew
+            # through the pending window because cancellation, confirmation
+            # decline, or a failed broadcast can leave a usable transaction.
             if self.state != TakerState.COMPLETE:
                 self.release_input_locks()
 

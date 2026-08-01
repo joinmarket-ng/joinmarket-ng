@@ -202,6 +202,7 @@ class TestTakerSigning:
         wallet.sign_input = lambda tx, idx, utxo: WalletSigningMixin.sign_input(
             wallet, tx, idx, utxo
         )
+        wallet.renew_coinjoin_inputs = MagicMock(return_value=True)
         return wallet
 
     @pytest.fixture
@@ -227,6 +228,10 @@ class TestTakerSigning:
         config.taker_utxo_age = 5
         config.taker_utxo_amtpercent = 20
         config.tx_fee_factor = 1.0
+        config.taker_utxo_retries = 3
+        config.max_maker_replacement_attempts = 3
+        config.broadcast_timeout_sec = 30
+        config.pending_tx_abandon_hours = 24
         return config
 
     @pytest.mark.asyncio
@@ -250,6 +255,7 @@ class TestTakerSigning:
             taker.backend = mock_backend
             taker.config = mock_config
             taker._session.selected_utxos = taker_utxos
+            taker._session.reserved_inputs = {(u.txid, u.vout) for u in taker_utxos}
 
             # Build the transaction
             builder = CoinJoinTxBuilder(network="regtest")
@@ -300,6 +306,7 @@ class TestTakerSigning:
             taker.backend = mock_backend
             taker.config = mock_config
             taker._session.selected_utxos = taker_utxos
+            taker._session.reserved_inputs = {(u.txid, u.vout) for u in taker_utxos}
 
             builder = CoinJoinTxBuilder(network="regtest")
             tx_bytes, metadata = builder.build_unsigned_tx(sample_coinjoin_tx_data)
@@ -313,6 +320,87 @@ class TestTakerSigning:
             expected_utxos = {(u.txid, u.vout) for u in taker_utxos}
 
             assert signed_utxos == expected_utxos
+
+    @pytest.mark.asyncio
+    async def test_sign_our_inputs_aborts_after_owner_loss(
+        self,
+        mock_wallet: MagicMock,
+        mock_backend: AsyncMock,
+        mock_config: MagicMock,
+        taker_utxos: list[UTXOInfo],
+        sample_coinjoin_tx_data: CoinJoinTxData,
+    ) -> None:
+        from taker.taker import Taker
+
+        with patch.object(Taker, "__init__", lambda self, *args, **kwargs: None):
+            taker = Taker.__new__(Taker)
+            taker._session = CoinJoinSession()
+            taker._session.attach(taker)
+            taker.wallet = mock_wallet
+            taker.backend = mock_backend
+            taker.config = mock_config
+            taker._session.selected_utxos = taker_utxos
+            taker._session.reserved_inputs = {(u.txid, u.vout) for u in taker_utxos}
+            tx_bytes, metadata = CoinJoinTxBuilder(network="regtest").build_unsigned_tx(
+                sample_coinjoin_tx_data
+            )
+            taker._session.unsigned_tx = tx_bytes
+            taker._session.tx_metadata = metadata
+            signer = MagicMock(side_effect=mock_wallet.sign_input)
+            mock_wallet.sign_input = signer
+            mock_wallet.renew_coinjoin_inputs.return_value = False
+
+            signatures = await taker._session._sign_our_inputs()
+
+            assert signatures == []
+            assert taker._session.signing_boundary_crossed is False
+            signer.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_partial_taker_signing_retains_input_lease(
+        self,
+        mock_wallet: MagicMock,
+        mock_backend: AsyncMock,
+        mock_config: MagicMock,
+        taker_utxos: list[UTXOInfo],
+        sample_coinjoin_tx_data: CoinJoinTxData,
+    ) -> None:
+        from taker.taker import Taker
+
+        real_signer = mock_wallet.sign_input
+        signing_calls = 0
+
+        def fail_after_first_signature(tx, input_index, utxo):
+            nonlocal signing_calls
+            signing_calls += 1
+            if signing_calls == 2:
+                raise RuntimeError("second signer failed")
+            return real_signer(tx, input_index, utxo)
+
+        mock_wallet.sign_input = MagicMock(side_effect=fail_after_first_signature)
+        with patch.object(Taker, "__init__", lambda self, *args, **kwargs: None):
+            taker = Taker.__new__(Taker)
+            taker._session = CoinJoinSession()
+            taker._session.attach(taker)
+            taker.wallet = mock_wallet
+            taker.backend = mock_backend
+            taker.config = mock_config
+            taker._session.selected_utxos = taker_utxos
+            taker._session.reserved_inputs = {(u.txid, u.vout) for u in taker_utxos}
+            tx_bytes, metadata = CoinJoinTxBuilder(network="regtest").build_unsigned_tx(
+                sample_coinjoin_tx_data
+            )
+            taker._session.unsigned_tx = tx_bytes
+            taker._session.tx_metadata = metadata
+
+            signatures = await taker._session._sign_our_inputs()
+            taker.release_input_locks()
+
+            assert signatures == []
+            assert signing_calls == 2
+            assert taker._session.signing_boundary_crossed is True
+            mock_wallet.release_coinjoin_inputs.assert_not_called()
+            assert mock_wallet.renew_coinjoin_inputs.call_count == 2
 
     @pytest.mark.asyncio
     async def test_sign_our_inputs_empty_utxos(
@@ -642,6 +730,11 @@ class TestPhaseCollectSignaturesCompleteness:
             taker.config.maker_timeout_sec = 5
             taker.config.minimum_makers = 1  # Low threshold -- should NOT matter
             taker.config.data_dir = Path("/tmp/test")
+            taker.config.order_wait_time = 120
+            taker.config.taker_utxo_retries = 3
+            taker.config.max_maker_replacement_attempts = 3
+            taker.config.broadcast_timeout_sec = 30
+            taker.config.pending_tx_abandon_hours = 24
             taker._session.unsigned_tx = tx_bytes
             taker._session.tx_metadata = metadata
             taker._session.selected_utxos = []
@@ -657,6 +750,13 @@ class TestPhaseCollectSignaturesCompleteness:
                 taker._session.maker_sessions = maker_sessions
             else:
                 taker._session.maker_sessions = {}
+
+            taker.wallet.renew_coinjoin_inputs = MagicMock(return_value=True)
+            taker._session.reserved_inputs = {
+                (tx_input.txid_le[::-1].hex(), tx_input.vout)
+                for tx_input in deserialize_transaction(tx_bytes).inputs
+                if (tx_input.txid_le[::-1].hex(), tx_input.vout) == ("a" * 64, 0)
+            }
 
             return taker
 
@@ -703,6 +803,46 @@ class TestPhaseCollectSignaturesCompleteness:
             "_phase_collect_signatures must fail when a maker whose inputs are "
             "in the transaction doesn't respond"
         )
+        assert taker._session.signing_boundary_crossed is True
+        assert taker.wallet.renew_coinjoin_inputs.call_count >= 1
+        taker.wallet.renew_coinjoin_inputs.reset_mock()
+        taker.release_input_locks()
+        taker.wallet.release_coinjoin_inputs.assert_not_called()
+        taker.wallet.renew_coinjoin_inputs.assert_called_once_with(
+            taker._session.reserved_inputs,
+            owner=taker._session.input_lock_owner,
+            ttl=taker._session.input_lock_ttl_sec(),
+        )
+
+    @pytest.mark.asyncio
+    async def test_owner_loss_before_tx_prevents_signature_requests(
+        self, two_maker_tx_data: CoinJoinTxData
+    ) -> None:
+        from jmcore.models import Offer, OfferType
+
+        offer = Offer(
+            counterparty="maker1",
+            oid=0,
+            ordertype=OfferType.SW0_RELATIVE,
+            minsize=100_000,
+            maxsize=10_000_000,
+            txfee=0,
+            cjfee="0.001",
+            fidelity_bond_value=0,
+        )
+        maker_sessions = {
+            "maker1": self._make_maker_session(
+                "maker1", offer, [{"txid": "b" * 64, "vout": 0, "value": 1_500_000}]
+            )
+        }
+        taker = self._build_taker_with_tx(two_maker_tx_data, maker_sessions=maker_sessions)
+        taker.wallet.renew_coinjoin_inputs.return_value = False
+
+        result = await taker._session._phase_collect_signatures()
+
+        assert result is False
+        assert taker._session.signing_boundary_crossed is False
+        taker.directory_client.send_privmsg.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_rejects_when_maker_provides_invalid_signature(

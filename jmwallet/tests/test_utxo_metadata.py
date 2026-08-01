@@ -1240,8 +1240,11 @@ class TestCoinJoinLocks:
     def test_lock_auto_expires(self, store_path, a):
         store = UTXOMetadataStore(path=store_path)
         store.load()
-        # Expire in the past.
-        store.try_lock_outpoints([a], ttl=-1)
+        store.try_lock_outpoints([a], ttl=1)
+        with store._exclusive_file_lock():
+            store.load()
+            store.records[a].lock_until = 1.0
+            store.save()
         assert store.get_locked_outpoints() == set()
         # Expired lock can be re-acquired.
         assert store.try_lock_outpoints([a], ttl=100) is True
@@ -1277,3 +1280,100 @@ class TestCoinJoinLocks:
         rec = next(r for r in lines if r.get("ref") == a)
         assert rec["type"] == "output"
         assert "jm_lock_until" in rec
+
+    def test_owned_lock_round_trip(self, store_path, a):
+        store = UTXOMetadataStore(path=store_path)
+        assert store.try_lock_outpoints([a], ttl=100, owner="session-a") is True
+
+        reloaded = UTXOMetadataStore(path=store_path)
+        reloaded.load()
+
+        assert reloaded.records[a].lock_owner == "session-a"
+        assert reloaded.records[a].to_dict()["jm_lock_owner"] == "session-a"
+
+    def test_expired_owner_cannot_release_reacquired_lock(self, store_path, a):
+        first = UTXOMetadataStore(path=store_path)
+        assert first.try_lock_outpoints([a], ttl=1, owner="session-a") is True
+        with first._exclusive_file_lock():
+            first.load()
+            first.records[a].lock_until = 1.0
+            first.save()
+
+        second = UTXOMetadataStore(path=store_path)
+        assert second.try_lock_outpoints([a], ttl=100, owner="session-b") is True
+        first.release_outpoints([a], owner="session-a")
+
+        reloaded = UTXOMetadataStore(path=store_path)
+        reloaded.load()
+        assert reloaded.get_locked_outpoints() == {a}
+        assert reloaded.records[a].lock_owner == "session-b"
+
+    def test_renew_is_all_or_nothing_for_valid_owner(self, store_path, a, b):
+        store = UTXOMetadataStore(path=store_path)
+        assert store.try_lock_outpoints([a, b], ttl=100, owner="session-a") is True
+        old_expiry = store.records[a].lock_until
+
+        assert store.renew_outpoints([a, b], owner="session-a", ttl=200) is True
+
+        reloaded = UTXOMetadataStore(path=store_path)
+        reloaded.load()
+        assert reloaded.records[a].lock_until == reloaded.records[b].lock_until
+        assert reloaded.records[a].lock_until is not None
+        assert old_expiry is not None
+        assert reloaded.records[a].lock_until > old_expiry
+
+    def test_legacy_ownerless_lock_is_not_adopted(self, store_path, a):
+        store_path.write_text(
+            json.dumps({"type": "output", "ref": a, "jm_lock_until": 4_000_000_000.0}) + "\n",
+            encoding="utf-8",
+        )
+        session = UTXOMetadataStore(path=store_path)
+
+        assert session.try_lock_outpoints([a], owner="session-a") is False
+        assert session.renew_outpoints([a], owner="session-a") is False
+        session.release_outpoints([a], owner="session-a")
+
+        reloaded = UTXOMetadataStore(path=store_path)
+        reloaded.load()
+        assert reloaded.get_locked_outpoints() == {a}
+        assert reloaded.records[a].lock_owner is None
+
+        # Legacy/manual callers can still release the ownerless record.
+        reloaded.release_outpoints([a])
+        final = UTXOMetadataStore(path=store_path)
+        final.load()
+        assert final.get_locked_outpoints() == set()
+
+    @pytest.mark.parametrize(
+        "ttl",
+        [float("nan"), float("inf"), float("-inf"), 0, -1, 31 * 24 * 60 * 60 + 1],
+    )
+    @pytest.mark.parametrize("operation", ["lock", "renew"])
+    def test_invalid_ttl_is_rejected_before_persistence(self, store_path, a, ttl, operation):
+        from jmwallet.wallet.utxo_metadata import MAX_COINJOIN_LOCK_TTL
+
+        store = UTXOMetadataStore(path=store_path)
+        if ttl == 31 * 24 * 60 * 60 + 1:
+            ttl = MAX_COINJOIN_LOCK_TTL + 1
+
+        with pytest.raises(ValueError, match="CoinJoin lock TTL"):
+            if operation == "lock":
+                store.try_lock_outpoints([a], ttl=ttl, owner="session-a")
+            else:
+                store.renew_outpoints([a], owner="session-a", ttl=ttl)
+
+        assert not store_path.exists()
+
+    def test_overflowing_ttl_is_rejected(self, store_path, a):
+        store = UTXOMetadataStore(path=store_path)
+
+        with pytest.raises(ValueError, match="CoinJoin lock TTL"):
+            store.try_lock_outpoints([a], ttl=10**10_000, owner="session-a")
+
+        assert not store_path.exists()
+
+    def test_maximum_ttl_is_accepted(self, store_path, a):
+        from jmwallet.wallet.utxo_metadata import MAX_COINJOIN_LOCK_TTL
+
+        store = UTXOMetadataStore(path=store_path)
+        assert store.try_lock_outpoints([a], ttl=MAX_COINJOIN_LOCK_TTL, owner="session-a")
