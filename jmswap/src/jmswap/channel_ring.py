@@ -47,8 +47,8 @@ async def initialize_channel_ring_backend(
         raise ValueError("unsupported channel ring network")
     if offer_type not in {"tr0absoffer", "tr0reloffer"}:
         raise ValueError("channel ring requires a tr0 offer type")
-    assert config.lnd_tls_cert_path is not None
-    assert config.lnd_macaroon_path is not None
+    if config.lnd_tls_cert_path is None or config.lnd_macaroon_path is None:
+        raise ValueError("channel ring backend requires LND TLS certificate and macaroon paths")
     grpc_target = config.lnd_grpc_url.removeprefix("https://")
     backend = LndBackend.from_paths(
         grpc_target,
