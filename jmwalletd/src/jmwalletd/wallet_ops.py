@@ -109,47 +109,35 @@ async def create_wallet(
     from jmwallet.wallet.service import WalletService
     from jmwalletd._backend import get_backend
 
-    seedphrase = generate_wallet_mnemonic(strength=128)
-
-    backend = await get_backend(
-        data_dir=data_dir,
-        mnemonic=seedphrase,
-        network=_get_network(),
-    )
-
-    # Record current block height as the wallet birthday.  Since this is a
-    # brand-new wallet, it cannot have received any funds before this point,
-    # so future rescans can safely start from this height.
-    creation_height: int | None = None
-    try:
-        creation_height = await backend.get_block_height()
-        logger.info(f"Recording wallet creation height: {creation_height}")
-    except Exception as exc:
-        logger.warning(f"Could not fetch block height for wallet birthday: {exc}")
-
-    wallet_settings = _get_wallet_settings()
-    ws = WalletService(
-        mnemonic=seedphrase,
-        backend=backend,
-        data_dir=data_dir,
-        network=_get_network(),
-        mixdepth_count=wallet_settings.mixdepth_count,
-        gap_limit=wallet_settings.gap_limit,
-        scan_range=wallet_settings.scan_range,
-        max_sats_freeze_reuse=wallet_settings.max_sats_freeze_reuse,
-        reconstruct_history=wallet_settings.reconstruct_history,
-    )
-
-    # Hold the process-independent lifecycle reservation through setup and
-    # initial sync. jmwalletd can expose only one active wallet, so different
-    # target filenames must not initialize competing backends concurrently.
     with _reserve_wallet_path(wallet_path):
-        _save_wallet_file(
-            wallet_path=wallet_path,
+        seedphrase = generate_wallet_mnemonic(strength=128)
+
+        backend = await get_backend(
+            data_dir=data_dir,
             mnemonic=seedphrase,
-            password=password,
-            wallet_type=wallet_type,
-            creation_height=creation_height,
+            network=_get_network(),
+        )
+
+        # Record current block height as the wallet birthday. Since this is a
+        # brand-new wallet, it cannot have received funds before this point.
+        creation_height: int | None = None
+        try:
+            creation_height = await backend.get_block_height()
+            logger.info(f"Recording wallet creation height: {creation_height}")
+        except Exception as exc:
+            logger.warning(f"Could not fetch block height for wallet birthday: {exc}")
+
+        wallet_settings = _get_wallet_settings()
+        ws = WalletService(
+            mnemonic=seedphrase,
+            backend=backend,
+            data_dir=data_dir,
+            network=_get_network(),
+            mixdepth_count=wallet_settings.mixdepth_count,
+            gap_limit=wallet_settings.gap_limit,
+            scan_range=wallet_settings.scan_range,
+            max_sats_freeze_reuse=wallet_settings.max_sats_freeze_reuse,
+            reconstruct_history=wallet_settings.reconstruct_history,
         )
 
         # Ensure the watch-only descriptor wallet is loaded in Bitcoin Core
@@ -159,6 +147,14 @@ async def create_wallet(
 
         # Initial sync to populate caches.
         await ws.sync()
+
+        _save_wallet_file(
+            wallet_path=wallet_path,
+            mnemonic=seedphrase,
+            password=password,
+            wallet_type=wallet_type,
+            creation_height=creation_height,
+        )
 
     logger.info("Created wallet: {}", wallet_path.name)
     return ws, seedphrase

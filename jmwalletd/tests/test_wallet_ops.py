@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -251,6 +252,8 @@ class TestCreateWallet:
         assert len(seedphrase.split()) == 12
         assert Mnemonic("english").check(seedphrase)
         assert wallet_path.exists()
+        stored_seedphrase, _ = _load_wallet_file(wallet_path=wallet_path, password="password")
+        assert stored_seedphrase == seedphrase
         assert wallet_path.stat().st_mode & 0o777 == 0o600
         assert wallet_path.parent.stat().st_mode & 0o777 == 0o700
 
@@ -365,6 +368,173 @@ class TestCreateWallet:
 
         mock_get_backend.assert_not_awaited()
         assert not wallet_path.exists()
+
+    @patch("jmwalletd.wallet_ops._get_network", return_value="mainnet")
+    @patch("jmwalletd._backend.get_backend", new_callable=AsyncMock)
+    @patch("jmwallet.wallet.service.WalletService")
+    async def test_descriptor_setup_failure_leaves_no_wallet_file(
+        self,
+        mock_ws_cls: MagicMock,
+        mock_get_backend: AsyncMock,
+        mock_get_network: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        wallet_path = tmp_path / "wallets" / "retryable.jmdat"
+        mock_ws = MagicMock()
+        mock_ws.setup_descriptor_wallet = AsyncMock(side_effect=RuntimeError("rpc unavailable"))
+        mock_ws.sync = AsyncMock()
+        mock_ws_cls.return_value = mock_ws
+        mock_get_backend.return_value = _make_descriptor_backend()
+
+        with pytest.raises(RuntimeError, match="rpc unavailable"):
+            await create_wallet(
+                wallet_path=wallet_path,
+                password="password",
+                wallet_type="sw",
+                data_dir=tmp_path,
+            )
+
+        assert not wallet_path.exists()
+        mock_ws.sync.assert_not_awaited()
+
+    @patch("jmwalletd.wallet_ops._get_network", return_value="mainnet")
+    @patch("jmwalletd._backend.get_backend", new_callable=AsyncMock)
+    @patch("jmwallet.wallet.service.WalletService")
+    async def test_sync_failure_leaves_no_wallet_file(
+        self,
+        mock_ws_cls: MagicMock,
+        mock_get_backend: AsyncMock,
+        mock_get_network: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        wallet_path = tmp_path / "wallets" / "retryable.jmdat"
+        mock_ws = MagicMock()
+        mock_ws.setup_descriptor_wallet = AsyncMock()
+        mock_ws.sync = AsyncMock(side_effect=RuntimeError("sync failed"))
+        mock_ws_cls.return_value = mock_ws
+        mock_get_backend.return_value = _make_descriptor_backend()
+
+        with pytest.raises(RuntimeError, match="sync failed"):
+            await create_wallet(
+                wallet_path=wallet_path,
+                password="password",
+                wallet_type="sw",
+                data_dir=tmp_path,
+            )
+
+        assert not wallet_path.exists()
+
+    @patch("jmwalletd.wallet_ops._get_network", return_value="mainnet")
+    @patch("jmwalletd._backend.get_backend", new_callable=AsyncMock)
+    @patch("jmwallet.wallet.service.WalletService")
+    async def test_same_name_can_be_retried_after_setup_failure(
+        self,
+        mock_ws_cls: MagicMock,
+        mock_get_backend: AsyncMock,
+        mock_get_network: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        wallet_path = tmp_path / "wallets" / "retryable.jmdat"
+        mock_ws = MagicMock()
+        mock_ws.setup_descriptor_wallet = AsyncMock(
+            side_effect=[RuntimeError("rpc unavailable"), None]
+        )
+        mock_ws.sync = AsyncMock()
+        mock_ws_cls.return_value = mock_ws
+        mock_get_backend.return_value = _make_descriptor_backend()
+
+        with pytest.raises(RuntimeError, match="rpc unavailable"):
+            await create_wallet(
+                wallet_path=wallet_path,
+                password="password",
+                wallet_type="sw",
+                data_dir=tmp_path,
+            )
+
+        wallet_service, seedphrase = await create_wallet(
+            wallet_path=wallet_path,
+            password="password",
+            wallet_type="sw",
+            data_dir=tmp_path,
+        )
+
+        assert wallet_service is mock_ws
+        assert wallet_path.exists()
+        loaded_mnemonic, _ = _load_wallet_file(wallet_path=wallet_path, password="password")
+        assert loaded_mnemonic == seedphrase
+        assert mock_ws.setup_descriptor_wallet.await_count == 2
+        mock_ws.sync.assert_awaited_once()
+
+    @patch("jmwalletd.wallet_ops._get_network", return_value="mainnet")
+    @patch("jmwalletd._backend.get_backend", new_callable=AsyncMock)
+    @patch("jmwallet.wallet.service.WalletService")
+    @patch("jmwallet.mnemonic.generate_wallet_mnemonic", return_value="abandon " * 11 + "about")
+    async def test_concurrent_same_name_loser_performs_no_initialization(
+        self,
+        mock_generate_mnemonic: MagicMock,
+        mock_ws_cls: MagicMock,
+        mock_get_backend: AsyncMock,
+        mock_get_network: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        wallet_path = tmp_path / "wallets" / "concurrent.jmdat"
+        backend_started = asyncio.Event()
+        release_backend = asyncio.Event()
+        backend = _make_descriptor_backend()
+
+        async def get_backend(**_kwargs: object) -> MagicMock:
+            backend_started.set()
+            await release_backend.wait()
+            return backend
+
+        mock_get_backend.side_effect = get_backend
+        mock_ws = MagicMock()
+        mock_ws.setup_descriptor_wallet = AsyncMock()
+        mock_ws.sync = AsyncMock()
+        mock_ws_cls.return_value = mock_ws
+
+        winner = asyncio.create_task(
+            create_wallet(
+                wallet_path=wallet_path,
+                password="password",
+                wallet_type="sw",
+                data_dir=tmp_path,
+            )
+        )
+        await backend_started.wait()
+
+        with pytest.raises(FileExistsError, match="operation already in progress"):
+            await create_wallet(
+                wallet_path=wallet_path,
+                password="password",
+                wallet_type="sw",
+                data_dir=tmp_path,
+            )
+
+        assert mock_generate_mnemonic.call_count == 1
+        assert mock_get_backend.await_count == 1
+        assert mock_ws_cls.call_count == 0
+
+        release_backend.set()
+        wallet_service, _ = await winner
+
+        assert wallet_service is mock_ws
+        assert wallet_path.exists()
+
+    async def test_existing_wallet_is_never_removed(self, tmp_path: Path) -> None:
+        wallet_path = tmp_path / "wallets" / "existing.jmdat"
+        wallet_path.parent.mkdir(parents=True)
+        wallet_path.write_bytes(b"wallet owned by another request")
+
+        with pytest.raises(FileExistsError, match="already exists"):
+            await create_wallet(
+                wallet_path=wallet_path,
+                password="password",
+                wallet_type="sw",
+                data_dir=tmp_path,
+            )
+
+        assert wallet_path.read_bytes() == b"wallet owned by another request"
 
 
 class TestGetNetwork:
