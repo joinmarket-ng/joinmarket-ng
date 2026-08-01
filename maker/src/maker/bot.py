@@ -1240,6 +1240,7 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
                     self._channel_ring_backend,
                     self.backend,
                     self._channel_ring_recovery_tasks,
+                    acceptor_timeout_seconds=self.config.channel_ring.phase_timeout_seconds,
                 )
                 report = self._channel_ring_store.load_all()
                 active = sum(record.active for record in report.records)
@@ -1395,6 +1396,9 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
             listener_task.cancel()
         for recovery_task in self._channel_ring_recovery_tasks.values():
             recovery_task.cancel()
+        for session in self.active_sessions.values():
+            if session.ring_participant is not None:
+                session.ring_participant.cancel_acceptor_task()
 
         if self.listen_tasks:
             _, pending_listeners = await asyncio.wait(set(self.listen_tasks), timeout=2.0)
@@ -1451,11 +1455,17 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         while self.running:
             assert self._channel_ring_store is not None
             assert self._channel_ring_backend is not None
+            active_identities = frozenset(
+                f"{session.taker_nick}:{session.commitment.hex()}"
+                for session in self.active_sessions.values()
+            )
             await reconcile_ring_records(
                 self._channel_ring_store,
                 self._channel_ring_backend,
                 self.backend,
                 self._channel_ring_recovery_tasks,
+                acceptor_timeout_seconds=self.config.channel_ring.phase_timeout_seconds,
+                active_session_identities=active_identities,
             )
             await asyncio.sleep(self.config.channel_ring.phase_timeout_seconds)
 
@@ -1490,6 +1500,8 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         """Remove timed-out sessions from active_sessions and clean up rate limiter."""
         for sid, session in list(self.active_sessions.items()):
             if session.is_timed_out():
+                if session.ring_participant is not None:
+                    session.ring_participant.cancel_acceptor_task()
                 await self._expire_timed_out_session(sid, session)
 
         await self._prune_pending_signed_rounds()

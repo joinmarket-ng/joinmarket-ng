@@ -176,6 +176,7 @@ class FakeLnd:
         self.resumed_incoming: list[object] = []
         self.pending_points: list[str] = []
         self.verified: VerifiedFunding | None = None
+        self.acceptor_timeouts: list[float] = []
 
     async def run_channel_acceptor(
         self,
@@ -185,7 +186,8 @@ class FakeLnd:
         timeout_seconds: float,
         ready: asyncio.Event | None = None,
     ) -> AcceptorObservation:
-        del bounds, timeout_seconds
+        del bounds
+        self.acceptor_timeouts.append(timeout_seconds)
         self.incoming = asyncio.get_running_loop().create_future()
         if ready is not None:
             ready.set()
@@ -911,6 +913,72 @@ async def test_restart_rehydrates_prepared_and_rebroadcasts_exact_final_tx(
     )
     assert harness.record().state is RingLifecycleState.CONFIRMED_OPEN
     assert harness.chain.broadcasts == [unsigned.unsigned_tx]
+
+
+async def test_reconcile_escalation_skips_live_sessions(harness: Harness) -> None:
+    await harness.through_open()
+    unsigned = await harness.unsigned()
+    await harness.machine.handle(unsigned)
+    await harness.machine.handle(harness.ready_set(unsigned.manifest))
+    await harness.machine.handle(
+        harness.signed(
+            RingSignPayload(
+                round_nonce="aa" * 32,
+                revision=0,
+                signer_key=harness.taker_key,
+                manifest_hash=manifest_hash(unsigned.manifest).hex(),
+                unsigned_tx_hash=unsigned.manifest.unsigned_tx_hash,
+            )
+        )
+    )
+    harness.machine.prepare_coinjoin_signing(unsigned.unsigned_tx)
+    live = harness.record()
+    assert live.state is RingLifecycleState.SIGNING
+
+    # A record belonging to a live in-process session is resumed but not escalated.
+    await reconcile_ring_records(
+        harness.store,
+        harness.initialized,
+        harness.chain,  # type: ignore[arg-type]
+        {},
+        active_session_identities=frozenset({live.taker_session_identity}),
+    )
+    assert harness.record().state is RingLifecycleState.SIGNING
+
+    # The same record with no live session is restart wreckage and escalates.
+    await reconcile_ring_records(
+        harness.store,
+        harness.initialized,
+        harness.chain,  # type: ignore[arg-type]
+        {},
+    )
+    assert harness.record().state is RingLifecycleState.RECOVERY_REQUIRED
+
+
+async def test_reconcile_rearms_acceptor_with_configured_timeout(harness: Harness) -> None:
+    await harness.machine.handle(harness.invite())
+    await harness.machine.handle(harness.plan())
+    assert harness.record().state is RingLifecycleState.ACCEPTOR_ARMED
+    task = harness.machine.acceptor_task
+    assert task is not None and not task.done()
+    harness.machine.cancel_acceptor_task()
+    await asyncio.gather(task, return_exceptions=True)
+    assert task.cancelled()
+
+    tasks: dict[str, asyncio.Task[object]] = {}
+    await reconcile_ring_records(
+        harness.store,
+        harness.initialized,
+        harness.chain,  # type: ignore[arg-type]
+        tasks,
+        acceptor_timeout_seconds=123.0,
+    )
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert harness.lnd.acceptor_timeouts[-1] == 123.0
+    for pending in tasks.values():
+        pending.cancel()
+    await asyncio.gather(*tasks.values(), return_exceptions=True)
 
 
 @pytest.mark.parametrize(

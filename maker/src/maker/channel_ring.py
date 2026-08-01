@@ -161,6 +161,11 @@ class MakerRingParticipant:
         self.record_key: RingRecordKey | None = None
         self.acceptor_task: asyncio.Task[object] | None = None
 
+    def cancel_acceptor_task(self) -> None:
+        """Stop the incoming-channel acceptor when its session ends without a ring."""
+        if self.acceptor_task is not None and not self.acceptor_task.done():
+            self.acceptor_task.cancel()
+
     @property
     def session_identity(self) -> str:
         return f"{self.session.taker_nick}:{self.session.commitment.hex()}"
@@ -1059,8 +1064,15 @@ async def reconcile_ring_records(
     initialized_backend: InitializedChannelRingBackend,
     chain_backend: BlockchainBackend,
     acceptor_tasks: dict[str, asyncio.Task[object]] | None = None,
+    *,
+    acceptor_timeout_seconds: float = 600.0,
+    active_session_identities: frozenset[str] = frozenset(),
 ) -> None:
-    """Inspect retained participant records without deleting unresolved evidence."""
+    """Inspect retained participant records without deleting unresolved evidence.
+
+    Records whose taker session is still live in this process are resumed but never
+    escalated: escalation targets restart-orphaned state, not in-flight rounds.
+    """
 
     report = store.load_all()
     if report.corruptions:
@@ -1097,7 +1109,7 @@ async def reconcile_ring_records(
                             initialized_backend.backend.run_channel_acceptor(
                                 incoming,
                                 AcceptorBounds(),
-                                timeout_seconds=600.0,
+                                timeout_seconds=acceptor_timeout_seconds,
                             )
                         )
                         if acceptor_tasks is not None:
@@ -1166,10 +1178,13 @@ async def reconcile_ring_records(
                     points.append(str(edge.funding_outpoint))
             for point in points:
                 await initialized_backend.backend.pending_channel_present(point)
-            if record.state is RingLifecycleState.PLANNED or (
-                record.state is RingLifecycleState.SIGNING
-                and record.local_input_signature_created
-                and not record.local_signatures
+            if record.taker_session_identity not in active_session_identities and (
+                record.state is RingLifecycleState.PLANNED
+                or (
+                    record.state is RingLifecycleState.SIGNING
+                    and record.local_input_signature_created
+                    and not record.local_signatures
+                )
             ):
                 store.transition(
                     record.key,
