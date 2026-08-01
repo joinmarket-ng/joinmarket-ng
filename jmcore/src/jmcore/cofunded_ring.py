@@ -900,31 +900,6 @@ class RingCancelPayload(RingPayload):
         return self
 
 
-class RingTerminalState(StrEnum):
-    BROADCAST = "broadcast"
-    OPEN = "open"
-    CONFLICTED = "conflicted"
-    RECONCILING = "reconciling"
-
-
-class RingStatusPayload(RingPayload):
-    message_type: ClassVar[str] = "ring_status"
-    type: Literal["ring_status"] = "ring_status"
-    state: RingTerminalState
-    transaction_id: Hex32
-    confirmations: int = Field(ge=0, le=MAX_REVISION)
-    conflict_code: str = Field(default="", max_length=64, pattern=r"^[a-z0-9_]*$")
-
-    @model_validator(mode="after")
-    def validate_transaction_id(self) -> RingStatusPayload:
-        _validate_hex(self.transaction_id, 32, "transaction_id")
-        if self.state == RingTerminalState.CONFLICTED and not self.conflict_code:
-            raise ValueError("conflicted status requires conflict_code")
-        if self.state != RingTerminalState.CONFLICTED and self.conflict_code:
-            raise ValueError("conflict_code is only valid for conflicted status")
-        return self
-
-
 RingPayloadType: TypeAlias = (
     RingInvitePayload
     | RingHelloPayload
@@ -939,7 +914,6 @@ RingPayloadType: TypeAlias = (
     | RingSignPayload
     | RingSignAckPayload
     | RingCancelPayload
-    | RingStatusPayload
 )
 
 _PAYLOAD_TYPES: dict[str, type[RingPayload]] = {
@@ -958,7 +932,6 @@ _PAYLOAD_TYPES: dict[str, type[RingPayload]] = {
         RingSignPayload,
         RingSignAckPayload,
         RingCancelPayload,
-        RingStatusPayload,
     )
 }
 

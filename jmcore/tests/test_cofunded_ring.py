@@ -264,6 +264,9 @@ def test_payload_signature_rejects_mutation_and_wrong_key() -> None:
     "message,match",
     [
         ("!ring unknown e30", "unknown ring message type"),
+        # ring_status is not part of this revision: participants reconcile chain
+        # state from their own backend rather than trusting a peer's report.
+        ("!ring ring_status e30", "unknown ring message type"),
         ("!ring ring_invite e30=", "unpadded base64url"),
         ("!ring ring_invite", "invalid ring envelope"),
         ("!ring ring_invite !!!", "unpadded base64url"),
