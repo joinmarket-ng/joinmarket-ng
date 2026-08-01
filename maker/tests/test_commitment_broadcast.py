@@ -64,9 +64,26 @@ class TestBroadcastCommitment:
             patch("maker.protocol_handlers.add_commitment") as mock_add,
             patch.object(maker_bot, "_broadcast_commitment_ephemeral", new=AsyncMock()),
         ):
-            await maker_bot._broadcast_commitment(COMMITMENT)
+            persisted = await maker_bot._broadcast_commitment(COMMITMENT)
 
+        assert persisted is True
         mock_add.assert_called_once_with(COMMITMENT)
+
+    async def test_persistence_failure_returns_false_without_gossip(
+        self, maker_bot: MakerBot
+    ) -> None:
+        mock_ephemeral = AsyncMock()
+        with (
+            patch(
+                "maker.protocol_handlers.add_commitment",
+                side_effect=OSError("disk full"),
+            ),
+            patch.object(maker_bot, "_broadcast_commitment_ephemeral", new=mock_ephemeral),
+        ):
+            persisted = await maker_bot._broadcast_commitment(COMMITMENT)
+
+        assert persisted is False
+        mock_ephemeral.assert_not_called()
 
     async def test_schedules_ephemeral_broadcast(self, maker_bot: MakerBot) -> None:
         with (
@@ -75,12 +92,28 @@ class TestBroadcastCommitment:
                 maker_bot, "_broadcast_commitment_ephemeral", new=AsyncMock()
             ) as mock_ephemeral,
         ):
-            await maker_bot._broadcast_commitment(COMMITMENT)
+            persisted = await maker_bot._broadcast_commitment(COMMITMENT)
 
         # Let the create_task fire
         await asyncio.sleep(0)
 
+        assert persisted is True
         mock_ephemeral.assert_called_once_with(COMMITMENT, is_relay=False)
+
+    async def test_gossip_scheduling_failure_preserves_persistence_success(
+        self, maker_bot: MakerBot
+    ) -> None:
+        def fail_spawn(coro) -> None:
+            coro.close()
+            raise RuntimeError("event loop unavailable")
+
+        with (
+            patch("maker.protocol_handlers.add_commitment"),
+            patch("maker.protocol_handlers.spawn_task", side_effect=fail_spawn),
+        ):
+            persisted = await maker_bot._broadcast_commitment(COMMITMENT)
+
+        assert persisted is True
 
     async def test_does_not_use_existing_directory_connections(
         self, maker_bot: MakerBot, mock_directory_client: MagicMock

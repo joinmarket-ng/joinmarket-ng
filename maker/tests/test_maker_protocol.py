@@ -597,7 +597,9 @@ async def test_select_our_utxos_forwards_exclude_to_wallet():
     assert mock_wallet.select_utxos_with_merge.call_args.args[1] == (
         1_000_000 + 1000 + DUST_THRESHOLD + 1 - 300
     )
-    mock_wallet.reserve_coinjoin_inputs.assert_called_once_with({(("ab" * 32), 1)}, ttl=3600)
+    mock_wallet.reserve_coinjoin_inputs.assert_called_once_with(
+        {("ab" * 32, 1)}, ttl=session.input_lock_ttl_sec, owner=session.input_lock_owner
+    )
 
 
 @pytest.mark.asyncio
@@ -817,7 +819,9 @@ async def test_select_our_utxos_releases_lock_after_address_failure():
 
     assert utxos == {}
     assert mixdepth == -1
-    mock_wallet.release_coinjoin_inputs.assert_called_once_with({(selected.txid, selected.vout)})
+    mock_wallet.release_coinjoin_inputs.assert_called_once_with(
+        {(selected.txid, selected.vout)}, owner=session.input_lock_owner
+    )
 
 
 @pytest.mark.asyncio
@@ -831,7 +835,7 @@ async def test_handle_auth_allows_hp2_seen_after_fill(tmp_path, monkeypatch):
     from jmwallet.backends.base import UTXO
     from jmwallet.wallet.models import UTXOInfo
 
-    from maker.coinjoin import CoinJoinSession
+    from maker.coinjoin import CoinJoinSession, CoinJoinState
 
     mock_wallet = MagicMock()
     mock_backend = MagicMock()
@@ -922,13 +926,19 @@ async def test_handle_auth_allows_hp2_seen_after_fill(tmp_path, monkeypatch):
 
     assert success is True
     assert response["utxo_list"]
+    assert session.state == CoinJoinState.AUTH_RECEIVED
     mock_wallet.release_coinjoin_inputs.assert_not_called()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("auth_success", [True, False])
-async def test_on_auth_releases_commitment_reservation(auth_success):
-    """Auth completion must not leave an in-flight commitment reservation."""
+@pytest.mark.parametrize(
+    ("auth_success", "persistence_success", "session_replaced"),
+    [(True, True, False), (True, False, False), (False, False, False), (False, False, True)],
+)
+async def test_on_auth_releases_reservation_only_after_persistence(
+    auth_success, persistence_success, session_replaced
+):
+    """Authenticated commitments stay reserved until local persistence succeeds."""
     from unittest.mock import AsyncMock, MagicMock, patch
 
     from maker.coinjoin import CoinJoinState
@@ -957,18 +967,23 @@ async def test_on_auth_releases_commitment_reservation(auth_success):
                 "btc_sig": "signature",
             }
             if auth_success
-            else {"error": "invalid PoDLE", "error_code": "PoDLE verification failed"},
+            else {"error": "Failed to select UTXOs", "error_code": "UTXO selection failed"},
         )
     )
     session = MakerSession(inner)
+    replacement = MagicMock()
 
     bot = MagicMock()
-    bot.active_sessions = {taker_nick: session}
+    bot.active_sessions = {taker_nick: replacement if session_replaced else session}
     bot.directory_clients = {}
     bot.config.network.value = "regtest"
     bot.wallet.wallet_fingerprint = "fingerprint"
-    bot._broadcast_commitment = AsyncMock()
-    session.send_response = AsyncMock()
+    bot._reserved_commitments = {commitment}
+    bot._broadcast_commitment = AsyncMock(return_value=persistence_success)
+    bot._release_commitment_reservation = MagicMock(
+        side_effect=lambda value: bot._reserved_commitments.discard(value)
+    )
+    session.send_response = AsyncMock(return_value=True)
     notifier = MagicMock()
 
     with (
@@ -980,15 +995,251 @@ async def test_on_auth_releases_commitment_reservation(auth_success):
     ):
         await session.on_auth(bot, "auth ciphertext", "dir:test")
 
-    bot._release_commitment_reservation.assert_called_once_with(commitment)
     if auth_success:
         bot._broadcast_commitment.assert_awaited_once_with(commitment)
         assert bot.active_sessions[taker_nick] is session
+        assert session.state == CoinJoinState.IOAUTH_SENT
         inner.wallet.release_coinjoin_inputs.assert_not_called()
+        if persistence_success:
+            bot._release_commitment_reservation.assert_called_once_with(commitment)
+            assert commitment not in bot._reserved_commitments
+        else:
+            bot._release_commitment_reservation.assert_not_called()
+            assert commitment in bot._reserved_commitments
     else:
         bot._broadcast_commitment.assert_not_awaited()
-        assert taker_nick not in bot.active_sessions
-        inner.wallet.release_coinjoin_inputs.assert_called_once_with(set())
+        if session_replaced:
+            bot._release_commitment_reservation.assert_not_called()
+            assert commitment in bot._reserved_commitments
+            assert bot.active_sessions[taker_nick] is replacement
+            inner.wallet.release_coinjoin_inputs.assert_not_called()
+            replacement.release_input_locks.assert_not_called()
+        else:
+            bot._release_commitment_reservation.assert_called_once_with(commitment)
+            assert commitment not in bot._reserved_commitments
+            assert taker_nick not in bot.active_sessions
+            inner.wallet.release_coinjoin_inputs.assert_called_once_with(
+                set(), owner=inner.input_lock_owner
+            )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tx_success", [True, False])
+async def test_stale_on_tx_terminal_callback_keeps_replacement(tx_success):
+    """A stale terminal tx callback cannot remove a replacement or release its input lock."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from maker.coinjoin import CoinJoinState
+    from maker.maker_session import MakerSession
+
+    taker_nick = "J5ReplacedTxTaker"
+    outpoint = ("ca" * 32, 1)
+    wallet = MagicMock()
+    inner = MagicMock()
+    inner.taker_nick = taker_nick
+    inner.state = CoinJoinState.IOAUTH_SENT
+    inner.crypto.is_encrypted = True
+    inner.crypto.decrypt.return_value = base64.b64encode(b"transaction").decode()
+    inner.our_utxos = {outpoint: MagicMock(address="bcrt1qmakerinput")}
+    inner.amount = 500_000
+    inner.offer.calculate_fee.return_value = 500
+    inner.offer.txfee = 100
+    inner.handle_tx = AsyncMock(
+        return_value=(
+            tx_success,
+            {"signatures": ["signature"], "txid": "ab" * 32}
+            if tx_success
+            else {"error": "invalid transaction"},
+        )
+    )
+    inner.wallet = wallet
+    session = MakerSession(inner)
+    session.send_response = AsyncMock()
+    replacement = MagicMock()
+    replacement.our_utxos = {outpoint: MagicMock()}
+
+    bot = MagicMock()
+    bot.active_sessions = {taker_nick: replacement}
+    notifier = MagicMock()
+
+    with (
+        patch("maker.maker_session.update_awaiting_transaction_signed", return_value=True),
+        patch("maker.maker_session.get_notifier", return_value=notifier),
+        patch("maker.maker_session.spawn_task"),
+    ):
+        await session.on_tx(bot, "tx ciphertext", "dir:test")
+
+    assert bot.active_sessions[taker_nick] is replacement
+    wallet.release_coinjoin_inputs.assert_not_called()
+    replacement.release_input_locks.assert_not_called()
+
+
+def test_maker_session_uses_monotonic_deadline_without_running_loop():
+    from unittest.mock import MagicMock, patch
+
+    from maker.maker_session import MakerSession
+
+    inner = MagicMock()
+    inner.session_timeout_sec = 30
+
+    with patch("maker.maker_session.time.monotonic", return_value=100.0):
+        session = MakerSession(inner)
+
+    assert session.deadline == 130.0
+    with patch("maker.maker_session.time.monotonic", return_value=129.0):
+        assert session.is_timed_out() is False
+        assert session.remaining_timeout() == 1.0
+    with patch("maker.maker_session.time.monotonic", return_value=130.0):
+        assert session.is_timed_out() is True
+        assert session.remaining_timeout() == 0.0
+
+
+@pytest.mark.asyncio
+async def test_signing_failure_crosses_lock_retention_boundary():
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from maker.coinjoin import CoinJoinSession, CoinJoinState
+
+    wallet = MagicMock()
+    wallet.network = "regtest"
+    backend = MagicMock()
+    backend.requires_neutrino_metadata.return_value = False
+    session = CoinJoinSession(
+        taker_nick="J5PartialSigningTaker",
+        offer=MagicMock(),
+        wallet=wallet,
+        backend=backend,
+    )
+    session.state = CoinJoinState.IOAUTH_SENT
+
+    with (
+        patch("maker.coinjoin.verify_unsigned_transaction", return_value=(True, "")),
+        patch.object(session, "_sign_transaction", new=AsyncMock(return_value=[])),
+    ):
+        success, _ = await session.handle_tx("00")
+
+    assert success is False
+    assert session.state == CoinJoinState.SIG_SENT
+
+
+@pytest.mark.asyncio
+async def test_valid_input_owner_is_renewed_before_signing(tmp_path):
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from jmwallet.wallet.service import WalletService
+    from jmwallet.wallet.utxo_metadata import UTXOMetadataStore
+
+    from maker.coinjoin import CoinJoinSession, CoinJoinState
+
+    wallet = WalletService.__new__(WalletService)
+    wallet.network = "regtest"
+    wallet.metadata_store = UTXOMetadataStore(path=tmp_path / "metadata.jsonl")
+    outpoint = ("ab" * 32, 0)
+    session = CoinJoinSession(
+        taker_nick="J5OwnedInputTaker",
+        offer=MagicMock(),
+        wallet=wallet,
+        backend=MagicMock(),
+    )
+    session.state = CoinJoinState.IOAUTH_SENT
+    session.our_utxos = {outpoint: MagicMock()}
+    assert wallet.reserve_coinjoin_inputs({outpoint}, ttl=10, owner=session.input_lock_owner)
+    old_expiry = wallet.metadata_store.records[f"{outpoint[0]}:{outpoint[1]}"].lock_until
+    sign = AsyncMock(return_value=["signature"])
+
+    with (
+        patch("maker.coinjoin.verify_unsigned_transaction", return_value=(True, "")),
+        patch.object(session, "_sign_transaction", new=sign),
+        patch("jmcore.bitcoin.get_txid", return_value="cd" * 32),
+    ):
+        success, _ = await session.handle_tx("00")
+
+    assert success is True
+    sign.assert_awaited_once_with("00")
+    wallet.metadata_store.load()
+    record = wallet.metadata_store.records[f"{outpoint[0]}:{outpoint[1]}"]
+    assert record.lock_owner == session.input_lock_owner
+    assert record.lock_until is not None
+    assert old_expiry is not None
+    assert record.lock_until > old_expiry
+
+
+@pytest.mark.asyncio
+async def test_maker_does_not_sign_after_input_ownership_loss(tmp_path):
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from jmwallet.wallet.service import WalletService
+    from jmwallet.wallet.utxo_metadata import UTXOMetadataStore
+
+    from maker.coinjoin import CoinJoinSession, CoinJoinState
+
+    wallet = WalletService.__new__(WalletService)
+    wallet.network = "regtest"
+    wallet.metadata_store = UTXOMetadataStore(path=tmp_path / "metadata.jsonl")
+    outpoint = ("ab" * 32, 0)
+    session = CoinJoinSession(
+        taker_nick="J5StaleInputTaker",
+        offer=MagicMock(),
+        wallet=wallet,
+        backend=MagicMock(),
+    )
+    session.state = CoinJoinState.IOAUTH_SENT
+    session.our_utxos = {outpoint: MagicMock()}
+    assert wallet.reserve_coinjoin_inputs({outpoint}, ttl=1, owner=session.input_lock_owner)
+    metadata_ref = f"{outpoint[0]}:{outpoint[1]}"
+    with wallet.metadata_store._exclusive_file_lock():
+        wallet.metadata_store.load()
+        wallet.metadata_store.records[metadata_ref].lock_until = 1.0
+        wallet.metadata_store.save()
+    assert wallet.reserve_coinjoin_inputs({outpoint}, owner="replacement-session")
+    sign = AsyncMock(return_value=["signature"])
+
+    with (
+        patch("maker.coinjoin.verify_unsigned_transaction", return_value=(True, "")),
+        patch.object(session, "_sign_transaction", new=sign),
+    ):
+        success, response = await session.handle_tx("00")
+
+    assert success is False
+    assert "ownership was lost" in response["error"]
+    assert session.state == CoinJoinState.FAILED
+    sign.assert_not_awaited()
+    wallet.metadata_store.load()
+    record = wallet.metadata_store.records[f"{outpoint[0]}:{outpoint[1]}"]
+    assert record.lock_owner == "replacement-session"
+
+
+@pytest.mark.asyncio
+async def test_on_tx_failure_after_signing_retains_input_locks():
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from maker.coinjoin import CoinJoinState
+    from maker.maker_session import MakerSession
+
+    taker_nick = "J5PartialSigningTaker"
+    inner = MagicMock()
+    inner.taker_nick = taker_nick
+    inner.state = CoinJoinState.IOAUTH_SENT
+    inner.crypto.is_encrypted = True
+    inner.crypto.decrypt.return_value = base64.b64encode(b"transaction").decode()
+
+    async def fail_after_signing(tx_hex, **kwargs):
+        inner.state = CoinJoinState.SIG_SENT
+        return False, {"error": "later input failed"}
+
+    inner.handle_tx = AsyncMock(side_effect=fail_after_signing)
+    session = MakerSession(inner)
+    bot = MagicMock()
+    bot.active_sessions = {taker_nick: session}
+
+    with (
+        patch("maker.maker_session.get_notifier", return_value=MagicMock()),
+        patch("maker.maker_session.spawn_task"),
+    ):
+        await session.on_tx(bot, "tx ciphertext", "dir:test")
+
+    assert taker_nick not in bot.active_sessions
+    inner.wallet.release_coinjoin_inputs.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -21,6 +21,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import time
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from jmcore.notifications import get_notifier
@@ -44,6 +47,18 @@ if TYPE_CHECKING:
     from maker.protocols import MakerBotProtocol
 
 
+@dataclass(frozen=True, slots=True)
+class PendingSignedRound:
+    """Minimal post-sign state required to authenticate a later ``!push``."""
+
+    taker_nick: str
+    txid: str
+    input_lock_owner: str
+    outpoints: frozenset[tuple[str, int]]
+    expires_at: float
+    lock_ttl_sec: float
+
+
 class MakerSession:
     """One CoinJoin session with a single taker.
 
@@ -56,6 +71,15 @@ class MakerSession:
     def __init__(self, inner: CoinJoinSession) -> None:
         self.inner = inner
         self.lock = asyncio.Lock()
+        # This is deliberately independent of an event loop so sessions remain
+        # safe to construct in synchronous tests and embedding contexts.
+        self.deadline = time.monotonic() + inner.session_timeout_sec
+        self.inner.deadline = self.deadline
+        self.handler_task: asyncio.Task[None] | None = None
+        self.expired = False
+        self.detached = False
+        self.cleanup_started = False
+        self.detached_event = asyncio.Event()
 
     # -- Identity -----------------------------------------------------------
 
@@ -86,6 +110,28 @@ class MakerSession:
         return self.inner.commitment
 
     @property
+    def commitment_authenticated(self) -> bool:
+        return self.inner.commitment_authenticated
+
+    @property
+    def signing_boundary_crossed(self) -> bool:
+        return self.inner.signing_boundary_crossed is True or self.inner.state in {
+            CoinJoinState.SIG_SENT,
+            CoinJoinState.COMPLETE,
+        }
+
+    @property
+    def ioauth_boundary_crossed(self) -> bool:
+        """Whether sending maker inputs and addresses may have disclosed them."""
+        return self.inner.state in {
+            CoinJoinState.IOAUTH_SEND_STARTED,
+            CoinJoinState.IOAUTH_SENT,
+            CoinJoinState.TX_RECEIVED,
+            CoinJoinState.SIG_SENT,
+            CoinJoinState.COMPLETE,
+        }
+
+    @property
     def amount(self) -> int:
         return self.inner.amount
 
@@ -102,9 +148,25 @@ class MakerSession:
         the broadcast propagates. Safe to call when nothing was reserved.
         """
         try:
-            self.inner.wallet.release_coinjoin_inputs(set(self.our_utxos.keys()))
+            self.inner.wallet.release_coinjoin_inputs(
+                set(self.our_utxos.keys()), owner=self.inner.input_lock_owner
+            )
         except Exception as e:  # pragma: no cover - best-effort cleanup
             logger.debug(f"Failed to release input locks for {self.taker_nick}: {e}")
+
+    def retain_input_locks(self) -> None:
+        """Best-effort renewal once maker signatures may exist."""
+        try:
+            renewed = self.inner.wallet.renew_coinjoin_inputs(
+                set(self.our_utxos),
+                owner=self.inner.input_lock_owner,
+                ttl=self.inner.input_lock_ttl_sec,
+            )
+        except Exception as exc:  # pragma: no cover - best-effort retention
+            logger.error(f"Failed to retain signed input locks for {self.taker_nick}: {exc}")
+            return
+        if not renewed:
+            logger.error(f"Signed input lock ownership was lost for {self.taker_nick}")
 
     @property
     def cj_address(self) -> str:
@@ -129,7 +191,34 @@ class MakerSession:
     # -- Lifecycle helpers -------------------------------------------------
 
     def is_timed_out(self) -> bool:
-        return self.inner.is_timed_out()
+        return time.monotonic() >= self.deadline
+
+    def remaining_timeout(self) -> float:
+        """Return the time left before the session's absolute deadline."""
+        return max(0.0, self.deadline - time.monotonic())
+
+    def is_active(self, bot: MakerBotProtocol) -> bool:
+        """Return whether this exact session may still progress."""
+        return not self.expired and bot.active_sessions.get(self.taker_nick) is self
+
+    async def run_handler(
+        self,
+        bot: MakerBotProtocol,
+        handler: Callable[[], Awaitable[None]],
+    ) -> None:
+        """Serialize and track one auth/tx handler for deadline cancellation."""
+        async with self.lock:
+            if not self.is_active(bot) or self.is_timed_out():
+                return
+            task = asyncio.current_task()
+            if task is None:  # pragma: no cover - asyncio always supplies one here
+                return
+            self.handler_task = task
+            try:
+                await handler()
+            finally:
+                if self.handler_task is task:
+                    self.handler_task = None
 
     def validate_channel(self, source: str) -> bool:
         return self.inner.validate_channel(source)
@@ -147,13 +236,20 @@ class MakerSession:
         revelation: dict[str, Any],
         kphex: str,
         exclude_utxos: set[tuple[str, int]] | None = None,
+        active_check: Callable[[], bool] | None = None,
     ) -> tuple[bool, dict[str, Any]]:
         return await self.inner.handle_auth(
-            commitment, revelation, kphex, exclude_utxos=exclude_utxos
+            commitment,
+            revelation,
+            kphex,
+            exclude_utxos=exclude_utxos,
+            active_check=active_check,
         )
 
-    async def handle_tx(self, tx_hex: str) -> tuple[bool, dict[str, Any]]:
-        return await self.inner.handle_tx(tx_hex)
+    async def handle_tx(
+        self, tx_hex: str, active_check: Callable[[], bool] | None = None
+    ) -> tuple[bool, dict[str, Any]]:
+        return await self.inner.handle_tx(tx_hex, active_check=active_check)
 
     # -- Per-taker handler bodies (moved from ProtocolHandlersMixin) -------
 
@@ -167,6 +263,8 @@ class MakerSession:
         """
         taker_nick = self.taker_nick
         try:
+            if not self.is_active(bot):
+                return
             # Record the channel (always accepted; takers may switch
             # direct<->directory mid-session, see validate_channel).
             self.validate_channel(source)
@@ -242,7 +340,14 @@ class MakerSession:
             # WalletService.reserve_coinjoin_inputs / CoinJoinSession.
             # _select_our_utxos), so the same input is never signed into two
             # concurrent CoinJoins.
-            success, response = await self.handle_auth(commitment, revelation, kphex)
+            success, response = await self.handle_auth(
+                commitment,
+                revelation,
+                kphex,
+                active_check=lambda: self.is_active(bot),
+            )
+            if not self.is_active(bot):
+                return
 
             if success:
                 # CRITICAL: Record addresses to history BEFORE revealing them to taker
@@ -273,11 +378,21 @@ class MakerSession:
                 except Exception as e:
                     logger.warning(f"Failed to record revealed addresses in history: {e}")
 
-                await self.send_response(bot, "ioauth", response)
+                if not self.is_active(bot):
+                    return
+                sent = await self.send_response(bot, "ioauth", response)
+                if not self.is_active(bot):
+                    return
+                if not sent:
+                    return
+                self.state = CoinJoinState.IOAUTH_SENT
 
                 # Broadcast the commitment via hp2 so other makers can blacklist it.
-                await bot._broadcast_commitment(commitment)
-                bot._release_commitment_reservation(commitment)
+                persisted = await bot._broadcast_commitment(commitment)
+                if not self.is_active(bot):
+                    return
+                if persisted:
+                    bot._release_commitment_reservation(commitment)
             else:
                 error_msg = response.get("error", "unknown error")
                 error_code = response.get("error_code", "")
@@ -286,15 +401,18 @@ class MakerSession:
                 try:
                     for client in bot.directory_clients.values():
                         await client.send_private_message(taker_nick, "error", error_msg)
+                        if not self.is_active(bot):
+                            return
                     logger.debug(f"Sent !error to {taker_nick}: {error_msg}")
                 except Exception as e:
                     logger.warning(f"Failed to send !error to {taker_nick}: {e}")
 
                 # Release protocol resources before best-effort notification
                 # work so notifier failures cannot extend the reservation.
-                self.release_input_locks()
-                bot._release_commitment_reservation(commitment)
-                bot.active_sessions.pop(taker_nick, None)
+                if bot.active_sessions.get(taker_nick) is self:
+                    bot.active_sessions.pop(taker_nick)
+                    self.release_input_locks()
+                    bot._release_commitment_reservation(commitment)
 
                 spawn_task(
                     get_notifier().notify_rejection(
@@ -315,6 +433,8 @@ class MakerSession:
         """
         taker_nick = self.taker_nick
         try:
+            if not self.is_active(bot):
+                return
             # Record the channel (always accepted; takers may switch
             # direct<->directory mid-session, see validate_channel).
             self.validate_channel(source)
@@ -354,19 +474,35 @@ class MakerSession:
                 logger.error(f"Failed to decode transaction: {e}")
                 return
 
-            success, response = await self.handle_tx(tx_hex)
+            success, response = await self.handle_tx(
+                tx_hex, active_check=lambda: self.is_active(bot)
+            )
+            if not self.is_active(bot):
+                return
 
             if success:
                 signatures = response.get("signatures", [])
+                txid = response.get("txid", "")
+                if not await bot._register_pending_signed_round(self, txid):
+                    logger.error(
+                        f"Cannot retain signed round for {taker_nick}; withholding signatures"
+                    )
+                    if bot.active_sessions.get(taker_nick) is self:
+                        bot.active_sessions.pop(taker_nick)
+                    self.retain_input_locks()
+                    return
                 for sig in signatures:
+                    if not self.is_active(bot):
+                        return
                     await self.send_response(bot, "sig", {"signature": sig})
+                    if not self.is_active(bot):
+                        return
                 logger.info(f"CoinJoin with {taker_nick} COMPLETE (sent {len(signatures)} sigs)")
 
                 fee_received = self.offer.calculate_fee(self.amount)
                 txfee_contribution = self.offer.txfee
 
                 try:
-                    txid = response.get("txid", "")
                     updated = update_awaiting_transaction_signed(
                         destination_address=self.cj_address,
                         txid=txid,
@@ -411,7 +547,9 @@ class MakerSession:
                     )
                 )
 
-                bot.active_sessions.pop(taker_nick, None)
+                if bot.active_sessions.get(taker_nick) is self:
+                    self.state = CoinJoinState.COMPLETE
+                    bot.active_sessions.pop(taker_nick)
 
                 # Schedule wallet re-sync in background to avoid blocking !push handling
                 spawn_task(bot._deferred_wallet_resync())
@@ -422,16 +560,22 @@ class MakerSession:
                         taker_nick, "TX verification failed", response.get("error", "")
                     )
                 )
-                # CoinJoin failed: free our inputs now (don't wait for the TTL).
-                self.release_input_locks()
-                bot.active_sessions.pop(taker_nick, None)
+                # Before signing starts, a failed transaction cannot conflict
+                # with a later use of these inputs. Once signing starts, retain
+                # the persisted locks through their TTL.
+                if bot.active_sessions.get(taker_nick) is self:
+                    bot.active_sessions.pop(taker_nick)
+                    if self.signing_boundary_crossed:
+                        self.retain_input_locks()
+                    else:
+                        self.release_input_locks()
 
         except Exception as e:
             logger.error(f"Failed to handle !tx: {e}")
 
     async def send_response(
         self, bot: MakerBotProtocol, command: str, data: dict[str, Any]
-    ) -> None:
+    ) -> bool:
         """Send a signed response (`!ioauth` or `!sig`) encrypted via this
         session's NaCl box, fanned out to all of the bot's directory clients.
 
@@ -440,6 +584,8 @@ class MakerSession:
         an active session's `crypto` (the response IS the public key).
         """
         try:
+            if not self.is_active(bot):
+                return False
             if command == "ioauth":
                 plaintext = " ".join(
                     [
@@ -459,10 +605,30 @@ class MakerSession:
             else:
                 msg_content = json.dumps(data)
 
-            for client in bot.directory_clients.values():
+            clients = list(bot.directory_clients.values())
+            if not clients:
+                logger.warning(f"No directory client available to send {command}")
+                return False
+
+            for index, client in enumerate(clients):
+                if not self.is_active(bot):
+                    return False
+                if command == "ioauth" and index == 0:
+                    if self.state != CoinJoinState.AUTH_RECEIVED:
+                        logger.error(f"Cannot send !ioauth from state {self.state}")
+                        return False
+                    # From this point a transport error or cancellation cannot
+                    # prove the encrypted maker details were not disclosed.
+                    self.state = CoinJoinState.IOAUTH_SEND_STARTED
                 await client.send_private_message(self.taker_nick, command, msg_content)
+                if not self.is_active(bot):
+                    return False
 
             logger.debug(f"Sent signed {command} to {self.taker_nick}")
+            if command == "ioauth":
+                self.state = CoinJoinState.IOAUTH_SENT
+            return True
 
         except Exception as e:
             logger.error(f"Failed to send response: {e}")
+            return False

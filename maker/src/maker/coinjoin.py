@@ -12,7 +12,9 @@ Manages the maker side of the CoinJoin protocol:
 
 from __future__ import annotations
 
+import secrets
 import time
+from collections.abc import Callable
 from enum import StrEnum
 from typing import Any
 
@@ -43,6 +45,7 @@ class CoinJoinState(StrEnum):
     FILL_RECEIVED = "fill_received"
     PUBKEY_SENT = "pubkey_sent"
     AUTH_RECEIVED = "auth_received"
+    IOAUTH_SEND_STARTED = "ioauth_send_started"
     IOAUTH_SENT = "ioauth_sent"
     TX_RECEIVED = "tx_received"
     SIG_SENT = "sig_sent"
@@ -88,10 +91,17 @@ class CoinJoinSession:
         self.change_address = ""
         self.mixdepth = 0
         self.commitment = b""
+        self.commitment_authenticated = False
         self.taker_nacl_pk = ""  # Taker's NaCl pubkey (hex) for btc_sig
-        self.created_at = time.time()
+        self.created_at = time.monotonic()
         self.session_timeout_sec = session_timeout_sec
-        self.input_lock_ttl_sec = max(input_lock_ttl_sec, float(session_timeout_sec))
+        self.deadline = self.created_at + session_timeout_sec
+        # Reservations span the remaining protocol and then a pending signed
+        # transaction window, so cover both sequential intervals.
+        self.pending_broadcast_ttl_sec = float(input_lock_ttl_sec)
+        self.input_lock_ttl_sec = self.pending_broadcast_ttl_sec + float(session_timeout_sec)
+        self.input_lock_owner = secrets.token_hex(32)
+        self.signing_boundary_crossed = False
         self.comm_channel = ""  # Track communication channel ("direct" or "dir:<node_id>")
 
         # Feature detection for extended UTXO format (neutrino_compat)
@@ -104,7 +114,7 @@ class CoinJoinSession:
 
     def is_timed_out(self) -> bool:
         """Check if the session has exceeded the timeout."""
-        return time.time() - self.created_at > self.session_timeout_sec
+        return time.monotonic() >= self.deadline
 
     def _get_channel_type(self, source: str) -> str:
         """Extract channel type from source string.
@@ -246,6 +256,7 @@ class CoinJoinSession:
         revelation: dict[str, Any],
         kphex: str,
         exclude_utxos: set[tuple[str, int]] | None = None,
+        active_check: Callable[[], bool] | None = None,
     ) -> tuple[bool, dict[str, Any]]:
         """
         Handle !auth message from taker.
@@ -267,6 +278,8 @@ class CoinJoinSession:
             if self.is_timed_out():
                 self.state = CoinJoinState.FAILED
                 return False, {"error": f"Session timed out after {self.session_timeout_sec}s"}
+            if active_check is not None and not active_check():
+                return False, {"error": "Session expired during authentication"}
 
             if self.state != CoinJoinState.PUBKEY_SENT:
                 return False, {"error": "Session not in correct state for !auth"}
@@ -356,6 +369,8 @@ class CoinJoinSession:
                     scriptpubkey=taker_scriptpubkey,
                     blockheight=taker_blockheight,
                 )
+                if active_check is not None and not active_check():
+                    return False, {"error": "Session expired during UTXO verification"}
                 if not result.valid:
                     return False, {"error": f"Taker's UTXO verification failed: {result.error}"}
 
@@ -368,6 +383,8 @@ class CoinJoinSession:
             else:
                 # Full node: direct UTXO lookup
                 taker_utxo = await self.backend.get_utxo(utxo_txid, utxo_vout)
+                if active_check is not None and not active_check():
+                    return False, {"error": "Session expired during UTXO verification"}
 
                 if not taker_utxo:
                     return False, {"error": "Taker's UTXO not found on blockchain"}
@@ -423,10 +440,15 @@ class CoinJoinSession:
                 f"Taker UTXO details: {utxo_txid}:{utxo_vout}, "
                 f"value={taker_utxo_value} sats, confirmations={taker_utxo_confirmations}"
             )
+            self.commitment_authenticated = True
 
             utxos_dict, cj_addr, change_addr, mixdepth = await self._select_our_utxos(
-                exclude_utxos=exclude_utxos
+                exclude_utxos=exclude_utxos,
+                active_check=active_check,
             )
+
+            if active_check is not None and not active_check():
+                return False, {"error": "Session expired during maker input selection"}
 
             if not utxos_dict:
                 return False, {
@@ -485,8 +507,10 @@ class CoinJoinSession:
                 "btc_sig": btc_sig,
             }
 
-            self.state = CoinJoinState.IOAUTH_SENT
-            logger.info(f"Sent !ioauth with {len(utxos_dict)} UTXOs")
+            # Authentication is complete and our inputs are reserved, but the
+            # outer session has not attempted to reveal them via !ioauth yet.
+            self.state = CoinJoinState.AUTH_RECEIVED
+            logger.info(f"Prepared !ioauth with {len(utxos_dict)} UTXOs")
 
             return True, response
 
@@ -495,7 +519,9 @@ class CoinJoinSession:
             self.state = CoinJoinState.FAILED
             return False, {"error": str(e)}
 
-    async def handle_tx(self, tx_hex: str) -> tuple[bool, dict[str, Any]]:
+    async def handle_tx(
+        self, tx_hex: str, active_check: Callable[[], bool] | None = None
+    ) -> tuple[bool, dict[str, Any]]:
         """
         Handle !tx message from taker.
 
@@ -511,6 +537,8 @@ class CoinJoinSession:
             if self.is_timed_out():
                 self.state = CoinJoinState.FAILED
                 return False, {"error": f"Session timed out after {self.session_timeout_sec}s"}
+            if active_check is not None and not active_check():
+                return False, {"error": "Session expired before transaction verification"}
 
             if self.state != CoinJoinState.IOAUTH_SENT:
                 return False, {"error": "Session not in correct state for !tx"}
@@ -539,8 +567,35 @@ class CoinJoinSession:
                 return False, {"error": f"Transaction verification failed: {error}"}
 
             logger.info("Transaction verification PASSED ✓")
+            self.state = CoinJoinState.TX_RECEIVED
 
-            signatures = await self._sign_transaction(tx_hex)  # type: ignore[arg-type]
+            if self.is_timed_out():
+                self.state = CoinJoinState.FAILED
+                return False, {"error": f"Session timed out after {self.session_timeout_sec}s"}
+
+            if active_check is not None and not active_check():
+                return False, {"error": "Session expired before signing"}
+
+            if not self.wallet.renew_coinjoin_inputs(
+                set(self.our_utxos),
+                owner=self.input_lock_owner,
+                ttl=self.input_lock_ttl_sec,
+            ):
+                self.state = CoinJoinState.FAILED
+                return False, {"error": "Maker input lock ownership was lost before signing"}
+
+            # Signing may produce a usable signature before returning or
+            # raising. Cross this boundary first so no later failure can make
+            # the committed inputs available to a conflicting transaction.
+            self.signing_boundary_crossed = True
+            self.state = CoinJoinState.SIG_SENT
+            if active_check is None:
+                signatures = await self._sign_transaction(tx_hex)
+            else:
+                signatures = await self._sign_transaction(tx_hex, active_check=active_check)
+
+            if active_check is not None and not active_check():
+                return False, {"error": "Session expired during signing"}
 
             if not signatures:
                 return False, {"error": "Failed to sign transaction"}
@@ -553,19 +608,20 @@ class CoinJoinSession:
 
             response = {"signatures": signatures, "txid": txid}
 
-            self.state = CoinJoinState.SIG_SENT
             logger.info(f"Sent !sig with {len(signatures)} signatures (txid: {txid[:16]}...)")
 
             return True, response
 
         except Exception as e:
             logger.error(f"Failed to handle !tx: {e}")
-            self.state = CoinJoinState.FAILED
+            if self.state != CoinJoinState.SIG_SENT:
+                self.state = CoinJoinState.FAILED
             return False, {"error": str(e)}
 
     async def _select_our_utxos(
         self,
         exclude_utxos: set[tuple[str, int]] | None = None,
+        active_check: Callable[[], bool] | None = None,
     ) -> tuple[dict[tuple[str, int], UTXOInfo], str, str, int]:
         """
         Select our UTXOs for the CoinJoin.
@@ -621,6 +677,8 @@ class CoinJoinSession:
                     restrict_md0=self.restrict_md0,
                     exclude=exclude,
                 )
+                if active_check is not None and not active_check():
+                    return {}, "", "", -1
                 balances[md] = balance
 
             eligible_mixdepths = {md: bal for md, bal in balances.items() if bal >= required_amount}
@@ -659,8 +717,12 @@ class CoinJoinSession:
                 if not candidate_dict:
                     continue
 
+                if active_check is not None and not active_check():
+                    return {}, "", "", -1
                 if not self.wallet.reserve_coinjoin_inputs(
-                    set(candidate_dict), ttl=self.input_lock_ttl_sec
+                    set(candidate_dict),
+                    ttl=self.input_lock_ttl_sec,
+                    owner=self.input_lock_owner,
                 ):
                     logger.warning(
                         f"Inputs from mixdepth {candidate_mixdepth} were locked by a "
@@ -701,10 +763,12 @@ class CoinJoinSession:
         except Exception as e:
             logger.error(f"Failed to select UTXOs: {e}")
             if reserved_outpoints:
-                self.wallet.release_coinjoin_inputs(reserved_outpoints)
+                self.wallet.release_coinjoin_inputs(reserved_outpoints, owner=self.input_lock_owner)
             return {}, "", "", -1
 
-    async def _sign_transaction(self, tx_hex: str) -> list[str]:
+    async def _sign_transaction(
+        self, tx_hex: str, active_check: Callable[[], bool] | None = None
+    ) -> list[str]:
         """Sign our inputs in the transaction.
 
         Returns list of base64-encoded signatures in JM format.
@@ -728,6 +792,9 @@ class CoinJoinSession:
                 input_index_map[(txid_hex, tx_input.vout)] = idx
 
             for (txid, vout), utxo_info in self.our_utxos.items():
+                if active_check is not None and not active_check():
+                    logger.warning("Session expired before all maker inputs could be signed")
+                    return []
                 # Find the input index in the transaction
                 utxo_key = (txid, vout)
                 if utxo_key not in input_index_map:

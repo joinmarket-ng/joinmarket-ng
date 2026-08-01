@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import dataclass
 
 from jmcore.crypto import NickIdentity, verify_signed_privmsg
 from jmcore.directory_client import DirectoryClient
@@ -30,6 +31,19 @@ from maker.protocols import MakerBotProtocol
 from maker.rate_limiting import DirectConnectionRateLimiter
 
 
+@dataclass(slots=True)
+class DirectConnectionState:
+    """Socket-local identity that becomes immutable after signature verification.
+
+    The first verified sender overrides a mismatched provisional handshake nick.
+    This favors availability after a forged preclaim without allowing one socket
+    to act as multiple verified identities.
+    """
+
+    nick: str | None = None
+    verified: bool = False
+
+
 class DirectConnectionMixin:
     """Mixin class providing direct connection handling methods for MakerBot.
 
@@ -46,7 +60,15 @@ class DirectConnectionMixin:
     current_offers: list[Offer]
     directory_clients: dict[str, DirectoryClient]
     direct_connections: dict[str, TCPConnection]
+    _direct_connection_states: dict[TCPConnection, DirectConnectionState]
     _direct_connection_rate_limiter: DirectConnectionRateLimiter
+
+    def _remove_direct_connection(self, connection: TCPConnection) -> None:
+        """Forget one socket without disturbing a newer routing hint."""
+        self._direct_connection_states.pop(connection, None)
+        for nick, registered_connection in list(self.direct_connections.items()):
+            if registered_connection is connection:
+                del self.direct_connections[nick]
 
     def _parse_direct_message(self, data: bytes) -> tuple[str, str, str] | None:
         """Parse a direct connection message supporting both formats.
@@ -161,6 +183,16 @@ class DirectConnectionMixin:
         peer_nick = handshake_data.get("nick", "unknown")
         peer_network = handshake_data.get("network", "")
 
+        state = self._direct_connection_states.setdefault(connection, DirectConnectionState())
+        if state.nick is not None and state.nick != peer_nick:
+            logger.warning(
+                f"Rejecting nick change on direct connection from {peer_str}: "
+                f"{state.nick} -> {peer_nick}"
+            )
+            await connection.close()
+            self._remove_direct_connection(connection)
+            return True
+
         # Parse peer's advertised features (supports both dict and comma-string formats)
         peer_features_raw = handshake_data.get("features", "")
         peer_features = FeatureSet()
@@ -196,20 +228,9 @@ class DirectConnectionMixin:
                 )
                 return True
 
-        existing_connection = self.direct_connections.get(peer_nick)
-        if (
-            existing_connection is not None
-            and existing_connection is not connection
-            and existing_connection.is_connected()
-        ):
-            logger.warning(
-                f"Rejecting duplicate direct handshake for active peer {peer_nick} from {peer_str}"
-            )
-            await connection.close()
-            return True
-
-        # Bind all later messages on this connection to the handshaked nick.
-        self.direct_connections[peer_nick] = connection
+        # The unsigned handshake nick is only a socket-local hint. It neither
+        # reserves the nick globally nor authenticates later private messages.
+        state.nick = peer_nick
 
         # Build our feature set for the handshake
         features = FeatureSet()
@@ -281,6 +302,8 @@ class DirectConnectionMixin:
             await connection.close()
             return
 
+        self._direct_connection_states.setdefault(connection, DirectConnectionState())
+
         try:
             # Keep connection open and process messages
             while self.running and connection.is_connected():
@@ -302,6 +325,11 @@ class DirectConnectionMixin:
                     if handshake_handled:
                         # Handshake was handled, connection may close after response
                         # Continue to allow follow-up messages or clean disconnect
+                        continue
+
+                    state = self._direct_connection_states.get(connection)
+                    if state is None or state.nick is None:
+                        logger.warning(f"Dropping message before direct handshake from {peer_str}")
                         continue
 
                     # Parse the message (supports both formats)
@@ -329,21 +357,10 @@ class DirectConnectionMixin:
 
                     logger.debug(f"Direct message from {sender_nick}: cmd={cmd}")
 
-                    registered_nick = next(
-                        (
-                            nick
-                            for nick, registered_connection in self.direct_connections.items()
-                            if registered_connection is connection
-                        ),
-                        None,
-                    )
-                    if registered_nick is None:
-                        logger.warning(f"Dropping message before direct handshake from {peer_str}")
-                        continue
-                    if sender_nick != registered_nick:
+                    if cmd.startswith("PUBLIC:") and sender_nick != state.nick:
                         logger.warning(
                             f"Dropping direct message claiming {sender_nick} on "
-                            f"{registered_nick}'s connection"
+                            f"{state.nick}'s connection"
                         )
                         continue
 
@@ -387,6 +404,26 @@ class DirectConnectionMixin:
                             )
                         continue
 
+                    if state.verified:
+                        if sender_nick != state.nick:
+                            logger.warning(
+                                f"Dropping verified direct message from {sender_nick} on "
+                                f"{state.nick}'s connection"
+                            )
+                            continue
+                    else:
+                        if sender_nick != state.nick:
+                            logger.info(
+                                f"Verified sender {sender_nick} overrides provisional direct "
+                                f"handshake nick {state.nick} from {peer_str}"
+                            )
+                        state.nick = sender_nick
+                        state.verified = True
+                        # This map is a non-authoritative routing/lifecycle hint.
+                        # Duplicate verified senders are allowed and the newest
+                        # verified socket becomes the current hint.
+                        self.direct_connections[sender_nick] = connection
+
                     # Process the command - reuse existing handlers
                     # Commands: fill, auth, tx (same as via directory)
                     full_msg = f"{cmd} {msg_data}" if msg_data else cmd
@@ -421,8 +458,5 @@ class DirectConnectionMixin:
             logger.error(f"Error in direct connection handler for {peer_str}: {e}")
         finally:
             await connection.close()
-            # Clean up nick -> connection mapping
-            for nick, conn in list(self.direct_connections.items()):
-                if conn == connection:
-                    del self.direct_connections[nick]
+            self._remove_direct_connection(connection)
             logger.info(f"Direct connection from {peer_str} closed")

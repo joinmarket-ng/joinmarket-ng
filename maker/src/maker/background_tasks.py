@@ -53,6 +53,24 @@ class BackgroundTasksMixin:
         """Remove completed tasks from listen_tasks to prevent unbounded growth."""
         self.listen_tasks = [t for t in self.listen_tasks if not t.done()]
 
+    async def _periodic_session_cleanup(self: MakerBotProtocol) -> None:
+        """Expire idle sessions independently of directory connectivity."""
+        logger.info("Starting periodic session cleanup task...")
+        while self.running:
+            try:
+                await self._cleanup_timed_out_sessions()
+                remaining = [
+                    session.remaining_timeout() for session in self.active_sessions.values()
+                ]
+                delay = min(1.0, min(remaining, default=1.0))
+                await asyncio.sleep(max(0.01, delay))
+            except asyncio.CancelledError:
+                logger.info("Periodic session cleanup task cancelled")
+                break
+            except Exception as e:
+                logger.error(f"Error in periodic session cleanup: {e}")
+        logger.info("Periodic session cleanup task stopped")
+
     async def _periodic_rescan(self: MakerBotProtocol) -> None:
         """Background task to periodically rescan wallet and update offers.
 
@@ -358,7 +376,7 @@ class BackgroundTasksMixin:
 
         logger.info("Directory reconnection task stopped")
 
-    async def _monitor_pending_transactions(self) -> None:
+    async def _monitor_pending_transactions(self: MakerBotProtocol) -> None:
         """
         Background task to monitor pending transactions and update their status.
 
@@ -590,10 +608,6 @@ class BackgroundTasksMixin:
         """Listen for messages from a specific directory client"""
         logger.info(f"Started listening on {node_id}")
 
-        # Track last cleanup time
-        last_cleanup = asyncio.get_event_loop().time()
-        cleanup_interval = 60.0  # Clean up timed-out sessions every 60 seconds
-
         # Track consecutive errors for exponential backoff
         consecutive_errors = 0
         max_consecutive_errors = 10
@@ -608,12 +622,6 @@ class BackgroundTasksMixin:
 
                 for message in messages:
                     await self._handle_message(message, source=f"dir:{node_id}")
-
-                # Periodic cleanup of timed-out sessions
-                now = asyncio.get_event_loop().time()
-                if now - last_cleanup > cleanup_interval:
-                    self._cleanup_timed_out_sessions()
-                    last_cleanup = now
 
                 # Reset error counter on successful iteration
                 consecutive_errors = 0

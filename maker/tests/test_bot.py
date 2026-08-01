@@ -7,6 +7,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import time
+from dataclasses import replace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -16,7 +18,9 @@ from jmcore.network import ONION_HOSTID, TCPConnection
 from jmcore.protocol import JM_VERSION, MessageType, create_handshake_request
 
 from maker.bot import MakerBot
+from maker.coinjoin import CoinJoinState
 from maker.config import MakerConfig
+from maker.direct_connection import DirectConnectionState
 from maker.fidelity import FidelityBondInfo
 
 
@@ -309,6 +313,37 @@ class TestHiddenServiceListener:
             onion_serving_port=0,  # Auto-assign port for tests
         )
 
+    @staticmethod
+    def _handshake(nick: str) -> bytes:
+        handshake = create_handshake_request(
+            nick=nick,
+            location="NOT-SERVING-ONION",
+            network=NetworkType.REGTEST.value,
+            directory=False,
+        )
+        return json.dumps(
+            {"type": MessageType.HANDSHAKE.value, "line": json.dumps(handshake)}
+        ).encode()
+
+    @staticmethod
+    def _signed_message(identity: NickIdentity, recipient: str, command: str, data: str) -> bytes:
+        signed = identity.sign_message(data, ONION_HOSTID)
+        return json.dumps(
+            {
+                "type": MessageType.PRIVMSG.value,
+                "line": f"{identity.nick}!{recipient}!{command} {signed}",
+            }
+        ).encode()
+
+    @staticmethod
+    def _connection(messages: list[bytes]) -> MagicMock:
+        connection = MagicMock(spec=TCPConnection)
+        connection.is_connected.side_effect = [True] * len(messages) + [False]
+        connection.receive = AsyncMock(side_effect=messages)
+        connection.send = AsyncMock()
+        connection.close = AsyncMock()
+        return connection
+
     def test_direct_connection_tracking(self, mock_wallet, mock_backend, config_with_onion):
         """Test that direct connections are tracked by nick."""
         bot = MakerBot(
@@ -421,6 +456,80 @@ class TestHiddenServiceListener:
         assert taker_identity.nick not in bot.direct_connections, "Connection should be cleaned up"
 
     @pytest.mark.asyncio
+    async def test_direct_connection_continues_after_session_timeout(
+        self, mock_wallet, mock_backend, config_with_onion
+    ):
+        from maker.maker_session import MakerSession
+
+        bot = MakerBot(wallet=mock_wallet, backend=mock_backend, config=config_with_onion)
+        bot.running = True
+        taker_identity = NickIdentity(JM_VERSION)
+        commitment = "bc" * 32
+
+        inner = MagicMock()
+        inner.taker_nick = taker_identity.nick
+        inner.session_timeout_sec = 0.01
+        inner.state = CoinJoinState.PUBKEY_SENT
+        inner.commitment = bytes.fromhex(commitment)
+        inner.commitment_authenticated = False
+        inner.our_utxos = {}
+        inner.input_lock_owner = "direct-timeout-owner"
+        inner.input_lock_ttl_sec = 3600.0
+        session = MakerSession(inner)
+
+        async def block_auth(*args):
+            await asyncio.Event().wait()
+
+        session.on_auth = AsyncMock(side_effect=block_auth)
+        bot.active_sessions[taker_identity.nick] = session
+        bot._reserved_commitments.add(commitment)
+        bot._handle_push = AsyncMock()
+        bot._start_session_cleanup_task()
+
+        handshake = create_handshake_request(
+            nick=taker_identity.nick,
+            location="NOT-SERVING-ONION",
+            network=NetworkType.REGTEST.value,
+            directory=False,
+        )
+
+        def signed_message(command: str, data: str) -> bytes:
+            signed = taker_identity.sign_message(data, ONION_HOSTID)
+            return json.dumps(
+                {
+                    "type": MessageType.PRIVMSG.value,
+                    "line": f"{taker_identity.nick}!{bot.nick}!{command} {signed}",
+                }
+            ).encode()
+
+        incoming = iter(
+            [
+                json.dumps(
+                    {"type": MessageType.HANDSHAKE.value, "line": json.dumps(handshake)}
+                ).encode(),
+                signed_message("auth", "payload"),
+                signed_message("push", "transaction"),
+            ]
+        )
+        connection = MagicMock(spec=TCPConnection)
+        connection.is_connected.side_effect = [True, True, True, False]
+        connection.receive = AsyncMock(side_effect=lambda: next(incoming))
+        connection.send = AsyncMock(return_value=True)
+        connection.close = AsyncMock()
+
+        await bot._on_direct_connection(connection, "127.0.0.1:12345")
+        bot.running = False
+        cleanup_task = bot._session_cleanup_task
+        assert cleanup_task is not None
+        cleanup_task.cancel()
+        await asyncio.gather(cleanup_task, return_exceptions=True)
+
+        assert taker_identity.nick not in bot.active_sessions
+        bot._handle_push.assert_awaited_once_with(
+            taker_identity.nick, "push transaction", source="direct"
+        )
+
+    @pytest.mark.asyncio
     async def test_message_dispatch_authenticates_private_sender(
         self, mock_wallet, mock_backend, config_with_onion
     ):
@@ -454,68 +563,202 @@ class TestHiddenServiceListener:
         handler.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_direct_handshake_does_not_replace_active_nick_binding(
+    async def test_attacker_preclaim_does_not_block_genuine_signed_peer(
         self, mock_wallet, mock_backend, config_with_onion
     ):
         bot = MakerBot(wallet=mock_wallet, backend=mock_backend, config=config_with_onion)
-        taker_identity = NickIdentity(JM_VERSION)
-        existing_connection = MagicMock(spec=TCPConnection)
-        existing_connection.is_connected.return_value = True
-        bot.direct_connections[taker_identity.nick] = existing_connection
+        bot.running = True
+        genuine = NickIdentity(JM_VERSION)
+        attacker_connection = self._connection([])
 
-        replacement_connection = MagicMock(spec=TCPConnection)
-        replacement_connection.send = AsyncMock(return_value=True)
-        replacement_connection.close = AsyncMock()
-        handshake = create_handshake_request(
-            nick=taker_identity.nick,
-            location="NOT-SERVING-ONION",
-            network=NetworkType.REGTEST.value,
-            directory=False,
+        await bot._try_handle_handshake(
+            attacker_connection,
+            self._handshake(genuine.nick),
+            "attacker:1",
         )
-        message = json.dumps(
-            {"type": MessageType.HANDSHAKE.value, "line": json.dumps(handshake)}
-        ).encode()
+        assert bot.direct_connections == {}
 
-        handled = await bot._try_handle_handshake(
-            replacement_connection, message, "127.0.0.1:12346"
+        fill_data = f"0 1000000 commitment P{'ab' * 32}"
+        genuine_connection = self._connection(
+            [
+                self._handshake(genuine.nick),
+                self._signed_message(genuine, bot.nick, "fill", fill_data),
+            ]
         )
+        bot._handle_fill = AsyncMock()
 
-        assert handled is True
-        assert bot.direct_connections[taker_identity.nick] is existing_connection
-        replacement_connection.send.assert_not_awaited()
-        replacement_connection.close.assert_awaited_once()
+        await bot._on_direct_connection(genuine_connection, "genuine:2")
+
+        bot._handle_fill.assert_awaited_once_with(
+            genuine.nick, f"fill {fill_data}", source="direct"
+        )
+        attacker_connection.close.assert_not_awaited()
+        bot._remove_direct_connection(attacker_connection)
 
     @pytest.mark.asyncio
-    async def test_direct_handshake_replaces_stale_nick_binding(
+    async def test_duplicate_provisional_claims_coexist(
         self, mock_wallet, mock_backend, config_with_onion
     ):
         bot = MakerBot(wallet=mock_wallet, backend=mock_backend, config=config_with_onion)
         taker_identity = NickIdentity(JM_VERSION)
-        stale_connection = MagicMock(spec=TCPConnection)
-        stale_connection.is_connected.return_value = False
-        bot.direct_connections[taker_identity.nick] = stale_connection
+        first = self._connection([])
+        second = self._connection([])
 
-        replacement_connection = MagicMock(spec=TCPConnection)
-        replacement_connection.send = AsyncMock(return_value=True)
-        replacement_connection.close = AsyncMock()
-        handshake = create_handshake_request(
-            nick=taker_identity.nick,
-            location="NOT-SERVING-ONION",
-            network=NetworkType.REGTEST.value,
-            directory=False,
-        )
-        message = json.dumps(
-            {"type": MessageType.HANDSHAKE.value, "line": json.dumps(handshake)}
-        ).encode()
+        await bot._try_handle_handshake(first, self._handshake(taker_identity.nick), "peer:1")
+        await bot._try_handle_handshake(second, self._handshake(taker_identity.nick), "peer:2")
 
-        handled = await bot._try_handle_handshake(
-            replacement_connection, message, "127.0.0.1:12346"
-        )
+        assert bot._direct_connection_states[first].nick == taker_identity.nick
+        assert bot._direct_connection_states[second].nick == taker_identity.nick
+        assert bot.direct_connections == {}
+        first.close.assert_not_awaited()
+        second.close.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_handshake_nick_change_rejects_only_that_socket(
+        self, mock_wallet, mock_backend, config_with_onion
+    ):
+        bot = MakerBot(wallet=mock_wallet, backend=mock_backend, config=config_with_onion)
+        first = NickIdentity(JM_VERSION)
+        second = NickIdentity(JM_VERSION)
+        changing = self._connection([])
+        unrelated = self._connection([])
+
+        await bot._try_handle_handshake(changing, self._handshake(first.nick), "peer:1")
+        await bot._try_handle_handshake(unrelated, self._handshake(first.nick), "peer:2")
+        await bot._try_handle_handshake(changing, self._handshake(first.nick), "peer:1")
+        changing.close.assert_not_awaited()
+        handled = await bot._try_handle_handshake(changing, self._handshake(second.nick), "peer:1")
 
         assert handled is True
-        assert bot.direct_connections[taker_identity.nick] is replacement_connection
-        replacement_connection.send.assert_awaited_once()
-        replacement_connection.close.assert_not_awaited()
+        changing.close.assert_awaited_once()
+        assert changing not in bot._direct_connection_states
+        assert bot._direct_connection_states[unrelated].nick == first.nick
+        unrelated.close.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_verified_sender_overrides_provisional_handshake_nick(
+        self, mock_wallet, mock_backend, config_with_onion
+    ):
+        bot = MakerBot(wallet=mock_wallet, backend=mock_backend, config=config_with_onion)
+        bot.running = True
+        provisional = NickIdentity(JM_VERSION)
+        verified = NickIdentity(JM_VERSION)
+        connection = self._connection(
+            [
+                self._handshake(provisional.nick),
+                self._signed_message(verified, bot.nick, "fill", "payload"),
+            ]
+        )
+        observed_state: DirectConnectionState | None = None
+
+        async def capture_state(_nick: str, _msg: str, source: str = "unknown") -> None:
+            nonlocal observed_state
+            state = bot._direct_connection_states[connection]
+            observed_state = DirectConnectionState(nick=state.nick, verified=state.verified)
+            assert bot.direct_connections[verified.nick] is connection
+
+        bot._handle_fill = capture_state
+
+        await bot._on_direct_connection(connection, "peer:1")
+
+        assert observed_state == DirectConnectionState(nick=verified.nick, verified=True)
+
+    @pytest.mark.asyncio
+    async def test_second_verified_identity_on_socket_is_rejected(
+        self, mock_wallet, mock_backend, config_with_onion
+    ):
+        bot = MakerBot(wallet=mock_wallet, backend=mock_backend, config=config_with_onion)
+        bot.running = True
+        first = NickIdentity(JM_VERSION)
+        second = NickIdentity(JM_VERSION)
+        connection = self._connection(
+            [
+                self._handshake(first.nick),
+                self._signed_message(first, bot.nick, "fill", "first"),
+                self._signed_message(second, bot.nick, "auth", "second"),
+            ]
+        )
+        bot._handle_fill = AsyncMock()
+        bot._handle_auth = AsyncMock()
+
+        await bot._on_direct_connection(connection, "peer:1")
+
+        bot._handle_fill.assert_awaited_once_with(first.nick, "fill first", source="direct")
+        bot._handle_auth.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_signed_message_before_handshake_is_rejected(
+        self, mock_wallet, mock_backend, config_with_onion
+    ):
+        bot = MakerBot(wallet=mock_wallet, backend=mock_backend, config=config_with_onion)
+        bot.running = True
+        taker = NickIdentity(JM_VERSION)
+        connection = self._connection([self._signed_message(taker, bot.nick, "fill", "payload")])
+        bot._handle_fill = AsyncMock()
+
+        await bot._on_direct_connection(connection, "peer:1")
+
+        bot._handle_fill.assert_not_awaited()
+        assert bot.direct_connections == {}
+
+    @pytest.mark.asyncio
+    async def test_orderbook_response_uses_ingress_socket_without_promotion(
+        self, mock_wallet, mock_backend, config_with_onion
+    ):
+        bot = MakerBot(wallet=mock_wallet, backend=mock_backend, config=config_with_onion)
+        bot.running = True
+        taker = NickIdentity(JM_VERSION)
+        newer_hint = self._connection([])
+        bot.direct_connections[taker.nick] = newer_hint
+        orderbook = json.dumps(
+            {
+                "type": MessageType.PUBMSG.value,
+                "line": f"{taker.nick}!PUBLIC!orderbook",
+            }
+        ).encode()
+        ingress = self._connection([self._handshake(taker.nick), orderbook])
+        bot._send_offers_via_direct_connection = AsyncMock()
+
+        await bot._on_direct_connection(ingress, "peer:1")
+
+        bot._send_offers_via_direct_connection.assert_awaited_once_with(taker.nick, ingress)
+        assert bot.direct_connections[taker.nick] is newer_hint
+
+    def test_disconnect_does_not_remove_newer_mapping(
+        self, mock_wallet, mock_backend, config_with_onion
+    ):
+        bot = MakerBot(wallet=mock_wallet, backend=mock_backend, config=config_with_onion)
+        taker = NickIdentity(JM_VERSION)
+        old = self._connection([])
+        new = self._connection([])
+        bot._direct_connection_states[old] = DirectConnectionState(taker.nick, verified=True)
+        bot._direct_connection_states[new] = DirectConnectionState(taker.nick, verified=True)
+        bot.direct_connections[taker.nick] = new
+
+        bot._remove_direct_connection(old)
+
+        assert old not in bot._direct_connection_states
+        assert bot._direct_connection_states[new].verified is True
+        assert bot.direct_connections[taker.nick] is new
+
+    @pytest.mark.asyncio
+    async def test_shutdown_closes_all_direct_sockets_and_clears_state(
+        self, mock_wallet, mock_backend, config_with_onion
+    ):
+        bot = MakerBot(wallet=mock_wallet, backend=mock_backend, config=config_with_onion)
+        unhandshaked = self._connection([])
+        verified = self._connection([])
+        taker = NickIdentity(JM_VERSION)
+        bot._direct_connection_states[unhandshaked] = DirectConnectionState()
+        bot._direct_connection_states[verified] = DirectConnectionState(taker.nick, verified=True)
+        bot.direct_connections[taker.nick] = verified
+
+        await bot.stop()
+
+        unhandshaked.close.assert_awaited_once()
+        verified.close.assert_awaited_once()
+        assert bot._direct_connection_states == {}
+        assert bot.direct_connections == {}
 
     @pytest.mark.asyncio
     async def test_rotated_fill_commitment_is_not_deduplicated(
@@ -624,19 +867,47 @@ class TestHandlePush:
         )
         return bot
 
+    @staticmethod
+    def _transaction(version: int = 1) -> bytes:
+        return version.to_bytes(4, "little") + bytes.fromhex("000000000000")
+
+    @staticmethod
+    def _authorize_push(maker_bot, taker_nick: str, tx_bytes: bytes) -> str:
+        from jmcore.bitcoin import get_txid
+
+        from maker.maker_session import PendingSignedRound
+
+        txid = get_txid(tx_bytes.hex())
+        maker_bot._pending_signed_rounds[(taker_nick, txid)] = PendingSignedRound(
+            taker_nick=taker_nick,
+            txid=txid,
+            input_lock_owner="round-owner",
+            outpoints=frozenset({("ab" * 32, 0)}),
+            expires_at=time.monotonic() + 60,
+            lock_ttl_sec=3600,
+        )
+        renew = maker_bot.wallet.renew_coinjoin_inputs
+        if isinstance(renew, MagicMock):
+            renew.return_value = True
+        return txid
+
     @pytest.mark.asyncio
     async def test_handle_push_broadcasts_transaction(self, maker_bot):
         """Test that !push broadcasts the transaction."""
         import base64
 
-        # Create a dummy transaction (minimal valid format)
-        tx_bytes = bytes.fromhex("0100000000010000000000")
+        tx_bytes = self._transaction()
+        txid = self._authorize_push(maker_bot, "J5taker123", tx_bytes)
         tx_b64 = base64.b64encode(tx_bytes).decode("ascii")
 
         await maker_bot._handle_push("J5taker123", f"push {tx_b64}")
 
         # Verify broadcast was called with the decoded transaction
         maker_bot.backend.broadcast_transaction.assert_called_once_with(tx_bytes.hex())
+        maker_bot.wallet.renew_coinjoin_inputs.assert_called_once_with(
+            {("ab" * 32, 0)}, owner="round-owner", ttl=3600
+        )
+        assert ("J5taker123", txid) not in maker_bot._pending_signed_rounds
 
     @pytest.mark.asyncio
     async def test_handle_push_invalid_format(self, maker_bot):
@@ -664,7 +935,8 @@ class TestHandlePush:
         # Make broadcast fail
         maker_bot.backend.broadcast_transaction = AsyncMock(side_effect=Exception("Network error"))
 
-        tx_bytes = bytes.fromhex("0100000000010000000000")
+        tx_bytes = self._transaction()
+        self._authorize_push(maker_bot, "J5taker123", tx_bytes)
         tx_b64 = base64.b64encode(tx_bytes).decode("ascii")
 
         # Should not raise
@@ -672,6 +944,83 @@ class TestHandlePush:
 
         # Broadcast was attempted
         maker_bot.backend.broadcast_transaction.assert_called_once()
+        assert maker_bot._pending_signed_rounds == {}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("wrong_identity", ["taker", "transaction"])
+    async def test_handle_push_rejects_wrong_taker_or_transaction(self, maker_bot, wrong_identity):
+        import base64
+
+        authorized_tx = self._transaction(1)
+        txid = self._authorize_push(maker_bot, "J5ExpectedTaker", authorized_tx)
+        pushed_tx = self._transaction(2) if wrong_identity == "transaction" else authorized_tx
+        taker_nick = "J5WrongTaker" if wrong_identity == "taker" else "J5ExpectedTaker"
+
+        await maker_bot._handle_push(
+            taker_nick, f"push {base64.b64encode(pushed_tx).decode('ascii')}"
+        )
+
+        maker_bot.backend.broadcast_transaction.assert_not_called()
+        assert ("J5ExpectedTaker", txid) in maker_bot._pending_signed_rounds
+
+    @pytest.mark.asyncio
+    async def test_delayed_push_fails_after_lease_loss_and_reacquisition(self, maker_bot, tmp_path):
+        import base64
+
+        from jmwallet.wallet.service import WalletService
+        from jmwallet.wallet.utxo_metadata import UTXOMetadataStore
+
+        wallet = WalletService.__new__(WalletService)
+        wallet.metadata_store = UTXOMetadataStore(path=tmp_path / "metadata.jsonl")
+        maker_bot.wallet = wallet
+        outpoint = ("ab" * 32, 0)
+        assert wallet.reserve_coinjoin_inputs({outpoint}, ttl=1, owner="round-owner")
+        ref = f"{outpoint[0]}:{outpoint[1]}"
+        with wallet.metadata_store._exclusive_file_lock():
+            wallet.metadata_store.load()
+            wallet.metadata_store.records[ref].lock_until = 1.0
+            wallet.metadata_store.save()
+        assert wallet.reserve_coinjoin_inputs({outpoint}, ttl=3600, owner="replacement-owner")
+
+        tx_bytes = self._transaction()
+        txid = self._authorize_push(maker_bot, "J5StaleTaker", tx_bytes)
+        await maker_bot._handle_push(
+            "J5StaleTaker", f"push {base64.b64encode(tx_bytes).decode('ascii')}"
+        )
+
+        maker_bot.backend.broadcast_transaction.assert_not_called()
+        assert ("J5StaleTaker", txid) not in maker_bot._pending_signed_rounds
+        wallet.metadata_store.load()
+        assert wallet.metadata_store.records[ref].lock_owner == "replacement-owner"
+
+    @pytest.mark.asyncio
+    async def test_expired_pending_push_record_is_cleaned(self, maker_bot):
+        tx_bytes = self._transaction()
+        txid = self._authorize_push(maker_bot, "J5ExpiredTaker", tx_bytes)
+        record = maker_bot._pending_signed_rounds[("J5ExpiredTaker", txid)]
+        maker_bot._pending_signed_rounds[("J5ExpiredTaker", txid)] = replace(
+            record, expires_at=time.monotonic() - 1
+        )
+
+        await maker_bot._prune_pending_signed_rounds()
+
+        assert maker_bot._pending_signed_rounds == {}
+
+    @pytest.mark.asyncio
+    async def test_pending_signed_round_registry_rejects_over_cap(self, maker_bot):
+        session = MagicMock()
+        session.taker_nick = "J5SecondPending"
+        session.inner.pending_broadcast_ttl_sec = 3600
+        session.inner.input_lock_owner = "second-owner"
+        session.our_utxos = {("cd" * 32, 1): MagicMock()}
+        existing_tx = self._transaction(1)
+        self._authorize_push(maker_bot, "J5FirstPending", existing_tx)
+
+        with patch("maker.protocol_handlers.MAX_PENDING_SIGNED_ROUNDS", 1):
+            registered = await maker_bot._register_pending_signed_round(session, "ef" * 32)
+
+        assert registered is False
+        assert len(maker_bot._pending_signed_rounds) == 1
 
     @pytest.mark.asyncio
     async def test_handle_push_via_privmsg(self, maker_bot):
@@ -2255,6 +2604,10 @@ class TestReferenceCompatHandshake:
         response = json.loads(response_bytes.decode("utf-8"))
         response_data = json.loads(response["line"])
 
+        assert maker_bot._direct_connection_states[mock_conn].nick == "J5RefTakerNick"
+        assert maker_bot._direct_connection_states[mock_conn].verified is False
+        assert maker_bot.direct_connections == {}
+
         # Simulate reference taker validation: our maker is NOT a directory peer
         accepted, reason = self._reference_taker_validate_handshake(
             msg_type=response["type"],
@@ -2414,6 +2767,120 @@ class TestListenTasksMemoryLeak:
             wallet=mock_wallet,
             backend=mock_backend,
             config=config,
+        )
+
+    @pytest.mark.asyncio
+    async def test_session_cleanup_expires_direct_session_without_directories(self, maker_bot):
+        commitment = "d1" * 32
+        session = MagicMock()
+        session.is_timed_out.return_value = True
+        session.lock = asyncio.Lock()
+        session.commitment = bytes.fromhex(commitment)
+        session.state = CoinJoinState.PUBKEY_SENT
+        session.comm_channel = "direct"
+        maker_bot.directory_clients.clear()
+        maker_bot.active_sessions["J5IdleDirectTaker"] = session
+        maker_bot._reserved_commitments.add(commitment)
+        maker_bot.running = True
+        cleanup = maker_bot._cleanup_timed_out_sessions
+
+        async def cleanup_once() -> None:
+            await cleanup()
+            maker_bot.running = False
+
+        with patch.object(
+            maker_bot, "_cleanup_timed_out_sessions", new=AsyncMock(side_effect=cleanup_once)
+        ):
+            with patch("maker.background_tasks.asyncio.sleep", new=AsyncMock()):
+                await maker_bot._periodic_session_cleanup()
+
+        assert maker_bot.directory_clients == {}
+        assert "J5IdleDirectTaker" not in maker_bot.active_sessions
+        assert commitment not in maker_bot._reserved_commitments
+        session.release_input_locks.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_session_cleanup_task_starts_once_and_stops_with_bot(self, maker_bot):
+        maker_bot.directory_clients.clear()
+        maker_bot.running = True
+
+        maker_bot._start_session_cleanup_task()
+        task = maker_bot._session_cleanup_task
+        maker_bot._start_session_cleanup_task()
+        await asyncio.sleep(0)
+
+        assert task is not None
+        assert [item for item in maker_bot.listen_tasks if item is task] == [task]
+        assert task.get_name() == "maker-session-cleanup"
+
+        await maker_bot.stop()
+
+        assert task.done()
+        assert maker_bot._session_cleanup_task is None
+        assert maker_bot.listen_tasks == []
+
+    @pytest.mark.asyncio
+    async def test_shutdown_releases_pre_sign_and_retains_post_sign_sessions(self, maker_bot):
+        from maker.maker_session import MakerSession
+
+        def session(nick: str, commitment: str, state: CoinJoinState) -> MakerSession:
+            inner = MagicMock()
+            inner.taker_nick = nick
+            inner.session_timeout_sec = 60
+            inner.state = state
+            inner.commitment = bytes.fromhex(commitment)
+            inner.commitment_authenticated = True
+            inner.our_utxos = {("ab" * 32, 0): MagicMock()}
+            inner.input_lock_owner = f"owner-{nick}"
+            inner.input_lock_ttl_sec = 3600.0
+            return MakerSession(inner)
+
+        pre_sign = session("J5PreSign", "d2" * 32, CoinJoinState.IOAUTH_SEND_STARTED)
+        post_sign = session("J5PostSign", "d3" * 32, CoinJoinState.SIG_SENT)
+        maker_bot.active_sessions = {
+            pre_sign.taker_nick: pre_sign,
+            post_sign.taker_nick: post_sign,
+        }
+        maker_bot._reserved_commitments.update({"d2" * 32, "d3" * 32})
+        maker_bot._broadcast_commitment = AsyncMock(return_value=True)
+        maker_bot.directory_clients.clear()
+
+        await maker_bot.stop()
+
+        assert maker_bot.active_sessions == {}
+        pre_sign.inner.wallet.release_coinjoin_inputs.assert_called_once_with(
+            set(pre_sign.our_utxos), owner=pre_sign.inner.input_lock_owner
+        )
+        pre_sign.inner.wallet.renew_coinjoin_inputs.assert_not_called()
+        post_sign.inner.wallet.release_coinjoin_inputs.assert_not_called()
+        post_sign.inner.wallet.renew_coinjoin_inputs.assert_called_once_with(
+            set(post_sign.our_utxos),
+            owner=post_sign.inner.input_lock_owner,
+            ttl=post_sign.inner.input_lock_ttl_sec,
+        )
+        assert maker_bot._broadcast_commitment.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_shutdown_drains_pending_round_and_renews_lease(self, maker_bot):
+        from maker.maker_session import PendingSignedRound
+
+        record = PendingSignedRound(
+            taker_nick="J5PendingShutdown",
+            txid="ab" * 32,
+            input_lock_owner="pending-owner",
+            outpoints=frozenset({("cd" * 32, 1)}),
+            expires_at=time.monotonic() + 60,
+            lock_ttl_sec=3600,
+        )
+        maker_bot._pending_signed_rounds[(record.taker_nick, record.txid)] = record
+        maker_bot.wallet.renew_coinjoin_inputs.return_value = True
+        maker_bot.directory_clients.clear()
+
+        await maker_bot.stop()
+
+        assert maker_bot._pending_signed_rounds == {}
+        maker_bot.wallet.renew_coinjoin_inputs.assert_called_once_with(
+            {("cd" * 32, 1)}, owner="pending-owner", ttl=3600
         )
 
     def test_prune_done_tasks_removes_completed(self, maker_bot):

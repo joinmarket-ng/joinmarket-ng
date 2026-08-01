@@ -26,6 +26,24 @@ def test_valid_config() -> None:
     assert config.cj_fee_relative == "0.001"
 
 
+def test_maximum_maker_lock_window_fits_metadata_ttl_cap() -> None:
+    from jmwallet.wallet.utxo_metadata import MAX_COINJOIN_LOCK_TTL
+
+    config = MakerConfig(
+        mnemonic=TEST_MNEMONIC,
+        session_timeout_sec=86_400,
+        pending_tx_timeout_min=1440,
+    )
+
+    assert config.session_timeout_sec + config.pending_tx_timeout_min * 60 == 172_800
+    assert 172_800 <= MAX_COINJOIN_LOCK_TTL
+
+
+def test_maker_session_timeout_rejects_value_above_ttl_design_limit() -> None:
+    with pytest.raises(ValidationError):
+        MakerConfig(mnemonic=TEST_MNEMONIC, session_timeout_sec=86_401)
+
+
 def test_zero_cj_fee_relative_fails() -> None:
     """Test that zero cj_fee_relative fails for relative offer types."""
     with pytest.raises(ValidationError, match="cj_fee_relative must be > 0"):

@@ -305,6 +305,7 @@ class MakerConfig(WalletConfig):
     session_timeout_sec: int = Field(
         default=300,
         ge=60,
+        le=86_400,
         description="Maximum time for a CoinJoin session to complete (all states)",
     )
 

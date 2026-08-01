@@ -38,7 +38,7 @@ from loguru import logger
 
 from maker.background_tasks import BackgroundTasksMixin
 from maker.config import MakerConfig
-from maker.direct_connection import DirectConnectionMixin
+from maker.direct_connection import DirectConnectionMixin, DirectConnectionState
 from maker.directory_pool import MakerDirectoryPool
 from maker.fidelity import (
     FidelityBondInfo,
@@ -46,7 +46,7 @@ from maker.fidelity import (
     find_fidelity_bonds,
     get_best_fidelity_bond,
 )
-from maker.maker_session import MakerSession
+from maker.maker_session import MakerSession, PendingSignedRound
 from maker.offers import OfferManager
 from maker.protocol_handlers import ProtocolHandlersMixin
 from maker.rate_limiting import (
@@ -56,6 +56,7 @@ from maker.rate_limiting import (
 
 # Approximately 64MB of memory for str->float mapping (including overhead)
 MAX_LOG_RATE_LIMIT_ENTRIES = 200000
+_DETACHED_SHUTDOWN_GRACE_SEC = 0.5
 
 
 class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixin):
@@ -99,6 +100,11 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
 
         self.running = False
         self.listen_tasks: list[asyncio.Task[None]] = []
+        self._session_cleanup_task: asyncio.Task[None] | None = None
+        self._session_handler_task_count = 0
+        self._detached_handler_tasks: set[asyncio.Task[None]] = set()
+        self._pending_signed_rounds: dict[tuple[str, str], PendingSignedRound] = {}
+        self._pending_signed_rounds_lock = asyncio.Lock()
 
         # Session locks now live on each `MakerSession` (one asyncio.Lock per
         # taker_nick) so we no longer keep a parallel dict on the bot.
@@ -106,6 +112,7 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         # Hidden service listener for direct peer connections
         self.hidden_service_listener: HiddenServiceListener | None = None
         self.direct_connections: dict[str, TCPConnection] = {}
+        self._direct_connection_states: dict[TCPConnection, DirectConnectionState] = {}
 
         # Tor control for dynamic hidden service creation
         self._tor_control: TorControlClient | None = None
@@ -636,6 +643,8 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
             logger.info("Maker bot started. Listening for takers...")
             self.running = True
 
+            self._start_session_cleanup_task()
+
             # Start listening on all directory clients
             for node_id, client in self.directory_clients.items():
                 task = asyncio.create_task(self._listen_client(node_id, client))
@@ -686,12 +695,52 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         logger.info("Stopping maker bot...")
         self.running = False
 
-        # Cancel all listening tasks
-        for task in self.listen_tasks:
-            task.cancel()
+        # Stop the dedicated reaper, then independently expire every exact
+        # session object. Handler cancellation and cleanup are bounded inside
+        # _expire_timed_out_session, including cancellation-suppressing tasks.
+        cleanup_task = self._session_cleanup_task
+        if cleanup_task is not None:
+            cleanup_task.cancel()
+            await asyncio.wait({cleanup_task}, timeout=1.0)
+
+        expiration_tasks = [
+            asyncio.create_task(self._expire_timed_out_session(nick, session))
+            for nick, session in list(self.active_sessions.items())
+        ]
+        if expiration_tasks:
+            _, pending_expirations = await asyncio.wait(expiration_tasks, timeout=1.5)
+            for expiration_task in pending_expirations:
+                expiration_task.cancel()
+
+        await self._drain_pending_signed_rounds()
+
+        # Cancellation-suppressing handlers remain strongly referenced until
+        # they actually finish. Shutdown sends another cancellation request and
+        # waits only for a bounded grace period.
+        detached_tasks = set(self._detached_handler_tasks)
+        for detached_task in detached_tasks:
+            detached_task.cancel()
+        if detached_tasks:
+            _, pending_detached = await asyncio.wait(
+                detached_tasks, timeout=_DETACHED_SHUTDOWN_GRACE_SEC
+            )
+            if pending_detached:
+                logger.warning(
+                    f"{len(pending_detached)} detached maker handler task(s) "
+                    "still suppress cancellation after shutdown grace period"
+                )
+
+        # Cancel all listening tasks after detached handlers have released
+        # their directory dispatchers.
+        for listener_task in self.listen_tasks:
+            listener_task.cancel()
 
         if self.listen_tasks:
-            await asyncio.gather(*self.listen_tasks, return_exceptions=True)
+            _, pending_listeners = await asyncio.wait(set(self.listen_tasks), timeout=2.0)
+            for listener_task in pending_listeners:
+                listener_task.cancel()
+        self.listen_tasks.clear()
+        self._session_cleanup_task = None
 
         # Stop hidden service listener
         if self.hidden_service_listener:
@@ -700,13 +749,17 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         # Clean up Tor control connection (ephemeral hidden service auto-removed)
         await self._cleanup_tor_hidden_service()
 
-        # Close all direct connections
-        for conn in self.direct_connections.values():
+        # Close every accepted direct socket, including sockets that never
+        # completed a handshake or authenticated a sender.
+        direct_sockets = set(self._direct_connection_states)
+        direct_sockets.update(self.direct_connections.values())
+        for conn in direct_sockets:
             try:
                 await conn.close()
             except Exception:
                 pass
         self.direct_connections.clear()
+        self._direct_connection_states.clear()
 
         # Close all directory clients
         for client in self.directory_clients.values():
@@ -719,6 +772,15 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         # The caller is responsible for managing the wallet lifecycle.
         # await self.wallet.close()
         logger.info("Maker bot stopped")
+
+    def _start_session_cleanup_task(self) -> None:
+        """Start the bot-wide session reaper exactly once."""
+        if self._session_cleanup_task is not None and not self._session_cleanup_task.done():
+            return
+        self._session_cleanup_task = asyncio.create_task(
+            self._periodic_session_cleanup(), name="maker-session-cleanup"
+        )
+        self.listen_tasks.append(self._session_cleanup_task)
 
     def _log_rate_limited(
         self, key: str, message: str, level: str = "warning", interval: float = 10.0
@@ -747,26 +809,13 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
             log_method(message)
             self._rate_limited_log_times[key] = now
 
-    def _cleanup_timed_out_sessions(self) -> None:
+    async def _cleanup_timed_out_sessions(self) -> None:
         """Remove timed-out sessions from active_sessions and clean up rate limiter."""
-        # Prune dead sessions
-        # A handler that started before the deadline may still be validating
-        # auth or signing a transaction. Releasing its reservation while it is
-        # running would let a second local session claim the same commitment.
-        dead_sessions = [
-            sid
-            for sid, session in self.active_sessions.items()
-            if session.is_timed_out() and not session.lock.locked()
-        ]
-        for sid in dead_sessions:
-            logger.debug("Cleaning up timed out session: {}", sid)
-            # A timed-out session never completed: free its committed inputs so
-            # they can be re-offered (the persisted lock would otherwise hold
-            # them until its TTL).
-            session = self.active_sessions[sid]
-            session.release_input_locks()
-            self._release_commitment_reservation(session.commitment.hex())
-            del self.active_sessions[sid]
+        for sid, session in list(self.active_sessions.items()):
+            if session.is_timed_out():
+                await self._expire_timed_out_session(sid, session)
+
+        await self._prune_pending_signed_rounds()
 
         # Ensure rate limiters are cleaned up periodically
         self._direct_connection_rate_limiter.cleanup_old_entries()

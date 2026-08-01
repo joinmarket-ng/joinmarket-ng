@@ -17,6 +17,7 @@ from pathlib import Path
 from loguru import logger
 
 from jmcore.paths import get_commitment_blacklist_path
+from jmcore.secure_files import atomic_write_private
 
 # PoDLE commitments are SHA256 hashes of an EC point, encoded as hex.
 # That means exactly 64 hex characters (32 bytes).
@@ -106,16 +107,11 @@ class CommitmentBlacklist:
     def _save_to_disk(self) -> None:
         """Save in-memory blacklist to disk."""
         try:
-            # Ensure parent directory exists
-            self.blacklist_path.parent.mkdir(parents=True, exist_ok=True)
-
-            with open(self.blacklist_path, "w", encoding="ascii") as f:
-                for commitment in sorted(self._commitments):
-                    f.write(commitment + "\n")
-                f.flush()
-            logger.debug(f"Saved {len(self._commitments)} commitments to blacklist")
+            serialized = "".join(f"{commitment}\n" for commitment in sorted(self._commitments))
+            atomic_write_private(self.blacklist_path, serialized.encode("ascii"))
         except Exception as e:
             logger.error(f"Failed to save blacklist to {self.blacklist_path}: {e}")
+            raise
 
     def is_blacklisted(self, commitment: str) -> bool:
         """
@@ -156,11 +152,15 @@ class CommitmentBlacklist:
                 return False
 
             self._commitments.add(commitment)
-            logger.debug(f"Added commitment to blacklist: {commitment[:16]}...")
 
             if persist:
-                self._save_to_disk()
+                try:
+                    self._save_to_disk()
+                except Exception:
+                    self._commitments.remove(commitment)
+                    raise
 
+            logger.debug(f"Added commitment to blacklist: {commitment[:16]}...")
             return True
 
     def check_and_add(self, commitment: str, persist: bool = True) -> bool:
@@ -190,11 +190,15 @@ class CommitmentBlacklist:
                 return False
 
             self._commitments.add(commitment)
-            logger.debug(f"Added commitment to blacklist: {commitment[:16]}...")
 
             if persist:
-                self._save_to_disk()
+                try:
+                    self._save_to_disk()
+                except Exception:
+                    self._commitments.remove(commitment)
+                    raise
 
+            logger.debug(f"Added commitment to blacklist: {commitment[:16]}...")
             return True
 
     def __len__(self) -> int:

@@ -16,6 +16,7 @@ from jmcore.models import NetworkType, Offer, OfferType
 from maker.bot import MakerBot
 from maker.coinjoin import CoinJoinState
 from maker.config import MakerConfig, OfferConfig
+from maker.maker_session import MakerSession
 from maker.offers import OfferManager
 
 
@@ -363,6 +364,25 @@ class TestOfferManagerMultiOffer:
 
 
 class TestMakerBotMultiOfferFill:
+    @staticmethod
+    def _session(
+        taker_nick: str,
+        commitment: str,
+        *,
+        state: CoinJoinState = CoinJoinState.PUBKEY_SENT,
+        timeout: float = 60.0,
+    ) -> MakerSession:
+        inner = MagicMock()
+        inner.taker_nick = taker_nick
+        inner.session_timeout_sec = timeout
+        inner.state = state
+        inner.commitment = bytes.fromhex(commitment)
+        inner.commitment_authenticated = False
+        inner.our_utxos = {}
+        inner.input_lock_owner = "test-owner"
+        inner.input_lock_ttl_sec = 3600.0
+        return MakerSession(inner)
+
     """Tests for MakerBot !fill handling with multiple offers."""
 
     @pytest.fixture
@@ -523,7 +543,7 @@ class TestMakerBotMultiOfferFill:
 
     @pytest.mark.asyncio
     async def test_fill_failure_releases_commitment_reservation(self, maker_bot):
-        """A failed fill must not consume a commitment locally."""
+        """A failed fill releases its commitment reservation."""
 
         async def mock_handle_fill(amount, commitment, taker_pk):
             return False, {"error": "invalid taker pubkey"}
@@ -542,6 +562,51 @@ class TestMakerBotMultiOfferFill:
             )
 
         assert "ac" * 32 not in maker_bot._reserved_commitments
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("session_replaced", [False, True])
+    async def test_fill_exception_removes_only_installed_candidate(
+        self, maker_bot, session_replaced
+    ):
+        """A post-install exception releases the candidate reservation only."""
+        taker_nick = "J5ExceptionTaker"
+        commitment = "a0" * 32
+        replacement = MagicMock()
+
+        def close_spawned(coro):
+            coro.close()
+
+        with (
+            patch("maker.protocol_handlers.CoinJoinSession") as mock_session_class,
+            patch("maker.protocol_handlers.check_commitment", return_value=True),
+            patch("maker.protocol_handlers.spawn_task", side_effect=close_spawned),
+        ):
+            mock_session = MagicMock()
+            mock_session.commitment = bytes.fromhex(commitment)
+            mock_session.state = CoinJoinState.PUBKEY_SENT
+            mock_session.handle_fill = AsyncMock(
+                return_value=(True, {"nacl_pubkey": "abc123", "features": []})
+            )
+            mock_session.validate_channel = MagicMock(return_value=True)
+            mock_session_class.return_value = mock_session
+
+            async def fail_send(*args, **kwargs):
+                installed_session = maker_bot.active_sessions[taker_nick]
+                assert installed_session.inner is mock_session
+                if session_replaced:
+                    maker_bot.active_sessions[taker_nick] = replacement
+                raise RuntimeError("send failed")
+
+            with patch.object(maker_bot, "_send_response", new=fail_send):
+                await maker_bot._handle_fill(
+                    taker_nick, f"fill 0 500000 taker_pk_hex P{commitment}"
+                )
+
+        assert commitment not in maker_bot._reserved_commitments
+        if session_replaced:
+            assert maker_bot.active_sessions[taker_nick] is replacement
+        else:
+            assert taker_nick not in maker_bot.active_sessions
 
     @pytest.mark.asyncio
     async def test_fill_exception_before_reservation_keeps_other_session_reservation(
@@ -601,7 +666,7 @@ class TestMakerBotMultiOfferFill:
 
     @pytest.mark.asyncio
     async def test_fill_does_not_replace_session_during_auth(self, maker_bot):
-        """A replacement cannot release a commitment while auth owns the lock."""
+        """A rejected replacement preserves the authenticating session."""
 
         def make_mock_session(*args, **kwargs):
             mock_session = MagicMock()
@@ -639,42 +704,518 @@ class TestMakerBotMultiOfferFill:
         first_session.lock.release()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("handler_name", "callback_name"),
+        [("_handle_auth", "on_auth"), ("_handle_tx", "on_tx")],
+    )
+    async def test_stale_waiter_ignores_replacement(self, maker_bot, handler_name, callback_name):
+        """A handler queued on an obsolete session must stop after acquiring its lock."""
+        taker_nick = "J5ReplacedTaker"
+        old_session = self._session(taker_nick, "a2" * 32)
+        old_session.on_auth = AsyncMock()
+        old_session.on_tx = AsyncMock()
+        replacement = MagicMock()
+        replacement.on_auth = AsyncMock()
+        replacement.on_tx = AsyncMock()
+        maker_bot.active_sessions[taker_nick] = old_session
+        commitments = set(maker_bot._reserved_commitments)
+
+        await old_session.lock.acquire()
+        task = asyncio.create_task(
+            getattr(maker_bot, handler_name)(taker_nick, f"{callback_name[3:]} payload")
+        )
+        await asyncio.sleep(0)
+        assert not task.done()
+
+        assert maker_bot.active_sessions.pop(taker_nick) is old_session
+        maker_bot.active_sessions[taker_nick] = replacement
+        old_session.lock.release()
+        await task
+
+        assert maker_bot.active_sessions[taker_nick] is replacement
+        getattr(old_session, callback_name).assert_not_awaited()
+        getattr(replacement, callback_name).assert_not_awaited()
+        old_session.inner.wallet.release_coinjoin_inputs.assert_not_called()
+        replacement.release_input_locks.assert_not_called()
+        assert maker_bot._reserved_commitments == commitments
+
+    @pytest.mark.asyncio
     async def test_timeout_cleanup_releases_commitment_reservation(self, maker_bot):
         commitment = "af" * 32
         session = MagicMock()
         session.is_timed_out.return_value = True
         session.lock = asyncio.Lock()
         session.commitment = bytes.fromhex(commitment)
+        session.state = CoinJoinState.PUBKEY_SENT
         maker_bot.active_sessions["J5TimedOutTaker"] = session
         maker_bot._reserved_commitments.add(commitment)
 
-        maker_bot._cleanup_timed_out_sessions()
+        await maker_bot._cleanup_timed_out_sessions()
 
         assert "J5TimedOutTaker" not in maker_bot.active_sessions
         assert commitment not in maker_bot._reserved_commitments
         session.release_input_locks.assert_called_once_with()
 
     @pytest.mark.asyncio
-    async def test_timeout_cleanup_defers_locked_session(self, maker_bot):
+    async def test_auth_received_timeout_releases_commitment_for_replacement(self, maker_bot):
+        commitment = "b3" * 32
+        session = MagicMock()
+        session.is_timed_out.return_value = True
+        session.lock = asyncio.Lock()
+        session.commitment = bytes.fromhex(commitment)
+        session.state = CoinJoinState.AUTH_RECEIVED
+        session.ioauth_boundary_crossed = False
+        maker_bot.active_sessions["J5AuthStageTaker"] = session
+        maker_bot._reserved_commitments.add(commitment)
+        maker_bot._broadcast_commitment = AsyncMock(return_value=True)
+
+        await maker_bot._cleanup_timed_out_sessions()
+
+        assert commitment not in maker_bot._reserved_commitments
+        maker_bot._broadcast_commitment.assert_not_awaited()
+        session.release_input_locks.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_ioauth_state_ordering_across_successful_fanout(self, maker_bot):
+        commitment = "bc" * 32
+        session = self._session("J5FanoutTaker", commitment, state=CoinJoinState.AUTH_RECEIVED)
+        session.inner.crypto.encrypt.return_value = "encrypted-ioauth"
+        observed_states: list[CoinJoinState] = []
+
+        async def record_state(*args):
+            observed_states.append(session.state)
+
+        first = MagicMock()
+        first.send_private_message = AsyncMock(side_effect=record_state)
+        second = MagicMock()
+        second.send_private_message = AsyncMock(side_effect=record_state)
+        maker_bot.directory_clients = {"first": first, "second": second}
+        maker_bot.active_sessions[session.taker_nick] = session
+
+        sent = await session.send_response(
+            maker_bot,
+            "ioauth",
+            {
+                "utxo_list": "ab:0",
+                "auth_pub": "auth-pub",
+                "cj_addr": "coinjoin-address",
+                "change_addr": "change-address",
+                "btc_sig": "signature",
+            },
+        )
+
+        assert sent is True
+        assert observed_states == [
+            CoinJoinState.IOAUTH_SEND_STARTED,
+            CoinJoinState.IOAUTH_SEND_STARTED,
+        ]
+        assert session.state == CoinJoinState.IOAUTH_SENT
+        states = list(CoinJoinState)
+        assert states.index(CoinJoinState.AUTH_RECEIVED) < states.index(
+            CoinJoinState.IOAUTH_SEND_STARTED
+        )
+        assert states.index(CoinJoinState.IOAUTH_SEND_STARTED) < states.index(
+            CoinJoinState.IOAUTH_SENT
+        )
+
+    @pytest.mark.asyncio
+    async def test_partial_ioauth_fanout_timeout_persists_and_releases_pre_sign_locks(
+        self, maker_bot
+    ):
+        commitment = "bd" * 32
+        outpoint = ("ab" * 32, 0)
+        session = self._session(
+            "J5PartialFanoutTaker", commitment, state=CoinJoinState.AUTH_RECEIVED
+        )
+        session.inner.crypto.encrypt.return_value = "encrypted-ioauth"
+        session.inner.our_utxos = {outpoint: MagicMock()}
+        session.inner.signing_boundary_crossed = False
+        second_started = asyncio.Event()
+        second_cancelled = asyncio.Event()
+
+        first = MagicMock()
+        first.send_private_message = AsyncMock()
+        second = MagicMock()
+
+        async def block_second(*args):
+            second_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                second_cancelled.set()
+                raise
+
+        second.send_private_message = AsyncMock(side_effect=block_second)
+        maker_bot.directory_clients = {"first": first, "second": second}
+        maker_bot.active_sessions[session.taker_nick] = session
+        maker_bot._reserved_commitments.add(commitment)
+        maker_bot._broadcast_commitment = AsyncMock(return_value=True)
+
+        async def send_ioauth() -> None:
+            await session.send_response(
+                maker_bot,
+                "ioauth",
+                {
+                    "utxo_list": "ab:0",
+                    "auth_pub": "auth-pub",
+                    "cj_addr": "coinjoin-address",
+                    "change_addr": "change-address",
+                    "btc_sig": "signature",
+                },
+            )
+
+        dispatch = asyncio.create_task(
+            maker_bot._dispatch_session_handler(
+                session, send_ioauth, name="test-partial-ioauth-fanout"
+            )
+        )
+        await second_started.wait()
+
+        first.send_private_message.assert_awaited_once()
+        assert session.state == CoinJoinState.IOAUTH_SEND_STARTED
+        session.deadline = asyncio.get_running_loop().time() - 1
+        session.inner.deadline = session.deadline
+        await maker_bot._cleanup_timed_out_sessions()
+        await dispatch
+
+        assert second_cancelled.is_set()
+        assert session.state == CoinJoinState.IOAUTH_SEND_STARTED
+        assert session.taker_nick not in maker_bot.active_sessions
+        assert commitment not in maker_bot._reserved_commitments
+        maker_bot._broadcast_commitment.assert_awaited_once_with(commitment)
+        session.inner.wallet.release_coinjoin_inputs.assert_called_once_with(
+            {outpoint}, owner=session.inner.input_lock_owner
+        )
+        session.inner.wallet.renew_coinjoin_inputs.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_ioauth_preparation_failure_does_not_persist_commitment(self, maker_bot):
+        commitment = "be" * 32
+        session = self._session(
+            "J5IoauthPreparationFailure", commitment, state=CoinJoinState.AUTH_RECEIVED
+        )
+        session.inner.crypto.encrypt.side_effect = ValueError("encryption failed")
+        client = MagicMock()
+        client.send_private_message = AsyncMock()
+        maker_bot.directory_clients = {"only": client}
+        maker_bot.active_sessions[session.taker_nick] = session
+        maker_bot._reserved_commitments.add(commitment)
+        maker_bot._broadcast_commitment = AsyncMock(return_value=True)
+
+        sent = await session.send_response(
+            maker_bot,
+            "ioauth",
+            {
+                "utxo_list": "ab:0",
+                "auth_pub": "auth-pub",
+                "cj_addr": "coinjoin-address",
+                "change_addr": "change-address",
+                "btc_sig": "signature",
+            },
+        )
+
+        assert sent is False
+        assert session.state == CoinJoinState.AUTH_RECEIVED
+        client.send_private_message.assert_not_awaited()
+        session.deadline = asyncio.get_running_loop().time() - 1
+        session.inner.deadline = session.deadline
+        await maker_bot._cleanup_timed_out_sessions()
+
+        maker_bot._broadcast_commitment.assert_not_awaited()
+        assert commitment not in maker_bot._reserved_commitments
+        session.inner.wallet.release_coinjoin_inputs.assert_called_once_with(
+            set(), owner=session.inner.input_lock_owner
+        )
+
+    @pytest.mark.asyncio
+    async def test_timeout_cleanup_keeps_ioauth_unpersisted_reservation(self, maker_bot):
+        commitment = "b3" * 32
+        session = MagicMock()
+        session.is_timed_out.return_value = True
+        session.lock = asyncio.Lock()
+        session.commitment = bytes.fromhex(commitment)
+        session.state = CoinJoinState.IOAUTH_SENT
+        session.ioauth_boundary_crossed = True
+        maker_bot.active_sessions["J5UnpersistedTaker"] = session
+        maker_bot._reserved_commitments.add(commitment)
+        maker_bot._broadcast_commitment = AsyncMock(return_value=False)
+
+        await maker_bot._cleanup_timed_out_sessions()
+
+        assert "J5UnpersistedTaker" not in maker_bot.active_sessions
+        assert commitment in maker_bot._reserved_commitments
+        session.release_input_locks.assert_called_once_with()
+        maker_bot._broadcast_commitment.assert_awaited_once_with(commitment)
+
+    @pytest.mark.asyncio
+    async def test_timeout_cleanup_retains_sig_sent_input_locks(self, maker_bot):
+        commitment = "b4" * 32
+        session = MagicMock()
+        session.is_timed_out.return_value = True
+        session.lock = asyncio.Lock()
+        session.commitment = bytes.fromhex(commitment)
+        session.state = CoinJoinState.SIG_SENT
+        maker_bot.active_sessions["J5SignedTaker"] = session
+        maker_bot._reserved_commitments.add(commitment)
+        maker_bot._broadcast_commitment = AsyncMock(return_value=True)
+
+        await maker_bot._cleanup_timed_out_sessions()
+
+        assert "J5SignedTaker" not in maker_bot.active_sessions
+        assert commitment not in maker_bot._reserved_commitments
+        session.release_input_locks.assert_not_called()
+        session.retain_input_locks.assert_called_once_with()
+        maker_bot._broadcast_commitment.assert_awaited_once_with(commitment)
+
+    @pytest.mark.asyncio
+    async def test_timeout_cleanup_detaches_locked_session(self, maker_bot):
         commitment = "b0" * 32
         session = MagicMock()
         session.is_timed_out.return_value = True
         session.lock = asyncio.Lock()
         await session.lock.acquire()
         session.commitment = bytes.fromhex(commitment)
+        session.state = CoinJoinState.PUBKEY_SENT
         maker_bot.active_sessions["J5BusyTaker"] = session
         maker_bot._reserved_commitments.add(commitment)
 
-        maker_bot._cleanup_timed_out_sessions()
+        await maker_bot._cleanup_timed_out_sessions()
 
-        assert maker_bot.active_sessions["J5BusyTaker"] is session
-        assert commitment in maker_bot._reserved_commitments
-        session.release_input_locks.assert_not_called()
-
-        session.lock.release()
-        maker_bot._cleanup_timed_out_sessions()
         assert "J5BusyTaker" not in maker_bot.active_sessions
         assert commitment not in maker_bot._reserved_commitments
+        session.release_input_locks.assert_called_once_with()
+        session.lock.release()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("handler_name", "callback_name"),
+        [("_handle_auth", "on_auth"), ("_handle_tx", "on_tx")],
+    )
+    async def test_handler_deadline_cancels_and_unwinds_before_cleanup(
+        self, maker_bot, handler_name, callback_name
+    ):
+        taker_nick = "J5BlockedHandler"
+        commitment = "b5" * 32
+        session = self._session(taker_nick, commitment, timeout=0.01)
+        cancelled_while_locked = False
+        started = asyncio.Event()
+
+        async def block(*args):
+            nonlocal cancelled_while_locked
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled_while_locked = session.lock.locked()
+                raise
+
+        setattr(session, callback_name, block)
+        maker_bot.active_sessions[taker_nick] = session
+        maker_bot._reserved_commitments.add(commitment)
+
+        dispatch = asyncio.create_task(
+            getattr(maker_bot, handler_name)(taker_nick, "message payload")
+        )
+        await started.wait()
+        await asyncio.sleep(0.02)
+        await maker_bot._cleanup_timed_out_sessions()
+        await dispatch
+
+        assert cancelled_while_locked is True
+        assert session.lock.locked() is False
+        assert taker_nick not in maker_bot.active_sessions
+        assert commitment not in maker_bot._reserved_commitments
+        session.inner.wallet.release_coinjoin_inputs.assert_called_once_with(
+            set(), owner="test-owner"
+        )
+
+    @pytest.mark.asyncio
+    async def test_lock_wait_timeout_detaches_without_holder_unwind(self, maker_bot):
+        taker_nick = "J5BlockedLock"
+        commitment = "b6" * 32
+        session = self._session(taker_nick, commitment, timeout=0.0)
+        await session.lock.acquire()
+        session.on_auth = AsyncMock()
+        maker_bot.active_sessions[taker_nick] = session
+        maker_bot._reserved_commitments.add(commitment)
+
+        dispatch = asyncio.create_task(maker_bot._handle_auth(taker_nick, "auth payload"))
+        await asyncio.sleep(0)
+        await maker_bot._cleanup_timed_out_sessions()
+        await dispatch
+
+        assert taker_nick not in maker_bot.active_sessions
+        assert commitment not in maker_bot._reserved_commitments
+        session.on_auth.assert_not_awaited()
+        session.lock.release()
+
+    @pytest.mark.asyncio
+    async def test_reaper_detaches_handler_that_suppresses_cancellation(self, maker_bot):
+        taker_nick = "J5UncooperativeTaker"
+        commitment = "b9" * 32
+        session = self._session(taker_nick, commitment, timeout=60.0)
+        session.inner.crypto.is_encrypted = True
+        session.inner.crypto.decrypt.return_value = (
+            f"{'ab' * 32}:0|02{'bc' * 32}|02{'cd' * 32}|11|22"
+        )
+        handler_started = asyncio.Event()
+        cancelled = asyncio.Event()
+        resume = asyncio.Event()
+
+        async def suppress_cancellation(*args, **kwargs):
+            handler_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                await resume.wait()
+            return True, {
+                "utxo_list": "ab:0",
+                "auth_pub": "02" + "de" * 32,
+                "cj_addr": "bcrt1qcoinjoin",
+                "change_addr": "bcrt1qchange",
+                "btc_sig": "signature",
+            }
+
+        session.inner.handle_auth = AsyncMock(side_effect=suppress_cancellation)
+        session.send_response = AsyncMock()
+        maker_bot.active_sessions[taker_nick] = session
+        maker_bot._reserved_commitments.add(commitment)
+
+        dispatch = asyncio.create_task(
+            maker_bot._handle_auth(taker_nick, "auth ciphertext", source="dir:test")
+        )
+        await handler_started.wait()
+        loop = asyncio.get_running_loop()
+        session.deadline = loop.time() - 1.0
+        session.inner.deadline = session.deadline
+        started = loop.time()
+        await maker_bot._cleanup_timed_out_sessions()
+        elapsed = loop.time() - started
+        await dispatch
+
+        assert cancelled.is_set()
+        assert elapsed < 0.8
+        assert session.detached is True
+        assert taker_nick not in maker_bot.active_sessions
+        detached_task = session.handler_task
+        assert detached_task is not None
+        assert detached_task in maker_bot._detached_handler_tasks
+
+        resume.set()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        session.send_response.assert_not_awaited()
+        assert maker_bot._detached_handler_tasks == set()
+
+    @pytest.mark.asyncio
+    async def test_shutdown_bounded_with_permanently_cancellation_suppressing_handler(
+        self, maker_bot
+    ):
+        taker_nick = "J5PermanentHandler"
+        commitment = "ba" * 32
+        session = self._session(taker_nick, commitment, timeout=60.0)
+        started = asyncio.Event()
+        terminate = asyncio.Event()
+        cancellation_count = 0
+
+        async def suppress_every_cancellation(*args):
+            nonlocal cancellation_count
+            started.set()
+            while not terminate.is_set():
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    cancellation_count += 1
+
+        session.on_auth = suppress_every_cancellation
+        maker_bot.active_sessions[taker_nick] = session
+        maker_bot._reserved_commitments.add(commitment)
+        dispatch = asyncio.create_task(maker_bot._handle_auth(taker_nick, "auth payload"))
+        await started.wait()
+        session.deadline = asyncio.get_running_loop().time() - 1
+        await maker_bot._cleanup_timed_out_sessions()
+        await dispatch
+        detached_task = session.handler_task
+        assert detached_task is not None
+
+        started_at = asyncio.get_running_loop().time()
+        await maker_bot.stop()
+
+        assert asyncio.get_running_loop().time() - started_at < 1.5
+        assert cancellation_count >= 2
+        assert detached_task in maker_bot._detached_handler_tasks
+
+        terminate.set()
+        detached_task.cancel()
+        await asyncio.wait_for(detached_task, timeout=1)
+        await asyncio.sleep(0)
+        assert maker_bot._detached_handler_tasks == set()
+
+    @pytest.mark.asyncio
+    async def test_handler_admission_cap_prevents_unbounded_task_creation(self, maker_bot):
+        from maker.protocol_handlers import MAX_SESSION_HANDLER_TASKS
+
+        session = self._session("J5CappedTaker", "bb" * 32)
+        session.on_auth = AsyncMock()
+        maker_bot.active_sessions[session.taker_nick] = session
+        maker_bot._session_handler_task_count = MAX_SESSION_HANDLER_TASKS
+
+        await maker_bot._handle_auth(session.taker_nick, "auth payload")
+
+        session.on_auth.assert_not_awaited()
+        assert maker_bot._session_handler_task_count == MAX_SESSION_HANDLER_TASKS
+
+    @pytest.mark.asyncio
+    async def test_timeout_expiration_ignores_replacement_identity(self, maker_bot):
+        taker_nick = "J5TimeoutReplacement"
+        stale = MagicMock()
+        stale.lock = asyncio.Lock()
+        stale.commitment = bytes.fromhex("b7" * 32)
+        stale.state = CoinJoinState.PUBKEY_SENT
+        replacement = MagicMock()
+        maker_bot.active_sessions[taker_nick] = replacement
+
+        expired = await maker_bot._expire_timed_out_session(taker_nick, stale)
+
+        assert expired is False
+        assert maker_bot.active_sessions[taker_nick] is replacement
+        stale.release_input_locks.assert_not_called()
+        replacement.release_input_locks.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_directory_dispatch_continues_after_session_timeout(self, maker_bot):
+        taker_nick = "J5DirectoryTimeout"
+        commitment = "b8" * 32
+        session = self._session(taker_nick, commitment, timeout=0.01)
+        started = asyncio.Event()
+
+        async def block_auth(*args):
+            started.set()
+            await asyncio.Event().wait()
+
+        session.on_auth = AsyncMock(side_effect=block_auth)
+        maker_bot.active_sessions[taker_nick] = session
+        maker_bot._reserved_commitments.add(commitment)
+        maker_bot._handle_push = AsyncMock()
+
+        dispatch = asyncio.create_task(
+            maker_bot._handle_privmsg(
+                f"{taker_nick}!{maker_bot.nick}!!auth payload", source="dir:test"
+            )
+        )
+        await started.wait()
+        await asyncio.sleep(0.02)
+        await maker_bot._cleanup_timed_out_sessions()
+        await dispatch
+        await maker_bot._handle_privmsg(
+            f"{taker_nick}!{maker_bot.nick}!!push transaction", source="dir:test"
+        )
+
+        assert taker_nick not in maker_bot.active_sessions
+        maker_bot._handle_push.assert_awaited_once_with(
+            taker_nick, "push transaction", source="dir:test"
+        )
 
     @pytest.mark.asyncio
     async def test_fill_invalid_offer_id_rejected(self, maker_bot):

@@ -12,7 +12,8 @@ https://mypy.readthedocs.io/en/stable/more_types.html#mixin-classes
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Protocol
+from collections.abc import Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Protocol
 
 from jmcore.crypto import NickIdentity
 from jmcore.deduplication import MessageDeduplicator
@@ -26,9 +27,14 @@ from jmwallet.wallet.service import WalletService
 from maker.config import MakerConfig
 from maker.directory_pool import MakerDirectoryPool
 from maker.fidelity import FidelityBondInfo
-from maker.maker_session import MakerSession
+from maker.maker_session import MakerSession, PendingSignedRound
 from maker.offers import OfferManager
 from maker.rate_limiting import DirectConnectionRateLimiter, OrderbookRateLimiter
+
+if TYPE_CHECKING:
+    from jmwallet.history import TransactionHistoryEntry
+
+    from maker.direct_connection import DirectConnectionState
 
 
 class MakerBotProtocol(Protocol):
@@ -54,6 +60,7 @@ class MakerBotProtocol(Protocol):
     offer_manager: OfferManager
     listen_tasks: list[asyncio.Task[None]]
     direct_connections: dict[str, TCPConnection]
+    _direct_connection_states: dict[TCPConnection, DirectConnectionState]
     _message_deduplicator: MessageDeduplicator
     _message_rate_limiter: RateLimiter
     _orderbook_rate_limiter: OrderbookRateLimiter
@@ -65,6 +72,11 @@ class MakerBotProtocol(Protocol):
     _reserved_commitments: set[str]
     _hp2_own_broadcast_semaphore: asyncio.Semaphore
     _hp2_relay_broadcast_semaphore: asyncio.Semaphore
+    _session_cleanup_task: asyncio.Task[None] | None
+    _session_handler_task_count: int
+    _detached_handler_tasks: set[asyncio.Task[None]]
+    _pending_signed_rounds: dict[tuple[str, str], PendingSignedRound]
+    _pending_signed_rounds_lock: asyncio.Lock
 
     # -- Cross-mixin methods --
 
@@ -85,7 +97,33 @@ class MakerBotProtocol(Protocol):
     ) -> None: ...
 
     # Defined in MakerBot, called by BackgroundTasksMixin
-    def _cleanup_timed_out_sessions(self) -> None: ...
+    async def _cleanup_timed_out_sessions(self) -> None: ...
+
+    def _start_session_cleanup_task(self) -> None: ...
+
+    def _prune_done_tasks(self) -> None: ...
+
+    async def _expire_timed_out_session(self, taker_nick: str, session: MakerSession) -> bool: ...
+
+    async def _dispatch_session_handler(
+        self,
+        session: MakerSession,
+        handler: Callable[[], Awaitable[None]],
+        *,
+        name: str,
+    ) -> None: ...
+
+    def _session_handler_done(self, task: asyncio.Task[None]) -> None: ...
+
+    def _register_detached_handler_task(self, task: asyncio.Task[None]) -> None: ...
+
+    async def _register_pending_signed_round(self, session: MakerSession, txid: str) -> bool: ...
+
+    async def _prune_pending_signed_rounds(self) -> None: ...
+
+    def _prune_pending_signed_rounds_locked(self, now: float) -> None: ...
+
+    async def _drain_pending_signed_rounds(self) -> None: ...
 
     def _release_commitment_reservation(self, commitment: str) -> None: ...
 
@@ -95,6 +133,16 @@ class MakerBotProtocol(Protocol):
 
     # Defined in BackgroundTasksMixin, called by ProtocolHandlersMixin and MakerSession
     async def _deferred_wallet_resync(self) -> None: ...
+
+    async def _periodic_session_cleanup(self) -> None: ...
+
+    async def _update_pending_history(self) -> None: ...
+
+    async def _discover_txid_for_address(self, address: str) -> str | None: ...
+
+    async def _chain_confirmations_for_entry(
+        self, entry: TransactionHistoryEntry
+    ) -> int | None: ...
 
     # Defined in MakerBot, called by DirectConnectionMixin
     def _log_rate_limited(
@@ -121,10 +169,12 @@ class MakerBotProtocol(Protocol):
         self, connection: TCPConnection, data: bytes, peer_str: str
     ) -> bool: ...
 
+    def _remove_direct_connection(self, connection: TCPConnection) -> None: ...
+
     # Defined in ProtocolHandlersMixin, called internally with Protocol-typed self
     async def _send_response(self, taker_nick: str, command: str, data: dict[str, Any]) -> None: ...
 
-    async def _broadcast_commitment(self, commitment: str) -> None: ...
+    async def _broadcast_commitment(self, commitment: str) -> bool: ...
 
     async def _handle_privmsg(self, line: str, source: str = "unknown") -> None: ...
 

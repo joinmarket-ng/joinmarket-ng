@@ -4,10 +4,12 @@ Tests for the commitment blacklist module.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
 
+from jmcore import secure_files
 from jmcore.commitment_blacklist import CommitmentBlacklist
 
 
@@ -82,6 +84,61 @@ class TestCommitmentBlacklist:
         assert len(blacklist2) == 2
         assert "e" * 64 in blacklist2
         assert "f" * 64 in blacklist2
+
+    @pytest.mark.parametrize("method_name", ["add", "check_and_add"])
+    def test_persistence_failure_rolls_back_for_retry(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, method_name: str
+    ) -> None:
+        blacklist = CommitmentBlacklist(tmp_path / "commitmentlist")
+        commitment = "1" * 64
+
+        def fail_save() -> None:
+            raise OSError("disk full")
+
+        with monkeypatch.context() as patch_context:
+            patch_context.setattr(blacklist, "_save_to_disk", fail_save)
+            with pytest.raises(OSError, match="disk full"):
+                getattr(blacklist, method_name)(commitment)
+
+        assert commitment not in blacklist
+        assert getattr(blacklist, method_name)(commitment) is True
+        assert commitment in CommitmentBlacklist(tmp_path / "commitmentlist")
+
+    def test_failed_atomic_replace_preserves_previous_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        blacklist_path = tmp_path / "commitmentlist"
+        previous_commitment = "1" * 64
+        previous_contents = f"{previous_commitment}\n".encode("ascii")
+        blacklist_path.write_bytes(previous_contents)
+        blacklist = CommitmentBlacklist(blacklist_path)
+        new_commitment = "2" * 64
+
+        def fail_replace(
+            source: str | os.PathLike[str], destination: str | os.PathLike[str]
+        ) -> None:
+            raise OSError("replacement failed")
+
+        with monkeypatch.context() as patch_context:
+            patch_context.setattr(secure_files.os, "replace", fail_replace)
+            with pytest.raises(OSError, match="replacement failed"):
+                blacklist.add(new_commitment)
+
+        assert blacklist_path.read_bytes() == previous_contents
+        assert previous_commitment in blacklist
+        assert new_commitment not in blacklist
+
+    def test_atomic_save_persists_complete_sorted_private_file(self, tmp_path: Path) -> None:
+        blacklist_path = tmp_path / "commitmentlist"
+        blacklist = CommitmentBlacklist(blacklist_path)
+        commitments = {"b" * 64, "1" * 64, "a" * 64}
+
+        for commitment in commitments:
+            assert blacklist.add(commitment) is True
+
+        expected = "".join(f"{commitment}\n" for commitment in sorted(commitments)).encode("ascii")
+        assert blacklist_path.read_bytes() == expected
+        assert blacklist_path.stat().st_mode & 0o777 == 0o600
 
     def test_case_insensitivity(self, tmp_path: Path) -> None:
         """Test that commitments are case-insensitive."""

@@ -11,8 +11,11 @@ import asyncio
 import base64
 import json
 import os
+import time
+from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
+from jmcore.bitcoin import get_txid
 from jmcore.commitment_blacklist import add_commitment, check_commitment, validate_commitment_hex
 from jmcore.crypto import NickIdentity, verify_signed_privmsg
 from jmcore.deduplication import MessageDeduplicator
@@ -30,13 +33,20 @@ from loguru import logger
 from maker.coinjoin import CoinJoinSession, CoinJoinState
 from maker.config import MakerConfig
 from maker.fidelity import FidelityBondInfo, create_fidelity_bond_proof
-from maker.maker_session import MakerSession
+from maker.maker_session import MakerSession, PendingSignedRound
 from maker.offers import OfferManager
 from maker.protocols import MakerBotProtocol
 from maker.rate_limiting import DirectConnectionRateLimiter, OrderbookRateLimiter
 
 if TYPE_CHECKING:
     from jmcore.network import TCPConnection
+
+
+_HANDLER_CANCEL_GRACE_SEC = 0.5
+# Admission is capped before task creation, which also bounds the
+# cancellation-suppressing subset retained after reaper detachment.
+MAX_SESSION_HANDLER_TASKS = 128
+MAX_PENDING_SIGNED_ROUNDS = 1024
 
 
 class ProtocolHandlersMixin:
@@ -416,6 +426,7 @@ class ProtocolHandlersMixin:
         simultaneously, each with a unique ID.
         """
         reservation_owned = False
+        session: MakerSession | None = None
         try:
             # Check for self-CoinJoin (same wallet running both maker and taker)
             if taker_nick in self._own_wallet_nicks:
@@ -548,9 +559,8 @@ class ProtocolHandlersMixin:
         except Exception as e:
             if reservation_owned:
                 self._release_commitment_reservation(commitment)
-                active_session = self.active_sessions.get(taker_nick)
-                if active_session is not None and active_session.commitment.hex() == commitment:
-                    active_session.release_input_locks()
+            if session is not None:
+                if self.active_sessions.get(taker_nick) is session:
                     self.active_sessions.pop(taker_nick, None)
             logger.error(f"Failed to handle !fill: {e}")
 
@@ -570,8 +580,71 @@ class ProtocolHandlersMixin:
             logger.warning(f"No active session for {taker_nick}")
             return
 
-        async with session.lock:
-            await session.on_auth(self, msg, source)
+        await self._dispatch_session_handler(
+            session,
+            lambda: session.on_auth(self, msg, source),
+            name=f"maker-auth-{taker_nick}",
+        )
+
+    async def _dispatch_session_handler(
+        self: MakerBotProtocol,
+        session: MakerSession,
+        handler: Callable[[], Awaitable[None]],
+        *,
+        name: str,
+    ) -> None:
+        """Run a handler independently so the reaper cannot cancel a directory listener."""
+        if self._session_handler_task_count >= MAX_SESSION_HANDLER_TASKS:
+            self._log_rate_limited(
+                "maker-session-handler-cap",
+                f"Dropping maker session handler at task cap ({MAX_SESSION_HANDLER_TASKS})",
+                interval=10.0,
+            )
+            return
+        self._session_handler_task_count += 1
+        task = asyncio.create_task(session.run_handler(self, handler), name=name)
+        task.add_done_callback(self._session_handler_done)
+        detached_wait = asyncio.create_task(session.detached_event.wait())
+        try:
+            done, _ = await asyncio.wait({task, detached_wait}, return_when=asyncio.FIRST_COMPLETED)
+            if task in done:
+                try:
+                    task.result()
+                except asyncio.CancelledError:
+                    if not session.expired:
+                        raise
+            else:
+                self._register_detached_handler_task(task)
+        except asyncio.CancelledError:
+            task.cancel()
+            if not task.done():
+                self._register_detached_handler_task(task)
+            raise
+        finally:
+            detached_wait.cancel()
+            await asyncio.gather(detached_wait, return_exceptions=True)
+
+    def _session_handler_done(self: MakerBotProtocol, task: asyncio.Task[None]) -> None:
+        """Release handler admission and remove completed detached tasks."""
+        self._detached_handler_tasks.discard(task)
+        self._session_handler_task_count -= 1
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+
+    def _register_detached_handler_task(self: MakerBotProtocol, task: asyncio.Task[None]) -> None:
+        """Keep a strong, bounded reference to a cancellation-suppressing handler."""
+        if task.done():
+            return
+        # Admission is capped before creation, so this condition indicates an
+        # internal accounting error rather than attacker-controlled growth.
+        if len(self._detached_handler_tasks) >= MAX_SESSION_HANDLER_TASKS:
+            logger.error("Detached maker handler registry reached its hard cap")
+            return
+        self._detached_handler_tasks.add(task)
 
     async def _handle_tx(
         self: MakerBotProtocol, taker_nick: str, msg: str, source: str = "unknown"
@@ -587,26 +660,144 @@ class ProtocolHandlersMixin:
             logger.warning(f"No active session for {taker_nick}")
             return
 
-        async with session.lock:
-            await session.on_tx(self, msg, source)
+        await self._dispatch_session_handler(
+            session,
+            lambda: session.on_tx(self, msg, source),
+            name=f"maker-tx-{taker_nick}",
+        )
 
-    async def _handle_push(self, taker_nick: str, msg: str, source: str = "unknown") -> None:
+    async def _expire_timed_out_session(
+        self: MakerBotProtocol, taker_nick: str, session: MakerSession
+    ) -> bool:
+        """Cancel, detach, and clean one expired session by object identity."""
+        if self.active_sessions.get(taker_nick) is not session or session.cleanup_started is True:
+            return False
+
+        session.cleanup_started = True
+        session.expired = True
+        handler_task = session.handler_task
+        if handler_task is not None and not handler_task.done():
+            handler_task.cancel()
+            try:
+                await asyncio.wait({handler_task}, timeout=_HANDLER_CANCEL_GRACE_SEC)
+            except asyncio.CancelledError:
+                # Shutdown also cancels the reaper. Expiration cleanup must
+                # still complete after the handler cancellation request.
+                pass
+            if not handler_task.done():
+                self._register_detached_handler_task(handler_task)
+
+        if self.active_sessions.get(taker_nick) is session:
+            self.active_sessions.pop(taker_nick)
+        session.detached = True
+        session.detached_event.set()
+        state = session.state
+        logger.debug("Cleaning up timed out session: {} (state={})", taker_nick, state)
+
+        # IOAUTH only reveals inputs and addresses. Until signatures have been
+        # produced, those inputs can safely return to the offer pool.
+        if session.signing_boundary_crossed is True or state in {
+            CoinJoinState.SIG_SENT,
+            CoinJoinState.COMPLETE,
+        }:
+            session.retain_input_locks()
+        else:
+            session.release_input_locks()
+
+        commitment = session.commitment.hex()
+        disclosed = state in {
+            CoinJoinState.IOAUTH_SEND_STARTED,
+            CoinJoinState.IOAUTH_SENT,
+            CoinJoinState.TX_RECEIVED,
+            CoinJoinState.SIG_SENT,
+            CoinJoinState.COMPLETE,
+        }
+        if commitment in self._reserved_commitments and disclosed:
+            if await self._broadcast_commitment(commitment):
+                self._release_commitment_reservation(commitment)
+        else:
+            self._release_commitment_reservation(commitment)
+
+        return True
+
+    async def _register_pending_signed_round(
+        self: MakerBotProtocol, session: MakerSession, txid: str
+    ) -> bool:
+        """Retain bounded post-sign identity and lease ownership for ``!push``."""
+        if len(txid) != 64:
+            return False
+        now = time.monotonic()
+        pending_ttl = session.inner.pending_broadcast_ttl_sec
+        record = PendingSignedRound(
+            taker_nick=session.taker_nick,
+            txid=txid.lower(),
+            input_lock_owner=session.inner.input_lock_owner,
+            outpoints=frozenset(session.our_utxos),
+            expires_at=now + pending_ttl,
+            lock_ttl_sec=pending_ttl,
+        )
+        async with self._pending_signed_rounds_lock:
+            self._prune_pending_signed_rounds_locked(now)
+            key = (record.taker_nick, record.txid)
+            if key not in self._pending_signed_rounds and (
+                len(self._pending_signed_rounds) >= MAX_PENDING_SIGNED_ROUNDS
+            ):
+                logger.error(
+                    f"Pending signed-round registry reached its cap ({MAX_PENDING_SIGNED_ROUNDS})"
+                )
+                return False
+            self._pending_signed_rounds[key] = record
+        return True
+
+    def _prune_pending_signed_rounds_locked(self: MakerBotProtocol, now: float) -> None:
+        for key, record in list(self._pending_signed_rounds.items()):
+            if record.expires_at <= now:
+                self._pending_signed_rounds.pop(key, None)
+
+    async def _prune_pending_signed_rounds(self: MakerBotProtocol) -> None:
+        """Forget expired push authorization while persisted leases expire independently."""
+        async with self._pending_signed_rounds_lock:
+            self._prune_pending_signed_rounds_locked(time.monotonic())
+
+    async def _drain_pending_signed_rounds(self: MakerBotProtocol) -> None:
+        """Renew post-sign leases for shutdown, then discard in-memory push state."""
+        async with self._pending_signed_rounds_lock:
+            records = list(self._pending_signed_rounds.values())
+            self._pending_signed_rounds.clear()
+        for record in records:
+            try:
+                renewed = self.wallet.renew_coinjoin_inputs(
+                    set(record.outpoints),
+                    owner=record.input_lock_owner,
+                    ttl=record.lock_ttl_sec,
+                )
+            except Exception as exc:
+                logger.error(f"Failed to retain pending signed-round locks on shutdown: {exc}")
+                continue
+            if not renewed:
+                logger.error(
+                    f"Pending signed-round input ownership was lost for {record.taker_nick}"
+                )
+
+    async def _handle_push(
+        self: MakerBotProtocol, taker_nick: str, msg: str, source: str = "unknown"
+    ) -> None:
         """Handle !push request from taker.
 
         The push message contains a base64-encoded signed transaction that the taker
         wants us to broadcast. This provides privacy benefits as the taker's IP is
         not linked to the transaction broadcast.
 
-        Per JoinMarket protocol, makers broadcast "unquestioningly" - we already
-        signed this transaction so it must be valid from our perspective. We don't
-        verify or check the result, just broadcast and move on.
+        Reference-compatible immediate pushes are broadcast only when they match
+        a signed round retained for this taker and its input lease is still owned.
 
         Security considerations:
         - DoS risk: A malicious taker could spam !push messages with invalid data
         - Mitigation: Generic per-peer rate limiting (in directory server) prevents
           this from being a significant attack vector
-        - We intentionally do NOT validate session state here to maintain protocol
-          compatibility and simplicity. The rate limiter is the primary defense.
+        - The signed transaction's non-witness txid must match the retained round.
+        - Owner-qualified input locks are atomically verified and renewed before
+          broadcast, preventing a stale delayed push after lease reacquisition.
 
         Format: push <base64_transaction>
 
@@ -622,16 +813,45 @@ class ProtocolHandlersMixin:
             tx_b64 = parts[1]
 
             try:
-                tx_bytes = base64.b64decode(tx_b64)
+                tx_bytes = base64.b64decode(tx_b64, validate=True)
                 tx_hex = tx_bytes.hex()
+                txid = get_txid(tx_hex)
             except Exception as e:
                 logger.error(f"Failed to decode !push transaction: {e}")
                 return
 
-            logger.info(f"Received !push from {taker_nick}, broadcasting transaction...")
+            key = (taker_nick, txid.lower())
+            async with self._pending_signed_rounds_lock:
+                self._prune_pending_signed_rounds_locked(time.monotonic())
+                pending = self._pending_signed_rounds.get(key)
+                if pending is None:
+                    logger.warning(
+                        f"Rejecting unmatched !push from {taker_nick} for {txid[:16]}..."
+                    )
+                    return
+                try:
+                    renewed = self.wallet.renew_coinjoin_inputs(
+                        set(pending.outpoints),
+                        owner=pending.input_lock_owner,
+                        ttl=pending.lock_ttl_sec,
+                    )
+                except Exception as exc:
+                    logger.error(f"Rejecting !push after input-lock renewal failure: {exc}")
+                    self._pending_signed_rounds.pop(key, None)
+                    return
+                if not renewed:
+                    logger.error(
+                        f"Rejecting !push from {taker_nick}: signed-round input ownership was lost"
+                    )
+                    self._pending_signed_rounds.pop(key, None)
+                    return
+                # Consume before the network await so duplicate pushes cannot
+                # race a second broadcast attempt. The renewed persisted lease
+                # remains for the complete pending-broadcast window.
+                self._pending_signed_rounds.pop(key, None)
 
-            # Broadcast "unquestioningly" - we already signed it, so it's valid
-            # from our perspective. Don't check the result.
+            logger.info(f"Received matched !push from {taker_nick}, broadcasting transaction...")
+
             try:
                 txid = await self.backend.broadcast_transaction(tx_hex)
                 logger.info(f"Broadcast transaction for {taker_nick}: {txid}")
@@ -721,7 +941,7 @@ class ProtocolHandlersMixin:
         except Exception as e:
             logger.error(f"Failed to handle !hp2 relay request: {e}")
 
-    async def _broadcast_commitment(self, commitment: str) -> None:
+    async def _broadcast_commitment(self, commitment: str) -> bool:
         """Broadcast a PoDLE commitment via !hp2 to help other makers blacklist it.
 
         After successfully processing a taker's !auth message, we broadcast the
@@ -747,20 +967,29 @@ class ProtocolHandlersMixin:
         A malicious peer could simply drop the relay request; with direct
         ephemeral broadcast, the commitment always reaches the network.
 
-        The broadcast is best-effort and fire-and-forget: connection failures
-        are logged but do not affect the CoinJoin flow.
+        Local persistence must succeed before the caller can release its
+        in-memory reservation. The network broadcast is best-effort and
+        fire-and-forget: connection failures are logged but do not affect the
+        CoinJoin flow.
         """
         try:
             # Add to our own blacklist first (persists to disk)
             add_commitment(commitment)
+        except Exception as e:
+            logger.error(f"Failed to persist commitment: {e}")
+            return False
 
+        broadcast_coro = self._broadcast_commitment_ephemeral(commitment, is_relay=False)
+        try:
             # Broadcast via ephemeral identity (fire-and-forget)
-            spawn_task(self._broadcast_commitment_ephemeral(commitment, is_relay=False))
+            spawn_task(broadcast_coro)
 
             logger.debug(f"Scheduled ephemeral commitment broadcast: {commitment[:16]}...")
-
         except Exception as e:
-            logger.error(f"Failed to broadcast commitment: {e}")
+            broadcast_coro.close()
+            logger.error(f"Failed to schedule commitment broadcast: {e}")
+
+        return True
 
     async def _broadcast_commitment_ephemeral(
         self, commitment: str, *, is_relay: bool = False
