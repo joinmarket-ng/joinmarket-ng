@@ -241,14 +241,22 @@ COFUNDED_CHANNEL_RING_V1_CAPABLE = can_advertise_cofunded_channel_ring_v1(
 
 
 class AcceptorBounds(StrictModel):
-    min_dust_limit_sat: Annotated[int, Field(ge=0)] = 330
+    # Every ring channel is a final Taproot commitment, whose outputs are dust below
+    # 354 satoshis, which is also exactly what stock LND proposes for this type. A
+    # lower limit would let a peer create commitment outputs that relay poorly.
+    min_dust_limit_sat: Annotated[int, Field(ge=0)] = 354
     max_dust_limit_sat: Annotated[int, Field(gt=0)] = 10_000
     min_max_value_in_flight_msat: Annotated[int, Field(ge=0)] = 0
     max_max_value_in_flight_msat: Annotated[int, Field(gt=0)] = 21_000_000 * 100_000_000_000
     min_min_htlc_msat: Annotated[int, Field(ge=0)] = 0
     max_min_htlc_msat: Annotated[int, Field(gt=0)] = 100_000_000
     min_fee_per_kw: Annotated[int, Field(gt=0)] = 1
-    max_fee_per_kw: Annotated[int, Field(gt=0)] = 1_000_000
+    # The opener pays the commitment fee out of its own ring contribution, so an
+    # absurd rate is a griefing surface that the exact readiness accounting only
+    # catches once a channel already exists. Anchor commitments cap the rate at
+    # 10 sat/vB (2,500 sat/kw) by default, so this leaves generous headroom while
+    # still rejecting a nonsense rate before anything is negotiated.
+    max_fee_per_kw: Annotated[int, Field(gt=0)] = 12_500
     min_csv_delay: Annotated[int, Field(gt=0)] = 1
     max_csv_delay: Annotated[int, Field(gt=0)] = 2016
     min_accepted_htlcs: Annotated[int, Field(gt=0)] = 1

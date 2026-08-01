@@ -467,7 +467,12 @@ async def test_open_timeout_attempts_safe_cancel() -> None:
         ("wants_scid_alias", True, "SCID alias"),
         ("channel_reserve", FUNDEE_RESERVE - 1, "fundee reserve"),
         ("dust_limit", 20_000, "dust limit"),
+        # Below the final-Taproot dust threshold that stock LND itself proposes.
+        ("dust_limit", 330, "dust limit"),
         ("fee_per_kw", 2_000_000, "fee policy"),
+        # Above the anchor commitment rate cap, so the opener would burn its own
+        # ring contribution into the commitment fee.
+        ("fee_per_kw", 25_000, "fee policy"),
         ("csv_delay", 144, "fundee CSV policy"),
     ],
 )
