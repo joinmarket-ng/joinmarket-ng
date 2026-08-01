@@ -239,19 +239,21 @@ run:
 
 ```bash
 rm -rf tmp/ring-e2e
-export RING_E2E_PROJECT=jm-ring-e2e
-docker compose -p "$RING_E2E_PROJECT" \
-  -f jmswap/docker-compose.ring-e2e.yml \
-  -f jmswap/docker-compose.ring-e2e.host.yml --profile ring-e2e up -d
-RING_E2E=1 pytest -c pytest.ini tests/e2e/test_cofunded_ring_e2e.py \
-  -m ring_e2e --fail-on-skip --no-cov -v -s --timeout=900
-docker compose -p "$RING_E2E_PROJECT" \
-  -f jmswap/docker-compose.ring-e2e.yml \
-  -f jmswap/docker-compose.ring-e2e.host.yml --profile ring-e2e down -v
+./scripts/run-ring-e2e.sh ring
 ```
 
-The parallel runner provides the same test with isolated ports and automatic
-state cleanup via `./scripts/run_parallel_tests.sh --suite ring-e2e`.
+The script tears down containers and volumes, removes container-owned LND, Tor,
+and wallet state, starts a fresh profile, runs the test, and cleans up. Resetting
+only the bitcoind volume leaves the host-mounted LND wallets ahead of the new
+chain and produces unrelated `Block height out of range` failures. Use
+`./scripts/run-ring-e2e.sh lnd-external` for the focused two-node LND lifecycle
+suite, or `all` for both suites. `RING_E2E_KEEP=1` leaves a profile running for
+inspection and `RING_E2E_NO_RESET=1` deliberately reuses the current profile.
+The ring suite rebuilds its application images by default so it cannot test stale
+maker code; `RING_E2E_NO_BUILD=1` explicitly reuses existing images.
+
+The parallel runner also provides the ring test with isolated ports and state
+cleanup via `./scripts/run_parallel_tests.sh --suite ring-e2e`.
 
 ## Maker Swap Provider
 

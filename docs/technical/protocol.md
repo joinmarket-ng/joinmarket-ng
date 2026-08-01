@@ -343,6 +343,19 @@ session durably bound to a ring revision. Cancellation is allowed before `ring_s
 requires exact backend and chain absence evidence after PSBT verification. Once signing
 authorization is sent, unresolved state is retained for reconciliation instead of canceled.
 
+The taker drives every negotiation phase. After a taker restart, a retained
+`ACCEPTOR_ARMED`, `PREPARED`, `PSBT_VERIFIED`, `READY`, or `SIGNING` record has no
+live peer sessions through which it can finish. Reconciliation restores its exact
+backend evidence and moves it to `RECOVERY_REQUIRED` rather than silently holding
+ring capacity or pretending cancellation succeeded. A record still owned by a
+live in-process round is excluded from this escalation.
+
+The acceptor fails closed on final-Taproot policy. Stock LND v0.21.1 proposes a
+354-satoshi dust limit and 2,500 sat/kw commitment rate; joinmarket-ng rejects a
+lower dust limit or a rate above 12,500 sat/kw before channel negotiation. An LND
+operator who raises the anchor commitment fee cap above this ring limit must
+restore compatible policy before advertising the capability.
+
 **Handshake Integration:**
 
 ```json
