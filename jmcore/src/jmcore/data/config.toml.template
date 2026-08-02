@@ -165,6 +165,11 @@
 # Override with a custom list if needed:
 # directory_servers = ["custom1.onion:5222", "custom2.onion:5222"]
 
+# Directory nick authentication policy (JMP-0005):
+# "prefer_verified" authenticates when supported and falls back to legacy servers.
+# "require_verified" rejects legacy servers. "disabled" uses the legacy handshake.
+# nick_auth_mode = "prefer_verified"
+
 # ============================================================================
 # Wallet Settings
 # ============================================================================
@@ -544,6 +549,15 @@
 # Server listening address
 # host = "127.0.0.1"
 # port = 5222
+
+# Directory nick authentication (JMP-0005). "prefer_verified" negotiates the
+# extension while accepting legacy clients, "require_verified" rejects clients
+# without it, and "disabled" keeps the legacy handshake only.
+# nick_auth_mode = "prefer_verified"
+# Stable identifier for this directory endpoint. Production onion directories
+# use their canonical "host.onion:port" endpoint; local tests may use a test ID.
+# nick_auth_directory_id = "test:jm-directory-5222"  # Local/test example only
+# nick_auth_timeout = 30.0
 
 # Limits
 # max_peers = 10000

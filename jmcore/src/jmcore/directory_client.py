@@ -34,9 +34,18 @@ from jmcore.network import (
 from jmcore.network import (
     ConnectionError as NetworkConnectionError,
 )
+from jmcore.nick_auth import (
+    NickAuthChallenge,
+    NickAuthMode,
+    NickAuthResult,
+    create_nick_auth_proof,
+    directory_id_for_endpoint,
+    parse_strict_json_object,
+)
 from jmcore.protocol import (
     COMMAND_PREFIX,
     FEATURE_NEUTRINO_COMPAT,
+    FEATURE_NICK_AUTH,
     FEATURE_PEERLIST_FEATURES,
     FEATURE_PING,
     JM_VERSION,
@@ -189,6 +198,7 @@ class DirectoryClient:
         peerlist_timeout: float = 60.0,
         socks_username: str | None = None,
         socks_password: str | None = None,
+        nick_auth_mode: NickAuthMode = NickAuthMode.PREFER_VERIFIED,
     ) -> None:
         """
         Initialize DirectoryClient.
@@ -208,6 +218,7 @@ class DirectoryClient:
             peerlist_timeout: Timeout for first PEERLIST chunk (default 60s, subsequent chunks use 5s)
             socks_username: SOCKS5 username for Tor stream isolation (optional)
             socks_password: SOCKS5 password for Tor stream isolation (optional)
+            nick_auth_mode: Policy for authenticating nick ownership to directory servers
         """
         self.host = host
         self.port = port
@@ -241,11 +252,13 @@ class DirectoryClient:
         self.last_orderbook_request_time: float = 0.0
         self.last_offer_received_time: float | None = None
         self.neutrino_compat = neutrino_compat
+        self.nick_auth_mode = nick_auth_mode
 
         # Version negotiation state (set after handshake)
         self.negotiated_version: int | None = None
         self.directory_neutrino_compat: bool = False
         self.directory_peerlist_features: bool = False  # True if directory supports F: suffix
+        self.directory_nick_authenticated: bool = False
 
         # Directory metadata from handshake
         self.directory_motd: str | None = None
@@ -337,12 +350,16 @@ class DirectoryClient:
         if not self.connection:
             raise DirectoryClientError("Not connected")
 
+        self.directory_nick_authenticated = False
+
         # Build our feature set - always include peerlist_features to indicate we support
         # the extended peerlist format with F: suffix for feature information.
         # Always include ping to indicate we support application-level PING/PONG heartbeat.
         our_features: set[str] = {FEATURE_PEERLIST_FEATURES, FEATURE_PING}
         if self.neutrino_compat:
             our_features.add(FEATURE_NEUTRINO_COMPAT)
+        if self.nick_auth_mode is not NickAuthMode.DISABLED:
+            our_features.add(FEATURE_NICK_AUTH)
         feature_set = FeatureSet(features=our_features)
 
         # Send our handshake with current version and features
@@ -354,9 +371,10 @@ class DirectoryClient:
             features=feature_set,
         )
         logger.debug(f"DirectoryClient._handshake: created handshake data: {handshake_data}")
+        handshake_line = json.dumps(handshake_data)
         handshake_msg = {
             "type": MessageType.HANDSHAKE.value,
-            "line": json.dumps(handshake_data),
+            "line": handshake_line,
         }
         logger.debug("DirectoryClient._handshake: sending handshake message")
         await self.connection.send(json.dumps(handshake_msg).encode("utf-8"))
@@ -408,12 +426,93 @@ class DirectoryClient:
         self.directory_proto_ver_max = dir_ver_max
         self.directory_features = dir_features
 
+        directory_supports_nick_auth = dir_features.get(FEATURE_NICK_AUTH, False) is True
+        if (
+            self.nick_auth_mode is NickAuthMode.REQUIRE_VERIFIED
+            and not directory_supports_nick_auth
+        ):
+            raise DirectoryClientError("Directory does not support required nick authentication")
+        if self.nick_auth_mode is not NickAuthMode.DISABLED and directory_supports_nick_auth:
+            await self._authenticate_nick(handshake_line)
+
         logger.info(
             f"Handshake successful with {self.host}:{self.port} (nick: {self.nick}, "
             f"negotiated_version: v{self.negotiated_version}, "
             f"neutrino_compat: {self.directory_neutrino_compat}, "
-            f"peerlist_features: {self.directory_peerlist_features})"
+            f"peerlist_features: {self.directory_peerlist_features}, "
+            f"nick_authenticated: {self.directory_nick_authenticated})"
         )
+
+    async def _authenticate_nick(self, handshake_line: str) -> None:
+        """Complete the mutually negotiated JMP-0005 challenge-response exchange."""
+        if not self.connection:
+            raise DirectoryClientError("Not connected")
+
+        try:
+            challenge_data = await asyncio.wait_for(self.connection.receive(), timeout=self.timeout)
+            challenge_envelope = parse_strict_json_object(challenge_data)
+            if challenge_envelope.get("type") != MessageType.NICK_AUTH.value:
+                raise DirectoryClientError(
+                    f"Unexpected nick authentication challenge type: "
+                    f"{challenge_envelope.get('type')}"
+                )
+            challenge_line = challenge_envelope.get("line")
+            if not isinstance(challenge_line, str):
+                raise DirectoryClientError("Nick authentication challenge line must be a string")
+            challenge = NickAuthChallenge.parse(challenge_line)
+
+            selected_directory_id = directory_id_for_endpoint(self.host, self.port)
+            directory_id = selected_directory_id
+            if selected_directory_id.startswith("test:") and challenge.directory_id.startswith(
+                "test:"
+            ):
+                # Non-production endpoints are commonly reached through a
+                # randomized host-side forwarded port. Their explicitly
+                # configured test identity is stable even when the selected
+                # transport alias is not.
+                directory_id = challenge.directory_id
+            elif challenge.directory_id != selected_directory_id:
+                raise DirectoryClientError(
+                    f"Nick authentication directory-id mismatch: expected {selected_directory_id}, "
+                    f"received {challenge.directory_id}"
+                )
+
+            proof = create_nick_auth_proof(
+                self.nick_identity,
+                challenge.challenge,
+                directory_id,
+                handshake_line,
+            )
+            proof_envelope = {
+                "type": MessageType.NICK_AUTH.value,
+                "line": proof.to_json(),
+            }
+            await self.connection.send(json.dumps(proof_envelope).encode("utf-8"))
+
+            result_data = await asyncio.wait_for(self.connection.receive(), timeout=self.timeout)
+            result_envelope = parse_strict_json_object(result_data)
+            if result_envelope.get("type") != MessageType.NICK_AUTH_RESULT.value:
+                raise DirectoryClientError(
+                    f"Unexpected nick authentication result type: {result_envelope.get('type')}"
+                )
+            result_line = result_envelope.get("line")
+            if not isinstance(result_line, str):
+                raise DirectoryClientError("Nick authentication result line must be a string")
+            result = NickAuthResult.parse(result_line)
+            if result.code != "ok" or not result.verified:
+                raise DirectoryClientError(
+                    f"Directory rejected nick authentication with code: {result.code}"
+                )
+        except DirectoryClientError:
+            raise
+        except TimeoutError as exc:
+            raise DirectoryClientError("Nick authentication timed out") from exc
+        except Exception:
+            # Validation errors can embed the untrusted challenge value. Keep it
+            # out of exception chains because connect() logs handshake failures.
+            raise DirectoryClientError("Invalid nick authentication response") from None
+
+        self.directory_nick_authenticated = True
 
     async def get_peerlist(self) -> list[str] | None:
         """

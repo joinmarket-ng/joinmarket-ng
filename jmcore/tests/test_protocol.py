@@ -7,6 +7,7 @@ import pytest
 from jmcore.protocol import (
     ALL_FEATURES,
     FEATURE_NEUTRINO_COMPAT,
+    FEATURE_NICK_AUTH,
     FEATURE_PEERLIST_FEATURES,
     FEATURE_PING,
     FEATURE_PUSH_ENCRYPTED,
@@ -873,3 +874,11 @@ class TestPingFeature:
         """FeatureSet.from_handshake() with ping=False should not include it."""
         fs = FeatureSet.from_handshake({"features": {"ping": False}})
         assert fs.supports_ping() is False
+
+
+def test_nick_auth_protocol_allocations():
+    assert FEATURE_NICK_AUTH == "nick_auth"
+    assert FEATURE_NICK_AUTH in ALL_FEATURES
+    assert FeatureSet(features={FEATURE_NICK_AUTH}).supports_nick_auth()
+    assert MessageType.NICK_AUTH == 803
+    assert MessageType.NICK_AUTH_RESULT == 805

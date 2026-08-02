@@ -339,6 +339,7 @@ def build_maker_config(
         backend_type=effective_backend_type,
         backend_config=backend_config,
         directory_servers=dir_servers,
+        nick_auth_mode=settings.network_config.nick_auth_mode,
         socks_host=effective_socks_host,
         socks_port=effective_socks_port,
         stream_isolation=settings.tor.stream_isolation,

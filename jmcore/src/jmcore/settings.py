@@ -60,6 +60,7 @@ from jmcore.models import (
     DIRECTORY_NODES_TESTNET,
     NetworkType,
 )
+from jmcore.nick_auth import NickAuthMode, validate_directory_id
 from jmcore.paths import get_default_data_dir
 
 # Default directory servers per network (single source of truth in models.py)
@@ -340,6 +341,10 @@ class NetworkSettings(BaseModel):
     directory_servers: list[str] = Field(
         default_factory=list,
         description="Directory server addresses (host:port). Uses defaults if empty.",
+    )
+    nick_auth_mode: NickAuthMode = Field(
+        default=NickAuthMode.PREFER_VERIFIED,
+        description="Client policy for authenticating nick ownership to directory servers",
     )
 
     @field_validator("directory_servers", mode="before")
@@ -1112,6 +1117,35 @@ class DirectoryServerSettings(BaseModel):
         le=65535,
         description="Port to listen on (0 = let OS assign)",
     )
+    nick_auth_mode: NickAuthMode = Field(
+        default=NickAuthMode.PREFER_VERIFIED,
+        description="Server policy for verifying client nick ownership",
+    )
+    nick_auth_directory_id: str | None = Field(
+        default=None,
+        description="Stable JMP-0005 identifier for this directory endpoint",
+    )
+    nick_auth_timeout: float = Field(
+        default=30.0,
+        gt=0.0,
+        le=30.0,
+        description="Seconds to wait for a negotiated nick authentication proof",
+    )
+
+    @field_validator("nick_auth_directory_id")
+    @classmethod
+    def validate_nick_auth_directory_id(cls, value: str | None) -> str | None:
+        return validate_directory_id(value) if value is not None else None
+
+    @model_validator(mode="after")
+    def require_nick_auth_directory_id(self) -> Self:
+        if (
+            self.nick_auth_mode is NickAuthMode.REQUIRE_VERIFIED
+            and self.nick_auth_directory_id is None
+        ):
+            raise ValueError("require_verified nick authentication needs nick_auth_directory_id")
+        return self
+
     max_peers: int = Field(
         default=10000,
         ge=1,

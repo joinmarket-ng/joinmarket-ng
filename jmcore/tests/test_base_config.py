@@ -15,6 +15,7 @@ from jmcore.config import (
     WalletConfig,
 )
 from jmcore.models import NetworkType
+from jmcore.nick_auth import NickAuthMode
 
 
 class TestTorConfig:
@@ -262,6 +263,13 @@ class TestWalletConfig:
             WalletConfig(mnemonic="test " * 12, connection_timeout=0.0)
         with pytest.raises(ValidationError):
             WalletConfig(mnemonic="test " * 12, connection_timeout=-1.0)
+
+    def test_nick_auth_mode(self):
+        default_config = WalletConfig(mnemonic="test " * 12)
+        required_config = WalletConfig(mnemonic="test " * 12, nick_auth_mode="require_verified")
+
+        assert default_config.nick_auth_mode is NickAuthMode.PREFER_VERIFIED
+        assert required_config.nick_auth_mode is NickAuthMode.REQUIRE_VERIFIED
 
 
 class TestDirectoryServerConfig:

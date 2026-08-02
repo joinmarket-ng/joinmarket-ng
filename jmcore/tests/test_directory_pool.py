@@ -10,6 +10,7 @@ import pytest
 
 from jmcore.crypto import NickIdentity
 from jmcore.directory_pool import DirectoryClientPool
+from jmcore.nick_auth import NickAuthMode
 
 
 def _identity() -> NickIdentity:
@@ -46,6 +47,18 @@ async def test_connect_to_directory_parses_address_and_connects():
     kwargs = ctor.call_args.kwargs
     assert kwargs["socks_username"] is None
     assert kwargs["socks_password"] is None
+    assert kwargs["nick_auth_mode"] is NickAuthMode.PREFER_VERIFIED
+
+
+@pytest.mark.asyncio
+async def test_connect_to_directory_passes_configured_nick_auth_mode():
+    pool = _make_pool(["onion.example:5222"], nick_auth_mode=NickAuthMode.REQUIRE_VERIFIED)
+    fake_client = MagicMock(connect=AsyncMock(return_value=None))
+
+    with patch("jmcore.directory_pool.DirectoryClient", return_value=fake_client) as ctor:
+        await pool.connect_to_directory("onion.example:5222")
+
+    assert ctor.call_args.kwargs["nick_auth_mode"] is NickAuthMode.REQUIRE_VERIFIED
 
 
 @pytest.mark.asyncio

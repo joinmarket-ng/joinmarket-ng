@@ -5,11 +5,25 @@ Implements Open/Closed Principle: extensible without modification.
 """
 
 import asyncio
+import contextlib
 import json
+import secrets
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime
+from typing import Literal
+from uuid import uuid4
+from weakref import WeakValueDictionary
 
-from jmcore.models import MessageEnvelope, NetworkType, PeerStatus
+from jmcore.models import MessageEnvelope, NetworkType, PeerInfo, PeerStatus
 from jmcore.network import ConnectionPool, TCPConnection
+from jmcore.nick_auth import (
+    NickAuthChallenge,
+    NickAuthMode,
+    NickAuthProof,
+    NickAuthResult,
+    parse_strict_json_object,
+    verify_nick_auth_proof,
+)
 from jmcore.notifications import get_notifier
 from jmcore.protocol import MessageType
 from jmcore.rate_limiter import RateLimitAction, RateLimiter
@@ -22,7 +36,13 @@ from directory_server.handshake_handler import HandshakeError, HandshakeHandler
 from directory_server.health import HealthCheckServer
 from directory_server.heartbeat import HeartbeatConfig, HeartbeatManager
 from directory_server.message_router import MessageRouter
-from directory_server.peer_registry import PeerRegistry
+from directory_server.peer_registry import (
+    PeerOwnershipConflictError,
+    PeerRegistry,
+    RegistrationResult,
+)
+
+_DIRECTORY_SEND_TIMEOUT_SEC = 30.0
 
 
 def build_motd(user_motd: str) -> str:
@@ -50,8 +70,10 @@ class DirectoryServer:
         self.server_nick = server_nick
 
         self.peer_registry = PeerRegistry(max_peers=settings.max_peers)
-        self.connections = ConnectionPool(max_connections=settings.max_peers)
+        self.connections = ConnectionPool(max_connections=settings.max_peers + 1)
         self.peer_key_to_conn_id: dict[str, str] = {}
+        self._registration_lock = asyncio.Lock()
+        self._owner_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
 
         # Heartbeat manager for peer liveness detection
         heartbeat_config = HeartbeatConfig(
@@ -79,7 +101,19 @@ class DirectoryServer:
             network=self.network,
             server_nick=server_nick,
             motd=build_motd(settings.motd),
+            nick_auth_mode=settings.nick_auth_mode,
+            nick_auth_directory_id=settings.nick_auth_directory_id,
         )
+        if (
+            settings.nick_auth_mode is not NickAuthMode.DISABLED
+            and settings.nick_auth_directory_id is None
+        ):
+            logger.warning(
+                "Directory nick authentication is not advertised because "
+                "nick_auth_directory_id is unset"
+            )
+        configured_auth_timeout = float(settings.nick_auth_timeout)
+        self.nick_auth_timeout = min(max(configured_auth_timeout, 0.1), 30.0)
         # Rate limit by connection ID to prevent nick spoofing attacks.
         # A malicious peer could claim another's nick and spam to get them rate limited.
         # Using connection ID ensures each physical connection has its own bucket.
@@ -160,8 +194,9 @@ class DirectoryServer:
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
         peer_addr = writer.get_extra_info("peername")
-        conn_id = f"{peer_addr[0]}:{peer_addr[1]}"
-        logger.trace(f"New connection from {conn_id}")
+        remote_id = f"{peer_addr[0]}:{peer_addr[1]}"
+        conn_id = uuid4().hex
+        logger.trace(f"New connection {conn_id} from {remote_id}")
 
         transport = writer.transport
         # Set reasonable write buffer limits (64KB high, 16KB low)
@@ -193,7 +228,7 @@ class DirectoryServer:
         try:
             logger.trace(f"[{conn_id}] Waiting for handshake message...")
             data = await asyncio.wait_for(connection.receive(), timeout=30.0)
-            logger.trace(f"[{conn_id}] Received {len(data)} bytes: {data[:200]!r}...")
+            logger.trace(f"[{conn_id}] Received {len(data)} handshake bytes")
 
             envelope = MessageEnvelope.from_bytes(
                 data,
@@ -208,7 +243,6 @@ class DirectoryServer:
                 logger.warning(f"[{conn_id}] Expected handshake, got {envelope.message_type}")
                 return None
 
-            logger.trace(f"[{conn_id}] Processing handshake payload: {envelope.payload[:200]}")
             peer_info, response = self.handshake_handler.process_handshake(
                 envelope.payload, conn_id
             )
@@ -221,24 +255,85 @@ class DirectoryServer:
             )
             response_bytes = response_envelope.to_bytes()
             logger.trace(f"[{conn_id}] Sending handshake response: {len(response_bytes)} bytes")
-            logger.trace(f"[{conn_id}] Response content: {response_bytes[:200]!r}...")
+
+            if response.get("accepted") is not True:
+                await connection.send(response_bytes)
+                return None
+
+            if self.handshake_handler.negotiates_nick_auth(peer_info):
+                await connection.send(response_bytes)
+                verified_pubkey = await self._perform_nick_auth(
+                    connection,
+                    conn_id,
+                    peer_info,
+                    envelope.payload,
+                )
+                if verified_pubkey is None:
+                    return None
+                try:
+                    registration = await self._register_peer(
+                        peer_info,
+                        conn_id,
+                        verified_pubkey=verified_pubkey,
+                    )
+                except (PeerOwnershipConflictError, ValueError):
+                    await self._send_nick_auth_result(connection, "policy", safe=True)
+                    logger.info(
+                        f"[{conn_id}] Rejected verified ownership collision for {peer_info.nick}"
+                    )
+                    return None
+                await self._close_displaced_connections(registration)
+                try:
+                    async with self._owner_lock(registration.peer_key):
+                        if not self.peer_registry.is_current_owner(
+                            registration.peer_key,
+                            conn_id,
+                        ):
+                            return None
+                        await self._send_nick_auth_result(connection, "ok")
+                        if not self.peer_registry.update_status(
+                            registration.peer_key,
+                            PeerStatus.HANDSHAKED,
+                            expected_connection_id=conn_id,
+                        ):
+                            return None
+                except Exception:
+                    await self._rollback_registration(registration.peer_key, conn_id)
+                    raise
+                return registration.peer_key
 
             try:
-                await connection.send(response_bytes)
+                registration = await self._register_peer(peer_info, conn_id)
+            except (PeerOwnershipConflictError, ValueError) as e:
+                rejection = MessageEnvelope(
+                    message_type=MessageType.DN_HANDSHAKE,
+                    payload=json.dumps(self.handshake_handler.create_rejection_response(str(e))),
+                )
+                await connection.send(rejection.to_bytes())
+                logger.info(f"[{conn_id}] Rejected duplicate peer ownership for {peer_info.nick}")
+                return None
+
+            peer_key = registration.peer_key
+            logger.trace(f"[{conn_id}] Peer registered in registry")
+
+            try:
+                async with self._owner_lock(peer_key):
+                    if not self.peer_registry.is_current_owner(peer_key, conn_id):
+                        return None
+                    await connection.send(response_bytes)
                 logger.trace(f"[{conn_id}] Handshake response sent successfully")
                 # Small delay to let client process the handshake response
                 await asyncio.sleep(0.05)
             except Exception as e:
                 logger.error(f"[{conn_id}] Failed to send handshake response: {e}")
+                await self._rollback_registration(peer_key, conn_id)
                 raise
 
-            peer_location = peer_info.location_string
-            self.peer_registry.register(peer_info)
-            logger.trace(f"[{conn_id}] Peer registered in registry")
-
-            peer_key = peer_info.nick if peer_location == "NOT-SERVING-ONION" else peer_location
-            self.peer_registry.update_status(peer_key, PeerStatus.HANDSHAKED)
-            self.peer_key_to_conn_id[peer_key] = conn_id
+            async with self._owner_lock(peer_key):
+                if not self.peer_registry.update_status(
+                    peer_key, PeerStatus.HANDSHAKED, expected_connection_id=conn_id
+                ):
+                    return None
             logger.trace(f"[{conn_id}] Peer key mapped: {peer_key}")
 
             logger.trace(f"[{conn_id}] Handshake complete for {peer_key} (nick={peer_info.nick})")
@@ -254,6 +349,212 @@ class DirectoryServer:
         except Exception as e:
             logger.error(f"[{conn_id}] Handshake error: {e}", exc_info=True)
             return None
+
+    async def _perform_nick_auth(
+        self,
+        connection: TCPConnection,
+        conn_id: str,
+        peer_info: PeerInfo,
+        handshake_line: str,
+    ) -> str | None:
+        directory_id = self.handshake_handler.nick_auth_directory_id
+        if directory_id is None:
+            return None
+
+        challenge = NickAuthChallenge.from_payload(
+            {
+                "kind": "challenge",
+                "challenge": secrets.token_hex(32),
+                "directory-id": directory_id,
+            }
+        )
+        challenge_envelope = MessageEnvelope(
+            message_type=MessageType.NICK_AUTH,
+            payload=challenge.to_json(),
+        )
+        await asyncio.wait_for(
+            connection.send(challenge_envelope.to_bytes()),
+            timeout=self.nick_auth_timeout,
+        )
+
+        try:
+            data = await asyncio.wait_for(
+                connection.receive(),
+                timeout=self.nick_auth_timeout,
+            )
+        except TimeoutError:
+            logger.info(f"[{conn_id}] Nick authentication timed out")
+            await self._send_nick_auth_result(connection, "expired", safe=True)
+            return None
+
+        try:
+            parse_strict_json_object(data)
+            proof_envelope = MessageEnvelope.from_bytes(
+                data,
+                max_line_length=self.settings.max_line_length,
+                max_json_nesting_depth=self.settings.max_json_nesting_depth,
+            )
+            if proof_envelope.message_type != MessageType.NICK_AUTH:
+                raise ValueError("unexpected nick authentication message type")
+            proof = NickAuthProof.parse(proof_envelope.payload)
+        except Exception:
+            logger.info(f"[{conn_id}] Nick authentication payload was malformed")
+            await self._send_nick_auth_result(connection, "malformed", safe=True)
+            return None
+
+        if not verify_nick_auth_proof(
+            proof,
+            expected_challenge=challenge.challenge,
+            expected_directory_id=directory_id,
+            handshake_line=handshake_line,
+            nick=peer_info.nick,
+        ):
+            logger.info(f"[{conn_id}] Nick authentication proof was invalid")
+            await self._send_nick_auth_result(connection, "invalid", safe=True)
+            return None
+
+        return proof.pubkey
+
+    async def _send_nick_auth_result(
+        self,
+        connection: TCPConnection,
+        code: Literal["ok", "malformed", "expired", "invalid", "policy"],
+        *,
+        safe: bool = False,
+    ) -> None:
+        result = NickAuthResult(code=code, verified=code == "ok")
+        envelope = MessageEnvelope(
+            message_type=MessageType.NICK_AUTH_RESULT,
+            payload=result.to_json(),
+        )
+        send_result = connection.send(envelope.to_bytes())
+        if safe:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(send_result, timeout=self.nick_auth_timeout)
+            return
+        await asyncio.wait_for(send_result, timeout=self.nick_auth_timeout)
+
+    @staticmethod
+    def _peer_key(peer: PeerInfo) -> str:
+        return peer.nick if peer.location_string == "NOT-SERVING-ONION" else peer.location_string
+
+    def _owner_lock(self, peer_key: str) -> asyncio.Lock:
+        lock = self._owner_locks.get(peer_key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._owner_locks[peer_key] = lock
+        return lock
+
+    @contextlib.asynccontextmanager
+    async def _lock_owner_keys(self, *peer_keys: str | None) -> AsyncIterator[None]:
+        keys = sorted({key for key in peer_keys if key is not None})
+        async with contextlib.AsyncExitStack() as stack:
+            for key in keys:
+                await stack.enter_async_context(self._owner_lock(key))
+            yield
+
+    async def _register_peer(
+        self,
+        peer: PeerInfo,
+        connection_id: str,
+        *,
+        verified_pubkey: bytes | str | None = None,
+    ) -> RegistrationResult:
+        """Serialize ownership replacement with writes to every affected routing key."""
+        async with self._registration_lock:
+            new_key = self._peer_key(peer)
+            current_nick_key = self.peer_registry.get_key_by_nick(peer.nick)
+            async with self._lock_owner_keys(new_key, current_nick_key):
+                registration = self.peer_registry.register(
+                    peer,
+                    connection_id,
+                    verified_pubkey=verified_pubkey,
+                )
+                self._activate_registration(registration)
+                return registration
+
+    def _activate_registration(self, registration: RegistrationResult) -> None:
+        for displaced in registration.displaced:
+            self.heartbeat.forget_owner(displaced.peer_key, displaced.connection_id)
+            self.message_router.remove_peer_offers(
+                displaced.peer_key,
+                displaced.connection_id,
+            )
+            if self.peer_key_to_conn_id.get(displaced.peer_key) == displaced.connection_id:
+                del self.peer_key_to_conn_id[displaced.peer_key]
+        self.peer_key_to_conn_id[registration.peer_key] = registration.connection_id
+
+    async def _close_displaced_connections(self, registration: RegistrationResult) -> None:
+        for displaced in registration.displaced:
+            await self.message_router.broadcast_displaced_peer_disconnect(
+                displaced.peer,
+                displaced.connection_id,
+            )
+            connection = self.connections.get(displaced.connection_id)
+            if connection is not None:
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(
+                        connection.close(),
+                        timeout=min(self.nick_auth_timeout, 5.0),
+                    )
+
+    async def _rollback_registration(self, peer_key: str, connection_id: str) -> None:
+        await self._remove_owned_peer_state(
+            peer_key,
+            connection_id,
+            broadcast_disconnect=False,
+        )
+
+    async def _remove_owned_peer_state(
+        self,
+        peer_key: str,
+        connection_id: str,
+        *,
+        broadcast_disconnect: bool = True,
+        clear_unqualified_mapping: bool = False,
+    ) -> PeerInfo | None:
+        """Remove all state for one exact owner while blocking replacement and routing writes."""
+        peer: PeerInfo | None = None
+        disconnect_snapshot: PeerInfo | None = None
+        was_visible = False
+        async with self._owner_lock(peer_key):
+            if not self.peer_registry.is_current_owner(peer_key, connection_id):
+                return None
+            peer = self.peer_registry.get_by_key(peer_key)
+            if peer is None:
+                return None
+
+            was_visible = peer.status is PeerStatus.HANDSHAKED
+            if was_visible:
+                disconnect_snapshot = peer.model_copy(deep=True)
+            self.peer_registry.update_status(peer_key, PeerStatus.DISCONNECTED, connection_id)
+            self.peer_registry.unregister(peer_key, connection_id)
+            self.message_router.remove_peer_offers(peer_key, connection_id)
+            self.heartbeat.forget_owner(peer_key, connection_id)
+            if clear_unqualified_mapping or self.peer_key_to_conn_id.get(peer_key) == connection_id:
+                self.peer_key_to_conn_id.pop(peer_key, None)
+
+        # Never hold an owner lock while sending to other owners. Concurrent
+        # disconnects could otherwise deadlock by each waiting on the other's
+        # lock. The snapshot form also remains valid after registry removal.
+        if broadcast_disconnect and disconnect_snapshot is not None:
+            try:
+                await self.message_router.broadcast_displaced_peer_disconnect(
+                    disconnect_snapshot,
+                    connection_id,
+                )
+            except Exception as exc:
+                logger.debug(f"Failed to broadcast disconnect for {peer_key}: {exc}")
+        return peer
+
+    async def _close_connection_generation(self, connection_id: str) -> None:
+        self.rate_limiter.remove_peer(connection_id)
+        connection = self.connections.get(connection_id)
+        if connection is None:
+            return
+        self.connections.remove(connection_id)
+        with contextlib.suppress(Exception):
+            await connection.close()
 
     async def _handle_peer_messages(
         self, connection: TCPConnection, conn_id: str, peer_key: str
@@ -274,10 +575,13 @@ class DirectoryServer:
 
         while connection.is_connected() and not self._shutdown:
             try:
+                if not self.peer_registry.is_current_owner(peer_key, conn_id):
+                    break
                 data = await connection.receive()
 
                 # Update last_seen on every received message for heartbeat liveness
-                self.peer_registry.update_last_seen(peer_key)
+                if not self.peer_registry.update_last_seen(peer_key, conn_id):
+                    break
 
                 # Rate limiting by connection ID to prevent nick spoofing attacks.
                 # A malicious peer could claim another's nick in handshake and spam
@@ -316,7 +620,7 @@ class DirectoryServer:
                     max_json_nesting_depth=self.settings.max_json_nesting_depth,
                 )
 
-                await self.message_router.route_message(envelope, peer_key)
+                await self.message_router.route_message(envelope, peer_key, conn_id)
 
             except asyncio.CancelledError:
                 break
@@ -339,25 +643,11 @@ class DirectoryServer:
 
         try:
             if peer_key:
-                peer_info = self.peer_registry.get_by_key(peer_key)
-
+                peer_info = await self._remove_owned_peer_state(peer_key, conn_id)
                 if peer_info:
                     logger.info(f"Peer {peer_info.nick} disconnected")
-                    # Fire-and-forget notification for peer disconnect
-                    total_peers = (
-                        self.peer_registry.count() - 1
-                    )  # Minus 1 since we're about to unregister
+                    total_peers = self.peer_registry.count()
                     spawn_task(get_notifier().notify_peer_disconnected(peer_info.nick, total_peers))
-                    await self.message_router.broadcast_peer_disconnect(
-                        peer_info.location_string, peer_info.network
-                    )
-                    self.peer_registry.unregister(peer_key)
-
-                if peer_key in self.peer_key_to_conn_id:
-                    del self.peer_key_to_conn_id[peer_key]
-
-                # Clean up offer tracking
-                self.message_router.remove_peer_offers(peer_key)
 
             # Clean up rate limiter state (keyed by conn_id, not peer_key)
             self.rate_limiter.remove_peer(conn_id)
@@ -368,75 +658,101 @@ class DirectoryServer:
             except Exception as e:
                 logger.trace(f"Error closing connection: {e}")
 
-    async def _send_to_peer(self, peer_location: str, data: bytes) -> None:
+    async def _send_to_peer(
+        self,
+        peer_location: str,
+        data: bytes,
+        expected_connection_id: str | None = None,
+    ) -> None:
         peer_key = peer_location
+        async with self._owner_lock(peer_key):
+            conn_id = self.peer_key_to_conn_id.get(peer_key)
+            if not conn_id:
+                raise ValueError(f"No connection for peer: {peer_location}")
 
-        conn_id = self.peer_key_to_conn_id.get(peer_key)
-        if not conn_id:
-            raise ValueError(f"No connection for peer: {peer_location}")
+            expected_connection_id = expected_connection_id or conn_id
+            peer = self.peer_registry.get_by_key(peer_key)
+            if (
+                conn_id != expected_connection_id
+                or peer is None
+                or peer.status is not PeerStatus.HANDSHAKED
+                or not self.peer_registry.is_current_owner(peer_key, expected_connection_id)
+            ):
+                raise ValueError(f"Stale connection for peer: {peer_location}")
 
-        connection = self.connections.get(conn_id)
-        if not connection:
-            raise ValueError(f"No connection for conn_id: {conn_id}")
+            connection = self.connections.get(expected_connection_id)
+            if not connection:
+                raise ValueError(f"No connection for conn_id: {expected_connection_id}")
 
-        await connection.send(data)
+            await asyncio.wait_for(
+                connection.send(data),
+                timeout=_DIRECTORY_SEND_TIMEOUT_SEC,
+            )
 
-    async def _handle_send_failed(self, peer_key: str) -> None:
+    async def _handle_send_failed(
+        self, peer_key: str, expected_connection_id: str | None = None
+    ) -> None:
         """
         Called when sending to a peer fails.
 
         Removes the peer from both the connection mapping and the registry
         to prevent further send attempts to this dead connection.
         """
-        if peer_key in self.peer_key_to_conn_id:
-            logger.debug(f"Removing failed peer mapping: {peer_key}")
-            del self.peer_key_to_conn_id[peer_key]
+        generation_was_explicit = expected_connection_id is not None
+        expected_connection_id = expected_connection_id or self.peer_registry.get_connection_id(
+            peer_key
+        )
+        if expected_connection_id is None or not self.peer_registry.is_current_owner(
+            peer_key, expected_connection_id
+        ):
+            return
 
-        # Also unregister from peer registry to prevent further routing attempts
-        peer_info = self.peer_registry.get_by_key(peer_key)
-        if peer_info:
-            logger.debug(f"Unregistering failed peer: {peer_key}")
-            self.peer_registry.unregister(peer_key)
+        peer_info = await self._remove_owned_peer_state(
+            peer_key,
+            expected_connection_id,
+            clear_unqualified_mapping=not generation_was_explicit,
+        )
+        if peer_info is None:
+            return
+        logger.debug(f"Unregistered failed peer: {peer_key}")
+        spawn_task(
+            get_notifier().notify_peer_disconnected(peer_info.nick, self.peer_registry.count())
+        )
+        await self._close_connection_generation(expected_connection_id)
 
-    async def _evict_peer(self, peer_key: str, reason: str) -> None:
+    async def _evict_peer(
+        self,
+        peer_key: str,
+        reason: str,
+        expected_connection_id: str | None = None,
+    ) -> None:
         """Evict a peer due to heartbeat timeout.
 
         Broadcasts disconnect, unregisters from registry, closes the
         underlying TCP connection, and cleans up all mappings.
         """
+        expected_connection_id = expected_connection_id or self.peer_registry.get_connection_id(
+            peer_key
+        )
         peer_info = self.peer_registry.get_by_key(peer_key)
-        if not peer_info:
+        if (
+            not peer_info
+            or expected_connection_id is None
+            or not self.peer_registry.is_current_owner(peer_key, expected_connection_id)
+        ):
             return
 
         logger.info(f"Evicting peer {peer_info.nick} ({peer_key}): {reason}")
-
-        # Broadcast disconnect to other peers
-        try:
-            await self.message_router.broadcast_peer_disconnect(
-                peer_info.location_string, peer_info.network
+        removed_peer = await self._remove_owned_peer_state(peer_key, expected_connection_id)
+        if removed_peer is None:
+            return
+        spawn_task(
+            get_notifier().notify_peer_disconnected(
+                removed_peer.nick,
+                self.peer_registry.count(),
             )
-        except Exception as e:
-            logger.debug(f"Failed to broadcast disconnect for {peer_key}: {e}")
-
-        # Fire-and-forget notification
-        total_peers = self.peer_registry.count() - 1
-        spawn_task(get_notifier().notify_peer_disconnected(peer_info.nick, total_peers))
-
-        # Unregister from registry
-        self.peer_registry.unregister(peer_key)
-        self.message_router.remove_peer_offers(peer_key)
-
-        # Close the underlying connection
-        conn_id = self.peer_key_to_conn_id.pop(peer_key, None)
-        if conn_id:
-            self.rate_limiter.remove_peer(conn_id)
-            connection = self.connections.get(conn_id)
-            if connection:
-                self.connections.remove(conn_id)
-                try:
-                    await connection.close()
-                except Exception as e:
-                    logger.trace(f"Error closing evicted connection: {e}")
+        )
+        await self._close_connection_generation(expected_connection_id)
 
     def is_healthy(self) -> bool:
         return (

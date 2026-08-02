@@ -36,6 +36,7 @@ from loguru import logger
 
 from jmcore.crypto import NickIdentity
 from jmcore.directory_client import DirectoryClient
+from jmcore.nick_auth import NickAuthMode
 from jmcore.tasks import parse_directory_address
 from jmcore.tor_isolation import IsolationCategory, get_isolation_credentials
 
@@ -74,6 +75,7 @@ class DirectoryClientPool:
         socks_port: int = 9050,
         connection_timeout: float = 120.0,
         stream_isolation: bool = False,
+        nick_auth_mode: NickAuthMode = NickAuthMode.PREFER_VERIFIED,
     ):
         self.directory_servers = directory_servers
         self.network = network
@@ -82,6 +84,7 @@ class DirectoryClientPool:
         self.socks_port = socks_port
         self.connection_timeout = connection_timeout
         self.stream_isolation = stream_isolation
+        self.nick_auth_mode = nick_auth_mode
 
         # Pre-compute isolation credentials (None when disabled). The peer
         # credentials are exposed for subclasses that establish direct
@@ -116,6 +119,7 @@ class DirectoryClientPool:
             "socks_host": self.socks_host,
             "socks_port": self.socks_port,
             "timeout": self.connection_timeout,
+            "nick_auth_mode": self.nick_auth_mode,
             "socks_username": self._dir_creds[0],
             "socks_password": self._dir_creds[1],
         }

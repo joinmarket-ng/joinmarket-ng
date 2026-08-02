@@ -10,6 +10,7 @@ services:
       - DIRECTORY_SERVER__HOST=0.0.0.0
       - DIRECTORY_SERVER__PORT=5222
       - DIRECTORY_SERVER__MAX_PEERS=10000
+      - DIRECTORY_SERVER__NICK_AUTH_DIRECTORY_ID
       - LOGGING__LEVEL=INFO
     networks:
       - joinmarket_directory_internal

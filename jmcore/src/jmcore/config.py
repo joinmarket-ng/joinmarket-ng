@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field, SecretStr, model_validator
 
 from jmcore.constants import DUST_THRESHOLD
 from jmcore.models import NetworkType
+from jmcore.nick_auth import NickAuthMode
 
 
 class TorConfig(BaseModel):
@@ -209,6 +210,10 @@ class WalletConfig(BaseModel):
     directory_servers: list[str] = Field(
         default_factory=list,
         description="List of directory server URLs (e.g., ['onion_host:port', ...])",
+    )
+    nick_auth_mode: NickAuthMode = Field(
+        default=NickAuthMode.PREFER_VERIFIED,
+        description="Client policy for authenticating nick ownership to directory servers",
     )
 
     # Tor/SOCKS configuration

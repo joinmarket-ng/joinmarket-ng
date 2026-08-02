@@ -5,7 +5,9 @@ Implements Single Responsibility Principle: only manages peer state.
 """
 
 from collections.abc import Iterator
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from uuid import uuid4
 
 from jmcore.models import NetworkType, PeerInfo, PeerStatus
 from jmcore.protocol import FeatureSet
@@ -16,36 +18,140 @@ class PeerNotFoundError(Exception):
     pass
 
 
+class PeerOwnershipConflictError(Exception):
+    """Raised when a live peer already owns a nick or routing key."""
+
+
+@dataclass(frozen=True)
+class PeerOwner:
+    connection_id: str
+    verified_pubkey: bytes | str | None = None
+
+    @property
+    def verified(self) -> bool:
+        return self.verified_pubkey is not None
+
+
+@dataclass(frozen=True)
+class DisplacedPeer:
+    peer_key: str
+    peer: PeerInfo
+    connection_id: str
+
+
+@dataclass(frozen=True)
+class RegistrationResult:
+    peer_key: str
+    connection_id: str
+    displaced: tuple[DisplacedPeer, ...] = ()
+
+
 class PeerRegistry:
     def __init__(self, max_peers: int = 1000):
         self.max_peers = max_peers
         self._peers: dict[str, PeerInfo] = {}
         self._nick_to_key: dict[str, str] = {}
+        self._owners: dict[str, PeerOwner] = {}
 
-    def register(self, peer: PeerInfo) -> None:
-        if len(self._peers) >= self.max_peers:
-            raise ValueError(f"Maximum peers reached: {self.max_peers}")
+    def register(
+        self,
+        peer: PeerInfo,
+        connection_id: str | None = None,
+        *,
+        verified_pubkey: bytes | str | None = None,
+    ) -> RegistrationResult:
+        """Atomically reserve a peer's nick and routing key for one connection.
 
+        Legacy registrations use first-live-writer ownership. A verified registration may
+        replace legacy owners, while replacing a verified owner requires the same full pubkey.
+        """
+        connection_id = connection_id or uuid4().hex
         location = peer.location_string
         key = peer.nick if location == "NOT-SERVING-ONION" else location
+        conflicting_keys = {
+            candidate for candidate in (key, self._nick_to_key.get(peer.nick)) if candidate
+        }
+
+        displaced: list[DisplacedPeer] = []
+        for conflicting_key in conflicting_keys:
+            existing_peer = self._peers.get(conflicting_key)
+            existing_owner = self._owners.get(conflicting_key)
+            if existing_peer is None or existing_owner is None:
+                continue
+            # Nick authentication proves ownership of a nick, not of an onion
+            # endpoint claimed in the handshake. Never let a verified nick
+            # evict a different peer by copying its routing location.
+            if conflicting_key == key and existing_peer.nick != peer.nick:
+                raise PeerOwnershipConflictError(
+                    f"Peer location already registered: {peer.location_string}"
+                )
+            if verified_pubkey is None:
+                raise PeerOwnershipConflictError(
+                    f"Peer nick or location already registered: {peer.nick}"
+                )
+            if existing_owner.verified and existing_owner.verified_pubkey != verified_pubkey:
+                raise PeerOwnershipConflictError(f"Verified nick already registered: {peer.nick}")
+            displaced.append(
+                DisplacedPeer(
+                    peer_key=conflicting_key,
+                    peer=existing_peer,
+                    connection_id=existing_owner.connection_id,
+                )
+            )
+
+        if len(self._peers) - len(displaced) >= self.max_peers:
+            raise ValueError(f"Maximum peers reached: {self.max_peers}")
+
+        for old in displaced:
+            self._remove(old.peer_key)
 
         self._peers[key] = peer
+        self._owners[key] = PeerOwner(
+            connection_id=connection_id,
+            verified_pubkey=verified_pubkey,
+        )
         if peer.nick:
             self._nick_to_key[peer.nick] = key
 
         peer.last_seen = datetime.now(UTC)
         logger.info(f"Registered peer: {peer.nick} at {location}")
+        return RegistrationResult(
+            peer_key=key,
+            connection_id=connection_id,
+            displaced=tuple(displaced),
+        )
 
-    def unregister(self, key: str) -> None:
-        if key not in self._peers:
-            return
+    def unregister(self, key: str, expected_connection_id: str | None = None) -> bool:
+        if not self.is_current_owner(key, expected_connection_id):
+            return False
 
-        peer = self._peers[key]
-        if peer.nick in self._nick_to_key:
-            del self._nick_to_key[peer.nick]
-
-        del self._peers[key]
+        peer = self._remove(key)
+        if peer is None:
+            return False
         logger.info(f"Unregistered peer: {peer.nick} at {peer.location_string}")
+        return True
+
+    def _remove(self, key: str) -> PeerInfo | None:
+        peer = self._peers.pop(key, None)
+        if peer is None:
+            return None
+        if self._nick_to_key.get(peer.nick) == key:
+            del self._nick_to_key[peer.nick]
+        self._owners.pop(key, None)
+        return peer
+
+    def is_current_owner(self, key: str, expected_connection_id: str | None) -> bool:
+        owner = self._owners.get(key)
+        if owner is None:
+            return False
+        return expected_connection_id is None or owner.connection_id == expected_connection_id
+
+    def get_owner(self, key: str) -> PeerOwner | None:
+        return self._owners.get(key)
+
+    def get_connection_id(self, key: str) -> str | None:
+        owner = self.get_owner(key)
+        return owner.connection_id if owner else None
 
     def get_by_key(self, key: str) -> PeerInfo | None:
         return self._peers.get(key)
@@ -59,21 +165,38 @@ class PeerRegistry:
             return self._peers.get(key)
         return None
 
-    def update_status(self, key: str, status: PeerStatus) -> None:
+    def get_key_by_nick(self, nick: str) -> str | None:
+        """Return the routing key currently reserved for ``nick``."""
+        return self._nick_to_key.get(nick)
+
+    def update_status(
+        self,
+        key: str,
+        status: PeerStatus,
+        expected_connection_id: str | None = None,
+    ) -> bool:
+        if not self.is_current_owner(key, expected_connection_id):
+            return False
         peer = self.get_by_key(key)
         if peer:
             peer.status = status
             if status in (PeerStatus.CONNECTED, PeerStatus.HANDSHAKED):
                 peer.last_seen = datetime.now(UTC)
+            return True
+        return False
 
-    def update_last_seen(self, key: str) -> None:
+    def update_last_seen(self, key: str, expected_connection_id: str | None = None) -> bool:
         """Update the last_seen timestamp for a peer.
 
         Called on every received message to track peer liveness for heartbeat.
         """
+        if not self.is_current_owner(key, expected_connection_id):
+            return False
         peer = self.get_by_key(key)
         if peer:
             peer.last_seen = datetime.now(UTC)
+            return True
+        return False
 
     def _iter_connected(self, network: NetworkType | None = None) -> Iterator[PeerInfo]:
         """Iterator over connected peers.
@@ -91,6 +214,20 @@ class PeerRegistry:
     def iter_connected(self, network: NetworkType | None = None) -> Iterator[PeerInfo]:
         """Public memory-efficient iterator over connected peers."""
         return self._iter_connected(network)
+
+    def iter_connected_owners(
+        self, network: NetworkType | None = None
+    ) -> Iterator[tuple[str, PeerInfo, str]]:
+        """Iterate over handshaked peers with their current ownership generation."""
+        for key, peer in list(self._peers.items()):
+            owner = self._owners.get(key)
+            if (
+                owner is not None
+                and peer.status == PeerStatus.HANDSHAKED
+                and not peer.is_directory
+                and (network is None or peer.network == network)
+            ):
+                yield key, peer, owner.connection_id
 
     def get_all_connected(self, network: NetworkType | None = None) -> list[PeerInfo]:
         return list(self._iter_connected(network))
@@ -129,6 +266,7 @@ class PeerRegistry:
     def clear(self) -> None:
         self._peers.clear()
         self._nick_to_key.clear()
+        self._owners.clear()
 
     def get_passive_peers(self, network: NetworkType | None = None) -> list[PeerInfo]:
         """
@@ -191,31 +329,37 @@ class PeerRegistry:
         """
         return [p for p in self._iter_connected(network) if p.neutrino_compat]
 
-    def get_peers_idle_since(self, cutoff: datetime) -> list[tuple[str, PeerInfo]]:
+    def get_peers_idle_since(self, cutoff: datetime) -> list[tuple[str, PeerInfo, str]]:
         """Get connected peers whose last_seen is older than cutoff.
 
-        Returns list of (peer_key, peer_info) tuples.
+        Returns list of (peer_key, peer_info, connection_id) tuples.
         """
-        result: list[tuple[str, PeerInfo]] = []
+        result: list[tuple[str, PeerInfo, str]] = []
         for key, peer in list(self._peers.items()):
+            owner = self._owners.get(key)
             if (
-                peer.status == PeerStatus.HANDSHAKED
+                owner is not None
+                and peer.status == PeerStatus.HANDSHAKED
                 and not peer.is_directory
                 and peer.last_seen is not None
                 and peer.last_seen < cutoff
             ):
-                result.append((key, peer))
+                result.append((key, peer, owner.connection_id))
         return result
 
-    def supports_ping(self, key: str) -> bool:
+    def supports_ping(self, key: str, expected_connection_id: str | None = None) -> bool:
         """Check if a peer supports PING/PONG heartbeat."""
+        if not self.is_current_owner(key, expected_connection_id):
+            return False
         peer = self.get_by_key(key)
         if peer is None:
             return False
         return peer.features.get("ping", False) is True
 
-    def is_maker(self, key: str) -> bool:
+    def is_maker(self, key: str, expected_connection_id: str | None = None) -> bool:
         """Check if a peer is a maker (serves an onion address)."""
+        if not self.is_current_owner(key, expected_connection_id):
+            return False
         peer = self.get_by_key(key)
         if peer is None:
             return False

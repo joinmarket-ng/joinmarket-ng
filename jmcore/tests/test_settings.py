@@ -11,8 +11,10 @@ import pytest
 from pydantic import BaseModel, ValidationError
 
 from jmcore.models import NetworkType
+from jmcore.nick_auth import NickAuthMode
 from jmcore.settings import (
     BitcoinSettings,
+    DirectoryServerSettings,
     JoinMarketSettings,
     MakerSettings,
     NetworkSettings,
@@ -183,6 +185,26 @@ class TestSettingsDefaults:
         assert settings.network_config.network == NetworkType.MAINNET
         assert settings.network_config.bitcoin_network is None
         assert settings.network_config.directory_servers == []
+        assert settings.network_config.nick_auth_mode is NickAuthMode.PREFER_VERIFIED
+
+    def test_default_directory_server_nick_auth_settings(self) -> None:
+        settings = JoinMarketSettings()
+
+        assert settings.directory_server.nick_auth_mode is NickAuthMode.PREFER_VERIFIED
+        assert settings.directory_server.nick_auth_directory_id is None
+        assert settings.directory_server.nick_auth_timeout == 30.0
+
+    def test_directory_server_validates_nick_auth_identity_and_required_mode(self) -> None:
+        with pytest.raises(ValueError, match="invalid onion directory-id"):
+            DirectoryServerSettings(nick_auth_directory_id="not-an-endpoint")
+        with pytest.raises(ValueError, match="needs nick_auth_directory_id"):
+            DirectoryServerSettings(nick_auth_mode=NickAuthMode.REQUIRE_VERIFIED)
+
+        settings = DirectoryServerSettings(
+            nick_auth_mode=NickAuthMode.REQUIRE_VERIFIED,
+            nick_auth_directory_id="test:directory-a",
+        )
+        assert settings.nick_auth_directory_id == "test:directory-a"
 
     def test_default_wallet_settings(self) -> None:
         """Test default wallet settings."""
@@ -775,6 +797,13 @@ class TestParseDirectoryServers:
         """JSON empty string should produce empty list."""
         settings = NetworkSettings(directory_servers='""')
         assert settings.directory_servers == []
+
+    def test_nick_auth_mode_defaults_to_prefer_verified(self) -> None:
+        assert NetworkSettings().nick_auth_mode is NickAuthMode.PREFER_VERIFIED
+
+    def test_nick_auth_mode_parses_config_value(self) -> None:
+        settings = NetworkSettings(nick_auth_mode="require_verified")
+        assert settings.nick_auth_mode is NickAuthMode.REQUIRE_VERIFIED
 
 
 class TestJoinMarketSettingsHelpers:

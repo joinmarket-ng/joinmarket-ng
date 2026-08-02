@@ -1047,6 +1047,7 @@ class ProtocolHandlersMixin:
                         socks_host=self.config.socks_host,
                         socks_port=self.config.socks_port,
                         timeout=30.0,
+                        nick_auth_mode=self.config.nick_auth_mode,
                         socks_username=socks_username,
                         socks_password=socks_password,
                     )

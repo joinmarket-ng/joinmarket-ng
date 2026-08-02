@@ -5,7 +5,7 @@ Tests for peer registry.
 import pytest
 from jmcore.models import NetworkType, PeerInfo, PeerStatus
 
-from directory_server.peer_registry import PeerRegistry
+from directory_server.peer_registry import PeerOwnershipConflictError, PeerRegistry
 
 
 @pytest.fixture
@@ -33,16 +33,79 @@ def test_register_peer(registry, sample_peer):
 
 
 def test_register_duplicate_nick(registry, sample_peer):
-    registry.register(sample_peer)
+    registry.register(sample_peer, "first")
 
     peer2 = PeerInfo(
         nick="test_peer",
         onion_address="abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvw2.onion",
         port=5222,
     )
-    registry.register(peer2)
+    with pytest.raises(PeerOwnershipConflictError):
+        registry.register(peer2, "second")
 
-    assert registry.count() == 2
+    assert registry.count() == 1
+    assert registry.get_connection_id(sample_peer.location_string) == "first"
+
+
+def test_verified_peer_atomically_displaces_legacy_owner(registry, sample_peer):
+    first = registry.register(sample_peer, "legacy")
+    replacement = sample_peer.model_copy(deep=True)
+
+    result = registry.register(replacement, "verified", verified_pubkey=b"full-pubkey")
+
+    assert result.peer_key == first.peer_key
+    assert result.displaced[0].connection_id == "legacy"
+    assert registry.get_by_key(first.peer_key) is replacement
+    assert registry.get_connection_id(first.peer_key) == "verified"
+
+
+def test_same_verified_pubkey_reconnect_replaces_owner(registry, sample_peer):
+    key = registry.register(sample_peer, "first", verified_pubkey=b"same-key").peer_key
+
+    result = registry.register(
+        sample_peer.model_copy(deep=True), "second", verified_pubkey=b"same-key"
+    )
+
+    assert result.displaced[0].connection_id == "first"
+    assert registry.get_connection_id(key) == "second"
+
+
+def test_different_verified_pubkey_for_same_nick_is_rejected(registry, sample_peer):
+    key = registry.register(sample_peer, "first", verified_pubkey=b"first-key").peer_key
+
+    with pytest.raises(PeerOwnershipConflictError):
+        registry.register(
+            sample_peer.model_copy(deep=True), "second", verified_pubkey=b"different-key"
+        )
+
+    assert registry.get_connection_id(key) == "first"
+
+
+def test_verified_nick_cannot_displace_different_nick_at_same_location(registry, sample_peer):
+    key = registry.register(sample_peer, "location-owner").peer_key
+    attacker = sample_peer.model_copy(update={"nick": "authenticated-attacker"})
+
+    with pytest.raises(PeerOwnershipConflictError, match="location already registered"):
+        registry.register(attacker, "attacker", verified_pubkey=b"attacker-key")
+
+    assert registry.get_connection_id(key) == "location-owner"
+    assert registry.get_by_nick(sample_peer.nick) is sample_peer
+
+
+def test_stale_generation_cannot_mutate_or_unregister_owner(registry, sample_peer):
+    key = registry.register(sample_peer, "old", verified_pubkey=b"same-key").peer_key
+    registry.register(sample_peer.model_copy(deep=True), "new", verified_pubkey=b"same-key")
+    current = registry.get_by_key(key)
+    assert current is not None
+    last_seen = current.last_seen
+
+    assert registry.update_status(key, PeerStatus.DISCONNECTED, "old") is False
+    assert registry.update_last_seen(key, "old") is False
+    assert registry.unregister(key, "old") is False
+
+    assert registry.get_by_key(key) is current
+    assert current.status != PeerStatus.DISCONNECTED
+    assert current.last_seen == last_seen
 
 
 def test_max_peers_limit(registry):

@@ -144,6 +144,7 @@ services:
       - LOGGING__LEVEL=DEBUG
       - DIRECTORY_SERVER__PORT=5222
       - DIRECTORY_SERVER__HOST=0.0.0.0
+      - DIRECTORY_SERVER__NICK_AUTH_DIRECTORY_ID=test:jm-directory-5222
     ports:
       - "5222:5222"
     networks:
@@ -184,6 +185,7 @@ services:
       - LOGGING__LEVEL=DEBUG
       - DIRECTORY_SERVER__PORT=5223
       - DIRECTORY_SERVER__HOST=0.0.0.0
+      - DIRECTORY_SERVER__NICK_AUTH_DIRECTORY_ID=test:jm-directory2-5223
     ports:
       - "5223:5223"
     networks:

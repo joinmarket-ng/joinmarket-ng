@@ -5,8 +5,11 @@ These tests verify that when sending to a peer fails, the peer is properly
 cleaned up from both the connection mapping and the peer registry.
 """
 
+from unittest.mock import AsyncMock
+
 import pytest
-from jmcore.models import NetworkType, PeerInfo, PeerStatus
+from jmcore.models import MessageEnvelope, NetworkType, PeerInfo, PeerStatus
+from jmcore.protocol import MessageType
 from jmcore.settings import DirectoryServerSettings
 
 from directory_server.server import DirectoryServer
@@ -129,6 +132,70 @@ class TestHandleSendFailed:
         # Verify peer no longer appears in connected list
         connected_after = list(server.peer_registry.iter_connected(NetworkType.MAINNET))
         assert not any(p.nick == sample_peer.nick for p in connected_after)
+
+    @pytest.mark.anyio
+    async def test_stale_send_failure_does_not_remove_replacement(self, server, sample_peer):
+        peer_key = server.peer_registry.register(
+            sample_peer, "old", verified_pubkey=b"same-pubkey"
+        ).peer_key
+        replacement = sample_peer.model_copy(deep=True)
+        server.peer_registry.register(replacement, "new", verified_pubkey=b"same-pubkey")
+        server.peer_key_to_conn_id[peer_key] = "new"
+
+        await server._handle_send_failed(peer_key, "old")
+
+        assert server.peer_registry.get_by_key(peer_key) is replacement
+        assert server.peer_key_to_conn_id[peer_key] == "new"
+
+    @pytest.mark.anyio
+    async def test_stale_connection_cleanup_does_not_remove_replacement(self, server, sample_peer):
+        peer_key = server.peer_registry.register(
+            sample_peer, "old", verified_pubkey=b"same-pubkey"
+        ).peer_key
+        replacement = sample_peer.model_copy(deep=True)
+        server.peer_registry.register(replacement, "new", verified_pubkey=b"same-pubkey")
+        server.peer_key_to_conn_id[peer_key] = "new"
+        server.message_router._peer_offers[(peer_key, "new")] = {"new-offer"}
+        old_connection = AsyncMock()
+
+        await server._cleanup_peer(old_connection, "old", peer_key)
+
+        assert server.peer_registry.get_by_key(peer_key) is replacement
+        assert server.peer_key_to_conn_id[peer_key] == "new"
+        assert server.message_router.get_offer_stats()["total_offers"] == 1
+
+    @pytest.mark.anyio
+    async def test_send_failure_cleans_generation_state_and_broadcasts_disconnect(
+        self, server, sample_peer
+    ):
+        failed_connection = AsyncMock()
+        observer_connection = AsyncMock()
+        peer_key = server.peer_registry.register(sample_peer, "failed").peer_key
+        server.peer_key_to_conn_id[peer_key] = "failed"
+        server.connections.add("failed", failed_connection)
+        server.message_router._peer_offers[(peer_key, "failed")] = {"offer"}
+        server.heartbeat._pong_pending.add((peer_key, "failed"))
+        observer = PeerInfo(
+            nick="observer",
+            onion_address="b" * 56 + ".onion",
+            port=5222,
+            network=NetworkType.MAINNET,
+            status=PeerStatus.HANDSHAKED,
+        )
+        observer_key = server.peer_registry.register(observer, "observer").peer_key
+        server.peer_key_to_conn_id[observer_key] = "observer"
+        server.connections.add("observer", observer_connection)
+
+        await server._handle_send_failed(peer_key, "failed")
+
+        assert server.peer_registry.get_by_key(peer_key) is None
+        assert server.message_router.get_offer_stats()["total_offers"] == 0
+        assert (peer_key, "failed") not in server.heartbeat.pong_pending
+        assert server.connections.get("failed") is None
+        failed_connection.close.assert_awaited_once()
+        sent = MessageEnvelope.from_bytes(observer_connection.send.await_args.args[0])
+        assert sent.message_type == MessageType.PEERLIST
+        assert sent.payload == f"{sample_peer.nick};{sample_peer.location_string};D"
 
 
 class TestPassivePeerSendFailure:

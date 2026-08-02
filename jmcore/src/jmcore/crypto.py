@@ -285,6 +285,12 @@ class NickIdentity:
 
         return f"{message} {self.public_key_hex} {sig_b64}"
 
+    def sign_bytes(self, message: bytes) -> str:
+        """Sign raw bytes using the Bitcoin Signed Message algorithm."""
+        msg_hash = bitcoin_message_hash_bytes(message)
+        signature = self._private_key.sign(msg_hash, hasher=None)
+        return base64.b64encode(signature).decode("ascii")
+
 
 class KeyPair:
     def __init__(self, private_key: PrivateKey | None = None):

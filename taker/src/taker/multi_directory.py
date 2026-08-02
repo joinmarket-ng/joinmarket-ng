@@ -19,6 +19,7 @@ from jmcore.directory_client import DirectoryClient
 from jmcore.directory_pool import DirectoryClientPool
 from jmcore.models import Offer
 from jmcore.network import ONION_HOSTID, OnionPeer
+from jmcore.nick_auth import NickAuthMode
 from jmcore.protocol import NOT_SERVING_ONION_HOSTNAME, parse_jm_message
 from jmcore.randomness import secure_random
 from loguru import logger
@@ -96,6 +97,7 @@ class MultiDirectoryClient(DirectoryClientPool):
         prefer_direct_connections: bool = True,
         our_location: str = "NOT-SERVING-ONION",
         stream_isolation: bool = False,
+        nick_auth_mode: NickAuthMode = NickAuthMode.PREFER_VERIFIED,
     ):
         # Connection / SOCKS / credential setup is delegated to the
         # DirectoryClientPool base; it handles directory_servers, network,
@@ -109,6 +111,7 @@ class MultiDirectoryClient(DirectoryClientPool):
             socks_port=socks_port,
             connection_timeout=connection_timeout,
             stream_isolation=stream_isolation,
+            nick_auth_mode=nick_auth_mode,
         )
 
         # Taker-specific state below.

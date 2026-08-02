@@ -159,6 +159,8 @@ async def run_watcher(log_level: str | None = None) -> None:
         uptime_grace_period=watcher_settings.uptime_grace_period,
         stream_isolation=settings.tor.stream_isolation,
         blockchain_backend=blockchain_backend,
+        nick_identity=nick_identity,
+        nick_auth_mode=settings.network_config.nick_auth_mode,
     )
 
     server = OrderbookServer(watcher_settings, aggregator)

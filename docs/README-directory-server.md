@@ -118,6 +118,26 @@ Behavior summary:
 - Legacy/non-ping makers receive `!orderbook` as a compatibility liveness probe
 - Peers idle beyond hard eviction threshold are disconnected
 
+Nick ownership authentication settings (section `[directory_server]`):
+
+- `nick_auth_mode` defaults to `prefer_verified`, which authenticates upgraded clients while
+  retaining legacy client compatibility. `require_verified` rejects legacy clients, and
+  `disabled` does not advertise the extension.
+- `nick_auth_directory_id` must be the canonical lowercase Tor v3 endpoint, including the port,
+  for example `your56characterhostname.onion:5222`. Authentication is not advertised until this
+  identity is configured. Local tests may use an explicit `test:` identity.
+- `nick_auth_timeout` controls the proof deadline and cannot exceed 30 seconds.
+
+For local test deployments, clients accept the directory's configured `test:`
+identity even when Docker or the test runner maps the service through a different
+host port. Production `.onion` identities are always matched exactly against the
+endpoint selected by the client.
+
+For the production Compose stack, retrieve the generated hostname first, configure the resulting
+`hostname.onion:5222` value as `DIRECTORY_SERVER__NICK_AUTH_DIRECTORY_ID`, then restart the
+directory server container. Do not use the container hostname as the identity for a public Tor
+endpoint.
+
 ## Optional
 
 ### Vanity Onion Address

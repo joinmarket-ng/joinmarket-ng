@@ -208,6 +208,87 @@ class TestMessageRouterPrivateMessageFailedSend:
         # The target peer should have been marked as failed
         assert to_peer.location_string in failed_peers
 
+    @pytest.mark.anyio
+    async def test_private_send_failure_reports_failed_generation(self, registry):
+        failed_owners: list[tuple[str, str]] = []
+        sender = PeerInfo(
+            nick="sender",
+            onion_address="a" * 56 + ".onion",
+            port=5222,
+            network=NetworkType.MAINNET,
+            status=PeerStatus.HANDSHAKED,
+        )
+        sender_key = registry.register(sender, "sender-connection").peer_key
+        recipient = PeerInfo(
+            nick="recipient",
+            onion_address="b" * 56 + ".onion",
+            port=5222,
+            network=NetworkType.MAINNET,
+            status=PeerStatus.HANDSHAKED,
+        )
+        recipient_key = registry.register(
+            recipient, "old-recipient", verified_pubkey=b"recipient-pubkey"
+        ).peer_key
+
+        async def replace_then_fail(peer_key: str, data: bytes, connection_id: str) -> None:
+            registry.register(
+                recipient.model_copy(deep=True),
+                "new-recipient",
+                verified_pubkey=b"recipient-pubkey",
+            )
+            raise ConnectionError("old connection closed")
+
+        async def on_failed(peer_key: str, connection_id: str) -> None:
+            failed_owners.append((peer_key, connection_id))
+
+        router = MessageRouter(
+            peer_registry=registry,
+            send_callback=replace_then_fail,
+            on_send_failed=on_failed,
+        )
+        envelope = MessageEnvelope(
+            message_type=MessageType.PRIVMSG,
+            payload="sender!recipient!fill payload pubkey signature",
+        )
+
+        await router.route_message(envelope, sender_key, "sender-connection")
+
+        assert failed_owners == [(recipient_key, "old-recipient")]
+        assert registry.get_connection_id(recipient_key) == "new-recipient"
+
+    @pytest.mark.anyio
+    async def test_private_message_does_not_route_to_pending_owner(self, registry):
+        sent_messages: list[tuple[str, str]] = []
+        sender = PeerInfo(
+            nick="sender",
+            onion_address="a" * 56 + ".onion",
+            port=5222,
+            network=NetworkType.MAINNET,
+            status=PeerStatus.HANDSHAKED,
+        )
+        sender_key = registry.register(sender, "sender-connection").peer_key
+        recipient = PeerInfo(
+            nick="recipient",
+            onion_address="b" * 56 + ".onion",
+            port=5222,
+            network=NetworkType.MAINNET,
+            status=PeerStatus.CONNECTED,
+        )
+        registry.register(recipient, "pending-recipient", verified_pubkey=b"recipient-key")
+
+        async def record_send(peer_key: str, data: bytes, connection_id: str) -> None:
+            sent_messages.append((peer_key, connection_id))
+
+        router = MessageRouter(peer_registry=registry, send_callback=record_send)
+        envelope = MessageEnvelope(
+            message_type=MessageType.PRIVMSG,
+            payload="sender!recipient!fill payload pubkey signature",
+        )
+
+        await router.route_message(envelope, sender_key, "sender-connection")
+
+        assert sent_messages == []
+
 
 class TestMessageRouterSenderBinding:
     """Messages cannot claim a nick other than the handshaked connection."""
@@ -230,7 +311,49 @@ class TestMessageRouterSenderBinding:
         await router._handle_public_message(envelope, sender.location_string)
 
         assert sent_messages == []
+
+    @pytest.mark.anyio
+    async def test_stale_generation_cannot_route_or_publish_offers(self, registry):
+        sent_messages: list[tuple[str, str]] = []
+
+        async def record_send(peer_key: str, data: bytes, connection_id: str) -> None:
+            sent_messages.append((peer_key, connection_id))
+
+        sender = PeerInfo(
+            nick="sender",
+            onion_address="a" * 56 + ".onion",
+            port=5222,
+            network=NetworkType.MAINNET,
+            status=PeerStatus.HANDSHAKED,
+        )
+        sender_key = registry.register(sender, "old").peer_key
+        recipient = PeerInfo(
+            nick="recipient",
+            onion_address="b" * 56 + ".onion",
+            port=5222,
+            network=NetworkType.MAINNET,
+            status=PeerStatus.HANDSHAKED,
+        )
+        recipient_key = registry.register(recipient, "recipient-connection").peer_key
+        router = MessageRouter(peer_registry=registry, send_callback=record_send)
+        envelope = MessageEnvelope(
+            message_type=MessageType.PUBMSG,
+            payload="sender!PUBLIC!sw0absoffer 0 30000 72590 0 1000",
+        )
+
+        await router.route_message(envelope, sender_key, "old")
+        assert router.get_offer_stats()["total_offers"] == 1
+
+        registry.register(sender.model_copy(deep=True), "new", verified_pubkey=b"verified-pubkey")
+        sent_messages.clear()
+        await router.route_message(envelope, sender_key, "old")
+
+        assert sent_messages == []
         assert router.get_offer_stats()["total_offers"] == 0
+
+        await router.route_message(envelope, sender_key, "new")
+        assert sent_messages == [(recipient_key, "recipient-connection")]
+        assert router.get_offer_stats()["total_offers"] == 1
 
     @pytest.mark.anyio
     async def test_drops_private_message_with_forged_sender(self, registry, sample_peers):
@@ -626,3 +749,26 @@ class TestPingPongRouting:
 
         # Should not raise
         await router.route_message(envelope, from_key)
+
+    @pytest.mark.anyio
+    async def test_connected_peer_cannot_route_before_handshake(self, registry):
+        sent_messages: list[str] = []
+
+        async def record_send(peer_key: str, data: bytes) -> None:
+            sent_messages.append(peer_key)
+
+        peer = PeerInfo(
+            nick="connecting",
+            onion_address="a" * 56 + ".onion",
+            port=5222,
+            network=NetworkType.MAINNET,
+            status=PeerStatus.CONNECTED,
+        )
+        key = registry.register(peer, "connection").peer_key
+        router = MessageRouter(peer_registry=registry, send_callback=record_send)
+
+        await router.route_message(
+            MessageEnvelope(message_type=MessageType.PING, payload=""), key, "connection"
+        )
+
+        assert sent_messages == []

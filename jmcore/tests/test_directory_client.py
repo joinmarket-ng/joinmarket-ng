@@ -6,9 +6,36 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from jmcore.directory_client import DirectoryClient, MessageType, _fidelity_bond_claim_key
+from jmcore.crypto import NickIdentity
+from jmcore.directory_client import (
+    DirectoryClient,
+    DirectoryClientError,
+    MessageType,
+    _fidelity_bond_claim_key,
+)
 from jmcore.models import Offer, OfferType
-from jmcore.protocol import FEATURE_PEERLIST_FEATURES
+from jmcore.nick_auth import (
+    NickAuthChallenge,
+    NickAuthMode,
+    NickAuthResult,
+    create_nick_auth_proof,
+    directory_id_for_endpoint,
+)
+from jmcore.protocol import FEATURE_NICK_AUTH, FEATURE_PEERLIST_FEATURES
+
+
+def _handshake_response(*, nick_auth: bool = False) -> bytes:
+    features = {FEATURE_NICK_AUTH: True} if nick_auth else {}
+    line = json.dumps(
+        {
+            "accepted": True,
+            "proto-ver-min": 5,
+            "proto-ver-max": 5,
+            "features": features,
+            "nick": "directory",
+        }
+    )
+    return json.dumps({"type": MessageType.DN_HANDSHAKE.value, "line": line}).encode()
 
 
 def _bond_offer(counterparty: str, oid: int, bond_data: dict[str, Any] | None = None) -> Offer:
@@ -109,6 +136,241 @@ def test_offer_bond_rotation_removes_old_reverse_index() -> None:
     assert set(client.offers) == {maker_offer_key, ("Maker2", 0)}
     assert maker_offer_key not in client._bond_to_offers[first_key]
     assert maker_offer_key in client._bond_to_offers[second_key]
+
+
+@pytest.mark.asyncio
+async def test_nick_auth_prefer_verified_falls_back_to_legacy_directory() -> None:
+    connection = AsyncMock()
+    connection.receive.return_value = _handshake_response()
+    client = DirectoryClient("directory-a", 5222, "regtest")
+    client.connection = connection
+
+    await client._handshake()
+
+    assert client.directory_nick_authenticated is False
+    assert connection.send.await_count == 1
+    handshake = json.loads(connection.send.await_args.args[0])
+    assert json.loads(handshake["line"])["features"][FEATURE_NICK_AUTH] is True
+
+
+@pytest.mark.asyncio
+async def test_nick_auth_require_verified_rejects_legacy_directory() -> None:
+    connection = AsyncMock()
+    connection.receive.return_value = _handshake_response()
+    client = DirectoryClient(
+        "directory-a", 5222, "regtest", nick_auth_mode=NickAuthMode.REQUIRE_VERIFIED
+    )
+    client.connection = connection
+
+    with pytest.raises(DirectoryClientError, match="does not support"):
+        await client._handshake()
+
+    assert client.directory_nick_authenticated is False
+    assert connection.send.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_nick_auth_valid_challenge_proof_and_result_use_exact_wire_envelopes() -> None:
+    identity = NickIdentity(private_key_bytes=b"\x01" * 32)
+    directory_id = directory_id_for_endpoint("directory-a", 5222)
+    challenge = NickAuthChallenge(challenge="22" * 32, directory_id=directory_id)
+    result = NickAuthResult(code="ok", verified=True)
+    connection = AsyncMock()
+    connection.receive.side_effect = [
+        _handshake_response(nick_auth=True),
+        json.dumps({"type": MessageType.NICK_AUTH.value, "line": challenge.to_json()}).encode(),
+        json.dumps({"type": MessageType.NICK_AUTH_RESULT.value, "line": result.to_json()}).encode(),
+    ]
+    client = DirectoryClient("directory-a", 5222, "regtest", nick_identity=identity)
+    client.connection = connection
+
+    await client._handshake()
+
+    sent = connection.send.await_args_list
+    assert len(sent) == 2
+    expected_handshake_line = json.dumps(
+        {
+            "app-name": "joinmarket",
+            "directory": False,
+            "location-string": "NOT-SERVING-ONION",
+            "proto-ver": 5,
+            "features": {
+                "nick_auth": True,
+                "peerlist_features": True,
+                "ping": True,
+            },
+            "nick": identity.nick,
+            "network": "regtest",
+        }
+    )
+    expected_handshake = json.dumps(
+        {"type": MessageType.HANDSHAKE.value, "line": expected_handshake_line}
+    ).encode()
+    expected_proof = create_nick_auth_proof(
+        identity, challenge.challenge, directory_id, expected_handshake_line
+    )
+    expected_proof_envelope = json.dumps(
+        {"type": MessageType.NICK_AUTH.value, "line": expected_proof.to_json()}
+    ).encode()
+    assert sent[0].args[0] == expected_handshake
+    assert sent[1].args[0] == expected_proof_envelope
+    assert client.directory_nick_authenticated is True
+
+
+@pytest.mark.asyncio
+async def test_nick_auth_malformed_result_fails_closed() -> None:
+    directory_id = directory_id_for_endpoint("directory-a", 5222)
+    challenge = NickAuthChallenge(challenge="22" * 32, directory_id=directory_id)
+    connection = AsyncMock()
+    connection.receive.side_effect = [
+        _handshake_response(nick_auth=True),
+        json.dumps({"type": MessageType.NICK_AUTH.value, "line": challenge.to_json()}).encode(),
+        json.dumps(
+            {
+                "type": MessageType.NICK_AUTH_RESULT.value,
+                "line": '{"code":"ok","verified":false}',
+            }
+        ).encode(),
+    ]
+    client = DirectoryClient("directory-a", 5222, "regtest")
+    client.connection = connection
+
+    with pytest.raises(DirectoryClientError, match="Invalid nick authentication response"):
+        await client._handshake()
+
+    assert client.directory_nick_authenticated is False
+
+
+@pytest.mark.asyncio
+async def test_nick_auth_malformed_challenge_is_redacted_from_exception_chain() -> None:
+    secret_challenge = "AA" * 32
+    connection = AsyncMock()
+    connection.receive.side_effect = [
+        _handshake_response(nick_auth=True),
+        json.dumps(
+            {
+                "type": MessageType.NICK_AUTH.value,
+                "line": json.dumps(
+                    {
+                        "kind": "challenge",
+                        "challenge": secret_challenge,
+                        "directory-id": directory_id_for_endpoint("directory-a", 5222),
+                    }
+                ),
+            }
+        ).encode(),
+    ]
+    client = DirectoryClient("directory-a", 5222, "regtest")
+    client.connection = connection
+
+    with pytest.raises(DirectoryClientError) as exc_info:
+        await client._handshake()
+
+    assert str(exc_info.value) == "Invalid nick authentication response"
+    assert secret_challenge not in str(exc_info.value)
+    assert exc_info.value.__suppress_context__ is True
+
+
+@pytest.mark.asyncio
+async def test_nick_auth_rejects_duplicate_outer_envelope_keys() -> None:
+    connection = AsyncMock()
+    connection.receive.side_effect = [
+        _handshake_response(nick_auth=True),
+        (
+            '{"type":803,"type":803,"line":'
+            + json.dumps(
+                NickAuthChallenge(
+                    challenge="22" * 32,
+                    directory_id=directory_id_for_endpoint("directory-a", 5222),
+                ).to_json()
+            )
+            + "}"
+        ).encode(),
+    ]
+    client = DirectoryClient("directory-a", 5222, "regtest")
+    client.connection = connection
+
+    with pytest.raises(DirectoryClientError, match="Invalid nick authentication response"):
+        await client._handshake()
+
+    assert connection.send.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_nick_auth_mismatched_directory_id_fails_before_proof() -> None:
+    selected_host = "a" * 56 + ".onion"
+    other_host = "b" * 56 + ".onion"
+    challenge = NickAuthChallenge(
+        challenge="22" * 32,
+        directory_id=directory_id_for_endpoint(other_host, 5222),
+    )
+    connection = AsyncMock()
+    connection.receive.side_effect = [
+        _handshake_response(nick_auth=True),
+        json.dumps({"type": MessageType.NICK_AUTH.value, "line": challenge.to_json()}).encode(),
+    ]
+    client = DirectoryClient(selected_host, 5222, "regtest")
+    client.connection = connection
+
+    with pytest.raises(DirectoryClientError, match="directory-id mismatch"):
+        await client._handshake()
+
+    assert connection.send.await_count == 1
+    assert client.directory_nick_authenticated is False
+
+
+@pytest.mark.asyncio
+async def test_nick_auth_accepts_stable_test_id_across_forwarded_endpoint() -> None:
+    challenge = NickAuthChallenge(
+        challenge="22" * 32,
+        directory_id="test:jm-directory-5222",
+    )
+    result = NickAuthResult(code="ok", verified=True)
+    connection = AsyncMock()
+    connection.receive.side_effect = [
+        _handshake_response(nick_auth=True),
+        json.dumps({"type": MessageType.NICK_AUTH.value, "line": challenge.to_json()}).encode(),
+        json.dumps({"type": MessageType.NICK_AUTH_RESULT.value, "line": result.to_json()}).encode(),
+    ]
+    client = DirectoryClient("127.0.0.1", 20004, "regtest")
+    client.connection = connection
+
+    await client._handshake()
+
+    assert connection.send.await_count == 2
+    assert client.directory_nick_authenticated is True
+
+
+@pytest.mark.asyncio
+async def test_nick_auth_challenge_timeout_fails_closed() -> None:
+    connection = AsyncMock()
+    connection.receive.side_effect = [
+        _handshake_response(nick_auth=True),
+        TimeoutError(),
+    ]
+    client = DirectoryClient("directory-a", 5222, "regtest", timeout=0.01)
+    client.connection = connection
+
+    with pytest.raises(DirectoryClientError, match="timed out"):
+        await client._handshake()
+
+    assert connection.send.await_count == 1
+    assert client.directory_nick_authenticated is False
+
+
+@pytest.mark.asyncio
+async def test_nick_auth_disabled_uses_legacy_handshake_only() -> None:
+    connection = AsyncMock()
+    connection.receive.return_value = _handshake_response(nick_auth=True)
+    client = DirectoryClient("directory-a", 5222, "regtest", nick_auth_mode=NickAuthMode.DISABLED)
+    client.connection = connection
+
+    await client._handshake()
+
+    assert connection.send.await_count == 1
+    handshake = json.loads(connection.send.await_args.args[0])
+    assert FEATURE_NICK_AUTH not in json.loads(handshake["line"])["features"]
+    assert client.directory_nick_authenticated is False
 
 
 def test_directory_client_default_timeout():

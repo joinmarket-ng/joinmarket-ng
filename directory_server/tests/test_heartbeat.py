@@ -168,7 +168,9 @@ class TestHeartbeatSweep:
         key = _register_and_handshake(registry, peer, last_seen=old_time)
 
         # Manually mark pending
-        manager._pong_pending.add(key)
+        connection_id = registry.get_connection_id(key)
+        assert connection_id is not None
+        manager._pong_pending.add((key, connection_id))
 
         await manager._sweep()
 
@@ -495,11 +497,11 @@ class TestHandlePong:
             send_callback=AsyncMock(),
             evict_callback=AsyncMock(),
         )
-        manager._pong_pending.add("some_key")
+        manager._pong_pending.add(("some_key", "connection"))
 
-        manager.handle_pong("some_key")
+        manager.handle_pong("some_key", "connection")
 
-        assert "some_key" not in manager.pong_pending
+        assert ("some_key", "connection") not in manager.pong_pending
 
     def test_handle_pong_noop_for_unknown_key(self) -> None:
         registry = PeerRegistry()
@@ -528,16 +530,32 @@ class TestPongPendingProperty:
             send_callback=AsyncMock(),
             evict_callback=AsyncMock(),
         )
-        manager._pong_pending.add("key1")
-        manager._pong_pending.add("key2")
+        manager._pong_pending.add(("key1", "connection1"))
+        manager._pong_pending.add(("key2", "connection2"))
 
         pending = manager.pong_pending
         assert isinstance(pending, frozenset)
-        assert pending == frozenset({"key1", "key2"})
+        assert pending == frozenset({("key1", "connection1"), ("key2", "connection2")})
 
         # Mutating the internal set should not affect previously returned snapshot
-        manager._pong_pending.discard("key1")
-        assert "key1" in pending  # still in the frozenset we captured
+        manager._pong_pending.discard(("key1", "connection1"))
+        assert ("key1", "connection1") in pending
+
+    def test_stale_pong_does_not_clear_replacement_pending(self) -> None:
+        registry = PeerRegistry()
+        peer = _make_peer("maker", features={"ping": True})
+        key = registry.register(peer, "old").peer_key
+        registry.register(peer.model_copy(deep=True), "new", verified_pubkey=b"pubkey")
+        manager = HeartbeatManager(
+            peer_registry=registry,
+            send_callback=AsyncMock(),
+            evict_callback=AsyncMock(),
+        )
+        manager._pong_pending.add((key, "new"))
+
+        manager.handle_pong(key, "old")
+
+        assert manager.pong_pending == frozenset({(key, "new")})
 
 
 # ---------------------------------------------------------------------------
@@ -609,7 +627,7 @@ class TestLifecycle:
             config=HeartbeatConfig(sweep_interval_sec=999),
         )
 
-        manager._pong_pending.add("leftover_key")
+        manager._pong_pending.add(("leftover_key", "connection"))
         manager.start()
         await manager.stop()
 

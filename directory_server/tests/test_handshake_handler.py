@@ -6,7 +6,8 @@ import json
 
 import pytest
 from jmcore.models import NetworkType
-from jmcore.protocol import JM_VERSION, JM_VERSION_MIN
+from jmcore.nick_auth import NickAuthMode
+from jmcore.protocol import FEATURE_NICK_AUTH, JM_VERSION, JM_VERSION_MIN
 
 from directory_server.handshake_handler import HandshakeError, HandshakeHandler
 
@@ -221,6 +222,74 @@ def test_create_rejection_response(handler):
 
     assert response["accepted"] is False
     assert "Rejected: Test rejection" in response["motd"]
+
+
+def test_advertises_nick_auth_only_with_enabled_mode_and_identity():
+    enabled = HandshakeHandler(
+        network=NetworkType.MAINNET,
+        server_nick="directory",
+        motd="test",
+        nick_auth_mode=NickAuthMode.PREFER_VERIFIED,
+        nick_auth_directory_id="test:directory",
+    )
+    missing_identity = HandshakeHandler(
+        network=NetworkType.MAINNET,
+        server_nick="directory",
+        motd="test",
+        nick_auth_mode=NickAuthMode.PREFER_VERIFIED,
+    )
+    disabled = HandshakeHandler(
+        network=NetworkType.MAINNET,
+        server_nick="directory",
+        motd="test",
+        nick_auth_mode=NickAuthMode.DISABLED,
+        nick_auth_directory_id="test:directory",
+    )
+    handshake_data = json.dumps(
+        {
+            "app-name": "joinmarket",
+            "directory": False,
+            "location-string": "NOT-SERVING-ONION",
+            "proto-ver": JM_VERSION,
+            "features": {FEATURE_NICK_AUTH: True},
+            "nick": "test_client",
+            "network": "mainnet",
+        }
+    )
+
+    _, enabled_response = enabled.process_handshake(handshake_data, "connection")
+    _, missing_response = missing_identity.process_handshake(handshake_data, "connection")
+    _, disabled_response = disabled.process_handshake(handshake_data, "connection")
+
+    assert enabled_response["features"][FEATURE_NICK_AUTH] is True
+    assert FEATURE_NICK_AUTH not in missing_response["features"]
+    assert FEATURE_NICK_AUTH not in disabled_response["features"]
+
+
+def test_require_verified_rejects_legacy_client_with_ordinary_response():
+    handler = HandshakeHandler(
+        network=NetworkType.MAINNET,
+        server_nick="directory",
+        motd="test",
+        nick_auth_mode=NickAuthMode.REQUIRE_VERIFIED,
+        nick_auth_directory_id="test:directory",
+    )
+    handshake_data = json.dumps(
+        {
+            "app-name": "joinmarket",
+            "directory": False,
+            "location-string": "NOT-SERVING-ONION",
+            "proto-ver": JM_VERSION,
+            "features": {},
+            "nick": "legacy_client",
+            "network": "mainnet",
+        }
+    )
+
+    _, response = handler.process_handshake(handshake_data, "connection")
+
+    assert response["accepted"] is False
+    assert response["features"][FEATURE_NICK_AUTH] is True
 
 
 class TestVersionNegotiation:

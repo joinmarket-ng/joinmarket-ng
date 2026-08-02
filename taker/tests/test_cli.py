@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 import click
 import pytest
 from jmcore.models import NetworkType
+from jmcore.nick_auth import NickAuthMode
 from typer.testing import CliRunner
 
 from taker.cli import app, build_taker_config, create_backend
@@ -45,6 +46,7 @@ class TestBuildTakerConfig:
         settings.network_config.network = NetworkType.SIGNET
         settings.network_config.bitcoin_network = None
         settings.network_config.directory_servers = ["dir1.onion:5222"]
+        settings.network_config.nick_auth_mode = NickAuthMode.PREFER_VERIFIED
 
         # Data dir
         settings.get_data_dir.return_value = "/tmp/jm-test"
@@ -638,3 +640,19 @@ class TestBuildTakerConfig:
         )
 
         assert config.gap_limit == 50
+
+    def test_nick_auth_mode_flows_into_config(
+        self, sample_mnemonic: str, mock_settings: MagicMock
+    ) -> None:
+        mock_settings.network_config.nick_auth_mode = NickAuthMode.REQUIRE_VERIFIED
+
+        config = build_taker_config(
+            settings=mock_settings,
+            mnemonic=sample_mnemonic,
+            passphrase="",
+            destination="bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+            amount=100000,
+            mixdepth=0,
+        )
+
+        assert config.nick_auth_mode is NickAuthMode.REQUIRE_VERIFIED

@@ -7,8 +7,10 @@ Implements Single Responsibility Principle: only handles handshakes.
 import json
 
 from jmcore.models import NetworkType, PeerInfo, PeerStatus
+from jmcore.nick_auth import NickAuthMode
 from jmcore.protocol import (
     FEATURE_NEUTRINO_COMPAT,
+    FEATURE_NICK_AUTH,
     FEATURE_PEERLIST_FEATURES,
     FEATURE_PING,
     JM_VERSION,
@@ -27,12 +29,29 @@ class HandshakeError(Exception):
 
 class HandshakeHandler:
     def __init__(
-        self, network: NetworkType, server_nick: str, motd: str, neutrino_compat: bool = False
+        self,
+        network: NetworkType,
+        server_nick: str,
+        motd: str,
+        neutrino_compat: bool = False,
+        nick_auth_mode: NickAuthMode = NickAuthMode.DISABLED,
+        nick_auth_directory_id: str | None = None,
     ):
         self.network = network
         self.server_nick = server_nick
         self.motd = motd
         self.neutrino_compat = neutrino_compat
+        self.nick_auth_mode = nick_auth_mode
+        self.nick_auth_directory_id = nick_auth_directory_id
+
+    @property
+    def advertises_nick_auth(self) -> bool:
+        return self.nick_auth_mode is not NickAuthMode.DISABLED and bool(
+            self.nick_auth_directory_id
+        )
+
+    def negotiates_nick_auth(self, peer: PeerInfo) -> bool:
+        return self.advertises_nick_auth and peer.features.get(FEATURE_NICK_AUTH) is True
 
     def process_handshake(self, handshake_data: str, peer_location: str) -> tuple[PeerInfo, dict]:
         try:
@@ -91,21 +110,31 @@ class HandshakeHandler:
             server_features: set[str] = {FEATURE_PEERLIST_FEATURES, FEATURE_PING}
             if self.neutrino_compat:
                 server_features.add(FEATURE_NEUTRINO_COMPAT)
+            if self.advertises_nick_auth:
+                server_features.add(FEATURE_NICK_AUTH)
             feature_set = FeatureSet(features=server_features)
+
+            accepted = not (
+                self.nick_auth_mode is NickAuthMode.REQUIRE_VERIFIED
+                and not self.negotiates_nick_auth(peer_info)
+            )
 
             response = create_handshake_response(
                 nick=self.server_nick,
                 network=self.network.value,
-                accepted=True,
-                motd=self.motd,
+                accepted=accepted,
+                motd=self.motd if accepted else "Rejected: verified nick authentication required",
                 features=feature_set,
             )
 
-            logger.info(
-                f"Handshake accepted: {nick} from {peer_network.value} "
-                f"at {peer_info.location_string} "
-                f"(v{negotiated_version}, neutrino={peer_neutrino_compat})"
-            )
+            if accepted:
+                logger.info(
+                    f"Handshake accepted: {nick} from {peer_network.value} "
+                    f"at {peer_info.location_string} "
+                    f"(v{negotiated_version}, neutrino={peer_neutrino_compat})"
+                )
+            else:
+                logger.info(f"Handshake rejected by nick authentication policy: {nick}")
 
             return (peer_info, response)
 

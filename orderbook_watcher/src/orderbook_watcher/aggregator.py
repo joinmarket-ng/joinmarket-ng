@@ -12,8 +12,11 @@ from typing import TYPE_CHECKING, Any
 
 from jmcore.bond_calc import calculate_timelocked_fidelity_bond_value
 from jmcore.btc_script import derive_bond_address
+from jmcore.crypto import NickIdentity
 from jmcore.mempool_api import MempoolAPI, TxOut
 from jmcore.models import FidelityBond, Offer, OrderBook
+from jmcore.nick_auth import NickAuthMode
+from jmcore.protocol import JM_VERSION
 from loguru import logger
 
 if TYPE_CHECKING:
@@ -150,6 +153,8 @@ class OrderbookAggregator:
         uptime_grace_period: int = 60,
         stream_isolation: bool = False,
         blockchain_backend: BlockchainBackend | None = None,
+        nick_identity: NickIdentity | None = None,
+        nick_auth_mode: NickAuthMode = NickAuthMode.PREFER_VERIFIED,
     ) -> None:
         self.directory_nodes = directory_nodes
         self.network = network
@@ -164,6 +169,8 @@ class OrderbookAggregator:
         self.max_message_size = max_message_size
         self.uptime_grace_period = uptime_grace_period
         self.blockchain_backend = blockchain_backend
+        self.nick_identity = nick_identity or NickIdentity(JM_VERSION)
+        self.nick_auth_mode = nick_auth_mode
 
         # Build the optional mempool proxy URL and pre-compute isolation credentials.
         self._dir_username: str | None = None
@@ -265,10 +272,12 @@ class OrderbookAggregator:
             onion_address,
             port,
             self.network,
+            nick_identity=self.nick_identity,
             socks_host=self.socks_host,
             socks_port=self.socks_port,
             timeout=self.timeout,
             max_message_size=self.max_message_size,
+            nick_auth_mode=self.nick_auth_mode,
             socks_username=self._dir_username,
             socks_password=self._dir_password,
         )
@@ -661,11 +670,13 @@ class OrderbookAggregator:
             onion_address,
             port,
             self.network,
+            nick_identity=self.nick_identity,
             socks_host=self.socks_host,
             socks_port=self.socks_port,
             timeout=self.timeout,
             max_message_size=self.max_message_size,
             on_disconnect=on_disconnect,
+            nick_auth_mode=self.nick_auth_mode,
             socks_username=self._dir_username,
             socks_password=self._dir_password,
         )

@@ -77,6 +77,7 @@ FEATURE_NEUTRINO_COMPAT = "neutrino_compat"
 FEATURE_PUSH_ENCRYPTED = "push_encrypted"
 FEATURE_PEERLIST_FEATURES = "peerlist_features"  # Supports extended peerlist with F: suffix
 FEATURE_PING = "ping"  # Supports application-level PING/PONG heartbeat
+FEATURE_NICK_AUTH = "nick_auth"
 
 # Feature dependencies: feature -> list of required features
 FEATURE_DEPENDENCIES: dict[str, list[str]] = {
@@ -84,6 +85,7 @@ FEATURE_DEPENDENCIES: dict[str, list[str]] = {
     FEATURE_PUSH_ENCRYPTED: [],  # Requires NaCl session, but that's implicit
     FEATURE_PEERLIST_FEATURES: [],  # No dependencies
     FEATURE_PING: [],  # No dependencies
+    FEATURE_NICK_AUTH: [],  # No dependencies
 }
 
 # All known features
@@ -92,6 +94,7 @@ ALL_FEATURES = {
     FEATURE_PUSH_ENCRYPTED,
     FEATURE_PEERLIST_FEATURES,
     FEATURE_PING,
+    FEATURE_NICK_AUTH,
 }
 
 
@@ -165,6 +168,10 @@ class FeatureSet:
     def supports_ping(self) -> bool:
         """Check if peer supports application-level PING/PONG heartbeat."""
         return FEATURE_PING in self.features
+
+    def supports_nick_auth(self) -> bool:
+        """Check if peer supports JMP-0005 nick ownership authentication."""
+        return FEATURE_NICK_AUTH in self.features
 
     def validate_dependencies(self) -> tuple[bool, str]:
         """Check that all feature dependencies are satisfied."""
@@ -387,6 +394,8 @@ class MessageType(IntEnum):
     PING = 798
     PONG = 799
     DISCONNECT = 801
+    NICK_AUTH = 803
+    NICK_AUTH_RESULT = 805
 
     # Local-only control messages, never sent over the wire.
     # The reference implementation uses 797 for CONNECT_IN (a local-only

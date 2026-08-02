@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from jmcore.nick_auth import NickAuthMode
 
 from orderbook_watcher.aggregator import OrderbookAggregator
 from orderbook_watcher.main import run_watcher
@@ -68,6 +69,7 @@ async def test_run_watcher_passes_mempool_transport_setting(tmp_path: Path) -> N
     settings.logging.level = "INFO"
     settings.network_config.network.value = "regtest"
     settings.network_config.directory_servers = []
+    settings.network_config.nick_auth_mode = NickAuthMode.REQUIRE_VERIFIED
     settings.get_directory_servers.return_value = ["directory.onion:5222"]
     settings.get_data_dir.return_value = tmp_path
     settings.tor.socks_host = "127.0.0.1"
@@ -105,3 +107,5 @@ async def test_run_watcher_passes_mempool_transport_setting(tmp_path: Path) -> N
         await run_watcher()
 
     assert aggregator_cls.call_args.kwargs["mempool_api_use_tor"] is False
+    assert aggregator_cls.call_args.kwargs["nick_identity"] is nick_identity
+    assert aggregator_cls.call_args.kwargs["nick_auth_mode"] is NickAuthMode.REQUIRE_VERIFIED
