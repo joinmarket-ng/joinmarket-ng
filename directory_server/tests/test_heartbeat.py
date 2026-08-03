@@ -60,7 +60,7 @@ def _register_and_handshake(
     Returns the peer key used in the registry.
     """
     registry.register(peer)
-    key = peer.nick if peer.location_string == "NOT-SERVING-ONION" else peer.location_string
+    key = peer.nick
     registry.update_status(key, PeerStatus.HANDSHAKED)
     if last_seen is not None:
         p = registry.get_by_key(key)
@@ -174,7 +174,7 @@ class TestHeartbeatSweep:
 
         await manager._sweep()
 
-        assert key not in manager.pong_pending
+        assert (key, connection_id) not in manager.pong_pending
 
     # -- probing idle peers --
 
@@ -242,6 +242,37 @@ class TestHeartbeatSweep:
         assert "orderbook" in payload
         assert "!PUBLIC!" in payload
         assert payload.startswith("J5DNtestdir!")
+
+    @pytest.mark.anyio
+    async def test_shared_location_peers_are_probed_by_nick(
+        self,
+        registry: PeerRegistry,
+        send_cb: AsyncMock,
+        config: HeartbeatConfig,
+    ) -> None:
+        manager = HeartbeatManager(
+            peer_registry=registry,
+            send_callback=send_cb,
+            evict_callback=AsyncMock(),
+            config=config,
+            server_nick="J5DNtestdir",
+        )
+        idle_time = datetime.now(UTC) - timedelta(seconds=config.idle_threshold_sec + 10)
+        shared_onion = "a" * 56 + ".onion"
+        first_key = _register_and_handshake(
+            registry,
+            _make_peer("first_maker", onion=shared_onion),
+            last_seen=idle_time,
+        )
+        second_key = _register_and_handshake(
+            registry,
+            _make_peer("second_maker", onion=shared_onion),
+            last_seen=idle_time,
+        )
+
+        await manager._sweep()
+
+        assert {call.args[0] for call in send_cb.await_args_list} == {first_key, second_key}
 
     @pytest.mark.anyio
     async def test_orderbook_probe_format_compatible_with_reference(

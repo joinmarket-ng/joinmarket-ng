@@ -44,7 +44,7 @@ def test_register_duplicate_nick(registry, sample_peer):
         registry.register(peer2, "second")
 
     assert registry.count() == 1
-    assert registry.get_connection_id(sample_peer.location_string) == "first"
+    assert registry.get_connection_id(sample_peer.nick) == "first"
 
 
 def test_verified_peer_atomically_displaces_legacy_owner(registry, sample_peer):
@@ -61,13 +61,16 @@ def test_verified_peer_atomically_displaces_legacy_owner(registry, sample_peer):
 
 def test_same_verified_pubkey_reconnect_replaces_owner(registry, sample_peer):
     key = registry.register(sample_peer, "first", verified_pubkey=b"same-key").peer_key
-
-    result = registry.register(
-        sample_peer.model_copy(deep=True), "second", verified_pubkey=b"same-key"
+    replacement = sample_peer.model_copy(
+        update={"onion_address": f"{'b' * 56}.onion"},
+        deep=True,
     )
+
+    result = registry.register(replacement, "second", verified_pubkey=b"same-key")
 
     assert result.displaced[0].connection_id == "first"
     assert registry.get_connection_id(key) == "second"
+    assert registry.get_by_key(key) is replacement
 
 
 def test_different_verified_pubkey_for_same_nick_is_rejected(registry, sample_peer):
@@ -81,15 +84,26 @@ def test_different_verified_pubkey_for_same_nick_is_rejected(registry, sample_pe
     assert registry.get_connection_id(key) == "first"
 
 
-def test_verified_nick_cannot_displace_different_nick_at_same_location(registry, sample_peer):
-    key = registry.register(sample_peer, "location-owner").peer_key
-    attacker = sample_peer.model_copy(update={"nick": "authenticated-attacker"})
+@pytest.mark.parametrize("verified_pubkey", [None, b"second-key"])
+def test_different_nicks_can_share_location(registry, sample_peer, verified_pubkey):
+    first = registry.register(sample_peer, "first")
+    second_peer = sample_peer.model_copy(update={"nick": "second-peer"})
 
-    with pytest.raises(PeerOwnershipConflictError, match="location already registered"):
-        registry.register(attacker, "attacker", verified_pubkey=b"attacker-key")
+    second = registry.register(second_peer, "second", verified_pubkey=verified_pubkey)
 
-    assert registry.get_connection_id(key) == "location-owner"
+    assert first.peer_key == sample_peer.nick
+    assert second.peer_key == second_peer.nick
+    assert second.displaced == ()
+    assert registry.count() == 2
     assert registry.get_by_nick(sample_peer.nick) is sample_peer
+    assert registry.get_by_nick(second_peer.nick) is second_peer
+
+    registry.update_status(first.peer_key, PeerStatus.HANDSHAKED, "first")
+    registry.update_status(second.peer_key, PeerStatus.HANDSHAKED, "second")
+    assert set(registry.get_peerlist_for_network(NetworkType.MAINNET)) == {
+        (sample_peer.nick, sample_peer.location_string),
+        (second_peer.nick, second_peer.location_string),
+    }
 
 
 def test_stale_generation_cannot_mutate_or_unregister_owner(registry, sample_peer):
@@ -122,30 +136,19 @@ def test_max_peers_limit(registry):
 
 def test_unregister_peer(registry, sample_peer):
     registry.register(sample_peer)
-    location = sample_peer.location_string
 
-    registry.unregister(location)
+    registry.unregister(sample_peer.nick)
 
     assert registry.count() == 0
     assert registry.get_by_nick("test_peer") is None
 
 
-def test_get_by_location(registry, sample_peer):
-    registry.register(sample_peer)
-    location = sample_peer.location_string
-
-    retrieved = registry.get_by_location(location)
-    assert retrieved is not None
-    assert retrieved.nick == "test_peer"
-
-
 def test_update_status(registry, sample_peer):
     registry.register(sample_peer)
-    location = sample_peer.location_string
 
-    registry.update_status(location, PeerStatus.HANDSHAKED)
+    registry.update_status(sample_peer.nick, PeerStatus.HANDSHAKED)
 
-    peer = registry.get_by_location(location)
+    peer = registry.get_by_nick(sample_peer.nick)
     assert peer.status == PeerStatus.HANDSHAKED
 
 
@@ -158,7 +161,7 @@ def test_get_all_connected(registry):
             network=NetworkType.MAINNET,
         )
         registry.register(peer)
-        registry.update_status(peer.location_string, PeerStatus.HANDSHAKED)
+        registry.update_status(peer.nick, PeerStatus.HANDSHAKED)
 
     connected = registry.get_all_connected(NetworkType.MAINNET)
     assert len(connected) == 3
@@ -174,8 +177,8 @@ def test_get_all_connected_filters_network(registry):
 
     registry.register(mainnet_peer)
     registry.register(testnet_peer)
-    registry.update_status(mainnet_peer.location_string, PeerStatus.HANDSHAKED)
-    registry.update_status(testnet_peer.location_string, PeerStatus.HANDSHAKED)
+    registry.update_status(mainnet_peer.nick, PeerStatus.HANDSHAKED)
+    registry.update_status(testnet_peer.nick, PeerStatus.HANDSHAKED)
 
     mainnet_peers = registry.get_all_connected(NetworkType.MAINNET)
     assert len(mainnet_peers) == 1
@@ -187,7 +190,7 @@ def test_get_peerlist_for_network(registry):
         nick="peer1", onion_address=f"{'a' * 56}.onion", port=5222, network=NetworkType.MAINNET
     )
     registry.register(peer)
-    registry.update_status(peer.location_string, PeerStatus.HANDSHAKED)
+    registry.update_status(peer.nick, PeerStatus.HANDSHAKED)
 
     peerlist = registry.get_peerlist_for_network(NetworkType.MAINNET)
     assert len(peerlist) == 1
@@ -474,7 +477,7 @@ class TestUpdateLastSeen:
             network=NetworkType.MAINNET,
         )
         registry.register(peer)
-        key = peer.location_string
+        key = peer.nick
 
         # Backdate last_seen
         p = registry.get_by_key(key)
@@ -598,7 +601,7 @@ class TestSupportsPing:
             features={"ping": True},
         )
         registry.register(peer)
-        key = peer.location_string
+        key = peer.nick
 
         assert registry.supports_ping(key) is True
 
@@ -611,7 +614,7 @@ class TestSupportsPing:
             features={},
         )
         registry.register(peer)
-        key = peer.location_string
+        key = peer.nick
 
         assert registry.supports_ping(key) is False
 
@@ -624,7 +627,7 @@ class TestSupportsPing:
             features={"ping": False},
         )
         registry.register(peer)
-        key = peer.location_string
+        key = peer.nick
 
         assert registry.supports_ping(key) is False
 
@@ -643,7 +646,7 @@ class TestIsMaker:
             network=NetworkType.MAINNET,
         )
         registry.register(peer)
-        key = peer.location_string
+        key = peer.nick
 
         assert registry.is_maker(key) is True
 

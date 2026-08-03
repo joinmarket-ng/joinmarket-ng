@@ -97,7 +97,7 @@ class TestMessageRouterFailedSendCleanup:
             send_callback=failing_send,
         )
 
-        targets = [(sample_peers[0].location_string, sample_peers[0].nick)]
+        targets = [(sample_peers[0].nick, sample_peers[0].nick)]
 
         # First broadcast - peer fails
         await router._batched_broadcast(targets, b"test data")
@@ -113,7 +113,7 @@ class TestMessageRouterFailedSendCleanup:
     ):
         """Failed peers should be filtered out within the same broadcast."""
         send_attempts = []
-        fail_peer = sample_peers[0].location_string
+        fail_peer = sample_peers[0].nick
 
         async def selective_failing_send(peer_key: str, data: bytes) -> None:
             send_attempts.append(peer_key)
@@ -128,7 +128,7 @@ class TestMessageRouterFailedSendCleanup:
 
         # Create targets with the failing peer appearing in multiple batches conceptually
         # (in practice they're unique, but the failed set should prevent retries)
-        targets = [(p.location_string, p.nick) for p in sample_peers]
+        targets = [(p.nick, p.nick) for p in sample_peers]
 
         await router._batched_broadcast(targets, b"test data")
 
@@ -203,10 +203,10 @@ class TestMessageRouterPrivateMessageFailedSend:
         payload = f"{from_peer.nick}!{to_peer.nick}!test message"
         envelope = MessageEnvelope(message_type=MessageType.PRIVMSG, payload=payload)
 
-        await router._handle_private_message(envelope, from_peer.location_string)
+        await router._handle_private_message(envelope, from_peer.nick)
 
         # The target peer should have been marked as failed
-        assert to_peer.location_string in failed_peers
+        assert to_peer.nick in failed_peers
 
     @pytest.mark.anyio
     async def test_private_send_failure_reports_failed_generation(self, registry):
@@ -289,6 +289,44 @@ class TestMessageRouterPrivateMessageFailedSend:
 
         assert sent_messages == []
 
+    @pytest.mark.anyio
+    async def test_private_message_routes_by_nick_when_locations_match(self, registry):
+        shared_onion = "a" * 56 + ".onion"
+        sender = PeerInfo(
+            nick="sender",
+            onion_address=shared_onion,
+            port=5222,
+            network=NetworkType.MAINNET,
+            status=PeerStatus.HANDSHAKED,
+        )
+        recipient = PeerInfo(
+            nick="recipient",
+            onion_address=shared_onion,
+            port=5222,
+            network=NetworkType.MAINNET,
+            status=PeerStatus.HANDSHAKED,
+        )
+        sender_key = registry.register(sender, "sender-connection").peer_key
+        recipient_key = registry.register(recipient, "recipient-connection").peer_key
+        sent_messages: list[tuple[str, MessageType, str]] = []
+
+        async def record_send(peer_key: str, data: bytes, connection_id: str) -> None:
+            envelope = MessageEnvelope.from_bytes(data)
+            sent_messages.append((peer_key, envelope.message_type, connection_id))
+
+        router = MessageRouter(peer_registry=registry, send_callback=record_send)
+        envelope = MessageEnvelope(
+            message_type=MessageType.PRIVMSG,
+            payload="sender!recipient!fill payload pubkey signature",
+        )
+
+        await router.route_message(envelope, sender_key, "sender-connection")
+
+        assert sent_messages == [
+            (recipient_key, MessageType.PRIVMSG, "recipient-connection"),
+            (recipient_key, MessageType.PEERLIST, "recipient-connection"),
+        ]
+
 
 class TestMessageRouterSenderBinding:
     """Messages cannot claim a nick other than the handshaked connection."""
@@ -308,7 +346,7 @@ class TestMessageRouterSenderBinding:
             payload=f"{forged.nick}!PUBLIC!sw0reloffer 0 30000 72590 0 0.001",
         )
 
-        await router._handle_public_message(envelope, sender.location_string)
+        await router._handle_public_message(envelope, sender.nick)
 
         assert sent_messages == []
 
@@ -371,7 +409,7 @@ class TestMessageRouterSenderBinding:
             payload=f"{forged.nick}!{recipient.nick}!fill payload pubkey signature",
         )
 
-        await router._handle_private_message(envelope, connection_owner.location_string)
+        await router._handle_private_message(envelope, connection_owner.nick)
 
         assert sent_messages == []
 
@@ -406,7 +444,7 @@ class TestOfferTracking:
         payload = f"{maker.nick}!PUBLIC!sw0absoffer 0 30000 72590 0 1000"
         envelope = MessageEnvelope(message_type=MessageType.PUBMSG, payload=payload)
 
-        await router._handle_public_message(envelope, maker.location_string)
+        await router._handle_public_message(envelope, maker.nick)
 
         # Check offer was tracked
         stats = router.get_offer_stats()
@@ -440,7 +478,7 @@ class TestOfferTracking:
         for i in range(3):
             payload = f"{maker.nick}!PUBLIC!sw0absoffer {i} 30000 72590 0 1000"
             envelope = MessageEnvelope(message_type=MessageType.PUBMSG, payload=payload)
-            await router._handle_public_message(envelope, maker.location_string)
+            await router._handle_public_message(envelope, maker.nick)
 
         # Check offers were tracked
         stats = router.get_offer_stats()
@@ -476,7 +514,7 @@ class TestOfferTracking:
             for i in range(num_offers):
                 payload = f"{maker.nick}!PUBLIC!sw0reloffer {i} 30000 72590 0 0.001"
                 envelope = MessageEnvelope(message_type=MessageType.PUBMSG, payload=payload)
-                await router._handle_public_message(envelope, maker.location_string)
+                await router._handle_public_message(envelope, maker.nick)
 
         # Check stats
         stats = router.get_offer_stats()
@@ -511,14 +549,14 @@ class TestOfferTracking:
         # Send offer message
         payload = f"{maker.nick}!PUBLIC!sw0absoffer 0 30000 72590 0 1000"
         envelope = MessageEnvelope(message_type=MessageType.PUBMSG, payload=payload)
-        await router._handle_public_message(envelope, maker.location_string)
+        await router._handle_public_message(envelope, maker.nick)
 
         # Verify offer is tracked
         stats = router.get_offer_stats()
         assert stats["total_offers"] == 1
 
         # Remove peer offers
-        router.remove_peer_offers(maker.location_string)
+        router.remove_peer_offers(maker.nick)
 
         # Verify offers were removed
         stats = router.get_offer_stats()
@@ -572,7 +610,7 @@ class TestChunkedPeerlist:
         registry.register(requester)
 
         # Send peerlist
-        await router.send_peerlist(requester.location_string, NetworkType.MAINNET, chunk_size=20)
+        await router.send_peerlist(requester.nick, NetworkType.MAINNET, chunk_size=20)
 
         # Should have sent 3 chunks (50 peers / 20 = 2.5, rounded up)
         # Note: requester is also in the registry so it's 51 total, but requester
@@ -582,7 +620,7 @@ class TestChunkedPeerlist:
         # Parse messages to verify content
         total_peers = 0
         for peer_key, data in sent_messages:
-            assert peer_key == requester.location_string
+            assert peer_key == requester.nick
             envelope = MessageEnvelope.from_bytes(data)
             assert envelope.message_type == MessageType.PEERLIST
             # Count comma-separated entries (each peer is an entry)
@@ -628,7 +666,7 @@ class TestChunkedPeerlist:
         registry.register(requester)
 
         # Send peerlist
-        await router.send_peerlist(requester.location_string, NetworkType.MAINNET, chunk_size=20)
+        await router.send_peerlist(requester.nick, NetworkType.MAINNET, chunk_size=20)
 
         # Should have sent exactly 1 chunk (6 peers including requester < 20)
         assert len(sent_messages) == 1
@@ -677,7 +715,7 @@ class TestPingPongRouting:
             send_callback=mock_send,
         )
 
-        from_key = sample_peers[0].location_string
+        from_key = sample_peers[0].nick
         envelope = MessageEnvelope(message_type=MessageType.PING, payload="")
 
         await router.route_message(envelope, from_key)
@@ -706,7 +744,7 @@ class TestPingPongRouting:
             on_pong=on_pong,
         )
 
-        from_key = sample_peers[0].location_string
+        from_key = sample_peers[0].nick
         envelope = MessageEnvelope(message_type=MessageType.PONG, payload="")
 
         await router.route_message(envelope, from_key)
@@ -726,7 +764,7 @@ class TestPingPongRouting:
             on_pong=None,
         )
 
-        from_key = sample_peers[0].location_string
+        from_key = sample_peers[0].nick
         envelope = MessageEnvelope(message_type=MessageType.PONG, payload="")
 
         # Should not raise
@@ -744,7 +782,7 @@ class TestPingPongRouting:
             send_callback=failing_send,
         )
 
-        from_key = sample_peers[0].location_string
+        from_key = sample_peers[0].nick
         envelope = MessageEnvelope(message_type=MessageType.PING, payload="")
 
         # Should not raise

@@ -436,7 +436,7 @@ class DirectoryServer:
 
     @staticmethod
     def _peer_key(peer: PeerInfo) -> str:
-        return peer.nick if peer.location_string == "NOT-SERVING-ONION" else peer.location_string
+        return peer.nick
 
     def _owner_lock(self, peer_key: str) -> asyncio.Lock:
         lock = self._owner_locks.get(peer_key)
@@ -660,15 +660,14 @@ class DirectoryServer:
 
     async def _send_to_peer(
         self,
-        peer_location: str,
+        peer_key: str,
         data: bytes,
         expected_connection_id: str | None = None,
     ) -> None:
-        peer_key = peer_location
         async with self._owner_lock(peer_key):
             conn_id = self.peer_key_to_conn_id.get(peer_key)
             if not conn_id:
-                raise ValueError(f"No connection for peer: {peer_location}")
+                raise ValueError(f"No connection for peer: {peer_key}")
 
             expected_connection_id = expected_connection_id or conn_id
             peer = self.peer_registry.get_by_key(peer_key)
@@ -678,7 +677,7 @@ class DirectoryServer:
                 or peer.status is not PeerStatus.HANDSHAKED
                 or not self.peer_registry.is_current_owner(peer_key, expected_connection_id)
             ):
-                raise ValueError(f"Stale connection for peer: {peer_location}")
+                raise ValueError(f"Stale connection for peer: {peer_key}")
 
             connection = self.connections.get(expected_connection_id)
             if not connection:

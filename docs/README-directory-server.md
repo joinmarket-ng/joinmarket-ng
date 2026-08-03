@@ -128,6 +128,9 @@ Nick ownership authentication settings (section `[directory_server]`):
   identity is configured. Local tests may use an explicit `test:` identity.
 - `nick_auth_timeout` controls the proof deadline and cannot exceed 30 seconds.
 
+The directory keys relay ownership by nick. A peer's self-declared onion location is
+advertised connection metadata and is not reserved or treated as proof of endpoint ownership.
+
 For local test deployments, clients accept the directory's configured `test:`
 identity even when Docker or the test runner maps the service through a different
 host port. Production `.onion` identities are always matched exactly against the

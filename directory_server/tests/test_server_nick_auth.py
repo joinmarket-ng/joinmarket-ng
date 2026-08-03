@@ -91,12 +91,17 @@ def _server(mode: NickAuthMode = NickAuthMode.PREFER_VERIFIED) -> DirectoryServe
     return server
 
 
-def _handshake_line(identity: NickIdentity, *, advertise_auth: bool) -> str:
+def _handshake_line(
+    identity: NickIdentity,
+    *,
+    advertise_auth: bool,
+    location: str = "NOT-SERVING-ONION",
+) -> str:
     return json.dumps(
         {
             "app-name": "joinmarket",
             "directory": False,
-            "location-string": "NOT-SERVING-ONION",
+            "location-string": location,
             "proto-ver": JM_VERSION,
             "features": {FEATURE_NICK_AUTH: True} if advertise_auth else {},
             "nick": identity.nick,
@@ -208,6 +213,54 @@ async def test_valid_nick_auth_replaces_legacy_owner_and_clears_offers() -> None
     assert len(disconnects) == 1
     assert disconnects[0].message_type == MessageType.PEERLIST
     assert disconnects[0].payload == f"{identity.nick};NOT-SERVING-ONION;D"
+
+
+@pytest.mark.anyio
+async def test_verified_maker_is_not_blocked_by_legacy_location_squatter() -> None:
+    server = _server()
+    mallory = NickIdentity()
+    bob = NickIdentity()
+    bob_location = f"{'b' * 56}.onion:5222"
+    mallory_line = _handshake_line(
+        mallory,
+        advertise_auth=False,
+        location=bob_location,
+    )
+    bob_line = _handshake_line(
+        bob,
+        advertise_auth=True,
+        location=bob_location,
+    )
+
+    def create_bob_proof(challenge: NickAuthChallenge) -> NickAuthProof:
+        return create_nick_auth_proof(bob, challenge.challenge, DIRECTORY_ID, bob_line)
+
+    mallory_connection = ScriptedConnection([_handshake_envelope(mallory_line)])
+    bob_connection = ScriptedConnection([_handshake_envelope(bob_line)], create_bob_proof)
+
+    mallory_key = await server._perform_handshake(  # type: ignore[arg-type]
+        mallory_connection,
+        "mallory-connection",
+    )
+    bob_key = await server._perform_handshake(  # type: ignore[arg-type]
+        bob_connection,
+        "bob-connection",
+    )
+
+    assert mallory_key == mallory.nick
+    assert bob_key == bob.nick
+    assert server.peer_registry.count() == 2
+    assert server.peer_registry.get_connection_id(mallory.nick) == "mallory-connection"
+    assert server.peer_registry.get_connection_id(bob.nick) == "bob-connection"
+    mallory_peer = server.peer_registry.get_by_nick(mallory.nick)
+    bob_peer = server.peer_registry.get_by_nick(bob.nick)
+    assert mallory_peer is not None
+    assert bob_peer is not None
+    assert mallory_peer.location_string == bob_location
+    assert bob_peer.location_string == bob_location
+    result = NickAuthResult.parse(_sent_envelopes(bob_connection)[-1].payload)
+    assert result.code == "ok"
+    assert result.verified is True
 
 
 @pytest.mark.anyio

@@ -290,11 +290,7 @@ class MessageRouter:
         to_peer = self.peer_registry.get_by_nick(to_nick)
         if not to_peer or to_peer.status != PeerStatus.HANDSHAKED:
             logger.warning(f"Target peer not found: {to_nick}")
-            # Log all registered peers for debugging
-            all_peers = list(self.peer_registry._peers.keys())
-            logger.info(f"Registered peer keys: {all_peers}")
-            nick_map = dict(self.peer_registry._nick_to_key)
-            logger.info(f"Nick to key map: {nick_map}")
+            logger.info(f"Registered peer nicks: {list(self.peer_registry._peers)}")
             return
 
         from_peer = self.peer_registry.get_by_key(from_key)
@@ -307,11 +303,7 @@ class MessageRouter:
             )
             return
 
-        to_peer_key = (
-            to_peer.nick
-            if to_peer.location_string == "NOT-SERVING-ONION"
-            else to_peer.location_string
-        )
+        to_peer_key = to_peer.nick
         to_connection_id = self.peer_registry.get_connection_id(to_peer_key)
         if to_connection_id is None:
             return
@@ -448,7 +440,7 @@ class MessageRouter:
 
     async def _send_peer_location(
         self,
-        to_location: str,
+        to_key: str,
         peer_info: PeerInfo,
         expected_connection_id: str | None = None,
     ) -> None:
@@ -468,24 +460,19 @@ class MessageRouter:
         envelope = MessageEnvelope(message_type=MessageType.PEERLIST, payload=entry)
 
         try:
-            await self._call_send(to_location, envelope.to_bytes(), expected_connection_id)
+            await self._call_send(to_key, envelope.to_bytes(), expected_connection_id)
         except Exception as e:
             logger.trace(f"Failed to send peer location: {e}")
 
     async def broadcast_peer_disconnect(
         self,
-        peer_location: str,
+        peer_key: str,
         network: NetworkType,
         expected_connection_id: str | None = None,
     ) -> None:
-        peer = self.peer_registry.get_by_location(peer_location) or self.peer_registry.get_by_key(
-            peer_location
-        )
+        peer = self.peer_registry.get_by_key(peer_key)
         if not peer or not peer.nick:
             return
-        peer_key = (
-            peer.nick if peer.location_string == "NOT-SERVING-ONION" else peer.location_string
-        )
         if not self.peer_registry.is_current_owner(peer_key, expected_connection_id):
             return
 

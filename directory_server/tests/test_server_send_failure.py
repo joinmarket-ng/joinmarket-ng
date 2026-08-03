@@ -49,7 +49,7 @@ class TestHandleSendFailed:
         """When send fails, the peer_key_to_conn_id mapping should be removed."""
         # Register the peer
         server.peer_registry.register(sample_peer)
-        peer_key = sample_peer.location_string
+        peer_key = sample_peer.nick
 
         # Simulate connection mapping
         server.peer_key_to_conn_id[peer_key] = "conn_123"
@@ -65,7 +65,7 @@ class TestHandleSendFailed:
         """When send fails, the peer should be unregistered from the registry."""
         # Register the peer
         server.peer_registry.register(sample_peer)
-        peer_key = sample_peer.location_string
+        peer_key = sample_peer.nick
 
         # Verify peer is registered
         assert server.peer_registry.get_by_key(peer_key) is not None
@@ -89,7 +89,7 @@ class TestHandleSendFailed:
         """_handle_send_failed should handle missing connection mapping gracefully."""
         # Register the peer but don't create a connection mapping
         server.peer_registry.register(sample_peer)
-        peer_key = sample_peer.location_string
+        peer_key = sample_peer.nick
 
         # Should not raise despite missing mapping
         await server._handle_send_failed(peer_key)
@@ -102,7 +102,7 @@ class TestHandleSendFailed:
         """_handle_send_failed should clean up both mapping and registry."""
         # Register the peer
         server.peer_registry.register(sample_peer)
-        peer_key = sample_peer.location_string
+        peer_key = sample_peer.nick
 
         # Create connection mapping
         server.peer_key_to_conn_id[peer_key] = "conn_456"
@@ -120,7 +120,7 @@ class TestHandleSendFailed:
         """After send failure, peer should not appear in iter_connected."""
         # Register the peer
         server.peer_registry.register(sample_peer)
-        peer_key = sample_peer.location_string
+        peer_key = sample_peer.nick
 
         # Verify peer appears in connected list
         connected_before = list(server.peer_registry.iter_connected(NetworkType.MAINNET))
@@ -195,6 +195,26 @@ class TestHandleSendFailed:
         failed_connection.close.assert_awaited_once()
         sent = MessageEnvelope.from_bytes(observer_connection.send.await_args.args[0])
         assert sent.message_type == MessageType.PEERLIST
+        assert sent.payload == f"{sample_peer.nick};{sample_peer.location_string};D"
+
+    @pytest.mark.anyio
+    async def test_send_failure_preserves_peer_with_same_location(self, server, sample_peer):
+        failed_connection = AsyncMock()
+        surviving_connection = AsyncMock()
+        peer_key = server.peer_registry.register(sample_peer, "failed").peer_key
+        server.peer_key_to_conn_id[peer_key] = "failed"
+        server.connections.add("failed", failed_connection)
+        survivor = sample_peer.model_copy(update={"nick": "survivor"}, deep=True)
+        survivor_key = server.peer_registry.register(survivor, "survivor").peer_key
+        server.peer_key_to_conn_id[survivor_key] = "survivor"
+        server.connections.add("survivor", surviving_connection)
+
+        await server._handle_send_failed(peer_key, "failed")
+
+        assert server.peer_registry.get_by_key(peer_key) is None
+        assert server.peer_registry.get_by_key(survivor_key) is survivor
+        assert server.peer_key_to_conn_id[survivor_key] == "survivor"
+        sent = MessageEnvelope.from_bytes(surviving_connection.send.await_args.args[0])
         assert sent.payload == f"{sample_peer.nick};{sample_peer.location_string};D"
 
 

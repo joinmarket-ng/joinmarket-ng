@@ -19,7 +19,7 @@ class PeerNotFoundError(Exception):
 
 
 class PeerOwnershipConflictError(Exception):
-    """Raised when a live peer already owns a nick or routing key."""
+    """Raised when a live peer already owns a nick."""
 
 
 @dataclass(frozen=True)
@@ -50,7 +50,6 @@ class PeerRegistry:
     def __init__(self, max_peers: int = 1000):
         self.max_peers = max_peers
         self._peers: dict[str, PeerInfo] = {}
-        self._nick_to_key: dict[str, str] = {}
         self._owners: dict[str, PeerOwner] = {}
 
     def register(
@@ -60,40 +59,27 @@ class PeerRegistry:
         *,
         verified_pubkey: bytes | str | None = None,
     ) -> RegistrationResult:
-        """Atomically reserve a peer's nick and routing key for one connection.
+        """Atomically reserve a peer's nick for one connection.
 
         Legacy registrations use first-live-writer ownership. A verified registration may
         replace legacy owners, while replacing a verified owner requires the same full pubkey.
+        The self-declared location remains metadata and is never an ownership key.
         """
         connection_id = connection_id or uuid4().hex
         location = peer.location_string
-        key = peer.nick if location == "NOT-SERVING-ONION" else location
-        conflicting_keys = {
-            candidate for candidate in (key, self._nick_to_key.get(peer.nick)) if candidate
-        }
+        key = peer.nick
 
         displaced: list[DisplacedPeer] = []
-        for conflicting_key in conflicting_keys:
-            existing_peer = self._peers.get(conflicting_key)
-            existing_owner = self._owners.get(conflicting_key)
-            if existing_peer is None or existing_owner is None:
-                continue
-            # Nick authentication proves ownership of a nick, not of an onion
-            # endpoint claimed in the handshake. Never let a verified nick
-            # evict a different peer by copying its routing location.
-            if conflicting_key == key and existing_peer.nick != peer.nick:
-                raise PeerOwnershipConflictError(
-                    f"Peer location already registered: {peer.location_string}"
-                )
+        existing_peer = self._peers.get(key)
+        existing_owner = self._owners.get(key)
+        if existing_peer is not None and existing_owner is not None:
             if verified_pubkey is None:
-                raise PeerOwnershipConflictError(
-                    f"Peer nick or location already registered: {peer.nick}"
-                )
+                raise PeerOwnershipConflictError(f"Peer nick already registered: {peer.nick}")
             if existing_owner.verified and existing_owner.verified_pubkey != verified_pubkey:
                 raise PeerOwnershipConflictError(f"Verified nick already registered: {peer.nick}")
             displaced.append(
                 DisplacedPeer(
-                    peer_key=conflicting_key,
+                    peer_key=key,
                     peer=existing_peer,
                     connection_id=existing_owner.connection_id,
                 )
@@ -110,8 +96,6 @@ class PeerRegistry:
             connection_id=connection_id,
             verified_pubkey=verified_pubkey,
         )
-        if peer.nick:
-            self._nick_to_key[peer.nick] = key
 
         peer.last_seen = datetime.now(UTC)
         logger.info(f"Registered peer: {peer.nick} at {location}")
@@ -135,8 +119,6 @@ class PeerRegistry:
         peer = self._peers.pop(key, None)
         if peer is None:
             return None
-        if self._nick_to_key.get(peer.nick) == key:
-            del self._nick_to_key[peer.nick]
         self._owners.pop(key, None)
         return peer
 
@@ -156,18 +138,12 @@ class PeerRegistry:
     def get_by_key(self, key: str) -> PeerInfo | None:
         return self._peers.get(key)
 
-    def get_by_location(self, location: str) -> PeerInfo | None:
-        return self._peers.get(location)
-
     def get_by_nick(self, nick: str) -> PeerInfo | None:
-        key = self._nick_to_key.get(nick)
-        if key:
-            return self._peers.get(key)
-        return None
+        return self._peers.get(nick)
 
     def get_key_by_nick(self, nick: str) -> str | None:
         """Return the routing key currently reserved for ``nick``."""
-        return self._nick_to_key.get(nick)
+        return nick if nick in self._peers else None
 
     def update_status(
         self,
@@ -265,7 +241,6 @@ class PeerRegistry:
 
     def clear(self) -> None:
         self._peers.clear()
-        self._nick_to_key.clear()
         self._owners.clear()
 
     def get_passive_peers(self, network: NetworkType | None = None) -> list[PeerInfo]:
