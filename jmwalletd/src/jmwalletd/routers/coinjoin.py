@@ -311,6 +311,7 @@ async def start_maker(
                     network=jm_settings.network_config.network,
                     directory_servers=jm_settings.get_directory_servers(),
                     nick_auth_mode=jm_settings.network_config.nick_auth_mode,
+                    nick_auth_directory_ids=jm_settings.network_config.nick_auth_directory_ids,
                     socks_host=jm_settings.tor.socks_host,
                     socks_port=jm_settings.tor.socks_port,
                     stream_isolation=jm_settings.tor.stream_isolation,

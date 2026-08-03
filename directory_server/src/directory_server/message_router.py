@@ -6,7 +6,6 @@ Implements Single Responsibility Principle: only handles message routing.
 
 import asyncio
 import contextlib
-import inspect
 from collections.abc import Awaitable, Callable, Iterator
 
 from jmcore.models import MessageEnvelope, NetworkType, PeerInfo, PeerStatus
@@ -15,9 +14,9 @@ from loguru import logger
 
 from directory_server.peer_registry import PeerRegistry
 
-SendCallback = Callable[..., Awaitable[None]]
-FailedSendCallback = Callable[..., Awaitable[None]]
-PongCallback = Callable[..., None]
+SendCallback = Callable[[str, bytes, str | None], Awaitable[None]]
+FailedSendCallback = Callable[[str, str], Awaitable[None]]
+PongCallback = Callable[[str, str], None]
 BroadcastTarget = tuple[str, str | None] | tuple[str, str | None, str]
 
 # Default batch size for concurrent broadcasts to limit memory usage
@@ -39,8 +38,6 @@ class MessageRouter:
         self.broadcast_batch_size = broadcast_batch_size
         self.on_send_failed = on_send_failed
         self.on_pong = on_pong
-        # Track peers that failed during current operation to avoid repeated attempts
-        self._failed_peers: set[tuple[str, str]] = set()
         # Offers belong to a connection generation, not just a reusable peer key.
         self._peer_offers: dict[tuple[str, str], set[str]] = {}
 
@@ -158,27 +155,18 @@ class MessageRouter:
         data: bytes,
         nick: str | None = None,
         expected_connection_id: str | None = None,
+        failed: set[tuple[str, str]] | None = None,
     ) -> None:
         """Send with exception handling to prevent one failed send from affecting others."""
+        failed = failed if failed is not None else set()
         expected_connection_id = expected_connection_id or self.peer_registry.get_connection_id(
             peer_key
         )
         if expected_connection_id is None:
-            legacy_failure = (peer_key, "")
-            if legacy_failure in self._failed_peers:
-                return
-            try:
-                await self.send_callback(peer_key, data)
-            except Exception as e:
-                logger.warning(f"Failed to send to {nick or peer_key}: {e}")
-                self._failed_peers.add(legacy_failure)
-                if self.on_send_failed:
-                    with contextlib.suppress(Exception):
-                        await self.on_send_failed(peer_key)
             return
         failed_owner = (peer_key, expected_connection_id)
         # Skip if this peer already failed in current operation
-        if failed_owner in self._failed_peers:
+        if failed_owner in failed:
             return
         peer = self.peer_registry.get_by_key(peer_key)
         if (
@@ -193,7 +181,7 @@ class MessageRouter:
         except Exception as e:
             logger.warning(f"Failed to send to {nick or peer_key}: {e}")
             # Mark peer as failed to prevent repeated attempts
-            self._failed_peers.add(failed_owner)
+            failed.add(failed_owner)
             # Notify server to clean up this peer
             if self.on_send_failed:
                 try:
@@ -221,9 +209,9 @@ class MessageRouter:
 
         Returns the number of targets processed.
         """
-        # Clear failed peers set at start of broadcast to allow fresh attempts
-        # while still preventing repeated attempts within this broadcast
-        self._failed_peers.clear()
+        # A disconnect broadcast re-enters this method through on_send_failed, and
+        # broadcasts also run concurrently. Keep failures local to this call.
+        failed: set[tuple[str, str]] = set()
 
         total_sent = 0
         batch: list[tuple[str, str | None, str]] = []
@@ -236,19 +224,19 @@ class MessageRouter:
             if connection_id is None:
                 continue
             # Skip peers that have already failed in this broadcast
-            if (peer_key, connection_id) in self._failed_peers:
+            if (peer_key, connection_id) in failed:
                 continue
             batch.append((peer_key, nick, connection_id))
 
             if len(batch) >= self.broadcast_batch_size:
-                tasks = [self._safe_send(pk, data, n, cid) for pk, n, cid in batch]
+                tasks = [self._safe_send(pk, data, n, cid, failed) for pk, n, cid in batch]
                 await asyncio.gather(*tasks)
                 total_sent += len(batch)
                 batch = []
 
         # Process remaining items
         if batch:
-            tasks = [self._safe_send(pk, data, n, cid) for pk, n, cid in batch]
+            tasks = [self._safe_send(pk, data, n, cid, failed) for pk, n, cid in batch]
             await asyncio.gather(*tasks)
             total_sent += len(batch)
 
@@ -563,37 +551,14 @@ class MessageRouter:
             peer_key, expected_connection_id
         ):
             return
-        if self._accepts_args(self.send_callback, 3):
-            await self.send_callback(peer_key, data, expected_connection_id)
-        else:
-            await self.send_callback(peer_key, data)
+        await self.send_callback(peer_key, data, expected_connection_id)
 
     async def _call_failed(self, peer_key: str, expected_connection_id: str) -> None:
         if self.on_send_failed is None:
             return
-        if self._accepts_args(self.on_send_failed, 2):
-            await self.on_send_failed(peer_key, expected_connection_id)
-        else:
-            await self.on_send_failed(peer_key)
+        await self.on_send_failed(peer_key, expected_connection_id)
 
     def _call_pong(self, peer_key: str, expected_connection_id: str) -> None:
         if self.on_pong is None:
             return
-        if self._accepts_args(self.on_pong, 2):
-            self.on_pong(peer_key, expected_connection_id)
-        else:
-            self.on_pong(peer_key)
-
-    @staticmethod
-    def _accepts_args(callback: Callable[..., object], count: int) -> bool:
-        try:
-            parameters = inspect.signature(callback).parameters.values()
-        except (TypeError, ValueError):
-            return True
-        positional = [
-            parameter
-            for parameter in parameters
-            if parameter.kind
-            in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
-        ]
-        return len(positional) >= count
+        self.on_pong(peer_key, expected_connection_id)

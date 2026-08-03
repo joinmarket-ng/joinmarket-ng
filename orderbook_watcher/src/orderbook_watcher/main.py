@@ -161,6 +161,7 @@ async def run_watcher(log_level: str | None = None) -> None:
         blockchain_backend=blockchain_backend,
         nick_identity=nick_identity,
         nick_auth_mode=settings.network_config.nick_auth_mode,
+        nick_auth_directory_ids=settings.network_config.nick_auth_directory_ids,
     )
 
     server = OrderbookServer(watcher_settings, aggregator)

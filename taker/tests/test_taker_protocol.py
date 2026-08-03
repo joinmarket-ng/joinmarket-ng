@@ -552,6 +552,13 @@ class TestMultiDirectoryClientDirectConnections:
         assert client.our_location == "NOT-SERVING-ONION"
         assert client._peer_connections == {}
 
+    def test_resolves_configured_directory_identity(self):
+        client = make_directory_client()
+
+        kwargs = client._build_client_kwargs("localhost", 5222)
+
+        assert kwargs["nick_auth_directory_id"] == "test:taker-directory"
+
     def test_direct_connections_can_be_disabled(self):
         """Test that direct connections can be disabled."""
         client = make_directory_client(prefer_direct_connections=False)

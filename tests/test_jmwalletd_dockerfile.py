@@ -61,6 +61,10 @@ def test_playwright_uses_jam_docker_standalone_ng() -> None:
         "NETWORK_CONFIG__NETWORK=testnet",
         "NETWORK_CONFIG__BITCOIN_NETWORK=regtest",
         "NETWORK_CONFIG__DIRECTORY_SERVERS=jm-directory:5222,jm-directory2:5223",
+        (
+            'NETWORK_CONFIG__NICK_AUTH_DIRECTORY_IDS={"jm-directory:5222":'
+            '"test:jm-directory-5222","jm-directory2:5223":"test:jm-directory2-5223"}'
+        ),
         "LOGGING__LEVEL=DEBUG",
         "DIRECTORY_NODES=jm-directory:5222",
     ]

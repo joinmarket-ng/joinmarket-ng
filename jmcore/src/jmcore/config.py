@@ -11,11 +11,11 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field, SecretStr, model_validator
+from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
 
 from jmcore.constants import DUST_THRESHOLD
 from jmcore.models import NetworkType
-from jmcore.nick_auth import NickAuthMode
+from jmcore.nick_auth import NickAuthMode, validate_directory_endpoint, validate_directory_id
 
 
 class TorConfig(BaseModel):
@@ -215,6 +215,18 @@ class WalletConfig(BaseModel):
         default=NickAuthMode.PREFER_VERIFIED,
         description="Client policy for authenticating nick ownership to directory servers",
     )
+    nick_auth_directory_ids: dict[str, str] = Field(
+        default_factory=dict,
+        description="Expected nick authentication identity by selected host:port endpoint",
+    )
+
+    @field_validator("nick_auth_directory_ids")
+    @classmethod
+    def validate_nick_auth_directory_ids(cls, value: dict[str, str]) -> dict[str, str]:
+        return {
+            validate_directory_endpoint(endpoint): validate_directory_id(directory_id)
+            for endpoint, directory_id in value.items()
+        }
 
     # Tor/SOCKS configuration
     socks_host: str = Field(default="127.0.0.1", description="Tor SOCKS5 proxy host")

@@ -155,6 +155,7 @@ class Taker(TakerMonitoringMixin):
             socks_port=config.socks_port,
             connection_timeout=config.connection_timeout,
             nick_auth_mode=config.nick_auth_mode,
+            nick_auth_directory_ids=config.nick_auth_directory_ids,
             neutrino_compat=neutrino_compat,
             stream_isolation=config.stream_isolation,
         )

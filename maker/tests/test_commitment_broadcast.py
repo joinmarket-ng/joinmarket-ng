@@ -31,6 +31,10 @@ def config() -> MakerConfig:
     return MakerConfig(
         mnemonic="abandon " * 11 + "about",
         directory_servers=["dir1.onion:5222", "dir2.onion:5222"],
+        nick_auth_directory_ids={
+            "dir1.onion:5222": "test:directory-1",
+            "dir2.onion:5222": "test:directory-2",
+        },
         network=NetworkType.REGTEST,
     )
 
@@ -53,6 +57,12 @@ def mock_directory_client() -> MagicMock:
     client.send_private_message = AsyncMock()
     client.get_active_nicks = MagicMock(return_value={"PeerA", "PeerB"})
     return client
+
+
+def test_maker_pool_resolves_configured_directory_identity(maker_bot: MakerBot) -> None:
+    kwargs = maker_bot._directory_pool._build_client_kwargs("dir1.onion", 5222)
+
+    assert kwargs["nick_auth_directory_id"] == "test:directory-1"
 
 
 @pytest.mark.asyncio
@@ -171,6 +181,23 @@ class TestBroadcastCommitmentEphemeral:
         # Password should be random (non-empty)
         assert kwargs1["socks_password"]
         assert len(kwargs1["socks_password"]) == 32  # hex(16 bytes)
+
+    async def test_resolves_expected_identity_for_each_ephemeral_client(
+        self, maker_bot: MakerBot
+    ) -> None:
+        mock_client = MagicMock(
+            connect=AsyncMock(),
+            send_public_message=AsyncMock(),
+            close=AsyncMock(),
+        )
+
+        with patch("maker.protocol_handlers.DirectoryClient", return_value=mock_client) as mock_cls:
+            await maker_bot._broadcast_commitment_ephemeral(COMMITMENT)
+
+        assert [call.kwargs["nick_auth_directory_id"] for call in mock_cls.call_args_list] == [
+            "test:directory-1",
+            "test:directory-2",
+        ]
 
     async def test_different_broadcasts_get_different_credentials(
         self, maker_bot: MakerBot

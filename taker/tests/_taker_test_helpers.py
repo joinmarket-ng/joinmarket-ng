@@ -25,6 +25,7 @@ SAMPLE_MNEMONIC = (
 )
 TEST_SCRIPTPUBKEY = "001400" * 10
 TEST_DIRECTORY_SERVERS = ["localhost:5222"]
+TEST_NICK_AUTH_DIRECTORY_IDS = {"localhost:5222": "test:taker-directory"}
 
 
 # ---------------------------------------------------------------------------
@@ -74,6 +75,7 @@ def make_taker_config(**overrides: object) -> TakerConfig:
         "mnemonic": SAMPLE_MNEMONIC,
         "network": NetworkType.REGTEST,
         "directory_servers": TEST_DIRECTORY_SERVERS,
+        "nick_auth_directory_ids": TEST_NICK_AUTH_DIRECTORY_IDS,
     }
     defaults.update(overrides)
     return TakerConfig(**defaults)  # type: ignore[arg-type]
@@ -84,6 +86,7 @@ def make_directory_client(**overrides: object) -> MultiDirectoryClient:
     nick_identity = NickIdentity(5)
     defaults: dict[str, object] = {
         "directory_servers": TEST_DIRECTORY_SERVERS,
+        "nick_auth_directory_ids": TEST_NICK_AUTH_DIRECTORY_IDS,
         "network": "regtest",
         "nick_identity": nick_identity,
     }

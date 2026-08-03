@@ -131,10 +131,10 @@ Nick ownership authentication settings (section `[directory_server]`):
 The directory keys relay ownership by nick. A peer's self-declared onion location is
 advertised connection metadata and is not reserved or treated as proof of endpoint ownership.
 
-For local test deployments, clients accept the directory's configured `test:`
-identity even when Docker or the test runner maps the service through a different
-host port. Production `.onion` identities are always matched exactly against the
-endpoint selected by the client.
+For local test deployments reached through an alias or forwarded port, configure
+`network_config.nick_auth_directory_ids` on each client. The map key is the exact selected
+`host:port`, and the value is the directory's configured `test:` identity. Production
+`.onion` identities are derived from and matched exactly against the selected endpoint.
 
 For the production Compose stack, retrieve the generated hostname first, configure the resulting
 `hostname.onion:5222` value as `DIRECTORY_SERVER__NICK_AUTH_DIRECTORY_ID`, then restart the

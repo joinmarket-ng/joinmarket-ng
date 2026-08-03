@@ -98,6 +98,7 @@ class MultiDirectoryClient(DirectoryClientPool):
         our_location: str = "NOT-SERVING-ONION",
         stream_isolation: bool = False,
         nick_auth_mode: NickAuthMode = NickAuthMode.PREFER_VERIFIED,
+        nick_auth_directory_ids: dict[str, str] | None = None,
     ):
         # Connection / SOCKS / credential setup is delegated to the
         # DirectoryClientPool base; it handles directory_servers, network,
@@ -112,6 +113,7 @@ class MultiDirectoryClient(DirectoryClientPool):
             connection_timeout=connection_timeout,
             stream_isolation=stream_isolation,
             nick_auth_mode=nick_auth_mode,
+            nick_auth_directory_ids=nick_auth_directory_ids,
         )
 
         # Taker-specific state below.

@@ -186,6 +186,7 @@ class TestSettingsDefaults:
         assert settings.network_config.bitcoin_network is None
         assert settings.network_config.directory_servers == []
         assert settings.network_config.nick_auth_mode is NickAuthMode.PREFER_VERIFIED
+        assert settings.network_config.nick_auth_directory_ids == {}
 
     def test_default_directory_server_nick_auth_settings(self) -> None:
         settings = JoinMarketSettings()
@@ -195,8 +196,8 @@ class TestSettingsDefaults:
         assert settings.directory_server.nick_auth_timeout == 30.0
 
     def test_directory_server_validates_nick_auth_identity_and_required_mode(self) -> None:
-        with pytest.raises(ValueError, match="invalid onion directory-id"):
-            DirectoryServerSettings(nick_auth_directory_id="not-an-endpoint")
+        with pytest.raises(ValueError, match="invalid directory-id"):
+            DirectoryServerSettings(nick_auth_directory_id="bad|identity")
         with pytest.raises(ValueError, match="needs nick_auth_directory_id"):
             DirectoryServerSettings(nick_auth_mode=NickAuthMode.REQUIRE_VERIFIED)
 
@@ -805,6 +806,19 @@ class TestParseDirectoryServers:
         settings = NetworkSettings(nick_auth_mode="require_verified")
         assert settings.nick_auth_mode is NickAuthMode.REQUIRE_VERIFIED
 
+    def test_nick_auth_directory_ids_validate_values(self) -> None:
+        settings = NetworkSettings(
+            nick_auth_directory_ids={"directory.internal:5222": "directory-identity-a"}
+        )
+
+        assert settings.nick_auth_directory_ids == {
+            "directory.internal:5222": "directory-identity-a"
+        }
+        with pytest.raises(ValueError, match="invalid directory-id"):
+            NetworkSettings(nick_auth_directory_ids={"directory.internal:5222": "bad|identity"})
+        with pytest.raises(ValueError, match="host:port"):
+            NetworkSettings(nick_auth_directory_ids={"directory.internal": "test:directory-a"})
+
 
 class TestJoinMarketSettingsHelpers:
     """Tests for JoinMarketSettings helper methods."""
@@ -928,6 +942,18 @@ class TestCommaListEnvSettingsSource:
         settings = JoinMarketSettings()
         servers = settings.network_config.directory_servers
         assert servers == ["host1.onion:5222", "host2.onion:5222"]
+
+    def test_json_nick_auth_directory_ids(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(
+            "NETWORK_CONFIG__NICK_AUTH_DIRECTORY_IDS",
+            '{"directory.internal:5222":"test:directory-a"}',
+        )
+
+        settings = JoinMarketSettings()
+
+        assert settings.network_config.nick_auth_directory_ids == {
+            "directory.internal:5222": "test:directory-a"
+        }
 
 
 class TestNeutrinoAuthTokenFile:

@@ -8,7 +8,6 @@ import asyncio
 import contextlib
 import json
 import secrets
-from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from typing import Literal
 from uuid import uuid4
@@ -72,7 +71,6 @@ class DirectoryServer:
         self.peer_registry = PeerRegistry(max_peers=settings.max_peers)
         self.connections = ConnectionPool(max_connections=settings.max_peers + 1)
         self.peer_key_to_conn_id: dict[str, str] = {}
-        self._registration_lock = asyncio.Lock()
         self._owner_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
 
         # Heartbeat manager for peer liveness detection
@@ -408,6 +406,7 @@ class DirectoryServer:
             expected_directory_id=directory_id,
             handshake_line=handshake_line,
             nick=peer_info.nick,
+            protocol_version=peer_info.protocol_version,
         ):
             logger.info(f"[{conn_id}] Nick authentication proof was invalid")
             await self._send_nick_auth_result(connection, "invalid", safe=True)
@@ -434,24 +433,12 @@ class DirectoryServer:
             return
         await asyncio.wait_for(send_result, timeout=self.nick_auth_timeout)
 
-    @staticmethod
-    def _peer_key(peer: PeerInfo) -> str:
-        return peer.nick
-
     def _owner_lock(self, peer_key: str) -> asyncio.Lock:
         lock = self._owner_locks.get(peer_key)
         if lock is None:
             lock = asyncio.Lock()
             self._owner_locks[peer_key] = lock
         return lock
-
-    @contextlib.asynccontextmanager
-    async def _lock_owner_keys(self, *peer_keys: str | None) -> AsyncIterator[None]:
-        keys = sorted({key for key in peer_keys if key is not None})
-        async with contextlib.AsyncExitStack() as stack:
-            for key in keys:
-                await stack.enter_async_context(self._owner_lock(key))
-            yield
 
     async def _register_peer(
         self,
@@ -460,18 +447,15 @@ class DirectoryServer:
         *,
         verified_pubkey: bytes | str | None = None,
     ) -> RegistrationResult:
-        """Serialize ownership replacement with writes to every affected routing key."""
-        async with self._registration_lock:
-            new_key = self._peer_key(peer)
-            current_nick_key = self.peer_registry.get_key_by_nick(peer.nick)
-            async with self._lock_owner_keys(new_key, current_nick_key):
-                registration = self.peer_registry.register(
-                    peer,
-                    connection_id,
-                    verified_pubkey=verified_pubkey,
-                )
-                self._activate_registration(registration)
-                return registration
+        """Serialize registration with writes to the affected nick owner."""
+        async with self._owner_lock(peer.nick):
+            registration = self.peer_registry.register(
+                peer,
+                connection_id,
+                verified_pubkey=verified_pubkey,
+            )
+            self._activate_registration(registration)
+            return registration
 
     def _activate_registration(self, registration: RegistrationResult) -> None:
         for displaced in registration.displaced:

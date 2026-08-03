@@ -155,6 +155,7 @@ class OrderbookAggregator:
         blockchain_backend: BlockchainBackend | None = None,
         nick_identity: NickIdentity | None = None,
         nick_auth_mode: NickAuthMode = NickAuthMode.PREFER_VERIFIED,
+        nick_auth_directory_ids: dict[str, str] | None = None,
     ) -> None:
         self.directory_nodes = directory_nodes
         self.network = network
@@ -171,6 +172,7 @@ class OrderbookAggregator:
         self.blockchain_backend = blockchain_backend
         self.nick_identity = nick_identity or NickIdentity(JM_VERSION)
         self.nick_auth_mode = nick_auth_mode
+        self.nick_auth_directory_ids = nick_auth_directory_ids or {}
 
         # Build the optional mempool proxy URL and pre-compute isolation credentials.
         self._dir_username: str | None = None
@@ -278,6 +280,7 @@ class OrderbookAggregator:
             timeout=self.timeout,
             max_message_size=self.max_message_size,
             nick_auth_mode=self.nick_auth_mode,
+            nick_auth_directory_id=self.nick_auth_directory_ids.get(node_id),
             socks_username=self._dir_username,
             socks_password=self._dir_password,
         )
@@ -677,6 +680,7 @@ class OrderbookAggregator:
             max_message_size=self.max_message_size,
             on_disconnect=on_disconnect,
             nick_auth_mode=self.nick_auth_mode,
+            nick_auth_directory_id=self.nick_auth_directory_ids.get(node_id),
             socks_username=self._dir_username,
             socks_password=self._dir_password,
         )

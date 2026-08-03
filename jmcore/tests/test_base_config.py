@@ -271,6 +271,24 @@ class TestWalletConfig:
         assert default_config.nick_auth_mode is NickAuthMode.PREFER_VERIFIED
         assert required_config.nick_auth_mode is NickAuthMode.REQUIRE_VERIFIED
 
+    def test_nick_auth_directory_ids(self):
+        config = WalletConfig(
+            mnemonic="test " * 12,
+            nick_auth_directory_ids={"directory.internal:5222": "test:directory-a"},
+        )
+
+        assert config.nick_auth_directory_ids == {"directory.internal:5222": "test:directory-a"}
+        with pytest.raises(ValidationError, match="invalid directory-id"):
+            WalletConfig(
+                mnemonic="test " * 12,
+                nick_auth_directory_ids={"directory.internal:5222": "bad|identity"},
+            )
+        with pytest.raises(ValidationError, match="host:port"):
+            WalletConfig(
+                mnemonic="test " * 12,
+                nick_auth_directory_ids={"directory.internal": "test:directory-a"},
+            )
+
 
 class TestDirectoryServerConfig:
     def test_default_values(self):

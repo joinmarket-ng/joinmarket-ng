@@ -149,10 +149,12 @@ class TestHeartbeatSweep:
         old_time = datetime.now(UTC) - timedelta(seconds=config.hard_evict_sec + 10)
         peer = _make_peer("stale_maker", features={"ping": True})
         key = _register_and_handshake(registry, peer, last_seen=old_time)
+        connection_id = registry.get_connection_id(key)
+        assert connection_id is not None
 
         await manager._sweep()
 
-        evict_cb.assert_any_await(key, "idle timeout")
+        evict_cb.assert_any_await(key, "idle timeout", connection_id)
 
     @pytest.mark.anyio
     async def test_hard_evict_clears_pong_pending(
@@ -184,6 +186,7 @@ class TestHeartbeatSweep:
         registry: PeerRegistry,
         manager: HeartbeatManager,
         send_cb: AsyncMock,
+        evict_cb: AsyncMock,
         config: HeartbeatConfig,
     ) -> None:
         """Peers with ping feature and idle > idle_threshold get a PING."""
@@ -205,7 +208,7 @@ class TestHeartbeatSweep:
         # Peer should be in pong_pending (will be cleared after pong_wait)
         # Note: after _sweep completes, pong_pending was checked and evict was called.
         # Since we didn't send a pong, the peer would have been evicted.
-        evict_calls = [c[0][0] for c in manager.evict_callback.call_args_list]
+        evict_calls = [c[0][0] for c in evict_cb.call_args_list]
         assert key in evict_calls
 
     @pytest.mark.anyio
@@ -411,11 +414,13 @@ class TestHeartbeatSweep:
         idle_time = datetime.now(UTC) - timedelta(seconds=config.idle_threshold_sec + 10)
         peer = _make_peer("unresponsive_maker", features={"ping": True})
         key = _register_and_handshake(registry, peer, last_seen=idle_time)
+        connection_id = registry.get_connection_id(key)
+        assert connection_id is not None
 
         await manager._sweep()
 
         # Peer should have been evicted with "pong timeout" reason
-        evict_cb.assert_any_await(key, "pong timeout")
+        evict_cb.assert_any_await(key, "pong timeout", connection_id)
 
     # -- send failure --
 
@@ -497,6 +502,8 @@ class TestHeartbeatSweep:
         # 3) Hard-evict candidate
         stale_peer = _make_peer("stale_peer", onion="c" * 56 + ".onion")
         stale_key = _register_and_handshake(registry, stale_peer, last_seen=hard_evict_time)
+        stale_connection_id = registry.get_connection_id(stale_key)
+        assert stale_connection_id is not None
 
         # 4) Recently active peer (should not be touched)
         active_peer = _make_peer("active_peer", onion="d" * 56 + ".onion", features={"ping": True})
@@ -505,7 +512,7 @@ class TestHeartbeatSweep:
         await manager._sweep()
 
         # Stale peer should be hard-evicted
-        evict_cb.assert_any_await(stale_key, "idle timeout")
+        evict_cb.assert_any_await(stale_key, "idle timeout", stale_connection_id)
 
         # Ping peer should be evicted (no pong response)
         evict_calls = [c[0][0] for c in evict_cb.call_args_list]

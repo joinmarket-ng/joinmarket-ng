@@ -48,6 +48,7 @@ async def test_connect_to_directory_parses_address_and_connects():
     assert kwargs["socks_username"] is None
     assert kwargs["socks_password"] is None
     assert kwargs["nick_auth_mode"] is NickAuthMode.PREFER_VERIFIED
+    assert kwargs["nick_auth_directory_id"] is None
 
 
 @pytest.mark.asyncio
@@ -59,6 +60,20 @@ async def test_connect_to_directory_passes_configured_nick_auth_mode():
         await pool.connect_to_directory("onion.example:5222")
 
     assert ctor.call_args.kwargs["nick_auth_mode"] is NickAuthMode.REQUIRE_VERIFIED
+
+
+@pytest.mark.asyncio
+async def test_connect_to_directory_resolves_expected_identity_by_selected_endpoint():
+    pool = _make_pool(
+        ["directory.internal"],
+        nick_auth_directory_ids={"directory.internal:5222": "test:directory-a"},
+    )
+    fake_client = MagicMock(connect=AsyncMock(return_value=None))
+
+    with patch("jmcore.directory_pool.DirectoryClient", return_value=fake_client) as ctor:
+        await pool.connect_to_directory("directory.internal")
+
+    assert ctor.call_args.kwargs["nick_auth_directory_id"] == "test:directory-a"
 
 
 @pytest.mark.asyncio

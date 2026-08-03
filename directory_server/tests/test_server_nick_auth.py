@@ -384,6 +384,43 @@ async def test_replacement_waits_for_inflight_write_to_old_owner() -> None:
 
 
 @pytest.mark.anyio
+async def test_unrelated_registration_does_not_wait_for_inflight_write() -> None:
+    server = _server()
+    blocked_peer = PeerInfo(
+        nick="blocked",
+        onion_address="NOT-SERVING-ONION",
+        port=-1,
+        network=NetworkType.MAINNET,
+        status=PeerStatus.HANDSHAKED,
+    )
+    blocked_key = server.peer_registry.register(blocked_peer, "blocked-connection").peer_key
+    blocked_connection = BlockingConnection()
+    server.connections.add("blocked-connection", blocked_connection)  # type: ignore[arg-type]
+    server.peer_key_to_conn_id[blocked_key] = "blocked-connection"
+
+    send_task = asyncio.create_task(
+        server._send_to_peer(blocked_key, b"message", "blocked-connection")
+    )
+    await blocked_connection.send_started.wait()
+    unrelated = PeerInfo(
+        nick="unrelated",
+        onion_address="NOT-SERVING-ONION",
+        port=-1,
+        network=NetworkType.MAINNET,
+    )
+
+    registration = await asyncio.wait_for(
+        server._register_peer(unrelated, "unrelated-connection"),
+        timeout=0.1,
+    )
+
+    assert registration.peer_key == unrelated.nick
+    assert server.peer_registry.get_connection_id(unrelated.nick) == "unrelated-connection"
+    blocked_connection.release_send.set()
+    await send_task
+
+
+@pytest.mark.anyio
 async def test_require_mode_rejects_nonadvertising_client() -> None:
     server = _server(NickAuthMode.REQUIRE_VERIFIED)
     identity = NickIdentity()

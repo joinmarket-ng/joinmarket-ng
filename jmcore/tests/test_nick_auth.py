@@ -5,9 +5,10 @@ import hashlib
 import json
 
 import pytest
+from coincurve import verify_signature as coincurve_verify
 from pydantic import ValidationError
 
-from jmcore.crypto import NickIdentity
+from jmcore.crypto import NickIdentity, bitcoin_message_hash_bytes
 from jmcore.nick_auth import (
     NickAuthChallenge,
     NickAuthMode,
@@ -18,8 +19,10 @@ from jmcore.nick_auth import (
     directory_id_for_endpoint,
     handshake_line_sha256,
     parse_strict_json_object,
+    validate_directory_id,
     verify_nick_auth_proof,
 )
+from jmcore.protocol import JM_VERSION
 
 PRIVATE_KEY = bytes.fromhex("11" * 32)
 CHALLENGE = "22" * 32
@@ -142,9 +145,20 @@ def test_handshake_hashes_exact_decoded_line_utf8_bytes():
 
 def test_directory_endpoint_ids_are_canonical():
     assert directory_id_for_endpoint(DIRECTORY_HOST.upper(), 5222) == DIRECTORY_ID
-    assert directory_id_for_endpoint("LOCALHOST", 1234) == "test:localhost-1234"
-    assert directory_id_for_endpoint("127.0.0.1", 1234) == "test:127.0.0.1-1234"
-    assert directory_id_for_endpoint("directory-a", 5222) == "test:directory-a-5222"
+
+
+@pytest.mark.parametrize(
+    "directory_id",
+    [DIRECTORY_ID, "test:directory-a", "directory.example:5222", "vpn_directory-1"],
+)
+def test_directory_ids_accept_spec_grammar(directory_id: str):
+    assert validate_directory_id(directory_id) == directory_id
+
+
+@pytest.mark.parametrize("directory_id", ["", "UPPERCASE", "bad|id", "bad id", "non-ascii-\u00e9"])
+def test_directory_ids_reject_values_outside_spec_grammar(directory_id: str):
+    with pytest.raises(ValueError, match="invalid directory-id"):
+        validate_directory_id(directory_id)
 
 
 @pytest.mark.parametrize(
@@ -153,6 +167,9 @@ def test_directory_endpoint_ids_are_canonical():
         ("short.onion", 5222),
         ("a" * 56 + ".onion", 0),
         ("bad host", 5222),
+        ("localhost", 1234),
+        ("127.0.0.1", 1234),
+        ("directory-a", 5222),
         ("example.com", 5222),
         ("8.8.8.8", 5222),
     ],
@@ -177,7 +194,7 @@ def test_signed_message_is_exact_ascii_transcript(identity: NickIdentity):
             f"nick-auth|{CHALLENGE}|{DIRECTORY_ID}|{handshake_hash}|"
             f"{identity.nick}|{identity.public_key_hex}"
         ).encode("ascii")
-        + b"onion-network"
+        + b"nick-auth-v1"
     )
 
 
@@ -188,8 +205,8 @@ def test_create_and_verify_deterministic_proof(identity: NickIdentity, proof: Ni
     )
     assert proof.pubkey == "034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa"
     assert proof.signature == (
-        "MEUCIQCy/qOvvS9DrnU8eOp09bftEqTvFmuDay7kXQtJw03a"
-        "RAIgR+WY4/hlsW8gC+NmGJIqM6ijM0r5oXmrhOIVn1ZlHAQ="
+        "MEQCIDTAF2VwsN1hK3n+Hc2iGt2xkhURfTfCiJnM4myGM6T2"
+        "AiAbXU8Kl5f16SwddktRYcl+gLHt5zS1nY7eLSi61e1g6w=="
     )
     assert verify_nick_auth_proof(
         proof,
@@ -197,6 +214,26 @@ def test_create_and_verify_deterministic_proof(identity: NickIdentity, proof: Ni
         DIRECTORY_ID,
         HANDSHAKE_LINE,
         identity.nick,
+        JM_VERSION,
+    )
+
+
+def test_proof_does_not_verify_in_message_signature_domain(
+    identity: NickIdentity,
+    proof: NickAuthProof,
+):
+    handshake_hash = handshake_line_sha256(HANDSHAKE_LINE)
+    transcript = (
+        f"nick-auth|{CHALLENGE}|{DIRECTORY_ID}|{handshake_hash}|"
+        f"{identity.nick}|{identity.public_key_hex}"
+    ).encode("ascii")
+    message_hash = bitcoin_message_hash_bytes(transcript + b"onion-network")
+
+    assert not coincurve_verify(
+        base64.b64decode(proof.signature),
+        message_hash,
+        bytes.fromhex(proof.pubkey),
+        hasher=None,
     )
 
 
@@ -229,6 +266,7 @@ def test_verification_rejects_replay_binding_mismatches(
         directory_id,
         handshake_line,
         nick or identity.nick,
+        JM_VERSION,
     )
 
 
@@ -244,4 +282,16 @@ def test_verification_rejects_tampered_signature(proof: NickAuthProof, identity:
         DIRECTORY_ID,
         HANDSHAKE_LINE,
         identity.nick,
+        JM_VERSION,
+    )
+
+
+def test_verification_uses_negotiated_version(identity: NickIdentity, proof: NickAuthProof):
+    assert not verify_nick_auth_proof(
+        proof,
+        CHALLENGE,
+        DIRECTORY_ID,
+        HANDSHAKE_LINE,
+        identity.nick,
+        JM_VERSION + 1,
     )

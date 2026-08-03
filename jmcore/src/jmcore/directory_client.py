@@ -41,6 +41,7 @@ from jmcore.nick_auth import (
     create_nick_auth_proof,
     directory_id_for_endpoint,
     parse_strict_json_object,
+    validate_directory_id,
 )
 from jmcore.protocol import (
     COMMAND_PREFIX,
@@ -199,6 +200,7 @@ class DirectoryClient:
         socks_username: str | None = None,
         socks_password: str | None = None,
         nick_auth_mode: NickAuthMode = NickAuthMode.PREFER_VERIFIED,
+        nick_auth_directory_id: str | None = None,
     ) -> None:
         """
         Initialize DirectoryClient.
@@ -219,6 +221,7 @@ class DirectoryClient:
             socks_username: SOCKS5 username for Tor stream isolation (optional)
             socks_password: SOCKS5 password for Tor stream isolation (optional)
             nick_auth_mode: Policy for authenticating nick ownership to directory servers
+            nick_auth_directory_id: Expected identity of this selected directory endpoint
         """
         self.host = host
         self.port = port
@@ -253,6 +256,14 @@ class DirectoryClient:
         self.last_offer_received_time: float | None = None
         self.neutrino_compat = neutrino_compat
         self.nick_auth_mode = nick_auth_mode
+        self.nick_auth_directory_id = (
+            validate_directory_id(nick_auth_directory_id)
+            if nick_auth_directory_id is not None
+            else None
+        )
+        if self.nick_auth_directory_id is None:
+            with contextlib.suppress(ValueError):
+                self.nick_auth_directory_id = directory_id_for_endpoint(self.host, self.port)
 
         # Version negotiation state (set after handshake)
         self.negotiated_version: int | None = None
@@ -352,13 +363,25 @@ class DirectoryClient:
 
         self.directory_nick_authenticated = False
 
+        if (
+            self.nick_auth_mode is NickAuthMode.REQUIRE_VERIFIED
+            and self.nick_auth_directory_id is None
+        ):
+            raise DirectoryClientError(
+                f"No expected nick authentication directory identity configured for "
+                f"{self.host}:{self.port}"
+            )
+
         # Build our feature set - always include peerlist_features to indicate we support
         # the extended peerlist format with F: suffix for feature information.
         # Always include ping to indicate we support application-level PING/PONG heartbeat.
         our_features: set[str] = {FEATURE_PEERLIST_FEATURES, FEATURE_PING}
         if self.neutrino_compat:
             our_features.add(FEATURE_NEUTRINO_COMPAT)
-        if self.nick_auth_mode is not NickAuthMode.DISABLED:
+        if (
+            self.nick_auth_mode is not NickAuthMode.DISABLED
+            and self.nick_auth_directory_id is not None
+        ):
             our_features.add(FEATURE_NICK_AUTH)
         feature_set = FeatureSet(features=our_features)
 
@@ -432,7 +455,11 @@ class DirectoryClient:
             and not directory_supports_nick_auth
         ):
             raise DirectoryClientError("Directory does not support required nick authentication")
-        if self.nick_auth_mode is not NickAuthMode.DISABLED and directory_supports_nick_auth:
+        if (
+            self.nick_auth_mode is not NickAuthMode.DISABLED
+            and self.nick_auth_directory_id is not None
+            and directory_supports_nick_auth
+        ):
             await self._authenticate_nick(handshake_line)
 
         logger.info(
@@ -447,9 +474,14 @@ class DirectoryClient:
         """Complete the mutually negotiated JMP-0005 challenge-response exchange."""
         if not self.connection:
             raise DirectoryClientError("Not connected")
+        if self.nick_auth_directory_id is None:
+            raise DirectoryClientError("No expected nick authentication directory identity")
 
         try:
-            challenge_data = await asyncio.wait_for(self.connection.receive(), timeout=self.timeout)
+            nick_auth_timeout = min(self.timeout, 30.0)
+            challenge_data = await asyncio.wait_for(
+                self.connection.receive(), timeout=nick_auth_timeout
+            )
             challenge_envelope = parse_strict_json_object(challenge_data)
             if challenge_envelope.get("type") != MessageType.NICK_AUTH.value:
                 raise DirectoryClientError(
@@ -461,35 +493,31 @@ class DirectoryClient:
                 raise DirectoryClientError("Nick authentication challenge line must be a string")
             challenge = NickAuthChallenge.parse(challenge_line)
 
-            selected_directory_id = directory_id_for_endpoint(self.host, self.port)
-            directory_id = selected_directory_id
-            if selected_directory_id.startswith("test:") and challenge.directory_id.startswith(
-                "test:"
-            ):
-                # Non-production endpoints are commonly reached through a
-                # randomized host-side forwarded port. Their explicitly
-                # configured test identity is stable even when the selected
-                # transport alias is not.
-                directory_id = challenge.directory_id
-            elif challenge.directory_id != selected_directory_id:
+            if challenge.directory_id != self.nick_auth_directory_id:
                 raise DirectoryClientError(
-                    f"Nick authentication directory-id mismatch: expected {selected_directory_id}, "
+                    f"Nick authentication directory-id mismatch: expected "
+                    f"{self.nick_auth_directory_id}, "
                     f"received {challenge.directory_id}"
                 )
 
             proof = create_nick_auth_proof(
                 self.nick_identity,
                 challenge.challenge,
-                directory_id,
+                self.nick_auth_directory_id,
                 handshake_line,
             )
             proof_envelope = {
                 "type": MessageType.NICK_AUTH.value,
                 "line": proof.to_json(),
             }
-            await self.connection.send(json.dumps(proof_envelope).encode("utf-8"))
+            await asyncio.wait_for(
+                self.connection.send(json.dumps(proof_envelope).encode("utf-8")),
+                timeout=nick_auth_timeout,
+            )
 
-            result_data = await asyncio.wait_for(self.connection.receive(), timeout=self.timeout)
+            result_data = await asyncio.wait_for(
+                self.connection.receive(), timeout=nick_auth_timeout
+            )
             result_envelope = parse_strict_json_object(result_data)
             if result_envelope.get("type") != MessageType.NICK_AUTH_RESULT.value:
                 raise DirectoryClientError(

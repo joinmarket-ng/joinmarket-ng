@@ -2,6 +2,8 @@
 Tests for message router, focusing on failed send cleanup and offer tracking.
 """
 
+import asyncio
+
 import pytest
 from jmcore.models import MessageEnvelope, NetworkType, PeerInfo, PeerStatus
 from jmcore.protocol import MessageType
@@ -42,10 +44,10 @@ class TestMessageRouterFailedSendCleanup:
         """When a send fails, the on_send_failed callback should be invoked."""
         failed_peers = []
 
-        async def failing_send(peer_key: str, data: bytes) -> None:
+        async def failing_send(peer_key: str, data: bytes, connection_id: str | None) -> None:
             raise ConnectionError("Connection closed")
 
-        async def on_failed(peer_key: str) -> None:
+        async def on_failed(peer_key: str, connection_id: str) -> None:
             failed_peers.append(peer_key)
 
         router = MessageRouter(
@@ -64,7 +66,7 @@ class TestMessageRouterFailedSendCleanup:
         """Peers that have already failed should be skipped on subsequent attempts."""
         send_attempts = []
 
-        async def failing_send(peer_key: str, data: bytes) -> None:
+        async def failing_send(peer_key: str, data: bytes, connection_id: str | None) -> None:
             send_attempts.append(peer_key)
             raise ConnectionError("Connection closed")
 
@@ -73,22 +75,24 @@ class TestMessageRouterFailedSendCleanup:
             send_callback=failing_send,
         )
 
+        failed: set[tuple[str, str]] = set()
+
         # First attempt - should try to send
-        await router._safe_send("peer0", b"test data", "peer0")
+        await router._safe_send("peer0", b"test data", "peer0", failed=failed)
         assert len(send_attempts) == 1
 
-        # Second attempt - should skip because peer is in _failed_peers
-        await router._safe_send("peer0", b"test data", "peer0")
+        # Second attempt - should skip because peer failed in this operation
+        await router._safe_send("peer0", b"test data", "peer0", failed=failed)
         assert len(send_attempts) == 1  # No additional attempt
 
     @pytest.mark.anyio
-    async def test_batched_broadcast_clears_failed_peers_on_new_broadcast(
+    async def test_batched_broadcast_uses_fresh_failures_for_new_broadcast(
         self, registry, sample_peers
     ):
-        """Each new broadcast should clear the failed peers set."""
+        """Each new broadcast should use an independent failed peers set."""
         send_attempts = []
 
-        async def failing_send(peer_key: str, data: bytes) -> None:
+        async def failing_send(peer_key: str, data: bytes, connection_id: str | None) -> None:
             send_attempts.append(peer_key)
             raise ConnectionError("Connection closed")
 
@@ -103,7 +107,7 @@ class TestMessageRouterFailedSendCleanup:
         await router._batched_broadcast(targets, b"test data")
         assert len(send_attempts) == 1
 
-        # Second broadcast - should try again because _failed_peers was cleared
+        # Second broadcast has an independent failure set and should try again
         await router._batched_broadcast(targets, b"test data")
         assert len(send_attempts) == 2
 
@@ -115,7 +119,9 @@ class TestMessageRouterFailedSendCleanup:
         send_attempts = []
         fail_peer = sample_peers[0].nick
 
-        async def selective_failing_send(peer_key: str, data: bytes) -> None:
+        async def selective_failing_send(
+            peer_key: str, data: bytes, connection_id: str | None
+        ) -> None:
             send_attempts.append(peer_key)
             if peer_key == fail_peer:
                 raise ConnectionError("Connection closed")
@@ -126,24 +132,121 @@ class TestMessageRouterFailedSendCleanup:
             broadcast_batch_size=2,  # Small batch to test filtering across batches
         )
 
-        # Create targets with the failing peer appearing in multiple batches conceptually
-        # (in practice they're unique, but the failed set should prevent retries)
-        targets = [(p.nick, p.nick) for p in sample_peers]
+        targets = [
+            (sample_peers[0].nick, sample_peers[0].nick),
+            (sample_peers[1].nick, sample_peers[1].nick),
+            (sample_peers[0].nick, sample_peers[0].nick),
+        ]
 
         await router._batched_broadcast(targets, b"test data")
 
-        # Each peer should only be attempted once
-        unique_attempts = set(send_attempts)
-        assert len(unique_attempts) == len(send_attempts)
+        assert send_attempts.count(fail_peer) == 1
+
+    @pytest.mark.anyio
+    async def test_reentrant_broadcast_keeps_outer_failures(self, registry, sample_peers) -> None:
+        failed_peer = sample_peers[0].nick
+        nested_peer = sample_peers[1].nick
+        send_attempts: list[str] = []
+        router: MessageRouter
+
+        async def selective_failing_send(
+            peer_key: str, data: bytes, connection_id: str | None
+        ) -> None:
+            send_attempts.append(peer_key)
+            if peer_key == failed_peer:
+                raise ConnectionError("Connection closed")
+
+        async def on_failed(peer_key: str, connection_id: str) -> None:
+            nested_connection_id = registry.get_connection_id(nested_peer)
+            assert nested_connection_id is not None
+            await router._batched_broadcast(
+                [(nested_peer, nested_peer, nested_connection_id)], b"nested"
+            )
+
+        router = MessageRouter(
+            peer_registry=registry,
+            send_callback=selective_failing_send,
+            broadcast_batch_size=1,
+            on_send_failed=on_failed,
+        )
+        failed_connection_id = registry.get_connection_id(failed_peer)
+        assert failed_connection_id is not None
+
+        await router._batched_broadcast(
+            [
+                (failed_peer, failed_peer, failed_connection_id),
+                (failed_peer, failed_peer, failed_connection_id),
+            ],
+            b"outer",
+        )
+
+        assert send_attempts == [failed_peer, nested_peer]
+
+    @pytest.mark.anyio
+    async def test_concurrent_broadcasts_keep_failures_isolated(
+        self, registry, sample_peers
+    ) -> None:
+        failed_peer = sample_peers[0].nick
+        gate_peer = sample_peers[1].nick
+        gate_started = asyncio.Event()
+        first_failure_recorded = asyncio.Event()
+        release_first_cleanup = asyncio.Event()
+        failed_payloads: list[bytes] = []
+        failure_count = 0
+
+        async def coordinated_send(peer_key: str, data: bytes, connection_id: str | None) -> None:
+            if peer_key == gate_peer:
+                gate_started.set()
+                await first_failure_recorded.wait()
+                return
+            failed_payloads.append(data)
+            raise ConnectionError("Connection closed")
+
+        async def on_failed(peer_key: str, connection_id: str) -> None:
+            nonlocal failure_count
+            failure_count += 1
+            first_failure_recorded.set()
+            if failure_count == 1:
+                await release_first_cleanup.wait()
+
+        router = MessageRouter(
+            peer_registry=registry,
+            send_callback=coordinated_send,
+            broadcast_batch_size=1,
+            on_send_failed=on_failed,
+        )
+        failed_connection_id = registry.get_connection_id(failed_peer)
+        gate_connection_id = registry.get_connection_id(gate_peer)
+        assert failed_connection_id is not None
+        assert gate_connection_id is not None
+
+        first = asyncio.create_task(
+            router._batched_broadcast(
+                [
+                    (gate_peer, gate_peer, gate_connection_id),
+                    (failed_peer, failed_peer, failed_connection_id),
+                ],
+                b"first",
+            )
+        )
+        await gate_started.wait()
+        second = asyncio.create_task(
+            router._batched_broadcast([(failed_peer, failed_peer, failed_connection_id)], b"second")
+        )
+        await first
+        release_first_cleanup.set()
+        await second
+
+        assert failed_payloads == [b"second", b"first"]
 
     @pytest.mark.anyio
     async def test_on_send_failed_callback_error_is_handled(self, registry, sample_peers):
         """Errors in the on_send_failed callback should not propagate."""
 
-        async def failing_send(peer_key: str, data: bytes) -> None:
+        async def failing_send(peer_key: str, data: bytes, connection_id: str | None) -> None:
             raise ConnectionError("Connection closed")
 
-        async def broken_callback(peer_key: str) -> None:
+        async def broken_callback(peer_key: str, connection_id: str) -> None:
             raise RuntimeError("Callback error")
 
         router = MessageRouter(
@@ -160,10 +263,10 @@ class TestMessageRouterFailedSendCleanup:
         """Successful sends should not trigger the on_send_failed callback."""
         failed_peers = []
 
-        async def successful_send(peer_key: str, data: bytes) -> None:
+        async def successful_send(peer_key: str, data: bytes, connection_id: str | None) -> None:
             pass  # Success
 
-        async def on_failed(peer_key: str) -> None:
+        async def on_failed(peer_key: str, connection_id: str) -> None:
             failed_peers.append(peer_key)
 
         router = MessageRouter(
@@ -187,10 +290,10 @@ class TestMessageRouterPrivateMessageFailedSend:
         from_peer = sample_peers[0]
         to_peer = sample_peers[1]
 
-        async def failing_send(peer_key: str, data: bytes) -> None:
+        async def failing_send(peer_key: str, data: bytes, connection_id: str | None) -> None:
             raise ConnectionError("Connection closed")
 
-        async def on_failed(peer_key: str) -> None:
+        async def on_failed(peer_key: str, connection_id: str) -> None:
             failed_peers.append(peer_key)
 
         router = MessageRouter(
@@ -230,7 +333,7 @@ class TestMessageRouterPrivateMessageFailedSend:
             recipient, "old-recipient", verified_pubkey=b"recipient-pubkey"
         ).peer_key
 
-        async def replace_then_fail(peer_key: str, data: bytes, connection_id: str) -> None:
+        async def replace_then_fail(peer_key: str, data: bytes, connection_id: str | None) -> None:
             registry.register(
                 recipient.model_copy(deep=True),
                 "new-recipient",
@@ -276,7 +379,8 @@ class TestMessageRouterPrivateMessageFailedSend:
         )
         registry.register(recipient, "pending-recipient", verified_pubkey=b"recipient-key")
 
-        async def record_send(peer_key: str, data: bytes, connection_id: str) -> None:
+        async def record_send(peer_key: str, data: bytes, connection_id: str | None) -> None:
+            assert connection_id is not None
             sent_messages.append((peer_key, connection_id))
 
         router = MessageRouter(peer_registry=registry, send_callback=record_send)
@@ -308,9 +412,10 @@ class TestMessageRouterPrivateMessageFailedSend:
         )
         sender_key = registry.register(sender, "sender-connection").peer_key
         recipient_key = registry.register(recipient, "recipient-connection").peer_key
-        sent_messages: list[tuple[str, MessageType, str]] = []
+        sent_messages: list[tuple[str, int, str]] = []
 
-        async def record_send(peer_key: str, data: bytes, connection_id: str) -> None:
+        async def record_send(peer_key: str, data: bytes, connection_id: str | None) -> None:
+            assert connection_id is not None
             envelope = MessageEnvelope.from_bytes(data)
             sent_messages.append((peer_key, envelope.message_type, connection_id))
 
@@ -335,7 +440,7 @@ class TestMessageRouterSenderBinding:
     async def test_drops_public_message_with_forged_sender(self, registry, sample_peers):
         sent_messages = []
 
-        async def record_send(peer_key: str, data: bytes) -> None:
+        async def record_send(peer_key: str, data: bytes, connection_id: str | None) -> None:
             sent_messages.append((peer_key, data))
 
         router = MessageRouter(peer_registry=registry, send_callback=record_send)
@@ -354,7 +459,8 @@ class TestMessageRouterSenderBinding:
     async def test_stale_generation_cannot_route_or_publish_offers(self, registry):
         sent_messages: list[tuple[str, str]] = []
 
-        async def record_send(peer_key: str, data: bytes, connection_id: str) -> None:
+        async def record_send(peer_key: str, data: bytes, connection_id: str | None) -> None:
+            assert connection_id is not None
             sent_messages.append((peer_key, connection_id))
 
         sender = PeerInfo(
@@ -397,7 +503,7 @@ class TestMessageRouterSenderBinding:
     async def test_drops_private_message_with_forged_sender(self, registry, sample_peers):
         sent_messages = []
 
-        async def record_send(peer_key: str, data: bytes) -> None:
+        async def record_send(peer_key: str, data: bytes, connection_id: str | None) -> None:
             sent_messages.append((peer_key, data))
 
         router = MessageRouter(peer_registry=registry, send_callback=record_send)
@@ -422,7 +528,7 @@ class TestOfferTracking:
         """Should track sw0absoffer messages."""
         sent_messages = []
 
-        async def mock_send(peer_key: str, data: bytes) -> None:
+        async def mock_send(peer_key: str, data: bytes, connection_id: str | None) -> None:
             sent_messages.append((peer_key, data))
 
         router = MessageRouter(
@@ -456,7 +562,7 @@ class TestOfferTracking:
         """Should track multiple offers from same peer."""
         sent_messages = []
 
-        async def mock_send(peer_key: str, data: bytes) -> None:
+        async def mock_send(peer_key: str, data: bytes, connection_id: str | None) -> None:
             sent_messages.append((peer_key, data))
 
         router = MessageRouter(
@@ -490,7 +596,7 @@ class TestOfferTracking:
         """Should identify peers with more than 2 offers."""
         sent_messages = []
 
-        async def mock_send(peer_key: str, data: bytes) -> None:
+        async def mock_send(peer_key: str, data: bytes, connection_id: str | None) -> None:
             sent_messages.append((peer_key, data))
 
         router = MessageRouter(
@@ -528,7 +634,7 @@ class TestOfferTracking:
         """Should remove offers when peer disconnects."""
         sent_messages = []
 
-        async def mock_send(peer_key: str, data: bytes) -> None:
+        async def mock_send(peer_key: str, data: bytes, connection_id: str | None) -> None:
             sent_messages.append((peer_key, data))
 
         router = MessageRouter(
@@ -572,7 +678,7 @@ class TestChunkedPeerlist:
         """Should send peerlist in chunks for large peer lists."""
         sent_messages: list[tuple[str, bytes]] = []
 
-        async def mock_send(peer_key: str, data: bytes) -> None:
+        async def mock_send(peer_key: str, data: bytes, connection_id: str | None) -> None:
             sent_messages.append((peer_key, data))
 
         router = MessageRouter(
@@ -636,7 +742,7 @@ class TestChunkedPeerlist:
         """Should send single chunk for small peer lists."""
         sent_messages: list[tuple[str, bytes]] = []
 
-        async def mock_send(peer_key: str, data: bytes) -> None:
+        async def mock_send(peer_key: str, data: bytes, connection_id: str | None) -> None:
             sent_messages.append((peer_key, data))
 
         router = MessageRouter(
@@ -676,7 +782,7 @@ class TestChunkedPeerlist:
         """Should send empty peerlist response when registry is empty."""
         sent_messages: list[tuple[str, bytes]] = []
 
-        async def mock_send(peer_key: str, data: bytes) -> None:
+        async def mock_send(peer_key: str, data: bytes, connection_id: str | None) -> None:
             sent_messages.append((peer_key, data))
 
         router = MessageRouter(
@@ -707,7 +813,7 @@ class TestPingPongRouting:
         """When a PING is received, the router should respond with a PONG."""
         sent_messages: list[tuple[str, bytes]] = []
 
-        async def mock_send(peer_key: str, data: bytes) -> None:
+        async def mock_send(peer_key: str, data: bytes, connection_id: str | None) -> None:
             sent_messages.append((peer_key, data))
 
         router = MessageRouter(
@@ -730,13 +836,13 @@ class TestPingPongRouting:
     @pytest.mark.anyio
     async def test_pong_calls_on_pong_callback(self, registry, sample_peers):
         """When a PONG is received, the on_pong callback should be invoked."""
-        pong_keys: list[str] = []
+        pong_keys: list[tuple[str, str]] = []
 
-        async def mock_send(peer_key: str, data: bytes) -> None:
+        async def mock_send(peer_key: str, data: bytes, connection_id: str | None) -> None:
             pass
 
-        def on_pong(peer_key: str) -> None:
-            pong_keys.append(peer_key)
+        def on_pong(peer_key: str, connection_id: str) -> None:
+            pong_keys.append((peer_key, connection_id))
 
         router = MessageRouter(
             peer_registry=registry,
@@ -749,13 +855,15 @@ class TestPingPongRouting:
 
         await router.route_message(envelope, from_key)
 
-        assert pong_keys == [from_key]
+        connection_id = registry.get_connection_id(from_key)
+        assert connection_id is not None
+        assert pong_keys == [(from_key, connection_id)]
 
     @pytest.mark.anyio
     async def test_pong_without_callback_does_not_raise(self, registry, sample_peers):
         """When a PONG is received with no on_pong callback, nothing should happen."""
 
-        async def mock_send(peer_key: str, data: bytes) -> None:
+        async def mock_send(peer_key: str, data: bytes, connection_id: str | None) -> None:
             pass
 
         router = MessageRouter(
@@ -774,7 +882,7 @@ class TestPingPongRouting:
     async def test_ping_send_failure_does_not_raise(self, registry, sample_peers):
         """If sending the PONG response fails, it should be handled gracefully."""
 
-        async def failing_send(peer_key: str, data: bytes) -> None:
+        async def failing_send(peer_key: str, data: bytes, connection_id: str | None) -> None:
             raise ConnectionError("Connection closed")
 
         router = MessageRouter(
@@ -792,7 +900,7 @@ class TestPingPongRouting:
     async def test_connected_peer_cannot_route_before_handshake(self, registry):
         sent_messages: list[str] = []
 
-        async def record_send(peer_key: str, data: bytes) -> None:
+        async def record_send(peer_key: str, data: bytes, connection_id: str | None) -> None:
             sent_messages.append(peer_key)
 
         peer = PeerInfo(

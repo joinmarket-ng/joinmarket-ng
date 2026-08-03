@@ -62,6 +62,7 @@ class MakerDirectoryPool(DirectoryClientPool):
             connection_timeout=config.connection_timeout,
             stream_isolation=config.stream_isolation,
             nick_auth_mode=config.nick_auth_mode,
+            nick_auth_directory_ids=config.nick_auth_directory_ids,
         )
 
     def _build_client_kwargs(self, host: str, port: int) -> dict[str, Any]:

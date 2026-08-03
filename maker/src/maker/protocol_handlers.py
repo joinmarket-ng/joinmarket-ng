@@ -1048,6 +1048,9 @@ class ProtocolHandlersMixin:
                         socks_port=self.config.socks_port,
                         timeout=30.0,
                         nick_auth_mode=self.config.nick_auth_mode,
+                        nick_auth_directory_id=self.config.nick_auth_directory_ids.get(
+                            f"{host}:{port}"
+                        ),
                         socks_username=socks_username,
                         socks_password=socks_password,
                     )

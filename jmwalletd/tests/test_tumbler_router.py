@@ -640,6 +640,9 @@ class TestBuildTumblerTakerConfig:
         settings.data_dir = Path("/tmp/jm-test")
         settings.network_config.network = NetworkType.REGTEST
         settings.network_config.directory_servers = []
+        settings.network_config.nick_auth_directory_ids = {
+            "directory.internal:5222": "test:tumbler-directory"
+        }
         settings.bitcoin.backend_type = "descriptor_wallet"
         settings.tor.socks_host = "127.0.0.1"
         settings.tor.socks_port = 9050
@@ -755,6 +758,9 @@ class TestBuildTumblerTakerConfig:
         assert captured["order_wait_time"] == 60.0
         assert captured["orderbook_min_wait"] == 45.0
         assert captured["orderbook_quiet_period"] == 20.0
+        assert captured["nick_auth_directory_ids"] == {
+            "directory.internal:5222": "test:tumbler-directory"
+        }
         # The runner resolves destinations itself; the placeholder stays empty.
         assert captured["destination_address"].get_secret_value() == ""
 

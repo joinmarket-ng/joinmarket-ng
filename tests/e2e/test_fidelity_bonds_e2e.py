@@ -38,6 +38,7 @@ async def test_orderbook_watcher_receives_bonds(wait_for_directory_server):
         host="127.0.0.1",
         port=get_directory_port(),
         network="testnet",
+        nick_auth_directory_id="test:jm-directory-5222",
     )
     await watcher.connect()
 
@@ -84,6 +85,7 @@ async def test_new_peer_triggers_orderbook_request(wait_for_directory_server):
         host="127.0.0.1",
         port=get_directory_port(),
         network="testnet",
+        nick_auth_directory_id="test:jm-directory-5222",
     )
     await watcher.connect()
 
@@ -152,6 +154,7 @@ async def test_bond_appears_in_privmsg_not_public(wait_for_directory_server):
         host="127.0.0.1",
         port=get_directory_port(),
         network="testnet",
+        nick_auth_directory_id="test:jm-directory-5222",
     )
     await watcher.connect()
 

@@ -60,7 +60,7 @@ from jmcore.models import (
     DIRECTORY_NODES_TESTNET,
     NetworkType,
 )
-from jmcore.nick_auth import NickAuthMode, validate_directory_id
+from jmcore.nick_auth import NickAuthMode, validate_directory_endpoint, validate_directory_id
 from jmcore.paths import get_default_data_dir
 
 # Default directory servers per network (single source of truth in models.py)
@@ -346,6 +346,10 @@ class NetworkSettings(BaseModel):
         default=NickAuthMode.PREFER_VERIFIED,
         description="Client policy for authenticating nick ownership to directory servers",
     )
+    nick_auth_directory_ids: dict[str, str] = Field(
+        default_factory=dict,
+        description="Expected nick authentication identity by selected host:port endpoint",
+    )
 
     @field_validator("directory_servers", mode="before")
     @classmethod
@@ -372,6 +376,14 @@ class NetworkSettings(BaseModel):
             # Fall back to comma-separated plain string
             return [s.strip() for s in v.split(",") if s.strip()]
         return v
+
+    @field_validator("nick_auth_directory_ids")
+    @classmethod
+    def validate_nick_auth_directory_ids(cls, value: dict[str, str]) -> dict[str, str]:
+        return {
+            validate_directory_endpoint(endpoint): validate_directory_id(directory_id)
+            for endpoint, directory_id in value.items()
+        }
 
 
 class WalletSettings(BaseModel):

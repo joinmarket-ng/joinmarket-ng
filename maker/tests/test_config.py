@@ -874,6 +874,17 @@ class TestNewSettingsWiring:
         config = build_maker_config(settings=settings, mnemonic=TEST_MNEMONIC, passphrase="")
         assert config.nick_auth_mode is NickAuthMode.REQUIRE_VERIFIED
 
+    def test_nick_auth_directory_ids_passed_from_settings(self) -> None:
+        from jmcore.settings import JoinMarketSettings
+
+        from maker.cli import build_maker_config
+
+        expected = {"directory.internal:5222": "test:directory-a"}
+        settings = JoinMarketSettings(network_config={"nick_auth_directory_ids": expected})
+        config = build_maker_config(settings=settings, mnemonic=TEST_MNEMONIC, passphrase="")
+
+        assert config.nick_auth_directory_ids == expected
+
     def test_directory_reconnect_interval_passed_from_settings(self) -> None:
         """maker.directory_reconnect_interval in config.toml must reach MakerConfig."""
         from jmcore.settings import JoinMarketSettings

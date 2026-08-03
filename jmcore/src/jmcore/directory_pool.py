@@ -76,6 +76,7 @@ class DirectoryClientPool:
         connection_timeout: float = 120.0,
         stream_isolation: bool = False,
         nick_auth_mode: NickAuthMode = NickAuthMode.PREFER_VERIFIED,
+        nick_auth_directory_ids: dict[str, str] | None = None,
     ):
         self.directory_servers = directory_servers
         self.network = network
@@ -85,6 +86,7 @@ class DirectoryClientPool:
         self.connection_timeout = connection_timeout
         self.stream_isolation = stream_isolation
         self.nick_auth_mode = nick_auth_mode
+        self.nick_auth_directory_ids = nick_auth_directory_ids or {}
 
         # Pre-compute isolation credentials (None when disabled). The peer
         # credentials are exposed for subclasses that establish direct
@@ -120,6 +122,7 @@ class DirectoryClientPool:
             "socks_port": self.socks_port,
             "timeout": self.connection_timeout,
             "nick_auth_mode": self.nick_auth_mode,
+            "nick_auth_directory_id": self.nick_auth_directory_ids.get(f"{host}:{port}"),
             "socks_username": self._dir_creds[0],
             "socks_password": self._dir_creds[1],
         }

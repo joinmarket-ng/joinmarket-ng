@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import inspect
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
@@ -38,8 +37,8 @@ from loguru import logger
 from directory_server.peer_registry import PeerRegistry
 
 # Type aliases
-SendCallback = Callable[..., Awaitable[None]]
-EvictCallback = Callable[..., Awaitable[None]]
+SendCallback = Callable[[str, bytes, str], Awaitable[None]]
+EvictCallback = Callable[[str, str, str], Awaitable[None]]
 
 
 @dataclass
@@ -60,8 +59,8 @@ class HeartbeatManager:
 
     Args:
         peer_registry: Registry to query peer state and last_seen.
-        send_callback: Async callable ``(peer_key, data_bytes) -> None``.
-        evict_callback: Async callable ``(peer_key, reason) -> None``
+        send_callback: Async callable ``(peer_key, data_bytes, connection_id) -> None``.
+        evict_callback: Async callable ``(peer_key, reason, connection_id) -> None``
             that disconnects and unregisters a peer.
         config: Timing configuration.
     """
@@ -252,27 +251,7 @@ class HeartbeatManager:
     async def _call_send(self, peer_key: str, data: bytes, connection_id: str) -> None:
         if not self.peer_registry.is_current_owner(peer_key, connection_id):
             return
-        if self._accepts_args(self.send_callback, 3):
-            await self.send_callback(peer_key, data, connection_id)
-        else:
-            await self.send_callback(peer_key, data)
+        await self.send_callback(peer_key, data, connection_id)
 
     async def _call_evict(self, peer_key: str, reason: str, connection_id: str) -> None:
-        if self._accepts_args(self.evict_callback, 3):
-            await self.evict_callback(peer_key, reason, connection_id)
-        else:
-            await self.evict_callback(peer_key, reason)
-
-    @staticmethod
-    def _accepts_args(callback: Callable[..., object], count: int) -> bool:
-        try:
-            parameters = inspect.signature(callback).parameters.values()
-        except (TypeError, ValueError):
-            return True
-        positional = [
-            parameter
-            for parameter in parameters
-            if parameter.kind
-            in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
-        ]
-        return len(positional) >= count
+        await self.evict_callback(peer_key, reason, connection_id)

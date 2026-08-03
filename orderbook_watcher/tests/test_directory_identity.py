@@ -26,6 +26,7 @@ async def test_aggregator_reuses_identity_and_auth_mode_for_all_directory_client
         mempool_api_url="",
         nick_identity=identity,
         nick_auth_mode=NickAuthMode.REQUIRE_VERIFIED,
+        nick_auth_directory_ids={"directory.example:5222": "test:directory-a"},
     )
     clients = [_mock_client(), _mock_client(), _mock_client()]
 
@@ -38,3 +39,4 @@ async def test_aggregator_reuses_identity_and_auth_mode_for_all_directory_client
     for call in client_cls.call_args_list:
         assert call.kwargs["nick_identity"] is identity
         assert call.kwargs["nick_auth_mode"] is NickAuthMode.REQUIRE_VERIFIED
+        assert call.kwargs["nick_auth_directory_id"] == "test:directory-a"

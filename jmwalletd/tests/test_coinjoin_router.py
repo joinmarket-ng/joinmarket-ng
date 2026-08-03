@@ -538,6 +538,8 @@ class TestStartMaker:
         mock_settings.get_directory_servers.return_value = expected_dirs
         mock_settings.network_config.network = NetworkType.SIGNET
         mock_settings.network_config.nick_auth_mode = "require_verified"
+        expected_ids = {expected_dirs[0]: "test:walletd-directory"}
+        mock_settings.network_config.nick_auth_directory_ids = expected_ids
         mock_settings.tor.socks_host = "127.0.0.1"
         mock_settings.tor.socks_port = 9050
         mock_settings.tor.stream_isolation = False
@@ -561,6 +563,7 @@ class TestStartMaker:
         assert kwargs["network"] == NetworkType.SIGNET
         assert kwargs["directory_servers"] == expected_dirs
         assert kwargs["nick_auth_mode"] == "require_verified"
+        assert kwargs["nick_auth_directory_ids"] == expected_ids
         assert kwargs["socks_host"] == "127.0.0.1"
         assert kwargs["socks_port"] == 9050
         assert kwargs["stream_isolation"] is False

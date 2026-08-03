@@ -227,6 +227,7 @@ services:
       - NETWORK_CONFIG__NETWORK=testnet
       - LOGGING__LEVEL=DEBUG
       - DIRECTORY_NODES=jm-directory:5222
+      - 'NETWORK_CONFIG__NICK_AUTH_DIRECTORY_IDS={"jm-directory:5222":"test:jm-directory-5222"}'
       - ORDERBOOK_WATCHER__HTTP_HOST=0.0.0.0
     ports:
       - "8080:8000"
@@ -268,6 +269,7 @@ services:
       # Directory servers for CoinJoin (tumbler/do_coinjoin taker needs these).
       # Regtest has no defaults so we must supply the local compose directories.
       - NETWORK_CONFIG__DIRECTORY_SERVERS=jm-directory:5222,jm-directory2:5223
+      - 'NETWORK_CONFIG__NICK_AUTH_DIRECTORY_IDS={"jm-directory:5222":"test:jm-directory-5222","jm-directory2:5223":"test:jm-directory2-5223"}'
       - JMWALLETD_HOST=0.0.0.0
       - LOGGING__LEVEL=DEBUG
       - OBWATCH_URL=http://jm-orderbook-watcher:8000
@@ -338,6 +340,7 @@ services:
       - NETWORK_CONFIG__NETWORK=testnet
       - NETWORK_CONFIG__BITCOIN_NETWORK=regtest
       - NETWORK_CONFIG__DIRECTORY_SERVERS=jm-directory:5222,jm-directory2:5223
+      - 'NETWORK_CONFIG__NICK_AUTH_DIRECTORY_IDS={"jm-directory:5222":"test:jm-directory-5222","jm-directory2:5223":"test:jm-directory2-5223"}'
       - LOGGING__LEVEL=DEBUG
       # standalone-ng supervises its own Tor and orderbook watcher. Keep their
       # loopback defaults so the Tor control cookie and nginx upstreams match.
@@ -389,6 +392,7 @@ services:
       - BITCOIN__RPC_USER=test
       - BITCOIN__RPC_PASSWORD=test
       - DIRECTORY_SERVERS=jm-directory:5222
+      - 'NETWORK_CONFIG__NICK_AUTH_DIRECTORY_IDS={"jm-directory:5222":"test:jm-directory-5222"}'
       - LOGGING__LEVEL=DEBUG
       - MAKER__MIN_SIZE=10000
       - MAKER__TX_FEE_CONTRIBUTION=500
@@ -435,6 +439,7 @@ services:
       - BITCOIN__RPC_USER=test
       - BITCOIN__RPC_PASSWORD=test
       - DIRECTORY_SERVERS=jm-directory:5222
+      - 'NETWORK_CONFIG__NICK_AUTH_DIRECTORY_IDS={"jm-directory:5222":"test:jm-directory-5222"}'
       - LOGGING__LEVEL=DEBUG
       - COINJOIN_AMOUNT=1000000
       - TAKER__MINIMUM_MAKERS=2
@@ -481,6 +486,7 @@ services:
       - BITCOIN__RPC_USER=test
       - BITCOIN__RPC_PASSWORD=test
       - DIRECTORY_SERVERS=jm-directory:5222,jm-directory2:5223
+      - 'NETWORK_CONFIG__NICK_AUTH_DIRECTORY_IDS={"jm-directory:5222":"test:jm-directory-5222","jm-directory2:5223":"test:jm-directory2-5223"}'
       - LOGGING__LEVEL=DEBUG
       - COINJOIN_AMOUNT=1000000
       - TAKER__MINIMUM_MAKERS=2
@@ -570,6 +576,7 @@ services:
       # Cookie-based auth: reads credentials from Bitcoin Core's .cookie file
       - BITCOIN__RPC_COOKIE_FILE=/shared/.cookie
       - DIRECTORY_SERVERS=jm-directory:5222,jm-directory2:5223
+      - 'NETWORK_CONFIG__NICK_AUTH_DIRECTORY_IDS={"jm-directory:5222":"test:jm-directory-5222","jm-directory2:5223":"test:jm-directory2-5223"}'
       - LOGGING__LEVEL=DEBUG
       - MAKER__MIN_SIZE=10000
       - MAKER__TX_FEE_CONTRIBUTION=500
@@ -636,6 +643,7 @@ services:
       - BITCOIN__RPC_USER=test
       - BITCOIN__RPC_PASSWORD=test
       - DIRECTORY_SERVERS=jm-directory:5222,jm-directory2:5223
+      - 'NETWORK_CONFIG__NICK_AUTH_DIRECTORY_IDS={"jm-directory:5222":"test:jm-directory-5222","jm-directory2:5223":"test:jm-directory2-5223"}'
       - LOGGING__LEVEL=DEBUG
       - MAKER__MIN_SIZE=10000
       - MAKER__TX_FEE_CONTRIBUTION=500
@@ -701,6 +709,7 @@ services:
       - BITCOIN__RPC_PASSWORD=test
       # Connect to both directories to test multi-directory handling
       - DIRECTORY_SERVERS=jm-directory:5222,jm-directory2:5223
+      - 'NETWORK_CONFIG__NICK_AUTH_DIRECTORY_IDS={"jm-directory:5222":"test:jm-directory-5222","jm-directory2:5223":"test:jm-directory2-5223"}'
       - LOGGING__LEVEL=DEBUG
       - MAKER__MIN_SIZE=10000
       - MAKER__TX_FEE_CONTRIBUTION=500
@@ -763,6 +772,7 @@ services:
       - BITCOIN__RPC_URL=http://jm-bitcoin:18443
       - BITCOIN__RPC_COOKIE_FILE=/shared/.cookie
       - DIRECTORY_SERVERS=jm-directory:5222,jm-directory2:5223
+      - 'NETWORK_CONFIG__NICK_AUTH_DIRECTORY_IDS={"jm-directory:5222":"test:jm-directory-5222","jm-directory2:5223":"test:jm-directory2-5223"}'
       - LOGGING__LEVEL=DEBUG
       - MAKER__MIN_SIZE=10000
       - MAKER__TX_FEE_CONTRIBUTION=500
@@ -824,6 +834,7 @@ services:
       - BITCOIN__RPC_URL=http://jm-bitcoin:18443
       - BITCOIN__RPC_COOKIE_FILE=/shared/.cookie
       - DIRECTORY_SERVERS=jm-directory:5222,jm-directory2:5223
+      - 'NETWORK_CONFIG__NICK_AUTH_DIRECTORY_IDS={"jm-directory:5222":"test:jm-directory-5222","jm-directory2:5223":"test:jm-directory2-5223"}'
       - LOGGING__LEVEL=DEBUG
       - MAKER__MIN_SIZE=10000
       - MAKER__TX_FEE_CONTRIBUTION=500
@@ -1302,6 +1313,7 @@ services:
       - BITCOIN__NEUTRINO_TLS_CERT=/data/neutrino/tls.cert
       - BITCOIN__NEUTRINO_AUTH_TOKEN_FILE=/data/neutrino/auth_token
       - DIRECTORY_SERVERS=jm-directory:5222
+      - 'NETWORK_CONFIG__NICK_AUTH_DIRECTORY_IDS={"jm-directory:5222":"test:jm-directory-5222"}'
       - LOGGING__LEVEL=DEBUG
       - MAKER__MIN_SIZE=10000
       - MAKER__TX_FEE_CONTRIBUTION=500
@@ -1349,6 +1361,7 @@ services:
       - BITCOIN__NEUTRINO_TLS_CERT=/data/neutrino/tls.cert
       - BITCOIN__NEUTRINO_AUTH_TOKEN_FILE=/data/neutrino/auth_token
       - DIRECTORY_SERVERS=jm-directory:5222
+      - 'NETWORK_CONFIG__NICK_AUTH_DIRECTORY_IDS={"jm-directory:5222":"test:jm-directory-5222"}'
       - LOGGING__LEVEL=DEBUG
       - COINJOIN_AMOUNT=1000000
       - TAKER__MINIMUM_MAKERS=2

@@ -5,7 +5,6 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
-import ipaddress
 import json
 import re
 from collections.abc import Mapping
@@ -17,14 +16,14 @@ from coincurve import verify_signature as coincurve_verify
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from jmcore.crypto import NickIdentity, bitcoin_message_hash_bytes, nick_from_pubkey_hex
-from jmcore.protocol import get_nick_version
 
 _LOWER_HEX_64_RE = re.compile(r"[0-9a-f]{64}")
 _COMPRESSED_PUBKEY_RE = re.compile(r"0[23][0-9a-f]{64}")
 _ONION_HOST_RE = re.compile(r"[a-z2-7]{56}\.onion")
-_DNS_LABEL_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
-_TEST_DIRECTORY_ID_RE = re.compile(r"test:[a-z0-9][a-z0-9._:-]{0,253}")
+_NICK_RE = re.compile(r"J[0-9][1-9A-HJ-NP-Za-km-zO]{14}")
+_DIRECTORY_ID_RE = re.compile(r"[a-z0-9][a-z0-9.:_-]*")
 _SECP256K1_ORDER = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+_NICK_AUTH_DOMAIN = b"nick-auth-v1"
 
 
 class NickAuthMode(StrEnum):
@@ -69,21 +68,29 @@ def _validate_lower_hex_64(value: str, field_name: str) -> str:
 
 
 def validate_directory_id(value: str) -> str:
-    """Validate and return a canonical JMP-0005 directory identity."""
-    if value.startswith("test:"):
-        if _TEST_DIRECTORY_ID_RE.fullmatch(value) is None:
-            raise ValueError("invalid test directory-id")
-        return value
+    """Validate and return a JMP-0005 directory identity."""
+    if not isinstance(value, str) or _DIRECTORY_ID_RE.fullmatch(value) is None:
+        raise ValueError("invalid directory-id")
+    return value
 
+
+def validate_directory_endpoint(value: str) -> str:
+    """Validate an exact host:port key used to select an expected directory identity."""
+    if not isinstance(value, str) or value != value.strip():
+        raise ValueError("invalid directory endpoint")
     try:
         host, port_text = value.rsplit(":", 1)
         port = int(port_text)
     except ValueError as exc:
-        raise ValueError("invalid onion directory-id") from exc
-    if _ONION_HOST_RE.fullmatch(host) is None or not 1 <= port <= 65535:
-        raise ValueError("invalid onion directory-id")
-    if value != f"{host}:{port}":
-        raise ValueError("directory-id is not canonical")
+        raise ValueError("directory endpoint must use host:port") from exc
+    if (
+        not host
+        or ":" in host
+        or any(char.isspace() for char in host)
+        or not 1 <= port <= 65535
+        or value != f"{host}:{port}"
+    ):
+        raise ValueError("directory endpoint must use canonical host:port")
     return value
 
 
@@ -228,28 +235,8 @@ def handshake_line_sha256(line: str) -> str:
     return hashlib.sha256(line.encode("utf-8")).hexdigest()
 
 
-def _normalize_test_host(host: str) -> str:
-    try:
-        address = ipaddress.ip_address(host)
-    except ValueError:
-        if len(host) > 253:
-            raise ValueError("host is too long") from None
-        labels = host.split(".")
-        if not labels or any(_DNS_LABEL_RE.fullmatch(label) is None for label in labels):
-            raise ValueError("invalid host") from None
-        if len(labels) > 1 and labels[-1] not in {"local", "localhost", "test"}:
-            raise ValueError("non-onion host must be a local or test endpoint") from None
-        return host
-
-    if address.version != 4:
-        raise ValueError("only IPv4 local/test endpoints are supported")
-    if not (address.is_private or address.is_loopback or address.is_unspecified):
-        raise ValueError("non-onion IP address must be local")
-    return address.compressed
-
-
 def directory_id_for_endpoint(host: str, port: int) -> str:
-    """Return the canonical JMP-0005 identity for a selected directory endpoint."""
+    """Derive a JMP-0005 identity from a selected Tor v3 endpoint."""
     if not isinstance(host, str) or isinstance(port, bool) or not isinstance(port, int):
         raise ValueError("host and port have invalid types")
     if not 1 <= port <= 65535:
@@ -264,19 +251,7 @@ def directory_id_for_endpoint(host: str, port: int) -> str:
         if _ONION_HOST_RE.fullmatch(normalized_host) is None:
             raise ValueError("onion endpoint must use a 56-character v3 hostname")
         return f"{normalized_host}:{port}"
-
-    normalized_host = _normalize_test_host(normalized_host)
-    return f"test:{normalized_host}-{port}"
-
-
-def _validate_transcript_part(value: str, name: str) -> str:
-    if not value or "|" in value:
-        raise ValueError(f"invalid {name}")
-    try:
-        value.encode("ascii")
-    except UnicodeEncodeError as exc:
-        raise ValueError(f"{name} must be ASCII") from exc
-    return value
+    raise ValueError("non-onion endpoint requires an explicitly configured directory-id")
 
 
 def build_nick_auth_signed_message(
@@ -289,10 +264,11 @@ def build_nick_auth_signed_message(
     challenge = _validate_lower_hex_64(challenge, "challenge")
     directory_id = validate_directory_id(directory_id)
     handshake_sha256 = _validate_lower_hex_64(handshake_sha256, "handshake-sha256")
-    _validate_transcript_part(nick, "nick")
+    if _NICK_RE.fullmatch(nick) is None:
+        raise ValueError("nick must use the JMP-0001 nick format")
     NickAuthProof.validate_pubkey(pubkey)
     transcript = f"nick-auth|{challenge}|{directory_id}|{handshake_sha256}|{nick}|{pubkey}"
-    return transcript.encode("ascii") + b"onion-network"
+    return transcript.encode("ascii") + _NICK_AUTH_DOMAIN
 
 
 def create_nick_auth_proof(
@@ -326,6 +302,7 @@ def verify_nick_auth_proof(
     expected_directory_id: str,
     handshake_line: str,
     nick: str,
+    protocol_version: int,
 ) -> bool:
     try:
         if proof.challenge != expected_challenge:
@@ -333,7 +310,7 @@ def verify_nick_auth_proof(
         handshake_sha256 = handshake_line_sha256(handshake_line)
         if proof.handshake_sha256 != handshake_sha256:
             return False
-        if nick_from_pubkey_hex(proof.pubkey, get_nick_version(nick)) != nick:
+        if nick_from_pubkey_hex(proof.pubkey, protocol_version) != nick:
             return False
 
         signature = _decode_canonical_der_signature(proof.signature)

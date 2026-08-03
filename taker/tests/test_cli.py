@@ -47,6 +47,7 @@ class TestBuildTakerConfig:
         settings.network_config.bitcoin_network = None
         settings.network_config.directory_servers = ["dir1.onion:5222"]
         settings.network_config.nick_auth_mode = NickAuthMode.PREFER_VERIFIED
+        settings.network_config.nick_auth_directory_ids = {}
 
         # Data dir
         settings.get_data_dir.return_value = "/tmp/jm-test"
@@ -656,3 +657,20 @@ class TestBuildTakerConfig:
         )
 
         assert config.nick_auth_mode is NickAuthMode.REQUIRE_VERIFIED
+
+    def test_nick_auth_directory_ids_flow_into_config(
+        self, sample_mnemonic: str, mock_settings: MagicMock
+    ) -> None:
+        expected = {"directory.internal:5222": "test:directory-a"}
+        mock_settings.network_config.nick_auth_directory_ids = expected
+
+        config = build_taker_config(
+            settings=mock_settings,
+            mnemonic=sample_mnemonic,
+            passphrase="",
+            destination="bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+            amount=100000,
+            mixdepth=0,
+        )
+
+        assert config.nick_auth_directory_ids == expected

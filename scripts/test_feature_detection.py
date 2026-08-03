@@ -67,6 +67,8 @@ async def run(args: argparse.Namespace) -> None:
         network=settings.network_config.network,
         socks_host=settings.tor.socks_host,
         socks_port=settings.tor.socks_port,
+        nick_auth_mode=settings.network_config.nick_auth_mode,
+        nick_auth_directory_ids=settings.network_config.nick_auth_directory_ids,
     )
 
     await aggregator.start_continuous_listening()

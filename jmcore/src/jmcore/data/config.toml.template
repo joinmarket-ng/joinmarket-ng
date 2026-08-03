@@ -169,6 +169,10 @@
 # "prefer_verified" authenticates when supported and falls back to legacy servers.
 # "require_verified" rejects legacy servers. "disabled" uses the legacy handshake.
 # nick_auth_mode = "prefer_verified"
+# Expected identity for each selected directory endpoint. Keys must exactly match
+# the host:port string used after directory address selection. V3 onion identities
+# are derived automatically; explicit entries are required for clearnet and test IDs.
+# nick_auth_directory_ids = { "127.0.0.1:5222" = "test:local-directory" }
 
 # ============================================================================
 # Wallet Settings
