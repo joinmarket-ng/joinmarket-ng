@@ -143,7 +143,20 @@ def test_directory_ids_accept_spec_grammar(directory_id: str):
     assert validate_directory_id(directory_id) == directory_id
 
 
-@pytest.mark.parametrize("directory_id", ["", "UPPERCASE", "bad|id", "bad id", "non-ascii-\u00e9"])
+@pytest.mark.parametrize(
+    "directory_id",
+    [
+        "",
+        "UPPERCASE",
+        ".directory",
+        ":directory",
+        "_directory",
+        "-directory",
+        "bad|id",
+        "bad id",
+        "non-ascii-\u00e9",
+    ],
+)
 def test_directory_ids_reject_values_outside_spec_grammar(directory_id: str):
     with pytest.raises(ValueError, match="invalid directory-id"):
         validate_directory_id(directory_id)

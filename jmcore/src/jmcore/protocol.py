@@ -395,8 +395,8 @@ class MessageType(IntEnum):
     PONG = 799
     DISCONNECT = 801
     NICK_AUTH_CHALLENGE = 803
-    NICK_AUTH_PROOF = 804
-    NICK_AUTH_RESULT = 805
+    NICK_AUTH_PROOF = 805
+    NICK_AUTH_RESULT = 807
 
     # Local-only control messages, never sent over the wire.
     # The reference implementation uses 797 for CONNECT_IN (a local-only

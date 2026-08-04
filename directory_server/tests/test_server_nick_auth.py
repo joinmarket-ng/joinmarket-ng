@@ -313,7 +313,7 @@ async def test_duplicate_outer_proof_keys_are_malformed() -> None:
             proof_envelope = MessageEnvelope.from_bytes(connection.received.pop())
             connection.received.append(
                 (
-                    '{"type":804,"type":804,"line":' + json.dumps(proof_envelope.payload) + "}"
+                    '{"type":805,"type":805,"line":' + json.dumps(proof_envelope.payload) + "}"
                 ).encode()
             )
 
