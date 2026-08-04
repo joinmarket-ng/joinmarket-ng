@@ -2,7 +2,7 @@ import asyncio
 import contextlib
 import json
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
@@ -371,6 +371,85 @@ async def test_nick_auth_rejects_proof_type_before_parsing_challenge_payload() -
 
     parse_challenge.assert_not_called()
     assert connection.send.await_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "message_type",
+    [MessageType.NICK_AUTH_CHALLENGE, MessageType.NICK_AUTH_PROOF],
+)
+async def test_nick_auth_rejects_out_of_order_result_type_before_parsing(
+    message_type: MessageType,
+) -> None:
+    challenge = NickAuthChallenge(challenge="22" * 32, directory_id=TEST_DIRECTORY_ID)
+    connection = AsyncMock()
+    connection.receive.side_effect = [
+        _handshake_response(nick_auth=True),
+        json.dumps(
+            {"type": MessageType.NICK_AUTH_CHALLENGE.value, "line": challenge.to_json()}
+        ).encode(),
+        json.dumps({"type": message_type.value, "line": "not a result payload"}).encode(),
+    ]
+    client = DirectoryClient(
+        "directory-a", 5222, "regtest", nick_auth_directory_id=TEST_DIRECTORY_ID
+    )
+    client.connection = connection
+
+    with (
+        patch("jmcore.directory_client.NickAuthResult.parse") as parse_result,
+        pytest.raises(DirectoryClientError, match="Unexpected nick authentication result type"),
+    ):
+        await client._handshake()
+
+    parse_result.assert_not_called()
+    assert connection.send.await_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("buffered", [False, True])
+@pytest.mark.parametrize(
+    "message_type",
+    [
+        MessageType.NICK_AUTH_CHALLENGE,
+        MessageType.NICK_AUTH_PROOF,
+        MessageType.NICK_AUTH_RESULT,
+    ],
+)
+async def test_nick_auth_message_after_handshake_closes_connection(
+    message_type: MessageType,
+    buffered: bool,
+) -> None:
+    message = {"type": message_type.value, "line": {}}
+    connection = AsyncMock()
+    connection.is_connected = Mock(return_value=True)
+    connection.receive.return_value = json.dumps(message).encode()
+    client = DirectoryClient("directory-a", 5222, "regtest")
+    client.connection = connection
+    client.directory_nick_authenticated = True
+    if buffered:
+        await client._message_buffer.put(message)
+
+    with pytest.raises(DirectoryClientError, match="Out-of-order nick authentication"):
+        await client.listen_for_messages(duration=0.01)
+
+    connection.close.assert_awaited_once()
+    assert client.connection is None
+    assert client.directory_nick_authenticated is False
+
+
+@pytest.mark.asyncio
+async def test_close_clears_authentication_state_when_transport_close_fails() -> None:
+    connection = AsyncMock()
+    connection.close.side_effect = ConnectionResetError("already closed")
+    client = DirectoryClient("directory-a", 5222, "regtest")
+    client.connection = connection
+    client.directory_nick_authenticated = True
+
+    with pytest.raises(ConnectionResetError, match="already closed"):
+        await client.close()
+
+    assert client.connection is None
+    assert client.directory_nick_authenticated is False
 
 
 @pytest.mark.asyncio

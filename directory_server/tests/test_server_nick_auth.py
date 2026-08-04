@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Callable
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from jmcore.crypto import NickIdentity
@@ -16,6 +16,7 @@ from jmcore.nick_auth import (
     create_nick_auth_proof,
 )
 from jmcore.protocol import FEATURE_NICK_AUTH, JM_VERSION, MessageType
+from jmcore.rate_limiter import RateLimitAction
 from jmcore.settings import DirectoryServerSettings
 
 from directory_server.handshake_handler import HandshakeHandler
@@ -327,12 +328,18 @@ async def test_duplicate_outer_proof_keys_are_malformed() -> None:
 
 
 @pytest.mark.anyio
-async def test_challenge_type_is_rejected_before_parsing_proof_payload() -> None:
+@pytest.mark.parametrize(
+    "message_type",
+    [MessageType.NICK_AUTH_CHALLENGE, MessageType.NICK_AUTH_RESULT],
+)
+async def test_out_of_order_type_is_rejected_before_parsing_proof_payload(
+    message_type: MessageType,
+) -> None:
     server = _server()
     identity = NickIdentity()
     line = _handshake_line(identity, advertise_auth=True)
     wrong_direction = MessageEnvelope(
-        message_type=MessageType.NICK_AUTH_CHALLENGE,
+        message_type=message_type,
         payload="not a proof payload",
     ).to_bytes()
     connection = ScriptedConnection([_handshake_envelope(line), wrong_direction])
@@ -344,6 +351,57 @@ async def test_challenge_type_is_rejected_before_parsing_proof_payload() -> None
     result = NickAuthResult.parse(_sent_envelopes(connection)[-1].payload)
     assert peer_key is None
     assert result.code == "malformed"
+
+
+@pytest.mark.anyio
+async def test_nick_auth_proof_before_handshake_is_rejected() -> None:
+    server = _server()
+    connection = ScriptedConnection(
+        [MessageEnvelope(message_type=MessageType.NICK_AUTH_PROOF, payload="{}").to_bytes()]
+    )
+
+    peer_key = await server._perform_handshake(connection, "proof-before-handshake")  # type: ignore[arg-type]
+
+    assert peer_key is None
+    assert server.peer_registry.count() == 0
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "message_type",
+    [
+        MessageType.NICK_AUTH_CHALLENGE,
+        MessageType.NICK_AUTH_PROOF,
+        MessageType.NICK_AUTH_RESULT,
+    ],
+)
+async def test_nick_auth_message_after_handshake_is_not_routed(
+    message_type: MessageType,
+) -> None:
+    server = _server()
+    identity = NickIdentity()
+    line = _handshake_line(identity, advertise_auth=True)
+
+    def create_proof(challenge: NickAuthChallenge) -> NickAuthProof:
+        return create_nick_auth_proof(identity, challenge.challenge, DIRECTORY_ID, line)
+
+    connection = ScriptedConnection([_handshake_envelope(line)], create_proof)
+    peer_key = await server._perform_handshake(connection, "late-auth")  # type: ignore[arg-type]
+    assert peer_key == identity.nick
+    connection.received.append(MessageEnvelope(message_type=message_type, payload="{}").to_bytes())
+
+    with (
+        patch.object(
+            server.rate_limiter,
+            "check",
+            return_value=(RateLimitAction.DELAY, 1.0),
+        ) as check_rate_limit,
+        patch.object(server.message_router, "route_message", new_callable=AsyncMock) as route,
+    ):
+        await server._handle_peer_messages(connection, "late-auth", peer_key)
+
+    check_rate_limit.assert_not_called()
+    route.assert_not_awaited()
 
 
 @pytest.mark.anyio

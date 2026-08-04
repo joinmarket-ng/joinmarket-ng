@@ -76,6 +76,15 @@ class DirectoryClientError(Exception):
     """Error raised by DirectoryClient operations."""
 
 
+_NICK_AUTH_MESSAGE_TYPES = frozenset(
+    {
+        MessageType.NICK_AUTH_CHALLENGE.value,
+        MessageType.NICK_AUTH_PROOF.value,
+        MessageType.NICK_AUTH_RESULT.value,
+    }
+)
+
+
 def _fidelity_bond_claim_key(bond_data: dict[str, Any]) -> str:
     return (
         f"{bond_data['utxo_txid']}:{bond_data['utxo_vout']}:"
@@ -542,6 +551,12 @@ class DirectoryClient:
 
         self.directory_nick_authenticated = True
 
+    async def _reject_out_of_order_nick_auth(self, message_type: object) -> None:
+        if message_type not in _NICK_AUTH_MESSAGE_TYPES:
+            return
+        await self.close()
+        raise DirectoryClientError(f"Out-of-order nick authentication message type: {message_type}")
+
     async def get_peerlist(self) -> list[str] | None:
         """
         Fetch the current list of connected peers.
@@ -707,6 +722,7 @@ class DirectoryClient:
                     )
                     response = json.loads(response_data.decode("utf-8"))
                     msg_type = response.get("type")
+                    await self._reject_out_of_order_nick_auth(msg_type)
                     consecutive_errors = 0
 
                     if msg_type == MessageType.PEERLIST.value:
@@ -927,6 +943,7 @@ class DirectoryClient:
         while not self._message_buffer.empty():
             try:
                 buffered_msg = self._message_buffer.get_nowait()
+                await self._reject_out_of_order_nick_auth(buffered_msg.get("type"))
                 logger.trace(
                     f"Processing buffered message type {buffered_msg.get('type')}: "
                     f"{buffered_msg.get('line', '')[:80]}..."
@@ -949,6 +966,7 @@ class DirectoryClient:
                     self.connection.receive(), timeout=remaining_time
                 )
                 response = json.loads(response_data.decode("utf-8"))
+                await self._reject_out_of_order_nick_auth(response.get("type"))
                 logger.trace(
                     f"Received message type {response.get('type')}: "
                     f"{response.get('line', '')[:80]}..."
@@ -969,6 +987,8 @@ class DirectoryClient:
             except NetworkConnectionError as e:
                 # Connection-level errors from our network layer - always propagate
                 raise DirectoryClientError(f"Connection lost: {e}") from e
+            except DirectoryClientError:
+                raise
             except (ConnectionResetError, BrokenPipeError, OSError) as e:
                 # System-level connection errors that bypassed our network layer
                 raise DirectoryClientError(f"Connection lost: {e}") from e
@@ -1242,16 +1262,16 @@ class DirectoryClient:
 
     async def close(self) -> None:
         """Close the connection to the directory server."""
-        if self.connection:
+        connection = self.connection
+        if connection:
             try:
-                # NOTE: We skip sending DISCONNECT (801) because the reference implementation
+                # Do not send DISCONNECT (801): the reference implementation
                 # crashes on unhandled control messages.
-                pass
-            except Exception:
-                pass
+                await connection.close()
             finally:
-                await self.connection.close()
-                self.connection = None
+                if self.connection is connection:
+                    self.connection = None
+                    self.directory_nick_authenticated = False
 
     async def _send_pong(self) -> None:
         """Send a PONG response to a PING from the directory server."""
@@ -1359,6 +1379,7 @@ class DirectoryClient:
 
                     message = json.loads(data.decode("utf-8"))
                 msg_type = message.get("type")
+                await self._reject_out_of_order_nick_auth(msg_type)
                 line = message.get("line", "")
 
                 # Handle PEERLIST responses (from periodic or automatic requests)

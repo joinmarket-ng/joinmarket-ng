@@ -566,6 +566,22 @@ class DirectoryServer:
                 if not self.peer_registry.update_last_seen(peer_key, conn_id):
                     break
 
+                envelope = MessageEnvelope.from_bytes(
+                    data,
+                    max_line_length=self.settings.max_line_length,
+                    max_json_nesting_depth=self.settings.max_json_nesting_depth,
+                )
+
+                if envelope.message_type in {
+                    MessageType.NICK_AUTH_CHALLENGE,
+                    MessageType.NICK_AUTH_PROOF,
+                    MessageType.NICK_AUTH_RESULT,
+                }:
+                    logger.warning(
+                        f"Out-of-order nick authentication message from {peer_info.nick}"
+                    )
+                    break
+
                 # Rate limiting by connection ID to prevent nick spoofing attacks.
                 # A malicious peer could claim another's nick in handshake and spam
                 # to get the legitimate peer rate-limited. Using conn_id ensures
@@ -596,12 +612,6 @@ class DirectoryServer:
                         )
                     # Drop message but stay connected - this is the "slowdown" approach
                     continue
-
-                envelope = MessageEnvelope.from_bytes(
-                    data,
-                    max_line_length=self.settings.max_line_length,
-                    max_json_nesting_depth=self.settings.max_json_nesting_depth,
-                )
 
                 await self.message_router.route_message(envelope, peer_key, conn_id)
 
