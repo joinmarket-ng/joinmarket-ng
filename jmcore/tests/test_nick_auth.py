@@ -50,17 +50,15 @@ def test_modes_are_stable_string_values():
 
 
 def test_payload_models_roundtrip_wire_aliases(proof: NickAuthProof):
-    challenge = NickAuthChallenge(kind="challenge", challenge=CHALLENGE, directory_id=DIRECTORY_ID)
+    challenge = NickAuthChallenge(challenge=CHALLENGE, directory_id=DIRECTORY_ID)
     assert challenge.to_payload() == {
-        "kind": "challenge",
         "challenge": CHALLENGE,
         "directory-id": DIRECTORY_ID,
     }
     assert NickAuthChallenge.parse(challenge.to_json()) == challenge
 
     proof_payload = proof.to_payload()
-    assert "handshake-sha256" in proof_payload
-    assert "handshake_sha256" not in proof_payload
+    assert set(proof_payload) == {"pubkey", "signature"}
     assert NickAuthProof.from_payload(json.dumps(proof_payload)) == proof
 
     result = NickAuthResult(code="ok", verified=True)
@@ -70,17 +68,13 @@ def test_payload_models_roundtrip_wire_aliases(proof: NickAuthProof):
 @pytest.mark.parametrize(
     "payload",
     [
-        '{"kind":"challenge","challenge":"'
+        '{"challenge":"'
         + CHALLENGE
         + '","challenge":"'
         + CHALLENGE
         + '","directory-id":"test:directory-a"}',
-        '{"kind":"challenge","challenge":"'
-        + CHALLENGE
-        + '","directory-id":"test:directory-a","value":NaN}',
-        '{"kind":"challenge","challenge":"'
-        + CHALLENGE
-        + '","directory-id":"test:directory-a","value":Infinity}',
+        '{"challenge":"' + CHALLENGE + '","directory-id":"test:directory-a","value":NaN}',
+        '{"challenge":"' + CHALLENGE + '","directory-id":"test:directory-a","value":Infinity}',
         "[]",
     ],
 )
@@ -93,7 +87,6 @@ def test_payload_models_reject_extra_fields_and_type_coercion():
     with pytest.raises(ValidationError):
         NickAuthChallenge.from_payload(
             {
-                "kind": "challenge",
                 "challenge": CHALLENGE,
                 "directory-id": "test:directory-a",
                 "extra": "rejected",
@@ -106,12 +99,9 @@ def test_payload_models_reject_extra_fields_and_type_coercion():
     with pytest.raises(ValidationError):
         NickAuthResult(code="unknown", verified=False)
 
-    with pytest.raises(ValueError, match="missing required field"):
-        NickAuthChallenge.from_payload({"challenge": CHALLENGE, "directory-id": "test:directory-a"})
     with pytest.raises(ValueError, match="wire name"):
         NickAuthChallenge.from_payload(
             {
-                "kind": "challenge",
                 "challenge": CHALLENGE,
                 "directory_id": "test:directory-a",
             }
@@ -121,8 +111,6 @@ def test_payload_models_reject_extra_fields_and_type_coercion():
 @pytest.mark.parametrize(
     ("field", "value"),
     [
-        ("challenge", "AA" * 32),
-        ("handshake-sha256", "0" * 63),
         ("pubkey", "02" + "AA" * 32),
         ("pubkey", "04" + "11" * 32),
         ("signature", "not base64"),
@@ -199,10 +187,13 @@ def test_signed_message_is_exact_ascii_transcript(identity: NickIdentity):
 
 
 def test_create_and_verify_deterministic_proof(identity: NickIdentity, proof: NickAuthProof):
-    assert proof.challenge == CHALLENGE
-    assert (
-        proof.handshake_sha256 == "ac72075bdc7009683bd8a563dfd09c5ad7ef8c42e8040db0717a5fb3c19b7666"
-    )
+    assert proof.to_payload() == {
+        "pubkey": "034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa",
+        "signature": (
+            "MEQCIDTAF2VwsN1hK3n+Hc2iGt2xkhURfTfCiJnM4myGM6T2"
+            "AiAbXU8Kl5f16SwddktRYcl+gLHt5zS1nY7eLSi61e1g6w=="
+        ),
+    }
     assert proof.pubkey == "034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa"
     assert proof.signature == (
         "MEQCIDTAF2VwsN1hK3n+Hc2iGt2xkhURfTfCiJnM4myGM6T2"

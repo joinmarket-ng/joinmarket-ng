@@ -215,7 +215,9 @@ async def test_nick_auth_valid_challenge_proof_and_result_use_exact_wire_envelop
     connection = AsyncMock()
     connection.receive.side_effect = [
         _handshake_response(nick_auth=True),
-        json.dumps({"type": MessageType.NICK_AUTH.value, "line": challenge.to_json()}).encode(),
+        json.dumps(
+            {"type": MessageType.NICK_AUTH_CHALLENGE.value, "line": challenge.to_json()}
+        ).encode(),
         json.dumps({"type": MessageType.NICK_AUTH_RESULT.value, "line": result.to_json()}).encode(),
     ]
     client = DirectoryClient(
@@ -253,7 +255,7 @@ async def test_nick_auth_valid_challenge_proof_and_result_use_exact_wire_envelop
         identity, challenge.challenge, directory_id, expected_handshake_line
     )
     expected_proof_envelope = json.dumps(
-        {"type": MessageType.NICK_AUTH.value, "line": expected_proof.to_json()}
+        {"type": MessageType.NICK_AUTH_PROOF.value, "line": expected_proof.to_json()}
     ).encode()
     assert sent[0].args[0] == expected_handshake
     assert sent[1].args[0] == expected_proof_envelope
@@ -267,7 +269,9 @@ async def test_nick_auth_malformed_result_fails_closed() -> None:
     connection = AsyncMock()
     connection.receive.side_effect = [
         _handshake_response(nick_auth=True),
-        json.dumps({"type": MessageType.NICK_AUTH.value, "line": challenge.to_json()}).encode(),
+        json.dumps(
+            {"type": MessageType.NICK_AUTH_CHALLENGE.value, "line": challenge.to_json()}
+        ).encode(),
         json.dumps(
             {
                 "type": MessageType.NICK_AUTH_RESULT.value,
@@ -292,10 +296,9 @@ async def test_nick_auth_malformed_challenge_is_redacted_from_exception_chain() 
         _handshake_response(nick_auth=True),
         json.dumps(
             {
-                "type": MessageType.NICK_AUTH.value,
+                "type": MessageType.NICK_AUTH_CHALLENGE.value,
                 "line": json.dumps(
                     {
-                        "kind": "challenge",
                         "challenge": secret_challenge,
                         "directory-id": TEST_DIRECTORY_ID,
                     }
@@ -344,6 +347,33 @@ async def test_nick_auth_rejects_duplicate_outer_envelope_keys() -> None:
 
 
 @pytest.mark.asyncio
+async def test_nick_auth_rejects_proof_type_before_parsing_challenge_payload() -> None:
+    connection = AsyncMock()
+    connection.receive.side_effect = [
+        _handshake_response(nick_auth=True),
+        json.dumps(
+            {
+                "type": MessageType.NICK_AUTH_PROOF.value,
+                "line": "not a challenge payload",
+            }
+        ).encode(),
+    ]
+    client = DirectoryClient(
+        "directory-a", 5222, "regtest", nick_auth_directory_id=TEST_DIRECTORY_ID
+    )
+    client.connection = connection
+
+    with (
+        patch("jmcore.directory_client.NickAuthChallenge.parse") as parse_challenge,
+        pytest.raises(DirectoryClientError, match="Unexpected nick authentication challenge type"),
+    ):
+        await client._handshake()
+
+    parse_challenge.assert_not_called()
+    assert connection.send.await_count == 1
+
+
+@pytest.mark.asyncio
 async def test_nick_auth_mismatched_directory_id_fails_before_proof() -> None:
     selected_host = "a" * 56 + ".onion"
     other_host = "b" * 56 + ".onion"
@@ -354,7 +384,9 @@ async def test_nick_auth_mismatched_directory_id_fails_before_proof() -> None:
     connection = AsyncMock()
     connection.receive.side_effect = [
         _handshake_response(nick_auth=True),
-        json.dumps({"type": MessageType.NICK_AUTH.value, "line": challenge.to_json()}).encode(),
+        json.dumps(
+            {"type": MessageType.NICK_AUTH_CHALLENGE.value, "line": challenge.to_json()}
+        ).encode(),
     ]
     client = DirectoryClient(selected_host, 5222, "regtest")
     client.connection = connection
@@ -376,7 +408,9 @@ async def test_nick_auth_accepts_configured_test_id_across_forwarded_endpoint() 
     connection = AsyncMock()
     connection.receive.side_effect = [
         _handshake_response(nick_auth=True),
-        json.dumps({"type": MessageType.NICK_AUTH.value, "line": challenge.to_json()}).encode(),
+        json.dumps(
+            {"type": MessageType.NICK_AUTH_CHALLENGE.value, "line": challenge.to_json()}
+        ).encode(),
         json.dumps({"type": MessageType.NICK_AUTH_RESULT.value, "line": result.to_json()}).encode(),
     ]
     client = DirectoryClient(
@@ -423,7 +457,9 @@ async def test_nick_auth_challenge_and_result_waits_are_capped_at_30_seconds() -
     connection = AsyncMock()
     connection.receive.side_effect = [
         _handshake_response(nick_auth=True),
-        json.dumps({"type": MessageType.NICK_AUTH.value, "line": challenge.to_json()}).encode(),
+        json.dumps(
+            {"type": MessageType.NICK_AUTH_CHALLENGE.value, "line": challenge.to_json()}
+        ).encode(),
         json.dumps({"type": MessageType.NICK_AUTH_RESULT.value, "line": result.to_json()}).encode(),
     ]
     client = DirectoryClient(

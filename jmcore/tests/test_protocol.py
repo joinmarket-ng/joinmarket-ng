@@ -880,5 +880,6 @@ def test_nick_auth_protocol_allocations():
     assert FEATURE_NICK_AUTH == "nick_auth"
     assert FEATURE_NICK_AUTH in ALL_FEATURES
     assert FeatureSet(features={FEATURE_NICK_AUTH}).supports_nick_auth()
-    assert MessageType.NICK_AUTH == 803
+    assert MessageType.NICK_AUTH_CHALLENGE == 803
+    assert MessageType.NICK_AUTH_PROOF == 804
     assert MessageType.NICK_AUTH_RESULT == 805

@@ -158,8 +158,6 @@ class _NickAuthPayload(BaseModel):
         if isinstance(payload, (str, bytes)):
             return cls.parse(payload)
         data = dict(payload)
-        if "kind" in cls.model_fields and "kind" not in data:
-            raise ValueError("payload is missing required field: kind")
         for field_name, field in cls.model_fields.items():
             if field.alias is not None and field.alias != field_name and field_name in data:
                 raise ValueError(f"payload field must use wire name: {field.alias}")
@@ -173,7 +171,6 @@ class _NickAuthPayload(BaseModel):
 
 
 class NickAuthChallenge(_NickAuthPayload):
-    kind: Literal["challenge"] = "challenge"
     challenge: str
     directory_id: str = Field(alias="directory-id")
 
@@ -189,16 +186,8 @@ class NickAuthChallenge(_NickAuthPayload):
 
 
 class NickAuthProof(_NickAuthPayload):
-    kind: Literal["proof"] = "proof"
-    challenge: str
-    handshake_sha256: str = Field(alias="handshake-sha256")
     pubkey: str
     signature: str
-
-    @field_validator("challenge", "handshake_sha256")
-    @classmethod
-    def validate_hash(cls, value: str, info: Any) -> str:
-        return _validate_lower_hex_64(value, info.field_name)
 
     @field_validator("pubkey")
     @classmethod
@@ -287,9 +276,6 @@ def create_nick_auth_proof(
     )
     return NickAuthProof.from_payload(
         {
-            "kind": "proof",
-            "challenge": challenge,
-            "handshake-sha256": handshake_sha256,
             "pubkey": identity.public_key_hex,
             "signature": identity.sign_bytes(message),
         }
@@ -305,11 +291,7 @@ def verify_nick_auth_proof(
     protocol_version: int,
 ) -> bool:
     try:
-        if proof.challenge != expected_challenge:
-            return False
         handshake_sha256 = handshake_line_sha256(handshake_line)
-        if proof.handshake_sha256 != handshake_sha256:
-            return False
         if nick_from_pubkey_hex(proof.pubkey, protocol_version) != nick:
             return False
 

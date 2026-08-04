@@ -483,7 +483,7 @@ class DirectoryClient:
                 self.connection.receive(), timeout=nick_auth_timeout
             )
             challenge_envelope = parse_strict_json_object(challenge_data)
-            if challenge_envelope.get("type") != MessageType.NICK_AUTH.value:
+            if challenge_envelope.get("type") != MessageType.NICK_AUTH_CHALLENGE.value:
                 raise DirectoryClientError(
                     f"Unexpected nick authentication challenge type: "
                     f"{challenge_envelope.get('type')}"
@@ -507,7 +507,7 @@ class DirectoryClient:
                 handshake_line,
             )
             proof_envelope = {
-                "type": MessageType.NICK_AUTH.value,
+                "type": MessageType.NICK_AUTH_PROOF.value,
                 "line": proof.to_json(),
             }
             await asyncio.wait_for(

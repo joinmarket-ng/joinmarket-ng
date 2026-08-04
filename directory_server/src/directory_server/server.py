@@ -361,13 +361,12 @@ class DirectoryServer:
 
         challenge = NickAuthChallenge.from_payload(
             {
-                "kind": "challenge",
                 "challenge": secrets.token_hex(32),
                 "directory-id": directory_id,
             }
         )
         challenge_envelope = MessageEnvelope(
-            message_type=MessageType.NICK_AUTH,
+            message_type=MessageType.NICK_AUTH_CHALLENGE,
             payload=challenge.to_json(),
         )
         await asyncio.wait_for(
@@ -392,7 +391,7 @@ class DirectoryServer:
                 max_line_length=self.settings.max_line_length,
                 max_json_nesting_depth=self.settings.max_json_nesting_depth,
             )
-            if proof_envelope.message_type != MessageType.NICK_AUTH:
+            if proof_envelope.message_type != MessageType.NICK_AUTH_PROOF:
                 raise ValueError("unexpected nick authentication message type")
             proof = NickAuthProof.parse(proof_envelope.payload)
         except Exception:

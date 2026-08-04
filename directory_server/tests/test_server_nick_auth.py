@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Callable
+from unittest.mock import patch
 
 import pytest
 from jmcore.crypto import NickIdentity
@@ -40,12 +41,15 @@ class ScriptedConnection:
     async def send(self, data: bytes) -> None:
         self.sent.append(data)
         envelope = MessageEnvelope.from_bytes(data)
-        if envelope.message_type == MessageType.NICK_AUTH and self.proof_factory is not None:
+        if (
+            envelope.message_type == MessageType.NICK_AUTH_CHALLENGE
+            and self.proof_factory is not None
+        ):
             challenge = NickAuthChallenge.parse(envelope.payload)
             proof = self.proof_factory(challenge)
             self.received.append(
                 MessageEnvelope(
-                    message_type=MessageType.NICK_AUTH,
+                    message_type=MessageType.NICK_AUTH_PROOF,
                     payload=proof.to_json(),
                 ).to_bytes()
             )
@@ -197,7 +201,7 @@ async def test_valid_nick_auth_replaces_legacy_owner_and_clears_offers() -> None
     envelopes = _sent_envelopes(connection)
     assert [envelope.message_type for envelope in envelopes] == [
         MessageType.DN_HANDSHAKE,
-        MessageType.NICK_AUTH,
+        MessageType.NICK_AUTH_CHALLENGE,
         MessageType.NICK_AUTH_RESULT,
     ]
     result = NickAuthResult.parse(envelopes[-1].payload)
@@ -304,11 +308,11 @@ async def test_duplicate_outer_proof_keys_are_malformed() -> None:
     async def duplicate_proof_send(data: bytes) -> None:
         await original_send(data)
         envelope = MessageEnvelope.from_bytes(data)
-        if envelope.message_type == MessageType.NICK_AUTH:
+        if envelope.message_type == MessageType.NICK_AUTH_CHALLENGE:
             proof_envelope = MessageEnvelope.from_bytes(connection.received.pop())
             connection.received.append(
                 (
-                    '{"type":803,"type":803,"line":' + json.dumps(proof_envelope.payload) + "}"
+                    '{"type":804,"type":804,"line":' + json.dumps(proof_envelope.payload) + "}"
                 ).encode()
             )
 
@@ -320,6 +324,26 @@ async def test_duplicate_outer_proof_keys_are_malformed() -> None:
     assert peer_key is None
     assert result.code == "malformed"
     assert server.peer_registry.get_by_nick(identity.nick) is None
+
+
+@pytest.mark.anyio
+async def test_challenge_type_is_rejected_before_parsing_proof_payload() -> None:
+    server = _server()
+    identity = NickIdentity()
+    line = _handshake_line(identity, advertise_auth=True)
+    wrong_direction = MessageEnvelope(
+        message_type=MessageType.NICK_AUTH_CHALLENGE,
+        payload="not a proof payload",
+    ).to_bytes()
+    connection = ScriptedConnection([_handshake_envelope(line), wrong_direction])
+
+    with patch("directory_server.server.NickAuthProof.parse") as parse_proof:
+        peer_key = await server._perform_handshake(connection, "wrong-direction")  # type: ignore[arg-type]
+
+    parse_proof.assert_not_called()
+    result = NickAuthResult.parse(_sent_envelopes(connection)[-1].payload)
+    assert peer_key is None
+    assert result.code == "malformed"
 
 
 @pytest.mark.anyio
