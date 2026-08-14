@@ -1139,7 +1139,8 @@ class TakerSettings(BaseModel):
         description=(
             "Combine construction when combine_channel_as_change is on: 'pool' (two "
             "makers' change in one shared 2-of-2) or 'knapsack' (each maker's change "
-            "split into grid-quantized pieces at a 2-of-2 with a round-robin partner)."
+            "split into grid-quantized pieces at a 2-of-2 with a round-robin partner), "
+            "or 'lnd_ring' (pooled change funds private LND channels in a maker ring)."
         ),
     )
     channelize_taker_change: bool = Field(
@@ -1147,6 +1148,14 @@ class TakerSettings(BaseModel):
         description=(
             "Also emit the taker's own change as a maker-taker 2-of-2 channel-funding "
             "output, so it has no chaining successor. Requires combine_channel_as_change."
+        ),
+    )
+    ring_min_channel_sats: int = Field(
+        default=200_000,
+        ge=1,
+        description=(
+            "Minimum pooled channel size in sats for combine_mode='lnd_ring'. Makers "
+            "whose change is below this threshold retain a plain change output."
         ),
     )
 

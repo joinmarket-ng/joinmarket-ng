@@ -515,9 +515,11 @@
 # outputs that pool their change, so no per-maker change output reveals an exact
 # residual. A plain CoinJoin is byte-identical to today when this is off.
 # combine_channel_as_change = false
-# combine_mode = "pool"            # "pool" (two makers -> one shared 2-of-2) or
-#                                  # "knapsack" (grid-quantized pieces, round-robin)
+# combine_mode = "pool"            # "pool" (two makers -> one shared 2-of-2),
+#                                  # "knapsack" (grid-quantized pieces, round-robin), or
+#                                  # "lnd_ring" (pooled private LND channels in a ring)
 # channelize_taker_change = false  # also channelize the taker's own change (maker-taker)
+# ring_min_channel_sats = 200000   # minimum pooled channel size for "lnd_ring"
 
 # ============================================================================
 # Tumbler Settings

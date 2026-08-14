@@ -200,16 +200,19 @@ class TestBuildTakerConfig:
         assert cfg.combine_channel_as_change is False
         assert cfg.combine_mode == "pool"
         assert cfg.channelize_taker_change is False
+        assert cfg.ring_min_channel_sats == 200_000
 
         settings.taker.combine_channel_as_change = True
-        settings.taker.combine_mode = "knapsack"
+        settings.taker.combine_mode = "lnd_ring"
         settings.taker.channelize_taker_change = True
+        settings.taker.ring_min_channel_sats = 350_000
         cfg2 = build_taker_config(
             settings=settings, mnemonic=sample_mnemonic, passphrase="", mixdepth=0
         )
         assert cfg2.combine_channel_as_change is True
-        assert cfg2.combine_mode == "knapsack"
+        assert cfg2.combine_mode == "lnd_ring"
         assert cfg2.channelize_taker_change is True
+        assert cfg2.ring_min_channel_sats == 350_000
 
     def test_combine_mode_rejects_unknown_value(self, sample_mnemonic: str) -> None:
         """A typo in combine_mode must fail loudly, not silently fall back to pool."""
