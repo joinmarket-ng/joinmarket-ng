@@ -27,6 +27,8 @@ from jmswap.errors import LightningError
 
 
 class ExternalFundingLightning(Protocol):
+    requires_pre_signing_funding_completion: bool
+
     async def open_channel_external_funding(
         self,
         node_pubkey: str,
@@ -46,6 +48,8 @@ class ExternalFundingLightning(Protocol):
         input_utxos: list[tuple[int, bytes]] | None = None,
     ) -> None: ...
 
+    async def cancel_external_channel_funding(self, user_channel_id: str) -> None: ...
+
 
 async def request_external_channel_funding(
     ldk: ExternalFundingLightning,
@@ -54,6 +58,7 @@ async def request_external_channel_funding(
     amount_sats: int,
     network: str = "mainnet",
     *,
+    push_to_counterparty_msat: int | None = None,
     poll_interval: float = 1.0,
     timeout: float = 60.0,
 ) -> tuple[str, str]:
@@ -62,8 +67,19 @@ async def request_external_channel_funding(
     Place an output paying ``address`` (worth exactly ``amount_sats``) in the
     CoinJoin, broadcast it, then call :func:`complete_external_channel_funding`.
     """
+    if push_to_counterparty_msat is not None and (
+        push_to_counterparty_msat < 0
+        or push_to_counterparty_msat % 1000
+        or push_to_counterparty_msat >= amount_sats * 1000
+    ):
+        raise LightningError(
+            "channel push must be a non-negative whole-satoshi amount below capacity"
+        )
     user_channel_id = await ldk.open_channel_external_funding(
-        peer_node_id, peer_address, amount_sats
+        peer_node_id,
+        peer_address,
+        amount_sats,
+        push_to_counterparty_msat=push_to_counterparty_msat,
     )
     deadline = asyncio.get_event_loop().time() + timeout
     while asyncio.get_event_loop().time() < deadline:

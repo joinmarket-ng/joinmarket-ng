@@ -121,3 +121,58 @@ def test_verifier_rejects_combined_tx_without_combine_info() -> None:
     )
     assert not ok
     assert "Change address appears 0 times" in err
+
+
+def _verify_ring(tx_hex: str, ring_outputs: list[tuple[str, int]]) -> tuple[bool, str]:
+    return verify_unsigned_transaction(
+        tx_hex=tx_hex,
+        our_utxos={("a" * 64, 0): _utxo("a" * 64, 1_500_000)},
+        cj_address=_addr(0x03),
+        change_address=_addr(0x04),
+        amount=1_000_000,
+        cjfee=1_000,
+        txfee=0,
+        offer_type=OfferType.SW0_ABSOLUTE,
+        network=NetworkType.REGTEST,
+        ring_outputs=ring_outputs,
+    )
+
+
+def test_ring_verifier_requires_distinct_strictly_cofunded_outputs() -> None:
+    """Ring relays cannot reuse an address or disguise a maker-only output as pooled."""
+    from jmcore.bitcoin import TxInput, TxOutput, address_to_scriptpubkey, serialize_transaction
+
+    address_a = _addr(0x31)
+    address_b = _addr(0x32)
+    ring = [(address_a, 250_000), (address_b, 251_000)]
+    tx_hex = serialize_transaction(
+        2,
+        [TxInput.from_hex("a" * 64, 0)],
+        [
+            TxOutput(value=1_000_000, script=address_to_scriptpubkey(_addr(0x03))),
+            TxOutput(value=400_000, script=address_to_scriptpubkey(address_a)),
+            TxOutput(value=400_000, script=address_to_scriptpubkey(address_b)),
+        ],
+        0,
+    ).hex()
+
+    ok, err = _verify_ring(tx_hex, ring)
+    assert ok, err
+
+    duplicate_ok, duplicate_err = _verify_ring(tx_hex, [(address_a, 250_000), (address_a, 251_000)])
+    assert duplicate_ok is False
+    assert "duplicate output addresses" in duplicate_err
+
+    maker_only_tx = serialize_transaction(
+        2,
+        [TxInput.from_hex("a" * 64, 0)],
+        [
+            TxOutput(value=1_000_000, script=address_to_scriptpubkey(_addr(0x03))),
+            TxOutput(value=250_000, script=address_to_scriptpubkey(address_a)),
+            TxOutput(value=400_000, script=address_to_scriptpubkey(address_b)),
+        ],
+        0,
+    ).hex()
+    maker_only_ok, maker_only_err = _verify_ring(maker_only_tx, ring)
+    assert maker_only_ok is False
+    assert "does not include partner funding" in maker_only_err

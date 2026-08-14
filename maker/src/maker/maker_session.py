@@ -452,11 +452,10 @@ class MakerSession:
     async def on_chanreq(self, bot: MakerBotProtocol, msg: str, source: str) -> None:
         """Handle a true-pooling ring channel-open request from the taker.
 
-        Format (encrypted): ``<partner_node_id@host:port> <capacity_sats>``. The maker
-        opens a real Lightning channel of that capacity to the assigned ring partner and
-        replies ``chanaddr`` with the funding address, which the taker places (co-funded
-        with the partner's contribution) as a shared output in the CoinJoin. Failures
-        reply ``chanaddr`` with an empty address so the taker falls back to plain change.
+        Format (encrypted): ``<partner_node_id@host:port> <capacity_sats> <push_msat>``.
+        The push allocates the partner's on-chain contribution as remote channel balance.
+        The maker replies ``chanaddr`` with the funding address, which the taker places as
+        a shared output in the CoinJoin. Failures return an empty address for fallback.
         """
         address = ""
         try:
@@ -466,9 +465,18 @@ class MakerSession:
                 logger.error("invalid chanreq: missing encrypted payload")
             else:
                 decrypted = self.crypto.decrypt(parts[1])
-                peer, capacity_str = decrypted.rsplit(" ", 1)
+                request_parts = decrypted.split()
+                if len(request_parts) != 3:
+                    raise ValueError("chanreq payload must contain peer, capacity, and push")
+                peer, capacity_str, push_str = request_parts
+                push_msat = int(push_str)
+                capacity = int(capacity_str)
+                if push_msat <= 0 or push_msat % 1000 or push_msat >= capacity * 1000:
+                    raise ValueError("chanreq push must be whole sats between zero and capacity")
                 logger.info(f"chanreq: opening {capacity_str} sat ring channel to {peer[:24]}")
-                addr = await self.inner.open_external_channel(peer, int(capacity_str))
+                addr = await self.inner.open_external_channel(
+                    peer, capacity, push_to_counterparty_msat=push_msat
+                )
                 address = addr or ""
                 logger.info(f"chanreq: ring channel funding address = {address or '(failed)'}")
         except Exception as e:  # noqa: BLE001 - never block the round; reply empty

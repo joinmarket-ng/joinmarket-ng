@@ -17,7 +17,7 @@ def _session(open_result: str | None) -> tuple[MakerSession, MagicMock]:
     inner = MagicMock()
     inner.taker_nick = "J5taker"
     inner.crypto.is_encrypted = True
-    inner.crypto.decrypt.return_value = "02aa@1.2.3.4:9735 500000"
+    inner.crypto.decrypt.return_value = "02aa@1.2.3.4:9735 500000 175000000"
     inner.crypto.encrypt.side_effect = lambda s: f"enc({s})"
     inner.open_external_channel = AsyncMock(return_value=open_result)
     return MakerSession(inner=inner), inner
@@ -37,7 +37,9 @@ async def test_chanreq_opens_channel_and_replies_chanaddr() -> None:
 
     await session.on_chanreq(bot, "chanreq ENC", "directory")
 
-    inner.open_external_channel.assert_awaited_once_with("02aa@1.2.3.4:9735", 500000)
+    inner.open_external_channel.assert_awaited_once_with(
+        "02aa@1.2.3.4:9735", 500000, push_to_counterparty_msat=175000000
+    )
     assert send.await_args is not None
     nick, command, content = send.await_args.args
     assert nick == "J5taker"
@@ -55,3 +57,17 @@ async def test_chanreq_open_failure_replies_empty_address() -> None:
     _, command, content = send.await_args.args
     assert command == "chanaddr"
     assert content == "enc()"  # empty address -> taker falls back to plain change
+
+
+async def test_chanreq_without_remote_push_is_rejected() -> None:
+    session, inner = _session("bcrt1ptaprootfunding")
+    inner.crypto.decrypt.return_value = "02aa@1.2.3.4:9735 500000"
+    bot, send = _bot()
+
+    await session.on_chanreq(bot, "chanreq ENC", "directory")
+
+    inner.open_external_channel.assert_not_awaited()
+    assert send.await_args is not None
+    _, command, content = send.await_args.args
+    assert command == "chanaddr"
+    assert content == "enc()"

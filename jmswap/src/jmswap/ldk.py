@@ -207,6 +207,8 @@ class HttpxLdkTransport(LdkTransport):
 class LdkServerBackend(LightningBackend):
     """A swap Lightning backend backed by an LDK Server node."""
 
+    requires_pre_signing_funding_completion = False
+
     def __init__(self, transport: LdkTransport, api_key: str) -> None:
         self._transport = transport
         self._api_key = api_key
@@ -364,6 +366,9 @@ class LdkServerBackend(LightningBackend):
         """
         req = f_str(1, user_channel_id) + f_str(2, funding_txid) + f_uint(3, funding_vout)
         await self._call("ProvideFundingOutpoint", req)
+
+    async def cancel_external_channel_funding(self, user_channel_id: str) -> None:
+        """LDK's external-funding API has no pending-open cancellation RPC."""
 
     async def decode_invoice(self, invoice: str) -> DecodedInvoice:
         parsed = await self._call("DecodeInvoice", f_str(1, invoice))

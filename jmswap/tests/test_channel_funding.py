@@ -16,7 +16,7 @@ FUNDING_SPK = create_p2tr_scriptpubkey(b"\x05" * 32)
 
 class _FakeLdk:
     def __init__(self, ready_after: int = 1, value: int = 1_000_000) -> None:
-        self.opened: tuple[str, str, int] | None = None
+        self.opened: tuple[str, str, int, int | None] | None = None
         self.calls = 0
         self.ready_after = ready_after
         self.value = value
@@ -25,7 +25,12 @@ class _FakeLdk:
     async def open_channel_external_funding(
         self, node_pubkey, address, channel_amount_sats, push_to_counterparty_msat=None
     ):
-        self.opened = (node_pubkey, address, channel_amount_sats)
+        self.opened = (
+            node_pubkey,
+            address,
+            channel_amount_sats,
+            push_to_counterparty_msat,
+        )
         return "ucid-1"
 
     async def get_funding_output(self, user_channel_id):
@@ -43,11 +48,17 @@ class _FakeLdk:
 async def test_request_returns_funding_address() -> None:
     ldk = _FakeLdk(ready_after=2, value=1_000_000)
     ucid, address = await request_external_channel_funding(
-        ldk, "02" + "11" * 32, "peer:9735", 1_000_000, "regtest", poll_interval=0.001
+        ldk,
+        "02" + "11" * 32,
+        "peer:9735",
+        1_000_000,
+        "regtest",
+        push_to_counterparty_msat=250_000_000,
+        poll_interval=0.001,
     )
     assert ucid == "ucid-1"
     assert address == scriptpubkey_to_address(FUNDING_SPK, "regtest")
-    assert ldk.opened == ("02" + "11" * 32, "peer:9735", 1_000_000)
+    assert ldk.opened == ("02" + "11" * 32, "peer:9735", 1_000_000, 250_000_000)
 
 
 async def test_request_rejects_value_mismatch() -> None:
@@ -56,6 +67,20 @@ async def test_request_rejects_value_mismatch() -> None:
         await request_external_channel_funding(
             ldk, "02" + "11" * 32, "peer:9735", 1_000_000, "regtest", poll_interval=0.001
         )
+
+
+async def test_request_rejects_invalid_remote_push() -> None:
+    ldk = _FakeLdk()
+    with pytest.raises(LightningError, match="push"):
+        await request_external_channel_funding(
+            ldk,
+            "02" + "11" * 32,
+            "peer:9735",
+            1_000_000,
+            "regtest",
+            push_to_counterparty_msat=1,
+        )
+    assert ldk.opened is None
 
 
 async def test_request_times_out() -> None:

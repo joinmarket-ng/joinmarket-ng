@@ -21,7 +21,7 @@ from __future__ import annotations
 import os
 import secrets
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, ClassVar
 
 from jmcore.bitcoin import (
     TxOutput,
@@ -84,6 +84,8 @@ class _PendingOpen:
 @dataclass
 class LndBackend:
     """Minimal LND gRPC client for taproot channel-as-change via PSBT funding."""
+
+    requires_pre_signing_funding_completion: ClassVar[bool] = True
 
     host: str  # 'host:port' of the LND gRPC listener
     tls_cert: bytes
@@ -160,22 +162,24 @@ class LndBackend:
 
         ``address`` is the peer's ``host:port`` (the channel counterparty). The returned
         id keys the in-flight open for :meth:`get_funding_output` /
-        :meth:`provide_funding_outpoint`. A requested push is ignored (taproot channels
-        cannot push at open in standalone LND); rebalance after the channel is active.
+        :meth:`provide_funding_outpoint`. ``push_to_counterparty_msat`` allocates the
+        peer's contribution as its initial remote balance.
         """
         self._ensure()
         from jmswap.lndrpc import lightning_pb2 as ln
 
-        if push_to_counterparty_msat:
-            logger.warning(
-                "LND taproot channels cannot push at open; ignoring "
-                f"{push_to_counterparty_msat} msat push (rebalance post-open instead)"
-            )
+        push_msat = push_to_counterparty_msat or 0
+        if push_msat < 0 or push_msat % 1000:
+            raise ValueError("LND channel push must be a non-negative whole-satoshi amount")
+        push_sat = push_msat // 1000
+        if push_sat >= channel_amount_sats:
+            raise ValueError("LND channel push must be less than the channel capacity")
         await self.connect_peer(node_pubkey, address)
         pending = secrets.token_bytes(32)
         req = ln.OpenChannelRequest(
             node_pubkey=bytes.fromhex(node_pubkey),
             local_funding_amount=channel_amount_sats,
+            push_sat=push_sat,
             commitment_type=ln.CommitmentType.SIMPLE_TAPROOT,
             private=True,  # LND requires taproot channels to be unannounced
             funding_shim=ln.FundingShim(
@@ -245,3 +249,19 @@ class LndBackend:
             f"LND channel point pinned at {funding_txid}:{funding_vout} "
             f"(ucid={user_channel_id[:12]}); awaiting on-chain confirmation"
         )
+
+    async def cancel_external_channel_funding(self, user_channel_id: str) -> None:
+        """Cancel an in-flight PSBT funding shim after the CoinJoin is rejected."""
+        pending = self._pending.get(user_channel_id)
+        if pending is None:
+            return
+        self._ensure()
+        from jmswap.lndrpc import lightning_pb2 as ln
+
+        await self._stub.FundingStateStep(
+            ln.FundingTransitionMsg(
+                shim_cancel=ln.FundingShimCancel(pending_chan_id=pending.pending_chan_id)
+            )
+        )
+        del self._pending[user_channel_id]
+        logger.info(f"Cancelled LND channel funding shim (ucid={user_channel_id[:12]})")

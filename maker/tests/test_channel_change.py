@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 from jmcore.bitcoin import get_address_type
@@ -143,13 +144,18 @@ class _FakeLdk:
 
     def __init__(self, funding_spk: bytes) -> None:
         self.funding_spk = funding_spk
-        self.opened: tuple[str, str, int] | None = None
+        self.opened: tuple[str, str, int, int | None] | None = None
         self.completed: tuple[str, str, int] | None = None
 
     async def open_channel_external_funding(
         self, node_pubkey, address, channel_amount_sats, push_to_counterparty_msat=None
     ):
-        self.opened = (node_pubkey, address, channel_amount_sats)
+        self.opened = (
+            node_pubkey,
+            address,
+            channel_amount_sats,
+            push_to_counterparty_msat,
+        )
         return "ucid-7"
 
     async def get_funding_output(self, user_channel_id):
@@ -194,7 +200,7 @@ async def test_session_channel_change_opens_real_channel(wallet: WalletService) 
     from jmcore.bitcoin import scriptpubkey_to_address
 
     assert addr == scriptpubkey_to_address(funding_spk, "regtest")
-    assert ldk.opened == ("02deadbeef", "1.2.3.4:9735", 250_000)
+    assert ldk.opened == ("02deadbeef", "1.2.3.4:9735", 250_000, None)
     assert session._channel_user_id == "ucid-7"
     assert session._channel_funding_spk == funding_spk
 
@@ -207,3 +213,205 @@ async def test_session_channel_change_opens_real_channel(wallet: WalletService) 
     tx_hex = serialize_transaction(2, [tx_in], outs, 0).hex()
     await session._complete_channel_change(tx_hex)
     assert ldk.completed == ("ucid-7", get_txid(tx_hex), 1)
+
+
+async def test_lnd_funding_failure_refuses_to_sign(
+    wallet: WalletService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A maker must not sign a CoinJoin that LND failed to pin to its channel."""
+    from jmcore.bitcoin import create_p2tr_scriptpubkey, scriptpubkey_to_address
+    from jmcore.models import Offer, OfferType
+
+    from maker.coinjoin import CoinJoinSession, CoinJoinState
+
+    class _FakeLnd:
+        requires_pre_signing_funding_completion = True
+
+        def __init__(self) -> None:
+            self.cancel_external_channel_funding = AsyncMock()
+
+    backend = _FakeLnd()
+    offer = Offer(
+        counterparty="x",
+        oid=0,
+        ordertype=OfferType.SW0_RELATIVE,
+        minsize=1,
+        maxsize=10_000_000,
+        txfee=0,
+        cjfee="0.0001",
+    )
+    session = CoinJoinSession(
+        taker_nick="t", offer=offer, wallet=wallet, backend=wallet.backend, ldk=backend
+    )
+    session.state = CoinJoinState.IOAUTH_SENT
+    session._channel_user_id = "pending-channel"
+    session._channel_funding_spk = create_p2tr_scriptpubkey(b"\x40" * 32)
+    session.change_address = scriptpubkey_to_address(session._channel_funding_spk, "regtest")
+    complete = AsyncMock(side_effect=RuntimeError("LND rejected PSBT"))
+    sign = AsyncMock(return_value=["signature"])
+    monkeypatch.setattr(session, "_complete_channel_change", complete)
+    monkeypatch.setattr(session, "_sign_transaction", sign)
+    monkeypatch.setattr("maker.coinjoin.verify_unsigned_transaction", lambda **_kwargs: (True, ""))
+
+    success, response = await session.handle_tx("00")
+
+    assert success is False
+    assert response == {"error": "channel-as-change funding verification failed"}
+    assert session.state == CoinJoinState.FAILED
+    complete.assert_awaited_once_with("00")
+    sign.assert_not_awaited()
+    backend.cancel_external_channel_funding.assert_awaited_once_with("pending-channel")
+
+
+async def test_lnd_signing_failure_cancels_verified_funding(
+    wallet: WalletService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A PSBT shim must be cancelled when local input signing subsequently fails."""
+    from jmcore.bitcoin import create_p2tr_scriptpubkey, scriptpubkey_to_address
+    from jmcore.models import Offer, OfferType
+
+    from maker.coinjoin import CoinJoinSession, CoinJoinState
+
+    class _FakeLnd:
+        requires_pre_signing_funding_completion = True
+
+        def __init__(self) -> None:
+            self.cancel_external_channel_funding = AsyncMock()
+
+    backend = _FakeLnd()
+    offer = Offer(
+        counterparty="x",
+        oid=0,
+        ordertype=OfferType.SW0_RELATIVE,
+        minsize=1,
+        maxsize=10_000_000,
+        txfee=0,
+        cjfee="0.0001",
+    )
+    session = CoinJoinSession(
+        taker_nick="t", offer=offer, wallet=wallet, backend=wallet.backend, ldk=backend
+    )
+    session.state = CoinJoinState.IOAUTH_SENT
+    session._channel_user_id = "pending-channel"
+    session._channel_funding_spk = create_p2tr_scriptpubkey(b"\x41" * 32)
+    session.change_address = scriptpubkey_to_address(session._channel_funding_spk, "regtest")
+    complete = AsyncMock()
+    monkeypatch.setattr(session, "_complete_channel_change", complete)
+    monkeypatch.setattr(session, "_sign_transaction", AsyncMock(return_value=[]))
+    monkeypatch.setattr("maker.coinjoin.verify_unsigned_transaction", lambda **_kwargs: (True, ""))
+
+    success, response = await session.handle_tx("00")
+
+    assert success is False
+    assert response == {"error": "Failed to sign transaction"}
+    complete.assert_awaited_once_with("00")
+    backend.cancel_external_channel_funding.assert_awaited_once_with("pending-channel")
+
+
+async def test_failed_ring_plan_cancels_channel_and_signs_plain_change(
+    wallet: WalletService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A taker ring fallback must not leave the maker trying to pin an absent output."""
+    from jmcore.bitcoin import TxInput, TxOutput, create_p2tr_scriptpubkey, serialize_transaction
+    from jmcore.models import Offer, OfferType
+
+    from maker.coinjoin import CoinJoinSession, CoinJoinState
+
+    class _FakeLnd:
+        requires_pre_signing_funding_completion = True
+
+        def __init__(self) -> None:
+            self.cancel_external_channel_funding = AsyncMock()
+
+    backend = _FakeLnd()
+    offer = Offer(
+        counterparty="x",
+        oid=0,
+        ordertype=OfferType.SW0_RELATIVE,
+        minsize=1,
+        maxsize=10_000_000,
+        txfee=0,
+        cjfee="0.0001",
+    )
+    session = CoinJoinSession(
+        taker_nick="t", offer=offer, wallet=wallet, backend=wallet.backend, ldk=backend
+    )
+    session.state = CoinJoinState.IOAUTH_SENT
+    session.change_address = wallet.get_change_address(0, 0)
+    session._channel_user_id = "unused-ring-channel"
+    session._channel_funding_spk = create_p2tr_scriptpubkey(b"\x42" * 32)
+    sign = AsyncMock(return_value=["signature"])
+    monkeypatch.setattr(session, "_sign_transaction", sign)
+    monkeypatch.setattr("maker.coinjoin.verify_unsigned_transaction", lambda **_kwargs: (True, ""))
+    tx_hex = serialize_transaction(
+        2,
+        [TxInput.from_hex("ab" * 32, 0)],
+        [TxOutput(value=100_000, script=create_p2tr_scriptpubkey(b"\x43" * 32))],
+        0,
+    ).hex()
+
+    success, response = await session.handle_tx(tx_hex)
+
+    assert success is True
+    assert response["signatures"] == ["signature"]
+    assert session.state == CoinJoinState.SIG_SENT
+    sign.assert_awaited_once_with(tx_hex)
+    backend.cancel_external_channel_funding.assert_awaited_once_with("unused-ring-channel")
+    assert session._channel_user_id is None
+    assert session._channel_funding_spk is None
+
+
+async def test_ring_relay_must_match_requested_channel_push(
+    wallet: WalletService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The relayed own share must equal capacity minus the irrevocable remote push."""
+    from jmcore.bitcoin import create_p2tr_scriptpubkey, scriptpubkey_to_address
+    from jmcore.models import Offer, OfferType
+
+    from maker.coinjoin import CoinJoinSession, CoinJoinState
+
+    class _FakeLnd:
+        requires_pre_signing_funding_completion = True
+
+        def __init__(self) -> None:
+            self.cancel_external_channel_funding = AsyncMock()
+
+    backend = _FakeLnd()
+    session = CoinJoinSession(
+        taker_nick="t",
+        offer=Offer(
+            counterparty="x",
+            oid=0,
+            ordertype=OfferType.SW0_RELATIVE,
+            minsize=1,
+            maxsize=10_000_000,
+            txfee=0,
+            cjfee="0.0001",
+        ),
+        wallet=wallet,
+        backend=wallet.backend,
+        ldk=backend,
+    )
+    session.state = CoinJoinState.IOAUTH_SENT
+    session._channel_user_id = "ring-channel"
+    session._channel_funding_spk = create_p2tr_scriptpubkey(b"\x44" * 32)
+    session._channel_capacity = 500_000
+    session._channel_push_msat = 175_000_000
+    funding_address = scriptpubkey_to_address(session._channel_funding_spk, "regtest")
+    sign = AsyncMock(return_value=["signature"])
+    monkeypatch.setattr(session, "_sign_transaction", sign)
+
+    success, response = await session.handle_tx(
+        "00", ring=[(funding_address, 300_000), (_addr_for_test(0x45), 201_000)]
+    )
+
+    assert success is False
+    assert response == {"error": "ring relay channel allocation mismatch"}
+    sign.assert_not_awaited()
+    backend.cancel_external_channel_funding.assert_awaited_once_with("ring-channel")
+
+
+def _addr_for_test(byte: int) -> str:
+    from jmcore.bitcoin import create_p2tr_scriptpubkey, scriptpubkey_to_address
+
+    return scriptpubkey_to_address(create_p2tr_scriptpubkey(bytes([byte]) * 32), "regtest")

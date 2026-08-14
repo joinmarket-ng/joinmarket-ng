@@ -1370,7 +1370,7 @@ class CoinJoinSession:
             if funder.crypto is None:
                 logger.warning(f"LND ring: no crypto for {ch.party_a}; using plain change")
                 return
-            enc = funder.crypto.encrypt(f"{ln_of[ch.party_b]} {ch.value}")
+            enc = funder.crypto.encrypt(f"{ln_of[ch.party_b]} {ch.value} {ch.contrib_b * 1000}")
             await self.directory_client.send_privmsg(
                 ch.party_a, "chanreq", enc, log_routing=True, force_channel=funder.comm_channel
             )

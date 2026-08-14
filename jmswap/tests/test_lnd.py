@@ -86,13 +86,16 @@ async def test_open_uses_simple_taproot_private_psbt_shim() -> None:
     backend = LndBackend(host="x", tls_cert=b"", macaroon_hex="")
     backend._stub = _FakeStub()
     node = "02" + "ab" * 32
-    ucid = await backend.open_channel_external_funding(node, "127.0.0.1:9836", 1_500_000)
+    ucid = await backend.open_channel_external_funding(
+        node, "127.0.0.1:9836", 1_500_000, push_to_counterparty_msat=400_000_000
+    )
 
     req = backend._stub.open_request
     assert req is not None
     assert req.commitment_type == ln.CommitmentType.SIMPLE_TAPROOT
     assert req.private is True
     assert req.local_funding_amount == 1_500_000
+    assert req.push_sat == 400_000
     assert req.funding_shim.psbt_shim.no_publish is True
     assert req.funding_shim.psbt_shim.pending_chan_id == bytes.fromhex(ucid)
 
@@ -100,6 +103,20 @@ async def test_open_uses_simple_taproot_private_psbt_shim() -> None:
     assert ready is True
     assert value == 1_500_000
     assert spk_hex  # address converted to a scriptpubkey
+
+
+@pytest.mark.parametrize("push_msat", [-1, 1, 1_500_000_000])
+async def test_open_rejects_invalid_push(push_msat: int) -> None:
+    backend = LndBackend(host="x", tls_cert=b"", macaroon_hex="")
+    backend._stub = _FakeStub()
+
+    with pytest.raises(ValueError, match="push"):
+        await backend.open_channel_external_funding(
+            "02" + "ab" * 32,
+            "127.0.0.1:9836",
+            1_500_000,
+            push_to_counterparty_msat=push_msat,
+        )
 
 
 async def test_provide_funding_outpoint_verifies_with_skip_finalize() -> None:
@@ -128,3 +145,18 @@ async def test_provide_funding_outpoint_requires_tx_and_utxos() -> None:
     )
     with pytest.raises(ValueError, match="raw_tx_hex"):
         await backend.provide_funding_outpoint(ucid, "ab" * 32, 0)
+
+
+async def test_cancel_external_channel_funding_cancels_pending_shim() -> None:
+    backend = LndBackend(host="x", tls_cert=b"", macaroon_hex="")
+    backend._stub = _FakeStub()
+    ucid = await backend.open_channel_external_funding(
+        "02" + "ab" * 32, "127.0.0.1:9836", 1_500_000
+    )
+
+    await backend.cancel_external_channel_funding(ucid)
+
+    steps = backend._stub.funding_steps
+    assert [s.WhichOneof("trigger") for s in steps] == ["shim_cancel"]
+    assert steps[0].shim_cancel.pending_chan_id == bytes.fromhex(ucid)
+    assert ucid not in backend._pending

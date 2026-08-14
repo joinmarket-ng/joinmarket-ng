@@ -92,6 +92,8 @@ class CoinJoinSession:
         self.ln_node = ln_node
         self._channel_user_id: str | None = None
         self._channel_funding_spk: bytes | None = None
+        self._channel_capacity: int | None = None
+        self._channel_push_msat: int = 0
         # Maker-to-maker channel-as-change (combine): the maker contributes a fresh
         # funding pubkey in !ioauth; the taker pairs two makers into one shared 2-of-2
         # output pooling their change. Verified on !tx against the relayed partner key.
@@ -583,13 +585,40 @@ class CoinJoinSession:
             if ring is not None and self._channel_funding_spk is not None:
                 from jmcore.bitcoin import address_to_scriptpubkey
 
-                funded = any(
-                    address_to_scriptpubkey(addr) == self._channel_funding_spk for addr, _ in ring
+                funded_piece = next(
+                    (
+                        (addr, contribution)
+                        for addr, contribution in ring
+                        if address_to_scriptpubkey(addr) == self._channel_funding_spk
+                    ),
+                    None,
                 )
-                if not funded:
+                if funded_piece is None:
                     logger.error("Ring relay does not include the channel we funded; refusing")
+                    await self._cancel_channel_change()
                     self.state = CoinJoinState.FAILED
                     return False, {"error": "ring relay missing our funded channel"}
+                capacity = self._channel_capacity
+                push_msat = self._channel_push_msat
+                if (
+                    capacity is None
+                    or push_msat % 1000
+                    or funded_piece[1] != capacity - push_msat // 1000
+                ):
+                    logger.error("Ring relay does not match our channel balance allocation")
+                    await self._cancel_channel_change()
+                    self.state = CoinJoinState.FAILED
+                    return False, {"error": "ring relay channel allocation mismatch"}
+
+            # A failed ring plan deliberately falls back to this maker's ordinary change
+            # address. Cancel any channel opened by chanreq before validating and signing
+            # that plain transaction. A single-maker channel change is unaffected because
+            # its advertised change address is the pending channel funding address.
+            if ring is None and self._channel_funding_spk is not None:
+                from jmcore.bitcoin import address_to_scriptpubkey
+
+                if address_to_scriptpubkey(self.change_address) != self._channel_funding_spk:
+                    await self._cancel_channel_change()
 
             is_valid, error = verify_unsigned_transaction(
                 tx_hex=tx_hex,
@@ -608,20 +637,38 @@ class CoinJoinSession:
 
             if not is_valid:
                 logger.error(f"Transaction verification FAILED: {error}")
+                await self._cancel_channel_change()
                 self.state = CoinJoinState.FAILED
                 return False, {"error": f"Transaction verification failed: {error}"}
 
             logger.info("Transaction verification PASSED ✓")
 
-            signatures = await self._sign_transaction(tx_hex)  # type: ignore[arg-type]
+            # LND must accept the assembled transaction through PsbtVerify before this
+            # maker authorizes it. Otherwise the CoinJoin could fund an output that LND
+            # has not pinned to the pending channel.
+            if self._requires_pre_signing_channel_completion():
+                try:
+                    await self._complete_channel_change(tx_hex)
+                except Exception as exc:  # noqa: BLE001 - reject before signing
+                    logger.error("channel-as-change funding verification failed: {}", exc)
+                    await self._cancel_channel_change()
+                    self.state = CoinJoinState.FAILED
+                    return False, {"error": "channel-as-change funding verification failed"}
+
+            signatures = await self._sign_transaction(tx_hex)
 
             if not signatures:
+                await self._cancel_channel_change()
                 return False, {"error": "Failed to sign transaction"}
 
             # Channel-as-change: now that we have co-signed the final transaction,
             # supply the channel funding outpoint so the channel can complete once
             # the taker broadcasts the round.
-            await self._complete_channel_change(tx_hex)
+            if not self._requires_pre_signing_channel_completion():
+                try:
+                    await self._complete_channel_change(tx_hex)
+                except Exception as exc:  # noqa: BLE001 - preserve legacy LDK behavior
+                    logger.error("channel-as-change outpoint provision failed: {}", exc)
 
             # Compute txid from the unsigned transaction for history tracking
             # The txid is computed from the non-witness data so we can calculate it now
@@ -638,6 +685,7 @@ class CoinJoinSession:
 
         except Exception as e:
             logger.error(f"Failed to handle !tx: {e}")
+            await self._cancel_channel_change()
             self.state = CoinJoinState.FAILED
             return False, {"error": str(e)}
 
@@ -803,7 +851,12 @@ class CoinJoinSession:
         change_index = self.wallet.get_next_address_index(max_mixdepth, 1)
         return self.wallet.get_change_address(max_mixdepth, change_index)
 
-    async def open_external_channel(self, peer: str, capacity: int) -> str | None:
+    async def open_external_channel(
+        self,
+        peer: str,
+        capacity: int,
+        push_to_counterparty_msat: int | None = None,
+    ) -> str | None:
         """Open an externally-funded Lightning channel of ``capacity`` sats to ``peer``.
 
         ``peer`` is ``node_id@host:port``. Returns the channel funding address (the
@@ -826,10 +879,13 @@ class CoinJoinSession:
                 peer_address,
                 capacity,
                 self.wallet.network,
+                push_to_counterparty_msat=push_to_counterparty_msat,
                 timeout=float(getattr(self, "channel_open_timeout", 45.0)),
             )
             self._channel_user_id = user_channel_id
             self._channel_funding_spk = address_to_scriptpubkey(funding_address)
+            self._channel_capacity = capacity
+            self._channel_push_msat = push_to_counterparty_msat or 0
             logger.info(
                 "channel-as-change: opened channel {} funding {} sats at {}",
                 user_channel_id,
@@ -860,32 +916,58 @@ class CoinJoinSession:
         ldk = getattr(self, "ldk", None)
         if not user_id or spk is None or ldk is None:
             return
-        try:
-            from jmcore.bitcoin import get_txid, parse_transaction
-            from jmswap.channel_funding import complete_external_channel_funding
+        from jmcore.bitcoin import get_txid, parse_transaction
+        from jmswap.channel_funding import complete_external_channel_funding
 
-            tx = parse_transaction(tx_hex)
-            vout = next(i for i, o in enumerate(tx.outputs) if o.script == spk)
-            txid = get_txid(tx_hex)
-            # Per-input prevouts are only needed by the LND (PSBT) backend; gather them
-            # best-effort so the LDK backend (which ignores them) is unaffected.
-            input_utxos: list[tuple[int, bytes]] | None = None
-            try:
-                gathered: list[tuple[int, bytes]] = []
-                for inp in tx.inputs:
-                    prev = await self.backend.get_utxo(inp.txid, inp.vout)
-                    if prev is None:
-                        raise ValueError(f"prevout {inp.txid}:{inp.vout} not resolvable")
-                    gathered.append((prev.value, bytes.fromhex(prev.scriptpubkey)))
-                input_utxos = gathered
-            except Exception as exc:  # noqa: BLE001 - LDK does not need these
-                logger.debug("channel-as-change: input UTXO gather skipped: {}", exc)
-            await complete_external_channel_funding(
-                ldk, user_id, txid, vout, raw_tx_hex=tx_hex, input_utxos=input_utxos
+        tx = parse_transaction(tx_hex)
+        vout = next(i for i, o in enumerate(tx.outputs) if o.script == spk)
+        txid = get_txid(tx_hex)
+        # Per-input prevouts are mandatory for LND's PSBT verification but unused by LDK.
+        input_utxos: list[tuple[int, bytes]] | None = None
+        try:
+            gathered: list[tuple[int, bytes]] = []
+            for inp in tx.inputs:
+                prev = await self.backend.get_utxo(inp.txid, inp.vout)
+                if prev is None:
+                    raise ValueError(f"prevout {inp.txid}:{inp.vout} not resolvable")
+                gathered.append((prev.value, bytes.fromhex(prev.scriptpubkey)))
+            input_utxos = gathered
+        except Exception as exc:  # noqa: BLE001 - LDK does not need these
+            logger.debug("channel-as-change: input UTXO gather skipped: {}", exc)
+        await complete_external_channel_funding(
+            ldk, user_id, txid, vout, raw_tx_hex=tx_hex, input_utxos=input_utxos
+        )
+        logger.info("channel-as-change: provided funding outpoint {}:{}", txid, vout)
+
+    def _requires_pre_signing_channel_completion(self) -> bool:
+        """Return whether the active backend must pin funding before signatures."""
+        return bool(
+            getattr(self, "_channel_user_id", None)
+            and getattr(self, "_channel_funding_spk", None) is not None
+            and getattr(
+                getattr(self, "ldk", None),
+                "requires_pre_signing_funding_completion",
+                False,
             )
-            logger.info("channel-as-change: provided funding outpoint {}:{}", txid, vout)
-        except Exception as exc:  # noqa: BLE001 - the maker still co-signs the round
-            logger.error("channel-as-change outpoint provision failed: {}", exc)
+        )
+
+    async def _cancel_channel_change(self) -> None:
+        """Best-effort cleanup of an in-flight channel open after rejection."""
+        user_id = getattr(self, "_channel_user_id", None)
+        ldk = getattr(self, "ldk", None)
+        cancel = getattr(ldk, "cancel_external_channel_funding", None)
+        if not user_id:
+            return
+        try:
+            if cancel is not None:
+                await cancel(user_id)
+        except Exception as exc:  # noqa: BLE001 - retain the original verification error
+            logger.error("channel-as-change cancellation failed: {}", exc)
+        finally:
+            self._channel_user_id = None
+            self._channel_funding_spk = None
+            self._channel_capacity = None
+            self._channel_push_msat = 0
 
     async def _sign_transaction(self, tx_hex: str) -> list[str]:
         """Sign our inputs in the transaction.
