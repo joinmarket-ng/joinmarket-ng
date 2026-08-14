@@ -46,37 +46,28 @@ The provider is always the swap "server" and never pays a swap fee:
   ``complete_external_channel_funding`` (the maker uses the returned funding
   address as its CoinJoin change output, then supplies the resulting outpoint).
   This is validated live: a channel opens with its funding output supplied by an
-  external transaction. The model is **taker-driven and needs no maker-to-maker
-  coordination**: makers do not know which other makers are in a round, so a
+  external transaction. The single-maker model needs no maker-to-maker
+  coordination: makers do not know which other makers are in a round, so a
   maker simply channelizes *its own* change. It opens an externally-funded
   channel to an LN peer of its own choosing for its (deterministically computed)
   change amount and hands the taker the channel's funding address as an ordinary
   change address; the taker builds and broadcasts the CoinJoin as usual, and the
-  maker supplies the resulting outpoint once it has co-signed the transaction.
+  maker supplies the resulting outpoint after validation (before signing for LND,
+  after signing for the LDK Server backend).
   The exact-change-amount bookkeeping in the live CoinJoin is implemented and
   validated end to end (a maker opens a real channel from its CoinJoin change in
   a real maker<->taker round).
 
-A **combined** variant pools several makers' change into one shared funding
-output. Because makers do not know each other, this is also taker-coordinated:
-the taker (which knows all participants) pairs two combine-capable makers,
-relays each one's funding pubkey to the other, and builds the CoinJoin with a
-single shared output (a MuSig2 2-of-2 of the two makers, worth the pooled
-change) instead of two separate change outputs. The funder opens an
-externally-funded channel for the pooled total and **pushes** the peer maker its
-own change, so each maker keeps its balance behind one on-chain output (no
-per-maker change to subset-sum against, and the counterparty stays in-family).
-The on-chain primitive (`combined_funding_output`), the push economics
-(`plan_combined_channel`) and the in-family cooperative close are implemented and
-the combined channel-open-with-push is validated live; the taker-side pairing
-(`taker.combine.pair_combine_makers`) and the shared-output construction
-(`build_coinjoin_tx`'s `combine_groups`, which folds the folder maker's change
-into the funder's single output) are implemented and unit-tested. The remaining
-work is the protocol-message round that carries the pairing at runtime: a maker
-advertising combine-capability and its Lightning node, and the extra taker->funder
-"open a channel to the folder and push it its change" exchange (after `!ioauth`,
-once the taker knows the change amounts) that yields the funder's funding
-address.
+The taker also supports three experimental combined constructions. `pool` emits
+one shared MuSig2 output for a maker pair, while `knapsack` emits overlapping,
+grid-quantized MuSig2 pieces. These are on-chain 2-of-2 primitives, not Lightning
+channels by themselves; production use requires a complete cooperative lifecycle
+for those outputs. `lnd_ring` creates real private SIMPLE_TAPROOT LND channels:
+the taker plans co-funded ring edges, asks each edge funder to open a PSBT-shim
+channel, and merges both makers' change contributions at the returned funding
+address. The request includes a remote push equal to the partner's contribution.
+This is required because LND derives initial balances from the open request, not
+from ownership of the CoinJoin inputs that pay the funding output.
 
 ### Channel-as-change is maker-to-maker only
 
@@ -114,43 +105,26 @@ the maker-to-maker rule with `assert_maker_to_maker`) and the maker-to-maker 2-o
 
 #### Runtime protocol wiring
 
-The planner and build helper are pure and tested, and the protocol-message round
-that carries the pairing at runtime is implemented and feature-flagged (taker
-`combine_channel_as_change`, `combine_mode = "pool" | "knapsack"`, and
-`channelize_taker_change`), so non-participating makers fall back to ordinary plain
-change. The flow:
+The runtime is feature-flagged with taker `combine_channel_as_change` and
+`combine_mode = "pool" | "knapsack" | "lnd_ring"`. Non-participating makers and
+failed plans retain ordinary change. The real-channel `lnd_ring` flow is:
 
-1. **Advertise.** A knapsack-capable maker (config `knapsack_capable` plus a
-   Lightning `ln_node`) signals the `channel_change` capability in its handshake
-   feature map, which the taker reads from the offer's `features`. The `ln_node`
-   address itself is never broadcast publicly (that would link the maker's nick to
-   its LN identity); it only gates whether the maker emits a per-round funding key in
-   its `!ioauth` response (step 3). A maker that does not signal `channel_change` is
-   treated as plain.
-2. **Plan (after `!ioauth`).** Once the taker knows every maker's UTXOs it computes each
-   maker's change and calls `plan_knapsack(makers, denomination=..., allowance=...)`,
-   yielding the per-maker pieces and, for each channel piece, the fellow-maker
-   counterparty.
-3. **Relay pubkeys.** Each maker sends a fresh funding pubkey as an optional sixth
-   `!ioauth` field (`cc_pubkey`). For each channel piece `(owner, counterparty)` the
-   taker relays the *counterparty's* pubkey back to the owner in the per-maker `!tx`
-   suffix (and vice versa), exactly as the combined variant relays one pubkey. Neither
-   maker learns more than the one pubkey it must co-sign with; the taker never holds
-   channel keys.
-4. **Addresses.** Each maker computes its channel pieces' addresses with
-   `jmswap.channel.channel_funding_output(own_key, partner_key)` (a MuSig2 2-of-2) and
-   its plain pieces' addresses ordinarily, and returns the `(address, amount)` list for
-   its pieces (which must sum to its taker-computed change).
-5. **Build and verify.** The taker assembles the per-maker `change_outputs` with
-   `plan_to_change_outputs(plan, address_for, participants=<nicks>)` (the
-   `participants` argument rejects any channel piece whose counterparty is not a fellow
-   participant, i.e. an external-peer channel) and passes them to `build_coinjoin_tx`.
-   Each maker recomputes the plan from the public parameters and checks its own outputs
-   before signing, so the taker cannot pin a maker to a shape it did not agree to.
-6. **Open and push.** After the round confirms, each owner opens its externally-funded
-   channels on the agreed funding outpoints (LDK
-   `unsafe_manual_funding_transaction_generated`, as the per-maker variant already
-   does), pushing the counterparty its share where a piece pools both sides' change.
+1. **Advertise.** A capable maker sends a per-round funding key and its configured
+   Lightning node in encrypted `!ioauth` fields. They are not public offer fields.
+2. **Plan.** After `!ioauth`, the taker computes exact maker change and plans equal or
+   near-equal co-funded ring channels above `ring_min_channel_sats`.
+3. **Open and allocate.** For each edge, the taker sends encrypted `chanreq` containing
+   the peer node, full channel capacity, and remote push in millisatoshis. The push is
+   exactly the partner's on-chain contribution. The funder starts a private LND
+   PSBT-shim open with `no_publish` and returns the funding address in `chanaddr`.
+4. **Build and verify.** The transaction builder merges both contributions into one
+   output per address. Each maker requires positive contributions at distinct singleton
+   outputs, exact conservation of its own change, nonzero partner funding, and an
+   allocation matching the capacity and push it accepted.
+5. **Pin before signing.** LND verifies the complete unsigned CoinJoin PSBT with
+   `skip_finalize` before the maker releases signatures. If opening, address collection,
+   allocation, or PSBT verification fails, the pending shim is canceled and the maker
+   either accepts a verified plain-change fallback or refuses the round.
 
 ### On-chain-only takers: sweep under homogeneous fees
 
