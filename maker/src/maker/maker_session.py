@@ -105,6 +105,11 @@ class MakerSession:
         except Exception as e:  # pragma: no cover - best-effort cleanup
             logger.debug(f"Failed to release input locks for {self.taker_nick}: {e}")
 
+    async def abort(self) -> None:
+        """Release local resources associated with an unsuccessful session."""
+        self.release_input_locks()
+        await self.inner._cancel_channel_change()
+
     @property
     def cj_address(self) -> str:
         return self.inner.cj_address

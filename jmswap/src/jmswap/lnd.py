@@ -33,6 +33,8 @@ from jmcore.bitcoin import (
 )
 from loguru import logger
 
+from jmswap.channel_funding import ChannelInputEscrowCapability
+
 # BIP-174 per-input witness UTXO key type.
 _PSBT_IN_WITNESS_UTXO = 0x01
 
@@ -86,6 +88,9 @@ class LndBackend:
     """Minimal LND gRPC client for taproot channel-as-change via PSBT funding."""
 
     requires_pre_signing_funding_completion: ClassVar[bool] = True
+    channel_input_escrow_capabilities: ClassVar[frozenset[ChannelInputEscrowCapability]] = (
+        frozenset()
+    )
 
     host: str  # 'host:port' of the LND gRPC listener
     tls_cert: bytes

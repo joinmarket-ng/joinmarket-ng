@@ -816,6 +816,14 @@ class MakerSettings(BaseModel):
             "Requires ln_node; defaults False for backward compatibility."
         ),
     )
+    allow_legacy_channel_change: bool = Field(
+        default=False,
+        description=(
+            "Acknowledge that current channel-as-change modes are research-only and lack "
+            "the complete channel-input escrow recovery lifecycle. Required when enabling "
+            "knapsack_capable or maker.swap_provider.channel_change."
+        ),
+    )
     ln_node: str | None = Field(
         default=None,
         description=(
@@ -1132,6 +1140,13 @@ class TakerSettings(BaseModel):
             "Pair makers that advertise a channel-as-change funding pubkey into shared "
             "maker-to-maker 2-of-2 funding outputs, pooling their change to hide amounts. "
             "Off by default (a plain CoinJoin is byte-identical to today)."
+        ),
+    )
+    allow_legacy_channel_change: bool = Field(
+        default=False,
+        description=(
+            "Acknowledge that current pooled channel-as-change modes are research-only and "
+            "lack the complete channel-input escrow recovery lifecycle."
         ),
     )
     combine_mode: str = Field(

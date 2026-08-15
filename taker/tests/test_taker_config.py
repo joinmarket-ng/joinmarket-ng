@@ -17,6 +17,27 @@ from taker.config import (
     resolve_counterparty_count,
 )
 
+TEST_MNEMONIC = (
+    "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+)
+
+
+def test_channel_change_requires_legacy_risk_acknowledgment() -> None:
+    with pytest.raises(ValidationError, match="allow_legacy_channel_change"):
+        TakerConfig(mnemonic=TEST_MNEMONIC, combine_channel_as_change=True)
+
+    config = TakerConfig(
+        mnemonic=TEST_MNEMONIC,
+        combine_channel_as_change=True,
+        allow_legacy_channel_change=True,
+    )
+    assert config.combine_channel_as_change is True
+
+
+def test_taker_change_channelization_requires_combined_mode() -> None:
+    with pytest.raises(ValidationError, match="channelize_taker_change"):
+        TakerConfig(mnemonic=TEST_MNEMONIC, channelize_taker_change=True)
+
 
 class TestResolveCounterpartyCount:
     """Tests for resolve_counterparty_count helper."""

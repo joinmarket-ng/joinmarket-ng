@@ -892,19 +892,21 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
             log_method(message)
             self._rate_limited_log_times[key] = now
 
-    def _cleanup_timed_out_sessions(self) -> None:
+    async def _cleanup_timed_out_sessions(self) -> None:
         """Remove timed-out sessions from active_sessions and clean up rate limiter."""
         # Prune dead sessions
         dead_sessions = [
             sid for sid, session in self.active_sessions.items() if session.is_timed_out()
         ]
         for sid in dead_sessions:
+            session = self.active_sessions.pop(sid, None)
+            if session is None:
+                continue
             logger.debug("Cleaning up timed out session: {}", sid)
             # A timed-out session never completed: free its committed inputs so
             # they can be re-offered (the persisted lock would otherwise hold
             # them until its TTL).
-            self.active_sessions[sid].release_input_locks()
-            del self.active_sessions[sid]
+            await session.abort()
 
         # Ensure rate limiters are cleaned up periodically
         self._direct_connection_rate_limiter.cleanup_old_entries()

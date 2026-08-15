@@ -19,6 +19,8 @@ The ``ldk`` argument is any object exposing the external-funding methods of
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
+from enum import StrEnum
 from typing import Protocol
 
 from jmcore.bitcoin import scriptpubkey_to_address
@@ -26,8 +28,43 @@ from jmcore.bitcoin import scriptpubkey_to_address
 from jmswap.errors import LightningError
 
 
+class ChannelInputEscrowCapability(StrEnum):
+    """Backend operations required by confirmation-gated channel-input escrow."""
+
+    SPEND_EXISTING_CHANNEL = "spend_existing_channel"
+    PRESIGN_TIMEOUT_RECOVERY = "presign_timeout_recovery"
+    MONITOR_PARENT_CONFIRMATIONS = "monitor_parent_confirmations"
+    MONITOR_CONFLICTS_AND_REORGS = "monitor_conflicts_and_reorgs"
+    FORCE_SINGLE_PART_PAYMENT = "force_single_part_payment"
+    EXCLUDE_CONSUMED_CHANNEL = "exclude_consumed_channel"
+    PERSIST_RECOVERY_STATE = "persist_recovery_state"
+    REBROADCAST_RECOVERY = "rebroadcast_recovery"
+
+
+REQUIRED_CHANNEL_INPUT_ESCROW_CAPABILITIES = frozenset(ChannelInputEscrowCapability)
+
+
+def missing_channel_input_escrow_capabilities(
+    backend: object,
+) -> frozenset[ChannelInputEscrowCapability]:
+    """Return escrow operations that ``backend`` does not explicitly provide."""
+    declared: frozenset[ChannelInputEscrowCapability] = frozenset(
+        getattr(backend, "channel_input_escrow_capabilities", frozenset())
+    )
+    return REQUIRED_CHANNEL_INPUT_ESCROW_CAPABILITIES.difference(declared)
+
+
+def require_channel_input_escrow_capabilities(backend: object) -> None:
+    """Fail closed unless a backend declares the complete escrow lifecycle."""
+    missing = missing_channel_input_escrow_capabilities(backend)
+    if missing:
+        names = ", ".join(sorted(capability.value for capability in missing))
+        raise LightningError(f"backend lacks channel-input escrow capabilities: {names}")
+
+
 class ExternalFundingLightning(Protocol):
     requires_pre_signing_funding_completion: bool
+    channel_input_escrow_capabilities: frozenset[ChannelInputEscrowCapability]
 
     async def open_channel_external_funding(
         self,
@@ -81,18 +118,23 @@ async def request_external_channel_funding(
         amount_sats,
         push_to_counterparty_msat=push_to_counterparty_msat,
     )
-    deadline = asyncio.get_event_loop().time() + timeout
-    while asyncio.get_event_loop().time() < deadline:
-        ready, script_hex, value = await ldk.get_funding_output(user_channel_id)
-        if ready:
-            if value != amount_sats:
-                raise LightningError(
-                    f"channel funding value {value} != requested amount {amount_sats}"
-                )
-            address = scriptpubkey_to_address(bytes.fromhex(script_hex), network)
-            return user_channel_id, address
-        await asyncio.sleep(poll_interval)
-    raise LightningError("timed out waiting for the channel funding output")
+    try:
+        deadline = asyncio.get_event_loop().time() + timeout
+        while asyncio.get_event_loop().time() < deadline:
+            ready, script_hex, value = await ldk.get_funding_output(user_channel_id)
+            if ready:
+                if value != amount_sats:
+                    raise LightningError(
+                        f"channel funding value {value} != requested amount {amount_sats}"
+                    )
+                address = scriptpubkey_to_address(bytes.fromhex(script_hex), network)
+                return user_channel_id, address
+            await asyncio.sleep(poll_interval)
+        raise LightningError("timed out waiting for the channel funding output")
+    except (Exception, asyncio.CancelledError):
+        with suppress(Exception):
+            await ldk.cancel_external_channel_funding(user_channel_id)
+        raise
 
 
 async def complete_external_channel_funding(

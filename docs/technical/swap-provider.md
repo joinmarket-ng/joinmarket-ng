@@ -58,7 +58,7 @@ The provider is always the swap "server" and never pays a swap fee:
   validated end to end (a maker opens a real channel from its CoinJoin change in
   a real maker<->taker round).
 
-The taker also supports three experimental combined constructions. `pool` emits
+The taker also contains three legacy experimental combined constructions. `pool` emits
 one shared MuSig2 output for a maker pair, while `knapsack` emits overlapping,
 grid-quantized MuSig2 pieces. These are on-chain 2-of-2 primitives, not Lightning
 channels by themselves; production use requires a complete cooperative lifecycle
@@ -68,6 +68,28 @@ channel, and merges both makers' change contributions at the returned funding
 address. The request includes a remote push equal to the partner's contribution.
 This is required because LND derives initial balances from the open request, not
 from ownership of the CoinJoin inputs that pay the funding output.
+
+None of these constructions is the channel-input HTLC escrow protocol. They fund
+new channels from CoinJoin outputs and do not cooperatively spend an existing
+channel funding outpoint into an escrow parent with a pre-signed timeout child.
+They are disabled unless both the original feature switch and
+`allow_legacy_channel_change` are set. This second switch is an acknowledgment for
+controlled research deployments, not a production-safety claim.
+
+### Channel-input escrow backend boundary
+
+The confirmation-gated construction remains unavailable until one backend provides
+the full lifecycle declared by `jmswap.ChannelInputEscrowCapability`:
+
+1. Cooperatively spend an existing channel funding output into the exact escrow parent.
+2. Fully sign and validate timeout recovery before releasing the parent signature.
+3. Monitor exact-parent confirmations, conflicts, and reorgs before Lightning settlement.
+4. Force a single payment part and exclude the consumed channel from routing.
+5. Persist recovery state and rebroadcast or fee-bump recovery transactions after restart.
+
+LND and the current LDK Server adapter explicitly declare an empty capability set.
+External channel funding APIs do not satisfy any part of this boundary merely by
+returning a new channel funding address.
 
 ### Channel-as-change is maker-to-maker only
 
@@ -105,7 +127,8 @@ the maker-to-maker rule with `assert_maker_to_maker`) and the maker-to-maker 2-o
 
 #### Runtime protocol wiring
 
-The runtime is feature-flagged with taker `combine_channel_as_change` and
+The legacy runtime is feature-flagged with taker `combine_channel_as_change`,
+`allow_legacy_channel_change`, and
 `combine_mode = "pool" | "knapsack" | "lnd_ring"`. Non-participating makers and
 failed plans retain ordinary change. The real-channel `lnd_ring` flow is:
 

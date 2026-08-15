@@ -313,6 +313,13 @@ class MakerConfig(WalletConfig):
             "channel-as-change (maker-to-maker shared outputs). Requires ln_node."
         ),
     )
+    allow_legacy_channel_change: bool = Field(
+        default=False,
+        description=(
+            "Explicitly acknowledge legacy channel-as-change constructions that do not "
+            "provide confirmation-gated channel-input escrow recovery."
+        ),
+    )
     ln_node: str | None = Field(
         default=None,
         description="The maker's Lightning node 'node_id@host:port' for channel-as-change.",
@@ -498,6 +505,14 @@ class MakerConfig(WalletConfig):
         # Set bitcoin_network default (handled by parent WalletConfig)
         if self.bitcoin_network is None:
             object.__setattr__(self, "bitcoin_network", self.network)
+
+        if (
+            self.knapsack_capable or self.swap_provider.channel_change
+        ) and not self.allow_legacy_channel_change:
+            raise ValueError(
+                "legacy channel-as-change requires allow_legacy_channel_change=true; "
+                "current backends do not implement confirmation-gated channel-input escrow"
+            )
 
         # Only validate single-offer fields if offer_configs is empty
         # (when offer_configs is set, those fields are ignored)

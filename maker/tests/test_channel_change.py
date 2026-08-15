@@ -146,6 +146,7 @@ class _FakeLdk:
         self.funding_spk = funding_spk
         self.opened: tuple[str, str, int, int | None] | None = None
         self.completed: tuple[str, str, int] | None = None
+        self.cancel_external_channel_funding = AsyncMock()
 
     async def open_channel_external_funding(
         self, node_pubkey, address, channel_amount_sats, push_to_counterparty_msat=None
@@ -261,6 +262,74 @@ async def test_lnd_funding_failure_refuses_to_sign(
     complete.assert_awaited_once_with("00")
     sign.assert_not_awaited()
     backend.cancel_external_channel_funding.assert_awaited_once_with("pending-channel")
+
+
+async def test_timed_out_session_cancels_pending_channel(
+    wallet: WalletService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A timed-out round must not leave its external channel open in the backend."""
+    from jmcore.bitcoin import create_p2tr_scriptpubkey
+    from jmcore.models import Offer, OfferType
+
+    from maker.coinjoin import CoinJoinSession, CoinJoinState
+
+    backend = _FakeLdk(create_p2tr_scriptpubkey(b"\x46" * 32))
+    session = CoinJoinSession(
+        taker_nick="t",
+        offer=Offer(
+            counterparty="x",
+            oid=0,
+            ordertype=OfferType.SW0_RELATIVE,
+            minsize=1,
+            maxsize=10_000_000,
+            txfee=0,
+            cjfee="0.0001",
+        ),
+        wallet=wallet,
+        backend=wallet.backend,
+        ldk=backend,
+    )
+    session.state = CoinJoinState.IOAUTH_SENT
+    session._channel_user_id = "timed-out-channel"
+    session._channel_funding_spk = backend.funding_spk
+    monkeypatch.setattr(session, "is_timed_out", lambda: True)
+
+    success, response = await session.handle_tx("00")
+
+    assert success is False
+    assert response == {"error": "Session timed out after 300s"}
+    backend.cancel_external_channel_funding.assert_awaited_once_with("timed-out-channel")
+
+
+async def test_duplicate_channel_open_is_rejected(wallet: WalletService) -> None:
+    """Repeated chanreq messages must not allocate untracked pending channels."""
+    from jmcore.bitcoin import create_p2tr_scriptpubkey
+    from jmcore.models import Offer, OfferType
+
+    from maker.coinjoin import CoinJoinSession
+
+    backend = _FakeLdk(create_p2tr_scriptpubkey(b"\x47" * 32))
+    session = CoinJoinSession(
+        taker_nick="t",
+        offer=Offer(
+            counterparty="x",
+            oid=0,
+            ordertype=OfferType.SW0_RELATIVE,
+            minsize=1,
+            maxsize=10_000_000,
+            txfee=0,
+            cjfee="0.0001",
+        ),
+        wallet=wallet,
+        backend=wallet.backend,
+        ldk=backend,
+    )
+    session._channel_user_id = "existing-channel"
+
+    result = await session.open_external_channel("02deadbeef@1.2.3.4:9735", 250_000)
+
+    assert result is None
+    assert backend.opened is None
 
 
 async def test_lnd_signing_failure_cancels_verified_funding(

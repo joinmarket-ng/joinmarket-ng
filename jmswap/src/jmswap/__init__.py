@@ -33,8 +33,12 @@ from jmswap.channel import (
     split_change,
 )
 from jmswap.channel_funding import (
+    REQUIRED_CHANNEL_INPUT_ESCROW_CAPABILITIES,
+    ChannelInputEscrowCapability,
     complete_external_channel_funding,
+    missing_channel_input_escrow_capabilities,
     request_external_channel_funding,
+    require_channel_input_escrow_capabilities,
 )
 from jmswap.client import SwapClient
 from jmswap.errors import (
@@ -69,6 +73,7 @@ from jmswap.wallet import FakeSwapWallet, SwapWallet
 __all__ = [
     "ChainBackend",
     "ChainError",
+    "ChannelInputEscrowCapability",
     "ChangeSplit",
     "CombinedChannelPlan",
     "CombinedFunding",
@@ -80,6 +85,7 @@ __all__ = [
     "LightningBackend",
     "LightningError",
     "ProviderTerms",
+    "REQUIRED_CHANNEL_INPUT_ESCROW_CAPABILITIES",
     "SwapClient",
     "SwapContract",
     "SwapDirection",
@@ -102,6 +108,8 @@ __all__ = [
     "complete_external_channel_funding",
     "cooperative_close",
     "plan_combined_channel",
+    "missing_channel_input_escrow_capabilities",
+    "require_channel_input_escrow_capabilities",
     "request_external_channel_funding",
     "select_bonded_providers",
     "verify_provider_bond",

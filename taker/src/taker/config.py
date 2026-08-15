@@ -230,6 +230,13 @@ class TakerConfig(WalletConfig):
             "amounts. Off by default (a plain CoinJoin is byte-identical to today)."
         ),
     )
+    allow_legacy_channel_change: bool = Field(
+        default=False,
+        description=(
+            "Explicitly acknowledge pooled channel-as-change constructions that do not "
+            "provide confirmation-gated channel-input escrow recovery."
+        ),
+    )
 
     combine_mode: str = Field(
         default="pool",
@@ -303,6 +310,13 @@ class TakerConfig(WalletConfig):
         """If bitcoin_network is not set, default to the protocol network."""
         if self.bitcoin_network is None:
             object.__setattr__(self, "bitcoin_network", self.network)
+        if self.combine_channel_as_change and not self.allow_legacy_channel_change:
+            raise ValueError(
+                "legacy channel-as-change requires allow_legacy_channel_change=true; "
+                "current backends do not implement confirmation-gated channel-input escrow"
+            )
+        if self.channelize_taker_change and not self.combine_channel_as_change:
+            raise ValueError("channelize_taker_change requires combine_channel_as_change=true")
         return self
 
     @model_validator(mode="after")

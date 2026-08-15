@@ -31,6 +31,7 @@ import hashlib
 import hmac
 import time
 
+from jmswap.channel_funding import ChannelInputEscrowCapability
 from jmswap.errors import LightningError
 from jmswap.lightning import (
     DecodedInvoice,
@@ -208,6 +209,7 @@ class LdkServerBackend(LightningBackend):
     """A swap Lightning backend backed by an LDK Server node."""
 
     requires_pre_signing_funding_completion = False
+    channel_input_escrow_capabilities: frozenset[ChannelInputEscrowCapability] = frozenset()
 
     def __init__(self, transport: LdkTransport, api_key: str) -> None:
         self._transport = transport

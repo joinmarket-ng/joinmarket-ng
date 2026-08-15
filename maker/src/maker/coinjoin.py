@@ -566,6 +566,7 @@ class CoinJoinSession:
         """
         try:
             if self.is_timed_out():
+                await self._cancel_channel_change()
                 self.state = CoinJoinState.FAILED
                 return False, {"error": f"Session timed out after {self.session_timeout_sec}s"}
 
@@ -867,6 +868,9 @@ class CoinJoinSession:
         """
         ldk = getattr(self, "ldk", None)
         if ldk is None or not peer or "@" not in peer:
+            return None
+        if self._channel_user_id is not None:
+            logger.error("channel-as-change open rejected: a channel open is already pending")
             return None
         try:
             from jmcore.bitcoin import address_to_scriptpubkey

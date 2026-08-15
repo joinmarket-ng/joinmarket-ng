@@ -579,7 +579,7 @@ class BackgroundTasksMixin:
                 # Periodic cleanup of timed-out sessions
                 now = asyncio.get_event_loop().time()
                 if now - last_cleanup > cleanup_interval:
-                    self._cleanup_timed_out_sessions()
+                    await self._cleanup_timed_out_sessions()
                     last_cleanup = now
 
                 # Reset error counter on successful iteration

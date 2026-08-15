@@ -6,8 +6,11 @@ import pytest
 from jmcore.bitcoin import create_p2tr_scriptpubkey, scriptpubkey_to_address
 
 from jmswap.channel_funding import (
+    ChannelInputEscrowCapability,
     complete_external_channel_funding,
+    missing_channel_input_escrow_capabilities,
     request_external_channel_funding,
+    require_channel_input_escrow_capabilities,
 )
 from jmswap.errors import LightningError
 
@@ -21,6 +24,7 @@ class _FakeLdk:
         self.ready_after = ready_after
         self.value = value
         self.completed: tuple[str, str, int] | None = None
+        self.cancelled: list[str] = []
 
     async def open_channel_external_funding(
         self, node_pubkey, address, channel_amount_sats, push_to_counterparty_msat=None
@@ -43,6 +47,9 @@ class _FakeLdk:
         self, user_channel_id, funding_txid, funding_vout, raw_tx_hex=None, input_utxos=None
     ):
         self.completed = (user_channel_id, funding_txid, funding_vout)
+
+    async def cancel_external_channel_funding(self, user_channel_id):
+        self.cancelled.append(user_channel_id)
 
 
 async def test_request_returns_funding_address() -> None:
@@ -67,6 +74,7 @@ async def test_request_rejects_value_mismatch() -> None:
         await request_external_channel_funding(
             ldk, "02" + "11" * 32, "peer:9735", 1_000_000, "regtest", poll_interval=0.001
         )
+    assert ldk.cancelled == ["ucid-1"]
 
 
 async def test_request_rejects_invalid_remote_push() -> None:
@@ -95,9 +103,40 @@ async def test_request_times_out() -> None:
             poll_interval=0.001,
             timeout=0.02,
         )
+    assert ldk.cancelled == ["ucid-1"]
 
 
 async def test_complete_provides_outpoint() -> None:
     ldk = _FakeLdk()
     await complete_external_channel_funding(ldk, "ucid-1", "ab" * 32, 1)
     assert ldk.completed == ("ucid-1", "ab" * 32, 1)
+
+
+def test_channel_input_escrow_requires_complete_backend_lifecycle() -> None:
+    class _Backend:
+        channel_input_escrow_capabilities = frozenset(
+            {ChannelInputEscrowCapability.SPEND_EXISTING_CHANNEL}
+        )
+
+    missing = missing_channel_input_escrow_capabilities(_Backend())
+
+    assert ChannelInputEscrowCapability.SPEND_EXISTING_CHANNEL not in missing
+    assert ChannelInputEscrowCapability.PRESIGN_TIMEOUT_RECOVERY in missing
+    with pytest.raises(LightningError, match="presign_timeout_recovery"):
+        require_channel_input_escrow_capabilities(_Backend())
+
+
+def test_channel_input_escrow_accepts_complete_backend_lifecycle() -> None:
+    class _Backend:
+        channel_input_escrow_capabilities = frozenset(ChannelInputEscrowCapability)
+
+    assert missing_channel_input_escrow_capabilities(_Backend()) == frozenset()
+    require_channel_input_escrow_capabilities(_Backend())
+
+
+def test_current_lightning_backends_declare_escrow_unsupported() -> None:
+    from jmswap.ldk import LdkServerBackend
+    from jmswap.lnd import LndBackend
+
+    assert LdkServerBackend.channel_input_escrow_capabilities == frozenset()
+    assert LndBackend.channel_input_escrow_capabilities == frozenset()

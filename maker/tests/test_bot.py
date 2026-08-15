@@ -7,7 +7,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from jmcore.models import NetworkType, Offer, OfferType
@@ -16,6 +16,37 @@ from jmcore.network import TCPConnection
 from maker.bot import MakerBot
 from maker.config import MakerConfig
 from maker.fidelity import FidelityBondInfo
+
+
+async def test_timed_out_session_cleanup_aborts_pending_resources() -> None:
+    bot = MagicMock(spec=MakerBot)
+    session = MagicMock()
+    session.is_timed_out.return_value = True
+    session.abort = AsyncMock()
+    bot.active_sessions = {"expired": session}
+    bot._direct_connection_rate_limiter = MagicMock()
+
+    await MakerBot._cleanup_timed_out_sessions(bot)
+
+    session.abort.assert_awaited_once_with()
+    assert bot.active_sessions == {}
+
+
+async def test_concurrent_timeout_cleanup_aborts_session_once() -> None:
+    bot = MagicMock(spec=MakerBot)
+    session = MagicMock()
+    session.is_timed_out.return_value = True
+    session.abort = AsyncMock()
+    bot.active_sessions = {"expired": session}
+    bot._direct_connection_rate_limiter = MagicMock()
+
+    await asyncio.gather(
+        MakerBot._cleanup_timed_out_sessions(bot),
+        MakerBot._cleanup_timed_out_sessions(bot),
+    )
+
+    session.abort.assert_awaited_once_with()
+    assert bot.active_sessions == {}
 
 
 class TestOfferAnnouncement:

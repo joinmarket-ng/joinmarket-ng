@@ -422,7 +422,9 @@
 # Channel-as-change capability signaling. When knapsack_capable is true and an
 # ln_node is set, the maker advertises the "channel_change" handshake feature so
 # takers can pair it with a fellow maker into knapsack channel-as-change outputs.
-# An external-peer channel is never used, so ln_node is required to advertise.
+# These historical constructions do not implement confirmation-gated channel-input
+# escrow or trustless timeout recovery. A second explicit acknowledgment is required.
+# allow_legacy_channel_change = false
 # knapsack_capable = false
 # ln_node = "node_id@host:port"
 
@@ -447,7 +449,7 @@
 # min_confirmations = 1       # confirmations on a swap funding output before acting (reorg safety)
 # bond_value = 0              # advertised fidelity-bond value in sats (sybil resistance)
 # accepts_whole_coin = false  # third role: absorb a client's whole UTXO, no change
-# channel_change = false      # experimental: emit change as a Taproot channel-funding output
+# channel_change = false      # legacy experiment, also requires maker.allow_legacy_channel_change
 # channel_peer = "node_id@host:port"  # LN peer to open channel-as-change channels to
 # ldk_grpc_url = "https://jm-ldk-provider:3536"
 # ldk_tls_cert = "/data/tls.crt"          # LDK Server self-signed TLS cert to pin
@@ -513,8 +515,10 @@
 # Maker-to-maker channel-as-change (experimental, opt-in). When enabled, makers that
 # advertise a channel-as-change funding pubkey are paired into shared 2-of-2 funding
 # outputs that pool their change, so no per-maker change output reveals an exact
-# residual. A plain CoinJoin is byte-identical to today when this is off.
+# residual. Current modes do not have the complete channel-input escrow recovery
+# lifecycle and require the second acknowledgment below.
 # combine_channel_as_change = false
+# allow_legacy_channel_change = false
 # combine_mode = "pool"            # "pool" (two makers -> one shared 2-of-2),
 #                                  # "knapsack" (grid-quantized pieces, round-robin), or
 #                                  # "lnd_ring" (pooled private LND channels in a ring)

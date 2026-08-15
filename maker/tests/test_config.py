@@ -344,6 +344,7 @@ class TestBuildMakerConfig:
         settings.maker.swap_provider.bond_value = 7_000_000
         settings.maker.swap_provider.accepts_whole_coin = True
         settings.maker.swap_provider.channel_change = True
+        settings.maker.allow_legacy_channel_change = True
         settings.maker.swap_provider.channel_peer = "02abc@1.2.3.4:9735"
         settings.maker.swap_provider.ldk_tls_cert = "/data/tls.crt"
         settings.maker.swap_provider.ldk_grpc_url = "https://ldk:3536"
@@ -370,6 +371,7 @@ class TestBuildMakerConfig:
         assert sp.bond_value == 7_000_000
         assert sp.accepts_whole_coin is True
         assert sp.channel_change is True
+        assert config.allow_legacy_channel_change is True
         assert sp.channel_peer == "02abc@1.2.3.4:9735"
         assert sp.ldk_tls_cert == "/data/tls.crt"
         assert sp.ldk_grpc_url == "https://ldk:3536"
@@ -1016,9 +1018,11 @@ class TestNewSettingsWiring:
 
         settings = JoinMarketSettings()
         settings.maker.knapsack_capable = True
+        settings.maker.allow_legacy_channel_change = True
         settings.maker.ln_node = "02ab@host:9735"
         config = build_maker_config(settings=settings, mnemonic=TEST_MNEMONIC, passphrase="")
         assert config.knapsack_capable is True
+        assert config.allow_legacy_channel_change is True
         assert config.ln_node == "02ab@host:9735"
         assert "channel_change" in config.capability_features()
 
@@ -1044,11 +1048,32 @@ class TestNewSettingsWiring:
             mnemonic=TEST_MNEMONIC,
             swap_provider=SwapProviderConfig(enabled=True, accepts_whole_coin=True),
             knapsack_capable=True,
+            allow_legacy_channel_change=True,
             ln_node="02ab@host:9735",
         )
         assert cfg.capability_features() == {"swap_provider", "whole_coin", "channel_change"}
         # knapsack without an ln_node does not advertise (external-peer channels are unused)
         assert (
-            MakerConfig(mnemonic=TEST_MNEMONIC, knapsack_capable=True).capability_features()
+            MakerConfig(
+                mnemonic=TEST_MNEMONIC,
+                knapsack_capable=True,
+                allow_legacy_channel_change=True,
+            ).capability_features()
             == set()
         )
+
+    def test_channel_change_requires_legacy_risk_acknowledgment(self) -> None:
+        """Unsafe historical modes must not activate from their old flag alone."""
+        from maker.config import SwapProviderConfig
+
+        with pytest.raises(ValidationError, match="allow_legacy_channel_change"):
+            MakerConfig(
+                mnemonic=TEST_MNEMONIC,
+                knapsack_capable=True,
+                ln_node="02ab@host:9735",
+            )
+        with pytest.raises(ValidationError, match="allow_legacy_channel_change"):
+            MakerConfig(
+                mnemonic=TEST_MNEMONIC,
+                swap_provider=SwapProviderConfig(channel_change=True),
+            )

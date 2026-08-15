@@ -264,6 +264,7 @@ def build_taker_config(
         taker_utxo_retries=settings.taker.taker_utxo_retries,
         taker_utxo_amtpercent=settings.taker.taker_utxo_amtpercent,
         combine_channel_as_change=settings.taker.combine_channel_as_change,
+        allow_legacy_channel_change=settings.taker.allow_legacy_channel_change,
         combine_mode=settings.taker.combine_mode,
         channelize_taker_change=settings.taker.channelize_taker_change,
         ring_min_channel_sats=settings.taker.ring_min_channel_sats,

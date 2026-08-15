@@ -216,6 +216,7 @@ async def test_channel_as_change_coinjoin() -> None:
             min_size=100_000,
             cj_fee_relative="0.0003",
             tx_fee_contribution=1_000,
+            allow_legacy_channel_change=True,
             tor_control=TorControlConfig(enabled=False),
             swap_provider=SwapProviderConfig(
                 channel_change=True,

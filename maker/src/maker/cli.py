@@ -364,6 +364,7 @@ def build_maker_config(
         size_factor=settings.maker.size_factor,
         min_confirmations=settings.maker.min_confirmations,
         knapsack_capable=settings.maker.knapsack_capable,
+        allow_legacy_channel_change=settings.maker.allow_legacy_channel_change,
         ln_node=settings.maker.ln_node,
         taker_utxo_age=settings.maker.taker_utxo_age,
         session_timeout_sec=settings.maker.session_timeout_sec,
