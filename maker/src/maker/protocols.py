@@ -20,12 +20,14 @@ from jmcore.directory_client import DirectoryClient
 from jmcore.models import Offer
 from jmcore.network import TCPConnection
 from jmcore.rate_limiter import RateLimiter
+from jmswap.escrow_coordinator import ChannelInputEscrowCoordinator
 from jmswap.ring_authorization import RingEdgeAuthorizationStore
 from jmwallet.backends.base import BlockchainBackend
 from jmwallet.wallet.service import WalletService
 
 from maker.config import MakerConfig
 from maker.directory_pool import MakerDirectoryPool
+from maker.escrow_deployment import ChannelInputEscrowDeployment
 from maker.fidelity import FidelityBondInfo
 from maker.maker_session import MakerSession
 from maker.offers import OfferManager
@@ -53,6 +55,8 @@ class MakerBotProtocol(Protocol):
     _directory_pool: MakerDirectoryPool
     active_sessions: dict[str, MakerSession]
     ring_edge_authorization_store: RingEdgeAuthorizationStore | None
+    channel_input_escrow_coordinator: ChannelInputEscrowCoordinator | None
+    channel_input_escrow_deployment: ChannelInputEscrowDeployment | None
     offer_manager: OfferManager
     listen_tasks: list[asyncio.Task[None]]
     direct_connections: dict[str, TCPConnection]

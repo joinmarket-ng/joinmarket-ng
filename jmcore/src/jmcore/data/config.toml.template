@@ -462,6 +462,36 @@
 # lnd_macaroon_path = "/data/lnd/admin.macaroon"
 # lnd_escrow_macaroon_path = "/data/lnd/data/chain/bitcoin/regtest/channelescrow.macaroon"
 
+# ----------------------------------------------------------------------------
+# Channel-input escrow (experimental, disabled by default)
+# ----------------------------------------------------------------------------
+# Confirmation-gated escrow for channel-funded CoinJoin inputs. Enabling this
+# requires bitcoin.backend_type = "descriptor_wallet" and the LND connection
+# paths above. It does not enable legacy channel-as-change capabilities.
+[maker.channel_input_escrow]
+# enabled = false
+# premium_sats = 1000
+# timeout_compensation_sats = 500
+# escrow_value_sats = 150000
+# timeout_fee_sats = 500
+# invoice_expiry_seconds = 3600
+# invoice_min_final_cltv_delta = 18
+# peer_settle_delta_blocks = 24
+# success_broadcast_delta_blocks = 36
+# timeout_delta_blocks = 72
+# parent_confirmation_depth = 1
+# success_confirmation_depth = 1
+# success_confirmation_budget_blocks = 6
+# reorg_margin_blocks = 6
+# safety_delta_blocks = 3
+# preimage_budget_blocks = 2
+# peer_message_timeout_seconds = 30.0
+# payment_fee_limit_msat = 100000
+# payment_timeout_seconds = 60
+# fee_target_blocks = 2
+# minimum_feerate_sat_vb = 1.0
+# monitor_poll_interval_seconds = 10.0
+
 # ============================================================================
 # Taker Settings (CoinJoin Client)
 # ============================================================================

@@ -172,6 +172,54 @@ class SwapProviderConfig(BaseModel):
     model_config = {"frozen": False}
 
 
+class ChannelInputEscrowConfig(BaseModel):
+    """Runtime configuration for confirmation-gated channel-input escrow."""
+
+    enabled: bool = False
+    premium_sats: int = Field(default=1_000, ge=0)
+    timeout_compensation_sats: int = Field(default=500, ge=0)
+    escrow_value_sats: int = Field(default=150_000, gt=0)
+    timeout_fee_sats: int = Field(default=500, ge=0)
+    invoice_expiry_seconds: int = Field(default=3_600, gt=0)
+    invoice_min_final_cltv_delta: int = Field(default=18, gt=0)
+    peer_settle_delta_blocks: int = Field(default=24, ge=0)
+    success_broadcast_delta_blocks: int = Field(default=36, ge=0)
+    timeout_delta_blocks: int = Field(default=72, gt=0)
+    parent_confirmation_depth: int = Field(default=1, gt=0)
+    success_confirmation_depth: int = Field(default=1, gt=0)
+    success_confirmation_budget_blocks: int = Field(default=6, gt=0)
+    reorg_margin_blocks: int = Field(default=6, ge=0)
+    safety_delta_blocks: int = Field(default=3, gt=0)
+    preimage_budget_blocks: int = Field(default=2, ge=0)
+    peer_message_timeout_seconds: float = Field(default=30.0, gt=0)
+    payment_fee_limit_msat: int = Field(default=100_000, gt=0)
+    payment_timeout_seconds: int = Field(default=60, gt=0)
+    fee_target_blocks: int = Field(default=2, gt=0)
+    minimum_feerate_sat_vb: float = Field(default=1.0, gt=0)
+    monitor_poll_interval_seconds: float = Field(default=10.0, gt=0)
+
+    @model_validator(mode="after")
+    def validate_timing(self) -> ChannelInputEscrowConfig:
+        """Ensure the escrow lifecycle has sufficient confirmation time."""
+        if self.peer_settle_delta_blocks >= self.success_broadcast_delta_blocks:
+            raise ValueError(
+                "peer_settle_delta_blocks must be less than success_broadcast_delta_blocks"
+            )
+        if (
+            self.success_broadcast_delta_blocks
+            + self.success_confirmation_budget_blocks
+            + self.reorg_margin_blocks
+            >= self.timeout_delta_blocks
+        ):
+            raise ValueError(
+                "success_broadcast_delta_blocks + success_confirmation_budget_blocks + "
+                "reorg_margin_blocks must be less than timeout_delta_blocks"
+            )
+        return self
+
+    model_config = {"frozen": False}
+
+
 class MergeAlgorithm(StrEnum):
     """
     UTXO selection algorithm for makers.
@@ -491,6 +539,10 @@ class MakerConfig(WalletConfig):
         default_factory=lambda: SwapProviderConfig(),
         description="Runtime configuration for the maker's swap-provider role.",
     )
+    channel_input_escrow: ChannelInputEscrowConfig = Field(
+        default_factory=ChannelInputEscrowConfig,
+        description="Runtime configuration for confirmation-gated channel-input escrow.",
+    )
 
     model_config = {"frozen": False}
 
@@ -514,6 +566,29 @@ class MakerConfig(WalletConfig):
                 "legacy channel-as-change requires allow_legacy_channel_change=true; "
                 "current backends do not implement confirmation-gated channel-input escrow"
             )
+
+        if self.channel_input_escrow.enabled:
+            if self.knapsack_capable or self.swap_provider.channel_change:
+                raise ValueError(
+                    "channel-input escrow cannot be combined with legacy channel-as-change"
+                )
+            if self.backend_type.lower() != "descriptor_wallet":
+                raise ValueError("channel-input escrow requires backend_type='descriptor_wallet'")
+            missing_lnd_settings = [
+                name
+                for name in (
+                    "lnd_grpc_url",
+                    "lnd_tls_cert_path",
+                    "lnd_macaroon_path",
+                    "lnd_escrow_macaroon_path",
+                )
+                if not getattr(self.swap_provider, name)
+            ]
+            if missing_lnd_settings:
+                raise ValueError(
+                    "channel-input escrow requires swap_provider settings: "
+                    + ", ".join(missing_lnd_settings)
+                )
 
         # Only validate single-offer fields if offer_configs is empty
         # (when offer_configs is set, those fields are ignored)

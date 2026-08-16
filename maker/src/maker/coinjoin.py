@@ -12,10 +12,12 @@ Manages the maker side of the CoinJoin protocol:
 
 from __future__ import annotations
 
+import secrets
 import time
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
+from jmcore.constants import DUST_THRESHOLD
 from jmcore.encryption import CryptoSession
 from jmcore.models import NetworkType, Offer
 from jmcore.podle import parse_podle_revelation, verify_podle
@@ -35,7 +37,11 @@ from loguru import logger
 from maker.tx_verification import verify_unsigned_transaction
 
 if TYPE_CHECKING:
+    from jmswap.channel_escrow import EscrowParentEvidence
     from jmswap.ring_authorization import RingEdgeAuthorizationStore, RingEdgeFunding
+    from jmwallet.backends.base import UTXO
+
+    from maker.channel_input_escrow import ChannelInputEscrowPlan, ChannelInputEscrowPlanProvider
 
 
 class CoinJoinState(StrEnum):
@@ -76,7 +82,16 @@ class CoinJoinSession:
         combine_capable: bool = False,
         ln_node: str | None = None,
         ring_edge_authorization_store: RingEdgeAuthorizationStore | None = None,
+        channel_input_escrow_plan: ChannelInputEscrowPlan | None = None,
+        channel_input_escrow_plan_provider: ChannelInputEscrowPlanProvider | None = None,
     ):
+        if channel_input_escrow_plan is not None and channel_input_escrow_plan_provider is not None:
+            raise ValueError("channel-input escrow plan and provider are mutually exclusive")
+        has_escrow = (
+            channel_input_escrow_plan is not None or channel_input_escrow_plan_provider is not None
+        )
+        if has_escrow and (channel_change or combine_capable):
+            raise ValueError("channel-input escrow cannot be combined with channel-change behavior")
         self.taker_nick = taker_nick
         self.offer = offer
         self.wallet = wallet
@@ -95,6 +110,10 @@ class CoinJoinSession:
         self.channel_peer = channel_peer
         self.ln_node = ln_node
         self.ring_edge_authorization_store = ring_edge_authorization_store
+        self.channel_input_escrow_plan = channel_input_escrow_plan
+        self.channel_input_escrow_plan_provider = channel_input_escrow_plan_provider
+        self.channel_input_utxo: UTXO | None = None
+        self._escrow_authorized = False
         self._ring_authorization_ids: dict[str, str] = {}
         self._channel_user_id: str | None = None
         self._channel_funding_spk: bytes | None = None
@@ -268,7 +287,11 @@ class CoinJoinSession:
             ):
                 from jmcore.protocol import FEATURE_CHANNEL_CHANGE, FEATURE_RING_EDGE_AUTH
 
-                features.extend((FEATURE_CHANNEL_CHANGE, FEATURE_RING_EDGE_AUTH))
+                features.append(FEATURE_CHANNEL_CHANGE)
+                if bool(getattr(self.ldk, "supports_reserved_external_funding_id", False)) and bool(
+                    getattr(self.ldk, "supports_external_funding_cancellation", False)
+                ):
+                    features.append(FEATURE_RING_EDGE_AUTH)
 
             return True, {"nacl_pubkey": nacl_pubkey, "features": features}
 
@@ -436,6 +459,11 @@ class CoinJoinSession:
                 f"value={taker_utxo_value} sats, confirmations={taker_utxo_confirmations}"
             )
 
+            if self.channel_input_escrow_plan_provider is not None:
+                self.channel_input_escrow_plan = await self.channel_input_escrow_plan_provider()
+            if self.channel_input_escrow_plan is not None:
+                await self._resolve_channel_input_escrow()
+
             utxos_dict, cj_addr, change_addr, mixdepth = await self._select_our_utxos(
                 exclude_utxos=exclude_utxos
             )
@@ -459,6 +487,15 @@ class CoinJoinSession:
                 )
                 for (txid, vout), utxo_info in utxos_dict.items()
             ]
+            if self.channel_input_utxo is not None:
+                utxo_metadata_list.append(
+                    UTXOMetadata(
+                        txid=self.channel_input_utxo.txid,
+                        vout=self.channel_input_utxo.vout,
+                        scriptpubkey=self.channel_input_utxo.scriptpubkey,
+                        blockheight=self.channel_input_utxo.height,
+                    )
+                )
 
             # Use extended format if peer supports neutrino_compat
             utxo_list_str = format_utxo_list(utxo_metadata_list, extended=self.peer_neutrino_compat)
@@ -493,6 +530,12 @@ class CoinJoinSession:
                 "change_addr": change_addr,
                 "btc_sig": btc_sig,
             }
+
+            if self.channel_input_escrow_plan is not None:
+                response["escrow_output"] = (
+                    f"escrow:{self.channel_input_escrow_plan.terms.escrow_value_sats}:"
+                    f"{self.channel_input_escrow_plan.escrow_address(self.wallet.network)}"
+                )
 
             # Maker-to-maker channel-as-change: advertise a fresh funding pubkey so
             # the taker can pair us with a fellow maker into a shared 2-of-2 output.
@@ -595,6 +638,13 @@ class CoinJoinSession:
             # Convert network string to NetworkType enum
             network = NetworkType(self.wallet.network)
 
+            if self.channel_input_escrow_plan is not None and (
+                combine is not None or ring is not None
+            ):
+                return False, {
+                    "error": "channel-input escrow cannot be combined with channel change"
+                }
+
             combine_address, combine_value = self._verify_combine(combine)
 
             # A failed ring plan deliberately falls back to this maker's ordinary change
@@ -624,6 +674,24 @@ class CoinJoinSession:
                     if ring is not None
                     else None
                 ),
+                additional_input_values=(
+                    {
+                        (
+                            self.channel_input_escrow_plan.terms.snapshot.funding_outpoint.txid,
+                            self.channel_input_escrow_plan.terms.snapshot.funding_outpoint.vout,
+                        ): self.channel_input_escrow_plan.terms.snapshot.capacity_sats
+                    }
+                    if self.channel_input_escrow_plan is not None
+                    else None
+                ),
+                escrow_output=(
+                    (
+                        self.channel_input_escrow_plan.escrow_address(self.wallet.network),
+                        self.channel_input_escrow_plan.terms.escrow_value_sats,
+                    )
+                    if self.channel_input_escrow_plan is not None
+                    else None
+                ),
             )
 
             if not is_valid:
@@ -642,6 +710,10 @@ class CoinJoinSession:
                     return False, {"error": "ring authorization verification failed"}
 
             logger.info("Transaction verification PASSED ✓")
+
+            escrow_evidence: EscrowParentEvidence | None = None
+            if self.channel_input_escrow_plan is not None:
+                escrow_evidence = await self._build_escrow_parent_evidence(tx_hex)
 
             # LND must accept the assembled transaction through PsbtVerify before this
             # maker authorizes it. Otherwise the CoinJoin could fund an output that LND
@@ -670,11 +742,14 @@ class CoinJoinSession:
                 except Exception as exc:  # noqa: BLE001 - preserve legacy LDK behavior
                     logger.error("channel-as-change outpoint provision failed: {}", exc)
 
-            # Compute txid from the unsigned transaction for history tracking
-            # The txid is computed from the non-witness data so we can calculate it now
-            from jmcore.bitcoin import get_txid
+            if escrow_evidence is not None:
+                txid = escrow_evidence.parent_txid
+                signatures.append(await self._authorize_escrow_parent(escrow_evidence))
+            else:
+                # The txid commits only to non-witness data, so it is stable here.
+                from jmcore.bitcoin import get_txid
 
-            txid = get_txid(tx_hex)
+                txid = get_txid(tx_hex)
 
             response = {"signatures": signatures, "txid": txid}
 
@@ -742,12 +817,143 @@ class CoinJoinSession:
                 edge.authorization_id,
                 edge.funding_address,
                 scriptpubkey_hex,
+                pending_channel_id=record.pending_channel_id,
             )
             store.bind_channel_point(
                 edge.edge_id,
                 edge.authorization_id,
                 RingChannelPoint(txid=txid, vout=vout),
             )
+
+    async def _resolve_channel_input_escrow(self) -> None:
+        """Resolve the frozen channel outpoint before revealing it to the taker."""
+        plan = self.channel_input_escrow_plan
+        if plan is None:
+            return
+        snapshot = plan.terms.snapshot
+        funding = snapshot.funding_outpoint
+        utxo = await self.backend.get_utxo(funding.txid, funding.vout)
+        if utxo is None:
+            raise ValueError("frozen channel input is not available on chain")
+        scriptpubkey = getattr(utxo, "scriptpubkey", None)
+        value = getattr(utxo, "value", None)
+        height = getattr(utxo, "height", None)
+        confirmations = getattr(utxo, "confirmations", None)
+        if (
+            getattr(utxo, "txid", None) != funding.txid
+            or getattr(utxo, "vout", None) != funding.vout
+            or not isinstance(scriptpubkey, str)
+            or scriptpubkey.lower() != snapshot.funding_scriptpubkey
+            or not isinstance(value, int)
+            or isinstance(value, bool)
+            or value != snapshot.capacity_sats
+            or not isinstance(height, int)
+            or isinstance(height, bool)
+            or height < 0
+            or not isinstance(confirmations, int)
+            or isinstance(confirmations, bool)
+            or confirmations < 1
+        ):
+            raise ValueError("frozen channel input does not match a confirmed channel snapshot")
+        self.channel_input_utxo = utxo
+
+    async def _build_escrow_parent_evidence(self, tx_hex: str) -> EscrowParentEvidence:
+        """Construct validated full-prevout evidence for the exact escrow parent."""
+        from jmcore.bitcoin import get_txid, parse_transaction
+        from jmswap.channel_escrow import EscrowOutpoint, EscrowParentEvidence, EscrowParentPrevout
+
+        plan = self.channel_input_escrow_plan
+        if plan is None:
+            raise RuntimeError("channel-input escrow plan is unavailable")
+        transaction = parse_transaction(tx_hex)
+        snapshot = plan.terms.snapshot
+        funding = snapshot.funding_outpoint
+        channel_inputs = [
+            index
+            for index, tx_input in enumerate(transaction.inputs)
+            if tx_input.txid == funding.txid and tx_input.vout == funding.vout
+        ]
+        if len(channel_inputs) != 1:
+            raise ValueError(
+                "parent transaction must contain the frozen channel input exactly once"
+            )
+        escrow_outputs = [
+            index
+            for index, output in enumerate(transaction.outputs)
+            if output.script.hex() == plan.escrow_scriptpubkey
+            and output.value == plan.terms.escrow_value_sats
+        ]
+        if len(escrow_outputs) != 1:
+            raise ValueError("parent transaction must contain the escrow output exactly once")
+
+        ordered_prevouts: list[EscrowParentPrevout] = []
+        for tx_input in transaction.inputs:
+            prevout = await self.backend.get_utxo(tx_input.txid, tx_input.vout)
+            if prevout is None:
+                raise ValueError(f"parent prevout {tx_input.txid}:{tx_input.vout} is unavailable")
+            ordered_prevouts.append(
+                EscrowParentPrevout(
+                    value_sats=prevout.value,
+                    scriptpubkey=prevout.scriptpubkey.lower(),
+                )
+            )
+
+        parent_txid = get_txid(tx_hex)
+        return EscrowParentEvidence(
+            parent_tx_hex=tx_hex,
+            parent_txid=parent_txid,
+            channel_funding_outpoint=funding,
+            channel_input_index=channel_inputs[0],
+            ordered_prevouts=tuple(ordered_prevouts),
+            escrow_outpoint=EscrowOutpoint(txid=parent_txid, vout=escrow_outputs[0]),
+            escrow_value_sats=plan.terms.escrow_value_sats,
+            escrow_scriptpubkey=plan.escrow_scriptpubkey,
+            all_inputs_nonmalleable=True,
+            exact_transaction_verified=True,
+        )
+
+    async def _authorize_escrow_parent(self, evidence: EscrowParentEvidence) -> str:
+        """Release a typed channel witness only after durable timeout preparation."""
+        from jmswap.channel_escrow import EscrowLifecycleState, PrepareTimeoutRequest
+
+        from maker.channel_input_escrow import format_channel_input_witness
+
+        plan = self.channel_input_escrow_plan
+        if plan is None:
+            raise RuntimeError("channel-input escrow plan is unavailable")
+        prepared_record = await plan.coordinator.prepare_timeout(
+            PrepareTimeoutRequest(terms=plan.terms, parent_evidence=evidence)
+        )
+        if (
+            prepared_record.terms != plan.terms
+            or prepared_record.state
+            not in {
+                EscrowLifecycleState.TIMEOUT_SIGNED,
+                EscrowLifecycleState.CHANNEL_SIGNATURE_RELEASED,
+            }
+            or prepared_record.prepared is None
+            or prepared_record.prepared.parent_evidence != evidence
+        ):
+            raise ValueError("escrow timeout preparation did not bind the exact parent")
+
+        record = await plan.coordinator.authorize_parent(plan.terms.snapshot.session_id)
+        authorization = record.authorization
+        if (
+            record.terms != plan.terms
+            or record.state is not EscrowLifecycleState.CHANNEL_SIGNATURE_RELEASED
+            or record.prepared is None
+            or record.prepared.parent_evidence != evidence
+            or authorization is None
+            or authorization.session_id != plan.terms.snapshot.session_id
+            or authorization.parent_txid != evidence.parent_txid
+            or authorization.prepared_parent_tx_hex != evidence.parent_tx_hex
+            or authorization.channel_funding_outpoint != plan.terms.snapshot.funding_outpoint
+            or authorization.channel_input_index != evidence.channel_input_index
+        ):
+            raise ValueError("escrow authorization does not match the exact parent")
+        typed_witness = format_channel_input_witness(authorization)
+        self._escrow_authorized = True
+        return typed_witness
 
     async def _select_our_utxos(
         self,
@@ -785,6 +991,12 @@ class CoinJoinSession:
 
             total_amount = self.amount + self.offer.txfee
             required_amount = total_amount + 10000 - real_cjfee
+            if self.channel_input_escrow_plan is not None:
+                channel_contribution = (
+                    self.channel_input_escrow_plan.terms.snapshot.capacity_sats
+                    - self.channel_input_escrow_plan.terms.escrow_value_sats
+                )
+                required_amount = max(1, required_amount - channel_contribution)
 
             balances = {}
             for md in range(self.wallet.mixdepth_count):
@@ -810,6 +1022,9 @@ class CoinJoinSession:
             # two concurrent transactions (which would double-spend each other).
             exclude = set(exclude_utxos or set())
             exclude |= self.wallet.get_locked_input_outpoints()
+            if self.channel_input_escrow_plan is not None:
+                snapshot_outpoint = self.channel_input_escrow_plan.terms.snapshot.funding_outpoint
+                exclude.add((snapshot_outpoint.txid, snapshot_outpoint.vout))
 
             # Use merge algorithm for UTXO selection
             # Makers can consolidate UTXOs "for free" since takers pay all fees
@@ -823,6 +1038,23 @@ class CoinJoinSession:
             )
 
             utxos_dict = {(utxo.txid, utxo.vout): utxo for utxo in selected}
+
+            if not utxos_dict:
+                return {}, "", "", -1
+
+            if self.channel_input_escrow_plan is not None:
+                ordinary_change = (
+                    sum(utxo.value for utxo in selected)
+                    + self.channel_input_escrow_plan.terms.snapshot.capacity_sats
+                    - self.amount
+                    - self.offer.txfee
+                    + real_cjfee
+                    - self.channel_input_escrow_plan.terms.escrow_value_sats
+                )
+                if ordinary_change < 0:
+                    return {}, "", "", -1
+                if 0 < ordinary_change <= DUST_THRESHOLD:
+                    return {}, "", "", -1
 
             # "Block first, then continue": persist a lock on the chosen inputs
             # before revealing them to the taker. Acquisition is atomic across
@@ -849,6 +1081,11 @@ class CoinJoinSession:
             change_amount = (
                 sum(u.value for u in selected) - self.amount - self.offer.txfee + real_cjfee
             )
+            if self.channel_input_escrow_plan is not None:
+                change_amount += (
+                    self.channel_input_escrow_plan.terms.snapshot.capacity_sats
+                    - self.channel_input_escrow_plan.terms.escrow_value_sats
+                )
             change_address = await self._build_change_address(max_mixdepth, change_amount)
 
             # Reserve addresses immediately after selection to prevent reuse
@@ -916,6 +1153,7 @@ class CoinJoinSession:
         peer: str,
         capacity: int,
         push_to_counterparty_msat: int | None = None,
+        user_channel_id: str | None = None,
     ) -> str | None:
         """Open an externally-funded Lightning channel of ``capacity`` sats to ``peer``.
 
@@ -936,7 +1174,7 @@ class CoinJoinSession:
             from jmswap.channel_funding import request_external_channel_funding
 
             peer_node_id, peer_address = peer.split("@", 1)
-            user_channel_id, funding_address = await request_external_channel_funding(
+            opened_channel_id, funding_address = await request_external_channel_funding(
                 ldk,
                 peer_node_id,
                 peer_address,
@@ -944,14 +1182,17 @@ class CoinJoinSession:
                 self.wallet.network,
                 push_to_counterparty_msat=push_to_counterparty_msat,
                 timeout=float(getattr(self, "channel_open_timeout", 45.0)),
+                user_channel_id=user_channel_id,
             )
-            self._channel_user_id = user_channel_id
+            if user_channel_id is not None and opened_channel_id != user_channel_id:
+                raise ValueError("channel backend returned a conflicting pending channel ID")
+            self._channel_user_id = opened_channel_id
             self._channel_funding_spk = address_to_scriptpubkey(funding_address)
             self._channel_capacity = capacity
             self._channel_push_msat = push_to_counterparty_msat or 0
             logger.info(
                 "channel-as-change: opened channel {} funding {} sats at {}",
-                user_channel_id,
+                opened_channel_id,
                 capacity,
                 funding_address,
             )
@@ -960,11 +1201,63 @@ class CoinJoinSession:
             logger.error("channel-as-change open failed, falling back: {}", exc)
             return None
 
+    def new_reserved_external_funding_id(self) -> str | None:
+        """Return a durable caller-selected ID only for backends that honor one."""
+        if not bool(getattr(self.ldk, "supports_reserved_external_funding_id", False)):
+            return None
+        return secrets.token_hex(32)
+
     async def _open_channel_change(self, change_amount: int) -> str | None:
         """Single-maker channel-as-change: open a channel of the change to channel_peer."""
         return await self.open_external_channel(
             getattr(self, "channel_peer", "") or "", change_amount
         )
+
+    async def restore_external_channel(
+        self,
+        *,
+        user_channel_id: str,
+        funding_address: str,
+        funding_scriptpubkey: str,
+        capacity: int,
+        push_to_counterparty_msat: int = 0,
+        edge_id: str | None = None,
+        authorization_id: str | None = None,
+    ) -> None:
+        """Restore a durably bound external channel open into this session."""
+        from jmcore.bitcoin import address_to_scriptpubkey
+
+        if not isinstance(user_channel_id, str) or not user_channel_id:
+            raise ValueError("pending channel ID is missing")
+        if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity <= 0:
+            raise ValueError("channel capacity is invalid")
+        if (
+            isinstance(push_to_counterparty_msat, bool)
+            or not isinstance(push_to_counterparty_msat, int)
+            or push_to_counterparty_msat < 0
+            or push_to_counterparty_msat >= capacity * 1000
+            or push_to_counterparty_msat % 1000
+        ):
+            raise ValueError("channel push is invalid")
+        if (edge_id is None) != (authorization_id is None):
+            raise ValueError("ring edge recovery identifiers are incomplete")
+        funding_spk = address_to_scriptpubkey(funding_address)
+        if funding_spk.hex() != funding_scriptpubkey.lower():
+            raise ValueError("durable funding address and script do not match")
+        existing_user_id = self._channel_user_id
+        if existing_user_id is not None and existing_user_id != user_channel_id:
+            raise ValueError("pending channel recovery conflicts with this session")
+        if self._channel_funding_spk is not None and self._channel_funding_spk != funding_spk:
+            raise ValueError("pending channel funding script conflicts with this session")
+        recovery = getattr(self.ldk, "recover_external_channel_funding", None)
+        if callable(recovery):
+            await recovery(user_channel_id, funding_address, capacity)
+        self._channel_user_id = user_channel_id
+        self._channel_funding_spk = funding_spk
+        self._channel_capacity = capacity
+        self._channel_push_msat = push_to_counterparty_msat
+        self._channel_edge_id = edge_id
+        self._channel_authorization_id = authorization_id
 
     async def _complete_channel_change(self, tx_hex: str) -> None:
         """Supply the CoinJoin funding outpoint to the LN backend after co-signing.
@@ -1013,6 +1306,15 @@ class CoinJoinSession:
         await complete_external_channel_funding(
             ldk, user_id, txid, vout, raw_tx_hex=tx_hex, input_utxos=input_utxos
         )
+        if edge_id is not None and authorization_id is not None:
+            from jmswap.ring_authorization import RingChannelPoint
+
+            store = self.ring_edge_authorization_store
+            if store is None:
+                raise RuntimeError("ring edge authorization store is unavailable")
+            store.complete_funding(
+                edge_id, authorization_id, RingChannelPoint(txid=txid, vout=vout)
+            )
         logger.info("channel-as-change: provided funding outpoint {}:{}", txid, vout)
 
     def _requires_pre_signing_channel_completion(self) -> bool:
@@ -1029,14 +1331,33 @@ class CoinJoinSession:
 
     async def _cancel_channel_change(self) -> None:
         """Best-effort cleanup of an in-flight channel open after rejection."""
+        if self._escrow_authorized:
+            return
         user_id = getattr(self, "_channel_user_id", None)
+        edge_id = self._channel_edge_id
+        authorization_id = self._channel_authorization_id
+        if edge_id is not None and authorization_id is not None:
+            store = self.ring_edge_authorization_store
+            if store is None:
+                raise RuntimeError("ring edge authorization store is unavailable")
+            record = store.load(edge_id)
+            if record is None or record.authorization.authorization_id != authorization_id:
+                raise RuntimeError("ring edge authorization record does not match")
+            if record.funding_completed:
+                return
+            store.cancel_funding(edge_id, authorization_id)
         ldk = getattr(self, "ldk", None)
         cancel = getattr(ldk, "cancel_external_channel_funding", None)
-        if not user_id:
-            return
         try:
-            if cancel is not None:
+            if user_id and callable(cancel):
                 await cancel(user_id)
+            elif user_id:
+                raise RuntimeError("channel backend cannot cancel external funding")
+            if edge_id is not None and authorization_id is not None and user_id:
+                completion_store = self.ring_edge_authorization_store
+                if completion_store is None:
+                    raise RuntimeError("ring edge authorization store is unavailable")
+                completion_store.complete_funding_cancellation(edge_id, authorization_id)
         except Exception as exc:  # noqa: BLE001 - retain the original verification error
             logger.error("channel-as-change cancellation failed: {}", exc)
         finally:

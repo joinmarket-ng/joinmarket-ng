@@ -7,12 +7,15 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from jmcore.models import NetworkType, Offer, OfferType
 from jmcore.network import TCPConnection
+from jmswap.channel_escrow import EscrowLifecycleState
 
+import maker.protocol_handlers as protocol_handlers
 from maker.bot import MakerBot
 from maker.config import MakerConfig
 from maker.fidelity import FidelityBondInfo
@@ -47,6 +50,106 @@ async def test_concurrent_timeout_cleanup_aborts_session_once() -> None:
 
     session.abort.assert_awaited_once_with()
     assert bot.active_sessions == {}
+
+
+async def test_stop_closes_escrow_deployment_before_network_clients() -> None:
+    events: list[str] = []
+
+    class Deployment:
+        async def close(self) -> None:
+            events.append("deployment")
+
+    class Client:
+        async def close(self) -> None:
+            events.append("network")
+
+    bot = MagicMock(spec=MakerBot)
+    bot.running = True
+    bot.listen_tasks = []
+    bot.hidden_service_listener = None
+    bot.direct_connections = {"direct": Client()}
+    bot.directory_clients = {"directory": Client()}
+    bot.channel_input_escrow_deployment = Deployment()
+    bot.channel_input_escrow_coordinator = MagicMock()
+    bot._cleanup_tor_hidden_service = AsyncMock()
+
+    await MakerBot.stop(bot)
+
+    assert events == ["deployment", "network", "network"]
+    assert bot.channel_input_escrow_deployment is None
+    assert bot.channel_input_escrow_coordinator is None
+
+
+@pytest.mark.asyncio
+async def test_fill_injects_deployment_plan_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+    offer = Offer(
+        counterparty="maker",
+        oid=0,
+        ordertype=OfferType.SW0_ABSOLUTE,
+        minsize=1,
+        maxsize=1_000_000,
+        txfee=1_000,
+        cjfee=500,
+    )
+
+    class Inner:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+    class Session:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def validate_channel(self, _source: str) -> bool:
+            return True
+
+        async def handle_fill(
+            self, _amount: int, _commitment: str, _taker_key: str
+        ) -> tuple[bool, dict[str, str]]:
+            return False, {"error": "decline"}
+
+    class Deployment:
+        async def plan_for_authenticated_fill(self) -> None:
+            return None
+
+    config = MakerConfig(
+        mnemonic="test " * 12,
+        channel_input_escrow={"enabled": True},
+        swap_provider={
+            "lnd_grpc_url": "127.0.0.1:10009",
+            "lnd_tls_cert_path": "/lnd/tls.cert",
+            "lnd_macaroon_path": "/lnd/admin.macaroon",
+            "lnd_escrow_macaroon_path": "/lnd/escrow.macaroon",
+        },
+    )
+    bot = SimpleNamespace(
+        _own_wallet_nicks=set(),
+        offer_manager=SimpleNamespace(
+            get_offer_by_id=lambda _offers, _offer_id: offer,
+            validate_offer_fill=lambda _offer, _amount: (True, ""),
+        ),
+        current_offers=[offer],
+        wallet=object(),
+        backend=object(),
+        config=config,
+        ring_edge_authorization_store=None,
+        channel_input_escrow_deployment=Deployment(),
+        active_sessions={},
+    )
+    monkeypatch.setattr(protocol_handlers, "CoinJoinSession", Inner)
+    monkeypatch.setattr(protocol_handlers, "MakerSession", Session)
+    monkeypatch.setattr(protocol_handlers, "check_commitment", lambda _commitment: True)
+
+    await protocol_handlers.ProtocolHandlersMixin._handle_fill(
+        bot, "taker", f"fill 0 1000 {'02' * 33} P{'01' * 32}"
+    )
+
+    assert captured["channel_input_escrow_plan_provider"] == (
+        bot.channel_input_escrow_deployment.plan_for_authenticated_fill
+    )
+    assert captured["channel_change"] is False
+    assert captured["combine_capable"] is False
 
 
 class TestOfferAnnouncement:
@@ -525,7 +628,7 @@ class TestHandlePush:
         import base64
 
         # Create a dummy transaction (minimal valid format)
-        tx_bytes = bytes.fromhex("0100000000010000000000")
+        tx_bytes = bytes.fromhex("01000000000000000000")
         tx_b64 = base64.b64encode(tx_bytes).decode("ascii")
 
         await maker_bot._handle_push("J5taker123", f"push {tx_b64}")
@@ -559,7 +662,7 @@ class TestHandlePush:
         # Make broadcast fail
         maker_bot.backend.broadcast_transaction = AsyncMock(side_effect=Exception("Network error"))
 
-        tx_bytes = bytes.fromhex("0100000000010000000000")
+        tx_bytes = bytes.fromhex("01000000000000000000")
         tx_b64 = base64.b64encode(tx_bytes).decode("ascii")
 
         # Should not raise
@@ -567,6 +670,74 @@ class TestHandlePush:
 
         # Broadcast was attempted
         maker_bot.backend.broadcast_transaction.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_handle_push_finalizes_and_broadcasts_durable_escrow_parent(
+        self, maker_bot, monkeypatch
+    ):
+        tx_bytes = bytes.fromhex("01000000000000000000")
+        tx_hex = tx_bytes.hex()
+        tx_b64 = base64.b64encode(tx_bytes).decode("ascii")
+        record = MagicMock(
+            state=EscrowLifecycleState.CHANNEL_SIGNATURE_RELEASED,
+            session_id="edge-1",
+        )
+        coordinator = MagicMock()
+        coordinator.find_parent.return_value = record
+        coordinator.finalize_parent = AsyncMock()
+        coordinator.broadcast_parent = AsyncMock()
+        maker_bot.channel_input_escrow_coordinator = coordinator
+        finalized = MagicMock()
+        validate = MagicMock(return_value=finalized)
+        monkeypatch.setattr(protocol_handlers, "validate_finalized_escrow_parent", validate)
+
+        await maker_bot._handle_push("J5taker123", f"push {tx_b64}")
+
+        validate.assert_called_once_with(record, tx_hex)
+        coordinator.finalize_parent.assert_awaited_once_with("edge-1", finalized)
+        coordinator.broadcast_parent.assert_awaited_once_with("edge-1")
+        maker_bot.backend.broadcast_transaction.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_handle_push_rejects_unreleased_escrow_without_generic_broadcast(self, maker_bot):
+        tx_bytes = bytes.fromhex("01000000000000000000")
+        tx_b64 = base64.b64encode(tx_bytes).decode("ascii")
+        coordinator = MagicMock()
+        coordinator.find_parent.return_value = MagicMock(
+            state=EscrowLifecycleState.TIMEOUT_SIGNED,
+            session_id="edge-1",
+            finalized_parent=None,
+        )
+        coordinator.finalize_parent = AsyncMock()
+        coordinator.broadcast_parent = AsyncMock()
+        maker_bot.channel_input_escrow_coordinator = coordinator
+
+        await maker_bot._handle_push("J5taker123", f"push {tx_b64}")
+
+        coordinator.finalize_parent.assert_not_awaited()
+        coordinator.broadcast_parent.assert_not_awaited()
+        maker_bot.backend.broadcast_transaction.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_handle_push_replays_exact_durable_escrow_broadcast(self, maker_bot):
+        tx_bytes = bytes.fromhex("01000000000000000000")
+        tx_hex = tx_bytes.hex()
+        tx_b64 = base64.b64encode(tx_bytes).decode("ascii")
+        coordinator = MagicMock()
+        coordinator.find_parent.return_value = MagicMock(
+            state=EscrowLifecycleState.PARENT_SIGNED,
+            session_id="edge-1",
+            finalized_parent=MagicMock(signed_parent_tx_hex=tx_hex),
+        )
+        coordinator.finalize_parent = AsyncMock()
+        coordinator.broadcast_parent = AsyncMock()
+        maker_bot.channel_input_escrow_coordinator = coordinator
+
+        await maker_bot._handle_push("J5taker123", f"push {tx_b64}")
+
+        coordinator.finalize_parent.assert_not_awaited()
+        coordinator.broadcast_parent.assert_awaited_once_with("edge-1")
+        maker_bot.backend.broadcast_transaction.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_handle_push_via_privmsg(self, maker_bot):

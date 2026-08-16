@@ -13,6 +13,7 @@ import json
 import os
 from typing import TYPE_CHECKING, Any
 
+from jmcore.bitcoin import get_txid
 from jmcore.commitment_blacklist import add_commitment, check_commitment, validate_commitment_hex
 from jmcore.crypto import NickIdentity
 from jmcore.deduplication import MessageDeduplicator
@@ -22,12 +23,16 @@ from jmcore.notifications import get_notifier
 from jmcore.protocol import COMMAND_PREFIX, JM_VERSION, MessageType
 from jmcore.rate_limiter import RateLimitAction, RateLimiter
 from jmcore.tasks import parse_directory_address
+from jmswap.channel_escrow import EscrowLifecycleState
+from jmswap.escrow_coordinator import ChannelInputEscrowCoordinator
 from jmwallet.backends.base import BlockchainBackend
 from jmwallet.wallet.service import WalletService
 from loguru import logger
 
 from maker.coinjoin import CoinJoinSession
 from maker.config import MakerConfig
+from maker.escrow_deployment import ChannelInputEscrowDeployment
+from maker.escrow_parent import validate_finalized_escrow_parent
 from maker.fidelity import FidelityBondInfo, create_fidelity_bond_proof
 from maker.maker_session import MakerSession
 from maker.offers import OfferManager
@@ -56,6 +61,8 @@ class ProtocolHandlersMixin:
     current_block_height: int
     directory_clients: dict[str, DirectoryClient]
     active_sessions: dict[str, MakerSession]
+    channel_input_escrow_coordinator: ChannelInputEscrowCoordinator | None
+    channel_input_escrow_deployment: ChannelInputEscrowDeployment | None
     offer_manager: OfferManager
     _message_deduplicator: MessageDeduplicator
     _message_rate_limiter: RateLimiter
@@ -481,6 +488,11 @@ class ProtocolHandlersMixin:
                 ),
                 ln_node=getattr(self.config, "ln_node", None),
                 ring_edge_authorization_store=self.ring_edge_authorization_store,
+                channel_input_escrow_plan_provider=(
+                    self.channel_input_escrow_deployment.plan_for_authenticated_fill
+                    if self.channel_input_escrow_deployment is not None
+                    else None
+                ),
             )
             session = MakerSession(inner=session_inner)
 
@@ -616,6 +628,33 @@ class ProtocolHandlersMixin:
                 tx_hex = tx_bytes.hex()
             except Exception as e:
                 logger.error(f"Failed to decode !push transaction: {e}")
+                return
+
+            coordinator = self.channel_input_escrow_coordinator
+            escrow_record = None
+            pushed_txid = None
+            if coordinator is not None:
+                try:
+                    pushed_txid = get_txid(tx_hex)
+                    escrow_record = coordinator.find_parent(pushed_txid)
+                except Exception as e:
+                    logger.warning(f"Rejected !push during escrow parent lookup: {e}")
+                    return
+
+            if coordinator is not None and escrow_record is not None:
+                try:
+                    if escrow_record.state is EscrowLifecycleState.CHANNEL_SIGNATURE_RELEASED:
+                        finalized = validate_finalized_escrow_parent(escrow_record, tx_hex)
+                        await coordinator.finalize_parent(escrow_record.session_id, finalized)
+                    elif (
+                        escrow_record.finalized_parent is None
+                        or escrow_record.finalized_parent.signed_parent_tx_hex != tx_hex
+                    ):
+                        raise ValueError("escrow parent is not ready for broadcast")
+                    await coordinator.broadcast_parent(escrow_record.session_id)
+                    logger.info(f"Broadcast escrow parent for {taker_nick}: {pushed_txid}")
+                except Exception as e:
+                    logger.warning(f"Rejected escrow !push transaction: {e}")
                 return
 
             logger.info(f"Received !push from {taker_nick}, broadcasting transaction...")

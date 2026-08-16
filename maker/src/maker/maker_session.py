@@ -468,6 +468,9 @@ class MakerSession:
         """
         address = ""
         response = ""
+        cleanup_edge_id: str | None = None
+        cleanup_authorization_id: str | None = None
+        store = None
         try:
             self.validate_channel(source)
             parts = msg.split()
@@ -492,33 +495,114 @@ class MakerSession:
                 authorization = record.authorization
                 if authorization.role_for(bot.nick) is not RingEdgeRole.FUNDER:
                     raise ChannelInputEscrowError("only the authorized funder may open the edge")
+                if not bool(
+                    getattr(self.inner.ldk, "supports_reserved_external_funding_id", False)
+                ) or not bool(
+                    getattr(self.inner.ldk, "supports_external_funding_cancellation", False)
+                ):
+                    raise ChannelInputEscrowError(
+                        "channel backend lacks durable ring funding support"
+                    )
                 if authorization.expires_at_unix <= int(time.time()):
                     raise ChannelInputEscrowError("ring edge authorization has expired")
                 peer = authorization.receiver_ln_node
                 capacity = authorization.capacity_sats
                 push_msat = authorization.receiver_contribution_sats * 1000
-                logger.info(f"chanreq: opening {capacity} sat authorized ring channel")
-                addr = await self.inner.open_external_channel(
-                    peer, capacity, push_to_counterparty_msat=push_msat
-                )
-                address = addr or ""
-                if address:
-                    from jmcore.bitcoin import address_to_scriptpubkey
-
-                    self.inner._channel_edge_id = edge_id
-                    self.inner._channel_authorization_id = authorization_id
-                    store.bind_funding(
-                        edge_id,
-                        authorization_id,
-                        address,
-                        address_to_scriptpubkey(address).hex(),
+                if record.channel_point is not None and record.funding_completed:
+                    address = record.funding_address or ""
+                elif record.funding_address is None and record.pending_channel_id is not None:
+                    if not record.funding_cancel_completed:
+                        cleanup_edge_id = edge_id
+                        cleanup_authorization_id = authorization_id
+                    raise ChannelInputEscrowError("ring funding reservation requires cancellation")
+                elif record.funding_address is not None:
+                    if record.funding_canceled:
+                        if not record.funding_cancel_completed:
+                            cleanup_edge_id = edge_id
+                            cleanup_authorization_id = authorization_id
+                        raise ChannelInputEscrowError("ring funding recovery data is unavailable")
+                    if record.pending_channel_id is None:
+                        raise ChannelInputEscrowError("ring funding recovery data is unavailable")
+                    await self.inner.restore_external_channel(
+                        user_channel_id=record.pending_channel_id,
+                        funding_address=record.funding_address,
+                        funding_scriptpubkey=record.funding_scriptpubkey or "",
+                        capacity=capacity,
+                        push_to_counterparty_msat=push_msat,
+                        edge_id=edge_id,
+                        authorization_id=authorization_id,
                     )
+                    address = record.funding_address
+                else:
+                    logger.info(f"chanreq: opening {capacity} sat authorized ring channel")
+                    reserved_id = self.inner.new_reserved_external_funding_id()
+                    if reserved_id is not None:
+                        store.reserve_funding(edge_id, authorization_id, reserved_id)
+                        cleanup_edge_id = edge_id
+                        cleanup_authorization_id = authorization_id
+                    addr = await self.inner.open_external_channel(
+                        peer,
+                        capacity,
+                        push_to_counterparty_msat=push_msat,
+                        user_channel_id=reserved_id,
+                    )
+                    address = addr or ""
+                    if not address:
+                        if reserved_id is not None:
+                            cleanup_edge_id = edge_id
+                            cleanup_authorization_id = authorization_id
+                            raise ChannelInputEscrowError("channel backend failed reserved open")
+                    else:
+                        from jmcore.bitcoin import address_to_scriptpubkey
+
+                        pending_channel_id = reserved_id or self.inner._channel_user_id
+                        if pending_channel_id is None:
+                            raise ChannelInputEscrowError(
+                                "channel backend omitted pending channel ID"
+                            )
+                        self.inner._channel_edge_id = edge_id
+                        self.inner._channel_authorization_id = authorization_id
+                        cleanup_edge_id = edge_id
+                        cleanup_authorization_id = authorization_id
+                        store.bind_funding(
+                            edge_id,
+                            authorization_id,
+                            address,
+                            address_to_scriptpubkey(address).hex(),
+                            pending_channel_id=pending_channel_id,
+                        )
+                if address:
                     response = f"1 {edge_id} {authorization_id} {address}"
                 logger.info(f"chanreq: ring channel funding address = {address or '(failed)'}")
         except Exception as e:  # noqa: BLE001 - never block the round; reply empty
             logger.error(f"chanreq handling failed: {e}")
-            if self.inner._channel_user_id is not None:
+            if (
+                cleanup_edge_id is not None
+                and cleanup_authorization_id is not None
+                and self.inner._channel_edge_id == cleanup_edge_id
+                and self.inner._channel_authorization_id == cleanup_authorization_id
+            ):
                 await self.inner._cancel_channel_change()
+            elif (
+                cleanup_edge_id is not None
+                and cleanup_authorization_id is not None
+                and store is not None
+            ):
+                try:
+                    record = store.load(cleanup_edge_id)
+                    cancel = getattr(self.inner.ldk, "cancel_external_channel_funding", None)
+                    if (
+                        record is not None
+                        and record.pending_channel_id is not None
+                        and callable(cancel)
+                    ):
+                        store.cancel_funding(cleanup_edge_id, cleanup_authorization_id)
+                        await cancel(record.pending_channel_id)
+                        store.complete_funding_cancellation(
+                            cleanup_edge_id, cleanup_authorization_id
+                        )
+                except Exception as cleanup_exc:  # noqa: BLE001 - startup reconciliation retries
+                    logger.error("reserved ring funding cleanup failed: {}", cleanup_exc)
         await self.send_response(bot, "chanaddr", {"address": response})
 
     async def on_chancancel(self, bot: MakerBotProtocol, msg: str, source: str) -> None:
@@ -544,11 +628,34 @@ class MakerSession:
             ):
                 raise ChannelInputEscrowError("ring cancellation authorization does not match")
             store = bot.ring_edge_authorization_store
-            record = store.load(edge_id) if store is not None else None
+            if store is None:
+                raise ChannelInputEscrowError("ring edge authorization store is unavailable")
+            record = store.load(edge_id)
             if record is None or record.authorization.authorization_id != authorization_id:
                 raise ChannelInputEscrowError("ring cancellation record does not match")
             if record.authorization.role_for(bot.nick) is not RingEdgeRole.FUNDER:
                 raise ChannelInputEscrowError("only the authorized funder can cancel an open")
+            if record.funding_completed:
+                return
+            if record.pending_channel_id is None:
+                raise ChannelInputEscrowError("ring cancellation recovery data is unavailable")
+            store.cancel_funding(edge_id, authorization_id)
+            if record.funding_address is None or record.funding_scriptpubkey is None:
+                cancel = getattr(self.inner.ldk, "cancel_external_channel_funding", None)
+                if not callable(cancel):
+                    raise ChannelInputEscrowError("channel backend cannot cancel reserved funding")
+                await cancel(record.pending_channel_id)
+                store.complete_funding_cancellation(edge_id, authorization_id)
+                return
+            await self.inner.restore_external_channel(
+                user_channel_id=record.pending_channel_id,
+                funding_address=record.funding_address,
+                funding_scriptpubkey=record.funding_scriptpubkey,
+                capacity=record.authorization.capacity_sats,
+                push_to_counterparty_msat=record.authorization.receiver_contribution_sats * 1000,
+                edge_id=edge_id,
+                authorization_id=authorization_id,
+            )
             await self.inner._cancel_channel_change()
         except Exception as exc:  # noqa: BLE001 - cancellation failures require operator review
             logger.error("chancancel handling failed: {}", exc)
@@ -665,6 +772,8 @@ class MakerSession:
                     # ignore trailing fields; ours reads index 6 when present.
                     if data.get("ln_node"):
                         fields.append(data["ln_node"])
+                if data.get("escrow_output"):
+                    fields.append(data["escrow_output"])
                 plaintext = " ".join(fields)
                 msg_content = self.crypto.encrypt(plaintext)
                 logger.debug(f"Encrypted ioauth message, plaintext_len={len(plaintext)}")

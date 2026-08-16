@@ -29,7 +29,13 @@ from loguru import logger
 from pydantic import SecretStr
 
 from maker.bot import MakerBot
-from maker.config import MakerConfig, MergeAlgorithm, OfferConfig, SwapProviderConfig
+from maker.config import (
+    ChannelInputEscrowConfig,
+    MakerConfig,
+    MergeAlgorithm,
+    OfferConfig,
+    SwapProviderConfig,
+)
 
 app = typer.Typer(no_args_is_help=True)
 
@@ -411,6 +417,9 @@ def build_maker_config(
             lnd_tls_cert_path=settings.maker.swap_provider.lnd_tls_cert_path,
             lnd_macaroon_path=settings.maker.swap_provider.lnd_macaroon_path,
             lnd_escrow_macaroon_path=settings.maker.swap_provider.lnd_escrow_macaroon_path,
+        ),
+        channel_input_escrow=ChannelInputEscrowConfig(
+            **settings.maker.channel_input_escrow.model_dump()
         ),
     )
 

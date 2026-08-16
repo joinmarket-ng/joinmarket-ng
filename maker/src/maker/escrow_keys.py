@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 from enum import StrEnum
 from typing import TYPE_CHECKING, Literal
 
@@ -30,6 +31,7 @@ class EscrowKeyPurpose(StrEnum):
     ESCROW = "escrow"
     CLAIM = "claim"
     TIMEOUT_DESTINATION = "timeout_destination"
+    NONCE_SEED = "nonce_seed"
 
 
 _APPLICATION_INDEX = (
@@ -45,7 +47,10 @@ _PURPOSE_INDICES = {
     EscrowKeyPurpose.ESCROW: 0,
     EscrowKeyPurpose.CLAIM: 1,
     EscrowKeyPurpose.TIMEOUT_DESTINATION: 2,
+    EscrowKeyPurpose.NONCE_SEED: 3,
 }
+_TIMEOUT_NONCE_DOMAIN = b"joinmarket-ng/channel-input-escrow/v1/timeout-nonce\x00"
+_INVOICE_PREIMAGE_DOMAIN = b"joinmarket-ng/channel-input-escrow/v1/invoice-preimage\x00"
 
 
 def _validate_session_id(session_id: str) -> None:
@@ -74,6 +79,18 @@ def escrow_derivation_path(
         *session_indices,
     ]
     return "m/" + "/".join(f"{index}'" for index in path_indices)
+
+
+def _normalize_32_byte_hex(value: str, label: str) -> bytes:
+    if not isinstance(value, str) or len(value) != 64:
+        raise EscrowKeyDerivationError(f"{label} must be a 32-byte hexadecimal string")
+    try:
+        normalized = bytes.fromhex(value)
+    except ValueError as exc:
+        raise EscrowKeyDerivationError(f"{label} must be a 32-byte hexadecimal string") from exc
+    if len(normalized) != 32:
+        raise EscrowKeyDerivationError(f"{label} must be a 32-byte hexadecimal string")
+    return normalized
 
 
 class EscrowKeyDerivation(BaseModel):
@@ -136,6 +153,71 @@ class EscrowKeyHandle:
             return self._key.private_key.sign_schnorr(digest)
         except Exception as exc:  # noqa: BLE001 - normalize key library failures
             raise EscrowKeyDerivationError("unable to sign escrow digest") from exc
+
+
+def derive_timeout_nonce_randomness(
+    nonce_seed: EscrowKeyHandle,
+    *,
+    edge_id: str,
+    timeout_txid: str,
+    timeout_sighash: bytes,
+    role: EscrowEndpointRole,
+) -> bytes:
+    """Derive deterministic, role-bound entropy for a timeout MuSig2 nonce."""
+    if not isinstance(nonce_seed, EscrowKeyHandle):
+        raise EscrowKeyDerivationError("invalid timeout nonce seed")
+    if not isinstance(role, EscrowEndpointRole):
+        raise EscrowKeyDerivationError("invalid escrow endpoint role")
+
+    edge_id_bytes = _normalize_32_byte_hex(edge_id, "edge ID")
+    timeout_txid_bytes = _normalize_32_byte_hex(timeout_txid, "timeout transaction ID")
+    if not isinstance(timeout_sighash, bytes) or len(timeout_sighash) != 32:
+        raise EscrowKeyDerivationError("timeout sighash must be exactly 32 bytes")
+
+    metadata = nonce_seed.metadata
+    if metadata.purpose is not EscrowKeyPurpose.NONCE_SEED:
+        raise EscrowKeyDerivationError("timeout nonce seed has an invalid purpose")
+    if metadata.role is not role:
+        raise EscrowKeyDerivationError("timeout nonce seed role does not match")
+    if metadata.session_id != edge_id_bytes.hex():
+        raise EscrowKeyDerivationError("timeout nonce seed session does not match edge ID")
+
+    transcript = (
+        _TIMEOUT_NONCE_DOMAIN
+        + edge_id_bytes
+        + timeout_txid_bytes
+        + timeout_sighash
+        + role.value.encode("ascii")
+    )
+    return hmac.digest(nonce_seed.private_key_bytes(), transcript, "sha256")
+
+
+def derive_invoice_preimage(
+    nonce_seed: EscrowKeyHandle, *, edge_id: str, role: EscrowEndpointRole
+) -> bytes:
+    """Derive a deterministic invoice preimage without adding it to durable state.
+
+    The endpoint's nonce-seed key is wallet-derived and restored after a restart, so
+    the economic peer can recreate an identical invoice request without retaining a
+    sensitive preimage in an application journal.
+    """
+    if not isinstance(nonce_seed, EscrowKeyHandle):
+        raise EscrowKeyDerivationError("invalid invoice nonce seed")
+    if not isinstance(role, EscrowEndpointRole):
+        raise EscrowKeyDerivationError("invalid escrow endpoint role")
+    edge_id_bytes = _normalize_32_byte_hex(edge_id, "edge ID")
+    metadata = nonce_seed.metadata
+    if metadata.purpose is not EscrowKeyPurpose.NONCE_SEED:
+        raise EscrowKeyDerivationError("invoice nonce seed has an invalid purpose")
+    if metadata.role is not role:
+        raise EscrowKeyDerivationError("invoice nonce seed role does not match")
+    if metadata.session_id != edge_id_bytes.hex():
+        raise EscrowKeyDerivationError("invoice nonce seed session does not match edge ID")
+    return hmac.digest(
+        nonce_seed.private_key_bytes(),
+        _INVOICE_PREIMAGE_DOMAIN + edge_id_bytes + role.value.encode("ascii"),
+        "sha256",
+    )
 
 
 class WalletEscrowKeyDeriver:

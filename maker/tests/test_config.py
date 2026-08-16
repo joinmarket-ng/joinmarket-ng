@@ -8,7 +8,14 @@ import pytest
 from jmcore.models import OfferType
 from pydantic import ValidationError
 
-from maker.config import MakerConfig, MergeAlgorithm, OfferConfig, TorControlConfig
+from maker.config import (
+    ChannelInputEscrowConfig,
+    MakerConfig,
+    MergeAlgorithm,
+    OfferConfig,
+    SwapProviderConfig,
+    TorControlConfig,
+)
 
 # Test mnemonic (BIP39 test vector)
 TEST_MNEMONIC = (
@@ -140,6 +147,74 @@ class TestMakerConfigTorControl:
         assert config.tor_control.enabled is True
         assert config.tor_control.host == "tor"
         assert config.tor_control.cookie_path == Path("/var/lib/tor/control_auth_cookie")
+
+
+class TestChannelInputEscrowConfig:
+    """Tests for confirmation-gated channel-input escrow configuration."""
+
+    def test_defaults_are_disabled_and_valid(self) -> None:
+        """Escrow must stay disabled unless explicitly configured."""
+        escrow = ChannelInputEscrowConfig()
+        assert escrow.enabled is False
+        assert escrow.premium_sats == 1_000
+        assert escrow.escrow_value_sats == 150_000
+        assert escrow.minimum_feerate_sat_vb == 1.0
+
+    def test_peer_settlement_must_precede_success_broadcast(self) -> None:
+        """Peer settlement needs to complete before the success broadcast window."""
+        with pytest.raises(ValidationError, match="peer_settle_delta_blocks"):
+            ChannelInputEscrowConfig(
+                peer_settle_delta_blocks=36,
+                success_broadcast_delta_blocks=36,
+            )
+
+    def test_success_confirmation_window_must_precede_timeout(self) -> None:
+        """Success confirmation and reorg budget must fit before timeout."""
+        with pytest.raises(ValidationError, match="success_confirmation_budget_blocks"):
+            ChannelInputEscrowConfig(
+                success_broadcast_delta_blocks=36,
+                success_confirmation_budget_blocks=6,
+                reorg_margin_blocks=6,
+                timeout_delta_blocks=48,
+            )
+
+    def test_settings_model_enforces_timing_relationships(self) -> None:
+        """The settings model must reject invalid escrow lifecycle timing too."""
+        from jmcore.settings import ChannelInputEscrowSettings
+
+        with pytest.raises(ValidationError, match="peer_settle_delta_blocks"):
+            ChannelInputEscrowSettings(
+                peer_settle_delta_blocks=36,
+                success_broadcast_delta_blocks=36,
+            )
+
+    def test_enabled_escrow_requires_descriptor_wallet_backend(self) -> None:
+        """Escrow cannot run with a backend that lacks descriptor-wallet support."""
+        with pytest.raises(ValidationError, match="backend_type='descriptor_wallet'"):
+            MakerConfig(
+                mnemonic=TEST_MNEMONIC,
+                backend_type="neutrino",
+                channel_input_escrow=ChannelInputEscrowConfig(enabled=True),
+                swap_provider=SwapProviderConfig(
+                    lnd_grpc_url="127.0.0.1:10009",
+                    lnd_tls_cert_path="/data/lnd/tls.cert",
+                    lnd_macaroon_path="/data/lnd/admin.macaroon",
+                    lnd_escrow_macaroon_path="/data/lnd/escrow.macaroon",
+                ),
+            )
+
+    def test_enabled_escrow_requires_all_lnd_settings(self) -> None:
+        """Escrow requires dedicated LND connection and authorization paths."""
+        with pytest.raises(ValidationError, match="lnd_escrow_macaroon_path"):
+            MakerConfig(
+                mnemonic=TEST_MNEMONIC,
+                channel_input_escrow=ChannelInputEscrowConfig(enabled=True),
+                swap_provider=SwapProviderConfig(
+                    lnd_grpc_url="127.0.0.1:10009",
+                    lnd_tls_cert_path="/data/lnd/tls.cert",
+                    lnd_macaroon_path="/data/lnd/admin.macaroon",
+                ),
+            )
 
 
 class TestMergeAlgorithm:
@@ -393,6 +468,66 @@ class TestBuildMakerConfig:
         )
         assert config.swap_provider.enabled is False
         assert config.swap_provider.directions == ["swapin", "swapout"]
+
+    def test_channel_input_escrow_settings_forwarded(self) -> None:
+        """Channel-input escrow settings must round-trip into MakerConfig."""
+        from jmcore.settings import JoinMarketSettings
+
+        from maker.cli import build_maker_config
+
+        settings = JoinMarketSettings()
+        settings.bitcoin.backend_type = "descriptor_wallet"
+        escrow = settings.maker.channel_input_escrow
+        escrow.enabled = True
+        escrow.premium_sats = 2_000
+        escrow.timeout_compensation_sats = 600
+        escrow.escrow_value_sats = 200_000
+        escrow.timeout_fee_sats = 700
+        escrow.invoice_expiry_seconds = 4_200
+        escrow.invoice_min_final_cltv_delta = 20
+        escrow.peer_settle_delta_blocks = 25
+        escrow.success_broadcast_delta_blocks = 40
+        escrow.timeout_delta_blocks = 80
+        escrow.parent_confirmation_depth = 2
+        escrow.success_confirmation_depth = 2
+        escrow.success_confirmation_budget_blocks = 7
+        escrow.reorg_margin_blocks = 7
+        escrow.safety_delta_blocks = 4
+        escrow.preimage_budget_blocks = 3
+        escrow.peer_message_timeout_seconds = 31.0
+        escrow.payment_fee_limit_msat = 110_000
+        escrow.payment_timeout_seconds = 61
+        escrow.fee_target_blocks = 3
+        escrow.minimum_feerate_sat_vb = 1.5
+        escrow.monitor_poll_interval_seconds = 11.0
+        settings.maker.swap_provider.lnd_grpc_url = "127.0.0.1:10009"
+        settings.maker.swap_provider.lnd_tls_cert_path = "/data/lnd/tls.cert"
+        settings.maker.swap_provider.lnd_macaroon_path = "/data/lnd/admin.macaroon"
+        settings.maker.swap_provider.lnd_escrow_macaroon_path = "/data/lnd/escrow.macaroon"
+
+        config = build_maker_config(settings=settings, mnemonic=TEST_MNEMONIC, passphrase="")
+
+        assert config.channel_input_escrow.model_dump() == escrow.model_dump()
+        assert config.knapsack_capable is False
+        assert config.swap_provider.channel_change is False
+        assert config.capability_features() == set()
+
+    def test_channel_input_escrow_rejects_legacy_channel_change(self) -> None:
+        """Escrow and historical channel-change sessions must remain exclusive."""
+        with pytest.raises(ValidationError, match="cannot be combined"):
+            MakerConfig(
+                mnemonic=TEST_MNEMONIC,
+                channel_input_escrow=ChannelInputEscrowConfig(enabled=True),
+                knapsack_capable=True,
+                allow_legacy_channel_change=True,
+                ln_node="02ab@host:9735",
+                swap_provider=SwapProviderConfig(
+                    lnd_grpc_url="127.0.0.1:10009",
+                    lnd_tls_cert_path="/data/lnd/tls.cert",
+                    lnd_macaroon_path="/data/lnd/admin.macaroon",
+                    lnd_escrow_macaroon_path="/data/lnd/escrow.macaroon",
+                ),
+            )
 
     def test_max_sats_freeze_reuse_forwarded(self) -> None:
         """``wallet.max_sats_freeze_reuse`` must reach the MakerConfig (#529)."""

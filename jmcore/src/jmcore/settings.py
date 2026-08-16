@@ -732,6 +732,80 @@ class SwapProviderSettings(BaseModel):
     )
 
 
+class ChannelInputEscrowSettings(BaseModel):
+    """Settings for confirmation-gated channel-input escrow."""
+
+    enabled: bool = Field(default=False, description="Enable channel-input escrow.")
+    premium_sats: int = Field(default=1_000, ge=0, description="Escrow premium in satoshis.")
+    timeout_compensation_sats: int = Field(
+        default=500, ge=0, description="Timeout compensation in satoshis."
+    )
+    escrow_value_sats: int = Field(default=150_000, gt=0, description="Escrow value in satoshis.")
+    timeout_fee_sats: int = Field(default=500, ge=0, description="Timeout fee in satoshis.")
+    invoice_expiry_seconds: int = Field(
+        default=3_600, gt=0, description="Invoice expiry in seconds."
+    )
+    invoice_min_final_cltv_delta: int = Field(
+        default=18, gt=0, description="Minimum final CLTV delta for invoices."
+    )
+    peer_settle_delta_blocks: int = Field(
+        default=24, ge=0, description="Blocks reserved for peer settlement."
+    )
+    success_broadcast_delta_blocks: int = Field(
+        default=36, ge=0, description="Blocks before timeout to broadcast success."
+    )
+    timeout_delta_blocks: int = Field(default=72, gt=0, description="Timeout delta in blocks.")
+    parent_confirmation_depth: int = Field(
+        default=1, gt=0, description="Required parent confirmation depth."
+    )
+    success_confirmation_depth: int = Field(
+        default=1, gt=0, description="Required success confirmation depth."
+    )
+    success_confirmation_budget_blocks: int = Field(
+        default=6, gt=0, description="Blocks budgeted for success confirmation."
+    )
+    reorg_margin_blocks: int = Field(default=6, ge=0, description="Reorganization safety margin.")
+    safety_delta_blocks: int = Field(default=3, gt=0, description="Additional safety delta.")
+    preimage_budget_blocks: int = Field(
+        default=2, ge=0, description="Blocks budgeted for preimage."
+    )
+    peer_message_timeout_seconds: float = Field(
+        default=30.0, gt=0, description="Peer message timeout in seconds."
+    )
+    payment_fee_limit_msat: int = Field(
+        default=100_000, gt=0, description="Maximum Lightning payment fee in millisatoshis."
+    )
+    payment_timeout_seconds: int = Field(
+        default=60, gt=0, description="Lightning payment timeout in seconds."
+    )
+    fee_target_blocks: int = Field(default=2, gt=0, description="Fee estimation target in blocks.")
+    minimum_feerate_sat_vb: float = Field(
+        default=1.0, gt=0, description="Minimum transaction feerate in sat/vB."
+    )
+    monitor_poll_interval_seconds: float = Field(
+        default=10.0, gt=0, description="Seconds between escrow lifecycle monitor passes."
+    )
+
+    @model_validator(mode="after")
+    def validate_timing(self) -> ChannelInputEscrowSettings:
+        """Ensure the escrow lifecycle has sufficient confirmation time."""
+        if self.peer_settle_delta_blocks >= self.success_broadcast_delta_blocks:
+            raise ValueError(
+                "peer_settle_delta_blocks must be less than success_broadcast_delta_blocks"
+            )
+        if (
+            self.success_broadcast_delta_blocks
+            + self.success_confirmation_budget_blocks
+            + self.reorg_margin_blocks
+            >= self.timeout_delta_blocks
+        ):
+            raise ValueError(
+                "success_broadcast_delta_blocks + success_confirmation_budget_blocks + "
+                "reorg_margin_blocks must be less than timeout_delta_blocks"
+            )
+        return self
+
+
 class MakerSettings(BaseModel):
     """Maker-specific settings."""
 
@@ -975,6 +1049,10 @@ class MakerSettings(BaseModel):
     swap_provider: SwapProviderSettings = Field(
         default_factory=SwapProviderSettings,
         description="Bidirectional Lightning swap-provider settings.",
+    )
+    channel_input_escrow: ChannelInputEscrowSettings = Field(
+        default_factory=ChannelInputEscrowSettings,
+        description="Confirmation-gated channel-input escrow settings.",
     )
 
     @field_validator("cj_fee_relative", mode="before")

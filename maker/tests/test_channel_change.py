@@ -216,6 +216,89 @@ async def test_session_channel_change_opens_real_channel(wallet: WalletService) 
     assert ldk.completed == ("ucid-7", get_txid(tx_hex), 1)
 
 
+async def test_session_marks_ring_funding_completed_after_backend_success(
+    tmp_path: Path, wallet: WalletService
+) -> None:
+    """The backend effect follows the durable channel-point intent and marks completion."""
+    from jmcore.bitcoin import (
+        TxInput,
+        TxOutput,
+        create_p2tr_scriptpubkey,
+        get_txid,
+        serialize_transaction,
+    )
+    from jmcore.models import Offer, OfferType
+    from jmswap.ring_authorization import RingEdgeAuthorization, RingEdgeAuthorizationStore
+
+    from maker.coinjoin import CoinJoinSession
+
+    funding_spk = create_p2tr_scriptpubkey(b"\x48" * 32)
+    ldk = _FakeLdk(funding_spk)
+    authorization = RingEdgeAuthorization(
+        edge_id="11" * 32,
+        coinjoin_context="22" * 32,
+        taker_nick="taker",
+        taker_session_pubkey="33" * 32,
+        funder_nick="funder",
+        receiver_nick="receiver",
+        funder_session_pubkey="44" * 32,
+        receiver_session_pubkey="55" * 32,
+        funder_ln_node="02" + "66" * 32 + "@funder.example:9735",
+        receiver_ln_node="03" + "77" * 32 + "@receiver.example:9735",
+        coinjoin_amount_sats=100_000,
+        capacity_sats=250_000,
+        funder_contribution_sats=150_000,
+        receiver_contribution_sats=100_000,
+        expires_at_unix=2_000_000_000,
+    )
+    store = RingEdgeAuthorizationStore(tmp_path / "ring")
+    store.authorize(authorization, local_nick="funder", now_unix=1)
+    from jmcore.bitcoin import scriptpubkey_to_address
+
+    store.bind_funding(
+        authorization.edge_id,
+        authorization.authorization_id,
+        scriptpubkey_to_address(funding_spk, "regtest"),
+        funding_spk.hex(),
+        pending_channel_id="ring-channel",
+    )
+    session = CoinJoinSession(
+        taker_nick="taker",
+        offer=Offer(
+            counterparty="funder",
+            oid=0,
+            ordertype=OfferType.SW0_RELATIVE,
+            minsize=1,
+            maxsize=10_000_000,
+            txfee=0,
+            cjfee="0.0001",
+        ),
+        wallet=wallet,
+        backend=wallet.backend,
+        ldk=ldk,
+        ring_edge_authorization_store=store,
+    )
+    session._channel_user_id = "ring-channel"
+    session._channel_funding_spk = funding_spk
+    session._channel_edge_id = authorization.edge_id
+    session._channel_authorization_id = authorization.authorization_id
+    tx_hex = serialize_transaction(
+        2,
+        [TxInput.from_hex("ab" * 32, 0)],
+        [TxOutput(value=250_000, script=funding_spk)],
+        0,
+    ).hex()
+
+    await session._complete_channel_change(tx_hex)
+
+    record = store.load(authorization.edge_id)
+    assert record is not None
+    assert record.channel_point is not None
+    assert record.channel_point.txid == get_txid(tx_hex)
+    assert record.funding_completed is True
+    assert ldk.completed == ("ring-channel", get_txid(tx_hex), 0)
+
+
 async def test_lnd_funding_failure_refuses_to_sign(
     wallet: WalletService, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -32,6 +32,7 @@ from jmcore.tor_control import (
     TorControlClient,
     TorControlError,
 )
+from jmswap.escrow_coordinator import ChannelInputEscrowCoordinator
 from jmswap.ring_authorization import RingEdgeAuthorizationStore
 from jmwallet.backends.base import BlockchainBackend
 from jmwallet.wallet.service import WalletService
@@ -41,6 +42,10 @@ from maker.background_tasks import BackgroundTasksMixin
 from maker.config import MakerConfig
 from maker.direct_connection import DirectConnectionMixin
 from maker.directory_pool import MakerDirectoryPool
+from maker.escrow_deployment import (
+    ChannelInputEscrowDeployment,
+    build_channel_input_escrow_deployment,
+)
 from maker.fidelity import (
     FidelityBondInfo,
     create_fidelity_bond_proof,
@@ -95,6 +100,8 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         self._directory_pool.clients = self.directory_clients
         self.active_sessions: dict[str, MakerSession] = {}
         self.ring_edge_authorization_store: RingEdgeAuthorizationStore | None = None
+        self.channel_input_escrow_coordinator: ChannelInputEscrowCoordinator | None = None
+        self.channel_input_escrow_deployment: ChannelInputEscrowDeployment | None = None
         self.current_offers: list[Offer] = []
         self.fidelity_bond: FidelityBondInfo | None = None
         self.current_block_height: int = 0  # Cached block height for bond proof generation
@@ -381,7 +388,7 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
             resolved_data_dir = (
                 self.config.data_dir if self.config.data_dir else get_default_data_dir()
             )
-            if self.config.knapsack_capable and self.config.ln_node:
+            if self.config.knapsack_capable or self.config.channel_input_escrow.enabled:
                 self.ring_edge_authorization_store = RingEdgeAuthorizationStore(
                     resolved_data_dir / "ring_edge_authorizations"
                 )
@@ -510,6 +517,21 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
 
             total_balance = await self.wallet.get_total_balance()
             logger.info(f"Wallet synced. Total balance: {total_balance:,} sats")
+
+            if self.config.channel_input_escrow.enabled:
+                ring_store = self.ring_edge_authorization_store
+                if ring_store is None:
+                    raise RuntimeError("channel-input escrow requires a ring authorization store")
+                deployment = await build_channel_input_escrow_deployment(
+                    self.wallet, self.backend, self.config, ring_store
+                )
+                try:
+                    await deployment.start()
+                except BaseException:
+                    await deployment.close()
+                    raise
+                self.channel_input_escrow_deployment = deployment
+                self.channel_input_escrow_coordinator = deployment.coordinator
 
             # Find fidelity bond for proof generation
             # If a specific bond is selected in config, use it; otherwise use the best one
@@ -851,6 +873,11 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
 
         # Clean up Tor control connection (ephemeral hidden service auto-removed)
         await self._cleanup_tor_hidden_service()
+
+        if self.channel_input_escrow_deployment is not None:
+            await self.channel_input_escrow_deployment.close()
+            self.channel_input_escrow_deployment = None
+            self.channel_input_escrow_coordinator = None
 
         # Close all direct connections
         for conn in self.direct_connections.values():
