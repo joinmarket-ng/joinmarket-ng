@@ -1,0 +1,230 @@
+From a445cad7a58f4c38065e1d86a49a9b7c8532fc36 Mon Sep 17 00:00:00 2001
+From: m0wer <m0wer@sgn.space>
+Date: Sun, 16 Aug 2026 18:08:31 +0200
+Subject: [PATCH] fix(channelescrowrpc): return channel witness before publish
+
+Finalize and persist only the exact channel input witness so CoinJoin can collect the remaining input signatures before broadcast.
+
+Changelog: Support channel-input signing in multi-party CoinJoin transactions
+---
+ channeldb/channel_escrow.go           | 21 +++++----------
+ channeldb/channel_escrow_test.go      | 19 +++++++-------
+ lnrpc/channelescrowrpc/server.go      | 37 +++++++++++++++++++++------
+ lnrpc/channelescrowrpc/server_test.go | 18 +++++++++----
+ peer/brontide.go                      |  2 +-
+ 5 files changed, 58 insertions(+), 39 deletions(-)
+
+diff --git a/channeldb/channel_escrow.go b/channeldb/channel_escrow.go
+index 1d4894b..e4194ce 100644
+--- a/channeldb/channel_escrow.go
++++ b/channeldb/channel_escrow.go
+@@ -10,7 +10,6 @@ import (
+ 	"github.com/btcsuite/btcd/chaincfg/chainhash"
+ 	"github.com/btcsuite/btcd/wire"
+ 	"github.com/lightningnetwork/lnd/kvdb"
+-	"github.com/lightningnetwork/lnd/lntypes"
+ )
+ 
+ var (
+@@ -223,11 +222,11 @@ func (c *OpenChannel) CancelEscrow(sessionID [32]byte) error {
+ 	})
+ }
+ 
+-// FinalizeEscrowCoop atomically records the final parent and the regular
+-// cooperative-close broadcast record, preserving the escrow lock for audit and
+-// exact-spend classification.
+-func (c *OpenChannel) FinalizeEscrowCoop(sessionID [32]byte, closeTx *wire.MsgTx,
+-	closer lntypes.ChannelParty) error {
++// FinalizeEscrowInput atomically records the parent with its finalized channel
++// input witness, preserving the escrow lock for audit and exact-spend
++// classification. Other CoinJoin input witnesses may still be absent, so this
++// does not mark the transaction broadcast or schedule it for publication.
++func (c *OpenChannel) FinalizeEscrowInput(sessionID [32]byte, closeTx *wire.MsgTx) error {
+ 
+ 	if closeTx == nil {
+ 		return errors.New("nil escrow cooperative transaction")
+@@ -258,15 +257,7 @@ func (c *OpenChannel) FinalizeEscrowCoop(sessionID [32]byte, closeTx *wire.MsgTx
+ 		if err := putEscrowRecord(bucket, record); err != nil {
+ 			return err
+ 		}
+-		if err := bucket.Put(coopCloseTxKey, txBuf.Bytes()); err != nil {
+-			return err
+-		}
+-		channel.chanStatus |= ChanStatusCoopBroadcasted | ChanStatusEscrowLocked
+-		if closer.IsLocal() {
+-			channel.chanStatus |= ChanStatusLocalCloseInitiator
+-		} else {
+-			channel.chanStatus |= ChanStatusRemoteCloseInitiator
+-		}
++		channel.chanStatus |= ChanStatusEscrowLocked
+ 		return putOpenChannel(bucket, channel)
+ 	})
+ }
+diff --git a/channeldb/channel_escrow_test.go b/channeldb/channel_escrow_test.go
+index 1f2edbb..f3f5110 100644
+--- a/channeldb/channel_escrow_test.go
++++ b/channeldb/channel_escrow_test.go
+@@ -8,7 +8,6 @@ import (
+ 
+ 	"github.com/btcsuite/btcd/chaincfg/chainhash"
+ 	"github.com/btcsuite/btcd/wire"
+-	"github.com/lightningnetwork/lnd/lntypes"
+ 	"github.com/stretchr/testify/require"
+ )
+ 
+@@ -171,16 +170,16 @@ func TestEscrowRecordDurableTransitions(t *testing.T) {
+ 	var parent wire.MsgTx
+ 	require.NoError(t, parent.Deserialize(bytes.NewReader(prepared.ParentTx)))
+ 	parent.TxIn[0].Witness = wire.TxWitness{bytes.Repeat([]byte{9}, 64)}
+-	require.NoError(t, reloaded.FinalizeEscrowCoop(
+-		prepared.SessionID, &parent, lntypes.Local,
+-	))
+-	require.NoError(t, reloaded.FinalizeEscrowCoop(
+-		prepared.SessionID, &parent, lntypes.Local,
+-	))
++	require.NoError(t, reloaded.FinalizeEscrowInput(prepared.SessionID, &parent))
++	require.False(t, reloaded.HasChanStatus(ChanStatusCoopBroadcasted))
++	_, err = reloaded.BroadcastedCooperative()
++	require.ErrorIs(t, err, ErrNoCloseTx)
++	require.NoError(t, reloaded.FinalizeEscrowInput(prepared.SessionID, &parent))
+ 	parent.TxOut[0].Value++
+-	require.ErrorIs(t, reloaded.FinalizeEscrowCoop(
+-		prepared.SessionID, &parent, lntypes.Local,
+-	), ErrEscrowMutation)
++	require.ErrorIs(
++		t, reloaded.FinalizeEscrowInput(prepared.SessionID, &parent),
++		ErrEscrowMutation,
++	)
+ }
+ 
+ func TestEscrowCancelAndStatusString(t *testing.T) {
+diff --git a/lnrpc/channelescrowrpc/server.go b/lnrpc/channelescrowrpc/server.go
+index fa3fe41..2986f51 100644
+--- a/lnrpc/channelescrowrpc/server.go
++++ b/lnrpc/channelescrowrpc/server.go
+@@ -432,9 +432,6 @@ func (s *Server) FinalizeParent(_ context.Context, req *FinalizeParentRequest) (
+ 			return nil, err
+ 		}
+ 		txid := tx.TxHash()
+-		if err := s.publishFinalized(channel, *op, &tx); err != nil {
+-			return nil, err
+-		}
+ 		return &FinalizeParentResponse{RawTx: record.FinalTx, Txid: txid[:]}, nil
+ 	}
+ 	if len(req.GetAttemptId()) != sha256.Size || len(req.GetRemotePartialSignature()) != input.MuSig2PartialSigSize {
+@@ -468,21 +465,18 @@ func (s *Server) FinalizeParent(_ context.Context, req *FinalizeParentRequest) (
+ 		return nil, err
+ 	}
+ 	tx.TxIn[record.ChannelInputIndex].Witness = wire.TxWitness{finalSig.Serialize()}
+-	if err := verifyEscrowParent(tx, prevOuts); err != nil {
++	if err := verifyEscrowInput(tx, prevOuts, record.ChannelInputIndex); err != nil {
+ 		s.cleanupAttemptLocked(key)
+ 		s.mu.Unlock()
+ 		return nil, err
+ 	}
+-	if err := channel.FinalizeEscrowCoop(sessionID, tx, lntypes.Local); err != nil {
++	if err := channel.FinalizeEscrowInput(sessionID, tx); err != nil {
+ 		s.cleanupAttemptLocked(key)
+ 		s.mu.Unlock()
+ 		return nil, err
+ 	}
+ 	s.cleanupAttemptLocked(key)
+ 	s.mu.Unlock()
+-	if err := s.publishFinalized(channel, *op, tx); err != nil {
+-		return nil, err
+-	}
+ 	var raw bytes.Buffer
+ 	if err := tx.Serialize(&raw); err != nil {
+ 		return nil, err
+@@ -753,6 +747,33 @@ func verifyEscrowParent(tx *wire.MsgTx, prevOuts []channeldb.EscrowPrevOut) erro
+ 	return nil
+ }
+ 
++func verifyEscrowInput(tx *wire.MsgTx, prevOuts []channeldb.EscrowPrevOut,
++	channelInputIndex uint32) error {
++
++	if tx == nil || len(tx.TxIn) != len(prevOuts) ||
++		int(channelInputIndex) >= len(tx.TxIn) {
++
++		return errors.New("invalid escrow parent input set")
++	}
++	fetcher := txscript.NewMultiPrevOutFetcher(nil)
++	for i, prev := range prevOuts {
++		fetcher.AddPrevOut(tx.TxIn[i].PreviousOutPoint, &wire.TxOut{
++			Value: prev.Value, PkScript: prev.PkScript,
++		})
++	}
++	hashes := txscript.NewTxSigHashes(tx, fetcher)
++	index := int(channelInputIndex)
++	prev := prevOuts[index]
++	vm, err := txscript.NewEngine(
++		prev.PkScript, tx, index, txscript.StandardVerifyFlags, nil,
++		hashes, prev.Value, fetcher,
++	)
++	if err != nil {
++		return err
++	}
++	return vm.Execute()
++}
++
+ func attemptKey(op wire.OutPoint, sessionID [32]byte) string {
+ 	return op.String() + string(sessionID[:])
+ }
+diff --git a/lnrpc/channelescrowrpc/server_test.go b/lnrpc/channelescrowrpc/server_test.go
+index dc1a5ac..b25a83c 100644
+--- a/lnrpc/channelescrowrpc/server_test.go
++++ b/lnrpc/channelescrowrpc/server_test.go
+@@ -302,16 +302,23 @@ func TestProductionMuSigManagerFinalizesEscrowSpend(t *testing.T) {
+ 	channel, fundingScript := testEscrowChannel(t)
+ 	tx := wire.NewMsgTx(2)
+ 	tx.AddTxIn(&wire.TxIn{PreviousOutPoint: channel.FundingOutpoint})
++	tx.AddTxIn(&wire.TxIn{PreviousOutPoint: wire.OutPoint{Index: 2}})
+ 	tx.AddTxOut(&wire.TxOut{
+ 		Value:    900,
+ 		PkScript: []byte{txscript.OP_TRUE},
+ 	})
+ 	record := &channeldb.EscrowRecord{
+ 		ParentTx: serializeTestTx(t, tx),
+-		PrevOuts: []channeldb.EscrowPrevOut{{
+-			Value:    1_000,
+-			PkScript: fundingScript,
+-		}},
++		PrevOuts: []channeldb.EscrowPrevOut{
++			{Value: 1_000, PkScript: fundingScript},
++			{
++				Value: 1_000,
++				PkScript: append(
++					[]byte{txscript.OP_0, 20},
++					bytes.Repeat([]byte{8}, 20)...,
++				),
++			},
++		},
+ 	}
+ 	hash, err := escrowSighash(record)
+ 	require.NoError(t, err)
+@@ -369,7 +376,8 @@ func TestProductionMuSigManagerFinalizesEscrowSpend(t *testing.T) {
+ 	require.True(t, complete)
+ 	require.NotNil(t, finalSignature)
+ 	tx.TxIn[0].Witness = wire.TxWitness{finalSignature.Serialize()}
+-	require.NoError(t, verifyEscrowParent(tx, record.PrevOuts))
++	require.NoError(t, verifyEscrowInput(tx, record.PrevOuts, 0))
++	require.Error(t, verifyEscrowParent(tx, record.PrevOuts))
+ }
+ 
+ type testChannelSwitch struct {
+diff --git a/peer/brontide.go b/peer/brontide.go
+index 5a18eb9..098b61b 100644
+--- a/peer/brontide.go
++++ b/peer/brontide.go
+@@ -3346,7 +3346,7 @@ func (p *Brontide) restartCoopClose(lnChan *lnwallet.LightningChannel) (
+ 	}
+ 	if locked {
+ 		// The chain arbitrator republishes the exact cooperative close
+-		// transaction persisted by FinalizeEscrowCoop. Never start a normal
++		// exact parent authorized by the escrow record. Never start a normal
+ 		// close negotiation for the same funding output.
+ 		return nil, nil
+ 	}
+-- 
+2.55.0
+

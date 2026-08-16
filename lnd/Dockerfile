@@ -12,6 +12,7 @@ RUN git clone https://github.com/lightningnetwork/lnd.git \
     && cd /go/src/github.com/lightningnetwork/lnd \
     && git -c advice.detachedHead=false checkout "${LND_REV}" \
     && git apply /patches/*.patch \
+    && go test -tags=channelescrowrpc ./lnrpc/channelescrowrpc \
     && make release-install
 
 FROM alpine:3.22

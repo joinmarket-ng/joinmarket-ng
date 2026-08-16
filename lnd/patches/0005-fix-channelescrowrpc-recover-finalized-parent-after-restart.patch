@@ -1,0 +1,257 @@
+From 65225eb799ce01f1de7de1c7995dd368ab02caba Mon Sep 17 00:00:00 2001
+From: m0wer <m0wer@sgn.space>
+Date: Sun, 16 Aug 2026 20:55:38 +0200
+Subject: [PATCH] fix(channelescrowrpc): recover finalized parent after restart
+
+Verify and combine the durably persisted MuSig2 transcript when the in-memory signer attempt no longer exists.\n\nChangelog: Recover channel escrow parent finalization after LND restart
+---
+ lnrpc/channelescrowrpc/server.go      | 179 ++++++++++++++++++++++++--
+ lnrpc/channelescrowrpc/server_test.go |  12 ++
+ 2 files changed, 177 insertions(+), 14 deletions(-)
+
+diff --git a/lnrpc/channelescrowrpc/server.go b/lnrpc/channelescrowrpc/server.go
+index 117a175..548c453 100644
+--- a/lnrpc/channelescrowrpc/server.go
++++ b/lnrpc/channelescrowrpc/server.go
+@@ -15,6 +15,7 @@ import (
+ 
+ 	"github.com/btcsuite/btcd/blockchain"
+ 	"github.com/btcsuite/btcd/btcec/v2"
++	"github.com/btcsuite/btcd/btcec/v2/schnorr"
+ 	"github.com/btcsuite/btcd/btcec/v2/schnorr/musig2"
+ 	"github.com/btcsuite/btcd/btcutil"
+ 	"github.com/btcsuite/btcd/chaincfg/chainhash"
+@@ -434,30 +435,44 @@ func (s *Server) FinalizeParent(_ context.Context, req *FinalizeParentRequest) (
+ 		txid := tx.TxHash()
+ 		return &FinalizeParentResponse{RawTx: record.FinalTx, Txid: txid[:]}, nil
+ 	}
+-	if len(req.GetAttemptId()) != sha256.Size || len(req.GetRemotePartialSignature()) != input.MuSig2PartialSigSize {
++	if len(req.GetRemotePartialSignature()) != input.MuSig2PartialSigSize ||
++		len(req.GetAttemptId()) != 0 && len(req.GetAttemptId()) != sha256.Size {
++
+ 		return nil, errors.New("invalid signing attempt or partial signature length")
+ 	}
+ 	key := attemptKey(*op, sessionID)
+ 	s.mu.Lock()
+ 	attempt := s.attempts[key]
+-	if attempt == nil || !bytes.Equal(attempt.signerSession[:], req.GetAttemptId()) || len(attempt.partial) == 0 {
+-		s.mu.Unlock()
+-		return nil, errors.New("unknown unsigned signing attempt")
+-	}
+ 	remotePartial, err := input.DeserializePartialSignature(req.GetRemotePartialSignature())
+ 	if err != nil {
+ 		s.mu.Unlock()
+ 		return nil, err
+ 	}
+-	if err := verifyRemotePartial(channel, record, attempt, remotePartial); err != nil {
+-		s.mu.Unlock()
+-		return nil, err
+-	}
+-	finalSig, complete, err := s.cfg.Signer.MuSig2CombineSig(attempt.signerSession, []*musig2.PartialSignature{remotePartial})
+-	if err != nil || !complete {
+-		s.cleanupAttemptLocked(key)
+-		s.mu.Unlock()
+-		return nil, fmt.Errorf("unable to combine escrow signature: %w", err)
++	var finalSig *schnorr.Signature
++	if attempt != nil && bytes.Equal(attempt.signerSession[:], req.GetAttemptId()) &&
++		len(attempt.partial) != 0 {
++
++		if err := verifyRemotePartial(channel, record, attempt, remotePartial); err != nil {
++			s.mu.Unlock()
++			return nil, err
++		}
++		var complete bool
++		finalSig, complete, err = s.cfg.Signer.MuSig2CombineSig(
++			attempt.signerSession, []*musig2.PartialSignature{remotePartial},
++		)
++		if err != nil || !complete {
++			s.cleanupAttemptLocked(key)
++			s.mu.Unlock()
++			return nil, fmt.Errorf("unable to combine escrow signature: %w", err)
++		}
++	} else {
++		finalSig, err = combinePersistedEscrowPartials(
++			channel, record, remotePartial,
++		)
++		if err != nil {
++			s.mu.Unlock()
++			return nil, err
++		}
+ 	}
+ 	tx, prevOuts, err := deserializeEscrowParent(record)
+ 	if err != nil {
+@@ -646,6 +661,142 @@ func verifyRemotePartial(channel *channeldb.OpenChannel,
+ 	return nil
+ }
+ 
++func combinePersistedEscrowPartials(channel *channeldb.OpenChannel,
++	record *channeldb.EscrowRecord,
++	remotePartial *musig2.PartialSignature) (*schnorr.Signature, error) {
++
++	if record.Stage != channeldb.EscrowParentSigned ||
++		len(record.LocalPubNonce) != musig2.PubNonceSize ||
++		len(record.RemotePubNonce) != musig2.PubNonceSize ||
++		len(record.LocalPartialSig) != input.MuSig2PartialSigSize {
++
++		return nil, errors.New("durable signed escrow attempt required")
++	}
++	var localNonce, remoteNonce [musig2.PubNonceSize]byte
++	copy(localNonce[:], record.LocalPubNonce)
++	copy(remoteNonce[:], record.RemotePubNonce)
++	attempt := &signAttempt{
++		localNonce:     localNonce,
++		remoteNonce:    remoteNonce,
++		hasRemoteNonce: true,
++	}
++	if err := verifyRemotePartial(channel, record, attempt, remotePartial); err != nil {
++		return nil, err
++	}
++	localPartial, err := input.DeserializePartialSignature(record.LocalPartialSig)
++	if err != nil {
++		return nil, err
++	}
++	if err := verifyLocalPartial(channel, record, attempt, localPartial); err != nil {
++		return nil, err
++	}
++	combinedNonce, err := musig2.AggregateNonces(
++		[][musig2.PubNonceSize]byte{localNonce, remoteNonce},
++	)
++	if err != nil {
++		return nil, fmt.Errorf("aggregate escrow nonces: %w", err)
++	}
++	hash, err := escrowSighash(record)
++	if err != nil {
++		return nil, err
++	}
++	localKey := channel.LocalChanCfg.MultiSigKey.PubKey
++	remoteKey := channel.RemoteChanCfg.MultiSigKey.PubKey
++	keys := []*btcec.PublicKey{localKey, remoteKey}
++	keyOptions := []musig2.KeyAggOption{}
++	combineOptions := []musig2.CombineOption{}
++	if channel.TapscriptRoot.IsSome() {
++		channel.TapscriptRoot.WhenSome(func(root chainhash.Hash) {
++			keyOptions = append(keyOptions, musig2.WithTaprootKeyTweak(root[:]))
++			combineOptions = append(
++				combineOptions,
++				musig2.WithTaprootTweakedCombine(hash, keys, root[:], true),
++			)
++		})
++	} else {
++		keyOptions = append(keyOptions, musig2.WithBIP86KeyTweak())
++		combineOptions = append(
++			combineOptions, musig2.WithBip86TweakedCombine(hash, keys, true),
++		)
++	}
++	combinedKey, _, _, err := musig2.AggregateKeys(keys, true, keyOptions...)
++	if err != nil {
++		return nil, fmt.Errorf("aggregate escrow keys: %w", err)
++	}
++	finalNonce, err := escrowFinalNonce(combinedNonce, combinedKey.FinalKey, hash)
++	if err != nil {
++		return nil, err
++	}
++	return musig2.CombineSigs(
++		finalNonce,
++		[]*musig2.PartialSignature{localPartial, remotePartial},
++		combineOptions...,
++	), nil
++}
++
++func verifyLocalPartial(channel *channeldb.OpenChannel,
++	record *channeldb.EscrowRecord, attempt *signAttempt,
++	partial *musig2.PartialSignature) error {
++
++	localKey := channel.LocalChanCfg.MultiSigKey.PubKey
++	remoteKey := channel.RemoteChanCfg.MultiSigKey.PubKey
++	combinedNonce, err := musig2.AggregateNonces(
++		[][musig2.PubNonceSize]byte{attempt.localNonce, attempt.remoteNonce},
++	)
++	if err != nil {
++		return fmt.Errorf("aggregate escrow nonces: %w", err)
++	}
++	hash, err := escrowSighash(record)
++	if err != nil {
++		return err
++	}
++	signOptions := []musig2.SignOption{musig2.WithSortedKeys()}
++	if channel.TapscriptRoot.IsSome() {
++		channel.TapscriptRoot.WhenSome(func(root chainhash.Hash) {
++			signOptions = append(signOptions, musig2.WithTaprootSignTweak(root[:]))
++		})
++	} else {
++		signOptions = append(signOptions, musig2.WithBip86SignTweak())
++	}
++	if !partial.Verify(
++		attempt.localNonce, combinedNonce,
++		[]*btcec.PublicKey{localKey, remoteKey}, localKey, hash,
++		signOptions...,
++	) {
++		return errors.New("invalid durable local escrow partial signature")
++	}
++	return nil
++}
++
++func escrowFinalNonce(combinedNonce [musig2.PubNonceSize]byte,
++	combinedKey *btcec.PublicKey, hash [sha256.Size]byte) (*btcec.PublicKey, error) {
++
++	var nonceMessage bytes.Buffer
++	nonceMessage.Write(combinedNonce[:])
++	nonceMessage.Write(schnorr.SerializePubKey(combinedKey))
++	nonceMessage.Write(hash[:])
++	blindHash := chainhash.TaggedHash(musig2.NonceBlindTag, nonceMessage.Bytes())
++	var blinder btcec.ModNScalar
++	blinder.SetByteSlice(blindHash[:])
++	r1, err := btcec.ParseJacobian(combinedNonce[:btcec.PubKeyBytesLenCompressed])
++	if err != nil {
++		return nil, err
++	}
++	r2, err := btcec.ParseJacobian(combinedNonce[btcec.PubKeyBytesLenCompressed:])
++	if err != nil {
++		return nil, err
++	}
++	var nonce btcec.JacobianPoint
++	btcec.ScalarMultNonConst(&blinder, &r2, &r2)
++	btcec.AddNonConst(&r1, &r2, &nonce)
++	if nonce.Z.IsZero() {
++		btcec.GeneratorJacobian(&nonce)
++	} else {
++		nonce.ToAffine()
++	}
++	return btcec.NewPublicKey(&nonce.X, &nonce.Y), nil
++}
++
+ func (s *Server) publishFinalized(channel *channeldb.OpenChannel,
+ 	op wire.OutPoint, tx *wire.MsgTx) error {
+ 
+diff --git a/lnrpc/channelescrowrpc/server_test.go b/lnrpc/channelescrowrpc/server_test.go
+index 9193810..49a8015 100644
+--- a/lnrpc/channelescrowrpc/server_test.go
++++ b/lnrpc/channelescrowrpc/server_test.go
+@@ -348,6 +348,12 @@ func TestProductionMuSigManagerFinalizesEscrowSpend(t *testing.T) {
+ 	localPartial, err := manager.MuSig2Sign(session.SessionID, hash, false)
+ 	require.NoError(t, err)
+ 	require.NotNil(t, localPartial)
++	encodedLocalPartial, err := input.SerializePartialSignature(localPartial)
++	require.NoError(t, err)
++	record.Stage = channeldb.EscrowParentSigned
++	record.LocalPubNonce = session.PublicNonce[:]
++	record.RemotePubNonce = remoteNonces.PubNonce[:]
++	record.LocalPartialSig = encodedLocalPartial[:]
+ 
+ 	combinedNonce, err := musig2.AggregateNonces(
+ 		[][musig2.PubNonceSize]byte{
+@@ -378,6 +384,12 @@ func TestProductionMuSigManagerFinalizesEscrowSpend(t *testing.T) {
+ 	tx.TxIn[0].Witness = wire.TxWitness{finalSignature.Serialize()}
+ 	require.NoError(t, verifyEscrowInput(tx, record.PrevOuts, 0))
+ 	require.Error(t, verifyEscrowParent(tx, record.PrevOuts))
++
++	recoveredSignature, err := combinePersistedEscrowPartials(
++		channel, record, remotePartial,
++	)
++	require.NoError(t, err)
++	require.Equal(t, finalSignature.Serialize(), recoveredSignature.Serialize())
+ }
+ 
+ type testChannelSwitch struct {
+-- 
+2.55.0
