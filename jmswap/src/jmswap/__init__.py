@@ -93,6 +93,7 @@ from jmswap.errors import (
     SwapStateError,
     SwapVerificationError,
 )
+from jmswap.escrow_coordinator import ChannelInputEscrowCoordinator
 from jmswap.lightning import (
     FakeLightningBackend,
     FakeLightningNetwork,
@@ -144,6 +145,7 @@ __all__ = [
     "ChainObservationRequest",
     "ChannelInputEscrowBackend",
     "ChannelInputEscrowCapability",
+    "ChannelInputEscrowCoordinator",
     "ChannelInputEscrowError",
     "ChannelInputEscrowRecord",
     "ChannelInputEscrowStore",

@@ -522,6 +522,7 @@ class ChannelInputEscrowRecord(BaseModel):
     model_config = _MUTABLE_MODEL_CONFIG
 
     terms: ChannelInputEscrowTerms
+    negotiated_parent_evidence: EscrowParentEvidence | None = None
     state: EscrowLifecycleState = EscrowLifecycleState.NEGOTIATED
     prepared: PreparedChannelInputEscrow | None = None
     authorization: ParentAuthorization | None = None
@@ -540,8 +541,22 @@ class ChannelInputEscrowRecord(BaseModel):
 
     @model_validator(mode="after")
     def validate_bound_artifacts(self) -> ChannelInputEscrowRecord:
+        if self.negotiated_parent_evidence is not None:
+            if (
+                self.negotiated_parent_evidence.channel_funding_outpoint
+                != self.terms.snapshot.funding_outpoint
+            ):
+                raise ValueError("negotiated parent must spend the frozen channel")
+            if self.negotiated_parent_evidence.escrow_value_sats != self.terms.escrow_value_sats:
+                raise ValueError("negotiated parent escrow value must match the terms")
         if self.prepared is not None and self.prepared.terms != self.terms:
             raise ValueError("prepared artifact terms must match the escrow record")
+        if (
+            self.prepared is not None
+            and self.negotiated_parent_evidence is not None
+            and self.prepared.parent_evidence != self.negotiated_parent_evidence
+        ):
+            raise ValueError("prepared artifact must match the negotiated parent evidence")
         if self.authorization is not None:
             if self.authorization.session_id != self.terms.snapshot.session_id:
                 raise ValueError("parent authorization session must match escrow record")
@@ -782,6 +797,21 @@ class ChannelInputEscrowRecord(BaseModel):
     def _touch(self) -> None:
         self.revision += 1
         self.updated_at = datetime.now(UTC)
+
+    def bind_negotiated_parent(self, parent_evidence: EscrowParentEvidence) -> None:
+        """Irrevocably bind the exact parent intent before timeout preparation."""
+        if self.state is not EscrowLifecycleState.NEGOTIATED or self.prepared is not None:
+            raise ChannelInputEscrowError("parent intent can only bind before timeout preparation")
+        if self.negotiated_parent_evidence is not None:
+            if self.negotiated_parent_evidence != parent_evidence:
+                raise ChannelInputEscrowError("negotiated parent evidence is immutable")
+            return
+        if parent_evidence.channel_funding_outpoint != self.terms.snapshot.funding_outpoint:
+            raise ChannelInputEscrowError("negotiated parent must spend the frozen channel")
+        if parent_evidence.escrow_value_sats != self.terms.escrow_value_sats:
+            raise ChannelInputEscrowError("negotiated parent escrow value must match the terms")
+        self.negotiated_parent_evidence = parent_evidence
+        self._touch()
 
     def _chain_observation_error(self, observation: EscrowChainObservation) -> str | None:
         if observation.session_id != self.session_id:
@@ -1166,11 +1196,31 @@ class ChannelInputEscrowRecord(BaseModel):
         if chain_error is not None:
             raise ChannelInputEscrowError(chain_error)
         if target is EscrowLifecycleState.PARENT_REORGED:
-            self.state_before_reorg = {
+            terminal_active_state = {
                 EscrowLifecycleState.SUCCESS_SPEND_CONFIRMED: EscrowLifecycleState.SUCCESS_SPEND_PENDING,
                 EscrowLifecycleState.TIMEOUT_CONFIRMED: EscrowLifecycleState.TIMEOUT_PENDING,
                 EscrowLifecycleState.PAID_TIMEOUT_LOSS: EscrowLifecycleState.SUCCESS_SPEND_PENDING,
-            }.get(self.state, self.state)
+            }.get(self.state)
+            if terminal_active_state is not None:
+                self.state_before_reorg = terminal_active_state
+            elif (
+                self.state is EscrowLifecycleState.PAYMENT_IN_FLIGHT
+                and self.payment_result is not None
+                and self.payment_result.status is PaymentStatus.SUCCEEDED
+                and self.success_spend is not None
+            ):
+                self.state_before_reorg = EscrowLifecycleState.SUCCESS_SPEND_PENDING
+            elif (
+                self.state
+                in {
+                    EscrowLifecycleState.PARENT_CONFIRMED,
+                    EscrowLifecycleState.PAYMENT_IN_FLIGHT,
+                }
+                and self.timeout_broadcast is not None
+            ):
+                self.state_before_reorg = EscrowLifecycleState.TIMEOUT_PENDING
+            else:
+                self.state_before_reorg = self.state
             self.recovery_required = True
         elif self.state is EscrowLifecycleState.PARENT_REORGED and (
             restores_reorg_state
@@ -1517,7 +1567,12 @@ class RecoveryRequest(BaseModel):
 
 @runtime_checkable
 class ChannelInputEscrowBackend(Protocol):
-    """Endpoint operations required for the complete escrow lifecycle."""
+    """Endpoint operations required for the complete escrow lifecycle.
+
+    Side-effecting methods must durably memoize exact requests. A retry after an
+    interrupted RPC must return the same transaction, payment, nonce, or signature
+    evidence rather than creating a new semantic attempt.
+    """
 
     channel_input_escrow_capabilities: frozenset[ChannelInputEscrowCapability]
 

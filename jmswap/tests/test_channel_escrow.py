@@ -499,6 +499,85 @@ def test_record_cannot_abort_after_parent_authorization() -> None:
         record.advance(EscrowLifecycleState.ABORTED)
 
 
+def test_reorg_tracks_durable_descendant_broadcast_obligation() -> None:
+    terms = _terms()
+    prepared = _prepared(terms)
+    success_record = ChannelInputEscrowRecord(terms=terms)
+    success_record.attach_prepared(prepared)
+    success_record.advance(EscrowLifecycleState.TIMEOUT_SIGNED)
+    success_record.attach_authorization(_authorization())
+    success_record.advance(EscrowLifecycleState.PARENT_SIGNED)
+    success_record.attach_parent_broadcast(_parent_broadcast())
+    success_record.advance(EscrowLifecycleState.PARENT_PENDING)
+    success_record.attach_chain_observation(_chain_observation())
+    success_record.advance(EscrowLifecycleState.PARENT_CONFIRMED)
+    success_record.attach_payment_request(
+        SinglePartPaymentRequest(
+            prepared=prepared,
+            chain_observation=_chain_observation(),
+            excluded_channel_ids=("channel-1",),
+            requested_at_height=950,
+            requested_at_unix=1_900_000_000,
+        )
+    )
+    pending = SinglePartPaymentResult(
+        payment_id="payment-1",
+        status=PaymentStatus.PENDING,
+        attempt_height=950,
+        observed_height=950,
+        route=EscrowRouteEvidence(
+            part_count=1,
+            route_channel_ids=("channel-elsewhere",),
+            final_expiry_height=975,
+            outgoing_expiry_height=978,
+        ),
+    )
+    success_record.attach_payment_result(pending)
+    success_record.advance(EscrowLifecycleState.PAYMENT_IN_FLIGHT)
+    success_record.attach_payment_result(
+        pending.model_copy(
+            update={
+                "status": PaymentStatus.SUCCEEDED,
+                "preimage": PREIMAGE,
+                "observed_height": 978,
+                "settled_height": 978,
+            }
+        )
+    )
+    success_record.attach_success_spend(_success_spend())
+    success_record.attach_chain_observation(
+        _chain_observation(parent_confirmations=0, in_best_chain=False, observed_height=979)
+    )
+    success_record.advance(EscrowLifecycleState.PARENT_REORGED)
+    assert success_record.state_before_reorg is EscrowLifecycleState.SUCCESS_SPEND_PENDING
+
+    timeout_record = success_record.model_copy(
+        deep=True,
+        update={
+            "state": EscrowLifecycleState.PARENT_CONFIRMED,
+            "state_before_reorg": None,
+            "recovery_required": False,
+            "payment_request": None,
+            "payment_result": None,
+            "success_spends": (),
+            "chain_observation": _chain_observation(),
+        },
+    )
+    timeout_record.attach_timeout_broadcast(
+        EscrowTimeoutBroadcast(
+            session_id="session-1",
+            parent_txid=TXID,
+            timeout_txid=TIMEOUT_TXID,
+            broadcast_height=1_001,
+        )
+    )
+    timeout_record.attach_chain_observation(
+        _chain_observation(parent_confirmations=0, in_best_chain=False, observed_height=1_001)
+    )
+    timeout_record.advance(EscrowLifecycleState.PARENT_REORGED)
+    assert timeout_record.state_before_reorg is EscrowLifecycleState.TIMEOUT_PENDING
+
+
 def test_parent_authorization_requires_timeout_signed_and_exact_artifacts() -> None:
     terms = _terms()
     record = ChannelInputEscrowRecord(terms=terms)
@@ -707,6 +786,18 @@ def test_store_atomic_round_trip_and_corrupt_list_behavior(tmp_path: Path) -> No
     corrupt_path.write_text("not json")
     assert [saved.session_id for saved in store.list()] == ["session-1"]
     assert corrupt_path.exists()
+
+
+def test_negotiated_parent_intent_is_exact_and_immutable() -> None:
+    terms = _terms()
+    record = ChannelInputEscrowRecord(terms=terms)
+    parent = _prepared(terms).parent_evidence
+    record.bind_negotiated_parent(parent)
+    revision = record.revision
+    record.bind_negotiated_parent(parent)
+    assert record.revision == revision
+    with pytest.raises(ChannelInputEscrowError, match="immutable"):
+        record.bind_negotiated_parent(parent.model_copy(update={"parent_tx_hex": "0300"}))
 
 
 def test_store_hashes_session_paths_without_collisions(tmp_path: Path) -> None:

@@ -104,20 +104,34 @@ the standard macaroon remains the compatibility fallback when the scoped path is
 `prepare_channel_input_parent`, `begin_channel_input_signing`,
 `sign_channel_input_parent`, and `finalize_channel_input_parent` API. It deliberately
 continues to declare an empty full-lifecycle capability set. Timeout construction,
-peer-to-peer endpoint coordination, confirmation and reorganization monitoring,
-single-part payment enforcement, and success or timeout recovery are not yet wired.
+the concrete payment and chain adapter, and maker runtime ownership are not yet wired.
 `jmswap.bitcoin_escrow` provides the isolated cryptographic layer for constructing and
 independently verifying the role-ordered P2TR escrow tree, fully signed timeout child,
 and immediate RBF success sweep. Bitcoin Core regtest acceptance covers both spend paths.
 External channel funding APIs still do not satisfy this boundary merely by returning a
 new channel funding address.
 
-`jmswap.ChannelInputEscrowBackend` is the typed adapter contract for a future
-implementation. Its strict request and evidence models bind the quiescent channel
+`jmswap.ChannelInputEscrowBackend` is the typed adapter contract for the concrete
+endpoint implementation. Its strict request and evidence models bind the quiescent channel
 snapshot, exact parent, fully signed timeout child, parent authorization, fresh chain
 observation, single-part route, payment result, and success or timeout broadcast to one
 session. `require_channel_input_escrow_backend` requires both every declared capability
 and every protocol method, so partial adapters fail closed.
+
+Endpoint coordination uses authenticated LND custom messages on odd type `53357`.
+Canonical envelopes bind the immutable ring authorization, finalized channel point, both
+LND node identities, per-direction sequence, and previous message ID. The endpoint journal
+persists exact outbound bytes before sending, rejects conflicting replay, records inbound
+messages before dispatch, and redelivers incomplete work after restart. Version 1 requires
+the escrow session ID to equal an authorized maker-ring edge ID and therefore does not
+permit arbitrary external peers.
+
+`ChannelInputEscrowCoordinator` owns write-before-side-effect ordering for a complete
+backend. It durably records timeout evidence before parent authorization, records the exact
+confirmation-gated payment request before sending, monitors pending payments through parent
+reorganizations, and requires descendant rebroadcast evidence before restoring a reorged
+state. Startup reconciliation treats the local store as authoritative and rejects unknown,
+conflicting, duplicate, or ahead-of-local backend records before resuming side effects.
 
 `ChannelInputEscrowRecord` enforces the authorization and recovery ordering, retains the
 prior state across a parent reorganization, and rejects persisted states that lack their
