@@ -22,7 +22,12 @@ import secrets
 import time
 from typing import TYPE_CHECKING, Any
 
-from jmcore.bitcoin import get_txid, parse_transaction
+from jmcore.bitcoin import (
+    address_to_scriptpubkey,
+    get_txid,
+    parse_transaction,
+    scriptpubkey_to_address,
+)
 from jmcore.encryption import CryptoSession
 from jmcore.protocol import FEATURE_NEUTRINO_COMPAT, parse_utxo_list
 from jmwallet.history import (
@@ -43,6 +48,12 @@ from taker.config import BroadcastPolicy
 from taker.models import MakerSession, PhaseResult
 from taker.orderbook import calculate_cj_fee
 from taker.podle import ExtendedPoDLECommitment, get_eligible_podle_utxos
+from taker.signatures import (
+    P2TRSignatureFormatError,
+    normalize_scriptpubkey,
+    parse_p2tr_maker_signature,
+    verify_p2tr_keypath_signature,
+)
 from taker.tx_builder import CoinJoinTxBuilder, build_coinjoin_tx
 
 if TYPE_CHECKING:
@@ -257,6 +268,236 @@ class CoinJoinSession:
             )
             del self.maker_sessions[nick]
         return dropped
+
+    def _parse_ioauth_optional_fields(
+        self, session: MakerSession, optional_fields: list[str]
+    ) -> None:
+        """Parse backward-compatible and tagged optional !ioauth fields."""
+        session.escrow_output_address = ""
+        session.escrow_output_value = 0
+
+        escrow_tokens = [field for field in optional_fields if field.startswith("escrow:")]
+        if len(escrow_tokens) > 1:
+            raise ValueError("duplicate escrow output token")
+        if escrow_tokens:
+            token_parts = escrow_tokens[0].split(":")
+            if len(token_parts) != 3 or token_parts[0] != "escrow":
+                raise ValueError("malformed escrow output token")
+
+            value_text, address = token_parts[1:]
+            if not value_text.isascii() or not value_text.isdecimal():
+                raise ValueError("escrow output value must be a decimal amount")
+            value = int(value_text)
+            if value <= 0:
+                raise ValueError("escrow output value must be positive")
+
+            try:
+                scriptpubkey = address_to_scriptpubkey(address)
+                canonical_address = scriptpubkey_to_address(scriptpubkey, self.config.network.value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("invalid escrow output address") from exc
+            if address.lower() != canonical_address.lower():
+                raise ValueError("escrow output address is for the wrong network")
+            if len(scriptpubkey) != 34 or scriptpubkey[:2] != b"\x51\x20":
+                raise ValueError("escrow output address must be P2TR")
+
+            session.escrow_output_address = address
+            session.escrow_output_value = value
+
+        # The legacy untagged fields retain their positional meaning. A tagged
+        # escrow field occupies its own position and must not be mistaken for either.
+        if optional_fields and not optional_fields[0].startswith("escrow:"):
+            session.cc_funding_pubkey = optional_fields[0]
+            logger.info(
+                f"{session.nick} offered channel-as-change (cc_pubkey "
+                f"{session.cc_funding_pubkey[:16]}...)"
+            )
+        if len(optional_fields) >= 2 and not optional_fields[1].startswith("escrow:"):
+            session.ln_node = optional_fields[1]
+
+    async def _process_ioauth_response(self, nick: str, response: dict[str, str]) -> bool:
+        """Process one maker !ioauth response and report whether it is usable."""
+        try:
+            session = self.maker_sessions[nick]
+            if session.crypto is None:
+                logger.warning(f"No encryption session for {nick}")
+                return False
+
+            # Extract encrypted data (first part of response)
+            response_data = response["data"].strip()
+            parts = response_data.split()
+            if not parts:
+                logger.warning(f"Empty !ioauth response from {nick}")
+                return False
+
+            encrypted_data = parts[0]
+
+            # Decrypt the ioauth message
+            decrypted = session.crypto.decrypt(encrypted_data)
+            logger.debug(f"Decrypted !ioauth response from {nick}")
+
+            # Parse: <utxo_list> <auth_pub> <cj_addr> <change_addr> <btc_sig>
+            ioauth_parts = decrypted.split()
+            if len(ioauth_parts) < 4:
+                logger.warning(
+                    f"Invalid !ioauth format from {nick}: expected 5 parts, got {len(ioauth_parts)}"
+                )
+                return False
+
+            utxo_list_str = ioauth_parts[0]
+            auth_pub = ioauth_parts[1]
+            cj_addr = ioauth_parts[2]
+            change_addr = ioauth_parts[3]
+
+            # Verify btc_sig if present - proves maker owns the UTXO
+            # NOTE: BTC sig verification is OPTIONAL per JoinMarket protocol
+            # It provides additional security by proving maker controls the UTXO
+            # but not all makers may provide it
+            if len(ioauth_parts) >= 5:
+                btc_sig = ioauth_parts[4]
+                # The signature is over the maker's NaCl pubkey
+                from jmcore.crypto import ecdsa_verify
+
+                maker_nacl_pk = session.pubkey  # Maker's NaCl pubkey from !pubkey
+                auth_pub_bytes = bytes.fromhex(auth_pub)
+                logger.debug(
+                    f"Verifying BTC sig from {nick}: "
+                    f"message={maker_nacl_pk[:32]}..., "
+                    f"sig={btc_sig[:32]}..., "
+                    f"pubkey={auth_pub[:16]}..."
+                )
+                if not ecdsa_verify(maker_nacl_pk, btc_sig, auth_pub_bytes):
+                    logger.warning(
+                        f"BTC signature verification failed from {nick} - "
+                        f"continuing anyway (optional security feature)"
+                    )
+                    # NOTE: We don't delete the session here - BTC sig is optional
+                    # The transaction verification will still protect against fraud
+                else:
+                    logger.info(f"BTC signature verified for {nick}")
+
+            # Optional fields after btc_sig retain the legacy cc/ln positions,
+            # with one tagged escrow output token accepted anywhere among them.
+            self._parse_ioauth_optional_fields(session, ioauth_parts[5:])
+
+            # Parse utxo_list using protocol helper
+            # (handles both legacy and extended format)
+            # Then verify each UTXO using the appropriate backend method
+            session.utxos = []
+            utxo_metadata_list = parse_utxo_list(utxo_list_str)
+
+            # Track if maker sent extended format
+            has_extended = any(u.has_neutrino_metadata() for u in utxo_metadata_list)
+            if has_extended:
+                session.supports_neutrino_compat = True
+                logger.debug(f"Maker {nick} sent extended UTXO format (neutrino_compat)")
+
+            utxo_verification_failed = False
+            for utxo_meta in utxo_metadata_list:
+                txid = utxo_meta.txid
+                vout = utxo_meta.vout
+                scriptpubkey = ""
+                scriptpubkey_was_provided = False
+
+                # Verify UTXO and get value/address
+                try:
+                    if (
+                        self.backend.requires_neutrino_metadata()
+                        and utxo_meta.has_neutrino_metadata()
+                    ):
+                        # Use Neutrino-compatible verification with metadata
+                        result = await self.backend.verify_utxo_with_metadata(
+                            txid=txid,
+                            vout=vout,
+                            scriptpubkey=utxo_meta.scriptpubkey,  # type: ignore
+                            blockheight=utxo_meta.blockheight,  # type: ignore
+                        )
+                        if result.valid:
+                            value = result.value
+                            address = ""  # Not available from verification
+                            scriptpubkey_was_provided = True
+                            scriptpubkey = normalize_scriptpubkey(utxo_meta.scriptpubkey or "")
+                            logger.debug(f"Neutrino-verified UTXO {txid}:{vout} = {value} sats")
+                        else:
+                            logger.warning(
+                                f"Neutrino UTXO verification failed for "
+                                f"{txid}:{vout}: {result.error}"
+                            )
+                            utxo_verification_failed = True
+                            break
+                    else:
+                        # Full node: direct UTXO lookup
+                        utxo_info = await self.backend.get_utxo(txid, vout)
+                        if utxo_info:
+                            value = utxo_info.value
+                            address = utxo_info.address
+                            if utxo_info.scriptpubkey:
+                                scriptpubkey_was_provided = True
+                                scriptpubkey = normalize_scriptpubkey(utxo_info.scriptpubkey)
+                        else:
+                            # Fallback: get raw transaction and parse it
+                            tx_info = await self.backend.get_transaction(txid)
+                            if tx_info and tx_info.raw:
+                                parsed_tx = parse_transaction(tx_info.raw)
+                                if parsed_tx and len(parsed_tx.outputs) > vout:
+                                    value = parsed_tx.outputs[vout].value
+                                    scriptpubkey_was_provided = True
+                                    scriptpubkey = normalize_scriptpubkey(
+                                        parsed_tx.outputs[vout].scriptpubkey
+                                    )
+                                    try:
+                                        address = parsed_tx.outputs[vout].address(
+                                            self.config.network
+                                        )
+                                    except (ValueError, Exception):
+                                        address = ""
+                                else:
+                                    logger.warning(f"Could not parse output {vout} from tx {txid}")
+                                    value = 0
+                                    address = ""
+                            else:
+                                logger.warning(f"Could not fetch transaction {txid}")
+                                value = 0
+                                address = ""
+                except Exception as e:
+                    logger.warning(f"Error verifying UTXO {txid}:{vout}: {e}")
+                    if scriptpubkey_was_provided:
+                        utxo_verification_failed = True
+                        break
+                    value = 0
+                    address = ""
+
+                session.utxos.append(
+                    {
+                        "txid": txid,
+                        "vout": vout,
+                        "value": value,
+                        "address": address,
+                        "scriptpubkey": scriptpubkey,
+                    }
+                )
+                logger.debug(f"Added UTXO from {nick}: {txid}:{vout} = {value} sats")
+
+            if utxo_verification_failed:
+                logger.warning(
+                    f"Dropping maker {nick}: one or more UTXOs failed "
+                    "Neutrino verification (likely already spent)"
+                )
+                return False
+
+            session.cj_address = cj_addr
+            session.change_address = change_addr
+            session.auth_pubkey = auth_pub  # Store for later verification
+            session.responded_auth = True
+            logger.debug(
+                f"Processed !ioauth from {nick}: {len(session.utxos)} UTXOs, "
+                f"cj_addr={cj_addr[:16]}..."
+            )
+        except Exception as e:
+            logger.warning(f"Invalid !ioauth response from {nick}: {e}")
+            return False
+
+        return True
 
     async def _phase_fill(self) -> PhaseResult:
         """Send !fill to all selected makers and wait for !pubkey responses.
@@ -611,190 +852,7 @@ class CoinJoinSession:
         # Response format from directory: "<encrypted_data> <signing_pubkey> <signature>"
         for nick in list(self.maker_sessions.keys()):
             if nick in responses:
-                try:
-                    session = self.maker_sessions[nick]
-                    if session.crypto is None:
-                        logger.warning(f"No encryption session for {nick}")
-                        failed_makers.append(nick)
-                        del self.maker_sessions[nick]
-                        continue
-
-                    # Extract encrypted data (first part of response)
-                    response_data = responses[nick]["data"].strip()
-                    parts = response_data.split()
-                    if not parts:
-                        logger.warning(f"Empty !ioauth response from {nick}")
-                        failed_makers.append(nick)
-                        del self.maker_sessions[nick]
-                        continue
-
-                    encrypted_data = parts[0]
-
-                    # Decrypt the ioauth message
-                    decrypted = session.crypto.decrypt(encrypted_data)
-                    logger.debug(f"Decrypted !ioauth from {nick}: {decrypted[:50]}...")
-
-                    # Parse: <utxo_list> <auth_pub> <cj_addr> <change_addr> <btc_sig>
-                    ioauth_parts = decrypted.split()
-                    if len(ioauth_parts) < 4:
-                        logger.warning(
-                            f"Invalid !ioauth format from {nick}: expected 5 parts, "
-                            f"got {len(ioauth_parts)}"
-                        )
-                        failed_makers.append(nick)
-                        del self.maker_sessions[nick]
-                        continue
-
-                    utxo_list_str = ioauth_parts[0]
-                    auth_pub = ioauth_parts[1]
-                    cj_addr = ioauth_parts[2]
-                    change_addr = ioauth_parts[3]
-
-                    # Verify btc_sig if present - proves maker owns the UTXO
-                    # NOTE: BTC sig verification is OPTIONAL per JoinMarket protocol
-                    # It provides additional security by proving maker controls the UTXO
-                    # but not all makers may provide it
-                    if len(ioauth_parts) >= 5:
-                        btc_sig = ioauth_parts[4]
-                        # The signature is over the maker's NaCl pubkey
-                        from jmcore.crypto import ecdsa_verify
-
-                        maker_nacl_pk = session.pubkey  # Maker's NaCl pubkey from !pubkey
-                        auth_pub_bytes = bytes.fromhex(auth_pub)
-                        logger.debug(
-                            f"Verifying BTC sig from {nick}: "
-                            f"message={maker_nacl_pk[:32]}..., "
-                            f"sig={btc_sig[:32]}..., "
-                            f"pubkey={auth_pub[:16]}..."
-                        )
-                        if not ecdsa_verify(maker_nacl_pk, btc_sig, auth_pub_bytes):
-                            logger.warning(
-                                f"BTC signature verification failed from {nick} - "
-                                f"continuing anyway (optional security feature)"
-                            )
-                            # NOTE: We don't delete the session here - BTC sig is optional
-                            # The transaction verification will still protect against fraud
-                        else:
-                            logger.info(f"BTC signature verified for {nick}")
-
-                    # Optional 6th field: the maker's maker-to-maker channel-as-change
-                    # funding pubkey (backward compatible; absent for plain makers).
-                    if len(ioauth_parts) >= 6:
-                        session.cc_funding_pubkey = ioauth_parts[5]
-                        logger.info(
-                            f"{nick} offered channel-as-change (cc_pubkey "
-                            f"{session.cc_funding_pubkey[:16]}...)"
-                        )
-                    # 7th field: the maker's Lightning node, for true-pooling LND ring opens.
-                    if len(ioauth_parts) >= 7:
-                        session.ln_node = ioauth_parts[6]
-
-                    # Parse utxo_list using protocol helper
-                    # (handles both legacy and extended format)
-                    # Then verify each UTXO using the appropriate backend method
-                    session.utxos = []
-                    utxo_metadata_list = parse_utxo_list(utxo_list_str)
-
-                    # Track if maker sent extended format
-                    has_extended = any(u.has_neutrino_metadata() for u in utxo_metadata_list)
-                    if has_extended:
-                        session.supports_neutrino_compat = True
-                        logger.debug(f"Maker {nick} sent extended UTXO format (neutrino_compat)")
-
-                    utxo_verification_failed = False
-                    for utxo_meta in utxo_metadata_list:
-                        txid = utxo_meta.txid
-                        vout = utxo_meta.vout
-
-                        # Verify UTXO and get value/address
-                        try:
-                            if (
-                                self.backend.requires_neutrino_metadata()
-                                and utxo_meta.has_neutrino_metadata()
-                            ):
-                                # Use Neutrino-compatible verification with metadata
-                                result = await self.backend.verify_utxo_with_metadata(
-                                    txid=txid,
-                                    vout=vout,
-                                    scriptpubkey=utxo_meta.scriptpubkey,  # type: ignore
-                                    blockheight=utxo_meta.blockheight,  # type: ignore
-                                )
-                                if result.valid:
-                                    value = result.value
-                                    address = ""  # Not available from verification
-                                    logger.debug(
-                                        f"Neutrino-verified UTXO {txid}:{vout} = {value} sats"
-                                    )
-                                else:
-                                    logger.warning(
-                                        f"Neutrino UTXO verification failed for "
-                                        f"{txid}:{vout}: {result.error}"
-                                    )
-                                    utxo_verification_failed = True
-                                    break
-                            else:
-                                # Full node: direct UTXO lookup
-                                utxo_info = await self.backend.get_utxo(txid, vout)
-                                if utxo_info:
-                                    value = utxo_info.value
-                                    address = utxo_info.address
-                                else:
-                                    # Fallback: get raw transaction and parse it
-                                    tx_info = await self.backend.get_transaction(txid)
-                                    if tx_info and tx_info.raw:
-                                        parsed_tx = parse_transaction(tx_info.raw)
-                                        if parsed_tx and len(parsed_tx.outputs) > vout:
-                                            value = parsed_tx.outputs[vout].value
-                                            try:
-                                                address = parsed_tx.outputs[vout].address(
-                                                    self.config.network
-                                                )
-                                            except (ValueError, Exception):
-                                                address = ""
-                                        else:
-                                            logger.warning(
-                                                f"Could not parse output {vout} from tx {txid}"
-                                            )
-                                            value = 0
-                                            address = ""
-                                    else:
-                                        logger.warning(f"Could not fetch transaction {txid}")
-                                        value = 0
-                                        address = ""
-                        except Exception as e:
-                            logger.warning(f"Error verifying UTXO {txid}:{vout}: {e}")
-                            value = 0
-                            address = ""
-
-                        session.utxos.append(
-                            {
-                                "txid": txid,
-                                "vout": vout,
-                                "value": value,
-                                "address": address,
-                            }
-                        )
-                        logger.debug(f"Added UTXO from {nick}: {txid}:{vout} = {value} sats")
-
-                    if utxo_verification_failed:
-                        logger.warning(
-                            f"Dropping maker {nick}: one or more UTXOs failed "
-                            "Neutrino verification (likely already spent)"
-                        )
-                        failed_makers.append(nick)
-                        del self.maker_sessions[nick]
-                        continue
-
-                    session.cj_address = cj_addr
-                    session.change_address = change_addr
-                    session.auth_pubkey = auth_pub  # Store for later verification
-                    session.responded_auth = True
-                    logger.debug(
-                        f"Processed !ioauth from {nick}: {len(session.utxos)} UTXOs, "
-                        f"cj_addr={cj_addr[:16]}..."
-                    )
-                except Exception as e:
-                    logger.warning(f"Invalid !ioauth response from {nick}: {e}")
+                if not await self._process_ioauth_response(nick, responses[nick]):
                     failed_makers.append(nick)
                     del self.maker_sessions[nick]
             else:
@@ -851,6 +909,22 @@ class CoinJoinSession:
             else:
                 # Normal mode: include taker change
                 num_outputs = 1 + len(self.maker_sessions) + 1 + len(self.maker_sessions)
+
+            # An escrow treatment replaces the normal maker change only when it
+            # consumes that entire change. Otherwise it adds one output for its
+            # separately accounted value.
+            num_outputs += sum(
+                1
+                for session in self.maker_sessions.values()
+                if 0
+                < session.escrow_output_value
+                < (
+                    sum(int(utxo["value"]) for utxo in session.utxos)
+                    - self.cj_amount
+                    - session.offer.txfee
+                    + calculate_cj_fee(session.offer, self.cj_amount)
+                )
+            )
 
             # Calculate actual tx fee based on real transaction size
             actual_tx_fee = self._estimate_tx_fee(num_inputs, num_outputs)
@@ -1039,6 +1113,8 @@ class CoinJoinSession:
                     "change_addr": session.change_address,
                     "cjfee": cjfee,
                     "txfee": maker_txfee,
+                    "escrow_address": session.escrow_output_address,
+                    "escrow_value": session.escrow_output_value,
                 }
 
             # Maker-to-maker channel-as-change (opt-in): pair makers that advertised a
@@ -1574,6 +1650,60 @@ class CoinJoinSession:
                     "LND ring: failed to cancel edge funded by {}: {}", channel.party_a, exc
                 )
 
+    def _build_p2tr_prevouts(self, tx: Any) -> tuple[list[int], list[bytes]] | None:
+        """Build the complete, ordered prevout vector required by BIP341 sighash."""
+        known_prevouts: dict[tuple[str, int], tuple[int, bytes]] = {}
+
+        def add_prevout(txid: object, vout: object, value: object, scriptpubkey: object) -> bool:
+            if (
+                not isinstance(txid, str)
+                or not isinstance(vout, int)
+                or isinstance(vout, bool)
+                or vout < 0
+                or vout > 0xFFFFFFFF
+                or not isinstance(value, int)
+                or isinstance(value, bool)
+                or value <= 0
+                or not isinstance(scriptpubkey, str)
+            ):
+                return False
+            try:
+                script = bytes.fromhex(normalize_scriptpubkey(scriptpubkey))
+            except (TypeError, ValueError):
+                return False
+            outpoint = (txid, vout)
+            if outpoint in known_prevouts:
+                return False
+            known_prevouts[outpoint] = (value, script)
+            return True
+
+        for utxo in self.selected_utxos:
+            if not add_prevout(utxo.txid, utxo.vout, utxo.value, utxo.scriptpubkey):
+                return None
+        for maker_session in self.maker_sessions.values():
+            for maker_utxo in maker_session.utxos:
+                if not isinstance(maker_utxo, dict) or not add_prevout(
+                    maker_utxo.get("txid"),
+                    maker_utxo.get("vout"),
+                    maker_utxo.get("value"),
+                    maker_utxo.get("scriptpubkey"),
+                ):
+                    return None
+
+        prevout_values: list[int] = []
+        prevout_scripts: list[bytes] = []
+        resolved_outpoints: set[tuple[str, int]] = set()
+        for tx_input in tx.inputs:
+            outpoint = (tx_input.txid_le[::-1].hex(), tx_input.vout)
+            prevout = known_prevouts.get(outpoint)
+            if prevout is None or outpoint in resolved_outpoints:
+                return None
+            resolved_outpoints.add(outpoint)
+            value, script = prevout
+            prevout_values.append(value)
+            prevout_scripts.append(script)
+        return prevout_values, prevout_scripts
+
     async def _phase_collect_signatures(self) -> bool:
         """Send !tx and collect !sig responses from makers.
 
@@ -1734,6 +1864,64 @@ class CoinJoinSession:
 
                         encrypted_data = parts[0]
                         decrypted_sig = session.crypto.decrypt(encrypted_data)
+
+                        if decrypted_sig.startswith("p2tr:"):
+                            try:
+                                p2tr_signature = parse_p2tr_maker_signature(decrypted_sig)
+                            except P2TRSignatureFormatError:
+                                logger.warning(f"Invalid typed P2TR signature from {nick}")
+                                continue
+
+                            matching_indices = [
+                                idx
+                                for idx, (txid, vout) in input_map.items()
+                                if idx not in matched_indices
+                                and txid == p2tr_signature.txid
+                                and vout == p2tr_signature.vout
+                                and idx < len(self.tx_metadata.get("input_owners", []))
+                                and self.tx_metadata["input_owners"][idx] == nick
+                            ]
+                            if len(matching_indices) != 1:
+                                logger.warning(
+                                    f"Typed P2TR signature from {nick} did not bind to one input"
+                                )
+                                continue
+
+                            prevouts = self._build_p2tr_prevouts(tx)
+                            if prevouts is None:
+                                logger.warning(
+                                    "Cannot verify typed P2TR signature: "
+                                    "incomplete or invalid prevouts"
+                                )
+                                continue
+                            prevout_values, prevout_scripts = prevouts
+                            p2tr_input_idx = matching_indices[0]
+                            if not verify_p2tr_keypath_signature(
+                                self.unsigned_tx,
+                                p2tr_input_idx,
+                                prevout_values,
+                                prevout_scripts,
+                                p2tr_signature.signature,
+                            ):
+                                logger.warning(
+                                    f"Typed P2TR signature from {nick} failed verification"
+                                )
+                                continue
+
+                            matched_indices.add(p2tr_input_idx)
+                            sig_infos.append(
+                                {
+                                    "txid": p2tr_signature.txid,
+                                    "vout": p2tr_signature.vout,
+                                    "witness": [p2tr_signature.signature.hex()],
+                                }
+                            )
+                            logger.debug(
+                                f"Verified typed P2TR signature from {nick} for input "
+                                f"{p2tr_input_idx} ({p2tr_signature.txid[:16]}...:"
+                                f"{p2tr_signature.vout})"
+                            )
+                            continue
 
                         # Parse signature (same as before)
                         padding_needed = (4 - len(decrypted_sig) % 4) % 4

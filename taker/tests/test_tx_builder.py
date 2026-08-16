@@ -4,8 +4,16 @@ Tests for transaction builder module.
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
-from jmcore.bitcoin import address_to_scriptpubkey, serialize_outpoint
+from jmcore.bitcoin import (
+    address_to_scriptpubkey,
+    create_p2tr_scriptpubkey,
+    parse_transaction_bytes,
+    scriptpubkey_to_address,
+    serialize_outpoint,
+)
 
 from taker.tx_builder import (
     CoinJoinTxBuilder,
@@ -337,6 +345,97 @@ class TestCoinJoinTxBuilder:
 
 class TestBuildCoinjoinTx:
     """Tests for build_coinjoin_tx convenience function."""
+
+    @staticmethod
+    def _p2tr_address(byte: int) -> str:
+        return scriptpubkey_to_address(create_p2tr_scriptpubkey(bytes([byte]) * 32), "regtest")
+
+    def _maker_data_with_escrow(self, escrow_value: int = 200_000) -> dict[str, dict[str, Any]]:
+        return {
+            "maker1": {
+                "utxos": [{"txid": "b" * 64, "vout": 1, "value": 1_500_000}],
+                "cj_addr": self._p2tr_address(0x11),
+                "change_addr": self._p2tr_address(0x12),
+                "cjfee": 1_000,
+                "txfee": 0,
+                "escrow_address": self._p2tr_address(0x13),
+                "escrow_value": escrow_value,
+            }
+        }
+
+    def _build_with_escrow(
+        self, maker_data: dict[str, dict[str, Any]], **kwargs: Any
+    ) -> tuple[bytes, dict[str, Any]]:
+        return build_coinjoin_tx(
+            taker_utxos=[{"txid": "a" * 64, "vout": 0, "value": 2_000_000}],
+            taker_cj_address=self._p2tr_address(0x01),
+            taker_change_address=self._p2tr_address(0x02),
+            taker_total_input=2_000_000,
+            maker_data=maker_data,
+            cj_amount=1_000_000,
+            tx_fee=5_000,
+            network="regtest",
+            **kwargs,
+        )
+
+    def test_build_coinjoin_escrow_output_preserves_maker_change(self) -> None:
+        maker_data = self._maker_data_with_escrow()
+
+        tx_bytes, metadata = self._build_with_escrow(maker_data)
+
+        tx = parse_transaction_bytes(tx_bytes)
+        maker_outputs = [
+            output.value
+            for output, (owner, output_type) in zip(
+                tx.outputs, metadata["output_owners"], strict=True
+            )
+            if owner == "maker1" and output_type in {"change", "escrow"}
+        ]
+        escrow_outputs = [
+            output
+            for output, (owner, output_type) in zip(
+                tx.outputs, metadata["output_owners"], strict=True
+            )
+            if owner == "maker1" and output_type == "escrow"
+        ]
+
+        assert sum(maker_outputs) == 501_000
+        assert len(escrow_outputs) == 1
+        assert escrow_outputs[0].value == 200_000
+        assert escrow_outputs[0].script == address_to_scriptpubkey(
+            str(maker_data["maker1"]["escrow_address"])
+        )
+        assert ("maker1", "escrow") in metadata["output_owners"]
+
+    def test_build_coinjoin_rejects_excessive_escrow_value(self) -> None:
+        with pytest.raises(ValueError, match="exceeds computed change"):
+            self._build_with_escrow(self._maker_data_with_escrow(501_001))
+
+    def test_build_coinjoin_rejects_dust_remainder(self) -> None:
+        with pytest.raises(ValueError, match="dust change remainder"):
+            self._build_with_escrow(self._maker_data_with_escrow(500_999))
+
+    def test_build_coinjoin_rejects_non_p2tr_escrow_address(self) -> None:
+        maker_data = self._maker_data_with_escrow()
+        maker_data["maker1"]["escrow_address"] = scriptpubkey_to_address(
+            b"\x00\x14" + b"\x15" * 20, "regtest"
+        )
+
+        with pytest.raises(ValueError, match="must be P2TR"):
+            self._build_with_escrow(maker_data)
+
+    def test_build_coinjoin_rejects_escrow_with_explicit_change_outputs(self) -> None:
+        maker_data = self._maker_data_with_escrow()
+        maker_data["maker1"]["change_outputs"] = [(self._p2tr_address(0x14), 501_000)]
+
+        with pytest.raises(ValueError, match="cannot combine escrow output with change_outputs"):
+            self._build_with_escrow(maker_data)
+
+    def test_build_coinjoin_rejects_escrow_with_combined_change(self) -> None:
+        with pytest.raises(ValueError, match="cannot combine escrow output with combine_groups"):
+            self._build_with_escrow(
+                self._maker_data_with_escrow(), combine_groups={"maker1": "maker2"}
+            )
 
     def test_build_simple_coinjoin(self) -> None:
         """Test building a simple CoinJoin transaction."""

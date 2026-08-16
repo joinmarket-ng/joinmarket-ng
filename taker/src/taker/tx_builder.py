@@ -52,6 +52,7 @@ class CoinJoinTxData:
     # shared output (co-funded 2-of-2). Off by default so ordinary/per-maker change is
     # never coalesced.
     merge_change_by_address: bool = False
+    maker_escrow_outputs: dict[str, TxOutput] | None = None
 
 
 class CoinJoinTxBuilder:
@@ -101,6 +102,9 @@ class CoinJoinTxBuilder:
         # channel co-funded by several parties becomes a single shared 2-of-2 funding
         # output (each party supplied its own contribution as a change piece). Off by
         # default, so ordinary/per-maker change is emitted piece-by-piece as before.
+        for nick, out in (tx_data.maker_escrow_outputs or {}).items():
+            all_outputs.append((out, nick, "escrow"))
+
         if tx_data.merge_change_by_address:
             change_pieces: dict[bytes, list[tuple[int, str]]] = {}
             if tx_data.taker_change_output:
@@ -353,6 +357,7 @@ def build_coinjoin_tx(
     maker_inputs: dict[str, list[TxInput]] = {}
     maker_cj_outputs: dict[str, TxOutput] = {}
     maker_change_outputs: dict[str, list[TxOutput]] = {}
+    maker_escrow_outputs: dict[str, TxOutput] = {}
 
     combine_groups = combine_groups or {}
     maker_changes: dict[str, int] = {}
@@ -385,6 +390,34 @@ def build_coinjoin_tx(
                 f"required={cj_amount + maker_txfee - data['cjfee']} sats, "
                 f"change={maker_change} sats. Maker's UTXOs may have been spent."
             )
+
+        escrow_address = data.get("escrow_address", "")
+        escrow_value = data.get("escrow_value", 0)
+        has_escrow = bool(escrow_address) or bool(escrow_value)
+        if has_escrow:
+            if not isinstance(escrow_address, str) or not escrow_address:
+                raise ValueError(f"Maker {nick} escrow output is missing an address")
+            if (
+                not isinstance(escrow_value, int)
+                or isinstance(escrow_value, bool)
+                or escrow_value <= 0
+            ):
+                raise ValueError(f"Maker {nick} escrow output value must be positive")
+            if escrow_value > maker_change:
+                raise ValueError(
+                    f"Maker {nick} escrow output value {escrow_value} exceeds computed "
+                    f"change {maker_change}"
+                )
+            if "change_outputs" in data:
+                raise ValueError(f"Maker {nick} cannot combine escrow output with change_outputs")
+            if nick in combine_groups or nick in combine_groups.values():
+                raise ValueError(f"Maker {nick} cannot combine escrow output with combine_groups")
+
+            escrow_output = TxOutput.from_address(escrow_address, escrow_value)
+            if len(escrow_output.script) != 34 or not escrow_output.script.startswith(b"\x51\x20"):
+                raise ValueError(f"Maker {nick} escrow output address must be P2TR")
+            maker_escrow_outputs[nick] = escrow_output
+            maker_change -= escrow_value
         maker_changes[nick] = maker_change
 
     # Combined channel-as-change: a "folder" maker's change folds into its
@@ -422,6 +455,11 @@ def build_coinjoin_tx(
                 maker_change_outputs[nick] = outs
             continue
 
+        has_escrow = nick in maker_escrow_outputs
+        if has_escrow and 0 < total_change <= dust_threshold:
+            raise ValueError(
+                f"Maker {nick} escrow output leaves a dust change remainder of {total_change} sats"
+            )
         if total_change > dust_threshold:
             maker_change_outputs[nick] = [
                 TxOutput.from_address(maker_data[nick]["change_addr"], total_change)
@@ -442,6 +480,7 @@ def build_coinjoin_tx(
         cj_amount=cj_amount,
         total_maker_fee=total_maker_fee,
         tx_fee=tx_fee,
+        maker_escrow_outputs=maker_escrow_outputs,
         merge_change_by_address=merge_change_by_address,
     )
 

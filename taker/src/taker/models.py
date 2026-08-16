@@ -53,6 +53,9 @@ class MakerSession:
     # field of !ioauth. Empty unless the maker advertised the combine capability.
     cc_funding_pubkey: str = ""
     ln_node: str = ""  # the maker's 'node_id@host:port', for true-pooling LND ring partners
+    # Optional channel-input escrow treatment output from a tagged !ioauth field.
+    escrow_output_address: str = ""
+    escrow_output_value: int = 0
     supports_ring_edge_auth: bool = False
     # Communication channel used for this session (must be consistent throughout)
     # "direct" = peer-to-peer onion connection
