@@ -460,6 +460,7 @@
 # lnd_grpc_url = "127.0.0.1:10009"
 # lnd_tls_cert_path = "/data/lnd/tls.cert"
 # lnd_macaroon_path = "/data/lnd/admin.macaroon"
+# lnd_escrow_macaroon_path = "/data/lnd/data/chain/bitcoin/regtest/channelescrow.macaroon"
 
 # ============================================================================
 # Taker Settings (CoinJoin Client)

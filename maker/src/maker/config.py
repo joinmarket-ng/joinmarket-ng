@@ -167,6 +167,7 @@ class SwapProviderConfig(BaseModel):
     lnd_grpc_url: str | None = None
     lnd_tls_cert_path: str | None = None
     lnd_macaroon_path: str | None = None
+    lnd_escrow_macaroon_path: str | None = None
 
     model_config = {"frozen": False}
 

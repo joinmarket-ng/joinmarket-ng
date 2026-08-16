@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the LND gRPC python stubs from the vendored lightning.proto.
+"""Generate the LND gRPC Python stubs from the vendored protocol schemas.
 
 Stubs land in ``jmswap/src/jmswap/lndrpc/`` as ``lightning_pb2.py`` and
 ``lightning_pb2_grpc.py``. The grpc stub's ``import lightning_pb2`` is rewritten
@@ -25,6 +25,7 @@ def main() -> int:
     (OUT_DIR / "__init__.py").write_text(
         '"""Generated LND gRPC stubs (do not edit; see scripts/gen_lnd_protos.py)."""\n'
     )
+    schemas = ("lightning.proto", "channelescrow.proto")
     subprocess.run(
         [
             sys.executable,
@@ -34,18 +35,20 @@ def main() -> int:
             f"--python_out={OUT_DIR}",
             f"--grpc_python_out={OUT_DIR}",
             f"--mypy_out={OUT_DIR}",  # typed .pyi stubs (mypy-protobuf)
-            "lightning.proto",
+            *schemas,
         ],
         check=True,
     )
-    # Rewrite the absolute import emitted by protoc into a package-relative one.
-    grpc_stub = OUT_DIR / "lightning_pb2_grpc.py"
-    text = grpc_stub.read_text()
-    text = text.replace(
-        "import lightning_pb2 as lightning__pb2",
-        "from . import lightning_pb2 as lightning__pb2",
-    )
-    grpc_stub.write_text(text)
+    # Rewrite absolute imports emitted by protoc into package-relative imports.
+    for schema in schemas:
+        grpc_stub = OUT_DIR / f"{Path(schema).stem}_pb2_grpc.py"
+        module = f"{Path(schema).stem}_pb2"
+        text = grpc_stub.read_text()
+        text = text.replace(
+            f"import {module} as {module.replace('_', '__')}",
+            f"from . import {module} as {module.replace('_', '__')}",
+        )
+        grpc_stub.write_text(text)
     print(f"generated stubs in {OUT_DIR}")
     return 0
 

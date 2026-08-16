@@ -726,6 +726,7 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
                 sp.lnd_tls_cert_path or "",
                 sp.lnd_macaroon_path or "",
                 network=str(network),
+                escrow_macaroon_path=sp.lnd_escrow_macaroon_path,
             )
         else:
             backend = self.ldk_backend()

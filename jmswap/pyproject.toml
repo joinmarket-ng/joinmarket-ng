@@ -10,8 +10,8 @@ dependencies = [
     "aiohttp>=3.9.0",
     "websockets>=12.0",
     "coincurve>=21.0.0",
-    "grpcio>=1.60.0",
-    "protobuf>=4.25.0",
+    "grpcio>=1.81.1",
+    "protobuf>=6.33.5",
 ]
 
 [project.optional-dependencies]
@@ -22,7 +22,8 @@ dev = [
     "pytest-timeout>=2.0.0",
     "mypy>=1.5.0",
     "ruff>=0.1.0",
-    "grpcio-tools>=1.60.0",
+    "grpcio-tools>=1.81.1",
+    "mypy-protobuf>=3.7.0",
 ]
 
 [build-system]
@@ -55,7 +56,7 @@ module = "jmswap.lndrpc.*"
 ignore_errors = true
 
 [[tool.mypy.overrides]]
-module = "grpc.*"
+module = ["grpc", "grpc.*"]
 ignore_missing_imports = true
 
 [tool.ruff]

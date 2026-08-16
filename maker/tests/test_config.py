@@ -352,6 +352,7 @@ class TestBuildMakerConfig:
         settings.maker.swap_provider.lnd_grpc_url = "127.0.0.1:10009"
         settings.maker.swap_provider.lnd_tls_cert_path = "/data/lnd/tls.cert"
         settings.maker.swap_provider.lnd_macaroon_path = "/data/lnd/admin.macaroon"
+        settings.maker.swap_provider.lnd_escrow_macaroon_path = "/data/lnd/channelescrow.macaroon"
 
         config = build_maker_config(
             settings=settings,
@@ -379,6 +380,7 @@ class TestBuildMakerConfig:
         assert sp.lnd_grpc_url == "127.0.0.1:10009"
         assert sp.lnd_tls_cert_path == "/data/lnd/tls.cert"
         assert sp.lnd_macaroon_path == "/data/lnd/admin.macaroon"
+        assert sp.lnd_escrow_macaroon_path == "/data/lnd/channelescrow.macaroon"
 
     def test_swap_provider_defaults_disabled(self) -> None:
         """The swap-provider role is off by default and round-trips cleanly."""

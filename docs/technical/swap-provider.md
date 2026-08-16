@@ -86,9 +86,28 @@ the full lifecycle declared by `jmswap.ChannelInputEscrowCapability`:
 4. Force a single payment part and exclude the consumed channel from routing.
 5. Persist recovery state and rebroadcast or fee-bump recovery transactions after restart.
 
-LND and the current LDK Server adapter explicitly declare an empty capability set.
-External channel funding APIs do not satisfy any part of this boundary merely by
-returning a new channel funding address.
+The repository now includes a pinned LND `v0.20.1-beta` patch and image under `lnd/`.
+Both owners of a consumed channel must run this build. Its `ChannelEscrowRPC` quiesces
+and durably locks a `SIMPLE_TAPROOT` channel, binds the complete BIP341 prevout set and
+exact parent, exchanges MuSig2 nonces and partial signatures, rejects normal close and
+abandon paths while locked, persists the final cooperative transaction, and publishes
+or rebroadcasts only that parent. Build it with
+`docker build -t jm-lnd-channel-escrow:local lnd`.
+
+Configure `lnd_macaroon_path` with a macaroon authorized for the standard LND
+operations used by channel funding. Configure `lnd_escrow_macaroon_path` with the
+patched node's generated `channelescrow.macaroon`, normally found beside the network's
+other macaroons. Keeping these credentials separate limits custom escrow RPC access;
+the standard macaroon remains the compatibility fallback when the scoped path is unset.
+
+`LndBackend` exposes these operations as the narrow `freeze_channel_input`,
+`prepare_channel_input_parent`, `begin_channel_input_signing`,
+`sign_channel_input_parent`, and `finalize_channel_input_parent` API. It deliberately
+continues to declare an empty full-lifecycle capability set. Timeout construction,
+peer-to-peer endpoint coordination, confirmation and reorganization monitoring,
+single-part payment enforcement, and success or timeout recovery are not yet wired.
+External channel funding APIs still do not satisfy this boundary merely by returning a
+new channel funding address.
 
 `jmswap.ChannelInputEscrowBackend` is the typed adapter contract for a future
 implementation. Its strict request and evidence models bind the quiescent channel

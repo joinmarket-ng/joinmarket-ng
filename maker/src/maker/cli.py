@@ -410,6 +410,7 @@ def build_maker_config(
             lnd_grpc_url=settings.maker.swap_provider.lnd_grpc_url,
             lnd_tls_cert_path=settings.maker.swap_provider.lnd_tls_cert_path,
             lnd_macaroon_path=settings.maker.swap_provider.lnd_macaroon_path,
+            lnd_escrow_macaroon_path=settings.maker.swap_provider.lnd_escrow_macaroon_path,
         ),
     )
 

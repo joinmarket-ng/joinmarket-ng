@@ -721,7 +721,14 @@ class SwapProviderSettings(BaseModel):
     )
     lnd_macaroon_path: str | None = Field(
         default=None,
-        description="Path to the LND macaroon (e.g. admin.macaroon) for gRPC auth.",
+        description="Path to the LND macaroon used for standard Lightning gRPC methods.",
+    )
+    lnd_escrow_macaroon_path: str | None = Field(
+        default=None,
+        description=(
+            "Path to the patched LND channelescrow.macaroon. When omitted, the standard "
+            "LND macaroon is also used for ChannelEscrowRPC."
+        ),
     )
 
 
