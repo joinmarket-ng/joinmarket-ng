@@ -84,6 +84,7 @@ FEATURE_PING = "ping"  # Supports application-level PING/PONG heartbeat
 # features above. Each is purely additive and defaults off (backward compatible).
 FEATURE_SWAP_PROVIDER = "swap_provider"  # bidirectional Lightning swap provider (fix 1)
 FEATURE_CHANNEL_CHANGE = "channel_change"  # taker-arranged channel-as-change (fix 2)
+FEATURE_RING_EDGE_AUTH = "ring_edge_auth_v1"  # durable maker-to-maker edge authorization
 FEATURE_WHOLE_COIN = "whole_coin"  # whole-coin liquidity-arbitrage third role (fix 3)
 
 # Feature dependencies: feature -> list of required features
@@ -94,6 +95,7 @@ FEATURE_DEPENDENCIES: dict[str, list[str]] = {
     FEATURE_PING: [],  # No dependencies
     FEATURE_SWAP_PROVIDER: [],
     FEATURE_CHANNEL_CHANGE: [],
+    FEATURE_RING_EDGE_AUTH: [FEATURE_CHANNEL_CHANGE],
     FEATURE_WHOLE_COIN: [],
 }
 
@@ -112,6 +114,7 @@ ALL_FEATURES = {
     FEATURE_PING,
     FEATURE_SWAP_PROVIDER,
     FEATURE_CHANNEL_CHANGE,
+    FEATURE_RING_EDGE_AUTH,
     FEATURE_WHOLE_COIN,
 }
 

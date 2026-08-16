@@ -431,11 +431,25 @@ async def test_failed_ring_plan_cancels_channel_and_signs_plain_change(
 
 
 async def test_ring_relay_must_match_requested_channel_push(
-    wallet: WalletService, monkeypatch: pytest.MonkeyPatch
+    wallet: WalletService, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The relayed own share must equal capacity minus the irrevocable remote push."""
-    from jmcore.bitcoin import create_p2tr_scriptpubkey, scriptpubkey_to_address
+    """The relayed own share must equal the immutable authorized contribution."""
+    import time
+
+    from jmcore.bitcoin import (
+        TxInput,
+        TxOutput,
+        create_p2tr_scriptpubkey,
+        get_txid,
+        scriptpubkey_to_address,
+        serialize_transaction,
+    )
     from jmcore.models import Offer, OfferType
+    from jmswap.ring_authorization import (
+        RingEdgeAuthorization,
+        RingEdgeAuthorizationStore,
+        RingEdgeFunding,
+    )
 
     from maker.coinjoin import CoinJoinSession, CoinJoinState
 
@@ -446,6 +460,25 @@ async def test_ring_relay_must_match_requested_channel_push(
             self.cancel_external_channel_funding = AsyncMock()
 
     backend = _FakeLnd()
+    store = RingEdgeAuthorizationStore(tmp_path / "ring")
+    authorization = RingEdgeAuthorization(
+        edge_id="11" * 32,
+        coinjoin_context="22" * 32,
+        taker_nick="t",
+        taker_session_pubkey="33" * 32,
+        funder_nick="funder",
+        receiver_nick="receiver",
+        funder_session_pubkey="44" * 32,
+        receiver_session_pubkey="55" * 32,
+        funder_ln_node="02" + "66" * 32 + "@funder.example:9735",
+        receiver_ln_node="03" + "77" * 32 + "@receiver.example:9735",
+        coinjoin_amount_sats=1_000_000,
+        capacity_sats=500_000,
+        funder_contribution_sats=325_000,
+        receiver_contribution_sats=175_000,
+        expires_at_unix=int(time.time()) + 60,
+    )
+    store.authorize(authorization, local_nick="funder")
     session = CoinJoinSession(
         taker_nick="t",
         offer=Offer(
@@ -460,24 +493,59 @@ async def test_ring_relay_must_match_requested_channel_push(
         wallet=wallet,
         backend=wallet.backend,
         ldk=backend,
+        ring_edge_authorization_store=store,
     )
     session.state = CoinJoinState.IOAUTH_SENT
     session._channel_user_id = "ring-channel"
     session._channel_funding_spk = create_p2tr_scriptpubkey(b"\x44" * 32)
     session._channel_capacity = 500_000
     session._channel_push_msat = 175_000_000
+    session._ring_authorization_ids = {authorization.edge_id: authorization.authorization_id}
     funding_address = scriptpubkey_to_address(session._channel_funding_spk, "regtest")
     sign = AsyncMock(return_value=["signature"])
     monkeypatch.setattr(session, "_sign_transaction", sign)
+    monkeypatch.setattr("maker.coinjoin.verify_unsigned_transaction", lambda **_kwargs: (True, ""))
+    tx_hex = serialize_transaction(
+        2,
+        [TxInput.from_hex("ab" * 32, 0)],
+        [TxOutput(value=500_000, script=session._channel_funding_spk)],
+        0,
+    ).hex()
 
     success, response = await session.handle_tx(
-        "00", ring=[(funding_address, 300_000), (_addr_for_test(0x45), 201_000)]
+        tx_hex,
+        ring=[
+            RingEdgeFunding(
+                edge_id=authorization.edge_id,
+                authorization_id=authorization.authorization_id,
+                funding_address=funding_address,
+                contribution_sats=300_000,
+            )
+        ],
     )
 
     assert success is False
-    assert response == {"error": "ring relay channel allocation mismatch"}
+    assert response == {"error": "ring authorization verification failed"}
     sign.assert_not_awaited()
     backend.cancel_external_channel_funding.assert_awaited_once_with("ring-channel")
+
+    session._bind_ring_funding(
+        tx_hex,
+        [
+            RingEdgeFunding(
+                edge_id=authorization.edge_id,
+                authorization_id=authorization.authorization_id,
+                funding_address=funding_address,
+                contribution_sats=325_000,
+            )
+        ],
+    )
+    record = store.load(authorization.edge_id)
+    assert record is not None
+    assert record.funding_address == funding_address
+    assert record.channel_point is not None
+    assert record.channel_point.txid == get_txid(tx_hex)
+    assert record.channel_point.vout == 0
 
 
 def _addr_for_test(byte: int) -> str:

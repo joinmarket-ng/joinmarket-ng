@@ -20,6 +20,7 @@ from jmcore.directory_client import DirectoryClient
 from jmcore.models import Offer
 from jmcore.network import TCPConnection
 from jmcore.rate_limiter import RateLimiter
+from jmswap.ring_authorization import RingEdgeAuthorizationStore
 from jmwallet.backends.base import BlockchainBackend
 from jmwallet.wallet.service import WalletService
 
@@ -51,6 +52,7 @@ class MakerBotProtocol(Protocol):
     directory_clients: dict[str, DirectoryClient]
     _directory_pool: MakerDirectoryPool
     active_sessions: dict[str, MakerSession]
+    ring_edge_authorization_store: RingEdgeAuthorizationStore | None
     offer_manager: OfferManager
     listen_tasks: list[asyncio.Task[None]]
     direct_connections: dict[str, TCPConnection]
@@ -78,6 +80,14 @@ class MakerBotProtocol(Protocol):
     async def _handle_tx(self, taker_nick: str, msg: str, source: str = "unknown") -> None: ...
 
     async def _handle_chanreq(self, taker_nick: str, msg: str, source: str = "unknown") -> None: ...
+
+    async def _handle_chanauth(
+        self, taker_nick: str, msg: str, source: str = "unknown"
+    ) -> None: ...
+
+    async def _handle_chancancel(
+        self, taker_nick: str, msg: str, source: str = "unknown"
+    ) -> None: ...
 
     async def _handle_push(self, taker_nick: str, msg: str, source: str = "unknown") -> None: ...
 

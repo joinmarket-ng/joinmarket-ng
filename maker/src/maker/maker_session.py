@@ -21,10 +21,13 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import time
 from typing import TYPE_CHECKING, Any
 
 from jmcore.notifications import get_notifier
 from jmcore.protocol import UTXOMetadata
+from jmswap.errors import ChannelInputEscrowError
+from jmswap.ring_authorization import RingEdgeAuthorization, RingEdgeFunding, RingEdgeRole
 from jmwallet.history import (
     append_history_entry,
     create_maker_history_entry,
@@ -160,7 +163,7 @@ class MakerSession:
         self,
         tx_hex: str,
         combine: dict[str, Any] | None = None,
-        ring: list[tuple[str, int]] | None = None,
+        ring: list[RingEdgeFunding] | None = None,
     ) -> tuple[bool, dict[str, Any]]:
         return await self.inner.handle_tx(tx_hex, combine=combine, ring=ring)
 
@@ -368,9 +371,11 @@ class MakerSession:
                         }
                     decrypted = tx_part
                 elif " ring " in decrypted:
-                    # True-pooling ring: "<tx_b64> ring <addr:contrib>,<addr:contrib>".
+                    # True-pooling ring: one compact authorized funding relay per edge.
                     tx_part, _, rest = decrypted.partition(" ring ")
-                    ring = [(a, int(v)) for a, v in (p.split(":", 1) for p in rest.split(",") if p)]
+                    ring = [
+                        RingEdgeFunding.from_transport(token) for token in rest.split(",") if token
+                    ]
                     decrypted = tx_part
                 tx_bytes = base64.b64decode(decrypted)
                 tx_hex = tx_bytes.hex()
@@ -457,12 +462,12 @@ class MakerSession:
     async def on_chanreq(self, bot: MakerBotProtocol, msg: str, source: str) -> None:
         """Handle a true-pooling ring channel-open request from the taker.
 
-        Format (encrypted): ``<partner_node_id@host:port> <capacity_sats> <push_msat>``.
-        The push allocates the partner's on-chain contribution as remote channel balance.
-        The maker replies ``chanaddr`` with the funding address, which the taker places as
-        a shared output in the CoinJoin. Failures return an empty address for fallback.
+        Format (encrypted): ``1 <edge_id> <authorization_id>``. Peer and allocation
+        parameters are loaded from the durable authorization rather than accepted from
+        this mutable command. Failures return an empty address for ring fallback.
         """
         address = ""
+        response = ""
         try:
             self.validate_channel(source)
             parts = msg.split()
@@ -471,22 +476,165 @@ class MakerSession:
             else:
                 decrypted = self.crypto.decrypt(parts[1])
                 request_parts = decrypted.split()
-                if len(request_parts) != 3:
-                    raise ValueError("chanreq payload must contain peer, capacity, and push")
-                peer, capacity_str, push_str = request_parts
-                push_msat = int(push_str)
-                capacity = int(capacity_str)
-                if push_msat <= 0 or push_msat % 1000 or push_msat >= capacity * 1000:
-                    raise ValueError("chanreq push must be whole sats between zero and capacity")
-                logger.info(f"chanreq: opening {capacity_str} sat ring channel to {peer[:24]}")
+                if len(request_parts) != 3 or request_parts[0] != "1":
+                    raise ValueError(
+                        "chanreq payload must contain version, edge, and authorization"
+                    )
+                _version, edge_id, authorization_id = request_parts
+                store = bot.ring_edge_authorization_store
+                if store is None:
+                    raise ChannelInputEscrowError("ring edge authorization store is unavailable")
+                if self.inner._ring_authorization_ids.get(edge_id) != authorization_id:
+                    raise ChannelInputEscrowError("ring edge was not authorized in this session")
+                record = store.load(edge_id)
+                if record is None or record.authorization.authorization_id != authorization_id:
+                    raise ChannelInputEscrowError("ring edge authorization record does not match")
+                authorization = record.authorization
+                if authorization.role_for(bot.nick) is not RingEdgeRole.FUNDER:
+                    raise ChannelInputEscrowError("only the authorized funder may open the edge")
+                if authorization.expires_at_unix <= int(time.time()):
+                    raise ChannelInputEscrowError("ring edge authorization has expired")
+                peer = authorization.receiver_ln_node
+                capacity = authorization.capacity_sats
+                push_msat = authorization.receiver_contribution_sats * 1000
+                logger.info(f"chanreq: opening {capacity} sat authorized ring channel")
                 addr = await self.inner.open_external_channel(
                     peer, capacity, push_to_counterparty_msat=push_msat
                 )
                 address = addr or ""
+                if address:
+                    from jmcore.bitcoin import address_to_scriptpubkey
+
+                    self.inner._channel_edge_id = edge_id
+                    self.inner._channel_authorization_id = authorization_id
+                    store.bind_funding(
+                        edge_id,
+                        authorization_id,
+                        address,
+                        address_to_scriptpubkey(address).hex(),
+                    )
+                    response = f"1 {edge_id} {authorization_id} {address}"
                 logger.info(f"chanreq: ring channel funding address = {address or '(failed)'}")
         except Exception as e:  # noqa: BLE001 - never block the round; reply empty
             logger.error(f"chanreq handling failed: {e}")
-        await self.send_response(bot, "chanaddr", {"address": address})
+            if self.inner._channel_user_id is not None:
+                await self.inner._cancel_channel_change()
+        await self.send_response(bot, "chanaddr", {"address": response})
+
+    async def on_chancancel(self, bot: MakerBotProtocol, msg: str, source: str) -> None:
+        """Cancel the exact pending ring edge after the taker abandons ring construction."""
+        try:
+            self.validate_channel(source)
+            parts = msg.split()
+            if len(parts) < 2 or not self.crypto.is_encrypted:
+                raise ChannelInputEscrowError("chancancel requires an encrypted payload")
+            request_parts = self.crypto.decrypt(parts[1]).split()
+            if len(request_parts) != 3 or request_parts[0] != "1":
+                raise ChannelInputEscrowError(
+                    "chancancel payload must contain version, edge, and authorization"
+                )
+            _version, edge_id, authorization_id = request_parts
+            if self.inner._ring_authorization_ids.get(edge_id) != authorization_id:
+                raise ChannelInputEscrowError("ring cancellation was not authorized")
+            if self.inner._channel_edge_id is not None and self.inner._channel_edge_id != edge_id:
+                raise ChannelInputEscrowError("ring cancellation targets another pending edge")
+            if (
+                self.inner._channel_authorization_id is not None
+                and self.inner._channel_authorization_id != authorization_id
+            ):
+                raise ChannelInputEscrowError("ring cancellation authorization does not match")
+            store = bot.ring_edge_authorization_store
+            record = store.load(edge_id) if store is not None else None
+            if record is None or record.authorization.authorization_id != authorization_id:
+                raise ChannelInputEscrowError("ring cancellation record does not match")
+            if record.authorization.role_for(bot.nick) is not RingEdgeRole.FUNDER:
+                raise ChannelInputEscrowError("only the authorized funder can cancel an open")
+            await self.inner._cancel_channel_change()
+        except Exception as exc:  # noqa: BLE001 - cancellation failures require operator review
+            logger.error("chancancel handling failed: {}", exc)
+
+    async def on_chanauth(self, bot: MakerBotProtocol, msg: str, source: str) -> None:
+        """Validate, persist, and acknowledge this maker's ring edge authorizations."""
+        acknowledgment = ""
+        try:
+            self.validate_channel(source)
+            parts = msg.split()
+            if len(parts) < 2 or not self.crypto.is_encrypted:
+                raise ChannelInputEscrowError("chanauth requires an encrypted payload")
+            if self.state is not CoinJoinState.IOAUTH_SENT:
+                raise ChannelInputEscrowError("chanauth arrived outside the authenticated phase")
+            store = bot.ring_edge_authorization_store
+            if store is None:
+                raise ChannelInputEscrowError("ring edge authorization store is unavailable")
+            tokens = self.crypto.decrypt(parts[1]).split(",")
+            if not 1 <= len(tokens) <= 2 or any(not token for token in tokens):
+                raise ChannelInputEscrowError("chanauth must contain one or two ring edges")
+            authorizations = [RingEdgeAuthorization.from_transport(token) for token in tokens]
+            edge_ids = {authorization.edge_id for authorization in authorizations}
+            if len(edge_ids) != len(authorizations):
+                raise ChannelInputEscrowError("chanauth contains duplicate ring edges")
+
+            own_session_pubkey = self.crypto.get_pubkey_hex()
+            own_ln_node = self.inner.ln_node
+            normalized_own_ln_node = None
+            if own_ln_node is not None and "@" in own_ln_node:
+                node_pubkey, node_endpoint = own_ln_node.split("@", 1)
+                normalized_own_ln_node = f"{node_pubkey.lower()}@{node_endpoint}"
+            expected_context = self.commitment.hex()
+            roles: set[RingEdgeRole] = set()
+            for authorization in authorizations:
+                role = authorization.role_for(bot.nick)
+                roles.add(role)
+                local_session_pubkey = (
+                    authorization.funder_session_pubkey
+                    if role is RingEdgeRole.FUNDER
+                    else authorization.receiver_session_pubkey
+                )
+                local_ln_node = (
+                    authorization.funder_ln_node
+                    if role is RingEdgeRole.FUNDER
+                    else authorization.receiver_ln_node
+                )
+                if authorization.taker_nick != self.taker_nick:
+                    raise ChannelInputEscrowError("ring authorization taker identity mismatch")
+                if authorization.taker_session_pubkey != self.inner.taker_nacl_pk.lower():
+                    raise ChannelInputEscrowError("ring authorization taker session key mismatch")
+                if local_session_pubkey != own_session_pubkey.lower():
+                    raise ChannelInputEscrowError("ring authorization maker session key mismatch")
+                if normalized_own_ln_node is None or local_ln_node != normalized_own_ln_node:
+                    raise ChannelInputEscrowError("ring authorization LN node identity mismatch")
+                if authorization.coinjoin_context != expected_context:
+                    raise ChannelInputEscrowError("ring authorization CoinJoin context mismatch")
+                if authorization.coinjoin_amount_sats != self.amount:
+                    raise ChannelInputEscrowError("ring authorization CoinJoin amount mismatch")
+                if authorization.expires_at_unix > int(
+                    time.time() + self.inner.session_timeout_sec
+                ):
+                    raise ChannelInputEscrowError(
+                        "ring authorization expiry exceeds session lifetime"
+                    )
+            if len(authorizations) == 2 and roles != {
+                RingEdgeRole.FUNDER,
+                RingEdgeRole.RECEIVER,
+            }:
+                raise ChannelInputEscrowError("two-edge authorization must assign both ring roles")
+
+            proposed = {
+                authorization.edge_id: authorization.authorization_id
+                for authorization in authorizations
+            }
+            if (
+                self.inner._ring_authorization_ids
+                and self.inner._ring_authorization_ids != proposed
+            ):
+                raise ChannelInputEscrowError("ring authorization set is immutable")
+            for authorization in authorizations:
+                store.authorize(authorization, local_nick=bot.nick)
+            self.inner._ring_authorization_ids = proposed
+            acknowledgment = ",".join(sorted(proposed.values()))
+        except Exception as exc:  # noqa: BLE001 - an empty acknowledgment fails the ring closed
+            logger.error("chanauth handling failed: {}", exc)
+        await self.send_response(bot, "chanauthack", {"authorization_ids": acknowledgment})
 
     async def send_response(
         self, bot: MakerBotProtocol, command: str, data: dict[str, Any]
@@ -526,6 +674,8 @@ class MakerSession:
                 logger.debug(f"Encrypted sig: plaintext_len={len(plaintext)}")
             elif command == "chanaddr":
                 msg_content = self.crypto.encrypt(data["address"])
+            elif command == "chanauthack":
+                msg_content = self.crypto.encrypt(data["authorization_ids"])
             else:
                 msg_content = json.dumps(data)
 

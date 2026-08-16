@@ -32,6 +32,7 @@ from jmcore.tor_control import (
     TorControlClient,
     TorControlError,
 )
+from jmswap.ring_authorization import RingEdgeAuthorizationStore
 from jmwallet.backends.base import BlockchainBackend
 from jmwallet.wallet.service import WalletService
 from loguru import logger
@@ -93,6 +94,7 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         )
         self._directory_pool.clients = self.directory_clients
         self.active_sessions: dict[str, MakerSession] = {}
+        self.ring_edge_authorization_store: RingEdgeAuthorizationStore | None = None
         self.current_offers: list[Offer] = []
         self.fidelity_bond: FidelityBondInfo | None = None
         self.current_block_height: int = 0  # Cached block height for bond proof generation
@@ -379,6 +381,10 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
             resolved_data_dir = (
                 self.config.data_dir if self.config.data_dir else get_default_data_dir()
             )
+            if self.config.knapsack_capable and self.config.ln_node:
+                self.ring_edge_authorization_store = RingEdgeAuthorizationStore(
+                    resolved_data_dir / "ring_edge_authorizations"
+                )
             fidelity_bond_addresses: list[tuple[str, int, int]] = []
 
             # Fidelity bonds are explicitly disabled

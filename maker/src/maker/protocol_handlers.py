@@ -368,6 +368,10 @@ class ProtocolHandlersMixin:
                 await self._handle_fill(from_nick, command, source=source)
             elif command.startswith("auth"):
                 await self._handle_auth(from_nick, command, source=source)
+            elif command.startswith("chanauth"):
+                await self._handle_chanauth(from_nick, command, source=source)
+            elif command.startswith("chancancel"):
+                await self._handle_chancancel(from_nick, command, source=source)
             elif command.startswith("chanreq"):
                 await self._handle_chanreq(from_nick, command, source=source)
             elif command.startswith("tx"):
@@ -476,6 +480,7 @@ class ProtocolHandlersMixin:
                     and getattr(self.config, "ln_node", None)
                 ),
                 ln_node=getattr(self.config, "ln_node", None),
+                ring_edge_authorization_store=self.ring_edge_authorization_store,
             )
             session = MakerSession(inner=session_inner)
 
@@ -552,6 +557,28 @@ class ProtocolHandlersMixin:
             return
         async with session.lock:
             await session.on_chanreq(self, msg, source)
+
+    async def _handle_chanauth(
+        self: MakerBotProtocol, taker_nick: str, msg: str, source: str = "unknown"
+    ) -> None:
+        """Persist and acknowledge this maker's authenticated ring edge terms."""
+        session = self.active_sessions.get(taker_nick)
+        if session is None:
+            logger.warning(f"No active session for {taker_nick}")
+            return
+        async with session.lock:
+            await session.on_chanauth(self, msg, source)
+
+    async def _handle_chancancel(
+        self: MakerBotProtocol, taker_nick: str, msg: str, source: str = "unknown"
+    ) -> None:
+        """Cancel a pending authorized ring open after taker-side fallback."""
+        session = self.active_sessions.get(taker_nick)
+        if session is None:
+            logger.warning(f"No active session for {taker_nick}")
+            return
+        async with session.lock:
+            await session.on_chancancel(self, msg, source)
 
     async def _handle_push(self, taker_nick: str, msg: str, source: str = "unknown") -> None:
         """Handle !push request from taker.

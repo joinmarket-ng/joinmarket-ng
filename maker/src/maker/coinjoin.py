@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import time
 from enum import StrEnum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from jmcore.encryption import CryptoSession
 from jmcore.models import NetworkType, Offer
@@ -33,6 +33,9 @@ from jmwallet.wallet.signing import (
 from loguru import logger
 
 from maker.tx_verification import verify_unsigned_transaction
+
+if TYPE_CHECKING:
+    from jmswap.ring_authorization import RingEdgeAuthorizationStore, RingEdgeFunding
 
 
 class CoinJoinState(StrEnum):
@@ -72,6 +75,7 @@ class CoinJoinSession:
         channel_peer: str | None = None,
         combine_capable: bool = False,
         ln_node: str | None = None,
+        ring_edge_authorization_store: RingEdgeAuthorizationStore | None = None,
     ):
         self.taker_nick = taker_nick
         self.offer = offer
@@ -90,10 +94,14 @@ class CoinJoinSession:
         self.ldk = ldk
         self.channel_peer = channel_peer
         self.ln_node = ln_node
+        self.ring_edge_authorization_store = ring_edge_authorization_store
+        self._ring_authorization_ids: dict[str, str] = {}
         self._channel_user_id: str | None = None
         self._channel_funding_spk: bytes | None = None
         self._channel_capacity: int | None = None
         self._channel_push_msat: int = 0
+        self._channel_edge_id: str | None = None
+        self._channel_authorization_id: str | None = None
         # Maker-to-maker channel-as-change (combine): the maker contributes a fresh
         # funding pubkey in !ioauth; the taker pairs two makers into one shared 2-of-2
         # output pooling their change. Verified on !tx against the relayed partner key.
@@ -253,6 +261,14 @@ class CoinJoinSession:
             # neutrino_compat: We support extended UTXO format (txid:vout:scriptpubkey:blockheight)
             # All modern makers can accept extended format (extra fields are simply ignored)
             features: list[str] = ["neutrino_compat"]
+            if (
+                self.combine_capable
+                and self.ring_edge_authorization_store is not None
+                and self.ldk is not None
+            ):
+                from jmcore.protocol import FEATURE_CHANNEL_CHANGE, FEATURE_RING_EDGE_AUTH
+
+                features.extend((FEATURE_CHANNEL_CHANGE, FEATURE_RING_EDGE_AUTH))
 
             return True, {"nacl_pubkey": nacl_pubkey, "features": features}
 
@@ -547,7 +563,7 @@ class CoinJoinSession:
         self,
         tx_hex: str,
         combine: dict[str, Any] | None = None,
-        ring: list[tuple[str, int]] | None = None,
+        ring: list[RingEdgeFunding] | None = None,
     ) -> tuple[bool, dict[str, Any]]:
         """
         Handle !tx message from taker.
@@ -581,36 +597,6 @@ class CoinJoinSession:
 
             combine_address, combine_value = self._verify_combine(combine)
 
-            # True-pooling ring: verify our change went only to the two co-funded shared
-            # outputs the taker relayed, and that we co-control the one we funded.
-            if ring is not None and self._channel_funding_spk is not None:
-                from jmcore.bitcoin import address_to_scriptpubkey
-
-                funded_piece = next(
-                    (
-                        (addr, contribution)
-                        for addr, contribution in ring
-                        if address_to_scriptpubkey(addr) == self._channel_funding_spk
-                    ),
-                    None,
-                )
-                if funded_piece is None:
-                    logger.error("Ring relay does not include the channel we funded; refusing")
-                    await self._cancel_channel_change()
-                    self.state = CoinJoinState.FAILED
-                    return False, {"error": "ring relay missing our funded channel"}
-                capacity = self._channel_capacity
-                push_msat = self._channel_push_msat
-                if (
-                    capacity is None
-                    or push_msat % 1000
-                    or funded_piece[1] != capacity - push_msat // 1000
-                ):
-                    logger.error("Ring relay does not match our channel balance allocation")
-                    await self._cancel_channel_change()
-                    self.state = CoinJoinState.FAILED
-                    return False, {"error": "ring relay channel allocation mismatch"}
-
             # A failed ring plan deliberately falls back to this maker's ordinary change
             # address. Cancel any channel opened by chanreq before validating and signing
             # that plain transaction. A single-maker channel change is unaffected because
@@ -633,7 +619,11 @@ class CoinJoinSession:
                 network=network,
                 combine_address=combine_address,
                 combine_value=combine_value,
-                ring_outputs=ring,
+                ring_outputs=(
+                    [(edge.funding_address, edge.contribution_sats) for edge in ring]
+                    if ring is not None
+                    else None
+                ),
             )
 
             if not is_valid:
@@ -641,6 +631,15 @@ class CoinJoinSession:
                 await self._cancel_channel_change()
                 self.state = CoinJoinState.FAILED
                 return False, {"error": f"Transaction verification failed: {error}"}
+
+            if ring is not None:
+                try:
+                    self._bind_ring_funding(tx_hex, ring)
+                except Exception as exc:  # noqa: BLE001 - reject before releasing signatures
+                    logger.error("ring authorization verification failed: {}", exc)
+                    await self._cancel_channel_change()
+                    self.state = CoinJoinState.FAILED
+                    return False, {"error": "ring authorization verification failed"}
 
             logger.info("Transaction verification PASSED ✓")
 
@@ -689,6 +688,66 @@ class CoinJoinSession:
             await self._cancel_channel_change()
             self.state = CoinJoinState.FAILED
             return False, {"error": str(e)}
+
+    def _bind_ring_funding(self, tx_hex: str, ring: list[RingEdgeFunding]) -> None:
+        """Verify and durably bind every relayed edge to the exact CoinJoin output."""
+        from jmcore.bitcoin import address_to_scriptpubkey, get_txid, parse_transaction
+        from jmswap.errors import ChannelInputEscrowError
+        from jmswap.ring_authorization import RingChannelPoint
+
+        store = self.ring_edge_authorization_store
+        if store is None or not self._ring_authorization_ids:
+            raise ChannelInputEscrowError("ring edge authorization is unavailable")
+        received = {edge.edge_id: edge.authorization_id for edge in ring}
+        if len(received) != len(ring) or received != self._ring_authorization_ids:
+            raise ChannelInputEscrowError("ring relay does not match the authorized edge set")
+
+        transaction = parse_transaction(tx_hex)
+        txid = get_txid(tx_hex)
+        bindings: list[tuple[RingEdgeFunding, str, int]] = []
+        for edge in ring:
+            record = store.load(edge.edge_id)
+            if record is None or record.authorization.authorization_id != edge.authorization_id:
+                raise ChannelInputEscrowError("ring relay authorization hash does not match")
+            authorization = record.authorization
+            if edge.contribution_sats != authorization.local_contribution_sats(record.local_nick):
+                raise ChannelInputEscrowError(
+                    "ring relay contribution does not match authorization"
+                )
+            scriptpubkey = address_to_scriptpubkey(edge.funding_address)
+            matches = [
+                (index, output)
+                for index, output in enumerate(transaction.outputs)
+                if output.script == scriptpubkey
+            ]
+            if len(matches) != 1:
+                raise ChannelInputEscrowError(
+                    "authorized ring funding script must appear exactly once"
+                )
+            vout, output = matches[0]
+            if output.value != authorization.capacity_sats:
+                raise ChannelInputEscrowError(
+                    "ring funding output does not match authorized capacity"
+                )
+            if record.funding_address is not None and (
+                record.funding_address != edge.funding_address
+                or record.funding_scriptpubkey != scriptpubkey.hex()
+            ):
+                raise ChannelInputEscrowError("ring funding output conflicts with durable binding")
+            bindings.append((edge, scriptpubkey.hex(), vout))
+
+        for edge, scriptpubkey_hex, vout in bindings:
+            store.bind_funding(
+                edge.edge_id,
+                edge.authorization_id,
+                edge.funding_address,
+                scriptpubkey_hex,
+            )
+            store.bind_channel_point(
+                edge.edge_id,
+                edge.authorization_id,
+                RingChannelPoint(txid=txid, vout=vout),
+            )
 
     async def _select_our_utxos(
         self,
@@ -926,6 +985,19 @@ class CoinJoinSession:
         tx = parse_transaction(tx_hex)
         vout = next(i for i, o in enumerate(tx.outputs) if o.script == spk)
         txid = get_txid(tx_hex)
+        edge_id = self._channel_edge_id
+        authorization_id = self._channel_authorization_id
+        if edge_id is not None and authorization_id is not None:
+            from jmswap.ring_authorization import RingChannelPoint
+
+            store = self.ring_edge_authorization_store
+            if store is None:
+                raise RuntimeError("ring edge authorization store is unavailable")
+            store.bind_channel_point(
+                edge_id,
+                authorization_id,
+                RingChannelPoint(txid=txid, vout=vout),
+            )
         # Per-input prevouts are mandatory for LND's PSBT verification but unused by LDK.
         input_utxos: list[tuple[int, bytes]] | None = None
         try:
@@ -972,6 +1044,8 @@ class CoinJoinSession:
             self._channel_funding_spk = None
             self._channel_capacity = None
             self._channel_push_msat = 0
+            self._channel_edge_id = None
+            self._channel_authorization_id = None
 
     async def _sign_transaction(self, tx_hex: str) -> list[str]:
         """Sign our inputs in the transaction.

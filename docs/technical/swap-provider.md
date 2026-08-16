@@ -179,22 +179,29 @@ The legacy runtime is feature-flagged with taker `combine_channel_as_change`,
 `combine_mode = "pool" | "knapsack" | "lnd_ring"`. Non-participating makers and
 failed plans retain ordinary change. The real-channel `lnd_ring` flow is:
 
-1. **Advertise.** A capable maker sends a per-round funding key and its configured
-   Lightning node in encrypted `!ioauth` fields. They are not public offer fields.
+1. **Advertise.** A capable maker advertises `ring_edge_auth_v1` during the encrypted
+   session handshake and sends a per-round funding key and its configured Lightning
+   node in encrypted `!ioauth` fields. The feature is advertised only when the maker
+   has both durable authorization storage and a channel-funding backend.
 2. **Plan.** After `!ioauth`, the taker computes exact maker change and plans equal or
    near-equal co-funded ring channels above `ring_min_channel_sats`.
-3. **Open and allocate.** For each edge, the taker sends encrypted `chanreq` containing
-   the peer node, full channel capacity, and remote push in millisatoshis. The push is
-   exactly the partner's on-chain contribution. The funder starts a private LND
-   PSBT-shim open with `no_publish` and returns the funding address in `chanaddr`.
-4. **Build and verify.** The transaction builder merges both contributions into one
-   output per address. Each maker requires positive contributions at distinct singleton
-   outputs, exact conservation of its own change, nonzero partner funding, and an
-   allocation matching the capacity and push it accepted.
-5. **Pin before signing.** LND verifies the complete unsigned CoinJoin PSBT with
+3. **Authorize both endpoints.** The taker creates a random edge ID and canonical record
+   binding the PoDLE round, taker and maker nicks, all three NaCl session keys, both LND
+   node IDs, capacity, contributions, and expiry. It sends the same encrypted record to
+   both makers in `chanauth`; both persist and acknowledge its hash before any open.
+4. **Open and allocate.** The encrypted `chanreq` contains only the edge ID and
+   authorization hash. The funder loads the peer, capacity, and exact remote push from
+   durable state, starts a private LND PSBT-shim open with `no_publish`, binds the returned
+   P2TR funding script, and returns the edge ID, hash, and address in `chanaddr`.
+5. **Build and verify.** The transaction builder merges both contributions into one
+   output per address. Each maker requires exactly its acknowledged edge set and verifies
+   every authorization hash, local contribution, singleton script, full capacity, and
+   computed funding outpoint before signing.
+6. **Pin before signing.** LND verifies the complete unsigned CoinJoin PSBT with
    `skip_finalize` before the maker releases signatures. If opening, address collection,
-   allocation, or PSBT verification fails, the pending shim is canceled and the maker
-   either accepts a verified plain-change fallback or refuses the round.
+   allocation, or PSBT verification fails, the taker sends authenticated `chancancel`
+   messages for every requested edge. The maker cancels the exact pending shim and either
+   accepts a verified plain-change fallback or refuses the round.
 
 ### On-chain-only takers: sweep under homogeneous fees
 

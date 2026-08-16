@@ -18,6 +18,7 @@ keeps ``Taker`` focused on lifecycle (start/stop/sync_wallet/run_schedule).
 from __future__ import annotations
 
 import asyncio
+import secrets
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -45,11 +46,13 @@ from taker.podle import ExtendedPoDLECommitment, get_eligible_podle_utxos
 from taker.tx_builder import CoinJoinTxBuilder, build_coinjoin_tx
 
 if TYPE_CHECKING:
+    from jmswap.ring_authorization import RingEdgeAuthorization, RingEdgeFunding
     from jmwallet.backends.base import BlockchainBackend
     from jmwallet.wallet.models import UTXOInfo
     from jmwallet.wallet.service import WalletService
 
     from taker.config import TakerConfig
+    from taker.knapsack import PooledPlan
     from taker.multi_directory import MultiDirectoryClient
     from taker.taker import Taker
 
@@ -414,11 +417,15 @@ class CoinJoinSession:
                         # Parse optional features (e.g., "features=neutrino_compat")
                         for part in parts[1:]:
                             if part.startswith("features="):
+                                from jmcore.protocol import FEATURE_RING_EDGE_AUTH
+
                                 features_str = part[9:]  # Skip "features="
                                 features = set(features_str.split(",")) if features_str else set()
                                 if "neutrino_compat" in features:
                                     self.maker_sessions[nick].supports_neutrino_compat = True
                                     logger.debug(f"Maker {nick} supports neutrino_compat")
+                                if FEATURE_RING_EDGE_AUTH in features:
+                                    self.maker_sessions[nick].supports_ring_edge_auth = True
                                 break
 
                         # Set up encryption session with this maker using their NaCl pubkey
@@ -1039,7 +1046,7 @@ class CoinJoinSession:
             # change, so no per-maker change output reveals an exact residual.
             combine_groups: dict[str, str] = {}
             self._combine_relay = {}
-            self._ring_relay: dict[str, list[tuple[str, int]]] = {}
+            self._ring_relay: dict[str, list[RingEdgeFunding]] = {}
             self._merge_change = False
             if getattr(self.config, "combine_channel_as_change", False):
                 mode = getattr(self.config, "combine_mode", "pool")
@@ -1339,12 +1346,14 @@ class CoinJoinSession:
         the builder merges into the shared co-funded outputs. On any failure the round
         falls back to plain change (no ring).
         """
+        from jmswap.ring_authorization import RingEdgeAuthorization, RingEdgeFunding
+
         from taker.knapsack import plan_pooled_knapsack, plan_pooled_session
 
         parties: list[tuple[str, int]] = []
         ln_of: dict[str, str] = {}
         for nick, s in self.maker_sessions.items():
-            if not s.ln_node:
+            if not s.ln_node or not s.supports_ring_edge_auth:
                 continue
             change = (
                 sum(int(u["value"]) for u in s.utxos)
@@ -1364,22 +1373,112 @@ class CoinJoinSession:
             logger.warning("LND ring: no feasible ring; using plain change")
             return
 
-        # Ask each funder (party_a of an edge) to open a channel to its partner (party_b).
-        for ch in plan.channels:
-            funder = self.maker_sessions[ch.party_a]
-            if funder.crypto is None:
-                logger.warning(f"LND ring: no crypto for {ch.party_a}; using plain change")
-                return
-            enc = funder.crypto.encrypt(f"{ln_of[ch.party_b]} {ch.value} {ch.contrib_b * 1000}")
-            await self.directory_client.send_privmsg(
-                ch.party_a, "chanreq", enc, log_routing=True, force_channel=funder.comm_channel
+        if self.crypto_session is None or self.podle_commitment is None:
+            logger.warning("LND ring: authenticated CoinJoin context is unavailable")
+            return
+        commitment = self.podle_commitment.to_commitment_str()
+        coinjoin_context = commitment[1:] if commitment.startswith("P") else commitment
+        taker_nick = self._taker.nick
+        taker_session_pubkey = self.crypto_session.get_pubkey_hex()
+        expires_at = int(time.time() + self.config.maker_timeout_sec)
+
+        edge_authorizations: dict[tuple[str, str], RingEdgeAuthorization] = {}
+        by_maker: dict[str, list[RingEdgeAuthorization]] = {}
+        try:
+            for channel in plan.channels:
+                authorization = RingEdgeAuthorization(
+                    edge_id=secrets.token_hex(32),
+                    coinjoin_context=coinjoin_context,
+                    taker_nick=taker_nick,
+                    taker_session_pubkey=taker_session_pubkey,
+                    funder_nick=channel.party_a,
+                    receiver_nick=channel.party_b,
+                    funder_session_pubkey=self.maker_sessions[channel.party_a].pubkey,
+                    receiver_session_pubkey=self.maker_sessions[channel.party_b].pubkey,
+                    funder_ln_node=ln_of[channel.party_a],
+                    receiver_ln_node=ln_of[channel.party_b],
+                    coinjoin_amount_sats=self.cj_amount,
+                    capacity_sats=channel.value,
+                    funder_contribution_sats=channel.contrib_a,
+                    receiver_contribution_sats=channel.contrib_b,
+                    expires_at_unix=expires_at,
+                )
+                edge_authorizations[(channel.party_a, channel.party_b)] = authorization
+                by_maker.setdefault(channel.party_a, []).append(authorization)
+                by_maker.setdefault(channel.party_b, []).append(authorization)
+        except ValueError as exc:
+            logger.warning("LND ring: invalid endpoint authorization: {}", exc)
+            return
+
+        # Both endpoints must durably acknowledge the same canonical edge record before
+        # either maker is asked to initiate an irreversible channel open.
+        try:
+            for nick, authorizations in by_maker.items():
+                session = self.maker_sessions[nick]
+                if session.crypto is None:
+                    raise RuntimeError(f"no crypto for {nick}")
+                bundle = ",".join(
+                    authorization.to_transport()
+                    for authorization in sorted(authorizations, key=lambda item: item.edge_id)
+                )
+                await self.directory_client.send_privmsg(
+                    nick,
+                    "chanauth",
+                    session.crypto.encrypt(bundle),
+                    log_routing=True,
+                    force_channel=session.comm_channel,
+                )
+            acknowledgments = await self.directory_client.wait_for_responses(
+                expected_nicks=list(by_maker),
+                expected_command="!chanauthack",
+                timeout=self.config.maker_timeout_sec,
             )
-        funders = [ch.party_a for ch in plan.channels]
-        responses = await self.directory_client.wait_for_responses(
-            expected_nicks=funders,
-            expected_command="!chanaddr",
-            timeout=self.config.maker_timeout_sec,
-        )
+        except Exception as exc:  # noqa: BLE001 - no channels exist yet, use plain change
+            logger.warning("LND ring: authorization phase failed: {}", exc)
+            return
+        for nick, authorizations in by_maker.items():
+            response = acknowledgments.get(nick)
+            crypto = self.maker_sessions[nick].crypto
+            if not response or response.get("error") or not response.get("data") or crypto is None:
+                logger.warning(f"LND ring: no authorization ack from {nick}; using plain change")
+                return
+            try:
+                received_ids = set(crypto.decrypt(response["data"].strip().split()[0]).split(","))
+            except Exception as exc:  # noqa: BLE001 - malformed ack fails the ring closed
+                logger.warning("LND ring: malformed authorization ack from {}: {}", nick, exc)
+                return
+            expected_ids = {authorization.authorization_id for authorization in authorizations}
+            if received_ids != expected_ids:
+                logger.warning(f"LND ring: authorization ack mismatch from {nick}")
+                return
+
+        # Ask each funder (party_a of an edge) to open a channel to its partner (party_b).
+        try:
+            for ch in plan.channels:
+                funder = self.maker_sessions[ch.party_a]
+                if funder.crypto is None:
+                    raise RuntimeError(f"no crypto for {ch.party_a}")
+                authorization = edge_authorizations[(ch.party_a, ch.party_b)]
+                enc = funder.crypto.encrypt(
+                    f"1 {authorization.edge_id} {authorization.authorization_id}"
+                )
+                await self.directory_client.send_privmsg(
+                    ch.party_a,
+                    "chanreq",
+                    enc,
+                    log_routing=True,
+                    force_channel=funder.comm_channel,
+                )
+            funders = [ch.party_a for ch in plan.channels]
+            responses = await self.directory_client.wait_for_responses(
+                expected_nicks=funders,
+                expected_command="!chanaddr",
+                timeout=self.config.maker_timeout_sec,
+            )
+        except Exception as exc:  # noqa: BLE001 - cancel any requests already delivered
+            logger.warning("LND ring: channel request phase failed: {}", exc)
+            await self._cancel_lnd_ring_openings(plan, edge_authorizations)
+            return
 
         edge_addr: dict[tuple[str, str], str] = {}
         for ch in plan.channels:
@@ -1387,22 +1486,93 @@ class CoinJoinSession:
             crypto = self.maker_sessions[ch.party_a].crypto
             if not r or r.get("error") or not r.get("data") or crypto is None:
                 logger.warning(f"LND ring: no chanaddr from {ch.party_a}; using plain change")
+                await self._cancel_lnd_ring_openings(plan, edge_authorizations)
                 return
-            addr = crypto.decrypt(r["data"].strip().split()[0])
-            if not addr:
+            authorization = edge_authorizations[(ch.party_a, ch.party_b)]
+            try:
+                response_parts = crypto.decrypt(r["data"].strip().split()[0]).split()
+            except Exception as exc:  # noqa: BLE001 - cancel every potentially opened edge
+                logger.warning("LND ring: malformed chanaddr from {}: {}", ch.party_a, exc)
+                await self._cancel_lnd_ring_openings(plan, edge_authorizations)
+                return
+            if (
+                len(response_parts) != 4
+                or response_parts[0] != "1"
+                or response_parts[1] != authorization.edge_id
+                or response_parts[2] != authorization.authorization_id
+            ):
                 logger.warning(f"LND ring: {ch.party_a} failed to open; using plain change")
+                await self._cancel_lnd_ring_openings(plan, edge_authorizations)
+                return
+            addr = response_parts[3]
+            try:
+                from jmcore.bitcoin import address_to_scriptpubkey
+
+                scriptpubkey = address_to_scriptpubkey(addr)
+                if len(scriptpubkey) != 34 or not scriptpubkey.startswith(b"\x51\x20"):
+                    raise ValueError("funding address is not P2TR")
+            except Exception:  # noqa: BLE001 - invalid address encodings vary by network backend
+                logger.warning(f"LND ring: {ch.party_a} returned invalid funding address")
+                await self._cancel_lnd_ring_openings(plan, edge_authorizations)
                 return
             edge_addr[(ch.party_a, ch.party_b)] = addr
 
         psession = plan_pooled_session(plan, lambda a, b: edge_addr[(a, b)])
         for nick, pieces in psession.change_outputs.items():
             maker_data[nick]["change_outputs"] = pieces
-        self._ring_relay = psession.change_outputs
+        ring_relay: dict[str, list[RingEdgeFunding]] = {}
+        for channel in plan.channels:
+            authorization = edge_authorizations[(channel.party_a, channel.party_b)]
+            address = edge_addr[(channel.party_a, channel.party_b)]
+            ring_relay.setdefault(channel.party_a, []).append(
+                RingEdgeFunding(
+                    edge_id=authorization.edge_id,
+                    authorization_id=authorization.authorization_id,
+                    funding_address=address,
+                    contribution_sats=channel.contrib_a,
+                )
+            )
+            ring_relay.setdefault(channel.party_b, []).append(
+                RingEdgeFunding(
+                    edge_id=authorization.edge_id,
+                    authorization_id=authorization.authorization_id,
+                    funding_address=address,
+                    contribution_sats=channel.contrib_b,
+                )
+            )
+        self._ring_relay = ring_relay
         self._merge_change = True
         logger.info(
             f"LND ring: {len(plan.channels)} co-funded taproot channel(s) "
             f"of ~{plan.channels[0].value:,} sats each"
         )
+
+    async def _cancel_lnd_ring_openings(
+        self,
+        plan: PooledPlan,
+        authorizations: dict[tuple[str, str], RingEdgeAuthorization],
+    ) -> None:
+        """Best-effort cancel every funder request issued for an abandoned ring plan."""
+        for channel in plan.channels:
+            session = self.maker_sessions[channel.party_a]
+            authorization = authorizations[(channel.party_a, channel.party_b)]
+            if session.crypto is None:
+                continue
+            try:
+                payload = session.crypto.encrypt(
+                    f"1 {authorization.edge_id} {authorization.authorization_id}"
+                )
+                await self.directory_client.send_privmsg(
+                    channel.party_a,
+                    "chancancel",
+                    payload,
+                    log_routing=True,
+                    force_channel=session.comm_channel,
+                )
+            except Exception as exc:  # noqa: BLE001 - continue canceling the remaining edges
+                logger.error(
+                    "LND ring: failed to cancel edge funded by {}: {}", channel.party_a, exc
+                )
 
     async def _phase_collect_signatures(self) -> bool:
         """Send !tx and collect !sig responses from makers.
@@ -1479,7 +1649,7 @@ class CoinJoinSession:
             elif ring is not None:
                 # True-pooling ring: relay this maker's two co-funded shared outputs
                 # (address:contribution) so it can verify its change is fully accounted.
-                pieces = ",".join(f"{addr}:{amt}" for addr, amt in ring)
+                pieces = ",".join(edge.to_transport() for edge in ring)
                 payload = f"{tx_b64} ring {pieces}"
             encrypted_tx = session.crypto.encrypt(payload)
             await self.directory_client.send_privmsg(

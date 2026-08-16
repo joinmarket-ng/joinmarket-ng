@@ -109,6 +109,14 @@ from jmswap.models import (
 from jmswap.nostr import SwapNostrNode
 from jmswap.persistence import SwapStore
 from jmswap.recovery import is_refundable, refund
+from jmswap.ring_authorization import (
+    RingChannelPoint,
+    RingEdgeAuthorization,
+    RingEdgeAuthorizationRecord,
+    RingEdgeAuthorizationStore,
+    RingEdgeFunding,
+    RingEdgeRole,
+)
 from jmswap.server import SwapServer
 from jmswap.swap_tree import SwapTree, verify_swap_tree
 from jmswap.wallet import FakeSwapWallet, SwapWallet
@@ -155,6 +163,12 @@ __all__ = [
     "REQUIRED_CHANNEL_INPUT_ESCROW_CAPABILITIES",
     "RecoveryBroadcastResult",
     "RecoveryRequest",
+    "RingChannelPoint",
+    "RingEdgeAuthorization",
+    "RingEdgeAuthorizationRecord",
+    "RingEdgeAuthorizationStore",
+    "RingEdgeFunding",
+    "RingEdgeRole",
     "SinglePartPaymentRequest",
     "SinglePartPaymentResult",
     "SwapClient",
