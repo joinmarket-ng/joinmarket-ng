@@ -77,8 +77,9 @@ controlled research deployments, not a production-safety claim.
 
 ### Channel-input escrow backend boundary
 
-The confirmation-gated construction remains unavailable until one backend provides
-the full lifecycle declared by `jmswap.ChannelInputEscrowCapability`:
+The confirmation-gated construction is an explicit, disabled-by-default maker mode. Its
+composite runtime provides the full lifecycle declared by
+`jmswap.ChannelInputEscrowCapability`:
 
 1. Cooperatively spend an existing channel funding output into the exact escrow parent.
 2. Fully sign and validate timeout recovery before releasing the parent signature.
@@ -103,8 +104,10 @@ the standard macaroon remains the compatibility fallback when the scoped path is
 `LndBackend` exposes these operations as the narrow `freeze_channel_input`,
 `prepare_channel_input_parent`, `begin_channel_input_signing`,
 `sign_channel_input_parent`, and `finalize_channel_input_parent` API. It deliberately
-continues to declare an empty full-lifecycle capability set. Timeout construction,
-the concrete payment and chain adapter, and maker runtime ownership are not yet wired.
+declares an empty full-lifecycle capability set by itself. The maker composes it with the
+timeout signer, Bitcoin Core chain adapter, single-part LND payment adapter, authenticated
+peer runtime, durable stores, and lifecycle monitor before declaring the complete capability
+set. A partial adapter therefore cannot advertise production support.
 `jmswap.bitcoin_escrow` provides the isolated cryptographic layer for constructing and
 independently verifying the role-ordered P2TR escrow tree, fully signed timeout child,
 and immediate RBF success sweep. Bitcoin Core regtest acceptance covers both spend paths.
@@ -132,6 +135,16 @@ confirmation-gated payment request before sending, monitors pending payments thr
 reorganizations, and requires descendant rebroadcast evidence before restoring a reorged
 state. Startup reconciliation treats the local store as authoritative and rejects unknown,
 conflicting, duplicate, or ahead-of-local backend records before resuming side effects.
+
+`ChannelInputEscrowDeployment` continuously advances each durable session in an independent
+monitor task. It observes exact-parent depth and conflicts, excludes the consumed channel
+before payment, persists immediate payment failure, broadcasts timeout recovery only after
+strict maturity, fee-bumps an unconfirmed success spend at most once per block before its
+deadline, and monitors confirmed descendants through the configured reorganization margin.
+Shallow reorganizations suspend new economic actions until the parent regains the selected
+depth. A failed monitor session retries without blocking other sessions, while new escrow
+admission remains disabled until monitor health recovers. Conflict and cross-layer loss states
+produce operational error logs.
 
 `ChannelInputEscrowRecord` enforces the authorization and recovery ordering, retains the
 prior state across a parent reorganization, and rejects persisted states that lack their
@@ -257,6 +270,12 @@ the role, choose directions, fee terms, and the Nostr relays, and point it at an
 docker-compose profile brings up a Nostr relay and two LDK Server nodes
 (`ldk-provider`, `ldk-client`) on regtest for end-to-end testing. The library
 itself (`jmswap`) is standalone and depends only on `jmcore`.
+
+Existing-channel escrow additionally requires `[maker.channel_input_escrow] enabled = true`,
+a descriptor-wallet Bitcoin Core backend, all four LND connection and macaroon paths under
+`[maker.swap_provider]`, and the patched LND build on both channel endpoints. The
+`monitor_poll_interval_seconds` setting controls lifecycle polling. This mode is mutually
+exclusive with the legacy `channel_change` and `knapsack_capable` constructions.
 
 ## Privacy fidelity (what is actually achieved)
 
