@@ -106,6 +106,9 @@ the standard macaroon remains the compatibility fallback when the scoped path is
 continues to declare an empty full-lifecycle capability set. Timeout construction,
 peer-to-peer endpoint coordination, confirmation and reorganization monitoring,
 single-part payment enforcement, and success or timeout recovery are not yet wired.
+`jmswap.bitcoin_escrow` provides the isolated cryptographic layer for constructing and
+independently verifying the role-ordered P2TR escrow tree, fully signed timeout child,
+and immediate RBF success sweep. Bitcoin Core regtest acceptance covers both spend paths.
 External channel funding APIs still do not satisfy this boundary merely by returning a
 new channel funding address.
 

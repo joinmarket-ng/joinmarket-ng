@@ -18,6 +18,18 @@ JoinMarket. The public surface:
 
 from __future__ import annotations
 
+from jmswap.bitcoin_escrow import (
+    ChannelInputEscrowTree,
+    UnsignedTimeoutSpend,
+    build_success_spend,
+    build_timeout_spend,
+    finalize_timeout_spend,
+    parse_escrow_transaction,
+    timeout_nonce,
+    timeout_session,
+    verify_success_spend,
+    verify_timeout,
+)
 from jmswap.bond import select_bonded_providers, verify_provider_bond
 from jmswap.chain import ChainBackend, FakeChainBackend
 from jmswap.channel import (
@@ -111,6 +123,7 @@ __all__ = [
     "ChannelInputEscrowRecord",
     "ChannelInputEscrowStore",
     "ChannelInputEscrowTerms",
+    "ChannelInputEscrowTree",
     "ChannelSnapshot",
     "ChangeSplit",
     "CombinedChannelPlan",
@@ -160,14 +173,19 @@ __all__ = [
     "SwapVerificationError",
     "SwapWallet",
     "SuccessSpendRequest",
+    "UnsignedTimeoutSpend",
+    "build_success_spend",
+    "build_timeout_spend",
     "channel_funding_address",
     "channel_funding_output",
     "combined_funding_address",
     "combined_funding_output",
     "complete_external_channel_funding",
     "cooperative_close",
+    "finalize_timeout_spend",
     "plan_combined_channel",
     "missing_channel_input_escrow_capabilities",
+    "parse_escrow_transaction",
     "require_channel_input_escrow_capabilities",
     "require_channel_input_escrow_backend",
     "request_external_channel_funding",
@@ -176,5 +194,9 @@ __all__ = [
     "is_refundable",
     "refund",
     "split_change",
+    "timeout_nonce",
+    "timeout_session",
+    "verify_success_spend",
     "verify_swap_tree",
+    "verify_timeout",
 ]
