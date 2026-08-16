@@ -256,7 +256,11 @@ class RingEdgeAuthorizationRecord(BaseModel):
     local_nick: str = Field(min_length=1)
     funding_address: str | None = Field(default=None, min_length=1)
     funding_scriptpubkey: str | None = None
+    pending_channel_id: str | None = Field(default=None, min_length=1)
+    funding_canceled: bool = False
+    funding_cancel_completed: bool = False
     channel_point: RingChannelPoint | None = None
+    funding_completed: bool = False
     revision: int = Field(default=0, ge=0)
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
@@ -276,8 +280,18 @@ class RingEdgeAuthorizationRecord(BaseModel):
             raise ValueError(str(exc)) from exc
         if (self.funding_address is None) != (self.funding_scriptpubkey is None):
             raise ValueError("funding address and scriptpubkey must be bound together")
+        if self.funding_cancel_completed and (
+            not self.funding_canceled or self.pending_channel_id is None
+        ):
+            raise ValueError("completed funding cancellation requires a canceled pending channel")
         if self.channel_point is not None and self.funding_address is None:
             raise ValueError("channel point requires a funding binding")
+        if self.funding_completed and self.channel_point is None:
+            raise ValueError("completed funding requires a channel point")
+        if self.funding_completed and self.funding_canceled:
+            raise ValueError("completed funding cannot be canceled")
+        if self.funding_completed and self.pending_channel_id is None:
+            raise ValueError("completed funding requires a pending channel ID")
         if self.created_at.tzinfo != UTC or self.updated_at.tzinfo != UTC:
             raise ValueError("record timestamps must use UTC")
         return self
@@ -414,8 +428,10 @@ class RingEdgeAuthorizationStore:
         authorization_id: str,
         address: str,
         scriptpubkey: str,
+        *,
+        pending_channel_id: str | None = None,
     ) -> RingEdgeAuthorizationRecord:
-        """Irreversibly bind an authorized edge to its jointly derived funding output."""
+        """Irreversibly bind an authorized edge to its pending funding output."""
         with self._edge_lock(edge_id):
             record = self._load_path(self._path(edge_id), edge_id)
             if record is None:
@@ -426,13 +442,141 @@ class RingEdgeAuthorizationStore:
                 if (
                     record.funding_address == address
                     and record.funding_scriptpubkey == scriptpubkey
+                    and record.pending_channel_id == pending_channel_id
                 ):
                     return record
                 raise ChannelInputEscrowError("ring edge funding binding is immutable")
+            if record.funding_canceled:
+                raise ChannelInputEscrowError("ring edge funding binding was canceled")
+            if record.funding_completed:
+                raise ChannelInputEscrowError("ring edge funding is already completed")
+            if (
+                record.pending_channel_id is not None
+                and pending_channel_id != record.pending_channel_id
+            ):
+                raise ChannelInputEscrowError("ring edge pending channel ID is immutable")
             updated = self._updated_record(
                 record,
                 funding_address=address,
                 funding_scriptpubkey=scriptpubkey,
+                pending_channel_id=record.pending_channel_id or pending_channel_id,
+                revision=record.revision + 1,
+                updated_at=datetime.now(UTC),
+            )
+            self._write_record(updated)
+            return updated
+
+    def reserve_funding(
+        self, edge_id: str, authorization_id: str, pending_channel_id: str
+    ) -> RingEdgeAuthorizationRecord:
+        """Durably reserve a caller-selected external funding ID before opening."""
+        if not isinstance(pending_channel_id, str) or not pending_channel_id:
+            raise ChannelInputEscrowError("pending channel ID must be non-empty")
+        with self._edge_lock(edge_id):
+            record = self._load_path(self._path(edge_id), edge_id)
+            if record is None:
+                raise ChannelInputEscrowError("ring edge authorization record does not exist")
+            if authorization_id != record.authorization.authorization_id:
+                raise ChannelInputEscrowError("ring edge authorization hash does not match")
+            if (
+                record.funding_canceled
+                or record.funding_completed
+                or record.funding_address is not None
+            ):
+                raise ChannelInputEscrowError("ring edge funding cannot be reserved")
+            if record.pending_channel_id is not None:
+                if record.pending_channel_id == pending_channel_id:
+                    return record
+                raise ChannelInputEscrowError("ring edge pending channel ID is immutable")
+            updated = self._updated_record(
+                record,
+                pending_channel_id=pending_channel_id,
+                revision=record.revision + 1,
+                updated_at=datetime.now(UTC),
+            )
+            self._write_record(updated)
+            return updated
+
+    def cancel_funding(self, edge_id: str, authorization_id: str) -> RingEdgeAuthorizationRecord:
+        """Durably abandon a pending funding binding so it cannot be replayed."""
+        with self._edge_lock(edge_id):
+            record = self._load_path(self._path(edge_id), edge_id)
+            if record is None:
+                raise ChannelInputEscrowError("ring edge authorization record does not exist")
+            if authorization_id != record.authorization.authorization_id:
+                raise ChannelInputEscrowError("ring edge authorization hash does not match")
+            if record.funding_completed:
+                raise ChannelInputEscrowError("ring edge funding is already completed")
+            if record.funding_address is None and record.pending_channel_id is None:
+                raise ChannelInputEscrowError(
+                    "ring edge funding cancellation requires a funding binding"
+                )
+            if record.funding_canceled:
+                return record
+            updated = self._updated_record(
+                record,
+                funding_canceled=True,
+                revision=record.revision + 1,
+                updated_at=datetime.now(UTC),
+            )
+            self._write_record(updated)
+            return updated
+
+    def complete_funding_cancellation(
+        self, edge_id: str, authorization_id: str
+    ) -> RingEdgeAuthorizationRecord:
+        """Record successful cancellation of a durably identified pending open."""
+        with self._edge_lock(edge_id):
+            record = self._load_path(self._path(edge_id), edge_id)
+            if record is None:
+                raise ChannelInputEscrowError("ring edge authorization record does not exist")
+            if authorization_id != record.authorization.authorization_id:
+                raise ChannelInputEscrowError("ring edge authorization hash does not match")
+            if not record.funding_canceled or record.pending_channel_id is None:
+                raise ChannelInputEscrowError("ring edge funding cancellation was not requested")
+            if record.funding_cancel_completed:
+                return record
+            updated = self._updated_record(
+                record,
+                funding_cancel_completed=True,
+                revision=record.revision + 1,
+                updated_at=datetime.now(UTC),
+            )
+            self._write_record(updated)
+            return updated
+
+    def complete_funding(
+        self,
+        edge_id: str,
+        authorization_id: str,
+        channel_point: RingChannelPoint,
+    ) -> RingEdgeAuthorizationRecord:
+        """Durably record successful backend completion of an intended channel point."""
+        if not isinstance(channel_point, RingChannelPoint):
+            raise ChannelInputEscrowError("ring edge channel point is invalid")
+        with self._edge_lock(edge_id):
+            record = self._load_path(self._path(edge_id), edge_id)
+            if record is None:
+                raise ChannelInputEscrowError("ring edge authorization record does not exist")
+            if authorization_id != record.authorization.authorization_id:
+                raise ChannelInputEscrowError("ring edge authorization hash does not match")
+            if record.funding_canceled:
+                raise ChannelInputEscrowError("ring edge funding binding was canceled")
+            if record.pending_channel_id is None:
+                raise ChannelInputEscrowError(
+                    "ring edge funding completion requires a pending channel ID"
+                )
+            if record.channel_point is None:
+                raise ChannelInputEscrowError(
+                    "ring edge funding completion requires a channel point"
+                )
+            if record.channel_point != channel_point:
+                raise ChannelInputEscrowError("ring edge channel point binding is immutable")
+            if record.funding_completed:
+                return record
+            updated = self._updated_record(
+                record,
+                funding_completed=True,
                 revision=record.revision + 1,
                 updated_at=datetime.now(UTC),
             )
@@ -456,6 +600,8 @@ class RingEdgeAuthorizationStore:
                 raise ChannelInputEscrowError("ring edge authorization hash does not match")
             if record.funding_address is None:
                 raise ChannelInputEscrowError("ring edge channel point requires a funding binding")
+            if record.funding_canceled:
+                raise ChannelInputEscrowError("ring edge funding binding was canceled")
             if record.channel_point is not None:
                 if record.channel_point == channel_point:
                     return record

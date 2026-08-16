@@ -7,6 +7,7 @@ import hashlib
 from pathlib import Path
 
 import pytest
+from jmcore.bitcoin import TxInput, TxOutput, get_txid, serialize_transaction
 
 from jmswap.channel_escrow import (
     ChainObservationRequest,
@@ -19,10 +20,12 @@ from jmswap.channel_escrow import (
     EscrowOutpoint,
     EscrowParentBroadcast,
     EscrowParentEvidence,
+    EscrowParentPrevout,
     EscrowRouteEvidence,
     EscrowSpendResult,
     EscrowTimeoutBroadcast,
     EscrowTimeoutEvidence,
+    FinalizedEscrowParent,
     FreezeChannelRequest,
     ParentAuthorization,
     ParentAuthorizationRequest,
@@ -41,7 +44,16 @@ from jmswap.errors import ChannelInputEscrowError
 from jmswap.escrow_coordinator import ChannelInputEscrowCoordinator
 from jmswap.lightning import PaymentStatus
 
-PARENT_TXID = "11" * 32
+_FUNDING_TXID = "44" * 32
+_FUNDING_SCRIPT = "5120" + "45" * 32
+_ESCROW_SCRIPT = "5120" + "55" * 32
+_PARENT_TX_HEX = serialize_transaction(
+    version=2,
+    inputs=[TxInput.from_hex(_FUNDING_TXID, 2, sequence=0xFFFFFFFD)],
+    outputs=[TxOutput.from_hex(_ESCROW_SCRIPT, 80_000)],
+    locktime=0,
+).hex()
+PARENT_TXID = get_txid(_PARENT_TX_HEX)
 TIMEOUT_TXID = "22" * 32
 SUCCESS_TXID = "77" * 32
 PREIMAGE = "33" * 32
@@ -53,7 +65,10 @@ def _terms(session_id: str = "session-1") -> ChannelInputEscrowTerms:
         snapshot=ChannelSnapshot(
             session_id=session_id,
             channel_id="channel-1",
-            funding_outpoint=EscrowOutpoint(txid="44" * 32, vout=2),
+            funding_outpoint=EscrowOutpoint(txid=_FUNDING_TXID, vout=2),
+            funding_scriptpubkey=_FUNDING_SCRIPT,
+            local_funding_pubkey="02" + "46" * 32,
+            remote_funding_pubkey="03" + "47" * 32,
             capacity_sats=100_000,
             maker_claim_sats=70_000,
             peer_claim_sats=30_000,
@@ -85,20 +100,24 @@ def _terms(session_id: str = "session-1") -> ChannelInputEscrowTerms:
     )
 
 
-def _prepared(
-    terms: ChannelInputEscrowTerms, parent_txid: str = PARENT_TXID
-) -> PreparedChannelInputEscrow:
-    outpoint = EscrowOutpoint(txid=parent_txid, vout=0)
+def _prepared(terms: ChannelInputEscrowTerms) -> PreparedChannelInputEscrow:
+    outpoint = EscrowOutpoint(txid=PARENT_TXID, vout=0)
     return PreparedChannelInputEscrow(
         terms=terms,
         parent_evidence=EscrowParentEvidence(
-            parent_tx_hex="0100",
-            parent_txid=parent_txid,
+            parent_tx_hex=_PARENT_TX_HEX,
+            parent_txid=PARENT_TXID,
             channel_funding_outpoint=terms.snapshot.funding_outpoint,
             channel_input_index=0,
+            ordered_prevouts=(
+                EscrowParentPrevout(
+                    value_sats=terms.snapshot.capacity_sats,
+                    scriptpubkey=terms.snapshot.funding_scriptpubkey,
+                ),
+            ),
             escrow_outpoint=outpoint,
             escrow_value_sats=80_000,
-            escrow_scriptpubkey="5120" + "55" * 32,
+            escrow_scriptpubkey=_ESCROW_SCRIPT,
             all_inputs_nonmalleable=True,
             exact_transaction_verified=True,
         ),
@@ -128,6 +147,19 @@ def _chain(
     }
     values.update(changes)
     return EscrowChainObservation.model_validate(values)
+
+
+def _finalized_parent(terms: ChannelInputEscrowTerms) -> FinalizedEscrowParent:
+    return FinalizedEscrowParent(
+        session_id=terms.snapshot.session_id,
+        parent_txid=PARENT_TXID,
+        signed_parent_tx_hex="010000",
+        channel_funding_outpoint=terms.snapshot.funding_outpoint,
+        channel_input_index=0,
+        all_inputs_signed=True,
+        all_signatures_verified=True,
+        signed_parent_txid_verified=True,
+    )
 
 
 class FakeBackend:
@@ -176,7 +208,7 @@ class FakeBackend:
         self.calls.append("prepare")
         if self.prepare_fails:
             raise RuntimeError("prepare failed")
-        return _prepared(request.terms, request.parent_evidence.parent_txid)
+        return _prepared(request.terms)
 
     async def authorize_parent(self, request: ParentAuthorizationRequest) -> ParentAuthorization:
         self.calls.append("authorize")
@@ -188,16 +220,13 @@ class FakeBackend:
             session_id=prepared.terms.snapshot.session_id,
             parent_txid=prepared.parent_evidence.parent_txid,
             prepared_parent_tx_hex=prepared.parent_evidence.parent_tx_hex,
-            signed_parent_tx_hex="010000",
             timeout_txid=prepared.timeout_evidence.timeout_txid,
             channel_funding_outpoint=prepared.terms.snapshot.funding_outpoint,
             channel_input_index=prepared.parent_evidence.channel_input_index,
-            signer_pubkey=prepared.terms.authorizer_pubkey,
-            signature=b"signature",
+            channel_input_witness=(b"w" * 64,),
             sighash="default",
-            parent_fully_signed=True,
-            signed_parent_txid_verified=True,
             signature_verified=True,
+            channel_witness_txid_verified=True,
             commits_all_inputs=True,
             commits_all_outputs=True,
         )
@@ -315,6 +344,7 @@ async def _parent_confirmed(
     request = PrepareTimeoutRequest(terms=terms, parent_evidence=_prepared(terms).parent_evidence)
     await coordinator.prepare_timeout(request)
     await coordinator.authorize_parent(terms.snapshot.session_id)
+    await coordinator.finalize_parent(terms.snapshot.session_id, _finalized_parent(terms))
     await coordinator.broadcast_parent(terms.snapshot.session_id)
     return await coordinator.observe_chain(terms.snapshot.session_id)
 
@@ -327,6 +357,35 @@ def setup(
     store = ChannelInputEscrowStore(tmp_path)
     backend.store = store
     return backend, ChannelInputEscrowCoordinator(backend, store), store
+
+
+def test_find_parent_requires_a_unique_durable_claim(
+    setup: tuple[FakeBackend, ChannelInputEscrowCoordinator, ChannelInputEscrowStore],
+) -> None:
+    _, coordinator, store = setup
+    first_terms = _terms()
+    first = ChannelInputEscrowRecord(
+        terms=first_terms,
+        negotiated_parent_evidence=_prepared(first_terms).parent_evidence,
+    )
+    store.save(first)
+
+    found = coordinator.find_parent(PARENT_TXID)
+    assert found == first
+    assert found is not first
+    assert coordinator.find_parent("00" * 32) is None
+    with pytest.raises(ChannelInputEscrowError, match="invalid escrow parent"):
+        coordinator.find_parent("invalid")
+
+    second_terms = _terms("session-2")
+    store.save(
+        ChannelInputEscrowRecord(
+            terms=second_terms,
+            negotiated_parent_evidence=_prepared(second_terms).parent_evidence,
+        )
+    )
+    with pytest.raises(ChannelInputEscrowError, match="multiple escrow sessions"):
+        coordinator.find_parent(PARENT_TXID)
 
 
 async def test_prepare_persists_terms_before_side_effect_and_rejects_conflicts(
@@ -347,7 +406,22 @@ async def test_prepare_persists_terms_before_side_effect_and_rejects_conflicts(
     assert prepared.state is EscrowLifecycleState.TIMEOUT_SIGNED
     assert (await coordinator.prepare_timeout(request)).revision == prepared.revision
     assert backend.calls.count("prepare") == 2
-    conflicting = _prepared(terms, "12" * 32).parent_evidence
+    conflicting_hex = serialize_transaction(
+        version=2,
+        inputs=[TxInput.from_hex(_FUNDING_TXID, 2, sequence=0xFFFFFFFC)],
+        outputs=[TxOutput.from_hex(_ESCROW_SCRIPT, 80_000)],
+        locktime=0,
+    ).hex()
+    conflicting_txid = get_txid(conflicting_hex)
+    conflicting_values = request.parent_evidence.model_dump()
+    conflicting_values.update(
+        {
+            "parent_tx_hex": conflicting_hex,
+            "parent_txid": conflicting_txid,
+            "escrow_outpoint": EscrowOutpoint(txid=conflicting_txid, vout=0),
+        }
+    )
+    conflicting = EscrowParentEvidence.model_validate(conflicting_values)
     with pytest.raises(ChannelInputEscrowError, match="conflicts"):
         await coordinator.prepare_timeout(
             PrepareTimeoutRequest(terms=terms, parent_evidence=conflicting)
@@ -375,6 +449,7 @@ async def test_parent_ordering_payment_durability_and_success_recovery(
     with pytest.raises(ChannelInputEscrowError, match="parent broadcast"):
         await coordinator.broadcast_parent("session-1")
     await coordinator.authorize_parent("session-1")
+    await coordinator.finalize_parent("session-1", _finalized_parent(terms))
     await coordinator.broadcast_parent("session-1")
     assert (
         await coordinator.observe_chain("session-1")
@@ -430,27 +505,56 @@ async def test_resume_replays_exact_negotiated_parent_after_interrupted_prepare(
 
     [resumed] = await coordinator.resume_durable_sessions()
 
-    assert resumed.state is EscrowLifecycleState.PARENT_CONFIRMED
+    assert resumed.state is EscrowLifecycleState.CHANNEL_SIGNATURE_RELEASED
     assert resumed.prepared is not None
     assert resumed.prepared.parent_evidence == parent_evidence
-    assert backend.calls[:5] == ["resume", "prepare", "authorize", "parent", "chain"]
+    assert backend.calls == ["resume", "prepare", "authorize"]
 
 
-async def test_initial_failed_payment_is_not_persisted_or_advanced(
+async def test_finalize_parent_is_idempotent_and_rejects_conflicting_evidence(
+    setup: tuple[FakeBackend, ChannelInputEscrowCoordinator, ChannelInputEscrowStore],
+) -> None:
+    backend, coordinator, _ = setup
+    terms = _terms()
+    request = PrepareTimeoutRequest(terms=terms, parent_evidence=_prepared(terms).parent_evidence)
+    await coordinator.prepare_timeout(request)
+    released = await coordinator.authorize_parent(terms.snapshot.session_id)
+    assert released.state is EscrowLifecycleState.CHANNEL_SIGNATURE_RELEASED
+
+    finalized = _finalized_parent(terms)
+    signed = await coordinator.finalize_parent(terms.snapshot.session_id, finalized)
+    assert signed.state is EscrowLifecycleState.PARENT_SIGNED
+    assert await coordinator.finalize_parent(terms.snapshot.session_id, finalized) == signed
+
+    conflicting = finalized.model_copy(update={"signed_parent_tx_hex": "020000"})
+    with pytest.raises(ChannelInputEscrowError, match="conflicts with durable evidence"):
+        await coordinator.finalize_parent(terms.snapshot.session_id, conflicting)
+
+
+async def test_initial_failed_payment_is_persisted_and_allows_timeout_recovery(
     setup: tuple[FakeBackend, ChannelInputEscrowCoordinator, ChannelInputEscrowStore],
 ) -> None:
     backend, coordinator, store = setup
     await _parent_confirmed(coordinator, _terms())
-    backend.payment_result = backend._payment(PaymentStatus.FAILED)
+    failed_result = backend._payment(PaymentStatus.FAILED)
+    backend.payment_result = failed_result
 
-    with pytest.raises(ChannelInputEscrowError, match="cannot be failed"):
-        await coordinator.start_payment("session-1", ("channel-1",), 1_900_000_000)
+    payment = await coordinator.start_payment("session-1", ("channel-1",), 1_900_000_000)
 
     record = store.load("session-1")
     assert record is not None
-    assert record.state is EscrowLifecycleState.PARENT_CONFIRMED
+    assert payment.state is EscrowLifecycleState.PAYMENT_IN_FLIGHT
+    assert record.state is EscrowLifecycleState.PAYMENT_IN_FLIGHT
     assert record.payment_request is not None
-    assert record.payment_result is None
+    assert record.payment_result == failed_result
+
+    backend.chain_observations.append(_chain(parent_confirmations=2, observed_height=1_001))
+    timeout = await coordinator.broadcast_timeout("session-1")
+
+    assert timeout.state is EscrowLifecycleState.TIMEOUT_PENDING
+    assert timeout.payment_result == failed_result
+    assert backend.calls.count("send") == 1
+    assert backend.calls.count("timeout") == 1
 
 
 async def test_timeout_reorg_conflict_and_resume_reconciliation(
@@ -662,3 +766,54 @@ async def test_pending_payment_conflict_waits_for_terminal_payment_evidence(
     assert resolved.state is expected_state
     if terminal_payment is PaymentStatus.SUCCEEDED:
         assert "success" in backend.calls
+
+
+async def test_reorg_recovery_classifies_conflict_before_rebroadcast(
+    setup: tuple[FakeBackend, ChannelInputEscrowCoordinator, ChannelInputEscrowStore],
+) -> None:
+    backend, coordinator, _ = setup
+    terms = _terms()
+    await _parent_confirmed(coordinator, terms)
+    backend.chain_observations.append(_chain(parent_confirmations=0, in_best_chain=False))
+    assert (
+        await coordinator.observe_chain(terms.snapshot.session_id)
+    ).state is EscrowLifecycleState.PARENT_REORGED
+    backend.chain_observations.append(
+        _chain(
+            parent_confirmations=0,
+            in_best_chain=False,
+            conflict_txid="99" * 32,
+            conflict_confirmations=1,
+            conflicting_channel_outpoint=terms.snapshot.funding_outpoint,
+            conflict_spends_channel=True,
+            observed_height=951,
+        )
+    )
+
+    recovered = await coordinator.recover_reorg(terms.snapshot.session_id)
+
+    assert recovered.state is EscrowLifecycleState.COMMITMENT_CONFLICT
+    assert "rebroadcast" not in backend.calls
+
+
+async def test_shallow_best_chain_reorg_waits_for_parent_depth_without_rebroadcast(
+    setup: tuple[FakeBackend, ChannelInputEscrowCoordinator, ChannelInputEscrowStore],
+) -> None:
+    backend, coordinator, _ = setup
+    terms = _terms().model_copy(update={"parent_confirmation_depth": 2})
+    backend.chain_observations.append(_chain(parent_confirmations=2))
+    confirmed = await _parent_confirmed(coordinator, terms)
+    assert confirmed.state is EscrowLifecycleState.PARENT_CONFIRMED
+
+    backend.chain_observations.append(_chain(parent_confirmations=1, observed_height=951))
+    reconfirming = await coordinator.observe_chain(terms.snapshot.session_id)
+
+    assert reconfirming.state is EscrowLifecycleState.PARENT_REORGED
+    assert reconfirming.state_before_reorg is EscrowLifecycleState.PARENT_CONFIRMED
+    assert not reconfirming.recovery_required
+
+    backend.chain_observations.append(_chain(parent_confirmations=2, observed_height=952))
+    restored = await coordinator.recover_reorg(terms.snapshot.session_id)
+
+    assert restored.state is EscrowLifecycleState.PARENT_CONFIRMED
+    assert "rebroadcast" not in backend.calls

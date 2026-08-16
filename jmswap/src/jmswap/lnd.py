@@ -20,9 +20,11 @@ from __future__ import annotations
 
 import os
 import secrets
+import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from enum import IntEnum
+from hashlib import sha256
 from typing import Any, ClassVar
 
 from jmcore.bitcoin import (
@@ -38,6 +40,7 @@ from loguru import logger
 
 from jmswap.channel_escrow import ChannelSnapshot, EscrowOutpoint
 from jmswap.channel_funding import ChannelInputEscrowCapability
+from jmswap.errors import LightningError
 from jmswap.peer_transport import (
     ESCROW_PEER_CUSTOM_MESSAGE_TYPE,
     MAX_LND_CUSTOM_MESSAGE_PAYLOAD,
@@ -134,7 +137,7 @@ def unsigned_psbt_from_tx(raw_tx_hex: str, input_utxos: list[tuple[int, bytes]])
 @dataclass
 class _PendingOpen:
     pending_chan_id: bytes
-    stream: Any
+    stream: Any | None
     funding_address: str = ""
     funding_amount: int = 0
     verified: bool = False
@@ -164,14 +167,34 @@ class LndEscrowStatus:
     stage: LndEscrowStage
     parent_txid: str | None
     finalized: bool
+    durable_local_public_nonce: bytes | None = None
+    durable_remote_public_nonce: bytes | None = None
+    durable_local_partial_signature: bytes | None = None
+    finalized_parent: LndFinalizedEscrowParent | None = None
+    active_attempt: LndEscrowSigningAttempt | None = None
 
 
 @dataclass(frozen=True)
 class LndFinalizedEscrowParent:
-    """The exact fully signed parent persisted and published by patched LND."""
+    """The exact parent carrying the finalized channel-input witness."""
 
     tx_hex: str
     txid: str
+    channel_input_index: int
+    channel_input_witness: tuple[bytes, ...]
+
+
+@dataclass(frozen=True)
+class LndEscrowInvoice:
+    """A decoded, term-bound BOLT11 invoice used for an escrow payment."""
+
+    invoice: str
+    payment_hash: str
+    payee_pubkey: str
+    payment_secret: str
+    amount_msat: int
+    expiry_unix: int
+    min_final_cltv_delta: int
 
 
 @dataclass
@@ -179,6 +202,8 @@ class LndBackend:
     """Minimal LND gRPC client for taproot channel-as-change via PSBT funding."""
 
     requires_pre_signing_funding_completion: ClassVar[bool] = True
+    supports_reserved_external_funding_id: ClassVar[bool] = True
+    supports_external_funding_cancellation: ClassVar[bool] = True
     channel_input_escrow_capabilities: ClassVar[frozenset[ChannelInputEscrowCapability]] = (
         frozenset()
     )
@@ -191,6 +216,7 @@ class LndBackend:
     _channel: Any = field(default=None, repr=False)
     _escrow_channel: Any = field(default=None, repr=False)
     _stub: Any = field(default=None, repr=False)
+    _router_stub: Any = field(default=None, repr=False)
     _escrow_stub: Any = field(default=None, repr=False)
     _pending: dict[str, _PendingOpen] = field(default_factory=dict, repr=False)
 
@@ -226,6 +252,7 @@ class LndBackend:
 
         from jmswap.lndrpc import channelescrow_pb2_grpc as escrow_grpc
         from jmswap.lndrpc import lightning_pb2_grpc as lng
+        from jmswap.lndrpc import router_pb2_grpc as router_grpc
 
         ssl = grpc.ssl_channel_credentials(self.tls_cert)
 
@@ -240,6 +267,7 @@ class LndBackend:
 
         self._channel = authenticated_channel(self.macaroon_hex)
         self._stub = lng.LightningStub(self._channel)
+        self._router_stub = router_grpc.RouterStub(self._channel)
         if self.escrow_macaroon_hex is None:
             self._escrow_channel = self._channel
         else:
@@ -254,7 +282,15 @@ class LndBackend:
         self._channel = None
         self._escrow_channel = None
         self._stub = None
+        self._router_stub = None
         self._escrow_stub = None
+
+    def payment_stubs(self) -> tuple[Any, Any]:
+        """Return the authenticated Lightning and Router stubs for payment adapters."""
+        self._ensure()
+        if self._stub is None or self._router_stub is None:
+            raise RuntimeError("LND payment stubs were not initialized")
+        return self._stub, self._router_stub
 
     async def node_id(self) -> str:
         self._ensure()
@@ -262,6 +298,181 @@ class LndBackend:
 
         info = await self._stub.GetInfo(ln.GetInfoRequest())
         return str(info.identity_pubkey)
+
+    @staticmethod
+    def _positive_int(value: object, name: str) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+        return value
+
+    @staticmethod
+    def _decoded_escrow_invoice(invoice: str, decoded: Any) -> LndEscrowInvoice:
+        """Validate the security-critical fields returned by LND's BOLT11 decoder."""
+        try:
+            if not isinstance(invoice, str) or not invoice:
+                raise ValueError("empty invoice")
+            if not isinstance(decoded.destination, str) or not isinstance(
+                decoded.payment_hash, str
+            ):
+                raise ValueError("invalid encoded fields")
+            if not isinstance(decoded.payment_addr, bytes):
+                raise ValueError("invalid payment secret")
+            destination = _validate_compressed_node_id(decoded.destination).hex()
+            payment_hash = bytes.fromhex(decoded.payment_hash)
+            if len(payment_hash) != 32:
+                raise ValueError("invalid payment hash")
+            payment_secret = decoded.payment_addr
+            if len(payment_secret) != 32:
+                raise ValueError("invalid payment secret")
+            amount_msat = LndBackend._positive_int(decoded.num_msat, "decoded amount")
+            timestamp = LndBackend._positive_int(decoded.timestamp, "decoded timestamp")
+            expiry = LndBackend._positive_int(decoded.expiry, "decoded expiry")
+            min_final_cltv_delta = LndBackend._positive_int(
+                decoded.cltv_expiry, "decoded CLTV expiry"
+            )
+            expiry_unix = timestamp + expiry
+            if expiry_unix <= int(time.time()):
+                raise ValueError("expired invoice")
+        except (AttributeError, TypeError, ValueError):
+            raise LightningError("LND returned an invalid escrow invoice") from None
+        return LndEscrowInvoice(
+            invoice=invoice.lower(),
+            payment_hash=payment_hash.hex(),
+            payee_pubkey=destination,
+            payment_secret=payment_secret.hex(),
+            amount_msat=amount_msat,
+            expiry_unix=expiry_unix,
+            min_final_cltv_delta=min_final_cltv_delta,
+        )
+
+    async def decode_escrow_invoice(self, invoice: str) -> LndEscrowInvoice:
+        """Decode and validate an escrow invoice without asserting payee ownership."""
+        if not isinstance(invoice, str) or not invoice:
+            raise LightningError("invalid escrow invoice")
+        self._ensure()
+        from jmswap.lndrpc import lightning_pb2 as ln
+
+        try:
+            decoded = await self._stub.DecodePayReq(ln.PayReqString(pay_req=invoice))
+        except Exception:  # noqa: BLE001 - sanitize gRPC failures
+            raise LightningError("LND could not decode escrow invoice") from None
+        return self._decoded_escrow_invoice(invoice, decoded)
+
+    async def create_escrow_invoice(
+        self,
+        amount_msat: int,
+        preimage: bytes,
+        expiry_seconds: int,
+        min_final_cltv_delta: int,
+        memo: str = "",
+    ) -> LndEscrowInvoice:
+        """Create and independently verify a private preimage-bound escrow invoice."""
+        amount_msat = self._positive_int(amount_msat, "amount_msat")
+        expiry_seconds = self._positive_int(expiry_seconds, "expiry_seconds")
+        min_final_cltv_delta = self._positive_int(min_final_cltv_delta, "min_final_cltv_delta")
+        if not isinstance(preimage, bytes) or len(preimage) != 32:
+            raise ValueError("preimage must be exactly 32 bytes")
+        if not isinstance(memo, str):
+            raise ValueError("memo must be a string")
+
+        self._ensure()
+        from jmswap.lndrpc import lightning_pb2 as ln
+
+        expected_hash = sha256(preimage).digest()
+        try:
+            info = await self._stub.GetInfo(ln.GetInfoRequest())
+            if not isinstance(info.identity_pubkey, str):
+                raise ValueError("invalid local node identity")
+            local_pubkey = _validate_compressed_node_id(info.identity_pubkey).hex()
+            request = ln.Invoice(
+                r_preimage=preimage,
+                value_msat=amount_msat,
+                expiry=expiry_seconds,
+                cltv_expiry=min_final_cltv_delta,
+                memo=memo,
+                private=True,
+            )
+            recovered_existing = False
+            try:
+                response = await self._stub.AddInvoice(request)
+            except Exception as exc:  # noqa: BLE001 - gRPC concrete errors vary by installation
+                if not self._same_hash_may_exist(exc):
+                    raise
+                response = await self._stub.LookupInvoice(ln.PaymentHash(r_hash=expected_hash))
+                recovered_existing = True
+            if not isinstance(response.r_hash, bytes) or not isinstance(
+                response.payment_addr, bytes
+            ):
+                raise ValueError("invalid AddInvoice response")
+            response_hash = response.r_hash
+            payment_secret = response.payment_addr
+            invoice = response.payment_request
+            if (
+                len(response_hash) != 32
+                or response_hash != expected_hash
+                or len(payment_secret) != 32
+                or not isinstance(invoice, str)
+                or not invoice
+            ):
+                raise ValueError("invalid AddInvoice response")
+        except LightningError:
+            raise
+        except Exception:  # noqa: BLE001 - sanitize gRPC and malformed responses
+            raise LightningError("LND could not create escrow invoice") from None
+
+        try:
+            decoded_response = await self._stub.DecodePayReq(ln.PayReqString(pay_req=invoice))
+        except Exception:  # noqa: BLE001 - sanitize gRPC failures
+            raise LightningError("LND could not decode escrow invoice") from None
+        decoded = self._decoded_escrow_invoice(invoice, decoded_response)
+        try:
+            decoded_expiry = self._positive_int(decoded_response.expiry, "decoded expiry")
+        except (AttributeError, TypeError, ValueError):
+            raise LightningError("LND returned an invalid escrow invoice") from None
+        if (
+            decoded.payee_pubkey != local_pubkey
+            or decoded.payment_hash != response_hash.hex()
+            or decoded.amount_msat != amount_msat
+            or decoded.payment_secret != payment_secret.hex()
+            or decoded_expiry != expiry_seconds
+            or decoded.min_final_cltv_delta != min_final_cltv_delta
+        ):
+            raise LightningError("LND returned escrow invoice terms that do not match the request")
+        if recovered_existing:
+            try:
+                if (
+                    response_hash != expected_hash
+                    or bytes(response.r_preimage) != preimage
+                    or bytes(response.payment_addr) != payment_secret
+                    or str(response.payment_request).lower() != decoded.invoice
+                    or int(response.value_msat) != amount_msat
+                    or int(response.expiry) != expiry_seconds
+                    or int(response.cltv_expiry) != min_final_cltv_delta
+                    or str(response.memo) != memo
+                    or bool(response.private) is not True
+                    or response.state in (ln.Invoice.SETTLED, ln.Invoice.CANCELED)
+                ):
+                    raise ValueError("recovered invoice does not match request")
+            except (AttributeError, TypeError, ValueError) as exc:
+                raise LightningError(
+                    "LND returned escrow invoice terms that do not match the request"
+                ) from exc
+        return decoded
+
+    @staticmethod
+    def _same_hash_may_exist(exc: Exception) -> bool:
+        """Return true only for duplicate-invoice failures that merit a hash lookup."""
+        code = getattr(exc, "code", None)
+        code_name: str | None = None
+        if callable(code):
+            try:
+                code_name = str(getattr(code(), "name", "")).upper()
+            except Exception:  # noqa: BLE001 - retain the original RPC failure path
+                code_name = None
+        message = str(exc).lower()
+        return code_name == "ALREADY_EXISTS" or (
+            "already exists" in message and ("invoice" in message or "hash" in message)
+        )
 
     async def connect_peer(self, node_pubkey: str, host: str) -> None:
         """Connect to a peer (idempotent: an existing connection is not an error)."""
@@ -378,10 +589,31 @@ class LndBackend:
         )
         if frozen_point != point:
             raise RuntimeError("patched LND froze a different channel outpoint")
+        try:
+            funding_script = bytes(response.funding_script)
+            local_funding_pubkey = bytes(response.local_funding_pubkey)
+            remote_funding_pubkey = bytes(response.remote_funding_pubkey)
+            if len(funding_script) != 34 or not funding_script.startswith(b"\x51\x20"):
+                raise ValueError("invalid funding script")
+            if (
+                len(local_funding_pubkey) != 33
+                or local_funding_pubkey[0] not in (0x02, 0x03)
+                or len(remote_funding_pubkey) != 33
+                or remote_funding_pubkey[0] not in (0x02, 0x03)
+                or local_funding_pubkey == remote_funding_pubkey
+            ):
+                raise ValueError("invalid funding public keys")
+        except (AttributeError, TypeError, ValueError):
+            raise RuntimeError(
+                "patched LND returned invalid channel funding signing data"
+            ) from None
         return ChannelSnapshot(
             session_id=session_id,
             channel_id=channel_id,
             funding_outpoint=frozen_point,
+            funding_scriptpubkey=funding_script.hex(),
+            local_funding_pubkey=local_funding_pubkey.hex(),
+            remote_funding_pubkey=remote_funding_pubkey.hex(),
             capacity_sats=response.capacity_sat,
             maker_claim_sats=response.local_claim_sat,
             peer_claim_sats=response.remote_claim_sat,
@@ -478,7 +710,7 @@ class LndBackend:
         attempt: LndEscrowSigningAttempt,
         remote_partial_signature: bytes,
     ) -> LndFinalizedEscrowParent:
-        """Combine, verify, persist, and publish the exact parent transaction."""
+        """Combine, verify, and persist the exact channel-input witness."""
         if len(attempt.attempt_id) != 32 or len(attempt.public_nonce) != 66:
             raise ValueError("invalid local MuSig2 signing attempt")
         if len(remote_partial_signature) != 32:
@@ -496,9 +728,65 @@ class LndBackend:
         )
         tx_hex = bytes(response.raw_tx).hex()
         txid = self._rpc_txid(response.txid)
+        return self._parse_finalized_escrow_parent(tx_hex, txid, funding_outpoint)
+
+    async def recover_channel_input_parent(
+        self,
+        session_id: str,
+        funding_outpoint: EscrowOutpoint,
+        remote_partial_signature: bytes,
+    ) -> LndFinalizedEscrowParent:
+        """Finalize from LND's durable local transcript after its attempt was lost."""
+        if len(remote_partial_signature) != 32:
+            raise ValueError("remote MuSig2 partial signature must be exactly 32 bytes")
+        self._ensure()
+        from jmswap.lndrpc import channelescrow_pb2 as escrow
+
+        response = await self._escrow_stub.FinalizeParent(
+            escrow.FinalizeParentRequest(
+                channel_point=self._rpc_channel_point(funding_outpoint),
+                session_id=self._escrow_session_id(session_id),
+                attempt_id=b"",
+                remote_partial_signature=remote_partial_signature,
+            )
+        )
+        tx_hex = bytes(response.raw_tx).hex()
+        txid = self._rpc_txid(response.txid)
+        return self._parse_finalized_escrow_parent(tx_hex, txid, funding_outpoint)
+
+    @staticmethod
+    def _parse_finalized_escrow_parent(
+        tx_hex: str, txid: str, funding_outpoint: EscrowOutpoint
+    ) -> LndFinalizedEscrowParent:
         if get_txid(tx_hex) != txid:
             raise RuntimeError("patched LND returned inconsistent finalized parent bytes")
-        return LndFinalizedEscrowParent(tx_hex=tx_hex, txid=txid)
+        try:
+            parsed = parse_transaction(tx_hex)
+            matching_indices = [
+                index
+                for index, tx_input in enumerate(parsed.inputs)
+                if tx_input.txid == funding_outpoint.txid and tx_input.vout == funding_outpoint.vout
+            ]
+            if len(matching_indices) != 1 or len(parsed.witnesses) != len(parsed.inputs):
+                raise ValueError("invalid channel input")
+            channel_input_index = matching_indices[0]
+            witness = tuple(parsed.witnesses[channel_input_index])
+            if len(witness) != 1 or len(witness[0]) != 64:
+                raise ValueError("invalid channel witness")
+            if any(
+                parsed.witnesses[index]
+                for index in range(len(parsed.inputs))
+                if index != channel_input_index
+            ):
+                raise ValueError("unexpected non-channel witness")
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("patched LND returned invalid channel-input witness data") from exc
+        return LndFinalizedEscrowParent(
+            tx_hex=tx_hex,
+            txid=txid,
+            channel_input_index=channel_input_index,
+            channel_input_witness=witness,
+        )
 
     async def channel_input_escrow_status(
         self, session_id: str, funding_outpoint: EscrowOutpoint
@@ -520,10 +808,59 @@ class LndBackend:
             raise RuntimeError("patched LND returned inconsistent escrow parent status")
         if bool(response.finalized) != (stage is LndEscrowStage.FINALIZED):
             raise RuntimeError("patched LND returned inconsistent finalized status")
+        durable_nonce = bytes(response.durable_local_public_nonce)
+        durable_remote_nonce = bytes(response.durable_remote_public_nonce)
+        durable_partial = bytes(response.durable_local_partial_signature)
+        finalized_parent = bytes(response.finalized_parent_tx)
+        active_attempt_id = bytes(response.active_attempt_id)
+        active_nonce = bytes(response.active_local_public_nonce)
+        expects_durable_signature = stage >= LndEscrowStage.PARENT_SIGNED
+        durable_lengths_valid = (
+            len(durable_nonce) == 66
+            and len(durable_remote_nonce) == 66
+            and len(durable_partial) == 32
+        )
+        if (expects_durable_signature and not durable_lengths_valid) or (
+            not expects_durable_signature
+            and any((durable_nonce, durable_remote_nonce, durable_partial))
+        ):
+            raise RuntimeError("patched LND returned inconsistent durable signing status")
+        if (stage is LndEscrowStage.FINALIZED) != bool(finalized_parent):
+            raise RuntimeError("patched LND returned inconsistent finalized parent status")
+        if (
+            bool(active_attempt_id) != bool(active_nonce)
+            or (active_attempt_id and (len(active_attempt_id) != 32 or len(active_nonce) != 66))
+            or (stage is LndEscrowStage.FINALIZED and active_attempt_id)
+        ):
+            raise RuntimeError("patched LND returned inconsistent active signing status")
+        finalized_artifact: LndFinalizedEscrowParent | None = None
+        if finalized_parent:
+            try:
+                if parent_txid is None:
+                    raise RuntimeError("finalized parent lacks its transaction ID")
+                finalized_artifact = self._parse_finalized_escrow_parent(
+                    finalized_parent.hex(), parent_txid, funding_outpoint
+                )
+            except RuntimeError:
+                raise
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError("patched LND returned invalid finalized parent bytes") from exc
         return LndEscrowStatus(
             stage=stage,
             parent_txid=parent_txid,
             finalized=response.finalized,
+            durable_local_public_nonce=durable_nonce or None,
+            durable_remote_public_nonce=durable_remote_nonce or None,
+            durable_local_partial_signature=durable_partial or None,
+            finalized_parent=finalized_artifact,
+            active_attempt=(
+                LndEscrowSigningAttempt(
+                    attempt_id=active_attempt_id,
+                    public_nonce=active_nonce,
+                )
+                if active_attempt_id
+                else None
+            ),
         )
 
     async def cancel_channel_input_escrow(
@@ -547,6 +884,7 @@ class LndBackend:
         address: str,
         channel_amount_sats: int,
         push_to_counterparty_msat: int | None = None,
+        user_channel_id: str | None = None,
     ) -> str:
         """Start a SIMPLE_TAPROOT PSBT-funded channel open; return a user_channel_id.
 
@@ -565,7 +903,11 @@ class LndBackend:
         if push_sat >= channel_amount_sats:
             raise ValueError("LND channel push must be less than the channel capacity")
         await self.connect_peer(node_pubkey, address)
-        pending = secrets.token_bytes(32)
+        pending = (
+            self._pending_channel_id_bytes(user_channel_id)
+            if user_channel_id is not None
+            else secrets.token_bytes(32)
+        )
         req = ln.OpenChannelRequest(
             node_pubkey=bytes.fromhex(node_pubkey),
             local_funding_amount=channel_amount_sats,
@@ -593,6 +935,18 @@ class LndBackend:
         )
         return ucid
 
+    @staticmethod
+    def _pending_channel_id_bytes(user_channel_id: str) -> bytes:
+        if not isinstance(user_channel_id, str) or len(user_channel_id) != 64:
+            raise ValueError("LND pending channel ID must be 32-byte hexadecimal")
+        try:
+            pending = bytes.fromhex(user_channel_id)
+        except ValueError as exc:
+            raise ValueError("LND pending channel ID must be 32-byte hexadecimal") from exc
+        if len(pending) != 32:
+            raise ValueError("LND pending channel ID must be 32-byte hexadecimal")
+        return pending
+
     async def get_funding_output(self, user_channel_id: str) -> tuple[bool, str, int]:
         """Return ``(ready, funding_scriptpubkey_hex, value)`` for the in-flight open."""
         p = self._pending.get(user_channel_id)
@@ -600,6 +954,34 @@ class LndBackend:
             return (False, "", 0)
         spk = address_to_scriptpubkey(p.funding_address)
         return (True, spk.hex(), p.funding_amount)
+
+    async def recover_external_channel_funding(
+        self, user_channel_id: str, funding_address: str, channel_amount_sats: int
+    ) -> None:
+        """Restore an externally funded PSBT shim after the application restarts."""
+        pending_chan_id = self._pending_channel_id_bytes(user_channel_id)
+        if not isinstance(funding_address, str) or not funding_address:
+            raise ValueError("LND funding address must be non-empty")
+        try:
+            address_to_scriptpubkey(funding_address)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("LND funding address is invalid") from exc
+        channel_amount_sats = self._positive_int(channel_amount_sats, "channel amount")
+        pending = self._pending.get(user_channel_id)
+        if pending is not None:
+            if (
+                pending.pending_chan_id != pending_chan_id
+                or pending.funding_address != funding_address
+                or pending.funding_amount != channel_amount_sats
+            ):
+                raise ValueError("LND pending channel recovery conflicts with an existing open")
+            return
+        self._pending[user_channel_id] = _PendingOpen(
+            pending_chan_id=pending_chan_id,
+            stream=None,
+            funding_address=funding_address,
+            funding_amount=channel_amount_sats,
+        )
 
     async def provide_funding_outpoint(
         self,
@@ -642,16 +1024,28 @@ class LndBackend:
 
     async def cancel_external_channel_funding(self, user_channel_id: str) -> None:
         """Cancel an in-flight PSBT funding shim after the CoinJoin is rejected."""
-        pending = self._pending.get(user_channel_id)
-        if pending is None:
-            return
+        pending_chan_id = self._pending_channel_id_bytes(user_channel_id)
         self._ensure()
         from jmswap.lndrpc import lightning_pb2 as ln
 
-        await self._stub.FundingStateStep(
-            ln.FundingTransitionMsg(
-                shim_cancel=ln.FundingShimCancel(pending_chan_id=pending.pending_chan_id)
+        try:
+            await self._stub.FundingStateStep(
+                ln.FundingTransitionMsg(
+                    shim_cancel=ln.FundingShimCancel(pending_chan_id=pending_chan_id)
+                )
             )
-        )
-        del self._pending[user_channel_id]
+        except Exception as exc:  # noqa: BLE001 - gRPC concrete errors vary by installation
+            if self._rpc_code_name(exc) != "NOT_FOUND":
+                raise
+        self._pending.pop(user_channel_id, None)
         logger.info(f"Cancelled LND channel funding shim (ucid={user_channel_id[:12]})")
+
+    @staticmethod
+    def _rpc_code_name(exc: Exception) -> str | None:
+        code = getattr(exc, "code", None)
+        if not callable(code):
+            return None
+        try:
+            return str(getattr(code(), "name", "")).upper() or None
+        except Exception:  # noqa: BLE001 - retain the original RPC failure path
+            return None

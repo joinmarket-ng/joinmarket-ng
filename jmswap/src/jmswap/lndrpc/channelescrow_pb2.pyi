@@ -355,19 +355,37 @@ class StatusResponse(_message.Message):
     STAGE_FIELD_NUMBER: _builtins.int
     PARENT_TXID_FIELD_NUMBER: _builtins.int
     FINALIZED_FIELD_NUMBER: _builtins.int
+    DURABLE_LOCAL_PUBLIC_NONCE_FIELD_NUMBER: _builtins.int
+    DURABLE_REMOTE_PUBLIC_NONCE_FIELD_NUMBER: _builtins.int
+    DURABLE_LOCAL_PARTIAL_SIGNATURE_FIELD_NUMBER: _builtins.int
+    FINALIZED_PARENT_TX_FIELD_NUMBER: _builtins.int
+    ACTIVE_ATTEMPT_ID_FIELD_NUMBER: _builtins.int
+    ACTIVE_LOCAL_PUBLIC_NONCE_FIELD_NUMBER: _builtins.int
     stage: _builtins.int
     parent_txid: _builtins.bytes
     finalized: _builtins.bool
+    durable_local_public_nonce: _builtins.bytes
+    durable_remote_public_nonce: _builtins.bytes
+    durable_local_partial_signature: _builtins.bytes
+    finalized_parent_tx: _builtins.bytes
+    active_attempt_id: _builtins.bytes
+    active_local_public_nonce: _builtins.bytes
     def __init__(
         self,
         *,
         stage: _builtins.int = ...,
         parent_txid: _builtins.bytes = ...,
         finalized: _builtins.bool = ...,
+        durable_local_public_nonce: _builtins.bytes = ...,
+        durable_remote_public_nonce: _builtins.bytes = ...,
+        durable_local_partial_signature: _builtins.bytes = ...,
+        finalized_parent_tx: _builtins.bytes = ...,
+        active_attempt_id: _builtins.bytes = ...,
+        active_local_public_nonce: _builtins.bytes = ...,
     ) -> None: ...
     _HasFieldArgType: _TypeAlias = _Never  # noqa: Y015
     def HasField(self, field_name: _HasFieldArgType) -> _builtins.bool: ...
-    _ClearFieldArgType: _TypeAlias = _typing.Literal["finalized", b"finalized", "parent_txid", b"parent_txid", "stage", b"stage"]  # noqa: Y015
+    _ClearFieldArgType: _TypeAlias = _typing.Literal["active_attempt_id", b"active_attempt_id", "active_local_public_nonce", b"active_local_public_nonce", "durable_local_partial_signature", b"durable_local_partial_signature", "durable_local_public_nonce", b"durable_local_public_nonce", "durable_remote_public_nonce", b"durable_remote_public_nonce", "finalized", b"finalized", "finalized_parent_tx", b"finalized_parent_tx", "parent_txid", b"parent_txid", "stage", b"stage"]  # noqa: Y015
     def ClearField(self, field_name: _ClearFieldArgType) -> None: ...
     def WhichOneof(self, oneof_group: _Never) -> None: ...
 

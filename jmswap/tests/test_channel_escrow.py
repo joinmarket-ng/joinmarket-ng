@@ -6,6 +6,7 @@ import hashlib
 from pathlib import Path
 
 import pytest
+from jmcore.bitcoin import TxInput, TxOutput, get_txid, serialize_transaction
 from pydantic import ValidationError
 
 from jmswap.channel_escrow import (
@@ -20,10 +21,12 @@ from jmswap.channel_escrow import (
     EscrowOutpoint,
     EscrowParentBroadcast,
     EscrowParentEvidence,
+    EscrowParentPrevout,
     EscrowRouteEvidence,
     EscrowSpendResult,
     EscrowTimeoutBroadcast,
     EscrowTimeoutEvidence,
+    FinalizedEscrowParent,
     FreezeChannelRequest,
     ParentAuthorization,
     ParentAuthorizationRequest,
@@ -42,7 +45,16 @@ from jmswap.channel_funding import ChannelInputEscrowCapability
 from jmswap.errors import ChannelInputEscrowError
 from jmswap.lightning import PaymentStatus
 
-TXID = "11" * 32
+CHANNEL_FUNDING_TXID = "44" * 32
+CHANNEL_FUNDING_SCRIPT = "5120" + "45" * 32
+ESCROW_SCRIPT = "5120" + "55" * 32
+PARENT_TX_HEX = serialize_transaction(
+    version=2,
+    inputs=[TxInput.from_hex(CHANNEL_FUNDING_TXID, 2, sequence=0xFFFFFFFD)],
+    outputs=[TxOutput.from_hex(ESCROW_SCRIPT, 80_000)],
+    locktime=0,
+).hex()
+TXID = get_txid(PARENT_TX_HEX)
 TIMEOUT_TXID = "22" * 32
 PREIMAGE = "33" * 32
 PAYMENT_HASH = hashlib.sha256(bytes.fromhex(PREIMAGE)).hexdigest()
@@ -53,7 +65,10 @@ def _terms(**overrides: object) -> ChannelInputEscrowTerms:
         "snapshot": ChannelSnapshot(
             session_id="session-1",
             channel_id="channel-1",
-            funding_outpoint=EscrowOutpoint(txid="44" * 32, vout=2),
+            funding_outpoint=EscrowOutpoint(txid=CHANNEL_FUNDING_TXID, vout=2),
+            funding_scriptpubkey=CHANNEL_FUNDING_SCRIPT,
+            local_funding_pubkey="02" + "46" * 32,
+            remote_funding_pubkey="03" + "47" * 32,
             capacity_sats=100_000,
             maker_claim_sats=70_000,
             peer_claim_sats=30_000,
@@ -93,13 +108,19 @@ def _prepared(terms: ChannelInputEscrowTerms | None = None) -> PreparedChannelIn
     return PreparedChannelInputEscrow(
         terms=selected_terms,
         parent_evidence=EscrowParentEvidence(
-            parent_tx_hex="0100",
+            parent_tx_hex=PARENT_TX_HEX,
             parent_txid=TXID,
             channel_funding_outpoint=selected_terms.snapshot.funding_outpoint,
             channel_input_index=0,
+            ordered_prevouts=(
+                EscrowParentPrevout(
+                    value_sats=selected_terms.snapshot.capacity_sats,
+                    scriptpubkey=selected_terms.snapshot.funding_scriptpubkey,
+                ),
+            ),
             escrow_outpoint=outpoint,
             escrow_value_sats=80_000,
-            escrow_scriptpubkey="5120" + "55" * 32,
+            escrow_scriptpubkey=ESCROW_SCRIPT,
             all_inputs_nonmalleable=True,
             exact_transaction_verified=True,
         ),
@@ -121,22 +142,34 @@ def _authorization(**overrides: object) -> ParentAuthorization:
     values: dict[str, object] = {
         "session_id": "session-1",
         "parent_txid": TXID,
-        "prepared_parent_tx_hex": "0100",
-        "signed_parent_tx_hex": "010000",
+        "prepared_parent_tx_hex": PARENT_TX_HEX,
         "timeout_txid": TIMEOUT_TXID,
-        "channel_funding_outpoint": EscrowOutpoint(txid="44" * 32, vout=2),
+        "channel_funding_outpoint": EscrowOutpoint(txid=CHANNEL_FUNDING_TXID, vout=2),
         "channel_input_index": 0,
-        "signer_pubkey": "02" + "66" * 32,
-        "signature": b"signature",
+        "channel_input_witness": (b"w" * 64,),
         "sighash": "default",
-        "parent_fully_signed": True,
-        "signed_parent_txid_verified": True,
         "signature_verified": True,
+        "channel_witness_txid_verified": True,
         "commits_all_inputs": True,
         "commits_all_outputs": True,
     }
     values.update(overrides)
     return ParentAuthorization(**values)
+
+
+def _finalized_parent(**overrides: object) -> FinalizedEscrowParent:
+    values: dict[str, object] = {
+        "session_id": "session-1",
+        "parent_txid": TXID,
+        "signed_parent_tx_hex": "010000",
+        "channel_funding_outpoint": EscrowOutpoint(txid=CHANNEL_FUNDING_TXID, vout=2),
+        "channel_input_index": 0,
+        "all_inputs_signed": True,
+        "all_signatures_verified": True,
+        "signed_parent_txid_verified": True,
+    }
+    values.update(overrides)
+    return FinalizedEscrowParent(**values)
 
 
 def _parent_broadcast() -> EscrowParentBroadcast:
@@ -227,6 +260,9 @@ def test_snapshot_rejects_nonsettled_or_unconserved_state(
             session_id="session-1",
             channel_id="channel-1",
             funding_outpoint=EscrowOutpoint(txid="44" * 32, vout=0),
+            funding_scriptpubkey="5120" + "45" * 32,
+            local_funding_pubkey="02" + "46" * 32,
+            remote_funding_pubkey="03" + "47" * 32,
             capacity_sats=100_000,
             maker_claim_sats=maker_claim_sats,
             peer_claim_sats=30_000,
@@ -263,16 +299,132 @@ def test_prepared_escrow_requires_exact_timeout_equations_and_outpoint(
 def test_parent_evidence_requires_independent_checks() -> None:
     with pytest.raises(ValidationError, match="nonmalleable"):
         EscrowParentEvidence(
-            parent_tx_hex="0100",
+            parent_tx_hex=PARENT_TX_HEX,
             parent_txid=TXID,
-            channel_funding_outpoint=EscrowOutpoint(txid="44" * 32, vout=2),
+            channel_funding_outpoint=EscrowOutpoint(txid=CHANNEL_FUNDING_TXID, vout=2),
             channel_input_index=0,
+            ordered_prevouts=(
+                EscrowParentPrevout(value_sats=100_000, scriptpubkey=CHANNEL_FUNDING_SCRIPT),
+            ),
             escrow_outpoint=EscrowOutpoint(txid=TXID, vout=0),
             escrow_value_sats=80_000,
-            escrow_scriptpubkey="51",
+            escrow_scriptpubkey=ESCROW_SCRIPT,
             all_inputs_nonmalleable=False,
             exact_transaction_verified=True,
         )
+
+
+def _parent_evidence(**overrides: object) -> EscrowParentEvidence:
+    values = _prepared().parent_evidence.model_dump()
+    values.update(overrides)
+    return EscrowParentEvidence(**values)
+
+
+def test_parent_evidence_rejects_missing_prevouts_malleable_scripts_and_scriptsigs() -> None:
+    second_input = TxInput.from_hex("66" * 32, 1, sequence=0xFFFFFFFD)
+    two_input_hex = serialize_transaction(
+        version=2,
+        inputs=[second_input, TxInput.from_hex(CHANNEL_FUNDING_TXID, 2, sequence=0xFFFFFFFD)],
+        outputs=[TxOutput.from_hex(ESCROW_SCRIPT, 80_000)],
+        locktime=0,
+    ).hex()
+    two_input_txid = get_txid(two_input_hex)
+    ordered_prevouts = (
+        EscrowParentPrevout(value_sats=10_000, scriptpubkey="0014" + "67" * 20),
+        EscrowParentPrevout(value_sats=100_000, scriptpubkey=CHANNEL_FUNDING_SCRIPT),
+    )
+    two_input_values: dict[str, object] = {
+        "parent_tx_hex": two_input_hex,
+        "parent_txid": two_input_txid,
+        "channel_input_index": 1,
+        "escrow_outpoint": EscrowOutpoint(txid=two_input_txid, vout=0),
+        "ordered_prevouts": ordered_prevouts,
+    }
+    valid = _parent_evidence(**two_input_values)
+    assert valid.channel_input_index == 1
+
+    with pytest.raises(ValidationError, match="input count"):
+        _parent_evidence(
+            **{
+                **two_input_values,
+                "ordered_prevouts": ordered_prevouts[:1],
+            }
+        )
+    with pytest.raises(ValidationError, match="native SegWit"):
+        _parent_evidence(
+            ordered_prevouts=(
+                EscrowParentPrevout(value_sats=100_000, scriptpubkey="a914" + "68" * 20 + "87"),
+            )
+        )
+
+    scriptsig_hex = serialize_transaction(
+        version=2,
+        inputs=[TxInput.from_hex(CHANNEL_FUNDING_TXID, 2, scriptsig="51", sequence=0xFFFFFFFD)],
+        outputs=[TxOutput.from_hex(ESCROW_SCRIPT, 80_000)],
+        locktime=0,
+    ).hex()
+    scriptsig_txid = get_txid(scriptsig_hex)
+    with pytest.raises(ValidationError, match="scriptSigs"):
+        _parent_evidence(
+            parent_tx_hex=scriptsig_hex,
+            parent_txid=scriptsig_txid,
+            escrow_outpoint=EscrowOutpoint(txid=scriptsig_txid, vout=0),
+        )
+
+
+def test_prepared_escrow_rejects_reordered_or_mismatched_channel_prevout() -> None:
+    terms = _terms()
+    other_prevout = EscrowParentPrevout(value_sats=10_000, scriptpubkey="0014" + "67" * 20)
+    channel_prevout = EscrowParentPrevout(
+        value_sats=terms.snapshot.capacity_sats,
+        scriptpubkey=terms.snapshot.funding_scriptpubkey,
+    )
+    parent_hex = serialize_transaction(
+        version=2,
+        inputs=[
+            TxInput.from_hex("66" * 32, 1, sequence=0xFFFFFFFD),
+            TxInput.from_hex(CHANNEL_FUNDING_TXID, 2, sequence=0xFFFFFFFD),
+        ],
+        outputs=[TxOutput.from_hex(ESCROW_SCRIPT, 80_000)],
+        locktime=0,
+    ).hex()
+    parent_txid = get_txid(parent_hex)
+    evidence = _parent_evidence(
+        parent_tx_hex=parent_hex,
+        parent_txid=parent_txid,
+        channel_input_index=1,
+        escrow_outpoint=EscrowOutpoint(txid=parent_txid, vout=0),
+        ordered_prevouts=(other_prevout, channel_prevout),
+    )
+    timeout = _prepared().timeout_evidence.model_copy(
+        update={"spent_escrow_outpoint": EscrowOutpoint(txid=parent_txid, vout=0)}
+    )
+    with pytest.raises(ValidationError, match="channel prevout"):
+        PreparedChannelInputEscrow(
+            terms=terms,
+            parent_evidence=evidence.model_copy(
+                update={"ordered_prevouts": (channel_prevout, other_prevout)}
+            ),
+            timeout_evidence=timeout,
+        )
+    with pytest.raises(ValidationError, match="channel prevout"):
+        PreparedChannelInputEscrow(
+            terms=terms,
+            parent_evidence=_parent_evidence(
+                ordered_prevouts=(
+                    EscrowParentPrevout(
+                        value_sats=terms.snapshot.capacity_sats - 1,
+                        scriptpubkey=terms.snapshot.funding_scriptpubkey,
+                    ),
+                )
+            ),
+            timeout_evidence=_prepared().timeout_evidence,
+        )
+
+
+def test_parent_evidence_rejects_escrow_output_mismatch() -> None:
+    with pytest.raises(ValidationError, match="escrow output"):
+        _parent_evidence(escrow_value_sats=79_999)
 
 
 def test_prepared_escrow_rejects_parent_value_and_timeout_signature_mismatch() -> None:
@@ -280,10 +432,8 @@ def test_prepared_escrow_rejects_parent_value_and_timeout_signature_mismatch() -
     prepared = _prepared(terms)
     with pytest.raises(ValidationError, match="parent escrow value"):
         PreparedChannelInputEscrow(
-            terms=terms,
-            parent_evidence=prepared.parent_evidence.model_copy(
-                update={"escrow_value_sats": 79_999}
-            ),
+            terms=terms.model_copy(update={"escrow_value_sats": 79_999}),
+            parent_evidence=prepared.parent_evidence,
             timeout_evidence=prepared.timeout_evidence,
         )
     with pytest.raises(ValidationError, match="fully signed"):
@@ -452,6 +602,8 @@ def test_record_rejects_illegal_transition_is_idempotent_and_tracks_reorg() -> N
     record.advance(EscrowLifecycleState.TIMEOUT_SIGNED)
     assert record.updated_at == timestamp
     record.attach_authorization(_authorization())
+    record.advance(EscrowLifecycleState.CHANNEL_SIGNATURE_RELEASED)
+    record.attach_finalized_parent(_finalized_parent())
     record.advance(EscrowLifecycleState.PARENT_SIGNED)
     with pytest.raises(ChannelInputEscrowError, match="broadcast evidence"):
         record.advance(EscrowLifecycleState.PARENT_PENDING)
@@ -492,8 +644,8 @@ def test_record_cannot_abort_after_parent_authorization() -> None:
     record = ChannelInputEscrowRecord(terms=terms)
     record.attach_prepared(_prepared(terms))
     record.advance(EscrowLifecycleState.TIMEOUT_SIGNED)
-    record.attach_authorization(_authorization(sighash="all"))
-    record.advance(EscrowLifecycleState.PARENT_SIGNED)
+    record.attach_authorization(_authorization())
+    record.advance(EscrowLifecycleState.CHANNEL_SIGNATURE_RELEASED)
 
     with pytest.raises(ChannelInputEscrowError, match="cannot transition"):
         record.advance(EscrowLifecycleState.ABORTED)
@@ -506,6 +658,8 @@ def test_reorg_tracks_durable_descendant_broadcast_obligation() -> None:
     success_record.attach_prepared(prepared)
     success_record.advance(EscrowLifecycleState.TIMEOUT_SIGNED)
     success_record.attach_authorization(_authorization())
+    success_record.advance(EscrowLifecycleState.CHANNEL_SIGNATURE_RELEASED)
+    success_record.attach_finalized_parent(_finalized_parent())
     success_record.advance(EscrowLifecycleState.PARENT_SIGNED)
     success_record.attach_parent_broadcast(_parent_broadcast())
     success_record.advance(EscrowLifecycleState.PARENT_PENDING)
@@ -588,8 +742,32 @@ def test_parent_authorization_requires_timeout_signed_and_exact_artifacts() -> N
     record.advance(EscrowLifecycleState.TIMEOUT_SIGNED)
     record.attach_authorization(authorization)
     assert record.authorization == authorization
-    with pytest.raises(ValidationError, match="independently verified"):
+    with pytest.raises(ValidationError, match="funding script"):
         _authorization(signature_verified=False)
+
+
+def test_parent_signed_requires_exact_finalized_parent_after_witness_release() -> None:
+    terms = _terms()
+    record = ChannelInputEscrowRecord(terms=terms)
+    record.attach_prepared(_prepared(terms))
+    record.advance(EscrowLifecycleState.TIMEOUT_SIGNED)
+    record.attach_authorization(_authorization())
+    record.advance(EscrowLifecycleState.CHANNEL_SIGNATURE_RELEASED)
+
+    with pytest.raises(ChannelInputEscrowError, match="finalized parent evidence"):
+        record.advance(EscrowLifecycleState.PARENT_SIGNED)
+    with pytest.raises(ChannelInputEscrowError, match="does not match parent transaction"):
+        record.attach_finalized_parent(_finalized_parent(parent_txid="99" * 32))
+    with pytest.raises(ChannelInputEscrowError, match="does not spend the frozen channel"):
+        record.attach_finalized_parent(
+            _finalized_parent(channel_funding_outpoint=EscrowOutpoint(txid="98" * 32, vout=0))
+        )
+
+    finalized = _finalized_parent()
+    record.attach_finalized_parent(finalized)
+    record.attach_finalized_parent(finalized)
+    record.advance(EscrowLifecycleState.PARENT_SIGNED)
+    assert record.finalized_parent == finalized
 
 
 def test_record_requires_route_and_success_spend_evidence(tmp_path: Path) -> None:
@@ -599,6 +777,8 @@ def test_record_requires_route_and_success_spend_evidence(tmp_path: Path) -> Non
     record.attach_prepared(prepared)
     record.advance(EscrowLifecycleState.TIMEOUT_SIGNED)
     record.attach_authorization(_authorization())
+    record.advance(EscrowLifecycleState.CHANNEL_SIGNATURE_RELEASED)
+    record.attach_finalized_parent(_finalized_parent())
     record.advance(EscrowLifecycleState.PARENT_SIGNED)
     record.attach_parent_broadcast(_parent_broadcast())
     record.advance(EscrowLifecycleState.PARENT_PENDING)
@@ -725,6 +905,8 @@ def test_record_requires_exact_mature_timeout_broadcast() -> None:
     record.attach_prepared(prepared)
     record.advance(EscrowLifecycleState.TIMEOUT_SIGNED)
     record.attach_authorization(_authorization())
+    record.advance(EscrowLifecycleState.CHANNEL_SIGNATURE_RELEASED)
+    record.attach_finalized_parent(_finalized_parent())
     record.advance(EscrowLifecycleState.PARENT_SIGNED)
     record.attach_parent_broadcast(_parent_broadcast())
     record.advance(EscrowLifecycleState.PARENT_PENDING)
@@ -809,6 +991,9 @@ def test_store_hashes_session_paths_without_collisions(tmp_path: Path) -> None:
                     session_id=session_id,
                     channel_id="channel-1",
                     funding_outpoint=EscrowOutpoint(txid="44" * 32, vout=2),
+                    funding_scriptpubkey="5120" + "45" * 32,
+                    local_funding_pubkey="02" + "46" * 32,
+                    remote_funding_pubkey="03" + "47" * 32,
                     capacity_sats=100_000,
                     maker_claim_sats=70_000,
                     peer_claim_sats=30_000,
@@ -839,6 +1024,9 @@ def test_store_rejects_incomplete_state_and_mismatched_session_file(tmp_path: Pa
                 session_id="session-2",
                 channel_id="channel-1",
                 funding_outpoint=EscrowOutpoint(txid="44" * 32, vout=2),
+                funding_scriptpubkey="5120" + "45" * 32,
+                local_funding_pubkey="02" + "46" * 32,
+                remote_funding_pubkey="03" + "47" * 32,
                 capacity_sats=100_000,
                 maker_claim_sats=70_000,
                 peer_claim_sats=30_000,

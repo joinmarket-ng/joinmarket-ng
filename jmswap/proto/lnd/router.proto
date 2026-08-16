@@ -1,0 +1,45 @@
+syntax = "proto3";
+
+package routerrpc;
+
+import "lightning.proto";
+
+// Minimal pinned Router RPC surface used by the channel-input escrow adapter.
+// Field numbers and service paths match LND v0.20.1-beta (848b72ce96eb68fa90fd4336523ca4c59bddcd4c).
+service Router {
+    rpc SendPaymentV2 (SendPaymentRequest) returns (stream lnrpc.Payment);
+    rpc TrackPaymentV2 (TrackPaymentRequest) returns (stream lnrpc.Payment);
+}
+
+message SendPaymentRequest {
+    bytes dest = 1;
+    int64 amt = 2;
+    bytes payment_hash = 3;
+    int32 final_cltv_delta = 4;
+    string payment_request = 5;
+    int32 timeout_seconds = 6;
+    int64 fee_limit_sat = 7;
+    uint64 outgoing_chan_id = 8 [jstype = JS_STRING, deprecated = true];
+    int32 cltv_limit = 9;
+    repeated lnrpc.RouteHint route_hints = 10;
+    map<uint64, bytes> dest_custom_records = 11;
+    int64 amt_msat = 12;
+    int64 fee_limit_msat = 13;
+    bytes last_hop_pubkey = 14;
+    bool allow_self_payment = 15;
+    repeated lnrpc.FeatureBit dest_features = 16;
+    uint32 max_parts = 17;
+    bool no_inflight_updates = 18;
+    repeated uint64 outgoing_chan_ids = 19;
+    bytes payment_addr = 20;
+    uint64 max_shard_size_msat = 21;
+    bool amp = 22;
+    double time_pref = 23;
+    bool cancelable = 24;
+    map<uint64, bytes> first_hop_custom_records = 25;
+}
+
+message TrackPaymentRequest {
+    bytes payment_hash = 1;
+    bool no_inflight_updates = 2;
+}

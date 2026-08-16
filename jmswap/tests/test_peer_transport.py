@@ -6,6 +6,7 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 
 import pytest
+from jmcore.bitcoin import get_txid
 from pydantic import ValidationError
 
 from jmswap.channel_escrow import EscrowLifecycleState
@@ -15,15 +16,23 @@ from jmswap.peer_transport import (
     MAX_ESCROW_PEER_ENVELOPE_BYTES,
     MAX_JOURNAL_MESSAGES_PER_DIRECTION,
     AcknowledgmentPayload,
+    EndpointAbortPayload,
+    EndpointAbortReason,
+    EscrowInvoiceProposalPayload,
     EscrowPeerBinding,
     EscrowPeerEnvelope,
     EscrowPeerJournal,
     EscrowPeerTransport,
     EscrowProtocolRole,
     EscrowPublicKeysPayload,
+    ParentMuSig2NoncePayload,
+    ParentMuSig2PartialSignaturePayload,
+    ParentPreparationPayload,
+    ParentPrevoutPayload,
     RawReceivedCustomMessage,
     RecoveryStatusPayload,
     TimeoutMuSig2NoncePayload,
+    TimeoutMuSig2PartialSignaturePayload,
 )
 from jmswap.ring_authorization import (
     RingChannelPoint,
@@ -35,6 +44,23 @@ LOCAL_NODE = "02" + "11" * 32
 PEER_NODE = "03" + "22" * 32
 EDGE_ID = "33" * 32
 CHANNEL_TXID = "44" * 32
+ROUND_ID = "55" * 32
+PARENT_TX_HEX = (
+    "01000000"
+    "0001"
+    "01"
+    + "00" * 32
+    + "00000000"
+    + "00"
+    + "ffffffff"
+    + "01"
+    + "0100000000000000"
+    + "01"
+    + "51"
+    + "00"
+    + "00000000"
+)
+PARENT_TXID = get_txid(PARENT_TX_HEX)
 
 
 class FakeRingStore:
@@ -104,6 +130,21 @@ def _binding() -> EscrowPeerBinding:
 
 def _payload() -> RecoveryStatusPayload:
     return RecoveryStatusPayload(state=EscrowLifecycleState.PARENT_SIGNED, parent_txid="aa" * 32)
+
+
+def _parent_preparation(**updates: object) -> ParentPreparationPayload:
+    values: dict[str, object] = {
+        "round_id": ROUND_ID,
+        "parent_tx_hex": PARENT_TX_HEX,
+        "parent_txid": PARENT_TXID,
+        "channel_input_index": 0,
+        "ordered_prevouts": (ParentPrevoutPayload(value_sats=1, scriptpubkey="51"),),
+        "escrow_output_index": 0,
+        "escrow_value_sats": 1,
+        "escrow_scriptpubkey": "51",
+    }
+    values.update(updates)
+    return ParentPreparationPayload(**values)
 
 
 def _inbound(
@@ -187,8 +228,142 @@ def test_key_and_timeout_payloads_are_role_and_transaction_bound() -> None:
             maker_claim_pubkey="03" + "ab" * 32,
             timeout_destination_scriptpubkey="5120" + "ef" * 32,
         )
-    with pytest.raises(ValidationError, match="timeout transaction ID"):
-        TimeoutMuSig2NoncePayload(timeout_txid="aa", public_nonce="bb" * 66)
+    with pytest.raises(ValidationError, match="timeout_txid"):
+        TimeoutMuSig2NoncePayload(
+            round_id=ROUND_ID,
+            timeout_txid="aa",
+            timeout_sighash="cc" * 32,
+            public_nonce="bb" * 66,
+        )
+
+
+def test_invoice_proposal_requires_the_peer_economic_role() -> None:
+    proposal = EscrowInvoiceProposalPayload(
+        role=EscrowProtocolRole.PEER,
+        invoice="lnbcrt1example",
+        payment_hash="AA" * 32,
+        payee_pubkey=PEER_NODE.upper(),
+        payment_secret="BB" * 32,
+        amount_msat=1,
+        expiry_unix=1,
+        min_final_cltv_delta=1,
+    )
+
+    assert proposal.payment_hash == "aa" * 32
+    assert proposal.payee_pubkey == PEER_NODE
+    with pytest.raises(ValidationError):
+        EscrowInvoiceProposalPayload(
+            role=EscrowProtocolRole.MAKER,
+            invoice="lnbcrt1example",
+            payment_hash="aa" * 32,
+            payee_pubkey=PEER_NODE,
+            payment_secret="bb" * 32,
+            amount_msat=1,
+            expiry_unix=1,
+            min_final_cltv_delta=1,
+        )
+
+
+@pytest.mark.parametrize(
+    ("updates", "match"),
+    [
+        ({"parent_tx_hex": "00"}, "parent transaction is invalid"),
+        ({"parent_txid": "00" * 32}, "does not match"),
+        (
+            {
+                "ordered_prevouts": (
+                    ParentPrevoutPayload(value_sats=1, scriptpubkey="51"),
+                    ParentPrevoutPayload(value_sats=1, scriptpubkey="51"),
+                )
+            },
+            "input count",
+        ),
+        ({"escrow_value_sats": 2}, "escrow output"),
+    ],
+)
+def test_parent_preparation_commits_to_the_parent_transaction(
+    updates: dict[str, object], match: str
+) -> None:
+    assert _parent_preparation().parent_txid == PARENT_TXID
+    with pytest.raises(ValidationError, match=match):
+        _parent_preparation(**updates)
+
+
+def test_signing_payloads_require_wire_round_and_timeout_sighash_bindings() -> None:
+    nonce = TimeoutMuSig2NoncePayload(
+        round_id=ROUND_ID.upper(),
+        timeout_txid="aa" * 32,
+        timeout_sighash="bb" * 32,
+        public_nonce="cc" * 66,
+    )
+    partial = TimeoutMuSig2PartialSignaturePayload(
+        round_id=ROUND_ID,
+        timeout_txid="aa" * 32,
+        timeout_sighash="bb" * 32,
+        partial_signature="cc" * 32,
+    )
+    parent_nonce = ParentMuSig2NoncePayload(
+        round_id=ROUND_ID,
+        parent_txid=PARENT_TXID,
+        public_nonce="cc" * 66,
+    )
+    parent_partial = ParentMuSig2PartialSignaturePayload(
+        round_id=ROUND_ID,
+        parent_txid=PARENT_TXID,
+        partial_signature="cc" * 32,
+    )
+
+    assert nonce.round_id == ROUND_ID
+    assert partial.timeout_sighash == "bb" * 32
+    assert parent_nonce.round_id == ROUND_ID
+    assert parent_partial.round_id == ROUND_ID
+    assert "attempt_id" not in ParentMuSig2NoncePayload.model_fields
+    assert "attempt_id" not in ParentMuSig2PartialSignaturePayload.model_fields
+    with pytest.raises(ValidationError):
+        TimeoutMuSig2NoncePayload(timeout_txid="aa" * 32, public_nonce="cc" * 66)
+    with pytest.raises(ValidationError):
+        TimeoutMuSig2PartialSignaturePayload(
+            round_id=ROUND_ID,
+            timeout_txid="aa" * 32,
+            partial_signature="cc" * 32,
+        )
+
+
+def test_endpoint_abort_uses_only_safe_reason_codes() -> None:
+    abort = EndpointAbortPayload(round_id=ROUND_ID, reason=EndpointAbortReason.PARENT_REJECTED)
+
+    assert abort.reason == EndpointAbortReason.PARENT_REJECTED
+    with pytest.raises(ValidationError):
+        EndpointAbortPayload(round_id=ROUND_ID, reason="not enough liquidity")
+    with pytest.raises(ValidationError):
+        EndpointAbortPayload(
+            round_id=ROUND_ID,
+            reason=EndpointAbortReason.PARENT_REJECTED,
+            detail="not enough liquidity",
+        )
+
+
+def test_new_payloads_round_trip_in_canonical_envelopes() -> None:
+    payloads = (
+        EscrowInvoiceProposalPayload(
+            role=EscrowProtocolRole.PEER,
+            invoice="lnbcrt1example",
+            payment_hash="aa" * 32,
+            payee_pubkey=PEER_NODE,
+            payment_secret="bb" * 32,
+            amount_msat=1,
+            expiry_unix=1,
+            min_final_cltv_delta=1,
+        ),
+        _parent_preparation(),
+        EndpointAbortPayload(round_id=ROUND_ID, reason=EndpointAbortReason.LOCAL_SHUTDOWN),
+    )
+
+    for payload in payloads:
+        envelope = EscrowPeerEnvelope.create(
+            binding=_binding(), sequence=1, previous_message_id=None, payload=payload
+        )
+        assert EscrowPeerEnvelope.decode(envelope.encode()).payload == payload
 
 
 def test_binding_requires_finalized_channel_and_matching_local_node() -> None:

@@ -20,6 +20,7 @@ FUNDING_SPK = create_p2tr_scriptpubkey(b"\x05" * 32)
 class _FakeLdk:
     def __init__(self, ready_after: int = 1, value: int = 1_000_000) -> None:
         self.opened: tuple[str, str, int, int | None] | None = None
+        self.opened_user_channel_id: str | None = None
         self.calls = 0
         self.ready_after = ready_after
         self.value = value
@@ -27,7 +28,12 @@ class _FakeLdk:
         self.cancelled: list[str] = []
 
     async def open_channel_external_funding(
-        self, node_pubkey, address, channel_amount_sats, push_to_counterparty_msat=None
+        self,
+        node_pubkey,
+        address,
+        channel_amount_sats,
+        push_to_counterparty_msat=None,
+        user_channel_id=None,
     ):
         self.opened = (
             node_pubkey,
@@ -35,7 +41,8 @@ class _FakeLdk:
             channel_amount_sats,
             push_to_counterparty_msat,
         )
-        return "ucid-1"
+        self.opened_user_channel_id = user_channel_id
+        return user_channel_id or "ucid-1"
 
     async def get_funding_output(self, user_channel_id):
         self.calls += 1
@@ -66,6 +73,23 @@ async def test_request_returns_funding_address() -> None:
     assert ucid == "ucid-1"
     assert address == scriptpubkey_to_address(FUNDING_SPK, "regtest")
     assert ldk.opened == ("02" + "11" * 32, "peer:9735", 1_000_000, 250_000_000)
+
+
+async def test_request_uses_caller_selected_pending_channel_id() -> None:
+    ldk = _FakeLdk()
+
+    ucid, _address = await request_external_channel_funding(
+        ldk,
+        "02" + "11" * 32,
+        "peer:9735",
+        1_000_000,
+        "regtest",
+        poll_interval=0.001,
+        user_channel_id="reserved-channel",
+    )
+
+    assert ucid == "reserved-channel"
+    assert ldk.opened_user_channel_id == "reserved-channel"
 
 
 async def test_request_rejects_value_mismatch() -> None:

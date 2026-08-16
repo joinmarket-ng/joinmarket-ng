@@ -13,6 +13,7 @@ from jmswap.channel_escrow import (
     ChannelSnapshot,
     EscrowChainObservation,
     EscrowLifecycleState,
+    FinalizedEscrowParent,
     FreezeChannelRequest,
     ParentAuthorizationRequest,
     ParentBroadcastRequest,
@@ -51,6 +52,28 @@ class ChannelInputEscrowCoordinator:
 
     def _save(self, record: ChannelInputEscrowRecord, expected_revision: int) -> None:
         self._store.save(record, expected_revision=expected_revision)
+
+    def find_parent(self, parent_txid: str) -> ChannelInputEscrowRecord | None:
+        """Find the unique durable session claiming an exact parent transaction ID."""
+        try:
+            raw_txid = bytes.fromhex(parent_txid)
+        except ValueError:
+            raise ChannelInputEscrowError("invalid escrow parent transaction ID") from None
+        if len(raw_txid) != 32 or parent_txid != parent_txid.lower():
+            raise ChannelInputEscrowError("invalid escrow parent transaction ID")
+
+        matches: list[ChannelInputEscrowRecord] = []
+        for record in self._store.list():
+            evidence = (
+                record.prepared.parent_evidence
+                if record.prepared is not None
+                else record.negotiated_parent_evidence
+            )
+            if evidence is not None and evidence.parent_txid == parent_txid:
+                matches.append(record)
+        if len(matches) > 1:
+            raise ChannelInputEscrowError("multiple escrow sessions claim the same parent")
+        return matches[0].model_copy(deep=True) if matches else None
 
     @staticmethod
     def _prepared_required(record: ChannelInputEscrowRecord) -> PreparedChannelInputEscrow:
@@ -138,6 +161,26 @@ class ChannelInputEscrowCoordinator:
             )
             expected_revision = record.revision
             record.attach_authorization(authorization)
+            record.advance(EscrowLifecycleState.CHANNEL_SIGNATURE_RELEASED)
+            self._save(record, expected_revision)
+            return record
+
+    async def finalize_parent(
+        self, session_id: str, finalized_parent: FinalizedEscrowParent
+    ) -> ChannelInputEscrowRecord:
+        """Durably attach exact all-input signing evidence before parent broadcast."""
+        async with self._lock_for(session_id):
+            record = self._load_required(session_id)
+            if record.state is EscrowLifecycleState.PARENT_SIGNED:
+                if record.finalized_parent != finalized_parent:
+                    raise ChannelInputEscrowError(
+                        "finalized parent conflicts with durable evidence"
+                    )
+                return record
+            if record.state is not EscrowLifecycleState.CHANNEL_SIGNATURE_RELEASED:
+                raise ChannelInputEscrowError("escrow is not ready for parent finalization")
+            expected_revision = record.revision
+            record.attach_finalized_parent(finalized_parent)
             record.advance(EscrowLifecycleState.PARENT_SIGNED)
             self._save(record, expected_revision)
             return record
@@ -153,8 +196,16 @@ class ChannelInputEscrowCoordinator:
             prepared = self._prepared_required(record)
             if record.authorization is None:
                 raise ChannelInputEscrowError("parent_signed escrow lacks authorization evidence")
+            if record.finalized_parent is None:
+                raise ChannelInputEscrowError(
+                    "parent_signed escrow lacks finalized parent evidence"
+                )
             broadcast = await self._backend.broadcast_parent(
-                ParentBroadcastRequest(prepared=prepared, authorization=record.authorization)
+                ParentBroadcastRequest(
+                    prepared=prepared,
+                    authorization=record.authorization,
+                    finalized_parent=record.finalized_parent,
+                )
             )
             expected_revision = record.revision
             record.attach_parent_broadcast(broadcast)
@@ -214,6 +265,7 @@ class ChannelInputEscrowCoordinator:
                 else EscrowLifecycleState.COMMITMENT_CONFLICT
             )
             if record.state in {
+                EscrowLifecycleState.CHANNEL_SIGNATURE_RELEASED,
                 EscrowLifecycleState.PARENT_SIGNED,
                 EscrowLifecycleState.PARENT_PENDING,
             }:
@@ -226,6 +278,22 @@ class ChannelInputEscrowCoordinator:
             }:
                 record.advance(EscrowLifecycleState.PARENT_REORGED)
                 record.advance(target)
+            return
+
+        if (
+            observation.in_best_chain
+            and observation.parent_confirmations < record.terms.parent_confirmation_depth
+        ):
+            if record.state in {
+                EscrowLifecycleState.PARENT_CONFIRMED,
+                EscrowLifecycleState.PAYMENT_IN_FLIGHT,
+                EscrowLifecycleState.SUCCESS_SPEND_PENDING,
+                EscrowLifecycleState.TIMEOUT_PENDING,
+                EscrowLifecycleState.SUCCESS_SPEND_CONFIRMED,
+                EscrowLifecycleState.TIMEOUT_CONFIRMED,
+                EscrowLifecycleState.PAID_TIMEOUT_LOSS,
+            }:
+                record.advance(EscrowLifecycleState.PARENT_REORGED)
             return
 
         if not observation.in_best_chain:
@@ -273,8 +341,6 @@ class ChannelInputEscrowCoordinator:
         if record.payment_request is None:
             raise ChannelInputEscrowError("escrow lacks a durable payment request")
         result = await self._backend.send_single_part_payment(record.payment_request)
-        if result.status is PaymentStatus.FAILED:
-            raise ChannelInputEscrowError("initial escrow payment result cannot be failed")
         expected_revision = record.revision
         record.attach_payment_result(result)
         record.advance(EscrowLifecycleState.PAYMENT_IN_FLIGHT)
@@ -452,6 +518,20 @@ class ChannelInputEscrowCoordinator:
             record = self._load_required(session_id)
             if record.state is not EscrowLifecycleState.PARENT_REORGED:
                 raise ChannelInputEscrowError("reorg recovery requires parent_reorged state")
+            prepared = self._prepared_required(record)
+            observation = await self._backend.observe_escrow_chain(
+                ChainObservationRequest(
+                    session_id=record.session_id,
+                    parent_txid=prepared.parent_evidence.parent_txid,
+                )
+            )
+            record = await self._ensure_timeout_evidence_locked(record, observation)
+            if observation.conflict_txid is not None:
+                expected_revision = record.revision
+                record.attach_chain_observation(observation)
+                self._advance_from_observation(record, observation)
+                self._save(record, expected_revision)
+                return record
             if record.recovery_required:
                 recovery = await self._backend.rebroadcast_recovery_artifacts(
                     RecoveryRequest(record=record)
@@ -459,19 +539,13 @@ class ChannelInputEscrowCoordinator:
                 expected_revision = record.revision
                 record.attach_recovery_broadcast(recovery)
                 self._save(record, expected_revision)
-            prepared = self._prepared_required(record)
-            observation = await self._backend.observe_escrow_chain(
-                ChainObservationRequest(
-                    session_id=record.session_id, parent_txid=prepared.parent_evidence.parent_txid
-                )
-            )
-            record = await self._ensure_timeout_evidence_locked(record, observation)
             expected_revision = record.revision
             record.attach_chain_observation(observation)
             self._advance_from_observation(record, observation)
             if (
                 record.state is EscrowLifecycleState.PARENT_REORGED
                 and observation.in_best_chain
+                and observation.parent_confirmations >= record.terms.parent_confirmation_depth
                 and record.state_before_reorg is not None
             ):
                 record.advance(record.state_before_reorg)

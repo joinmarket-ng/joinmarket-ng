@@ -331,12 +331,15 @@ class LdkServerBackend(LightningBackend):
         address: str,
         channel_amount_sats: int,
         push_to_counterparty_msat: int | None = None,
+        user_channel_id: str | None = None,
     ) -> str:
         """Open a channel whose funding output is provided externally.
 
         Returns the ``user_channel_id`` to track the open. Requires the LDK
         Server fork that exposes the external-funding RPCs.
         """
+        if user_channel_id is not None:
+            raise LightningError("LDK does not support caller-selected external funding IDs")
         req = f_str(1, node_pubkey) + f_str(2, address) + f_uint(3, channel_amount_sats)
         if push_to_counterparty_msat is not None:
             req += f_uint(4, push_to_counterparty_msat)

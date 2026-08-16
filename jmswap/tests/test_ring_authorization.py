@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -175,6 +176,130 @@ def test_store_funding_binding_checks_hash_and_is_immutable(tmp_path: Path) -> N
         )
 
 
+def test_store_persists_pending_channel_id_and_rejects_conflicting_replay(tmp_path: Path) -> None:
+    authorization = _authorization()
+    store = RingEdgeAuthorizationStore(tmp_path)
+    store.authorize(authorization, local_nick="funder", now_unix=1)
+
+    bound = store.bind_funding(
+        authorization.edge_id,
+        authorization.authorization_id,
+        "bcrt1qfunding",
+        "5120" + "aa" * 32,
+        pending_channel_id="pending-channel",
+    )
+
+    assert bound.pending_channel_id == "pending-channel"
+    assert (
+        store.bind_funding(
+            authorization.edge_id,
+            authorization.authorization_id,
+            "bcrt1qfunding",
+            "5120" + "aa" * 32,
+            pending_channel_id="pending-channel",
+        )
+        == bound
+    )
+    with pytest.raises(ChannelInputEscrowError, match="immutable"):
+        store.bind_funding(
+            authorization.edge_id,
+            authorization.authorization_id,
+            "bcrt1qfunding",
+            "5120" + "aa" * 32,
+            pending_channel_id="other-pending-channel",
+        )
+
+
+def test_store_reserves_funding_before_binding_and_tracks_cancellation_completion(
+    tmp_path: Path,
+) -> None:
+    authorization = _authorization()
+    store = RingEdgeAuthorizationStore(tmp_path)
+    store.authorize(authorization, local_nick="funder", now_unix=1)
+
+    reserved = store.reserve_funding(
+        authorization.edge_id, authorization.authorization_id, "reserved-channel"
+    )
+
+    assert reserved.pending_channel_id == "reserved-channel"
+    assert reserved.funding_address is None
+    assert (
+        store.reserve_funding(
+            authorization.edge_id, authorization.authorization_id, "reserved-channel"
+        )
+        == reserved
+    )
+    with pytest.raises(ChannelInputEscrowError, match="immutable"):
+        store.reserve_funding(
+            authorization.edge_id, authorization.authorization_id, "other-channel"
+        )
+    with pytest.raises(ChannelInputEscrowError, match="immutable"):
+        store.bind_funding(
+            authorization.edge_id,
+            authorization.authorization_id,
+            "bcrt1qfunding",
+            "5120" + "aa" * 32,
+            pending_channel_id="other-channel",
+        )
+
+    canceled = store.cancel_funding(authorization.edge_id, authorization.authorization_id)
+    completed = store.complete_funding_cancellation(
+        authorization.edge_id, authorization.authorization_id
+    )
+
+    assert canceled.funding_canceled is True
+    assert completed.funding_cancel_completed is True
+    assert (
+        store.complete_funding_cancellation(authorization.edge_id, authorization.authorization_id)
+        == completed
+    )
+
+
+def test_store_canceled_funding_cannot_bind_a_channel_point(tmp_path: Path) -> None:
+    authorization = _authorization()
+    store = RingEdgeAuthorizationStore(tmp_path)
+    store.authorize(authorization, local_nick="funder", now_unix=1)
+    store.bind_funding(
+        authorization.edge_id,
+        authorization.authorization_id,
+        "bcrt1qfunding",
+        "5120" + "aa" * 32,
+        pending_channel_id="pending-channel",
+    )
+
+    canceled = store.cancel_funding(authorization.edge_id, authorization.authorization_id)
+
+    assert canceled.funding_canceled is True
+    assert store.cancel_funding(authorization.edge_id, authorization.authorization_id) == canceled
+    with pytest.raises(ChannelInputEscrowError, match="canceled"):
+        store.bind_channel_point(
+            authorization.edge_id, authorization.authorization_id, _channel_point()
+        )
+    with pytest.raises(ChannelInputEscrowError, match="canceled"):
+        store.complete_funding(
+            authorization.edge_id, authorization.authorization_id, _channel_point()
+        )
+
+
+def test_legacy_record_without_pending_channel_id_remains_parseable() -> None:
+    authorization = _authorization()
+    record = RingEdgeAuthorizationRecord.model_validate(
+        {
+            "authorization": authorization.model_dump(mode="json"),
+            "local_nick": "funder",
+            "funding_address": "bcrt1qfunding",
+            "funding_scriptpubkey": "5120" + "aa" * 32,
+            "revision": 1,
+            "created_at": datetime(2025, 1, 1, tzinfo=UTC),
+            "updated_at": datetime(2025, 1, 1, tzinfo=UTC),
+        }
+    )
+
+    assert record.pending_channel_id is None
+    assert record.funding_canceled is False
+    assert record.funding_completed is False
+
+
 def test_store_channel_point_requires_funding_and_is_immutable(tmp_path: Path) -> None:
     authorization = _authorization()
     store = RingEdgeAuthorizationStore(tmp_path)
@@ -206,6 +331,65 @@ def test_store_channel_point_requires_funding_and_is_immutable(tmp_path: Path) -
             authorization.edge_id,
             authorization.authorization_id,
             _channel_point("99" * 32),
+        )
+    with pytest.raises(ChannelInputEscrowError, match="pending channel ID"):
+        store.complete_funding(
+            authorization.edge_id, authorization.authorization_id, _channel_point()
+        )
+
+
+def test_store_marks_exact_pending_channel_point_completed_idempotently(tmp_path: Path) -> None:
+    authorization = _authorization()
+    store = RingEdgeAuthorizationStore(tmp_path)
+    store.authorize(authorization, local_nick="funder", now_unix=1)
+    store.bind_funding(
+        authorization.edge_id,
+        authorization.authorization_id,
+        "bcrt1qfunding",
+        "5120" + "aa" * 32,
+        pending_channel_id="pending-channel",
+    )
+    point = _channel_point()
+    store.bind_channel_point(authorization.edge_id, authorization.authorization_id, point)
+
+    completed = store.complete_funding(authorization.edge_id, authorization.authorization_id, point)
+
+    assert completed.funding_completed is True
+    assert completed.revision == 3
+    assert (
+        store.complete_funding(authorization.edge_id, authorization.authorization_id, point)
+        == completed
+    )
+    assert (
+        store.bind_funding(
+            authorization.edge_id,
+            authorization.authorization_id,
+            "bcrt1qfunding",
+            "5120" + "aa" * 32,
+            pending_channel_id="pending-channel",
+        )
+        == completed
+    )
+    with pytest.raises(ChannelInputEscrowError, match="already completed"):
+        store.cancel_funding(authorization.edge_id, authorization.authorization_id)
+    with pytest.raises(ChannelInputEscrowError, match="immutable"):
+        store.complete_funding(
+            authorization.edge_id,
+            authorization.authorization_id,
+            _channel_point("99" * 32),
+        )
+
+
+def test_record_rejects_completed_funding_without_funder_recovery_state() -> None:
+    authorization = _authorization()
+    with pytest.raises(ValidationError, match="pending channel ID"):
+        RingEdgeAuthorizationRecord(
+            authorization=authorization,
+            local_nick="funder",
+            funding_address="bcrt1qfunding",
+            funding_scriptpubkey="5120" + "aa" * 32,
+            channel_point=_channel_point(),
+            funding_completed=True,
         )
 
 

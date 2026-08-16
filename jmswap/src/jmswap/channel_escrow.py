@@ -18,6 +18,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Literal, Protocol, cast, runtime_checkable
 
+from jmcore.bitcoin import get_txid, parse_transaction
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from jmswap.channel_funding import (
@@ -42,7 +43,7 @@ def _validate_hex(value: str, *, byte_length: int | None = None, name: str) -> s
         raise ValueError(f"{name} must be non-empty hexadecimal")
     if byte_length is not None and len(value) != byte_length * 2:
         raise ValueError(f"{name} must be exactly {byte_length} bytes")
-    return value
+    return value.lower()
 
 
 class EscrowOutpoint(BaseModel):
@@ -67,11 +68,30 @@ class ChannelSnapshot(BaseModel):
     session_id: str = Field(min_length=1)
     channel_id: str = Field(min_length=1)
     funding_outpoint: EscrowOutpoint
+    funding_scriptpubkey: str
+    local_funding_pubkey: str
+    remote_funding_pubkey: str
     capacity_sats: int = Field(gt=0)
     maker_claim_sats: int = Field(ge=0)
     peer_claim_sats: int = Field(ge=0)
     quiescent: bool
     active_htlcs: int = Field(ge=0)
+
+    @field_validator("funding_scriptpubkey")
+    @classmethod
+    def validate_funding_scriptpubkey(cls, value: str) -> str:
+        value = _validate_hex(value, byte_length=34, name="channel funding scriptPubKey")
+        if not value.startswith("5120"):
+            raise ValueError("channel funding scriptPubKey must be P2TR OP_1 PUSH32")
+        return value
+
+    @field_validator("local_funding_pubkey", "remote_funding_pubkey")
+    @classmethod
+    def validate_funding_pubkey(cls, value: str) -> str:
+        value = _validate_hex(value, byte_length=33, name="channel funding public key")
+        if not value.startswith(("02", "03")):
+            raise ValueError("channel funding public key must be compressed")
+        return value
 
     @model_validator(mode="after")
     def validate_settlement_state(self) -> ChannelSnapshot:
@@ -81,6 +101,8 @@ class ChannelSnapshot(BaseModel):
             raise ValueError("channel snapshot must have no active HTLCs")
         if self.capacity_sats != self.maker_claim_sats + self.peer_claim_sats:
             raise ValueError("channel claims must exactly conserve capacity")
+        if self.local_funding_pubkey == self.remote_funding_pubkey:
+            raise ValueError("channel funding public keys must be distinct")
         return self
 
 
@@ -152,6 +174,30 @@ class ChannelInputEscrowTerms(BaseModel):
         return self
 
 
+class EscrowParentPrevout(BaseModel):
+    """An ordered parent transaction input prevout committed for escrow signing."""
+
+    model_config = _FROZEN_MODEL_CONFIG
+
+    value_sats: int = Field(gt=0)
+    scriptpubkey: str
+
+    @field_validator("scriptpubkey")
+    @classmethod
+    def validate_scriptpubkey(cls, value: str) -> str:
+        return _validate_hex(value, name="parent prevout scriptPubKey")
+
+
+def _is_native_segwit_program(scriptpubkey: str) -> bool:
+    script = bytes.fromhex(scriptpubkey)
+    if len(script) < 4 or script[0] not in (0, *range(0x51, 0x61)):
+        return False
+    program_length = script[1]
+    if not 2 <= program_length <= 40 or len(script) != program_length + 2:
+        return False
+    return script[0] != 0 or program_length in (20, 32)
+
+
 class EscrowParentEvidence(BaseModel):
     """Maker-local evidence that the exact escrow parent is safe to authorize."""
 
@@ -161,6 +207,7 @@ class EscrowParentEvidence(BaseModel):
     parent_txid: str
     channel_funding_outpoint: EscrowOutpoint
     channel_input_index: int = Field(ge=0, le=0xFFFFFFFF)
+    ordered_prevouts: tuple[EscrowParentPrevout, ...] = Field(min_length=1)
     escrow_outpoint: EscrowOutpoint
     escrow_value_sats: int = Field(gt=0)
     escrow_scriptpubkey: str
@@ -185,6 +232,37 @@ class EscrowParentEvidence(BaseModel):
             raise ValueError("exact parent transaction must be independently verified")
         if self.escrow_outpoint.txid != self.parent_txid:
             raise ValueError("escrow outpoint must belong to the parent transaction")
+        try:
+            parent = parse_transaction(self.parent_tx_hex)
+            calculated_txid = get_txid(self.parent_tx_hex)
+        except Exception as exc:  # noqa: BLE001 - normalize transaction parser failures
+            raise ValueError("parent transaction is invalid") from exc
+        if calculated_txid != self.parent_txid:
+            raise ValueError("parent transaction ID does not match parent transaction")
+        if len(parent.inputs) != len(self.ordered_prevouts):
+            raise ValueError("parent transaction input count does not match ordered prevouts")
+        if self.channel_input_index >= len(parent.inputs):
+            raise ValueError("channel input index does not exist in parent transaction")
+        channel_input = parent.inputs[self.channel_input_index]
+        if (
+            channel_input.txid != self.channel_funding_outpoint.txid
+            or channel_input.vout != self.channel_funding_outpoint.vout
+        ):
+            raise ValueError("channel input does not spend the frozen channel funding outpoint")
+        if self.escrow_outpoint.vout >= len(parent.outputs):
+            raise ValueError("escrow output index does not exist in parent transaction")
+        escrow_output = parent.outputs[self.escrow_outpoint.vout]
+        if (
+            escrow_output.value != self.escrow_value_sats
+            or escrow_output.script.hex() != self.escrow_scriptpubkey
+        ):
+            raise ValueError("parent transaction escrow output does not match escrow evidence")
+        if any(parent_input.scriptsig for parent_input in parent.inputs):
+            raise ValueError("all parent input scriptSigs must be empty")
+        if any(
+            not _is_native_segwit_program(prevout.scriptpubkey) for prevout in self.ordered_prevouts
+        ):
+            raise ValueError("all parent prevouts must use native SegWit scriptPubKeys")
         return self
 
 
@@ -245,6 +323,16 @@ class PreparedChannelInputEscrow(BaseModel):
             raise ValueError("parent escrow value must match escrow terms")
         if self.parent_evidence.channel_funding_outpoint != self.terms.snapshot.funding_outpoint:
             raise ValueError("parent must consume the frozen channel funding outpoint")
+        if self.parent_evidence.channel_input_index >= len(self.parent_evidence.ordered_prevouts):
+            raise ValueError("parent channel input index must reference an ordered prevout")
+        channel_prevout = self.parent_evidence.ordered_prevouts[
+            self.parent_evidence.channel_input_index
+        ]
+        if (
+            channel_prevout.value_sats != self.terms.snapshot.capacity_sats
+            or channel_prevout.scriptpubkey != self.terms.snapshot.funding_scriptpubkey
+        ):
+            raise ValueError("parent channel prevout must match the frozen channel snapshot")
         if self.parent_evidence.escrow_outpoint != self.timeout_evidence.spent_escrow_outpoint:
             raise ValueError("timeout must spend the exact parent escrow outpoint")
         if self.timeout_evidence.locktime != self.terms.timeout_height:
@@ -300,23 +388,20 @@ class EscrowRouteEvidence(BaseModel):
 
 
 class ParentAuthorization(BaseModel):
-    """Authorization for the exact parent after timeout recovery is secured."""
+    """Attested release of the exact channel-input witness after timeout safety."""
 
     model_config = _FROZEN_MODEL_CONFIG
 
     session_id: str = Field(min_length=1)
     parent_txid: str
     prepared_parent_tx_hex: str
-    signed_parent_tx_hex: str
     timeout_txid: str
     channel_funding_outpoint: EscrowOutpoint
     channel_input_index: int = Field(ge=0, le=0xFFFFFFFF)
-    signer_pubkey: str
-    signature: bytes = Field(min_length=1)
-    sighash: Literal["all", "default"]
-    parent_fully_signed: bool
-    signed_parent_txid_verified: bool
+    channel_input_witness: tuple[bytes, ...]
+    sighash: Literal["default"]
     signature_verified: bool
+    channel_witness_txid_verified: bool
     commits_all_inputs: bool
     commits_all_outputs: bool
 
@@ -325,29 +410,58 @@ class ParentAuthorization(BaseModel):
     def validate_authorized_txid(cls, value: str) -> str:
         return _validate_hex(value, byte_length=32, name="authorized transaction ID")
 
-    @field_validator("prepared_parent_tx_hex", "signed_parent_tx_hex")
+    @field_validator("prepared_parent_tx_hex")
     @classmethod
     def validate_authorized_parent_hex(cls, value: str) -> str:
         return _validate_hex(value, name="authorized parent transaction")
 
-    @field_validator("signer_pubkey")
-    @classmethod
-    def validate_signer_pubkey(cls, value: str) -> str:
-        _validate_hex(value, byte_length=33, name="authorization signer public key")
-        if not value.startswith(("02", "03")):
-            raise ValueError("authorization signer public key must be compressed")
-        return value
-
     @model_validator(mode="after")
     def validate_authorization_evidence(self) -> ParentAuthorization:
-        if not self.parent_fully_signed:
-            raise ValueError("parent transaction must be fully signed before release")
-        if not self.signed_parent_txid_verified:
-            raise ValueError("signed parent transaction ID must be independently verified")
+        if len(self.channel_input_witness) != 1 or len(self.channel_input_witness[0]) != 64:
+            raise ValueError("channel authorization must contain exactly one 64-byte witness item")
         if not self.signature_verified:
-            raise ValueError("parent authorization signature must be independently verified")
+            raise ValueError("channel witness must be verified against the funding script")
+        if not self.channel_witness_txid_verified:
+            raise ValueError(
+                "channel witness must be attested to the prepared parent transaction ID"
+            )
         if not self.commits_all_inputs or not self.commits_all_outputs:
             raise ValueError("parent authorization must commit to every input and output")
+        return self
+
+
+class FinalizedEscrowParent(BaseModel):
+    """Evidence that every parent input has been signed after channel witness release."""
+
+    model_config = _FROZEN_MODEL_CONFIG
+
+    session_id: str = Field(min_length=1)
+    parent_txid: str
+    signed_parent_tx_hex: str
+    channel_funding_outpoint: EscrowOutpoint
+    channel_input_index: int = Field(ge=0, le=0xFFFFFFFF)
+    all_inputs_signed: bool
+    all_signatures_verified: bool
+    signed_parent_txid_verified: bool
+
+    @field_validator("parent_txid")
+    @classmethod
+    def validate_finalized_parent_txid(cls, value: str) -> str:
+        return _validate_hex(value, byte_length=32, name="finalized parent transaction ID")
+
+    @field_validator("signed_parent_tx_hex")
+    @classmethod
+    def validate_finalized_parent_hex(cls, value: str) -> str:
+        return _validate_hex(value, name="finalized parent transaction")
+
+    @model_validator(mode="after")
+    def validate_finalized_evidence(self) -> FinalizedEscrowParent:
+        if not self.all_inputs_signed:
+            raise ValueError("finalized parent must have every input signed")
+        if not self.all_signatures_verified:
+            raise ValueError("finalized parent signatures must be independently verified")
+        if not self.signed_parent_txid_verified:
+            raise ValueError("finalized parent transaction ID must be independently verified")
         return self
 
 
@@ -434,6 +548,7 @@ class EscrowLifecycleState(StrEnum):
 
     NEGOTIATED = "negotiated"
     TIMEOUT_SIGNED = "timeout_signed"
+    CHANNEL_SIGNATURE_RELEASED = "channel_signature_released"
     PARENT_SIGNED = "parent_signed"
     PARENT_PENDING = "parent_pending"
     PARENT_CONFIRMED = "parent_confirmed"
@@ -458,8 +573,14 @@ _ALLOWED_TRANSITIONS: dict[EscrowLifecycleState, frozenset[EscrowLifecycleState]
     ),
     EscrowLifecycleState.TIMEOUT_SIGNED: frozenset(
         {
-            EscrowLifecycleState.PARENT_SIGNED,
+            EscrowLifecycleState.CHANNEL_SIGNATURE_RELEASED,
             EscrowLifecycleState.ABORTED,
+        }
+    ),
+    EscrowLifecycleState.CHANNEL_SIGNATURE_RELEASED: frozenset(
+        {
+            EscrowLifecycleState.PARENT_SIGNED,
+            EscrowLifecycleState.COMMITMENT_CONFLICT,
         }
     ),
     EscrowLifecycleState.PARENT_SIGNED: frozenset(
@@ -526,6 +647,7 @@ class ChannelInputEscrowRecord(BaseModel):
     state: EscrowLifecycleState = EscrowLifecycleState.NEGOTIATED
     prepared: PreparedChannelInputEscrow | None = None
     authorization: ParentAuthorization | None = None
+    finalized_parent: FinalizedEscrowParent | None = None
     parent_broadcast: EscrowParentBroadcast | None = None
     chain_observation: EscrowChainObservation | None = None
     payment_request: SinglePartPaymentRequest | None = None
@@ -541,6 +663,16 @@ class ChannelInputEscrowRecord(BaseModel):
 
     @model_validator(mode="after")
     def validate_bound_artifacts(self) -> ChannelInputEscrowRecord:
+        self._validate_prepared_artifacts()
+        self._validate_authorization_artifact()
+        self._validate_finalized_parent_artifact()
+        self._validate_payment_artifacts()
+        self._validate_parent_broadcast_and_spends()
+        self._validate_timeout_and_recovery_broadcasts()
+        self._validate_lifecycle_artifacts()
+        return self
+
+    def _validate_prepared_artifacts(self) -> None:
         if self.negotiated_parent_evidence is not None:
             if (
                 self.negotiated_parent_evidence.channel_funding_outpoint
@@ -557,6 +689,8 @@ class ChannelInputEscrowRecord(BaseModel):
             and self.prepared.parent_evidence != self.negotiated_parent_evidence
         ):
             raise ValueError("prepared artifact must match the negotiated parent evidence")
+
+    def _validate_authorization_artifact(self) -> None:
         if self.authorization is not None:
             if self.authorization.session_id != self.terms.snapshot.session_id:
                 raise ValueError("parent authorization session must match escrow record")
@@ -578,8 +712,27 @@ class ChannelInputEscrowRecord(BaseModel):
                 != self.prepared.parent_evidence.channel_input_index
             ):
                 raise ValueError("parent authorization input index must match prepared escrow")
-            if self.authorization.signer_pubkey != self.terms.authorizer_pubkey:
-                raise ValueError("parent authorization signer must match negotiated authorizer")
+
+    def _validate_finalized_parent_artifact(self) -> None:
+        if self.finalized_parent is not None:
+            if self.finalized_parent.session_id != self.terms.snapshot.session_id:
+                raise ValueError("finalized parent session must match escrow record")
+            if self.prepared is None:
+                raise ValueError("finalized parent requires a prepared timeout artifact")
+            if self.finalized_parent.parent_txid != self.prepared.parent_evidence.parent_txid:
+                raise ValueError("finalized parent must bind the prepared parent")
+            if (
+                self.finalized_parent.channel_funding_outpoint
+                != self.terms.snapshot.funding_outpoint
+            ):
+                raise ValueError("finalized parent must spend the frozen channel")
+            if (
+                self.finalized_parent.channel_input_index
+                != self.prepared.parent_evidence.channel_input_index
+            ):
+                raise ValueError("finalized parent input index must match prepared escrow")
+
+    def _validate_payment_artifacts(self) -> None:
         if self.payment_result is not None:
             try:
                 self.payment_result.validate_against(self.terms)
@@ -593,6 +746,8 @@ class ChannelInputEscrowRecord(BaseModel):
             self.prepared is None or self.payment_request.prepared != self.prepared
         ):
             raise ValueError("payment request must bind the prepared escrow")
+
+    def _validate_parent_broadcast_and_spends(self) -> None:
         if self.parent_broadcast is not None:
             if self.parent_broadcast.session_id != self.session_id:
                 raise ValueError("parent broadcast session must match escrow record")
@@ -629,6 +784,8 @@ class ChannelInputEscrowRecord(BaseModel):
                     raise ValueError(
                         "success replacement must increase fee, feerate, and preserve ordering"
                     )
+
+    def _validate_timeout_and_recovery_broadcasts(self) -> None:
         if self.timeout_broadcast is not None:
             if self.prepared is None:
                 raise ValueError("timeout broadcast requires prepared escrow evidence")
@@ -644,8 +801,11 @@ class ChannelInputEscrowRecord(BaseModel):
             error = self._recovery_broadcast_error(recovery)
             if error is not None:
                 raise ValueError(error)
+
+    def _validate_lifecycle_artifacts(self) -> None:
         states_requiring_prepared = {
             EscrowLifecycleState.TIMEOUT_SIGNED,
+            EscrowLifecycleState.CHANNEL_SIGNATURE_RELEASED,
             EscrowLifecycleState.PARENT_SIGNED,
             EscrowLifecycleState.PARENT_PENDING,
             EscrowLifecycleState.PARENT_CONFIRMED,
@@ -661,6 +821,19 @@ class ChannelInputEscrowRecord(BaseModel):
         }
         states_requiring_authorization = states_requiring_prepared - {
             EscrowLifecycleState.TIMEOUT_SIGNED
+        }
+        states_requiring_finalized_parent = {
+            EscrowLifecycleState.PARENT_SIGNED,
+            EscrowLifecycleState.PARENT_PENDING,
+            EscrowLifecycleState.PARENT_CONFIRMED,
+            EscrowLifecycleState.PAYMENT_IN_FLIGHT,
+            EscrowLifecycleState.SUCCESS_SPEND_PENDING,
+            EscrowLifecycleState.TIMEOUT_PENDING,
+            EscrowLifecycleState.SUCCESS_SPEND_CONFIRMED,
+            EscrowLifecycleState.TIMEOUT_CONFIRMED,
+            EscrowLifecycleState.PAID_TIMEOUT_LOSS,
+            EscrowLifecycleState.PARENT_REORGED,
+            EscrowLifecycleState.CROSS_LAYER_LOSS,
         }
         states_requiring_payment = {
             EscrowLifecycleState.PAYMENT_IN_FLIGHT,
@@ -706,6 +879,8 @@ class ChannelInputEscrowRecord(BaseModel):
             raise ValueError(f"{evidence_state} state requires prepared timeout evidence")
         if evidence_state in states_requiring_authorization and self.authorization is None:
             raise ValueError(f"{evidence_state} state requires parent authorization")
+        if evidence_state in states_requiring_finalized_parent and self.finalized_parent is None:
+            raise ValueError(f"{evidence_state} state requires finalized parent evidence")
         if evidence_state in states_requiring_payment and self.payment_result is None:
             raise ValueError(f"{evidence_state} state requires payment and route evidence")
         if evidence_state in states_requiring_payment and self.payment_request is None:
@@ -753,7 +928,6 @@ class ChannelInputEscrowRecord(BaseModel):
             and self.timeout_broadcast is None
         ):
             raise ValueError(f"{evidence_state} state requires a timeout spend transaction")
-        return self
 
     @property
     def session_id(self) -> str:
@@ -879,10 +1053,15 @@ class ChannelInputEscrowRecord(BaseModel):
             or self.chain_observation.observed_height < self.timeout_broadcast.broadcast_height
         ):
             return f"{state} state requires a parent observation after the timeout broadcast"
-        if state is EscrowLifecycleState.PARENT_REORGED and (
-            self.chain_observation is None or self.chain_observation.in_best_chain
-        ):
-            return "parent_reorged state requires evidence outside the best chain"
+        if state is EscrowLifecycleState.PARENT_REORGED:
+            if self.chain_observation is None:
+                return "parent_reorged state requires chain evidence"
+            if (
+                self.chain_observation.in_best_chain
+                and self.chain_observation.parent_confirmations
+                >= self.terms.parent_confirmation_depth
+            ):
+                return "parent_reorged state requires missing parent confirmation depth"
         if state in {
             EscrowLifecycleState.COMMITMENT_CONFLICT,
             EscrowLifecycleState.CROSS_LAYER_LOSS,
@@ -960,10 +1139,33 @@ class ChannelInputEscrowRecord(BaseModel):
             raise ChannelInputEscrowError("parent authorization does not spend the frozen channel")
         if authorization.channel_input_index != self.prepared.parent_evidence.channel_input_index:
             raise ChannelInputEscrowError("parent authorization input index does not match record")
-        if authorization.signer_pubkey != self.terms.authorizer_pubkey:
-            raise ChannelInputEscrowError("parent authorization signer does not match record")
         self.authorization = authorization
         self._touch()
+
+    def attach_finalized_parent(self, finalized_parent: FinalizedEscrowParent) -> None:
+        """Attach all-input signing evidence after channel witness release."""
+        if self.state is not EscrowLifecycleState.CHANNEL_SIGNATURE_RELEASED:
+            raise ChannelInputEscrowError(
+                "finalized parent requires channel_signature_released state"
+            )
+        if self.prepared is None:
+            raise ChannelInputEscrowError("finalized parent requires a prepared timeout")
+        if finalized_parent.session_id != self.session_id:
+            raise ChannelInputEscrowError("finalized parent session does not match record")
+        if finalized_parent.parent_txid != self.prepared.parent_evidence.parent_txid:
+            raise ChannelInputEscrowError("finalized parent does not match parent transaction")
+        if finalized_parent.channel_funding_outpoint != self.terms.snapshot.funding_outpoint:
+            raise ChannelInputEscrowError("finalized parent does not spend the frozen channel")
+        if (
+            finalized_parent.channel_input_index
+            != self.prepared.parent_evidence.channel_input_index
+        ):
+            raise ChannelInputEscrowError("finalized parent input index does not match record")
+        if self.finalized_parent is not None and self.finalized_parent != finalized_parent:
+            raise ChannelInputEscrowError("finalized parent evidence is immutable")
+        if self.finalized_parent is None:
+            self.finalized_parent = finalized_parent
+            self._touch()
 
     def attach_parent_broadcast(self, result: EscrowParentBroadcast) -> None:
         """Bind broadcast evidence for the exact authorized parent."""
@@ -1016,16 +1218,9 @@ class ChannelInputEscrowRecord(BaseModel):
             raise ChannelInputEscrowError(
                 "payment result attempt height does not match its request"
             )
-        if (
-            self.state is EscrowLifecycleState.PARENT_CONFIRMED
-            and result.status is PaymentStatus.FAILED
-        ):
-            raise ChannelInputEscrowError("failed payment cannot enter payment_in_flight state")
         if self.payment_result is not None:
             if result.payment_id != self.payment_result.payment_id:
                 raise ChannelInputEscrowError("payment observation changed the backend payment ID")
-            if result.route != self.payment_result.route:
-                raise ChannelInputEscrowError("payment observation changed the selected route")
             if result.attempt_height != self.payment_result.attempt_height:
                 raise ChannelInputEscrowError("payment observation changed the attempt height")
             if result.observed_height < self.payment_result.observed_height:
@@ -1152,8 +1347,12 @@ class ChannelInputEscrowRecord(BaseModel):
             raise ChannelInputEscrowError(f"cannot transition from {self.state} to {target}")
         if target is EscrowLifecycleState.TIMEOUT_SIGNED and self.prepared is None:
             raise ChannelInputEscrowError("timeout_signed requires a prepared timeout artifact")
-        if target is EscrowLifecycleState.PARENT_SIGNED and self.authorization is None:
-            raise ChannelInputEscrowError("parent_signed requires exact parent authorization")
+        if target is EscrowLifecycleState.CHANNEL_SIGNATURE_RELEASED and self.authorization is None:
+            raise ChannelInputEscrowError(
+                "channel_signature_released requires exact parent authorization"
+            )
+        if target is EscrowLifecycleState.PARENT_SIGNED and self.finalized_parent is None:
+            raise ChannelInputEscrowError("parent_signed requires finalized parent evidence")
         if target is EscrowLifecycleState.PARENT_PENDING and self.parent_broadcast is None:
             raise ChannelInputEscrowError("parent_pending requires exact parent broadcast evidence")
         if target is EscrowLifecycleState.PAYMENT_IN_FLIGHT and (
@@ -1221,7 +1420,9 @@ class ChannelInputEscrowRecord(BaseModel):
                 self.state_before_reorg = EscrowLifecycleState.TIMEOUT_PENDING
             else:
                 self.state_before_reorg = self.state
-            self.recovery_required = True
+            self.recovery_required = bool(
+                self.chain_observation is not None and not self.chain_observation.in_best_chain
+            )
         elif self.state is EscrowLifecycleState.PARENT_REORGED and (
             restores_reorg_state
             or target
@@ -1263,12 +1464,13 @@ class ParentAuthorizationRequest(BaseModel):
 
 
 class ParentBroadcastRequest(BaseModel):
-    """Request to broadcast the exact fully authorized escrow parent."""
+    """Request to broadcast the exact fully finalized escrow parent."""
 
     model_config = _FROZEN_MODEL_CONFIG
 
     prepared: PreparedChannelInputEscrow
     authorization: ParentAuthorization
+    finalized_parent: FinalizedEscrowParent
 
     @model_validator(mode="after")
     def validate_parent_binding(self) -> ParentBroadcastRequest:
@@ -1289,8 +1491,19 @@ class ParentBroadcastRequest(BaseModel):
             != self.prepared.parent_evidence.channel_input_index
         ):
             raise ValueError("parent broadcast authorization does not match the channel input")
-        if self.authorization.signer_pubkey != self.prepared.terms.authorizer_pubkey:
-            raise ValueError("parent broadcast authorization signer does not match escrow terms")
+        if self.finalized_parent.session_id != self.prepared.terms.snapshot.session_id:
+            raise ValueError(
+                "parent broadcast finalized parent session does not match prepared escrow"
+            )
+        if self.finalized_parent.parent_txid != self.prepared.parent_evidence.parent_txid:
+            raise ValueError("parent broadcast finalized parent does not match prepared parent")
+        if (
+            self.finalized_parent.channel_funding_outpoint
+            != self.prepared.parent_evidence.channel_funding_outpoint
+            or self.finalized_parent.channel_input_index
+            != self.prepared.parent_evidence.channel_input_index
+        ):
+            raise ValueError("parent broadcast finalized parent does not match the channel input")
         return self
 
 
@@ -1359,7 +1572,7 @@ class SinglePartPaymentResult(BaseModel):
     attempt_height: int = Field(ge=0, lt=_MAX_BLOCK_HEIGHT_LOCKTIME)
     observed_height: int = Field(ge=0, lt=_MAX_BLOCK_HEIGHT_LOCKTIME)
     settled_height: int | None = Field(default=None, ge=0, lt=_MAX_BLOCK_HEIGHT_LOCKTIME)
-    route: EscrowRouteEvidence
+    route: EscrowRouteEvidence | None = None
 
     @field_validator("preimage")
     @classmethod
@@ -1381,10 +1594,16 @@ class SinglePartPaymentResult(BaseModel):
                 raise ValueError("payment settlement height must be within its observation window")
         elif self.preimage is not None or self.settled_height is not None:
             raise ValueError("an unsettled escrow payment cannot return settlement evidence")
+        if self.status is not PaymentStatus.FAILED and self.route is None:
+            raise ValueError("an active escrow payment must include route evidence")
         return self
 
     def validate_against(self, terms: ChannelInputEscrowTerms) -> None:
         """Validate route policy and any returned preimage against escrow terms."""
+        if self.route is None:
+            if self.status is not PaymentStatus.FAILED:
+                raise ChannelInputEscrowError("active escrow payment lacks route evidence")
+            return
         self.route.validate_against(terms)
         if (
             self.route.final_expiry_height

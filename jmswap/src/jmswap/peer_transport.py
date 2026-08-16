@@ -2,19 +2,21 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import fcntl
 import hashlib
 import json
 import os
 import tempfile
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Literal, Protocol, TypeAlias, runtime_checkable
 
+from jmcore.bitcoin import get_txid, parse_transaction
 from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
@@ -67,8 +69,43 @@ def _canonical_json(value: object) -> bytes:
     )
 
 
+class EscrowProtocolRole(StrEnum):
+    """Economic endpoint role in the channel-input escrow protocol."""
+
+    MAKER = "maker"
+    PEER = "peer"
+
+
+class EscrowInvoiceProposalPayload(BaseModel):
+    """Endpoint-private invoice proposal issued by the economic peer."""
+
+    model_config = _FROZEN_MODEL_CONFIG
+
+    kind: Literal["escrow_invoice_proposal"] = "escrow_invoice_proposal"
+    role: Literal[EscrowProtocolRole.PEER]
+    invoice: str = Field(min_length=1)
+    payment_hash: str
+    payee_pubkey: str
+    payment_secret: str
+    amount_msat: int = Field(gt=0)
+    expiry_unix: int = Field(gt=0)
+    min_final_cltv_delta: int = Field(ge=1)
+
+    @field_validator("payment_hash", "payment_secret")
+    @classmethod
+    def validate_payment_identifiers(cls, value: str, info: object) -> str:
+        return _validate_hex(
+            value, byte_length=32, name=str(getattr(info, "field_name", "payment identifier"))
+        )
+
+    @field_validator("payee_pubkey")
+    @classmethod
+    def validate_payee_pubkey(cls, value: str) -> str:
+        return _validate_compressed_pubkey(value, name="payee public key")
+
+
 class EndpointTermsPayload(BaseModel):
-    """Private escrow terms and invoice exchange between the two maker endpoints."""
+    """Final endpoint-private escrow terms between the two maker endpoints."""
 
     model_config = _FROZEN_MODEL_CONFIG
 
@@ -91,13 +128,6 @@ class EndpointTermsPayload(BaseModel):
                 "invoice_payment_secret": value.invoice_payment_secret.lower(),
             }
         )
-
-
-class EscrowProtocolRole(StrEnum):
-    """Economic endpoint role in the channel-input escrow protocol."""
-
-    MAKER = "maker"
-    PEER = "peer"
 
 
 class EscrowPublicKeysPayload(BaseModel):
@@ -140,13 +170,17 @@ class TimeoutMuSig2NoncePayload(BaseModel):
     model_config = _FROZEN_MODEL_CONFIG
 
     kind: Literal["timeout_musig2_nonce"] = "timeout_musig2_nonce"
+    round_id: str
     timeout_txid: str
+    timeout_sighash: str
     public_nonce: str
 
-    @field_validator("timeout_txid")
+    @field_validator("round_id", "timeout_txid", "timeout_sighash")
     @classmethod
-    def validate_timeout_txid(cls, value: str) -> str:
-        return _validate_hex(value, byte_length=32, name="timeout transaction ID")
+    def validate_identifiers(cls, value: str, info: object) -> str:
+        return _validate_hex(
+            value, byte_length=32, name=str(getattr(info, "field_name", "identifier"))
+        )
 
     @field_validator("public_nonce")
     @classmethod
@@ -160,13 +194,17 @@ class TimeoutMuSig2PartialSignaturePayload(BaseModel):
     model_config = _FROZEN_MODEL_CONFIG
 
     kind: Literal["timeout_musig2_partial_signature"] = "timeout_musig2_partial_signature"
+    round_id: str
     timeout_txid: str
+    timeout_sighash: str
     partial_signature: str
 
-    @field_validator("timeout_txid")
+    @field_validator("round_id", "timeout_txid", "timeout_sighash")
     @classmethod
-    def validate_timeout_txid(cls, value: str) -> str:
-        return _validate_hex(value, byte_length=32, name="timeout transaction ID")
+    def validate_identifiers(cls, value: str, info: object) -> str:
+        return _validate_hex(
+            value, byte_length=32, name=str(getattr(info, "field_name", "identifier"))
+        )
 
     @field_validator("partial_signature")
     @classmethod
@@ -174,17 +212,87 @@ class TimeoutMuSig2PartialSignaturePayload(BaseModel):
         return _validate_hex(value, byte_length=32, name="timeout MuSig2 partial signature")
 
 
+class ParentPrevoutPayload(BaseModel):
+    """An ordered parent transaction input prevout commitment."""
+
+    model_config = _FROZEN_MODEL_CONFIG
+
+    value_sats: int = Field(gt=0)
+    scriptpubkey: str
+
+    @field_validator("scriptpubkey")
+    @classmethod
+    def validate_scriptpubkey(cls, value: str) -> str:
+        return _validate_scriptpubkey(value, name="prevout scriptpubkey")
+
+
+class ParentPreparationPayload(BaseModel):
+    """Complete parent transaction commitment before MuSig2 signing."""
+
+    model_config = _FROZEN_MODEL_CONFIG
+
+    kind: Literal["parent_preparation"] = "parent_preparation"
+    round_id: str
+    parent_tx_hex: str
+    parent_txid: str
+    channel_input_index: int = Field(ge=0, le=0xFFFFFFFF)
+    ordered_prevouts: tuple[ParentPrevoutPayload, ...] = Field(min_length=1)
+    escrow_output_index: int = Field(ge=0, le=0xFFFFFFFF)
+    escrow_value_sats: int = Field(gt=0)
+    escrow_scriptpubkey: str
+
+    @field_validator("round_id", "parent_txid")
+    @classmethod
+    def validate_identifiers(cls, value: str, info: object) -> str:
+        return _validate_hex(
+            value, byte_length=32, name=str(getattr(info, "field_name", "identifier"))
+        )
+
+    @field_validator("parent_tx_hex")
+    @classmethod
+    def validate_parent_tx_hex(cls, value: str) -> str:
+        return _validate_hex(value, name="parent transaction")
+
+    @field_validator("escrow_scriptpubkey")
+    @classmethod
+    def validate_escrow_scriptpubkey(cls, value: str) -> str:
+        return _validate_scriptpubkey(value, name="escrow scriptpubkey")
+
+    @model_validator(mode="after")
+    def validate_parent_transaction(self) -> ParentPreparationPayload:
+        if self.channel_input_index >= len(self.ordered_prevouts):
+            raise ValueError("channel input index must reference an ordered prevout")
+        try:
+            parsed = parse_transaction(self.parent_tx_hex)
+            calculated_txid = get_txid(self.parent_tx_hex)
+        except Exception as exc:  # noqa: BLE001 - normalize transaction parser failures
+            raise ValueError("parent transaction is invalid") from exc
+        if calculated_txid != self.parent_txid:
+            raise ValueError("parent transaction ID does not match parent transaction")
+        if len(parsed.inputs) != len(self.ordered_prevouts):
+            raise ValueError("parent transaction input count does not match ordered prevouts")
+        if self.escrow_output_index >= len(parsed.outputs):
+            raise ValueError("escrow output index does not exist in parent transaction")
+        escrow_output = parsed.outputs[self.escrow_output_index]
+        if (
+            escrow_output.value != self.escrow_value_sats
+            or escrow_output.script.hex() != self.escrow_scriptpubkey
+        ):
+            raise ValueError("parent transaction escrow output does not match commitment")
+        return self
+
+
 class ParentMuSig2NoncePayload(BaseModel):
-    """A public MuSig2 nonce for a patched-LND parent signing attempt."""
+    """A public MuSig2 nonce for the committed parent transaction round."""
 
     model_config = _FROZEN_MODEL_CONFIG
 
     kind: Literal["parent_musig2_nonce"] = "parent_musig2_nonce"
-    attempt_id: str
+    round_id: str
     parent_txid: str
     public_nonce: str
 
-    @field_validator("attempt_id", "parent_txid")
+    @field_validator("round_id", "parent_txid")
     @classmethod
     def validate_identifiers(cls, value: str, info: object) -> str:
         return _validate_hex(
@@ -198,16 +306,16 @@ class ParentMuSig2NoncePayload(BaseModel):
 
 
 class ParentMuSig2PartialSignaturePayload(BaseModel):
-    """A MuSig2 partial signature for a patched-LND parent signing attempt."""
+    """A MuSig2 partial signature for the committed parent transaction round."""
 
     model_config = _FROZEN_MODEL_CONFIG
 
     kind: Literal["parent_musig2_partial_signature"] = "parent_musig2_partial_signature"
-    attempt_id: str
+    round_id: str
     parent_txid: str
     partial_signature: str
 
-    @field_validator("attempt_id", "parent_txid")
+    @field_validator("round_id", "parent_txid")
     @classmethod
     def validate_identifiers(cls, value: str, info: object) -> str:
         return _validate_hex(
@@ -218,6 +326,31 @@ class ParentMuSig2PartialSignaturePayload(BaseModel):
     @classmethod
     def validate_partial_signature(cls, value: str) -> str:
         return _validate_hex(value, byte_length=32, name="parent MuSig2 partial signature")
+
+
+class EndpointAbortReason(StrEnum):
+    """Safe endpoint-private escrow abort reason codes."""
+
+    TERMS_REJECTED = "terms_rejected"
+    PARENT_REJECTED = "parent_rejected"
+    SIGNING_FAILED = "signing_failed"
+    DEADLINE_EXPIRED = "deadline_expired"
+    LOCAL_SHUTDOWN = "local_shutdown"
+
+
+class EndpointAbortPayload(BaseModel):
+    """Endpoint-private protocol abort without free-text disclosure."""
+
+    model_config = _FROZEN_MODEL_CONFIG
+
+    kind: Literal["endpoint_abort"] = "endpoint_abort"
+    round_id: str
+    reason: EndpointAbortReason
+
+    @field_validator("round_id")
+    @classmethod
+    def validate_round_id(cls, value: str) -> str:
+        return _validate_hex(value, byte_length=32, name="round ID")
 
 
 class RecoveryStatusPayload(BaseModel):
@@ -254,16 +387,37 @@ class AcknowledgmentPayload(BaseModel):
 
 
 EscrowPeerPayload: TypeAlias = Annotated[
-    EndpointTermsPayload
+    EscrowInvoiceProposalPayload
+    | EndpointTermsPayload
     | EscrowPublicKeysPayload
     | TimeoutMuSig2NoncePayload
     | TimeoutMuSig2PartialSignaturePayload
+    | ParentPreparationPayload
     | ParentMuSig2NoncePayload
     | ParentMuSig2PartialSignaturePayload
+    | EndpointAbortPayload
     | RecoveryStatusPayload
     | AcknowledgmentPayload,
     Field(discriminator="kind"),
 ]
+
+_PARENT_ROUND_PAYLOAD_TYPES = (
+    ParentMuSig2NoncePayload,
+    ParentMuSig2PartialSignaturePayload,
+)
+_ESCROW_PEER_PAYLOAD_TYPES: tuple[type[BaseModel], ...] = (
+    EscrowInvoiceProposalPayload,
+    EndpointTermsPayload,
+    EscrowPublicKeysPayload,
+    TimeoutMuSig2NoncePayload,
+    TimeoutMuSig2PartialSignaturePayload,
+    ParentPreparationPayload,
+    ParentMuSig2NoncePayload,
+    ParentMuSig2PartialSignaturePayload,
+    EndpointAbortPayload,
+    RecoveryStatusPayload,
+    AcknowledgmentPayload,
+)
 
 
 class EscrowPeerBinding(BaseModel):
@@ -662,6 +816,45 @@ class EscrowPeerJournal:
             self._write(self._updated(record, outbound=record.outbound + (envelope,)))
             return envelope
 
+    def prepare_or_replay_outbound(
+        self, binding: EscrowPeerBinding, payload: EscrowPeerPayload
+    ) -> EscrowPeerEnvelope:
+        """Return an exact prior application envelope or persist a new semantic message."""
+        if isinstance(payload, AcknowledgmentPayload):
+            raise ChannelInputEscrowError(
+                "application escrow peer messages cannot be acknowledgments"
+            )
+        with self._lock(binding):
+            record = self._load(binding) or self._new_record(binding)
+            for envelope in record.outbound:
+                if isinstance(envelope.payload, AcknowledgmentPayload):
+                    continue
+                if envelope.payload == payload:
+                    return envelope
+                if envelope.payload.kind == payload.kind:
+                    if isinstance(payload, RecoveryStatusPayload):
+                        continue
+                    if (
+                        isinstance(payload, _PARENT_ROUND_PAYLOAD_TYPES)
+                        and isinstance(envelope.payload, _PARENT_ROUND_PAYLOAD_TYPES)
+                        and envelope.payload.round_id != payload.round_id
+                    ):
+                        continue
+                    raise ChannelInputEscrowError(
+                        "conflicting escrow peer semantic retry for protocol version 1"
+                    )
+            if len(record.outbound) >= MAX_JOURNAL_MESSAGES_PER_DIRECTION:
+                raise ChannelInputEscrowError("outbound escrow peer journal message limit exceeded")
+            previous = record.outbound[-1].message_id if record.outbound else None
+            envelope = EscrowPeerEnvelope.create(
+                binding=binding,
+                sequence=len(record.outbound) + 1,
+                previous_message_id=previous,
+                payload=payload,
+            )
+            self._write(self._updated(record, outbound=record.outbound + (envelope,)))
+            return envelope
+
     def prepare_acknowledgment(
         self, binding: EscrowPeerBinding, message_id: str
     ) -> EscrowPeerEnvelope:
@@ -817,11 +1010,32 @@ class EscrowPeerTransport:
             raise ChannelInputEscrowError("maker-ring escrow peer edge is unknown")
         return EscrowPeerBinding.from_authorization_record(record, self._local_node_id)
 
+    def prepare_or_replay(self, edge_id: str, payload: EscrowPeerPayload) -> EscrowPeerEnvelope:
+        """Durably select an exact outbound replay or prepare one new application message."""
+        return self._journal.prepare_or_replay_outbound(self.binding(edge_id), payload)
+
+    async def send_envelope(self, edge_id: str, envelope: EscrowPeerEnvelope) -> None:
+        """Transmit one exact outbound envelope that is already present in the local journal."""
+        if not isinstance(envelope, EscrowPeerEnvelope):
+            raise ChannelInputEscrowError("outbound escrow peer envelope is invalid")
+        binding = self.binding(edge_id)
+        if envelope not in self._journal.outbound(binding):
+            raise ChannelInputEscrowError("outbound escrow peer envelope is not durably persisted")
+        await self._send_envelope(binding, envelope)
+
+    def pending(self, edge_id: str) -> tuple[EscrowPeerEnvelope, ...]:
+        """Return accepted application messages that still require explicit completion."""
+        return self._journal.pending_inbound(self.binding(edge_id))
+
+    def complete(self, edge_id: str, message_id: str) -> None:
+        """Mark one accepted application message complete after durable application handling."""
+        self._journal.mark_dispatched(self.binding(edge_id), message_id)
+
     async def send(self, edge_id: str, payload: EscrowPeerPayload) -> EscrowPeerEnvelope:
         """Durably prepare, then send one new outbound maker-ring message."""
         binding = self.binding(edge_id)
         envelope = self._journal.prepare_outbound(binding, payload)
-        await self._send_envelope(binding, envelope)
+        await self.send_envelope(edge_id, envelope)
         return envelope
 
     async def accept(self, raw: RawReceivedCustomMessage) -> EscrowPeerEnvelope | None:
@@ -836,7 +1050,7 @@ class EscrowPeerTransport:
             return None
         acknowledgment = self._journal.prepare_acknowledgment(binding, envelope.message_id)
         try:
-            await self._send_envelope(binding, acknowledgment)
+            await self.send_envelope(binding.edge_id, acknowledgment)
         except Exception as exc:  # noqa: BLE001 - receipt stays durable for exact replay
             logger.warning(
                 "Unable to send escrow peer acknowledgment for {}: {}",
@@ -855,17 +1069,16 @@ class EscrowPeerTransport:
 
     async def pending_messages(self, edge_id: str) -> AsyncIterator[EscrowPeerEnvelope]:
         """Redeliver accepted application messages left incomplete across a restart."""
-        binding = self.binding(edge_id)
-        for envelope in self._journal.pending_inbound(binding):
+        for envelope in self.pending(edge_id):
             yield envelope
-            self._journal.mark_dispatched(binding, envelope.message_id)
+            self.complete(edge_id, envelope.message_id)
 
     async def replay(self, edge_id: str) -> tuple[EscrowPeerEnvelope, ...]:
         """Resend exact persisted outbound envelopes in their original order."""
         binding = self.binding(edge_id)
         envelopes = self._journal.outbound(binding)
         for envelope in envelopes:
-            await self._send_envelope(binding, envelope)
+            await self.send_envelope(edge_id, envelope)
         return envelopes
 
     async def _send_envelope(
@@ -908,3 +1121,145 @@ class EscrowPeerTransport:
             raise ChannelInputEscrowError(
                 "inbound escrow peer envelope does not match maker-ring binding"
             )
+
+
+class EscrowPeerBroker:
+    """Durable application delivery over one escrow peer transport subscription."""
+
+    def __init__(self, transport: EscrowPeerTransport) -> None:
+        if not isinstance(transport, EscrowPeerTransport):
+            raise ChannelInputEscrowError("escrow peer broker transport is invalid")
+        self._transport = transport
+        self._conditions: dict[str, asyncio.Condition] = {}
+        self._task: asyncio.Task[None] | None = None
+        self._terminal_error: Exception | None = None
+        self._closed = False
+
+    def start(self) -> None:
+        """Start the single custom-message subscription task once."""
+        if self._closed:
+            raise ChannelInputEscrowError("escrow peer broker is closed")
+        if self._terminal_error is not None:
+            return
+        if self._task is None:
+            self._task = asyncio.create_task(self._consume(), name="escrow-peer-broker")
+
+    async def close(self) -> None:
+        """Cancel and await the subscription task, waking any waiting receivers."""
+        if self._closed:
+            return
+        self._closed = True
+        task = self._task
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        await self._notify_all()
+
+    async def send(self, edge_id: str, payload: EscrowPeerPayload) -> EscrowPeerEnvelope:
+        """Transmit an atomically selected exact application envelope."""
+        envelope = self._transport.prepare_or_replay(edge_id, payload)
+        await self._transport.send_envelope(edge_id, envelope)
+        return envelope
+
+    def binding(self, edge_id: str) -> EscrowPeerBinding:
+        """Return the finalized transport binding for a known escrow edge."""
+        return self._transport.binding(edge_id)
+
+    def pending(self, edge_id: str) -> tuple[EscrowPeerEnvelope, ...]:
+        """Return durable application receipts not yet completed by a consumer."""
+        return self._transport.pending(edge_id)
+
+    async def receive(
+        self,
+        edge_id: str,
+        expected_type: type[BaseModel] | tuple[type[BaseModel], ...],
+        *,
+        predicate: Callable[[EscrowPeerEnvelope], bool] | None = None,
+        timeout: float | None = None,
+    ) -> EscrowPeerEnvelope:
+        """Return the first matching durable receipt without marking it complete."""
+        expected_types = self._validate_expected_type(expected_type)
+        self.start()
+        condition = self._conditions.setdefault(edge_id, asyncio.Condition())
+        try:
+            async with asyncio.timeout(timeout):
+                async with condition:
+                    while True:
+                        for envelope in self._transport.pending(edge_id):
+                            if isinstance(envelope.payload, expected_types) and (
+                                predicate is None or predicate(envelope)
+                            ):
+                                return envelope
+                        self._raise_terminal_error()
+                        if self._closed:
+                            raise ChannelInputEscrowError("escrow peer broker is closed")
+                        await condition.wait()
+        except TimeoutError as exc:
+            raise ChannelInputEscrowError("timed out waiting for escrow peer message") from exc
+
+    def complete(self, envelope: EscrowPeerEnvelope) -> None:
+        """Complete exactly one bound inbound receipt after application persistence."""
+        if not isinstance(envelope, EscrowPeerEnvelope):
+            raise ChannelInputEscrowError("inbound escrow peer envelope is invalid")
+        binding = self._transport.binding(envelope.edge_id)
+        if (
+            envelope.sender_node_id != binding.peer_node_id
+            or envelope.recipient_node_id != binding.local_node_id
+            or envelope.authorization_id != binding.authorization_id
+            or envelope.session_id != binding.session_id
+            or envelope.channel_point != binding.channel_point
+        ):
+            raise ChannelInputEscrowError("inbound escrow peer envelope binding is invalid")
+        if envelope not in self._transport.pending(envelope.edge_id):
+            raise ChannelInputEscrowError("inbound escrow peer envelope is not pending")
+        self._transport.complete(envelope.edge_id, envelope.message_id)
+
+    async def _consume(self) -> None:
+        try:
+            async for raw in self._transport._backend.subscribe_custom_messages(
+                ESCROW_PEER_CUSTOM_MESSAGE_TYPE
+            ):
+                envelope = EscrowPeerEnvelope.decode(raw.data)
+                await self._transport.accept(raw)
+                if envelope.message_id in {
+                    item.message_id for item in self._transport.pending(envelope.edge_id)
+                }:
+                    await self._notify_edge(envelope.edge_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - normalize backend and decoder failures for receivers
+            self._terminal_error = exc
+            await self._notify_all()
+        else:
+            self._terminal_error = RuntimeError("escrow peer custom-message subscription ended")
+            await self._notify_all()
+
+    async def _notify_edge(self, edge_id: str) -> None:
+        condition = self._conditions.get(edge_id)
+        if condition is None:
+            return
+        async with condition:
+            condition.notify_all()
+
+    async def _notify_all(self) -> None:
+        for condition in tuple(self._conditions.values()):
+            async with condition:
+                condition.notify_all()
+
+    def _raise_terminal_error(self) -> None:
+        if self._terminal_error is not None:
+            raise ChannelInputEscrowError(
+                "escrow peer subscription failed"
+            ) from self._terminal_error
+
+    @staticmethod
+    def _validate_expected_type(
+        expected_type: type[BaseModel] | tuple[type[BaseModel], ...],
+    ) -> tuple[type[BaseModel], ...]:
+        expected_types = (expected_type,) if isinstance(expected_type, type) else expected_type
+        if not expected_types or not all(
+            isinstance(item, type) and item in _ESCROW_PEER_PAYLOAD_TYPES for item in expected_types
+        ):
+            raise ChannelInputEscrowError("expected type must be an escrow peer payload model")
+        return expected_types

@@ -73,6 +73,7 @@ class ExternalFundingLightning(Protocol):
         address: str,
         channel_amount_sats: int,
         push_to_counterparty_msat: int | None = None,
+        user_channel_id: str | None = None,
     ) -> str: ...
 
     async def get_funding_output(self, user_channel_id: str) -> tuple[bool, str, int]: ...
@@ -99,6 +100,7 @@ async def request_external_channel_funding(
     push_to_counterparty_msat: int | None = None,
     poll_interval: float = 1.0,
     timeout: float = 60.0,
+    user_channel_id: str | None = None,
 ) -> tuple[str, str]:
     """Open an externally-funded channel and return ``(user_channel_id, address)``.
 
@@ -113,12 +115,22 @@ async def request_external_channel_funding(
         raise LightningError(
             "channel push must be a non-negative whole-satoshi amount below capacity"
         )
-    user_channel_id = await ldk.open_channel_external_funding(
-        peer_node_id,
-        peer_address,
-        amount_sats,
-        push_to_counterparty_msat=push_to_counterparty_msat,
-    )
+    if user_channel_id is not None:
+        opened_channel_id = await ldk.open_channel_external_funding(
+            peer_node_id,
+            peer_address,
+            amount_sats,
+            push_to_counterparty_msat=push_to_counterparty_msat,
+            user_channel_id=user_channel_id,
+        )
+    else:
+        opened_channel_id = await ldk.open_channel_external_funding(
+            peer_node_id,
+            peer_address,
+            amount_sats,
+            push_to_counterparty_msat=push_to_counterparty_msat,
+        )
+    user_channel_id = opened_channel_id
     try:
         deadline = asyncio.get_event_loop().time() + timeout
         while asyncio.get_event_loop().time() < deadline:

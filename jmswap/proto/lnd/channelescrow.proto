@@ -93,6 +93,12 @@ message StatusResponse {
     uint32 stage = 1;
     bytes parent_txid = 2;
     bool finalized = 3;
+    bytes durable_local_public_nonce = 4;
+    bytes durable_remote_public_nonce = 5;
+    bytes durable_local_partial_signature = 6;
+    bytes finalized_parent_tx = 7;
+    bytes active_attempt_id = 8;
+    bytes active_local_public_nonce = 9;
 }
 
 message CancelRequest {
