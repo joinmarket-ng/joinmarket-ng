@@ -30,9 +30,9 @@ repos:
     rev: v6.0.0
     hooks:
       - id: trailing-whitespace
-        exclude: '^ldk_server/patches/.*\.patch$'
+        exclude: '^(ldk_server|lnd)/patches/.*\.patch$'
       - id: end-of-file-fixer
-        exclude: '^ldk_server/patches/.*\.patch$'
+        exclude: '^(ldk_server|lnd)/patches/.*\.patch$'
       - id: check-yaml
       - id: check-added-large-files
       - id: check-merge-conflict
