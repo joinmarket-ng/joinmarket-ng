@@ -1,0 +1,65 @@
+From 9781d8ba1fb9bc4de8756d7d538c248067d0ff32 Mon Sep 17 00:00:00 2001
+From: m0wer <m0wer@sgn.space>
+Date: Sun, 16 Aug 2026 13:49:00 +0200
+Subject: [PATCH] fix(channelescrowrpc): omit unprepared parent txid
+
+Changelog: Avoid reporting a zero parent transaction ID before parent preparation
+---
+ lnrpc/channelescrowrpc/server.go      | 15 ++++++++++++++-
+ lnrpc/channelescrowrpc/server_test.go | 18 ++++++++++++++++++
+ 2 files changed, 32 insertions(+), 1 deletion(-)
+
+diff --git a/lnrpc/channelescrowrpc/server.go b/lnrpc/channelescrowrpc/server.go
+index 5098194..fa3fe41 100644
+--- a/lnrpc/channelescrowrpc/server.go
++++ b/lnrpc/channelescrowrpc/server.go
+@@ -504,7 +504,20 @@ func (s *Server) Status(_ context.Context, req *StatusRequest) (*StatusResponse,
+ 	if err != nil || record.SessionID != sessionID {
+ 		return nil, channeldb.ErrEscrowSessionMismatch
+ 	}
+-	return &StatusResponse{Stage: uint32(record.Stage), ParentTxid: record.ParentTxID[:], Finalized: record.Stage == channeldb.EscrowFinalized}, nil
++	return statusResponse(record), nil
++}
++
++func statusResponse(record *channeldb.EscrowRecord) *StatusResponse {
++	var parentTxID []byte
++	if record.Stage >= channeldb.EscrowParentPrepared {
++		parentTxID = record.ParentTxID[:]
++	}
++
++	return &StatusResponse{
++		Stage:      uint32(record.Stage),
++		ParentTxid: parentTxID,
++		Finalized:  record.Stage == channeldb.EscrowFinalized,
++	}
+ }
+ 
+ func (s *Server) Cancel(_ context.Context, req *CancelRequest) (*CancelResponse, error) {
+diff --git a/lnrpc/channelescrowrpc/server_test.go b/lnrpc/channelescrowrpc/server_test.go
+index 1210afe..dc1a5ac 100644
+--- a/lnrpc/channelescrowrpc/server_test.go
++++ b/lnrpc/channelescrowrpc/server_test.go
+@@ -432,3 +432,21 @@ func TestSignedAttemptRequiresSameRemoteNonce(t *testing.T) {
+ 	require.False(t, attempt.acceptsRemoteNonce(otherNonce))
+ 	require.Len(t, attempt.partial, 32)
+ }
++
++func TestStatusOmitsUnpreparedParentTxID(t *testing.T) {
++	t.Parallel()
++
++	locked := statusResponse(&channeldb.EscrowRecord{
++		Stage:      channeldb.EscrowLocked,
++		ParentTxID: chainhash.Hash{1},
++	})
++	require.Empty(t, locked.ParentTxid)
++	require.False(t, locked.Finalized)
++
++	prepared := statusResponse(&channeldb.EscrowRecord{
++		Stage:      channeldb.EscrowParentPrepared,
++		ParentTxID: chainhash.Hash{2},
++	})
++	expectedParentTxID := chainhash.Hash{2}
++	require.Equal(t, expectedParentTxID[:], prepared.ParentTxid)
++}
+-- 
+2.55.0

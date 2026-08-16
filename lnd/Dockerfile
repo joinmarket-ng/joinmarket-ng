@@ -11,7 +11,7 @@ RUN git clone https://github.com/lightningnetwork/lnd.git \
         /go/src/github.com/lightningnetwork/lnd \
     && cd /go/src/github.com/lightningnetwork/lnd \
     && git -c advice.detachedHead=false checkout "${LND_REV}" \
-    && git apply /patches/0001-feat-channelescrowrpc-add-exact-parent-channel-escro.patch \
+    && git apply /patches/*.patch \
     && make release-install
 
 FROM alpine:3.22
