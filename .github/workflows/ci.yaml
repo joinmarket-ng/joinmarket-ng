@@ -68,6 +68,11 @@ jobs:
             image: taker
             target: ""
             tag_suffix: ""
+          - name: lnd-channel-escrow
+            dockerfile: ./lnd/Dockerfile
+            image: lnd-channel-escrow
+            target: ""
+            tag_suffix: ""
           - name: jam-ng
             dockerfile: ./jmwalletd/Dockerfile
             image: jam-ng
