@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import os
 import secrets
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Any, ClassVar
@@ -37,6 +38,11 @@ from loguru import logger
 
 from jmswap.channel_escrow import ChannelSnapshot, EscrowOutpoint
 from jmswap.channel_funding import ChannelInputEscrowCapability
+from jmswap.peer_transport import (
+    ESCROW_PEER_CUSTOM_MESSAGE_TYPE,
+    MAX_LND_CUSTOM_MESSAGE_PAYLOAD,
+    RawReceivedCustomMessage,
+)
 
 # BIP-174 per-input witness UTXO key type.
 _PSBT_IN_WITNESS_UTXO = 0x01
@@ -46,6 +52,54 @@ _PSBT_IN_WITNESS_UTXO = 0x01
 os.environ.setdefault("GRPC_SSL_CIPHER_SUITES", "HIGH+ECDSA")
 
 _PSBT_MAGIC = b"\x70\x73\x62\x74\xff"
+
+# BOLT custom message types occupy the upper half of the uint16 type space. The wire
+# message includes the two-byte type, leaving 65,533 bytes for the payload.
+LND_CUSTOM_MESSAGE_TYPE_MIN = 32_768
+LND_CUSTOM_MESSAGE_TYPE_MAX = 65_535
+LND_CUSTOM_MESSAGE_MAX_DATA_SIZE = MAX_LND_CUSTOM_MESSAGE_PAYLOAD
+JOINMARKET_ESCROW_MESSAGE_TYPE = ESCROW_PEER_CUSTOM_MESSAGE_TYPE
+
+
+def _validate_compressed_node_id_bytes(peer_node_id: bytes) -> bytes:
+    if not isinstance(peer_node_id, bytes):
+        raise ValueError("peer node ID must be bytes")
+    if len(peer_node_id) != 33 or peer_node_id[0] not in (0x02, 0x03):
+        raise ValueError("peer node ID must be a 33-byte compressed public key")
+    return peer_node_id
+
+
+def _validate_compressed_node_id(peer_node_id: str) -> bytes:
+    if not isinstance(peer_node_id, str) or len(peer_node_id) != 66:
+        raise ValueError("peer node ID must be a 33-byte compressed public key hex string")
+    try:
+        peer = bytes.fromhex(peer_node_id)
+    except ValueError as exc:
+        raise ValueError("peer node ID must be a 33-byte compressed public key hex string") from exc
+    return _validate_compressed_node_id_bytes(peer)
+
+
+def _validate_custom_message_type(message_type: int) -> int:
+    if isinstance(message_type, bool) or not isinstance(message_type, int):
+        raise ValueError("custom message type must be an integer")
+    if not LND_CUSTOM_MESSAGE_TYPE_MIN <= message_type <= LND_CUSTOM_MESSAGE_TYPE_MAX:
+        raise ValueError(
+            f"custom message type must be in {LND_CUSTOM_MESSAGE_TYPE_MIN}.."
+            f"{LND_CUSTOM_MESSAGE_TYPE_MAX}"
+        )
+    return message_type
+
+
+def _validate_custom_message_data(data: bytes) -> bytes:
+    if not isinstance(data, bytes):
+        raise ValueError("custom message data must be bytes")
+    if not data:
+        raise ValueError("custom message data cannot be empty")
+    if len(data) > LND_CUSTOM_MESSAGE_MAX_DATA_SIZE:
+        raise ValueError(
+            f"custom message data must be at most {LND_CUSTOM_MESSAGE_MAX_DATA_SIZE} bytes"
+        )
+    return data
 
 
 def _psbt_kv(key_type: int, value: bytes) -> bytes:
@@ -222,6 +276,42 @@ class LndBackend:
         except Exception as e:  # noqa: BLE001 - already-connected is benign
             if "already connected" not in str(e).lower():
                 raise
+
+    async def send_custom_message(
+        self,
+        peer_node_id: str,
+        data: bytes,
+        message_type: int = JOINMARKET_ESCROW_MESSAGE_TYPE,
+    ) -> None:
+        """Queue one JoinMarket custom message for an authenticated LND peer."""
+        peer = _validate_compressed_node_id(peer_node_id)
+        payload = _validate_custom_message_data(data)
+        custom_type = _validate_custom_message_type(message_type)
+        self._ensure()
+        from jmswap.lndrpc import lightning_pb2 as ln
+
+        response = await self._stub.SendCustomMessage(
+            ln.SendCustomMessageRequest(peer=peer, type=custom_type, data=payload)
+        )
+        status = str(response.status).strip()
+        if status != "message sent successfully":
+            raise RuntimeError(f"LND returned an unexpected custom message status: {status}")
+
+    async def subscribe_custom_messages(
+        self, message_type: int = JOINMARKET_ESCROW_MESSAGE_TYPE
+    ) -> AsyncIterator[RawReceivedCustomMessage]:
+        """Yield validated inbound messages of one LND custom type."""
+        custom_type = _validate_custom_message_type(message_type)
+        self._ensure()
+        from jmswap.lndrpc import lightning_pb2 as ln
+
+        stream = self._stub.SubscribeCustomMessages(ln.SubscribeCustomMessagesRequest())
+        async for message in stream:
+            if message.type != custom_type:
+                continue
+            peer = _validate_compressed_node_id_bytes(message.peer)
+            data = _validate_custom_message_data(message.data)
+            yield RawReceivedCustomMessage(peer_node_id=peer.hex(), data=data)
 
     @staticmethod
     def _escrow_session_id(session_id: str) -> bytes:

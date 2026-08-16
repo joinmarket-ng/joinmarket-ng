@@ -7,6 +7,7 @@ witness-UTXO-bearing unsigned PSBT, and PsbtVerify-then-PsbtFinalize on completi
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from pathlib import Path
 
 import pytest
@@ -18,7 +19,13 @@ from jmcore.bitcoin import (
     serialize_transaction,
 )
 
-from jmswap.lnd import LndBackend, LndEscrowStage, unsigned_psbt_from_tx
+from jmswap.lnd import (
+    JOINMARKET_ESCROW_MESSAGE_TYPE,
+    LND_CUSTOM_MESSAGE_MAX_DATA_SIZE,
+    LndBackend,
+    LndEscrowStage,
+    unsigned_psbt_from_tx,
+)
 from jmswap.lndrpc import channelescrow_pb2 as escrow
 from jmswap.lndrpc import lightning_pb2 as ln
 
@@ -66,10 +73,30 @@ class _FakeStream:
         return self._update
 
 
+class _FakeCustomMessageStream:
+    def __init__(self, messages: list[ln.CustomMessage]) -> None:
+        self._messages = messages
+        self._index = 0
+
+    def __aiter__(self) -> AsyncIterator[ln.CustomMessage]:
+        return self
+
+    async def __anext__(self) -> ln.CustomMessage:
+        if self._index >= len(self._messages):
+            raise StopAsyncIteration
+        message = self._messages[self._index]
+        self._index += 1
+        return message
+
+
 class _FakeStub:
     def __init__(self) -> None:
         self.open_request: ln.OpenChannelRequest | None = None
         self.funding_steps: list[ln.FundingTransitionMsg] = []
+        self.custom_message_request: ln.SendCustomMessageRequest | None = None
+        self.subscribe_custom_messages_request: ln.SubscribeCustomMessagesRequest | None = None
+        self.custom_message_send_status = "message sent successfully"
+        self.custom_message_stream: list[ln.CustomMessage] = []
 
     def OpenChannel(self, req: ln.OpenChannelRequest) -> _FakeStream:  # noqa: N802
         self.open_request = req
@@ -89,6 +116,18 @@ class _FakeStub:
     ) -> ln.FundingStateStepResp:
         self.funding_steps.append(msg)
         return ln.FundingStateStepResp()
+
+    async def SendCustomMessage(  # noqa: N802
+        self, request: ln.SendCustomMessageRequest
+    ) -> ln.SendCustomMessageResponse:
+        self.custom_message_request = request
+        return ln.SendCustomMessageResponse(status=self.custom_message_send_status)
+
+    def SubscribeCustomMessages(  # noqa: N802
+        self, request: ln.SubscribeCustomMessagesRequest
+    ) -> _FakeCustomMessageStream:
+        self.subscribe_custom_messages_request = request
+        return _FakeCustomMessageStream(self.custom_message_stream)
 
 
 class _FakeEscrowStub:
@@ -185,6 +224,98 @@ async def test_open_uses_simple_taproot_private_psbt_shim() -> None:
     assert ready is True
     assert value == 1_500_000
     assert spk_hex  # address converted to a scriptpubkey
+
+
+async def test_send_custom_message_uses_default_escrow_type() -> None:
+    backend = LndBackend(host="x", tls_cert=b"", macaroon_hex="")
+    stub = _FakeStub()
+    backend._stub = stub
+    peer_node_id = "02" + "ab" * 32
+
+    await backend.send_custom_message(peer_node_id, b"escrow payload")
+
+    request = stub.custom_message_request
+    assert request is not None
+    assert request.peer == bytes.fromhex(peer_node_id)
+    assert request.type == JOINMARKET_ESCROW_MESSAGE_TYPE
+    assert request.data == b"escrow payload"
+
+
+async def test_send_custom_message_rejects_invalid_peer_type_and_data() -> None:
+    backend = LndBackend(host="x", tls_cert=b"", macaroon_hex="")
+    backend._stub = _FakeStub()
+
+    with pytest.raises(ValueError, match="compressed public key"):
+        await backend.send_custom_message("04" + "ab" * 32, b"payload")
+    with pytest.raises(ValueError, match="32768..65535"):
+        await backend.send_custom_message("02" + "ab" * 32, b"payload", 32_767)
+    with pytest.raises(ValueError, match="integer"):
+        await backend.send_custom_message("02" + "ab" * 32, b"payload", True)
+    with pytest.raises(ValueError, match="cannot be empty"):
+        await backend.send_custom_message("02" + "ab" * 32, b"")
+    with pytest.raises(ValueError, match="must be bytes"):
+        await backend.send_custom_message("02" + "ab" * 32, bytearray(b"payload"))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="at most"):
+        await backend.send_custom_message(
+            "02" + "ab" * 32, b"x" * (LND_CUSTOM_MESSAGE_MAX_DATA_SIZE + 1)
+        )
+
+
+async def test_subscribe_custom_messages_filters_other_types() -> None:
+    backend = LndBackend(host="x", tls_cert=b"", macaroon_hex="")
+    stub = _FakeStub()
+    stub.custom_message_stream = [
+        ln.CustomMessage(peer=bytes.fromhex("02" + "aa" * 32), type=50_000, data=b"ignored"),
+        ln.CustomMessage(
+            peer=bytes.fromhex("03" + "bb" * 32),
+            type=JOINMARKET_ESCROW_MESSAGE_TYPE,
+            data=b"escrow payload",
+        ),
+    ]
+    backend._stub = stub
+
+    messages = [message async for message in backend.subscribe_custom_messages()]
+
+    assert stub.subscribe_custom_messages_request is not None
+    assert messages[0].peer_node_id == "03" + "bb" * 32
+    assert messages[0].data == b"escrow payload"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        ln.CustomMessage(
+            peer=bytes.fromhex("04" + "aa" * 32),
+            type=JOINMARKET_ESCROW_MESSAGE_TYPE,
+            data=b"payload",
+        ),
+        ln.CustomMessage(
+            peer=bytes.fromhex("02" + "aa" * 32),
+            type=JOINMARKET_ESCROW_MESSAGE_TYPE,
+            data=b"",
+        ),
+    ],
+)
+async def test_subscribe_custom_messages_rejects_malformed_selected_message(
+    message: ln.CustomMessage,
+) -> None:
+    backend = LndBackend(host="x", tls_cert=b"", macaroon_hex="")
+    stub = _FakeStub()
+    stub.custom_message_stream = [message]
+    backend._stub = stub
+
+    with pytest.raises(ValueError):
+        await anext(backend.subscribe_custom_messages())
+
+
+async def test_send_custom_message_rejects_explicit_failure_status() -> None:
+    backend = LndBackend(host="x", tls_cert=b"", macaroon_hex="")
+    stub = _FakeStub()
+    stub.custom_message_send_status = "message failed"
+    backend._stub = stub
+
+    with pytest.raises(RuntimeError, match="unexpected custom message status"):
+        await backend.send_custom_message("02" + "ab" * 32, b"payload")
 
 
 def test_from_paths_loads_scoped_escrow_macaroon(tmp_path: Path) -> None:

@@ -107,6 +107,22 @@ from jmswap.models import (
     SwapState,
 )
 from jmswap.nostr import SwapNostrNode
+from jmswap.peer_transport import (
+    ESCROW_PEER_CUSTOM_MESSAGE_TYPE,
+    AcknowledgmentPayload,
+    EndpointTermsPayload,
+    EscrowPeerBinding,
+    EscrowPeerEnvelope,
+    EscrowPeerJournal,
+    EscrowPeerTransport,
+    EscrowProtocolRole,
+    EscrowPublicKeysPayload,
+    ParentMuSig2NoncePayload,
+    ParentMuSig2PartialSignaturePayload,
+    RecoveryStatusPayload,
+    TimeoutMuSig2NoncePayload,
+    TimeoutMuSig2PartialSignaturePayload,
+)
 from jmswap.persistence import SwapStore
 from jmswap.recovery import is_refundable, refund
 from jmswap.ring_authorization import (
@@ -122,6 +138,7 @@ from jmswap.swap_tree import SwapTree, verify_swap_tree
 from jmswap.wallet import FakeSwapWallet, SwapWallet
 
 __all__ = [
+    "AcknowledgmentPayload",
     "ChainBackend",
     "ChainError",
     "ChainObservationRequest",
@@ -145,6 +162,12 @@ __all__ = [
     "EscrowOutpoint",
     "EscrowParentBroadcast",
     "EscrowParentEvidence",
+    "EscrowPeerBinding",
+    "EscrowPeerEnvelope",
+    "EscrowPeerJournal",
+    "EscrowPeerTransport",
+    "EscrowProtocolRole",
+    "EscrowPublicKeysPayload",
     "EscrowRouteEvidence",
     "EscrowSpendResult",
     "EscrowTimeoutBroadcast",
@@ -156,6 +179,8 @@ __all__ = [
     "ParentAuthorization",
     "ParentAuthorizationRequest",
     "ParentBroadcastRequest",
+    "ParentMuSig2NoncePayload",
+    "ParentMuSig2PartialSignaturePayload",
     "PaymentObservationRequest",
     "PreparedChannelInputEscrow",
     "PrepareTimeoutRequest",
@@ -163,6 +188,7 @@ __all__ = [
     "REQUIRED_CHANNEL_INPUT_ESCROW_CAPABILITIES",
     "RecoveryBroadcastResult",
     "RecoveryRequest",
+    "RecoveryStatusPayload",
     "RingChannelPoint",
     "RingEdgeAuthorization",
     "RingEdgeAuthorizationRecord",
@@ -187,7 +213,11 @@ __all__ = [
     "SwapVerificationError",
     "SwapWallet",
     "SuccessSpendRequest",
+    "TimeoutMuSig2NoncePayload",
+    "TimeoutMuSig2PartialSignaturePayload",
     "UnsignedTimeoutSpend",
+    "EndpointTermsPayload",
+    "ESCROW_PEER_CUSTOM_MESSAGE_TYPE",
     "build_success_spend",
     "build_timeout_spend",
     "channel_funding_address",
