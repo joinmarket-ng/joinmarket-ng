@@ -46,14 +46,13 @@ The provider is always the swap "server" and never pays a swap fee:
   ``complete_external_channel_funding`` (the maker uses the returned funding
   address as its CoinJoin change output, then supplies the resulting outpoint).
   This is validated live: a channel opens with its funding output supplied by an
-  external transaction. The single-maker model needs no maker-to-maker
-  coordination: makers do not know which other makers are in a round, so a
-  maker simply channelizes *its own* change. It opens an externally-funded
-  channel to an LN peer of its own choosing for its (deterministically computed)
-  change amount and hands the taker the channel's funding address as an ordinary
-  change address; the taker builds and broadcasts the CoinJoin as usual, and the
-  maker supplies the resulting outpoint after validation (before signing for LND,
-  after signing for the LDK Server backend).
+  external transaction. That validates the funding primitive, not an external-peer
+  privacy deployment. Makers do not coordinate directly; the taker pairs CoinJoin
+  participants, and each maker channelizes *its own* change with its selected partner
+  for the deterministically computed amount. The maker hands the taker the channel's
+  funding address as an ordinary change address; the taker builds and broadcasts the
+  CoinJoin as usual, and the maker supplies the resulting outpoint after validation
+  (before signing for LND, after signing for the LDK Server backend).
   The exact-change-amount bookkeeping in the live CoinJoin is implemented and
   validated end to end (a maker opens a real channel from its CoinJoin change in
   a real maker<->taker round).
@@ -90,6 +89,32 @@ the full lifecycle declared by `jmswap.ChannelInputEscrowCapability`:
 LND and the current LDK Server adapter explicitly declare an empty capability set.
 External channel funding APIs do not satisfy any part of this boundary merely by
 returning a new channel funding address.
+
+`jmswap.ChannelInputEscrowBackend` is the typed adapter contract for a future
+implementation. Its strict request and evidence models bind the quiescent channel
+snapshot, exact parent, fully signed timeout child, parent authorization, fresh chain
+observation, single-part route, payment result, and success or timeout broadcast to one
+session. `require_channel_input_escrow_backend` requires both every declared capability
+and every protocol method, so partial adapters fail closed.
+
+`ChannelInputEscrowRecord` enforces the authorization and recovery ordering, retains the
+prior state across a parent reorganization, and rejects persisted states that lack their
+required evidence. Confirmation and terminal states require exact-parent, descendant, or
+conflict observations at their required confirmation depths. Payment attempts retain the fresh
+confirmation-gated request, late peer settlement remains recoverable but is classified as a
+protocol violation, and success fee replacements plus reorganization rebroadcast attempts
+remain durable. `ChannelInputEscrowStore` serializes each session with a file lock, rejects
+stale or colliding revisions, writes records atomically, syncs both the file and directory,
+uses collision-resistant hashed filenames, and rejects session-file substitution. These
+records contain private invoice, balance, timeout, and preimage-related artifacts and must
+remain inside the maker endpoint; they are not taker messages or aggregate-log data.
+
+The evidence fields such as `invoice_verified`, `signature_verified`, and
+`exact_transaction_verified` are adapter attestations. The typed boundary validates their
+presence, cross-artifact identities, economic equations, confirmation gate, route exclusion,
+CLTV inequalities, and broadcast budgets. It does not itself decode BOLT 11 invoices,
+verify Bitcoin signatures or scripts, inspect a node's route, or broadcast transactions.
+A production adapter must perform those operations before setting the evidence fields.
 
 ### Channel-as-change is maker-to-maker only
 

@@ -27,6 +27,10 @@ class LightningError(SwapError):
     """The Lightning backend reported a failure."""
 
 
+class ChannelInputEscrowError(SwapError):
+    """A channel-input escrow lifecycle or backend boundary check failed."""
+
+
 class ChainError(SwapError):
     """The chain backend reported a failure (broadcast, lookup)."""
 

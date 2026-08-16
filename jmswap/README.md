@@ -59,6 +59,9 @@ SwapServer (provider)        SwapClient (user)
   (NIP-04 DMs, kind 25582). A `LoopbackRelay` runs the whole protocol in-process.
 - `SwapStore` / `jmswap.recovery` - crash-safe contract persistence and timelock
   refund recovery so an in-flight swap survives a restart.
+- `ChannelInputEscrowBackend` - a fail-closed typed boundary for a future
+  confirmation-gated existing-channel escrow backend. Current LND and LDK adapters
+  explicitly declare this lifecycle unsupported.
 
 Inside JoinMarket, the maker runs the provider as a background task when
 `[maker.swap_provider]` is enabled, using `maker.swap_adapter` to bind the swap

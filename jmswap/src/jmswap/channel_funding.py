@@ -39,6 +39,7 @@ class ChannelInputEscrowCapability(StrEnum):
     EXCLUDE_CONSUMED_CHANNEL = "exclude_consumed_channel"
     PERSIST_RECOVERY_STATE = "persist_recovery_state"
     REBROADCAST_RECOVERY = "rebroadcast_recovery"
+    FEE_BUMP_SUCCESS_SPEND = "fee_bump_success_spend"
 
 
 REQUIRED_CHANNEL_INPUT_ESCROW_CAPABILITIES = frozenset(ChannelInputEscrowCapability)
