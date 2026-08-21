@@ -2358,6 +2358,7 @@ async def test_select_our_utxos_uses_absolute_fee_for_tr0abs():
     mock_wallet.get_next_address_index.return_value = 0
     mock_wallet.get_change_address.return_value = "bcrt1pcjorchange"
     mock_wallet.get_locked_input_outpoints.return_value = set()
+    mock_wallet.get_maker_rotation_lineage_outpoints = AsyncMock(return_value=set())
     mock_wallet.reserve_coinjoin_inputs.return_value = True
     mock_wallet.select_utxos_with_merge.return_value = [
         UTXOInfo(

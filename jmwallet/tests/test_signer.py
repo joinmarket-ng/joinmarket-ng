@@ -153,6 +153,7 @@ class TestSignInputP2TR:
             mixdepth=0,
         )
         tx = _single_input_tx()
+        tx.inputs[0].txid_le = bytes.fromhex(utxo.txid)[::-1]
 
         signed = wallet_service.sign_input(
             tx,

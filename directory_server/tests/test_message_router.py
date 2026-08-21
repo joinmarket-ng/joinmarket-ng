@@ -618,7 +618,7 @@ class TestOfferTracking:
         payload = f"{maker.nick}!PUBLIC!tr0reloffer 0 30000 72590 0 0.001"
         envelope = MessageEnvelope(message_type=MessageType.PUBMSG, payload=payload)
 
-        await router._handle_public_message(envelope, maker.location_string)
+        await router._handle_public_message(envelope, maker.nick)
 
         stats = router.get_offer_stats()
         assert stats["total_offers"] == 1
