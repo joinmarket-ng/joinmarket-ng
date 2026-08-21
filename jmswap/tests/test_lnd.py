@@ -21,6 +21,8 @@ from jmswap.lnd import (
     COFUNDED_CHANNEL_RING_V1_CAPABLE,
     FINAL_TAPROOT_COMMITMENT,
     AcceptorBounds,
+    ChannelInputCandidate,
+    ChannelInputForceCloseOutcome,
     EndpointRole,
     EscrowOutpoint,
     ExternalChannelRequest,
@@ -68,13 +70,18 @@ FUNDEE_RESERVE = 15_000
 
 
 class FakeStream:
-    def __init__(self, update: Any = None, *, delay: float = 0) -> None:
+    def __init__(
+        self, update: Any = None, *, delay: float = 0, error: Exception | None = None
+    ) -> None:
         self.update = update
         self.delay = delay
+        self.error = error
 
     async def read(self) -> Any:
         if self.delay:
             await asyncio.sleep(self.delay)
+        if self.error is not None:
+            raise self.error
         return self.update
 
 
@@ -119,6 +126,12 @@ class FakeStub:
         self.abandon_requests: list[Any] = []
         self.abandon_error: Exception | None = None
         self.keep_pending_after_abandon = False
+        self.list_channels_response = ln.ListChannelsResponse()
+        self.list_channels_delay = 0.0
+        self.list_channels_error: Exception | None = None
+        self.close_requests: list[Any] = []
+        self.close_stream = FakeStream()
+        self.close_error: Exception | None = None
 
     async def GetInfo(self, _request: Any) -> Any:  # noqa: N802
         return ln.GetInfoResponse(
@@ -167,6 +180,19 @@ class FakeStub:
         if self.pending_responses:
             return self.pending_responses[0]
         return ln.PendingChannelsResponse()
+
+    async def ListChannels(self, _request: Any) -> Any:  # noqa: N802
+        if self.list_channels_delay:
+            await asyncio.sleep(self.list_channels_delay)
+        if self.list_channels_error is not None:
+            raise self.list_channels_error
+        return self.list_channels_response
+
+    def CloseChannel(self, request: Any) -> FakeStream:  # noqa: N802
+        self.close_requests.append(request)
+        if self.close_error is not None:
+            raise self.close_error
+        return self.close_stream
 
     async def AbandonChannel(self, request: Any) -> Any:  # noqa: N802
         self.abandon_requests.append(request)
@@ -405,6 +431,33 @@ def escrow_target() -> tuple[LndBackend, FakeEscrowStub, EscrowOutpoint]:
     return target, escrow_stub, EscrowOutpoint(txid="aa" * 32, vout=0)
 
 
+def listed_channel(**changes: Any) -> Any:
+    values: dict[str, Any] = {
+        "active": True,
+        "remote_pubkey": OPENER_ID,
+        "channel_point": f"{'11' * 32}:1",
+        "chan_id": 42,
+        "capacity": CAPACITY,
+        "local_balance": PUSH,
+        "remote_balance": CAPACITY - PUSH,
+        "pending_htlcs": [],
+        "private": True,
+        "chan_status_flags": "ChanStatusDefault",
+        "commitment_type": FINAL_TAPROOT_COMMITMENT,
+    }
+    values.update(changes)
+    return ln.Channel(**values)
+
+
+def signed_escrow_status(escrow_stub: FakeEscrowStub) -> str:
+    escrow_stub.stage = LndEscrowStage.PARENT_SIGNED
+    escrow_stub.parent_txid = b"\x88" * 32
+    escrow_stub.durable_local_public_nonce = b"l" * 66
+    escrow_stub.durable_remote_public_nonce = b"r" * 66
+    escrow_stub.durable_local_partial_signature = b"s" * 32
+    return "88" * 32
+
+
 def test_lnd_constructor_and_from_paths_remain_compatible(tmp_path: Path) -> None:
     legacy = LndBackend("localhost:10009", b"cert", "admin")
     assert legacy.escrow_macaroon_hex is None
@@ -479,6 +532,202 @@ async def test_channel_escrow_cancel_uses_pre_signature_session() -> None:
         escrow_stub.cancel_request.channel_point.funding_txid == bytes.fromhex(outpoint.txid)[::-1]
     )
     assert escrow_stub.cancel_request.session_id == sha256(b"cancel-session").digest()
+
+
+async def test_list_channel_input_candidates_filters_and_orders_without_freezing() -> None:
+    stub = FakeStub()
+    first = listed_channel(channel_point=f"{'22' * 32}:3", chan_id=5)
+    second = listed_channel(channel_point=f"{'11' * 32}:2", chan_id=9)
+    stub.list_channels_response = ln.ListChannelsResponse(
+        channels=[
+            first,
+            listed_channel(active=False),
+            listed_channel(commitment_type=ln.SIMPLE_TAPROOT),
+            listed_channel(pending_htlcs=[ln.HTLC()]),
+            listed_channel(capacity=0),
+            listed_channel(chan_status_flags=""),
+            listed_channel(chan_status_flags="ChanStatusLocalDataLoss"),
+            second,
+        ]
+    )
+    target = backend(stub)
+
+    candidates = await target.list_channel_input_candidates()
+
+    assert all(isinstance(candidate, ChannelInputCandidate) for candidate in candidates)
+    assert [candidate.funding_outpoint for candidate in candidates] == [
+        EscrowOutpoint(txid="11" * 32, vout=2),
+        EscrowOutpoint(txid="22" * 32, vout=3),
+    ]
+    assert candidates[0].active is True
+    assert candidates[0].default_channel_state is True
+    assert candidates[0].pending_htlc_count == 0
+    assert candidates[0].commitment_type == FINAL_TAPROOT_COMMITMENT
+    assert target._escrow_stub is None
+
+
+async def test_list_channel_input_candidates_applies_validated_filters() -> None:
+    stub = FakeStub()
+    allowed = EscrowOutpoint(txid="22" * 32, vout=3)
+    stub.list_channels_response = ln.ListChannelsResponse(
+        channels=[
+            listed_channel(channel_point=f"{'11' * 32}:2", remote_pubkey=OPENER_ID),
+            listed_channel(channel_point=f"{allowed.txid}:{allowed.vout}", remote_pubkey=FUNDEE_ID),
+        ]
+    )
+
+    candidates = await backend(stub).list_channel_input_candidates(
+        allowed_outpoints=[allowed], allowed_peer_node_pubkeys=[FUNDEE_ID]
+    )
+
+    assert [candidate.funding_outpoint for candidate in candidates] == [allowed]
+    with pytest.raises(ValueError, match="allowed peer"):
+        await backend(stub).list_channel_input_candidates(
+            allowed_peer_node_pubkeys=["02" + "AA" * 32]
+        )
+    with pytest.raises(ValueError, match="EscrowOutpoint"):
+        await backend(stub).list_channel_input_candidates(allowed_outpoints=["not-an-outpoint"])
+
+
+async def test_list_channel_input_candidates_rejects_malformed_eligible_channel_data() -> None:
+    stub = FakeStub()
+    stub.list_channels_response = ln.ListChannelsResponse(
+        channels=[listed_channel(remote_pubkey="not-a-public-key")]
+    )
+
+    with pytest.raises(LndValidationError, match="invalid channel data"):
+        await backend(stub).list_channel_input_candidates()
+
+
+@pytest.mark.parametrize(
+    ("delay", "error", "error_type", "message"),
+    [
+        (0.05, None, LndTimeoutError, "ListChannels timed out"),
+        (0.0, RuntimeError("list unavailable"), LndRpcError, "list unavailable"),
+    ],
+)
+async def test_list_channel_input_candidates_wraps_rpc_failures(
+    delay: float, error: Exception | None, error_type: type[Exception], message: str
+) -> None:
+    stub = FakeStub()
+    stub.list_channels_delay = delay
+    stub.list_channels_error = error
+
+    with pytest.raises(error_type, match=message):
+        await backend(stub).list_channel_input_candidates(timeout_seconds=0.001)
+
+
+@pytest.mark.parametrize("stage", [LndEscrowStage.LOCKED, LndEscrowStage.PARENT_PREPARED])
+async def test_force_close_channel_input_recovery_rejects_unsigned_escrow_stage(
+    stage: LndEscrowStage,
+) -> None:
+    target, escrow_stub, outpoint = escrow_target()
+    escrow_stub.stage = stage
+    escrow_stub.parent_txid = b"\x88" * 32 if stage is LndEscrowStage.PARENT_PREPARED else b""
+
+    with pytest.raises(LndValidationError, match="requires a signed"):
+        await target.force_close_channel_input_recovery(
+            "private-session", outpoint, "88" * 32, 100, 100
+        )
+    assert target._stub.close_requests == []
+
+
+async def test_force_close_channel_input_recovery_requires_durable_evidence_and_height() -> None:
+    target, escrow_stub, outpoint = escrow_target()
+    parent_txid = signed_escrow_status(escrow_stub)
+    escrow_stub.durable_local_partial_signature = b""
+
+    with pytest.raises(LndValidationError, match="inconsistent durable status"):
+        await target.force_close_channel_input_recovery(
+            "private-session", outpoint, parent_txid, 100, 100
+        )
+
+    signed_escrow_status(escrow_stub)
+    with pytest.raises(LndValidationError, match="differs from recovery transcript"):
+        await target.force_close_channel_input_recovery(
+            "private-session", outpoint, "99" * 32, 100, 100
+        )
+    with pytest.raises(LndValidationError, match="not yet permitted"):
+        await target.force_close_channel_input_recovery(
+            "private-session", outpoint, parent_txid, 101, 100
+        )
+    assert target._stub.close_requests == []
+
+
+@pytest.mark.parametrize(
+    ("stream", "error_type", "message"),
+    [
+        (FakeStream(delay=0.05), LndTimeoutError, "CloseChannel timed out"),
+        (FakeStream(error=RuntimeError("close unavailable")), LndRpcError, "close unavailable"),
+        (
+            FakeStream(ln.CloseStatusUpdate(chan_close=ln.ChannelCloseUpdate())),
+            LndValidationError,
+            "close_pending",
+        ),
+        (
+            FakeStream(
+                ln.CloseStatusUpdate(
+                    close_pending=ln.PendingUpdate(txid=b"x" * 32, local_close_tx=False)
+                )
+            ),
+            LndValidationError,
+            "locally initiated",
+        ),
+        (
+            FakeStream(
+                ln.CloseStatusUpdate(
+                    close_pending=ln.PendingUpdate(txid=b"x" * 31, local_close_tx=True)
+                )
+            ),
+            LndValidationError,
+            "commitment transaction ID",
+        ),
+    ],
+)
+async def test_force_close_channel_input_recovery_rejects_invalid_close_result(
+    stream: FakeStream, error_type: type[Exception], message: str
+) -> None:
+    target, escrow_stub, outpoint = escrow_target()
+    parent_txid = signed_escrow_status(escrow_stub)
+    target._stub.close_stream = stream
+
+    with pytest.raises(error_type, match=message):
+        await target.force_close_channel_input_recovery(
+            "private-session", outpoint, parent_txid, 100, 100, timeout_seconds=0.001
+        )
+
+
+async def test_force_close_channel_input_recovery_wraps_close_rpc_error() -> None:
+    target, escrow_stub, outpoint = escrow_target()
+    parent_txid = signed_escrow_status(escrow_stub)
+    target._stub.close_error = RuntimeError("close RPC unavailable")
+
+    with pytest.raises(LndRpcError, match="close RPC unavailable"):
+        await target.force_close_channel_input_recovery(
+            "private-session", outpoint, parent_txid, 100, 100
+        )
+
+
+async def test_force_close_channel_input_recovery_returns_display_order_commitment_txid() -> None:
+    target, escrow_stub, outpoint = escrow_target()
+    parent_txid = signed_escrow_status(escrow_stub)
+    wire_txid = bytes(range(32))
+    target._stub.close_stream = FakeStream(
+        ln.CloseStatusUpdate(close_pending=ln.PendingUpdate(txid=wire_txid, local_close_tx=True))
+    )
+
+    outcome = await target.force_close_channel_input_recovery(
+        "private-session", outpoint, parent_txid, 100, 100
+    )
+
+    assert isinstance(outcome, ChannelInputForceCloseOutcome)
+    assert outcome.funding_outpoint == outpoint
+    assert outcome.commitment_txid == wire_txid[::-1].hex()
+    request = target._stub.close_requests[0]
+    assert request.force is True
+    assert request.channel_point.funding_txid_bytes == bytes.fromhex(outpoint.txid)[::-1]
+    assert request.channel_point.output_index == outpoint.vout
+    assert escrow_stub.cancel_request is None
 
 
 async def test_channel_escrow_requires_a_dedicated_credential_without_initializing_lnd() -> None:

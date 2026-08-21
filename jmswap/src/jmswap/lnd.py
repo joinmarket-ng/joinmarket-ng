@@ -205,6 +205,44 @@ class LndEscrowStatus(StrictModel):
         return self
 
 
+class ChannelInputCandidate(StrictModel):
+    """A safe, unfrozen final-Taproot channel available for channel-input selection."""
+
+    channel_id: Annotated[int, Field(ge=0)]
+    funding_outpoint: EscrowOutpoint
+    peer_node_pubkey: NodeId
+    capacity_sat: Annotated[int, Field(gt=0)]
+    local_balance_sat: Annotated[int, Field(ge=0)]
+    remote_balance_sat: Annotated[int, Field(ge=0)]
+    private: bool
+    active: bool
+    default_channel_state: bool
+    pending_htlc_count: Annotated[int, Field(ge=0)]
+    commitment_type: int
+
+    @model_validator(mode="after")
+    def validate_balances(self) -> ChannelInputCandidate:
+        if (
+            self.local_balance_sat > self.capacity_sat
+            or self.remote_balance_sat > self.capacity_sat
+        ):
+            raise ValueError("channel balances cannot exceed channel capacity")
+        if not self.active or not self.default_channel_state or self.pending_htlc_count != 0:
+            raise ValueError(
+                "channel candidate must be active, default state, and free of pending HTLCs"
+            )
+        if self.commitment_type != FINAL_TAPROOT_COMMITMENT:
+            raise ValueError("channel candidate must use final-Taproot commitments")
+        return self
+
+
+class ChannelInputForceCloseOutcome(StrictModel):
+    """The locally initiated commitment transaction from recovery force-close."""
+
+    funding_outpoint: EscrowOutpoint
+    commitment_txid: Hex32
+
+
 class LndNodeInfo(StrictModel):
     identity_pubkey: NodeId
     version: str
@@ -792,6 +830,191 @@ class LndBackend:
         if len(raw_hash) != 32:
             raise LndValidationError("ChannelEscrowRPC returned an invalid transaction ID")
         return raw_hash[::-1].hex()
+
+    @staticmethod
+    def _validate_timeout(timeout_seconds: float) -> None:
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or timeout_seconds <= 0
+        ):
+            raise ValueError("timeout_seconds must be positive")
+
+    @staticmethod
+    def _validate_channel_input_peer_filter(peer_node_pubkey: str) -> str:
+        if (
+            not isinstance(peer_node_pubkey, str)
+            or re.fullmatch(r"(?:02|03)[0-9a-f]{64}", peer_node_pubkey) is None
+        ):
+            raise ValueError("allowed peer public key must be a lowercase compressed public key")
+        return peer_node_pubkey
+
+    async def list_channel_input_candidates(
+        self,
+        *,
+        allowed_outpoints: Sequence[EscrowOutpoint] | None = None,
+        allowed_peer_node_pubkeys: Sequence[str] | None = None,
+        timeout_seconds: float = 10.0,
+    ) -> tuple[ChannelInputCandidate, ...]:
+        """List eligible final-Taproot channels without changing their escrow state."""
+        self._validate_timeout(timeout_seconds)
+        if allowed_outpoints is not None and (
+            isinstance(allowed_outpoints, (str, bytes))
+            or not isinstance(allowed_outpoints, Sequence)
+        ):
+            raise ValueError("allowed_outpoints must be a sequence of funding outpoints")
+        if allowed_peer_node_pubkeys is not None and (
+            isinstance(allowed_peer_node_pubkeys, (str, bytes))
+            or not isinstance(allowed_peer_node_pubkeys, Sequence)
+        ):
+            raise ValueError("allowed_peer_node_pubkeys must be a sequence of public keys")
+        allowed_points: frozenset[EscrowOutpoint] | None = None
+        if allowed_outpoints is not None:
+            for point in allowed_outpoints:
+                if not isinstance(point, EscrowOutpoint):
+                    raise ValueError("allowed outpoint must be an EscrowOutpoint")
+            allowed_points = frozenset(allowed_outpoints)
+        allowed_peers: frozenset[str] | None = None
+        if allowed_peer_node_pubkeys is not None:
+            allowed_peers = frozenset(
+                self._validate_channel_input_peer_filter(peer) for peer in allowed_peer_node_pubkeys
+            )
+        self._ensure()
+        try:
+            response = await asyncio.wait_for(
+                self._stub.ListChannels(ln.ListChannelsRequest()), timeout_seconds
+            )
+        except TimeoutError as exc:
+            raise LndTimeoutError("ListChannels timed out") from exc
+        except Exception as exc:
+            raise LndRpcError(f"ListChannels failed: {exc}") from exc
+        try:
+            candidates: list[ChannelInputCandidate] = []
+            for channel in response.channels:
+                if (
+                    not isinstance(channel.active, bool)
+                    or not isinstance(channel.commitment_type, int)
+                    or not isinstance(channel.chan_status_flags, str)
+                    or not isinstance(channel.capacity, int)
+                    or not isinstance(channel.pending_htlcs, Sequence)
+                ):
+                    raise ValueError("invalid channel eligibility fields")
+                if (
+                    not channel.active
+                    or channel.commitment_type != FINAL_TAPROOT_COMMITMENT
+                    or channel.chan_status_flags != "ChanStatusDefault"
+                    or channel.capacity <= 0
+                    or len(channel.pending_htlcs) != 0
+                ):
+                    continue
+                candidate = ChannelInputCandidate(
+                    channel_id=channel.chan_id,
+                    funding_outpoint=self._parse_escrow_outpoint(channel.channel_point),
+                    peer_node_pubkey=channel.remote_pubkey,
+                    capacity_sat=channel.capacity,
+                    local_balance_sat=channel.local_balance,
+                    remote_balance_sat=channel.remote_balance,
+                    private=channel.private,
+                    active=channel.active,
+                    default_channel_state=channel.chan_status_flags == "ChanStatusDefault",
+                    pending_htlc_count=len(channel.pending_htlcs),
+                    commitment_type=channel.commitment_type,
+                )
+                if (allowed_points is None or candidate.funding_outpoint in allowed_points) and (
+                    allowed_peers is None or candidate.peer_node_pubkey in allowed_peers
+                ):
+                    candidates.append(candidate)
+            return tuple(
+                sorted(
+                    candidates,
+                    key=lambda candidate: (
+                        candidate.funding_outpoint.txid,
+                        candidate.funding_outpoint.vout,
+                        candidate.channel_id,
+                    ),
+                )
+            )
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise LndValidationError(f"ListChannels returned invalid channel data: {exc}") from exc
+
+    async def force_close_channel_input_recovery(
+        self,
+        session_id: str,
+        funding_outpoint: EscrowOutpoint,
+        parent_txid: str,
+        recovery_height: int,
+        current_height: int,
+        *,
+        timeout_seconds: float = 10.0,
+    ) -> ChannelInputForceCloseOutcome:
+        """Force-close only after durable signature release and transcript recovery height."""
+        self._validate_timeout(timeout_seconds)
+        if not isinstance(parent_txid, str) or re.fullmatch(r"[0-9a-f]{64}", parent_txid) is None:
+            raise ValueError("parent transaction ID must be a lowercase 32-byte hexadecimal value")
+        for name, height in (
+            ("recovery_height", recovery_height),
+            ("current_height", current_height),
+        ):
+            if (
+                isinstance(height, bool)
+                or not isinstance(height, int)
+                or not 0 <= height <= 0xFFFFFFFF
+            ):
+                raise ValueError(f"{name} must be a valid block height")
+
+        try:
+            status = await asyncio.wait_for(
+                self.channel_input_escrow_status(session_id, funding_outpoint), timeout_seconds
+            )
+        except TimeoutError as exc:
+            raise LndTimeoutError("ChannelEscrowRPC Status timed out") from exc
+        except LndError:
+            raise
+        except Exception as exc:
+            raise LndRpcError(f"ChannelEscrowRPC Status failed: {exc}") from exc
+        if status.stage not in (LndEscrowStage.PARENT_SIGNED, LndEscrowStage.FINALIZED):
+            raise LndValidationError("force-close recovery requires a signed escrow parent")
+        if status.parent_txid != parent_txid:
+            raise LndValidationError(
+                "escrow parent transaction ID differs from recovery transcript"
+            )
+        if current_height < recovery_height:
+            raise LndValidationError(
+                "force-close recovery is not yet permitted by transcript height"
+            )
+
+        self._ensure()
+        request = ln.CloseChannelRequest(
+            channel_point=ln.ChannelPoint(
+                funding_txid_bytes=bytes.fromhex(funding_outpoint.txid)[::-1],
+                output_index=funding_outpoint.vout,
+            ),
+            force=True,
+        )
+        try:
+            stream = self._stub.CloseChannel(request)
+            update = await asyncio.wait_for(stream.read(), timeout_seconds)
+        except TimeoutError as exc:
+            raise LndTimeoutError("CloseChannel timed out waiting for close_pending") from exc
+        except Exception as exc:
+            raise LndRpcError(f"CloseChannel failed: {exc}") from exc
+        try:
+            if update.WhichOneof("update") != "close_pending":
+                raise ValueError("CloseChannel did not return a close_pending update")
+            pending = update.close_pending
+            if not pending.local_close_tx:
+                raise ValueError("CloseChannel close_pending update is not locally initiated")
+            raw_txid = bytes(pending.txid)
+            if len(raw_txid) != 32:
+                raise ValueError("CloseChannel returned an invalid commitment transaction ID")
+            return ChannelInputForceCloseOutcome(
+                funding_outpoint=funding_outpoint,
+                commitment_txid=raw_txid[::-1].hex(),
+            )
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise LndValidationError(
+                f"CloseChannel returned invalid close_pending data: {exc}"
+            ) from exc
 
     async def _resolve_escrow_channel_point(self, channel_id: str) -> EscrowOutpoint:
         if ":" in channel_id:
