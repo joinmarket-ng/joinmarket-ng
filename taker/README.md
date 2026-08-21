@@ -11,6 +11,22 @@ Mix your bitcoin for privacy via CoinJoin. Takers initiate transactions and pay 
 - **Transaction Monitoring**: Track transaction progress and confirmations
 - **Retry Logic**: Automatic retry on failure or maker timeout
 
+## Channel Input Coordination
+
+`taker.channel_input_parent.ChannelInputParentCoordinator` is an internal,
+fail-closed policy API for exact parents that combine established final-Taproot
+LND channel inputs with ordinary native-SegWit inputs. Callers provide an
+immutable unsigned parent, complete ordered prevouts, prevalidated participant
+witnesses, explicit channel settlement outputs, and two authenticated endpoint
+transports per channel.
+
+The coordinator validates claim and fee conservation before signing, persists
+MuSig2 attempts and partial signatures across restart, assembles and verifies
+every witness, and stores exact final bytes before query-first publication.
+Cancellation is available only before channel signing begins. This API is not
+yet exposed by the `jm-taker` CLI and does not add channel negotiation messages
+to the existing maker protocol.
+
 ## Documentation
 
 For full documentation, see [taker Documentation](https://joinmarket-ng.github.io/joinmarket-ng/README-taker/).

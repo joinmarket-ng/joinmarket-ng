@@ -30,9 +30,9 @@ outpoint, and every native SegWit witness UTXO before calling
 `PsbtVerify(skip_finalize=true)`. Readiness requires matching
 `PendingChannelObservation` values from both endpoints.
 
-The end-to-end confirmation-gated channel-input coordinator is not implemented.
 The stock-LND path supports the co-funded channel-ring lifecycle and guarded
 retirement before any funding transaction signatures are created or broadcast.
+The separate taker policy layer owns established-channel input coordination.
 
 ## Optional ChannelEscrowRPC Transport
 
@@ -47,7 +47,7 @@ Set `LND_EXTERNAL_IMAGE` for the two-node external-LND Compose profile or
 `RING_E2E_LND_IMAGE` for the ring E2E profile to run a compatible patched
 image. Both variables retain stock LND `v0.21.1-beta` as their default.
 
-Run the opt-in exact-parent restart-recovery test with a patched image:
+Run the opt-in mixed-input exact-parent restart-recovery test with a patched image:
 
 ```bash
 LND_EXTERNAL_IMAGE=lnd-channelescrow:v0.21.1-beta-local \
@@ -58,9 +58,11 @@ The boundary can freeze a channel, bind an exact parent and its prevouts,
 manage MuSig2 signing attempts, recover finalization from durable evidence,
 query durable status, and cancel before signing. It validates all returned
 outpoints, transaction IDs, final witnesses, and stage evidence. It does not
-provide an escrow coordinator, established-channel-input lifecycle, timeout or
-HTLC policy, or transaction broadcast. The external coordinator broadcasts
-only after all CoinJoin inputs are finalized.
+own coordination, timeout or HTLC policy, or transaction broadcast.
+`taker.channel_input_parent.ChannelInputParentCoordinator` combines this
+transport with prevalidated ordinary native-SegWit witnesses, atomically
+persists the exact final transaction, and broadcasts only after every input is
+finalized.
 
 After `PsbtVerify(skip_finalize=true)`, a funding shim cannot provide a
 reliable rollback. `retire_verified_external_channel` permits LND's destructive
