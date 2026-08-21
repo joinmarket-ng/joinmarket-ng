@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 from copy import deepcopy
+from hashlib import sha256
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -20,13 +22,17 @@ from jmswap.lnd import (
     FINAL_TAPROOT_COMMITMENT,
     AcceptorBounds,
     EndpointRole,
+    EscrowOutpoint,
     ExternalChannelRequest,
+    FrozenChannelSnapshot,
     FundingNegotiation,
     FundingTransactionChainStatus,
     InboundChannelExpectation,
     LndAmbiguousShimError,
     LndBackend,
     LndCapabilityError,
+    LndEscrowCredentialError,
+    LndEscrowStage,
     LndRetirementPostconditionError,
     LndRetirementRpcError,
     LndRpcError,
@@ -45,6 +51,7 @@ from jmswap.lnd import (
     validate_contribution_accounting,
     validate_endpoint_readiness,
 )
+from jmswap.lndrpc import channelescrow_pb2 as escrow
 from jmswap.lndrpc import lightning_pb2 as ln
 
 PENDING_ID = b"\x11" * 32
@@ -177,6 +184,114 @@ class FakeStub:
         return ln.VerifyMessageResponse(valid=request.signature == "signed", pubkey=OPENER_ID)
 
 
+class FakeEscrowStub:
+    def __init__(self) -> None:
+        self.freeze_request: Any = None
+        self.prepare_request: Any = None
+        self.begin_request: Any = None
+        self.sign_request: Any = None
+        self.finalize_request: Any = None
+        self.status_request: Any = None
+        self.cancel_request: Any = None
+        self.parent_tx = b""
+        self.parent_txid = b""
+        self.stage = LndEscrowStage.LOCKED
+        self.durable_local_public_nonce = b""
+        self.durable_remote_public_nonce = b""
+        self.durable_local_partial_signature = b""
+        self.active_attempt_id = b""
+        self.active_local_public_nonce = b""
+        self.finalized_parent_tx = b""
+        self.finalized_witnesses: list[list[bytes]] = [[b"f" * 64], []]
+        self.capacity_sat = 2_000_000
+        self.local_claim_sat = 1_200_000
+        self.remote_claim_sat = 800_000
+        self.funding_script = FUNDING_SCRIPT
+        self.peer_pubkey = bytes.fromhex("02" + "44" * 32)
+        self.local_funding_pubkey = bytes.fromhex("02" + "66" * 32)
+        self.remote_funding_pubkey = bytes.fromhex("03" + "77" * 32)
+
+    async def FreezeChannel(self, request: Any) -> Any:  # noqa: N802
+        self.freeze_request = request
+        return escrow.FreezeChannelResponse(
+            capacity_sat=self.capacity_sat,
+            local_claim_sat=self.local_claim_sat,
+            remote_claim_sat=self.remote_claim_sat,
+            peer_pubkey=self.peer_pubkey,
+            funding_outpoint=request.channel_point,
+            funding_script=self.funding_script,
+            local_funding_pubkey=self.local_funding_pubkey,
+            remote_funding_pubkey=self.remote_funding_pubkey,
+        )
+
+    async def PrepareParent(self, request: Any) -> Any:  # noqa: N802
+        self.prepare_request = request
+        self.parent_tx = bytes(request.raw_parent_tx)
+        self.parent_txid = bytes.fromhex(get_txid(self.parent_tx.hex()))[::-1]
+        self.stage = LndEscrowStage.PARENT_PREPARED
+        return escrow.PrepareParentResponse(txid=self.parent_txid)
+
+    async def BeginSigning(self, request: Any) -> Any:  # noqa: N802
+        self.begin_request = request
+        self.active_attempt_id = b"a" * 32
+        self.active_local_public_nonce = b"n" * 66
+        return escrow.BeginSigningResponse(
+            attempt_id=self.active_attempt_id,
+            local_public_nonce=self.active_local_public_nonce,
+        )
+
+    async def SignParent(self, request: Any) -> Any:  # noqa: N802
+        self.sign_request = request
+        self.stage = LndEscrowStage.PARENT_SIGNED
+        self.durable_local_public_nonce = self.active_local_public_nonce
+        self.durable_remote_public_nonce = bytes(request.remote_public_nonce)
+        self.durable_local_partial_signature = b"s" * 32
+        return escrow.SignParentResponse(
+            local_partial_signature=self.durable_local_partial_signature
+        )
+
+    async def FinalizeParent(self, request: Any) -> Any:  # noqa: N802
+        self.finalize_request = request
+        self.stage = LndEscrowStage.FINALIZED
+        parent = parse_transaction(self.parent_tx.hex())
+        self.finalized_parent_tx = serialize_transaction(
+            parent.version,
+            parent.inputs,
+            parent.outputs,
+            parent.locktime,
+            witnesses=self.finalized_witnesses,
+        )
+        self.active_attempt_id = b""
+        self.active_local_public_nonce = b""
+        return escrow.FinalizeParentResponse(raw_tx=self.finalized_parent_tx, txid=self.parent_txid)
+
+    async def Status(self, request: Any) -> Any:  # noqa: N802
+        self.status_request = request
+        return escrow.StatusResponse(
+            stage=self.stage,
+            parent_txid=self.parent_txid,
+            finalized=self.stage is LndEscrowStage.FINALIZED,
+            durable_local_public_nonce=self.durable_local_public_nonce,
+            durable_remote_public_nonce=self.durable_remote_public_nonce,
+            durable_local_partial_signature=self.durable_local_partial_signature,
+            finalized_parent_tx=self.finalized_parent_tx,
+            active_attempt_id=self.active_attempt_id,
+            active_local_public_nonce=self.active_local_public_nonce,
+        )
+
+    async def Cancel(self, request: Any) -> Any:  # noqa: N802
+        self.cancel_request = request
+        return escrow.CancelResponse(link_resumed=True)
+
+
+class CloseTrackingChannel:
+    def __init__(self) -> None:
+        self.close_calls = 0
+
+    async def close(self) -> None:
+        self.close_calls += 1
+
+
 def backend(stub: Any | None = None) -> LndBackend:
     result = LndBackend(host="localhost:10009", tls_cert=b"", macaroon_hex="")
     result._stub = stub or FakeStub()
@@ -281,6 +396,160 @@ def funding_tx(
         WitnessUtxo(value_sat=1_300_000, script_pubkey=bytes.fromhex("5120" + "99" * 32)),
     ]
     return raw, utxos
+
+
+def escrow_target() -> tuple[LndBackend, FakeEscrowStub, EscrowOutpoint]:
+    target = backend()
+    escrow_stub = FakeEscrowStub()
+    target._escrow_stub = escrow_stub
+    return target, escrow_stub, EscrowOutpoint(txid="aa" * 32, vout=0)
+
+
+def test_lnd_constructor_and_from_paths_remain_compatible(tmp_path: Path) -> None:
+    legacy = LndBackend("localhost:10009", b"cert", "admin")
+    assert legacy.escrow_macaroon_hex is None
+
+    cert_path = tmp_path / "tls.cert"
+    macaroon_path = tmp_path / "admin.macaroon"
+    escrow_path = tmp_path / "escrow.macaroon"
+    cert_path.write_bytes(b"cert")
+    macaroon_path.write_bytes(b"admin")
+    escrow_path.write_bytes(b"escrow")
+    from_paths = LndBackend.from_paths("localhost:10009", cert_path, macaroon_path)
+    with_escrow = LndBackend.from_paths(
+        "localhost:10009", cert_path, macaroon_path, escrow_macaroon_path=escrow_path
+    )
+    assert from_paths.escrow_macaroon_hex is None
+    assert with_escrow.escrow_macaroon_hex == b"escrow".hex()
+
+
+async def test_channel_escrow_lifecycle_uses_exact_requests_and_durable_recovery() -> None:
+    target, escrow_stub, outpoint = escrow_target()
+    snapshot = await target.freeze_channel_input(
+        "private-session", f"{outpoint.txid}:{outpoint.vout}"
+    )
+
+    assert isinstance(snapshot, FrozenChannelSnapshot)
+    assert snapshot.funding_outpoint == outpoint
+    assert (
+        escrow_stub.freeze_request.channel_point.funding_txid == bytes.fromhex(outpoint.txid)[::-1]
+    )
+    assert escrow_stub.freeze_request.session_id == sha256(b"private-session").digest()
+    assert target._channel is None
+    assert target._escrow_channel is None
+
+    parent_tx, utxos = funding_tx()
+    parent_txid = await target.prepare_channel_input_parent(
+        "private-session", outpoint, parent_tx, utxos, 0
+    )
+    assert parent_txid == get_txid(parent_tx)
+    assert escrow_stub.prepare_request.channel_input_index == 0
+    assert [item.value_sat for item in escrow_stub.prepare_request.prev_outs] == [
+        700_000,
+        1_300_000,
+    ]
+
+    attempt = await target.begin_channel_input_signing("private-session", outpoint)
+    partial_signature = await target.sign_channel_input_parent(
+        "private-session", outpoint, attempt, b"r" * 66
+    )
+    assert partial_signature == b"s" * 32
+    signed = await target.channel_input_escrow_status("private-session", outpoint)
+    assert signed.stage is LndEscrowStage.PARENT_SIGNED
+    assert signed.active_attempt == attempt
+
+    finalized = await target.finalize_channel_input_parent(
+        "private-session", outpoint, attempt, b"p" * 32
+    )
+    assert finalized.txid == parent_txid
+    assert finalized.channel_input_index == 0
+    assert finalized.channel_input_witness == (b"f" * 64,)
+    restarted = backend()
+    restarted._escrow_stub = escrow_stub
+    recovered = await restarted.recover_channel_input_parent("private-session", outpoint, b"p" * 32)
+    assert recovered == finalized
+    assert escrow_stub.finalize_request.attempt_id == b""
+
+
+async def test_channel_escrow_cancel_uses_pre_signature_session() -> None:
+    target, escrow_stub, outpoint = escrow_target()
+
+    assert await target.cancel_channel_input_escrow("cancel-session", outpoint) is True
+    assert (
+        escrow_stub.cancel_request.channel_point.funding_txid == bytes.fromhex(outpoint.txid)[::-1]
+    )
+    assert escrow_stub.cancel_request.session_id == sha256(b"cancel-session").digest()
+
+
+async def test_channel_escrow_requires_a_dedicated_credential_without_initializing_lnd() -> None:
+    target = LndBackend(host="localhost:10009", tls_cert=b"", macaroon_hex="admin")
+    with pytest.raises(LndEscrowCredentialError, match="dedicated escrow macaroon"):
+        await target.channel_input_escrow_status(
+            "private-session", EscrowOutpoint(txid="aa" * 32, vout=0)
+        )
+    assert target._channel is None
+    assert target._escrow_channel is None
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("funding_script", bytes.fromhex("0014" + "55" * 20)),
+        ("peer_pubkey", b"short"),
+        ("local_funding_pubkey", b"\x04" + b"l" * 32),
+        ("remote_funding_pubkey", bytes.fromhex("02" + "66" * 32)),
+        ("capacity_sat", 2_000_001),
+    ],
+)
+async def test_channel_escrow_rejects_invalid_frozen_channel_data(
+    field: str, value: bytes | int
+) -> None:
+    target, escrow_stub, outpoint = escrow_target()
+    setattr(escrow_stub, field, value)
+    with pytest.raises(LndValidationError, match="invalid frozen"):
+        await target.freeze_channel_input("private-session", f"{outpoint.txid}:{outpoint.vout}")
+
+
+@pytest.mark.parametrize(
+    ("stage", "updates"),
+    [
+        (LndEscrowStage.PARENT_SIGNED, {}),
+        (LndEscrowStage.PARENT_PREPARED, {"durable_local_public_nonce": b"n" * 66}),
+    ],
+)
+async def test_channel_escrow_rejects_inconsistent_durable_status(
+    stage: LndEscrowStage, updates: dict[str, bytes]
+) -> None:
+    target, escrow_stub, outpoint = escrow_target()
+    parent_tx, utxos = funding_tx()
+    await target.prepare_channel_input_parent("private-session", outpoint, parent_tx, utxos, 0)
+    escrow_stub.stage = stage
+    for field, value in updates.items():
+        setattr(escrow_stub, field, value)
+    with pytest.raises(LndValidationError, match="inconsistent durable status"):
+        await target.channel_input_escrow_status("private-session", outpoint)
+
+
+async def test_channel_escrow_rejects_invalid_final_witness_data() -> None:
+    target, escrow_stub, outpoint = escrow_target()
+    parent_tx, utxos = funding_tx()
+    await target.prepare_channel_input_parent("private-session", outpoint, parent_tx, utxos, 0)
+    attempt = await target.begin_channel_input_signing("private-session", outpoint)
+    escrow_stub.finalized_witnesses = [[b"f" * 63], []]
+    with pytest.raises(LndValidationError, match="channel witness data"):
+        await target.finalize_channel_input_parent("private-session", outpoint, attempt, b"p" * 32)
+
+
+async def test_close_closes_each_transport_once() -> None:
+    target = backend()
+    primary = CloseTrackingChannel()
+    escrow_channel = CloseTrackingChannel()
+    target._channel = primary
+    target._escrow_channel = escrow_channel
+    await target.close()
+    await target.close()
+    assert primary.close_calls == 1
+    assert escrow_channel.close_calls == 1
 
 
 async def negotiate(target: LndBackend) -> Any:

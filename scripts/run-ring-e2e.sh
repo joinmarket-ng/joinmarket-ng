@@ -9,7 +9,7 @@
 # because the services write it as root.
 #
 # Usage:
-#   scripts/run-ring-e2e.sh [lnd-external|ring|all]   (default: all)
+#   scripts/run-ring-e2e.sh [lnd-external|lnd-escrow|ring|all]   (default: all)
 #
 # Environment:
 #   RING_E2E_KEEP=1     leave the stack running after the tests
@@ -41,8 +41,9 @@ RING_E2E_DATA_DIR=$(realpath -m "${RING_E2E_DATA_DIR:-${PROJECT_ROOT}/tmp/ring-e
 RING_E2E_PROJECT=${RING_E2E_PROJECT:-jm-ring-e2e}
 export LND_EXTERNAL_DATA_DIR RING_E2E_DATA_DIR RING_E2E_PROJECT
 
-if [ "$SUITE" != "lnd-external" ] && [ "$SUITE" != "ring" ] && [ "$SUITE" != "all" ]; then
-    echo "usage: $0 [lnd-external|ring|all]" >&2
+if [ "$SUITE" != "lnd-external" ] && [ "$SUITE" != "lnd-escrow" ] && \
+    [ "$SUITE" != "ring" ] && [ "$SUITE" != "all" ]; then
+    echo "usage: $0 [lnd-external|lnd-escrow|ring|all]" >&2
     exit 2
 fi
 
@@ -143,6 +144,23 @@ run_lnd_external() {
         -m lnd_external --fail-on-skip --no-cov -v --timeout=300
 }
 
+run_lnd_escrow() {
+    if [ -z "${LND_EXTERNAL_IMAGE:-}" ]; then
+        echo "LND_EXTERNAL_IMAGE must name a channelescrowrpc-enabled LND image" >&2
+        return 2
+    fi
+    if [ "$NO_RESET" != "1" ]; then
+        lnd_external_compose down -v >/dev/null 2>&1 || true
+        wipe_host_state "$LND_EXTERNAL_DATA_DIR"
+        lnd_external_compose up -d
+        wait_for_healthy lnd_external_compose 180 lnd-bitcoin lnd-opener lnd-fundee
+        sleep 15
+    fi
+    LND_CHANNEL_ESCROW_E2E=1 pytest -c "${PROJECT_ROOT}/pytest.ini" \
+        "${PROJECT_ROOT}/tests/e2e/test_lnd_channel_escrow_e2e.py" \
+        -m lnd_channel_escrow --fail-on-skip --no-cov -v --timeout=300
+}
+
 run_ring() {
     build_ring_images
     if [ "$NO_RESET" != "1" ]; then
@@ -170,7 +188,8 @@ cleanup() {
         ring_compose down -v >/dev/null 2>&1 || true
         wipe_host_state "$RING_E2E_DATA_DIR" || true
     fi
-    if [ "$SUITE" = "lnd-external" ] || [ "$SUITE" = "all" ]; then
+    if [ "$SUITE" = "lnd-external" ] || [ "$SUITE" = "lnd-escrow" ] || \
+        [ "$SUITE" = "all" ]; then
         lnd_external_compose down -v >/dev/null 2>&1 || true
         wipe_host_state "$LND_EXTERNAL_DATA_DIR" || true
     fi
@@ -180,6 +199,7 @@ trap cleanup EXIT
 
 case "$SUITE" in
 lnd-external) run_lnd_external ;;
+lnd-escrow) run_lnd_escrow ;;
 ring) run_ring ;;
 all)
     run_lnd_external

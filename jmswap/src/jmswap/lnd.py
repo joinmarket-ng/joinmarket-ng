@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import os
 import re
 import struct
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from enum import StrEnum
+from enum import IntEnum, StrEnum
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -84,8 +86,123 @@ class LndRpcError(LndError):
     """An LND RPC failed; the message carries the reason LND reported."""
 
 
+class LndEscrowCredentialError(LndError):
+    """A ChannelEscrowRPC call was attempted without its dedicated macaroon."""
+
+
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+
+class EscrowOutpoint(StrictModel):
+    """A Bitcoin funding outpoint in conventional display byte order."""
+
+    txid: Hex32
+    vout: Annotated[int, Field(ge=0, le=0xFFFFFFFF)]
+
+
+class LndEscrowStage(IntEnum):
+    """Durable final-Taproot channel-input signing stages reported by ChannelEscrowRPC."""
+
+    LOCKED = 0
+    PARENT_PREPARED = 1
+    PARENT_SIGNED = 2
+    FINALIZED = 3
+
+
+class FrozenChannelSnapshot(StrictModel):
+    """Quiescent final-Taproot channel data returned by an escrow freeze."""
+
+    session_id: Annotated[str, StringConstraints(min_length=1)]
+    channel_id: Annotated[str, StringConstraints(min_length=1)]
+    funding_outpoint: EscrowOutpoint
+    funding_scriptpubkey: Annotated[bytes, Field(min_length=34, max_length=34)]
+    peer_node_pubkey: Annotated[bytes, Field(min_length=33, max_length=33)]
+    local_funding_pubkey: Annotated[bytes, Field(min_length=33, max_length=33)]
+    remote_funding_pubkey: Annotated[bytes, Field(min_length=33, max_length=33)]
+    capacity_sat: Annotated[int, Field(gt=0)]
+    local_claim_sat: Annotated[int, Field(ge=0)]
+    remote_claim_sat: Annotated[int, Field(ge=0)]
+    quiescent: bool = True
+    active_htlcs: Annotated[int, Field(ge=0)] = 0
+
+    @model_validator(mode="after")
+    def validate_final_taproot_funding_data(self) -> FrozenChannelSnapshot:
+        if self.funding_scriptpubkey[:2] != b"\x51\x20":
+            raise ValueError("funding script must be P2TR")
+        for name, pubkey in (
+            ("peer node public key", self.peer_node_pubkey),
+            ("local funding public key", self.local_funding_pubkey),
+            ("remote funding public key", self.remote_funding_pubkey),
+        ):
+            if pubkey[0] not in (0x02, 0x03):
+                raise ValueError(f"{name} must be a compressed public key")
+        if self.local_funding_pubkey == self.remote_funding_pubkey:
+            raise ValueError("funding public keys must differ")
+        if self.local_claim_sat + self.remote_claim_sat != self.capacity_sat:
+            raise ValueError("channel claims must exactly conserve capacity")
+        if not self.quiescent or self.active_htlcs != 0:
+            raise ValueError("frozen channel must be quiescent without active HTLCs")
+        return self
+
+
+class LndEscrowSigningAttempt(StrictModel):
+    """An active MuSig2 nonce attempt for one immutable prepared parent."""
+
+    attempt_id: Annotated[bytes, Field(min_length=32, max_length=32)]
+    public_nonce: Annotated[bytes, Field(min_length=66, max_length=66)]
+
+
+class LndFinalizedEscrowParent(StrictModel):
+    """A finalized parent transaction and its final-Taproot input witness."""
+
+    tx_hex: Annotated[str, StringConstraints(pattern=r"^[0-9a-f]+$")]
+    txid: Hex32
+    channel_input_index: Annotated[int, Field(ge=0)]
+    channel_input_witness: tuple[Annotated[bytes, Field(min_length=64, max_length=64)], ...]
+
+    @model_validator(mode="after")
+    def validate_channel_witness(self) -> LndFinalizedEscrowParent:
+        if len(self.channel_input_witness) != 1:
+            raise ValueError("final-Taproot channel input must have one witness element")
+        return self
+
+
+class LndEscrowStatus(StrictModel):
+    """Durable escrow evidence needed to resume a final-Taproot signing session."""
+
+    stage: LndEscrowStage
+    parent_txid: Hex32 | None
+    finalized: bool
+    durable_local_public_nonce: Annotated[bytes, Field(min_length=66, max_length=66)] | None = None
+    durable_remote_public_nonce: Annotated[bytes, Field(min_length=66, max_length=66)] | None = None
+    durable_local_partial_signature: (
+        Annotated[bytes, Field(min_length=32, max_length=32)] | None
+    ) = None
+    finalized_parent: LndFinalizedEscrowParent | None = None
+    active_attempt: LndEscrowSigningAttempt | None = None
+
+    @model_validator(mode="after")
+    def validate_stage_evidence(self) -> LndEscrowStatus:
+        durable = (
+            self.durable_local_public_nonce,
+            self.durable_remote_public_nonce,
+            self.durable_local_partial_signature,
+        )
+        if (self.parent_txid is not None) != (self.stage >= LndEscrowStage.PARENT_PREPARED):
+            raise ValueError("escrow stage and parent transaction evidence differ")
+        if self.finalized != (self.stage is LndEscrowStage.FINALIZED):
+            raise ValueError("escrow stage and finalization evidence differ")
+        if self.stage >= LndEscrowStage.PARENT_SIGNED:
+            if not all(value is not None for value in durable):
+                raise ValueError("signed escrow stage lacks durable signing evidence")
+        elif any(value is not None for value in durable):
+            raise ValueError("unsigned escrow stage includes durable signing evidence")
+        if (self.finalized_parent is not None) != self.finalized:
+            raise ValueError("escrow stage and finalized parent evidence differ")
+        if self.stage is LndEscrowStage.FINALIZED and self.active_attempt is not None:
+            raise ValueError("finalized escrow cannot retain an active signing attempt")
+        return self
 
 
 class LndNodeInfo(StrictModel):
@@ -547,8 +664,11 @@ class LndBackend:
     tls_cert: bytes = field(repr=False)
     macaroon_hex: str = field(repr=False)
     network: str = "regtest"
+    escrow_macaroon_hex: str | None = field(default=None, repr=False)
     _channel: Any = field(default=None, repr=False)
+    _escrow_channel: Any = field(default=None, repr=False)
     _stub: Any = field(default=None, repr=False)
+    _escrow_stub: Any = field(default=None, repr=False)
     _pending: dict[bytes, _PendingOpen] = field(default_factory=dict, repr=False)
     _seen_pending_ids: set[bytes] = field(default_factory=set, repr=False)
     _accepted: dict[bytes, InboundChannelExpectation] = field(default_factory=dict, repr=False)
@@ -567,12 +687,18 @@ class LndBackend:
         tls_cert_path: str | Path,
         macaroon_path: str | Path,
         network: str = "regtest",
+        escrow_macaroon_path: str | Path | None = None,
     ) -> LndBackend:
         return cls(
             host=host,
             tls_cert=Path(tls_cert_path).read_bytes(),
             macaroon_hex=Path(macaroon_path).read_bytes().hex(),
             network=network,
+            escrow_macaroon_hex=(
+                Path(escrow_macaroon_path).read_bytes().hex()
+                if escrow_macaroon_path is not None
+                else None
+            ),
         )
 
     def _ensure(self) -> None:
@@ -595,6 +721,30 @@ class LndBackend:
             self._channel
         )
 
+    def _ensure_escrow(self) -> None:
+        if self._escrow_stub is not None:
+            return
+        if not self.escrow_macaroon_hex:
+            raise LndEscrowCredentialError(
+                "ChannelEscrowRPC requires a dedicated escrow macaroon credential"
+            )
+        import grpc  # type: ignore[import-untyped]
+
+        from jmswap.lndrpc import channelescrow_pb2_grpc
+
+        ssl = grpc.ssl_channel_credentials(self.tls_cert)
+
+        def add_escrow_macaroon(_context: Any, callback: Any) -> None:
+            callback((("macaroon", self.escrow_macaroon_hex),), None)
+
+        credentials = grpc.composite_channel_credentials(
+            ssl, grpc.metadata_call_credentials(add_escrow_macaroon)
+        )
+        self._escrow_channel = grpc.aio.secure_channel(self.host, credentials)
+        self._escrow_stub = channelescrow_pb2_grpc.ChannelEscrowStub(  # type: ignore[no-untyped-call]
+            self._escrow_channel
+        )
+
     async def close(self) -> None:
         if self._acceptor_task is not None:
             self._acceptor_task.cancel()
@@ -603,10 +753,373 @@ class LndBackend:
         self._acceptor_started = None
         self._acceptor_call = None
         self._acceptor_registrations.clear()
-        if self._channel is not None:
-            await self._channel.close()
+        channels = (self._escrow_channel, self._channel)
+        closed: set[int] = set()
+        for channel in channels:
+            if channel is not None and id(channel) not in closed:
+                await channel.close()
+                closed.add(id(channel))
         self._channel = None
+        self._escrow_channel = None
         self._stub = None
+        self._escrow_stub = None
+
+    @staticmethod
+    def _escrow_session_id(session_id: str) -> bytes:
+        if not isinstance(session_id, str) or not session_id:
+            raise ValueError("escrow session ID must be a non-empty string")
+        return hashlib.sha256(session_id.encode()).digest()
+
+    @staticmethod
+    def _parse_escrow_outpoint(channel_point: str) -> EscrowOutpoint:
+        try:
+            txid, vout = channel_point.rsplit(":", 1)
+            return EscrowOutpoint(txid=txid, vout=int(vout))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("channel point must use lowercase txid:vout format") from exc
+
+    @staticmethod
+    def _rpc_escrow_outpoint(outpoint: EscrowOutpoint) -> Any:
+        from jmswap.lndrpc import channelescrow_pb2 as escrow
+
+        return escrow.ChannelPoint(
+            funding_txid=bytes.fromhex(outpoint.txid)[::-1],
+            output_index=outpoint.vout,
+        )
+
+    @staticmethod
+    def _rpc_escrow_txid(raw_hash: bytes) -> str:
+        if len(raw_hash) != 32:
+            raise LndValidationError("ChannelEscrowRPC returned an invalid transaction ID")
+        return raw_hash[::-1].hex()
+
+    async def _resolve_escrow_channel_point(self, channel_id: str) -> EscrowOutpoint:
+        if ":" in channel_id:
+            return self._parse_escrow_outpoint(channel_id)
+        self._ensure()
+        response = await self._stub.ListChannels(ln.ListChannelsRequest())
+        for channel in response.channels:
+            if str(channel.chan_id) == channel_id:
+                return self._parse_escrow_outpoint(str(channel.channel_point))
+        raise LndValidationError(f"LND channel not found: {channel_id}")
+
+    async def freeze_channel_input(self, session_id: str, channel_id: str) -> FrozenChannelSnapshot:
+        """Freeze one existing final-Taproot channel for an externally coordinated parent."""
+        self._ensure_escrow()
+        point = await self._resolve_escrow_channel_point(channel_id)
+        from jmswap.lndrpc import channelescrow_pb2 as escrow
+
+        response = await self._escrow_stub.FreezeChannel(
+            escrow.FreezeChannelRequest(
+                channel_point=self._rpc_escrow_outpoint(point),
+                session_id=self._escrow_session_id(session_id),
+            )
+        )
+        try:
+            if not response.HasField("funding_outpoint"):
+                raise ValueError("missing frozen funding outpoint")
+            frozen_point = EscrowOutpoint(
+                txid=self._rpc_escrow_txid(bytes(response.funding_outpoint.funding_txid)),
+                vout=int(response.funding_outpoint.output_index),
+            )
+            if frozen_point != point:
+                raise ValueError("frozen outpoint differs from the requested channel")
+            return FrozenChannelSnapshot(
+                session_id=session_id,
+                channel_id=channel_id,
+                funding_outpoint=frozen_point,
+                funding_scriptpubkey=bytes(response.funding_script),
+                peer_node_pubkey=bytes(response.peer_pubkey),
+                local_funding_pubkey=bytes(response.local_funding_pubkey),
+                remote_funding_pubkey=bytes(response.remote_funding_pubkey),
+                capacity_sat=int(response.capacity_sat),
+                local_claim_sat=int(response.local_claim_sat),
+                remote_claim_sat=int(response.remote_claim_sat),
+            )
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise LndValidationError(
+                "ChannelEscrowRPC returned invalid frozen final-Taproot channel data"
+            ) from exc
+
+    @staticmethod
+    def _escrow_prevouts(
+        parent_tx_hex: str,
+        input_utxos: Sequence[WitnessUtxo | tuple[int, bytes]],
+        channel_input_index: int,
+        funding_outpoint: EscrowOutpoint,
+    ) -> tuple[bytes, list[WitnessUtxo]]:
+        try:
+            raw_parent_tx = bytes.fromhex(parent_tx_hex)
+            parent = parse_transaction(parent_tx_hex)
+            if not raw_parent_tx or len(input_utxos) != len(parent.inputs):
+                raise ValueError("parent transaction and prevouts differ in input count")
+            if not 0 <= channel_input_index < len(parent.inputs):
+                raise ValueError("channel input index is outside the parent transaction")
+            channel_input = parent.inputs[channel_input_index]
+            if (
+                channel_input.txid != funding_outpoint.txid
+                or channel_input.vout != funding_outpoint.vout
+            ):
+                raise ValueError("channel input does not spend the frozen funding outpoint")
+            prevouts = [
+                utxo
+                if isinstance(utxo, WitnessUtxo)
+                else WitnessUtxo(value_sat=utxo[0], script_pubkey=utxo[1])
+                for utxo in input_utxos
+            ]
+        except (IndexError, TypeError, ValueError) as exc:
+            raise ValueError("invalid final-Taproot parent transaction or prevouts") from exc
+        return raw_parent_tx, prevouts
+
+    async def prepare_channel_input_parent(
+        self,
+        session_id: str,
+        funding_outpoint: EscrowOutpoint,
+        parent_tx_hex: str,
+        input_utxos: Sequence[WitnessUtxo | tuple[int, bytes]],
+        channel_input_index: int,
+    ) -> str:
+        """Durably bind LND to one exact parent and complete BIP341 prevouts."""
+        raw_parent_tx, prevouts = self._escrow_prevouts(
+            parent_tx_hex, input_utxos, channel_input_index, funding_outpoint
+        )
+        expected_txid = get_txid(parent_tx_hex)
+        self._ensure_escrow()
+        from jmswap.lndrpc import channelescrow_pb2 as escrow
+
+        response = await self._escrow_stub.PrepareParent(
+            escrow.PrepareParentRequest(
+                channel_point=self._rpc_escrow_outpoint(funding_outpoint),
+                session_id=self._escrow_session_id(session_id),
+                raw_parent_tx=raw_parent_tx,
+                prev_outs=[
+                    escrow.PrevOut(value_sat=utxo.value_sat, pk_script=utxo.script_pubkey)
+                    for utxo in prevouts
+                ],
+                channel_input_index=channel_input_index,
+            )
+        )
+        response_txid = self._rpc_escrow_txid(bytes(response.txid))
+        if response_txid != expected_txid:
+            raise LndValidationError("ChannelEscrowRPC authorized an unexpected parent transaction")
+        return response_txid
+
+    async def begin_channel_input_signing(
+        self,
+        session_id: str,
+        funding_outpoint: EscrowOutpoint,
+        *,
+        restart_attempt: bool = False,
+    ) -> LndEscrowSigningAttempt:
+        """Create or retrieve the active MuSig2 attempt for the prepared parent."""
+        if not isinstance(restart_attempt, bool):
+            raise ValueError("restart_attempt must be a boolean")
+        self._ensure_escrow()
+        from jmswap.lndrpc import channelescrow_pb2 as escrow
+
+        response = await self._escrow_stub.BeginSigning(
+            escrow.BeginSigningRequest(
+                channel_point=self._rpc_escrow_outpoint(funding_outpoint),
+                session_id=self._escrow_session_id(session_id),
+                restart_attempt=restart_attempt,
+            )
+        )
+        try:
+            return LndEscrowSigningAttempt(
+                attempt_id=bytes(response.attempt_id),
+                public_nonce=bytes(response.local_public_nonce),
+            )
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise LndValidationError(
+                "ChannelEscrowRPC returned invalid MuSig2 attempt data"
+            ) from exc
+
+    async def sign_channel_input_parent(
+        self,
+        session_id: str,
+        funding_outpoint: EscrowOutpoint,
+        attempt: LndEscrowSigningAttempt,
+        remote_public_nonce: bytes,
+    ) -> bytes:
+        """Persist and return this endpoint's partial signature for the active attempt."""
+        if len(remote_public_nonce) != 66:
+            raise ValueError("remote MuSig2 public nonce must be exactly 66 bytes")
+        self._ensure_escrow()
+        from jmswap.lndrpc import channelescrow_pb2 as escrow
+
+        response = await self._escrow_stub.SignParent(
+            escrow.SignParentRequest(
+                channel_point=self._rpc_escrow_outpoint(funding_outpoint),
+                session_id=self._escrow_session_id(session_id),
+                attempt_id=attempt.attempt_id,
+                remote_public_nonce=remote_public_nonce,
+            )
+        )
+        partial_signature = bytes(response.local_partial_signature)
+        if len(partial_signature) != 32:
+            raise LndValidationError(
+                "ChannelEscrowRPC returned an invalid MuSig2 partial signature"
+            )
+        return partial_signature
+
+    async def finalize_channel_input_parent(
+        self,
+        session_id: str,
+        funding_outpoint: EscrowOutpoint,
+        attempt: LndEscrowSigningAttempt,
+        remote_partial_signature: bytes,
+    ) -> LndFinalizedEscrowParent:
+        """Finalize an active attempt; the external coordinator owns subsequent broadcast."""
+        return await self._finalize_channel_input_parent(
+            session_id, funding_outpoint, attempt.attempt_id, remote_partial_signature
+        )
+
+    async def recover_channel_input_parent(
+        self,
+        session_id: str,
+        funding_outpoint: EscrowOutpoint,
+        remote_partial_signature: bytes,
+    ) -> LndFinalizedEscrowParent:
+        """Finalize from durable partial-signature evidence after an attempt ID is lost."""
+        return await self._finalize_channel_input_parent(
+            session_id, funding_outpoint, b"", remote_partial_signature
+        )
+
+    async def _finalize_channel_input_parent(
+        self,
+        session_id: str,
+        funding_outpoint: EscrowOutpoint,
+        attempt_id: bytes,
+        remote_partial_signature: bytes,
+    ) -> LndFinalizedEscrowParent:
+        if len(attempt_id) not in (0, 32):
+            raise ValueError("MuSig2 attempt ID must be empty or exactly 32 bytes")
+        if len(remote_partial_signature) != 32:
+            raise ValueError("remote MuSig2 partial signature must be exactly 32 bytes")
+        self._ensure_escrow()
+        from jmswap.lndrpc import channelescrow_pb2 as escrow
+
+        response = await self._escrow_stub.FinalizeParent(
+            escrow.FinalizeParentRequest(
+                channel_point=self._rpc_escrow_outpoint(funding_outpoint),
+                session_id=self._escrow_session_id(session_id),
+                attempt_id=attempt_id,
+                remote_partial_signature=remote_partial_signature,
+            )
+        )
+        return self._parse_finalized_escrow_parent(
+            bytes(response.raw_tx), self._rpc_escrow_txid(bytes(response.txid)), funding_outpoint
+        )
+
+    @staticmethod
+    def _parse_finalized_escrow_parent(
+        raw_tx: bytes, txid: str, funding_outpoint: EscrowOutpoint
+    ) -> LndFinalizedEscrowParent:
+        try:
+            tx_hex = raw_tx.hex()
+            if get_txid(tx_hex) != txid:
+                raise ValueError("finalized parent transaction ID differs from its bytes")
+            parsed = parse_transaction(tx_hex)
+            matching_indices = [
+                index
+                for index, tx_input in enumerate(parsed.inputs)
+                if tx_input.txid == funding_outpoint.txid and tx_input.vout == funding_outpoint.vout
+            ]
+            if len(matching_indices) != 1 or len(parsed.witnesses) != len(parsed.inputs):
+                raise ValueError("finalized parent lacks one exact channel input")
+            channel_input_index = matching_indices[0]
+            witness = tuple(parsed.witnesses[channel_input_index])
+            if any(
+                parsed.witnesses[index]
+                for index in range(len(parsed.inputs))
+                if index != channel_input_index
+            ):
+                raise ValueError("finalized parent includes unexpected non-channel witnesses")
+            return LndFinalizedEscrowParent(
+                tx_hex=tx_hex,
+                txid=txid,
+                channel_input_index=channel_input_index,
+                channel_input_witness=witness,
+            )
+        except (IndexError, TypeError, ValueError) as exc:
+            raise LndValidationError(
+                "ChannelEscrowRPC returned invalid final-Taproot channel witness data"
+            ) from exc
+
+    async def channel_input_escrow_status(
+        self, session_id: str, funding_outpoint: EscrowOutpoint
+    ) -> LndEscrowStatus:
+        """Return and validate durable state for a final-Taproot channel-input session."""
+        self._ensure_escrow()
+        from jmswap.lndrpc import channelescrow_pb2 as escrow
+
+        response = await self._escrow_stub.Status(
+            escrow.StatusRequest(
+                channel_point=self._rpc_escrow_outpoint(funding_outpoint),
+                session_id=self._escrow_session_id(session_id),
+            )
+        )
+        try:
+            stage = LndEscrowStage(int(response.stage))
+            active_attempt_id = bytes(response.active_attempt_id)
+            active_nonce = bytes(response.active_local_public_nonce)
+            if bool(active_attempt_id) != bool(active_nonce):
+                raise ValueError("active attempt ID and nonce differ")
+            parent_txid = (
+                self._rpc_escrow_txid(bytes(response.parent_txid)) if response.parent_txid else None
+            )
+            finalized_parent = None
+            if response.finalized_parent_tx:
+                if parent_txid is None:
+                    raise ValueError("finalized parent lacks a parent transaction ID")
+                finalized_parent = self._parse_finalized_escrow_parent(
+                    bytes(response.finalized_parent_tx), parent_txid, funding_outpoint
+                )
+            return LndEscrowStatus(
+                stage=stage,
+                parent_txid=parent_txid,
+                finalized=bool(response.finalized),
+                durable_local_public_nonce=(
+                    bytes(response.durable_local_public_nonce)
+                    if response.durable_local_public_nonce
+                    else None
+                ),
+                durable_remote_public_nonce=(
+                    bytes(response.durable_remote_public_nonce)
+                    if response.durable_remote_public_nonce
+                    else None
+                ),
+                durable_local_partial_signature=(
+                    bytes(response.durable_local_partial_signature)
+                    if response.durable_local_partial_signature
+                    else None
+                ),
+                finalized_parent=finalized_parent,
+                active_attempt=(
+                    LndEscrowSigningAttempt(attempt_id=active_attempt_id, public_nonce=active_nonce)
+                    if active_attempt_id
+                    else None
+                ),
+            )
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise LndValidationError(
+                "ChannelEscrowRPC returned inconsistent durable status"
+            ) from exc
+
+    async def cancel_channel_input_escrow(
+        self, session_id: str, funding_outpoint: EscrowOutpoint
+    ) -> bool:
+        """Cancel a pre-sign escrow session and report whether its channel link resumed."""
+        self._ensure_escrow()
+        from jmswap.lndrpc import channelescrow_pb2 as escrow
+
+        response = await self._escrow_stub.Cancel(
+            escrow.CancelRequest(
+                channel_point=self._rpc_escrow_outpoint(funding_outpoint),
+                session_id=self._escrow_session_id(session_id),
+            )
+        )
+        return bool(response.link_resumed)
 
     async def node_info(self, *, timeout_seconds: float = 10.0) -> LndNodeInfo:
         self._ensure()

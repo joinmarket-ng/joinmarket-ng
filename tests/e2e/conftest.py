@@ -135,6 +135,7 @@ def pytest_collection_modifyitems(
             "reference_maker",
             "neutrino_reference",
             "tumbler_e2e",
+            "lnd_channel_escrow",
             "ring_e2e",
         }
         item_markers = {marker.name for marker in item.iter_markers()}

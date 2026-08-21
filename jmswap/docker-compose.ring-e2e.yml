@@ -1,5 +1,5 @@
 x-lnd: &lnd
-  image: lightninglabs/lnd:v0.21.1-beta
+  image: ${RING_E2E_LND_IMAGE:-lightninglabs/lnd:v0.21.1-beta}
   entrypoint: ["/bin/sh", "/scripts/ring-e2e-lnd.sh"]
   restart: "no"
   volumes:

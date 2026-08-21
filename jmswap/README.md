@@ -30,10 +30,37 @@ outpoint, and every native SegWit witness UTXO before calling
 `PsbtVerify(skip_finalize=true)`. Readiness requires matching
 `PendingChannelObservation` values from both endpoints.
 
-The confirmation-gated channel-input escrow and reuse of live channels are not
-implemented. The current backend supports only the co-funded channel-ring
-lifecycle and guarded retirement before any funding transaction signatures are
-created or broadcast.
+The end-to-end confirmation-gated channel-input coordinator is not implemented.
+The stock-LND path supports the co-funded channel-ring lifecycle and guarded
+retirement before any funding transaction signatures are created or broadcast.
+
+## Optional ChannelEscrowRPC Transport
+
+For a patched LND v0.21.1 deployment, `LndBackend` also exposes a narrow,
+typed ChannelEscrowRPC transport boundary for a final-Taproot channel input.
+Pass `escrow_macaroon_hex` to the constructor, or `escrow_macaroon_path` to
+`from_paths`, to enable it. Escrow RPCs use a separate authenticated gRPC
+channel and refuse to run without that dedicated credential; ordinary
+co-funded channel-ring use never initializes it.
+
+Set `LND_EXTERNAL_IMAGE` for the two-node external-LND Compose profile or
+`RING_E2E_LND_IMAGE` for the ring E2E profile to run a compatible patched
+image. Both variables retain stock LND `v0.21.1-beta` as their default.
+
+Run the opt-in exact-parent restart-recovery test with a patched image:
+
+```bash
+LND_EXTERNAL_IMAGE=lnd-channelescrow:v0.21.1-beta-local \
+  scripts/run-ring-e2e.sh lnd-escrow
+```
+
+The boundary can freeze a channel, bind an exact parent and its prevouts,
+manage MuSig2 signing attempts, recover finalization from durable evidence,
+query durable status, and cancel before signing. It validates all returned
+outpoints, transaction IDs, final witnesses, and stage evidence. It does not
+provide an escrow coordinator, established-channel-input lifecycle, timeout or
+HTLC policy, or transaction broadcast. The external coordinator broadcasts
+only after all CoinJoin inputs are finalized.
 
 After `PsbtVerify(skip_finalize=true)`, a funding shim cannot provide a
 reliable rollback. `retire_verified_external_channel` permits LND's destructive

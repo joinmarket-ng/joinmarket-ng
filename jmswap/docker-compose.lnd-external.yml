@@ -22,7 +22,7 @@ services:
     profiles: [lnd_external]
 
   lnd-opener:
-    image: lightninglabs/lnd:v0.21.1-beta
+    image: ${LND_EXTERNAL_IMAGE:-lightninglabs/lnd:v0.21.1-beta}
     command:
       - --noseedbackup
       - --bitcoin.active
@@ -51,7 +51,7 @@ services:
     profiles: [lnd_external]
 
   lnd-fundee:
-    image: lightninglabs/lnd:v0.21.1-beta
+    image: ${LND_EXTERNAL_IMAGE:-lightninglabs/lnd:v0.21.1-beta}
     command:
       - --noseedbackup
       - --bitcoin.active

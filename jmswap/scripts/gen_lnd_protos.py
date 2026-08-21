@@ -59,16 +59,23 @@ def main() -> int:
             f"--grpc_python_out={OUT_DIR}",
             f"--mypy_out={OUT_DIR}",
             "lightning.proto",
+            "channelescrow.proto",
         ],
         check=True,
     )
-    grpc_stub = OUT_DIR / "lightning_pb2_grpc.py"
-    grpc_stub.write_text(
-        grpc_stub.read_text().replace(
-            "import lightning_pb2 as lightning__pb2",
-            "from . import lightning_pb2 as lightning__pb2",
+    for proto_name in ("lightning", "channelescrow"):
+        grpc_stub = OUT_DIR / f"{proto_name}_pb2_grpc.py"
+        grpc_stub.write_text(
+            grpc_stub.read_text().replace(
+                f"import {proto_name}_pb2 as {proto_name}__pb2",
+                f"from . import {proto_name}_pb2 as {proto_name}__pb2",
+            )
         )
-    )
+    for generated_path in (
+        OUT_DIR / "channelescrow_pb2.py",
+        OUT_DIR / "channelescrow_pb2_grpc.py",
+    ):
+        generated_path.write_text(f"# ruff: noqa\n{generated_path.read_text()}")
     print(f"generated {LND_TAG} stubs from SHA256 {PROTO_SHA256}")
     return 0
 
