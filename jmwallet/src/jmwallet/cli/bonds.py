@@ -320,12 +320,12 @@ def generate_bond_address(
     from jmwallet.wallet.address import script_to_p2wsh_address
     from jmwallet.wallet.bip32 import HDKey, mnemonic_to_seed
     from jmwallet.wallet.bond_registry import (
+        BondRegistry,
         create_bond_info,
         get_registry_path,
-        load_registry,
         make_wallet_ownership_predicate,
         migrate_legacy_registry,
-        save_registry,
+        update_registry,
     )
     from jmwallet.wallet.service import FIDELITY_BOND_BRANCH
 
@@ -364,12 +364,16 @@ def generate_bond_address(
             wallet_fingerprint,
             make_wallet_ownership_predicate(master_key, root_path),
         )
-        registry = load_registry(resolved_data_dir, wallet_fingerprint, allow_legacy_fallback=False)
-        existing_bond = registry.get_bond_by_address(address)
-        if existing_bond:
-            existing = True
-            logger.info(f"Bond already exists in registry (created: {existing_bond.created_at})")
-        else:
+
+        def add_bond(registry: BondRegistry) -> bool:
+            nonlocal existing
+            existing_bond = registry.get_bond_by_address(address)
+            if existing_bond:
+                existing = True
+                logger.info(
+                    f"Bond already exists in registry (created: {existing_bond.created_at})"
+                )
+                return False
             bond_info = create_bond_info(
                 address=address,
                 locktime=locktime,
@@ -380,8 +384,15 @@ def generate_bond_address(
                 network=resolved_network,
             )
             registry.add_bond(bond_info)
-            save_registry(registry, resolved_data_dir, wallet_fingerprint)
-            saved = True
+            return True
+
+        saved = (
+            update_registry(resolved_data_dir, wallet_fingerprint, add_bond).get_bond_by_address(
+                address
+            )
+            is not None
+            and not existing
+        )
 
     print("\n" + "=" * 80)
     print("FIDELITY BOND ADDRESS")
@@ -554,12 +565,12 @@ def import_bond(
     from jmwallet.wallet.address import script_to_p2wsh_address
     from jmwallet.wallet.bip32 import HDKey, mnemonic_to_seed
     from jmwallet.wallet.bond_registry import (
+        BondRegistry,
         create_bond_info,
         get_registry_path,
-        load_registry,
         make_wallet_ownership_predicate,
         migrate_legacy_registry,
-        save_registry,
+        update_registry,
     )
     from jmwallet.wallet.service import FIDELITY_BOND_BRANCH
 
@@ -584,24 +595,31 @@ def import_bond(
         wallet_fingerprint,
         make_wallet_ownership_predicate(master_key, root_path),
     )
-    registry = load_registry(resolved_data_dir, wallet_fingerprint, allow_legacy_fallback=False)
-    existing = registry.get_bond_by_address(address)
-    if existing:
-        print(f"\nBond already in registry (created: {existing.created_at})")
+    existing_created_at: str | None = None
+
+    def add_imported_bond(registry: BondRegistry) -> bool:
+        nonlocal existing_created_at
+        existing_bond = registry.get_bond_by_address(address)
+        if existing_bond:
+            existing_created_at = existing_bond.created_at
+            return False
+        bond_info = create_bond_info(
+            address=address,
+            locktime=locktime,
+            index=timenumber,
+            path=deriv_path,
+            pubkey_hex=pubkey_hex,
+            witness_script=witness_script,
+            network=resolved_network,
+        )
+        registry.add_bond(bond_info)
+        return True
+
+    update_registry(resolved_data_dir, wallet_fingerprint, add_imported_bond)
+    if existing_created_at:
+        print(f"\nBond already in registry (created: {existing_created_at})")
         print(f"Address: {address}")
         raise typer.Exit(0)
-
-    bond_info = create_bond_info(
-        address=address,
-        locktime=locktime,
-        index=timenumber,
-        path=deriv_path,
-        pubkey_hex=pubkey_hex,
-        witness_script=witness_script,
-        network=resolved_network,
-    )
-    registry.add_bond(bond_info)
-    save_registry(registry, resolved_data_dir, wallet_fingerprint)
 
     from jmcore.timenumber import format_locktime_date
 
@@ -736,9 +754,10 @@ async def _sync_bonds_async(
     )
     from jmwallet.backends.neutrino import NeutrinoBackend
     from jmwallet.wallet.bond_registry import (
+        BondRegistry,
         get_registry_path,
         load_registry,
-        save_registry,
+        update_registry,
     )
     from jmwallet.wallet.service import WalletService
 
@@ -839,13 +858,25 @@ async def _sync_bonds_async(
                 )
 
         funded = 0
-        for bond in network_bonds:
-            addr_utxos = utxos_by_address.get(bond.address.lower(), [])
-            registry.set_bond_utxos(bond.address, addr_utxos)
-            if addr_utxos:
-                funded += 1
+        scanned_addresses = {bond.address.lower() for bond in network_bonds}
 
-        save_registry(registry, data_dir, wallet.wallet_fingerprint)
+        def refresh_bond_utxos(current_registry: BondRegistry) -> bool:
+            nonlocal funded
+            changed = False
+            for bond in current_registry.bonds:
+                if bond.network != network or bond.address.lower() not in scanned_addresses:
+                    continue
+                addr_utxos = utxos_by_address.get(bond.address.lower(), [])
+                before = (bond.txid, bond.vout, bond.value, bond.confirmations, bond.extra_utxos)
+                current_registry.set_bond_utxos(bond.address, addr_utxos)
+                after = (bond.txid, bond.vout, bond.value, bond.confirmations, bond.extra_utxos)
+                changed |= before != after
+                if addr_utxos:
+                    funded += 1
+            return changed
+
+        registry = update_registry(data_dir, wallet.wallet_fingerprint, refresh_bond_utxos)
+        network_bonds = [bond for bond in registry.bonds if bond.network == network]
 
         print("-" * 60)
         print(f"Funded bonds:   {funded}")
@@ -1028,11 +1059,12 @@ async def _recover_bonds_async(
     )
     from jmwallet.backends.neutrino import NeutrinoBackend
     from jmwallet.wallet.bond_registry import (
+        BondRegistry,
         BondUtxo,
         create_bond_info,
         get_registry_path,
         load_registry,
-        save_registry,
+        update_registry,
     )
     from jmwallet.wallet.service import FIDELITY_BOND_BRANCH, WalletService
 
@@ -1209,8 +1241,47 @@ async def _recover_bonds_async(
                 registry.set_bond_utxos(address, bond_utxos)
                 new_bonds += 1
 
-        # Save registry
-        save_registry(registry, backend_settings.data_dir, wallet.wallet_fingerprint)
+        def merge_discovered_bonds(current_registry: BondRegistry) -> bool:
+            changed = False
+            for address, addr_utxos in utxos_by_address.items():
+                source_bond = registry.get_bond_by_address(address)
+                if source_bond is None:
+                    continue
+                target_bond = current_registry.get_bond_by_address(address)
+                bond_utxos = [
+                    BondUtxo(
+                        txid=utxo.txid,
+                        vout=utxo.vout,
+                        value=utxo.value,
+                        confirmations=utxo.confirmations,
+                    )
+                    for utxo in addr_utxos
+                ]
+                if target_bond is None:
+                    current_registry.add_bond(source_bond)
+                    target_bond = current_registry.get_bond_by_address(address)
+                    changed = True
+                assert target_bond is not None
+                before = (
+                    target_bond.txid,
+                    target_bond.vout,
+                    target_bond.value,
+                    target_bond.confirmations,
+                    target_bond.extra_utxos,
+                )
+                current_registry.set_bond_utxos(address, bond_utxos)
+                changed |= before != (
+                    target_bond.txid,
+                    target_bond.vout,
+                    target_bond.value,
+                    target_bond.confirmations,
+                    target_bond.extra_utxos,
+                )
+            return changed
+
+        update_registry(
+            backend_settings.data_dir, wallet.wallet_fingerprint, merge_discovered_bonds
+        )
 
         print("-" * 60)
         print(f"Added {new_bonds} new bond(s) to registry")

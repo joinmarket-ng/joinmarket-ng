@@ -384,6 +384,75 @@ class TestAppendAndReadHistory:
 
         assert {entry.txid for entry in read_history(temp_data_dir)} == {"existing", "new"}
 
+    def test_append_preserves_malformed_current_header_rows(self, temp_data_dir: Path) -> None:
+        """Appending retains current-layout rows that the reader skips."""
+        history_path = temp_data_dir / "history.csv"
+        fieldnames = [field.name for field in fields(TransactionHistoryEntry)]
+        valid_entry = TransactionHistoryEntry(
+            timestamp="2024-01-01T00:00:00",
+            txid="existing-valid",
+            failure_reason='Preserve this, including "quotes"',
+        )
+        malformed_row = {fieldname: "" for fieldname in fieldnames}
+        malformed_row.update(
+            timestamp="2024-01-02T00:00:00",
+            txid="existing-malformed",
+            confirmations="not-an-integer",
+            failure_reason='Preserve this malformed, "row"',
+        )
+        with open(history_path, "w", newline="", encoding="utf-8") as history_file:
+            writer = csv.DictWriter(history_file, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerow(
+                {field.name: getattr(valid_entry, field.name) for field in fields(valid_entry)}
+            )
+            writer.writerow(malformed_row)
+        original_content = history_path.read_bytes()
+
+        appended_entry = TransactionHistoryEntry(
+            timestamp="2024-01-03T00:00:00",
+            txid="appended-entry",
+        )
+        append_history_entry(appended_entry, temp_data_dir)
+
+        assert history_path.read_bytes().startswith(original_content)
+        with open(history_path, newline="", encoding="utf-8") as history_file:
+            rows = list(csv.DictReader(history_file))
+        assert rows[1] == malformed_row
+        assert {entry.txid for entry in read_history(temp_data_dir)} == {
+            "existing-valid",
+            "appended-entry",
+        }
+
+    def test_append_separates_unterminated_current_header_row(self, temp_data_dir: Path) -> None:
+        """Appending creates a row boundary when the existing final row has no newline."""
+        history_path = temp_data_dir / "history.csv"
+        fieldnames = [field.name for field in fields(TransactionHistoryEntry)]
+        existing_entry = TransactionHistoryEntry(
+            timestamp="2024-01-01T00:00:00",
+            txid="unterminated-entry",
+        )
+        with open(history_path, "w", newline="", encoding="utf-8") as history_file:
+            writer = csv.DictWriter(history_file, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerow(
+                {
+                    field.name: getattr(existing_entry, field.name)
+                    for field in fields(existing_entry)
+                }
+            )
+        history_path.write_bytes(history_path.read_bytes().rstrip(b"\r\n"))
+
+        append_history_entry(
+            TransactionHistoryEntry(timestamp="2024-01-02T00:00:00", txid="appended-entry"),
+            temp_data_dir,
+        )
+
+        assert {entry.txid for entry in read_history(temp_data_dir)} == {
+            "unterminated-entry",
+            "appended-entry",
+        }
+
     def test_read_with_role_filter(self, temp_data_dir: Path) -> None:
         """Test reading with role filter."""
         # Add maker entry

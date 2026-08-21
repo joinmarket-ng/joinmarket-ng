@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
 import time
 from pathlib import Path
 
@@ -15,7 +16,31 @@ from jmwallet.wallet.bond_registry import (
     get_registry_path,
     load_registry,
     save_registry,
+    update_registry,
 )
+
+
+def _add_bond_in_process(data_dir: str, index: int) -> None:
+    """Exercise the sidecar lock from independent Python processes."""
+    path = Path(data_dir)
+
+    def add_bond(registry: BondRegistry) -> bool:
+        registry.add_bond(
+            FidelityBondInfo(
+                address=f"bcrt1qconcurrent{index}",
+                locktime=1_900_000_000 + index,
+                locktime_human="2030-03-17 17:46:40",
+                index=index,
+                path=f"m/84'/1'/0'/2/{index}",
+                pubkey="02" + f"{index:02x}" * 32,
+                witness_script_hex="00" * 50,
+                network="regtest",
+                created_at="2026-01-01T00:00:00",
+            )
+        )
+        return True
+
+    update_registry(path, "deadbeef", add_bond)
 
 
 class TestFidelityBondInfo:
@@ -492,6 +517,55 @@ class TestRegistryPersistence:
         save_registry(registry, tmp_path)
         mode = get_registry_path(tmp_path).stat().st_mode & 0o777
         assert mode == 0o600
+
+    def test_update_registry_preserves_concurrent_updates(self, tmp_path: Path) -> None:
+        """Two independent writers must not lose either registry mutation."""
+        context = multiprocessing.get_context("spawn")
+        processes = [
+            context.Process(target=_add_bond_in_process, args=(str(tmp_path), index))
+            for index in range(2)
+        ]
+        for process in processes:
+            process.start()
+        for process in processes:
+            process.join(timeout=10)
+            assert process.exitcode == 0
+
+        registry = load_registry(tmp_path, "deadbeef", allow_legacy_fallback=False)
+        assert {bond.address for bond in registry.bonds} == {
+            "bcrt1qconcurrent0",
+            "bcrt1qconcurrent1",
+        }
+
+    def test_update_registry_preserves_delegated_certificate(self, tmp_path: Path) -> None:
+        bond = FidelityBondInfo(
+            address="bcrt1qdelegated",
+            locktime=1_900_000_000,
+            locktime_human="2030-03-17 17:46:40",
+            index=-1,
+            path="external",
+            pubkey="02" + "11" * 32,
+            witness_script_hex="00" * 50,
+            network="regtest",
+            created_at="2026-01-01T00:00:00",
+            cert_pubkey="02" + "22" * 32,
+            cert_privkey="33" * 32,
+            cert_signature="44" * 64,
+            cert_expiry=999,
+        )
+        save_registry(BondRegistry(bonds=[bond]), tmp_path, "deadbeef")
+
+        def refresh_utxo(registry: BondRegistry) -> bool:
+            return registry.update_utxo_info(bond.address, "aa" * 32, 0, 50_000, 6)
+
+        refreshed = update_registry(tmp_path, "deadbeef", refresh_utxo)
+        updated = refreshed.get_bond_by_address(bond.address)
+        assert updated is not None
+        assert updated.value == 50_000
+        assert updated.cert_pubkey == bond.cert_pubkey
+        assert updated.cert_privkey == bond.cert_privkey
+        assert updated.cert_signature == bond.cert_signature
+        assert updated.cert_expiry == bond.cert_expiry
 
 
 class TestCreateBondInfo:

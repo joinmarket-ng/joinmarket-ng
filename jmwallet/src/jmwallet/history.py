@@ -191,6 +191,7 @@ HISTORY_FILENAME = "history.csv"
 LEGACY_HISTORY_FILENAME = "coinjoin_history.csv"
 HISTORY_LOCK_SUFFIX = ".lock"
 
+
 # A normal CoinJoin has no more than two outputs per participant (CoinJoin and
 # change). New rows retain the exact vout; this cap bounds compatibility scans
 # of manually edited or legacy history rows.
@@ -684,7 +685,11 @@ def append_history_entry(
             # Migrate legacy headers so new columns are not appended past the
             # on-disk header (which would otherwise silently lose data on read).
             _ensure_history_header_current(history_path)
-            fd = _open_owner_only_regular(history_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
+            fd = _open_owner_only_regular(history_path, os.O_RDWR | os.O_CREAT | os.O_APPEND)
+            if os.fstat(fd).st_size:
+                os.lseek(fd, -1, os.SEEK_END)
+                if os.read(fd, 1) not in (b"\n", b"\r"):
+                    os.write(fd, b"\n")
             with os.fdopen(fd, "a", newline="", encoding="utf-8") as f:
                 writer = csv.DictWriter(f, fieldnames=fieldnames)
                 if os.fstat(f.fileno()).st_size == 0:

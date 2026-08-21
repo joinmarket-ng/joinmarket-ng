@@ -14,7 +14,7 @@ from loguru import logger
 
 from jmcore.protocol import UTXOMetadata
 from jmwallet.history import get_address_history_types, get_used_addresses
-from jmwallet.wallet.bond_registry import create_bond_info, load_registry, save_registry
+from jmwallet.wallet.bond_registry import create_bond_info, update_registry
 from jmwallet.wallet.constants import FIDELITY_BOND_BRANCH
 from jmwalletd.deps import get_daemon_state, require_auth, require_wallet_match
 from jmwalletd.errors import (
@@ -349,8 +349,12 @@ async def get_timelock_address(
     # Persist the bond to the registry so the maker can pick it up at startup.
     # Disable the legacy fallback so foreign bonds are never copied into this
     # wallet's per-wallet file on save (#492).
-    registry = load_registry(state.data_dir, ws.wallet_fingerprint, allow_legacy_fallback=False)
-    if not registry.get_bond_by_address(address):
+    registered = False
+
+    def register_bond(registry: Any) -> bool:
+        nonlocal registered
+        if registry.get_bond_by_address(address):
+            return False
         pubkey_hex = (
             ws.get_fidelity_bond_key(timenumber, locktime)
             .get_public_key_bytes(compressed=True)
@@ -368,7 +372,11 @@ async def get_timelock_address(
             network=ws.network,
         )
         registry.add_bond(bond_info)
-        save_registry(registry, state.data_dir, ws.wallet_fingerprint)
+        registered = True
+        return True
+
+    update_registry(state.data_dir, ws.wallet_fingerprint, register_bond)
+    if registered:
         logger.debug(
             "Registered fidelity bond address {} (timenumber={}, locktime={}) in registry",
             address,

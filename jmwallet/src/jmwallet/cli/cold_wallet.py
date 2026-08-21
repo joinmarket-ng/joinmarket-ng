@@ -186,10 +186,10 @@ def create_bond_address(
 
     from jmwallet.wallet.address import script_to_p2wsh_address
     from jmwallet.wallet.bond_registry import (
+        BondRegistry,
         create_bond_info,
         get_registry_path,
-        load_registry,
-        save_registry,
+        update_registry,
     )
 
     # Resolve wallet fingerprint up front so we fail fast even when --no-save is set,
@@ -211,12 +211,16 @@ def create_bond_address(
     saved = False
     existing = False
     if not no_save:
-        registry = load_registry(resolved_data_dir, resolved_fingerprint)
-        existing_bond = registry.get_bond_by_address(address)
-        if existing_bond:
-            existing = True
-            logger.info(f"Bond already exists in registry (created: {existing_bond.created_at})")
-        else:
+
+        def add_external_bond(registry: BondRegistry) -> bool:
+            nonlocal existing
+            existing_bond = registry.get_bond_by_address(address)
+            if existing_bond:
+                existing = True
+                logger.info(
+                    f"Bond already exists in registry (created: {existing_bond.created_at})"
+                )
+                return False
             # For bonds created from pubkey, we don't have the derivation path or index
             # So we use placeholder values
             bond_info = create_bond_info(
@@ -229,8 +233,10 @@ def create_bond_address(
                 network=network,
             )
             registry.add_bond(bond_info)
-            save_registry(registry, resolved_data_dir, resolved_fingerprint)
-            saved = True
+            return True
+
+        update_registry(resolved_data_dir, resolved_fingerprint, add_external_bond)
+        saved = not existing
 
     # Compute the underlying P2WPKH address for the pubkey (for user confirmation)
     from jmwallet.wallet.address import pubkey_to_p2wpkh_address
@@ -338,24 +344,14 @@ def import_bond_registration(
     from jmcore.paths import get_default_data_dir
 
     from jmwallet.wallet.bond_registry import (
+        BondRegistry,
         create_bond_info,
         get_registry_path,
-        load_registry,
-        save_registry,
+        update_registry,
     )
 
     resolved_data_dir = data_dir if data_dir else get_default_data_dir()
     resolved_fingerprint = _resolve_wallet_fingerprint(wallet_fingerprint)
-    try:
-        registry = load_registry(
-            resolved_data_dir,
-            resolved_fingerprint,
-            allow_legacy_fallback=False,
-            fail_closed=True,
-        )
-    except ValueError as exc:
-        logger.error(f"Cannot import into bond registry: {exc}")
-        raise typer.Exit(1) from exc
 
     imported_bond = create_bond_info(
         address=imported.address,
@@ -367,24 +363,34 @@ def import_bond_registration(
         network=imported.network,
         signer_master_fingerprint=imported.master_fingerprint,
     )
-    existing_bond = registry.get_bond_by_address(imported.address)
-    if existing_bond is None:
-        registry.add_bond(imported_bond)
-        result = "Imported"
-    else:
-        # Preserve observed UTXOs, certificate material, and creation time.
-        existing_bond.address = imported_bond.address
-        existing_bond.locktime = imported_bond.locktime
-        existing_bond.locktime_human = imported_bond.locktime_human
-        existing_bond.index = imported_bond.index
-        existing_bond.path = imported_bond.path
-        existing_bond.pubkey = imported_bond.pubkey
-        existing_bond.witness_script_hex = imported_bond.witness_script_hex
-        existing_bond.network = imported_bond.network
-        existing_bond.signer_master_fingerprint = imported_bond.signer_master_fingerprint
-        result = "Updated existing"
+    result = ""
 
-    save_registry(registry, resolved_data_dir, resolved_fingerprint)
+    def import_registration(registry: BondRegistry) -> bool:
+        nonlocal result
+        existing_bond = registry.get_bond_by_address(imported.address)
+        if existing_bond is None:
+            registry.add_bond(imported_bond)
+            result = "Imported"
+        else:
+            # Preserve observed UTXOs, certificate material, and creation time.
+            existing_bond.address = imported_bond.address
+            existing_bond.locktime = imported_bond.locktime
+            existing_bond.locktime_human = imported_bond.locktime_human
+            existing_bond.index = imported_bond.index
+            existing_bond.path = imported_bond.path
+            existing_bond.pubkey = imported_bond.pubkey
+            existing_bond.witness_script_hex = imported_bond.witness_script_hex
+            existing_bond.network = imported_bond.network
+            existing_bond.signer_master_fingerprint = imported_bond.signer_master_fingerprint
+            result = "Updated existing"
+        return True
+
+    try:
+        update_registry(resolved_data_dir, resolved_fingerprint, import_registration)
+    except ValueError as exc:
+        logger.error(f"Cannot import into bond registry: {exc}")
+        raise typer.Exit(1) from exc
+
     print(f"{result} SeedSigner BIP46 bond registration: {imported.address}")
     print(f"Registry: {get_registry_path(resolved_data_dir, resolved_fingerprint)}")
 
@@ -444,16 +450,24 @@ def generate_hot_keypair(
     saved_to_registry = False
     saved_key_file: Path | None = None
     if bond_address:
-        from jmwallet.wallet.bond_registry import load_registry, save_registry
+        from jmwallet.wallet.bond_registry import BondRegistry, update_registry
 
         resolved_fingerprint = _resolve_wallet_fingerprint(wallet_fingerprint)
-        registry = load_registry(resolved_data_dir, resolved_fingerprint)
-        bond = registry.get_bond_by_address(bond_address)
 
-        if bond:
+        found_bond = False
+
+        def save_hot_key(registry: BondRegistry) -> bool:
+            nonlocal found_bond
+            bond = registry.get_bond_by_address(bond_address)
+            if bond is None:
+                return False
+            found_bond = True
             bond.cert_pubkey = pubkey.hex()
             bond.cert_privkey = privkey.secret_bytes.hex()
-            save_registry(registry, resolved_data_dir, resolved_fingerprint)
+            return True
+
+        update_registry(resolved_data_dir, resolved_fingerprint, save_hot_key)
+        if found_bond:
             saved_to_registry = True
             logger.info("Saved hot keypair to bond registry")
             logger.bind(sensitive=True).info(
@@ -999,12 +1013,26 @@ def import_certificate(
 
     from jmcore.paths import get_default_data_dir
 
-    from jmwallet.wallet.bond_registry import get_registry_path, load_registry, save_registry
+    from jmwallet.wallet.bond_registry import (
+        BondRegistry,
+        get_registry_path,
+        load_registry,
+        update_registry,
+    )
 
     # Load registry first to get bond info
     resolved_data_dir = data_dir if data_dir else get_default_data_dir()
     resolved_fingerprint = _resolve_wallet_fingerprint(wallet_fingerprint)
-    registry = load_registry(resolved_data_dir, resolved_fingerprint)
+    try:
+        registry = load_registry(
+            resolved_data_dir,
+            resolved_fingerprint,
+            allow_legacy_fallback=False,
+            fail_closed=True,
+        )
+    except ValueError as exc:
+        logger.error(f"Cannot import into bond registry: {exc}")
+        raise typer.Exit(1) from exc
 
     # Find bond by address
     bond = registry.get_bond_by_address(address)
@@ -1182,13 +1210,19 @@ def import_certificate(
     else:
         der_sig = cert_sig_bytes
 
-    # Update bond with certificate
-    bond.cert_pubkey = cert_pubkey
-    bond.cert_privkey = cert_privkey
-    bond.cert_signature = der_sig.hex()  # Store as hex DER
-    bond.cert_expiry = cert_expiry
+    def save_certificate(updated_registry: BondRegistry) -> bool:
+        updated_bond = updated_registry.get_bond_by_address(address)
+        if updated_bond is None:
+            raise RuntimeError(f"Bond disappeared from registry: {address}")
+        if updated_bond.pubkey != bond.pubkey:
+            raise RuntimeError(f"Bond changed while importing certificate: {address}")
+        updated_bond.cert_pubkey = cert_pubkey
+        updated_bond.cert_privkey = cert_privkey
+        updated_bond.cert_signature = der_sig.hex()
+        updated_bond.cert_expiry = cert_expiry
+        return True
 
-    save_registry(registry, resolved_data_dir, resolved_fingerprint)
+    update_registry(resolved_data_dir, resolved_fingerprint, save_certificate)
 
     # Calculate expiry info for display
     expiry_block = cert_expiry * retarget_interval

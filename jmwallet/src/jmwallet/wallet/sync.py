@@ -1538,12 +1538,7 @@ class WalletSyncMixin:
             from jmwallet.wallet.bond_registry import (
                 BondUtxo,
                 create_bond_info,
-                load_registry,
-                save_registry,
-            )
-
-            registry = load_registry(
-                self.data_dir, self.wallet_fingerprint, allow_legacy_fallback=False
+                update_registry,
             )
 
             # Group every recognized UTXO by bond address. The registry keeps
@@ -1564,64 +1559,68 @@ class WalletSyncMixin:
 
             registered = 0
             refreshed = 0
-            for address, addr_utxos in utxos_by_address.items():
-                addr_lower = address.lower()
-                existing = registry.get_bond_by_address(address)
-                if existing is not None:
-                    # Refresh the stored UTXO set (announced + extras) to what
-                    # this sync sees; no canonical derivation needed since the
-                    # bond is already recorded. Covers external/cold bonds too,
-                    # exactly like ``sync-bonds``. Only counts as a change when
-                    # the resulting UTXO state actually differs, so steady-state
-                    # syncs do not rewrite the registry file.
-                    before = _bond_utxo_signature(existing)
+
+            def reconcile(registry: Any) -> bool:
+                nonlocal registered, refreshed
+                for address, addr_utxos in utxos_by_address.items():
+                    addr_lower = address.lower()
+                    existing = registry.get_bond_by_address(address)
+                    if existing is not None:
+                        # Refresh the stored UTXO set (announced + extras) to what
+                        # this sync sees; no canonical derivation needed since the
+                        # bond is already recorded. Covers external/cold bonds too,
+                        # exactly like ``sync-bonds``. Only counts as a change when
+                        # the resulting UTXO state actually differs, so steady-state
+                        # syncs do not rewrite the registry file.
+                        before = _bond_utxo_signature(existing)
+                        registry.set_bond_utxos(address, addr_utxos)
+                        if _bond_utxo_signature(existing) != before:
+                            refreshed += 1
+                        continue
+                    canonical = self._canonical_bond_address_map().get(addr_lower)
+                    if canonical is None:
+                        # Not a canonically-derivable bond (e.g. an external/cold
+                        # bond not yet registered); those are managed via their own
+                        # registry flow (cold-wallet commands / recover-bonds).
+                        continue
+                    locktime, timenumber = canonical
+                    key = self.get_fidelity_bond_key(timenumber, locktime)
+                    pubkey_hex = key.get_public_key_bytes(compressed=True).hex()
+                    witness_script = self.get_fidelity_bond_script(timenumber, locktime)
+                    path = f"{self.root_path}/0'/{FIDELITY_BOND_BRANCH}/{timenumber}"
+                    bond_info = create_bond_info(
+                        address=address,
+                        locktime=locktime,
+                        index=timenumber,
+                        path=path,
+                        pubkey_hex=pubkey_hex,
+                        witness_script=witness_script,
+                        network=self.network,
+                    )
+                    registry.add_bond(bond_info)
                     registry.set_bond_utxos(address, addr_utxos)
+                    registered += 1
+
+                # A complete bond-aware scan also proves which registered
+                # addresses are now empty. Clear stale funding metadata after a
+                # redemption instead of leaving offline list-bonds views funded.
+                found_addresses = {address.lower() for address in utxos_by_address}
+                for existing in registry.bonds:
+                    address_lower = existing.address.lower()
+                    if (
+                        scanned_addresses is None
+                        or address_lower not in scanned_addresses
+                        or address_lower in found_addresses
+                    ):
+                        continue
+                    before = _bond_utxo_signature(existing)
+                    registry.set_bond_utxos(existing.address, [])
                     if _bond_utxo_signature(existing) != before:
                         refreshed += 1
-                    continue
-                canonical = self._canonical_bond_address_map().get(addr_lower)
-                if canonical is None:
-                    # Not a canonically-derivable bond (e.g. an external/cold
-                    # bond not yet registered); those are managed via their own
-                    # registry flow (cold-wallet commands / recover-bonds).
-                    continue
-                locktime, timenumber = canonical
-                key = self.get_fidelity_bond_key(timenumber, locktime)
-                pubkey_hex = key.get_public_key_bytes(compressed=True).hex()
-                witness_script = self.get_fidelity_bond_script(timenumber, locktime)
-                path = f"{self.root_path}/0'/{FIDELITY_BOND_BRANCH}/{timenumber}"
-                bond_info = create_bond_info(
-                    address=address,
-                    locktime=locktime,
-                    index=timenumber,
-                    path=path,
-                    pubkey_hex=pubkey_hex,
-                    witness_script=witness_script,
-                    network=self.network,
-                )
-                registry.add_bond(bond_info)
-                registry.set_bond_utxos(address, addr_utxos)
-                registered += 1
+                return bool(registered or refreshed)
 
-            # A complete bond-aware scan also proves which registered
-            # addresses are now empty. Clear stale funding metadata after a
-            # redemption instead of leaving offline list-bonds views funded.
-            found_addresses = {address.lower() for address in utxos_by_address}
-            for existing in registry.bonds:
-                address_lower = existing.address.lower()
-                if (
-                    scanned_addresses is None
-                    or address_lower not in scanned_addresses
-                    or address_lower in found_addresses
-                ):
-                    continue
-                before = _bond_utxo_signature(existing)
-                registry.set_bond_utxos(existing.address, [])
-                if _bond_utxo_signature(existing) != before:
-                    refreshed += 1
-
+            update_registry(self.data_dir, self.wallet_fingerprint, reconcile)
             if registered or refreshed:
-                save_registry(registry, self.data_dir, self.wallet_fingerprint)
                 logger.info(
                     f"Reconciled fidelity bond registry during sync: {registered} added "
                     f"(recognized via canonical derivation), {refreshed} refreshed to the "

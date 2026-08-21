@@ -44,22 +44,13 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from jmcore.file_lock import exclusive_sidecar_lock
 from jmcore.secure_files import (
     atomic_write_sensitive_file,
     ensure_sensitive_directory,
     read_sensitive_file,
 )
 from loguru import logger
-
-try:
-    import fcntl  # POSIX advisory locks; absent on Windows.
-except ImportError:  # pragma: no cover - non-POSIX platforms
-    fcntl = None  # type: ignore[assignment]
-
-try:
-    import msvcrt  # Windows file locking; absent on POSIX.
-except ImportError:  # pragma: no cover - POSIX platforms
-    msvcrt = None  # type: ignore[assignment]
 
 USED_LABEL_PREFIX = "jm:used"
 
@@ -744,36 +735,10 @@ class UTXOMetadataStore:
 
     @contextmanager
     def _exclusive_file_lock(self) -> Iterator[None]:
-        """Serialize lock acquisition/release across processes.
-
-        Uses an advisory lock on a sidecar ``.lock`` file. The metadata
-        file itself is replaced via rename on every save, which would break a
-        lock held on its inode, so we lock a stable sidecar path instead.
-        Windows uses ``msvcrt.locking`` over the same stable file.
-        """
-        if fcntl is None and msvcrt is None:  # pragma: no cover - unknown platform
-            yield
-            return
+        """Serialize metadata updates through jmcore's stable sidecar lock."""
         ensure_sensitive_directory(self.path.parent)
-        with open(self._flock_path, "a+b") as handle:
-            if fcntl is not None:
-                fcntl.flock(handle, fcntl.LOCK_EX)
-            else:  # pragma: no cover - Windows
-                assert msvcrt is not None
-                if handle.tell() == 0:
-                    handle.write(b"\0")
-                    handle.flush()
-                handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
-            try:
-                yield
-            finally:
-                if fcntl is not None:
-                    fcntl.flock(handle, fcntl.LOCK_UN)
-                else:  # pragma: no cover - Windows
-                    assert msvcrt is not None
-                    handle.seek(0)
-                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        with exclusive_sidecar_lock(self.path):
+            yield
 
     def _prune_expired_locks(self, now: float) -> None:
         """Clear expired ``lock_until`` markers and drop now-empty records."""

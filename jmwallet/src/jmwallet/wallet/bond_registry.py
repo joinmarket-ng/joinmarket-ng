@@ -11,10 +11,12 @@ import json
 import os
 import tempfile
 from collections.abc import Callable
+from contextlib import ExitStack
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from jmcore.file_lock import exclusive_sidecar_lock
 from loguru import logger
 from pydantic import BaseModel
 
@@ -386,6 +388,11 @@ def load_registry(
         else:
             return BondRegistry()
 
+    return _load_registry_path(registry_path, fail_closed=fail_closed)
+
+
+def _load_registry_path(registry_path: Path, *, fail_closed: bool = False) -> BondRegistry:
+    """Load one known registry path without applying fallback rules."""
     try:
         data = json.loads(registry_path.read_text())
         return BondRegistry.model_validate(data)
@@ -439,6 +446,31 @@ def save_registry(registry: BondRegistry, data_dir: Path, fingerprint: str | Non
                 temp_path.unlink()
             except OSError:
                 pass
+
+
+def update_registry(
+    data_dir: Path,
+    fingerprint: str | None,
+    update: Callable[[BondRegistry], bool],
+) -> BondRegistry:
+    """Atomically apply a registry update under its cross-process lock.
+
+    The callback receives a fresh per-wallet registry while its stable sidecar
+    lock is held. Return ``True`` to persist the mutation, or ``False`` when
+    no write is needed. Writers deliberately never use the legacy display
+    fallback: persisting that unpartitioned view could copy another wallet's
+    records into this wallet registry.
+    """
+    registry_path = get_registry_path(data_dir, fingerprint)
+    with exclusive_sidecar_lock(registry_path):
+        registry = (
+            _load_registry_path(registry_path, fail_closed=True)
+            if registry_path.exists()
+            else BondRegistry()
+        )
+        if update(registry):
+            save_registry(registry, data_dir, fingerprint)
+        return registry
 
 
 def get_active_locktimes(data_dir: Path, fingerprint: str | None = None) -> list[int]:
@@ -571,53 +603,58 @@ def migrate_legacy_registry(
     per_wallet_path = get_registry_path(data_dir, safe_fp)
     legacy_path = get_legacy_registry_path(data_dir)
 
-    if per_wallet_path.exists():
-        return 0
-    if not legacy_path.exists():
-        return 0
+    # Legacy migration changes two registries. Lock targets in lexical order,
+    # so two wallets claiming entries cannot deadlock while holding one each.
+    with ExitStack() as locks:
+        for path in sorted((legacy_path, per_wallet_path), key=lambda item: str(item)):
+            locks.enter_context(exclusive_sidecar_lock(path))
 
-    try:
-        legacy_data = json.loads(legacy_path.read_text())
-        legacy_registry = BondRegistry.model_validate(legacy_data)
-    except Exception as e:
-        logger.error(f"Failed to read legacy bond registry for migration: {e}")
-        return 0
+        if per_wallet_path.exists():
+            return 0
+        if not legacy_path.exists():
+            return 0
 
-    claimed: list[FidelityBondInfo] = []
-    remaining: list[FidelityBondInfo] = []
-    for bond in legacy_registry.bonds:
         try:
-            if bond_belongs_to_wallet(bond):
-                claimed.append(bond)
-            else:
+            legacy_registry = _load_registry_path(legacy_path, fail_closed=True)
+        except ValueError:
+            return 0
+        claimed: list[FidelityBondInfo] = []
+        remaining: list[FidelityBondInfo] = []
+        for bond in legacy_registry.bonds:
+            try:
+                if bond_belongs_to_wallet(bond):
+                    claimed.append(bond)
+                else:
+                    remaining.append(bond)
+            except Exception as e:
+                # Failing to verify a single bond must not lose data. Keep it
+                # in the legacy file so a future open can try again.
+                logger.bind(sensitive=True).warning(
+                    f"Bond {bond.address} verification raised during migration: {e}; "
+                    "leaving entry in legacy file"
+                )
                 remaining.append(bond)
-        except Exception as e:
-            # Failing to verify a single bond must not lose data. Keep it
-            # in the legacy file so a future open can try again.
-            logger.bind(sensitive=True).warning(
-                f"Bond {bond.address} verification raised during migration: {e}; "
-                "leaving entry in legacy file"
-            )
-            remaining.append(bond)
 
-    if not claimed:
-        # Nothing to write; leave the legacy file untouched.
-        return 0
+        if not claimed:
+            # Nothing to write; leave the legacy file untouched.
+            return 0
 
-    # Persist claimed entries to per-wallet file.
-    save_registry(BondRegistry(version=legacy_registry.version, bonds=claimed), data_dir, safe_fp)
-
-    # Rewrite legacy file with the remaining entries, or delete it when
-    # empty so future wallets do not see a phantom file.
-    if remaining:
+        # Persist claimed entries to per-wallet file.
         save_registry(
-            BondRegistry(version=legacy_registry.version, bonds=remaining), data_dir, None
+            BondRegistry(version=legacy_registry.version, bonds=claimed), data_dir, safe_fp
         )
-    else:
-        try:
-            legacy_path.unlink()
-        except OSError as e:
-            logger.warning(f"Failed to remove empty legacy bond registry {legacy_path}: {e}")
+
+        # Rewrite legacy file with the remaining entries, or delete it when
+        # empty so future wallets do not see a phantom file.
+        if remaining:
+            save_registry(
+                BondRegistry(version=legacy_registry.version, bonds=remaining), data_dir, None
+            )
+        else:
+            try:
+                legacy_path.unlink()
+            except OSError as e:
+                logger.warning(f"Failed to remove empty legacy bond registry {legacy_path}: {e}")
 
     logger.info(
         f"Migrated {len(claimed)} bond(s) from legacy registry into "
@@ -647,44 +684,48 @@ def delete_wallet_registry_entries(
 
     per_wallet_path = get_registry_path(data_dir, safe_fp)
     legacy_path = get_legacy_registry_path(data_dir)
-    per_wallet_registry: BondRegistry | None = None
-    legacy_registry: BondRegistry | None = None
+    # This update can change two registry files. Acquire their stable sidecars
+    # in lexical order and validate both before modifying either one.
+    with ExitStack() as locks:
+        for path in sorted((legacy_path, per_wallet_path), key=lambda item: str(item)):
+            locks.enter_context(exclusive_sidecar_lock(path))
 
-    try:
-        if per_wallet_path.exists():
-            per_wallet_registry = BondRegistry.model_validate_json(per_wallet_path.read_text())
-        if legacy_path.exists():
-            legacy_registry = BondRegistry.model_validate_json(legacy_path.read_text())
-    except Exception as exc:
-        raise ValueError(f"Cannot delete entries from an invalid bond registry: {exc}") from exc
+        per_wallet_registry = (
+            _load_registry_path(per_wallet_path, fail_closed=True)
+            if per_wallet_path.exists()
+            else None
+        )
+        legacy_registry = (
+            _load_registry_path(legacy_path, fail_closed=True) if legacy_path.exists() else None
+        )
 
-    removed = len(per_wallet_registry.bonds) if per_wallet_registry is not None else 0
-    if legacy_registry is not None:
+        removed = len(per_wallet_registry.bonds) if per_wallet_registry is not None else 0
         remaining: list[FidelityBondInfo] = []
-        for bond in legacy_registry.bonds:
-            try:
-                owned = bond_belongs_to_wallet(bond)
-            except Exception as exc:
-                raise ValueError(
-                    f"Cannot determine ownership of legacy bond {bond.address}: {exc}"
-                ) from exc
-            if owned:
-                removed += 1
-            else:
-                remaining.append(bond)
+        if legacy_registry is not None:
+            for bond in legacy_registry.bonds:
+                try:
+                    owned = bond_belongs_to_wallet(bond)
+                except Exception as exc:
+                    raise ValueError(
+                        f"Cannot determine ownership of legacy bond {bond.address}: {exc}"
+                    ) from exc
+                if owned:
+                    removed += 1
+                else:
+                    remaining.append(bond)
 
-        if len(remaining) != len(legacy_registry.bonds):
-            if remaining:
-                save_registry(
-                    BondRegistry(version=legacy_registry.version, bonds=remaining),
-                    data_dir,
-                    None,
-                )
-            else:
-                legacy_path.unlink()
+            if len(remaining) != len(legacy_registry.bonds):
+                if remaining:
+                    save_registry(
+                        BondRegistry(version=legacy_registry.version, bonds=remaining),
+                        data_dir,
+                        None,
+                    )
+                else:
+                    legacy_path.unlink()
 
-    if per_wallet_path.exists():
-        per_wallet_path.unlink()
+        if per_wallet_path.exists():
+            per_wallet_path.unlink()
 
     logger.info(f"Deleted {removed} fidelity-bond registry entries for wallet {safe_fp}")
     return removed

@@ -52,6 +52,16 @@ def _registry_with_unfunded_bond() -> BondRegistry:
     return registry
 
 
+def _registry_update_transaction(registry: BondRegistry) -> MagicMock:
+    """Drive the locked-registry callback against the test registry."""
+
+    def update(_data_dir, _fingerprint, callback):
+        callback(registry)
+        return registry
+
+    return MagicMock(side_effect=update)
+
+
 @pytest.mark.asyncio
 async def test_sync_bonds_updates_registry_with_funded_utxo() -> None:
     registry = _registry_with_unfunded_bond()
@@ -78,7 +88,7 @@ async def test_sync_bonds_updates_registry_with_funded_utxo() -> None:
     backend = MagicMock()
     backend.create_wallet = AsyncMock()
 
-    saved: list[BondRegistry] = []
+    update_registry = _registry_update_transaction(registry)
 
     with (
         patch(
@@ -92,10 +102,7 @@ async def test_sync_bonds_updates_registry_with_funded_utxo() -> None:
         ),
         patch("jmwallet.wallet.service.WalletService", return_value=wallet),
         patch("jmwallet.wallet.bond_registry.load_registry", return_value=registry),
-        patch(
-            "jmwallet.wallet.bond_registry.save_registry",
-            side_effect=lambda reg, *a, **k: saved.append(reg),
-        ),
+        patch("jmwallet.wallet.bond_registry.update_registry", update_registry),
     ):
         await _sync_bonds_async(MNEMONIC, _backend_settings())
 
@@ -111,7 +118,7 @@ async def test_sync_bonds_updates_registry_with_funded_utxo() -> None:
     assert bond.value == 100_000
     assert bond.txid == "ab" * 32
     assert bond.confirmations == 3
-    assert saved and saved[0] is registry
+    update_registry.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -136,7 +143,7 @@ async def test_sync_bonds_clears_spent_bond_metadata_and_counts_unfunded(
 
     backend = MagicMock()
     backend.create_wallet = AsyncMock()
-    saved: list[BondRegistry] = []
+    update_registry = _registry_update_transaction(registry)
 
     with (
         patch(
@@ -150,10 +157,7 @@ async def test_sync_bonds_clears_spent_bond_metadata_and_counts_unfunded(
         ),
         patch("jmwallet.wallet.service.WalletService", return_value=wallet),
         patch("jmwallet.wallet.bond_registry.load_registry", return_value=registry),
-        patch(
-            "jmwallet.wallet.bond_registry.save_registry",
-            side_effect=lambda reg, *a, **k: saved.append(reg),
-        ),
+        patch("jmwallet.wallet.bond_registry.update_registry", update_registry),
     ):
         await _sync_bonds_async(MNEMONIC, _backend_settings())
 
@@ -164,7 +168,7 @@ async def test_sync_bonds_clears_spent_bond_metadata_and_counts_unfunded(
     assert bond.value is None
     assert bond.confirmations is None
     assert bond.extra_utxos == []
-    assert saved and saved[0] is registry
+    update_registry.assert_called_once()
 
     out = capsys.readouterr().out
     assert "Funded bonds:   0" in out
@@ -196,6 +200,7 @@ async def test_sync_bonds_records_extra_utxos_on_same_address() -> None:
 
     backend = MagicMock()
     backend.create_wallet = AsyncMock()
+    update_registry = _registry_update_transaction(registry)
 
     with (
         patch(
@@ -209,7 +214,7 @@ async def test_sync_bonds_records_extra_utxos_on_same_address() -> None:
         ),
         patch("jmwallet.wallet.service.WalletService", return_value=wallet),
         patch("jmwallet.wallet.bond_registry.load_registry", return_value=registry),
-        patch("jmwallet.wallet.bond_registry.save_registry"),
+        patch("jmwallet.wallet.bond_registry.update_registry", update_registry),
     ):
         await _sync_bonds_async(MNEMONIC, _backend_settings())
 
@@ -221,6 +226,7 @@ async def test_sync_bonds_records_extra_utxos_on_same_address() -> None:
     # The smaller UTXO is preserved as a locked extra.
     assert [(u.txid, u.value) for u in bond.extra_utxos] == [("aa" * 32, 10_000)]
     assert bond.total_locked_value == 30_000
+    update_registry.assert_called_once()
 
 
 @pytest.mark.asyncio

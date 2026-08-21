@@ -768,12 +768,10 @@ class TestConfigSet:
 
 
 class TestTimelockAddress:
-    @patch("jmwalletd.routers.wallet_data.save_registry")
-    @patch("jmwalletd.routers.wallet_data.load_registry")
+    @patch("jmwalletd.routers.wallet_data.update_registry")
     def test_get_timelock_address(
         self,
-        mock_load_registry: Mock,
-        mock_save_registry: Mock,
+        mock_update_registry: Mock,
         authed_client: tuple[TestClient, str],
     ) -> None:
         client, token = authed_client
@@ -789,7 +787,9 @@ class TestTimelockAddress:
         mock_registry = MagicMock()
         mock_registry.bonds = []
         mock_registry.get_bond_by_address.return_value = None
-        mock_load_registry.return_value = mock_registry
+        mock_update_registry.side_effect = lambda _data_dir, _fingerprint, callback: callback(
+            mock_registry
+        )
 
         resp = client.get(
             "/api/v1/wallet/test_wallet.jmdat/address/timelock/new/2026-06",
@@ -802,8 +802,8 @@ class TestTimelockAddress:
         args = ws.get_fidelity_bond_address.call_args
         # 2026-06 -> timenumber 77 (months since Jan 2020)
         assert args[0][0] == 77  # timenumber is first arg
-        # Check that the bond was saved to the registry
-        mock_save_registry.assert_called_once()
+        # Check that the bond was added through the locked registry transaction.
+        mock_update_registry.assert_called_once()
         mock_registry.add_bond.assert_called_once()
 
     def test_invalid_date_format(self, authed_client: tuple[TestClient, str]) -> None:
