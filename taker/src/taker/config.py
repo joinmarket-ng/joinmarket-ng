@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 
+from jmcore.channel_input_config import ChannelInputConfig
 from jmcore.channel_ring import ChannelRingConfig
 from jmcore.config import WalletConfig
 from jmcore.models import (
@@ -103,6 +104,7 @@ class TakerConfig(WalletConfig):
         ),
     )
     channel_ring: ChannelRingConfig = Field(default_factory=ChannelRingConfig)
+    channel_input: ChannelInputConfig = Field(default_factory=ChannelInputConfig)
 
     # Fee settings
     max_cj_fee: MaxCjFee = Field(
@@ -321,6 +323,11 @@ class TakerConfig(WalletConfig):
                 raise ValueError("enabled channel ring requires a p2tr wallet")
             if not is_taproot_offer_type(self.preferred_offer_type):
                 raise ValueError("enabled channel ring requires a tr0 preferred offer")
+        if self.channel_input.enabled:
+            if self.address_type != "p2tr":
+                raise ValueError("enabled channel input requires a p2tr wallet")
+            if not is_taproot_offer_type(self.preferred_offer_type):
+                raise ValueError("enabled channel input requires a tr0 preferred offer")
         expected_address_type = offer_output_script_type(self.preferred_offer_type)
         if expected_address_type != self.address_type:
             raise ValueError(

@@ -31,6 +31,7 @@ from jmcore.bitcoin import (
     sha256,
 )
 from jmcore.btc_script import BondAddressInfo, derive_bond_address
+from jmcore.channel_input_config import ChannelInputConfig, ChannelInputSettings
 from jmcore.channel_ring import ChannelRingConfig, ChannelRingSettings
 from jmcore.commitment_blacklist import (
     COMMITMENT_HEX_LENGTH,
@@ -291,6 +292,8 @@ __all__ = [
     # Channel ring
     "ChannelRingConfig",
     "ChannelRingSettings",
+    "ChannelInputConfig",
+    "ChannelInputSettings",
     # Rate limiting
     "RateLimiter",
     "TokenBucket",

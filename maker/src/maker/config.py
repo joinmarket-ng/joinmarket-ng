@@ -7,6 +7,7 @@ from __future__ import annotations
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 
+from jmcore.channel_input_config import ChannelInputConfig
 from jmcore.channel_ring import ChannelRingConfig
 from jmcore.config import TorControlConfig, WalletConfig, create_tor_control_config_from_env
 from jmcore.models import (
@@ -267,6 +268,7 @@ class MakerConfig(WalletConfig):
         ),
     )
     channel_ring: ChannelRingConfig = Field(default_factory=ChannelRingConfig)
+    channel_input: ChannelInputConfig = Field(default_factory=ChannelInputConfig)
 
     # Single offer configuration (legacy, used when offer_configs is empty)
     offer_type: OfferType = Field(
@@ -564,6 +566,15 @@ class MakerConfig(WalletConfig):
                 for offer in self.get_effective_offer_configs()
             ):
                 raise ValueError("enabled channel ring requires only tr0 maker offers")
+
+        if self.channel_input.enabled:
+            if self.address_type != "p2tr":
+                raise ValueError("enabled channel input requires a p2tr wallet")
+            if any(
+                not is_taproot_offer_type(offer.offer_type)
+                for offer in self.get_effective_offer_configs()
+            ):
+                raise ValueError("enabled channel input requires only tr0 maker offers")
 
         for offer in self.get_effective_offer_configs():
             expected_address_type = offer_output_script_type(offer.offer_type)

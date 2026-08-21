@@ -54,6 +54,7 @@ from pydantic_settings import (
     SettingsConfigDict,
 )
 
+from jmcore.channel_input_config import ChannelInputSettings
 from jmcore.channel_ring import ChannelRingSettings
 from jmcore.constants import DUST_THRESHOLD
 from jmcore.models import (
@@ -973,6 +974,7 @@ class MakerSettings(BaseModel):
         ),
     )
     channel_ring: ChannelRingSettings = Field(default_factory=ChannelRingSettings)
+    channel_input: ChannelInputSettings = Field(default_factory=ChannelInputSettings)
 
     @field_validator("cj_fee_relative", mode="before")
     @classmethod
@@ -1011,6 +1013,7 @@ class TakerSettings(BaseModel):
     """Taker-specific settings."""
 
     channel_ring: ChannelRingSettings = Field(default_factory=ChannelRingSettings)
+    channel_input: ChannelInputSettings = Field(default_factory=ChannelInputSettings)
     counterparty_count: int | None = Field(
         default=None,
         ge=1,

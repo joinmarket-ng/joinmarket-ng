@@ -32,7 +32,7 @@ def test_only_one_cofunded_ring_feature_is_defined() -> None:
     cofunded_features = {
         value
         for name, value in vars(protocol).items()
-        if name.startswith("FEATURE_") and isinstance(value, str) and "channel" in value
+        if name.startswith("FEATURE_") and isinstance(value, str) and "cofunded_channel" in value
     }
     assert cofunded_features == {"cofunded_channel_ring_v1"}
     assert FEATURE_COFUNDED_CHANNEL_RING_V1 == "cofunded_channel_ring_v1"

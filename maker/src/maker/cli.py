@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Annotated, Any
 
 import typer
+from jmcore.channel_input_config import ChannelInputConfig
 from jmcore.channel_ring import ChannelRingConfig
 from jmcore.cli_common import resolve_mnemonic, setup_cli
 from jmcore.cli_help import SortedTyper
@@ -431,6 +432,7 @@ def build_maker_config(
         orderbook_violation_severe_threshold=settings.maker.orderbook_violation_severe_threshold,
         orderbook_ban_duration=settings.maker.orderbook_ban_duration,
         channel_ring=ChannelRingConfig.from_settings(settings.maker.channel_ring),
+        channel_input=ChannelInputConfig.from_settings(settings.maker.channel_input),
     )
 
 

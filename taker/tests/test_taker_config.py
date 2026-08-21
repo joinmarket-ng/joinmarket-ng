@@ -702,3 +702,81 @@ def test_disabled_channel_ring_round_trip_preserves_default_behavior(sample_mnem
     config = build_taker_config(JoinMarketSettings(), mnemonic=sample_mnemonic, passphrase="")
     assert config.channel_ring.enabled is False
     assert config.channel_ring.onion_endpoint == ""
+
+
+def test_channel_input_settings_round_trip_and_require_tr0_wallet(
+    tmp_path, sample_mnemonic: str
+) -> None:
+    from jmcore.channel_input_config import ChannelInputSettings
+    from jmcore.models import OfferType
+    from jmcore.settings import JoinMarketSettings, TakerSettings, WalletSettings
+
+    from taker.config_builder import build_taker_config
+
+    channel_input = ChannelInputSettings(
+        enabled=True,
+        lnd_grpc_url="https://localhost:10009",
+        lnd_tls_cert_path=tmp_path / "tls.cert",
+        lnd_macaroon_path=tmp_path / "admin.macaroon",
+        lnd_escrow_macaroon_path=tmp_path / "channel-escrow.macaroon",
+        allowed_channel_points=["b" * 64 + ":1"],
+        allowed_peer_node_pubkeys=[
+            "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+        ],
+        minimum_makers=5,
+        min_channel_capacity_sat=4_000_000,
+        max_channel_capacity_sat=50_000_000,
+        max_claim_adjustment_sat=500_000,
+        max_miner_fee_share_sat=600_000,
+        max_parent_fee_sat=700_000,
+        max_fee_rate_sat_vb=900,
+        recovery_delay_blocks=24,
+        phase_timeout_seconds=180.0,
+        max_active_sessions=6,
+        persistence_directory=tmp_path / "channel-input-state",
+    )
+    settings = JoinMarketSettings(
+        wallet=WalletSettings(address_type="p2tr"),
+        taker=TakerSettings(
+            preferred_offer_type=OfferType.TR0_RELATIVE,
+            channel_input=channel_input,
+        ),
+    )
+    config = build_taker_config(settings, mnemonic=sample_mnemonic, passphrase="")
+    assert config.channel_input.model_dump() == {
+        **channel_input.model_dump(),
+        "allowed_channel_points": ("b" * 64 + ":1",),
+        "allowed_peer_node_pubkeys": (
+            "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+        ),
+    }
+
+    incompatible = JoinMarketSettings(
+        wallet=WalletSettings(address_type="p2wpkh"),
+        taker=TakerSettings(
+            preferred_offer_type=OfferType.TR0_RELATIVE,
+            channel_input=channel_input,
+        ),
+    )
+    with pytest.raises(ValueError, match="p2tr wallet"):
+        build_taker_config(incompatible, mnemonic=sample_mnemonic, passphrase="")
+
+    wrong_offer = JoinMarketSettings(
+        wallet=WalletSettings(address_type="p2tr"),
+        taker=TakerSettings(
+            preferred_offer_type=OfferType.SW0_RELATIVE,
+            channel_input=channel_input,
+        ),
+    )
+    with pytest.raises(ValueError, match="tr0 preferred offer"):
+        build_taker_config(wrong_offer, mnemonic=sample_mnemonic, passphrase="")
+
+
+def test_disabled_channel_input_round_trip_preserves_default_behavior(sample_mnemonic: str) -> None:
+    from jmcore.settings import JoinMarketSettings
+
+    from taker.config_builder import build_taker_config
+
+    config = build_taker_config(JoinMarketSettings(), mnemonic=sample_mnemonic, passphrase="")
+    assert config.channel_input.enabled is False
+    assert config.channel_input.allowed_channel_points == ()
