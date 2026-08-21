@@ -17,10 +17,14 @@ Available Features:
   abuse of makers as unauthenticated broadcast bots.
 - cofunded_channel_ring_v1: Backend-validated support for private co-funded
   Taproot channel rings. This has no legacy fallback.
+- channel_input_v1: Authenticated private coordination for contributing
+  existing Taproot Lightning channel funding outputs to a CoinJoin parent.
 
 Feature Dependencies:
 - neutrino_compat: No dependencies
 - push_encrypted: Requires active NaCl encryption session (implicit)
+- cofunded_channel_ring_v1: No dependencies
+- channel_input_v1: No dependencies
 
 Nick Format:
 ============
@@ -85,6 +89,7 @@ _FEATURE_IDENTIFIER_DELIMITERS = _PEERLIST_FIELD_DELIMITERS | {"+"}
 FEATURE_NEUTRINO_COMPAT = "neutrino_compat"
 FEATURE_PUSH_ENCRYPTED = "push_encrypted"
 FEATURE_COFUNDED_CHANNEL_RING_V1 = "cofunded_channel_ring_v1"
+FEATURE_CHANNEL_INPUT_V1 = "channel_input_v1"
 FEATURE_PEERLIST_FEATURES = "peerlist_features"  # Supports extended peerlist with F: suffix
 FEATURE_PING = "ping"  # Supports application-level PING/PONG heartbeat
 FEATURE_NICK_AUTH = "nick_auth"
@@ -94,6 +99,7 @@ FEATURE_DEPENDENCIES: dict[str, list[str]] = {
     FEATURE_NEUTRINO_COMPAT: [],
     FEATURE_PUSH_ENCRYPTED: [],  # Requires NaCl session, but that's implicit
     FEATURE_COFUNDED_CHANNEL_RING_V1: [],
+    FEATURE_CHANNEL_INPUT_V1: [],
     FEATURE_PEERLIST_FEATURES: [],  # No dependencies
     FEATURE_PING: [],  # No dependencies
     FEATURE_NICK_AUTH: [],  # No dependencies
@@ -104,6 +110,7 @@ ALL_FEATURES = {
     FEATURE_NEUTRINO_COMPAT,
     FEATURE_PUSH_ENCRYPTED,
     FEATURE_COFUNDED_CHANNEL_RING_V1,
+    FEATURE_CHANNEL_INPUT_V1,
     FEATURE_PEERLIST_FEATURES,
     FEATURE_PING,
     FEATURE_NICK_AUTH,
@@ -216,6 +223,10 @@ class FeatureSet:
     def supports_push_encrypted(self) -> bool:
         """Check if push_encrypted is supported."""
         return FEATURE_PUSH_ENCRYPTED in self.features
+
+    def supports_channel_input_v1(self) -> bool:
+        """Check if peer supports authenticated channel-input protocol v1."""
+        return FEATURE_CHANNEL_INPUT_V1 in self.features
 
     def supports_peerlist_features(self) -> bool:
         """Check if peer supports extended peerlist with features (F: suffix)."""

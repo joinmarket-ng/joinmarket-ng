@@ -6,6 +6,7 @@ import pytest
 
 from jmcore.protocol import (
     ALL_FEATURES,
+    FEATURE_CHANNEL_INPUT_V1,
     FEATURE_NEUTRINO_COMPAT,
     FEATURE_NICK_AUTH,
     FEATURE_PEERLIST_FEATURES,
@@ -992,3 +993,10 @@ def test_nick_auth_protocol_allocations():
     assert MessageType.NICK_AUTH_CHALLENGE == 803
     assert MessageType.NICK_AUTH_PROOF == 805
     assert MessageType.NICK_AUTH_RESULT == 807
+
+
+def test_channel_input_feature_is_known_and_supported() -> None:
+    assert FEATURE_CHANNEL_INPUT_V1 == "channel_input_v1"
+    assert FEATURE_CHANNEL_INPUT_V1 in ALL_FEATURES
+    assert FeatureSet(features={FEATURE_CHANNEL_INPUT_V1}).supports_channel_input_v1()
+    assert not FeatureSet().supports_channel_input_v1()
