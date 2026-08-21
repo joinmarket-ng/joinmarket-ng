@@ -19,6 +19,7 @@ from jmcore.paths import (
     get_used_commitments_path,
     get_wallet_metadata_path,
     read_nick_state,
+    read_nick_states,
     remove_nick_state,
     write_nick_state,
 )
@@ -94,6 +95,35 @@ class TestNickStateFiles:
 
         nick = read_nick_state(tmp_path, "maker")
         assert nick == "J5NEWNICK"
+
+    def test_instance_state_coexists_with_legacy_state(self, tmp_path: Path) -> None:
+        """Plural reads include all process instances and the legacy file."""
+        write_nick_state(tmp_path, "maker", "J5LEGACY")
+        first = write_nick_state(tmp_path, "maker", "J5FIRST", instance_id="segwit")
+        second = write_nick_state(tmp_path, "maker", "J5SECOND", instance_id="taproot")
+
+        assert first == tmp_path / "state" / "maker.segwit.nick"
+        assert second == tmp_path / "state" / "maker.taproot.nick"
+        assert read_nick_state(tmp_path, "maker", instance_id="segwit") == "J5FIRST"
+        assert read_nick_states(tmp_path, "maker") == {"J5LEGACY", "J5FIRST", "J5SECOND"}
+
+    def test_remove_instance_state_only_removes_requested_instance(self, tmp_path: Path) -> None:
+        write_nick_state(tmp_path, "taker", "J5FIRST", instance_id="first")
+        write_nick_state(tmp_path, "taker", "J5SECOND", instance_id="second")
+
+        assert remove_nick_state(tmp_path, "taker", instance_id="first") is True
+        assert read_nick_states(tmp_path, "taker") == {"J5SECOND"}
+
+    @pytest.mark.parametrize("instance_id", ["", "../other", "with.dot", "with/slash", "has space"])
+    def test_instance_id_must_be_filename_safe(self, tmp_path: Path, instance_id: str) -> None:
+        with pytest.raises(ValueError, match="instance_id"):
+            write_nick_state(tmp_path, "maker", "J5UNSAFE", instance_id=instance_id)
+
+    def test_instance_state_write_is_atomic(self, tmp_path: Path) -> None:
+        path = write_nick_state(tmp_path, "maker", "J5ATOMIC", instance_id="instance")
+
+        assert path.read_text() == "J5ATOMIC\n"
+        assert not list(path.parent.glob(f".{path.name}.*.tmp"))
 
     def test_write_creates_state_directory(self, tmp_path: Path) -> None:
         """Test that writing creates the state directory if needed."""

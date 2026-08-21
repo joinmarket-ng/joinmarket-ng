@@ -60,6 +60,18 @@ an older release that predates the starter retains its full-template behavior.
 sections and keys absent from a user file. It returns a list of `section:<name>`
 and `key:<section>.<key>` strings, not a release-to-release comparison.
 
+## CoinJoin Mode
+
+`[wallet].address_type` is the explicit CoinJoin mode for a maker or taker
+process. Use `p2wpkh` with `sw0reloffer` or `sw0absoffer`, and use `p2tr` with
+`tr0reloffer` or `tr0absoffer`. A process cannot mix these offer families; the
+configuration is rejected before it starts.
+
+To run both modes concurrently, start separate maker or taker processes with
+separate config files. The processes may use the same mnemonic and data
+directory. Maker `dual_offers` advertises relative and absolute offers within
+the single family selected by `wallet.address_type`.
+
 ## Section Names
 
 Top-level sections in config use these names:
@@ -87,7 +99,6 @@ Nested fields use double underscores:
 - `MAKER__MIN_SIZE`
 - `TAKER__COUNTERPARTY_COUNT`
 - `MAKER__CHANNEL_RING__ENABLED`
-- `MAKER__SWAP_PROVIDER__ENABLED`
 
 Some CLI flags still support legacy env var names (for compatibility), but config/env should prefer the canonical section-based names above.
 
@@ -254,28 +265,6 @@ maker code; `RING_E2E_NO_BUILD=1` explicitly reuses existing images.
 
 The parallel runner also provides the ring test with isolated ports and state
 cleanup via `./scripts/run_parallel_tests.sh --suite ring-e2e`.
-
-## Maker Swap Provider
-
-`[maker.swap_provider]` is disabled by default. Enabling it requires
-`bitcoin.backend_type = "descriptor_wallet"`, `wallet.address_type = "p2tr"`, one
-or more `ws://` or `wss://` Nostr relays, an HTTPS LND REST URL, and pinned LND TLS
-and macaroon paths. Nostr always uses `[tor]` SOCKS settings. Direct onion serving
-also requires a static maker onion host or enabled Tor control.
-
-The nested section controls offered directions, percentage and mining fees, amount
-limits, confirmation depth, invoice/swap timeout, polling, offer refresh, request
-limits, and the mode-0700 persistence directory. Forward requests that do not register
-an invoice expire separately, concurrent nonterminal swaps are globally capped, and only
-the configured number of newest terminal records are retained. `use_channel_ring_lnd = true` is
-an explicit privacy tradeoff: it reuses the channel-ring LND credentials and is
-rejected unless that backend is enabled. The separate REST URL is still required.
-
-The isolated Docker profile exercises Tor-routed Nostr discovery/RPC, authenticated
-direct onion RPC, both swap directions, provider restart, cooperative MuSig2 spend,
-and script-path settlement. Run it with
-`./scripts/run_parallel_tests.sh --suite swap-provider-e2e`, or use the manual
-commands in `jmswap/README.md`.
 
 ## Notes
 

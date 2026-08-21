@@ -8,7 +8,12 @@ from enum import StrEnum
 
 from jmcore.channel_ring import ChannelRingConfig
 from jmcore.config import WalletConfig
-from jmcore.models import OfferType, is_taproot_offer_type, normalize_relative_fee
+from jmcore.models import (
+    OfferType,
+    is_taproot_offer_type,
+    normalize_relative_fee,
+    offer_output_script_type,
+)
 from jmcore.randomness import secure_random
 from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
 
@@ -316,6 +321,13 @@ class TakerConfig(WalletConfig):
                 raise ValueError("enabled channel ring requires a p2tr wallet")
             if not is_taproot_offer_type(self.preferred_offer_type):
                 raise ValueError("enabled channel ring requires a tr0 preferred offer")
+        expected_address_type = offer_output_script_type(self.preferred_offer_type)
+        if expected_address_type != self.address_type:
+            raise ValueError(
+                f"preferred_offer_type {self.preferred_offer_type.value!r} requires a "
+                f"{expected_address_type!r} wallet, but address_type is "
+                f"{self.address_type!r}"
+            )
         return self
 
     @model_validator(mode="after")

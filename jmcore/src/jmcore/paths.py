@@ -8,6 +8,7 @@ This module provides consistent path handling across all JoinMarket components
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 from jmcore.secure_files import (
@@ -15,6 +16,26 @@ from jmcore.secure_files import (
     ensure_sensitive_directory,
     read_sensitive_file,
 )
+
+_INSTANCE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
+
+
+def _resolve_data_dir(data_dir: Path | str | None) -> Path:
+    """Resolve an optional data directory to a path."""
+    if data_dir is None:
+        return get_default_data_dir()
+    return Path(data_dir)
+
+
+def _validate_instance_id(instance_id: str | None) -> str | None:
+    """Return a filename-safe instance ID or reject unsafe input."""
+    if instance_id is None:
+        return None
+    if not _INSTANCE_ID_RE.fullmatch(instance_id):
+        raise ValueError(
+            "instance_id must contain only ASCII letters, digits, hyphens, or underscores"
+        )
+    return instance_id
 
 
 def get_default_data_dir() -> Path:
@@ -90,7 +111,11 @@ def get_ignored_makers_path(data_dir: Path | None = None) -> Path:
     return data_dir / "ignored_makers.txt"
 
 
-def get_nick_state_path(data_dir: Path | str | None = None, component: str = "") -> Path:
+def get_nick_state_path(
+    data_dir: Path | str | None = None,
+    component: str = "",
+    instance_id: str | None = None,
+) -> Path:
     """
     Get the path to a component's nick state file.
 
@@ -101,23 +126,30 @@ def get_nick_state_path(data_dir: Path | str | None = None, component: str = "")
     Args:
         data_dir: Optional data directory (defaults to get_default_data_dir())
         component: Component name (e.g., 'maker', 'taker', 'directory', 'orderbook')
+        instance_id: Optional filename-safe process instance identifier. When
+            omitted, returns the legacy singular state file.
 
     Returns:
-        Path to state/<component>.nick (e.g., ~/.joinmarket-ng/state/maker.nick)
+        Path to ``state/<component>.nick`` or
+        ``state/<component>.<instance_id>.nick``.
     """
-    if data_dir is None:
-        data_dir = get_default_data_dir()
-    elif isinstance(data_dir, str):
-        data_dir = Path(data_dir)
+    data_dir = _resolve_data_dir(data_dir)
+    instance_id = _validate_instance_id(instance_id)
 
     # Use state/ subdirectory to keep state files organized
     state_dir = data_dir / "state"
     ensure_sensitive_directory(state_dir)
 
-    return state_dir / f"{component}.nick"
+    filename = f"{component}.nick" if instance_id is None else f"{component}.{instance_id}.nick"
+    return state_dir / filename
 
 
-def write_nick_state(data_dir: Path | str | None, component: str, nick: str) -> Path:
+def write_nick_state(
+    data_dir: Path | str | None,
+    component: str,
+    nick: str,
+    instance_id: str | None = None,
+) -> Path:
     """
     Write a component's nick to its state file.
 
@@ -127,32 +159,35 @@ def write_nick_state(data_dir: Path | str | None, component: str, nick: str) -> 
         data_dir: Optional data directory (defaults to get_default_data_dir())
         component: Component name (e.g., 'maker', 'taker', 'directory', 'orderbook')
         nick: The nick to write (e.g., 'J5XXXXXXXXX')
+        instance_id: Optional process instance identifier. When omitted, writes
+            the legacy singular state file.
 
     Returns:
         Path to the written state file
     """
-    path = get_nick_state_path(data_dir, component)
+    path = get_nick_state_path(data_dir, component, instance_id)
     atomic_write_sensitive_file(path, (nick + "\n").encode("utf-8"))
     return path
 
 
-def read_nick_state(data_dir: Path | str | None, component: str) -> str | None:
+def read_nick_state(
+    data_dir: Path | str | None,
+    component: str,
+    instance_id: str | None = None,
+) -> str | None:
     """
     Read a component's nick from its state file.
 
     Args:
         data_dir: Optional data directory (defaults to get_default_data_dir())
         component: Component name (e.g., 'maker', 'taker', 'directory', 'orderbook')
+        instance_id: Optional process instance identifier. When omitted, reads
+            the legacy singular state file.
 
     Returns:
         The nick string if file exists and is readable, None otherwise
     """
-    if data_dir is None:
-        data_dir = get_default_data_dir()
-    elif isinstance(data_dir, str):
-        data_dir = Path(data_dir)
-
-    path = get_nick_state_path(data_dir, component)
+    path = get_nick_state_path(data_dir, component, instance_id)
     if path.exists():
         try:
             return read_sensitive_file(path).decode("utf-8").strip()
@@ -161,23 +196,24 @@ def read_nick_state(data_dir: Path | str | None, component: str) -> str | None:
     return None
 
 
-def remove_nick_state(data_dir: Path | str | None, component: str) -> bool:
+def remove_nick_state(
+    data_dir: Path | str | None,
+    component: str,
+    instance_id: str | None = None,
+) -> bool:
     """
     Remove a component's nick state file (e.g., on shutdown).
 
     Args:
         data_dir: Optional data directory (defaults to get_default_data_dir())
         component: Component name (e.g., 'maker', 'taker', 'directory', 'orderbook')
+        instance_id: Optional process instance identifier. When omitted,
+            removes the legacy singular state file.
 
     Returns:
         True if file was removed, False if it didn't exist or removal failed
     """
-    if data_dir is None:
-        data_dir = get_default_data_dir()
-    elif isinstance(data_dir, str):
-        data_dir = Path(data_dir)
-
-    path = get_nick_state_path(data_dir, component)
+    path = get_nick_state_path(data_dir, component, instance_id)
     if path.exists():
         try:
             path.unlink()
@@ -185,6 +221,39 @@ def remove_nick_state(data_dir: Path | str | None, component: str) -> bool:
         except OSError:
             return False
     return False
+
+
+def read_nick_states(data_dir: Path | str | None, component: str) -> set[str]:
+    """Read every non-empty nick state for a component, including legacy state.
+
+    Instance files are named ``<component>.<instance_id>.nick``. The legacy
+    ``<component>.nick`` file is included so new readers can coexist with
+    older writers during upgrades.
+    """
+    data_dir = _resolve_data_dir(data_dir)
+    state_dir = data_dir / "state"
+    if not state_dir.exists():
+        return set()
+
+    nicks: set[str] = set()
+    for path in state_dir.glob(f"{component}*.nick"):
+        if path.name != f"{component}.nick":
+            prefix = f"{component}."
+            instance_suffix = ".nick"
+            if not path.name.startswith(prefix) or not path.name.endswith(instance_suffix):
+                continue
+            instance_id = path.name[len(prefix) : -len(instance_suffix)]
+            try:
+                _validate_instance_id(instance_id)
+            except ValueError:
+                continue
+        try:
+            nick = path.read_text().strip()
+        except OSError:
+            continue
+        if nick:
+            nicks.add(nick)
+    return nicks
 
 
 def get_wallet_metadata_path(

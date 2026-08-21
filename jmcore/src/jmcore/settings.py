@@ -408,8 +408,9 @@ class WalletSettings(BaseModel):
         default="p2wpkh",
         description=(
             "Wallet address type: 'p2wpkh' (BIP84 native segwit, the default) or "
-            "'p2tr' (BIP86 Taproot key-path). A p2tr wallet participates in tr0 "
-            "Taproot CoinJoins (JMP-0005)."
+            "'p2tr' (BIP86 Taproot key-path). This selects the process CoinJoin "
+            "mode: p2wpkh requires sw0 offers and p2tr requires tr0 offers "
+            "(JMP-0005)."
         ),
     )
     mixdepth_count: int = Field(
@@ -726,7 +727,9 @@ class MakerSettings(BaseModel):
     )
     offer_type: str = Field(
         default="sw0reloffer",
-        description="Offer type: sw0reloffer (relative) or sw0absoffer (absolute)",
+        description=(
+            "Offer type: sw0reloffer/sw0absoffer for p2wpkh, or tr0reloffer/tr0absoffer for p2tr"
+        ),
     )
     cj_fee_relative: str = Field(
         default="0.0001",
@@ -782,6 +785,12 @@ class MakerSettings(BaseModel):
             "The base protocol requires at least one confirmation because "
             "takers reject unconfirmed maker inputs. The separate taker PoDLE "
             "commitment remains gated by taker_utxo_age (default 5)."
+        ),
+    )
+    discover_fidelity_bonds_on_startup: bool = Field(
+        default=False,
+        description=(
+            "Discover wallet-derived fidelity bonds at maker startup (scans all 960 timelocks)"
         ),
     )
     allow_mixdepth_zero_merge: bool = Field(
@@ -959,7 +968,8 @@ class MakerSettings(BaseModel):
         description=(
             "Advertise both a relative and an absolute fee offer simultaneously. "
             "Uses cj_fee_relative and cj_fee_absolute for the respective offer. "
-            "The CLI flag --dual-offers overrides this setting."
+            "Both offers use the family selected by wallet.address_type. The CLI "
+            "flag --dual-offers overrides this setting."
         ),
     )
     channel_ring: ChannelRingSettings = Field(default_factory=ChannelRingSettings)

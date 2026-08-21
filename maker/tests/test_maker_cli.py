@@ -166,9 +166,12 @@ def test_start_expired_certificate_exits_and_cleans_up(
     assert result.exit_code == 1
     assert config.mnemonic_file == mnemonic_file
     bot.stop.assert_awaited_once()
-    remove_nick_state.assert_called_once_with(tmp_path, "maker")
+    remove_nick_state.assert_called_once()
+    assert remove_nick_state.call_args.args == (tmp_path, "maker")
+    instance_id = remove_nick_state.call_args.kwargs["instance_id"]
+    assert instance_id
 
     callback = maker_kwargs["nick_change_callback"]
     assert callable(callback)
     callback("J5ExpiredMaker", "J5RotatedMaker")
-    write_nick_state.assert_any_call(tmp_path, "maker", "J5RotatedMaker")
+    write_nick_state.assert_any_call(tmp_path, "maker", "J5RotatedMaker", instance_id=instance_id)

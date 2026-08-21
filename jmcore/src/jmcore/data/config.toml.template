@@ -184,8 +184,10 @@
 
 [wallet]
 # Wallet address type: "p2wpkh" (BIP84 native segwit, the default) or "p2tr"
-# (BIP86 Taproot key-path). A p2tr wallet takes part in tr0 Taproot CoinJoins
-# (JMP-0005) and cannot mix with p2wpkh makers in the same round (rigid pit).
+# (BIP86 Taproot key-path). This is the process CoinJoin mode: p2wpkh requires
+# sw0 offers and p2tr requires tr0 offers (JMP-0005). A process cannot mix
+# these families. To run both modes in parallel, use separate config files for
+# separate maker/taker processes. They may share a mnemonic and data directory.
 # address_type = "p2wpkh"
 
 # Number of mixing depths (1-10)
@@ -382,16 +384,20 @@
 # Simply changing cj_fee_absolute will NOT switch to absolute fees - you must set offer_type.
 #
 # Offer type options:
-#   "sw0reloffer" - relative fee (uses cj_fee_relative) [DEFAULT]
-#   "sw0absoffer" - absolute fee (uses cj_fee_absolute)
+#   "sw0reloffer" - p2wpkh relative fee (uses cj_fee_relative) [DEFAULT]
+#   "sw0absoffer" - p2wpkh absolute fee (uses cj_fee_absolute)
+#   "tr0reloffer" - p2tr relative fee (uses cj_fee_relative)
+#   "tr0absoffer" - p2tr absolute fee (uses cj_fee_absolute)
+# offer_type must match wallet.address_type above.
 #
 # Example: To use absolute fees, set BOTH:
 #   offer_type = "sw0absoffer"
 #   cj_fee_absolute = 500
 #
 # To run BOTH offer types simultaneously, use the CLI flag --dual-offers
-# In dual-offer mode the maker advertises one relative and one absolute
-# offer.  Their size ranges are split automatically at the fee
+# In dual-offer mode the maker advertises one relative and one absolute offer
+# in the sw0 or tr0 family selected by wallet.address_type. Their size ranges
+# are split automatically at the fee
 # intersection x = cj_fee_absolute / cj_fee_relative:
 #   - absolute offer covers small CJs in [min_size, x]
 #     (guarantees a flat minimum profit per join)
@@ -424,6 +430,12 @@
 # least 1. The PoDLE commitment lives on a separate taker UTXO and is still
 # gated by taker_utxo_age (default 5).
 # min_confirmations = 1
+
+# Discover wallet-derived fidelity bonds before maker startup sync. This scans
+# all 960 canonical timelocks (Jan 2020 through Dec 2099), which can be slow
+# and reveals the complete bond address set to the configured backend. Disabled
+# by default. Delegated external-key bonds remain registry-managed.
+# discover_fidelity_bonds_on_startup = false
 
 # UTXO merge algorithm: "default", "gradual", "greedy", "random"
 # merge_algorithm = "default"

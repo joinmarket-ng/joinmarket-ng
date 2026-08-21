@@ -9,7 +9,12 @@ from enum import StrEnum
 
 from jmcore.channel_ring import ChannelRingConfig
 from jmcore.config import TorControlConfig, WalletConfig, create_tor_control_config_from_env
-from jmcore.models import OfferType, is_absolute_offer_type, is_taproot_offer_type
+from jmcore.models import (
+    OfferType,
+    is_absolute_offer_type,
+    is_taproot_offer_type,
+    offer_output_script_type,
+)
 from jmcore.tor_control import HiddenServiceDoSConfig
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -332,6 +337,12 @@ class MakerConfig(WalletConfig):
     no_fidelity_bond: bool = Field(
         default=False, description="Disable fidelity bond usage (run without bond proof)"
     )
+    discover_fidelity_bonds_on_startup: bool = Field(
+        default=False,
+        description=(
+            "Discover canonical fidelity bonds before startup sync (scans all 960 timelocks)"
+        ),
+    )
 
     # Timeouts
     session_timeout_sec: int = Field(
@@ -553,6 +564,15 @@ class MakerConfig(WalletConfig):
                 for offer in self.get_effective_offer_configs()
             ):
                 raise ValueError("enabled channel ring requires only tr0 maker offers")
+
+        for offer in self.get_effective_offer_configs():
+            expected_address_type = offer_output_script_type(offer.offer_type)
+            if expected_address_type != self.address_type:
+                raise ValueError(
+                    f"offer_type {offer.offer_type.value!r} requires a "
+                    f"{expected_address_type!r} wallet, but address_type is "
+                    f"{self.address_type!r}"
+                )
 
         return self
 

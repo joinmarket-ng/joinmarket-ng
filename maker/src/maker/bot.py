@@ -26,7 +26,7 @@ from jmcore.fee_policy import resolve_min_fee_rate
 from jmcore.models import Offer
 from jmcore.network import HiddenServiceListener, TCPConnection
 from jmcore.notifications import get_notifier
-from jmcore.paths import get_default_data_dir, read_nick_state
+from jmcore.paths import get_default_data_dir, read_nick_states
 from jmcore.protocol import (
     JM_VERSION,
 )
@@ -284,12 +284,10 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         # Key: log_key, Value: timestamp of last log
         self._rate_limited_log_times: dict[str, float] = {}
 
-        # Own wallet nicks to exclude from CoinJoin sessions (self-CoinJoin protection)
-        # Read the taker nick from state file if running both components from same wallet
-        self._own_wallet_nicks: set[str] = set()
-        taker_nick = read_nick_state(config.data_dir, "taker")
-        if taker_nick:
-            self._own_wallet_nicks.add(taker_nick)
+        # Own wallet nicks to exclude from CoinJoin sessions (self-CoinJoin protection).
+        # Include every taker instance and legacy state while both formats coexist.
+        self._own_wallet_nicks = read_nick_states(config.data_dir, "taker")
+        for taker_nick in self._own_wallet_nicks:
             logger.info(f"Self-CoinJoin protection: excluding taker nick {taker_nick}")
 
         initial_generation = MakerGeneration(
@@ -954,7 +952,7 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
             # We scan wallet + fidelity bonds in a single pass to avoid extra
             # backend round-trips during sync.
             from jmcore.paths import get_default_data_dir
-            from jmwallet.wallet.bond_registry import load_registry
+            from jmwallet.wallet.bond_registry import BondRegistry, load_registry
 
             resolved_data_dir = (
                 self.config.data_dir if self.config.data_dir else get_default_data_dir()
@@ -986,6 +984,11 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
                     )
             # Option 2: Load from registry (default)
             else:
+                if self.config.discover_fidelity_bonds_on_startup:
+                    logger.info("Discovering wallet-derived fidelity bonds before startup sync")
+                    await self.wallet.discover_fidelity_bonds()
+                    # Discovery persists canonical addresses. Reloading below is
+                    # intentional so the standard registry sync imports them too.
                 bond_registry = load_registry(
                     resolved_data_dir,
                     self.wallet.wallet_fingerprint,
@@ -1004,7 +1007,7 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
                     ]
                     logger.info(
                         f"Loaded {len(fidelity_bond_addresses)} "
-                        f"fidelity bond address(es) from registry"
+                        "fidelity bond address(es) from registry"
                     )
 
             logger.info("Syncing wallet and fidelity bonds...")
@@ -1051,36 +1054,42 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
 
             # Update bond registry with UTXO info from the scan (only if using registry)
             if self.config.fidelity_bond_index is None and fidelity_bond_addresses:
-                from jmwallet.wallet.bond_registry import save_registry
+                from jmwallet.wallet.bond_registry import update_registry
 
-                bond_registry = load_registry(
-                    resolved_data_dir,
-                    self.wallet.wallet_fingerprint,
-                    allow_legacy_fallback=False,
-                )
-                for bond in bond_registry.bonds:
-                    # Find the UTXO for this bond address in mixdepth 0
-                    bond_utxo = next(
-                        (
-                            utxo
-                            for utxo in self.wallet.utxo_cache.get(0, [])
-                            if utxo.address == bond.address
-                        ),
-                        None,
-                    )
-                    if bond_utxo:
-                        # Update the bond registry with UTXO info
-                        bond.txid = bond_utxo.txid
-                        bond.vout = bond_utxo.vout
-                        bond.value = bond_utxo.value
-                        bond.confirmations = bond_utxo.confirmations
-                        logger.bind(sensitive=True).debug(
-                            f"Updated bond {bond.address[:20]}... with UTXO "
-                            f"{bond_utxo.txid[:16]}...:{bond_utxo.vout}, value={bond_utxo.value}"
+                def update_bond_utxos(bond_registry: BondRegistry) -> bool:
+                    changed = False
+                    for bond in bond_registry.bonds:
+                        # Find the UTXO for this bond address in mixdepth 0.
+                        bond_utxo = next(
+                            (
+                                utxo
+                                for utxo in self.wallet.utxo_cache.get(0, [])
+                                if utxo.address == bond.address
+                            ),
+                            None,
                         )
+                        if bond_utxo and (
+                            bond.txid != bond_utxo.txid
+                            or bond.vout != bond_utxo.vout
+                            or bond.value != bond_utxo.value
+                            or bond.confirmations != bond_utxo.confirmations
+                        ):
+                            # Update the bond registry with UTXO info.
+                            bond.txid = bond_utxo.txid
+                            bond.vout = bond_utxo.vout
+                            bond.value = bond_utxo.value
+                            bond.confirmations = bond_utxo.confirmations
+                            changed = True
+                            logger.bind(sensitive=True).debug(
+                                f"Updated bond {bond.address[:20]}... with UTXO "
+                                f"{bond_utxo.txid[:16]}...:{bond_utxo.vout}, "
+                                f"value={bond_utxo.value}"
+                            )
+                    return changed
 
-                # Save updated registry
-                save_registry(bond_registry, resolved_data_dir, self.wallet.wallet_fingerprint)
+                update_registry(
+                    resolved_data_dir, self.wallet.wallet_fingerprint, update_bond_utxos
+                )
 
             # Get current block height for bond proof generation
             self.current_block_height = await self.backend.get_block_height()
@@ -1235,6 +1244,11 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
                 assert self._channel_ring_store is not None
                 from maker.channel_ring import reconcile_ring_records
 
+                if not self._renew_channel_ring_input_locks():
+                    raise RuntimeError(
+                        "Cannot recover persisted channel-ring records because "
+                        "input-lock renewal failed"
+                    )
                 await reconcile_ring_records(
                     self._channel_ring_store,
                     self._channel_ring_backend,
@@ -1455,6 +1469,13 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         while self.running:
             assert self._channel_ring_store is not None
             assert self._channel_ring_backend is not None
+            if not self._renew_channel_ring_input_locks():
+                error = RuntimeError(
+                    "Cannot recover persisted channel-ring records because "
+                    "input-lock renewal failed"
+                )
+                self._abort_for_fatal_error(error)
+                raise error
             active_identities = frozenset(
                 f"{session.taker_nick}:{session.commitment.hex()}"
                 for session in self.active_sessions.values()
@@ -1468,6 +1489,59 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
                 active_session_identities=active_identities,
             )
             await asyncio.sleep(self.config.channel_ring.phase_timeout_seconds)
+
+    def _renew_channel_ring_input_locks(self) -> bool:
+        """Retain owned locks for active channel-ring records after a restart.
+
+        A persisted record is evidence of an in-flight funding transaction, not
+        authority to acquire its inputs again. Renewal therefore succeeds only
+        when every existing lock is still held by the exact persisted owner.
+        """
+        if self._channel_ring_store is None:
+            return True
+
+        report = self._channel_ring_store.load_all()
+        if report.corruptions:
+            logger.error("Cannot renew channel-ring input locks while records are corrupt")
+            return False
+
+        ttl = max(
+            self.config.pending_tx_timeout_min * 60,
+            self.config.pending_tx_abandon_hours * 3600,
+        )
+        all_renewed = True
+        for record in report.records:
+            if not record.active or not record.local_input_outpoints:
+                continue
+            if record.input_lock_owner is None:
+                logger.error(
+                    f"Active channel-ring record {record.key.filename} has no input-lock owner"
+                )
+                all_renewed = False
+                continue
+
+            outpoints = {
+                (outpoint.txid, outpoint.vout) for outpoint in record.local_input_outpoints
+            }
+            try:
+                renewed = self.wallet.renew_coinjoin_inputs(
+                    outpoints,
+                    owner=record.input_lock_owner,
+                    ttl=ttl,
+                )
+            except Exception as exc:
+                logger.error(
+                    f"Failed to renew channel-ring input locks for {record.key.filename}: {exc}"
+                )
+                all_renewed = False
+                continue
+            if not renewed:
+                logger.error(
+                    f"Channel-ring input lock ownership was lost for {record.key.filename}"
+                )
+                all_renewed = False
+
+        return all_renewed
 
     def _log_rate_limited(
         self, key: str, message: str, level: str = "warning", interval: float = 10.0

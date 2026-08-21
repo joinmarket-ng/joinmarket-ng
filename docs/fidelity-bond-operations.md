@@ -68,6 +68,13 @@ jm-wallet sync-bonds --mnemonic-file <hot-wallet.mnemonic>
 jm-wallet list-bonds --mnemonic-file <hot-wallet.mnemonic>
 ```
 
+For an unattended maker recovered from the same mnemonic, set
+`maker.discover_fidelity_bonds_on_startup = true` to scan every canonical bond
+timelock before startup sync. This is disabled by default because it scans 960
+addresses and reveals the full derived bond set to the configured backend.
+External-key bonds with delegated certificates remain registry-managed and are
+not imported from another mnemonic.
+
 A fidelity bond is one UTXO. Sending funds to the same address again creates an
 additional locked UTXO; it does not increase the advertised bond's value. The
 registry records those extras, but only the largest UTXO at the address is

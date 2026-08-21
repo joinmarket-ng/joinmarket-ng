@@ -11,6 +11,7 @@ Configuration is loaded with the following priority (highest to lowest):
 from __future__ import annotations
 
 import asyncio
+import uuid
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -480,14 +481,14 @@ async def _run_coinjoin(
 
     # Create taker
     taker = Taker(wallet, backend, config, confirmation_callback=confirmation_callback)
+    instance_id = uuid.uuid4().hex
 
     try:
         # Write nick state file for external tracking and cross-component protection
         nick = taker.nick
         data_dir = config.data_dir
-        write_nick_state(data_dir, "taker", nick)
-        logger.info("Taker nick state written")
-        logger.bind(sensitive=True).info(f"Nick state written to {data_dir}/state/taker.nick")
+        nick_state_path = write_nick_state(data_dir, "taker", nick, instance_id)
+        logger.info(f"Nick state written to {nick_state_path}")
 
         # Send startup notification (including nick)
         notifier = get_notifier(settings, component_name="Taker")
@@ -547,7 +548,7 @@ async def _run_coinjoin(
 
     finally:
         # Clean up nick state file on shutdown
-        remove_nick_state(config.data_dir, "taker")
+        remove_nick_state(config.data_dir, "taker", instance_id)
         await taker.stop()
 
 

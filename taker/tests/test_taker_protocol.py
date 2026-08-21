@@ -2538,7 +2538,8 @@ async def test_do_coinjoin_refreshes_maker_nick_exclusion(
     assert "J5LateStartMaker" not in taker.orderbook_manager.own_wallet_nicks
 
     # Simulate the maker starting after the taker: write the nick file now.
-    write_nick_state(tmp_path, "maker", "J5LateStartMaker")
+    write_nick_state(tmp_path, "maker", "J5LateStartMaker", instance_id="segwit")
+    write_nick_state(tmp_path, "maker", "J5LateStartMakerTaproot", instance_id="taproot")
 
     # Attempt a coinjoin -- it will fail (empty orderbook) but we only care
     # that own_wallet_nicks was updated before any selection happens.
@@ -2555,9 +2556,11 @@ async def test_do_coinjoin_refreshes_maker_nick_exclusion(
         # The nick must be in the exclusion set by the time select_makers is
         # called (the coinjoin itself may have failed for unrelated reasons).
         assert "J5LateStartMaker" in taker.orderbook_manager.own_wallet_nicks
+        assert "J5LateStartMakerTaproot" in taker.orderbook_manager.own_wallet_nicks
         if mock_select.called:
             # If selection was attempted, the nick must already be excluded.
             assert "J5LateStartMaker" in taker.orderbook_manager.own_wallet_nicks
+            assert "J5LateStartMakerTaproot" in taker.orderbook_manager.own_wallet_nicks
 
 
 class TestPhaseAuthMakerAuthentication:

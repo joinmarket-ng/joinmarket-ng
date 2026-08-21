@@ -10,7 +10,7 @@ import json
 import time
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 from jmcore.crypto import NickIdentity
@@ -271,6 +271,7 @@ class TestBotInitialization:
             mnemonic="test " * 12,
             directory_servers=["localhost:5222"],
             network=NetworkType.REGTEST,
+            address_type="p2tr",
             offer_type=OfferType.TR0_RELATIVE,
         )
         with pytest.raises(ValueError, match="resolve arbitrary prevouts"):
@@ -288,6 +289,7 @@ class TestBotInitialization:
             mnemonic="test " * 12,
             directory_servers=["localhost:5222"],
             network=NetworkType.REGTEST,
+            address_type="p2tr",
             offer_type=OfferType.TR0_RELATIVE,
         )
         bot = MakerBot(wallet=wallet, backend=backend, config=config)
@@ -623,22 +625,25 @@ class TestHiddenServiceListener:
             directory=False,
         )
 
-        def signed_message(command: str, data: str) -> bytes:
+        def signed_message(command: str, data: str) -> tuple[bytes, str]:
             signed = taker_identity.sign_message(data, ONION_HOSTID)
             return json.dumps(
                 {
                     "type": MessageType.PRIVMSG.value,
                     "line": f"{taker_identity.nick}!{bot.nick}!{command} {signed}",
                 }
-            ).encode()
+            ).encode(), signed
+
+        auth_message, _ = signed_message("auth", "payload")
+        push_message, signed_push = signed_message("push", "transaction")
 
         incoming = iter(
             [
                 json.dumps(
                     {"type": MessageType.HANDSHAKE.value, "line": json.dumps(handshake)}
                 ).encode(),
-                signed_message("auth", "payload"),
-                signed_message("push", "transaction"),
+                auth_message,
+                push_message,
             ]
         )
         connection = MagicMock(spec=TCPConnection)
@@ -656,7 +661,7 @@ class TestHiddenServiceListener:
 
         assert (session.generation_id, taker_identity.nick) not in bot.active_sessions
         bot._handle_push.assert_awaited_once_with(
-            taker_identity.nick, "push transaction", source="direct", generation_id=0
+            taker_identity.nick, f"push {signed_push}", source="direct", generation_id=0
         )
 
     @pytest.mark.asyncio
@@ -709,10 +714,16 @@ class TestHiddenServiceListener:
         assert bot.direct_connections == {}
 
         fill_data = f"0 1000000 commitment P{'ab' * 32}"
+        signed_fill = genuine.sign_message(fill_data, ONION_HOSTID)
         genuine_connection = self._connection(
             [
                 self._handshake(genuine.nick),
-                self._signed_message(genuine, bot.nick, "fill", fill_data),
+                json.dumps(
+                    {
+                        "type": MessageType.PRIVMSG.value,
+                        "line": f"{genuine.nick}!{bot.nick}!fill {signed_fill}",
+                    }
+                ).encode(),
             ]
         )
         bot._handle_fill = AsyncMock()
@@ -720,7 +731,7 @@ class TestHiddenServiceListener:
         await bot._on_direct_connection(genuine_connection, "genuine:2")
 
         bot._handle_fill.assert_awaited_once_with(
-            genuine.nick, f"fill {fill_data}", source="direct", generation_id=0
+            genuine.nick, f"fill {signed_fill}", source="direct", generation_id=0
         )
         attacker_connection.close.assert_not_awaited()
         bot._remove_direct_connection(attacker_connection)
@@ -806,10 +817,16 @@ class TestHiddenServiceListener:
         bot.running = True
         first = NickIdentity(JM_VERSION)
         second = NickIdentity(JM_VERSION)
+        signed_first = first.sign_message("first", ONION_HOSTID)
         connection = self._connection(
             [
                 self._handshake(first.nick),
-                self._signed_message(first, bot.nick, "fill", "first"),
+                json.dumps(
+                    {
+                        "type": MessageType.PRIVMSG.value,
+                        "line": f"{first.nick}!{bot.nick}!fill {signed_first}",
+                    }
+                ).encode(),
                 self._signed_message(second, bot.nick, "auth", "second"),
             ]
         )
@@ -819,7 +836,7 @@ class TestHiddenServiceListener:
         await bot._on_direct_connection(connection, "peer:1")
 
         bot._handle_fill.assert_awaited_once_with(
-            first.nick, "fill first", source="direct", generation_id=0
+            first.nick, f"fill {signed_first}", source="direct", generation_id=0
         )
         bot._handle_auth.assert_not_awaited()
 
@@ -929,10 +946,15 @@ class TestHiddenServiceListener:
             config=config_with_onion,
         )
         bot.running = True
-        received: list[tuple[str, str, str]] = []
+        received: list[tuple[str, str, str, int | None]] = []
 
-        async def mock_handle_ring(taker_nick: str, msg: str, source: str = "unknown") -> None:
-            received.append((taker_nick, msg, source))
+        async def mock_handle_ring(
+            taker_nick: str,
+            msg: str,
+            source: str = "unknown",
+            generation_id: int | None = None,
+        ) -> None:
+            received.append((taker_nick, msg, source, generation_id))
 
         bot._handle_ring = mock_handle_ring
         taker_identity = NickIdentity(JM_VERSION)
@@ -974,6 +996,7 @@ class TestHiddenServiceListener:
                 taker_identity.nick,
                 f"ring {signed}",
                 "direct",
+                0,
             )
         ]
 
@@ -1529,6 +1552,97 @@ class TestWalletRescanAndOfferUpdate:
         mock_wallet.sync_all.assert_awaited_once_with(
             [(registry_bond.address, registry_bond.locktime, registry_bond.index)]
         )
+
+    @pytest.mark.asyncio
+    async def test_start_discovers_bonds_before_registry_sync_and_auto_selection(
+        self, maker_bot, mock_wallet, tmp_path
+    ):
+        from jmwallet.wallet.bond_registry import BondRegistry, FidelityBondInfo
+
+        maker_bot.config.data_dir = tmp_path
+        maker_bot.config.discover_fidelity_bonds_on_startup = True
+        mock_wallet.data_dir = tmp_path
+        mock_wallet.wallet_fingerprint = "deadbeef"
+        mock_wallet.network = "regtest"
+        mock_wallet.discover_fidelity_bonds = AsyncMock()
+        bond = FidelityBondInfo(
+            address="bcrt1qdiscovered",
+            locktime=2_000_000_000,
+            locktime_human="2033-05-18T03:33:20Z",
+            index=7,
+            path="m/84'/1'/0'/2/7",
+            pubkey="02" + "11" * 32,
+            witness_script_hex="00",
+            network="regtest",
+            created_at="2026-08-18T00:00:00Z",
+        )
+
+        with (
+            patch(
+                "jmwallet.wallet.bond_registry.load_registry",
+                return_value=BondRegistry(bonds=[bond]),
+            ),
+            patch(
+                "maker.bot.get_best_fidelity_bond",
+                new=AsyncMock(side_effect=RuntimeError("stop after selection")),
+            ) as select_best,
+        ):
+            with pytest.raises(RuntimeError, match="stop after selection"):
+                await maker_bot.start()
+
+        mock_wallet.discover_fidelity_bonds.assert_awaited_once()
+        mock_wallet.sync_all.assert_awaited_once_with([(bond.address, bond.locktime, bond.index)])
+        select_best.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_start_skips_discovery_when_bonds_are_disabled(
+        self, maker_bot, mock_wallet, tmp_path
+    ):
+        maker_bot.config.data_dir = tmp_path
+        maker_bot.config.no_fidelity_bond = True
+        maker_bot.config.discover_fidelity_bonds_on_startup = True
+        mock_wallet.wallet_fingerprint = "deadbeef"
+        mock_wallet.discover_fidelity_bonds = AsyncMock()
+        mock_wallet.reconstruct_imported_state_safe.side_effect = RuntimeError("stop after sync")
+
+        with pytest.raises(RuntimeError, match="stop after sync"):
+            await maker_bot.start()
+
+        mock_wallet.discover_fidelity_bonds.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_start_stops_before_ring_reconciliation_when_lock_renewal_fails(
+        self, maker_bot, tmp_path
+    ):
+        from jmcore.channel_ring import ChannelRingConfig
+
+        maker_bot.config.no_fidelity_bond = True
+        maker_bot.config.channel_ring = ChannelRingConfig(
+            enabled=True,
+            lnd_grpc_url="127.0.0.1:10009",
+            lnd_tls_cert_path=tmp_path / "tls.cert",
+            lnd_macaroon_path=tmp_path / "admin.macaroon",
+            onion_endpoint=f"{'a' * 56}.onion:9735",
+        )
+        maker_bot._channel_ring_store = object()  # type: ignore[assignment]
+        maker_bot._renew_channel_ring_input_locks = Mock(return_value=False)
+        maker_bot._setup_tor_hidden_service = AsyncMock(return_value=None)
+        maker_bot._connect_to_directories_with_retry = AsyncMock()
+        maker_bot.offer_manager.create_offers = AsyncMock(return_value=maker_bot.current_offers)
+
+        with (
+            patch(
+                "jmswap.channel_ring.initialize_channel_ring_backend",
+                new=AsyncMock(return_value=object()),
+            ),
+            patch("maker.channel_ring.reconcile_ring_records", new=AsyncMock()) as reconcile,
+        ):
+            with pytest.raises(RuntimeError, match="input-lock renewal failed"):
+                await maker_bot.start()
+
+        reconcile.assert_not_awaited()
+        maker_bot._connect_to_directories_with_retry.assert_not_awaited()
+        assert maker_bot.channel_ring_capability_validated is False
 
     @pytest.mark.asyncio
     async def test_periodic_rescan_aborts_on_expired_certificate(self, maker_bot):

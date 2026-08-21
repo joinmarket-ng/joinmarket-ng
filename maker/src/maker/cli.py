@@ -11,6 +11,7 @@ Configuration is loaded with the following priority (highest to lowest):
 from __future__ import annotations
 
 import asyncio
+import uuid
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -219,6 +220,13 @@ def build_maker_config(
     # Resolve dual_offers: CLI bool (True/False) overrides settings when explicitly passed
     effective_dual_offers = dual_offers if dual_offers is not None else settings.maker.dual_offers
 
+    relative_offer_type = (
+        OfferType.TR0_RELATIVE if settings.wallet.address_type == "p2tr" else OfferType.SW0_RELATIVE
+    )
+    absolute_offer_type = (
+        OfferType.TR0_ABSOLUTE if settings.wallet.address_type == "p2tr" else OfferType.SW0_ABSOLUTE
+    )
+
     if effective_dual_offers:
         # Create both relative and absolute offers
         # Use CLI values if provided, otherwise use settings
@@ -233,7 +241,7 @@ def build_maker_config(
 
         offer_configs = [
             OfferConfig(
-                offer_type=OfferType.SW0_RELATIVE,
+                offer_type=relative_offer_type,
                 min_size=min_sz,
                 cj_fee_relative=rel_fee,
                 cj_fee_absolute=abs_fee,
@@ -243,7 +251,7 @@ def build_maker_config(
                 size_factor=settings.maker.size_factor,
             ),
             OfferConfig(
-                offer_type=OfferType.SW0_ABSOLUTE,
+                offer_type=absolute_offer_type,
                 min_size=min_sz,
                 cj_fee_relative=rel_fee,
                 cj_fee_absolute=abs_fee,
@@ -254,7 +262,7 @@ def build_maker_config(
             ),
         ]
         # Set dummy values for legacy fields (they won't be used)
-        parsed_offer_type = OfferType.SW0_RELATIVE
+        parsed_offer_type = relative_offer_type
         actual_cj_fee_relative = rel_fee
         actual_cj_fee_absolute = abs_fee
     elif cj_fee_relative is not None and cj_fee_absolute is not None:
@@ -264,12 +272,12 @@ def build_maker_config(
         )
     elif cj_fee_absolute is not None:
         # User explicitly set absolute fee via CLI
-        parsed_offer_type = OfferType.SW0_ABSOLUTE
+        parsed_offer_type = absolute_offer_type
         actual_cj_fee_relative = settings.maker.cj_fee_relative
         actual_cj_fee_absolute = cj_fee_absolute
     elif cj_fee_relative is not None:
         # User explicitly set relative fee via CLI
-        parsed_offer_type = OfferType.SW0_RELATIVE
+        parsed_offer_type = relative_offer_type
         actual_cj_fee_relative = cj_fee_relative
         actual_cj_fee_absolute = settings.maker.cj_fee_absolute
     else:
@@ -280,7 +288,7 @@ def build_maker_config(
         except ValueError:
             raise ValueError(
                 f"Invalid offer_type in config: {settings.maker.offer_type}. "
-                "Must be one of: sw0reloffer, sw0absoffer"
+                "Must be one of: sw0reloffer, sw0absoffer, tr0reloffer, tr0absoffer"
             )
         actual_cj_fee_relative = settings.maker.cj_fee_relative
         actual_cj_fee_absolute = settings.maker.cj_fee_absolute
@@ -408,6 +416,7 @@ def build_maker_config(
         fidelity_bond_locktimes=list(effective_locktimes),
         fidelity_bond_index=effective_bond_index,
         no_fidelity_bond=no_fidelity_bond,
+        discover_fidelity_bonds_on_startup=settings.maker.discover_fidelity_bonds_on_startup,
         merge_algorithm=parsed_merge_algorithm,
         mixdepth_selection_policy=parsed_mixdepth_selection,
         offer_configs=offer_configs,
@@ -770,9 +779,10 @@ def start(
     logger.info(f"Directory servers: {len(config.directory_servers)} configured")
 
     wallet = create_wallet_service(config)
+    nick_state_instance_id = uuid.uuid4().hex
 
     def _publish_maker_nick(_old_nick: str, new_nick: str) -> None:
-        write_nick_state(config.data_dir, "maker", new_nick)
+        write_nick_state(config.data_dir, "maker", new_nick, instance_id=nick_state_instance_id)
 
     bot = MakerBot(
         wallet,
@@ -805,9 +815,11 @@ def start(
             # Write nick state file for external tracking and cross-component protection
             nick = bot.nick
             data_dir = config.data_dir
-            write_nick_state(data_dir, "maker", nick)
+            nick_state_path = write_nick_state(
+                data_dir, "maker", nick, instance_id=nick_state_instance_id
+            )
             logger.info("Maker nick state written")
-            logger.bind(sensitive=True).info(f"Nick state written to {data_dir}/state/maker.nick")
+            logger.bind(sensitive=True).info(f"Nick state written to {nick_state_path}")
 
             # Send startup notification immediately (including nick)
             notifier = get_notifier(settings, component_name="Maker")
@@ -823,7 +835,7 @@ def start(
             pass
         finally:
             # Clean up nick state file on shutdown
-            remove_nick_state(config.data_dir, "maker")
+            remove_nick_state(config.data_dir, "maker", instance_id=nick_state_instance_id)
             await bot.stop()
 
     try:

@@ -380,13 +380,29 @@ class TestTakerSigning:
 
         real_signer = mock_wallet.sign_input
         signing_calls = 0
+        successful_signatures = []
 
-        def fail_after_first_signature(tx, input_index, utxo):
+        def fail_after_first_signature(
+            tx: Any,
+            input_index: int,
+            utxo: UTXOInfo,
+            *,
+            prevout_values: list[int] | None = None,
+            prevout_scripts: list[bytes] | None = None,
+        ) -> Any:
             nonlocal signing_calls
             signing_calls += 1
             if signing_calls == 2:
                 raise RuntimeError("second signer failed")
-            return real_signer(tx, input_index, utxo)
+            signed = real_signer(
+                tx,
+                input_index,
+                utxo,
+                prevout_values=prevout_values,
+                prevout_scripts=prevout_scripts,
+            )
+            successful_signatures.append(signed)
+            return signed
 
         mock_wallet.sign_input = MagicMock(side_effect=fail_after_first_signature)
         with patch.object(Taker, "__init__", lambda self, *args, **kwargs: None):
@@ -409,6 +425,7 @@ class TestTakerSigning:
 
             assert signatures == []
             assert signing_calls == 2
+            assert len(successful_signatures) == 1
             assert taker._session.signing_boundary_crossed is True
             mock_wallet.release_coinjoin_inputs.assert_not_called()
             assert mock_wallet.renew_coinjoin_inputs.call_count == 2

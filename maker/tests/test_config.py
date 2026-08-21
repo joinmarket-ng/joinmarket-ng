@@ -3,6 +3,7 @@ Tests for maker configuration validation.
 """
 
 from pathlib import Path
+from typing import Literal
 
 import pytest
 from jmcore.models import OfferType
@@ -45,7 +46,46 @@ def test_minimum_fee_floor_cannot_exceed_maximum_fee_rate() -> None:
         MakerConfig(mnemonic=TEST_MNEMONIC, min_fee_rate_sat_vb=2.0, max_fee_rate_sat_vb=1.0)
 
 
-def test_maximum_maker_lock_windows_fit_metadata_ttl_cap() -> None:
+@pytest.mark.parametrize(
+    ("address_type", "offer_type"),
+    [
+        ("p2wpkh", OfferType.SW0_RELATIVE),
+        ("p2tr", OfferType.TR0_RELATIVE),
+    ],
+)
+def test_offer_family_matches_wallet_address_type(
+    address_type: Literal["p2wpkh", "p2tr"], offer_type: OfferType
+) -> None:
+    config = MakerConfig(
+        mnemonic=TEST_MNEMONIC,
+        address_type=address_type,
+        offer_type=offer_type,
+    )
+    assert config.offer_type == offer_type
+
+
+def test_offer_family_mismatch_is_rejected() -> None:
+    with pytest.raises(ValidationError, match="requires a 'p2tr' wallet"):
+        MakerConfig(
+            mnemonic=TEST_MNEMONIC,
+            address_type="p2wpkh",
+            offer_type=OfferType.TR0_RELATIVE,
+        )
+
+
+def test_mixed_offer_configs_are_rejected() -> None:
+    with pytest.raises(ValidationError, match="requires a 'p2wpkh' wallet"):
+        MakerConfig(
+            mnemonic=TEST_MNEMONIC,
+            address_type="p2tr",
+            offer_configs=[
+                OfferConfig(offer_type=OfferType.TR0_RELATIVE),
+                OfferConfig(offer_type=OfferType.SW0_ABSOLUTE),
+            ],
+        )
+
+
+def test_maximum_maker_lock_window_fits_metadata_ttl_cap() -> None:
     from jmwallet.wallet.utxo_metadata import MAX_COINJOIN_LOCK_TTL
 
     config = MakerConfig(
@@ -483,6 +523,7 @@ class TestBuildMakerConfig:
         from maker.cli import build_maker_config
 
         settings = JoinMarketSettings()
+        settings.wallet.address_type = "p2tr"
         settings.maker.offer_type = "tr0reloffer"
 
         records: list[str] = []
@@ -530,6 +571,7 @@ class TestBuildMakerConfig:
         assert config.address_type == "p2wpkh"
 
         settings.wallet.address_type = "p2tr"
+        settings.maker.offer_type = "tr0reloffer"
         config = build_maker_config(
             settings=settings,
             mnemonic=TEST_MNEMONIC,
@@ -1191,6 +1233,17 @@ class TestNewSettingsWiring:
         config = build_maker_config(settings=settings, mnemonic=TEST_MNEMONIC, passphrase="")
         assert config.directory_startup_timeout == 60
 
+    def test_fidelity_bond_discovery_passed_from_settings(self) -> None:
+        """maker.discovery setting must reach MakerConfig unchanged."""
+        from jmcore.settings import JoinMarketSettings
+
+        from maker.cli import build_maker_config
+
+        settings = JoinMarketSettings()
+        settings.maker.discover_fidelity_bonds_on_startup = True
+        config = build_maker_config(settings=settings, mnemonic=TEST_MNEMONIC, passphrase="")
+        assert config.discover_fidelity_bonds_on_startup is True
+
     def test_orderbook_rate_limit_passed_from_settings(self) -> None:
         """maker.orderbook_rate_limit in config.toml must reach MakerConfig."""
         from jmcore.settings import JoinMarketSettings
@@ -1257,9 +1310,14 @@ class TestNewSettingsWiring:
         from maker.cli import build_maker_config
 
         settings = JoinMarketSettings()
+        settings.wallet.address_type = "p2tr"
         settings.maker.dual_offers = True
         config = build_maker_config(settings=settings, mnemonic=TEST_MNEMONIC, passphrase="")
         assert len(config.offer_configs) == 2
+        assert [offer.offer_type for offer in config.offer_configs] == [
+            OfferType.TR0_RELATIVE,
+            OfferType.TR0_ABSOLUTE,
+        ]
 
     def test_dual_offers_cli_overrides_settings_false(self) -> None:
         """CLI dual_offers=True overrides settings.maker.dual_offers=False."""
@@ -1269,10 +1327,15 @@ class TestNewSettingsWiring:
 
         settings = JoinMarketSettings()
         settings.maker.dual_offers = False
+        settings.wallet.address_type = "p2tr"
         config = build_maker_config(
             settings=settings, mnemonic=TEST_MNEMONIC, passphrase="", dual_offers=True
         )
         assert len(config.offer_configs) == 2
+        assert [offer.offer_type for offer in config.offer_configs] == [
+            OfferType.TR0_RELATIVE,
+            OfferType.TR0_ABSOLUTE,
+        ]
 
     def test_dual_offers_not_set_uses_settings_default(self) -> None:
         """When dual_offers=None (not given on CLI), settings default (False) is used."""

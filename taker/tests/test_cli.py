@@ -526,6 +526,7 @@ class TestBuildTakerConfig:
         assert config.address_type == "p2wpkh"
 
         settings.wallet.address_type = "p2tr"
+        settings.taker.preferred_offer_type = OfferType.TR0_RELATIVE
         config = build_taker_config(
             settings=settings,
             mnemonic=sample_mnemonic,

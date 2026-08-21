@@ -4,7 +4,10 @@ Tests for taker configuration module.
 
 from __future__ import annotations
 
+from typing import Literal
+
 import pytest
+from jmcore.models import OfferType
 from pydantic import ValidationError
 
 from taker.config import (
@@ -150,6 +153,34 @@ class TestTakerConfig:
                 mnemonic=sample_mnemonic,
                 min_fee_rate_sat_vb=2.0,
                 max_fee_rate_sat_vb=1.0,
+            )
+
+    @pytest.mark.parametrize(
+        ("address_type", "preferred_offer_type"),
+        [
+            ("p2wpkh", OfferType.SW0_RELATIVE),
+            ("p2tr", OfferType.TR0_RELATIVE),
+        ],
+    )
+    def test_preferred_offer_family_matches_wallet_address_type(
+        self,
+        sample_mnemonic: str,
+        address_type: Literal["p2wpkh", "p2tr"],
+        preferred_offer_type: OfferType,
+    ) -> None:
+        config = TakerConfig(
+            mnemonic=sample_mnemonic,
+            address_type=address_type,
+            preferred_offer_type=preferred_offer_type,
+        )
+        assert config.preferred_offer_type == preferred_offer_type
+
+    def test_preferred_offer_family_mismatch_is_rejected(self, sample_mnemonic: str) -> None:
+        with pytest.raises(ValidationError, match="requires a 'p2tr' wallet"):
+            TakerConfig(
+                mnemonic=sample_mnemonic,
+                address_type="p2wpkh",
+                preferred_offer_type=OfferType.TR0_RELATIVE,
             )
 
     @pytest.mark.parametrize(
@@ -558,7 +589,6 @@ class TestPreferredOfferTypeRoundTrip:
     """Settings-to-config wiring for the rigid pit offer family."""
 
     def test_preferred_offer_type_propagates_to_taker_config(self, sample_mnemonic: str) -> None:
-        from jmcore.models import OfferType
         from jmcore.settings import (
             JoinMarketSettings,
             NetworkSettings,

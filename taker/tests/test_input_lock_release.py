@@ -37,6 +37,7 @@ def _make_wallet(utxos: list) -> AsyncMock:
 
 def _backend() -> AsyncMock:
     backend = AsyncMock()
+    backend.get_block_height = AsyncMock(return_value=100)
     backend.can_provide_neutrino_metadata = Mock(return_value=False)
     backend.requires_neutrino_metadata = Mock(return_value=False)
     backend.can_estimate_fee = Mock(return_value=False)
@@ -187,8 +188,8 @@ async def test_late_synchronous_confirmation_is_rejected() -> None:
 
 
 @pytest.mark.asyncio
-async def test_new_round_does_not_release_prior_post_sign_lease() -> None:
-    """Fresh round state must not compare-and-release an earlier signed lease."""
+async def test_new_round_renews_prior_post_sign_lease() -> None:
+    """Fresh round state must renew, not release, an earlier signed lease."""
     utxo = make_utxo(txid_char="a", value=25_000_000, confirmations=1)  # immature
     wallet = _make_wallet([utxo])
     wallet.select_utxos = Mock(side_effect=ValueError("Insufficient funds"))
@@ -205,11 +206,15 @@ async def test_new_round_does_not_release_prior_post_sign_lease() -> None:
     assert taker._session is not prior_session
     assert taker._session.input_lock_owner != prior_owner
     wallet.release_coinjoin_inputs.assert_not_called()
-    wallet.renew_coinjoin_inputs.assert_not_called()
+    wallet.renew_coinjoin_inputs.assert_called_once_with(
+        leftover,
+        owner=prior_owner,
+        ttl=prior_session.input_lock_ttl_sec(),
+    )
     assert taker._session.reserved_inputs == set()
 
 
-def test_active_ring_lock_is_retained_when_round_cleanup_runs() -> None:
+def test_active_pre_sign_ring_lock_is_retained_when_round_cleanup_runs() -> None:
     wallet = _make_wallet([])
     taker = Taker(wallet, _backend(), make_taker_config())
     reserved = {("c" * 64, 2)}

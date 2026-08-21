@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import secrets
 from typing import Any, cast
 
 from fastapi import APIRouter, Depends
@@ -308,6 +309,7 @@ async def start_maker(
         from maker.bot import MakerBot
 
         state.activate_coinjoin_state(CoinjoinState.MAKER_RUNNING)
+        instance_id = secrets.token_hex(16)
 
         async def _run_maker() -> None:
             maker: MakerBot | None = None
@@ -333,7 +335,7 @@ async def start_maker(
 
                 def _publish_maker_nick(_old_nick: str, new_nick: str) -> None:
                     state.nickname = new_nick
-                    write_nick_state(state.data_dir, "maker", new_nick)
+                    write_nick_state(state.data_dir, "maker", new_nick, instance_id=instance_id)
 
                 maker = MakerBot(
                     wallet=ws,
@@ -343,7 +345,7 @@ async def start_maker(
                 )
                 state._maker_ref = maker
                 state.nickname = maker.nick
-                write_nick_state(state.data_dir, "maker", maker.nick)
+                write_nick_state(state.data_dir, "maker", maker.nick, instance_id=instance_id)
 
                 await maker.start()
                 # NOTE: maker.start() blocks until shutdown (it awaits
@@ -375,7 +377,7 @@ async def start_maker(
                 state.nickname = None
                 state._maker_ref = None
                 state._maker_task = None
-                remove_nick_state(state.data_dir, "maker")
+                remove_nick_state(state.data_dir, "maker", instance_id=instance_id)
 
         state._maker_task = asyncio.create_task(_run_maker())
     except ImportError:

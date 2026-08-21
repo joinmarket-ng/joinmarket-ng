@@ -856,12 +856,16 @@ class TestStartMaker:
         # Allow the background asyncio task to run to completion.
         time.sleep(0.1)
 
+        instance_id = mock_write_nick.call_args.kwargs["instance_id"]
+        assert instance_id
         assert mock_write_nick.call_args_list == [
-            call(state.data_dir, "maker", "J5TestNickWalletd"),
-            call(state.data_dir, "maker", "J5RotatedNickWalletd"),
+            call(state.data_dir, "maker", "J5TestNickWalletd", instance_id=instance_id),
+            call(state.data_dir, "maker", "J5RotatedNickWalletd", instance_id=instance_id),
         ]
-        mock_remove_nick.assert_called_once_with(state.data_dir, "maker")
+        mock_remove_nick.assert_called_once_with(state.data_dir, "maker", instance_id=instance_id)
 
+    @patch("jmwalletd.routers.coinjoin.remove_nick_state")
+    @patch("jmwalletd.routers.coinjoin.write_nick_state")
     @patch("jmwalletd._backend.get_backend", new_callable=AsyncMock)
     @patch("maker.bot.MakerBot")
     @patch("maker.config.MakerConfig")
@@ -870,6 +874,8 @@ class TestStartMaker:
         mock_config: Mock,
         mock_maker_cls: Mock,
         mock_backend: AsyncMock,
+        mock_write_nick: Mock,
+        mock_remove_nick: Mock,
         authed_client: tuple[TestClient, str],
     ) -> None:
         client, token = authed_client
@@ -896,6 +902,10 @@ class TestStartMaker:
 
         mock_maker.stop.assert_awaited_once()
         mock_backend.return_value.close.assert_awaited_once()
+        mock_write_nick.assert_called_once()
+        instance_id = mock_write_nick.call_args.kwargs["instance_id"]
+        assert instance_id
+        mock_remove_nick.assert_called_once_with(state.data_dir, "maker", instance_id=instance_id)
         assert state._maker_ref is None
         assert state.coinjoin_state == CoinjoinState.NOT_RUNNING
 

@@ -33,7 +33,7 @@ from jmcore.fee_policy import fee_rate_meets_minimum
 from jmcore.logging_context import coinjoin_id_from_commitment, coinjoin_log_context
 from jmcore.models import Offer, offer_output_script_type, offer_types_for_family
 from jmcore.notifications import get_notifier
-from jmcore.paths import get_default_data_dir, read_nick_state
+from jmcore.paths import get_default_data_dir, read_nick_states
 from jmcore.protocol import FEATURE_COFUNDED_CHANNEL_RING_V1, FEATURE_NEUTRINO_COMPAT, JM_VERSION
 from jmcore.tasks import spawn_task
 from jmwallet.backends.base import BlockchainBackend, BondVerificationRequest
@@ -233,11 +233,9 @@ class Taker(TakerMonitoringMixin):
         )
 
         # Orderbook manager
-        # Read maker nick from state file to exclude from peer selection (self-CoinJoin protection)
-        own_wallet_nicks: set[str] = set()
-        maker_nick = read_nick_state(config.data_dir, "maker")
-        if maker_nick:
-            own_wallet_nicks.add(maker_nick)
+        # Read every maker instance nick to exclude from peer selection.
+        own_wallet_nicks = read_nick_states(config.data_dir, "maker")
+        for maker_nick in own_wallet_nicks:
             logger.info(f"Self-CoinJoin protection: excluding maker nick {maker_nick}")
 
         self.orderbook_manager = OrderbookManager(
@@ -1224,6 +1222,10 @@ class Taker(TakerMonitoringMixin):
             return None
 
         async with self._round_lock:
+            # Settle the prior session's leases before replacing the only
+            # in-memory reference to its owner token. Pre-sign leases are
+            # released; post-sign leases are renewed through the pending window.
+            self.release_input_locks()
             session = CoinJoinSession()
             session.attach(self)
             self._session = session
@@ -1287,8 +1289,8 @@ class Taker(TakerMonitoringMixin):
             # in tumbler runs), so the nick read at __init__ time would be
             # stale.  Refreshing here ensures the hard exclusion is always
             # current regardless of startup order.
-            current_maker_nick = read_nick_state(self.config.data_dir, "maker")
-            if current_maker_nick:
+            current_maker_nicks = read_nick_states(self.config.data_dir, "maker")
+            for current_maker_nick in current_maker_nicks:
                 if current_maker_nick not in self.orderbook_manager.own_wallet_nicks:
                     logger.bind(sensitive=True).info(
                         f"Self-CoinJoin protection: adding maker nick {current_maker_nick} "
