@@ -23,7 +23,3 @@ HiddenServiceVersion 3
 HiddenServiceDir /var/lib/tor/lnd-taker
 HiddenServicePort 9735 ring-onion-taker:9735
 HiddenServiceVersion 3
-
-HiddenServiceDir /var/lib/tor/swap-nostr
-HiddenServicePort 80 ring-nostr:7000
-HiddenServiceVersion 3
