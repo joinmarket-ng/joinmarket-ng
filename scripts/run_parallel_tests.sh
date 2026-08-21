@@ -149,7 +149,6 @@ declare -A SUITE_SLOT=(
     [tumbler]=9
     [reference-migration]=10
     [ring-e2e]=11
-    [swap-provider-e2e]=12
 )
 
 # Service slot index within a suite's port window.
@@ -497,31 +496,6 @@ ring_compose_cmd() {
             "$@"
 }
 
-swap_provider_compose_cmd() {
-    local suite="swap-provider-e2e"
-    RING_E2E_DATA_DIR="${PARALLEL_DIR}/shared/${suite}" \
-    SWAP_PROVIDER_E2E_PROJECT="${PROJECT_PREFIX}-${suite}" \
-    SWAP_PROVIDER_E2E_JUNIT_DIR="${PARALLEL_DIR}/junit/${suite}" \
-    SWAP_PROVIDER_TOR_SOCKS_HOST=ring-tor-client \
-    SWAP_PROVIDER_E2E=true \
-        docker compose \
-            -p "${PROJECT_PREFIX}-${suite}" \
-            -f "${PROJECT_ROOT}/jmswap/docker-compose.ring-e2e.yml" \
-            --profile ring-e2e \
-            --profile swap-provider-e2e \
-            "$@"
-}
-
-run_swap_provider_test() {
-    local suite="swap-provider-e2e"
-    RING_E2E_DATA_DIR="${PARALLEL_DIR}/shared/${suite}" \
-    SWAP_PROVIDER_E2E_PROJECT="${PROJECT_PREFIX}-${suite}" \
-    SWAP_PROVIDER_E2E_JUNIT_DIR="${PARALLEL_DIR}/junit/${suite}" \
-    SWAP_PROVIDER_TOR_SOCKS_HOST=ring-tor-client \
-    SWAP_PROVIDER_E2E=true \
-        "${PROJECT_ROOT}/scripts/run-swap-provider-e2e.sh"
-}
-
 # =============================================================================
 # Wait for Bitcoin RPC readiness on a specific port
 #
@@ -828,11 +802,6 @@ cleanup_suite() {
         rm -rf "${PARALLEL_DIR}/shared/${suite}" 2>/dev/null || true
         return
     fi
-    if [ "$suite" = "swap-provider-e2e" ]; then
-        swap_provider_compose_cmd down --remove-orphans -v 2>/dev/null || true
-        rm -rf "${PARALLEL_DIR}/shared/${suite}" 2>/dev/null || true
-        return
-    fi
     compose_cmd "$suite" --profile e2e --profile reference --profile neutrino --profile reference-maker --profile reference-migration down -v 2>/dev/null || true
     compose_cmd "$suite" down --remove-orphans -v 2>/dev/null || true
     rm -rf "${PARALLEL_DIR}/shared/${suite}" 2>/dev/null || true
@@ -926,7 +895,6 @@ configure_shared_images() {
     export JMWALLETD_IMAGE="${jmwalletd_image:-${SHARED_IMAGE_PROJECT}-jmwalletd:latest}"
     export JAM_NG_BASE_IMAGE="${jam_ng_base_image:-${SHARED_IMAGE_PROJECT}-jam-playwright-base:latest}"
     export JAM_NG_IMAGE="${jam_ng_image:-${SHARED_IMAGE_PROJECT}-jam-playwright:latest}"
-    export SWAP_PROVIDER_TEST_IMAGE="${SHARED_IMAGE_PROJECT}-swap-provider-test:latest"
 }
 
 build_images() {
@@ -947,7 +915,6 @@ build_images() {
         --profile taker \
         build --parallel 2>&1 | tee "${PARALLEL_DIR}/build.log"
     configure_shared_images
-    swap_provider_compose_cmd build swap-provider-test-runner
     log_success "Docker images built"
 }
 
@@ -1079,37 +1046,6 @@ run_suite_ring_e2e() {
             echo "Channel-ring container diagnostics (suite=${suite}, rc=${rc})"
             ring_compose_cmd ps
             ring_compose_cmd logs --tail=200
-        } >> "$log" 2>&1 || true
-    fi
-    cleanup_suite "$suite"
-    return $rc
-}
-
-run_suite_swap_provider_e2e() {
-    local suite="swap-provider-e2e"
-    local log="${PARALLEL_DIR}/${suite}.log"
-    local data_dir="${PARALLEL_DIR}/shared/${suite}"
-
-    log_suite "Starting: Maker Swap Provider E2E Tests ($suite)"
-    local rc=0
-    set +e
-    (
-        set -e
-        cleanup_suite "$suite"
-        mkdir -p "$data_dir"
-        mkdir -p "${PARALLEL_DIR}/junit/${suite}"
-        swap_provider_compose_cmd up -d
-
-        run_swap_provider_test
-    ) > "$log" 2>&1
-    rc=$?
-    set -e
-    if [ "$rc" -ne 0 ]; then
-        {
-            echo
-            echo "Swap-provider container diagnostics (suite=${suite}, rc=${rc})"
-            swap_provider_compose_cmd ps
-            swap_provider_compose_cmd logs --tail=200
         } >> "$log" 2>&1 || true
     fi
     cleanup_suite "$suite"
@@ -1858,7 +1794,6 @@ main() {
     # Docker test suites (each with isolated compose project)
     launch_suite "e2e" run_suite_e2e
     launch_suite "ring-e2e" run_suite_ring_e2e
-    launch_suite "swap-provider-e2e" run_suite_swap_provider_e2e
     launch_suite "jmwallet" run_suite_jmwallet
     launch_suite "reference-interop" run_suite_reference_interop
     launch_suite "reference-legacy" run_suite_reference_legacy
@@ -1979,7 +1914,6 @@ case "${1:-}" in
             unit)                  run_suite_unit ;;
             e2e)                   run_suite_e2e ;;
             ring-e2e)              run_suite_ring_e2e ;;
-            swap-provider-e2e)     run_suite_swap_provider_e2e ;;
             playwright)            run_suite_playwright ;;
             jmwallet)              run_suite_jmwallet ;;
             reference-interop)     run_suite_reference_interop ;;
@@ -2034,7 +1968,6 @@ Available suites:
   unit                  Unit tests (no Docker)
   e2e                   E2E + Docker integration tests
   ring-e2e              Four-node co-funded channel-ring E2E test
-  swap-provider-e2e     Electrum-compatible maker swap-provider E2E test
   playwright            Playwright browser tests
   jmwallet              jmwallet Docker tests
   reference-interop     Reference interop tests (our maker + JAM taker)

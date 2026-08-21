@@ -1,7 +1,7 @@
 #!/bin/bash
 set -eu
 
-for service in lnd-maker1 lnd-maker2 lnd-maker3 lnd-taker swap-nostr; do
+for service in lnd-maker1 lnd-maker2 lnd-maker3 lnd-taker; do
     test -s "/var/lib/tor/${service}/hostname"
 done
 

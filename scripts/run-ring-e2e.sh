@@ -151,7 +151,7 @@ run_ring() {
         mkdir -p "$RING_E2E_DATA_DIR"
         ring_compose up -d
         wait_for_healthy ring_compose 300 \
-            ring-bitcoin ring-directory ring-orderbook ring-nostr ring-tor \
+            ring-bitcoin ring-directory ring-orderbook ring-tor \
             ring-onion-maker1 ring-onion-maker2 ring-onion-maker3 ring-onion-taker \
             lnd-maker1 lnd-maker2 lnd-maker3 lnd-taker \
             ring-maker1 ring-maker2 ring-maker3

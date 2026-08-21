@@ -22,7 +22,7 @@ Utility scripts for JoinMarket NG development and operations.
 - **ring-e2e-lnd.sh** - Start one stock LND node for the isolated channel-ring profile
 - **ring-e2e-maker.sh** - Start one configured maker for the isolated channel-ring profile
 - **run-ring-e2e.sh** - Reset, run, and clean up the focused LND external-channel and full four-party channel-ring E2E profiles
-- **run_parallel_tests.sh** - Execute all test suites, including `--suite ring-e2e` and `--suite swap-provider-e2e`, using Docker Compose project isolation
+- **run_parallel_tests.sh** - Execute all test suites, including `--suite ring-e2e`, using Docker Compose project isolation
 - **sign-release.sh** - Sign a release manifest (supports local-first and CI-first workflows)
 - **update_readme_help.py** - Update generated CLI help in component READMEs (run manually when CLI changes; user guides link to this reference)
 - **update-base-images.sh** - Update Docker base image digests
