@@ -6,11 +6,49 @@ import asyncio
 import json
 import os
 import time
+from collections.abc import Sequence
+from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 import pytest
-from jmswap.lnd import LndBackend, LndEscrowStage, WitnessUtxo
+from coincurve import PrivateKey
+from jmcore.bitcoin import (
+    TxInput,
+    TxOutput,
+    address_to_scriptpubkey,
+    analyze_coinjoin_outputs,
+    get_txid,
+    parse_transaction,
+    scriptpubkey_to_address,
+    serialize_transaction,
+    taproot_tweak_privkey,
+)
+from jmswap.lnd import (
+    EscrowOutpoint,
+    FrozenChannelSnapshot,
+    LndBackend,
+    LndEscrowSigningAttempt,
+    LndEscrowStage,
+    LndEscrowStatus,
+    LndFinalizedEscrowParent,
+    WitnessUtxo,
+)
+from jmwallet.wallet.signing import sign_p2tr_input, verify_p2tr_signature
+from taker.channel_input_parent import (
+    ChannelContribution,
+    ChannelInputEndpoint,
+    ChannelInputParentCoordinator,
+    ChannelInputParentError,
+    ChannelInputParentPlan,
+    ChannelInputParentState,
+    ChainTransaction,
+    EndpointContribution,
+    OrdinaryWitness,
+    ParentPrevout,
+    SettlementOutput,
+)
 
 from tests.e2e.test_lnd_external_channel_e2e import (
     DATA_DIR,
@@ -99,14 +137,18 @@ async def wait_for_resolved_channel(timeout: float = 60) -> None:
             lncli("lnd-opener", "pendingchannels"),
             lncli("lnd-fundee", "pendingchannels"),
         )
-        if all(
-            not state[key]
-            for state in (opener, fundee)
-            for key in (
-                "pending_open_channels",
-                "pending_closing_channels",
-                "pending_force_closing_channels",
-                "waiting_close_channels",
+        if (
+            not (await lncli("lnd-opener", "listchannels"))["channels"]
+            and not (await lncli("lnd-fundee", "listchannels"))["channels"]
+            and all(
+                not state[key]
+                for state in (opener, fundee)
+                for key in (
+                    "pending_open_channels",
+                    "pending_closing_channels",
+                    "pending_force_closing_channels",
+                    "waiting_close_channels",
+                )
             )
         ):
             return
@@ -114,7 +156,147 @@ async def wait_for_resolved_channel(timeout: float = 60) -> None:
     raise RuntimeError("confirmed exact parent did not resolve the channel")
 
 
-async def test_exact_parent_restart_recovery_through_python_client() -> None:
+@dataclass(frozen=True)
+class CoreTransaction(ChainTransaction):
+    txid: str
+    raw: str
+    confirmations: int
+
+
+class CoreChain:
+    async def get_transaction(self, txid: str) -> ChainTransaction | None:
+        try:
+            transaction = await bitcoin_rpc("getrawtransaction", [txid, True])
+        except RuntimeError as exc:
+            message = str(exc)
+            if (
+                "-5" in message
+                or "No such mempool or blockchain transaction" in message
+            ):
+                return None
+            raise
+        return CoreTransaction(
+            txid=str(transaction["txid"]),
+            raw=str(transaction["hex"]),
+            confirmations=int(transaction.get("confirmations", 0)),
+        )
+
+    async def broadcast_transaction(self, tx_hex: str) -> str:
+        return str(await bitcoin_rpc("sendrawtransaction", [tx_hex]))
+
+
+class SimulatedCoordinatorInterruption(ChannelInputParentError):
+    """Raised after LND has durably signed but before the coordinator saves it."""
+
+
+class RestartingOpenerEndpoint:
+    def __init__(self, backend: LndBackend) -> None:
+        self.backend = backend
+        self.restarted_backend: LndBackend | None = None
+        self.begin_calls = 0
+        self.sign_calls = 0
+        self._interrupted = False
+
+    async def freeze_channel_input(
+        self, session_id: str, channel_id: str
+    ) -> FrozenChannelSnapshot:
+        return await self.backend.freeze_channel_input(session_id, channel_id)
+
+    async def prepare_channel_input_parent(
+        self,
+        session_id: str,
+        funding_outpoint: EscrowOutpoint,
+        parent_tx_hex: str,
+        input_utxos: Sequence[WitnessUtxo],
+        channel_input_index: int,
+    ) -> str:
+        return await self.backend.prepare_channel_input_parent(
+            session_id,
+            funding_outpoint,
+            parent_tx_hex,
+            input_utxos,
+            channel_input_index,
+        )
+
+    async def begin_channel_input_signing(
+        self,
+        session_id: str,
+        funding_outpoint: EscrowOutpoint,
+        *,
+        restart_attempt: bool = False,
+    ) -> LndEscrowSigningAttempt:
+        self.begin_calls += 1
+        return await self.backend.begin_channel_input_signing(
+            session_id, funding_outpoint, restart_attempt=restart_attempt
+        )
+
+    async def sign_channel_input_parent(
+        self,
+        session_id: str,
+        funding_outpoint: EscrowOutpoint,
+        attempt: LndEscrowSigningAttempt,
+        remote_public_nonce: bytes,
+    ) -> bytes:
+        self.sign_calls += 1
+        partial = await self.backend.sign_channel_input_parent(
+            session_id, funding_outpoint, attempt, remote_public_nonce
+        )
+        if not self._interrupted:
+            self._interrupted = True
+            await self.backend.close()
+            await compose("restart", "lnd-opener")
+            self.restarted_backend = escrow_backend("opener", OPENER_GRPC)
+            self.backend = self.restarted_backend
+            await wait_for_node(self.backend)
+            raise SimulatedCoordinatorInterruption(
+                "simulated interruption after durable opener partial signature"
+            )
+        return partial
+
+    async def finalize_channel_input_parent(
+        self,
+        session_id: str,
+        funding_outpoint: EscrowOutpoint,
+        attempt: LndEscrowSigningAttempt,
+        remote_partial_signature: bytes,
+    ) -> LndFinalizedEscrowParent:
+        return await self.backend.finalize_channel_input_parent(
+            session_id, funding_outpoint, attempt, remote_partial_signature
+        )
+
+    async def recover_channel_input_parent(
+        self,
+        session_id: str,
+        funding_outpoint: EscrowOutpoint,
+        remote_partial_signature: bytes,
+    ) -> LndFinalizedEscrowParent:
+        return await self.backend.recover_channel_input_parent(
+            session_id, funding_outpoint, remote_partial_signature
+        )
+
+    async def channel_input_escrow_status(
+        self, session_id: str, funding_outpoint: EscrowOutpoint
+    ) -> LndEscrowStatus:
+        return await self.backend.channel_input_escrow_status(
+            session_id, funding_outpoint
+        )
+
+    async def cancel_channel_input_escrow(
+        self, session_id: str, funding_outpoint: EscrowOutpoint
+    ) -> bool:
+        return await self.backend.cancel_channel_input_escrow(
+            session_id, funding_outpoint
+        )
+
+
+def p2tr_script(key_material: bytes) -> tuple[PrivateKey, bytes]:
+    key = PrivateKey(taproot_tweak_privkey(key_material))
+    return key, b"\x51\x20" + key.public_key_xonly.format()
+
+
+async def test_exact_parent_restart_recovery_through_python_client(
+    tmp_path: Path,
+) -> None:
     if os.getenv("LND_CHANNEL_ESCROW_E2E") != "1":
         pytest.skip(
             "start the lnd_external profile with patched LND and set "
@@ -133,7 +315,7 @@ async def test_exact_parent_restart_recovery_through_python_client() -> None:
     await asyncio.gather(*(wait_for_file(path) for path in credential_paths))
     opener = escrow_backend("opener", OPENER_GRPC)
     fundee = escrow_backend("fundee", FUNDEE_GRPC)
-    restarted_opener: LndBackend | None = None
+    restarting_opener = RestartingOpenerEndpoint(opener)
     try:
         wallet = await core_wallet()
         await mine(wallet, 101)
@@ -143,6 +325,11 @@ async def test_exact_parent_restart_recovery_through_python_client() -> None:
             lncli("lnd-opener", "newaddress", "p2tr"),
             lncli("lnd-fundee", "newaddress", "p2tr"),
         )
+        ordinary_key, ordinary_script = p2tr_script(b"\x11" * 32)
+        ordinary_address = scriptpubkey_to_address(ordinary_script, "regtest")
+        ordinary_funding_txid = str(
+            await bitcoin_rpc("sendtoaddress", [ordinary_address, 0.005], wallet=wallet)
+        )
         await bitcoin_rpc(
             "sendtoaddress", [opener_address["address"], 0.02], wallet=wallet
         )
@@ -151,6 +338,20 @@ async def test_exact_parent_restart_recovery_through_python_client() -> None:
         )
         await mine(wallet, 6)
         await asyncio.gather(wait_for_node(opener), wait_for_node(fundee))
+
+        ordinary_funding = await bitcoin_rpc(
+            "getrawtransaction", [ordinary_funding_txid, True]
+        )
+        ordinary_vouts = [
+            output
+            for output in ordinary_funding["vout"]
+            if int(Decimal(str(output["value"])) * 100_000_000) == 500_000
+            and bytes.fromhex(str(output["scriptPubKey"]["hex"])) == ordinary_script
+        ]
+        assert len(ordinary_vouts) == 1
+        ordinary_vout = ordinary_vouts[0]
+        ordinary_value = int(Decimal(str(ordinary_vout["value"])) * 100_000_000)
+        assert ordinary_value == 500_000
 
         fundee_info = await fundee.node_info()
         await lncli(
@@ -175,7 +376,9 @@ async def test_exact_parent_restart_recovery_through_python_client() -> None:
         assert channel_point.startswith(f"{opened['funding_txid']}:")
 
         session_id = "joinmarket-python-client-regtest-restart-recovery"
-        opener_snapshot = await opener.freeze_channel_input(session_id, channel_point)
+        opener_snapshot = await restarting_opener.freeze_channel_input(
+            session_id, channel_point
+        )
         fundee_snapshot = await fundee.freeze_channel_input(session_id, channel_point)
         assert opener_snapshot.funding_outpoint == fundee_snapshot.funding_outpoint
         assert (
@@ -184,103 +387,233 @@ async def test_exact_parent_restart_recovery_through_python_client() -> None:
         assert opener_snapshot.local_claim_sat == fundee_snapshot.remote_claim_sat
         assert opener_snapshot.remote_claim_sat == fundee_snapshot.local_claim_sat
 
-        destination = await bitcoin_rpc("getnewaddress", ["", "bech32m"], wallet=wallet)
-        parent_hex = await bitcoin_rpc(
-            "createrawtransaction",
-            [
-                [
-                    {
-                        "txid": opener_snapshot.funding_outpoint.txid,
-                        "vout": opener_snapshot.funding_outpoint.vout,
-                    }
-                ],
-                [{destination: 0.01499}],
-            ],
+        (
+            opener_equal_address,
+            opener_change_address,
+            fundee_equal_address,
+            fundee_change_address,
+        ) = await asyncio.gather(
+            lncli("lnd-opener", "newaddress", "p2tr"),
+            lncli("lnd-opener", "newaddress", "p2tr"),
+            lncli("lnd-fundee", "newaddress", "p2tr"),
+            lncli("lnd-fundee", "newaddress", "p2tr"),
         )
-        prevouts = [
-            WitnessUtxo(
-                value_sat=opener_snapshot.capacity_sat,
-                script_pubkey=opener_snapshot.funding_scriptpubkey,
-            )
+        _, ordinary_equal_script = p2tr_script(b"\x12" * 32)
+        _, ordinary_change_script = p2tr_script(b"\x13" * 32)
+        opener_equal_script = address_to_scriptpubkey(
+            str(opener_equal_address["address"])
+        )
+        opener_change_script = address_to_scriptpubkey(
+            str(opener_change_address["address"])
+        )
+        fundee_equal_script = address_to_scriptpubkey(
+            str(fundee_equal_address["address"])
+        )
+        fundee_change_script = address_to_scriptpubkey(
+            str(fundee_change_address["address"])
+        )
+        output_scripts = (
+            opener_equal_script,
+            fundee_equal_script,
+            ordinary_equal_script,
+            opener_change_script,
+            fundee_change_script,
+            ordinary_change_script,
+        )
+        assert len(set(output_scripts)) == 6
+        assert all(script.startswith(b"\x51\x20") for script in output_scripts)
+
+        opener_change = opener_snapshot.local_claim_sat - 300_000 - 500
+        fundee_change = fundee_snapshot.local_claim_sat - 300_000 - 500
+        ordinary_change = ordinary_value - 300_000 - 1_000
+        changes = (opener_change, fundee_change, ordinary_change)
+        assert all(change > 0 and change != 300_000 for change in changes)
+        assert len(set(changes)) == 3
+        inputs = [
+            TxInput.from_hex(
+                opener_snapshot.funding_outpoint.txid,
+                opener_snapshot.funding_outpoint.vout,
+            ),
+            TxInput.from_hex(ordinary_funding_txid, int(ordinary_vout["n"])),
         ]
-        opener_txid, fundee_txid = await asyncio.gather(
-            opener.prepare_channel_input_parent(
-                session_id, opener_snapshot.funding_outpoint, parent_hex, prevouts, 0
+        outputs = [
+            TxOutput(value=300_000, script=opener_equal_script),
+            TxOutput(value=300_000, script=fundee_equal_script),
+            TxOutput(value=300_000, script=ordinary_equal_script),
+            TxOutput(value=opener_change, script=opener_change_script),
+            TxOutput(value=fundee_change, script=fundee_change_script),
+            TxOutput(value=ordinary_change, script=ordinary_change_script),
+        ]
+        assert (
+            opener_snapshot.capacity_sat
+            + ordinary_value
+            - sum(output.value for output in outputs)
+            == 2_000
+        )
+        analysis = analyze_coinjoin_outputs(outputs)
+        assert analysis.is_coinjoin
+        assert analysis.cj_amount == 300_000
+        assert analysis.cj_count == 3
+        unsigned_parent_hex = serialize_transaction(2, inputs, outputs, 0).hex()
+        unsigned_parent = parse_transaction(unsigned_parent_hex)
+        prevout_values = [opener_snapshot.capacity_sat, ordinary_value]
+        prevout_scripts = [opener_snapshot.funding_scriptpubkey, ordinary_script]
+        ordinary_signature = sign_p2tr_input(
+            unsigned_parent, 1, prevout_values, prevout_scripts, ordinary_key
+        )
+        plan = ChannelInputParentPlan(
+            session_id=session_id,
+            unsigned_parent_hex=unsigned_parent_hex,
+            prevouts=(
+                ParentPrevout(
+                    value_sat=opener_snapshot.capacity_sat,
+                    script_pubkey=opener_snapshot.funding_scriptpubkey.hex(),
+                ),
+                ParentPrevout(
+                    value_sat=ordinary_value, script_pubkey=ordinary_script.hex()
+                ),
             ),
-            fundee.prepare_channel_input_parent(
-                session_id, fundee_snapshot.funding_outpoint, parent_hex, prevouts, 0
+            channels=(
+                ChannelContribution(
+                    channel_id=channel_point,
+                    channel_input_index=0,
+                    first=EndpointContribution(
+                        endpoint_id="opener",
+                        settlement_outputs=(
+                            SettlementOutput(
+                                output_index=0,
+                                value_sat=300_000,
+                                script_pubkey=opener_equal_script.hex(),
+                            ),
+                            SettlementOutput(
+                                output_index=3,
+                                value_sat=opener_change,
+                                script_pubkey=opener_change_script.hex(),
+                            ),
+                        ),
+                        miner_fee_share_sat=500,
+                    ),
+                    second=EndpointContribution(
+                        endpoint_id="fundee",
+                        settlement_outputs=(
+                            SettlementOutput(
+                                output_index=1,
+                                value_sat=300_000,
+                                script_pubkey=fundee_equal_script.hex(),
+                            ),
+                            SettlementOutput(
+                                output_index=4,
+                                value_sat=fundee_change,
+                                script_pubkey=fundee_change_script.hex(),
+                            ),
+                        ),
+                        miner_fee_share_sat=500,
+                    ),
+                ),
+            ),
+            ordinary_witnesses=(
+                OrdinaryWitness(input_index=1, witness=(ordinary_signature.hex(),)),
             ),
         )
-        assert opener_txid == fundee_txid
-        assert opener_txid not in await bitcoin_rpc("getrawmempool")
-
-        opener_attempt, fundee_attempt = await asyncio.gather(
-            opener.begin_channel_input_signing(
+        coordinator = ChannelInputParentCoordinator(tmp_path)
+        endpoints: dict[str, ChannelInputEndpoint] = {
+            "opener": restarting_opener,
+            "fundee": fundee,
+        }
+        expected_txid = get_txid(unsigned_parent_hex)
+        with pytest.raises(SimulatedCoordinatorInterruption):
+            await coordinator.execute(plan, endpoints)
+        assert restarting_opener.sign_calls == 1
+        assert restarting_opener.begin_calls == 1
+        assert restarting_opener.restarted_backend is not None
+        restarted_status = (
+            await restarting_opener.restarted_backend.channel_input_escrow_status(
                 session_id, opener_snapshot.funding_outpoint
-            ),
-            fundee.begin_channel_input_signing(
-                session_id, fundee_snapshot.funding_outpoint
-            ),
+            )
         )
-        opener_partial, fundee_partial = await asyncio.gather(
-            opener.sign_channel_input_parent(
-                session_id,
-                opener_snapshot.funding_outpoint,
-                opener_attempt,
-                fundee_attempt.public_nonce,
-            ),
-            fundee.sign_channel_input_parent(
-                session_id,
-                fundee_snapshot.funding_outpoint,
-                fundee_attempt,
-                opener_attempt.public_nonce,
-            ),
-        )
-        assert opener_txid not in await bitcoin_rpc("getrawmempool")
+        assert restarted_status.stage in {
+            LndEscrowStage.PARENT_SIGNED,
+            LndEscrowStage.FINALIZED,
+        }
+        assert restarted_status.parent_txid == expected_txid
+        assert restarted_status.durable_local_public_nonce is not None
+        assert restarted_status.durable_remote_public_nonce is not None
+        assert restarted_status.durable_local_partial_signature is not None
 
-        await opener.close()
-        await compose("restart", "lnd-opener")
-        restarted_opener = escrow_backend("opener", OPENER_GRPC)
-        await wait_for_node(restarted_opener)
-        recovered = await restarted_opener.channel_input_escrow_status(
-            session_id, opener_snapshot.funding_outpoint
+        resumed = await ChannelInputParentCoordinator(tmp_path).resume(
+            session_id, endpoints
         )
-        assert recovered.stage is LndEscrowStage.PARENT_SIGNED
-        assert recovered.parent_txid == opener_txid
-        assert recovered.durable_local_public_nonce == opener_attempt.public_nonce
-        assert recovered.durable_remote_public_nonce == fundee_attempt.public_nonce
-        assert recovered.durable_local_partial_signature == opener_partial
-
-        opener_final, fundee_final = await asyncio.gather(
-            restarted_opener.recover_channel_input_parent(
-                session_id, opener_snapshot.funding_outpoint, fundee_partial
-            ),
-            fundee.finalize_channel_input_parent(
-                session_id,
-                fundee_snapshot.funding_outpoint,
-                fundee_attempt,
-                opener_partial,
-            ),
+        assert resumed.state is ChannelInputParentState.FINAL_TX_PERSISTED
+        assert resumed.final_txid == expected_txid
+        assert resumed.final_tx_hex is not None
+        assert restarting_opener.sign_calls == 1
+        assert restarting_opener.begin_calls == 1
+        final_parent = parse_transaction(resumed.final_tx_hex)
+        assert len(final_parent.inputs) == 2
+        assert len(final_parent.outputs) == 6
+        assert all(len(witness) == 1 for witness in final_parent.witnesses)
+        assert verify_p2tr_signature(
+            final_parent,
+            0,
+            prevout_values,
+            prevout_scripts,
+            final_parent.witnesses[0][0],
+            opener_snapshot.funding_scriptpubkey[2:],
         )
-        assert opener_final == fundee_final
-        assert opener_final.txid == opener_txid
-        assert len(opener_final.channel_input_witness) == 1
-        assert opener_txid not in await bitcoin_rpc("getrawmempool")
+        assert verify_p2tr_signature(
+            final_parent,
+            1,
+            prevout_values,
+            prevout_scripts,
+            final_parent.witnesses[1][0],
+            ordinary_script[2:],
+        )
+        assert (
+            serialize_transaction(
+                final_parent.version,
+                final_parent.inputs,
+                final_parent.outputs,
+                final_parent.locktime,
+            ).hex()
+            == unsigned_parent_hex
+        )
+        final_analysis = analyze_coinjoin_outputs(final_parent.outputs)
+        assert final_analysis.is_coinjoin
+        assert final_analysis.cj_amount == 300_000
+        assert final_analysis.cj_count == 3
 
-        broadcast_txid = await bitcoin_rpc("sendrawtransaction", [opener_final.tx_hex])
-        assert broadcast_txid == opener_txid
+        post_resume_status = (
+            await restarting_opener.backend.channel_input_escrow_status(
+                session_id, opener_snapshot.funding_outpoint
+            )
+        )
+        assert post_resume_status.stage in {
+            LndEscrowStage.PARENT_SIGNED,
+            LndEscrowStage.FINALIZED,
+        }
+        assert post_resume_status.parent_txid == expected_txid
+        assert post_resume_status.durable_local_partial_signature is not None
+        assert expected_txid not in await bitcoin_rpc("getrawmempool")
+        chain = CoreChain()
+        published = await coordinator.publish(session_id, chain)
+        assert published.final_txid == expected_txid
+        assert expected_txid in await bitcoin_rpc("getrawmempool")
         await mine(wallet, 3)
-        assert (await bitcoin_rpc("getrawtransaction", [broadcast_txid, True]))[
+        observed = await coordinator.observe(session_id, chain)
+        assert observed.state is ChannelInputParentState.CONFIRMED
+        assert observed.observation is not None
+        assert observed.observation.confirmations == 3
+        assert (await bitcoin_rpc("getrawtransaction", [expected_txid, True]))[
             "confirmations"
         ] == 3
+        await wait_for_resolved_channel()
         assert not (await lncli("lnd-opener", "listchannels"))["channels"]
         assert not (await lncli("lnd-fundee", "listchannels"))["channels"]
-        await wait_for_resolved_channel()
     finally:
         await asyncio.gather(
             *(
                 client.close()
-                for client in (opener, fundee, restarted_opener)
+                for client in (opener, fundee, restarting_opener.restarted_backend)
                 if client is not None
             ),
             return_exceptions=True,
