@@ -300,6 +300,7 @@ async def test_rejected_revision_then_complete_four_party_ring(tmp_path: Path) -
         network="regtest",
         mixdepth_count=5,
         address_type="p2tr",
+        data_dir=tmp_path,
     )
     config = taker_config(tmp_path)
     taker: Taker | None = None

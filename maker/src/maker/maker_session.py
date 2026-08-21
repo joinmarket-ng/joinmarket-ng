@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Any
 from jmcore.cofunded_ring import (
     MAX_RING_CIPHERTEXT_BYTES,
     RingCancelPayload,
+    RingPlanPayload,
     decode_ring_message,
     encode_ring_message,
 )
@@ -840,6 +841,7 @@ class MakerSession:
                 f"Rejecting malformed encrypted !ring from {self.taker_nick}"
             )
             return
+        payload = None
         try:
             verified, command, encrypted = verify_signed_privmsg(self.taker_nick, msg, ONION_HOSTID)
             if not verified or command != "ring" or encrypted != parts[1]:
@@ -868,6 +870,18 @@ class MakerSession:
                 f"Rejected invalid or out-of-order !ring from {self.taker_nick} "
                 f"({type(exc).__name__})"
             )
+            if isinstance(payload, RingPlanPayload) and self.ring_participant is not None:
+                try:
+                    responses = self.ring_participant.reject_plan(payload)
+                    self.release_input_locks()
+                    for response in responses:
+                        encrypted = self.crypto.encrypt(encode_ring_message(response))
+                        await self._send_ring_response(bot, encrypted, source)
+                except Exception as rejection_exc:
+                    logger.warning(
+                        "Could not durably reject channel-ring plan from "
+                        f"{self.taker_nick} ({type(rejection_exc).__name__})"
+                    )
 
     async def _send_ring_response(self, bot: MakerBotProtocol, encrypted: str, source: str) -> None:
         """Return a ring response only through the authenticated request channel."""

@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from coincurve import PrivateKey
@@ -672,6 +672,41 @@ async def test_order_signature_residual_and_replay_fail_closed(harness: Harness)
         await harness.machine.handle(changed)
 
 
+async def test_rejected_plan_retires_revision_and_acknowledges_later_cancel(
+    harness: Harness,
+) -> None:
+    invite = harness.invite()
+    bounds = invite.policy_bounds.model_copy(update={"max_reserve": 15_000})
+    invite = harness.signed(invite.model_copy(update={"policy_bounds": bounds, "sig": "00" * 64}))
+    await harness.machine.handle(invite)
+    plan = harness.plan()
+    policy = plan.incoming_edge.policy.model_copy(update={"fundee_reserve": 15_000})
+    incoming = plan.incoming_edge.model_copy(update={"policy": policy})
+    rejected = harness.signed(plan.model_copy(update={"incoming_edge": incoming, "sig": "00" * 64}))
+
+    with pytest.raises(MakerRingError, match="configured policy"):
+        await harness.machine.handle(rejected)
+
+    responses = harness.machine.reject_plan(rejected)
+    assert isinstance(responses[0], RingCancelPayload)
+    assert responses[0].reason_code == "participant_rejection"
+    assert harness.record().state is RingLifecycleState.RETIRED
+    assert await harness.machine.handle(rejected) == responses
+
+    coordinator_cancel = harness.signed(
+        RingCancelPayload(
+            round_nonce="aa" * 32,
+            revision=0,
+            signer_key=harness.taker_key,
+            reason_code="coordinator_failure",
+        )
+    )
+    acknowledgments = await harness.machine.handle(coordinator_cancel)
+    assert isinstance(acknowledgments[0], RingCancelPayload)
+    assert acknowledgments[0].reason_code == "coordinator_failure"
+    assert harness.record().state is RingLifecycleState.RETIRED
+
+
 async def test_script_substitution_and_wrong_open_binding_are_rejected(harness: Harness) -> None:
     await harness.machine.handle(harness.invite())
     ack = await harness.machine.handle(harness.plan())
@@ -1025,6 +1060,7 @@ async def test_encrypted_ring_dispatch_requires_ioauth_and_enabled_validated_fea
     inner = SimpleNamespace(
         state=state,
         taker_nick="taker",
+        session_timeout_sec=300,
         validate_channel=lambda source: True,
     )
     session = MakerSession(inner)  # type: ignore[arg-type]
@@ -1065,6 +1101,16 @@ class _WireParticipant:
         return [self.response]
 
 
+class _RejectingWireParticipant(_WireParticipant):
+    async def handle(self, payload: Any) -> list[Any]:
+        self.handled.append(payload)
+        raise MakerRingError("channel policy differs from local configured policy")
+
+    def reject_plan(self, payload: RingPlanPayload) -> list[Any]:
+        assert self.handled == [payload]
+        return [self.response]
+
+
 @pytest.mark.parametrize("source", ["dir:selected", "direct"])
 async def test_signed_ring_dispatch_replies_only_on_source_channel(
     harness: Harness, source: str
@@ -1076,6 +1122,7 @@ async def test_signed_ring_dispatch_replies_only_on_source_channel(
     inner = SimpleNamespace(
         state=CoinJoinState.IOAUTH_SENT,
         taker_nick=taker_identity.nick,
+        session_timeout_sec=300,
         validate_channel=lambda received: received == source,
         crypto=crypto,
     )
@@ -1119,6 +1166,56 @@ async def test_signed_ring_dispatch_replies_only_on_source_channel(
         assert (ok, command, data) == (True, "ring", "ZW5jcnlwdGVk")
 
 
+async def test_signed_plan_rejection_replies_and_releases_input_lock(harness: Harness) -> None:
+    taker_identity = NickIdentity()
+    maker_identity = NickIdentity()
+    await harness.machine.handle(harness.invite())
+    request = harness.plan()
+    response = harness.signed(
+        RingCancelPayload(
+            round_nonce=request.round_nonce,
+            revision=request.revision,
+            signer_key=harness.taker_key,
+            reason_code="participant_rejection",
+        )
+    )
+    crypto = _WireCrypto(encode_ring_message(request))
+    release_inputs = Mock()
+    outpoint = ("04" * 32, 0)
+    inner = SimpleNamespace(
+        state=CoinJoinState.IOAUTH_SENT,
+        taker_nick=taker_identity.nick,
+        session_timeout_sec=300,
+        validate_channel=lambda received: received == "dir:selected",
+        crypto=crypto,
+        wallet=SimpleNamespace(release_coinjoin_inputs=release_inputs),
+        our_utxos={outpoint: object()},
+        input_lock_owner="maker:round-owner",
+    )
+    session = MakerSession(inner)  # type: ignore[arg-type]
+    session.ring_participant = _RejectingWireParticipant(response)  # type: ignore[assignment]
+    selected = SimpleNamespace(send_private_message=AsyncMock())
+    bot = SimpleNamespace(
+        config=SimpleNamespace(channel_ring=SimpleNamespace(enabled=True)),
+        channel_ring_capability_validated=True,
+        _channel_ring_backend=object(),
+        _channel_ring_store=object(),
+        directory_clients={"selected": selected},
+        direct_connections={},
+        nick_identity=maker_identity,
+        nick=maker_identity.nick,
+    )
+    ciphertext = "Y2lwaGVydGV4dA=="
+    signed = taker_identity.sign_message(ciphertext, ONION_HOSTID)
+
+    await session.on_ring(bot, f"ring {signed}", "dir:selected")  # type: ignore[arg-type]
+
+    release_inputs.assert_called_once_with({outpoint}, owner="maker:round-owner")
+    selected.send_private_message.assert_awaited_once_with(
+        taker_identity.nick, "ring", "ZW5jcnlwdGVk"
+    )
+
+
 async def test_ring_cancel_releases_coinjoin_input_locks(harness: Harness) -> None:
     taker_identity = NickIdentity()
     maker_identity = NickIdentity()
@@ -1136,6 +1233,7 @@ async def test_ring_cancel_releases_coinjoin_input_locks(harness: Harness) -> No
     inner = SimpleNamespace(
         state=CoinJoinState.IOAUTH_SENT,
         taker_nick=taker_identity.nick,
+        session_timeout_sec=300,
         validate_channel=lambda received: received == "dir:selected",
         crypto=crypto,
         wallet=SimpleNamespace(release_coinjoin_inputs=release_inputs),
@@ -1167,6 +1265,7 @@ def test_active_ring_record_retains_maker_input_locks() -> None:
     outpoint = ("02" * 32, 1)
     inner = SimpleNamespace(
         taker_nick="taker",
+        session_timeout_sec=300,
         wallet=SimpleNamespace(release_coinjoin_inputs=release_inputs),
         our_utxos={outpoint: object()},
         input_lock_owner="maker:persisted-owner",
@@ -1186,7 +1285,7 @@ def test_active_ring_record_retains_maker_input_locks() -> None:
 
 def test_restart_renews_maker_ring_lock_with_persisted_owner() -> None:
     outpoint = SimpleNamespace(txid="03" * 32, vout=2)
-    wallet = SimpleNamespace(reserve_coinjoin_inputs=Mock(return_value=True))
+    wallet = SimpleNamespace(renew_coinjoin_inputs=Mock(return_value=True))
     bot = MakerBot.__new__(MakerBot)
     bot.wallet = wallet  # type: ignore[assignment]
     bot.config = SimpleNamespace(  # type: ignore[assignment]
@@ -1207,8 +1306,32 @@ def test_restart_renews_maker_ring_lock_with_persisted_owner() -> None:
     )
 
     assert bot._renew_channel_ring_input_locks()
-    wallet.reserve_coinjoin_inputs.assert_called_once_with(
+    wallet.renew_coinjoin_inputs.assert_called_once_with(
         {(outpoint.txid, outpoint.vout)},
         ttl=6 * 3600,
         owner="maker:persisted-owner",
     )
+
+
+@pytest.mark.asyncio
+async def test_periodic_reconciliation_aborts_when_ring_lock_renewal_fails() -> None:
+    bot = MakerBot.__new__(MakerBot)
+    bot.running = True
+    bot._fatal_error = None
+    bot.listen_tasks = []
+    bot._channel_ring_store = object()  # type: ignore[assignment]
+    bot._channel_ring_backend = object()  # type: ignore[assignment]
+    bot.active_sessions = {}
+    bot._channel_ring_recovery_tasks = {}
+    bot.config = SimpleNamespace(  # type: ignore[assignment]
+        channel_ring=SimpleNamespace(phase_timeout_seconds=120.0)
+    )
+    bot._renew_channel_ring_input_locks = Mock(return_value=False)
+
+    with patch("maker.channel_ring.reconcile_ring_records", new=AsyncMock()) as reconcile:
+        with pytest.raises(RuntimeError, match="input-lock renewal failed"):
+            await bot._periodic_channel_ring_reconciliation()
+
+    reconcile.assert_not_awaited()
+    assert bot.running is False
+    assert isinstance(bot._fatal_error, RuntimeError)

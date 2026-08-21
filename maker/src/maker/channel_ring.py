@@ -506,6 +506,19 @@ class MakerRingParticipant:
         self.store.transition(record.key, RingLifecycleState.ACCEPTOR_ARMED, updates=updates)
         return [ack]
 
+    def reject_plan(self, payload: RingPlanPayload) -> list[RingPayloadType]:
+        """Durably reject a valid plan before any channel state is armed."""
+        record = self._record()
+        self._check_common(payload, record)
+        if record.state is not RingLifecycleState.INVITED:
+            raise MakerRingError("only an unplanned ring revision can be rejected immediately")
+        response = self._cancel_response(record, "participant_rejection", ())
+        record = self.store.transition(record.key, RingLifecycleState.RETIRING)
+        record = self.store.transition(record.key, RingLifecycleState.RETIRED)
+        updates = self._cache_updates(record, payload, [response])
+        self.store.transition(record.key, RingLifecycleState.RETIRED, updates=updates)
+        return [response]
+
     async def _open(
         self, payload: RingOpenPayload, record: RingParticipantRecord
     ) -> list[RingPayloadType]:
@@ -1042,6 +1055,11 @@ class MakerRingParticipant:
             payload.canceled_pending_ids
         ):
             raise MakerRingError("ring_cancel does not identify both local pending channels")
+        if record.state is RingLifecycleState.RETIRED:
+            response = self._cancel_response(record, payload.reason_code, ())
+            updates = self._cache_updates(record, payload, [response])
+            self.store.transition(record.key, RingLifecycleState.RETIRED, updates=updates)
+            return [response]
         if self.acceptor_task is not None and not self.acceptor_task.done():
             self.acceptor_task.cancel()
             await asyncio.gather(self.acceptor_task, return_exceptions=True)
@@ -1080,23 +1098,31 @@ class MakerRingParticipant:
                     },
                 )
             raise
-        response = cast(
+        response = self._cancel_response(record, payload.reason_code, canceled)
+        retired = self._record()
+        updates = self._cache_updates(retired, payload, [response])
+        self.store.transition(retired.key, RingLifecycleState.RETIRED, updates=updates)
+        return [response]
+
+    @staticmethod
+    def _cancel_response(
+        record: RingParticipantRecord,
+        reason_code: str,
+        canceled_pending_ids: Sequence[str],
+    ) -> RingPayloadType:
+        return cast(
             RingPayloadType,
             _signed(
                 RingCancelPayload(
                     round_nonce=record.round_nonce,
                     revision=record.revision,
                     signer_key=record.ring_public_key,
-                    reason_code=payload.reason_code,
-                    canceled_pending_ids=sorted(canceled),
+                    reason_code=reason_code,
+                    canceled_pending_ids=sorted(canceled_pending_ids),
                 ),
                 record.ring_secret,
             ),
         )
-        retired = self._record()
-        updates = self._cache_updates(retired, payload, [response])
-        self.store.transition(retired.key, RingLifecycleState.RETIRED, updates=updates)
-        return [response]
 
 
 async def reconcile_ring_records(

@@ -794,12 +794,20 @@ restart_makers() {
 # =============================================================================
 # Cleanup a single suite
 # =============================================================================
+wipe_host_state() {
+    local target=$1
+    [ -e "$target" ] || return 0
+    docker run --rm \
+        -v "$(dirname "$target"):/wipe" \
+        alpine:3.20 sh -c 'rm -rf -- "/wipe/$1"' sh "$(basename "$target")"
+}
+
 cleanup_suite() {
     local suite=$1
     log_info "Cleaning up suite: $suite"
     if [ "$suite" = "ring-e2e" ]; then
         ring_compose_cmd down --remove-orphans -v 2>/dev/null || true
-        rm -rf "${PARALLEL_DIR}/shared/${suite}" 2>/dev/null || true
+        wipe_host_state "${PARALLEL_DIR}/shared/${suite}" 2>/dev/null || true
         return
     fi
     compose_cmd "$suite" --profile e2e --profile reference --profile neutrino --profile reference-maker --profile reference-migration down -v 2>/dev/null || true
