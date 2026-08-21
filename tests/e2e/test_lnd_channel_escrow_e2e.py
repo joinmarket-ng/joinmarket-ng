@@ -10,7 +10,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from coincurve import PrivateKey
@@ -19,11 +19,30 @@ from jmcore.bitcoin import (
     TxOutput,
     address_to_scriptpubkey,
     analyze_coinjoin_outputs,
+    estimate_vsize,
     get_txid,
     parse_transaction,
     scriptpubkey_to_address,
     serialize_transaction,
     taproot_tweak_privkey,
+)
+from jmcore.channel_input import (
+    ChannelDescriptor,
+    ChannelInputApprovalPayload,
+    ChannelInputApprovalSetAckPayload,
+    ChannelInputApprovalSetPayload,
+    ChannelInputKeyPair,
+    ChannelInputPreparePayload,
+    ChannelInputTranscript,
+    EndpointTerms,
+    InputPrevout,
+    Outpoint,
+    PolicyCeilings,
+    SettlementOutput as AuthorizedSettlementOutput,
+    approval_set_hash,
+    endpoint_terms_hash,
+    sign_payload,
+    transcript_hash,
 )
 from jmswap.lnd import (
     EscrowOutpoint,
@@ -43,6 +62,7 @@ from taker.channel_input_parent import (
     ChannelInputParentError,
     ChannelInputParentPlan,
     ChannelInputParentState,
+    ChannelInputAuthorization,
     ChainTransaction,
     EndpointContribution,
     OrdinaryWitness,
@@ -63,6 +83,200 @@ pytestmark = [pytest.mark.docker, pytest.mark.lnd_channel_escrow]
 
 ROOT = Path(__file__).resolve().parents[2]
 COMPOSE_FILE = ROOT / "jmswap/docker-compose.lnd-external.yml"
+FIRST_PARTICIPANT_SECRET = b"\x41" * 32
+SECOND_PARTICIPANT_SECRET = b"\x42" * 32
+
+
+def _participant_key(secret: bytes) -> str:
+    return ChannelInputKeyPair.from_secret(secret).public_key
+
+
+def _authorization(
+    *,
+    session_id: str,
+    unsigned_parent_hex: str,
+    opener_snapshot: FrozenChannelSnapshot,
+    fundee_snapshot: FrozenChannelSnapshot,
+    ordinary_value: int,
+    ordinary_script: bytes,
+    ordinary_outpoint: Outpoint,
+    outputs: list[TxOutput],
+) -> ChannelInputAuthorization:
+    first_participant_key = _participant_key(FIRST_PARTICIPANT_SECRET)
+    second_participant_key = _participant_key(SECOND_PARTICIPANT_SECRET)
+    ceilings = PolicyCeilings(
+        max_miner_fee_share_sat=500,
+        max_claim_adjustment_sat=0,
+        max_settlement_outputs=2,
+    )
+    first_terms = EndpointTerms(
+        session_id=session_id,
+        attempt=0,
+        funding_outpoint=Outpoint(
+            txid=opener_snapshot.funding_outpoint.txid,
+            vout=opener_snapshot.funding_outpoint.vout,
+        ),
+        input_index=0,
+        participant_key=first_participant_key,
+        role="first",
+        local_node_key=fundee_snapshot.peer_node_pubkey.hex(),
+        peer_node_key=opener_snapshot.peer_node_pubkey.hex(),
+        capacity_sat=opener_snapshot.capacity_sat,
+        frozen_local_claim_sat=opener_snapshot.local_claim_sat,
+        frozen_remote_claim_sat=opener_snapshot.remote_claim_sat,
+        settlement_outputs=tuple(
+            AuthorizedSettlementOutput(
+                output_index=index,
+                amount_sat=outputs[index].value,
+                script_pubkey=outputs[index].script.hex(),
+            )
+            for index in (0, 3)
+        ),
+        miner_fee_share_sat=500,
+        claim_adjustment_sat=0,
+        policy_ceilings=ceilings,
+    )
+    second_terms = EndpointTerms(
+        session_id=session_id,
+        attempt=0,
+        funding_outpoint=Outpoint(
+            txid=fundee_snapshot.funding_outpoint.txid,
+            vout=fundee_snapshot.funding_outpoint.vout,
+        ),
+        input_index=0,
+        participant_key=second_participant_key,
+        role="second",
+        local_node_key=opener_snapshot.peer_node_pubkey.hex(),
+        peer_node_key=fundee_snapshot.peer_node_pubkey.hex(),
+        capacity_sat=fundee_snapshot.capacity_sat,
+        frozen_local_claim_sat=fundee_snapshot.local_claim_sat,
+        frozen_remote_claim_sat=fundee_snapshot.remote_claim_sat,
+        settlement_outputs=tuple(
+            AuthorizedSettlementOutput(
+                output_index=index,
+                amount_sat=outputs[index].value,
+                script_pubkey=outputs[index].script.hex(),
+            )
+            for index in (1, 4)
+        ),
+        miner_fee_share_sat=500,
+        claim_adjustment_sat=0,
+        policy_ceilings=ceilings,
+    )
+    fee_sat = (
+        opener_snapshot.capacity_sat
+        + ordinary_value
+        - sum(output.value for output in outputs)
+    )
+    transcript = ChannelInputTranscript(
+        network="regtest",
+        session_id=session_id,
+        attempt=0,
+        unsigned_parent_tx=unsigned_parent_hex,
+        input_prevouts=(
+            InputPrevout(
+                outpoint=first_terms.funding_outpoint,
+                value_sat=opener_snapshot.capacity_sat,
+                script_pubkey=opener_snapshot.funding_scriptpubkey.hex(),
+            ),
+            InputPrevout(
+                outpoint=ordinary_outpoint,
+                value_sat=ordinary_value,
+                script_pubkey=ordinary_script.hex(),
+            ),
+        ),
+        total_fee_sat=fee_sat,
+        fee_rate_sat_vb=(fee_sat + estimate_vsize(["p2tr", "p2tr"], ["p2tr"] * 6) - 1)
+        // estimate_vsize(["p2tr", "p2tr"], ["p2tr"] * 6),
+        expiry=1_900_000_000,
+        recovery_height=999_999,
+        participant_keys=(first_participant_key, second_participant_key),
+        coordinator_key=first_participant_key,
+        channels=(
+            ChannelDescriptor(
+                funding_outpoint=first_terms.funding_outpoint,
+                input_index=0,
+                capacity_sat=opener_snapshot.capacity_sat,
+                first_participant_key=first_participant_key,
+                second_participant_key=second_participant_key,
+                first_terms_hash=endpoint_terms_hash(first_terms).hex(),
+                second_terms_hash=endpoint_terms_hash(second_terms).hex(),
+            ),
+        ),
+    )
+    participants = (
+        (first_participant_key, FIRST_PARTICIPANT_SECRET),
+        (second_participant_key, SECOND_PARTICIPANT_SECRET),
+    )
+    approvals = tuple(
+        cast(
+            ChannelInputApprovalPayload,
+            sign_payload(
+                ChannelInputApprovalPayload(
+                    session_id=session_id,
+                    attempt=0,
+                    signer_key=participant_key,
+                    transcript_hash=transcript_hash(transcript).hex(),
+                    terms_hashes=tuple(
+                        sorted(transcript.terms_hashes_for(participant_key))
+                    ),
+                ),
+                secret,
+                aux_randomness=secret,
+            ),
+        )
+        for participant_key, secret in participants
+    )
+    approval_set = cast(
+        ChannelInputApprovalSetPayload,
+        sign_payload(
+            ChannelInputApprovalSetPayload(
+                session_id=session_id,
+                attempt=0,
+                signer_key=first_participant_key,
+                transcript=transcript,
+                approvals=approvals,
+            ),
+            FIRST_PARTICIPANT_SECRET,
+            aux_randomness=b"\x43" * 32,
+        ),
+    )
+    acks = tuple(
+        cast(
+            ChannelInputApprovalSetAckPayload,
+            sign_payload(
+                ChannelInputApprovalSetAckPayload(
+                    session_id=session_id,
+                    attempt=0,
+                    signer_key=participant_key,
+                    transcript_hash=transcript_hash(transcript).hex(),
+                    approval_set_hash=approval_set_hash(approval_set).hex(),
+                ),
+                secret,
+                aux_randomness=bytes([index]) * 32,
+            ),
+        )
+        for index, (participant_key, secret) in enumerate(participants, start=0x44)
+    )
+    prepare = cast(
+        ChannelInputPreparePayload,
+        sign_payload(
+            ChannelInputPreparePayload(
+                session_id=session_id,
+                attempt=0,
+                signer_key=first_participant_key,
+                transcript_hash=transcript_hash(transcript).hex(),
+                approval_set_hash=approval_set_hash(approval_set).hex(),
+                approval_set=approval_set,
+                approval_set_acks=acks,
+            ),
+            FIRST_PARTICIPANT_SECRET,
+            aux_randomness=b"\x46" * 32,
+        ),
+    )
+    return ChannelInputAuthorization(
+        prepare=prepare, endpoint_terms=(first_terms, second_terms)
+    )
 
 
 async def compose(*args: str) -> str:
@@ -375,7 +589,7 @@ async def test_exact_parent_restart_recovery_through_python_client(
         channel_point = channel["channel_point"]
         assert channel_point.startswith(f"{opened['funding_txid']}:")
 
-        session_id = "joinmarket-python-client-regtest-restart-recovery"
+        session_id = "11" * 32
         opener_snapshot = await restarting_opener.freeze_channel_input(
             session_id, channel_point
         )
@@ -479,6 +693,7 @@ async def test_exact_parent_restart_recovery_through_python_client(
                     channel_input_index=0,
                     first=EndpointContribution(
                         endpoint_id="opener",
+                        participant_key=_participant_key(FIRST_PARTICIPANT_SECRET),
                         settlement_outputs=(
                             SettlementOutput(
                                 output_index=0,
@@ -495,6 +710,7 @@ async def test_exact_parent_restart_recovery_through_python_client(
                     ),
                     second=EndpointContribution(
                         endpoint_id="fundee",
+                        participant_key=_participant_key(SECOND_PARTICIPANT_SECRET),
                         settlement_outputs=(
                             SettlementOutput(
                                 output_index=1,
@@ -513,6 +729,18 @@ async def test_exact_parent_restart_recovery_through_python_client(
             ),
             ordinary_witnesses=(
                 OrdinaryWitness(input_index=1, witness=(ordinary_signature.hex(),)),
+            ),
+            authorization=_authorization(
+                session_id=session_id,
+                unsigned_parent_hex=unsigned_parent_hex,
+                opener_snapshot=opener_snapshot,
+                fundee_snapshot=fundee_snapshot,
+                ordinary_value=ordinary_value,
+                ordinary_script=ordinary_script,
+                ordinary_outpoint=Outpoint(
+                    txid=ordinary_funding_txid, vout=int(ordinary_vout["n"])
+                ),
+                outputs=outputs,
             ),
         )
         coordinator = ChannelInputParentCoordinator(tmp_path)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -10,10 +11,31 @@ from jmcore.bitcoin import (
     TxInput,
     TxOutput,
     analyze_coinjoin_outputs,
+    estimate_vsize,
     get_txid,
     parse_transaction,
     pubkey_to_p2wpkh_script,
     serialize_transaction,
+)
+from jmcore.channel_input import (
+    ChannelDescriptor,
+    ChannelInputApprovalPayload,
+    ChannelInputApprovalSetAckPayload,
+    ChannelInputApprovalSetPayload,
+    ChannelInputKeyPair,
+    ChannelInputPreparePayload,
+    ChannelInputTranscript,
+    EndpointTerms,
+    InputPrevout,
+    Outpoint,
+    PolicyCeilings,
+    approval_set_hash,
+    endpoint_terms_hash,
+    sign_payload,
+    transcript_hash,
+)
+from jmcore.channel_input import (
+    SettlementOutput as AuthorizedSettlementOutput,
 )
 from jmswap.lnd import (
     EscrowOutpoint,
@@ -28,11 +50,13 @@ from jmwallet.wallet.signing import create_p2wpkh_script_code, sign_p2tr_input, 
 
 from taker.channel_input_parent import (
     ChannelContribution,
+    ChannelInputAuthorization,
     ChannelInputParentCoordinator,
     ChannelInputParentError,
     ChannelInputParentPlan,
     ChannelInputParentState,
     EndpointContribution,
+    FrozenSnapshot,
     OrdinaryWitness,
     ParentPrevout,
     SettlementOutput,
@@ -74,6 +98,8 @@ class FakeEndpoint:
         fail_freeze_once: bool = False,
         fail_prepare_once: bool = False,
         mutate_final: bool = False,
+        snapshot_peer_key: PrivateKey | None = None,
+        snapshot_local_claim_sat: int = 50_000,
     ) -> None:
         self.local_key = local_key
         self.remote_key = remote_key
@@ -84,6 +110,8 @@ class FakeEndpoint:
         self.fail_freeze_once = fail_freeze_once
         self.fail_prepare_once = fail_prepare_once
         self.mutate_final = mutate_final
+        self.snapshot_peer_key = snapshot_peer_key
+        self.snapshot_local_claim_sat = snapshot_local_claim_sat
         self.parent_hex = ""
         self.index = 0
         self.attempt: LndEscrowSigningAttempt | None = None
@@ -93,11 +121,13 @@ class FakeEndpoint:
         self.begin_calls = 0
         self.sign_calls = 0
         self.cancel_calls = 0
+        self.freeze_calls = 0
 
     def _snapshot(self, session_id: str, channel_id: str) -> FrozenChannelSnapshot:
         del session_id
         local = self.local_key.public_key.format(compressed=True)
-        remote = self.remote_key.public_key.format(compressed=True)
+        remote_key = self.snapshot_peer_key or self.remote_key
+        remote = remote_key.public_key.format(compressed=True)
         return FrozenChannelSnapshot(
             session_id="fake",
             channel_id=channel_id,
@@ -107,11 +137,12 @@ class FakeEndpoint:
             local_funding_pubkey=local,
             remote_funding_pubkey=remote,
             capacity_sat=100_000,
-            local_claim_sat=50_000,
-            remote_claim_sat=50_000,
+            local_claim_sat=self.snapshot_local_claim_sat,
+            remote_claim_sat=100_000 - self.snapshot_local_claim_sat,
         )
 
     async def freeze_channel_input(self, session_id: str, channel_id: str) -> FrozenChannelSnapshot:
+        self.freeze_calls += 1
         if self.fail_freeze_once:
             self.fail_freeze_once = False
             raise RuntimeError("simulated freeze interruption")
@@ -122,7 +153,7 @@ class FakeEndpoint:
         session_id: str,
         funding_outpoint: EscrowOutpoint,
         parent_tx_hex: str,
-        input_utxos: tuple[WitnessUtxo, ...],
+        input_utxos: Sequence[WitnessUtxo],
         channel_input_index: int,
     ) -> str:
         del session_id, funding_outpoint, input_utxos
@@ -238,16 +269,200 @@ class FakeEndpoint:
 
 
 ORDINARY_KEY = PrivateKey(b"\x07" * 32)
+SESSION_ID = "11" * 32
+FIRST_PARTICIPANT_SECRET = b"\x01" * 32
+SECOND_PARTICIPANT_SECRET = b"\x02" * 32
 
 
-def _plan(*, invalid_witness: bool = False) -> ChannelInputParentPlan:
+def _participant_key(secret: bytes) -> str:
+    return ChannelInputKeyPair.from_secret(secret).public_key
+
+
+def _authorization(
+    *,
+    unsigned_parent_hex: str,
+    ordinary_script: bytes,
+    outputs: list[TxOutput],
+    first_value_sat: int,
+    second_value_sat: int,
+    first_claim_adjustment_sat: int,
+    second_claim_adjustment_sat: int,
+) -> ChannelInputAuthorization:
+    funding_key = PrivateKey(b"\x05" * 32)
+    first_node = PrivateKey(b"\x01" * 32)
+    second_node = PrivateKey(b"\x02" * 32)
+    first_participant_key = _participant_key(FIRST_PARTICIPANT_SECRET)
+    second_participant_key = _participant_key(SECOND_PARTICIPANT_SECRET)
+    ceilings = PolicyCeilings(
+        max_miner_fee_share_sat=1_000,
+        max_claim_adjustment_sat=1_000,
+        max_settlement_outputs=1,
+    )
+    first_terms = EndpointTerms(
+        session_id=SESSION_ID,
+        attempt=0,
+        funding_outpoint=Outpoint(txid="11" * 32, vout=0),
+        input_index=0,
+        participant_key=first_participant_key,
+        role="first",
+        local_node_key=first_node.public_key.format(compressed=True).hex(),
+        peer_node_key=second_node.public_key.format(compressed=True).hex(),
+        capacity_sat=100_000,
+        frozen_local_claim_sat=50_000,
+        frozen_remote_claim_sat=50_000,
+        settlement_outputs=(
+            AuthorizedSettlementOutput(
+                output_index=0, amount_sat=first_value_sat, script_pubkey=outputs[0].script.hex()
+            ),
+        ),
+        miner_fee_share_sat=1_000,
+        claim_adjustment_sat=first_claim_adjustment_sat,
+        policy_ceilings=ceilings,
+    )
+    second_terms = EndpointTerms(
+        session_id=SESSION_ID,
+        attempt=0,
+        funding_outpoint=Outpoint(txid="11" * 32, vout=0),
+        input_index=0,
+        participant_key=second_participant_key,
+        role="second",
+        local_node_key=second_node.public_key.format(compressed=True).hex(),
+        peer_node_key=first_node.public_key.format(compressed=True).hex(),
+        capacity_sat=100_000,
+        frozen_local_claim_sat=50_000,
+        frozen_remote_claim_sat=50_000,
+        settlement_outputs=(
+            AuthorizedSettlementOutput(
+                output_index=1, amount_sat=second_value_sat, script_pubkey=outputs[1].script.hex()
+            ),
+        ),
+        miner_fee_share_sat=1_000,
+        claim_adjustment_sat=second_claim_adjustment_sat,
+        policy_ceilings=ceilings,
+    )
+    fee_sat = 230_000 - sum(output.value for output in outputs)
+    transcript = ChannelInputTranscript(
+        network="regtest",
+        session_id=SESSION_ID,
+        attempt=0,
+        unsigned_parent_tx=unsigned_parent_hex,
+        input_prevouts=(
+            InputPrevout(
+                outpoint=Outpoint(txid="11" * 32, vout=0),
+                value_sat=100_000,
+                script_pubkey=(b"\x51\x20" + funding_key.public_key_xonly.format()).hex(),
+            ),
+            InputPrevout(
+                outpoint=Outpoint(txid="22" * 32, vout=1),
+                value_sat=130_000,
+                script_pubkey=ordinary_script.hex(),
+            ),
+        ),
+        total_fee_sat=fee_sat,
+        fee_rate_sat_vb=(
+            fee_sat + estimate_vsize(["p2tr", "p2wpkh"], ["p2tr", "p2tr", "p2wpkh", "p2tr"]) - 1
+        )
+        // estimate_vsize(["p2tr", "p2wpkh"], ["p2tr", "p2tr", "p2wpkh", "p2tr"]),
+        expiry=1_900_000_000,
+        recovery_height=999_999,
+        participant_keys=(first_participant_key, second_participant_key),
+        coordinator_key=first_participant_key,
+        channels=(
+            ChannelDescriptor(
+                funding_outpoint=Outpoint(txid="11" * 32, vout=0),
+                input_index=0,
+                capacity_sat=100_000,
+                first_participant_key=first_participant_key,
+                second_participant_key=second_participant_key,
+                first_terms_hash=endpoint_terms_hash(first_terms).hex(),
+                second_terms_hash=endpoint_terms_hash(second_terms).hex(),
+            ),
+        ),
+    )
+    approvals = tuple(
+        sign_payload(
+            ChannelInputApprovalPayload(
+                session_id=SESSION_ID,
+                attempt=0,
+                signer_key=participant_key,
+                transcript_hash=transcript_hash(transcript).hex(),
+                terms_hashes=tuple(sorted(transcript.terms_hashes_for(participant_key))),
+            ),
+            secret,
+            aux_randomness=secret,
+        )
+        for participant_key, secret in (
+            (first_participant_key, FIRST_PARTICIPANT_SECRET),
+            (second_participant_key, SECOND_PARTICIPANT_SECRET),
+        )
+    )
+    approval_set = sign_payload(
+        ChannelInputApprovalSetPayload(
+            session_id=SESSION_ID,
+            attempt=0,
+            signer_key=first_participant_key,
+            transcript=transcript,
+            approvals=approvals,
+        ),
+        FIRST_PARTICIPANT_SECRET,
+        aux_randomness=b"\x03" * 32,
+    )
+    acks = tuple(
+        sign_payload(
+            ChannelInputApprovalSetAckPayload(
+                session_id=SESSION_ID,
+                attempt=0,
+                signer_key=participant_key,
+                transcript_hash=transcript_hash(transcript).hex(),
+                approval_set_hash=approval_set_hash(approval_set).hex(),
+            ),
+            secret,
+            aux_randomness=bytes([index]) * 32,
+        )
+        for index, (participant_key, secret) in enumerate(
+            (
+                (first_participant_key, FIRST_PARTICIPANT_SECRET),
+                (second_participant_key, SECOND_PARTICIPANT_SECRET),
+            ),
+            start=4,
+        )
+    )
+    prepare = sign_payload(
+        ChannelInputPreparePayload(
+            session_id=SESSION_ID,
+            attempt=0,
+            signer_key=first_participant_key,
+            transcript_hash=transcript_hash(transcript).hex(),
+            approval_set_hash=approval_set_hash(approval_set).hex(),
+            approval_set=approval_set,
+            approval_set_acks=acks,
+        ),
+        FIRST_PARTICIPANT_SECRET,
+        aux_randomness=b"\x06" * 32,
+    )
+    return ChannelInputAuthorization(prepare=prepare, endpoint_terms=(first_terms, second_terms))
+
+
+def _plan(
+    *,
+    invalid_witness: bool = False,
+    first_claim_adjustment_sat: int = 0,
+    second_claim_adjustment_sat: int = 0,
+    first_settlement_value_sat: int | None = None,
+) -> ChannelInputParentPlan:
     funding_key = PrivateKey(b"\x05" * 32)
     ordinary_pubkey = ORDINARY_KEY.public_key.format(compressed=True)
     ordinary_script = pubkey_to_p2wpkh_script(ordinary_pubkey)
     inputs = [TxInput.from_hex("11" * 32, 0), TxInput.from_hex("22" * 32, 1)]
+    first_value = (
+        49_000 + first_claim_adjustment_sat
+        if first_settlement_value_sat is None
+        else first_settlement_value_sat
+    )
+    second_value = 49_000 + second_claim_adjustment_sat
     outputs = [
-        TxOutput(value=49_000, script=b"\x51\x20" + b"\x21" * 32),
-        TxOutput(value=49_000, script=b"\x51\x20" + b"\x22" * 32),
+        TxOutput(value=first_value, script=b"\x51\x20" + b"\x21" * 32),
+        TxOutput(value=second_value, script=b"\x51\x20" + b"\x22" * 32),
         TxOutput(value=40_000, script=ordinary_script),
         TxOutput(value=40_000, script=b"\x51\x20" + b"\x23" * 32),
     ]
@@ -259,7 +474,7 @@ def _plan(*, invalid_witness: bool = False) -> ChannelInputParentPlan:
     if invalid_witness:
         signature = b"\x00" * len(signature)
     return ChannelInputParentPlan(
-        session_id="parent-test-session",
+        session_id=SESSION_ID,
         unsigned_parent_hex=unsigned,
         prevouts=(
             ParentPrevout(
@@ -274,26 +489,43 @@ def _plan(*, invalid_witness: bool = False) -> ChannelInputParentPlan:
                 channel_input_index=0,
                 first=EndpointContribution(
                     endpoint_id="first",
+                    participant_key=_participant_key(FIRST_PARTICIPANT_SECRET),
                     settlement_outputs=(
                         SettlementOutput(
-                            output_index=0, value_sat=49_000, script_pubkey=outputs[0].script.hex()
+                            output_index=0,
+                            value_sat=first_value,
+                            script_pubkey=outputs[0].script.hex(),
                         ),
                     ),
                     miner_fee_share_sat=1_000,
+                    claim_adjustment_sat=first_claim_adjustment_sat,
                 ),
                 second=EndpointContribution(
                     endpoint_id="second",
+                    participant_key=_participant_key(SECOND_PARTICIPANT_SECRET),
                     settlement_outputs=(
                         SettlementOutput(
-                            output_index=1, value_sat=49_000, script_pubkey=outputs[1].script.hex()
+                            output_index=1,
+                            value_sat=second_value,
+                            script_pubkey=outputs[1].script.hex(),
                         ),
                     ),
                     miner_fee_share_sat=1_000,
+                    claim_adjustment_sat=second_claim_adjustment_sat,
                 ),
             ),
         ),
         ordinary_witnesses=(
             OrdinaryWitness(input_index=1, witness=(signature.hex(), ordinary_pubkey.hex())),
+        ),
+        authorization=_authorization(
+            unsigned_parent_hex=unsigned,
+            ordinary_script=ordinary_script,
+            outputs=outputs,
+            first_value_sat=first_value,
+            second_value_sat=second_value,
+            first_claim_adjustment_sat=first_claim_adjustment_sat,
+            second_claim_adjustment_sat=second_claim_adjustment_sat,
         ),
     )
 
@@ -304,6 +536,8 @@ def _endpoints(
     fail_freeze_once: bool = False,
     fail_prepare_once: bool = False,
     mutate_final: bool = False,
+    first_snapshot_peer_key: PrivateKey | None = None,
+    first_snapshot_local_claim_sat: int = 50_000,
 ) -> dict[str, FakeEndpoint]:
     first_key = PrivateKey(b"\x01" * 32)
     second_key = PrivateKey(b"\x02" * 32)
@@ -320,6 +554,8 @@ def _endpoints(
             fail_freeze_once=fail_freeze_once,
             fail_prepare_once=fail_prepare_once,
             mutate_final=mutate_final,
+            snapshot_peer_key=first_snapshot_peer_key,
+            snapshot_local_claim_sat=first_snapshot_local_claim_sat,
         ),
         "second": FakeEndpoint(
             local_key=second_key,
@@ -334,7 +570,10 @@ def _endpoints(
 def test_happy_path_persists_final_bytes_and_publishes_query_first(tmp_path: Path) -> None:
     coordinator = ChannelInputParentCoordinator(tmp_path)
     endpoints = _endpoints()
-    record = asyncio.run(coordinator.execute(_plan(), endpoints))
+    plan = _plan()
+    assert plan.channels[0].first.claim_adjustment_sat == 0
+    assert plan.channels[0].second.claim_adjustment_sat == 0
+    record = asyncio.run(coordinator.execute(plan, endpoints))
 
     assert record.state is ChannelInputParentState.FINAL_TX_PERSISTED
     assert record.final_tx_hex is not None
@@ -350,6 +589,263 @@ def test_happy_path_persists_final_bytes_and_publishes_query_first(tmp_path: Pat
     observed = asyncio.run(coordinator.publish(record.plan.session_id, chain))
     assert observed.state is ChannelInputParentState.CONFIRMED
     assert len(chain.broadcasts) == 2
+
+
+def test_zero_sum_claim_adjustments_progress_and_conserve_capacity(tmp_path: Path) -> None:
+    adjustment_sat = 500
+    plan = _plan(
+        first_claim_adjustment_sat=adjustment_sat,
+        second_claim_adjustment_sat=-adjustment_sat,
+    )
+    record = asyncio.run(ChannelInputParentCoordinator(tmp_path).execute(plan, _endpoints()))
+
+    assert record.state is ChannelInputParentState.FINAL_TX_PERSISTED
+    channel = record.channels[0]
+    first, second = plan.channels[0].first, plan.channels[0].second
+    assert (
+        sum(output.value_sat for output in first.settlement_outputs) + first.miner_fee_share_sat
+        == channel.first_snapshot.local_claim_sat + first.claim_adjustment_sat
+    )
+    assert (
+        sum(output.value_sat for output in second.settlement_outputs) + second.miner_fee_share_sat
+        == channel.second_snapshot.local_claim_sat + second.claim_adjustment_sat
+    )
+    assert (
+        sum(output.value_sat for output in first.settlement_outputs)
+        + first.miner_fee_share_sat
+        + sum(output.value_sat for output in second.settlement_outputs)
+        + second.miner_fee_share_sat
+        == channel.first_snapshot.capacity_sat
+    )
+
+
+def test_rejects_nonzero_sum_claim_adjustments_before_rpc_progression(tmp_path: Path) -> None:
+    plan = _plan()
+    contribution = plan.channels[0]
+    malformed = plan.model_copy(
+        update={
+            "channels": (
+                contribution.model_copy(
+                    update={
+                        "first": contribution.first.model_copy(update={"claim_adjustment_sat": 1})
+                    }
+                ),
+            )
+        }
+    )
+    endpoints = _endpoints()
+
+    with pytest.raises(ChannelInputParentError, match="claim adjustment differs"):
+        asyncio.run(ChannelInputParentCoordinator(tmp_path).execute(malformed, endpoints))
+
+    assert endpoints["first"].freeze_calls == endpoints["second"].freeze_calls == 0
+
+
+@pytest.mark.parametrize("settlement_value_sat", [49_499, 49_501])
+def test_rejects_underpay_and_overpay_against_adjusted_claim(
+    tmp_path: Path, settlement_value_sat: int
+) -> None:
+    authorized = _plan(
+        first_claim_adjustment_sat=500,
+        second_claim_adjustment_sat=-500,
+    )
+    plan = authorized.model_copy(
+        update={
+            "channels": (
+                authorized.channels[0].model_copy(
+                    update={
+                        "first": authorized.channels[0].first.model_copy(
+                            update={
+                                "settlement_outputs": (
+                                    SettlementOutput(
+                                        output_index=0,
+                                        value_sat=settlement_value_sat,
+                                        script_pubkey=authorized.channels[0]
+                                        .first.settlement_outputs[0]
+                                        .script_pubkey,
+                                    ),
+                                )
+                            }
+                        )
+                    }
+                ),
+            )
+        }
+    )
+
+    with pytest.raises(ChannelInputParentError, match="settlement outputs differ"):
+        asyncio.run(ChannelInputParentCoordinator(tmp_path).execute(plan, _endpoints()))
+
+
+def test_peer_node_pubkey_is_durable_and_requires_a_valid_compressed_key(tmp_path: Path) -> None:
+    endpoints = _endpoints()
+    plan = _plan()
+    record = asyncio.run(ChannelInputParentCoordinator(tmp_path).execute(plan, endpoints))
+    durable = asyncio.run(
+        ChannelInputParentCoordinator(tmp_path).resume(record.plan.session_id, endpoints)
+    )
+    expected_first_peer = endpoints["first"].remote_key.public_key.format(compressed=True).hex()
+    expected_second_peer = endpoints["second"].remote_key.public_key.format(compressed=True).hex()
+
+    assert durable.channels[0].first_snapshot.peer_node_pubkey == expected_first_peer
+    assert durable.channels[0].second_snapshot.peer_node_pubkey == expected_second_peer
+    assert durable.plan.authorization == plan.authorization
+    invalid = durable.channels[0].first_snapshot.model_dump()
+    invalid["peer_node_pubkey"] = "02" + "00" * 32
+    with pytest.raises(ValueError, match="valid secp256k1"):
+        FrozenSnapshot.model_validate(invalid)
+
+
+def test_rejects_absent_or_invalid_signed_authorization_before_freeze(tmp_path: Path) -> None:
+    plan = _plan()
+    with pytest.raises(ValueError, match="authorization"):
+        ChannelInputParentPlan.model_validate(plan.model_dump(exclude={"authorization"}))
+
+    tampered = plan.model_copy(
+        update={
+            "authorization": plan.authorization.model_copy(
+                update={"prepare": plan.authorization.prepare.model_copy(update={"sig": "00" * 64})}
+            )
+        }
+    )
+    endpoints = _endpoints()
+    with pytest.raises(ChannelInputParentError, match="authorization is invalid"):
+        asyncio.run(ChannelInputParentCoordinator(tmp_path).execute(tampered, endpoints))
+
+    assert endpoints["first"].freeze_calls == endpoints["second"].freeze_calls == 0
+
+
+@pytest.mark.parametrize("kind", ["missing", "extra", "substituted"])
+def test_authorization_requires_exact_revealed_endpoint_terms(kind: str) -> None:
+    authorization = _plan().authorization
+    first, second = authorization.endpoint_terms
+    terms: tuple[EndpointTerms, ...]
+    if kind == "missing":
+        terms = (first,)
+    elif kind == "extra":
+        terms = (first, second, first)
+    else:
+        terms = (
+            first,
+            second.model_copy(
+                update={
+                    "peer_node_key": PrivateKey(b"\x03" * 32)
+                    .public_key.format(compressed=True)
+                    .hex()
+                }
+            ),
+        )
+
+    with pytest.raises(ValueError):
+        ChannelInputAuthorization(prepare=authorization.prepare, endpoint_terms=terms)
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ["transaction", "prevout", "fee", "participant", "settlement", "fee_share", "adjustment"],
+)
+def test_rejects_plan_authorization_mismatches_before_freeze(tmp_path: Path, kind: str) -> None:
+    plan = _plan()
+    channel = plan.channels[0]
+    if kind == "transaction":
+        mismatched = plan.model_copy(
+            update={"unsigned_parent_hex": plan.unsigned_parent_hex[:-2] + "01"}
+        )
+    elif kind in {"prevout", "fee"}:
+        mismatched = plan.model_copy(
+            update={
+                "prevouts": (
+                    plan.prevouts[0],
+                    plan.prevouts[1].model_copy(
+                        update={"value_sat": plan.prevouts[1].value_sat + 1}
+                    ),
+                )
+            }
+        )
+    elif kind == "participant":
+        mismatched = plan.model_copy(
+            update={
+                "channels": (
+                    channel.model_copy(
+                        update={
+                            "first": channel.first.model_copy(
+                                update={"participant_key": channel.second.participant_key}
+                            )
+                        }
+                    ),
+                )
+            }
+        )
+    elif kind == "settlement":
+        mismatched = plan.model_copy(
+            update={
+                "channels": (
+                    channel.model_copy(
+                        update={
+                            "first": channel.first.model_copy(
+                                update={
+                                    "settlement_outputs": (
+                                        channel.first.settlement_outputs[0].model_copy(
+                                            update={
+                                                "value_sat": channel.first.settlement_outputs[
+                                                    0
+                                                ].value_sat
+                                                + 1
+                                            }
+                                        ),
+                                    )
+                                }
+                            )
+                        }
+                    ),
+                )
+            }
+        )
+    elif kind == "fee_share":
+        mismatched = plan.model_copy(
+            update={
+                "channels": (
+                    channel.model_copy(
+                        update={
+                            "first": channel.first.model_copy(update={"miner_fee_share_sat": 999})
+                        }
+                    ),
+                )
+            }
+        )
+    else:
+        mismatched = plan.model_copy(
+            update={
+                "channels": (
+                    channel.model_copy(
+                        update={
+                            "first": channel.first.model_copy(update={"claim_adjustment_sat": 1})
+                        }
+                    ),
+                )
+            }
+        )
+    endpoints = _endpoints()
+
+    with pytest.raises(ChannelInputParentError):
+        asyncio.run(ChannelInputParentCoordinator(tmp_path).execute(mismatched, endpoints))
+
+    assert endpoints["first"].freeze_calls == endpoints["second"].freeze_calls == 0
+
+
+@pytest.mark.parametrize("kind", ["peer", "claims"])
+def test_rejects_frozen_data_that_differs_from_authorization_terms(
+    tmp_path: Path, kind: str
+) -> None:
+    endpoints = _endpoints(
+        first_snapshot_peer_key=PrivateKey(b"\x03" * 32) if kind == "peer" else None,
+        first_snapshot_local_claim_sat=49_999 if kind == "claims" else 50_000,
+    )
+
+    with pytest.raises(ChannelInputParentError, match="frozen channel data differs"):
+        asyncio.run(ChannelInputParentCoordinator(tmp_path).execute(_plan(), endpoints))
+
+    assert endpoints["first"].freeze_calls == endpoints["second"].freeze_calls == 1
 
 
 def test_rejects_invalid_ordinary_witness_before_channel_signing(tmp_path: Path) -> None:
@@ -410,7 +906,7 @@ def test_rejects_channel_prevout_and_fee_share_mismatches(tmp_path: Path) -> Non
             )
         }
     )
-    with pytest.raises(ChannelInputParentError, match="channel prevout"):
+    with pytest.raises(ChannelInputParentError, match="parent prevouts differ"):
         asyncio.run(
             ChannelInputParentCoordinator(tmp_path / "prevout").execute(
                 mismatched_prevout, _endpoints()
@@ -424,7 +920,7 @@ def test_rejects_channel_prevout_and_fee_share_mismatches(tmp_path: Path) -> Non
             )
         }
     )
-    with pytest.raises(ChannelInputParentError, match="channel prevout"):
+    with pytest.raises(ChannelInputParentError, match="parent prevouts differ"):
         asyncio.run(
             ChannelInputParentCoordinator(tmp_path / "script").execute(
                 mismatched_script, _endpoints()
@@ -447,7 +943,7 @@ def test_rejects_channel_prevout_and_fee_share_mismatches(tmp_path: Path) -> Non
             )
         }
     )
-    with pytest.raises(ChannelInputParentError, match="below channel fee shares"):
+    with pytest.raises(ChannelInputParentError, match="miner fee share differs"):
         asyncio.run(
             ChannelInputParentCoordinator(tmp_path / "fees").execute(excessive_shares, _endpoints())
         )
@@ -471,9 +967,7 @@ def test_recovers_after_durable_partial_without_restarting_attempt(tmp_path: Pat
     with pytest.raises(ChannelInputParentError, match="progression failed"):
         asyncio.run(coordinator.execute(_plan(), endpoints))
 
-    resumed = asyncio.run(
-        ChannelInputParentCoordinator(tmp_path).resume("parent-test-session", endpoints)
-    )
+    resumed = asyncio.run(ChannelInputParentCoordinator(tmp_path).resume(SESSION_ID, endpoints))
     assert resumed.state is ChannelInputParentState.FINAL_TX_PERSISTED
     assert endpoints["first"].begin_calls == 1
     assert endpoints["first"].sign_calls == 1
@@ -496,7 +990,7 @@ def test_rejects_durable_signing_evidence_contradictions(
         endpoints["first"].status_partial = b"\x09" * 32
 
     with pytest.raises(ChannelInputParentError, match="status changed"):
-        asyncio.run(coordinator.resume("parent-test-session", endpoints))
+        asyncio.run(coordinator.resume(SESSION_ID, endpoints))
 
 
 def test_rejects_same_txid_with_different_chain_witness(tmp_path: Path) -> None:
@@ -523,7 +1017,7 @@ def test_cancellation_only_before_channel_signing(tmp_path: Path) -> None:
     with pytest.raises(ChannelInputParentError):
         asyncio.run(coordinator.execute(_plan(), endpoints))
     with pytest.raises(ChannelInputParentError, match="forbidden"):
-        asyncio.run(coordinator.cancel("parent-test-session", endpoints))
+        asyncio.run(coordinator.cancel(SESSION_ID, endpoints))
 
     coordinator = ChannelInputParentCoordinator(tmp_path / "pre-sign")
     endpoints = _endpoints()
@@ -538,6 +1032,6 @@ def test_cancellation_only_before_channel_signing(tmp_path: Path) -> None:
     endpoints = _endpoints(fail_freeze_once=True)
     with pytest.raises(ChannelInputParentError, match="progression failed"):
         asyncio.run(coordinator.execute(_plan(), endpoints))
-    canceled = asyncio.run(coordinator.cancel("parent-test-session", endpoints))
+    canceled = asyncio.run(coordinator.cancel(SESSION_ID, endpoints))
     assert canceled.state is ChannelInputParentState.CANCELED
     assert endpoints["first"].cancel_calls == endpoints["second"].cancel_calls == 1

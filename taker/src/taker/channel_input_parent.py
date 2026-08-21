@@ -12,11 +12,23 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Protocol
 
+from coincurve import PublicKey, PublicKeyXOnly
 from jmcore.bitcoin import (
     get_txid,
     parse_transaction,
     pubkey_to_p2wpkh_script,
     serialize_transaction,
+)
+from jmcore.channel_input import (
+    ChannelInputPreparePayload,
+    ChannelInputValidationError,
+    EndpointTerms,
+    InputPrevout,
+    Outpoint,
+    endpoint_terms_hash,
+    validate_prepare_payload,
+    validate_revealed_endpoint_pair,
+    validate_transcript_against_transaction,
 )
 from jmswap.lnd import (
     EscrowOutpoint,
@@ -44,6 +56,7 @@ from pydantic import (
 Hex = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]+$")]
 Hex32 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 MAX_PARENT_FEE_SAT = 1_000_000
+MAX_CLAIM_ADJUSTMENT_SAT = 1_000_000
 
 
 class ChannelInputParentError(Exception):
@@ -83,6 +96,26 @@ def _hex(value: str, name: str, *, length: int | None = None) -> str:
     return value
 
 
+def _compressed_pubkey(value: str, name: str) -> str:
+    _hex(value, name, length=33)
+    if not value.startswith(("02", "03")):
+        raise ValueError(f"{name} is not compressed")
+    try:
+        PublicKey(bytes.fromhex(value))
+    except ValueError as exc:
+        raise ValueError(f"{name} is not a valid secp256k1 public key") from exc
+    return value
+
+
+def _xonly_pubkey(value: str, name: str) -> str:
+    _hex(value, name, length=32)
+    try:
+        PublicKeyXOnly(bytes.fromhex(value))
+    except ValueError as exc:
+        raise ValueError(f"{name} is not a valid BIP340 public key") from exc
+    return value
+
+
 class ParentPrevout(_StrictModel):
     value_sat: int = Field(gt=0)
     script_pubkey: Hex
@@ -113,8 +146,17 @@ class SettlementOutput(_StrictModel):
 
 class EndpointContribution(_StrictModel):
     endpoint_id: str = Field(min_length=1, max_length=128)
+    participant_key: Hex32
     settlement_outputs: tuple[SettlementOutput, ...] = Field(min_length=1)
     miner_fee_share_sat: int = Field(ge=0)
+    claim_adjustment_sat: int = Field(
+        default=0, ge=-MAX_CLAIM_ADJUSTMENT_SAT, le=MAX_CLAIM_ADJUSTMENT_SAT
+    )
+
+    @field_validator("participant_key")
+    @classmethod
+    def validate_participant_key(cls, value: str) -> str:
+        return _xonly_pubkey(value, "participant_key")
 
 
 class ChannelContribution(_StrictModel):
@@ -124,9 +166,11 @@ class ChannelContribution(_StrictModel):
     second: EndpointContribution
 
     @model_validator(mode="after")
-    def validate_endpoint_ids(self) -> ChannelContribution:
+    def validate_endpoints(self) -> ChannelContribution:
         if self.first.endpoint_id == self.second.endpoint_id:
             raise ValueError("channel endpoints must have distinct identities")
+        if self.first.claim_adjustment_sat + self.second.claim_adjustment_sat != 0:
+            raise ValueError("channel claim adjustments must sum to zero")
         return self
 
 
@@ -140,12 +184,51 @@ class OrdinaryWitness(_StrictModel):
         return tuple(_hex(item, "ordinary witness") for item in value)
 
 
+class ChannelInputAuthorization(_StrictModel):
+    """Durable signed prepare authorization and every committed endpoint term."""
+
+    prepare: ChannelInputPreparePayload
+    endpoint_terms: tuple[EndpointTerms, ...] = Field(min_length=2, max_length=64)
+
+    @model_validator(mode="after")
+    def validate_authorization(self) -> ChannelInputAuthorization:
+        try:
+            validate_prepare_payload(self.prepare)
+            transcript = self.prepare.approval_set.transcript
+            terms_by_hash = {
+                endpoint_terms_hash(terms).hex(): terms for terms in self.endpoint_terms
+            }
+            if len(terms_by_hash) != len(self.endpoint_terms):
+                raise ChannelInputValidationError("endpoint terms hashes must be unique")
+            if set(terms_by_hash) != transcript.all_terms_hashes():
+                raise ChannelInputValidationError(
+                    "endpoint terms hashes do not exactly match transcript"
+                )
+            for descriptor in transcript.channels:
+                validate_revealed_endpoint_pair(
+                    transcript,
+                    descriptor,
+                    terms_by_hash[descriptor.first_terms_hash],
+                    terms_by_hash[descriptor.second_terms_hash],
+                )
+        except ChannelInputValidationError as exc:
+            raise ValueError(str(exc)) from exc
+        return self
+
+    def terms_for(
+        self, first_terms_hash: str, second_terms_hash: str
+    ) -> tuple[EndpointTerms, EndpointTerms]:
+        terms_by_hash = {endpoint_terms_hash(terms).hex(): terms for terms in self.endpoint_terms}
+        return terms_by_hash[first_terms_hash], terms_by_hash[second_terms_hash]
+
+
 class ChannelInputParentPlan(_StrictModel):
     session_id: str = Field(min_length=1, max_length=256)
     unsigned_parent_hex: Hex
     prevouts: tuple[ParentPrevout, ...] = Field(min_length=1)
     channels: tuple[ChannelContribution, ...] = Field(min_length=1)
     ordinary_witnesses: tuple[OrdinaryWitness, ...]
+    authorization: ChannelInputAuthorization
     maximum_miner_fee_sat: int = Field(default=MAX_PARENT_FEE_SAT, gt=0, le=MAX_PARENT_FEE_SAT)
 
     @field_validator("unsigned_parent_hex")
@@ -161,6 +244,7 @@ class FrozenSnapshot(_StrictModel):
     capacity_sat: int = Field(gt=0)
     local_claim_sat: int = Field(ge=0)
     remote_claim_sat: int = Field(ge=0)
+    peer_node_pubkey: Hex
     local_funding_pubkey: Hex
     remote_funding_pubkey: Hex
 
@@ -172,13 +256,10 @@ class FrozenSnapshot(_StrictModel):
             raise ValueError("frozen funding script is not P2TR")
         return value
 
-    @field_validator("local_funding_pubkey", "remote_funding_pubkey")
+    @field_validator("peer_node_pubkey", "local_funding_pubkey", "remote_funding_pubkey")
     @classmethod
     def validate_funding_pubkey(cls, value: str) -> str:
-        _hex(value, "frozen funding public key", length=33)
-        if not value.startswith(("02", "03")):
-            raise ValueError("frozen funding public key is not compressed")
-        return value
+        return _compressed_pubkey(value, "frozen public key")
 
     @model_validator(mode="after")
     def validate_claims(self) -> FrozenSnapshot:
@@ -195,6 +276,7 @@ class FrozenSnapshot(_StrictModel):
             capacity_sat=snapshot.capacity_sat,
             local_claim_sat=snapshot.local_claim_sat,
             remote_claim_sat=snapshot.remote_claim_sat,
+            peer_node_pubkey=snapshot.peer_node_pubkey.hex(),
             local_funding_pubkey=snapshot.local_funding_pubkey.hex(),
             remote_funding_pubkey=snapshot.remote_funding_pubkey.hex(),
         )
@@ -402,6 +484,17 @@ class ChannelInputParentCoordinator:
     @staticmethod
     def _validate_plan(plan: ChannelInputParentPlan) -> None:
         try:
+            authorization = ChannelInputAuthorization.model_validate(
+                plan.authorization.model_dump(mode="python")
+            )
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ChannelInputParentError("channel input authorization is invalid") from exc
+        transcript = authorization.prepare.approval_set.transcript
+        if plan.session_id != transcript.session_id:
+            raise ChannelInputParentError("parent session ID differs from authorization transcript")
+        if plan.unsigned_parent_hex != transcript.unsigned_parent_tx:
+            raise ChannelInputParentError("unsigned parent differs from authorization transcript")
+        try:
             tx = parse_transaction(plan.unsigned_parent_hex)
         except ValueError as exc:
             raise ChannelInputParentError("unsigned parent cannot be parsed") from exc
@@ -411,6 +504,22 @@ class ChannelInputParentCoordinator:
             )
         if len(tx.inputs) != len(plan.prevouts):
             raise ChannelInputParentError("parent input and prevout counts differ")
+        try:
+            plan_input_prevouts = tuple(
+                InputPrevout(
+                    outpoint=Outpoint(txid=tx_input.txid, vout=tx_input.vout),
+                    value_sat=prevout.value_sat,
+                    script_pubkey=prevout.script_pubkey,
+                )
+                for tx_input, prevout in zip(tx.inputs, plan.prevouts, strict=True)
+            )
+            validate_transcript_against_transaction(
+                transcript, bytes.fromhex(plan.unsigned_parent_hex), plan_input_prevouts
+            )
+        except (ChannelInputValidationError, ValueError) as exc:
+            raise ChannelInputParentError(
+                "parent prevouts differ from authorization transcript"
+            ) from exc
         outpoints = [(item.txid, item.vout) for item in tx.inputs]
         if len(outpoints) != len(set(outpoints)):
             raise ChannelInputParentError("parent has duplicate input outpoints")
@@ -420,6 +529,17 @@ class ChannelInputParentCoordinator:
         ):
             raise ChannelInputParentError(
                 "channel input indices are duplicate or outside the parent"
+            )
+        if len(plan.channels) != len(transcript.channels):
+            raise ChannelInputParentError(
+                "parent channel count differs from authorization transcript"
+            )
+        descriptors_by_index = {
+            descriptor.input_index: descriptor for descriptor in transcript.channels
+        }
+        if set(channel_indices) != set(descriptors_by_index):
+            raise ChannelInputParentError(
+                "parent channel inputs differ from authorization transcript"
             )
         assigned = [
             output.output_index
@@ -434,6 +554,40 @@ class ChannelInputParentCoordinator:
                 "settlement output indices are duplicate or outside the parent"
             )
         for channel in plan.channels:
+            descriptor = descriptors_by_index[channel.channel_input_index]
+            first_terms, second_terms = authorization.terms_for(
+                descriptor.first_terms_hash, descriptor.second_terms_hash
+            )
+            for contribution, participant_key, terms in (
+                (channel.first, descriptor.first_participant_key, first_terms),
+                (channel.second, descriptor.second_participant_key, second_terms),
+            ):
+                if contribution.participant_key != participant_key:
+                    raise ChannelInputParentError(
+                        "channel contribution participant differs from authorization transcript"
+                    )
+                committed_outputs = tuple(
+                    (output.output_index, output.value_sat, output.script_pubkey)
+                    for output in contribution.settlement_outputs
+                )
+                authorized_outputs = tuple(
+                    (output.output_index, output.amount_sat, output.script_pubkey)
+                    for output in terms.settlement_outputs
+                )
+                if committed_outputs != authorized_outputs:
+                    raise ChannelInputParentError(
+                        "channel settlement outputs differ from authorization terms"
+                    )
+                if contribution.miner_fee_share_sat != terms.miner_fee_share_sat:
+                    raise ChannelInputParentError(
+                        "channel miner fee share differs from authorization terms"
+                    )
+                if contribution.claim_adjustment_sat != terms.claim_adjustment_sat:
+                    raise ChannelInputParentError(
+                        "channel claim adjustment differs from authorization terms"
+                    )
+            if channel.first.claim_adjustment_sat + channel.second.claim_adjustment_sat != 0:
+                raise ChannelInputParentError("channel claim adjustments must sum to zero")
             for endpoint in (channel.first, channel.second):
                 for output in endpoint.settlement_outputs:
                     parent_output = tx.outputs[output.output_index]
@@ -451,6 +605,10 @@ class ChannelInputParentCoordinator:
         fee = sum(item.value_sat for item in plan.prevouts) - sum(item.value for item in tx.outputs)
         if fee <= 0 or fee > plan.maximum_miner_fee_sat:
             raise ChannelInputParentError("parent miner fee is nonpositive or excessive")
+        if fee != transcript.total_fee_sat:
+            raise ChannelInputParentError("parent miner fee differs from authorization transcript")
+        if transcript.total_fee_sat > plan.maximum_miner_fee_sat:
+            raise ChannelInputParentError("authorization transcript fee exceeds local maximum")
         channel_fee_shares = sum(
             endpoint.miner_fee_share_sat
             for channel in plan.channels
@@ -461,6 +619,8 @@ class ChannelInputParentCoordinator:
 
     @staticmethod
     def _validate_snapshot_pair(first: FrozenSnapshot, second: FrozenSnapshot) -> None:
+        for snapshot in (first, second):
+            _compressed_pubkey(snapshot.peer_node_pubkey, "frozen peer node public key")
         fields = ("funding_txid", "funding_vout", "funding_script_pubkey", "capacity_sat")
         if any(getattr(first, field) != getattr(second, field) for field in fields):
             raise ChannelInputParentError("mirrored frozen channel snapshots disagree")
@@ -477,10 +637,25 @@ class ChannelInputParentCoordinator:
         contribution: EndpointContribution, snapshot: FrozenSnapshot
     ) -> None:
         committed = sum(output.value_sat for output in contribution.settlement_outputs)
-        if committed + contribution.miner_fee_share_sat != snapshot.local_claim_sat:
+        adjusted_claim = snapshot.local_claim_sat + contribution.claim_adjustment_sat
+        if adjusted_claim <= 0:
+            raise ChannelInputParentError("endpoint adjusted frozen claim is nonpositive")
+        if committed + contribution.miner_fee_share_sat != adjusted_claim:
             raise ChannelInputParentError(
-                "endpoint settlement outputs do not conserve frozen claim"
+                "endpoint settlement outputs do not conserve adjusted frozen claim"
             )
+
+    @staticmethod
+    def _validate_snapshot_terms(snapshot: FrozenSnapshot, terms: EndpointTerms) -> None:
+        if (
+            snapshot.funding_txid != terms.funding_outpoint.txid
+            or snapshot.funding_vout != terms.funding_outpoint.vout
+            or snapshot.capacity_sat != terms.capacity_sat
+            or snapshot.local_claim_sat != terms.frozen_local_claim_sat
+            or snapshot.remote_claim_sat != terms.frozen_remote_claim_sat
+            or snapshot.peer_node_pubkey != terms.peer_node_key
+        ):
+            raise ChannelInputParentError("frozen channel data differs from authorization terms")
 
     @staticmethod
     def _validate_ordinary_witnesses(plan: ChannelInputParentPlan) -> None:
@@ -588,6 +763,10 @@ class ChannelInputParentCoordinator:
     ) -> ChannelInputParentRecord:
         channel_records: list[ChannelRecord] = []
         parent = parse_transaction(record.plan.unsigned_parent_hex)
+        transcript = record.plan.authorization.prepare.approval_set.transcript
+        descriptors_by_index = {
+            descriptor.input_index: descriptor for descriptor in transcript.channels
+        }
         for channel in record.plan.channels:
             first_endpoint = self._endpoint(endpoints, channel.first)
             second_endpoint = self._endpoint(endpoints, channel.second)
@@ -601,6 +780,12 @@ class ChannelInputParentCoordinator:
                     record.plan.session_id, channel.channel_id
                 )
             )
+            descriptor = descriptors_by_index[channel.channel_input_index]
+            first_terms, second_terms = record.plan.authorization.terms_for(
+                descriptor.first_terms_hash, descriptor.second_terms_hash
+            )
+            self._validate_snapshot_terms(first, first_terms)
+            self._validate_snapshot_terms(second, second_terms)
             self._validate_snapshot_pair(first, second)
             self._validate_conservation(channel.first, first)
             self._validate_conservation(channel.second, second)
