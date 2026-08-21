@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from unittest.mock import patch
 
 import pytest
 
@@ -1407,3 +1408,106 @@ class TestCoinJoinLocks:
 
         store = UTXOMetadataStore(path=store_path)
         assert store.try_lock_outpoints([a], ttl=MAX_COINJOIN_LOCK_TTL, owner="session-a")
+
+
+class TestBatchFreeze:
+    """Tests for atomic batched freeze/unfreeze (issue #596)."""
+
+    @pytest.fixture
+    def store_path(self, tmp_path):
+        return tmp_path / "wallet_metadata.jsonl"
+
+    @pytest.fixture
+    def store(self, store_path):
+        return UTXOMetadataStore(path=store_path)
+
+    @pytest.fixture
+    def a(self):
+        return "aa" * 32 + ":0"
+
+    @pytest.fixture
+    def b(self):
+        return "bb" * 32 + ":1"
+
+    @pytest.fixture
+    def c(self):
+        return "cc" * 32 + ":2"
+
+    def test_mixed_batch_applies_both_directions(self, store, a, b, c):
+        """One call can freeze some outpoints and unfreeze others."""
+        store.freeze(b)
+        store.freeze(c)
+
+        store.set_frozen([(a, True), (b, False), (c, True)])
+
+        assert store.is_frozen(a)
+        assert not store.is_frozen(b)
+        assert store.is_frozen(c)
+
+    def test_batch_persists(self, store, a, b):
+        """A batch is written to disk, not just held in memory."""
+        store.set_frozen([(a, True), (b, True)])
+
+        reloaded = UTXOMetadataStore(path=store.path)
+        reloaded.load()
+        assert reloaded.is_frozen(a)
+        assert reloaded.is_frozen(b)
+
+    def test_empty_batch_writes_nothing(self, store, store_path):
+        """An empty batch is a no-op and must not touch the file."""
+        store.set_frozen([])
+        assert not store_path.exists()
+
+    def test_duplicate_outpoint_raises(self, store, a):
+        """Two entries for one outpoint have no defined outcome, so refuse."""
+        with pytest.raises(ValueError, match="Duplicate outpoint"):
+            store.set_frozen([(a, True), (a, False)])
+
+    def test_duplicate_outpoint_applies_nothing(self, store, a, b, store_path):
+        """A rejected batch must not partially apply."""
+        with pytest.raises(ValueError, match="Duplicate outpoint"):
+            store.set_frozen([(b, True), (a, True), (a, False)])
+
+        assert not store_path.exists()
+        assert not store.is_frozen(a)
+        assert not store.is_frozen(b)
+
+    def test_batch_unfreeze_drops_bare_record(self, store, a):
+        """Batch unfreeze matches unfreeze(): a record with nothing else goes away."""
+        store.freeze(a)
+        store.set_frozen([(a, False)])
+
+        assert not store.is_frozen(a)
+        assert a not in store.records
+
+    def test_batch_unfreeze_keeps_labelled_record(self, store, a):
+        """A label must survive a batch unfreeze, same as the single-outpoint path."""
+        store.freeze(a, label="cj-out")
+        store.set_frozen([(a, False)])
+
+        assert not store.is_frozen(a)
+        assert store.records[a].label == "cj-out"
+
+    def test_batch_writes_once(self, store, a, b, c):
+        """The whole batch costs one read-modify-write, not one per outpoint."""
+        with patch.object(
+            UTXOMetadataStore, "save", autospec=True, side_effect=UTXOMetadataStore.save
+        ) as spy:
+            store.set_frozen([(a, True), (b, True), (c, True)])
+
+        assert spy.call_count == 1
+
+    def test_failed_save_leaves_disk_untouched(self, store, a, b, store_path):
+        """If persisting fails the batch must not be half applied on disk."""
+        store.freeze(a)
+
+        with (
+            patch.object(UTXOMetadataStore, "save", side_effect=OSError("disk full")),
+            pytest.raises(OSError, match="disk full"),
+        ):
+            store.set_frozen([(a, False), (b, True)])
+
+        reloaded = UTXOMetadataStore(path=store_path)
+        reloaded.load()
+        assert reloaded.is_frozen(a)
+        assert not reloaded.is_frozen(b)

@@ -1977,3 +1977,61 @@ class TestApplyFrozenStateHotReload:
         # Should not raise
         ws._apply_frozen_state()
         assert not ws.utxo_cache[0][0].frozen
+
+
+class TestSetUtxosFrozen:
+    """WalletService.set_utxos_frozen: batched freeze/unfreeze (issue #596)."""
+
+    def _attach_store(self, ws, tmp_path):
+        from jmwallet.wallet.utxo_metadata import UTXOMetadataStore
+
+        ws.metadata_store = UTXOMetadataStore(path=tmp_path / "wallet_metadata.jsonl")
+        ws.metadata_store.load()
+
+    def test_updates_cache_in_both_directions(self, wallet_service, tmp_path):
+        self._attach_store(wallet_service, tmp_path)
+        a = "a" * 64 + ":0"
+        b = "b" * 64 + ":0"
+        wallet_service.freeze_utxo(b)
+
+        wallet_service.set_utxos_frozen([(a, True), (b, False)])
+
+        by_outpoint = {u.outpoint: u for u in wallet_service.utxo_cache[0]}
+        assert by_outpoint[a].frozen is True
+        assert by_outpoint[b].frozen is False
+
+    def test_updates_every_match_not_just_the_first(self, wallet_service, tmp_path):
+        """The single-outpoint helpers return at the first hit; a batch cannot."""
+        self._attach_store(wallet_service, tmp_path)
+        cached = [u for utxos in wallet_service.utxo_cache.values() for u in utxos]
+        outpoints = [u.outpoint for u in cached]
+        assert len(outpoints) > 1, "fixture should cache more than one UTXO"
+
+        wallet_service.set_utxos_frozen([(op, True) for op in outpoints])
+
+        assert all(u.frozen for u in cached)
+
+    def test_persists_through_the_store(self, wallet_service, tmp_path):
+        from jmwallet.wallet.utxo_metadata import UTXOMetadataStore
+
+        self._attach_store(wallet_service, tmp_path)
+        a = "a" * 64 + ":0"
+
+        wallet_service.set_utxos_frozen([(a, True)])
+
+        reloaded = UTXOMetadataStore(path=tmp_path / "wallet_metadata.jsonl")
+        reloaded.load()
+        assert reloaded.is_frozen(a)
+
+    def test_duplicate_outpoint_raises(self, wallet_service, tmp_path):
+        self._attach_store(wallet_service, tmp_path)
+        a = "a" * 64 + ":0"
+
+        with pytest.raises(ValueError, match="Duplicate outpoint"):
+            wallet_service.set_utxos_frozen([(a, True), (a, False)])
+
+    def test_without_store_raises(self, wallet_service):
+        wallet_service.metadata_store = None
+
+        with pytest.raises(RuntimeError, match="without a data directory"):
+            wallet_service.set_utxos_frozen([("a" * 64 + ":0", True)])
