@@ -37,9 +37,11 @@ from maker.rate_limiting import (
 )
 
 if TYPE_CHECKING:
+    from jmswap.channel_input import InitializedChannelInputBackend
     from jmswap.channel_ring import InitializedChannelRingBackend
     from jmwallet.history import TransactionHistoryEntry
 
+    from maker.channel_input_runtime import MakerChannelInputRegistry
     from maker.direct_connection import DirectConnectionState
     from maker.generation import MakerGeneration
 
@@ -97,6 +99,8 @@ class MakerBotProtocol(Protocol):
     channel_input_capability_validated: bool
     _channel_ring_backend: InitializedChannelRingBackend | None
     _channel_ring_store: RingParticipantStore | None
+    _channel_input_backend: InitializedChannelInputBackend | None
+    _channel_input_registry: MakerChannelInputRegistry | None
 
     # -- Cross-mixin methods --
 
@@ -128,6 +132,15 @@ class MakerBotProtocol(Protocol):
         generation_id: int | None = None,
     ) -> None: ...
 
+    async def _handle_channel_input(
+        self,
+        taker_nick: str,
+        msg: str,
+        source: str = "unknown",
+        direct_connection: TCPConnection | None = None,
+        generation_id: int | None = None,
+    ) -> None: ...
+
     async def _handle_push(
         self, taker_nick: str, msg: str, source: str = "unknown", generation_id: int | None = None
     ) -> None: ...
@@ -142,6 +155,8 @@ class MakerBotProtocol(Protocol):
     def _start_session_cleanup_task(self) -> None: ...
 
     def _abort_for_fatal_error(self, error: Exception) -> None: ...
+
+    def _refresh_channel_input_capability(self) -> bool: ...
 
     def _prune_done_tasks(self) -> None: ...
 

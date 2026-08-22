@@ -73,7 +73,7 @@ async def test_runtime_reconciles_before_capability_activation(tmp_path: Path) -
     initialized = SimpleNamespace(
         backend=lnd,
         node_info=SimpleNamespace(identity_pubkey="02" + "22" * 32),
-        candidates=(object(),),
+        candidates=(SimpleNamespace(funding_outpoint=SimpleNamespace(txid="33" * 32, vout=1)),),
     )
 
     def load(**kwargs: object) -> object:
@@ -102,6 +102,27 @@ async def test_runtime_reconciles_before_capability_activation(tmp_path: Path) -
     assert bot._channel_input_backend is initialized
     assert bot._channel_input_registry is registry
     assert bot.channel_input_capability_validated is True
+
+
+def test_runtime_capability_disables_after_candidate_admission(tmp_path: Path) -> None:
+    bot = _bot(tmp_path)
+    candidate_outpoint = SimpleNamespace(txid="33" * 32, vout=1)
+    bot._channel_input_backend = SimpleNamespace(
+        candidates=(SimpleNamespace(funding_outpoint=candidate_outpoint),)
+    )
+    bot._channel_input_registry = SimpleNamespace(recovery_outpoints=(), session_count=0)
+    bot._directory_pool.enable_channel_input_v1 = MagicMock()
+    bot._directory_pool.disable_channel_input_v1 = MagicMock()
+
+    assert bot._refresh_channel_input_capability() is True
+    bot._directory_pool.enable_channel_input_v1.assert_called_once()
+
+    bot._channel_input_registry = SimpleNamespace(
+        recovery_outpoints=(candidate_outpoint,), session_count=1
+    )
+    assert bot._refresh_channel_input_capability() is False
+    assert bot.channel_input_capability_validated is False
+    bot._directory_pool.disable_channel_input_v1.assert_called_once()
 
 
 @pytest.mark.asyncio

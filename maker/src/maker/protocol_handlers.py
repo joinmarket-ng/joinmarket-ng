@@ -547,6 +547,10 @@ class ProtocolHandlersMixin:
                 await self._handle_ring(
                     from_nick, command, source=source, generation_id=generation_id
                 )
+            elif command.startswith("channel_input"):
+                await self._handle_channel_input(
+                    from_nick, command, source=source, generation_id=generation_id
+                )
             elif command.startswith("push"):
                 await self._handle_push(
                     from_nick, command, source=source, generation_id=generation_id
@@ -1061,6 +1065,40 @@ class ProtocolHandlersMixin:
             session,
             lambda: session.on_ring(self, msg, source),
             name=f"maker-ring-{taker_nick}",
+        )
+
+    async def _handle_channel_input(
+        self: MakerBotProtocol,
+        taker_nick: str,
+        msg: str,
+        source: str = "unknown",
+        direct_connection: TCPConnection | None = None,
+        generation_id: int | None = None,
+    ) -> None:
+        """Dispatch !channel_input to the per-taker encrypted session."""
+
+        generation_id = self.current_generation_id if generation_id is None else generation_id
+        generation = self._generation(generation_id)
+        if (
+            generation is None
+            or generation.state is GenerationState.CLOSED
+            or (
+                generation.grace_deadline is not None
+                and time.monotonic() >= generation.grace_deadline
+            )
+        ):
+            return
+        session = self.active_sessions.get((generation_id, taker_nick))
+        if session is None:
+            logger.warning("No active session for !channel_input")
+            logger.bind(sensitive=True).warning(
+                f"No active session for !channel_input from {taker_nick}"
+            )
+            return
+        await self._dispatch_session_handler(
+            session,
+            lambda: session.on_channel_input(self, msg, source, direct_connection),
+            name=f"maker-channel-input-{taker_nick}",
         )
 
     async def _handle_push(

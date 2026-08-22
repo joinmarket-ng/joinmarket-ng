@@ -1508,19 +1508,36 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
 
         self._channel_input_backend = initialized
         self._channel_input_registry = registry
-        capacity_available = (
-            bool(initialized.candidates)
-            and registry.session_count < self.config.channel_input.max_active_sessions
-        )
-        if capacity_available:
-            self.channel_input_capability_validated = True
-            self._directory_pool.enable_channel_input_v1()
+        if self._refresh_channel_input_capability():
             logger.info("Validated channel-input v1 LND backend")
         else:
             logger.warning(
                 "Channel input is not advertised: no unfrozen candidate or durable "
                 "session capacity remains"
             )
+
+    def _refresh_channel_input_capability(self) -> bool:
+        """Advertise only while a live negotiation can claim a fresh channel."""
+
+        initialized = self._channel_input_backend
+        registry = self._channel_input_registry
+        available = False
+        if initialized is not None and registry is not None:
+            reserved = {(outpoint.txid, outpoint.vout) for outpoint in registry.recovery_outpoints}
+            available = (
+                registry.session_count < self.config.channel_input.max_active_sessions
+                and any(
+                    (candidate.funding_outpoint.txid, candidate.funding_outpoint.vout)
+                    not in reserved
+                    for candidate in initialized.candidates
+                )
+            )
+        self.channel_input_capability_validated = available
+        if available:
+            self._directory_pool.enable_channel_input_v1()
+        else:
+            self._directory_pool.disable_channel_input_v1()
+        return available
 
     def _start_session_cleanup_task(self) -> None:
         """Start the bot-wide session reaper exactly once."""

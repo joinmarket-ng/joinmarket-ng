@@ -26,6 +26,13 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from jmcore.bitcoin import address_to_scriptpubkey, scriptpubkey_to_address
+from jmcore.channel_input import (
+    MAX_CHANNEL_INPUT_CIPHERTEXT_BYTES,
+    ChannelInputInvitePayload,
+    decode_channel_input_message,
+    encode_channel_input_message,
+)
 from jmcore.cofunded_ring import (
     MAX_RING_CIPHERTEXT_BYTES,
     RingCancelPayload,
@@ -56,6 +63,8 @@ from maker.session_logging import log_coinjoin_message
 if TYPE_CHECKING:
     from jmcore.encryption import CryptoSession
     from jmcore.models import Offer
+    from jmcore.network import TCPConnection
+    from jmswap.lnd import ChannelInputCandidate
     from jmwallet.wallet.models import UTXOInfo
 
     from maker.channel_ring import MakerRingParticipant
@@ -882,6 +891,135 @@ class MakerSession:
                         "Could not durably reject channel-ring plan from "
                         f"{self.taker_nick} ({type(rejection_exc).__name__})"
                     )
+
+    async def on_channel_input(
+        self,
+        bot: MakerBotProtocol,
+        msg: str,
+        source: str,
+        direct_connection: TCPConnection | None = None,
+    ) -> None:
+        """Decrypt and dispatch one authenticated channel-input envelope."""
+
+        self.validate_channel(source)
+        if self.state != CoinJoinState.IOAUTH_SENT:
+            logger.warning(
+                f"Rejecting !channel_input from {self.taker_nick}: PoDLE/!ioauth not complete"
+            )
+            return
+        if (
+            not bot.config.channel_input.enabled
+            or bot._channel_input_backend is None
+            or bot._channel_input_registry is None
+        ):
+            logger.warning(
+                f"Rejecting !channel_input from {self.taker_nick}: feature is unavailable"
+            )
+            return
+        if not self.crypto.is_encrypted:
+            logger.warning(
+                f"Rejecting !channel_input from {self.taker_nick}: encryption is unavailable"
+            )
+            return
+        if source == "direct" and direct_connection is None:
+            logger.warning(
+                f"Rejecting !channel_input from {self.taker_nick}: direct source is unavailable"
+            )
+            return
+        if source.startswith("dir:") and source[4:] not in bot.directory_clients:
+            logger.warning(
+                f"Rejecting !channel_input from {self.taker_nick}: directory source is unavailable"
+            )
+            return
+        if source != "direct" and not source.startswith("dir:"):
+            logger.warning(
+                f"Rejecting !channel_input from {self.taker_nick}: source is unavailable"
+            )
+            return
+        parts = msg.split()
+        if len(parts) != 4 or len(parts[1]) > MAX_CHANNEL_INPUT_CIPHERTEXT_BYTES:
+            logger.warning(f"Rejecting malformed encrypted !channel_input from {self.taker_nick}")
+            return
+        try:
+            verified, command, encrypted = verify_signed_privmsg(self.taker_nick, msg, ONION_HOSTID)
+            if not verified or command != "channel_input" or encrypted != parts[1]:
+                raise ValueError("invalid signed channel-input envelope")
+            payload = decode_channel_input_message(self.crypto.decrypt(encrypted))
+            initialized_backend = bot._channel_input_backend
+            registry = bot._channel_input_registry
+            if initialized_backend is None or registry is None:
+                raise RuntimeError("channel-input runtime became unavailable")
+            if (
+                isinstance(payload, ChannelInputInvitePayload)
+                and not bot.channel_input_capability_validated
+                and registry.get(payload.session_id, payload.attempt) is None
+            ):
+                raise RuntimeError("channel-input admission is unavailable")
+
+            def settlement_script_for(candidate: ChannelInputCandidate) -> str:
+                mixdepth = (self.inner.mixdepth + 1) % bot.wallet.mixdepth_count
+                outpoint = candidate.funding_outpoint
+                label = (
+                    f"channel-input:{payload.session_id}:{payload.attempt}:"
+                    f"{outpoint.txid}:{outpoint.vout}"
+                )
+                address = bot.wallet.get_new_persisted_internal_address(mixdepth, label)
+                script = address_to_scriptpubkey(address)
+                if len(script) != 34 or script[:2] != b"\x51\x20":
+                    raise ValueError("channel-input settlement address is not P2TR")
+                if scriptpubkey_to_address(script, bot.wallet.network) != address:
+                    raise ValueError("channel-input settlement address is not canonical")
+                return script.hex()
+
+            responses = await registry.handle_payload(
+                payload,
+                coordinator_actor=self.taker_nick,
+                local_actor=bot.nick,
+                local_node_key=initialized_backend.node_info.identity_pubkey,
+                backend=initialized_backend.backend,
+                candidates=initialized_backend.candidates,
+                settlement_script_for=settlement_script_for,
+                current_time=int(time.time()),
+                current_height=bot.current_block_height,
+            )
+            if isinstance(payload, ChannelInputInvitePayload):
+                bot._refresh_channel_input_capability()
+            for response in responses:
+                response_encrypted = self.crypto.encrypt(encode_channel_input_message(response))
+                await self._send_channel_input_response(
+                    bot, response_encrypted, source, direct_connection
+                )
+        except Exception as exc:
+            logger.warning(
+                f"Rejected invalid or out-of-order !channel_input from {self.taker_nick} "
+                f"({type(exc).__name__})"
+            )
+
+    async def _send_channel_input_response(
+        self,
+        bot: MakerBotProtocol,
+        encrypted: str,
+        source: str,
+        direct_connection: TCPConnection | None,
+    ) -> None:
+        """Return a channel-input response only through the request channel."""
+
+        if source == "direct":
+            if direct_connection is None:
+                raise RuntimeError("direct channel-input response channel is unavailable")
+            signed = bot.nick_identity.sign_message(encrypted, ONION_HOSTID)
+            line = format_jm_message(bot.nick, self.taker_nick, "channel_input", signed)
+            await direct_connection.send(
+                json.dumps({"type": MessageType.PRIVMSG.value, "line": line}).encode("utf-8")
+            )
+            return
+        if source.startswith("dir:"):
+            client = bot.directory_clients.get(source[4:])
+            if client is None:
+                raise RuntimeError("directory channel-input response channel is unavailable")
+            await client.send_private_message(self.taker_nick, "channel_input", encrypted)
+            return
+        raise RuntimeError("channel-input request has no authenticated response channel")
 
     async def _send_ring_response(self, bot: MakerBotProtocol, encrypted: str, source: str) -> None:
         """Return a ring response only through the authenticated request channel."""
