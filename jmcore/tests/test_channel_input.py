@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+from typing import Literal, cast
 
 import pytest
 from coincurve import PrivateKey
@@ -23,6 +24,7 @@ from jmcore.channel_input import (
     ChannelInputApprovalSetPayload,
     ChannelInputCancelPayload,
     ChannelInputFinalizedPayload,
+    ChannelInputFinalizePayload,
     ChannelInputHelloPayload,
     ChannelInputInvitePayload,
     ChannelInputKeyPair,
@@ -30,6 +32,7 @@ from jmcore.channel_input import (
     ChannelInputPreparedPayload,
     ChannelInputPreparePayload,
     ChannelInputProposalPayload,
+    ChannelInputSignPayload,
     ChannelInputTranscript,
     ChannelInputValidationError,
     EndpointTerms,
@@ -46,14 +49,18 @@ from jmcore.channel_input import (
     transcript_hash,
     validate_channel_payload_for_transcript,
     validate_complete_approval_set,
+    validate_finalize_for_transcript,
     validate_finalized_for_transcript,
     validate_hello_for_invite,
     validate_hello_pair,
+    validate_partial_for_transcript,
     validate_prepare_payload,
+    validate_prepared_for_transcript,
     validate_proposal,
     validate_proposal_for_hellos,
     validate_recipient_approval,
     validate_revealed_endpoint_pair,
+    validate_sign_for_transcript,
     validate_transcript_against_transaction,
     validate_transcript_for_invite,
     verify_payload,
@@ -84,7 +91,7 @@ def _terms(
     participant: int,
     peer: int,
     *,
-    role: str,
+    role: Literal["first", "second"],
     funding_index: int,
     output_index: int,
     adjustment: int = 0,
@@ -328,6 +335,101 @@ def _resign_prepare(
     prepare: ChannelInputPreparePayload, *, signer: int = 1, aux: int = 21
 ) -> ChannelInputPreparePayload:
     return sign_payload(prepare, _secret(signer), aux_randomness=bytes([aux]) * 32)
+
+
+def _post_approval_payloads() -> tuple[
+    ChannelInputTranscript,
+    ChannelInputPreparedPayload,
+    ChannelInputPreparedPayload,
+    ChannelInputSignPayload,
+    ChannelInputPartialPayload,
+    ChannelInputFinalizePayload,
+]:
+    transcript, _ = _transcript()
+    digest = transcript_hash(transcript).hex()
+    outpoint = transcript.channels[0].funding_outpoint
+    first_nonce = "aa" * 66
+    second_nonce = "bb" * 66
+    first_prepared = cast(
+        ChannelInputPreparedPayload,
+        sign_payload(
+            ChannelInputPreparedPayload(
+                session_id=transcript.session_id,
+                attempt=transcript.attempt,
+                signer_key=_key(1),
+                transcript_hash=digest,
+                funding_outpoint=outpoint,
+                public_nonce=first_nonce,
+            ),
+            _secret(1),
+            aux_randomness=b"\x31" * 32,
+        ),
+    )
+    second_prepared = cast(
+        ChannelInputPreparedPayload,
+        sign_payload(
+            ChannelInputPreparedPayload(
+                session_id=transcript.session_id,
+                attempt=transcript.attempt,
+                signer_key=_key(2),
+                transcript_hash=digest,
+                funding_outpoint=outpoint,
+                public_nonce=second_nonce,
+            ),
+            _secret(2),
+            aux_randomness=b"\x32" * 32,
+        ),
+    )
+    sign = cast(
+        ChannelInputSignPayload,
+        sign_payload(
+            ChannelInputSignPayload(
+                session_id=transcript.session_id,
+                attempt=transcript.attempt,
+                signer_key=transcript.coordinator_key,
+                transcript_hash=digest,
+                funding_outpoint=outpoint,
+                local_public_nonce=first_nonce,
+                peer_prepared=second_prepared,
+            ),
+            _secret(1),
+            aux_randomness=b"\x33" * 32,
+        ),
+    )
+    partial = cast(
+        ChannelInputPartialPayload,
+        sign_payload(
+            ChannelInputPartialPayload(
+                session_id=transcript.session_id,
+                attempt=transcript.attempt,
+                signer_key=_key(2),
+                transcript_hash=digest,
+                funding_outpoint=outpoint,
+                local_public_nonce=second_nonce,
+                peer_public_nonce=first_nonce,
+                partial_signature="cc" * 32,
+            ),
+            _secret(2),
+            aux_randomness=b"\x34" * 32,
+        ),
+    )
+    finalize = cast(
+        ChannelInputFinalizePayload,
+        sign_payload(
+            ChannelInputFinalizePayload(
+                session_id=transcript.session_id,
+                attempt=transcript.attempt,
+                signer_key=transcript.coordinator_key,
+                transcript_hash=digest,
+                funding_outpoint=outpoint,
+                local_public_nonce=first_nonce,
+                peer_partial=partial,
+            ),
+            _secret(1),
+            aux_randomness=b"\x35" * 32,
+        ),
+    )
+    return transcript, first_prepared, second_prepared, sign, partial, finalize
 
 
 def test_full_multi_maker_round_and_observation_barrier() -> None:
@@ -1065,7 +1167,20 @@ def test_channel_messages_cancel_and_finalized_witness_binding() -> None:
             signer_key=_key(1),
             transcript_hash=transcript_digest,
             funding_outpoint=transcript.channels[0].funding_outpoint,
+            local_public_nonce="aa" * 66,
+            peer_public_nonce="bb" * 66,
             partial_signature="bb" * 31,
+        )
+    with pytest.raises(ValidationError, match="66-byte"):
+        ChannelInputPartialPayload(
+            session_id=transcript.session_id,
+            attempt=transcript.attempt,
+            signer_key=_key(1),
+            transcript_hash=transcript_digest,
+            funding_outpoint=transcript.channels[0].funding_outpoint,
+            local_public_nonce="aa" * 65,
+            peer_public_nonce="bb" * 66,
+            partial_signature="bb" * 32,
         )
     with pytest.raises(ValidationError):
         ChannelInputCancelPayload(
@@ -1074,7 +1189,7 @@ def test_channel_messages_cancel_and_finalized_witness_binding() -> None:
             signer_key=_key(1),
             transcript_hash=transcript_digest,
             reason_code="after_sign",
-            partial_released=True,
+            partial_released=True,  # type: ignore[arg-type]
         )
     unsigned = parse_transaction_bytes(bytes.fromhex(transcript.unsigned_parent_tx))
     final_raw = serialize_transaction(
@@ -1122,4 +1237,221 @@ def test_channel_messages_cancel_and_finalized_witness_binding() -> None:
     with pytest.raises(ValidationError, match="scriptSig"):
         ChannelInputFinalizedPayload(
             **{**finalized.model_dump(), "final_tx": script_raw.hex(), "txid": script_txid}
+        )
+
+
+def test_post_approval_validator_chain_and_nested_wire_evidence() -> None:
+    transcript, first_prepared, second_prepared, sign, partial, finalize = _post_approval_payloads()
+    first_nonce = first_prepared.public_nonce
+    second_nonce = second_prepared.public_nonce
+
+    validate_prepared_for_transcript(first_prepared, transcript, _key(1))
+    validate_prepared_for_transcript(second_prepared, transcript, _key(2))
+    validate_sign_for_transcript(
+        sign,
+        transcript,
+        _key(1),
+        expected_local_public_nonce=first_nonce,
+    )
+    validate_partial_for_transcript(
+        partial,
+        transcript,
+        _key(2),
+        expected_local_public_nonce=second_nonce,
+        expected_peer_public_nonce=first_nonce,
+    )
+    validate_finalize_for_transcript(
+        finalize,
+        transcript,
+        _key(1),
+        expected_local_public_nonce=first_nonce,
+        expected_peer_public_nonce=second_nonce,
+    )
+    assert decode_channel_input_message(encode_channel_input_message(finalize)) == finalize
+
+    tampered_partial = partial.model_copy(update={"sig": "00" * 64})
+    tampered_finalize = sign_payload(
+        finalize.model_copy(update={"peer_partial": tampered_partial}),
+        _secret(1),
+        aux_randomness=b"\x36" * 32,
+    )
+    with pytest.raises(ChannelInputValidationError, match="channel payload BIP340"):
+        validate_finalize_for_transcript(
+            cast(ChannelInputFinalizePayload, tampered_finalize),
+            transcript,
+            _key(1),
+            expected_local_public_nonce=first_nonce,
+            expected_peer_public_nonce=second_nonce,
+        )
+
+
+def test_sign_binds_current_nonce_and_signed_peer_prepared_evidence() -> None:
+    transcript, _, second_prepared, sign, _, _ = _post_approval_payloads()
+    first_nonce = sign.local_public_nonce
+
+    with pytest.raises(ChannelInputValidationError, match="recipient current nonce"):
+        validate_sign_for_transcript(
+            sign,
+            transcript,
+            _key(1),
+            expected_local_public_nonce="cc" * 66,
+        )
+    malformed_prepared = second_prepared.model_copy(update={"attempt": sign.attempt + 1})
+    with pytest.raises(ValidationError, match="peer prepared does not match"):
+        ChannelInputSignPayload(**{**sign.model_dump(), "peer_prepared": malformed_prepared})
+    wrong_peer = sign_payload(
+        second_prepared.model_copy(update={"signer_key": _key(3)}),
+        _secret(3),
+        aux_randomness=b"\x37" * 32,
+    )
+    wrong_peer_sign = sign_payload(
+        sign.model_copy(update={"peer_prepared": wrong_peer}),
+        _secret(1),
+        aux_randomness=b"\x38" * 32,
+    )
+    with pytest.raises(ChannelInputValidationError, match="prepared signer"):
+        validate_sign_for_transcript(
+            cast(ChannelInputSignPayload, wrong_peer_sign),
+            transcript,
+            _key(1),
+            expected_local_public_nonce=first_nonce,
+        )
+    invalid_peer_sign = sign_payload(
+        sign.model_copy(
+            update={"peer_prepared": second_prepared.model_copy(update={"sig": "00" * 64})}
+        ),
+        _secret(1),
+        aux_randomness=b"\x39" * 32,
+    )
+    with pytest.raises(ChannelInputValidationError, match="channel payload BIP340"):
+        validate_sign_for_transcript(
+            cast(ChannelInputSignPayload, invalid_peer_sign),
+            transcript,
+            _key(1),
+            expected_local_public_nonce=first_nonce,
+        )
+    with pytest.raises(ValidationError, match="nonces must differ"):
+        ChannelInputSignPayload(
+            **{
+                **sign.model_dump(),
+                "peer_prepared": second_prepared.model_copy(update={"public_nonce": first_nonce}),
+            }
+        )
+    non_coordinator = sign_payload(
+        sign.model_copy(update={"signer_key": _key(3)}),
+        _secret(3),
+        aux_randomness=b"\x3a" * 32,
+    )
+    with pytest.raises(ChannelInputValidationError, match="sign signer"):
+        validate_sign_for_transcript(
+            cast(ChannelInputSignPayload, non_coordinator),
+            transcript,
+            _key(1),
+            expected_local_public_nonce=first_nonce,
+        )
+
+
+def test_partial_and_finalize_validate_ordered_authenticated_nonce_evidence() -> None:
+    transcript, _, second_prepared, _, partial, finalize = _post_approval_payloads()
+    first_nonce = finalize.local_public_nonce
+    second_nonce = second_prepared.public_nonce
+
+    wrong_signer = sign_payload(
+        partial.model_copy(update={"signer_key": _key(3)}),
+        _secret(3),
+        aux_randomness=b"\x3b" * 32,
+    )
+    with pytest.raises(ChannelInputValidationError, match="partial signer"):
+        validate_partial_for_transcript(
+            cast(ChannelInputPartialPayload, wrong_signer),
+            transcript,
+            _key(2),
+            expected_local_public_nonce=second_nonce,
+            expected_peer_public_nonce=first_nonce,
+        )
+    wrong_local_nonce = sign_payload(
+        partial.model_copy(update={"local_public_nonce": "cc" * 66}),
+        _secret(2),
+        aux_randomness=b"\x3c" * 32,
+    )
+    with pytest.raises(ChannelInputValidationError, match="partial local nonce"):
+        validate_partial_for_transcript(
+            cast(ChannelInputPartialPayload, wrong_local_nonce),
+            transcript,
+            _key(2),
+            expected_local_public_nonce=second_nonce,
+            expected_peer_public_nonce=first_nonce,
+        )
+    wrong_peer_nonce = sign_payload(
+        partial.model_copy(update={"peer_public_nonce": "cc" * 66}),
+        _secret(2),
+        aux_randomness=b"\x3d" * 32,
+    )
+    with pytest.raises(ChannelInputValidationError, match="partial peer nonce"):
+        validate_partial_for_transcript(
+            cast(ChannelInputPartialPayload, wrong_peer_nonce),
+            transcript,
+            _key(2),
+            expected_local_public_nonce=second_nonce,
+            expected_peer_public_nonce=first_nonce,
+        )
+    with pytest.raises(ChannelInputValidationError, match="recipient current nonce"):
+        validate_finalize_for_transcript(
+            finalize,
+            transcript,
+            _key(1),
+            expected_local_public_nonce="cc" * 66,
+            expected_peer_public_nonce=second_nonce,
+        )
+    wrong_peer_partial = sign_payload(
+        partial.model_copy(update={"signer_key": _key(3)}),
+        _secret(3),
+        aux_randomness=b"\x3e" * 32,
+    )
+    wrong_peer_finalize = sign_payload(
+        finalize.model_copy(update={"peer_partial": wrong_peer_partial}),
+        _secret(1),
+        aux_randomness=b"\x3f" * 32,
+    )
+    with pytest.raises(ChannelInputValidationError, match="partial signer"):
+        validate_finalize_for_transcript(
+            cast(ChannelInputFinalizePayload, wrong_peer_finalize),
+            transcript,
+            _key(1),
+            expected_local_public_nonce=first_nonce,
+            expected_peer_public_nonce=second_nonce,
+        )
+    invalid_peer_finalize = sign_payload(
+        finalize.model_copy(update={"peer_partial": partial.model_copy(update={"sig": "00" * 64})}),
+        _secret(1),
+        aux_randomness=b"\x40" * 32,
+    )
+    with pytest.raises(ChannelInputValidationError, match="channel payload BIP340"):
+        validate_finalize_for_transcript(
+            cast(ChannelInputFinalizePayload, invalid_peer_finalize),
+            transcript,
+            _key(1),
+            expected_local_public_nonce=first_nonce,
+            expected_peer_public_nonce=second_nonce,
+        )
+    reversed_partial = partial.model_copy(
+        update={"local_public_nonce": first_nonce, "peer_public_nonce": second_nonce}
+    )
+    with pytest.raises(ValidationError, match="orientation"):
+        ChannelInputFinalizePayload(**{**finalize.model_dump(), "peer_partial": reversed_partial})
+    mismatched_partial = partial.model_copy(update={"peer_public_nonce": "cc" * 66})
+    with pytest.raises(ValidationError, match="orientation"):
+        ChannelInputFinalizePayload(**{**finalize.model_dump(), "peer_partial": mismatched_partial})
+    non_coordinator = sign_payload(
+        finalize.model_copy(update={"signer_key": _key(3)}),
+        _secret(3),
+        aux_randomness=b"\x41" * 32,
+    )
+    with pytest.raises(ChannelInputValidationError, match="finalize signer"):
+        validate_finalize_for_transcript(
+            cast(ChannelInputFinalizePayload, non_coordinator),
+            transcript,
+            _key(1),
+            expected_local_public_nonce=first_nonce,
+            expected_peer_public_nonce=second_nonce,
         )

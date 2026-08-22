@@ -15,7 +15,7 @@ import json
 import secrets
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, ClassVar, Literal, TypeAlias, cast
+from typing import Any, ClassVar, Literal, TypeAlias, TypeVar, cast
 
 from coincurve import PrivateKey, PublicKey, PublicKeyXOnly
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -564,33 +564,59 @@ class ChannelInputPreparedPayload(ChannelInputChannelPayload):
 class ChannelInputSignPayload(ChannelInputChannelPayload):
     message_type: ClassVar[str] = "channel_input_sign"
     type: Literal["channel_input_sign"] = "channel_input_sign"
-    peer_public_nonce: str
+    local_public_nonce: str
+    peer_prepared: ChannelInputPreparedPayload
 
     @model_validator(mode="after")
     def validate_nonce(self) -> ChannelInputSignPayload:
-        _validate_hex(self.peer_public_nonce, 66, "peer_public_nonce")
+        _validate_hex(self.local_public_nonce, 66, "local_public_nonce")
+        if (
+            self.peer_prepared.session_id != self.session_id
+            or self.peer_prepared.attempt != self.attempt
+            or self.peer_prepared.transcript_hash != self.transcript_hash
+            or self.peer_prepared.funding_outpoint != self.funding_outpoint
+        ):
+            raise ValueError("peer prepared does not match sign channel binding")
+        if self.local_public_nonce == self.peer_prepared.public_nonce:
+            raise ValueError("local and peer public nonces must differ")
         return self
 
 
 class ChannelInputPartialPayload(ChannelInputChannelPayload):
     message_type: ClassVar[str] = "channel_input_partial"
     type: Literal["channel_input_partial"] = "channel_input_partial"
+    local_public_nonce: str
+    peer_public_nonce: str
     partial_signature: Hex32
 
     @model_validator(mode="after")
     def validate_partial(self) -> ChannelInputPartialPayload:
+        _validate_hex(self.local_public_nonce, 66, "local_public_nonce")
+        _validate_hex(self.peer_public_nonce, 66, "peer_public_nonce")
         _validate_hex(self.partial_signature, 32, "partial_signature")
+        if self.local_public_nonce == self.peer_public_nonce:
+            raise ValueError("local and peer public nonces must differ")
         return self
 
 
 class ChannelInputFinalizePayload(ChannelInputChannelPayload):
     message_type: ClassVar[str] = "channel_input_finalize"
     type: Literal["channel_input_finalize"] = "channel_input_finalize"
-    peer_partial_signature: Hex32
+    local_public_nonce: str
+    peer_partial: ChannelInputPartialPayload
 
     @model_validator(mode="after")
     def validate_partial(self) -> ChannelInputFinalizePayload:
-        _validate_hex(self.peer_partial_signature, 32, "peer_partial_signature")
+        _validate_hex(self.local_public_nonce, 66, "local_public_nonce")
+        if (
+            self.peer_partial.session_id != self.session_id
+            or self.peer_partial.attempt != self.attempt
+            or self.peer_partial.transcript_hash != self.transcript_hash
+            or self.peer_partial.funding_outpoint != self.funding_outpoint
+        ):
+            raise ValueError("peer partial does not match finalize channel binding")
+        if self.local_public_nonce != self.peer_partial.peer_public_nonce:
+            raise ValueError("finalize local nonce does not match peer partial orientation")
         return self
 
 
@@ -671,6 +697,8 @@ ChannelInputPayloadType: TypeAlias = (
     | ChannelInputFinalizedPayload
     | ChannelInputCancelPayload
 )
+
+ChannelInputPayloadT = TypeVar("ChannelInputPayloadT", bound=ChannelInputPayloadType)
 
 _PAYLOAD_TYPES: dict[str, type[ChannelInputPayload]] = {
     payload_type.message_type: payload_type
@@ -1133,6 +1161,125 @@ def validate_channel_payload_for_transcript(
         validate_finalized_for_transcript(payload, transcript)
 
 
+def _descriptor_for_outpoint(
+    transcript: ChannelInputTranscript, funding_outpoint: Outpoint
+) -> ChannelDescriptor:
+    descriptors = [
+        descriptor
+        for descriptor in transcript.channels
+        if descriptor.funding_outpoint == funding_outpoint
+    ]
+    if len(descriptors) != 1:
+        raise ChannelInputValidationError(
+            "channel payload funding outpoint must identify exactly one descriptor"
+        )
+    return descriptors[0]
+
+
+def _opposite_endpoint_key(descriptor: ChannelDescriptor, participant_key: str) -> str:
+    if participant_key == descriptor.first_participant_key:
+        return descriptor.second_participant_key
+    if participant_key == descriptor.second_participant_key:
+        return descriptor.first_participant_key
+    raise ChannelInputValidationError("channel participant is not an endpoint in the descriptor")
+
+
+def _validate_expected_public_nonce(value: str, field_name: str) -> None:
+    try:
+        _validate_hex(value, 66, field_name)
+    except ValueError as exc:
+        raise ChannelInputValidationError(str(exc)) from exc
+
+
+def validate_prepared_for_transcript(
+    payload: ChannelInputPreparedPayload,
+    transcript: ChannelInputTranscript,
+    participant_key: str,
+) -> None:
+    """Verify a prepared nonce came from one descriptor endpoint."""
+
+    validate_channel_payload_for_transcript(payload, transcript)
+    descriptor = _descriptor_for_outpoint(transcript, payload.funding_outpoint)
+    if payload.signer_key != participant_key:
+        raise ChannelInputValidationError("prepared signer does not match channel participant")
+    _opposite_endpoint_key(descriptor, participant_key)
+
+
+def validate_sign_for_transcript(
+    payload: ChannelInputSignPayload,
+    transcript: ChannelInputTranscript,
+    recipient_key: str,
+    *,
+    expected_local_public_nonce: str,
+) -> None:
+    """Verify a coordinator sign authorization binds current endpoint nonce evidence."""
+
+    validate_channel_payload_for_transcript(payload, transcript)
+    descriptor = _descriptor_for_outpoint(transcript, payload.funding_outpoint)
+    if payload.signer_key != transcript.coordinator_key:
+        raise ChannelInputValidationError("sign signer does not match transcript coordinator")
+    peer_key = _opposite_endpoint_key(descriptor, recipient_key)
+    _validate_expected_public_nonce(expected_local_public_nonce, "expected_local_public_nonce")
+    if payload.local_public_nonce != expected_local_public_nonce:
+        raise ChannelInputValidationError("sign local nonce does not match recipient current nonce")
+    validate_prepared_for_transcript(payload.peer_prepared, transcript, peer_key)
+    if payload.local_public_nonce == payload.peer_prepared.public_nonce:
+        raise ChannelInputValidationError("sign local and peer public nonces must differ")
+
+
+def validate_partial_for_transcript(
+    payload: ChannelInputPartialPayload,
+    transcript: ChannelInputTranscript,
+    participant_key: str,
+    *,
+    expected_local_public_nonce: str,
+    expected_peer_public_nonce: str,
+) -> None:
+    """Verify a participant partial signature binds the exact ordered nonce pair."""
+
+    validate_channel_payload_for_transcript(payload, transcript)
+    descriptor = _descriptor_for_outpoint(transcript, payload.funding_outpoint)
+    if payload.signer_key != participant_key:
+        raise ChannelInputValidationError("partial signer does not match channel participant")
+    _opposite_endpoint_key(descriptor, participant_key)
+    _validate_expected_public_nonce(expected_local_public_nonce, "expected_local_public_nonce")
+    _validate_expected_public_nonce(expected_peer_public_nonce, "expected_peer_public_nonce")
+    if payload.local_public_nonce != expected_local_public_nonce:
+        raise ChannelInputValidationError("partial local nonce does not match expected nonce")
+    if payload.peer_public_nonce != expected_peer_public_nonce:
+        raise ChannelInputValidationError("partial peer nonce does not match expected nonce")
+
+
+def validate_finalize_for_transcript(
+    payload: ChannelInputFinalizePayload,
+    transcript: ChannelInputTranscript,
+    recipient_key: str,
+    *,
+    expected_local_public_nonce: str,
+    expected_peer_public_nonce: str,
+) -> None:
+    """Verify a coordinator finalize authorization retains peer partial evidence."""
+
+    validate_channel_payload_for_transcript(payload, transcript)
+    descriptor = _descriptor_for_outpoint(transcript, payload.funding_outpoint)
+    if payload.signer_key != transcript.coordinator_key:
+        raise ChannelInputValidationError("finalize signer does not match transcript coordinator")
+    peer_key = _opposite_endpoint_key(descriptor, recipient_key)
+    _validate_expected_public_nonce(expected_local_public_nonce, "expected_local_public_nonce")
+    _validate_expected_public_nonce(expected_peer_public_nonce, "expected_peer_public_nonce")
+    if payload.local_public_nonce != expected_local_public_nonce:
+        raise ChannelInputValidationError(
+            "finalize local nonce does not match recipient current nonce"
+        )
+    validate_partial_for_transcript(
+        payload.peer_partial,
+        transcript,
+        peer_key,
+        expected_local_public_nonce=expected_peer_public_nonce,
+        expected_peer_public_nonce=expected_local_public_nonce,
+    )
+
+
 def validate_finalized_for_transcript(
     payload: ChannelInputFinalizedPayload, transcript: ChannelInputTranscript
 ) -> None:
@@ -1286,15 +1433,15 @@ def verify_hash(public_key: str, message_hash: bytes, signature: str) -> bool:
 
 
 def sign_payload(
-    payload: ChannelInputPayloadType, secret_key: bytes, *, aux_randomness: bytes | None = None
-) -> ChannelInputPayloadType:
+    payload: ChannelInputPayloadT, secret_key: bytes, *, aux_randomness: bytes | None = None
+) -> ChannelInputPayloadT:
     """Return a copy of the payload signed by its declared fresh participant key."""
 
     key_pair = ChannelInputKeyPair.from_secret(secret_key)
     if payload.signer_key != key_pair.public_key:
         raise ChannelInputValidationError("payload signer_key does not match secret key")
     return cast(
-        ChannelInputPayloadType,
+        ChannelInputPayloadT,
         payload.model_copy(
             update={
                 "sig": sign_hash(secret_key, payload_hash(payload), aux_randomness=aux_randomness)
