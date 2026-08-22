@@ -91,3 +91,58 @@ async def test_channel_input_capability_enables_only_after_backend_validation(
     )
     await taker.stop(close_wallet=False)
     initialized_backend.backend.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_channel_input_reconciles_before_capability_advertisement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wallet = AsyncMock()
+    wallet.address_type = "p2tr"
+    wallet.mixdepth_count = 5
+    backend = AsyncMock()
+    backend.can_provide_neutrino_metadata = Mock(return_value=True)
+    config = make_taker_config(
+        data_dir=str(tmp_path),
+        address_type="p2tr",
+        preferred_offer_type=OfferType.TR0_RELATIVE,
+        channel_input=_channel_input_config(tmp_path),
+    )
+    events: list[str] = []
+    registry = SimpleNamespace(
+        recovery_outpoints=(),
+        reconcile_all=AsyncMock(side_effect=RuntimeError("recovery conflict")),
+    )
+    monkeypatch.setattr(
+        "taker.channel_input_runtime.TakerChannelInputRegistry.load", lambda **_kwargs: registry
+    )
+    taker = Taker(wallet, backend, config)
+    initialized_backend = SimpleNamespace(
+        backend=SimpleNamespace(close=AsyncMock()),
+        node_info=SimpleNamespace(identity_pubkey="02" + "22" * 32),
+        candidates=(),
+    )
+    monkeypatch.setattr(
+        "jmswap.channel_input.initialize_channel_input_backend",
+        AsyncMock(return_value=initialized_backend),
+    )
+    original_enable = taker.directory_client.enable_channel_input_v1
+
+    def enable() -> None:
+        events.append("enable")
+        original_enable()
+
+    taker.directory_client.enable_channel_input_v1 = enable
+
+    with pytest.raises(RuntimeError, match="recovery conflict"):
+        await taker.connect()
+    registry.reconcile_all.assert_awaited_once_with(
+        initialized_backend.backend, initialized_backend.node_info.identity_pubkey
+    )
+    assert events == []
+    assert taker.directory_client.channel_input_v1 is False
+    assert taker._channel_input_backend is None
+    initialized_backend.backend.close.assert_awaited_once()
+    await taker.stop(close_wallet=False)
+    initialized_backend.backend.close.assert_awaited_once()

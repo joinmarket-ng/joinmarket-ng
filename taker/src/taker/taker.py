@@ -75,6 +75,7 @@ from taker.podle_manager import PoDLEManager
 if TYPE_CHECKING:
     from jmswap.channel_input import InitializedChannelInputBackend
 
+    from taker.channel_input_runtime import TakerChannelInputRegistry
     from taker.channel_input_store import TakerChannelInputStore
 
 # Backward-compatible re-exports: many tests and modules import these from taker.taker
@@ -217,7 +218,9 @@ class Taker(TakerMonitoringMixin):
 
         self._channel_input_backend: InitializedChannelInputBackend | None = None
         self._channel_input_store: TakerChannelInputStore | None = None
+        self._channel_input_registry: TakerChannelInputRegistry | None = None
         if config.channel_input.enabled:
+            from taker.channel_input_runtime import TakerChannelInputRegistry
             from taker.channel_input_store import TakerChannelInputStore
 
             data_directory = Path(config.data_dir or get_default_data_dir())
@@ -230,6 +233,14 @@ class Taker(TakerMonitoringMixin):
         else:
             self.nick_identity = NickIdentity(JM_VERSION)
         self.nick = self.nick_identity.nick
+        if config.channel_input.enabled:
+            assert self._channel_input_store is not None
+            self._channel_input_registry = TakerChannelInputRegistry.load(
+                store=self._channel_input_store,
+                config=config.channel_input,
+                network=config.network.value,
+                local_actor=self.nick,
+            )
         self.state = TakerState.IDLE
         # Source mixdepth of the most recent ``do_coinjoin`` call. With
         # interactive selection this is derived from the selected UTXOs, so
@@ -467,43 +478,27 @@ class Taker(TakerMonitoringMixin):
                 )
 
         if self.config.channel_input.enabled:
-            if self._channel_input_store is None:
-                raise RuntimeError("Channel-input durable store was not initialized")
-            from taker.channel_input_negotiation import TakerChannelInputStage
-
-            channel_report = self._channel_input_store.load_all()
-            if channel_report.corruptions:
-                raise RuntimeError("Channel-input durable store contains corrupt records")
-            active_records = tuple(
-                record
-                for record in channel_report.records
-                if record.stage is not TakerChannelInputStage.CANCELED
-            )
-            if any(record.local_actor != self.nick for record in active_records):
-                raise RuntimeError("Channel-input recovery state belongs to another taker identity")
+            if self._channel_input_registry is None:
+                raise RuntimeError("Channel-input durable registry was not initialized")
 
             from jmswap.channel_input import initialize_channel_input_backend
-            from jmswap.lnd import EscrowOutpoint
 
-            recovery_outpoints = tuple(
-                sorted(
-                    {
-                        EscrowOutpoint(
-                            txid=hello.funding_outpoint.txid,
-                            vout=hello.funding_outpoint.vout,
-                        )
-                        for record in active_records
-                        for _, hello in record.local_hellos
-                    },
-                    key=lambda outpoint: (outpoint.txid, outpoint.vout),
-                )
-            )
             self._channel_input_backend = await initialize_channel_input_backend(
                 self.config.channel_input,
                 network=self.config.network.value,
                 offer_type=self.config.preferred_offer_type.value,
-                recovery_outpoints=recovery_outpoints,
+                recovery_outpoints=self._channel_input_registry.recovery_outpoints,
             )
+            try:
+                await self._channel_input_registry.reconcile_all(
+                    self._channel_input_backend.backend,
+                    self._channel_input_backend.node_info.identity_pubkey,
+                )
+            except BaseException:
+                channel_input_backend = self._channel_input_backend
+                self._channel_input_backend = None
+                await channel_input_backend.backend.close()
+                raise
             self.directory_client.enable_channel_input_v1()
 
         # Connect to directory servers
