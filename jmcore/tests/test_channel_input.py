@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import itertools
 import json
 from typing import Literal, cast
 
@@ -33,7 +34,12 @@ from jmcore.channel_input import (
     ChannelInputPreparedPayload,
     ChannelInputPreparePayload,
     ChannelInputProposalPayload,
+    ChannelInputRecoveryAcceptPayload,
+    ChannelInputRecoveryConfirmPayload,
+    ChannelInputRecoveryInitPayload,
     ChannelInputSignPayload,
+    ChannelInputStatusPayload,
+    ChannelInputStatusRequestPayload,
     ChannelInputTranscript,
     ChannelInputValidationError,
     EndpointTerms,
@@ -66,6 +72,8 @@ from jmcore.channel_input import (
     validate_recipient_approval,
     validate_revealed_endpoint_pair,
     validate_sign_for_transcript,
+    validate_status_for_transcript,
+    validate_status_request_for_transcript,
     validate_transcript_against_transaction,
     validate_transcript_for_invite,
     verify_payload,
@@ -470,6 +478,85 @@ def _post_approval_payloads() -> tuple[
         ),
     )
     return transcript, first_prepared, second_prepared, sign, partial, finalize
+
+
+def _signed_status_request(
+    transcript: ChannelInputTranscript,
+    *,
+    query_id: str = "dd" * 32,
+    outpoint: Outpoint | None = None,
+) -> ChannelInputStatusRequestPayload:
+    return sign_payload(
+        ChannelInputStatusRequestPayload(
+            session_id=transcript.session_id,
+            attempt=transcript.attempt,
+            signer_key=transcript.coordinator_key,
+            transcript_hash=transcript_hash(transcript).hex(),
+            funding_outpoint=outpoint or transcript.channels[0].funding_outpoint,
+            query_id=query_id,
+        ),
+        _secret(1),
+        aux_randomness=b"\x60" * 32,
+    )
+
+
+def _status_evidence() -> tuple[
+    ChannelInputTranscript,
+    ChannelInputPreparedPayload,
+    ChannelInputPartialPayload,
+    ChannelInputFinalizedPayload,
+]:
+    transcript, _, prepared, _, partial, _ = _post_approval_payloads()
+    unsigned = parse_transaction_bytes(bytes.fromhex(transcript.unsigned_parent_tx))
+    finalized = sign_payload(
+        ChannelInputFinalizedPayload(
+            session_id=transcript.session_id,
+            attempt=transcript.attempt,
+            signer_key=_key(2),
+            transcript_hash=transcript_hash(transcript).hex(),
+            funding_outpoint=transcript.channels[0].funding_outpoint,
+            channel_signed_parent_tx=serialize_transaction(
+                unsigned.version,
+                unsigned.inputs,
+                unsigned.outputs,
+                unsigned.locktime,
+                [[b"\x01" * 64], []],
+            ).hex(),
+            txid=hash256(bytes.fromhex(transcript.unsigned_parent_tx))[::-1].hex(),
+        ),
+        _secret(2),
+        aux_randomness=b"\x61" * 32,
+    )
+    return transcript, prepared, partial, finalized
+
+
+def _signed_status(
+    request: ChannelInputStatusRequestPayload,
+    *,
+    escrow_stage: Literal["parent_prepared", "parent_signed", "finalized"],
+    attempt_active: bool | None = None,
+) -> ChannelInputStatusPayload:
+    transcript, prepared, partial, finalized = _status_evidence()
+    if attempt_active is None:
+        attempt_active = escrow_stage != "finalized"
+    return sign_payload(
+        ChannelInputStatusPayload(
+            session_id=request.session_id,
+            attempt=request.attempt,
+            signer_key=_key(2),
+            transcript_hash=request.transcript_hash,
+            funding_outpoint=request.funding_outpoint,
+            query_id=request.query_id,
+            status_request_hash=payload_hash(request).hex(),
+            escrow_stage=escrow_stage,
+            attempt_active=attempt_active,
+            prepared=prepared,
+            partial=partial if escrow_stage != "parent_prepared" else None,
+            finalized=finalized if escrow_stage == "finalized" else None,
+        ),
+        _secret(2),
+        aux_randomness=b"\x62" * 32,
+    )
 
 
 def test_full_multi_maker_round_and_observation_barrier() -> None:
@@ -1182,6 +1269,58 @@ def test_codec_rejects_malformed_noncanonical_and_bounded_data() -> None:
         decode_channel_input_message(f"!channel_input channel_input_invite {oversized}")
 
 
+def test_recovery_handshake_payloads_bind_keys_and_round_trip() -> None:
+    init = sign_payload(
+        ChannelInputRecoveryInitPayload(
+            session_id="11" * 32,
+            attempt=3,
+            signer_key=_key(1),
+            recovery_id="22" * 32,
+            ephemeral_pubkey="33" * 32,
+            expires_at=2_000,
+        ),
+        _secret(1),
+        aux_randomness=b"\x31" * 32,
+    )
+    accept = sign_payload(
+        ChannelInputRecoveryAcceptPayload(
+            session_id=init.session_id,
+            attempt=init.attempt,
+            signer_key=_key(2),
+            recovery_id=init.recovery_id,
+            init_hash=payload_hash(init).hex(),
+            ephemeral_pubkey="44" * 32,
+        ),
+        _secret(2),
+        aux_randomness=b"\x32" * 32,
+    )
+    confirm = sign_payload(
+        ChannelInputRecoveryConfirmPayload(
+            session_id=init.session_id,
+            attempt=init.attempt,
+            signer_key=_key(1),
+            recovery_id=init.recovery_id,
+            accept_hash=payload_hash(accept).hex(),
+        ),
+        _secret(1),
+        aux_randomness=b"\x33" * 32,
+    )
+
+    for payload in (init, accept, confirm):
+        assert verify_payload(payload)
+        assert decode_channel_input_message(encode_channel_input_message(payload)) == payload
+
+    with pytest.raises(ValidationError, match="must not be zero"):
+        ChannelInputRecoveryInitPayload(
+            session_id=init.session_id,
+            attempt=init.attempt,
+            signer_key=init.signer_key,
+            recovery_id=init.recovery_id,
+            ephemeral_pubkey="00" * 32,
+            expires_at=init.expires_at,
+        )
+
+
 def test_cancel_ack_round_trips_and_binds_exact_signed_cancel() -> None:
     transcript, _ = _transcript()
     cancel = _signed_cancel(transcript)
@@ -1739,3 +1878,205 @@ def test_partial_and_finalize_validate_ordered_authenticated_nonce_evidence() ->
             expected_local_public_nonce=first_nonce,
             expected_peer_public_nonce=second_nonce,
         )
+
+
+@pytest.mark.parametrize(
+    ("escrow_stage", "attempt_active"),
+    [
+        ("parent_prepared", True),
+        ("parent_signed", True),
+        ("parent_signed", False),
+        ("finalized", False),
+    ],
+)
+def test_status_request_and_response_round_trip_all_valid_stages(
+    escrow_stage: Literal["parent_prepared", "parent_signed", "finalized"], attempt_active: bool
+) -> None:
+    transcript, _ = _transcript()
+    request = _signed_status_request(transcript)
+    status = _signed_status(request, escrow_stage=escrow_stage, attempt_active=attempt_active)
+
+    validate_status_request_for_transcript(request, transcript, _key(1))
+    validate_status_for_transcript(status, request, transcript, _key(2))
+    assert decode_channel_input_message(encode_channel_input_message(request)) == request
+    assert decode_channel_input_message(encode_channel_input_message(status)) == status
+
+
+def test_status_model_rejects_every_forbidden_evidence_combination() -> None:
+    transcript, prepared, partial, finalized = _status_evidence()
+    request = _signed_status_request(transcript)
+    valid_combinations = {
+        ("parent_prepared", True, False, False),
+        ("parent_signed", True, True, False),
+        ("parent_signed", False, True, False),
+        ("finalized", False, True, True),
+    }
+    for escrow_stage, attempt_active, include_partial, include_finalized in itertools.product(
+        ("parent_prepared", "parent_signed", "finalized"),
+        (False, True),
+        (False, True),
+        (False, True),
+    ):
+        values = {
+            "session_id": transcript.session_id,
+            "attempt": transcript.attempt,
+            "signer_key": _key(2),
+            "transcript_hash": transcript_hash(transcript).hex(),
+            "funding_outpoint": transcript.channels[0].funding_outpoint,
+            "query_id": request.query_id,
+            "status_request_hash": payload_hash(request).hex(),
+            "escrow_stage": escrow_stage,
+            "attempt_active": attempt_active,
+            "prepared": prepared,
+            "partial": partial if include_partial else None,
+            "finalized": finalized if include_finalized else None,
+        }
+        combination = (escrow_stage, attempt_active, include_partial, include_finalized)
+        if combination in valid_combinations:
+            ChannelInputStatusPayload(**values)
+        else:
+            with pytest.raises(ValidationError, match="status requires"):
+                ChannelInputStatusPayload(**values)
+
+
+def test_status_model_binds_nested_evidence_to_response_channel_and_signer() -> None:
+    transcript, prepared, partial, finalized = _status_evidence()
+    request = _signed_status_request(transcript)
+    base = {
+        "session_id": transcript.session_id,
+        "attempt": transcript.attempt,
+        "signer_key": _key(2),
+        "transcript_hash": transcript_hash(transcript).hex(),
+        "funding_outpoint": transcript.channels[0].funding_outpoint,
+        "query_id": request.query_id,
+        "status_request_hash": payload_hash(request).hex(),
+        "escrow_stage": "finalized",
+        "attempt_active": False,
+        "prepared": prepared,
+        "partial": partial,
+        "finalized": finalized,
+    }
+    replacements = (
+        {"prepared": prepared.model_copy(update={"session_id": "22" * 32})},
+        {"partial": partial.model_copy(update={"attempt": partial.attempt + 1})},
+        {"finalized": finalized.model_copy(update={"transcript_hash": "00" * 32})},
+        {
+            "prepared": prepared.model_copy(
+                update={"funding_outpoint": transcript.channels[1].funding_outpoint}
+            )
+        },
+        {"partial": partial.model_copy(update={"signer_key": _key(1)})},
+    )
+    for replacement in replacements:
+        with pytest.raises(ValidationError, match="status evidence"):
+            ChannelInputStatusPayload(**{**base, **replacement})
+
+
+def test_status_validators_reject_invalid_signatures_signers_and_request_binding() -> None:
+    transcript, _ = _transcript()
+    request = _signed_status_request(transcript)
+    status = _signed_status(request, escrow_stage="finalized")
+
+    with pytest.raises(ChannelInputValidationError, match="channel payload BIP340"):
+        validate_status_request_for_transcript(
+            request.model_copy(update={"sig": "00" * 64}), transcript, _key(1)
+        )
+    wrong_coordinator = sign_payload(
+        request.model_copy(update={"signer_key": _key(2)}),
+        _secret(2),
+        aux_randomness=b"\x63" * 32,
+    )
+    with pytest.raises(ChannelInputValidationError, match="status request signer"):
+        validate_status_request_for_transcript(wrong_coordinator, transcript, _key(1))
+    with pytest.raises(ChannelInputValidationError, match="expected coordinator"):
+        validate_status_request_for_transcript(request, transcript, _key(2))
+    with pytest.raises(ChannelInputValidationError, match="channel payload BIP340"):
+        validate_status_for_transcript(
+            status.model_copy(update={"sig": "00" * 64}), request, transcript, _key(2)
+        )
+
+    wrong_maker = sign_payload(
+        status.model_copy(update={"signer_key": _key(1)}),
+        _secret(1),
+        aux_randomness=b"\x64" * 32,
+    )
+    with pytest.raises(ChannelInputValidationError, match="status signer"):
+        validate_status_for_transcript(wrong_maker, request, transcript, _key(2))
+
+    for evidence_name in ("prepared", "partial", "finalized"):
+        evidence = getattr(status, evidence_name)
+        assert evidence is not None
+        invalid_evidence = evidence.model_copy(update={"sig": "00" * 64})
+        invalid_status = sign_payload(
+            status.model_copy(update={evidence_name: invalid_evidence}),
+            _secret(2),
+            aux_randomness=b"\x65" * 32,
+        )
+        with pytest.raises(ChannelInputValidationError, match="channel payload BIP340"):
+            validate_status_for_transcript(invalid_status, request, transcript, _key(2))
+
+    wrong_query = sign_payload(
+        status.model_copy(update={"query_id": "ee" * 32}),
+        _secret(2),
+        aux_randomness=b"\x66" * 32,
+    )
+    with pytest.raises(ChannelInputValidationError, match="query_id"):
+        validate_status_for_transcript(wrong_query, request, transcript, _key(2))
+    wrong_request_hash = sign_payload(
+        status.model_copy(update={"status_request_hash": "00" * 32}),
+        _secret(2),
+        aux_randomness=b"\x67" * 32,
+    )
+    with pytest.raises(ChannelInputValidationError, match="exact signed status request"):
+        validate_status_for_transcript(wrong_request_hash, request, transcript, _key(2))
+
+
+def test_status_validators_reject_transcript_channel_and_request_replay_substitutions() -> None:
+    transcript, _ = _transcript()
+    request = _signed_status_request(transcript)
+    status = _signed_status(request, escrow_stage="parent_signed")
+
+    for field, value in (
+        ("session_id", "22" * 32),
+        ("attempt", status.attempt + 1),
+        ("transcript_hash", "00" * 32),
+    ):
+        substituted = sign_payload(
+            status.model_copy(update={field: value}), _secret(2), aux_randomness=b"\x68" * 32
+        )
+        with pytest.raises(ChannelInputValidationError, match="session or attempt|transcript hash"):
+            validate_status_for_transcript(substituted, request, transcript, _key(2))
+
+    cross_channel_request = _signed_status_request(
+        transcript,
+        query_id=request.query_id,
+        outpoint=transcript.channels[1].funding_outpoint,
+    )
+    cross_channel_status = sign_payload(
+        status.model_copy(
+            update={
+                "query_id": cross_channel_request.query_id,
+                "status_request_hash": payload_hash(cross_channel_request).hex(),
+            }
+        ),
+        _secret(2),
+        aux_randomness=b"\x69" * 32,
+    )
+    with pytest.raises(ChannelInputValidationError, match="status request channel envelope"):
+        validate_status_for_transcript(
+            cross_channel_status, cross_channel_request, transcript, _key(2)
+        )
+
+    replayed_request = _signed_status_request(transcript, query_id="ee" * 32)
+    with pytest.raises(ChannelInputValidationError, match="query_id"):
+        validate_status_for_transcript(status, replayed_request, transcript, _key(2))
+
+    wrong_outpoint = sign_payload(
+        status.model_copy(update={"funding_outpoint": transcript.channels[1].funding_outpoint}),
+        _secret(2),
+        aux_randomness=b"\x6a" * 32,
+    )
+    with pytest.raises(
+        ChannelInputValidationError, match="channel participant|status request channel envelope"
+    ):
+        validate_status_for_transcript(wrong_outpoint, request, transcript, _key(2))

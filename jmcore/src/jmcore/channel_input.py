@@ -379,6 +379,58 @@ class ChannelInputPayload(ChannelInputModel):
         return self
 
 
+class ChannelInputRecoveryInitPayload(ChannelInputPayload):
+    """Coordinator request to establish fresh process-local recovery encryption."""
+
+    message_type: ClassVar[str] = "channel_input_recovery_init"
+    type: Literal["channel_input_recovery_init"] = "channel_input_recovery_init"
+    recovery_id: Hex32
+    ephemeral_pubkey: Hex32
+    expires_at: int = Field(ge=1, le=0x7FFFFFFFFFFFFFFF)
+
+    @model_validator(mode="after")
+    def validate_recovery_init(self) -> ChannelInputRecoveryInitPayload:
+        _validate_hex(self.recovery_id, 32, "recovery_id")
+        _validate_hex(self.ephemeral_pubkey, 32, "ephemeral_pubkey")
+        if self.ephemeral_pubkey == "00" * 32:
+            raise ValueError("ephemeral_pubkey must not be zero")
+        return self
+
+
+class ChannelInputRecoveryAcceptPayload(ChannelInputPayload):
+    """Participant commitment to one exact recovery initiation and fresh key."""
+
+    message_type: ClassVar[str] = "channel_input_recovery_accept"
+    type: Literal["channel_input_recovery_accept"] = "channel_input_recovery_accept"
+    recovery_id: Hex32
+    init_hash: Hex32
+    ephemeral_pubkey: Hex32
+
+    @model_validator(mode="after")
+    def validate_recovery_accept(self) -> ChannelInputRecoveryAcceptPayload:
+        _validate_hex(self.recovery_id, 32, "recovery_id")
+        _validate_hex(self.init_hash, 32, "init_hash")
+        _validate_hex(self.ephemeral_pubkey, 32, "ephemeral_pubkey")
+        if self.ephemeral_pubkey == "00" * 32:
+            raise ValueError("ephemeral_pubkey must not be zero")
+        return self
+
+
+class ChannelInputRecoveryConfirmPayload(ChannelInputPayload):
+    """Encrypted coordinator proof of possession for one accepted recovery key."""
+
+    message_type: ClassVar[str] = "channel_input_recovery_confirm"
+    type: Literal["channel_input_recovery_confirm"] = "channel_input_recovery_confirm"
+    recovery_id: Hex32
+    accept_hash: Hex32
+
+    @model_validator(mode="after")
+    def validate_recovery_confirm(self) -> ChannelInputRecoveryConfirmPayload:
+        _validate_hex(self.recovery_id, 32, "recovery_id")
+        _validate_hex(self.accept_hash, 32, "accept_hash")
+        return self
+
+
 class ChannelInputInvitePayload(ChannelInputPayload):
     message_type: ClassVar[str] = "channel_input_invite"
     type: Literal["channel_input_invite"] = "channel_input_invite"
@@ -552,6 +604,19 @@ class ChannelInputChannelPayload(ChannelInputPayload):
         return self
 
 
+class ChannelInputStatusRequestPayload(ChannelInputChannelPayload):
+    """Coordinator request for a channel endpoint's current prepare status."""
+
+    message_type: ClassVar[str] = "channel_input_status_request"
+    type: Literal["channel_input_status_request"] = "channel_input_status_request"
+    query_id: Hex32
+
+    @model_validator(mode="after")
+    def validate_query_id(self) -> ChannelInputStatusRequestPayload:
+        _validate_hex(self.query_id, 32, "query_id")
+        return self
+
+
 class ChannelInputPreparedPayload(ChannelInputChannelPayload):
     message_type: ClassVar[str] = "channel_input_prepared"
     type: Literal["channel_input_prepared"] = "channel_input_prepared"
@@ -675,6 +740,45 @@ class ChannelInputFinalizedPayload(ChannelInputChannelPayload):
         return self
 
 
+class ChannelInputStatusPayload(ChannelInputChannelPayload):
+    """Signed endpoint evidence for one exact post-prepare status request."""
+
+    message_type: ClassVar[str] = "channel_input_status"
+    type: Literal["channel_input_status"] = "channel_input_status"
+    query_id: Hex32
+    status_request_hash: Hex32
+    escrow_stage: Literal["parent_prepared", "parent_signed", "finalized"]
+    attempt_active: bool
+    prepared: ChannelInputPreparedPayload
+    partial: ChannelInputPartialPayload | None = None
+    finalized: ChannelInputFinalizedPayload | None = None
+
+    @model_validator(mode="after")
+    def validate_status(self) -> ChannelInputStatusPayload:
+        _validate_hex(self.query_id, 32, "query_id")
+        _validate_hex(self.status_request_hash, 32, "status_request_hash")
+        for evidence in (self.prepared, self.partial, self.finalized):
+            if evidence is not None and (
+                evidence.session_id != self.session_id
+                or evidence.attempt != self.attempt
+                or evidence.transcript_hash != self.transcript_hash
+                or evidence.funding_outpoint != self.funding_outpoint
+                or evidence.signer_key != self.signer_key
+            ):
+                raise ValueError("status evidence does not match status channel binding or signer")
+        if self.escrow_stage == "parent_prepared":
+            if not self.attempt_active or self.partial is not None or self.finalized is not None:
+                raise ValueError(
+                    "parent_prepared status requires active attempt and prepared evidence only"
+                )
+        elif self.escrow_stage == "parent_signed":
+            if self.partial is None or self.finalized is not None:
+                raise ValueError("parent_signed status requires prepared and partial evidence only")
+        elif self.partial is None or self.finalized is None or self.attempt_active:
+            raise ValueError("finalized status requires inactive attempt and complete evidence")
+        return self
+
+
 class ChannelInputCancelPayload(ChannelInputPayload):
     message_type: ClassVar[str] = "channel_input_cancel"
     type: Literal["channel_input_cancel"] = "channel_input_cancel"
@@ -709,18 +813,23 @@ class ChannelInputCancelAckPayload(ChannelInputPayload):
 
 
 ChannelInputPayloadType: TypeAlias = (
-    ChannelInputInvitePayload
+    ChannelInputRecoveryInitPayload
+    | ChannelInputRecoveryAcceptPayload
+    | ChannelInputRecoveryConfirmPayload
+    | ChannelInputInvitePayload
     | ChannelInputHelloPayload
     | ChannelInputProposalPayload
     | ChannelInputApprovalPayload
     | ChannelInputApprovalSetPayload
     | ChannelInputApprovalSetAckPayload
     | ChannelInputPreparePayload
+    | ChannelInputStatusRequestPayload
     | ChannelInputPreparedPayload
     | ChannelInputSignPayload
     | ChannelInputPartialPayload
     | ChannelInputFinalizePayload
     | ChannelInputFinalizedPayload
+    | ChannelInputStatusPayload
     | ChannelInputCancelPayload
     | ChannelInputCancelAckPayload
 )
@@ -730,6 +839,9 @@ ChannelInputPayloadT = TypeVar("ChannelInputPayloadT", bound=ChannelInputPayload
 _PAYLOAD_TYPES: dict[str, type[ChannelInputPayload]] = {
     payload_type.message_type: payload_type
     for payload_type in (
+        ChannelInputRecoveryInitPayload,
+        ChannelInputRecoveryAcceptPayload,
+        ChannelInputRecoveryConfirmPayload,
         ChannelInputInvitePayload,
         ChannelInputHelloPayload,
         ChannelInputProposalPayload,
@@ -737,11 +849,13 @@ _PAYLOAD_TYPES: dict[str, type[ChannelInputPayload]] = {
         ChannelInputApprovalSetPayload,
         ChannelInputApprovalSetAckPayload,
         ChannelInputPreparePayload,
+        ChannelInputStatusRequestPayload,
         ChannelInputPreparedPayload,
         ChannelInputSignPayload,
         ChannelInputPartialPayload,
         ChannelInputFinalizePayload,
         ChannelInputFinalizedPayload,
+        ChannelInputStatusPayload,
         ChannelInputCancelPayload,
         ChannelInputCancelAckPayload,
     )
@@ -1189,6 +1303,69 @@ def validate_channel_payload_for_transcript(
         validate_finalized_for_transcript(payload, transcript)
 
 
+def validate_status_request_for_transcript(
+    request: ChannelInputStatusRequestPayload,
+    transcript: ChannelInputTranscript,
+    expected_coordinator_key: str,
+) -> None:
+    """Verify a coordinator's exact authenticated request for one channel status."""
+
+    try:
+        _validate_xonly_key(expected_coordinator_key, "expected_coordinator_key")
+    except ValueError as exc:
+        raise ChannelInputValidationError(str(exc)) from exc
+    validate_channel_payload_for_transcript(request, transcript)
+    if expected_coordinator_key != transcript.coordinator_key:
+        raise ChannelInputValidationError(
+            "expected coordinator does not match transcript coordinator"
+        )
+    if request.signer_key != expected_coordinator_key:
+        raise ChannelInputValidationError("status request signer does not match coordinator")
+
+
+def validate_status_for_transcript(
+    status: ChannelInputStatusPayload,
+    request: ChannelInputStatusRequestPayload,
+    transcript: ChannelInputTranscript,
+    expected_participant_key: str,
+) -> None:
+    """Verify an endpoint's signed recovery status and nested signing evidence."""
+
+    validate_status_request_for_transcript(request, transcript, transcript.coordinator_key)
+    try:
+        _validate_xonly_key(expected_participant_key, "expected_participant_key")
+    except ValueError as exc:
+        raise ChannelInputValidationError(str(exc)) from exc
+    validate_channel_payload_for_transcript(status, transcript)
+    descriptor = _descriptor_for_outpoint(transcript, status.funding_outpoint)
+    _opposite_endpoint_key(descriptor, expected_participant_key)
+    if status.signer_key != expected_participant_key:
+        raise ChannelInputValidationError("status signer does not match channel participant")
+    if (
+        request.session_id != status.session_id
+        or request.attempt != status.attempt
+        or request.transcript_hash != status.transcript_hash
+        or request.funding_outpoint != status.funding_outpoint
+    ):
+        raise ChannelInputValidationError("status does not bind status request channel envelope")
+    if status.query_id != request.query_id:
+        raise ChannelInputValidationError("status query_id does not match status request")
+    if status.status_request_hash != payload_hash(request).hex():
+        raise ChannelInputValidationError("status does not bind the exact signed status request")
+    validate_prepared_for_transcript(status.prepared, transcript, expected_participant_key)
+    if status.partial is not None:
+        validate_partial_for_transcript(
+            status.partial,
+            transcript,
+            expected_participant_key,
+            expected_local_public_nonce=status.prepared.public_nonce,
+            expected_peer_public_nonce=status.partial.peer_public_nonce,
+        )
+    if status.finalized is not None:
+        validate_channel_payload_for_transcript(status.finalized, transcript)
+        validate_finalized_for_transcript(status.finalized, transcript)
+
+
 def validate_cancel_ack(
     cancel: ChannelInputCancelPayload,
     ack: ChannelInputCancelAckPayload,
@@ -1392,10 +1569,12 @@ def _canonical_value(value: Any) -> Any:
         return normalized
     if isinstance(value, tuple | list):
         return [_canonical_value(item) for item in value]
+    if value is None:
+        return None
     if type(value) in (str, int, bool):
         return value
     raise ChannelInputValidationError(
-        "canonical channel-input JSON supports only integer, string, and bool"
+        "canonical channel-input JSON supports only integer, string, bool, and null"
     )
 
 
