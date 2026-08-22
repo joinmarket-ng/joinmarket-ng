@@ -18,6 +18,8 @@ keeps ``Taker`` focused on lifecycle (start/stop/sync_wallet/run_schedule).
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import secrets
 import time
 from dataclasses import dataclass
@@ -2011,6 +2013,37 @@ class CoinJoinSession:
         return failure_reason
 
     @staticmethod
+    def _decode_maker_signature_payload(encoded_payload: str) -> tuple[bytes, bytes]:
+        """Decode one length-delimited maker signature payload."""
+        padding_needed = (4 - len(encoded_payload) % 4) % 4
+        try:
+            payload = base64.b64decode(encoded_payload + "=" * padding_needed, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("maker signature payload is not valid base64") from exc
+
+        if len(payload) < 2:
+            raise ValueError("maker signature payload is truncated")
+        signature_length = payload[0]
+        public_key_length_offset = 1 + signature_length
+        if public_key_length_offset >= len(payload):
+            raise ValueError("maker signature payload is truncated")
+        public_key_length = payload[public_key_length_offset]
+        expected_length = 2 + signature_length + public_key_length
+        if len(payload) != expected_length:
+            raise ValueError(
+                f"maker signature payload length is {len(payload)}, expected {expected_length}"
+            )
+
+        signature = payload[1:public_key_length_offset]
+        public_key = payload[public_key_length_offset + 1 :]
+        if public_key_length == 32 and signature_length != 64:
+            raise ValueError(
+                "Taproot maker signature payload must be 0x40 || signature[64] || "
+                "0x20 || output_key[32]"
+            )
+        return signature, public_key
+
+    @staticmethod
     def _match_maker_input_signature(
         *,
         maker_input_indices: list[int],
@@ -2078,8 +2111,6 @@ class CoinJoinSession:
                 return False
 
         # Encode transaction as base64 (expected by maker after decryption)
-        import base64
-
         tx_b64 = base64.b64encode(self.unsigned_tx).decode("ascii")
 
         # Record history BEFORE sending !tx to makers.
@@ -2239,14 +2270,7 @@ class CoinJoinSession:
                         encrypted_data = parts[0]
                         decrypted_sig = session.crypto.decrypt(encrypted_data)
 
-                        # Parse signature (same as before)
-                        padding_needed = (4 - len(decrypted_sig) % 4) % 4
-                        padded_sig = decrypted_sig + "=" * padding_needed
-                        sig_bytes = base64.b64decode(padded_sig)
-                        sig_len = sig_bytes[0]
-                        signature = sig_bytes[1 : 1 + sig_len]
-                        pub_len = sig_bytes[1 + sig_len]
-                        pubkey = sig_bytes[2 + sig_len : 2 + sig_len + pub_len]
+                        signature, pubkey = self._decode_maker_signature_payload(decrypted_sig)
 
                         matched_input_idx, matched_is_taproot = self._match_maker_input_signature(
                             maker_input_indices=maker_input_indices,

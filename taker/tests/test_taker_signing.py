@@ -664,6 +664,46 @@ class TestEdgeCases:
             assert signatures == []
 
 
+class TestMakerSignaturePayload:
+    """Tests for strict maker signature wire framing."""
+
+    @staticmethod
+    def _encode(signature: bytes, public_key: bytes, trailing: bytes = b"") -> str:
+        payload = (
+            bytes([len(signature)]) + signature + bytes([len(public_key)]) + public_key + trailing
+        )
+        return base64.b64encode(payload).decode("ascii")
+
+    def test_accepts_canonical_taproot_payload(self) -> None:
+        signature = b"\x11" * 64
+        output_key = b"\x22" * 32
+
+        assert CoinJoinSession._decode_maker_signature_payload(
+            self._encode(signature, output_key)
+        ) == (signature, output_key)
+
+    @pytest.mark.parametrize("sighash_byte", [0x00, 0x01, 0x81])
+    def test_rejects_65_byte_taproot_signature(self, sighash_byte: int) -> None:
+        payload = self._encode(b"\x11" * 64 + bytes([sighash_byte]), b"\x22" * 32)
+
+        with pytest.raises(ValueError, match="Taproot maker signature payload"):
+            CoinJoinSession._decode_maker_signature_payload(payload)
+
+    def test_rejects_trailing_bytes(self) -> None:
+        payload = self._encode(b"\x11" * 64, b"\x22" * 32, trailing=b"\x50")
+
+        with pytest.raises(ValueError, match="payload length"):
+            CoinJoinSession._decode_maker_signature_payload(payload)
+
+    def test_preserves_legacy_signature_framing(self) -> None:
+        signature = b"\x30" + b"\x11" * 70
+        public_key = b"\x02" + b"\x22" * 32
+
+        assert CoinJoinSession._decode_maker_signature_payload(
+            self._encode(signature, public_key)
+        ) == (signature, public_key)
+
+
 class TestPhaseCollectSignaturesCompleteness:
     """Tests that _phase_collect_signatures requires ALL maker signatures.
 
@@ -1307,6 +1347,127 @@ class TestPhaseCollectSignaturesCompleteness:
         taker.wallet.sign_input.assert_not_called()
         assert "Could not finalize declined CoinJoin history entry" in normal_logs
         assert "disk full" not in "\n".join(normal_logs)
+
+    def _collect_with_taproot_maker1(
+        self,
+        two_maker_tx_data: CoinJoinTxData,
+        *,
+        append_sighash_byte: bool,
+    ) -> tuple[Any, bytes]:
+        from coincurve import PrivateKey
+        from jmcore.models import Offer, OfferType
+        from jmwallet.wallet.signing import sign_p2tr_input
+
+        maker_key = PrivateKey.from_int(1)
+        output_key = maker_key.public_key.format(compressed=True)[1:]
+        maker1_script = (b"\x51\x20" + output_key).hex()
+        fallback_pubkey = PrivateKey.from_int(2).public_key.format(compressed=True)
+        fallback_script = pubkey_to_p2wpkh_script(fallback_pubkey).hex()
+        offer = Offer(
+            counterparty="maker1",
+            oid=0,
+            ordertype=OfferType.TR0_RELATIVE,
+            minsize=100_000,
+            maxsize=10_000_000,
+            txfee=0,
+            cjfee="0.001",
+            fidelity_bond_value=0,
+        )
+        maker_sessions = {
+            "maker1": self._make_maker_session(
+                "maker1",
+                offer,
+                [
+                    {
+                        "txid": "b" * 64,
+                        "vout": 0,
+                        "value": 1_500_000,
+                        "scriptpubkey": maker1_script,
+                    }
+                ],
+            ),
+            "maker2": self._make_maker_session(
+                "maker2",
+                offer,
+                [
+                    {
+                        "txid": "c" * 64,
+                        "vout": 0,
+                        "value": 1_200_000,
+                        "scriptpubkey": fallback_script,
+                    }
+                ],
+            ),
+        }
+        taker = self._build_taker_with_tx(two_maker_tx_data, maker_sessions=maker_sessions)
+        taker._session.selected_utxos = [
+            UTXOInfo(
+                txid="a" * 64,
+                vout=0,
+                value=2_000_000,
+                address="bcrt1qtaker",
+                confirmations=10,
+                scriptpubkey=fallback_script,
+                path="m/84'/1'/0'/0/0",
+                mixdepth=0,
+            )
+        ]
+        tx = deserialize_transaction(taker._session.unsigned_tx)
+        prevout_values, prevout_scripts = taker._session._assemble_prevouts(
+            tx,
+            taker._session._build_prevout_map(),
+        )
+        input_index = next(
+            index
+            for index, tx_input in enumerate(tx.inputs)
+            if (tx_input.txid_le[::-1].hex(), tx_input.vout) == ("b" * 64, 0)
+        )
+        signature = sign_p2tr_input(
+            tx,
+            input_index,
+            prevout_values,
+            prevout_scripts,
+            maker_key,
+        )
+        wire_signature = signature + b"\x00" if append_sighash_byte else signature
+        payload = TestMakerSignaturePayload._encode(wire_signature, output_key)
+        maker_sessions["maker1"].crypto.decrypt = MagicMock(return_value=payload)
+        taker.directory_client.wait_for_responses = AsyncMock(
+            return_value={"maker1": {"data": [payload]}}
+        )
+        return taker, signature
+
+    @pytest.mark.asyncio
+    async def test_accepts_canonical_taproot_signature_through_collection(
+        self, two_maker_tx_data: CoinJoinTxData
+    ) -> None:
+        taker, signature = self._collect_with_taproot_maker1(
+            two_maker_tx_data,
+            append_sighash_byte=False,
+        )
+
+        result = await taker._session._phase_collect_signatures()
+
+        assert result is False  # maker2 stayed silent
+        maker1 = taker._session.maker_sessions["maker1"]
+        assert maker1.responded_sig is True
+        assert maker1.signature == {
+            "signatures": [{"txid": "b" * 64, "vout": 0, "witness": [signature.hex()]}]
+        }
+
+    @pytest.mark.asyncio
+    async def test_rejects_65_byte_taproot_signature_through_collection(
+        self, two_maker_tx_data: CoinJoinTxData
+    ) -> None:
+        taker, _signature = self._collect_with_taproot_maker1(
+            two_maker_tx_data,
+            append_sighash_byte=True,
+        )
+
+        result = await taker._session._phase_collect_signatures()
+
+        assert result is False
+        assert "maker1" not in taker._session.maker_sessions
 
 
 # Re-export fixtures for use in conftest
