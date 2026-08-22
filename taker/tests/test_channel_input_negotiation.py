@@ -5,16 +5,27 @@ from pathlib import Path
 
 import pytest
 from coincurve import PrivateKey
-from jmcore.bitcoin import TxInput, TxOutput, estimate_vsize, serialize_transaction
+from jmcore.bitcoin import (
+    TxInput,
+    TxOutput,
+    estimate_vsize,
+    get_txid,
+    parse_transaction_bytes,
+    serialize_transaction,
+)
 from jmcore.channel_input import (
     ChannelDescriptor,
     ChannelInputApprovalPayload,
     ChannelInputApprovalSetAckPayload,
     ChannelInputCancelAckPayload,
     ChannelInputCancelPayload,
+    ChannelInputFinalizedPayload,
     ChannelInputHelloPayload,
     ChannelInputKeyPair,
+    ChannelInputPartialPayload,
+    ChannelInputPreparedPayload,
     ChannelInputProposalPayload,
+    ChannelInputStatusPayload,
     ChannelInputTranscript,
     ChannelInputValidationError,
     EndpointTerms,
@@ -26,10 +37,16 @@ from jmcore.channel_input import (
     cancel_payload_hash,
     cancellation_binding_hash,
     endpoint_terms_hash,
+    payload_hash,
     sign_payload,
     transcript_hash,
 )
-from jmswap.lnd import ChannelInputCandidate, EscrowOutpoint, FrozenChannelSnapshot
+from jmswap.lnd import (
+    ChannelInputCandidate,
+    EscrowOutpoint,
+    FrozenChannelSnapshot,
+    LndEscrowSigningAttempt,
+)
 
 from taker.channel_input_negotiation import (
     TakerChannelInputNegotiation,
@@ -336,6 +353,105 @@ def _approve_all(
         negotiation.accept_approval(nick, _approval(proposal, secret))
 
 
+def _prepared() -> TakerChannelInputNegotiation:
+    negotiation, secrets = _ready()
+    transcript, terms = _plan(negotiation)
+    proposals = negotiation.plan_proposals(transcript, terms, current_time=100, current_height=100)
+    _approve_all(negotiation, proposals, secrets)
+    approval_set = negotiation.build_approval_set()
+    for (nick, proposal), secret in zip(proposals, secrets, strict=True):
+        negotiation.accept_approval_ack(
+            nick,
+            sign_payload(
+                ChannelInputApprovalSetAckPayload(
+                    session_id=_SESSION,
+                    attempt=1,
+                    signer_key=proposal.recipient_key,
+                    transcript_hash=transcript_hash(transcript).hex(),
+                    approval_set_hash=approval_set_hash(approval_set).hex(),
+                ),
+                secret,
+                aux_randomness=b"\x91" * 32,
+            ),
+        )
+    negotiation.build_prepare()
+    return negotiation
+
+
+def _maker_prepared(
+    negotiation: TakerChannelInputNegotiation, nick: str, nonce: bytes
+) -> ChannelInputPreparedPayload:
+    index = negotiation.selected_nicks.index(nick)
+    remote = dict(negotiation.remote_hellos)[nick]
+    return sign_payload(
+        ChannelInputPreparedPayload(
+            session_id=_SESSION,
+            attempt=1,
+            signer_key=remote.participant_key,
+            transcript_hash=transcript_hash(negotiation.transcript).hex(),  # type: ignore[arg-type]
+            funding_outpoint=remote.funding_outpoint,
+            public_nonce=nonce.hex(),
+        ),
+        _MAKER_SECRETS[index],
+        aux_randomness=bytes([index + 30]) * 32,
+    )
+
+
+def _maker_partial(
+    negotiation: TakerChannelInputNegotiation, nick: str, signature: bytes
+) -> ChannelInputPartialPayload:
+    state = next(state for state in negotiation.parent_channel_states if state.nick == nick)
+    assert state.local_prepared is not None and state.remote_prepared is not None
+    index = negotiation.selected_nicks.index(nick)
+    remote = dict(negotiation.remote_hellos)[nick]
+    return sign_payload(
+        ChannelInputPartialPayload(
+            session_id=_SESSION,
+            attempt=1,
+            signer_key=remote.participant_key,
+            transcript_hash=transcript_hash(negotiation.transcript).hex(),  # type: ignore[arg-type]
+            funding_outpoint=state.funding_outpoint,
+            local_public_nonce=state.remote_prepared.public_nonce,
+            peer_public_nonce=state.local_prepared.public_nonce,
+            partial_signature=signature.hex(),
+        ),
+        _MAKER_SECRETS[index],
+        aux_randomness=bytes([index + 40]) * 32,
+    )
+
+
+def _maker_finalized(
+    negotiation: TakerChannelInputNegotiation, nick: str
+) -> ChannelInputFinalizedPayload:
+    assert negotiation.transcript is not None
+    state = next(state for state in negotiation.parent_channel_states if state.nick == nick)
+    index = next(
+        descriptor.input_index
+        for descriptor in negotiation.transcript.channels
+        if descriptor.funding_outpoint == state.funding_outpoint
+    )
+    unsigned = parse_transaction_bytes(bytes.fromhex(negotiation.transcript.unsigned_parent_tx))
+    witnesses: list[list[bytes]] = [[] for _ in unsigned.inputs]
+    witnesses[index] = [b"\x99" * 64]
+    remote = dict(negotiation.remote_hellos)[nick]
+    maker_index = negotiation.selected_nicks.index(nick)
+    return sign_payload(
+        ChannelInputFinalizedPayload(
+            session_id=_SESSION,
+            attempt=1,
+            signer_key=remote.participant_key,
+            transcript_hash=transcript_hash(negotiation.transcript).hex(),
+            funding_outpoint=state.funding_outpoint,
+            channel_signed_parent_tx=serialize_transaction(
+                unsigned.version, unsigned.inputs, unsigned.outputs, unsigned.locktime, witnesses
+            ).hex(),
+            txid=get_txid(negotiation.transcript.unsigned_parent_tx),
+        ),
+        _MAKER_SECRETS[maker_index],
+        aux_randomness=bytes([maker_index + 50]) * 32,
+    )
+
+
 def _unknown_hello_cancel_ack(
     negotiation: TakerChannelInputNegotiation,
     cancel: ChannelInputCancelPayload,
@@ -404,6 +520,203 @@ def test_three_maker_prepare_round_trip_and_replays() -> None:
         TakerChannelInputSnapshot.model_validate_json(negotiation.snapshot().model_dump_json())
     )
     assert restored.snapshot() == negotiation.snapshot()
+
+
+def test_parent_channel_state_orders_prepared_records_and_replays_wire_evidence() -> None:
+    negotiation = _prepared()
+    nick = "maker-a"
+    remote = _maker_prepared(negotiation, nick, b"\x03" * 66)
+    negotiation.accept_remote_prepared(nick, remote)
+    local = negotiation.record_local_prepared(
+        nick, LndEscrowSigningAttempt(attempt_id=b"\x01" * 32, public_nonce=b"\x02" * 66)
+    )
+    assert (
+        negotiation.record_local_prepared(
+            nick, LndEscrowSigningAttempt(attempt_id=b"\x01" * 32, public_nonce=b"\x02" * 66)
+        )
+        == local
+    )
+    sign = negotiation.build_sign_request(nick)
+    assert negotiation.build_sign_request(nick) == sign
+    assert sign.local_public_nonce == remote.public_nonce and sign.peer_prepared == local
+    remote_partial = _maker_partial(negotiation, nick, b"\xaa" * 32)
+    negotiation.accept_remote_partial(nick, remote_partial)
+    negotiation.accept_remote_partial(nick, remote_partial)
+    local_partial = negotiation.record_local_partial(nick, b"\xbb" * 32)
+    assert negotiation.record_local_partial(nick, b"\xbb" * 32) == local_partial
+    finalize = negotiation.build_finalize_request(nick)
+    assert negotiation.build_finalize_request(nick) == finalize
+    assert finalize.local_public_nonce == remote.public_nonce
+    assert finalize.peer_partial == local_partial
+    finalized = _maker_finalized(negotiation, nick)
+    negotiation.accept_remote_finalized(nick, finalized)
+    negotiation.accept_remote_finalized(nick, finalized)
+    assert negotiation.parent_channel_states == tuple(
+        sorted(negotiation.parent_channel_states, key=lambda state: state.nick)
+    )
+    assert TakerChannelInputNegotiation.from_snapshot(negotiation.snapshot()).snapshot() == (
+        negotiation.snapshot()
+    )
+
+
+def test_local_rotation_and_cancellation_are_gated_by_parent_evidence() -> None:
+    negotiation = _prepared()
+    nick = "maker-a"
+    first = negotiation.record_local_prepared(
+        nick, LndEscrowSigningAttempt(attempt_id=b"\x01" * 32, public_nonce=b"\x02" * 66)
+    )
+    negotiation.plan_local_prepared_rotation(nick)
+    second = negotiation.record_local_prepared(
+        nick, LndEscrowSigningAttempt(attempt_id=b"\x04" * 32, public_nonce=b"\x05" * 66)
+    )
+    assert second != first
+    negotiation.accept_remote_prepared(nick, _maker_prepared(negotiation, nick, b"\x06" * 66))
+    negotiation.build_sign_request(nick)
+    with pytest.raises(ChannelInputValidationError, match="cannot rotate"):
+        negotiation.plan_local_prepared_rotation(nick)
+    assert negotiation.plan_cancel("pre_partial")
+
+    signed = _prepared()
+    signed.record_local_prepared(
+        nick, LndEscrowSigningAttempt(attempt_id=b"\x01" * 32, public_nonce=b"\x02" * 66)
+    )
+    signed.accept_remote_prepared(nick, _maker_prepared(signed, nick, b"\x03" * 66))
+    signed.build_sign_request(nick)
+    signed.record_local_partial(nick, b"\xaa" * 32)
+    with pytest.raises(ChannelInputValidationError, match="partial or final"):
+        signed.plan_cancel("post_partial")
+
+
+def test_status_replays_pending_query_and_recovers_only_stronger_evidence() -> None:
+    negotiation = _prepared()
+    nick = "maker-a"
+    negotiation.record_local_prepared(
+        nick, LndEscrowSigningAttempt(attempt_id=b"\x01" * 32, public_nonce=b"\x02" * 66)
+    )
+    remote = _maker_prepared(negotiation, nick, b"\x03" * 66)
+    negotiation.accept_remote_prepared(nick, remote)
+    negotiation.build_sign_request(nick)
+    local_partial = negotiation.record_local_partial(nick, b"\xaa" * 32)
+    request = negotiation.build_status_request(nick)
+    assert negotiation.build_status_request(nick) == request
+    remote_partial = _maker_partial(negotiation, nick, b"\xbb" * 32)
+    maker = dict(negotiation.remote_hellos)[nick]
+    status = sign_payload(
+        ChannelInputStatusPayload(
+            session_id=_SESSION,
+            attempt=1,
+            signer_key=maker.participant_key,
+            transcript_hash=transcript_hash(negotiation.transcript).hex(),  # type: ignore[arg-type]
+            funding_outpoint=maker.funding_outpoint,
+            query_id=request.query_id,
+            status_request_hash=payload_hash(request).hex(),
+            escrow_stage="parent_signed",
+            attempt_active=False,
+            prepared=remote,
+            partial=remote_partial,
+        ),
+        _MAKER_SECRETS[0],
+        aux_randomness=b"\x61" * 32,
+    )
+    negotiation.accept_remote_status(nick, status)
+    state = negotiation.parent_channel_states[0]
+    assert state.local_partial == local_partial and state.remote_partial == remote_partial
+    next_request = negotiation.build_status_request(nick)
+    assert next_request.query_id != request.query_id
+    regression = sign_payload(
+        status.model_copy(
+            update={
+                "query_id": next_request.query_id,
+                "status_request_hash": payload_hash(next_request).hex(),
+                "escrow_stage": "parent_prepared",
+                "attempt_active": True,
+                "partial": None,
+                "sig": "00" * 64,
+            }
+        ),
+        _MAKER_SECRETS[0],
+        aux_randomness=b"\x62" * 32,
+    )
+    with pytest.raises(ChannelInputValidationError, match="regresses"):
+        negotiation.accept_remote_status(nick, regression)
+
+
+def test_status_recovers_remote_partial_before_local_signing() -> None:
+    negotiation = _prepared()
+    nick = "maker-a"
+    negotiation.record_local_prepared(
+        nick, LndEscrowSigningAttempt(attempt_id=b"\x01" * 32, public_nonce=b"\x02" * 66)
+    )
+    remote = _maker_prepared(negotiation, nick, b"\x03" * 66)
+    negotiation.accept_remote_prepared(nick, remote)
+    negotiation.build_sign_request(nick)
+    request = negotiation.build_status_request(nick)
+    remote_partial = _maker_partial(negotiation, nick, b"\xbb" * 32)
+    maker = dict(negotiation.remote_hellos)[nick]
+    status = sign_payload(
+        ChannelInputStatusPayload(
+            session_id=_SESSION,
+            attempt=1,
+            signer_key=maker.participant_key,
+            transcript_hash=transcript_hash(negotiation.transcript).hex(),  # type: ignore[arg-type]
+            funding_outpoint=maker.funding_outpoint,
+            query_id=request.query_id,
+            status_request_hash=payload_hash(request).hex(),
+            escrow_stage="parent_signed",
+            attempt_active=False,
+            prepared=remote,
+            partial=remote_partial,
+        ),
+        _MAKER_SECRETS[0],
+        aux_randomness=b"\x63" * 32,
+    )
+
+    negotiation.accept_remote_status(nick, status)
+
+    state = negotiation.parent_channel_states[0]
+    assert state.local_partial is None
+    assert state.remote_partial == remote_partial
+    assert TakerChannelInputNegotiation.from_snapshot(negotiation.snapshot()).snapshot() == (
+        negotiation.snapshot()
+    )
+
+
+def test_historical_prepared_status_allows_later_final_evidence() -> None:
+    negotiation = _prepared()
+    nick = "maker-a"
+    negotiation.record_local_prepared(
+        nick, LndEscrowSigningAttempt(attempt_id=b"\x01" * 32, public_nonce=b"\x02" * 66)
+    )
+    remote = _maker_prepared(negotiation, nick, b"\x03" * 66)
+    negotiation.accept_remote_prepared(nick, remote)
+    negotiation.build_sign_request(nick)
+    request = negotiation.build_status_request(nick)
+    maker = dict(negotiation.remote_hellos)[nick]
+    status = sign_payload(
+        ChannelInputStatusPayload(
+            session_id=_SESSION,
+            attempt=1,
+            signer_key=maker.participant_key,
+            transcript_hash=transcript_hash(negotiation.transcript).hex(),  # type: ignore[arg-type]
+            funding_outpoint=maker.funding_outpoint,
+            query_id=request.query_id,
+            status_request_hash=payload_hash(request).hex(),
+            escrow_stage="parent_prepared",
+            attempt_active=True,
+            prepared=remote,
+        ),
+        _MAKER_SECRETS[0],
+        aux_randomness=b"\x64" * 32,
+    )
+    negotiation.accept_remote_status(nick, status)
+    negotiation.accept_remote_partial(nick, _maker_partial(negotiation, nick, b"\xaa" * 32))
+    negotiation.record_local_partial(nick, b"\xbb" * 32)
+    negotiation.build_finalize_request(nick)
+    negotiation.accept_remote_finalized(nick, _maker_finalized(negotiation, nick))
+
+    assert TakerChannelInputNegotiation.from_snapshot(negotiation.snapshot()).snapshot() == (
+        negotiation.snapshot()
+    )
 
 
 def test_rejects_collisions_and_tampered_restore() -> None:

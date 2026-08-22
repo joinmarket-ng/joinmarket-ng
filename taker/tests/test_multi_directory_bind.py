@@ -14,7 +14,7 @@ from jmcore.protocol import (
     FEATURE_NEUTRINO_COMPAT,
 )
 
-from taker.multi_directory import ChannelBinding, MultiDirectoryClient
+from taker.multi_directory import ChannelBinding, MultiDirectoryClient, ReplyRoute
 
 
 def _make_client(
@@ -198,7 +198,7 @@ def test_bind_session_last_resort_any_connected_directory():
     "location",
     ["127.0.0.1:5222", "maker.example:5222", "192.0.2.1:5222"],
 )
-def test_non_onion_peerlist_location_is_ignored_in_production(location: str):
+def test_non_onion_peerlist_location_is_ignored_in_production(location: str) -> None:
     directory = MagicMock()
     directory._active_peers = {"J5x": location}
     mdc = _make_client(clients={"dir": directory})
@@ -206,7 +206,7 @@ def test_non_onion_peerlist_location_is_ignored_in_production(location: str):
     assert mdc.get_peer_location("J5x") is None
 
 
-def test_regtest_allows_local_peerlist_location():
+def test_regtest_allows_local_peerlist_location() -> None:
     directory = MagicMock()
     directory._active_peers = {"J5x": "127.0.0.1:5222"}
     mdc = _make_client(clients={"dir": directory})
@@ -215,7 +215,7 @@ def test_regtest_allows_local_peerlist_location():
     assert mdc.get_peer_location("J5x") == "127.0.0.1:5222"
 
 
-def test_clearnet_development_override_reaches_directory_clients():
+def test_clearnet_development_override_reaches_directory_clients() -> None:
     mdc = MultiDirectoryClient(
         directory_servers=["directory.example:5222"],
         network="mainnet",
@@ -224,6 +224,25 @@ def test_clearnet_development_override_reaches_directory_clients():
     )
 
     assert mdc._build_client_kwargs("directory.example", 5222)["allow_clearnet_connections"] is True
+
+
+def test_recovery_bootstrap_routes_prioritize_presence_then_cover_fallbacks():
+    listed = MagicMock()
+    listed._active_peers = {"J5maker": "maker.onion:1"}
+    active = MagicMock()
+    active._active_peers = {}
+    fallback = MagicMock()
+    fallback._active_peers = {}
+    mdc = _make_client(
+        clients={"fallback": fallback, "listed": listed, "active": active},
+        active_nicks={"J5maker": {"active": True, "listed": False}},
+    )
+
+    assert mdc.recovery_bootstrap_routes("J5maker") == (
+        ReplyRoute(nick="J5maker", channel_id="directory:active"),
+        ReplyRoute(nick="J5maker", channel_id="directory:listed"),
+        ReplyRoute(nick="J5maker", channel_id="directory:fallback"),
+    )
 
 
 def test_channel_binding_is_frozen():

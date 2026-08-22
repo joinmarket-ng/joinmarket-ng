@@ -38,6 +38,7 @@ from jmcore.channel_input import (
     SettlementOutput as AuthorizedSettlementOutput,
 )
 from jmswap.lnd import (
+    ChannelInputForceCloseOutcome,
     EscrowOutpoint,
     FrozenChannelSnapshot,
     LndEscrowSigningAttempt,
@@ -1147,6 +1148,61 @@ def test_restart_decision_recovers_durable_partial_at_deadline(tmp_path: Path) -
     assert at_deadline is ChannelInputRestartAction.FORCE_CLOSE
 
 
+def test_force_close_outcome_is_durable_terminal_and_replayable(tmp_path: Path) -> None:
+    coordinator = ChannelInputParentCoordinator(tmp_path)
+    endpoints = _endpoints(crash_after_sign=True)
+    with pytest.raises(ChannelInputParentError, match="progression failed"):
+        asyncio.run(coordinator.execute(_plan(), endpoints))
+    assert (
+        asyncio.run(
+            coordinator.decide_restart(SESSION_ID, endpoints, FakeChain(), current_height=999_999)
+        )
+        is ChannelInputRestartAction.FORCE_CLOSE
+    )
+    record = coordinator.load(SESSION_ID)
+    assert record is not None
+    snapshot = record.channels[0].second_snapshot
+    outcome = ChannelInputForceCloseOutcome(
+        funding_outpoint=EscrowOutpoint(txid=snapshot.funding_txid, vout=snapshot.funding_vout),
+        commitment_txid="99" * 32,
+    )
+
+    closed = coordinator.record_force_close(SESSION_ID, outcome)
+
+    assert closed.state is ChannelInputParentState.FORCE_CLOSED
+    assert coordinator.record_force_close(SESSION_ID, outcome) == closed
+    assert (
+        asyncio.run(coordinator.decide_restart(SESSION_ID, {}, FakeChain(), current_height=999_999))
+        is ChannelInputRestartAction.NONE
+    )
+    with pytest.raises(ChannelInputParentError, match="conflicts"):
+        coordinator.record_force_close(
+            SESSION_ID,
+            outcome.model_copy(update={"commitment_txid": "88" * 32}),
+        )
+
+
+def test_unobserved_final_parent_can_force_close_at_recovery_height(tmp_path: Path) -> None:
+    coordinator = ChannelInputParentCoordinator(tmp_path)
+    record = asyncio.run(coordinator.execute(_plan(), _endpoints()))
+    assert record.final_tx_hex is not None
+    assert (
+        asyncio.run(coordinator.decide_restart(SESSION_ID, {}, FakeChain(), current_height=999_999))
+        is ChannelInputRestartAction.FORCE_CLOSE
+    )
+    snapshot = record.channels[0].second_snapshot
+    closed = coordinator.record_force_close(
+        SESSION_ID,
+        ChannelInputForceCloseOutcome(
+            funding_outpoint=EscrowOutpoint(txid=snapshot.funding_txid, vout=snapshot.funding_vout),
+            commitment_txid="77" * 32,
+        ),
+    )
+
+    assert closed.state is ChannelInputParentState.FORCE_CLOSED
+    assert closed.final_tx_hex == record.final_tx_hex
+
+
 def test_restart_decision_publishes_persisted_parent_before_deadline(tmp_path: Path) -> None:
     coordinator = ChannelInputParentCoordinator(tmp_path)
     record = asyncio.run(coordinator.execute(_plan(), _endpoints()))
@@ -1280,3 +1336,44 @@ def test_restart_decision_rejects_invalid_current_height(
                 current_height=current_height,  # type: ignore[arg-type]
             )
         )
+
+
+def test_public_parent_loads_are_stable_and_fail_closed(tmp_path: Path) -> None:
+    coordinator = ChannelInputParentCoordinator(tmp_path)
+    _save_record(coordinator, _plan(), ChannelInputParentState.CREATED)
+    record = coordinator.load(SESSION_ID)
+
+    assert record is not None
+    assert coordinator.load_all() == (record,)
+    temporary = tmp_path / f".{record.record_id}.123.456.tmp"
+    temporary.write_bytes(b"interrupted write")
+    temporary.chmod(0o600)
+    assert coordinator.load_all() == (record,)
+
+    (tmp_path / "unexpected").write_text("unsafe", encoding="ascii")
+    with pytest.raises(ChannelInputParentError, match="unexpected"):
+        coordinator.load_all()
+
+
+def test_public_parent_load_all_rejects_corrupt_record_file(tmp_path: Path) -> None:
+    coordinator = ChannelInputParentCoordinator(tmp_path)
+    path = tmp_path / f"{'00' * 32}.json"
+    path.write_text("not json", encoding="ascii")
+    path.chmod(0o600)
+
+    with pytest.raises(ChannelInputParentError, match="unsafe|invalid"):
+        coordinator.load_all()
+
+
+def test_public_parent_load_rejects_tampered_frozen_outpoint(tmp_path: Path) -> None:
+    coordinator = ChannelInputParentCoordinator(tmp_path)
+    record = asyncio.run(coordinator.execute(_plan(), _endpoints()))
+    channel = record.channels[0]
+    tampered_snapshot = channel.second_snapshot.model_copy(update={"funding_txid": "99" * 32})
+    tampered = record.model_copy(
+        update={"channels": (channel.model_copy(update={"second_snapshot": tampered_snapshot}),)}
+    )
+    coordinator._store.save(tampered)
+
+    with pytest.raises(ChannelInputParentError, match="frozen channel data differs"):
+        coordinator.load(record.plan.session_id)

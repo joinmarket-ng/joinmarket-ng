@@ -33,6 +33,8 @@ def test_channel_input_taker_reuses_durable_outer_identity(
     wallet.mixdepth_count = 5
     backend = AsyncMock()
     backend.can_provide_neutrino_metadata = Mock(return_value=True)
+    backend.has_mempool_access = Mock(return_value=True)
+    backend.can_get_confirmations_by_txid = Mock(return_value=True)
     config = make_taker_config(
         data_dir=str(tmp_path),
         address_type="p2tr",
@@ -60,6 +62,8 @@ async def test_channel_input_capability_enables_only_after_backend_validation(
     wallet.mixdepth_count = 5
     backend = AsyncMock()
     backend.can_provide_neutrino_metadata = Mock(return_value=True)
+    backend.has_mempool_access = Mock(return_value=True)
+    backend.can_get_confirmations_by_txid = Mock(return_value=True)
     config = make_taker_config(
         data_dir=str(tmp_path),
         address_type="p2tr",
@@ -103,6 +107,8 @@ async def test_channel_input_reconciles_before_capability_advertisement(
     wallet.mixdepth_count = 5
     backend = AsyncMock()
     backend.can_provide_neutrino_metadata = Mock(return_value=True)
+    backend.has_mempool_access = Mock(return_value=True)
+    backend.can_get_confirmations_by_txid = Mock(return_value=True)
     config = make_taker_config(
         data_dir=str(tmp_path),
         address_type="p2tr",

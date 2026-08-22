@@ -4,6 +4,10 @@ Tests for transaction builder module.
 
 from __future__ import annotations
 
+import json
+from dataclasses import replace
+from types import SimpleNamespace
+
 import pytest
 from jmcore.bitcoin import (
     address_to_scriptpubkey,
@@ -14,8 +18,13 @@ from jmcore.bitcoin import (
 from jmcore.constants import BITCOIN_DUST_THRESHOLD, DUST_THRESHOLD
 
 from taker.tx_builder import (
+    ChannelEndpointContribution,
+    ChannelEndpointSettlement,
+    ChannelTransactionContribution,
     CoinJoinTxBuilder,
     CoinJoinTxData,
+    FinalizedRingChannelOutput,
+    FinalizedRingTransactionPlan,
     TxInput,
     TxOutput,
     build_coinjoin_tx,
@@ -399,6 +408,329 @@ class TestCoinJoinTxBuilder:
         # Should be 64 hex characters
         assert len(txid) == 64
         assert all(c in "0123456789abcdef" for c in txid)
+
+
+class TestChannelInputTransactionContributions:
+    """Tests for channel funding inputs and endpoint settlement outputs."""
+
+    @staticmethod
+    def _p2tr_output(marker: int, value: int) -> TxOutput:
+        return TxOutput.from_hex("5120" + f"{marker:02x}" * 32, value)
+
+    def _contribution(
+        self,
+        channel_id: str = "channel-1",
+        funding_marker: int = 0xD1,
+        first_marker: int = 0xE1,
+        second_marker: int = 0xE2,
+        funding_value: int = 1_000,
+    ) -> ChannelTransactionContribution:
+        return ChannelTransactionContribution(
+            channel_id=channel_id,
+            funding_input=TxInput.from_hex(
+                txid=f"{funding_marker:02x}" * 32,
+                vout=7,
+                value=funding_value,
+                scriptpubkey="5120" + f"{funding_marker:02x}" * 32,
+            ),
+            first_endpoint=ChannelEndpointSettlement(
+                endpoint_id=f"{channel_id}-maker",
+                participant_key="maker-participant-key",
+                output=self._p2tr_output(first_marker, 300),
+            ),
+            second_endpoint=ChannelEndpointSettlement(
+                endpoint_id=f"{channel_id}-taker",
+                participant_key="taker-participant-key",
+                output=self._p2tr_output(second_marker, 400),
+            ),
+        )
+
+    def _tx_data(
+        self, contributions: tuple[ChannelTransactionContribution, ...] = ()
+    ) -> CoinJoinTxData:
+        return CoinJoinTxData(
+            taker_inputs=[TxInput.from_hex(txid="a" * 64, vout=0, value=1_000)],
+            taker_cj_output=self._p2tr_output(0xA1, 400),
+            taker_change_output=self._p2tr_output(0xA2, 1_000),
+            maker_inputs={
+                "maker1": [TxInput.from_hex(txid="b" * 64, vout=1, value=2_000)],
+            },
+            maker_cj_outputs={"maker1": self._p2tr_output(0xA3, 400)},
+            maker_change_outputs={},
+            cj_amount=400,
+            total_maker_fee=0,
+            tx_fee=42,
+            channel_contributions=contributions,
+        )
+
+    def _ring_plan(self) -> FinalizedRingTransactionPlan:
+        participants = ("taker", "maker1", "maker2", "maker3")
+        outputs = []
+        for index, opener in enumerate(participants):
+            fundee = participants[(index + 1) % len(participants)]
+            script_pubkey = "5120" + f"{0xC1 + index:02x}" * 32
+            outputs.append(
+                FinalizedRingChannelOutput(
+                    edge_id=f"edge-{index}",
+                    script_pubkey=script_pubkey,
+                    address=TxOutput.from_hex(script_pubkey, 2).address("regtest"),
+                    capacity=2,
+                    opener=ChannelEndpointContribution(participant_id=opener, amount=1),
+                    fundee=ChannelEndpointContribution(participant_id=fundee, amount=1),
+                )
+            )
+        return FinalizedRingTransactionPlan(
+            network="regtest",
+            participant_ids=list(participants),
+            residuals={participant: 2 for participant in participants},
+            channel_outputs=outputs,
+        )
+
+    def test_ordinary_transaction_keeps_compatibility_metadata(self) -> None:
+        tx_data = self._tx_data()
+
+        _, metadata = CoinJoinTxBuilder("regtest").build_unsigned_tx(tx_data)
+
+        assert metadata["fee"] == tx_data.tx_fee
+        assert metadata["actual_fee"] == 1_200
+        assert metadata["channel_input_ids"] == [None, None]
+        assert metadata["channel_endpoint_outputs"] == [None, None, None]
+        assert len(metadata["input_scriptpubkeys"]) == len(metadata["input_owners"])
+
+    def test_channel_contributions_survive_shared_shuffle_with_exact_metadata(self) -> None:
+        first = self._contribution()
+        second = self._contribution("channel-2", 0xD2, 0xE3, 0xE4, 1_100)
+        tx_data = self._tx_data((first, second))
+
+        tx_bytes, metadata = CoinJoinTxBuilder("regtest").build_unsigned_tx(tx_data)
+        parsed = parse_transaction_bytes(tx_bytes)
+        contributions = {contribution.channel_id: contribution for contribution in (first, second)}
+
+        assert len(parsed.inputs) == 4
+        assert len(parsed.outputs) == 7
+        assert metadata["fee"] == tx_data.tx_fee
+        assert metadata["actual_fee"] == 1_900
+        for index, channel_id in enumerate(metadata["channel_input_ids"]):
+            if channel_id is None:
+                continue
+            funding_input = contributions[channel_id].funding_input
+            assert parsed.inputs[index].txid == funding_input.txid
+            assert parsed.inputs[index].vout == funding_input.vout
+            assert metadata["input_scriptpubkeys"][index] == funding_input.scriptpubkey_hex
+            assert metadata["input_owners"][index] == f"__channel_input__:{channel_id}"
+
+        endpoint_outputs = [
+            descriptor
+            for descriptor in metadata["channel_endpoint_outputs"]
+            if descriptor is not None
+        ]
+        assert len(endpoint_outputs) == 4
+        for index, descriptor in enumerate(metadata["channel_endpoint_outputs"]):
+            if descriptor is None:
+                continue
+            output = parsed.outputs[index]
+            assert output.scriptpubkey == descriptor["script_pubkey"]
+            assert output.value == descriptor["value"]
+            assert descriptor["channel_id"] in contributions
+            assert descriptor["endpoint_id"] in {
+                contributions[descriptor["channel_id"]].first_endpoint.endpoint_id,
+                contributions[descriptor["channel_id"]].second_endpoint.endpoint_id,
+            }
+        json.dumps(metadata["channel_endpoint_outputs"])
+
+    def test_channel_contributions_use_the_existing_single_shuffle_stage(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        contribution = self._contribution()
+        shuffle_sizes: list[int] = []
+
+        def reverse_shuffle(items: list[object]) -> None:
+            shuffle_sizes.append(len(items))
+            items.reverse()
+
+        monkeypatch.setattr(
+            "taker.tx_builder.secure_random", SimpleNamespace(shuffle=reverse_shuffle)
+        )
+        tx_bytes, metadata = CoinJoinTxBuilder("regtest").build_unsigned_tx(
+            self._tx_data((contribution,))
+        )
+        parsed = parse_transaction_bytes(tx_bytes)
+
+        assert shuffle_sizes == [3, 5]
+        assert [input_.txid for input_ in parsed.inputs] == [
+            contribution.funding_input.txid,
+            "b" * 64,
+            "a" * 64,
+        ]
+        assert [output.scriptpubkey for output in parsed.outputs] == [
+            contribution.second_endpoint.output.scriptpubkey,
+            contribution.first_endpoint.output.scriptpubkey,
+            self._p2tr_output(0xA2, 1_000).scriptpubkey,
+            self._p2tr_output(0xA3, 400).scriptpubkey,
+            self._p2tr_output(0xA1, 400).scriptpubkey,
+        ]
+        assert metadata["channel_input_ids"] == ["channel-1", None, None]
+        assert [
+            descriptor["endpoint_id"] if descriptor is not None else None
+            for descriptor in metadata["channel_endpoint_outputs"]
+        ] == ["channel-1-taker", "channel-1-maker", None, None, None]
+
+    def test_build_coinjoin_convenience_forwards_channel_contributions(self) -> None:
+        contribution = self._contribution()
+        taker_script = self._p2tr_output(0xA5, 400).scriptpubkey
+
+        tx_bytes, metadata = build_coinjoin_tx(
+            taker_utxos=[
+                {
+                    "txid": "a" * 64,
+                    "vout": 0,
+                    "value": 1_000,
+                    "scriptpubkey": taker_script,
+                }
+            ],
+            taker_cj_address=TxOutput.from_hex(taker_script, 400).address("regtest"),
+            taker_change_address="",
+            taker_total_input=1_000,
+            maker_data={},
+            cj_amount=400,
+            tx_fee=600,
+            network="regtest",
+            channel_contributions=(contribution,),
+        )
+
+        parsed = parse_transaction_bytes(tx_bytes)
+        assert len(parsed.inputs) == 2
+        assert len(parsed.outputs) == 3
+        assert contribution.channel_id in metadata["channel_input_ids"]
+
+    def test_rejects_ring_and_channel_input_modes_together(self) -> None:
+        tx_data = self._tx_data((self._contribution(),))
+        tx_data = replace(tx_data, ring_plan=self._ring_plan())
+
+        with pytest.raises(ValueError, match="cannot be ring transactions"):
+            CoinJoinTxBuilder("regtest").build_unsigned_tx(tx_data)
+
+    @pytest.mark.parametrize(
+        ("contributions", "match"),
+        [
+            (("",), "nonempty channel ID"),
+            (("channel-1", "channel-1"), "duplicate channel IDs"),
+        ],
+    )
+    def test_rejects_invalid_channel_ids(self, contributions: tuple[str, ...], match: str) -> None:
+        channel_contributions = tuple(
+            self._contribution(channel_id, 0xD1 + index, 0xE1 + index * 2, 0xE2 + index * 2)
+            for index, channel_id in enumerate(contributions)
+        )
+
+        with pytest.raises(ValueError, match=match):
+            CoinJoinTxBuilder("regtest").build_unsigned_tx(self._tx_data(channel_contributions))
+
+    def test_rejects_duplicate_or_colliding_channel_funding_outpoints(self) -> None:
+        duplicate = self._contribution("channel-2", 0xD1, 0xE3, 0xE4)
+        with pytest.raises(ValueError, match="duplicate funding outpoints"):
+            CoinJoinTxBuilder("regtest").build_unsigned_tx(
+                self._tx_data((self._contribution(), duplicate))
+            )
+
+        colliding = replace(
+            self._contribution(),
+            funding_input=TxInput.from_hex(
+                txid="a" * 64,
+                vout=0,
+                value=1_000,
+                scriptpubkey="5120" + "d1" * 32,
+            ),
+        )
+        with pytest.raises(ValueError, match="collides with an ordinary input"):
+            CoinJoinTxBuilder("regtest").build_unsigned_tx(self._tx_data((colliding,)))
+
+    @pytest.mark.parametrize(
+        ("funding_input", "match"),
+        [
+            (
+                TxInput.from_hex(txid="d1" * 32, vout=7, value=0, scriptpubkey="5120" + "d1" * 32),
+                "positive value",
+            ),
+            (
+                TxInput.from_hex(
+                    txid="d1" * 32, vout=7, value=1_000, scriptpubkey="0014" + "d1" * 20
+                ),
+                "P2TR",
+            ),
+        ],
+    )
+    def test_rejects_invalid_channel_funding_input(
+        self, funding_input: TxInput, match: str
+    ) -> None:
+        contribution = replace(self._contribution(), funding_input=funding_input)
+
+        with pytest.raises(ValueError, match=match):
+            CoinJoinTxBuilder("regtest").build_unsigned_tx(self._tx_data((contribution,)))
+
+    def test_rejects_invalid_channel_endpoint_settlements(self) -> None:
+        contribution = self._contribution()
+        duplicate_endpoint = replace(
+            contribution,
+            second_endpoint=replace(contribution.second_endpoint, endpoint_id="channel-1-maker"),
+        )
+        with pytest.raises(ValueError, match="distinct endpoint IDs"):
+            CoinJoinTxBuilder("regtest").build_unsigned_tx(self._tx_data((duplicate_endpoint,)))
+
+        missing_participant = replace(
+            contribution,
+            first_endpoint=replace(contribution.first_endpoint, participant_key=""),
+        )
+        with pytest.raises(ValueError, match="nonempty participant key"):
+            CoinJoinTxBuilder("regtest").build_unsigned_tx(self._tx_data((missing_participant,)))
+
+        missing_endpoint_id = replace(
+            contribution,
+            first_endpoint=replace(contribution.first_endpoint, endpoint_id=""),
+        )
+        with pytest.raises(ValueError, match="nonempty endpoint ID"):
+            CoinJoinTxBuilder("regtest").build_unsigned_tx(self._tx_data((missing_endpoint_id,)))
+
+        invalid_output = replace(
+            contribution,
+            first_endpoint=replace(
+                contribution.first_endpoint,
+                output=TxOutput.from_hex("0014" + "e1" * 20, 300),
+            ),
+        )
+        with pytest.raises(ValueError, match="P2TR"):
+            CoinJoinTxBuilder("regtest").build_unsigned_tx(self._tx_data((invalid_output,)))
+
+        zero_value = replace(
+            contribution,
+            first_endpoint=replace(
+                contribution.first_endpoint,
+                output=self._p2tr_output(0xE1, 0),
+            ),
+        )
+        with pytest.raises(ValueError, match="positive value"):
+            CoinJoinTxBuilder("regtest").build_unsigned_tx(self._tx_data((zero_value,)))
+
+    def test_rejects_duplicate_output_scripts_in_channel_mode(self) -> None:
+        contribution = replace(
+            self._contribution(),
+            first_endpoint=ChannelEndpointSettlement(
+                endpoint_id="channel-1-maker",
+                participant_key="maker-participant-key",
+                output=self._p2tr_output(0xA1, 300),
+            ),
+        )
+
+        with pytest.raises(ValueError, match="duplicate output scripts"):
+            CoinJoinTxBuilder("regtest").build_unsigned_tx(self._tx_data((contribution,)))
+
+        ordinary_duplicate = self._tx_data((self._contribution(),))
+        ordinary_duplicate = replace(
+            ordinary_duplicate,
+            maker_cj_outputs={"maker1": self._p2tr_output(0xA1, 400)},
+        )
+        with pytest.raises(ValueError, match="duplicate output scripts"):
+            CoinJoinTxBuilder("regtest").build_unsigned_tx(ordinary_duplicate)
 
 
 class TestBuildCoinjoinTx:

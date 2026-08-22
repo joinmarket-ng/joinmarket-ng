@@ -28,9 +28,11 @@ every witness, and stores exact final bytes before query-first publication. On
 restart it queries the chain before reconciling LND state, then selects pre-sign
 cancellation, exact-parent resume or publication, or force-close recovery at the
 transcript's committed height. Cancellation remains available until a durable
-partial signature is released. This API is not yet exposed by the `jm-taker`
-CLI, and the channel-input messages are not yet wired into maker or taker
-sessions.
+partial signature is released. When the opt-in `channel_input` configuration is
+enabled, the normal taker CoinJoin flow uses this coordinator and authenticated
+maker transports. Startup restores the durable taker identity, establishes fresh
+encrypted recovery sessions through connected directories, and resolves every
+active negotiation and exact-parent record before accepting new work.
 
 ## Documentation
 

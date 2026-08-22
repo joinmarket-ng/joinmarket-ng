@@ -438,6 +438,14 @@ class Taker(TakerMonitoringMixin):
 
         This should be called after sync_wallet() and any fund validation.
         """
+        if self.config.channel_input.enabled and (
+            not self.backend.has_mempool_access()
+            or not self.backend.can_get_confirmations_by_txid()
+        ):
+            raise RuntimeError(
+                "Channel-input taker requires a full backend that can query the mempool "
+                "and confirmations by transaction ID"
+            )
         if self.config.channel_ring.enabled:
             if not self.backend.has_mempool_access() or not (
                 self.backend.can_get_confirmations_by_txid()
@@ -521,6 +529,17 @@ class Taker(TakerMonitoringMixin):
                 connection_result.total,
             )
 
+        if self.config.channel_input.enabled:
+            try:
+                await self._reconcile_channel_input_startup()
+            except BaseException:
+                await self.directory_client.close_all()
+                failed_backend = self._channel_input_backend
+                self._channel_input_backend = None
+                if failed_backend is not None:
+                    await failed_backend.backend.close()
+                raise
+
         # Mark as running and start background tasks
         self.running = True
 
@@ -538,6 +557,23 @@ class Taker(TakerMonitoringMixin):
         if self._channel_ring_backend is not None:
             ring_task = asyncio.create_task(self._periodic_channel_ring_reconciliation())
             self._background_tasks.append(ring_task)
+
+    async def _reconcile_channel_input_startup(self) -> None:
+        """Resolve every durable parent before this process accepts new taker work."""
+
+        if self._channel_input_backend is None or self._channel_input_registry is None:
+            raise RuntimeError("Channel-input recovery runtime was not initialized")
+        from taker.channel_input_recovery import reconcile_taker_channel_input_records
+
+        data_directory = Path(self.config.data_dir or get_default_data_dir())
+        await reconcile_taker_channel_input_records(
+            self.config.channel_input,
+            self._channel_input_registry,
+            self._channel_input_backend,
+            self.backend,
+            self.directory_client,
+            self.config.channel_input.persistence_path(data_directory) / "parents",
+        )
 
     async def start(self) -> None:
         """
@@ -588,6 +624,7 @@ class Taker(TakerMonitoringMixin):
         self._session.reserved_inputs = set()
         self._session.input_lock_owner = secrets.token_hex(32)
         self._session.ring_coordinator = None
+        self._session.channel_input_coordinator = None
 
     @property
     def last_failure_reason(self) -> str | None:
@@ -1334,9 +1371,65 @@ class Taker(TakerMonitoringMixin):
         self._session.last_failure_reason = "Strict channel-ring negotiation aborted"
         return False
 
+    async def _prepare_channel_input(self, destination: str, mixdepth: int) -> bool:
+        if (
+            self._channel_input_backend is None
+            or self._channel_input_registry is None
+            or self._channel_input_store is None
+        ):
+            self._session.last_failure_reason = "Channel-input backend was not safely initialized"
+            logger.error(self._session.last_failure_reason)
+            return False
+        from taker.channel_input_coordinator import (
+            TakerChannelInputCoordinator,
+            TakerChannelInputCoordinatorError,
+        )
+
+        self.state = TakerState.BUILDING_TX
+        data_directory = Path(self.config.data_dir or get_default_data_dir())
+        coordinator = TakerChannelInputCoordinator(
+            self._session,
+            config=self.config.channel_input,
+            registry=self._channel_input_registry,
+            initialized_backend=self._channel_input_backend,
+            chain_backend=self.backend,
+            parent_record_directory=(
+                self.config.channel_input.persistence_path(data_directory) / "parents"
+            ),
+        )
+        self._session.channel_input_coordinator = coordinator
+        try:
+            await coordinator.prepare(destination, mixdepth)
+        except TakerChannelInputCoordinatorError as exc:
+            self._session.last_failure_reason = str(exc)
+            logger.error(f"Channel-input preparation failed: {exc}")
+            return False
+        return True
+
+    async def _finalize_channel_input_parent(self) -> None:
+        if not self.config.channel_input.enabled:
+            return
+        coordinator = self._session.channel_input_coordinator
+        if coordinator is None:
+            raise RuntimeError("Channel-input coordinator is missing after signature collection")
+        await coordinator.finalize_parent()
+
+    async def _abort_channel_input_round(self) -> None:
+        coordinator = self._session.channel_input_coordinator
+        if coordinator is None:
+            return
+        try:
+            aborted = await coordinator.abort("round_failure")
+            if not aborted:
+                logger.warning("Channel-input round abort was refused or incomplete")
+        except Exception as exc:
+            logger.warning(f"Channel-input round abort failed: {exc}")
+
     async def _build_transaction_phase(self, destination: str, mixdepth: int) -> bool:
         if self.config.channel_ring.enabled:
             return await self._prepare_channel_ring(destination, mixdepth)
+        if self.config.channel_input.enabled:
+            return await self._prepare_channel_input(destination, mixdepth)
         self.state = TakerState.BUILDING_TX
         logger.debug("Phase 3: Building transaction...")
         return await self._session._phase_build_tx(destination=destination, mixdepth=mixdepth)
@@ -1950,6 +2043,8 @@ class Taker(TakerMonitoringMixin):
                 self.state = TakerState.FAILED
                 return None
 
+            await self._finalize_channel_input_parent()
+
             return await self._finalize_and_broadcast(destination)
 
         except Exception as e:
@@ -1972,6 +2067,7 @@ class Taker(TakerMonitoringMixin):
             # cancellation, confirmation decline, or a failed broadcast can
             # leave a usable transaction.
             if self.state != TakerState.COMPLETE:
+                await self._abort_channel_input_round()
                 self.release_input_locks()
             self._clear_coinjoin_log_context()
 
@@ -2546,19 +2642,33 @@ class Taker(TakerMonitoringMixin):
         # Final confirmation before broadcast
         num_taker_inputs = len(self._session.selected_utxos)
         num_maker_inputs = sum(len(s.utxos) for s in self._session.maker_sessions.values())
-        total_inputs = num_taker_inputs + num_maker_inputs
 
         tx = deserialize_transaction(self._session.final_tx)
+        coordinator = self._session.channel_input_coordinator
+        if coordinator is not None:
+            input_values = self._session.tx_metadata.get("input_values")
+            if (
+                not isinstance(input_values, list)
+                or len(input_values) != len(tx.inputs)
+                or any(
+                    isinstance(value, bool) or not isinstance(value, int) or value <= 0
+                    for value in input_values
+                )
+            ):
+                raise RuntimeError("Channel-input parent has invalid input value metadata")
+            total_inputs = len(tx.inputs)
+            total_input_value = sum(input_values)
+        else:
+            total_inputs = num_taker_inputs + num_maker_inputs
+            taker_input_value = sum(utxo.value for utxo in self._session.selected_utxos)
+            maker_input_value = sum(
+                utxo["value"]
+                for session in self._session.maker_sessions.values()
+                for utxo in session.utxos
+            )
+            total_input_value = taker_input_value + maker_input_value
         total_outputs = len(tx.outputs)
         total_output_value = sum(out.value for out in tx.outputs)
-
-        taker_input_value = sum(utxo.value for utxo in self._session.selected_utxos)
-        maker_input_value = sum(
-            utxo["value"]
-            for session in self._session.maker_sessions.values()
-            for utxo in session.utxos
-        )
-        total_input_value = taker_input_value + maker_input_value
         actual_mining_fee = total_input_value - total_output_value
 
         final_fee_plan = self._session.maker_fee_plan()
@@ -2662,7 +2772,10 @@ class Taker(TakerMonitoringMixin):
         self.state = TakerState.BROADCASTING
         logger.debug("Phase 5: Broadcasting transaction...")
 
-        self._session.txid = await self._session._phase_broadcast()
+        if coordinator is not None:
+            self._session.txid = await coordinator.publish()
+        else:
+            self._session.txid = await self._session._phase_broadcast()
         if not self._session.txid:
             logger.error("Broadcast failed")
             self.state = TakerState.FAILED

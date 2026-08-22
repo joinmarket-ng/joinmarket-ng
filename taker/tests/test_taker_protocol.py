@@ -30,7 +30,12 @@ from jmcore.directory_pool import DirectoryConnectionResult
 from jmcore.encryption import CryptoSession
 from jmcore.models import Offer, OfferType
 from jmcore.network import ONION_HOSTID
-from jmcore.protocol import FEATURE_CHANNEL_INPUT_V1, MakerError, MessageType
+from jmcore.protocol import (
+    FEATURE_CHANNEL_INPUT_V1,
+    FEATURE_NEUTRINO_COMPAT,
+    MakerError,
+    MessageType,
+)
 from jmwallet.backends.base import Transaction
 from jmwallet.wallet.models import UTXOInfo
 from loguru import logger
@@ -3033,7 +3038,10 @@ class TestNeutrinoIncompatibleMakerReplacement:
         taker = self._make_neutrino_taker(minimum_makers=2)
 
         compatible = MakerSession(
-            nick="J5good", offer=_simple_offer("J5good"), supports_neutrino_compat=True
+            nick="J5good",
+            offer=_simple_offer("J5good"),
+            features={FEATURE_NEUTRINO_COMPAT},
+            supports_neutrino_compat=True,
         )
         incompatible = MakerSession(
             nick="J5legacy", offer=_simple_offer("J5legacy"), supports_neutrino_compat=False
@@ -3053,6 +3061,23 @@ class TestNeutrinoIncompatibleMakerReplacement:
         assert set(taker._session.maker_sessions.keys()) == {"J5good"}
         # The incompatibility preflight fires before revealing the PoDLE
         # commitment or waiting for !ioauth responses.
+        taker.directory_client.send_privmsg.assert_not_awaited()
+        taker.directory_client.wait_for_responses.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_phase_auth_reports_every_incompatible_maker_before_floor_check(self):
+        """Feature filtering must finish before enforcing the maker floor."""
+        taker = self._make_neutrino_taker(minimum_makers=2)
+        taker._session.maker_sessions = {
+            "J5legacy1": MakerSession(nick="J5legacy1", offer=_simple_offer("J5legacy1")),
+            "J5legacy2": MakerSession(nick="J5legacy2", offer=_simple_offer("J5legacy2")),
+        }
+
+        result = await taker._session._phase_auth()
+
+        assert result.success is False
+        assert result.failed_makers == ["J5legacy1", "J5legacy2"]
+        assert taker._session.maker_sessions == {}
         taker.directory_client.send_privmsg.assert_not_awaited()
         taker.directory_client.wait_for_responses.assert_not_awaited()
 

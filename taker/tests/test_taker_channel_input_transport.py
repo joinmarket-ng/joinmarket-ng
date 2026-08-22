@@ -17,18 +17,26 @@ from jmcore.channel_input import (
     ChannelInputCancelPayload,
     ChannelInputHelloPayload,
     ChannelInputInvitePayload,
+    ChannelInputKeyPair,
     ChannelInputPayload,
+    ChannelInputPreparedPayload,
     ChannelInputPreparePayload,
+    ChannelInputRecoveryAcceptPayload,
+    ChannelInputRecoveryConfirmPayload,
+    ChannelInputRecoveryInitPayload,
     ChannelInputTranscript,
     EndpointTerms,
     approval_set_hash,
     cancel_payload_hash,
     decode_channel_input_message,
     encode_channel_input_message,
+    payload_hash,
     sign_payload,
     transcript_hash,
 )
 from jmcore.channel_input_config import ChannelInputConfig
+from jmcore.encryption import CryptoSession
+from jmswap.channel_input import InitializedChannelInputBackend
 from test_channel_input_negotiation import (
     _MAKER_SECRETS,
     _approval,
@@ -47,7 +55,11 @@ from taker.channel_input_negotiation import (
 )
 from taker.channel_input_runtime import TakerChannelInputRegistry
 from taker.channel_input_store import TakerChannelInputStore
-from taker.channel_input_transport import TakerChannelInputTransport
+from taker.channel_input_transport import (
+    TakerChannelInputTransport,
+    TakerChannelInputTransportError,
+)
+from taker.coinjoin_session import CoinJoinSession
 from taker.multi_directory import ReplyRoute
 
 
@@ -77,6 +89,7 @@ class FakeDirectory:
         self.events: list[str] = []
         self.cryptos: dict[str, WireCrypto] = {}
         self.outbound_payloads: list[tuple[str, ChannelInputPayload]] = []
+        self.wait_arguments: list[dict[str, object]] = []
 
     async def send_privmsg(
         self, recipient: str, command: str, data: str, *, force_channel: str
@@ -93,6 +106,7 @@ class FakeDirectory:
         return route.channel_id
 
     async def wait_for_responses(self, **_kwargs: object) -> dict[str, dict[str, object]]:
+        self.wait_arguments.append(dict(_kwargs))
         if self.response_batches:
             return self.response_batches.pop(0)
         if self.response_factories:
@@ -115,6 +129,75 @@ class FakeRegistry:
 
     def get(self, _session_id: str, _attempt: int) -> object:
         return self.negotiation
+
+
+class RecoveryDirectory:
+    """Recovery peer that proves fresh NaCl ownership before returning a payload."""
+
+    def __init__(self, maker_secret: bytes, route: ReplyRoute) -> None:
+        self._maker_secret = maker_secret
+        self._maker_key = ChannelInputKeyPair.from_secret(maker_secret)
+        self._route = route
+        self._crypto: CryptoSession | None = None
+        self._accept: ChannelInputRecoveryAcceptPayload | None = None
+        self._responses: list[dict[str, dict[str, object]]] = []
+        self.commands: list[str] = []
+
+    async def send_privmsg_via_route(
+        self, recipient: str, command: str, data: str, route: ReplyRoute
+    ) -> str:
+        assert recipient == "maker-a"
+        assert route == self._route
+        self.commands.append(command)
+        if self._accept is None:
+            init = TakerChannelInputTransport._decode_recovery_token(data)
+            assert isinstance(init, ChannelInputRecoveryInitPayload)
+            crypto = CryptoSession()
+            crypto.setup_encryption(init.ephemeral_pubkey)
+            accept = sign_payload(
+                ChannelInputRecoveryAcceptPayload(
+                    session_id=init.session_id,
+                    attempt=init.attempt,
+                    signer_key=self._maker_key.public_key,
+                    recovery_id=init.recovery_id,
+                    init_hash=payload_hash(init).hex(),
+                    ephemeral_pubkey=crypto.get_pubkey_hex(),
+                ),
+                self._maker_secret,
+            )
+            self._crypto = crypto
+            self._accept = accept
+            token = TakerChannelInputTransport._encode_recovery_token(accept)
+            self._responses.append({"maker-a": {"data": f"{token} key sig", "route": route}})
+            return route.channel_id
+        assert self._crypto is not None
+        recovery_id, ciphertext = data.split()
+        inbound = decode_channel_input_message(self._crypto.decrypt(ciphertext))
+        response: ChannelInputPayload
+        if isinstance(inbound, ChannelInputRecoveryConfirmPayload):
+            assert self._accept is not None
+            assert inbound.accept_hash == payload_hash(self._accept).hex()
+            response = self._accept
+        else:
+            response = sign_payload(
+                ChannelInputPreparedPayload(
+                    session_id=inbound.session_id,
+                    attempt=inbound.attempt,
+                    signer_key=self._maker_key.public_key,
+                    transcript_hash="01" * 32,
+                    funding_outpoint=_freeze_remote(0).funding_outpoint,
+                    public_nonce="02" * 66,
+                ),
+                self._maker_secret,
+            )
+        encrypted = self._crypto.encrypt(encode_channel_input_message(response))
+        self._responses.append(
+            {"maker-a": {"data": f"{recovery_id} {encrypted} key sig", "route": route}}
+        )
+        return route.channel_id
+
+    async def wait_for_responses(self, **_kwargs: object) -> dict[str, dict[str, object]]:
+        return self._responses.pop(0)
 
 
 def _transport(
@@ -140,11 +223,12 @@ def _transport(
     )
     return (
         TakerChannelInputTransport(
-            session=session,
+            session=cast(CoinJoinSession, session),
             registry=cast(TakerChannelInputRegistry, registry or FakeRegistry(negotiation)),
             initialized_backend=cast(
-                object, initialized_backend or SimpleNamespace(backend=backend or FakeBackend())
-            ),  # type: ignore[arg-type]
+                InitializedChannelInputBackend,
+                initialized_backend or SimpleNamespace(backend=backend or FakeBackend()),
+            ),
             config=config or ChannelInputConfig(),
             settlement_script_allocator=lambda _nick: "5120" + "01" * 32,
             current_time=current_time,
@@ -753,3 +837,131 @@ async def test_inner_validation_rejects_type_session_and_signature_but_uses_oute
                 ChannelInputHelloPayload,
                 accept,
             )
+
+
+@pytest.mark.asyncio
+async def test_single_maker_exchange_reuses_latest_route_and_refreshes_ingress() -> None:
+    negotiation = _new()
+    negotiation.selected_nicks = ("maker-a",)  # type: ignore[misc]
+    transport, directory, cryptos = _transport(negotiation, ("maker-a",))
+    old_route = ReplyRoute(nick="maker-a", channel_id="old-direct")
+    new_route = ReplyRoute(nick="maker-a", channel_id="new-direct")
+    transport._routes["maker-a"] = old_route
+    response = sign_payload(
+        ChannelInputPreparedPayload(
+            session_id=negotiation.invite.session_id,
+            attempt=negotiation.invite.attempt,
+            signer_key=_freeze_remote(0).participant_key,
+            transcript_hash="01" * 32,
+            funding_outpoint=_freeze_remote(0).funding_outpoint,
+            public_nonce="02" * 66,
+        ),
+        _MAKER_SECRETS[0],
+        aux_randomness=b"\x08" * 32,
+    )
+    directory.responses = {
+        "maker-a": _response("maker-a", response, cryptos["maker-a"], "new-direct")
+    }
+
+    received = await transport.exchange_one(
+        negotiation.invite.session_id,
+        negotiation.invite.attempt,
+        "maker-a",
+        negotiation.invite,
+        ChannelInputPreparedPayload,
+    )
+
+    assert received == response
+    assert directory.routed[-1][3] == old_route
+    assert directory.wait_arguments[-1]["expected_nicks"] == ["maker-a"]
+    assert directory.wait_arguments[-1]["expected_command"] == "!channel_input"
+    assert transport.latest_reply_routes == (("maker-a", new_route),)
+
+
+@pytest.mark.asyncio
+async def test_recovery_establishes_fresh_crypto_without_live_maker_session() -> None:
+    negotiation = _new()
+    negotiation.selected_nicks = ("maker-a",)  # type: ignore[misc]
+    _add_freeze(negotiation, "maker-a", 0)
+    negotiation.install_frozen_channel("maker-a", _frozen_snapshot(0))
+    route = ReplyRoute(nick="maker-a", channel_id="direct:fresh")
+    directory = RecoveryDirectory(_MAKER_SECRETS[0], route)
+    session = SimpleNamespace(maker_sessions={}, directory_client=directory)
+    transport = TakerChannelInputTransport(
+        session=cast(CoinJoinSession, session),
+        registry=cast(TakerChannelInputRegistry, FakeRegistry(negotiation)),
+        initialized_backend=cast(
+            InitializedChannelInputBackend, SimpleNamespace(backend=FakeBackend())
+        ),
+        config=ChannelInputConfig(),
+        settlement_script_allocator=lambda _nick: "5120" + "01" * 32,
+        current_time=1,
+        current_height=1,
+    )
+
+    assert (
+        await transport.establish_recovery(
+            negotiation.invite.session_id, negotiation.invite.attempt, "maker-a", route
+        )
+        == route
+    )
+    response = await transport.exchange_one(
+        negotiation.invite.session_id,
+        negotiation.invite.attempt,
+        "maker-a",
+        negotiation.invite,
+        ChannelInputPreparedPayload,
+    )
+
+    assert isinstance(response, ChannelInputPreparedPayload)
+    assert directory.commands == [
+        "channel_input_recover",
+        "channel_input_recover",
+        "channel_input_recover",
+    ]
+
+
+def test_recovery_response_parsers_require_exact_verified_envelopes() -> None:
+    negotiation = _new()
+    maker_key = ChannelInputKeyPair.from_secret(_MAKER_SECRETS[0])
+    crypto = CryptoSession()
+    accept = sign_payload(
+        ChannelInputRecoveryAcceptPayload(
+            session_id=negotiation.invite.session_id,
+            attempt=negotiation.invite.attempt,
+            signer_key=maker_key.public_key,
+            recovery_id="22" * 32,
+            init_hash="33" * 32,
+            ephemeral_pubkey=crypto.get_pubkey_hex(),
+        ),
+        _MAKER_SECRETS[0],
+    )
+    token = TakerChannelInputTransport._encode_recovery_token(accept)
+
+    assert (
+        TakerChannelInputTransport._decode_recovery_response_token(
+            f"{token} outer-key outer-signature"
+        )
+        == accept
+    )
+    for malformed in (token, f"{token} outer-key outer-signature extra"):
+        with pytest.raises(TakerChannelInputTransportError, match="malformed"):
+            TakerChannelInputTransport._decode_recovery_response_token(malformed)
+
+    wire = WireCrypto()
+    ciphertext = wire.encrypt(encode_channel_input_message(accept))
+    recovery_id = accept.recovery_id
+    assert (
+        TakerChannelInputTransport._decode_recovery_encrypted(
+            f"{recovery_id} {ciphertext} outer-key outer-signature",
+            recovery_id,
+            wire,
+        )
+        == accept
+    )
+    for malformed in (
+        f"{recovery_id} {ciphertext}",
+        f"{recovery_id} {ciphertext} outer-key outer-signature extra",
+    ):
+        with pytest.raises(TakerChannelInputTransportError, match="active ID"):
+            TakerChannelInputTransport._decode_recovery_encrypted(malformed, recovery_id, wire)

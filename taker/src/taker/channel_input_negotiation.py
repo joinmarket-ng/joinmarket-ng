@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import secrets
 from collections.abc import Sequence
 from enum import StrEnum
 from typing import Literal, TypeVar, cast
@@ -13,13 +14,23 @@ from jmcore.channel_input import (
     ChannelInputApprovalSetPayload,
     ChannelInputCancelAckPayload,
     ChannelInputCancelPayload,
+    ChannelInputFinalizedPayload,
+    ChannelInputFinalizePayload,
     ChannelInputHelloPayload,
     ChannelInputInvitePayload,
     ChannelInputKeyPair,
     ChannelInputModel,
+    ChannelInputPartialPayload,
     ChannelInputPayload,
+    ChannelInputPreparedPayload,
     ChannelInputPreparePayload,
     ChannelInputProposalPayload,
+    ChannelInputRecoveryAcceptPayload,
+    ChannelInputRecoveryConfirmPayload,
+    ChannelInputRecoveryInitPayload,
+    ChannelInputSignPayload,
+    ChannelInputStatusPayload,
+    ChannelInputStatusRequestPayload,
     ChannelInputTranscript,
     ChannelInputValidationError,
     EndpointTerms,
@@ -33,16 +44,27 @@ from jmcore.channel_input import (
     transcript_hash,
     validate_cancel_ack,
     validate_complete_approval_set,
+    validate_finalize_for_transcript,
+    validate_finalized_for_transcript,
     validate_hello_for_invite,
     validate_hello_pair,
+    validate_partial_for_transcript,
     validate_prepare_payload,
+    validate_prepared_for_transcript,
     validate_proposal_for_hellos,
     validate_revealed_endpoint_pair,
+    validate_sign_for_transcript,
+    validate_status_for_transcript,
     validate_transcript_for_invite,
     verify_payload,
 )
 from jmcore.channel_input_session import ChannelInputActorRegistry, ChannelInputReplayLedger
-from jmswap.lnd import ChannelInputCandidate, EscrowOutpoint, FrozenChannelSnapshot
+from jmswap.lnd import (
+    ChannelInputCandidate,
+    EscrowOutpoint,
+    FrozenChannelSnapshot,
+    LndEscrowSigningAttempt,
+)
 from pydantic import Field, field_serializer, field_validator, model_validator
 
 _FROZEN_SNAPSHOT_BYTE_FIELDS = (
@@ -135,6 +157,86 @@ class TakerFrozenChannelInput(ChannelInputModel):
         return data
 
 
+class TakerChannelInputParentChannelState(ChannelInputModel):
+    """Durable post-prepare signing evidence for exactly one selected maker."""
+
+    nick: str = Field(min_length=1)
+    funding_outpoint: Outpoint
+    local_attempt_id: str | None = Field(default=None, repr=False)
+    local_prepared: ChannelInputPreparedPayload | None = None
+    remote_prepared: ChannelInputPreparedPayload | None = None
+    local_restart_intended: bool = False
+    sign_request: ChannelInputSignPayload | None = None
+    local_partial: ChannelInputPartialPayload | None = None
+    remote_partial: ChannelInputPartialPayload | None = None
+    finalize_request: ChannelInputFinalizePayload | None = None
+    remote_finalized: ChannelInputFinalizedPayload | None = None
+    status_request: ChannelInputStatusRequestPayload | None = None
+    status_response: ChannelInputStatusPayload | None = None
+
+    @field_validator("local_attempt_id")
+    @classmethod
+    def validate_attempt_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str) or len(value) != 64 or value.lower() != value:
+            raise ValueError("local_attempt_id must be 32-byte lowercase hexadecimal")
+        try:
+            bytes.fromhex(value)
+        except ValueError as exc:
+            raise ValueError("local_attempt_id must be 32-byte lowercase hexadecimal") from exc
+        return value
+
+    @model_validator(mode="after")
+    def validate_shape(self) -> TakerChannelInputParentChannelState:
+        payloads = (
+            self.local_prepared,
+            self.remote_prepared,
+            self.sign_request,
+            self.local_partial,
+            self.remote_partial,
+            self.finalize_request,
+            self.remote_finalized,
+            self.status_request,
+            self.status_response,
+        )
+        if any(
+            payload is not None and payload.funding_outpoint != self.funding_outpoint
+            for payload in payloads
+        ):
+            raise ValueError("parent channel state payload outpoint differs from state")
+        if (self.local_attempt_id is None) != (self.local_prepared is None):
+            raise ValueError("local signing attempt and prepared evidence must be paired")
+        if self.sign_request is not None and (
+            self.local_prepared is None or self.remote_prepared is None
+        ):
+            raise ValueError("sign request requires both prepared records")
+        if self.local_partial is not None and self.sign_request is None:
+            raise ValueError("local partial requires a sign request")
+        if self.remote_partial is not None and self.sign_request is None:
+            raise ValueError("remote partial requires a sign request")
+        if self.finalize_request is not None and (
+            self.local_partial is None or self.remote_partial is None
+        ):
+            raise ValueError("finalize request requires both partial records")
+        if self.remote_finalized is not None and self.finalize_request is None:
+            raise ValueError("remote finalized evidence requires a finalize request")
+        if self.status_response is not None and self.status_request is None:
+            raise ValueError("status response requires a status request")
+        if self.local_restart_intended and any(
+            value is not None
+            for value in (
+                self.sign_request,
+                self.local_partial,
+                self.remote_partial,
+                self.finalize_request,
+                self.remote_finalized,
+            )
+        ):
+            raise ValueError("local restart intent conflicts with signing evidence")
+        return self
+
+
 class TakerChannelInputSnapshot(ChannelInputModel):
     """The complete signed coordinator state for a single protocol attempt."""
 
@@ -158,6 +260,7 @@ class TakerChannelInputSnapshot(ChannelInputModel):
     local_ack: ChannelInputApprovalSetAckPayload | None = None
     maker_acks: tuple[tuple[str, ChannelInputApprovalSetAckPayload], ...] = ()
     prepare: ChannelInputPreparePayload | None = None
+    parent_channel_states: tuple[TakerChannelInputParentChannelState, ...] = ()
     cancel: ChannelInputCancelPayload | None = None
     cancel_acks: tuple[tuple[str, ChannelInputCancelAckPayload], ...] = ()
     local_resumed_outpoints: tuple[Outpoint, ...] = ()
@@ -187,6 +290,32 @@ class TakerChannelInputSnapshot(ChannelInputModel):
             raise ValueError("local_actor must not be selected")
         if self.invite.network != self.network:
             raise ValueError("snapshot network differs from invitation")
+        if (
+            tuple(sorted(self.parent_channel_states, key=lambda state: state.nick))
+            != self.parent_channel_states
+        ):
+            raise ValueError("parent channel states must be nick-sorted")
+        if len({state.nick for state in self.parent_channel_states}) != len(
+            self.parent_channel_states
+        ):
+            raise ValueError("parent channel states must have unique nicks")
+        if self.parent_channel_states and self.stage not in {
+            TakerChannelInputStage.PREPARE_READY,
+            TakerChannelInputStage.CANCEL_INTENDED,
+            TakerChannelInputStage.CANCELED,
+        }:
+            raise ValueError("parent channel states require prepare-ready or cancellation stage")
+        if self.stage in {
+            TakerChannelInputStage.CANCEL_INTENDED,
+            TakerChannelInputStage.CANCELED,
+        } and any(
+            state.local_partial is not None
+            or state.remote_partial is not None
+            or state.finalize_request is not None
+            or state.remote_finalized is not None
+            for state in self.parent_channel_states
+        ):
+            raise ValueError("canceled snapshot contains partial or final parent evidence")
         return self
 
 
@@ -217,6 +346,7 @@ class TakerChannelInputNegotiation:
         local_ack: ChannelInputApprovalSetAckPayload | None = None,
         maker_acks: tuple[tuple[str, ChannelInputApprovalSetAckPayload], ...] = (),
         prepare: ChannelInputPreparePayload | None = None,
+        parent_channel_states: tuple[TakerChannelInputParentChannelState, ...] = (),
         cancel: ChannelInputCancelPayload | None = None,
         cancel_acks: tuple[tuple[str, ChannelInputCancelAckPayload], ...] = (),
         local_resumed_outpoints: tuple[Outpoint, ...] = (),
@@ -242,6 +372,7 @@ class TakerChannelInputNegotiation:
         self.local_ack = local_ack
         self.maker_acks = maker_acks
         self.prepare = prepare
+        self.parent_channel_states = parent_channel_states
         self.cancel = cancel
         self.cancel_acks = cancel_acks
         self.local_resumed_outpoints = local_resumed_outpoints
@@ -264,22 +395,19 @@ class TakerChannelInputNegotiation:
     ) -> TakerChannelInputNegotiation:
         nicks = _selected_nicks(selected_nicks, local_actor)
         key_pair = ChannelInputKeyPair.from_secret(secret_key)
-        invite = cast(
-            ChannelInputInvitePayload,
-            sign_payload(
-                ChannelInputInvitePayload(
-                    session_id=session_id,
-                    attempt=attempt,
-                    signer_key=key_pair.public_key,
-                    network=network,
-                    expiry=expiry,
-                    max_parent_fee_sat=max_parent_fee_sat,
-                    max_fee_rate_sat_vb=max_fee_rate_sat_vb,
-                    min_recovery_delta=min_recovery_delta,
-                    max_recovery_delta=max_recovery_delta,
-                ),
-                secret_key,
+        invite = sign_payload(
+            ChannelInputInvitePayload(
+                session_id=session_id,
+                attempt=attempt,
+                signer_key=key_pair.public_key,
+                network=network,
+                expiry=expiry,
+                max_parent_fee_sat=max_parent_fee_sat,
+                max_fee_rate_sat_vb=max_fee_rate_sat_vb,
+                min_recovery_delta=min_recovery_delta,
+                max_recovery_delta=max_recovery_delta,
             ),
+            secret_key,
         )
         registry = ChannelInputActorRegistry()
         registry.bind(local_actor, key_pair.public_key)
@@ -298,6 +426,32 @@ class TakerChannelInputNegotiation:
     @property
     def coordinator_key(self) -> str:
         return self._key_pair.public_key
+
+    def sign_recovery_init(
+        self, payload: ChannelInputRecoveryInitPayload
+    ) -> ChannelInputRecoveryInitPayload:
+        """Sign a process-local recovery request with the durable coordinator key."""
+
+        if payload.signer_key != self.coordinator_key:
+            raise ChannelInputValidationError("recovery request signer differs from coordinator")
+        return sign_payload(payload, self._key_pair.secret_key)
+
+    def sign_recovery_confirm(
+        self, payload: ChannelInputRecoveryConfirmPayload
+    ) -> ChannelInputRecoveryConfirmPayload:
+        """Sign the encrypted recovery proof with the durable coordinator key."""
+
+        if payload.signer_key != self.coordinator_key:
+            raise ChannelInputValidationError("recovery confirm signer differs from coordinator")
+        return sign_payload(payload, self._key_pair.secret_key)
+
+    def require_recovery_accept(
+        self, nick: str, payload: ChannelInputRecoveryAcceptPayload
+    ) -> None:
+        """Require a recovery response from the selected maker's durable signer."""
+
+        self._require_nick(nick)
+        self._registry.require_verified(nick, payload)
 
     def snapshot(self) -> TakerChannelInputSnapshot:
         return TakerChannelInputSnapshot(
@@ -320,6 +474,7 @@ class TakerChannelInputNegotiation:
             local_ack=self.local_ack,
             maker_acks=self.maker_acks,
             prepare=self.prepare,
+            parent_channel_states=self.parent_channel_states,
             cancel=self.cancel,
             cancel_acks=self.cancel_acks,
             local_resumed_outpoints=self.local_resumed_outpoints,
@@ -360,6 +515,7 @@ class TakerChannelInputNegotiation:
             local_ack=snapshot.local_ack,
             maker_acks=snapshot.maker_acks,
             prepare=snapshot.prepare,
+            parent_channel_states=snapshot.parent_channel_states,
             cancel=snapshot.cancel,
             cancel_acks=snapshot.cancel_acks,
             local_resumed_outpoints=snapshot.local_resumed_outpoints,
@@ -548,9 +704,7 @@ class TakerChannelInputNegotiation:
                 recipient_key=hello.participant_key,
                 recipient_terms=recipient_terms,
             )
-            signed = cast(
-                ChannelInputProposalPayload, sign_payload(proposal, self._key_pair.secret_key)
-            )
+            signed = sign_payload(proposal, self._key_pair.secret_key)
             validate_proposal_for_hellos(
                 self.invite,
                 (hello,),
@@ -568,9 +722,7 @@ class TakerChannelInputNegotiation:
             transcript_hash=transcript_hash(transcript).hex(),
             terms_hashes=tuple(sorted(transcript.terms_hashes_for(self.coordinator_key))),
         )
-        signed_local = cast(
-            ChannelInputApprovalPayload, sign_payload(local, self._key_pair.secret_key)
-        )
+        signed_local = sign_payload(local, self._key_pair.secret_key)
         self._registry.require_verified(self.local_actor, signed_local)
         _record(self._ledger, _slot("approval_local"), signed_local)
         self.transcript = transcript
@@ -624,9 +776,7 @@ class TakerChannelInputNegotiation:
             transcript=self.transcript,
             approvals=approvals,
         )
-        signed = cast(
-            ChannelInputApprovalSetPayload, sign_payload(approval_set, self._key_pair.secret_key)
-        )
+        signed = sign_payload(approval_set, self._key_pair.secret_key)
         validate_complete_approval_set(signed)
         ack = ChannelInputApprovalSetAckPayload(
             session_id=self.invite.session_id,
@@ -635,9 +785,7 @@ class TakerChannelInputNegotiation:
             transcript_hash=transcript_hash(self.transcript).hex(),
             approval_set_hash=approval_set_hash(signed).hex(),
         )
-        signed_ack = cast(
-            ChannelInputApprovalSetAckPayload, sign_payload(ack, self._key_pair.secret_key)
-        )
+        signed_ack = sign_payload(ack, self._key_pair.secret_key)
         self._registry.require_verified(self.local_actor, signed)
         self._registry.require_verified(self.local_actor, signed_ack)
         _record(self._ledger, _slot("approval_set"), signed)
@@ -694,13 +842,278 @@ class TakerChannelInputNegotiation:
                 )
             ),
         )
-        signed = cast(ChannelInputPreparePayload, sign_payload(prepare, self._key_pair.secret_key))
+        signed = sign_payload(prepare, self._key_pair.secret_key)
         validate_prepare_payload(signed)
         self._registry.require_verified(self.local_actor, signed)
         _record(self._ledger, _slot("prepare"), signed)
         self.prepare = signed
         self.stage = TakerChannelInputStage.PREPARE_READY
         return signed
+
+    def accept_remote_prepared(self, nick: str, payload: ChannelInputPreparedPayload) -> None:
+        """Accept one maker's signed nonce after the complete prepare authorization."""
+
+        self._require_post_prepare(nick)
+        state = self._state_for_nick(nick)
+        if state.remote_prepared is not None:
+            if state.remote_prepared != payload:
+                raise ChannelInputValidationError(
+                    "remote prepared conflicts with durable channel state"
+                )
+            return
+        self._validate_remote_prepared(nick, payload)
+        self._replace_parent_channel_state(state.model_copy(update={"remote_prepared": payload}))
+
+    def record_local_prepared(
+        self, nick: str, attempt: LndEscrowSigningAttempt
+    ) -> ChannelInputPreparedPayload:
+        """Sign and retain the local LND nonce before exposing it to a maker."""
+
+        self._require_post_prepare(nick)
+        attempt = _validated_signing_attempt(attempt)
+        state = self._state_for_nick(nick)
+        if state.local_prepared is not None:
+            if (
+                state.local_attempt_id == attempt.attempt_id.hex()
+                and state.local_prepared.public_nonce == attempt.public_nonce.hex()
+            ):
+                return state.local_prepared
+            if not state.local_restart_intended:
+                raise ChannelInputValidationError(
+                    "local prepared conflicts with durable channel state"
+                )
+            self._require_unconsumed_local_prepared(state)
+            if state.local_attempt_id == attempt.attempt_id.hex():
+                raise ChannelInputValidationError(
+                    "local prepared rotation requires a new LND attempt"
+                )
+        prepared = self._sign_local_prepared(nick, attempt)
+        self._replace_parent_channel_state(
+            state.model_copy(
+                update={
+                    "local_attempt_id": attempt.attempt_id.hex(),
+                    "local_prepared": prepared,
+                    "local_restart_intended": False,
+                }
+            )
+        )
+        return prepared
+
+    def plan_local_prepared_rotation(self, nick: str) -> None:
+        """Persist intent to replace one unconsumed local LND signing attempt."""
+
+        self._require_post_prepare(nick)
+        state = self._state_for_nick(nick)
+        if state.local_prepared is None:
+            raise ChannelInputValidationError(
+                "local prepared rotation requires local prepared evidence"
+            )
+        self._require_unconsumed_local_prepared(state)
+        if not state.local_restart_intended:
+            self._replace_parent_channel_state(
+                state.model_copy(update={"local_restart_intended": True})
+            )
+
+    def build_sign_request(self, nick: str) -> ChannelInputSignPayload:
+        """Build the exact coordinator signing authorization for one maker channel."""
+
+        self._require_post_prepare(nick)
+        state = self._state_for_nick(nick)
+        if state.sign_request is not None:
+            return state.sign_request
+        if (
+            state.local_prepared is None
+            or state.remote_prepared is None
+            or state.local_restart_intended
+        ):
+            raise ChannelInputValidationError(
+                "sign request requires stable local and remote prepared evidence"
+            )
+        request = ChannelInputSignPayload(
+            session_id=self.invite.session_id,
+            attempt=self.invite.attempt,
+            signer_key=self.coordinator_key,
+            transcript_hash=self._transcript_hash(),
+            funding_outpoint=state.funding_outpoint,
+            local_public_nonce=state.remote_prepared.public_nonce,
+            peer_prepared=state.local_prepared,
+        )
+        signed = sign_payload(request, self._key_pair.secret_key)
+        self._validate_sign_request(nick, signed, state)
+        self._replace_parent_channel_state(state.model_copy(update={"sign_request": signed}))
+        return signed
+
+    def accept_remote_partial(self, nick: str, payload: ChannelInputPartialPayload) -> None:
+        """Accept exactly one maker partial signature with its ordered nonce pair."""
+
+        self._require_post_prepare(nick)
+        state = self._state_for_nick(nick)
+        if state.remote_partial is not None:
+            if state.remote_partial != payload:
+                raise ChannelInputValidationError(
+                    "remote partial conflicts with durable channel state"
+                )
+            return
+        self._validate_remote_partial(nick, payload, state)
+        self._replace_parent_channel_state(state.model_copy(update={"remote_partial": payload}))
+
+    def record_local_partial(
+        self, nick: str, partial_signature: bytes
+    ) -> ChannelInputPartialPayload:
+        """Sign and retain the coordinator partial after its sign request is durable."""
+
+        self._require_post_prepare(nick)
+        if not isinstance(partial_signature, bytes) or len(partial_signature) != 32:
+            raise ChannelInputValidationError("partial signature must be exactly 32 bytes")
+        state = self._state_for_nick(nick)
+        if state.local_partial is not None:
+            if state.local_partial.partial_signature == partial_signature.hex():
+                return state.local_partial
+            raise ChannelInputValidationError("local partial conflicts with durable channel state")
+        if (
+            state.sign_request is None
+            or state.local_prepared is None
+            or state.remote_prepared is None
+        ):
+            raise ChannelInputValidationError(
+                "local partial requires durable sign and prepared evidence"
+            )
+        partial = ChannelInputPartialPayload(
+            session_id=self.invite.session_id,
+            attempt=self.invite.attempt,
+            signer_key=self.coordinator_key,
+            transcript_hash=self._transcript_hash(),
+            funding_outpoint=state.funding_outpoint,
+            local_public_nonce=state.local_prepared.public_nonce,
+            peer_public_nonce=state.remote_prepared.public_nonce,
+            partial_signature=partial_signature.hex(),
+        )
+        signed = sign_payload(partial, self._key_pair.secret_key)
+        self._validate_local_partial(signed, state)
+        self._replace_parent_channel_state(state.model_copy(update={"local_partial": signed}))
+        return signed
+
+    def build_finalize_request(self, nick: str) -> ChannelInputFinalizePayload:
+        """Build the exact coordinator finalization authorization for one maker channel."""
+
+        self._require_post_prepare(nick)
+        state = self._state_for_nick(nick)
+        if state.finalize_request is not None:
+            return state.finalize_request
+        if (
+            state.local_prepared is None
+            or state.remote_prepared is None
+            or state.local_partial is None
+            or state.remote_partial is None
+        ):
+            raise ChannelInputValidationError(
+                "finalize request requires both prepared and partial records"
+            )
+        request = ChannelInputFinalizePayload(
+            session_id=self.invite.session_id,
+            attempt=self.invite.attempt,
+            signer_key=self.coordinator_key,
+            transcript_hash=self._transcript_hash(),
+            funding_outpoint=state.funding_outpoint,
+            local_public_nonce=state.remote_prepared.public_nonce,
+            peer_partial=state.local_partial,
+        )
+        signed = sign_payload(request, self._key_pair.secret_key)
+        self._validate_finalize_request(nick, signed, state)
+        self._replace_parent_channel_state(state.model_copy(update={"finalize_request": signed}))
+        return signed
+
+    def accept_remote_finalized(self, nick: str, payload: ChannelInputFinalizedPayload) -> None:
+        """Accept exact maker final-parent evidence after the finalize authorization."""
+
+        self._require_post_prepare(nick)
+        state = self._state_for_nick(nick)
+        if state.remote_finalized is not None:
+            if state.remote_finalized != payload:
+                raise ChannelInputValidationError(
+                    "remote finalized conflicts with durable channel state"
+                )
+            return
+        if state.finalize_request is None:
+            raise ChannelInputValidationError(
+                "remote finalized requires a durable finalize request"
+            )
+        self._registry.require_verified(nick, payload)
+        assert self.transcript is not None
+        validate_finalized_for_transcript(payload, self.transcript)
+        if (
+            payload.signer_key != self._maker_key(nick)
+            or payload.funding_outpoint != state.funding_outpoint
+        ):
+            raise ChannelInputValidationError(
+                "remote finalized differs from maker channel identity"
+            )
+        self._replace_parent_channel_state(state.model_copy(update={"remote_finalized": payload}))
+
+    def build_status_request(self, nick: str) -> ChannelInputStatusRequestPayload:
+        """Persist a fresh query before returning it, or replay an unanswered query exactly."""
+
+        self._require_post_prepare(nick)
+        state = self._state_for_nick(nick)
+        if state.status_request is not None and state.status_response is None:
+            return state.status_request
+        request = ChannelInputStatusRequestPayload(
+            session_id=self.invite.session_id,
+            attempt=self.invite.attempt,
+            signer_key=self.coordinator_key,
+            transcript_hash=self._transcript_hash(),
+            funding_outpoint=state.funding_outpoint,
+            query_id=secrets.token_bytes(32).hex(),
+        )
+        signed = sign_payload(request, self._key_pair.secret_key)
+        self._registry.require_verified(self.local_actor, signed)
+        self._replace_parent_channel_state(
+            state.model_copy(update={"status_request": signed, "status_response": None})
+        )
+        return signed
+
+    def accept_remote_status(self, nick: str, response: ChannelInputStatusPayload) -> None:
+        """Merge one exact signed maker status without regressing stronger evidence."""
+
+        self._require_post_prepare(nick)
+        state = self._state_for_nick(nick)
+        if state.status_response is not None:
+            if state.status_response == response:
+                return
+            raise ChannelInputValidationError(
+                "status response conflicts with durable channel state"
+            )
+        if state.status_request is None:
+            raise ChannelInputValidationError("status response requires an exact pending request")
+        assert self.transcript is not None
+        self._registry.require_verified(nick, response)
+        validate_status_for_transcript(
+            response, state.status_request, self.transcript, self._maker_key(nick)
+        )
+        if response.prepared.funding_outpoint != state.funding_outpoint:
+            raise ChannelInputValidationError("status prepared differs from maker channel")
+        replacement = state
+        if state.remote_prepared is None:
+            self._validate_remote_prepared(nick, response.prepared)
+            replacement = replacement.model_copy(update={"remote_prepared": response.prepared})
+        elif state.remote_prepared != response.prepared:
+            if response.escrow_stage != "parent_prepared" or self._has_sign_or_stronger_evidence(
+                state
+            ):
+                raise ChannelInputValidationError(
+                    "status prepared conflicts with durable signing evidence"
+                )
+            self._validate_remote_prepared(nick, response.prepared)
+            replacement = replacement.model_copy(update={"remote_prepared": response.prepared})
+        if replacement.local_prepared is not None and response.partial is not None:
+            if response.partial.peer_public_nonce != replacement.local_prepared.public_nonce:
+                raise ChannelInputValidationError(
+                    "status partial peer nonce differs from local prepared"
+                )
+        replacement = self._merge_status_evidence(nick, response, replacement)
+        self._replace_parent_channel_state(
+            replacement.model_copy(update={"status_response": response})
+        )
 
     def plan_cancel(self, reason_code: str) -> ChannelInputCancelPayload:
         if self.cancel is not None:
@@ -718,6 +1131,10 @@ class TakerChannelInputNegotiation:
             TakerChannelInputStage.PREPARE_READY,
         }:
             raise ChannelInputValidationError("cancel is not valid at this negotiation stage")
+        if self._has_partial_or_final_evidence():
+            raise ChannelInputValidationError(
+                "cancel conflicts with durable partial or final evidence"
+            )
         cancel = ChannelInputCancelPayload(
             session_id=self.invite.session_id,
             attempt=self.invite.attempt,
@@ -726,7 +1143,7 @@ class TakerChannelInputNegotiation:
             reason_code=reason_code,
             partial_released=False,
         )
-        signed = cast(ChannelInputCancelPayload, sign_payload(cancel, self._key_pair.secret_key))
+        signed = sign_payload(cancel, self._key_pair.secret_key)
         self._registry.require_verified(self.local_actor, signed)
         _record(self._ledger, _slot("cancel"), signed)
         self.cancel = signed
@@ -786,6 +1203,259 @@ class TakerChannelInputNegotiation:
             raise ChannelInputValidationError("local resume is not valid at this negotiation stage")
         self.local_resumed_outpoints = resumed
         self.stage = TakerChannelInputStage.CANCELED
+
+    def _require_post_prepare(self, nick: str) -> None:
+        self._require_nick(nick)
+        if self.stage is not TakerChannelInputStage.PREPARE_READY or self.prepare is None:
+            raise ChannelInputValidationError(
+                "post-prepare channel state requires accepted prepare"
+            )
+        if self.prepare != self._exact_prepare():
+            raise ChannelInputValidationError(
+                "post-prepare channel state requires exact accepted prepare"
+            )
+
+    def _exact_prepare(self) -> ChannelInputPreparePayload:
+        assert self.transcript is not None and self.approval_set is not None
+        assert self.local_ack is not None
+        expected_acks = tuple(
+            sorted(
+                (self.local_ack, *(ack for _, ack in self.maker_acks)),
+                key=lambda item: item.signer_key,
+            )
+        )
+        return ChannelInputPreparePayload(
+            session_id=self.invite.session_id,
+            attempt=self.invite.attempt,
+            signer_key=self.coordinator_key,
+            transcript_hash=transcript_hash(self.transcript).hex(),
+            approval_set_hash=approval_set_hash(self.approval_set).hex(),
+            approval_set=self.approval_set,
+            approval_set_acks=expected_acks,
+            sig=self.prepare.sig if self.prepare is not None else "00" * 64,
+        )
+
+    def _state_for_nick(self, nick: str) -> TakerChannelInputParentChannelState:
+        self._require_nick(nick)
+        existing = next((state for state in self.parent_channel_states if state.nick == nick), None)
+        if existing is not None:
+            return existing
+        remote = dict(self.remote_hellos).get(nick)
+        if remote is None:
+            raise ChannelInputValidationError("parent channel state requires accepted maker hello")
+        return TakerChannelInputParentChannelState(
+            nick=nick, funding_outpoint=remote.funding_outpoint
+        )
+
+    def _replace_parent_channel_state(
+        self, replacement: TakerChannelInputParentChannelState
+    ) -> None:
+        states = [
+            replacement if state.nick == replacement.nick else state
+            for state in self.parent_channel_states
+        ]
+        if not any(state.nick == replacement.nick for state in self.parent_channel_states):
+            states.append(replacement)
+        self.parent_channel_states = tuple(sorted(states, key=lambda state: state.nick))
+
+    def _maker_key(self, nick: str) -> str:
+        try:
+            return dict(self.remote_hellos)[nick].participant_key
+        except KeyError as exc:
+            raise ChannelInputValidationError("maker hello is absent from negotiation") from exc
+
+    def _transcript_hash(self) -> str:
+        assert self.transcript is not None
+        return transcript_hash(self.transcript).hex()
+
+    def _sign_local_prepared(
+        self, nick: str, attempt: LndEscrowSigningAttempt
+    ) -> ChannelInputPreparedPayload:
+        state = self._state_for_nick(nick)
+        prepared = ChannelInputPreparedPayload(
+            session_id=self.invite.session_id,
+            attempt=self.invite.attempt,
+            signer_key=self.coordinator_key,
+            transcript_hash=self._transcript_hash(),
+            funding_outpoint=state.funding_outpoint,
+            public_nonce=attempt.public_nonce.hex(),
+        )
+        signed = sign_payload(prepared, self._key_pair.secret_key)
+        assert self.transcript is not None
+        self._registry.require_verified(self.local_actor, signed)
+        validate_prepared_for_transcript(signed, self.transcript, self.coordinator_key)
+        return signed
+
+    def _validate_remote_prepared(self, nick: str, payload: ChannelInputPreparedPayload) -> None:
+        state = self._state_for_nick(nick)
+        assert self.transcript is not None
+        self._registry.require_verified(nick, payload)
+        validate_prepared_for_transcript(payload, self.transcript, self._maker_key(nick))
+        if payload.funding_outpoint != state.funding_outpoint:
+            raise ChannelInputValidationError("remote prepared differs from maker channel identity")
+
+    def _validate_sign_request(
+        self,
+        nick: str,
+        payload: ChannelInputSignPayload,
+        state: TakerChannelInputParentChannelState,
+    ) -> None:
+        assert (
+            self.transcript is not None
+            and state.local_prepared is not None
+            and state.remote_prepared is not None
+        )
+        self._registry.require_verified(self.local_actor, payload)
+        if (
+            payload.signer_key != self.coordinator_key
+            or payload.local_public_nonce
+            != (state.remote_prepared.public_nonce if state.remote_prepared is not None else None)
+            or payload.peer_prepared != state.local_prepared
+        ):
+            raise ChannelInputValidationError("sign request differs from prepared channel evidence")
+        validate_sign_for_transcript(
+            payload,
+            self.transcript,
+            self._maker_key(nick),
+            expected_local_public_nonce=state.remote_prepared.public_nonce,
+        )
+
+    def _validate_remote_partial(
+        self,
+        nick: str,
+        payload: ChannelInputPartialPayload,
+        state: TakerChannelInputParentChannelState,
+    ) -> None:
+        if (
+            state.sign_request is None
+            or state.local_prepared is None
+            or state.remote_prepared is None
+        ):
+            raise ChannelInputValidationError(
+                "remote partial requires durable sign and prepared evidence"
+            )
+        assert self.transcript is not None
+        self._registry.require_verified(nick, payload)
+        validate_partial_for_transcript(
+            payload,
+            self.transcript,
+            self._maker_key(nick),
+            expected_local_public_nonce=state.remote_prepared.public_nonce,
+            expected_peer_public_nonce=state.local_prepared.public_nonce,
+        )
+
+    def _validate_local_partial(
+        self, payload: ChannelInputPartialPayload, state: TakerChannelInputParentChannelState
+    ) -> None:
+        if state.local_prepared is None or state.remote_prepared is None:
+            raise ChannelInputValidationError("local partial requires both prepared records")
+        assert self.transcript is not None
+        self._registry.require_verified(self.local_actor, payload)
+        validate_partial_for_transcript(
+            payload,
+            self.transcript,
+            self.coordinator_key,
+            expected_local_public_nonce=state.local_prepared.public_nonce,
+            expected_peer_public_nonce=state.remote_prepared.public_nonce,
+        )
+
+    def _validate_finalize_request(
+        self,
+        nick: str,
+        payload: ChannelInputFinalizePayload,
+        state: TakerChannelInputParentChannelState,
+    ) -> None:
+        if state.local_prepared is None or state.remote_prepared is None:
+            raise ChannelInputValidationError("finalize request requires both prepared records")
+        assert self.transcript is not None
+        self._registry.require_verified(self.local_actor, payload)
+        validate_finalize_for_transcript(
+            payload,
+            self.transcript,
+            self._maker_key(nick),
+            expected_local_public_nonce=state.remote_prepared.public_nonce,
+            expected_peer_public_nonce=state.local_prepared.public_nonce,
+        )
+        if payload.peer_partial != state.local_partial:
+            raise ChannelInputValidationError(
+                "finalize request differs from local partial evidence"
+            )
+
+    @staticmethod
+    def _has_sign_or_stronger_evidence(state: TakerChannelInputParentChannelState) -> bool:
+        return any(
+            value is not None
+            for value in (
+                state.sign_request,
+                state.local_partial,
+                state.remote_partial,
+                state.finalize_request,
+                state.remote_finalized,
+            )
+        )
+
+    def _require_unconsumed_local_prepared(
+        self, state: TakerChannelInputParentChannelState
+    ) -> None:
+        if self._has_sign_or_stronger_evidence(state):
+            raise ChannelInputValidationError("local prepared cannot rotate after signing evidence")
+
+    def _has_partial_or_final_evidence(self) -> bool:
+        return any(
+            state.local_partial is not None
+            or state.remote_partial is not None
+            or state.finalize_request is not None
+            or state.remote_finalized is not None
+            for state in self.parent_channel_states
+        )
+
+    def _merge_status_evidence(
+        self,
+        nick: str,
+        response: ChannelInputStatusPayload,
+        state: TakerChannelInputParentChannelState,
+    ) -> TakerChannelInputParentChannelState:
+        if response.escrow_stage == "parent_prepared":
+            if any(
+                value is not None
+                for value in (
+                    state.local_partial,
+                    state.remote_partial,
+                    state.finalize_request,
+                    state.remote_finalized,
+                )
+            ):
+                raise ChannelInputValidationError("status regresses durable signing evidence")
+            return state
+        if response.partial is None:
+            raise ChannelInputValidationError("signed status lacks remote partial evidence")
+        if state.remote_partial is None:
+            self._validate_remote_partial(nick, response.partial, state)
+            state = state.model_copy(update={"remote_partial": response.partial})
+        elif state.remote_partial != response.partial:
+            raise ChannelInputValidationError(
+                "status remote partial conflicts with durable evidence"
+            )
+        if response.escrow_stage == "parent_signed":
+            if state.remote_finalized is not None:
+                raise ChannelInputValidationError("status regresses durable final evidence")
+            return state
+        if response.finalized is None:
+            raise ChannelInputValidationError("finalized status lacks final parent evidence")
+        if state.remote_finalized is None:
+            if state.finalize_request is None:
+                raise ChannelInputValidationError("status final evidence lacks finalize request")
+            self._registry.require_verified(nick, response.finalized)
+            assert self.transcript is not None
+            validate_finalized_for_transcript(response.finalized, self.transcript)
+            if response.finalized.signer_key != self._maker_key(nick):
+                raise ChannelInputValidationError("status finalized signer differs from maker")
+            state = state.model_copy(update={"remote_finalized": response.finalized})
+        elif state.remote_finalized != response.finalized:
+            raise ChannelInputValidationError(
+                "status final evidence conflicts with durable evidence"
+            )
+        return state
 
     def _validate_plan(
         self,
@@ -1024,27 +1694,24 @@ class TakerChannelInputNegotiation:
         frozen: TakerFrozenChannelInput,
     ) -> ChannelInputHelloPayload:
         snapshot = frozen.snapshot
-        return cast(
-            ChannelInputHelloPayload,
-            sign_payload(
-                ChannelInputHelloPayload(
-                    session_id=self.invite.session_id,
-                    attempt=self.invite.attempt,
-                    signer_key=self.coordinator_key,
-                    participant_key=self.coordinator_key,
-                    node_key=remote.peer_node_key,
-                    peer_node_key=remote.node_key,
-                    funding_outpoint=remote.funding_outpoint,
-                    capacity_sat=snapshot.capacity_sat,
-                    funding_script_pubkey=snapshot.funding_scriptpubkey.hex(),
-                    frozen_local_claim_sat=snapshot.local_claim_sat,
-                    frozen_remote_claim_sat=snapshot.remote_claim_sat,
-                    settlement_script_pubkey=intent.settlement_script_pubkey,
-                    quoted_miner_fee_share_sat=intent.quoted_miner_fee_share_sat,
-                    policy_ceilings=intent.policy_ceilings,
-                ),
-                self._key_pair.secret_key,
+        return sign_payload(
+            ChannelInputHelloPayload(
+                session_id=self.invite.session_id,
+                attempt=self.invite.attempt,
+                signer_key=self.coordinator_key,
+                participant_key=self.coordinator_key,
+                node_key=remote.peer_node_key,
+                peer_node_key=remote.node_key,
+                funding_outpoint=remote.funding_outpoint,
+                capacity_sat=snapshot.capacity_sat,
+                funding_script_pubkey=snapshot.funding_scriptpubkey.hex(),
+                frozen_local_claim_sat=snapshot.local_claim_sat,
+                frozen_remote_claim_sat=snapshot.remote_claim_sat,
+                settlement_script_pubkey=intent.settlement_script_pubkey,
+                quoted_miner_fee_share_sat=intent.quoted_miner_fee_share_sat,
+                policy_ceilings=intent.policy_ceilings,
             ),
+            self._key_pair.secret_key,
         )
 
     def _validate_local_hello_from_frozen(
@@ -1104,6 +1771,12 @@ class TakerChannelInputNegotiation:
             self.cancel_acks,
             self.local_resumed_outpoints,
         )
+        if self.parent_channel_states and self.stage not in {
+            TakerChannelInputStage.PREPARE_READY,
+            TakerChannelInputStage.CANCEL_INTENDED,
+            TakerChannelInputStage.CANCELED,
+        }:
+            raise ChannelInputValidationError("parent channel states precede prepare")
         if self.stage is TakerChannelInputStage.INVITED:
             if (
                 remote_hello_count >= len(self.selected_nicks)
@@ -1199,7 +1872,15 @@ class TakerChannelInputNegotiation:
     ) -> None:
         if self.cancel is None:
             raise ChannelInputValidationError("cancel state lacks cancellation intent")
+        if self._has_partial_or_final_evidence():
+            raise ChannelInputValidationError(
+                "cancel state contains partial or final parent evidence"
+            )
         if pre_transcript:
+            if self.parent_channel_states:
+                raise ChannelInputValidationError(
+                    "pre-transcript cancel contains parent channel states"
+                )
             if (
                 self.endpoint_terms
                 or self.proposals
@@ -1324,7 +2005,100 @@ class TakerChannelInputNegotiation:
             validate_prepare_payload(self.prepare)
             if self.approval_set != self.prepare.approval_set:
                 raise ChannelInputValidationError("prepare differs from approval set")
+            self._validate_parent_channel_states()
+        elif self.parent_channel_states:
+            raise ChannelInputValidationError("parent channel states require accepted prepare")
         self._validate_cancel_evidence()
+
+    def _validate_parent_channel_states(self) -> None:
+        """Recheck dynamic post-prepare evidence outside the immutable replay ledger."""
+
+        assert self.transcript is not None
+        states = self.parent_channel_states
+        if tuple(sorted(states, key=lambda state: state.nick)) != states:
+            raise ChannelInputValidationError("parent channel states are not nick-sorted")
+        if len({state.nick for state in states}) != len(states):
+            raise ChannelInputValidationError("parent channel states have duplicate nicks")
+        remote_hellos = dict(self.remote_hellos)
+        for state in states:
+            self._require_nick(state.nick)
+            remote = remote_hellos.get(state.nick)
+            if remote is None or state.funding_outpoint != remote.funding_outpoint:
+                raise ChannelInputValidationError(
+                    "parent channel state differs from accepted maker hello"
+                )
+            if state.local_prepared is not None:
+                assert state.local_attempt_id is not None
+                try:
+                    attempt = LndEscrowSigningAttempt(
+                        attempt_id=bytes.fromhex(state.local_attempt_id),
+                        public_nonce=bytes.fromhex(state.local_prepared.public_nonce),
+                    )
+                except ValueError as exc:
+                    raise ChannelInputValidationError("local signing attempt is invalid") from exc
+                if attempt.public_nonce.hex() != state.local_prepared.public_nonce:
+                    raise ChannelInputValidationError("local prepared differs from signing attempt")
+                self._registry.require_verified(self.local_actor, state.local_prepared)
+                validate_prepared_for_transcript(
+                    state.local_prepared, self.transcript, self.coordinator_key
+                )
+            if state.remote_prepared is not None:
+                self._validate_remote_prepared(state.nick, state.remote_prepared)
+            if state.sign_request is not None:
+                self._validate_sign_request(state.nick, state.sign_request, state)
+            if state.local_partial is not None:
+                self._validate_local_partial(state.local_partial, state)
+            if state.remote_partial is not None:
+                self._validate_remote_partial(state.nick, state.remote_partial, state)
+            if state.finalize_request is not None:
+                self._validate_finalize_request(state.nick, state.finalize_request, state)
+            if state.remote_finalized is not None:
+                if state.finalize_request is None:
+                    raise ChannelInputValidationError("remote finalized lacks finalize request")
+                self._registry.require_verified(state.nick, state.remote_finalized)
+                validate_finalized_for_transcript(state.remote_finalized, self.transcript)
+                if state.remote_finalized.signer_key != self._maker_key(state.nick):
+                    raise ChannelInputValidationError("remote finalized signer differs from maker")
+            if state.status_request is not None:
+                self._registry.require_verified(self.local_actor, state.status_request)
+                if (
+                    state.status_request.session_id != self.invite.session_id
+                    or state.status_request.attempt != self.invite.attempt
+                    or state.status_request.transcript_hash != self._transcript_hash()
+                    or state.status_request.funding_outpoint != state.funding_outpoint
+                ):
+                    raise ChannelInputValidationError(
+                        "status request differs from parent channel state"
+                    )
+            if state.status_response is not None:
+                assert state.status_request is not None
+                self._registry.require_verified(state.nick, state.status_response)
+                validate_status_for_transcript(
+                    state.status_response,
+                    state.status_request,
+                    self.transcript,
+                    self._maker_key(state.nick),
+                )
+                if state.remote_prepared != state.status_response.prepared:
+                    raise ChannelInputValidationError(
+                        "status prepared was not merged into parent channel state"
+                    )
+                if state.status_response.partial is not None and (
+                    state.remote_partial != state.status_response.partial
+                    or state.local_prepared is None
+                    or state.status_response.partial.peer_public_nonce
+                    != state.local_prepared.public_nonce
+                ):
+                    raise ChannelInputValidationError(
+                        "status partial was not merged into parent channel state"
+                    )
+                if (
+                    state.status_response.finalized is not None
+                    and state.remote_finalized != state.status_response.finalized
+                ):
+                    raise ChannelInputValidationError(
+                        "status final evidence was not merged into parent channel state"
+                    )
 
     def _validate_cancel_evidence(self) -> None:
         if self.cancel is not None:
@@ -1469,6 +2243,15 @@ def _normalize_candidate(candidate: ChannelInputCandidate) -> ChannelInputCandid
         return ChannelInputCandidate.model_validate(candidate.model_dump(mode="python"))
     except ValueError as exc:
         raise ChannelInputValidationError("freeze candidate evidence is invalid") from exc
+
+
+def _validated_signing_attempt(attempt: LndEscrowSigningAttempt) -> LndEscrowSigningAttempt:
+    if not isinstance(attempt, LndEscrowSigningAttempt):
+        raise ChannelInputValidationError("LND signing attempt is invalid")
+    try:
+        return LndEscrowSigningAttempt.model_validate(attempt.model_dump(mode="python"))
+    except ValueError as exc:
+        raise ChannelInputValidationError("LND signing attempt is invalid") from exc
 
 
 def _normalize_frozen_input(snapshot: FrozenChannelSnapshot) -> TakerFrozenChannelInput:

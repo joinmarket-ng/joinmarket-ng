@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import stat
 import time
 from collections.abc import Mapping, Sequence
@@ -31,6 +32,7 @@ from jmcore.channel_input import (
     validate_transcript_against_transaction,
 )
 from jmswap.lnd import (
+    ChannelInputForceCloseOutcome,
     EscrowOutpoint,
     FrozenChannelSnapshot,
     LndEscrowSigningAttempt,
@@ -57,6 +59,10 @@ Hex = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]+$")]
 Hex32 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 MAX_PARENT_FEE_SAT = 1_000_000
 MAX_CLAIM_ADJUSTMENT_SAT = 1_000_000
+MAX_PARENT_RECORDS = 10_000
+MAX_PARENT_RECORD_BYTES = 4 * 1024 * 1024
+_PARENT_RECORD_NAME = re.compile(r"^[0-9a-f]{64}\.json$")
+_PARENT_TEMP_NAME = re.compile(r"^\.[0-9a-f]{64}\.[0-9]+\.[0-9]+\.tmp$")
 
 
 class ChannelInputParentError(Exception):
@@ -76,6 +82,7 @@ class ChannelInputParentState(StrEnum):
     CONFIRMED = "confirmed"
     CANCELED = "canceled"
     RECOVERY_REQUIRED = "recovery_required"
+    FORCE_CLOSED = "force_closed"
 
 
 class ChannelInputRestartAction(StrEnum):
@@ -312,6 +319,20 @@ class ChainObservation(_StrictModel):
     confirmations: int = Field(ge=0)
 
 
+class ChannelInputForceCloseRecord(_StrictModel):
+    funding_txid: Hex32
+    funding_vout: int = Field(ge=0, le=0xFFFFFFFF)
+    commitment_txid: Hex32
+
+    @classmethod
+    def from_outcome(cls, outcome: ChannelInputForceCloseOutcome) -> ChannelInputForceCloseRecord:
+        return cls(
+            funding_txid=outcome.funding_outpoint.txid,
+            funding_vout=outcome.funding_outpoint.vout,
+            commitment_txid=outcome.commitment_txid,
+        )
+
+
 class ChannelInputParentRecord(_StrictModel):
     record_id: Hex32
     plan: ChannelInputParentPlan
@@ -320,7 +341,32 @@ class ChannelInputParentRecord(_StrictModel):
     final_tx_hex: Hex | None = None
     final_txid: Hex32 | None = None
     observation: ChainObservation | None = None
+    force_closes: tuple[ChannelInputForceCloseRecord, ...] = ()
     updated_at_ns: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def validate_force_closes(self) -> ChannelInputParentRecord:
+        points = [(item.funding_txid, item.funding_vout) for item in self.force_closes]
+        if len(points) != len(set(points)):
+            raise ValueError("force-close records contain duplicate funding outpoints")
+        expected = {
+            (channel.second_snapshot.funding_txid, channel.second_snapshot.funding_vout)
+            for channel in self.channels
+        }
+        if not set(points).issubset(expected):
+            raise ValueError("force-close records contain an unknown funding outpoint")
+        if self.force_closes and self.state not in {
+            ChannelInputParentState.RECOVERY_REQUIRED,
+            ChannelInputParentState.FORCE_CLOSED,
+            ChannelInputParentState.OBSERVED,
+            ChannelInputParentState.CONFIRMED,
+        }:
+            raise ValueError("force-close records conflict with parent state")
+        if self.state is ChannelInputParentState.FORCE_CLOSED and (
+            not expected or set(points) != expected
+        ):
+            raise ValueError("force-closed parent lacks exact channel coverage")
+        return self
 
 
 class ChannelInputEndpoint(Protocol):
@@ -405,13 +451,80 @@ class _Store:
 
     def load(self, record_id: str) -> ChannelInputParentRecord | None:
         path = self._path(record_id)
-        if not path.exists():
-            return None
-        if path.is_symlink() or stat.S_IMODE(path.stat().st_mode) != 0o600:
-            raise ChannelInputParentError("channel-parent record is unsafe")
         try:
-            record = ChannelInputParentRecord.model_validate_json(path.read_bytes())
-        except ValueError as exc:
+            info = path.lstat()
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise ChannelInputParentError("could not inspect channel-parent record") from exc
+        if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600:
+            raise ChannelInputParentError("channel-parent record is unsafe")
+        if info.st_size > MAX_PARENT_RECORD_BYTES:
+            raise ChannelInputParentError("channel-parent record exceeds size limit")
+        try:
+            payload = path.read_bytes()
+            if len(payload) > MAX_PARENT_RECORD_BYTES:
+                raise ChannelInputParentError("channel-parent record exceeds size limit")
+            record = ChannelInputParentRecord.model_validate_json(payload)
+        except (OSError, ValueError) as exc:
+            raise ChannelInputParentError("channel-parent record is invalid") from exc
+        if path.name != f"{record.record_id}.json":
+            raise ChannelInputParentError("channel-parent record identity differs from filename")
+        return record
+
+    def load_all(self) -> tuple[ChannelInputParentRecord, ...]:
+        self._ensure_directory()
+        try:
+            paths = tuple(sorted(self.directory.iterdir(), key=lambda path: path.name))
+        except OSError as exc:
+            raise ChannelInputParentError("could not enumerate channel-parent records") from exc
+        record_paths: list[Path] = []
+        for path in paths:
+            if _PARENT_TEMP_NAME.fullmatch(path.name):
+                try:
+                    info = path.lstat()
+                except OSError as exc:
+                    raise ChannelInputParentError(
+                        "could not inspect channel-parent temporary record"
+                    ) from exc
+                if (
+                    not stat.S_ISREG(info.st_mode)
+                    or stat.S_IMODE(info.st_mode) != 0o600
+                    or info.st_size > MAX_PARENT_RECORD_BYTES
+                ):
+                    raise ChannelInputParentError("channel-parent temporary record is unsafe")
+                continue
+            if _PARENT_RECORD_NAME.fullmatch(path.name) is None:
+                raise ChannelInputParentError("channel-parent store contains an unexpected file")
+            record_paths.append(path)
+        if len(record_paths) > MAX_PARENT_RECORDS:
+            raise ChannelInputParentError("channel-parent store exceeds maximum record count")
+
+        records = tuple(self.load_path(path) for path in record_paths)
+        sessions: set[str] = set()
+        for record in records:
+            if record.record_id != ChannelInputParentCoordinator.record_id(record.plan.session_id):
+                raise ChannelInputParentError("channel-parent record ID differs from session ID")
+            if record.plan.session_id in sessions:
+                raise ChannelInputParentError("channel-parent store contains duplicate sessions")
+            sessions.add(record.plan.session_id)
+        return tuple(sorted(records, key=lambda record: (record.plan.session_id, record.record_id)))
+
+    def load_path(self, path: Path) -> ChannelInputParentRecord:
+        try:
+            info = path.lstat()
+        except OSError as exc:
+            raise ChannelInputParentError("could not inspect channel-parent record") from exc
+        if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600:
+            raise ChannelInputParentError("channel-parent record is unsafe")
+        if info.st_size > MAX_PARENT_RECORD_BYTES:
+            raise ChannelInputParentError("channel-parent record exceeds size limit")
+        try:
+            payload = path.read_bytes()
+            if len(payload) > MAX_PARENT_RECORD_BYTES:
+                raise ChannelInputParentError("channel-parent record exceeds size limit")
+            record = ChannelInputParentRecord.model_validate_json(payload)
+        except (OSError, ValueError) as exc:
             raise ChannelInputParentError("channel-parent record is invalid") from exc
         if path.name != f"{record.record_id}.json":
             raise ChannelInputParentError("channel-parent record identity differs from filename")
@@ -421,6 +534,8 @@ class _Store:
         payload = json.dumps(
             record.model_dump(mode="json"), sort_keys=True, separators=(",", ":"), ensure_ascii=True
         ).encode("ascii")
+        if len(payload) > MAX_PARENT_RECORD_BYTES:
+            raise ChannelInputParentError("channel-parent record exceeds size limit")
         target = self._path(record.record_id)
         temporary = self.directory / f".{record.record_id}.{os.getpid()}.{time.time_ns()}.tmp"
         try:
@@ -456,6 +571,24 @@ class ChannelInputParentCoordinator:
     @staticmethod
     def record_id(session_id: str) -> str:
         return hashlib.sha256(session_id.encode("utf-8")).hexdigest()
+
+    def load(self, session_id: str) -> ChannelInputParentRecord | None:
+        """Return one exact durable parent record, or no record for this session."""
+
+        record = self._store.load(self.record_id(session_id))
+        if record is not None and record.plan.session_id != session_id:
+            raise ChannelInputParentError("channel-parent record session differs from lookup")
+        if record is not None:
+            self._validate_record(record)
+        return record
+
+    def load_all(self) -> tuple[ChannelInputParentRecord, ...]:
+        """Return all durable parent records in a stable fail-closed order."""
+
+        records = self._store.load_all()
+        for record in records:
+            self._validate_record(record)
+        return records
 
     @staticmethod
     def _endpoint(
@@ -624,6 +757,54 @@ class ChannelInputParentCoordinator:
         )
         if fee < channel_fee_shares:
             raise ChannelInputParentError("parent miner fee is below channel fee shares")
+
+    @classmethod
+    def _validate_record(cls, record: ChannelInputParentRecord) -> None:
+        cls._validate_plan(record.plan)
+        if record.state is ChannelInputParentState.CREATED:
+            if record.channels:
+                raise ChannelInputParentError("created parent unexpectedly has frozen channels")
+            return
+        records_by_index = {channel.channel_input_index: channel for channel in record.channels}
+        plan_by_index = {channel.channel_input_index: channel for channel in record.plan.channels}
+        if len(records_by_index) != len(record.channels) or set(records_by_index) != set(
+            plan_by_index
+        ):
+            raise ChannelInputParentError("persisted frozen channels differ from parent plan")
+        parent = parse_transaction(record.plan.unsigned_parent_hex)
+        transcript = record.plan.authorization.prepare.approval_set.transcript
+        descriptors = {descriptor.input_index: descriptor for descriptor in transcript.channels}
+        for index, contribution in plan_by_index.items():
+            channel = records_by_index[index]
+            if channel.channel_id != contribution.channel_id:
+                raise ChannelInputParentError(
+                    "persisted frozen channel ID differs from parent plan"
+                )
+            descriptor = descriptors[index]
+            first_terms, second_terms = record.plan.authorization.terms_for(
+                descriptor.first_terms_hash, descriptor.second_terms_hash
+            )
+            cls._validate_snapshot_terms(channel.first_snapshot, first_terms)
+            cls._validate_snapshot_terms(channel.second_snapshot, second_terms)
+            cls._validate_snapshot_pair(channel.first_snapshot, channel.second_snapshot)
+            cls._validate_conservation(contribution.first, channel.first_snapshot)
+            cls._validate_conservation(contribution.second, channel.second_snapshot)
+            tx_input = parent.inputs[index]
+            prevout = record.plan.prevouts[index]
+            if (tx_input.txid, tx_input.vout) != (
+                channel.first_snapshot.funding_txid,
+                channel.first_snapshot.funding_vout,
+            ):
+                raise ChannelInputParentError(
+                    "channel parent input differs from persisted frozen outpoint"
+                )
+            if (
+                prevout.value_sat != channel.first_snapshot.capacity_sat
+                or prevout.script_pubkey != channel.first_snapshot.funding_script_pubkey
+            ):
+                raise ChannelInputParentError(
+                    "channel prevout differs from persisted frozen channel"
+                )
 
     @staticmethod
     def _validate_snapshot_pair(first: FrozenSnapshot, second: FrozenSnapshot) -> None:
@@ -1195,13 +1376,11 @@ class ChannelInputParentCoordinator:
         }:
             return ChannelInputRestartAction.NONE
 
-        if record.final_tx_hex is not None:
-            record = await self.observe(session_id, chain)
-        else:
-            record = await self._observe_authorized_parent(record, chain)
+        record = await self.observe_restart(session_id, chain)
         if record.state in {
             ChannelInputParentState.OBSERVED,
             ChannelInputParentState.CONFIRMED,
+            ChannelInputParentState.FORCE_CLOSED,
         }:
             return ChannelInputRestartAction.NONE
 
@@ -1231,6 +1410,70 @@ class ChannelInputParentCoordinator:
         if record.final_tx_hex is not None:
             return ChannelInputRestartAction.PUBLISH_EXACT_PARENT
         return ChannelInputRestartAction.RESUME_EXACT_PARENT
+
+    async def observe_restart(
+        self, session_id: str, chain: ChannelInputParentChain
+    ) -> ChannelInputParentRecord:
+        """Query for the exact authorized parent without requiring peer endpoints."""
+
+        record = self._store.load(self.record_id(session_id))
+        if record is None:
+            raise ChannelInputParentError("channel-parent record does not exist")
+        if record.state in {
+            ChannelInputParentState.CANCELED,
+            ChannelInputParentState.OBSERVED,
+            ChannelInputParentState.CONFIRMED,
+        }:
+            return record
+        if record.final_tx_hex is not None:
+            return await self.observe(session_id, chain)
+        return await self._observe_authorized_parent(record, chain)
+
+    def record_force_close(
+        self, session_id: str, outcome: ChannelInputForceCloseOutcome
+    ) -> ChannelInputParentRecord:
+        """Persist one force-close result and finish only after exact channel coverage."""
+
+        record = self._store.load(self.record_id(session_id))
+        if record is None:
+            raise ChannelInputParentError("channel-parent record does not exist")
+        if record.state is ChannelInputParentState.FORCE_CLOSED:
+            existing = {
+                (item.funding_txid, item.funding_vout): item for item in record.force_closes
+            }.get((outcome.funding_outpoint.txid, outcome.funding_outpoint.vout))
+            if existing != ChannelInputForceCloseRecord.from_outcome(outcome):
+                raise ChannelInputParentError("force-close result conflicts with durable evidence")
+            return record
+        if record.state not in {
+            ChannelInputParentState.CHANNEL_SIGNING,
+            ChannelInputParentState.CHANNEL_SIGNED,
+            ChannelInputParentState.FINAL_TX_PERSISTED,
+            ChannelInputParentState.BROADCAST_ATTEMPTED,
+            ChannelInputParentState.RECOVERY_REQUIRED,
+        }:
+            raise ChannelInputParentError("force close is not valid in the current parent state")
+        expected = {
+            (channel.second_snapshot.funding_txid, channel.second_snapshot.funding_vout)
+            for channel in record.channels
+        }
+        point = (outcome.funding_outpoint.txid, outcome.funding_outpoint.vout)
+        if point not in expected:
+            raise ChannelInputParentError("force-close outpoint is not part of the parent")
+        durable = {(item.funding_txid, item.funding_vout): item for item in record.force_closes}
+        candidate = ChannelInputForceCloseRecord.from_outcome(outcome)
+        existing = durable.get(point)
+        if existing is not None and existing != candidate:
+            raise ChannelInputParentError("force-close result conflicts with durable evidence")
+        durable[point] = candidate
+        force_closes = tuple(
+            sorted(durable.values(), key=lambda item: (item.funding_txid, item.funding_vout))
+        )
+        state = (
+            ChannelInputParentState.FORCE_CLOSED
+            if set(durable) == expected
+            else ChannelInputParentState.RECOVERY_REQUIRED
+        )
+        return self._save(record, state=state, force_closes=force_closes)
 
     async def _reconcile_signing(
         self, record: ChannelInputParentRecord, endpoints: Mapping[str, ChannelInputEndpoint]

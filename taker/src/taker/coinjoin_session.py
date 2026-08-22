@@ -58,17 +58,24 @@ from jmwallet.wallet.signing import (
 from jmwallet.wallet.spend import enforce_fee_rate_cap
 from loguru import logger
 
+from taker.channel_input_parent import OrdinaryWitness
 from taker.config import BroadcastPolicy
 from taker.models import MakerSession, PhaseResult
 from taker.orderbook import calculate_cj_fee, calculate_cj_fee_plan
 from taker.podle import ExtendedPoDLECommitment, get_eligible_podle_utxos
-from taker.tx_builder import CoinJoinTxBuilder, build_coinjoin_tx, compute_tx_locktime
+from taker.tx_builder import (
+    ChannelTransactionContribution,
+    CoinJoinTxBuilder,
+    build_coinjoin_tx,
+    compute_tx_locktime,
+)
 
 if TYPE_CHECKING:
     from jmwallet.backends.base import BlockchainBackend
     from jmwallet.wallet.models import UTXOInfo
     from jmwallet.wallet.service import WalletService
 
+    from taker.channel_input_coordinator import TakerChannelInputCoordinator
     from taker.channel_ring import TakerRingCoordinator
     from taker.config import TakerConfig
     from taker.multi_directory import MultiDirectoryClient
@@ -203,7 +210,12 @@ class CoinJoinSession:
         self._randomized_fee_rate: float | None = None
         self._minimum_fee_rate_sat_vb: float | None = None
         self.ring_coordinator: TakerRingCoordinator | None = None
+        self.channel_input_coordinator: TakerChannelInputCoordinator | None = None
         self.strict_maker_count: int | None = None
+        # Immutable channel inputs are assembled into the unsigned parent but
+        # finalized by ChannelInputParentCoordinator, not this session.
+        self.channel_contributions: tuple[ChannelTransactionContribution, ...] = ()
+        self.ordinary_witnesses: tuple[OrdinaryWitness, ...] = ()
 
     def attach(self, taker: Taker) -> None:
         """Wire the owning ``Taker`` so the session can read persistent deps.
@@ -260,7 +272,10 @@ class CoinJoinSession:
         self._randomized_fee_rate = None
         self._minimum_fee_rate_sat_vb = None
         self.ring_coordinator = None
+        self.channel_input_coordinator = None
         self.strict_maker_count = None
+        self.channel_contributions = ()
+        self.ordinary_witnesses = ()
 
     @property
     def required_maker_count(self) -> int:
@@ -756,17 +771,18 @@ class CoinJoinSession:
                 incompatible_makers.append(nick)
                 del self.maker_sessions[nick]
 
-            pending_nicks = [nick for nick in pending_nicks if nick in self.maker_sessions]
+        pending_nicks = [nick for nick in pending_nicks if nick in self.maker_sessions]
 
-            # Report incompatible makers as failed so the replacement loop can
-            # ignore them and pick substitutes before any PoDLE proof is revealed.
-            if len(self.maker_sessions) < self.required_maker_count:
-                logger.error(
-                    f"Not enough compatible makers: {len(self.maker_sessions)} "
-                    f"< {self.required_maker_count}; required features are "
-                    f"{sorted(self.required_maker_features)}."
-                )
-                return PhaseResult(success=False, failed_makers=incompatible_makers)
+        # Report every incompatible maker before deciding whether the retained
+        # set still satisfies the maker floor. This lets replacement selection
+        # exclude the complete incompatible set without revealing a PoDLE proof.
+        if len(self.maker_sessions) < self.required_maker_count:
+            logger.error(
+                f"Not enough compatible makers: {len(self.maker_sessions)} "
+                f"< {self.required_maker_count}; required features are "
+                f"{sorted(self.required_maker_features)}."
+            )
+            return PhaseResult(success=False, failed_makers=incompatible_makers)
 
         podle_revealed = False
         for nick in pending_nicks:
@@ -1163,19 +1179,38 @@ class CoinJoinSession:
                 continue
         return result
 
-    async def _phase_build_tx(self, destination: str, mixdepth: int) -> bool:
+    async def _phase_build_tx(
+        self,
+        destination: str,
+        mixdepth: int,
+        *,
+        channel_contributions: tuple[ChannelTransactionContribution, ...] = (),
+    ) -> bool:
         """Build the unsigned CoinJoin transaction."""
+        self.channel_contributions = ()
+        self.ordinary_witnesses = ()
         try:
+            if channel_contributions and self.is_sweep:
+                raise ValueError("channel input transactions cannot be sweeps")
+            if channel_contributions and self.ring_coordinator is not None:
+                raise ValueError("channel input transactions cannot be ring transactions")
+
             # Store destination for broadcast verification
             self.cj_destination = destination
 
             # Calculate total input needed (now with exact maker UTXOs)
             maker_fee_plan = self.maker_fee_plan()
-            total_maker_fee = sum(maker_fee_plan.values())
+            ordinary_maker_fee_plan = (
+                dict.fromkeys(maker_fee_plan, 0) if channel_contributions else maker_fee_plan
+            )
+            total_maker_fee = sum(ordinary_maker_fee_plan.values())
             for nick, session in self.maker_sessions.items():
                 maker_total_input = sum(utxo["value"] for utxo in session.utxos)
                 maker_change = (
-                    maker_total_input - self.cj_amount - session.offer.txfee + maker_fee_plan[nick]
+                    maker_total_input
+                    - self.cj_amount
+                    - session.offer.txfee
+                    + ordinary_maker_fee_plan[nick]
                 )
                 if maker_change < DUST_THRESHOLD:
                     self.last_failure_reason = (
@@ -1188,7 +1223,7 @@ class CoinJoinSession:
                         "Final maker fee plan detail: {}", self.last_failure_reason
                     )
                     return False
-            if self.config.equalize_cj_fees and maker_fee_plan:
+            if not channel_contributions and self.config.equalize_cj_fees and maker_fee_plan:
                 target_fee = max(maker_fee_plan.values())
                 base_fees = {
                     nick: calculate_cj_fee(
@@ -1216,7 +1251,9 @@ class CoinJoinSession:
             # Estimate tx fee with actual input counts
             num_taker_inputs = len(self.preselected_utxos)
             num_maker_inputs = sum(len(s.utxos) for s in self.maker_sessions.values())
-            num_inputs = num_taker_inputs + num_maker_inputs
+            num_channel_inputs = len(channel_contributions)
+            num_channel_outputs = 2 * num_channel_inputs
+            num_inputs = num_taker_inputs + num_maker_inputs + num_channel_inputs
 
             # Output count depends on sweep mode:
             # - Normal: CJ outputs (1 + n_makers) + change outputs (1 + n_makers)
@@ -1227,11 +1264,15 @@ class CoinJoinSession:
             else:
                 # Normal mode: include taker change
                 num_outputs = 1 + len(self.maker_sessions) + 1 + len(self.maker_sessions)
+            num_outputs += num_channel_outputs
 
             # Classify the actual inputs so a legacy bond input in a taproot
             # round cannot make the fee estimate too small.
             est_input_types, est_output_types = self._build_script_type_lists(
-                self.preselected_utxos, num_outputs
+                self.preselected_utxos,
+                num_outputs,
+                channel_input_count=num_channel_inputs,
+                channel_output_count=num_channel_outputs,
             )
             actual_tx_fee = self._estimate_tx_fee(
                 num_inputs,
@@ -1388,7 +1429,8 @@ class CoinJoinSession:
                 # NORMAL MODE: Use pre-selected UTXOs, add more if needed
                 # For normal mode, we use the actual tx_fee estimate
                 tx_fee = actual_tx_fee
-                required = self.cj_amount + total_maker_fee + tx_fee
+                ordinary_maker_fee = 0 if channel_contributions else total_maker_fee
+                required = self.cj_amount + ordinary_maker_fee + tx_fee
 
                 # Use pre-selected UTXOs (which include the PoDLE UTXO)
                 # These were selected during PoDLE generation to ensure the commitment
@@ -1459,7 +1501,8 @@ class CoinJoinSession:
 
             # Calculate expected change to determine if we need a change address
             # Change = total_input - cj_amount - maker_fees - tx_fee
-            expected_change = taker_total - self.cj_amount - total_maker_fee - tx_fee
+            ordinary_maker_fee = 0 if channel_contributions else total_maker_fee
+            expected_change = taker_total - self.cj_amount - ordinary_maker_fee - tx_fee
 
             # Only generate change address if we'll actually have a change output
             # This avoids recording unused addresses in history
@@ -1485,7 +1528,7 @@ class CoinJoinSession:
             # Build maker data
             maker_data = {}
             for nick, session in self.maker_sessions.items():
-                cjfee = maker_fee_plan[nick]
+                cjfee = ordinary_maker_fee_plan[nick]
                 # JoinMarket protocol: txfee in offer is the total transaction fee
                 # the maker contributes (in satoshis), not a per-input/output fee
                 maker_txfee = session.offer.txfee
@@ -1502,6 +1545,7 @@ class CoinJoinSession:
             network = self.config.network.value
             current_height = await self.backend.get_block_height()
             locktime = compute_tx_locktime(current_height)
+            self.channel_contributions = channel_contributions
             self.unsigned_tx, self.tx_metadata = build_coinjoin_tx(
                 taker_utxos=[
                     {
@@ -1520,6 +1564,7 @@ class CoinJoinSession:
                 tx_fee=tx_fee,
                 network=network,
                 locktime=locktime,
+                channel_contributions=channel_contributions,
             )
 
             logger.bind(sensitive=True).debug("Built unsigned tx: {} bytes", len(self.unsigned_tx))
@@ -1530,7 +1575,8 @@ class CoinJoinSession:
             # Log final transaction details
             logger.bind(sensitive=True).debug(
                 f"Final CoinJoin transaction details: "
-                f"{num_inputs} inputs ({num_taker_inputs} taker, {num_maker_inputs} maker), "
+                f"{num_inputs} inputs ({num_taker_inputs} taker, {num_maker_inputs} maker, "
+                f"{num_channel_inputs} channel), "
                 f"{num_outputs} outputs"
             )
             logger.bind(sensitive=True).debug(
@@ -1556,6 +1602,8 @@ class CoinJoinSession:
         except Exception as e:
             logger.error("Failed to build transaction")
             logger.bind(sensitive=True).error("Transaction build error detail: {}", e)
+            self.channel_contributions = ()
+            self.ordinary_witnesses = ()
             return False
 
     @staticmethod
@@ -1620,7 +1668,12 @@ class CoinJoinSession:
         return True
 
     def _build_script_type_lists(
-        self, selected_utxos: list[Any], num_outputs: int
+        self,
+        selected_utxos: list[Any],
+        num_outputs: int,
+        *,
+        channel_input_count: int = 0,
+        channel_output_count: int = 0,
     ) -> tuple[list[str], list[str]]:
         """Derive concrete input and output types for fee estimation."""
         cj_type = offer_output_script_type(self.config.preferred_offer_type)
@@ -1633,6 +1686,7 @@ class CoinJoinSession:
                 self._classify_scriptpubkey(utxo.get("scriptpubkey", "") or "", cj_type)
                 for utxo in session.utxos
             )
+        input_types.extend(["p2tr"] * channel_input_count)
 
         output_types = [cj_type] * (1 + len(self.maker_sessions))
         change_addresses: list[str] = []
@@ -1648,9 +1702,10 @@ class CoinJoinSession:
                 output_types.append(get_address_type(address))
             except ValueError:
                 output_types.append(cj_type)
-
-        if len(output_types) != num_outputs:
-            output_types = [cj_type] * num_outputs
+        ordinary_output_count = num_outputs - channel_output_count
+        if len(output_types) != ordinary_output_count:
+            output_types = [cj_type] * ordinary_output_count
+        output_types.extend(["p2tr"] * channel_output_count)
         return input_types, output_types
 
     def _estimate_tx_fee(
@@ -2087,6 +2142,7 @@ class CoinJoinSession:
             )
 
         # Build expected signature counts for early termination
+        maker_owner_labels = set(self.maker_sessions)
         expected_counts = {
             nick: len(session.utxos) for nick, session in self.maker_sessions.items()
         }
@@ -2257,8 +2313,30 @@ class CoinJoinSession:
         # selecting counterparties, once the transaction is built with specific inputs,
         # ALL those inputs need signatures or the transaction is invalid.
         required_makers = {
-            owner for owner in self.tx_metadata.get("input_owners", []) if owner != "taker"
+            owner
+            for owner in self.tx_metadata.get("input_owners", [])
+            if owner in maker_owner_labels
         }
+        if self.channel_contributions:
+            input_owners = self.tx_metadata.get("input_owners")
+            channel_input_ids = self.tx_metadata.get("channel_input_ids")
+            if not isinstance(input_owners, list) or not isinstance(channel_input_ids, list):
+                logger.error("Channel parent metadata has no complete input owner map")
+                return False
+            if len(input_owners) != len(channel_input_ids):
+                logger.error("Channel parent metadata input owner map has inconsistent lengths")
+                return False
+            unknown_ordinary_owners = {
+                owner
+                for owner, channel_id in zip(input_owners, channel_input_ids, strict=True)
+                if channel_id is None and owner != "taker" and owner not in maker_owner_labels
+            }
+            if unknown_ordinary_owners:
+                logger.error(
+                    "Channel parent has ordinary inputs without a matching maker session: "
+                    f"{unknown_ordinary_owners}"
+                )
+                return False
         signed_makers = set(signatures.keys())
         missing_makers = required_makers - signed_makers
 
@@ -2291,6 +2369,18 @@ class CoinJoinSession:
             self.ring_coordinator.mark_local_signatures(taker_sigs)
         signatures["taker"] = taker_sigs
 
+        if self.channel_contributions:
+            ordinary_witnesses = self._collect_ordinary_witnesses(tx, signatures)
+            if ordinary_witnesses is None:
+                self.ordinary_witnesses = ()
+                return False
+            self.ordinary_witnesses = ordinary_witnesses
+            self.final_tx = b""
+            logger.info(
+                f"Collected {len(ordinary_witnesses)} ordinary witnesses for channel parent"
+            )
+            return True
+
         self.final_tx = builder.add_signatures(
             self.unsigned_tx,
             signatures,
@@ -2301,6 +2391,66 @@ class CoinJoinSession:
 
         logger.bind(sensitive=True).info("Signed tx: {} bytes", len(self.final_tx))
         return True
+
+    def _collect_ordinary_witnesses(
+        self,
+        tx: Any,
+        signatures: dict[str, list[dict[str, Any]]],
+    ) -> tuple[OrdinaryWitness, ...] | None:
+        """Return exactly one witness for every non-channel parent input."""
+        channel_input_ids = self.tx_metadata.get("channel_input_ids")
+        if not isinstance(channel_input_ids, list) or len(channel_input_ids) != len(tx.inputs):
+            logger.error("Channel parent metadata has no complete channel input map")
+            return None
+
+        ordinary_by_outpoint: dict[tuple[str, int], int] = {}
+        for index, tx_input in enumerate(tx.inputs):
+            if channel_input_ids[index] is not None:
+                continue
+            outpoint = (tx_input.txid_le[::-1].hex(), tx_input.vout)
+            if outpoint in ordinary_by_outpoint:
+                logger.error(
+                    f"Channel parent has duplicate ordinary input {outpoint[0]}:{outpoint[1]}"
+                )
+                return None
+            ordinary_by_outpoint[outpoint] = index
+
+        witnesses_by_index: dict[int, OrdinaryWitness] = {}
+        for signer, sig_infos in signatures.items():
+            for sig_info in sig_infos:
+                txid = sig_info.get("txid")
+                vout = sig_info.get("vout")
+                witness = sig_info.get("witness")
+                if (
+                    not isinstance(txid, str)
+                    or not isinstance(vout, int)
+                    or not isinstance(witness, list)
+                ):
+                    logger.error(f"Malformed ordinary signature record from {signer}")
+                    return None
+                input_index = ordinary_by_outpoint.get((txid, vout))
+                if input_index is None:
+                    logger.error(
+                        f"Signature from {signer} substituted non-ordinary input {txid}:{vout}"
+                    )
+                    return None
+                if input_index in witnesses_by_index:
+                    logger.error(f"Duplicate ordinary witness for input {input_index}")
+                    return None
+                try:
+                    witnesses_by_index[input_index] = OrdinaryWitness(
+                        input_index=input_index,
+                        witness=tuple(witness),
+                    )
+                except (TypeError, ValueError) as exc:
+                    logger.error(f"Invalid ordinary witness for input {input_index}: {exc}")
+                    return None
+
+        expected_indexes = set(ordinary_by_outpoint.values())
+        if set(witnesses_by_index) != expected_indexes:
+            logger.error("Missing ordinary witnesses for one or more channel parent inputs")
+            return None
+        return tuple(witnesses_by_index[index] for index in sorted(witnesses_by_index))
 
     def _build_prevout_map(self) -> dict[tuple[str, int], tuple[int, bytes]]:
         """Map every CoinJoin input to the data committed by BIP341."""
@@ -2323,6 +2473,12 @@ class CoinJoinSession:
                     maker_utxo["value"],
                     script,
                 )
+        for contribution in self.channel_contributions:
+            funding_input = contribution.funding_input
+            prevouts[(funding_input.txid, funding_input.vout)] = (
+                funding_input.value,
+                funding_input.scriptpubkey,
+            )
         return prevouts
 
     @staticmethod
@@ -2508,6 +2664,12 @@ class CoinJoinSession:
                     (utxo["txid"], utxo["vout"]),
                     (utxo.get("scriptpubkey", ""), utxo.get("blockheight"), False),
                 )
+        for contribution in self.channel_contributions:
+            funding_input = contribution.funding_input
+            inputs.setdefault(
+                (funding_input.txid, funding_input.vout),
+                (funding_input.scriptpubkey.hex(), None, False),
+            )
 
         for (txid, vout), (scriptpubkey, blockheight, wallet_owned) in inputs.items():
             try:

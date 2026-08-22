@@ -2,18 +2,22 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
 from jmcore.channel_input import (
+    ChannelInputApprovalSetAckPayload,
     ChannelInputCancelAckPayload,
     ChannelInputCancelPayload,
     ChannelInputHelloPayload,
     ChannelInputKeyPair,
     Outpoint,
     PolicyCeilings,
+    approval_set_hash,
     cancel_payload_hash,
     sign_payload,
+    transcript_hash,
 )
 from jmcore.channel_input_config import ChannelInputConfig
 from jmswap.lnd import (
@@ -27,12 +31,15 @@ from test_channel_input_negotiation import (
     _COORDINATOR_SECRET,
     _MAKER_SECRETS,
     _accept_hello,
+    _approve_all,
     _candidate,
     _freeze_intent,
     _freeze_remote,
     _frozen_snapshot,
+    _maker_prepared,
     _new,
     _node,
+    _plan,
 )
 
 from taker.channel_input_negotiation import TakerChannelInputNegotiation, TakerChannelInputStage
@@ -164,6 +171,34 @@ def _unknown_hello_cancel_ack(
         _MAKER_SECRETS[index],
         aux_randomness=bytes([index + 20]) * 32,
     )
+
+
+def _frozen_prepared() -> TakerChannelInputNegotiation:
+    negotiation = _new()
+    for index, nick in enumerate(negotiation.selected_nicks):
+        _freeze_intent(negotiation, index)
+        negotiation.install_frozen_channel(nick, _frozen_snapshot(index))
+    transcript, terms = _plan(negotiation)
+    proposals = negotiation.plan_proposals(transcript, terms, current_time=100, current_height=100)
+    _approve_all(negotiation, proposals, _MAKER_SECRETS)
+    approval_set = negotiation.build_approval_set()
+    for (nick, proposal), secret in zip(proposals, _MAKER_SECRETS, strict=True):
+        negotiation.accept_approval_ack(
+            nick,
+            sign_payload(
+                ChannelInputApprovalSetAckPayload(
+                    session_id=negotiation.invite.session_id,
+                    attempt=negotiation.invite.attempt,
+                    signer_key=proposal.recipient_key,
+                    transcript_hash=transcript_hash(transcript).hex(),
+                    approval_set_hash=approval_set_hash(approval_set).hex(),
+                ),
+                secret,
+                aux_randomness=b"\x93" * 32,
+            ),
+        )
+    negotiation.build_prepare()
+    return negotiation
 
 
 def test_load_is_fail_closed_and_allows_full_recovery_capacity(tmp_path: Path) -> None:
@@ -593,3 +628,62 @@ async def test_local_node_mismatch_prevents_all_lnd_calls(tmp_path: Path) -> Non
     with pytest.raises(TakerChannelInputRuntimeError, match="another local node"):
         await registry.reconcile_all(backend, _node(99))
     assert backend.events == []
+
+
+@pytest.mark.asyncio
+async def test_post_prepare_registry_wrappers_save_before_return_and_serialize_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    negotiation = _frozen_prepared()
+    registry = _registry(tmp_path, negotiation)
+    restored = registry.get(negotiation.invite.session_id, negotiation.invite.attempt)
+    assert restored is not None
+    saves: list[object] = []
+    original_save = registry._store.save
+
+    def save(snapshot: object) -> None:
+        saves.append(snapshot)
+        original_save(snapshot)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(registry._store, "save", save)
+    nick = "maker-a"
+    prepared = _maker_prepared(restored, nick, b"\x03" * 66)
+    lock = registry.lock_for(restored.invite.session_id, restored.invite.attempt)
+    await lock.acquire()
+    task = asyncio.create_task(
+        registry.accept_remote_prepared(
+            restored.invite.session_id, restored.invite.attempt, nick, prepared
+        )
+    )
+    await asyncio.sleep(0)
+    assert not task.done() and not saves
+    lock.release()
+    await task
+    assert len(saves) == 1
+    request = await registry.build_status_request(
+        restored.invite.session_id, restored.invite.attempt, nick
+    )
+    assert len(saves) == 2
+    persisted = registry._store.load(restored.invite.session_id, restored.invite.attempt)
+    assert persisted is not None
+    assert persisted.parent_channel_states[0].status_request == request
+
+
+def test_active_negotiations_are_stable_and_exclude_canceled(tmp_path: Path) -> None:
+    first = _new()
+    second = _new()
+    second.invite = second.invite.model_copy(update={"session_id": "aa" * 32, "attempt": 2})
+    canceled = _new()
+    canceled.invite = canceled.invite.model_copy(update={"session_id": "cc" * 32, "attempt": 3})
+    canceled.stage = TakerChannelInputStage.CANCELED
+    registry = _registry(tmp_path, first)
+    registry._negotiations = {
+        (first.invite.session_id, first.invite.attempt): first,
+        (canceled.invite.session_id, canceled.invite.attempt): canceled,
+        (second.invite.session_id, second.invite.attempt): second,
+    }
+
+    active = registry.active_negotiations
+
+    assert active == (first, second)
+    assert isinstance(active, tuple)

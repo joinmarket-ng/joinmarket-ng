@@ -142,6 +142,25 @@ class FinalizedRingTransactionPlan(RingTransactionModel):
         return self
 
 
+@dataclass(frozen=True)
+class ChannelEndpointSettlement:
+    """One immutable channel endpoint settlement output."""
+
+    endpoint_id: str
+    participant_key: str
+    output: TxOutput
+
+
+@dataclass(frozen=True)
+class ChannelTransactionContribution:
+    """One immutable P2TR channel funding input and its two settlements."""
+
+    channel_id: str
+    funding_input: TxInput
+    first_endpoint: ChannelEndpointSettlement
+    second_endpoint: ChannelEndpointSettlement
+
+
 @dataclass
 class CoinJoinTxData:
     """Data for building a CoinJoin transaction."""
@@ -161,6 +180,7 @@ class CoinJoinTxData:
     total_maker_fee: int
     tx_fee: int
     ring_plan: FinalizedRingTransactionPlan | None = None
+    channel_contributions: tuple[ChannelTransactionContribution, ...] = ()
 
 
 class CoinJoinTxBuilder:
@@ -192,30 +212,35 @@ class CoinJoinTxBuilder:
         Returns:
             (tx_bytes, metadata) where metadata maps inputs/outputs to owners
         """
-        # Collect all inputs with owner info
-        all_inputs: list[tuple[TxInput, str]] = []
+        if tx_data.channel_contributions and tx_data.ring_plan is not None:
+            raise ValueError("channel input transactions cannot be ring transactions")
+
+        # Collect all inputs with owner and optional channel identity.
+        all_inputs: list[tuple[TxInput, str, str | None]] = []
 
         for inp in tx_data.taker_inputs:
-            all_inputs.append((inp, "taker"))
+            all_inputs.append((inp, "taker", None))
 
         for nick, inputs in tx_data.maker_inputs.items():
             for inp in inputs:
-                all_inputs.append((inp, nick))
+                all_inputs.append((inp, nick, None))
 
-        # Collect all outputs with owner info
-        all_outputs: list[tuple[TxOutput, str | None, str]] = []  # (output, owner, type)
+        # Collect all outputs with owner and optional channel endpoint info.
+        all_outputs: list[
+            tuple[TxOutput, str | None, str, str | None, ChannelEndpointSettlement | None]
+        ] = []
 
         # CJ outputs (equal amounts)
-        all_outputs.append((tx_data.taker_cj_output, "taker", "cj"))
+        all_outputs.append((tx_data.taker_cj_output, "taker", "cj", None, None))
         for nick, out in tx_data.maker_cj_outputs.items():
-            all_outputs.append((out, nick, "cj"))
+            all_outputs.append((out, nick, "cj", None, None))
 
         if tx_data.ring_plan is None:
             # Change outputs
             if tx_data.taker_change_output:
-                all_outputs.append((tx_data.taker_change_output, "taker", "change"))
+                all_outputs.append((tx_data.taker_change_output, "taker", "change", None, None))
             for nick, out in tx_data.maker_change_outputs.items():
-                all_outputs.append((out, nick, "change"))
+                all_outputs.append((out, nick, "change", None, None))
         else:
             if tx_data.taker_change_output is not None or tx_data.maker_change_outputs:
                 raise ValueError("ring transactions cannot contain plain change outputs")
@@ -235,7 +260,33 @@ class CoinJoinTxBuilder:
                 raise ValueError("ring transaction contains duplicate output scripts")
             for channel in tx_data.ring_plan.channel_outputs:
                 all_outputs.append(
-                    (TxOutput.from_hex(channel.script_pubkey, channel.capacity), None, "channel")
+                    (
+                        TxOutput.from_hex(channel.script_pubkey, channel.capacity),
+                        None,
+                        "channel",
+                        None,
+                        None,
+                    )
+                )
+
+        self._validate_channel_contributions(tx_data, all_inputs, all_outputs)
+        for contribution in tx_data.channel_contributions:
+            all_inputs.append(
+                (
+                    contribution.funding_input,
+                    f"__channel_input__:{contribution.channel_id}",
+                    contribution.channel_id,
+                )
+            )
+            for endpoint in (contribution.first_endpoint, contribution.second_endpoint):
+                all_outputs.append(
+                    (
+                        endpoint.output,
+                        None,
+                        "channel_settlement",
+                        contribution.channel_id,
+                        endpoint,
+                    )
                 )
 
         # Ring positions are public manifest commitments, and ordinary CoinJoin
@@ -244,11 +295,27 @@ class CoinJoinTxBuilder:
         secure_random.shuffle(all_outputs)
 
         # Build metadata
-        metadata = {
-            "input_owners": [owner for _, owner in all_inputs],
-            "output_owners": [(owner, out_type) for _, owner, out_type in all_outputs],
-            "input_values": [inp.value for inp, _ in all_inputs],
+        metadata: dict[str, Any] = {
+            "input_owners": [owner for _, owner, _ in all_inputs],
+            "output_owners": [(owner, out_type) for _, owner, out_type, _, _ in all_outputs],
+            "input_values": [inp.value for inp, _, _ in all_inputs],
+            "input_scriptpubkeys": [inp.scriptpubkey.hex() for inp, _, _ in all_inputs],
+            "channel_input_ids": [channel_id for _, _, channel_id in all_inputs],
+            "channel_endpoint_outputs": [
+                {
+                    "channel_id": channel_id,
+                    "endpoint_id": endpoint.endpoint_id,
+                    "participant_key": endpoint.participant_key,
+                    "script_pubkey": output.scriptpubkey,
+                    "value": output.value,
+                }
+                if endpoint is not None and channel_id is not None
+                else None
+                for output, _, _, channel_id, endpoint in all_outputs
+            ],
             "fee": tx_data.tx_fee,
+            "actual_fee": sum(inp.value for inp, _, _ in all_inputs)
+            - sum(output.value for output, _, _, _, _ in all_outputs),
         }
         if tx_data.ring_plan is not None:
             channel_by_script = {
@@ -256,7 +323,7 @@ class CoinJoinTxBuilder:
             }
             metadata["channel_edges"] = [
                 channel_by_script[output.scriptpubkey].edge_id if out_type == "channel" else None
-                for output, _, out_type in all_outputs
+                for output, _, out_type, _, _ in all_outputs
             ]
             metadata["channel_endpoints"] = [
                 (
@@ -265,16 +332,78 @@ class CoinJoinTxBuilder:
                 )
                 if out_type == "channel"
                 else None
-                for output, _, out_type in all_outputs
+                for output, _, out_type, _, _ in all_outputs
             ]
 
         # Serialize transaction
         tx_bytes = self._serialize_tx(
-            inputs=[inp for inp, _ in all_inputs],
-            outputs=[out for out, _, _ in all_outputs],
+            inputs=[inp for inp, _, _ in all_inputs],
+            outputs=[out for out, _, _, _, _ in all_outputs],
         )
 
         return tx_bytes, metadata
+
+    def _validate_channel_contributions(
+        self,
+        tx_data: CoinJoinTxData,
+        ordinary_inputs: list[tuple[TxInput, str, str | None]],
+        ordinary_outputs: list[
+            tuple[TxOutput, str | None, str, str | None, ChannelEndpointSettlement | None]
+        ],
+    ) -> None:
+        """Validate channel inputs before they enter the shared shuffle."""
+        contributions = tx_data.channel_contributions
+        if not contributions:
+            return
+        if tx_data.ring_plan is not None:
+            raise ValueError("channel input transactions cannot be ring transactions")
+
+        channel_ids = [contribution.channel_id for contribution in contributions]
+        if any(not channel_id for channel_id in channel_ids):
+            raise ValueError("channel contribution requires a nonempty channel ID")
+        if len(set(channel_ids)) != len(channel_ids):
+            raise ValueError("channel transaction contains duplicate channel IDs")
+
+        ordinary_outpoints = {(inp.txid_le, inp.vout) for inp, _, _ in ordinary_inputs}
+        funding_outpoints: set[tuple[bytes, int]] = set()
+        ordinary_scripts = [output.script for output, _, _, _, _ in ordinary_outputs]
+        if len(set(ordinary_scripts)) != len(ordinary_scripts):
+            raise ValueError("channel transaction contains duplicate output scripts")
+        output_scripts = set(ordinary_scripts)
+
+        for contribution in contributions:
+            funding_input = contribution.funding_input
+            funding_outpoint = (funding_input.txid_le, funding_input.vout)
+            if funding_outpoint in ordinary_outpoints:
+                raise ValueError("channel funding input collides with an ordinary input")
+            if funding_outpoint in funding_outpoints:
+                raise ValueError("channel transaction contains duplicate funding outpoints")
+            funding_outpoints.add(funding_outpoint)
+
+            if funding_input.value <= 0:
+                raise ValueError("channel funding input must have a positive value")
+            if not self._is_p2tr(funding_input.scriptpubkey):
+                raise ValueError("channel funding input must have a P2TR scriptPubKey")
+
+            endpoints = (contribution.first_endpoint, contribution.second_endpoint)
+            if endpoints[0].endpoint_id == endpoints[1].endpoint_id:
+                raise ValueError("channel contribution endpoints must have distinct endpoint IDs")
+            for endpoint in endpoints:
+                if not endpoint.endpoint_id:
+                    raise ValueError("channel endpoint requires a nonempty endpoint ID")
+                if not endpoint.participant_key:
+                    raise ValueError("channel endpoint requires a nonempty participant key")
+                if endpoint.output.value <= 0:
+                    raise ValueError("channel settlement output must have a positive value")
+                if not self._is_p2tr(endpoint.output.script):
+                    raise ValueError("channel settlement output must have a P2TR scriptPubKey")
+                if endpoint.output.script in output_scripts:
+                    raise ValueError("channel transaction contains duplicate output scripts")
+                output_scripts.add(endpoint.output.script)
+
+    @staticmethod
+    def _is_p2tr(script_pubkey: bytes) -> bool:
+        return len(script_pubkey) == 34 and script_pubkey[:2] == b"\x51\x20"
 
     def _serialize_tx(self, inputs: list[TxInput], outputs: list[TxOutput]) -> bytes:
         """Serialize transaction to bytes.
@@ -434,6 +563,7 @@ def build_coinjoin_tx(
     dust_threshold: int = DUST_THRESHOLD,
     locktime: int = 0,
     ring_plan: FinalizedRingTransactionPlan | None = None,
+    channel_contributions: tuple[ChannelTransactionContribution, ...] = (),
 ) -> tuple[bytes, dict[str, Any]]:
     """
     Build a complete CoinJoin transaction.
@@ -573,6 +703,7 @@ def build_coinjoin_tx(
         total_maker_fee=total_maker_fee,
         tx_fee=tx_fee,
         ring_plan=ring_plan,
+        channel_contributions=channel_contributions,
     )
 
     return builder.build_unsigned_tx(tx_data)

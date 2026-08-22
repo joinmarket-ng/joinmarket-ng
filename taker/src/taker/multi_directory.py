@@ -196,6 +196,22 @@ class MultiDirectoryClient(DirectoryClientPool):
         """Advertise channel-input support after its local backend is initialized."""
         self.channel_input_v1 = True
 
+    def recovery_bootstrap_routes(self, nick: str) -> tuple[ReplyRoute, ...]:
+        """Return deterministic relay routes for a fresh authenticated recovery handshake."""
+
+        active = {
+            server
+            for server, present in self._active_nicks.get(nick, {}).items()
+            if present and server in self.clients
+        }
+        listed = {server for server, client in self.clients.items() if nick in client._active_peers}
+        ordered = (
+            *sorted(active),
+            *sorted(listed - active),
+            *sorted(set(self.clients) - active - listed),
+        )
+        return tuple(ReplyRoute(nick=nick, channel_id=f"directory:{server}") for server in ordered)
+
     def _update_nick_status(self, nick: str, server: str, is_present: bool) -> None:
         """
         Update a nick's presence status on a specific directory server.

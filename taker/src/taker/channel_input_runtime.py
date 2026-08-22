@@ -13,9 +13,16 @@ from jmcore.channel_input import (
     ChannelInputApprovalSetPayload,
     ChannelInputCancelAckPayload,
     ChannelInputCancelPayload,
+    ChannelInputFinalizedPayload,
+    ChannelInputFinalizePayload,
     ChannelInputHelloPayload,
+    ChannelInputPartialPayload,
+    ChannelInputPreparedPayload,
     ChannelInputPreparePayload,
     ChannelInputProposalPayload,
+    ChannelInputSignPayload,
+    ChannelInputStatusPayload,
+    ChannelInputStatusRequestPayload,
     ChannelInputTranscript,
     ChannelInputValidationError,
     EndpointTerms,
@@ -27,6 +34,7 @@ from jmswap.lnd import (
     ChannelInputCandidate,
     EscrowOutpoint,
     FrozenChannelSnapshot,
+    LndEscrowSigningAttempt,
     LndEscrowStage,
     LndEscrowStatus,
 )
@@ -97,6 +105,16 @@ class TakerChannelInputRegistry:
         return sum(
             negotiation.stage is not TakerChannelInputStage.CANCELED
             for negotiation in self._negotiations.values()
+        )
+
+    @property
+    def active_negotiations(self) -> tuple[TakerChannelInputNegotiation, ...]:
+        """Return active negotiations in a stable immutable order."""
+
+        return tuple(
+            negotiation
+            for _, negotiation in sorted(self._negotiations.items())
+            if negotiation.stage is not TakerChannelInputStage.CANCELED
         )
 
     @property
@@ -335,6 +353,135 @@ class TakerChannelInputRegistry:
                 ) from exc
             self._save(negotiation)
             return prepare
+
+    async def accept_remote_prepared(
+        self, session_id: str, attempt: int, nick: str, payload: ChannelInputPreparedPayload
+    ) -> None:
+        negotiation = self._require(session_id, attempt)
+        async with self.lock_for(session_id, attempt):
+            try:
+                negotiation.accept_remote_prepared(nick, payload)
+            except (ChannelInputValidationError, TypeError, ValueError) as exc:
+                raise TakerChannelInputRuntimeError(
+                    "maker prepared conflicts with negotiation"
+                ) from exc
+            self._save(negotiation)
+
+    async def record_local_prepared(
+        self, session_id: str, attempt: int, nick: str, signing_attempt: LndEscrowSigningAttempt
+    ) -> ChannelInputPreparedPayload:
+        negotiation = self._require(session_id, attempt)
+        async with self.lock_for(session_id, attempt):
+            try:
+                prepared = negotiation.record_local_prepared(nick, signing_attempt)
+            except (ChannelInputValidationError, TypeError, ValueError) as exc:
+                raise TakerChannelInputRuntimeError(
+                    "could not record local prepared evidence"
+                ) from exc
+            self._save(negotiation)
+            return prepared
+
+    async def plan_local_prepared_rotation(self, session_id: str, attempt: int, nick: str) -> None:
+        negotiation = self._require(session_id, attempt)
+        async with self.lock_for(session_id, attempt):
+            try:
+                negotiation.plan_local_prepared_rotation(nick)
+            except (ChannelInputValidationError, TypeError, ValueError) as exc:
+                raise TakerChannelInputRuntimeError(
+                    "could not plan local prepared rotation"
+                ) from exc
+            self._save(negotiation)
+
+    async def build_sign_request(
+        self, session_id: str, attempt: int, nick: str
+    ) -> ChannelInputSignPayload:
+        negotiation = self._require(session_id, attempt)
+        async with self.lock_for(session_id, attempt):
+            try:
+                request = negotiation.build_sign_request(nick)
+            except (ChannelInputValidationError, TypeError, ValueError) as exc:
+                raise TakerChannelInputRuntimeError(
+                    "could not build channel-input sign request"
+                ) from exc
+            self._save(negotiation)
+            return request
+
+    async def accept_remote_partial(
+        self, session_id: str, attempt: int, nick: str, payload: ChannelInputPartialPayload
+    ) -> None:
+        negotiation = self._require(session_id, attempt)
+        async with self.lock_for(session_id, attempt):
+            try:
+                negotiation.accept_remote_partial(nick, payload)
+            except (ChannelInputValidationError, TypeError, ValueError) as exc:
+                raise TakerChannelInputRuntimeError(
+                    "maker partial conflicts with negotiation"
+                ) from exc
+            self._save(negotiation)
+
+    async def record_local_partial(
+        self, session_id: str, attempt: int, nick: str, partial_signature: bytes
+    ) -> ChannelInputPartialPayload:
+        negotiation = self._require(session_id, attempt)
+        async with self.lock_for(session_id, attempt):
+            try:
+                partial = negotiation.record_local_partial(nick, partial_signature)
+            except (ChannelInputValidationError, TypeError, ValueError) as exc:
+                raise TakerChannelInputRuntimeError(
+                    "could not record local partial evidence"
+                ) from exc
+            self._save(negotiation)
+            return partial
+
+    async def build_finalize_request(
+        self, session_id: str, attempt: int, nick: str
+    ) -> ChannelInputFinalizePayload:
+        negotiation = self._require(session_id, attempt)
+        async with self.lock_for(session_id, attempt):
+            try:
+                request = negotiation.build_finalize_request(nick)
+            except (ChannelInputValidationError, TypeError, ValueError) as exc:
+                raise TakerChannelInputRuntimeError(
+                    "could not build channel-input finalize request"
+                ) from exc
+            self._save(negotiation)
+            return request
+
+    async def accept_remote_finalized(
+        self, session_id: str, attempt: int, nick: str, payload: ChannelInputFinalizedPayload
+    ) -> None:
+        negotiation = self._require(session_id, attempt)
+        async with self.lock_for(session_id, attempt):
+            try:
+                negotiation.accept_remote_finalized(nick, payload)
+            except (ChannelInputValidationError, TypeError, ValueError) as exc:
+                raise TakerChannelInputRuntimeError("maker finalized evidence conflicts") from exc
+            self._save(negotiation)
+
+    async def build_status_request(
+        self, session_id: str, attempt: int, nick: str
+    ) -> ChannelInputStatusRequestPayload:
+        negotiation = self._require(session_id, attempt)
+        async with self.lock_for(session_id, attempt):
+            try:
+                request = negotiation.build_status_request(nick)
+            except (ChannelInputValidationError, TypeError, ValueError) as exc:
+                raise TakerChannelInputRuntimeError("could not build status request") from exc
+            self._save(negotiation)
+            return request
+
+    async def accept_remote_status(
+        self, session_id: str, attempt: int, nick: str, response: ChannelInputStatusPayload
+    ) -> None:
+        negotiation = self._require(session_id, attempt)
+        async with self.lock_for(session_id, attempt):
+            try:
+                negotiation.accept_remote_status(nick, response)
+            except (ChannelInputValidationError, TypeError, ValueError) as exc:
+                raise TakerChannelInputRuntimeError(
+                    "maker status conflicts with negotiation"
+                ) from exc
+            self._save(negotiation)
 
     async def accept_maker_cancel_ack(
         self,
