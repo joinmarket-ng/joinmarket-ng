@@ -34,6 +34,7 @@ Reference: https://github.com/bitcoin/bips/blob/master/bip-0329.mediawiki
 
 from __future__ import annotations
 
+import copy
 import json
 import math
 import tempfile
@@ -667,9 +668,18 @@ class UTXOMetadataStore:
 
         with self._exclusive_file_lock():
             self.load()
+            # Snapshot before mutating so a save() failure can roll the
+            # in-memory state back to what is actually on disk, instead of
+            # leaving self.records reporting a batch that was never
+            # persisted.
+            before = copy.deepcopy(self.records)
             for outpoint, freeze in items:
                 self._apply_freeze(outpoint, freeze)
-            self.save()
+            try:
+                self.save()
+            except Exception:
+                self.records = before
+                raise
 
         frozen = sum(1 for _outpoint, freeze in items if freeze)
         logger.info(f"Batch freeze update: {frozen} frozen, {len(items) - frozen} unfrozen")

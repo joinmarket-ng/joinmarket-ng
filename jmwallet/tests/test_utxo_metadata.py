@@ -1518,3 +1518,19 @@ class TestBatchFreeze:
         reloaded.load()
         assert reloaded.is_frozen(a)
         assert not reloaded.is_frozen(b)
+
+    def test_failed_save_restores_in_memory_records(self, store, a, b):
+        """A save() failure must not leave the same store object's in-memory
+        records reporting a batch that was never actually persisted -- a
+        caller checking is_frozen() right after the failed call should still
+        see the pre-batch state, not the mutated-but-unsaved one."""
+        store.freeze(a)
+
+        with (
+            patch.object(UTXOMetadataStore, "save", side_effect=OSError("disk full")),
+            pytest.raises(OSError, match="disk full"),
+        ):
+            store.set_frozen([(a, False), (b, True)])
+
+        assert store.is_frozen(a)
+        assert not store.is_frozen(b)

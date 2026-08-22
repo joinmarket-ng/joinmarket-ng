@@ -508,6 +508,71 @@ class TestFreezeBatch:
         assert resp.status_code == 400
         ws.set_utxos_frozen.assert_not_called()
 
+    def test_non_hex_txid_is_rejected(self, authed_client: tuple[TestClient, str]) -> None:
+        client, token = authed_client
+        state = get_daemon_state()
+        ws = state.wallet_service
+        ws.set_utxos_frozen = Mock()
+
+        resp = client.post(
+            "/api/v1/wallet/test_wallet.jmdat/freeze-batch",
+            json={"entries": [{"utxo-string": "zz" * 32 + ":0", "freeze": True}]},
+            headers=_auth_headers(token),
+        )
+
+        assert resp.status_code == 400
+        ws.set_utxos_frozen.assert_not_called()
+
+    def test_wrong_length_txid_is_rejected(self, authed_client: tuple[TestClient, str]) -> None:
+        client, token = authed_client
+        state = get_daemon_state()
+        ws = state.wallet_service
+        ws.set_utxos_frozen = Mock()
+
+        resp = client.post(
+            "/api/v1/wallet/test_wallet.jmdat/freeze-batch",
+            json={"entries": [{"utxo-string": "aa" * 31 + ":0", "freeze": True}]},
+            headers=_auth_headers(token),
+        )
+
+        assert resp.status_code == 400
+        ws.set_utxos_frozen.assert_not_called()
+
+    def test_negative_vout_is_rejected(self, authed_client: tuple[TestClient, str]) -> None:
+        client, token = authed_client
+        state = get_daemon_state()
+        ws = state.wallet_service
+        ws.set_utxos_frozen = Mock()
+
+        resp = client.post(
+            "/api/v1/wallet/test_wallet.jmdat/freeze-batch",
+            json={"entries": [{"utxo-string": "aa" * 32 + ":-1", "freeze": True}]},
+            headers=_auth_headers(token),
+        )
+
+        assert resp.status_code == 400
+        ws.set_utxos_frozen.assert_not_called()
+
+    def test_uppercase_and_padded_outpoint_is_normalized_before_applying(
+        self, authed_client: tuple[TestClient, str]
+    ) -> None:
+        """A wrongly-cased/padded outpoint must still hit the canonical cached UTXO,
+        not silently no-op under its raw key while the endpoint reports success."""
+        client, token = authed_client
+        state = get_daemon_state()
+        ws = state.wallet_service
+        ws.set_utxos_frozen = Mock()
+
+        resp = client.post(
+            "/api/v1/wallet/test_wallet.jmdat/freeze-batch",
+            json={"entries": [{"utxo-string": "AA" * 32 + ":00", "freeze": True}]},
+            headers=_auth_headers(token),
+        )
+
+        assert resp.status_code == 200
+        ((changes,), _kwargs) = ws.set_utxos_frozen.call_args
+        assert list(changes) == [("aa" * 32 + ":0", True)]
+
     def test_rejects_while_coinjoin_running(self, authed_client: tuple[TestClient, str]) -> None:
         client, token = authed_client
         state = get_daemon_state()
