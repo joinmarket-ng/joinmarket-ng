@@ -16,6 +16,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from jmcore.channel_input_config import ChannelInputConfig
 from jmcore.channel_ring import ChannelRingConfig
 from jmcore.channel_ring_store import RingParticipantStore
 from jmcore.commitment_blacklist import set_blacklist_path
@@ -47,6 +48,8 @@ from jmwallet.wallet.service import WalletService
 from loguru import logger
 
 from maker.background_tasks import BackgroundTasksMixin
+from maker.channel_input_runtime import MakerChannelInputRegistry
+from maker.channel_input_store import MakerChannelInputStore
 from maker.config import MakerConfig
 from maker.direct_connection import DirectConnectionMixin, DirectConnectionState
 from maker.directory_pool import MakerDirectoryPool
@@ -77,6 +80,7 @@ from maker.rate_limiting import (
 )
 
 if TYPE_CHECKING:
+    from jmswap.channel_input import InitializedChannelInputBackend
     from jmswap.channel_ring import InitializedChannelRingBackend
 
 # Approximately 64MB of memory for str->float mapping (including overhead)
@@ -142,6 +146,15 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
             )
         self.directory_clients: dict[str, DirectoryClient] = {}
         self.channel_input_capability_validated = False
+        self._channel_input_backend: InitializedChannelInputBackend | None = None
+        self._channel_input_store: MakerChannelInputStore | None = None
+        self._channel_input_registry: MakerChannelInputRegistry | None = None
+        if isinstance(config.channel_input, ChannelInputConfig) and config.channel_input.enabled:
+            data_directory = config.data_dir or get_default_data_dir()
+            self._channel_input_store = MakerChannelInputStore(
+                config.channel_input.persistence_path(data_directory),
+                max_active_sessions=config.channel_input.max_active_sessions,
+            )
         # Shared connection plumbing (parsing, SOCKS isolation creds,
         # DirectoryClient construction, retry loop). The pool stores its
         # connected clients in self.directory_clients via the shared-dict
@@ -1234,6 +1247,8 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
             # Determine the onion address to advertise
             onion_host = self.config.onion_host
 
+            await self._initialize_channel_input_runtime()
+
             if self.config.channel_ring.enabled:
                 from jmswap.channel_ring import initialize_channel_ring_backend
 
@@ -1360,6 +1375,9 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         except ExpiredFidelityBondCertificateError:
             raise
         except Exception as e:
+            self.channel_input_capability_validated = False
+            self._directory_pool.disable_channel_input_v1()
+            await self._close_channel_input_runtime()
             logger.error("Failed to start maker bot")
             logger.bind(sensitive=True).error(f"Failed to start maker bot: {e}")
             raise
@@ -1371,6 +1389,7 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         self.channel_input_capability_validated = False
         if self._identity_renewal_task is not None:
             self._identity_renewal_task.cancel()
+        self._directory_pool.disable_channel_input_v1()
 
         # Stop the dedicated reaper, then independently expire every exact
         # session object. Handler cancellation and cleanup are bounded inside
@@ -1436,6 +1455,8 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
             await self._close_generation(generation)
         self.generations.clear()
 
+        await self._close_channel_input_runtime()
+
         if self._channel_ring_backend is not None:
             await self._channel_ring_backend.backend.close()
             self._channel_ring_backend = None
@@ -1445,6 +1466,61 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         # The caller is responsible for managing the wallet lifecycle.
         # await self.wallet.close()
         logger.info("Maker bot stopped")
+
+    async def _close_channel_input_runtime(self) -> None:
+        """Close LND runtime state without disturbing durable recovery records."""
+
+        if self._channel_input_backend is not None:
+            await self._channel_input_backend.backend.close()
+            self._channel_input_backend = None
+        self._channel_input_registry = None
+
+    async def _initialize_channel_input_runtime(self) -> None:
+        """Restore LND escrow state before channel-input capability advertisement."""
+
+        if not self.config.channel_input.enabled:
+            return
+        if self._channel_input_store is None:
+            raise RuntimeError("channel-input store is not initialized")
+
+        registry = MakerChannelInputRegistry.load(
+            store=self._channel_input_store,
+            config=self.config.channel_input,
+            network=self.config.network.value,
+        )
+        from jmswap.channel_input import initialize_channel_input_backend
+
+        offer_type = self.config.get_effective_offer_configs()[0].offer_type.value
+        initialized = await initialize_channel_input_backend(
+            self.config.channel_input,
+            network=self.config.network.value,
+            offer_type=offer_type,
+            recovery_outpoints=registry.recovery_outpoints,
+        )
+        try:
+            await registry.reconcile_all(
+                initialized.backend,
+                initialized.node_info.identity_pubkey,
+            )
+        except Exception:
+            await initialized.backend.close()
+            raise
+
+        self._channel_input_backend = initialized
+        self._channel_input_registry = registry
+        capacity_available = (
+            bool(initialized.candidates)
+            and registry.session_count < self.config.channel_input.max_active_sessions
+        )
+        if capacity_available:
+            self.channel_input_capability_validated = True
+            self._directory_pool.enable_channel_input_v1()
+            logger.info("Validated channel-input v1 LND backend")
+        else:
+            logger.warning(
+                "Channel input is not advertised: no unfrozen candidate or durable "
+                "session capacity remains"
+            )
 
     def _start_session_cleanup_task(self) -> None:
         """Start the bot-wide session reaper exactly once."""

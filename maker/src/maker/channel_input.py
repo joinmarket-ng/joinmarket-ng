@@ -164,6 +164,7 @@ class MakerChannelInputChannelState(ChannelInputModel):
     parent_txid: str
     attempt_id: str = Field(repr=False)
     prepared: ChannelInputPreparedPayload
+    restart_intended: bool = False
     sign_request: ChannelInputSignPayload | None = None
     partial: ChannelInputPartialPayload | None = None
     finalize_request: ChannelInputFinalizePayload | None = None
@@ -198,6 +199,16 @@ class MakerChannelInputChannelState(ChannelInputModel):
             raise ValueError("channel state finalize request requires a partial")
         if self.finalized is not None and self.finalize_request is None:
             raise ValueError("channel state finalized evidence requires a finalize request")
+        if self.restart_intended and any(
+            value is not None
+            for value in (
+                self.sign_request,
+                self.partial,
+                self.finalize_request,
+                self.finalized,
+            )
+        ):
+            raise ValueError("nonce restart intent conflicts with signing evidence")
         return self
 
 
@@ -766,13 +777,19 @@ class MakerChannelInputNegotiation:
         _require_parent_txid(parent_txid, self._parent_txid())
         attempt = _validated_signing_attempt(attempt)
         state = self._require_channel_state(funding_outpoint)
-        if (
-            state.partial is not None
-            or state.finalize_request is not None
-            or state.finalized is not None
+        if not state.restart_intended:
+            raise ChannelInputValidationError("prepared nonce rotation lacks durable intent")
+        if any(
+            value is not None
+            for value in (
+                state.sign_request,
+                state.partial,
+                state.finalize_request,
+                state.finalized,
+            )
         ):
             raise ChannelInputValidationError(
-                "prepared nonce cannot rotate after a durable partial"
+                "prepared nonce cannot rotate after signing authorization"
             )
         if state.attempt_id == attempt.attempt_id.hex():
             raise ChannelInputValidationError("prepared nonce rotation requires a new LND attempt")
@@ -783,12 +800,34 @@ class MakerChannelInputNegotiation:
                     "parent_txid": parent_txid,
                     "attempt_id": attempt.attempt_id.hex(),
                     "prepared": prepared,
-                    "sign_request": None,
+                    "restart_intended": False,
                 }
             )
         )
         self._recompute_channel_stage()
         return prepared
+
+    def plan_unsigned_prepared_rotation(self, funding_outpoint: Outpoint) -> None:
+        """Persist authorization to replace one unconsumed LND nonce attempt."""
+
+        self._require_prepared_negotiation()
+        state = self._require_channel_state(funding_outpoint)
+        if any(
+            value is not None
+            for value in (
+                state.sign_request,
+                state.partial,
+                state.finalize_request,
+                state.finalized,
+            )
+        ):
+            raise ChannelInputValidationError(
+                "prepared nonce cannot restart after signing authorization"
+            )
+        if state.restart_intended:
+            return
+        self._replace_channel_state(state.model_copy(update={"restart_intended": True}))
+        self._recompute_channel_stage()
 
     def signing_attempt_for(self, funding_outpoint: Outpoint) -> LndEscrowSigningAttempt:
         """Reconstruct the exact persisted LND attempt for a later pure backend call."""
@@ -808,6 +847,8 @@ class MakerChannelInputNegotiation:
         if self.stage is MakerChannelInputStage.PREPARED:
             raise ChannelInputValidationError("sign requires complete local nonce coverage")
         state = self._require_channel_state(sign.funding_outpoint)
+        if state.restart_intended:
+            raise ChannelInputValidationError("sign conflicts with a durable nonce restart intent")
         assert self.proposal is not None
         validate_sign_for_transcript(
             sign,

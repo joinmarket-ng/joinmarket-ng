@@ -595,7 +595,7 @@ def test_channel_state_chain_is_durable_and_replays_exact_payloads() -> None:
     assert restored.channel_states[0].finalized is not None
 
 
-def test_prepared_rotation_invalidates_pending_sign_and_tampering_fails_closed() -> None:
+def test_prepared_rotation_requires_durable_intent_and_tampering_fails_closed() -> None:
     negotiation, proposal = _prepared_negotiation(channels=1)
     terms = proposal.recipient_terms[0]
     parent_txid = get_txid(proposal.transcript.unsigned_parent_tx)
@@ -606,13 +606,24 @@ def test_prepared_rotation_invalidates_pending_sign_and_tampering_fails_closed()
     )
     peer = _peer_prepared(proposal, first, b"\x03" * 66)
     stale_sign = _sign_intent(proposal, first, peer)
-    assert negotiation.accept_sign("coordinator", stale_sign) is None
+    with pytest.raises(ChannelInputValidationError, match="durable intent"):
+        negotiation.rotate_unsigned_prepared(
+            terms.funding_outpoint,
+            parent_txid,
+            LndEscrowSigningAttempt(attempt_id=b"\x04" * 32, public_nonce=b"\x05" * 66),
+        )
+    negotiation.plan_unsigned_prepared_rotation(terms.funding_outpoint)
+    restored_intent = MakerChannelInputNegotiation.from_snapshot(negotiation.snapshot())
+    assert restored_intent.channel_states[0].restart_intended is True
+    with pytest.raises(ChannelInputValidationError, match="restart intent"):
+        negotiation.accept_sign("coordinator", stale_sign)
     rotated = negotiation.rotate_unsigned_prepared(
         terms.funding_outpoint,
         parent_txid,
         LndEscrowSigningAttempt(attempt_id=b"\x04" * 32, public_nonce=b"\x05" * 66),
     )
     assert rotated != first
+    assert negotiation.channel_states[0].restart_intended is False
     assert negotiation.stage is MakerChannelInputStage.NONCES_READY
     with pytest.raises(ChannelInputValidationError):
         negotiation.accept_sign("coordinator", stale_sign)
@@ -657,7 +668,9 @@ def test_rotation_rejects_same_attempt_and_all_durable_signing_boundaries() -> N
     negotiation, proposal, local, peer, sign = _signing_negotiation()
     terms = proposal.recipient_terms[0]
     parent_txid = get_txid(proposal.transcript.unsigned_parent_tx)
-    with pytest.raises(ChannelInputValidationError):
+    with pytest.raises(ChannelInputValidationError, match="signing authorization"):
+        negotiation.plan_unsigned_prepared_rotation(terms.funding_outpoint)
+    with pytest.raises(ChannelInputValidationError, match="durable intent"):
         negotiation.rotate_unsigned_prepared(
             terms.funding_outpoint,
             parent_txid,

@@ -24,3 +24,7 @@ def test_maker_capability_is_disabled_until_backend_validation() -> None:
     pool.enable_channel_input_v1()
     after_channel_input = pool._build_client_kwargs("directory", 5222)
     assert after_channel_input[FEATURE_CHANNEL_INPUT_V1] is True
+
+    pool.disable_channel_input_v1()
+    after_disable = pool._build_client_kwargs("directory", 5222)
+    assert after_disable[FEATURE_CHANNEL_INPUT_V1] is False

@@ -850,6 +850,19 @@ class LndBackend:
             raise ValueError("allowed peer public key must be a lowercase compressed public key")
         return peer_node_pubkey
 
+    @staticmethod
+    def _is_escrow_session_mismatch(error: Exception) -> bool:
+        import grpc  # type: ignore[import-untyped]
+
+        status_code = getattr(error, "code", None)
+        details = getattr(error, "details", None)
+        return (
+            callable(status_code)
+            and callable(details)
+            and status_code() == grpc.StatusCode.UNKNOWN
+            and details() == "escrow session does not match lock"
+        )
+
     async def list_channel_input_candidates(
         self,
         *,
@@ -964,16 +977,7 @@ class LndBackend:
         except TimeoutError as exc:
             raise LndTimeoutError("ChannelEscrowRPC Status probe timed out") from exc
         except Exception as exc:
-            import grpc  # type: ignore[import-untyped]
-
-            status_code = getattr(exc, "code", None)
-            details = getattr(exc, "details", None)
-            if (
-                callable(status_code)
-                and callable(details)
-                and status_code() == grpc.StatusCode.UNKNOWN
-                and details() == "escrow session does not match lock"
-            ):
+            if self._is_escrow_session_mismatch(exc):
                 return
             raise LndCapabilityError(f"ChannelEscrowRPC Status probe failed: {exc}") from exc
         raise LndCapabilityError(
@@ -1371,6 +1375,18 @@ class LndBackend:
             raise LndValidationError(
                 "ChannelEscrowRPC returned inconsistent durable status"
             ) from exc
+
+    async def find_channel_input_escrow_status(
+        self, session_id: str, funding_outpoint: EscrowOutpoint
+    ) -> LndEscrowStatus | None:
+        """Return exact durable state, or None when this session owns no lock."""
+
+        try:
+            return await self.channel_input_escrow_status(session_id, funding_outpoint)
+        except Exception as exc:
+            if self._is_escrow_session_mismatch(exc):
+                return None
+            raise
 
     async def cancel_channel_input_escrow(
         self, session_id: str, funding_outpoint: EscrowOutpoint

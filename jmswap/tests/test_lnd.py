@@ -847,6 +847,23 @@ async def test_channel_escrow_requires_a_dedicated_credential_without_initializi
     assert target._escrow_channel is None
 
 
+async def test_find_channel_escrow_status_returns_none_only_for_exact_session_mismatch() -> None:
+    target = LndBackend(
+        host="localhost:10009", tls_cert=b"cert", macaroon_hex="admin", escrow_macaroon_hex="escrow"
+    )
+    outpoint = EscrowOutpoint(txid="aa" * 32, vout=0)
+    target._escrow_stub = StatusOnlyEscrowStub(
+        error=FakeGrpcError(grpc.StatusCode.UNKNOWN, "escrow session does not match lock")
+    )
+
+    assert await target.find_channel_input_escrow_status("private-session", outpoint) is None
+
+    error = FakeGrpcError(grpc.StatusCode.PERMISSION_DENIED, "permission denied")
+    target._escrow_stub = StatusOnlyEscrowStub(error=error)
+    with pytest.raises(FakeGrpcError, match="permission denied"):
+        await target.find_channel_input_escrow_status("private-session", outpoint)
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [

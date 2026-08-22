@@ -112,3 +112,7 @@ class MakerDirectoryPool(DirectoryClientPool):
     def enable_channel_input_v1(self) -> None:
         """Advertise the feature on future connections after backend validation."""
         self._channel_input_v1 = True
+
+    def disable_channel_input_v1(self) -> None:
+        """Stop advertising the feature on future connections during shutdown."""
+        self._channel_input_v1 = False
