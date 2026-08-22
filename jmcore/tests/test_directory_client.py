@@ -24,7 +24,12 @@ from jmcore.nick_auth import (
     create_nick_auth_proof,
     directory_id_for_endpoint,
 )
-from jmcore.protocol import FEATURE_NEUTRINO_COMPAT, FEATURE_NICK_AUTH, FEATURE_PEERLIST_FEATURES
+from jmcore.protocol import (
+    FEATURE_CHANNEL_INPUT_V1,
+    FEATURE_NEUTRINO_COMPAT,
+    FEATURE_NICK_AUTH,
+    FEATURE_PEERLIST_FEATURES,
+)
 
 TEST_DIRECTORY_ID = "test:directory-a"
 VALID_MAKER_NICK = "J57wPBk1VfjSP5Te"
@@ -269,6 +274,28 @@ async def test_nick_auth_prefer_verified_does_not_advertise_without_expected_ide
     assert FEATURE_NICK_AUTH not in json.loads(handshake["line"])["features"]
     assert connection.receive.await_count == 1
     assert client.directory_nick_authenticated is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("channel_input_v1", [False, True])
+async def test_directory_handshake_advertises_channel_input_only_when_enabled(
+    channel_input_v1: bool,
+) -> None:
+    connection = AsyncMock()
+    connection.receive.return_value = _handshake_response()
+    client = DirectoryClient(
+        "directory-a",
+        5222,
+        "regtest",
+        channel_input_v1=channel_input_v1,
+    )
+    client.connection = connection
+
+    await client._handshake()
+
+    handshake = json.loads(connection.send.await_args.args[0])
+    features = json.loads(handshake["line"])["features"]
+    assert (FEATURE_CHANNEL_INPUT_V1 in features) is channel_input_v1
 
 
 @pytest.mark.asyncio

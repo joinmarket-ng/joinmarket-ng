@@ -54,6 +54,7 @@ class MakerSession:
     responded_fill: bool = False
     responded_auth: bool = False
     responded_sig: bool = False
+    features: set[str] = Field(default_factory=set)
     supports_neutrino_compat: bool = False  # Supports extended UTXO metadata for Neutrino
     # Communication channel used for this session (must be consistent throughout)
     # "direct" = peer-to-peer onion connection

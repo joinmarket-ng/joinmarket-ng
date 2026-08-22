@@ -31,10 +31,15 @@ from jmcore.commitment_blacklist import set_blacklist_path
 from jmcore.crypto import NickIdentity
 from jmcore.fee_policy import fee_rate_meets_minimum
 from jmcore.logging_context import coinjoin_id_from_commitment, coinjoin_log_context
-from jmcore.models import Offer, offer_output_script_type, offer_types_for_family
+from jmcore.models import Offer, OfferType, offer_output_script_type, offer_types_for_family
 from jmcore.notifications import get_notifier
 from jmcore.paths import get_default_data_dir, read_nick_states
-from jmcore.protocol import FEATURE_COFUNDED_CHANNEL_RING_V1, FEATURE_NEUTRINO_COMPAT, JM_VERSION
+from jmcore.protocol import (
+    FEATURE_CHANNEL_INPUT_V1,
+    FEATURE_COFUNDED_CHANNEL_RING_V1,
+    FEATURE_NEUTRINO_COMPAT,
+    JM_VERSION,
+)
 from jmcore.tasks import spawn_task
 from jmwallet.backends.base import BlockchainBackend, BondVerificationRequest
 from jmwallet.history import (
@@ -62,6 +67,7 @@ from taker.orderbook import (
     OrderbookManager,
     calculate_cj_fee,
     maker_selection_keys,
+    offer_supports_channel_input_v1,
     offer_supports_cofunded_channel_ring_v1,
 )
 from taker.podle_manager import PoDLEManager
@@ -229,6 +235,8 @@ class Taker(TakerMonitoringMixin):
             nick_auth_directory_ids=config.nick_auth_directory_ids,
             allow_clearnet_connections=config.allow_clearnet_connections,
             neutrino_compat=neutrino_compat,
+            cofunded_channel_ring_v1=config.channel_ring.enabled,
+            channel_input_v1=config.channel_input.enabled,
             stream_isolation=config.stream_isolation,
         )
 
@@ -1131,6 +1139,24 @@ class Taker(TakerMonitoringMixin):
         self._session.last_failure_reason = error
         raise ValueError(error)
 
+    def _channel_input_request_error(self, amount: int, maker_count: int) -> str | None:
+        if not self.config.channel_input.enabled:
+            return None
+        self._session.strict_maker_count = maker_count
+        minimum = max(self.config.minimum_makers, self.config.channel_input.minimum_makers)
+        if amount == 0:
+            return "Channel-input mode rejects sweep/no-change CoinJoins"
+        if maker_count < minimum:
+            return f"Channel-input mode requires at least {minimum} selected makers"
+        return None
+
+    def _enforce_channel_input_request(self, amount: int, maker_count: int) -> None:
+        error = self._channel_input_request_error(amount, maker_count)
+        if error is None:
+            return
+        self._session.last_failure_reason = error
+        raise ValueError(error)
+
     def _ring_filter_offers(
         self, offers: list[Any], maker_count: int
     ) -> tuple[list[Any], str | None]:
@@ -1154,6 +1180,31 @@ class Taker(TakerMonitoringMixin):
             return "Channel-ring selection did not return the exact requested maker set"
         return None
 
+    def _channel_input_filter_offers(
+        self, offers: list[Any], maker_count: int
+    ) -> tuple[list[Any], str | None]:
+        if not self.config.channel_input.enabled:
+            return offers, None
+        filtered = [
+            offer
+            for offer in offers
+            if offer_supports_channel_input_v1(offer)
+            and offer.ordertype is self.config.preferred_offer_type
+        ]
+        if len(filtered) < maker_count:
+            return filtered, (
+                "Not enough makers explicitly advertise the exact configured "
+                "channel_input_v1 tr0 offer"
+            )
+        return filtered, None
+
+    def _channel_input_selection_error(
+        self, selected_count: int, requested_count: int
+    ) -> str | None:
+        if self.config.channel_input.enabled and selected_count != requested_count:
+            return "Channel-input selection did not return the exact requested maker set"
+        return None
+
     def _prepare_ring_offer_selection(
         self,
         offers: list[Any],
@@ -1169,12 +1220,40 @@ class Taker(TakerMonitoringMixin):
             raise ValueError(error)
         return filtered, required_features
 
+    def _prepare_channel_input_offer_selection(
+        self,
+        offers: list[Any],
+        required_features: set[str] | None,
+        maker_count: int,
+    ) -> tuple[list[Any], set[str] | None]:
+        if self.config.channel_input.enabled:
+            required_features = set(required_features or ())
+            required_features.add(FEATURE_CHANNEL_INPUT_V1)
+        filtered, error = self._channel_input_filter_offers(offers, maker_count)
+        if error is not None:
+            self._session.last_failure_reason = error
+            raise ValueError(error)
+        return filtered, required_features
+
     def _enforce_ring_selection(self, selected_count: int, requested_count: int) -> None:
         error = self._ring_selection_error(selected_count, requested_count)
         if error is None:
             return
         self._session.last_failure_reason = error
         raise ValueError(error)
+
+    def _enforce_channel_input_selection(self, selected_count: int, requested_count: int) -> None:
+        error = self._channel_input_selection_error(selected_count, requested_count)
+        if error is None:
+            return
+        self._session.last_failure_reason = error
+        raise ValueError(error)
+
+    def _replacement_allowed_types(self) -> set[OfferType] | None:
+        """Keep strict protocol replacements on the exact configured offer type."""
+        if self.config.channel_ring.enabled or self.config.channel_input.enabled:
+            return {self.config.preferred_offer_type}
+        return None
 
     async def _prepare_channel_ring(self, destination: str, mixdepth: int) -> bool:
         if self._channel_ring_backend is None or self._channel_ring_store is None:
@@ -1306,6 +1385,7 @@ class Taker(TakerMonitoringMixin):
             n_makers = resolve_counterparty_count(requested)
             self._session.maker_target_count = n_makers
             self._enforce_ring_request(amount, n_makers)
+            self._enforce_channel_input_request(amount, n_makers)
             self._session.maker_target_count = n_makers
 
             # Resolve explicit or interactive input requests before orderbook
@@ -1364,6 +1444,9 @@ class Taker(TakerMonitoringMixin):
             if self.backend.requires_neutrino_metadata():
                 required_features = {FEATURE_NEUTRINO_COMPAT}
             offers, required_features = self._prepare_ring_offer_selection(
+                offers, required_features, n_makers
+            )
+            offers, required_features = self._prepare_channel_input_offer_selection(
                 offers, required_features, n_makers
             )
 
@@ -1567,6 +1650,7 @@ class Taker(TakerMonitoringMixin):
                     self.state = TakerState.FAILED
                     return None
                 self._enforce_ring_selection(len(selected_offers), n_makers)
+                self._enforce_channel_input_selection(len(selected_offers), n_makers)
 
                 # Pre-select UTXOs for CoinJoin, then generate PoDLE from one of them
                 # This ensures the PoDLE UTXO is one we'll actually use in the transaction
@@ -1757,6 +1841,7 @@ class Taker(TakerMonitoringMixin):
             self._activate_coinjoin_log_context()
 
             max_replacement_attempts = self.config.max_maker_replacement_attempts
+            self._session.required_maker_features = set(required_features or ())
             if not await self._run_fill_with_replacements(
                 destination=destination,
                 selected_offers=selected_offers,
@@ -1942,6 +2027,7 @@ class Taker(TakerMonitoringMixin):
         penalized_maker_keys: set[str] | None = None,
     ) -> bool:
         self.state = TakerState.AUTHENTICATING
+        self._session.required_maker_features = set(required_features or ())
         logger.debug("Phase 2: Sending !auth and receiving !ioauth...")
 
         auth_replacement_attempt = 0
@@ -1997,6 +2083,7 @@ class Taker(TakerMonitoringMixin):
                     hard_exclude_nicks=current_session_nicks | failed_nicks,
                     required_features=required_features,
                     penalized_maker_keys=penalized_maker_keys,
+                    allowed_types=self._replacement_allowed_types(),
                 )
 
                 if not replacement_offers:
@@ -2099,6 +2186,13 @@ class Taker(TakerMonitoringMixin):
         logger.debug("Running fill phase for replacement makers...")
         new_maker_nicks = list(replacement_offers.keys())
 
+        # A replacement can already have an established direct peer handshake.
+        # Exclude explicit negative capability claims before sending it !fill.
+        for nick in self._session._drop_sessions_missing_required_features():
+            failed_nicks.add(nick)
+            self.orderbook_manager.add_ignored_maker(nick)
+        new_maker_nicks = [nick for nick in new_maker_nicks if nick in self._session.maker_sessions]
+
         commitment_hex = self._session.podle_commitment.to_commitment_str()
         taker_pubkey = self._session.crypto_session.get_pubkey_hex()
 
@@ -2140,7 +2234,18 @@ class Taker(TakerMonitoringMixin):
                     response_data = responses[nick]["data"].strip()
                     ready = self._session.process_pubkey_response(nick, response_data)
                     if ready:
-                        logger.debug(f"Replacement maker {nick} ready")
+                        replacement_session = self._session.maker_sessions[nick]
+                        missing = (
+                            self._session.required_maker_features - replacement_session.features
+                        )
+                        if missing:
+                            logger.warning(
+                                f"Dropping replacement maker {nick} after !pubkey: missing "
+                                f"required features {sorted(missing)}."
+                            )
+                            ready = False
+                        else:
+                            logger.debug(f"Replacement maker {nick} ready")
                 except Exception as e:
                     logger.warning("Failed to process maker response")
                     logger.bind(sensitive=True).warning(
@@ -2165,6 +2270,7 @@ class Taker(TakerMonitoringMixin):
         penalized_maker_keys: set[str] | None = None,
     ) -> bool:
         self.state = TakerState.FILLING
+        self._session.required_maker_features = set(required_features or ())
         logger.debug("Phase 1: Sending !fill to makers...")
         directory_count = len(self.directory_client.clients)
         directories = [
@@ -2195,6 +2301,7 @@ class Taker(TakerMonitoringMixin):
         podle_retry = 0
         failed_nicks: set[str] = set()
         target_makers = max(self._session.maker_target_count, self._session.required_maker_count)
+        required_floor = self._session.required_maker_count
         while True:
             session_size_before_fill = len(self._session.maker_sessions)
             fill_result = await self._session._phase_fill()
@@ -2319,15 +2426,15 @@ class Taker(TakerMonitoringMixin):
 
             needed = target_makers - current_makers
             if replacement_attempt >= max_replacement_attempts:
-                if fill_result.success and current_makers >= self._session.required_maker_count:
+                if fill_result.success and current_makers >= required_floor:
                     logger.warning(
                         f"Fill replacement attempts exhausted; proceeding with {current_makers}/"
-                        f"{target_makers} makers (minimum {self._session.required_maker_count})"
+                        f"{target_makers} makers (required floor {required_floor})"
                     )
                     return True
                 reason = (
                     f"Fill phase failed: only {current_makers} responding makers remain, "
-                    f"below minimum {self._session.required_maker_count}"
+                    f"below required floor {required_floor}"
                 )
                 logger.error(reason)
                 self._session.last_failure_reason = reason
@@ -2347,18 +2454,19 @@ class Taker(TakerMonitoringMixin):
                 hard_exclude_nicks=current_session_nicks | failed_nicks,
                 required_features=required_features,
                 penalized_maker_keys=penalized_maker_keys,
+                allowed_types=self._replacement_allowed_types(),
             )
 
             if not replacement_offers:
-                if fill_result.success and current_makers >= self._session.required_maker_count:
+                if fill_result.success and current_makers >= required_floor:
                     logger.warning(
                         f"No fill replacements available; proceeding with {current_makers}/"
-                        f"{target_makers} makers (minimum {self._session.required_maker_count})"
+                        f"{target_makers} makers (required floor {required_floor})"
                     )
                     return True
                 reason = (
                     f"Fill phase failed: no replacements available and only {current_makers} "
-                    f"makers remain (minimum {self._session.required_maker_count})"
+                    f"makers remain (required floor {required_floor})"
                 )
                 logger.error(reason)
                 self._session.last_failure_reason = reason

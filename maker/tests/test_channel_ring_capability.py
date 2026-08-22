@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from jmcore.protocol import FEATURE_COFUNDED_CHANNEL_RING_V1
+from jmcore.protocol import FEATURE_CHANNEL_INPUT_V1, FEATURE_COFUNDED_CHANNEL_RING_V1
 
 from maker.config import MakerConfig
 from maker.directory_pool import MakerDirectoryPool
@@ -15,7 +15,12 @@ def test_maker_capability_is_disabled_until_backend_validation() -> None:
     )
     before = pool._build_client_kwargs("directory", 5222)
     assert before[FEATURE_COFUNDED_CHANNEL_RING_V1] is False
+    assert before[FEATURE_CHANNEL_INPUT_V1] is False
 
     pool.enable_cofunded_channel_ring_v1()
     after = pool._build_client_kwargs("directory", 5222)
     assert after[FEATURE_COFUNDED_CHANNEL_RING_V1] is True
+
+    pool.enable_channel_input_v1()
+    after_channel_input = pool._build_client_kwargs("directory", 5222)
+    assert after_channel_input[FEATURE_CHANNEL_INPUT_V1] is True

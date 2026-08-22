@@ -20,6 +20,7 @@ from jmcore.network import ConnectionError as NetworkConnectionError
 from jmcore.nick_auth import NickAuthMode
 from jmcore.protocol import (
     COMMAND_PREFIX,
+    FEATURE_CHANNEL_INPUT_V1,
     FEATURE_COFUNDED_CHANNEL_RING_V1,
     FEATURE_NEUTRINO_COMPAT,
     FEATURE_NICK_AUTH,
@@ -249,6 +250,7 @@ class DirectConnectionMixin:
     _direct_connection_states: dict[TCPConnection, DirectConnectionState]
     _direct_connection_rate_limiter: DirectConnectionRateLimiter
     channel_ring_capability_validated: bool
+    channel_input_capability_validated: bool
 
     def _remove_direct_connection(
         self: MakerBotProtocol, connection: TCPConnection, generation_id: int | None = None
@@ -458,6 +460,8 @@ class DirectConnectionMixin:
             features.features.add(FEATURE_NICK_AUTH)
         if self.channel_ring_capability_validated:
             features.features.add(FEATURE_COFUNDED_CHANNEL_RING_V1)
+        if self.channel_input_capability_validated:
+            features.features.add(FEATURE_CHANNEL_INPUT_V1)
 
         # Determine our location string (onion address or NOT-SERVING-ONION)
         onion_host = generation.onion_host

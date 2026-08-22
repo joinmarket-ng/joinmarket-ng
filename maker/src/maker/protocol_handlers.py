@@ -33,6 +33,7 @@ from jmcore.network import ONION_HOSTID
 from jmcore.notifications import get_notifier
 from jmcore.protocol import (
     COMMAND_PREFIX,
+    FEATURE_CHANNEL_INPUT_V1,
     FEATURE_COFUNDED_CHANNEL_RING_V1,
     JM_VERSION,
     MessageType,
@@ -104,6 +105,7 @@ class ProtocolHandlersMixin:
     _own_wallet_nicks: set[str]
     _hp2_own_broadcast_semaphore: asyncio.Semaphore
     _hp2_relay_broadcast_semaphore: asyncio.Semaphore
+    channel_input_capability_validated: bool
 
     async def _handle_message(
         self: MakerBotProtocol,
@@ -749,6 +751,10 @@ class ProtocolHandlersMixin:
 
                 if self.channel_ring_capability_validated:
                     response.setdefault("features", []).append(FEATURE_COFUNDED_CHANNEL_RING_V1)
+                if self.channel_input_capability_validated:
+                    features = response.setdefault("features", [])
+                    if FEATURE_CHANNEL_INPUT_V1 not in features:
+                        features.append(FEATURE_CHANNEL_INPUT_V1)
                 self.active_sessions[session_key] = session
                 logger.info(
                     f"Created CoinJoin session with {taker_nick} "

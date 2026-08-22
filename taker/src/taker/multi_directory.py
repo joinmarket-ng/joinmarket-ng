@@ -21,7 +21,11 @@ from jmcore.models import Offer
 from jmcore.network import ONION_HOSTID, OnionPeer
 from jmcore.nick_auth import NickAuthMode
 from jmcore.protocol import (
+    FEATURE_CHANNEL_INPUT_V1,
+    FEATURE_COFUNDED_CHANNEL_RING_V1,
+    FEATURE_NEUTRINO_COMPAT,
     NOT_SERVING_ONION_HOSTNAME,
+    FeatureSet,
     MessageType,
     is_onion_peer_location,
     parse_jm_message,
@@ -98,6 +102,8 @@ class MultiDirectoryClient(DirectoryClientPool):
         socks_port: int = 9050,
         connection_timeout: float = 120.0,
         neutrino_compat: bool = False,
+        cofunded_channel_ring_v1: bool = False,
+        channel_input_v1: bool = False,
         on_nick_leave: Any | None = None,
         prefer_direct_connections: bool = True,
         our_location: str = "NOT-SERVING-ONION",
@@ -126,6 +132,8 @@ class MultiDirectoryClient(DirectoryClientPool):
         self.nick = nick_identity.nick
         self.neutrino_compat = neutrino_compat
         self.allow_clearnet_connections = allow_clearnet_connections
+        self.cofunded_channel_ring_v1 = cofunded_channel_ring_v1
+        self.channel_input_v1 = channel_input_v1
         self.on_nick_leave = on_nick_leave
 
         # Direct peer connection settings
@@ -147,11 +155,28 @@ class MultiDirectoryClient(DirectoryClientPool):
         self._active_nicks: dict[str, dict[str, bool]] = {}
 
     def _build_client_kwargs(self, host: str, port: int) -> dict[str, Any]:
-        """Inject the taker's ``neutrino_compat`` flag into the base kwargs."""
+        """Inject local capability flags into directory-client construction kwargs."""
         kwargs = super()._build_client_kwargs(host, port)
         kwargs["neutrino_compat"] = self.neutrino_compat
         kwargs["allow_clearnet_connections"] = self.allow_clearnet_connections
+        kwargs["cofunded_channel_ring_v1"] = self.cofunded_channel_ring_v1
+        kwargs["channel_input_v1"] = self.channel_input_v1
         return kwargs
+
+    def _local_features(self) -> FeatureSet:
+        """Return the capabilities advertised in initiating direct-peer handshakes."""
+        features: set[str] = set()
+        if self.neutrino_compat:
+            features.add(FEATURE_NEUTRINO_COMPAT)
+        if self.cofunded_channel_ring_v1:
+            features.add(FEATURE_COFUNDED_CHANNEL_RING_V1)
+        if self.channel_input_v1:
+            features.add(FEATURE_CHANNEL_INPUT_V1)
+        return FeatureSet(features=features)
+
+    def enable_channel_input_v1(self) -> None:
+        """Advertise channel-input support after its local backend is initialized."""
+        self.channel_input_v1 = True
 
     def _update_nick_status(self, nick: str, server: str, is_present: bool) -> None:
         """
@@ -470,6 +495,7 @@ class MultiDirectoryClient(DirectoryClientPool):
                 socks_username=self._peer_creds[0],
                 socks_password=self._peer_creds[1],
                 allow_clearnet_connections=self.allow_clearnet_connections,
+                local_features=self._local_features(),
             )
             self._peer_connections[nick] = peer
         else:

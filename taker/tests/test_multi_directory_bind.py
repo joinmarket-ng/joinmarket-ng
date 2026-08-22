@@ -5,8 +5,14 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _taker_test_helpers import make_directory_client
 from jmcore.crypto import NickIdentity
 from jmcore.models import Offer, OfferType
+from jmcore.protocol import (
+    FEATURE_CHANNEL_INPUT_V1,
+    FEATURE_COFUNDED_CHANNEL_RING_V1,
+    FEATURE_NEUTRINO_COMPAT,
+)
 
 from taker.multi_directory import ChannelBinding, MultiDirectoryClient
 
@@ -224,6 +230,41 @@ def test_channel_binding_is_frozen():
     cb = ChannelBinding(nick="n", channel_id="direct")
     with pytest.raises((AttributeError, TypeError)):
         cb.nick = "other"  # type: ignore[misc]
+
+
+def test_capabilities_are_forwarded_to_directory_and_direct_peer_clients(monkeypatch):
+    client = make_directory_client(neutrino_compat=True, cofunded_channel_ring_v1=True)
+
+    kwargs = client._build_client_kwargs("directory", 5222)
+    assert kwargs["neutrino_compat"] is True
+    assert kwargs["cofunded_channel_ring_v1"] is True
+    assert kwargs["channel_input_v1"] is False
+    assert client._local_features().features == {
+        FEATURE_NEUTRINO_COMPAT,
+        FEATURE_COFUNDED_CHANNEL_RING_V1,
+    }
+
+    client.enable_channel_input_v1()
+    assert kwargs["channel_input_v1"] is False
+    assert FEATURE_CHANNEL_INPUT_V1 in client._local_features().features
+    assert client._build_client_kwargs("directory", 5222)["channel_input_v1"] is True
+
+    directory = MagicMock()
+    directory._active_peers = {"J5maker": "maker.onion:5222"}
+    client.clients = {"directory": directory}
+    peer = MagicMock()
+    peer.try_to_connect.return_value = None
+    onion_peer = MagicMock(return_value=peer)
+    monkeypatch.setattr("taker.multi_directory.OnionPeer", onion_peer)
+
+    client._try_direct_connect("J5maker")
+
+    onion_peer_kwargs = onion_peer.call_args.kwargs
+    assert onion_peer_kwargs["local_features"].features == {
+        FEATURE_NEUTRINO_COMPAT,
+        FEATURE_COFUNDED_CHANNEL_RING_V1,
+        FEATURE_CHANNEL_INPUT_V1,
+    }
 
 
 def test_upgrade_channel_prefers_direct_once_connected():

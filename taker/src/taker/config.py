@@ -318,6 +318,8 @@ class TakerConfig(WalletConfig):
         """If bitcoin_network is not set, default to the protocol network."""
         if self.bitcoin_network is None:
             object.__setattr__(self, "bitcoin_network", self.network)
+        if self.channel_ring.enabled and self.channel_input.enabled:
+            raise ValueError("channel ring and channel input cannot both be enabled")
         if self.channel_ring.enabled:
             if self.address_type != "p2tr":
                 raise ValueError("enabled channel ring requires a p2tr wallet")

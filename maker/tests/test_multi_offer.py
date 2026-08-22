@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from jmcore.constants import DUST_THRESHOLD
 from jmcore.models import NetworkType, Offer, OfferType
+from jmcore.protocol import FEATURE_CHANNEL_INPUT_V1
 from loguru import logger
 
 from maker.bot import MakerBot
@@ -695,6 +696,46 @@ class TestMakerBotMultiOfferFill:
         call_kwargs = mock_session_class.call_args[1]
         assert call_kwargs["offer"].oid == 1
         assert call_kwargs["offer"].ordertype == OfferType.SW0_ABSOLUTE
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("capability_validated", "response_features", "expected_features"),
+        [
+            (False, [], []),
+            (True, [FEATURE_CHANNEL_INPUT_V1], [FEATURE_CHANNEL_INPUT_V1]),
+        ],
+    )
+    async def test_fill_pubkey_advertises_validated_channel_input_once(
+        self,
+        maker_bot,
+        capability_validated,
+        response_features,
+        expected_features,
+    ):
+        maker_bot.channel_input_capability_validated = capability_validated
+        response = {"nacl_pubkey": "abc123", "features": response_features}
+        sent_response = AsyncMock()
+
+        async def mock_handle_fill(amount, commitment, taker_pk):
+            return True, response
+
+        with patch("maker.protocol_handlers.CoinJoinSession") as mock_session_class:
+            mock_session = MagicMock()
+            mock_session.handle_fill = mock_handle_fill
+            mock_session.validate_channel = MagicMock(return_value=True)
+            mock_session_class.return_value = mock_session
+
+            with patch("maker.protocol_handlers.check_commitment", return_value=True):
+                with patch.object(maker_bot, "_send_response", new=sent_response):
+                    await maker_bot._handle_fill(
+                        "J5ChannelInputTaker",
+                        f"fill 0 500000 taker_pk_hex P{'ce' * 32}",
+                    )
+
+        sent_response.assert_awaited_once_with(
+            "J5ChannelInputTaker", "pubkey", response, generation_id=0
+        )
+        assert response["features"] == expected_features
 
     @pytest.mark.asyncio
     async def test_fill_reserves_commitment_across_local_sessions(self, maker_bot):

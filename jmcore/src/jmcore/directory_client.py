@@ -46,6 +46,7 @@ from jmcore.nick_auth import (
 )
 from jmcore.protocol import (
     COMMAND_PREFIX,
+    FEATURE_CHANNEL_INPUT_V1,
     FEATURE_COFUNDED_CHANNEL_RING_V1,
     FEATURE_NEUTRINO_COMPAT,
     FEATURE_NICK_AUTH,
@@ -258,6 +259,7 @@ class DirectoryClient:
         nick_auth_mode: NickAuthMode = NickAuthMode.PREFER_VERIFIED,
         nick_auth_directory_id: str | None = None,
         allow_clearnet_connections: bool = False,
+        channel_input_v1: bool = False,
     ) -> None:
         """
         Initialize DirectoryClient.
@@ -274,6 +276,7 @@ class DirectoryClient:
             max_message_size: Maximum message size in bytes
             on_disconnect: Callback when connection drops
             neutrino_compat: Advertise support for Neutrino-compatible UTXO metadata
+            channel_input_v1: Advertise validated channel-input v1 support
             peerlist_timeout: Timeout for first PEERLIST chunk (default 60s, subsequent chunks use 5s)
             socks_username: SOCKS5 username for Tor stream isolation (optional)
             socks_password: SOCKS5 password for Tor stream isolation (optional)
@@ -326,6 +329,7 @@ class DirectoryClient:
             with contextlib.suppress(ValueError):
                 self.nick_auth_directory_id = directory_id_for_endpoint(self.host, self.port)
         self.cofunded_channel_ring_v1 = cofunded_channel_ring_v1
+        self.channel_input_v1 = channel_input_v1
 
         # Version negotiation state (set after handshake)
         self.negotiated_version: int | None = None
@@ -607,6 +611,8 @@ class DirectoryClient:
             our_features.add(FEATURE_NICK_AUTH)
         if self.cofunded_channel_ring_v1:
             our_features.add(FEATURE_COFUNDED_CHANNEL_RING_V1)
+        if self.channel_input_v1:
+            our_features.add(FEATURE_CHANNEL_INPUT_V1)
         feature_set = FeatureSet(features=our_features)
 
         # Send our handshake with current version and features

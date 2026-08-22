@@ -30,7 +30,7 @@ from jmcore.directory_pool import DirectoryConnectionResult
 from jmcore.encryption import CryptoSession
 from jmcore.models import Offer, OfferType
 from jmcore.network import ONION_HOSTID
-from jmcore.protocol import MakerError, MessageType
+from jmcore.protocol import FEATURE_CHANNEL_INPUT_V1, MakerError, MessageType
 from jmwallet.backends.base import Transaction
 from jmwallet.wallet.models import UTXOInfo
 from loguru import logger
@@ -3057,7 +3057,7 @@ class TestNeutrinoIncompatibleMakerReplacement:
         taker.directory_client.wait_for_responses.assert_not_awaited()
 
     def test_process_pubkey_response_parses_features(self):
-        """The shared !pubkey processing must record neutrino_compat support."""
+        """The shared !pubkey processing retains every advertised feature."""
         from taker.coinjoin_session import CoinJoinSession
 
         session = CoinJoinSession()
@@ -3068,6 +3068,7 @@ class TestNeutrinoIncompatibleMakerReplacement:
 
         payload = f"{maker_crypto.get_pubkey_hex()} features=neutrino_compat,other signpk sig"
         assert session.process_pubkey_response("J5x", payload) is True
+        assert mk.features == {"neutrino_compat", "other"}
         assert mk.supports_neutrino_compat is True
         assert mk.responded_fill is True
         assert mk.pubkey == maker_crypto.get_pubkey_hex()
@@ -3097,6 +3098,19 @@ class TestNeutrinoIncompatibleMakerReplacement:
         session.maker_sessions = {"J5x": mk}
 
         assert session.process_pubkey_response("J5x", "") is False
+        assert mk.responded_fill is False
+
+    def test_process_pubkey_response_rejects_empty_feature_names(self):
+        from taker.coinjoin_session import CoinJoinSession
+
+        session = CoinJoinSession()
+        session.crypto_session = CryptoSession()
+        maker_crypto = CryptoSession()
+        mk = MakerSession(nick="J5x", offer=_simple_offer("J5x"))
+        session.maker_sessions = {"J5x": mk}
+
+        payload = f"{maker_crypto.get_pubkey_hex()} features=neutrino_compat, signpk sig"
+        assert session.process_pubkey_response("J5x", payload) is False
         assert mk.responded_fill is False
 
     @staticmethod
@@ -3175,6 +3189,45 @@ class TestNeutrinoIncompatibleMakerReplacement:
         assert set(taker._session.maker_sessions.keys()) == {"J5good", "J5legacy"}
 
     @pytest.mark.asyncio
+    async def test_phase_fill_drops_missing_required_channel_input_feature(self):
+        from jmcore.protocol import FEATURE_CHANNEL_INPUT_V1
+
+        taker = self._make_neutrino_taker(minimum_makers=1)
+        taker.backend.requires_neutrino_metadata = MagicMock(return_value=False)
+        taker._session.required_maker_features = {FEATURE_CHANNEL_INPUT_V1}
+        maker_crypto = CryptoSession()
+        self._prepare_fill(
+            taker,
+            {"J5legacy": {"data": f"{maker_crypto.get_pubkey_hex()} signpk sig"}},
+        )
+        taker._session.maker_sessions = {
+            "J5legacy": MakerSession(nick="J5legacy", offer=_simple_offer("J5legacy"))
+        }
+
+        result = await taker._session._phase_fill()
+
+        assert result.success is False
+        assert result.failed_makers == ["J5legacy"]
+        assert taker._session.maker_sessions == {}
+
+    @pytest.mark.asyncio
+    async def test_phase_auth_rechecks_required_features_before_auth(self):
+        from jmcore.protocol import FEATURE_COFUNDED_CHANNEL_RING_V1
+
+        taker = self._make_neutrino_taker(minimum_makers=1)
+        taker.backend.requires_neutrino_metadata = MagicMock(return_value=False)
+        taker._session.required_maker_features = {FEATURE_COFUNDED_CHANNEL_RING_V1}
+        maker = MakerSession(nick="J5replacement", offer=_simple_offer("J5replacement"))
+        maker.crypto = CryptoSession()
+        taker._session.maker_sessions = {"J5replacement": maker}
+
+        result = await taker._session._phase_auth()
+
+        assert result.success is False
+        assert result.failed_makers == ["J5replacement"]
+        taker.directory_client.send_privmsg.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_auth_replacement_detects_replacement_maker_features(self):
         """Replacement makers advertising neutrino_compat in their !pubkey must
         be recognized (previously the replacement mini-fill skipped the features
@@ -3243,6 +3296,29 @@ class TestNeutrinoIncompatibleMakerReplacement:
         taker.podle_manager.generate_fresh_commitment.assert_not_called()
         fill_data = taker.directory_client.send_privmsg.await_args.args[2]
         assert fill_data.endswith("ab" * 32)
+
+    @pytest.mark.asyncio
+    async def test_auth_replacement_drops_missing_required_feature_after_pubkey(self):
+        from jmcore.protocol import FEATURE_CHANNEL_INPUT_V1
+
+        taker = self._make_neutrino_taker(minimum_makers=1)
+        taker._session.cj_amount = 1_000_000
+        taker._session.crypto_session = CryptoSession()
+        taker._session.podle_commitment.to_commitment_str = MagicMock(return_value="ab" * 32)
+        taker._session.required_maker_features = {FEATURE_CHANNEL_INPUT_V1}
+        taker.orderbook_manager = MagicMock()
+        binding = MagicMock()
+        binding.channel_id = "direct"
+        binding.is_direct = True
+        taker.directory_client.bind_session = MagicMock(return_value=binding)
+        maker_crypto = CryptoSession()
+        taker.directory_client.wait_for_responses = AsyncMock(
+            return_value={"J5new": {"data": f"{maker_crypto.get_pubkey_hex()} signpk sig"}}
+        )
+
+        assert await taker._fill_replacement_makers({"J5new": _simple_offer("J5new")}, set())
+        assert "J5new" not in taker._session.maker_sessions
+        taker.orderbook_manager.add_ignored_maker.assert_called_once_with("J5new")
 
     @pytest.mark.asyncio
     async def test_auth_replacement_retries_when_replacement_does_not_respond(self):
@@ -3414,6 +3490,9 @@ class TestReplacementTargetRestoration:
         taker.config.taker_utxo_retries = 3
         taker.config.taker_utxo_age = 1
         taker.config.taker_utxo_amtpercent = 20
+        taker.config.channel_ring.enabled = False
+        taker.config.channel_input.enabled = False
+        taker.config.preferred_offer_type = OfferType.SW0_RELATIVE
         taker.directory_client = MagicMock()
         taker.directory_client.clients = {}
         taker.directory_client.prefer_direct_connections = False
@@ -3532,6 +3611,84 @@ class TestReplacementTargetRestoration:
         assert below_floor_ok is False
         assert below_floor_taker.state is TakerState.FAILED
         assert below_floor_taker._session.last_failure_reason is not None
+
+    @pytest.mark.asyncio
+    async def test_strict_fill_fails_when_replacement_attempts_are_exhausted(self):
+        taker = self._make_taker(minimum_makers=8, target_makers=9, current_makers=8)
+        taker.config.channel_input.enabled = True
+        taker._session.strict_maker_count = 9
+        taker._session._phase_fill = AsyncMock(return_value=PhaseResult(success=True))
+        notifier = MagicMock()
+        notifier.notify_coinjoin_start = AsyncMock()
+
+        with patch("taker.taker.get_notifier", return_value=notifier):
+            ok = await taker._run_fill_with_replacements(
+                destination="bcrt1qdest",
+                selected_offers={},
+                required_features={FEATURE_CHANNEL_INPUT_V1},
+                mixdepth=0,
+                get_private_key=MagicMock(),
+                max_replacement_attempts=0,
+            )
+
+        assert ok is False
+        assert taker.state is TakerState.FAILED
+        assert "required floor 9" in (taker._session.last_failure_reason or "")
+
+    @pytest.mark.asyncio
+    async def test_strict_fill_fails_when_no_replacements_are_available(self):
+        taker = self._make_taker(minimum_makers=8, target_makers=9, current_makers=8)
+        taker.config.channel_input.enabled = True
+        taker._session.strict_maker_count = 9
+        taker._session._phase_fill = AsyncMock(return_value=PhaseResult(success=True))
+        taker.orderbook_manager.select_makers.return_value = ({}, 0)
+        notifier = MagicMock()
+        notifier.notify_coinjoin_start = AsyncMock()
+
+        with patch("taker.taker.get_notifier", return_value=notifier):
+            ok = await taker._run_fill_with_replacements(
+                destination="bcrt1qdest",
+                selected_offers={},
+                required_features={FEATURE_CHANNEL_INPUT_V1},
+                mixdepth=0,
+                get_private_key=MagicMock(),
+                max_replacement_attempts=1,
+            )
+
+        assert ok is False
+        assert taker.state is TakerState.FAILED
+        assert "required floor 9" in (taker._session.last_failure_reason or "")
+
+    @pytest.mark.asyncio
+    async def test_strict_fill_replacement_uses_exact_configured_offer_type(self):
+        taker = self._make_taker(minimum_makers=8, target_makers=9, current_makers=8)
+        taker.config.channel_input.enabled = True
+        taker.config.preferred_offer_type = OfferType.TR0_ABSOLUTE
+        taker._session.strict_maker_count = 9
+        taker._session._phase_fill = AsyncMock(
+            side_effect=[PhaseResult(success=True), PhaseResult(success=True)]
+        )
+        taker.orderbook_manager.select_makers.return_value = (
+            self._replacement_offers("J5replacement"),
+            0,
+        )
+        notifier = MagicMock()
+        notifier.notify_coinjoin_start = AsyncMock()
+
+        with patch("taker.taker.get_notifier", return_value=notifier):
+            ok = await taker._run_fill_with_replacements(
+                destination="bcrt1qdest",
+                selected_offers={},
+                required_features={FEATURE_CHANNEL_INPUT_V1},
+                mixdepth=0,
+                get_private_key=MagicMock(),
+                max_replacement_attempts=1,
+            )
+
+        assert ok is True
+        assert taker.orderbook_manager.select_makers.call_args.kwargs["allowed_types"] == {
+            OfferType.TR0_ABSOLUTE
+        }
 
     @pytest.mark.asyncio
     async def test_auth_replaces_to_requested_target_before_success(self):

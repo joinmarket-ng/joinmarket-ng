@@ -22,6 +22,7 @@ from jmcore.fee_quantization import QUANT_ABS, QUANT_REL, quantize_abs_up, quant
 from jmcore.models import Offer, OfferType, is_absolute_offer_type
 from jmcore.paths import get_ignored_makers_path
 from jmcore.protocol import (
+    FEATURE_CHANNEL_INPUT_V1,
     FEATURE_COFUNDED_CHANNEL_RING_V1,
     FEATURE_NEUTRINO_COMPAT,
     get_nick_version,
@@ -33,6 +34,7 @@ from taker.config import MaxCjFee
 
 DEFAULT_MAKER_REPEAT_PENALTY = 0.8
 _MAX_REPEAT_PENALTY_DRAWS = 64
+_STRICT_ORDERBOOK_FEATURES = frozenset({FEATURE_COFUNDED_CHANNEL_RING_V1, FEATURE_CHANNEL_INPUT_V1})
 
 
 def maker_nick_selection_key(nick: str) -> str:
@@ -297,17 +299,18 @@ def filter_offers(
                 )
                 continue
 
-        # Filter by required features (e.g., neutrino_compat).
-        # Only reject offers where we KNOW the maker lacks a required feature
-        # (features dict is populated but the feature is missing/false).
-        # Offers with empty features (unknown status) pass through -- they will
-        # be verified during the handshake in _phase_auth().
-        if required_features and offer.features:
-            missing = {f for f in required_features if not offer.features.get(f)}
-            if missing:
+        # Channel protocols require explicit orderbook confirmation. Neutrino
+        # remains handshake-negotiated, so offers with no feature information
+        # are still eligible when it is the only required capability.
+        if required_features:
+            missing = {feature for feature in required_features if not offer.features.get(feature)}
+            strict_missing = missing & _STRICT_ORDERBOOK_FEATURES
+            known_missing = missing if offer.features else strict_missing
+            if known_missing:
                 exclusion_counts["known missing feature"] += 1
                 logger.debug(
-                    f"Ignoring offer from {offer.counterparty}: missing required features {missing}"
+                    f"Ignoring offer from {offer.counterparty}: missing required features "
+                    f"{known_missing}"
                 )
                 continue
 
@@ -483,6 +486,11 @@ def _offer_confirms_features(offer: Offer, required_features: set[str]) -> bool:
 def offer_supports_cofunded_channel_ring_v1(offer: Offer) -> bool:
     """Recognize backend-validated ring support without changing offer selection."""
     return offer.features.get(FEATURE_COFUNDED_CHANNEL_RING_V1, False)
+
+
+def offer_supports_channel_input_v1(offer: Offer) -> bool:
+    """Recognize explicit channel-input support from an orderbook offer."""
+    return offer.features.get(FEATURE_CHANNEL_INPUT_V1, False)
 
 
 def prefer_offers_with_confirmed_features(
@@ -1180,6 +1188,7 @@ class OrderbookManager:
         hard_exclude_nicks: set[str] | None = None,
         required_features: set[str] | None = None,
         penalized_maker_keys: set[str] | None = None,
+        allowed_types: set[OfferType] | None = None,
     ) -> tuple[dict[str, Offer], int]:
         """
         Select makers for a CoinJoin.
@@ -1199,6 +1208,7 @@ class OrderbookManager:
             required_features: Feature names that makers must support
             penalized_maker_keys: Recent maker nick and bond keys to penalize with
                 :data:`DEFAULT_MAKER_REPEAT_PENALTY` while retaining full support
+            allowed_types: Optional offer types that replace the manager default
 
         Returns:
             (selected offers dict, total fee)
@@ -1212,6 +1222,7 @@ class OrderbookManager:
             hard_exclude_nicks=hard_exclude_nicks,
             required_features=required_features,
             penalized_maker_keys=penalized_maker_keys,
+            allowed_types=allowed_types,
         )
 
     def _select_with_soft_fallback(
@@ -1224,6 +1235,7 @@ class OrderbookManager:
         hard_exclude_nicks: set[str] | None,
         required_features: set[str] | None,
         penalized_maker_keys: set[str] | None,
+        allowed_types: set[OfferType] | None,
     ) -> tuple[dict[str, Offer], int]:
         """Select makers, falling back to soft-excluded ones if needed.
 
@@ -1237,6 +1249,7 @@ class OrderbookManager:
             if honest_only
             else self.offers
         )
+        selection_types = self.allowed_types if allowed_types is None else allowed_types
 
         hard = self.own_wallet_nicks.copy()
         if hard_exclude_nicks:
@@ -1262,7 +1275,7 @@ class OrderbookManager:
             require_quantized_cj_fees=self.require_quantized_cj_fees,
             round_up_cj_fees=self.round_up_cj_fees,
             equalize_cj_fees=self.equalize_cj_fees,
-            allowed_types=self.allowed_types,
+            allowed_types=selection_types,
         )
         if len(result) >= n or not soft:
             return result, fee
@@ -1293,7 +1306,7 @@ class OrderbookManager:
             require_quantized_cj_fees=self.require_quantized_cj_fees,
             round_up_cj_fees=self.round_up_cj_fees,
             equalize_cj_fees=self.equalize_cj_fees,
-            allowed_types=self.allowed_types,
+            allowed_types=selection_types,
         )
         result.update(topup_result)
         if not self.equalize_cj_fees:

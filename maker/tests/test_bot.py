@@ -17,7 +17,12 @@ from jmcore.crypto import NickIdentity
 from jmcore.models import NetworkType, Offer, OfferType
 from jmcore.network import ONION_HOSTID, TCPConnection
 from jmcore.nick_auth import NickAuthMode
-from jmcore.protocol import JM_VERSION, MessageType, create_handshake_request
+from jmcore.protocol import (
+    FEATURE_CHANNEL_INPUT_V1,
+    JM_VERSION,
+    MessageType,
+    create_handshake_request,
+)
 from jmwallet.wallet.models import UTXOInfo
 
 from maker.bot import MakerBot, _get_fidelity_bond_linkable_utxos
@@ -3024,6 +3029,34 @@ class TestDirectConnectionHandshake:
         assert features["peerlist_features"] is True
         assert features["ping"] is True
         assert features["nick_auth"] is True
+        assert FEATURE_CHANNEL_INPUT_V1 not in features
+
+    @pytest.mark.asyncio
+    async def test_try_handle_handshake_advertises_validated_channel_input(self, maker_bot):
+        maker_bot.channel_input_capability_validated = True
+        mock_conn = MagicMock(spec=TCPConnection)
+        handshake_request = {
+            "type": MessageType.HANDSHAKE.value,
+            "line": json.dumps(
+                {
+                    "app-name": "joinmarket",
+                    "directory": False,
+                    "location-string": "NOT-SERVING-ONION",
+                    "proto-ver": JM_VERSION,
+                    "features": {},
+                    "nick": "J5TestNick",
+                    "network": "regtest",
+                }
+            ),
+        }
+
+        await maker_bot._try_handle_handshake(
+            mock_conn, json.dumps(handshake_request).encode(), "test:1234"
+        )
+
+        response = json.loads(mock_conn.send.call_args.args[0])
+        features = json.loads(response["line"])["features"]
+        assert features[FEATURE_CHANNEL_INPUT_V1] is True
 
     @pytest.mark.asyncio
     async def test_try_handle_handshake_omits_disabled_nick_auth(self, mock_wallet, mock_backend):
@@ -3620,6 +3653,7 @@ class TestListenTasksMemoryLeak:
     async def test_session_cleanup_task_starts_once_and_stops_with_bot(self, maker_bot):
         maker_bot.directory_clients.clear()
         maker_bot.running = True
+        maker_bot.channel_input_capability_validated = True
 
         maker_bot._start_session_cleanup_task()
         task = maker_bot._session_cleanup_task
@@ -3635,6 +3669,7 @@ class TestListenTasksMemoryLeak:
         assert task.done()
         assert maker_bot._session_cleanup_task is None
         assert maker_bot.listen_tasks == []
+        assert maker_bot.channel_input_capability_validated is False
 
     @pytest.mark.asyncio
     async def test_shutdown_releases_pre_sign_and_retains_post_sign_sessions(self, maker_bot):

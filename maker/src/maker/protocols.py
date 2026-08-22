@@ -94,6 +94,7 @@ class MakerBotProtocol(Protocol):
     _pending_signed_rounds_lock: asyncio.Lock
     minimum_fee_rate_sat_vb: float
     channel_ring_capability_validated: bool
+    channel_input_capability_validated: bool
     _channel_ring_backend: InitializedChannelRingBackend | None
     _channel_ring_store: RingParticipantStore | None
 

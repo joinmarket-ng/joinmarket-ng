@@ -3,6 +3,7 @@ Tests for jmcore.network
 """
 
 import asyncio
+import json
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -18,6 +19,7 @@ from jmcore.network import (
     PeerStatus,
     TCPConnection,
 )
+from jmcore.protocol import FEATURE_CHANNEL_INPUT_V1, FeatureSet
 
 
 @pytest.mark.asyncio
@@ -516,6 +518,38 @@ class TestOnionPeerConnection:
         assert success is True
         connect_direct.assert_awaited_once()
         await peer.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_initiating_handshake_uses_local_feature_snapshot(self):
+        local_features = FeatureSet(features={FEATURE_CHANNEL_INPUT_V1})
+        peer = OnionPeer(
+            nick="J5maker",
+            location="test.onion:5222",
+            local_features=local_features,
+        )
+        local_features.features.clear()
+        mock_connection = AsyncMock()
+        mock_connection.receive.side_effect = TimeoutError
+        peer._connection = mock_connection
+
+        await peer._handshake("J5taker", "NOT-SERVING-ONION", "regtest")
+
+        message = json.loads(mock_connection.send.await_args.args[0])
+        handshake = json.loads(message["line"])
+        assert handshake["features"] == {FEATURE_CHANNEL_INPUT_V1: True}
+
+    @pytest.mark.asyncio
+    async def test_initiating_handshake_defaults_to_no_local_features(self):
+        peer = OnionPeer(nick="J5maker", location="test.onion:5222")
+        mock_connection = AsyncMock()
+        mock_connection.receive.side_effect = TimeoutError
+        peer._connection = mock_connection
+
+        await peer._handshake("J5taker", "NOT-SERVING-ONION", "regtest")
+
+        message = json.loads(mock_connection.send.await_args.args[0])
+        handshake = json.loads(message["line"])
+        assert handshake["features"] == {}
 
     @pytest.mark.asyncio
     async def test_connect_records_peer_features(self):

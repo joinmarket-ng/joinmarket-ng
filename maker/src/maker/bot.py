@@ -141,6 +141,7 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
                 "or configure a p2wpkh (sw0) wallet instead."
             )
         self.directory_clients: dict[str, DirectoryClient] = {}
+        self.channel_input_capability_validated = False
         # Shared connection plumbing (parsing, SOCKS isolation creds,
         # DirectoryClient construction, retry loop). The pool stores its
         # connected clients in self.directory_clients via the shared-dict
@@ -150,6 +151,7 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
             config=config,
             nick_identity=self.nick_identity,
             neutrino_compat=backend.can_provide_neutrino_metadata(),
+            channel_input_v1=self.channel_input_capability_validated,
         )
         self.channel_ring_capability_validated = False
         self._channel_ring_backend: InitializedChannelRingBackend | None = None
@@ -1366,6 +1368,7 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         """Stop the maker bot"""
         logger.info("Stopping maker bot...")
         self.running = False
+        self.channel_input_capability_validated = False
         if self._identity_renewal_task is not None:
             self._identity_renewal_task.cancel()
 

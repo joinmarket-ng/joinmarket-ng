@@ -647,6 +647,7 @@ class TestPreferredOfferTypeRoundTrip:
 def test_channel_ring_settings_round_trip_and_require_tr0_wallet(
     tmp_path, sample_mnemonic: str
 ) -> None:
+    from jmcore.channel_input_config import ChannelInputSettings
     from jmcore.channel_ring import ChannelRingSettings
     from jmcore.models import OfferType
     from jmcore.settings import JoinMarketSettings, TakerSettings, WalletSettings
@@ -692,6 +693,27 @@ def test_channel_ring_settings_round_trip_and_require_tr0_wallet(
     )
     with pytest.raises(ValueError, match="tr0 preferred offer"):
         build_taker_config(wrong_offer, mnemonic=sample_mnemonic, passphrase="")
+
+    mutually_enabled = JoinMarketSettings(
+        wallet=WalletSettings(address_type="p2tr"),
+        taker=TakerSettings(
+            preferred_offer_type=OfferType.TR0_RELATIVE,
+            channel_ring=ring,
+            channel_input=ChannelInputSettings(
+                enabled=True,
+                lnd_grpc_url="https://localhost:10009",
+                lnd_tls_cert_path=tmp_path / "tls.cert",
+                lnd_macaroon_path=tmp_path / "admin.macaroon",
+                lnd_escrow_macaroon_path=tmp_path / "channel-escrow.macaroon",
+                allowed_channel_points=["b" * 64 + ":1"],
+                allowed_peer_node_pubkeys=[
+                    "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+                ],
+            ),
+        ),
+    )
+    with pytest.raises(ValueError, match="cannot both be enabled"):
+        build_taker_config(mutually_enabled, mnemonic=sample_mnemonic, passphrase="")
 
 
 def test_disabled_channel_ring_round_trip_preserves_default_behavior(sample_mnemonic: str) -> None:

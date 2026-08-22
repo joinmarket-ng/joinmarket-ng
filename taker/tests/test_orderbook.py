@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 from jmcore.bitcoin import calculate_sweep_amount
 from jmcore.models import Offer, OfferType
+from jmcore.protocol import FEATURE_CHANNEL_INPUT_V1, FEATURE_COFUNDED_CHANNEL_RING_V1
 from loguru import logger
 
 from taker.config import MaxCjFee
@@ -1443,6 +1444,27 @@ class TestOrderbookManager:
 
         assert len(orders) == 3, "Soft exclude_nicks must be relaxed when pool is too small"
 
+    def test_soft_fallback_preserves_allowed_types_override(
+        self, sample_offers: list[Offer], max_cj_fee: MaxCjFee, tmp_path: Path
+    ) -> None:
+        """A strict offer-type override applies to both selection passes."""
+        tr0_offers = [
+            offer.model_copy(update={"ordertype": OfferType.TR0_ABSOLUTE, "cjfee": 500})
+            for offer in sample_offers[:2]
+        ]
+        manager = OrderbookManager(max_cj_fee, data_dir=tmp_path)
+        manager.update_offers([*tr0_offers, sample_offers[2]])
+        manager.add_ignored_maker("maker2")
+
+        orders, _ = manager.select_makers(
+            cj_amount=100_000,
+            n=2,
+            allowed_types={OfferType.TR0_ABSOLUTE},
+        )
+
+        assert set(orders) == {"maker1", "maker2"}
+        assert {offer.ordertype for offer in orders.values()} == {OfferType.TR0_ABSOLUTE}
+
     def test_hard_exclude_nicks_never_relaxed(
         self, sample_offers: list[Offer], max_cj_fee: MaxCjFee, tmp_path: Path
     ) -> None:
@@ -2183,6 +2205,52 @@ class TestRequiredFeaturesFiltering:
             required_features={"neutrino_compat"},
         )
         assert len(eligible) == 1
+
+    @pytest.mark.parametrize(
+        ("required_feature", "expects_unknown"),
+        [
+            ("neutrino_compat", True),
+            (FEATURE_COFUNDED_CHANNEL_RING_V1, False),
+            (FEATURE_CHANNEL_INPUT_V1, False),
+        ],
+    )
+    def test_protocol_features_require_explicit_orderbook_confirmation(
+        self, max_cj_fee: MaxCjFee, required_feature: str, expects_unknown: bool
+    ) -> None:
+        offers = [
+            Offer(
+                counterparty="J5confirmedOOOOOO",
+                oid=0,
+                ordertype=OfferType.SW0_RELATIVE,
+                minsize=10_000,
+                maxsize=1_000_000,
+                txfee=1000,
+                cjfee="0.001",
+                features={required_feature: True},
+            ),
+            Offer(
+                counterparty="J5unknownOOOOOOOO",
+                oid=1,
+                ordertype=OfferType.SW0_RELATIVE,
+                minsize=10_000,
+                maxsize=1_000_000,
+                txfee=1000,
+                cjfee="0.001",
+                features={},
+            ),
+        ]
+
+        eligible = filter_offers(
+            offers=offers,
+            cj_amount=100_000,
+            max_cj_fee=max_cj_fee,
+            required_features={required_feature},
+        )
+
+        expected_nicks = {"J5confirmedOOOOOO"}
+        if expects_unknown:
+            expected_nicks.add("J5unknownOOOOOOOO")
+        assert {offer.counterparty for offer in eligible} == expected_nicks
 
     def test_empty_required_features_passes_all(
         self, offers_with_features: list[Offer], max_cj_fee: MaxCjFee

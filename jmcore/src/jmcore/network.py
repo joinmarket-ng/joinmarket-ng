@@ -15,6 +15,7 @@ from loguru import logger
 
 if TYPE_CHECKING:
     from jmcore.crypto import NickIdentity
+    from jmcore.protocol import FeatureSet
 
 # Host ID for direct peer-to-peer onion connections
 # Used for message signing to prevent replay attacks
@@ -413,6 +414,7 @@ class OnionPeer:
         socks_username: str | None = None,
         socks_password: str | None = None,
         allow_clearnet_connections: bool = False,
+        local_features: FeatureSet | None = None,
     ):
         """
         Initialize OnionPeer.
@@ -432,6 +434,7 @@ class OnionPeer:
             socks_username: SOCKS5 username for Tor stream isolation (optional)
             socks_password: SOCKS5 password for Tor stream isolation (optional)
             allow_clearnet_connections: Permit direct TCP for non-onion peers in development
+            local_features: Features to advertise in the initiating peer handshake
         """
         self.nick = nick
         self.location = location
@@ -446,6 +449,9 @@ class OnionPeer:
         self.on_handshake_complete = on_handshake_complete
         self.nick_identity = nick_identity
         self.allow_clearnet_connections = allow_clearnet_connections
+        # Retain an immutable snapshot so mutations by the caller cannot alter
+        # a peer after it has been constructed.
+        self._local_features = frozenset(local_features.features) if local_features else frozenset()
 
         # Parse location
         self._hostname: str | None = None
@@ -632,6 +638,7 @@ class OnionPeer:
         import json
 
         from jmcore.protocol import (
+            FeatureSet,
             MessageType,
             create_handshake_request,
         )
@@ -643,6 +650,7 @@ class OnionPeer:
             location=our_location,
             network=network,
             directory=False,
+            features=FeatureSet(features=set(self._local_features)),
         )
         msg = json.dumps({"type": MessageType.HANDSHAKE.value, "line": json.dumps(handshake)})
         await self._connection.send(msg.encode("utf-8"))

@@ -547,6 +547,9 @@ class MakerConfig(WalletConfig):
                 "identity_rotation_quiet_min_sec must not exceed identity_rotation_quiet_max_sec"
             )
 
+        if self.channel_ring.enabled and self.channel_input.enabled:
+            raise ValueError("channel ring and channel input cannot both be enabled")
+
         # Only validate single-offer fields if offer_configs is empty
         # (when offer_configs is set, those fields are ignored)
         if not self.offer_configs:

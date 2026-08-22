@@ -128,6 +128,9 @@ class CoinJoinSession:
         # Requested maker count for this round. Replacement runners use this
         # target before falling back to the configured minimum floor.
         self.maker_target_count: int = 0
+        # Every maker that reaches auth must have confirmed these capabilities
+        # in its !pubkey response. This survives replacement mini-fill cycles.
+        self.required_maker_features: set[str] = set()
 
         # PoDLE commitment used for this CoinJoin. Rotated on majority-blacklist.
         self.podle_commitment: ExtendedPoDLECommitment | None = None
@@ -229,6 +232,7 @@ class CoinJoinSession:
         self.is_sweep = False
         self.maker_sessions = {}
         self.maker_target_count = 0
+        self.required_maker_features = set()
         self.podle_commitment = None
         self.unsigned_tx = b""
         self.tx_metadata = {}
@@ -358,33 +362,47 @@ class CoinJoinSession:
             return 1
         return 0
 
-    def _drop_neutrino_incompatible_sessions(self, nicks: list[str] | None = None) -> list[str]:
-        """Drop sessions for makers whose handshake explicitly lacks neutrino_compat.
+    def _drop_sessions_missing_required_features(self, nicks: list[str] | None = None) -> list[str]:
+        """Drop direct peers explicitly known to lack a required capability.
 
         Called just after opportunistic direct-peer handshakes complete, to
-        avoid wasting a !fill + !pubkey round trip on a maker we already know
-        is incompatible. Peers whose feature status is unknown (no direct
-        handshake, or legacy peer that sent an empty features field) are kept
-        and revalidated during _phase_auth.
+        avoid wasting a !fill + !pubkey round trip. Peers whose feature status
+        is unknown (no direct handshake, or legacy peer that sent no features
+        field) remain eligible until !pubkey confirms their capabilities.
 
         Returns the list of dropped nicks (empty if none).
         """
         dropped: list[str] = []
         candidates = list(self.maker_sessions.keys()) if nicks is None else list(nicks)
+        if not self.required_maker_features:
+            return dropped
         for nick in candidates:
             peer = self.directory_client.get_connected_peer(nick)
             if peer is None:
                 continue
-            support = peer.supports_feature(FEATURE_NEUTRINO_COMPAT)
-            if support is False:
+            missing = {
+                feature
+                for feature in self.required_maker_features
+                if peer.supports_feature(feature) is False
+            }
+            if missing:
                 dropped.append(nick)
         for nick in dropped:
             logger.warning(
-                f"Dropping maker {nick} before !fill: peer handshake reports "
-                f"no neutrino_compat support (taker requires it)."
+                f"Dropping maker {nick} before !fill: peer handshake reports missing required "
+                f"features {sorted(self.required_maker_features)}."
             )
             del self.maker_sessions[nick]
         return dropped
+
+    def _drop_neutrino_incompatible_sessions(self) -> list[str]:
+        """Backward-compatible neutrino-specific direct-peer filter."""
+        original_required_features = self.required_maker_features
+        self.required_maker_features = {FEATURE_NEUTRINO_COMPAT}
+        try:
+            return self._drop_sessions_missing_required_features()
+        finally:
+            self.required_maker_features = original_required_features
 
     def process_pubkey_response(self, nick: str, response_data: str) -> bool:
         """Parse a maker's !pubkey payload and set up its encryption session.
@@ -392,7 +410,7 @@ class CoinJoinSession:
         Payload format: ``<nacl_pubkey_hex> [features=<comma-separated>]
         <signing_pk> <sig>``. Records the maker's NaCl pubkey, parses the
         optional features field (e.g. ``features=neutrino_compat``) into
-        ``supports_neutrino_compat``, and creates the per-maker crypto session
+        ``features`` and ``supports_neutrino_compat``, and creates the per-maker crypto session
         reusing the taker keypair from ``self.crypto_session`` (the pubkey the
         maker saw in !fill). Used for both the initial fill phase and the
         mini-fill run for replacement makers, so feature detection stays
@@ -411,20 +429,23 @@ class CoinJoinSession:
             logger.warning(f"Empty !pubkey response from {nick}")
             return False
 
-        session = self.maker_sessions[nick]
         nacl_pubkey = parts[0]
-        session.pubkey = nacl_pubkey
-        session.responded_fill = True
-
-        # Parse optional features (e.g., "features=neutrino_compat")
+        features: set[str] = set()
         for part in parts[1:]:
             if part.startswith("features="):
-                features_str = part[len("features=") :]
-                features = set(features_str.split(",")) if features_str else set()
-                if FEATURE_NEUTRINO_COMPAT in features:
-                    session.supports_neutrino_compat = True
-                    logger.debug(f"Maker {nick} supports neutrino_compat")
-                break
+                feature_names = part[len("features=") :].split(",")
+                if any(not feature_name for feature_name in feature_names):
+                    logger.warning(f"Malformed features list in !pubkey response from {nick}")
+                    return False
+                features.update(feature_names)
+
+        session = self.maker_sessions[nick]
+        session.pubkey = nacl_pubkey
+        session.responded_fill = True
+        session.features = features
+        session.supports_neutrino_compat = FEATURE_NEUTRINO_COMPAT in session.features
+        if session.supports_neutrino_compat:
+            logger.debug(f"Maker {nick} supports neutrino_compat")
 
         # Set up encryption session with this maker using their NaCl pubkey.
         # IMPORTANT: Reuse the same keypair from self.crypto_session that was
@@ -446,6 +467,9 @@ class CoinJoinSession:
         """
         if not self.podle_commitment:
             return PhaseResult(success=False)
+
+        if self.backend.requires_neutrino_metadata():
+            self.required_maker_features.add(FEATURE_NEUTRINO_COMPAT)
 
         # A repeat !fill reuses the commitment, which the maker refuses as already
         # reserved without replying, so only fill makers that have not responded.
@@ -500,20 +524,14 @@ class CoinJoinSession:
                         f"Established {connected_count}/{len(pending_tasks)} direct connections"
                     )
 
-        # Pre-fill compatibility filter: once direct connections have handshaked,
-        # we know each peer's advertised features. If the taker requires
-        # neutrino_compat and a peer explicitly does NOT advertise it, drop the
-        # session now rather than wasting a !fill + !pubkey round trip (and a
-        # PoDLE retry if the maker happens to also blacklist our commitment).
-        #
-        # Peers whose feature support is still unknown (no direct handshake,
-        # or legacy peer with no features field) are kept; the existing check
-        # in _phase_auth will catch them later.
-        if self.backend.requires_neutrino_metadata():
-            incompatible = self._drop_neutrino_incompatible_sessions(pending_nicks)
+        # Direct peers can disclose their handshake features before !fill. Only
+        # explicit negative claims are rejected here; unknown peers must still
+        # confirm the full required feature set in !pubkey.
+        if self.required_maker_features:
+            incompatible = self._drop_sessions_missing_required_features(pending_nicks)
             if incompatible and len(self.maker_sessions) < self.required_maker_count:
                 logger.error(
-                    f"After filtering {len(incompatible)} neutrino-incompatible maker(s), "
+                    f"After filtering {len(incompatible)} incompatible maker(s), "
                     f"only {len(self.maker_sessions)} remain (need "
                     f"{self.required_maker_count})."
                 )
@@ -633,21 +651,19 @@ class CoinJoinSession:
                 if nick not in blacklist_makers:
                     blacklist_makers.append(nick)
 
-        # Opportunistic early drop for neutrino takers: a maker whose !pubkey
-        # did not advertise neutrino_compat would be dropped in _phase_auth
-        # anyway (we cannot verify its UTXOs without extended metadata), so
-        # drop it now, before wasting an !auth round trip, and let the fill
-        # replacement machinery find a substitute. The auth-phase check stays
-        # as a safety net for replacement paths.
-        if self.backend.requires_neutrino_metadata():
+        # Every selected protocol capability must be explicitly confirmed in
+        # !pubkey. This catches unknown orderbook entries and applies equally
+        # to initial fills and replacement mini-fills.
+        if self.required_maker_features:
             for nick in pending_nicks:
                 if nick not in self.maker_sessions:
                     continue
                 session = self.maker_sessions[nick]
-                if session.responded_fill and not session.supports_neutrino_compat:
+                missing = self.required_maker_features - session.features
+                if session.responded_fill and missing:
                     logger.warning(
-                        f"Dropping maker {nick} after !pubkey: no neutrino_compat in "
-                        f"advertised features (taker requires extended UTXO metadata)."
+                        f"Dropping maker {nick} after !pubkey: missing required features "
+                        f"{sorted(missing)}."
                     )
                     failed_makers.append(nick)
                     del self.maker_sessions[nick]
@@ -704,16 +720,34 @@ class CoinJoinSession:
         has_metadata = self.podle_commitment.has_neutrino_metadata()
         taker_requires_extended = self.backend.requires_neutrino_metadata()
 
+        incompatible_makers: list[str] = []
+        if taker_requires_extended:
+            self.required_maker_features.add(FEATURE_NEUTRINO_COMPAT)
+
         # Remove incompatible makers before sending any !auth. Otherwise, if
         # filtering drops the session below the maker floor, a replacement pass
         # would resend !auth to compatible makers whose responses were not read.
-        incompatible_makers: list[str] = []
-        if taker_requires_extended:
-            for nick in list(pending_nicks):
-                session = self.maker_sessions[nick]
-                if session.supports_neutrino_compat:
-                    continue
+        for nick, session in list(self.maker_sessions.items()):
+            missing_features = self.required_maker_features - session.features
+            if missing_features:
+                logger.error(
+                    f"Incompatible maker {nick}: !pubkey did not confirm required features "
+                    f"{sorted(missing_features)}."
+                )
+                incompatible_makers.append(nick)
+                del self.maker_sessions[nick]
+                continue
+            if session.crypto is None:
+                logger.error(f"No encryption session for {nick}")
+                continue
 
+            maker_requires_extended = session.supports_neutrino_compat
+
+            # Fail early if taker needs extended format but maker doesn't support it.
+            # This happens when taker uses Neutrino backend but maker doesn't advertise
+            # neutrino_compat (e.g., reference implementation makers). Without extended
+            # metadata, the taker cannot verify the maker's UTXOs via block filters.
+            if taker_requires_extended and not maker_requires_extended:
                 logger.error(
                     f"Incompatible maker {nick}: taker uses Neutrino backend but maker "
                     f"doesn't support neutrino_compat. Taker cannot verify maker's UTXOs "
@@ -729,8 +763,8 @@ class CoinJoinSession:
             if len(self.maker_sessions) < self.required_maker_count:
                 logger.error(
                     f"Not enough compatible makers: {len(self.maker_sessions)} "
-                    f"< {self.required_maker_count}. Neutrino takers require makers that "
-                    f"provide extended UTXO metadata (neutrino_compat)."
+                    f"< {self.required_maker_count}; required features are "
+                    f"{sorted(self.required_maker_features)}."
                 )
                 return PhaseResult(success=False, failed_makers=incompatible_makers)
 
@@ -2277,15 +2311,18 @@ class CoinJoinSession:
                 bytes.fromhex(utxo.scriptpubkey),
             )
         for session in self.maker_sessions.values():
-            for utxo in session.utxos:
-                script_hex = utxo.get("scriptpubkey") or ""
+            for maker_utxo in session.utxos:
+                script_hex = maker_utxo.get("scriptpubkey") or ""
                 if script_hex:
                     script = bytes.fromhex(script_hex)
-                elif utxo.get("address"):
-                    script = address_to_scriptpubkey(utxo["address"])
+                elif maker_utxo.get("address"):
+                    script = address_to_scriptpubkey(maker_utxo["address"])
                 else:
                     continue
-                prevouts[(utxo["txid"], utxo["vout"])] = (utxo["value"], script)
+                prevouts[(maker_utxo["txid"], maker_utxo["vout"])] = (
+                    maker_utxo["value"],
+                    script,
+                )
         return prevouts
 
     @staticmethod
