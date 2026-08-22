@@ -371,6 +371,49 @@ class TestGeneratePoDLE:
             "b643f3799fb7a793c95c5500e8395cdeabe87ddeffa22e9bf203b427e953c3e4"
         )
 
+    @pytest.mark.parametrize(
+        ("internal_scalar", "expected_internal_prefix", "expected_tweaked_prefix"),
+        [
+            (11, 0x03, 0x02),
+            (1, 0x02, 0x03),
+        ],
+    )
+    def test_bip86_generation_normalizes_internal_and_output_parity(
+        self,
+        internal_scalar: int,
+        expected_internal_prefix: int,
+        expected_tweaked_prefix: int,
+    ) -> None:
+        from coincurve import PrivateKey
+
+        from jmcore.bitcoin import taproot_tweak_privkey, taproot_tweak_pubkey
+
+        internal_key = PrivateKey.from_int(internal_scalar)
+        internal_pubkey = internal_key.public_key.format(compressed=True)
+        tweaked_key = taproot_tweak_privkey(internal_key.secret)
+        tweaked_pubkey = PrivateKey(tweaked_key).public_key.format(compressed=True)
+        _, output_key = taproot_tweak_pubkey(internal_pubkey[1:])
+
+        assert internal_pubkey[0] == expected_internal_prefix
+        assert tweaked_pubkey[0] == expected_tweaked_prefix
+
+        commitment = generate_podle(
+            internal_key.secret,
+            "ab" * 32 + ":0",
+            index=0,
+            p2tr=True,
+        )
+
+        assert commitment.p == b"\x02" + output_key
+        is_valid, error = verify_podle(
+            p=commitment.p,
+            p2=commitment.p2,
+            sig=commitment.sig,
+            e=commitment.e,
+            commitment=commitment.commitment,
+        )
+        assert is_valid, error
+
     def test_invalid_private_key_length(self) -> None:
         """Test invalid private key length."""
         with pytest.raises(PoDLEError, match="Invalid private key length"):
@@ -1105,13 +1148,18 @@ class TestVerifyPodleBinding:
         assert "P2WPKH" in err
 
     def test_bip86_p2tr_binding_matches(self) -> None:
-        from jmcore.bitcoin import taproot_tweak_pubkey
-
-        p = self._pubkey(444)
-        _, output_key = taproot_tweak_pubkey(p[1:])
-        spk = b"\x51\x20" + output_key
+        p = generate_podle((1).to_bytes(32, "big"), "aa" * 32 + ":0", p2tr=True).p
+        spk = b"\x51\x20" + p[1:]
         assert verify_podle_binding(p, spk) == (True, "")
         assert verify_podle_binding(p, spk.hex()) == (True, "")
+
+    def test_bip86_p2tr_binding_rejects_odd_proof_key(self) -> None:
+        p = self._pubkey(1)
+        assert p[0] == 0x02
+        odd_p = b"\x03" + p[1:]
+        bound, err = verify_podle_binding(odd_p, b"\x51\x20" + odd_p[1:])
+        assert not bound
+        assert "even-Y" in err
 
     def test_bip86_p2tr_binding_mismatch(self) -> None:
         p = self._pubkey(555)

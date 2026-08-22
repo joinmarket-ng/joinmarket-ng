@@ -308,6 +308,37 @@ async def test_podle_generation(mock_wallet, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_podle_generation_uses_bip86_output_key_for_p2tr_utxo(tmp_path):
+    from coincurve import PrivateKey
+    from jmcore.bitcoin import taproot_tweak_pubkey
+
+    private_key = PrivateKey.from_int(1)
+    _, output_key = taproot_tweak_pubkey(private_key.public_key.format(compressed=True)[1:])
+    utxo = UTXOInfo(
+        txid="c" * 64,
+        vout=2,
+        value=30_000_000,
+        address="bcrt1ptest",
+        confirmations=10,
+        scriptpubkey=(b"\x51\x20" + output_key).hex(),
+        path="m/86'/1'/0'/0/0",
+        mixdepth=0,
+    )
+    manager = PoDLEManager(data_dir=tmp_path)
+
+    commitment = manager.generate_fresh_commitment(
+        wallet_utxos=[utxo],
+        cj_amount=10_000_000,
+        private_key_getter=lambda _address: private_key.secret,
+        min_confirmations=1,
+        min_percent=20,
+    )
+
+    assert commitment is not None
+    assert commitment.p == b"\x02" + output_key
+
+
+@pytest.mark.asyncio
 async def test_podle_retry_limit(mock_wallet, tmp_path):
     """Test that PoDLE respects max_retries limit."""
     # Create a single UTXO
