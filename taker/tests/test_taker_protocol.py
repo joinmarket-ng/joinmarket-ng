@@ -2594,7 +2594,9 @@ class TestNeutrinoIncompatibleMakerReplacement:
         assert result.needs_replacement is True
         # The compatible maker stays in the session for the replacement pass.
         assert set(taker._session.maker_sessions.keys()) == {"J5good"}
-        # The early return fires before waiting for !ioauth responses.
+        # The incompatibility preflight fires before revealing the PoDLE
+        # commitment or waiting for !ioauth responses.
+        taker.directory_client.send_privmsg.assert_not_awaited()
         taker.directory_client.wait_for_responses.assert_not_awaited()
 
     def test_process_pubkey_response_parses_features(self):
@@ -3185,3 +3187,165 @@ class TestReplacementTargetRestoration:
         assert ok is True
         assert taker._session._phase_fill.await_count == 2
         taker.podle_manager.generate_fresh_commitment.assert_called_once()
+
+
+class TestIncrementalPhaseTopUp:
+    """Topping a session back up to the requested maker count must not re-drive
+    a phase against makers that already completed it.
+
+    A repeated !fill carries the same PoDLE commitment, which the maker refuses
+    as "commitment already in use" without replying at all, and a repeated
+    !auth hits a session that is no longer in PUBKEY_SENT. Either way the taker
+    would drop a healthy maker and permanently add it to the ignored list.
+    """
+
+    @staticmethod
+    def _make_taker(minimum_makers: int = 2) -> Taker:
+        from taker.coinjoin_session import CoinJoinSession
+
+        with patch.object(Taker, "__init__", lambda self, *a, **k: None):
+            taker = Taker.__new__(Taker)
+        taker._session = CoinJoinSession()
+        taker._session.attach(taker)
+        taker.wallet = MagicMock()
+        taker.backend = AsyncMock()
+        taker.backend.requires_neutrino_metadata = MagicMock(return_value=False)
+        taker.config = MagicMock()
+        taker.config.minimum_makers = minimum_makers
+        taker.config.maker_timeout_sec = 1
+
+        binding = MagicMock()
+        binding.channel_id = "directory:host:5222"
+        binding.is_direct = False
+        binding.peer_location = None
+
+        dc = MagicMock()
+        dc.prefer_direct_connections = False
+        dc.bind_session = MagicMock(return_value=binding)
+        dc.send_privmsg = AsyncMock(return_value="directory:host:5222")
+        dc.upgrade_channel_prefer_direct = MagicMock(side_effect=lambda n, ch: ch)
+        dc.wait_for_responses = AsyncMock(return_value={})
+        taker.directory_client = dc
+
+        commitment = MagicMock()
+        commitment.has_neutrino_metadata.return_value = True
+        commitment.to_commitment_str.return_value = "ab" * 32
+        commitment.to_revelation.return_value = {
+            "utxo": "a" * 64 + ":0",
+            "P": "00",
+            "P2": "00",
+            "sig": "00",
+            "e": "00",
+        }
+        taker._session.podle_commitment = commitment
+        return taker
+
+    @staticmethod
+    def _filled_maker(nick: str) -> MakerSession:
+        maker = MakerSession(nick=nick, offer=_simple_offer(nick))
+        peer = CryptoSession()
+        maker.pubkey = peer.get_pubkey_hex()
+        maker.crypto = CryptoSession()
+        maker.crypto.setup_encryption(peer.get_pubkey_hex())
+        maker.comm_channel = "directory:host:5222"
+        maker.responded_fill = True
+        return maker
+
+    @pytest.mark.asyncio
+    async def test_phase_fill_only_messages_makers_that_have_not_filled(self):
+        taker = self._make_taker()
+        established = self._filled_maker("J5filled")
+        taker._session.maker_sessions = {
+            "J5filled": established,
+            "J5new": MakerSession(nick="J5new", offer=_simple_offer("J5new")),
+        }
+        taker._session.crypto_session = CryptoSession()
+        replacement_crypto = CryptoSession()
+        taker.directory_client.wait_for_responses = AsyncMock(
+            return_value={"J5new": {"data": f"{replacement_crypto.get_pubkey_hex()} signpk sig"}}
+        )
+
+        result = await taker._session._phase_fill()
+
+        assert result.success is True
+        assert result.failed_makers == []
+        assert set(taker._session.maker_sessions.keys()) == {"J5filled", "J5new"}
+        assert taker._session.maker_sessions["J5filled"] is established
+
+        filled_nicks = [
+            call.args[0] for call in taker.directory_client.send_privmsg.await_args_list
+        ]
+        assert filled_nicks == ["J5new"]
+        expected = taker.directory_client.wait_for_responses.await_args.kwargs["expected_nicks"]
+        assert expected == ["J5new"]
+
+    @pytest.mark.asyncio
+    async def test_phase_fill_keeps_crypto_session_when_topping_up(self):
+        """The established makers hold the taker pubkey from the first !fill, so
+        rotating the crypto session would break their E2E encryption."""
+        taker = self._make_taker()
+        taker._session.maker_sessions = {
+            "J5filled": self._filled_maker("J5filled"),
+            "J5new": MakerSession(nick="J5new", offer=_simple_offer("J5new")),
+        }
+        taker._session.crypto_session = CryptoSession()
+        original_pubkey = taker._session.crypto_session.get_pubkey_hex()
+        replacement_crypto = CryptoSession()
+        taker.directory_client.wait_for_responses = AsyncMock(
+            return_value={"J5new": {"data": f"{replacement_crypto.get_pubkey_hex()} signpk sig"}}
+        )
+
+        await taker._session._phase_fill()
+
+        assert taker._session.crypto_session.get_pubkey_hex() == original_pubkey
+
+    @pytest.mark.asyncio
+    async def test_phase_fill_rotates_crypto_session_for_a_fresh_round(self):
+        """A commitment rotation rebuilds every maker session, and that round
+        must still get a fresh taker keypair."""
+        taker = self._make_taker()
+        taker._session.maker_sessions = {
+            "J5a": MakerSession(nick="J5a", offer=_simple_offer("J5a")),
+            "J5b": MakerSession(nick="J5b", offer=_simple_offer("J5b")),
+        }
+        taker._session.crypto_session = CryptoSession()
+        stale_pubkey = taker._session.crypto_session.get_pubkey_hex()
+        taker.directory_client.wait_for_responses = AsyncMock(
+            return_value={
+                "J5a": {"data": f"{CryptoSession().get_pubkey_hex()} signpk sig"},
+                "J5b": {"data": f"{CryptoSession().get_pubkey_hex()} signpk sig"},
+            }
+        )
+
+        await taker._session._phase_fill()
+
+        assert taker._session.crypto_session.get_pubkey_hex() != stale_pubkey
+
+    @pytest.mark.asyncio
+    async def test_phase_auth_only_messages_makers_that_have_not_authenticated(self):
+        taker = self._make_taker()
+        established = self._filled_maker("J5authed")
+        established.responded_auth = True
+        established.cj_address = "bcrt1qcj"
+        established.change_address = "bcrt1qchange"
+        established.utxos = [{"txid": "c" * 64, "vout": 0, "scriptpubkey": "0014" + "ab" * 20}]
+        replacement = self._filled_maker("J5new")
+        taker._session.maker_sessions = {"J5authed": established, "J5new": replacement}
+        taker._session.crypto_session = CryptoSession()
+
+        result = await taker._session._phase_auth()
+
+        # J5new is the only maker sent !auth, and it does not answer, so it is
+        # the only one dropped.
+        assert set(taker._session.maker_sessions.keys()) == {"J5authed"}
+        assert taker._session.maker_sessions["J5authed"] is established
+        assert established.responded_auth is True
+        assert established.utxos
+
+        authed_nicks = [
+            call.args[0] for call in taker.directory_client.send_privmsg.await_args_list
+        ]
+        assert authed_nicks == ["J5new"]
+        expected = taker.directory_client.wait_for_responses.await_args.kwargs["expected_nicks"]
+        assert expected == ["J5new"]
+        assert result.failed_makers == ["J5new"]
