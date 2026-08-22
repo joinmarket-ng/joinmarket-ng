@@ -20,7 +20,13 @@ from typing import Any, ClassVar, Literal, TypeAlias, cast
 from coincurve import PrivateKey, PublicKey, PublicKeyXOnly
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from jmcore.bitcoin import estimate_vsize, hash256, parse_transaction_bytes, serialize_transaction
+from jmcore.bitcoin import (
+    ParsedTransaction,
+    estimate_vsize,
+    hash256,
+    parse_transaction_bytes,
+    serialize_transaction,
+)
 from jmcore.constants import MAX_MONEY
 
 CHANNEL_INPUT_VERSION = 1
@@ -676,7 +682,7 @@ _PAYLOAD_TYPES: dict[str, type[ChannelInputPayload]] = {
 }
 
 
-def _parse_canonical_unsigned_transaction(unsigned_tx: str):
+def _parse_canonical_unsigned_transaction(unsigned_tx: str) -> ParsedTransaction:
     try:
         raw = bytes.fromhex(_validate_hex(unsigned_tx, None, "unsigned_parent_tx"))
         transaction = parse_transaction_bytes(raw)
@@ -826,6 +832,8 @@ def validate_transcript_for_invite(
         raise ChannelInputValidationError("transcript has expired")
     if invite.session_id != transcript.session_id or invite.attempt != transcript.attempt:
         raise ChannelInputValidationError("transcript does not match invitation session or attempt")
+    if invite.signer_key != transcript.coordinator_key:
+        raise ChannelInputValidationError("invite signer does not match transcript coordinator")
     if invite.network != transcript.network:
         raise ChannelInputValidationError("transcript network does not match invitation")
     if transcript.expiry > invite.expiry:
@@ -846,6 +854,75 @@ def validate_proposal(proposal: ChannelInputProposalPayload) -> None:
         raise ChannelInputValidationError("proposal BIP340 signature is invalid")
     if proposal.signer_key != proposal.transcript.coordinator_key:
         raise ChannelInputValidationError("proposal signer does not match transcript coordinator")
+
+
+def validate_proposal_for_hellos(
+    invite: ChannelInputInvitePayload,
+    hellos: Sequence[ChannelInputHelloPayload],
+    proposal: ChannelInputProposalPayload,
+    *,
+    current_time: int,
+    current_height: int,
+) -> None:
+    """Bind a recipient proposal to its prior signed channel hello claims."""
+
+    if not isinstance(hellos, Sequence) or isinstance(hellos, str | bytes):
+        raise ChannelInputValidationError("hellos must be a finite sequence")
+    if not hellos:
+        raise ChannelInputValidationError("hellos must not be empty")
+
+    validate_proposal(proposal)
+    validate_transcript_for_invite(
+        invite,
+        proposal.transcript,
+        current_time=current_time,
+        current_height=current_height,
+    )
+
+    hello_outpoints: set[tuple[str, int]] = set()
+    hellos_by_outpoint: dict[tuple[str, int], ChannelInputHelloPayload] = {}
+    for hello in hellos:
+        if not isinstance(hello, ChannelInputHelloPayload):
+            raise ChannelInputValidationError("hellos must contain hello payloads")
+        validate_hello_for_invite(invite, hello)
+        if (
+            hello.participant_key != proposal.recipient_key
+            or hello.signer_key != proposal.recipient_key
+        ):
+            raise ChannelInputValidationError("hello participant does not match proposal recipient")
+        outpoint = hello.funding_outpoint.key()
+        if outpoint in hello_outpoints:
+            raise ChannelInputValidationError("duplicate hello funding outpoint")
+        hello_outpoints.add(outpoint)
+        hellos_by_outpoint[outpoint] = hello
+
+    terms_outpoints = [terms.funding_outpoint.key() for terms in proposal.recipient_terms]
+    if len(set(terms_outpoints)) != len(terms_outpoints):
+        raise ChannelInputValidationError(
+            "proposal recipient terms have duplicate funding outpoints"
+        )
+    if hello_outpoints != set(terms_outpoints):
+        raise ChannelInputValidationError(
+            "hello funding outpoints do not exactly match proposal terms"
+        )
+
+    for terms in proposal.recipient_terms:
+        hello = hellos_by_outpoint[terms.funding_outpoint.key()]
+        if terms.capacity_sat != hello.capacity_sat:
+            raise ChannelInputValidationError("proposal term capacity does not match hello")
+        if terms.local_node_key != hello.node_key:
+            raise ChannelInputValidationError("proposal term local node key does not match hello")
+        if terms.policy_ceilings != hello.policy_ceilings:
+            raise ChannelInputValidationError("proposal term policy ceilings do not match hello")
+        if terms.miner_fee_share_sat > hello.quoted_miner_fee_share_sat:
+            raise ChannelInputValidationError("proposal term miner fee share exceeds hello quote")
+        if any(
+            output.script_pubkey != hello.settlement_script_pubkey
+            for output in terms.settlement_outputs
+        ):
+            raise ChannelInputValidationError(
+                "proposal term settlement script does not match hello"
+            )
 
 
 def validate_complete_approval_set(approval_set: ChannelInputApprovalSetPayload) -> None:

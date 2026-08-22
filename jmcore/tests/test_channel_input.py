@@ -50,6 +50,7 @@ from jmcore.channel_input import (
     validate_hello_for_invite,
     validate_prepare_payload,
     validate_proposal,
+    validate_proposal_for_hellos,
     validate_recipient_approval,
     validate_revealed_endpoint_pair,
     validate_transcript_against_transaction,
@@ -207,6 +208,43 @@ def _signed_hello() -> ChannelInputHelloPayload:
         ),
         _secret(2),
         aux_randomness=b"\x01" * 32,
+    )
+
+
+def _signed_hello_for_terms(terms: EndpointTerms) -> ChannelInputHelloPayload:
+    return sign_payload(
+        ChannelInputHelloPayload(
+            session_id=terms.session_id,
+            attempt=terms.attempt,
+            signer_key=_key(2),
+            participant_key=_key(2),
+            node_key=terms.local_node_key,
+            funding_outpoint=terms.funding_outpoint,
+            capacity_sat=terms.capacity_sat,
+            settlement_script_pubkey=terms.settlement_outputs[0].script_pubkey,
+            quoted_miner_fee_share_sat=terms.miner_fee_share_sat,
+            policy_ceilings=terms.policy_ceilings,
+        ),
+        _secret(2),
+        aux_randomness=b"\x02" * 32,
+    )
+
+
+def _signed_proposal(
+    transcript: ChannelInputTranscript, recipient_terms: tuple[EndpointTerms, ...]
+) -> ChannelInputProposalPayload:
+    return sign_payload(
+        ChannelInputProposalPayload(
+            session_id=transcript.session_id,
+            attempt=transcript.attempt,
+            signer_key=_key(1),
+            recipient_key=_key(2),
+            transcript=transcript,
+            transcript_hash=transcript_hash(transcript).hex(),
+            recipient_terms=recipient_terms,
+        ),
+        _secret(1),
+        aux_randomness=b"\x03" * 32,
     )
 
 
@@ -433,6 +471,138 @@ def test_invite_hello_signatures_and_expiry_are_verified_without_clock() -> None
             current_time=1_800_000_000,
             current_height=999_900,
         )
+    with pytest.raises(ChannelInputValidationError, match="invite signer.*coordinator"):
+        validate_transcript_for_invite(
+            invite,
+            transcript.model_copy(update={"coordinator_key": _key(2)}),
+            current_time=1_800_000_000,
+            current_height=999_900,
+        )
+
+
+def test_proposal_for_hellos_binds_signed_recipient_claims() -> None:
+    transcript, terms = _transcript()
+    invite = _signed_invite()
+    hello = _signed_hello_for_terms(terms[1])
+    proposal = _signed_proposal(transcript, (terms[1],))
+
+    validate_proposal_for_hellos(
+        invite, (hello,), proposal, current_time=1_800_000_000, current_height=999_900
+    )
+    with pytest.raises(ChannelInputValidationError, match="finite sequence"):
+        validate_proposal_for_hellos(
+            invite,
+            iter((hello,)),  # type: ignore[arg-type]
+            proposal,
+            current_time=1_800_000_000,
+            current_height=999_900,
+        )
+
+    wrong_actor = sign_payload(
+        hello.model_copy(update={"signer_key": _key(3), "participant_key": _key(3)}),
+        _secret(3),
+        aux_randomness=b"\x04" * 32,
+    )
+    with pytest.raises(ChannelInputValidationError, match="participant does not match"):
+        validate_proposal_for_hellos(
+            invite, (wrong_actor,), proposal, current_time=1_800_000_000, current_height=999_900
+        )
+
+    mutations = (
+        ({"funding_outpoint": terms[2].funding_outpoint}, "outpoints do not exactly"),
+        ({"capacity_sat": 99_999}, "capacity does not match"),
+        ({"node_key": _node(30)}, "local node key"),
+        (
+            {
+                "policy_ceilings": hello.policy_ceilings.model_copy(
+                    update={"max_claim_adjustment_sat": 1_999}
+                )
+            },
+            "policy ceilings",
+        ),
+        ({"quoted_miner_fee_share_sat": 999}, "fee share exceeds hello quote"),
+        ({"settlement_script_pubkey": "5120" + "33" * 32}, "settlement script"),
+    )
+    for update, match in mutations:
+        mutated = sign_payload(
+            hello.model_copy(update=update), _secret(2), aux_randomness=b"\x05" * 32
+        )
+        with pytest.raises(ChannelInputValidationError, match=match):
+            validate_proposal_for_hellos(
+                invite, (mutated,), proposal, current_time=1_800_000_000, current_height=999_900
+            )
+
+    excess = sign_payload(
+        hello.model_copy(update={"funding_outpoint": Outpoint(txid="99" * 32, vout=1)}),
+        _secret(2),
+        aux_randomness=b"\x06" * 32,
+    )
+    with pytest.raises(ChannelInputValidationError, match="duplicate hello"):
+        validate_proposal_for_hellos(
+            invite, (hello, hello), proposal, current_time=1_800_000_000, current_height=999_900
+        )
+    with pytest.raises(ChannelInputValidationError, match="must not be empty"):
+        validate_proposal_for_hellos(
+            invite, (), proposal, current_time=1_800_000_000, current_height=999_900
+        )
+    with pytest.raises(ChannelInputValidationError, match="outpoints do not exactly"):
+        validate_proposal_for_hellos(
+            invite, (hello, excess), proposal, current_time=1_800_000_000, current_height=999_900
+        )
+    with pytest.raises(ChannelInputValidationError, match="hello BIP340"):
+        validate_proposal_for_hellos(
+            invite,
+            (hello.model_copy(update={"sig": "00" * 64}),),
+            proposal,
+            current_time=1_800_000_000,
+            current_height=999_900,
+        )
+    with pytest.raises(ChannelInputValidationError, match="proposal BIP340"):
+        validate_proposal_for_hellos(
+            invite,
+            (hello,),
+            proposal.model_copy(update={"sig": "00" * 64}),
+            current_time=1_800_000_000,
+            current_height=999_900,
+        )
+    with pytest.raises(ChannelInputValidationError, match="invite BIP340"):
+        validate_proposal_for_hellos(
+            invite.model_copy(update={"sig": "00" * 64}),
+            (hello,),
+            proposal,
+            current_time=1_800_000_000,
+            current_height=999_900,
+        )
+    with pytest.raises(ChannelInputValidationError, match="invite has expired"):
+        validate_proposal_for_hellos(
+            invite, (hello,), proposal, current_time=invite.expiry, current_height=999_900
+        )
+    with pytest.raises(ChannelInputValidationError, match="recovery height"):
+        validate_proposal_for_hellos(
+            invite, (hello,), proposal, current_time=1_800_000_000, current_height=999_000
+        )
+
+
+def test_proposal_for_hellos_allows_multiple_endpoints_for_one_participant() -> None:
+    transcript, terms = _transcript()
+    second_recipient_terms = terms[2].model_copy(update={"participant_key": _key(2)})
+    second_descriptor = transcript.channels[1].model_copy(
+        update={
+            "first_participant_key": _key(2),
+            "first_terms_hash": endpoint_terms_hash(second_recipient_terms).hex(),
+        }
+    )
+    reassigned = transcript.model_copy(
+        update={"channels": (transcript.channels[0], second_descriptor)}
+    )
+    proposal = _signed_proposal(reassigned, (terms[1], second_recipient_terms))
+    validate_proposal_for_hellos(
+        _signed_invite(),
+        (_signed_hello_for_terms(terms[1]), _signed_hello_for_terms(second_recipient_terms)),
+        proposal,
+        current_time=1_800_000_000,
+        current_height=999_900,
+    )
 
 
 def _transcript_with_descriptor(
