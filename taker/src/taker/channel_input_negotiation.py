@@ -6,6 +6,7 @@ from collections.abc import Sequence
 from enum import StrEnum
 from typing import Literal, TypeVar, cast
 
+from coincurve import PublicKey
 from jmcore.channel_input import (
     ChannelInputApprovalPayload,
     ChannelInputApprovalSetAckPayload,
@@ -24,6 +25,7 @@ from jmcore.channel_input import (
     EndpointTerms,
     Network,
     Outpoint,
+    PolicyCeilings,
     approval_set_hash,
     endpoint_terms_hash,
     sign_payload,
@@ -39,7 +41,15 @@ from jmcore.channel_input import (
     verify_payload,
 )
 from jmcore.channel_input_session import ChannelInputActorRegistry, ChannelInputReplayLedger
-from pydantic import Field, field_validator, model_validator
+from jmswap.lnd import ChannelInputCandidate, EscrowOutpoint, FrozenChannelSnapshot
+from pydantic import Field, field_serializer, field_validator, model_validator
+
+_FROZEN_SNAPSHOT_BYTE_FIELDS = (
+    "funding_scriptpubkey",
+    "peer_node_pubkey",
+    "local_funding_pubkey",
+    "remote_funding_pubkey",
+)
 
 
 class TakerChannelInputNegotiationError(Exception):
@@ -48,12 +58,80 @@ class TakerChannelInputNegotiationError(Exception):
 
 class TakerChannelInputStage(StrEnum):
     INVITED = "invited"
+    FREEZE_INTENDED = "freeze_intended"
     HELLOS_READY = "hellos_ready"
     PROPOSALS_READY = "proposals_ready"
     APPROVAL_SET_READY = "approval_set_ready"
     PREPARE_READY = "prepare_ready"
     CANCEL_INTENDED = "cancel_intended"
     CANCELED = "canceled"
+
+
+class TakerChannelInputFreezeIntent(ChannelInputModel):
+    """Exact durable request facts for one selected maker's local LND freeze."""
+
+    nick: str = Field(min_length=1)
+    channel_id: str
+    funding_outpoint: EscrowOutpoint
+    peer_node_pubkey: str
+    capacity_sat: int = Field(gt=0)
+    settlement_script_pubkey: str
+    quoted_miner_fee_share_sat: int = Field(ge=0)
+    policy_ceilings: PolicyCeilings
+
+    @field_validator("channel_id")
+    @classmethod
+    def validate_channel_id(cls, value: str) -> str:
+        _validate_outpoint_identifier(value, "channel_id")
+        return value
+
+    @field_validator("peer_node_pubkey")
+    @classmethod
+    def validate_peer_node_pubkey(cls, value: str) -> str:
+        _validate_node_key(value, "peer_node_pubkey")
+        return value
+
+    @field_validator("settlement_script_pubkey")
+    @classmethod
+    def validate_settlement_script(cls, value: str) -> str:
+        _validate_p2tr_script(value, "settlement_script_pubkey")
+        return value
+
+    @model_validator(mode="after")
+    def validate_intent(self) -> TakerChannelInputFreezeIntent:
+        if self.channel_id != _outpoint_identifier(self.funding_outpoint):
+            raise ValueError("channel_id must equal the funding outpoint")
+        if self.quoted_miner_fee_share_sat > self.policy_ceilings.max_miner_fee_share_sat:
+            raise ValueError("quoted fee share exceeds policy ceiling")
+        return self
+
+
+class TakerFrozenChannelInput(ChannelInputModel):
+    """One exact LND freeze result, with JSON-safe byte serialization."""
+
+    snapshot: FrozenChannelSnapshot
+
+    @field_validator("snapshot", mode="before")
+    @classmethod
+    def parse_snapshot_json(cls, value: object) -> object:
+        if not isinstance(value, dict):
+            return value
+        converted = dict(value)
+        for name in _FROZEN_SNAPSHOT_BYTE_FIELDS:
+            item = converted.get(name)
+            if isinstance(item, str):
+                try:
+                    converted[name] = bytes.fromhex(item)
+                except ValueError as exc:
+                    raise ValueError(f"frozen {name} must be hexadecimal") from exc
+        return converted
+
+    @field_serializer("snapshot", when_used="json")
+    def serialize_snapshot_json(self, value: FrozenChannelSnapshot) -> dict[str, object]:
+        data = value.model_dump(mode="python")
+        for name in _FROZEN_SNAPSHOT_BYTE_FIELDS:
+            data[name] = cast(bytes, data[name]).hex()
+        return data
 
 
 class TakerChannelInputSnapshot(ChannelInputModel):
@@ -68,6 +146,8 @@ class TakerChannelInputSnapshot(ChannelInputModel):
     invite: ChannelInputInvitePayload
     remote_hellos: tuple[tuple[str, ChannelInputHelloPayload], ...] = ()
     local_hellos: tuple[tuple[str, ChannelInputHelloPayload], ...] = ()
+    freeze_intents: tuple[tuple[str, TakerChannelInputFreezeIntent], ...] = ()
+    frozen_inputs: tuple[tuple[str, TakerFrozenChannelInput], ...] = ()
     transcript: ChannelInputTranscript | None = None
     endpoint_terms: tuple[EndpointTerms, ...] = ()
     proposals: tuple[tuple[str, ChannelInputProposalPayload], ...] = ()
@@ -125,6 +205,8 @@ class TakerChannelInputNegotiation:
         stage: TakerChannelInputStage = TakerChannelInputStage.INVITED,
         remote_hellos: tuple[tuple[str, ChannelInputHelloPayload], ...] = (),
         local_hellos: tuple[tuple[str, ChannelInputHelloPayload], ...] = (),
+        freeze_intents: tuple[tuple[str, TakerChannelInputFreezeIntent], ...] = (),
+        frozen_inputs: tuple[tuple[str, TakerFrozenChannelInput], ...] = (),
         transcript: ChannelInputTranscript | None = None,
         endpoint_terms: tuple[EndpointTerms, ...] = (),
         proposals: tuple[tuple[str, ChannelInputProposalPayload], ...] = (),
@@ -148,6 +230,8 @@ class TakerChannelInputNegotiation:
         self.stage = stage
         self.remote_hellos = remote_hellos
         self.local_hellos = local_hellos
+        self.freeze_intents = freeze_intents
+        self.frozen_inputs = frozen_inputs
         self.transcript = transcript
         self.endpoint_terms = endpoint_terms
         self.proposals = proposals
@@ -224,6 +308,8 @@ class TakerChannelInputNegotiation:
             invite=self.invite,
             remote_hellos=self.remote_hellos,
             local_hellos=self.local_hellos,
+            freeze_intents=self.freeze_intents,
+            frozen_inputs=self.frozen_inputs,
             transcript=self.transcript,
             endpoint_terms=self.endpoint_terms,
             proposals=self.proposals,
@@ -262,6 +348,8 @@ class TakerChannelInputNegotiation:
             stage=snapshot.stage,
             remote_hellos=snapshot.remote_hellos,
             local_hellos=snapshot.local_hellos,
+            freeze_intents=snapshot.freeze_intents,
+            frozen_inputs=snapshot.frozen_inputs,
             transcript=snapshot.transcript,
             endpoint_terms=snapshot.endpoint_terms,
             proposals=snapshot.proposals,
@@ -322,6 +410,108 @@ class TakerChannelInputNegotiation:
         self.local_hellos = _nick_items((*self.local_hellos, (nick, local_hello)))
         if len(self.remote_hellos) == len(self.selected_nicks):
             self.stage = TakerChannelInputStage.HELLOS_READY
+
+    def record_freeze_intent(
+        self,
+        nick: str,
+        remote_hello: ChannelInputHelloPayload,
+        candidate: ChannelInputCandidate,
+        *,
+        local_node_key: str,
+        settlement_script_pubkey: str,
+        quoted_miner_fee_share_sat: int,
+        policy_ceilings: PolicyCeilings,
+    ) -> TakerChannelInputFreezeIntent:
+        """Authenticate a maker hello and durably plan its local LND freeze request."""
+
+        self._require_nick(nick)
+        intent = _freeze_intent_from_candidate(
+            nick,
+            candidate,
+            settlement_script_pubkey=settlement_script_pubkey,
+            quoted_miner_fee_share_sat=quoted_miner_fee_share_sat,
+            policy_ceilings=policy_ceilings,
+        )
+        if intent.quoted_miner_fee_share_sat > self.invite.max_parent_fee_sat:
+            raise ChannelInputValidationError(
+                "freeze intent quoted fee exceeds invitation parent fee"
+            )
+        existing_intent = dict(self.freeze_intents).get(nick)
+        existing_remote = dict(self.remote_hellos).get(nick)
+        if existing_intent is not None:
+            if existing_intent != intent or existing_remote != remote_hello:
+                raise ChannelInputValidationError("freeze intent conflicts with durable evidence")
+            return existing_intent
+        if self.stage not in {
+            TakerChannelInputStage.INVITED,
+            TakerChannelInputStage.FREEZE_INTENDED,
+        }:
+            raise ChannelInputValidationError(
+                "freeze intent is not valid at this negotiation stage"
+            )
+        if existing_remote is not None:
+            if existing_remote != remote_hello:
+                raise ChannelInputValidationError("remote hello conflicts with durable evidence")
+        if nick in dict(self.local_hellos):
+            raise ChannelInputValidationError(
+                "local hello cannot exist before remote freeze evidence"
+            )
+        self._validate_remote_freeze_hello(nick, remote_hello, candidate, local_node_key)
+        if any(
+            other.funding_outpoint == intent.funding_outpoint
+            for other_nick, other in self.freeze_intents
+            if other_nick != nick
+        ):
+            raise ChannelInputValidationError("channel funding outpoint is already assigned")
+        self._registry.bind_verified(nick, remote_hello)
+        if existing_remote is None:
+            _record(self._ledger, _slot("hello_remote", nick), remote_hello)
+            self.remote_hellos = _nick_items((*self.remote_hellos, (nick, remote_hello)))
+        self.freeze_intents = _nick_items((*self.freeze_intents, (nick, intent)))
+        self.stage = TakerChannelInputStage.FREEZE_INTENDED
+        return intent
+
+    def install_frozen_channel(
+        self, nick: str, snapshot: FrozenChannelSnapshot
+    ) -> ChannelInputHelloPayload:
+        """Install one exact LND freeze result and create the signed local hello."""
+
+        self._require_nick(nick)
+        frozen = _normalize_frozen_input(snapshot)
+        existing = dict(self.frozen_inputs).get(nick)
+        if existing is not None:
+            if existing != frozen:
+                raise ChannelInputValidationError("frozen channel conflicts with durable evidence")
+            local = dict(self.local_hellos).get(nick)
+            if local is None:
+                raise ChannelInputValidationError("frozen channel lacks durable local hello")
+            return local
+        if self.stage is not TakerChannelInputStage.FREEZE_INTENDED:
+            raise ChannelInputValidationError(
+                "frozen channel is not valid at this negotiation stage"
+            )
+        intent = dict(self.freeze_intents).get(nick)
+        remote = dict(self.remote_hellos).get(nick)
+        if intent is None or remote is None:
+            raise ChannelInputValidationError("frozen channel requires intent and remote hello")
+        if nick in dict(self.local_hellos):
+            raise ChannelInputValidationError("frozen channel conflicts with durable local hello")
+        self._validate_frozen_channel(nick, frozen, intent, remote)
+        signed = self._local_hello_from_frozen(remote, intent, frozen)
+        validate_hello_for_invite(self.invite, signed)
+        validate_hello_pair(remote, signed)
+        self._registry.require_verified(self.local_actor, signed)
+        _record(self._ledger, _slot("hello_local", nick), signed)
+        self.local_hellos = _nick_items((*self.local_hellos, (nick, signed)))
+        self.frozen_inputs = _nick_items((*self.frozen_inputs, (nick, frozen)))
+        if (
+            len(self.freeze_intents) == len(self.selected_nicks)
+            and len(self.frozen_inputs) == len(self.selected_nicks)
+            and len(self.remote_hellos) == len(self.selected_nicks)
+            and len(self.local_hellos) == len(self.selected_nicks)
+        ):
+            self.stage = TakerChannelInputStage.HELLOS_READY
+        return signed
 
     def plan_proposals(
         self,
@@ -680,17 +870,37 @@ class TakerChannelInputNegotiation:
             if not verify_payload(self.invite):
                 raise ChannelInputValidationError("invite signature is invalid")
             remote, local = dict(self.remote_hellos), dict(self.local_hellos)
+            intents, frozen = dict(self.freeze_intents), dict(self.frozen_inputs)
             if (
                 _nick_items(self.remote_hellos) != self.remote_hellos
                 or _nick_items(self.local_hellos) != self.local_hellos
+                or _nick_items(self.freeze_intents) != self.freeze_intents
+                or _nick_items(self.frozen_inputs) != self.frozen_inputs
             ):
-                raise ChannelInputValidationError("hello mappings are not sorted")
-            if set(remote) != set(local) or not set(remote).issubset(self.selected_nicks):
-                raise ChannelInputValidationError("hello mappings do not match selected makers")
+                raise ChannelInputValidationError("durable nick mappings are not sorted")
+            if (
+                not set(remote).issubset(self.selected_nicks)
+                or not set(local).issubset(remote)
+                or not set(intents).issubset(remote)
+                or not set(frozen).issubset(set(intents) & set(local))
+            ):
+                raise ChannelInputValidationError("durable evidence does not match selected makers")
             for nick in remote:
-                self._validate_hello_evidence(nick, remote[nick], local[nick])
+                if nick in local:
+                    self._validate_hello_evidence(nick, remote[nick], local[nick])
+                else:
+                    self._validate_remote_hello_evidence(nick, remote[nick])
             if len({hello.funding_outpoint for hello in remote.values()}) != len(remote):
                 raise ChannelInputValidationError("hello outpoints are not unique")
+            for nick, intent in intents.items():
+                self._validate_freeze_intent_evidence(nick, intent, remote[nick])
+            if len({intent.funding_outpoint for intent in intents.values()}) != len(intents):
+                raise ChannelInputValidationError("freeze intent outpoints are not unique")
+            for nick, frozen_input in frozen.items():
+                self._validate_frozen_channel(nick, frozen_input, intents[nick], remote[nick])
+                self._validate_local_hello_from_frozen(
+                    local[nick], remote[nick], intents[nick], frozen_input
+                )
             self._validate_stage_fields()
             self._validate_signed_evidence()
             expected = self._expected_registry()
@@ -718,9 +928,145 @@ class TakerChannelInputNegotiation:
             raise ChannelInputValidationError("restored hello coordinator keys differ")
         validate_hello_pair(remote, local)
 
+    def _validate_remote_hello_evidence(self, nick: str, remote: ChannelInputHelloPayload) -> None:
+        self._require_nick(nick)
+        validate_hello_for_invite(self.invite, remote)
+        if (
+            remote.participant_key == self.coordinator_key
+            or remote.signer_key != remote.participant_key
+        ):
+            raise ChannelInputValidationError("restored remote hello signer differs from maker")
+
+    def _validate_remote_freeze_hello(
+        self,
+        nick: str,
+        remote: ChannelInputHelloPayload,
+        candidate: ChannelInputCandidate,
+        local_node_key: str,
+    ) -> None:
+        self._validate_remote_hello_evidence(nick, remote)
+        _validate_node_key(local_node_key, "local_node_key")
+        normalized_candidate = _normalize_candidate(candidate)
+        if (
+            remote.node_key != normalized_candidate.peer_node_pubkey
+            or remote.peer_node_key != local_node_key
+            or remote.funding_outpoint.key()
+            != (
+                normalized_candidate.funding_outpoint.txid,
+                normalized_candidate.funding_outpoint.vout,
+            )
+            or remote.capacity_sat != normalized_candidate.capacity_sat
+        ):
+            raise ChannelInputValidationError("remote hello differs from local freeze candidate")
+        if remote.participant_key in {
+            item.participant_key for other_nick, item in self.remote_hellos if other_nick != nick
+        }:
+            raise ChannelInputValidationError("maker participant key is already assigned")
+        if remote.funding_outpoint in {
+            item.funding_outpoint for other_nick, item in self.remote_hellos if other_nick != nick
+        }:
+            raise ChannelInputValidationError("channel funding outpoint is already assigned")
+
+    def _validate_freeze_intent_evidence(
+        self, nick: str, intent: TakerChannelInputFreezeIntent, remote: ChannelInputHelloPayload
+    ) -> None:
+        if (
+            intent.nick != nick
+            or intent.peer_node_pubkey != remote.node_key
+            or intent.funding_outpoint.txid != remote.funding_outpoint.txid
+            or intent.funding_outpoint.vout != remote.funding_outpoint.vout
+            or intent.capacity_sat != remote.capacity_sat
+            or intent.quoted_miner_fee_share_sat > self.invite.max_parent_fee_sat
+        ):
+            raise ChannelInputValidationError("freeze intent differs from remote hello")
+
+    def _validate_frozen_channel(
+        self,
+        nick: str,
+        frozen: TakerFrozenChannelInput,
+        intent: TakerChannelInputFreezeIntent,
+        remote: ChannelInputHelloPayload,
+    ) -> None:
+        snapshot = frozen.snapshot
+        self._validate_freeze_intent_evidence(nick, intent, remote)
+        if (
+            snapshot.session_id != self.invite.session_id
+            or snapshot.channel_id != intent.channel_id
+            or snapshot.funding_outpoint != intent.funding_outpoint
+            or snapshot.peer_node_pubkey.hex() != intent.peer_node_pubkey
+            or snapshot.capacity_sat != intent.capacity_sat
+            or snapshot.funding_scriptpubkey.hex() != remote.funding_script_pubkey
+            or snapshot.local_claim_sat != remote.frozen_remote_claim_sat
+            or snapshot.remote_claim_sat != remote.frozen_local_claim_sat
+            or not snapshot.quiescent
+            or snapshot.active_htlcs != 0
+        ):
+            raise ChannelInputValidationError("frozen channel differs from intent or remote hello")
+
+    def _local_hello_from_frozen(
+        self,
+        remote: ChannelInputHelloPayload,
+        intent: TakerChannelInputFreezeIntent,
+        frozen: TakerFrozenChannelInput,
+    ) -> ChannelInputHelloPayload:
+        snapshot = frozen.snapshot
+        return cast(
+            ChannelInputHelloPayload,
+            sign_payload(
+                ChannelInputHelloPayload(
+                    session_id=self.invite.session_id,
+                    attempt=self.invite.attempt,
+                    signer_key=self.coordinator_key,
+                    participant_key=self.coordinator_key,
+                    node_key=remote.peer_node_key,
+                    peer_node_key=remote.node_key,
+                    funding_outpoint=remote.funding_outpoint,
+                    capacity_sat=snapshot.capacity_sat,
+                    funding_script_pubkey=snapshot.funding_scriptpubkey.hex(),
+                    frozen_local_claim_sat=snapshot.local_claim_sat,
+                    frozen_remote_claim_sat=snapshot.remote_claim_sat,
+                    settlement_script_pubkey=intent.settlement_script_pubkey,
+                    quoted_miner_fee_share_sat=intent.quoted_miner_fee_share_sat,
+                    policy_ceilings=intent.policy_ceilings,
+                ),
+                self._key_pair.secret_key,
+            ),
+        )
+
+    def _validate_local_hello_from_frozen(
+        self,
+        local: ChannelInputHelloPayload,
+        remote: ChannelInputHelloPayload,
+        intent: TakerChannelInputFreezeIntent,
+        frozen: TakerFrozenChannelInput,
+    ) -> None:
+        snapshot = frozen.snapshot
+        validate_hello_for_invite(self.invite, local)
+        validate_hello_pair(remote, local)
+        if (
+            local.signer_key != self.coordinator_key
+            or local.participant_key != self.coordinator_key
+            or local.node_key != remote.peer_node_key
+            or local.peer_node_key != remote.node_key
+            or local.funding_outpoint != remote.funding_outpoint
+            or local.capacity_sat != snapshot.capacity_sat
+            or local.funding_script_pubkey != snapshot.funding_scriptpubkey.hex()
+            or local.frozen_local_claim_sat != snapshot.local_claim_sat
+            or local.frozen_remote_claim_sat != snapshot.remote_claim_sat
+            or local.settlement_script_pubkey != intent.settlement_script_pubkey
+            or local.quoted_miner_fee_share_sat != intent.quoted_miner_fee_share_sat
+            or local.policy_ceilings != intent.policy_ceilings
+        ):
+            raise ChannelInputValidationError("local hello differs from frozen channel evidence")
+
     def _validate_stage_fields(self) -> None:
-        hello_count = len(self.remote_hellos)
-        complete_hellos = hello_count == len(self.selected_nicks)
+        remote_hello_count = len(self.remote_hellos)
+        complete_hellos = remote_hello_count == len(self.selected_nicks) and len(
+            self.local_hellos
+        ) == len(self.selected_nicks)
+        complete_freeze = len(self.freeze_intents) == len(self.selected_nicks) and len(
+            self.frozen_inputs
+        ) == len(self.selected_nicks)
         complete_proposals = (
             self.transcript is not None
             and bool(self.endpoint_terms)
@@ -745,13 +1091,35 @@ class TakerChannelInputNegotiation:
             self.local_resumed_outpoints,
         )
         if self.stage is TakerChannelInputStage.INVITED:
-            if hello_count >= len(self.selected_nicks) or any(later_evidence):
+            if (
+                remote_hello_count >= len(self.selected_nicks)
+                or self.freeze_intents
+                or self.frozen_inputs
+                or any(later_evidence)
+            ):
                 raise ChannelInputValidationError("invited state evidence is inconsistent")
             return
+        if self.stage is TakerChannelInputStage.FREEZE_INTENDED:
+            if not self.freeze_intents or any(later_evidence):
+                raise ChannelInputValidationError("freeze-intended state evidence is inconsistent")
+            if complete_hellos and complete_freeze:
+                raise ChannelInputValidationError(
+                    "freeze-intended state has complete hello evidence"
+                )
+            return
         if self.stage is TakerChannelInputStage.HELLOS_READY:
-            if not complete_hellos or any(later_evidence):
+            if (
+                not complete_hellos
+                or any(later_evidence)
+                or bool(self.freeze_intents) != bool(self.frozen_inputs)
+                or (self.freeze_intents and not complete_freeze)
+            ):
                 raise ChannelInputValidationError("hello-ready state evidence is inconsistent")
             return
+        if bool(self.freeze_intents) != bool(self.frozen_inputs) or (
+            self.freeze_intents and not complete_freeze
+        ):
+            raise ChannelInputValidationError("later state contains incomplete freeze evidence")
         if not complete_hellos or not complete_proposals:
             raise ChannelInputValidationError("state requires complete proposal evidence")
         if self.stage is TakerChannelInputStage.PROPOSALS_READY:
@@ -992,6 +1360,50 @@ class TakerChannelInputNegotiation:
             raise ChannelInputValidationError("actor is not a selected maker")
 
 
+def _freeze_intent_from_candidate(
+    nick: str,
+    candidate: ChannelInputCandidate,
+    *,
+    settlement_script_pubkey: str,
+    quoted_miner_fee_share_sat: int,
+    policy_ceilings: PolicyCeilings,
+) -> TakerChannelInputFreezeIntent:
+    normalized = _normalize_candidate(candidate)
+    try:
+        return TakerChannelInputFreezeIntent(
+            nick=nick,
+            channel_id=_outpoint_identifier(normalized.funding_outpoint),
+            funding_outpoint=normalized.funding_outpoint,
+            peer_node_pubkey=normalized.peer_node_pubkey,
+            capacity_sat=normalized.capacity_sat,
+            settlement_script_pubkey=settlement_script_pubkey,
+            quoted_miner_fee_share_sat=quoted_miner_fee_share_sat,
+            policy_ceilings=policy_ceilings,
+        )
+    except ValueError as exc:
+        raise ChannelInputValidationError("freeze intent evidence is invalid") from exc
+
+
+def _normalize_candidate(candidate: ChannelInputCandidate) -> ChannelInputCandidate:
+    if not isinstance(candidate, ChannelInputCandidate):
+        raise ChannelInputValidationError("freeze candidate must use an exact LND candidate")
+    try:
+        return ChannelInputCandidate.model_validate(candidate.model_dump(mode="python"))
+    except ValueError as exc:
+        raise ChannelInputValidationError("freeze candidate evidence is invalid") from exc
+
+
+def _normalize_frozen_input(snapshot: FrozenChannelSnapshot) -> TakerFrozenChannelInput:
+    if not isinstance(snapshot, FrozenChannelSnapshot):
+        raise ChannelInputValidationError("frozen channel must use an exact LND snapshot")
+    try:
+        return TakerFrozenChannelInput.model_validate(
+            {"snapshot": snapshot.model_dump(mode="python")}
+        )
+    except ValueError as exc:
+        raise ChannelInputValidationError("frozen channel evidence is invalid") from exc
+
+
 def _selected_nicks(selected_nicks: Sequence[str], local_actor: str) -> tuple[str, ...]:
     if not isinstance(local_actor, str) or not local_actor:
         raise ChannelInputValidationError("local_actor must be a non-empty string")
@@ -1054,3 +1466,56 @@ def _slot(name: str, nick: str | None = None) -> str:
 
 def _record(ledger: ChannelInputReplayLedger, slot: str, payload: ChannelInputPayload) -> None:
     ledger.record(slot, payload)
+
+
+def _outpoint_identifier(outpoint: EscrowOutpoint) -> str:
+    return f"{outpoint.txid}:{outpoint.vout}"
+
+
+def _validate_outpoint_identifier(value: str, field_name: str) -> None:
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a lowercase <64hex>:<uint32> outpoint")
+    txid, separator, vout_text = value.partition(":")
+    if (
+        not separator
+        or ":" in vout_text
+        or len(txid) != 64
+        or txid.lower() != txid
+        or not vout_text.isascii()
+        or not vout_text.isdecimal()
+        or (len(vout_text) > 1 and vout_text.startswith("0"))
+    ):
+        raise ValueError(f"{field_name} must be a lowercase <64hex>:<uint32> outpoint")
+    try:
+        bytes.fromhex(txid)
+        vout = int(vout_text)
+    except ValueError as exc:
+        raise ValueError(f"{field_name} must be a lowercase <64hex>:<uint32> outpoint") from exc
+    if vout > 0xFFFFFFFF:
+        raise ValueError(f"{field_name} must be a lowercase <64hex>:<uint32> outpoint")
+
+
+def _validate_p2tr_script(value: str, field_name: str) -> None:
+    if (
+        not isinstance(value, str)
+        or len(value) != 68
+        or value.lower() != value
+        or not value.startswith("5120")
+    ):
+        raise ValueError(f"{field_name} must be a P2TR script_pubkey")
+    try:
+        bytes.fromhex(value)
+    except ValueError as exc:
+        raise ValueError(f"{field_name} must be a P2TR script_pubkey") from exc
+
+
+def _validate_node_key(value: str, field_name: str) -> None:
+    if not isinstance(value, str) or len(value) != 66 or value.lower() != value:
+        raise ValueError(f"{field_name} must be a compressed secp256k1 public key")
+    try:
+        raw = bytes.fromhex(value)
+        if raw[0] not in (2, 3):
+            raise ValueError
+        PublicKey(raw)
+    except ValueError as exc:
+        raise ValueError(f"{field_name} must be a compressed secp256k1 public key") from exc
