@@ -8,10 +8,17 @@ from collections.abc import Sequence
 from typing import Protocol
 
 from jmcore.channel_input import (
+    ChannelInputApprovalPayload,
+    ChannelInputApprovalSetAckPayload,
+    ChannelInputApprovalSetPayload,
     ChannelInputCancelAckPayload,
     ChannelInputCancelPayload,
     ChannelInputHelloPayload,
+    ChannelInputPreparePayload,
+    ChannelInputProposalPayload,
+    ChannelInputTranscript,
     ChannelInputValidationError,
+    EndpointTerms,
     Network,
     PolicyCeilings,
 )
@@ -232,6 +239,102 @@ class TakerChannelInputRegistry:
                 ) from exc
             self._save(negotiation)
             return cancel
+
+    async def plan_proposals(
+        self,
+        session_id: str,
+        attempt: int,
+        transcript: ChannelInputTranscript,
+        endpoint_terms: Sequence[EndpointTerms],
+        *,
+        current_time: int,
+        current_height: int,
+    ) -> tuple[tuple[str, ChannelInputProposalPayload], ...]:
+        """Durably build the per-maker proposal plan before transport exposes it."""
+
+        negotiation = self._require(session_id, attempt)
+        async with self.lock_for(session_id, attempt):
+            try:
+                proposals = negotiation.plan_proposals(
+                    transcript,
+                    endpoint_terms,
+                    current_time=current_time,
+                    current_height=current_height,
+                )
+            except (ChannelInputValidationError, TypeError, ValueError) as exc:
+                raise TakerChannelInputRuntimeError(
+                    "could not plan channel-input proposals"
+                ) from exc
+            self._save(negotiation)
+            return proposals
+
+    async def accept_maker_approval(
+        self,
+        session_id: str,
+        attempt: int,
+        nick: str,
+        approval: ChannelInputApprovalPayload,
+    ) -> None:
+        """Durably accept one maker approval, including an exact replay."""
+
+        negotiation = self._require(session_id, attempt)
+        async with self.lock_for(session_id, attempt):
+            try:
+                negotiation.accept_approval(nick, approval)
+            except (ChannelInputValidationError, TypeError, ValueError) as exc:
+                raise TakerChannelInputRuntimeError(
+                    "maker approval conflicts with negotiation"
+                ) from exc
+            self._save(negotiation)
+
+    async def build_approval_set(
+        self, session_id: str, attempt: int
+    ) -> ChannelInputApprovalSetPayload:
+        """Durably build the complete approval set before transport exposes it."""
+
+        negotiation = self._require(session_id, attempt)
+        async with self.lock_for(session_id, attempt):
+            try:
+                approval_set = negotiation.build_approval_set()
+            except (ChannelInputValidationError, TypeError, ValueError) as exc:
+                raise TakerChannelInputRuntimeError(
+                    "could not build channel-input approval set"
+                ) from exc
+            self._save(negotiation)
+            return approval_set
+
+    async def accept_maker_approval_ack(
+        self,
+        session_id: str,
+        attempt: int,
+        nick: str,
+        ack: ChannelInputApprovalSetAckPayload,
+    ) -> None:
+        """Durably accept one maker approval-set ACK, including an exact replay."""
+
+        negotiation = self._require(session_id, attempt)
+        async with self.lock_for(session_id, attempt):
+            try:
+                negotiation.accept_approval_ack(nick, ack)
+            except (ChannelInputValidationError, TypeError, ValueError) as exc:
+                raise TakerChannelInputRuntimeError(
+                    "maker approval-set ACK conflicts with negotiation"
+                ) from exc
+            self._save(negotiation)
+
+    async def build_prepare(self, session_id: str, attempt: int) -> ChannelInputPreparePayload:
+        """Durably build the signed prepare authorization without sending it."""
+
+        negotiation = self._require(session_id, attempt)
+        async with self.lock_for(session_id, attempt):
+            try:
+                prepare = negotiation.build_prepare()
+            except (ChannelInputValidationError, TypeError, ValueError) as exc:
+                raise TakerChannelInputRuntimeError(
+                    "could not build channel-input prepare"
+                ) from exc
+            self._save(negotiation)
+            return prepare
 
     async def accept_maker_cancel_ack(
         self,
