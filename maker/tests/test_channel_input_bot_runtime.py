@@ -53,6 +53,14 @@ def _bot(tmp_path: Path) -> MakerBot:
     return MakerBot(wallet=wallet, backend=backend, config=_config(tmp_path))
 
 
+def test_channel_input_maker_restores_outer_nick_identity(tmp_path: Path) -> None:
+    first = _bot(tmp_path)
+    second = _bot(tmp_path)
+
+    assert first.nick == second.nick
+    assert first.nick_identity.public_key_hex == second.nick_identity.public_key_hex
+
+
 @pytest.mark.asyncio
 async def test_runtime_reconciles_before_capability_activation(tmp_path: Path) -> None:
     bot = _bot(tmp_path)

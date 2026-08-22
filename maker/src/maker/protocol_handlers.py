@@ -15,7 +15,7 @@ import os
 import time
 from collections.abc import Awaitable, Callable
 from contextlib import AbstractContextManager
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from jmcore.bitcoin import get_txid
 from jmcore.commitment_blacklist import (
@@ -47,7 +47,7 @@ from loguru import logger
 from maker.coinjoin import CoinJoinSession, CoinJoinState
 from maker.config import MakerConfig
 from maker.fidelity import FidelityBondInfo, create_fidelity_bond_proof
-from maker.generation import GenerationState
+from maker.generation import GenerationState, MakerGeneration
 from maker.maker_session import MakerSession, PendingSignedRound
 from maker.offers import OfferManager
 from maker.protocols import MakerBotProtocol
@@ -71,6 +71,29 @@ _ORDERBOOK_SEND_TIMEOUT_SEC = 5.0
 MAX_SESSION_HANDLER_TASKS = 128
 MAX_ACTIVE_MAKER_SESSIONS = 128
 MAX_PENDING_SIGNED_ROUNDS = 1024
+
+
+class _GenerationBoundRecoveryBot:
+    """Expose identity-bound reply routes while delegating shared runtime state."""
+
+    def __init__(self, bot: MakerBotProtocol, generation: MakerGeneration) -> None:
+        self._bot = bot
+        self._generation = generation
+
+    @property
+    def nick(self) -> str:
+        return self._generation.nick_identity.nick
+
+    @property
+    def nick_identity(self) -> NickIdentity:
+        return self._generation.nick_identity
+
+    @property
+    def directory_clients(self) -> dict[str, DirectoryClient]:
+        return self._bot._generation_clients(self._generation.generation_id)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._bot, name)
 
 
 class ProtocolHandlersMixin:
@@ -545,6 +568,10 @@ class ProtocolHandlersMixin:
                 )
             elif command.startswith("ring"):
                 await self._handle_ring(
+                    from_nick, command, source=source, generation_id=generation_id
+                )
+            elif command.startswith("channel_input_recover"):
+                await self._handle_channel_input_recover(
                     from_nick, command, source=source, generation_id=generation_id
                 )
             elif command.startswith("channel_input"):
@@ -1101,6 +1128,36 @@ class ProtocolHandlersMixin:
             name=f"maker-channel-input-{taker_nick}",
         )
 
+    async def _handle_channel_input_recover(
+        self: MakerBotProtocol,
+        taker_nick: str,
+        msg: str,
+        source: str = "unknown",
+        direct_connection: TCPConnection | None = None,
+        generation_id: int | None = None,
+    ) -> None:
+        """Dispatch recovery traffic without requiring a live CoinJoin session."""
+
+        generation_id = self.current_generation_id if generation_id is None else generation_id
+        generation = self._generation(generation_id)
+        if (
+            generation is None
+            or generation.state is GenerationState.CLOSED
+            or (
+                generation.grace_deadline is not None
+                and time.monotonic() >= generation.grace_deadline
+            )
+        ):
+            return
+        recovery_bot = _GenerationBoundRecoveryBot(self, generation)
+        await self._channel_input_recovery.handle(
+            cast(MakerBotProtocol, recovery_bot),
+            taker_nick,
+            msg,
+            source,
+            direct_connection,
+        )
+
     async def _handle_push(
         self: MakerBotProtocol,
         taker_nick: str,
@@ -1205,7 +1262,7 @@ class ProtocolHandlersMixin:
                 self._pending_signed_rounds.pop(key, None)
 
             logger.info(f"Received matched !push from {taker_nick}, broadcasting transaction...")
-            session = self.active_sessions.get(taker_nick)
+            session = self.active_sessions.get((generation_id, taker_nick))
             if session is not None and session.ring_participant is not None:
                 try:
                     await session.ring_participant.observe_final_transaction(tx_hex)

@@ -28,6 +28,7 @@ from jmcore.channel_input import (
     ChannelInputPreparePayload,
     ChannelInputProposalPayload,
     ChannelInputSignPayload,
+    ChannelInputStatusRequestPayload,
     ChannelInputTranscript,
     ChannelInputValidationError,
     EndpointTerms,
@@ -48,10 +49,13 @@ from jmswap.lnd import (
     EscrowOutpoint,
     FrozenChannelSnapshot,
     LndEscrowSigningAttempt,
+    LndEscrowStage,
+    LndEscrowStatus,
     LndFinalizedEscrowParent,
 )
 
 from maker.channel_input import (
+    MakerChannelInputChannelState,
     MakerChannelInputFreezeIntent,
     MakerChannelInputNegotiation,
     MakerChannelInputSnapshot,
@@ -553,6 +557,48 @@ def _finalized_result(
     )
 
 
+def _status_request(
+    proposal: ChannelInputProposalPayload, outpoint: Outpoint, *, query: bytes = b"\x01" * 32
+) -> ChannelInputStatusRequestPayload:
+    coordinator = ChannelInputKeyPair.from_secret(COORDINATOR_SECRET)
+    return cast(
+        ChannelInputStatusRequestPayload,
+        sign_payload(
+            ChannelInputStatusRequestPayload(
+                session_id=proposal.session_id,
+                attempt=proposal.attempt,
+                signer_key=coordinator.public_key,
+                transcript_hash=proposal.transcript_hash,
+                funding_outpoint=outpoint,
+                query_id=query.hex(),
+            ),
+            COORDINATOR_SECRET,
+        ),
+    )
+
+
+def _escrow_status(
+    stage: LndEscrowStage,
+    *,
+    parent_txid: str | None,
+    attempt: LndEscrowSigningAttempt | None = None,
+    local_nonce: bytes | None = None,
+    remote_nonce: bytes | None = None,
+    partial: bytes | None = None,
+    finalized: LndFinalizedEscrowParent | None = None,
+) -> LndEscrowStatus:
+    return LndEscrowStatus(
+        stage=stage,
+        parent_txid=parent_txid,
+        finalized=stage is LndEscrowStage.FINALIZED,
+        active_attempt=attempt,
+        durable_local_public_nonce=local_nonce,
+        durable_remote_public_nonce=remote_nonce,
+        durable_local_partial_signature=partial,
+        finalized_parent=finalized,
+    )
+
+
 def _signing_negotiation() -> tuple[
     MakerChannelInputNegotiation,
     ChannelInputProposalPayload,
@@ -633,6 +679,204 @@ def test_channel_state_chain_is_durable_and_replays_exact_payloads() -> None:
     restored = MakerChannelInputNegotiation.from_snapshot(snapshot)
     assert restored.snapshot() == snapshot
     assert restored.channel_states[0].finalized is not None
+
+
+def test_status_evidence_tracks_reconciled_prepared_signed_and_finalized_state() -> None:
+    negotiation, proposal = _prepared_negotiation(channels=1)
+    outpoint = proposal.recipient_terms[0].funding_outpoint
+    parent_txid = get_txid(proposal.transcript.unsigned_parent_tx)
+    attempt = LndEscrowSigningAttempt(attempt_id=b"\x01" * 32, public_nonce=b"\x02" * 66)
+    local = negotiation.record_prepared(outpoint, parent_txid, attempt)
+    prepared_request = _status_request(proposal, outpoint)
+    prepared_status = negotiation.record_status(
+        "coordinator",
+        prepared_request,
+        _escrow_status(LndEscrowStage.PARENT_PREPARED, parent_txid=parent_txid, attempt=attempt),
+    )
+    assert prepared_status.escrow_stage == "parent_prepared"
+    assert prepared_status.attempt_active is True
+    assert prepared_status.partial is None and prepared_status.finalized is None
+    assert (
+        negotiation.record_status(
+            "coordinator",
+            prepared_request,
+            _escrow_status(
+                LndEscrowStage.PARENT_PREPARED, parent_txid=parent_txid, attempt=attempt
+            ),
+        )
+        == prepared_status
+    )
+    replacement_request = _status_request(proposal, outpoint, query=b"\x06" * 32)
+    replacement_status = negotiation.record_status(
+        "coordinator",
+        replacement_request,
+        _escrow_status(LndEscrowStage.PARENT_PREPARED, parent_txid=parent_txid, attempt=attempt),
+    )
+    assert replacement_status.query_id == replacement_request.query_id
+    assert replacement_status != prepared_status
+    assert negotiation.channel_states[0].status_request == replacement_request
+
+    peer = _peer_prepared(proposal, local, b"\x03" * 66)
+    negotiation.accept_sign("coordinator", _sign_intent(proposal, local, peer))
+    negotiation.record_partial(outpoint, b"\xaa" * 32)
+    signed_request = _status_request(proposal, outpoint, query=b"\x04" * 32)
+    signed_status = negotiation.record_status(
+        "coordinator",
+        signed_request,
+        _escrow_status(
+            LndEscrowStage.PARENT_SIGNED,
+            parent_txid=parent_txid,
+            local_nonce=bytes.fromhex(local.public_nonce),
+            remote_nonce=bytes.fromhex(peer.public_nonce),
+            partial=b"\xaa" * 32,
+        ),
+    )
+    assert signed_status.escrow_stage == "parent_signed"
+    assert signed_status.attempt_active is False
+    assert signed_status.partial == negotiation.channel_states[0].partial
+    assert signed_status != prepared_status
+
+    negotiation.accept_finalize("coordinator", _finalize_intent(proposal, local, peer))
+    result = _finalized_result(proposal, 0, b"\x11" * 64)
+    negotiation.record_finalized(outpoint, result)
+    finalized_request = _status_request(proposal, outpoint, query=b"\x05" * 32)
+    finalized_status = negotiation.record_status(
+        "coordinator",
+        finalized_request,
+        _escrow_status(
+            LndEscrowStage.FINALIZED,
+            parent_txid=parent_txid,
+            local_nonce=bytes.fromhex(local.public_nonce),
+            remote_nonce=bytes.fromhex(peer.public_nonce),
+            partial=b"\xaa" * 32,
+            finalized=result,
+        ),
+    )
+    assert finalized_status.escrow_stage == "finalized"
+    assert finalized_status.attempt_active is False
+    assert finalized_status.finalized == negotiation.channel_states[0].finalized
+    assert negotiation.channel_states[0].status_request == finalized_request
+    assert negotiation.channel_states[0].status_response == finalized_status
+    snapshot = MakerChannelInputSnapshot.model_validate_json(
+        negotiation.snapshot().model_dump_json()
+    )
+    assert MakerChannelInputNegotiation.from_snapshot(snapshot).snapshot() == snapshot
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ["actor", "signer", "signature", "hash", "outpoint", "locked", "parent", "attempt"],
+)
+def test_status_rejects_bad_request_and_prepared_backend_evidence(failure: str) -> None:
+    negotiation, proposal = _prepared_negotiation(channels=1)
+    outpoint = proposal.recipient_terms[0].funding_outpoint
+    parent_txid = get_txid(proposal.transcript.unsigned_parent_tx)
+    attempt = LndEscrowSigningAttempt(attempt_id=b"\x01" * 32, public_nonce=b"\x02" * 66)
+    negotiation.record_prepared(outpoint, parent_txid, attempt)
+    request = _status_request(proposal, outpoint)
+    actor = "coordinator"
+    status = _escrow_status(
+        LndEscrowStage.PARENT_PREPARED, parent_txid=parent_txid, attempt=attempt
+    )
+    if failure == "actor":
+        actor = "other"
+    elif failure == "signer":
+        request = sign_payload(
+            request.model_copy(update={"signer_key": negotiation.participant_key}),
+            PARTICIPANT_SECRET,
+        )
+    elif failure == "signature":
+        request = request.model_copy(update={"sig": "00" * 64})
+    elif failure == "hash":
+        request = sign_payload(
+            request.model_copy(update={"transcript_hash": "00" * 32}), COORDINATOR_SECRET
+        )
+    elif failure == "outpoint":
+        request = _status_request(proposal, Outpoint(txid="ff" * 32, vout=0))
+    elif failure == "locked":
+        status = _escrow_status(LndEscrowStage.LOCKED, parent_txid=None)
+    elif failure == "parent":
+        status = _escrow_status(
+            LndEscrowStage.PARENT_PREPARED, parent_txid="00" * 32, attempt=attempt
+        )
+    else:
+        status = _escrow_status(
+            LndEscrowStage.PARENT_PREPARED,
+            parent_txid=parent_txid,
+            attempt=LndEscrowSigningAttempt(attempt_id=b"\x03" * 32, public_nonce=b"\x04" * 66),
+        )
+    with pytest.raises(ChannelInputValidationError):
+        negotiation.record_status(actor, request, status)
+
+
+@pytest.mark.parametrize("failure", ["local_nonce", "remote_nonce", "partial", "finalized"])
+def test_status_rejects_signed_and_finalized_backend_mismatches(failure: str) -> None:
+    negotiation, proposal, local, peer, _ = _signing_negotiation()
+    outpoint = local.funding_outpoint
+    parent_txid = get_txid(proposal.transcript.unsigned_parent_tx)
+    negotiation.record_partial(outpoint, b"\xaa" * 32)
+    request = _status_request(proposal, outpoint)
+    status = _escrow_status(
+        LndEscrowStage.PARENT_SIGNED,
+        parent_txid=parent_txid,
+        local_nonce=bytes.fromhex(local.public_nonce),
+        remote_nonce=bytes.fromhex(peer.public_nonce),
+        partial=b"\xaa" * 32,
+    )
+    if failure == "local_nonce":
+        status = status.model_copy(update={"durable_local_public_nonce": b"\x04" * 66})
+    elif failure == "remote_nonce":
+        status = status.model_copy(update={"durable_remote_public_nonce": b"\x04" * 66})
+    elif failure == "partial":
+        status = status.model_copy(update={"durable_local_partial_signature": b"\xbb" * 32})
+    else:
+        negotiation.accept_finalize("coordinator", _finalize_intent(proposal, local, peer))
+        result = _finalized_result(proposal, 0, b"\x11" * 64)
+        negotiation.record_finalized(outpoint, result)
+        status = _escrow_status(
+            LndEscrowStage.FINALIZED,
+            parent_txid=parent_txid,
+            local_nonce=bytes.fromhex(local.public_nonce),
+            remote_nonce=bytes.fromhex(peer.public_nonce),
+            partial=b"\xaa" * 32,
+            finalized=_finalized_result(proposal, 0, b"\x22" * 64),
+        )
+    with pytest.raises(ChannelInputValidationError):
+        negotiation.record_status("coordinator", request, status)
+
+
+def test_status_snapshot_rejects_mismatched_query_binding() -> None:
+    negotiation, proposal = _prepared_negotiation(channels=1)
+    outpoint = proposal.recipient_terms[0].funding_outpoint
+    parent_txid = get_txid(proposal.transcript.unsigned_parent_tx)
+    attempt = LndEscrowSigningAttempt(attempt_id=b"\x01" * 32, public_nonce=b"\x02" * 66)
+    negotiation.record_prepared(outpoint, parent_txid, attempt)
+    negotiation.record_status(
+        "coordinator",
+        _status_request(proposal, outpoint),
+        _escrow_status(LndEscrowStage.PARENT_PREPARED, parent_txid=parent_txid, attempt=attempt),
+    )
+    state = negotiation.channel_states[0]
+    assert state.status_response is not None
+    data = state.model_dump(mode="python")
+    data["status_response"]["query_id"] = "ff" * 32
+    with pytest.raises(ValueError, match="status evidence"):
+        MakerChannelInputChannelState.model_validate(data)
+
+
+def test_status_rejects_before_prepare_is_accepted() -> None:
+    negotiation, proposal, _ = _proposal_approved()
+    outpoint = proposal.recipient_terms[0].funding_outpoint
+    with pytest.raises(ChannelInputValidationError, match="preparation"):
+        negotiation.record_status(
+            "coordinator",
+            _status_request(proposal, outpoint),
+            _escrow_status(
+                LndEscrowStage.PARENT_PREPARED,
+                parent_txid=get_txid(proposal.transcript.unsigned_parent_tx),
+                attempt=LndEscrowSigningAttempt(attempt_id=b"\x01" * 32, public_nonce=b"\x02" * 66),
+            ),
+        )
 
 
 def test_cancel_is_signed_replayable_and_rejects_partial_evidence() -> None:

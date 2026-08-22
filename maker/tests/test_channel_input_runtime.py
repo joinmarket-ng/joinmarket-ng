@@ -4,14 +4,18 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from pathlib import Path
+from typing import cast
 
 import pytest
 from jmcore.bitcoin import get_txid
 from jmcore.channel_input import (
     ChannelInputCancelPayload,
     ChannelInputKeyPair,
+    ChannelInputStatusPayload,
+    ChannelInputStatusRequestPayload,
     ChannelInputValidationError,
     Outpoint,
+    encode_channel_input_message,
     sign_payload,
 )
 from jmswap.lnd import (
@@ -41,6 +45,7 @@ from test_channel_input_negotiation import (
     _proposal_approved,
     _sign_intent,
     _signing_negotiation,
+    _status_request,
 )
 
 from maker.channel_input import (
@@ -840,6 +845,165 @@ async def _dispatch_cancel(
         current_time=1_000,
         current_height=100,
     )
+
+
+async def _dispatch_status(
+    registry: MakerChannelInputRegistry,
+    negotiation: MakerChannelInputNegotiation,
+    backend: FakeBackend,
+    request: ChannelInputStatusRequestPayload,
+) -> tuple[ChannelInputStatusPayload, ...]:
+    responses = await registry.handle_payload(
+        request,
+        coordinator_actor="coordinator",
+        local_actor="maker",
+        local_node_key=negotiation.local_node_key,
+        backend=backend,
+        candidates=(),
+        settlement_script_for=lambda candidate: "",
+        current_time=1_000,
+        current_height=100,
+    )
+    return tuple(cast(ChannelInputStatusPayload, response) for response in responses)
+
+
+@pytest.mark.asyncio
+async def test_status_dispatch_recovers_then_persists_exact_prepared_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    negotiation, proposal = _prepared_negotiation(channels=1)
+    outpoint = proposal.recipient_terms[0].funding_outpoint
+    escrow = _escrow(outpoint)
+    parent_txid = get_txid(proposal.transcript.unsigned_parent_tx)
+    attempt = LndEscrowSigningAttempt(attempt_id=b"\x01" * 32, public_nonce=b"\x02" * 66)
+    registry = _registry(tmp_path, negotiation)
+    backend = FakeBackend()
+    backend.statuses[(proposal.session_id, escrow)] = _status(
+        LndEscrowStage.PARENT_PREPARED, parent_txid=parent_txid, attempt=attempt
+    )
+    backend.attempts[escrow] = attempt
+    original_save = registry._store.save
+
+    def saving(snapshot: object) -> None:
+        backend.events.append("save")
+        original_save(snapshot)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(registry._store, "save", saving)
+    request = _status_request(proposal, outpoint)
+    response = await _dispatch_status(registry, negotiation, backend, request)
+
+    assert len(response) == 1
+    status = response[0]
+    assert status.escrow_stage == "parent_prepared"
+    assert backend.events == [
+        f"find:{outpoint.txid}:{outpoint.vout}",
+        "save",
+        f"begin:{outpoint.txid}:False",
+        "save",
+        f"find:{outpoint.txid}:{outpoint.vout}",
+        "save",
+    ]
+    restored = registry.get(proposal.session_id, proposal.attempt)
+    assert restored is not None
+    assert restored.channel_states[0].status_response == status
+    encoded = encode_channel_input_message(status)
+    assert attempt.attempt_id.hex() not in encoded
+
+
+@pytest.mark.asyncio
+async def test_status_dispatch_reflects_recovered_nonce_rotation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    negotiation, proposal = _prepared_negotiation(channels=1)
+    outpoint = proposal.recipient_terms[0].funding_outpoint
+    escrow = _escrow(outpoint)
+    parent_txid = get_txid(proposal.transcript.unsigned_parent_tx)
+    first = LndEscrowSigningAttempt(attempt_id=b"\x01" * 32, public_nonce=b"\x02" * 66)
+    replacement = LndEscrowSigningAttempt(attempt_id=b"\x03" * 32, public_nonce=b"\x04" * 66)
+    negotiation.record_prepared(outpoint, parent_txid, first)
+    registry = _registry(tmp_path, negotiation)
+    backend = FakeBackend()
+    backend.statuses[(proposal.session_id, escrow)] = _status(
+        LndEscrowStage.PARENT_PREPARED, parent_txid=parent_txid
+    )
+
+    async def begin(
+        session_id: str,
+        funding_outpoint: EscrowOutpoint,
+        *,
+        restart_attempt: bool = False,
+    ) -> LndEscrowSigningAttempt:
+        assert session_id == proposal.session_id
+        assert funding_outpoint == escrow and restart_attempt
+        backend.statuses[(proposal.session_id, escrow)] = _status(
+            LndEscrowStage.PARENT_PREPARED, parent_txid=parent_txid, attempt=replacement
+        )
+        return replacement
+
+    monkeypatch.setattr(backend, "begin_channel_input_signing", begin)
+    response = await _dispatch_status(
+        registry, negotiation, backend, _status_request(proposal, outpoint)
+    )
+
+    status = response[0]
+    assert status.prepared.public_nonce == replacement.public_nonce.hex()
+    restored = registry.get(proposal.session_id, proposal.attempt)
+    assert restored is not None
+    assert restored.channel_states[0].attempt_id == replacement.attempt_id.hex()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", [LndEscrowStage.PARENT_SIGNED, LndEscrowStage.FINALIZED])
+async def test_status_dispatch_returns_recovered_partial_and_finalized_evidence(
+    tmp_path: Path, stage: LndEscrowStage
+) -> None:
+    negotiation, proposal, local, peer, _ = _signing_negotiation()
+    outpoint = local.funding_outpoint
+    escrow = _escrow(outpoint)
+    parent_txid = get_txid(proposal.transcript.unsigned_parent_tx)
+    result = _finalized_result(proposal, 0, b"\x11" * 64)
+    if stage is LndEscrowStage.FINALIZED:
+        negotiation.record_partial(outpoint, b"\xaa" * 32)
+        negotiation.accept_finalize("coordinator", _finalize_intent(proposal, local, peer))
+    registry = _registry(tmp_path, negotiation)
+    backend = FakeBackend()
+    backend.statuses[(proposal.session_id, escrow)] = _status(
+        stage,
+        parent_txid=parent_txid,
+        local_nonce=bytes.fromhex(local.public_nonce),
+        remote_nonce=bytes.fromhex(peer.public_nonce),
+        partial=b"\xaa" * 32,
+        finalized=result if stage is LndEscrowStage.FINALIZED else None,
+    )
+
+    response = await _dispatch_status(
+        registry, negotiation, backend, _status_request(proposal, outpoint)
+    )
+
+    status = response[0]
+    assert status.partial is not None
+    assert status.escrow_stage == (
+        "finalized" if stage is LndEscrowStage.FINALIZED else "parent_signed"
+    )
+    assert (status.finalized is not None) is (stage is LndEscrowStage.FINALIZED)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [None, _status(LndEscrowStage.LOCKED)])
+async def test_status_dispatch_rejects_missing_or_locked_evidence(
+    tmp_path: Path, status: LndEscrowStatus | None
+) -> None:
+    negotiation, proposal = _prepared_negotiation(channels=1)
+    outpoint = proposal.recipient_terms[0].funding_outpoint
+    parent_txid = get_txid(proposal.transcript.unsigned_parent_tx)
+    attempt = LndEscrowSigningAttempt(attempt_id=b"\x01" * 32, public_nonce=b"\x02" * 66)
+    negotiation.record_prepared(outpoint, parent_txid, attempt)
+    registry = _registry(tmp_path, negotiation)
+    backend = FakeBackend()
+    backend.statuses[(proposal.session_id, _escrow(outpoint))] = status
+
+    with pytest.raises(MakerChannelInputRuntimeError):
+        await _dispatch_status(registry, negotiation, backend, _status_request(proposal, outpoint))
 
 
 @pytest.mark.asyncio

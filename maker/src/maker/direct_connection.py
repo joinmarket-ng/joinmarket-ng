@@ -222,6 +222,14 @@ async def _process_direct_message(
         await bot._handle_ring(
             sender_nick, full_message, source="direct", generation_id=generation_id
         )
+    elif command == "channel_input_recover":
+        await bot._handle_channel_input_recover(
+            sender_nick,
+            full_message,
+            source="direct",
+            direct_connection=connection,
+            generation_id=generation_id,
+        )
     elif command == "channel_input":
         await bot._handle_channel_input(
             sender_nick,

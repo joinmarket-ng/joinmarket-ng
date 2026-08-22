@@ -41,6 +41,7 @@ if TYPE_CHECKING:
     from jmswap.channel_ring import InitializedChannelRingBackend
     from jmwallet.history import TransactionHistoryEntry
 
+    from maker.channel_input_recovery import MakerChannelInputRecoveryTransport
     from maker.channel_input_runtime import MakerChannelInputRegistry
     from maker.direct_connection import DirectConnectionState
     from maker.generation import MakerGeneration
@@ -101,6 +102,7 @@ class MakerBotProtocol(Protocol):
     _channel_ring_store: RingParticipantStore | None
     _channel_input_backend: InitializedChannelInputBackend | None
     _channel_input_registry: MakerChannelInputRegistry | None
+    _channel_input_recovery: MakerChannelInputRecoveryTransport
 
     # -- Cross-mixin methods --
 
@@ -133,6 +135,15 @@ class MakerBotProtocol(Protocol):
     ) -> None: ...
 
     async def _handle_channel_input(
+        self,
+        taker_nick: str,
+        msg: str,
+        source: str = "unknown",
+        direct_connection: TCPConnection | None = None,
+        generation_id: int | None = None,
+    ) -> None: ...
+
+    async def _handle_channel_input_recover(
         self,
         taker_nick: str,
         msg: str,

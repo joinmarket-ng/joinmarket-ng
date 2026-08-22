@@ -135,6 +135,31 @@ def test_secret_is_private_in_record_and_not_in_store_error(tmp_path: Path) -> N
     assert raised.value.__cause__ is None
 
 
+def test_nick_identity_is_private_stable_and_accepted_by_store_scan(tmp_path: Path) -> None:
+    store = MakerChannelInputStore(tmp_path / "channel-input", max_active_sessions=1)
+
+    first = store.load_or_create_nick_secret()
+    second = store.load_or_create_nick_secret()
+    identity_path = store.directory / "participant-nick.key"
+
+    assert first == second
+    assert len(first) == 32
+    assert identity_path.read_text(encoding="ascii") == first.hex()
+    assert _mode(identity_path) == 0o600
+    assert store.load_all().safe
+
+
+@pytest.mark.parametrize("contents", (b"short", b"z" * 64))
+def test_invalid_nick_identity_fails_closed(tmp_path: Path, contents: bytes) -> None:
+    store = MakerChannelInputStore(tmp_path / "channel-input", max_active_sessions=1)
+    identity_path = store.directory / "participant-nick.key"
+    atomic_write_private(identity_path, contents)
+
+    with pytest.raises(MakerChannelInputStoreError, match="identity"):
+        store.load_or_create_nick_secret()
+    assert store.load_all().corruptions == ("participant-nick.key: invalid participant identity",)
+
+
 def test_store_tightens_directory_and_record_modes(tmp_path: Path) -> None:
     directory = tmp_path / "channel-input"
     directory.mkdir(mode=0o755)

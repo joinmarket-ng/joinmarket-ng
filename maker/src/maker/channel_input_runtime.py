@@ -18,6 +18,7 @@ from jmcore.channel_input import (
     ChannelInputPreparePayload,
     ChannelInputProposalPayload,
     ChannelInputSignPayload,
+    ChannelInputStatusRequestPayload,
     ChannelInputValidationError,
     Network,
     Outpoint,
@@ -220,6 +221,7 @@ class MakerChannelInputRegistry:
                 ChannelInputProposalPayload,
                 ChannelInputApprovalSetPayload,
                 ChannelInputPreparePayload,
+                ChannelInputStatusRequestPayload,
                 ChannelInputSignPayload,
                 ChannelInputFinalizePayload,
             ),
@@ -259,6 +261,24 @@ class MakerChannelInputRegistry:
                 self._save(negotiation)
                 await self._recover_prepared_or_later(negotiation, backend)
                 return tuple(state.prepared for state in negotiation.channel_states)
+            if isinstance(payload, ChannelInputStatusRequestPayload):
+                if negotiation.prepare is None:
+                    raise ChannelInputValidationError("channel preparation has not been accepted")
+                await self._recover_prepared_or_later(negotiation, backend)
+                status = await backend.find_channel_input_escrow_status(
+                    negotiation.invite.session_id,
+                    EscrowOutpoint(
+                        txid=payload.funding_outpoint.txid,
+                        vout=payload.funding_outpoint.vout,
+                    ),
+                )
+                if status is None or status.stage is LndEscrowStage.LOCKED:
+                    raise MakerChannelInputRuntimeError(
+                        "prepared channel has no active escrow status evidence"
+                    )
+                response = negotiation.record_status(coordinator_actor, payload, status)
+                self._save(negotiation)
+                return (response,)
             if isinstance(payload, ChannelInputSignPayload):
                 partial = negotiation.accept_sign(coordinator_actor, payload)
                 self._save(negotiation)

@@ -28,7 +28,10 @@ from jmcore.channel_input import (
     ChannelInputPreparedPayload,
     ChannelInputPreparePayload,
     ChannelInputProposalPayload,
+    ChannelInputRecoveryAcceptPayload,
     ChannelInputSignPayload,
+    ChannelInputStatusPayload,
+    ChannelInputStatusRequestPayload,
     ChannelInputValidationError,
     Network,
     Outpoint,
@@ -38,6 +41,7 @@ from jmcore.channel_input import (
     cancellation_binding_hash,
     canonical_json,
     endpoint_terms_hash,
+    payload_hash,
     sign_payload,
     transcript_hash,
     validate_cancel_ack,
@@ -51,6 +55,8 @@ from jmcore.channel_input import (
     validate_proposal_for_hellos,
     validate_recipient_approval,
     validate_sign_for_transcript,
+    validate_status_for_transcript,
+    validate_status_request_for_transcript,
 )
 from jmcore.channel_input_config import ChannelInputConfig
 from jmcore.channel_input_session import (
@@ -63,6 +69,8 @@ from jmswap.lnd import (
     EscrowOutpoint,
     FrozenChannelSnapshot,
     LndEscrowSigningAttempt,
+    LndEscrowStage,
+    LndEscrowStatus,
     LndFinalizedEscrowParent,
 )
 from pydantic import Field, field_serializer, field_validator, model_validator
@@ -176,6 +184,8 @@ class MakerChannelInputChannelState(ChannelInputModel):
     partial: ChannelInputPartialPayload | None = None
     finalize_request: ChannelInputFinalizePayload | None = None
     finalized: ChannelInputFinalizedPayload | None = None
+    status_request: ChannelInputStatusRequestPayload | None = None
+    status_response: ChannelInputStatusPayload | None = None
 
     @field_validator("parent_txid", "attempt_id")
     @classmethod
@@ -206,6 +216,19 @@ class MakerChannelInputChannelState(ChannelInputModel):
             raise ValueError("channel state finalize request requires a partial")
         if self.finalized is not None and self.finalize_request is None:
             raise ValueError("channel state finalized evidence requires a finalize request")
+        if (self.status_request is None) != (self.status_response is None):
+            raise ValueError("channel status request and response must be paired")
+        if self.status_request is not None and self.status_response is not None:
+            if (
+                self.status_request.funding_outpoint != self.funding_outpoint
+                or self.status_response.funding_outpoint != self.funding_outpoint
+                or self.status_response.query_id != self.status_request.query_id
+                or self.status_response.status_request_hash
+                != payload_hash(self.status_request).hex()
+            ):
+                raise ValueError(
+                    "channel status evidence does not bind the state outpoint or request"
+                )
         if self.restart_intended and any(
             value is not None
             for value in (
@@ -546,6 +569,20 @@ class MakerChannelInputNegotiation:
     @property
     def participant_key(self) -> str:
         return self._key_pair.public_key
+
+    def require_recovery_init(self, coordinator_actor: str, payload: ChannelInputPayload) -> None:
+        """Authenticate a recovery init against the durable coordinator binding."""
+
+        self._require_coordinator(coordinator_actor, payload)
+
+    def sign_recovery_accept(
+        self, payload: ChannelInputRecoveryAcceptPayload
+    ) -> ChannelInputRecoveryAcceptPayload:
+        """Sign a process-local recovery response with the durable participant key."""
+
+        if payload.signer_key != self.participant_key:
+            raise ChannelInputValidationError("recovery response signer differs from participant")
+        return sign_payload(payload, self._key_pair.secret_key)
 
     def snapshot(self) -> MakerChannelInputSnapshot:
         """Return state suitable for durable persistence at every protocol boundary."""
@@ -1069,6 +1106,50 @@ class MakerChannelInputNegotiation:
         self._recompute_channel_stage()
         return signed
 
+    def record_status(
+        self,
+        coordinator_actor: str,
+        request: ChannelInputStatusRequestPayload,
+        escrow_status: LndEscrowStatus,
+    ) -> ChannelInputStatusPayload:
+        """Sign durable channel evidence for one reconciled coordinator status request."""
+
+        self._require_coordinator(coordinator_actor, request)
+        self._require_prepared_negotiation()
+        assert self.proposal is not None
+        validate_status_request_for_transcript(
+            request, self.proposal.transcript, self.proposal.transcript.coordinator_key
+        )
+        state = self._require_channel_state(request.funding_outpoint)
+        stage, active = self._status_evidence_for(state, escrow_status)
+        response = ChannelInputStatusPayload(
+            session_id=request.session_id,
+            attempt=request.attempt,
+            signer_key=self.participant_key,
+            transcript_hash=request.transcript_hash,
+            funding_outpoint=request.funding_outpoint,
+            query_id=request.query_id,
+            status_request_hash=payload_hash(request).hex(),
+            escrow_stage=stage,
+            attempt_active=active,
+            prepared=state.prepared,
+            partial=state.partial,
+            finalized=state.finalized,
+        )
+        if state.status_request == request and state.status_response is not None:
+            if state.status_response.model_copy(update={"sig": "00" * 64}) == response:
+                return state.status_response
+        signed = sign_payload(response, self._key_pair.secret_key)
+        self._registry.require_verified(self.local_actor, signed)
+        validate_status_for_transcript(
+            signed, request, self.proposal.transcript, self.participant_key
+        )
+        self._replace_channel_state(
+            state.model_copy(update={"status_request": request, "status_response": signed})
+        )
+        self._recompute_channel_stage()
+        return signed
+
     def accept_cancel(
         self, coordinator_actor: str, cancel: ChannelInputCancelPayload
     ) -> ChannelInputCancelAckPayload | None:
@@ -1261,6 +1342,96 @@ class MakerChannelInputNegotiation:
         assert self.proposal is not None
         self._registry.require_verified(self.local_actor, finalized)
         validate_finalized_for_transcript(finalized, self.proposal.transcript)
+
+    def _status_evidence_for(
+        self, state: MakerChannelInputChannelState, status: LndEscrowStatus
+    ) -> tuple[Literal["parent_prepared", "parent_signed", "finalized"], bool]:
+        """Map exact reconciled LND evidence to the public status representation."""
+
+        try:
+            status = LndEscrowStatus.model_validate(status.model_dump(mode="python"))
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ChannelInputValidationError("LND escrow status is invalid") from exc
+        if status.stage is LndEscrowStage.LOCKED:
+            raise ChannelInputValidationError("locked escrow has no prepared status evidence")
+        _require_parent_txid(status.parent_txid or "", self._parent_txid())
+        if status.parent_txid != state.parent_txid:
+            raise ChannelInputValidationError(
+                "backend parent transaction differs from durable state"
+            )
+        if status.stage is LndEscrowStage.PARENT_PREPARED:
+            if any(value is not None for value in (state.partial, state.finalized)):
+                raise ChannelInputValidationError(
+                    "backend escrow stage precedes durable signing evidence"
+                )
+            if status.active_attempt is None or not _attempt_matches_state(
+                status.active_attempt, state
+            ):
+                raise ChannelInputValidationError(
+                    "backend signing attempt differs from durable state"
+                )
+            return "parent_prepared", True
+        if status.stage is LndEscrowStage.PARENT_SIGNED:
+            self._require_status_signed_state(state, status)
+            if state.finalized is not None:
+                raise ChannelInputValidationError(
+                    "backend escrow stage precedes durable final evidence"
+                )
+            return "parent_signed", status.active_attempt is not None
+        if status.stage is LndEscrowStage.FINALIZED:
+            self._require_status_signed_state(state, status)
+            if state.finalized is None or status.finalized_parent is None:
+                raise ChannelInputValidationError(
+                    "finalized escrow lacks durable finalization evidence"
+                )
+            self._require_status_finalized_parent(state, status.finalized_parent)
+            return "finalized", False
+        raise ChannelInputValidationError("unknown escrow status stage")
+
+    def _require_status_signed_state(
+        self, state: MakerChannelInputChannelState, status: LndEscrowStatus
+    ) -> None:
+        if state.sign_request is None or state.partial is None:
+            raise ChannelInputValidationError("signed escrow lacks durable signing evidence")
+        if status.active_attempt is not None and not _attempt_matches_state(
+            status.active_attempt, state
+        ):
+            raise ChannelInputValidationError("backend signing attempt differs from durable state")
+        if (
+            status.durable_local_public_nonce != bytes.fromhex(state.prepared.public_nonce)
+            or status.durable_remote_public_nonce
+            != bytes.fromhex(state.sign_request.peer_prepared.public_nonce)
+            or status.durable_local_partial_signature
+            != bytes.fromhex(state.partial.partial_signature)
+        ):
+            raise ChannelInputValidationError("backend signing evidence differs from durable state")
+
+    def _require_status_finalized_parent(
+        self, state: MakerChannelInputChannelState, result: LndFinalizedEscrowParent
+    ) -> None:
+        assert self.proposal is not None and state.finalized is not None
+        result = _validated_finalized_parent(result)
+        descriptor = _descriptor_for_local_outpoint(self.proposal, state.funding_outpoint)
+        if (
+            result.tx_hex != state.finalized.channel_signed_parent_tx
+            or result.txid != state.finalized.txid
+            or result.channel_input_index != descriptor.input_index
+        ):
+            raise ChannelInputValidationError(
+                "backend finalized parent differs from durable evidence"
+            )
+        try:
+            transaction = parse_transaction_bytes(bytes.fromhex(result.tx_hex))
+        except (ValueError, IndexError) as exc:
+            raise ChannelInputValidationError("backend finalized parent is invalid") from exc
+        if (
+            len(transaction.witnesses) <= result.channel_input_index
+            or tuple(transaction.witnesses[result.channel_input_index])
+            != result.channel_input_witness
+        ):
+            raise ChannelInputValidationError(
+                "backend finalized parent witness differs from result"
+            )
 
     def _recompute_channel_stage(self) -> None:
         expected_count = len(self._expected_local_outpoints())
@@ -1494,6 +1665,15 @@ class MakerChannelInputNegotiation:
                 )
             if state.finalized is not None:
                 self._validate_local_finalized(state.finalized)
+            if state.status_request is not None and state.status_response is not None:
+                self._require_coordinator(self.coordinator_actor, state.status_request)
+                self._registry.require_verified(self.local_actor, state.status_response)
+                validate_status_for_transcript(
+                    state.status_response,
+                    state.status_request,
+                    self.proposal.transcript,
+                    self.participant_key,
+                )
         original_stage = self.stage
         self._recompute_channel_stage()
         if original_stage in {
@@ -1534,6 +1714,15 @@ def _validated_finalized_parent(result: LndFinalizedEscrowParent) -> LndFinalize
         return LndFinalizedEscrowParent.model_validate(result.model_dump(mode="python"))
     except ValueError as exc:
         raise ChannelInputValidationError("LND finalized parent is invalid") from exc
+
+
+def _attempt_matches_state(
+    attempt: LndEscrowSigningAttempt, state: MakerChannelInputChannelState
+) -> bool:
+    return (
+        attempt.attempt_id.hex() == state.attempt_id
+        and attempt.public_nonce.hex() == state.prepared.public_nonce
+    )
 
 
 def _descriptor_for_local_outpoint(

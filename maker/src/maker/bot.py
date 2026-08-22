@@ -48,6 +48,7 @@ from jmwallet.wallet.service import WalletService
 from loguru import logger
 
 from maker.background_tasks import BackgroundTasksMixin
+from maker.channel_input_recovery import MakerChannelInputRecoveryTransport
 from maker.channel_input_runtime import MakerChannelInputRegistry
 from maker.channel_input_store import MakerChannelInputStore
 from maker.config import MakerConfig
@@ -126,8 +127,17 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         self._minimum_fee_policy_lock = asyncio.Lock()
         self._minimum_fee_policy_warning_emitted = False
 
-        # Create nick identity for signing messages
-        self.nick_identity = NickIdentity(JM_VERSION)
+        self._channel_input_store: MakerChannelInputStore | None = None
+        if isinstance(config.channel_input, ChannelInputConfig) and config.channel_input.enabled:
+            data_directory = config.data_dir or get_default_data_dir()
+            self._channel_input_store = MakerChannelInputStore(
+                config.channel_input.persistence_path(data_directory),
+                max_active_sessions=config.channel_input.max_active_sessions,
+            )
+            nick_secret = self._channel_input_store.load_or_create_nick_secret()
+            self.nick_identity = NickIdentity(JM_VERSION, private_key_bytes=nick_secret)
+        else:
+            self.nick_identity = NickIdentity(JM_VERSION)
         self.nick = self.nick_identity.nick
 
         # A Taproot (tr0) maker signs BIP341 sighashes that commit to every
@@ -147,14 +157,8 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         self.directory_clients: dict[str, DirectoryClient] = {}
         self.channel_input_capability_validated = False
         self._channel_input_backend: InitializedChannelInputBackend | None = None
-        self._channel_input_store: MakerChannelInputStore | None = None
         self._channel_input_registry: MakerChannelInputRegistry | None = None
-        if isinstance(config.channel_input, ChannelInputConfig) and config.channel_input.enabled:
-            data_directory = config.data_dir or get_default_data_dir()
-            self._channel_input_store = MakerChannelInputStore(
-                config.channel_input.persistence_path(data_directory),
-                max_active_sessions=config.channel_input.max_active_sessions,
-            )
+        self._channel_input_recovery = MakerChannelInputRecoveryTransport()
         # Shared connection plumbing (parsing, SOCKS isolation creds,
         # DirectoryClient construction, retry loop). The pool stores its
         # connected clients in self.directory_clients via the shared-dict

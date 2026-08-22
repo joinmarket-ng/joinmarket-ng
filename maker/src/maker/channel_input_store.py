@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
 import stat
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,6 +24,7 @@ MAX_ACTIVE_SESSIONS = 10_000
 MAX_RECORD_BYTES = 4 * 1024 * 1024
 
 _RECORD_NAME = re.compile(r"^([0-9a-f]{64})-([0-9]+)-([0-9a-f]{64})\.json$")
+_IDENTITY_NAME = "participant-nick.key"
 
 
 class MakerChannelInputStoreError(Exception):
@@ -105,6 +107,29 @@ class MakerChannelInputStore:
             except Exception as exc:
                 raise MakerChannelInputStoreError(
                     "could not durably save channel-input snapshot"
+                ) from exc
+
+    def load_or_create_nick_secret(self) -> bytes:
+        """Return the durable outer nick key required for restart recovery."""
+
+        with self._lock:
+            try:
+                self._ensure_directory()
+                path = self.directory / _IDENTITY_NAME
+                if path.exists() or path.is_symlink():
+                    return _read_nick_secret(path)
+                secret = secrets.token_bytes(32)
+                from coincurve import PrivateKey
+
+                PrivateKey(secret)
+                atomic_write_private(path, secret.hex().encode("ascii"))
+                _fsync_private_directory(self.directory)
+                return secret
+            except MakerChannelInputStoreError:
+                raise
+            except Exception as exc:
+                raise MakerChannelInputStoreError(
+                    "could not load or create channel-input participant identity"
                 ) from exc
 
     def load(self, session_id: str, attempt: int) -> MakerChannelInputSnapshot | None:
@@ -211,7 +236,14 @@ class MakerChannelInputStore:
                 "could not enumerate channel-input snapshots"
             ) from exc
 
-        for path in paths:
+        identity_path = self.directory / _IDENTITY_NAME
+        if identity_path.exists() or identity_path.is_symlink():
+            try:
+                _read_nick_secret(identity_path)
+            except MakerChannelInputStoreError:
+                corruptions.append(f"{_IDENTITY_NAME}: invalid participant identity")
+
+        for path in (path for path in paths if path.name != _IDENTITY_NAME):
             if _is_atomic_temp_artifact(path.name):
                 try:
                     if stat.S_ISREG(path.lstat().st_mode):
@@ -370,6 +402,25 @@ def _validate_participant_key(participant_key: str) -> str:
             "participant key must be 32-byte lowercase hexadecimal"
         ) from exc
     return participant_key
+
+
+def _read_nick_secret(path: Path) -> bytes:
+    try:
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_size != 64:
+            raise MakerChannelInputStoreError("participant identity file is unsafe")
+        encoded = read_private_file(path)
+        if len(encoded) != 64 or encoded.lower() != encoded:
+            raise MakerChannelInputStoreError("participant identity is invalid")
+        secret = bytes.fromhex(encoded.decode("ascii"))
+        from coincurve import PrivateKey
+
+        PrivateKey(secret)
+        return secret
+    except MakerChannelInputStoreError:
+        raise
+    except Exception as exc:
+        raise MakerChannelInputStoreError("participant identity is invalid") from exc
 
 
 def _is_atomic_temp_artifact(name: str) -> bool:
