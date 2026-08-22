@@ -26,6 +26,7 @@ from jmswap.lnd import (
 )
 from test_channel_input_negotiation import (
     _approval_set,
+    _cancel,
     _candidate,
     _finalize_intent,
     _finalized_result,
@@ -36,6 +37,7 @@ from test_channel_input_negotiation import (
     _prepare,
     _prepared_negotiation,
     _proposal,
+    _proposal_approved,
     _sign_intent,
     _signing_negotiation,
 )
@@ -63,6 +65,13 @@ class FakeBackend:
     ) -> LndEscrowStatus | None:
         self.events.append(f"find:{funding_outpoint.txid}:{funding_outpoint.vout}")
         return self.statuses.get((session_id, funding_outpoint))
+
+    async def cancel_channel_input_escrow(
+        self, session_id: str, funding_outpoint: EscrowOutpoint
+    ) -> bool:
+        self.events.append(f"cancel:{funding_outpoint.txid}:{funding_outpoint.vout}")
+        self.statuses[(session_id, funding_outpoint)] = None
+        return True
 
     async def freeze_channel_input(self, session_id: str, channel_id: str) -> FrozenChannelSnapshot:
         self.events.append(f"freeze:{channel_id}")
@@ -739,7 +748,7 @@ async def test_live_dispatch_rejects_unknown_and_unsupported_payloads(tmp_path: 
         transcript_hash="00" * 32,
         reason_code="unsupported",
     )
-    with pytest.raises(ChannelInputValidationError, match="unsupported"):
+    with pytest.raises(MakerChannelInputRuntimeError, match="unknown"):
         await registry.handle_payload(
             cancel,
             coordinator_actor="coordinator",
@@ -816,3 +825,205 @@ async def test_live_invite_excludes_frozen_outpoints_and_enforces_capacity(tmp_p
             current_time=1_000,
             current_height=100,
         )
+
+
+async def _dispatch_cancel(
+    registry: MakerChannelInputRegistry,
+    negotiation: MakerChannelInputNegotiation,
+    backend: FakeBackend,
+    cancel: ChannelInputCancelPayload | None = None,
+) -> tuple[object, ...]:
+    assert negotiation.proposal is not None
+    return await registry.handle_payload(
+        cancel if cancel is not None else _cancel(negotiation.proposal),
+        coordinator_actor="coordinator",
+        local_actor="maker",
+        local_node_key=negotiation.local_node_key,
+        backend=backend,
+        candidates=(),
+        settlement_script_for=lambda candidate: "",
+        current_time=1_000,
+        current_height=100,
+    )
+
+
+@pytest.mark.asyncio
+async def test_cancel_preflights_saves_and_replays_signed_ack(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    negotiation, proposal = _prepared_negotiation(channels=2)
+    registry = _registry(tmp_path, negotiation)
+    backend = FakeBackend()
+    for terms in proposal.recipient_terms:
+        backend.statuses[(proposal.session_id, _escrow(terms.funding_outpoint))] = _status(
+            LndEscrowStage.LOCKED
+        )
+    original_save = registry._store.save
+
+    def saving(snapshot: object) -> None:
+        backend.events.append("save")
+        original_save(snapshot)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(registry._store, "save", saving)
+    cancel = _cancel(proposal)
+    response = await _dispatch_cancel(registry, negotiation, backend, cancel)
+
+    assert len(response) == 1
+    assert (
+        registry.get(proposal.session_id, proposal.attempt).stage is MakerChannelInputStage.CANCELED
+    )  # type: ignore[union-attr]
+    first_cancel = next(
+        index for index, event in enumerate(backend.events) if event.startswith("cancel:")
+    )
+    assert backend.events[:first_cancel].count("save") == 2
+    assert all(
+        event.startswith("find:") or event == "save" for event in backend.events[:first_cancel]
+    )
+    cancel_count = sum(event.startswith("cancel:") for event in backend.events)
+    assert await _dispatch_cancel(registry, negotiation, backend, cancel) == response
+    assert sum(event.startswith("cancel:") for event in backend.events) == cancel_count
+
+
+@pytest.mark.asyncio
+async def test_cancel_rejects_signed_status_before_intent_or_backend_cancel(tmp_path: Path) -> None:
+    negotiation, proposal = _prepared_negotiation(channels=1)
+    registry = _registry(tmp_path, negotiation)
+    backend = FakeBackend()
+    outpoint = proposal.recipient_terms[0].funding_outpoint
+    backend.statuses[(proposal.session_id, _escrow(outpoint))] = _status(
+        LndEscrowStage.PARENT_SIGNED,
+        parent_txid=get_txid(proposal.transcript.unsigned_parent_tx),
+        local_nonce=b"\x01" * 66,
+        remote_nonce=b"\x02" * 66,
+        partial=b"\x03" * 32,
+    )
+
+    with pytest.raises(MakerChannelInputRuntimeError, match="signed"):
+        await _dispatch_cancel(registry, negotiation, backend)
+    restored = registry.get(proposal.session_id, proposal.attempt)
+    assert restored is not None and restored.cancel is None
+    assert not any(event.startswith("cancel:") for event in backend.events)
+
+
+@pytest.mark.asyncio
+async def test_canceled_attempt_rejects_durable_sign_replay_before_backend_call(
+    tmp_path: Path,
+) -> None:
+    negotiation, proposal, _, _, sign = _signing_negotiation()
+    registry = _registry(tmp_path, negotiation)
+    backend = FakeBackend()
+    outpoint = proposal.recipient_terms[0].funding_outpoint
+    backend.statuses[(proposal.session_id, _escrow(outpoint))] = _status(
+        LndEscrowStage.PARENT_PREPARED,
+        parent_txid=get_txid(proposal.transcript.unsigned_parent_tx),
+    )
+    await _dispatch_cancel(registry, negotiation, backend)
+    backend.events.clear()
+
+    with pytest.raises(MakerChannelInputRuntimeError, match="terminal"):
+        await registry.handle_payload(
+            sign,
+            coordinator_actor="coordinator",
+            local_actor="maker",
+            local_node_key=negotiation.local_node_key,
+            backend=backend,
+            candidates=(),
+            settlement_script_for=lambda candidate: "",
+            current_time=1_000,
+            current_height=100,
+        )
+
+    assert backend.events == []
+
+
+@pytest.mark.asyncio
+async def test_startup_resumes_cancel_intent_after_one_escrow_already_resumed(
+    tmp_path: Path,
+) -> None:
+    negotiation, proposal = _prepared_negotiation(channels=2)
+    assert negotiation.accept_cancel("coordinator", _cancel(proposal)) is None
+    store = _store(tmp_path, negotiation)
+    registry = MakerChannelInputRegistry.load(
+        store=store, config=negotiation.config, network=negotiation.network
+    )
+    backend = FakeBackend()
+    first, second = proposal.recipient_terms
+    backend.statuses[(proposal.session_id, _escrow(first.funding_outpoint))] = None
+    backend.statuses[(proposal.session_id, _escrow(second.funding_outpoint))] = _status(
+        LndEscrowStage.PARENT_PREPARED,
+        parent_txid=get_txid(proposal.transcript.unsigned_parent_tx),
+    )
+
+    await registry.reconcile_all(backend, negotiation.local_node_key)
+
+    restored = registry.get(proposal.session_id, proposal.attempt)
+    assert restored is not None and restored.stage is MakerChannelInputStage.CANCELED
+    assert (
+        backend.events.count(
+            f"cancel:{second.funding_outpoint.txid}:{second.funding_outpoint.vout}"
+        )
+        == 1
+    )
+    assert not any(
+        event.startswith(f"cancel:{first.funding_outpoint.txid}") for event in backend.events
+    )
+
+
+def test_expired_canceled_tombstone_is_pruned_and_releases_capacity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    negotiation, proposal, _ = _proposal_approved()
+    assert negotiation.accept_cancel("coordinator", _cancel(proposal)) is None
+    negotiation.record_canceled(
+        tuple(
+            sorted(
+                (term.funding_outpoint for term in proposal.recipient_terms),
+                key=lambda item: item.key(),
+            )
+        )
+    )
+    store = _store(tmp_path, negotiation)
+    monkeypatch.setattr("maker.channel_input_runtime.time.time", lambda: 2_000)
+
+    registry = MakerChannelInputRegistry.load(
+        store=store, config=negotiation.config, network=negotiation.network
+    )
+
+    assert registry.session_count == 0
+    assert store.load_all().records == ()
+
+
+@pytest.mark.asyncio
+async def test_unexpired_tombstone_releases_candidate_and_active_capacity(tmp_path: Path) -> None:
+    negotiation, proposal = _prepared_negotiation(channels=1)
+    store = MakerChannelInputStore(tmp_path / "channel-input", max_active_sessions=1)
+    store.save(negotiation.snapshot())
+    registry = MakerChannelInputRegistry.load(
+        store=store, config=negotiation.config, network=negotiation.network
+    )
+    backend = FakeBackend()
+    outpoint = proposal.recipient_terms[0].funding_outpoint
+    backend.statuses[(proposal.session_id, _escrow(outpoint))] = _status(LndEscrowStage.LOCKED)
+    await _dispatch_cancel(registry, negotiation, backend)
+    assert registry.session_count == 0
+
+    next_invite = sign_payload(
+        negotiation.invite.model_copy(update={"attempt": negotiation.invite.attempt + 1}),
+        (1).to_bytes(32, "big"),
+    )
+    frozen = negotiation.frozen_inputs[0]
+    backend.frozen[frozen.snapshot.channel_id] = frozen.snapshot
+    response = await registry.handle_payload(
+        next_invite,
+        coordinator_actor="coordinator",
+        local_actor="maker",
+        local_node_key=negotiation.local_node_key,
+        backend=backend,
+        candidates=(_candidate(frozen),),
+        settlement_script_for=lambda candidate: frozen.settlement_script_pubkey,
+        current_time=1_000,
+        current_height=100,
+    )
+
+    assert len(response) == 1
+    assert registry.session_count == 1

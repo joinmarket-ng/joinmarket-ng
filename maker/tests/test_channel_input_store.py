@@ -11,6 +11,7 @@ from coincurve import PrivateKey
 from jmcore.channel_input import ChannelInputInvitePayload, ChannelInputKeyPair, sign_payload
 from jmcore.channel_input_config import ChannelInputConfig
 from jmcore.secure_files import atomic_write_private
+from test_channel_input_negotiation import _cancel, _proposal_approved
 
 import maker.channel_input_store as channel_input_store
 from maker.channel_input import MakerChannelInputNegotiation, MakerChannelInputSnapshot
@@ -305,3 +306,46 @@ def test_invalid_snapshot_never_calls_atomic_write(
         store.save(invalid)
 
     assert not write_called
+
+
+def test_delete_requires_exact_durable_snapshot_and_fsyncs(tmp_path: Path) -> None:
+    store = MakerChannelInputStore(tmp_path / "channel-input", max_active_sessions=1)
+    snapshot = _snapshot()
+    store.save(snapshot)
+
+    with pytest.raises(MakerChannelInputStoreError, match="differs"):
+        store.delete(_snapshot(session_id="22" * 32))
+    assert store.load(snapshot.invite.session_id, snapshot.invite.attempt) == snapshot
+
+    store.delete(snapshot)
+    assert store.load(snapshot.invite.session_id, snapshot.invite.attempt) is None
+
+
+def test_delete_refuses_corrupt_store_without_unlinking_target(tmp_path: Path) -> None:
+    store = MakerChannelInputStore(tmp_path / "channel-input", max_active_sessions=1)
+    snapshot = _snapshot()
+    store.save(snapshot)
+    (store.directory / "corrupt.json").write_text("bad", encoding="ascii")
+
+    with pytest.raises(MakerChannelInputStoreError, match="corrupt"):
+        store.delete(snapshot)
+    assert _record_path(store.directory, snapshot).exists()
+
+
+def test_canceled_snapshot_does_not_consume_active_session_capacity(tmp_path: Path) -> None:
+    negotiation, proposal, _ = _proposal_approved()
+    assert negotiation.accept_cancel("coordinator", _cancel(proposal)) is None
+    negotiation.record_canceled(
+        tuple(
+            sorted(
+                (term.funding_outpoint for term in proposal.recipient_terms),
+                key=lambda item: item.key(),
+            )
+        )
+    )
+    store = MakerChannelInputStore(tmp_path / "channel-input", max_active_sessions=1)
+
+    store.save(negotiation.snapshot())
+    store.save(_snapshot(session_id="22" * 32))
+
+    assert len(store.load_all().records) == 2

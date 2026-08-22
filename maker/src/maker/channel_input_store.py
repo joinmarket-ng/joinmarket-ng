@@ -13,7 +13,11 @@ from threading import RLock
 from jmcore.channel_input import MAX_ATTEMPT
 from jmcore.secure_files import atomic_write_private, ensure_private_directory, read_private_file
 
-from maker.channel_input import MakerChannelInputNegotiation, MakerChannelInputSnapshot
+from maker.channel_input import (
+    MakerChannelInputNegotiation,
+    MakerChannelInputSnapshot,
+    MakerChannelInputStage,
+)
 
 MAX_ACTIVE_SESSIONS = 10_000
 MAX_RECORD_BYTES = 4 * 1024 * 1024
@@ -91,6 +95,7 @@ class MakerChannelInputStore:
                     session_id=validated.invite.session_id,
                     attempt=validated.invite.attempt,
                     participant_key=participant_key,
+                    stage=validated.stage,
                 )
                 atomic_write_private(self.directory / filename, payload)
                 _fsync_private_directory(self.directory)
@@ -139,6 +144,52 @@ class MakerChannelInputStore:
             except Exception as exc:
                 raise MakerChannelInputStoreError(
                     "could not enumerate channel-input snapshots"
+                ) from exc
+
+    def delete(self, snapshot: MakerChannelInputSnapshot) -> None:
+        """Durably remove exactly one validated private snapshot record."""
+
+        try:
+            validated, participant_key = _validate_snapshot(snapshot)
+            filename = _record_filename(
+                validated.invite.session_id,
+                validated.invite.attempt,
+                participant_key,
+            )
+        except Exception as exc:
+            if isinstance(exc, MakerChannelInputStoreError):
+                raise
+            raise MakerChannelInputStoreError("channel-input snapshot is invalid") from None
+        with self._lock:
+            try:
+                self._ensure_directory()
+                report = self._load_all_unlocked()
+                if report.corruptions:
+                    raise MakerChannelInputStoreError(
+                        "cannot delete channel-input snapshot while corrupt records exist"
+                    )
+                matches = [
+                    record
+                    for record in report.records
+                    if _session_attempt(record) == _session_attempt(validated)
+                ]
+                if len(matches) != 1 or matches[0] != validated:
+                    raise MakerChannelInputStoreError(
+                        "channel-input snapshot differs from durable record"
+                    )
+                path = self.directory / filename
+                if self._load_path(path) != validated:
+                    raise MakerChannelInputStoreError(
+                        "channel-input snapshot filename differs from durable record"
+                    )
+                path.unlink()
+                _fsync_private_directory(self.directory)
+                self._ensure_directory()
+            except MakerChannelInputStoreError:
+                raise
+            except Exception as exc:
+                raise MakerChannelInputStoreError(
+                    "could not durably delete channel-input snapshot"
                 ) from exc
 
     def _ensure_directory(self) -> None:
@@ -219,6 +270,7 @@ class MakerChannelInputStore:
         session_id: str,
         attempt: int,
         participant_key: str,
+        stage: MakerChannelInputStage,
     ) -> None:
         exact_exists = False
         for record in records:
@@ -230,8 +282,19 @@ class MakerChannelInputStore:
                     "channel-input session attempt belongs to another participant"
                 )
             exact_exists = True
-        if not exact_exists and len(records) >= self.max_active_sessions:
-            raise MakerChannelInputStoreLimitError("maximum active channel-input sessions reached")
+        if not exact_exists:
+            if len(records) >= MAX_ACTIVE_SESSIONS:
+                raise MakerChannelInputStoreLimitError("maximum channel-input records reached")
+            active_records = sum(
+                record.stage is not MakerChannelInputStage.CANCELED for record in records
+            )
+            if (
+                stage is not MakerChannelInputStage.CANCELED
+                and active_records >= self.max_active_sessions
+            ):
+                raise MakerChannelInputStoreLimitError(
+                    "maximum active channel-input sessions reached"
+                )
 
 
 def _validate_snapshot(

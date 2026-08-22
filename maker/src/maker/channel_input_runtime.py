@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Callable, Sequence
 from typing import Protocol
 
@@ -10,6 +11,7 @@ from jmcore.bitcoin import get_txid
 from jmcore.channel_input import (
     MAX_CHANNELS,
     ChannelInputApprovalSetPayload,
+    ChannelInputCancelPayload,
     ChannelInputFinalizePayload,
     ChannelInputInvitePayload,
     ChannelInputPayload,
@@ -52,6 +54,10 @@ class MakerChannelInputBackend(Protocol):
     async def find_channel_input_escrow_status(
         self, session_id: str, funding_outpoint: EscrowOutpoint
     ) -> LndEscrowStatus | None: ...
+
+    async def cancel_channel_input_escrow(
+        self, session_id: str, funding_outpoint: EscrowOutpoint
+    ) -> bool: ...
 
     async def freeze_channel_input(
         self, session_id: str, channel_id: str
@@ -132,7 +138,10 @@ class MakerChannelInputRegistry:
     def session_count(self) -> int:
         """Return the number of active restored session attempts."""
 
-        return len(self._negotiations)
+        return sum(
+            negotiation.stage is not MakerChannelInputStage.CANCELED
+            for negotiation in self._negotiations.values()
+        )
 
     @property
     def recovery_outpoints(self) -> tuple[EscrowOutpoint, ...]:
@@ -141,6 +150,7 @@ class MakerChannelInputRegistry:
         outpoints = [
             intent.funding_outpoint
             for negotiation in self._negotiations.values()
+            if negotiation.stage is not MakerChannelInputStage.CANCELED
             for intent in negotiation.freeze_intents
         ]
         return tuple(sorted(outpoints, key=lambda outpoint: (outpoint.txid, outpoint.vout)))
@@ -195,6 +205,14 @@ class MakerChannelInputRegistry:
                 candidates=candidates,
                 settlement_script_for=settlement_script_for,
             )
+        if isinstance(payload, ChannelInputCancelPayload):
+            return await self._handle_cancel(
+                payload,
+                coordinator_actor=coordinator_actor,
+                local_actor=local_actor,
+                local_node_key=local_node_key,
+                backend=backend,
+            )
         if not isinstance(
             payload,
             (
@@ -215,6 +233,13 @@ class MakerChannelInputRegistry:
             raise MakerChannelInputRuntimeError("unknown channel-input session attempt") from exc
         async with lock:
             self._require_local_identity(negotiation, local_actor, local_node_key)
+            if negotiation.stage in {
+                MakerChannelInputStage.CANCEL_INTENDED,
+                MakerChannelInputStage.CANCELED,
+            }:
+                raise MakerChannelInputRuntimeError(
+                    "channel-input cancellation is terminal for non-cancel payloads"
+                )
             if isinstance(payload, ChannelInputProposalPayload):
                 approval = negotiation.accept_proposal(
                     coordinator_actor,
@@ -270,6 +295,40 @@ class MakerChannelInputRegistry:
                 finalized = state.finalized
             return (finalized,)
 
+    async def _handle_cancel(
+        self,
+        cancel: ChannelInputCancelPayload,
+        *,
+        coordinator_actor: str,
+        local_actor: str,
+        local_node_key: str,
+        backend: MakerChannelInputBackend,
+    ) -> tuple[ChannelInputPayload, ...]:
+        """Serialize admission with a cancellation before touching escrow state."""
+
+        key = (cancel.session_id, cancel.attempt)
+        async with self._admission_lock:
+            try:
+                negotiation = self._negotiations[key]
+                lock = self._locks[key]
+            except KeyError as exc:
+                raise MakerChannelInputRuntimeError(
+                    "unknown channel-input session attempt"
+                ) from exc
+            async with lock:
+                self._require_local_identity(negotiation, local_actor, local_node_key)
+                if negotiation.stage is MakerChannelInputStage.CANCELED:
+                    ack = negotiation.accept_cancel(coordinator_actor, cancel)
+                    assert ack is not None
+                    return (ack,)
+                negotiation.validate_cancel(coordinator_actor, cancel)
+                await self._preflight_cancellation(negotiation, backend)
+                accepted = negotiation.accept_cancel(coordinator_actor, cancel)
+                if accepted is not None:
+                    return (accepted,)
+                self._save(negotiation)
+                return (await self._resume_cancellation(negotiation, backend),)
+
     async def _handle_invite(
         self,
         invite: ChannelInputInvitePayload,
@@ -293,6 +352,10 @@ class MakerChannelInputRegistry:
                     local_node_key=local_node_key,
                 )
                 async with self._locks[key]:
+                    if negotiation.stage is MakerChannelInputStage.CANCELED:
+                        raise MakerChannelInputRuntimeError(
+                            "canceled channel-input invitation is terminal"
+                        )
                     if negotiation.stage is MakerChannelInputStage.FREEZE_INTENDED:
                         await self._recover_freezes(negotiation, backend)
                     elif negotiation.stage is MakerChannelInputStage.INVITED:
@@ -306,6 +369,7 @@ class MakerChannelInputRegistry:
             unavailable = {
                 (intent.funding_outpoint.txid, intent.funding_outpoint.vout)
                 for existing in self._negotiations.values()
+                if existing.stage is not MakerChannelInputStage.CANCELED
                 for intent in existing.freeze_intents
             }
             selected = tuple(
@@ -387,6 +451,16 @@ class MakerChannelInputRegistry:
         if report.corruptions:
             raise MakerChannelInputRuntimeError("channel-input recovery state is corrupt")
         for snapshot in report.records:
+            if snapshot.stage is MakerChannelInputStage.CANCELED and snapshot.invite.expiry <= int(
+                time.time()
+            ):
+                try:
+                    self._store.delete(snapshot)
+                except MakerChannelInputStoreError as exc:
+                    raise MakerChannelInputRuntimeError(
+                        "could not prune expired channel-input tombstone"
+                    ) from exc
+                continue
             key = (snapshot.invite.session_id, snapshot.invite.attempt)
             if key in self._negotiations:
                 raise MakerChannelInputRuntimeError("duplicate channel-input session attempt")
@@ -404,6 +478,10 @@ class MakerChannelInputRegistry:
                 raise MakerChannelInputRuntimeError(
                     "channel-input recovery state is invalid"
                 ) from exc
+            if negotiation.stage is MakerChannelInputStage.CANCELED:
+                self._negotiations[key] = negotiation
+                self._locks[key] = asyncio.Lock()
+                continue
             for intent in negotiation.freeze_intents:
                 outpoint = (intent.funding_outpoint.txid, intent.funding_outpoint.vout)
                 if outpoint in freeze_outpoints:
@@ -418,6 +496,11 @@ class MakerChannelInputRegistry:
         self, negotiation: MakerChannelInputNegotiation, backend: MakerChannelInputBackend
     ) -> None:
         stage = negotiation.stage
+        if stage is MakerChannelInputStage.CANCELED:
+            return
+        if stage is MakerChannelInputStage.CANCEL_INTENDED:
+            await self._resume_cancellation(negotiation, backend)
+            return
         if stage is MakerChannelInputStage.INVITED:
             return
         if stage is MakerChannelInputStage.FREEZE_INTENDED:
@@ -461,6 +544,75 @@ class MakerChannelInputRegistry:
                 "recovered frozen channel data conflicts with intent"
             ) from exc
         self._save(negotiation)
+
+    async def _resume_cancellation(
+        self,
+        negotiation: MakerChannelInputNegotiation,
+        backend: MakerChannelInputBackend,
+    ) -> ChannelInputPayload:
+        """Query every escrow before resuming any of them after a durable intent."""
+
+        if negotiation.stage is MakerChannelInputStage.CANCELED:
+            assert negotiation.cancel_ack is not None
+            return negotiation.cancel_ack
+        if negotiation.stage is not MakerChannelInputStage.CANCEL_INTENDED:
+            raise MakerChannelInputRuntimeError("cancellation recovery lacks durable intent")
+        statuses = await self._preflight_cancellation(negotiation, backend)
+        for outpoint, escrow_outpoint, status in statuses:
+            if status is None:
+                continue
+            self._save(negotiation)
+            resumed = await backend.cancel_channel_input_escrow(
+                negotiation.invite.session_id, escrow_outpoint
+            )
+            if not resumed:
+                raise MakerChannelInputRuntimeError(
+                    "backend did not resume canceled channel escrow"
+                )
+        try:
+            ack = negotiation.record_canceled(tuple(outpoint for outpoint, _, _ in statuses))
+        except (ChannelInputValidationError, TypeError, ValueError) as exc:
+            raise MakerChannelInputRuntimeError(
+                "cancellation recovery conflicts with durable state"
+            ) from exc
+        self._save(negotiation)
+        return ack
+
+    async def _preflight_cancellation(
+        self, negotiation: MakerChannelInputNegotiation, backend: MakerChannelInputBackend
+    ) -> list[tuple[Outpoint, EscrowOutpoint, LndEscrowStatus | None]]:
+        """Reject every partial or terminal escrow before any cancel mutation."""
+
+        if any(
+            state.partial is not None
+            or state.finalize_request is not None
+            or state.finalized is not None
+            for state in negotiation.channel_states
+        ):
+            raise MakerChannelInputRuntimeError(
+                "cancellation conflicts with durable partial evidence"
+            )
+        if negotiation.proposal is None:
+            raise MakerChannelInputRuntimeError("cancellation requires an accepted proposal")
+        statuses: list[tuple[Outpoint, EscrowOutpoint, LndEscrowStatus | None]] = []
+        for terms in sorted(
+            negotiation.proposal.recipient_terms,
+            key=lambda terms: terms.funding_outpoint.key(),
+        ):
+            outpoint = terms.funding_outpoint
+            escrow_outpoint = EscrowOutpoint(txid=outpoint.txid, vout=outpoint.vout)
+            status = await backend.find_channel_input_escrow_status(
+                negotiation.invite.session_id, escrow_outpoint
+            )
+            if status is not None and status.stage not in {
+                LndEscrowStage.LOCKED,
+                LndEscrowStage.PARENT_PREPARED,
+            }:
+                raise MakerChannelInputRuntimeError(
+                    "cancellation conflicts with signed or finalized escrow evidence"
+                )
+            statuses.append((outpoint, escrow_outpoint, status))
+        return statuses
 
     async def _require_locked_frozen_inputs(
         self, negotiation: MakerChannelInputNegotiation, backend: MakerChannelInputBackend

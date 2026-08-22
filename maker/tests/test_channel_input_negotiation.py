@@ -19,6 +19,7 @@ from jmcore.channel_input import (
     ChannelInputApprovalPayload,
     ChannelInputApprovalSetAckPayload,
     ChannelInputApprovalSetPayload,
+    ChannelInputCancelPayload,
     ChannelInputFinalizePayload,
     ChannelInputInvitePayload,
     ChannelInputKeyPair,
@@ -384,6 +385,25 @@ def _prepare(
     )
 
 
+def _cancel(
+    proposal: ChannelInputProposalPayload, *, reason_code: str = "coordinator_abort"
+) -> ChannelInputCancelPayload:
+    coordinator = ChannelInputKeyPair.from_secret(COORDINATOR_SECRET)
+    return cast(
+        ChannelInputCancelPayload,
+        sign_payload(
+            ChannelInputCancelPayload(
+                session_id=proposal.session_id,
+                attempt=proposal.attempt,
+                signer_key=coordinator.public_key,
+                transcript_hash=proposal.transcript_hash,
+                reason_code=reason_code,
+            ),
+            COORDINATOR_SECRET,
+        ),
+    )
+
+
 def _proposal_approved() -> tuple[
     MakerChannelInputNegotiation,
     ChannelInputProposalPayload,
@@ -593,6 +613,33 @@ def test_channel_state_chain_is_durable_and_replays_exact_payloads() -> None:
     restored = MakerChannelInputNegotiation.from_snapshot(snapshot)
     assert restored.snapshot() == snapshot
     assert restored.channel_states[0].finalized is not None
+
+
+def test_cancel_is_signed_replayable_and_rejects_partial_evidence() -> None:
+    negotiation, proposal, _ = _proposal_approved()
+    cancel = _cancel(proposal)
+
+    assert negotiation.accept_cancel("coordinator", cancel) is None
+    assert negotiation.stage is MakerChannelInputStage.CANCEL_INTENDED
+    ack = negotiation.record_canceled(
+        tuple(
+            sorted(
+                (term.funding_outpoint for term in proposal.recipient_terms),
+                key=lambda item: item.key(),
+            )
+        )
+    )
+    assert negotiation.stage is MakerChannelInputStage.CANCELED
+    assert negotiation.accept_cancel("coordinator", cancel) == ack
+    restored = MakerChannelInputNegotiation.from_snapshot(negotiation.snapshot())
+    assert restored.accept_cancel("coordinator", cancel) == ack
+    with pytest.raises(ChannelInputValidationError, match="conflicts"):
+        restored.accept_cancel("coordinator", _cancel(proposal, reason_code="replacement"))
+
+    signing, signing_proposal, local, _, _ = _signing_negotiation()
+    signing.record_partial(local.funding_outpoint, b"\xaa" * 32)
+    with pytest.raises(ChannelInputValidationError, match="partial"):
+        signing.accept_cancel("coordinator", _cancel(signing_proposal))
 
 
 def test_prepared_rotation_requires_durable_intent_and_tampering_fails_closed() -> None:

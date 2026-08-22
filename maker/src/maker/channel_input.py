@@ -15,6 +15,8 @@ from jmcore.channel_input import (
     ChannelInputApprovalPayload,
     ChannelInputApprovalSetAckPayload,
     ChannelInputApprovalSetPayload,
+    ChannelInputCancelAckPayload,
+    ChannelInputCancelPayload,
     ChannelInputFinalizedPayload,
     ChannelInputFinalizePayload,
     ChannelInputHelloPayload,
@@ -32,10 +34,12 @@ from jmcore.channel_input import (
     Outpoint,
     PolicyCeilings,
     approval_set_hash,
+    cancel_payload_hash,
     canonical_json,
     endpoint_terms_hash,
     sign_payload,
     transcript_hash,
+    validate_cancel_ack,
     validate_complete_approval_set,
     validate_finalize_for_transcript,
     validate_finalized_for_transcript,
@@ -76,6 +80,8 @@ class MakerChannelInputStage(StrEnum):
     SIGNING = "signing"
     FINALIZING = "finalizing"
     FINALIZED = "finalized"
+    CANCEL_INTENDED = "cancel_intended"
+    CANCELED = "canceled"
 
 
 class MakerFrozenChannelInput(ChannelInputModel):
@@ -234,6 +240,8 @@ class MakerChannelInputSnapshot(ChannelInputModel):
     local_ack: ChannelInputApprovalSetAckPayload | None = None
     prepare: ChannelInputPreparePayload | None = None
     channel_states: tuple[MakerChannelInputChannelState, ...] = ()
+    cancel: ChannelInputCancelPayload | None = None
+    cancel_ack: ChannelInputCancelAckPayload | None = None
     actor_registry_snapshot: tuple[tuple[str, str], ...]
     replay_ledger_snapshot: tuple[tuple[str, str], ...]
 
@@ -263,6 +271,10 @@ class MakerChannelInputSnapshot(ChannelInputModel):
             or len(self.hellos) > MAX_CHANNELS
         ):
             raise ValueError("channel input snapshot exceeds channel limit")
+        cancellation_stage = self.stage in {
+            MakerChannelInputStage.CANCEL_INTENDED,
+            MakerChannelInputStage.CANCELED,
+        }
         stage_rank = {
             MakerChannelInputStage.INVITED: 0,
             MakerChannelInputStage.FREEZE_INTENDED: 1,
@@ -275,7 +287,34 @@ class MakerChannelInputSnapshot(ChannelInputModel):
             MakerChannelInputStage.FINALIZING: 8,
             MakerChannelInputStage.FINALIZED: 9,
         }
-        rank = stage_rank[self.stage]
+        rank = stage_rank.get(self.stage, -1)
+        if cancellation_stage:
+            if self.proposal is None or self.local_approval is None or self.accepted_height is None:
+                raise ValueError("canceled snapshot requires an accepted proposal")
+            if self.cancel is None:
+                raise ValueError("canceled snapshot requires a cancellation payload")
+            if (self.stage is MakerChannelInputStage.CANCELED) != (self.cancel_ack is not None):
+                raise ValueError("canceled snapshot ACK does not match stage")
+            if self.approval_set is None and (
+                self.local_ack is not None or self.prepare is not None
+            ):
+                raise ValueError("canceled snapshot approval evidence is inconsistent")
+            if self.approval_set is not None and self.local_ack is None:
+                raise ValueError("canceled snapshot approval ACK is missing")
+            if self.prepare is not None and self.approval_set is None:
+                raise ValueError("canceled snapshot prepare lacks approval evidence")
+            if any(
+                state.partial is not None
+                or state.finalize_request is not None
+                or state.finalized is not None
+                for state in self.channel_states
+            ):
+                raise ValueError("canceled snapshot contains partial or final evidence")
+        else:
+            if self.cancel is not None or self.cancel_ack is not None:
+                raise ValueError("non-canceled snapshot contains cancellation evidence")
+            if rank < 0:
+                raise ValueError("snapshot stage is not supported")
         if self.stage is MakerChannelInputStage.INVITED:
             if self.freeze_intents or self.frozen_inputs or self.hellos:
                 raise ValueError("invited snapshot contains freeze or hello evidence")
@@ -289,21 +328,37 @@ class MakerChannelInputSnapshot(ChannelInputModel):
             or len(self.frozen_inputs) != len(self.hellos)
         ):
             raise ValueError("snapshot intents, frozen inputs, and hellos do not match stage")
-        if rank >= 3 and (self.proposal is None or self.local_approval is None):
+        if (
+            not cancellation_stage
+            and rank >= 3
+            and (self.proposal is None or self.local_approval is None)
+        ):
             raise ValueError("snapshot proposal and approval do not match stage")
-        if rank < 3 and (self.proposal is not None or self.local_approval is not None):
+        if (
+            not cancellation_stage
+            and rank < 3
+            and (self.proposal is not None or self.local_approval is not None)
+        ):
             raise ValueError("snapshot proposal and approval do not match stage")
-        if (rank >= 3) != (self.accepted_height is not None):
+        if not cancellation_stage and (rank >= 3) != (self.accepted_height is not None):
             raise ValueError("snapshot accepted height does not match stage")
-        if rank >= 4 and (self.approval_set is None or self.local_ack is None):
+        if (
+            not cancellation_stage
+            and rank >= 4
+            and (self.approval_set is None or self.local_ack is None)
+        ):
             raise ValueError("snapshot approval set and ACK do not match stage")
-        if rank < 4 and (self.approval_set is not None or self.local_ack is not None):
+        if (
+            not cancellation_stage
+            and rank < 4
+            and (self.approval_set is not None or self.local_ack is not None)
+        ):
             raise ValueError("snapshot approval set and ACK do not match stage")
-        if rank >= 5 and self.prepare is None:
+        if not cancellation_stage and rank >= 5 and self.prepare is None:
             raise ValueError("snapshot prepare does not match stage")
-        if rank < 5 and self.prepare is not None:
+        if not cancellation_stage and rank < 5 and self.prepare is not None:
             raise ValueError("snapshot prepare does not match stage")
-        if rank < 5 and self.channel_states:
+        if not cancellation_stage and rank < 5 and self.channel_states:
             raise ValueError("snapshot channel states precede prepare")
         ordered_states = tuple(
             sorted(
@@ -316,7 +371,9 @@ class MakerChannelInputSnapshot(ChannelInputModel):
             {_outpoint_sort_key(state.funding_outpoint) for state in self.channel_states}
         ) != len(self.channel_states):
             raise ValueError("snapshot channel states must have unique funding outpoints")
-        if rank == 5:
+        if cancellation_stage:
+            pass
+        elif rank == 5:
             if self.proposal is not None and len(self.channel_states) >= len(
                 self.proposal.recipient_terms
             ):
@@ -388,6 +445,8 @@ class MakerChannelInputNegotiation:
         local_ack: ChannelInputApprovalSetAckPayload | None = None,
         prepare: ChannelInputPreparePayload | None = None,
         channel_states: tuple[MakerChannelInputChannelState, ...] = (),
+        cancel: ChannelInputCancelPayload | None = None,
+        cancel_ack: ChannelInputCancelAckPayload | None = None,
     ) -> None:
         self.config = config
         self.network = network
@@ -409,6 +468,8 @@ class MakerChannelInputNegotiation:
         self.local_ack = local_ack
         self.prepare = prepare
         self.channel_states = channel_states
+        self.cancel = cancel
+        self.cancel_ack = cancel_ack
 
     @classmethod
     def from_invite(
@@ -485,6 +546,8 @@ class MakerChannelInputNegotiation:
             local_ack=self.local_ack,
             prepare=self.prepare,
             channel_states=self.channel_states,
+            cancel=self.cancel,
+            cancel_ack=self.cancel_ack,
             actor_registry_snapshot=self._registry.snapshot(),
             replay_ledger_snapshot=self._ledger.snapshot(),
         )
@@ -525,6 +588,8 @@ class MakerChannelInputNegotiation:
             local_ack=snapshot.local_ack,
             prepare=snapshot.prepare,
             channel_states=snapshot.channel_states,
+            cancel=snapshot.cancel,
+            cancel_ack=snapshot.cancel_ack,
         )
         negotiation._validate_restored_state()
         return negotiation
@@ -981,6 +1046,97 @@ class MakerChannelInputNegotiation:
         self._recompute_channel_stage()
         return signed
 
+    def accept_cancel(
+        self, coordinator_actor: str, cancel: ChannelInputCancelPayload
+    ) -> ChannelInputCancelAckPayload | None:
+        """Persist an authenticated pre-partial cancellation intent."""
+
+        self.validate_cancel(coordinator_actor, cancel)
+        if self.cancel is not None:
+            return self.cancel_ack
+        _record_new(self._ledger, _slot("cancel"), cancel)
+        self.cancel = cancel
+        self.stage = MakerChannelInputStage.CANCEL_INTENDED
+        return None
+
+    def validate_cancel(self, coordinator_actor: str, cancel: ChannelInputCancelPayload) -> None:
+        """Authenticate a cancellation without changing durable negotiation state."""
+
+        self._require_coordinator(coordinator_actor, cancel)
+        if self.cancel is not None:
+            if cancel != self.cancel:
+                raise ChannelInputValidationError(
+                    "cancel conflicts with durable cancellation intent"
+                )
+            return
+        if self.stage not in {
+            MakerChannelInputStage.PROPOSAL_APPROVED,
+            MakerChannelInputStage.APPROVAL_SET_ACKED,
+            MakerChannelInputStage.PREPARED,
+            MakerChannelInputStage.NONCES_READY,
+            MakerChannelInputStage.SIGNING,
+        }:
+            raise ChannelInputValidationError("cancel is not valid at this negotiation stage")
+        assert self.proposal is not None
+        if (
+            cancel.session_id != self.proposal.session_id
+            or cancel.attempt != self.proposal.attempt
+            or cancel.transcript_hash != self.proposal.transcript_hash
+        ):
+            raise ChannelInputValidationError("cancel does not bind the accepted proposal")
+        if self._has_partial_or_final_evidence():
+            raise ChannelInputValidationError(
+                "cancel conflicts with durable partial or final evidence"
+            )
+
+    def record_canceled(
+        self, resumed_outpoints: Sequence[Outpoint]
+    ) -> ChannelInputCancelAckPayload:
+        """Sign the terminal cancellation ACK after every local escrow resumed."""
+
+        if self.cancel is None:
+            raise ChannelInputValidationError(
+                "cancellation ACK requires a durable cancellation intent"
+            )
+        expected_outpoints = tuple(
+            sorted(self._expected_local_outpoints(), key=lambda outpoint: outpoint.key())
+        )
+        try:
+            resumed = tuple(resumed_outpoints)
+        except TypeError as exc:
+            raise ChannelInputValidationError("resumed outpoints must be a sequence") from exc
+        if resumed != expected_outpoints:
+            raise ChannelInputValidationError("resumed outpoints differ from local proposal terms")
+        if self.cancel_ack is not None:
+            return self.cancel_ack
+        if self.stage is not MakerChannelInputStage.CANCEL_INTENDED:
+            raise ChannelInputValidationError(
+                "cancellation ACK is not valid at this negotiation stage"
+            )
+        assert self.proposal is not None
+        ack = ChannelInputCancelAckPayload(
+            session_id=self.cancel.session_id,
+            attempt=self.cancel.attempt,
+            signer_key=self.participant_key,
+            transcript_hash=self.proposal.transcript_hash,
+            cancel_hash=cancel_payload_hash(self.cancel).hex(),
+            resumed_outpoints=expected_outpoints,
+        )
+        signed = sign_payload(ack, self._key_pair.secret_key)
+        validate_cancel_ack(self.cancel, signed, self.participant_key, expected_outpoints)
+        _record_new(self._ledger, _slot("cancel_ack"), signed)
+        self.cancel_ack = signed
+        self.stage = MakerChannelInputStage.CANCELED
+        return signed
+
+    def _has_partial_or_final_evidence(self) -> bool:
+        return any(
+            state.partial is not None
+            or state.finalize_request is not None
+            or state.finalized is not None
+            for state in self.channel_states
+        )
+
     def _require_prepared_negotiation(self) -> None:
         if self.prepare is None or self.stage not in (
             MakerChannelInputStage.PREPARED,
@@ -1208,6 +1364,30 @@ class MakerChannelInputNegotiation:
             expected_entries.append((_slot("prepare"), self.prepare))
         if self.prepare is not None:
             self._validate_restored_channel_states()
+        elif self.channel_states:
+            raise ChannelInputValidationError("restored channel states require accepted prepare")
+        if self.cancel is not None:
+            assert self.proposal is not None
+            self._require_coordinator(self.coordinator_actor, self.cancel)
+            if (
+                self.cancel.session_id != self.proposal.session_id
+                or self.cancel.attempt != self.proposal.attempt
+                or self.cancel.transcript_hash != self.proposal.transcript_hash
+            ):
+                raise ChannelInputValidationError("restored cancel differs from accepted proposal")
+            if self._has_partial_or_final_evidence():
+                raise ChannelInputValidationError(
+                    "restored cancellation conflicts with partial or final evidence"
+                )
+            expected_entries.append((_slot("cancel"), self.cancel))
+            if self.cancel_ack is not None:
+                validate_cancel_ack(
+                    self.cancel,
+                    self.cancel_ack,
+                    self.participant_key,
+                    tuple(sorted(self._expected_local_outpoints(), key=lambda item: item.key())),
+                )
+                expected_entries.append((_slot("cancel_ack"), self.cancel_ack))
         expected_ledger = tuple(
             sorted((slot, _payload_digest(payload)) for slot, payload in expected_entries)
         )
@@ -1278,7 +1458,12 @@ class MakerChannelInputNegotiation:
                 self._validate_local_finalized(state.finalized)
         original_stage = self.stage
         self._recompute_channel_stage()
-        if self.stage is not original_stage:
+        if original_stage in {
+            MakerChannelInputStage.CANCEL_INTENDED,
+            MakerChannelInputStage.CANCELED,
+        }:
+            self.stage = original_stage
+        elif self.stage is not original_stage:
             raise ChannelInputValidationError("restored channel state shape differs from stage")
 
 
