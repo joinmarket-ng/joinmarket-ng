@@ -159,6 +159,42 @@ async def test_initialize_validates_policy_and_probes_deterministic_candidate(
     assert not fake.closed
 
 
+async def test_initialize_uses_configured_recovery_outpoint_without_candidates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeBackend(())
+    monkeypatch.setattr(LndBackend, "from_paths", lambda *args, **kwargs: fake)
+
+    initialized = await initialize_channel_input_backend(
+        config(tmp_path),
+        network="regtest",
+        offer_type="tr0absoffer",
+        recovery_outpoints=(FIRST_OUTPOINT,),
+    )
+
+    assert initialized.candidates == ()
+    assert fake.probe_call == (FIRST_OUTPOINT, 12.0)
+    assert not fake.closed
+
+
+async def test_initialize_rejects_recovery_outpoint_outside_allowlist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        LndBackend,
+        "from_paths",
+        lambda *args, **kwargs: pytest.fail("backend must not be built"),
+    )
+
+    with pytest.raises(ValueError, match="configured channel points"):
+        await initialize_channel_input_backend(
+            config(tmp_path),
+            network="regtest",
+            offer_type="tr0absoffer",
+            recovery_outpoints=(SECOND_OUTPOINT,),
+        )
+
+
 @pytest.mark.parametrize(
     "fake",
     [

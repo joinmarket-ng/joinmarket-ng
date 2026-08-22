@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 from jmcore.channel_input_config import ChannelInputConfig
 
 from jmswap.lnd import (
     ChannelInputCandidate,
+    EscrowOutpoint,
     LndBackend,
     LndCapabilityError,
     LndNodeInfo,
@@ -28,6 +30,7 @@ async def initialize_channel_input_backend(
     *,
     network: str,
     offer_type: str,
+    recovery_outpoints: Sequence[EscrowOutpoint] = (),
 ) -> InitializedChannelInputBackend:
     """Create and fully validate LND before channel-input v1 can be advertised."""
     if not config.enabled:
@@ -53,6 +56,18 @@ async def initialize_channel_input_backend(
         for channel_point in config.allowed_channel_points
     )
     allowed_set = frozenset(allowed_outpoints)
+    if isinstance(recovery_outpoints, (str, bytes)) or not isinstance(recovery_outpoints, Sequence):
+        raise ValueError("recovery_outpoints must be a sequence of funding outpoints")
+    if any(not isinstance(outpoint, EscrowOutpoint) for outpoint in recovery_outpoints):
+        raise ValueError("recovery outpoint must be an EscrowOutpoint")
+    normalized_recovery_outpoints = tuple(
+        sorted(
+            set(recovery_outpoints),
+            key=lambda outpoint: (outpoint.txid, outpoint.vout),
+        )
+    )
+    if any(outpoint not in allowed_set for outpoint in normalized_recovery_outpoints):
+        raise ValueError("recovery outpoints must be configured channel points")
     backend = LndBackend.from_paths(
         config.lnd_grpc_url.removeprefix("https://"),
         tls_cert_path,
@@ -85,10 +100,13 @@ async def initialize_channel_input_backend(
                 ),
             )
         )
-        if not eligible:
+        if not eligible and not normalized_recovery_outpoints:
             raise LndCapabilityError("no configured channel input candidate meets capacity policy")
+        probe_outpoint = (
+            eligible[0].funding_outpoint if eligible else normalized_recovery_outpoints[0]
+        )
         await backend.probe_channel_input_escrow(
-            eligible[0].funding_outpoint,
+            probe_outpoint,
             timeout_seconds=config.phase_timeout_seconds,
         )
     except Exception:
