@@ -7,8 +7,15 @@ from pathlib import Path
 
 import pytest
 from jmcore.bitcoin import get_txid
-from jmcore.channel_input import Outpoint
+from jmcore.channel_input import (
+    ChannelInputCancelPayload,
+    ChannelInputKeyPair,
+    ChannelInputValidationError,
+    Outpoint,
+    sign_payload,
+)
 from jmswap.lnd import (
+    ChannelInputCandidate,
     EscrowOutpoint,
     FrozenChannelSnapshot,
     LndEscrowSigningAttempt,
@@ -18,16 +25,26 @@ from jmswap.lnd import (
     WitnessUtxo,
 )
 from test_channel_input_negotiation import (
+    _approval_set,
+    _candidate,
     _finalize_intent,
     _finalized_result,
     _negotiation,
     _node,
+    _peer_prepared,
     _plan_freeze,
+    _prepare,
     _prepared_negotiation,
+    _proposal,
+    _sign_intent,
     _signing_negotiation,
 )
 
-from maker.channel_input import MakerChannelInputNegotiation, MakerChannelInputStage
+from maker.channel_input import (
+    MakerChannelInputNegotiation,
+    MakerChannelInputStage,
+    MakerFrozenChannelInput,
+)
 from maker.channel_input_runtime import MakerChannelInputRegistry, MakerChannelInputRuntimeError
 from maker.channel_input_store import MakerChannelInputStore
 
@@ -37,6 +54,7 @@ class FakeBackend:
         self.statuses: dict[tuple[str, EscrowOutpoint], LndEscrowStatus | None] = {}
         self.frozen: dict[str, FrozenChannelSnapshot] = {}
         self.attempts: dict[EscrowOutpoint, LndEscrowSigningAttempt] = {}
+        self.partials: dict[EscrowOutpoint, bytes] = {}
         self.finalized: dict[EscrowOutpoint, LndFinalizedEscrowParent] = {}
         self.events: list[str] = []
 
@@ -80,6 +98,30 @@ class FakeBackend:
     ) -> LndFinalizedEscrowParent:
         self.events.append(f"recover:{funding_outpoint.txid}")
         assert len(remote_partial_signature) == 32
+        return self.finalized[funding_outpoint]
+
+    async def sign_channel_input_parent(
+        self,
+        session_id: str,
+        funding_outpoint: EscrowOutpoint,
+        attempt: LndEscrowSigningAttempt,
+        remote_public_nonce: bytes,
+    ) -> bytes:
+        self.events.append(f"sign:{funding_outpoint.txid}:{attempt.attempt_id.hex()}")
+        assert len(remote_public_nonce) == 66
+        assert self.attempts[funding_outpoint] == attempt
+        return self.partials[funding_outpoint]
+
+    async def finalize_channel_input_parent(
+        self,
+        session_id: str,
+        funding_outpoint: EscrowOutpoint,
+        attempt: LndEscrowSigningAttempt,
+        remote_partial_signature: bytes,
+    ) -> LndFinalizedEscrowParent:
+        self.events.append(f"finalize:{funding_outpoint.txid}:{attempt.attempt_id.hex()}")
+        assert len(remote_partial_signature) == 32
+        assert self.attempts[funding_outpoint] == attempt
         return self.finalized[funding_outpoint]
 
 
@@ -447,3 +489,330 @@ async def test_node_mismatch_stops_all_backend_calls(tmp_path: Path) -> None:
     with pytest.raises(MakerChannelInputRuntimeError, match="another local node"):
         await registry.reconcile_all(backend, _node(99))
     assert backend.events == []
+
+
+def _empty_registry(
+    tmp_path: Path, negotiation: MakerChannelInputNegotiation
+) -> MakerChannelInputRegistry:
+    return MakerChannelInputRegistry.load(
+        store=MakerChannelInputStore(tmp_path / "channel-input", max_active_sessions=10),
+        config=negotiation.config,
+        network=negotiation.network,
+    )
+
+
+async def _invite(
+    registry: MakerChannelInputRegistry,
+    backend: FakeBackend,
+    negotiation: MakerChannelInputNegotiation,
+    frozen: tuple[MakerFrozenChannelInput, ...],
+    allocations: list[str],
+) -> tuple[object, ...]:
+    for item in frozen:
+        backend.frozen[item.snapshot.channel_id] = item.snapshot
+
+    def allocate(candidate: ChannelInputCandidate) -> str:
+        allocations.append(candidate.funding_outpoint.txid)
+        return "5120" + candidate.funding_outpoint.txid
+
+    return await registry.handle_payload(
+        negotiation.invite,
+        coordinator_actor="coordinator",
+        local_actor="maker",
+        local_node_key=negotiation.local_node_key,
+        backend=backend,
+        candidates=tuple(_candidate(item, channel_id=index) for index, item in enumerate(frozen)),
+        settlement_script_for=allocate,
+        current_time=1_000,
+        current_height=100,
+    )
+
+
+@pytest.mark.asyncio
+async def test_live_invite_persists_before_freeze_and_replays_without_allocating(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    negotiation, frozen = _negotiation(channels=2)
+    registry = _empty_registry(tmp_path, negotiation)
+    backend = FakeBackend()
+    allocations: list[str] = []
+    original_save = registry._store.save
+
+    def saving(snapshot: object) -> None:
+        backend.events.append("save")
+        original_save(snapshot)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(registry._store, "save", saving)
+    hellos = await _invite(registry, backend, negotiation, frozen, allocations)
+
+    assert len(hellos) == 2
+    assert allocations == [item.snapshot.funding_outpoint.txid for item in frozen]
+    assert backend.events == [
+        "save",
+        *(
+            event
+            for item in frozen
+            for event in (
+                f"find:{item.snapshot.funding_outpoint.txid}:{item.snapshot.funding_outpoint.vout}",
+            )
+        ),
+        "save",
+        f"freeze:{frozen[0].snapshot.channel_id}",
+        "save",
+        f"freeze:{frozen[1].snapshot.channel_id}",
+        "save",
+    ]
+
+    replay = await _invite(registry, backend, negotiation, frozen, allocations)
+    assert replay == hellos
+    assert len(allocations) == 2
+    with pytest.raises(ChannelInputValidationError, match="different actor"):
+        await registry.handle_payload(
+            negotiation.invite,
+            coordinator_actor="other-coordinator",
+            local_actor="maker",
+            local_node_key=negotiation.local_node_key,
+            backend=backend,
+            candidates=(),
+            settlement_script_for=lambda candidate: pytest.fail(
+                "settlement allocation must not run"
+            ),
+            current_time=1_000,
+            current_height=100,
+        )
+
+
+@pytest.mark.asyncio
+async def test_live_dispatch_persists_backend_boundaries_and_replays_responses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original, frozen = _negotiation(channels=1)
+    registry = _empty_registry(tmp_path, original)
+    backend = FakeBackend()
+    allocations: list[str] = []
+    await _invite(registry, backend, original, frozen, allocations)
+    negotiation = registry.get(original.invite.session_id, original.invite.attempt)
+    assert negotiation is not None
+    proposal, _ = _proposal(negotiation)
+    approval = await registry.handle_payload(
+        proposal,
+        coordinator_actor="coordinator",
+        local_actor="maker",
+        local_node_key=negotiation.local_node_key,
+        backend=backend,
+        candidates=(),
+        settlement_script_for=lambda candidate: "",
+        current_time=1_000,
+        current_height=100,
+    )
+    approval_set = _approval_set(proposal, approval[0])
+    ack = await registry.handle_payload(
+        approval_set,
+        coordinator_actor="coordinator",
+        local_actor="maker",
+        local_node_key=negotiation.local_node_key,
+        backend=backend,
+        candidates=(),
+        settlement_script_for=lambda candidate: "",
+        current_time=1_000,
+        current_height=100,
+    )
+    prepare = _prepare(approval_set, ack[0])
+    outpoint = proposal.recipient_terms[0].funding_outpoint
+    escrow = _escrow(outpoint)
+    attempt = LndEscrowSigningAttempt(attempt_id=b"\x01" * 32, public_nonce=b"\x02" * 66)
+    backend.statuses[(proposal.session_id, escrow)] = _status(LndEscrowStage.LOCKED)
+    backend.attempts[escrow] = attempt
+    prepared = await registry.handle_payload(
+        prepare,
+        coordinator_actor="coordinator",
+        local_actor="maker",
+        local_node_key=negotiation.local_node_key,
+        backend=backend,
+        candidates=(),
+        settlement_script_for=lambda candidate: "",
+        current_time=1_000,
+        current_height=100,
+    )
+    local = prepared[0]
+    backend.statuses[(proposal.session_id, escrow)] = _status(
+        LndEscrowStage.PARENT_PREPARED,
+        parent_txid=get_txid(proposal.transcript.unsigned_parent_tx),
+        attempt=attempt,
+    )
+    assert (
+        await registry.handle_payload(
+            prepare,
+            coordinator_actor="coordinator",
+            local_actor="maker",
+            local_node_key=negotiation.local_node_key,
+            backend=backend,
+            candidates=(),
+            settlement_script_for=lambda candidate: "",
+            current_time=1_000,
+            current_height=100,
+        )
+        == prepared
+    )
+    peer = _peer_prepared(proposal, local, b"\x03" * 66)
+    sign = _sign_intent(proposal, local, peer)
+    backend.partials[escrow] = b"\xaa" * 32
+    original_save = registry._store.save
+
+    def saving(snapshot: object) -> None:
+        backend.events.append("save")
+        original_save(snapshot)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(registry._store, "save", saving)
+    partial = await registry.handle_payload(
+        sign,
+        coordinator_actor="coordinator",
+        local_actor="maker",
+        local_node_key=negotiation.local_node_key,
+        backend=backend,
+        candidates=(),
+        settlement_script_for=lambda candidate: "",
+        current_time=1_000,
+        current_height=100,
+    )
+    assert backend.events[-2:] == [
+        f"sign:{outpoint.txid}:{attempt.attempt_id.hex()}",
+        "save",
+    ]
+    assert (
+        await registry.handle_payload(
+            sign,
+            coordinator_actor="coordinator",
+            local_actor="maker",
+            local_node_key=negotiation.local_node_key,
+            backend=backend,
+            candidates=(),
+            settlement_script_for=lambda candidate: "",
+            current_time=1_000,
+            current_height=100,
+        )
+        == partial
+    )
+
+    finalize = _finalize_intent(proposal, local, peer)
+    backend.finalized[escrow] = _finalized_result(proposal, 0, b"\x11" * 64)
+    finalized = await registry.handle_payload(
+        finalize,
+        coordinator_actor="coordinator",
+        local_actor="maker",
+        local_node_key=negotiation.local_node_key,
+        backend=backend,
+        candidates=(),
+        settlement_script_for=lambda candidate: "",
+        current_time=1_000,
+        current_height=100,
+    )
+    assert backend.events[-2:] == [
+        f"finalize:{outpoint.txid}:{attempt.attempt_id.hex()}",
+        "save",
+    ]
+    assert (
+        await registry.handle_payload(
+            finalize,
+            coordinator_actor="coordinator",
+            local_actor="maker",
+            local_node_key=negotiation.local_node_key,
+            backend=backend,
+            candidates=(),
+            settlement_script_for=lambda candidate: "",
+            current_time=1_000,
+            current_height=100,
+        )
+        == finalized
+    )
+
+
+@pytest.mark.asyncio
+async def test_live_dispatch_rejects_unknown_and_unsupported_payloads(tmp_path: Path) -> None:
+    negotiation, _ = _negotiation(channels=1)
+    registry = _empty_registry(tmp_path, negotiation)
+    backend = FakeBackend()
+    cancel = ChannelInputCancelPayload(
+        session_id=negotiation.invite.session_id,
+        attempt=negotiation.invite.attempt,
+        signer_key=ChannelInputKeyPair.from_secret((1).to_bytes(32, "big")).public_key,
+        transcript_hash="00" * 32,
+        reason_code="unsupported",
+    )
+    with pytest.raises(ChannelInputValidationError, match="unsupported"):
+        await registry.handle_payload(
+            cancel,
+            coordinator_actor="coordinator",
+            local_actor="maker",
+            local_node_key=negotiation.local_node_key,
+            backend=backend,
+            candidates=(),
+            settlement_script_for=lambda candidate: "",
+            current_time=1_000,
+            current_height=100,
+        )
+    prepared_negotiation, _ = _prepared_negotiation(channels=1)
+    assert prepared_negotiation.proposal is not None
+    unknown = prepared_negotiation.proposal.model_copy(update={"attempt": 2})
+    with pytest.raises(MakerChannelInputRuntimeError, match="unknown"):
+        await registry.handle_payload(
+            unknown,
+            coordinator_actor="coordinator",
+            local_actor="maker",
+            local_node_key=negotiation.local_node_key,
+            backend=backend,
+            candidates=(),
+            settlement_script_for=lambda candidate: "",
+            current_time=1_000,
+            current_height=100,
+        )
+
+
+@pytest.mark.asyncio
+async def test_live_invite_excludes_frozen_outpoints_and_enforces_capacity(tmp_path: Path) -> None:
+    negotiation, frozen = _negotiation(channels=1)
+    registry = _empty_registry(tmp_path, negotiation)
+    backend = FakeBackend()
+    allocations: list[str] = []
+    await _invite(registry, backend, negotiation, frozen, allocations)
+    next_invite = sign_payload(
+        negotiation.invite.model_copy(update={"attempt": negotiation.invite.attempt + 1}),
+        (1).to_bytes(32, "big"),
+    )
+
+    with pytest.raises(MakerChannelInputRuntimeError, match="no channel-input candidates"):
+        await registry.handle_payload(
+            next_invite,
+            coordinator_actor="coordinator",
+            local_actor="maker",
+            local_node_key=negotiation.local_node_key,
+            backend=backend,
+            candidates=(_candidate(frozen[0]),),
+            settlement_script_for=lambda candidate: pytest.fail(
+                "settlement allocation must not run"
+            ),
+            current_time=1_000,
+            current_height=100,
+        )
+
+    limited = MakerChannelInputRegistry.load(
+        store=MakerChannelInputStore(tmp_path / "limited", max_active_sessions=1),
+        config=negotiation.config,
+        network=negotiation.network,
+    )
+    limited_backend = FakeBackend()
+    await _invite(limited, limited_backend, negotiation, frozen, [])
+    with pytest.raises(MakerChannelInputRuntimeError, match="maximum active"):
+        await limited.handle_payload(
+            next_invite,
+            coordinator_actor="coordinator",
+            local_actor="maker",
+            local_node_key=negotiation.local_node_key,
+            backend=limited_backend,
+            candidates=(),
+            settlement_script_for=lambda candidate: pytest.fail(
+                "settlement allocation must not run"
+            ),
+            current_time=1_000,
+            current_height=100,
+        )

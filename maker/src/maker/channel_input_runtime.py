@@ -3,13 +3,27 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Protocol
 
 from jmcore.bitcoin import get_txid
-from jmcore.channel_input import ChannelInputValidationError, Network, Outpoint
+from jmcore.channel_input import (
+    MAX_CHANNELS,
+    ChannelInputApprovalSetPayload,
+    ChannelInputFinalizePayload,
+    ChannelInputInvitePayload,
+    ChannelInputPayload,
+    ChannelInputPayloadType,
+    ChannelInputPreparePayload,
+    ChannelInputProposalPayload,
+    ChannelInputSignPayload,
+    ChannelInputValidationError,
+    Network,
+    Outpoint,
+)
 from jmcore.channel_input_config import ChannelInputConfig
 from jmswap.lnd import (
+    ChannelInputCandidate,
     EscrowOutpoint,
     FrozenChannelSnapshot,
     LndEscrowSigningAttempt,
@@ -67,6 +81,22 @@ class MakerChannelInputBackend(Protocol):
         remote_partial_signature: bytes,
     ) -> LndFinalizedEscrowParent: ...
 
+    async def sign_channel_input_parent(
+        self,
+        session_id: str,
+        funding_outpoint: EscrowOutpoint,
+        attempt: LndEscrowSigningAttempt,
+        remote_public_nonce: bytes,
+    ) -> bytes: ...
+
+    async def finalize_channel_input_parent(
+        self,
+        session_id: str,
+        funding_outpoint: EscrowOutpoint,
+        attempt: LndEscrowSigningAttempt,
+        remote_partial_signature: bytes,
+    ) -> LndFinalizedEscrowParent: ...
+
 
 class MakerChannelInputRegistry:
     """Own restored negotiations and serialize their startup recovery."""
@@ -83,6 +113,7 @@ class MakerChannelInputRegistry:
         self._network = network
         self._negotiations: dict[tuple[str, int], MakerChannelInputNegotiation] = {}
         self._locks: dict[tuple[str, int], asyncio.Lock] = {}
+        self._admission_lock = asyncio.Lock()
         self._load()
 
     @classmethod
@@ -138,6 +169,212 @@ class MakerChannelInputRegistry:
         for key in sorted(self._negotiations):
             async with self._locks[key]:
                 await self._reconcile_one(self._negotiations[key], backend)
+
+    async def handle_payload(
+        self,
+        payload: ChannelInputPayloadType,
+        *,
+        coordinator_actor: str,
+        local_actor: str,
+        local_node_key: str,
+        backend: MakerChannelInputBackend,
+        candidates: Sequence[ChannelInputCandidate],
+        settlement_script_for: Callable[[ChannelInputCandidate], str],
+        current_time: int,
+        current_height: int,
+    ) -> tuple[ChannelInputPayload, ...]:
+        """Apply one authenticated inbound payload and return durable local responses."""
+
+        if isinstance(payload, ChannelInputInvitePayload):
+            return await self._handle_invite(
+                payload,
+                coordinator_actor=coordinator_actor,
+                local_actor=local_actor,
+                local_node_key=local_node_key,
+                backend=backend,
+                candidates=candidates,
+                settlement_script_for=settlement_script_for,
+            )
+        if not isinstance(
+            payload,
+            (
+                ChannelInputProposalPayload,
+                ChannelInputApprovalSetPayload,
+                ChannelInputPreparePayload,
+                ChannelInputSignPayload,
+                ChannelInputFinalizePayload,
+            ),
+        ):
+            raise ChannelInputValidationError("unsupported inbound channel-input payload")
+
+        key = (payload.session_id, payload.attempt)
+        try:
+            lock = self._locks[key]
+            negotiation = self._negotiations[key]
+        except KeyError as exc:
+            raise MakerChannelInputRuntimeError("unknown channel-input session attempt") from exc
+        async with lock:
+            self._require_local_identity(negotiation, local_actor, local_node_key)
+            if isinstance(payload, ChannelInputProposalPayload):
+                approval = negotiation.accept_proposal(
+                    coordinator_actor,
+                    payload,
+                    current_time=current_time,
+                    current_height=current_height,
+                )
+                self._save(negotiation)
+                return (approval,)
+            if isinstance(payload, ChannelInputApprovalSetPayload):
+                ack = negotiation.accept_approval_set(coordinator_actor, payload)
+                self._save(negotiation)
+                return (ack,)
+            if isinstance(payload, ChannelInputPreparePayload):
+                negotiation.accept_prepare(coordinator_actor, payload)
+                self._save(negotiation)
+                await self._recover_prepared_or_later(negotiation, backend)
+                return tuple(state.prepared for state in negotiation.channel_states)
+            if isinstance(payload, ChannelInputSignPayload):
+                partial = negotiation.accept_sign(coordinator_actor, payload)
+                self._save(negotiation)
+                if partial is None:
+                    partial_signature = await backend.sign_channel_input_parent(
+                        negotiation.invite.session_id,
+                        EscrowOutpoint(
+                            txid=payload.funding_outpoint.txid,
+                            vout=payload.funding_outpoint.vout,
+                        ),
+                        negotiation.signing_attempt_for(payload.funding_outpoint),
+                        bytes.fromhex(payload.peer_prepared.public_nonce),
+                    )
+                    self._record_partial(negotiation, payload.funding_outpoint, partial_signature)
+                    state = self._channel_state(negotiation, payload.funding_outpoint)
+                    assert state is not None and state.partial is not None
+                    partial = state.partial
+                return (partial,)
+            assert isinstance(payload, ChannelInputFinalizePayload)
+            finalized = negotiation.accept_finalize(coordinator_actor, payload)
+            self._save(negotiation)
+            if finalized is None:
+                result = await backend.finalize_channel_input_parent(
+                    negotiation.invite.session_id,
+                    EscrowOutpoint(
+                        txid=payload.funding_outpoint.txid,
+                        vout=payload.funding_outpoint.vout,
+                    ),
+                    negotiation.signing_attempt_for(payload.funding_outpoint),
+                    bytes.fromhex(payload.peer_partial.partial_signature),
+                )
+                self._record_finalized(negotiation, payload.funding_outpoint, result)
+                state = self._channel_state(negotiation, payload.funding_outpoint)
+                assert state is not None and state.finalized is not None
+                finalized = state.finalized
+            return (finalized,)
+
+    async def _handle_invite(
+        self,
+        invite: ChannelInputInvitePayload,
+        *,
+        coordinator_actor: str,
+        local_actor: str,
+        local_node_key: str,
+        backend: MakerChannelInputBackend,
+        candidates: Sequence[ChannelInputCandidate],
+        settlement_script_for: Callable[[ChannelInputCandidate], str],
+    ) -> tuple[ChannelInputPayload, ...]:
+        key = (invite.session_id, invite.attempt)
+        async with self._admission_lock:
+            negotiation = self._negotiations.get(key)
+            if negotiation is not None:
+                self._require_matching_invite(
+                    negotiation,
+                    invite,
+                    coordinator_actor=coordinator_actor,
+                    local_actor=local_actor,
+                    local_node_key=local_node_key,
+                )
+                async with self._locks[key]:
+                    if negotiation.stage is MakerChannelInputStage.FREEZE_INTENDED:
+                        await self._recover_freezes(negotiation, backend)
+                    elif negotiation.stage is MakerChannelInputStage.INVITED:
+                        raise MakerChannelInputRuntimeError(
+                            "channel-input invitation has no durable freeze intent"
+                        )
+                    return tuple(negotiation.hellos)
+
+            if self.session_count >= self._store.max_active_sessions:
+                raise MakerChannelInputRuntimeError("maximum active channel-input sessions reached")
+            unavailable = {
+                (intent.funding_outpoint.txid, intent.funding_outpoint.vout)
+                for existing in self._negotiations.values()
+                for intent in existing.freeze_intents
+            }
+            selected = tuple(
+                candidate
+                for candidate in sorted(
+                    candidates,
+                    key=lambda candidate: (
+                        candidate.funding_outpoint.txid,
+                        candidate.funding_outpoint.vout,
+                    ),
+                )
+                if (
+                    candidate.funding_outpoint.txid,
+                    candidate.funding_outpoint.vout,
+                )
+                not in unavailable
+            )[:MAX_CHANNELS]
+            if not selected:
+                raise MakerChannelInputRuntimeError("no channel-input candidates are available")
+            negotiation = MakerChannelInputNegotiation.from_invite(
+                local_actor=local_actor,
+                coordinator_actor=coordinator_actor,
+                invite=invite,
+                config=self._config,
+                network=self._network,
+                local_node_key=local_node_key,
+            )
+            settlement_scripts = {
+                f"{candidate.funding_outpoint.txid}:{candidate.funding_outpoint.vout}": (
+                    settlement_script_for(candidate)
+                )
+                for candidate in selected
+            }
+            negotiation.plan_freeze(selected, settlement_scripts=settlement_scripts)
+            self._save(negotiation)
+            self._negotiations[key] = negotiation
+            self._locks[key] = asyncio.Lock()
+            async with self._locks[key]:
+                await self._recover_freezes(negotiation, backend)
+            return tuple(negotiation.hellos)
+
+    @staticmethod
+    def _require_matching_invite(
+        negotiation: MakerChannelInputNegotiation,
+        invite: ChannelInputInvitePayload,
+        *,
+        coordinator_actor: str,
+        local_actor: str,
+        local_node_key: str,
+    ) -> None:
+        if coordinator_actor != negotiation.coordinator_actor:
+            raise ChannelInputValidationError("channel-input invite came from a different actor")
+        if invite != negotiation.invite:
+            raise ChannelInputValidationError(
+                "channel-input invite conflicts with prior invitation"
+            )
+        if local_actor != negotiation.local_actor or local_node_key != negotiation.local_node_key:
+            raise MakerChannelInputRuntimeError(
+                "channel-input invitation differs from local identity"
+            )
+
+    @staticmethod
+    def _require_local_identity(
+        negotiation: MakerChannelInputNegotiation, local_actor: str, local_node_key: str
+    ) -> None:
+        if local_actor != negotiation.local_actor or local_node_key != negotiation.local_node_key:
+            raise MakerChannelInputRuntimeError(
+                "channel-input session belongs to another local identity"
+            )
 
     def _load(self) -> None:
         freeze_outpoints: set[tuple[str, int]] = set()
