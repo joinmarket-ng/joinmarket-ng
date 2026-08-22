@@ -388,11 +388,14 @@ class UTXOMetadataStore:
     funded_addresses: set[str] = field(default_factory=set)
     foreign_addr_lines: list[dict[str, str | bool]] = field(default_factory=list)
 
-    def load(self) -> None:
+    def load(self, *, strict: bool = False) -> None:
         """Load metadata from disk.
 
         Gracefully handles missing files, empty files, and malformed lines.
         Lines that cannot be parsed are logged and skipped.
+        When ``strict`` is true, unreadable files and malformed JoinMarket
+        records raise instead. Durable resource allocation uses this mode to
+        fail closed rather than overwrite a partial snapshot.
         """
         self.records.clear()
         self.address_records.clear()
@@ -408,6 +411,8 @@ class UTXOMetadataStore:
             text = read_sensitive_file(self.path).decode("utf-8")
         except OSError as e:
             logger.error(f"Failed to read wallet metadata: {e}")
+            if strict:
+                raise
             return
 
         for line_no, line in enumerate(text.splitlines(), start=1):
@@ -417,14 +422,21 @@ class UTXOMetadataStore:
             try:
                 data = json.loads(line)
             except json.JSONDecodeError as e:
+                if strict:
+                    raise ValueError(f"Malformed wallet metadata at {self.path}:{line_no}") from e
                 logger.warning(f"Malformed JSON at {self.path}:{line_no}: {e}")
                 continue
+
+            if strict and not isinstance(data, dict):
+                raise ValueError(f"Malformed wallet metadata at {self.path}:{line_no}")
 
             record_type = data.get("type") if isinstance(data, dict) else None
             if record_type == "output":
                 record = OutputRecord.from_dict(data)
                 if record is not None:
                     self.records[record.ref] = record
+                elif strict:
+                    raise ValueError(f"Malformed output metadata at {self.path}:{line_no}")
             elif record_type == "addr":
                 # Only our ``jm:used`` labels count as used-address markers.
                 # Foreign addr records (Sparrow address-book labels etc.) are
@@ -434,14 +446,26 @@ class UTXOMetadataStore:
                     rec = AddressRecord.from_dict(data)
                     if rec is not None:
                         self.address_records[rec.ref] = rec
+                    elif strict:
+                        raise ValueError(
+                            f"Malformed used-address metadata at {self.path}:{line_no}"
+                        )
                 elif isinstance(label, str) and label.startswith(RESERVED_LABEL_PREFIX):
                     reserved = ReservedAddressRecord.from_dict(data)
                     if reserved is not None:
                         self.reserved_records[reserved.ref] = reserved
+                    elif strict:
+                        raise ValueError(
+                            f"Malformed reserved-address metadata at {self.path}:{line_no}"
+                        )
                 elif isinstance(label, str) and label.startswith(FUNDED_LABEL_PREFIX):
                     ref = data.get("ref")
                     if isinstance(ref, str) and ref:
                         self.funded_addresses.add(ref)
+                    elif strict:
+                        raise ValueError(
+                            f"Malformed funded-address metadata at {self.path}:{line_no}"
+                        )
                 else:
                     if isinstance(data, dict):
                         self.foreign_addr_lines.append(data)
@@ -1099,6 +1123,30 @@ class UTXOMetadataStore:
                 msg = f"Could not persist reservation for address {address}"
                 raise AddressReservationError(msg) from exc
             return address
+
+    def reserve_address_if_unreserved(self, address: str, label: str = "") -> bool:
+        """Persist a reservation only when ``address`` is not already reserved.
+
+        The sidecar lock makes the check and write atomic across wallet
+        processes. Returns ``False`` when another caller already owns the
+        reservation and leaves its label unchanged.
+        """
+        if not address:
+            return False
+        user_label = label or ""
+        with self._exclusive_file_lock():
+            self.load(strict=True)
+            if address in self.reserved_records:
+                return False
+            self.reserved_records[address] = ReservedAddressRecord(
+                ref=address, user_label=user_label
+            )
+            try:
+                self.save()
+            except Exception:
+                del self.reserved_records[address]
+                raise
+            return True
 
     def unreserve_address(self, address: str) -> bool:
         """Remove any reservation for ``address``. Returns ``True`` if changed."""

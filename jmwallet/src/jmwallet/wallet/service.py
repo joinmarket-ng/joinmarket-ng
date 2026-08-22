@@ -904,7 +904,12 @@ class WalletService(
         return self.allocate_output_address(mixdepth, 1)
 
     def allocate_output_address(
-        self, mixdepth: int, change: int, *, user_visible: bool = False
+        self,
+        mixdepth: int,
+        change: int,
+        *,
+        user_visible: bool = False,
+        label: str = "",
     ) -> str:
         """Allocate and durably reserve the next address on a wallet branch.
 
@@ -928,6 +933,7 @@ class WalletService(
                 address = store.reserve_first_available_address(
                     candidates,
                     internal=not user_visible,
+                    label=label,
                 )
             else:
                 unavailable = (
@@ -951,6 +957,17 @@ class WalletService(
                 self.issued_receive_addresses.add(address)
                 self.reserved_address_labels[address] = ""
             return address
+
+    def get_new_persisted_internal_address(self, mixdepth: int, label: str = "") -> str:
+        """Allocate an internally reserved address for a protocol settlement.
+
+        This compatibility API requires metadata persistence because callers
+        may disclose the address before it appears in history. Allocation uses
+        the same bounded, cross-process-safe path as other owned outputs.
+        """
+        if self.metadata_store is None:
+            raise RuntimeError("Persistent wallet metadata is required for address allocation")
+        return self.allocate_output_address(mixdepth, 1, label=label)
 
     async def sync(self) -> dict[int, list[UTXOInfo]]:
         """Sync wallet (alias for sync_all for backward compatibility)."""

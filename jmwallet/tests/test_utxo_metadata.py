@@ -862,6 +862,44 @@ class TestReservedAddresses:
         # The on-disk label is the bare prefix (no trailing colon).
         assert s2.reserved_records["bcrt1qa"].label == "jm:reserved"
 
+    def test_reserve_if_unreserved_does_not_overwrite_existing_label(self, tmp_path):
+        path = tmp_path / "m.jsonl"
+        first = UTXOMetadataStore(path=path)
+        first.load()
+        second = UTXOMetadataStore(path=path)
+        second.load()
+
+        assert first.reserve_address_if_unreserved("bcrt1qa", "first") is True
+        assert second.reserve_address_if_unreserved("bcrt1qa", "second") is False
+
+        persisted = UTXOMetadataStore(path=path)
+        persisted.load()
+        assert persisted.get_reserved_labels() == {"bcrt1qa": "first"}
+
+    def test_reserve_if_unreserved_rolls_back_after_save_failure(self, tmp_path, monkeypatch):
+        store = UTXOMetadataStore(path=tmp_path / "m.jsonl")
+        store.load()
+
+        def fail_save() -> None:
+            raise OSError("disk unavailable")
+
+        monkeypatch.setattr(store, "save", fail_save)
+        with pytest.raises(OSError, match="disk unavailable"):
+            store.reserve_address_if_unreserved("bcrt1qa", "settlement")
+
+        assert not store.is_address_reserved("bcrt1qa")
+
+    def test_reserve_if_unreserved_rejects_malformed_metadata(self, tmp_path):
+        path = tmp_path / "m.jsonl"
+        original = '{"type":"addr","ref":"bcrt1qa","label":"jm:reserved:first"}\n{bad\n'
+        path.write_text(original, encoding="utf-8")
+        store = UTXOMetadataStore(path=path)
+
+        with pytest.raises(ValueError, match="Malformed wallet metadata"):
+            store.reserve_address_if_unreserved("bcrt1qb", "second")
+
+        assert path.read_text(encoding="utf-8") == original
+
     def test_unreserve(self, tmp_path):
         path = tmp_path / "m.jsonl"
         s = UTXOMetadataStore(path=path)

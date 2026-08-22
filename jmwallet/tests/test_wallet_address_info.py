@@ -1814,6 +1814,79 @@ class TestReservedAddressPersistence:
             wallet.get_new_internal_address(0)
         assert wallet.reserved_addresses == set()
 
+    def test_persisted_internal_address_not_reissued_after_restart(
+        self, mock_backend, temp_data_dir, test_mnemonic, test_network
+    ):
+        wallet = self._make_wallet(mock_backend, temp_data_dir, test_mnemonic, test_network)
+        first = wallet.get_new_persisted_internal_address(2, "channel-input settlement")
+        assert first == wallet.get_change_address(2, 0)
+
+        wallet2 = self._make_wallet(mock_backend, temp_data_dir, test_mnemonic, test_network)
+        second = wallet2.get_new_persisted_internal_address(2, "channel-input settlement")
+
+        assert second == wallet2.get_change_address(2, 1)
+        assert {first, second} <= wallet2.reserved_addresses
+        assert wallet2.get_reserved_addresses() == {}
+        assert wallet2.metadata_store is not None
+        records = wallet2.metadata_store.reserved_records
+        assert records[first].internal is True
+        assert records[first].user_label == "channel-input settlement"
+        assert records[second].internal is True
+        assert records[second].user_label == "channel-input settlement"
+
+    def test_persisted_internal_address_resolves_process_collision(
+        self, mock_backend, temp_data_dir, test_mnemonic, test_network
+    ):
+        first_wallet = self._make_wallet(mock_backend, temp_data_dir, test_mnemonic, test_network)
+        stale_wallet = self._make_wallet(mock_backend, temp_data_dir, test_mnemonic, test_network)
+
+        first = first_wallet.get_new_persisted_internal_address(1, "first")
+        second = stale_wallet.get_new_persisted_internal_address(1, "second")
+
+        assert first == first_wallet.get_change_address(1, 0)
+        assert second == stale_wallet.get_change_address(1, 1)
+        assert second in stale_wallet.reserved_addresses
+        assert stale_wallet.get_reserved_addresses() == {}
+        assert stale_wallet.metadata_store is not None
+        records = stale_wallet.metadata_store.reserved_records
+        assert records[first].user_label == "first"
+        assert records[second].user_label == "second"
+
+    def test_persisted_internal_address_requires_metadata(
+        self, mock_backend, test_mnemonic, test_network
+    ):
+        wallet = WalletService(
+            mnemonic=test_mnemonic,
+            backend=mock_backend,
+            network=test_network,
+            mixdepth_count=5,
+        )
+
+        with pytest.raises(RuntimeError, match="Persistent wallet metadata"):
+            wallet.get_new_persisted_internal_address(0, "settlement")
+
+        assert wallet.reserved_addresses == set()
+
+    def test_persisted_internal_address_does_not_reserve_on_disk_failure(
+        self, mock_backend, temp_data_dir, test_mnemonic, test_network, monkeypatch
+    ):
+        wallet = self._make_wallet(mock_backend, temp_data_dir, test_mnemonic, test_network)
+        expected = wallet.get_change_address(0, 0)
+
+        def fail_reservation(*_args, **_kwargs) -> str:
+            raise AddressReservationError("metadata unavailable")
+
+        assert wallet.metadata_store is not None
+        monkeypatch.setattr(
+            wallet.metadata_store, "reserve_first_available_address", fail_reservation
+        )
+        with pytest.raises(AddressReservationError, match="metadata unavailable"):
+            wallet.get_new_persisted_internal_address(0, "settlement")
+
+        assert expected not in wallet.reserved_addresses
+        assert expected not in wallet.issued_receive_addresses
+        assert expected not in wallet.reserved_address_labels
+
     @pytest.mark.asyncio
     async def test_reserve_and_release_roundtrip(
         self, mock_backend, temp_data_dir, test_mnemonic, test_network
