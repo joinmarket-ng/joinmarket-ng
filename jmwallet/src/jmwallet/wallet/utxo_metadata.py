@@ -34,6 +34,7 @@ Reference: https://github.com/bitcoin/bips/blob/master/bip-0329.mediawiki
 
 from __future__ import annotations
 
+import copy
 import json
 import math
 import tempfile
@@ -100,6 +101,27 @@ def _validate_lock_ttl(ttl: float) -> float:
     if validated > MAX_COINJOIN_LOCK_TTL:
         raise ValueError(f"CoinJoin lock TTL must not exceed {MAX_COINJOIN_LOCK_TTL:.0f} seconds")
     return validated
+
+
+def _normalize_outpoint_for_dedup(outpoint: str) -> str | tuple[str, int]:
+    """Return a case/padding-independent identity for a ``txid:vout`` string.
+
+    Two outpoint strings that differ only in txid case or vout zero-padding
+    (``"AB..:0"`` vs. ``"ab..:00"``) name the same UTXO but never compare
+    equal as raw strings, which lets a naive string-based duplicate check let
+    both through. Callers of :meth:`UTXOMetadataStore.set_frozen` are expected
+    to pass well-formed outpoints (the HTTP layer validates this before the
+    store ever sees them); a malformed string falls back to raw-string
+    identity rather than raising here, since format validation is not this
+    method's job.
+    """
+    txid, sep, vout = outpoint.partition(":")
+    if not sep:
+        return outpoint
+    try:
+        return txid.lower(), int(vout)
+    except ValueError:
+        return outpoint
 
 
 @dataclass
@@ -542,6 +564,45 @@ class UTXOMetadataStore:
         """
         return outpoint in self.records
 
+    def _apply_freeze(self, outpoint: str, freeze: bool, label: str | None = None) -> bool:
+        """Apply one freeze/unfreeze to the in-memory records.
+
+        The caller must already hold :meth:`_exclusive_file_lock` and have
+        called :meth:`load`; persisting with :meth:`save` is also the caller's
+        job. Factored out so the single-outpoint and batch entry points cannot
+        drift apart on the "drop the record when nothing else needs it" rule.
+
+        Returns:
+            True if ``self.records`` was changed.
+        """
+        record = self.records.get(outpoint)
+
+        if freeze:
+            if record is not None:
+                record.spendable = False
+                if label is not None and record.label is None:
+                    record.label = label
+            else:
+                self.records[outpoint] = OutputRecord(ref=outpoint, spendable=False, label=label)
+            return True
+
+        if record is None:
+            # Already unfrozen (no record means spendable)
+            return False
+
+        if (
+            record.label is not None
+            or record.lock_until is not None
+            or record.seen
+            or record.coinjoin_output
+        ):
+            # Keep the record for labels, locks, and reuse observations.
+            record.spendable = True
+        else:
+            # No other metadata -- remove entirely
+            del self.records[outpoint]
+        return True
+
     def freeze(self, outpoint: str, label: str | None = None) -> None:
         """Freeze a UTXO (set spendable to False) and persist.
 
@@ -552,12 +613,7 @@ class UTXOMetadataStore:
         """
         with self._exclusive_file_lock():
             self.load()
-            if outpoint in self.records:
-                self.records[outpoint].spendable = False
-                if label is not None and self.records[outpoint].label is None:
-                    self.records[outpoint].label = label
-            else:
-                self.records[outpoint] = OutputRecord(ref=outpoint, spendable=False, label=label)
+            self._apply_freeze(outpoint, True, label)
             self.save()
         logger.info(f"Frozen UTXO: {outpoint}")
 
@@ -572,25 +628,61 @@ class UTXOMetadataStore:
         """
         with self._exclusive_file_lock():
             self.load()
-            record = self.records.get(outpoint)
-            if record is None:
-                # Already unfrozen (no record means spendable)
+            if not self._apply_freeze(outpoint, False):
+                # Nothing on disk to change; skip the rewrite.
                 return
-
-            if (
-                record.label is not None
-                or record.lock_until is not None
-                or record.seen
-                or record.coinjoin_output
-            ):
-                # Keep the record for labels, locks, and reuse observations.
-                record.spendable = True
-            else:
-                # No other metadata -- remove entirely
-                del self.records[outpoint]
-
             self.save()
         logger.info(f"Unfrozen UTXO: {outpoint}")
+
+    def set_frozen(self, changes: Iterable[tuple[str, bool]]) -> None:
+        """Atomically apply several freeze/unfreeze changes in one write.
+
+        Mirrors :meth:`try_lock_outpoints`: the batch is validated up front and
+        then applied under a single exclusive file lock, with one ``load`` and
+        one ``save``. Either every change lands or none does, so a rejected
+        entry can never leave the batch half applied, and callers pay one
+        read-modify-write cycle instead of one per outpoint.
+
+        Args:
+            changes: ``(outpoint, freeze)`` pairs, where ``freeze=True``
+                freezes and ``False`` unfreezes. Mixed directions in one batch
+                are fine. An empty batch is a no-op and writes nothing.
+
+        Raises:
+            ValueError: If the same outpoint appears more than once. Two
+                entries for one outpoint have no well-defined result -- list
+                order alone would decide it -- so the batch is refused instead
+                of silently resolving it.
+        """
+        items = list(changes)
+        if not items:
+            return
+
+        seen: set[str | tuple[str, int]] = set()
+        for outpoint, _freeze in items:
+            key = _normalize_outpoint_for_dedup(outpoint)
+            if key in seen:
+                msg = f"Duplicate outpoint in batch: {outpoint}"
+                raise ValueError(msg)
+            seen.add(key)
+
+        with self._exclusive_file_lock():
+            self.load()
+            # Snapshot before mutating so a save() failure can roll the
+            # in-memory state back to what is actually on disk, instead of
+            # leaving self.records reporting a batch that was never
+            # persisted.
+            before = copy.deepcopy(self.records)
+            for outpoint, freeze in items:
+                self._apply_freeze(outpoint, freeze)
+            try:
+                self.save()
+            except Exception:
+                self.records = before
+                raise
+
+        frozen = sum(1 for _outpoint, freeze in items if freeze)
+        logger.info(f"Batch freeze update: {frozen} frozen, {len(items) - frozen} unfrozen")
 
     def toggle_freeze(self, outpoint: str) -> bool:
         """Toggle the frozen state of a UTXO and persist.

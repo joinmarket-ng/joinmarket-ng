@@ -10,6 +10,7 @@ from typing import Any
 from fastapi import APIRouter, Depends
 from loguru import logger
 
+from jmcore.protocol import UTXOMetadata
 from jmwallet.history import get_address_history_types, get_used_addresses
 from jmwallet.wallet.bond_registry import create_bond_info, load_registry, save_registry
 from jmwallet.wallet.constants import FIDELITY_BOND_BRANCH
@@ -25,6 +26,7 @@ from jmwalletd.models import (
     ConfigGetRequest,
     ConfigGetResponse,
     ConfigSetRequest,
+    FreezeBatchRequest,
     FreezeRequest,
     GetAddressResponse,
     GetSeedResponse,
@@ -371,6 +373,57 @@ async def get_seed(
     return GetSeedResponse(seedphrase=state.wallet_mnemonic)
 
 
+def _validate_outpoint_format(utxo_str: str) -> None:
+    """Validate a ``txid:vout`` string, raising :class:`InvalidRequestFormat` on failure."""
+    parts = utxo_str.split(":")
+    if len(parts) != 2:
+        raise InvalidRequestFormat(f"Invalid UTXO format: {utxo_str}. Expected txid:vout.")
+
+    try:
+        int(parts[1])
+    except ValueError as exc:
+        raise InvalidRequestFormat(f"Invalid vout in UTXO: {utxo_str}") from exc
+
+
+def _validate_and_normalize_outpoint(utxo_str: str) -> tuple[str, int]:
+    """Validate a ``txid:vout`` string and return its canonical identity.
+
+    Stricter than :func:`_validate_outpoint_format`, and reuses
+    :class:`jmcore.protocol.UTXOMetadata`'s validation (the same contract the
+    rest of the protocol enforces) instead of a parallel, weaker
+    reimplementation: the txid must be exactly 64 hex characters -- checked
+    with ``binascii.unhexlify``, which (unlike ``bytes.fromhex``) rejects
+    embedded whitespace, so a 64-character string that is actually fewer than
+    32 real bytes padded with spaces is caught -- and the vout must fit the
+    Bitcoin uint32 range (``0`` to ``0xFFFFFFFF``).
+
+    Returns ``(lowercase_txid, vout)`` so callers can both deduplicate and
+    build the same canonical ``"txid:vout"`` string the wallet's UTXO cache
+    and metadata store use as their key. Freeze-batch normalizes to this
+    before applying (not just for duplicate detection), because a
+    wrongly-cased or zero-padded outpoint would otherwise be accepted,
+    written to the metadata store under that literal key, and return success
+    -- without ever touching the real cached UTXO, which is keyed by the
+    canonical form.
+    """
+    parts = utxo_str.split(":")
+    if len(parts) != 2:
+        raise InvalidRequestFormat(f"Invalid UTXO format: {utxo_str}. Expected txid:vout.")
+
+    txid, vout_str = parts
+    try:
+        vout = int(vout_str)
+    except ValueError as exc:
+        raise InvalidRequestFormat(f"Invalid vout in UTXO: {utxo_str}") from exc
+
+    try:
+        UTXOMetadata(txid=txid, vout=vout)
+    except ValueError as exc:
+        raise InvalidRequestFormat(f"Invalid UTXO {utxo_str}: {exc}") from exc
+
+    return txid.lower(), vout
+
+
 # ---------------------------------------------------------------------------
 # POST /api/v1/wallet/{walletname}/freeze
 # ---------------------------------------------------------------------------
@@ -386,22 +439,59 @@ async def freeze_utxo(
     if state.taker_running:
         raise ActionNotAllowed("Cannot freeze/unfreeze UTXOs while a coinjoin is in progress.")
 
-    # Validate utxo format: "txid:vout"
     utxo_str = body.utxo_string
-    parts = utxo_str.split(":")
-    if len(parts) != 2:
-        raise InvalidRequestFormat(f"Invalid UTXO format: {utxo_str}. Expected txid:vout.")
-
-    try:
-        int(parts[1])
-    except ValueError as exc:
-        raise InvalidRequestFormat(f"Invalid vout in UTXO: {utxo_str}") from exc
+    _validate_outpoint_format(utxo_str)
 
     ws = state.wallet_service
     if body.freeze:
         ws.freeze_utxo(utxo_str)
     else:
         ws.unfreeze_utxo(utxo_str)
+
+    return {}
+
+
+# ---------------------------------------------------------------------------
+# POST /api/v1/wallet/{walletname}/freeze-batch
+# ---------------------------------------------------------------------------
+@router.post("/wallet/{walletname}/freeze-batch", operation_id="freezebatch")
+async def freeze_utxos_batch(
+    walletname: str,
+    body: FreezeBatchRequest,
+    _auth: dict[str, Any] = Depends(require_auth),
+    _wallet: None = Depends(require_wallet_match),
+    state: DaemonState = Depends(get_daemon_state),
+) -> dict[str, str]:
+    """Freeze and/or unfreeze several UTXOs in one atomic request (issue #596).
+
+    Mixed directions are allowed in the same batch. Every entry is validated
+    before anything is written; if any outpoint is malformed or repeated, the
+    whole request is rejected and nothing on disk changes.
+    """
+    if state.taker_running:
+        raise ActionNotAllowed("Cannot freeze/unfreeze UTXOs while a coinjoin is in progress.")
+
+    # Validate, dedupe, and canonicalize in one pass: normalizing here (rather
+    # than deferring to the store) means the outpoint actually applied is the
+    # same string the wallet's UTXO cache and metadata store already key on,
+    # so a wrongly-cased or zero-padded request can't silently freeze nothing
+    # while still reporting success.
+    seen: set[tuple[str, int]] = set()
+    normalized_entries: list[tuple[str, bool]] = []
+    for entry in body.entries:
+        txid, vout = _validate_and_normalize_outpoint(entry.utxo_string)
+        if (txid, vout) in seen:
+            raise InvalidRequestFormat(f"Duplicate UTXO in batch: {entry.utxo_string}")
+        seen.add((txid, vout))
+        normalized_entries.append((f"{txid}:{vout}", entry.freeze))
+
+    ws = state.wallet_service
+    try:
+        ws.set_utxos_frozen(normalized_entries)
+    except ValueError as exc:
+        # Belt-and-braces: the store re-checks duplicates itself, so this
+        # should be unreachable given the pre-check above.
+        raise InvalidRequestFormat(str(exc)) from exc
 
     return {}
 

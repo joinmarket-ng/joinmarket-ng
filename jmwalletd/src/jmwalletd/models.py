@@ -523,6 +523,33 @@ class FreezeRequest(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class FreezeBatchEntry(BaseModel):
+    """One entry of a POST /api/v1/wallet/{walletname}/freeze-batch request.
+
+    Same field name and hyphenated wire alias as :class:`FreezeRequest`, so a
+    caller migrating from one-at-a-time calls to a batch just wraps the same
+    entries in a list.
+    """
+
+    utxo_string: str = Field(alias="utxo-string")
+    freeze: bool
+
+    model_config = {"populate_by_name": True}
+
+
+class FreezeBatchRequest(BaseModel):
+    """POST /api/v1/wallet/{walletname}/freeze-batch request (issue #596).
+
+    Applies every entry atomically: either the whole batch lands or, if any
+    entry is invalid, none of it does. An empty list and a repeated outpoint
+    are both rejected outright rather than treated as a partial no-op, since
+    a duplicate has no well-defined outcome (list order alone would decide
+    it) and an empty list is more likely a client bug than "no preference".
+    """
+
+    entries: list[FreezeBatchEntry] = Field(..., min_length=1, max_length=500)
+
+
 # ---------------------------------------------------------------------------
 # Sign message
 # ---------------------------------------------------------------------------

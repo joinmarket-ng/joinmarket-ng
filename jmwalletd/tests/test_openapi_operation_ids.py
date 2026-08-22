@@ -39,6 +39,7 @@ EXPECTED_OPERATION_IDS: dict[tuple[str, str], str] = {
     ): "gettimelockaddress",
     ("get", "/api/v1/wallet/{walletname}/getseed"): "getseed",
     ("post", "/api/v1/wallet/{walletname}/freeze"): "freeze",
+    ("post", "/api/v1/wallet/{walletname}/freeze-batch"): "freezebatch",
     ("post", "/api/v1/wallet/{walletname}/configget"): "configget",
     ("post", "/api/v1/wallet/{walletname}/configset"): "configsetting",
     (

@@ -5,6 +5,7 @@ JoinMarket wallet service with mixdepth support.
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
@@ -1136,6 +1137,33 @@ class WalletService(
                 if utxo.outpoint == outpoint:
                     utxo.frozen = False
                     return
+
+    def set_utxos_frozen(self, changes: Iterable[tuple[str, bool]]) -> None:
+        """Freeze and/or unfreeze several UTXOs in one atomic write (issue #596).
+
+        Persisting is all-or-nothing, so the in-memory cache below is only
+        reached once the whole batch is on disk.
+
+        Args:
+            changes: ``(outpoint, freeze)`` pairs in ``txid:vout`` form.
+                Mixed directions in one batch are allowed.
+
+        Raises:
+            RuntimeError: If no metadata store is available (no data_dir).
+            ValueError: If the same outpoint appears more than once.
+        """
+        if self.metadata_store is None:
+            raise RuntimeError("Cannot freeze UTXOs without a data directory")
+        items = list(changes)
+        self.metadata_store.set_frozen(items)
+        # Update the in-memory UTXO cache. Unlike the single-outpoint helpers
+        # above this cannot stop at the first hit, so index the batch instead.
+        wanted = dict(items)
+        for utxos in self.utxo_cache.values():
+            for utxo in utxos:
+                frozen = wanted.get(utxo.outpoint)
+                if frozen is not None:
+                    utxo.frozen = frozen
 
     # -- Temporary CoinJoin input locks (cross-process) ----------------------
 
