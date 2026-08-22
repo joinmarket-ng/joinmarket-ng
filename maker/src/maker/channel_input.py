@@ -41,7 +41,7 @@ from jmcore.channel_input_session import (
     ChannelInputReplayLedger,
     ChannelInputReplayResult,
 )
-from jmswap.lnd import FrozenChannelSnapshot
+from jmswap.lnd import ChannelInputCandidate, EscrowOutpoint, FrozenChannelSnapshot
 from pydantic import Field, field_serializer, field_validator, model_validator
 
 
@@ -49,6 +49,7 @@ class MakerChannelInputStage(StrEnum):
     """Durable stages that do not make any LND or network calls."""
 
     INVITED = "invited"
+    FREEZE_INTENDED = "freeze_intended"
     HELLOS_READY = "hellos_ready"
     PROPOSAL_APPROVED = "proposal_approved"
     APPROVAL_SET_ACKED = "approval_set_acked"
@@ -100,6 +101,33 @@ class MakerFrozenChannelInput(ChannelInputModel):
         return self
 
 
+class MakerChannelInputFreezeIntent(ChannelInputModel):
+    """Durable exact request facts for a future idempotent LND freeze RPC."""
+
+    channel_id: str
+    funding_outpoint: EscrowOutpoint
+    peer_node_pubkey: str
+    capacity_sat: int = Field(gt=0)
+
+    @field_validator("channel_id")
+    @classmethod
+    def validate_channel_id(cls, value: str) -> str:
+        _validate_outpoint_identifier(value, "channel_id")
+        return value
+
+    @field_validator("peer_node_pubkey")
+    @classmethod
+    def validate_peer_node_pubkey(cls, value: str) -> str:
+        _validate_node_key(value, "peer_node_pubkey")
+        return value
+
+    @model_validator(mode="after")
+    def validate_channel_id_matches_outpoint(self) -> MakerChannelInputFreezeIntent:
+        if self.channel_id != _outpoint_identifier(self.funding_outpoint):
+            raise ValueError("channel_id must equal the funding outpoint")
+        return self
+
+
 class MakerChannelInputSnapshot(ChannelInputModel):
     """Complete immutable persisted negotiation state, including signed wire data."""
 
@@ -112,6 +140,7 @@ class MakerChannelInputSnapshot(ChannelInputModel):
     participant_secret_key_hex: str = Field(repr=False)
     stage: MakerChannelInputStage
     invite: ChannelInputInvitePayload
+    freeze_intents: tuple[MakerChannelInputFreezeIntent, ...] = ()
     frozen_inputs: tuple[MakerFrozenChannelInput, ...] = ()
     hellos: tuple[ChannelInputHelloPayload, ...] = ()
     proposal: ChannelInputProposalPayload | None = None
@@ -143,31 +172,47 @@ class MakerChannelInputSnapshot(ChannelInputModel):
             raise ValueError("snapshot maker network differs from invitation")
         if self.local_actor == self.coordinator_actor:
             raise ValueError("local and coordinator actors must differ")
-        if len(self.frozen_inputs) > MAX_CHANNELS or len(self.hellos) > MAX_CHANNELS:
+        if (
+            len(self.freeze_intents) > MAX_CHANNELS
+            or len(self.frozen_inputs) > MAX_CHANNELS
+            or len(self.hellos) > MAX_CHANNELS
+        ):
             raise ValueError("channel input snapshot exceeds channel limit")
         stage_rank = {
             MakerChannelInputStage.INVITED: 0,
-            MakerChannelInputStage.HELLOS_READY: 1,
-            MakerChannelInputStage.PROPOSAL_APPROVED: 2,
-            MakerChannelInputStage.APPROVAL_SET_ACKED: 3,
-            MakerChannelInputStage.PREPARED: 4,
+            MakerChannelInputStage.FREEZE_INTENDED: 1,
+            MakerChannelInputStage.HELLOS_READY: 2,
+            MakerChannelInputStage.PROPOSAL_APPROVED: 3,
+            MakerChannelInputStage.APPROVAL_SET_ACKED: 4,
+            MakerChannelInputStage.PREPARED: 5,
         }
         rank = stage_rank[self.stage]
-        if (rank >= 1) != bool(self.frozen_inputs) or len(self.frozen_inputs) != len(self.hellos):
-            raise ValueError("snapshot frozen inputs and hellos do not match stage")
-        if rank >= 2 and (self.proposal is None or self.local_approval is None):
+        if self.stage is MakerChannelInputStage.INVITED:
+            if self.freeze_intents or self.frozen_inputs or self.hellos:
+                raise ValueError("invited snapshot contains freeze or hello evidence")
+        elif self.stage is MakerChannelInputStage.FREEZE_INTENDED:
+            if not self.freeze_intents or self.frozen_inputs or self.hellos:
+                raise ValueError("freeze-intended snapshot evidence does not match stage")
+        elif (
+            not self.freeze_intents
+            or not self.frozen_inputs
+            or len(self.freeze_intents) != len(self.frozen_inputs)
+            or len(self.frozen_inputs) != len(self.hellos)
+        ):
+            raise ValueError("snapshot intents, frozen inputs, and hellos do not match stage")
+        if rank >= 3 and (self.proposal is None or self.local_approval is None):
             raise ValueError("snapshot proposal and approval do not match stage")
-        if rank < 2 and (self.proposal is not None or self.local_approval is not None):
+        if rank < 3 and (self.proposal is not None or self.local_approval is not None):
             raise ValueError("snapshot proposal and approval do not match stage")
-        if (rank >= 2) != (self.accepted_height is not None):
+        if (rank >= 3) != (self.accepted_height is not None):
             raise ValueError("snapshot accepted height does not match stage")
-        if rank >= 3 and (self.approval_set is None or self.local_ack is None):
+        if rank >= 4 and (self.approval_set is None or self.local_ack is None):
             raise ValueError("snapshot approval set and ACK do not match stage")
-        if rank < 3 and (self.approval_set is not None or self.local_ack is not None):
+        if rank < 4 and (self.approval_set is not None or self.local_ack is not None):
             raise ValueError("snapshot approval set and ACK do not match stage")
-        if rank >= 4 and self.prepare is None:
+        if rank >= 5 and self.prepare is None:
             raise ValueError("snapshot prepare does not match stage")
-        if rank < 4 and self.prepare is not None:
+        if rank < 5 and self.prepare is not None:
             raise ValueError("snapshot prepare does not match stage")
         return self
 
@@ -188,6 +233,7 @@ class MakerChannelInputNegotiation:
         registry: ChannelInputActorRegistry,
         ledger: ChannelInputReplayLedger,
         stage: MakerChannelInputStage = MakerChannelInputStage.INVITED,
+        freeze_intents: tuple[MakerChannelInputFreezeIntent, ...] = (),
         frozen_inputs: tuple[MakerFrozenChannelInput, ...] = (),
         hellos: tuple[ChannelInputHelloPayload, ...] = (),
         proposal: ChannelInputProposalPayload | None = None,
@@ -207,6 +253,7 @@ class MakerChannelInputNegotiation:
         self._registry = registry
         self._ledger = ledger
         self.stage = stage
+        self.freeze_intents = freeze_intents
         self.frozen_inputs = frozen_inputs
         self.hellos = hellos
         self.proposal = proposal
@@ -281,6 +328,7 @@ class MakerChannelInputNegotiation:
             participant_secret_key_hex=self._key_pair.secret_key.hex(),
             stage=self.stage,
             invite=self.invite,
+            freeze_intents=self.freeze_intents,
             frozen_inputs=self.frozen_inputs,
             hellos=self.hellos,
             proposal=self.proposal,
@@ -319,6 +367,7 @@ class MakerChannelInputNegotiation:
             registry=registry,
             ledger=ledger,
             stage=snapshot.stage,
+            freeze_intents=snapshot.freeze_intents,
             frozen_inputs=snapshot.frozen_inputs,
             hellos=snapshot.hellos,
             proposal=snapshot.proposal,
@@ -330,6 +379,27 @@ class MakerChannelInputNegotiation:
         )
         negotiation._validate_restored_state()
         return negotiation
+
+    def plan_freeze(
+        self, candidates: Sequence[ChannelInputCandidate]
+    ) -> tuple[MakerChannelInputFreezeIntent, ...]:
+        """Persist exact outpoint-based freeze requests before calling an LND backend."""
+
+        normalized = _normalize_freeze_candidates(candidates)
+        intents = _freeze_intents_from_candidates(self.config, self.local_node_key, normalized)
+        if self.freeze_intents:
+            if intents != self.freeze_intents:
+                raise ChannelInputValidationError(
+                    "freeze candidates conflict with prior freeze intents"
+                )
+            return self.freeze_intents
+        if self.stage is not MakerChannelInputStage.INVITED:
+            raise ChannelInputValidationError(
+                "freeze intents are not valid at this negotiation stage"
+            )
+        self.freeze_intents = intents
+        self.stage = MakerChannelInputStage.FREEZE_INTENDED
+        return intents
 
     def install_frozen_inputs(
         self, frozen_inputs: Sequence[MakerFrozenChannelInput]
@@ -343,11 +413,12 @@ class MakerChannelInputNegotiation:
                     "frozen channel inputs conflict with prior hello evidence"
                 )
             return self.hellos
-        if self.stage is not MakerChannelInputStage.INVITED:
+        if self.stage is not MakerChannelInputStage.FREEZE_INTENDED:
             raise ChannelInputValidationError(
                 "frozen inputs are not valid at this negotiation stage"
             )
         _validate_frozen_inputs(self.config, self.invite, self.local_node_key, normalized)
+        _validate_frozen_inputs_against_intents(self.freeze_intents, normalized)
         ceilings = PolicyCeilings(
             max_miner_fee_share_sat=self.config.max_miner_fee_share_sat,
             max_claim_adjustment_sat=self.config.max_claim_adjustment_sat,
@@ -542,9 +613,15 @@ class MakerChannelInputNegotiation:
         self._registry.require_verified(self.coordinator_actor, self.invite)
         expected_entries: list[tuple[str, ChannelInputPayload]] = [(_slot("invite"), self.invite)]
         if self.stage is not MakerChannelInputStage.INVITED:
+            _validate_freeze_intents(self.config, self.local_node_key, self.freeze_intents)
+        if self.stage not in (
+            MakerChannelInputStage.INVITED,
+            MakerChannelInputStage.FREEZE_INTENDED,
+        ):
             _validate_frozen_inputs(
                 self.config, self.invite, self.local_node_key, self.frozen_inputs
             )
+            _validate_frozen_inputs_against_intents(self.freeze_intents, self.frozen_inputs)
             for frozen, hello in zip(self.frozen_inputs, self.hellos, strict=True):
                 self._registry.require_verified(self.local_actor, hello)
                 _validate_hello_against_frozen(self.invite, self.local_node_key, frozen, hello)
@@ -727,6 +804,171 @@ def _normalize_frozen_inputs(
     )
 
 
+def _normalize_freeze_candidates(
+    candidates: Sequence[ChannelInputCandidate],
+) -> tuple[ChannelInputCandidate, ...]:
+    if isinstance(candidates, str | bytes):
+        raise ChannelInputValidationError("freeze candidates must be a sequence")
+    normalized = tuple(candidates)
+    if not 1 <= len(normalized) <= MAX_CHANNELS:
+        raise ChannelInputValidationError("freeze candidate count is outside protocol bounds")
+    if any(not isinstance(item, ChannelInputCandidate) for item in normalized):
+        raise ChannelInputValidationError(
+            "freeze candidates must use exact LND candidate snapshots"
+        )
+    try:
+        normalized = tuple(
+            ChannelInputCandidate.model_validate(item.model_dump(mode="python"))
+            for item in normalized
+        )
+    except ValueError as exc:
+        raise ChannelInputValidationError("freeze candidate evidence is invalid") from exc
+    outpoints = {(item.funding_outpoint.txid, item.funding_outpoint.vout) for item in normalized}
+    channel_ids = {item.channel_id for item in normalized}
+    if len(outpoints) != len(normalized) or len(channel_ids) != len(normalized):
+        raise ChannelInputValidationError("freeze candidates must have unique outpoints and IDs")
+    return tuple(
+        sorted(
+            normalized,
+            key=lambda item: (item.funding_outpoint.txid, item.funding_outpoint.vout),
+        )
+    )
+
+
+def _freeze_intents_from_candidates(
+    config: ChannelInputConfig,
+    local_node_key: str,
+    candidates: tuple[ChannelInputCandidate, ...],
+) -> tuple[MakerChannelInputFreezeIntent, ...]:
+    _validate_freeze_candidates(config, local_node_key, candidates)
+    try:
+        return tuple(
+            MakerChannelInputFreezeIntent(
+                channel_id=_outpoint_identifier(candidate.funding_outpoint),
+                funding_outpoint=candidate.funding_outpoint,
+                peer_node_pubkey=candidate.peer_node_pubkey,
+                capacity_sat=candidate.capacity_sat,
+            )
+            for candidate in candidates
+        )
+    except ValueError as exc:
+        raise ChannelInputValidationError("freeze candidate intent is invalid") from exc
+
+
+def _validate_freeze_candidates(
+    config: ChannelInputConfig,
+    local_node_key: str,
+    candidates: tuple[ChannelInputCandidate, ...],
+) -> None:
+    if not config.enabled:
+        raise ChannelInputValidationError("channel input is disabled")
+    _validate_node_key(local_node_key, "local_node_key")
+    allowed_outpoints = set(config.allowed_channel_points)
+    allowed_peers = set(config.allowed_peer_node_pubkeys)
+    for candidate in candidates:
+        point_text = _outpoint_identifier(candidate.funding_outpoint)
+        if point_text not in allowed_outpoints:
+            raise ChannelInputValidationError(
+                "freeze funding outpoint is not allowed by configuration"
+            )
+        if allowed_peers and candidate.peer_node_pubkey not in allowed_peers:
+            raise ChannelInputValidationError("freeze channel peer is not allowed by configuration")
+        if not (
+            config.min_channel_capacity_sat
+            <= candidate.capacity_sat
+            <= config.max_channel_capacity_sat
+        ):
+            raise ChannelInputValidationError(
+                "freeze channel capacity is outside configuration bounds"
+            )
+        if local_node_key == candidate.peer_node_pubkey:
+            raise ChannelInputValidationError("local node key must differ from freeze channel peer")
+
+
+def _validate_freeze_intents(
+    config: ChannelInputConfig,
+    local_node_key: str,
+    intents: tuple[MakerChannelInputFreezeIntent, ...],
+) -> None:
+    if not 1 <= len(intents) <= MAX_CHANNELS:
+        raise ChannelInputValidationError("freeze intent count is outside protocol bounds")
+    try:
+        normalized = tuple(
+            MakerChannelInputFreezeIntent.model_validate(intent.model_dump(mode="python"))
+            for intent in intents
+        )
+    except ValueError as exc:
+        raise ChannelInputValidationError("freeze intent evidence is invalid") from exc
+    ordered = tuple(
+        sorted(
+            normalized,
+            key=lambda intent: (intent.funding_outpoint.txid, intent.funding_outpoint.vout),
+        )
+    )
+    if normalized != ordered:
+        raise ChannelInputValidationError("freeze intents are not deterministically ordered")
+    outpoints = {
+        (intent.funding_outpoint.txid, intent.funding_outpoint.vout) for intent in normalized
+    }
+    channel_ids = {intent.channel_id for intent in normalized}
+    if len(outpoints) != len(normalized) or len(channel_ids) != len(normalized):
+        raise ChannelInputValidationError("freeze intents must have unique outpoints and IDs")
+    _validate_freeze_intent_policy(config, local_node_key, normalized)
+
+
+def _validate_freeze_intent_policy(
+    config: ChannelInputConfig,
+    local_node_key: str,
+    intents: tuple[MakerChannelInputFreezeIntent, ...],
+) -> None:
+    if not config.enabled:
+        raise ChannelInputValidationError("channel input is disabled")
+    _validate_node_key(local_node_key, "local_node_key")
+    allowed_outpoints = set(config.allowed_channel_points)
+    allowed_peers = set(config.allowed_peer_node_pubkeys)
+    for intent in intents:
+        if intent.channel_id not in allowed_outpoints:
+            raise ChannelInputValidationError(
+                "freeze funding outpoint is not allowed by configuration"
+            )
+        if allowed_peers and intent.peer_node_pubkey not in allowed_peers:
+            raise ChannelInputValidationError("freeze channel peer is not allowed by configuration")
+        if not (
+            config.min_channel_capacity_sat
+            <= intent.capacity_sat
+            <= config.max_channel_capacity_sat
+        ):
+            raise ChannelInputValidationError(
+                "freeze channel capacity is outside configuration bounds"
+            )
+        if local_node_key == intent.peer_node_pubkey:
+            raise ChannelInputValidationError("local node key must differ from freeze channel peer")
+
+
+def _validate_frozen_inputs_against_intents(
+    intents: tuple[MakerChannelInputFreezeIntent, ...],
+    frozen_inputs: tuple[MakerFrozenChannelInput, ...],
+) -> None:
+    if len(intents) != len(frozen_inputs):
+        raise ChannelInputValidationError("frozen inputs do not match freeze intent count")
+    intents_by_outpoint = {
+        (intent.funding_outpoint.txid, intent.funding_outpoint.vout): intent for intent in intents
+    }
+    for frozen in frozen_inputs:
+        snapshot = frozen.snapshot
+        intent = intents_by_outpoint.get(
+            (snapshot.funding_outpoint.txid, snapshot.funding_outpoint.vout)
+        )
+        if intent is None:
+            raise ChannelInputValidationError("frozen input is not covered by a freeze intent")
+        if (
+            snapshot.channel_id != intent.channel_id
+            or snapshot.peer_node_pubkey.hex() != intent.peer_node_pubkey
+            or snapshot.capacity_sat != intent.capacity_sat
+        ):
+            raise ChannelInputValidationError("frozen input differs from its freeze intent")
+
+
 def _validate_frozen_inputs(
     config: ChannelInputConfig,
     invite: ChannelInputInvitePayload,
@@ -794,6 +1036,41 @@ def _validate_hello_against_frozen(
         or hello.settlement_script_pubkey != frozen.settlement_script_pubkey
     ):
         raise ChannelInputValidationError("hello differs from exact frozen channel evidence")
+
+
+def _outpoint_identifier(outpoint: EscrowOutpoint) -> str:
+    return f"{outpoint.txid}:{outpoint.vout}"
+
+
+def _validate_outpoint_identifier(value: str, field_name: str) -> None:
+    if not isinstance(value, str):
+        raise ChannelInputValidationError(
+            f"{field_name} must be a lowercase <64hex>:<uint32> outpoint"
+        )
+    txid, separator, vout_text = value.partition(":")
+    if (
+        not separator
+        or ":" in vout_text
+        or len(txid) != 64
+        or txid.lower() != txid
+        or not vout_text.isascii()
+        or not vout_text.isdecimal()
+        or (len(vout_text) > 1 and vout_text.startswith("0"))
+    ):
+        raise ChannelInputValidationError(
+            f"{field_name} must be a lowercase <64hex>:<uint32> outpoint"
+        )
+    try:
+        bytes.fromhex(txid)
+        vout = int(vout_text)
+    except ValueError as exc:
+        raise ChannelInputValidationError(
+            f"{field_name} must be a lowercase <64hex>:<uint32> outpoint"
+        ) from exc
+    if vout > 0xFFFFFFFF:
+        raise ChannelInputValidationError(
+            f"{field_name} must be a lowercase <64hex>:<uint32> outpoint"
+        )
 
 
 def _validate_p2tr_script(value: str, field_name: str) -> None:

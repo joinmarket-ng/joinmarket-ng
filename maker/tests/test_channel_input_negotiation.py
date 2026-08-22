@@ -7,6 +7,7 @@ import pytest
 from coincurve import PrivateKey
 from jmcore.bitcoin import TxInput, TxOutput, estimate_vsize, serialize_transaction
 from jmcore.channel_input import (
+    MAX_CHANNELS,
     ChannelDescriptor,
     ChannelInputApprovalPayload,
     ChannelInputApprovalSetAckPayload,
@@ -27,9 +28,15 @@ from jmcore.channel_input import (
     transcript_hash,
 )
 from jmcore.channel_input_config import ChannelInputConfig
-from jmswap.lnd import EscrowOutpoint, FrozenChannelSnapshot
+from jmswap.lnd import (
+    FINAL_TAPROOT_COMMITMENT,
+    ChannelInputCandidate,
+    EscrowOutpoint,
+    FrozenChannelSnapshot,
+)
 
 from maker.channel_input import (
+    MakerChannelInputFreezeIntent,
     MakerChannelInputNegotiation,
     MakerChannelInputSnapshot,
     MakerChannelInputStage,
@@ -85,11 +92,12 @@ def _invite() -> ChannelInputInvitePayload:
 
 
 def _frozen(index: int) -> MakerFrozenChannelInput:
+    funding_outpoint = EscrowOutpoint(txid=f"{index + 10:064x}", vout=index)
     return MakerFrozenChannelInput(
         snapshot=FrozenChannelSnapshot(
             session_id=SESSION_ID,
-            channel_id=f"channel-{index}",
-            funding_outpoint=EscrowOutpoint(txid=f"{index + 10:064x}", vout=index),
+            channel_id=f"{funding_outpoint.txid}:{funding_outpoint.vout}",
+            funding_outpoint=funding_outpoint,
             funding_scriptpubkey=bytes.fromhex("5120" + f"{index + 20:064x}"),
             peer_node_pubkey=bytes.fromhex(_node(index + 10)),
             local_funding_pubkey=bytes.fromhex(_node(index + 20)),
@@ -99,6 +107,32 @@ def _frozen(index: int) -> MakerFrozenChannelInput:
             remote_claim_sat=50_000,
         ),
         settlement_script_pubkey="5120" + f"{index + 40:064x}",
+    )
+
+
+def _candidate(frozen: MakerFrozenChannelInput, *, channel_id: int = 1) -> ChannelInputCandidate:
+    snapshot = frozen.snapshot
+    return ChannelInputCandidate(
+        channel_id=channel_id,
+        funding_outpoint=snapshot.funding_outpoint,
+        peer_node_pubkey=snapshot.peer_node_pubkey.hex(),
+        capacity_sat=snapshot.capacity_sat,
+        local_balance_sat=snapshot.local_claim_sat,
+        remote_balance_sat=snapshot.remote_claim_sat,
+        private=True,
+        active=True,
+        default_channel_state=True,
+        pending_htlc_count=0,
+        commitment_type=FINAL_TAPROOT_COMMITMENT,
+    )
+
+
+def _plan_freeze(
+    negotiation: MakerChannelInputNegotiation,
+    frozen: tuple[MakerFrozenChannelInput, ...],
+) -> tuple[MakerChannelInputFreezeIntent, ...]:
+    return negotiation.plan_freeze(
+        tuple(_candidate(item, channel_id=index) for index, item in enumerate(frozen))
     )
 
 
@@ -330,6 +364,7 @@ def _proposal_approved() -> tuple[
     ChannelInputApprovalPayload,
 ]:
     negotiation, frozen = _negotiation()
+    _plan_freeze(negotiation, frozen)
     negotiation.install_frozen_inputs(frozen)
     proposal, _ = _proposal(negotiation)
     approval = negotiation.accept_proposal(
@@ -342,6 +377,17 @@ def test_negotiation_multichannel_replay_and_json_restore() -> None:
     negotiation, frozen = _negotiation()
     assert negotiation.stage is MakerChannelInputStage.INVITED
     assert negotiation.snapshot().participant_secret_key_hex == PARTICIPANT_SECRET.hex()
+
+    intents = _plan_freeze(negotiation, tuple(reversed(frozen)))
+    assert negotiation.stage is MakerChannelInputStage.FREEZE_INTENDED
+    assert [intent.channel_id for intent in intents] == sorted(
+        f"{item.snapshot.funding_outpoint.txid}:{item.snapshot.funding_outpoint.vout}"
+        for item in frozen
+    )
+    freeze_snapshot = MakerChannelInputSnapshot.model_validate_json(
+        negotiation.snapshot().model_dump_json()
+    )
+    assert MakerChannelInputNegotiation.from_snapshot(freeze_snapshot).snapshot() == freeze_snapshot
 
     hellos = negotiation.install_frozen_inputs(tuple(reversed(frozen)))
     assert [hello.funding_outpoint.txid for hello in hellos] == sorted(
@@ -382,6 +428,7 @@ def test_negotiation_multichannel_replay_and_json_restore() -> None:
 
 def test_rejects_wrong_actor_and_conflicting_proposal() -> None:
     negotiation, frozen = _negotiation(channels=1)
+    _plan_freeze(negotiation, frozen)
     negotiation.install_frozen_inputs(frozen)
     proposal, _ = _proposal(negotiation)
     with pytest.raises(ChannelInputValidationError):
@@ -398,6 +445,7 @@ def test_rejects_wrong_actor_and_conflicting_proposal() -> None:
 
 def test_rejects_invalid_frozen_evidence_and_snapshot_tampering() -> None:
     negotiation, frozen = _negotiation(channels=1)
+    _plan_freeze(negotiation, frozen)
     wrong_session = frozen[0].model_copy(
         update={"snapshot": frozen[0].snapshot.model_copy(update={"session_id": "22" * 32})}
     )
@@ -410,6 +458,69 @@ def test_rejects_invalid_frozen_evidence_and_snapshot_tampering() -> None:
     tampered = MakerChannelInputSnapshot.model_validate(data)
     with pytest.raises(ChannelInputValidationError):
         MakerChannelInputNegotiation.from_snapshot(tampered)
+
+
+def test_plan_freeze_replay_and_stage_rules() -> None:
+    negotiation, frozen = _negotiation(channels=2)
+    candidates = tuple(_candidate(item, channel_id=index) for index, item in enumerate(frozen))
+
+    intents = negotiation.plan_freeze(tuple(reversed(candidates)))
+    assert intents == negotiation.plan_freeze(candidates)
+    assert negotiation.stage is MakerChannelInputStage.FREEZE_INTENDED
+
+    conflict = candidates[0].model_copy(update={"capacity_sat": 99_999})
+    with pytest.raises(ChannelInputValidationError):
+        negotiation.plan_freeze((conflict, candidates[1]))
+
+    negotiation.install_frozen_inputs(frozen)
+    assert negotiation.plan_freeze(candidates) == intents
+
+    wrong_stage, wrong_stage_frozen = _negotiation(channels=1)
+    wrong_stage.stage = MakerChannelInputStage.HELLOS_READY
+    with pytest.raises(ChannelInputValidationError):
+        _plan_freeze(wrong_stage, wrong_stage_frozen)
+
+
+@pytest.mark.parametrize("failure", ["zero", "over_limit", "duplicate_outpoint", "duplicate_id"])
+def test_plan_freeze_rejects_invalid_candidate_sets(failure: str) -> None:
+    channels = MAX_CHANNELS + 1 if failure == "over_limit" else 2
+    negotiation, frozen = _negotiation(channels=channels)
+    candidates = tuple(_candidate(item, channel_id=index) for index, item in enumerate(frozen))
+    supplied: tuple[ChannelInputCandidate, ...]
+    if failure == "zero":
+        supplied = ()
+    elif failure == "over_limit":
+        supplied = candidates
+    elif failure == "duplicate_outpoint":
+        supplied = (
+            candidates[0],
+            candidates[1].model_copy(update={"funding_outpoint": candidates[0].funding_outpoint}),
+        )
+    else:
+        supplied = (
+            candidates[0],
+            candidates[1].model_copy(update={"channel_id": candidates[0].channel_id}),
+        )
+    with pytest.raises(ChannelInputValidationError):
+        negotiation.plan_freeze(supplied)
+
+
+@pytest.mark.parametrize("failure", ["allowlist", "peer", "capacity", "invalid"])
+def test_plan_freeze_rejects_candidate_policy_and_model_mismatches(failure: str) -> None:
+    negotiation, frozen = _negotiation(channels=1)
+    candidate = _candidate(frozen[0])
+    if failure == "allowlist":
+        candidate = candidate.model_copy(
+            update={"funding_outpoint": EscrowOutpoint(txid="99" * 32, vout=0)}
+        )
+    elif failure == "peer":
+        candidate = candidate.model_copy(update={"peer_node_pubkey": _node(90)})
+    elif failure == "capacity":
+        candidate = candidate.model_copy(update={"capacity_sat": 99_999})
+    elif failure == "invalid":
+        candidate = candidate.model_copy(update={"pending_htlc_count": 1})
+    with pytest.raises(ChannelInputValidationError):
+        negotiation.plan_freeze((candidate,))
 
 
 @pytest.mark.parametrize(
@@ -460,6 +571,7 @@ def test_from_invite_rejects_invalid_admission(failure: str) -> None:
 )
 def test_install_frozen_inputs_rejects_each_evidence_invariant(failure: str) -> None:
     negotiation, frozen = _negotiation(channels=2 if failure.startswith("duplicate") else 1)
+    _plan_freeze(negotiation, frozen)
     first = frozen[0]
     supplied: tuple[MakerFrozenChannelInput, ...]
     if failure == "session":
@@ -522,10 +634,85 @@ def test_install_frozen_inputs_rejects_each_evidence_invariant(failure: str) -> 
 
 def test_install_frozen_inputs_rejects_conflicting_repeat() -> None:
     negotiation, frozen = _negotiation(channels=1)
+    _plan_freeze(negotiation, frozen)
     negotiation.install_frozen_inputs(frozen)
     conflict = frozen[0].model_copy(update={"settlement_script_pubkey": "5120" + "ff" * 32})
     with pytest.raises(ChannelInputValidationError):
         negotiation.install_frozen_inputs((conflict,))
+
+
+@pytest.mark.parametrize(
+    "failure", ["channel_id", "outpoint", "peer", "capacity", "missing", "extra"]
+)
+def test_install_frozen_inputs_requires_exact_freeze_intent_bijection(failure: str) -> None:
+    negotiation, frozen = _negotiation(channels=3)
+    _plan_freeze(negotiation, frozen[:2])
+    first, second, third = frozen
+    supplied: tuple[MakerFrozenChannelInput, ...]
+    if failure == "channel_id":
+        supplied = (
+            first.model_copy(
+                update={
+                    "snapshot": first.snapshot.model_copy(update={"channel_id": "00" * 32 + ":0"})
+                }
+            ),
+            second,
+        )
+    elif failure == "outpoint":
+        supplied = (
+            first.model_copy(
+                update={
+                    "snapshot": first.snapshot.model_copy(
+                        update={"funding_outpoint": third.snapshot.funding_outpoint}
+                    )
+                }
+            ),
+            second,
+        )
+    elif failure == "peer":
+        supplied = (
+            first.model_copy(
+                update={
+                    "snapshot": first.snapshot.model_copy(
+                        update={"peer_node_pubkey": third.snapshot.peer_node_pubkey}
+                    )
+                }
+            ),
+            second,
+        )
+    elif failure == "capacity":
+        negotiation.config = negotiation.config.model_copy(
+            update={"min_channel_capacity_sat": 99_999}
+        )
+        supplied = (
+            first.model_copy(
+                update={"snapshot": first.snapshot.model_copy(update={"capacity_sat": 99_999})}
+            ),
+            second,
+        )
+    elif failure == "missing":
+        supplied = (first,)
+    else:
+        supplied = (first, second, third)
+    with pytest.raises(ChannelInputValidationError):
+        negotiation.install_frozen_inputs(supplied)
+
+
+def test_snapshot_restore_rejects_tampered_or_missing_freeze_intents() -> None:
+    negotiation, frozen = _negotiation(channels=1)
+    _plan_freeze(negotiation, frozen)
+    freeze_data = negotiation.snapshot().model_dump(mode="python")
+    tampered_intent = negotiation.freeze_intents[0].model_copy(update={"capacity_sat": 99_999})
+    freeze_data["freeze_intents"] = (tampered_intent,)
+    tampered = MakerChannelInputSnapshot.model_validate(freeze_data)
+    with pytest.raises(ChannelInputValidationError):
+        MakerChannelInputNegotiation.from_snapshot(tampered)
+
+    negotiation.install_frozen_inputs(frozen)
+    old_hello_data = negotiation.snapshot().model_dump(mode="python")
+    old_hello_data["freeze_intents"] = ()
+    with pytest.raises(ValueError):
+        MakerChannelInputSnapshot.model_validate(old_hello_data)
 
 
 @pytest.mark.parametrize(
@@ -534,6 +721,7 @@ def test_install_frozen_inputs_rejects_conflicting_repeat() -> None:
 )
 def test_proposal_rejects_maker_local_policy(field: str, value: int) -> None:
     negotiation, frozen = _negotiation(channels=1)
+    _plan_freeze(negotiation, frozen)
     negotiation.install_frozen_inputs(frozen)
     proposal, _ = _proposal(negotiation)
     negotiation.config = negotiation.config.model_copy(update={field: value})
