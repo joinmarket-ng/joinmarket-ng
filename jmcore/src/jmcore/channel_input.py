@@ -399,8 +399,12 @@ class ChannelInputHelloPayload(ChannelInputPayload):
     type: Literal["channel_input_hello"] = "channel_input_hello"
     participant_key: Hex32
     node_key: Hex33
+    peer_node_key: Hex33
     funding_outpoint: Outpoint
     capacity_sat: int = Field(ge=1, le=MAX_MONEY)
+    funding_script_pubkey: str
+    frozen_local_claim_sat: int = Field(ge=0, le=MAX_MONEY)
+    frozen_remote_claim_sat: int = Field(ge=0, le=MAX_MONEY)
     settlement_script_pubkey: str
     quoted_miner_fee_share_sat: int = Field(ge=0, le=MAX_MONEY)
     policy_ceilings: PolicyCeilings
@@ -409,6 +413,12 @@ class ChannelInputHelloPayload(ChannelInputPayload):
     def validate_hello(self) -> ChannelInputHelloPayload:
         _validate_xonly_key(self.participant_key)
         _validate_node_key(self.node_key)
+        _validate_node_key(self.peer_node_key, "peer_node_key")
+        if self.node_key == self.peer_node_key:
+            raise ValueError("hello local and peer node keys must differ")
+        _validate_p2tr_script(self.funding_script_pubkey, "funding_script_pubkey")
+        if self.frozen_local_claim_sat + self.frozen_remote_claim_sat != self.capacity_sat:
+            raise ValueError("hello frozen claims must conserve channel capacity")
         _validate_p2tr_script(self.settlement_script_pubkey)
         if self.signer_key != self.participant_key:
             raise ValueError("hello signer_key must match participant_key")
@@ -811,6 +821,32 @@ def validate_hello_for_invite(
         raise ChannelInputValidationError("hello quoted fee exceeds invitation parent fee")
 
 
+def validate_hello_pair(first: ChannelInputHelloPayload, second: ChannelInputHelloPayload) -> None:
+    """Verify that two signed frozen-channel hello claims are reciprocal."""
+
+    if not verify_payload(first):
+        raise ChannelInputValidationError("first hello BIP340 signature is invalid")
+    if not verify_payload(second):
+        raise ChannelInputValidationError("second hello BIP340 signature is invalid")
+    if first.session_id != second.session_id or first.attempt != second.attempt:
+        raise ChannelInputValidationError("hello pair session or attempt does not match")
+    if first.funding_outpoint != second.funding_outpoint:
+        raise ChannelInputValidationError("hello pair funding outpoint does not match")
+    if first.capacity_sat != second.capacity_sat:
+        raise ChannelInputValidationError("hello pair capacity does not match")
+    if first.funding_script_pubkey != second.funding_script_pubkey:
+        raise ChannelInputValidationError("hello pair funding script does not match")
+    if first.participant_key == second.participant_key:
+        raise ChannelInputValidationError("hello pair participants must differ")
+    if first.node_key != second.peer_node_key or second.node_key != first.peer_node_key:
+        raise ChannelInputValidationError("hello pair node identities are not reciprocal")
+    if (
+        first.frozen_local_claim_sat != second.frozen_remote_claim_sat
+        or first.frozen_remote_claim_sat != second.frozen_local_claim_sat
+    ):
+        raise ChannelInputValidationError("hello pair frozen claims are not reciprocal")
+
+
 def validate_transcript_for_invite(
     invite: ChannelInputInvitePayload,
     transcript: ChannelInputTranscript,
@@ -908,10 +944,31 @@ def validate_proposal_for_hellos(
 
     for terms in proposal.recipient_terms:
         hello = hellos_by_outpoint[terms.funding_outpoint.key()]
+        try:
+            prevout = proposal.transcript.input_prevouts[terms.input_index]
+        except IndexError as exc:
+            raise ChannelInputValidationError(
+                "proposal term input_index is outside transcript prevouts"
+            ) from exc
+        if prevout.outpoint != hello.funding_outpoint:
+            raise ChannelInputValidationError("proposal transcript outpoint does not match hello")
+        if prevout.value_sat != hello.capacity_sat:
+            raise ChannelInputValidationError("proposal transcript capacity does not match hello")
+        if prevout.script_pubkey != hello.funding_script_pubkey:
+            raise ChannelInputValidationError(
+                "proposal transcript funding script does not match hello"
+            )
         if terms.capacity_sat != hello.capacity_sat:
             raise ChannelInputValidationError("proposal term capacity does not match hello")
         if terms.local_node_key != hello.node_key:
             raise ChannelInputValidationError("proposal term local node key does not match hello")
+        if terms.peer_node_key != hello.peer_node_key:
+            raise ChannelInputValidationError("proposal term peer node key does not match hello")
+        if (
+            terms.frozen_local_claim_sat != hello.frozen_local_claim_sat
+            or terms.frozen_remote_claim_sat != hello.frozen_remote_claim_sat
+        ):
+            raise ChannelInputValidationError("proposal term frozen claims do not match hello")
         if terms.policy_ceilings != hello.policy_ceilings:
             raise ChannelInputValidationError("proposal term policy ceilings do not match hello")
         if terms.miner_fee_share_sat > hello.quoted_miner_fee_share_sat:

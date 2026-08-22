@@ -48,6 +48,7 @@ from jmcore.channel_input import (
     validate_complete_approval_set,
     validate_finalized_for_transcript,
     validate_hello_for_invite,
+    validate_hello_pair,
     validate_prepare_payload,
     validate_proposal,
     validate_proposal_for_hellos,
@@ -200,8 +201,12 @@ def _signed_hello() -> ChannelInputHelloPayload:
             signer_key=_key(2),
             participant_key=_key(2),
             node_key=_node(22),
+            peer_node_key=_node(23),
             funding_outpoint=Outpoint(txid="01" * 32, vout=0),
             capacity_sat=100_000,
+            funding_script_pubkey="5120" + "22" * 32,
+            frozen_local_claim_sat=50_000,
+            frozen_remote_claim_sat=50_000,
             settlement_script_pubkey="5120" + "33" * 32,
             quoted_miner_fee_share_sat=1_000,
             policy_ceilings=_ceilings(),
@@ -211,21 +216,27 @@ def _signed_hello() -> ChannelInputHelloPayload:
     )
 
 
-def _signed_hello_for_terms(terms: EndpointTerms) -> ChannelInputHelloPayload:
+def _signed_hello_for_terms(
+    terms: EndpointTerms, *, signer_index: int = 2
+) -> ChannelInputHelloPayload:
     return sign_payload(
         ChannelInputHelloPayload(
             session_id=terms.session_id,
             attempt=terms.attempt,
-            signer_key=_key(2),
-            participant_key=_key(2),
+            signer_key=_key(signer_index),
+            participant_key=_key(signer_index),
             node_key=terms.local_node_key,
+            peer_node_key=terms.peer_node_key,
             funding_outpoint=terms.funding_outpoint,
             capacity_sat=terms.capacity_sat,
+            funding_script_pubkey="5120" + f"{terms.input_index + 201:064x}",
+            frozen_local_claim_sat=terms.frozen_local_claim_sat,
+            frozen_remote_claim_sat=terms.frozen_remote_claim_sat,
             settlement_script_pubkey=terms.settlement_outputs[0].script_pubkey,
             quoted_miner_fee_share_sat=terms.miner_fee_share_sat,
             policy_ceilings=terms.policy_ceilings,
         ),
-        _secret(2),
+        _secret(signer_index),
         aux_randomness=b"\x02" * 32,
     )
 
@@ -480,6 +491,99 @@ def test_invite_hello_signatures_and_expiry_are_verified_without_clock() -> None
         )
 
 
+def test_hello_requires_frozen_channel_evidence() -> None:
+    hello = _signed_hello()
+    for update, match in (
+        ({"funding_script_pubkey": "0014" + "44" * 20}, "funding_script_pubkey.*P2TR"),
+        ({"peer_node_key": hello.node_key}, "local and peer node keys must differ"),
+        (
+            {"frozen_local_claim_sat": 50_001, "frozen_remote_claim_sat": 50_000},
+            "frozen claims must conserve",
+        ),
+    ):
+        with pytest.raises(ValidationError, match=match):
+            ChannelInputHelloPayload(**{**hello.model_dump(), **update})
+
+
+def test_hello_pair_binds_reciprocal_frozen_channel_evidence() -> None:
+    _, terms = _transcript()
+    first = _signed_hello_for_terms(terms[0], signer_index=1)
+    second = _signed_hello_for_terms(terms[1])
+
+    validate_hello_pair(second, first)
+
+    substitutions = (
+        (first.model_copy(update={"sig": "00" * 64}), "second hello BIP340"),
+        (
+            sign_payload(
+                second.model_copy(update={"attempt": second.attempt + 1}),
+                _secret(2),
+                aux_randomness=b"\x21" * 32,
+            ),
+            "session or attempt",
+        ),
+        (
+            sign_payload(
+                second.model_copy(update={"funding_outpoint": Outpoint(txid="99" * 32, vout=1)}),
+                _secret(2),
+                aux_randomness=b"\x22" * 32,
+            ),
+            "funding outpoint",
+        ),
+        (
+            sign_payload(
+                second.model_copy(
+                    update={
+                        "capacity_sat": 99_999,
+                        "frozen_local_claim_sat": 49_999,
+                        "frozen_remote_claim_sat": 50_000,
+                    }
+                ),
+                _secret(2),
+                aux_randomness=b"\x23" * 32,
+            ),
+            "capacity",
+        ),
+        (
+            sign_payload(
+                second.model_copy(update={"funding_script_pubkey": "5120" + "99" * 32}),
+                _secret(2),
+                aux_randomness=b"\x24" * 32,
+            ),
+            "funding script",
+        ),
+        (
+            sign_payload(
+                second.model_copy(update={"signer_key": _key(1), "participant_key": _key(1)}),
+                _secret(1),
+                aux_randomness=b"\x25" * 32,
+            ),
+            "participants must differ",
+        ),
+        (
+            sign_payload(
+                second.model_copy(update={"peer_node_key": _node(30)}),
+                _secret(2),
+                aux_randomness=b"\x26" * 32,
+            ),
+            "node identities",
+        ),
+        (
+            sign_payload(
+                second.model_copy(
+                    update={"frozen_local_claim_sat": 49_999, "frozen_remote_claim_sat": 50_001}
+                ),
+                _secret(2),
+                aux_randomness=b"\x27" * 32,
+            ),
+            "frozen claims",
+        ),
+    )
+    for substituted, match in substitutions:
+        with pytest.raises(ChannelInputValidationError, match=match):
+            validate_hello_pair(first, substituted)
+
+
 def test_proposal_for_hellos_binds_signed_recipient_claims() -> None:
     transcript, terms = _transcript()
     invite = _signed_invite()
@@ -512,6 +616,11 @@ def test_proposal_for_hellos_binds_signed_recipient_claims() -> None:
         ({"funding_outpoint": terms[2].funding_outpoint}, "outpoints do not exactly"),
         ({"capacity_sat": 99_999}, "capacity does not match"),
         ({"node_key": _node(30)}, "local node key"),
+        ({"peer_node_key": _node(30)}, "peer node key"),
+        (
+            {"frozen_local_claim_sat": 49_999, "frozen_remote_claim_sat": 50_001},
+            "frozen claims",
+        ),
         (
             {
                 "policy_ceilings": hello.policy_ceilings.model_copy(
@@ -531,6 +640,33 @@ def test_proposal_for_hellos_binds_signed_recipient_claims() -> None:
             validate_proposal_for_hellos(
                 invite, (mutated,), proposal, current_time=1_800_000_000, current_height=999_900
             )
+
+    substituted_prevouts = list(transcript.input_prevouts)
+    substituted_prevouts[terms[1].input_index] = substituted_prevouts[
+        terms[1].input_index
+    ].model_copy(update={"script_pubkey": "5120" + "99" * 32})
+    substituted_transcript = ChannelInputTranscript(
+        **{**transcript.model_dump(), "input_prevouts": tuple(substituted_prevouts)}
+    )
+    substituted_proposal = sign_payload(
+        ChannelInputProposalPayload(
+            **{
+                **proposal.model_dump(),
+                "transcript": substituted_transcript,
+                "transcript_hash": transcript_hash(substituted_transcript).hex(),
+            }
+        ),
+        _secret(1),
+        aux_randomness=b"\x28" * 32,
+    )
+    with pytest.raises(ChannelInputValidationError, match="transcript funding script"):
+        validate_proposal_for_hellos(
+            invite,
+            (hello,),
+            substituted_proposal,
+            current_time=1_800_000_000,
+            current_height=999_900,
+        )
 
     excess = sign_payload(
         hello.model_copy(update={"funding_outpoint": Outpoint(txid="99" * 32, vout=1)}),
@@ -877,7 +1013,9 @@ def test_prepare_rejects_coordinator_substitution_and_wrong_set_hash() -> None:
 
 def test_codec_rejects_malformed_noncanonical_and_bounded_data() -> None:
     invite = _signed_invite()
+    hello = _signed_hello()
     assert decode_channel_input_message(encode_channel_input_message(invite)) == invite
+    assert decode_channel_input_message(encode_channel_input_message(hello)) == hello
     body = canonical_json(invite).decode()
     duplicate = body[:-1] + ',"v":1}'
     encoded = base64.urlsafe_b64encode(duplicate.encode()).rstrip(b"=").decode()
