@@ -102,6 +102,27 @@ def _validate_lock_ttl(ttl: float) -> float:
     return validated
 
 
+def _normalize_outpoint_for_dedup(outpoint: str) -> str | tuple[str, int]:
+    """Return a case/padding-independent identity for a ``txid:vout`` string.
+
+    Two outpoint strings that differ only in txid case or vout zero-padding
+    (``"AB..:0"`` vs. ``"ab..:00"``) name the same UTXO but never compare
+    equal as raw strings, which lets a naive string-based duplicate check let
+    both through. Callers of :meth:`UTXOMetadataStore.set_frozen` are expected
+    to pass well-formed outpoints (the HTTP layer validates this before the
+    store ever sees them); a malformed string falls back to raw-string
+    identity rather than raising here, since format validation is not this
+    method's job.
+    """
+    txid, sep, vout = outpoint.partition(":")
+    if not sep:
+        return outpoint
+    try:
+        return txid.lower(), int(vout)
+    except ValueError:
+        return outpoint
+
+
 @dataclass
 class OutputRecord:
     """A BIP-329 output record for UTXO metadata.
@@ -636,12 +657,13 @@ class UTXOMetadataStore:
         if not items:
             return
 
-        seen: set[str] = set()
+        seen: set[str | tuple[str, int]] = set()
         for outpoint, _freeze in items:
-            if outpoint in seen:
+            key = _normalize_outpoint_for_dedup(outpoint)
+            if key in seen:
                 msg = f"Duplicate outpoint in batch: {outpoint}"
                 raise ValueError(msg)
-            seen.add(outpoint)
+            seen.add(key)
 
         with self._exclusive_file_lock():
             self.load()

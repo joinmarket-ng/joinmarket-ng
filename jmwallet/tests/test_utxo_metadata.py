@@ -1463,6 +1463,13 @@ class TestBatchFreeze:
         with pytest.raises(ValueError, match="Duplicate outpoint"):
             store.set_frozen([(a, True), (a, False)])
 
+    def test_duplicate_outpoint_different_case_and_padding_raises(self, store):
+        """A raw-string check would miss this; same UTXO, different formatting."""
+        upper = "AA" * 32 + ":0"
+        padded = "aa" * 32 + ":00"
+        with pytest.raises(ValueError, match="Duplicate outpoint"):
+            store.set_frozen([(upper, True), (padded, False)])
+
     def test_duplicate_outpoint_applies_nothing(self, store, a, b, store_path):
         """A rejected batch must not partially apply."""
         with pytest.raises(ValueError, match="Duplicate outpoint"):

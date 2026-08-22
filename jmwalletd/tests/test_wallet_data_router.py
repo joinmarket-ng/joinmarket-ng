@@ -469,6 +469,30 @@ class TestFreezeBatch:
         assert "Duplicate" in resp.json()["message"]
         ws.set_utxos_frozen.assert_not_called()
 
+    def test_duplicate_outpoint_with_different_case_and_padding_is_rejected(
+        self, authed_client: tuple[TestClient, str]
+    ) -> None:
+        """A raw-string dedup would miss this: same UTXO, different formatting."""
+        client, token = authed_client
+        state = get_daemon_state()
+        ws = state.wallet_service
+        ws.set_utxos_frozen = Mock()
+
+        resp = client.post(
+            "/api/v1/wallet/test_wallet.jmdat/freeze-batch",
+            json={
+                "entries": [
+                    {"utxo-string": "AA" * 32 + ":0", "freeze": True},
+                    {"utxo-string": "aa" * 32 + ":00", "freeze": False},
+                ]
+            },
+            headers=_auth_headers(token),
+        )
+
+        assert resp.status_code == 400
+        assert "Duplicate" in resp.json()["message"]
+        ws.set_utxos_frozen.assert_not_called()
+
     def test_malformed_outpoint_is_rejected(self, authed_client: tuple[TestClient, str]) -> None:
         client, token = authed_client
         state = get_daemon_state()

@@ -384,6 +384,19 @@ def _validate_outpoint_format(utxo_str: str) -> None:
         raise InvalidRequestFormat(f"Invalid vout in UTXO: {utxo_str}") from exc
 
 
+def _normalized_outpoint_key(utxo_str: str) -> tuple[str, int]:
+    """Return an outpoint's ``(txid, vout)`` identity, independent of formatting.
+
+    Callers must run :func:`_validate_outpoint_format` first. Two outpoint
+    strings that only differ in txid case or vout zero-padding (e.g.
+    ``"AB..:0"`` vs. ``"ab..:00"``) refer to the same UTXO but never equal
+    each other as raw strings -- which lets a naive string-based duplicate
+    check miss them and let both through.
+    """
+    txid, vout = utxo_str.split(":")
+    return txid.lower(), int(vout)
+
+
 # ---------------------------------------------------------------------------
 # POST /api/v1/wallet/{walletname}/freeze
 # ---------------------------------------------------------------------------
@@ -434,11 +447,12 @@ async def freeze_utxos_batch(
     for entry in body.entries:
         _validate_outpoint_format(entry.utxo_string)
 
-    seen: set[str] = set()
+    seen: set[tuple[str, int]] = set()
     for entry in body.entries:
-        if entry.utxo_string in seen:
+        key = _normalized_outpoint_key(entry.utxo_string)
+        if key in seen:
             raise InvalidRequestFormat(f"Duplicate UTXO in batch: {entry.utxo_string}")
-        seen.add(entry.utxo_string)
+        seen.add(key)
 
     ws = state.wallet_service
     try:
