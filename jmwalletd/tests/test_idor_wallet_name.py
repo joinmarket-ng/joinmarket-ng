@@ -181,6 +181,31 @@ class TestIDORFreeze:
         assert resp.status_code != 404
 
 
+class TestIDORFreezeBatch:
+    """POST /api/v1/wallet/{walletname}/freeze-batch"""
+
+    def test_idor_wrong_name_rejected(self, app_with_wallet: TestClient, auth_token: str) -> None:
+        resp = app_with_wallet.post(
+            f"/api/v1/wallet/{EVIL_WALLET}/freeze-batch",
+            headers=_auth(auth_token),
+            json={"entries": [{"utxo-string": "aa" * 32 + ":0", "freeze": True}]},
+        )
+        assert resp.status_code == 404, (
+            f"IDOR: freeze-batch returned {resp.status_code} for '{EVIL_WALLET}'"
+        )
+
+    def test_correct_walletname_any_response(
+        self, app_with_wallet: TestClient, auth_token: str
+    ) -> None:
+        """Just confirm the request is not blocked by wallet-name check."""
+        resp = app_with_wallet.post(
+            f"/api/v1/wallet/{REAL_WALLET}/freeze-batch",
+            headers=_auth(auth_token),
+            json={"entries": [{"utxo-string": "aa" * 32 + ":0", "freeze": True}]},
+        )
+        assert resp.status_code != 404
+
+
 class TestIDORDirectSend:
     """POST /api/v1/wallet/{walletname}/taker/direct-send"""
 

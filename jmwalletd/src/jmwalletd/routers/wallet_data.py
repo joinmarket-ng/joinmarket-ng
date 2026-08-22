@@ -25,6 +25,7 @@ from jmwalletd.models import (
     ConfigGetRequest,
     ConfigGetResponse,
     ConfigSetRequest,
+    FreezeBatchRequest,
     FreezeRequest,
     GetAddressResponse,
     GetSeedResponse,
@@ -371,6 +372,18 @@ async def get_seed(
     return GetSeedResponse(seedphrase=state.wallet_mnemonic)
 
 
+def _validate_outpoint_format(utxo_str: str) -> None:
+    """Validate a ``txid:vout`` string, raising :class:`InvalidRequestFormat` on failure."""
+    parts = utxo_str.split(":")
+    if len(parts) != 2:
+        raise InvalidRequestFormat(f"Invalid UTXO format: {utxo_str}. Expected txid:vout.")
+
+    try:
+        int(parts[1])
+    except ValueError as exc:
+        raise InvalidRequestFormat(f"Invalid vout in UTXO: {utxo_str}") from exc
+
+
 # ---------------------------------------------------------------------------
 # POST /api/v1/wallet/{walletname}/freeze
 # ---------------------------------------------------------------------------
@@ -386,22 +399,54 @@ async def freeze_utxo(
     if state.taker_running:
         raise ActionNotAllowed("Cannot freeze/unfreeze UTXOs while a coinjoin is in progress.")
 
-    # Validate utxo format: "txid:vout"
     utxo_str = body.utxo_string
-    parts = utxo_str.split(":")
-    if len(parts) != 2:
-        raise InvalidRequestFormat(f"Invalid UTXO format: {utxo_str}. Expected txid:vout.")
-
-    try:
-        int(parts[1])
-    except ValueError as exc:
-        raise InvalidRequestFormat(f"Invalid vout in UTXO: {utxo_str}") from exc
+    _validate_outpoint_format(utxo_str)
 
     ws = state.wallet_service
     if body.freeze:
         ws.freeze_utxo(utxo_str)
     else:
         ws.unfreeze_utxo(utxo_str)
+
+    return {}
+
+
+# ---------------------------------------------------------------------------
+# POST /api/v1/wallet/{walletname}/freeze-batch
+# ---------------------------------------------------------------------------
+@router.post("/wallet/{walletname}/freeze-batch", operation_id="freezebatch")
+async def freeze_utxos_batch(
+    walletname: str,
+    body: FreezeBatchRequest,
+    _auth: dict[str, Any] = Depends(require_auth),
+    _wallet: None = Depends(require_wallet_match),
+    state: DaemonState = Depends(get_daemon_state),
+) -> dict[str, str]:
+    """Freeze and/or unfreeze several UTXOs in one atomic request (issue #596).
+
+    Mixed directions are allowed in the same batch. Every entry is validated
+    before anything is written; if any outpoint is malformed or repeated, the
+    whole request is rejected and nothing on disk changes.
+    """
+    if state.taker_running:
+        raise ActionNotAllowed("Cannot freeze/unfreeze UTXOs while a coinjoin is in progress.")
+
+    for entry in body.entries:
+        _validate_outpoint_format(entry.utxo_string)
+
+    seen: set[str] = set()
+    for entry in body.entries:
+        if entry.utxo_string in seen:
+            raise InvalidRequestFormat(f"Duplicate UTXO in batch: {entry.utxo_string}")
+        seen.add(entry.utxo_string)
+
+    ws = state.wallet_service
+    try:
+        ws.set_utxos_frozen((entry.utxo_string, entry.freeze) for entry in body.entries)
+    except ValueError as exc:
+        # Belt-and-braces: the store re-checks duplicates itself, so this
+        # should be unreachable given the pre-check above.
+        raise InvalidRequestFormat(str(exc)) from exc
 
     return {}
 

@@ -395,6 +395,128 @@ class TestFreeze:
         ws.unfreeze_utxo.assert_called_once_with("abc123:0")
 
 
+class TestFreezeBatch:
+    """POST /freeze-batch — atomic batched freeze/unfreeze (issue #596)."""
+
+    def test_requires_auth(self, authed_client: tuple[TestClient, str]) -> None:
+        client, _ = authed_client
+        resp = client.post(
+            "/api/v1/wallet/test_wallet.jmdat/freeze-batch",
+            json={"entries": [{"utxo-string": "abc:0", "freeze": True}]},
+        )
+        assert resp.status_code == 401
+
+    def test_mixed_batch_forwards_pairs_in_order(
+        self, authed_client: tuple[TestClient, str]
+    ) -> None:
+        client, token = authed_client
+        state = get_daemon_state()
+        ws = state.wallet_service
+        ws.set_utxos_frozen = Mock()
+
+        resp = client.post(
+            "/api/v1/wallet/test_wallet.jmdat/freeze-batch",
+            json={
+                "entries": [
+                    {"utxo-string": "aa" * 32 + ":0", "freeze": True},
+                    {"utxo-string": "bb" * 32 + ":1", "freeze": False},
+                ]
+            },
+            headers=_auth_headers(token),
+        )
+
+        assert resp.status_code == 200
+        ((changes,), _kwargs) = ws.set_utxos_frozen.call_args
+        assert list(changes) == [
+            ("aa" * 32 + ":0", True),
+            ("bb" * 32 + ":1", False),
+        ]
+
+    def test_empty_batch_is_rejected(self, authed_client: tuple[TestClient, str]) -> None:
+        client, token = authed_client
+        state = get_daemon_state()
+        ws = state.wallet_service
+        ws.set_utxos_frozen = Mock()
+
+        resp = client.post(
+            "/api/v1/wallet/test_wallet.jmdat/freeze-batch",
+            json={"entries": []},
+            headers=_auth_headers(token),
+        )
+
+        assert resp.status_code == 422
+        ws.set_utxos_frozen.assert_not_called()
+
+    def test_duplicate_outpoint_is_rejected(self, authed_client: tuple[TestClient, str]) -> None:
+        client, token = authed_client
+        state = get_daemon_state()
+        ws = state.wallet_service
+        ws.set_utxos_frozen = Mock()
+        outpoint = "aa" * 32 + ":0"
+
+        resp = client.post(
+            "/api/v1/wallet/test_wallet.jmdat/freeze-batch",
+            json={
+                "entries": [
+                    {"utxo-string": outpoint, "freeze": True},
+                    {"utxo-string": outpoint, "freeze": False},
+                ]
+            },
+            headers=_auth_headers(token),
+        )
+
+        assert resp.status_code == 400
+        assert "Duplicate" in resp.json()["message"]
+        ws.set_utxos_frozen.assert_not_called()
+
+    def test_malformed_outpoint_is_rejected(self, authed_client: tuple[TestClient, str]) -> None:
+        client, token = authed_client
+        state = get_daemon_state()
+        ws = state.wallet_service
+        ws.set_utxos_frozen = Mock()
+
+        resp = client.post(
+            "/api/v1/wallet/test_wallet.jmdat/freeze-batch",
+            json={"entries": [{"utxo-string": "not-an-outpoint", "freeze": True}]},
+            headers=_auth_headers(token),
+        )
+
+        assert resp.status_code == 400
+        ws.set_utxos_frozen.assert_not_called()
+
+    def test_rejects_while_coinjoin_running(self, authed_client: tuple[TestClient, str]) -> None:
+        client, token = authed_client
+        state = get_daemon_state()
+        state.taker_running = True
+        ws = state.wallet_service
+        ws.set_utxos_frozen = Mock()
+
+        resp = client.post(
+            "/api/v1/wallet/test_wallet.jmdat/freeze-batch",
+            json={"entries": [{"utxo-string": "aa" * 32 + ":0", "freeze": True}]},
+            headers=_auth_headers(token),
+        )
+
+        assert resp.status_code == 400
+        ws.set_utxos_frozen.assert_not_called()
+
+    def test_batch_size_cap_is_enforced(self, authed_client: tuple[TestClient, str]) -> None:
+        client, token = authed_client
+        state = get_daemon_state()
+        ws = state.wallet_service
+        ws.set_utxos_frozen = Mock()
+        entries = [{"utxo-string": f"{i:064x}:0", "freeze": True} for i in range(501)]
+
+        resp = client.post(
+            "/api/v1/wallet/test_wallet.jmdat/freeze-batch",
+            json={"entries": entries},
+            headers=_auth_headers(token),
+        )
+
+        assert resp.status_code == 422
+        ws.set_utxos_frozen.assert_not_called()
+
+
 class TestConfigGet:
     def test_requires_auth(self, authed_client: tuple[TestClient, str]) -> None:
         client, _ = authed_client
