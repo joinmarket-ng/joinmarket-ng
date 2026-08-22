@@ -78,6 +78,14 @@ class ChannelInputParentState(StrEnum):
     RECOVERY_REQUIRED = "recovery_required"
 
 
+class ChannelInputRestartAction(StrEnum):
+    NONE = "none"
+    CANCEL_PRE_SIGN = "cancel_pre_sign"
+    RESUME_EXACT_PARENT = "resume_exact_parent"
+    PUBLISH_EXACT_PARENT = "publish_exact_parent"
+    FORCE_CLOSE = "force_close"
+
+
 class _StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
@@ -1048,6 +1056,182 @@ class ChannelInputParentCoordinator:
             raise ChannelInputParentError("channel-parent record does not exist")
         return await self._progress(record, endpoints)
 
+    @staticmethod
+    def _validate_current_height(current_height: int) -> None:
+        if (
+            isinstance(current_height, bool)
+            or not isinstance(current_height, int)
+            or not 0 <= current_height <= 0xFFFFFFFF
+        ):
+            raise ChannelInputParentError("current height must be a uint32 integer")
+
+    @staticmethod
+    def _has_persisted_partial(record: ChannelInputParentRecord) -> bool:
+        return any(
+            evidence is not None and evidence.partial_signature is not None
+            for channel in record.channels
+            for evidence in (channel.first_evidence, channel.second_evidence)
+        )
+
+    @staticmethod
+    def _is_inherently_post_sign(record: ChannelInputParentRecord) -> bool:
+        return (
+            record.state is ChannelInputParentState.CHANNEL_SIGNED
+            or record.final_tx_hex is not None
+        )
+
+    @staticmethod
+    def _validate_observed_parent(
+        record: ChannelInputParentRecord, observed: ChainTransaction
+    ) -> tuple[str, tuple[ChannelRecord, ...]]:
+        expected_txid = get_txid(record.plan.unsigned_parent_hex)
+        try:
+            raw = bytes.fromhex(observed.raw).hex()
+            if observed.txid != expected_txid or get_txid(raw) != expected_txid:
+                raise ChannelInputParentError("chain returned contradictory transaction data")
+            transaction = parse_transaction(raw)
+            unsigned = serialize_transaction(
+                transaction.version, transaction.inputs, transaction.outputs, transaction.locktime
+            ).hex()
+        except (TypeError, ValueError) as exc:
+            raise ChannelInputParentError("chain returned malformed transaction data") from exc
+        if unsigned != record.plan.unsigned_parent_hex:
+            raise ChannelInputParentError("chain returned a mutated parent transaction")
+        if len(transaction.witnesses) != len(transaction.inputs):
+            raise ChannelInputParentError("chain returned incomplete transaction witnesses")
+
+        ordinary_by_index = {
+            ordinary.input_index: ordinary for ordinary in record.plan.ordinary_witnesses
+        }
+        channel_by_index = {
+            channel.channel_input_index: channel for channel in record.plan.channels
+        }
+        values = [prevout.value_sat for prevout in record.plan.prevouts]
+        scripts = [bytes.fromhex(prevout.script_pubkey) for prevout in record.plan.prevouts]
+        observed_witnesses: dict[int, str] = {}
+        for index, witness in enumerate(transaction.witnesses):
+            if index in ordinary_by_index:
+                if tuple(item.hex() for item in witness) != ordinary_by_index[index].witness:
+                    raise ChannelInputParentError("chain returned contradictory ordinary witness")
+            elif index in channel_by_index:
+                script = scripts[index]
+                if (
+                    len(script) != 34
+                    or script[:2] != b"\x51\x20"
+                    or len(witness) != 1
+                    or not verify_p2tr_signature(
+                        parse_transaction(record.plan.unsigned_parent_hex),
+                        index,
+                        values,
+                        scripts,
+                        witness[0],
+                        script[2:],
+                    )
+                ):
+                    raise ChannelInputParentError("invalid observed channel P2TR witness")
+                observed_witnesses[index] = witness[0].hex()
+            else:
+                raise ChannelInputParentError("chain returned an unexpected parent input")
+
+        if not record.channels:
+            return raw, record.channels
+        records_by_index = {channel.channel_input_index: channel for channel in record.channels}
+        if set(records_by_index) != set(channel_by_index):
+            raise ChannelInputParentError("persisted channel records differ from parent plan")
+        return (
+            raw,
+            tuple(
+                channel.model_copy(
+                    update={"witness": observed_witnesses[channel.channel_input_index]}
+                )
+                for channel in record.channels
+            ),
+        )
+
+    async def _observe_authorized_parent(
+        self, record: ChannelInputParentRecord, chain: ChannelInputParentChain
+    ) -> ChannelInputParentRecord:
+        try:
+            expected_txid = get_txid(record.plan.unsigned_parent_hex)
+            observed = await chain.get_transaction(expected_txid)
+            if observed is None:
+                return record
+            raw, channels = self._validate_observed_parent(record, observed)
+            state = (
+                ChannelInputParentState.CONFIRMED
+                if observed.confirmations > 0
+                else ChannelInputParentState.OBSERVED
+            )
+            return self._save(
+                record,
+                state=state,
+                channels=channels,
+                final_tx_hex=raw,
+                final_txid=expected_txid,
+                observation=ChainObservation(confirmations=observed.confirmations),
+            )
+        except Exception as exc:
+            self._mark_recovery_required(record.record_id)
+            if isinstance(exc, ChannelInputParentError):
+                raise
+            raise ChannelInputParentError("chain observation failed") from exc
+
+    async def decide_restart(
+        self,
+        session_id: str,
+        endpoints: Mapping[str, ChannelInputEndpoint],
+        chain: ChannelInputParentChain,
+        *,
+        current_height: int,
+    ) -> ChannelInputRestartAction:
+        self._validate_current_height(current_height)
+        record = self._store.load(self.record_id(session_id))
+        if record is None:
+            raise ChannelInputParentError("channel-parent record does not exist")
+        if record.state in {
+            ChannelInputParentState.CANCELED,
+            ChannelInputParentState.OBSERVED,
+            ChannelInputParentState.CONFIRMED,
+        }:
+            return ChannelInputRestartAction.NONE
+
+        if record.final_tx_hex is not None:
+            record = await self.observe(session_id, chain)
+        else:
+            record = await self._observe_authorized_parent(record, chain)
+        if record.state in {
+            ChannelInputParentState.OBSERVED,
+            ChannelInputParentState.CONFIRMED,
+        }:
+            return ChannelInputRestartAction.NONE
+
+        if record.state in {
+            ChannelInputParentState.CREATED,
+            ChannelInputParentState.CHANNELS_FROZEN,
+            ChannelInputParentState.PARENT_PREPARED,
+            ChannelInputParentState.ORDINARY_SIGNED,
+        }:
+            return ChannelInputRestartAction.CANCEL_PRE_SIGN
+
+        if (
+            record.state
+            in {
+                ChannelInputParentState.CHANNEL_SIGNING,
+                ChannelInputParentState.RECOVERY_REQUIRED,
+            }
+            and record.final_tx_hex is None
+        ):
+            record = await self._reconcile_signing(record, endpoints)
+
+        if not self._has_persisted_partial(record) and not self._is_inherently_post_sign(record):
+            return ChannelInputRestartAction.CANCEL_PRE_SIGN
+        recovery_height = record.plan.authorization.prepare.approval_set.transcript.recovery_height
+        if current_height >= recovery_height:
+            return ChannelInputRestartAction.FORCE_CLOSE
+        if record.final_tx_hex is not None:
+            return ChannelInputRestartAction.PUBLISH_EXACT_PARENT
+        return ChannelInputRestartAction.RESUME_EXACT_PARENT
+
     async def _reconcile_signing(
         self, record: ChannelInputParentRecord, endpoints: Mapping[str, ChannelInputEndpoint]
     ) -> ChannelInputParentRecord:
@@ -1138,10 +1322,24 @@ class ChannelInputParentCoordinator:
             raise ChannelInputParentError("channel-parent record does not exist")
         if record.state is ChannelInputParentState.CREATED:
             record = await self._freeze_channels(record, endpoints)
+        if (
+            record.state
+            in {
+                ChannelInputParentState.CHANNEL_SIGNING,
+                ChannelInputParentState.RECOVERY_REQUIRED,
+            }
+            and record.final_tx_hex is None
+        ):
+            record = await self._reconcile_signing(record, endpoints)
+            if self._has_persisted_partial(record):
+                raise ChannelInputParentError(
+                    "cancellation is forbidden after a channel partial is signed"
+                )
         if record.state not in {
             ChannelInputParentState.CHANNELS_FROZEN,
             ChannelInputParentState.PARENT_PREPARED,
             ChannelInputParentState.ORDINARY_SIGNED,
+            ChannelInputParentState.CHANNEL_SIGNING,
         }:
             raise ChannelInputParentError("cancellation is forbidden after channel signing begins")
         for contribution, channel in zip(record.plan.channels, record.channels, strict=True):

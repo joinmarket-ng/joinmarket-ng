@@ -54,7 +54,9 @@ from taker.channel_input_parent import (
     ChannelInputParentCoordinator,
     ChannelInputParentError,
     ChannelInputParentPlan,
+    ChannelInputParentRecord,
     ChannelInputParentState,
+    ChannelInputRestartAction,
     EndpointContribution,
     FrozenSnapshot,
     OrdinaryWitness,
@@ -71,11 +73,14 @@ class FakeTransaction:
 
 
 class FakeChain:
-    def __init__(self) -> None:
+    def __init__(self, calls: list[str] | None = None) -> None:
         self.transaction: FakeTransaction | None = None
         self.broadcasts: list[str] = []
+        self.calls = calls
 
     async def get_transaction(self, txid: str) -> FakeTransaction | None:
+        if self.calls is not None:
+            self.calls.append("chain")
         if self.transaction is not None and self.transaction.txid == txid:
             return self.transaction
         return None
@@ -95,11 +100,13 @@ class FakeEndpoint:
         first: bool,
         shared_signature: list[bytes | None],
         crash_after_sign: bool = False,
+        fail_sign_once: bool = False,
         fail_freeze_once: bool = False,
         fail_prepare_once: bool = False,
         mutate_final: bool = False,
         snapshot_peer_key: PrivateKey | None = None,
         snapshot_local_claim_sat: int = 50_000,
+        calls: list[str] | None = None,
     ) -> None:
         self.local_key = local_key
         self.remote_key = remote_key
@@ -107,6 +114,7 @@ class FakeEndpoint:
         self.first = first
         self.shared_signature = shared_signature
         self.crash_after_sign = crash_after_sign
+        self.fail_sign_once = fail_sign_once
         self.fail_freeze_once = fail_freeze_once
         self.fail_prepare_once = fail_prepare_once
         self.mutate_final = mutate_final
@@ -122,6 +130,7 @@ class FakeEndpoint:
         self.sign_calls = 0
         self.cancel_calls = 0
         self.freeze_calls = 0
+        self.calls = calls
 
     def _snapshot(self, session_id: str, channel_id: str) -> FrozenChannelSnapshot:
         del session_id
@@ -187,6 +196,9 @@ class FakeEndpoint:
         del session_id, funding_outpoint, remote_public_nonce
         assert self.attempt == attempt
         self.sign_calls += 1
+        if self.fail_sign_once:
+            self.fail_sign_once = False
+            raise RuntimeError("simulated signing interruption before durable partial")
         if self.partial is None:
             self.partial = (b"\x03" if self.first else b"\x04") * 32
         if self.crash_after_sign:
@@ -241,6 +253,8 @@ class FakeEndpoint:
         self, session_id: str, funding_outpoint: EscrowOutpoint
     ) -> LndEscrowStatus:
         del session_id, funding_outpoint
+        if self.calls is not None:
+            self.calls.append("status")
         assert self.attempt is not None
         partial = self.status_partial if self.status_partial is not None else self.partial
         signed = partial is not None
@@ -533,11 +547,13 @@ def _plan(
 def _endpoints(
     *,
     crash_after_sign: bool = False,
+    fail_sign_once: bool = False,
     fail_freeze_once: bool = False,
     fail_prepare_once: bool = False,
     mutate_final: bool = False,
     first_snapshot_peer_key: PrivateKey | None = None,
     first_snapshot_local_claim_sat: int = 50_000,
+    calls: list[str] | None = None,
 ) -> dict[str, FakeEndpoint]:
     first_key = PrivateKey(b"\x01" * 32)
     second_key = PrivateKey(b"\x02" * 32)
@@ -551,11 +567,13 @@ def _endpoints(
             first=True,
             shared_signature=shared_signature,
             crash_after_sign=crash_after_sign,
+            fail_sign_once=fail_sign_once,
             fail_freeze_once=fail_freeze_once,
             fail_prepare_once=fail_prepare_once,
             mutate_final=mutate_final,
             snapshot_peer_key=first_snapshot_peer_key,
             snapshot_local_claim_sat=first_snapshot_local_claim_sat,
+            calls=calls,
         ),
         "second": FakeEndpoint(
             local_key=second_key,
@@ -563,8 +581,44 @@ def _endpoints(
             funding_key=funding_key,
             first=False,
             shared_signature=shared_signature,
+            calls=calls,
         ),
     }
+
+
+def _final_parent(plan: ChannelInputParentPlan) -> str:
+    funding_key = PrivateKey(b"\x05" * 32)
+    transaction = parse_transaction(plan.unsigned_parent_hex)
+    signature = sign_p2tr_input(
+        transaction,
+        0,
+        [prevout.value_sat for prevout in plan.prevouts],
+        [bytes.fromhex(prevout.script_pubkey) for prevout in plan.prevouts],
+        funding_key,
+    )
+    ordinary = plan.ordinary_witnesses[0]
+    return serialize_transaction(
+        transaction.version,
+        transaction.inputs,
+        transaction.outputs,
+        transaction.locktime,
+        [[signature], [bytes.fromhex(item) for item in ordinary.witness]],
+    ).hex()
+
+
+def _save_record(
+    coordinator: ChannelInputParentCoordinator,
+    plan: ChannelInputParentPlan,
+    state: ChannelInputParentState,
+) -> None:
+    coordinator._store.save(
+        ChannelInputParentRecord(
+            record_id=coordinator.record_id(plan.session_id),
+            plan=plan,
+            state=state,
+            updated_at_ns=0,
+        )
+    )
 
 
 def test_happy_path_persists_final_bytes_and_publishes_query_first(tmp_path: Path) -> None:
@@ -1035,3 +1089,194 @@ def test_cancellation_only_before_channel_signing(tmp_path: Path) -> None:
     canceled = asyncio.run(coordinator.cancel(SESSION_ID, endpoints))
     assert canceled.state is ChannelInputParentState.CANCELED
     assert endpoints["first"].cancel_calls == endpoints["second"].cancel_calls == 1
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        ChannelInputParentState.CREATED,
+        ChannelInputParentState.CHANNELS_FROZEN,
+        ChannelInputParentState.PARENT_PREPARED,
+        ChannelInputParentState.ORDINARY_SIGNED,
+    ],
+)
+def test_restart_decision_cancels_pre_sign_states(
+    tmp_path: Path, state: ChannelInputParentState
+) -> None:
+    coordinator = ChannelInputParentCoordinator(tmp_path)
+    plan = _plan()
+    _save_record(coordinator, plan, state)
+
+    action = asyncio.run(
+        coordinator.decide_restart(SESSION_ID, _endpoints(), FakeChain(), current_height=0)
+    )
+
+    assert action is ChannelInputRestartAction.CANCEL_PRE_SIGN
+
+
+def test_cancel_and_restart_decision_allow_reconciled_nonce_only_signing(tmp_path: Path) -> None:
+    coordinator = ChannelInputParentCoordinator(tmp_path)
+    endpoints = _endpoints(fail_sign_once=True)
+    with pytest.raises(ChannelInputParentError, match="progression failed"):
+        asyncio.run(coordinator.execute(_plan(), endpoints))
+
+    action = asyncio.run(
+        coordinator.decide_restart(SESSION_ID, endpoints, FakeChain(), current_height=0)
+    )
+    canceled = asyncio.run(coordinator.cancel(SESSION_ID, endpoints))
+
+    assert action is ChannelInputRestartAction.CANCEL_PRE_SIGN
+    assert canceled.state is ChannelInputParentState.CANCELED
+    assert endpoints["first"].cancel_calls == endpoints["second"].cancel_calls == 1
+
+
+def test_restart_decision_recovers_durable_partial_at_deadline(tmp_path: Path) -> None:
+    coordinator = ChannelInputParentCoordinator(tmp_path)
+    endpoints = _endpoints(crash_after_sign=True)
+    with pytest.raises(ChannelInputParentError, match="progression failed"):
+        asyncio.run(coordinator.execute(_plan(), endpoints))
+
+    below_deadline = asyncio.run(
+        coordinator.decide_restart(SESSION_ID, endpoints, FakeChain(), current_height=999_998)
+    )
+    at_deadline = asyncio.run(
+        coordinator.decide_restart(SESSION_ID, endpoints, FakeChain(), current_height=999_999)
+    )
+
+    assert below_deadline is ChannelInputRestartAction.RESUME_EXACT_PARENT
+    assert at_deadline is ChannelInputRestartAction.FORCE_CLOSE
+
+
+def test_restart_decision_publishes_persisted_parent_before_deadline(tmp_path: Path) -> None:
+    coordinator = ChannelInputParentCoordinator(tmp_path)
+    record = asyncio.run(coordinator.execute(_plan(), _endpoints()))
+
+    below_deadline = asyncio.run(
+        coordinator.decide_restart(
+            record.plan.session_id, _endpoints(), FakeChain(), current_height=999_998
+        )
+    )
+    at_deadline = asyncio.run(
+        coordinator.decide_restart(
+            record.plan.session_id, _endpoints(), FakeChain(), current_height=999_999
+        )
+    )
+
+    assert below_deadline is ChannelInputRestartAction.PUBLISH_EXACT_PARENT
+    assert at_deadline is ChannelInputRestartAction.FORCE_CLOSE
+
+
+def test_restart_decision_adopts_exact_observed_parent_before_final_persistence(
+    tmp_path: Path,
+) -> None:
+    coordinator = ChannelInputParentCoordinator(tmp_path)
+    plan = _plan()
+    endpoints = _endpoints(crash_after_sign=True)
+    with pytest.raises(ChannelInputParentError, match="progression failed"):
+        asyncio.run(coordinator.execute(plan, endpoints))
+    final_hex = _final_parent(plan)
+    chain = FakeChain()
+    chain.transaction = FakeTransaction(get_txid(final_hex), final_hex, confirmations=1)
+
+    action = asyncio.run(coordinator.decide_restart(SESSION_ID, endpoints, chain, current_height=0))
+    record = coordinator._store.load(coordinator.record_id(SESSION_ID))
+
+    assert action is ChannelInputRestartAction.NONE
+    assert record is not None
+    assert record.state is ChannelInputParentState.CONFIRMED
+    assert record.final_tx_hex == final_hex
+    assert record.channels[0].witness is not None
+
+
+@pytest.mark.parametrize("kind", ["malformed", "mutated", "invalid_witness"])
+def test_restart_decision_rejects_invalid_observed_parent_before_persistence(
+    tmp_path: Path, kind: str
+) -> None:
+    coordinator = ChannelInputParentCoordinator(tmp_path)
+    plan = _plan()
+    endpoints = _endpoints(crash_after_sign=True)
+    with pytest.raises(ChannelInputParentError):
+        asyncio.run(coordinator.execute(plan, endpoints))
+    final_hex = _final_parent(plan)
+    if kind == "malformed":
+        raw = "00"
+    else:
+        transaction = parse_transaction(final_hex)
+        if kind == "mutated":
+            transaction.outputs[0] = TxOutput(
+                value=transaction.outputs[0].value + 1, script=transaction.outputs[0].script
+            )
+        else:
+            transaction.witnesses[0] = [b"\x00" * len(transaction.witnesses[0][0])]
+        raw = serialize_transaction(
+            transaction.version,
+            transaction.inputs,
+            transaction.outputs,
+            transaction.locktime,
+            transaction.witnesses,
+        ).hex()
+    chain = FakeChain()
+    chain.transaction = FakeTransaction(get_txid(plan.unsigned_parent_hex), raw, confirmations=0)
+
+    with pytest.raises(ChannelInputParentError):
+        asyncio.run(coordinator.decide_restart(SESSION_ID, endpoints, chain, current_height=0))
+
+
+@pytest.mark.parametrize(
+    "terminal_state",
+    [
+        ChannelInputParentState.CANCELED,
+        ChannelInputParentState.OBSERVED,
+        ChannelInputParentState.CONFIRMED,
+    ],
+)
+def test_restart_decision_queries_chain_before_lnd_and_skips_terminal_rpcs(
+    tmp_path: Path, terminal_state: ChannelInputParentState
+) -> None:
+    coordinator = ChannelInputParentCoordinator(tmp_path)
+    calls: list[str] = []
+    endpoints = _endpoints(crash_after_sign=True, calls=calls)
+    with pytest.raises(ChannelInputParentError):
+        asyncio.run(coordinator.execute(_plan(), endpoints))
+    calls.clear()
+
+    action = asyncio.run(
+        coordinator.decide_restart(SESSION_ID, endpoints, FakeChain(calls), current_height=0)
+    )
+
+    assert action is ChannelInputRestartAction.RESUME_EXACT_PARENT
+    assert calls == ["chain", "status", "status"]
+    terminal = ChannelInputParentCoordinator(tmp_path / "terminal")
+    plan = _plan()
+    _save_record(terminal, plan, terminal_state)
+    terminal_calls: list[str] = []
+    assert (
+        asyncio.run(
+            terminal.decide_restart(
+                SESSION_ID,
+                _endpoints(calls=terminal_calls),
+                FakeChain(terminal_calls),
+                current_height=0,
+            )
+        )
+        is ChannelInputRestartAction.NONE
+    )
+    assert terminal_calls == []
+
+
+@pytest.mark.parametrize("current_height", [-1, 0x1_0000_0000, True, 1.5])
+def test_restart_decision_rejects_invalid_current_height(
+    tmp_path: Path, current_height: object
+) -> None:
+    coordinator = ChannelInputParentCoordinator(tmp_path)
+    _save_record(coordinator, _plan(), ChannelInputParentState.CREATED)
+
+    with pytest.raises(ChannelInputParentError, match="uint32"):
+        asyncio.run(
+            coordinator.decide_restart(
+                SESSION_ID,
+                _endpoints(),
+                FakeChain(),
+                current_height=current_height,  # type: ignore[arg-type]
+            )
+        )
