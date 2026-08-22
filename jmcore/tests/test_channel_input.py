@@ -22,6 +22,7 @@ from jmcore.channel_input import (
     ChannelInputApprovalPayload,
     ChannelInputApprovalSetAckPayload,
     ChannelInputApprovalSetPayload,
+    ChannelInputCancelAckPayload,
     ChannelInputCancelPayload,
     ChannelInputFinalizedPayload,
     ChannelInputFinalizePayload,
@@ -41,12 +42,14 @@ from jmcore.channel_input import (
     PolicyCeilings,
     SettlementOutput,
     approval_set_hash,
+    cancel_payload_hash,
     canonical_json,
     decode_channel_input_message,
     encode_channel_input_message,
     endpoint_terms_hash,
     sign_payload,
     transcript_hash,
+    validate_cancel_ack,
     validate_channel_payload_for_transcript,
     validate_complete_approval_set,
     validate_finalize_for_transcript,
@@ -220,6 +223,41 @@ def _signed_hello() -> ChannelInputHelloPayload:
         ),
         _secret(2),
         aux_randomness=b"\x01" * 32,
+    )
+
+
+def _signed_cancel(transcript: ChannelInputTranscript) -> ChannelInputCancelPayload:
+    return sign_payload(
+        ChannelInputCancelPayload(
+            session_id=transcript.session_id,
+            attempt=transcript.attempt,
+            signer_key=_key(1),
+            transcript_hash=transcript_hash(transcript).hex(),
+            reason_code="maker_unavailable",
+        ),
+        _secret(1),
+        aux_randomness=b"\x50" * 32,
+    )
+
+
+def _signed_cancel_ack(
+    cancel: ChannelInputCancelPayload,
+    resumed_outpoints: tuple[Outpoint, ...],
+    *,
+    signer: int = 2,
+    aux: int = 51,
+) -> ChannelInputCancelAckPayload:
+    return sign_payload(
+        ChannelInputCancelAckPayload(
+            session_id=cancel.session_id,
+            attempt=cancel.attempt,
+            signer_key=_key(signer),
+            transcript_hash=cancel.transcript_hash,
+            cancel_hash=cancel_payload_hash(cancel).hex(),
+            resumed_outpoints=resumed_outpoints,
+        ),
+        _secret(signer),
+        aux_randomness=bytes([aux]) * 32,
     )
 
 
@@ -1140,6 +1178,128 @@ def test_codec_rejects_malformed_noncanonical_and_bounded_data() -> None:
     oversized = "a" * (4 * MAX_CHANNEL_INPUT_PAYLOAD_BYTES // 3 + 129)
     with pytest.raises(ChannelInputValidationError, match="maximum encoded size"):
         decode_channel_input_message(f"!channel_input channel_input_invite {oversized}")
+
+
+def test_cancel_ack_round_trips_and_binds_exact_signed_cancel() -> None:
+    transcript, _ = _transcript()
+    cancel = _signed_cancel(transcript)
+    outpoints = tuple(channel.funding_outpoint for channel in transcript.channels)
+    ack = _signed_cancel_ack(cancel, outpoints)
+
+    validate_cancel_ack(cancel, ack, _key(2), outpoints)
+    assert decode_channel_input_message(encode_channel_input_message(ack)) == ack
+
+    differently_signed_cancel = sign_payload(cancel, _secret(1), aux_randomness=b"\x52" * 32)
+    assert cancel_payload_hash(differently_signed_cancel) != cancel_payload_hash(cancel)
+    with pytest.raises(ChannelInputValidationError, match="exact signed cancel"):
+        validate_cancel_ack(differently_signed_cancel, ack, _key(2), outpoints)
+
+
+def test_cancel_ack_rejects_invalid_bindings_and_outpoint_coverage() -> None:
+    transcript, _ = _transcript()
+    cancel = _signed_cancel(transcript)
+    outpoints = tuple(channel.funding_outpoint for channel in transcript.channels)
+    ack = _signed_cancel_ack(cancel, outpoints)
+
+    with pytest.raises(ChannelInputValidationError, match="cancel BIP340"):
+        validate_cancel_ack(cancel.model_copy(update={"sig": "00" * 64}), ack, _key(2), outpoints)
+    with pytest.raises(ChannelInputValidationError, match="cancel ACK BIP340"):
+        validate_cancel_ack(cancel, ack.model_copy(update={"sig": "00" * 64}), _key(2), outpoints)
+
+    substitutions = (
+        (
+            _signed_cancel_ack(cancel, outpoints, signer=3, aux=53),
+            _key(2),
+            outpoints,
+            "expected signer",
+        ),
+        (
+            sign_payload(
+                ack.model_copy(update={"session_id": "22" * 32}),
+                _secret(2),
+                aux_randomness=b"\x53" * 32,
+            ),
+            _key(2),
+            outpoints,
+            "session, attempt, or transcript",
+        ),
+        (
+            sign_payload(
+                ack.model_copy(update={"attempt": cancel.attempt + 1}),
+                _secret(2),
+                aux_randomness=b"\x54" * 32,
+            ),
+            _key(2),
+            outpoints,
+            "session, attempt, or transcript",
+        ),
+        (
+            sign_payload(
+                ack.model_copy(update={"transcript_hash": "00" * 32}),
+                _secret(2),
+                aux_randomness=b"\x55" * 32,
+            ),
+            _key(2),
+            outpoints,
+            "session, attempt, or transcript",
+        ),
+        (
+            sign_payload(
+                ack.model_copy(update={"cancel_hash": "00" * 32}),
+                _secret(2),
+                aux_randomness=b"\x56" * 32,
+            ),
+            _key(2),
+            outpoints,
+            "exact signed cancel",
+        ),
+        (
+            _signed_cancel_ack(cancel, outpoints[:-1], aux=57),
+            _key(2),
+            outpoints,
+            "do not exactly match",
+        ),
+    )
+    for substituted_ack, expected_signer, expected_outpoints, match in substitutions:
+        with pytest.raises(ChannelInputValidationError, match=match):
+            validate_cancel_ack(cancel, substituted_ack, expected_signer, expected_outpoints)
+
+    with pytest.raises(ValidationError, match="cancel_hash"):
+        ChannelInputCancelAckPayload(
+            session_id=cancel.session_id,
+            attempt=cancel.attempt,
+            signer_key=_key(2),
+            transcript_hash=cancel.transcript_hash,
+            cancel_hash="00" * 31,
+            resumed_outpoints=outpoints,
+        )
+    with pytest.raises(ValidationError, match="transcript_hash"):
+        ChannelInputCancelAckPayload(
+            session_id=cancel.session_id,
+            attempt=cancel.attempt,
+            signer_key=_key(2),
+            transcript_hash="00" * 31,
+            cancel_hash=cancel_payload_hash(cancel).hex(),
+            resumed_outpoints=outpoints,
+        )
+    with pytest.raises(ValidationError, match="duplicate resumed outpoint"):
+        ChannelInputCancelAckPayload(
+            session_id=cancel.session_id,
+            attempt=cancel.attempt,
+            signer_key=_key(2),
+            transcript_hash=cancel.transcript_hash,
+            cancel_hash=cancel_payload_hash(cancel).hex(),
+            resumed_outpoints=(outpoints[0], outpoints[0]),
+        )
+    with pytest.raises(ValidationError, match="stable lexicographic order"):
+        ChannelInputCancelAckPayload(
+            session_id=cancel.session_id,
+            attempt=cancel.attempt,
+            signer_key=_key(2),
+            transcript_hash=cancel.transcript_hash,
+            cancel_hash=cancel_payload_hash(cancel).hex(),
+            resumed_outpoints=tuple(reversed(outpoints)),
+        )
 
 
 def test_channel_messages_cancel_and_finalized_witness_binding() -> None:

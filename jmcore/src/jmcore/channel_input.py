@@ -688,6 +688,26 @@ class ChannelInputCancelPayload(ChannelInputPayload):
         return self
 
 
+class ChannelInputCancelAckPayload(ChannelInputPayload):
+    """Maker acknowledgment that every listed channel has resumed after cancellation."""
+
+    message_type: ClassVar[str] = "channel_input_cancel_ack"
+    type: Literal["channel_input_cancel_ack"] = "channel_input_cancel_ack"
+    transcript_hash: Hex32
+    cancel_hash: Hex32
+    resumed_outpoints: tuple[Outpoint, ...] = Field(min_length=1, max_length=MAX_CHANNELS)
+
+    @model_validator(mode="after")
+    def validate_cancel_ack(self) -> ChannelInputCancelAckPayload:
+        _validate_hex(self.transcript_hash, 32, "transcript_hash")
+        _validate_hex(self.cancel_hash, 32, "cancel_hash")
+        outpoints = tuple(outpoint.key() for outpoint in self.resumed_outpoints)
+        _require_unique(outpoints, "resumed outpoint")
+        if outpoints != tuple(sorted(outpoints)):
+            raise ValueError("resumed outpoints must use stable lexicographic order")
+        return self
+
+
 ChannelInputPayloadType: TypeAlias = (
     ChannelInputInvitePayload
     | ChannelInputHelloPayload
@@ -702,6 +722,7 @@ ChannelInputPayloadType: TypeAlias = (
     | ChannelInputFinalizePayload
     | ChannelInputFinalizedPayload
     | ChannelInputCancelPayload
+    | ChannelInputCancelAckPayload
 )
 
 ChannelInputPayloadT = TypeVar("ChannelInputPayloadT", bound=ChannelInputPayloadType)
@@ -722,6 +743,7 @@ _PAYLOAD_TYPES: dict[str, type[ChannelInputPayload]] = {
         ChannelInputFinalizePayload,
         ChannelInputFinalizedPayload,
         ChannelInputCancelPayload,
+        ChannelInputCancelAckPayload,
     )
 }
 
@@ -1167,6 +1189,51 @@ def validate_channel_payload_for_transcript(
         validate_finalized_for_transcript(payload, transcript)
 
 
+def validate_cancel_ack(
+    cancel: ChannelInputCancelPayload,
+    ack: ChannelInputCancelAckPayload,
+    expected_signer_key: str,
+    expected_outpoints: Sequence[Outpoint],
+) -> None:
+    """Verify a maker's signed replayable acknowledgment of one exact cancellation."""
+
+    if not verify_payload(cancel):
+        raise ChannelInputValidationError("cancel BIP340 signature is invalid")
+    if not verify_payload(ack):
+        raise ChannelInputValidationError("cancel ACK BIP340 signature is invalid")
+    try:
+        _validate_xonly_key(expected_signer_key, "expected_signer_key")
+    except ValueError as exc:
+        raise ChannelInputValidationError(str(exc)) from exc
+    try:
+        expected = tuple(expected_outpoints)
+    except TypeError as exc:
+        raise ChannelInputValidationError("expected_outpoints must be a sequence") from exc
+    if not all(isinstance(outpoint, Outpoint) for outpoint in expected):
+        raise ChannelInputValidationError("expected_outpoints must contain outpoints")
+    expected_keys = tuple(outpoint.key() for outpoint in expected)
+    if len(set(expected_keys)) != len(expected_keys):
+        raise ChannelInputValidationError("expected outpoints contain duplicates")
+    if expected_keys != tuple(sorted(expected_keys)):
+        raise ChannelInputValidationError("expected outpoints must use stable lexicographic order")
+    if (
+        ack.session_id != cancel.session_id
+        or ack.attempt != cancel.attempt
+        or ack.transcript_hash != cancel.transcript_hash
+    ):
+        raise ChannelInputValidationError(
+            "cancel ACK does not bind cancel session, attempt, or transcript"
+        )
+    if ack.signer_key != expected_signer_key:
+        raise ChannelInputValidationError("cancel ACK signer does not match expected signer")
+    if ack.cancel_hash != cancel_payload_hash(cancel).hex():
+        raise ChannelInputValidationError("cancel ACK does not bind the exact signed cancel")
+    if tuple(outpoint.key() for outpoint in ack.resumed_outpoints) != expected_keys:
+        raise ChannelInputValidationError(
+            "cancel ACK resumed outpoints do not exactly match expected"
+        )
+
+
 def _descriptor_for_outpoint(
     transcript: ChannelInputTranscript, funding_outpoint: Outpoint
 ) -> ChannelDescriptor:
@@ -1367,6 +1434,12 @@ def approval_set_hash(approval_set: ChannelInputApprovalSetPayload) -> bytes:
     """Commit to the complete approval set, including every BIP340 signature."""
 
     return channel_input_hash("approval-set", approval_set)
+
+
+def cancel_payload_hash(cancel: ChannelInputCancelPayload) -> bytes:
+    """Commit to the complete signed cancellation payload."""
+
+    return channel_input_hash("cancel", cancel)
 
 
 def payload_hash(payload: ChannelInputPayload) -> bytes:
