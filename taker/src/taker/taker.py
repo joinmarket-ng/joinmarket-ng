@@ -21,7 +21,7 @@ import secrets
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from jmcore.bitcoin import calculate_tx_vsize, get_address_type
 from jmcore.bond_calc import calculate_timelocked_fidelity_bond_value
@@ -71,6 +71,11 @@ from taker.orderbook import (
     offer_supports_cofunded_channel_ring_v1,
 )
 from taker.podle_manager import PoDLEManager
+
+if TYPE_CHECKING:
+    from jmswap.channel_input import InitializedChannelInputBackend
+
+    from taker.channel_input_store import TakerChannelInputStore
 
 # Backward-compatible re-exports: many tests and modules import these from taker.taker
 __all__ = [
@@ -210,7 +215,20 @@ class Taker(TakerMonitoringMixin):
                 f"matching offer family)."
             )
 
-        self.nick_identity = NickIdentity(JM_VERSION)
+        self._channel_input_backend: InitializedChannelInputBackend | None = None
+        self._channel_input_store: TakerChannelInputStore | None = None
+        if config.channel_input.enabled:
+            from taker.channel_input_store import TakerChannelInputStore
+
+            data_directory = Path(config.data_dir or get_default_data_dir())
+            self._channel_input_store = TakerChannelInputStore(
+                config.channel_input.persistence_path(data_directory),
+                max_active_sessions=config.channel_input.max_active_sessions,
+            )
+            nick_secret = self._channel_input_store.load_or_create_nick_secret()
+            self.nick_identity = NickIdentity(JM_VERSION, private_key_bytes=nick_secret)
+        else:
+            self.nick_identity = NickIdentity(JM_VERSION)
         self.nick = self.nick_identity.nick
         self.state = TakerState.IDLE
         # Source mixdepth of the most recent ``do_coinjoin`` call. With
@@ -236,7 +254,7 @@ class Taker(TakerMonitoringMixin):
             allow_clearnet_connections=config.allow_clearnet_connections,
             neutrino_compat=neutrino_compat,
             cofunded_channel_ring_v1=config.channel_ring.enabled,
-            channel_input_v1=config.channel_input.enabled,
+            channel_input_v1=False,
             stream_isolation=config.stream_isolation,
         )
 
@@ -447,6 +465,46 @@ class Taker(TakerMonitoringMixin):
                 raise RuntimeError(
                     "Channel-ring durable capacity is exhausted or contains corrupt records"
                 )
+
+        if self.config.channel_input.enabled:
+            if self._channel_input_store is None:
+                raise RuntimeError("Channel-input durable store was not initialized")
+            from taker.channel_input_negotiation import TakerChannelInputStage
+
+            channel_report = self._channel_input_store.load_all()
+            if channel_report.corruptions:
+                raise RuntimeError("Channel-input durable store contains corrupt records")
+            active_records = tuple(
+                record
+                for record in channel_report.records
+                if record.stage is not TakerChannelInputStage.CANCELED
+            )
+            if any(record.local_actor != self.nick for record in active_records):
+                raise RuntimeError("Channel-input recovery state belongs to another taker identity")
+
+            from jmswap.channel_input import initialize_channel_input_backend
+            from jmswap.lnd import EscrowOutpoint
+
+            recovery_outpoints = tuple(
+                sorted(
+                    {
+                        EscrowOutpoint(
+                            txid=hello.funding_outpoint.txid,
+                            vout=hello.funding_outpoint.vout,
+                        )
+                        for record in active_records
+                        for _, hello in record.local_hellos
+                    },
+                    key=lambda outpoint: (outpoint.txid, outpoint.vout),
+                )
+            )
+            self._channel_input_backend = await initialize_channel_input_backend(
+                self.config.channel_input,
+                network=self.config.network.value,
+                offer_type=self.config.preferred_offer_type.value,
+                recovery_outpoints=recovery_outpoints,
+            )
+            self.directory_client.enable_channel_input_v1()
 
         # Connect to directory servers
         logger.info("Connecting to directory servers...")
@@ -893,6 +951,9 @@ class Taker(TakerMonitoringMixin):
         if self._channel_ring_backend is not None:
             await self._channel_ring_backend.backend.close()
             self._channel_ring_backend = None
+        if self._channel_input_backend is not None:
+            await self._channel_input_backend.backend.close()
+            self._channel_input_backend = None
         if close_wallet:
             await self.wallet.close()
         logger.info("Taker stopped")

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
 import stat
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,6 +24,7 @@ MAX_ACTIVE_SESSIONS = 16
 MAX_TOTAL_RECORDS = 10_000
 MAX_RECORD_BYTES = 4 * 1024 * 1024
 _RECORD_NAME = re.compile(r"^([0-9a-f]{64})-([0-9]+)-([0-9a-f]{64})\.json$")
+_IDENTITY_NAME = "coordinator-nick.key"
 
 
 class TakerChannelInputStoreError(Exception):
@@ -96,6 +98,29 @@ class TakerChannelInputStore:
             except Exception as exc:
                 raise TakerChannelInputStoreError(
                     "could not durably save channel-input snapshot"
+                ) from exc
+
+    def load_or_create_nick_secret(self) -> bytes:
+        """Return the durable outer nick key required for restart recovery."""
+        with self._lock:
+            try:
+                self._ensure_directory()
+                path = self.directory / _IDENTITY_NAME
+                if path.exists() or path.is_symlink():
+                    return _read_nick_secret(path)
+                secret = secrets.token_bytes(32)
+                # Validate the scalar before exposing or persisting it.
+                from coincurve import PrivateKey
+
+                PrivateKey(secret)
+                atomic_write_private(path, secret.hex().encode("ascii"))
+                _fsync_private_directory(self.directory)
+                return secret
+            except TakerChannelInputStoreError:
+                raise
+            except Exception as exc:
+                raise TakerChannelInputStoreError(
+                    "could not load or create channel-input coordinator identity"
                 ) from exc
 
     def load(self, session_id: str, attempt: int) -> TakerChannelInputSnapshot | None:
@@ -172,7 +197,15 @@ class TakerChannelInputStore:
             raise TakerChannelInputStoreError(
                 "could not enumerate channel-input snapshots"
             ) from exc
-        record_paths = [path for path in paths if not _is_atomic_temp_path(path)]
+        identity_path = self.directory / _IDENTITY_NAME
+        if identity_path.exists() or identity_path.is_symlink():
+            try:
+                _read_nick_secret(identity_path)
+            except TakerChannelInputStoreError:
+                corruptions.append(f"{_IDENTITY_NAME}: invalid coordinator identity")
+        record_paths = [
+            path for path in paths if path.name != _IDENTITY_NAME and not _is_atomic_temp_path(path)
+        ]
         if len(record_paths) > MAX_TOTAL_RECORDS:
             return TakerChannelInputLoadReport(
                 records=(),
@@ -308,6 +341,25 @@ def _validate_coordinator_key(value: str) -> str:
             "coordinator key must be 32-byte lowercase hexadecimal"
         ) from exc
     return value
+
+
+def _read_nick_secret(path: Path) -> bytes:
+    try:
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_size != 64:
+            raise TakerChannelInputStoreError("coordinator identity file is unsafe")
+        encoded = read_private_file(path)
+        if len(encoded) != 64 or encoded.lower() != encoded:
+            raise TakerChannelInputStoreError("coordinator identity is invalid")
+        secret = bytes.fromhex(encoded.decode("ascii"))
+        from coincurve import PrivateKey
+
+        PrivateKey(secret)
+        return secret
+    except TakerChannelInputStoreError:
+        raise
+    except Exception as exc:
+        raise TakerChannelInputStoreError("coordinator identity is invalid") from exc
 
 
 def _is_atomic_temp_artifact(name: str) -> bool:

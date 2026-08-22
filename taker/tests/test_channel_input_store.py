@@ -47,6 +47,32 @@ def test_save_load_delete_and_private_modes(tmp_path: Path) -> None:
     assert store.load(snapshot.invite.session_id, snapshot.invite.attempt) is None
 
 
+def test_nick_identity_is_private_durable_and_not_a_snapshot(tmp_path: Path) -> None:
+    store = TakerChannelInputStore(tmp_path / "private", max_active_sessions=1)
+
+    first = store.load_or_create_nick_secret()
+    second = store.load_or_create_nick_secret()
+
+    assert first == second
+    assert len(first) == 32
+    identity_path = store.directory / "coordinator-nick.key"
+    assert stat.S_IMODE(identity_path.stat().st_mode) == 0o600
+    assert identity_path.read_text(encoding="ascii") == first.hex()
+    assert store.load_all().records == ()
+    assert store.load_all().safe
+
+
+def test_invalid_nick_identity_fails_closed(tmp_path: Path) -> None:
+    store = TakerChannelInputStore(tmp_path / "private", max_active_sessions=1)
+    identity_path = store.directory / "coordinator-nick.key"
+    identity_path.write_text("00" * 32, encoding="ascii")
+    identity_path.chmod(0o600)
+
+    with pytest.raises(TakerChannelInputStoreError):
+        store.load_or_create_nick_secret()
+    assert not store.load_all().safe
+
+
 def test_capacity_and_corruption_are_fail_closed(tmp_path: Path) -> None:
     store = TakerChannelInputStore(tmp_path / "private", max_active_sessions=1)
     first = _snapshot("1")
