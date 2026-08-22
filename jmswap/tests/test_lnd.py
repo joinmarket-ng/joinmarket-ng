@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
 
+import grpc
 import pytest
 from jmcore.bitcoin import (
     TxInput,
@@ -308,6 +309,34 @@ class FakeEscrowStub:
     async def Cancel(self, request: Any) -> Any:  # noqa: N802
         self.cancel_request = request
         return escrow.CancelResponse(link_resumed=True)
+
+
+class FakeGrpcError(Exception):
+    def __init__(self, status_code: grpc.StatusCode, detail: str) -> None:
+        super().__init__(detail)
+        self.status_code = status_code
+        self.detail = detail
+
+    def code(self) -> grpc.StatusCode:
+        return self.status_code
+
+    def details(self) -> str:
+        return self.detail
+
+
+class StatusOnlyEscrowStub:
+    def __init__(self, *, error: Exception | None = None, delay: float = 0.0) -> None:
+        self.error = error
+        self.delay = delay
+        self.requests: list[Any] = []
+
+    async def Status(self, request: Any) -> Any:  # noqa: N802
+        self.requests.append(request)
+        if self.delay:
+            await asyncio.sleep(self.delay)
+        if self.error is not None:
+            raise self.error
+        return escrow.StatusResponse()
 
 
 class CloseTrackingChannel:
@@ -615,6 +644,84 @@ async def test_list_channel_input_candidates_wraps_rpc_failures(
 
     with pytest.raises(error_type, match=message):
         await backend(stub).list_channel_input_candidates(timeout_seconds=0.001)
+
+
+async def test_probe_channel_input_escrow_accepts_only_exact_unknown_session_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = LndBackend(
+        host="localhost:10009", tls_cert=b"cert", macaroon_hex="admin", escrow_macaroon_hex="escrow"
+    )
+    escrow_stub = StatusOnlyEscrowStub(
+        error=FakeGrpcError(grpc.StatusCode.UNKNOWN, "escrow session does not match lock")
+    )
+    target._escrow_stub = escrow_stub
+    outpoint = EscrowOutpoint(txid="aa" * 32, vout=7)
+
+    monkeypatch.setattr("jmswap.lnd.secrets.token_hex", lambda length: "01" * length)
+    await target.probe_channel_input_escrow(outpoint, timeout_seconds=2.0)
+
+    assert target._stub is None
+    assert target._channel is None
+    assert len(escrow_stub.requests) == 1
+    request = escrow_stub.requests[0]
+    assert request.channel_point.funding_txid == bytes.fromhex(outpoint.txid)[::-1]
+    assert request.channel_point.output_index == outpoint.vout
+    assert request.session_id == target._escrow_session_id(
+        "channel-input-escrow-probe:" + "01" * 32
+    )
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        FakeGrpcError(grpc.StatusCode.PERMISSION_DENIED, "permission denied"),
+        FakeGrpcError(grpc.StatusCode.UNIMPLEMENTED, "method unavailable"),
+        FakeGrpcError(grpc.StatusCode.UNKNOWN, "another failure"),
+    ],
+)
+async def test_probe_channel_input_escrow_rejects_other_grpc_errors(error: Exception) -> None:
+    target = LndBackend(
+        host="localhost:10009", tls_cert=b"cert", macaroon_hex="admin", escrow_macaroon_hex="escrow"
+    )
+    target._escrow_stub = StatusOnlyEscrowStub(error=error)
+
+    with pytest.raises(LndCapabilityError, match="Status probe failed"):
+        await target.probe_channel_input_escrow(EscrowOutpoint(txid="aa" * 32, vout=0))
+
+    assert target._stub is None
+    assert target._channel is None
+
+
+async def test_probe_channel_input_escrow_rejects_success_and_maps_timeout() -> None:
+    target = LndBackend(
+        host="localhost:10009", tls_cert=b"cert", macaroon_hex="admin", escrow_macaroon_hex="escrow"
+    )
+    target._escrow_stub = StatusOnlyEscrowStub()
+    outpoint = EscrowOutpoint(txid="aa" * 32, vout=0)
+
+    with pytest.raises(LndCapabilityError, match="unexpectedly found"):
+        await target.probe_channel_input_escrow(outpoint)
+
+    target._escrow_stub = StatusOnlyEscrowStub(delay=0.01)
+    with pytest.raises(LndTimeoutError, match="Status probe timed out"):
+        await target.probe_channel_input_escrow(outpoint, timeout_seconds=0.001)
+
+
+async def test_probe_channel_input_escrow_validates_arguments_before_rpc() -> None:
+    target = LndBackend(
+        host="localhost:10009", tls_cert=b"cert", macaroon_hex="admin", escrow_macaroon_hex="escrow"
+    )
+    escrow_stub = StatusOnlyEscrowStub()
+    target._escrow_stub = escrow_stub
+
+    with pytest.raises(ValueError, match="EscrowOutpoint"):
+        await target.probe_channel_input_escrow("not-an-outpoint")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="timeout_seconds"):
+        await target.probe_channel_input_escrow(
+            EscrowOutpoint(txid="aa" * 32, vout=0), timeout_seconds=0
+        )
+    assert escrow_stub.requests == []
 
 
 @pytest.mark.parametrize("stage", [LndEscrowStage.LOCKED, LndEscrowStage.PARENT_PREPARED])

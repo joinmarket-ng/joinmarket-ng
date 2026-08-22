@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import struct
 import time
 from collections.abc import Sequence
@@ -936,6 +937,48 @@ class LndBackend:
             )
         except (AttributeError, TypeError, ValueError) as exc:
             raise LndValidationError(f"ListChannels returned invalid channel data: {exc}") from exc
+
+    async def probe_channel_input_escrow(
+        self, funding_outpoint: EscrowOutpoint, *, timeout_seconds: float = 10.0
+    ) -> None:
+        """Prove the dedicated escrow service is live without changing channel state."""
+        self._validate_timeout(timeout_seconds)
+        if not isinstance(funding_outpoint, EscrowOutpoint):
+            raise ValueError("funding_outpoint must be an EscrowOutpoint")
+        self._ensure_escrow()
+        from jmswap.lndrpc import channelescrow_pb2 as escrow
+
+        probe_session_id = self._escrow_session_id(
+            f"channel-input-escrow-probe:{secrets.token_hex(32)}"
+        )
+        try:
+            await asyncio.wait_for(
+                self._escrow_stub.Status(
+                    escrow.StatusRequest(
+                        channel_point=self._rpc_escrow_outpoint(funding_outpoint),
+                        session_id=probe_session_id,
+                    )
+                ),
+                timeout_seconds,
+            )
+        except TimeoutError as exc:
+            raise LndTimeoutError("ChannelEscrowRPC Status probe timed out") from exc
+        except Exception as exc:
+            import grpc  # type: ignore[import-untyped]
+
+            status_code = getattr(exc, "code", None)
+            details = getattr(exc, "details", None)
+            if (
+                callable(status_code)
+                and callable(details)
+                and status_code() == grpc.StatusCode.UNKNOWN
+                and details() == "escrow session does not match lock"
+            ):
+                return
+            raise LndCapabilityError(f"ChannelEscrowRPC Status probe failed: {exc}") from exc
+        raise LndCapabilityError(
+            "ChannelEscrowRPC Status probe unexpectedly found a random escrow session"
+        )
 
     async def force_close_channel_input_recovery(
         self,
