@@ -10,6 +10,7 @@ from typing import Any
 from fastapi import APIRouter, Depends
 from loguru import logger
 
+from jmcore.protocol import UTXOMetadata
 from jmwallet.history import get_address_history_types, get_used_addresses
 from jmwallet.wallet.bond_registry import create_bond_info, load_registry, save_registry
 from jmwallet.wallet.constants import FIDELITY_BOND_BRANCH
@@ -387,12 +388,19 @@ def _validate_outpoint_format(utxo_str: str) -> None:
 def _validate_and_normalize_outpoint(utxo_str: str) -> tuple[str, int]:
     """Validate a ``txid:vout`` string and return its canonical identity.
 
-    Stricter than :func:`_validate_outpoint_format`: the txid must be exactly
-    64 hex characters and the vout a non-negative integer. Returns
-    ``(lowercase_txid, vout)`` so callers can both deduplicate and build the
-    same canonical ``"txid:vout"`` string the wallet's UTXO cache and
-    metadata store use as their key (lowercase txid, unpadded vout).
-    Freeze-batch uses this instead of the looser single-UTXO check because a
+    Stricter than :func:`_validate_outpoint_format`, and reuses
+    :class:`jmcore.protocol.UTXOMetadata`'s validation (the same contract the
+    rest of the protocol enforces) instead of a parallel, weaker
+    reimplementation: the txid must be exactly 64 hex characters -- checked
+    with ``binascii.unhexlify``, which (unlike ``bytes.fromhex``) rejects
+    embedded whitespace, so a 64-character string that is actually fewer than
+    32 real bytes padded with spaces is caught -- and the vout must fit the
+    Bitcoin uint32 range (``0`` to ``0xFFFFFFFF``).
+
+    Returns ``(lowercase_txid, vout)`` so callers can both deduplicate and
+    build the same canonical ``"txid:vout"`` string the wallet's UTXO cache
+    and metadata store use as their key. Freeze-batch normalizes to this
+    before applying (not just for duplicate detection), because a
     wrongly-cased or zero-padded outpoint would otherwise be accepted,
     written to the metadata store under that literal key, and return success
     -- without ever touching the real cached UTXO, which is keyed by the
@@ -403,19 +411,15 @@ def _validate_and_normalize_outpoint(utxo_str: str) -> tuple[str, int]:
         raise InvalidRequestFormat(f"Invalid UTXO format: {utxo_str}. Expected txid:vout.")
 
     txid, vout_str = parts
-    if len(txid) != 64:
-        raise InvalidRequestFormat(f"Invalid txid in UTXO: {utxo_str}. Expected 64 hex characters.")
-    try:
-        bytes.fromhex(txid)
-    except ValueError as exc:
-        raise InvalidRequestFormat(f"Invalid txid in UTXO: {utxo_str}. Expected hex.") from exc
-
     try:
         vout = int(vout_str)
     except ValueError as exc:
         raise InvalidRequestFormat(f"Invalid vout in UTXO: {utxo_str}") from exc
-    if vout < 0:
-        raise InvalidRequestFormat(f"Invalid vout in UTXO: {utxo_str}. Must not be negative.")
+
+    try:
+        UTXOMetadata(txid=txid, vout=vout)
+    except ValueError as exc:
+        raise InvalidRequestFormat(f"Invalid UTXO {utxo_str}: {exc}") from exc
 
     return txid.lower(), vout
 

@@ -553,6 +553,57 @@ class TestFreezeBatch:
         assert resp.status_code == 400
         ws.set_utxos_frozen.assert_not_called()
 
+    def test_whitespace_padded_txid_is_rejected(
+        self, authed_client: tuple[TestClient, str]
+    ) -> None:
+        """64 characters but only 62 are real hex -- bytes.fromhex() tolerates the
+        embedded spaces and would silently accept this as a 31-byte txid."""
+        client, token = authed_client
+        state = get_daemon_state()
+        ws = state.wallet_service
+        ws.set_utxos_frozen = Mock()
+
+        resp = client.post(
+            "/api/v1/wallet/test_wallet.jmdat/freeze-batch",
+            json={"entries": [{"utxo-string": "aa" * 31 + "  " + ":0", "freeze": True}]},
+            headers=_auth_headers(token),
+        )
+
+        assert resp.status_code == 400
+        ws.set_utxos_frozen.assert_not_called()
+
+    def test_vout_above_uint32_max_is_rejected(self, authed_client: tuple[TestClient, str]) -> None:
+        """vout must fit Bitcoin's uint32 range; 0xFFFFFFFF + 1 overflows it."""
+        client, token = authed_client
+        state = get_daemon_state()
+        ws = state.wallet_service
+        ws.set_utxos_frozen = Mock()
+
+        resp = client.post(
+            "/api/v1/wallet/test_wallet.jmdat/freeze-batch",
+            json={"entries": [{"utxo-string": "aa" * 32 + ":4294967296", "freeze": True}]},
+            headers=_auth_headers(token),
+        )
+
+        assert resp.status_code == 400
+        ws.set_utxos_frozen.assert_not_called()
+
+    def test_vout_at_uint32_max_is_accepted(self, authed_client: tuple[TestClient, str]) -> None:
+        """0xFFFFFFFF itself is the boundary and must still be valid."""
+        client, token = authed_client
+        state = get_daemon_state()
+        ws = state.wallet_service
+        ws.set_utxos_frozen = Mock()
+
+        resp = client.post(
+            "/api/v1/wallet/test_wallet.jmdat/freeze-batch",
+            json={"entries": [{"utxo-string": "aa" * 32 + ":4294967295", "freeze": True}]},
+            headers=_auth_headers(token),
+        )
+
+        assert resp.status_code == 200
+        ws.set_utxos_frozen.assert_called_once()
+
     def test_uppercase_and_padded_outpoint_is_normalized_before_applying(
         self, authed_client: tuple[TestClient, str]
     ) -> None:
