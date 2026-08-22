@@ -9,7 +9,6 @@ from typing import Protocol
 
 from jmcore.bitcoin import get_txid
 from jmcore.channel_input import (
-    MAX_CHANNELS,
     ChannelInputApprovalSetPayload,
     ChannelInputCancelPayload,
     ChannelInputFinalizePayload,
@@ -42,6 +41,8 @@ from maker.channel_input import (
     MakerFrozenChannelInput,
 )
 from maker.channel_input_store import MakerChannelInputStore, MakerChannelInputStoreError
+
+_MAX_COORDINATOR_CHANNELS_PER_MAKER = 1
 
 
 class MakerChannelInputRuntimeError(Exception):
@@ -386,7 +387,7 @@ class MakerChannelInputRegistry:
                     candidate.funding_outpoint.vout,
                 )
                 not in unavailable
-            )[:MAX_CHANNELS]
+            )[:_MAX_COORDINATOR_CHANNELS_PER_MAKER]
             if not selected:
                 raise MakerChannelInputRuntimeError("no channel-input candidates are available")
             negotiation = MakerChannelInputNegotiation.from_invite(

@@ -527,7 +527,7 @@ class TakerChannelInputRegistry:
                 raise TakerChannelInputRuntimeError(
                     "backend did not resume canceled channel escrow"
                 )
-        if len(negotiation.cancel_acks) != len(negotiation.remote_hellos) or not escrows:
+        if len(negotiation.cancel_acks) != len(negotiation.selected_nicks):
             return
         try:
             negotiation.record_local_resumed(

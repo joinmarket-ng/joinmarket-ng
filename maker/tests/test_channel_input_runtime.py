@@ -539,7 +539,7 @@ async def _invite(
 
 
 @pytest.mark.asyncio
-async def test_live_invite_persists_before_freeze_and_replays_without_allocating(
+async def test_live_invite_selects_one_candidate_and_replays_without_allocating(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     negotiation, frozen = _negotiation(channels=2)
@@ -555,27 +555,19 @@ async def test_live_invite_persists_before_freeze_and_replays_without_allocating
     monkeypatch.setattr(registry._store, "save", saving)
     hellos = await _invite(registry, backend, negotiation, frozen, allocations)
 
-    assert len(hellos) == 2
-    assert allocations == [item.snapshot.funding_outpoint.txid for item in frozen]
+    assert len(hellos) == 1
+    assert allocations == [frozen[0].snapshot.funding_outpoint.txid]
     assert backend.events == [
         "save",
-        *(
-            event
-            for item in frozen
-            for event in (
-                f"find:{item.snapshot.funding_outpoint.txid}:{item.snapshot.funding_outpoint.vout}",
-            )
-        ),
+        f"find:{frozen[0].snapshot.funding_outpoint.txid}:{frozen[0].snapshot.funding_outpoint.vout}",
         "save",
         f"freeze:{frozen[0].snapshot.channel_id}",
-        "save",
-        f"freeze:{frozen[1].snapshot.channel_id}",
         "save",
     ]
 
     replay = await _invite(registry, backend, negotiation, frozen, allocations)
     assert replay == hellos
-    assert len(allocations) == 2
+    assert len(allocations) == 1
     with pytest.raises(ChannelInputValidationError, match="different actor"):
         await registry.handle_payload(
             negotiation.invite,

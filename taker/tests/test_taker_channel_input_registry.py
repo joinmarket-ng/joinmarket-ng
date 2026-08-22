@@ -9,6 +9,8 @@ from jmcore.channel_input import (
     ChannelInputCancelAckPayload,
     ChannelInputCancelPayload,
     ChannelInputHelloPayload,
+    ChannelInputKeyPair,
+    Outpoint,
     PolicyCeilings,
     cancel_payload_hash,
     sign_payload,
@@ -144,6 +146,26 @@ def _cancel_ack(
     )
 
 
+def _unknown_hello_cancel_ack(
+    negotiation: TakerChannelInputNegotiation,
+    cancel: ChannelInputCancelPayload,
+    index: int,
+) -> ChannelInputCancelAckPayload:
+    maker = ChannelInputKeyPair.from_secret(_MAKER_SECRETS[index])
+    return sign_payload(
+        ChannelInputCancelAckPayload(
+            session_id=negotiation.invite.session_id,
+            attempt=negotiation.invite.attempt,
+            signer_key=maker.public_key,
+            transcript_hash=cancel.transcript_hash,
+            cancel_hash=cancel_payload_hash(cancel).hex(),
+            resumed_outpoints=(Outpoint(txid=f"{index + 20:064x}", vout=index),),
+        ),
+        _MAKER_SECRETS[index],
+        aux_randomness=bytes([index + 20]) * 32,
+    )
+
+
 def test_load_is_fail_closed_and_allows_full_recovery_capacity(tmp_path: Path) -> None:
     empty = TakerChannelInputStore(tmp_path / "empty", max_active_sessions=1)
     registry = TakerChannelInputRegistry.load(
@@ -210,6 +232,8 @@ def test_expired_canceled_tombstone_is_pruned(tmp_path: Path) -> None:
     negotiation.install_frozen_channel("maker-a", _frozen_snapshot(0))
     cancel = negotiation.plan_cancel("local_freeze_failed")
     negotiation.accept_cancel_ack("maker-a", _cancel_ack(negotiation, cancel, "maker-a", 0))
+    negotiation.accept_cancel_ack("maker-b", _unknown_hello_cancel_ack(negotiation, cancel, 1))
+    negotiation.accept_cancel_ack("maker-c", _unknown_hello_cancel_ack(negotiation, cancel, 2))
     negotiation.record_local_resumed((remote.funding_outpoint,))
     store = _store(tmp_path, negotiation)
 
@@ -404,10 +428,50 @@ async def test_cancellation_waits_for_ack_before_recording_local_resume(tmp_path
     await registry.accept_maker_cancel_ack(
         negotiation.invite.session_id, negotiation.invite.attempt, "maker-a", ack
     )
+    await registry.accept_maker_cancel_ack(
+        negotiation.invite.session_id,
+        negotiation.invite.attempt,
+        "maker-b",
+        _unknown_hello_cancel_ack(negotiation, cancel, 1),
+    )
+    await registry.accept_maker_cancel_ack(
+        negotiation.invite.session_id,
+        negotiation.invite.attempt,
+        "maker-c",
+        _unknown_hello_cancel_ack(negotiation, cancel, 2),
+    )
     await registry.attempt_local_cancellation_completion(
         negotiation.invite.session_id, negotiation.invite.attempt, backend
     )
     assert restored.stage is TakerChannelInputStage.CANCELED
+
+
+@pytest.mark.asyncio
+async def test_cancellation_completes_after_unknown_hello_acks_without_local_escrows(
+    tmp_path: Path,
+) -> None:
+    negotiation = _new()
+    registry = _registry(tmp_path, negotiation)
+    cancel = await registry.plan_cancellation(
+        negotiation.invite.session_id, negotiation.invite.attempt, "hello_timeout"
+    )
+    for index, nick in enumerate(negotiation.selected_nicks):
+        await registry.accept_maker_cancel_ack(
+            negotiation.invite.session_id,
+            negotiation.invite.attempt,
+            nick,
+            _unknown_hello_cancel_ack(negotiation, cancel, index),
+        )
+
+    backend = FakeBackend()
+    await registry.attempt_local_cancellation_completion(
+        negotiation.invite.session_id, negotiation.invite.attempt, backend
+    )
+
+    restored = registry.get(negotiation.invite.session_id, negotiation.invite.attempt)
+    assert restored is not None and restored.stage is TakerChannelInputStage.CANCELED
+    assert restored.local_resumed_outpoints == ()
+    assert backend.events == []
 
 
 @pytest.mark.asyncio
@@ -434,6 +498,12 @@ async def test_cancellation_preflights_before_mutation_and_orders_resumed_outpoi
         negotiation.invite.attempt,
         "maker-b",
         _cancel_ack(negotiation, cancel, "maker-b", 0),
+    )
+    await registry.accept_maker_cancel_ack(
+        negotiation.invite.session_id,
+        negotiation.invite.attempt,
+        "maker-c",
+        _unknown_hello_cancel_ack(negotiation, cancel, 2),
     )
     backend = FakeBackend()
     first_outpoint = EscrowOutpoint(

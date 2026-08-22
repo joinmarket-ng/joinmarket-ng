@@ -336,6 +336,31 @@ def _approve_all(
         negotiation.accept_approval(nick, _approval(proposal, secret))
 
 
+def _unknown_hello_cancel_ack(
+    negotiation: TakerChannelInputNegotiation,
+    cancel: ChannelInputCancelPayload,
+    index: int,
+    *,
+    outpoints: tuple[Outpoint, ...] | None = None,
+    secret: bytes | None = None,
+) -> ChannelInputCancelAckPayload:
+    maker_secret = _MAKER_SECRETS[index] if secret is None else secret
+    maker = ChannelInputKeyPair.from_secret(maker_secret)
+    resumed = outpoints or (Outpoint(txid=f"{index + 20:064x}", vout=index),)
+    return sign_payload(
+        ChannelInputCancelAckPayload(
+            session_id=negotiation.invite.session_id,
+            attempt=negotiation.invite.attempt,
+            signer_key=maker.public_key,
+            transcript_hash=cancel.transcript_hash,
+            cancel_hash=cancel_payload_hash(cancel).hex(),
+            resumed_outpoints=resumed,
+        ),
+        maker_secret,
+        aux_randomness=bytes([index + 20]) * 32,
+    )
+
+
 def test_three_maker_prepare_round_trip_and_replays() -> None:
     negotiation, secrets = _ready()
     transcript, terms = _plan(negotiation)
@@ -733,7 +758,7 @@ def test_cancel_requires_all_remote_and_local_resume() -> None:
     assert negotiation.stage is TakerChannelInputStage.CANCELED
 
 
-def test_pretranscript_cancel_resumes_partial_local_freeze_and_restores_json() -> None:
+def test_pretranscript_cancel_requires_the_full_selected_roster_and_restores_json() -> None:
     negotiation = _new()
     remote, _ = _freeze_intent(negotiation, 0)
     negotiation.install_frozen_channel("maker-a", _frozen_snapshot(0))
@@ -754,7 +779,7 @@ def test_pretranscript_cancel_resumes_partial_local_freeze_and_restores_json() -
     )
     with pytest.raises(ChannelInputValidationError, match="exactly match"):
         negotiation.accept_cancel_ack("maker-a", wrong_ack)
-    with pytest.raises(ChannelInputValidationError, match="durable remote hello"):
+    with pytest.raises(ChannelInputValidationError, match="different actor"):
         negotiation.accept_cancel_ack("maker-b", wrong_ack)
 
     outpoint = remote.funding_outpoint
@@ -771,8 +796,10 @@ def test_pretranscript_cancel_resumes_partial_local_freeze_and_restores_json() -
         aux_randomness=b"\x09" * 32,
     )
     negotiation.accept_cancel_ack("maker-a", ack)
-    with pytest.raises(ChannelInputValidationError, match="local hello"):
-        negotiation.record_local_resumed(())
+    with pytest.raises(ChannelInputValidationError, match="every maker"):
+        negotiation.record_local_resumed((outpoint,))
+    negotiation.accept_cancel_ack("maker-b", _unknown_hello_cancel_ack(negotiation, cancel, 1))
+    negotiation.accept_cancel_ack("maker-c", _unknown_hello_cancel_ack(negotiation, cancel, 2))
     negotiation.record_local_resumed((outpoint,))
     assert negotiation.stage is TakerChannelInputStage.CANCELED
     negotiation.accept_cancel_ack("maker-a", ack)
@@ -782,6 +809,83 @@ def test_pretranscript_cancel_resumes_partial_local_freeze_and_restores_json() -
         negotiation.snapshot().model_dump_json()
     )
     assert TakerChannelInputNegotiation.from_snapshot(snapshot).snapshot() == snapshot
+
+
+def test_invited_cancel_binds_unknown_hello_acks_and_completes_empty_local_work() -> None:
+    negotiation = _new()
+
+    cancel = negotiation.plan_cancel("hello_timeout")
+    for index, nick in enumerate(negotiation.selected_nicks):
+        negotiation.accept_cancel_ack(nick, _unknown_hello_cancel_ack(negotiation, cancel, index))
+
+    negotiation.record_local_resumed(())
+    assert negotiation.stage is TakerChannelInputStage.CANCELED
+    negotiation.record_local_resumed(())
+    snapshot = TakerChannelInputSnapshot.model_validate_json(
+        negotiation.snapshot().model_dump_json()
+    )
+    assert TakerChannelInputNegotiation.from_snapshot(snapshot).snapshot() == snapshot
+    with pytest.raises(TakerChannelInputNegotiationError, match="deep validation"):
+        TakerChannelInputNegotiation.from_snapshot(
+            snapshot.model_copy(update={"cancel_acks": snapshot.cancel_acks[:-1]})
+        )
+
+
+def test_unknown_hello_cancel_ack_rejects_substitution_and_collisions() -> None:
+    negotiation = _new()
+    cancel = negotiation.plan_cancel("hello_timeout")
+    first = _unknown_hello_cancel_ack(negotiation, cancel, 0)
+    negotiation.accept_cancel_ack("maker-a", first)
+
+    with pytest.raises(ChannelInputValidationError, match="exact signed cancel"):
+        negotiation.accept_cancel_ack(
+            "maker-b",
+            sign_payload(
+                first.model_copy(update={"cancel_hash": "00" * 32}),
+                _MAKER_SECRETS[0],
+                aux_randomness=b"\x21" * 32,
+            ),
+        )
+    with pytest.raises(ChannelInputValidationError, match="BIP340 signature"):
+        negotiation.accept_cancel_ack(
+            "maker-b",
+            first.model_copy(
+                update={"signer_key": ChannelInputKeyPair.from_secret(_MAKER_SECRETS[1]).public_key}
+            ),
+        )
+    substituted = _unknown_hello_cancel_ack(
+        negotiation,
+        cancel,
+        1,
+        outpoints=first.resumed_outpoints,
+    )
+    with pytest.raises(ChannelInputValidationError, match="outpoint"):
+        negotiation.accept_cancel_ack("maker-b", substituted)
+    with pytest.raises(ChannelInputValidationError, match="signer key"):
+        negotiation.accept_cancel_ack(
+            "maker-b",
+            _unknown_hello_cancel_ack(negotiation, cancel, 1, secret=_MAKER_SECRETS[0]),
+        )
+    with pytest.raises(ChannelInputValidationError, match="exactly one"):
+        negotiation.accept_cancel_ack(
+            "maker-b",
+            _unknown_hello_cancel_ack(
+                negotiation,
+                cancel,
+                1,
+                outpoints=(
+                    Outpoint(txid="30" * 32, vout=0),
+                    Outpoint(txid="31" * 32, vout=0),
+                ),
+            ),
+        )
+    with pytest.raises(ChannelInputValidationError, match="cancel ACK conflicts"):
+        negotiation.accept_cancel_ack(
+            "maker-a",
+            _unknown_hello_cancel_ack(
+                negotiation, cancel, 0, outpoints=(Outpoint(txid="32" * 32, vout=0),)
+            ),
+        )
 
 
 def test_hello_ready_cancel_binds_the_invitation() -> None:

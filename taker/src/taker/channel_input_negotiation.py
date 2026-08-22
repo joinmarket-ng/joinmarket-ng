@@ -710,6 +710,7 @@ class TakerChannelInputNegotiation:
                 )
             return self.cancel
         if self.stage not in {
+            TakerChannelInputStage.INVITED,
             TakerChannelInputStage.FREEZE_INTENDED,
             TakerChannelInputStage.HELLOS_READY,
             TakerChannelInputStage.PROPOSALS_READY,
@@ -742,16 +743,28 @@ class TakerChannelInputNegotiation:
         if self.cancel is None or self.stage is not TakerChannelInputStage.CANCEL_INTENDED:
             raise ChannelInputValidationError("cancel ACK requires cancellation intent")
         remote_hello = dict(self.remote_hellos).get(nick)
+        updated_registry: ChannelInputActorRegistry | None = None
         if remote_hello is None:
-            raise ChannelInputValidationError("cancel ACK requires a durable remote hello")
-        self._registry.require_verified(nick, ack)
-        validate_cancel_ack(
-            self.cancel,
-            ack,
-            remote_hello.participant_key,
-            (remote_hello.funding_outpoint,),
-        )
+            if len(ack.resumed_outpoints) != 1:
+                raise ChannelInputValidationError(
+                    "cancel ACK without a durable hello requires exactly one resumed outpoint"
+                )
+            validate_cancel_ack(self.cancel, ack, ack.signer_key, ack.resumed_outpoints)
+            self._require_unique_cancel_ack_outpoints(ack)
+            updated_registry = ChannelInputActorRegistry.from_snapshot(self._registry.snapshot())
+            updated_registry.bind_verified(nick, ack)
+        else:
+            self._registry.require_verified(nick, ack)
+            validate_cancel_ack(
+                self.cancel,
+                ack,
+                remote_hello.participant_key,
+                (remote_hello.funding_outpoint,),
+            )
+            self._require_unique_cancel_ack_outpoints(ack)
         _record(self._ledger, _slot("cancel_ack", nick), ack)
+        if updated_registry is not None:
+            self._registry = updated_registry
         self.cancel_acks = _nick_items((*self.cancel_acks, (nick, ack)))
 
     def record_local_resumed(self, outpoints: Sequence[Outpoint]) -> None:
@@ -761,9 +774,9 @@ class TakerChannelInputNegotiation:
             raise ChannelInputValidationError(
                 "local resumed outpoints differ from local hello outpoints"
             )
-        if len(self.cancel_acks) != len(self.remote_hellos):
+        if len(self.cancel_acks) != len(self.selected_nicks):
             raise ChannelInputValidationError("local resume requires every maker cancel ACK")
-        if self.local_resumed_outpoints:
+        if self.stage is TakerChannelInputStage.CANCELED:
             if self.local_resumed_outpoints != resumed:
                 raise ChannelInputValidationError(
                     "local resumed outpoints conflict with durable evidence"
@@ -771,8 +784,6 @@ class TakerChannelInputNegotiation:
             return
         if self.stage is not TakerChannelInputStage.CANCEL_INTENDED:
             raise ChannelInputValidationError("local resume is not valid at this negotiation stage")
-        if not resumed:
-            raise ChannelInputValidationError("local resume requires frozen local inputs")
         self.local_resumed_outpoints = resumed
         self.stage = TakerChannelInputStage.CANCELED
 
@@ -1078,7 +1089,7 @@ class TakerChannelInputNegotiation:
         )
         complete_approvals = len(self.maker_approvals) == len(self.selected_nicks)
         complete_acks = len(self.maker_acks) == len(self.selected_nicks)
-        complete_cancel_acks = len(self.cancel_acks) == len(self.remote_hellos)
+        complete_cancel_acks = len(self.cancel_acks) == len(self.selected_nicks)
         later_evidence = (
             self.transcript,
             self.endpoint_terms,
@@ -1203,7 +1214,7 @@ class TakerChannelInputNegotiation:
                     "pre-transcript cancel contains proposal evidence"
                 )
             if canceled:
-                if not complete_cancel_acks or not self.local_resumed_outpoints:
+                if not complete_cancel_acks:
                     raise ChannelInputValidationError(
                         "canceled state lacks complete resume evidence"
                     )
@@ -1219,7 +1230,7 @@ class TakerChannelInputNegotiation:
             if self.prepare is not None and not complete_acks:
                 raise ChannelInputValidationError("cancel state prepare ACK evidence is incomplete")
         if canceled:
-            if not complete_cancel_acks or not self.local_resumed_outpoints:
+            if not complete_cancel_acks:
                 raise ChannelInputValidationError("canceled state lacks complete resume evidence")
         elif self.local_resumed_outpoints:
             raise ChannelInputValidationError("cancel-intended state has local resume evidence")
@@ -1327,21 +1338,38 @@ class TakerChannelInputNegotiation:
                 raise ChannelInputValidationError("cancel differs from cancellation binding")
         _validate_nick_mapping(
             self.cancel_acks,
-            tuple(sorted(nick for nick, _ in self.remote_hellos)),
+            self.selected_nicks,
             require_complete=self.stage is TakerChannelInputStage.CANCELED,
             label="cancel ACKs",
         )
+        resumed_outpoints: set[Outpoint] = set()
         for nick, cancel_ack in self.cancel_acks:
             if self.cancel is None:
                 raise ChannelInputValidationError("cancel ACK lacks cancellation")
+            remote_hello = dict(self.remote_hellos).get(nick)
+            if remote_hello is None:
+                if len(cancel_ack.resumed_outpoints) != 1:
+                    raise ChannelInputValidationError(
+                        "cancel ACK without a durable hello requires exactly one resumed outpoint"
+                    )
+                validate_cancel_ack(
+                    self.cancel, cancel_ack, cancel_ack.signer_key, cancel_ack.resumed_outpoints
+                )
+            else:
+                validate_cancel_ack(
+                    self.cancel,
+                    cancel_ack,
+                    remote_hello.participant_key,
+                    (remote_hello.funding_outpoint,),
+                )
             self._registry.require_verified(nick, cancel_ack)
-            validate_cancel_ack(
-                self.cancel,
-                cancel_ack,
-                dict(self.remote_hellos)[nick].participant_key,
-                (dict(self.remote_hellos)[nick].funding_outpoint,),
-            )
-        if self.local_resumed_outpoints:
+            for outpoint in cancel_ack.resumed_outpoints:
+                if outpoint in resumed_outpoints:
+                    raise ChannelInputValidationError(
+                        "cancel ACK resumed outpoint is already assigned"
+                    )
+                resumed_outpoints.add(outpoint)
+        if self.stage is TakerChannelInputStage.CANCELED:
             expected = self._expected_local_resumed_outpoints()
             if self.local_resumed_outpoints != expected:
                 raise ChannelInputValidationError("local resumed outpoints are invalid")
@@ -1360,14 +1388,23 @@ class TakerChannelInputNegotiation:
         return tuple(sorted(outpoints, key=lambda x: x.key()))
 
     def _expected_registry(self) -> tuple[tuple[str, str], ...]:
-        return tuple(
-            sorted(
-                (
-                    (self.local_actor, self.coordinator_key),
-                    *((nick, hello.signer_key) for nick, hello in self.remote_hellos),
-                )
-            )
-        )
+        bindings = {
+            self.local_actor: self.coordinator_key,
+            **{nick: hello.signer_key for nick, hello in self.remote_hellos},
+            **{
+                nick: ack.signer_key
+                for nick, ack in self.cancel_acks
+                if nick not in dict(self.remote_hellos)
+            },
+        }
+        return tuple(sorted(bindings.items()))
+
+    def _require_unique_cancel_ack_outpoints(self, ack: ChannelInputCancelAckPayload) -> None:
+        assigned = {
+            outpoint for _, existing in self.cancel_acks for outpoint in existing.resumed_outpoints
+        }
+        if any(outpoint in assigned for outpoint in ack.resumed_outpoints):
+            raise ChannelInputValidationError("cancel ACK resumed outpoint is already assigned")
 
     def _expected_ledger(self) -> tuple[tuple[str, str], ...]:
         ledger = ChannelInputReplayLedger()
