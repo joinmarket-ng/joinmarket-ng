@@ -621,16 +621,20 @@ class ChannelInputFinalizePayload(ChannelInputChannelPayload):
 
 
 class ChannelInputFinalizedPayload(ChannelInputChannelPayload):
+    """Authenticated evidence of one channel's final Taproot parent witness."""
+
     message_type: ClassVar[str] = "channel_input_finalized"
     type: Literal["channel_input_finalized"] = "channel_input_finalized"
-    final_tx: str
+    channel_signed_parent_tx: str
     txid: Hex32
 
     @model_validator(mode="after")
     def validate_finalized(self) -> ChannelInputFinalizedPayload:
         _validate_hex(self.txid, 32, "txid")
         try:
-            raw = bytes.fromhex(_validate_hex(self.final_tx, None, "final_tx"))
+            raw = bytes.fromhex(
+                _validate_hex(self.channel_signed_parent_tx, None, "channel_signed_parent_tx")
+            )
             transaction = parse_transaction_bytes(raw)
             canonical = serialize_transaction(
                 transaction.version,
@@ -640,32 +644,32 @@ class ChannelInputFinalizedPayload(ChannelInputChannelPayload):
                 transaction.witnesses if transaction.has_witness else None,
             )
         except (ValueError, IndexError) as exc:
-            raise ValueError("final_tx must be a canonical transaction") from exc
+            raise ValueError("channel_signed_parent_tx must be a canonical transaction") from exc
         if canonical != raw:
-            raise ValueError("final_tx must be canonical")
-        if (
-            not transaction.has_witness
-            or len(transaction.witnesses) != len(transaction.inputs)
-            or any(not witness for witness in transaction.witnesses)
-        ):
-            raise ValueError("final_tx must contain a witness for every input")
+            raise ValueError("channel_signed_parent_tx must be canonical")
         if any(tx_input.scriptsig for tx_input in transaction.inputs):
-            raise ValueError("final_tx must not contain scriptSig data")
-        if (
-            hash256(
-                canonical
-                if not transaction.has_witness
-                else serialize_transaction(
-                    transaction.version,
-                    transaction.inputs,
-                    transaction.outputs,
-                    transaction.locktime,
-                    None,
-                )
-            )[::-1].hex()
-            != self.txid
-        ):
-            raise ValueError("final_tx txid does not match txid")
+            raise ValueError("channel_signed_parent_tx must not contain scriptSig data")
+        if not transaction.has_witness or len(transaction.witnesses) != len(transaction.inputs):
+            raise ValueError(
+                "channel_signed_parent_tx must include a witness vector for every input"
+            )
+        nonempty_witnesses = [witness for witness in transaction.witnesses if witness]
+        if len(nonempty_witnesses) != 1:
+            raise ValueError("channel_signed_parent_tx must contain exactly one channel witness")
+        channel_witness = nonempty_witnesses[0]
+        if len(channel_witness) != 1 or len(channel_witness[0]) != 64:
+            raise ValueError(
+                "channel_signed_parent_tx channel witness must be one 64-byte Taproot signature"
+            )
+        unsigned = serialize_transaction(
+            transaction.version,
+            transaction.inputs,
+            transaction.outputs,
+            transaction.locktime,
+            None,
+        )
+        if hash256(unsigned)[::-1].hex() != self.txid:
+            raise ValueError("channel_signed_parent_tx txid does not match txid")
         return self
 
 
@@ -1283,29 +1287,28 @@ def validate_finalize_for_transcript(
 def validate_finalized_for_transcript(
     payload: ChannelInputFinalizedPayload, transcript: ChannelInputTranscript
 ) -> None:
-    """Require a final transaction to retain the transcript's exact unsigned portion."""
+    """Bind channel-witness evidence to its exact transcript input."""
 
     try:
-        transaction = parse_transaction_bytes(bytes.fromhex(payload.final_tx))
+        transaction = parse_transaction_bytes(bytes.fromhex(payload.channel_signed_parent_tx))
         unsigned = serialize_transaction(
             transaction.version, transaction.inputs, transaction.outputs, transaction.locktime, None
         ).hex()
     except (ValueError, IndexError) as exc:
-        raise ChannelInputValidationError("finalized transaction is invalid") from exc
+        raise ChannelInputValidationError("channel-signed parent transaction is invalid") from exc
     if unsigned != transcript.unsigned_parent_tx:
         raise ChannelInputValidationError(
-            "finalized transaction differs from transcript unsigned parent"
+            "channel-signed parent differs from transcript unsigned parent"
         )
-    if (
-        not transaction.has_witness
-        or len(transaction.witnesses) != len(transaction.inputs)
-        or any(not witness for witness in transaction.witnesses)
-    ):
+    descriptor = _descriptor_for_outpoint(transcript, payload.funding_outpoint)
+    nonempty_indices = [index for index, witness in enumerate(transaction.witnesses) if witness]
+    if nonempty_indices != [descriptor.input_index]:
         raise ChannelInputValidationError(
-            "finalized transaction must contain a witness for every input"
+            "channel witness is not at the funding outpoint transcript input"
         )
-    if any(tx_input.scriptsig for tx_input in transaction.inputs):
-        raise ChannelInputValidationError("finalized transaction must not contain scriptSig data")
+    transcript_txid = hash256(bytes.fromhex(transcript.unsigned_parent_tx))[::-1].hex()
+    if payload.txid != transcript_txid:
+        raise ChannelInputValidationError("channel-signed parent txid does not match transcript")
 
 
 def _canonical_value(value: Any) -> Any:

@@ -1192,26 +1192,76 @@ def test_channel_messages_cancel_and_finalized_witness_binding() -> None:
             partial_released=True,  # type: ignore[arg-type]
         )
     unsigned = parse_transaction_bytes(bytes.fromhex(transcript.unsigned_parent_tx))
-    final_raw = serialize_transaction(
+    channel_signed_parent = serialize_transaction(
         unsigned.version,
         unsigned.inputs,
         unsigned.outputs,
         unsigned.locktime,
-        [[b"\x01"] for _ in unsigned.inputs],
+        [[], [b"\x01" * 64]],
     )
-    finalized = ChannelInputFinalizedPayload(
-        session_id=transcript.session_id,
-        attempt=transcript.attempt,
-        signer_key=_key(1),
-        transcript_hash=transcript_digest,
-        funding_outpoint=transcript.channels[0].funding_outpoint,
-        final_tx=final_raw.hex(),
-        txid=hash256(bytes.fromhex(transcript.unsigned_parent_tx))[::-1].hex(),
-    )
-    validate_finalized_for_transcript(finalized, transcript)
-    with pytest.raises(ValidationError, match="witness for every input"):
+    finalized = sign_payload(
         ChannelInputFinalizedPayload(
-            **{**finalized.model_dump(), "final_tx": transcript.unsigned_parent_tx}
+            session_id=transcript.session_id,
+            attempt=transcript.attempt,
+            signer_key=_key(3),
+            transcript_hash=transcript_digest,
+            funding_outpoint=transcript.channels[1].funding_outpoint,
+            channel_signed_parent_tx=channel_signed_parent.hex(),
+            txid=hash256(bytes.fromhex(transcript.unsigned_parent_tx))[::-1].hex(),
+        ),
+        _secret(3),
+        aux_randomness=b"\x40" * 32,
+    )
+    assert verify_payload(finalized)
+    validate_finalized_for_transcript(finalized, transcript)
+    validate_channel_payload_for_transcript(finalized, transcript)
+    assert decode_channel_input_message(encode_channel_input_message(finalized)) == finalized
+
+    with pytest.raises(ValidationError, match="witness vector"):
+        ChannelInputFinalizedPayload(
+            **{
+                **finalized.model_dump(),
+                "channel_signed_parent_tx": transcript.unsigned_parent_tx,
+            }
+        )
+    with pytest.raises(ValidationError, match="exactly one channel witness"):
+        ChannelInputFinalizedPayload(
+            **{
+                **finalized.model_dump(),
+                "channel_signed_parent_tx": serialize_transaction(
+                    unsigned.version,
+                    unsigned.inputs,
+                    unsigned.outputs,
+                    unsigned.locktime,
+                    [[b"\x02" * 64], [b"\x01" * 64]],
+                ).hex(),
+            }
+        )
+    with pytest.raises(ValidationError, match="one 64-byte Taproot signature"):
+        ChannelInputFinalizedPayload(
+            **{
+                **finalized.model_dump(),
+                "channel_signed_parent_tx": serialize_transaction(
+                    unsigned.version,
+                    unsigned.inputs,
+                    unsigned.outputs,
+                    unsigned.locktime,
+                    [[], [b"\x01" * 32, b"\x02" * 32]],
+                ).hex(),
+            }
+        )
+    with pytest.raises(ValidationError, match="one 64-byte Taproot signature"):
+        ChannelInputFinalizedPayload(
+            **{
+                **finalized.model_dump(),
+                "channel_signed_parent_tx": serialize_transaction(
+                    unsigned.version,
+                    unsigned.inputs,
+                    unsigned.outputs,
+                    unsigned.locktime,
+                    [[], [b"\x01" * 63]],
+                ).hex(),
+            }
         )
     script_input = TxInput(
         txid_le=unsigned.inputs[0].txid_le,
@@ -1224,7 +1274,7 @@ def test_channel_messages_cancel_and_finalized_witness_binding() -> None:
         [script_input, unsigned.inputs[1]],
         unsigned.outputs,
         unsigned.locktime,
-        [[b"\x01"] for _ in unsigned.inputs],
+        [[], [b"\x01" * 64]],
     )
     script_txid = hash256(
         serialize_transaction(
@@ -1236,8 +1286,72 @@ def test_channel_messages_cancel_and_finalized_witness_binding() -> None:
     )[::-1].hex()
     with pytest.raises(ValidationError, match="scriptSig"):
         ChannelInputFinalizedPayload(
-            **{**finalized.model_dump(), "final_tx": script_raw.hex(), "txid": script_txid}
+            **{
+                **finalized.model_dump(),
+                "channel_signed_parent_tx": script_raw.hex(),
+                "txid": script_txid,
+            }
         )
+
+    with pytest.raises(ValidationError, match="canonical"):
+        ChannelInputFinalizedPayload(
+            **{
+                **finalized.model_dump(),
+                "channel_signed_parent_tx": channel_signed_parent.replace(
+                    b"\x01\x40" + b"\x01" * 64,
+                    b"\xfd\x01\x00\x40" + b"\x01" * 64,
+                ).hex(),
+            }
+        )
+    with pytest.raises(ValidationError, match="txid does not match"):
+        ChannelInputFinalizedPayload(**{**finalized.model_dump(), "txid": "00" * 32})
+
+    wrong_position = sign_payload(
+        finalized.model_copy(
+            update={
+                "channel_signed_parent_tx": serialize_transaction(
+                    unsigned.version,
+                    unsigned.inputs,
+                    unsigned.outputs,
+                    unsigned.locktime,
+                    [[b"\x01" * 64], []],
+                ).hex()
+            }
+        ),
+        _secret(3),
+        aux_randomness=b"\x41" * 32,
+    )
+    with pytest.raises(ChannelInputValidationError, match="not at the funding outpoint"):
+        validate_finalized_for_transcript(wrong_position, transcript)
+
+    mutated_outputs = list(unsigned.outputs)
+    mutated_outputs[0] = TxOutput(
+        value=mutated_outputs[0].value - 1, script=mutated_outputs[0].script
+    )
+    mutated_unsigned = serialize_transaction(
+        unsigned.version, unsigned.inputs, mutated_outputs, unsigned.locktime
+    )
+    mutated_parent = serialize_transaction(
+        unsigned.version,
+        unsigned.inputs,
+        mutated_outputs,
+        unsigned.locktime,
+        [[], [b"\x01" * 64]],
+    )
+    mutated = sign_payload(
+        finalized.model_copy(
+            update={
+                "channel_signed_parent_tx": mutated_parent.hex(),
+                "txid": hash256(mutated_unsigned)[::-1].hex(),
+            }
+        ),
+        _secret(3),
+        aux_randomness=b"\x42" * 32,
+    )
+    with pytest.raises(
+        ChannelInputValidationError, match="differs from transcript unsigned parent"
+    ):
+        validate_finalized_for_transcript(mutated, transcript)
 
 
 def test_post_approval_validator_chain_and_nested_wire_evidence() -> None:
