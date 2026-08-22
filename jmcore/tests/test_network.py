@@ -973,6 +973,22 @@ class TestOnionPeerConnection:
         message_part = line.split("!")[-1]
         assert message_part == "fill 123 456 abc"
 
+    @pytest.mark.asyncio
+    async def test_connection_binding_does_not_follow_peer_reconnect(self):
+        """A reply binding must keep using the connection that received a request."""
+        peer = OnionPeer(nick="J5maker", location="test.onion:5222")
+        ingress_connection = AsyncMock()
+        replacement_connection = AsyncMock()
+        peer._connection = ingress_connection
+        peer._status = PeerStatus.HANDSHAKED
+
+        binding = peer.bind_current_connection()
+        peer._connection = replacement_connection
+
+        assert await binding.send_privmsg("J5taker", "channel_input", "payload")
+        ingress_connection.send.assert_awaited_once()
+        replacement_connection.send.assert_not_awaited()
+
 
 class TestOnionPeerBackoff:
     """Test connection backoff and retry behavior."""

@@ -118,6 +118,47 @@ class TCPConnection(Connection):
         return self._connected
 
 
+class PeerConnectionBinding:
+    """Opaque binding to one exact direct-peer TCP connection."""
+
+    def __init__(
+        self,
+        connection: TCPConnection,
+        recipient_nick: str,
+        nick_identity: NickIdentity | None,
+    ) -> None:
+        self._connection = connection
+        self._recipient_nick = recipient_nick
+        self._nick_identity = nick_identity
+
+    async def send_privmsg(self, our_nick: str, command: str, message: str) -> bool:
+        """Send a signed private message only on the bound connection."""
+        import json
+
+        from jmcore.protocol import MessageType, format_jm_message
+
+        signed_message = (
+            self._nick_identity.sign_message(message, ONION_HOSTID)
+            if self._nick_identity
+            else message
+        )
+        jm_msg = format_jm_message(
+            our_nick,
+            self._recipient_nick,
+            command,
+            signed_message,
+        )
+        payload = json.dumps({"type": MessageType.PRIVMSG.value, "line": jm_msg}).encode("utf-8")
+        try:
+            await self._connection.send(payload)
+            return True
+        except Exception as e:
+            logger.warning(
+                f"Failed to send to peer {self._recipient_nick} on bound connection: {e}"
+            )
+            return False
+
+
 class ConnectionPool:
     def __init__(self, max_connections: int = 1000):
         self.max_connections = max_connections
@@ -527,6 +568,12 @@ class OnionPeer:
     def is_connecting(self) -> bool:
         """Check if connection is in progress."""
         return self._status == PeerStatus.CONNECTING
+
+    def bind_current_connection(self) -> PeerConnectionBinding:
+        """Bind replies to the exact TCP connection currently serving this peer."""
+        if not self._connection or not self.is_connected():
+            raise OnionPeerConnectionError(f"Peer {self.nick} has no active connection")
+        return PeerConnectionBinding(self._connection, self.nick, self.nick_identity)
 
     def can_connect(self) -> bool:
         """Check if we can attempt to connect to this peer."""

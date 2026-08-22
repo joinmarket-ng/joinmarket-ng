@@ -10,7 +10,7 @@ it as disconnected.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from jmcore.crypto import NickIdentity, verify_signed_privmsg
@@ -18,7 +18,7 @@ from jmcore.deduplication import ResponseDeduplicator
 from jmcore.directory_client import DirectoryClient, DirectoryClientError
 from jmcore.directory_pool import DirectoryClientPool
 from jmcore.models import Offer
-from jmcore.network import ONION_HOSTID, OnionPeer
+from jmcore.network import ONION_HOSTID, OnionPeer, PeerConnectionBinding
 from jmcore.nick_auth import NickAuthMode
 from jmcore.protocol import (
     FEATURE_CHANNEL_INPUT_V1,
@@ -61,6 +61,24 @@ class ChannelBinding:
     @property
     def is_direct(self) -> bool:
         """True if this binding routes through a direct peer connection."""
+        return self.channel_id == "direct"
+
+
+@dataclass(frozen=True)
+class ReplyRoute:
+    """Authenticated ingress route that can carry a response back to its source."""
+
+    nick: str
+    channel_id: str
+    _direct_binding: PeerConnectionBinding | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+
+    @property
+    def is_direct(self) -> bool:
+        """True when the route is bound to one direct peer connection."""
         return self.channel_id == "direct"
 
 
@@ -431,7 +449,7 @@ class MultiDirectoryClient(DirectoryClientPool):
         """Return the in-flight direct-connect task for ``nick``, if any."""
         return self._pending_connect_tasks.get(nick)
 
-    async def _on_peer_message(self, nick: str, data: bytes) -> None:
+    async def _on_peer_message(self, peer: OnionPeer, nick: str, data: bytes) -> None:
         """
         Handle message received from a direct peer connection.
 
@@ -448,6 +466,11 @@ class MultiDirectoryClient(DirectoryClientPool):
             # Enrich message with sender nick for wait_for_responses to identify
             msg["from_nick"] = nick
             msg["from_direct"] = True
+            msg["_reply_route"] = ReplyRoute(
+                nick=nick,
+                channel_id="direct",
+                _direct_binding=peer.bind_current_connection(),
+            )
 
             # Queue for processing by wait_for_responses
             await self._direct_message_queue.put(msg)
@@ -488,7 +511,7 @@ class MultiDirectoryClient(DirectoryClientPool):
                 socks_host=self.socks_host,
                 socks_port=self.socks_port,
                 timeout=self.connection_timeout,
-                on_message=self._on_peer_message,
+                on_message=None,
                 on_disconnect=self._on_peer_disconnect,
                 on_handshake_complete=self._on_peer_handshake_complete,
                 nick_identity=self.nick_identity,
@@ -497,6 +520,16 @@ class MultiDirectoryClient(DirectoryClientPool):
                 allow_clearnet_connections=self.allow_clearnet_connections,
                 local_features=self._local_features(),
             )
+
+            async def on_peer_message(
+                from_nick: str,
+                data: bytes,
+                *,
+                ingress_peer: OnionPeer = peer,
+            ) -> None:
+                await self._on_peer_message(ingress_peer, from_nick, data)
+
+            peer.on_message = on_peer_message
             self._peer_connections[nick] = peer
         else:
             peer = self._peer_connections[nick]
@@ -758,12 +791,39 @@ class MultiDirectoryClient(DirectoryClientPool):
 
         raise RuntimeError(f"Failed to send !{command} to {recipient} via any directory")
 
+    async def send_privmsg_via_route(
+        self,
+        recipient: str,
+        command: str,
+        data: str,
+        route: ReplyRoute,
+    ) -> str:
+        """Send a response over the exact authenticated ingress route."""
+        if recipient != route.nick:
+            raise ValueError(
+                f"Reply route is bound to {route.nick}, not requested recipient {recipient}"
+            )
+        if route.is_direct:
+            if route._direct_binding is None:
+                raise RuntimeError("Direct reply route has no bound connection")
+            success = await route._direct_binding.send_privmsg(self.nick, command, data)
+            if not success:
+                raise RuntimeError(f"Failed to send to {recipient} via bound direct connection")
+            return route.channel_id
+        return await self.send_privmsg(
+            recipient,
+            command,
+            data,
+            force_channel=route.channel_id,
+        )
+
     async def wait_for_responses(
         self,
         expected_nicks: list[str],
         expected_command: str,
         timeout: float = 60.0,
         expected_counts: dict[str, int] | None = None,
+        include_routes: bool = False,
     ) -> dict[str, dict[str, Any]]:
         """Wait for responses from multiple makers at once.
 
@@ -863,6 +923,14 @@ class MultiDirectoryClient(DirectoryClientPool):
 
             # Preserve the downstream payload contract (data plus pubkey/sig suffix).
             payload = parsed[2].split(" ", 1)[1].strip() if " " in parsed[2] else ""
+            route = (
+                msg.get("_reply_route")
+                if source == "direct"
+                else ReplyRoute(nick=from_nick, channel_id=source)
+            )
+            if include_routes and not isinstance(route, ReplyRoute):
+                logger.warning(f"Dropping {command} from {from_nick}: missing reply route")
+                return
 
             if command == "error":
                 if not deduplicator.add_response(from_nick, "error", line, source):
@@ -873,6 +941,8 @@ class MultiDirectoryClient(DirectoryClientPool):
                     )
                     return
                 responses[from_nick] = {"error": True, "data": _data or "Unknown error"}
+                if include_routes:
+                    responses[from_nick]["route"] = route
                 remaining_nicks.discard(from_nick)
                 logger.warning("Received error from peer")
                 logger.bind(sensitive=True).warning(f"Received error from {from_nick}: {_data}")
@@ -890,6 +960,8 @@ class MultiDirectoryClient(DirectoryClientPool):
                     logger.debug(f"Duplicate {expected_command} from {from_nick} via {source}")
                     return
                 responses[from_nick] = {"data": payload}
+                if include_routes:
+                    responses[from_nick]["route"] = route
                 remaining_nicks.discard(from_nick)
                 logger.debug(f"Received {expected_command} from {from_nick} via {source}")
             else:
@@ -901,8 +973,12 @@ class MultiDirectoryClient(DirectoryClientPool):
                 nick_seen.add(payload)
                 if from_nick not in responses:
                     responses[from_nick] = {"data": []}
+                    if include_routes:
+                        responses[from_nick]["routes"] = []
                     remaining_nicks.discard(from_nick)
                 responses[from_nick]["data"].append(payload)
+                if include_routes:
+                    responses[from_nick]["routes"].append(route)
                 logger.debug(
                     f"Received {expected_command} #{len(responses[from_nick]['data'])} "
                     f"from {from_nick} via {source}"
