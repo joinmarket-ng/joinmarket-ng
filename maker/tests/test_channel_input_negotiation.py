@@ -36,6 +36,7 @@ from jmcore.channel_input import (
     PolicyCeilings,
     SettlementOutput,
     approval_set_hash,
+    cancellation_binding_hash,
     endpoint_terms_hash,
     sign_payload,
     transcript_hash,
@@ -404,6 +405,25 @@ def _cancel(
     )
 
 
+def _pretranscript_cancel(
+    negotiation: MakerChannelInputNegotiation, *, binding: str | None = None
+) -> ChannelInputCancelPayload:
+    coordinator = ChannelInputKeyPair.from_secret(COORDINATOR_SECRET)
+    return cast(
+        ChannelInputCancelPayload,
+        sign_payload(
+            ChannelInputCancelPayload(
+                session_id=negotiation.invite.session_id,
+                attempt=negotiation.invite.attempt,
+                signer_key=coordinator.public_key,
+                transcript_hash=binding or cancellation_binding_hash(negotiation.invite).hex(),
+                reason_code="coordinator_abort",
+            ),
+            COORDINATOR_SECRET,
+        ),
+    )
+
+
 def _proposal_approved() -> tuple[
     MakerChannelInputNegotiation,
     ChannelInputProposalPayload,
@@ -640,6 +660,43 @@ def test_cancel_is_signed_replayable_and_rejects_partial_evidence() -> None:
     signing.record_partial(local.funding_outpoint, b"\xaa" * 32)
     with pytest.raises(ChannelInputValidationError, match="partial"):
         signing.accept_cancel("coordinator", _cancel(signing_proposal))
+
+
+@pytest.mark.parametrize("install_hellos", (False, True))
+def test_pretranscript_cancel_is_signed_replayable_and_restores(
+    install_hellos: bool,
+) -> None:
+    negotiation, frozen = _negotiation(channels=1)
+    _plan_freeze(negotiation, frozen)
+    if install_hellos:
+        negotiation.install_frozen_inputs(frozen)
+
+    cancel = _pretranscript_cancel(negotiation)
+    assert negotiation.accept_cancel("coordinator", cancel) is None
+    outpoints = tuple(
+        sorted(
+            (
+                Outpoint(txid=intent.funding_outpoint.txid, vout=intent.funding_outpoint.vout)
+                for intent in negotiation.freeze_intents
+            ),
+            key=lambda item: item.key(),
+        )
+    )
+    ack = negotiation.record_canceled(outpoints)
+    assert ack.transcript_hash == cancellation_binding_hash(negotiation.invite).hex()
+    assert negotiation.accept_cancel("coordinator", cancel) == ack
+    restored = MakerChannelInputNegotiation.from_snapshot(negotiation.snapshot())
+    assert restored.accept_cancel("coordinator", cancel) == ack
+
+
+def test_pretranscript_cancel_rejects_wrong_invitation_binding() -> None:
+    negotiation, frozen = _negotiation(channels=1)
+    _plan_freeze(negotiation, frozen)
+
+    with pytest.raises(ChannelInputValidationError, match="invitation"):
+        negotiation.accept_cancel(
+            "coordinator", _pretranscript_cancel(negotiation, binding="00" * 32)
+        )
 
 
 def test_prepared_rotation_requires_durable_intent_and_tampering_fails_closed() -> None:

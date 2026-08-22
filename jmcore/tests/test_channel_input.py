@@ -43,10 +43,12 @@ from jmcore.channel_input import (
     SettlementOutput,
     approval_set_hash,
     cancel_payload_hash,
+    cancellation_binding_hash,
     canonical_json,
     decode_channel_input_message,
     encode_channel_input_message,
     endpoint_terms_hash,
+    payload_hash,
     sign_payload,
     transcript_hash,
     validate_cancel_ack,
@@ -1193,6 +1195,14 @@ def test_cancel_ack_round_trips_and_binds_exact_signed_cancel() -> None:
     assert cancel_payload_hash(differently_signed_cancel) != cancel_payload_hash(cancel)
     with pytest.raises(ChannelInputValidationError, match="exact signed cancel"):
         validate_cancel_ack(differently_signed_cancel, ack, _key(2), outpoints)
+
+
+def test_cancellation_binding_uses_invite_before_a_transcript_exists() -> None:
+    invite = _signed_invite()
+    transcript, _ = _transcript()
+
+    assert cancellation_binding_hash(invite) == payload_hash(invite)
+    assert cancellation_binding_hash(invite, transcript) == transcript_hash(transcript)
 
 
 def test_cancel_ack_rejects_invalid_bindings_and_outpoint_coverage() -> None:

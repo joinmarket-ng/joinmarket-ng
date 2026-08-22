@@ -35,6 +35,7 @@ from jmcore.channel_input import (
     PolicyCeilings,
     approval_set_hash,
     cancel_payload_hash,
+    cancellation_binding_hash,
     canonical_json,
     endpoint_terms_hash,
     sign_payload,
@@ -258,6 +259,46 @@ class MakerChannelInputSnapshot(ChannelInputModel):
             ) from exc
         return value
 
+    def _validate_cancellation_shape(self, cancellation_stage: bool, rank: int) -> None:
+        if not cancellation_stage:
+            if self.cancel is not None or self.cancel_ack is not None:
+                raise ValueError("non-canceled snapshot contains cancellation evidence")
+            if rank < 0:
+                raise ValueError("snapshot stage is not supported")
+            return
+        if self.cancel is None:
+            raise ValueError("canceled snapshot requires a cancellation payload")
+        if (self.stage is MakerChannelInputStage.CANCELED) != (self.cancel_ack is not None):
+            raise ValueError("canceled snapshot ACK does not match stage")
+        if self.proposal is None:
+            if (
+                self.local_approval is not None
+                or self.accepted_height is not None
+                or self.approval_set is not None
+                or self.local_ack is not None
+                or self.prepare is not None
+                or self.channel_states
+            ):
+                raise ValueError("pre-transcript cancel contains proposal evidence")
+        else:
+            if self.local_approval is None or self.accepted_height is None:
+                raise ValueError("canceled snapshot requires accepted proposal evidence")
+            if self.approval_set is None and (
+                self.local_ack is not None or self.prepare is not None
+            ):
+                raise ValueError("canceled snapshot approval evidence is inconsistent")
+            if self.approval_set is not None and self.local_ack is None:
+                raise ValueError("canceled snapshot approval ACK is missing")
+            if self.prepare is not None and self.approval_set is None:
+                raise ValueError("canceled snapshot prepare lacks approval evidence")
+        if any(
+            state.partial is not None
+            or state.finalize_request is not None
+            or state.finalized is not None
+            for state in self.channel_states
+        ):
+            raise ValueError("canceled snapshot contains partial or final evidence")
+
     @model_validator(mode="after")
     def validate_stage_shape(self) -> MakerChannelInputSnapshot:
         _validate_node_key(self.local_node_key, "local_node_key")
@@ -288,39 +329,21 @@ class MakerChannelInputSnapshot(ChannelInputModel):
             MakerChannelInputStage.FINALIZED: 9,
         }
         rank = stage_rank.get(self.stage, -1)
-        if cancellation_stage:
-            if self.proposal is None or self.local_approval is None or self.accepted_height is None:
-                raise ValueError("canceled snapshot requires an accepted proposal")
-            if self.cancel is None:
-                raise ValueError("canceled snapshot requires a cancellation payload")
-            if (self.stage is MakerChannelInputStage.CANCELED) != (self.cancel_ack is not None):
-                raise ValueError("canceled snapshot ACK does not match stage")
-            if self.approval_set is None and (
-                self.local_ack is not None or self.prepare is not None
-            ):
-                raise ValueError("canceled snapshot approval evidence is inconsistent")
-            if self.approval_set is not None and self.local_ack is None:
-                raise ValueError("canceled snapshot approval ACK is missing")
-            if self.prepare is not None and self.approval_set is None:
-                raise ValueError("canceled snapshot prepare lacks approval evidence")
-            if any(
-                state.partial is not None
-                or state.finalize_request is not None
-                or state.finalized is not None
-                for state in self.channel_states
-            ):
-                raise ValueError("canceled snapshot contains partial or final evidence")
-        else:
-            if self.cancel is not None or self.cancel_ack is not None:
-                raise ValueError("non-canceled snapshot contains cancellation evidence")
-            if rank < 0:
-                raise ValueError("snapshot stage is not supported")
+        self._validate_cancellation_shape(cancellation_stage, rank)
         if self.stage is MakerChannelInputStage.INVITED:
             if self.freeze_intents or self.frozen_inputs or self.hellos:
                 raise ValueError("invited snapshot contains freeze or hello evidence")
         elif self.stage is MakerChannelInputStage.FREEZE_INTENDED:
             if not self.freeze_intents or self.frozen_inputs or self.hellos:
                 raise ValueError("freeze-intended snapshot evidence does not match stage")
+        elif cancellation_stage and self.proposal is None:
+            if not self.freeze_intents or bool(self.frozen_inputs) != bool(self.hellos):
+                raise ValueError("pre-transcript cancel freeze evidence is inconsistent")
+            if self.frozen_inputs and (
+                len(self.freeze_intents) != len(self.frozen_inputs)
+                or len(self.frozen_inputs) != len(self.hellos)
+            ):
+                raise ValueError("pre-transcript cancel frozen inputs do not match intents")
         elif (
             not self.freeze_intents
             or not self.frozen_inputs
@@ -1070,6 +1093,8 @@ class MakerChannelInputNegotiation:
                 )
             return
         if self.stage not in {
+            MakerChannelInputStage.FREEZE_INTENDED,
+            MakerChannelInputStage.HELLOS_READY,
             MakerChannelInputStage.PROPOSAL_APPROVED,
             MakerChannelInputStage.APPROVAL_SET_ACKED,
             MakerChannelInputStage.PREPARED,
@@ -1077,11 +1102,18 @@ class MakerChannelInputNegotiation:
             MakerChannelInputStage.SIGNING,
         }:
             raise ChannelInputValidationError("cancel is not valid at this negotiation stage")
-        assert self.proposal is not None
-        if (
+        if self.proposal is None:
+            if (
+                cancel.session_id != self.invite.session_id
+                or cancel.attempt != self.invite.attempt
+                or cancel.transcript_hash != cancellation_binding_hash(self.invite).hex()
+            ):
+                raise ChannelInputValidationError("cancel does not bind the invitation")
+        elif (
             cancel.session_id != self.proposal.session_id
             or cancel.attempt != self.proposal.attempt
-            or cancel.transcript_hash != self.proposal.transcript_hash
+            or cancel.transcript_hash
+            != cancellation_binding_hash(self.invite, self.proposal.transcript).hex()
         ):
             raise ChannelInputValidationError("cancel does not bind the accepted proposal")
         if self._has_partial_or_final_evidence():
@@ -1106,19 +1138,18 @@ class MakerChannelInputNegotiation:
         except TypeError as exc:
             raise ChannelInputValidationError("resumed outpoints must be a sequence") from exc
         if resumed != expected_outpoints:
-            raise ChannelInputValidationError("resumed outpoints differ from local proposal terms")
+            raise ChannelInputValidationError("resumed outpoints differ from local freeze evidence")
         if self.cancel_ack is not None:
             return self.cancel_ack
         if self.stage is not MakerChannelInputStage.CANCEL_INTENDED:
             raise ChannelInputValidationError(
                 "cancellation ACK is not valid at this negotiation stage"
             )
-        assert self.proposal is not None
         ack = ChannelInputCancelAckPayload(
             session_id=self.cancel.session_id,
             attempt=self.cancel.attempt,
             signer_key=self.participant_key,
-            transcript_hash=self.proposal.transcript_hash,
+            transcript_hash=self.cancel.transcript_hash,
             cancel_hash=cancel_payload_hash(self.cancel).hex(),
             resumed_outpoints=expected_outpoints,
         )
@@ -1152,8 +1183,14 @@ class MakerChannelInputNegotiation:
         return get_txid(self.proposal.transcript.unsigned_parent_tx)
 
     def _expected_local_outpoints(self) -> tuple[Outpoint, ...]:
-        assert self.proposal is not None
-        outpoints = tuple(terms.funding_outpoint for terms in self.proposal.recipient_terms)
+        outpoints = (
+            tuple(terms.funding_outpoint for terms in self.proposal.recipient_terms)
+            if self.proposal is not None
+            else tuple(
+                Outpoint(txid=intent.funding_outpoint.txid, vout=intent.funding_outpoint.vout)
+                for intent in self.freeze_intents
+            )
+        )
         if len({_outpoint_sort_key(outpoint) for outpoint in outpoints}) != len(outpoints):
             raise ChannelInputValidationError(
                 "proposal local terms have duplicate funding outpoints"
@@ -1279,10 +1316,7 @@ class MakerChannelInputNegotiation:
         expected_entries: list[tuple[str, ChannelInputPayload]] = [(_slot("invite"), self.invite)]
         if self.stage is not MakerChannelInputStage.INVITED:
             _validate_freeze_intents(self.config, self.local_node_key, self.freeze_intents)
-        if self.stage not in (
-            MakerChannelInputStage.INVITED,
-            MakerChannelInputStage.FREEZE_INTENDED,
-        ):
+        if self.frozen_inputs:
             _validate_frozen_inputs(
                 self.config, self.invite, self.local_node_key, self.frozen_inputs
             )
@@ -1367,14 +1401,18 @@ class MakerChannelInputNegotiation:
         elif self.channel_states:
             raise ChannelInputValidationError("restored channel states require accepted prepare")
         if self.cancel is not None:
-            assert self.proposal is not None
             self._require_coordinator(self.coordinator_actor, self.cancel)
+            binding = cancellation_binding_hash(
+                self.invite, self.proposal.transcript if self.proposal is not None else None
+            ).hex()
             if (
-                self.cancel.session_id != self.proposal.session_id
-                or self.cancel.attempt != self.proposal.attempt
-                or self.cancel.transcript_hash != self.proposal.transcript_hash
+                self.cancel.session_id != self.invite.session_id
+                or self.cancel.attempt != self.invite.attempt
+                or self.cancel.transcript_hash != binding
             ):
-                raise ChannelInputValidationError("restored cancel differs from accepted proposal")
+                raise ChannelInputValidationError(
+                    "restored cancel differs from cancellation binding"
+                )
             if self._has_partial_or_final_evidence():
                 raise ChannelInputValidationError(
                     "restored cancellation conflicts with partial or final evidence"

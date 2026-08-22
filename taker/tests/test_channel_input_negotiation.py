@@ -11,6 +11,7 @@ from jmcore.channel_input import (
     ChannelInputApprovalPayload,
     ChannelInputApprovalSetAckPayload,
     ChannelInputCancelAckPayload,
+    ChannelInputCancelPayload,
     ChannelInputHelloPayload,
     ChannelInputKeyPair,
     ChannelInputProposalPayload,
@@ -23,6 +24,7 @@ from jmcore.channel_input import (
     SettlementOutput,
     approval_set_hash,
     cancel_payload_hash,
+    cancellation_binding_hash,
     endpoint_terms_hash,
     sign_payload,
     transcript_hash,
@@ -729,6 +731,88 @@ def test_cancel_requires_all_remote_and_local_resume() -> None:
         negotiation.record_local_resumed(tuple(reversed(local_outpoints)))
     negotiation.record_local_resumed(local_outpoints)
     assert negotiation.stage is TakerChannelInputStage.CANCELED
+
+
+def test_pretranscript_cancel_resumes_partial_local_freeze_and_restores_json() -> None:
+    negotiation = _new()
+    remote, _ = _freeze_intent(negotiation, 0)
+    negotiation.install_frozen_channel("maker-a", _frozen_snapshot(0))
+    cancel = negotiation.plan_cancel("local_freeze_failed")
+    assert cancel.transcript_hash == cancellation_binding_hash(negotiation.invite).hex()
+
+    wrong_ack = sign_payload(
+        ChannelInputCancelAckPayload(
+            session_id=_SESSION,
+            attempt=1,
+            signer_key=remote.participant_key,
+            transcript_hash=cancel.transcript_hash,
+            cancel_hash=cancel_payload_hash(cancel).hex(),
+            resumed_outpoints=(Outpoint(txid="ff" * 32, vout=0),),
+        ),
+        _MAKER_SECRETS[0],
+        aux_randomness=b"\x08" * 32,
+    )
+    with pytest.raises(ChannelInputValidationError, match="exactly match"):
+        negotiation.accept_cancel_ack("maker-a", wrong_ack)
+    with pytest.raises(ChannelInputValidationError, match="durable remote hello"):
+        negotiation.accept_cancel_ack("maker-b", wrong_ack)
+
+    outpoint = remote.funding_outpoint
+    ack = sign_payload(
+        ChannelInputCancelAckPayload(
+            session_id=_SESSION,
+            attempt=1,
+            signer_key=remote.participant_key,
+            transcript_hash=cancel.transcript_hash,
+            cancel_hash=cancel_payload_hash(cancel).hex(),
+            resumed_outpoints=(outpoint,),
+        ),
+        _MAKER_SECRETS[0],
+        aux_randomness=b"\x09" * 32,
+    )
+    negotiation.accept_cancel_ack("maker-a", ack)
+    with pytest.raises(ChannelInputValidationError, match="local hello"):
+        negotiation.record_local_resumed(())
+    negotiation.record_local_resumed((outpoint,))
+    assert negotiation.stage is TakerChannelInputStage.CANCELED
+    negotiation.accept_cancel_ack("maker-a", ack)
+    negotiation.record_local_resumed((outpoint,))
+
+    snapshot = TakerChannelInputSnapshot.model_validate_json(
+        negotiation.snapshot().model_dump_json()
+    )
+    assert TakerChannelInputNegotiation.from_snapshot(snapshot).snapshot() == snapshot
+
+
+def test_hello_ready_cancel_binds_the_invitation() -> None:
+    negotiation, _ = _ready()
+
+    cancel = negotiation.plan_cancel("maker_unavailable")
+
+    assert cancel.transcript_hash == cancellation_binding_hash(negotiation.invite).hex()
+    assert TakerChannelInputNegotiation.from_snapshot(negotiation.snapshot()).snapshot() == (
+        negotiation.snapshot()
+    )
+
+
+def test_pretranscript_cancel_rejects_wrong_invitation_binding_on_restore() -> None:
+    negotiation = _new()
+    _freeze_intent(negotiation, 0)
+    negotiation.plan_cancel("local_freeze_failed")
+    wrong_cancel = sign_payload(
+        ChannelInputCancelPayload(
+            session_id=_SESSION,
+            attempt=1,
+            signer_key=negotiation.coordinator_key,
+            transcript_hash="00" * 32,
+            reason_code="local_freeze_failed",
+        ),
+        _COORDINATOR_SECRET,
+        aux_randomness=b"\x0a" * 32,
+    )
+    snapshot = negotiation.snapshot().model_copy(update={"cancel": wrong_cancel})
+    with pytest.raises(TakerChannelInputNegotiationError, match="deep validation"):
+        TakerChannelInputNegotiation.from_snapshot(snapshot)
 
 
 @pytest.mark.parametrize(

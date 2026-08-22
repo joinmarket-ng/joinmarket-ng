@@ -1426,6 +1426,16 @@ def transcript_hash(transcript: ChannelInputTranscript) -> bytes:
     return channel_input_hash("transcript", transcript)
 
 
+def cancellation_binding_hash(
+    invite: ChannelInputInvitePayload, transcript: ChannelInputTranscript | None = None
+) -> bytes:
+    """Return the cancellation binding for the committed negotiation boundary."""
+
+    if transcript is None:
+        return payload_hash(invite)
+    return transcript_hash(transcript)
+
+
 def endpoint_terms_hash(terms: EndpointTerms) -> bytes:
     return channel_input_hash("endpoint-terms", terms)
 

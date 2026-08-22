@@ -592,26 +592,25 @@ class MakerChannelInputRegistry:
             raise MakerChannelInputRuntimeError(
                 "cancellation conflicts with durable partial evidence"
             )
-        if negotiation.proposal is None:
-            raise MakerChannelInputRuntimeError("cancellation requires an accepted proposal")
         statuses: list[tuple[Outpoint, EscrowOutpoint, LndEscrowStatus | None]] = []
-        for terms in sorted(
-            negotiation.proposal.recipient_terms,
-            key=lambda terms: terms.funding_outpoint.key(),
-        ):
-            outpoint = terms.funding_outpoint
+        has_later_escrow_evidence = False
+        for outpoint in negotiation._expected_local_outpoints():
             escrow_outpoint = EscrowOutpoint(txid=outpoint.txid, vout=outpoint.vout)
             status = await backend.find_channel_input_escrow_status(
                 negotiation.invite.session_id, escrow_outpoint
             )
-            if status is not None and status.stage not in {
-                LndEscrowStage.LOCKED,
-                LndEscrowStage.PARENT_PREPARED,
-            }:
-                raise MakerChannelInputRuntimeError(
-                    "cancellation conflicts with signed or finalized escrow evidence"
-                )
+            allowed_stages = (
+                {LndEscrowStage.LOCKED}
+                if negotiation.proposal is None
+                else {LndEscrowStage.LOCKED, LndEscrowStage.PARENT_PREPARED}
+            )
+            if status is not None and status.stage not in allowed_stages:
+                has_later_escrow_evidence = True
             statuses.append((outpoint, escrow_outpoint, status))
+        if has_later_escrow_evidence:
+            raise MakerChannelInputRuntimeError(
+                "cancellation conflicts with signed or finalized escrow evidence"
+            )
         return statuses
 
     async def _require_locked_frozen_inputs(
@@ -752,13 +751,13 @@ class MakerChannelInputRegistry:
         escrow_outpoint: EscrowOutpoint,
         status: LndEscrowStatus,
     ) -> None:
+        assert status.parent_txid is not None
         state = self._channel_state(negotiation, outpoint)
         if state is None:
             self._save(negotiation)
             attempt = await backend.begin_channel_input_signing(
                 negotiation.invite.session_id, escrow_outpoint
             )
-            assert status.parent_txid is not None
             self._record_prepared(negotiation, outpoint, status.parent_txid, attempt)
             return
         if status.active_attempt is not None:
@@ -797,7 +796,6 @@ class MakerChannelInputRegistry:
         attempt = await backend.begin_channel_input_signing(
             negotiation.invite.session_id, escrow_outpoint, restart_attempt=True
         )
-        assert status.parent_txid is not None
         self._rotate_prepared(negotiation, outpoint, status.parent_txid, attempt)
 
     def _rotate_prepared(
@@ -827,8 +825,9 @@ class MakerChannelInputRegistry:
         if state.partial is None:
             assert status.durable_local_partial_signature is not None
             self._record_partial(negotiation, outpoint, status.durable_local_partial_signature)
-            state = self._channel_state(negotiation, outpoint)
-            assert state is not None
+            recovered_state = self._channel_state(negotiation, outpoint)
+            assert recovered_state is not None
+            state = recovered_state
         if state.finalize_request is not None and state.finalized is None:
             self._save(negotiation)
             result = await backend.recover_channel_input_parent(

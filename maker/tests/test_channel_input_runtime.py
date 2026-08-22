@@ -36,6 +36,7 @@ from test_channel_input_negotiation import (
     _plan_freeze,
     _prepare,
     _prepared_negotiation,
+    _pretranscript_cancel,
     _proposal,
     _proposal_approved,
     _sign_intent,
@@ -833,9 +834,11 @@ async def _dispatch_cancel(
     backend: FakeBackend,
     cancel: ChannelInputCancelPayload | None = None,
 ) -> tuple[object, ...]:
-    assert negotiation.proposal is not None
+    if cancel is None:
+        assert negotiation.proposal is not None
+        cancel = _cancel(negotiation.proposal)
     return await registry.handle_payload(
-        cancel if cancel is not None else _cancel(negotiation.proposal),
+        cancel,
         coordinator_actor="coordinator",
         local_actor="maker",
         local_node_key=negotiation.local_node_key,
@@ -882,6 +885,62 @@ async def test_cancel_preflights_saves_and_replays_signed_ack(
     cancel_count = sum(event.startswith("cancel:") for event in backend.events)
     assert await _dispatch_cancel(registry, negotiation, backend, cancel) == response
     assert sum(event.startswith("cancel:") for event in backend.events) == cancel_count
+
+
+@pytest.mark.asyncio
+async def test_pretranscript_cancel_queries_before_resume_and_replays_ack(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    negotiation, frozen = _negotiation(channels=2)
+    _plan_freeze(negotiation, frozen)
+    registry = _registry(tmp_path, negotiation)
+    backend = FakeBackend()
+    for intent in negotiation.freeze_intents:
+        backend.statuses[(negotiation.invite.session_id, intent.funding_outpoint)] = _status(
+            LndEscrowStage.LOCKED
+        )
+    original_save = registry._store.save
+
+    def saving(snapshot: object) -> None:
+        backend.events.append("save")
+        original_save(snapshot)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(registry._store, "save", saving)
+    cancel = _pretranscript_cancel(negotiation)
+    response = await _dispatch_cancel(registry, negotiation, backend, cancel)
+
+    first_cancel = next(
+        index for index, event in enumerate(backend.events) if event.startswith("cancel:")
+    )
+    assert all(
+        event.startswith("find:") or event == "save" for event in backend.events[:first_cancel]
+    )
+    assert backend.events[:first_cancel].count("save") == 2
+    cancel_count = sum(event.startswith("cancel:") for event in backend.events)
+    assert await _dispatch_cancel(registry, negotiation, backend, cancel) == response
+    assert sum(event.startswith("cancel:") for event in backend.events) == cancel_count
+
+
+@pytest.mark.asyncio
+async def test_pretranscript_cancel_rejects_later_escrow_before_mutation(tmp_path: Path) -> None:
+    negotiation, frozen = _negotiation(channels=2)
+    _plan_freeze(negotiation, frozen)
+    registry = _registry(tmp_path, negotiation)
+    backend = FakeBackend()
+    first, second = negotiation.freeze_intents
+    backend.statuses[(negotiation.invite.session_id, first.funding_outpoint)] = _status(
+        LndEscrowStage.LOCKED
+    )
+    backend.statuses[(negotiation.invite.session_id, second.funding_outpoint)] = _status(
+        LndEscrowStage.PARENT_PREPARED, parent_txid="00" * 32
+    )
+
+    with pytest.raises(MakerChannelInputRuntimeError, match="signed"):
+        await _dispatch_cancel(registry, negotiation, backend, _pretranscript_cancel(negotiation))
+    restored = registry.get(negotiation.invite.session_id, negotiation.invite.attempt)
+    assert restored is not None and restored.cancel is None
+    assert len([event for event in backend.events if event.startswith("find:")]) == 2
+    assert not any(event.startswith("cancel:") for event in backend.events)
 
 
 @pytest.mark.asyncio
@@ -966,6 +1025,35 @@ async def test_startup_resumes_cancel_intent_after_one_escrow_already_resumed(
     )
     assert not any(
         event.startswith(f"cancel:{first.funding_outpoint.txid}") for event in backend.events
+    )
+
+
+@pytest.mark.asyncio
+async def test_startup_resumes_pretranscript_cancel_intent(tmp_path: Path) -> None:
+    negotiation, frozen = _negotiation(channels=2)
+    _plan_freeze(negotiation, frozen)
+    cancel = _pretranscript_cancel(negotiation)
+    assert negotiation.accept_cancel("coordinator", cancel) is None
+    store = _store(tmp_path, negotiation)
+    registry = MakerChannelInputRegistry.load(
+        store=store, config=negotiation.config, network=negotiation.network
+    )
+    backend = FakeBackend()
+    first, second = negotiation.freeze_intents
+    backend.statuses[(negotiation.invite.session_id, first.funding_outpoint)] = None
+    backend.statuses[(negotiation.invite.session_id, second.funding_outpoint)] = _status(
+        LndEscrowStage.LOCKED
+    )
+
+    await registry.reconcile_all(backend, negotiation.local_node_key)
+
+    restored = registry.get(negotiation.invite.session_id, negotiation.invite.attempt)
+    assert restored is not None and restored.stage is MakerChannelInputStage.CANCELED
+    assert (
+        backend.events.count(
+            f"cancel:{second.funding_outpoint.txid}:{second.funding_outpoint.vout}"
+        )
+        == 1
     )
 
 
