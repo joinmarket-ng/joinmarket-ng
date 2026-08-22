@@ -17,15 +17,20 @@ Mix your bitcoin for privacy via CoinJoin. Takers initiate transactions and pay 
 fail-closed policy API for exact parents that combine established final-Taproot
 LND channel inputs with ordinary native-SegWit inputs. Callers provide an
 immutable unsigned parent, complete ordered prevouts, prevalidated participant
-witnesses, explicit channel settlement outputs, and two authenticated endpoint
-transports per channel.
+witnesses, explicit channel settlement outputs, two authenticated endpoint
+transports per channel, and the complete signed `channel_input_v1` prepare
+authorization. The persisted authorization includes every participant approval,
+approval-set acknowledgment, and hash-bound endpoint term.
 
 The coordinator validates claim and fee conservation before signing, persists
 MuSig2 attempts and partial signatures across restart, assembles and verifies
-every witness, and stores exact final bytes before query-first publication.
-Cancellation is available only before channel signing begins. This API is not
-yet exposed by the `jm-taker` CLI and does not add channel negotiation messages
-to the existing maker protocol.
+every witness, and stores exact final bytes before query-first publication. On
+restart it queries the chain before reconciling LND state, then selects pre-sign
+cancellation, exact-parent resume or publication, or force-close recovery at the
+transcript's committed height. Cancellation remains available until a durable
+partial signature is released. This API is not yet exposed by the `jm-taker`
+CLI, and the channel-input messages are not yet wired into maker or taker
+sessions.
 
 ## Documentation
 
