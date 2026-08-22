@@ -132,8 +132,20 @@ def _plan_freeze(
     frozen: tuple[MakerFrozenChannelInput, ...],
 ) -> tuple[MakerChannelInputFreezeIntent, ...]:
     return negotiation.plan_freeze(
-        tuple(_candidate(item, channel_id=index) for index, item in enumerate(frozen))
+        tuple(_candidate(item, channel_id=index) for index, item in enumerate(frozen)),
+        settlement_scripts=_settlement_scripts(frozen),
     )
+
+
+def _settlement_scripts(
+    frozen: tuple[MakerFrozenChannelInput, ...],
+) -> dict[str, str]:
+    return {
+        f"{item.snapshot.funding_outpoint.txid}:{item.snapshot.funding_outpoint.vout}": (
+            item.settlement_script_pubkey
+        )
+        for item in frozen
+    }
 
 
 def _negotiation(
@@ -464,16 +476,28 @@ def test_plan_freeze_replay_and_stage_rules() -> None:
     negotiation, frozen = _negotiation(channels=2)
     candidates = tuple(_candidate(item, channel_id=index) for index, item in enumerate(frozen))
 
-    intents = negotiation.plan_freeze(tuple(reversed(candidates)))
-    assert intents == negotiation.plan_freeze(candidates)
+    settlement_scripts = _settlement_scripts(frozen)
+    intents = negotiation.plan_freeze(
+        tuple(reversed(candidates)), settlement_scripts=settlement_scripts
+    )
+    assert intents == negotiation.plan_freeze(candidates, settlement_scripts=settlement_scripts)
     assert negotiation.stage is MakerChannelInputStage.FREEZE_INTENDED
 
     conflict = candidates[0].model_copy(update={"capacity_sat": 99_999})
     with pytest.raises(ChannelInputValidationError):
-        negotiation.plan_freeze((conflict, candidates[1]))
+        negotiation.plan_freeze((conflict, candidates[1]), settlement_scripts=settlement_scripts)
 
     negotiation.install_frozen_inputs(frozen)
-    assert negotiation.plan_freeze(candidates) == intents
+    assert negotiation.plan_freeze(candidates, settlement_scripts=settlement_scripts) == intents
+
+    with pytest.raises(ChannelInputValidationError):
+        negotiation.plan_freeze(
+            candidates,
+            settlement_scripts={
+                **settlement_scripts,
+                intents[0].channel_id: "5120" + "ff" * 32,
+            },
+        )
 
     wrong_stage, wrong_stage_frozen = _negotiation(channels=1)
     wrong_stage.stage = MakerChannelInputStage.HELLOS_READY
@@ -502,7 +526,7 @@ def test_plan_freeze_rejects_invalid_candidate_sets(failure: str) -> None:
             candidates[1].model_copy(update={"channel_id": candidates[0].channel_id}),
         )
     with pytest.raises(ChannelInputValidationError):
-        negotiation.plan_freeze(supplied)
+        negotiation.plan_freeze(supplied, settlement_scripts=_settlement_scripts(frozen))
 
 
 @pytest.mark.parametrize("failure", ["allowlist", "peer", "capacity", "invalid"])
@@ -520,7 +544,7 @@ def test_plan_freeze_rejects_candidate_policy_and_model_mismatches(failure: str)
     elif failure == "invalid":
         candidate = candidate.model_copy(update={"pending_htlc_count": 1})
     with pytest.raises(ChannelInputValidationError):
-        negotiation.plan_freeze((candidate,))
+        negotiation.plan_freeze((candidate,), settlement_scripts=_settlement_scripts(frozen))
 
 
 @pytest.mark.parametrize(
@@ -642,7 +666,8 @@ def test_install_frozen_inputs_rejects_conflicting_repeat() -> None:
 
 
 @pytest.mark.parametrize(
-    "failure", ["channel_id", "outpoint", "peer", "capacity", "missing", "extra"]
+    "failure",
+    ["channel_id", "outpoint", "peer", "capacity", "settlement", "missing", "extra"],
 )
 def test_install_frozen_inputs_requires_exact_freeze_intent_bijection(failure: str) -> None:
     negotiation, frozen = _negotiation(channels=3)
@@ -688,6 +713,11 @@ def test_install_frozen_inputs_requires_exact_freeze_intent_bijection(failure: s
             first.model_copy(
                 update={"snapshot": first.snapshot.model_copy(update={"capacity_sat": 99_999})}
             ),
+            second,
+        )
+    elif failure == "settlement":
+        supplied = (
+            first.model_copy(update={"settlement_script_pubkey": "5120" + "ff" * 32}),
             second,
         )
     elif failure == "missing":

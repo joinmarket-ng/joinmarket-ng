@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from enum import StrEnum
 from typing import Literal, cast
 
@@ -108,6 +108,7 @@ class MakerChannelInputFreezeIntent(ChannelInputModel):
     funding_outpoint: EscrowOutpoint
     peer_node_pubkey: str
     capacity_sat: int = Field(gt=0)
+    settlement_script_pubkey: str
 
     @field_validator("channel_id")
     @classmethod
@@ -119,6 +120,12 @@ class MakerChannelInputFreezeIntent(ChannelInputModel):
     @classmethod
     def validate_peer_node_pubkey(cls, value: str) -> str:
         _validate_node_key(value, "peer_node_pubkey")
+        return value
+
+    @field_validator("settlement_script_pubkey")
+    @classmethod
+    def validate_settlement_script_pubkey(cls, value: str) -> str:
+        _validate_p2tr_script(value, "settlement_script_pubkey")
         return value
 
     @model_validator(mode="after")
@@ -381,12 +388,20 @@ class MakerChannelInputNegotiation:
         return negotiation
 
     def plan_freeze(
-        self, candidates: Sequence[ChannelInputCandidate]
+        self,
+        candidates: Sequence[ChannelInputCandidate],
+        *,
+        settlement_scripts: Mapping[str, str],
     ) -> tuple[MakerChannelInputFreezeIntent, ...]:
         """Persist exact outpoint-based freeze requests before calling an LND backend."""
 
         normalized = _normalize_freeze_candidates(candidates)
-        intents = _freeze_intents_from_candidates(self.config, self.local_node_key, normalized)
+        intents = _freeze_intents_from_candidates(
+            self.config,
+            self.local_node_key,
+            normalized,
+            settlement_scripts=settlement_scripts,
+        )
         if self.freeze_intents:
             if intents != self.freeze_intents:
                 raise ChannelInputValidationError(
@@ -839,8 +854,19 @@ def _freeze_intents_from_candidates(
     config: ChannelInputConfig,
     local_node_key: str,
     candidates: tuple[ChannelInputCandidate, ...],
+    *,
+    settlement_scripts: Mapping[str, str],
 ) -> tuple[MakerChannelInputFreezeIntent, ...]:
     _validate_freeze_candidates(config, local_node_key, candidates)
+    expected_outpoints = {
+        _outpoint_identifier(candidate.funding_outpoint) for candidate in candidates
+    }
+    if not isinstance(settlement_scripts, Mapping) or set(settlement_scripts) != expected_outpoints:
+        raise ChannelInputValidationError(
+            "settlement scripts must exactly cover the freeze candidate outpoints"
+        )
+    for script in settlement_scripts.values():
+        _validate_p2tr_script(script, "settlement_script_pubkey")
     try:
         return tuple(
             MakerChannelInputFreezeIntent(
@@ -848,6 +874,9 @@ def _freeze_intents_from_candidates(
                 funding_outpoint=candidate.funding_outpoint,
                 peer_node_pubkey=candidate.peer_node_pubkey,
                 capacity_sat=candidate.capacity_sat,
+                settlement_script_pubkey=settlement_scripts[
+                    _outpoint_identifier(candidate.funding_outpoint)
+                ],
             )
             for candidate in candidates
         )
@@ -965,6 +994,7 @@ def _validate_frozen_inputs_against_intents(
             snapshot.channel_id != intent.channel_id
             or snapshot.peer_node_pubkey.hex() != intent.peer_node_pubkey
             or snapshot.capacity_sat != intent.capacity_sat
+            or frozen.settlement_script_pubkey != intent.settlement_script_pubkey
         ):
             raise ChannelInputValidationError("frozen input differs from its freeze intent")
 
