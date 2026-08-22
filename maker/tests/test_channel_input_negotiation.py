@@ -5,21 +5,33 @@ from typing import cast
 
 import pytest
 from coincurve import PrivateKey
-from jmcore.bitcoin import TxInput, TxOutput, estimate_vsize, serialize_transaction
+from jmcore.bitcoin import (
+    TxInput,
+    TxOutput,
+    estimate_vsize,
+    get_txid,
+    parse_transaction_bytes,
+    serialize_transaction,
+)
 from jmcore.channel_input import (
     MAX_CHANNELS,
     ChannelDescriptor,
     ChannelInputApprovalPayload,
     ChannelInputApprovalSetAckPayload,
     ChannelInputApprovalSetPayload,
+    ChannelInputFinalizePayload,
     ChannelInputInvitePayload,
     ChannelInputKeyPair,
+    ChannelInputPartialPayload,
+    ChannelInputPreparedPayload,
     ChannelInputPreparePayload,
     ChannelInputProposalPayload,
+    ChannelInputSignPayload,
     ChannelInputTranscript,
     ChannelInputValidationError,
     EndpointTerms,
     InputPrevout,
+    Outpoint,
     PolicyCeilings,
     SettlementOutput,
     approval_set_hash,
@@ -33,6 +45,8 @@ from jmswap.lnd import (
     ChannelInputCandidate,
     EscrowOutpoint,
     FrozenChannelSnapshot,
+    LndEscrowSigningAttempt,
+    LndFinalizedEscrowParent,
 )
 
 from maker.channel_input import (
@@ -383,6 +397,490 @@ def _proposal_approved() -> tuple[
         "coordinator", proposal, current_time=1_000, current_height=100
     )
     return negotiation, proposal, approval
+
+
+def _prepared_negotiation(
+    channels: int = 2,
+) -> tuple[MakerChannelInputNegotiation, ChannelInputProposalPayload]:
+    negotiation, frozen = _negotiation(channels)
+    _plan_freeze(negotiation, frozen)
+    negotiation.install_frozen_inputs(frozen)
+    proposal, _ = _proposal(negotiation)
+    approval = negotiation.accept_proposal(
+        "coordinator", proposal, current_time=1_000, current_height=100
+    )
+    approval_set = _approval_set(proposal, approval)
+    ack = negotiation.accept_approval_set("coordinator", approval_set)
+    negotiation.accept_prepare("coordinator", _prepare(approval_set, ack))
+    return negotiation, proposal
+
+
+def _peer_prepared(
+    proposal: ChannelInputProposalPayload, local: ChannelInputPreparedPayload, nonce: bytes
+) -> ChannelInputPreparedPayload:
+    coordinator = ChannelInputKeyPair.from_secret(COORDINATOR_SECRET)
+    return cast(
+        ChannelInputPreparedPayload,
+        sign_payload(
+            ChannelInputPreparedPayload(
+                session_id=proposal.session_id,
+                attempt=proposal.attempt,
+                signer_key=coordinator.public_key,
+                transcript_hash=proposal.transcript_hash,
+                funding_outpoint=local.funding_outpoint,
+                public_nonce=nonce.hex(),
+            ),
+            COORDINATOR_SECRET,
+        ),
+    )
+
+
+def _sign_intent(
+    proposal: ChannelInputProposalPayload,
+    local: ChannelInputPreparedPayload,
+    peer: ChannelInputPreparedPayload,
+) -> ChannelInputSignPayload:
+    coordinator = ChannelInputKeyPair.from_secret(COORDINATOR_SECRET)
+    return cast(
+        ChannelInputSignPayload,
+        sign_payload(
+            ChannelInputSignPayload(
+                session_id=proposal.session_id,
+                attempt=proposal.attempt,
+                signer_key=coordinator.public_key,
+                transcript_hash=proposal.transcript_hash,
+                funding_outpoint=local.funding_outpoint,
+                local_public_nonce=local.public_nonce,
+                peer_prepared=peer,
+            ),
+            COORDINATOR_SECRET,
+        ),
+    )
+
+
+def _finalize_intent(
+    proposal: ChannelInputProposalPayload,
+    local: ChannelInputPreparedPayload,
+    peer: ChannelInputPreparedPayload,
+) -> ChannelInputFinalizePayload:
+    coordinator = ChannelInputKeyPair.from_secret(COORDINATOR_SECRET)
+    peer_partial = cast(
+        ChannelInputPartialPayload,
+        sign_payload(
+            ChannelInputPartialPayload(
+                session_id=proposal.session_id,
+                attempt=proposal.attempt,
+                signer_key=coordinator.public_key,
+                transcript_hash=proposal.transcript_hash,
+                funding_outpoint=local.funding_outpoint,
+                local_public_nonce=peer.public_nonce,
+                peer_public_nonce=local.public_nonce,
+                partial_signature="cc" * 32,
+            ),
+            COORDINATOR_SECRET,
+        ),
+    )
+    return cast(
+        ChannelInputFinalizePayload,
+        sign_payload(
+            ChannelInputFinalizePayload(
+                session_id=proposal.session_id,
+                attempt=proposal.attempt,
+                signer_key=coordinator.public_key,
+                transcript_hash=proposal.transcript_hash,
+                funding_outpoint=local.funding_outpoint,
+                local_public_nonce=local.public_nonce,
+                peer_partial=peer_partial,
+            ),
+            COORDINATOR_SECRET,
+        ),
+    )
+
+
+def _finalized_result(
+    proposal: ChannelInputProposalPayload, index: int, signature: bytes
+) -> LndFinalizedEscrowParent:
+    unsigned = parse_transaction_bytes(bytes.fromhex(proposal.transcript.unsigned_parent_tx))
+    witnesses: list[tuple[bytes, ...]] = [() for _ in unsigned.inputs]
+    witnesses[index] = (signature,)
+    return LndFinalizedEscrowParent(
+        tx_hex=serialize_transaction(
+            unsigned.version, unsigned.inputs, unsigned.outputs, unsigned.locktime, witnesses
+        ).hex(),
+        txid=get_txid(proposal.transcript.unsigned_parent_tx),
+        channel_input_index=index,
+        channel_input_witness=(signature,),
+    )
+
+
+def _signing_negotiation() -> tuple[
+    MakerChannelInputNegotiation,
+    ChannelInputProposalPayload,
+    ChannelInputPreparedPayload,
+    ChannelInputPreparedPayload,
+    ChannelInputSignPayload,
+]:
+    negotiation, proposal = _prepared_negotiation(channels=1)
+    terms = proposal.recipient_terms[0]
+    local = negotiation.record_prepared(
+        terms.funding_outpoint,
+        get_txid(proposal.transcript.unsigned_parent_tx),
+        LndEscrowSigningAttempt(attempt_id=b"\x01" * 32, public_nonce=b"\x02" * 66),
+    )
+    peer = _peer_prepared(proposal, local, b"\x03" * 66)
+    sign = _sign_intent(proposal, local, peer)
+    assert negotiation.accept_sign("coordinator", sign) is None
+    return negotiation, proposal, local, peer, sign
+
+
+def test_channel_state_chain_is_durable_and_replays_exact_payloads() -> None:
+    negotiation, proposal = _prepared_negotiation()
+    parent_txid = get_txid(proposal.transcript.unsigned_parent_tx)
+    local_prepared: list[ChannelInputPreparedPayload] = []
+    for index, terms in enumerate(proposal.recipient_terms):
+        attempt = LndEscrowSigningAttempt(
+            attempt_id=(index + 1).to_bytes(32, "big"),
+            public_nonce=bytes([index + 10]) * 66,
+        )
+        prepared = negotiation.record_prepared(terms.funding_outpoint, parent_txid, attempt)
+        assert negotiation.signing_attempt_for(terms.funding_outpoint) == attempt
+        assert negotiation.record_prepared(terms.funding_outpoint, parent_txid, attempt) == prepared
+        local_prepared.append(prepared)
+        snapshot = MakerChannelInputSnapshot.model_validate_json(
+            negotiation.snapshot().model_dump_json()
+        )
+        assert MakerChannelInputNegotiation.from_snapshot(snapshot).snapshot() == snapshot
+    assert negotiation.stage is MakerChannelInputStage.NONCES_READY
+
+    peer_prepared = [
+        _peer_prepared(proposal, local, bytes([index + 30]) * 66)
+        for index, local in enumerate(local_prepared)
+    ]
+    signs = [
+        _sign_intent(proposal, local, peer)
+        for local, peer in zip(local_prepared, peer_prepared, strict=True)
+    ]
+    assert negotiation.accept_sign("coordinator", signs[0]) is None
+    first_partial = negotiation.record_partial(local_prepared[0].funding_outpoint, b"\xaa" * 32)
+    assert negotiation.accept_sign("coordinator", signs[0]) == first_partial
+    assert negotiation.stage is MakerChannelInputStage.SIGNING
+
+    assert negotiation.accept_sign("coordinator", signs[1]) is None
+    second_partial = negotiation.record_partial(local_prepared[1].funding_outpoint, b"\xbb" * 32)
+    assert (
+        negotiation.record_partial(local_prepared[1].funding_outpoint, b"\xbb" * 32)
+        == second_partial
+    )
+    first_finalize = _finalize_intent(proposal, local_prepared[0], peer_prepared[0])
+    assert negotiation.accept_finalize("coordinator", first_finalize) is None
+    assert negotiation.stage is MakerChannelInputStage.FINALIZING
+    first_result = _finalized_result(proposal, 0, b"\x11" * 64)
+    first_finalized = negotiation.record_finalized(local_prepared[0].funding_outpoint, first_result)
+    assert (
+        negotiation.record_finalized(local_prepared[0].funding_outpoint, first_result)
+        == first_finalized
+    )
+
+    second_finalize = _finalize_intent(proposal, local_prepared[1], peer_prepared[1])
+    assert negotiation.accept_finalize("coordinator", second_finalize) is None
+    negotiation.record_finalized(
+        local_prepared[1].funding_outpoint, _finalized_result(proposal, 1, b"\x22" * 64)
+    )
+    assert negotiation.stage is MakerChannelInputStage.FINALIZED
+    snapshot = MakerChannelInputSnapshot.model_validate_json(
+        negotiation.snapshot().model_dump_json()
+    )
+    restored = MakerChannelInputNegotiation.from_snapshot(snapshot)
+    assert restored.snapshot() == snapshot
+    assert restored.channel_states[0].finalized is not None
+
+
+def test_prepared_rotation_invalidates_pending_sign_and_tampering_fails_closed() -> None:
+    negotiation, proposal = _prepared_negotiation(channels=1)
+    terms = proposal.recipient_terms[0]
+    parent_txid = get_txid(proposal.transcript.unsigned_parent_tx)
+    first = negotiation.record_prepared(
+        terms.funding_outpoint,
+        parent_txid,
+        LndEscrowSigningAttempt(attempt_id=b"\x01" * 32, public_nonce=b"\x02" * 66),
+    )
+    peer = _peer_prepared(proposal, first, b"\x03" * 66)
+    stale_sign = _sign_intent(proposal, first, peer)
+    assert negotiation.accept_sign("coordinator", stale_sign) is None
+    rotated = negotiation.rotate_unsigned_prepared(
+        terms.funding_outpoint,
+        parent_txid,
+        LndEscrowSigningAttempt(attempt_id=b"\x04" * 32, public_nonce=b"\x05" * 66),
+    )
+    assert rotated != first
+    assert negotiation.stage is MakerChannelInputStage.NONCES_READY
+    with pytest.raises(ChannelInputValidationError):
+        negotiation.accept_sign("coordinator", stale_sign)
+
+    data = negotiation.snapshot().model_dump(mode="python")
+    data["channel_states"][0]["prepared"]["sig"] = "00" * 64
+    tampered = MakerChannelInputSnapshot.model_validate(data)
+    with pytest.raises(ChannelInputValidationError):
+        MakerChannelInputNegotiation.from_snapshot(tampered)
+
+
+def test_prepared_rejects_bad_backend_inputs_and_requires_complete_coverage() -> None:
+    negotiation, proposal = _prepared_negotiation(channels=2)
+    first, second = proposal.recipient_terms
+    parent_txid = get_txid(proposal.transcript.unsigned_parent_tx)
+    attempt = LndEscrowSigningAttempt(attempt_id=b"\x01" * 32, public_nonce=b"\x02" * 66)
+    with pytest.raises(ChannelInputValidationError):
+        negotiation.record_prepared(Outpoint(txid="ff" * 32, vout=0), parent_txid, attempt)
+    with pytest.raises(ChannelInputValidationError):
+        negotiation.record_prepared(first.funding_outpoint, "00" * 32, attempt)
+    with pytest.raises(ChannelInputValidationError):
+        negotiation.record_prepared(
+            first.funding_outpoint, parent_txid, cast(LndEscrowSigningAttempt, object())
+        )
+    negotiation.record_prepared(first.funding_outpoint, parent_txid, attempt)
+    assert negotiation.stage is MakerChannelInputStage.PREPARED
+    with pytest.raises(ChannelInputValidationError):
+        negotiation.record_prepared(
+            first.funding_outpoint,
+            parent_txid,
+            LndEscrowSigningAttempt(attempt_id=b"\x03" * 32, public_nonce=b"\x04" * 66),
+        )
+    negotiation.record_prepared(
+        second.funding_outpoint,
+        parent_txid,
+        LndEscrowSigningAttempt(attempt_id=b"\x05" * 32, public_nonce=b"\x06" * 66),
+    )
+    assert negotiation.stage is MakerChannelInputStage.NONCES_READY
+
+
+def test_rotation_rejects_same_attempt_and_all_durable_signing_boundaries() -> None:
+    negotiation, proposal, local, peer, sign = _signing_negotiation()
+    terms = proposal.recipient_terms[0]
+    parent_txid = get_txid(proposal.transcript.unsigned_parent_tx)
+    with pytest.raises(ChannelInputValidationError):
+        negotiation.rotate_unsigned_prepared(
+            terms.funding_outpoint,
+            parent_txid,
+            LndEscrowSigningAttempt(attempt_id=b"\x01" * 32, public_nonce=b"\x07" * 66),
+        )
+    negotiation.record_partial(terms.funding_outpoint, b"\xaa" * 32)
+    with pytest.raises(ChannelInputValidationError):
+        negotiation.rotate_unsigned_prepared(
+            terms.funding_outpoint,
+            parent_txid,
+            LndEscrowSigningAttempt(attempt_id=b"\x08" * 32, public_nonce=b"\x09" * 66),
+        )
+    finalize = _finalize_intent(proposal, local, peer)
+    negotiation.accept_finalize("coordinator", finalize)
+    with pytest.raises(ChannelInputValidationError):
+        negotiation.rotate_unsigned_prepared(
+            terms.funding_outpoint,
+            parent_txid,
+            LndEscrowSigningAttempt(attempt_id=b"\x0a" * 32, public_nonce=b"\x0b" * 66),
+        )
+    negotiation.record_finalized(
+        terms.funding_outpoint, _finalized_result(proposal, 0, b"\x11" * 64)
+    )
+    with pytest.raises(ChannelInputValidationError):
+        negotiation.rotate_unsigned_prepared(
+            terms.funding_outpoint,
+            parent_txid,
+            LndEscrowSigningAttempt(attempt_id=b"\x0c" * 32, public_nonce=b"\x0d" * 66),
+        )
+    assert sign == negotiation.channel_states[0].sign_request
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ["actor", "signer", "signature", "outpoint", "nonce", "peer", "peer_signature", "peer_nonce"],
+)
+def test_sign_rejects_authenticated_binding_failures(failure: str) -> None:
+    negotiation, proposal = _prepared_negotiation(channels=1)
+    terms = proposal.recipient_terms[0]
+    local = negotiation.record_prepared(
+        terms.funding_outpoint,
+        get_txid(proposal.transcript.unsigned_parent_tx),
+        LndEscrowSigningAttempt(attempt_id=b"\x01" * 32, public_nonce=b"\x02" * 66),
+    )
+    peer = _peer_prepared(proposal, local, b"\x03" * 66)
+    sign = _sign_intent(proposal, local, peer)
+    actor = "coordinator"
+    if failure == "actor":
+        actor = "other"
+    elif failure == "signer":
+        sign = sign_payload(
+            sign.model_copy(update={"signer_key": negotiation.participant_key}), PARTICIPANT_SECRET
+        )
+    elif failure == "signature":
+        sign = sign.model_copy(update={"sig": "00" * 64})
+    elif failure == "outpoint":
+        wrong = Outpoint(txid="ff" * 32, vout=0)
+        peer = peer.model_copy(update={"funding_outpoint": wrong})
+        sign = sign_payload(
+            sign.model_copy(update={"funding_outpoint": wrong, "peer_prepared": peer}),
+            COORDINATOR_SECRET,
+        )
+    elif failure == "nonce":
+        sign = sign_payload(
+            sign.model_copy(update={"local_public_nonce": "04" * 66}), COORDINATOR_SECRET
+        )
+    elif failure == "peer":
+        peer = sign_payload(
+            peer.model_copy(update={"signer_key": negotiation.participant_key}), PARTICIPANT_SECRET
+        )
+        sign = sign_payload(sign.model_copy(update={"peer_prepared": peer}), COORDINATOR_SECRET)
+    elif failure == "peer_signature":
+        sign = sign_payload(
+            sign.model_copy(update={"peer_prepared": peer.model_copy(update={"sig": "00" * 64})}),
+            COORDINATOR_SECRET,
+        )
+    else:
+        peer = sign_payload(
+            peer.model_copy(update={"public_nonce": local.public_nonce}), COORDINATOR_SECRET
+        )
+        sign = sign_payload(sign.model_copy(update={"peer_prepared": peer}), COORDINATOR_SECRET)
+    with pytest.raises(ChannelInputValidationError):
+        negotiation.accept_sign(actor, sign)
+
+
+def test_partial_finalize_and_finalized_reject_conflicting_evidence() -> None:
+    negotiation, proposal, local, peer, _ = _signing_negotiation()
+    outpoint = local.funding_outpoint
+    with pytest.raises(ChannelInputValidationError):
+        negotiation.record_partial(outpoint, b"\x01" * 31)
+    negotiation.record_partial(outpoint, b"\xaa" * 32)
+    with pytest.raises(ChannelInputValidationError):
+        negotiation.record_partial(outpoint, b"\xbb" * 32)
+    finalize = _finalize_intent(proposal, local, peer)
+    peer_partial = finalize.peer_partial
+    for actor, candidate in (
+        ("other", finalize),
+        ("coordinator", finalize.model_copy(update={"sig": "00" * 64})),
+        (
+            "coordinator",
+            sign_payload(
+                finalize.model_copy(update={"signer_key": negotiation.participant_key}),
+                PARTICIPANT_SECRET,
+            ),
+        ),
+        (
+            "coordinator",
+            sign_payload(
+                finalize.model_copy(update={"local_public_nonce": "04" * 66}), COORDINATOR_SECRET
+            ),
+        ),
+        (
+            "coordinator",
+            sign_payload(
+                finalize.model_copy(
+                    update={
+                        "peer_partial": sign_payload(
+                            peer_partial.model_copy(
+                                update={"signer_key": negotiation.participant_key}
+                            ),
+                            PARTICIPANT_SECRET,
+                        )
+                    }
+                ),
+                COORDINATOR_SECRET,
+            ),
+        ),
+        (
+            "coordinator",
+            sign_payload(
+                finalize.model_copy(
+                    update={"peer_partial": peer_partial.model_copy(update={"sig": "00" * 64})}
+                ),
+                COORDINATOR_SECRET,
+            ),
+        ),
+        (
+            "coordinator",
+            sign_payload(
+                finalize.model_copy(
+                    update={
+                        "peer_partial": sign_payload(
+                            peer_partial.model_copy(update={"peer_public_nonce": "04" * 66}),
+                            COORDINATOR_SECRET,
+                        )
+                    }
+                ),
+                COORDINATOR_SECRET,
+            ),
+        ),
+    ):
+        with pytest.raises(ChannelInputValidationError):
+            negotiation.accept_finalize(actor, candidate)
+    negotiation.accept_finalize("coordinator", finalize)
+    result = _finalized_result(proposal, 0, b"\x11" * 64)
+    for candidate in (
+        result.model_copy(update={"txid": "00" * 32}),
+        result.model_copy(update={"channel_input_index": 1}),
+        result.model_copy(update={"channel_input_witness": (b"\x22" * 64,)}),
+    ):
+        with pytest.raises(ChannelInputValidationError):
+            negotiation.record_finalized(outpoint, candidate)
+    unsigned = parse_transaction_bytes(bytes.fromhex(proposal.transcript.unsigned_parent_tx))
+    outputs = list(unsigned.outputs)
+    outputs[0] = TxOutput(value=outputs[0].value - 1, script=outputs[0].script)
+    mismatched_parent = serialize_transaction(
+        unsigned.version,
+        unsigned.inputs,
+        outputs,
+        unsigned.locktime,
+        [(b"\x11" * 64,)],
+    ).hex()
+    with pytest.raises(ChannelInputValidationError):
+        negotiation.record_finalized(
+            outpoint, result.model_copy(update={"tx_hex": mismatched_parent})
+        )
+    negotiation.record_finalized(outpoint, result)
+    with pytest.raises(ChannelInputValidationError):
+        negotiation.record_finalized(outpoint, _finalized_result(proposal, 0, b"\x33" * 64))
+
+
+def test_snapshot_channel_state_tampering_fails_closed() -> None:
+    negotiation, proposal, local, peer, _ = _signing_negotiation()
+    negotiation.record_partial(local.funding_outpoint, b"\xaa" * 32)
+    negotiation.accept_finalize("coordinator", _finalize_intent(proposal, local, peer))
+    negotiation.record_finalized(
+        local.funding_outpoint, _finalized_result(proposal, 0, b"\x11" * 64)
+    )
+    for field, value in (
+        ("stage", "nonces_ready"),
+        ("attempt_id", "invalid"),
+        (
+            "prepared",
+            {**negotiation.channel_states[0].prepared.model_dump(), "signer_key": _node(90)},
+        ),
+        (
+            "prepared",
+            {
+                **negotiation.channel_states[0].prepared.model_dump(),
+                "public_nonce": "04" * 66,
+            },
+        ),
+        (
+            "partial",
+            {**negotiation.channel_states[0].partial.model_dump(), "partial_signature": "00" * 32},
+        ),
+        (
+            "finalized",
+            {
+                **negotiation.channel_states[0].finalized.model_dump(),
+                "channel_signed_parent_tx": proposal.transcript.unsigned_parent_tx,
+            },
+        ),
+    ):
+        data = negotiation.snapshot().model_dump(mode="python")
+        if field == "stage":
+            data["stage"] = value
+        else:
+            data["channel_states"][0][field] = value
+        with pytest.raises((ValueError, ChannelInputValidationError)):
+            MakerChannelInputNegotiation.from_snapshot(
+                MakerChannelInputSnapshot.model_validate(data)
+            )
 
 
 def test_negotiation_multichannel_replay_and_json_restore() -> None:

@@ -8,18 +8,25 @@ from enum import StrEnum
 from typing import Literal, cast
 
 from coincurve import PublicKey
+from jmcore.bitcoin import get_txid, parse_transaction_bytes
 from jmcore.channel_input import (
     MAX_CHANNELS,
+    ChannelDescriptor,
     ChannelInputApprovalPayload,
     ChannelInputApprovalSetAckPayload,
     ChannelInputApprovalSetPayload,
+    ChannelInputFinalizedPayload,
+    ChannelInputFinalizePayload,
     ChannelInputHelloPayload,
     ChannelInputInvitePayload,
     ChannelInputKeyPair,
     ChannelInputModel,
+    ChannelInputPartialPayload,
     ChannelInputPayload,
+    ChannelInputPreparedPayload,
     ChannelInputPreparePayload,
     ChannelInputProposalPayload,
+    ChannelInputSignPayload,
     ChannelInputValidationError,
     Network,
     Outpoint,
@@ -30,10 +37,15 @@ from jmcore.channel_input import (
     sign_payload,
     transcript_hash,
     validate_complete_approval_set,
+    validate_finalize_for_transcript,
+    validate_finalized_for_transcript,
     validate_hello_for_invite,
+    validate_partial_for_transcript,
     validate_prepare_payload,
+    validate_prepared_for_transcript,
     validate_proposal_for_hellos,
     validate_recipient_approval,
+    validate_sign_for_transcript,
 )
 from jmcore.channel_input_config import ChannelInputConfig
 from jmcore.channel_input_session import (
@@ -41,7 +53,13 @@ from jmcore.channel_input_session import (
     ChannelInputReplayLedger,
     ChannelInputReplayResult,
 )
-from jmswap.lnd import ChannelInputCandidate, EscrowOutpoint, FrozenChannelSnapshot
+from jmswap.lnd import (
+    ChannelInputCandidate,
+    EscrowOutpoint,
+    FrozenChannelSnapshot,
+    LndEscrowSigningAttempt,
+    LndFinalizedEscrowParent,
+)
 from pydantic import Field, field_serializer, field_validator, model_validator
 
 
@@ -54,6 +72,10 @@ class MakerChannelInputStage(StrEnum):
     PROPOSAL_APPROVED = "proposal_approved"
     APPROVAL_SET_ACKED = "approval_set_acked"
     PREPARED = "prepared"
+    NONCES_READY = "nonces_ready"
+    SIGNING = "signing"
+    FINALIZING = "finalizing"
+    FINALIZED = "finalized"
 
 
 class MakerFrozenChannelInput(ChannelInputModel):
@@ -135,6 +157,50 @@ class MakerChannelInputFreezeIntent(ChannelInputModel):
         return self
 
 
+class MakerChannelInputChannelState(ChannelInputModel):
+    """Durable per-channel LND signing boundary and authenticated wire evidence."""
+
+    funding_outpoint: Outpoint
+    parent_txid: str
+    attempt_id: str = Field(repr=False)
+    prepared: ChannelInputPreparedPayload
+    sign_request: ChannelInputSignPayload | None = None
+    partial: ChannelInputPartialPayload | None = None
+    finalize_request: ChannelInputFinalizePayload | None = None
+    finalized: ChannelInputFinalizedPayload | None = None
+
+    @field_validator("parent_txid", "attempt_id")
+    @classmethod
+    def validate_hex32(cls, value: str) -> str:
+        if not isinstance(value, str) or len(value) != 64 or value.lower() != value:
+            raise ValueError("channel state value must be 32-byte lowercase hexadecimal")
+        try:
+            bytes.fromhex(value)
+        except ValueError as exc:
+            raise ValueError("channel state value must be 32-byte lowercase hexadecimal") from exc
+        return value
+
+    @model_validator(mode="after")
+    def validate_shape(self) -> MakerChannelInputChannelState:
+        payloads = (
+            self.prepared,
+            self.sign_request,
+            self.partial,
+            self.finalize_request,
+            self.finalized,
+        )
+        for payload in payloads:
+            if payload is not None and payload.funding_outpoint != self.funding_outpoint:
+                raise ValueError("channel state payload funding outpoint differs from state")
+        if self.partial is not None and self.sign_request is None:
+            raise ValueError("channel state partial requires a sign request")
+        if self.finalize_request is not None and self.partial is None:
+            raise ValueError("channel state finalize request requires a partial")
+        if self.finalized is not None and self.finalize_request is None:
+            raise ValueError("channel state finalized evidence requires a finalize request")
+        return self
+
+
 class MakerChannelInputSnapshot(ChannelInputModel):
     """Complete immutable persisted negotiation state, including signed wire data."""
 
@@ -156,6 +222,7 @@ class MakerChannelInputSnapshot(ChannelInputModel):
     approval_set: ChannelInputApprovalSetPayload | None = None
     local_ack: ChannelInputApprovalSetAckPayload | None = None
     prepare: ChannelInputPreparePayload | None = None
+    channel_states: tuple[MakerChannelInputChannelState, ...] = ()
     actor_registry_snapshot: tuple[tuple[str, str], ...]
     replay_ledger_snapshot: tuple[tuple[str, str], ...]
 
@@ -192,6 +259,10 @@ class MakerChannelInputSnapshot(ChannelInputModel):
             MakerChannelInputStage.PROPOSAL_APPROVED: 3,
             MakerChannelInputStage.APPROVAL_SET_ACKED: 4,
             MakerChannelInputStage.PREPARED: 5,
+            MakerChannelInputStage.NONCES_READY: 6,
+            MakerChannelInputStage.SIGNING: 7,
+            MakerChannelInputStage.FINALIZING: 8,
+            MakerChannelInputStage.FINALIZED: 9,
         }
         rank = stage_rank[self.stage]
         if self.stage is MakerChannelInputStage.INVITED:
@@ -221,6 +292,62 @@ class MakerChannelInputSnapshot(ChannelInputModel):
             raise ValueError("snapshot prepare does not match stage")
         if rank < 5 and self.prepare is not None:
             raise ValueError("snapshot prepare does not match stage")
+        if rank < 5 and self.channel_states:
+            raise ValueError("snapshot channel states precede prepare")
+        ordered_states = tuple(
+            sorted(
+                self.channel_states, key=lambda state: _outpoint_sort_key(state.funding_outpoint)
+            )
+        )
+        if ordered_states != self.channel_states:
+            raise ValueError("snapshot channel states are not deterministically ordered")
+        if len(
+            {_outpoint_sort_key(state.funding_outpoint) for state in self.channel_states}
+        ) != len(self.channel_states):
+            raise ValueError("snapshot channel states must have unique funding outpoints")
+        if rank == 5:
+            if self.proposal is not None and len(self.channel_states) >= len(
+                self.proposal.recipient_terms
+            ):
+                raise ValueError("prepared snapshot has complete channel nonce coverage")
+            if any(
+                state.sign_request is not None
+                or state.partial is not None
+                or state.finalize_request is not None
+                or state.finalized is not None
+                for state in self.channel_states
+            ):
+                raise ValueError("prepared snapshot contains signing evidence")
+        elif rank > 5:
+            if self.proposal is None:
+                raise ValueError("snapshot channel states require a proposal")
+            expected_count = len(self.proposal.recipient_terms)
+            if len(self.channel_states) != expected_count:
+                raise ValueError("snapshot channel state count does not match local terms")
+            if self.stage is MakerChannelInputStage.NONCES_READY and any(
+                state.sign_request is not None for state in self.channel_states
+            ):
+                raise ValueError("nonces-ready snapshot contains sign requests")
+            if self.stage is MakerChannelInputStage.SIGNING and (
+                not any(
+                    state.sign_request is not None or state.partial is not None
+                    for state in self.channel_states
+                )
+                or any(
+                    state.finalize_request is not None or state.finalized is not None
+                    for state in self.channel_states
+                )
+            ):
+                raise ValueError("signing snapshot channel states do not match stage")
+            if self.stage is MakerChannelInputStage.FINALIZING and not any(
+                state.finalize_request is not None or state.finalized is not None
+                for state in self.channel_states
+            ):
+                raise ValueError("finalizing snapshot channel states do not match stage")
+            if self.stage is MakerChannelInputStage.FINALIZED and not all(
+                state.finalized is not None for state in self.channel_states
+            ):
+                raise ValueError("finalized snapshot is missing channel evidence")
         return self
 
 
@@ -249,6 +376,7 @@ class MakerChannelInputNegotiation:
         approval_set: ChannelInputApprovalSetPayload | None = None,
         local_ack: ChannelInputApprovalSetAckPayload | None = None,
         prepare: ChannelInputPreparePayload | None = None,
+        channel_states: tuple[MakerChannelInputChannelState, ...] = (),
     ) -> None:
         self.config = config
         self.network = network
@@ -269,6 +397,7 @@ class MakerChannelInputNegotiation:
         self.approval_set = approval_set
         self.local_ack = local_ack
         self.prepare = prepare
+        self.channel_states = channel_states
 
     @classmethod
     def from_invite(
@@ -344,6 +473,7 @@ class MakerChannelInputNegotiation:
             approval_set=self.approval_set,
             local_ack=self.local_ack,
             prepare=self.prepare,
+            channel_states=self.channel_states,
             actor_registry_snapshot=self._registry.snapshot(),
             replay_ledger_snapshot=self._ledger.snapshot(),
         )
@@ -383,6 +513,7 @@ class MakerChannelInputNegotiation:
             approval_set=snapshot.approval_set,
             local_ack=snapshot.local_ack,
             prepare=snapshot.prepare,
+            channel_states=snapshot.channel_states,
         )
         negotiation._validate_restored_state()
         return negotiation
@@ -461,7 +592,7 @@ class MakerChannelInputNegotiation:
                 quoted_miner_fee_share_sat=self.config.max_miner_fee_share_sat,
                 policy_ceilings=ceilings,
             )
-            signed = cast(ChannelInputHelloPayload, sign_payload(hello, self._key_pair.secret_key))
+            signed = sign_payload(hello, self._key_pair.secret_key)
             self._registry.require_verified(self.local_actor, signed)
             _record_new(self._ledger, _hello_slot(signed), signed)
             hellos.append(signed)
@@ -509,9 +640,7 @@ class MakerChannelInputNegotiation:
             transcript_hash=proposal.transcript_hash,
             terms_hashes=terms_hashes,
         )
-        signed = cast(
-            ChannelInputApprovalPayload, sign_payload(approval, self._key_pair.secret_key)
-        )
+        signed = sign_payload(approval, self._key_pair.secret_key)
         self._registry.require_verified(self.local_actor, signed)
         _record_new(self._ledger, _slot("approval"), signed)
         self.proposal = proposal
@@ -556,9 +685,7 @@ class MakerChannelInputNegotiation:
             transcript_hash=transcript_hash(approval_set.transcript).hex(),
             approval_set_hash=approval_set_hash(approval_set).hex(),
         )
-        signed = cast(
-            ChannelInputApprovalSetAckPayload, sign_payload(ack, self._key_pair.secret_key)
-        )
+        signed = sign_payload(ack, self._key_pair.secret_key)
         self._registry.require_verified(self.local_actor, signed)
         _record_new(self._ledger, _slot("approval_ack"), signed)
         self.approval_set = approval_set
@@ -593,6 +720,332 @@ class MakerChannelInputNegotiation:
         self.prepare = prepare
         self.stage = MakerChannelInputStage.PREPARED
         return prepare
+
+    def record_prepared(
+        self,
+        funding_outpoint: Outpoint,
+        parent_txid: str,
+        attempt: LndEscrowSigningAttempt,
+    ) -> ChannelInputPreparedPayload:
+        """Persist a locally generated LND nonce before it is sent to the coordinator."""
+
+        self._require_prepared_negotiation()
+        _require_parent_txid(parent_txid, self._parent_txid())
+        attempt = _validated_signing_attempt(attempt)
+        self._require_local_outpoint(funding_outpoint)
+        existing = self._channel_state(funding_outpoint)
+        if existing is not None:
+            if (
+                existing.parent_txid == parent_txid
+                and existing.attempt_id == attempt.attempt_id.hex()
+                and existing.prepared.public_nonce == attempt.public_nonce.hex()
+            ):
+                return existing.prepared
+            raise ChannelInputValidationError("prepared nonce conflicts with durable channel state")
+        prepared = self._sign_prepared(funding_outpoint, attempt)
+        self._replace_channel_state(
+            MakerChannelInputChannelState(
+                funding_outpoint=funding_outpoint,
+                parent_txid=parent_txid,
+                attempt_id=attempt.attempt_id.hex(),
+                prepared=prepared,
+            )
+        )
+        self._recompute_channel_stage()
+        return prepared
+
+    def rotate_unsigned_prepared(
+        self,
+        funding_outpoint: Outpoint,
+        parent_txid: str,
+        attempt: LndEscrowSigningAttempt,
+    ) -> ChannelInputPreparedPayload:
+        """Replace an unconsumed LND nonce after an explicit backend restart decision."""
+
+        self._require_prepared_negotiation()
+        _require_parent_txid(parent_txid, self._parent_txid())
+        attempt = _validated_signing_attempt(attempt)
+        state = self._require_channel_state(funding_outpoint)
+        if (
+            state.partial is not None
+            or state.finalize_request is not None
+            or state.finalized is not None
+        ):
+            raise ChannelInputValidationError(
+                "prepared nonce cannot rotate after a durable partial"
+            )
+        if state.attempt_id == attempt.attempt_id.hex():
+            raise ChannelInputValidationError("prepared nonce rotation requires a new LND attempt")
+        prepared = self._sign_prepared(funding_outpoint, attempt)
+        self._replace_channel_state(
+            state.model_copy(
+                update={
+                    "parent_txid": parent_txid,
+                    "attempt_id": attempt.attempt_id.hex(),
+                    "prepared": prepared,
+                    "sign_request": None,
+                }
+            )
+        )
+        self._recompute_channel_stage()
+        return prepared
+
+    def signing_attempt_for(self, funding_outpoint: Outpoint) -> LndEscrowSigningAttempt:
+        """Reconstruct the exact persisted LND attempt for a later pure backend call."""
+
+        state = self._require_channel_state(funding_outpoint)
+        return LndEscrowSigningAttempt(
+            attempt_id=bytes.fromhex(state.attempt_id),
+            public_nonce=bytes.fromhex(state.prepared.public_nonce),
+        )
+
+    def accept_sign(
+        self, coordinator_actor: str, sign: ChannelInputSignPayload
+    ) -> ChannelInputPartialPayload | None:
+        """Persist a verified coordinator signing authorization without calling LND."""
+
+        self._require_coordinator(coordinator_actor, sign)
+        if self.stage is MakerChannelInputStage.PREPARED:
+            raise ChannelInputValidationError("sign requires complete local nonce coverage")
+        state = self._require_channel_state(sign.funding_outpoint)
+        assert self.proposal is not None
+        validate_sign_for_transcript(
+            sign,
+            self.proposal.transcript,
+            self.participant_key,
+            expected_local_public_nonce=state.prepared.public_nonce,
+        )
+        if state.sign_request is not None:
+            if sign != state.sign_request:
+                raise ChannelInputValidationError(
+                    "sign request conflicts with durable channel state"
+                )
+            return state.partial
+        self._replace_channel_state(state.model_copy(update={"sign_request": sign}))
+        self._recompute_channel_stage()
+        return None
+
+    def record_partial(
+        self, funding_outpoint: Outpoint, partial_signature: bytes
+    ) -> ChannelInputPartialPayload:
+        """Sign and persist a local partial after its coordinator intent is durable."""
+
+        state = self._require_channel_state(funding_outpoint)
+        if state.sign_request is None:
+            raise ChannelInputValidationError("partial requires a durable sign request")
+        if not isinstance(partial_signature, bytes) or len(partial_signature) != 32:
+            raise ChannelInputValidationError("partial signature must be exactly 32 bytes")
+        if state.partial is not None:
+            if state.partial.partial_signature == partial_signature.hex():
+                return state.partial
+            raise ChannelInputValidationError(
+                "partial signature conflicts with durable channel state"
+            )
+        partial = ChannelInputPartialPayload(
+            session_id=state.sign_request.session_id,
+            attempt=state.sign_request.attempt,
+            signer_key=self.participant_key,
+            transcript_hash=state.sign_request.transcript_hash,
+            funding_outpoint=funding_outpoint,
+            local_public_nonce=state.prepared.public_nonce,
+            peer_public_nonce=state.sign_request.peer_prepared.public_nonce,
+            partial_signature=partial_signature.hex(),
+        )
+        signed = sign_payload(partial, self._key_pair.secret_key)
+        self._validate_local_partial(signed, state)
+        self._replace_channel_state(state.model_copy(update={"partial": signed}))
+        self._recompute_channel_stage()
+        return signed
+
+    def accept_finalize(
+        self, coordinator_actor: str, finalize: ChannelInputFinalizePayload
+    ) -> ChannelInputFinalizedPayload | None:
+        """Persist a verified coordinator finalization authorization without calling LND."""
+
+        self._require_coordinator(coordinator_actor, finalize)
+        if self.stage is MakerChannelInputStage.PREPARED:
+            raise ChannelInputValidationError("finalize requires complete local nonce coverage")
+        state = self._require_channel_state(finalize.funding_outpoint)
+        if state.partial is None or state.sign_request is None:
+            raise ChannelInputValidationError("finalize requires a durable local partial")
+        assert self.proposal is not None
+        validate_finalize_for_transcript(
+            finalize,
+            self.proposal.transcript,
+            self.participant_key,
+            expected_local_public_nonce=state.prepared.public_nonce,
+            expected_peer_public_nonce=state.sign_request.peer_prepared.public_nonce,
+        )
+        if state.finalize_request is not None:
+            if finalize != state.finalize_request:
+                raise ChannelInputValidationError(
+                    "finalize request conflicts with durable channel state"
+                )
+            return state.finalized
+        self._replace_channel_state(state.model_copy(update={"finalize_request": finalize}))
+        self._recompute_channel_stage()
+        return None
+
+    def record_finalized(
+        self, funding_outpoint: Outpoint, result: LndFinalizedEscrowParent
+    ) -> ChannelInputFinalizedPayload:
+        """Persist the exact one-witness LND parent transaction before network release."""
+
+        state = self._require_channel_state(funding_outpoint)
+        if state.finalize_request is None:
+            raise ChannelInputValidationError(
+                "finalized parent requires a durable finalize request"
+            )
+        result = _validated_finalized_parent(result)
+        _require_parent_txid(result.txid, self._parent_txid())
+        assert self.proposal is not None
+        descriptor = _descriptor_for_local_outpoint(self.proposal, funding_outpoint)
+        if result.channel_input_index != descriptor.input_index:
+            raise ChannelInputValidationError(
+                "finalized parent channel input index differs from transcript"
+            )
+        try:
+            transaction = parse_transaction_bytes(bytes.fromhex(result.tx_hex))
+        except (ValueError, IndexError) as exc:
+            raise ChannelInputValidationError("finalized parent transaction is invalid") from exc
+        if (
+            len(transaction.witnesses) <= descriptor.input_index
+            or tuple(transaction.witnesses[descriptor.input_index]) != result.channel_input_witness
+        ):
+            raise ChannelInputValidationError("finalized parent witness differs from LND result")
+        if state.finalized is not None:
+            if (
+                state.finalized.channel_signed_parent_tx == result.tx_hex
+                and state.finalized.txid == result.txid
+            ):
+                return state.finalized
+            raise ChannelInputValidationError(
+                "finalized parent conflicts with durable channel state"
+            )
+        try:
+            finalized = ChannelInputFinalizedPayload(
+                session_id=state.finalize_request.session_id,
+                attempt=state.finalize_request.attempt,
+                signer_key=self.participant_key,
+                transcript_hash=state.finalize_request.transcript_hash,
+                funding_outpoint=funding_outpoint,
+                channel_signed_parent_tx=result.tx_hex,
+                txid=result.txid,
+            )
+        except ValueError as exc:
+            raise ChannelInputValidationError("finalized parent differs from transcript") from exc
+        signed = sign_payload(finalized, self._key_pair.secret_key)
+        self._validate_local_finalized(signed)
+        self._replace_channel_state(state.model_copy(update={"finalized": signed}))
+        self._recompute_channel_stage()
+        return signed
+
+    def _require_prepared_negotiation(self) -> None:
+        if self.prepare is None or self.stage not in (
+            MakerChannelInputStage.PREPARED,
+            MakerChannelInputStage.NONCES_READY,
+            MakerChannelInputStage.SIGNING,
+            MakerChannelInputStage.FINALIZING,
+            MakerChannelInputStage.FINALIZED,
+        ):
+            raise ChannelInputValidationError("channel preparation has not been accepted")
+
+    def _parent_txid(self) -> str:
+        assert self.proposal is not None
+        return get_txid(self.proposal.transcript.unsigned_parent_tx)
+
+    def _expected_local_outpoints(self) -> tuple[Outpoint, ...]:
+        assert self.proposal is not None
+        outpoints = tuple(terms.funding_outpoint for terms in self.proposal.recipient_terms)
+        if len({_outpoint_sort_key(outpoint) for outpoint in outpoints}) != len(outpoints):
+            raise ChannelInputValidationError(
+                "proposal local terms have duplicate funding outpoints"
+            )
+        return tuple(sorted(outpoints, key=_outpoint_sort_key))
+
+    def _require_local_outpoint(self, funding_outpoint: Outpoint) -> None:
+        if funding_outpoint not in self._expected_local_outpoints():
+            raise ChannelInputValidationError("funding outpoint is not a local recipient term")
+
+    def _channel_state(self, funding_outpoint: Outpoint) -> MakerChannelInputChannelState | None:
+        return next(
+            (state for state in self.channel_states if state.funding_outpoint == funding_outpoint),
+            None,
+        )
+
+    def _require_channel_state(self, funding_outpoint: Outpoint) -> MakerChannelInputChannelState:
+        self._require_local_outpoint(funding_outpoint)
+        state = self._channel_state(funding_outpoint)
+        if state is None:
+            raise ChannelInputValidationError("funding outpoint has no durable LND signing attempt")
+        return state
+
+    def _replace_channel_state(self, replacement: MakerChannelInputChannelState) -> None:
+        states = [
+            replacement if state.funding_outpoint == replacement.funding_outpoint else state
+            for state in self.channel_states
+        ]
+        if not any(
+            state.funding_outpoint == replacement.funding_outpoint for state in self.channel_states
+        ):
+            states.append(replacement)
+        self.channel_states = tuple(
+            sorted(states, key=lambda state: _outpoint_sort_key(state.funding_outpoint))
+        )
+
+    def _sign_prepared(
+        self, funding_outpoint: Outpoint, attempt: LndEscrowSigningAttempt
+    ) -> ChannelInputPreparedPayload:
+        assert self.proposal is not None
+        prepared = ChannelInputPreparedPayload(
+            session_id=self.proposal.session_id,
+            attempt=self.proposal.attempt,
+            signer_key=self.participant_key,
+            transcript_hash=self.proposal.transcript_hash,
+            funding_outpoint=funding_outpoint,
+            public_nonce=attempt.public_nonce.hex(),
+        )
+        signed = sign_payload(prepared, self._key_pair.secret_key)
+        self._registry.require_verified(self.local_actor, signed)
+        validate_prepared_for_transcript(signed, self.proposal.transcript, self.participant_key)
+        return signed
+
+    def _validate_local_partial(
+        self, partial: ChannelInputPartialPayload, state: MakerChannelInputChannelState
+    ) -> None:
+        assert self.proposal is not None and state.sign_request is not None
+        self._registry.require_verified(self.local_actor, partial)
+        validate_partial_for_transcript(
+            partial,
+            self.proposal.transcript,
+            self.participant_key,
+            expected_local_public_nonce=state.prepared.public_nonce,
+            expected_peer_public_nonce=state.sign_request.peer_prepared.public_nonce,
+        )
+
+    def _validate_local_finalized(self, finalized: ChannelInputFinalizedPayload) -> None:
+        assert self.proposal is not None
+        self._registry.require_verified(self.local_actor, finalized)
+        validate_finalized_for_transcript(finalized, self.proposal.transcript)
+
+    def _recompute_channel_stage(self) -> None:
+        expected_count = len(self._expected_local_outpoints())
+        if len(self.channel_states) < expected_count:
+            self.stage = MakerChannelInputStage.PREPARED
+        elif all(state.finalized is not None for state in self.channel_states):
+            self.stage = MakerChannelInputStage.FINALIZED
+        elif any(
+            state.finalize_request is not None or state.finalized is not None
+            for state in self.channel_states
+        ):
+            self.stage = MakerChannelInputStage.FINALIZING
+        elif any(
+            state.sign_request is not None or state.partial is not None
+            for state in self.channel_states
+        ):
+            self.stage = MakerChannelInputStage.SIGNING
+        else:
+            self.stage = MakerChannelInputStage.NONCES_READY
 
     def _require_coordinator(self, actor: str, payload: ChannelInputPayload) -> None:
         if actor != self.coordinator_actor:
@@ -712,15 +1165,124 @@ class MakerChannelInputNegotiation:
             assert self.local_ack is not None
             _require_exact_ack(self.prepare, self.local_ack)
             expected_entries.append((_slot("prepare"), self.prepare))
+        if self.prepare is not None:
+            self._validate_restored_channel_states()
         expected_ledger = tuple(
             sorted((slot, _payload_digest(payload)) for slot, payload in expected_entries)
         )
         if self._ledger.snapshot() != expected_ledger:
             raise ChannelInputValidationError("replay ledger does not match negotiation payloads")
 
+    def _validate_restored_channel_states(self) -> None:
+        """Recheck all state not covered by the immutable pre-prepare replay ledger."""
+
+        assert self.proposal is not None
+        expected_outpoints = self._expected_local_outpoints()
+        frozen_outpoints = {hello.funding_outpoint.key() for hello in self.hellos}
+        if any(outpoint.key() not in frozen_outpoints for outpoint in expected_outpoints):
+            raise ChannelInputValidationError(
+                "proposal local term is not backed by frozen hello evidence"
+            )
+        state_outpoints = tuple(state.funding_outpoint for state in self.channel_states)
+        if any(outpoint not in expected_outpoints for outpoint in state_outpoints):
+            raise ChannelInputValidationError("channel state is not a local recipient term")
+        if len(set(_outpoint_sort_key(outpoint) for outpoint in state_outpoints)) != len(
+            state_outpoints
+        ):
+            raise ChannelInputValidationError("channel states have duplicate funding outpoints")
+        if tuple(sorted(state_outpoints, key=_outpoint_sort_key)) != state_outpoints:
+            raise ChannelInputValidationError("channel states are not deterministically ordered")
+        parent_txid = self._parent_txid()
+        for state in self.channel_states:
+            _require_parent_txid(state.parent_txid, parent_txid)
+            try:
+                attempt = LndEscrowSigningAttempt(
+                    attempt_id=bytes.fromhex(state.attempt_id),
+                    public_nonce=bytes.fromhex(state.prepared.public_nonce),
+                )
+            except ValueError as exc:
+                raise ChannelInputValidationError("channel signing attempt is invalid") from exc
+            if attempt.public_nonce.hex() != state.prepared.public_nonce:
+                raise ChannelInputValidationError(
+                    "channel prepared nonce differs from signing attempt"
+                )
+            self._registry.require_verified(self.local_actor, state.prepared)
+            validate_prepared_for_transcript(
+                state.prepared, self.proposal.transcript, self.participant_key
+            )
+            if state.sign_request is not None:
+                self._registry.require_verified(self.coordinator_actor, state.sign_request)
+                validate_sign_for_transcript(
+                    state.sign_request,
+                    self.proposal.transcript,
+                    self.participant_key,
+                    expected_local_public_nonce=state.prepared.public_nonce,
+                )
+            if state.partial is not None:
+                if state.sign_request is None:
+                    raise ChannelInputValidationError("restored partial lacks sign request")
+                self._validate_local_partial(state.partial, state)
+            if state.finalize_request is not None:
+                if state.sign_request is None:
+                    raise ChannelInputValidationError("restored finalize lacks sign request")
+                self._registry.require_verified(self.coordinator_actor, state.finalize_request)
+                validate_finalize_for_transcript(
+                    state.finalize_request,
+                    self.proposal.transcript,
+                    self.participant_key,
+                    expected_local_public_nonce=state.prepared.public_nonce,
+                    expected_peer_public_nonce=state.sign_request.peer_prepared.public_nonce,
+                )
+            if state.finalized is not None:
+                self._validate_local_finalized(state.finalized)
+        original_stage = self.stage
+        self._recompute_channel_stage()
+        if self.stage is not original_stage:
+            raise ChannelInputValidationError("restored channel state shape differs from stage")
+
 
 def _slot(name: str) -> str:
     return f"maker-channel-input-v1:{name}"
+
+
+def _outpoint_sort_key(outpoint: Outpoint) -> tuple[str, int]:
+    return (outpoint.txid, outpoint.vout)
+
+
+def _require_parent_txid(value: str, expected: str) -> None:
+    if value != expected:
+        raise ChannelInputValidationError("parent txid differs from accepted transcript")
+
+
+def _validated_signing_attempt(attempt: LndEscrowSigningAttempt) -> LndEscrowSigningAttempt:
+    if not isinstance(attempt, LndEscrowSigningAttempt):
+        raise ChannelInputValidationError("LND signing attempt is invalid")
+    try:
+        return LndEscrowSigningAttempt.model_validate(attempt.model_dump(mode="python"))
+    except ValueError as exc:
+        raise ChannelInputValidationError("LND signing attempt is invalid") from exc
+
+
+def _validated_finalized_parent(result: LndFinalizedEscrowParent) -> LndFinalizedEscrowParent:
+    if not isinstance(result, LndFinalizedEscrowParent):
+        raise ChannelInputValidationError("LND finalized parent is invalid")
+    try:
+        return LndFinalizedEscrowParent.model_validate(result.model_dump(mode="python"))
+    except ValueError as exc:
+        raise ChannelInputValidationError("LND finalized parent is invalid") from exc
+
+
+def _descriptor_for_local_outpoint(
+    proposal: ChannelInputProposalPayload, funding_outpoint: Outpoint
+) -> ChannelDescriptor:
+    descriptors = [
+        descriptor
+        for descriptor in proposal.transcript.channels
+        if descriptor.funding_outpoint == funding_outpoint
+    ]
+    if len(descriptors) != 1:
+        raise ChannelInputValidationError("funding outpoint has no unique transcript descriptor")
+    return descriptors[0]
 
 
 def _hello_slot(hello: ChannelInputHelloPayload) -> str:
