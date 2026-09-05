@@ -1354,14 +1354,14 @@ class TestPhaseCollectSignaturesCompleteness:
         *,
         append_sighash_byte: bool,
     ) -> tuple[Any, bytes]:
-        from coincurve import PrivateKey
+        from bitcointx.core.key import CKey
         from jmcore.models import Offer, OfferType
         from jmwallet.wallet.signing import sign_p2tr_input
 
-        maker_key = PrivateKey.from_int(1)
-        output_key = maker_key.public_key.format(compressed=True)[1:]
+        maker_key = CKey.from_secret_bytes((1).to_bytes(32, "big"))
+        output_key = bytes(maker_key.xonly_pub)
         maker1_script = (b"\x51\x20" + output_key).hex()
-        fallback_pubkey = PrivateKey.from_int(2).public_key.format(compressed=True)
+        fallback_pubkey = bytes(CKey.from_secret_bytes((2).to_bytes(32, "big")).pub)
         fallback_script = pubkey_to_p2wpkh_script(fallback_pubkey).hex()
         offer = Offer(
             counterparty="maker1",

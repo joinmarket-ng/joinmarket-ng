@@ -127,27 +127,27 @@ class TestAuthPubkeyOwnsUtxo:
     def test_sw0_binds_p2wpkh(self) -> None:
         from types import SimpleNamespace
 
-        from coincurve import PrivateKey
+        from bitcointx.core.key import CKey
         from jmcore.bitcoin import pubkey_to_p2wpkh_script
 
         session = _session(OfferType.SW0_RELATIVE)
-        pub = PrivateKey(b"\x11" * 32).public_key.format(compressed=True)
+        pub = bytes(CKey.from_secret_bytes(b"\x11" * 32).pub)
         spk = pubkey_to_p2wpkh_script(pub).hex()
         maker = SimpleNamespace(utxos=[{"scriptpubkey": spk}])
         assert session._auth_pubkey_owns_utxo(pub.hex(), maker) is True
         # A different key does not own it.
-        other = PrivateKey(b"\x22" * 32).public_key.format(compressed=True)
+        other = bytes(CKey.from_secret_bytes(b"\x22" * 32).pub)
         assert session._auth_pubkey_owns_utxo(other.hex(), maker) is False
 
     def test_tr0_binds_taproot_output_key(self) -> None:
         """For a tr0 pit the internal auth pubkey is taptweaked to the P2TR key."""
         from types import SimpleNamespace
 
-        from coincurve import PrivateKey
+        from bitcointx.core.key import CKey
         from jmcore.bitcoin import taproot_tweak_pubkey
 
         session = _session(OfferType.TR0_RELATIVE)
-        internal = PrivateKey(b"\x33" * 32).public_key.format(compressed=True)
+        internal = bytes(CKey.from_secret_bytes(b"\x33" * 32).pub)
         _parity, output_xonly = taproot_tweak_pubkey(internal[1:])
         spk = "5120" + output_xonly.hex()
         maker = SimpleNamespace(utxos=[{"scriptpubkey": spk}])
@@ -156,7 +156,7 @@ class TestAuthPubkeyOwnsUtxo:
         # Binding the raw (untweaked) key as if it were P2WPKH must NOT match.
         assert (
             session._auth_pubkey_owns_utxo(
-                PrivateKey(b"\x44" * 32).public_key.format(compressed=True).hex(), maker
+                bytes(CKey.from_secret_bytes(b"\x44" * 32).pub).hex(), maker
             )
             is False
         )

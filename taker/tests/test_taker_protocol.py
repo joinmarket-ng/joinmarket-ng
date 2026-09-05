@@ -309,11 +309,11 @@ async def test_podle_generation(mock_wallet, tmp_path):
 
 @pytest.mark.asyncio
 async def test_podle_generation_uses_bip86_output_key_for_p2tr_utxo(tmp_path):
-    from coincurve import PrivateKey
+    from bitcointx.core.key import CKey
     from jmcore.bitcoin import taproot_tweak_pubkey
 
-    private_key = PrivateKey.from_int(1)
-    _, output_key = taproot_tweak_pubkey(private_key.public_key.format(compressed=True)[1:])
+    private_key = CKey.from_secret_bytes((1).to_bytes(32, "big"))
+    _, output_key = taproot_tweak_pubkey(bytes(private_key.xonly_pub))
     utxo = UTXOInfo(
         txid="c" * 64,
         vout=2,
@@ -329,7 +329,7 @@ async def test_podle_generation_uses_bip86_output_key_for_p2tr_utxo(tmp_path):
     commitment = manager.generate_fresh_commitment(
         wallet_utxos=[utxo],
         cj_amount=10_000_000,
-        private_key_getter=lambda _address: private_key.secret,
+        private_key_getter=lambda _address: private_key.secret_bytes,
         min_confirmations=1,
         min_percent=20,
     )

@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
-from coincurve import PrivateKey
+from bitcointx.core.key import CKey
 from jmcore.bitcoin import (
     TxInput,
     TxOutput,
@@ -503,9 +503,9 @@ class RestartingOpenerEndpoint:
         )
 
 
-def p2tr_script(key_material: bytes) -> tuple[PrivateKey, bytes]:
-    key = PrivateKey(taproot_tweak_privkey(key_material))
-    return key, b"\x51\x20" + key.public_key_xonly.format()
+def p2tr_script(key_material: bytes) -> tuple[CKey, bytes]:
+    key = CKey.from_secret_bytes(taproot_tweak_privkey(key_material))
+    return key, b"\x51\x20" + bytes(key.xonly_pub)
 
 
 async def test_exact_parent_restart_recovery_through_python_client(
