@@ -1,5 +1,9 @@
 # Experimental Credential Market
 
+For a simple explanation of buying, selling, privacy, and the main risks, start
+with the [user overview](credential-market-overview.md). This page covers setup
+and commands.
+
 `jm-market` is an opt-in native directory market with a scriptable JSON CLI for
 external PoDLE openings and delegated fidelity-bond certificates. It does not create wallets,
 send payments, run a Lightning node, broadcast Bitcoin transactions, hold
