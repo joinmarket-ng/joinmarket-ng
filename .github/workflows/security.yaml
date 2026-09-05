@@ -90,6 +90,7 @@ jobs:
         run: |
           python -m venv "$RUNNER_TEMP/joinmarket-target"
           "$RUNNER_TEMP/joinmarket-target/bin/python" -m pip install \
+            --build-constraint taker/build-constraints.txt \
             -e ./jmcore \
             -e ./jmwallet \
             -e ./directory_server \

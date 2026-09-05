@@ -1,0 +1,8 @@
+Source: https://github.com/lnbits/bolt11
+Version: 2.1.1
+Commit: 5f26caae05b9dc0a47dad6ffa3e42dbc503e67c3
+Annotated tag object: 6d99abbc4ec880461e1cb27816865bea1b602ee1
+License: MIT (see LICENSE)
+
+This copy contains the upstream library source excluding cli.py. Local changes
+replace coincurve with python-bitcointx and make package imports relative.

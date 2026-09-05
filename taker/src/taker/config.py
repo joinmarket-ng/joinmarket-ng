@@ -5,6 +5,7 @@ Configuration for JoinMarket Taker.
 from __future__ import annotations
 
 from enum import StrEnum
+from typing import Literal
 
 from jmcore.config import WalletConfig
 from jmcore.models import OfferType, normalize_relative_fee
@@ -198,6 +199,13 @@ class TakerConfig(WalletConfig):
     taker_utxo_age: int = Field(default=5, ge=1, description="Minimum UTXO confirmations")
     taker_utxo_amtpercent: int = Field(
         default=20, ge=1, le=100, description="Min UTXO value as % of CJ amount"
+    )
+    external_podle_mode: Literal["disabled", "only"] = Field(
+        default="disabled",
+        description=(
+            "Use externally imported PoDLE credentials only. Their backing UTXOs are "
+            "verified but never selected as CoinJoin inputs."
+        ),
     )
 
     # Timeouts
