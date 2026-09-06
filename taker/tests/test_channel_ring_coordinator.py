@@ -6,7 +6,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
-from coincurve import PrivateKey
+import pytest
+from bitcointx.core.key import CKey
 from jmcore.bitcoin import parse_transaction, scriptpubkey_to_address
 from jmcore.channel_ring import ChannelRingConfig
 from jmcore.channel_ring_store import RingLifecycleState, RingParticipantStore
@@ -34,7 +35,7 @@ from jmcore.cofunded_ring import (
     sign_attestation,
     sign_payload,
 )
-from jmcore.models import Offer, OfferType
+from jmcore.models import Offer, OfferType, calculate_cj_fee
 from jmswap.channel_ring import InitializedChannelRingBackend
 from jmswap.lnd import (
     AcceptorObservation,
@@ -68,11 +69,11 @@ def _secret(index: int) -> bytes:
 
 
 def _ring_key(index: int) -> str:
-    return PrivateKey(_secret(index)).public_key.format(compressed=True)[1:].hex()
+    return bytes(CKey.from_secret_bytes(_secret(index)).pub)[1:].hex()
 
 
 def _node(index: int) -> str:
-    return PrivateKey(_secret(index)).public_key.format(compressed=True).hex()
+    return bytes(CKey.from_secret_bytes(_secret(index)).pub).hex()
 
 
 def _script(index: int) -> str:
@@ -658,6 +659,38 @@ async def test_complete_coordinator_reaches_signing_with_exact_ring(tmp_path: Pa
 
     await coordinator.cancel("too_late")
     assert coordinator._record().state is RingLifecycleState.SIGNING
+
+
+@pytest.mark.parametrize(
+    ("round_up_cj_fees", "equalize_cj_fees"),
+    [(True, False), (False, True)],
+)
+async def test_coordinator_preserves_paid_fee_residuals(
+    tmp_path: Path, round_up_cj_fees: bool, equalize_cj_fees: bool
+) -> None:
+    coordinator = _harness(tmp_path)
+    coordinator.session.config.round_up_cj_fees = round_up_cj_fees
+    coordinator.session.config.equalize_cj_fees = equalize_cj_fees
+    if round_up_cj_fees:
+        for maker in coordinator.session.maker_sessions.values():
+            maker.offer = maker.offer.model_copy(update={"cjfee": 1_001})
+    else:
+        coordinator.session.maker_sessions["maker-2"].offer = coordinator.session.maker_sessions[
+            "maker-2"
+        ].offer.model_copy(update={"cjfee": 2_000})
+
+    assert await coordinator.prepare(_address(300), 0)
+
+    paid_fees = coordinator.session.maker_fee_plan()
+    assert any(
+        paid_fees[nick]
+        > calculate_cj_fee(maker.offer.ordertype, maker.offer.cjfee, coordinator.session.cj_amount)
+        for nick, maker in coordinator.session.maker_sessions.items()
+    )
+    record = coordinator._record()
+    for key, plan in record.coordinator_plans.items():
+        participant_id = "taker" if key == record.ring_public_key else coordinator._peer_by_key[key]
+        assert plan.contribution.residual == coordinator._residuals[participant_id]
 
 
 async def test_malicious_readiness_aborts_and_safely_retires(tmp_path: Path) -> None:

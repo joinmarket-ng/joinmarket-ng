@@ -5,7 +5,7 @@ import hashlib
 import json
 
 import pytest
-from coincurve import PrivateKey
+from bitcointx.core.key import CKey
 from pydantic import ValidationError
 
 from jmcore.bitcoin import (
@@ -68,7 +68,7 @@ def _ring_key(index: int) -> str:
 
 
 def _node_id(index: int) -> str:
-    return PrivateKey(_secret(index)).public_key.format(compressed=True).hex()
+    return bytes(CKey.from_secret_bytes(_secret(index)).pub).hex()
 
 
 def _policy() -> ChannelPolicy:
@@ -168,13 +168,19 @@ def _psbt(unsigned_tx: bytes, input_count: int, output_count: int) -> bytes:
     )
 
 
-def _unsigned_payload() -> tuple[RingUnsignedPayload, bytes]:
+def _unsigned_payload(
+    *, locktime: int = 0, sequence: int | None = None
+) -> tuple[RingUnsignedPayload, bytes]:
     manifest = _manifest()
-    inputs = [TxInput.from_hex(f"{index + 200:064x}", index) for index in range(4)]
+    if sequence is None:
+        sequence = 0xFFFFFFFF if locktime == 0 else 0xFFFFFFFE
+    inputs = [
+        TxInput.from_hex(f"{index + 200:064x}", index, sequence=sequence) for index in range(4)
+    ]
     outputs = [
         TxOutput.from_hex(output.script_pubkey, output.amount) for output in manifest.outputs
     ]
-    unsigned_tx = serialize_transaction(2, inputs, outputs, 0)
+    unsigned_tx = serialize_transaction(2, inputs, outputs, locktime)
     manifest = manifest.model_copy(
         update={
             "unsigned_tx_hash": hashlib.sha256(unsigned_tx).hexdigest(),
@@ -512,16 +518,27 @@ def test_unsigned_payload_binds_canonical_transaction_and_psbt() -> None:
         RingUnsignedPayload(**{**payload.model_dump(), "unsigned_tx": witnessed.hex()})
 
 
+def test_unsigned_payload_accepts_height_locktime_with_non_rbf_sequences() -> None:
+    payload, unsigned_tx = _unsigned_payload(locktime=123)
+    transaction = parse_transaction_bytes(unsigned_tx)
+
+    assert payload.unsigned_tx == unsigned_tx.hex()
+    assert transaction.locktime == 123
+    assert {item.sequence for item in transaction.inputs} == {0xFFFFFFFE}
+
+
 @pytest.mark.parametrize(
-    ("version", "locktime", "sequence"),
+    ("version", "locktime", "sequence", "match"),
     [
-        (1, 0, 0xFFFFFFFF),
-        (2, 500_000_000, 0xFFFFFFFE),
-        (2, 0, 0xFFFFFFFE),
+        (1, 0, 0xFFFFFFFF, "version 2"),
+        (2, 500_000_000, 0xFFFFFFFE, "block height"),
+        (2, 0, 0xFFFFFFFE, "zero locktime"),
+        (2, 100, 0xFFFFFFFF, "uniform non-RBF"),
+        (2, 100, 0xFFFFFFFD, "uniform non-RBF"),
     ],
 )
 def test_unsigned_payload_rejects_nonfinal_transaction_policy(
-    version: int, locktime: int, sequence: int
+    version: int, locktime: int, sequence: int, match: str
 ) -> None:
     payload, unsigned_tx = _unsigned_payload()
     transaction = parse_transaction_bytes(unsigned_tx)
@@ -530,7 +547,18 @@ def test_unsigned_payload_rejects_nonfinal_transaction_policy(
     ]
     changed = serialize_transaction(version, inputs, transaction.outputs, locktime)
 
-    with pytest.raises(ValidationError, match="version 2, zero locktime, and final"):
+    with pytest.raises(ValidationError, match=match):
+        RingUnsignedPayload(**_unsigned_payload_data(payload, changed))
+
+
+def test_unsigned_payload_rejects_mixed_height_locktime_sequences() -> None:
+    payload, unsigned_tx = _unsigned_payload()
+    transaction = parse_transaction_bytes(unsigned_tx)
+    inputs = transaction.inputs.copy()
+    inputs[0] = TxInput.from_hex(inputs[0].txid, inputs[0].vout, sequence=0xFFFFFFFE)
+    changed = serialize_transaction(2, inputs, transaction.outputs, 100)
+
+    with pytest.raises(ValidationError, match="uniform non-RBF"):
         RingUnsignedPayload(**_unsigned_payload_data(payload, changed))
 
 

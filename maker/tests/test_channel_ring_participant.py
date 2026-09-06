@@ -11,7 +11,7 @@ from typing import Any
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
-from coincurve import PrivateKey
+from bitcointx.core.key import CKey
 from jmcore.bitcoin import (
     TxInput,
     TxOutput,
@@ -100,7 +100,7 @@ def _key(index: int) -> str:
 
 
 def _node(index: int) -> str:
-    return PrivateKey(_secret(index)).public_key.format(compressed=True).hex()
+    return bytes(CKey.from_secret_bytes(_secret(index)).pub).hex()
 
 
 ONION = "a" * 56 + ".onion:9735"
@@ -196,7 +196,7 @@ class FakeLnd:
         return await self.incoming
 
     async def start_external_channel(self, request: Any) -> FundingNegotiation:
-        assert request.capacity_sat == 900_000
+        assert request.capacity_sat >= 900_000
         assert request.push_sat == 300_000
         assert request.pending_channel_id == bytes.fromhex("12" * 32)
         assert self.incoming is not None
@@ -256,8 +256,16 @@ class FakeLnd:
             remote_node_id=expected.fundee_node_id if opener else expected.opener_node_id,
             channel_point=expected.channel_point,
             capacity_sat=expected.capacity_sat,
-            local_balance_sat=598_340 if opener else 400_000,
-            remote_balance_sat=300_000 if opener else 598_340,
+            local_balance_sat=(
+                expected.opener_contribution_sat - 1_000 - 660
+                if opener
+                else expected.fundee_contribution_sat
+            ),
+            remote_balance_sat=(
+                expected.fundee_contribution_sat
+                if opener
+                else expected.opener_contribution_sat - 1_000 - 660
+            ),
             commit_fee_sat=1_000,
             commitment_overhead_sat=660,
             local_reserve_sat=10_000,
@@ -309,6 +317,10 @@ class FakeChain:
         self.utxos: dict[tuple[str, int], UTXO] = {}
         self.transactions: dict[str, Transaction] = {}
         self.broadcasts: list[str] = []
+        self.block_height = 100
+
+    async def get_block_height(self) -> int:
+        return self.block_height
 
     async def get_utxo(self, txid: str, vout: int) -> UTXO | None:
         return self.utxos.get((txid, vout))
@@ -429,6 +441,7 @@ class Harness:
     def plan(self, *, residual: int = 1_000_000) -> RingPlanPayload:
         local = self.record().ring_public_key
         cycle = [self.taker_key, local, _key(12), _key(13)]
+        outgoing = residual - 400_000
         return self.signed(
             RingPlanPayload(
                 round_nonce="aa" * 32,
@@ -441,7 +454,7 @@ class Harness:
                 contribution=LocalContribution(
                     participant_key=local,
                     residual=residual,
-                    outgoing=residual - 400_000,
+                    outgoing=outgoing,
                     incoming=400_000,
                 ),
                 predecessor=_participant(self.taker_key, _node(20)),
@@ -460,7 +473,7 @@ class Harness:
                     pending_channel_id="12" * 32,
                     opener_key=local,
                     acceptor_key=_key(12),
-                    capacity=900_000,
+                    capacity=outgoing + 300_000,
                     push_amount=300_000,
                     policy=_policy(),
                 ),
@@ -482,11 +495,23 @@ class Harness:
             )
         )
 
-    async def unsigned(self, *, outgoing_script: str = OUTGOING_SCRIPT) -> RingUnsignedPayload:
+    async def unsigned(
+        self,
+        *,
+        outgoing_script: str = OUTGOING_SCRIPT,
+        locktime: int = 0,
+        outgoing_capacity_delta: int = 0,
+    ) -> RingUnsignedPayload:
         record = self.record()
         local = record.ring_public_key
+        assert record.plan is not None
         keys = [self.taker_key, local, _key(12), _key(13)]
-        capacities = [1_000_000, 900_000, 800_000, 700_000]
+        capacities = [
+            record.plan.incoming_edge.capacity,
+            record.plan.outgoing_edge.capacity + outgoing_capacity_delta,
+            800_000,
+            700_000,
+        ]
         pending = ["11" * 32, "12" * 32, "13" * 32, "14" * 32]
         scripts = ["5120" + f"{index + 30:064x}" for index in range(4)]
         scripts[1] = outgoing_script
@@ -523,9 +548,16 @@ class Harness:
         ]
         tx = serialize_transaction(
             2,
-            [TxInput.from_hex(txid, vout) for txid, vout, _, _ in input_specs],
+            [
+                TxInput.from_hex(
+                    txid,
+                    vout,
+                    sequence=0xFFFFFFFF if locktime == 0 else 0xFFFFFFFE,
+                )
+                for txid, vout, _, _ in input_specs
+            ],
             [TxOutput.from_hex(item.script_pubkey, item.amount) for item in outputs],
-            0,
+            locktime,
         )
         for txid, vout, value, script in input_specs[1:]:
             self.chain.utxos[(txid, vout)] = UTXO(
@@ -663,7 +695,7 @@ async def test_order_signature_residual_and_replay_fail_closed(harness: Harness)
     with pytest.raises(MakerRingError, match="conflicting invitation|invalid BIP340"):
         await harness.machine.handle(bad_signature)
 
-    with pytest.raises(MakerRingError, match="finalized residual"):
+    with pytest.raises(MakerRingError, match="below advertised residual"):
         await harness.machine.handle(harness.plan(residual=999_999))
     good_plan = harness.plan()
     await harness.machine.handle(good_plan)
@@ -707,7 +739,9 @@ async def test_rejected_plan_retires_revision_and_acknowledges_later_cancel(
     assert harness.record().state is RingLifecycleState.RETIRED
 
 
-async def test_script_substitution_and_wrong_open_binding_are_rejected(harness: Harness) -> None:
+async def test_script_and_residual_substitution_and_wrong_open_binding_are_rejected(
+    harness: Harness,
+) -> None:
     await harness.machine.handle(harness.invite())
     ack = await harness.machine.handle(harness.plan())
     with pytest.raises(MakerRingError, match="plan hash"):
@@ -734,6 +768,61 @@ async def test_script_substitution_and_wrong_open_binding_are_rejected(harness: 
     substituted = await harness.unsigned(outgoing_script="5120" + "ff" * 32)
     with pytest.raises(MakerRingError, match="substituted.*script"):
         await harness.machine.handle(substituted)
+    residual_substitution = await harness.unsigned(outgoing_capacity_delta=-1)
+    with pytest.raises(MakerRingError, match="substituted a local edge"):
+        await harness.machine.handle(residual_substitution)
+
+
+async def test_height_locktime_is_verified_before_external_psbt(harness: Harness) -> None:
+    await harness.through_open()
+    unsigned = await harness.unsigned(locktime=100)
+
+    ready = await harness.machine.handle(unsigned)
+
+    assert len(ready) == 2
+    assert harness.lnd.verified is not None
+
+
+async def test_future_height_locktime_is_rejected_before_external_psbt(harness: Harness) -> None:
+    await harness.through_open()
+    unsigned = await harness.unsigned(locktime=harness.chain.block_height + 13)
+
+    with pytest.raises(MakerRingError, match="ahead of chain tip"):
+        await harness.machine.handle(unsigned)
+
+    assert harness.lnd.verified is None
+
+
+async def test_paid_fee_above_advertised_raw_fee_preserves_acknowledged_residual(
+    harness: Harness,
+) -> None:
+    await harness.machine.handle(harness.invite())
+    plan = harness.plan(residual=1_001_000)
+    acknowledgments = await harness.machine.handle(plan)
+    await harness.machine.handle(
+        harness.signed(
+            RingOpenPayload(
+                round_nonce="aa" * 32,
+                revision=0,
+                signer_key=harness.taker_key,
+                plan_hash=acknowledgments[0].plan_hash,
+            )
+        )
+    )
+    unsigned = await harness.unsigned()
+    await harness.machine.handle(unsigned)
+
+    record = harness.record()
+    assert record.local_contribution == plan.contribution
+    assert record.manifest is not None
+    local_index = record.manifest.participant_keys.index(record.ring_public_key)
+    outgoing = record.manifest.edges[local_index]
+    assert outgoing.capacity - plan.outgoing_edge.push_amount == plan.contribution.outgoing
+    assert plan.incoming_edge.push_amount == plan.contribution.incoming
+    assert record.outgoing_pending_state is not None
+    assert record.outgoing_pending_state.opener_balance == plan.contribution.outgoing - 1_660
+    assert record.incoming_pending_state is not None
+    assert record.incoming_pending_state.fundee_balance == plan.contribution.incoming
 
 
 async def test_wrong_push_pending_id_psbt_and_incomplete_readiness_are_rejected(
@@ -1101,14 +1190,76 @@ class _WireParticipant:
         return [self.response]
 
 
+class _RetiringCancelWireParticipant(_WireParticipant):
+    def __init__(self, response: Any) -> None:
+        super().__init__(response)
+        self.record = SimpleNamespace(state=RingLifecycleState.INVITED, active=True)
+
+    async def handle(self, payload: Any) -> list[Any]:
+        self.handled.append(payload)
+        self.record.state = RingLifecycleState.RETIRED
+        self.record.active = False
+        return [self.response]
+
+    def _record(self) -> Any:
+        return self.record
+
+
 class _RejectingWireParticipant(_WireParticipant):
+    def __init__(self, response: Any) -> None:
+        super().__init__(response)
+        self.record = SimpleNamespace(state=RingLifecycleState.INVITED, active=True)
+
     async def handle(self, payload: Any) -> list[Any]:
         self.handled.append(payload)
         raise MakerRingError("channel policy differs from local configured policy")
 
     def reject_plan(self, payload: RingPlanPayload) -> list[Any]:
         assert self.handled == [payload]
+        self.record.state = RingLifecycleState.RETIRED
+        self.record.active = False
         return [self.response]
+
+    def _record(self) -> Any:
+        return self.record
+
+
+class _FailingCancelWireParticipant(_WireParticipant):
+    def __init__(self, state: RingLifecycleState) -> None:
+        super().__init__(None)
+        self.record = SimpleNamespace(state=state, active=True)
+
+    async def handle(self, payload: Any) -> list[Any]:
+        self.handled.append(payload)
+        raise MakerRingError("ring cancellation cannot safely retire")
+
+    def _record(self) -> Any:
+        return self.record
+
+
+class _UnretiredCancelWireParticipant(_WireParticipant):
+    def __init__(self, response: Any) -> None:
+        super().__init__(response)
+        self.record = SimpleNamespace(state=RingLifecycleState.RETIRING, active=True)
+
+    def _record(self) -> Any:
+        return self.record
+
+
+def _wire_maker_bot(maker_identity: NickIdentity, selected: Any) -> Any:
+    bot: Any = MakerBot.__new__(MakerBot)
+    bot.config = SimpleNamespace(channel_ring=SimpleNamespace(enabled=True))
+    bot.channel_ring_capability_validated = True
+    bot._channel_ring_backend = object()
+    bot._channel_ring_store = object()
+    bot.directory_clients = {"selected": selected}
+    bot.direct_connections = {}
+    bot._generation = lambda generation_id: None
+    bot.nick_identity = maker_identity
+    bot.nick = maker_identity.nick
+    bot._active_podle_outpoints = {}
+    bot._reserved_commitments = set()
+    return bot
 
 
 @pytest.mark.parametrize("source", ["dir:selected", "direct"])
@@ -1166,7 +1317,9 @@ async def test_signed_ring_dispatch_replies_only_on_source_channel(
         assert (ok, command, data) == (True, "ring", "ZW5jcnlwdGVk")
 
 
-async def test_signed_plan_rejection_replies_and_releases_input_lock(harness: Harness) -> None:
+async def test_signed_plan_rejection_releases_owned_podle_for_fresh_commitment(
+    harness: Harness,
+) -> None:
     taker_identity = NickIdentity()
     maker_identity = NickIdentity()
     await harness.machine.handle(harness.invite())
@@ -1182,6 +1335,8 @@ async def test_signed_plan_rejection_replies_and_releases_input_lock(harness: Ha
     crypto = _WireCrypto(encode_ring_message(request))
     release_inputs = Mock()
     outpoint = ("04" * 32, 0)
+    podle_outpoint = ("05" * 32, 1)
+    commitment = "06" * 32
     inner = SimpleNamespace(
         state=CoinJoinState.IOAUTH_SENT,
         taker_nick=taker_identity.nick,
@@ -1191,26 +1346,32 @@ async def test_signed_plan_rejection_replies_and_releases_input_lock(harness: Ha
         wallet=SimpleNamespace(release_coinjoin_inputs=release_inputs),
         our_utxos={outpoint: object()},
         input_lock_owner="maker:round-owner",
+        commitment=bytes.fromhex(commitment),
     )
     session = MakerSession(inner)  # type: ignore[arg-type]
     session.ring_participant = _RejectingWireParticipant(response)  # type: ignore[assignment]
     selected = SimpleNamespace(send_private_message=AsyncMock())
-    bot = SimpleNamespace(
-        config=SimpleNamespace(channel_ring=SimpleNamespace(enabled=True)),
-        channel_ring_capability_validated=True,
-        _channel_ring_backend=object(),
-        _channel_ring_store=object(),
-        directory_clients={"selected": selected},
-        direct_connections={},
-        nick_identity=maker_identity,
-        nick=maker_identity.nick,
-    )
+    bot = _wire_maker_bot(maker_identity, selected)
+    bot._reserved_commitments.add(commitment)
+    assert bot._reserve_podle_outpoint(podle_outpoint, session) is True
     ciphertext = "Y2lwaGVydGV4dA=="
     signed = taker_identity.sign_message(ciphertext, ONION_HOSTID)
 
     await session.on_ring(bot, f"ring {signed}", "dir:selected")  # type: ignore[arg-type]
 
     release_inputs.assert_called_once_with({outpoint}, owner="maker:round-owner")
+    assert podle_outpoint not in bot._active_podle_outpoints
+    assert session.podle_outpoint is None
+    assert session.ring_participant is not None
+    assert commitment in bot._reserved_commitments
+    next_session = MakerSession(
+        SimpleNamespace(
+            taker_nick=taker_identity.nick,
+            session_timeout_sec=300,
+            commitment=bytes.fromhex("07" * 32),
+        )
+    )
+    assert bot._reserve_podle_outpoint(podle_outpoint, next_session) is True
     selected.send_private_message.assert_awaited_once_with(
         taker_identity.nick, "ring", "ZW5jcnlwdGVk"
     )
@@ -1240,24 +1401,110 @@ async def test_ring_cancel_releases_coinjoin_input_locks(harness: Harness) -> No
         our_utxos={outpoint: object()},
     )
     session = MakerSession(inner)  # type: ignore[arg-type]
-    session.ring_participant = _WireParticipant(request)  # type: ignore[assignment]
+    session.ring_participant = _RetiringCancelWireParticipant(request)  # type: ignore[assignment]
     selected = SimpleNamespace(send_private_message=AsyncMock())
-    bot = SimpleNamespace(
-        config=SimpleNamespace(channel_ring=SimpleNamespace(enabled=True)),
-        channel_ring_capability_validated=True,
-        _channel_ring_backend=object(),
-        _channel_ring_store=object(),
-        directory_clients={"selected": selected},
-        direct_connections={},
-        nick_identity=maker_identity,
-        nick=maker_identity.nick,
-    )
+    bot = _wire_maker_bot(maker_identity, selected)
+    podle_outpoint = ("03" * 32, 2)
+    assert bot._reserve_podle_outpoint(podle_outpoint, session) is True
     ciphertext = "Y2lwaGVydGV4dA=="
     signed = taker_identity.sign_message(ciphertext, ONION_HOSTID)
 
     await session.on_ring(bot, f"ring {signed}", "dir:selected")  # type: ignore[arg-type]
 
     release_inputs.assert_called_once_with({outpoint})
+    assert podle_outpoint not in bot._active_podle_outpoints
+    assert session.podle_outpoint is None
+
+
+@pytest.mark.parametrize("failure", ["invalid", "failed", "post-sign", "unretired"])
+async def test_unsafe_ring_cancel_keeps_podle_reservation(harness: Harness, failure: str) -> None:
+    taker_identity = NickIdentity()
+    maker_identity = NickIdentity()
+    cancel = harness.signed(
+        RingCancelPayload(
+            round_nonce="aa" * 32,
+            revision=0,
+            signer_key=harness.taker_key,
+            reason_code="test_cancel",
+        )
+    )
+    plaintext = "invalid ring payload" if failure == "invalid" else encode_ring_message(cancel)
+    crypto = _WireCrypto(plaintext)
+    release_inputs = Mock()
+    inner = SimpleNamespace(
+        state=CoinJoinState.IOAUTH_SENT,
+        taker_nick=taker_identity.nick,
+        session_timeout_sec=300,
+        validate_channel=lambda received: received == "dir:selected",
+        crypto=crypto,
+        wallet=SimpleNamespace(release_coinjoin_inputs=release_inputs),
+        our_utxos={("08" * 32, 0): object()},
+    )
+    session = MakerSession(inner)  # type: ignore[arg-type]
+    if failure == "unretired":
+        session.ring_participant = _UnretiredCancelWireParticipant(cancel)  # type: ignore[assignment]
+    elif failure != "invalid":
+        state = (
+            RingLifecycleState.RECOVERY_REQUIRED
+            if failure == "failed"
+            else RingLifecycleState.SIGNING
+        )
+        session.ring_participant = _FailingCancelWireParticipant(state)  # type: ignore[assignment]
+    selected = SimpleNamespace(send_private_message=AsyncMock())
+    bot = _wire_maker_bot(maker_identity, selected)
+    podle_outpoint = ("09" * 32, 3)
+    assert bot._reserve_podle_outpoint(podle_outpoint, session) is True
+    ciphertext = "Y2lwaGVydGV4dA=="
+    signed = taker_identity.sign_message(ciphertext, ONION_HOSTID)
+
+    await session.on_ring(bot, f"ring {signed}", "dir:selected")  # type: ignore[arg-type]
+
+    assert bot._active_podle_outpoints[podle_outpoint] is session
+    assert session.podle_outpoint == podle_outpoint
+    release_inputs.assert_not_called()
+
+
+async def test_ring_cancel_does_not_release_another_session_podle_reservation(
+    harness: Harness,
+) -> None:
+    taker_identity = NickIdentity()
+    maker_identity = NickIdentity()
+    cancel = harness.signed(
+        RingCancelPayload(
+            round_nonce="aa" * 32,
+            revision=0,
+            signer_key=harness.taker_key,
+            reason_code="test_cancel",
+        )
+    )
+    crypto = _WireCrypto(encode_ring_message(cancel))
+    inner = SimpleNamespace(
+        state=CoinJoinState.IOAUTH_SENT,
+        taker_nick=taker_identity.nick,
+        session_timeout_sec=300,
+        validate_channel=lambda received: received == "dir:selected",
+        crypto=crypto,
+        wallet=SimpleNamespace(release_coinjoin_inputs=Mock()),
+        our_utxos={("0a" * 32, 0): object()},
+    )
+    session = MakerSession(inner)  # type: ignore[arg-type]
+    session.ring_participant = _RetiringCancelWireParticipant(cancel)  # type: ignore[assignment]
+    other_session = MakerSession(
+        SimpleNamespace(taker_nick="other", session_timeout_sec=300, commitment=b"")
+    )
+    selected = SimpleNamespace(send_private_message=AsyncMock())
+    bot = _wire_maker_bot(maker_identity, selected)
+    podle_outpoint = ("0b" * 32, 4)
+    session.podle_outpoint = podle_outpoint
+    other_session.podle_outpoint = podle_outpoint
+    bot._active_podle_outpoints[podle_outpoint] = other_session
+    ciphertext = "Y2lwaGVydGV4dA=="
+    signed = taker_identity.sign_message(ciphertext, ONION_HOSTID)
+
+    await session.on_ring(bot, f"ring {signed}", "dir:selected")  # type: ignore[arg-type]
+
+    assert bot._active_podle_outpoints[podle_outpoint] is other_session
+    assert other_session.podle_outpoint == podle_outpoint
 
 
 def test_active_ring_record_retains_maker_input_locks() -> None:

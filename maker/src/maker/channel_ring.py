@@ -59,6 +59,7 @@ from jmcore.cofunded_ring import (
     sign_attestation,
     sign_payload,
     validate_plan_for_invite,
+    validate_ring_unsigned_transaction_policy,
     verify_payload,
     verify_ready_set,
 )
@@ -102,6 +103,7 @@ _CHAIN_HASHES = {
     "signet": "00000008819873e925422c1ff0f99f7c3bdb3adc1d93b6f4e2af5f996e3157b",
     "regtest": "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206",
 }
+_MAX_RING_LOCKTIME_AHEAD = 12
 
 
 def _chain_hash(network: str) -> bytes:
@@ -354,10 +356,9 @@ class MakerRingParticipant:
             self.session.amount,
         )
         residual = input_value - self.session.amount + realized_fee - self.session.offer.txfee
-        if contribution.residual != residual:
+        if contribution.residual < residual:
             raise MakerRingError(
-                f"planned residual {contribution.residual} differs from "
-                f"finalized residual {residual}"
+                f"planned residual {contribution.residual} is below advertised residual {residual}"
             )
         outgoing_floor = (
             self.config.opener_reserve
@@ -637,17 +638,31 @@ class MakerRingParticipant:
         tx_inputs = {(item.txid, item.vout) for item in transaction.inputs}
         if not tx_inputs.issuperset(self.session.our_utxos):
             raise MakerRingError("ring transaction omits a selected local input")
-        local_accounted = self.session.amount + contribution.outgoing + contribution.incoming
-        realized_fee = calculate_cj_fee(
-            self.session.offer.ordertype, self.session.offer.cjfee, self.session.amount
+        manifest_residual = (
+            outgoing.capacity - plan.outgoing_edge.push_amount + plan.incoming_edge.push_amount
         )
-        local_available = (
-            sum(item.value for item in self.session.our_utxos.values())
-            + realized_fee
-            - self.session.offer.txfee
-        )
-        if local_accounted != local_available:
-            raise MakerRingError("ring manifest violates finalized local contribution accounting")
+        if manifest_residual != contribution.residual:
+            raise MakerRingError("ring manifest substituted the acknowledged local contribution")
+
+    async def _validate_unsigned_transaction_policy(self, payload: RingUnsignedPayload) -> None:
+        transaction = parse_transaction(payload.unsigned_tx)
+        try:
+            validate_ring_unsigned_transaction_policy(
+                transaction.version,
+                transaction.locktime,
+                [tx_input.sequence for tx_input in transaction.inputs],
+            )
+        except ValueError as exc:
+            raise MakerRingError(f"ring transaction policy is invalid: {exc}") from exc
+        if transaction.locktime == 0:
+            return
+        chain_tip = await self.chain_backend.get_block_height()
+        max_locktime = chain_tip + _MAX_RING_LOCKTIME_AHEAD
+        if transaction.locktime > max_locktime:
+            raise MakerRingError(
+                f"ring locktime {transaction.locktime} is ahead of chain tip {chain_tip} "
+                f"(max {max_locktime})"
+            )
 
     async def _resolve_witness_utxos(self, unsigned_tx: str) -> list[WitnessUtxo]:
         transaction = parse_transaction(unsigned_tx)
@@ -775,6 +790,7 @@ class MakerRingParticipant:
         if record.state is not RingLifecycleState.PREPARED:
             raise MakerRingError("ring_unsigned is out of order")
         self._validate_manifest(payload, record)
+        await self._validate_unsigned_transaction_policy(payload)
         witnesses = await self._resolve_witness_utxos(payload.unsigned_tx)
         expected_psbt, expected_txid = build_unsigned_psbt(payload.unsigned_tx, witnesses)
         supplied_psbt = base64.b64decode(payload.psbt, validate=True)

@@ -13,11 +13,12 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, ClassVar, Literal, TypeAlias, cast
 
-from coincurve import PrivateKey, PublicKey, PublicKeyXOnly
+from bitcointx.core.key import CKey, CPubKey, XOnlyPubKey
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from jmcore.bitcoin import hash256, parse_transaction_bytes, serialize_transaction
 from jmcore.constants import MAX_MONEY
+from jmcore.transaction_policy import NON_RBF_LOCKTIME_SEQUENCE
 
 RING_DESIGN = "cofunded_channel_ring_v1"
 RING_VERSION = 1
@@ -29,6 +30,8 @@ MAX_REVISION = 2_147_483_647
 MAX_RING_ENCODED_BYTES = 4 * MAX_RING_PAYLOAD_BYTES // 3 + 128
 # NaCl Box adds a 24-byte nonce and 16-byte authenticator before base64 encoding.
 MAX_RING_CIPHERTEXT_BYTES = 4 * ((MAX_RING_ENCODED_BYTES + 40 + 2) // 3)
+LOCKTIME_THRESHOLD = 500_000_000
+FINAL_SEQUENCE = 0xFFFFFFFF
 
 Hex32 = str
 Hex33 = str
@@ -61,7 +64,8 @@ def _validate_hex(value: str, byte_length: int, field_name: str) -> str:
 def _validate_xonly_key(value: str, field_name: str = "ring key") -> str:
     _validate_hex(value, 32, field_name)
     try:
-        PublicKeyXOnly(bytes.fromhex(value))
+        if not XOnlyPubKey(bytes.fromhex(value)).is_fullyvalid():
+            raise ValueError
     except ValueError as exc:
         raise ValueError(f"{field_name} is not a valid BIP340 public key") from exc
     return value
@@ -73,7 +77,8 @@ def _validate_node_id(value: str) -> str:
     if raw[0] not in (2, 3):
         raise ValueError("node_id must be a compressed secp256k1 public key")
     try:
-        PublicKey(raw)
+        if not CPubKey(raw).is_fullyvalid():
+            raise ValueError
     except ValueError as exc:
         raise ValueError("node_id is not a valid secp256k1 public key") from exc
     return value
@@ -709,6 +714,22 @@ def _psbt_unsigned_transaction(psbt: bytes) -> bytes:
     return unsigned_tx
 
 
+def validate_ring_unsigned_transaction_policy(
+    version: int, locktime: int, sequences: Sequence[int]
+) -> None:
+    """Validate the two transaction fingerprints permitted for a co-funded ring."""
+    if version != 2:
+        raise ValueError("unsigned_tx must use version 2")
+    if locktime == 0:
+        if any(sequence != FINAL_SEQUENCE for sequence in sequences):
+            raise ValueError("zero locktime requires final input sequences")
+        return
+    if not 0 < locktime < LOCKTIME_THRESHOLD:
+        raise ValueError("nonzero locktime must be a block height")
+    if any(sequence != NON_RBF_LOCKTIME_SEQUENCE for sequence in sequences):
+        raise ValueError("height locktime requires uniform non-RBF input sequences")
+
+
 class RingUnsignedPayload(RingPayload):
     message_type: ClassVar[str] = "ring_unsigned"
     type: Literal["ring_unsigned"] = "ring_unsigned"
@@ -738,14 +759,11 @@ class RingUnsignedPayload(RingPayload):
             or canonical_transaction != transaction_bytes
         ):
             raise ValueError("unsigned_tx must be canonical and contain no signatures or witness")
-        if (
-            transaction.version != 2
-            or transaction.locktime != 0
-            or any(tx_input.sequence != 0xFFFFFFFF for tx_input in transaction.inputs)
-        ):
-            raise ValueError(
-                "unsigned_tx must use version 2, zero locktime, and final input sequences"
-            )
+        validate_ring_unsigned_transaction_policy(
+            transaction.version,
+            transaction.locktime,
+            [tx_input.sequence for tx_input in transaction.inputs],
+        )
         outpoints = [(tx_input.txid, tx_input.vout) for tx_input in transaction.inputs]
         if len(set(outpoints)) != len(outpoints):
             raise ValueError("unsigned_tx must not contain duplicate input outpoints")
@@ -1036,10 +1054,10 @@ class RingKeyPair:
         if len(secret_key) != 32:
             raise RingValidationError("ring secret key must be 32 bytes")
         try:
-            private_key = PrivateKey(secret_key)
+            private_key = CKey.from_secret_bytes(secret_key)
         except ValueError as exc:
             raise RingValidationError("ring secret key is outside the secp256k1 range") from exc
-        public_key = private_key.public_key.format(compressed=True)[1:].hex()
+        public_key = bytes(private_key.pub)[1:].hex()
         return cls(secret_key=secret_key, public_key=public_key)
 
 
@@ -1056,7 +1074,9 @@ def sign_hash(
     try:
         return cast(
             str,
-            PrivateKey(secret_key).sign_schnorr(message_hash, aux_randomness=auxiliary).hex(),
+            CKey.from_secret_bytes(secret_key)
+            .sign_schnorr_no_tweak(message_hash, aux=auxiliary)
+            .hex(),
         )
     except ValueError as exc:
         raise RingValidationError("invalid BIP340 secret key") from exc
@@ -1069,7 +1089,9 @@ def verify_hash(public_key: str, message_hash: bytes, signature: str) -> bool:
         if len(message_hash) != 32:
             return False
         return bool(
-            PublicKeyXOnly(bytes.fromhex(public_key)).verify(bytes.fromhex(signature), message_hash)
+            XOnlyPubKey(bytes.fromhex(public_key)).verify_schnorr(
+                message_hash, bytes.fromhex(signature)
+            )
         )
     except ValueError:
         return False
