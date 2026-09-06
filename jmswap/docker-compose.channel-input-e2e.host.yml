@@ -1,0 +1,32 @@
+services:
+  ring-bitcoin:
+    ports:
+      - "127.0.0.1:${CHANNEL_INPUT_E2E_BITCOIN_PORT:-30443}:18443"
+
+  ring-directory:
+    ports:
+      - "127.0.0.1:${CHANNEL_INPUT_E2E_DIRECTORY_PORT:-30322}:5222"
+
+  ring-orderbook:
+    ports:
+      - "127.0.0.1:${CHANNEL_INPUT_E2E_ORDERBOOK_PORT:-30880}:8000"
+
+  ring-tor:
+    ports:
+      - "127.0.0.1:${CHANNEL_INPUT_E2E_TOR_SOCKS_PORT:-30950}:9050"
+
+  lnd-maker1:
+    ports:
+      - "127.0.0.1:${CHANNEL_INPUT_E2E_MAKER1_GRPC_PORT:-31009}:10009"
+
+  lnd-maker2:
+    ports:
+      - "127.0.0.1:${CHANNEL_INPUT_E2E_MAKER2_GRPC_PORT:-32009}:10009"
+
+  lnd-maker3:
+    ports:
+      - "127.0.0.1:${CHANNEL_INPUT_E2E_MAKER3_GRPC_PORT:-31309}:10009"
+
+  lnd-taker:
+    ports:
+      - "127.0.0.1:${CHANNEL_INPUT_E2E_TAKER_GRPC_PORT:-30009}:10009"

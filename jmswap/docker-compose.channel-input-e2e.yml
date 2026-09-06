@@ -1,0 +1,59 @@
+x-channel-input-maker-environment: &channel-input-maker-environment
+  MAKER__CHANNEL_RING__ENABLED: "false"
+  MAKER__CHANNEL_INPUT__MINIMUM_MAKERS: 3
+  MAKER__CHANNEL_INPUT__MIN_CHANNEL_CAPACITY_SAT: 1000000
+  MAKER__CHANNEL_INPUT__MAX_CHANNEL_CAPACITY_SAT: 2000000
+  MAKER__CHANNEL_INPUT__MAX_CLAIM_ADJUSTMENT_SAT: 10000
+  MAKER__CHANNEL_INPUT__MAX_MINER_FEE_SHARE_SAT: 10000
+  MAKER__CHANNEL_INPUT__MAX_PARENT_FEE_SAT: 100000
+  MAKER__CHANNEL_INPUT__MAX_FEE_RATE_SAT_VB: 100
+  MAKER__CHANNEL_INPUT__RECOVERY_DELAY_BLOCKS: 6
+  MAKER__CHANNEL_INPUT__PHASE_TIMEOUT_SECONDS: 120
+  MAKER__CHANNEL_INPUT__MAX_ACTIVE_SESSIONS: 4
+  MAKER__CHANNEL_INPUT__LND_GRPC_URL: https://127.0.0.1:10009
+  MAKER__CHANNEL_INPUT__LND_TLS_CERT_PATH: /lnd/tls.cert
+  MAKER__CHANNEL_INPUT__LND_MACAROON_PATH: /lnd/admin.macaroon
+  MAKER__CHANNEL_INPUT__LND_ESCROW_MACAROON_PATH: /lnd/channelescrow.macaroon
+
+services:
+  lnd-maker1:
+    image: ${CHANNEL_INPUT_E2E_LND_IMAGE:-lnd-channelescrow:v0.21.1-beta-local}
+
+  lnd-maker2:
+    image: ${CHANNEL_INPUT_E2E_LND_IMAGE:-lnd-channelescrow:v0.21.1-beta-local}
+
+  lnd-maker3:
+    image: ${CHANNEL_INPUT_E2E_LND_IMAGE:-lnd-channelescrow:v0.21.1-beta-local}
+
+  lnd-taker:
+    image: ${CHANNEL_INPUT_E2E_LND_IMAGE:-lnd-channelescrow:v0.21.1-beta-local}
+
+  ring-maker1:
+    environment:
+      <<: *channel-input-maker-environment
+      CHANNEL_INPUT_E2E_MAKER: maker1
+      MAKER__CHANNEL_INPUT__ENABLED: ${CHANNEL_INPUT_E2E_MAKER1_ENABLED:-false}
+      MAKER__CHANNEL_INPUT__ALLOWED_CHANNEL_POINTS: ${CHANNEL_INPUT_E2E_MAKER1_CHANNEL_POINTS:-[]}
+      PYTHONPATH: /opt/python-bitcointx:/app/lib/python3.14/site-packages
+    volumes:
+      - ${CHANNEL_INPUT_E2E_BITCOINTX_SOURCE:?set local MuSig checkout path}:/opt/python-bitcointx:ro
+
+  ring-maker2:
+    environment:
+      <<: *channel-input-maker-environment
+      CHANNEL_INPUT_E2E_MAKER: maker2
+      MAKER__CHANNEL_INPUT__ENABLED: ${CHANNEL_INPUT_E2E_MAKER2_ENABLED:-false}
+      MAKER__CHANNEL_INPUT__ALLOWED_CHANNEL_POINTS: ${CHANNEL_INPUT_E2E_MAKER2_CHANNEL_POINTS:-[]}
+      PYTHONPATH: /opt/python-bitcointx:/app/lib/python3.14/site-packages
+    volumes:
+      - ${CHANNEL_INPUT_E2E_BITCOINTX_SOURCE:?set local MuSig checkout path}:/opt/python-bitcointx:ro
+
+  ring-maker3:
+    environment:
+      <<: *channel-input-maker-environment
+      CHANNEL_INPUT_E2E_MAKER: maker3
+      MAKER__CHANNEL_INPUT__ENABLED: ${CHANNEL_INPUT_E2E_MAKER3_ENABLED:-false}
+      MAKER__CHANNEL_INPUT__ALLOWED_CHANNEL_POINTS: ${CHANNEL_INPUT_E2E_MAKER3_CHANNEL_POINTS:-[]}
+      PYTHONPATH: /opt/python-bitcointx:/app/lib/python3.14/site-packages
+    volumes:
+      - ${CHANNEL_INPUT_E2E_BITCOINTX_SOURCE:?set local MuSig checkout path}:/opt/python-bitcointx:ro
