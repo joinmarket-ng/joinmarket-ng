@@ -21,6 +21,7 @@ from jmcore.credential_market import (
     FaultProof,
     MarketAuthorization,
     MarketListing,
+    MarketQuote,
     PaymentTerms,
     SignedDocument,
     bond_resource,
@@ -29,6 +30,7 @@ from jmcore.credential_market import (
     sign_document,
 )
 from jmcore.external_podle import ExternalPoDLEOutpoint
+from jmcore.market_faults import MarketFaultCache
 from jmcore.models import NetworkType
 from jmcore.podle import generate_podle
 from jmcore.settings import JoinMarketSettings, NetworkSettings
@@ -55,9 +57,12 @@ def _key(value: int) -> CKey:
 
 
 class _Backend:
-    def __init__(self, payment: PaymentTerms | None = None, *, amount: int = 100) -> None:
+    def __init__(
+        self, payment: PaymentTerms | None = None, *, amount: int = 100, neutrino: bool = False
+    ) -> None:
         self.payment = payment
         self.amount = amount
+        self.neutrino = neutrino
 
     async def get_block_height(self) -> int:
         return 1
@@ -89,7 +94,7 @@ class _Backend:
         )
 
     def requires_neutrino_metadata(self) -> bool:
-        return False
+        return self.neutrino
 
     async def close(self) -> None:
         return None
@@ -631,6 +636,87 @@ def test_lightning_settlement_requires_explicit_acknowledgement(
     )
 
 
+def test_onchain_settlement_fails_closed_on_neutrino_backends(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """Neutrino cannot resolve arbitrary outpoints; settle must fail with a clear reason."""
+    now = int(time.time())
+    settings = _settings(tmp_path)
+    monkeypatch.setattr(market_cli, "_settings", lambda _args: settings)
+    owner, seller, buyer = _key(0x41), _key(0x42), PrivateKey(bytes([0x43]) * 32)
+    authorization = sign_document(
+        MarketAuthorization(bond=_bond(owner), period=0, seller_pubkey=bytes(seller.pub).hex()),
+        owner,
+    )
+    proof = generate_podle(b"\x44" * 32, f"{'44' * 32}:1", 0)
+    podle = {
+        "version": 1,
+        "network": "regtest",
+        "outpoint": {"txid": "44" * 32, "vout": 1},
+        "P": proof.p.hex(),
+        "P2": proof.p2.hex(),
+        "sig": proof.sig.hex(),
+        "e": proof.e.hex(),
+        "commitment": proof.commitment.hex(),
+        "index": 0,
+        "scriptpubkey": (b"\x00\x14" + hash160(proof.p)).hex(),
+        "blockheight": 1,
+    }
+    terms = _payment_terms()
+    store = MarketStore(tmp_path / "market" / "seller.sqlite")
+    store.add_inventory("podle", proof.commitment.hex(), podle)
+    store.add_payment(terms, "chain:test-payment")
+    quote = store.create_quote(
+        authorization,
+        seller,
+        bytes(buyer.public_key).hex(),
+        "podle",
+        None,
+        "onchain",
+        100,
+        now,
+        1,
+        request_id="02" * 16,
+    )
+    store.attach_credential(quote.body["quote_id"], podle)
+    store.close()
+
+    keys = tmp_path / "seller-keys.json"
+    _json(
+        keys,
+        {
+            "version": 1,
+            "seller_signing_key": seller.secret_bytes.hex(),
+            "encryption_key": bytes(PrivateKey.generate()).hex(),
+            "renter_certificate_key": _key(0x45).secret_bytes.hex(),
+        },
+    )
+    monkeypatch.setattr(
+        market_cli, "_new_backend", lambda _settings: _Backend(terms, neutrino=True)
+    )
+    assert (
+        market_cli.run(
+            [
+                "seller",
+                "settle",
+                "--data-dir",
+                str(tmp_path),
+                "--quote-id",
+                quote.body["quote_id"],
+                "--keys",
+                str(keys),
+                "--onchain-outpoint",
+                f"{'ee' * 32}:0",
+                "--output",
+                str(tmp_path / "package.json"),
+            ]
+        )
+        == 1
+    )
+    assert "full-node backend" in capsys.readouterr().err
+    assert not (tmp_path / "package.json").exists()
+
+
 def test_key_output_and_errors_never_echo_private_key(tmp_path: Path, capsys) -> None:
     keys = tmp_path / "keys.json"
     assert market_cli.run(["keygen", "--output", str(keys)]) == 0
@@ -915,3 +1001,179 @@ def test_import_existing_bond_registry_conflict_is_not_overwritten(
     assert stored.bonds[0].cert_pubkey == bytes(certificate.pub).hex()
     assert stored.bonds[0].txid == bond.outpoint.txid
     assert stored.bonds[0].vout == bond.outpoint.vout
+
+
+def _buyer_bound_bond_package(
+    authorization: SignedDocument,
+    seller: CKey,
+    certificate: CKey,
+    owner: CKey,
+    buyer_key: PrivateKey,
+    now: int,
+) -> tuple[CredentialPackage, SignedDocument]:
+    """Build a delivered package plus the signed quote it settles, bound to one buyer key."""
+    credential = market_cli.make_bond_credential(authorization, bytes(certificate.pub).hex(), owner)
+    authority = authorization.verified(MarketAuthorization, bytes(owner.pub).hex())
+    quote_id = "73" * 32
+    resource = bond_resource(authority.bond, authority.period)
+    allocation = sign_document(
+        Allocation(
+            authorization=document_hash(authorization.body),
+            allocation_id=quote_id,
+            buyer_tag=hashlib.sha256(bytes(buyer_key.public_key)).hexdigest(),
+            product="bond",
+            resource=resource,
+            certificate_pubkey=credential.cert_pubkey,
+        ),
+        seller,
+    )
+    delivery = sign_document(
+        Delivery(
+            allocation=document_hash(allocation.body),
+            credential=credential.model_dump(mode="json"),
+        ),
+        seller,
+    )
+    quote = sign_document(
+        MarketQuote(
+            authorization=authorization,
+            quote_id=quote_id,
+            buyer_pubkey=bytes(buyer_key.public_key).hex(),
+            product="bond",
+            resource=resource,
+            certificate_pubkey=credential.cert_pubkey,
+            payment=_payment_terms(),
+            created_at=now,
+            expires_at=now + 300,
+        ),
+        seller,
+    )
+    package = CredentialPackage(
+        authorization=authorization, allocation=allocation, delivery=delivery
+    )
+    return package, quote
+
+
+def test_import_quote_binding_blocks_mismatched_delivery(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """With --quote, a package delivered for another buyer's quote is rejected."""
+    now = int(time.time())
+    settings = _settings(tmp_path)
+    monkeypatch.setattr(market_cli, "_settings", lambda _args: settings)
+    monkeypatch.setattr(market_cli, "_new_backend", lambda _settings: _Backend())
+    owner, seller, certificate = _key(0x65), _key(0x66), _key(0x67)
+    buyer_key = PrivateKey.generate()
+    authorization = sign_document(
+        MarketAuthorization(bond=_bond(owner), period=0, seller_pubkey=bytes(seller.pub).hex()),
+        owner,
+    )
+    package, quote = _buyer_bound_bond_package(
+        authorization, seller, certificate, owner, buyer_key, now
+    )
+    package_file = tmp_path / "package.json"
+    _json(package_file, package.model_dump(mode="json"))
+    quote_file = tmp_path / "quote.json"
+    _json(quote_file, quote.model_dump(mode="json"))
+    certificate_file = tmp_path / "certificate.key"
+    _write(certificate_file, certificate.secret_bytes.hex().encode("ascii"))
+
+    _, other_quote = _buyer_bound_bond_package(
+        authorization, seller, certificate, owner, PrivateKey.generate(), now
+    )
+    other_quote_file = tmp_path / "other-quote.json"
+    _json(other_quote_file, other_quote.model_dump(mode="json"))
+    assert (
+        market_cli.run(
+            [
+                "import",
+                "--data-dir",
+                str(tmp_path),
+                "--package",
+                str(package_file),
+                "--quote",
+                str(other_quote_file),
+                "--certificate-key",
+                str(certificate_file),
+                "--wallet-fingerprint",
+                "deadbeef",
+            ]
+        )
+        == 1
+    )
+    assert "does not match the purchased quote" in capsys.readouterr().err
+
+    assert (
+        market_cli.run(
+            [
+                "import",
+                "--data-dir",
+                str(tmp_path),
+                "--package",
+                str(package_file),
+                "--quote",
+                str(quote_file),
+                "--certificate-key",
+                str(certificate_file),
+                "--wallet-fingerprint",
+                "deadbeef",
+            ]
+        )
+        == 0
+    )
+
+
+def test_import_rejects_bond_with_persisted_fault_evidence(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """A bond package whose collateral has promoted fault evidence must not import."""
+    settings = _settings(tmp_path)
+    monkeypatch.setattr(market_cli, "_settings", lambda _args: settings)
+    monkeypatch.setattr(market_cli, "_new_backend", lambda _settings: _Backend())
+    owner, seller, certificate = _key(0x68), _key(0x69), _key(0x6A)
+    bond = _bond(owner)
+    authorization = sign_document(
+        MarketAuthorization(bond=bond, period=0, seller_pubkey=bytes(seller.pub).hex()), owner
+    )
+    package = _bond_package(authorization, seller, certificate, owner)
+    package_file = tmp_path / "package.json"
+    _json(package_file, package.model_dump(mode="json"))
+    certificate_file = tmp_path / "certificate.key"
+    _write(certificate_file, certificate.secret_bytes.hex().encode("ascii"))
+
+    invalid_delivery = sign_document(
+        Delivery(allocation=document_hash(package.allocation.body), credential={"version": 1}),
+        seller,
+    )
+    proof = FaultProof(
+        reason="invalid-delivery",
+        authorization=authorization,
+        first=package.allocation,
+        second=invalid_delivery,
+    )
+    cache = MarketFaultCache(tmp_path)
+    assert cache.ingest(canonical(proof))
+    assert cache.excludes_verified_bond(bond, height=1)
+
+    assert (
+        market_cli.run(
+            [
+                "import",
+                "--data-dir",
+                str(tmp_path),
+                "--package",
+                str(package_file),
+                "--certificate-key",
+                str(certificate_file),
+                "--wallet-fingerprint",
+                "deadbeef",
+            ]
+        )
+        == 1
+    )
+    assert "fault evidence" in capsys.readouterr().err
+    from jmwallet.wallet.bond_registry import load_registry
+
+    assert not load_registry(
+        tmp_path, "deadbeef", allow_legacy_fallback=False, fail_closed=True
+    ).bonds

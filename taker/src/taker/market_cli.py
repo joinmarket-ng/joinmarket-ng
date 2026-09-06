@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import hashlib
 import json
 import secrets
 import sys
@@ -23,6 +24,7 @@ from jmcore.btc_script import derive_bond_address
 from jmcore.cli_common import resolve_backend_settings, setup_cli
 from jmcore.credential_market import (
     MAX_MARKET_BYTES,
+    Allocation,
     BondCredential,
     BondReference,
     CredentialPackage,
@@ -38,6 +40,7 @@ from jmcore.credential_market import (
     bond_resource,
     canonical,
     decode_document,
+    document_hash,
     sign_document,
     verify_allocation,
     verify_authorization,
@@ -622,6 +625,12 @@ async def _settle(args: argparse.Namespace, settings: JoinMarketSettings) -> Cre
         if args.onchain_outpoint is not None:
             if quote.payment.rail != "onchain":
                 raise MarketCLIError("on-chain reference cannot settle a Lightning quote")
+            if backend.requires_neutrino_metadata():
+                # Neutrino cannot look up an arbitrary settlement outpoint, so this
+                # would otherwise fail with a misleading "unavailable or spent" error.
+                raise MarketCLIError(
+                    "on-chain settlement verification requires a full-node backend"
+                )
             settlement_ref = await verify_onchain_payment(
                 backend, quote.payment, _network(settings), args.onchain_outpoint
             )
@@ -994,11 +1003,29 @@ def _import_bond_credential(
     return True
 
 
+def _require_quote_binding(
+    package: CredentialPackage, allocation: Allocation, quote_path: Path
+) -> None:
+    """Require the package to be the delivery for exactly this purchased quote."""
+    _, quote = _verified_quote(_quote(quote_path))
+    if (
+        document_hash(package.authorization.body) != document_hash(quote.authorization.body)
+        or allocation.allocation_id != quote.quote_id
+        or allocation.buyer_tag != hashlib.sha256(bytes.fromhex(quote.buyer_pubkey)).hexdigest()
+        or allocation.resource != quote.resource
+        or allocation.product != quote.product
+        or allocation.certificate_pubkey != quote.certificate_pubkey
+    ):
+        raise MarketCLIError("credential package does not match the purchased quote")
+
+
 async def _import_package(args: argparse.Namespace, settings: JoinMarketSettings) -> dict[str, Any]:
     package = _credential_package(args.package)
     authority, allocation = verify_allocation(package.authorization, package.allocation)
     if authority.bond.network != _network(settings):
         raise MarketCLIError("package network differs from configured network")
+    if args.quote is not None:
+        _require_quote_binding(package, allocation, args.quote)
     credential = package.verify()
     backend = _new_backend(settings)
     try:
@@ -1006,7 +1033,18 @@ async def _import_package(args: argparse.Namespace, settings: JoinMarketSettings
             await _verify_podle_chain(credential, backend)
             imported = PoDLEManager(settings.get_data_dir()).import_external(credential)
             return {"product": "podle", "imported": imported, "resource": allocation.resource}
-        await verify_market_bond(authority, backend, _network(settings), int(time.time()))
+        try:
+            await verify_market_bond(
+                authority,
+                backend,
+                _network(settings),
+                int(time.time()),
+                MarketFaultCache(settings.get_data_dir()),
+            )
+        except MarketError as exc:
+            raise MarketCLIError(
+                "bond collateral is invalid or has verified fault evidence"
+            ) from exc
         if args.certificate_key is None or args.wallet_fingerprint is None:
             raise MarketCLIError("bond import requires certificate key and wallet fingerprint")
         imported = _import_bond_credential(
@@ -1230,6 +1268,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _common_options(import_command)
     import_command.add_argument("--package", type=Path, required=True)
+    import_command.add_argument(
+        "--quote",
+        type=Path,
+        help="require the package to be the delivery for exactly this purchased quote",
+    )
     import_command.add_argument("--certificate-key", type=Path)
     import_command.add_argument("--wallet-fingerprint")
     import_command.add_argument("--output", type=Path)
@@ -1263,6 +1306,11 @@ def run(argv: Sequence[str] | None = None) -> int:
         args.handler(args)
     except KeyboardInterrupt:
         return 130
+    except MarketCLIError as exc:
+        # MarketCLIError messages are static strings that never embed supplied
+        # data, so surfacing the reason cannot leak market material.
+        sys.stderr.write(f"market command failed: {exc}\n")
+        return 1
     except Exception:
         sys.stderr.write("market command failed\n")
         return 1

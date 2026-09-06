@@ -282,10 +282,12 @@ jm-market seller attach \
 ```
 
 For an onchain quote, use the externally observed and independently verified
-settlement output. For Lightning, first obtain a local confirmation from the
-external wallet or node, save the 32-byte preimage in an owner-only file, and
-give the explicit acknowledgment. A remotely claimed preimage never settles a
-trade.
+settlement output. Onchain settlement verification requires a full-node
+(Bitcoin Core) backend; a neutrino seller cannot resolve an arbitrary
+settlement outpoint and the command fails closed. For Lightning, first obtain
+a local confirmation from the external wallet or node, save the 32-byte
+preimage in an owner-only file, and give the explicit acknowledgment. A
+remotely claimed preimage never settles a trade.
 
 ```bash
 jm-market seller settle \
@@ -374,12 +376,15 @@ jm-market poll \
 The seller listing may have expired by the time of polling. It is still accepted
 only when its authorized seller key matches the quote.
 
-Import a PoDLE package after chain verification:
+Import a PoDLE package after chain verification. Pass the original quote so the
+import refuses a package that was not delivered for exactly your purchase (for
+example, a re-sealed delivery that belongs to another buyer's allocation):
 
 ```bash
 jm-market import \
   --data-dir "$BUYER_DATA" \
   --package market/raw-delivery.json \
+  --quote market/quote.json \
   --output market/import-result.json
 ```
 
@@ -394,6 +399,7 @@ jq -r '.renter_certificate_key' market/buyer-keys.json > market/renter-certifica
 jm-market import \
   --data-dir "$BUYER_DATA" \
   --package market/raw-delivery.json \
+  --quote market/quote.json \
   --certificate-key market/renter-certificate.key \
   --wallet-fingerprint "$WALLET_FINGERPRINT" \
   --output market/import-result.json
@@ -401,8 +407,9 @@ jm-market import \
 
 The wallet fingerprint is the eight-character fingerprint for the hot
 JoinMarket wallet registry. Bond import verifies the owner authorization and
-chain stake, then stores the certificate as an external registry entry with
-`index = -1` and path `external`. The renter certificate key remains local.
+chain stake, refuses collateral with locally verified fault evidence, then
+stores the certificate as an external registry entry with `index = -1` and
+path `external`. The renter certificate key remains local.
 
 ### External-Only PoDLE Policy
 
