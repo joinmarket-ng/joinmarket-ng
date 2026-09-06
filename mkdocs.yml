@@ -122,6 +122,7 @@ nav:
           - Architecture: technical/architecture.md
           - Protocol: technical/protocol.md
           - Privacy analysis: technical/privacy.md
+          - Channel-ring privacy experiment: technical/channel-ring-privacy.md
           - Wallet internals: technical/wallet.md
           - Wallet scanning: technical/wallet-scanning.md
           - Security: technical/security.md

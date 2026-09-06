@@ -8,6 +8,8 @@ The runtime package contains only:
 
 - `jmswap.channel_ring`, which initializes the backend and exposes validated
   participant limits for the ring protocol.
+- `jmswap.channel_input`, which initializes the optional patched-LND escrow
+  backend and validates established-channel candidates.
 - `jmswap.lnd`, which validates LND capabilities, negotiates externally funded
   channels, validates funding PSBTs, observes channel readiness, and performs
   guarded pre-broadcast retirement.
@@ -35,6 +37,16 @@ retirement before any funding transaction signatures are created or broadcast.
 The separate taker policy layer owns established-channel input coordination.
 
 ## Optional ChannelEscrowRPC Transport
+
+The channel-input transport is experimental. A complete live three-maker
+channel-input CoinJoin, including broadcast, confirmation, durable recovery,
+and taker restart, is exercised by `scripts/run-channel-input-e2e.sh` against
+patched LND nodes. Makers credit the advertised fee through the exactly
+authorized channel settlement instead of the ordinary change output, and keep
+the completed ordinary session available for its bound channel-signing
+exchange. Deployment still depends on a reproducible patched-LND build and a
+published MuSig-enabled `python-bitcointx` release; do not deploy
+`channel_input_v1` from unverified local artifacts.
 
 For a patched LND v0.21.1 deployment, `LndBackend` also exposes a narrow,
 typed ChannelEscrowRPC transport boundary for a final-Taproot channel input.
@@ -82,3 +94,16 @@ Run package tests with:
 ```bash
 pytest jmswap
 ```
+
+## Cryptography Development
+
+Schnorr signing, Taproot tweaks, and sighashes use `python-bitcointx`; there is
+no `coincurve` dependency. The `jmcore.musig2` adapter requires the new native
+`bitcointx.core.musig` API in the local fork and a libsecp256k1 build with the
+MuSig module. That API is not in the currently pinned fork release, v2.1.1.
+Use the updated local fork when running the MuSig unit and escrow integration
+tests. A published, hash-pinned fork artifact and corresponding CI dependency
+update are required before those tests are reproducible from release locks.
+
+LND performs production channel signing itself. The Python MuSig adapter is not
+a replacement for LND's durable escrow state or its nonce lifecycle.

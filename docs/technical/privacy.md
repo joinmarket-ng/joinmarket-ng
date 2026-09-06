@@ -4,6 +4,30 @@ For practical guidance, start with [privacy practices](best-practices.md).
 [Collaborative Transaction Privacy](https://gist.github.com/nothingmuch/d84ba390d89b5b08897af2d95009c2a1)
 examines broader transaction-graph attacks and what privacy claims need to establish.
 
+## Scope of Protection
+
+Equal outputs and uniform Taproot key-path witnesses are transaction-shape
+properties, not a guarantee of anonymity against a transaction graph observer.
+An observer can combine input and output amounts, later consolidation, repeated
+counterparties, timing, publicly advertised fees and bonds, and external labels
+across many rounds. The taker still learns the selected makers' ordinary inputs
+and output addresses through `!ioauth`.
+
+Channel rings remove individual plain change outputs from the funding round.
+They do not hide that round from its coordinator, and private Lightning channels
+do not hide their endpoints from each other. Two colluding neighbors can learn
+a participant's complete opening allocation. Fee quantization and equalization
+address fee fingerprints separately; neither removes these observations.
+
+A claim of improved graph privacy needs evaluation across funding, actual
+off-chain use, and subsequent spending. Relevant cases include unchanged
+balances, coordinated closes, force closes, repeated counterparties, and
+colluding participants. Counting equal outputs or successfully routing a payment
+is not that evaluation. No quantitative graph-anonymity guarantee is established
+by the current integration tests. A bounded synthetic graph-observer experiment
+for channel rings, with its assumptions and limits, is documented in
+[Channel-Ring Privacy Experiment](channel-ring-privacy.md).
+
 ## Co-funded Channel Rings
 
 A co-funded channel-ring round has two separate privacy products. First, every
