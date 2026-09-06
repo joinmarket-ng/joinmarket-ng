@@ -26,6 +26,7 @@ from jmcore.channel_input import (
 from jmcore.channel_input_config import ChannelInputConfig
 from jmswap.lnd import (
     ChannelInputCandidate,
+    ChannelInputForceCloseOutcome,
     EscrowOutpoint,
     FrozenChannelSnapshot,
     LndEscrowSigningAttempt,
@@ -105,6 +106,15 @@ class MakerChannelInputBackend(Protocol):
         remote_partial_signature: bytes,
     ) -> LndFinalizedEscrowParent: ...
 
+    async def force_close_channel_input_recovery(
+        self,
+        session_id: str,
+        funding_outpoint: EscrowOutpoint,
+        parent_txid: str,
+        recovery_height: int,
+        current_height: int,
+    ) -> ChannelInputForceCloseOutcome: ...
+
 
 class MakerChannelInputRegistry:
     """Own restored negotiations and serialize their startup recovery."""
@@ -181,6 +191,68 @@ class MakerChannelInputRegistry:
         for key in sorted(self._negotiations):
             async with self._locks[key]:
                 await self._reconcile_one(self._negotiations[key], backend)
+
+    async def force_close_expired_recoveries(
+        self, backend: MakerChannelInputBackend, *, current_height: int
+    ) -> tuple[ChannelInputForceCloseOutcome, ...]:
+        """Force-close signed escrows whose coordinator vanished past recovery height.
+
+        Once the escrow has released a partial signature over the parent, the
+        maker cannot cancel and cannot publish the parent alone. After the
+        transcript recovery height it unilaterally force-closes its own frozen
+        channel; the commitment transaction pays the frozen claims, so this
+        only trades close fees for liveness. The LND backend independently
+        re-validates the signed stage, the exact parent, and the height.
+        """
+
+        outcomes: list[ChannelInputForceCloseOutcome] = []
+        for key in sorted(self._negotiations):
+            async with self._locks[key]:
+                negotiation = self._negotiations[key]
+                proposal = negotiation.proposal
+                if proposal is None or negotiation.stage in (
+                    MakerChannelInputStage.CANCEL_INTENDED,
+                    MakerChannelInputStage.CANCELED,
+                ):
+                    continue
+                transcript = proposal.transcript
+                if current_height < transcript.recovery_height:
+                    continue
+                parent_txid = get_txid(transcript.unsigned_parent_tx)
+                for terms in proposal.recipient_terms:
+                    outpoint = terms.funding_outpoint
+                    state = self._channel_state(negotiation, outpoint)
+                    if state is None or state.partial is None:
+                        # No signature was released; cancellation paths apply.
+                        continue
+                    if state.force_close_commitment_txid is not None:
+                        continue
+                    escrow_outpoint = EscrowOutpoint(txid=outpoint.txid, vout=outpoint.vout)
+                    status = await backend.find_channel_input_escrow_status(
+                        negotiation.invite.session_id, escrow_outpoint
+                    )
+                    if status is None or status.stage not in (
+                        LndEscrowStage.PARENT_SIGNED,
+                        LndEscrowStage.FINALIZED,
+                    ):
+                        # The escrow already resolved, for example because the
+                        # parent or an earlier close confirmed on chain.
+                        continue
+                    if status.parent_txid != parent_txid:
+                        raise MakerChannelInputRuntimeError(
+                            "backend parent transaction differs from transcript"
+                        )
+                    outcome = await backend.force_close_channel_input_recovery(
+                        negotiation.invite.session_id,
+                        escrow_outpoint,
+                        parent_txid,
+                        transcript.recovery_height,
+                        current_height,
+                    )
+                    negotiation.record_force_close(outpoint, outcome.commitment_txid)
+                    self._save(negotiation)
+                    outcomes.append(outcome)
+        return tuple(outcomes)
 
     async def handle_payload(
         self,

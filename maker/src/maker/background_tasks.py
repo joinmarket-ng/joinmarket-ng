@@ -113,6 +113,45 @@ class BackgroundTasksMixin:
 
         logger.debug("Periodic rescan task stopped")
 
+    async def _periodic_channel_input_force_close(self: MakerBotProtocol) -> None:
+        """Last-resort recovery for signed channel-input escrows past recovery height.
+
+        A coordinator that vanishes after the escrow released a signature would
+        otherwise leave the maker's frozen channel stuck until manual LND
+        intervention. This sweep force-closes only such channels; every guard
+        is re-validated by the registry and the LND backend.
+        """
+
+        logger.debug("Starting periodic channel-input force-close task...")
+        while self.running:
+            try:
+                await asyncio.sleep(self.config.rescan_interval_sec)
+                if not self.running:
+                    break
+                registry = self._channel_input_registry
+                initialized = self._channel_input_backend
+                height = self.current_block_height
+                if registry is None or initialized is None or height <= 0:
+                    continue
+                outcomes = await registry.force_close_expired_recoveries(
+                    initialized.backend, current_height=height
+                )
+                for outcome in outcomes:
+                    logger.warning(
+                        "Force-closed stuck channel-input escrow "
+                        f"{outcome.funding_outpoint.txid}:{outcome.funding_outpoint.vout} "
+                        f"(commitment {outcome.commitment_txid})"
+                    )
+            except asyncio.CancelledError:
+                logger.debug("Periodic channel-input force-close task cancelled")
+                break
+            except Exception as e:
+                logger.error("Error in periodic channel-input force-close")
+                logger.bind(sensitive=True).error(
+                    f"Error in periodic channel-input force-close: {e}"
+                )
+        logger.debug("Periodic channel-input force-close task stopped")
+
     async def _periodic_rate_limit_status(self) -> None:
         """Background task to periodically log rate limiting statistics.
 

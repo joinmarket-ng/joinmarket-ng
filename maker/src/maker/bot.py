@@ -1342,6 +1342,11 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
             rescan_task = asyncio.create_task(self._periodic_rescan())
             self.listen_tasks.append(rescan_task)
 
+            # Start last-resort recovery for stuck signed channel-input escrows
+            if self.config.channel_input.enabled:
+                force_close_task = asyncio.create_task(self._periodic_channel_input_force_close())
+                self.listen_tasks.append(force_close_task)
+
             # Start periodic rate limit status logging task
             status_task = asyncio.create_task(self._periodic_rate_limit_status())
             self.listen_tasks.append(status_task)

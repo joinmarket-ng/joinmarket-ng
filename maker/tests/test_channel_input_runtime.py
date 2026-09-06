@@ -20,6 +20,7 @@ from jmcore.channel_input import (
 )
 from jmswap.lnd import (
     ChannelInputCandidate,
+    ChannelInputForceCloseOutcome,
     EscrowOutpoint,
     FrozenChannelSnapshot,
     LndEscrowSigningAttempt,
@@ -50,6 +51,7 @@ from test_maker_channel_input_negotiation import (
 
 from maker.channel_input import (
     MakerChannelInputNegotiation,
+    MakerChannelInputSnapshot,
     MakerChannelInputStage,
     MakerFrozenChannelInput,
 )
@@ -64,6 +66,7 @@ class FakeBackend:
         self.attempts: dict[EscrowOutpoint, LndEscrowSigningAttempt] = {}
         self.partials: dict[EscrowOutpoint, bytes] = {}
         self.finalized: dict[EscrowOutpoint, LndFinalizedEscrowParent] = {}
+        self.commitment_txid = "dd" * 32
         self.events: list[str] = []
 
     async def find_channel_input_escrow_status(
@@ -138,6 +141,24 @@ class FakeBackend:
         assert len(remote_partial_signature) == 32
         assert self.attempts[funding_outpoint] == attempt
         return self.finalized[funding_outpoint]
+
+    async def force_close_channel_input_recovery(
+        self,
+        session_id: str,
+        funding_outpoint: EscrowOutpoint,
+        parent_txid: str,
+        recovery_height: int,
+        current_height: int,
+    ) -> ChannelInputForceCloseOutcome:
+        self.events.append(f"force_close:{funding_outpoint.txid}:{current_height}")
+        # The real backend re-validates the signed stage, exact parent, and height.
+        assert current_height >= recovery_height
+        status = self.statuses[(session_id, funding_outpoint)]
+        assert status is not None and status.parent_txid == parent_txid
+        return ChannelInputForceCloseOutcome(
+            funding_outpoint=funding_outpoint,
+            commitment_txid=self.commitment_txid,
+        )
 
 
 def _store(tmp_path: Path, negotiation: MakerChannelInputNegotiation) -> MakerChannelInputStore:
@@ -1271,3 +1292,117 @@ async def test_unexpired_tombstone_releases_candidate_and_active_capacity(tmp_pa
 
     assert len(response) == 1
     assert registry.session_count == 1
+
+
+def _signed_registry(
+    tmp_path: Path,
+) -> tuple[MakerChannelInputRegistry, MakerChannelInputNegotiation, FakeBackend, EscrowOutpoint]:
+    """A durable negotiation whose escrow already released a partial signature."""
+
+    negotiation, proposal, local, peer, _ = _signing_negotiation()
+    outpoint = local.funding_outpoint
+    escrow = _escrow(outpoint)
+    negotiation.record_partial(outpoint, b"\xaa" * 32)
+    registry = _registry(tmp_path, negotiation)
+    backend = FakeBackend()
+    backend.statuses[(negotiation.invite.session_id, escrow)] = _status(
+        LndEscrowStage.PARENT_SIGNED,
+        parent_txid=get_txid(proposal.transcript.unsigned_parent_tx),
+        local_nonce=bytes.fromhex(local.public_nonce),
+        remote_nonce=bytes.fromhex(peer.public_nonce),
+        partial=b"\xaa" * 32,
+    )
+    restored = registry.get(negotiation.invite.session_id, negotiation.invite.attempt)
+    assert restored is not None
+    return registry, restored, backend, escrow
+
+
+@pytest.mark.asyncio
+async def test_force_close_waits_for_the_transcript_recovery_height(tmp_path: Path) -> None:
+    registry, negotiation, backend, _ = _signed_registry(tmp_path)
+    assert negotiation.proposal is not None
+    recovery_height = negotiation.proposal.transcript.recovery_height
+
+    assert (
+        await registry.force_close_expired_recoveries(backend, current_height=recovery_height - 1)
+        == ()
+    )
+    assert backend.events == []
+
+
+@pytest.mark.asyncio
+async def test_force_close_recovers_a_stuck_signed_escrow_exactly_once(tmp_path: Path) -> None:
+    registry, negotiation, backend, escrow = _signed_registry(tmp_path)
+    assert negotiation.proposal is not None
+    height = negotiation.proposal.transcript.recovery_height
+
+    outcomes = await registry.force_close_expired_recoveries(backend, current_height=height)
+
+    assert len(outcomes) == 1
+    assert outcomes[0].funding_outpoint == escrow
+    assert outcomes[0].commitment_txid == backend.commitment_txid
+    state = negotiation.channel_states[0]
+    assert state.force_close_commitment_txid == backend.commitment_txid
+
+    # The durable record survives a reload and is never repeated.
+    reloaded = MakerChannelInputRegistry.load(
+        store=registry._store, config=negotiation.config, network=negotiation.network
+    )
+    assert await reloaded.force_close_expired_recoveries(backend, current_height=height + 10) == ()
+    assert [event for event in backend.events if event.startswith("force_close")] == [
+        f"force_close:{escrow.txid}:{height}"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_force_close_skips_escrows_without_a_released_signature(tmp_path: Path) -> None:
+    negotiation, proposal = _prepared_negotiation(channels=1)
+    registry = _registry(tmp_path, negotiation)
+    backend = FakeBackend()
+
+    outcomes = await registry.force_close_expired_recoveries(
+        backend, current_height=proposal.transcript.recovery_height + 100
+    )
+
+    assert outcomes == ()
+    assert backend.events == []
+
+
+@pytest.mark.asyncio
+async def test_force_close_skips_a_resolved_escrow_and_rejects_a_foreign_parent(
+    tmp_path: Path,
+) -> None:
+    registry, negotiation, backend, escrow = _signed_registry(tmp_path)
+    assert negotiation.proposal is not None
+    height = negotiation.proposal.transcript.recovery_height
+    session_id = negotiation.invite.session_id
+    resolved = dict(backend.statuses)
+    backend.statuses[(session_id, escrow)] = None
+
+    assert await registry.force_close_expired_recoveries(backend, current_height=height) == ()
+    assert negotiation.channel_states[0].force_close_commitment_txid is None
+
+    backend.statuses = resolved
+    backend.statuses[(session_id, escrow)] = _status(
+        LndEscrowStage.PARENT_SIGNED,
+        parent_txid="ee" * 32,
+        local_nonce=b"\x02" * 66,
+        remote_nonce=b"\x03" * 66,
+        partial=b"\xaa" * 32,
+    )
+    with pytest.raises(MakerChannelInputRuntimeError, match="differs from transcript"):
+        await registry.force_close_expired_recoveries(backend, current_height=height)
+
+
+def test_snapshot_from_a_build_without_force_close_evidence_loads_unclosed() -> None:
+    negotiation, _, local, _, _ = _signing_negotiation()
+    negotiation.record_partial(local.funding_outpoint, b"\xaa" * 32)
+    data = negotiation.snapshot().model_dump(mode="python")
+    for state in data["channel_states"]:
+        state.pop("force_close_commitment_txid")
+
+    restored = MakerChannelInputNegotiation.from_snapshot(
+        MakerChannelInputSnapshot.model_validate(data)
+    )
+
+    assert restored.channel_states[0].force_close_commitment_txid is None
