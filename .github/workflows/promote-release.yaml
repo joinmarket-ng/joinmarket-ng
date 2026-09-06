@@ -19,6 +19,12 @@ on:
       - main
     paths:
       - 'signatures/**'
+  # Signatures can land on main before the Release workflow finishes creating
+  # the pre-release (local-first signing, or a fast second signer). Re-check
+  # after every Release run so an early quorum still promotes automatically.
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
   workflow_dispatch:
 
 permissions:

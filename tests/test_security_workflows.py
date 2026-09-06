@@ -236,6 +236,10 @@ def test_promote_release_gates_publication_on_signature_quorum() -> None:
     assert triggers["push"]["branches"] == ["main"]
     assert triggers["push"]["paths"] == ["signatures/**"]
     assert "workflow_dispatch" in triggers
+    # Race guard: signatures pushed before the Release workflow creates the
+    # pre-release (observed with 0.39.1) must still promote once it exists.
+    assert triggers["workflow_run"]["workflows"] == ["Release"]
+    assert triggers["workflow_run"]["types"] == ["completed"]
 
     assert workflow["concurrency"]["group"] == "promote-release"
     assert workflow["permissions"] == {"contents": "read"}
