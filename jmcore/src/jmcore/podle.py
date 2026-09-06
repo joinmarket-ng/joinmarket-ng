@@ -354,11 +354,10 @@ def generate_podle(
     if p2tr:
         try:
             tweaked_key = taproot_tweak_privkey(private_key_bytes)
-            private_key = PrivateKey(tweaked_key)
-            if private_key.public_key.format(compressed=True)[0] == 0x03:
-                output_scalar = int.from_bytes(tweaked_key, "big")
-                private_key = PrivateKey.from_int(SECP256K1_N - output_scalar)
-            private_key_bytes = private_key.secret
+            private_key = CKey(tweaked_key)
+            if bytes(private_key.pub)[0] == 0x03:
+                private_key = private_key.negated()
+            private_key_bytes = private_key.secret_bytes
         except ValueError as exc:
             raise PoDLEError("Failed to derive BIP86 PoDLE key") from exc
 
@@ -477,7 +476,9 @@ def verify_podle_binding(p: bytes, scriptpubkey: bytes | str) -> tuple[bool, str
     # BIP86 P2TR: P is the even-Y, parity-normalized output key.
     if len(spk) == 34 and spk[0] == 0x51 and spk[1] == 0x20:
         try:
-            PublicKey(p)
+            pubkey = CPubKey(p)
+            if not pubkey.is_fullyvalid():
+                raise ValueError("invalid public key")
         except ValueError:
             return False, "P is not a valid compressed secp256k1 public key"
         if p[0] != 0x02:

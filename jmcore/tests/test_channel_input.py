@@ -6,7 +6,7 @@ import json
 from typing import Literal, cast
 
 import pytest
-from coincurve import PrivateKey
+from bitcointx.core.key import CKey
 from pydantic import ValidationError
 
 from jmcore.bitcoin import (
@@ -89,7 +89,7 @@ def _key(index: int) -> str:
 
 
 def _node(index: int) -> str:
-    return PrivateKey(_secret(index)).public_key.format(compressed=True).hex()
+    return bytes(CKey.from_secret_bytes(_secret(index)).pub).hex()
 
 
 def _ceilings() -> PolicyCeilings:

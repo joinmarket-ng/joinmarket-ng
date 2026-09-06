@@ -21,8 +21,8 @@ from dataclasses import dataclass
 from hashlib import sha256
 from typing import TYPE_CHECKING
 
-from coincurve import PrivateKey
-from jmcore.bitcoin import pubkey_to_p2wpkh_script
+from bitcointx.core.key import CKey
+from jmcore.bitcoin import pubkey_to_p2wpkh_script, taproot_tweak_privkey
 from jmcore.btc_script import mk_freeze_script
 
 from jmwallet.wallet.signing import (
@@ -123,12 +123,13 @@ class WalletSigningMixin:
             # BIP86 key-path spend: sign with the tweaked output key over the
             # full prevout set; the witness is the single Schnorr signature.
             xonly = key.get_p2tr_output_xonly()
+            output_private_key = CKey(taproot_tweak_privkey(key.private_key.secret_bytes))
             signature = sign_p2tr_input(
                 tx=tx,
                 input_index=input_index,
                 prevouts_values=prevout_values,
                 prevouts_scripts=prevout_scripts,
-                private_key=PrivateKey(key.get_p2tr_private_key()),
+                private_key=output_private_key,
             )
             return SignedInput(signature=signature, pubkey=xonly, witness=[signature])
 

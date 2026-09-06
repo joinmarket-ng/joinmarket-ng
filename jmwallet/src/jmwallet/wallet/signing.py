@@ -9,11 +9,16 @@ an audited library. The transaction is serialized via the in-tree
 
 from __future__ import annotations
 
-from typing import cast
-
-from bitcointx.core import CTransaction
-from bitcointx.core.key import CKey
-from bitcointx.core.script import SIGVERSION_WITNESS_V0, CScript, SIGHASH_Type, SignatureHash
+from bitcointx.core import CTransaction, CTxOut
+from bitcointx.core.key import CKey, XOnlyPubKey
+from bitcointx.core.script import (
+    SIGVERSION_TAPROOT,
+    SIGVERSION_WITNESS_V0,
+    CScript,
+    SIGHASH_Type,
+    SignatureHash,
+    SignatureHashSchnorr,
+)
 from jmcore.bitcoin import (
     ParsedTransaction,
     TxInput,
@@ -24,8 +29,6 @@ from jmcore.bitcoin import (
     hash256,
     parse_transaction_bytes,
     serialize_transaction,
-    sha256,
-    tagged_hash,
 )
 from jmcore.crypto import verify_strict_ecdsa
 
@@ -130,7 +133,7 @@ def sign_p2wpkh_input(
     sighash = compute_sighash_segwit(tx, input_index, script_code, value, sighash_type)
 
     # Sign the pre-hashed sighash (it is already SHA256d).
-    signature = cast(bytes, private_key.sign(sighash, _ecdsa_sig_grind_low_r=False))
+    signature = private_key.sign(sighash, _ecdsa_sig_grind_low_r=False)
 
     return signature + bytes([sighash_type])
 
@@ -206,7 +209,7 @@ def sign_p2wsh_input(
     sighash = compute_sighash_segwit(tx, input_index, witness_script, value, sighash_type)
 
     # Sign the pre-hashed sighash (it is already SHA256d).
-    signature = cast(bytes, private_key.sign(sighash, _ecdsa_sig_grind_low_r=False))
+    signature = private_key.sign(sighash, _ecdsa_sig_grind_low_r=False)
 
     return signature + bytes([sighash_type])
 
@@ -253,69 +256,32 @@ def compute_sighash_taproot(
     sighash_type: int = SIGHASH_DEFAULT,
 ) -> bytes:
     """Compute the BIP341 sighash for a key-path spend."""
-    if input_index >= len(tx.inputs):
+    if input_index < 0 or input_index >= len(tx.inputs):
         raise TransactionSigningError("Input index out of range")
     if len(prevouts_values) != len(tx.inputs) or len(prevouts_scripts) != len(tx.inputs):
         raise TransactionSigningError("Prevouts length must match inputs length")
+    native_sighash_type = _native_taproot_sighash_type(sighash_type)
+    if (sighash_type & 0x03) == SIGHASH_SINGLE and input_index >= len(tx.outputs):
+        raise TransactionSigningError("SIGHASH_SINGLE requires a corresponding output")
 
-    import struct
-
-    hash_prevouts = b""
-    hash_amounts = b""
-    hash_script_pubkeys = b""
-    hash_sequences = b""
-    if not (sighash_type & SIGHASH_ANYONECANPAY):
-        hash_prevouts = sha256(
-            b"".join(inp.txid_le + inp.vout.to_bytes(4, "little") for inp in tx.inputs)
+    try:
+        native_tx = CTransaction.deserialize(
+            serialize_transaction(tx.version, tx.inputs, tx.outputs, tx.locktime)
         )
-        hash_amounts = sha256(b"".join(value.to_bytes(8, "little") for value in prevouts_values))
-        hash_script_pubkeys = sha256(
-            b"".join(encode_varint(len(script)) + script for script in prevouts_scripts)
-        )
-        hash_sequences = sha256(b"".join(inp.sequence_bytes for inp in tx.inputs))
-
-    output_kind = sighash_type & 0x03
-    hash_outputs = b""
-    if output_kind not in (SIGHASH_NONE, SIGHASH_SINGLE):
-        hash_outputs = sha256(
-            b"".join(
-                output.value.to_bytes(8, "little")
-                + encode_varint(len(output.script))
-                + output.script
-                for output in tx.outputs
+        spent_outputs = _taproot_spent_outputs(prevouts_values, prevouts_scripts)
+        return bytes(
+            SignatureHashSchnorr(
+                native_tx,
+                input_index,
+                spent_outputs,
+                hashtype=native_sighash_type,
+                sigversion=SIGVERSION_TAPROOT,
             )
         )
-
-    preimage = bytes([0x00, sighash_type])
-    preimage += tx.version_bytes + tx.locktime_bytes
-    if not (sighash_type & SIGHASH_ANYONECANPAY):
-        preimage += hash_prevouts + hash_amounts + hash_script_pubkeys + hash_sequences
-    if output_kind not in (SIGHASH_NONE, SIGHASH_SINGLE):
-        preimage += hash_outputs
-
-    preimage += b"\x00"  # key-path spend, no annex
-    if sighash_type & SIGHASH_ANYONECANPAY:
-        target = tx.inputs[input_index]
-        preimage += target.txid_le + target.vout.to_bytes(4, "little")
-        preimage += prevouts_values[input_index].to_bytes(8, "little")
-        target_script = prevouts_scripts[input_index]
-        preimage += encode_varint(len(target_script)) + target_script
-        preimage += target.sequence_bytes
-    else:
-        preimage += struct.pack("<I", input_index)
-
-    if output_kind == SIGHASH_SINGLE:
-        if input_index < len(tx.outputs):
-            output = tx.outputs[input_index]
-            preimage += sha256(
-                output.value.to_bytes(8, "little")
-                + encode_varint(len(output.script))
-                + output.script
-            )
-        else:
-            preimage += b"\x00" * 32
-
-    return tagged_hash("TapSighash", preimage)
+    except TransactionSigningError:
+        raise
+    except (TypeError, ValueError) as exc:
+        raise TransactionSigningError(f"Failed to compute Taproot sighash: {exc}") from exc
 
 
 def sign_p2tr_input(
@@ -323,14 +289,16 @@ def sign_p2tr_input(
     input_index: int,
     prevouts_values: list[int],
     prevouts_scripts: list[bytes],
-    private_key: PrivateKey,
+    private_key: CKey,
     sighash_type: int = SIGHASH_DEFAULT,
 ) -> bytes:
     """Sign a P2TR key-path input with its already-tweaked output key."""
+    if not isinstance(private_key, CKey):
+        raise TransactionSigningError("Taproot signing key must be a CKey")
     sighash = compute_sighash_taproot(
         tx, input_index, prevouts_values, prevouts_scripts, sighash_type
     )
-    signature = private_key.sign_schnorr(sighash)
+    signature = private_key.sign_schnorr_no_tweak(sighash)
     if sighash_type != SIGHASH_DEFAULT:
         signature += bytes([sighash_type])
     return signature
@@ -346,20 +314,50 @@ def verify_p2tr_signature(
 ) -> bool:
     """Verify a BIP341 key-path Schnorr signature."""
     try:
-        from coincurve import PublicKeyXOnly
-
-        if len(signature) == 65:
+        if len(signature) == 64:
+            sighash_type = SIGHASH_DEFAULT
+            raw_signature = signature
+        elif len(signature) == 65 and signature[-1] != SIGHASH_DEFAULT:
             sighash_type = signature[-1]
             raw_signature = signature[:64]
         else:
-            sighash_type = SIGHASH_DEFAULT
-            raw_signature = signature
+            return False
         sighash = compute_sighash_taproot(
             tx, input_index, prevouts_values, prevouts_scripts, sighash_type
         )
-        return bool(PublicKeyXOnly(x_only_pubkey).verify(raw_signature, sighash))
+        return XOnlyPubKey(x_only_pubkey).verify_schnorr(sighash, raw_signature)
     except Exception:  # noqa: BLE001 - verification must never raise
         return False
+
+
+def _native_taproot_sighash_type(sighash_type: int) -> SIGHASH_Type | None:
+    if not isinstance(sighash_type, int) or isinstance(sighash_type, bool):
+        raise TransactionSigningError("Taproot sighash type must be an integer")
+    valid_sighash_types = {
+        SIGHASH_DEFAULT,
+        SIGHASH_ALL,
+        SIGHASH_NONE,
+        SIGHASH_SINGLE,
+        SIGHASH_ANYONECANPAY | SIGHASH_ALL,
+        SIGHASH_ANYONECANPAY | SIGHASH_NONE,
+        SIGHASH_ANYONECANPAY | SIGHASH_SINGLE,
+    }
+    if sighash_type not in valid_sighash_types:
+        raise TransactionSigningError(f"Invalid Taproot sighash type: {sighash_type:#x}")
+    return None if sighash_type == SIGHASH_DEFAULT else SIGHASH_Type(sighash_type)
+
+
+def _taproot_spent_outputs(values: list[int], scripts: list[bytes]) -> list[CTxOut]:
+    outputs: list[CTxOut] = []
+    for index, (value, scriptpubkey) in enumerate(zip(values, scripts, strict=True)):
+        if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value < 2**63:
+            raise TransactionSigningError(
+                f"Taproot prevout value at index {index} is outside the signed 64-bit range"
+            )
+        if not isinstance(scriptpubkey, bytes):
+            raise TransactionSigningError(f"Taproot prevout script at index {index} must be bytes")
+        outputs.append(CTxOut(value, CScript(scriptpubkey)))
+    return outputs
 
 
 # Re-export from jmcore for backward compatibility

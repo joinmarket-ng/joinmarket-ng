@@ -23,6 +23,8 @@ from typing import Any
 
 import base58
 import bech32 as bech32_lib
+from bitcointx.core.key import CKey, XOnlyPubKey, compute_tap_tweak_hash
+from bitcointx.core.key import tap_tweak_pubkey as _tap_tweak_pubkey
 from pydantic import validate_call
 from pydantic.dataclasses import dataclass
 
@@ -258,7 +260,7 @@ def calculate_sweep_amount(available_sats: int, relative_fees: list[str]) -> int
             break
         cj_amount -= 1
 
-    return cj_amount
+    return int(cj_amount)
 
 
 # =============================================================================
@@ -553,18 +555,21 @@ def taproot_tweak_pubkey(
         ``(output_y_parity, 32-byte x-only tweaked output key)`` where
         ``output_y_parity`` is 0 (even) or 1 (odd), needed for the control block.
     """
-    from coincurve import PublicKey
-
     if len(internal_pubkey) != 32:
         raise ValueError(f"internal_pubkey must be 32 bytes, got {len(internal_pubkey)}")
+    if merkle_root is not None and len(merkle_root) != 32:
+        raise ValueError(f"merkle_root must be 32 bytes, got {len(merkle_root)}")
     try:
-        pub = PublicKey(b"\x02" + internal_pubkey)
-    except ValueError:
-        raise ValueError("Invalid internal public key") from None
-    tweak = tagged_hash("TapTweak", internal_pubkey + (merkle_root or b""))
-    tweaked_pub = pub.add(tweak)
-    tweaked_bytes = tweaked_pub.format(compressed=True)
-    return tweaked_bytes[0] - 2, tweaked_bytes[1:]
+        result = _tap_tweak_pubkey(
+            XOnlyPubKey(internal_pubkey),
+            merkle_root=merkle_root if merkle_root is not None else b"",
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Invalid internal public key") from exc
+    if result is None:
+        raise ValueError("Taproot public key tweak failed")
+    output_key, parity = result
+    return int(parity), bytes(output_key)
 
 
 def taproot_tweak_privkey(privkey_bytes: bytes, merkle_root: bytes | None = None) -> bytes:
@@ -581,19 +586,18 @@ def taproot_tweak_privkey(privkey_bytes: bytes, merkle_root: bytes | None = None
     Returns:
         32-byte tweaked private key (the key-path signing key for the output).
     """
-    import coincurve
+    if merkle_root is not None and len(merkle_root) != 32:
+        raise ValueError(f"merkle_root must be 32 bytes, got {len(merkle_root)}")
+    private_key = CKey(privkey_bytes)
+    if bytes(private_key.pub)[0] == 0x03:
+        private_key = private_key.negated()
 
-    from jmcore.constants import SECP256K1_N
-
-    priv_key = coincurve.PrivateKey(privkey_bytes)
-    pub = priv_key.public_key
-    internal_pub = pub.format(compressed=True)[1:]
-    d = int.from_bytes(privkey_bytes, "big")
-    if pub.format(compressed=True)[0] == 0x03:
-        d = (SECP256K1_N - d) % SECP256K1_N
-    priv_key_even = coincurve.PrivateKey.from_int(d)
-    tweak = tagged_hash("TapTweak", internal_pub + (merkle_root or b""))
-    return priv_key_even.add(tweak).secret
+    tweak = compute_tap_tweak_hash(
+        private_key.xonly_pub, merkle_root=merkle_root if merkle_root is not None else b""
+    )
+    if tweak == bytes(32):
+        return private_key.secret_bytes
+    return CKey.add(private_key, CKey(tweak)).secret_bytes
 
 
 def address_to_scriptpubkey(address: str) -> bytes:
@@ -1374,8 +1378,8 @@ def get_address_type(address: str) -> str:
 
     # Base58
     try:
-        decoded = base58.b58decode_check(address)
-        version = decoded[0]
+        base58_decoded = base58.b58decode_check(address)
+        version = base58_decoded[0]
         if version in (0x00, 0x6F):  # P2PKH
             return "p2pkh"
         elif version in (0x05, 0xC4):  # P2SH

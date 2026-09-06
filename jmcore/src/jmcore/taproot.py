@@ -4,7 +4,7 @@ blocks, key/script-path sighash, and Schnorr signing.
 
 This module is the on-chain building block for the JoinMarket swap protocol
 (``jmswap``), but it contains no swap-specific logic: it is a general Taproot
-toolkit built on ``coincurve`` (libsecp256k1), matching the rest of ``jmcore``.
+toolkit built on ``python-bitcointx`` and libsecp256k1.
 
 References:
     - BIP340 (Schnorr signatures)
@@ -18,17 +18,23 @@ import hashlib
 import struct
 from dataclasses import dataclass, field
 
-from coincurve import PrivateKey, PublicKey, PublicKeyXOnly
+from bitcointx.core import CTransaction, CTxOut
+from bitcointx.core.key import CKey, CPubKey, XOnlyPubKey
+from bitcointx.core.script import (
+    SIGVERSION_TAPROOT,
+    SIGVERSION_TAPSCRIPT,
+    CScript,
+    SIGHASH_Type,
+    SignatureHashSchnorr,
+)
 
 from jmcore.bitcoin import (
     create_p2tr_scriptpubkey,
     encode_varint,
     scriptpubkey_to_address,
-    sha256,
     tagged_hash,
     taproot_tweak_pubkey,
 )
-from jmcore.constants import SECP256K1_N
 
 # BIP342 tapscript leaf version (the only one Bitcoin currently defines).
 LEAF_VERSION_TAPSCRIPT = 0xC0
@@ -146,7 +152,8 @@ def to_xonly(pubkey: bytes) -> bytes:
         return bytes(pubkey)
     if len(pubkey) != 33 or pubkey[0] not in (0x02, 0x03):
         raise TaprootError("expected 33-byte compressed pubkey")
-    PublicKey(bytes(pubkey))  # validate
+    if not CPubKey(bytes(pubkey)).is_fullyvalid():
+        raise TaprootError("invalid compressed pubkey")
     return bytes(pubkey[1:])
 
 
@@ -326,67 +333,62 @@ def taproot_sighash(
     ``None`` for a key-path spend. All prevout values and scriptPubKeys for the
     transaction's inputs must be supplied (Taproot commits to all of them).
     """
-    n = len(tx.inputs)
-    if input_index >= n:
+    n_inputs = len(tx.inputs)
+    if input_index < 0 or input_index >= n_inputs:
         raise TaprootError("input index out of range")
-    if len(prevout_values) != n or len(prevout_scripts) != n:
+    if len(prevout_values) != n_inputs or len(prevout_scripts) != n_inputs:
         raise TaprootError("prevouts length must match inputs length")
+    if leaf_hash is not None and (not isinstance(leaf_hash, bytes) or len(leaf_hash) != 32):
+        raise TaprootError("leaf_hash must be exactly 32 bytes")
 
-    anyonecanpay = bool(sighash_type & SIGHASH_ANYONECANPAY)
-    out_kind = sighash_type & 0x03
+    native_sighash_type = _native_sighash_type(sighash_type)
+    if (sighash_type & 0x03) == SIGHASH_SINGLE and input_index >= len(tx.outputs):
+        raise TaprootError("SIGHASH_SINGLE requires a corresponding output")
 
-    hash_prevouts = hash_amounts = hash_scripts = hash_sequences = b""
-    if not anyonecanpay:
-        hash_prevouts = sha256(b"".join(i.outpoint for i in tx.inputs))
-        hash_amounts = sha256(b"".join(v.to_bytes(8, "little") for v in prevout_values))
-        hash_scripts = sha256(b"".join(encode_varint(len(s)) + s for s in prevout_scripts))
-        hash_sequences = sha256(b"".join(struct.pack("<I", i.sequence) for i in tx.inputs))
-
-    hash_outputs = b""
-    if out_kind not in (SIGHASH_NONE, SIGHASH_SINGLE):
-        hash_outputs = sha256(
-            b"".join(
-                o.value.to_bytes(8, "little") + encode_varint(len(o.scriptpubkey)) + o.scriptpubkey
-                for o in tx.outputs
+    try:
+        native_tx = CTransaction.deserialize(tx._serialize_no_witness())
+        spent_outputs = _spent_outputs(prevout_values, prevout_scripts)
+        return bytes(
+            SignatureHashSchnorr(
+                native_tx,
+                input_index,
+                spent_outputs,
+                hashtype=native_sighash_type,
+                sigversion=SIGVERSION_TAPSCRIPT if leaf_hash is not None else SIGVERSION_TAPROOT,
+                tapleaf_hash=leaf_hash,
             )
         )
+    except TaprootError:
+        raise
+    except (TypeError, ValueError) as exc:
+        raise TaprootError(f"failed to compute Taproot sighash: {exc}") from exc
 
-    preimage = bytes([0x00])  # epoch
-    preimage += bytes([sighash_type])
-    preimage += struct.pack("<I", tx.version)
-    preimage += struct.pack("<I", tx.locktime)
-    if not anyonecanpay:
-        preimage += hash_prevouts + hash_amounts + hash_scripts + hash_sequences
-    if out_kind not in (SIGHASH_NONE, SIGHASH_SINGLE):
-        preimage += hash_outputs
 
-    spend_type = 0x02 if leaf_hash is not None else 0x00  # ext_flag*2 + annex(0)
-    preimage += bytes([spend_type])
+def _native_sighash_type(sighash_type: int) -> SIGHASH_Type | None:
+    if not isinstance(sighash_type, int) or isinstance(sighash_type, bool):
+        raise TaprootError("sighash type must be an integer")
+    if sighash_type not in (
+        SIGHASH_DEFAULT,
+        SIGHASH_ALL,
+        SIGHASH_NONE,
+        SIGHASH_SINGLE,
+        SIGHASH_ANYONECANPAY | SIGHASH_ALL,
+        SIGHASH_ANYONECANPAY | SIGHASH_NONE,
+        SIGHASH_ANYONECANPAY | SIGHASH_SINGLE,
+    ):
+        raise TaprootError(f"invalid Taproot sighash type: {sighash_type:#x}")
+    return None if sighash_type == SIGHASH_DEFAULT else SIGHASH_Type(sighash_type)
 
-    if anyonecanpay:
-        target = tx.inputs[input_index]
-        preimage += target.outpoint
-        preimage += prevout_values[input_index].to_bytes(8, "little")
-        preimage += encode_varint(len(prevout_scripts[input_index])) + prevout_scripts[input_index]
-        preimage += struct.pack("<I", target.sequence)
-    else:
-        preimage += struct.pack("<I", input_index)
 
-    if out_kind == SIGHASH_SINGLE:
-        if input_index < len(tx.outputs):
-            o = tx.outputs[input_index]
-            preimage += sha256(
-                o.value.to_bytes(8, "little") + encode_varint(len(o.scriptpubkey)) + o.scriptpubkey
-            )
-        else:
-            preimage += b"\x00" * 32
-
-    if leaf_hash is not None:
-        preimage += leaf_hash
-        preimage += bytes([0x00])  # key version
-        preimage += b"\xff\xff\xff\xff"  # codeseparator position (none)
-
-    return tagged_hash("TapSighash", preimage)
+def _spent_outputs(values: list[int], scripts: list[bytes]) -> list[CTxOut]:
+    outputs: list[CTxOut] = []
+    for index, (value, scriptpubkey) in enumerate(zip(values, scripts, strict=True)):
+        if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value < 2**63:
+            raise TaprootError(f"prevout value at index {index} is outside the signed 64-bit range")
+        if not isinstance(scriptpubkey, bytes):
+            raise TaprootError(f"prevout script at index {index} must be bytes")
+        outputs.append(CTxOut(value, CScript(scriptpubkey)))
+    return outputs
 
 
 def sign_taproot_keypath(
@@ -394,7 +396,7 @@ def sign_taproot_keypath(
     input_index: int,
     prevout_values: list[int],
     prevout_scripts: list[bytes],
-    output_privkey: bytes,
+    output_privkey: CKey | bytes,
     sighash_type: int = SIGHASH_DEFAULT,
     aux_rand: bytes = b"\x00" * 32,
 ) -> bytes:
@@ -405,7 +407,8 @@ def sign_taproot_keypath(
     passes the raw key for a key-path-only output).
     """
     sighash = taproot_sighash(tx, input_index, prevout_values, prevout_scripts, sighash_type)
-    sig = PrivateKey(output_privkey).sign_schnorr(sighash, aux_rand)
+    private_key = _coerce_private_key(output_privkey)
+    sig = private_key.sign_schnorr_no_tweak(sighash, aux=aux_rand)
     if sighash_type != SIGHASH_DEFAULT:
         sig += bytes([sighash_type])
     return sig
@@ -417,7 +420,7 @@ def sign_taproot_scriptpath(
     prevout_values: list[int],
     prevout_scripts: list[bytes],
     leaf_script: bytes,
-    privkey: bytes,
+    privkey: CKey | bytes,
     leaf_version: int = LEAF_VERSION_TAPSCRIPT,
     sighash_type: int = SIGHASH_DEFAULT,
     aux_rand: bytes = b"\x00" * 32,
@@ -427,7 +430,8 @@ def sign_taproot_scriptpath(
     sighash = taproot_sighash(
         tx, input_index, prevout_values, prevout_scripts, sighash_type, leaf_hash=lh
     )
-    sig = PrivateKey(privkey).sign_schnorr(sighash, aux_rand)
+    private_key = _coerce_private_key(privkey)
+    sig = private_key.sign_schnorr_no_tweak(sighash, aux=aux_rand)
     if sighash_type != SIGHASH_DEFAULT:
         sig += bytes([sighash_type])
     return sig
@@ -436,22 +440,29 @@ def sign_taproot_scriptpath(
 def verify_schnorr(xonly_pubkey: bytes, signature: bytes, message: bytes) -> bool:
     """Verify a 64-byte BIP340 Schnorr signature over ``message`` (a 32-byte hash)."""
     try:
-        if len(signature) not in (64, 65):
+        if len(signature) != 64:
             return False
-        return bool(PublicKeyXOnly(xonly_pubkey).verify(signature[:64], message))
+        return XOnlyPubKey(xonly_pubkey).verify_schnorr(message, signature)
     except Exception:  # noqa: BLE001 - verification must never raise
         return False
 
 
 def xonly_from_privkey(privkey: bytes) -> bytes:
     """Return the 32-byte x-only public key for a private key."""
-    return PrivateKey(privkey).public_key.format(compressed=True)[1:]
+    return bytes(CKey(privkey).xonly_pub)
 
 
 def negate_privkey_if_odd(privkey: bytes) -> bytes:
     """Return a private key whose public key has even Y (BIP340 convention)."""
-    pk = PrivateKey(privkey)
-    if pk.public_key.format(compressed=True)[0] == 0x03:
-        d = (SECP256K1_N - int.from_bytes(privkey, "big")) % SECP256K1_N
-        return d.to_bytes(32, "big")
-    return privkey
+    private_key = CKey(privkey)
+    if bytes(private_key.pub)[0] == 0x03:
+        return private_key.negated().secret_bytes
+    return private_key.secret_bytes
+
+
+def _coerce_private_key(privkey: CKey | bytes) -> CKey:
+    if isinstance(privkey, CKey):
+        return privkey
+    if isinstance(privkey, bytes):
+        return CKey(privkey)
+    raise TaprootError("private key must be a CKey or 32-byte secret")

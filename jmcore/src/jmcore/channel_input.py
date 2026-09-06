@@ -17,7 +17,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, ClassVar, Literal, TypeAlias, TypeVar, cast
 
-from coincurve import PrivateKey, PublicKey, PublicKeyXOnly
+from bitcointx.core.key import CKey, CPubKey, XOnlyPubKey
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from jmcore.bitcoin import (
@@ -76,7 +76,8 @@ def _validate_hex(value: str, byte_length: int | None, field_name: str) -> str:
 def _validate_xonly_key(value: str, field_name: str = "participant_key") -> str:
     _validate_hex(value, 32, field_name)
     try:
-        PublicKeyXOnly(bytes.fromhex(value))
+        if not XOnlyPubKey(bytes.fromhex(value)).is_fullyvalid():
+            raise ValueError
     except ValueError as exc:
         raise ValueError(f"{field_name} is not a valid BIP340 public key") from exc
     return value
@@ -88,7 +89,8 @@ def _validate_node_key(value: str, field_name: str = "node_key") -> str:
     if raw[0] not in (2, 3):
         raise ValueError(f"{field_name} must be a compressed secp256k1 public key")
     try:
-        PublicKey(raw)
+        if not CPubKey(raw).is_fullyvalid():
+            raise ValueError
     except ValueError as exc:
         raise ValueError(f"{field_name} is not a valid secp256k1 public key") from exc
     return value
@@ -1661,14 +1663,14 @@ class ChannelInputKeyPair:
         if len(secret_key) != 32:
             raise ChannelInputValidationError("channel input secret key must be 32 bytes")
         try:
-            private_key = PrivateKey(secret_key)
+            private_key = CKey.from_secret_bytes(secret_key)
         except ValueError as exc:
             raise ChannelInputValidationError(
                 "channel input secret key is outside secp256k1 range"
             ) from exc
         return cls(
             secret_key=secret_key,
-            public_key=private_key.public_key.format(compressed=True)[1:].hex(),
+            public_key=bytes(private_key.pub)[1:].hex(),
         )
 
 
@@ -1683,7 +1685,11 @@ def sign_hash(
     if len(auxiliary) != 32:
         raise ChannelInputValidationError("BIP340 auxiliary randomness must be 32 bytes")
     try:
-        return PrivateKey(secret_key).sign_schnorr(message_hash, aux_randomness=auxiliary).hex()
+        return (
+            CKey.from_secret_bytes(secret_key)
+            .sign_schnorr_no_tweak(message_hash, aux=auxiliary)
+            .hex()
+        )
     except ValueError as exc:
         raise ChannelInputValidationError("invalid BIP340 secret key") from exc
 
@@ -1693,7 +1699,9 @@ def verify_hash(public_key: str, message_hash: bytes, signature: str) -> bool:
         _validate_xonly_key(public_key)
         _validate_hex(signature, 64, "signature")
         return len(message_hash) == 32 and bool(
-            PublicKeyXOnly(bytes.fromhex(public_key)).verify(bytes.fromhex(signature), message_hash)
+            XOnlyPubKey(bytes.fromhex(public_key)).verify_schnorr(
+                message_hash, bytes.fromhex(signature)
+            )
         )
     except ValueError:
         return False

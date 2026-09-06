@@ -266,9 +266,22 @@ class TestTakerSigning:
 
             real_signer = mock_wallet.sign_input
 
-            def assert_local_signing_boundary(tx: Any, input_index: int, utxo: UTXOInfo) -> Any:
+            def assert_local_signing_boundary(
+                tx: Any,
+                input_index: int,
+                utxo: UTXOInfo,
+                *,
+                prevout_values: list[int] | None = None,
+                prevout_scripts: list[bytes] | None = None,
+            ) -> Any:
                 assert taker._session.signing_boundary_crossed is True
-                return real_signer(tx, input_index, utxo)
+                return real_signer(
+                    tx,
+                    input_index,
+                    utxo,
+                    prevout_values=prevout_values,
+                    prevout_scripts=prevout_scripts,
+                )
 
             mock_wallet.sign_input = MagicMock(side_effect=assert_local_signing_boundary)
 

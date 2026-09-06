@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from coincurve import PublicKey
+from bitcointx.core.key import CPubKey
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from jmcore.channel_input import MAX_FEE_RATE_SAT_VB
@@ -120,7 +120,8 @@ class ChannelInputConfig(BaseModel):
                     "allowed_peer_node_pubkeys must be lowercase compressed secp256k1 keys"
                 )
             try:
-                PublicKey(bytes.fromhex(public_key))
+                if not CPubKey(bytes.fromhex(public_key)).is_fullyvalid():
+                    raise ValueError
             except ValueError as exc:
                 raise ValueError(
                     "allowed_peer_node_pubkeys must contain valid secp256k1 keys"

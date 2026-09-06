@@ -384,21 +384,19 @@ class TestGeneratePoDLE:
         expected_internal_prefix: int,
         expected_tweaked_prefix: int,
     ) -> None:
-        from coincurve import PrivateKey
-
         from jmcore.bitcoin import taproot_tweak_privkey, taproot_tweak_pubkey
 
-        internal_key = PrivateKey.from_int(internal_scalar)
-        internal_pubkey = internal_key.public_key.format(compressed=True)
-        tweaked_key = taproot_tweak_privkey(internal_key.secret)
-        tweaked_pubkey = PrivateKey(tweaked_key).public_key.format(compressed=True)
+        internal_key = CKey(internal_scalar.to_bytes(32, "big"))
+        internal_pubkey = bytes(internal_key.pub)
+        tweaked_key = taproot_tweak_privkey(internal_key.secret_bytes)
+        tweaked_pubkey = bytes(CKey(tweaked_key).pub)
         _, output_key = taproot_tweak_pubkey(internal_pubkey[1:])
 
         assert internal_pubkey[0] == expected_internal_prefix
         assert tweaked_pubkey[0] == expected_tweaked_prefix
 
         commitment = generate_podle(
-            internal_key.secret,
+            internal_key.secret_bytes,
             "ab" * 32 + ":0",
             index=0,
             p2tr=True,
@@ -1200,10 +1198,13 @@ class TestVerifyPodleBinding:
     def test_unsupported_34_byte_witness_script_type_is_named(
         self, spk: bytes, family: str
     ) -> None:
-        bound, err = verify_podle_binding(self._pubkey(), spk)
+        bound, err = verify_podle_binding(self._pubkey(1), spk)
         assert not bound
         assert family in err
-        assert "34 bytes" in err
+        if family == "P2WSH":
+            assert "34 bytes" in err
+        else:
+            assert "BIP86 P2TR" in err
 
     @pytest.mark.parametrize(
         ("spk", "family"),
