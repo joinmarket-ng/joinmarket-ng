@@ -78,9 +78,22 @@ def _approved_negotiation(
     binding: str = _BINDING,
     channels: int = 1,
     duplicate_settlement_index: bool = False,
+    settlement_underpay_sat: int = 0,
     txfee: int = _TXFEE,
 ) -> tuple[MakerChannelInputNegotiation, ChannelInputProposalPayload, str]:
     base, frozen = _negotiation(channels=channels)
+    if duplicate_settlement_index:
+        # Both channels share one settlement script, so parent binding alone
+        # cannot distinguish which channel a duplicate claimed output backs.
+        frozen = (
+            frozen[0],
+            *(
+                item.model_copy(
+                    update={"settlement_script_pubkey": frozen[0].settlement_script_pubkey}
+                )
+                for item in frozen[1:]
+            ),
+        )
     negotiation = MakerChannelInputNegotiation.from_invite(
         local_actor=base.local_actor,
         coordinator_actor=base.coordinator_actor,
@@ -158,6 +171,15 @@ def _approved_negotiation(
             TxOutput.from_hex(_CHANGE_SCRIPT, _ORDINARY_INPUT_VALUE - _AMOUNT - txfee),
         )
     )
+    if settlement_underpay_sat:
+        # The parent underpays the maker's claimed settlement and diverts the
+        # difference to a coordinator output, keeping the total fee unchanged.
+        target = local_outputs[0].output_index
+        outputs[target] = TxOutput(
+            value=outputs[target].value - settlement_underpay_sat,
+            script=outputs[target].script,
+        )
+        outputs.append(TxOutput.from_hex("5120" + "aa" * 32, settlement_underpay_sat))
 
     maker_terms: list[EndpointTerms] = []
     coordinator_terms: list[EndpointTerms] = []
@@ -405,8 +427,47 @@ async def test_channel_mode_allows_zero_and_rounded_advertised_fees() -> None:
 
 @pytest.mark.asyncio
 async def test_channel_settlement_cannot_be_counted_twice_for_fee_credit() -> None:
-    negotiation, _, tx_hex = _approved_negotiation(channels=2, duplicate_settlement_index=True)
-    session = _session(cjfee=1_600)
+    # Two terms claiming one parent output would credit the maker twice for a
+    # single payment, in the fee credit and in the escrow release alike, so
+    # the proposal is rejected before anything is approved.
+    with pytest.raises(ChannelInputValidationError, match="duplicate settlement output_index"):
+        _approved_negotiation(channels=2, duplicate_settlement_index=True)
+
+
+_SETTLEMENT_UNDERPAY_SAT = 50_354
+
+
+def _negotiation_approved_without_settlement_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> MakerChannelInputNegotiation:
+    """Approve a short-paid parent as a build without the binding would have."""
+
+    with monkeypatch.context() as context:
+        context.setattr(
+            "maker.channel_input.validate_settlement_outputs_against_parent",
+            lambda *_args: None,
+        )
+        negotiation, _, _ = _approved_negotiation(settlement_underpay_sat=_SETTLEMENT_UNDERPAY_SAT)
+    return negotiation
+
+
+@pytest.mark.asyncio
+async def test_signing_gate_rejects_settlement_that_the_parent_underpays(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fee-credit gate must reject a short-paid settlement on its own.
+
+    Both earlier layers (proposal acceptance and snapshot restore) are
+    disabled here, simulating durable state approved by a build without the
+    settlement binding that reaches the signing path unchecked.
+    """
+
+    monkeypatch.setattr(
+        "maker.channel_input.validate_settlement_outputs_against_parent",
+        lambda *_args: None,
+    )
+    negotiation, _, tx_hex = _approved_negotiation(settlement_underpay_sat=_SETTLEMENT_UNDERPAY_SAT)
+    session = _session()
 
     success, response = await session.handle_tx(
         tx_hex,
@@ -415,8 +476,21 @@ async def test_channel_settlement_cannot_be_counted_twice_for_fee_credit() -> No
     )
 
     assert not success
-    assert "counted more than once" in response["error"]
+    assert "settlement" in response["error"]
+    session._sign_transaction.assert_not_awaited()
     session.backend.get_block_height.assert_not_awaited()
+
+
+def test_restore_rejects_snapshot_approved_without_settlement_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A durable snapshot from a pre-binding build must fail closed on restore."""
+
+    negotiation = _negotiation_approved_without_settlement_binding(monkeypatch)
+    snapshot = negotiation.snapshot()
+
+    with pytest.raises(ChannelInputValidationError, match="settlement output"):
+        MakerChannelInputNegotiation.from_snapshot(snapshot)
 
 
 class _BindingFreezeBackend:

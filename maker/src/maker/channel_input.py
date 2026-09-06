@@ -54,6 +54,7 @@ from jmcore.channel_input import (
     validate_prepared_for_transcript,
     validate_proposal_for_hellos,
     validate_recipient_approval,
+    validate_settlement_outputs_against_parent,
     validate_sign_for_transcript,
     validate_status_for_transcript,
     validate_status_request_for_transcript,
@@ -186,6 +187,9 @@ class MakerChannelInputChannelState(ChannelInputModel):
     finalized: ChannelInputFinalizedPayload | None = None
     status_request: ChannelInputStatusRequestPayload | None = None
     status_response: ChannelInputStatusPayload | None = None
+    # Set once the maker unilaterally force-closed this frozen channel after
+    # the transcript recovery height. Absent in snapshots from older builds.
+    force_close_commitment_txid: str | None = None
 
     @field_validator("parent_txid", "attempt_id")
     @classmethod
@@ -197,6 +201,13 @@ class MakerChannelInputChannelState(ChannelInputModel):
         except ValueError as exc:
             raise ValueError("channel state value must be 32-byte lowercase hexadecimal") from exc
         return value
+
+    @field_validator("force_close_commitment_txid")
+    @classmethod
+    def validate_optional_hex32(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return cls.validate_hex32(value)
 
     @model_validator(mode="after")
     def validate_shape(self) -> MakerChannelInputChannelState:
@@ -216,6 +227,8 @@ class MakerChannelInputChannelState(ChannelInputModel):
             raise ValueError("channel state finalize request requires a partial")
         if self.finalized is not None and self.finalize_request is None:
             raise ValueError("channel state finalized evidence requires a finalize request")
+        if self.force_close_commitment_txid is not None and self.partial is None:
+            raise ValueError("channel state force close requires a released partial signature")
         if (self.status_request is None) != (self.status_response is None):
             raise ValueError("channel status request and response must be paired")
         if self.status_request is not None and self.status_response is not None:
@@ -784,6 +797,10 @@ class MakerChannelInputNegotiation:
         )
         if proposal.recipient_key != self.participant_key:
             raise ChannelInputValidationError("proposal is assigned to a different participant")
+        # The coordinator builds both the terms and the parent, so the maker
+        # must bind its own claimed settlement outputs to the actual parent
+        # bytes. Terms alone only conserve the frozen claim arithmetic.
+        validate_settlement_outputs_against_parent(proposal.transcript, proposal.recipient_terms)
         _record_new(self._ledger, _slot("proposal"), proposal)
         terms_hashes = tuple(
             sorted(endpoint_terms_hash(terms).hex() for terms in proposal.recipient_terms)
@@ -1124,6 +1141,20 @@ class MakerChannelInputNegotiation:
         self._replace_channel_state(state.model_copy(update={"finalized": signed}))
         self._recompute_channel_stage()
         return signed
+
+    def record_force_close(self, funding_outpoint: Outpoint, commitment_txid: str) -> None:
+        """Persist one unilateral recovery force-close for a signed channel."""
+
+        state = self._require_channel_state(funding_outpoint)
+        if state.partial is None:
+            raise ChannelInputValidationError("force close requires a released partial signature")
+        if state.force_close_commitment_txid is not None:
+            if state.force_close_commitment_txid == commitment_txid:
+                return
+            raise ChannelInputValidationError("force close conflicts with durable channel state")
+        self._replace_channel_state(
+            state.model_copy(update={"force_close_commitment_txid": commitment_txid})
+        )
 
     def record_status(
         self,
@@ -1528,6 +1559,11 @@ class MakerChannelInputNegotiation:
                 raise ChannelInputValidationError(
                     "restored proposal belongs to another participant"
                 )
+            # A snapshot approved by a build without the settlement binding must
+            # fail closed on restore rather than reach the signing gates.
+            validate_settlement_outputs_against_parent(
+                self.proposal.transcript, self.proposal.recipient_terms
+            )
             assert self.local_approval is not None
             _validate_maker_proposal_policy(
                 self.config, self.proposal, _require_accepted_height(self.accepted_height)

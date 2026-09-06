@@ -19,7 +19,10 @@ from enum import StrEnum
 from typing import Any
 
 from jmcore.bitcoin import address_to_scriptpubkey_for_network, estimate_vsize, parse_transaction
-from jmcore.channel_input import ChannelInputValidationError
+from jmcore.channel_input import (
+    ChannelInputValidationError,
+    validate_settlement_outputs_against_parent,
+)
 from jmcore.encryption import CryptoSession
 from jmcore.fee_policy import (
     estimate_p2wpkh_vsize,
@@ -830,6 +833,15 @@ class CoinJoinSession:
         transcript = negotiation.proposal.transcript
         if tx_hex != transcript.unsigned_parent_tx:
             raise ValueError("ordinary transaction differs from channel-input transcript")
+        # Defense in depth: accept_proposal already bound these terms to the
+        # parent bytes, but this is the last gate before an irreversible
+        # signature, and the approved settlement is what backs the fee credit.
+        try:
+            validate_settlement_outputs_against_parent(
+                transcript, negotiation.proposal.recipient_terms
+            )
+        except ChannelInputValidationError as exc:
+            raise ValueError(f"channel settlement does not match the parent transaction: {exc}")
         transaction = parse_transaction(tx_hex)
         channel_input_indices = {descriptor.input_index for descriptor in transcript.channels}
         input_indices = {

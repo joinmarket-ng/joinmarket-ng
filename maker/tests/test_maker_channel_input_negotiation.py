@@ -1297,6 +1297,121 @@ def test_negotiation_multichannel_replay_and_json_restore() -> None:
     assert restored.accept_prepare("coordinator", prepare) == prepare
 
 
+def _shortpaid_proposal(
+    negotiation: MakerChannelInputNegotiation,
+    *,
+    diverted_sat: int = 0,
+    steal_script: str | None = None,
+    drop_settlement_output: bool = False,
+) -> ChannelInputProposalPayload:
+    """Re-sign an honest proposal over a parent that underpays the maker.
+
+    The endpoint terms stay exactly as the maker would approve them, mirroring
+    the real attack: only the parent bytes diverge from the approved terms.
+    """
+
+    proposal, maker_terms = _proposal(negotiation)
+    transcript = proposal.transcript
+    parsed = parse_transaction_bytes(bytes.fromhex(transcript.unsigned_parent_tx))
+    settlement_index = maker_terms[0].settlement_outputs[0].output_index
+    outputs = list(parsed.outputs)
+    if drop_settlement_output:
+        # The claimed index no longer exists in a shorter parent. The dropped
+        # value moves to the coordinator's own output so the declared fee, and
+        # therefore the maker's fee-rate policy check, is unchanged.
+        dropped = outputs[settlement_index]
+        keeper = 1 if settlement_index == 0 else 0
+        outputs[keeper] = TxOutput(
+            value=outputs[keeper].value + dropped.value,
+            script=outputs[keeper].script,
+        )
+        outputs.pop(settlement_index)
+    elif steal_script is not None:
+        outputs[settlement_index] = TxOutput(
+            value=outputs[settlement_index].value,
+            script=bytes.fromhex(steal_script),
+        )
+    else:
+        outputs[settlement_index] = TxOutput(
+            value=outputs[settlement_index].value - diverted_sat,
+            script=outputs[settlement_index].script,
+        )
+        outputs.append(TxOutput(value=diverted_sat, script=bytes.fromhex("5120" + "aa" * 32)))
+    unsigned = serialize_transaction(
+        parsed.version, list(parsed.inputs), outputs, parsed.locktime
+    ).hex()
+    total_fee = sum(prevout.value_sat for prevout in transcript.input_prevouts) - sum(
+        output.value for output in outputs
+    )
+    vsize = estimate_vsize(["p2tr"] * len(parsed.inputs), ["p2tr"] * len(outputs))
+    # Keep every declared aggregate consistent with the malicious bytes so only
+    # the settlement binding can reject this proposal.
+    updated_transcript = transcript.model_copy(
+        update={
+            "unsigned_parent_tx": unsigned,
+            "total_fee_sat": total_fee,
+            "fee_rate_sat_vb": (total_fee + vsize - 1) // vsize,
+        }
+    )
+    return cast(
+        ChannelInputProposalPayload,
+        sign_payload(
+            ChannelInputProposalPayload(
+                session_id=SESSION_ID,
+                attempt=1,
+                signer_key=transcript.coordinator_key,
+                recipient_key=negotiation.participant_key,
+                transcript=updated_transcript,
+                transcript_hash=transcript_hash(updated_transcript).hex(),
+                recipient_terms=maker_terms,
+            ),
+            COORDINATOR_SECRET,
+            aux_randomness=b"\x02" * 32,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "description"),
+    [
+        # The coordinator short-pays the settlement and keeps the difference.
+        ({"diverted_sat": 48_454}, "short-paid settlement value"),
+        # The parent pays the claimed amount to a coordinator script instead.
+        ({"steal_script": "5120" + "aa" * 32}, "substituted settlement script"),
+        # The claimed settlement index is absent from the parent.
+        ({"drop_settlement_output": True}, "out-of-range settlement index"),
+    ],
+)
+def test_rejects_settlement_terms_that_differ_from_the_parent(
+    kwargs: dict[str, object], description: str
+) -> None:
+    negotiation, frozen = _negotiation(channels=1)
+    _plan_freeze(negotiation, frozen)
+    negotiation.install_frozen_inputs(frozen)
+    proposal = _shortpaid_proposal(negotiation, **kwargs)  # type: ignore[arg-type]
+
+    with pytest.raises(ChannelInputValidationError, match="settlement output"):
+        negotiation.accept_proposal("coordinator", proposal, current_time=1_000, current_height=100)
+
+    # A rejected proposal must leave nothing approved behind.
+    assert negotiation.proposal is None
+    assert negotiation.local_approval is None
+
+
+def test_accepts_settlement_terms_that_match_the_parent_exactly() -> None:
+    negotiation, frozen = _negotiation(channels=1)
+    _plan_freeze(negotiation, frozen)
+    negotiation.install_frozen_inputs(frozen)
+    proposal, maker_terms = _proposal(negotiation)
+
+    approval = negotiation.accept_proposal(
+        "coordinator", proposal, current_time=1_000, current_height=100
+    )
+
+    assert negotiation.proposal == proposal
+    assert set(approval.terms_hashes) == {endpoint_terms_hash(terms).hex() for terms in maker_terms}
+
+
 def test_rejects_wrong_actor_and_conflicting_proposal() -> None:
     negotiation, frozen = _negotiation(channels=1)
     _plan_freeze(negotiation, frozen)

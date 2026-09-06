@@ -910,6 +910,41 @@ def validate_transcript_against_transaction(
         raise
 
 
+def validate_settlement_outputs_against_parent(
+    transcript: ChannelInputTranscript, terms: Sequence[EndpointTerms]
+) -> None:
+    """Require every claimed settlement output to exist exactly once in the parent.
+
+    Endpoint terms only conserve their own frozen claim, fee share, and
+    adjustment. Without this check a coordinator can approve terms that claim a
+    settlement the parent transaction never pays, or back two terms with one
+    output, so each recipient must bind its own terms to the actual parent
+    bytes before authorizing any signature.
+    """
+
+    transaction = _parse_canonical_unsigned_transaction(transcript.unsigned_parent_tx)
+    claimed_indices: set[int] = set()
+    for item in terms:
+        for settlement_output in item.settlement_outputs:
+            if settlement_output.output_index in claimed_indices:
+                raise ChannelInputValidationError(
+                    "duplicate settlement output_index across endpoint terms"
+                )
+            claimed_indices.add(settlement_output.output_index)
+            if settlement_output.output_index >= len(transaction.outputs):
+                raise ChannelInputValidationError(
+                    "settlement output_index is outside parent transaction"
+                )
+            parent_output = transaction.outputs[settlement_output.output_index]
+            if (
+                settlement_output.amount_sat != parent_output.value
+                or settlement_output.script_pubkey != parent_output.script.hex()
+            ):
+                raise ChannelInputValidationError(
+                    "settlement output does not match parent transaction output"
+                )
+
+
 def validate_revealed_endpoint_pair(
     transcript: ChannelInputTranscript,
     descriptor: ChannelDescriptor,
@@ -956,26 +991,7 @@ def validate_revealed_endpoint_pair(
         raise ChannelInputValidationError("endpoint frozen claims are not mirrored")
     if first.claim_adjustment_sat + second.claim_adjustment_sat != 0:
         raise ChannelInputValidationError("endpoint claim adjustments must sum to zero")
-    output_indices = [
-        output.output_index for terms in (first, second) for output in terms.settlement_outputs
-    ]
-    if len(set(output_indices)) != len(output_indices):
-        raise ChannelInputValidationError("duplicate settlement output_index across endpoint terms")
-    transaction = _parse_canonical_unsigned_transaction(transcript.unsigned_parent_tx)
-    for terms in (first, second):
-        for settlement_output in terms.settlement_outputs:
-            if settlement_output.output_index >= len(transaction.outputs):
-                raise ChannelInputValidationError(
-                    "settlement output_index is outside parent transaction"
-                )
-            parent_output = transaction.outputs[settlement_output.output_index]
-            if (
-                settlement_output.amount_sat != parent_output.value
-                or settlement_output.script_pubkey != parent_output.script.hex()
-            ):
-                raise ChannelInputValidationError(
-                    "settlement output does not match parent transaction output"
-                )
+    validate_settlement_outputs_against_parent(transcript, (first, second))
 
 
 def validate_hello_for_invite(
