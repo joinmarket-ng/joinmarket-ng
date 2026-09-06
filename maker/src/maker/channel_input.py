@@ -7,7 +7,7 @@ from collections.abc import Mapping, Sequence
 from enum import StrEnum
 from typing import Literal, cast
 
-from coincurve import PublicKey
+from bitcointx.core.key import CPubKey
 from jmcore.bitcoin import get_txid, parse_transaction_bytes
 from jmcore.channel_input import (
     MAX_CHANNELS,
@@ -252,6 +252,7 @@ class MakerChannelInputSnapshot(ChannelInputModel):
     coordinator_actor: str = Field(min_length=1)
     local_node_key: str
     participant_secret_key_hex: str = Field(repr=False)
+    ordinary_session_binding: str | None = None
     stage: MakerChannelInputStage
     invite: ChannelInputInvitePayload
     freeze_intents: tuple[MakerChannelInputFreezeIntent, ...] = ()
@@ -281,6 +282,11 @@ class MakerChannelInputSnapshot(ChannelInputModel):
                 "participant_secret_key_hex must be 32-byte lowercase hexadecimal"
             ) from exc
         return value
+
+    @field_validator("ordinary_session_binding")
+    @classmethod
+    def validate_ordinary_session_binding(cls, value: str | None) -> str | None:
+        return _validate_ordinary_session_binding(value)
 
     def _validate_cancellation_shape(self, cancellation_stage: bool, rank: int) -> None:
         if not cancellation_stage:
@@ -480,6 +486,7 @@ class MakerChannelInputNegotiation:
         invite: ChannelInputInvitePayload,
         registry: ChannelInputActorRegistry,
         ledger: ChannelInputReplayLedger,
+        ordinary_session_binding: str | None = None,
         stage: MakerChannelInputStage = MakerChannelInputStage.INVITED,
         freeze_intents: tuple[MakerChannelInputFreezeIntent, ...] = (),
         frozen_inputs: tuple[MakerFrozenChannelInput, ...] = (),
@@ -503,6 +510,7 @@ class MakerChannelInputNegotiation:
         self.invite = invite
         self._registry = registry
         self._ledger = ledger
+        self.ordinary_session_binding = _validate_ordinary_session_binding(ordinary_session_binding)
         self.stage = stage
         self.freeze_intents = freeze_intents
         self.frozen_inputs = frozen_inputs
@@ -528,11 +536,13 @@ class MakerChannelInputNegotiation:
         network: Network,
         local_node_key: str,
         key_pair: ChannelInputKeyPair | None = None,
+        ordinary_session_binding: str | None = None,
     ) -> MakerChannelInputNegotiation:
         """Bind a signed invitation before the caller freezes any local channel."""
 
         if not config.enabled:
             raise ChannelInputValidationError("channel input is disabled")
+        ordinary_session_binding = _validate_ordinary_session_binding(ordinary_session_binding)
         _revalidate_payload(invite)
         if invite.network != network:
             raise ChannelInputValidationError("invite network differs from maker network")
@@ -564,6 +574,7 @@ class MakerChannelInputNegotiation:
             invite=invite,
             registry=registry,
             ledger=ledger,
+            ordinary_session_binding=ordinary_session_binding,
         )
 
     @property
@@ -574,6 +585,12 @@ class MakerChannelInputNegotiation:
         """Authenticate a recovery init against the durable coordinator binding."""
 
         self._require_coordinator(coordinator_actor, payload)
+
+    def require_ordinary_session_binding(self, binding: str | None) -> None:
+        """Reject an ordinary-session binding that differs from durable admission."""
+
+        if binding is not None and binding != self.ordinary_session_binding:
+            raise ChannelInputValidationError("ordinary session binding differs from admission")
 
     def sign_recovery_accept(
         self, payload: ChannelInputRecoveryAcceptPayload
@@ -594,6 +611,7 @@ class MakerChannelInputNegotiation:
             coordinator_actor=self.coordinator_actor,
             local_node_key=self.local_node_key,
             participant_secret_key_hex=self._key_pair.secret_key.hex(),
+            ordinary_session_binding=self.ordinary_session_binding,
             stage=self.stage,
             invite=self.invite,
             freeze_intents=self.freeze_intents,
@@ -637,6 +655,7 @@ class MakerChannelInputNegotiation:
             invite=snapshot.invite,
             registry=registry,
             ledger=ledger,
+            ordinary_session_binding=snapshot.ordinary_session_binding,
             stage=snapshot.stage,
             freeze_intents=snapshot.freeze_intents,
             frozen_inputs=snapshot.frozen_inputs,
@@ -1792,6 +1811,22 @@ def _require_accepted_height(accepted_height: int | None) -> int:
     return accepted_height
 
 
+def _validate_ordinary_session_binding(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or len(value) != 64 or value.lower() != value:
+        raise ChannelInputValidationError(
+            "ordinary session binding must be 32-byte lowercase hexadecimal"
+        )
+    try:
+        bytes.fromhex(value)
+    except ValueError as exc:
+        raise ChannelInputValidationError(
+            "ordinary session binding must be 32-byte lowercase hexadecimal"
+        ) from exc
+    return value
+
+
 def _validate_maker_proposal_policy(
     config: ChannelInputConfig, proposal: ChannelInputProposalPayload, current_height: int
 ) -> None:
@@ -2139,7 +2174,8 @@ def _validate_node_key(value: str, field_name: str) -> None:
         raw = bytes.fromhex(value)
         if raw[0] not in (2, 3):
             raise ValueError
-        PublicKey(raw)
+        if not CPubKey(raw).is_fullyvalid():
+            raise ValueError
     except ValueError as exc:
         raise ChannelInputValidationError(
             f"{field_name} must be a compressed secp256k1 public key"

@@ -46,6 +46,8 @@ def _session(taker_nick: str, crypto: WireCrypto) -> MakerSession:
         validate_channel=lambda _source: True,
         crypto=crypto,
         mixdepth=2,
+        commitment=b"\x01" * 32,
+        input_lock_owner="test-owner",
     )
     return MakerSession(inner)  # type: ignore[arg-type]
 
@@ -106,6 +108,7 @@ async def test_channel_input_directory_response_uses_selected_directory(
     crypto = WireCrypto()
     session = _session(taker.nick, crypto)
     payload = SimpleNamespace(session_id="aa" * 32, attempt=1)
+    session.channel_input_key = (payload.session_id, payload.attempt)
     response = SimpleNamespace()
     registry = SimpleNamespace(handle_payload=AsyncMock(return_value=(response,)))
     selected = SimpleNamespace(send_private_message=AsyncMock())
@@ -137,6 +140,7 @@ async def test_channel_input_direct_response_uses_request_socket(
     crypto = WireCrypto()
     session = _session(taker.nick, crypto)
     payload = SimpleNamespace(session_id="aa" * 32, attempt=1)
+    session.channel_input_key = (payload.session_id, payload.attempt)
     registry = SimpleNamespace(handle_payload=AsyncMock(return_value=(SimpleNamespace(),)))
     wallet = MagicMock(mixdepth_count=5, network="regtest")
     bot = _bot(maker, wallet, registry, directories={})
@@ -273,6 +277,7 @@ async def test_channel_input_settlement_allocator_uses_persisted_p2tr_address(
     crypto = WireCrypto()
     session = _session(taker.nick, crypto)
     payload = SimpleNamespace(session_id="aa" * 32, attempt=7)
+    session.channel_input_key = (payload.session_id, payload.attempt)
     candidate = SimpleNamespace(funding_outpoint=SimpleNamespace(txid="bb" * 32, vout=3))
     address = scriptpubkey_to_address(b"\x51\x20" + b"\x01" * 32, "regtest")
     wallet = MagicMock(mixdepth_count=5, network="regtest")
@@ -309,6 +314,7 @@ async def test_channel_input_settlement_allocator_rejects_non_p2tr_before_respon
     crypto = WireCrypto()
     session = _session(taker.nick, crypto)
     payload = SimpleNamespace(session_id="aa" * 32, attempt=7)
+    session.channel_input_key = (payload.session_id, payload.attempt)
     candidate = SimpleNamespace(funding_outpoint=SimpleNamespace(txid="bb" * 32, vout=3))
     non_p2tr = scriptpubkey_to_address(b"\x00\x14" + b"\x01" * 20, "regtest")
     wallet = MagicMock(mixdepth_count=5, network="regtest")
@@ -351,6 +357,7 @@ async def test_directory_router_passes_channel_input_source() -> None:
         "taker",
         "channel_input ciphertext pubkey signature",
         source="dir:selected",
+        generation_id=0,
     )
 
 
@@ -390,4 +397,5 @@ async def test_direct_router_passes_ingress_socket_to_channel_input() -> None:
         f"channel_input {signed}",
         source="direct",
         direct_connection=connection,
+        generation_id=0,
     )

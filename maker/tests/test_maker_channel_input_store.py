@@ -7,11 +7,11 @@ from pathlib import Path
 from typing import cast
 
 import pytest
-from coincurve import PrivateKey
+from bitcointx.core.key import CKey
 from jmcore.channel_input import ChannelInputInvitePayload, ChannelInputKeyPair, sign_payload
 from jmcore.channel_input_config import ChannelInputConfig
 from jmcore.secure_files import atomic_write_private
-from test_channel_input_negotiation import _cancel, _proposal_approved
+from test_maker_channel_input_negotiation import _cancel, _proposal_approved
 
 import maker.channel_input_store as channel_input_store
 from maker.channel_input import MakerChannelInputNegotiation, MakerChannelInputSnapshot
@@ -28,7 +28,7 @@ _COORDINATOR_SECRET = (1).to_bytes(32, "big")
 
 
 def _node(index: int) -> str:
-    return PrivateKey(index.to_bytes(32, "big")).public_key.format(compressed=True).hex()
+    return bytes(CKey.from_secret_bytes(index.to_bytes(32, "big")).pub).hex()
 
 
 def _snapshot(

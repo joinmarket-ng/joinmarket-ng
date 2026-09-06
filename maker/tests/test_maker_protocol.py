@@ -1579,13 +1579,26 @@ async def test_signing_failure_crosses_lock_retention_boundary():
     assert session.state == CoinJoinState.SIG_SENT
 
 
-def _fee_policy_tx(output_value: int) -> str:
+def _fee_policy_tx(
+    output_values: list[int] | int,
+    *,
+    input_count: int = 2,
+    output_script: str = "0014" + "11" * 20,
+) -> str:
     from jmcore.bitcoin import TxInput, TxOutput, serialize_transaction
 
+    if isinstance(output_values, int):
+        # Preserve the scalar fixture's outpoints used by signing-refusal tests.
+        inputs = [TxInput.from_hex("aa" * 32, 0), TxInput.from_hex("bb" * 32, 1)]
+        output_values = [output_values]
+    else:
+        inputs = [TxInput.from_hex(f"{index + 1:064x}", index) for index in range(input_count)]
     return serialize_transaction(
         version=2,
-        inputs=[TxInput.from_hex("aa" * 32, 0), TxInput.from_hex("bb" * 32, 1)],
-        outputs=[TxOutput(value=output_value, script=bytes.fromhex("0014" + "11" * 20))],
+        inputs=inputs,
+        outputs=[
+            TxOutput(value=value, script=bytes.fromhex(output_script)) for value in output_values
+        ],
         locktime=0,
     ).hex()
 
@@ -1601,7 +1614,7 @@ async def test_maker_minimum_fee_policy_rejects_low_fee_and_missing_prevout():
     backend = MagicMock()
     backend.requires_neutrino_metadata.return_value = False
     backend.get_utxo = AsyncMock(
-        return_value=UTXO("bb" * 32, 1, 10_000, "bcrt1qforeign", 1, "0014" + "22" * 20)
+        return_value=UTXO(f"{2:064x}", 1, 10_000, "bcrt1qforeign", 1, "0014" + "22" * 20)
     )
     ours = MagicMock(value=10_000)
     session = CoinJoinSession(
@@ -1611,21 +1624,21 @@ async def test_maker_minimum_fee_policy_rejects_low_fee_and_missing_prevout():
         backend=backend,
         minimum_fee_rate_sat_vb=2.0,
     )
-    session.our_utxos = {("aa" * 32, 0): ours}
+    session.our_utxos = {(f"{1:064x}", 0): ours}
 
-    error = await session._verify_minimum_miner_fee(_fee_policy_tx(19_800), None)
+    error = await session._verify_minimum_miner_fee(_fee_policy_tx([19_800]), None)
     assert "below required" in (error or "")
-    assert await session._verify_minimum_miner_fee(_fee_policy_tx(19_000), None) is None
+    assert await session._verify_minimum_miner_fee(_fee_policy_tx([19_000]), None) is None
 
     backend.get_utxo.return_value = None
     with patch("maker.coinjoin.logger") as mock_logger:
         assert "Could not look up all foreign prevouts" in (
-            await session._verify_minimum_miner_fee(_fee_policy_tx(19_000), None)
+            await session._verify_minimum_miner_fee(_fee_policy_tx([19_000]), None)
         )
 
     sensitive_warning = mock_logger.bind.return_value.warning
     assert "spent or absent" in sensitive_warning.call_args.args[0]
-    assert f"{'bb' * 32}:1" in sensitive_warning.call_args.args[1]
+    assert f"{2:064x}:1" in sensitive_warning.call_args.args[1]
 
 
 @pytest.mark.asyncio
@@ -1748,6 +1761,104 @@ async def test_maker_minimum_fee_policy_bounds_foreign_prevout_lookup_concurrenc
     assert await session._verify_minimum_miner_fee(tx_hex, None) is None
     assert peak_lookups == MINER_FEE_PREVOUT_LOOKUP_BATCH_SIZE
     assert backend.get_utxo.await_count == foreign_count
+
+
+def _tr0_fee_policy_session(input_count: int, foreign_scriptpubkeys: list[str]):
+    from unittest.mock import AsyncMock, MagicMock
+
+    from jmcore.models import Offer, OfferType
+    from jmwallet.backends.base import UTXO
+
+    from maker.coinjoin import CoinJoinSession
+
+    backend = MagicMock()
+    backend.requires_neutrino_metadata.return_value = False
+    backend.get_utxo = AsyncMock(
+        side_effect=[
+            UTXO(
+                f"{index + 1:064x}",
+                index,
+                100_000,
+                "bcrt1pforeign",
+                1,
+                scriptpubkey,
+            )
+            for index, scriptpubkey in enumerate(foreign_scriptpubkeys, start=1)
+        ]
+    )
+    wallet = MagicMock()
+    wallet.address_type = "p2tr"
+    offer = Offer(
+        counterparty="J5FeePolicyTr0",
+        ordertype=OfferType.TR0_ABSOLUTE,
+        oid=0,
+        minsize=10_000,
+        maxsize=100_000_000,
+        txfee=1_000,
+        cjfee=0,
+    )
+    session = CoinJoinSession(
+        taker_nick="J5FeePolicyTr0",
+        offer=offer,
+        wallet=wallet,
+        backend=backend,
+        minimum_fee_rate_sat_vb=2.0,
+    )
+    session.our_utxos = {
+        (f"{1:064x}", 0): MagicMock(value=100_000, scriptpubkey="5120" + "01" * 32)
+    }
+    assert input_count == len(foreign_scriptpubkeys) + 1
+    return session
+
+
+@pytest.mark.asyncio
+async def test_maker_tr0_minimum_fee_policy_accepts_input_heavy_p2tr_boundary():
+    from jmcore.bitcoin import estimate_vsize
+    from jmcore.fee_policy import estimate_p2wpkh_vsize
+
+    input_count = 10
+    output_count = 1
+    vsize = estimate_vsize(["p2tr"] * input_count, ["p2tr"] * output_count)
+    fee = 2 * vsize
+    assert fee < 2 * estimate_p2wpkh_vsize(input_count, output_count)
+
+    session = _tr0_fee_policy_session(input_count, ["5120" + "02" * 32] * (input_count - 1))
+    tx_hex = _fee_policy_tx(
+        [input_count * 100_000 - fee], input_count=input_count, output_script="5120" + "03" * 32
+    )
+
+    assert await session._verify_minimum_miner_fee(tx_hex, None) is None
+
+
+@pytest.mark.asyncio
+async def test_maker_tr0_minimum_fee_policy_rejects_output_heavy_p2tr_boundary():
+    from jmcore.bitcoin import estimate_vsize
+    from jmcore.fee_policy import estimate_p2wpkh_vsize
+
+    input_count = 1
+    output_count = 10
+    vsize = estimate_vsize(["p2tr"] * input_count, ["p2tr"] * output_count)
+    fee = 2 * vsize - 1
+    assert fee >= 2 * estimate_p2wpkh_vsize(input_count, output_count)
+
+    session = _tr0_fee_policy_session(input_count, [])
+    tx_hex = _fee_policy_tx(
+        [1] * (output_count - 1) + [input_count * 100_000 - fee - output_count + 1],
+        input_count=input_count,
+        output_script="5120" + "03" * 32,
+    )
+
+    error = await session._verify_minimum_miner_fee(tx_hex, None)
+    assert "below required" in (error or "")
+
+
+@pytest.mark.asyncio
+async def test_maker_tr0_minimum_fee_policy_rejects_missing_prevout_script():
+    session = _tr0_fee_policy_session(2, [""])
+    tx_hex = _fee_policy_tx([199_000], output_script="5120" + "03" * 32)
+
+    error = await session._verify_minimum_miner_fee(tx_hex, None)
+    assert "foreign prevout scripts" in (error or "")
 
 
 @pytest.mark.asyncio

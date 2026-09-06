@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from threading import RLock
 
+from bitcointx.core.key import CKey
 from jmcore.channel_input import MAX_ATTEMPT
 from jmcore.secure_files import atomic_write_private, ensure_private_directory, read_private_file
 
@@ -119,9 +120,7 @@ class MakerChannelInputStore:
                 if path.exists() or path.is_symlink():
                     return _read_nick_secret(path)
                 secret = secrets.token_bytes(32)
-                from coincurve import PrivateKey
-
-                PrivateKey(secret)
+                CKey.from_secret_bytes(secret)
                 atomic_write_private(path, secret.hex().encode("ascii"))
                 _fsync_private_directory(self.directory)
                 return secret
@@ -413,9 +412,7 @@ def _read_nick_secret(path: Path) -> bytes:
         if len(encoded) != 64 or encoded.lower() != encoded:
             raise MakerChannelInputStoreError("participant identity is invalid")
         secret = bytes.fromhex(encoded.decode("ascii"))
-        from coincurve import PrivateKey
-
-        PrivateKey(secret)
+        CKey.from_secret_bytes(secret)
         return secret
     except MakerChannelInputStoreError:
         raise

@@ -194,6 +194,7 @@ class MakerChannelInputRegistry:
         settlement_script_for: Callable[[ChannelInputCandidate], str],
         current_time: int,
         current_height: int,
+        ordinary_session_binding: str | None = None,
     ) -> tuple[ChannelInputPayload, ...]:
         """Apply one authenticated inbound payload and return durable local responses."""
 
@@ -206,6 +207,7 @@ class MakerChannelInputRegistry:
                 backend=backend,
                 candidates=candidates,
                 settlement_script_for=settlement_script_for,
+                ordinary_session_binding=ordinary_session_binding,
             )
         if isinstance(payload, ChannelInputCancelPayload):
             return await self._handle_cancel(
@@ -214,6 +216,7 @@ class MakerChannelInputRegistry:
                 local_actor=local_actor,
                 local_node_key=local_node_key,
                 backend=backend,
+                ordinary_session_binding=ordinary_session_binding,
             )
         if not isinstance(
             payload,
@@ -236,6 +239,7 @@ class MakerChannelInputRegistry:
             raise MakerChannelInputRuntimeError("unknown channel-input session attempt") from exc
         async with lock:
             self._require_local_identity(negotiation, local_actor, local_node_key)
+            negotiation.require_ordinary_session_binding(ordinary_session_binding)
             if negotiation.stage in {
                 MakerChannelInputStage.CANCEL_INTENDED,
                 MakerChannelInputStage.CANCELED,
@@ -324,6 +328,7 @@ class MakerChannelInputRegistry:
         local_actor: str,
         local_node_key: str,
         backend: MakerChannelInputBackend,
+        ordinary_session_binding: str | None,
     ) -> tuple[ChannelInputPayload, ...]:
         """Serialize admission with a cancellation before touching escrow state."""
 
@@ -338,6 +343,7 @@ class MakerChannelInputRegistry:
                 ) from exc
             async with lock:
                 self._require_local_identity(negotiation, local_actor, local_node_key)
+                negotiation.require_ordinary_session_binding(ordinary_session_binding)
                 if negotiation.stage is MakerChannelInputStage.CANCELED:
                     ack = negotiation.accept_cancel(coordinator_actor, cancel)
                     assert ack is not None
@@ -360,6 +366,7 @@ class MakerChannelInputRegistry:
         backend: MakerChannelInputBackend,
         candidates: Sequence[ChannelInputCandidate],
         settlement_script_for: Callable[[ChannelInputCandidate], str],
+        ordinary_session_binding: str | None,
     ) -> tuple[ChannelInputPayload, ...]:
         key = (invite.session_id, invite.attempt)
         async with self._admission_lock:
@@ -371,6 +378,7 @@ class MakerChannelInputRegistry:
                     coordinator_actor=coordinator_actor,
                     local_actor=local_actor,
                     local_node_key=local_node_key,
+                    ordinary_session_binding=ordinary_session_binding,
                 )
                 async with self._locks[key]:
                     if negotiation.stage is MakerChannelInputStage.CANCELED:
@@ -417,6 +425,7 @@ class MakerChannelInputRegistry:
                 config=self._config,
                 network=self._network,
                 local_node_key=local_node_key,
+                ordinary_session_binding=ordinary_session_binding,
             )
             settlement_scripts = {
                 f"{candidate.funding_outpoint.txid}:{candidate.funding_outpoint.vout}": (
@@ -440,6 +449,7 @@ class MakerChannelInputRegistry:
         coordinator_actor: str,
         local_actor: str,
         local_node_key: str,
+        ordinary_session_binding: str | None,
     ) -> None:
         if coordinator_actor != negotiation.coordinator_actor:
             raise ChannelInputValidationError("channel-input invite came from a different actor")
@@ -451,6 +461,7 @@ class MakerChannelInputRegistry:
             raise MakerChannelInputRuntimeError(
                 "channel-input invitation differs from local identity"
             )
+        negotiation.require_ordinary_session_binding(ordinary_session_binding)
 
     @staticmethod
     def _require_local_identity(

@@ -70,6 +70,8 @@ def verify_unsigned_transaction(
     offer_type: OfferType,
     network: NetworkType = NetworkType.MAINNET,
     current_block_height: int | None = None,
+    *,
+    channel_fee_credit_sat: int = 0,
 ) -> tuple[bool, str]:
     """
     Verify unsigned CoinJoin transaction proposed by taker.
@@ -90,6 +92,8 @@ def verify_unsigned_transaction(
             validate a height-based nLockTime (reference/JAM sw0 takers set
             this for anti-fee-sniping). ``None`` rejects any height-based
             locktime outright (fail closed when the tip is unknown).
+        channel_fee_credit_sat: A channel-input authorization may replace up
+            to the advertised CoinJoin fee in the maker's ordinary change.
 
     Returns:
         (is_valid, error_message)
@@ -120,7 +124,14 @@ def verify_unsigned_transaction(
 
         real_cjfee = calculate_cj_fee(offer_type, cjfee, amount)
 
-        expected_change_value = my_total_in - amount - txfee + real_cjfee
+        if (
+            not isinstance(channel_fee_credit_sat, int)
+            or isinstance(channel_fee_credit_sat, bool)
+            or not 0 <= channel_fee_credit_sat <= real_cjfee
+        ):
+            return False, "Channel fee credit is outside the advertised CoinJoin fee"
+
+        expected_change_value = my_total_in - amount - txfee + real_cjfee - channel_fee_credit_sat
 
         potentially_earned = real_cjfee - txfee
 

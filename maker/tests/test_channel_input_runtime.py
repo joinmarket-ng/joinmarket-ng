@@ -28,7 +28,7 @@ from jmswap.lnd import (
     LndFinalizedEscrowParent,
     WitnessUtxo,
 )
-from test_channel_input_negotiation import (
+from test_maker_channel_input_negotiation import (
     _approval_set,
     _cancel,
     _candidate,

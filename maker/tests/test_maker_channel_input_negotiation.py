@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import cast
 
 import pytest
-from coincurve import PrivateKey
+from bitcointx.core.key import CKey
 from jmcore.bitcoin import (
     TxInput,
     TxOutput,
@@ -69,7 +69,7 @@ PARTICIPANT_SECRET = (2).to_bytes(32, "big")
 
 
 def _node(index: int) -> str:
-    return PrivateKey(index.to_bytes(32, "big")).public_key.format(compressed=True).hex()
+    return bytes(CKey.from_secret_bytes(index.to_bytes(32, "big")).pub).hex()
 
 
 def _config(*, points: tuple[str, ...], peers: tuple[str, ...]) -> ChannelInputConfig:

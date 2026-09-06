@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import time
 from collections.abc import Awaitable, Callable
@@ -33,6 +34,7 @@ from jmcore.channel_input import (
     decode_channel_input_message,
     encode_channel_input_message,
 )
+from jmcore.channel_ring_store import RingLifecycleState
 from jmcore.cofunded_ring import (
     MAX_RING_CIPHERTEXT_BYTES,
     RingCancelPayload,
@@ -125,6 +127,7 @@ class MakerSession:
         self.cleanup_started = False
         self.detached_event = asyncio.Event()
         self.ring_participant: MakerRingParticipant | None = None
+        self.channel_input_key: tuple[str, int] | None = None
 
     # -- Identity -----------------------------------------------------------
 
@@ -212,6 +215,14 @@ class MakerSession:
             logger.bind(sensitive=True).debug(
                 f"Failed to release input locks for {self.taker_nick}: {e}"
             )
+
+    def _release_retired_ring_resources(self, bot: MakerBotProtocol) -> None:
+        """Release pre-sign resources only after durable ring retirement."""
+        participant = self.ring_participant
+        if participant is None or participant._record().state is not RingLifecycleState.RETIRED:
+            return
+        bot._release_podle_outpoint(self)
+        self.release_input_locks()
 
     def retain_input_locks(self) -> None:
         """Best-effort renewal once maker signatures may exist."""
@@ -329,6 +340,52 @@ class MakerSession:
         self, tx_hex: str, active_check: Callable[[], bool] | None = None
     ) -> tuple[bool, dict[str, Any]]:
         return await self.inner.handle_tx(tx_hex, active_check=active_check)
+
+    def _channel_input_generation(self, bot: MakerBotProtocol) -> Any:
+        resolver = getattr(bot, "_generation", None)
+        if not callable(resolver):
+            return bot
+        generation = resolver(self.generation_id)
+        if generation is None:
+            raise RuntimeError("channel-input session generation is unavailable")
+        return generation
+
+    def _channel_input_binding(self, local_actor: str) -> str:
+        if len(self.commitment) != 32 or not self.inner.input_lock_owner:
+            raise ValueError("channel-input requires authenticated ordinary input ownership")
+        facts = (
+            "jm-channel-input-ordinary-v1",
+            self.generation_id,
+            local_actor,
+            self.taker_nick,
+            self.commitment.hex(),
+            self.inner.input_lock_owner,
+        )
+        return hashlib.sha256(json.dumps(facts, separators=(",", ":")).encode("ascii")).hexdigest()
+
+    async def _handle_channel_input_tx(
+        self, bot: MakerBotProtocol, tx_hex: str
+    ) -> tuple[bool, dict[str, Any]]:
+        try:
+            registry = bot._channel_input_registry
+            if registry is None or self.channel_input_key is None:
+                raise ValueError("channel-input authorization is unavailable")
+            generation = self._channel_input_generation(bot)
+            binding = self._channel_input_binding(generation.nick_identity.nick)
+            # Recovery cancellation uses the same lock. It must not invalidate
+            # authorization while ordinary signatures are being produced.
+            async with registry.lock_for(*self.channel_input_key):
+                negotiation = registry.get(*self.channel_input_key)
+                if negotiation is None:
+                    raise ValueError("channel-input authorization is missing")
+                return await self.inner.handle_tx(
+                    tx_hex,
+                    active_check=lambda: self.is_active(bot),
+                    channel_input=negotiation,
+                    channel_input_binding=binding,
+                )
+        except Exception as exc:
+            return False, {"error": str(exc)}
 
     # -- Per-taker handler bodies (moved from ProtocolHandlersMixin) -------
 
@@ -627,7 +684,9 @@ class MakerSession:
                 logger.bind(sensitive=True).error(f"Failed to decode transaction: {e}")
                 return
 
-            if self.ring_participant is None:
+            if self.channel_input_key is not None:
+                success, response = await self._handle_channel_input_tx(bot, tx_hex)
+            elif self.ring_participant is None:
                 success, response = await self.handle_tx(
                     tx_hex, active_check=lambda: self.is_active(bot)
                 )
@@ -752,7 +811,7 @@ class MakerSession:
 
                 if bot.active_sessions.get((self.generation_id, taker_nick)) is self:
                     self.state = CoinJoinState.COMPLETE
-                    if self.ring_participant is None:
+                    if self.ring_participant is None and self.channel_input_key is None:
                         bot.active_sessions.pop((self.generation_id, taker_nick))
                         bot._release_podle_outpoint(self)
 
@@ -820,6 +879,9 @@ class MakerSession:
         """Decrypt, authenticate, and dispatch one canonical JMP-0010 envelope."""
 
         self.validate_channel(source)
+        if self.channel_input_key is not None:
+            logger.warning("Rejecting !ring in a channel-input session")
+            return
         if self.state != CoinJoinState.IOAUTH_SENT:
             logger.warning("Rejecting !ring before CoinJoin authentication is complete")
             logger.bind(sensitive=True).warning(
@@ -869,7 +931,7 @@ class MakerSession:
                 )
             responses = await self.ring_participant.handle(payload)
             if isinstance(payload, RingCancelPayload):
-                self.release_input_locks()
+                self._release_retired_ring_resources(bot)
             for response in responses:
                 encrypted = self.crypto.encrypt(encode_ring_message(response))
                 await self._send_ring_response(bot, encrypted, source)
@@ -882,7 +944,7 @@ class MakerSession:
             if isinstance(payload, RingPlanPayload) and self.ring_participant is not None:
                 try:
                     responses = self.ring_participant.reject_plan(payload)
-                    self.release_input_locks()
+                    self._release_retired_ring_resources(bot)
                     for response in responses:
                         encrypted = self.crypto.encrypt(encode_ring_message(response))
                         await self._send_ring_response(bot, encrypted, source)
@@ -902,10 +964,13 @@ class MakerSession:
         """Decrypt and dispatch one authenticated channel-input envelope."""
 
         self.validate_channel(source)
-        if self.state != CoinJoinState.IOAUTH_SENT:
+        if self.state not in {CoinJoinState.IOAUTH_SENT, CoinJoinState.COMPLETE}:
             logger.warning(
                 f"Rejecting !channel_input from {self.taker_nick}: PoDLE/!ioauth not complete"
             )
+            return
+        if self.ring_participant is not None:
+            logger.warning("Rejecting !channel_input in a ring session")
             return
         if (
             not bot.config.channel_input.enabled
@@ -926,11 +991,6 @@ class MakerSession:
                 f"Rejecting !channel_input from {self.taker_nick}: direct source is unavailable"
             )
             return
-        if source.startswith("dir:") and source[4:] not in bot.directory_clients:
-            logger.warning(
-                f"Rejecting !channel_input from {self.taker_nick}: directory source is unavailable"
-            )
-            return
         if source != "direct" and not source.startswith("dir:"):
             logger.warning(
                 f"Rejecting !channel_input from {self.taker_nick}: source is unavailable"
@@ -940,7 +1000,11 @@ class MakerSession:
         if len(parts) != 4 or len(parts[1]) > MAX_CHANNEL_INPUT_CIPHERTEXT_BYTES:
             logger.warning(f"Rejecting malformed encrypted !channel_input from {self.taker_nick}")
             return
+        newly_bound_key: tuple[str, int] | None = None
         try:
+            generation = self._channel_input_generation(bot)
+            if source.startswith("dir:") and source[4:] not in generation.directory_clients:
+                raise ValueError("channel-input directory source is unavailable")
             verified, command, encrypted = verify_signed_privmsg(self.taker_nick, msg, ONION_HOSTID)
             if not verified or command != "channel_input" or encrypted != parts[1]:
                 raise ValueError("invalid signed channel-input envelope")
@@ -949,12 +1013,27 @@ class MakerSession:
             registry = bot._channel_input_registry
             if initialized_backend is None or registry is None:
                 raise RuntimeError("channel-input runtime became unavailable")
+            key = (payload.session_id, payload.attempt)
+            if isinstance(payload, ChannelInputInvitePayload):
+                if self.state != CoinJoinState.IOAUTH_SENT:
+                    raise ValueError("channel-input invitation after ordinary signing")
+                if self.channel_input_key is not None and key != self.channel_input_key:
+                    raise ValueError("ordinary session already belongs to another channel attempt")
+            elif key != self.channel_input_key:
+                raise ValueError("channel-input payload is not bound to this ordinary session")
             if (
                 isinstance(payload, ChannelInputInvitePayload)
                 and not bot.channel_input_capability_validated
                 and registry.get(payload.session_id, payload.attempt) is None
             ):
                 raise RuntimeError("channel-input admission is unavailable")
+            local_actor = generation.nick_identity.nick
+            binding = self._channel_input_binding(local_actor)
+            # Keep the attempt association even if a freeze RPC fails after its
+            # durable intent. Retries may only address that same attempt.
+            if self.channel_input_key is None:
+                newly_bound_key = key
+            self.channel_input_key = key
 
             def settlement_script_for(candidate: ChannelInputCandidate) -> str:
                 mixdepth = (self.inner.mixdepth + 1) % bot.wallet.mixdepth_count
@@ -974,13 +1053,14 @@ class MakerSession:
             responses = await registry.handle_payload(
                 payload,
                 coordinator_actor=self.taker_nick,
-                local_actor=bot.nick,
+                local_actor=local_actor,
                 local_node_key=initialized_backend.node_info.identity_pubkey,
                 backend=initialized_backend.backend,
                 candidates=initialized_backend.candidates,
                 settlement_script_for=settlement_script_for,
                 current_time=int(time.time()),
                 current_height=bot.current_block_height,
+                ordinary_session_binding=binding,
             )
             if isinstance(payload, ChannelInputInvitePayload):
                 bot._refresh_channel_input_capability()
@@ -990,10 +1070,23 @@ class MakerSession:
                     bot, response_encrypted, source, direct_connection
                 )
         except Exception as exc:
+            # An invite that failed before creating any durable negotiation must
+            # not poison the ordinary session with a phantom channel attempt.
+            # After a durable freeze intent, the registry retains the
+            # negotiation, so the binding stays for that exact attempt.
+            if newly_bound_key is not None and self.channel_input_key == newly_bound_key:
+                retained_registry = bot._channel_input_registry
+                if retained_registry is None or retained_registry.get(*newly_bound_key) is None:
+                    self.channel_input_key = None
             logger.warning(
                 f"Rejected invalid or out-of-order !channel_input from {self.taker_nick} "
                 f"({type(exc).__name__})"
             )
+            logger.bind(sensitive=True).debug("Channel-input rejection detail: {}", exc)
+            if exc.__cause__ is not None:
+                logger.bind(sensitive=True).debug(
+                    "Channel-input rejection cause: {}", exc.__cause__
+                )
 
     async def _send_channel_input_response(
         self,
@@ -1004,17 +1097,19 @@ class MakerSession:
     ) -> None:
         """Return a channel-input response only through the request channel."""
 
+        generation = self._channel_input_generation(bot)
         if source == "direct":
             if direct_connection is None:
                 raise RuntimeError("direct channel-input response channel is unavailable")
-            signed = bot.nick_identity.sign_message(encrypted, ONION_HOSTID)
-            line = format_jm_message(bot.nick, self.taker_nick, "channel_input", signed)
+            identity = generation.nick_identity
+            signed = identity.sign_message(encrypted, ONION_HOSTID)
+            line = format_jm_message(identity.nick, self.taker_nick, "channel_input", signed)
             await direct_connection.send(
                 json.dumps({"type": MessageType.PRIVMSG.value, "line": line}).encode("utf-8")
             )
             return
         if source.startswith("dir:"):
-            client = bot.directory_clients.get(source[4:])
+            client = generation.directory_clients.get(source[4:])
             if client is None:
                 raise RuntimeError("directory channel-input response channel is unavailable")
             await client.send_private_message(self.taker_nick, "channel_input", encrypted)

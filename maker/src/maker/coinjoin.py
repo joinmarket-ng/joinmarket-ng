@@ -18,14 +18,15 @@ from collections.abc import Callable
 from enum import StrEnum
 from typing import Any
 
-from jmcore.bitcoin import parse_transaction
+from jmcore.bitcoin import address_to_scriptpubkey_for_network, estimate_vsize, parse_transaction
+from jmcore.channel_input import ChannelInputValidationError
 from jmcore.encryption import CryptoSession
 from jmcore.fee_policy import (
     estimate_p2wpkh_vsize,
     fee_rate_meets_minimum,
     format_low_fee_error,
 )
-from jmcore.models import NetworkType, Offer, offer_output_script_type
+from jmcore.models import NetworkType, Offer, calculate_cj_fee, offer_output_script_type
 from jmcore.podle import parse_podle_revelation, verify_podle, verify_podle_binding
 from jmcore.protocol import (
     UTXOMetadata,
@@ -40,12 +41,43 @@ from jmwallet.wallet.signing import (
 )
 from loguru import logger
 
+from maker.channel_input import MakerChannelInputNegotiation, MakerChannelInputStage
 from maker.mixdepth_selection import MixdepthSelectionPolicy, mixdepth_attempt_order
 from maker.offer_math import required_maker_input
 from maker.tx_verification import find_output_index, verify_unsigned_transaction
 
 MINER_FEE_PREVOUT_LOOKUP_TIMEOUT_SEC = 10.0
 MINER_FEE_PREVOUT_LOOKUP_BATCH_SIZE = 10
+
+
+def _classify_scriptpubkey(scriptpubkey: str | bytes) -> str | None:
+    """Return an ``estimate_vsize`` script type for a standard scriptPubKey."""
+    if isinstance(scriptpubkey, str):
+        try:
+            script = bytes.fromhex(scriptpubkey)
+        except ValueError:
+            return None
+    elif isinstance(scriptpubkey, bytes):
+        script = scriptpubkey
+    else:
+        return None
+
+    if len(script) == 22 and script.startswith(b"\x00\x14"):
+        return "p2wpkh"
+    if len(script) == 34 and script.startswith(b"\x00\x20"):
+        return "p2wsh"
+    if len(script) == 34 and script.startswith(b"\x51\x20"):
+        return "p2tr"
+    if len(script) == 25 and script.startswith(b"\x76\xa9\x14") and script.endswith(b"\x88\xac"):
+        return "p2pkh"
+    if len(script) == 23 and script.startswith(b"\xa9\x14") and script.endswith(b"\x87"):
+        return "p2sh"
+    return None
+
+
+def _has_scriptpubkey_metadata(scriptpubkey: object) -> bool:
+    """Return whether a prevout has usable scriptPubKey metadata."""
+    return isinstance(scriptpubkey, (str, bytes)) and bool(scriptpubkey)
 
 
 class CoinJoinState(StrEnum):
@@ -615,7 +647,12 @@ class CoinJoinSession:
             return False, {"error": str(e)}
 
     async def handle_tx(
-        self, tx_hex: str, active_check: Callable[[], bool] | None = None
+        self,
+        tx_hex: str,
+        active_check: Callable[[], bool] | None = None,
+        *,
+        channel_input: MakerChannelInputNegotiation | None = None,
+        channel_input_binding: str | None = None,
     ) -> tuple[bool, dict[str, Any]]:
         """
         Handle !tx message from taker.
@@ -641,6 +678,12 @@ class CoinJoinSession:
             logger.debug(f"Received !tx from {self.taker_nick}, verifying...")
             logger.bind(sensitive=True).debug(f"Transaction hex to verify and sign: {tx_hex}")
 
+            channel_fee_credit_sat = self._authorize_channel_input_fee_credit(
+                tx_hex,
+                channel_input=channel_input,
+                channel_input_binding=channel_input_binding,
+            )
+
             # Convert network string to NetworkType enum
             network = NetworkType(self.wallet.network)
 
@@ -665,6 +708,7 @@ class CoinJoinSession:
                 offer_type=self.offer.ordertype,
                 network=network,
                 current_block_height=current_block_height,
+                channel_fee_credit_sat=channel_fee_credit_sat,
             )
 
             if not is_valid:
@@ -746,6 +790,117 @@ class CoinJoinSession:
                 self.state = CoinJoinState.FAILED
             return False, {"error": str(e)}
 
+    def _authorize_channel_input_fee_credit(
+        self,
+        tx_hex: str,
+        *,
+        channel_input: MakerChannelInputNegotiation | None,
+        channel_input_binding: str | None,
+    ) -> int:
+        """Authorize the only ordinary-fee credit backed by a frozen channel transcript."""
+
+        if channel_input is None and channel_input_binding is None:
+            return 0
+        if channel_input is None or channel_input_binding is None:
+            raise ValueError("channel-input fee credit requires negotiation and binding")
+        try:
+            negotiation = MakerChannelInputNegotiation.from_snapshot(channel_input.snapshot())
+        except (ChannelInputValidationError, TypeError, ValueError) as exc:
+            raise ValueError("channel-input negotiation is not durably authorized") from exc
+        if negotiation.ordinary_session_binding != channel_input_binding:
+            raise ValueError("channel-input binding differs from ordinary session")
+        if negotiation.coordinator_actor != self.taker_nick:
+            raise ValueError("channel-input coordinator differs from ordinary taker")
+        if negotiation.stage not in {
+            MakerChannelInputStage.APPROVAL_SET_ACKED,
+            MakerChannelInputStage.PREPARED,
+            MakerChannelInputStage.NONCES_READY,
+            MakerChannelInputStage.SIGNING,
+            MakerChannelInputStage.FINALIZING,
+            MakerChannelInputStage.FINALIZED,
+        }:
+            raise ValueError("channel-input negotiation has not acknowledged approvals")
+        if (
+            negotiation.proposal is None
+            or negotiation.approval_set is None
+            or negotiation.local_ack is None
+        ):
+            raise ValueError("channel-input negotiation lacks approved transcript evidence")
+
+        transcript = negotiation.proposal.transcript
+        if tx_hex != transcript.unsigned_parent_tx:
+            raise ValueError("ordinary transaction differs from channel-input transcript")
+        transaction = parse_transaction(tx_hex)
+        channel_input_indices = {descriptor.input_index for descriptor in transcript.channels}
+        input_indices = {
+            (tx_input.txid, tx_input.vout): index
+            for index, tx_input in enumerate(transaction.inputs)
+        }
+        if len(input_indices) != len(transaction.inputs):
+            raise ValueError("ordinary transaction has duplicate inputs")
+        for outpoint, utxo in self.our_utxos.items():
+            input_index = input_indices.get(outpoint)
+            if input_index is None:
+                raise ValueError("ordinary transaction omits a maker input")
+            if input_index in channel_input_indices:
+                raise ValueError("maker wallet input occupies a channel-input index")
+            prevout = transcript.input_prevouts[input_index]
+            try:
+                wallet_script = bytes.fromhex(utxo.scriptpubkey)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("maker wallet input has an invalid prevout script") from exc
+            if (
+                prevout.outpoint.key() != outpoint
+                or prevout.value_sat != utxo.value
+                or bytes.fromhex(prevout.script_pubkey) != wallet_script
+            ):
+                raise ValueError("channel transcript prevout differs from maker wallet input")
+
+        try:
+            ordinary_scripts = {
+                address_to_scriptpubkey_for_network(self.cj_address, self.wallet.network),
+                address_to_scriptpubkey_for_network(self.change_address, self.wallet.network),
+            }
+        except ValueError as exc:
+            raise ValueError("maker ordinary output address is invalid") from exc
+        ordinary_output_indices = {
+            index
+            for index, output in enumerate(transaction.outputs)
+            if output.script in ordinary_scripts
+        }
+        channel_settlement_indices: set[int] = set()
+        channel_net_claim_sat = 0
+        for terms in negotiation.proposal.recipient_terms:
+            channel_net_claim_sat += terms.claim_adjustment_sat - terms.miner_fee_share_sat
+            for output in terms.settlement_outputs:
+                settlement_script = bytes.fromhex(output.script_pubkey)
+                if (
+                    output.output_index in ordinary_output_indices
+                    or settlement_script in ordinary_scripts
+                ):
+                    raise ValueError("channel settlement overlaps an ordinary CoinJoin output")
+                if output.output_index in channel_settlement_indices:
+                    raise ValueError("channel settlement output is counted more than once")
+                channel_settlement_indices.add(output.output_index)
+
+        advertised_fee_sat = calculate_cj_fee(self.offer.ordertype, self.offer.cjfee, self.amount)
+        if channel_net_claim_sat < advertised_fee_sat:
+            raise ValueError("channel settlement does not authorize the advertised CoinJoin fee")
+        expected_change_sat = (
+            sum(utxo.value for utxo in self.our_utxos.values()) - self.amount - self.offer.txfee
+        )
+        change_script = address_to_scriptpubkey_for_network(
+            self.change_address, self.wallet.network
+        )
+        change_outputs = [
+            output for output in transaction.outputs if output.script == change_script
+        ]
+        if len(change_outputs) != 1 or change_outputs[0].value != expected_change_sat:
+            raise ValueError(
+                "channel-input ordinary change must exactly exclude the advertised fee"
+            )
+        return advertised_fee_sat
+
     async def _verify_minimum_miner_fee(
         self, tx_hex: str, active_check: Callable[[], bool] | None
     ) -> str | None:
@@ -820,7 +975,51 @@ class CoinJoinSession:
         )
         total_output = sum(output.value for output in tx.outputs)
         fee = total_input - total_output
-        vsize = estimate_p2wpkh_vsize(len(tx.inputs), len(tx.outputs))
+        foreign_prevouts = dict(zip(foreign_inputs, foreign_utxos, strict=True))
+        input_scripts: list[str | bytes] = []
+        missing_local_script = False
+        for tx_input in tx.inputs:
+            outpoint = (tx_input.txid, tx_input.vout)
+            local_utxo = self.our_utxos.get(outpoint)
+            if local_utxo is not None:
+                scriptpubkey = local_utxo.scriptpubkey
+                if not _has_scriptpubkey_metadata(scriptpubkey):
+                    missing_local_script = True
+                    continue
+            else:
+                foreign_utxo = foreign_prevouts[outpoint]
+                if foreign_utxo is None or not _has_scriptpubkey_metadata(
+                    foreign_utxo.scriptpubkey
+                ):
+                    return (
+                        "Could not resolve all foreign prevout scripts for miner-fee verification"
+                    )
+                scriptpubkey = foreign_utxo.scriptpubkey
+            input_scripts.append(scriptpubkey)
+
+        input_types = [_classify_scriptpubkey(script) for script in input_scripts]
+        output_types = [_classify_scriptpubkey(output.script) for output in tx.outputs]
+        if any(script_type is None for script_type in output_types):
+            return "Could not classify all transaction output scripts for miner-fee verification"
+
+        if self.pit_script_type == "p2tr":
+            if missing_local_script:
+                return "Could not resolve all local prevout scripts for tr0 miner-fee verification"
+            if any(script_type != "p2tr" for script_type in input_types):
+                return "tr0 CoinJoin contains a non-P2TR input"
+            if any(script_type != "p2tr" for script_type in output_types):
+                return "tr0 CoinJoin contains a non-P2TR output"
+            vsize = estimate_vsize(["p2tr"] * len(tx.inputs), ["p2tr"] * len(tx.outputs))
+        elif missing_local_script:
+            # Legacy sw0 wallet callers may omit local scriptPubKey metadata.
+            vsize = estimate_p2wpkh_vsize(len(tx.inputs), len(tx.outputs))
+        else:
+            if any(script_type not in {"p2wpkh", "p2wsh", "p2tr"} for script_type in input_types):
+                return "Cannot estimate miner fee for an unsupported input script type"
+            vsize = estimate_vsize(
+                [script_type for script_type in input_types if script_type is not None],
+                [script_type for script_type in output_types if script_type is not None],
+            )
         if fee < 0:
             return "CoinJoin has a negative miner fee"
         minimum_fee_rate = self.minimum_fee_rate_sat_vb
@@ -999,14 +1198,14 @@ class CoinJoinSession:
                 scripts.append(bytes.fromhex(utxo.scriptpubkey))
                 continue
 
-            utxo = await self.backend.get_utxo(txid_hex, tx_input.vout)
-            if utxo is None or not utxo.scriptpubkey:
+            foreign_utxo = await self.backend.get_utxo(txid_hex, tx_input.vout)
+            if foreign_utxo is None or not foreign_utxo.scriptpubkey:
                 raise TransactionSigningError(
                     f"Cannot resolve prevout for {txid_hex}:{tx_input.vout} "
                     "(required for taproot sighash)"
                 )
-            values.append(utxo.value)
-            scripts.append(bytes.fromhex(utxo.scriptpubkey))
+            values.append(foreign_utxo.value)
+            scripts.append(bytes.fromhex(foreign_utxo.scriptpubkey))
         return values, scripts
 
     async def _sign_transaction(
