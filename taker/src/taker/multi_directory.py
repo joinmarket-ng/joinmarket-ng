@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, NamedTuple
 
 from jmcore.crypto import NickIdentity, verify_signed_privmsg
 from jmcore.deduplication import ResponseDeduplicator
@@ -80,6 +80,16 @@ class ReplyRoute:
     def is_direct(self) -> bool:
         """True when the route is bound to one direct peer connection."""
         return self.channel_id == "direct"
+
+
+class _VerifiedResponse(NamedTuple):
+    """Verified private-message contents and its authenticated ingress route."""
+
+    from_nick: str
+    command: str
+    data: str
+    payload: str
+    route: ReplyRoute | None
 
 
 class MultiDirectoryClient(DirectoryClientPool):
@@ -833,6 +843,50 @@ class MultiDirectoryClient(DirectoryClientPool):
             force_channel=route.channel_id,
         )
 
+    def _parse_verified_response(
+        self,
+        msg: dict[str, Any],
+        source: str,
+        expected_nicks: list[str],
+        include_routes: bool,
+    ) -> _VerifiedResponse | None:
+        """Validate a private response and retain its exact authenticated return route."""
+        if msg.get("type") != MessageType.PRIVMSG.value:
+            return None
+
+        line = msg.get("line", "")
+        if not line:
+            return None
+
+        # Attribute strictly to the authenticated sender. Substring matching
+        # let any peer claim another maker's nick by embedding it in payload.
+        parsed = parse_jm_message(line)
+        if parsed is None:
+            return None
+        from_nick = parsed[0]
+        if from_nick not in expected_nicks:
+            return None
+        if parsed[1] != self.nick:
+            return None
+
+        ok, command, data = verify_signed_privmsg(from_nick, parsed[2], ONION_HOSTID)
+        if not ok:
+            logger.warning(f"Dropping unverified message from {from_nick} via {source}")
+            return None
+
+        # Preserve the downstream payload contract (data plus pubkey/sig suffix).
+        payload = parsed[2].split(" ", 1)[1].strip() if " " in parsed[2] else ""
+        route = (
+            msg.get("_reply_route")
+            if source == "direct"
+            else ReplyRoute(nick=from_nick, channel_id=source)
+        )
+        if include_routes and not isinstance(route, ReplyRoute):
+            logger.warning(f"Dropping {command} from {from_nick}: missing reply route")
+            return None
+
+        return _VerifiedResponse(from_nick, command, data, payload, route)
+
     async def wait_for_responses(
         self,
         expected_nicks: list[str],
@@ -914,39 +968,11 @@ class MultiDirectoryClient(DirectoryClientPool):
             """Process a single message from any source (directory or direct)."""
             nonlocal responses, remaining_nicks
 
-            if msg.get("type") != MessageType.PRIVMSG.value:
-                return
-
-            line = msg.get("line", "")
-            if not line:
-                return
-
-            # Attribute strictly to the authenticated sender. Substring matching
-            # let any peer claim another maker's nick by embedding it in payload.
-            parsed = parse_jm_message(line)
+            parsed = self._parse_verified_response(msg, source, expected_nicks, include_routes)
             if parsed is None:
                 return
-            from_nick = parsed[0]
-            if from_nick not in expected_nicks:
-                return
-            if parsed[1] != self.nick:
-                return
-
-            ok, command, _data = verify_signed_privmsg(from_nick, parsed[2], ONION_HOSTID)
-            if not ok:
-                logger.warning(f"Dropping unverified message from {from_nick} via {source}")
-                return
-
-            # Preserve the downstream payload contract (data plus pubkey/sig suffix).
-            payload = parsed[2].split(" ", 1)[1].strip() if " " in parsed[2] else ""
-            route = (
-                msg.get("_reply_route")
-                if source == "direct"
-                else ReplyRoute(nick=from_nick, channel_id=source)
-            )
-            if include_routes and not isinstance(route, ReplyRoute):
-                logger.warning(f"Dropping {command} from {from_nick}: missing reply route")
-                return
+            from_nick, command, data, payload, route = parsed
+            line = msg.get("line", "")
 
             if command == "error":
                 if not deduplicator.add_response(from_nick, "error", line, source):
@@ -956,12 +982,12 @@ class MultiDirectoryClient(DirectoryClientPool):
                         f"Ignoring late !error from {from_nick} after an earlier response"
                     )
                     return
-                responses[from_nick] = {"error": True, "data": _data or "Unknown error"}
+                responses[from_nick] = {"error": True, "data": data or "Unknown error"}
                 if include_routes:
                     responses[from_nick]["route"] = route
                 remaining_nicks.discard(from_nick)
                 logger.warning("Received error from peer")
-                logger.bind(sensitive=True).warning(f"Received error from {from_nick}: {_data}")
+                logger.bind(sensitive=True).warning(f"Received error from {from_nick}: {data}")
                 return
 
             if command != expected_command.lstrip("!"):

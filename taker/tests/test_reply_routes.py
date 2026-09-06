@@ -9,6 +9,7 @@ import pytest
 from _taker_test_helpers import make_directory_client
 from jmcore.crypto import NickIdentity
 from jmcore.network import ONION_HOSTID, PeerConnectionBinding
+from jmcore.protocol import MessageType
 
 from taker.multi_directory import ReplyRoute
 
@@ -31,7 +32,7 @@ async def test_direct_response_retains_exact_ingress_binding() -> None:
     await client._on_peer_message(
         ingress_peer,
         maker.nick,
-        json.dumps({"line": line}).encode(),
+        json.dumps({"type": MessageType.PRIVMSG.value, "line": line}).encode(),
     )
     client.clients = {}
     responses = await client.wait_for_responses(

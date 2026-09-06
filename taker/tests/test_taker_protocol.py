@@ -894,6 +894,10 @@ class TestSweepCjAmountPreservation:
             maker_timeout_sec=30.0,
             order_wait_time=10.0,
             fee_rate=1.0,  # 1 sat/vB
+            require_quantized_cj_fees=True,
+            round_up_cj_fees=False,
+            equalize_cj_fees=False,
+            dust_threshold=DUST_THRESHOLD,
         )
 
     @staticmethod
@@ -1193,7 +1197,13 @@ class TestSweepCjAmountPreservation:
             )
 
         assert result is expected_result
-        estimate.assert_any_call(3, 3, use_base_rate=True)
+        estimate.assert_any_call(
+            3,
+            3,
+            use_base_rate=True,
+            input_types=["p2wpkh", "p2wpkh", "p2wpkh"],
+            output_types=["p2wpkh", "p2wpkh", "p2wpkh"],
+        )
         if expected_result:
             assert session.last_failure_reason is None
         else:
@@ -2675,6 +2685,7 @@ class TestPhaseAuthMakerAuthentication:
             nick=nick,
             offer=offer,
             pubkey=maker_nacl_pk_hex,
+            features={FEATURE_NEUTRINO_COMPAT} if is_neutrino_unavailable else set(),
             supports_neutrino_compat=is_neutrino_unavailable,
         )
         object.__setattr__(session, "crypto", taker_crypto)
