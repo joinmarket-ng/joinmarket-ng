@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import subprocess
+import sys
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -41,6 +42,7 @@ TAKER_MNEMONIC = (
 )
 
 LND_SERVICES = ("lnd-maker1", "lnd-maker2", "lnd-maker3", "lnd-taker")
+DIRECTED_PAYMENT_AMOUNTS = (1_111, 2_222, 3_333, 4_444)
 LND_PORTS = {
     "lnd-maker1": os.getenv("RING_E2E_MAKER1_GRPC_PORT", "21009"),
     "lnd-maker2": os.getenv("RING_E2E_MAKER2_GRPC_PORT", "22009"),
@@ -225,12 +227,7 @@ async def make_taker(
 async def wait_for_channels(timeout: float = 120) -> dict[str, list[dict[str, Any]]]:
     deadline = asyncio.get_running_loop().time() + timeout
     while True:
-        channels = {
-            service: list(
-                (await asyncio.to_thread(lncli, service, "listchannels"))["channels"]
-            )
-            for service in LND_SERVICES
-        }
+        channels = await list_channels()
         if all(
             len(items) == 2 and all(item["active"] for item in items)
             for items in channels.values()
@@ -239,6 +236,16 @@ async def wait_for_channels(timeout: float = 120) -> dict[str, list[dict[str, An
         if asyncio.get_running_loop().time() >= deadline:
             raise RuntimeError(f"ring channels did not become active: {channels}")
         await asyncio.sleep(2)
+
+
+async def list_channels() -> dict[str, list[dict[str, Any]]]:
+    responses = await asyncio.gather(
+        *(asyncio.to_thread(lncli, service, "listchannels") for service in LND_SERVICES)
+    )
+    return {
+        service: list(response["channels"])
+        for service, response in zip(LND_SERVICES, responses, strict=True)
+    }
 
 
 async def assert_no_pending_channels() -> None:
@@ -250,17 +257,216 @@ async def assert_no_pending_channels() -> None:
         assert not pending["waiting_close_channels"]
 
 
-async def pay_directed_edges(node_service: dict[str, str], record: Any) -> None:
+def endpoint_balance_snapshot(
+    channels: dict[str, list[dict[str, Any]]],
+) -> dict[str, dict[str, int]]:
+    snapshot: dict[str, dict[str, int]] = {}
+    for service, items in channels.items():
+        balances: dict[str, int] = {}
+        for channel in items:
+            channel_point = str(channel["channel_point"])
+            assert channel_point not in balances
+            balances[channel_point] = int(channel["local_balance"])
+        snapshot[service] = balances
+    return snapshot
+
+
+async def wait_for_balance_deltas(
+    before: dict[str, dict[str, int]],
+    expected_deltas: dict[str, dict[str, int]],
+    timeout: float = 30,
+) -> dict[str, list[dict[str, Any]]]:
+    deadline = asyncio.get_running_loop().time() + timeout
+    observed: dict[str, dict[str, int]] | None = None
+    while True:
+        channels = await list_channels()
+        after = endpoint_balance_snapshot(channels)
+        if set(after) == set(before) and all(
+            set(after[service]) == set(before[service]) for service in before
+        ):
+            observed = {
+                service: {
+                    channel_point: after[service][channel_point]
+                    - before[service][channel_point]
+                    for channel_point in before[service]
+                }
+                for service in before
+            }
+            if observed == expected_deltas:
+                return channels
+        if asyncio.get_running_loop().time() >= deadline:
+            raise RuntimeError(
+                "directed ring payments did not produce the expected endpoint balance "
+                f"deltas: expected={expected_deltas}, observed={observed}"
+            )
+        await asyncio.sleep(0.5)
+
+
+def bitcoin_value_sats(value: Any) -> int:
+    return int(Decimal(str(value)) * 100_000_000)
+
+
+def close_channel(service: str, channel_point: str) -> str:
+    result = compose(
+        "exec",
+        "-T",
+        service,
+        "lncli",
+        "--network=regtest",
+        "--tlscertpath=/root/.lnd/tls.cert",
+        "--macaroonpath=/root/.lnd/admin.macaroon",
+        "closechannel",
+        f"--chan_point={channel_point}",
+    )
+    decoder = json.JSONDecoder()
+    remaining = result.stdout.lstrip()
+    updates: list[dict[str, Any]] = []
+    while remaining:
+        update, offset = decoder.raw_decode(remaining)
+        if not isinstance(update, dict):
+            raise RuntimeError(f"unexpected closechannel response: {update!r}")
+        updates.append(update)
+        remaining = remaining[offset:].lstrip()
+    for update in updates:
+        pending = update.get("close_pending")
+        candidates = (
+            update.get("closing_txid"),
+            update.get("txid"),
+            pending.get("txid") if isinstance(pending, dict) else None,
+            pending.get("closing_txid") if isinstance(pending, dict) else None,
+        )
+        if txid := next((str(item) for item in candidates if item), None):
+            return txid
+    raise RuntimeError(f"closechannel did not report a closing transaction: {updates}")
+
+
+async def wait_for_mempool_transaction(txid: str, timeout: float = 30) -> None:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        if txid in await bitcoin_rpc("getrawmempool"):
+            return
+        if asyncio.get_running_loop().time() >= deadline:
+            raise RuntimeError(f"cooperative close was not broadcast: {txid}")
+        await asyncio.sleep(0.5)
+
+
+async def wait_for_closed_channel(channel_point: str, timeout: float = 60) -> None:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        channels = await list_channels()
+        matching_channels = [
+            channel
+            for items in channels.values()
+            for channel in items
+            if str(channel["channel_point"]) == channel_point
+        ]
+        if not matching_channels or all(
+            not channel["active"] for channel in matching_channels
+        ):
+            return
+        if asyncio.get_running_loop().time() >= deadline:
+            raise RuntimeError(
+                f"confirmed channel close remained active: {channel_point}"
+            )
+        await asyncio.sleep(0.5)
+
+
+async def wait_for_no_ring_channels(timeout: float = 60) -> None:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        channels = await list_channels()
+        pending = await asyncio.gather(
+            *(
+                asyncio.to_thread(lncli, service, "pendingchannels")
+                for service in LND_SERVICES
+            )
+        )
+        has_pending = any(
+            state[key]
+            for state in pending
+            for key in (
+                "pending_open_channels",
+                "pending_closing_channels",
+                "pending_force_closing_channels",
+                "waiting_close_channels",
+            )
+        )
+        has_active = any(
+            channel["active"] for items in channels.values() for channel in items
+        )
+        if not has_active and not has_pending:
+            return
+        if asyncio.get_running_loop().time() >= deadline:
+            raise RuntimeError(
+                f"ring channels did not fully close: channels={channels}, pending={pending}"
+            )
+        await asyncio.sleep(0.5)
+
+
+async def assert_confirmed_cooperative_close(
+    closing_txid: str, channel_point: str
+) -> None:
+    funding_txid, separator, output_index_text = channel_point.partition(":")
+    assert separator
+    funding_output_index = int(output_index_text)
+    funding_transaction = await bitcoin_rpc("getrawtransaction", [funding_txid, True])
+    funding_output = funding_transaction["vout"][funding_output_index]
+    assert str(funding_output["scriptPubKey"]["hex"]).startswith("5120")
+    funding_value = bitcoin_value_sats(funding_output["value"])
+
+    closing_transaction = await bitcoin_rpc("getrawtransaction", [closing_txid, True])
+    assert int(closing_transaction["confirmations"]) == 1
+    assert len(closing_transaction["vin"]) == 1
+    closing_input = closing_transaction["vin"][0]
+    assert (str(closing_input["txid"]), int(closing_input["vout"])) == (
+        funding_txid,
+        funding_output_index,
+    )
+    witness = [str(item) for item in closing_input["txinwitness"]]
+    assert len(witness) == 1
+    assert len(bytes.fromhex(witness[0])) in {64, 65}
+
+    closing_output_values = [
+        bitcoin_value_sats(output["value"]) for output in closing_transaction["vout"]
+    ]
+    assert closing_output_values and all(value > 0 for value in closing_output_values)
+    closing_fee = funding_value - sum(closing_output_values)
+    assert closing_fee > 0
+    assert funding_value == sum(closing_output_values) + closing_fee
+
+
+async def pay_directed_edges(
+    node_service: dict[str, str],
+    record: Any,
+    channels: dict[str, list[dict[str, Any]]],
+) -> dict[str, dict[str, int]]:
     participant_node = {
         participant.participant_key: participant.node_id
         for participant in record.coordinator_participants
     }
     assert record.manifest is not None
+    assert len(record.manifest.edges) == len(DIRECTED_PAYMENT_AMOUNTS)
+    expected_deltas = {
+        service: {channel_point: 0 for channel_point in balances}
+        for service, balances in endpoint_balance_snapshot(channels).items()
+    }
     for index, edge in enumerate(record.manifest.edges):
         opener = node_service[participant_node[edge.opener_key]]
         fundee = node_service[participant_node[edge.acceptor_key]]
+        channel_point = f"{record.manifest.unsigned_txid}:{edge.output_index}"
+        opener_channels = [
+            channel
+            for channel in channels[opener]
+            if str(channel["channel_point"]) == channel_point
+        ]
+        assert len(opener_channels) == 1
+        opener_channel = opener_channels[0]
+        assert (
+            str(opener_channel["remote_pubkey"]) == participant_node[edge.acceptor_key]
+        )
+        amount = DIRECTED_PAYMENT_AMOUNTS[index]
         invoice = await asyncio.to_thread(
-            lncli, fundee, "addinvoice", "--amt=1000", f"--memo=ring-edge-{index}"
+            lncli, fundee, "addinvoice", f"--amt={amount}", f"--memo=ring-edge-{index}"
         )
         payment = await asyncio.to_thread(
             lncli,
@@ -269,10 +475,21 @@ async def pay_directed_edges(node_service: dict[str, str], record: Any) -> None:
             "--json",
             "--force",
             "--fee_limit=100",
+            f"--outgoing_chan_id={opener_channel['scid']}",
             str(invoice["payment_request"]),
         )
         assert not payment.get("payment_error")
         assert payment.get("payment_preimage")
+        successful_attempts = [
+            attempt for attempt in payment["htlcs"] if attempt["status"] == "SUCCEEDED"
+        ]
+        assert len(successful_attempts) == 1
+        assert [
+            str(hop["chan_id"]) for hop in successful_attempts[0]["route"]["hops"]
+        ] == [str(opener_channel["scid"])]
+        expected_deltas[opener][channel_point] -= amount
+        expected_deltas[fundee][channel_point] += amount
+    return expected_deltas
 
 
 @pytest.mark.asyncio
@@ -360,9 +577,7 @@ async def test_rejected_revision_then_complete_four_party_ring(tmp_path: Path) -
         input_value = 0
         for tx_input in parsed.inputs:
             previous = await bitcoin_rpc("getrawtransaction", [tx_input.txid, True])
-            input_value += int(
-                Decimal(str(previous["vout"][tx_input.vout]["value"])) * 100_000_000
-            )
+            input_value += bitcoin_value_sats(previous["vout"][tx_input.vout]["value"])
         actual_fee = input_value - sum(output.value for output in parsed.outputs)
         maker_txfees = sum(
             session.offer.txfee for session in taker._session.maker_sessions.values()
@@ -405,7 +620,11 @@ async def test_rejected_revision_then_complete_four_party_ring(tmp_path: Path) -
             info.identity_pubkey: service
             for info, service in zip(node_infos, LND_SERVICES, strict=True)
         }
-        await pay_directed_edges(node_service, record)
+        before_payment_balances = endpoint_balance_snapshot(channels)
+        expected_payment_deltas = await pay_directed_edges(
+            node_service, record, channels
+        )
+        await wait_for_balance_deltas(before_payment_balances, expected_payment_deltas)
 
         assert taker._channel_ring_store is not None
         assert taker._channel_ring_backend is not None
@@ -425,13 +644,53 @@ async def test_rejected_revision_then_complete_four_party_ring(tmp_path: Path) -
         assert len(successful) == 1
         assert successful[0].state is RingLifecycleState.CONFIRMED_OPEN
         assert successful[0].final_tx == raw_tx
+
+        participant_node = {
+            participant.participant_key: participant.node_id
+            for participant in record.coordinator_participants
+        }
+        channel_points = [f"{txid}:{edge.output_index}" for edge in manifest.edges]
+        assert len(channel_points) == len(set(channel_points)) == 4
+        closing_txids: set[str] = set()
+        for edge, channel_point in zip(manifest.edges, channel_points, strict=True):
+            closer = node_service[participant_node[edge.opener_key]]
+            block_height = int(await bitcoin_rpc("getblockcount"))
+            closing_txid = await asyncio.to_thread(close_channel, closer, channel_point)
+            assert closing_txid not in closing_txids
+            closing_txids.add(closing_txid)
+            await wait_for_mempool_transaction(closing_txid)
+            mined_blocks = await bitcoin_rpc("generatetoaddress", [1, destination])
+            assert len(mined_blocks) == 1
+            assert int(await bitcoin_rpc("getblockcount")) == block_height + 1
+            await assert_confirmed_cooperative_close(closing_txid, channel_point)
+            await wait_for_closed_channel(channel_point)
+        assert len(closing_txids) == 4
+        # LND retains cooperative closes until its additional close-confirmation depth.
+        await bitcoin_rpc("generatetoaddress", [6, destination])
+        await wait_for_no_ring_channels()
+        await assert_no_pending_channels()
     finally:
-        if restart_taker is not None:
-            await restart_taker.stop(close_wallet=False)
-        if taker is not None:
-            await taker.stop(close_wallet=False)
-        await asyncio.gather(
+        cleanup_failures: list[BaseException] = []
+        for active_taker in (restart_taker, taker):
+            if active_taker is None:
+                continue
+            try:
+                await active_taker.stop(close_wallet=False)
+            except BaseException as exc:
+                cleanup_failures.append(exc)
+        cleanup_results = await asyncio.gather(
             *(item.close() for item in lnd_backends), return_exceptions=True
         )
-        await wallet.close()
-        await recreate_maker3(10_000)
+        cleanup_failures.extend(
+            result for result in cleanup_results if isinstance(result, BaseException)
+        )
+        try:
+            await wallet.close()
+        except BaseException as exc:
+            cleanup_failures.append(exc)
+        try:
+            await recreate_maker3(10_000)
+        except BaseException as exc:
+            cleanup_failures.append(exc)
+        if sys.exc_info()[0] is None and cleanup_failures:
+            raise cleanup_failures[0]
