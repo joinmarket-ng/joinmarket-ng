@@ -113,6 +113,26 @@ def test_validate_lightning_rejects_amount_and_network_mismatches() -> None:
             validate_payment_terms(terms, "regtest", NOW, QUOTE_EXPIRY)
 
 
+def test_validate_lightning_uses_distinct_bolt11_signet_prefix() -> None:
+    """BOLT11 uses lntbs for signet and lntb for testnet; the two must not mix."""
+    signet_invoice = make_invoice(currency="tbs")
+    testnet_invoice = make_invoice(currency="tb")
+
+    assert (
+        validate_payment_terms(lightning_terms(signet_invoice), "signet", NOW, QUOTE_EXPIRY)
+        == f"ln:{PAYMENT_HASH}"
+    )
+    assert (
+        validate_payment_terms(lightning_terms(testnet_invoice), "testnet", NOW, QUOTE_EXPIRY)
+        == f"ln:{PAYMENT_HASH}"
+    )
+
+    with pytest.raises(PaymentValidationError, match="network"):
+        validate_payment_terms(lightning_terms(testnet_invoice), "signet", NOW, QUOTE_EXPIRY)
+    with pytest.raises(PaymentValidationError, match="network"):
+        validate_payment_terms(lightning_terms(signet_invoice), "testnet", NOW, QUOTE_EXPIRY)
+
+
 def test_validate_lightning_rejects_expired_future_and_short_lived_invoices() -> None:
     expired = lightning_terms(make_invoice(date=NOW - 700, expiry=600))
     future = lightning_terms(make_invoice(date=NOW + 1))

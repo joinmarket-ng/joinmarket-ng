@@ -23,8 +23,8 @@ _NETWORKS = frozenset({"mainnet", "testnet", "signet", "regtest"})
 _LIGHTNING_CURRENCIES = {
     "mainnet": "bc",
     "testnet": "tb",
-    # BOLT11 uses lntb for both testnet and signet.
-    "signet": "tb",
+    # BOLT11 defines a distinct signet prefix (lntbs), separate from testnet.
+    "signet": "tbs",
     "regtest": "bcrt",
 }
 _SINGLETON_TAGS = frozenset({"d", "h", "p", "s", "n", "f", "x", "c", "m", "9"})
