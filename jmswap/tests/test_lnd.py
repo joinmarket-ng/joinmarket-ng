@@ -646,15 +646,23 @@ async def test_list_channel_input_candidates_wraps_rpc_failures(
         await backend(stub).list_channel_input_candidates(timeout_seconds=0.001)
 
 
-async def test_probe_channel_input_escrow_accepts_only_exact_unknown_session_mismatch(
+@pytest.mark.parametrize(
+    "details",
+    [
+        # A random-session mismatch or an already-spent configured channel both
+        # prove the dedicated escrow service processed the request.
+        "escrow session does not match lock",
+        "channel not found",
+    ],
+)
+async def test_probe_channel_input_escrow_accepts_exact_liveness_domain_errors(
     monkeypatch: pytest.MonkeyPatch,
+    details: str,
 ) -> None:
     target = LndBackend(
         host="localhost:10009", tls_cert=b"cert", macaroon_hex="admin", escrow_macaroon_hex="escrow"
     )
-    escrow_stub = StatusOnlyEscrowStub(
-        error=FakeGrpcError(grpc.StatusCode.UNKNOWN, "escrow session does not match lock")
-    )
+    escrow_stub = StatusOnlyEscrowStub(error=FakeGrpcError(grpc.StatusCode.UNKNOWN, details))
     target._escrow_stub = escrow_stub
     outpoint = EscrowOutpoint(txid="aa" * 32, vout=7)
 

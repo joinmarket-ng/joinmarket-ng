@@ -852,16 +852,22 @@ class LndBackend:
 
     @staticmethod
     def _is_escrow_session_mismatch(error: Exception) -> bool:
+        return LndBackend._escrow_error_details(error) == "escrow session does not match lock"
+
+    @staticmethod
+    def _is_escrow_channel_not_found(error: Exception) -> bool:
+        return LndBackend._escrow_error_details(error) == "channel not found"
+
+    @staticmethod
+    def _escrow_error_details(error: Exception) -> str | None:
         import grpc  # type: ignore[import-untyped]
 
         status_code = getattr(error, "code", None)
         details = getattr(error, "details", None)
-        return (
-            callable(status_code)
-            and callable(details)
-            and status_code() == grpc.StatusCode.UNKNOWN
-            and details() == "escrow session does not match lock"
-        )
+        if callable(status_code) and callable(details) and status_code() == grpc.StatusCode.UNKNOWN:
+            result = details()
+            return result if isinstance(result, str) else None
+        return None
 
     async def list_channel_input_candidates(
         self,
@@ -977,7 +983,12 @@ class LndBackend:
         except TimeoutError as exc:
             raise LndTimeoutError("ChannelEscrowRPC Status probe timed out") from exc
         except Exception as exc:
-            if self._is_escrow_session_mismatch(exc):
+            # Both domain errors prove the dedicated escrow service processed
+            # the request. "channel not found" is expected after a configured
+            # channel's funding outpoint was legitimately spent by a completed
+            # round; an absent or unauthorized escrow service fails with a
+            # transport-level status instead.
+            if self._is_escrow_session_mismatch(exc) or self._is_escrow_channel_not_found(exc):
                 return
             raise LndCapabilityError(f"ChannelEscrowRPC Status probe failed: {exc}") from exc
         raise LndCapabilityError(
