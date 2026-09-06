@@ -180,6 +180,14 @@ def warn_if_destination_script_mismatch(destination: str) -> str | None:
     return dest_type
 
 
+def _log_coinjoin_failure(error: Exception) -> None:
+    """Log a failed round with sensitive detail and its chained cause."""
+    logger.error("CoinJoin failed")
+    logger.bind(sensitive=True).error("CoinJoin failure detail: {}", error)
+    if error.__cause__ is not None:
+        logger.bind(sensitive=True).error("CoinJoin failure cause: {}", error.__cause__)
+
+
 class Taker(TakerMonitoringMixin):
     """
     Main Taker class for executing CoinJoin transactions.
@@ -2048,8 +2056,7 @@ class Taker(TakerMonitoringMixin):
             return await self._finalize_and_broadcast(destination)
 
         except Exception as e:
-            logger.error("CoinJoin failed")
-            logger.bind(sensitive=True).error("CoinJoin failure detail: {}", e)
+            _log_coinjoin_failure(e)
             # Fire-and-forget notification for failed CoinJoin
             phase = self.state.value if hasattr(self, "state") else ""
             amount = self._session.cj_amount

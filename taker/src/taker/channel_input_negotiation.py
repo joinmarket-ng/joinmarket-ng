@@ -7,7 +7,7 @@ from collections.abc import Sequence
 from enum import StrEnum
 from typing import Literal, TypeVar, cast
 
-from coincurve import PublicKey
+from bitcointx.core.key import CPubKey
 from jmcore.channel_input import (
     ChannelInputApprovalPayload,
     ChannelInputApprovalSetAckPayload,
@@ -2377,6 +2377,7 @@ def _validate_node_key(value: str, field_name: str) -> None:
         raw = bytes.fromhex(value)
         if raw[0] not in (2, 3):
             raise ValueError
-        PublicKey(raw)
+        if not CPubKey(raw).is_fullyvalid():
+            raise ValueError
     except ValueError as exc:
         raise ValueError(f"{field_name} must be a compressed secp256k1 public key") from exc

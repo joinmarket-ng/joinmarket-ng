@@ -62,6 +62,32 @@ def test_nick_identity_is_private_durable_and_not_a_snapshot(tmp_path: Path) -> 
     assert store.load_all().safe
 
 
+def test_parent_store_can_coexist_with_negotiations(tmp_path: Path) -> None:
+    from taker.channel_input_parent import ChannelInputParentCoordinator
+
+    store = TakerChannelInputStore(tmp_path / "private", max_active_sessions=1)
+    ChannelInputParentCoordinator(store.directory / "parents")
+    snapshot = _snapshot()
+    store.save(snapshot)
+    assert store.load_all().safe
+    assert store.load(snapshot.invite.session_id, snapshot.invite.attempt) == snapshot
+
+
+@pytest.mark.parametrize("kind", ["symlink", "public", "unexpected"])
+def test_only_private_parent_directory_is_excluded(tmp_path: Path, kind: str) -> None:
+    store = TakerChannelInputStore(tmp_path / "private", max_active_sessions=1)
+    if kind == "symlink":
+        (store.directory / "parents").symlink_to(tmp_path, target_is_directory=True)
+    elif kind == "public":
+        (store.directory / "parents").mkdir(mode=0o755)
+        (store.directory / "parents").chmod(0o755)
+    else:
+        (store.directory / "unexpected").mkdir(mode=0o700)
+    assert not store.load_all().safe
+    with pytest.raises(TakerChannelInputStoreError):
+        store.save(_snapshot())
+
+
 def test_invalid_nick_identity_fails_closed(tmp_path: Path) -> None:
     store = TakerChannelInputStore(tmp_path / "private", max_active_sessions=1)
     identity_path = store.directory / "coordinator-nick.key"

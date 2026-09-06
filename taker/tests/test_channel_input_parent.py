@@ -6,8 +6,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
-from coincurve import PrivateKey
+from bitcointx.core.key import CKey
 from jmcore.bitcoin import (
+    ParsedTransaction,
     TxInput,
     TxOutput,
     analyze_coinjoin_outputs,
@@ -47,7 +48,11 @@ from jmswap.lnd import (
     LndFinalizedEscrowParent,
     WitnessUtxo,
 )
-from jmwallet.wallet.signing import create_p2wpkh_script_code, sign_p2tr_input, sign_p2wpkh_input
+from jmwallet.wallet.signing import (
+    compute_sighash_taproot,
+    create_p2wpkh_script_code,
+    sign_p2wpkh_input,
+)
 
 from taker.channel_input_parent import (
     ChannelContribution,
@@ -95,9 +100,9 @@ class FakeEndpoint:
     def __init__(
         self,
         *,
-        local_key: PrivateKey,
-        remote_key: PrivateKey,
-        funding_key: PrivateKey,
+        local_key: CKey,
+        remote_key: CKey,
+        funding_key: CKey,
         first: bool,
         shared_signature: list[bytes | None],
         crash_after_sign: bool = False,
@@ -105,7 +110,7 @@ class FakeEndpoint:
         fail_freeze_once: bool = False,
         fail_prepare_once: bool = False,
         mutate_final: bool = False,
-        snapshot_peer_key: PrivateKey | None = None,
+        snapshot_peer_key: CKey | None = None,
         snapshot_local_claim_sat: int = 50_000,
         calls: list[str] | None = None,
     ) -> None:
@@ -135,14 +140,14 @@ class FakeEndpoint:
 
     def _snapshot(self, session_id: str, channel_id: str) -> FrozenChannelSnapshot:
         del session_id
-        local = self.local_key.public_key.format(compressed=True)
+        local = bytes(self.local_key.pub)
         remote_key = self.snapshot_peer_key or self.remote_key
-        remote = remote_key.public_key.format(compressed=True)
+        remote = bytes(remote_key.pub)
         return FrozenChannelSnapshot(
             session_id="fake",
             channel_id=channel_id,
             funding_outpoint=EscrowOutpoint(txid="11" * 32, vout=0),
-            funding_scriptpubkey=b"\x51\x20" + self.funding_key.public_key_xonly.format(),
+            funding_scriptpubkey=b"\x51\x20" + bytes(self.funding_key.xonly_pub),
             peer_node_pubkey=remote,
             local_funding_pubkey=local,
             remote_funding_pubkey=remote,
@@ -222,12 +227,12 @@ class FakeEndpoint:
             130_000,
         ]
         scripts = [
-            b"\x51\x20" + self.funding_key.public_key_xonly.format(),
-            pubkey_to_p2wpkh_script(ORDINARY_KEY.public_key.format(compressed=True)),
+            b"\x51\x20" + bytes(self.funding_key.xonly_pub),
+            pubkey_to_p2wpkh_script(bytes(ORDINARY_KEY.pub)),
         ]
         signature = self.shared_signature[0]
         if signature is None:
-            signature = sign_p2tr_input(tx, self.index, prevouts, scripts, self.funding_key)
+            signature = _sign_p2tr_input(tx, self.index, prevouts, scripts, self.funding_key)
             self.shared_signature[0] = signature
         outputs = list(tx.outputs)
         if self.mutate_final:
@@ -283,10 +288,22 @@ class FakeEndpoint:
         return True
 
 
-ORDINARY_KEY = PrivateKey(b"\x07" * 32)
+ORDINARY_KEY = CKey.from_secret_bytes(b"\x07" * 32)
 SESSION_ID = "11" * 32
 FIRST_PARTICIPANT_SECRET = b"\x01" * 32
 SECOND_PARTICIPANT_SECRET = b"\x02" * 32
+
+
+def _sign_p2tr_input(
+    transaction: ParsedTransaction,
+    input_index: int,
+    prevout_values: list[int],
+    prevout_scripts: list[bytes],
+    private_key: CKey,
+) -> bytes:
+    return private_key.sign_schnorr_no_tweak(
+        compute_sighash_taproot(transaction, input_index, prevout_values, prevout_scripts)
+    )
 
 
 def _participant_key(secret: bytes) -> str:
@@ -303,9 +320,9 @@ def _authorization(
     first_claim_adjustment_sat: int,
     second_claim_adjustment_sat: int,
 ) -> ChannelInputAuthorization:
-    funding_key = PrivateKey(b"\x05" * 32)
-    first_node = PrivateKey(b"\x01" * 32)
-    second_node = PrivateKey(b"\x02" * 32)
+    funding_key = CKey.from_secret_bytes(b"\x05" * 32)
+    first_node = CKey.from_secret_bytes(b"\x01" * 32)
+    second_node = CKey.from_secret_bytes(b"\x02" * 32)
     first_participant_key = _participant_key(FIRST_PARTICIPANT_SECRET)
     second_participant_key = _participant_key(SECOND_PARTICIPANT_SECRET)
     ceilings = PolicyCeilings(
@@ -320,8 +337,8 @@ def _authorization(
         input_index=0,
         participant_key=first_participant_key,
         role="first",
-        local_node_key=first_node.public_key.format(compressed=True).hex(),
-        peer_node_key=second_node.public_key.format(compressed=True).hex(),
+        local_node_key=bytes(first_node.pub).hex(),
+        peer_node_key=bytes(second_node.pub).hex(),
         capacity_sat=100_000,
         frozen_local_claim_sat=50_000,
         frozen_remote_claim_sat=50_000,
@@ -341,8 +358,8 @@ def _authorization(
         input_index=0,
         participant_key=second_participant_key,
         role="second",
-        local_node_key=second_node.public_key.format(compressed=True).hex(),
-        peer_node_key=first_node.public_key.format(compressed=True).hex(),
+        local_node_key=bytes(second_node.pub).hex(),
+        peer_node_key=bytes(first_node.pub).hex(),
         capacity_sat=100_000,
         frozen_local_claim_sat=50_000,
         frozen_remote_claim_sat=50_000,
@@ -365,7 +382,7 @@ def _authorization(
             InputPrevout(
                 outpoint=Outpoint(txid="11" * 32, vout=0),
                 value_sat=100_000,
-                script_pubkey=(b"\x51\x20" + funding_key.public_key_xonly.format()).hex(),
+                script_pubkey=(b"\x51\x20" + bytes(funding_key.xonly_pub)).hex(),
             ),
             InputPrevout(
                 outpoint=Outpoint(txid="22" * 32, vout=1),
@@ -465,8 +482,8 @@ def _plan(
     second_claim_adjustment_sat: int = 0,
     first_settlement_value_sat: int | None = None,
 ) -> ChannelInputParentPlan:
-    funding_key = PrivateKey(b"\x05" * 32)
-    ordinary_pubkey = ORDINARY_KEY.public_key.format(compressed=True)
+    funding_key = CKey.from_secret_bytes(b"\x05" * 32)
+    ordinary_pubkey = bytes(ORDINARY_KEY.pub)
     ordinary_script = pubkey_to_p2wpkh_script(ordinary_pubkey)
     inputs = [TxInput.from_hex("11" * 32, 0), TxInput.from_hex("22" * 32, 1)]
     first_value = (
@@ -494,7 +511,7 @@ def _plan(
         prevouts=(
             ParentPrevout(
                 value_sat=100_000,
-                script_pubkey=(b"\x51\x20" + funding_key.public_key_xonly.format()).hex(),
+                script_pubkey=(b"\x51\x20" + bytes(funding_key.xonly_pub)).hex(),
             ),
             ParentPrevout(value_sat=130_000, script_pubkey=ordinary_script.hex()),
         ),
@@ -552,13 +569,13 @@ def _endpoints(
     fail_freeze_once: bool = False,
     fail_prepare_once: bool = False,
     mutate_final: bool = False,
-    first_snapshot_peer_key: PrivateKey | None = None,
+    first_snapshot_peer_key: CKey | None = None,
     first_snapshot_local_claim_sat: int = 50_000,
     calls: list[str] | None = None,
 ) -> dict[str, FakeEndpoint]:
-    first_key = PrivateKey(b"\x01" * 32)
-    second_key = PrivateKey(b"\x02" * 32)
-    funding_key = PrivateKey(b"\x05" * 32)
+    first_key = CKey.from_secret_bytes(b"\x01" * 32)
+    second_key = CKey.from_secret_bytes(b"\x02" * 32)
+    funding_key = CKey.from_secret_bytes(b"\x05" * 32)
     shared_signature: list[bytes | None] = [None]
     return {
         "first": FakeEndpoint(
@@ -588,9 +605,9 @@ def _endpoints(
 
 
 def _final_parent(plan: ChannelInputParentPlan) -> str:
-    funding_key = PrivateKey(b"\x05" * 32)
+    funding_key = CKey.from_secret_bytes(b"\x05" * 32)
     transaction = parse_transaction(plan.unsigned_parent_hex)
-    signature = sign_p2tr_input(
+    signature = _sign_p2tr_input(
         transaction,
         0,
         [prevout.value_sat for prevout in plan.prevouts],
@@ -739,8 +756,8 @@ def test_peer_node_pubkey_is_durable_and_requires_a_valid_compressed_key(tmp_pat
     durable = asyncio.run(
         ChannelInputParentCoordinator(tmp_path).resume(record.plan.session_id, endpoints)
     )
-    expected_first_peer = endpoints["first"].remote_key.public_key.format(compressed=True).hex()
-    expected_second_peer = endpoints["second"].remote_key.public_key.format(compressed=True).hex()
+    expected_first_peer = bytes(endpoints["first"].remote_key.pub).hex()
+    expected_second_peer = bytes(endpoints["second"].remote_key.pub).hex()
 
     assert durable.channels[0].first_snapshot.peer_node_pubkey == expected_first_peer
     assert durable.channels[0].second_snapshot.peer_node_pubkey == expected_second_peer
@@ -783,11 +800,7 @@ def test_authorization_requires_exact_revealed_endpoint_terms(kind: str) -> None
         terms = (
             first,
             second.model_copy(
-                update={
-                    "peer_node_key": PrivateKey(b"\x03" * 32)
-                    .public_key.format(compressed=True)
-                    .hex()
-                }
+                update={"peer_node_key": bytes(CKey.from_secret_bytes(b"\x03" * 32).pub).hex()}
             ),
         )
 
@@ -893,7 +906,7 @@ def test_rejects_frozen_data_that_differs_from_authorization_terms(
     tmp_path: Path, kind: str
 ) -> None:
     endpoints = _endpoints(
-        first_snapshot_peer_key=PrivateKey(b"\x03" * 32) if kind == "peer" else None,
+        first_snapshot_peer_key=CKey.from_secret_bytes(b"\x03" * 32) if kind == "peer" else None,
         first_snapshot_local_claim_sat=49_999 if kind == "claims" else 50_000,
     )
 

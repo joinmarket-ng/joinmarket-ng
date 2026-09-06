@@ -38,8 +38,12 @@ def _config() -> ChannelInputConfig:
 
 def _contribution(nick: str) -> SimpleNamespace:
     return SimpleNamespace(
-        first_endpoint=SimpleNamespace(endpoint_id=f"remote:{nick}"),
-        second_endpoint=SimpleNamespace(endpoint_id=f"local:{nick}"),
+        first_endpoint=SimpleNamespace(
+            endpoint_id=f"remote:{nick}", output=SimpleNamespace(value=0)
+        ),
+        second_endpoint=SimpleNamespace(
+            endpoint_id=f"local:{nick}", output=SimpleNamespace(value=0)
+        ),
     )
 
 
@@ -67,16 +71,22 @@ def _session() -> SimpleNamespace:
         txid="",
     )
     session._phase_build_tx = AsyncMock(return_value=True)
+    session.maker_fee_plan = MagicMock(return_value={"alice": 17, "bob": 17})
     session._revalidate_inputs_before_broadcast = AsyncMock(return_value=(True, ""))
     session.renew_input_locks = MagicMock(return_value=True)
     return session
 
 
-def test_prepare_persists_before_transport_and_builds_once(
-    monkeypatch: pytest.MonkeyPatch, tmp_path
+@pytest.mark.parametrize("reverse_selection", [False, True])
+def test_prepare_persists_uses_paid_fee_plan_and_builds_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path, reverse_selection: bool
 ) -> None:
     events: list[str] = []
     session = _session()
+    if reverse_selection:
+        session.maker_sessions = dict(reversed(session.maker_sessions.items()))
+    paid_maker_fees = {"alice": 1_001, "bob": 1_001}
+    session.maker_fee_plan.return_value = paid_maker_fees
     negotiation = SimpleNamespace(
         selected_nicks=("alice", "bob"), stage=TakerChannelInputStage.HELLOS_READY
     )
@@ -84,6 +94,7 @@ def test_prepare_persists_before_transport_and_builds_once(
     prepare = SimpleNamespace()
 
     def create(**_kwargs: object) -> SimpleNamespace:
+        assert _kwargs["selected_nicks"] == ("alice", "bob")
         events.append("create")
         return negotiation
 
@@ -106,14 +117,26 @@ def test_prepare_persists_before_transport_and_builds_once(
             events.append("prepare")
             return SimpleNamespace(prepare=prepare)
 
-    contributions = (_contribution("alice"), _contribution("bob"))
     fees: list[tuple[TakerChannelInputNegotiation, Mapping[str, int]]] = []
 
     def plan(
         actual: TakerChannelInputNegotiation, mapping: Mapping[str, int]
     ) -> tuple[ChannelTransactionContribution, ...]:
         fees.append((actual, mapping))
-        return cast(tuple[ChannelTransactionContribution, ...], contributions)
+        return cast(
+            tuple[ChannelTransactionContribution, ...],
+            tuple(
+                SimpleNamespace(
+                    first_endpoint=SimpleNamespace(
+                        endpoint_id=f"remote:{nick}", output=SimpleNamespace(value=50_000 + fee)
+                    ),
+                    second_endpoint=SimpleNamespace(
+                        endpoint_id=f"local:{nick}", output=SimpleNamespace(value=50_000 - fee)
+                    ),
+                )
+                for nick, fee in mapping.items()
+            ),
+        )
 
     monkeypatch.setattr("taker.channel_input_coordinator.TakerChannelInputTransport", Transport)
     monkeypatch.setattr(
@@ -123,10 +146,6 @@ def test_prepare_persists_before_transport_and_builds_once(
     monkeypatch.setattr(
         "taker.channel_input_coordinator.derive_channel_input_parent_draft", lambda *a: draft
     )
-    monkeypatch.setattr(
-        "taker.channel_input_coordinator.calculate_cj_fee", lambda offer, amount: 17
-    )
-
     coordinator = TakerChannelInputCoordinator(
         cast(CoinJoinSession, session),
         _config(),
@@ -147,9 +166,14 @@ def test_prepare_persists_before_transport_and_builds_once(
     assert registry.create.await_args.kwargs["expiry"] == 1_060
     assert registry.create.await_args.kwargs["min_recovery_delta"] == 6
     assert registry.create.await_args.kwargs["max_recovery_delta"] == 10
-    assert fees == [(cast(TakerChannelInputNegotiation, negotiation), {"alice": 17, "bob": 17})]
+    assert fees == [(cast(TakerChannelInputNegotiation, negotiation), paid_maker_fees)]
+    session.maker_fee_plan.assert_called_once_with()
+    first_settlement_values = [
+        contribution.first_endpoint.output.value for contribution in coordinator.contributions
+    ]
+    assert first_settlement_values == [51_001, 51_001]
     session._phase_build_tx.assert_awaited_once_with(
-        "bcrt1pdestination", 2, channel_contributions=contributions
+        "bcrt1pdestination", 2, channel_contributions=coordinator.contributions
     )
     assert session.wallet.get_new_persisted_internal_address.call_args_list[0].args == (
         3,
@@ -373,7 +397,6 @@ def test_prepare_rejects_failed_build_without_rebuilding(
         "taker.channel_input_coordinator.plan_channel_input_contributions",
         lambda *_args: (_contribution("alice"),),
     )
-    monkeypatch.setattr("taker.channel_input_coordinator.calculate_cj_fee", lambda *_args: 17)
     coordinator = TakerChannelInputCoordinator(
         cast(CoinJoinSession, session),
         _config(),

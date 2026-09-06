@@ -8,6 +8,7 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from jmcore.directory_pool import DirectoryConnectionResult
 
 from taker.models import TakerState
 from taker.taker import Taker
@@ -60,7 +61,12 @@ async def test_channel_final_broadcast_uses_coordinator_and_exact_input_values(
     session = SimpleNamespace(
         selected_utxos=[],
         maker_sessions={
-            "maker": SimpleNamespace(offer=SimpleNamespace(fidelity_bond_value=0), utxos=[])
+            "maker": SimpleNamespace(
+                offer=SimpleNamespace(
+                    counterparty="maker", fidelity_bond_value=0, fidelity_bond_data=None
+                ),
+                utxos=[],
+            )
         },
         channel_input_coordinator=coordinator,
         final_tx=b"final",
@@ -69,6 +75,12 @@ async def test_channel_final_broadcast_uses_coordinator_and_exact_input_values(
         cj_destination="destination",
         taker_change_address="",
         txid="",
+        podle_commitment=None,
+        broadcast_policy="self",
+        broadcast_method="self",
+        broadcast_fallback_reason="",
+        _minimum_fee_rate_sat_vb=1.0,
+        maker_fee_plan=MagicMock(return_value={"maker": 200}),
         _phase_broadcast=AsyncMock(return_value="normal"),
         _get_taker_cj_output_index=MagicMock(return_value=0),
     )
@@ -85,7 +97,7 @@ async def test_channel_final_broadcast_uses_coordinator_and_exact_input_values(
     )
     monkeypatch.setattr("taker.taker.deserialize_transaction", lambda _raw: tx)
     monkeypatch.setattr("taker.taker.calculate_tx_vsize", lambda _raw: 100)
-    monkeypatch.setattr("taker.taker.calculate_cj_fee", lambda _offer, _amount: 200)
+    monkeypatch.setattr("taker.taker.calculate_cj_fee", lambda _offer, _amount, _round_up: 200)
     monkeypatch.setattr(
         "taker.taker.update_taker_awaiting_transaction_broadcast", lambda **_kwargs: True
     )
@@ -154,6 +166,7 @@ async def test_channel_connect_reconciles_parents_after_directory_connection_and
         enable_channel_input_v1=MagicMock(),
         connect_all=AsyncMock(side_effect=lambda: _record_connect(events)),
         close_all=AsyncMock(side_effect=lambda: _record_close_directories(events)),
+        last_connection_result=DirectoryConnectionResult(connected=1, total=1),
     )
     initialized = SimpleNamespace(
         backend=SimpleNamespace(close=AsyncMock(side_effect=lambda: _record_close_backend(events))),

@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 import pytest
-from coincurve import PrivateKey
+from bitcointx.core.key import CKey
 from jmcore.bitcoin import (
     TxInput,
     TxOutput,
@@ -62,7 +62,7 @@ _MAKER_SECRETS = tuple(index.to_bytes(32, "big") for index in range(2, 5))
 
 
 def _node(index: int) -> str:
-    return PrivateKey(index.to_bytes(32, "big")).public_key.format(compressed=True).hex()
+    return bytes(CKey.from_secret_bytes(index.to_bytes(32, "big")).pub).hex()
 
 
 def _signed_hello(

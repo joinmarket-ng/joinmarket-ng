@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from threading import RLock
 
+from bitcointx.core.key import CKey
 from jmcore.channel_input import MAX_ATTEMPT
 from jmcore.secure_files import atomic_write_private, ensure_private_directory, read_private_file
 
@@ -25,6 +26,21 @@ MAX_TOTAL_RECORDS = 10_000
 MAX_RECORD_BYTES = 4 * 1024 * 1024
 _RECORD_NAME = re.compile(r"^([0-9a-f]{64})-([0-9]+)-([0-9a-f]{64})\.json$")
 _IDENTITY_NAME = "coordinator-nick.key"
+
+
+def _is_parent_store_directory(path: Path) -> bool:
+    """Parent records have their own validator and share only this private root."""
+    if path.name != "parents":
+        return False
+    try:
+        info = path.lstat()
+        return (
+            stat.S_ISDIR(info.st_mode)
+            and stat.S_IMODE(info.st_mode) == 0o700
+            and info.st_uid == os.getuid()
+        )
+    except OSError:
+        return False
 
 
 class TakerChannelInputStoreError(Exception):
@@ -110,9 +126,7 @@ class TakerChannelInputStore:
                     return _read_nick_secret(path)
                 secret = secrets.token_bytes(32)
                 # Validate the scalar before exposing or persisting it.
-                from coincurve import PrivateKey
-
-                PrivateKey(secret)
+                CKey.from_secret_bytes(secret)
                 atomic_write_private(path, secret.hex().encode("ascii"))
                 _fsync_private_directory(self.directory)
                 return secret
@@ -204,7 +218,11 @@ class TakerChannelInputStore:
             except TakerChannelInputStoreError:
                 corruptions.append(f"{_IDENTITY_NAME}: invalid coordinator identity")
         record_paths = [
-            path for path in paths if path.name != _IDENTITY_NAME and not _is_atomic_temp_path(path)
+            path
+            for path in paths
+            if path.name != _IDENTITY_NAME
+            and not _is_atomic_temp_path(path)
+            and not _is_parent_store_directory(path)
         ]
         if len(record_paths) > MAX_TOTAL_RECORDS:
             return TakerChannelInputLoadReport(
@@ -352,9 +370,7 @@ def _read_nick_secret(path: Path) -> bytes:
         if len(encoded) != 64 or encoded.lower() != encoded:
             raise TakerChannelInputStoreError("coordinator identity is invalid")
         secret = bytes.fromhex(encoded.decode("ascii"))
-        from coincurve import PrivateKey
-
-        PrivateKey(secret)
+        CKey.from_secret_bytes(secret)
         return secret
     except TakerChannelInputStoreError:
         raise

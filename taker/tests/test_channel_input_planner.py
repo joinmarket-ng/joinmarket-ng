@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import cast
 
 import pytest
-from coincurve import PrivateKey
+from bitcointx.core.key import CKey
 from jmcore.bitcoin import TxInput, TxOutput, pubkey_to_p2wpkh_script, serialize_transaction
 from jmcore.channel_input import (
     ChannelInputApprovalPayload,
@@ -41,7 +41,7 @@ _MAKER_SECRET = b"\x02" * 32
 
 
 def _node(secret: bytes) -> str:
-    return PrivateKey(secret).public_key.format(compressed=True).hex()
+    return bytes(CKey.from_secret_bytes(secret).pub).hex()
 
 
 def _p2tr(marker: int) -> str:
@@ -91,7 +91,7 @@ class Fixture:
     metadata: dict[str, object]
 
 
-def _fixture() -> Fixture:
+def _fixture(maker_secret: bytes = _MAKER_SECRET) -> Fixture:
     negotiation = TakerChannelInputNegotiation.create(
         network="regtest",
         local_actor="taker",
@@ -105,9 +105,9 @@ def _fixture() -> Fixture:
         min_recovery_delta=10,
         max_recovery_delta=50,
     )
-    maker_key = ChannelInputKeyPair.from_secret(_MAKER_SECRET)
+    maker_key = ChannelInputKeyPair.from_secret(maker_secret)
     remote = _hello(
-        _MAKER_SECRET,
+        maker_secret,
         maker_key.public_key,
         _node(b"\x03" * 32),
         _node(b"\x04" * 32),
@@ -127,9 +127,7 @@ def _fixture() -> Fixture:
     negotiation.accept_hello("maker", remote, local)
     contributions = plan_channel_input_contributions(negotiation, {"maker": 1_000})
     channel = contributions[0]
-    ordinary_script = pubkey_to_p2wpkh_script(
-        PrivateKey(b"\x05" * 32).public_key.format(compressed=True)
-    )
+    ordinary_script = pubkey_to_p2wpkh_script(bytes(CKey.from_secret_bytes(b"\x05" * 32).pub))
     # The channel input and settlements deliberately occupy shuffled positions.
     parent = serialize_transaction(
         2,
@@ -289,7 +287,13 @@ def test_postbuild_derives_shuffled_indexes_exact_bytes_and_fee_rate() -> None:
     assert draft.transcript.total_fee_sat == 500
     assert draft.transcript.fee_rate_sat_vb > 0
     assert draft.transcript.expiry == fixture.negotiation.invite.expiry
-    assert draft.transcript.recovery_height == 130
+    # Makers require exactly their configured recovery delay above their own
+    # height, and that shared policy value travels as the invite minimum.
+    assert (
+        draft.transcript.recovery_height
+        == 100 + fixture.negotiation.invite.min_recovery_delta
+        == 110
+    )
 
 
 def test_postbuild_never_rebuilds_the_parent(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -301,6 +305,25 @@ def test_postbuild_never_rebuilds_the_parent(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(CoinJoinTxBuilder, "build_unsigned_tx", fail_rebuild)
 
     assert _draft(fixture).unsigned_parent == fixture.parent
+
+
+@pytest.mark.parametrize("maker_secret", [bytes([value]) * 32 for value in range(2, 8)])
+def test_postbuild_terms_are_canonical_and_accepted_by_negotiation(maker_secret: bytes) -> None:
+    fixture = _fixture(maker_secret)
+    draft = _draft(fixture)
+
+    assert draft.endpoint_terms == tuple(
+        sorted(
+            draft.endpoint_terms,
+            key=lambda item: (item.funding_outpoint.key(), item.participant_key),
+        )
+    )
+    proposals = fixture.negotiation.plan_proposals(
+        draft.transcript, draft.endpoint_terms, current_time=1_000, current_height=100
+    )
+    assert len(proposals) == 1
+    assert proposals[0][1].recipient_terms[0].role == "first"
+    assert proposals[0][1].transcript.unsigned_parent_tx == fixture.parent.hex()
 
 
 @pytest.mark.parametrize("field", ("input_values", "channel_input_ids", "channel_endpoint_outputs"))

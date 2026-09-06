@@ -139,6 +139,54 @@ async def test_channel_build_sizes_p2tr_shape_and_excludes_advertised_cjfee() ->
 
 
 @pytest.mark.asyncio
+async def test_channel_build_accepts_valid_parent_at_minimum_fee_floor() -> None:
+    session = _build_session()
+    session._minimum_fee_rate_sat_vb = 1.0
+
+    assert await session._phase_build_tx(
+        _TAKER_ADDRESS,
+        0,
+        channel_contributions=(_contribution(),),
+    )
+    assert session.tx_metadata["actual_fee"] > 0
+    assert session._verify_unsigned_minimum_miner_fee() is None
+
+
+def _replace_channel_input(session: CoinJoinSession, replacement: TxInput) -> None:
+    tx = deserialize_transaction(session.unsigned_tx)
+    channel_index = session.tx_metadata["channel_input_ids"].index("channel-1")
+    inputs = list(tx.inputs)
+    inputs[channel_index] = replacement
+    session.unsigned_tx = serialize_transaction(tx.version, inputs, tx.outputs, tx.locktime, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("replacement", "expected_error"),
+    [
+        (TxInput.from_hex("f" * 64, 9), "Missing prevout"),
+        (TxInput.from_hex("a" * 64, 0), "missing or substituted"),
+    ],
+)
+async def test_channel_fee_floor_rejects_missing_or_substituted_prevout(
+    replacement: TxInput, expected_error: str
+) -> None:
+    session = _build_session()
+    assert await session._phase_build_tx(
+        _TAKER_ADDRESS,
+        0,
+        channel_contributions=(_contribution(),),
+    )
+    session._minimum_fee_rate_sat_vb = 1.0
+    _replace_channel_input(session, replacement)
+
+    error = session._verify_unsigned_minimum_miner_fee()
+
+    assert error is not None
+    assert expected_error in error
+
+
+@pytest.mark.asyncio
 async def test_channel_build_failure_clears_transient_state() -> None:
     session = _build_session()
     invalid = ChannelTransactionContribution(

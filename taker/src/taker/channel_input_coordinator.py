@@ -31,7 +31,6 @@ from taker.channel_input_planner import (
 )
 from taker.channel_input_runtime import TakerChannelInputRegistry
 from taker.channel_input_transport import TakerChannelInputTransport
-from taker.orderbook import calculate_cj_fee
 from taker.tx_builder import ChannelTransactionContribution
 
 if TYPE_CHECKING:
@@ -127,7 +126,7 @@ class TakerChannelInputCoordinator:
         attempt = 1
         self._settlement_mixdepth = self._destination_mixdepth(mixdepth)
         negotiation = await self.registry.create(
-            selected_nicks=tuple(self.session.maker_sessions),
+            selected_nicks=tuple(sorted(self.session.maker_sessions)),
             secret_key=secret,
             session_id=session_id,
             attempt=attempt,
@@ -155,10 +154,8 @@ class TakerChannelInputCoordinator:
             )
         negotiation = reloaded
         self._negotiation = reloaded
-        maker_fees = {
-            nick: calculate_cj_fee(self.session.maker_sessions[nick].offer, self.session.cj_amount)
-            for nick in negotiation.selected_nicks
-        }
+        paid_maker_fees = self.session.maker_fee_plan()
+        maker_fees = {nick: paid_maker_fees[nick] for nick in negotiation.selected_nicks}
         self._contributions = plan_channel_input_contributions(negotiation, maker_fees)
         self._build_started = True
         built = await self.session._phase_build_tx(

@@ -13,7 +13,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Protocol
 
-from coincurve import PublicKey, PublicKeyXOnly
+from bitcointx.core.key import CPubKey, XOnlyPubKey
 from jmcore.bitcoin import (
     get_txid,
     parse_transaction,
@@ -116,7 +116,8 @@ def _compressed_pubkey(value: str, name: str) -> str:
     if not value.startswith(("02", "03")):
         raise ValueError(f"{name} is not compressed")
     try:
-        PublicKey(bytes.fromhex(value))
+        if not CPubKey(bytes.fromhex(value)).is_fullyvalid():
+            raise ValueError
     except ValueError as exc:
         raise ValueError(f"{name} is not a valid secp256k1 public key") from exc
     return value
@@ -125,7 +126,8 @@ def _compressed_pubkey(value: str, name: str) -> str:
 def _xonly_pubkey(value: str, name: str) -> str:
     _hex(value, name, length=32)
     try:
-        PublicKeyXOnly(bytes.fromhex(value))
+        if not XOnlyPubKey(bytes.fromhex(value)).is_fullyvalid():
+            raise ValueError
     except ValueError as exc:
         raise ValueError(f"{name} is not a valid BIP340 public key") from exc
     return value

@@ -1871,13 +1871,40 @@ class CoinJoinSession:
             tx = deserialize_transaction(self.unsigned_tx)
         except TransactionSigningError as exc:
             return f"Cannot verify unsigned CoinJoin miner fee: {exc}"
-        total_input = sum(utxo.value for utxo in self.selected_utxos) + sum(
-            utxo["value"] for session in self.maker_sessions.values() for utxo in session.utxos
-        )
+        if self.channel_contributions:
+            try:
+                prevout_values, _prevout_scripts = self._assemble_prevouts(
+                    tx, self._build_prevout_map()
+                )
+            except (TransactionSigningError, TypeError, ValueError) as exc:
+                return f"Cannot verify unsigned CoinJoin miner fee: {exc}"
+            transaction_outpoints = {
+                (tx_input.txid_le[::-1].hex(), tx_input.vout) for tx_input in tx.inputs
+            }
+            for contribution in self.channel_contributions:
+                funding_input = contribution.funding_input
+                if (funding_input.txid, funding_input.vout) not in transaction_outpoints:
+                    return (
+                        "Cannot verify unsigned CoinJoin miner fee: channel input "
+                        f"{funding_input.txid}:{funding_input.vout} is missing or substituted"
+                    )
+            total_input = sum(prevout_values)
+            input_types, output_types = self._build_script_type_lists(
+                self.selected_utxos,
+                len(tx.outputs),
+                channel_input_count=len(self.channel_contributions),
+                channel_output_count=2 * len(self.channel_contributions),
+            )
+        else:
+            # Ordinary CoinJoins retain the existing session-value accounting;
+            # only channel parents add separately negotiated prevouts.
+            total_input = sum(utxo.value for utxo in self.selected_utxos) + sum(
+                utxo["value"] for session in self.maker_sessions.values() for utxo in session.utxos
+            )
+            input_types, output_types = self._build_script_type_lists(
+                self.selected_utxos, len(tx.outputs)
+            )
         fee = total_input - sum(output.value for output in tx.outputs)
-        input_types, output_types = self._build_script_type_lists(
-            self.selected_utxos, len(tx.outputs)
-        )
         vsize = estimate_vsize(input_types, output_types)
         if fee < 0:
             return "CoinJoin has a negative miner fee"

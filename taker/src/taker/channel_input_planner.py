@@ -184,7 +184,12 @@ def derive_channel_input_parent_draft(
             ),
             channels=channels,
             transcript=transcript,
-            endpoint_terms=endpoint_terms,
+            endpoint_terms=tuple(
+                sorted(
+                    endpoint_terms,
+                    key=lambda item: (item.funding_outpoint.key(), item.participant_key),
+                )
+            ),
             maximum_miner_fee_sat=maximum_miner_fee_sat,
         )
     except ChannelInputPlanningError:
@@ -593,10 +598,10 @@ def _build_transcript(
     fee_sat: int,
     current_height: int,
 ) -> ChannelInputTranscript:
-    recovery_delta = (
-        negotiation.invite.min_recovery_delta + negotiation.invite.max_recovery_delta
-    ) // 2
-    recovery_height = current_height + recovery_delta
+    # Makers enforce recovery_height == their height + their exact configured
+    # recovery delay. The invite's minimum carries that shared policy value; the
+    # window above it only tolerates maker height lag during validation.
+    recovery_height = current_height + negotiation.invite.min_recovery_delta
     if recovery_height > 0xFFFFFFFF:
         raise ValueError("recovery height overflows uint32")
     descriptors = tuple(
