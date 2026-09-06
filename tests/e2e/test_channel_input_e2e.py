@@ -400,9 +400,7 @@ def taker_config(data_dir: Path, channel_points: dict[str, str]) -> TakerConfig:
             lnd_grpc_url=f"https://127.0.0.1:{LND_PORTS['lnd-taker']}",
             lnd_tls_cert_path=lnd_path("lnd-taker", "tls.cert"),
             lnd_macaroon_path=lnd_path("lnd-taker", "admin.macaroon"),
-            lnd_escrow_macaroon_path=lnd_path(
-                "lnd-taker", "channelescrow.macaroon"
-            ),
+            lnd_escrow_macaroon_path=lnd_path("lnd-taker", "channelescrow.macaroon"),
             allowed_channel_points=tuple(sorted(channel_points.values())),
             minimum_makers=3,
             min_channel_capacity_sat=1_000_000,

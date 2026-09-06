@@ -147,6 +147,9 @@ def test_complete_profile_fetches_tumbler_lock_for_hash_verification() -> None:
     assert _release_file_paths(result) == [
         "jmcore/requirements.txt",
         "jmwallet/requirements.txt",
+        # The maker and tumbler profiles install the jmswap channel backend,
+        # so its lock joins the hash-verified set.
+        "jmswap/requirements.txt",
         "maker/requirements.txt",
         "taker/requirements.txt",
         "tumbler/requirements.txt",
