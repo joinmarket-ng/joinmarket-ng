@@ -78,6 +78,10 @@ class DirectoryClientError(Exception):
     """Error raised by DirectoryClient operations."""
 
 
+class _DirectoryClientLimitError(DirectoryClientError):
+    """Internal error for directory-controlled resource limit exhaustion."""
+
+
 @dataclass(frozen=True)
 class PeerlistSnapshot:
     """A completed, authoritative GETPEERLIST response."""
@@ -106,6 +110,22 @@ _NICK_AUTH_MESSAGE_TYPES = frozenset(
         MessageType.NICK_AUTH_RESULT.value,
     }
 )
+
+
+# These are intentionally internal fixed limits. Directory responses are untrusted,
+# and callers must not be able to disable these bounds through configuration.
+MAX_BUFFERED_MESSAGES = 1_024
+MAX_BUFFERED_MESSAGE_BYTES = 8 * 1024 * 1024
+MAX_COLLECTED_MESSAGES = 10_000
+MAX_COLLECTED_MESSAGE_BYTES = 32 * 1024 * 1024
+MAX_INFLIGHT_PEERLIST_CHUNKS = 1_024
+MAX_INFLIGHT_PEERLIST_BYTES = 8 * 1024 * 1024
+MAX_RETAINED_OFFERS = 10_000
+MAX_RETAINED_PEERS = 20_000
+MAX_PEER_FEATURES = 64
+MAX_NICK_UTF8_BYTES = 64
+MAX_LOCATION_UTF8_BYTES = 300
+MAX_FEATURE_UTF8_BYTES = 128
 
 
 def _fidelity_bond_claim_key(bond_data: dict[str, Any]) -> str:
@@ -287,6 +307,7 @@ class DirectoryClient:
         self._active_peers: dict[str, str] = {}
         self.running = False
         self.on_disconnect = on_disconnect
+        self._disconnect_notified = False
         self.initial_orderbook_received = False
         self.last_orderbook_request_time: float = 0.0
         self.last_offer_received_time: float | None = None
@@ -336,7 +357,10 @@ class DirectoryClient:
 
         # Message buffer for messages received while waiting for specific responses
         # (e.g., PEERLIST). These messages should be processed, not discarded.
-        self._message_buffer: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        self._message_buffer: asyncio.Queue[dict[str, Any]] = asyncio.Queue(
+            maxsize=MAX_BUFFERED_MESSAGES
+        )
+        self._message_buffer_bytes = 0
 
         # In-flight GETPEERLIST sink. When non-None, the listen() receive loop
         # redirects PEERLIST payloads into this queue instead of handling them
@@ -344,6 +368,7 @@ class DirectoryClient:
         # both read from self.connection concurrently and the listener
         # "steals" the response (see issue #259).
         self._peerlist_inflight: asyncio.Queue[str | None] | None = None
+        self._peerlist_inflight_bytes = 0
 
         # True only while listen_continuously()'s receive loop is actively
         # reading from the connection. _fetch_peerlist() uses this to decide
@@ -352,8 +377,150 @@ class DirectoryClient:
         # the initial startup fetch before the listen loop begins).
         self._listen_loop_active: bool = False
 
+    @staticmethod
+    def _serialized_message_size(message: dict[str, Any]) -> int:
+        """Return the UTF-8 JSON size used for message collection limits."""
+        try:
+            return len(json.dumps(message).encode("utf-8"))
+        except (TypeError, ValueError, UnicodeEncodeError) as e:
+            raise _DirectoryClientLimitError(
+                f"Unable to measure directory message size: {e}"
+            ) from e
+
+    @staticmethod
+    def _utf8_size(value: str, field_name: str) -> int:
+        """Return a control field's UTF-8 size, rejecting invalid strings."""
+        try:
+            return len(value.encode("utf-8"))
+        except UnicodeEncodeError as e:
+            raise _DirectoryClientLimitError(
+                f"Directory {field_name} is not valid UTF-8 text"
+            ) from e
+
+    def _validate_nick_storage(self, nick: str) -> None:
+        if self._utf8_size(nick, "peer nick") > MAX_NICK_UTF8_BYTES:
+            raise _DirectoryClientLimitError(
+                f"Directory peer nick exceeds {MAX_NICK_UTF8_BYTES} UTF-8 bytes"
+            )
+
+    def _validate_peer_storage(self, nick: str, location: str) -> None:
+        self._validate_nick_storage(nick)
+        if self._utf8_size(location, "peer location") > MAX_LOCATION_UTF8_BYTES:
+            raise _DirectoryClientLimitError(
+                f"Directory peer location exceeds {MAX_LOCATION_UTF8_BYTES} UTF-8 bytes"
+            )
+
+    def _validate_feature_storage(self, feature: str) -> None:
+        if self._utf8_size(feature, "feature identifier") > MAX_FEATURE_UTF8_BYTES:
+            raise _DirectoryClientLimitError(
+                f"Directory feature identifier exceeds {MAX_FEATURE_UTF8_BYTES} UTF-8 bytes"
+            )
+
+    def _buffer_message(self, message: dict[str, Any]) -> None:
+        """Buffer one unexpected message without allowing queue growth or blocking."""
+        message_size = self._serialized_message_size(message)
+        if self._message_buffer.qsize() >= MAX_BUFFERED_MESSAGES:
+            raise _DirectoryClientLimitError(
+                f"Directory message buffer limit exceeded: maximum {MAX_BUFFERED_MESSAGES} messages"
+            )
+        if self._message_buffer_bytes + message_size > MAX_BUFFERED_MESSAGE_BYTES:
+            raise _DirectoryClientLimitError(
+                "Directory message buffer byte limit exceeded: "
+                f"maximum {MAX_BUFFERED_MESSAGE_BYTES} bytes"
+            )
+        try:
+            self._message_buffer.put_nowait(message)
+        except asyncio.QueueFull as e:
+            raise _DirectoryClientLimitError(
+                f"Directory message buffer limit exceeded: maximum {MAX_BUFFERED_MESSAGES} messages"
+            ) from e
+        self._message_buffer_bytes += message_size
+
+    def _discard_buffered_message(self, message: dict[str, Any]) -> None:
+        """Update byte accounting after a buffered message is consumed."""
+        self._message_buffer_bytes = max(
+            0, self._message_buffer_bytes - self._serialized_message_size(message)
+        )
+
+    def _append_collected_message(
+        self,
+        messages: list[dict[str, Any]],
+        message: dict[str, Any],
+        total_bytes: int,
+        collection_name: str,
+    ) -> int:
+        """Append a received message after enforcing collection count and byte limits."""
+        message_size = self._serialized_message_size(message)
+        if len(messages) >= MAX_COLLECTED_MESSAGES:
+            raise _DirectoryClientLimitError(
+                f"Directory {collection_name} message limit exceeded: "
+                f"maximum {MAX_COLLECTED_MESSAGES} messages"
+            )
+        if total_bytes + message_size > MAX_COLLECTED_MESSAGE_BYTES:
+            raise _DirectoryClientLimitError(
+                f"Directory {collection_name} byte limit exceeded: "
+                f"maximum {MAX_COLLECTED_MESSAGE_BYTES} bytes"
+            )
+        messages.append(message)
+        return total_bytes + message_size
+
+    def _enqueue_peerlist_chunk(self, peerlist_str: str) -> None:
+        """Route a peerlist chunk to the sole fetch reader without blocking the listener."""
+        peerlist_sink = self._peerlist_inflight
+        if peerlist_sink is None:
+            return
+
+        chunk_size = self._utf8_size(peerlist_str, "peerlist chunk")
+        if peerlist_sink.qsize() >= MAX_INFLIGHT_PEERLIST_CHUNKS:
+            raise _DirectoryClientLimitError(
+                "Directory peerlist in-flight queue limit exceeded: "
+                f"maximum {MAX_INFLIGHT_PEERLIST_CHUNKS} chunks"
+            )
+        if self._peerlist_inflight_bytes + chunk_size > MAX_INFLIGHT_PEERLIST_BYTES:
+            raise _DirectoryClientLimitError(
+                "Directory peerlist in-flight byte limit exceeded: "
+                f"maximum {MAX_INFLIGHT_PEERLIST_BYTES} bytes"
+            )
+        try:
+            peerlist_sink.put_nowait(peerlist_str)
+        except asyncio.QueueFull as e:
+            raise _DirectoryClientLimitError(
+                "Directory peerlist in-flight queue limit exceeded: "
+                f"maximum {MAX_INFLIGHT_PEERLIST_CHUNKS} chunks"
+            ) from e
+        self._peerlist_inflight_bytes += chunk_size
+
+    def _discard_peerlist_chunk(self, peerlist_str: str) -> None:
+        """Update in-flight queue byte accounting after a fetch consumes one chunk."""
+        self._peerlist_inflight_bytes = max(
+            0,
+            self._peerlist_inflight_bytes - self._utf8_size(peerlist_str, "peerlist chunk"),
+        )
+
+    async def _abort_for_resource_limit(self, error: _DirectoryClientLimitError) -> None:
+        """Disconnect and wake any sole-reader waiter before exposing a limit error."""
+        self.running = False
+        self._listen_loop_active = False
+        self._wake_peerlist_sink()
+        with contextlib.suppress(Exception):
+            await self.close()
+        self._notify_disconnect()
+        raise error
+
+    @staticmethod
+    def _reraise_resource_limit(error: Exception) -> None:
+        """Keep resource limit failures out of best-effort parse error handling."""
+        if isinstance(error, _DirectoryClientLimitError):
+            raise error
+
+    async def _abort_if_resource_limit(self, error: Exception) -> None:
+        """Close the client when a broad handler receives a resource limit failure."""
+        if isinstance(error, _DirectoryClientLimitError):
+            await self._abort_for_resource_limit(error)
+
     async def connect(self) -> None:
         """Connect to the directory server and perform handshake."""
+        self._disconnect_notified = False
         try:
             logger.bind(sensitive=True).debug(
                 f"DirectoryClient.connect: connecting to {self.host}:{self.port}"
@@ -660,6 +827,8 @@ class DirectoryClient:
         """
         try:
             return (await self._fetch_peerlist_result()).snapshot
+        except _DirectoryClientLimitError:
+            raise
         except Exception as e:
             logger.bind(sensitive=True).debug(
                 f"GETPEERLIST did not yield an authoritative snapshot: {e}"
@@ -719,7 +888,8 @@ class DirectoryClient:
                 # surface the condition loudly if it ever does.
                 logger.warning("Another GETPEERLIST is already in flight; aborting duplicate fetch")
                 return _PeerlistFetchResult(peers=(), snapshot=None, legacy_returns_none=True)
-            self._peerlist_inflight = asyncio.Queue()
+            self._peerlist_inflight = asyncio.Queue(maxsize=MAX_INFLIGHT_PEERLIST_CHUNKS)
+            self._peerlist_inflight_bytes = 0
 
         getpeerlist_msg = {"type": MessageType.GETPEERLIST.value, "line": ""}
         logger.debug("Sending GETPEERLIST request")
@@ -777,12 +947,13 @@ class DirectoryClient:
                         )
                         if peerlist_str is None:
                             raise DirectoryClientError("Connection lost while waiting for PEERLIST")
+                        self._discard_peerlist_chunk(peerlist_str)
                         consecutive_errors = 0
                         got_first_response = True
                         chunks_received += 1
                         chunk_peers, chunk_malformed = self._process_peerlist_response(peerlist_str)
                         response_incomplete = response_incomplete or chunk_malformed
-                        all_peers.extend(chunk_peers)
+                        self._extend_peerlist_peers(all_peers, chunk_peers)
                         logger.debug(
                             f"Received PEERLIST chunk {chunks_received} with "
                             f"{len(chunk_peers)} peers (total: {len(all_peers)})"
@@ -803,7 +974,7 @@ class DirectoryClient:
                         peerlist_str = response.get("line", "")
                         chunk_peers, chunk_malformed = self._process_peerlist_response(peerlist_str)
                         response_incomplete = response_incomplete or chunk_malformed
-                        all_peers.extend(chunk_peers)
+                        self._extend_peerlist_peers(all_peers, chunk_peers)
                         logger.debug(
                             f"Received PEERLIST chunk {chunks_received} with "
                             f"{len(chunk_peers)} peers (total: {len(all_peers)})"
@@ -820,7 +991,7 @@ class DirectoryClient:
                     logger.trace(
                         f"Buffering unexpected message type {msg_type} while waiting for PEERLIST"
                     )
-                    await self._message_buffer.put(response)
+                    self._buffer_message(response)
 
                 except TimeoutError:
                     if not got_first_response:
@@ -849,6 +1020,8 @@ class DirectoryClient:
                     raise DirectoryClientError(
                         f"Connection lost while waiting for PEERLIST: {e}"
                     ) from e
+                except _DirectoryClientLimitError as e:
+                    await self._abort_for_resource_limit(e)
                 except DirectoryClientError:
                     raise
 
@@ -875,6 +1048,7 @@ class DirectoryClient:
         finally:
             if use_inflight_sink:
                 self._peerlist_inflight = None
+                self._peerlist_inflight_bytes = 0
 
         # Success - reset timeout counter and mark as supported
         self._peerlist_timeout_count = 0
@@ -917,6 +1091,18 @@ class DirectoryClient:
         peers, _ = self._process_peerlist_response(peerlist_str)
         return peers
 
+    @staticmethod
+    def _extend_peerlist_peers(
+        all_peers: list[tuple[str, str, FeatureSet]],
+        chunk_peers: list[tuple[str, str, FeatureSet]],
+    ) -> None:
+        """Accumulate a fetch response without permitting an unbounded snapshot."""
+        if len(all_peers) + len(chunk_peers) > MAX_RETAINED_PEERS:
+            raise _DirectoryClientLimitError(
+                f"Directory peerlist snapshot limit exceeded: maximum {MAX_RETAINED_PEERS} peers"
+            )
+        all_peers.extend(chunk_peers)
+
     def _process_peerlist_response(
         self, peerlist_str: str
     ) -> tuple[list[tuple[str, str, FeatureSet]], bool]:
@@ -932,7 +1118,7 @@ class DirectoryClient:
             return [], False
 
         peers: list[tuple[str, str, FeatureSet]] = []
-        explicitly_disconnected: list[str] = []
+        explicitly_disconnected: set[str] = set()
         malformed = False
 
         for entry in peerlist_str.split(","):
@@ -952,16 +1138,40 @@ class DirectoryClient:
                 )
                 if disconnected:
                     # Nick explicitly marked as disconnected - remove their offers
-                    explicitly_disconnected.append(nick)
+                    if (
+                        nick not in explicitly_disconnected
+                        and len(explicitly_disconnected) >= MAX_RETAINED_PEERS
+                    ):
+                        raise _DirectoryClientLimitError(
+                            "Directory peerlist disconnect limit exceeded: "
+                            f"maximum {MAX_RETAINED_PEERS} peers"
+                        )
+                    explicitly_disconnected.add(nick)
                 else:
+                    if len(peers) >= MAX_RETAINED_PEERS:
+                        raise _DirectoryClientLimitError(
+                            "Directory peerlist chunk limit exceeded: "
+                            f"maximum {MAX_RETAINED_PEERS} peers"
+                        )
+                    self._validate_peer_storage(nick, location)
+                    if (
+                        nick not in self._active_peers
+                        and len(self._active_peers) >= MAX_RETAINED_PEERS
+                    ):
+                        raise _DirectoryClientLimitError(
+                            "Directory active peer limit exceeded: "
+                            f"maximum {MAX_RETAINED_PEERS} peers"
+                        )
+                    # Merge features before active-peer mutation so a feature cache
+                    # limit cannot leave a partially added peer behind.
+                    features_dict = features.to_dict()
+                    self._merge_peer_features(nick, features_dict)
                     peers.append((nick, location, features))
                     # Update/add this nick to active peers
                     self._active_peers[nick] = location
                     # Merge features into peer_features cache (never overwrite/downgrade)
                     # This prevents losing features when receiving peerlist from directories
                     # that don't support peerlist_features
-                    features_dict = features.to_dict()
-                    self._merge_peer_features(nick, features_dict)
 
                     # Update features on any cached offers for this peer
                     # This fixes the race condition where offers are stored before
@@ -1012,6 +1222,7 @@ class DirectoryClient:
             raise DirectoryClientError("Connection closed")
 
         messages: list[dict[str, Any]] = []
+        total_message_bytes = 0
         start_time = asyncio.get_event_loop().time()
 
         # First, drain any buffered messages into our result list
@@ -1019,14 +1230,19 @@ class DirectoryClient:
         while not self._message_buffer.empty():
             try:
                 buffered_msg = self._message_buffer.get_nowait()
+                self._discard_buffered_message(buffered_msg)
                 await self._reject_out_of_order_nick_auth(buffered_msg.get("type"))
                 logger.bind(sensitive=True).trace(
                     f"Processing buffered message type {buffered_msg.get('type')}: "
                     f"{buffered_msg.get('line', '')[:80]}..."
                 )
-                messages.append(buffered_msg)
+                total_message_bytes = self._append_collected_message(
+                    messages, buffered_msg, total_message_bytes, "listen"
+                )
             except asyncio.QueueEmpty:
                 break
+            except _DirectoryClientLimitError as e:
+                await self._abort_for_resource_limit(e)
 
         # Track consecutive errors to prevent tight loops on persistent failures
         consecutive_errors = 0
@@ -1054,7 +1270,9 @@ class DirectoryClient:
                     consecutive_errors = 0
                     continue
 
-                messages.append(response)
+                total_message_bytes = self._append_collected_message(
+                    messages, response, total_message_bytes, "listen"
+                )
                 consecutive_errors = 0
 
             except TimeoutError:
@@ -1063,6 +1281,8 @@ class DirectoryClient:
             except NetworkConnectionError as e:
                 # Connection-level errors from our network layer - always propagate
                 raise DirectoryClientError(f"Connection lost: {e}") from e
+            except _DirectoryClientLimitError as e:
+                await self._abort_for_resource_limit(e)
             except DirectoryClientError:
                 raise
             except (ConnectionResetError, BrokenPipeError, OSError) as e:
@@ -1163,6 +1383,7 @@ class DirectoryClient:
         offer_prefixes = ("sw0absoffer", "sw0reloffer", "swabsoffer", "swreloffer")
 
         messages: list[dict[str, Any]] = []
+        total_message_bytes = 0
         offer_count = 0
         start_time = asyncio.get_event_loop().time()
         last_offer_time = start_time
@@ -1191,7 +1412,12 @@ class DirectoryClient:
             chunk = await self.listen_for_messages(duration=listen_time)
             new_offers = 0
             for msg in chunk:
-                messages.append(msg)
+                try:
+                    total_message_bytes = self._append_collected_message(
+                        messages, msg, total_message_bytes, "orderbook fetch"
+                    )
+                except _DirectoryClientLimitError as e:
+                    await self._abort_for_resource_limit(e)
                 # Lightweight offer detection: check if the line contains an offer type
                 line = msg.get("line", "")
                 if any(prefix in line for prefix in offer_prefixes):
@@ -1217,6 +1443,8 @@ class DirectoryClient:
                     try:
                         self._handle_peerlist_response(line)
                         logger.debug("Processed PEERLIST during orderbook fetch")
+                    except _DirectoryClientLimitError as e:
+                        await self._abort_for_resource_limit(e)
                     except Exception as e:
                         logger.bind(sensitive=True).debug(f"Failed to process PEERLIST: {e}")
                     continue
@@ -1265,6 +1493,8 @@ class DirectoryClient:
                 else:
                     logger.bind(sensitive=True).debug(f"Message not an offer: {rest[:50]}...")
 
+            except _DirectoryClientLimitError as e:
+                await self._abort_for_resource_limit(e)
             except Exception as e:
                 logger.warning("Failed to process directory message")
                 logger.bind(sensitive=True).warning(f"Failed to process message: {e}")
@@ -1381,10 +1611,20 @@ class DirectoryClient:
         # after this listener detects the disconnect.
         peerlist_sink = self._peerlist_inflight
         if peerlist_sink is not None:
-            peerlist_sink.put_nowait(None)
+            while True:
+                try:
+                    peerlist_sink.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+            self._peerlist_inflight_bytes = 0
+            with contextlib.suppress(asyncio.QueueFull):
+                peerlist_sink.put_nowait(None)
 
     def _notify_disconnect(self) -> None:
         """Run the optional disconnect callback without breaking cleanup."""
+        if self._disconnect_notified:
+            return
+        self._disconnect_notified = True
         if self.on_disconnect is None:
             return
         try:
@@ -1462,6 +1702,7 @@ class DirectoryClient:
                     "learned from offer messages"
                 )
         except Exception as e:
+            await self._abort_if_resource_limit(e)
             logger.warning("Failed to fetch peerlist with features")
             logger.bind(sensitive=True).warning(f"Failed to fetch peerlist with features: {e}")
 
@@ -1486,6 +1727,7 @@ class DirectoryClient:
                 # (e.g., messages received while waiting for PEERLIST)
                 if not self._message_buffer.empty():
                     message = await self._message_buffer.get()
+                    self._discard_buffered_message(message)
                     logger.trace("Processing buffered message from queue")
                 else:
                     # Read next message with timeout
@@ -1510,14 +1752,12 @@ class DirectoryClient:
                     # this message is an unsolicited update (e.g. a peer
                     # disconnect broadcast) and we update state directly.
                     if self._peerlist_inflight is not None:
-                        try:
-                            self._peerlist_inflight.put_nowait(line)
-                        except asyncio.QueueFull:
-                            logger.debug("PEERLIST sink queue full; dropping chunk")
+                        self._enqueue_peerlist_chunk(line)
                         continue
                     try:
                         self._handle_peerlist_response(line)
                     except Exception as e:
+                        self._reraise_resource_limit(e)
                         logger.bind(sensitive=True).debug(f"Failed to process PEERLIST: {e}")
                     continue
 
@@ -1598,6 +1838,7 @@ class DirectoryClient:
                                     self.initial_orderbook_received = True
                                     self.last_offer_received_time = time.monotonic()
                     except Exception as e:
+                        self._reraise_resource_limit(e)
                         logger.bind(sensitive=True).debug(f"Failed to process PUBMSG: {e}")
 
             except TimeoutError:
@@ -1608,6 +1849,7 @@ class DirectoryClient:
                 )
                 break
             except Exception as e:
+                await self._abort_if_resource_limit(e)
                 logger.error("Directory listener failed")
                 logger.bind(sensitive=True).error(f"Error in continuous listening: {e}")
                 self._notify_disconnect()
@@ -1627,6 +1869,9 @@ class DirectoryClient:
         bond_data: dict[str, Any] | None,
     ) -> bool:
         """Store one parsed offer while preserving monotonic bond renewals."""
+        # Offers can arrive before a peerlist update. Retain their empty feature
+        # entry only after applying the same peer cap as peerlist processing.
+        self._merge_peer_features(from_nick, {})
         bond_claim_key = _fidelity_bond_claim_key(bond_data) if bond_data else None
         if not self._store_offer((from_nick, offer.oid), offer, bond_claim_key):
             return False
@@ -1643,7 +1888,6 @@ class DirectoryClient:
                 fidelity_bond_data=bond_data,
             )
 
-        self.peer_features.setdefault(from_nick, {})
         logger.bind(sensitive=True).debug(
             f"Updated offer cache: {from_nick} {offer.ordertype.value} oid={offer.oid}"
             + (" (with bond)" if bond_data else "")
@@ -1798,6 +2042,7 @@ class DirectoryClient:
         """
         current_time = time.time()
         old_offer_data = self.offers.get(offer_key)
+        self._validate_nick_storage(offer_key[0])
         new_expiry = (offer.fidelity_bond_data or {}).get("cert_expiry", -1)
 
         if bond_utxo_key:
@@ -1812,6 +2057,13 @@ class DirectoryClient:
                         f"claim already has certificate expiring at {old_expiry}"
                     )
                     return False
+
+        # Never evict an unrelated cached offer to make room for a newly seen
+        # one. Existing keys remain updateable at the limit.
+        if old_offer_data is None and len(self.offers) >= MAX_RETAINED_OFFERS:
+            raise _DirectoryClientLimitError(
+                f"Directory offer cache limit exceeded: maximum {MAX_RETAINED_OFFERS} offers"
+            )
 
         # An offer can rotate from one bond claim to another. Remove its old
         # reverse index before processing deduplication for the replacement.
@@ -1845,8 +2097,7 @@ class DirectoryClient:
                         f"Removing stale offer from {old_key[0]} oid={old_key[1]} - "
                         f"same bond UTXO now used by {offer_key[0]}"
                     )
-                    del self.offers[old_key]
-                    self._bond_to_offers[bond_utxo_key].discard(old_key)
+                    self._remove_offer(old_key)
 
             # Update bond -> offers mapping: add this offer to the set
             if bond_utxo_key not in self._bond_to_offers:
@@ -1898,15 +2149,29 @@ class DirectoryClient:
         Returns:
             Number of offers updated
         """
-        updated = 0
-        for key, offer_ts in self.offers.items():
-            if key[0] == nick:
-                # Update features on the cached offer
-                # Merge new features with any existing ones (new features take precedence)
-                for feature, value in features.items():
-                    if value:  # Only set true features
-                        offer_ts.offer.features[feature] = value
-                updated += 1
+        self._validate_nick_storage(nick)
+        positive_features = {feature for feature, value in features.items() if value}
+        for feature in positive_features:
+            self._validate_feature_storage(feature)
+
+        matching_offers = [offer_ts for key, offer_ts in self.offers.items() if key[0] == nick]
+        for offer_ts in matching_offers:
+            merged_feature_count = len(
+                {feature for feature, value in offer_ts.offer.features.items() if value}
+                | positive_features
+            )
+            if merged_feature_count > MAX_PEER_FEATURES:
+                raise _DirectoryClientLimitError(
+                    "Directory offer feature limit exceeded: "
+                    f"maximum {MAX_PEER_FEATURES} features per peer"
+                )
+
+        for offer_ts in matching_offers:
+            # Merge new features with any existing ones (new features take precedence).
+            for feature in positive_features:
+                offer_ts.offer.features[feature] = True
+
+        updated = len(matching_offers)
 
         if updated > 0:
             logger.bind(sensitive=True).debug(
@@ -1935,10 +2200,30 @@ class DirectoryClient:
             nick: The peer's nick
             new_features: New features dict to merge (only True values are added)
         """
-        existing = self.peer_features.get(nick, {})
-        for feature, value in new_features.items():
-            if value:  # Only set true features, never downgrade
-                existing[feature] = value
+        self._validate_nick_storage(nick)
+        existing = self.peer_features.get(nick)
+        positive_features = {feature for feature, value in new_features.items() if value}
+        for feature in positive_features:
+            self._validate_feature_storage(feature)
+
+        if existing is None:
+            if len(self.peer_features) >= MAX_RETAINED_PEERS:
+                raise _DirectoryClientLimitError(
+                    "Directory peer feature cache limit exceeded: "
+                    f"maximum {MAX_RETAINED_PEERS} peers"
+                )
+            existing = {}
+
+        added_features = positive_features.difference(existing)
+        if len(existing) + len(added_features) > MAX_PEER_FEATURES:
+            raise _DirectoryClientLimitError(
+                "Directory peer feature limit exceeded: "
+                f"maximum {MAX_PEER_FEATURES} features per peer"
+            )
+
+        for feature in added_features:
+            # Only set true features, never downgrade an existing positive value.
+            existing[feature] = True
         self.peer_features[nick] = existing
 
     def remove_offers_for_nick(self, nick: str) -> int:
@@ -1993,6 +2278,8 @@ class DirectoryClient:
                 logger.debug(
                     f"Refreshed peerlist for new peer discovery: {len(peers)} active peers"
                 )
+        except _DirectoryClientLimitError:
+            raise
         except Exception as e:
             logger.bind(sensitive=True).debug(f"Failed to refresh peerlist for new peer: {e}")
 
