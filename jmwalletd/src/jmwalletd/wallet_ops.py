@@ -10,13 +10,14 @@ module only wires things together in the way the HTTP daemon needs.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import fcntl
 import os
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar
 
 from loguru import logger
 
@@ -25,6 +26,37 @@ from jmcore.secure_files import atomic_write_private, ensure_private_directory, 
 
 if TYPE_CHECKING:
     from jmcore.settings import WalletSettings
+
+
+P = ParamSpec("P")
+T = TypeVar("T")
+
+
+async def _run_wallet_file_operation(
+    operation: Callable[P, T], /, *args: P.args, **kwargs: P.kwargs
+) -> T:
+    """Run blocking wallet-file work without releasing lifecycle ownership early."""
+    worker_task = asyncio.create_task(asyncio.to_thread(operation, *args, **kwargs))
+    cancelled = False
+
+    while not worker_task.done():
+        try:
+            await asyncio.shield(worker_task)
+        except asyncio.CancelledError:
+            cancelled = True
+        except BaseException:
+            break
+
+    try:
+        result = worker_task.result()
+    except BaseException:
+        if cancelled:
+            raise asyncio.CancelledError from None
+        raise
+
+    if cancelled:
+        raise asyncio.CancelledError
+    return result
 
 
 def _is_descriptor_backend(backend: Any) -> bool:
@@ -149,7 +181,8 @@ async def create_wallet(
         # Initial sync to populate caches.
         await ws.sync()
 
-        _save_wallet_file(
+        await _run_wallet_file_operation(
+            _save_wallet_file,
             wallet_path=wallet_path,
             mnemonic=seedphrase,
             password=password,
@@ -268,7 +301,8 @@ async def _recover_reserved_wallet(
 
         # Do not leave a wallet file behind when descriptor setup or initial
         # synchronization fails. The same recovery request must be retryable.
-        _save_wallet_file(
+        await _run_wallet_file_operation(
+            _save_wallet_file,
             wallet_path=wallet_path,
             mnemonic=seedphrase,
             password=password,
@@ -305,7 +339,9 @@ async def open_wallet_with_mnemonic(
     if not wallet_path.exists():
         raise FileNotFoundError(f"Wallet file not found: {wallet_path}")
 
-    seedphrase, creation_height = _load_wallet_file(wallet_path=wallet_path, password=password)
+    seedphrase, creation_height = await _run_wallet_file_operation(
+        _load_wallet_file, wallet_path=wallet_path, password=password
+    )
 
     # Legacy or manually migrated wallet data may contain a phrase with an
     # invalid BIP39 checksum. Such a phrase still derives a wallet and may
@@ -372,7 +408,7 @@ async def verify_wallet_password(*, wallet_path: Path, password: str) -> None:
     """
     if not wallet_path.exists():
         raise FileNotFoundError(f"Wallet file not found: {wallet_path}")
-    _load_wallet_file(wallet_path=wallet_path, password=password)
+    await _run_wallet_file_operation(_load_wallet_file, wallet_path=wallet_path, password=password)
 
 
 async def open_wallet(
