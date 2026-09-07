@@ -7,9 +7,12 @@ from hashlib import sha256
 import pytest
 from bitcointx.core.key import CKey
 from jmcore.bitcoin import (
+    BIP32Derivation,
+    PSBTInput,
     TxInput,
     TxOutput,
     create_p2wpkh_script_code,
+    create_psbt,
     encode_varint,
     estimate_vsize,
     pubkey_to_p2wpkh_script,
@@ -26,6 +29,7 @@ from jmwallet.wallet.psbt import (
     PSBTError,
     parse_psbt,
 )
+from jmwallet.wallet.service import WalletService
 from jmwallet.wallet.signing import (
     TransactionSigningError,
     verify_p2wpkh_signature,
@@ -135,6 +139,57 @@ def test_signs_regular_input_from_verified_key_origin(wallet_service) -> None:
         create_p2wpkh_script_code(pubkey),
         100_000,
         signature,
+        pubkey,
+    )
+
+
+@pytest.mark.parametrize("legacy_empty_script", [False, True])
+def test_signs_jmcore_psbt_preserving_input_records(
+    wallet_service: WalletService, legacy_empty_script: bool
+) -> None:
+    """New exports omit empty scripts; signing still preserves older imported records."""
+    records, pubkey, script_pubkey = _regular_input_records(wallet_service, 1, 1, 3, 100_000)
+    raw = create_psbt(
+        version=2,
+        inputs=[TxInput.from_hex("aa" * 32, 2)],
+        outputs=[TxOutput(value=98_000, script=b"\x00\x14" + b"\x33" * 20)],
+        locktime=0,
+        psbt_inputs=[
+            PSBTInput(
+                witness_utxo_value=100_000,
+                witness_utxo_script=script_pubkey,
+                witness_script=b"",
+                bip32_derivations=[
+                    BIP32Derivation(
+                        pubkey=pubkey,
+                        fingerprint=wallet_service.master_key.fingerprint,
+                        path=[84 | HARDENED, 0 | HARDENED, 1 | HARDENED, 1, 3],
+                    )
+                ],
+            )
+        ],
+    )
+    parsed = parse_psbt(raw)
+    assert [(record.key, record.value) for record in parsed.input_maps[0].records] == records
+    if legacy_empty_script:
+        parsed.append_input_key_value(0, bytes([PSBT_IN_WITNESS_SCRIPT]), b"")
+        raw = parsed.serialize()
+
+    plan = wallet_service.prepare_psbt_signing(raw, scan_range=0)
+    result = wallet_service.sign_psbt(plan)
+
+    assert result.signed_indices == (0,)
+    signed = parse_psbt(result.psbt)
+    assert signed.unsigned_tx == parsed.unsigned_tx
+    assert signed.input_maps[0].records[:-1] == parsed.input_maps[0].records
+    signature_record = signed.input_maps[0].records[-1]
+    assert signature_record.key == bytes([PSBT_IN_PARTIAL_SIG]) + pubkey
+    assert verify_p2wpkh_signature(
+        signed.transaction,
+        0,
+        create_p2wpkh_script_code(pubkey),
+        100_000,
+        signature_record.value,
         pubkey,
     )
 

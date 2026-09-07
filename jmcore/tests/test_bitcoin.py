@@ -309,6 +309,66 @@ class TestPSBTMagic:
 class TestCreatePSBT:
     """Tests for create_psbt function."""
 
+    @pytest.mark.parametrize(
+        "input_types",
+        [
+            ("p2wpkh",),
+            ("p2wsh",),
+            ("p2wpkh", "p2wsh", "p2wpkh"),
+            ("p2wsh_missing_script",),
+        ],
+    )
+    def test_witness_script_serialization_matches_bitcointx(
+        self, input_types: tuple[str, ...]
+    ) -> None:
+        """Match the reference implementation's omission of empty witness scripts."""
+        from bitcointx.core import CTxOut
+        from bitcointx.core.psbt import PSBT_Input
+        from bitcointx.core.script import CScript
+
+        ws = _make_witness_script()
+        p2wpkh = pubkey_to_p2wpkh_script(TEST_PUBKEY_HEX)
+        p2wsh = _make_p2wsh_scriptpubkey(ws)
+        script_data = {
+            "p2wpkh": (p2wpkh, b""),
+            "p2wsh": (p2wsh, ws),
+            "p2wsh_missing_script": (p2wsh, b""),
+        }
+        inputs = [
+            TxInput.from_hex(TEST_TXID, index, sequence=0xFFFFFFFE)
+            for index in range(len(input_types))
+        ]
+        outputs = [TxOutput(value=100_000 * len(inputs) - 1_000, script=p2wpkh)]
+        metadata = [
+            PSBTInput(
+                witness_utxo_value=100_000,
+                witness_utxo_script=script_data[input_type][0],
+                witness_script=script_data[input_type][1],
+            )
+            for input_type in input_types
+        ]
+        raw = create_psbt(2, inputs, outputs, TEST_LOCKTIME, metadata)
+
+        # Compare complete maps, including separators, instead of searching raw bytes.
+        reference_maps = b"".join(
+            PSBT_Input(
+                utxo=CTxOut(pi.witness_utxo_value, CScript(pi.witness_utxo_script)),
+                witness_script=CScript(pi.witness_script),
+                sighash_type=pi.sighash_type,
+            ).serialize()
+            for pi in metadata
+        )
+        unsigned_tx = serialize_transaction(2, inputs, outputs, TEST_LOCKTIME)
+        assert raw == (
+            PSBT_MAGIC
+            + b"\x01\x00"
+            + encode_varint(len(unsigned_tx))
+            + unsigned_tx
+            + b"\x00"
+            + reference_maps
+            + b"\x00" * len(outputs)
+        )
+
     def test_psbt_starts_with_magic(self) -> None:
         """PSBT must begin with the BIP-174 magic bytes."""
         ws = _make_witness_script()

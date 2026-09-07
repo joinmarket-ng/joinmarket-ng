@@ -1479,7 +1479,8 @@ class PSBTInput:
     Attributes:
         witness_utxo_value: Value of the UTXO in satoshis.
         witness_utxo_script: scriptPubKey of the UTXO (e.g. P2WSH 34-byte script).
-        witness_script: The full witness script (redeem script) for P2WSH inputs.
+        witness_script: The full witness script for P2WSH inputs. Empty bytes mean
+            no script is supplied (e.g. P2WPKH) and omit PSBT_IN_WITNESS_SCRIPT.
         sighash_type: Sighash type (default SIGHASH_ALL = 0x01).
         bip32_derivations: Optional BIP32 key origin info for signing devices.
     """
@@ -1502,7 +1503,7 @@ def create_psbt(
 
     Builds a complete PSBT with:
     - Global map: the unsigned transaction (no witness data, empty scriptSigs)
-    - Per-input maps: WITNESS_UTXO, WITNESS_SCRIPT, SIGHASH_TYPE
+    - Per-input maps: WITNESS_UTXO, SIGHASH_TYPE, and WITNESS_SCRIPT when nonempty
     - Per-output maps: empty (no metadata needed for spending)
 
     The resulting PSBT can be imported into hardware wallet software
@@ -1554,8 +1555,9 @@ def create_psbt(
         sighash_bytes = struct.pack("<I", pi.sighash_type)
         result.extend(_serialize_psbt_pair(PSBT_IN_SIGHASH_TYPE, sighash_bytes))
 
-        # PSBT_IN_WITNESS_SCRIPT: the full witness script
-        result.extend(_serialize_psbt_pair(PSBT_IN_WITNESS_SCRIPT, pi.witness_script))
+        # Match python-bitcointx: an empty script means the field is absent.
+        if pi.witness_script:
+            result.extend(_serialize_psbt_pair(PSBT_IN_WITNESS_SCRIPT, pi.witness_script))
 
         # PSBT_IN_BIP32_DERIVATION: key origin info for signing devices
         # BIP-174: key = <0x06> <pubkey>, value = <4-byte fingerprint> <4-byte LE index>...
