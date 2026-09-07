@@ -29,6 +29,7 @@ import httpx
 from jmcore.bitcoin import btc_to_sats, get_txid
 from loguru import logger
 
+from jmwallet.backends._transport_security import warn_if_unencrypted_remote_http
 from jmwallet.backends.base import (
     UTXO,
     BlockchainBackend,
@@ -192,6 +193,7 @@ class DescriptorWalletBackend(BlockchainBackend):
             scan_lookback_blocks: Blocks to look back when no explicit start is set
         """
         self.rpc_url = rpc_url.rstrip("/")
+        warn_if_unencrypted_remote_http(self.rpc_url)
         self.rpc_user = rpc_user
         self.rpc_password = rpc_password
         self.wallet_name = wallet_name

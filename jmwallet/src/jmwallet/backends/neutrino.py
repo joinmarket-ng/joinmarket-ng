@@ -34,6 +34,7 @@ from jmcore.constants import MAX_MONEY
 from jmcore.secure_files import atomic_write_private
 from loguru import logger
 
+from jmwallet.backends._transport_security import warn_if_unencrypted_remote_http
 from jmwallet.backends.base import (
     UTXO,
     BlockchainBackend,
@@ -195,6 +196,7 @@ class NeutrinoBackend(BlockchainBackend):
                 fee source requests, typically the Tor SOCKS port.
         """
         self.neutrino_url = neutrino_url.rstrip("/")
+        warn_if_unencrypted_remote_http(self.neutrino_url)
         self.network = network
         self.add_peers = add_peers or []
         self.data_dir = data_dir
