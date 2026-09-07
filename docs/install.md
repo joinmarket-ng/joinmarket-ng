@@ -100,10 +100,15 @@ When the authenticated installer runs `--update`, it:
 - Upgrades all installed Python packages to the specified (or latest) version
 - Resolves and installs any new or changed dependencies (so a swapped dependency, such as PyNaCl replacing libnacl, is installed rather than leaving the venv missing a module)
 - Verifies the core libraries import cleanly after the update and prints actionable remediation if a runtime module is missing
-- Checks your config for new settings: compares `config.toml` against the latest template and prints any new sections or keys that are available
+- Compares the previously installed full template with the target release's template, with section labels for each diff hunk
 - Refreshes shell completions and Tor configuration
 
-Your existing config is never modified. If new settings are available, the installer prints them so you can add them manually from `~/.joinmarket-ng/config.toml.template`, a reference copy of the current template that is kept in sync on every install and update.
+Your existing config contents are never modified. Interactive updates offer the
+template diff; unattended updates print it. When comparison is unavailable
+(for example, an older installation without a bundled template), the installer
+points to the release notes instead. The current full reference is kept at
+`~/.joinmarket-ng/config.toml.template`. Omitted options already use built-in
+defaults, so there is no need to copy every new option into your config.
 
 ### Existing Installations
 
@@ -262,12 +267,14 @@ The `requirements.txt` lock files are the single source of truth and are regener
 
 Edit `~/.joinmarket-ng/config.toml`.
 
+New installations start with a small set of commented connection and fee
+examples. Uncomment only your overrides; use the adjacent `config.toml.template`
+for the full reference. Existing customized configs are left intact.
+
 If this is a manual/source install and the file does not exist yet:
 
 ```bash
-mkdir -p ~/.joinmarket-ng/wallets
-chmod 700 ~/.joinmarket-ng ~/.joinmarket-ng/wallets
-curl -fsSL https://raw.githubusercontent.com/joinmarket-ng/joinmarket-ng/main/jmcore/src/jmcore/data/config.toml.template -o ~/.joinmarket-ng/config.toml
+python -c 'from jmcore.settings import ensure_config_file; print(ensure_config_file())'
 ```
 
 ### Bitcoin Core (`descriptor_wallet`, recommended)

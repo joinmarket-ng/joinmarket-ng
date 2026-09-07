@@ -1682,6 +1682,12 @@ def get_config_path() -> Path:
     return data_dir / "config.toml"
 
 
+def generate_config_starter() -> str:
+    """Return the small, override-only starter shipped with this release."""
+    ref = importlib.resources.files("jmcore") / "data" / "config-starter.toml.template"
+    return ref.read_text(encoding="utf-8")
+
+
 def generate_config_template() -> str:
     """
     Generate a config file template with all settings commented out.
@@ -1960,7 +1966,7 @@ def migrate_config(
     config_path: Path,
     template_text: str | None = None,
 ) -> list[str]:
-    """Create the config file from the template if it does not exist.
+    """Create a small starter config if the config file does not exist.
 
     When the config file already exists, no modifications are made.
     Use :func:`config_diff` to discover new settings that the user
@@ -1974,9 +1980,9 @@ def migrate_config(
 
     Args:
         config_path: Path to the user's ``config.toml``.
-        template_text: Template text for fresh creation.  When *None*,
-            the bundled ``config.toml.template`` shipped with the package
-            is used.
+        template_text: Explicit template for both fresh creation and the
+            reference copy (retained for compatibility). When *None*, create
+            from the bundled starter and refresh the separate full reference.
 
     Returns:
         Empty list (kept for backward compatibility).
@@ -1989,6 +1995,7 @@ def migrate_config(
     if config_exists:
         ensure_sensitive_file(config_path)
 
+    custom_template = template_text is not None
     if template_text is None:
         template_text = _get_bundled_template()
     if template_text is None:
@@ -1998,17 +2005,19 @@ def migrate_config(
         return []
 
     if not config_exists:
-        logger.info(f"Config file missing; creating from template at {config_path}")
-        atomic_write_sensitive_file(config_path, template_text.encode("utf-8"))
+        logger.info(f"Config file missing; creating starter at {config_path}")
+        starter_text = template_text if custom_template else generate_config_starter()
+        atomic_write_sensitive_file(config_path, starter_text.encode("utf-8"))
 
     # Keep a reference copy of the template alongside the config so users
     # can diff their settings against the current version's template.
     # Failures here must never break startup or config creation.
     template_copy = config_path.with_name("config.toml.template")
     try:
-        if (
-            not template_copy.exists()
-            or read_sensitive_file(template_copy).decode("utf-8") != template_text
+        if template_copy.resolve() == config_path.resolve():
+            raise OSError("Reference template aliases the user config; leaving it unchanged")
+        if not template_copy.exists() or read_sensitive_file(template_copy) != template_text.encode(
+            "utf-8"
         ):
             atomic_write_sensitive_file(template_copy, template_text.encode("utf-8"))
     except OSError as exc:
@@ -2023,7 +2032,7 @@ def ensure_config_file(
 ) -> Path:
     """Ensure the config file exists.
 
-    On first run the config file is created from the bundled template.
+    On first run the config file is created from the bundled starter.
     Existing config files are never modified.
 
     The config file location is resolved with this priority:
@@ -2101,6 +2110,7 @@ __all__ = [
     "reset_settings",
     "get_config_path",
     "generate_config_template",
+    "generate_config_starter",
     "ensure_config_file",
     "config_diff",
     "migrate_config",

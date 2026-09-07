@@ -163,6 +163,20 @@ CONFIG_FILE="${DATA_DIR}/config.toml"
 LOG_DIR="${DATA_DIR}/logs"
 MAKER_ENV="${DATA_DIR}/.maker.env"
 
+# ---- Activate virtual environment -------------------------------------------
+# Prefer the environment paired with this TUI over global entry points or
+# appliance wrappers that happen to be earlier in PATH. Activate before TOML
+# reads so the config helper is always loaded from the selected installation.
+if [ -f "$VENV_BIN/activate" ]; then
+    source "$VENV_BIN/activate"
+elif ! command -v jm-wallet &>/dev/null; then
+    echo "ERROR: jm-wallet not found in PATH and no venv at $VENV_BIN"
+    exit 1
+fi
+# Ensure ~/.local/bin is in PATH (fallback for pip console scripts)
+export PATH="${HOME_JM}/.local/bin:$PATH"
+TUI_PYTHON=$(command -v python3)
+
 # ---- CLI logging inside the TUI --------------------------------------------
 # jm-wallet / jm-* commands use loguru and log to stderr.
 # In a menu UI, INFO-level logs pollute the output (issue #459), so the
@@ -172,7 +186,7 @@ MAKER_ENV="${DATA_DIR}/.maker.env"
 #
 # Priority: environment variable > config.toml > built-in default (WARNING)
 if [ -z "${LOGGING__LEVEL:-}" ]; then
-    TUI_LOG_LEVEL=$(python3 - "$CONFIG_FILE" <<'PYEOF' 2>/dev/null
+    TUI_LOG_LEVEL=$("$TUI_PYTHON" - "$CONFIG_FILE" <<'PYEOF' 2>/dev/null
 import sys, pathlib
 try:
     import tomllib
@@ -198,7 +212,7 @@ DEFAULT_MIXDEPTH="0"
 DEFAULT_FEE_RATE=""
 DEFAULT_DESTINATION=""
 # Counterparty default: read from config.toml [taker] section, fall back to 10
-DEFAULT_COUNTERPARTIES=$(python3 - "$CONFIG_FILE" <<'PYEOF' 2>/dev/null
+DEFAULT_COUNTERPARTIES=$("$TUI_PYTHON" - "$CONFIG_FILE" <<'PYEOF' 2>/dev/null
 import sys, pathlib
 try:
     import tomllib
@@ -219,18 +233,6 @@ DEFAULT_COUNTERPARTIES="${DEFAULT_COUNTERPARTIES:-10}"
 
 # Ensure log directory exists
 mkdir -p "$LOG_DIR"
-
-# ---- Activate virtual environment -------------------------------------------
-# Prefer the environment paired with this TUI over global entry points or
-# appliance wrappers that happen to be earlier in PATH.
-if [ -f "$VENV_BIN/activate" ]; then
-    source "$VENV_BIN/activate"
-elif ! command -v jm-wallet &>/dev/null; then
-    echo "ERROR: jm-wallet not found in PATH and no venv at $VENV_BIN"
-    exit 1
-fi
-# Ensure ~/.local/bin is in PATH (fallback for pip console scripts)
-export PATH="${HOME_JM}/.local/bin:$PATH"
 
 # =============================================================================
 # Notes for Contributors
@@ -260,16 +262,14 @@ pause() {
 
 # Helper: Get configured mnemonic file from config.toml
 get_mnemonic_file() {
-    local val
-    val=$(grep '^mnemonic_file[[:space:]]*=' "$CONFIG_FILE" 2>/dev/null | head -1 | sed 's/^mnemonic_file[[:space:]]*=[[:space:]]*//' | tr -d '"')
-    echo "$val"
+    "$TUI_PYTHON" -m jmcore.config_file get \
+        --config "$CONFIG_FILE" --section wallet --key mnemonic_file
 }
 
 # Helper: Get stored mnemonic_password from config.toml (empty if unset/commented).
 get_stored_mnemonic_password() {
-    local val
-    val=$(grep '^mnemonic_password[[:space:]]*=' "$CONFIG_FILE" 2>/dev/null | head -1 | sed 's/^mnemonic_password[[:space:]]*=[[:space:]]*//' | tr -d '"')
-    echo "$val"
+    "$TUI_PYTHON" -m jmcore.config_file get \
+        --config "$CONFIG_FILE" --section wallet --key mnemonic_password
 }
 
 # Helper: Read the temporary wallet password from .maker.env (empty if absent).
@@ -306,36 +306,40 @@ write_maker_env() {
     chmod 600 "$MAKER_ENV"
 }
 
-# Helper: Comment out (clear) a value in config.toml
+# Helper: Remove a value in config.toml.
 clear_config_value() {
-    local key=$1
-    if grep -q "^${key}[[:space:]]*=" "$CONFIG_FILE"; then
-        sed -i "s|^${key}[[:space:]]*=.*|# ${key} =|" "$CONFIG_FILE"
-    fi
+    local section=$1
+    local key=$2
+    "$TUI_PYTHON" -m jmcore.config_file remove \
+        --config "$CONFIG_FILE" --section "$section" --key "$key"
 }
 
-# Helper: Set a value in config.toml (uncomment if needed)
-# Values are escaped for safe use in sed replacement strings.
+# Helper: Set a string value in config.toml. Secrets travel over stdin so they
+# are never present in a process command line or environment variable.
 set_config_value() {
-    local key=$1
-    local value=$2
-    local quote=$3 # "true" to wrap in quotes
+    local section=$1
+    local key=$2
+    local value=$3
+    printf '%s' "$value" | "$TUI_PYTHON" -m jmcore.config_file set \
+        --config "$CONFIG_FILE" --section "$section" --key "$key"
+}
 
-    if [ "$quote" == "true" ]; then
-        value="\"${value}\""
-    fi
+# Clear the saved password before changing the active wallet. If saving the
+# new wallet fails, the old wallet remains selected without a mismatched secret.
+set_active_wallet_config() {
+    local wallet_path=$1
+    clear_config_value wallet mnemonic_password || return 1
+    set_config_value wallet mnemonic_file "$wallet_path"
+}
 
-    # Escape sed metacharacters in the value (backslash, ampersand, pipe delimiter)
-    local sed_value
-    sed_value=$(printf '%s' "$value" | sed -e 's/[&\\/|]/\\&/g')
+clear_active_wallet_config() {
+    clear_config_value wallet mnemonic_password || return 1
+    clear_config_value wallet mnemonic_file
+}
 
-    if grep -q "^${key}[[:space:]]*=" "$CONFIG_FILE"; then
-        sed -i "s|^${key}[[:space:]]*=.*|${key} = ${sed_value}|" "$CONFIG_FILE"
-    elif grep -q "^#[[:space:]]*${key}[[:space:]]*=" "$CONFIG_FILE"; then
-        sed -i "s|^#[[:space:]]*${key}[[:space:]]*=.*|${key} = ${sed_value}|" "$CONFIG_FILE"
-    else
-        echo "# Warning: Could not find key '${key}' in config"
-    fi
+show_config_save_error() {
+    whiptail --title " Config Error " \
+        --msgbox "Could not finish updating config.toml. The active wallet was not changed." 8 60
 }
 
 # Helper: List .mnemonic files in wallets dir
@@ -495,7 +499,7 @@ store_password() {
     if [ "$RASPIBLITZ" = "1" ]; then
         sudo "$BONUS_SCRIPT" store-password "$password"
     else
-        set_config_value "mnemonic_password" "$password" "true"
+        set_config_value wallet mnemonic_password "$password"
     fi
 }
 
@@ -554,7 +558,12 @@ prompt_and_store_password() {
             return 1
         fi
         if verify_wallet_password "$wallet_path" "$pwd_store"; then
-            store_password "${pwd_store}"
+            if ! store_password "${pwd_store}"; then
+                unset pwd_store
+                whiptail --title " Config Error " \
+                    --msgbox "Could not save the wallet password to config.toml." 8 55
+                return 1
+            fi
             unset pwd_store
             whiptail --title " Password Stored " \
                 --msgbox "Password verified and saved to config.toml." 8 55
@@ -746,9 +755,10 @@ post_wallet_create() {
     if whiptail --title " Active Wallet " \
         --yesno "Set this wallet as the active wallet in config?\n\n$(basename "$wallet_path")" \
         10 60 3>&1 1>&2 2>&3; then
-        set_config_value "mnemonic_file" "$wallet_path" "true"
-        # Clear any previously stored password -- it belongs to the old wallet.
-        clear_config_value "mnemonic_password"
+        if ! set_active_wallet_config "$wallet_path"; then
+            show_config_save_error
+            return 1
+        fi
         set_active=1
         whiptail --title " Wallet Updated " --msgbox "Active wallet updated in config.toml." 8 55
     fi
@@ -780,9 +790,13 @@ post_wallet_create() {
                 # Password came from the just-completed wallet creation, so
                 # it trivially matches the wallet -- no need to re-prompt or
                 # re-verify (issue #462).
-                store_password "$known_password"
-                whiptail --title " Password Stored " \
-                    --msgbox "Password saved to config.toml." 8 55
+                if store_password "$known_password"; then
+                    whiptail --title " Password Stored " \
+                        --msgbox "Password saved to config.toml." 8 55
+                else
+                    whiptail --title " Config Error " \
+                        --msgbox "Could not save the wallet password to config.toml." 8 55
+                fi
             else
                 if ! prompt_and_store_password "$wallet_path"; then
                     whiptail --title " Password " --msgbox "Password not stored." 8 50
@@ -875,8 +889,10 @@ check_stale_wallet() {
         whiptail --title " Stale Wallet Config " \
             --msgbox "The configured wallet file no longer exists:\n\n$CURRENT_WALLET\n\nThis usually means the .mnemonic file was deleted\noutside the TUI. Clearing mnemonic_file and\nmnemonic_password from config.toml.\n\nUse 'Wallet Management' to select or create a\nnew active wallet." \
             16 70 3>&1 1>&2 2>&3 || true
-        clear_config_value "mnemonic_file"
-        clear_config_value "mnemonic_password"
+        if ! clear_active_wallet_config; then
+            show_config_save_error
+            return 1
+        fi
         CURRENT_WALLET=""
     fi
     if [ -n "$CURRENT_WALLET" ]; then
@@ -910,8 +926,10 @@ ensure_active_wallet() {
     # in the loop; this handles the rare case where the file was deleted
     # between the loop's check and this call).
     if [ -n "$CURRENT_WALLET" ] && [ ! -f "$CURRENT_WALLET" ]; then
-        clear_config_value "mnemonic_file"
-        clear_config_value "mnemonic_password"
+        if ! clear_active_wallet_config; then
+            show_config_save_error
+            return 1
+        fi
         CURRENT_WALLET=""
     fi
 
@@ -943,8 +961,10 @@ ensure_active_wallet() {
         local only_wallet
         only_wallet=$(printf '%s\n' "$wallets" | sed -n '1p')
         local only_path="$DATA_DIR/wallets/$only_wallet"
-        set_config_value "mnemonic_file" "$only_path" "true"
-        clear_config_value "mnemonic_password"
+        if ! set_active_wallet_config "$only_path"; then
+            show_config_save_error
+            return 1
+        fi
         CURRENT_WALLET="$only_path"
         wallet_just_changed="yes"
     else
@@ -976,8 +996,10 @@ ensure_active_wallet() {
 
         # Update config
         if [ "$CURRENT_WALLET" != "$selected_path" ]; then
-            set_config_value "mnemonic_file" "$selected_path" "true"
-            clear_config_value "mnemonic_password"
+            if ! set_active_wallet_config "$selected_path"; then
+                show_config_save_error
+                return 1
+            fi
             CURRENT_WALLET="$selected_path"
             wallet_just_changed="yes"
         fi
@@ -1685,9 +1707,11 @@ No:  automatic coin selection from one mixdepth." 12 64
               echo "Please wait..."
 
               if [ -f "$DATA_DIR/wallets/$WNAME" ]; then
-                  set_config_value "mnemonic_file" "$DATA_DIR/wallets/$WNAME" "true"
-                  # Clear stored password to prevent mismatch with the new wallet
-                  clear_config_value "mnemonic_password"
+                  if ! set_active_wallet_config "$DATA_DIR/wallets/$WNAME"; then
+                      show_config_save_error
+                      clear
+                      continue
+                  fi
 
                   # Check if wallet is encrypted before offering to store password
                   # (issue #455 Case 3: previously the old password was cleared with
@@ -2138,10 +2162,12 @@ No:  automatic coin selection from one mixdepth." 12 64
               "WARNING" "WARNING - Warning messages only (default)" \
               "ERROR"   "ERROR   - Error messages only" 3>&1 1>&2 2>&3) || continue
 
-            set_config_value "log_level" "$LOG_CHOICE" "true"
-            export LOGGING__LEVEL="$LOG_CHOICE"
-
-            whiptail --title " Log Level " --msgbox "Log level set to: $LOG_CHOICE\n\nChanges take effect immediately." 9 50
+            if set_config_value tui log_level "$LOG_CHOICE"; then
+              export LOGGING__LEVEL="$LOG_CHOICE"
+              whiptail --title " Log Level " --msgbox "Log level set to: $LOG_CHOICE\n\nChanges take effect immediately." 9 50
+            else
+              whiptail --title " Config Error " --msgbox "Could not save the log level to config.toml." 8 55
+            fi
             ;;
 
           DELPW)
@@ -2159,8 +2185,11 @@ No:  automatic coin selection from one mixdepth." 12 64
               "\n$WALLET_INFO | Maker Bot: $MAKER_STATUS\n\nDelete the stored password for wallet:\n$(basename "$CURRENT_WALLET")\n\nThis will require entering the password on next use." \
               13 60 --defaultno 3>&1 1>&2 2>&3; then
 
-              clear_config_value "mnemonic_password"
-              whiptail --title " Password Deleted " --msgbox "Wallet password removed from config.toml." 8 50
+              if clear_config_value wallet mnemonic_password; then
+                whiptail --title " Password Deleted " --msgbox "Wallet password removed from config.toml." 8 50
+              else
+                whiptail --title " Config Error " --msgbox "Could not remove the wallet password from config.toml." 8 55
+              fi
             fi
             ;;
 

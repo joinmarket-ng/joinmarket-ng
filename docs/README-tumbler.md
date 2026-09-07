@@ -242,9 +242,10 @@ process can be resumed by re-running `jm-tumbler run`.
 
 ## Configuration
 
-Tumbler defaults live in `config.toml` under the `[tumbler]` section. Run
-`jm-tumbler config-init` to write a copy of `config.toml.template` to your data
-directory; relevant keys are documented inline there. Per-plan knobs such as
+Tumbler overrides live in `config.toml` under the `[tumbler]` section. Run
+`jm-tumbler config-init` to create a small starter config and the separate full
+`config.toml.template` reference in your data directory. Add a `[tumbler]` section
+when overriding its built-in defaults. Per-plan knobs such as
 `--maker-count-min`, `--mincjamount-sats`, `--maker-sessions/--no-maker-sessions`,
 and `--seed` override the config for one invocation only.
 

@@ -21,15 +21,44 @@ Template/reference:
   `~/.joinmarket-ng/config.toml.template` and refreshed automatically on
   install, update, and component startup.
 
-The installer creates a starter config automatically from the bundled template.
+Fresh installations create a small `config.toml` from the bundled
+`config-starter.toml.template`. It contains empty sections and commented examples
+for Bitcoin Core connections, maker fees, taker fee limits, and TUI logging.
+The full reference remains in the separate `config.toml.template` file. Flatpak
+continues to use its bundled Neutrino backend unless explicitly overridden.
+
+Uncomment only the settings you want to override. Omitted settings use the
+installed version's built-in defaults, which can change between releases.
+An active assignment pins your choice even when it equals a current default.
+Copy additional options into the matching section, adding its header only if
+that section is absent. The TUI can insert its settings into an empty or minimal
+config; template placeholders are not required.
 
 ## Config Updates
 
-Your `config.toml` is never modified automatically after creation. When updating via `install.sh --update`, the installer compares your config against the bundled template and prints any new sections or keys that are available but not yet in your file. You can then copy them manually from `~/.joinmarket-ng/config.toml.template`, which is kept in sync with the installed version.
+Your `config.toml` contents are never modified automatically after creation.
+Existing installations keep their customized files, including full templates
+from older versions. They are not automatically shortened or merged.
 
-If `config.toml` is missing entirely (fresh install), it is created from the template.
+During `install.sh --update`, the installer snapshots the previously installed
+package's full template before replacing packages and compares it with the
+target release's template. This includes changes across skipped releases,
+without inspecting or displaying credentials from your config. Interactive
+updates offer to show the diff; unattended updates print it in their output.
+Each diff hunk identifies its TOML section. Release notes also include these
+section-labeled template diffs.
 
-The comparison is available programmatically via `jmcore.settings.config_diff()`, which returns a dict of missing sections and missing keys (per section) without modifying the file.
+The adjacent reference is refreshed on startup, so it is not used as an upgrade
+baseline. If the old package template or comparison helper is unavailable, the
+installer reports that comparison is unavailable and refers to the release
+notes. Missing settings are normal, not an indication that your file is outdated.
+
+If `config.toml` is missing entirely, creation uses the small starter. Installing
+an older release that predates the starter retains its full-template behavior.
+
+`jmcore.settings.config_diff()` remains available as a read-only inventory of
+sections and keys absent from a user file. It returns a list of `section:<name>`
+and `key:<section>.<key>` strings, not a release-to-release comparison.
 
 ## Section Names
 
@@ -43,8 +72,10 @@ Top-level sections in config use these names:
 - `[notifications]`
 - `[maker]`
 - `[taker]`
+- `[tumbler]`
 - `[directory_server]`
 - `[orderbook_watcher]`
+- `[tui]`
 
 ## Environment Variable Mapping
 

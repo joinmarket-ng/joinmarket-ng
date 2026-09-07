@@ -63,6 +63,43 @@ def make_source(tmp_path: Path) -> tuple[Path, str]:
     return source, commit
 
 
+def make_source_with_starter(tmp_path: Path) -> tuple[Path, str]:
+    source, _ = make_source(tmp_path)
+    starter = source / "jmcore/src/jmcore/data/config-starter.toml.template"
+    starter.write_text("# authenticated starter\n")
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(source),
+            "add",
+            str(starter.relative_to(source)),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(source),
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "starter",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    commit = subprocess.check_output(
+        ["git", "-C", str(source), "rev-parse", "HEAD"], text=True
+    ).strip()
+    return source, commit
+
+
 def source_env(tmp_path: Path, source: Path, commit: str) -> dict[str, str]:
     return {
         "JOINMARKET_DATA_DIR": str(tmp_path / "data"),
@@ -111,6 +148,32 @@ setup_cli_completion
         data / "completions/jm-wallet.bash"
     ).read_text() == "# authenticated completion\n"
     assert not list(tmp_path.glob("jmng-source.*"))
+
+
+def test_authenticated_starter_and_full_reference_are_distinct(tmp_path: Path) -> None:
+    source, commit = make_source_with_starter(tmp_path)
+    # Neither current worktree file may influence the authenticated release copy.
+    (source / "jmcore/src/jmcore/data/config-starter.toml.template").write_text(
+        "untrusted starter\n"
+    )
+    (source / "jmcore/src/jmcore/data/config.toml.template").write_text(
+        "untrusted full template\n"
+    )
+    result = run_shell(
+        """
+SKIP_VERIFY=false
+VERSION=1.2.3
+VERIFIED_RELEASE_COMMIT="$TEST_COMMIT"
+prepare_verified_source "$TEST_COMMIT"
+trap cleanup_install EXIT
+setup_data_directory
+""",
+        source_env(tmp_path, source, commit),
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    data = tmp_path / "data"
+    assert (data / "config.toml").read_text() == "# authenticated starter\n"
+    assert (data / "config.toml.template").read_text() == "# authenticated config\n"
 
 
 def test_missing_authenticated_source_fails_without_http_fallback(

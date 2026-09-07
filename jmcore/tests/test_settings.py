@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import os
 import stat
+import tomllib
 from collections.abc import Generator
 from pathlib import Path
 
@@ -26,6 +27,7 @@ from jmcore.settings import (
     _get_user_sections,
     config_diff,
     ensure_config_file,
+    generate_config_starter,
     generate_config_template,
     get_config_path,
     get_settings,
@@ -129,8 +131,8 @@ class TestConfigTemplate:
         assert JoinMarketSettings.model_config["env_nested_delimiter"] == "__"
         assert derived_env_names == expected_env_names
 
-    def test_ensure_config_file_creates_template(self, temp_data_dir: Path) -> None:
-        """Test that ensure_config_file creates the config file."""
+    def test_ensure_config_file_creates_starter(self, temp_data_dir: Path) -> None:
+        """Fresh installs get a small starter and the separate full reference."""
         config_path = temp_data_dir / "config.toml"
         assert not config_path.exists()
 
@@ -144,9 +146,43 @@ class TestConfigTemplate:
         assert config_path.exists()
         content = config_path.read_text()
         assert "# JoinMarket" in content
-        assert "[tor]" in content
+        assert content == generate_config_starter()
+        assert (temp_data_dir / "config.toml.template").read_text() == _get_bundled_template()
         assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
         assert stat.S_IMODE((temp_data_dir / "config.toml.template").stat().st_mode) == 0o600
+
+    def test_starter_has_only_commented_examples(self, temp_data_dir: Path) -> None:
+        before = JoinMarketSettings().model_dump()
+        config_path = ensure_config_file(temp_data_dir)
+        starter = config_path.read_text()
+        assert tomllib.loads(starter) == {
+            "tor": {},
+            "bitcoin": {},
+            "wallet": {},
+            "maker": {},
+            "taker": {},
+            "tui": {},
+        }
+        assert len(starter.splitlines()) < 60
+        assert "config.toml.template in this directory" in starter
+        assert "mnemonic_password" not in starter
+        assert JoinMarketSettings().model_dump() == before
+
+    def test_starter_examples_match_full_reference(self) -> None:
+        """Keep the small, maintained set of examples in sync with the full reference."""
+        starter = generate_config_starter()
+        reference = _get_bundled_template()
+        assert reference is not None
+        reference_keys = _get_template_section_keys(reference)
+        for section, keys in _get_template_section_keys(starter).items():
+            assert keys <= reference_keys[section]
+        for line in starter.splitlines():
+            if line.startswith("# ") and " = " in line:
+                assignment = line.removeprefix("# ").split("#", 1)[0].strip()
+                # Explanatory sentences also contain '=', but are not assignments.
+                if not assignment.split(" = ", 1)[0].isidentifier():
+                    continue
+                assert f"# {assignment}" in reference
 
     def test_ensure_config_file_does_not_overwrite(self, temp_data_dir: Path) -> None:
         """Test that ensure_config_file does not overwrite existing file."""
@@ -1300,6 +1336,39 @@ class TestMigrateConfig:
 
         assert template_copy.stat().st_mtime_ns == before
 
+    def test_reference_alias_cannot_overwrite_user_config(self, tmp_path: Path) -> None:
+        config_path = tmp_path / "config.toml"
+        original = b"[bitcoin]\nrpc_password = 'keep-private'\n"
+        config_path.write_bytes(original)
+        reference = tmp_path / "config.toml.template"
+        reference.symlink_to(config_path)
+
+        migrate_config(config_path)
+
+        assert config_path.read_bytes() == original
+        assert reference.is_symlink()
+
+    def test_config_named_like_reference_is_not_overwritten(self, tmp_path: Path) -> None:
+        config_path = tmp_path / "config.toml.template"
+        original = b"[maker]\ncj_fee_absolute = 700\n"
+        config_path.write_bytes(original)
+
+        migrate_config(config_path)
+
+        assert config_path.read_bytes() == original
+
+    def test_invalid_utf8_reference_is_refreshed(self, tmp_path: Path) -> None:
+        config_path = tmp_path / "config.toml"
+        original = b"[maker]\ncj_fee_absolute = 700\n"
+        config_path.write_bytes(original)
+        reference = tmp_path / "config.toml.template"
+        reference.write_bytes(b"\xffbroken template")
+
+        migrate_config(config_path)
+
+        assert config_path.read_bytes() == original
+        assert reference.read_text() == _get_bundled_template()
+
     def test_expands_tilde_instead_of_creating_literal_dir(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1436,7 +1505,7 @@ class TestEnsureConfigFile:
         assert result == config_path
         assert config_path.exists()
         content = config_path.read_text()
-        assert "[tor]" in content
+        assert content == generate_config_starter()
         assert "[bitcoin]" in content
         # A reference copy of the bundled template is kept alongside.
         template_copy = temp_data_dir / "config.toml.template"
@@ -1469,7 +1538,7 @@ class TestEnsureConfigFile:
 
         assert result == config_file
         assert config_file.exists()
-        assert "[tor]" in config_file.read_text()
+        assert config_file.read_text() == generate_config_starter()
         # The data dir must NOT get its own config.toml.
         assert not (data_dir / "config.toml").exists()
         assert stat.S_IMODE(config_file.parent.stat().st_mode) == 0o755

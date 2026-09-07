@@ -35,6 +35,8 @@ INSTALLER_SOURCE="${BASH_SOURCE[0]:-}"
 VERIFIED_RELEASE_COMMIT=""
 VERIFIED_RELEASE_VERSION=""
 VERIFIED_SOURCE_DIR=""
+CONFIG_TEMPLATE_SNAPSHOT=""
+CONFIG_TEMPLATE_LABEL="previously installed"
 
 # Colors for output
 RED='\033[0;31m'
@@ -934,6 +936,7 @@ prepare_release() {
 
 cleanup_install() {
     cleanup_dep_pinning
+    [[ -z "$CONFIG_TEMPLATE_SNAPSHOT" ]] || rm -f "$CONFIG_TEMPLATE_SNAPSHOT"
     [[ -z "$VERIFIED_SOURCE_DIR" ]] || rm -rf "$VERIFIED_SOURCE_DIR"
 }
 
@@ -1413,74 +1416,219 @@ verify_update_imports() {
     return 1
 }
 
-# Migrate config file: add new sections and keys from the bundled template
-migrate_config() {
-    print_header "Configuration Check"
-
-    local config_file="$DATA_DIR/config.toml"
-
-    if [ ! -f "$config_file" ]; then
-        print_info "No config file found; creating from template..."
-        local stderr_file
-        stderr_file=$(mktemp)
-        python3 -c "
+# Resolve an existing symlink so template refreshes preserve configured aliases.
+config_destination() {
+    local destination="$1"
+    python3 -c '
 from pathlib import Path
-from jmcore.settings import migrate_config
-migrate_config(Path('$config_file'))
-" 2>"$stderr_file" || {
-            print_warning "Config creation failed"
-            if [ -s "$stderr_file" ]; then
-                tail -5 "$stderr_file" >&2
-            fi
-            rm -f "$stderr_file"
-            return 0
-        }
-        rm -f "$stderr_file"
-        if [ -f "$config_file" ]; then
-            print_success "Config file created at $config_file"
-        fi
+import sys
+
+print(Path(sys.argv[1]).resolve(strict=False))
+' "$destination"
+}
+
+# Create a private staged file alongside its final destination.
+stage_config_destination() {
+    local destination="$1"
+    local resolved_destination
+    resolved_destination=$(config_destination "$destination") || return 1
+    mktemp "$(dirname "$resolved_destination")/.$(basename "$resolved_destination").XXXXXX"
+}
+
+# Read a release file completely before atomically replacing its destination.
+install_release_config_file() {
+    local release_path="$1"
+    local destination="$2"
+    local staged_file
+    local resolved_destination
+    staged_file=$(stage_config_destination "$destination") || return 1
+    resolved_destination=$(config_destination "$destination") || {
+        rm -f "$staged_file"
+        return 1
+    }
+
+    if ! read_release_file "$release_path" > "$staged_file" 2>/dev/null || [[ ! -s "$staged_file" ]]; then
+        rm -f "$staged_file"
+        return 1
+    fi
+    chmod 600 "$staged_file" || {
+        rm -f "$staged_file"
+        return 1
+    }
+    if ! mv -f "$staged_file" "$resolved_destination"; then
+        rm -f "$staged_file"
+        return 1
+    fi
+}
+
+install_inline_config_fallback() {
+    local destination="$1"
+    local staged_file
+    local resolved_destination
+    staged_file=$(stage_config_destination "$destination") || return 1
+    resolved_destination=$(config_destination "$destination") || {
+        rm -f "$staged_file"
+        return 1
+    }
+    cat > "$staged_file" << 'EOF'
+# JoinMarket-NG Configuration
+# Uncomment settings to override built-in defaults.
+# Full current reference: config.toml.template in this directory.
+# Documentation: https://joinmarket-ng.github.io/joinmarket-ng/technical/configuration/
+
+[bitcoin]
+# rpc_url = "http://127.0.0.1:8332"
+# rpc_user = ""
+# rpc_password = ""
+EOF
+    if ! mv -f "$staged_file" "$resolved_destination"; then
+        rm -f "$staged_file"
+        return 1
+    fi
+}
+
+release_file_exists() {
+    local release_path="$1"
+    [[ "$SKIP_VERIFY" != "true" && -n "$VERIFIED_SOURCE_DIR" && -n "$VERIFIED_RELEASE_COMMIT" ]] || return 1
+    git --no-replace-objects -C "$VERIFIED_SOURCE_DIR" cat-file -e \
+        "$VERIFIED_RELEASE_COMMIT:$release_path" 2>/dev/null
+}
+
+valid_config_template() {
+    local template_file="$1"
+    python3 - "$template_file" 2>/dev/null << 'PY'
+from pathlib import Path
+import sys
+import tomllib
+
+template = Path(sys.argv[1]).read_text(encoding="utf-8")
+if not template.strip():
+    raise SystemExit(1)
+tomllib.loads(template)
+PY
+}
+
+# Snapshot the currently installed package without importing jmcore.settings,
+# which could load the user's configuration before the package is replaced.
+snapshot_installed_config_template() {
+    CONFIG_TEMPLATE_SNAPSHOT=""
+    CONFIG_TEMPLATE_LABEL="previously installed"
+
+    local package_template
+    if ! package_template=$(python3 -c '
+import importlib.util
+from pathlib import Path
+
+spec = importlib.util.find_spec("jmcore")
+if spec is None or not spec.submodule_search_locations:
+    raise SystemExit(1)
+template = Path(next(iter(spec.submodule_search_locations))) / "data" / "config.toml.template"
+if not template.is_file():
+    raise SystemExit(1)
+print(template)
+' 2>/dev/null); then
+        return 0
+    fi
+    if [[ ! -s "$package_template" ]] || ! valid_config_template "$package_template"; then
         return 0
     fi
 
-    # Config exists -- refresh the config.toml.template reference copy and
-    # check for new settings in the template. migrate_config never modifies
-    # an existing config.toml; it only (re)writes the template copy.
-    print_info "Checking for new settings in the template..."
+    local snapshot
+    snapshot=$(mktemp "${TMPDIR:-/tmp}/jmng-config-template.XXXXXX") || return 0
+    if ! cp "$package_template" "$snapshot" || ! valid_config_template "$snapshot"; then
+        rm -f "$snapshot"
+        return 0
+    fi
+    CONFIG_TEMPLATE_SNAPSHOT="$snapshot"
+}
+
+print_config_comparison_unavailable() {
+    print_warning "Configuration comparison unavailable; see the release notes for configuration changes."
+    print_info "Your existing config.toml is unchanged."
+}
+
+report_config_template_changes() {
+    if [[ -z "$CONFIG_TEMPLATE_SNAPSHOT" || ! -s "$CONFIG_TEMPLATE_SNAPSHOT" ]] || \
+        ! valid_config_template "$CONFIG_TEMPLATE_SNAPSHOT"; then
+        print_config_comparison_unavailable
+        return 0
+    fi
+
+    local target_template
+    target_template=$(mktemp "${TMPDIR:-/tmp}/jmng-target-config-template.XXXXXX") || {
+        print_config_comparison_unavailable
+        return 0
+    }
+    if ! read_release_file "jmcore/src/jmcore/data/config.toml.template" > "$target_template" 2>/dev/null || \
+        ! valid_config_template "$target_template"; then
+        rm -f "$target_template"
+        print_config_comparison_unavailable
+        return 0
+    fi
+
+    local diff_helper
+    diff_helper=$(mktemp "${TMPDIR:-/tmp}/jmng-config-changelog.XXXXXX") || {
+        rm -f "$target_template"
+        print_config_comparison_unavailable
+        return 0
+    }
+    if ! read_release_file "scripts/config_changelog.py" > "$diff_helper" 2>/dev/null || \
+        [[ ! -s "$diff_helper" ]]; then
+        rm -f "$target_template" "$diff_helper"
+        print_config_comparison_unavailable
+        return 0
+    fi
+
+    local diff_output
+    if ! diff_output=$(python3 "$diff_helper" --from-file "$CONFIG_TEMPLATE_SNAPSHOT" \
+        --to-file "$target_template" --from-label "$CONFIG_TEMPLATE_LABEL" \
+        --to-label "${VERSION:-target release}" 2>/dev/null); then
+        rm -f "$target_template" "$diff_helper"
+        print_config_comparison_unavailable
+        return 0
+    fi
+    rm -f "$target_template" "$diff_helper"
+
+    [[ -n "$diff_output" ]] || return 0
+
+    print_info "Configuration template changes are available; your config.toml is unchanged."
+    if [[ "$AUTO_YES" == "true" || ! -t 0 ]]; then
+        printf '%s\n' "$diff_output"
+        return 0
+    fi
+
+    local response
+    read -r -p "Show full configuration template changes? [Y/n] " response </dev/tty || return 0
+    if [[ -z "$response" || "$response" =~ ^[Yy]$ ]]; then
+        printf '%s\n' "$diff_output"
+    fi
+}
+
+# Migrate config file without changing an existing user configuration.
+migrate_config() {
+    local config_file="$DATA_DIR/config.toml"
+    local config_existed=false
+    if [[ -e "$config_file" || -L "$config_file" ]]; then
+        config_existed=true
+    fi
+
     local stderr_file
     stderr_file=$(mktemp)
-    local result
-    result=$(python3 -c "
+    CONFIG_FILE="$config_file" python3 -c '
+import os
 from pathlib import Path
-from jmcore.settings import config_diff, migrate_config
-config = Path('$config_file')
-migrate_config(config)
-diffs = config_diff(config)
-for d in diffs:
-    print(d)
-" 2>"$stderr_file") || {
-        print_warning "Config diff check failed (your config is unchanged)"
+from jmcore.settings import migrate_config
+
+migrate_config(Path(os.environ["CONFIG_FILE"]))
+' 2>"$stderr_file" || {
+        print_warning "Config refresh failed (your config is unchanged)"
         rm -f "$stderr_file"
         return 0
     }
     rm -f "$stderr_file"
 
-    if [ -z "$result" ]; then
-        print_info "Config is up to date"
-    else
-        local section_count=0
-        local key_count=0
-        while IFS= read -r diff; do
-            if [[ "$diff" == section:* ]]; then
-                print_info "  New section available: [${diff#section:}]"
-                section_count=$((section_count + 1))
-            elif [[ "$diff" == key:* ]]; then
-                print_info "  New setting available: ${diff#key:}"
-                key_count=$((key_count + 1))
-            fi
-        done <<< "$result"
-        local total=$((section_count + key_count))
-        print_info "$total new setting(s) available in the template"
-        print_info "Compare your config with $DATA_DIR/config.toml.template to see details"
+    if [[ "$config_existed" == "false" && ( -e "$config_file" || -L "$config_file" ) ]]; then
+        print_success "Config file created at $config_file"
     fi
 }
 
@@ -1492,40 +1640,50 @@ setup_data_directory() {
     chmod 700 "$DATA_DIR"
     chmod 700 "$DATA_DIR/wallets"
 
-    # Initialize config file if it doesn't exist
+    # Initialize config file if it doesn't exist. Releases before the starter
+    # asset intentionally retain their full-template first-run behavior.
     local config_file="$DATA_DIR/config.toml"
-    if [ ! -f "$config_file" ]; then
+    if [[ ! -e "$config_file" && ! -L "$config_file" ]]; then
         print_info "Creating config file at $config_file..."
 
-        if ! read_release_file "jmcore/src/jmcore/data/config.toml.template" > "$config_file"; then
-            print_warning "Failed to download config template, using fallback..."
-            # Fallback: create minimal config if download fails
-            cat > "$config_file" << 'EOF'
-# JoinMarket-NG Configuration
-# See: https://joinmarket-ng.github.io/joinmarket-ng/
-# For full template: https://github.com/joinmarket-ng/joinmarket-ng/blob/main/jmcore/src/jmcore/data/config.toml.template
-
-# [bitcoin]
-# rpc_url = "http://127.0.0.1:8332"
-# rpc_user = ""
-# rpc_password = ""
-EOF
+        if release_file_exists "jmcore/src/jmcore/data/config-starter.toml.template"; then
+            if ! install_release_config_file \
+                "jmcore/src/jmcore/data/config-starter.toml.template" "$config_file"; then
+                print_warning "Failed to install the config starter, using fallback..."
+                install_inline_config_fallback "$config_file" || \
+                    print_warning "Could not create fallback config file"
+            fi
+        elif install_release_config_file \
+            "jmcore/src/jmcore/data/config-starter.toml.template" "$config_file"; then
+            :
+        elif install_release_config_file \
+            "jmcore/src/jmcore/data/config.toml.template" "$config_file"; then
+            print_info "Target release has no config starter; using its full template."
+        else
+            print_warning "Failed to download config templates, using fallback..."
+            install_inline_config_fallback "$config_file" || \
+                print_warning "Could not create fallback config file"
         fi
-        print_success "Config file created"
-
-        echo ""
-        print_info "Edit $config_file to customize your settings."
-        echo "  Required: Configure the [bitcoin] section (RPC credentials)"
-        echo "  Optional: Review [maker] and [taker] fee/privacy settings"
-        echo "  All options documented with defaults in the config file"
+        if [[ -e "$config_file" || -L "$config_file" ]]; then
+            print_success "Config file created"
+            echo ""
+            print_info "Edit $config_file to customize your settings."
+            echo "  Required: Configure the [bitcoin] section (RPC credentials)"
+            echo "  Optional: Review [maker] and [taker] fee/privacy settings"
+            echo "  Full defaults are in config.toml.template"
+        else
+            print_warning "Could not create config file at $config_file"
+        fi
     else
         print_info "Config file already exists at $config_file"
     fi
 
     # Keep a reference copy of the full template alongside the config so
     # users can compare their settings after updates.
-    if ! read_release_file "jmcore/src/jmcore/data/config.toml.template" > "$DATA_DIR/config.toml.template"; then
-        rm -f "$DATA_DIR/config.toml.template"
+    if [[ "$(config_destination "$DATA_DIR/config.toml.template")" == "$(config_destination "$config_file")" ]]; then
+        print_warning "Reference template aliases config.toml; leaving it unchanged."
+    elif ! install_release_config_file \
+        "jmcore/src/jmcore/data/config.toml.template" "$DATA_DIR/config.toml.template"; then
         print_warning "Could not install config.toml.template reference copy"
     fi
 }
@@ -2003,8 +2161,10 @@ main() {
         check_system_dependencies
         prepare_release
         setup_virtualenv
+        snapshot_installed_config_template
         update_packages
         migrate_config
+        report_config_template_changes
         create_shell_integration
         if [[ "$SKIP_TOR" == "false" ]]; then
             setup_tor

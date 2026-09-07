@@ -351,13 +351,14 @@ setup_data_dir() {
     # Record the entrypoint PID so jam-ng-stop can find it
     echo "$$" > "${PIDFILE_DIR}/jam-ng.pid"
 
-    # Copy config template on first run
-    if [ ! -f "${CONFIG_FILE}" ]; then
-        log "First run: creating config from template..."
-        cp /app/share/joinmarket-ng/config.toml.template "${CONFIG_FILE}"
-        log "Config created at ${CONFIG_FILE}"
-        log "Edit this file to customize your setup."
-    fi
+    # Use the same starter and full reference as CLI and source installations.
+    python3 - "${CONFIG_FILE}" <<'PY'
+from pathlib import Path
+import sys
+from jmcore.settings import ensure_config_file
+
+ensure_config_file(config_file=Path(sys.argv[1]))
+PY
 
     # Regenerate torrc every launch so dynamic ports are always up to date
     sed -e "s|__DATA_DIR__|${DATA_DIR}|g" \

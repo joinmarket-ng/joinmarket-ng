@@ -1,0 +1,39 @@
+# JoinMarket-NG Configuration
+# Uncomment settings to override built-in defaults. Add other sections as needed.
+# Omitted settings follow the installed version's defaults, which may change.
+# Full, current reference: config.toml.template in this directory.
+# Copy options into their matching section; do not repeat a section header.
+# CLI arguments and environment variables override this file.
+# Documentation: https://joinmarket-ng.github.io/joinmarket-ng/technical/configuration/
+
+[tor]
+
+[bitcoin]
+# Bitcoin Core connection (Flatpak uses bundled Neutrino unless overridden).
+# backend_type = "descriptor_wallet"
+# rpc_url = "http://127.0.0.1:8332"
+# Choose cookie authentication OR a configured Bitcoin Core RPC user/password.
+# rpc_cookie_file = "~/.bitcoin/.cookie"
+# rpc_user = ""
+# rpc_password = ""
+
+[wallet]
+# Maximum miner fee rate for any wallet transaction, in sat/vB.
+# max_fee_rate_sat_vb = 1000
+
+[maker]
+# Relative offers use cj_fee_relative; absolute offers use cj_fee_absolute.
+# To charge an absolute fee, also set offer_type = "sw0absoffer".
+# offer_type = "sw0reloffer"
+# cj_fee_relative = "0.0001"  # 0.01%, a public fee-quantization quantum
+# cj_fee_absolute = 500      # Satoshis
+
+[taker]
+# Maker-fee limits (not miner fees), per maker. Relative fee is a fraction.
+# max_cj_fee_abs = 500
+# max_cj_fee_rel = "0.001"   # 0.1%
+# Target confirmation time for miner-fee estimation, in blocks.
+# fee_block_target = 6
+
+[tui]
+# log_level = "WARNING"

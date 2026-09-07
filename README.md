@@ -74,7 +74,7 @@ See the [installation guide](https://joinmarket-ng.github.io/joinmarket-ng/insta
 for the trust model, manual verification, custom directories, and migration of
 an existing installation.
 
-2. Edit `~/.joinmarket-ng/config.toml` and set your backend (`descriptor_wallet` for Bitcoin Core, or `neutrino`):
+2. Edit `~/.joinmarket-ng/config.toml` and set your backend (`descriptor_wallet` for Bitcoin Core, or `neutrino`). New installs have a small commented starter; the complete reference is in the adjacent `config.toml.template`. Uncomment only the settings you want to override:
 
 ```toml
 [bitcoin]

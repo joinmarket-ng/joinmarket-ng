@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import patch
@@ -32,6 +33,67 @@ def test_tui_script_is_valid_bash() -> None:
         text=True,
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_tui_config_helpers_update_sparse_config_in_subprocess(tmp_path: Path) -> None:
+    """The menu's shell helpers must create and update scoped sparse config values."""
+    content = SCRIPT_PATH.read_text()
+    helpers = content.split(
+        "# =============================================================================\n# Helpers",
+        1,
+    )[1].split(
+        "# =============================================================================\n# Main Loop",
+        1,
+    )[0]
+    helpers_path = tmp_path / "menu-helpers.sh"
+    helpers_path.write_text(helpers)
+    config_path = tmp_path / "config.toml"
+    config_path.write_text('[maker]\nmnemonic_file = "maker-owned.mnemonic"\n\n[tui]\n')
+    first_wallet = r'/wallets/first "wallet" #1\\path & more.mnemonic'
+    password = r'password # "quoted" \\ & value'
+    selected_wallet = "/wallets/selected.mnemonic"
+
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            """
+                TUI_PYTHON="$1"
+                CONFIG_FILE="$2"
+                source "$3"
+                set_config_value wallet mnemonic_file "$4" || exit 11
+                set_config_value wallet mnemonic_password "$5" || exit 12
+                printf '%s\\n%s\\n' "$(get_mnemonic_file)" "$(get_stored_mnemonic_password)"
+                set_active_wallet_config "$6" || exit 13
+                set_config_value tui log_level INFO || exit 14
+                printf '%s\\n%s\\n%s\\n' \
+                    "$(get_mnemonic_file)" "$(get_stored_mnemonic_password)" \
+                    "$("$TUI_PYTHON" -m jmcore.config_file get --config "$CONFIG_FILE" --section tui --key log_level)"
+            """,
+            "bash",
+            sys.executable,
+            str(config_path),
+            str(helpers_path),
+            first_wallet,
+            password,
+            selected_wallet,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [
+        first_wallet,
+        password,
+        selected_wallet,
+        "",
+        "INFO",
+    ]
+    config_text = config_path.read_text()
+    assert 'mnemonic_file = "maker-owned.mnemonic"' in config_text
+    assert password not in config_text
 
 
 def test_tui_script_has_environment_detection() -> None:
@@ -125,10 +187,12 @@ def test_tui_script_has_history_role_validation() -> None:
     assert "maker|taker)" in content
 
 
-def test_tui_script_has_sed_escaping() -> None:
-    """set_config_value must escape sed metacharacters."""
+def test_tui_script_uses_toml_helper_for_config_values() -> None:
+    """TUI config changes must use the table-aware TOML helper."""
     content = SCRIPT_PATH.read_text()
-    assert "sed -e 's/[&\\\\/|]/\\\\&/g'" in content or "escape" in content.lower()
+    assert "-m jmcore.config_file set" in content
+    assert "-m jmcore.config_file remove" in content
+    assert 'printf \'%s\' "$value" | "$TUI_PYTHON"' in content
 
 
 def test_tui_script_has_clear_config_value() -> None:
@@ -140,7 +204,8 @@ def test_tui_script_has_clear_config_value() -> None:
 def test_tui_script_select_wallet_clears_password() -> None:
     """Select Active Wallet must clear stored password to prevent mismatch."""
     content = SCRIPT_PATH.read_text()
-    assert 'clear_config_value "mnemonic_password"' in content
+    assert "set_active_wallet_config()" in content
+    assert "clear_config_value wallet mnemonic_password" in content
 
 
 def test_tui_script_post_wallet_create_validates_password() -> None:
@@ -162,8 +227,7 @@ def test_tui_script_post_wallet_create_clears_password_on_activate() -> None:
     post_create_block = content.split("post_wallet_create()", 1)[1].split(
         "# Helper:", 1
     )[0]
-    assert 'set_config_value "mnemonic_file"' in post_create_block
-    assert 'clear_config_value "mnemonic_password"' in post_create_block
+    assert 'set_active_wallet_config "$wallet_path"' in post_create_block
 
 
 def test_tui_script_fidelity_bonds_list_uses_msgbox_when_empty() -> None:
@@ -325,7 +389,7 @@ def test_tui_script_select_wallet_offers_password_storage() -> None:
     assert 'prompt_and_store_password "$DATA_DIR/wallets/$WNAME"' in content
     # And still clear any pre-existing password first so a declined
     # prompt leaves the config in a clean state (no mismatch).
-    assert 'clear_config_value "mnemonic_password"' in content
+    assert "clear_config_value wallet mnemonic_password" in content
 
 
 def test_tui_script_has_update_menu() -> None:
@@ -558,8 +622,7 @@ def test_tui_clears_stale_mnemonic_file_entry() -> None:
     main_loop = content.split("while true; do", 1)[1]
     # Both detection and cleanup must happen before we compute WALLET_INFO.
     assert '[ ! -f "$CURRENT_WALLET" ]' in main_loop
-    assert 'clear_config_value "mnemonic_file"' in main_loop
-    assert 'clear_config_value "mnemonic_password"' in main_loop
+    assert "clear_active_wallet_config" in main_loop
     # And the stale-config path must surface a warning so the user knows
     # why their "active wallet" suddenly went away.
     assert "Stale Wallet Config" in main_loop
@@ -1506,19 +1569,19 @@ def test_tui_script_config_center_restore_lists_backups() -> None:
 
 
 def test_tui_script_config_center_log_level_sets_value() -> None:
-    """LOG case in Config Center calls set_config_value for log_level."""
+    """LOG case in Config Center writes the [tui] log level."""
     content = SCRIPT_PATH.read_text()
     # Extract C block (Config Center)
     c_block = content.split("C)\n", 1)[1].split("U)\n", 1)[0]
     # Check that log_level setting exists in Config Center
-    assert 'set_config_value "log_level"' in c_block, "LOG must call set_config_value"
+    assert "set_config_value tui log_level" in c_block, "LOG must call set_config_value"
 
 
 def test_tui_script_config_center_delpw_clears_password() -> None:
     """DELPW case calls clear_config_value for mnemonic_password."""
     content = SCRIPT_PATH.read_text()
     delpw_case = content.split("DELPW)", 1)[1].split(";;", 1)[0]
-    assert 'clear_config_value "mnemonic_password"' in delpw_case, (
+    assert "clear_config_value wallet mnemonic_password" in delpw_case, (
         "DELPW must clear password"
     )
 
