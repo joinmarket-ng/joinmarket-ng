@@ -51,6 +51,24 @@ from jmwalletd.state import DaemonState
 
 router = APIRouter()
 
+_CONFIG_SECRET_FIELDS = frozenset(
+    {
+        "password",
+        "rpc_password",
+        "rpcpassword",
+        "mnemonic_password",
+        "bip39_passphrase",
+        "neutrino_auth_token",
+    }
+)
+
+
+def _config_response_value(field: str, value: Any) -> str:
+    """Mask secret fields even when overrides bypass typed settings values."""
+    if field in _CONFIG_SECRET_FIELDS and value:
+        return "**********"
+    return str(value)
+
 
 def _format_bond_locktime(locktime: int | None) -> str | None:
     """Render a fidelity bond locktime as the legacy UTC datetime string.
@@ -535,7 +553,11 @@ async def config_get(
 
     # Check in-memory overrides first.
     if section in state.config_overrides and field_name in state.config_overrides[section]:
-        return ConfigGetResponse(configvalue=state.config_overrides[section][field_name])
+        return ConfigGetResponse(
+            configvalue=_config_response_value(
+                field_name, state.config_overrides[section][field_name]
+            )
+        )
 
     # Fall back to the settings system.
     from jmcore.settings import get_settings
@@ -555,7 +577,7 @@ async def config_get(
                 return ConfigGetResponse(configvalue=str(value))
 
         value = _get_setting_value(settings, section, field_name)
-        return ConfigGetResponse(configvalue=str(value))
+        return ConfigGetResponse(configvalue=_config_response_value(field_name, value))
     except (AttributeError, KeyError) as exc:
         raise ConfigNotPresent(f"Config not found: [{section}] {field_name}") from exc
 
@@ -608,7 +630,7 @@ async def config_set(
         state.config_overrides[section] = {}
 
     state.config_overrides[section][field_name] = body.value
-    logger.info("Config override set: [{}] {} = {}", section, field_name, body.value)
+    logger.info("Config override updated")
     return {}
 
 
