@@ -430,7 +430,7 @@ def mnemonic_requires_fidelity_bond_recovery(
     """Return whether the wallet explicitly requests its first automatic recovery.
 
     New imports are explicitly marked pending, while generated wallets are
-    marked not-required. Missing legacy metadata does not establish that a
+    marked not-required. Missing recovery metadata does not establish that a
     recovery is needed. Started attempts require explicit retry because Core
     can finish scanning after the originating process exits.
     """
@@ -463,10 +463,13 @@ def mnemonic_requires_fidelity_bond_recovery(
         and not isinstance(creation_height, bool)
         and creation_height >= 0
     ):
-        logger.warning(
-            "Fidelity bond recovery coverage is unknown for this legacy wallet. "
-            "No automatic recovery scan will run. Use `jm-wallet recover-bonds` "
-            "if historical bonds need to be discovered."
+        logger.info(
+            "This wallet has no fidelity bond recovery metadata; coverage is unknown. "
+            "No automatic recovery scan will run, and registered bonds still sync normally. "
+            "A regular wallet history scan does not establish that all 960 bond addresses "
+            "were scanned. Use `jm-wallet recover-bonds` to discover historical bonds, "
+            "or `jm-wallet recover-bonds --mark-scanned` only if full bond recovery "
+            "already completed. Use the same wallet file and BIP39 passphrase."
         )
     return False
 
@@ -475,11 +478,20 @@ def mark_fidelity_bond_recovery_complete(
     mnemonic_file: Path,
     wallet_fingerprint: str,
 ) -> None:
-    """Persist successful completion of the imported-wallet bond scan."""
+    """Persist recovery completion for the selected wallet."""
     with _mnemonic_meta_lock(mnemonic_file):
         meta = load_mnemonic_meta(mnemonic_file)
         meta[_fidelity_bond_recovery_key(wallet_fingerprint)] = FIDELITY_BOND_RECOVERY_COMPLETE
         _write_mnemonic_meta(mnemonic_file, meta)
+
+
+def acknowledge_fidelity_bond_recovery_scanned(
+    mnemonic_file: Path,
+    wallet_fingerprint: str,
+) -> None:
+    """Record user-confirmed prior recovery, excluding active recovery attempts."""
+    with _mnemonic_meta_lock(mnemonic_file, recovery=True):
+        mark_fidelity_bond_recovery_complete(mnemonic_file, wallet_fingerprint)
 
 
 @contextmanager

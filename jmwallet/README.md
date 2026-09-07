@@ -1046,6 +1046,20 @@ For full documentation, see [jmwallet Documentation](https://joinmarket-ng.githu
 <details>
 <summary><code>jm-wallet recover-bonds --help</code></summary>
 
+Missing fidelity-bond recovery metadata is reported at INFO level. It means
+coverage is unknown, not that the wallet came from the reference implementation
+or needs a rescan. Registered bonds still sync normally. Regular wallet history
+scanning (including the default roughly one-year scan) does not establish that
+all 960 bond addresses were searched.
+
+Use `jm-wallet recover-bonds` for full bond discovery. If that recovery already
+completed, use `jm-wallet recover-bonds --mark-scanned --mnemonic-file /path/to/wallet.mnemonic`
+to record completion without scanning. Use the same BIP39 passphrase (add
+`--prompt-bip39-passphrase` when needed). This offline option requires confirmation
+and does not verify coverage. Do not confirm based only on a regular history scan
+or while recovery is still running. See [wallet scanning](../docs/technical/wallet-scanning.md)
+for coverage details.
+
 ```
 
  Usage: jm-wallet recover-bonds [OPTIONS]
@@ -1060,6 +1074,11 @@ For full documentation, see [jmwallet Documentation](https://joinmarket-ng.githu
  Each timenumber (0-959) maps to exactly one address, matching the
  reference JoinMarket implementation.
 
+ With --mark-scanned, only record your confirmation that full bond recovery
+ already completed. This does not scan or verify coverage. A regular wallet
+ history scan alone is not sufficient. Requires a mnemonic file and prompts
+ for confirmation; use the same BIP39 passphrase as the recovered wallet.
+
 ╭─ Options ────────────────────────────────────────────────────────────────────╮
 │ --backend                  -b      TEXT  Backend: descriptor_wallet |        │
 │                                          neutrino                            │
@@ -1073,6 +1092,9 @@ For full documentation, see [jmwallet Documentation](https://joinmarket-ng.githu
 │                                          [env var: JOINMARKET_DATA_DIR]      │
 │ --help                                   Show this message and exit.         │
 │ --log-level                -l      TEXT  Log level                           │
+│ --mark-scanned                           Confirm prior full bond recovery    │
+│                                          and record completion without       │
+│                                          scanning (offline).                 │
 │ --mnemonic-file            -f      PATH  [env var: MNEMONIC_FILE]            │
 │ --network                  -n      TEXT  Bitcoin network                     │
 │ --neutrino-url                     TEXT  [env var: NEUTRINO_URL]             │

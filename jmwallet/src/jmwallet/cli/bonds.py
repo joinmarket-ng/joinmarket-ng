@@ -873,6 +873,15 @@ async def _sync_bonds_async(
 
 @app.command("recover-bonds")
 def recover_bonds(
+    mark_scanned: Annotated[
+        bool,
+        typer.Option(
+            "--mark-scanned",
+            help=(
+                "Confirm prior full bond recovery and record completion without scanning (offline)."
+            ),
+        ),
+    ] = False,
     mnemonic_file: Annotated[
         Path | None, typer.Option("--mnemonic-file", "-f", envvar="MNEMONIC_FILE")
     ] = None,
@@ -919,6 +928,11 @@ def recover_bonds(
 
     Each timenumber (0-959) maps to exactly one address, matching the
     reference JoinMarket implementation.
+
+    With --mark-scanned, only record your confirmation that full bond recovery
+    already completed. This does not scan or verify coverage. A regular wallet
+    history scan alone is not sufficient. Requires a mnemonic file and prompts
+    for confirmation; use the same BIP39 passphrase as the recovered wallet.
     """
     settings = setup_cli(log_level, data_dir=data_dir, config_file=config_file)
 
@@ -936,6 +950,38 @@ def recover_bonds(
     except (FileNotFoundError, ValueError) as e:
         logger.error(str(e))
         raise typer.Exit(1)
+
+    if mark_scanned:
+        from jmwallet.backends.descriptor_wallet import get_mnemonic_fingerprint
+        from jmwallet.cli.mnemonic import (
+            FidelityBondRecoveryInProgressError,
+            acknowledge_fidelity_bond_recovery_scanned,
+        )
+
+        if resolved.mnemonic_file is None:
+            logger.error("--mark-scanned requires a mnemonic file; select it with --mnemonic-file")
+            raise typer.Exit(1)
+        fingerprint = get_mnemonic_fingerprint(resolved_mnemonic, resolved_bip39_passphrase)
+        print(f"Mnemonic file: {resolved.mnemonic_file}")
+        print(f"Wallet fingerprint: {fingerprint}")
+        print(
+            "This only records your confirmation; it does not scan, discover bonds, or verify "
+            "coverage. A regular wallet history scan (including the default one-year scan) "
+            "does not prove all 960 bond addresses were scanned. "
+            "Do not confirm while a recovery scan is still running."
+        )
+        typer.confirm(
+            "Has full fidelity bond recovery already completed for this wallet?",
+            default=False,
+            abort=True,
+        )
+        try:
+            acknowledge_fidelity_bond_recovery_scanned(resolved.mnemonic_file, fingerprint)
+        except (OSError, FidelityBondRecoveryInProgressError) as e:
+            logger.error(str(e))
+            raise typer.Exit(1)
+        print("Recorded user-confirmed fidelity bond recovery completion. No scan was performed.")
+        return
 
     # Resolve backend settings
     backend_settings = resolve_backend_settings(

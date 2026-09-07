@@ -46,10 +46,42 @@ Found bonds are recorded in the per-wallet registry, so normal maker startup
 can select them without a separate recovery command. Completion is stored by
 derived wallet fingerprint in the mnemonic's `.meta` sidecar, so different
 BIP39 passphrases are recovered independently. Only newly imported wallets
-explicitly marked pending start recovery automatically. Missing metadata on a
-legacy wallet does not trigger a recovery scan after an upgrade. Existing
+explicitly marked pending start recovery automatically. Missing metadata on an
+existing wallet does not trigger a recovery scan after an upgrade. Existing
 registered bonds still participate in normal synchronization; use
 `jm-wallet recover-bonds` to discover any missing historical bonds explicitly.
+
+An INFO message about missing fidelity-bond recovery metadata means that this
+installation has no recorded recovery coverage for the wallet. It does not identify
+the wallet as coming from the reference implementation, nor prove that recovery
+is needed or that a previous scan failed. No completion marker is filled in
+automatically. This can occur with wallets created or imported before recovery
+metadata was introduced.
+
+A regular history scan, including the default roughly one-year smart scan or a
+full block rescan, does not by itself prove that all 960 fidelity-bond addresses
+were searched. Routine bond synchronization covers only registered bonds. Explicit
+`jm-wallet recover-bonds` derives all 960 addresses and, with Bitcoin Core, scans
+from genesis (or the recorded wallet creation height), regardless of the smart-scan
+lookback setting.
+
+If full fidelity-bond recovery already completed and only its metadata is missing,
+you can record that fact without repeating the scan:
+
+```bash
+jm-wallet recover-bonds --mark-scanned --mnemonic-file /path/to/wallet.mnemonic
+```
+
+Use the same BIP39 passphrase as that wallet, adding `--prompt-bip39-passphrase`
+when needed. The command displays the selected file and derived fingerprint and
+requires confirmation (default: no). It works offline and only writes the
+fingerprint-scoped completion marker, preserving other metadata. It does not
+discover bonds, verify coverage, or stop any running scan. Do not confirm based
+only on a regular history scan or while recovery is still running. An incorrect
+confirmation can leave historical bonds undiscovered and suppress automatic
+recovery for that wallet. If unsure, leave coverage unknown or explicitly run
+`jm-wallet recover-bonds`; that command remains available even after marking
+recovery complete.
 
 Recovery records a started state before importing descriptors, and concurrent
 recovery attempts for the same mnemonic file are refused. Completion is recorded
