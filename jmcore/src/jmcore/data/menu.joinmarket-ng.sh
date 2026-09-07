@@ -1430,7 +1430,7 @@ No:  automatic coin selection from one mixdepth." 12 64
                           echo ""
                           (
                               ensure_wallet_password "$CURRENT_WALLET" || exit 1
-                              jm-wallet info
+                              jm-wallet info --prompt-bip39-passphrase
                               pause
                           )
                           clear
@@ -1444,7 +1444,7 @@ No:  automatic coin selection from one mixdepth." 12 64
                           echo ""
                           (
                               ensure_wallet_password "$CURRENT_WALLET" || exit 1
-                              jm-wallet info --extended
+                              jm-wallet info --extended --prompt-bip39-passphrase
                               pause
                           )
                           clear

@@ -947,6 +947,7 @@ def resolve_mnemonic(
             import getpass
 
             resolved_passphrase = getpass.getpass("Enter BIP39 passphrase (leave empty for none): ")
+        _confirm_prompted_wallet(resolved_mnemonic, resolved_passphrase)
 
     # Load wallet metadata (creation_height) from companion .meta file
     creation_height: int | None = None
@@ -978,6 +979,35 @@ def resolve_mnemonic(
         creation_height=creation_height,
         mnemonic_file=mnemonic_file_path,
     )
+
+
+def _confirm_prompted_wallet(mnemonic: str, passphrase: str) -> None:
+    """Confirm the locally derived wallet before callers start backend work."""
+    status = "set" if passphrase else "empty (no passphrase)"
+    message = f"BIP39 passphrase: {status}"
+    try:
+        from jmwallet.backends.descriptor_wallet import get_mnemonic_fingerprint
+    except ModuleNotFoundError as exc:
+        # jmcore can be used without the optional wallet package.
+        if not exc.name or not (exc.name == "jmwallet" or exc.name.startswith("jmwallet.")):
+            raise
+        message += "\nWallet fingerprint unavailable (jmwallet is not installed)."
+    else:
+        fingerprint = get_mnemonic_fingerprint(mnemonic, passphrase)
+        message += f"\nWallet fingerprint: {fingerprint}"
+    try:
+        import typer
+    except ImportError:
+        print(message)
+        try:
+            answer = input("Continue with this wallet? [y/N]: ")
+        except (EOFError, KeyboardInterrupt):
+            raise ValueError("Wallet selection cancelled") from None
+        if answer.strip().lower() not in ("y", "yes"):
+            raise ValueError("Wallet selection cancelled") from None
+    else:
+        typer.echo(message)
+        typer.confirm("Continue with this wallet?", default=False, abort=True)
 
 
 def resolve_bip39_passphrase(

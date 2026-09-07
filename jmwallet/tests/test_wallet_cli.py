@@ -597,6 +597,7 @@ def test_bip39_prompt_passphrase():
                     "--gap",
                     "1",  # Only show first address
                 ],
+                input="y\n",
             )
 
             # Debug output

@@ -148,6 +148,7 @@ def test_history_accepts_prompt_bip39_passphrase() -> None:
                     str(mnemonic_file),
                     "--prompt-bip39-passphrase",
                 ],
+                input="y\n",
             )
 
         assert result.exit_code == 0, result.stdout

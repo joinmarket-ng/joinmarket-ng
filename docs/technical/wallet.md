@@ -17,7 +17,7 @@ JoinMarket NG supports the optional BIP39 passphrase ("25th word"):
 **Important Distinction:**
 
 - **File encryption password** (`--password`): Encrypts mnemonic file with AES (Fernet, key derived via Argon2id; legacy files using PBKDF2 are still readable)
-- **BIP39 passphrase** (`--bip39-passphrase`): Used in seed derivation per BIP39
+- **BIP39 passphrase** (`--prompt-bip39-passphrase`): Used in seed derivation per BIP39
 
 The passphrase is provided when **using** the wallet, not when importing:
 
@@ -27,13 +27,24 @@ jm-wallet import --words 24
 
 # Passphrase provided at usage time:
 jm-wallet info --prompt-bip39-passphrase
-jm-wallet info --bip39-passphrase "my phrase"
 BIP39_PASSPHRASE="my phrase" jm-wallet info
 ```
 
+When `--prompt-bip39-passphrase` prompts interactively, input stays hidden.
+After you press Enter, the CLI displays whether the passphrase is set or empty
+and the derived JoinMarket wallet fingerprint. It asks `Continue with this wallet?`
+before loading or scanning the wallet; the default is No. Compare the fingerprint
+with the one shown by a previous `jm-wallet info` invocation for the intended
+wallet. This identifies the wallet but cannot verify that a passphrase is correct:
+every passphrase derives a valid wallet.
+
+Environment and config passphrases retain precedence and do not prompt or require
+confirmation, including when the prompt flag is supplied. Without that flag,
+commands remain noninteractive with respect to the BIP39 passphrase.
+
 **Security Notes:**
 
-- Empty passphrase (`""`) is valid and different from no passphrase
+- An empty passphrase (`""`) is valid and selects the wallet without a passphrase
 - Passphrase is case-sensitive and whitespace-sensitive
 - Can be set in `[wallet] bip39_passphrase` in `config.toml`, but this is discouraged because it places the passphrase next to the encrypted mnemonic; prefer `--prompt-bip39-passphrase` or the `BIP39_PASSPHRASE` env variable.
 

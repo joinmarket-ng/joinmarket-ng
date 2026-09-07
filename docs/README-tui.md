@@ -86,6 +86,14 @@ Manage wallets through this submenu. Create new wallets, import from seed, valid
 **BASIC** shows total balance and individual balance per mixdepth.
 **EXT** shows all addresses with derivation paths, status labels (`new`, `deposit`, `cj-out`, `non-cj-change`, `reserved`, `used-empty`, `flagged`, with a `(reused)` suffix on addresses paid to more than once), individual balances, and mixdepth totals.
 
+Both views prompt for the optional BIP39 passphrase in the terminal after
+unlocking the wallet file. This is separate from the wallet encryption password;
+leave it empty for a wallet without a BIP39 passphrase. The entered passphrase
+stays hidden. Before loading or scanning, the CLI shows whether it is set or empty
+and the derived wallet fingerprint, then asks you to confirm (default: No).
+An existing `BIP39_PASSPHRASE` environment value or `[wallet].bip39_passphrase`
+configuration is reused without prompting.
+
 ## Maker Bot Control
 
 ![Maker Bot Control](./media/maker-menu.png)
