@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from dataclasses import dataclass
 
 from jmcore.crypto import NickIdentity, verify_signed_privmsg
@@ -34,6 +35,10 @@ from maker.config import MakerConfig
 from maker.protocols import MakerBotProtocol
 from maker.rate_limiting import DirectConnectionRateLimiter
 
+_MAX_DIRECT_CONNECTIONS = 256
+_DIRECT_CONNECTION_IDLE_TIMEOUT_SEC = 60.0
+_DIRECT_CONNECTION_UNAUTHENTICATED_TIMEOUT_SEC = 60.0
+
 
 @dataclass(slots=True)
 class DirectConnectionState:
@@ -46,6 +51,178 @@ class DirectConnectionState:
 
     nick: str | None = None
     verified: bool = False
+
+
+async def _handle_direct_public_message(
+    bot: MakerBotProtocol,
+    state: DirectConnectionState,
+    sender_nick: str,
+    command: str,
+    connection: TCPConnection,
+    peer_str: str,
+    generation_id: int,
+    unauthenticated_deadline: float,
+) -> bool:
+    """Handle a public direct message and report whether the socket stays open."""
+    public_command = command[7:]
+    if public_command != "orderbook":
+        logger.trace(f"Unknown PUBLIC command from {sender_nick} via direct: {public_command}")
+        return True
+
+    if not bot._direct_connection_rate_limiter.check_orderbook(peer_str):
+        violations = bot._direct_connection_rate_limiter.get_violation_count(peer_str)
+        if bot._direct_connection_rate_limiter.is_banned(peer_str):
+            logger.debug(
+                f"Ignoring orderbook request from banned connection {peer_str} "
+                f"(nick: {sender_nick})"
+            )
+            await connection.close()
+            return False
+        logger.debug(
+            f"Rate limiting orderbook request from {peer_str} "
+            f"(nick: {sender_nick}, violations: {violations})"
+        )
+        return True
+
+    logger.trace(
+        f"Received !orderbook request from {sender_nick} via direct connection, sending offers"
+    )
+    if state.verified:
+        await bot._send_offers_via_direct_connection(sender_nick, connection, generation_id)
+        return True
+
+    remaining_unauthenticated_time = unauthenticated_deadline - time.monotonic()
+    if remaining_unauthenticated_time <= 0:
+        logger.bind(sensitive=True).debug(
+            f"Direct connection from {peer_str} did not authenticate in time"
+        )
+        return False
+    await asyncio.wait_for(
+        bot._send_offers_via_direct_connection(sender_nick, connection, generation_id),
+        timeout=remaining_unauthenticated_time,
+    )
+    return True
+
+
+async def _process_direct_message(
+    bot: MakerBotProtocol,
+    connection: TCPConnection,
+    data: bytes,
+    peer_str: str,
+    generation_id: int,
+    unauthenticated_deadline: float,
+) -> bool:
+    """Process one direct message and report whether the socket stays open."""
+    generation = bot._generation(generation_id)
+    if generation is None:
+        return False
+    state = generation.direct_connection_states.get(connection)
+    if state is None:
+        return False
+
+    if not bot._direct_connection_rate_limiter.check_message(peer_str):
+        logger.debug("Rate limiting direct-connection message flood")
+        logger.bind(sensitive=True).debug(f"Rate limiting message from {peer_str} (message flood)")
+        return True
+
+    if state.verified:
+        handshake_handled = await bot._try_handle_handshake(
+            connection, data, peer_str, generation_id
+        )
+    else:
+        remaining_unauthenticated_time = unauthenticated_deadline - time.monotonic()
+        if remaining_unauthenticated_time <= 0:
+            logger.bind(sensitive=True).debug(
+                f"Direct connection from {peer_str} did not authenticate in time"
+            )
+            return False
+        handshake_handled = await asyncio.wait_for(
+            bot._try_handle_handshake(connection, data, peer_str, generation_id),
+            timeout=remaining_unauthenticated_time,
+        )
+    if handshake_handled:
+        return True
+
+    if state.nick is None:
+        logger.warning("Dropping message before direct handshake")
+        logger.bind(sensitive=True).warning(
+            f"Dropping message before direct handshake from {peer_str}"
+        )
+        return True
+
+    parsed = bot._parse_direct_message(data, generation_id)
+    if parsed is None:
+        data_str = data.decode("utf-8", errors="replace") if isinstance(data, bytes) else str(data)
+        logger.trace("Received unparseable direct message")
+        logger.bind(sensitive=True).trace(
+            f"Unparseable direct message from {peer_str}: {data_str!r}"
+        )
+        msg_preview = data_str[:100] + "..." if len(data_str) > 100 else data_str
+        bot._log_rate_limited(
+            f"direct_parse_fail:{peer_str}",
+            f"Failed to parse direct message from {peer_str}: {msg_preview!r}",
+            interval=10,
+        )
+        return True
+
+    sender_nick, command, message_data = parsed
+    logger.trace(f"Direct message from {sender_nick}: cmd={command}")
+
+    if command.startswith("PUBLIC:"):
+        if sender_nick != state.nick:
+            logger.warning(
+                f"Dropping direct message claiming {sender_nick} on {state.nick}'s connection"
+            )
+            return True
+        return await _handle_direct_public_message(
+            bot,
+            state,
+            sender_nick,
+            command,
+            connection,
+            peer_str,
+            generation_id,
+            unauthenticated_deadline,
+        )
+
+    if state.verified:
+        if sender_nick != state.nick:
+            logger.warning(
+                f"Dropping verified direct message from {sender_nick} on {state.nick}'s connection"
+            )
+            return True
+    else:
+        if sender_nick != state.nick:
+            logger.trace(
+                f"Verified sender {sender_nick} overrides provisional direct "
+                f"handshake nick {state.nick} from {peer_str}"
+            )
+        state.nick = sender_nick
+        state.verified = True
+        # This map is a non-authoritative routing/lifecycle hint. Duplicate
+        # verified senders are allowed and the newest socket is its current hint.
+        generation.direct_connections[sender_nick] = connection
+
+    full_message = f"{command} {message_data}" if message_data else command
+    if command == "fill":
+        await bot._handle_fill(
+            sender_nick, full_message, source="direct", generation_id=generation_id
+        )
+    elif command == "auth":
+        await bot._handle_auth(
+            sender_nick, full_message, source="direct", generation_id=generation_id
+        )
+    elif command == "tx":
+        await bot._handle_tx(
+            sender_nick, full_message, source="direct", generation_id=generation_id
+        )
+    elif command == "push":
+        await bot._handle_push(
+            sender_nick, full_message, source="direct", generation_id=generation_id
+        )
+    else:
+        logger.trace(f"Unknown direct command from {sender_nick}: {command}")
+    return True
 
 
 class DirectConnectionMixin:
@@ -75,16 +252,8 @@ class DirectConnectionMixin:
         generation = self._generation(generation_id)
         if generation is None:
             return
-        states = (
-            self._direct_connection_states
-            if generation_id == self.current_generation_id
-            else generation.direct_connection_states
-        )
-        connections = (
-            self.direct_connections
-            if generation_id == self.current_generation_id
-            else generation.direct_connections
-        )
+        states = generation.direct_connection_states
+        connections = generation.direct_connections
         states.pop(connection, None)
         for nick, registered_connection in list(connections.items()):
             if registered_connection is connection:
@@ -200,11 +369,7 @@ class DirectConnectionMixin:
             generation = self._generation(generation_id)
             if generation is None:
                 return True
-            states = (
-                self._direct_connection_states
-                if generation_id == self.current_generation_id
-                else generation.direct_connection_states
-            )
+            states = generation.direct_connection_states
             message = json.loads(data.decode("utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError):
             return False
@@ -359,179 +524,70 @@ class DirectConnectionMixin:
         if generation is None:
             await connection.close()
             return
-        states = (
-            self._direct_connection_states
-            if generation_id == self.current_generation_id
-            else generation.direct_connection_states
-        )
-        connections = (
-            self.direct_connections
-            if generation_id == self.current_generation_id
-            else generation.direct_connections
-        )
-        states.setdefault(connection, DirectConnectionState())
+        states = generation.direct_connection_states
+
+        # Generation state is authoritative. The compatibility aliases point
+        # at the current generation, but counting only a nick routing hint or
+        # the current generation would let duplicate nicks and rotations evade
+        # this process-wide socket bound. This check and insertion deliberately
+        # have no await between them.
+        if connection not in states:
+            direct_connection_count = sum(
+                len(generation.direct_connection_states) for generation in self.generations.values()
+            )
+            if direct_connection_count >= _MAX_DIRECT_CONNECTIONS:
+                logger.warning("Rejecting direct connection because the socket limit is reached")
+                logger.bind(sensitive=True).warning(
+                    f"Rejecting direct connection from {peer_str}: "
+                    f"{direct_connection_count}/{_MAX_DIRECT_CONNECTIONS} sockets in use"
+                )
+                await connection.close()
+                return
+            states[connection] = DirectConnectionState()
+
+        unauthenticated_deadline = time.monotonic() + _DIRECT_CONNECTION_UNAUTHENTICATED_TIMEOUT_SEC
 
         try:
             # Keep connection open and process messages
             while self.running and connection.is_connected():
+                state = states.get(connection)
+                if state is None:
+                    break
+                receive_timeout = _DIRECT_CONNECTION_IDLE_TIMEOUT_SEC
+                if not state.verified:
+                    remaining_unauthenticated_time = unauthenticated_deadline - time.monotonic()
+                    if remaining_unauthenticated_time <= 0:
+                        logger.bind(sensitive=True).debug(
+                            f"Direct connection from {peer_str} did not authenticate in time"
+                        )
+                        break
+                    receive_timeout = min(receive_timeout, remaining_unauthenticated_time)
                 try:
-                    # Receive message with timeout
-                    data = await asyncio.wait_for(connection.receive(), timeout=60.0)
+                    # The idle timeout applies to every socket. Before a sender
+                    # verifies, the shorter remaining accept-time window also
+                    # bounds handshakes and arbitrary traffic.
+                    data = await asyncio.wait_for(connection.receive(), timeout=receive_timeout)
                     if not data:
                         logger.bind(sensitive=True).debug(
                             f"Direct connection from {peer_str} closed"
                         )
                         break
 
-                    # Apply connection-based message rate limiting FIRST
-                    # This catches general floods before any processing
-                    if not self._direct_connection_rate_limiter.check_message(peer_str):
-                        logger.debug("Rate limiting direct-connection message flood")
-                        logger.bind(sensitive=True).debug(
-                            f"Rate limiting message from {peer_str} (message flood)"
-                        )
-                        continue
-
-                    # Check for handshake request first (health check / feature discovery)
-                    handshake_handled = await self._try_handle_handshake(
-                        connection, data, peer_str, generation_id
-                    )
-                    if handshake_handled:
-                        # Handshake was handled, connection may close after response
-                        # Continue to allow follow-up messages or clean disconnect
-                        continue
-
-                    state = states.get(connection)
-                    if state is None or state.nick is None:
-                        logger.warning("Dropping message before direct handshake")
-                        logger.bind(sensitive=True).warning(
-                            f"Dropping message before direct handshake from {peer_str}"
-                        )
-                        continue
-
-                    # Parse the message (supports both formats)
-                    parsed = self._parse_direct_message(data, generation_id)
-                    if parsed is None:
-                        # Log message content for debugging
-                        # data is bytes, decode for display (replace errors to handle binary)
-                        data_str = (
-                            data.decode("utf-8", errors="replace")
-                            if isinstance(data, bytes)
-                            else str(data)
-                        )
-                        # Full message at TRACE level for troubleshooting.
-                        logger.trace("Received unparseable direct message")
-                        logger.bind(sensitive=True).trace(
-                            f"Unparseable direct message from {peer_str}: {data_str!r}"
-                        )
-                        # Rate-limited WARNING with truncated preview
-                        msg_preview = data_str[:100] + "..." if len(data_str) > 100 else data_str
-                        self._log_rate_limited(
-                            f"direct_parse_fail:{peer_str}",
-                            f"Failed to parse direct message from {peer_str}: {msg_preview!r}",
-                            interval=10,
-                        )
-                        continue
-
-                    sender_nick, cmd, msg_data = parsed
-
-                    logger.trace(f"Direct message from {sender_nick}: cmd={cmd}")
-
-                    if cmd.startswith("PUBLIC:") and sender_nick != state.nick:
-                        logger.warning(
-                            f"Dropping direct message claiming {sender_nick} on "
-                            f"{state.nick}'s connection"
-                        )
-                        continue
-
-                    # Handle PUBLIC messages (orderbook requests via direct connection)
-                    if cmd.startswith("PUBLIC:"):
-                        public_cmd = cmd[7:]  # Strip "PUBLIC:" prefix
-                        if public_cmd == "orderbook":
-                            # Apply CONNECTION-BASED rate limiting (not nick-based!)
-                            # This prevents nick rotation attacks
-                            if not self._direct_connection_rate_limiter.check_orderbook(peer_str):
-                                violations = (
-                                    self._direct_connection_rate_limiter.get_violation_count(
-                                        peer_str
-                                    )
-                                )
-                                is_banned = self._direct_connection_rate_limiter.is_banned(peer_str)
-                                if is_banned:
-                                    logger.debug(
-                                        f"Ignoring orderbook request from banned connection "
-                                        f"{peer_str} (nick: {sender_nick})"
-                                    )
-                                    # Close connection to banned peer
-                                    await connection.close()
-                                    return
-                                else:
-                                    logger.debug(
-                                        f"Rate limiting orderbook request from {peer_str} "
-                                        f"(nick: {sender_nick}, violations: {violations})"
-                                    )
-                                continue
-
-                            logger.trace(
-                                f"Received !orderbook request from {sender_nick} via direct "
-                                f"connection, sending offers"
-                            )
-                            await self._send_offers_via_direct_connection(
-                                sender_nick, connection, generation_id
-                            )
-                        else:
-                            logger.trace(
-                                f"Unknown PUBLIC command from {sender_nick} via direct: "
-                                f"{public_cmd}"
-                            )
-                        continue
-
-                    if state.verified:
-                        if sender_nick != state.nick:
-                            logger.warning(
-                                f"Dropping verified direct message from {sender_nick} on "
-                                f"{state.nick}'s connection"
-                            )
-                            continue
-                    else:
-                        if sender_nick != state.nick:
-                            logger.trace(
-                                f"Verified sender {sender_nick} overrides provisional direct "
-                                f"handshake nick {state.nick} from {peer_str}"
-                            )
-                        state.nick = sender_nick
-                        state.verified = True
-                        # This map is a non-authoritative routing/lifecycle hint.
-                        # Duplicate verified senders are allowed and the newest
-                        # verified socket becomes the current hint.
-                        connections[sender_nick] = connection
-
-                    # Process the command - reuse existing handlers
-                    # Commands: fill, auth, tx (same as via directory)
-                    full_msg = f"{cmd} {msg_data}" if msg_data else cmd
-
-                    if cmd == "fill":
-                        await self._handle_fill(
-                            sender_nick, full_msg, source="direct", generation_id=generation_id
-                        )
-                    elif cmd == "auth":
-                        await self._handle_auth(
-                            sender_nick, full_msg, source="direct", generation_id=generation_id
-                        )
-                    elif cmd == "tx":
-                        await self._handle_tx(
-                            sender_nick, full_msg, source="direct", generation_id=generation_id
-                        )
-                    elif cmd == "push":
-                        await self._handle_push(
-                            sender_nick, full_msg, source="direct", generation_id=generation_id
-                        )
-                    else:
-                        logger.trace(f"Unknown direct command from {sender_nick}: {cmd}")
+                    if not await _process_direct_message(
+                        self,
+                        connection,
+                        data,
+                        peer_str,
+                        generation_id,
+                        unauthenticated_deadline,
+                    ):
+                        break
 
                 except TimeoutError:
-                    # No message received, continue waiting
-                    continue
+                    logger.bind(sensitive=True).debug(
+                        f"Direct connection from {peer_str} timed out waiting for a message"
+                    )
+                    break
                 except NetworkConnectionError as e:
                     # Remote closed the TCP connection. This is routine for
                     # orderbook-watcher health checks and directory-handshake
@@ -555,6 +611,14 @@ class DirectConnectionMixin:
                 f"Error in direct connection handler for {peer_str}: {e}"
             )
         finally:
-            await connection.close()
-            self._remove_direct_connection(connection, generation_id)
+            try:
+                await connection.close()
+            except Exception as e:
+                logger.bind(sensitive=True).debug(
+                    f"Failed to close direct connection from {peer_str}: {e}"
+                )
+            finally:
+                # Always release the admission slot, including on cancellation
+                # or a transport close failure.
+                self._remove_direct_connection(connection, generation_id)
             logger.bind(sensitive=True).trace(f"Direct connection from {peer_str} closed")

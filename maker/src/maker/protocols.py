@@ -39,6 +39,7 @@ if TYPE_CHECKING:
     from jmwallet.history import TransactionHistoryEntry
 
     from maker.direct_connection import DirectConnectionState
+    from maker.generation import MakerGeneration
 
 
 class MakerBotProtocol(Protocol):
@@ -56,6 +57,7 @@ class MakerBotProtocol(Protocol):
     nick: str
     nick_identity: NickIdentity
     current_generation_id: int
+    generations: dict[int, MakerGeneration]
     current_offers: list[Offer]
     fidelity_bond: FidelityBondInfo | None
     current_block_height: int
