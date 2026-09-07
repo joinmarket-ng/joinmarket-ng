@@ -371,6 +371,48 @@ test.describe("feature display names", () => {
 });
 
 test.describe("orderbook rendering safety", () => {
+  test("renders hostile feature names without creating markup", async ({ page }) => {
+    const feature = '<img src=x onerror="window.__featureXssExecuted=true">';
+    const directory = "directory.example:5222";
+    const offers: FixtureOffer[] = [{
+      counterparty: "featuremaker",
+      oid: 0,
+      ordertype: "sw0reloffer",
+      cjfee: "0.0001",
+      minsize: 100_000,
+      maxsize: 1_000_000,
+      txfee: 0,
+      fidelity_bond_value: 10_000,
+      directory_nodes: [directory],
+      features: { [feature]: true },
+    }];
+    const server = await openChart(page, payload(offers, {
+      directory_nodes: [directory],
+      directory_stats: {
+        [directory]: {
+          offer_count: 1,
+          connected: true,
+          features: { [feature]: true },
+        },
+      },
+      feature_stats: { [feature]: 1 },
+      feature_stats_denominator: 1,
+    }));
+
+    try {
+      await expect(page.locator("#orderbook-tbody .feature-badge")).toHaveAttribute("title", feature);
+      await expect(page.locator("#feature-breakdown .feature-badge")).toHaveAttribute("title", feature);
+      await expect(page.locator(".directory-features")).toHaveAttribute(
+        "title", `Directory features: ${feature}`,
+      );
+      await expect(page.locator("#orderbook-tbody img, #feature-breakdown img, .directory-features img"))
+        .toHaveCount(0);
+      expect(await page.evaluate(() => Reflect.get(window, "__featureXssExecuted"))).toBeUndefined();
+    } finally {
+      server.close();
+    }
+  });
+
   test("renders a hostile counterparty as text without executing markup", async ({ page }) => {
     const maliciousNick = '<img src=x onerror="window.__nickXssExecuted=true">';
     const offers: FixtureOffer[] = [{
