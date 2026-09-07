@@ -19,6 +19,9 @@ app = SortedTyper(
 
 def main() -> None:
     """Entry point for the ``jm-wallet`` console script."""
+    from jmcore.process_hardening import harden_current_process
+
+    harden_current_process()
     app()
 
 
