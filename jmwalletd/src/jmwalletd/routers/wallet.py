@@ -287,8 +287,8 @@ async def wallet_create(
             )
         except FileExistsError as exc:
             raise WalletAlreadyExists() from exc
-        except OSError as exc:
-            raise LockExists(str(exc)) from exc
+        except OSError:
+            raise LockExists() from None
         except ValueError as exc:
             raise InvalidRequestFormat(str(exc)) from exc
 
@@ -343,8 +343,8 @@ async def wallet_recover(
             )
         except FileExistsError as exc:
             raise WalletAlreadyExists() from exc
-        except OSError as exc:
-            raise LockExists(str(exc)) from exc
+        except OSError:
+            raise LockExists() from None
         except ValueError as exc:
             raise InvalidRequestFormat(str(exc)) from exc
 
@@ -434,9 +434,10 @@ async def wallet_unlock(
         if state.wallet_loaded:
             try:
                 await verify_wallet_password(wallet_path=wallet_path, password=body.password)
-            except ValueError as exc:
+            except ValueError:
+                logger.info("Failed wallet unlock")
                 state.record_unlock_failure(walletname)
-                raise InvalidCredentials(str(exc)) from exc
+                raise InvalidCredentials() from None
             await state._lock_wallet()
 
         try:
@@ -446,11 +447,12 @@ async def wallet_unlock(
                 data_dir=state.data_dir,
                 sync_on_open=False,
             )
-        except OSError as exc:
-            raise LockExists(str(exc)) from exc
-        except ValueError as exc:
+        except OSError:
+            raise LockExists() from None
+        except ValueError:
+            logger.info("Failed wallet unlock")
             state.record_unlock_failure(walletname)
-            raise InvalidCredentials(str(exc)) from exc
+            raise InvalidCredentials() from None
 
         state.reset_unlock_failures(walletname)
         state.wallet_service = wallet_service

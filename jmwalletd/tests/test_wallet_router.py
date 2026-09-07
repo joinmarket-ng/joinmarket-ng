@@ -13,6 +13,7 @@ from jmwalletd.app import create_app
 from jmwalletd.deps import get_daemon_state, set_daemon_state
 from jmwalletd.errors import (
     InvalidCredentials,
+    LockExists,
     UnlockBackoff,
     WalletAlreadyUnlocked,
     WalletLifecycleQueueFull,
@@ -336,6 +337,20 @@ class TestWalletCreate:
             with pytest.raises(WalletAlreadyUnlocked):
                 await second
 
+    @patch("jmwalletd.routers.wallet.create_wallet", new_callable=AsyncMock)
+    def test_lock_error_hides_wallet_path(self, mock_create: AsyncMock, client: TestClient) -> None:
+        private_path = "/private/wallets/secret.jmdat"
+        mock_create.side_effect = OSError(private_path)
+
+        response = client.post(
+            "/api/v1/wallet/create",
+            json={"walletname": "new.jmdat", "password": "secret"},
+        )
+
+        assert response.status_code == 409
+        assert response.json()["message"] == LockExists.detail
+        assert private_path not in response.text
+
 
 class TestWalletRecover:
     @patch("jmwalletd.routers.wallet.recover_wallet", new_callable=AsyncMock)
@@ -593,6 +608,26 @@ class TestWalletUnlock:
         assert daemon_state._wallet_lifecycle_operations == 0
         assert daemon_state._wallet_sync_task is not None
         await daemon_state._wallet_sync_task
+
+    @patch("jmwalletd.routers.wallet.open_wallet_with_mnemonic", new_callable=AsyncMock)
+    def test_wrong_password_error_is_generic_and_logged(
+        self, mock_open: AsyncMock, client: TestClient, daemon_state: DaemonState
+    ) -> None:
+        wallet_name = "wrong-password.jmdat"
+        private_path = "/private/wallets/wrong-password.jmdat"
+        (daemon_state.wallets_dir / wallet_name).touch()
+        mock_open.side_effect = ValueError(f"wrong password at {private_path}")
+
+        with patch.object(wallet_router.logger, "info") as log_info:
+            response = client.post(
+                f"/api/v1/wallet/{wallet_name}/unlock",
+                json={"password": "secret"},
+            )
+
+        assert response.status_code == 401
+        assert response.json()["message"] == InvalidCredentials.detail
+        assert private_path not in response.text
+        log_info.assert_called_once_with("Failed wallet unlock")
 
     async def test_same_wallet_compares_utf8_encoded_passwords(
         self, daemon_state: DaemonState
