@@ -1508,6 +1508,7 @@ def _show_extended_wallet_info(
 
 @app.command("verify-password")
 def verify_password(
+    ctx: typer.Context,
     mnemonic_file: Annotated[
         Path,
         typer.Option(
@@ -1540,6 +1541,14 @@ def verify_password(
     Intended for scripting (e.g. the TUI) to validate a password before
     storing it in config.toml. No mnemonic content is printed.
     """
+    from click.core import ParameterSource
+
+    if ctx.get_parameter_source("password") is ParameterSource.COMMANDLINE:
+        typer.echo(
+            "WARNING: Passing a password on the command line can expose it to other users.",
+            err=True,
+        )
+
     if not mnemonic_file.exists():
         print(f"Error: Mnemonic file not found: {mnemonic_file}")
         raise typer.Exit(1)
@@ -1631,6 +1640,7 @@ def validate(
 
 @app.command()
 def showseed(
+    ctx: typer.Context,
     mnemonic_file: Annotated[
         Path,
         typer.Option(
@@ -1681,6 +1691,14 @@ def showseed(
       plaintext; redirect carefully.
     - The password is required when the mnemonic file is encrypted.
     """
+    from click.core import ParameterSource
+
+    if ctx.get_parameter_source("password") is ParameterSource.COMMANDLINE:
+        typer.echo(
+            "WARNING: Passing a password on the command line can expose it to other users.",
+            err=True,
+        )
+
     if not mnemonic_file.exists():
         print(f"Error: Mnemonic file not found: {mnemonic_file}")
         raise typer.Exit(1)
