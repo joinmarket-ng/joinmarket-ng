@@ -11,7 +11,12 @@ from fastapi.testclient import TestClient
 
 from jmwalletd.app import create_app
 from jmwalletd.deps import get_daemon_state, set_daemon_state
-from jmwalletd.errors import InvalidCredentials, UnlockBackoff, WalletAlreadyUnlocked
+from jmwalletd.errors import (
+    InvalidCredentials,
+    UnlockBackoff,
+    WalletAlreadyUnlocked,
+    WalletLifecycleQueueFull,
+)
 from jmwalletd.models import CreateWalletRequest, UnlockWalletRequest
 from jmwalletd.routers import wallet as wallet_router
 from jmwalletd.state import CoinjoinState, DaemonState
@@ -544,6 +549,48 @@ class TestWalletUnlock:
 
         assert response.walletname == wallet_name
         assert wallet_name not in daemon_state._unlock_failures
+        assert daemon_state._wallet_sync_task is not None
+        await daemon_state._wallet_sync_task
+
+    async def test_wallet_lifecycle_admission_rejects_flood_before_kdf(
+        self, daemon_state: DaemonState
+    ) -> None:
+        wallet_name = "bounded.jmdat"
+        (daemon_state.wallets_dir / wallet_name).touch()
+        started = asyncio.Event()
+        release = asyncio.Event()
+        wallet_service = MagicMock()
+        wallet_service.backend.supports_tx_enumeration = False
+        wallet_service.sync = AsyncMock()
+
+        async def open_wallet(**_kwargs: Any) -> tuple[MagicMock, str]:
+            started.set()
+            await release.wait()
+            return wallet_service, "abandon " * 11 + "about"
+
+        request = UnlockWalletRequest(password="secret")
+        with patch.object(
+            wallet_router, "open_wallet_with_mnemonic", new=AsyncMock(side_effect=open_wallet)
+        ) as mock_open:
+            first = asyncio.create_task(
+                wallet_router.wallet_unlock(wallet_name, request, daemon_state)
+            )
+            await started.wait()
+            waiting = [
+                asyncio.create_task(wallet_router.wallet_unlock(wallet_name, request, daemon_state))
+                for _ in range(7)
+            ]
+            await asyncio.sleep(0)
+
+            with pytest.raises(WalletLifecycleQueueFull):
+                await wallet_router.wallet_unlock(wallet_name, request, daemon_state)
+            assert mock_open.await_count == 1
+
+            release.set()
+            await first
+            await asyncio.gather(*waiting)
+
+        assert daemon_state._wallet_lifecycle_operations == 0
         assert daemon_state._wallet_sync_task is not None
         await daemon_state._wallet_sync_task
 

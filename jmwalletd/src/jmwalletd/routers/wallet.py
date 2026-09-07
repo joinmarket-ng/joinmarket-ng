@@ -269,7 +269,7 @@ async def wallet_create(
     state: DaemonState = Depends(get_daemon_state),
 ) -> CreateWalletResponse:
     """Create a new wallet."""
-    async with state.wallet_lifecycle_lock:
+    async with state.wallet_lifecycle_admission():
         if state.wallet_loaded:
             raise WalletAlreadyUnlocked()
 
@@ -323,7 +323,7 @@ async def wallet_recover(
     state: DaemonState = Depends(get_daemon_state),
 ) -> CreateWalletResponse:
     """Recover a wallet from a seed phrase."""
-    async with state.wallet_lifecycle_lock:
+    async with state.wallet_lifecycle_admission():
         if state.wallet_loaded:
             raise WalletAlreadyUnlocked()
 
@@ -390,7 +390,7 @@ async def wallet_unlock(
     state: DaemonState = Depends(get_daemon_state),
 ) -> UnlockWalletResponse:
     """Unlock (decrypt) a wallet."""
-    async with state.wallet_lifecycle_lock:
+    async with state.wallet_lifecycle_admission():
         wallet_path = state.wallets_dir / walletname
         if not wallet_path.exists():
             raise WalletNotFound()

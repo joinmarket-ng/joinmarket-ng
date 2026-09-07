@@ -14,6 +14,7 @@ import asyncio
 import contextlib
 import enum
 import time
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,7 @@ from loguru import logger
 from jmcore.paths import get_default_data_dir
 from jmcore.secure_files import ensure_private_directory
 from jmwalletd.auth import JMTokenAuthority
+from jmwalletd.errors import WalletLifecycleQueueFull
 from jmwalletd.log_buffer import get_log_buffer
 
 
@@ -75,6 +77,7 @@ _UNLOCK_BACKOFF_BASE_SECONDS = 1.0
 _UNLOCK_BACKOFF_MAX_SECONDS = 30.0
 _UNLOCK_BACKOFF_MAX_FAILURES = 6
 _MAX_PREAUTH_WS_CLIENTS = 32
+_MAX_WALLET_LIFECYCLE_OPERATIONS = 8
 
 
 class WebSocketRegistrationLimit(Exception):
@@ -98,6 +101,7 @@ class DaemonState:
         self.wallet_name: str = ""
         self.wallet_password: str = ""  # kept for re-unlock verification
         self.wallet_lifecycle_lock = asyncio.Lock()
+        self._wallet_lifecycle_operations = 0
         self._unlock_failures: dict[str, UnlockFailure] = {}
 
         # Coinjoin state
@@ -210,6 +214,23 @@ class DaemonState:
         """Serialize and lock the current wallet."""
         async with self.wallet_lifecycle_lock:
             return await self._lock_wallet()
+
+    @contextlib.asynccontextmanager
+    async def wallet_lifecycle_admission(self) -> AsyncIterator[None]:
+        """Reserve bounded capacity and serialize an unauthenticated lifecycle operation.
+
+        The reservation includes the active operation and callers waiting for
+        ``wallet_lifecycle_lock``. It is made before the first await and is
+        released for successful, failed, and canceled requests.
+        """
+        if self._wallet_lifecycle_operations >= _MAX_WALLET_LIFECYCLE_OPERATIONS:
+            raise WalletLifecycleQueueFull()
+        self._wallet_lifecycle_operations += 1
+        try:
+            async with self.wallet_lifecycle_lock:
+                yield
+        finally:
+            self._wallet_lifecycle_operations -= 1
 
     async def _lock_wallet(self) -> bool:
         """Lock the current wallet, stopping any running maker/taker first.

@@ -46,6 +46,13 @@ class UnlockBackoff(JMWalletDaemonError):
     detail = "Too many failed unlock attempts. Please try again later."
 
 
+class WalletLifecycleQueueFull(JMWalletDaemonError):
+    """429 - Unauthenticated wallet lifecycle admission is at capacity."""
+
+    status_code = 429
+    detail = "Too many wallet operations in progress. Please try again later."
+
+
 class InvalidToken(JMWalletDaemonError):
     """401 - Bearer token is invalid, expired, or missing."""
 

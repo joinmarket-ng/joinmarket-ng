@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from jmwalletd.errors import WalletLifecycleQueueFull
 from jmwalletd.log_buffer import get_log_buffer
 from jmwalletd.state import (
     CoinjoinState,
@@ -173,6 +174,54 @@ class TestDaemonState:
         daemon_state.unregister_ws_client(clients[0])
         replacement = daemon_state.register_ws_client()
         assert replacement in daemon_state._ws_clients
+
+    @pytest.mark.asyncio
+    async def test_wallet_lifecycle_admission_is_bounded_and_reclaimed(
+        self, daemon_state: DaemonState
+    ) -> None:
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        tasks: list[asyncio.Task[None]] = []
+
+        async def hold_admission(*, notify: bool = False) -> None:
+            async with daemon_state.wallet_lifecycle_admission():
+                if notify:
+                    entered.set()
+                await release.wait()
+
+        try:
+            first = asyncio.create_task(hold_admission(notify=True))
+            tasks.append(first)
+            await entered.wait()
+
+            waiting = [asyncio.create_task(hold_admission()) for _ in range(7)]
+            tasks.extend(waiting)
+            await asyncio.sleep(0)
+            assert daemon_state._wallet_lifecycle_operations == 8
+
+            with pytest.raises(WalletLifecycleQueueFull):
+                async with daemon_state.wallet_lifecycle_admission():
+                    pytest.fail("queue admission should reject excess operations")
+
+            waiting[0].cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await waiting[0]
+            assert daemon_state._wallet_lifecycle_operations == 7
+
+            replacement = asyncio.create_task(hold_admission())
+            tasks.append(replacement)
+            await asyncio.sleep(0)
+            assert daemon_state._wallet_lifecycle_operations == 8
+
+            release.set()
+            await asyncio.gather(first, *waiting[1:], replacement)
+            assert daemon_state._wallet_lifecycle_operations == 0
+        finally:
+            release.set()
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     def test_broadcast_ws(self, daemon_state: DaemonState) -> None:
         daemon_state.wallet_service = MagicMock()
