@@ -7,7 +7,13 @@ import json
 import pytest
 from jmcore.models import NetworkType
 from jmcore.nick_auth import NickAuthMode
-from jmcore.protocol import FEATURE_NICK_AUTH, JM_VERSION, JM_VERSION_MIN
+from jmcore.protocol import (
+    FEATURE_NICK_AUTH,
+    JM_VERSION,
+    JM_VERSION_MIN,
+    create_peerlist_entry,
+    parse_peerlist_entry,
+)
 
 from directory_server.handshake_handler import HandshakeError, HandshakeHandler
 
@@ -17,6 +23,20 @@ def handler():
     return HandshakeHandler(
         network=NetworkType.MAINNET, server_nick="test_directory", motd="Test Server"
     )
+
+
+def _valid_handshake(**overrides: object) -> str:
+    handshake = {
+        "app-name": "joinmarket",
+        "directory": False,
+        "location-string": "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx.onion:5222",
+        "proto-ver": JM_VERSION,
+        "features": {},
+        "nick": "test_client",
+        "network": "mainnet",
+    }
+    handshake.update(overrides)
+    return json.dumps(handshake)
 
 
 def test_valid_handshake(handler):
@@ -214,6 +234,70 @@ def test_handshake_lenient_location(handler):
     # Should default to NOT-SERVING-ONION instead of raising error
     assert peer_info.onion_address == "NOT-SERVING-ONION"
     assert peer_info.port == -1
+    assert response["accepted"] is True
+
+
+def test_handshake_rejects_nick_that_would_spoof_disconnect(handler):
+    spoofed_nick = "victim;victim.onion:5222;D"
+
+    # An unpatched server would serialize this as a canonical D notification,
+    # which a recipient cannot distinguish from a legitimate disconnect.
+    parsed_nick, parsed_location, disconnected, _features = parse_peerlist_entry(
+        f"{spoofed_nick};attacker.onion:5222"
+    )
+    assert parsed_nick == "victim"
+    assert parsed_location == "victim.onion:5222"
+    assert disconnected is True
+
+    with pytest.raises(HandshakeError, match="Invalid nickname for peerlist"):
+        handler.process_handshake(_valid_handshake(nick=spoofed_nick), "127.0.0.1:12345")
+
+    with pytest.raises(ValueError, match="Invalid peerlist nickname"):
+        create_peerlist_entry(spoofed_nick, "attacker.onion:5222")
+
+
+@pytest.mark.parametrize("nick", ["attacker,victim", "attacker!victim", "attacker name"])
+def test_handshake_rejects_nick_peerlist_delimiters(handler, nick):
+    with pytest.raises(HandshakeError, match="Invalid nickname for peerlist"):
+        handler.process_handshake(_valid_handshake(nick=nick), "127.0.0.1:12345")
+
+
+@pytest.mark.parametrize(
+    "location",
+    [
+        "attacker.onion:5222;victim.onion:5222",
+        "attacker.onion:5222,victim.onion:5222",
+        "attacker.onion:5222!victim",
+        "attacker.onion:5222\n",
+    ],
+)
+def test_handshake_rejects_location_peerlist_injection(handler, location):
+    with pytest.raises(HandshakeError, match="Invalid location string for peerlist"):
+        handler.process_handshake(
+            _valid_handshake(**{"location-string": location}), "127.0.0.1:12345"
+        )
+
+
+@pytest.mark.parametrize(
+    "features",
+    [
+        {"future,feature": True},
+        {"future;feature": True},
+        {"future+feature": True},
+        {"future feature": True},
+    ],
+)
+def test_handshake_rejects_unsafe_feature_identifiers(handler, features):
+    with pytest.raises(HandshakeError, match="Invalid feature identifier"):
+        handler.process_handshake(_valid_handshake(features=features), "127.0.0.1:12345")
+
+
+def test_handshake_accepts_safe_unknown_feature_identifier(handler):
+    peer_info, response = handler.process_handshake(
+        _valid_handshake(features={"future-feature.v1": True}), "127.0.0.1:12345"
+    )
+
+    assert peer_info.features == {"future-feature.v1": True}
     assert response["accepted"] is True
 
 

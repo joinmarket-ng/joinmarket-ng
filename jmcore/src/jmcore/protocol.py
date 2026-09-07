@@ -75,6 +75,8 @@ NICK_MAX_ENCODED = 14
 _NICK_RE = re.compile(rf"J[0-9][1-9A-HJ-NP-Za-km-zO]{{{NICK_MAX_ENCODED}}}")
 _HOSTNAME_LABEL_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?")
 _MAX_HOSTNAME_LENGTH = 253
+_PEERLIST_FIELD_DELIMITERS = frozenset({",", NICK_PEERLOCATOR_SEPARATOR, COMMAND_PREFIX})
+_FEATURE_IDENTIFIER_DELIMITERS = _PEERLIST_FIELD_DELIMITERS | {"+"}
 
 # Feature flag constants
 FEATURE_NEUTRINO_COMPAT = "neutrino_compat"
@@ -102,6 +104,31 @@ ALL_FEATURES = {
 }
 
 
+def _is_safe_peerlist_value(value: object, delimiters: frozenset[str]) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and all(
+            char not in delimiters and char.isprintable() and not char.isspace() for char in value
+        )
+    )
+
+
+def is_safe_peerlist_nick(nick: object) -> bool:
+    """Return whether a nick can be represented in a peerlist entry."""
+    return _is_safe_peerlist_value(nick, _PEERLIST_FIELD_DELIMITERS)
+
+
+def is_safe_peerlist_location(location: object) -> bool:
+    """Return whether a location can be represented in a peerlist entry."""
+    return _is_safe_peerlist_value(location, _PEERLIST_FIELD_DELIMITERS)
+
+
+def is_safe_peerlist_feature(feature: object) -> bool:
+    """Return whether a feature identifier can be represented in a peerlist entry."""
+    return _is_safe_peerlist_value(feature, _FEATURE_IDENTIFIER_DELIMITERS)
+
+
 class MakerError(StrEnum):
     """Fixed maker error messages that are safe to expose to counterparties."""
 
@@ -123,6 +150,10 @@ class FeatureSet:
     def from_handshake(cls, handshake_data: dict[str, Any]) -> FeatureSet:
         """Extract features from a handshake payload."""
         features_dict = handshake_data.get("features", {})
+        if not isinstance(features_dict, dict) or not all(
+            is_safe_peerlist_feature(feature) for feature in features_dict
+        ):
+            raise ValueError("Invalid feature identifier")
         # Only include features that are set to True
         features = {k for k, v in features_dict.items() if v is True}
         return cls(features=features)
@@ -130,6 +161,8 @@ class FeatureSet:
     @classmethod
     def from_list(cls, feature_list: list[str]) -> FeatureSet:
         """Create from a list of feature names."""
+        if not all(is_safe_peerlist_feature(feature) for feature in feature_list):
+            raise ValueError("Invalid feature identifier")
         return cls(features=set(feature_list))
 
     @classmethod
@@ -144,8 +177,12 @@ class FeatureSet:
             return cls(features=set())
         # Support both + (peerlist) and , (legacy/handshake) separators
         if "+" in s:
-            return cls(features={f.strip() for f in s.split("+") if f.strip()})
-        return cls(features={f.strip() for f in s.split(",") if f.strip()})
+            features = {feature for feature in s.split("+") if feature}
+        else:
+            features = {feature for feature in s.split(",") if feature}
+        if not all(is_safe_peerlist_feature(feature) for feature in features):
+            raise ValueError("Invalid feature identifier")
+        return cls(features=features)
 
     def to_dict(self) -> dict[str, bool]:
         """Convert to dict for JSON serialization."""
@@ -158,6 +195,8 @@ class FeatureSet:
         itself uses ',' to separate entries. Using ',' for features would
         cause parsing ambiguity.
         """
+        if not all(is_safe_peerlist_feature(feature) for feature in self.features):
+            raise ValueError("Invalid feature identifier")
         return "+".join(sorted(self.features))
 
     def supports(self, feature: str) -> bool:
@@ -604,6 +643,11 @@ def create_peerlist_entry(
 
     The F: prefix is used to identify the features field and maintain backward compatibility.
     """
+    if not is_safe_peerlist_nick(nick):
+        raise ValueError("Invalid peerlist nickname")
+    if not is_safe_peerlist_location(location):
+        raise ValueError("Invalid peerlist location")
+
     entry = f"{nick}{NICK_PEERLOCATOR_SEPARATOR}{location}"
     if disconnected:
         entry += f"{NICK_PEERLOCATOR_SEPARATOR}D"
@@ -619,12 +663,20 @@ def parse_peerlist_entry(entry: str) -> tuple[str, str, bool, FeatureSet]:
     Returns:
         Tuple of (nick, location, disconnected, features)
     """
+    if not isinstance(entry, str):
+        raise ValueError("Invalid peerlist entry")
+
     parts = entry.split(NICK_PEERLOCATOR_SEPARATOR)
     if len(parts) < 2:
         raise ValueError(f"Invalid peerlist entry: {entry}")
 
     nick = parts[0]
     location = parts[1]
+    if not is_safe_peerlist_nick(nick):
+        raise ValueError("Invalid peerlist nickname")
+    if not is_safe_peerlist_location(location):
+        raise ValueError("Invalid peerlist location")
+
     disconnected = False
     features = FeatureSet()
 
@@ -633,7 +685,10 @@ def parse_peerlist_entry(entry: str) -> tuple[str, str, bool, FeatureSet]:
         if part == "D":
             disconnected = True
         elif part.startswith("F:"):
-            features = FeatureSet.from_comma_string(part[2:])
+            feature_string = part[2:]
+            if "," in feature_string:
+                raise ValueError("Invalid peerlist feature identifier")
+            features = FeatureSet.from_comma_string(feature_string)
 
     return (nick, location, disconnected, features)
 

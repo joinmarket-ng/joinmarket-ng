@@ -18,6 +18,9 @@ from jmcore.protocol import (
     NOT_SERVING_ONION_HOSTNAME,
     FeatureSet,
     create_handshake_response,
+    is_safe_peerlist_feature,
+    is_safe_peerlist_location,
+    is_safe_peerlist_nick,
     peer_supports_neutrino_compat,
 )
 from loguru import logger
@@ -72,6 +75,15 @@ class HandshakeHandler:
 
             if not all([app_name, proto_ver, nick, network_str]):
                 raise HandshakeError("Missing required handshake fields")
+
+            if not is_safe_peerlist_nick(nick):
+                raise HandshakeError("Invalid nickname for peerlist")
+            if location_string is not None and not is_safe_peerlist_location(location_string):
+                raise HandshakeError("Invalid location string for peerlist")
+            if not isinstance(features, dict) or not all(
+                is_safe_peerlist_feature(feature) for feature in features
+            ):
+                raise HandshakeError("Invalid feature identifier")
 
             if app_name.lower() != "joinmarket":
                 raise HandshakeError(f"Invalid app name: {app_name}")

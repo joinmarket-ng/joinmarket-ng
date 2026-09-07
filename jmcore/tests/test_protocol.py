@@ -585,6 +585,11 @@ class TestFeatureSet:
         assert FEATURE_PUSH_ENCRYPTED not in fs  # Was False
         assert "unknown_feature" in fs
 
+    @pytest.mark.parametrize("feature", ["future,feature", "future;feature", "future+feature"])
+    def test_from_list_rejects_unsafe_feature_identifiers(self, feature: str) -> None:
+        with pytest.raises(ValueError, match="Invalid feature identifier"):
+            FeatureSet.from_list([feature])
+
     def test_intersection(self):
         """Intersection of two FeatureSets."""
         fs1 = FeatureSet.from_list([FEATURE_NEUTRINO_COMPAT, FEATURE_PUSH_ENCRYPTED])
@@ -672,6 +677,50 @@ class TestPeerlistEntryFeatures:
         assert location == "round.onion:5222"
         assert not disco
         assert parsed_features.features == original_features.features
+
+    def test_roundtrip_preserves_disconnection_and_safe_unknown_feature(self):
+        entry = create_peerlist_entry(
+            "legacy_nick",
+            "round.onion:5222",
+            disconnected=True,
+            features=FeatureSet.from_list(["future-feature.v1"]),
+        )
+
+        nick, location, disconnected, features = parse_peerlist_entry(entry)
+
+        assert nick == "legacy_nick"
+        assert location == "round.onion:5222"
+        assert disconnected is True
+        assert features.features == {"future-feature.v1"}
+
+    @pytest.mark.parametrize(
+        ("nick", "location"),
+        [
+            ("victim;victim.onion:5222;D", "attacker.onion:5222"),
+            ("attacker,victim", "attacker.onion:5222"),
+            ("attacker!victim", "attacker.onion:5222"),
+            ("attacker name", "attacker.onion:5222"),
+            ("attacker", "attacker.onion:5222,victim.onion:5222"),
+            ("attacker", "attacker.onion:5222;victim.onion:5222"),
+            ("attacker", "attacker.onion:5222\n"),
+        ],
+    )
+    def test_create_entry_rejects_unsafe_peerlist_fields(self, nick: str, location: str) -> None:
+        with pytest.raises(ValueError, match="Invalid peerlist"):
+            create_peerlist_entry(nick, location)
+
+    @pytest.mark.parametrize(
+        "entry",
+        [
+            "attacker!victim;attacker.onion:5222",
+            "attacker;attacker.onion:5222,victim.onion:5222",
+            "attacker;attacker.onion:5222;F:future,feature",
+            "attacker;attacker.onion:5222;F:future+feature name",
+        ],
+    )
+    def test_parse_entry_rejects_unsafe_peerlist_fields(self, entry: str) -> None:
+        with pytest.raises(ValueError, match="Invalid (peerlist|feature)"):
+            parse_peerlist_entry(entry)
 
     def test_invalid_entry_no_separator(self):
         """Entry without separator raises ValueError."""
