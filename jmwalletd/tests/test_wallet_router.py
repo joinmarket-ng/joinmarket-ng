@@ -594,6 +594,36 @@ class TestWalletUnlock:
         assert daemon_state._wallet_sync_task is not None
         await daemon_state._wallet_sync_task
 
+    async def test_same_wallet_compares_utf8_encoded_passwords(
+        self, daemon_state: DaemonState
+    ) -> None:
+        wallet_name = "unicode.jmdat"
+        daemon_state.wallet_service = MagicMock()
+        daemon_state.wallet_name = wallet_name
+        daemon_state.wallet_password = "secret-cafe\u00e9"
+        (daemon_state.wallets_dir / wallet_name).touch()
+
+        response = await wallet_router.wallet_unlock(
+            wallet_name,
+            UnlockWalletRequest(password="secret-cafe\u00e9"),
+            daemon_state,
+        )
+
+        assert response.walletname == wallet_name
+
+    async def test_same_wallet_none_password_never_matches_empty(
+        self, daemon_state: DaemonState
+    ) -> None:
+        wallet_name = "empty.jmdat"
+        daemon_state.wallet_service = MagicMock()
+        daemon_state.wallet_name = wallet_name
+        daemon_state.wallet_password = ""
+        (daemon_state.wallets_dir / wallet_name).touch()
+        request = UnlockWalletRequest.model_construct(password=None)
+
+        with pytest.raises(InvalidCredentials):
+            await wallet_router.wallet_unlock(wallet_name, request, daemon_state)
+
 
 class TestWalletLock:
     def test_requires_auth(self, client: TestClient) -> None:

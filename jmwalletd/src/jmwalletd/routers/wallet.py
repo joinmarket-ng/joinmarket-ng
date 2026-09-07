@@ -7,6 +7,7 @@ wallet/{name}/unlock, wallet/{name}/lock, token refresh.
 from __future__ import annotations
 
 import asyncio
+import hmac
 from typing import Any
 
 import jwt as pyjwt
@@ -400,7 +401,16 @@ async def wallet_unlock(
 
         # If the same wallet is already unlocked, just verify password and re-issue tokens.
         if state.wallet_loaded and state.wallet_name == walletname:
-            if body.password != state.wallet_password:
+            stored_password = state.wallet_password
+            same_password = (
+                body.password is not None
+                and stored_password is not None
+                and hmac.compare_digest(
+                    body.password.encode("utf-8"), stored_password.encode("utf-8")
+                )
+            )
+            if not same_password:
+                logger.info("Failed wallet unlock")
                 state.record_unlock_failure(walletname)
                 raise InvalidCredentials()
             state.reset_unlock_failures(walletname)
