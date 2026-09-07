@@ -84,6 +84,34 @@ Full orchestrated suite (unit + Docker-backed suites, in parallel):
 
 When selecting Docker-marked tests manually, use `--fail-on-skip`.
 
+### Rootless Docker Port Forwarding
+
+With rootless Docker using pasta and `--port-driver=implicit`, recent pasta
+versions exclude ephemeral ports from automatic forwarding (`--tcp-ports=auto`).
+Bitcoin RPC can therefore be healthy inside its container while the runner reports
+`Bitcoin RPC not ready on host port ...`. See the
+[pasta port-forwarding documentation](https://passt.top/builds/latest/web/passt.1.html).
+
+Check the host's ephemeral range and existing listeners:
+
+```bash
+sysctl net.ipv4.ip_local_port_range
+ss -ltn
+docker ps
+```
+
+By default, an instance's E2E Bitcoin RPC port is `20000 + instance * 2000`;
+other services and suites use offsets within that instance's port band. For an
+ephemeral range of `32768-60999`, instance 18 uses the excluded port `56000`,
+while instance 3 uses `26000`. Choose an unused instance whose published ports
+are outside the host's ephemeral range and do not overlap existing listeners:
+
+```bash
+./scripts/run_parallel_tests.sh --instance 3 --suite e2e
+```
+
+This workaround does not require restarting Docker or changing host networking.
+
 ## Documentation
 
 Build docs locally from repository root:
