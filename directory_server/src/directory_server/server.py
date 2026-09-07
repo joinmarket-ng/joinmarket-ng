@@ -42,6 +42,7 @@ from directory_server.peer_registry import (
 )
 
 _DIRECTORY_SEND_TIMEOUT_SEC = 30.0
+_MAX_PENDING_HANDSHAKES = 128
 
 
 def build_motd(user_motd: str) -> str:
@@ -69,7 +70,12 @@ class DirectoryServer:
         self.server_nick = server_nick
 
         self.peer_registry = PeerRegistry(max_peers=settings.max_peers)
-        self.connections = ConnectionPool(max_connections=settings.max_peers + 1)
+        self._pending_handshake_cap = min(settings.max_peers, _MAX_PENDING_HANDSHAKES)
+        self._pending_handshakes = 0
+        self._pending_handshake_rejections = 0
+        self.connections = ConnectionPool(
+            max_connections=settings.max_peers + self._pending_handshake_cap
+        )
         self.peer_key_to_conn_id: dict[str, str] = {}
         self._owner_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
 
@@ -209,9 +215,23 @@ class DirectoryServer:
         connection = TCPConnection(reader, writer, self.settings.max_message_size)
         peer_key: str | None = None
 
+        if self._pending_handshakes >= self._pending_handshake_cap:
+            self._pending_handshake_rejections += 1
+            if self._pending_handshake_rejections % 50 == 1:
+                logger.debug("Rejecting connection because pending handshake capacity is full")
+            with contextlib.suppress(Exception):
+                await connection.close()
+            return
+
+        # Reserve before the first await so concurrent callbacks cannot over-admit.
+        self._pending_handshakes += 1
+
         try:
-            self.connections.add(conn_id, connection)
-            peer_key = await self._perform_handshake(connection, conn_id)
+            try:
+                self.connections.add(conn_id, connection)
+                peer_key = await self._perform_handshake(connection, conn_id)
+            finally:
+                self._pending_handshakes -= 1
             if not peer_key:
                 return
 
