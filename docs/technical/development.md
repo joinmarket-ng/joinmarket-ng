@@ -9,8 +9,12 @@ python -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 
-pip install -e './jmcore[dev]' -e './jmwallet[dev]' -e './maker[dev]' -e './taker[dev]' -e './directory_server[dev]' -e './orderbook_watcher[dev]' -e './jmwalletd[dev]' -e './tumbler[dev]'
+python -m pip install --upgrade --upgrade-strategy eager -e './jmcore[dev]' -e './jmwallet[dev]' -e './maker[dev]' -e './taker[dev]' -e './directory_server[dev]' -e './orderbook_watcher[dev]' -e './jmwalletd[dev]' -e './tumbler[dev]'
 ```
+
+CI's unit jobs install dependencies in a fresh environment. Repeat the install
+command above before local CI-parity testing: without dependency upgrades, an
+existing environment can hide compatibility regressions.
 
 ## Lint / Format / Type Check
 

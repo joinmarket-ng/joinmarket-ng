@@ -1541,9 +1541,9 @@ def verify_password(
     Intended for scripting (e.g. the TUI) to validate a password before
     storing it in config.toml. No mnemonic content is printed.
     """
-    from click.core import ParameterSource
-
-    if ctx.get_parameter_source("password") is ParameterSource.COMMANDLINE:
+    # Recent Typer versions vendor Click, so the enum's identity is not shared.
+    source = ctx.get_parameter_source("password")
+    if source is not None and source.name == "COMMANDLINE":
         typer.echo(
             "WARNING: Passing a password on the command line can expose it to other users.",
             err=True,
@@ -1691,9 +1691,9 @@ def showseed(
       plaintext; redirect carefully.
     - The password is required when the mnemonic file is encrypted.
     """
-    from click.core import ParameterSource
-
-    if ctx.get_parameter_source("password") is ParameterSource.COMMANDLINE:
+    # Recent Typer versions vendor Click, so the enum's identity is not shared.
+    source = ctx.get_parameter_source("password")
+    if source is not None and source.name == "COMMANDLINE":
         typer.echo(
             "WARNING: Passing a password on the command line can expose it to other users.",
             err=True,
