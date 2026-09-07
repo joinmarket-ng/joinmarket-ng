@@ -1,332 +1,137 @@
-# =============================================================================
-# MkDocs Configuration for JoinMarket NG Documentation
-# =============================================================================
-#
-# This configuration file defines how the documentation is built and rendered.
-# It uses the Material theme and includes support for:
-# - Python API documentation via mkdocstrings
-# - Mathematical formulas via MathJax
-# - Diagrams via Mermaid and draw.io: https://github.com/jgraph/drawio
-# - Syntax highlighting and code blocks
-#
-# For more information, see:
-# - MkDocs: https://www.mkdocs.org/
-# - Material theme: https://squidfunk.github.io/mkdocs-material/
-# =============================================================================
-
-# -----------------------------------------------------------------------------
-# Site Metadata
-# -----------------------------------------------------------------------------
-
-# Site name displayed in the browser tab and page header
 site_name: JoinMarket NG
-
-# GitHub repository link displayed in the header for easy access to source code
+site_url: https://joinmarket-ng.github.io/joinmarket-ng/
 repo_url: https://github.com/joinmarket-ng/joinmarket-ng
 repo_name: GitHub
+copyright: <a href="https://github.com/joinmarket-ng/joinmarket-ng/blob/main/LICENSE">MIT License</a>
 
-# Footer copyright with link to license page
-# This appears at the bottom of every page
-copyright: <a href="license">MIT License</a> © 2026 JoinMarket contributors
-
-# -----------------------------------------------------------------------------
-# Pages not in navigation
-# -----------------------------------------------------------------------------
-# These pages exist in docs/ but are not included in the nav configuration.
-# This suppresses the INFO warning during build.
 not_in_nav: |
+  separator.md
   extension-documentation.md
   technical/tumbler-redesign.md
 
-# -----------------------------------------------------------------------------
-# Theme Configuration
-# -----------------------------------------------------------------------------
+validation:
+  links:
+    anchors: warn
+    unrecognized_links: warn
 
 theme:
-  # Use the Material theme - a modern, responsive documentation theme
-  # Requires: pip install mkdocs-material
   name: material
-
-  # Logo displayed in the header and navigation
   logo: media/logo_title_v4.png
-
-  # Theme features enabled for this documentation
   features:
-    # Add a "copy" button to code blocks for easy copying
     - content.code.copy
-    # Enable section index pages - shows an overview page for each section
     - navigation.indexes
-
-  # Color scheme configuration
+    - search.suggest
+    - search.highlight
   palette:
-    # Use custom primary color defined in docs/stylesheets/extra.css
-    # This allows branding consistency with JoinMarket colors
     primary: custom
-    # Use custom accent color defined in docs/stylesheets/extra.css
     accent: custom
 
-# -----------------------------------------------------------------------------
-# Plugins
-# -----------------------------------------------------------------------------
-
 plugins:
-  # Built-in search plugin - enables full-text search across all documentation
   - search
-  # List of glob patterns for pages to exclude from search
-  # Patterns are relative to the docs/ directory
-  # All excluded pages remain accessible via the navigation menu
+  # Keep generated internals out of user search; they remain browsable in Reference.
   - exclude-search:
       exclude:
         - api/*
-        - Scripts/*
-
-  # mkdocs-gen-files - Programmatically generate documentation pages at build time
-  # Runs docs/_scripts/gen_ref_pages.py to auto-create API reference .md files
-  # from Python source directories, so they don't need to be committed to git.
-  #
-  # For more information, see: https://oprypin.github.io/mkdocs-gen-files/
+        - extension-documentation.md
+        - technical/tumbler-redesign.md
+        - separator.md
   - gen-files:
       scripts:
         - docs/_scripts/gen_ref_pages.py
-
-  # mkdocs-literate-nav - Define navigation structure via SUMMARY.md files
-  # The gen_ref_pages.py script writes api/SUMMARY.md which literate-nav
-  # uses to build the API Reference navigation tree automatically.
-  #
-  # For more information, see: https://oprypin.github.io/mkdocs-literate-nav/
   - literate-nav:
       nav_file: SUMMARY.md
-
-  # mkdocstrings - Generates API documentation from Python docstrings
-  # This plugin reads Python source files and extracts documentation from
-  # docstrings, creating formatted API reference pages automatically.
-  #
-  # For more information, see: https://mkdocstrings.github.io/
   - mkdocstrings:
       handlers:
         python:
-          # Paths to Python source directories to scan for docstrings
-          # These are the main modules of the JoinMarket NG project
           paths:
-            - jmcore/src        # Core functionality (crypto, networking, etc.)
-            - jmwallet/src      # Wallet management
-            - taker/src         # Taker module for coinjoin initiation
-            - maker/src         # Maker module for liquidity provision
-            - directory_server/src    # Directory server for peer discovery
-            - orderbook_watcher/src   # Orderbook monitoring
-            - tumbler/src     # Tumbler scheduler
-            - jmwalletd/src   # JAM-compatible wallet daemon
+            - jmcore/src
+            - jmwallet/src
+            - taker/src
+            - maker/src
+            - directory_server/src
+            - orderbook_watcher/src
+            - tumbler/src
+            - jmwalletd/src
           options:
-            # Use NumPy-style docstring parsing
-            # NumPy style is used because it's readable and supports
-            # mathematical notation with $...$ delimiters for LaTeX formulas
             docstring_style: numpy
-
-            # Custom extension to hide __init__ methods from dataclass documentation
-            # This keeps API docs clean by not showing auto-generated __init__ methods
             extensions:
               - docs/_extensions/hide_dataclass_init.py:HideDataclassInit
-
-            # Show the source code link in documentation
             show_source: true
-            # Show the main heading for each module/class
             show_root_heading: true
-            # Group members by their type (classes, functions, etc.)
             group_by_category: true
-            # Show category headings (Classes, Functions, etc.)
             show_category_heading: true
-            # Sort members alphabetically within each category
             members_order: alphabetical
-            # Show base classes for inheritance documentation
             show_bases: true
-            # Show function/method signatures with full type annotations
             show_signature: true
             show_signature_annotations: true
-            # Include members even if they have no docstring
             show_if_no_docstring: true
 
-# -----------------------------------------------------------------------------
-# Markdown Extensions
-# -----------------------------------------------------------------------------
-# These extensions extend Markdown syntax with additional features.
-# They are processed by Python-Markdown during the build process.
-# -----------------------------------------------------------------------------
-
 markdown_extensions:
-
-  # Enable attribute lists on elements
-  # Allows syntax like: ![alt](image.png){ .class #id align=left }
   - attr_list
-
-  # Enable Markdown processing inside HTML blocks
-  # Required for: <figure markdown="span">![alt](image.png)<figcaption>Caption</figcaption></figure>
   - md_in_html
-
-  # Syntax highlighting for code blocks
-  # Supports many languages with automatic language detection
   - pymdownx.highlight
-
-  # Enable ==highlighted text== syntax for highlighting important content
   - pymdownx.mark
-
-  # Enhanced fenced code blocks with support for:
-  # - Nested code blocks
-  # - Custom fences for diagrams (Mermaid)
-  # - Better code block handling
   - pymdownx.superfences:
       custom_fences:
-        # Mermaid diagram support - renders flowcharts, sequence diagrams, etc.
-        # Diagrams are rendered client-side by the Mermaid JavaScript library
         - name: mermaid
           class: mermaid
           format: !!python/name:pymdownx.superfences.fence_code_format
-
-  # Inline code syntax highlighting - enables `code:language` syntax
   - pymdownx.inlinehilite
-
-  # =============================================================================
-  # Mathematical Formula Support (MathJax)
-  # =============================================================================
-  #
-  # This extension enables LaTeX-style mathematical formulas in documentation.
-  #
-  # Inline formulas: $C = H(P_2)$
-  # Block formulas: $$C = H(P_2)$$
-  #
-  # The 'generic: true' option tells the extension to output generic markup
-  # that MathJax will process client-side. This is the recommended approach
-  # for MkDocs Material theme.
-  #
-  # Configuration is in docs/javascripts/mathjax.js
-  #
-  # For more information, see:
-  # https://squidfunk.github.io/mkdocs-material/reference/math/
-  # =============================================================================
   - pymdownx.arithmatex:
       generic: true
 
-# -----------------------------------------------------------------------------
-# JavaScript
-# -----------------------------------------------------------------------------
-
 extra_javascript:
-  # MathJax configuration file
-  # This file configures MathJax to recognize $...$ and $$...$$ delimiters
-  # for inline and display math respectively.
-  #
-  # IMPORTANT: This file MUST be loaded before the MathJax library itself.
   - javascripts/mathjax.js
-
-  # MathJax library from CDN
-  # This is the main MathJax library that renders mathematical formulas.
-  # The tex-mml-chtml.js bundle includes:
-  # - TeX input processor (for LaTeX syntax)
-  # - MathML input processor
-  # - CommonHTML output processor (fast, widely compatible)
-  #
-  # Alternative CDNs:
-  # - https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js
-  #
-  # For offline use, download and host locally.
   - https://unpkg.com/mathjax@3/es5/tex-mml-chtml.js
-
-# -----------------------------------------------------------------------------
-# Custom CSS
-# -----------------------------------------------------------------------------
-
 extra_css:
-  # Custom stylesheet for additional styling
-  # Includes:
-  # - Custom theme colors (primary, accent)
-  # - Navigation separator styling
-  # - Math formula display styling (if needed)
   - stylesheets/extra.css
 
-# -----------------------------------------------------------------------------
-# Navigation Menu Structure
-# -----------------------------------------------------------------------------
-# This defines the structure of the documentation navigation menu.
-# Each entry is a page or section with its corresponding Markdown file.
-# -----------------------------------------------------------------------------
-
 nav:
-  # -------------------------------------------------------------------------
-  # Main Pages
-  # -------------------------------------------------------------------------
   - Home: index.md
-  - FAQ: faq.md
-  - Installation: install.md
-  - Flatpak: flatpak.md
-  - TUI Menu: README-tui.md
-
-  # -------------------------------------------------------------------------
-  # Protocol Documentation
-  # -------------------------------------------------------------------------
-  # Comprehensive documentation about the JoinMarket NG protocol
-  # These files contain mathematical formulas rendered via MathJax
-  - Technical Documentation:
-      - technical/index.md
-      - Concepts: technical/concepts.md
-      - Overview: technical/overview.md
-      - Architecture: technical/architecture.md
-      - Protocol: technical/protocol.md
-      - Privacy: technical/privacy.md
-      - Wallet: technical/wallet.md
-      - Wallet Scanning: technical/wallet-scanning.md
+  - Start Here:
+      - Get started: getting-started.md
+      - Install: install.md
+      - Set up Bitcoin and Tor: setup.md
+      - Terminal menu: README-tui.md
+  - Use Your Wallet:
+      - Receive and send: README-jmwallet.md
+      - Run a CoinJoin: README-taker.md
+      - Run the tumbler: README-tumbler.md
+      - Run a maker: README-maker.md
+      - Back up and recover: recover-wallet.md
+      - Update: update.md
+  - Understand Privacy:
+      - CoinJoin and wallet concepts: technical/concepts.md
+      - Protect your funds and privacy: technical/best-practices.md
+      - Common questions: faq.md
+  - Troubleshoot: troubleshooting.md
+  - Reference:
+      - reference.md
       - Configuration: technical/configuration.md
-      - Security: technical/security.md
-      - Maker Verification Checklist: technical/maker-verification-checklist.md
-      - Threat Model: technical/threat-model.md
-      - Neutrino TLS: technical/neutrino-tls.md
-      - Development: technical/development.md
-      - Best Practices: technical/best-practices.md
-      - References: technical/references.md
-
-  # -------------------------------------------------------------------------
-  # Main Modules
-  # -------------------------------------------------------------------------
-  # Documentation for the core modules
-  - Main Modules:
-      - JM Core: README-jmcore.md
-      - Wallet: README-jmwallet.md
-      - Fidelity Bond Operations: fidelity-bond-operations.md
-      - Taker: README-taker.md
-      - Maker: README-maker.md
-      - Tumbler: README-tumbler.md
-      - Wallet Daemon (JAM API): README-jmwalletd.md
-
-  # -------------------------------------------------------------------------
-  # Extra Modules
-  # -------------------------------------------------------------------------
-  # Documentation for supplementary modules
-  - Extra Modules:
-      - Orderbook Watcher: README-orderbook-watcher.md
-      - Directory Server: README-directory-server.md
-
-  # -------------------------------------------------------------------------
-  # Visual Separator
-  # -------------------------------------------------------------------------
-  # This creates a horizontal line separator in the navigation menu
-  # The actual styling is defined in docs/stylesheets/extra.css
-  - '---': separator.md
-
-  # -------------------------------------------------------------------------
-  # Scripts, Signatures
-  # -------------------------------------------------------------------------
-  - Signatures: README-signatures.md
-  - Scripts: README-scripts.md
-
-  # -------------------------------------------------------------------------
-  # API Reference
-  # -------------------------------------------------------------------------
-  # Auto-generated from Python source by mkdocs-gen-files + literate-nav.
-  # The gen_ref_pages.py script creates api/ .md files and api/SUMMARY.md
-  # at build time. No manual .md files needed in docs/api/.
-  - API Reference: api/
-
-  # -------------------------------------------------------------------------
-  # External Links
-  # -------------------------------------------------------------------------
-  # Link to external resources - opens in new tab
-  - '---': separator.md
+      - Fidelity bonds: fidelity-bond-operations.md
+      - Unattended makers: maker-service.md
+      - Advanced installation: install-advanced.md
+      - Experimental JAM NG Flatpak: flatpak.md
+      - Wallet daemon (JAM API): README-jmwalletd.md
+      - Orderbook watcher: README-orderbook-watcher.md
+      - Directory server: README-directory-server.md
+      - Release signatures: README-signatures.md
+      - Technical reference:
+          - technical/index.md
+          - Compatibility: technical/overview.md
+          - Architecture: technical/architecture.md
+          - Protocol: technical/protocol.md
+          - Privacy analysis: technical/privacy.md
+          - Wallet internals: technical/wallet.md
+          - Wallet scanning: technical/wallet-scanning.md
+          - Security: technical/security.md
+          - Maker verification: technical/maker-verification-checklist.md
+          - Threat model: technical/threat-model.md
+          - Neutrino TLS: technical/neutrino-tls.md
+          - Sources: technical/references.md
+      - Python API: api/
+  - Contribute:
+      - Development and documentation: technical/development.md
+      - Core library: README-jmcore.md
+      - Scripts: README-scripts.md
   - JoinMarket NG Orderbook: https://joinmarket-ng.sgn.space/

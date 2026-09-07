@@ -18,7 +18,7 @@ existing environment can hide compatibility regressions.
 
 ## Lint / Format / Type Check
 
-Install and enable [prek](https://github.com/anomalyco/prek) to run checks automatically on commit:
+Install and enable [prek](https://github.com/j178/prek) to run checks automatically on commit:
 
 ```bash
 pip install prek
@@ -118,7 +118,28 @@ This workaround does not require restarting Docker or changing host networking.
 
 ## Documentation
 
-Build docs locally from repository root:
+Use one canonical page per topic. User guides describe goals and necessary
+actions; concepts explain custody, CoinJoin, and privacy limits; reference owns
+exact options and internals. A new option usually needs a reference update,
+not a new guide or another quick start.
+
+- Give each page a concrete user question or task and a clear next step.
+- Put prerequisites, irreversible consequences, and recovery requirements before
+  commands. Include how to recognize success or diagnose failure.
+- Keep defaults and flag inventories in `--help` and `config.toml.template`.
+  Refresh component command reference with `python scripts/update_readme_help.py`;
+  do not paste generated help into user guides.
+- Link to existing explanations instead of repeating them. Use descriptive
+  headings that match user vocabulary, including common error messages.
+- Preserve published paths and useful anchors when moving content. Check internal
+  links, search results, and narrow-screen navigation before merging.
+- Remove stale claims and unnecessary prose. Avoid privacy guarantees, speculative
+  feature descriptions, and changelog-style implementation narratives.
+
+These conventions follow [Diataxis how-to guidance](https://diataxis.fr/how-to-guides/)
+and [Write the Docs principles](https://www.writethedocs.org/guide/writing/docs-principles/).
+
+Build from the repository root in an activated Python virtual environment:
 
 ```bash
 python scripts/build_docs.py
@@ -128,21 +149,25 @@ What this does:
 
 - installs docs dependencies from `requirements-docs.txt`
 - installs editable project packages used by API doc generation
-- runs `properdocs build -q -f properdocs.yml` and writes output to `site/`
+- runs the documentation build and writes output to `site/`
 
 If you want to run the steps manually:
 
 ```bash
 python -m pip install -r requirements-docs.txt
 python -m pip install -e jmcore -e jmwallet -e taker -e maker -e directory_server -e orderbook_watcher -e jmwalletd -e tumbler
-python -m properdocs build -q -f properdocs.yml
+python -m properdocs build --strict -f properdocs.yml
 ```
 
 For local preview:
 
 ```bash
-python -m properdocs serve -q -f properdocs.yml
+python -m properdocs serve -f properdocs.yml -a 127.0.0.1:8000
 ```
+
+Open <http://127.0.0.1:8000/joinmarket-ng/>. The documentation workflow checks pull requests
+with a strict build and deploys only outside pull requests. Changes that only
+affect wording need a docs build and link review, not transaction tests.
 
 ## Reference Compatibility Tests
 

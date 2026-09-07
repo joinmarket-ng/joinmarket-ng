@@ -1,5 +1,9 @@
 # Privacy
 
+For practical guidance, start with [privacy practices](best-practices.md).
+[Collaborative Transaction Privacy](https://gist.github.com/nothingmuch/d84ba390d89b5b08897af2d95009c2a1)
+examines broader transaction-graph attacks and what privacy claims need to establish.
+
 ## Mixdepths
 
 Mixdepths are isolated wallet accounts. Inputs for one CoinJoin come from one

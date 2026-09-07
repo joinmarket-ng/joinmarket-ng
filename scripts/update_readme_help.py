@@ -2,7 +2,7 @@
 """Update CLI help sections in documentation files.
 
 This script extracts help text from CLI commands and inserts them into
-auto-generated sections in both module READMEs and docs pages.
+auto-generated sections in component READMEs. User guides link to that reference.
 """
 
 from __future__ import annotations
@@ -251,41 +251,36 @@ def main() -> int:
     script_dir = Path(__file__).parent
     project_root = script_dir.parent
 
-    # Define commands and all docs files that should contain their help sections.
+    # Component READMEs own generated help; task guides link to them.
     commands_to_update: list[tuple[str, list[Path]]] = [
         (
             "jm-wallet",
             [
                 project_root / "jmwallet" / "README.md",
-                project_root / "docs" / "README-jmwallet.md",
             ],
         ),
         (
             "jm-maker",
             [
                 project_root / "maker" / "README.md",
-                project_root / "docs" / "README-maker.md",
             ],
         ),
         (
             "jm-taker",
             [
                 project_root / "taker" / "README.md",
-                project_root / "docs" / "README-taker.md",
             ],
         ),
         (
             "jm-directory-ctl",
             [
                 project_root / "directory_server" / "README.md",
-                project_root / "docs" / "README-directory-server.md",
             ],
         ),
         (
             "jm-tumbler",
             [
                 project_root / "tumbler" / "README.md",
-                project_root / "docs" / "README-tumbler.md",
             ],
         ),
     ]

@@ -84,7 +84,7 @@ funds; backups and mnemonic hygiene are out of scope here and live in
       selects uniformly only among zero-fee offers, while the remaining slots
       retain fidelity-bond weighting ([Protocol](protocol.md)).
     - **Feature stats over bonded makers only** in the orderbook watcher
-      (issue #483) so a sybil cannot skew "% of makers supporting X".
+      ([issue #483](https://github.com/joinmarket-ng/joinmarket-ng/issues/483)) so a sybil cannot skew "% of makers supporting X".
 
 ### Costless UTXO Probing
 
@@ -97,7 +97,7 @@ funds; backups and mnemonic hygiene are out of scope here and live in
     - **Rate limiting** in directory and maker code paths.
     - **Operational guidance** to rotate mixdepths and treat revealed
       UTXOs as semi-public ([Best Practices](best-practices.md)). See
-      also issue #47 for ongoing mitigation work.
+      also [issue #47](https://github.com/joinmarket-ng/joinmarket-ng/issues/47) for ongoing mitigation work.
 
 ### Subset-Sum Linkage of Equal-Output CoinJoins
 
@@ -106,9 +106,11 @@ funds; backups and mnemonic hygiene are out of scope here and live in
 - **Mitigations**:
     - Equal-value outputs across multiple participants make multiple
       subset solutions plausible.
-    - Running multiple smaller CoinJoins over time, rather than one large
-      one, raises the cost of subset analysis ([Best Practices](best-practices.md)).
-    - Ongoing research in issue #114 (subset sum mitigations).
+    - Multiple rounds and varied timing can add ambiguity, but do not guarantee
+      protection from amount matching. Consider the whole spending path
+      ([Privacy Practices](best-practices.md)).
+    - Ongoing research in [issue #114](https://github.com/joinmarket-ng/joinmarket-ng/issues/114)
+      examines subset-sum mitigations.
 
 ### Malicious or Compromised Directory
 
@@ -123,7 +125,7 @@ funds; backups and mnemonic hygiene are out of scope here and live in
       on a cross-directory union that masks censorship.
     - **Direct maker reachability.** The orderbook watcher actively
       probes maker onion addresses and signals direct reachability in the
-      UI (issue #105) so a taker can prefer makers whose presence does
+      UI ([issue #105](https://github.com/joinmarket-ng/joinmarket-ng/issues/105)) so a taker can prefer makers whose presence does
       not depend on a single directory.
 
 ### Session Confusion and Channel Hijack
@@ -152,8 +154,8 @@ funds; backups and mnemonic hygiene are out of scope here and live in
       for makers ([Security](security.md)).
     - **Ephemeral onion services** for maker sessions when Tor control
       is enabled.
-    - **Operational guidance** to anonymize fidelity bond UTXOs before
-      locking them, since the bond UTXO is published per identity
+    - **Operational guidance** to consider bond funding history and avoid
+      merging unrelated funds, since the bond UTXO is published per identity
       ([Best Practices](best-practices.md)).
 
 ### Hot Bond Key Compromise
@@ -195,6 +197,6 @@ funds; backups and mnemonic hygiene are out of scope here and live in
 
 ## Disclosure
 
-Security issues should be reported through the channels documented in the
-repository's `SECURITY.md` (tracked in issue #117 until published). Do not
-file public GitHub issues for unpatched vulnerabilities affecting funds.
+Use [private vulnerability reporting](https://github.com/joinmarket-ng/joinmarket-ng/security/advisories/new)
+and follow the published [security policy](https://github.com/joinmarket-ng/joinmarket-ng/security/policy).
+Do not report unpatched vulnerabilities in public issues or community channels.

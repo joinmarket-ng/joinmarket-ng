@@ -158,7 +158,7 @@ underlying label exposed as `base_status` on `AddressInfo`.
 A wallet imported or recovered from seed has no such history file, so every
 coin would otherwise fall back to `deposit` (external branch) or
 `non-cj-change` (internal branch), even when it actually came from a CoinJoin.
-To recover the correct labels, the wallet reconstructs them from on-chain data:
+To infer likely labels, the wallet reconstructs them from on-chain data:
 for each funded coin without a local-history classification it fetches the
 transaction that created it and applies the same equal-output heuristic the
 legacy joinmarket-clientserver uses (a transaction is a CoinJoin when its most
@@ -166,7 +166,7 @@ frequent output value repeats more than once and the count of those equal
 outputs matches the number of other outputs, with `+1` slack for one
 no-change participant). The derived origin (`cj_out` / `cj_change` / `deposit`
 / `non_cj_change`) is persisted into the BIP-329 metadata store, so the work is
-done once and the display then surfaces the true status.
+done once and the display then surfaces the inferred status.
 
 The reconstruction is best-effort and bounded: it runs once per process during
 the bond-aware sync, skips addresses the local history already classifies (those
@@ -196,7 +196,7 @@ exemption. Exact CoinJoin-output roots are persisted separately as the
 
 - Method: `importdescriptors` + `listunspent` RPC
 - Requirements: Bitcoin Core v24+
-- Storage: ~900 GB + small wallet file
+- Storage: Bitcoin Core chain data and a descriptor wallet
 - Sync: Fast after initial descriptor import
 - **Smart Scan**: Scans ~1 year of blocks initially, full rescan in background
 
@@ -206,14 +206,14 @@ Trade-off: Addresses stored in Core wallet file - never use with third-party nod
 
 - Method: BIP157/158 compact block filters
 - Requirements: [neutrino-api server](https://github.com/m0wer/neutrino-api)
-- Storage: ~500 MB
-- Sync: Minutes instead of days
+- Storage: Headers, compact filters, and wallet-related data; depends on retained history
+- Sync: Initial header and filter sync, then wallet scanning; duration depends on hardware and history
 
 **Decision Matrix:**
 
-- Use DescriptorWallet if: You run a full node (recommended)
-- Use BitcoinCore if: Simple one-off UTXO queries
-- Use Neutrino if: Limited storage, fast setup needed
+- Use `descriptor_wallet` with a Bitcoin Core node you control (recommended).
+- Use `neutrino` when you need a lightweight backend without running Bitcoin Core.
+- See [backend setup](../setup.md) for connection and authentication requirements.
 
 **Neutrino Broadcast Strategy:**
 
@@ -232,7 +232,7 @@ When mempool access is unavailable (legacy server, or operator opt-out
 via `bitcoin.neutrino_include_mempool = false`), all non-`SELF`
 policies fan out the `!push` to every available maker simultaneously.
 This avoids the privacy-leaking self-broadcast fallback when an
-individual maker is offline (issue #482); confirmation is then
+individual maker is offline ([issue #482](https://github.com/joinmarket-ng/joinmarket-ng/issues/482)); confirmation is then
 established via block-based UTXO lookups.
 
 When the tracker is available, neutrino behaves like the descriptor
@@ -278,7 +278,7 @@ backups accordingly. Deleting only the mnemonic does not remove this history;
 while preserving other wallets and unattributed legacy rows.
 
 The same fingerprint scopes the fidelity bond registry on disk as
-`fidelity_bonds_<fingerprint>.json` (issue #492). Both `jm-wallet
+`fidelity_bonds_<fingerprint>.json` ([issue #492](https://github.com/joinmarket-ng/joinmarket-ng/issues/492)). Both `jm-wallet
 list-bonds` and `jm-wallet registry-show` read this per-wallet file.
 
 Both `jmwalletd` and the `jm-wallet` CLI read this registry and run a
@@ -330,7 +330,8 @@ To pick a wallet, the offline commands `history`, `list-bonds` and
    fingerprint yet, the mnemonic is decrypted once and the derived
    fingerprint is written back to the sidecar so later reads stay
    passwordless. This is what makes `jm-wallet history` show the active
-   wallet's CoinJoins rather than another wallet's (issue #523).
+   wallet's CoinJoins rather than another wallet's
+   ([issue #523](https://github.com/joinmarket-ng/joinmarket-ng/issues/523)).
 4. Auto-detection when the data directory contains exactly one
    wallet's data (one fingerprint in `history.csv` for `history`, one
    `fidelity_bonds_*.json` file for `list-bonds` / `registry-show`).

@@ -1,13 +1,22 @@
-# Flatpak
+# Experimental JAM NG Flatpak
 
-The Flatpak package (`org.joinmarketng.JamNG`) bundles all services
+This experimental Flatpak package (`org.joinmarketng.JamNG`) bundles all services
 (jmwalletd + JAM web UI, Tor, the Neutrino light client, and the orderbook
-watcher) in a single sandboxed desktop application. It is the easiest way to
-run JoinMarket NG with the JAM web UI on mainnet.
+watcher) in a single sandboxed desktop application. It is intended for testing
+the integration. For normal JoinMarket NG use, start with the [CLI](getting-started.md).
+For a browser interface, use the upstream [JAM project](https://github.com/joinmarket-webui/jam).
 
 ## Build and install
 
-Install the latest .flatpak from the releases page, or build and install from source with:
+Download the `.flatpak` bundle from the
+[release page](https://github.com/joinmarket-ng/joinmarket-ng/releases), then install
+that local file (replace the placeholder with its path):
+
+```bash
+flatpak install --user /path/to/release.flatpak
+```
+
+Or, from a source checkout with `flatpak-builder` installed:
 
 ```bash
 flatpak-builder --user --install --force-clean build-dir flatpak/org.joinmarketng.JamNG.yml
@@ -23,6 +32,12 @@ flatpak run org.joinmarketng.JamNG --no-gui   # headless (opens the browser inst
 On launch the app starts Tor, the Neutrino light client, jmwalletd, and the
 orderbook watcher, then opens the JAM web UI. All ports are allocated
 dynamically so the Flatpak never conflicts with other local services.
+
+In JAM, create a new wallet or restore one from recovery words. Record the
+recovery words and any BIP39 passphrase offline before depositing. Wait for the
+backend to sync and check the selected network. See
+[wallet concepts](technical/concepts.md) and [backup requirements](recover-wallet.md)
+before using funds; the CLI import procedure is for native wallets, not JAM files.
 
 ## Running CLI commands
 

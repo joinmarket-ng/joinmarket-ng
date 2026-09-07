@@ -5,7 +5,7 @@ This script mirrors `.github/workflows/properdocs-pages.yml`:
 
 1. Install docs dependencies from `requirements-docs.txt`
 2. Install editable project packages needed for API docs generation
-3. Run `properdocs build -q -f properdocs.yml`
+3. Run `properdocs build --strict -f properdocs.yml`
 
 It runs all commands via the current Python interpreter so the behavior is
 consistent inside a virtualenv and in CI-like local environments.
@@ -26,6 +26,8 @@ EDITABLE_PACKAGES = [
     "maker",
     "directory_server",
     "orderbook_watcher",
+    "jmwalletd",
+    "tumbler",
 ]
 
 
@@ -53,7 +55,7 @@ def main() -> None:
     _run(editable_install_cmd)
 
     print("Building documentation with ProperDocs...")
-    _run([python, "-m", "properdocs", "build", "-q", "-f", "properdocs.yml"])
+    _run([python, "-m", "properdocs", "build", "--strict", "-f", "properdocs.yml"])
 
     print("=" * 60)
     print("Build complete: site/")

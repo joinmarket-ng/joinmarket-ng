@@ -6,7 +6,7 @@ Utility scripts for JoinMarket NG development and operations.
 
 ### Development & Operations
 
-- **build_docs.py** - Reproduce `.github/workflows/properdocs-pages.yml` locally (install docs deps + editable packages, then run `properdocs build -q -f properdocs.yml`)
+- **build_docs.py** - Reproduce `.github/workflows/properdocs-pages.yml` locally (install docs deps + editable packages, then run `properdocs build --strict -f properdocs.yml`)
 - **bump_version.py** - Bump the project version across all components
 - **coinjoin_notifier.py** - Monitor and notify about CoinJoin events
 - **fidelity_bond_tool.py** - Fetch, parse, and analyze fidelity bond proofs from mainnet makers
@@ -20,7 +20,7 @@ Utility scripts for JoinMarket NG development and operations.
 - **regtest-miner.sh** - Run Bitcoin Core regtest miner
 - **run_parallel_tests.sh** - Execute all test suites (including Docker-based e2e tests) in parallel using Docker Compose project isolation
 - **sign-release.sh** - Sign a release manifest (supports local-first and CI-first workflows)
-- **update_readme_help.py** - Update module READMEs and `docs/README-*.md` pages with CLI command help sections (run manually when CLI changes)
+- **update_readme_help.py** - Update generated CLI help in component READMEs (run manually when CLI changes; user guides link to this reference)
 - **update-base-images.sh** - Update Docker base image digests
 - **update-deps.sh** - Update project dependencies, including the maintained `python-bitcointx` release pin
 - **update-flatpak-deps.py** - Update Flatpak sources and pinned JAM Docker dependencies

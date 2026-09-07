@@ -1,80 +1,66 @@
-# Best Practices
+# Protect Your Funds And Privacy
 
-This page collects the practical guidance users and makers should follow on
-top of the default configuration. Each section links to the canonical
-technical pages for more depth.
+CoinJoin is one part of a spending path. What you reveal before and after it
+can matter as much as the transaction itself.
 
 ## Backups
 
-- **Back up every key that controls funds.** The JoinMarket mnemonic recovers
-  wallet-derived outputs and bonds. An external-key bond additionally requires
-  the external signer seed or key, any BIP39 passphrase, and its derivation path.
-- **Record fidelity bond metadata.** For each active bond, store the
-  derivation path and locktime in your backup. A wallet-derived bond can be
-  spent from the JoinMarket mnemonic alone, but the metadata makes recovery
-  faster. An external-key bond also requires its external seed or key, any
-  passphrase, and the exact key origin. See
-  [Fidelity Bond Operations](../fidelity-bond-operations.md) and [Wallet](wallet.md)
-  for recovery details.
-- **Back up before any major change.** Re-confirm the mnemonic and bond
-  metadata before upgrades, re-imports, or hardware migrations.
+Keep recovery words offline and retain the exact BIP39 passphrase if you use
+one. Preserve wallet files and private metadata before an upgrade or migration;
+the seed does not restore labels, frozen state, or address reservations.
+External-key fidelity bonds need the external signer's recovery material too.
+Follow [backups and recovery](../recover-wallet.md).
 
 ## Mixdepth Hygiene
 
-- **Treat mixdepths as privacy boundaries.** Do not mix funds across
-  mixdepths. Built-in flows
-  (taker, tumbler, maker change) respect this boundary; manual spends from
-  the wallet CLI do not.
-- **Prefer `INTERNAL` destinations across mixdepths** when building privacy
-  in steps. External destinations (deposits to exchanges, payments) should
-  be sourced from the highest-mixdepth coins you have, not coins you just
-  received.
-- **Run multiple smaller rounds over time** instead of one large round. This
-  is harder to subset-sum analyze, and avoids large change outputs
-  that stand out on chain.
+Keep funds with unrelated histories separate. Use a fresh receiving address
+for each deposit, and do not combine CoinJoin outputs with their linkable change
+in a later payment. Mixdepths help preserve this separation, but their numbers
+are not a privacy score.
+
+A sweep avoids creating taker change but links all inputs it spends.
+Consolidating for lower future fees has a privacy cost. Consider who already
+knows those inputs belong to you before accepting that link.
+
+## Payments After CoinJoin
+
+Check the destination and source coins before every payment. A recipient knows
+what you paid them; an exchange may already know your identity. Distinctive
+amounts, close timing, and recombining several payouts can reveal links.
+Neither a round count nor a larger number of equal outputs guarantees anonymity.
+
+For a longer strategy, the [tumbler](../README-tumbler.md) uses several
+destinations and waits. Do not immediately recombine its payouts or treat its
+completion as a privacy certificate.
 
 ## Fidelity Bonds
 
-- **Anonymize bond UTXOs before locking them.** A bond reveals its UTXO
-  publicly on directories, so any history attached to that UTXO becomes
-  attached to your maker identity. Coin-control the funds, run them through
-  a few CoinJoin rounds, and only then lock them into a bond. See
-  [Privacy](privacy.md) for the full rationale.
-- **Use a dedicated mnemonic for fidelity bonds.**
-  The bond mnemonic only holds bond funds, which are locked and not
-  required for the maker operation, since they can sign a delegated certificate.
-  It is safer but requires a separate backup; see
-  [Fidelity Bond Operations](../fidelity-bond-operations.md#backups-and-compromise).
-- **Prefer hardware-wallet-signed bonds when possible.** Blockstream Jade
-  and Specter DIY can sign bond redemptions. Original Digital BitBox / BitBox01
-  support is expected from its raw-digest signing design but is untested and
-  the device is EOL. Ledger works only with the legacy Bitcoin app (2.0.x and
-  earlier -- the current app has been reported to reject bond PSBTs). Trezor,
-  Coldcard, BitBox02, and KeepKey currently cannot. Always test the full
-  create-and-spend flow before funding a bond;
-  you can check any device model risk-free with the public test mnemonic
-  described in [Fidelity Bond Operations](../fidelity-bond-operations.md#testing-device-compatibility-with-the-public-test-mnemonic).
+A bond is publicly associated with its maker. Consider the funding history
+before locking funds, and understand when and how you can redeem them.
+CoinJoin does not guarantee that a bond's origin is hidden.
+
+A separate signer can keep the bond key away from the online maker, but adds
+backup and compatibility responsibilities. Test the complete signing and
+redemption workflow without valuable funds first. Use the maintained
+[bond operations guide](../fidelity-bond-operations.md), not a generic hardware
+wallet compatibility assumption.
 
 ## Taker Operation
 
-- **Use multiple directories.** Configure several directory nodes so the
-  loss or compromise of one does not silently degrade your offer view. See
-  [Configuration](configuration.md).
-- **Verify maker offers stay within your fee budget** before sending. The
-  taker enforces caps you configure; pick conservative defaults.
+Review both maker and mining fees. Use Tor and multiple directories. Repeated
+attempts are not free of privacy cost: authentication reveals a proof coin to
+participating makers. Stop to understand repeated failures rather than
+lowering safeguards until a transaction succeeds.
 
 ## Maker Operation
 
-- **Use the Bitcoin Core `descriptor_wallet` backend.** It is the most
-  compatible and best-tested backend (see [Wallet](wallet.md)).
-- **Run with Tor control enabled** so the maker can create ephemeral onion
-  services and accept direct connections.
-- **Monitor balance and logs.** Use the watchdog / monitoring of your
-  choice to catch silent loss of funds or repeated failed signs early.
+Treat the online host as a hot wallet. Keep only funds you are prepared to
+expose to that risk, protect its credentials, and monitor offers and completed
+transactions. Earnings and uptime do not establish that an installation is safe.
 
-## Operators and Contributors
+## Getting Help
 
-- Keep docs focused on defaults and working paths; avoid duplicate deep
-  dives.
-- Prefer linking to one canonical page per topic.
-- Validate docs by running commands in a clean environment.
+Do not publish addresses, transaction history, config files, or screenshots
+without reviewing their contents. Use the [diagnostic reporting procedure](../troubleshooting.md#report-a-problem)
+and never share recovery secrets. For the limits of these precautions, see the
+[threat model](threat-model.md).

@@ -1,390 +1,95 @@
-# JoinMarket Taker Client
+# Run A CoinJoin
 
-Mix your bitcoin for privacy via CoinJoin. Takers initiate transactions and pay small fees to makers.
+A taker selects makers, coordinates one CoinJoin, and pays their fees plus the
+Bitcoin mining fee. A successful transaction does not guarantee anonymity.
 
-## Installation
+## Before You Start
 
-Install JoinMarket-NG with the taker component:
+Complete [wallet setup](getting-started.md), wait for eligible confirmed funds,
+and keep your Bitcoin backend and Tor running. Stop other processes spending
+from this wallet. Check `jm-wallet info` before choosing an amount.
 
-```bash
-curl -sSL https://raw.githubusercontent.com/joinmarket-ng/joinmarket-ng/main/install.sh | bash -s -- --taker
-```
-
-See [Installation](install.md) for backend setup, Tor configuration, and manual install.
+The amount is in **satoshis**, not BTC. Leave room for fees. The default
+authentication proof needs an eligible UTXO with at least five confirmations
+and a value of at least 20% of the CoinJoin amount.
 
 ## Quick Start
 
-### 1) Create a wallet
+Replace `AMOUNT_SATS` with the amount you intend to CoinJoin:
 
 ```bash
-jm-wallet generate --output ~/.joinmarket-ng/wallets/default.mnemonic
+jm-taker coinjoin --amount AMOUNT_SATS --destination INTERNAL
 ```
 
-Store the mnemonic offline. See [Wallet guide](README-jmwallet.md).
+Review the maker and fee preview, then the final transaction fee confirmation.
+Do not use `--yes` for your first run. If the preview expires, start again to
+obtain current offers.
 
-### 2) Fund and inspect
-
-```bash
-jm-wallet info --mnemonic-file ~/.joinmarket-ng/wallets/default.mnemonic --backend neutrino
-```
-
-### 3) Run a CoinJoin
-
-```bash
-jm-taker coinjoin \
-  --mnemonic-file ~/.joinmarket-ng/wallets/default.mnemonic \
-  --amount 1000000
-```
-
-Default destination is `INTERNAL` (next mixdepth), which is the standard privacy-preserving path.
+`INTERNAL` sends the equal output to the next mixdepth in your wallet. Change
+stays in the source mixdepth. After broadcast, wait for confirmation and check
+`jm-wallet info` and `jm-wallet history`. If the process stops unexpectedly,
+[check for a broadcast transaction before retrying](troubleshooting.md#coinjoin-failed-or-stopped).
 
 ## Common Use Cases
 
+To choose the source compartment, add `--mixdepth N`. To pay another wallet,
+replace `INTERNAL` with a fresh destination address that you have checked on
+the correct network. External payments reveal information to the recipient.
+
+A sweep CoinJoins the selected mixdepth's eligible funds, less fees, without
+creating taker change:
+
 ```bash
-# Mix to next mixdepth (INTERNAL)
-jm-taker coinjoin --mnemonic-file ~/.joinmarket-ng/wallets/default.mnemonic --amount 500000
-
-# Mix and send to external destination
-jm-taker coinjoin --mnemonic-file ~/.joinmarket-ng/wallets/default.mnemonic \
-  --amount 500000 --destination bc1qexampleaddress...
-
-# Sweep one mixdepth
-jm-taker coinjoin --mnemonic-file ~/.joinmarket-ng/wallets/default.mnemonic \
-  --amount 0 --mixdepth 2
-
-# Pick the inputs by hand (interactive TUI)
-jm-taker coinjoin --mnemonic-file ~/.joinmarket-ng/wallets/default.mnemonic \
-  --select-utxos
-
-# Spend an exact input set (repeat --input-utxo as needed)
-jm-taker coinjoin --mnemonic-file ~/.joinmarket-ng/wallets/default.mnemonic \
-  --amount 500000 --mixdepth 2 \
-  --input-utxo TXID:0 --input-utxo OTHER_TXID:1
+jm-taker coinjoin --amount 0 --mixdepth 2 --destination INTERNAL
 ```
 
-Increase counterparties (for larger anonymity sets) with `--counterparties`.
-
-With `--select-utxos` the selector shows every UTXO in the wallet grouped by
-mixdepth. A CoinJoin spends from a single mixdepth, so the first UTXO you
-toggle pins the source mixdepth (deselect everything to unpin); pass
-`--mixdepth` to pin it up front. The `INTERNAL` destination then targets the
-mixdepth after the derived one. When `--amount` is omitted, all selected inputs
-are swept into the CoinJoin.
-
-With `--input-utxo`, every listed outpoint must be an eligible input in the
-requested mixdepth (mixdepth 0 by default). Fixed-amount CoinJoins and sweeps
-spend exactly the listed inputs. If maker or mining fees make that set
-insufficient, the round fails instead of adding another wallet UTXO.
-
-## Tumbler
-
-For multi-step automated mixing, create and run a persisted plan with
-`jm-tumbler plan` and `jm-tumbler run`.
-
-- Plan format and operational guidance are in [JoinMarket Tumbler](README-tumbler.md).
-- Privacy model and protocol-level behavior are in [Technical Privacy Notes](technical/privacy.md).
+A sweep links the inputs it spends. It is not automatically the best privacy
+choice. For manual input selection, use `--select-utxos` with an explicit
+`--amount`; omitting the amount sweeps the selection. Selection is limited to
+one mixdepth. `--input-utxo TXID:VOUT` selects exact inputs without an interactive
+menu; repeat it for each input and specify the source mixdepth.
 
 ## Configuration Notes
 
-Configuration merges as: `config.toml` < environment variables < CLI flags.
+Set fee limits in `[taker]` in your configuration. Consult the installed
+`config.toml.template` for exact settings and defaults, and
+`jm-taker coinjoin --help` for per-run overrides. The
+[configuration reference](technical/configuration.md) explains precedence.
 
-Backend setup and defaults: [Installation](install.md#configure-backend).
+Maker fees and mining fees are separate costs. More participants and inputs
+usually make a larger transaction. Additional equal outputs do not represent
+a guaranteed anonymity set. If there are too few suitable offers, wait or
+review your amount and budget rather than immediately weakening limits.
 
-`taker.tx_fee_factor` controls additive fee randomization, not a direct multiplier. A value
-of `0.2` picks a session fee rate between the base rate and `base_rate * 1.2`; `0` disables
-randomization.
+The default offer filter selects fees on a shared public grid. See the
+[fee quantization discussion and paper](https://github.com/joinmarket-ng/joinmarket-ng/issues/508)
+for background; the installed settings reference describes current behavior.
+Fee rounding and equalization are optional policies that may be incompatible
+with older makers. Keep the defaults unless you understand the compatibility
+and cost implications. `tx_fee_factor` adds fee-rate randomization: `0.2`
+allows a rate between the base rate and 1.2 times that rate, not 0.2 times it.
 
-By default, `taker.require_quantized_cj_fees = true` selects only offers already on the public
-fee grid, while `taker.round_up_cj_fees = false` pays each maker's advertised fee. This avoids
-fee-bump incompatibility with pre-v0.9.12 makers that require exact output values. Enabling
-rounding requires makers that accept outputs paying at least their advertised fee, as supported
-by joinmarket-clientserver v0.9.12 and newer implementations.
+## Ignored Makers
 
-The opt-in `taker.equalize_cj_fees = true` policy pays every selected maker the highest realized
-satoshi fee among the selected offers. For example, makers advertising 0.01%, 0.02%, 0.05%, and
-0.1% are all paid the realized 0.1% fee. Each selected offer must first pass its normal configured
-fee limit. Equalization makes maker payments indistinguishable by amount, but a legacy maker may
-refuse the increased payment and cause that CoinJoin attempt to fail. The taker logs the uniform
-target and how many maker payments were increased.
+Previously problematic makers are avoided when enough alternatives exist, but
+the persisted ignored list is a preference, not a permanent ban. Inspect the
+reported failure before using `jm-taker clear-ignored-makers` to reset it.
 
-`taker.counterparty_count` is the per-round target. During fill and authentication, the taker
-uses up to `taker.max_maker_replacement_attempts` (default `3`) to restore that target after a
-maker fails. `taker.minimum_makers` is only the final floor after those attempts are exhausted
-or no candidates remain; a round below that floor fails.
+## Tumbler
 
-The initial maker and fee preview expires after
-`taker.initial_confirmation_timeout_sec` seconds (default `300`). An expired preview is
-cancelled before the taker creates a PoDLE commitment or contacts makers; start a fresh run to
-fetch current offers. Set the value to `0` only when an unbounded confirmation wait is required.
-
-For all option details, use the auto-generated `jm-taker coinjoin --help` below. Tumbler
-commands are documented in [JoinMarket Tumbler](README-tumbler.md).
-
-## Ignored makers
-
-The taker keeps a persisted list of makers that previously misbehaved (rejected
-PoDLE commitments, returned an invalid signature, etc.) at
-`<data-dir>/ignored_makers.txt`. This list is treated as a **soft preference**:
-the maker selector tries to avoid these nicks, but if the resulting eligible
-pool is too small to fill the requested counterparty count the selector tops
-the pick up from the ignored list rather than failing the whole CoinJoin. Use
-`jm-taker clear-ignored-makers` to reset the list.
-
-In contrast, makers that explicitly reject the *current* CoinJoin attempt
-(e.g. a fresh blacklist response in this fill phase) are hard-excluded from
-that attempt only — they will be retried in future runs unless they also end
-up on the persisted ignored list.
+For a sequence of CoinJoins with several destinations, use the
+[tumbler guide](README-tumbler.md). Repeating one command is not a substitute
+for considering the entire spending path.
 
 ## Docker Deployment
 
-This component ships with `docker-compose.yml` for containerized operation.
-
-Typical flow:
-
-```bash
-docker-compose up -d bitcoind tor
-docker-compose run --rm taker jm-taker coinjoin --amount 1000000
-docker-compose logs -f taker
-```
-
-Takers only require Tor SOCKS; no Tor control port is needed.
+Container operators should use the
+[taker Compose configuration](https://github.com/joinmarket-ng/joinmarket-ng/blob/main/taker/docker-compose.yml)
+and its environment settings. Do not assume a native installation's paths or
+credentials apply inside a container.
 
 ## Command Reference
 
-<!-- AUTO-GENERATED HELP START: jm-taker -->
-
-<details>
-<summary><code>jm-taker --help</code></summary>
-
-```
-
- Usage: jm-taker [OPTIONS] COMMAND [ARGS]...
-
- JoinMarket Taker - Execute CoinJoin transactions
-
-╭─ Options ────────────────────────────────────────────────────────────────────╮
-│ --help                        Show this message and exit.                    │
-│ --install-completion          Install completion for the current shell.      │
-│ --show-completion             Show completion for the current shell, to copy │
-│                               it or customize the installation.              │
-╰──────────────────────────────────────────────────────────────────────────────╯
-╭─ Commands ───────────────────────────────────────────────────────────────────╮
-│ clear-ignored-makers  Clear the list of ignored makers.                      │
-│ coinjoin              Execute a single CoinJoin transaction.                 │
-│ config-init           Initialize the config file with default settings.      │
-╰──────────────────────────────────────────────────────────────────────────────╯
-```
-
-</details>
-
-<details>
-<summary><code>jm-taker clear-ignored-makers --help</code></summary>
-
-```
-
- Usage: jm-taker clear-ignored-makers [OPTIONS]
-
- Clear the list of ignored makers.
-
-╭─ Options ────────────────────────────────────────────────────────────────────╮
-│ --config-file          PATH  Config file path (decoupled from data dir).     │
-│                              Defaults to <data-dir>/config.toml              │
-│                              [env var: JOINMARKET_CONFIG_FILE]               │
-│ --data-dir     -d      PATH  Data directory for JoinMarket files             │
-│                              [env var: JOINMARKET_DATA_DIR]                  │
-│ --help                       Show this message and exit.                     │
-╰──────────────────────────────────────────────────────────────────────────────╯
-```
-
-</details>
-
-<details>
-<summary><code>jm-taker coinjoin --help</code></summary>
-
-```
-
- Usage: jm-taker coinjoin [OPTIONS]
-
- Execute a single CoinJoin transaction.
-
- Configuration is loaded from ~/.joinmarket-ng/config.toml (or
- $JOINMARKET_DATA_DIR/config.toml),
- environment variables, and CLI arguments. CLI arguments have the highest
- priority.
-
-╭─ Options ────────────────────────────────────────────────────────────────────╮
-│ --amount           -a                     INTEGER           Amount in sats   │
-│                                                             (0 for sweep;    │
-│                                                             with             │
-│                                                             --select-utxos,  │
-│                                                             defaults to      │
-│                                                             sweep)           │
-│ --backend          -b                     TEXT              Backend type:    │
-│                                                             descriptor_wall… │
-│                                                             | neutrino       │
-│ --bitcoin-network                         [mainnet|testnet  Bitcoin network  │
-│                                           |signet|regtest]  for addresses    │
-│                                                             (defaults to     │
-│                                                             --network)       │
-│ --block-target                            INTEGER           Target blocks    │
-│                                                             for fee          │
-│                                                             estimation       │
-│                                                             (1-1008). Cannot │
-│                                                             be used with     │
-│                                                             neutrino.        │
-│ --bond-exponent                           FLOAT             Exponent for     │
-│                                                             fidelity bond    │
-│                                                             value            │
-│                                                             calculation      │
-│                                                             [env var:        │
-│                                                             BOND_VALUE_EXPO… │
-│ --bondless-allow…                         FLOAT             Fraction of      │
-│                                                             allowance slots  │
-│                                                             chosen uniformly │
-│                                                             from zero-fee    │
-│                                                             offers (0.0-1.0) │
-│                                                             [env var:        │
-│                                                             BONDLESS_MAKERS… │
-│ --bondless-zero-…      --no-bondless-…                      Restrict         │
-│                                                             allowance spots  │
-│                                                             to zero-fee      │
-│                                                             offers           │
-│                                                             [env var:        │
-│                                                             BONDLESS_REQUIR… │
-│ --config-file                             PATH              Config file path │
-│                                                             (decoupled from  │
-│                                                             data dir).       │
-│                                                             Defaults to      │
-│                                                             <data-dir>/conf… │
-│                                                             [env var:        │
-│                                                             JOINMARKET_CONF… │
-│ --counterparties   -n                     INTEGER           Number of makers │
-│ --data-dir                                PATH              Data directory   │
-│                                                             (default:        │
-│                                                             ~/.joinmarket-ng │
-│                                                             or               │
-│                                                             $JOINMARKET_DAT… │
-│                                                             [env var:        │
-│                                                             JOINMARKET_DATA… │
-│ --destination      -d                     TEXT              Destination      │
-│                                                             address (or      │
-│                                                             'INTERNAL' for   │
-│                                                             next mixdepth)   │
-│                                                             [default:        │
-│                                                             INTERNAL]        │
-│ --directory        -D                     TEXT              Directory        │
-│                                                             servers          │
-│                                                             (comma-separate… │
-│                                                             [env var:        │
-│                                                             DIRECTORY_SERVE… │
-│ --equalize-cj-fe…      --no-equalize-…                      Pay all selected │
-│                                                             makers the       │
-│                                                             highest realized │
-│                                                             fee in the       │
-│                                                             selected set     │
-│ --fee-rate                                FLOAT             Manual fee rate  │
-│                                                             in sat/vB.       │
-│                                                             Mutually         │
-│                                                             exclusive with   │
-│                                                             --block-target.  │
-│ --help                                                      Show this        │
-│                                                             message and      │
-│                                                             exit.            │
-│ --input-utxo                              TEXT              Explicit input   │
-│                                                             UTXO as          │
-│                                                             txid:vout        │
-│                                                             (repeatable).    │
-│                                                             CoinJoin spends  │
-│                                                             exactly the      │
-│                                                             given UTXOs,     │
-│                                                             including for    │
-│                                                             sweeps, and      │
-│                                                             never adds other │
-│                                                             inputs. Every    │
-│                                                             UTXO must be     │
-│                                                             eligible and     │
-│                                                             belong to        │
-│                                                             --mixdepth.      │
-│                                                             Mutually         │
-│                                                             exclusive with   │
-│                                                             --select-utxos.  │
-│ --log-level        -l                     TEXT              Log level        │
-│ --max-abs-fee                             INTEGER           Max absolute fee │
-│                                                             in sats          │
-│ --max-rel-fee                             TEXT              Max relative fee │
-│                                                             (0.001=0.1%)     │
-│ --mixdepth         -m                     INTEGER           Source mixdepth  │
-│                                                             (default 0; with │
-│                                                             --select-utxos,  │
-│                                                             derived from the │
-│                                                             selection unless │
-│                                                             set explicitly;  │
-│                                                             --input-utxo     │
-│                                                             entries must     │
-│                                                             belong to this   │
-│                                                             mixdepth)        │
-│ --mnemonic-file    -f                     PATH              Path to mnemonic │
-│                                                             file             │
-│ --network                                 [mainnet|testnet  Protocol network │
-│                                           |signet|regtest]  for handshakes   │
-│ --neutrino-url                            TEXT              Neutrino REST    │
-│                                                             API URL          │
-│                                                             [env var:        │
-│                                                             NEUTRINO_URL]    │
-│ --prompt-bip39-p…                                           Prompt for BIP39 │
-│                                                             passphrase       │
-│                                                             interactively    │
-│ --quantized-offe…      --allow-non-qu…                      Only select      │
-│                                                             offers whose     │
-│                                                             advertised       │
-│                                                             CoinJoin fee is  │
-│                                                             on the public    │
-│                                                             grid             │
-│ --round-up-cj-fe…      --no-round-up-…                      Round selected   │
-│                                                             maker fees up to │
-│                                                             public fee       │
-│                                                             quanta           │
-│ --rpc-url                                 TEXT              Bitcoin full     │
-│                                                             node RPC URL     │
-│                                                             [env var:        │
-│                                                             BITCOIN_RPC_URL] │
-│ --select-utxos     -s                                       Interactively    │
-│                                                             select UTXOs     │
-│                                                             (fzf-like TUI)   │
-│ --tor-socks-host                          TEXT              Tor SOCKS proxy  │
-│                                                             host (overrides  │
-│                                                             TOR__SOCKS_HOST) │
-│ --tor-socks-port                          INTEGER           Tor SOCKS proxy  │
-│                                                             port (overrides  │
-│                                                             TOR__SOCKS_PORT) │
-│ --yes              -y                                       Skip             │
-│                                                             confirmation     │
-│                                                             prompt           │
-╰──────────────────────────────────────────────────────────────────────────────╯
-```
-
-</details>
-
-<details>
-<summary><code>jm-taker config-init --help</code></summary>
-
-```
-
- Usage: jm-taker config-init [OPTIONS]
-
- Initialize the config file with default settings.
-
-╭─ Options ────────────────────────────────────────────────────────────────────╮
-│ --config-file          PATH  Config file path (decoupled from data dir).     │
-│                              Defaults to <data-dir>/config.toml              │
-│                              [env var: JOINMARKET_CONFIG_FILE]               │
-│ --data-dir     -d      PATH  Data directory for JoinMarket files             │
-│                              [env var: JOINMARKET_DATA_DIR]                  │
-│ --help                       Show this message and exit.                     │
-╰──────────────────────────────────────────────────────────────────────────────╯
-```
-
-</details>
-
-
-<!-- AUTO-GENERATED HELP END: jm-taker -->
+Use `jm-taker --help` or `jm-taker coinjoin --help` for the installed version.
+The [component reference](https://github.com/joinmarket-ng/joinmarket-ng/blob/main/taker/README.md)
+contains generated command help for the source checkout.

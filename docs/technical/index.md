@@ -11,8 +11,12 @@ This section covers protocol behavior, architecture, privacy model, configuratio
 | [Protocol](protocol.md) | Protocol specification and flow |
 | [Privacy Mechanisms](privacy.md) | Privacy features and techniques |
 | [Wallet](wallet.md) | Wallet architecture and management |
+| [Wallet Scanning](wallet-scanning.md) | Coverage, sync, and explicit recovery scans |
 | [Configuration](configuration.md) | Configuration options and settings |
 | [Security](security.md) | Security considerations and best practices |
+| [Maker Verification](maker-verification-checklist.md) | Checks required before signing |
+| [Threat Model](threat-model.md) | Adversaries, assumptions, and limits |
+| [Neutrino TLS](neutrino-tls.md) | Backend authentication and credential handling |
 | [Development](development.md) | Development guidelines and setup |
 | [Best Practices](best-practices.md) | Recommended practices and patterns |
 | [References](references.md) | External references and resources |

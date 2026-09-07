@@ -71,7 +71,7 @@ class HideDataclassInit(griffe.Extension):
 
 ### Configuration
 
-The extension is registered in `properdocs.yml`:
+The extension is registered in `mkdocs.yml`, inherited by `properdocs.yml`:
 
 ```yaml
 plugins:
@@ -157,7 +157,7 @@ If this extension causes issues or becomes unnecessary, it can be removed in thr
 
 ### Option 1: Disable in Configuration (Quick)
 
-Comment out or remove the extension in `properdocs.yml`:
+Comment out or remove the extension in `mkdocs.yml`:
 
 ```yaml
 plugins:
@@ -177,7 +177,7 @@ plugins:
 rm docs/_extensions/hide_dataclass_init.py
 ```
 
-And remove the extension registration from `properdocs.yml`.
+And remove the extension registration from `mkdocs.yml`.
 
 ### Option 3: Revert the Commit
 

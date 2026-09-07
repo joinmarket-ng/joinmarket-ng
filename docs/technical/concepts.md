@@ -1,40 +1,70 @@
-# Concepts
+# CoinJoin And Wallet Concepts
 
-## What is CoinJoin
+## What Is CoinJoin
 
-CoinJoin transactions combine multiple users' funds into a single transaction, making it difficult to trace coins. This enhances financial privacy.
+Bitcoin transactions are public. CoinJoin combines inputs from several owners
+into one transaction. In JoinMarket, each participant receives an output of
+the same amount, making several ownership mappings plausible to an observer.
+The transaction, amounts, and subsequent spends remain visible.
 
-The transaction includes several equal amount outputs from inputs belonging to different users. An outside observer cannot determine which input corresponds to which equal amount output, effectively obfuscating the transaction history.
+An **input** spends an existing **UTXO** (unspent transaction output). An
+**output** creates a new UTXO. Wallet balances are totals of these individual
+coins, not a single account balance held by a service.
 
-Change outputs are also included, but they are of different amounts and can be easily identified as change and sometimes matched to inputs using heuristics. However, the equal amount outputs remain ambiguous.
+## Makers And Takers
 
-One round of CoinJoin increases privacy, but generally multiple rounds are needed to achieve strong anonymity.
+A **taker** arranges a CoinJoin, chooses offers, and pays maker and mining fees.
+A **maker** advertises liquidity and signs a valid proposed transaction when
+selected, earning its offered fee. Neither role guarantees privacy or profit.
 
-## Makers and Takers
+A **tumbler** automates a sequence of CoinJoins and waits, optionally taking
+both roles. It does not change the underlying custody or privacy limits.
 
-JoinMarket connects users who want to mix their coins (takers) with those willing to provide liquidity for a fee (makers):
+## Equal Outputs And Change
 
-- **Makers**: Liquidity providers who offer their UTXOs for CoinJoin and earn fees. They run bots that automatically participate when selected.
-- **Takers**: Users who initiate CoinJoins by selecting makers and coordinating the transaction. They pay fees for the privacy service.
+The equal-value outputs provide the main ownership ambiguity. Any remaining
+input value returns as **change**, after accounting for fees. Its distinct
+amount can make it easier to link to a participant. Treat change differently
+from a CoinJoin's equal output when deciding what to spend next.
 
-## Why JoinMarket is Different
+## Mixdepths
 
-Unlike other CoinJoin implementations (Wasabi, Whirlpool), JoinMarket has **no central coordinator**:
+A mixdepth is a separate account within the same wallet. An `INTERNAL` CoinJoin
+moves the equal output to the next mixdepth while change stays behind; the last
+mixdepth wraps to the first. This separates coins with different histories.
 
-- **Taker acts as coordinator**: Chooses peers, gains maximum privacy (doesn't share inputs/outputs with a centralized party)
-- **Most censorship-resistant**: Directory servers are easily replaceable and don't route communications, only host the orderbook
-- **Multiple fallbacks**: Works with Tor hidden services, can easily move to alternatives like Nostr relays
-- **Peer-to-peer**: Direct encrypted communication between participants
+Mixdepth numbers are not a count of CoinJoins or a privacy rating. Later
+consolidation, address reuse, or matching amounts can undo useful separation.
 
-## Key Design Principles
+## Why JoinMarket Is Different
 
-1. **Trustless**: No central coordinator; the taker constructs the transaction
-2. **Privacy-preserving**: End-to-end encryption for sensitive data
-3. **Sybil-resistant**: PoDLE commitments prevent costless DOS attacks
-4. **Decentralized**: Multiple redundant directory servers for message routing
+There is no global coordinator choosing every round or holding participants'
+keys. Directory servers help peers discover and reach one another; each taker
+coordinates its own transaction. Tor protects network connections, while
+CoinJoin addresses links on the public ledger. Neither replaces the other.
 
-## Why Financial Privacy Matters
+## Fidelity Bonds
 
-Just as you wouldn't want your employer to see your bank balance when paying you, or a friend to know your net worth when splitting a bill, Bitcoin users deserve financial privacy. JoinMarket helps individuals exercise their right to financial freedom without promoting illegal activities.
+A fidelity bond locks bitcoin until a chosen date. A maker proves control of it
+to make operating many apparently independent makers more costly. Takers can
+favor bonded makers, but a bond does not prove honesty or guarantee selection.
+The bond is public and can link its funding history to the maker.
 
----
+## Recovery Words And Passwords
+
+The **mnemonic** is the set of recovery words from which a wallet derives its
+keys. An optional **BIP39 passphrase** changes those keys, so it must be backed
+up too. The **wallet-file password** only encrypts the local file. These are
+different secrets with different purposes; see [backups and recovery](../recover-wallet.md).
+
+## Privacy Limits
+
+An observer may combine public transactions with exchange records, timing,
+network observations, or knowledge gained as a participant. A CoinJoin adds
+ambiguity; it does not erase those observations. There is no universal number
+of rounds or participants that makes coins untraceable.
+
+Read [privacy practices](best-practices.md) before spending, or the
+[threat model](threat-model.md) for the adversaries and assumptions in detail.
+For a deeper analysis of transaction graphs and privacy claims, read
+[Collaborative Transaction Privacy](https://gist.github.com/nothingmuch/d84ba390d89b5b08897af2d95009c2a1).

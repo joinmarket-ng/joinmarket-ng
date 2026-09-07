@@ -1,72 +1,43 @@
-<p align="center">
-  <img src="media/logo.svg" alt="JoinMarket NG Logo" width="200"/>
-</p>
-
 # JoinMarket NG
 
-JoinMarket NG is a modern implementation of the JoinMarket CoinJoin protocol.
-
-It is wire-compatible with the reference JoinMarket network and can run as:
-
-- **Taker** (`jm-taker`) to initiate CoinJoin transactions
-- **Maker** (`jm-maker`) to provide liquidity and earn fees
+JoinMarket NG is a self-custodial Bitcoin wallet for CoinJoin. It connects to the
+JoinMarket market, where **takers** pay to arrange CoinJoins and **makers** offer
+liquidity in exchange for fees. You keep control of your keys.
 
 ## Start Here
 
-1. [Installation](install.md)
-2. [Wallet guide](README-jmwallet.md)
-3. [Taker guide](README-taker.md) or [Maker guide](README-maker.md)
-4. [Frequently asked questions](faq.md)
+[Get started](getting-started.md) walks through choosing an interface, setting up
+a wallet, and preparing for your first CoinJoin. Already have a wallet?
+[Recover or migrate it](recover-wallet.md) before using it here.
 
-## Quick Start
+## What Do You Need To Do?
 
-Install (Linux/macOS):
+| Goal | Guide |
+| --- | --- |
+| Install or connect a Bitcoin node | [Install](install.md) and [set up Bitcoin and Tor](setup.md) |
+| Receive, check a balance, or send a payment | [Manage your wallet](README-jmwallet.md) |
+| Make a CoinJoin now | [Run a CoinJoin](README-taker.md) |
+| Automate several CoinJoins | [Run the tumbler](README-tumbler.md) |
+| Offer liquidity and earn fees | [Run a maker](README-maker.md) |
+| Back up or restore a wallet | [Back up and recover](recover-wallet.md) |
+| Fix an error or a missing balance | [Troubleshoot](troubleshooting.md) |
+| Upgrade an existing installation | [Update](update.md) |
 
-```bash
-curl -sSL https://raw.githubusercontent.com/joinmarket-ng/joinmarket-ng/main/install.sh | bash
-source ~/.joinmarket-ng/activate.sh
-```
+## Before You Use Funds
 
-Configure your backend in `~/.joinmarket-ng/config.toml`:
+CoinJoin creates ambiguity about ownership; it does not make transactions
+invisible or guarantee anonymity. Change, address reuse, and later spending can
+reveal links. Read [CoinJoin and wallet concepts](technical/concepts.md) and
+[privacy practices](technical/best-practices.md). Back up your recovery material
+before depositing funds.
 
-```toml
-[bitcoin]
-backend_type = "descriptor_wallet"  # or "neutrino"
-rpc_url = "http://127.0.0.1:8332"
-rpc_user = "your_rpc_user"
-rpc_password = "your_rpc_password"
-```
+Find short answers in [common questions](faq.md), exact options in
+[reference](reference.md), and development material under
+[contribute](technical/development.md).
 
-Create a wallet and inspect addresses:
+## Get Help
 
-```bash
-jm-wallet generate
-jm-wallet info
-```
-
-Run a CoinJoin (taker) or start making offers (maker):
-
-```bash
-jm-taker coinjoin --amount 1000000 --destination INTERNAL
-# or
-jm-maker start
-```
-
-## Key Docs
-
-- [Installation](install.md)
-- [Frequently asked questions](faq.md)
-- [Technical Documentation](technical/index.md)
-- [JM Core](README-jmcore.md)
-- [Wallet](README-jmwallet.md)
-- [Taker](README-taker.md)
-- [Maker](README-maker.md)
-- [Orderbook Watcher](README-orderbook-watcher.md)
-- [Directory Server](README-directory-server.md)
-- [Signatures](README-signatures.md)
-- [Scripts](README-scripts.md)
-
-## Community
-
-- [Telegram - JoinMarket Community](https://t.me/joinmarketorg)
-- [SimpleX - JoinMarket Community](https://smp12.simplex.im/g#bx_0bFdk7OnttE0jlytSd73jGjCcHy2qCrhmEzgWXTk)
+Ask general questions in the [JoinMarket Telegram community](https://t.me/joinmarketorg)
+or [SimpleX community](https://smp12.simplex.im/g#bx_0bFdk7OnttE0jlytSd73jGjCcHy2qCrhmEzgWXTk).
+For a reproducible problem, follow [reporting a problem](troubleshooting.md#report-a-problem).
+Never share a seed, passphrase, wallet file, or configuration containing credentials.

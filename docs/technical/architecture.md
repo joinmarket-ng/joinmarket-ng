@@ -18,6 +18,8 @@ The implementation separates concerns into distinct packages:
 | `directory_server` | Directory node: message routing, peer registry |
 | `maker` | Maker bot: offer management, CoinJoin participation |
 | `taker` | Taker bot: CoinJoin orchestration, maker selection |
+| `tumbler` | Scheduler: multi-step CoinJoins and maker sessions |
+| `jmwalletd` | Wallet daemon: JAM-compatible HTTP and WebSocket API |
 | `orderbook_watcher` | Monitoring: orderbook visualization |
 | `neutrino_server` (external) | Lightweight SPV server (BIP157/158) - [github.com/m0wer/neutrino-api](https://github.com/m0wer/neutrino-api) |
 
@@ -108,7 +110,7 @@ continues to use `.jmdat` naming for JAM compatibility until wallet-name aliases
 or capability support exists. No suffix alias or migration is currently
 implemented.
 
-## Wallet Persistence Design (issue #524)
+## Wallet Persistence Design ([issue #524](https://github.com/joinmarket-ng/joinmarket-ng/issues/524))
 
 Per-wallet state is split across several files keyed by the 8-char BIP32
 `m/0` fingerprint rather than packed into one encrypted container (the
@@ -139,10 +141,13 @@ so mixed-version concurrent access is unsupported; advisory locking alone
 cannot make an old process apply new lease rules.
 
 Active-wallet identity is resolved uniformly for all per-wallet read
-commands (see `wallet.md`): explicit fingerprint, then `--mnemonic-file`,
+commands (see [Wallet](wallet.md)): explicit fingerprint, then `--mnemonic-file`,
 then the configured/default wallet's cached `.meta` fingerprint, then
 single-wallet auto-detection. This single resolution path is what keeps
-each wallet's history and bonds isolated (issues #473, #492, #523).
+each wallet's history and bonds isolated
+([#473](https://github.com/joinmarket-ng/joinmarket-ng/issues/473),
+[#492](https://github.com/joinmarket-ng/joinmarket-ng/issues/492),
+[#523](https://github.com/joinmarket-ng/joinmarket-ng/issues/523)).
 
 Files that are intentionally **not** per-wallet: `cmtdata/*` (PoDLE
 commitments are UTXO-derived and the blacklist is network-shared),

@@ -1,627 +1,92 @@
-# JoinMarket Maker Bot
+# Run A Maker
 
-Earn fees by providing liquidity for CoinJoin transactions. Makers passively earn bitcoin while enhancing network privacy.
-
-> Coming from the reference [joinmarket-clientserver](https://github.com/JoinMarket-Org/joinmarket-clientserver) (now archived)?
-> Read [Migration from JoinMarket Reference](#migration-from-joinmarket-reference) first.
-
-## Installation
-
-Install JoinMarket-NG with the maker component:
-
-```bash
-curl -sSL https://raw.githubusercontent.com/joinmarket-ng/joinmarket-ng/main/install.sh | bash -s -- --maker
-```
-
-See [Installation](install.md) for backend setup, Tor configuration, and manual install.
+A maker keeps liquidity online and offers to participate in other users'
+CoinJoins for a fee. Selection and earnings are not guaranteed. The running
+process can sign transactions, so treat the host as a hot-wallet system.
 
 ## Prerequisites
 
-- Tor is required for production maker operation.
-- For Tor SOCKS/control defaults, see [Tor Notes](install.md#tor-notes).
-- **No minimum balance is required to run a maker.** The 100k sats
-  per mixdepth figure is a common orientation for new users, not a
-  protocol requirement; makers with smaller balances will simply match
-  fewer taker requests.
+Complete [wallet setup](getting-started.md), back up the recovery material,
+and keep the backend and [Tor SOCKS and control services](setup.md#tor) running.
+Do not run another spender against the same wallet.
+
+There is no universal minimum wallet balance. Eligible coins, your offer limits,
+and taker demand determine whether your wallet can participate.
 
 ## Quick Start
 
-### 1) Create or import a wallet
-
 ```bash
-jm-wallet generate
-# or import an existing mnemonic
-jm-wallet import
-```
-
-Both commands write to `~/.joinmarket-ng/wallets/default.mnemonic` by
-default; subsequent `jm-maker` and `jm-wallet` commands pick it up
-automatically (use `--mnemonic-file` only to override).
-
-Store the mnemonic offline. See [Wallet guide](README-jmwallet.md).
-
-### 2) Configure backend
-
-Set `~/.joinmarket-ng/config.toml` and choose one backend:
-
-- `descriptor_wallet` (recommended, own Bitcoin Core)
-- `neutrino` (lightweight alternative)
-
-Backend configuration examples are in [Installation](install.md#configure-backend).
-
-### 3) Start maker
-
-```bash
+jm-wallet info
 jm-maker start
 ```
 
-The bot syncs wallet state, builds offers, and waits for takers.
+The maker syncs, publishes offers for eligible funds, and waits for takers.
+Check that the logs show funded offers and directory connections, not just a
+running process. Use Ctrl-C to request a clean shutdown and let it finish.
 
-By default, mixdepth 0 deposits and deposit-derived change remain isolated from
-maker rotation funds. When the final mixdepth wraps an equal CoinJoin output
-back to md0, the maker can continue using that output and recursively proven
-CoinJoin-only change without disabling the md0 safeguard. Missing or ambiguous
-history fails closed; an older or recovered wallet may need a taker sweep from
-md0 to restore liquidity that cannot be proven automatically.
+By default, fresh deposits and deposit-derived change in mixdepth 0 are kept out
+of maker rotation. A wallet funded only there may need an
+[internal taker CoinJoin](README-taker.md) before it has maker liquidity.
+Recovered wallets may also lack the history needed to prove eligibility. Do not
+disable this safeguard simply because the displayed balance exceeds an offer.
 
-The maker also defaults to `mixdepth_selection_policy = "balanced"`: when
-several mixdepths can fill a request, it spends from the largest eligible
-balance so the configured privacy compartments remain meaningfully active. To
-favor larger long-term offers instead, set
-`mixdepth_selection_policy = "concentrated"` under `[maker]`, or start with
-`--mixdepth-selection concentrated`. This ports the reference
-`yg-privacyenhanced` cyclic-gap heuristic. It concentrates liquidity into fewer
-active mixdepths, which weakens effective separation between equal outputs and
-maker change. See [Technical Privacy Notes](technical/privacy.md#mixdepths) for
-the tradeoff and probing model.
+## Set Your Fees
 
-### 4) Optional: tune fees
+Use `[maker]` in `config.toml` for lasting settings, or `jm-maker start --help`
+for one-run overrides. Choose the fee model and offer size limits deliberately;
+there is no fee setting that guarantees profit.
 
-```bash
-# Relative fee (0.2%)
-jm-maker start --cj-fee-relative 0.002 --min-size 200000
-```
-
-Use exactly one fee model: `--cj-fee-relative` or `--cj-fee-absolute`.
-
-> **Privacy tip: keep your fee on the quantization grid.** A per-maker fee is a
-> near-unique fingerprint that lets a passive observer re-link your equal
-> outputs across CoinJoins. The default fee (`cj_fee_relative = 0.0001`) sits
-> on a public quantization quantum, and fee randomization is off by default
-> (`cjfee_factor = 0`). If you set a custom fee, prefer another on-grid value
-> (relative: `0.00002, 0.00005, 0.0001, 0.0002, 0.0005, 0.001, ...`; absolute:
-> `100, 200, 500, 1000, ...` sats). Keep `cjfee_factor = 0` to remain on-grid;
-> randomized or other off-grid offers can be excluded by quantized-only takers.
-> The orderbook watcher's "Fee Quantization Bands" chart shows how many makers
-> sit exactly on each quantum, so you can pick the one with the largest
-> anonymity set.
-
-### 5) Optional: dual offers (relative + absolute)
-
-Pass `--dual-offers` (or set `dual_offers = true` under `[maker]` in
-`config.toml`) to advertise one relative and one absolute offer
-simultaneously.  Their size ranges are split automatically at the fee
-intersection `x = cj_fee_absolute / cj_fee_relative`:
-
-- absolute offer covers `[min_size, x]` -- guarantees a flat minimum
-  profit on small CoinJoins where percentage fees would be negligible.
-- relative offer covers `[x, max_balance]` -- stays competitive on large
-  mixes where absolute fees would be wastefully cheap.
-
-Example: `cj_fee_absolute = 1000` sats, `cj_fee_relative = 0.001` -> the
-abs offer is announced for CJs up to 1 000 000 sats, the rel offer for
-larger CJs.  This produces a piecewise fee curve roughly equivalent to a
-linear `min flat fee + proportional component` model without breaking
-the protocol.  If the intersection falls below the configured min_size
-or above the wallet balance, the dominated offer is suppressed
-automatically.
+The defaults use shared fee bands to reduce distinctive pricing. Unusual or
+randomized fees can fingerprint your maker and be excluded by takers that
+require those bands. The [fee quantization discussion and paper](https://github.com/joinmarket-ng/joinmarket-ng/issues/508)
+explain the evidence and proposed mitigations. Consult the installed `config.toml.template` before
+changing fee or mixdepth-selection policies. The
+[configuration guide](technical/configuration.md) explains precedence.
 
 ## Fidelity Bonds
 
-Makers automatically discover bonds from the local registry at startup.
+A bond can make an offer more likely to be selected, but locks funds until its
+expiry and publicly links the bond to the maker. It is optional, not a startup
+requirement. Read [fidelity bond operations](fidelity-bond-operations.md) before
+locking funds; external-signing bonds require separate recovery material.
 
-- User workflow (generate/list/recover bonds): [Wallet guide](README-jmwallet.md)
-- Setup and cold-wallet certificate flow: [Fidelity Bond Operations](fidelity-bond-operations.md)
-- Privacy and protocol details: [Technical Privacy Notes](technical/privacy.md#fidelity-bonds)
+## Migration From JoinMarket Reference
 
-## Migration from JoinMarket Reference
+The network protocol is compatible; wallet files and configuration are not
+interchangeable. Follow [recovery and migration](recover-wallet.md), compare
+addresses and all mixdepth balances, and recover existing bonds before starting
+the maker. Retain the original wallet backup and do not run both copies.
 
-If you ran a maker on the legacy
-[joinmarket-clientserver](https://github.com/JoinMarket-Org/joinmarket-clientserver)
-(now archived), most operational concepts carry over: same wire protocol,
-same fee models, same fidelity bonds. The main differences:
+## Running As A Service
 
-- **Wallet formats are not interchangeable.** The reference implementation's
-  `wallet.jmdat` uses its JMDAT format. Native `jm-wallet` and `jm-maker`
-  commands instead use an encrypted BIP39 `*.mnemonic` file. Export or recover
-  the seed with the appropriate tooling, then import it with `jm-wallet import`;
-  do not pass the reference wallet file to `--mnemonic-file`.
-- **JAM daemon naming is compatibility-only.** `jmwalletd` uses its own encrypted
-  `JMNG` container, which may currently have a `.jmdat` filename for JAM/API
-  compatibility. It is not the reference JMDAT format and is not a native CLI
-  `.mnemonic` file. See [Wallet File Formats](technical/architecture.md#wallet-file-formats).
-- **No `joinmarket.cfg`.** Configuration lives in
-  `~/.joinmarket-ng/config.toml` (TOML, sectioned). See
-  [Configuration](technical/configuration.md) and
-  [`config.toml.template`](https://github.com/joinmarket-ng/joinmarket-ng/blob/main/jmcore/src/jmcore/data/config.toml.template).
-- **No IRC.** Transport is Tor onion services to directory nodes. Tor is
-  required in production.
-- **Backends:** instead of a Bitcoin Core wallet with manual import, choose
-  `descriptor_wallet` (recommended, watch-only on your own Core) or
-  `neutrino` (light client). See [Installation](install.md#configure-backend).
-- **Yield generators:** the legacy `yg-privacyenhanced.py` script is
-  replaced by `jm-maker start` with the same fee flags
-  (`--cj-fee-relative`, `--cj-fee-absolute`, `--min-size`). NG defaults to
-  balanced source selection; use `--mixdepth-selection concentrated` to port
-  the reference script's cyclic-gap liquidity behavior.
-
-Typical migration flow:
-
-```bash
-# 1. Import only the existing BIP39 mnemonic into the default wallet location
-jm-wallet import
-
-# 2. Run the first regular-wallet sync, then compare every mixdepth balance
-# and next deposit address with the records from the reference wallet
-jm-wallet info
-
-# 3. Check the descriptor range. If a used legacy address index is outside
-# the imported range, choose N above the highest used index and widen it once
-jm-wallet info --scan-status
-jm-wallet rescan --scan-depth N
-
-# 4. Recover existing fidelity bonds from the mnemonic in one full scan
-jm-wallet recover-bonds
-jm-wallet list-bonds
-
-# 5. Verify balances, addresses, and bonds before starting a maker
-jm-wallet info
-
-# 6. Start the maker only after the recovered state matches your records
-jm-maker start
-```
-
-Before retiring the reference wallet, record its balance in every mixdepth,
-the highest used external and internal address index in each mixdepth, and each
-fidelity bond's address, value, and locktime. Keep an offline backup of the
-reference wallet until the NG maker has completed a CoinJoin. A successful
-mnemonic import only creates the NG wallet file; it does not prove that the
-node's descriptor range covers every address used by a long-running legacy
-wallet. See [Wallet Scanning](technical/wallet-scanning.md) for choosing
-`--scan-depth` and limiting a rescan to a known start height.
-
-See [Wallet guide](README-jmwallet.md) for import options and BIP39
-passphrase handling, and [Fidelity Bonds](technical/privacy.md#fidelity-bonds)
-for the cold-wallet certificate flow used to register bonds whose key is
-not in the hot wallet.
-
-## Docker Deployment
-
-This component ships with a production-oriented `docker-compose.yml`.
-
-- Setup and Tor requirements: see local compose comments and [Tor Notes](install.md#tor-notes)
-- Backend tradeoffs and compatibility notes: [Technical Wallet Notes](technical/wallet.md#backend-systems)
-
-Typical run:
-
-```bash
-docker-compose up -d
-docker-compose logs -f maker
-```
-
-## Running as a Service
-
-Makers are long-running and benefit from supervised, auto-restarting
-processes. The two common options:
-
-### systemd (Linux)
-
-Create `/etc/systemd/system/jm-maker.service` (replace `youruser` and paths):
-
-```ini
-[Unit]
-Description=JoinMarket-NG Maker
-# Make sure bitcoind and Tor are at least started before us. The unit
-# still retries forever (see Restart= below) so a slow bitcoind boot
-# (IBD, mempool rebuild, ...) does not put the service into failed state.
-After=network-online.target bitcoind.service tor.service
-Wants=network-online.target bitcoind.service tor.service
-
-[Service]
-Type=simple
-User=youruser
-ExecStart=/home/youruser/.joinmarket-ng/venv/bin/jm-maker start \
-    --mnemonic-file /home/youruser/.joinmarket-ng/wallets/default.mnemonic
-Restart=on-failure
-RestartSec=30
-# Retry forever: bitcoind RPC may be unavailable for several minutes
-# after boot. Without this systemd would give up after a few attempts.
-StartLimitIntervalSec=0
-# Optional hardening
-NoNewPrivileges=true
-PrivateTmp=true
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Then:
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now jm-maker
-journalctl -u jm-maker -f         # live logs
-```
-
-For boot auto-start to work the mnemonic password must already live
-in `~/.joinmarket-ng/config.toml` (see the next paragraph). If you do
-not want the password on disk, leave the unit disabled (drop the
-`enable` above) and start it interactively when you log in. This is
-the same trade-off the Raspiblitz integration exposes.
-
-If your mnemonic file is encrypted, the bot needs the password at startup
-and cannot prompt under systemd. Set `mnemonic_password` (the encryption
-password) and/or `bip39_passphrase` (BIP39 25th word) in the `[wallet]`
-section of `~/.joinmarket-ng/config.toml`. Make sure that file is
-`chmod 600` and owned by the service user.
-
-To avoid keeping the encryption password in `config.toml`, you can instead
-deliver it to the service environment via the `MNEMONIC_PASSWORD` variable in
-a `chmod 600` `EnvironmentFile` (the maker reads `MNEMONIC_PASSWORD` from the
-environment):
-
-```ini
-[Service]
-EnvironmentFile=-/home/youruser/.joinmarket-ng/.maker.env
-```
-
-This is the approach the Raspiblitz integration uses for passwords the user
-declines to store permanently: the password lives only in `.maker.env` (mode
-600) while the maker runs and is removed on stop, so it is never written to
-`config.toml`.
-
-On Raspiblitz, the bonus script manages the systemd unit for you; see the
-[TUI guide](README-tui.md).
-
-#### FHS layout: separate config and data directories
-
-By default the config file lives at `<data-dir>/config.toml`. To follow the
-Linux Filesystem Hierarchy Standard (config under `/etc`, state under
-`/var/lib`) pass `--config-file` to decouple the two paths. This pairs well
-with systemd's `ConfigurationDirectory` and `StateDirectory` directives:
-
-```ini
-[Service]
-Type=simple
-DynamicUser=yes
-ConfigurationDirectory=joinmarket
-StateDirectory=joinmarket
-ExecStart=/opt/joinmarket-ng/venv/bin/jm-maker start \
-    --config-file /etc/joinmarket/config.toml \
-    --data-dir /var/lib/joinmarket \
-    --mnemonic-file /var/lib/joinmarket/wallets/default.mnemonic
-```
-
-`--config-file` accepts a path anywhere on disk (the equivalent
-`JOINMARKET_CONFIG_FILE` environment variable also works, and is honored by
-the components that do not take a `--data-dir` flag, such as the directory
-server and orderbook watcher). On first run the config template is created at
-that path; the data directory is used only for wallet state, history, and
-runtime files.
-
-### Docker
-
-The bundled `docker-compose.yml` uses `restart: unless-stopped` and is the
-recommended path on machines where Tor and the backend are also containers.
-See the [Docker Deployment](#docker-deployment) section above.
+First establish that interactive startup works. Then follow
+[unattended maker operation](maker-service.md). Auto-start requires access to
+wallet decryption credentials without a terminal prompt; storing them on the
+host changes the protection offered by wallet-file encryption.
 
 ## Logs
 
-By default `jm-maker` logs to stderr in human-readable format. Common
-patterns:
+Watch connection, offer, and transaction errors. Check `jm-wallet history` for
+completed activity and `jm-wallet info` for the current balance. With systemd,
+use `journalctl -u jm-maker -f`. Review logs for private data before sharing.
 
-```bash
-# Tee to a file while keeping live output
-jm-maker start --mnemonic-file ... 2>&1 | tee -a ~/.joinmarket-ng/jm-maker.log
-
-# Verbose troubleshooting (very chatty)
-jm-maker start --log-level DEBUG ...
-
-# Quieter for unattended operation
-jm-maker start --log-level WARNING ...
-```
-
-When running under systemd, logs go to the journal automatically; use
-`journalctl -u jm-maker` (add `-f` to follow, `--since "1 hour ago"` to
-filter). Persistent journals survive reboots if
-`/var/log/journal` exists.
-
-The default `INFO` level only logs state changes (offers created/updated,
-balance changes, peer events). Routine periodic wallet rescans and healthy
-directory connection status are emitted at `DEBUG` to keep long-running
-maker logs readable. Disconnections, failed transactions, and rate-limit
-events are always logged at `WARNING` or `ERROR`.
-
-## Configuration Notes
-
-Configuration merges as: `config.toml` < environment variables < CLI flags.
+For a maker with no earnings or repeated failures, use
+[troubleshooting](troubleshooting.md#maker-is-online-but-earns-nothing).
 
 ## Multiple Local Instances
 
-If you want to run more than one maker on the same machine, give each maker
-its own data directory. The simplest pattern is to pass `--data-dir` (or set
-`JOINMARKET_DATA_DIR`) on every `jm-maker` and `jm-wallet` command so each
-instance gets its own `config.toml`, wallet files, logs, and local runtime
-state.
+Give each maker its own wallet and data directory. Pass its `--data-dir` and
+`--mnemonic-file` consistently to wallet and maker commands; do not run the same
+seed as independent makers. See the
+[component reference](https://github.com/joinmarket-ng/joinmarket-ng/blob/main/maker/README.md#multiple-local-instances)
+for an example.
 
-```bash
-mkdir -p ~/jm-maker-a ~/jm-maker-b
+## Docker Deployment
 
-jm-maker config-init --data-dir ~/jm-maker-a
-jm-maker config-init --data-dir ~/jm-maker-b
-
-jm-wallet generate --data-dir ~/jm-maker-a
-jm-wallet generate --data-dir ~/jm-maker-b
-
-jm-maker start \
-  --data-dir ~/jm-maker-a \
-  --mnemonic-file ~/jm-maker-a/wallets/default.mnemonic
-
-jm-maker start \
-  --data-dir ~/jm-maker-b \
-  --mnemonic-file ~/jm-maker-b/wallets/default.mnemonic
-```
-
-For takers, separate installations are usually unnecessary. One installation
-can manage multiple wallet mnemonic files, and you can switch between them
-with `--mnemonic-file`. Use separate `--data-dir` values for takers only when
-you specifically want isolated config and runtime state.
-
-For full option lists and exact defaults, use the auto-generated command help below (`jm-maker start --help`).
-
-## Security and Operations
-
-- Maker transaction signing includes strict verification before signature release.
-- Directory communication goes over Tor; production should avoid clearnet fallback behavior.
-- Keep mnemonic files encrypted and backed up; never share mnemonic or wallet files.
-
-Common checks:
-
-```bash
-jm-wallet info --mnemonic-file ~/.joinmarket-ng/wallets/default.mnemonic
-jm-maker start --help
-```
+Use the [maker Compose configuration](https://github.com/joinmarket-ng/joinmarket-ng/blob/main/maker/docker-compose.yml)
+for container-specific paths, networking, and restart policy.
 
 ## Command Reference
 
-<!-- AUTO-GENERATED HELP START: jm-maker -->
-
-<details>
-<summary><code>jm-maker --help</code></summary>
-
-```
-
- Usage: jm-maker [OPTIONS] COMMAND [ARGS]...
-
-╭─ Options ────────────────────────────────────────────────────────────────────╮
-│ --help                        Show this message and exit.                    │
-│ --install-completion          Install completion for the current shell.      │
-│ --show-completion             Show completion for the current shell, to copy │
-│                               it or customize the installation.              │
-╰──────────────────────────────────────────────────────────────────────────────╯
-╭─ Commands ───────────────────────────────────────────────────────────────────╮
-│ config-init       Initialize the config file with default settings.          │
-│ generate-address  Generate a new receive address.                            │
-│ start             Start the maker bot.                                       │
-╰──────────────────────────────────────────────────────────────────────────────╯
-```
-
-</details>
-
-<details>
-<summary><code>jm-maker config-init --help</code></summary>
-
-```
-
- Usage: jm-maker config-init [OPTIONS]
-
- Initialize the config file with default settings.
-
-╭─ Options ────────────────────────────────────────────────────────────────────╮
-│ --config-file          PATH  Config file path (decoupled from data dir).     │
-│                              Defaults to <data-dir>/config.toml              │
-│                              [env var: JOINMARKET_CONFIG_FILE]               │
-│ --data-dir     -d      PATH  Data directory for JoinMarket files             │
-│                              [env var: JOINMARKET_DATA_DIR]                  │
-│ --help                       Show this message and exit.                     │
-╰──────────────────────────────────────────────────────────────────────────────╯
-```
-
-</details>
-
-<details>
-<summary><code>jm-maker generate-address --help</code></summary>
-
-```
-
- Usage: jm-maker generate-address [OPTIONS]
-
- Generate a new receive address.
-
-╭─ Options ────────────────────────────────────────────────────────────────────╮
-│ --backend-type                  TEXT                  Backend type           │
-│ --bitcoin-network               [mainnet|testnet|sig  Bitcoin network for    │
-│                                 net|regtest]          address generation     │
-│                                                       (defaults to           │
-│                                                       --network)             │
-│ --config-file                   PATH                  Config file path       │
-│                                                       (decoupled from data   │
-│                                                       dir). Defaults to      │
-│                                                       <data-dir>/config.toml │
-│                                                       [env var:              │
-│                                                       JOINMARKET_CONFIG_FIL… │
-│ --data-dir                      PATH                  Data directory         │
-│                                                       (default:              │
-│                                                       ~/.joinmarket-ng or    │
-│                                                       $JOINMARKET_DATA_DIR)  │
-│                                                       [env var:              │
-│                                                       JOINMARKET_DATA_DIR]   │
-│ --help                                                Show this message and  │
-│                                                       exit.                  │
-│ --log-level             -l      TEXT                  Log level              │
-│ --mnemonic-file         -f      PATH                  Path to mnemonic file  │
-│ --network                       [mainnet|testnet|sig  Protocol network       │
-│                                 net|regtest]                                 │
-│ --prompt-bip39-passph…                                Prompt for BIP39       │
-│                                                       passphrase             │
-│                                                       interactively          │
-╰──────────────────────────────────────────────────────────────────────────────╯
-```
-
-</details>
-
-<details>
-<summary><code>jm-maker start --help</code></summary>
-
-```
-
- Usage: jm-maker start [OPTIONS]
-
- Start the maker bot.
-
- Configuration is loaded from ~/.joinmarket-ng/config.toml (or
- $JOINMARKET_DATA_DIR/config.toml),
- environment variables, and CLI arguments. CLI arguments have the highest
- priority.
-
-╭─ Options ────────────────────────────────────────────────────────────────────╮
-│ --backend-type                  TEXT                  Backend type:          │
-│                                                       descriptor_wallet |    │
-│                                                       neutrino               │
-│ --bitcoin-network               [mainnet|testnet|sig  Bitcoin network for    │
-│                                 net|regtest]          address generation     │
-│                                                       (defaults to           │
-│                                                       --network)             │
-│ --cj-fee-absolute               INTEGER               Absolute coinjoin fee  │
-│                                                       in sats. Mutually      │
-│                                                       exclusive with         │
-│                                                       --cj-fee-relative.     │
-│                                                       [env var:              │
-│                                                       CJ_FEE_ABSOLUTE]       │
-│ --cj-fee-relative               TEXT                  Relative coinjoin fee  │
-│                                                       (e.g., 0.001 = 0.1%)   │
-│                                                       [env var:              │
-│                                                       CJ_FEE_RELATIVE]       │
-│ --config-file                   PATH                  Config file path       │
-│                                                       (decoupled from data   │
-│                                                       dir). Defaults to      │
-│                                                       <data-dir>/config.toml │
-│                                                       [env var:              │
-│                                                       JOINMARKET_CONFIG_FIL… │
-│ --data-dir              -d      PATH                  Data directory for     │
-│                                                       JoinMarket files.      │
-│                                                       Defaults to            │
-│                                                       ~/.joinmarket-ng       │
-│                                                       [env var:              │
-│                                                       JOINMARKET_DATA_DIR]   │
-│ --directory             -D      TEXT                  Directory servers      │
-│                                                       (comma-separated       │
-│                                                       host:port)             │
-│                                                       [env var:              │
-│                                                       DIRECTORY_SERVERS]     │
-│ --disable-tor-control                                 Disable Tor control    │
-│                                                       port integration       │
-│ --dual-offers                                         Create both relative   │
-│                                                       and absolute fee       │
-│                                                       offers simultaneously. │
-│                                                       Each offer gets a      │
-│                                                       unique ID (0 for       │
-│                                                       relative, 1 for        │
-│                                                       absolute). Use with    │
-│                                                       --cj-fee-relative and  │
-│                                                       --cj-fee-absolute to   │
-│                                                       set fees for each.     │
-│ --fidelity-bond         -B      TEXT                  Specific fidelity bond │
-│                                                       to use (format:        │
-│                                                       txid:vout)             │
-│ --fidelity-bond-index   -I      INTEGER               Fidelity bond          │
-│                                                       derivation index       │
-│                                                       [env var:              │
-│                                                       FIDELITY_BOND_INDEX]   │
-│ --fidelity-bond-lockt…  -L      INTEGER               Fidelity bond          │
-│                                                       locktimes to scan for  │
-│ --help                                                Show this message and  │
-│                                                       exit.                  │
-│ --log-level             -l      TEXT                  Log level              │
-│ --merge-algorithm       -M      TEXT                  UTXO selection         │
-│                                                       strategy: default,     │
-│                                                       gradual, greedy,       │
-│                                                       random                 │
-│                                                       [env var:              │
-│                                                       MERGE_ALGORITHM]       │
-│ --min-size                      INTEGER               Minimum CoinJoin size  │
-│                                                       in sats                │
-│ --mixdepth-selection            TEXT                  Source mixdepth        │
-│                                                       policy: balanced       │
-│                                                       (privacy compartments) │
-│                                                       or concentrated        │
-│                                                       (legacy liquidity      │
-│                                                       heuristic)             │
-│                                                       [env var:              │
-│                                                       MIXDEPTH_SELECTION]    │
-│ --mnemonic-file         -f      PATH                  Path to mnemonic file  │
-│ --network                       [mainnet|testnet|sig  Protocol network       │
-│                                 net|regtest]          (mainnet, testnet,     │
-│                                                       signet, regtest)       │
-│ --neutrino-url                  TEXT                  Neutrino REST API URL  │
-│                                                       [env var:              │
-│                                                       NEUTRINO_URL]          │
-│ --no-fidelity-bond                                    Disable fidelity bond  │
-│                                                       usage. Skips registry  │
-│                                                       lookup and bond proof  │
-│                                                       generation even when   │
-│                                                       bonds exist in the     │
-│                                                       registry.              │
-│ --onion-serving-host            TEXT                  Bind address for       │
-│                                                       incoming connections   │
-│                                                       (overrides             │
-│                                                       MAKER__ONION_SERVING_… │
-│ --onion-serving-port            INTEGER               Port for incoming      │
-│                                                       .onion connections     │
-│                                                       (overrides             │
-│                                                       MAKER__ONION_SERVING_… │
-│ --prompt-bip39-passph…                                Prompt for BIP39       │
-│                                                       passphrase             │
-│                                                       interactively          │
-│ --rpc-url                       TEXT                  Bitcoin full node RPC  │
-│                                                       URL                    │
-│                                                       [env var:              │
-│                                                       BITCOIN_RPC_URL]       │
-│ --tor-control-host              TEXT                  Tor control port host  │
-│                                                       (overrides             │
-│                                                       TOR__CONTROL_HOST)     │
-│ --tor-control-port              INTEGER               Tor control port       │
-│                                                       (overrides             │
-│                                                       TOR__CONTROL_PORT)     │
-│ --tor-cookie-path               PATH                  Path to Tor cookie     │
-│                                                       auth file (overrides   │
-│                                                       TOR__COOKIE_PATH)      │
-│ --tor-socks-host                TEXT                  Tor SOCKS proxy host   │
-│                                                       (overrides             │
-│                                                       TOR__SOCKS_HOST)       │
-│ --tor-socks-port                INTEGER               Tor SOCKS proxy port   │
-│                                                       (overrides             │
-│                                                       TOR__SOCKS_PORT)       │
-│ --tor-target-host               TEXT                  Target hostname for    │
-│                                                       Tor hidden service     │
-│                                                       (overrides             │
-│                                                       TOR__TARGET_HOST)      │
-│ --tx-fee-contribution           INTEGER               Tx fee contribution in │
-│                                                       sats                   │
-╰──────────────────────────────────────────────────────────────────────────────╯
-```
-
-</details>
-
-
-<!-- AUTO-GENERATED HELP END: jm-maker -->
+`jm-maker start --help` describes the installed version's options. Generated
+help also lives in the [component reference](https://github.com/joinmarket-ng/joinmarket-ng/blob/main/maker/README.md).

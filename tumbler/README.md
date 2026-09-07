@@ -2,47 +2,10 @@
 
 High-level CoinJoin scheduler for joinmarket-ng.
 
-This README is the short practical entry point. For user-facing concepts and
-privacy rationale, see [`docs/README-tumbler.md`](../docs/README-tumbler.md).
+For planning, safe operation, and resuming an interrupted tumble, use the
+[tumbler guide](../docs/README-tumbler.md). Generated command help lives below.
 For implementation details, see
 [`docs/technical/tumbler-redesign.md`](../docs/technical/tumbler-redesign.md).
-
-## Quick Start
-
-Build a plan:
-
-```bash
-jm-tumbler plan \
-  --mnemonic-file ~/.joinmarket-ng/wallets/default.mnemonic \
-  --destination bc1qdest1... \
-  --destination bc1qdest2... \
-  --destination bc1qdest3...
-```
-
-Inspect it:
-
-```bash
-jm-tumbler status --mnemonic-file ~/.joinmarket-ng/wallets/default.mnemonic
-```
-
-Run it:
-
-```bash
-jm-tumbler run --mnemonic-file ~/.joinmarket-ng/wallets/default.mnemonic
-```
-
-Delete it:
-
-```bash
-jm-tumbler delete --mnemonic-file ~/.joinmarket-ng/wallets/default.mnemonic
-```
-
-Notes:
-
-- Use at least three destination addresses for real tumbles.
-- Progress is persisted to `plan.yaml`, so `jm-tumbler run` can resume.
-- While a tumble is active, `jmwalletd` blocks manual taker/maker operations on
-  the same wallet.
 
 ## Development
 

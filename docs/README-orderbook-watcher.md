@@ -4,17 +4,10 @@ The orderbook watcher aggregates maker offers from directory servers and exposes
 
 ## Install
 
-With the recommended installer:
-
-```bash
-curl -sSL https://raw.githubusercontent.com/joinmarket-ng/joinmarket-ng/main/install.sh | bash
-source ~/.joinmarket-ng/activate.sh
-```
-
-The orderbook watcher is part of the default complete profile. To install only
-the watcher and its core dependencies, pass `--orderbook-watcher`. Rerunning
-the installer repairs existing `0.35.0` installations that are missing the
-watcher entry point.
+The [recommended installation](install.md) includes the watcher. For a
+watcher-only installation or to add it to an existing installation, follow
+[installation profiles](install-advanced.md#installation-profiles). This also
+repairs older installations missing the watcher entry point.
 
 From a source checkout:
 

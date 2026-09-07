@@ -44,73 +44,20 @@ time.
 
 ## Start Here
 
-- Documentation home: https://joinmarket-ng.github.io/joinmarket-ng/
-- Installation guide: https://joinmarket-ng.github.io/joinmarket-ng/install/
-- Technical docs: https://joinmarket-ng.github.io/joinmarket-ng/technical/
+- [Get started](https://joinmarket-ng.github.io/joinmarket-ng/getting-started/):
+  choose an interface, set up a backend, back up a wallet, and prepare for a CoinJoin.
+- [Use your wallet](https://joinmarket-ng.github.io/joinmarket-ng/README-jmwallet/):
+  receive, check balances, and send.
+- [Common questions](https://joinmarket-ng.github.io/joinmarket-ng/faq/) and
+  [troubleshooting](https://joinmarket-ng.github.io/joinmarket-ng/troubleshooting/).
+- [Reference](https://joinmarket-ng.github.io/joinmarket-ng/reference/):
+  commands, settings, specialized operations, and protocol details.
+- [Contribute](https://joinmarket-ng.github.io/joinmarket-ng/technical/development/):
+  development setup, tests, and documentation preview.
 
-## Quick Start
-
-1. Install (Linux/macOS):
-
-The installer needs ``curl`` to fetch itself and uses ``sudo`` to install
-system packages on Debian/Ubuntu (so on a fresh minimal image you'll
-want ``curl``, ``sudo``, and your user added to the ``sudo`` group; on
-macOS you'll want Homebrew). Everything else (``gnupg``, ``git``,
-build tools) is installed for you on first run.
-
-```bash
-curl -sSL https://raw.githubusercontent.com/joinmarket-ng/joinmarket-ng/main/install.sh | bash
-source ~/.joinmarket-ng/activate.sh
-```
-
-The first command is an HTTPS bootstrap. After a successful verified run, the
-installer saves a trusted local updater. Use it for every later update:
-
-```bash
-bash ~/.joinmarket-ng/install.sh --update
-```
-
-See the [installation guide](https://joinmarket-ng.github.io/joinmarket-ng/install/)
-for the trust model, manual verification, custom directories, and migration of
-an existing installation.
-
-2. Edit `~/.joinmarket-ng/config.toml` and set your backend (`descriptor_wallet` for Bitcoin Core, or `neutrino`). New installs have a small commented starter; the complete reference is in the adjacent `config.toml.template`. Uncomment only the settings you want to override:
-
-```toml
-[bitcoin]
-backend_type = "descriptor_wallet"
-rpc_url = "http://127.0.0.1:8332"
-rpc_user = "your_rpc_user"
-rpc_password = "your_rpc_password"
-```
-
-3. Create wallet and get deposit addresses:
-
-```bash
-jm-wallet generate
-jm-wallet info
-```
-
-4. Run CoinJoin as a taker, or start earning fees as a maker:
-
-```bash
-jm-taker coinjoin --amount 1000000 --destination INTERNAL
-# or
-jm-maker start
-```
-
-## Module Docs
-
-- `jmcore`: https://joinmarket-ng.github.io/joinmarket-ng/README-jmcore/
-- `jmwallet`: https://joinmarket-ng.github.io/joinmarket-ng/README-jmwallet/
-- `taker`: https://joinmarket-ng.github.io/joinmarket-ng/README-taker/
-- `maker`: https://joinmarket-ng.github.io/joinmarket-ng/README-maker/
-- `tumbler`: https://joinmarket-ng.github.io/joinmarket-ng/README-tumbler/
-- `jmwalletd`: https://joinmarket-ng.github.io/joinmarket-ng/README-jmwalletd/
-- `orderbook_watcher`: https://joinmarket-ng.github.io/joinmarket-ng/README-orderbook-watcher/
-- `directory_server`: https://joinmarket-ng.github.io/joinmarket-ng/README-directory-server/
-- `signatures`: https://joinmarket-ng.github.io/joinmarket-ng/README-signatures/
-- `scripts`: https://joinmarket-ng.github.io/joinmarket-ng/README-scripts/
+CoinJoin does not guarantee anonymity. Before using funds, read the
+[privacy practices](https://joinmarket-ng.github.io/joinmarket-ng/technical/best-practices/)
+and [backup requirements](https://joinmarket-ng.github.io/joinmarket-ng/recover-wallet/).
 
 ## Community
 
@@ -119,7 +66,7 @@ jm-maker start
 
 ## License
 
-MIT: https://joinmarket-ng.github.io/joinmarket-ng/license/
+MIT: [LICENSE](LICENSE)
 
 ## Acknowledgements
 
@@ -140,7 +87,7 @@ is a good option.
 sp1qqt3jvfalrvtjksvmul943cpt3vvx0aydg0fegz4kzagu2dw9zp2x2qjyydsrdzmcf5ltr973zsadcktyqdfzrzkmml2guta6p664fu8e4uvmvmq4
 ```
 
-For Lightning Network donations, uset his BOLT12 invoice:
+For Lightning Network donations, use this BOLT12 invoice:
 
 ```text
 lno1pgx55mmfdexkzuntv46zqnj8zcssyy55ll6edeyh455s9n2lr9nnaypqj57eqcjadrpzayd4rfzuqvkn
