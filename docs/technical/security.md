@@ -68,6 +68,18 @@ mode `0700`. These permissions protect against other unprivileged local users;
 they do not protect against the wallet process's own user, root, backups, swap,
 or a compromised host.
 
+Config, nick state, and wallet metadata are also written atomically with mode
+`0600`. Reads tighten existing regular files when permitted. For these state
+files, configured symlinks remain supported and updates preserve their targets.
+Readable administrator-owned or read-only files remain usable if permissions
+cannot be tightened; a warning asks the operator to address the exposure.
+Wallet key and TLS files retain their stricter no-follow rules.
+
+An upgrade preserves existing file contents, metadata records, and directory
+permissions. Missing default data and state directories are created with mode
+`0700`; existing shared or symlinked directories are not changed. This permission
+hardening does not trigger rescans, metadata reconstruction, or new migrations.
+
 PoDLE proof nonces use a domain-separated RFC 6979-style HMAC-SHA256 derivation
 keyed by the UTXO private key and bound to the proof transcript. Proof generation
 therefore does not depend on runtime randomness, avoiding private-key exposure
@@ -81,6 +93,50 @@ reproducible plans.
 - use multiple directory servers where possible
 - prefer direct maker/taker channels when available
 - enforce per-message signatures and a strict session state machine during the CoinJoin flow (takers may switch transport mid-session)
+
+Peerlist nicknames, locations, and feature identifiers cannot contain wire
+delimiters or control/whitespace characters. Unknown safe feature names remain
+supported. Directory operators must upgrade as well as clients: a client cannot
+distinguish a syntactically valid forged disconnect record from a genuine record
+sent by an unpatched directory.
+
+### Resource Limits
+
+The following implementation limits bound work from untrusted peers without
+changing private transaction message sizes or signed-input lock policy:
+
+| Boundary | Limit |
+| --- | --- |
+| Directory pending handshakes | At most 128, or `max_peers` when smaller; separate from established capacity |
+| Public broadcast ingress | 32 KiB/s per connection generation, 256 KiB burst |
+| Public broadcast forwarding | 16 MiB/s across recipients, 64 MiB burst |
+| Tracked directory offers | 256 per connection generation; order IDs at most 64 characters |
+| Maker direct sockets | 256 across all identity generations; 60-second receive-idle and initial authentication deadlines |
+| Client buffered messages | 1,024 messages and 8 MiB serialized data |
+| Client message collection | 10,000 messages and 32 MiB per collection/fetch |
+| Client retained state | 10,000 offers and 20,000 peers per directory; 64 features per peer |
+| Watcher bond caches | 4,096 positive entries and 4,096 short-lived retry entries |
+| Watcher mempool verification | At most 256 claims per update, five concurrent lookups, 60-second retry cooldown |
+
+Excess public broadcasts are dropped. Client collection/state exhaustion closes
+the connection and reports failure rather than accepting a partial authoritative
+peerlist. Maker deadlines do not impose a 60-second limit on verified CoinJoin
+work. These bounds reduce resource exhaustion; they do not prevent Sybil attacks
+or guarantee admission while an adversary continuously occupies available slots.
+
+### Wallet Daemon Admission
+
+Create, recover, and unlock share a serialized lifecycle with at most eight
+active or waiting requests. Excess requests receive HTTP 429. Password failures
+also retain per-wallet retry backoff. Expensive wallet-file cryptography runs
+outside the event loop; cancellation waits for that work to finish before
+releasing lifecycle ownership. Wallet formats and KDF parameters are unchanged.
+
+Authentication failures and filesystem errors return generic details. Config
+responses mask backend tokens and password fields, including in-memory overrides;
+config updates do not log submitted values. These controls do not change the
+reference-compatible unauthenticated session/list/bootstrap API. Do not expose
+the daemon to untrusted clients without an appropriate access-control boundary.
 
 ## Neutrino Notes
 
@@ -99,7 +155,8 @@ reproducible plans.
 
 Each long-running daemon (jmwalletd, maker, taker, directory server,
 orderbook watcher) calls `jmcore.process_hardening.harden_current_process`
-at startup. This applies two cheap, OS-level mitigations on Linux to keep
+at startup, as does the `jm-wallet` command-line entry point. This applies
+two cheap, OS-level mitigations on Linux to keep
 secrets (mnemonic, BIP32 extended keys, derived private keys, NaCl session
 keys, signed PSBTs) from leaking on crash or live introspection:
 
@@ -110,6 +167,13 @@ keys, signed PSBTs) from leaking on crash or live introspection:
 
 Set `JOINMARKET_DISABLE_PROCESS_HARDENING=1` to opt out (only useful when
 debugging with gdb or rr).
+
+`verify-password` and `showseed` warn on stderr when a password is supplied as a
+command-line argument. Prefer their hidden prompt; argument values can remain
+visible in process listings and shell history despite the warning. Direct
+Bitcoin Core and Neutrino backends also warn for non-loopback HTTP endpoints,
+including private LAN/container names. Such endpoints need a trusted transport
+or HTTPS; the warning does not change routing or reject the configuration.
 
 These mitigations do not protect anonymous pages that get paged out to
 swap or written to a hibernation image. Operators who hold non-trivial
