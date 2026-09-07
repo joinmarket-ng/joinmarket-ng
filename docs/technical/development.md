@@ -220,7 +220,10 @@ release to the published latest release.
 The version bump also compares the bundled `config.toml.template` with the
 previous release. It adds the complete commented diff to the changelog, or an
 explicit unchanged notice, so the same configuration guidance is included in
-the GitHub release notes. Existing user configuration files are never modified.
+the GitHub release notes. Each hunk includes its TOML section in the `@@` header,
+including old and new section names when they differ. Existing user
+configuration files are never modified, and existing release notes are not
+automatically backfilled when the diff formatter changes.
 
 To preview GitHub release-note synchronization from the committed changelog:
 

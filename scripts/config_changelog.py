@@ -26,6 +26,13 @@ COMPARE_LINK_PATTERN = re.compile(
     r"^\[(?P<version>[^]]+)]: \S*/compare/(?P<from_ref>\S+)\.\.\.(?P<to_ref>\S+)\s*$",
     re.MULTILINE,
 )
+TOML_SECTION_HEADER_PATTERN = re.compile(
+    r"^\s*(?:#\s*)?(?P<header>\[\[[^]\r\n]+\]\]|\[[^]\r\n]+\])\s*(?:#.*)?$"
+)
+UNIFIED_HUNK_HEADER_PATTERN = re.compile(
+    r"^@@ -(?P<from_start>\d+)(?:,(?P<from_count>\d+))? "
+    r"\+(?P<to_start>\d+)(?:,(?P<to_count>\d+))? @@$"
+)
 
 
 class ConfigChangelogError(Exception):
@@ -76,6 +83,78 @@ def read_template_snapshot(
     return None
 
 
+def section_contexts(lines: list[str]) -> list[str]:
+    """Return the active TOML table for each line, including commented placeholders."""
+    contexts: list[str] = []
+    current_context = "top level"
+    for line in lines:
+        header_match = TOML_SECTION_HEADER_PATTERN.match(line)
+        if header_match:
+            current_context = header_match.group("header")
+            # Older templates mislabeled the top-level data_dir example as [core].
+            if current_context == "[core]" and line.lstrip().startswith("#"):
+                current_context = "top level"
+        contexts.append(current_context)
+    return contexts
+
+
+def append_context(contexts: list[str], context: str) -> None:
+    if context not in contexts:
+        contexts.append(context)
+
+
+def format_hunk_context(from_contexts: list[str], to_contexts: list[str]) -> str:
+    if not from_contexts:
+        return ", ".join(to_contexts)
+    if not to_contexts or from_contexts == to_contexts:
+        return ", ".join(from_contexts)
+    return f"old: {', '.join(from_contexts)}; new: {', '.join(to_contexts)}"
+
+
+def annotate_hunk_contexts(
+    diff_lines: list[str], from_lines: list[str], to_lines: list[str]
+) -> list[str]:
+    """Append active TOML tables to unified-diff hunk headers without changing payload."""
+    from_line_contexts = section_contexts(from_lines)
+    to_line_contexts = section_contexts(to_lines)
+    annotated: list[str] = []
+    index = 0
+
+    while index < len(diff_lines):
+        line = diff_lines[index]
+        hunk_match = UNIFIED_HUNK_HEADER_PATTERN.match(line)
+        if not hunk_match:
+            annotated.append(line)
+            index += 1
+            continue
+
+        from_line = int(hunk_match.group("from_start")) - 1
+        to_line = int(hunk_match.group("to_start")) - 1
+        from_contexts: list[str] = []
+        to_contexts: list[str] = []
+        hunk_end = index + 1
+
+        while hunk_end < len(diff_lines) and not diff_lines[hunk_end].startswith("@@ "):
+            payload_line = diff_lines[hunk_end]
+            marker = payload_line[:1]
+            if marker == " ":
+                from_line += 1
+                to_line += 1
+            elif marker == "-":
+                append_context(from_contexts, from_line_contexts[from_line])
+                from_line += 1
+            elif marker == "+":
+                append_context(to_contexts, to_line_contexts[to_line])
+                to_line += 1
+            hunk_end += 1
+
+        annotated.append(f"{line} {format_hunk_context(from_contexts, to_contexts)}")
+        annotated.extend(diff_lines[index + 1 : hunk_end])
+        index = hunk_end
+
+    return annotated
+
+
 def render_template_diff(
     from_snapshot: TemplateSnapshot | None,
     to_snapshot: TemplateSnapshot | None,
@@ -87,13 +166,16 @@ def render_template_diff(
     if from_lines == to_lines:
         return ""
 
-    diff_lines = difflib.unified_diff(
-        from_lines,
-        to_lines,
-        fromfile=f"config.toml.template ({from_label})",
-        tofile=f"config.toml.template ({to_label})",
-        lineterm="",
+    diff_lines = list(
+        difflib.unified_diff(
+            from_lines,
+            to_lines,
+            fromfile=f"config.toml.template ({from_label})",
+            tofile=f"config.toml.template ({to_label})",
+            lineterm="",
+        )
     )
+    diff_lines = annotate_hunk_contexts(diff_lines, from_lines, to_lines)
     return "\n".join("" if line == " " else line for line in diff_lines)
 
 
@@ -187,6 +269,13 @@ def backfill_changelog(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--from-file", type=Path, help="Previously installed template file"
+    )
+    parser.add_argument("--to-file", type=Path, help="Target release template file")
+    parser.add_argument(
+        "--from-label", default="previously installed", help="Old file label"
+    )
     parser.add_argument("--from-ref", help="Earlier Git ref to compare")
     parser.add_argument(
         "--to-ref", default="HEAD", help="Later Git ref (default: HEAD)"
@@ -205,6 +294,31 @@ def main() -> None:
     args = parser.parse_args()
 
     try:
+        if args.from_file is not None or args.to_file is not None:
+            if (
+                args.from_file is None
+                or args.to_file is None
+                or args.backfill
+                or args.update
+            ):
+                parser.error(
+                    "--from-file and --to-file must be used together without --backfill/--update"
+                )
+            print(
+                render_template_diff(
+                    TemplateSnapshot(
+                        args.from_label, str(args.from_file), args.from_file.read_text()
+                    ),
+                    TemplateSnapshot(
+                        args.to_label or "target release",
+                        str(args.to_file),
+                        args.to_file.read_text(),
+                    ),
+                    args.from_label,
+                    args.to_label or "target release",
+                )
+            )
+            return
         if args.backfill:
             content = CHANGELOG.read_text()
             new_content, versions = backfill_changelog(content)
@@ -224,7 +338,7 @@ def main() -> None:
                 to_label=args.to_label,
             )
         )
-    except ConfigChangelogError as exc:
+    except (ConfigChangelogError, OSError, UnicodeError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
 

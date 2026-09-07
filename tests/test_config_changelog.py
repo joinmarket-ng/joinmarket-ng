@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import difflib
 import importlib
 import os
 import subprocess
@@ -17,8 +18,10 @@ config_changelog = importlib.import_module("config_changelog")
 bump_version = importlib.import_module("bump_version")
 
 ConfigChangelogError = config_changelog.ConfigChangelogError
+TemplateSnapshot = config_changelog.TemplateSnapshot
 backfill_changelog = config_changelog.backfill_changelog
 generate_config_changes_section = config_changelog.generate_config_changes_section
+render_template_diff = config_changelog.render_template_diff
 replace_config_section = config_changelog.replace_config_section
 
 
@@ -53,6 +56,117 @@ def make_template_repo(tmp_path: Path) -> Path:
     repo_dir.mkdir()
     run_git(repo_dir, "init")
     return repo_dir
+
+
+def render_diff(from_content: str, to_content: str) -> str:
+    return render_template_diff(
+        TemplateSnapshot(ref="old", path="config.toml.template", content=from_content),
+        TemplateSnapshot(ref="new", path="config.toml.template", content=to_content),
+        "old",
+        "new",
+    )
+
+
+@pytest.mark.parametrize("change", ["insert", "update", "delete"])
+def test_render_template_diff_labels_middle_of_long_section(change: str) -> None:
+    from_lines = ["[taker]", *(f"# value_{index} = {index}" for index in range(12))]
+    to_lines = from_lines.copy()
+    if change == "insert":
+        to_lines.insert(8, "# inserted = true")
+    elif change == "update":
+        to_lines[7] = "# value_6 = 99"
+    else:
+        del to_lines[7]
+
+    diff = render_diff("\n".join(from_lines) + "\n", "\n".join(to_lines) + "\n")
+    diff_lines = diff.splitlines()
+    hunk_header = next(line for line in diff_lines if line.startswith("@@"))
+
+    assert hunk_header.endswith("[taker]")
+    assert " [taker]" not in (line for line in diff_lines if not line.startswith("@@"))
+
+
+def test_render_template_diff_only_annotates_unified_hunk_headers() -> None:
+    from_content = "[maker]\n# fee = 1\n# unchanged\n[taker]\n# fee = 1\n"
+    to_content = "[maker]\n# fee = 2\n# unchanged\n[taker]\n# fee = 2\n"
+    expected_diff = list(
+        difflib.unified_diff(
+            from_content.splitlines(),
+            to_content.splitlines(),
+            fromfile="config.toml.template (old)",
+            tofile="config.toml.template (new)",
+            lineterm="",
+        )
+    )
+    rendered_diff = render_diff(from_content, to_content).splitlines()
+
+    assert len(rendered_diff) == len(expected_diff)
+    for rendered_line, expected_line in zip(rendered_diff, expected_diff, strict=True):
+        if expected_line.startswith("@@"):
+            assert rendered_line.startswith(f"{expected_line} ")
+        else:
+            assert rendered_line == expected_line
+
+
+def test_render_template_diff_labels_multiple_separate_hunks() -> None:
+    from_content = "[maker]\n# fee = 1\n" + "# unchanged\n" * 8 + "[taker]\n# fee = 1\n"
+    to_content = from_content.replace(
+        "[maker]\n# fee = 1", "[maker]\n# fee = 2"
+    ).replace("[taker]\n# fee = 1", "[taker]\n# fee = 2")
+
+    hunk_headers = [
+        line
+        for line in render_diff(from_content, to_content).splitlines()
+        if line.startswith("@@")
+    ]
+
+    assert len(hunk_headers) == 2
+    assert hunk_headers[0].endswith("[maker]")
+    assert hunk_headers[1].endswith("[taker]")
+
+
+def test_render_template_diff_labels_all_sections_in_one_hunk() -> None:
+    from_content = "[maker]\n# fee = 1\n\n[taker]\n# fee = 1\n"
+    to_content = "[maker]\n# fee = 2\n\n[taker]\n# fee = 2\n"
+
+    diff = render_diff(from_content, to_content)
+
+    assert "@@ -1,5 +1,5 @@ [maker], [taker]" in diff
+
+
+@pytest.mark.parametrize(
+    ("from_content", "to_content", "expected_context"),
+    [
+        ("[maker]\n# fee = 1\n", "", "[maker]"),
+        ("", "[taker]\n# fee = 1\n", "[taker]"),
+        ("[maker]\n# fee = 1\n", "[taker]\n# fee = 1\n", "old: [maker]; new: [taker]"),
+    ],
+)
+def test_render_template_diff_labels_added_deleted_and_renamed_sections(
+    from_content: str, to_content: str, expected_context: str
+) -> None:
+    hunk_header = next(
+        line
+        for line in render_diff(from_content, to_content).splitlines()
+        if line.startswith("@@")
+    )
+
+    assert hunk_header.endswith(expected_context)
+
+
+def test_render_template_diff_labels_preamble_as_top_level() -> None:
+    from_content = 'value = "[not_a_section]"\n[wallet]\n# gap_limit = 20\n'
+    to_content = (
+        'value = "[not_a_section]"\n# added = true\n[wallet]\n# gap_limit = 20\n'
+    )
+
+    assert "@@ -1,3 +1,4 @@ top level" in render_diff(from_content, to_content)
+
+
+def test_render_template_diff_labels_commented_section_placeholders() -> None:
+    diff = render_diff("# [wallet]\n# value = 1\n", "# [wallet]\n# value = 2\n")
+
+    assert "@@ -1,2 +1,2 @@ [wallet]" in diff
 
 
 def test_generate_config_changes_section_includes_comments_and_values(
@@ -198,3 +312,58 @@ def test_version_bump_dry_run_executes_config_preview(
             False,
         )
     ]
+
+
+def test_file_diff_cli_works_outside_a_git_repository(tmp_path: Path) -> None:
+    before = tmp_path / "before.toml"
+    after = tmp_path / "after.toml"
+    before.write_text("[taker]\n" + "# explanation\n" * 8 + "# max_cj_fee_abs = 500\n")
+    after.write_text(before.read_text().replace("500", "600"))
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPTS_DIR / "config_changelog.py"),
+            "--from-file",
+            str(before),
+            "--to-file",
+            str(after),
+            "--from-label",
+            "1.0.0",
+            "--to-label",
+            "2.0.0",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "config.toml.template (1.0.0)" in result.stdout
+    assert "config.toml.template (2.0.0)" in result.stdout
+    assert "@@ [taker]" in result.stdout
+    assert "+# max_cj_fee_abs = 600" in result.stdout
+
+
+def test_file_diff_cli_requires_both_files(tmp_path: Path) -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPTS_DIR / "config_changelog.py"),
+            "--from-file",
+            str(tmp_path / "old"),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 2
+    assert "must be used together" in result.stderr
+
+
+def test_legacy_core_placeholder_is_labeled_top_level() -> None:
+    before = config_changelog.TemplateSnapshot(
+        "old", "template", '# [core]\n# data_dir = "old"\n'
+    )
+    after = config_changelog.TemplateSnapshot("new", "template", '# data_dir = "new"\n')
+    diff = config_changelog.render_template_diff(before, after, "old", "new")
+    assert next(line for line in diff.splitlines() if line.startswith("@@")).endswith(
+        "top level"
+    )
