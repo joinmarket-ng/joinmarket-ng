@@ -9,7 +9,12 @@ import contextlib
 import gc
 import json
 import random
+import subprocess
+import sys
 import time
+from collections.abc import AsyncIterator
+from pathlib import Path
+from unittest.mock import patch
 
 import psutil
 import pytest
@@ -172,8 +177,8 @@ class LoadTestScenario:
         }
 
 
-@pytest_asyncio.fixture
-async def test_server():
+@contextlib.asynccontextmanager
+async def running_test_server() -> AsyncIterator[tuple[str, int]]:
     settings = DirectoryServerSettings(
         host="127.0.0.1",
         port=0,
@@ -191,16 +196,23 @@ async def test_server():
     assert server.server is not None, "Server should be running after start()"
     actual_port = server.server.sockets[0].getsockname()[1]
 
-    yield "127.0.0.1", actual_port
+    try:
+        yield "127.0.0.1", actual_port
+    finally:
+        # Clean up server
+        await server.stop()
+        # Cancel the server task since serve_forever() won't return naturally
+        server_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, TimeoutError):
+            # Use timeout to prevent hangs in Python 3.12+ where task cancellation
+            # can block indefinitely if serve_forever() doesn't exit cleanly
+            await asyncio.wait_for(server_task, timeout=5.0)
 
-    # Clean up server
-    await server.stop()
-    # Cancel the server task since serve_forever() won't return naturally
-    server_task.cancel()
-    with contextlib.suppress(asyncio.CancelledError, TimeoutError):
-        # Use timeout to prevent hangs in Python 3.12+ where task cancellation
-        # can block indefinitely if serve_forever() doesn't exit cleanly
-        await asyncio.wait_for(server_task, timeout=5.0)
+
+@pytest_asyncio.fixture
+async def test_server() -> AsyncIterator[tuple[str, int]]:
+    async with running_test_server() as address:
+        yield address
 
 
 @pytest.mark.asyncio
@@ -420,8 +432,27 @@ async def test_load_churn(test_server):
         await scenario.cleanup()
 
 
-@pytest.mark.asyncio
-async def test_load_stress_max_peers(test_server):
+def test_load_stress_max_peers() -> None:
+    # The absolute RSS cap must not include memory retained by earlier tests.
+    result = subprocess.run(
+        [sys.executable, str(Path(__file__).resolve())],
+        capture_output=True,
+        text=True,
+        timeout=45,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_stress_subprocess_failure_propagates() -> None:
+    result = subprocess.CompletedProcess([], 1, stdout="", stderr="stress assertion failed")
+    with (
+        patch.object(subprocess, "run", return_value=result),
+        pytest.raises(AssertionError, match="stress assertion failed"),
+    ):
+        test_load_stress_max_peers()
+
+
+async def run_stress_max_peers(test_server: tuple[str, int]) -> None:
     host, port = test_server
     scenario = LoadTestScenario(host, port)
     scenario.memory_tracker.start()
@@ -462,3 +493,12 @@ async def test_load_stress_max_peers(test_server):
 
     finally:
         await scenario.cleanup()
+
+
+async def run_isolated_stress_test() -> None:
+    async with running_test_server() as address:
+        await run_stress_max_peers(address)
+
+
+if __name__ == "__main__":
+    asyncio.run(run_isolated_stress_test())
