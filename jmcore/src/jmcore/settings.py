@@ -41,6 +41,7 @@ import json
 import os
 import re
 from decimal import Decimal, InvalidOperation
+from io import BytesIO
 from pathlib import Path
 from typing import Any, ClassVar, Self
 
@@ -62,6 +63,11 @@ from jmcore.models import (
 )
 from jmcore.nick_auth import NickAuthMode, validate_directory_endpoint, validate_directory_id
 from jmcore.paths import get_default_data_dir
+from jmcore.secure_files import (
+    atomic_write_sensitive_file,
+    ensure_sensitive_file,
+    read_sensitive_file,
+)
 
 # Default directory servers per network (single source of truth in models.py)
 DEFAULT_DIRECTORY_SERVERS: dict[str, list[str]] = {
@@ -1622,8 +1628,7 @@ class TomlConfigSettingsSource(PydanticBaseSettingsSource):
         try:
             import tomllib
 
-            with open(config_path, "rb") as f:
-                self._config = tomllib.load(f)
+            self._config = tomllib.load(BytesIO(read_sensitive_file(config_path)))
 
             logger.info(f"Loaded config from {config_path}")
         except tomllib.TOMLDecodeError as e:
@@ -1980,6 +1985,9 @@ def migrate_config(
     # ``~/.joinmarket-ng/config.toml``). Expanding here ensures we never create
     # a literal ``./~`` directory regardless of how data_dir was resolved (#536).
     config_path = config_path.expanduser()
+    config_exists = config_path.exists()
+    if config_exists:
+        ensure_sensitive_file(config_path)
 
     if template_text is None:
         template_text = _get_bundled_template()
@@ -1989,18 +1997,20 @@ def migrate_config(
         logger.warning("No config template available; skipping config creation")
         return []
 
-    if not config_path.exists():
+    if not config_exists:
         logger.info(f"Config file missing; creating from template at {config_path}")
-        config_path.parent.mkdir(parents=True, exist_ok=True)
-        config_path.write_text(template_text)
+        atomic_write_sensitive_file(config_path, template_text.encode("utf-8"))
 
     # Keep a reference copy of the template alongside the config so users
     # can diff their settings against the current version's template.
     # Failures here must never break startup or config creation.
     template_copy = config_path.with_name("config.toml.template")
     try:
-        if not template_copy.exists() or template_copy.read_text() != template_text:
-            template_copy.write_text(template_text)
+        if (
+            not template_copy.exists()
+            or read_sensitive_file(template_copy).decode("utf-8") != template_text
+        ):
+            atomic_write_sensitive_file(template_copy, template_text.encode("utf-8"))
     except OSError as exc:
         logger.warning(f"Could not update template copy at {template_copy}: {exc}")
 

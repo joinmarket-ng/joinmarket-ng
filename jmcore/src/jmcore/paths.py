@@ -10,6 +10,12 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from jmcore.secure_files import (
+    atomic_write_sensitive_file,
+    ensure_sensitive_directory,
+    read_sensitive_file,
+)
+
 
 def get_default_data_dir() -> Path:
     """
@@ -23,8 +29,8 @@ def get_default_data_dir() -> Path:
     """
     env_path = os.getenv("JOINMARKET_DATA_DIR")
     data_dir = Path(env_path) if env_path else Path.home() / ".joinmarket-ng"
+    ensure_sensitive_directory(data_dir)
 
-    data_dir.mkdir(parents=True, exist_ok=True)
     return data_dir
 
 
@@ -106,7 +112,7 @@ def get_nick_state_path(data_dir: Path | str | None = None, component: str = "")
 
     # Use state/ subdirectory to keep state files organized
     state_dir = data_dir / "state"
-    state_dir.mkdir(parents=True, exist_ok=True)
+    ensure_sensitive_directory(state_dir)
 
     return state_dir / f"{component}.nick"
 
@@ -126,7 +132,7 @@ def write_nick_state(data_dir: Path | str | None, component: str, nick: str) -> 
         Path to the written state file
     """
     path = get_nick_state_path(data_dir, component)
-    path.write_text(nick + "\n")
+    atomic_write_sensitive_file(path, (nick + "\n").encode("utf-8"))
     return path
 
 
@@ -149,7 +155,7 @@ def read_nick_state(data_dir: Path | str | None, component: str) -> str | None:
     path = get_nick_state_path(data_dir, component)
     if path.exists():
         try:
-            return path.read_text().strip()
+            return read_sensitive_file(path).decode("utf-8").strip()
         except OSError:
             return None
     return None
@@ -259,7 +265,7 @@ def get_all_nick_states(data_dir: Path | str | None = None) -> dict[str, str]:
     for path in state_dir.glob("*.nick"):
         component = path.stem  # e.g., 'maker' from 'maker.nick'
         try:
-            nick = path.read_text().strip()
+            nick = read_sensitive_file(path).decode("utf-8").strip()
             if nick:
                 result[component] = nick
         except OSError:

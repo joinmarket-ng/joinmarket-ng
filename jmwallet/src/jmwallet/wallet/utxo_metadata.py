@@ -44,6 +44,11 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from jmcore.secure_files import (
+    atomic_write_sensitive_file,
+    ensure_sensitive_directory,
+    read_sensitive_file,
+)
 from loguru import logger
 
 try:
@@ -409,7 +414,7 @@ class UTXOMetadataStore:
             return
 
         try:
-            text = self.path.read_text(encoding="utf-8")
+            text = read_sensitive_file(self.path).decode("utf-8")
         except OSError as e:
             logger.error(f"Failed to read wallet metadata: {e}")
             return
@@ -485,8 +490,6 @@ class UTXOMetadataStore:
         Raises:
             OSError: If the file cannot be written (e.g., read-only filesystem).
         """
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-
         # Filter out output records that carry no useful metadata
         outputs_to_write = [r for r in self.records.values() if r.has_metadata]
         outputs_to_write.sort(key=lambda r: r.ref)
@@ -504,7 +507,7 @@ class UTXOMetadataStore:
         ):
             if self.path.exists():
                 try:
-                    self.path.unlink()
+                    self.path.resolve(strict=True).unlink()
                     logger.debug("Removed empty wallet metadata file")
                 except OSError as e:
                     logger.warning(f"Failed to remove empty metadata file: {e}")
@@ -531,16 +534,10 @@ class UTXOMetadataStore:
         ):
             lines.append(json.dumps(foreign, separators=(",", ":")))
 
-        tmp_path = self.path.with_suffix(".tmp")
         try:
-            tmp_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-            tmp_path.replace(self.path)
+            atomic_write_sensitive_file(self.path, ("\n".join(lines) + "\n").encode("utf-8"))
         except OSError as e:
             logger.error(f"Failed to save wallet metadata: {e}")
-            try:
-                tmp_path.unlink(missing_ok=True)
-            except OSError:
-                pass
             raise
 
     def is_frozen(self, outpoint: str) -> bool:
@@ -757,7 +754,7 @@ class UTXOMetadataStore:
         if fcntl is None and msvcrt is None:  # pragma: no cover - unknown platform
             yield
             return
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_sensitive_directory(self.path.parent)
         with open(self._flock_path, "a+b") as handle:
             if fcntl is not None:
                 fcntl.flock(handle, fcntl.LOCK_EX)
@@ -1220,7 +1217,7 @@ class UTXOMetadataStore:
             OSError: If the directory is not writable.
         """
         parent = self.path.parent
-        parent.mkdir(parents=True, exist_ok=True)
+        ensure_sensitive_directory(parent)
         # Try creating a temp file in the target directory
         try:
             fd = tempfile.NamedTemporaryFile(dir=parent, prefix=".jm_write_test_", delete=True)
@@ -1305,7 +1302,7 @@ def _migrate_shared_metadata(
         owned = {addr for addr in owned_addresses if addr}
 
     try:
-        text = shared_path.read_text(encoding="utf-8")
+        text = read_sensitive_file(shared_path).decode("utf-8")
     except OSError as exc:
         logger.warning(
             f"Could not read legacy shared metadata {shared_path} for "
@@ -1362,8 +1359,10 @@ def _migrate_shared_metadata(
         return
 
     try:
-        per_wallet_path.parent.mkdir(parents=True, exist_ok=True)
-        per_wallet_path.write_text("\n".join(kept_lines) + "\n", encoding="utf-8")
+        atomic_write_sensitive_file(
+            per_wallet_path,
+            ("\n".join(kept_lines) + "\n").encode("utf-8"),
+        )
     except OSError as exc:
         logger.warning(f"Could not write migrated metadata to {per_wallet_path}: {exc}")
         return

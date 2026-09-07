@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import os
 from pathlib import Path
 
@@ -9,9 +10,13 @@ import pytest
 
 from jmcore.secure_files import (
     atomic_write_private,
+    atomic_write_sensitive_file,
     ensure_private_directory,
     ensure_private_file,
+    ensure_sensitive_directory,
+    ensure_sensitive_file,
     read_private_file,
+    read_sensitive_file,
 )
 
 
@@ -195,3 +200,58 @@ def test_atomic_write_private_replaces_symlink_without_following_it(tmp_path: Pa
     assert link.read_bytes() == b"new secret"
     assert target.read_bytes() == b"do not overwrite"
     assert _mode(link) == 0o600
+
+
+def test_read_sensitive_file_follows_alias_and_tightens_target(tmp_path: Path) -> None:
+    target = tmp_path / "configured.toml"
+    target.write_bytes(b"secret")
+    target.chmod(0o644)
+    link = tmp_path / "config.toml"
+    link.symlink_to(target)
+
+    assert read_sensitive_file(link) == b"secret"
+    ensure_sensitive_file(link)
+
+    assert link.is_symlink()
+    assert _mode(target) == 0o600
+
+
+def test_read_sensitive_file_allows_read_when_tightening_is_denied(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sensitive = tmp_path / "configured.toml"
+    sensitive.write_bytes(b"admin-managed")
+
+    def deny_tightening(_fd: int, _mode: int) -> None:
+        raise OSError(errno.EPERM, "operation not permitted")
+
+    monkeypatch.setattr(os, "fchmod", deny_tightening)
+
+    assert read_sensitive_file(sensitive) == b"admin-managed"
+
+
+def test_atomic_write_sensitive_file_preserves_alias(tmp_path: Path) -> None:
+    target = tmp_path / "configured.toml"
+    target.write_bytes(b"old")
+    link = tmp_path / "config.toml"
+    link.symlink_to(target)
+
+    atomic_write_sensitive_file(link, b"new")
+
+    assert link.is_symlink()
+    assert target.read_bytes() == b"new"
+    assert _mode(target) == 0o600
+
+
+def test_ensure_sensitive_directory_preserves_existing_alias_mode(tmp_path: Path) -> None:
+    target = tmp_path / "shared-data"
+    target.mkdir()
+    target.chmod(0o755)
+    link = tmp_path / "data"
+    link.symlink_to(target, target_is_directory=True)
+
+    ensure_sensitive_directory(link)
+
+    assert link.is_symlink()
+    assert _mode(target) == 0o755

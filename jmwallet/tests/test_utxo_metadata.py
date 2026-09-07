@@ -13,6 +13,8 @@ Tests cover:
 from __future__ import annotations
 
 import json
+import os
+import stat
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
@@ -194,6 +196,79 @@ class TestUTXOMetadataStore:
         """Loading with no file on disk results in empty store."""
         store.load()
         assert len(store.records) == 0
+        assert not store.path.exists()
+
+    def test_save_is_private_despite_permissive_umask(self, store, outpoint_a):
+        """Metadata writes never expose a permissively-mode final file."""
+        previous_umask = os.umask(0o022)
+        try:
+            store.freeze(outpoint_a)
+        finally:
+            os.umask(previous_umask)
+
+        assert stat.S_IMODE(store.path.stat().st_mode) == 0o600
+
+    def test_load_tightens_existing_file_without_changing_content(self, store_path):
+        """Loading legacy metadata upgrades only the file permissions."""
+        original = b'{"type":"output","ref":"aa:0","spendable":false}\n'
+        store_path.write_bytes(original)
+        store_path.chmod(0o644)
+
+        UTXOMetadataStore(path=store_path).load()
+
+        assert store_path.read_bytes() == original
+        assert stat.S_IMODE(store_path.stat().st_mode) == 0o600
+
+    def test_metadata_alias_loads_and_saves_without_replacement(self, tmp_path):
+        """Configured aliases retain all metadata while updates land at the target."""
+        target = tmp_path / "managed-metadata.jsonl"
+        target.write_text(
+            '{"type":"output","ref":"aa:0","spendable":false}\n'
+            '{"type":"addr","ref":"bcrt1qused","label":"jm:used:deposit"}\n'
+            '{"type":"addr","ref":"bcrt1qreserved","label":"jm:reserved:Alice"}\n'
+            '{"type":"tx","ref":"deadbeef","label":"external"}\n',
+            encoding="utf-8",
+        )
+        target.chmod(0o644)
+        alias = tmp_path / "wallet_metadata.jsonl"
+        alias.symlink_to(target)
+
+        store = UTXOMetadataStore(path=alias)
+        store.load()
+
+        assert store.is_frozen("aa:0")
+        assert store.get_used_addresses() == {"bcrt1qused"}
+        assert store.get_reserved_labels() == {"bcrt1qreserved": "Alice"}
+        assert store.foreign_addr_lines == [{"type": "tx", "ref": "deadbeef", "label": "external"}]
+        assert stat.S_IMODE(target.stat().st_mode) == 0o600
+
+        store.set_label("aa:0", "keep")
+        reloaded = UTXOMetadataStore(path=alias)
+        reloaded.load()
+
+        assert alias.is_symlink()
+        assert reloaded.is_frozen("aa:0")
+        assert reloaded.get_label("aa:0") == "keep"
+        assert reloaded.get_used_addresses() == {"bcrt1qused"}
+        assert reloaded.get_reserved_labels() == {"bcrt1qreserved": "Alice"}
+        assert reloaded.foreign_addr_lines == [
+            {"type": "tx", "ref": "deadbeef", "label": "external"}
+        ]
+
+    def test_metadata_load_survives_denied_permission_tightening(self, tmp_path, monkeypatch):
+        """An admin-managed readable file must not be treated as missing metadata."""
+        path = tmp_path / "wallet_metadata.jsonl"
+        path.write_text('{"type":"output","ref":"aa:0","spendable":false}\n')
+
+        def deny_tightening(_fd: int, _mode: int) -> None:
+            raise OSError(1, "operation not permitted")
+
+        monkeypatch.setattr("jmcore.secure_files.os.fchmod", deny_tightening)
+
+        store = UTXOMetadataStore(path=path)
+        store.load()
+
+        assert store.is_frozen("aa:0")
 
     def test_save_and_load_roundtrip(self, store, outpoint_a):
         """Save records and load them back."""
@@ -753,6 +828,7 @@ class TestMarkAddressUsed:
         s2 = UTXOMetadataStore(path=path)
         s2.load()
         assert s2.foreign_addr_lines == [foreign]
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
 class TestReservedAddresses:
@@ -1207,6 +1283,28 @@ class TestPerWalletPartitioning:
 
         assert shared.exists()
         assert shared.read_text(encoding="utf-8") == original
+
+    def test_migration_writes_private_output_and_preserves_foreign_records(self, tmp_path):
+        """Migrated records retain their bytes while the output is owner-only."""
+        shared = tmp_path / "wallet_metadata.jsonl"
+        output = '{"type":"output","ref":"aa:0","spendable":false}'
+        foreign = '{"type":"tx","ref":"deadbeef","label":"external"}'
+        original = (output + "\n" + foreign + "\n").encode("utf-8")
+        shared.write_bytes(original)
+        shared.chmod(0o644)
+
+        previous_umask = os.umask(0o022)
+        try:
+            store = load_metadata_store(tmp_path, fingerprint=self.FP_A, owned_addresses=set())
+        finally:
+            os.umask(previous_umask)
+
+        migrated = tmp_path / f"wallet_metadata_{self.FP_A}.jsonl"
+        assert migrated.read_bytes() == original
+        assert stat.S_IMODE(migrated.stat().st_mode) == 0o600
+        assert shared.read_bytes() == original
+        assert stat.S_IMODE(shared.stat().st_mode) == 0o600
+        assert store.foreign_addr_lines == [json.loads(foreign)]
 
     def test_migration_without_owned_addresses_skips_all_addr(self, tmp_path):
         """When the caller cannot supply ownership info, no addr records leak.

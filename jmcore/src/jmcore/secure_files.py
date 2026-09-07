@@ -2,33 +2,58 @@
 
 from __future__ import annotations
 
+import errno
+import logging
 import os
 import stat
 import tempfile
 from contextlib import suppress
 from pathlib import Path
 
+logger = logging.getLogger(__name__)
 
-def _open_private_regular_file(path: Path) -> int:
-    """Open a regular file without following its final symlink component."""
-    if path.is_symlink():
+
+def _open_regular_file(
+    path: Path,
+    *,
+    follow_final_symlink: bool,
+    allow_unchanged_mode: bool,
+) -> int:
+    """Open and tighten a regular file, optionally following a configured alias."""
+    if not follow_final_symlink and path.is_symlink():
         raise OSError(f"refusing to use symlink as private file: {path}")
 
-    flags = (
-        os.O_RDONLY
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-        | getattr(os, "O_NONBLOCK", 0)
-    )
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
+    if not follow_final_symlink:
+        flags |= getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(path, flags)
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
-            raise OSError(f"private file does not exist or is not regular: {path}")
-        os.fchmod(fd, 0o600)
+            kind = "sensitive" if follow_final_symlink else "private"
+            raise OSError(f"{kind} file does not exist or is not regular: {path}")
+        try:
+            os.fchmod(fd, 0o600)
+        except OSError as exc:
+            if not allow_unchanged_mode or exc.errno not in {
+                errno.EACCES,
+                errno.EPERM,
+                errno.EROFS,
+            }:
+                raise
+            logger.warning("Could not tighten sensitive file permissions")
         return fd
     except Exception:
         os.close(fd)
         raise
+
+
+def _open_private_regular_file(path: Path) -> int:
+    """Open a regular file without following its final symlink component."""
+    return _open_regular_file(
+        path,
+        follow_final_symlink=False,
+        allow_unchanged_mode=False,
+    )
 
 
 def _tighten_private_directory(path: Path) -> None:
@@ -84,6 +109,34 @@ def read_private_file(path: Path) -> bytes:
         return private_file.read()
 
 
+def ensure_sensitive_directory(path: Path) -> None:
+    """Create a missing application directory privately without changing an existing one."""
+    resolved_path = path.resolve(strict=False)
+    if not resolved_path.exists():
+        ensure_private_directory(resolved_path)
+
+
+def ensure_sensitive_file(path: Path) -> None:
+    """Best-effort tighten a regular config or metadata file, following aliases."""
+    fd = _open_regular_file(
+        path,
+        follow_final_symlink=True,
+        allow_unchanged_mode=True,
+    )
+    os.close(fd)
+
+
+def read_sensitive_file(path: Path) -> bytes:
+    """Read a regular config or metadata file, following aliases when configured."""
+    fd = _open_regular_file(
+        path,
+        follow_final_symlink=True,
+        allow_unchanged_mode=True,
+    )
+    with os.fdopen(fd, "rb") as sensitive_file:
+        return sensitive_file.read()
+
+
 def atomic_write_private(path: Path, data: bytes) -> None:
     """Atomically write bytes without exposing a permissively-mode temporary file."""
     _reject_parent_traversal(path)
@@ -112,3 +165,8 @@ def atomic_write_private(path: Path, data: bytes) -> None:
             os.close(fd)
         with suppress(FileNotFoundError):
             temp_path.unlink()
+
+
+def atomic_write_sensitive_file(path: Path, data: bytes) -> None:
+    """Atomically update a sensitive file while preserving configured aliases."""
+    atomic_write_private(path.resolve(strict=False), data)

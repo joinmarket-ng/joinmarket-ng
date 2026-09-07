@@ -4,6 +4,8 @@ Tests for the unified settings module.
 
 from __future__ import annotations
 
+import os
+import stat
 from collections.abc import Generator
 from pathlib import Path
 
@@ -132,24 +134,54 @@ class TestConfigTemplate:
         config_path = temp_data_dir / "config.toml"
         assert not config_path.exists()
 
-        result = ensure_config_file(temp_data_dir)
+        previous_umask = os.umask(0o022)
+        try:
+            result = ensure_config_file(temp_data_dir)
+        finally:
+            os.umask(previous_umask)
 
         assert result == config_path
         assert config_path.exists()
         content = config_path.read_text()
         assert "# JoinMarket" in content
         assert "[tor]" in content
+        assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
+        assert stat.S_IMODE((temp_data_dir / "config.toml.template").stat().st_mode) == 0o600
 
     def test_ensure_config_file_does_not_overwrite(self, temp_data_dir: Path) -> None:
         """Test that ensure_config_file does not overwrite existing file."""
         config_path = temp_data_dir / "config.toml"
-        config_path.write_text("# Custom config\ntor.socks_host = 'custom'\n")
+        original = b"# Custom config\ntor.socks_host = 'custom'\n"
+        config_path.write_bytes(original)
+        config_path.chmod(0o644)
 
         ensure_config_file(temp_data_dir)
 
-        content = config_path.read_text()
-        assert "# Custom config" in content
-        assert "custom" in content
+        assert config_path.read_bytes() == original
+        assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
+
+    def test_loading_config_tightens_legacy_mode(self, temp_data_dir: Path) -> None:
+        """Reading a legacy config upgrades its mode without rewriting it."""
+        config_path = temp_data_dir / "config.toml"
+        original = b"[tor]\nsocks_port = 9150\n"
+        config_path.write_bytes(original)
+        config_path.chmod(0o644)
+
+        assert JoinMarketSettings().tor.socks_port == 9150
+        assert config_path.read_bytes() == original
+        assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
+
+    def test_loading_config_follows_configured_alias(self, temp_data_dir: Path) -> None:
+        """An administrator-configured config alias remains readable and intact."""
+        target = temp_data_dir.parent / "managed-config.toml"
+        target.write_text("[tor]\nsocks_port = 9150\n")
+        target.chmod(0o644)
+        config_path = temp_data_dir / "config.toml"
+        config_path.symlink_to(target)
+
+        assert JoinMarketSettings().tor.socks_port == 9150
+        assert config_path.is_symlink()
+        assert stat.S_IMODE(target.stat().st_mode) == 0o600
 
 
 class TestSettingsDefaults:
@@ -1430,6 +1462,8 @@ class TestEnsureConfigFile:
         data_dir = tmp_path / "data"
         data_dir.mkdir()
         config_file = tmp_path / "etc" / "joinmarket" / "config.toml"
+        config_file.parent.mkdir(parents=True)
+        config_file.parent.chmod(0o755)
 
         result = ensure_config_file(data_dir, config_file=config_file)
 
@@ -1438,6 +1472,7 @@ class TestEnsureConfigFile:
         assert "[tor]" in config_file.read_text()
         # The data dir must NOT get its own config.toml.
         assert not (data_dir / "config.toml").exists()
+        assert stat.S_IMODE(config_file.parent.stat().st_mode) == 0o755
 
     def test_config_file_env_var_decouples_from_data_dir(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

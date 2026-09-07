@@ -4,6 +4,8 @@ Tests for jmcore.paths module - nick state file management.
 
 from __future__ import annotations
 
+import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -106,6 +108,73 @@ class TestNickStateFiles:
         assert state_dir.exists()
         assert state_dir.is_dir()
 
+    def test_nick_state_is_private_despite_permissive_umask(self, tmp_path: Path) -> None:
+        """New nick state and its application-owned directory are owner-only."""
+        previous_umask = os.umask(0o022)
+        try:
+            path = write_nick_state(tmp_path, "maker", "J5ABCDEFGHI")
+        finally:
+            os.umask(previous_umask)
+
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+
+    def test_read_tightens_existing_nick_state_without_changing_content(
+        self, tmp_path: Path
+    ) -> None:
+        """Legacy nick state permissions are upgraded when the file is read."""
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        path = state_dir / "maker.nick"
+        original = b"J5ABCDEFGHI\n"
+        path.write_bytes(original)
+        path.chmod(0o644)
+
+        assert read_nick_state(tmp_path, "maker") == "J5ABCDEFGHI"
+        assert path.read_bytes() == original
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+    def test_write_does_not_tighten_custom_data_parent(self, tmp_path: Path) -> None:
+        """Only the application-owned state directory is tightened."""
+        data_dir = tmp_path / "shared-data"
+        data_dir.mkdir()
+        data_dir.chmod(0o755)
+
+        write_nick_state(data_dir, "maker", "J5ABCDEFGHI")
+
+        assert stat.S_IMODE(data_dir.stat().st_mode) == 0o755
+
+    def test_state_directory_alias_preserves_target_mode(self, tmp_path: Path) -> None:
+        """A configured state directory alias remains intact while its nick is updated."""
+        state_target = tmp_path / "shared-state"
+        state_target.mkdir()
+        state_target.chmod(0o755)
+        state_alias = tmp_path / "state"
+        state_alias.symlink_to(state_target, target_is_directory=True)
+
+        path = write_nick_state(tmp_path, "maker", "J5ABCDEFGHI")
+
+        assert path == state_alias / "maker.nick"
+        assert state_alias.is_symlink()
+        assert (state_target / "maker.nick").read_text() == "J5ABCDEFGHI\n"
+        assert stat.S_IMODE(state_target.stat().st_mode) == 0o755
+
+    def test_nick_alias_is_read_and_updated_without_replacement(self, tmp_path: Path) -> None:
+        """A configured nick alias is read and atomically updated at its target."""
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        target = tmp_path / "maker.nick.target"
+        target.write_text("J5OLDNICK\n")
+        nick_alias = state_dir / "maker.nick"
+        nick_alias.symlink_to(target)
+
+        assert read_nick_state(tmp_path, "maker") == "J5OLDNICK"
+        write_nick_state(tmp_path, "maker", "J5NEWNICK")
+
+        assert nick_alias.is_symlink()
+        assert target.read_text() == "J5NEWNICK\n"
+        assert stat.S_IMODE(target.stat().st_mode) == 0o600
+
     def test_read_strips_whitespace(self, tmp_path: Path) -> None:
         """Test that reading strips whitespace from nick."""
         # Manually create file with extra whitespace
@@ -183,14 +252,17 @@ class TestNickStateDefaultDataDir:
 class TestPathUtilities:
     """Tests for path utility functions."""
 
-    def test_get_default_data_dir(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_get_default_data_dir(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Test get_default_data_dir with JOINMARKET_DATA_DIR env var."""
-        from unittest.mock import patch
+        data_dir = tmp_path / "jm-test-data"
+        data_dir.mkdir()
+        data_dir.chmod(0o755)
+        monkeypatch.setenv("JOINMARKET_DATA_DIR", str(data_dir))
 
-        monkeypatch.setenv("JOINMARKET_DATA_DIR", "/tmp/jm-test-data")
-        with patch("pathlib.Path.mkdir"):
-            result = get_default_data_dir()
-            assert result == Path("/tmp/jm-test-data")
+        result = get_default_data_dir()
+
+        assert result == data_dir
+        assert stat.S_IMODE(data_dir.stat().st_mode) == 0o755
 
     def test_get_default_data_dir_no_env(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -202,6 +274,25 @@ class TestPathUtilities:
         with patch("pathlib.Path.home", return_value=tmp_path):
             result = get_default_data_dir()
             assert result == tmp_path / ".joinmarket-ng"
+            assert stat.S_IMODE(result.stat().st_mode) == 0o700
+
+    def test_get_default_data_dir_preserves_existing_alias(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """An existing default data-directory alias remains usable and unchanged."""
+        monkeypatch.delenv("JOINMARKET_DATA_DIR", raising=False)
+        target = tmp_path / "shared-data"
+        target.mkdir()
+        target.chmod(0o755)
+        alias = tmp_path / ".joinmarket-ng"
+        alias.symlink_to(target, target_is_directory=True)
+        from unittest.mock import patch
+
+        with patch("pathlib.Path.home", return_value=tmp_path):
+            assert get_default_data_dir() == alias
+
+        assert alias.is_symlink()
+        assert stat.S_IMODE(target.stat().st_mode) == 0o755
 
     def test_get_commitment_blacklist_path(self, tmp_path: Path) -> None:
         """Test get_commitment_blacklist_path with explicit data_dir."""
