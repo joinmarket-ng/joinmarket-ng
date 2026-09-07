@@ -7,9 +7,10 @@ import asyncio
 import pytest
 from jmcore.models import MessageEnvelope, NetworkType, PeerInfo, PeerStatus
 from jmcore.protocol import MessageType
+from jmcore.rate_limiter import TokenBucket
 from loguru import logger
 
-from directory_server.message_router import MessageRouter
+from directory_server.message_router import _MAX_OFFERS_PER_OWNER, MessageRouter
 from directory_server.peer_registry import PeerRegistry
 
 
@@ -791,6 +792,171 @@ class TestOfferTracking:
         stats = router.get_offer_stats()
         assert stats["total_offers"] == 0
         assert stats["peers_with_offers"] == 0
+
+
+class TestPublicRoutingLimits:
+    @pytest.mark.anyio
+    async def test_public_ingress_and_fanout_budgets_drop_before_send(self, registry, sample_peers):
+        sent_messages: list[tuple[str, bytes]] = []
+
+        async def record_send(peer_key: str, data: bytes, connection_id: str | None) -> None:
+            sent_messages.append((peer_key, data))
+
+        sender = sample_peers[0]
+        sender_connection_id = registry.get_connection_id(sender.nick)
+        assert sender_connection_id is not None
+        router = MessageRouter(peer_registry=registry, send_callback=record_send)
+        envelope = MessageEnvelope(
+            message_type=MessageType.PUBMSG,
+            payload=f"{sender.nick}!PUBLIC!bounded broadcast",
+        )
+        serialized_size = len(envelope.to_bytes())
+        recipient_count = len(sample_peers) - 1
+        owner = (sender.nick, sender_connection_id)
+
+        router._public_ingress_buckets[owner] = TokenBucket(
+            capacity=serialized_size - 1,
+            refill_rate=0.0,
+        )
+        await router.route_message(envelope, *owner)
+        assert sent_messages == []
+
+        router._public_ingress_buckets[owner] = TokenBucket(
+            capacity=serialized_size,
+            refill_rate=0.0,
+        )
+        router._public_outgoing_bucket = TokenBucket(
+            capacity=serialized_size * recipient_count - 1,
+            refill_rate=0.0,
+        )
+        await router.route_message(envelope, *owner)
+        assert sent_messages == []
+
+        router._public_ingress_buckets[owner] = TokenBucket(
+            capacity=serialized_size,
+            refill_rate=0.0,
+        )
+        router._public_outgoing_bucket = TokenBucket(
+            capacity=serialized_size * recipient_count,
+            refill_rate=0.0,
+        )
+        await router.route_message(envelope, *owner)
+
+        assert [peer_key for peer_key, _data in sent_messages] == [
+            peer.nick for peer in sample_peers[1:]
+        ]
+
+    @pytest.mark.anyio
+    async def test_private_messages_bypass_public_byte_budgets(self, registry, sample_peers):
+        sent_messages: list[MessageType] = []
+
+        async def record_send(peer_key: str, data: bytes, connection_id: str | None) -> None:
+            sent_messages.append(MessageEnvelope.from_bytes(data).message_type)
+
+        sender = sample_peers[0]
+        recipient = sample_peers[1]
+        sender_connection_id = registry.get_connection_id(sender.nick)
+        assert sender_connection_id is not None
+        router = MessageRouter(peer_registry=registry, send_callback=record_send)
+        router._public_ingress_buckets[(sender.nick, sender_connection_id)] = TokenBucket(
+            capacity=0,
+            refill_rate=0.0,
+        )
+        router._public_outgoing_bucket = TokenBucket(capacity=0, refill_rate=0.0)
+
+        await router.route_message(
+            MessageEnvelope(
+                message_type=MessageType.PRIVMSG,
+                payload=f"{sender.nick}!{recipient.nick}!fill payload pubkey signature",
+            ),
+            sender.nick,
+            sender_connection_id,
+        )
+
+        assert sent_messages == [MessageType.PRIVMSG, MessageType.PEERLIST]
+
+    @pytest.mark.anyio
+    async def test_offer_limits_preserve_updates_cancels_and_current_generation(self, registry):
+        sent_messages: list[tuple[str, bytes]] = []
+
+        async def record_send(peer_key: str, data: bytes, connection_id: str | None) -> None:
+            sent_messages.append((peer_key, data))
+
+        maker = PeerInfo(
+            nick="maker",
+            onion_address="a" * 56 + ".onion",
+            port=5222,
+            network=NetworkType.MAINNET,
+            status=PeerStatus.HANDSHAKED,
+        )
+        observer = PeerInfo(
+            nick="observer",
+            onion_address="b" * 56 + ".onion",
+            port=5222,
+            network=NetworkType.MAINNET,
+            status=PeerStatus.HANDSHAKED,
+        )
+        maker_key = registry.register(maker, "old").peer_key
+        registry.register(observer, "observer-connection")
+        router = MessageRouter(peer_registry=registry, send_callback=record_send)
+
+        async def publish(order_id: str) -> None:
+            await router.route_message(
+                MessageEnvelope(
+                    message_type=MessageType.PUBMSG,
+                    payload=f"{maker.nick}!PUBLIC!sw0absoffer {order_id} 30000 72590 0 1000",
+                ),
+                maker_key,
+                "old",
+            )
+
+        await publish("x" * 65)
+        assert sent_messages == []
+        assert router.get_offer_stats()["total_offers"] == 0
+
+        for order_id in range(_MAX_OFFERS_PER_OWNER):
+            await publish(str(order_id))
+        assert router.get_offer_stats()["total_offers"] == _MAX_OFFERS_PER_OWNER
+
+        sent_messages.clear()
+        await publish(str(_MAX_OFFERS_PER_OWNER))
+        assert sent_messages == []
+        assert router.get_offer_stats()["total_offers"] == _MAX_OFFERS_PER_OWNER
+
+        await publish("0")
+        assert [peer_key for peer_key, _data in sent_messages] == [observer.nick]
+
+        sent_messages.clear()
+        await router.route_message(
+            MessageEnvelope(
+                message_type=MessageType.PUBMSG,
+                payload=f"{maker.nick}!PUBLIC!cancel 0",
+            ),
+            maker_key,
+            "old",
+        )
+        assert router.get_offer_stats()["total_offers"] == _MAX_OFFERS_PER_OWNER - 1
+
+        sent_messages.clear()
+        await publish(str(_MAX_OFFERS_PER_OWNER))
+        assert [peer_key for peer_key, _data in sent_messages] == [observer.nick]
+        assert router.get_offer_stats()["total_offers"] == _MAX_OFFERS_PER_OWNER
+
+        replacement = maker.model_copy(deep=True)
+        registry.register(replacement, "new", verified_pubkey=b"maker-key")
+        router._peer_offers[(maker_key, "new")] = {"replacement-offer"}
+        router._public_ingress_buckets[(maker_key, "new")] = TokenBucket(
+            capacity=1,
+            refill_rate=0.0,
+        )
+
+        router.remove_peer_offers(maker_key, "old")
+
+        assert (maker_key, "old") not in router._peer_offers
+        assert (maker_key, "old") not in router._public_ingress_buckets
+        assert (maker_key, "old") not in router._public_drop_counts
+        assert router._peer_offers[(maker_key, "new")] == {"replacement-offer"}
+        assert (maker_key, "new") in router._public_ingress_buckets
 
 
 class TestChunkedPeerlist:

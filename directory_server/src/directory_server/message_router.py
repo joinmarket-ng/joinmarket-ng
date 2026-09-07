@@ -10,6 +10,7 @@ from collections.abc import Awaitable, Callable, Iterator
 
 from jmcore.models import MessageEnvelope, NetworkType, PeerInfo, PeerStatus
 from jmcore.protocol import FeatureSet, MessageType, create_peerlist_entry, parse_jm_message
+from jmcore.rate_limiter import TokenBucket
 from loguru import logger
 
 from directory_server.peer_registry import PeerRegistry
@@ -22,6 +23,12 @@ BroadcastTarget = tuple[str, str | None] | tuple[str, str | None, str]
 # Default batch size for concurrent broadcasts to limit memory usage
 # This can be overridden via Settings.broadcast_batch_size
 DEFAULT_BROADCAST_BATCH_SIZE = 50
+_PUBLIC_INGRESS_BYTES_PER_SEC = 32 * 1024
+_PUBLIC_INGRESS_BURST_BYTES = 256 * 1024
+_PUBLIC_OUTGOING_BYTES_PER_SEC = 16 * 1024 * 1024
+_PUBLIC_OUTGOING_BURST_BYTES = 64 * 1024 * 1024
+_MAX_OFFERS_PER_OWNER = 256
+_MAX_OFFER_ID_LENGTH = 64
 
 
 class MessageRouter:
@@ -40,6 +47,13 @@ class MessageRouter:
         self.on_pong = on_pong
         # Offers belong to a connection generation, not just a reusable peer key.
         self._peer_offers: dict[tuple[str, str], set[str]] = {}
+        self._public_ingress_buckets: dict[tuple[str, str], TokenBucket] = {}
+        self._public_drop_counts: dict[tuple[str, str], int] = {}
+        self._public_outgoing_bucket = TokenBucket(
+            capacity=_PUBLIC_OUTGOING_BURST_BYTES,
+            refill_rate=float(_PUBLIC_OUTGOING_BYTES_PER_SEC),
+        )
+        self._public_outgoing_drop_count = 0
 
     async def route_message(
         self,
@@ -105,6 +119,11 @@ class MessageRouter:
             )
             return
 
+        envelope_bytes = envelope.to_bytes()
+        offer_owner = (from_key, connection_id)
+        if not self._consume_public_ingress(offer_owner, len(envelope_bytes)):
+            return
+
         # Track offers (absorder, absoffer, reloffer, relorder)
         if rest:
             message_parts = rest.split()
@@ -126,13 +145,19 @@ class MessageRouter:
                 # Extract order ID (second field in offer messages)
                 try:
                     order_id = message_parts[1]
-                    offer_owner = (from_key, connection_id)
-                    if offer_owner not in self._peer_offers:
-                        self._peer_offers[offer_owner] = set()
-                    self._peer_offers[offer_owner].add(order_id)
+                    if len(order_id) > _MAX_OFFER_ID_LENGTH:
+                        self._record_public_drop(offer_owner, "oversized order ID")
+                        return
+                    offers = self._peer_offers.get(offer_owner)
+                    if offers is None:
+                        offers = set()
+                        self._peer_offers[offer_owner] = offers
+                    if order_id not in offers and len(offers) >= _MAX_OFFERS_PER_OWNER:
+                        self._record_public_drop(offer_owner, "offer capacity exhausted")
+                        return
+                    offers.add(order_id)
                     logger.bind(sensitive=True).trace(
-                        f"Tracked offer {order_id} from {from_nick} "
-                        f"(total offers: {len(self._peer_offers[offer_owner])})"
+                        f"Tracked offer {order_id} from {from_nick} (total offers: {len(offers)})"
                     )
                 except (ValueError, IndexError):
                     pass
@@ -152,8 +177,15 @@ class MessageRouter:
                     f"Removed canceled offer {message_parts[1]} from {from_nick}"
                 )
 
-        # Pre-serialize envelope once instead of per-peer
-        envelope_bytes = envelope.to_bytes()
+        recipient_count = sum(
+            1
+            for peer_key, _peer, _target_connection_id in self.peer_registry.iter_connected_owners(
+                from_peer.network
+            )
+            if peer_key != from_key
+        )
+        if not self._consume_public_outgoing(len(envelope_bytes), recipient_count):
+            return
 
         # Use generator to avoid building full target list in memory
         def target_generator() -> Iterator[BroadcastTarget]:
@@ -169,6 +201,38 @@ class MessageRouter:
         logger.bind(sensitive=True).trace(
             f"Broadcasted public message from {from_nick} to {sent_count} peers"
         )
+
+    def _consume_public_ingress(self, owner: tuple[str, str], byte_count: int) -> bool:
+        bucket = self._public_ingress_buckets.get(owner)
+        if bucket is None:
+            bucket = TokenBucket(
+                capacity=_PUBLIC_INGRESS_BURST_BYTES,
+                refill_rate=float(_PUBLIC_INGRESS_BYTES_PER_SEC),
+            )
+            self._public_ingress_buckets[owner] = bucket
+        if bucket.consume(byte_count):
+            return True
+
+        self._record_public_drop(owner, "rate-limited")
+
+        return False
+
+    def _record_public_drop(self, owner: tuple[str, str], reason: str) -> None:
+        drop_count = self._public_drop_counts.get(owner, 0) + 1
+        self._public_drop_counts[owner] = drop_count
+        if drop_count % 50 == 1:
+            logger.bind(sensitive=True).debug(f"Dropping {reason} public message from {owner[0]}")
+
+    def _consume_public_outgoing(self, message_size: int, recipient_count: int) -> bool:
+        if recipient_count == 0:
+            return True
+        if self._public_outgoing_bucket.consume(message_size * recipient_count):
+            return True
+
+        self._public_outgoing_drop_count += 1
+        if self._public_outgoing_drop_count % 50 == 1:
+            logger.debug("Dropping public broadcast because outgoing capacity is exhausted")
+        return False
 
     async def _safe_send(
         self,
@@ -577,12 +641,18 @@ class MessageRouter:
         }
 
     def remove_peer_offers(self, peer_key: str, expected_connection_id: str | None = None) -> None:
-        """Remove offer tracking for a disconnected peer."""
+        """Remove public routing state for a disconnected peer generation."""
         if expected_connection_id is None:
             for owner in [owner for owner in self._peer_offers if owner[0] == peer_key]:
                 self._peer_offers.pop(owner, None)
+            for owner in [owner for owner in self._public_ingress_buckets if owner[0] == peer_key]:
+                self._public_ingress_buckets.pop(owner, None)
+                self._public_drop_counts.pop(owner, None)
             return
-        self._peer_offers.pop((peer_key, expected_connection_id), None)
+        owner = (peer_key, expected_connection_id)
+        self._peer_offers.pop(owner, None)
+        self._public_ingress_buckets.pop(owner, None)
+        self._public_drop_counts.pop(owner, None)
 
     async def _call_send(
         self, peer_key: str, data: bytes, expected_connection_id: str | None
