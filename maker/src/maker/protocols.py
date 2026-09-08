@@ -72,7 +72,8 @@ class MakerBotProtocol(Protocol):
     _message_rate_limiter: RateLimiter
     _orderbook_rate_limiter: OrderbookRateLimiter
     _direct_connection_rate_limiter: DirectConnectionRateLimiter
-    _orderbook_proof_work_limiter: ProcessWideTokenBucket
+    _directory_orderbook_response_limiter: ProcessWideTokenBucket
+    _direct_orderbook_response_limiter: ProcessWideTokenBucket
     _orderbook_response_counts: dict[str, int]
     _hp2_admission_limiter: ProcessWideTokenBucket
     _hp2_relay_work_limiter: ProcessWideTokenBucket

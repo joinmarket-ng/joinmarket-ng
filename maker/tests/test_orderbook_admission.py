@@ -12,6 +12,7 @@ from jmcore.protocol import MessageType
 
 from maker.bot import MakerBot
 from maker.config import MakerConfig
+from maker.direct_connection import DirectConnectionState, _handle_direct_public_message
 
 
 @pytest.fixture
@@ -56,6 +57,19 @@ async def request(bot: MakerBot, nick: str, directory: str) -> None:
     )
 
 
+async def direct_request(bot: MakerBot, nick: str, connection: MagicMock, peer: str) -> None:
+    await _handle_direct_public_message(
+        bot,
+        DirectConnectionState(nick=nick, verified=True),
+        nick,
+        "PUBLIC!orderbook",
+        connection,
+        peer,
+        generation_id=0,
+        unauthenticated_deadline=float("inf"),
+    )
+
+
 def response_count(bot: MakerBot) -> int:
     client = next(iter(bot.directory_clients.values()))
     return client.send_private_message.await_count
@@ -88,7 +102,7 @@ async def test_five_requesters_across_seven_directories_spend_five_tokens(bot: M
     assert response_count(bot) == 5
     assert bot._orderbook_rate_limiter.get_statistics()["total_violations"] == 0
     assert bot._orderbook_rate_limiter.get_statistics()["fanout_duplicates"] == 30
-    assert sum(bot._orderbook_proof_work_limiter.try_consume() for _ in range(16)) == 15
+    assert sum(bot._directory_orderbook_response_limiter.try_consume() for _ in range(196)) == 195
 
 
 async def test_fanout_does_not_log_spam_backoff_but_repeated_source_does(bot: MakerBot) -> None:
@@ -107,29 +121,56 @@ async def test_fanout_does_not_log_spam_backoff_but_repeated_source_does(bot: Ma
 
 
 @pytest.mark.parametrize("bonded", [False, True])
-async def test_default_global_burst_and_recovery(
+async def test_default_directory_burst_and_recovery(
     bot: MakerBot, now: list[float], bonded: bool
 ) -> None:
     bot.fidelity_bond = MagicMock() if bonded else None
     source = bot.config.directory_servers[0]
     with patch("maker.protocol_handlers.create_fidelity_bond_proof", return_value="proof") as proof:
-        for index in range(21):
+        for index in range(201):
             await request(bot, f"J5requester{index}", source)
-        assert response_count(bot) == 20
+        assert response_count(bot) == 200
+        assert proof.call_count == (200 if bonded else 0)
+
+        now[0] += 0.049
+        await request(bot, "J5tooearly", source)
+        assert response_count(bot) == 200
+        now[0] += 0.001
+        await request(bot, "J5recovered", source)
+        assert response_count(bot) == 201
+        assert proof.call_count == (201 if bonded else 0)
+
+        now[0] += 10.0
+        for index in range(201):
+            await request(bot, f"J5later{index}", source)
+        assert response_count(bot) == 401
+        assert proof.call_count == (401 if bonded else 0)
+
+
+@pytest.mark.parametrize("bonded", [False, True])
+async def test_default_direct_burst_and_recovery(
+    bot: MakerBot, now: list[float], bonded: bool
+) -> None:
+    bot.fidelity_bond = MagicMock() if bonded else None
+    connection = MagicMock(send=AsyncMock())
+    with patch("maker.protocol_handlers.create_fidelity_bond_proof", return_value="proof") as proof:
+        for index in range(21):
+            await direct_request(bot, f"J5requester{index}", connection, f"peer:{index}")
+        assert connection.send.await_count == 20
         assert proof.call_count == (20 if bonded else 0)
 
-        now[0] += 0.999
-        await request(bot, "J5tooearly", source)
-        assert response_count(bot) == 20
-        now[0] += 0.0011
-        await request(bot, "J5recovered", source)
-        assert response_count(bot) == 21
+        now[0] += 0.49
+        await direct_request(bot, "J5tooearly", connection, "peer:tooearly")
+        assert connection.send.await_count == 20
+        now[0] += 0.01
+        await direct_request(bot, "J5recovered", connection, "peer:recovered")
+        assert connection.send.await_count == 21
         assert proof.call_count == (21 if bonded else 0)
 
-        now[0] += 20.0
+        now[0] += 10.0
         for index in range(21):
-            await request(bot, f"J5later{index}", source)
-        assert response_count(bot) == 41
+            await direct_request(bot, f"J5later{index}", connection, f"later:{index}")
+        assert connection.send.await_count == 41
         assert proof.call_count == (41 if bonded else 0)
 
 
@@ -141,36 +182,73 @@ async def test_delayed_directory_copies_obey_base_interval(bot: MakerBot, now: l
     assert bot._orderbook_rate_limiter.get_violation_count("J5delayed") == 0
 
 
-async def test_direct_and_directory_requests_share_default_budget(
+async def test_directory_sustains_twenty_responses_per_second_after_burst(
+    bot: MakerBot, now: list[float]
+) -> None:
+    """Refill supports normal traffic after a burst while continuing to bound overload."""
+    source = bot.config.directory_servers[0]
+    for index in range(200):
+        await request(bot, f"J5burst{index}", source)
+
+    for second in range(60):
+        now[0] += 1.0
+        # Reuse a bounded pool of requesters at their ten-second nick cooldown.
+        for index in range(20):
+            await request(bot, f"J5steady{(second % 10) * 20 + index}", source)
+        assert response_count(bot) == 200 + (second + 1) * 20
+        await request(bot, f"J5excess{second}", source)
+        assert response_count(bot) == 200 + (second + 1) * 20
+
+    assert bot._orderbook_response_counts["directory_suppressed"] == 60
+    assert bot._orderbook_rate_limiter.get_statistics()["total_violations"] == 0
+
+
+async def test_exhausting_direct_budget_does_not_block_directory_handler(
     bot: MakerBot, now: list[float]
 ) -> None:
     connection = MagicMock(send=AsyncMock())
     source = bot.config.directory_servers[0]
-    for index in range(10):
+    for index in range(20):
+        await direct_request(bot, f"J5direct{index}", connection, f"direct:{index}")
+
+    await request(bot, "J5directory", source)
+
+    assert connection.send.await_count == 20
+    assert response_count(bot) == 1
+
+
+async def test_exhausting_directory_budget_does_not_block_direct_handler(
+    bot: MakerBot, now: list[float]
+) -> None:
+    source = bot.config.directory_servers[0]
+    connection = MagicMock(send=AsyncMock())
+    for index in range(200):
         await request(bot, f"J5directory{index}", source)
-        await bot._send_offers_via_direct_connection(f"J5direct{index}", connection)
-    assert response_count(bot) == 10
-    assert connection.send.await_count == 10
 
-    await request(bot, "J5directoryblocked", source)
-    await bot._send_offers_via_direct_connection("J5directblocked", connection)
-    assert response_count(bot) == 10
-    assert connection.send.await_count == 10
+    await direct_request(bot, "J5direct", connection, "direct:1")
 
-    now[0] += 1.0
-    await bot._send_offers_via_direct_connection("J5directrecovered", connection)
-    assert connection.send.await_count == 11
-    assert bot._orderbook_response_counts == {
-        "directory_admitted": 10,
-        "directory_suppressed": 1,
-        "direct_admitted": 11,
-        "direct_suppressed": 1,
-    }
+    assert response_count(bot) == 200
+    connection.send.assert_awaited_once()
 
 
-async def test_suppression_logs_are_throttled_but_all_drops_are_counted(bot: MakerBot) -> None:
+async def test_same_nick_spam_is_rejected_before_directory_budget(bot: MakerBot) -> None:
+    source = bot.config.directory_servers[0]
+    await request(bot, "J5spammer", source)
+    for _ in range(11):
+        await request(bot, "J5spammer", source)
+
+    assert response_count(bot) == 1
+    assert bot._orderbook_rate_limiter.get_violation_count("J5spammer") == 11
+    assert sum(bot._directory_orderbook_response_limiter.try_consume() for _ in range(200)) == 199
+
+
+async def test_suppression_logs_are_throttled_but_all_drops_are_counted(
+    bot: MakerBot, now: list[float]
+) -> None:
+    for _ in range(200):
+        assert bot._directory_orderbook_response_limiter.try_consume()
     for _ in range(20):
-        assert bot._orderbook_proof_work_limiter.try_consume()
+        assert bot._direct_orderbook_response_limiter.try_consume()
     connection = MagicMock(send=AsyncMock())
     with (
         patch("maker.bot.time.time", return_value=1000.0),
@@ -184,11 +262,11 @@ async def test_suppression_logs_are_throttled_but_all_drops_are_counted(bot: Mak
             await bot._send_offers_via_direct_connection(f"J5direct{index}", connection)
         warning.assert_called_once_with(
             "Suppressing !orderbook response "
-            "(global response budget exhausted; refills automatically)"
+            "(directory response budget exhausted; refills automatically)"
         )
         debug.assert_called_once_with(
             "Dropping direct orderbook response "
-            "(global response budget exhausted; refills automatically)"
+            "(direct response budget exhausted; refills automatically)"
         )
         proof.assert_not_called()
 
@@ -198,6 +276,13 @@ async def test_suppression_logs_are_throttled_but_all_drops_are_counted(bot: Mak
         "direct_admitted": 0,
         "direct_suppressed": 5,
     }
+    assert response_count(bot) == 0
+    assert all(
+        client.send_private_message.await_count == 0 for client in bot.directory_clients.values()
+    )
+    connection.send.assert_not_awaited()
+    now[0] += 10.0
+    await asyncio.sleep(0)
     assert response_count(bot) == 0
     connection.send.assert_not_awaited()
 
@@ -236,8 +321,10 @@ async def test_periodic_admission_summary_is_aggregate_only(
 
 
 async def test_periodic_summary_counts_suppression_without_peer_violations(bot: MakerBot) -> None:
+    for _ in range(200):
+        assert bot._directory_orderbook_response_limiter.try_consume()
     for _ in range(20):
-        assert bot._orderbook_proof_work_limiter.try_consume()
+        assert bot._direct_orderbook_response_limiter.try_consume()
     await request(bot, "J5private-requester", bot.config.directory_servers[0])
     await bot._send_offers_via_direct_connection("J5direct", MagicMock(send=AsyncMock()))
     bot.running = True

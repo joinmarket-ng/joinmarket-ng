@@ -15,7 +15,13 @@ from jmcore.models import NetworkType, Offer, OfferType
 
 from maker.bot import DirectConnectionRateLimiter, MakerBot, OrderbookRateLimiter
 from maker.config import MakerConfig
-from maker.rate_limiting import ProcessWideTokenBucket
+from maker.rate_limiting import (
+    DEFAULT_DIRECT_ORDERBOOK_RESPONSE_BURST,
+    DEFAULT_DIRECT_ORDERBOOK_RESPONSE_REFILL_PER_SECOND,
+    DEFAULT_DIRECTORY_ORDERBOOK_RESPONSE_BURST,
+    DEFAULT_DIRECTORY_ORDERBOOK_RESPONSE_REFILL_PER_SECOND,
+    ProcessWideTokenBucket,
+)
 
 
 class TestOrderbookRateLimiter:
@@ -359,6 +365,35 @@ class TestProcessWideTokenBucket:
         now[0] = 1.0
         assert limiter.try_consume() is True
 
+    @pytest.mark.parametrize(
+        ("burst", "refill_per_second", "one_token_delay"),
+        [
+            (
+                DEFAULT_DIRECTORY_ORDERBOOK_RESPONSE_BURST,
+                DEFAULT_DIRECTORY_ORDERBOOK_RESPONSE_REFILL_PER_SECOND,
+                0.05,
+            ),
+            (
+                DEFAULT_DIRECT_ORDERBOOK_RESPONSE_BURST,
+                DEFAULT_DIRECT_ORDERBOOK_RESPONSE_REFILL_PER_SECOND,
+                0.5,
+            ),
+        ],
+        ids=["directory", "direct"],
+    )
+    def test_default_response_budget_boundary_and_refill(
+        self, burst: int, refill_per_second: float, one_token_delay: float
+    ) -> None:
+        now = [0.0]
+        limiter = ProcessWideTokenBucket(burst, refill_per_second, clock=lambda: now[0])
+
+        assert all(limiter.try_consume() for _ in range(burst))
+        assert limiter.try_consume() is False
+        now[0] = one_token_delay - 0.001
+        assert limiter.try_consume() is False
+        now[0] = one_token_delay
+        assert limiter.try_consume() is True
+
 
 class TestMakerBotRateLimiting:
     """Tests for rate limiting integration in MakerBot."""
@@ -405,8 +440,17 @@ class TestMakerBotRateLimiting:
         """Test that rate limiter uses config values."""
         assert maker_bot._orderbook_rate_limiter.interval == 5.0
 
+    def test_bot_has_independent_orderbook_response_limiters(self, maker_bot):
+        assert maker_bot._directory_orderbook_response_limiter is not (
+            maker_bot._direct_orderbook_response_limiter
+        )
+        assert maker_bot._directory_orderbook_response_limiter.burst == 200
+        assert maker_bot._directory_orderbook_response_limiter.refill_per_second == 20.0
+        assert maker_bot._direct_orderbook_response_limiter.burst == 20
+        assert maker_bot._direct_orderbook_response_limiter.refill_per_second == 2.0
+
     @pytest.mark.asyncio
-    async def test_directory_and_direct_responses_share_proof_budget(self, maker_bot):
+    async def test_directory_and_direct_responses_use_independent_response_budgets(self, maker_bot):
         maker_bot.current_offers = [
             Offer(
                 counterparty=maker_bot.nick,
@@ -419,7 +463,8 @@ class TestMakerBotRateLimiting:
             )
         ]
         maker_bot.fidelity_bond = MagicMock()
-        maker_bot._orderbook_proof_work_limiter = ProcessWideTokenBucket(1, 0.0)
+        maker_bot._directory_orderbook_response_limiter = ProcessWideTokenBucket(1, 0.0)
+        maker_bot._direct_orderbook_response_limiter = ProcessWideTokenBucket(1, 0.0)
         directory_client = MagicMock(send_private_message=AsyncMock())
         direct_connection = MagicMock(send=AsyncMock())
         maker_bot.directory_clients["directory"] = directory_client
@@ -430,14 +475,14 @@ class TestMakerBotRateLimiting:
             await maker_bot._send_offers_to_taker("J5DirectoryTaker")
             await maker_bot._send_offers_via_direct_connection("J5DirectTaker", direct_connection)
 
-        create_proof.assert_called_once()
+        assert create_proof.call_count == 2
         directory_client.send_private_message.assert_awaited_once()
-        direct_connection.send.assert_not_awaited()
+        direct_connection.send.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_proof_work_suppression_has_no_sent_offers_log(self, maker_bot):
-        maker_bot._orderbook_proof_work_limiter = ProcessWideTokenBucket(1, 0.0)
-        assert maker_bot._orderbook_proof_work_limiter.try_consume() is True
+    async def test_directory_response_suppression_has_no_sent_offers_log(self, maker_bot):
+        maker_bot._directory_orderbook_response_limiter = ProcessWideTokenBucket(1, 0.0)
+        assert maker_bot._directory_orderbook_response_limiter.try_consume() is True
 
         with (
             patch("maker.protocol_handlers.logger.info") as info_log,
@@ -449,7 +494,7 @@ class TestMakerBotRateLimiting:
         info_log.assert_not_called()
         warning_log.assert_called_once_with(
             "Suppressing !orderbook response "
-            "(global response budget exhausted; refills automatically)"
+            "(directory response budget exhausted; refills automatically)"
         )
 
     def test_config_default_rate_limit_values(self, mock_wallet, mock_backend):

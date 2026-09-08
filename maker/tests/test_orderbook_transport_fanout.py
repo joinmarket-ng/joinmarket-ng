@@ -11,17 +11,20 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+from bitcointx.core.key import CKey
 from directory_server.server import DirectoryServer
 from jmcore.config import TorControlConfig
-from jmcore.crypto import NickIdentity
-from jmcore.directory_client import DirectoryClient
+from jmcore.crypto import NickIdentity, verify_signed_privmsg
+from jmcore.directory_client import DirectoryClient, parse_fidelity_bond_proof
 from jmcore.models import NetworkType, Offer, OfferType
+from jmcore.network import ONION_HOSTID
 from jmcore.nick_auth import NickAuthMode
 from jmcore.protocol import COMMAND_PREFIX, MessageType
 from jmcore.settings import DirectoryServerSettings
 
 from maker.bot import MakerBot
 from maker.config import MakerConfig
+from maker.fidelity import FidelityBondInfo
 
 _HOST = "127.0.0.1"
 _STARTUP_TIMEOUT = 5.0
@@ -100,8 +103,11 @@ class Requester:
 class TransportFanoutHarness:
     """Own real TCP resources so every failure path can close them deterministically."""
 
-    def __init__(self, directory_count: int, tmp_path: Path) -> None:
+    def __init__(
+        self, directory_count: int, tmp_path: Path, requester_count: int = _REQUESTER_COUNT
+    ) -> None:
         self.directory_count = directory_count
+        self.requester_count = requester_count
         self.tmp_path = tmp_path
         self.servers: list[DirectoryServer] = []
         self.server_tasks: list[asyncio.Task[None]] = []
@@ -114,7 +120,7 @@ class TransportFanoutHarness:
                 DirectoryServerSettings(
                     host=_HOST,
                     port=0,
-                    max_peers=_REQUESTER_COUNT + 1,
+                    max_peers=self.requester_count + 1,
                     health_check_port=0,
                     nick_auth_mode=NickAuthMode.DISABLED,
                 ),
@@ -167,7 +173,7 @@ class TransportFanoutHarness:
             "maker directory listeners",
         )
 
-        for _ in range(_REQUESTER_COUNT):
+        for _ in range(self.requester_count):
             identity = NickIdentity()
             self.requesters.append(
                 Requester(
@@ -190,7 +196,7 @@ class TransportFanoutHarness:
         )
         await _wait_until(
             lambda: all(
-                server.peer_registry.count() == _REQUESTER_COUNT + 1 for server in self.servers
+                server.peer_registry.count() == self.requester_count + 1 for server in self.servers
             ),
             "all maker and requester directory handshakes",
         )
@@ -284,5 +290,82 @@ async def test_orderbook_fanout_over_real_regtest_tcp(directory_count: int, tmp_
             "direct_admitted": 0,
             "direct_suppressed": 0,
         }
+    finally:
+        await harness.close()
+
+
+async def _receive_bonded_offers(client: DirectoryClient, maker_nick: str) -> None:
+    """Check that both signed offers and their requester-bound proofs survive routing."""
+    offer_ids = set()
+    for _ in range(2):
+        message = await _receive_offer(client, maker_nick)
+        command_data = message["line"].split(COMMAND_PREFIX, 2)[2]
+        authenticated, command, data = verify_signed_privmsg(maker_nick, command_data, ONION_HOSTID)
+        assert authenticated
+        assert command == OfferType.SW0_RELATIVE.value
+        offer_data, proof = data.split("!tbond ")
+        offer_ids.add(int(offer_data.split()[0]))
+        assert parse_fidelity_bond_proof(proof, maker_nick, client.nick) is not None
+    assert offer_ids == {0, 1}
+
+
+@pytest.mark.parametrize(
+    ("directory_count", "requester_count", "request_interval"),
+    [(2, 200, 0.0), (8, 40, 0.0), (2, 200, 0.05)],
+    ids=["full-burst", "eight-directories", "twenty-per-second"],
+)
+async def test_bonded_discovery_capacity_over_real_tcp(
+    directory_count: int, requester_count: int, request_interval: float, tmp_path: Path
+) -> None:
+    """Exercise real proof signing, directory fanout, and delivery at the new capacity."""
+    harness = TransportFanoutHarness(directory_count, tmp_path, requester_count)
+    try:
+        await harness.start()
+        assert harness.bot is not None
+        bot = harness.bot
+        bot.current_offers.append(bot.current_offers[0].model_copy(update={"oid": 1}))
+        key = CKey(b"\x01" * 32)
+        bot.fidelity_bond = FidelityBondInfo(
+            txid="00" * 32,
+            vout=0,
+            value=100_000_000,
+            locktime=2_000_000_000,
+            confirmation_time=1_700_000_000,
+            bond_value=1,
+            pubkey=bytes(key.pub),
+            private_key=key,
+        )
+
+        # One task per requester drains all its directories while sending. In the
+        # paced case, requesters start at 20/s without blocking response readers.
+        async def discover(requester: Requester, index: int) -> None:
+            if request_interval:
+                await asyncio.sleep(index * request_interval)
+            async with asyncio.TaskGroup() as exchange:
+                for client in requester.clients:
+                    exchange.create_task(client.send_public_message("orderbook"))
+                    exchange.create_task(_receive_bonded_offers(client, bot.nick))
+
+        async with asyncio.TaskGroup() as discoveries:
+            for index, requester in enumerate(harness.requesters):
+                discoveries.create_task(discover(requester, index))
+
+        expected_duplicates = requester_count * (directory_count - 1)
+        await _wait_until(
+            lambda: (
+                bot._orderbook_rate_limiter.get_statistics()["fanout_duplicates"]
+                == expected_duplicates
+            ),
+            "capacity-test directory fanout copies",
+        )
+        assert bot._orderbook_response_counts == {
+            "directory_admitted": requester_count,
+            "directory_suppressed": 0,
+            "direct_admitted": 0,
+            "direct_suppressed": 0,
+        }
+        assert bot._orderbook_rate_limiter.get_statistics()["total_violations"] == 0
+        assert len(bot.directory_clients) == directory_count
+        assert all(client.connection is not None for client in bot.directory_clients.values())
     finally:
         await harness.close()

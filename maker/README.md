@@ -79,16 +79,27 @@ signing and network resources. These limits apply with or without a fidelity bon
   still count as violations. The fanout exemption does not apply during escalated
   backoff or a ban, and it does not extend the cooldown.
 - Direct connections have their own per-connection cooldown, normally 30 seconds.
-- Both paths share one maker-wide response budget: a burst of 20 requests,
-  replenished continuously at one request per second. One admission covers all
-  of that maker's offers and directory sends, not each offer or directory separately.
-  This aggregate budget is fixed; the per-peer `orderbook_*` settings do not change it.
+- Directory responses have a maker-wide budget of 200 requests per burst,
+  replenished continuously at 20 requests per second.
+- Direct responses have an independent maker-wide budget of 20 requests per burst,
+  replenished continuously at two requests per second. Exhausting either transport's
+  budget does not consume the other transport's capacity.
+- One admission covers all of that maker's offers and, for directory requests, all
+  connected directory sends. It is not charged per offer or per directory.
+  These aggregate budgets are fixed; the per-peer `orderbook_*` settings do not change them.
 
-`Suppressing !orderbook response (global response budget exhausted; refills automatically)`
+`Suppressing !orderbook response (directory response budget exhausted; refills automatically)`
 means a response was dropped, not queued. No restart is needed to replenish capacity.
 A later request can succeed once capacity is available and its separate per-peer or
 per-connection cooldown has elapsed. Existing CoinJoin sessions are not aborted by
 this limit, but sustained suppression can prevent new takers from discovering offers.
+These limits bound response admissions, not network-wide traffic or service fairness:
+multiple identities can still compete for one transport's budget, and response work
+increases with the number of offers and connected directories.
+
+Upgrading from the shared 20-request, one-per-second budget automatically applies
+the new independent limits when the maker restarts. No configuration or wallet-state
+migration is needed.
 
 Directory suppression warnings and direct-path debug messages are each throttled to
 once every 10 seconds; they do not count every dropped response. An aggregate

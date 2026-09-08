@@ -91,7 +91,8 @@ class ProtocolHandlersMixin:
     _message_rate_limiter: RateLimiter
     _orderbook_rate_limiter: OrderbookRateLimiter
     _direct_connection_rate_limiter: DirectConnectionRateLimiter
-    _orderbook_proof_work_limiter: ProcessWideTokenBucket
+    _directory_orderbook_response_limiter: ProcessWideTokenBucket
+    _direct_orderbook_response_limiter: ProcessWideTokenBucket
     _orderbook_response_counts: dict[str, int]
     _hp2_admission_limiter: ProcessWideTokenBucket
     _hp2_relay_work_limiter: ProcessWideTokenBucket
@@ -338,12 +339,12 @@ class ProtocolHandlersMixin:
             generation = self._generation(generation_id)
             if generation is None or generation.state is not GenerationState.ACCEPTING:
                 return
-            if not self._orderbook_proof_work_limiter.try_consume():
+            if not self._directory_orderbook_response_limiter.try_consume():
                 self._orderbook_response_counts["directory_suppressed"] += 1
                 self._log_rate_limited(
-                    "orderbook-proof-work-budget",
+                    "directory-orderbook-response-budget",
                     "Suppressing !orderbook response "
-                    "(global response budget exhausted; refills automatically)",
+                    "(directory response budget exhausted; refills automatically)",
                 )
                 return
             self._orderbook_response_counts["directory_admitted"] += 1
@@ -436,12 +437,12 @@ class ProtocolHandlersMixin:
             generation = self._generation(generation_id)
             if generation is None or generation.state is not GenerationState.ACCEPTING:
                 return
-            if not self._orderbook_proof_work_limiter.try_consume():
+            if not self._direct_orderbook_response_limiter.try_consume():
                 self._orderbook_response_counts["direct_suppressed"] += 1
                 self._log_rate_limited(
-                    "direct-orderbook-proof-work-budget",
+                    "direct-orderbook-response-budget",
                     "Dropping direct orderbook response "
-                    "(global response budget exhausted; refills automatically)",
+                    "(direct response budget exhausted; refills automatically)",
                     level="debug",
                 )
                 return

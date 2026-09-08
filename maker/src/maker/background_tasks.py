@@ -121,7 +121,7 @@ class BackgroundTasksMixin:
         - Total violations across all peers
         - Currently banned peers
         - Top violators (by violation count)
-        - Aggregate response admissions, global-budget drops, and directory fanout
+        - Aggregate response admissions, transport-budget drops, and directory fanout
         """
         # First log after 10 minutes (give time for initial activity)
         await asyncio.sleep(600)

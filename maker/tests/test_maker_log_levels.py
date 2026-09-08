@@ -97,8 +97,8 @@ async def test_orderbook_offer_send_diagnostics_use_trace(
     client = MagicMock()
     client.send_private_message = AsyncMock()
     maker_bot.directory_clients["directory"] = client
-    maker_bot._orderbook_proof_work_limiter = MagicMock()
-    maker_bot._orderbook_proof_work_limiter.try_consume.return_value = True
+    maker_bot._directory_orderbook_response_limiter = MagicMock()
+    maker_bot._directory_orderbook_response_limiter.try_consume.return_value = True
 
     await maker_bot._send_offers_to_taker("J5peer")
 

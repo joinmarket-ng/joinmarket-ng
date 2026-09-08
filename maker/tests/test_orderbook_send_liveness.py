@@ -362,7 +362,7 @@ async def test_concurrent_healthy_responses_preserve_budget_and_bond_proofs(bot:
     """Concurrent normal responses spend one budget token and proof per requester, not per peer."""
     bot.current_offers = _offers(bot, 1)
     bot.fidelity_bond = MagicMock()
-    bot._orderbook_proof_work_limiter = ProcessWideTokenBucket(2, 0.0)
+    bot._directory_orderbook_response_limiter = ProcessWideTokenBucket(2, 0.0)
     first = MagicMock(send_private_message=AsyncMock(), abort=MagicMock())
     second = MagicMock(send_private_message=AsyncMock(), abort=MagicMock())
     bot.directory_clients = {"first": first, "second": second}
@@ -385,7 +385,7 @@ async def test_concurrent_healthy_responses_preserve_budget_and_bond_proofs(bot:
     assert {tuple(sent.args) for sent in first.send_private_message.await_args_list} == expected
     assert {tuple(sent.args) for sent in second.send_private_message.await_args_list} == expected
     assert proof.call_count == 2
-    assert bot._orderbook_proof_work_limiter.try_consume() is False
+    assert bot._directory_orderbook_response_limiter.try_consume() is False
     assert bot._orderbook_response_counts == {
         "directory_admitted": 2,
         "directory_suppressed": 0,
