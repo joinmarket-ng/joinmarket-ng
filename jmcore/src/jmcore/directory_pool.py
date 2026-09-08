@@ -30,6 +30,7 @@ to live in the subclasses that own them.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from dataclasses import dataclass
 from typing import Any
 
@@ -179,11 +180,19 @@ class DirectoryClientPool:
 
         node_id = f"{host}:{port}"
 
+        client: DirectoryClient | None = None
         try:
             kwargs = self._build_client_kwargs(host, port)
             client = DirectoryClient(**kwargs)
             await client.connect()
             return (node_id, client)
+        except asyncio.CancelledError:
+            # Startup may finish while this client's handshake is still pending.
+            # DirectoryClient.connect() only cleans up ordinary exceptions.
+            if client is not None:
+                with contextlib.suppress(Exception):
+                    await client.close()
+            raise
         except Exception as e:
             logger.bind(sensitive=True).debug(f"Failed to connect to {dir_server}: {e}")
             return None
@@ -229,13 +238,16 @@ class DirectoryClientPool:
         backoff: float = 1.5,
     ) -> int:
         """
-        Connect to all configured servers with bounded retry.
+        Connect to configured servers concurrently with bounded retry.
 
         Tor may still be bootstrapping when the caller starts; this loop
         keeps retrying failed servers until either at least one client
         connects or ``timeout`` elapses, whichever comes first. After
         timeout the method returns gracefully so callers can rely on a
-        separate periodic reconnect task.
+        separate periodic reconnect task. Retain completed successes, cancel
+        unfinished attempts once a directory is available, and let periodic
+        reconnection fill in the remaining directories. A slow endpoint must
+        not prevent callers from listening on a ready connection.
 
         Args:
             timeout: Hard deadline in seconds across all attempts.
@@ -248,52 +260,80 @@ class DirectoryClientPool:
             Number of clients currently in ``self.clients`` when the
             method returns.
         """
-        deadline = asyncio.get_event_loop().time() + timeout
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
         delay = initial_delay
         attempt = 0
 
-        while True:
+        while loop.time() < deadline:
             attempt += 1
-            for dir_server in self.directory_servers:
-                # Compute the node_id for the "already connected" check
-                # without raising if the address is malformed; we'll
-                # rely on connect_to_directory to log the parse failure.
-                try:
-                    host, port = parse_directory_address(dir_server)
-                    node_id = f"{host}:{port}"
-                except Exception:
-                    node_id = dir_server
-
-                if node_id in self.clients:
-                    continue
-
-                result = await self.connect_to_directory(dir_server)
-                if result is None:
-                    logger.bind(sensitive=True).warning(
-                        f"Could not connect to {dir_server} (attempt {attempt}), "
-                        "Tor may still be bootstrapping"
+            # Aliases such as host and host:5222 must not race to replace one
+            # another, leaving an authenticated but unowned connection behind.
+            missing = {node_id: server for server, node_id in self.list_disconnected()}
+            tasks = {
+                asyncio.create_task(self.connect_to_directory(server)): server
+                for server in missing.values()
+            }
+            pending = set(tasks)
+            adopted: set[asyncio.Task[tuple[str, DirectoryClient] | None]] = set()
+            try:
+                while pending:
+                    done, pending = await asyncio.wait(
+                        pending,
+                        timeout=max(0.0, deadline - loop.time()),
+                        return_when=asyncio.FIRST_COMPLETED,
                     )
-                    continue
-                connected_id, client = result
-                self.clients[connected_id] = client
-                logger.bind(sensitive=True).info(f"Connected to directory: {dir_server}")
-                await self._on_directory_connected(connected_id, client)
+                    # Preserve configured ordering among simultaneous results.
+                    for task, server in tasks.items():
+                        if task not in done:
+                            continue
+                        result = task.result()
+                        if result is None:
+                            logger.bind(sensitive=True).warning(
+                                f"Could not connect to {server} (attempt {attempt})"
+                            )
+                            continue
+                        node_id, client = result
+                        self.clients[node_id] = client
+                        try:
+                            await self._on_directory_connected(node_id, client)
+                        except BaseException:
+                            self.clients.pop(node_id, None)
+                            raise
+                        adopted.add(task)
+                        logger.bind(sensitive=True).info(f"Connected to directory: {server}")
+                    if self.clients or loop.time() >= deadline:
+                        break
+            finally:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                # A connect can complete just as the caller cancels or a hook
+                # yields. Close every successful result we did not adopt.
+                for task, outcome in zip(tasks, results, strict=True):
+                    if task not in adopted and isinstance(outcome, tuple):
+                        with contextlib.suppress(Exception):
+                            await outcome[1].close()
 
             if self.clients:
                 return len(self.clients)
 
-            remaining = deadline - asyncio.get_event_loop().time()
+            remaining = deadline - loop.time()
             if remaining <= 0:
-                logger.error(
-                    f"Failed to connect to any directory server after {timeout}s. "
-                    "Caller should rely on the periodic reconnect task."
-                )
-                return 0
+                break
 
             wait = min(delay, remaining)
             logger.info(f"Retrying directory connections in {wait:.0f}s...")
             await asyncio.sleep(wait)
             delay = min(delay * backoff, max_delay)
+
+        if not self.clients:
+            logger.error(
+                f"Failed to connect to any directory server after {timeout}s. "
+                "Caller should rely on the periodic reconnect task."
+            )
+        return len(self.clients)
 
     def list_disconnected(self) -> list[tuple[str, str]]:
         """

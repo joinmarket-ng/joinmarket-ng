@@ -46,6 +46,20 @@ can manage multiple wallet mnemonic files, and you can switch between them
 with `--mnemonic-file`. Use separate `--data-dir` values for takers only when
 you specifically want isolated config and runtime state.
 
+## Directory Connections
+
+Startup connects to configured directories concurrently and starts serving once a
+directory is ready. Slow or unreachable endpoints cannot hold up a healthy connection
+and accumulate incoming requests into a burst. Unfinished connection attempts are
+closed; the background reconnect task fills in missing directories. It first runs
+after a 60-second settling delay plus `directory_reconnect_interval` (normally five
+minutes). Subsequent passes use that interval.
+
+`directory_startup_timeout` bounds the initial connection attempts and retries as a
+whole. If none succeed, the maker still starts and relies on background reconnection.
+Tor connection failures and reconnect delays are separate from orderbook response
+limits.
+
 ## Orderbook Rate Limits
 
 Makers limit `!orderbook` responses to keep unsolicited requests from exhausting
