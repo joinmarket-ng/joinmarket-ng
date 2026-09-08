@@ -14,9 +14,10 @@ __all__ = ["sensitive_log_filter"]
 def sensitive_log_filter(sensitive: bool = False) -> Callable[[Record], bool]:
     """Build a Loguru filter that hides records bound with ``sensitive=True``.
 
-    Privacy-rich log calls must opt in explicitly with
+    Log calls containing wallet, transaction, or detailed error information opt in with
     ``logger.bind(sensitive=True)``. Standard sinks keep those records hidden
-    unless sensitive logging is enabled.
+    unless sensitive logging is enabled. This filter selects whole records;
+    it does not redact message contents or exception variable values.
     """
 
     def filter_record(record: Record) -> bool:

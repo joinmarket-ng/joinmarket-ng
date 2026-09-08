@@ -447,7 +447,7 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
                             f"{self.config.tor_target_host}:{self.config.onion_serving_port}",
                         )
                     ],
-                    # Don't discard private key in case we want to log it for debugging
+                    # Ask Tor to omit the service private key from its response.
                     discard_pk=True,
                     # Don't detach - we want the service to be removed when we disconnect
                     detach=False,

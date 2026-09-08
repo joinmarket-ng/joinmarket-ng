@@ -1422,8 +1422,9 @@ class LoggingSettings(BaseModel):
     sensitive: bool = Field(
         default=False,
         description=(
-            "Enable logs containing wallet addresses, amounts, balances, txids, transaction "
-            "data, descriptors, and secrets"
+            "Enable privacy-sensitive diagnostics: wallet addresses, amounts, balances, "
+            "transaction IDs, transaction data, descriptors, and detailed errors. "
+            "Disabled by default; review logs before sharing"
         ),
     )
 

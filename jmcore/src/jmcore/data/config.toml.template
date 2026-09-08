@@ -270,8 +270,10 @@
 # Log level: "TRACE", "DEBUG", "INFO", "WARNING", "ERROR"
 # level = "INFO"
 
-# Log sensitive wallet addresses, amounts, balances, txids, transaction data,
-# descriptors, and secrets. Disabled by default.
+# Include privacy-sensitive diagnostics: wallet addresses, amounts, balances,
+# transaction IDs, transaction data, descriptors, and detailed errors.
+# Disabled by default. Exception details can include variable values;
+# review logs before sharing. See the configuration guide's Logging section.
 # sensitive = false
 
 # ============================================================================

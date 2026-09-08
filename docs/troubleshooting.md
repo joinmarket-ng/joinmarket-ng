@@ -126,6 +126,8 @@ The report is designed to omit keys, addresses, balances, and transactions.
 Review it before sharing. Logs, screenshots, and configuration files may contain
 sensitive information that this command's redaction does not cover. Never send
 recovery words, passphrases, wallet files, RPC credentials, or Neutrino tokens.
+See [logging settings](technical/configuration.md#logging) for how verbosity and
+wallet diagnostic details are controlled.
 
 Search [existing issues](https://github.com/joinmarket-ng/joinmarket-ng/issues)
 before filing a report. For a vulnerability, use

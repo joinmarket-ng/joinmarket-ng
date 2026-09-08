@@ -111,6 +111,30 @@ socks_port = 9050
 - `descriptor_wallet` (recommended)
 - `neutrino`
 
+## Logging
+
+`[logging].level` controls verbosity (default: `"INFO"`). The separate
+`sensitive` option includes privacy-sensitive diagnostics such as wallet
+addresses, mixdepth balances, selected UTXOs, transaction IDs, descriptors, and
+detailed errors. It defaults to `false`, including at `DEBUG` and `TRACE` levels.
+To include these details while troubleshooting, set:
+
+```toml
+[logging]
+level = "DEBUG"
+sensitive = true
+```
+
+Restart the component to apply the change. The equivalent environment variables
+are `LOGGING__LEVEL=DEBUG` and `LOGGING__SENSITIVE=true`.
+
+The option is intended for wallet and transaction diagnostics. Routine wallet
+initialization reports whether a BIP39 passphrase is set, without printing its
+value; mnemonic source messages report where the recovery words were loaded
+from, without printing the words. However, this option filters whole log records
+and does not redact their contents. Detailed exception tracebacks can include
+variable values. Keep these logs private and review them before sharing excerpts.
+
 ## Wallet History Reconstruction
 
 `[wallet].reconstruct_history` defaults to `true`. When a wallet with no local
