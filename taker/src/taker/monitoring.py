@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any
 
 from jmwallet.history import (
     TransactionHistoryEntry,
-    abandon_transaction,
+    expire_pending_transaction_monitoring,
     get_pending_transactions,
     update_transaction_confirmation,
     verify_history_destination_output,
@@ -138,31 +138,26 @@ class TakerMonitoringMixin:
 
     async def _check_pending_with_mempool(self, entry: TransactionHistoryEntry) -> None:
         """Check pending transaction status using get_transaction (requires mempool access)."""
+        if expire_pending_transaction_monitoring(
+            entry,
+            max_age_minutes=self.config.pending_tx_abandon_hours * 60,
+            data_dir=self.config.data_dir,
+            wallet_fingerprint=self.wallet.wallet_fingerprint,
+        ):
+            return
+
         tx_info = await self.backend.get_transaction(entry.txid)
 
         if tx_info is None:
-            # Transaction not found - might have been rejected/replaced
             from datetime import datetime
 
             timestamp = datetime.fromisoformat(entry.timestamp)
             age_hours = (datetime.now() - timestamp).total_seconds() / 3600
-            abandon_hours: float = getattr(self.config, "pending_tx_abandon_hours", 72)
 
-            if age_hours >= abandon_hours:
-                abandon_transaction(
-                    txid=entry.txid,
-                    reason=(
-                        f"not found in mempool after {age_hours:.1f} hours "
-                        f"(threshold: {abandon_hours:.0f} h); "
-                        "likely rejected or replaced"
-                    ),
-                    data_dir=self.config.data_dir,
-                    wallet_fingerprint=self.wallet.wallet_fingerprint,
-                )
-            elif age_hours > 24:
-                logger.warning("Pending transaction may have been rejected")
+            if age_hours > 24:
+                logger.warning("Pending transaction remains unobserved")
                 logger.bind(sensitive=True).warning(
-                    "Transaction {} not found after {:.1f} hours", entry.txid, age_hours
+                    "Transaction {} remains unobserved after {:.1f} hours", entry.txid, age_hours
                 )
             return
 
@@ -196,6 +191,14 @@ class TakerMonitoringMixin:
         for block confirmation. The transaction may be in mempool but we
         won't know until it's mined.
         """
+        if expire_pending_transaction_monitoring(
+            entry,
+            max_age_minutes=self.config.pending_tx_abandon_hours * 60,
+            data_dir=self.config.data_dir,
+            wallet_fingerprint=self.wallet.wallet_fingerprint,
+        ):
+            return
+
         from datetime import datetime
 
         # Need destination address for Neutrino verification
@@ -241,26 +244,12 @@ class TakerMonitoringMixin:
             timestamp = datetime.fromisoformat(entry.timestamp)
             age_hours = (datetime.now() - timestamp).total_seconds() / 3600
 
-            abandon_hours: float = getattr(self.config, "pending_tx_abandon_hours", 72)
-            if age_hours >= abandon_hours:
-                abandon_transaction(
-                    txid=entry.txid,
-                    reason=(
-                        f"not confirmed after {age_hours:.1f} hours "
-                        f"(threshold: {abandon_hours:.0f} h); "
-                        "likely dropped from all mempools"
-                    ),
-                    data_dir=self.config.data_dir,
-                    wallet_fingerprint=self.wallet.wallet_fingerprint,
-                )
-                return
-
             # For Neutrino, be more patient before warning since we can't see mempool
             # Only log at WARNING level if it's been a long time, otherwise DEBUG to reduce noise
             if age_hours > 2:  # 2 hour threshold for Neutrino
-                logger.warning("Pending transaction has not confirmed and may have been rejected")
+                logger.warning("Pending transaction remains unconfirmed")
                 logger.bind(sensitive=True).warning(
-                    "Transaction {} not confirmed after {:.1f} hours", entry.txid, age_hours
+                    "Transaction {} remains unconfirmed after {:.1f} hours", entry.txid, age_hours
                 )
             elif age_hours > 0.5:  # Log at debug for txs older than 30 min
                 logger.debug("Pending transaction is awaiting confirmation")

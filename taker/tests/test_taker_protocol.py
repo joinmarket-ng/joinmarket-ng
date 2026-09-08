@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
@@ -30,6 +31,7 @@ from jmcore.encryption import CryptoSession
 from jmcore.models import Offer, OfferType
 from jmcore.network import ONION_HOSTID
 from jmcore.protocol import MakerError, MessageType
+from jmwallet.backends.base import Transaction
 from jmwallet.wallet.models import UTXOInfo
 from loguru import logger
 
@@ -2015,6 +2017,179 @@ class TestUpdatePendingTransactionNow:
             start_height=100,
             include_mempool=False,
         )
+
+
+class TestPendingTransactionMonitoring:
+    """Regression tests for bounded CoinJoin confirmation monitoring."""
+
+    @staticmethod
+    def _append_aged_pending_entry(
+        tmp_path, *, txid: str, age_hours: float, destination: str = "bcrt1qdestmonitor"
+    ) -> None:
+        from jmwallet.history import append_history_entry, create_taker_history_entry
+
+        entry = create_taker_history_entry(
+            maker_nicks=["J5TestMaker"],
+            cj_amount=100_000,
+            total_maker_fees=250,
+            mining_fee=500,
+            destination=destination,
+            change_address="bcrt1qchangemonitor",
+            source_mixdepth=0,
+            selected_utxos=[("a" * 64, 0)],
+            txid=txid,
+            wallet_fingerprint="deadbeef",
+            destination_vout=2,
+        )
+        entry.timestamp = (datetime.now() - timedelta(hours=age_hours)).isoformat()
+        append_history_entry(entry, data_dir=tmp_path)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("age_hours", "monitoring_hours", "initial_confirmations"),
+        [(23, 24, None), (23, 24, 0), (48, 72, 0)],
+    )
+    async def test_core_monitor_keeps_pre_deadline_transactions_pending(
+        self,
+        mock_wallet,
+        mock_backend,
+        mock_config,
+        tmp_path,
+        age_hours: int,
+        monitoring_hours: int,
+        initial_confirmations: int | None,
+    ) -> None:
+        """Missing and zero-confirmation transactions remain pending before the deadline."""
+        from jmwallet.history import get_pending_transactions, read_history
+
+        mock_config.data_dir = tmp_path
+        mock_config.pending_tx_abandon_hours = monitoring_hours
+        taker = Taker(mock_wallet, mock_backend, mock_config)
+        txid = "b" * 64
+        self._append_aged_pending_entry(tmp_path, txid=txid, age_hours=age_hours)
+        initial_transaction = (
+            None
+            if initial_confirmations is None
+            else Transaction(txid=txid, raw="", confirmations=initial_confirmations)
+        )
+        mock_backend.get_transaction = AsyncMock(return_value=initial_transaction)
+
+        await taker._check_pending_with_mempool(read_history(data_dir=tmp_path)[0])
+
+        pending = get_pending_transactions(data_dir=tmp_path, wallet_fingerprint="deadbeef")
+        assert [entry.txid for entry in pending] == [txid]
+        assert read_history(data_dir=tmp_path)[0].completed_at == ""
+
+        mock_backend.get_transaction = AsyncMock(
+            return_value=Transaction(txid=txid, raw="", confirmations=2)
+        )
+        await taker._check_pending_with_mempool(read_history(data_dir=tmp_path)[0])
+
+        confirmed = read_history(data_dir=tmp_path)[0]
+        assert confirmed.success is True
+        assert confirmed.confirmations == 2
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("age_hours", [24, 100 * 24])
+    async def test_expired_core_monitor_skips_rpc_and_wallet_info_recovers(
+        self, mock_wallet, mock_backend, mock_config, tmp_path, age_hours: int
+    ) -> None:
+        """Timed-out background monitoring does not prevent explicit recovery."""
+        from jmwallet.history import (
+            MONITORING_TIMEOUT_REASON_PREFIX,
+            get_pending_transactions,
+            read_history,
+            update_all_pending_transactions,
+        )
+
+        mock_config.data_dir = tmp_path
+        mock_backend.can_get_confirmations_by_txid = Mock(return_value=True)
+        taker = Taker(mock_wallet, mock_backend, mock_config)
+        txid = "c" * 64
+        self._append_aged_pending_entry(tmp_path, txid=txid, age_hours=age_hours)
+
+        mock_backend.get_transaction = AsyncMock()
+        await taker._check_pending_with_mempool(read_history(data_dir=tmp_path)[0])
+
+        pending = get_pending_transactions(data_dir=tmp_path, wallet_fingerprint="deadbeef")
+        assert pending == []
+        expired = read_history(data_dir=tmp_path)[0]
+        assert expired.failure_reason.startswith(MONITORING_TIMEOUT_REASON_PREFIX)
+        assert expired.completed_at
+        mock_backend.get_transaction.assert_not_awaited()
+
+        mock_backend.get_transaction = AsyncMock(
+            return_value=Transaction(txid=txid, raw="", confirmations=1)
+        )
+        updated = await update_all_pending_transactions(
+            mock_backend,
+            data_dir=tmp_path,
+            wallet_fingerprint="deadbeef",
+        )
+
+        confirmed = read_history(data_dir=tmp_path)[0]
+        assert updated == 1
+        assert confirmed.success is True
+        assert confirmed.confirmations == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("age_hours", [24, 100 * 24])
+    async def test_expired_neutrino_monitor_skips_verification(
+        self, mock_wallet, mock_backend, mock_config, tmp_path, age_hours: int
+    ) -> None:
+        """Timed-out Neutrino rows do not start a block-height or output lookup."""
+        from jmwallet.history import get_pending_transactions, read_history
+
+        mock_config.data_dir = tmp_path
+        mock_backend.get_block_height = AsyncMock(return_value=840_000)
+        mock_backend.verify_tx_output = AsyncMock(return_value=True)
+        taker = Taker(mock_wallet, mock_backend, mock_config)
+        txid = "d" * 64
+        self._append_aged_pending_entry(tmp_path, txid=txid, age_hours=age_hours)
+
+        await taker._check_pending_without_mempool(read_history(data_dir=tmp_path)[0])
+
+        assert get_pending_transactions(data_dir=tmp_path, wallet_fingerprint="deadbeef") == []
+        mock_backend.get_block_height.assert_not_awaited()
+        mock_backend.verify_tx_output.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_background_monitor_ignores_completed_failed_rows(
+        self, mock_wallet, mock_backend, mock_config, tmp_path
+    ) -> None:
+        """The background loop never rechecks completed failed history rows."""
+        from jmwallet.history import abandon_transaction, get_pending_transactions
+
+        mock_config.data_dir = tmp_path
+        mock_backend.can_get_confirmations_by_txid = Mock(return_value=True)
+        taker = Taker(mock_wallet, mock_backend, mock_config)
+        txid = "e" * 64
+        self._append_aged_pending_entry(tmp_path, txid=txid, age_hours=1)
+        assert abandon_transaction(
+            txid=txid,
+            reason="Transaction was not visible",
+            data_dir=tmp_path,
+            wallet_fingerprint="deadbeef",
+        )
+        assert get_pending_transactions(data_dir=tmp_path, wallet_fingerprint="deadbeef") == []
+
+        sleep_count = 0
+
+        async def sleep_until_second_iteration(_seconds: float) -> None:
+            nonlocal sleep_count
+            sleep_count += 1
+            if sleep_count == 2:
+                taker.running = False
+
+        mock_backend.get_transaction = AsyncMock()
+        taker.running = True
+        with patch(
+            "taker.monitoring.asyncio.sleep", side_effect=sleep_until_second_iteration
+        ) as sleep:
+            await taker._monitor_pending_transactions()
+
+        assert sleep.await_count == 2
+        mock_backend.get_transaction.assert_not_awaited()
 
 
 class TestHistoryMiningFeeRecording:

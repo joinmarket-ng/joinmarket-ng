@@ -30,6 +30,30 @@ UTXO outpoints for review or explicit coin control. `history` shows this
 wallet's recorded CoinJoin and send history; it is not a replacement for
 independent transaction records.
 
+A low-fee transaction can take hours or days to confirm. `info` refreshes
+confirmation status without expiring pending entries; `history` displays the
+recorded status without querying the backend.
+
+Background monitoring has configurable limits. Makers use `pending_tx_timeout_min`
+(default 60 minutes) for attempts without a recorded TXID and
+`pending_tx_abandon_hours` (default 72 hours) for recorded transactions. Takers use
+their `pending_tx_abandon_hours` setting (default 24 hours). A deadline stops
+automatic checks and records `[TIMED OUT]` in CLI history. This is a local
+monitoring outcome: it does not invalidate the transaction, abandon it in
+Bitcoin Core, or release its inputs. Existing input reservation limits still apply.
+
+Run `jm-wallet info` to check for a later confirmation, even after a timeout.
+This also repairs failed rows from older versions when their recorded TXIDs
+are verified as confirmed. On upgrade, expired pending rows time out without
+restarting backend polling, and failed rows remain out of background monitoring.
+Explicit refresh uses targeted lookups without a full wallet rescan; rows
+without a recorded TXID cannot be repaired this way. A 100-day-old transaction
+is not repeatedly polled in the background.
+
+CPFP adds a child transaction while preserving the parent's TXID. RBF creates a
+different transaction with a new TXID. Automatic linkage between a replacement
+and the original CoinJoin history entry is not currently supported.
+
 ## Sending Funds
 
 For an ordinary Bitcoin payment, replace the destination, amount in satoshis,

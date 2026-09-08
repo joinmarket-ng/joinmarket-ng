@@ -1049,18 +1049,7 @@ async def _show_wallet_info(
         balance_width = len(f"{spendable_balance + total_frozen:,}")
 
         # Show pending transactions if any
-        from jmwallet.history import cleanup_stale_pending_transactions, get_pending_transactions
-
-        # Clean up any stale pending transactions (older than 60 minutes).
-        # Scope to the active wallet (issue #473) so we don't mark another
-        # wallet's pending entries as failed from this wallet's CLI run.
-        cleaned = cleanup_stale_pending_transactions(
-            max_age_minutes=60,
-            data_dir=data_dir,
-            wallet_fingerprint=wallet.wallet_fingerprint,
-        )
-        if cleaned > 0:
-            logger.info(f"Cleaned up {cleaned} stale pending transaction(s)")
+        from jmwallet.history import get_pending_transactions
 
         pending = get_pending_transactions(data_dir, wallet_fingerprint=wallet.wallet_fingerprint)
         if pending:

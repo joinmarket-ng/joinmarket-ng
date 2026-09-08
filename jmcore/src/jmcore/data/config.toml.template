@@ -450,8 +450,8 @@
 # identity_rotation_quiet_min_sec = 60   # Minimum silence after old TCP disconnects
 # identity_rotation_quiet_max_sec = 600  # Maximum silence before replacement connects
 # rescan_interval_sec = 600
-# pending_tx_timeout_min = 60   # Minutes before marking unbroadcast CoinJoins as failed
-# pending_tx_abandon_hours = 72  # Hours before abandoning a broadcast but unconfirmed tx
+# pending_tx_timeout_min = 60   # Monitoring deadline without a TXID; also input reservation lifetime
+# pending_tx_abandon_hours = 72  # Confirmation monitoring deadline for recorded TXIDs; refresh can recover later
 
 # Privacy: random delay (seconds) before re-announcing offers after a balance change.
 # Prevents observers from correlating block confirmations with offer updates.
@@ -559,7 +559,7 @@
 # orderbook_min_wait = 30.0      # Min seconds before early exit is allowed
 # orderbook_quiet_period = 15.0  # Seconds of silence to trigger early exit
 # rescan_interval_sec = 600
-# pending_tx_abandon_hours = 24  # Hours before abandoning unconfirmed CoinJoin (makers can double-spend)
+# pending_tx_abandon_hours = 24  # Confirmation monitoring deadline; also pending allowance in input reservation lifetime
 
 # Transaction broadcast settings
 # Options: "self", "random-peer", "multiple-peers", "not-self"

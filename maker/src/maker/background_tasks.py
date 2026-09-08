@@ -452,30 +452,41 @@ class BackgroundTasksMixin:
         For entries without txid, attempts to discover the txid by checking
         if the destination address has received funds.
 
-        Transactions that remain pending longer than pending_tx_timeout_min
-        are marked as failed (taker likely never broadcast the transaction).
+        Use the short discovery deadline only for entries without a txid. Known
+        txids get the longer confirmation-monitoring window. Timeouts end local
+        monitoring; explicit wallet refresh can still reconcile later confirmation.
         """
         from datetime import datetime
 
         from jmwallet.history import (
+            expire_pending_transaction_monitoring,
             get_pending_transactions,
-            mark_pending_transaction_failed,
             update_pending_transaction_txid,
             update_transaction_confirmation_with_detection,
         )
 
         wallet_fp = self.wallet.wallet_fingerprint
         pending = get_pending_transactions(
-            data_dir=self.config.data_dir, wallet_fingerprint=wallet_fp
+            data_dir=self.config.data_dir,
+            wallet_fingerprint=wallet_fp,
         )
         if not pending:
             return
 
         logger.debug(f"Checking {len(pending)} pending transaction(s)...")
-        timeout_minutes = self.config.pending_tx_timeout_min
 
         for entry in pending:
             try:
+                timeout_minutes = (
+                    self.config.pending_tx_abandon_hours * 60
+                    if entry.txid
+                    else self.config.pending_tx_timeout_min
+                )
+                if expire_pending_transaction_monitoring(
+                    entry, timeout_minutes, self.config.data_dir, wallet_fp
+                ):
+                    continue
+
                 # Calculate age of the pending transaction
                 timestamp = datetime.fromisoformat(entry.timestamp)
                 age_minutes = (datetime.now() - timestamp).total_seconds() / 60
@@ -502,18 +513,6 @@ class BackgroundTasksMixin:
                             )
                             # Update entry for confirmation check below
                             entry.txid = txid
-                        elif age_minutes >= timeout_minutes:
-                            # Timed out waiting for taker to broadcast
-                            mark_pending_transaction_failed(
-                                destination_address=entry.destination_address,
-                                failure_reason=(
-                                    f"Timed out after {int(age_minutes)} minutes - "
-                                    "taker never broadcast transaction"
-                                ),
-                                data_dir=self.config.data_dir,
-                                wallet_fingerprint=wallet_fp,
-                            )
-                            continue
                         else:
                             logger.bind(sensitive=True).debug(
                                 f"No UTXO found for {entry.destination_address[:20]}... "
@@ -536,21 +535,9 @@ class BackgroundTasksMixin:
                     confirmations = await self._chain_confirmations_for_entry(entry)
 
                 if confirmations is None:
-                    # Transaction not found - might have been rejected/replaced
-                    # or never made it to the mempool
-                    if age_minutes >= timeout_minutes:
-                        # Mark as failed - tx was never broadcast or got dropped
-                        mark_pending_transaction_failed(
-                            destination_address=entry.destination_address,
-                            failure_reason=(
-                                f"Transaction {entry.txid[:16]}... not found after "
-                                f"{int(age_minutes)} minutes - likely never broadcast"
-                            ),
-                            data_dir=self.config.data_dir,
-                            txid=entry.txid,
-                            wallet_fingerprint=wallet_fp,
-                        )
-                    elif age_minutes > 30:
+                    # A node may miss or evict a transaction that later confirms.
+                    # Its absence cannot finalize the history row as failed.
+                    if age_minutes > 30:
                         # Log warning after 30 minutes
                         logger.bind(sensitive=True).warning(
                             f"Transaction {entry.txid[:16]}... not found after "

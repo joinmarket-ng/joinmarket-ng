@@ -104,6 +104,7 @@ def history(
     Pass ``--all-wallets`` to disable per-wallet filtering entirely.
     """
     from jmwallet.history import (
+        MONITORING_TIMEOUT_REASON_PREFIX,
         HistoryRole,
         count_other_wallet_entries,
         get_history_stats,
@@ -237,6 +238,8 @@ def history(
                 status = ""
             elif entry.confirmations == 0 and entry.failure_reason == "Pending confirmation":
                 status = " [PENDING]"
+            elif entry.failure_reason.startswith(MONITORING_TIMEOUT_REASON_PREFIX):
+                status = " [TIMED OUT]"
             else:
                 status = " [FAILED]"
             txid_full = entry.txid if entry.txid else "N/A"

@@ -379,9 +379,9 @@ class MakerConfig(WalletConfig):
         ge=10,
         le=1440,
         description=(
-            "Minutes to wait for a pending CoinJoin transaction to appear on-chain "
-            "before marking it as failed. If the taker doesn't broadcast the transaction "
-            "within this time, we assume it was abandoned."
+            "Minutes to monitor an attempt without a recorded transaction ID. "
+            "Also sets the maker input reservation lifetime. Expiration stops local "
+            "monitoring, not transaction validity."
         ),
     )
     pending_tx_abandon_hours: int = Field(
@@ -389,10 +389,9 @@ class MakerConfig(WalletConfig):
         ge=1,
         le=8760,
         description=(
-            "Hours after which a broadcast but unconfirmed transaction is "
-            "marked as abandoned and removed from the pending-monitoring list. "
-            "Bitcoin transactions not confirmed within ~3 days are typically "
-            "dropped from mempools."
+            "Hours to monitor a recorded transaction for confirmation before a local "
+            "monitoring timeout. Explicit wallet refresh can still reconcile later "
+            "confirmation. Default 72 h."
         ),
     )
 

@@ -11,7 +11,7 @@ import struct
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import fields
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Event
 from typing import Any
@@ -28,6 +28,7 @@ except ImportError:  # pragma: no cover - non-POSIX platforms
 
 from jmwallet.backends.base import Transaction
 from jmwallet.history import (
+    MONITORING_TIMEOUT_REASON_PREFIX,
     ORIGIN_CJ_CHANGE,
     ORIGIN_CJ_OUT,
     ORIGIN_DEPOSIT,
@@ -47,6 +48,7 @@ from jmwallet.history import (
     create_taker_history_entry,
     destination_vout_candidates,
     detect_coinjoin_peer_count,
+    expire_pending_transaction_monitoring,
     format_yield_generator_report,
     get_address_history_types,
     get_coinjoin_lineage_outpoints,
@@ -1128,6 +1130,69 @@ class TestPendingTransactions:
         result = get_pending_transactions(temp_data_dir, wallet_fingerprint="cafef00d")
         assert result == []
 
+    def test_get_pending_transactions_only_includes_failed_rows_when_requested(
+        self, temp_data_dir: Path
+    ) -> None:
+        """Failed rows stay out of the normal display but can be reconciled by txid."""
+        wallet_fingerprint = "deadbeef"
+        old_timestamp = (datetime.now() - timedelta(days=2)).isoformat()
+
+        failed = _make_pending_maker_entry(txid="a" * 64, network="regtest")
+        failed.wallet_fingerprint = wallet_fingerprint
+        failed.timestamp = old_timestamp
+        failed.completed_at = old_timestamp
+        failed.failure_reason = "Timed out before confirmation"
+        append_history_entry(failed, temp_data_dir)
+
+        failed_without_txid = _make_pending_maker_entry(txid="", network="regtest")
+        failed_without_txid.wallet_fingerprint = wallet_fingerprint
+        failed_without_txid.timestamp = old_timestamp
+        failed_without_txid.completed_at = old_timestamp
+        failed_without_txid.failure_reason = "Broadcast failed before txid was recorded"
+        append_history_entry(failed_without_txid, temp_data_dir)
+
+        other_wallet_failed = _make_pending_maker_entry(txid="b" * 64, network="regtest")
+        other_wallet_failed.wallet_fingerprint = "otherwallet"
+        other_wallet_failed.timestamp = old_timestamp
+        other_wallet_failed.completed_at = old_timestamp
+        other_wallet_failed.failure_reason = "Timed out before confirmation"
+        append_history_entry(other_wallet_failed, temp_data_dir)
+
+        shadowed_failed = _make_pending_maker_entry(txid="c" * 64, network="regtest")
+        shadowed_failed.wallet_fingerprint = wallet_fingerprint
+        shadowed_failed.timestamp = old_timestamp
+        shadowed_failed.completed_at = old_timestamp
+        shadowed_failed.failure_reason = "Timed out before confirmation"
+        append_history_entry(shadowed_failed, temp_data_dir)
+
+        successful_sibling = TransactionHistoryEntry(
+            timestamp=datetime.now().isoformat(),
+            completed_at=datetime.now().isoformat(),
+            role="maker",
+            success=True,
+            confirmations=2,
+            txid="c" * 64,
+            cj_amount=1_000_000,
+            wallet_fingerprint=wallet_fingerprint,
+            network="regtest",
+        )
+        append_history_entry(successful_sibling, temp_data_dir)
+
+        pending = _make_pending_maker_entry(txid="d" * 64, network="regtest")
+        pending.wallet_fingerprint = wallet_fingerprint
+        append_history_entry(pending, temp_data_dir)
+
+        default_entries = get_pending_transactions(
+            temp_data_dir, wallet_fingerprint=wallet_fingerprint
+        )
+        reconciliation_entries = get_pending_transactions(
+            temp_data_dir, wallet_fingerprint=wallet_fingerprint, include_failed=True
+        )
+
+        assert {entry.txid for entry in default_entries} == {"d" * 64}
+        assert {entry.txid for entry in reconciliation_entries} == {"a" * 64, "d" * 64}
+        assert {entry.txid for entry in reconciliation_entries if entry.completed_at} == {"a" * 64}
+
     def test_update_transaction_confirmation_prefers_pending_duplicate(
         self, temp_data_dir: Path
     ) -> None:
@@ -1229,6 +1294,154 @@ class TestPendingTransactions:
         assert entries[0].confirmations == 0
 
 
+class TestPendingTransactionMonitoringExpiry:
+    """Tests for bounded background transaction monitoring metadata."""
+
+    def test_before_deadline_leaves_transaction_pending(self, temp_data_dir: Path) -> None:
+        entry = _make_pending_maker_entry(txid="a" * 64, network="regtest")
+        entry.timestamp = (datetime.now(UTC) - timedelta(minutes=30)).isoformat()
+        append_history_entry(entry, temp_data_dir)
+
+        expired = expire_pending_transaction_monitoring(
+            entry, max_age_minutes=60, data_dir=temp_data_dir
+        )
+
+        assert expired is False
+        unchanged = read_history(temp_data_dir)[0]
+        assert unchanged.success is False
+        assert unchanged.completed_at == ""
+        assert unchanged.failure_reason == "Pending confirmation"
+
+    @pytest.mark.parametrize(
+        ("txid", "deadline"),
+        [
+            ("b" * 64, "confirmation"),
+            ("", "transaction discovery"),
+        ],
+        ids=["known-txid", "unknown-txid"],
+    )
+    def test_expiry_records_deadline_type_from_txid(
+        self, temp_data_dir: Path, txid: str, deadline: str
+    ) -> None:
+        entry = _make_pending_maker_entry(txid=txid, network="regtest")
+        entry.timestamp = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
+        append_history_entry(entry, temp_data_dir)
+
+        expired = expire_pending_transaction_monitoring(
+            entry, max_age_minutes=60, data_dir=temp_data_dir
+        )
+
+        assert expired is True
+        timed_out = read_history(temp_data_dir)[0]
+        assert timed_out.success is False
+        assert timed_out.completed_at
+        assert timed_out.failure_reason == (
+            f"{MONITORING_TIMEOUT_REASON_PREFIX} {deadline} deadline of 60 minutes elapsed"
+        )
+        assert get_pending_transactions(temp_data_dir) == []
+
+    def test_expiry_updates_only_selected_wallet(self, temp_data_dir: Path) -> None:
+        selected = _make_pending_maker_entry(txid="c" * 64, network="regtest")
+        selected.wallet_fingerprint = "selected"
+        selected.timestamp = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
+        other = _make_pending_maker_entry(txid="d" * 64, network="regtest")
+        other.wallet_fingerprint = "other"
+        other.timestamp = selected.timestamp
+        append_history_entry(selected, temp_data_dir)
+        append_history_entry(other, temp_data_dir)
+
+        expired = expire_pending_transaction_monitoring(
+            selected,
+            max_age_minutes=60,
+            data_dir=temp_data_dir,
+            wallet_fingerprint="selected",
+        )
+
+        assert expired is True
+        entries = {entry.wallet_fingerprint: entry for entry in read_history(temp_data_dir)}
+        assert entries["selected"].failure_reason.startswith(MONITORING_TIMEOUT_REASON_PREFIX)
+        assert entries["selected"].completed_at
+        assert entries["other"].failure_reason == "Pending confirmation"
+        assert entries["other"].completed_at == ""
+
+    def test_expiry_does_not_overwrite_concurrent_confirmation(self, temp_data_dir: Path) -> None:
+        txid = "e" * 64
+        entry = _make_pending_maker_entry(txid=txid, network="regtest")
+        entry.timestamp = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
+        append_history_entry(entry, temp_data_dir)
+        stale_pending = read_history(temp_data_dir)[0]
+        monitoring_started = Event()
+        confirmation_finished = Event()
+        original_mark_failed = mark_pending_transaction_failed
+
+        def confirm_while_monitoring_is_pending() -> None:
+            assert monitoring_started.wait(timeout=2)
+            assert update_transaction_confirmation(txid, 1, temp_data_dir)
+            confirmation_finished.set()
+
+        def mark_after_confirmation(*args: Any, **kwargs: Any) -> bool:
+            monitoring_started.set()
+            assert confirmation_finished.wait(timeout=2)
+            return original_mark_failed(*args, **kwargs)
+
+        with patch(
+            "jmwallet.history.mark_pending_transaction_failed", side_effect=mark_after_confirmation
+        ):
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                confirmation = executor.submit(confirm_while_monitoring_is_pending)
+                expired = expire_pending_transaction_monitoring(
+                    stale_pending, max_age_minutes=60, data_dir=temp_data_dir
+                )
+                confirmation.result(timeout=2)
+
+        assert expired is True
+        confirmed = read_history(temp_data_dir)[0]
+        assert confirmed.success is True
+        assert confirmed.confirmations == 1
+        assert confirmed.failure_reason == ""
+
+    def test_invalid_timestamp_does_not_mutate_history(self, temp_data_dir: Path) -> None:
+        entry = _make_pending_maker_entry(txid="f" * 64, network="regtest")
+        entry.timestamp = "not-a-timestamp"
+        append_history_entry(entry, temp_data_dir)
+        history_path = temp_data_dir / "history.csv"
+        before = history_path.read_bytes()
+
+        expired = expire_pending_transaction_monitoring(
+            entry, max_age_minutes=60, data_dir=temp_data_dir
+        )
+
+        assert expired is False
+        assert history_path.read_bytes() == before
+
+    @pytest.mark.asyncio
+    async def test_timed_out_transaction_recovers_on_explicit_refresh(
+        self, temp_data_dir: Path
+    ) -> None:
+        txid = "0" * 64
+        entry = _make_pending_maker_entry(txid=txid, network="regtest")
+        entry.timestamp = (datetime.now(UTC) - timedelta(days=2)).isoformat()
+        append_history_entry(entry, temp_data_dir)
+        assert expire_pending_transaction_monitoring(
+            entry, max_age_minutes=60, data_dir=temp_data_dir
+        )
+
+        mock_backend = MagicMock()
+        mock_backend.can_get_confirmations_by_txid.return_value = True
+        mock_backend.get_transaction = AsyncMock(
+            return_value=Transaction(txid=txid, raw="00", confirmations=2, block_height=123)
+        )
+
+        updated = await update_all_pending_transactions(mock_backend, data_dir=temp_data_dir)
+
+        assert updated == 1
+        mock_backend.get_transaction.assert_awaited_once_with(txid)
+        recovered = read_history(temp_data_dir)[0]
+        assert recovered.success is True
+        assert recovered.confirmations == 2
+        assert recovered.failure_reason == ""
+
+
 class TestPendingConfirmationRefresh:
     """Tests for update_all_pending_transactions behavior."""
 
@@ -1290,6 +1503,111 @@ class TestPendingConfirmationRefresh:
         assert entries[0].txid == "confirmed_txid"
         assert entries[0].success is True
         assert entries[0].confirmations == 3
+
+    @pytest.mark.asyncio
+    async def test_core_confirmation_repairs_two_day_old_failed_row(
+        self, temp_data_dir: Path
+    ) -> None:
+        txid = "1" * 64
+        old_timestamp = (datetime.now() - timedelta(days=2)).isoformat()
+        failed = _make_pending_maker_entry(txid=txid, network="regtest")
+        failed.timestamp = old_timestamp
+        failed.completed_at = old_timestamp
+        failed.failure_reason = "Transaction not found after timeout"
+        append_history_entry(failed, temp_data_dir)
+
+        mock_backend = MagicMock()
+        mock_backend.can_get_confirmations_by_txid.return_value = True
+        mock_backend.get_transaction = AsyncMock(
+            return_value=Transaction(
+                txid=txid,
+                raw="00",
+                confirmations=3,
+                block_height=123,
+            )
+        )
+
+        updated = await update_all_pending_transactions(mock_backend, data_dir=temp_data_dir)
+
+        assert updated == 1
+        repaired = read_history(temp_data_dir)[0]
+        assert repaired.success is True
+        assert repaired.confirmations == 3
+        assert repaired.failure_reason == ""
+        assert repaired.completed_at != old_timestamp
+
+    @pytest.mark.asyncio
+    async def test_neutrino_confirmation_repairs_two_day_old_failed_row(
+        self, temp_data_dir: Path
+    ) -> None:
+        txid = "2" * 64
+        old_timestamp = (datetime.now() - timedelta(days=2)).isoformat()
+        failed = _make_pending_maker_entry(txid=txid, network="regtest")
+        failed.timestamp = old_timestamp
+        failed.completed_at = old_timestamp
+        failed.failure_reason = "Transaction not found after timeout"
+        failed.destination_vout = 4
+        append_history_entry(failed, temp_data_dir)
+
+        mock_backend = MagicMock()
+        mock_backend.can_get_confirmations_by_txid.return_value = False
+        mock_backend.get_block_height = AsyncMock(return_value=200)
+        mock_backend.verify_tx_output = AsyncMock(return_value=True)
+
+        updated = await update_all_pending_transactions(mock_backend, data_dir=temp_data_dir)
+
+        assert updated == 1
+        repaired = read_history(temp_data_dir)[0]
+        assert repaired.success is True
+        assert repaired.confirmations == 1
+        assert repaired.failure_reason == ""
+        assert repaired.completed_at != old_timestamp
+        mock_backend.verify_tx_output.assert_awaited_once_with(
+            txid=txid,
+            vout=4,
+            address=failed.destination_address,
+            start_height=200,
+            include_mempool=False,
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "tx_result",
+        [
+            None,
+            Transaction(txid="unused", raw="00", confirmations=0, block_height=None),
+            Transaction(txid="unused", raw="00", confirmations=-1, block_height=None),
+            RuntimeError("backend unavailable"),
+        ],
+        ids=["missing", "zero-confirmations", "negative-confirmations", "backend-error"],
+    )
+    async def test_failed_row_requires_positive_core_confirmation(
+        self, temp_data_dir: Path, tx_result: Transaction | None | RuntimeError
+    ) -> None:
+        txid = "3" * 64
+        old_timestamp = (datetime.now() - timedelta(days=2)).isoformat()
+        failure_reason = "Transaction not found after timeout"
+        failed = _make_pending_maker_entry(txid=txid, network="regtest")
+        failed.timestamp = old_timestamp
+        failed.completed_at = old_timestamp
+        failed.failure_reason = failure_reason
+        append_history_entry(failed, temp_data_dir)
+
+        mock_backend = MagicMock()
+        mock_backend.can_get_confirmations_by_txid.return_value = True
+        if isinstance(tx_result, RuntimeError):
+            mock_backend.get_transaction = AsyncMock(side_effect=tx_result)
+        else:
+            mock_backend.get_transaction = AsyncMock(return_value=tx_result)
+
+        updated = await update_all_pending_transactions(mock_backend, data_dir=temp_data_dir)
+
+        assert updated == 0
+        unchanged = read_history(temp_data_dir)[0]
+        assert unchanged.success is False
+        assert unchanged.confirmations == 0
+        assert unchanged.failure_reason == failure_reason
+        assert unchanged.completed_at == old_timestamp
 
     @pytest.mark.asyncio
     async def test_confirmation_update_remains_wallet_scoped(self, temp_data_dir: Path) -> None:

@@ -298,11 +298,9 @@ class TakerConfig(WalletConfig):
         ge=1,
         le=336,
         description=(
-            "Hours after which a broadcast but unconfirmed CoinJoin transaction is marked as "
-            "abandoned and removed from the pending-monitoring list. Makers can double-spend "
-            "their inputs at any time, so a CoinJoin not confirmed within a few hours is "
-            "unlikely to ever confirm. Default 24 h; Bitcoin's default mempool expiry is "
-            "336 h (14 days)."
+            "Hours to monitor a recorded CoinJoin for confirmation before a local "
+            "monitoring timeout. Also sets the pending allowance in the input reservation "
+            "lifetime. Explicit wallet refresh can reconcile later confirmation. Default 24 h."
         ),
     )
 

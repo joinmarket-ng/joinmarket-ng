@@ -52,6 +52,10 @@ if TYPE_CHECKING:
 # polling the same already-deeply-confirmed txid forever.
 PENDING_CONFIRMATION_TRACKING_MAX = 6
 
+# Timeouts describe local monitoring, not transaction validity. Keep a stable
+# reason prefix so history can distinguish them without a CSV schema change.
+MONITORING_TIMEOUT_REASON_PREFIX = "Monitoring timed out:"
+
 
 class HistoryWriteError(Exception):
     """Raised when a history entry cannot be persisted to disk."""
@@ -1305,6 +1309,8 @@ def create_maker_history_entry(
 def get_pending_transactions(
     data_dir: Path | None = None,
     wallet_fingerprint: str | None = None,
+    *,
+    include_failed: bool = False,
 ) -> list[TransactionHistoryEntry]:
     """
     Get all pending (unconfirmed) transactions from history.
@@ -1332,6 +1338,11 @@ def get_pending_transactions(
             given wallet (issue #473). This is what prevents another wallet's
             phantom pending transactions from showing up under a freshly
             generated wallet.
+        include_failed: Also check unsuccessful completed rows with a recorded
+            txid. A local timeout or broadcast error cannot prove that a signed
+            transaction will never confirm. Explicit wallet refresh uses this
+            to reconcile old failed rows without restarting background monitoring
+            or reviving unsigned attempts. Only verified confirmation repairs them.
 
     Returns:
         List of pending entries (includes entries without txid)
@@ -1351,7 +1362,7 @@ def get_pending_transactions(
         for e in entries
         if not e.success
         and e.confirmations < PENDING_CONFIRMATION_TRACKING_MAX
-        and not e.completed_at
+        and (not e.completed_at or (include_failed and bool(e.txid)))
         and (not e.txid or (e.wallet_fingerprint, e.txid) not in successful_txids)
     ]
 
@@ -1451,11 +1462,12 @@ def abandon_transaction(
     data_dir: Path | None = None,
     wallet_fingerprint: str | None = None,
 ) -> bool:
-    """Mark a pending transaction as abandoned so the monitor stops checking it.
+    """Explicitly mark a transaction as abandoned in local history.
 
     Sets ``completed_at`` and ``failure_reason`` so ``get_pending_transactions``
-    will no longer return the entry.  ``success`` is left ``False`` and
-    ``confirmations`` stays ``0``.
+    will no longer return the entry by default. Confirmation reconciliation
+    still checks recorded txids: local abandonment cannot invalidate a signed
+    transaction. ``success`` and ``confirmations`` are left unchanged.
 
     Args:
         txid: Transaction ID to abandon
@@ -1792,9 +1804,10 @@ def mark_pending_transaction_failed(
     """
     Mark a pending transaction as failed by matching the destination address and optionally txid.
 
-    This is used when a pending CoinJoin times out - the taker never broadcast
-    the transaction, so we mark it as failed rather than leaving it pending
-    indefinitely.
+    This records a local outcome, not proof that a signed transaction cannot
+    confirm. Timeouts use ``expire_pending_transaction_monitoring`` so they
+    have a distinct reason. Recorded txids remain eligible for confirmation
+    reconciliation on an explicit wallet refresh.
 
     Args:
         destination_address: The CoinJoin destination address to match
@@ -1840,16 +1853,56 @@ def mark_pending_transaction_failed(
         return False
 
 
+def expire_pending_transaction_monitoring(
+    entry: TransactionHistoryEntry,
+    max_age_minutes: int,
+    data_dir: Path | None = None,
+    wallet_fingerprint: str | None = None,
+) -> bool:
+    """Stop active monitoring at its deadline without declaring chain failure.
+
+    Call before backend I/O so even very old entries on an upgraded installation
+    do not restart polling. A successful concurrent confirmation is protected by
+    ``mark_pending_transaction_failed``'s locked state check. Return whether the
+    deadline has elapsed, including when the row was already finalized.
+
+    This only updates local history. It does not abandon the transaction in
+    Bitcoin Core, release inputs, or prevent explicit late-confirmation recovery.
+    Invalid timestamps do not establish an elapsed deadline.
+    """
+    try:
+        timestamp = datetime.fromisoformat(entry.timestamp)
+    except ValueError:
+        return False
+    age = datetime.now(tz=timestamp.tzinfo) - timestamp
+    if age < timedelta(minutes=max_age_minutes):
+        return False
+
+    mark_pending_transaction_failed(
+        destination_address=entry.destination_address,
+        failure_reason=(
+            f"{MONITORING_TIMEOUT_REASON_PREFIX} "
+            f"{'confirmation' if entry.txid else 'transaction discovery'} "
+            f"deadline of {max_age_minutes} minutes elapsed"
+        ),
+        data_dir=data_dir,
+        txid=entry.txid,
+        wallet_fingerprint=wallet_fingerprint,
+    )
+    return True
+
+
 def cleanup_stale_pending_transactions(
     max_age_minutes: int = 60,
     data_dir: Path | None = None,
     wallet_fingerprint: str | None = None,
 ) -> int:
     """
-    Mark all stale pending transactions as failed.
+    Explicit compatibility operation to mark old pending history rows failed.
 
-    This is a cleanup function for entries that got stuck in pending state
-    (e.g., from before the timeout feature was implemented, or due to bugs).
+    Do not call this during automatic monitoring or wallet display: age does
+    not prove failure. This only changes local bookkeeping and cannot cancel
+    a transaction. Recorded txids remain eligible for confirmation reconciliation.
 
     Args:
         max_age_minutes: Mark entries older than this as failed (default: 60)
@@ -2690,8 +2743,9 @@ async def update_all_pending_transactions(
     """
     Update the status of all pending transactions using the blockchain backend.
 
-    This function is called when displaying wallet info or history to ensure
-    pending transactions are updated with their current confirmation status.
+    This function is called when displaying wallet info to ensure recorded
+    transactions are updated with their current confirmation status. Failed
+    rows with a txid are also checked, including timeouts from older versions.
     Particularly important for one-shot coinjoin commands that exit before
     the background monitor can update the status.
 
@@ -2704,7 +2758,9 @@ async def update_all_pending_transactions(
     Returns:
         Number of transactions that were updated
     """
-    pending = get_pending_transactions(data_dir, wallet_fingerprint=wallet_fingerprint)
+    pending = get_pending_transactions(
+        data_dir, wallet_fingerprint=wallet_fingerprint, include_failed=True
+    )
     if not pending:
         return 0
 

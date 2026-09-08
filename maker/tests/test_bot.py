@@ -2012,6 +2012,144 @@ class TestPendingConfirmationNotifications:
         append_history_entry(entry, data_dir=tmp_path)
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("initial_confirmations", [None, 0])
+    async def test_two_day_old_transaction_can_confirm_after_visibility_loss(
+        self, mock_wallet, config, tmp_path, initial_confirmations
+    ):
+        from datetime import datetime, timedelta
+
+        from jmwallet.backends.base import Transaction
+        from jmwallet.history import TransactionHistoryEntry, append_history_entry, read_history
+
+        txid = "ab" * 32
+        entry = TransactionHistoryEntry(
+            timestamp=(datetime.now() - timedelta(days=2)).isoformat(),
+            role="maker",
+            success=False,
+            failure_reason="Pending confirmation",
+            txid=txid,
+            destination_address="bcrt1qlateconfirmation",
+            wallet_fingerprint="deadbeef",
+            network="regtest",
+        )
+        append_history_entry(entry, tmp_path)
+        backend = self._make_backend(confirmations=0)
+        backend.can_get_confirmations_by_txid.return_value = True
+        backend.get_transaction.return_value = (
+            None
+            if initial_confirmations is None
+            else Transaction(txid=txid, raw="", confirmations=initial_confirmations)
+        )
+        bot = MakerBot(wallet=mock_wallet, backend=backend, config=config)
+        notifier = MagicMock(notify_mempool=AsyncMock(), notify_confirmed=AsyncMock())
+
+        with patch("maker.background_tasks.get_notifier", return_value=notifier):
+            await bot._update_pending_history()
+            pending = read_history(tmp_path)[0]
+            assert not pending.success
+            assert pending.completed_at == ""
+            assert pending.failure_reason == "Pending confirmation"
+
+            backend.get_transaction.return_value = Transaction(txid=txid, raw="", confirmations=1)
+            await bot._update_pending_history()
+
+        confirmed = read_history(tmp_path)[0]
+        assert confirmed.success
+        assert confirmed.confirmations == 1
+        assert confirmed.failure_reason == ""
+        notifier.notify_confirmed.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_failed_history_only_repaired_on_explicit_refresh(
+        self, mock_wallet, config, tmp_path
+    ):
+        from jmwallet.backends.base import Transaction
+        from jmwallet.history import (
+            abandon_transaction,
+            read_history,
+            update_all_pending_transactions,
+        )
+
+        self._append_pending(tmp_path)
+        assert abandon_transaction("test_txid_123", "Legacy timeout", tmp_path)
+        backend = self._make_backend(confirmations=0)
+        backend.can_get_confirmations_by_txid.return_value = True
+        backend.get_transaction.return_value = Transaction(
+            txid="test_txid_123", raw="", confirmations=1
+        )
+        bot = MakerBot(wallet=mock_wallet, backend=backend, config=config)
+        await bot._update_pending_history()
+        backend.get_transaction.assert_not_awaited()
+        assert read_history(tmp_path)[0].failure_reason == "Legacy timeout"
+
+        assert (
+            await update_all_pending_transactions(backend, tmp_path, wallet_fingerprint="deadbeef")
+            == 1
+        )
+        backend.get_transaction.assert_awaited_once_with("test_txid_123")
+
+        confirmed = read_history(tmp_path)[0]
+        assert confirmed.success
+        assert confirmed.failure_reason == ""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("txid", "age_minutes", "discovery_minutes", "confirmation_hours"),
+        [
+            ("", 61, 60, 72),
+            ("ab" * 32, 72 * 60 + 1, 60, 72),
+            ("ab" * 32, 100 * 24 * 60, 60, 72),
+            ("", 11, 10, 72),
+            ("ab" * 32, 3 * 60, 60, 2),
+        ],
+    )
+    async def test_expired_monitoring_stops_before_backend_lookup(
+        self,
+        mock_wallet,
+        config,
+        tmp_path,
+        txid,
+        age_minutes,
+        discovery_minutes,
+        confirmation_hours,
+    ):
+        from datetime import datetime, timedelta
+
+        from jmwallet.history import (
+            MONITORING_TIMEOUT_REASON_PREFIX,
+            TransactionHistoryEntry,
+            append_history_entry,
+            read_history,
+        )
+
+        config.pending_tx_timeout_min = discovery_minutes
+        config.pending_tx_abandon_hours = confirmation_hours
+        entry = TransactionHistoryEntry(
+            timestamp=(datetime.now() - timedelta(minutes=age_minutes)).isoformat(),
+            role="maker",
+            success=False,
+            failure_reason="Pending confirmation" if txid else "Awaiting transaction",
+            txid=txid,
+            destination_address="bcrt1qexpiredmonitoring",
+            wallet_fingerprint="deadbeef",
+            network="regtest",
+        )
+        append_history_entry(entry, tmp_path)
+        backend = self._make_backend(confirmations=0)
+        backend.can_get_confirmations_by_txid.return_value = True
+        backend.get_utxos = AsyncMock()
+        bot = MakerBot(wallet=mock_wallet, backend=backend, config=config)
+
+        await bot._update_pending_history()
+        timed_out = read_history(tmp_path)[0]
+        assert not timed_out.success
+        assert timed_out.completed_at
+        assert timed_out.failure_reason.startswith(MONITORING_TIMEOUT_REASON_PREFIX)
+        await bot._update_pending_history()
+        backend.get_transaction.assert_not_awaited()
+        backend.get_utxos.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_notify_confirmed_on_first_confirmation(self, mock_wallet, config, tmp_path):
         from unittest.mock import AsyncMock, patch
 

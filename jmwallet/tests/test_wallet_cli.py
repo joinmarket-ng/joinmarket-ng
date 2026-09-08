@@ -10,6 +10,7 @@ import os
 import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1407,8 +1408,12 @@ async def test_send_reports_dust_change_as_actual_fee():
 
 
 def test_history_command_status_display(monkeypatch):
-    """Test that history command displays correct status for pending, failed, and successful txs."""
-    from jmwallet.history import append_history_entry, create_taker_history_entry
+    """Test status display for pending, failed, timed-out, and successful transactions."""
+    from jmwallet.history import (
+        MONITORING_TIMEOUT_REASON_PREFIX,
+        append_history_entry,
+        create_taker_history_entry,
+    )
 
     with tempfile.TemporaryDirectory() as tmpdir:
         data_dir = Path(tmpdir)
@@ -1468,6 +1473,23 @@ def test_history_command_status_display(monkeypatch):
         )
         append_history_entry(failed_entry, data_dir)
 
+        timed_out_entry = create_taker_history_entry(
+            maker_nicks=["J5maker4"],
+            cj_amount=175000,
+            total_maker_fees=575,
+            mining_fee=125,
+            destination="bc1qtimedout...",
+            change_address="bc1qtimedoutchange...",
+            source_mixdepth=0,
+            selected_utxos=[("utxo4", 0)],
+            txid="d" * 64,
+            success=False,
+            failure_reason=(
+                f"{MONITORING_TIMEOUT_REASON_PREFIX} confirmation deadline of 60 minutes elapsed"
+            ),
+        )
+        append_history_entry(timed_out_entry, data_dir)
+
         # Run the history command
         result = runner.invoke(app, ["history", "--data-dir", str(data_dir)])
 
@@ -1476,21 +1498,28 @@ def test_history_command_status_display(monkeypatch):
         # Verify status labels
         assert "[PENDING]" in result.stdout, "Pending transaction should show [PENDING]"
         assert "[FAILED]" in result.stdout, "Failed transaction should show [FAILED]"
+        assert "[TIMED OUT]" in result.stdout, "Timed-out transaction should show [TIMED OUT]"
 
         # Count occurrences to ensure the successful transaction doesn't have a status label
         lines = result.stdout.split("\n")
-        status_lines = [line for line in lines if "aa" in line or "bb" in line or "cc" in line]
+        status_lines = [
+            line for line in lines if "aa" in line or "bb" in line or "cc" in line or "dd" in line
+        ]
 
         # Verify specific txids have correct status
         pending_line = next((line for line in status_lines if "aa" in line), None)
         success_line = next((line for line in status_lines if "bb" in line), None)
         failed_line = next((line for line in status_lines if "cc" in line), None)
+        timed_out_line = next((line for line in status_lines if "dd" in line), None)
 
         assert pending_line and "[PENDING]" in pending_line, "Pending tx should have [PENDING]"
         assert (
             success_line and "[PENDING]" not in success_line and "[FAILED]" not in success_line
         ), "Success tx should have no status label"
         assert failed_line and "[FAILED]" in failed_line, "Failed tx should have [FAILED]"
+        assert timed_out_line and "[TIMED OUT]" in timed_out_line, (
+            "Timed-out tx should have [TIMED OUT]"
+        )
 
 
 def test_history_stats_marks_reconstructed_estimates() -> None:
@@ -2809,6 +2838,108 @@ def _make_descriptor_info_mock_backend() -> MagicMock:
     mock_backend.supports_watch_address = False
     mock_backend.supports_descriptor_scan = True
     return mock_backend
+
+
+@pytest.mark.asyncio
+async def test_info_keeps_old_mempool_row_pending_and_repairs_later_confirmation(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Info does not age-fail a mempool row and can repair a legacy failed row."""
+    from jmwallet.backends.base import Transaction
+    from jmwallet.backends.descriptor_wallet import get_mnemonic_fingerprint
+    from jmwallet.cli.wallet import _show_wallet_info
+    from jmwallet.history import (
+        TransactionHistoryEntry,
+        append_history_entry,
+        cleanup_stale_pending_transactions,
+        read_history,
+    )
+
+    mnemonic = "abandon " * 11 + "about"
+    wallet_fingerprint = get_mnemonic_fingerprint(mnemonic, "")
+    txid = "4" * 64
+    old_timestamp = (datetime.now() - timedelta(days=2)).isoformat()
+    append_history_entry(
+        TransactionHistoryEntry(
+            timestamp=old_timestamp,
+            role="maker",
+            success=False,
+            failure_reason="Pending confirmation",
+            confirmations=0,
+            txid=txid,
+            cj_amount=1_000_000,
+            destination_address="bcrt1qoldpendinghistory0000000000000000000000000",
+            wallet_fingerprint=wallet_fingerprint,
+            network="regtest",
+        ),
+        tmp_path,
+    )
+    backend_settings = ResolvedBackendSettings(
+        network="regtest",
+        bitcoin_network="regtest",
+        backend_type="descriptor_wallet",
+        rpc_url="http://127.0.0.1:18443",
+        rpc_user="user",
+        rpc_password="pass",
+        neutrino_url="",
+        neutrino_add_peers=[],
+        data_dir=tmp_path,
+    )
+    mock_backend = _make_descriptor_info_mock_backend()
+    mock_backend.can_get_confirmations_by_txid.return_value = True
+    mock_backend.get_transaction = AsyncMock(
+        side_effect=[
+            Transaction(txid=txid, raw="00", confirmations=0, block_height=None),
+            Transaction(txid=txid, raw="00", confirmations=2, block_height=123),
+        ]
+    )
+    mock_wallet = MagicMock()
+    mock_wallet.wallet_fingerprint = wallet_fingerprint
+    mock_wallet.sync_with_registered_bonds = AsyncMock(return_value={})
+    mock_wallet.get_total_balance = AsyncMock(return_value=0)
+    mock_wallet.get_fidelity_bond_balance = AsyncMock(return_value=0)
+    mock_wallet.get_balance = AsyncMock(return_value=0)
+    mock_wallet.get_next_safe_deposit_address = AsyncMock(
+        return_value=("bcrt1qnextunused000000000000000000000000000000", False)
+    )
+    mock_wallet.utxo_cache = {}
+    mock_wallet.close = AsyncMock()
+
+    with (
+        patch(
+            "jmwallet.backends.descriptor_wallet.DescriptorWalletBackend",
+            _stub_backend_class(mock_backend),
+        ),
+        patch("jmwallet.wallet.service.WalletService", return_value=mock_wallet),
+    ):
+        await _show_wallet_info(mnemonic, backend_settings, reconstruct_history=False)
+
+        first_info_output = capsys.readouterr().out
+        pending = read_history(tmp_path)[0]
+        assert "Pending Transactions: 1" in first_info_output
+        assert pending.success is False
+        assert pending.completed_at == ""
+        assert pending.failure_reason == "Pending confirmation"
+
+        # Represent a row failed by the compatibility cleanup API in an older run.
+        assert (
+            cleanup_stale_pending_transactions(
+                max_age_minutes=60,
+                data_dir=tmp_path,
+                wallet_fingerprint=wallet_fingerprint,
+            )
+            == 1
+        )
+        assert read_history(tmp_path)[0].success is False
+        assert read_history(tmp_path)[0].completed_at != ""
+
+        await _show_wallet_info(mnemonic, backend_settings, reconstruct_history=False)
+
+    repaired = read_history(tmp_path)[0]
+    assert repaired.success is True
+    assert repaired.confirmations == 2
+    assert repaired.failure_reason == ""
+    mock_wallet.close.assert_awaited()
 
 
 def _make_rescan_scan_depth_backend() -> MagicMock:
