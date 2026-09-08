@@ -60,6 +60,14 @@ whole. If none succeed, the maker still starts and relies on background reconnec
 Tor connection failures and reconnect delays are separate from orderbook response
 limits.
 
+Orderbook responses are sent to connected directories concurrently. Each directory
+has five seconds to flush a complete response, including all offers. This bounds
+local write backpressure; it does not wait for a reply from the taker. A timed-out
+connection is aborted and recovered through the same background reconnect task.
+Healthy directories can receive responses while another directory's write is stalled.
+Severe congestion can trigger this disconnect even if the directory is otherwise
+reachable. The response budget is unchanged, and failed sends are not queued or retried.
+
 ## Orderbook Rate Limits
 
 Makers limit `!orderbook` responses to keep unsolicited requests from exhausting

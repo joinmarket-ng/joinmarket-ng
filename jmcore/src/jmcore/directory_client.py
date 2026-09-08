@@ -1575,6 +1575,14 @@ class DirectoryClient:
         }
         await self.connection.send(json.dumps(privmsg).encode("utf-8"))
 
+    def abort(self) -> None:
+        """Detach a stalled connection without waiting for buffered writes to flush."""
+        connection = self.connection
+        self.connection = None
+        self.directory_nick_authenticated = False
+        if connection is not None:
+            connection.abort()
+
     async def close(self) -> None:
         """Close the connection to the directory server."""
         connection = self.connection

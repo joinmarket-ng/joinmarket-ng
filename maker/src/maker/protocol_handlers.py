@@ -57,6 +57,9 @@ if TYPE_CHECKING:
 
 
 _HANDLER_CANCEL_GRACE_SEC = 0.5
+# Bound local write backpressure, including send-lock contention. This does not
+# wait for a remote acknowledgment or a Tor round trip.
+_ORDERBOOK_SEND_TIMEOUT_SEC = 5.0
 # Admission is capped before task creation, which also bounds the
 # cancellation-suppressing subset retained after reaper detachment.
 MAX_SESSION_HANDLER_TASKS = 128
@@ -279,7 +282,7 @@ class ProtocolHandlersMixin:
                     # Note: Ban events are already logged by check() method, so we skip
                     # logging here to avoid duplicate log messages
                     if not is_banned:
-                        should_log = violations <= 1 or violations % 10 == 0
+                        should_log = violations > 0 and (violations == 1 or violations % 10 == 0)
 
                         if should_log:
                             # Show backoff level for context
@@ -352,6 +355,7 @@ class ProtocolHandlersMixin:
                 if generation_id == self.current_generation_id
                 else generation.current_offers
             )
+            responses: list[tuple[str, str]] = []
             for offer in offers:
                 # Format offer data (parameters without the command)
                 order_type_str = offer.ordertype.value
@@ -373,15 +377,37 @@ class ProtocolHandlersMixin:
                             f"(proof length: {len(bond_proof)})"
                         )
 
-                # Send via all connected directory clients
-                for client in self._generation_clients(generation_id).values():
-                    try:
-                        # Send as PRIVMSG
-                        # Format: taker_nick!maker_nick!<order_type> <data> <signature>
-                        await client.send_private_message(taker_nick, order_type_str, data)
-                        logger.trace(f"Sent {order_type_str} offer to {taker_nick}")
-                    except Exception as e:
-                        logger.error(f"Failed to send offer to {taker_nick} via directory: {e}")
+                responses.append((order_type_str, data))
+
+            async def send_offers(client: DirectoryClient) -> None:
+                try:
+                    # One deadline for this directory's complete response. Snapshot
+                    # clients below because listeners can remove failed connections.
+                    async with asyncio.timeout(_ORDERBOOK_SEND_TIMEOUT_SEC):
+                        for order_type_str, data in responses:
+                            try:
+                                await client.send_private_message(taker_nick, order_type_str, data)
+                                logger.trace(f"Sent {order_type_str} offer to {taker_nick}")
+                            except TimeoutError:
+                                raise
+                            except Exception as e:
+                                logger.error(
+                                    f"Failed to send offer to {taker_nick} via directory: {e}"
+                                )
+                except TimeoutError:
+                    # Graceful close can itself wait for a blocked writer. Abort
+                    # wakes the listener, which owns removal and reconnect notices.
+                    client.abort()
+                    logger.warning("Directory orderbook response timed out; disconnecting")
+                except Exception as e:
+                    logger.error(f"Failed to send offer to {taker_nick} via directory: {e}")
+
+            # No detached response tasks or queue: admission still happens above,
+            # and every directory send completes or times out before returning.
+            clients = list(self._generation_clients(generation_id).values())
+            async with asyncio.TaskGroup() as sends:
+                for client in clients:
+                    sends.create_task(send_offers(client))
 
         except Exception as e:
             logger.error(f"Failed to send offers to taker {taker_nick}: {e}")

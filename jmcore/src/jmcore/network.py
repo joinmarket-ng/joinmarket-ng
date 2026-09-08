@@ -102,6 +102,11 @@ class TCPConnection(Connection):
                 logger.bind(sensitive=True).trace(f"TCPConnection.receive: connection error: {e}")
                 raise ConnectionError(f"Connection lost: {e}") from e
 
+    def abort(self) -> None:
+        """Disconnect immediately, discarding writes that cannot make progress."""
+        self._connected = False
+        self.writer.transport.abort()
+
     async def close(self) -> None:
         # I/O failures mark the connection disconnected without closing its transport.
         self._connected = False

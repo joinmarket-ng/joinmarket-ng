@@ -91,6 +91,21 @@ async def test_five_requesters_across_seven_directories_spend_five_tokens(bot: M
     assert sum(bot._orderbook_proof_work_limiter.try_consume() for _ in range(16)) == 15
 
 
+async def test_fanout_does_not_log_spam_backoff_but_repeated_source_does(bot: MakerBot) -> None:
+    sources = bot.config.directory_servers
+    with patch("maker.protocol_handlers.logger.debug") as debug:
+        await request(bot, "J5watcher", sources[0])
+        await request(bot, "J5watcher", sources[1])
+        debug.assert_not_called()
+        assert bot._orderbook_rate_limiter.get_violation_count("J5watcher") == 0
+
+        await request(bot, "J5watcher", sources[1])
+        assert bot._orderbook_rate_limiter.get_violation_count("J5watcher") == 1
+        debug.assert_any_call(
+            "Rate limiting orderbook request from J5watcher (violations: 1, backoff: NORMAL)"
+        )
+
+
 @pytest.mark.parametrize("bonded", [False, True])
 async def test_default_global_burst_and_recovery(
     bot: MakerBot, now: list[float], bonded: bool

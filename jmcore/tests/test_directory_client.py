@@ -532,6 +532,25 @@ async def test_close_clears_authentication_state_when_transport_close_fails() ->
 
 
 @pytest.mark.asyncio
+async def test_abort_detaches_connection_and_does_not_wait_for_graceful_close() -> None:
+    connection = Mock(close=AsyncMock())
+    client = DirectoryClient("directory-a", 5222, "regtest")
+    client.connection = connection
+    client.directory_nick_authenticated = True
+
+    client.abort()
+    client.abort()
+    await client.close()
+
+    connection.abort.assert_called_once_with()
+    connection.close.assert_not_awaited()
+    assert client.connection is None
+    assert client.directory_nick_authenticated is False
+    with pytest.raises(DirectoryClientError, match="Not connected"):
+        await client.listen_for_messages()
+
+
+@pytest.mark.asyncio
 async def test_nick_auth_mismatched_directory_id_fails_before_proof() -> None:
     selected_host = "a" * 56 + ".onion"
     other_host = "b" * 56 + ".onion"

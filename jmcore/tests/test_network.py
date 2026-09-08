@@ -100,6 +100,24 @@ async def test_tcp_connection_close_is_repeatable() -> None:
     assert writer.wait_closed.await_count == 2
 
 
+@pytest.mark.asyncio
+async def test_tcp_connection_abort_rejects_io_without_waiting_for_close() -> None:
+    writer = Mock(drain=AsyncMock(), wait_closed=AsyncMock())
+    conn = TCPConnection(AsyncMock(), writer)
+
+    conn.abort()
+    conn.abort()
+
+    assert not conn.is_connected()
+    assert writer.transport.abort.call_count == 2
+    writer.wait_closed.assert_not_awaited()
+    with pytest.raises(ConnectionError, match="Connection closed"):
+        await conn.send(b"hello")
+    with pytest.raises(ConnectionError, match="Connection closed"):
+        await conn.receive()
+    writer.write.assert_not_called()
+
+
 def test_connection_pool():
     pool = ConnectionPool(max_connections=2)
     c1 = Mock()
