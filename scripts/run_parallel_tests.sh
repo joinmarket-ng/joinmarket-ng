@@ -918,6 +918,7 @@ run_suite_e2e() {
     local log="${PARALLEL_DIR}/${suite}.log"
     local btc_rpc=$(host_port "$suite" btc_rpc)
     local dir_port=$(host_port "$suite" dir)
+    local dir2_port=$(host_port "$suite" dir2)
     local walletd_port=$(host_port "$suite" walletd)
     local obwatch_port=$(host_port "$suite" obwatch)
     local prefix="${CONTAINER_PREFIX}-${suite}"
@@ -945,6 +946,7 @@ run_suite_e2e() {
         BITCOIN_RPC_PASSWORD=test \
         JMWALLETD_URL="https://127.0.0.1:${walletd_port}" \
         DIRECTORY_PORT="${dir_port}" \
+        DIRECTORY2_PORT="${dir2_port}" \
         OBWATCH_URL="http://127.0.0.1:${obwatch_port}" \
         JM_CONTAINER_PREFIX="${prefix}" \
         COMPOSE_PROJECT_NAME="${PROJECT_PREFIX}-${suite}" \

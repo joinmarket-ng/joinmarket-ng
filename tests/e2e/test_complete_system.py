@@ -44,6 +44,7 @@ _RPC_URL = os.environ.get("BITCOIN_RPC_URL", "http://127.0.0.1:18443")
 _RPC_USER = os.environ.get("BITCOIN_RPC_USER", "test")
 _RPC_PASSWORD = os.environ.get("BITCOIN_RPC_PASSWORD", "test")
 _DIRECTORY_SERVER = f"127.0.0.1:{os.environ.get('DIRECTORY_PORT', '5222')}"
+_DIRECTORY2_SERVER = f"127.0.0.1:{os.environ.get('DIRECTORY2_PORT', '5223')}"
 
 
 def _suite_data_dir() -> Path:
@@ -80,40 +81,6 @@ GENERIC_TEST_MNEMONIC = (
 
 # Address used for mining blocks (valid P2WPKH on regtest)
 MINING_ADDRESS = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"
-
-
-def _wait_for_offer_fee_profiles(
-    expected_fees: set[str], timeout: float = 120.0
-) -> bool:
-    """Wait until the watcher contains every maker fee profile required by a test."""
-    import json
-    import time
-    import urllib.error
-    import urllib.request
-
-    from tests.e2e.docker_utils import get_orderbook_watcher_url
-
-    url = f"{get_orderbook_watcher_url()}/orderbook.json"
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            with urllib.request.urlopen(url, timeout=3) as response:
-                offers = json.loads(response.read().decode("utf-8")).get("offers", [])
-        except (
-            urllib.error.URLError,
-            OSError,
-            json.JSONDecodeError,
-            TimeoutError,
-        ):
-            time.sleep(2)
-            continue
-
-        observed_fees = {str(offer.get("cjfee")) for offer in offers}
-        if expected_fees <= observed_fees:
-            return True
-        time.sleep(2)
-
-    return False
 
 
 def _require_docker_container(service: str) -> None:
@@ -1069,11 +1036,8 @@ async def test_coinjoin_replaces_failed_maker_without_redriving_survivor(
     from tests.e2e.docker_utils import get_container_name
     from tests.e2e.rpc_utils import mine_blocks
 
-    for service in ("maker1", "maker2", "maker3"):
+    for service in ("directory2", "maker1", "maker2", "maker3"):
         _require_docker_container(service)
-    assert _wait_for_offer_fee_profiles({"0.001", "0.0005", "0.0002"}), (
-        "Required maker1, maker2, and maker3 fee profiles did not become ready"
-    )
 
     await mine_blocks(10, MINING_ADDRESS)
     wallet = WalletService(
@@ -1086,7 +1050,14 @@ async def test_coinjoin_replaces_failed_maker_without_redriving_survivor(
     await wallet.sync_all()
 
     config = taker_config.model_copy(
-        update={"maker_timeout_sec": 10, "max_maker_replacement_attempts": 2}
+        update={
+            # Makers may initially connect to either directory. The watcher and
+            # shared taker fixture see only directory1, so this test must discover
+            # its three specific makers through both independent directories.
+            "directory_servers": [_DIRECTORY_SERVER, _DIRECTORY2_SERVER],
+            "maker_timeout_sec": 10,
+            "max_maker_replacement_attempts": 2,
+        }
     )
     taker = Taker(wallet, bitcoin_backend, config)
     stopped_container = get_container_name("maker2")
@@ -1104,6 +1075,16 @@ async def test_coinjoin_replaces_failed_maker_without_redriving_survivor(
             **kwargs: Any,
         ) -> tuple[dict[str, Any], int]:
             hard_excludes = kwargs.get("hard_exclude_nicks") or set()
+            if not hard_excludes:
+                # Validate readiness using the actual CoinJoin discovery, without
+                # a second !orderbook request that could hit the maker rate limit.
+                observed_fees = {
+                    str(offer.cjfee) for offer in taker.orderbook_manager.offers
+                }
+                assert {"0.001", "0.0005", "0.0002"} <= observed_fees, (
+                    "Required maker1, maker2, and maker3 fee profiles not discovered: "
+                    f"{sorted(observed_fees)}"
+                )
             fees = ["0.001", "0.0005"] if not hard_excludes else ["0.0002"]
             selected: dict[str, Any] = {}
             for fee in fees:
