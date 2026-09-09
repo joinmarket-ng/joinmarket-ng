@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -15,6 +17,75 @@ SCRIPT_PATH = (
 )
 MNEMONIC = "abandon " * 11 + "about"
 PASSPHRASE = "test wallet passphrase"
+
+
+def _run_test_shell(
+    command: list[str], *, input_text: str, env: dict[str, str], timeout: float
+) -> subprocess.CompletedProcess[str]:
+    """Run a shell without a controlling terminal and clean up its process group on errors."""
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = process.communicate(input_text, timeout=timeout)
+    except BaseException:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.communicate()
+        raise
+
+    assert process.returncode is not None
+    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+
+
+def _process_exists(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def test_run_test_shell_kills_descendants_on_timeout(tmp_path: Path) -> None:
+    child_pid_path = tmp_path / "child.pid"
+    dummy_script_path = tmp_path / "dummy-script.py"
+    dummy_script_path.write_text(
+        """
+import os
+import signal
+import subprocess
+import sys
+from pathlib import Path
+
+child = subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()"])
+Path(os.environ["CHILD_PID_PATH"]).write_text(str(child.pid))
+child.wait()
+"""
+    )
+    env = os.environ.copy()
+    env["CHILD_PID_PATH"] = str(child_pid_path)
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        _run_test_shell(
+            [sys.executable, str(dummy_script_path)],
+            input_text="",
+            env=env,
+            timeout=3,
+        )
+
+    child_pid = int(child_pid_path.read_text())
+    deadline = time.monotonic() + 1
+    while _process_exists(child_pid) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert not _process_exists(child_pid)
 
 
 @pytest.mark.parametrize("view", ["BASIC", "EXT"])
@@ -89,14 +160,11 @@ with patch('jmwallet.cli.wallet._show_wallet_info', show_info):
         MAKER_ENV=str(tmp_path / ".maker.env"),
         INFO_CHOICE=view,
     )
-    result = subprocess.run(
+    result = _run_test_shell(
         ["bash", str(shell_path)],
-        input=passphrase + ("\ny\n" if confirm else "\nn\n"),
+        input_text=passphrase + ("\ny\n" if confirm else "\nn\n"),
         env=env,
-        capture_output=True,
-        text=True,
         timeout=30,
-        check=False,
     )
     assert result.returncode == 0, result.stderr
     expected = get_mnemonic_fingerprint(MNEMONIC, passphrase)
