@@ -29,6 +29,7 @@ from maker.fidelity import FidelityBondInfo
 _HOST = "127.0.0.1"
 _STARTUP_TIMEOUT = 5.0
 _RESPONSE_TIMEOUT = 5.0
+_CAPACITY_COMPLETION_TIMEOUT = 30.0
 _TEARDOWN_TIMEOUT = 5.0
 _REQUESTER_COUNT = 5
 
@@ -56,27 +57,27 @@ async def _wait_for_server_start(server: DirectoryServer, server_task: asyncio.T
     return int(server.server.sockets[0].getsockname()[1])
 
 
-async def _receive_offer(client: DirectoryClient, maker_nick: str) -> dict[str, Any]:
+async def _receive_offer(
+    client: DirectoryClient, maker_nick: str, response_timeout: float = _RESPONSE_TIMEOUT
+) -> dict[str, Any]:
     """Receive the offer addressed to ``client`` while skipping public fanout copies."""
     assert client.connection is not None
-    deadline = asyncio.get_running_loop().time() + _RESPONSE_TIMEOUT
-    while True:
-        remaining = deadline - asyncio.get_running_loop().time()
-        if remaining <= 0:
-            raise TimeoutError(f"Timed out waiting for offer on {client.host}:{client.port}")
-        message = json.loads(
-            (await asyncio.wait_for(client.connection.receive(), timeout=remaining)).decode("utf-8")
-        )
-        line = message.get("line", "")
-        parts = line.split(COMMAND_PREFIX, 2)
-        if (
-            message.get("type") == MessageType.PRIVMSG.value
-            and len(parts) == 3
-            and parts[0] == maker_nick
-            and parts[1] == client.nick
-            and parts[2].split(maxsplit=1)[0] == OfferType.SW0_RELATIVE.value
-        ):
-            return message
+    try:
+        async with asyncio.timeout(response_timeout):
+            while True:
+                message = json.loads((await client.connection.receive()).decode("utf-8"))
+                line = message.get("line", "")
+                parts = line.split(COMMAND_PREFIX, 2)
+                if (
+                    message.get("type") == MessageType.PRIVMSG.value
+                    and len(parts) == 3
+                    and parts[0] == maker_nick
+                    and parts[1] == client.nick
+                    and parts[2].split(maxsplit=1)[0] == OfferType.SW0_RELATIVE.value
+                ):
+                    return message
+    except TimeoutError as exc:
+        raise TimeoutError(f"Timed out waiting for offer on {client.host}:{client.port}") from exc
 
 
 def _unexpected_failures(results: Sequence[object]) -> list[BaseException]:
@@ -294,11 +295,13 @@ async def test_orderbook_fanout_over_real_regtest_tcp(directory_count: int, tmp_
         await harness.close()
 
 
-async def _receive_bonded_offers(client: DirectoryClient, maker_nick: str) -> None:
+async def _receive_bonded_offers(
+    client: DirectoryClient, maker_nick: str, response_timeout: float = _RESPONSE_TIMEOUT
+) -> None:
     """Check that both signed offers and their requester-bound proofs survive routing."""
     offer_ids = set()
     for _ in range(2):
-        message = await _receive_offer(client, maker_nick)
+        message = await _receive_offer(client, maker_nick, response_timeout)
         command_data = message["line"].split(COMMAND_PREFIX, 2)[2]
         authenticated, command, data = verify_signed_privmsg(maker_nick, command_data, ONION_HOSTID)
         assert authenticated
@@ -344,11 +347,15 @@ async def test_bonded_discovery_capacity_over_real_tcp(
             async with asyncio.TaskGroup() as exchange:
                 for client in requester.clients:
                     exchange.create_task(client.send_public_message("orderbook"))
-                    exchange.create_task(_receive_bonded_offers(client, bot.nick))
+                    exchange.create_task(
+                        _receive_bonded_offers(client, bot.nick, _CAPACITY_COMPLETION_TIMEOUT)
+                    )
 
-        async with asyncio.TaskGroup() as discoveries:
-            for index, requester in enumerate(harness.requesters):
-                discoveries.create_task(discover(requester, index))
+        # This bounds aggregate capacity-test completion, not the Maker send deadline.
+        async with asyncio.timeout(_CAPACITY_COMPLETION_TIMEOUT):
+            async with asyncio.TaskGroup() as discoveries:
+                for index, requester in enumerate(harness.requesters):
+                    discoveries.create_task(discover(requester, index))
 
         expected_duplicates = requester_count * (directory_count - 1)
         await _wait_until(
