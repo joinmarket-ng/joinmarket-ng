@@ -1930,5 +1930,287 @@ async def test_on_tx_rejects_noncanonical_transaction_base64():
     inner.handle_tx.assert_not_awaited()
 
 
+def _append_awaiting_maker_history(
+    data_dir, *, wallet_fingerprint: str, destination: str, change_address: str, source_address: str
+) -> None:
+    from jmwallet.history import append_history_entry, create_maker_history_entry
+
+    entry = create_maker_history_entry(
+        taker_nick="J5FeePolicyTaker",
+        cj_amount=10_000,
+        fee_received=0,
+        txfee_contribution=0,
+        cj_address=destination,
+        change_address=change_address,
+        our_utxos=[("aa" * 32, 0)],
+        wallet_fingerprint=wallet_fingerprint,
+        source_addresses=[source_address],
+        input_value=10_000,
+    )
+    entry.failure_reason = "Awaiting transaction"
+    append_history_entry(entry, data_dir=data_dir)
+
+
+def _low_fee_maker_session(data_dir, client):
+    from unittest.mock import AsyncMock, MagicMock
+
+    from jmwallet.backends.base import UTXO
+
+    from maker.coinjoin import CoinJoinSession, CoinJoinState
+    from maker.maker_session import MakerSession
+
+    source_address = "bcrt1qmakerinputforfeepolicy0000000000000000"
+    cj_address = "bcrt1qmakercjforfeepolicy000000000000000000"
+    change_address = "bcrt1qmakerchangeforfeepolicy00000000000000"
+    outpoint = ("aa" * 32, 0)
+    wallet = MagicMock()
+    wallet.network = "regtest"
+    backend = MagicMock()
+    backend.requires_neutrino_metadata.return_value = False
+    backend.can_lookup_arbitrary_utxos.return_value = True
+    backend.get_utxo = AsyncMock(
+        return_value=UTXO("bb" * 32, 1, 10_000, "bcrt1qforeign", 1, "0014" + "22" * 20)
+    )
+    inner = CoinJoinSession(
+        taker_nick="J5FeePolicyTaker",
+        offer=MagicMock(),
+        wallet=wallet,
+        backend=backend,
+        minimum_fee_rate_sat_vb=2.0,
+    )
+    inner.state = CoinJoinState.IOAUTH_SENT
+    inner.our_utxos = {outpoint: MagicMock(value=10_000, address=source_address)}
+    inner.cj_address = cj_address
+    inner.change_address = change_address
+    inner.crypto = MagicMock()
+    inner.crypto.is_encrypted = True
+    low_fee_transaction = bytes.fromhex(_fee_policy_tx(19_800))
+    inner.crypto.decrypt.return_value = base64.b64encode(low_fee_transaction).decode("ascii")
+    session = MakerSession(inner)
+
+    bot = MagicMock()
+    bot.active_sessions = {_session_key(inner.taker_nick): session}
+    bot.config.data_dir = data_dir
+    bot.wallet.wallet_fingerprint = "maker-wallet"
+    bot._generation_clients.return_value = {"directory.test:5222": client}
+    return session, bot, wallet, source_address, cj_address, change_address
+
+
+@pytest.mark.asyncio
+async def test_on_tx_low_fee_refusal_finalizes_history_sends_diagnostic_and_logs_rates(tmp_path):
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from jmcore.log_filter import sensitive_log_filter
+    from jmwallet.history import get_pending_transactions, get_used_addresses, read_history
+
+    client = MagicMock()
+    client.send_private_message = AsyncMock()
+    session, bot, wallet, source_address, cj_address, change_address = _low_fee_maker_session(
+        tmp_path, client
+    )
+    _append_awaiting_maker_history(
+        tmp_path,
+        wallet_fingerprint="maker-wallet",
+        destination=cj_address,
+        change_address=change_address,
+        source_address=source_address,
+    )
+    _append_awaiting_maker_history(
+        tmp_path,
+        wallet_fingerprint="other-wallet",
+        destination=cj_address,
+        change_address="bcrt1qotherwalletchange000000000000000000000",
+        source_address="bcrt1qotherwalletsource000000000000000000000",
+    )
+    signed = AsyncMock()
+    normal_logs: list[str] = []
+    handler_id = logger.add(
+        lambda message: normal_logs.append(message.record["message"]),
+        level="INFO",
+        filter=sensitive_log_filter(),
+    )
+    try:
+        with (
+            patch("maker.coinjoin.verify_unsigned_transaction", return_value=(True, "")),
+            patch.object(session.inner, "_sign_transaction", new=signed),
+            patch("maker.maker_session.get_notifier", return_value=MagicMock()),
+            patch("maker.maker_session.spawn_task"),
+        ):
+            await session.on_tx(bot, "tx ciphertext", "dir:test")
+    finally:
+        logger.remove(handler_id)
+
+    diagnostic = "CoinJoin miner fee rate 1.1236 sat/vB is below required 2.0000 sat/vB"
+    signed.assert_not_awaited()
+    client.send_private_message.assert_awaited_once_with(session.taker_nick, "error", diagnostic)
+    session.inner.crypto.encrypt.assert_not_called()
+    assert (
+        "Rejecting CoinJoin before signing: proposed miner fee rate 1.1236 sat/vB, "
+        "required minimum 2.0000 sat/vB"
+    ) in normal_logs
+    assert _session_key(session.taker_nick) not in bot.active_sessions
+    wallet.release_coinjoin_inputs.assert_called_once_with(
+        {("aa" * 32, 0)}, owner=session.inner.input_lock_owner
+    )
+
+    own_entries = read_history(tmp_path, wallet_fingerprint="maker-wallet")
+    assert len(own_entries) == 1
+    assert own_entries[0].txid == ""
+    assert own_entries[0].completed_at
+    assert own_entries[0].failure_reason == f"Signing rejected: {diagnostic}"
+    assert get_pending_transactions(tmp_path, wallet_fingerprint="maker-wallet") == []
+    assert get_used_addresses(tmp_path, wallet_fingerprint="maker-wallet") == {
+        source_address,
+        cj_address,
+        change_address,
+    }
+
+    other_entries = read_history(tmp_path, wallet_fingerprint="other-wallet")
+    assert len(other_entries) == 1
+    assert other_entries[0].failure_reason == "Awaiting transaction"
+    assert other_entries[0].completed_at == ""
+    assert len(get_pending_transactions(tmp_path, wallet_fingerprint="other-wallet")) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "transport_failure", [RuntimeError("directory unavailable"), asyncio.CancelledError()]
+)
+async def test_on_tx_low_fee_refusal_cleanup_survives_transport_failure(
+    tmp_path, transport_failure
+):
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from jmwallet.history import get_pending_transactions, read_history
+
+    client = MagicMock()
+    client.send_private_message = AsyncMock(side_effect=transport_failure)
+    session, bot, wallet, source_address, cj_address, change_address = _low_fee_maker_session(
+        tmp_path, client
+    )
+    _append_awaiting_maker_history(
+        tmp_path,
+        wallet_fingerprint="maker-wallet",
+        destination=cj_address,
+        change_address=change_address,
+        source_address=source_address,
+    )
+
+    with (
+        patch("maker.coinjoin.verify_unsigned_transaction", return_value=(True, "")),
+        patch.object(session.inner, "_sign_transaction", new=AsyncMock()) as signed,
+        patch("maker.maker_session.get_notifier", return_value=MagicMock()),
+        patch("maker.maker_session.spawn_task"),
+    ):
+        if isinstance(transport_failure, asyncio.CancelledError):
+            with pytest.raises(asyncio.CancelledError):
+                await session.on_tx(bot, "tx ciphertext", "dir:test")
+        else:
+            await session.on_tx(bot, "tx ciphertext", "dir:test")
+
+    signed.assert_not_awaited()
+    assert _session_key(session.taker_nick) not in bot.active_sessions
+    wallet.release_coinjoin_inputs.assert_called_once_with(
+        {("aa" * 32, 0)}, owner=session.inner.input_lock_owner
+    )
+    entries = read_history(tmp_path, wallet_fingerprint="maker-wallet")
+    assert entries[0].completed_at
+    assert entries[0].txid == ""
+    assert get_pending_transactions(tmp_path, wallet_fingerprint="maker-wallet") == []
+
+
+@pytest.mark.asyncio
+async def test_on_tx_after_signing_keeps_awaiting_history_and_input_locks(tmp_path):
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from jmwallet.history import get_pending_transactions, read_history
+
+    from maker.coinjoin import CoinJoinState
+    from maker.maker_session import MakerSession
+
+    taker_nick = "J5AfterSigningTaker"
+    source_address = "bcrt1qmakersourceaftersigning000000000000000000"
+    cj_address = "bcrt1qmakercjaftersigning000000000000000000000"
+    change_address = "bcrt1qmakerchangeaftersigning0000000000000000"
+    outpoint = ("aa" * 32, 0)
+    inner = MagicMock()
+    inner.taker_nick = taker_nick
+    inner.state = CoinJoinState.IOAUTH_SENT
+    inner.crypto.is_encrypted = True
+    inner.crypto.decrypt.return_value = base64.b64encode(b"transaction").decode("ascii")
+    inner.our_utxos = {outpoint: MagicMock(address=source_address, value=10_000)}
+    inner.cj_address = cj_address
+    inner.change_address = change_address
+
+    async def fail_after_signing(tx_hex, **kwargs):
+        inner.state = CoinJoinState.SIG_SENT
+        return False, {"error": "later input failed"}
+
+    inner.handle_tx = AsyncMock(side_effect=fail_after_signing)
+    session = MakerSession(inner)
+    session.send_response = AsyncMock()
+    bot = MagicMock()
+    bot.active_sessions = {_session_key(taker_nick): session}
+    bot.config.data_dir = tmp_path
+    bot.wallet.wallet_fingerprint = "maker-wallet"
+    _append_awaiting_maker_history(
+        tmp_path,
+        wallet_fingerprint="maker-wallet",
+        destination=cj_address,
+        change_address=change_address,
+        source_address=source_address,
+    )
+
+    with (
+        patch("maker.maker_session.get_notifier", return_value=MagicMock()),
+        patch("maker.maker_session.spawn_task"),
+    ):
+        await session.on_tx(bot, "tx ciphertext", "dir:test")
+
+    assert _session_key(taker_nick) not in bot.active_sessions
+    session.send_response.assert_not_awaited()
+    inner.wallet.release_coinjoin_inputs.assert_not_called()
+    inner.wallet.renew_coinjoin_inputs.assert_called_once_with(
+        {outpoint}, owner=inner.input_lock_owner, ttl=inner.pending_broadcast_ttl_sec
+    )
+    entries = read_history(tmp_path, wallet_fingerprint="maker-wallet")
+    assert entries[0].failure_reason == "Awaiting transaction"
+    assert entries[0].completed_at == ""
+    assert len(get_pending_transactions(tmp_path, wallet_fingerprint="maker-wallet")) == 1
+
+
+@pytest.mark.asyncio
+async def test_on_tx_masks_non_fee_verification_error_from_taker():
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from maker.coinjoin import CoinJoinState
+    from maker.maker_session import MakerSession
+
+    taker_nick = "J5MaskedErrorTaker"
+    inner = MagicMock()
+    inner.taker_nick = taker_nick
+    inner.state = CoinJoinState.IOAUTH_SENT
+    inner.crypto.is_encrypted = True
+    inner.crypto.decrypt.return_value = base64.b64encode(b"transaction").decode("ascii")
+    inner.handle_tx = AsyncMock(
+        return_value=(False, {"error": "backend https://127.0.0.1:38334/private/path"})
+    )
+    session = MakerSession(inner)
+    session.send_response = AsyncMock(return_value=True)
+    bot = MagicMock()
+    bot.active_sessions = {_session_key(taker_nick): session}
+
+    with (
+        patch("maker.maker_session.mark_pending_transaction_failed", return_value=True),
+        patch("maker.maker_session.get_notifier", return_value=MagicMock()),
+        patch("maker.maker_session.spawn_task"),
+    ):
+        await session.on_tx(bot, "tx ciphertext", "dir:test")
+
+    session.send_response.assert_awaited_once_with(
+        bot, "error", {"error": "Transaction verification failed"}
+    )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

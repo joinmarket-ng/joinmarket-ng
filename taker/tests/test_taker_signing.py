@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from jmcore.bitcoin import pubkey_to_p2wpkh_script
+from jmcore.log_filter import sensitive_log_filter
 from jmwallet.wallet.bip32 import HDKey, mnemonic_to_seed
 from jmwallet.wallet.models import UTXOInfo
 from jmwallet.wallet.signing import (
@@ -1075,6 +1076,7 @@ class TestPhaseCollectSignaturesCompleteness:
     async def test_declining_maker_is_not_added_to_failed_signers(
         self,
         two_maker_tx_data: CoinJoinTxData,
+        tmp_path: Path,
     ) -> None:
         """A maker that answers !tx with a policy error must not be blacklisted.
 
@@ -1104,23 +1106,190 @@ class TestPhaseCollectSignaturesCompleteness:
         }
         taker = self._build_taker_with_tx(two_maker_tx_data, maker_sessions=maker_sessions)
         taker.config.network = NetworkType.REGTEST
+        taker.config.data_dir = tmp_path
+        source_address = "bcrt1qsourceaddressusedonce000000000000000000000"
+        change_address = "bcrt1qchangeaddressusedonce000000000000000000000"
+        taker._session.selected_utxos = [
+            UTXOInfo(
+                txid="a" * 64,
+                vout=0,
+                value=2_000_000,
+                address=source_address,
+                confirmations=1,
+                scriptpubkey="0014" + "00" * 20,
+                path="m/84'/1'/0'/0/0",
+                mixdepth=0,
+            ),
+        ]
+        taker._session.taker_change_address = change_address
+        taker.wallet.sign_input = MagicMock()
         taker.directory_client.wait_for_responses = AsyncMock(
             return_value={
                 "maker1": {
                     "error": True,
-                    "data": "miner fee rate 1.20 sat/vB is below minimum 3.00 sat/vB",
+                    "data": (
+                        "CoinJoin miner fee rate 1.2000 sat/vB is below required 3.0000 sat/vB"
+                    ),
                 }
             }
         )
         expected_tx_deliveries = len(maker_sessions)
 
-        result = await taker._session._phase_collect_signatures()
+        normal_logs: list[str] = []
+
+        from loguru import logger
+
+        handler_id = logger.add(
+            lambda message: normal_logs.append(message.record["message"]),
+            level="INFO",
+            filter=sensitive_log_filter(),
+        )
+        try:
+            result = await taker._session._phase_collect_signatures()
+        finally:
+            logger.remove(handler_id)
 
         assert result is False
         assert taker.directory_client.send_privmsg.await_count == expected_tx_deliveries
         assert taker.failed_signer_nicks == {"maker2"}
         assert taker._session.declined_signer_nicks == {"maker1"}
         assert taker._session.signing_boundary_crossed is False
+        taker.wallet.sign_input.assert_not_called()
+        assert (
+            "Maker maker1 declined to sign: proposed miner fee rate 1.2000 sat/vB, "
+            "required minimum 3.0000 sat/vB"
+        ) in normal_logs
+
+        from jmwallet.history import get_used_addresses, read_history
+
+        history = read_history(data_dir=tmp_path, wallet_fingerprint="deadbeef")
+        assert len(history) == 1
+        assert history[0].success is False
+        assert history[0].completed_at
+        assert history[0].failure_reason == (
+            "Maker declined signing: proposed miner fee rate 1.2000 sat/vB, "
+            "required minimum 3.0000 sat/vB"
+        )
+        assert get_used_addresses(tmp_path, wallet_fingerprint="deadbeef") == {
+            taker._session.cj_destination,
+            change_address,
+            source_address,
+        }
+
+    @pytest.mark.asyncio
+    async def test_unrecognized_decline_error_is_not_logged_normally(
+        self,
+        two_maker_tx_data: CoinJoinTxData,
+        tmp_path: Path,
+    ) -> None:
+        """Only a bounded low-fee error may expose diagnostics in ordinary logs."""
+        from jmcore.models import Offer, OfferType
+        from loguru import logger
+
+        offer = Offer(
+            counterparty="maker1",
+            oid=0,
+            ordertype=OfferType.SW0_RELATIVE,
+            minsize=100_000,
+            maxsize=10_000_000,
+            txfee=0,
+            cjfee="0.001",
+            fidelity_bond_value=0,
+        )
+        maker_sessions = {
+            "maker1": self._make_maker_session(
+                "maker1", offer, [{"txid": "b" * 64, "vout": 0, "value": 1_500_000}]
+            ),
+            "maker2": self._make_maker_session(
+                "maker2", offer, [{"txid": "c" * 64, "vout": 0, "value": 1_200_000}]
+            ),
+        }
+        taker = self._build_taker_with_tx(two_maker_tx_data, maker_sessions=maker_sessions)
+        taker.config.data_dir = tmp_path
+        unrelated_peer_text = "peer-id=not-for-ordinary-logs"
+        taker.directory_client.wait_for_responses = AsyncMock(
+            return_value={
+                "maker1": {
+                    "error": True,
+                    "data": (
+                        "CoinJoin miner fee rate 1.2 sat/vB is below required 3.0 sat/vB "
+                        f"{unrelated_peer_text}"
+                    ),
+                }
+            }
+        )
+        normal_logs: list[str] = []
+
+        handler_id = logger.add(
+            lambda message: normal_logs.append(message.record["message"]),
+            level="INFO",
+            filter=sensitive_log_filter(),
+        )
+        try:
+            result = await taker._session._phase_collect_signatures()
+        finally:
+            logger.remove(handler_id)
+
+        assert result is False
+        assert taker._session.declined_signer_nicks == {"maker1"}
+        assert unrelated_peer_text not in "\n".join(normal_logs)
+
+    @pytest.mark.asyncio
+    async def test_declining_maker_still_fails_when_history_finalization_errors(
+        self,
+        two_maker_tx_data: CoinJoinTxData,
+        tmp_path: Path,
+    ) -> None:
+        """A history write error must not turn an explicit decline into a pending round."""
+        from jmcore.models import Offer, OfferType
+        from jmwallet.history import HistoryWriteError
+        from loguru import logger
+
+        offer = Offer(
+            counterparty="maker1",
+            oid=0,
+            ordertype=OfferType.SW0_RELATIVE,
+            minsize=100_000,
+            maxsize=10_000_000,
+            txfee=0,
+            cjfee="0.001",
+            fidelity_bond_value=0,
+        )
+        maker_sessions = {
+            "maker1": self._make_maker_session(
+                "maker1", offer, [{"txid": "b" * 64, "vout": 0, "value": 1_500_000}]
+            ),
+            "maker2": self._make_maker_session(
+                "maker2", offer, [{"txid": "c" * 64, "vout": 0, "value": 1_200_000}]
+            ),
+        }
+        taker = self._build_taker_with_tx(two_maker_tx_data, maker_sessions=maker_sessions)
+        taker.config.data_dir = tmp_path
+        taker.wallet.sign_input = MagicMock()
+        taker.directory_client.wait_for_responses = AsyncMock(
+            return_value={"maker1": {"error": True, "data": "maker storage full"}}
+        )
+        normal_logs: list[str] = []
+        handler_id = logger.add(
+            lambda message: normal_logs.append(message.record["message"]),
+            level="INFO",
+            filter=sensitive_log_filter(),
+        )
+        try:
+            with patch(
+                "taker.coinjoin_session.mark_pending_transaction_failed",
+                side_effect=HistoryWriteError("disk full"),
+            ):
+                result = await taker._session._phase_collect_signatures()
+        finally:
+            logger.remove(handler_id)
+
+        assert result is False
+        assert taker._session.declined_signer_nicks == {"maker1"}
+        assert taker.failed_signer_nicks == {"maker2"}
+        taker.wallet.sign_input.assert_not_called()
+        assert "Could not finalize declined CoinJoin history entry" in normal_logs
+        assert "disk full" not in "\n".join(normal_logs)
 
 
 # Re-export fixtures for use in conftest

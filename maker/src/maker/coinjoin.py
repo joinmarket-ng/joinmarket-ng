@@ -21,7 +21,11 @@ from typing import Any
 
 from jmcore.bitcoin import parse_transaction
 from jmcore.encryption import CryptoSession
-from jmcore.fee_policy import estimate_p2wpkh_vsize, fee_rate_meets_minimum
+from jmcore.fee_policy import (
+    estimate_p2wpkh_vsize,
+    fee_rate_meets_minimum,
+    format_low_fee_error,
+)
 from jmcore.models import NetworkType, Offer
 from jmcore.podle import parse_podle_revelation, verify_podle, verify_podle_binding
 from jmcore.protocol import (
@@ -642,9 +646,9 @@ class CoinJoinSession:
             ):
                 fee_policy_error = await self._verify_minimum_miner_fee(tx_hex, active_check)
                 if fee_policy_error is not None:
-                    logger.warning("Rejecting low-fee CoinJoin")
+                    logger.warning("Rejecting CoinJoin: miner-fee verification failed")
                     logger.bind(sensitive=True).warning(
-                        f"Rejecting low-fee CoinJoin from {self.taker_nick}: {fee_policy_error}"
+                        f"Rejecting CoinJoin from {self.taker_nick}: {fee_policy_error}"
                     )
                     self.state = CoinJoinState.FAILED
                     return False, {"error": fee_policy_error}
@@ -748,10 +752,13 @@ class CoinJoinSession:
             return "Minimum CoinJoin miner fee rate was not resolved"
         if not fee_rate_meets_minimum(fee, vsize, minimum_fee_rate):
             actual_rate = fee / vsize
-            return (
-                f"CoinJoin miner fee rate {actual_rate:.2f} sat/vB is below required "
-                f"{minimum_fee_rate:.2f} sat/vB"
+            logger.info(
+                "Rejecting CoinJoin before signing: proposed miner fee rate {:.4f} sat/vB, "
+                "required minimum {:.4f} sat/vB",
+                actual_rate,
+                minimum_fee_rate,
             )
+            return format_low_fee_error(actual_rate, minimum_fee_rate)
         return None
 
     async def _select_our_utxos(

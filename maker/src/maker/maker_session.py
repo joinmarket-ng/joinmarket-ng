@@ -26,13 +26,16 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from jmcore.fee_policy import format_low_fee_error, parse_low_fee_error
 from jmcore.logging_context import coinjoin_id_from_commitment, coinjoin_log_context
 from jmcore.notifications import get_notifier
 from jmcore.protocol import MakerError, UTXOMetadata
 from jmcore.tasks import spawn_task
 from jmwallet.history import (
+    HistoryWriteError,
     append_history_entry,
     create_maker_history_entry,
+    mark_pending_transaction_failed,
     update_awaiting_transaction_signed,
 )
 from loguru import logger
@@ -692,16 +695,46 @@ class MakerSession:
                 logger.bind(sensitive=True).error(
                     f"Transaction verification failed: {response.get('error')}"
                 )
-                # Before signing starts, a failed transaction cannot conflict
-                # with a later use of these inputs. Once signing starts, retain
-                # the persisted locks through their TTL.
-                if bot.active_sessions.get((self.generation_id, taker_nick)) is self:
-                    bot.active_sessions.pop((self.generation_id, taker_nick))
-                    bot._release_podle_outpoint(self)
-                    if self.signing_boundary_crossed:
-                        self.retain_input_locks()
-                    else:
-                        self.release_input_locks()
+                try:
+                    if not self.signing_boundary_crossed:
+                        error_msg = str(response.get("error") or "Transaction verification failed")
+                        # We have definitively refused to sign. Keep the revealed
+                        # addresses recorded, but do not leave this attempt pending.
+                        try:
+                            finalized = mark_pending_transaction_failed(
+                                destination_address=self.cj_address,
+                                failure_reason=f"Signing rejected: {error_msg}",
+                                data_dir=bot.config.data_dir,
+                                txid="",
+                                wallet_fingerprint=bot.wallet.wallet_fingerprint,
+                            )
+                            if not finalized:
+                                logger.warning("Could not finalize rejected CoinJoin history entry")
+                        except HistoryWriteError as exc:
+                            logger.warning("Could not finalize rejected CoinJoin history entry")
+                            logger.bind(sensitive=True).warning(
+                                "Rejected CoinJoin history finalization detail: {}", exc
+                            )
+
+                        # Only the bounded fee diagnostic is safe to disclose.
+                        # Other verification errors may include backend details.
+                        fee_rejection = parse_low_fee_error(error_msg)
+                        peer_error = (
+                            format_low_fee_error(*fee_rejection)
+                            if fee_rejection is not None
+                            else "Transaction verification failed"
+                        )
+                        await self.send_response(bot, "error", {"error": peer_error})
+                finally:
+                    # Sending a refusal can fail or be cancelled. Always clean
+                    # up this session, while retaining locks if signing began.
+                    if bot.active_sessions.get((self.generation_id, taker_nick)) is self:
+                        bot.active_sessions.pop((self.generation_id, taker_nick))
+                        bot._release_podle_outpoint(self)
+                        if self.signing_boundary_crossed:
+                            self.retain_input_locks()
+                        else:
+                            self.release_input_locks()
                 spawn_task(
                     get_notifier().notify_rejection(
                         taker_nick,
@@ -718,8 +751,10 @@ class MakerSession:
     async def send_response(
         self, bot: MakerBotProtocol, command: str, data: dict[str, Any]
     ) -> bool:
-        """Send a signed response (`!ioauth` or `!sig`) encrypted via this
-        session's NaCl box, fanned out to all of the bot's directory clients.
+        """Send a signed response through this generation's directory clients.
+
+        `!ioauth` and `!sig` use the session's NaCl box. `!error` is plain text,
+        as in the reference protocol, authenticated by the transport signature.
 
         The `pubkey` response is sent unencrypted via
         :func:`MakerSession.send_pubkey_response` because it doesn't require
@@ -744,6 +779,8 @@ class MakerSession:
                 plaintext = data["signature"]
                 msg_content = self.crypto.encrypt(plaintext)
                 logger.debug(f"Encrypted sig: plaintext_len={len(plaintext)}")
+            elif command == "error":
+                msg_content = data["error"]
             else:
                 msg_content = json.dumps(data)
 

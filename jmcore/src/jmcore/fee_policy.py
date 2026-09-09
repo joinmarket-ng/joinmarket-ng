@@ -3,10 +3,41 @@
 from __future__ import annotations
 
 import math
+import re
 from inspect import isawaitable
 from typing import Any
 
 from loguru import logger
+
+_LOW_FEE_ERROR = re.compile(
+    r"CoinJoin miner fee rate ([0-9]{1,16}\.[0-9]{1,8}) sat/vB is below required "
+    r"([0-9]{1,16}\.[0-9]{1,8}) sat/vB"
+)
+
+
+def format_low_fee_error(fee_rate: float, minimum_fee_rate: float) -> str:
+    """Return a human-readable !error with only the two fee-policy values."""
+    return (
+        f"CoinJoin miner fee rate {fee_rate:.4f} sat/vB is below required "
+        f"{minimum_fee_rate:.4f} sat/vB"
+    )
+
+
+def parse_low_fee_error(message: object) -> tuple[float, float] | None:
+    """Extract bounded numeric diagnostics without logging arbitrary peer text.
+
+    Accept the current and earlier decimal precision. Full matching excludes
+    identifiers, terminal escapes, and extra lines from ordinary INFO logs.
+    """
+    if not isinstance(message, str):
+        return None
+    match = _LOW_FEE_ERROR.fullmatch(message)
+    if match is None:
+        return None
+    fee_rate, minimum_fee_rate = map(float, match.groups())
+    if minimum_fee_rate <= 0 or fee_rate > minimum_fee_rate:
+        return None
+    return fee_rate, minimum_fee_rate
 
 
 class MinimumFeeRateExceedsCapError(ValueError):

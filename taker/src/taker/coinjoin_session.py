@@ -30,6 +30,7 @@ from jmcore.fee_policy import (
     MinimumFeeRateExceedsCapError,
     estimate_p2wpkh_vsize,
     fee_rate_meets_minimum,
+    parse_low_fee_error,
     resolve_min_fee_rate,
 )
 from jmcore.protocol import FEATURE_NEUTRINO_COMPAT, MakerError, UTXOMetadata, parse_utxo_list
@@ -38,6 +39,7 @@ from jmwallet.history import (
     HistoryWriteError,
     append_history_entry,
     create_taker_history_entry,
+    mark_pending_transaction_failed,
 )
 from jmwallet.wallet.signing import (
     TransactionSigningError,
@@ -1724,6 +1726,58 @@ class CoinJoinSession:
                 return idx
         return None
 
+    def _record_signer_decline(self, nick: str, error_msg: object) -> tuple[float, float] | None:
+        """Record a maker's explicit signing refusal without exposing peer text."""
+        low_fee_decline = parse_low_fee_error(error_msg)
+        if low_fee_decline is not None:
+            proposed_fee_rate, minimum_fee_rate = low_fee_decline
+            logger.info(
+                "Maker {} declined to sign: proposed miner fee rate {:.4f} sat/vB, "
+                "required minimum {:.4f} sat/vB",
+                nick,
+                proposed_fee_rate,
+                minimum_fee_rate,
+            )
+        else:
+            logger.warning(f"Maker {nick} declined to sign")
+        logger.bind(sensitive=True).warning("Maker {} declined to sign: {}", nick, error_msg)
+        self.declined_signer_nicks.add(nick)
+        del self.maker_sessions[nick]
+        return low_fee_decline
+
+    def _finalize_declined_history(self, low_fee_decline: tuple[float, float] | None) -> str:
+        """Finalize the pre-sign history row for a definitive maker refusal."""
+        failure_reason = "Maker declined signing"
+        if low_fee_decline is not None:
+            proposed_fee_rate, minimum_fee_rate = low_fee_decline
+            failure_reason = (
+                "Maker declined signing: proposed miner fee rate "
+                f"{proposed_fee_rate:.4f} sat/vB, required minimum "
+                f"{minimum_fee_rate:.4f} sat/vB"
+            )
+
+        if self.signing_boundary_crossed:
+            return failure_reason
+
+        try:
+            finalized = mark_pending_transaction_failed(
+                destination_address=self.cj_destination,
+                failure_reason=failure_reason,
+                data_dir=self.config.data_dir,
+                txid="",
+                wallet_fingerprint=self.wallet.wallet_fingerprint,
+            )
+            if not finalized:
+                logger.warning(
+                    "Could not find pending CoinJoin history entry to finalize after maker decline"
+                )
+        except HistoryWriteError as exc:
+            logger.warning("Could not finalize declined CoinJoin history entry")
+            logger.bind(sensitive=True).warning(
+                "Declined CoinJoin history finalization detail: {}", exc
+            )
+        return failure_reason
+
     async def _phase_collect_signatures(self) -> bool:
         """Send !tx and collect !sig responses from makers.
 
@@ -1837,15 +1891,15 @@ class CoinJoinSession:
             input_map[idx] = (txid_hex, tx_input.vout)
 
         # Process responses
+        low_fee_decline: tuple[float, float] | None = None
         for nick in list(self.maker_sessions.keys()):
             if nick in responses:
                 if responses[nick].get("error"):
-                    logger.warning(f"Maker {nick} declined to sign")
-                    logger.bind(sensitive=True).warning(
-                        "Maker {} declined to sign: {}", nick, responses[nick].get("data", "")
+                    parsed_low_fee_error = self._record_signer_decline(
+                        nick, responses[nick].get("data", "")
                     )
-                    self.declined_signer_nicks.add(nick)
-                    del self.maker_sessions[nick]
+                    if low_fee_decline is None:
+                        low_fee_decline = parsed_low_fee_error
                     continue
 
                 try:
@@ -1987,9 +2041,14 @@ class CoinJoinSession:
 
         if missing_makers:
             self.failed_signer_nicks.update(missing_makers - self.declined_signer_nicks)
-            self.last_failure_reason = (
+            missing_signature_reason = (
                 f"Missing or invalid signatures from maker(s): {', '.join(sorted(missing_makers))}"
             )
+            if self.declined_signer_nicks:
+                decline_failure_reason = self._finalize_declined_history(low_fee_decline)
+                self.last_failure_reason = f"{decline_failure_reason}; {missing_signature_reason}"
+            else:
+                self.last_failure_reason = missing_signature_reason
             logger.error("Missing signatures from required makers")
             logger.bind(sensitive=True).error(
                 f"Missing signatures from {len(missing_makers)} maker(s) "
