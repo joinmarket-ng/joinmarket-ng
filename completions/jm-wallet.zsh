@@ -270,6 +270,7 @@ _jm_wallet() {
           ;;
         recover-bonds)
           _arguments \
+            '--mark-scanned[Confirm prior full bond recovery and record completion without scanning (offline).]' \
             '--mnemonic-file=[]:file:_files' \
             '--prompt-bip39-passphrase[Prompt for BIP39 passphrase]' \
             '--network=[Bitcoin network]: :' \

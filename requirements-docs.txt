@@ -210,9 +210,9 @@ ghp-import==2.1.0 \
     # via
     #   mkdocs
     #   properdocs
-griffelib==2.2.0 \
-    --hash=sha256:d71c3bc2bbed9f958488634fe788b843a9f705d6d2838ca32cd6c25eeb64dfc4 \
-    --hash=sha256:e1bc36fe9cd21d4b6b659b456346755e4cfdc5676c0a5214083126ee12612b3c
+griffelib==2.3.0 \
+    --hash=sha256:1b8f9cd525681c26b1d6d574faa1371651e8459ca51d209684f50b8096ae06e0 \
+    --hash=sha256:7b0952caf5bca6afa4bb5ee8c6a2d183fe3f21b62efc5f6c7243cb2b26d2d115
     # via mkdocstrings-python
 idna==3.19 \
     --hash=sha256:5e0811a4383b21dc5838069f801c4fb62113b7447663d2530d2bd6e77b49bf15 \
@@ -406,9 +406,9 @@ pathspec==1.1.1 \
     # via
     #   mkdocs
     #   properdocs
-platformdirs==4.11.7 \
-    --hash=sha256:4f41487eeeeeb07f3a6625e61d9bc0ae6809f92d3386dbd74392fbb76108104d \
-    --hash=sha256:8a02cb259042c79d1cd0450facc2fe6dc9d303ae7901afbe33bf8ea0b188cef6
+platformdirs==4.11.8 \
+    --hash=sha256:52f2f181bbfde907966932cc8312d967d02976422d66d537ea16092b8e291081 \
+    --hash=sha256:f23abafea7dd4276d1f29104b83598d7dcc567cafd07c9c951e66665645437fc
     # via
     #   mkdocs-get-deps
     #   properdocs
