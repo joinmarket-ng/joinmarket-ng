@@ -7,6 +7,99 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.39.2] - 2026-09-10
+
+Bug fixes! And more security hardening, privacy improvements, and usability enhancements. And a new maker diagnostic tool for checking reachability, offer(s), fidelity bond, and nick authentication.
+
+### Added
+
+- Start new installations with a minimal config and support missing settings in the TUI ([8e9b3df3](../../commit/8e9b3df301621be54227b14134ba390906151653))
+- Show release-to-release template changes during updates without modifying user configs ([8e9b3df3](../../commit/8e9b3df301621be54227b14134ba390906151653))
+- Add a maker diagnostic tool with signet support, nick authentication, and directory/direct offer comparison ([7418a64d](../../commit/7418a64d5806ee6ce050d1a13633264a47f04b4a))
+
+### Fixed
+
+- Fix PSBT compatibility with Core Lightning by omitting empty witness scripts ([22b0279f](../../commit/22b0279fdc6721442fdbcd1844833170232eff48))
+- Reject unsafe peerlist fields that can forge directory records ([88d40f92](../../commit/88d40f92fa67a96d4d11c578e5f4cc1f6e97a568))
+- Keep the wallet daemon responsive during wallet-file cryptography ([55f19b30](../../commit/55f19b30770d2ae18112884b46ec33963c00232a))
+- Limit queued wallet operations and return HTTP 429 at capacity ([a50a50b3](../../commit/a50a50b349eae75abb1916d90acd6060391d11a4))
+- Harden password comparison when re-unlocking an open wallet ([a94bf912](../../commit/a94bf912cd8c05b171005ac8c6191777929e6443))
+- Avoid exposing wallet paths in lifecycle API errors ([5894bcf4](../../commit/5894bcf4f09dc412bd8947a7e084d58f5e078547))
+- Keep backend credentials out of config responses and update logs ([a4ee9b4d](../../commit/a4ee9b4d44e0ff49df1b5d9cb9a97e724c701671))
+- Protect config and wallet metadata permissions while preserving existing installations ([a8fab5e3](../../commit/a8fab5e3f9c1e76706e10b9449eabc2ce9368b86))
+- Bound unauthenticated directory connections awaiting handshakes ([05c33846](../../commit/05c338465e21e989910e11b2a60dd63606984c81))
+- Limit public broadcast amplification and per-peer offer tracking ([37cecf5e](../../commit/37cecf5e98ad8d56c097f940664e8a21e2a7e447))
+- Bound directory client resource usage and reconnect after limit failures ([142c4edf](../../commit/142c4edf87bb0a47518518047e8fb422bd1e9597))
+- Limit idle and unauthenticated maker direct connections ([495f69e0](../../commit/495f69e0bea70fbfba4049aeb39c29b643c51ccd))
+- Bound orderbook bond verification work and repeated lookup attempts ([87a30297](../../commit/87a302979709f3eada012af2e624763b095e1d52))
+- Protect wallet CLI secrets against process inspection and core dumps ([4a2b325a](../../commit/4a2b325a5b9739fd85debdff678eb2697427d4db))
+- Warn when wallet password arguments may be exposed in process listings ([17b2debe](../../commit/17b2debe21493086df4aaf519cf15b8e51ed375d))
+- Warn when remote backend HTTP connections expose credentials and wallet traffic ([e4908607](../../commit/e49086071842e3d7a2ff4d196d868f656dea7445))
+- Show TOML section context in configuration release-note diffs ([8a8a4d8b](../../commit/8a8a4d8b22c5e3a39543da2758704996bbbdb5b7))
+- Clarify unknown fidelity bond recovery coverage and add a manual mark-scanned option ([86bdc217](../../commit/86bdc2177278b43408ee73f788574b291b19a65f))
+- Prompt for the BIP39 passphrase in TUI Wallet Info ([d3188928](../../commit/d3188928825522fc1debb072caf21399cf4997b2))
+- Confirm the wallet fingerprint after interactive passphrase entry ([d3188928](../../commit/d3188928825522fc1debb072caf21399cf4997b2))
+- Restore command-line password warnings with newer CLI dependencies ([6972ab35](../../commit/6972ab35df6c683a85d3098db8bfc81b0712b2e1))
+- Prevent slow directory handshakes from delaying maker startup and accumulating orderbook requests ([546afa83](../../commit/546afa839153997b3cf56c1ed8cc3874fb085068))
+- Prevent stalled directory writes from indefinitely blocking maker orderbook responses ([3f560200](../../commit/3f5602007ad2c9704d3b1dbcd2458b1237f12968))
+- Stop reporting harmless directory fanout copies as spam backoff ([3f560200](../../commit/3f5602007ad2c9704d3b1dbcd2458b1237f12968))
+- Add another default mainnet directory server. ([b66b6544](../../commit/b66b65449c2b11084411a72a269a37d54a3e25ad))
+- Fix premature CoinJoin timeouts and recover late confirmations when refreshing wallet info ([12bef3d2](../../commit/12bef3d21b0d6e5eb689f32dcd22b335d7426c65))
+- Improve maker discovery under load with higher, independent directory and direct response limits ([64acb2ad](../../commit/64acb2ad3ad793a5f6d0567b7fe8669923ce9390))
+- Show low-fee signing refusal details and finalize rejected CoinJoin history before signing ([d8af17a1](../../commit/d8af17a1e5edc0d2a85c7f3a5a8dd59e86cb16c2))
+- Stop wallet info from reserving addresses and keep fresh receive addresses visible ([f65b8106](../../commit/f65b8106952461bea13a6d7b7033a2f630832ca8))
+- Preserve maker direct connections during identity rotation and rollback ([c185b00c](../../commit/c185b00cbfb445605dbe3cd0184e4e98f9a4c814))
+
+### Configuration Changes
+
+Existing `config.toml` files are not updated automatically. Review the bundled template changes below and apply the relevant options manually.
+
+````diff
+--- config.toml.template (0.39.1)
++++ config.toml.template (0.39.2)
+@@ -11,7 +11,6 @@ top level
+ # Core Settings
+ # ============================================================================
+
+-# [core]
+ # data_dir = "~/.joinmarket-ng"  # Default data directory
+
+ # ============================================================================
+@@ -271,8 +270,10 @@ [logging]
+ # Log level: "TRACE", "DEBUG", "INFO", "WARNING", "ERROR"
+ # level = "INFO"
+
+-# Log sensitive wallet addresses, amounts, balances, txids, transaction data,
+-# descriptors, and secrets. Disabled by default.
++# Include privacy-sensitive diagnostics: wallet addresses, amounts, balances,
++# transaction IDs, transaction data, descriptors, and detailed errors.
++# Disabled by default. Exception details can include variable values;
++# review logs before sharing. See the configuration guide's Logging section.
+ # sensitive = false
+
+ # ============================================================================
+@@ -449,8 +450,8 @@ [maker]
+ # identity_rotation_quiet_min_sec = 60   # Minimum silence after old TCP disconnects
+ # identity_rotation_quiet_max_sec = 600  # Maximum silence before replacement connects
+ # rescan_interval_sec = 600
+-# pending_tx_timeout_min = 60   # Minutes before marking unbroadcast CoinJoins as failed
+-# pending_tx_abandon_hours = 72  # Hours before abandoning a broadcast but unconfirmed tx
++# pending_tx_timeout_min = 60   # Monitoring deadline without a TXID; also input reservation lifetime
++# pending_tx_abandon_hours = 72  # Confirmation monitoring deadline for recorded TXIDs; refresh can recover later
+
+ # Privacy: random delay (seconds) before re-announcing offers after a balance change.
+ # Prevents observers from correlating block confirmations with offer updates.
+@@ -558,7 +559,7 @@ [taker]
+ # orderbook_min_wait = 30.0      # Min seconds before early exit is allowed
+ # orderbook_quiet_period = 15.0  # Seconds of silence to trigger early exit
+ # rescan_interval_sec = 600
+-# pending_tx_abandon_hours = 24  # Hours before abandoning unconfirmed CoinJoin (makers can double-spend)
++# pending_tx_abandon_hours = 24  # Confirmation monitoring deadline; also pending allowance in input reservation lifetime
+
+ # Transaction broadcast settings
+ # Options: "self", "random-peer", "multiple-peers", "not-self"
+````
+
 ## [0.39.1] - 2026-09-06
 
 Pre-release workflow (to pevent releases with all needed signatures), rescan bug loop fix, local installer for updates (supply chain hardening), UTXO selector redesign, and local up to date config.toml.template reference copy.
@@ -4095,7 +4188,8 @@ This release did not change the bundled `config.toml.template`.
 - Pre-built image support for directory server compose.
 - Tor configuration instructions.
 
-[Unreleased]: ../../compare/0.39.1...HEAD
+[Unreleased]: ../../compare/0.39.2...HEAD
+[0.39.2]: ../../compare/0.39.1...0.39.2
 [0.39.1]: ../../compare/0.39.0...0.39.1
 [0.39.0]: ../../compare/0.38.0...0.39.0
 [0.38.0]: ../../compare/0.37.1...0.38.0

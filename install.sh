@@ -22,7 +22,7 @@ VENV_DIR="${JMNG_VENV_DIR:-$HOME/.joinmarket-ng/venv}"
 DATA_DIR="${JOINMARKET_DATA_DIR:-$HOME/.joinmarket-ng}"
 PYTHON_MIN_VERSION="3.11"
 GITHUB_REPO="joinmarket-ng/joinmarket-ng"
-DEFAULT_VERSION="0.39.1"  # Updated on each release
+DEFAULT_VERSION="0.39.2"  # Updated on each release
 REQUIRED_GPG_SIGNATURES=2
 # These are trust anchors, not a list to refresh from the download server.
 # Changing them requires a new installer authenticated by the previous quorum.
