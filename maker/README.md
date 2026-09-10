@@ -46,6 +46,25 @@ can manage multiple wallet mnemonic files, and you can switch between them
 with `--mnemonic-file`. Use separate `--data-dir` values for takers only when
 you specifically want isolated config and runtime state.
 
+## Direct Connections and Identity Rotation
+
+With automatically created Tor onion services, identity rotation prepares a new
+onion address on a randomly assigned local listening port. The initial listener
+uses `onion_serving_port` (normally 5222); replacement listeners can log a different
+local port. Peers continue to use the configured onion port because Tor forwards
+it to the replacement listener's actual port. Standalone Tor must reach that local
+address; in Docker, `tor_target_host` must identify the maker container.
+
+Rotation stops accepting new connections on the old listener while existing
+connections remain available for generation-specific continuations during grace.
+After pending sessions drain and the configured quiet period ends, the maker
+announces its replacement identity. If the replacement cannot connect to a
+directory, the maker restores the old listener on its previous port. Static onion
+services do not rotate.
+
+Upgrading applies the listener lifecycle fix when the maker restarts. Existing
+configuration, wallet data, and Tor settings require no migration.
+
 ## Directory Connections
 
 Startup connects to configured directories concurrently and starts serving once a

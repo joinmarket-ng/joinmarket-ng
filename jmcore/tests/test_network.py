@@ -13,10 +13,124 @@ from jmcore.network import (
     ONION_HOSTID,
     ConnectionError,
     ConnectionPool,
+    HiddenServiceListener,
     OnionPeer,
     PeerStatus,
     TCPConnection,
 )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("serve_forever", [False, True])
+async def test_listener_stop_preserves_clients_and_allows_restart(serve_forever: bool) -> None:
+    accepted = asyncio.Event()
+    handlers: list[asyncio.Task[None]] = []
+
+    async def echo(connection: TCPConnection, _peer: str) -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        handlers.append(task)
+        accepted.set()
+        try:
+            await connection.send(await connection.receive())
+        finally:
+            await connection.close()
+
+    listener = HiddenServiceListener(on_connection=echo)
+    port = await listener.start()
+    server = listener.server
+    serving = asyncio.create_task(listener.serve_forever()) if serve_forever else None
+    writers: list[asyncio.StreamWriter] = []
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writers.append(writer)
+        await asyncio.wait_for(accepted.wait(), timeout=2)
+        await asyncio.wait_for(listener.stop(), timeout=2)
+        assert not listener.running
+        assert listener.server is None
+        if serving is not None:
+            await asyncio.wait_for(serving, timeout=2)
+        with pytest.raises(OSError):
+            await asyncio.open_connection("127.0.0.1", port)
+
+        # A rollback can reuse the port while the old accepted socket stays open.
+        listener.port = port
+        assert await listener.start() == port
+        fresh_reader, fresh_writer = await asyncio.open_connection("127.0.0.1", port)
+        writers.append(fresh_writer)
+        for response_reader, request_writer in [(reader, writer), (fresh_reader, fresh_writer)]:
+            request_writer.write(b"still connected\r\n")
+            await request_writer.drain()
+            assert await asyncio.wait_for(response_reader.readline(), timeout=2) == (
+                b"still connected\r\n"
+            )
+    finally:
+        for writer in writers:
+            writer.close()
+            await writer.wait_closed()
+        await listener.stop()
+        if serving is not None:
+            await asyncio.gather(serving, return_exceptions=True)
+        await asyncio.wait_for(asyncio.gather(*handlers, return_exceptions=True), timeout=2)
+        assert server is not None
+        await asyncio.wait_for(server.wait_closed(), timeout=2)
+
+
+@pytest.mark.asyncio
+async def test_listener_waiter_does_not_follow_restart() -> None:
+    listener = HiddenServiceListener()
+    await listener.start()
+    # Save the coroutine without scheduling it until after the restart.
+    waiting = listener.serve_forever()
+    try:
+        await listener.stop()
+        await listener.start()
+        await asyncio.wait_for(waiting, timeout=2)
+        assert listener.running
+        assert listener.server is not None
+        assert listener.server.is_serving()
+    finally:
+        waiting.close()
+        await listener.stop()
+
+
+@pytest.mark.asyncio
+async def test_listener_stop_closes_in_progress_bind() -> None:
+    listener = HiddenServiceListener()
+    bound = asyncio.Event()
+    release_bind = asyncio.Event()
+    server = await asyncio.start_server(lambda _reader, _writer: None, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+
+    async def finish_bind(*_args: object, **_kwargs: object) -> asyncio.Server:
+        bound.set()
+        await release_bind.wait()
+        return server
+
+    starting: asyncio.Task[int] | None = None
+    stopping: asyncio.Task[None] | None = None
+    try:
+        with patch("jmcore.network.asyncio.start_server", side_effect=finish_bind):
+            starting = asyncio.create_task(listener.start())
+            await asyncio.wait_for(bound.wait(), timeout=2)
+            stopping = asyncio.create_task(listener.stop())
+            await asyncio.sleep(0)
+            assert not stopping.done()
+            release_bind.set()
+            await asyncio.wait_for(asyncio.gather(starting, stopping), timeout=2)
+        assert not listener.running
+        assert listener.server is None
+        assert not server.is_serving()
+        with pytest.raises(OSError):
+            await asyncio.open_connection("127.0.0.1", port)
+    finally:
+        release_bind.set()
+        await asyncio.gather(
+            *(task for task in (starting, stopping) if task is not None), return_exceptions=True
+        )
+        await listener.stop()
+        server.close()
+        await server.wait_closed()
 
 
 @pytest.mark.asyncio

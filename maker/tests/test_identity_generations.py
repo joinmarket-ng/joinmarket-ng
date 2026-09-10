@@ -13,6 +13,7 @@ from jmcore.bitcoin import get_txid
 from jmcore.crypto import NickIdentity
 from jmcore.directory_client import DirectoryClientError
 from jmcore.models import NetworkType
+from jmcore.network import HiddenServiceListener, TCPConnection, connect_direct
 from jmcore.protocol import JM_VERSION, MessageType
 
 from maker.bot import MakerBot
@@ -667,6 +668,110 @@ def test_dynamic_pool_advertises_virtual_onion_port(bot: MakerBot) -> None:
 
     assert kwargs["location"] == f"generation-1.onion:{bot.config.onion_serving_port}"
     assert str(generation.listener_port) not in kwargs["location"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replacement_connects", [True, False])
+async def test_rotation_with_open_direct_socket_keeps_serving(
+    bot: MakerBot, replacement_connects: bool
+) -> None:
+    """Real sockets must survive listener retirement without blocking cutover or rollback."""
+    bot.running = True
+    bot.config.tor_control.enabled = True
+    old = bot.generations[0]
+    old.onion_host = "generation-0.onion"
+    handler_tasks: list[asyncio.Task[None]] = []
+    on_direct_connection = bot._on_direct_connection
+
+    async def handle(
+        connection: TCPConnection, peer: str, generation_id: int | None = None
+    ) -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        handler_tasks.append(task)
+        await on_direct_connection(connection, peer, generation_id=generation_id)
+
+    async def handshake(connection: TCPConnection) -> dict[str, object]:
+        await connection.send(
+            json.dumps(
+                {
+                    "type": MessageType.HANDSHAKE.value,
+                    "line": json.dumps({"nick": "J5Peer", "network": "regtest"}),
+                }
+            ).encode()
+        )
+        response = await asyncio.wait_for(connection.receive(), timeout=2)
+        return json.loads(json.loads(response)["line"])
+
+    old.hidden_service_listener = HiddenServiceListener(
+        host="127.0.0.1",
+        port=0,
+        on_connection=lambda connection, peer: handle(connection, peer, generation_id=0),
+    )
+    old.listener_port = await old.hidden_service_listener.start()
+    bot._start_generation_listeners(old)
+    tor = AsyncMock()
+    tor.create_ephemeral_hidden_service.return_value = MagicMock(
+        onion_address="generation-1.onion", service_id="generation-1"
+    )
+    connections: list[TCPConnection] = []
+    replacement: MakerGeneration | None = None
+    try:
+        existing = await connect_direct("127.0.0.1", old.listener_port)
+        connections.append(existing)
+        assert (await handshake(existing))["nick"] == old.nick_identity.nick
+        with (
+            patch.object(bot, "_on_direct_connection", side_effect=handle),
+            patch("maker.bot.TorControlClient", return_value=tor),
+            patch.object(OfferManager, "create_offers", new=AsyncMock(return_value=[])),
+        ):
+            replacement = await bot._create_replacement_generation()
+            assert replacement is not None
+            assert replacement.listener_port is not None
+            assert replacement.listener_port != old.listener_port
+            tor.create_ephemeral_hidden_service.assert_awaited_once()
+            assert tor.create_ephemeral_hidden_service.await_args.kwargs["ports"] == [
+                (bot.config.onion_serving_port, f"127.0.0.1:{replacement.listener_port}")
+            ]
+            replacement.directory_pool.connect_all_with_retry = AsyncMock(
+                return_value=int(replacement_connects)
+            )
+            old.directory_pool.connect_all_with_retry = AsyncMock(return_value=1)
+            with (
+                patch.object(
+                    bot,
+                    "_create_replacement_generation",
+                    new=AsyncMock(return_value=replacement),
+                ),
+                patch.object(bot, "_announce_generation_offers", new=AsyncMock()),
+                patch("maker.bot.spawn_task", side_effect=lambda coroutine: coroutine.close()),
+            ):
+                assert await asyncio.wait_for(bot._rotate_generation(), timeout=2) is (
+                    replacement_connects
+                )
+
+            current = replacement if replacement_connects else old
+            assert bot.current_generation_id == current.generation_id
+            # The existing socket still belongs to the old identity during grace.
+            assert (await handshake(existing))["nick"] == old.nick_identity.nick
+            assert current.listener_port is not None
+            fresh = await connect_direct("127.0.0.1", current.listener_port)
+            connections.append(fresh)
+            response = await handshake(fresh)
+            assert response["nick"] == current.nick_identity.nick
+            assert response["location-string"] == (
+                f"{current.onion_host}:{bot.config.onion_serving_port}"
+            )
+            if replacement_connects:
+                with pytest.raises(OSError):
+                    await asyncio.open_connection("127.0.0.1", old.listener_port)
+    finally:
+        for connection in connections:
+            await connection.close()
+        await bot.stop()
+        if replacement is not None:
+            await bot._close_generation(replacement)
+        await asyncio.wait_for(asyncio.gather(*handler_tasks), timeout=2)
 
 
 @pytest.mark.asyncio

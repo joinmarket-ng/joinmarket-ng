@@ -267,6 +267,9 @@ class HiddenServiceListener:
         self.server: asyncio.Server | None = None  # type: ignore[no-any-unimported]
         self.running = False
         self._bound_port: int = 0
+        self._stopped = asyncio.Event()
+        self._stopped.set()
+        self._lifecycle_lock = asyncio.Lock()
 
     @property
     def bound_port(self) -> int:
@@ -280,20 +283,24 @@ class HiddenServiceListener:
         Returns:
             The port number the server is bound to
         """
-        self.server = await asyncio.start_server(
-            self._handle_connection,
-            self.host,
-            self.port,
-            limit=self.max_message_size,
-        )
-        self.running = True
+        # A shutdown must also close a bind that is still in progress (for
+        # example, when restoring the old listener after a failed rotation).
+        async with self._lifecycle_lock:
+            self.server = await asyncio.start_server(
+                self._handle_connection,
+                self.host,
+                self.port,
+                limit=self.max_message_size,
+            )
+            self.running = True
+            self._stopped = asyncio.Event()
 
-        # Get the actual bound port
-        addrs = self.server.sockets[0].getsockname() if self.server.sockets else None
-        if addrs:
-            self._bound_port = addrs[1]
-        else:
-            self._bound_port = self.port
+            # Get the actual bound port
+            addrs = self.server.sockets[0].getsockname() if self.server.sockets else None
+            if addrs:
+                self._bound_port = addrs[1]
+            else:
+                self._bound_port = self.port
 
         logger.bind(sensitive=True).info(
             f"Hidden service listener started on {self.host}:{self._bound_port}"
@@ -319,18 +326,32 @@ class HiddenServiceListener:
                 await connection.close()
 
     async def stop(self) -> None:
-        """Stop the listener."""
-        self.running = False
-        if self.server:
-            self.server.close()
-            await self.server.wait_closed()
-            self.server = None
+        """Stop accepting sockets; the caller owns existing connections."""
+        async with self._lifecycle_lock:
+            self.running = False
+            if self.server:
+                # close() releases the listening sockets immediately. wait_closed()
+                # would also wait for accepted connections, blocking maker rotation
+                # before its session drain and grace-period retirement can run.
+                self.server.close()
+                self.server = None
+            self._stopped.set()
         logger.info("Hidden service listener stopped")
 
-    async def serve_forever(self) -> None:
+    def serve_forever(self) -> Coroutine[Any, Any, None]:
         """Run the server until stopped."""
-        if self.server:
-            await self.server.serve_forever()
+        # start_server() already accepts connections. Server.serve_forever()
+        # closes accepted clients on cancellation in Python 3.14, including
+        # cancellation triggered by Server.close(). Keep lifetime notification
+        # separate so stopping the listener preserves generation-pinned sockets.
+        # Capture this start's event at call time, before a scheduled waiter can
+        # be overtaken by stop() and a rollback restart.
+        stopped = self._stopped
+
+        async def wait_until_stopped() -> None:
+            await stopped.wait()
+
+        return wait_until_stopped()
 
 
 class PeerStatus:
