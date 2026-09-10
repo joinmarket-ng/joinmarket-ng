@@ -13,6 +13,18 @@ ARG JM_SIGNING_FINGERPRINT=088495423873FE5EDE77062273E6558DA7CB887A
 
 RUN apk add --no-cache curl git gnupg \
     && install -d -m 0700 /root/.gnupg
+
+# The pinned Jam image has expired Tor signing-subkey metadata. Fetch the
+# refreshed key in this stage, which does not depend on the broken APT source.
+# Export only the pinned primary key, never an entire downloaded key bundle.
+ARG TOR_ARCHIVE_FINGERPRINT=A3C4F0F979CAA22CDBA8F512EE8CBC9E886DDD89
+RUN curl --fail --location --silent --show-error \
+        "https://deb.torproject.org/torproject.org/${TOR_ARCHIVE_FINGERPRINT}.asc" \
+        --output /tmp/tor-archive-keyring.asc \
+    && gpg --batch --import /tmp/tor-archive-keyring.asc \
+    && gpg --batch --export "${TOR_ARCHIVE_FINGERPRINT}" > /tmp/tor-archive-keyring.gpg \
+    && test -s /tmp/tor-archive-keyring.gpg
+
 WORKDIR /src
 RUN git init \
     && git remote add origin https://github.com/JoinMarket-Org/joinmarket-clientserver.git \
@@ -39,6 +51,8 @@ LABEL server-version="${JM_SERVER_TAG}" \
 USER root
 RUN rm -rf /src
 COPY --from=server-builder /src /src
+# Match the signed-by path in the pinned image's /etc/apt/sources.list.d/tor.list.
+COPY --from=server-builder /tmp/tor-archive-keyring.gpg /usr/share/keyrings/tor-archive-keyring.gpg
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
