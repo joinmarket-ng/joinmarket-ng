@@ -760,6 +760,17 @@ def info(
             ),
         ),
     ] = False,
+    show_utxos: Annotated[
+        bool,
+        typer.Option(
+            "--show-utxos",
+            help=(
+                "In the basic view, add a per-mixdepth UTXO breakdown grouped "
+                "by type (cj-out, cj-change, deposit, reg-change) plus "
+                "fidelity bonds."
+            ),
+        ),
+    ] = False,
     scan_status: Annotated[
         bool,
         typer.Option(
@@ -833,6 +844,7 @@ def info(
             max_sats_freeze_reuse=settings.wallet.max_sats_freeze_reuse,
             reconstruct_history=settings.wallet.reconstruct_history,
             show_empty=show_empty,
+            show_utxos=show_utxos,
             creation_height=resolved.creation_height if resolved else None,
             mnemonic_file=resolved.mnemonic_file if resolved else None,
             scan_status_only=scan_status,
@@ -852,6 +864,7 @@ async def _show_wallet_info(
     max_sats_freeze_reuse: int = -1,
     reconstruct_history: bool = True,
     show_empty: bool = False,
+    show_utxos: bool = False,
     creation_height: int | None = None,
     mnemonic_file: Path | None = None,
     scan_status_only: bool = False,
@@ -1026,9 +1039,21 @@ async def _show_wallet_info(
             backend, data_dir, wallet_fingerprint=wallet.wallet_fingerprint
         )
 
-        # Show the wallet master fingerprint so users can pass it via
-        # --wallet-fingerprint to cold-wallet bond commands.
-        print(f"\nWallet fingerprint: {wallet.wallet_fingerprint}")
+        # Show the wallet name and master fingerprint so users can pass the
+        # fingerprint via --wallet-fingerprint to cold-wallet bond commands.
+        if wallet.mnemonic_file is not None:
+            print(
+                f"\n{_colorize('Wallet:', _ANSI_BOLD_YELLOW)} {wallet.mnemonic_file.name}"
+            )
+            print(
+                f"{_colorize('Wallet fingerprint:', _ANSI_BOLD_YELLOW)} "
+                f"{wallet.wallet_fingerprint}"
+            )
+        else:
+            print(
+                f"\n{_colorize('Wallet fingerprint:', _ANSI_BOLD_YELLOW)} "
+                f"{wallet.wallet_fingerprint}"
+            )
 
         # Spendable balance: get_total_balance() excludes frozen UTXOs (and,
         # with include_fidelity_bonds=False, fidelity bonds). It is therefore
@@ -1078,46 +1103,50 @@ async def _show_wallet_info(
             )
         else:
             # Balance checks must not allocate receive addresses.
-            print("\nBalance by mixdepth:")
-            for md in range(5):
-                balance = await wallet.get_balance(md, include_fidelity_bonds=False)
-                # Calculate frozen balance for this mixdepth
-                frozen_balance = sum(
+            # Simple view - show UTXO breakdown, then balance per mixdepth
+            if show_utxos:
+                _print_categorized_utxos(wallet)
+
+            print(f"\n{_colorize('Spendable Balance by Mixdepth:', _ANSI_BOLD_YELLOW)}")
+            md_balances = [
+                await wallet.get_balance(md, include_fidelity_bonds=False) for md in range(5)
+            ]
+            # Right-align the sums so the ``sats`` column lines up, sizing the
+            # column to the widest value so padding stays minimal for small sums.
+            md_balance_width = max((len(f"{b:,}") for b in md_balances), default=0)
+            # Right-align the per-mixdepth frozen amounts too, so the frozen
+            # figures line up in one column across mixdepths.
+            md_frozen = [
+                sum(
                     u.value
                     for u in wallet.utxo_cache.get(md, [])
                     if u.frozen and not u.is_fidelity_bond
                 )
-                # Build suffix parts
+                for md in range(5)
+            ]
+            frozen_width = max((len(f"{f:,}") for f in md_frozen), default=0)
+            for md, balance in enumerate(md_balances):
+                frozen_balance = md_frozen[md]
+                # Build suffix parts (frozen first, then fidelity bonds)
                 md_suffix_parts: list[str] = []
+                if frozen_balance > 0:
+                    md_suffix_parts.append(f"{frozen_balance:>{frozen_width},} frozen")
                 if md == 0:
                     fb_balance = await wallet.get_fidelity_bond_balance(md)
                     if fb_balance > 0:
-                        md_suffix_parts.append(f"+{fb_balance:,} FB")
-                if frozen_balance > 0:
-                    md_suffix_parts.append(f"{frozen_balance:,} frozen")
+                        md_suffix_parts.append(f"{fb_balance:,} Fidelity Bonds")
                 suffix = f" ({', '.join(md_suffix_parts)})" if md_suffix_parts else ""
-                print(f"  Mixdepth {md}: {balance:>15,} sats{suffix}")
-
-            print("\nTo receive funds, reserve a fresh address: jm-wallet address new <mixdepth>")
+                print(f"  Mixdepth {md}: {balance:>{md_balance_width},} sats{suffix}")
 
         # Show Total Balance with aligned columns and visual calculation
         unit_suffix = " sats"
-        unit_suffix_width = len(unit_suffix)
 
         # Calculate total: spendable + frozen + all FBs (locked + expired)
         total_balance = spendable_balance + total_frozen + fb_balance
-        total_str = f"{total_balance:,}{unit_suffix}"
-        header = _colorize(f"{'Total Wallet Balance:':<35}", _ANSI_BOLD_YELLOW)
-        print(f"\n{header}{total_str:>{balance_width + unit_suffix_width}}")
 
-        # Subtract frozen UTXOs (not spendable)
-        if total_frozen > 0:
-            frozen_str = f"{total_frozen:,}{unit_suffix}"
-            print(f"{'- Frozen UTXOs:':<35}{frozen_str:>{balance_width + unit_suffix_width}}")
-
-        # Subtract Fidelity Bonds (locked and expired, not spendable)
+        # Split FBs into time-locked (not yet expired) and expired.
+        bond_locked_total = 0
         if fb_balance > 0:
-            # Calculate time-locked FBs (not yet expired)
             import time
 
             current_time = int(time.time())
@@ -1127,36 +1156,72 @@ async def _show_wallet_info(
                 for u in utxos
                 if u.is_fidelity_bond and u.locktime and u.locktime > current_time
             )
+        expired_balance = fb_balance - bond_locked_total
 
-            # Expired = Total FBs - Locked
-            expired_balance = fb_balance - bond_locked_total
+        # Right-align the sums so the ``sats`` column lines up, sizing the
+        # column to the widest printed value (same system as the per-mixdepth
+        # block above) so it stays aligned even for large totals.
+        block_amounts = [
+            a
+            for a in (
+                total_balance,
+                total_frozen,
+                bond_locked_total,
+                expired_balance,
+                spendable_balance,
+            )
+            if a > 0
+        ]
+        block_width = max((len(f"{a:,}") for a in block_amounts), default=0)
 
+        # Size the label column to the widest label actually printed so the
+        # right-aligned sums sit as close to the labels as possible while still
+        # lining up at the ``sats`` column. The longest printed label (e.g. the
+        # time-locked line) then sits with minimal gap and the shorter ones fill
+        # in with extra spacing; labels that are not printed (no time-locked
+        # bonds) do not inflate the column.
+        printed_labels = ["Total Wallet Balance:", "= Total Spendable Balance:"]
+        if total_frozen > 0:
+            printed_labels.append("- Frozen UTXOs:")
+        if fb_balance > 0:
+            printed_labels.append("- Fidelity Bonds Expired:")
             if bond_locked_total > 0:
-                locked_str = f"{bond_locked_total:,}{unit_suffix}"
-                print(
-                    f"{'- Fidelity Bonds Time-Locked:':<35}"
-                    f"{locked_str:>{balance_width + unit_suffix_width}}"
-                )
+                printed_labels.append("- Fidelity Bonds Time-Locked:")
+        balance_label_width = max(len(label) for label in printed_labels)
 
-                expired_str = f"{expired_balance:,}{unit_suffix}"
+        header = _colorize(f"{'Total Wallet Balance:':<{balance_label_width}}", _ANSI_BOLD_YELLOW)
+        print(f"\n{header}{total_balance:>{block_width},}{unit_suffix}")
+
+        # Subtract frozen UTXOs (not spendable)
+        if total_frozen > 0:
+            print(
+                f"{'- Frozen UTXOs:':<{balance_label_width}}"
+                f"{total_frozen:>{block_width},}{unit_suffix}"
+            )
+
+        # Subtract Fidelity Bonds (locked and expired, not spendable)
+        if fb_balance > 0:
+            if bond_locked_total > 0:
                 print(
-                    f"{'- Fidelity Bonds Expired:':<35}"
-                    f"{expired_str:>{balance_width + unit_suffix_width}}"
+                    f"{'- Fidelity Bonds Time-Locked:':<{balance_label_width}}"
+                    f"{bond_locked_total:>{block_width},}{unit_suffix}"
                 )
-            else:
-                # Only expired bonds present
-                expired_str = f"{expired_balance:,}{unit_suffix}"
-                print(
-                    f"{'- Fidelity Bonds Expired:':<35}"
-                    f"{expired_str:>{balance_width + unit_suffix_width}}"
-                )
+            print(
+                f"{'- Fidelity Bonds Expired:':<{balance_label_width}}"
+                f"{expired_balance:>{block_width},}{unit_suffix}"
+            )
 
         # Final spendable amount after all deductions
-        spendable_str = f"{spendable_balance:,}{unit_suffix}"
         print(
-            f"{'= Total Spendable Balance:':<35}"
-            f"{spendable_str:>{balance_width + unit_suffix_width}}"
+            f"{'= Total Spendable Balance:':<{balance_label_width}}"
+            f"{spendable_balance:>{block_width},}{unit_suffix}"
         )
+        # Basic (non-extended) view: point users to how to get a fresh receive
+        # address. Printed last so it is the final actionable line of the output.
+        if not extended:
+            print("\nTo receive funds, reserve a fresh address: jm-wallet address new <mixdepth>")
+        # Trailing blank line so the output stands out from the next prompt
+        print()
 
     finally:
         await wallet.close()
@@ -1207,6 +1272,135 @@ def _print_utxo_rows(utxos: list[Any]) -> None:
         confs_display = "5+ conf" if utxo.confirmations >= 5 else f"{utxo.confirmations} conf"
         frozen_display = " [FROZEN]" if utxo.frozen else ""
         print(f"    - {utxo.outpoint}  {utxo.value:,} sats  ({confs_display}){frozen_display}")
+
+
+def _elide_address(addr: str, width: int) -> str:
+    """Truncate an address to exactly ``width`` chars, eliding the middle.
+
+    Bech32m fidelity-bond addresses are longer than regular spend addresses;
+    keeping both ends (prefix and checksum) while eliding the middle keeps them
+    recognizable while lining up with the normal-address column.
+    """
+    if len(addr) <= width:
+        return addr
+    inner = width - 3  # reserve 3 chars for the "..."
+    first = (inner + 1) // 2
+    last = inner - first
+    return f"{addr[:first]}...{addr[-last:]}"
+
+
+def _print_categorized_utxos(wallet: WalletService) -> None:
+    """Print the basic ``jm-wallet info`` UTXO breakdown grouped by type.
+
+    Every funded UTXO is bucketed by its CoinJoin provenance classification
+    (``cj-out``, ``cj-change``, ``deposit``, ``non-cj-change``), with one
+    section per type. Fidelity bonds are excluded from those four categories
+    (they are time-locked and never CoinJoin outputs) and get their own
+    ``fidelity bonds`` section instead, so the sum of all sections matches the
+    total wallet balance.
+
+    Each row shows a copy-ready ``TXID:VOUT`` outpoint plus a lowercase state
+    (``spendable``, ``frozen``, ``locked`` for time-locked fidelity bonds, or
+    ``redeemable`` for an expired bond that is ready to be redeemed), with
+    fields separated by ``|`` like the UTXO selector. Within each section,
+    UTXOs are ordered like the extended view (by mixdepth, then
+    external/internal branch, then derivation index), which also groups UTXOs
+    sharing an address so the address is printed once and elided on
+    continuation rows. Empty categories print a single ``none`` line rather
+    than one ``none`` per mixdepth.
+    """
+    from jmwallet.wallet.models import UTXOInfo
+
+    # Bucket UTXOs by classification, keeping (mixdepth, utxo) pairs.
+    by_category: dict[str, list[tuple[int, UTXOInfo]]] = {
+        "cj-out": [],
+        "cj-change": [],
+        "deposit": [],
+        "non-cj-change": [],
+    }
+    bonds: list[tuple[int, UTXOInfo]] = []
+    label_cache: dict[str, str] = {}
+
+    for md in range(wallet.mixdepth_count):
+        for utxo in wallet.utxo_cache.get(md, []):
+            if utxo.is_fidelity_bond:
+                bonds.append((md, utxo))
+                continue
+            label = label_cache.get(utxo.address)
+            if label is None:
+                label = wallet.get_utxo_label_from_wallet(utxo.address)
+                label_cache[utxo.address] = label
+            by_category.setdefault(label, []).append((md, utxo))
+
+    # Order UTXOs within each category the same way the extended view lists
+    # addresses: by mixdepth, then external/internal branch, then derivation
+    # index (resolved via ``address_cache``). Sorting by the address path also
+    # groups UTXOs that share an address, so the address column is printed
+    # once on the first row and elided on the continuation rows below.
+    def _path_sort_key(item: tuple[int, UTXOInfo]) -> tuple[int, int, int]:
+        md, utxo = item
+        return wallet.address_cache.get(utxo.address, (md, 0, 0))
+
+    for key in by_category:
+        by_category[key].sort(key=_path_sort_key)
+    bonds.sort(key=_path_sort_key)
+
+    # Column widths so every row lines up regardless of value magnitude.
+    all_utxos = [u for items in by_category.values() for _, u in items] + [u for _, u in bonds]
+    normal_utxos = [u for items in by_category.values() for _, u in items]
+    value_width = max((len(f"{u.value:,}") for u in all_utxos), default=9)
+    md_width = max((len(f"MD {md}:") for md in range(wallet.mixdepth_count)), default=8)
+    # Match the widest normal (non-bond) address so long fidelity-bond
+    # addresses are elided down to the same column as ordinary UTXOs.
+    addr_width = max((len(u.address) for u in normal_utxos), default=42)
+    # Fixed-width confs/state columns so outpoints align in their own column.
+    confs_width = max(
+        len("5+ conf" if u.confirmations >= 5 else f"{u.confirmations} conf") for u in all_utxos
+    )
+    # Widest state label (``redeemable``) so outpoints stay aligned in their
+    # own column for every row, including expired fidelity bonds.
+    state_width = max(len(s) for s in ("spendable", "frozen", "locked", "redeemable"))
+
+    sections: list[tuple[str, list[tuple[int, UTXOInfo]]]] = [
+        ("cj-out UTXOs:", by_category["cj-out"]),
+        ("cj-change UTXOs:", by_category["cj-change"]),
+        ("deposit UTXOs:", by_category["deposit"]),
+        ("reg-change UTXOs:", by_category["non-cj-change"]),
+        ("fidelity bonds:", bonds),
+    ]
+
+    for title, items in sections:
+        print(f"\n{_colorize(title, _ANSI_BOLD_CYAN)}")
+        if not items:
+            print("  none")
+            continue
+        last_md: int | None = None
+        last_addr: str | None = None
+        for md, utxo in items:
+            if md == last_md and utxo.address == last_addr:
+                addr_field = ""
+            else:
+                addr_field = _elide_address(utxo.address, addr_width)
+            confs_display = "5+ conf" if utxo.confirmations >= 5 else f"{utxo.confirmations} conf"
+            if utxo.frozen:
+                state = "frozen"
+            elif utxo.is_fidelity_bond and utxo.is_locked:
+                state = "locked"
+            elif utxo.is_fidelity_bond:
+                # Expired bond: still redeemable via the bond redeem flow, not
+                # a regular spendable UTXO.
+                state = "redeemable"
+            else:
+                state = "spendable"
+            md_label = _colorize(f"MD {md}:".ljust(md_width), _ANSI_CYAN)
+            print(
+                f"  {md_label} {addr_field:<{addr_width}} | "
+                f"{utxo.value:>{value_width},} sats | "
+                f"{confs_display:<{confs_width}} | {state:<{state_width}} | "
+                f"{utxo.outpoint}"
+            )
+            last_md = md
+            last_addr = utxo.address
 
 
 def _print_branch_addresses(

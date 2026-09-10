@@ -845,6 +845,13 @@ For full documentation, see [jmwallet Documentation](https://joinmarket-ng.githu
 │                                                        address.              │
 │                                                        [default:             │
 │                                                        no-show-empty]        │
+│ --show-utxos                                           In the basic view,    │
+│                                                        add a per-mixdepth    │
+│                                                        UTXO breakdown        │
+│                                                        grouped by type       │
+│                                                        (cj-out, cj-change,   │
+│                                                        deposit, reg-change)  │
+│                                                        plus fidelity bonds.  │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ```
 

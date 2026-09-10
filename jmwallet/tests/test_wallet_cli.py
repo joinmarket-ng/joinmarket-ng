@@ -2963,9 +2963,6 @@ async def test_info_keeps_old_mempool_row_pending_and_repairs_later_confirmation
     mock_wallet.get_total_balance = AsyncMock(return_value=0)
     mock_wallet.get_fidelity_bond_balance = AsyncMock(return_value=0)
     mock_wallet.get_balance = AsyncMock(return_value=0)
-    mock_wallet.get_next_safe_deposit_address = AsyncMock(
-        return_value=("bcrt1qnextunused000000000000000000000000000000", False)
-    )
     mock_wallet.utxo_cache = {}
     mock_wallet.close = AsyncMock()
 

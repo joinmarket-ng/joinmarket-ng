@@ -54,7 +54,7 @@ _jm_wallet_completion() {
         COMPREPLY=( $(compgen -W "--help --cert-pubkey --cert-signature --cert-expiry --data-dir --config-file --skip-verification --network -n --backend -b --rpc-url --neutrino-url --current-block --wallet-fingerprint --log-level" -- "$cur") )
         ;;
       info)
-        COMPREPLY=( $(compgen -W "--help --mnemonic-file -f --prompt-bip39-passphrase --network -n --backend -b --rpc-url --neutrino-url --extended -e --gap -g --show-empty --scan-status --data-dir --config-file --log-level -l" -- "$cur") )
+        COMPREPLY=( $(compgen -W "--help --mnemonic-file -f --prompt-bip39-passphrase --network -n --backend -b --rpc-url --neutrino-url --extended -e --gap -g --show-empty --show-utxos --scan-status --data-dir --config-file --log-level -l" -- "$cur") )
         ;;
       list-bonds)
         COMPREPLY=( $(compgen -W "--help --mnemonic-file -f --prompt-bip39-passphrase --wallet-fingerprint --data-dir --config-file --funded-only --active-only --json -j --log-level -l" -- "$cur") )

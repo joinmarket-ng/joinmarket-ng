@@ -219,6 +219,7 @@ _jm_wallet() {
             '--extended[Show detailed addresses, derivations, and UTXO outpoints]' \
             '--gap=[Max address gap to show in extended view]: :' \
             '--show-empty[In --extended view, show addresses with zero balance. When disabled (default), empty addresses are hidden except for the first unused one per branch so you still have a fresh receive address.]' \
+            '--show-utxos[In the basic view, add a per-mixdepth UTXO breakdown grouped by type (cj-out, cj-change, deposit, reg-change) plus fidelity bonds.]' \
             '--scan-status[Print Bitcoin Core'\''s wallet scan/coverage diagnostics and exit (descriptor wallet only). Use it when the wallet proposes already-used addresses; if coverage is incomplete, repair it with `jm-wallet rescan`. See the wallet scanning docs.]' \
             '--data-dir=[Data directory (default\: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)]:file:_files' \
             '--config-file=[Config file path (decoupled from data dir). Defaults to <data-dir>/config.toml]:file:_files' \
