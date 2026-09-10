@@ -1143,6 +1143,51 @@ class TestAddressInfoForMixdepth:
         for i in [6, 7, 8]:
             assert addresses[i].status == "new"
 
+    def test_external_display_extends_past_unfunded_reservations(self, wallet):
+        """Sequential unfunded reservations remain visible with a fresh gap."""
+        reserved = [wallet.get_receive_address(0, index) for index in range(7)]
+        for index, address in enumerate(reserved):
+            wallet.reserve_address(address, f"Reservation {index}")
+
+        reservations_before_display = (
+            set(wallet.reserved_addresses),
+            set(wallet.issued_receive_addresses),
+            dict(wallet.reserved_address_labels),
+        )
+        addresses = wallet.get_address_info_for_mixdepth(
+            mixdepth=0,
+            change=0,
+            gap_limit=3,
+            used_addresses=set(),
+            history_addresses={},
+        )
+
+        assert [info.index for info in addresses] == list(range(10))
+        assert [info.status for info in addresses[:7]] == ["reserved"] * 7
+        assert [info.label for info in addresses[:7]] == [
+            f"Reservation {index}" for index in range(7)
+        ]
+        assert [info.status for info in addresses[7:]] == ["new"] * 3
+        assert (
+            set(wallet.reserved_addresses),
+            set(wallet.issued_receive_addresses),
+            dict(wallet.reserved_address_labels),
+        ) == reservations_before_display
+
+    def test_issued_receive_display_range_is_external_and_mixdepth_scoped(self, wallet):
+        """An issued receive address extends only its external mixdepth branch."""
+        issued = wallet.get_receive_address(1, 8)
+        wallet.issued_receive_addresses.add(issued)
+
+        external = wallet.get_address_info_for_mixdepth(1, 0, gap_limit=2)
+        other_mixdepth = wallet.get_address_info_for_mixdepth(0, 0, gap_limit=2)
+        internal = wallet.get_address_info_for_mixdepth(1, 1, gap_limit=2)
+
+        assert [info.index for info in external] == list(range(11))
+        assert all(info.status == "new" for info in external)
+        assert [info.index for info in other_mixdepth] == [0, 1]
+        assert [info.index for info in internal] == [0, 1]
+
 
 class TestAccountXpub:
     """Tests for xpub generation."""
@@ -1806,6 +1851,25 @@ class TestReservedAddressPersistence:
         info = next(i for i in infos if i.address == addr)
         assert info.status == "reserved"
         assert info.label == "Bob"
+
+    def test_labeled_reservation_extends_display_after_restart(
+        self, mock_backend, temp_data_dir, test_mnemonic, test_network
+    ):
+        """A durable labeled reservation remains visible beyond chain history."""
+        wallet = self._make_wallet(mock_backend, temp_data_dir, test_mnemonic, test_network)
+        last_used = wallet.get_receive_address(0, 2)
+        reserved = wallet.get_receive_address(0, 10)
+        wallet.reserve_address(reserved, "Alice")
+
+        restarted = self._make_wallet(mock_backend, temp_data_dir, test_mnemonic, test_network)
+        restarted.addresses_with_history.add(last_used)
+        infos = restarted.get_address_info_for_mixdepth(0, 0, gap_limit=2)
+
+        assert [info.index for info in infos] == list(range(13))
+        assert infos[10].address == reserved
+        assert infos[10].status == "reserved"
+        assert infos[10].label == "Alice"
+        assert [info.status for info in infos[11:]] == ["new", "new"]
 
 
 class TestGetUtxoLabelFromWallet:

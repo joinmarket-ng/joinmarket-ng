@@ -952,7 +952,7 @@ class WalletService(
         last bulk enumeration was truncated by an RPC failure, this
         method may return a previously-funded address.
 
-        Privacy-critical callers (CLI ``info`` / daemon address
+        Privacy-critical callers (CLI ``address new`` / daemon address
         endpoints) should prefer :meth:`get_new_address_verified`,
         which adds a per-candidate ``getreceivedbyaddress`` check.
         """
@@ -964,7 +964,7 @@ class WalletService(
         Wraps :meth:`get_next_safe_deposit_address` and reserves the chosen
         address (persisted when a ``data_dir`` is configured) so it is never
         reissued, even across restarts. Use this from any async code path that
-        exposes a deposit address to users or peers (``jm-wallet info``,
+        exposes a deposit address to users or peers (``jm-wallet address new``,
         jmwalletd ``/wallet/address/new``, maker/taker deposit prompts).
         """
         address, _ = await self.get_next_safe_deposit_address(

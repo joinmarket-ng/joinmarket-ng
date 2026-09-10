@@ -859,7 +859,7 @@ async def _show_wallet_info(
     """Show wallet info implementation.
 
     Args:
-        display_gap: Max empty addresses shown beyond last used in extended view.
+        display_gap: Empty addresses beyond the last used or reserved receive address.
         gap_limit: BIP44 gap limit (trailing-empty threshold). Forwarded to
             ``WalletService`` for sync-time logic.
         scan_range: Initial descriptor scan range (the address-index lookahead
@@ -1077,7 +1077,7 @@ async def _show_wallet_info(
                 balance_width=balance_width,
             )
         else:
-            # Simple view - show balance and suggested address per mixdepth
+            # Balance checks must not allocate receive addresses.
             print("\nBalance by mixdepth:")
             for md in range(5):
                 balance = await wallet.get_balance(md, include_fidelity_bonds=False)
@@ -1098,19 +1098,7 @@ async def _show_wallet_info(
                 suffix = f" ({', '.join(md_suffix_parts)})" if md_suffix_parts else ""
                 print(f"  Mixdepth {md}: {balance:>15,} sats{suffix}")
 
-            print("\nDeposit addresses (next unused):")
-            for md in range(5):
-                # Get next deposit address with per-candidate on-chain
-                # verification (Layer 4b). Even if the bulk address-history
-                # sync was incomplete due to a transient RPC failure,
-                # ``get_next_safe_deposit_address`` will catch a
-                # previously-funded candidate via ``getreceivedbyaddress``
-                # and advance past it. This is the privacy belt-and-
-                # suspenders that prevents proposing already-used
-                # deposit addresses; see ``tmp/joinmarket_ng_wallet_rescan_3.txt``
-                # for the real-world failure trace that motivated it.
-                addr, _ = await wallet.get_next_safe_deposit_address(md, used_addresses)
-                print(f"  Mixdepth {md}: {addr}")
+            print("\nTo receive funds, reserve a fresh address: jm-wallet address new <mixdepth>")
 
         # Show Total Balance with aligned columns and visual calculation
         unit_suffix = " sats"
@@ -1335,7 +1323,7 @@ def _show_extended_wallet_info(
     print("  cj-change     - Change output from a CoinJoin (deanonymising, keep separate)")
     print("  non-cj-change - Regular change (not from CoinJoin)")
     print("  (reused)      - Appended when paid to more than once (privacy warning; avoid reuse)")
-    print('  reserved      - Set aside/handed out by you (label in "quotes"); do not reuse')
+    print('  reserved      - Previously issued or set aside (label in "quotes"); do not reuse')
     print("  used-empty    - Previously used, now empty (do not reuse)")
     print("  flagged       - Shared with peers but tx failed (do not reuse)")
     print()

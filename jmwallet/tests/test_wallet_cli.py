@@ -2841,6 +2841,70 @@ def _make_descriptor_info_mock_backend() -> MagicMock:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("extended", [False, True])
+@pytest.mark.parametrize("existing_reservations", [False, True])
+async def test_info_does_not_issue_addresses_or_change_reservations(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    extended: bool,
+    existing_reservations: bool,
+) -> None:
+    """Repeated info calls preserve metadata and the next explicitly issued address."""
+    from jmwallet.cli.wallet import _show_wallet_info
+    from jmwallet.wallet.service import WalletService
+
+    mnemonic = "abandon " * 11 + "about"
+    backend = _make_descriptor_info_mock_backend()
+    settings = ResolvedBackendSettings(
+        network="regtest",
+        bitcoin_network="regtest",
+        backend_type="descriptor_wallet",
+        rpc_url="http://127.0.0.1:18443",
+        rpc_user="user",
+        rpc_password="pass",
+        neutrino_url="",
+        neutrino_add_peers=[],
+        data_dir=tmp_path,
+    )
+    wallet = WalletService(mnemonic, backend, network="regtest", data_dir=tmp_path)
+    if existing_reservations:
+        wallet.reserve_address(wallet.get_receive_address(0, 0))
+        wallet.reserve_address(wallet.get_receive_address(0, 1), "deposit")
+        wallet.get_new_internal_address(0)
+    expected_next = wallet.get_receive_address(0, 2 if existing_reservations else 0)
+    metadata_path = tmp_path / f"wallet_metadata_{wallet.wallet_fingerprint}.jsonl"
+    metadata_before = metadata_path.read_bytes() if metadata_path.exists() else None
+
+    async def sync_without_network(instance: WalletService) -> None:
+        instance.utxo_cache = {md: [] for md in range(instance.mixdepth_count)}
+
+    with (
+        patch(
+            "jmwallet.backends.descriptor_wallet.DescriptorWalletBackend",
+            _stub_backend_class(backend),
+        ),
+        patch.object(WalletService, "sync_with_registered_bonds", sync_without_network),
+    ):
+        for _ in range(2):
+            await _show_wallet_info(
+                mnemonic, settings, extended=extended, reconstruct_history=False
+            )
+            output = capsys.readouterr().out
+            assert "Total Wallet Balance:" in output
+            if not extended:
+                assert "jm-wallet address new <mixdepth>" in output
+                assert expected_next not in output
+            metadata_after = metadata_path.read_bytes() if metadata_path.exists() else None
+            assert metadata_after == metadata_before
+
+    backend.address_has_history.assert_not_awaited()
+    restarted = WalletService(mnemonic, backend, network="regtest", data_dir=tmp_path)
+    assert await restarted.get_new_address_verified(0) == expected_next
+    await restarted.close()
+    await wallet.close()
+
+
+@pytest.mark.asyncio
 async def test_info_keeps_old_mempool_row_pending_and_repairs_later_confirmation(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

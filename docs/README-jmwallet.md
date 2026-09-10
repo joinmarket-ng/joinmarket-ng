@@ -25,7 +25,9 @@ jm-wallet info --extended
 jm-wallet history
 ```
 
-`info` shows balances by mixdepth. The extended view includes addresses and
+`info` shows balances by mixdepth without issuing or reserving receive addresses.
+Use `jm-wallet address new <mixdepth>` when you need an address to give to a payer.
+The extended view includes addresses and
 UTXO outpoints for review or explicit coin control. `history` shows this
 wallet's recorded CoinJoin and send history; it is not a replacement for
 independent transaction records.
@@ -103,6 +105,17 @@ normal way to reserve a fresh receive address; `--label` associates it with a
 purpose without affecting whether received coins can be spent. A reserved
 address can be inspected with `jm-wallet address list` or released only when it
 was never handed out.
+
+The extended view shows fresh addresses after the last used or reserved receive
+address. Viewing these rows does not reserve them; use `address new` before
+giving an address to a payer.
+
+Older versions also reserved one address per mixdepth whenever ordinary `info`
+displayed deposit suggestions. Those reservations remain intact on upgrade,
+including ones without labels: the wallet cannot tell whether a displayed
+address was subsequently handed out. They do not freeze funds or prevent an
+expected payment from arriving. Release an old reservation only if you know
+the address was never shared.
 
 ## Deleting A Wallet
 

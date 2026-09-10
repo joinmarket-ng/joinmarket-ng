@@ -66,7 +66,8 @@ class WalletDisplayMixin:
 
         This generates a list of AddressInfo objects for addresses in the
         specified mixdepth and branch (external or internal), up to the
-        specified gap limit beyond the last used address.
+        specified gap limit beyond the last used address or, for external
+        branches, the last reserved or issued receive address.
 
         Args:
             mixdepth: The mixdepth (account) number (0-4)
@@ -116,7 +117,7 @@ class WalletDisplayMixin:
             if utxo.confirmations == 0:
                 address_unconfirmed[utxo.address] = True
 
-        # Find the highest index with funds or history
+        # Find the highest index with funds or history.
         max_used_index = -1
         for address, (md, ch, idx) in self.address_cache.items():
             if md == mixdepth and ch == change:
@@ -133,6 +134,16 @@ class WalletDisplayMixin:
                 md, ch, idx = self.address_cache[utxo.address]
                 if md == mixdepth and ch == change and idx > max_used_index:
                     max_used_index = idx
+
+        if is_external:
+            # Unfunded receive addresses reserved by the user or already issued
+            # to a caller must remain visible, followed by a fresh display gap.
+            # Durable reservations are resolved into address_cache at startup.
+            for address in set(self.reserved_address_labels) | self.issued_receive_addresses:
+                if address in self.address_cache:
+                    md, ch, idx = self.address_cache[address]
+                    if md == mixdepth and ch == change and idx > max_used_index:
+                        max_used_index = idx
 
         # Generate addresses from 0 to max_used_index + gap_limit
         end_index = max(0, max_used_index + 1 + gap_limit)
