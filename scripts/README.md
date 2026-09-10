@@ -9,7 +9,7 @@ Utility scripts for JoinMarket NG development and operations.
 - **build_docs.py** - Reproduce `.github/workflows/properdocs-pages.yml` locally (install docs deps + editable packages, then run `properdocs build --strict -f properdocs.yml`)
 - **bump_version.py** - Bump the project version across all components
 - **coinjoin_notifier.py** - Monitor and notify about CoinJoin events
-- **fidelity_bond_tool.py** - Fetch, parse, and analyze fidelity bond proofs from mainnet makers
+- **diagnose_maker.py** - Discover a maker's onion endpoint, compare directory and direct offers, and analyze any fidelity bond proofs
 - **fund-test-wallets.sh** - Fund regtest wallets for testing
 - **generate_changelog.py** - Generate changelog entries from git history
 - **config_changelog.py** - Generate or backfill per-release configuration template changes
@@ -26,6 +26,64 @@ Utility scripts for JoinMarket NG development and operations.
 - **update-flatpak-deps.py** - Update Flatpak sources and pinned JAM Docker dependencies
 - **verify-release.sh** - Verify release signatures and optionally reproduce builds
 - **build-release.sh** - Build Docker images locally and generate a release manifest for local-first signing
+
+### Maker Diagnostics
+
+`diagnose_maker.py` runs an automatic diagnostic through Tor at `127.0.0.1:9050`:
+
+1. Connect to the directory and negotiate nick ownership authentication.
+2. Discover and print the maker's onion endpoint and advertised features.
+3. Request the orderbook through the directory and display the maker's signed offers.
+4. Connect directly to the maker's onion, request the orderbook again, and display those offers separately.
+5. Parse and check both signatures of any fidelity bond proofs received on either path.
+
+Offers are displayed even without a fidelity bond. Rejected messages are logged
+with their contents and reasons; they do not count as verified offers.
+If the direct endpoint responds under a different nick with a valid signature,
+the diagnostic warns that the requested nick may be stale and shows the responding
+nick. It keeps filtering for the requested identity; `--maker-address` overrides
+only the endpoint, not the expected nick.
+The network defaults to mainnet and must match the directory. `--network signet`
+selects a signet default directory when `--directory` is omitted. Explicit
+`--directory onion:port` ports are used as supplied; bare directory onions use 5222.
+
+```bash
+# Diagnose through the default signet directory and the discovered maker onion
+python scripts/diagnose_maker.py <maker_nick> --network signet
+
+# Select a directory and save a JSON report
+python scripts/diagnose_maker.py <maker_nick> --network signet --output diagnosis.json \
+  --directory signetvaxgd3ivj4tml4g6ed3samaa2rscre2gyeyohncmwk4fbesiqd.onion:5222
+
+# Supply a known direct endpoint if the directory cannot provide a complete peerlist
+python scripts/diagnose_maker.py <maker_nick> --network signet \
+  --maker-address <maker_onion:port> --timeout 20 --log-level INFO
+```
+
+Loguru logs go to stderr, with DEBUG enabled by default. They include sent
+orderbook requests, received directory envelopes and raw direct messages, and
+validation failures. Use `--log-level INFO` for progress without message dumps.
+The final report goes to stdout; `--output` additionally saves the structured
+report, including offer fields and raw bond proofs with their signature analysis.
+`--timeout` defaults to 60 seconds per connection/collection phase; peerlist
+discovery allows an additional five seconds to finish a chunked response.
+
+The default
+`--nick-auth-mode prefer_verified` authenticates when the directory supports it
+and permits legacy directories without it. Use `--nick-auth-mode require_verified`
+to reject directories without authentication support. A negotiated authentication
+failure stops directory requests. `disabled` is available for compatibility
+diagnostics. An explicit `--maker-address` still permits an independent direct
+check when directory connection or discovery fails.
+
+Exit status is 0 when both paths return verified offers and every received bond
+has valid signatures. A missing bond is normal. Exit status 1 means a failed or
+incomplete diagnostic, including an unavailable direct endpoint, and 2 means
+invalid command arguments. Signature checks do not establish whether a bond UTXO
+is unspent or eligible on chain.
+
+This replaces `fidelity_bond_tool.py`. Its `fetch`, `fetch-parse`, and `parse`
+subcommands have been removed; supply only the maker nick and connection options.
 
 ### Fidelity Bond Cold Storage
 
