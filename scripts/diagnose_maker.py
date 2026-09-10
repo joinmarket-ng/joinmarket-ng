@@ -38,7 +38,8 @@ from jmcore.protocol import MessageType, is_valid_nick
 DEFAULT_MAINNET_DIRECTORY = (
     "nakamotourflxwjnjpnrk7yc2nhkf6r62ed4gdfxmmn5f4saw5q5qoyd.onion:5222"
 )
-MAX_ROUTE_MESSAGES = 1_000
+# Directory orderbook requests include traffic from all makers, not just the target.
+MAX_ROUTE_MESSAGES = 100_000
 MAX_ROUTE_OFFERS = 1_000
 MAX_ROUTE_BONDS = 1_000
 MAX_COMMANDS_PER_MESSAGE = 1_000
@@ -903,8 +904,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--log-level",
         choices=("TRACE", "DEBUG", "INFO", "WARNING", "ERROR"),
-        default="DEBUG",
-        help="Loguru logging level (default: DEBUG, includes sent and received orderbook messages)",
+        default="INFO",
+        help="Loguru logging level (default: INFO; DEBUG includes sent and received orderbook messages)",
     )
     return parser
 

@@ -57,16 +57,20 @@ python scripts/diagnose_maker.py <maker_nick> --network signet --output diagnosi
 
 # Supply a known direct endpoint if the directory cannot provide a complete peerlist
 python scripts/diagnose_maker.py <maker_nick> --network signet \
-  --maker-address <maker_onion:port> --timeout 20 --log-level INFO
+  --maker-address <maker_onion:port> --timeout 20
 ```
 
-Loguru logs go to stderr, with DEBUG enabled by default. They include sent
-orderbook requests, received directory envelopes and raw direct messages, and
-validation failures. Use `--log-level INFO` for progress without message dumps.
+Loguru logs go to stderr, with INFO enabled by default for progress and verified
+offers without message dumps. Use `--log-level DEBUG` to include sent orderbook
+requests, received directory envelopes and raw direct messages, and validation
+details.
 The final report goes to stdout; `--output` additionally saves the structured
 report, including offer fields and raw bond proofs with their signature analysis.
 `--timeout` defaults to 60 seconds per connection/collection phase; peerlist
 discovery allows an additional five seconds to finish a chunked response.
+Each route can receive up to 100,000 messages, including traffic from other makers
+in the directory orderbook. Stored offers and bond proofs remain limited to 1,000
+each for the requested maker.
 
 The default
 `--nick-auth-mode prefer_verified` authenticates when the directory supports it

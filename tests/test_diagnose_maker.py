@@ -545,12 +545,43 @@ def test_malformed_unsigned_direct_offer_explains_both_defects() -> None:
     assert any(content in message for message in logs)
 
 
-def test_log_level_defaults_to_debug_and_can_be_reduced() -> None:
+def test_log_level_defaults_to_info_and_debug_can_be_enabled() -> None:
     parser = tool.build_parser()
-    assert parser.parse_args([VALID_USER_NICK]).log_level == "DEBUG"
+    assert parser.parse_args([VALID_USER_NICK]).log_level == "INFO"
     assert (
-        parser.parse_args([VALID_USER_NICK, "--log-level", "INFO"]).log_level == "INFO"
+        parser.parse_args([VALID_USER_NICK, "--log-level", "DEBUG"]).log_level
+        == "DEBUG"
     )
+
+
+@pytest.mark.asyncio
+async def test_directory_offer_after_large_orderbook_is_collected() -> None:
+    taker = NickIdentity(private_key_bytes=TAKER_KEY)
+    maker = NickIdentity(private_key_bytes=MAKER_KEY)
+    other = NickIdentity(private_key_bytes=b"\x05" * 32)
+    unrelated_offer = _signed_response(other, taker.nick, _offer_line())
+    target_offer = _signed_response(maker, taker.nick, _offer_line())
+    messages = [unrelated_offer] * 1_500 + [target_offer]
+
+    async def listen(duration: float) -> list[dict[str, Any]]:
+        # A completed collection window can contain thousands of other makers' messages.
+        await asyncio.sleep(duration)
+        return messages
+
+    client = MagicMock()
+    client.send_public_message = AsyncMock()
+    client.listen_for_messages = AsyncMock(side_effect=listen)
+    result = tool.RouteResult(name="directory", connected=True)
+
+    await tool._collect_directory_responses(
+        client, maker.nick, taker.nick, 0.01, result
+    )
+
+    assert result.successful
+    assert result.messages_received == 1_501
+    assert len(result.offers) == 1
+    assert result.offers[0].counterparty == maker.nick
+    assert result.errors == []
 
 
 @pytest.mark.asyncio
