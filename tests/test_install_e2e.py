@@ -34,6 +34,10 @@ INSTALL_DIR = REPO_ROOT / "tests" / "install"
 # local re-runs do not collide on a single tag. We include the workflow
 # / process id to keep collisions improbable without leaking secrets.
 _TAG_NS = f"joinmarket-ng/install-smoke-{os.getpid()}"
+# Cold hosted runners can spend more than five minutes pulling and unpacking a
+# base image. Keep phase-specific limits below the existing 15-minute test cap.
+DOCKER_BUILD_TIMEOUT = 600
+DOCKER_RUN_TIMEOUT = 600
 
 
 def _docker_available() -> bool:
@@ -71,30 +75,31 @@ def _build_and_run(
     checked-out branch.
     """
     tag = f"{_TAG_NS}-{tag_suffix}"
-    build = subprocess.run(
-        [
-            "docker",
-            "build",
-            "-f",
-            str(INSTALL_DIR / dockerfile),
-            "-t",
-            tag,
-            str(REPO_ROOT),
-        ],
-        capture_output=True,
-        text=True,
-        timeout=300,
-    )
-    assert build.returncode == 0, (
-        f"docker build failed for {dockerfile}:\n{build.stdout}\n{build.stderr}"
-    )
-    install_ref = os.environ.get("JMNG_INSTALL_REF", "main")
+    container_name = f"jmng-install-smoke-{os.getpid()}-{tag_suffix}"
     try:
+        # Keep BuildKit output attached so slow image pulls remain visible in CI.
+        build = subprocess.run(
+            [
+                "docker",
+                "build",
+                "-f",
+                str(INSTALL_DIR / dockerfile),
+                "-t",
+                tag,
+                str(REPO_ROOT),
+            ],
+            text=True,
+            timeout=DOCKER_BUILD_TIMEOUT,
+        )
+        assert build.returncode == 0, f"docker build failed for {dockerfile}"
+        install_ref = os.environ.get("JMNG_INSTALL_REF", "main")
         run = subprocess.run(
             [
                 "docker",
                 "run",
                 "--rm",
+                "--name",
+                container_name,
                 "-e",
                 f"JMNG_INSTALL_REF={install_ref}",
                 "-e",
@@ -106,9 +111,13 @@ def _build_and_run(
             # The full install pulls Python deps from PyPI / git, which
             # can be slow on a cold runner. 10 minutes is generous but
             # finite so a hung interactive prompt still fails the test.
-            timeout=600,
+            timeout=DOCKER_RUN_TIMEOUT,
         )
     finally:
+        # Killing the docker client on timeout does not stop its container.
+        subprocess.run(
+            ["docker", "rm", "-f", container_name], capture_output=True, check=False
+        )
         # Always free the image so re-runs do not bloat the local cache.
         subprocess.run(["docker", "rmi", "-f", tag], capture_output=True, check=False)
     return run
