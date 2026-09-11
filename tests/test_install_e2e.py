@@ -34,10 +34,11 @@ INSTALL_DIR = REPO_ROOT / "tests" / "install"
 # local re-runs do not collide on a single tag. We include the workflow
 # / process id to keep collisions improbable without leaking secrets.
 _TAG_NS = f"joinmarket-ng/install-smoke-{os.getpid()}"
-# Cold hosted runners can spend more than five minutes pulling and unpacking a
-# base image. Keep phase-specific limits below the existing 15-minute test cap.
+# Cold hosted runners can spend more than five minutes on image or package
+# downloads. Keep finite phase and test limits below the workflow's job ceiling.
 DOCKER_BUILD_TIMEOUT = 600
-DOCKER_RUN_TIMEOUT = 600
+DOCKER_RUN_TIMEOUT = 900
+DOCKER_TEST_TIMEOUT = 1200
 
 
 def _docker_available() -> bool:
@@ -76,6 +77,7 @@ def _build_and_run(
     """
     tag = f"{_TAG_NS}-{tag_suffix}"
     container_name = f"jmng-install-smoke-{os.getpid()}-{tag_suffix}"
+    log_stream: subprocess.Popen[str] | None = None
     try:
         # Keep BuildKit output attached so slow image pulls remain visible in CI.
         build = subprocess.run(
@@ -93,31 +95,81 @@ def _build_and_run(
         )
         assert build.returncode == 0, f"docker build failed for {dockerfile}"
         install_ref = os.environ.get("JMNG_INSTALL_REF", "main")
-        run = subprocess.run(
+        run_command = [
+            "docker",
+            "run",
+            "--detach",
+            "--name",
+            container_name,
+            "-e",
+            f"JMNG_INSTALL_REF={install_ref}",
+            "-e",
+            f"JMNG_INSTALL_PROFILE={install_profile}",
+            tag,
+        ]
+        started = subprocess.run(
+            run_command,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        assert started.returncode == 0, (
+            f"docker run failed to start:\n{started.stdout}\n{started.stderr}"
+        )
+
+        # Follow output in CI while retaining Docker's copy for assertions.
+        log_stream = subprocess.Popen(
+            ["docker", "logs", "--follow", container_name],
+            text=True,
+        )
+        waited = subprocess.run(
             [
                 "docker",
-                "run",
-                "--rm",
-                "--name",
+                "wait",
                 container_name,
-                "-e",
-                f"JMNG_INSTALL_REF={install_ref}",
-                "-e",
-                f"JMNG_INSTALL_PROFILE={install_profile}",
-                tag,
             ],
             capture_output=True,
             text=True,
-            # The full install pulls Python deps from PyPI / git, which
-            # can be slow on a cold runner. 10 minutes is generous but
-            # finite so a hung interactive prompt still fails the test.
             timeout=DOCKER_RUN_TIMEOUT,
+            check=False,
+        )
+        assert waited.returncode == 0, (
+            f"docker wait failed:\n{waited.stdout}\n{waited.stderr}"
+        )
+        log_stream.wait(timeout=30)
+        captured = subprocess.run(
+            ["docker", "logs", container_name],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        assert captured.returncode == 0, (
+            f"docker logs failed:\n{captured.stdout}\n{captured.stderr}"
+        )
+        try:
+            returncode = int(waited.stdout.strip())
+        except ValueError:
+            returncode = 125
+        run = subprocess.CompletedProcess(
+            run_command,
+            returncode,
+            stdout=captured.stdout,
+            stderr=captured.stderr,
         )
     finally:
-        # Killing the docker client on timeout does not stop its container.
+        # Stop timed-out containers before waiting for the log follower.
         subprocess.run(
             ["docker", "rm", "-f", container_name], capture_output=True, check=False
         )
+        if log_stream is not None and log_stream.poll() is None:
+            log_stream.terminate()
+            try:
+                log_stream.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                log_stream.kill()
+                log_stream.wait(timeout=10)
         # Always free the image so re-runs do not bloat the local cache.
         subprocess.run(["docker", "rmi", "-f", tag], capture_output=True, check=False)
     return run
@@ -140,14 +192,14 @@ def _assert_install_succeeded(result: subprocess.CompletedProcess[str]) -> None:
     )
 
 
-@pytest.mark.timeout(900)
+@pytest.mark.timeout(DOCKER_TEST_TIMEOUT)
 def test_install_on_debian_stable() -> None:
     """The default install includes working tumbler and watcher commands."""
     result = _build_and_run("Dockerfile.debian", "debian", "default")
     _assert_install_succeeded(result)
 
 
-@pytest.mark.timeout(900)
+@pytest.mark.timeout(DOCKER_TEST_TIMEOUT)
 def test_install_on_ubuntu_2404() -> None:
     """A taker-only install can update when a new native dependency is absent."""
     result = _build_and_run("Dockerfile.ubuntu", "ubuntu", "taker")
