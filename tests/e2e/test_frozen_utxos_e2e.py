@@ -77,7 +77,7 @@ def bitcoin_backend():
 
 @pytest_asyncio.fixture
 async def funded_wallet_with_metadata(bitcoin_backend, tmp_path):
-    """Create a funded wallet with metadata store enabled (for freezing).
+    """Create a wallet with at least three UTXOs and metadata enabled for freezing.
 
     Uses a temporary data directory so freeze state is isolated per test.
     """
@@ -108,6 +108,16 @@ async def funded_wallet_with_metadata(bitcoin_backend, tmp_path):
         pytest.skip("Wallet has no funds. Auto-funding failed.")
 
     try:
+        # Selection tests need an unfrozen alternative after freezing up to two UTXOs.
+        # Funding via sendtoaddress creates only one output, unlike the old
+        # coinbase fallback, so establish this prerequisite explicitly.
+        missing_utxos = max(0, 3 - len(await wallet.get_utxos(0)))
+        for _ in range(missing_utxos):
+            assert await ensure_wallet_funded(
+                wallet.get_receive_address(0, 0), amount_btc=1.0, confirmations=2
+            ), "Could not fund the additional UTXOs required by freezing tests"
+        if missing_utxos:
+            await wallet.sync_all()
         yield wallet
     finally:
         await wallet.close()

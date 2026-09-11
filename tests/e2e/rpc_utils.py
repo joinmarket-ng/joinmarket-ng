@@ -80,8 +80,8 @@ async def send_from_test_funder(
     insufficient funds (callers should fall back to coinbase mining).
     """
     try:
-        info = await rpc_call("getwalletinfo", wallet=TEST_FUNDER_WALLET)
-        balance = float(info.get("balance", 0))
+        # getwalletinfo no longer includes balances in modern Bitcoin Core.
+        balance = float(await rpc_call("getbalance", wallet=TEST_FUNDER_WALLET))
         if balance < amount_btc:
             logger.warning(
                 f"test-funder balance ({balance:.4f} BTC) < {amount_btc:.4f} BTC required"
@@ -197,8 +197,7 @@ async def fund_core_wallet(
     Returns:
         True once the wallet's spendable balance is >= ``target_btc``.
     """
-    info = await rpc_call("getwalletinfo", wallet=wallet)
-    balance = float(info.get("balance", 0))
+    balance = float(await rpc_call("getbalance", wallet=wallet))
     if balance >= target_btc:
         return True
 
@@ -209,8 +208,7 @@ async def fund_core_wallet(
 
     # Fallback: coinbase mining.
     for _ in range(max_rounds):
-        info = await rpc_call("getwalletinfo", wallet=wallet)
-        balance = float(info.get("balance", 0))
+        balance = float(await rpc_call("getbalance", wallet=wallet))
         if balance >= target_btc:
             return True
 
@@ -232,11 +230,11 @@ async def fund_core_wallet(
             "generatetoaddress", [needed_mature + 100, miner_address], wallet=wallet
         )
 
-    info = await rpc_call("getwalletinfo", wallet=wallet)
-    funded = float(info.get("balance", 0)) >= target_btc
+    balance = float(await rpc_call("getbalance", wallet=wallet))
+    funded = balance >= target_btc
     if not funded:
         logger.error(
             f"Could not fund Core wallet {wallet} to {target_btc} BTC after "
-            f"{max_rounds} rounds (balance={info.get('balance', 0)})"
+            f"{max_rounds} rounds (balance={balance})"
         )
     return funded
