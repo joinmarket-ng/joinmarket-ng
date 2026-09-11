@@ -14,6 +14,8 @@ from enum import StrEnum
 from typing import Any, ClassVar, Literal, TypeAlias, cast
 
 from bitcointx.core.key import CKey, CPubKey, XOnlyPubKey
+from nacl import bindings, public
+from nacl.exceptions import CryptoError
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from jmcore.bitcoin import hash256, parse_transaction_bytes, serialize_transaction
@@ -30,6 +32,9 @@ MAX_REVISION = 2_147_483_647
 MAX_RING_ENCODED_BYTES = 4 * MAX_RING_PAYLOAD_BYTES // 3 + 128
 # NaCl Box adds a 24-byte nonce and 16-byte authenticator before base64 encoding.
 MAX_RING_CIPHERTEXT_BYTES = 4 * ((MAX_RING_ENCODED_BYTES + 40 + 2) // 3)
+CONTACT_PADDED_PLAINTEXT_BYTES = 2048
+CONTACT_CIPHERTEXT_BYTES = CONTACT_PADDED_PLAINTEXT_BYTES + 40
+CONTACT_CIPHERTEXT_BASE64_BYTES = 4 * ((CONTACT_CIPHERTEXT_BYTES + 2) // 3)
 LOCKTIME_THRESHOLD = 500_000_000
 FINAL_SEQUENCE = 0xFFFFFFFF
 
@@ -81,6 +86,16 @@ def _validate_node_id(value: str) -> str:
             raise ValueError
     except ValueError as exc:
         raise ValueError("node_id is not a valid secp256k1 public key") from exc
+    return value
+
+
+def _validate_contact_public_key(value: str, field_name: str = "encryption_key") -> str:
+    _validate_hex(value, 32, field_name)
+    try:
+        # libsodium rejects the low-order points that would make the shared secret public.
+        bindings.crypto_scalarmult(b"\x01" * 32, bytes.fromhex(value))
+    except (CryptoError, RuntimeError, ValueError) as exc:
+        raise ValueError(f"{field_name} is not a valid non-low-order X25519 public key") from exc
     return value
 
 
@@ -203,6 +218,20 @@ class PrivateParticipant(RingModel):
             or not 1 <= int(port_text) <= 65535
         ):
             raise ValueError("onion_endpoint must be a v3 onion host and valid port")
+        return self
+
+
+class CoordinatorParticipant(RingModel):
+    """Participant descriptor visible to the coordinator without Lightning contact data."""
+
+    participant_key: Hex32
+    encryption_key: Hex32
+    backend_limits: BackendLimits
+
+    @model_validator(mode="after")
+    def validate_identity(self) -> CoordinatorParticipant:
+        _validate_xonly_key(self.participant_key, "participant_key")
+        _validate_contact_public_key(self.encryption_key)
         return self
 
 
@@ -461,7 +490,7 @@ class RingPayload(RingModel):
     """Fields shared by every canonical ring message payload."""
 
     message_type: ClassVar[str]
-    v: Literal[1] = 1
+    v: Literal[1, 2] = 1
     type: str
     round_nonce: Hex32
     revision: int = Field(ge=0, le=MAX_REVISION)
@@ -480,6 +509,7 @@ class RingPayload(RingModel):
 
 class RingInvitePayload(RingPayload):
     message_type: ClassVar[str] = "ring_invite"
+    v: Literal[1] = 1
     type: Literal["ring_invite"] = "ring_invite"
     network: RingNetwork
     offer_type: Tr0OfferType
@@ -489,6 +519,7 @@ class RingInvitePayload(RingPayload):
 
 class RingHelloPayload(RingPayload):
     message_type: ClassVar[str] = "ring_hello"
+    v: Literal[1] = 1
     type: Literal["ring_hello"] = "ring_hello"
     participant: PrivateParticipant
 
@@ -496,6 +527,33 @@ class RingHelloPayload(RingPayload):
     def validate_signer(self) -> RingHelloPayload:
         if self.signer_key != self.participant.participant_key:
             raise ValueError("hello signer_key does not match participant_key")
+        return self
+
+
+class RingPrivateInvitePayload(RingPayload):
+    """Version-2 invitation for a ring that relays neighbor contacts privately."""
+
+    message_type: ClassVar[str] = "ring_private_invite"
+    v: Literal[2] = 2
+    type: Literal["ring_private_invite"] = "ring_private_invite"
+    network: RingNetwork
+    offer_type: Tr0OfferType
+    expiry: int = Field(ge=1, le=MAX_REVISION)
+    policy_bounds: PolicyBounds
+
+
+class RingPrivateHelloPayload(RingPayload):
+    """Version-2 signed descriptor that excludes persistent Lightning contact data."""
+
+    message_type: ClassVar[str] = "ring_private_hello"
+    v: Literal[2] = 2
+    type: Literal["ring_private_hello"] = "ring_private_hello"
+    participant: CoordinatorParticipant
+
+    @model_validator(mode="after")
+    def validate_signer(self) -> RingPrivateHelloPayload:
+        if self.signer_key != self.participant.participant_key:
+            raise ValueError("private hello signer_key does not match participant_key")
         return self
 
 
@@ -519,8 +577,57 @@ class PrivateEdgePlan(RingModel):
         return self
 
 
+def _validate_local_plan_fields(
+    *,
+    signer_key: Hex32,
+    cycle_keys: list[Hex32],
+    position: int,
+    contribution: LocalContribution,
+    predecessor: PrivateParticipant | CoordinatorParticipant,
+    successor: PrivateParticipant | CoordinatorParticipant,
+    incoming_edge: PrivateEdgePlan,
+    outgoing_edge: PrivateEdgePlan,
+    network: RingNetwork,
+    offer_type: Tr0OfferType,
+) -> None:
+    for key in cycle_keys:
+        _validate_xonly_key(key, "cycle key")
+    _all_unique(cycle_keys, "cycle key")
+    if signer_key not in cycle_keys:
+        raise ValueError("plan signer must be the taker's cycle key")
+    if position >= len(cycle_keys):
+        raise ValueError("local plan position is outside the cycle")
+    local_key = cycle_keys[position]
+    if contribution.participant_key != local_key:
+        raise ValueError("local contribution does not identify the plan recipient")
+    predecessor_key = cycle_keys[(position - 1) % len(cycle_keys)]
+    successor_key = cycle_keys[(position + 1) % len(cycle_keys)]
+    if predecessor.participant_key != predecessor_key:
+        raise ValueError("predecessor does not match cycle")
+    if successor.participant_key != successor_key:
+        raise ValueError("successor does not match cycle")
+    if (
+        incoming_edge.opener_key != predecessor_key
+        or incoming_edge.acceptor_key != local_key
+        or outgoing_edge.opener_key != local_key
+        or outgoing_edge.acceptor_key != successor_key
+    ):
+        raise ValueError("local edges do not match cycle neighbors")
+    if incoming_edge.push_amount != contribution.incoming:
+        raise ValueError("incoming push does not match local contribution")
+    if network != predecessor.backend_limits.network:
+        raise ValueError("predecessor backend network mismatch")
+    if network != successor.backend_limits.network:
+        raise ValueError("successor backend network mismatch")
+    if offer_type != predecessor.backend_limits.offer_type:
+        raise ValueError("predecessor offer type mismatch")
+    if offer_type != successor.backend_limits.offer_type:
+        raise ValueError("successor offer type mismatch")
+
+
 class RingPlanPayload(RingPayload):
     message_type: ClassVar[str] = "ring_plan"
+    v: Literal[1] = 1
     type: Literal["ring_plan"] = "ring_plan"
     network: RingNetwork
     offer_type: Tr0OfferType
@@ -536,39 +643,136 @@ class RingPlanPayload(RingPayload):
 
     @model_validator(mode="after")
     def validate_local_plan(self) -> RingPlanPayload:
-        for key in self.cycle_keys:
-            _validate_xonly_key(key, "cycle key")
-        _all_unique(self.cycle_keys, "cycle key")
-        if self.signer_key not in self.cycle_keys:
-            raise ValueError("plan signer must be the taker's cycle key")
-        if self.position >= len(self.cycle_keys):
-            raise ValueError("local plan position is outside the cycle")
+        _validate_local_plan_fields(
+            signer_key=self.signer_key,
+            cycle_keys=self.cycle_keys,
+            position=self.position,
+            contribution=self.contribution,
+            predecessor=self.predecessor,
+            successor=self.successor,
+            incoming_edge=self.incoming_edge,
+            outgoing_edge=self.outgoing_edge,
+            network=self.network,
+            offer_type=self.offer_type,
+        )
+        return self
+
+
+class RingPrivatePlanPayload(RingPayload):
+    """Version-2 plan carrying only signed coordinator-visible neighbor descriptors."""
+
+    message_type: ClassVar[str] = "ring_private_plan"
+    v: Literal[2] = 2
+    type: Literal["ring_private_plan"] = "ring_private_plan"
+    network: RingNetwork
+    offer_type: Tr0OfferType
+    cycle_keys: list[Hex32] = Field(
+        min_length=MIN_RING_PARTICIPANTS, max_length=MAX_RING_PARTICIPANTS
+    )
+    position: int = Field(ge=0, le=MAX_RING_PARTICIPANTS - 1)
+    contribution: LocalContribution
+    predecessor: CoordinatorParticipant
+    successor: CoordinatorParticipant
+    incoming_edge: PrivateEdgePlan
+    outgoing_edge: PrivateEdgePlan
+    neighbor_hellos: list[RingPrivateHelloPayload] = Field(min_length=3, max_length=3)
+
+    @model_validator(mode="after")
+    def validate_local_plan(self) -> RingPrivatePlanPayload:
+        _validate_local_plan_fields(
+            signer_key=self.signer_key,
+            cycle_keys=self.cycle_keys,
+            position=self.position,
+            contribution=self.contribution,
+            predecessor=self.predecessor,
+            successor=self.successor,
+            incoming_edge=self.incoming_edge,
+            outgoing_edge=self.outgoing_edge,
+            network=self.network,
+            offer_type=self.offer_type,
+        )
         local_key = self.cycle_keys[self.position]
-        if self.contribution.participant_key != local_key:
-            raise ValueError("local contribution does not identify the plan recipient")
-        predecessor_key = self.cycle_keys[(self.position - 1) % len(self.cycle_keys)]
-        successor_key = self.cycle_keys[(self.position + 1) % len(self.cycle_keys)]
-        if self.predecessor.participant_key != predecessor_key:
-            raise ValueError("predecessor does not match cycle")
-        if self.successor.participant_key != successor_key:
-            raise ValueError("successor does not match cycle")
-        if (
-            self.incoming_edge.opener_key != predecessor_key
-            or self.incoming_edge.acceptor_key != local_key
-            or self.outgoing_edge.opener_key != local_key
-            or self.outgoing_edge.acceptor_key != successor_key
-        ):
-            raise ValueError("local edges do not match cycle neighbors")
-        if self.incoming_edge.push_amount != self.contribution.incoming:
-            raise ValueError("incoming push does not match local contribution")
-        if self.network != self.predecessor.backend_limits.network:
-            raise ValueError("predecessor backend network mismatch")
-        if self.network != self.successor.backend_limits.network:
-            raise ValueError("successor backend network mismatch")
-        if self.offer_type != self.predecessor.backend_limits.offer_type:
-            raise ValueError("predecessor offer type mismatch")
-        if self.offer_type != self.successor.backend_limits.offer_type:
-            raise ValueError("successor offer type mismatch")
+        expected_keys = [
+            local_key,
+            self.cycle_keys[(self.position - 1) % len(self.cycle_keys)],
+            self.cycle_keys[(self.position + 1) % len(self.cycle_keys)],
+        ]
+        for hello, expected_key in zip(self.neighbor_hellos, expected_keys, strict=True):
+            if hello.v != self.v:
+                raise ValueError("private hello version does not match private plan")
+            if hello.round_nonce != self.round_nonce or hello.revision != self.revision:
+                raise ValueError("private hello round does not match private plan")
+            if hello.participant.participant_key != expected_key:
+                raise ValueError("private hello does not match planned cycle position")
+            if hello.participant.backend_limits.network != self.network:
+                raise ValueError("private hello backend network does not match private plan")
+            if hello.participant.backend_limits.offer_type != self.offer_type:
+                raise ValueError("private hello offer type does not match private plan")
+            if not verify_payload(hello):
+                raise ValueError("private hello signature is invalid")
+        if self.neighbor_hellos[1].participant != self.predecessor:
+            raise ValueError("predecessor descriptor does not match its private hello")
+        if self.neighbor_hellos[2].participant != self.successor:
+            raise ValueError("successor descriptor does not match its private hello")
+        return self
+
+
+class ContactEnvelope(RingModel):
+    """Authenticated, fixed-size contact ciphertext relayed by the coordinator."""
+
+    sender_key: Hex32
+    recipient_key: Hex32
+    context_hash: Hex32
+    ciphertext: str = Field(
+        min_length=CONTACT_CIPHERTEXT_BASE64_BYTES,
+        max_length=CONTACT_CIPHERTEXT_BASE64_BYTES,
+    )
+
+    @model_validator(mode="after")
+    def validate_envelope(self) -> ContactEnvelope:
+        _validate_xonly_key(self.sender_key, "sender_key")
+        _validate_xonly_key(self.recipient_key, "recipient_key")
+        _validate_hex(self.context_hash, 32, "context_hash")
+        if self.sender_key == self.recipient_key:
+            raise ValueError("contact envelope endpoints must be distinct")
+        try:
+            ciphertext = base64.b64decode(self.ciphertext, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("contact ciphertext must be padded base64") from exc
+        if base64.b64encode(ciphertext).decode("ascii") != self.ciphertext:
+            raise ValueError("contact ciphertext must use canonical padded base64")
+        if len(ciphertext) != CONTACT_CIPHERTEXT_BYTES:
+            raise ValueError("contact ciphertext has an invalid fixed length")
+        return self
+
+
+class RingContactsPayload(RingPayload):
+    """Two encrypted contacts sent by one participant to its planned neighbors."""
+
+    message_type: ClassVar[str] = "ring_contacts"
+    v: Literal[2] = 2
+    type: Literal["ring_contacts"] = "ring_contacts"
+    envelopes: list[ContactEnvelope] = Field(min_length=2, max_length=2)
+
+    @model_validator(mode="after")
+    def validate_contacts(self) -> RingContactsPayload:
+        if any(envelope.sender_key != self.signer_key for envelope in self.envelopes):
+            raise ValueError("contact envelope sender does not match payload signer")
+        _all_unique([envelope.recipient_key for envelope in self.envelopes], "contact recipient")
+        return self
+
+
+class RingContactDeliveryPayload(RingPayload):
+    """Coordinator delivery of exactly one encrypted contact from each neighbor."""
+
+    message_type: ClassVar[str] = "ring_contact_delivery"
+    v: Literal[2] = 2
+    type: Literal["ring_contact_delivery"] = "ring_contact_delivery"
+    envelopes: list[ContactEnvelope] = Field(min_length=2, max_length=2)
+
+    @model_validator(mode="after")
+    def validate_delivery(self) -> RingContactDeliveryPayload:
+        _all_unique([envelope.sender_key for envelope in self.envelopes], "contact sender")
         return self
 
 
@@ -640,14 +844,55 @@ class PreparedIncomingState(RingModel):
         return self
 
 
+class PublicPreparedIncomingState(RingModel):
+    """Version-2 fundee observation without the opener's persistent node identity."""
+
+    pending_channel_id: Hex32
+    opener_key: Hex32
+    acceptor_key: Hex32
+    capacity: int = Field(ge=1, le=MAX_MONEY)
+    push_amount: int = Field(ge=1, le=MAX_MONEY)
+    policy: ChannelPolicy
+
+    @model_validator(mode="after")
+    def validate_state(self) -> PublicPreparedIncomingState:
+        _validate_hex(self.pending_channel_id, 32, "pending_channel_id")
+        _validate_xonly_key(self.opener_key, "opener_key")
+        _validate_xonly_key(self.acceptor_key, "acceptor_key")
+        if self.push_amount >= self.capacity:
+            raise ValueError("push_amount must be below channel capacity")
+        return self
+
+
 class RingPreparedPayload(RingPayload):
     message_type: ClassVar[str] = "ring_prepared"
+    v: Literal[1] = 1
     type: Literal["ring_prepared"] = "ring_prepared"
     outgoing: PreparedOutgoingState
     incoming: PreparedIncomingState
 
     @model_validator(mode="after")
     def validate_distinct_edges(self) -> RingPreparedPayload:
+        if self.outgoing.pending_channel_id == self.incoming.pending_channel_id:
+            raise ValueError("prepared states must cover distinct edges")
+        if self.outgoing.opener_key != self.signer_key:
+            raise ValueError("outgoing state opener does not match signer")
+        if self.incoming.acceptor_key != self.signer_key:
+            raise ValueError("incoming state fundee does not match signer")
+        return self
+
+
+class RingPrivatePreparedPayload(RingPayload):
+    """Version-2 prepared state with no persistent Lightning identity disclosure."""
+
+    message_type: ClassVar[str] = "ring_private_prepared"
+    v: Literal[2] = 2
+    type: Literal["ring_private_prepared"] = "ring_private_prepared"
+    outgoing: PreparedOutgoingState
+    incoming: PublicPreparedIncomingState
+
+    @model_validator(mode="after")
+    def validate_distinct_edges(self) -> RingPrivatePreparedPayload:
         if self.outgoing.pending_channel_id == self.incoming.pending_channel_id:
             raise ValueError("prepared states must cover distinct edges")
         if self.outgoing.opener_key != self.signer_key:
@@ -922,9 +1167,15 @@ RingPayloadType: TypeAlias = (
     RingInvitePayload
     | RingHelloPayload
     | RingPlanPayload
+    | RingPrivateInvitePayload
+    | RingPrivateHelloPayload
+    | RingPrivatePlanPayload
     | RingPlanAckPayload
     | RingOpenPayload
     | RingPreparedPayload
+    | RingContactsPayload
+    | RingContactDeliveryPayload
+    | RingPrivatePreparedPayload
     | RingUnsignedPayload
     | RingReadyPayload
     | RingReadySetPayload
@@ -940,9 +1191,15 @@ _PAYLOAD_TYPES: dict[str, type[RingPayload]] = {
         RingInvitePayload,
         RingHelloPayload,
         RingPlanPayload,
+        RingPrivateInvitePayload,
+        RingPrivateHelloPayload,
+        RingPrivatePlanPayload,
         RingPlanAckPayload,
         RingOpenPayload,
         RingPreparedPayload,
+        RingContactsPayload,
+        RingContactDeliveryPayload,
+        RingPrivatePreparedPayload,
         RingUnsignedPayload,
         RingReadyPayload,
         RingReadySetPayload,
@@ -952,6 +1209,25 @@ _PAYLOAD_TYPES: dict[str, type[RingPayload]] = {
         RingCancelPayload,
     )
 }
+
+_V1_ONLY_PAYLOAD_TYPES = frozenset(
+    {
+        RingInvitePayload.message_type,
+        RingHelloPayload.message_type,
+        RingPlanPayload.message_type,
+        RingPreparedPayload.message_type,
+    }
+)
+_V2_ONLY_PAYLOAD_TYPES = frozenset(
+    {
+        RingPrivateInvitePayload.message_type,
+        RingPrivateHelloPayload.message_type,
+        RingPrivatePlanPayload.message_type,
+        RingContactsPayload.message_type,
+        RingContactDeliveryPayload.message_type,
+        RingPrivatePreparedPayload.message_type,
+    }
+)
 
 
 def validate_hello_for_invite(invite: RingInvitePayload, hello: RingHelloPayload) -> None:
@@ -964,6 +1240,24 @@ def validate_hello_for_invite(invite: RingInvitePayload, hello: RingHelloPayload
         raise RingValidationError("hello backend network does not match invite")
     if invite.offer_type != limits.offer_type:
         raise RingValidationError("hello tr0 offer type does not match invite")
+
+
+def validate_private_hello_for_invite(
+    invite: RingPrivateInvitePayload, hello: RingPrivateHelloPayload
+) -> None:
+    """Reject a v2 hello that is unsigned or belongs to another private ring round."""
+
+    limits = hello.participant.backend_limits
+    if not verify_payload(hello):
+        raise RingValidationError("private hello signature is invalid")
+    if invite.round_nonce != hello.round_nonce or invite.revision != hello.revision:
+        raise RingValidationError("private hello round does not match private invite")
+    if hello.v != invite.v:
+        raise RingValidationError("private hello version does not match private invite")
+    if invite.network != limits.network:
+        raise RingValidationError("private hello backend network does not match private invite")
+    if invite.offer_type != limits.offer_type:
+        raise RingValidationError("private hello tr0 offer type does not match private invite")
 
 
 def validate_plan_for_invite(invite: RingInvitePayload, plan: RingPlanPayload) -> None:
@@ -979,6 +1273,31 @@ def validate_plan_for_invite(invite: RingInvitePayload, plan: RingPlanPayload) -
     outgoing_policy_ok = invite.policy_bounds.accepts(plan.outgoing_edge.policy)
     if not incoming_policy_ok or not outgoing_policy_ok:
         raise RingValidationError("plan channel policy is outside invitation bounds")
+
+
+def validate_private_plan_for_invite(
+    invite: RingPrivateInvitePayload, plan: RingPrivatePlanPayload
+) -> None:
+    """Bind a v2 plan and its signed contact descriptors to the private invitation."""
+
+    try:
+        RingPrivatePlanPayload.model_validate(plan.model_dump())
+    except ValueError as exc:
+        raise RingValidationError("private plan has invalid signed hello bindings") from exc
+    if invite.round_nonce != plan.round_nonce or invite.revision != plan.revision:
+        raise RingValidationError("private plan round does not match private invite")
+    if plan.v != invite.v:
+        raise RingValidationError("private plan version does not match private invite")
+    if plan.signer_key != invite.signer_key:
+        raise RingValidationError("private plan is not signed by the inviting taker")
+    if plan.network != invite.network or plan.offer_type != invite.offer_type:
+        raise RingValidationError(
+            "private plan network or offer type does not match private invite"
+        )
+    incoming_policy_ok = invite.policy_bounds.accepts(plan.incoming_edge.policy)
+    outgoing_policy_ok = invite.policy_bounds.accepts(plan.outgoing_edge.policy)
+    if not incoming_policy_ok or not outgoing_policy_ok:
+        raise RingValidationError("private plan channel policy is outside invitation bounds")
 
 
 def _canonical_value(value: Any) -> Any:
@@ -1030,8 +1349,56 @@ def manifest_hash(manifest: RingManifest) -> bytes:
 
 
 def payload_hash(payload: RingPayload) -> bytes:
-    domain = f"JMP0010/{payload.type}/v1\0".encode("ascii")
+    domain = f"JMP0010/{payload.type}/v{payload.v}\0".encode("ascii")
     return hashlib.sha256(domain + canonical_json(payload, exclude_signature=True)).digest()
+
+
+def cycle_context_hash(
+    network: RingNetwork,
+    round_nonce: Hex32,
+    revision: int,
+    cycle_keys: Sequence[Hex32],
+) -> Hex32:
+    """Hash the ordered v2 cycle context that authenticated contacts are bound to."""
+
+    if network not in ("mainnet", "testnet", "signet", "regtest"):
+        raise RingValidationError("contact context network is invalid")
+    if type(revision) is not int or not 0 <= revision <= MAX_REVISION:
+        raise RingValidationError("contact context revision is invalid")
+    if not MIN_RING_PARTICIPANTS <= len(cycle_keys) <= MAX_RING_PARTICIPANTS:
+        raise RingValidationError("contact context cycle length is invalid")
+    try:
+        _validate_hex(round_nonce, 32, "round_nonce")
+        for key in cycle_keys:
+            _validate_xonly_key(key, "cycle key")
+        _all_unique(cycle_keys, "cycle key")
+    except (TypeError, ValueError) as exc:
+        raise RingValidationError("contact context is invalid") from exc
+    context = {
+        "cycle_keys": list(cycle_keys),
+        "network": network,
+        "revision": revision,
+        "round_nonce": round_nonce,
+    }
+    return hashlib.sha256(
+        b"JMP0006/ring-contact-context/v2\0" + canonical_json(context)
+    ).hexdigest()
+
+
+class _PeerContactPlaintext(RingModel):
+    sender_key: Hex32
+    recipient_key: Hex32
+    context_hash: Hex32
+    participant: PrivateParticipant
+
+    @model_validator(mode="after")
+    def validate_bindings(self) -> _PeerContactPlaintext:
+        _validate_xonly_key(self.sender_key, "sender_key")
+        _validate_xonly_key(self.recipient_key, "recipient_key")
+        _validate_hex(self.context_hash, 32, "context_hash")
+        if self.sender_key != self.participant.participant_key:
+            raise ValueError("contact plaintext sender does not match participant")
+        return self
 
 
 @dataclass(frozen=True)
@@ -1112,6 +1479,157 @@ def sign_payload(
 
 def verify_payload(payload: RingPayload) -> bool:
     return verify_hash(payload.signer_key, payload_hash(payload), payload.sig)
+
+
+def _contact_private_key(secret_hex: Hex32) -> public.PrivateKey:
+    try:
+        _validate_hex(secret_hex, 32, "contact secret")
+        return public.PrivateKey(bytes.fromhex(secret_hex))
+    except (TypeError, ValueError) as exc:
+        raise RingValidationError("contact secret must be 32-byte lowercase hex") from exc
+
+
+def _contact_public_key(value: Hex32, field_name: str = "encryption_key") -> public.PublicKey:
+    try:
+        _validate_contact_public_key(value, field_name)
+        return public.PublicKey(bytes.fromhex(value))
+    except (TypeError, ValueError) as exc:
+        raise RingValidationError(f"{field_name} is not a valid X25519 public key") from exc
+
+
+def contact_public_key(secret_hex: Hex32) -> Hex32:
+    """Derive the X25519 contact public key for a 32-byte lowercase secret."""
+
+    return bytes(_contact_private_key(secret_hex).public_key).hex()
+
+
+def _padded_peer_contact(
+    sender: PrivateParticipant,
+    recipient_key: Hex32,
+    context_hash: Hex32,
+) -> bytes:
+    plaintext = _PeerContactPlaintext(
+        sender_key=sender.participant_key,
+        recipient_key=recipient_key,
+        context_hash=context_hash,
+        participant=sender,
+    )
+    encoded = canonical_json(plaintext)
+    if len(encoded) > CONTACT_PADDED_PLAINTEXT_BYTES - 2:
+        raise RingValidationError("peer contact exceeds fixed plaintext bound")
+    return (
+        len(encoded).to_bytes(2, "big")
+        + encoded
+        + b"\x00" * (CONTACT_PADDED_PLAINTEXT_BYTES - 2 - len(encoded))
+    )
+
+
+def encrypt_peer_contact(
+    local_contact_secret: Hex32,
+    recipient: CoordinatorParticipant,
+    sender: PrivateParticipant,
+    context_hash: Hex32,
+) -> ContactEnvelope:
+    """Encrypt a sender's Lightning contact to one signed neighboring descriptor."""
+
+    try:
+        _validate_hex(context_hash, 32, "context_hash")
+    except (TypeError, ValueError) as exc:
+        raise RingValidationError("contact context_hash must be 32-byte lowercase hex") from exc
+    if sender.participant_key == recipient.participant_key:
+        raise RingValidationError("contact envelope endpoints must be distinct")
+    try:
+        ciphertext = bytes(
+            public.Box(
+                _contact_private_key(local_contact_secret),
+                _contact_public_key(recipient.encryption_key),
+            ).encrypt(_padded_peer_contact(sender, recipient.participant_key, context_hash))
+        )
+    except (CryptoError, RuntimeError, ValueError) as exc:
+        raise RingValidationError("peer contact encryption failed") from exc
+    return ContactEnvelope(
+        sender_key=sender.participant_key,
+        recipient_key=recipient.participant_key,
+        context_hash=context_hash,
+        ciphertext=base64.b64encode(ciphertext).decode("ascii"),
+    )
+
+
+def _decode_peer_contact_plaintext(padded_plaintext: bytes) -> _PeerContactPlaintext:
+    if len(padded_plaintext) != CONTACT_PADDED_PLAINTEXT_BYTES:
+        raise RingValidationError("peer contact plaintext has an invalid fixed length")
+    encoded_length = int.from_bytes(padded_plaintext[:2], "big")
+    if not 0 < encoded_length <= CONTACT_PADDED_PLAINTEXT_BYTES - 2:
+        raise RingValidationError("peer contact plaintext length is invalid")
+    encoded = padded_plaintext[2 : 2 + encoded_length]
+    if padded_plaintext[2 + encoded_length :] != b"\x00" * (
+        CONTACT_PADDED_PLAINTEXT_BYTES - 2 - encoded_length
+    ):
+        raise RingValidationError("peer contact plaintext padding is invalid")
+    _validate_encoded_depth(encoded)
+    try:
+        decoded = json.loads(
+            encoded,
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=lambda value: (_ for _ in ()).throw(
+                RingValidationError(f"invalid JSON constant: {value}")
+            ),
+        )
+    except (json.JSONDecodeError, UnicodeDecodeError, RingValidationError) as exc:
+        raise RingValidationError("peer contact plaintext is not valid canonical JSON") from exc
+    if not isinstance(decoded, dict):
+        raise RingValidationError("peer contact plaintext must be a JSON object")
+    try:
+        contact = _PeerContactPlaintext.model_validate(decoded)
+    except ValueError as exc:
+        raise RingValidationError("peer contact plaintext schema is invalid") from exc
+    if canonical_json(contact) != encoded:
+        raise RingValidationError("peer contact plaintext is not canonical")
+    return contact
+
+
+def decrypt_peer_contact(
+    local_contact_secret: Hex32,
+    sender: CoordinatorParticipant,
+    envelope: ContactEnvelope,
+    expected_recipient_key: Hex32,
+    expected_context_hash: Hex32,
+) -> PrivateParticipant:
+    """Authenticate, decrypt, and bind a relayed neighbor contact to its descriptor."""
+
+    try:
+        _validate_xonly_key(expected_recipient_key, "expected_recipient_key")
+        _validate_hex(expected_context_hash, 32, "expected_context_hash")
+    except (TypeError, ValueError) as exc:
+        raise RingValidationError("expected contact binding is invalid") from exc
+    if envelope.sender_key != sender.participant_key:
+        raise RingValidationError("contact envelope sender does not match signed descriptor")
+    if envelope.recipient_key != expected_recipient_key:
+        raise RingValidationError("contact envelope recipient does not match expected recipient")
+    if envelope.context_hash != expected_context_hash:
+        raise RingValidationError("contact envelope context does not match expected context")
+    try:
+        ciphertext = base64.b64decode(envelope.ciphertext, validate=True)
+        if len(ciphertext) != CONTACT_CIPHERTEXT_BYTES:
+            raise ValueError("invalid ciphertext length")
+        padded_plaintext = public.Box(
+            _contact_private_key(local_contact_secret),
+            _contact_public_key(sender.encryption_key),
+        ).decrypt(ciphertext)
+    except (binascii.Error, CryptoError, RuntimeError, ValueError) as exc:
+        raise RingValidationError("peer contact authentication failed") from exc
+    contact = _decode_peer_contact_plaintext(padded_plaintext)
+    if (
+        contact.sender_key != envelope.sender_key
+        or contact.recipient_key != envelope.recipient_key
+        or contact.context_hash != envelope.context_hash
+    ):
+        raise RingValidationError("peer contact plaintext does not match envelope")
+    if contact.participant.participant_key != sender.participant_key:
+        raise RingValidationError("peer contact participant does not match signed descriptor")
+    if contact.participant.backend_limits != sender.backend_limits:
+        raise RingValidationError("peer contact backend limits do not match signed descriptor")
+    return contact.participant
 
 
 def sign_attestation(
@@ -1240,7 +1758,12 @@ def decode_ring_message(message: str) -> RingPayloadType:
         raise RingValidationError("ring payload is not valid UTF-8 JSON") from exc
     if not isinstance(decoded, dict):
         raise RingValidationError("ring payload must be a JSON object")
-    if decoded.get("v") != RING_VERSION:
+    version = decoded.get("v")
+    if (
+        version not in (RING_VERSION, 2)
+        or (envelope_type in _V1_ONLY_PAYLOAD_TYPES and version != 1)
+        or (envelope_type in _V2_ONLY_PAYLOAD_TYPES and version != 2)
+    ):
         raise RingValidationError("unknown ring payload version")
     if decoded.get("type") != envelope_type:
         raise RingValidationError("envelope and payload message types differ")
