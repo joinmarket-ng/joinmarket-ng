@@ -22,6 +22,7 @@ from jmcore.protocol import (
     COMMAND_PREFIX,
     FEATURE_CHANNEL_INPUT_V1,
     FEATURE_COFUNDED_CHANNEL_RING_V1,
+    FEATURE_COFUNDED_CHANNEL_RING_V2,
     FEATURE_NEUTRINO_COMPAT,
     FEATURE_NICK_AUTH,
     FEATURE_PEERLIST_FEATURES,
@@ -475,7 +476,11 @@ class DirectConnectionMixin:
         if self.config.nick_auth_mode is not NickAuthMode.DISABLED:
             features.features.add(FEATURE_NICK_AUTH)
         if self.channel_ring_capability_validated:
-            features.features.add(FEATURE_COFUNDED_CHANNEL_RING_V1)
+            features.features.add(
+                FEATURE_COFUNDED_CHANNEL_RING_V2
+                if self.config.channel_ring.private_coordination
+                else FEATURE_COFUNDED_CHANNEL_RING_V1
+            )
         if self.channel_input_capability_validated:
             features.features.add(FEATURE_CHANNEL_INPUT_V1)
 

@@ -725,6 +725,10 @@ ruff==0.16.4 \
     --hash=sha256:f2d812e482f5a7e02eee26cd73d2a37ebbdf47d795ea63ba1b89110ae93e9fb3 \
     --hash=sha256:fbd85d2875fdd67e833213a651f613bbf25303abf6aa822a5121f4531195678d
     # via jmswap (pyproject.toml)
+types-grpcio==1.83.0.20260730 \
+    --hash=sha256:400e0517d088e90ecfe302a96f09728cb9c72508d835fa0793fce552cd4e1477 \
+    --hash=sha256:e2b0532526a563dbb39aa6ee39fe0961488116ac1afec3065607532c93299b64
+    # via jmswap (pyproject.toml)
 types-protobuf==7.35.1.20260821 \
     --hash=sha256:a99b71356e153e53cc7bc3c8c0e22d8aa54d92f02bf02486f7a19a3a947caf03 \
     --hash=sha256:abc85e9271f9774f4899201dbfb731ef4a453f302454fdb66091a557b2adb2ac

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Callable, Sequence
+from pathlib import Path
 from typing import Protocol
 
 from jmcore.bitcoin import get_txid
@@ -125,6 +126,7 @@ class MakerChannelInputRegistry:
         store: MakerChannelInputStore,
         config: ChannelInputConfig,
         network: Network,
+        maintenance_directory: Path | None = None,
     ) -> None:
         self._store = store
         self._config = config
@@ -132,7 +134,36 @@ class MakerChannelInputRegistry:
         self._negotiations: dict[tuple[str, int], MakerChannelInputNegotiation] = {}
         self._locks: dict[tuple[str, int], asyncio.Lock] = {}
         self._admission_lock = asyncio.Lock()
+        self._maintenance_directory = maintenance_directory
         self._load()
+
+    def _sync_spend_admission(self, negotiation: MakerChannelInputNegotiation) -> None:
+        if self._maintenance_directory is None or not negotiation.freeze_intents:
+            return
+        from jmswap.maintenance import (
+            MaintenanceError,
+            claim_spend_channels,
+            release_spend_channels,
+        )
+
+        directory = self._maintenance_directory
+        node_id = negotiation.local_node_key
+        owner = f"maker:{negotiation.invite.session_id}:{negotiation.invite.attempt}"
+        points = tuple(
+            f"{intent.funding_outpoint.txid}:{intent.funding_outpoint.vout}"
+            for intent in negotiation.freeze_intents
+        )
+        try:
+            if negotiation.stage is MakerChannelInputStage.CANCELED:
+                release_spend_channels(directory, node_id, owner, points)
+            elif not claim_spend_channels(directory, node_id, owner, points):
+                raise MakerChannelInputRuntimeError(
+                    "channel input is busy with another local operation"
+                )
+        except MaintenanceError as exc:
+            raise MakerChannelInputRuntimeError(
+                "channel-input admission state is unavailable"
+            ) from exc
 
     @classmethod
     def load(
@@ -141,10 +172,13 @@ class MakerChannelInputRegistry:
         store: MakerChannelInputStore,
         config: ChannelInputConfig,
         network: Network,
+        maintenance_directory: Path | None = None,
     ) -> MakerChannelInputRegistry:
         """Restore a registry only when every persisted record is trustworthy."""
 
-        return cls(store=store, config=config, network=network)
+        return cls(
+            store=store, config=config, network=network, maintenance_directory=maintenance_directory
+        )
 
     @property
     def session_count(self) -> int:
@@ -558,6 +592,8 @@ class MakerChannelInputRegistry:
             if snapshot.stage is MakerChannelInputStage.CANCELED and snapshot.invite.expiry <= int(
                 time.time()
             ):
+                if self._maintenance_directory is not None:
+                    self._sync_spend_admission(MakerChannelInputNegotiation.from_snapshot(snapshot))
                 try:
                     self._store.delete(snapshot)
                 except MakerChannelInputStoreError as exc:
@@ -599,6 +635,7 @@ class MakerChannelInputRegistry:
     async def _reconcile_one(
         self, negotiation: MakerChannelInputNegotiation, backend: MakerChannelInputBackend
     ) -> None:
+        self._sync_spend_admission(negotiation)
         stage = negotiation.stage
         if stage is MakerChannelInputStage.CANCELED:
             return
@@ -1048,3 +1085,4 @@ class MakerChannelInputRegistry:
             raise MakerChannelInputRuntimeError(
                 "could not persist channel-input recovery state"
             ) from exc
+        self._sync_spend_admission(negotiation)

@@ -6,10 +6,16 @@ from dataclasses import dataclass, field
 from typing import cast
 
 from jmcore.channel_ring import ChannelRingConfig
+from jmcore.channel_ring_store import (
+    RingLifecycleState,
+    RingParticipantRecord,
+    RingParticipantStore,
+)
 from jmcore.cofunded_ring import (
     BackendLimits,
     PrivateParticipant,
     RingNetwork,
+    RingPrivatePlanPayload,
     Tr0OfferType,
 )
 
@@ -32,6 +38,65 @@ class InitializedChannelRingBackend:
             onion_endpoint=self.onion_endpoint,
             backend_limits=self.backend_limits,
         )
+
+    def enroll_confirmed_channels(
+        self, store: RingParticipantStore, record: RingParticipantRecord
+    ) -> None:
+        """Hand off affirmative new-v2 enrollment once, without inferring missing state."""
+        current = store.load(record.key)
+        if current is None:
+            raise ValueError("confirmed private ring record is missing")
+        record = current
+        if (
+            not isinstance(record.plan, RingPrivatePlanPayload)
+            or record.maintenance_directory is None
+            or record.state is not RingLifecycleState.CONFIRMED_OPEN
+            or record.manifest is None
+        ):
+            return
+        edges = (record.incoming_edge, record.outgoing_edge)
+        for edge in edges:
+            if (
+                edge is None
+                or edge.funding_outpoint is None
+                or edge.funding_outpoint.txid != record.manifest.unsigned_txid
+            ):
+                raise ValueError("confirmed private ring lacks exact local channel outpoints")
+        from jmswap.maintenance import enroll_channel, require_channel_enrollment
+
+        error_message = "Private channel maintenance enrollment requires operator review"
+        try:
+            # Record the attempt first. A missing database after this point must
+            # never trigger automatic reenrollment and a second fee initialization.
+            if not record.maintenance_enrollment_recorded:
+                store.transition(
+                    record.key, record.state, updates={"maintenance_enrollment_recorded": True}
+                )
+                for edge in edges:
+                    assert edge is not None and edge.funding_outpoint is not None
+                    enroll_channel(
+                        record.maintenance_directory,
+                        self.node_info.identity_pubkey,
+                        edge.peer.node_id,
+                        str(edge.funding_outpoint),
+                        record.manifest.unsigned_txid,
+                    )
+            for edge in edges:
+                assert edge is not None and edge.funding_outpoint is not None
+                require_channel_enrollment(
+                    record.maintenance_directory,
+                    self.node_info.identity_pubkey,
+                    edge.peer.node_id,
+                    str(edge.funding_outpoint),
+                    record.manifest.unsigned_txid,
+                )
+        except Exception:
+            store.transition(
+                record.key,
+                record.state,
+                updates={"retry": record.retry.model_copy(update={"last_error": error_message})},
+            )
+            raise
 
 
 async def initialize_channel_ring_backend(
@@ -61,6 +126,8 @@ async def initialize_channel_ring_backend(
             config.onion_endpoint,
             timeout_seconds=config.open_timeout_seconds,
         )
+        if config.private_coordination and not info.feature_bits.intersection({46, 47}):
+            raise ValueError("private ring v2 requires LND option-scid-alias support")
     except Exception:
         await backend.close()
         raise

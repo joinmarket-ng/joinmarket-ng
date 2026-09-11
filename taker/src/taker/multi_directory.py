@@ -23,6 +23,7 @@ from jmcore.nick_auth import NickAuthMode
 from jmcore.protocol import (
     FEATURE_CHANNEL_INPUT_V1,
     FEATURE_COFUNDED_CHANNEL_RING_V1,
+    FEATURE_COFUNDED_CHANNEL_RING_V2,
     FEATURE_NEUTRINO_COMPAT,
     NOT_SERVING_ONION_HOSTNAME,
     FeatureSet,
@@ -131,6 +132,7 @@ class MultiDirectoryClient(DirectoryClientPool):
         connection_timeout: float = 120.0,
         neutrino_compat: bool = False,
         cofunded_channel_ring_v1: bool = False,
+        cofunded_channel_ring_v2: bool = False,
         channel_input_v1: bool = False,
         on_nick_leave: Any | None = None,
         prefer_direct_connections: bool = True,
@@ -161,6 +163,7 @@ class MultiDirectoryClient(DirectoryClientPool):
         self.neutrino_compat = neutrino_compat
         self.allow_clearnet_connections = allow_clearnet_connections
         self.cofunded_channel_ring_v1 = cofunded_channel_ring_v1
+        self.cofunded_channel_ring_v2 = cofunded_channel_ring_v2
         self.channel_input_v1 = channel_input_v1
         self.on_nick_leave = on_nick_leave
 
@@ -188,6 +191,7 @@ class MultiDirectoryClient(DirectoryClientPool):
         kwargs["neutrino_compat"] = self.neutrino_compat
         kwargs["allow_clearnet_connections"] = self.allow_clearnet_connections
         kwargs["cofunded_channel_ring_v1"] = self.cofunded_channel_ring_v1
+        kwargs["cofunded_channel_ring_v2"] = self.cofunded_channel_ring_v2
         kwargs["channel_input_v1"] = self.channel_input_v1
         return kwargs
 
@@ -198,6 +202,8 @@ class MultiDirectoryClient(DirectoryClientPool):
             features.add(FEATURE_NEUTRINO_COMPAT)
         if self.cofunded_channel_ring_v1:
             features.add(FEATURE_COFUNDED_CHANNEL_RING_V1)
+        if self.cofunded_channel_ring_v2:
+            features.add(FEATURE_COFUNDED_CHANNEL_RING_V2)
         if self.channel_input_v1:
             features.add(FEATURE_CHANNEL_INPUT_V1)
         return FeatureSet(features=features)

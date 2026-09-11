@@ -8,7 +8,7 @@ import hashlib
 import secrets
 import time
 from collections.abc import Mapping, Sequence
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from jmcore.bitcoin import get_txid, parse_transaction, scriptpubkey_to_address
 from jmcore.channel_ring import ChannelRingConfig
@@ -22,6 +22,7 @@ from jmcore.channel_ring_store import (
     RingParticipantStore,
     RingRecordKey,
     RingRetirementAction,
+    RingStoreError,
 )
 from jmcore.channel_ring_store import (
     TransactionPresence as StoreTransactionPresence,
@@ -29,6 +30,7 @@ from jmcore.channel_ring_store import (
 from jmcore.cofunded_ring import (
     MAX_RING_CIPHERTEXT_BYTES,
     ChannelPolicy,
+    CoordinatorParticipant,
     EndpointRole,
     LocalContribution,
     ManifestOutput,
@@ -37,9 +39,12 @@ from jmcore.cofunded_ring import (
     PreparedOutgoingState,
     PrivateEdgePlan,
     PrivateParticipant,
+    PublicPreparedIncomingState,
     ReadinessAttestation,
     ReadinessState,
     RingCancelPayload,
+    RingContactDeliveryPayload,
+    RingContactsPayload,
     RingEdge,
     RingHelloPayload,
     RingInvitePayload,
@@ -49,6 +54,10 @@ from jmcore.cofunded_ring import (
     RingPlanAckPayload,
     RingPlanPayload,
     RingPreparedPayload,
+    RingPrivateHelloPayload,
+    RingPrivateInvitePayload,
+    RingPrivatePlanPayload,
+    RingPrivatePreparedPayload,
     RingReadyPayload,
     RingReadySetAckPayload,
     RingReadySetPayload,
@@ -56,6 +65,8 @@ from jmcore.cofunded_ring import (
     RingSignPayload,
     RingUnsignedPayload,
     SignedReadinessAttestation,
+    contact_public_key,
+    cycle_context_hash,
     decode_ring_message,
     encode_ring_message,
     manifest_hash,
@@ -63,6 +74,7 @@ from jmcore.cofunded_ring import (
     sign_attestation,
     sign_payload,
     validate_hello_for_invite,
+    validate_private_hello_for_invite,
     verify_payload,
     verify_ready_payload,
 )
@@ -89,7 +101,10 @@ from jmswap.lnd import (
 )
 from loguru import logger
 
-from taker.orderbook import offer_supports_cofunded_channel_ring_v1
+from taker.orderbook import (
+    offer_supports_cofunded_channel_ring_v1,
+    offer_supports_cofunded_channel_ring_v2,
+)
 from taker.ring_planner import (
     ParticipantChannelLimits,
     RingParty,
@@ -136,6 +151,7 @@ def _signed(payload: RingPayloadType, secret_hex: str) -> RingPayloadType:
 # every phase, so a restart leaves them permanently stuck rather than resumable.
 _UNRESUMABLE_NEGOTIATION_STATES = frozenset(
     {
+        RingLifecycleState.PLANNED,
         RingLifecycleState.ACCEPTOR_ARMED,
         RingLifecycleState.PREPARED,
         RingLifecycleState.PSBT_VERIFIED,
@@ -201,9 +217,9 @@ class TakerRingCoordinator:
         self.acceptor_task: asyncio.Task[AcceptorObservation] | None = None
         self.sign_authorized = False
         self._peer_by_key: dict[str, str] = {}
-        self._participant_by_key: dict[str, PrivateParticipant] = {}
+        self._participant_by_key: dict[str, PrivateParticipant | CoordinatorParticipant] = {}
         self._edge_by_id: dict[str, PrivateEdgePlan] = {}
-        self._prepared_by_key: dict[str, RingPreparedPayload] = {}
+        self._prepared_by_key: dict[str, RingPreparedPayload | RingPrivatePreparedPayload] = {}
         self._negotiation: FundingNegotiation | None = None
         self._residuals: dict[str, int] = {}
 
@@ -226,6 +242,20 @@ class TakerRingCoordinator:
     def _sign(self, payload: RingPayloadType) -> RingPayloadType:
         return _signed(payload, self.local_secret)
 
+    def _uses_private_coordination(self, record: RingParticipantRecord | None = None) -> bool:
+        """Use durable round state after invitation, never current configuration alone."""
+        current = self._record() if record is None else record
+        return current.contact_secret is not None
+
+    def _payload_version(self, record: RingParticipantRecord | None = None) -> Literal[1, 2]:
+        return 2 if self._uses_private_coordination(record) else 1
+
+    def _backend_plan(self, record: RingParticipantRecord | None = None) -> RingPlanPayload:
+        try:
+            return (self._record() if record is None else record).backend_plan()
+        except RingStoreError as exc:
+            raise TakerRingError("local ring contacts are incomplete") from exc
+
     def _set_phase(self, phase: str) -> None:
         from taker.models import TakerState
 
@@ -246,10 +276,14 @@ class TakerRingCoordinator:
             self.chain_backend.can_get_confirmations_by_txid()
         ):
             raise TakerRingError("ring cancellation requires a full absence-proving backend")
-        if any(
-            not offer_supports_cofunded_channel_ring_v1(maker.offer) for maker in makers.values()
-        ):
-            raise TakerRingError("every selected maker must advertise cofunded_channel_ring_v1")
+        if self.config.private_coordination:
+            supports_ring = offer_supports_cofunded_channel_ring_v2
+            feature = "cofunded_channel_ring_v2"
+        else:
+            supports_ring = offer_supports_cofunded_channel_ring_v1
+            feature = "cofunded_channel_ring_v1"
+        if any(not supports_ring(maker.offer) for maker in makers.values()):
+            raise TakerRingError(f"every selected maker must advertise {feature}")
         offer_types = {maker.offer.ordertype for maker in makers.values()}
         if offer_types != {self.session.config.preferred_offer_type}:
             raise TakerRingError("ring makers must use the exact preferred tr0 offer type")
@@ -307,6 +341,8 @@ class TakerRingCoordinator:
                 record = self._record()
                 if payload.round_nonce != record.round_nonce or payload.revision != record.revision:
                     raise TakerRingError("ring peer response belongs to another revision")
+                if payload.v != self._payload_version(record):
+                    raise TakerRingError("ring peer response has the wrong protocol version")
                 known_key = next(
                     (key for key, peer_nick in self._peer_by_key.items() if peer_nick == nick), None
                 )
@@ -393,7 +429,9 @@ class TakerRingCoordinator:
             raise TakerRingError("ring participant has no positive finalized residual")
         return tx_fee, residuals
 
-    def _limits(self, participant: PrivateParticipant) -> ParticipantChannelLimits:
+    def _limits(
+        self, participant: PrivateParticipant | CoordinatorParticipant
+    ) -> ParticipantChannelLimits:
         backend = participant.backend_limits
         return ParticipantChannelLimits(
             min_channel_capacity=backend.min_channel_capacity,
@@ -430,41 +468,82 @@ class TakerRingCoordinator:
                 Outpoint(txid=utxo.txid, vout=utxo.vout) for utxo in self.session.selected_utxos
             ),
             input_lock_owner=self.session.input_lock_owner,
+            private_coordination=self.config.private_coordination,
+            maintenance_directory=self.config.maintenance_directory,
         )
         self.store.save(record)
         self.record_key = record.key
-        invite = cast(
-            RingInvitePayload,
-            self._sign(
-                RingInvitePayload(
-                    round_nonce=record.round_nonce,
-                    revision=record.revision,
-                    signer_key=record.ring_public_key,
-                    network=cast(Any, self.session.config.network.value),
-                    offer_type=cast(Any, self.session.config.preferred_offer_type.value),
-                    expiry=int(time.time() + self.config.phase_timeout_seconds),
-                    policy_bounds=PolicyBounds(
-                        min_csv_delay=self.config.minimum_csv_delay,
-                        max_csv_delay=self.config.maximum_csv_delay,
-                        min_depth=self.config.confirmation_depth,
-                        max_depth=self.config.confirmation_depth,
-                        min_reserve=min(self.config.opener_reserve, self.config.fundee_reserve),
-                        max_reserve=max(self.config.opener_reserve, self.config.fundee_reserve),
-                    ),
-                )
+        invite_fields = {
+            "round_nonce": record.round_nonce,
+            "revision": record.revision,
+            "signer_key": record.ring_public_key,
+            "network": cast(Any, self.session.config.network.value),
+            "offer_type": cast(Any, self.session.config.preferred_offer_type.value),
+            "expiry": int(time.time() + self.config.phase_timeout_seconds),
+            "policy_bounds": PolicyBounds(
+                min_csv_delay=self.config.minimum_csv_delay,
+                max_csv_delay=self.config.maximum_csv_delay,
+                min_depth=self.config.confirmation_depth,
+                max_depth=self.config.confirmation_depth,
+                min_reserve=min(self.config.opener_reserve, self.config.fundee_reserve),
+                max_reserve=max(self.config.opener_reserve, self.config.fundee_reserve),
             ),
-        )
+        }
+        invite: RingInvitePayload | RingPrivateInvitePayload
+        if self._uses_private_coordination(record):
+            invite = cast(
+                RingPrivateInvitePayload,
+                self._sign(RingPrivateInvitePayload(**invite_fields)),
+            )
+            response_type: type[Any] = RingPrivateHelloPayload
+            local_private = self.initialized_backend.private_participant(record.ring_public_key)
+            if record.contact_secret is None:
+                raise TakerRingError("private ring contact key is not durable")
+            local_descriptor = CoordinatorParticipant(
+                participant_key=record.ring_public_key,
+                encryption_key=contact_public_key(record.contact_secret),
+                backend_limits=local_private.backend_limits,
+            )
+            own_hello = cast(
+                RingPrivateHelloPayload,
+                self._sign(
+                    RingPrivateHelloPayload(
+                        v=2,
+                        round_nonce=record.round_nonce,
+                        revision=record.revision,
+                        signer_key=record.ring_public_key,
+                        participant=local_descriptor,
+                    )
+                ),
+            )
+            participants: list[PrivateParticipant | CoordinatorParticipant] = [local_descriptor]
+            hellos: dict[str, RingPrivateHelloPayload] = {record.ring_public_key: own_hello}
+        else:
+            invite = cast(RingInvitePayload, self._sign(RingInvitePayload(**invite_fields)))
+            response_type = RingHelloPayload
+            participants = [self.initialized_backend.private_participant(record.ring_public_key)]
+            hellos = {}
         responses = await self._exchange(
-            {nick: invite for nick in self.session.maker_sessions}, RingHelloPayload
+            {nick: invite for nick in self.session.maker_sessions}, response_type
         )
-        participants = [self.initialized_backend.private_participant(record.ring_public_key)]
         for nick, items in responses.items():
-            hello = cast(RingHelloPayload, items[0])
-            validate_hello_for_invite(invite, hello)
+            hello = items[0]
+            participant: PrivateParticipant | CoordinatorParticipant
+            if isinstance(invite, RingPrivateInvitePayload):
+                if not isinstance(hello, RingPrivateHelloPayload):
+                    raise TakerRingError("maker did not return a private ring hello")
+                validate_private_hello_for_invite(invite, hello)
+                participant = hello.participant
+                hellos[hello.signer_key] = hello
+            else:
+                if not isinstance(hello, RingHelloPayload):
+                    raise TakerRingError("maker did not return a ring hello")
+                validate_hello_for_invite(invite, hello)
+                participant = hello.participant
             if hello.signer_key in self._peer_by_key:
                 raise TakerRingError("two selected makers returned the same ring key")
             self._peer_by_key[hello.signer_key] = nick
-            participants.append(hello.participant)
+            participants.append(participant)
         self._participant_by_key = {item.participant_key: item for item in participants}
         self.store.transition(
             record.key,
@@ -473,11 +552,17 @@ class TakerRingCoordinator:
                 "coordinator_participants": tuple(participants),
                 "coordinator_reached_keys": tuple(self._peer_by_key),
                 "coordinator_tx_fee": tx_fee,
+                "coordinator_hellos": hellos,
             },
         )
         self._residuals = residuals
 
-    def _build_plans(self) -> tuple[dict[str, RingPlanPayload], RingPlanPayload]:
+    def _build_plans(
+        self,
+    ) -> tuple[
+        dict[str, RingPlanPayload | RingPrivatePlanPayload],
+        RingPlanPayload | RingPrivatePlanPayload,
+    ]:
         local = self._record()
         party_id_by_key = {local.ring_public_key: "taker"}
         party_id_by_key.update({key: nick for key, nick in self._peer_by_key.items()})
@@ -507,38 +592,56 @@ class TakerRingCoordinator:
             private_edges.append(private)
             self._edge_by_id[private.edge_id] = private
         contributions = {item.party_id: item for item in planned.contributions}
-        plans_by_key: dict[str, RingPlanPayload] = {}
+        plans_by_key: dict[str, RingPlanPayload | RingPrivatePlanPayload] = {}
+        private_mode = self._uses_private_coordination(local)
         for position, key in enumerate(cycle_keys):
             party_id = party_id_by_key[key]
             contribution = contributions[party_id]
-            plans_by_key[key] = cast(
-                RingPlanPayload,
-                self._sign(
-                    RingPlanPayload(
-                        round_nonce=local.round_nonce,
-                        revision=local.revision,
-                        signer_key=local.ring_public_key,
-                        network=cast(Any, self.session.config.network.value),
-                        offer_type=cast(Any, self.session.config.preferred_offer_type.value),
-                        cycle_keys=cycle_keys,
-                        position=position,
-                        contribution=LocalContribution(
-                            participant_key=key,
-                            residual=contribution.residual,
-                            outgoing=contribution.outgoing,
-                            incoming=contribution.incoming,
-                        ),
-                        predecessor=self._participant_by_key[
-                            cycle_keys[(position - 1) % len(cycle_keys)]
-                        ],
-                        successor=self._participant_by_key[
-                            cycle_keys[(position + 1) % len(cycle_keys)]
-                        ],
-                        incoming_edge=private_edges[(position - 1) % len(private_edges)],
-                        outgoing_edge=private_edges[position],
-                    )
+            predecessor_key = cycle_keys[(position - 1) % len(cycle_keys)]
+            successor_key = cycle_keys[(position + 1) % len(cycle_keys)]
+            fields = {
+                "round_nonce": local.round_nonce,
+                "revision": local.revision,
+                "signer_key": local.ring_public_key,
+                "network": cast(Any, self.session.config.network.value),
+                "offer_type": cast(Any, self.session.config.preferred_offer_type.value),
+                "cycle_keys": cycle_keys,
+                "position": position,
+                "contribution": LocalContribution(
+                    participant_key=key,
+                    residual=contribution.residual,
+                    outgoing=contribution.outgoing,
+                    incoming=contribution.incoming,
                 ),
-            )
+                "predecessor": self._participant_by_key[predecessor_key],
+                "successor": self._participant_by_key[successor_key],
+                "incoming_edge": private_edges[(position - 1) % len(private_edges)],
+                "outgoing_edge": private_edges[position],
+            }
+            if private_mode:
+                neighbor_hellos = local.coordinator_hellos
+                try:
+                    plans_by_key[key] = cast(
+                        RingPrivatePlanPayload,
+                        self._sign(
+                            RingPrivatePlanPayload(
+                                v=2,
+                                **fields,
+                                neighbor_hellos=[
+                                    neighbor_hellos[key],
+                                    neighbor_hellos[predecessor_key],
+                                    neighbor_hellos[successor_key],
+                                ],
+                            )
+                        ),
+                    )
+                except KeyError as exc:
+                    raise TakerRingError("private ring hello records are incomplete") from exc
+            else:
+                plans_by_key[key] = cast(
+                    RingPlanPayload,
+                    self._sign(RingPlanPayload(**fields)),
+                )
         return plans_by_key, plans_by_key[local.ring_public_key]
 
     def _acceptor_expectation(self, plan: RingPlanPayload) -> InboundChannelExpectation:
@@ -546,6 +649,7 @@ class TakerRingCoordinator:
         return InboundChannelExpectation(
             pending_channel_id=bytes.fromhex(edge.pending_channel_id),
             opener_node_id=plan.predecessor.node_id,
+            scid_alias=isinstance(self._record().plan, RingPrivatePlanPayload),
             chain_hash=_chain_hash(plan.network),
             capacity_sat=edge.capacity,
             push_msat=edge.push_amount * 1000,
@@ -556,37 +660,191 @@ class TakerRingCoordinator:
             min_depth=edge.policy.min_depth,
         )
 
-    async def _plan(self) -> RingPlanPayload:
-        self._set_phase("ring_planning")
-        logger.info("Channel-ring phase: complete-cycle planning")
-        plans_by_key, local_plan = self._build_plans()
+    def _validate_contact_payload(
+        self, payload: RingContactsPayload, plan: RingPrivatePlanPayload
+    ) -> None:
+        expected_recipients = {
+            plan.predecessor.participant_key,
+            plan.successor.participant_key,
+        }
+        context = cycle_context_hash(plan.network, plan.round_nonce, plan.revision, plan.cycle_keys)
+        if payload.signer_key != plan.contribution.participant_key:
+            raise TakerRingError("contact payload signer does not match its private plan")
+        if {item.sender_key for item in payload.envelopes} != {payload.signer_key}:
+            raise TakerRingError("contact payload sender does not match its signer")
+        if {item.recipient_key for item in payload.envelopes} != expected_recipients:
+            raise TakerRingError("contact payload recipients do not match planned adjacency")
+        if any(item.context_hash != context for item in payload.envelopes):
+            raise TakerRingError("contact payload context does not match its private plan")
+
+    def _contact_deliveries(
+        self,
+        record: RingParticipantRecord,
+        contacts_by_sender: Mapping[str, RingContactsPayload],
+    ) -> dict[str, RingContactDeliveryPayload]:
+        deliveries: dict[str, RingContactDeliveryPayload] = {}
+        for key, candidate in record.coordinator_plans.items():
+            if not isinstance(candidate, RingPrivatePlanPayload):
+                raise TakerRingError("private round contains a legacy coordinator plan")
+            by_sender = {
+                envelope.sender_key: envelope
+                for payload in contacts_by_sender.values()
+                for envelope in payload.envelopes
+                if envelope.recipient_key == key
+            }
+            expected_senders = {
+                candidate.predecessor.participant_key,
+                candidate.successor.participant_key,
+            }
+            if set(by_sender) != expected_senders:
+                raise TakerRingError(
+                    "contact delivery does not cover exactly the planned neighbors"
+                )
+            deliveries[key] = cast(
+                RingContactDeliveryPayload,
+                self._sign(
+                    RingContactDeliveryPayload(
+                        v=2,
+                        round_nonce=record.round_nonce,
+                        revision=record.revision,
+                        signer_key=record.ring_public_key,
+                        envelopes=[
+                            by_sender[candidate.predecessor.participant_key],
+                            by_sender[candidate.successor.participant_key],
+                        ],
+                    )
+                ),
+            )
+        return deliveries
+
+    def _persist_local_contacts(self, delivery: RingContactDeliveryPayload) -> RingPlanPayload:
         record = self._record()
+        try:
+            local_contacts = record.decrypt_contacts(delivery.envelopes)
+            record = self.store.transition(
+                record.key,
+                RingLifecycleState.PLANNED,
+                updates={"local_contacts": local_contacts},
+            )
+            backend_plan = record.backend_plan()
+        except (RingStoreError, ValueError) as exc:
+            raise TakerRingError("local private contact delivery is invalid") from exc
         self.store.transition(
             record.key,
             RingLifecycleState.PLANNED,
             updates={
-                "local_position": local_plan.position,
-                "plan": local_plan,
-                "plan_hash": ring_hash("plan", local_plan).hex(),
-                "local_contribution": local_plan.contribution,
                 "incoming_edge": FundingEdgeRecord(
-                    plan=local_plan.incoming_edge, peer=local_plan.predecessor
+                    plan=backend_plan.incoming_edge,
+                    peer=backend_plan.predecessor,
                 ),
                 "outgoing_edge": FundingEdgeRecord(
-                    plan=local_plan.outgoing_edge, peer=local_plan.successor
+                    plan=backend_plan.outgoing_edge,
+                    peer=backend_plan.successor,
                 ),
-                "pending_channel_ids": (
-                    local_plan.incoming_edge.pending_channel_id,
-                    local_plan.outgoing_edge.pending_channel_id,
-                ),
-                "coordinator_plans": plans_by_key,
             },
+        )
+        return backend_plan
+
+    async def _plan(self) -> RingPlanPayload | RingPrivatePlanPayload:
+        self._set_phase("ring_planning")
+        logger.info("Channel-ring phase: complete-cycle planning")
+        plans_by_key, local_plan = self._build_plans()
+        record = self._record()
+        updates: dict[str, object] = {
+            "local_position": local_plan.position,
+            "plan": local_plan,
+            "plan_hash": ring_hash("plan", local_plan).hex(),
+            "local_contribution": local_plan.contribution,
+            "pending_channel_ids": (
+                local_plan.incoming_edge.pending_channel_id,
+                local_plan.outgoing_edge.pending_channel_id,
+            ),
+            "coordinator_plans": plans_by_key,
+        }
+        if isinstance(local_plan, RingPlanPayload):
+            updates.update(
+                {
+                    "incoming_edge": FundingEdgeRecord(
+                        plan=local_plan.incoming_edge, peer=local_plan.predecessor
+                    ),
+                    "outgoing_edge": FundingEdgeRecord(
+                        plan=local_plan.outgoing_edge, peer=local_plan.successor
+                    ),
+                }
+            )
+        record = self.store.transition(
+            record.key,
+            RingLifecycleState.PLANNED,
+            updates=updates,
         )
         payloads = {
             self._peer_by_key[key]: plan
             for key, plan in plans_by_key.items()
             if key != self.local_key
         }
+
+        if isinstance(local_plan, RingPrivatePlanPayload):
+            # The signed descriptor-only plan is durable before this coordinator creates
+            # its own encrypted neighbor capsules.
+            local_private = self.initialized_backend.private_participant(record.ring_public_key)
+            try:
+                local_contacts = record.contact_envelopes(local_private)
+            except (RingStoreError, ValueError) as exc:
+                raise TakerRingError("local private plan has invalid contact descriptors") from exc
+            own_contacts = cast(
+                RingContactsPayload,
+                self._sign(
+                    RingContactsPayload(
+                        v=2,
+                        round_nonce=record.round_nonce,
+                        revision=record.revision,
+                        signer_key=record.ring_public_key,
+                        envelopes=local_contacts,
+                    )
+                ),
+            )
+            self._validate_contact_payload(own_contacts, local_plan)
+            responses = await self._exchange(payloads, RingContactsPayload)
+            contacts_by_sender = {record.ring_public_key: own_contacts}
+            for nick, items in responses.items():
+                payload = cast(RingContactsPayload, items[0])
+                peer_key = next(key for key, value in self._peer_by_key.items() if value == nick)
+                candidate = record.coordinator_plans[peer_key]
+                if not isinstance(candidate, RingPrivatePlanPayload):
+                    raise TakerRingError("private round contains a legacy coordinator plan")
+                self._validate_contact_payload(payload, candidate)
+                contacts_by_sender[peer_key] = payload
+            deliveries = self._contact_deliveries(record, contacts_by_sender)
+            backend_plan = self._persist_local_contacts(deliveries[record.ring_public_key])
+            acknowledgments = await self._exchange(
+                {
+                    self._peer_by_key[key]: delivery
+                    for key, delivery in deliveries.items()
+                    if key != record.ring_public_key
+                },
+                RingPlanAckPayload,
+            )
+            for nick, items in acknowledgments.items():
+                ack = cast(RingPlanAckPayload, items[0])
+                peer_key = next(key for key, value in self._peer_by_key.items() if value == nick)
+                if ack.plan_hash != ring_hash("plan", record.coordinator_plans[peer_key]).hex():
+                    raise TakerRingError("maker acknowledged a different recipient plan")
+            ready = asyncio.Event()
+            self.acceptor_task = asyncio.create_task(
+                self.lnd.run_channel_acceptor(
+                    self._acceptor_expectation(backend_plan),
+                    AcceptorBounds(
+                        min_csv_delay=self.config.minimum_csv_delay,
+                        max_csv_delay=self.config.maximum_csv_delay,
+                    ),
+                    timeout_seconds=self.config.phase_timeout_seconds,
+                    ready=ready,
+                )
+            )
+            await asyncio.wait_for(ready.wait(), self.config.open_timeout_seconds)
+            self.store.transition(record.key, RingLifecycleState.ACCEPTOR_ARMED)
+            return local_plan
+
         responses = await self._exchange(payloads, RingPlanAckPayload)
         for nick, items in responses.items():
             ack = cast(RingPlanAckPayload, items[0])
@@ -619,6 +877,7 @@ class TakerRingCoordinator:
         request = ExternalChannelRequest(
             pending_channel_id=bytes.fromhex(edge.pending_channel_id),
             peer_node_id=plan.successor.node_id,
+            scid_alias=isinstance(self._record().plan, RingPrivatePlanPayload),
             peer_host=plan.successor.onion_endpoint,
             capacity_sat=edge.capacity,
             push_sat=edge.push_amount,
@@ -640,7 +899,7 @@ class TakerRingCoordinator:
         )
         return outgoing, incoming
 
-    async def _open(self, local_plan: RingPlanPayload) -> None:
+    async def _open(self, local_plan: RingPlanPayload | RingPrivatePlanPayload) -> None:
         self._set_phase("ring_opening")
         logger.info("Channel-ring phase: private channel preparation")
         record = self._record()
@@ -650,6 +909,7 @@ class TakerRingCoordinator:
                 RingOpenPayload,
                 self._sign(
                     RingOpenPayload(
+                        v=self._payload_version(record),
                         round_nonce=record.round_nonce,
                         revision=record.revision,
                         signer_key=record.ring_public_key,
@@ -660,38 +920,64 @@ class TakerRingCoordinator:
             for key, nick in self._peer_by_key.items()
         }
         await asyncio.gather(*(self._send(nick, payload) for nick, payload in payloads.items()))
-        remote_task = asyncio.create_task(
-            self._receive(RingPreparedPayload, timeout=self.config.open_timeout_seconds)
+        prepared_type = (
+            RingPrivatePreparedPayload
+            if self._uses_private_coordination(record)
+            else RingPreparedPayload
         )
-        local_task = asyncio.create_task(self._open_local(local_plan))
+        remote_task = asyncio.create_task(
+            self._receive(prepared_type, timeout=self.config.open_timeout_seconds)
+        )
+        local_task = asyncio.create_task(self._open_local(self._backend_plan(record)))
         remote, (negotiation, incoming) = await asyncio.gather(remote_task, local_task)
         self._negotiation = negotiation
-        local_prepared = RingPreparedPayload(
-            round_nonce=record.round_nonce,
-            revision=record.revision,
-            signer_key=record.ring_public_key,
-            outgoing=PreparedOutgoingState(
-                pending_channel_id=local_plan.outgoing_edge.pending_channel_id,
-                opener_key=local_plan.outgoing_edge.opener_key,
-                acceptor_key=local_plan.outgoing_edge.acceptor_key,
-                script_pubkey=negotiation.funding_script_pubkey.hex(),
-                capacity=local_plan.outgoing_edge.capacity,
-                push_amount=local_plan.outgoing_edge.push_amount,
-                policy=local_plan.outgoing_edge.policy,
-            ),
-            incoming=PreparedIncomingState(
-                pending_channel_id=incoming.pending_channel_id.hex(),
-                opener_key=local_plan.incoming_edge.opener_key,
-                acceptor_key=local_plan.incoming_edge.acceptor_key,
-                opener_node_id=incoming.opener_node_id,
-                capacity=incoming.capacity_sat,
-                push_amount=incoming.push_msat // 1000,
-                policy=local_plan.incoming_edge.policy,
-            ),
+        backend_plan = self._backend_plan(record)
+        prepared_outgoing = PreparedOutgoingState(
+            pending_channel_id=backend_plan.outgoing_edge.pending_channel_id,
+            opener_key=backend_plan.outgoing_edge.opener_key,
+            acceptor_key=backend_plan.outgoing_edge.acceptor_key,
+            script_pubkey=negotiation.funding_script_pubkey.hex(),
+            capacity=backend_plan.outgoing_edge.capacity,
+            push_amount=backend_plan.outgoing_edge.push_amount,
+            policy=backend_plan.outgoing_edge.policy,
         )
+        prepared_incoming = PreparedIncomingState(
+            pending_channel_id=incoming.pending_channel_id.hex(),
+            opener_key=backend_plan.incoming_edge.opener_key,
+            acceptor_key=backend_plan.incoming_edge.acceptor_key,
+            opener_node_id=incoming.opener_node_id,
+            capacity=incoming.capacity_sat,
+            push_amount=incoming.push_msat // 1000,
+            policy=backend_plan.incoming_edge.policy,
+        )
+        if self._uses_private_coordination(record):
+            local_prepared: RingPreparedPayload | RingPrivatePreparedPayload
+            local_prepared = RingPrivatePreparedPayload(
+                v=2,
+                round_nonce=record.round_nonce,
+                revision=record.revision,
+                signer_key=record.ring_public_key,
+                outgoing=prepared_outgoing,
+                incoming=PublicPreparedIncomingState(
+                    pending_channel_id=prepared_incoming.pending_channel_id,
+                    opener_key=prepared_incoming.opener_key,
+                    acceptor_key=prepared_incoming.acceptor_key,
+                    capacity=prepared_incoming.capacity,
+                    push_amount=prepared_incoming.push_amount,
+                    policy=prepared_incoming.policy,
+                ),
+            )
+        else:
+            local_prepared = RingPreparedPayload(
+                round_nonce=record.round_nonce,
+                revision=record.revision,
+                signer_key=record.ring_public_key,
+                outgoing=prepared_outgoing,
+                incoming=prepared_incoming,
+            )
         prepared = {record.ring_public_key: local_prepared}
         for nick, items in remote.items():
-            payload = cast(RingPreparedPayload, items[0])
+            payload = cast(RingPreparedPayload | RingPrivatePreparedPayload, items[0])
             prepared[payload.signer_key] = payload
         self._validate_prepared(prepared)
         self._prepared_by_key = prepared
@@ -699,16 +985,19 @@ class TakerRingCoordinator:
             record.key,
             RingLifecycleState.PREPARED,
             updates={
-                "prepared_outgoing": local_prepared.outgoing,
-                "prepared_incoming": local_prepared.incoming,
+                "prepared_outgoing": prepared_outgoing,
+                "prepared_incoming": prepared_incoming,
                 "outgoing_funding_address": negotiation.funding_address,
                 "coordinator_prepared": prepared,
             },
         )
 
-    def _validate_prepared(self, prepared: Mapping[str, RingPreparedPayload]) -> None:
+    def _validate_prepared(
+        self, prepared: Mapping[str, RingPreparedPayload | RingPrivatePreparedPayload]
+    ) -> None:
         if set(prepared) != set(self._participant_by_key):
             raise TakerRingError("prepared reports do not cover every ring participant")
+        private = self._uses_private_coordination()
         scripts: set[str] = set()
         for key, payload in prepared.items():
             plan = self._record().coordinator_plans[key]
@@ -728,12 +1017,19 @@ class TakerRingCoordinator:
                 reciprocal.pending_channel_id != payload.outgoing.pending_channel_id
                 or reciprocal.opener_key != key
                 or reciprocal.acceptor_key != successor
-                or reciprocal.opener_node_id != self._participant_by_key[key].node_id
                 or reciprocal.capacity != payload.outgoing.capacity
                 or reciprocal.push_amount != payload.outgoing.push_amount
                 or reciprocal.policy != payload.outgoing.policy
             ):
                 raise TakerRingError("successor incoming report is not reciprocal to outgoing")
+            if not private:
+                if not isinstance(reciprocal, PreparedIncomingState):
+                    raise TakerRingError("legacy prepared report omitted the opener node identity")
+                participant = self._participant_by_key[key]
+                if not isinstance(participant, PrivateParticipant):
+                    raise TakerRingError("legacy ring participant lacks its Lightning contact")
+                if reciprocal.opener_node_id != participant.node_id:
+                    raise TakerRingError("successor incoming report is not reciprocal to outgoing")
             if payload.outgoing.script_pubkey in scripts:
                 raise TakerRingError("two negotiated channels returned the same funding script")
             scripts.add(payload.outgoing.script_pubkey)
@@ -900,6 +1196,7 @@ class TakerRingCoordinator:
             RingUnsignedPayload,
             self._sign(
                 RingUnsignedPayload(
+                    v=self._payload_version(record),
                     round_nonce=record.round_nonce,
                     revision=record.revision,
                     signer_key=record.ring_public_key,
@@ -914,7 +1211,7 @@ class TakerRingCoordinator:
         self, manifest: RingManifest
     ) -> tuple[PendingChannelExpectation, PendingChannelExpectation]:
         record = self._record()
-        assert record.plan is not None
+        plan = self._backend_plan(record)
         index = manifest.participant_keys.index(record.ring_public_key)
         outgoing_edge = manifest.edges[index]
         incoming_edge = manifest.edges[(index - 1) % len(manifest.edges)]
@@ -942,14 +1239,14 @@ class TakerRingCoordinator:
         return (
             make(
                 outgoing_edge,
-                record.plan.outgoing_edge,
+                plan.outgoing_edge,
                 local_node,
-                record.plan.successor.node_id,
+                plan.successor.node_id,
             ),
             make(
                 incoming_edge,
-                record.plan.incoming_edge,
-                record.plan.predecessor.node_id,
+                plan.incoming_edge,
+                plan.predecessor.node_id,
                 local_node,
             ),
         )
@@ -1209,6 +1506,7 @@ class TakerRingCoordinator:
             RingReadySetPayload,
             self._sign(
                 RingReadySetPayload(
+                    v=self._payload_version(record),
                     round_nonce=record.round_nonce,
                     revision=record.revision,
                     signer_key=record.ring_public_key,
@@ -1236,6 +1534,7 @@ class TakerRingCoordinator:
             RingSignPayload,
             self._sign(
                 RingSignPayload(
+                    v=self._payload_version(record),
                     round_nonce=record.round_nonce,
                     revision=record.revision,
                     signer_key=record.ring_public_key,
@@ -1372,6 +1671,7 @@ class TakerRingCoordinator:
             RingCancelPayload,
             self._sign(
                 RingCancelPayload(
+                    v=self._payload_version(record),
                     round_nonce=record.round_nonce,
                     revision=record.revision,
                     signer_key=record.ring_public_key,
@@ -1471,6 +1771,11 @@ async def reconcile_taker_ring_records(
     if report.corruptions:
         return
     for record in report.records:
+        if record.state is RingLifecycleState.CONFIRMED_OPEN and record.maintenance_directory:
+            try:
+                initialized_backend.enroll_confirmed_channels(store, record)
+            except Exception:
+                logger.warning("Private channel maintenance enrollment requires operator review")
         if not record.active:
             continue
         stranded = (
@@ -1484,7 +1789,7 @@ async def reconcile_taker_ring_records(
                 and record.state is RingLifecycleState.ACCEPTOR_ARMED
                 and not stranded
             ):
-                plan = record.plan
+                plan = record.backend_plan()
                 task_key = record.key.filename
                 existing = None if acceptor_tasks is None else acceptor_tasks.get(task_key)
                 if existing is None or existing.done():
@@ -1495,6 +1800,7 @@ async def reconcile_taker_ring_records(
                                     plan.incoming_edge.pending_channel_id
                                 ),
                                 opener_node_id=plan.predecessor.node_id,
+                                scid_alias=isinstance(record.plan, RingPrivatePlanPayload),
                                 chain_hash=_chain_hash(plan.network),
                                 capacity_sat=plan.incoming_edge.capacity,
                                 push_msat=plan.incoming_edge.push_amount * 1000,
@@ -1516,11 +1822,12 @@ async def reconcile_taker_ring_records(
                 RingLifecycleState.READY,
                 RingLifecycleState.SIGNING,
             }:
-                plan = record.plan
+                plan = record.backend_plan()
                 initialized_backend.backend.resume_inbound_channel(
                     InboundChannelExpectation(
                         pending_channel_id=bytes.fromhex(plan.incoming_edge.pending_channel_id),
                         opener_node_id=plan.predecessor.node_id,
+                        scid_alias=isinstance(record.plan, RingPrivatePlanPayload),
                         chain_hash=_chain_hash(plan.network),
                         capacity_sat=plan.incoming_edge.capacity,
                         push_msat=plan.incoming_edge.push_amount * 1000,
@@ -1591,7 +1898,7 @@ async def reconcile_taker_ring_records(
                 if record.manifest is None:
                     continue
                 if exact is not None and exact.confirmations > 0:
-                    store.transition(
+                    record = store.transition(
                         record.key,
                         RingLifecycleState.CONFIRMED_OPEN,
                         updates={
@@ -1604,6 +1911,12 @@ async def reconcile_taker_ring_records(
                             )
                         },
                     )
+                    try:
+                        initialized_backend.enroll_confirmed_channels(store, record)
+                    except Exception:
+                        logger.warning(
+                            "Private channel maintenance enrollment requires operator review"
+                        )
                     continue
                 missing_input = False
                 if exact is None:

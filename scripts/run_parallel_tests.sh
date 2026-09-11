@@ -149,6 +149,8 @@ declare -A SUITE_SLOT=(
     [tumbler]=9
     [reference-migration]=10
     [ring-e2e]=11
+    [ring-e2e-v2]=12
+    [ring-e2e-maintenance]=13
 )
 
 # Service slot index within a suite's port window.
@@ -479,6 +481,10 @@ compose_cmd() {
 
 ring_compose_cmd() {
     local suite="ring-e2e"
+    if [[ "${1:-}" == "ring-e2e" || "${1:-}" == "ring-e2e-v2" || "${1:-}" == "ring-e2e-maintenance" ]]; then
+        suite=$1
+        shift
+    fi
     RING_E2E_DATA_DIR="${PARALLEL_DIR}/shared/${suite}" \
     RING_E2E_BITCOIN_PORT="$(host_port "$suite" btc_rpc)" \
     RING_E2E_DIRECTORY_PORT="$(host_port "$suite" dir)" \
@@ -805,8 +811,8 @@ wipe_host_state() {
 cleanup_suite() {
     local suite=$1
     log_info "Cleaning up suite: $suite"
-    if [ "$suite" = "ring-e2e" ]; then
-        ring_compose_cmd down --remove-orphans -v 2>/dev/null || true
+    if [[ "$suite" == ring-e2e* ]]; then
+        ring_compose_cmd "$suite" down --remove-orphans -v 2>/dev/null || true
         wipe_host_state "${PARALLEL_DIR}/shared/${suite}" 2>/dev/null || true
         return
     fi
@@ -1017,10 +1023,20 @@ run_suite_e2e() {
 }
 
 run_suite_ring_e2e() {
-    local suite="ring-e2e"
+    local suite=${1:-ring-e2e}
     local log="${PARALLEL_DIR}/${suite}.log"
     local data_dir="${PARALLEL_DIR}/shared/${suite}"
     local project="${PROJECT_PREFIX}-${suite}"
+    local private_coordination=false
+    local test_filter="test_rejected_revision_then_complete_four_party_ring"
+
+    if [ "$suite" = "ring-e2e-v2" ]; then
+        private_coordination=true
+        test_filter="test_private_coordination_complete_four_party_ring"
+    elif [ "$suite" = "ring-e2e-maintenance" ]; then
+        private_coordination=true
+        test_filter="test_private_coordination_maintenance_triangle"
+    fi
 
     log_suite "Starting: Co-funded Channel Ring E2E Tests ($suite)"
     local rc=0
@@ -1029,9 +1045,10 @@ run_suite_ring_e2e() {
         set -e
         cleanup_suite "$suite"
         mkdir -p "$data_dir"
-        ring_compose_cmd up -d
+        RING_E2E_PRIVATE_COORDINATION="$private_coordination" ring_compose_cmd "$suite" up -d
 
         RING_E2E=1 \
+        RING_E2E_PRIVATE_COORDINATION="$private_coordination" \
         RING_E2E_PROJECT="$project" \
         RING_E2E_DATA_DIR="$data_dir" \
         RING_E2E_BITCOIN_PORT="$(host_port "$suite" btc_rpc)" \
@@ -1044,7 +1061,8 @@ run_suite_ring_e2e() {
         RING_E2E_TAKER_GRPC_PORT="$(host_port "$suite" lnd_taker)" \
         COVERAGE_FILE=".coverage.${suite}" \
             pytest -c pytest.ini tests/e2e/test_cofunded_ring_e2e.py \
-                -m ring_e2e --fail-on-skip --no-cov -lv --timeout=900
+                tests/e2e/test_channel_maintenance_e2e.py \
+                -m ring_e2e -k "$test_filter" --fail-on-skip --no-cov -lv --timeout=900
     ) > "$log" 2>&1
     rc=$?
     set -e
@@ -1052,8 +1070,8 @@ run_suite_ring_e2e() {
         {
             echo
             echo "Channel-ring container diagnostics (suite=${suite}, rc=${rc})"
-            ring_compose_cmd ps
-            ring_compose_cmd logs --tail=200
+            ring_compose_cmd "$suite" ps
+            ring_compose_cmd "$suite" logs --tail=200
         } >> "$log" 2>&1 || true
     fi
     cleanup_suite "$suite"
@@ -1802,6 +1820,8 @@ main() {
     # Docker test suites (each with isolated compose project)
     launch_suite "e2e" run_suite_e2e
     launch_suite "ring-e2e" run_suite_ring_e2e
+    launch_suite "ring-e2e-v2" "run_suite_ring_e2e ring-e2e-v2"
+    launch_suite "ring-e2e-maintenance" "run_suite_ring_e2e ring-e2e-maintenance"
     launch_suite "jmwallet" run_suite_jmwallet
     launch_suite "reference-interop" run_suite_reference_interop
     launch_suite "reference-legacy" run_suite_reference_legacy
@@ -1922,6 +1942,8 @@ case "${1:-}" in
             unit)                  run_suite_unit ;;
             e2e)                   run_suite_e2e ;;
             ring-e2e)              run_suite_ring_e2e ;;
+            ring-e2e-v2)           run_suite_ring_e2e ring-e2e-v2 ;;
+            ring-e2e-maintenance)  run_suite_ring_e2e ring-e2e-maintenance ;;
             playwright)            run_suite_playwright ;;
             jmwallet)              run_suite_jmwallet ;;
             reference-interop)     run_suite_reference_interop ;;
@@ -1976,6 +1998,8 @@ Available suites:
   unit                  Unit tests (no Docker)
   e2e                   E2E + Docker integration tests
   ring-e2e              Four-node co-funded channel-ring E2E test
+  ring-e2e-v2           Private four-node co-funded channel-ring E2E test
+  ring-e2e-maintenance  Node-local zero-fee circular maintenance E2E test
   playwright            Playwright browser tests
   jmwallet              jmwallet Docker tests
   reference-interop     Reference interop tests (our maker + JAM taker)

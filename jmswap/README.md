@@ -95,6 +95,96 @@ Run package tests with:
 pytest jmswap
 ```
 
+## Node-Local Channel Maintenance
+
+Run one maintenance service for each LND identity that owns private co-funded
+ring channels:
+
+```bash
+jm-channel-maintenance --role maker run
+jm-channel-maintenance --role maker status
+```
+
+The command defaults to the maker role; use `--role taker` only for the
+separately configured taker LND identity. `--config PATH` follows the normal
+`JOINMARKET_CONFIG_FILE` override, and `--data-dir PATH` overrides the resolved
+JoinMarket data directory. `run` is the default command, so the first command
+can omit it. The service stays in the foreground and must have a single owner
+for an LND identity.
+
+Set both `enabled = true` and `private_coordination = true` in the selected
+`[maker.channel_ring]` or `[taker.channel_ring]` section. Set
+`maintenance_directory` to one stable, private directory for that same LND
+identity. Every maker, taker, and maintenance process controlling that identity
+must use the same directory. Do not share it between identities or start more
+than one maintenance service against it. The regular ring producer records
+affirmative enrollment for new private-ring channels.
+
+Upgrading preserves legacy v1 coordination unless private coordination is
+explicitly enabled. Retained v1 rounds remain recoverable; enabling v2 does not
+enroll their channels. An interrupted enrollment handoff records an operator-review
+error in the ring record and is not automatically retried if enrollment state is
+missing. There is currently no automatic repair command for this condition.
+
+On restart, an unknown or unresolved payment remains blocked for reconciliation
+of that original payment. Do not delete maintenance state to bypass it. Existing channels
+that were not affirmatively enrolled by private-ring production are untouched.
+Zero routing fees do not make a payment risk-free and do not guarantee privacy.
+Current discovery requires an eligible three-node triangle, so a lone four-node
+ring has no eligible triangle to maintain.
+
+Run the isolated service-level regtest with
+`./scripts/run_parallel_tests.sh --suite ring-e2e-maintenance` from the repository
+root. It creates a private triangle plus an unenrolled parallel return channel,
+checks selected-channel settlement and zero fees, and exercises advisory pauses
+over real LND peer messages. Payments use one explicit `SendToRouteV2` attempt.
+A hold invoice releases its preimage only for a single HTLC on the selected
+incoming channel with the exact amount. A payment arriving through a parallel
+channel is canceled. This controls settlement; it does not prevent ordinary
+Lightning forwarding or temporary HTLCs on other channels.
+
+Maker and taker freezes now share a durable admission lock with maintenance.
+Admission checks both selected local funding outpoints. Local spend guards
+survive restart and only proven cancellation releases them. After upgrading,
+older enrollments without an admission marker remain paused for new payments
+and fee initialization. Existing dispatched payments are still reconciled.
+After reconciling both local spend registries and checking the selected channels
+are idle, stop maintenance and explicitly enable their admission:
+
+```bash
+jm-channel-maintenance --role maker reconcile-admission \
+  --channel-point "$CHANNEL_POINT" --confirm-idle
+```
+
+Repeat `--channel-point` for additional fully enrolled channels. This command
+does not enroll channels, reset fees, or remove local spend guards. Unknown fee
+initialization states remain blocked.
+
+If backend history cannot establish a historical payment's outcome, independently
+verify its exact terminal outcome and that no HTLC remains in flight. With the
+maintenance service stopped, record that operator resolution using its exact hash:
+
+```bash
+jm-channel-maintenance --role maker resolve-payment \
+  --payment-hash "$PAYMENT_HASH" --terminal-status failed --confirm-no-inflight
+```
+
+Use `succeeded` for a verified successful payment. Expiry, canceled RPCs, and
+missing history alone do not establish failure. The command records an audit
+marker and schedules the next attempt in the future.
+
+The experimental custom-message type 65501 also supports `spend_pause_v1` through
+explicit capability negotiation. Pauses bind the Lightning peer, chain genesis,
+funding outpoint, request ID, and expiry. Each channel permits at most 30 seconds
+of remote pause per rolling minute. Restart expires remote pauses and quarantines
+new requests for a full elapsed minute; replay and budget records remain durable.
+The service makes one best-effort announcement per observed local guard and
+releases its accepted lease after that guard disappears. A freeze can happen
+before this scheduling pass, so announcement or acknowledgment is never required
+for spending. These hints only suspend future maintenance initiation. They do
+not clear local guards, authorize signing, guarantee drained HTLCs, or replace
+the existing nick-bound channel-input protocol.
+
 ## Cryptography Development
 
 Schnorr signing, Taproot tweaks, and sighashes use `python-bitcointx`; there is

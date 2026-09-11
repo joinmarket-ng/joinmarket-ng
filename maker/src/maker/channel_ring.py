@@ -22,18 +22,23 @@ from jmcore.channel_ring_store import (
     RingParticipantStore,
     RingRecordKey,
     RingRetirementAction,
+    RingStoreError,
 )
 from jmcore.channel_ring_store import (
     TransactionPresence as StoreTransactionPresence,
 )
 from jmcore.cofunded_ring import (
+    CoordinatorParticipant,
     EndpointRole,
     PreparedIncomingState,
     PreparedOutgoingState,
     PrivateEdgePlan,
+    PublicPreparedIncomingState,
     ReadinessAttestation,
     ReadinessState,
     RingCancelPayload,
+    RingContactDeliveryPayload,
+    RingContactsPayload,
     RingEdge,
     RingHelloPayload,
     RingInvitePayload,
@@ -44,6 +49,10 @@ from jmcore.cofunded_ring import (
     RingPlanAckPayload,
     RingPlanPayload,
     RingPreparedPayload,
+    RingPrivateHelloPayload,
+    RingPrivateInvitePayload,
+    RingPrivatePlanPayload,
+    RingPrivatePreparedPayload,
     RingReadyPayload,
     RingReadySetAckPayload,
     RingReadySetPayload,
@@ -52,6 +61,7 @@ from jmcore.cofunded_ring import (
     RingUnsignedPayload,
     SignedReadinessAttestation,
     canonical_json,
+    contact_public_key,
     decode_ring_message,
     encode_ring_message,
     manifest_hash,
@@ -59,6 +69,7 @@ from jmcore.cofunded_ring import (
     sign_attestation,
     sign_payload,
     validate_plan_for_invite,
+    validate_private_plan_for_invite,
     validate_ring_unsigned_transaction_policy,
     verify_payload,
     verify_ready_set,
@@ -85,6 +96,7 @@ from jmswap.lnd import (
 from jmswap.lnd import (
     TransactionPresence as LndTransactionPresence,
 )
+from loguru import logger
 
 if TYPE_CHECKING:
     from jmswap.channel_ring import InitializedChannelRingBackend
@@ -155,9 +167,12 @@ def _retained_observed_point(
 
 def _funding_negotiation(record: RingParticipantRecord) -> FundingNegotiation:
     prepared = record.prepared_outgoing
-    plan = record.plan
-    if prepared is None or plan is None or record.outgoing_funding_address is None:
+    if prepared is None or record.plan is None or record.outgoing_funding_address is None:
         raise MakerRingError("outgoing funding negotiation is not durable")
+    try:
+        plan = record.backend_plan()
+    except RingStoreError as exc:
+        raise MakerRingError("outgoing funding negotiation contacts are incomplete") from exc
     policy = prepared.policy
     return FundingNegotiation(
         pending_channel_id=bytes.fromhex(prepared.pending_channel_id),
@@ -219,6 +234,8 @@ class MakerRingParticipant:
             raise MakerRingError("ring payload belongs to another nonce or revision")
         if record.invite is None or payload.signer_key != record.invite.signer_key:
             raise MakerRingError("ring payload is not signed by the bound taker key")
+        if payload.v != record.invite.v:
+            raise MakerRingError("ring payload version does not match the bound invitation")
 
     def _cached(
         self, payload: RingPayload, record: RingParticipantRecord
@@ -246,7 +263,7 @@ class MakerRingParticipant:
         return {"handled_requests": requests, "handled_responses": encoded_responses}
 
     async def handle(self, payload: RingPayloadType) -> list[RingPayloadType]:
-        if isinstance(payload, RingInvitePayload):
+        if isinstance(payload, (RingInvitePayload, RingPrivateInvitePayload)):
             return await self._invite(payload)
         record = self._record()
         self._check_common(payload, record)
@@ -255,6 +272,10 @@ class MakerRingParticipant:
             return cached
         if isinstance(payload, RingPlanPayload):
             return await self._plan(payload, record)
+        if isinstance(payload, RingPrivatePlanPayload):
+            return await self._private_plan(payload, record)
+        if isinstance(payload, RingContactDeliveryPayload):
+            return await self._contact_delivery(payload, record)
         if isinstance(payload, RingOpenPayload):
             return await self._open(payload, record)
         if isinstance(payload, RingUnsignedPayload):
@@ -267,7 +288,9 @@ class MakerRingParticipant:
             return await self._cancel(payload, record)
         raise MakerRingError(f"maker cannot receive {payload.type} in the participant flow")
 
-    async def _invite(self, payload: RingInvitePayload) -> list[RingPayloadType]:
+    async def _invite(
+        self, payload: RingInvitePayload | RingPrivateInvitePayload
+    ) -> list[RingPayloadType]:
         if not verify_payload(payload):
             raise MakerRingError("ring invitation has an invalid BIP340 signature")
         if payload.expiry < int(time.time()):
@@ -303,6 +326,10 @@ class MakerRingParticipant:
                 raise MakerRingError("ring revision did not increase")
             if latest.state is not RingLifecycleState.RETIRED:
                 raise MakerRingError("previous ring revision is not fully retired")
+        if isinstance(payload, RingInvitePayload) and self.config.private_coordination:
+            raise MakerRingError("legacy ring invitations are disabled by private coordination")
+        if isinstance(payload, RingPrivateInvitePayload) and not self.config.private_coordination:
+            raise MakerRingError("private ring invitations require private coordination")
 
         record = RingParticipantRecord.fresh(
             round_nonce=payload.round_nonce,
@@ -318,24 +345,43 @@ class MakerRingParticipant:
                 "input_lock_owner",
                 f"maker:{self.session_identity}",
             ),
+            private_coordination=isinstance(payload, RingPrivateInvitePayload),
+            maintenance_directory=self.config.maintenance_directory,
         )
         participant = self.initialized_backend.private_participant(record.ring_public_key)
-        hello = _signed(
-            RingHelloPayload(
-                round_nonce=record.round_nonce,
-                revision=record.revision,
-                signer_key=record.ring_public_key,
-                participant=participant,
-            ),
-            record.ring_secret,
-        )
+        if isinstance(payload, RingPrivateInvitePayload):
+            if record.contact_secret is None:
+                raise MakerRingError("private ring contact key is not durable")
+            hello = _signed(
+                RingPrivateHelloPayload(
+                    round_nonce=record.round_nonce,
+                    revision=record.revision,
+                    signer_key=record.ring_public_key,
+                    participant=CoordinatorParticipant(
+                        participant_key=record.ring_public_key,
+                        encryption_key=contact_public_key(record.contact_secret),
+                        backend_limits=participant.backend_limits,
+                    ),
+                ),
+                record.ring_secret,
+            )
+        else:
+            hello = _signed(
+                RingHelloPayload(
+                    round_nonce=record.round_nonce,
+                    revision=record.revision,
+                    signer_key=record.ring_public_key,
+                    participant=participant,
+                ),
+                record.ring_secret,
+            )
         updates = self._cache_updates(record, payload, [hello])
         record = RingParticipantRecord(**{**record.model_dump(), "invite": payload, **updates})
         self.store.save(record)
         self.record_key = record.key
         return [hello]
 
-    def _validate_policy(self, plan: RingPlanPayload) -> None:
+    def _validate_policy(self, plan: RingPlanPayload | RingPrivatePlanPayload) -> None:
         for edge in (plan.incoming_edge, plan.outgoing_edge):
             policy = edge.policy
             if (
@@ -347,7 +393,7 @@ class MakerRingParticipant:
             ):
                 raise MakerRingError("channel policy differs from local configured policy")
 
-    def _validate_plan_accounting(self, plan: RingPlanPayload) -> None:
+    def _validate_plan_accounting(self, plan: RingPlanPayload | RingPrivatePlanPayload) -> None:
         contribution = plan.contribution
         input_value = sum(utxo.value for utxo in self.session.our_utxos.values())
         realized_fee = calculate_cj_fee(
@@ -411,6 +457,7 @@ class MakerRingParticipant:
         return InboundChannelExpectation(
             pending_channel_id=bytes.fromhex(edge.pending_channel_id),
             opener_node_id=plan.predecessor.node_id,
+            scid_alias=isinstance(self._record().plan, RingPrivatePlanPayload),
             chain_hash=_chain_hash(plan.network),
             capacity_sat=edge.capacity,
             push_msat=edge.push_amount * 1000,
@@ -442,7 +489,9 @@ class MakerRingParticipant:
     async def _plan(
         self, payload: RingPlanPayload, record: RingParticipantRecord
     ) -> list[RingPayloadType]:
-        if record.state is not RingLifecycleState.INVITED or record.invite is None:
+        if record.state is not RingLifecycleState.INVITED or not isinstance(
+            record.invite, RingInvitePayload
+        ):
             raise MakerRingError("ring_plan is out of order")
         validate_plan_for_invite(record.invite, payload)
         if len(payload.cycle_keys) < self.config.minimum_makers + 1:
@@ -495,6 +544,7 @@ class MakerRingParticipant:
             RingPayloadType,
             _signed(
                 RingPlanAckPayload(
+                    v=1,
                     round_nonce=record.round_nonce,
                     revision=record.revision,
                     signer_key=record.ring_public_key,
@@ -507,7 +557,134 @@ class MakerRingParticipant:
         self.store.transition(record.key, RingLifecycleState.ACCEPTOR_ARMED, updates=updates)
         return [ack]
 
-    def reject_plan(self, payload: RingPlanPayload) -> list[RingPayloadType]:
+    async def _private_plan(
+        self, payload: RingPrivatePlanPayload, record: RingParticipantRecord
+    ) -> list[RingPayloadType]:
+        if record.state is not RingLifecycleState.INVITED or not isinstance(
+            record.invite, RingPrivateInvitePayload
+        ):
+            raise MakerRingError("ring_private_plan is out of order")
+        validate_private_plan_for_invite(record.invite, payload)
+        if len(payload.cycle_keys) < self.config.minimum_makers + 1:
+            raise MakerRingError("ring plan has too few makers")
+        if payload.cycle_keys[payload.position] != record.ring_public_key:
+            raise MakerRingError("ring plan local position does not identify this maker")
+        self._validate_policy(payload)
+        self._validate_plan_accounting(payload)
+        candidate_pending_ids = {
+            payload.incoming_edge.pending_channel_id,
+            payload.outgoing_edge.pending_channel_id,
+        }
+        if len(candidate_pending_ids) != 2:
+            raise MakerRingError("local ring edges reuse a pending channel ID")
+        known_pending_ids = {
+            pending_id
+            for known in self.store.load_all().records
+            if known.key != record.key
+            for pending_id in known.pending_channel_ids
+        }
+        if candidate_pending_ids & known_pending_ids:
+            raise MakerRingError("ring plan reuses a retained pending channel ID")
+
+        plan_hash = ring_hash("plan", payload).hex()
+        plan_updates: dict[str, object] = {
+            "local_position": payload.position,
+            "plan": payload,
+            "plan_hash": plan_hash,
+            "local_contribution": payload.contribution,
+            "pending_channel_ids": (
+                payload.incoming_edge.pending_channel_id,
+                payload.outgoing_edge.pending_channel_id,
+            ),
+        }
+        try:
+            planned = record.transition(RingLifecycleState.PLANNED, updates=plan_updates)
+            envelopes = planned.contact_envelopes(
+                self.initialized_backend.private_participant(record.ring_public_key)
+            )
+        except (RingStoreError, ValueError) as exc:
+            raise MakerRingError("private plan substituted the local contact descriptor") from exc
+        contacts = cast(
+            RingPayloadType,
+            _signed(
+                RingContactsPayload(
+                    v=2,
+                    round_nonce=planned.round_nonce,
+                    revision=planned.revision,
+                    signer_key=planned.ring_public_key,
+                    envelopes=envelopes,
+                ),
+                planned.ring_secret,
+            ),
+        )
+        updates = {**plan_updates, **self._cache_updates(planned, payload, [contacts])}
+        self.store.transition(record.key, RingLifecycleState.PLANNED, updates=updates)
+        return [contacts]
+
+    async def _contact_delivery(
+        self, payload: RingContactDeliveryPayload, record: RingParticipantRecord
+    ) -> list[RingPayloadType]:
+        if (
+            record.state is not RingLifecycleState.PLANNED
+            or not isinstance(record.plan, RingPrivatePlanPayload)
+            or not isinstance(record.invite, RingPrivateInvitePayload)
+        ):
+            raise MakerRingError("ring_contact_delivery is out of order")
+        try:
+            local_contacts = record.decrypt_contacts(payload.envelopes)
+            completed = record.transition(
+                RingLifecycleState.PLANNED,
+                updates={"local_contacts": local_contacts},
+            )
+            backend_plan = completed.backend_plan()
+        except (RingStoreError, ValueError) as exc:
+            raise MakerRingError("ring contact delivery is invalid") from exc
+        incoming = FundingEdgeRecord(
+            plan=backend_plan.incoming_edge,
+            peer=backend_plan.predecessor,
+        )
+        outgoing = FundingEdgeRecord(
+            plan=backend_plan.outgoing_edge,
+            peer=backend_plan.successor,
+        )
+        record = self.store.transition(
+            record.key,
+            RingLifecycleState.PLANNED,
+            updates={
+                "local_contacts": local_contacts,
+                "incoming_edge": incoming,
+                "outgoing_edge": outgoing,
+            },
+        )
+        ready = self._arm_acceptor(backend_plan)
+        try:
+            await asyncio.wait_for(ready.wait(), self.config.open_timeout_seconds)
+        except Exception:
+            if self.acceptor_task is not None:
+                self.acceptor_task.cancel()
+            raise
+        if record.plan_hash is None:
+            raise MakerRingError("private ring plan hash is not durable")
+        ack = cast(
+            RingPayloadType,
+            _signed(
+                RingPlanAckPayload(
+                    v=2,
+                    round_nonce=record.round_nonce,
+                    revision=record.revision,
+                    signer_key=record.ring_public_key,
+                    plan_hash=record.plan_hash,
+                ),
+                record.ring_secret,
+            ),
+        )
+        updates = self._cache_updates(record, payload, [ack])
+        self.store.transition(record.key, RingLifecycleState.ACCEPTOR_ARMED, updates=updates)
+        return [ack]
+
+    def reject_plan(
+        self, payload: RingPlanPayload | RingPrivatePlanPayload
+    ) -> list[RingPayloadType]:
         """Durably reject a valid plan before any channel state is armed."""
         record = self._record()
         self._check_common(payload, record)
@@ -529,12 +706,22 @@ class MakerRingParticipant:
             raise MakerRingError("ring_open plan hash differs from the acknowledged plan")
         if self.acceptor_task is None:
             raise MakerRingError("incoming channel acceptor is not armed")
-        plan = record.plan
+        if record.incoming_edge is None or record.outgoing_edge is None:
+            raise MakerRingError("ring_open has incomplete durable local edges")
+        if isinstance(record.plan, RingPrivatePlanPayload) != isinstance(
+            record.invite, RingPrivateInvitePayload
+        ):
+            raise MakerRingError("ring_open has an inconsistent durable plan version")
+        try:
+            plan = record.backend_plan()
+        except RingStoreError as exc:
+            raise MakerRingError("ring_open has incomplete authenticated contacts") from exc
         edge = plan.outgoing_edge
         policy = edge.policy
         request = ExternalChannelRequest(
             pending_channel_id=bytes.fromhex(edge.pending_channel_id),
             peer_node_id=plan.successor.node_id,
+            scid_alias=isinstance(record.plan, RingPrivatePlanPayload),
             peer_host=plan.successor.onion_endpoint,
             capacity_sat=edge.capacity,
             push_sat=edge.push_amount,
@@ -574,19 +761,43 @@ class MakerRingParticipant:
             push_amount=incoming.push_msat // 1000,
             policy=incoming_edge.policy,
         )
-        response = cast(
-            RingPayloadType,
-            _signed(
-                RingPreparedPayload(
-                    round_nonce=record.round_nonce,
-                    revision=record.revision,
-                    signer_key=record.ring_public_key,
-                    outgoing=prepared_outgoing,
-                    incoming=prepared_incoming,
+        if isinstance(record.plan, RingPrivatePlanPayload):
+            response = cast(
+                RingPayloadType,
+                _signed(
+                    RingPrivatePreparedPayload(
+                        v=2,
+                        round_nonce=record.round_nonce,
+                        revision=record.revision,
+                        signer_key=record.ring_public_key,
+                        outgoing=prepared_outgoing,
+                        incoming=PublicPreparedIncomingState(
+                            pending_channel_id=prepared_incoming.pending_channel_id,
+                            opener_key=prepared_incoming.opener_key,
+                            acceptor_key=prepared_incoming.acceptor_key,
+                            capacity=prepared_incoming.capacity,
+                            push_amount=prepared_incoming.push_amount,
+                            policy=prepared_incoming.policy,
+                        ),
+                    ),
+                    record.ring_secret,
                 ),
-                record.ring_secret,
-            ),
-        )
+            )
+        else:
+            response = cast(
+                RingPayloadType,
+                _signed(
+                    RingPreparedPayload(
+                        v=1,
+                        round_nonce=record.round_nonce,
+                        revision=record.revision,
+                        signer_key=record.ring_public_key,
+                        outgoing=prepared_outgoing,
+                        incoming=prepared_incoming,
+                    ),
+                    record.ring_secret,
+                ),
+            )
         updates = {
             "prepared_outgoing": prepared_outgoing,
             "prepared_incoming": prepared_incoming,
@@ -687,7 +898,10 @@ class MakerRingParticipant:
     ) -> tuple[PendingChannelExpectation, PendingChannelExpectation]:
         if record.plan is None:
             raise MakerRingError("local plan is missing")
-        plan = record.plan
+        try:
+            plan = record.backend_plan()
+        except RingStoreError as exc:
+            raise MakerRingError("local plan contacts are incomplete") from exc
         index = manifest.participant_keys.index(record.ring_public_key)
         incoming_edge = manifest.edges[(index - 1) % len(manifest.edges)]
         outgoing_edge = manifest.edges[index]
@@ -775,6 +989,7 @@ class MakerRingParticipant:
         )
         endpoint = sign_attestation(attestation, bytes.fromhex(record.ring_secret))
         payload = RingReadyPayload(
+            v=record.invite.v if record.invite is not None else 1,
             round_nonce=record.round_nonce,
             revision=record.revision,
             signer_key=record.ring_public_key,
@@ -909,6 +1124,7 @@ class MakerRingParticipant:
             RingPayloadType,
             _signed(
                 RingReadySetAckPayload(
+                    v=record.invite.v if record.invite is not None else 1,
                     round_nonce=record.round_nonce,
                     revision=record.revision,
                     signer_key=record.ring_public_key,
@@ -942,6 +1158,7 @@ class MakerRingParticipant:
             RingPayloadType,
             _signed(
                 RingSignAckPayload(
+                    v=record.invite.v if record.invite is not None else 1,
                     round_nonce=record.round_nonce,
                     revision=record.revision,
                     signer_key=record.ring_public_key,
@@ -1130,6 +1347,7 @@ class MakerRingParticipant:
             RingPayloadType,
             _signed(
                 RingCancelPayload(
+                    v=record.invite.v if record.invite is not None else 1,
                     round_nonce=record.round_nonce,
                     revision=record.revision,
                     signer_key=record.ring_public_key,
@@ -1160,6 +1378,11 @@ async def reconcile_ring_records(
     if report.corruptions:
         return
     for record in report.records:
+        if record.state is RingLifecycleState.CONFIRMED_OPEN and record.maintenance_directory:
+            try:
+                initialized_backend.enroll_confirmed_channels(store, record)
+            except Exception:
+                logger.warning("Private channel maintenance enrollment requires operator review")
         if not record.active:
             continue
         try:
@@ -1170,10 +1393,11 @@ async def reconcile_ring_records(
                 RingLifecycleState.READY,
                 RingLifecycleState.SIGNING,
             }:
-                plan = record.plan
+                plan = record.backend_plan()
                 incoming = InboundChannelExpectation(
                     pending_channel_id=bytes.fromhex(plan.incoming_edge.pending_channel_id),
                     opener_node_id=plan.predecessor.node_id,
+                    scid_alias=isinstance(record.plan, RingPrivatePlanPayload),
                     chain_hash=_chain_hash(plan.network),
                     capacity_sat=plan.incoming_edge.capacity,
                     push_msat=plan.incoming_edge.push_amount * 1000,
@@ -1229,7 +1453,11 @@ async def reconcile_ring_records(
                         )
                 elif transaction is not None and record.state is RingLifecycleState.SIGNED:
                     record = store.transition(record.key, RingLifecycleState.BROADCAST)
-                if transaction is not None and transaction.confirmations > 0:
+                if (
+                    transaction is not None
+                    and transaction.confirmations > 0
+                    and record.manifest is not None
+                ):
                     status = RingChainStatus(
                         exact_txid=record.manifest.unsigned_txid,
                         mempool=StoreTransactionPresence.ABSENT,
@@ -1237,11 +1465,17 @@ async def reconcile_ring_records(
                         confirmations=transaction.confirmations,
                         checked_at=time.time(),
                     )
-                    store.transition(
+                    record = store.transition(
                         record.key,
                         RingLifecycleState.CONFIRMED_OPEN,
                         updates={"chain_status": status},
                     )
+                    try:
+                        initialized_backend.enroll_confirmed_channels(store, record)
+                    except Exception:
+                        logger.warning(
+                            "Private channel maintenance enrollment requires operator review"
+                        )
                     continue
                 if record.manifest is not None:
                     if transaction is None:

@@ -23,6 +23,7 @@ from jmcore.cofunded_ring import (
     RingHelloPayload,
     RingPayloadType,
     RingPlanAckPayload,
+    RingPlanPayload,
     RingPreparedPayload,
     RingReadyPayload,
     RingReadySetAckPayload,
@@ -55,6 +56,7 @@ from jmwallet.wallet.models import UTXOInfo
 from taker.channel_ring import TakerRingCoordinator, _chain_hash, reconcile_taker_ring_records
 from taker.coinjoin_session import CoinJoinSession
 from taker.models import MakerSession
+from taker.taker import Taker
 
 ONION = "a" * 56 + ".onion:9735"
 
@@ -337,6 +339,7 @@ class MockCoordinator(TakerRingCoordinator):
     def _prepared(self, key: str) -> RingPreparedPayload:
         record = self._record()
         plan = record.coordinator_plans[key]
+        assert isinstance(plan, RingPlanPayload)
         outgoing = plan.outgoing_edge
         incoming = plan.incoming_edge
         return RingPreparedPayload(
@@ -571,11 +574,14 @@ def _harness(
         data_dir=tmp_path,
     )
     session.attach(
-        SimpleNamespace(
-            wallet=wallet,
-            backend=chain,
-            config=taker_config,
-            directory_client=SimpleNamespace(),
+        cast(
+            Taker,
+            SimpleNamespace(
+                wallet=wallet,
+                backend=chain,
+                config=taker_config,
+                directory_client=SimpleNamespace(),
+            ),
         )
     )
     session.cj_amount = 1_000_000
@@ -777,7 +783,59 @@ async def test_stranded_negotiation_escalates_only_without_a_live_round(tmp_path
     )
     escalated = coordinator._record()
     assert escalated.state is RingLifecycleState.RECOVERY_REQUIRED
+    assert escalated.retry is not None
+    assert escalated.retry.last_error is not None
     assert "cannot be resumed" in escalated.retry.last_error
+
+
+async def test_stranded_planned_ring_escalates_without_releasing_inputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    coordinator = _harness(tmp_path)
+    coordinator._preconditions()
+    tx_fee, residuals = coordinator._finalize_fees_and_inputs(0)
+    await coordinator._invite(tx_fee, residuals)
+
+    async def lost_driving_session(*args: Any, **kwargs: Any) -> dict[str, list[RingPayloadType]]:
+        del args, kwargs
+        raise RuntimeError("driving session lost")
+
+    monkeypatch.setattr(coordinator, "_exchange", lost_driving_session)
+    with pytest.raises(RuntimeError, match="driving session lost"):
+        await coordinator._plan()
+
+    record = coordinator._record()
+    assert record.state is RingLifecycleState.PLANNED
+    assert isinstance(record.plan, RingPlanPayload)
+    reserved_inputs = set(coordinator.session.reserved_inputs)
+    locked_inputs = set(coordinator.session.wallet.locked)
+
+    await reconcile_taker_ring_records(
+        coordinator.store,
+        coordinator.initialized_backend,
+        cast(Any, coordinator.chain_backend),
+        active_session_identities=frozenset({record.taker_session_identity}),
+    )
+    assert coordinator._record().state is RingLifecycleState.PLANNED
+
+    await reconcile_taker_ring_records(
+        coordinator.store, coordinator.initialized_backend, cast(Any, coordinator.chain_backend)
+    )
+
+    escalated = coordinator._record()
+    lnd = cast(FakeLnd, coordinator.lnd)
+    assert escalated.state is RingLifecycleState.RECOVERY_REQUIRED
+    assert escalated.retry is not None
+    assert escalated.retry.last_error is not None
+    assert "cannot be resumed" in escalated.retry.last_error
+    assert coordinator.session.reserved_inputs == reserved_inputs
+    assert coordinator.session.wallet.locked == locked_inputs
+    assert lnd.incoming is None
+    assert lnd.canceled == []
+    assert lnd.retired == []
+    assert lnd.resumed_incoming_points == []
+    assert lnd.resumed_verified == []
+    assert cast(FakeChain, coordinator.chain_backend).broadcasts == []
 
 
 async def test_restart_rebroadcasts_and_confirms_exact_final_transaction(tmp_path: Path) -> None:

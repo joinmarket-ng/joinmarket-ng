@@ -654,7 +654,14 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
                 # This is the peer-visible virtual onion port. Tor maps it
                 # independently to listener_port above.
                 onion_serving_port=self.config.onion_serving_port,
-                cofunded_channel_ring_v1=self.channel_ring_capability_validated,
+                cofunded_channel_ring_v1=(
+                    self.channel_ring_capability_validated
+                    and not self.config.channel_ring.private_coordination
+                ),
+                cofunded_channel_ring_v2=(
+                    self.channel_ring_capability_validated
+                    and self.config.channel_ring.private_coordination
+                ),
             )
             generation = MakerGeneration(
                 generation_id=generation_id,
@@ -1287,7 +1294,10 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
                 )
                 if capacity_available:
                     self.channel_ring_capability_validated = True
-                    self._directory_pool.enable_cofunded_channel_ring_v1()
+                    if self.config.channel_ring.private_coordination:
+                        self._directory_pool.enable_cofunded_channel_ring_v2()
+                    else:
+                        self._directory_pool.enable_cofunded_channel_ring_v1()
                     logger.info("Validated co-funded channel-ring LND backend")
                 else:
                     logger.warning(
@@ -1496,6 +1506,8 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
             store=self._channel_input_store,
             config=self.config.channel_input,
             network=self.config.network.value,
+            maintenance_directory=self.config.channel_ring.maintenance_directory
+            or self.config.data_dir / "channel-maintenance",
         )
         from jmswap.channel_input import initialize_channel_input_backend
 

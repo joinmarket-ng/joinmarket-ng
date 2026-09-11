@@ -10,19 +10,28 @@ import sys
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 import pytest
 from jmcore.bitcoin import parse_transaction
+from jmcore.channel_maintenance import ChannelMaintenanceConfig
 from jmcore.channel_ring import ChannelRingConfig
 from jmcore.channel_ring_store import RingLifecycleState
+from jmcore.cofunded_ring import (
+    CoordinatorParticipant,
+    PrivateParticipant,
+    RingPrivatePlanPayload,
+)
 from jmcore.models import NetworkType, OfferType
 from jmswap.lnd import LndBackend
+from jmswap.maintenance import MaintenanceService, maintenance_status
 from jmwallet.backends.descriptor_wallet import (
     DescriptorWalletBackend,
     get_mnemonic_fingerprint,
 )
 from jmwallet.wallet.service import WalletService
+from pydantic import SecretStr
 
 from taker.channel_ring import reconcile_taker_ring_records
 from taker.config import BroadcastPolicy, MaxCjFee, TakerConfig
@@ -51,10 +60,12 @@ LND_PORTS = {
 }
 
 
-async def bitcoin_rpc(method: str, params: list[Any] | None = None) -> Any:
+async def bitcoin_rpc(
+    method: str, params: list[Any] | None = None, *, wallet: str | None = None
+) -> Any:
     async with httpx.AsyncClient(timeout=30) as client:
         response = await client.post(
-            RPC_URL,
+            RPC_URL if wallet is None else f"{RPC_URL}/wallet/{quote(wallet, safe='')}",
             auth=("test", "test"),
             json={
                 "jsonrpc": "2.0",
@@ -187,7 +198,7 @@ def channel_ring_config(data_dir: Path) -> ChannelRingConfig:
 
 def taker_config(data_dir: Path) -> TakerConfig:
     return TakerConfig(
-        mnemonic=TAKER_MNEMONIC,
+        mnemonic=SecretStr(TAKER_MNEMONIC),
         network=NetworkType.REGTEST,
         bitcoin_network=NetworkType.REGTEST,
         data_dir=data_dir,
@@ -582,6 +593,7 @@ async def test_rejected_revision_then_complete_four_party_ring(tmp_path: Path) -
         maker_txfees = sum(
             session.offer.txfee for session in taker._session.maker_sessions.values()
         )
+        assert record.coordinator_tx_fee is not None
         assert actual_fee == record.coordinator_tx_fee + maker_txfees
 
         await bitcoin_rpc("generatetoaddress", [3, destination])
@@ -645,10 +657,10 @@ async def test_rejected_revision_then_complete_four_party_ring(tmp_path: Path) -
         assert successful[0].state is RingLifecycleState.CONFIRMED_OPEN
         assert successful[0].final_tx == raw_tx
 
-        participant_node = {
-            participant.participant_key: participant.node_id
-            for participant in record.coordinator_participants
-        }
+        participant_node = {}
+        for participant in record.coordinator_participants:
+            assert isinstance(participant, PrivateParticipant)
+            participant_node[participant.participant_key] = participant.node_id
         channel_points = [f"{txid}:{edge.output_index}" for edge in manifest.edges]
         assert len(channel_points) == len(set(channel_points)) == 4
         closing_txids: set[str] = set()
@@ -690,6 +702,398 @@ async def test_rejected_revision_then_complete_four_party_ring(tmp_path: Path) -
             cleanup_failures.append(exc)
         try:
             await recreate_maker3(10_000)
+        except BaseException as exc:
+            cleanup_failures.append(exc)
+        if sys.exc_info()[0] is None and cleanup_failures:
+            raise cleanup_failures[0]
+
+
+def private_taker_config(data_dir: Path) -> TakerConfig:
+    config = taker_config(data_dir)
+    return config.model_copy(
+        update={
+            "channel_ring": config.channel_ring.model_copy(
+                update={
+                    "private_coordination": True,
+                    "maintenance_directory": data_dir / "maintenance",
+                }
+            )
+        }
+    )
+
+
+def private_ring_endpoints(
+    channels: dict[str, list[dict[str, Any]]], service_node_id: dict[str, str]
+) -> dict[str, tuple[str, str]]:
+    by_point: dict[str, list[tuple[str, str, bool]]] = {}
+    for service, items in channels.items():
+        local_node_id = service_node_id[service]
+        for channel in items:
+            by_point.setdefault(str(channel["channel_point"]), []).append(
+                (
+                    local_node_id,
+                    str(channel["remote_pubkey"]),
+                    bool(channel["initiator"]),
+                )
+            )
+
+    endpoints: dict[str, tuple[str, str]] = {}
+    for channel_point, sides in by_point.items():
+        assert len(sides) == 2
+        assert {side[0] for side in sides} == {side[1] for side in sides}
+        initiators = [side[0] for side in sides if side[2]]
+        assert len(initiators) == 1
+        opener = initiators[0]
+        fundee = next(side[0] for side in sides if side[0] != opener)
+        endpoints[channel_point] = (opener, fundee)
+    return endpoints
+
+
+async def pay_directed_private_edges(
+    node_service: dict[str, str],
+    manifest: Any,
+    channels: dict[str, list[dict[str, Any]]],
+    endpoints: dict[str, tuple[str, str]],
+) -> dict[str, dict[str, int]]:
+    expected_deltas = {
+        service: {channel_point: 0 for channel_point in balances}
+        for service, balances in endpoint_balance_snapshot(channels).items()
+    }
+    for index, edge in enumerate(manifest.edges):
+        channel_point = f"{manifest.unsigned_txid}:{edge.output_index}"
+        opener_node_id, fundee_node_id = endpoints[channel_point]
+        opener = node_service[opener_node_id]
+        fundee = node_service[fundee_node_id]
+        opener_channels = [
+            channel
+            for channel in channels[opener]
+            if str(channel["channel_point"]) == channel_point
+        ]
+        assert len(opener_channels) == 1
+        opener_channel = opener_channels[0]
+        assert str(opener_channel["remote_pubkey"]) == fundee_node_id
+        amount = DIRECTED_PAYMENT_AMOUNTS[index]
+        invoice = await asyncio.to_thread(
+            lncli, fundee, "addinvoice", f"--amt={amount}", f"--memo=ring-edge-{index}"
+        )
+        payment = await asyncio.to_thread(
+            lncli,
+            opener,
+            "payinvoice",
+            "--json",
+            "--force",
+            "--fee_limit=100",
+            f"--outgoing_chan_id={opener_channel['scid']}",
+            str(invoice["payment_request"]),
+        )
+        assert not payment.get("payment_error")
+        assert payment.get("payment_preimage")
+        successful_attempts = [
+            attempt for attempt in payment["htlcs"] if attempt["status"] == "SUCCEEDED"
+        ]
+        assert len(successful_attempts) == 1
+        assert [
+            str(hop["chan_id"]) for hop in successful_attempts[0]["route"]["hops"]
+        ] == [str(opener_channel["scid"])]
+        expected_deltas[opener][channel_point] -= amount
+        expected_deltas[fundee][channel_point] += amount
+    return expected_deltas
+
+
+def assert_private_coordinator_record(
+    record: Any, nonneighbor_node_ids: set[str]
+) -> None:
+    assert isinstance(record.plan, RingPrivatePlanPayload)
+    assert all(
+        isinstance(item, CoordinatorParticipant)
+        for item in record.coordinator_participants
+    )
+    assert all(
+        "node_id" not in item.model_dump(mode="json")
+        and "onion_endpoint" not in item.model_dump(mode="json")
+        for item in record.coordinator_participants
+    )
+    assert all(
+        isinstance(item, RingPrivatePlanPayload)
+        for item in record.coordinator_plans.values()
+    )
+    assert set(record.local_contacts) == {
+        record.plan.predecessor.participant_key,
+        record.plan.successor.participant_key,
+    }
+    serialized_plans = [
+        json.dumps(plan.model_dump(mode="json"), sort_keys=True)
+        for plan in record.coordinator_plans.values()
+    ]
+    assert all(
+        "node_id" not in plan and "onion_endpoint" not in plan
+        for plan in serialized_plans
+    )
+    serialized_record = json.dumps(record.model_dump(mode="json"), sort_keys=True)
+    assert all(node_id not in serialized_record for node_id in nonneighbor_node_ids)
+    assert all(
+        all(node_id not in plan for plan in serialized_plans)
+        for node_id in nonneighbor_node_ids
+    )
+
+
+def assert_maintenance_enrollments(
+    data_dir: Path,
+    record: Any,
+    taker_node_id: str,
+    endpoints: dict[str, tuple[str, str]],
+) -> None:
+    assert record.maintenance_enrollment_recorded
+    assert record.manifest is not None
+    assert record.incoming_edge is not None
+    assert record.outgoing_edge is not None
+    state = json.loads((data_dir / "maintenance" / "maintenance-v1.json").read_text())
+    enrollment_points = {
+        str(record.incoming_edge.funding_outpoint),
+        str(record.outgoing_edge.funding_outpoint),
+    }
+    assert set(state["enrollments"]) == enrollment_points
+    for channel_point, enrollment in state["enrollments"].items():
+        opener, fundee = endpoints[channel_point]
+        assert enrollment == {
+            "node_id": taker_node_id,
+            "peer_node_id": fundee if opener == taker_node_id else opener,
+            "channel_point": channel_point,
+            "origin_id": record.manifest.unsigned_txid,
+            "status": "pending_validation",
+        }
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(900)
+async def test_private_coordination_complete_four_party_ring(tmp_path: Path) -> None:
+    if os.getenv("RING_E2E") != "1":
+        pytest.skip("start the ring-e2e Compose profile and set RING_E2E=1")
+    if os.getenv("RING_E2E_PRIVATE_COORDINATION") != "true":
+        pytest.skip(
+            "start the ring-e2e Compose profile with private coordination enabled"
+        )
+
+    credential_paths = [
+        path
+        for service in LND_SERVICES
+        for path in (lnd_path(service, "tls.cert"), lnd_path(service, "admin.macaroon"))
+    ]
+    await asyncio.gather(*(wait_for_file(path) for path in credential_paths))
+
+    backend = DescriptorWalletBackend(
+        rpc_url=RPC_URL,
+        rpc_user="test",
+        rpc_password="test",
+        wallet_name=f"jm_{get_mnemonic_fingerprint(TAKER_MNEMONIC)}_ring_e2e_regtest",
+    )
+    wallet = WalletService(
+        mnemonic=TAKER_MNEMONIC,
+        backend=backend,
+        network="regtest",
+        mixdepth_count=5,
+        address_type="p2tr",
+        data_dir=tmp_path,
+    )
+    config = private_taker_config(tmp_path)
+    taker: Taker | None = None
+    restart_taker: Taker | None = None
+    lnd_backends: list[LndBackend] = []
+    try:
+        taker = await make_taker(wallet, backend, config)
+        destination = wallet.get_receive_address(1, 0)
+        txid = await taker.do_coinjoin(
+            amount=1_000_000, destination=destination, mixdepth=0, counterparty_count=3
+        )
+        assert txid is not None
+        coordinator = taker._session.ring_coordinator
+        assert coordinator is not None
+        record = coordinator._record()
+        assert record.state is RingLifecycleState.BROADCAST
+        assert record.manifest is not None
+        manifest = record.manifest
+        assert manifest.unsigned_txid == txid
+        assert len(manifest.participant_keys) == 4
+        assert len(manifest.edges) == 4
+        assert len(manifest.equal_output_indices) == 4
+        assert len(manifest.outputs) == 8
+
+        raw_tx = str(await bitcoin_rpc("getrawtransaction", [txid]))
+        parsed = parse_transaction(raw_tx)
+        assert len(parsed.outputs) == 8
+        assert sum(output.value == 1_000_000 for output in parsed.outputs) == 4
+        assert all(output.script.startswith(b"\x51\x20") for output in parsed.outputs)
+        assert {
+            (output.index, output.amount, output.script_pubkey)
+            for output in manifest.outputs
+        } == {
+            (index, output.value, output.script.hex())
+            for index, output in enumerate(parsed.outputs)
+        }
+
+        input_value = 0
+        for tx_input in parsed.inputs:
+            previous = await bitcoin_rpc("getrawtransaction", [tx_input.txid, True])
+            input_value += bitcoin_value_sats(previous["vout"][tx_input.vout]["value"])
+        actual_fee = input_value - sum(output.value for output in parsed.outputs)
+        maker_txfees = sum(
+            session.offer.txfee for session in taker._session.maker_sessions.values()
+        )
+        assert record.coordinator_tx_fee is not None
+        assert actual_fee == record.coordinator_tx_fee + maker_txfees
+
+        await bitcoin_rpc("generatetoaddress", [3, destination])
+        channels = await wait_for_channels()
+        expected_points = {f"{txid}:{edge.output_index}" for edge in manifest.edges}
+        assert {
+            str(channel["channel_point"])
+            for items in channels.values()
+            for channel in items
+        } == expected_points
+        assert sum(len(items) for items in channels.values()) == 8
+        for items in channels.values():
+            assert len({str(item["remote_pubkey"]) for item in items}) == 2
+            assert all(item["private"] for item in items)
+            assert all(item["alias_scids"] for item in items)
+            assert all(
+                item["commitment_type"] in {7, "7", "SIMPLE_TAPROOT", "TAPROOT"}
+                for item in items
+            )
+            assert all(
+                int(item["local_balance"]) + int(item["remote_balance"])
+                < int(item["capacity"])
+                for item in items
+            )
+
+        for service in LND_SERVICES:
+            lnd_backends.append(
+                LndBackend.from_paths(
+                    f"127.0.0.1:{LND_PORTS[service]}",
+                    lnd_path(service, "tls.cert"),
+                    lnd_path(service, "admin.macaroon"),
+                )
+            )
+        node_infos = await asyncio.gather(*(item.node_info() for item in lnd_backends))
+        service_node_id = {
+            service: info.identity_pubkey
+            for service, info in zip(LND_SERVICES, node_infos, strict=True)
+        }
+        node_service = {
+            node_id: service for service, node_id in service_node_id.items()
+        }
+        endpoints = private_ring_endpoints(channels, service_node_id)
+        assert set(endpoints) == expected_points
+        taker_node_id = service_node_id["lnd-taker"]
+        nonneighbor_node_ids = (
+            set(node_service)
+            - {taker_node_id}
+            - {contact.node_id for contact in record.local_contacts.values()}
+        )
+        assert len(nonneighbor_node_ids) == 1
+        assert_private_coordinator_record(record, nonneighbor_node_ids)
+
+        before_payment_balances = endpoint_balance_snapshot(channels)
+        expected_payment_deltas = await pay_directed_private_edges(
+            node_service, manifest, channels, endpoints
+        )
+        await wait_for_balance_deltas(before_payment_balances, expected_payment_deltas)
+
+        assert taker._channel_ring_store is not None
+        assert taker._channel_ring_backend is not None
+        await reconcile_taker_ring_records(
+            taker._channel_ring_store, taker._channel_ring_backend, backend
+        )
+        assert coordinator._record().state is RingLifecycleState.CONFIRMED_OPEN
+
+        await taker.stop(close_wallet=False)
+        taker = None
+        restart_taker = await make_taker(wallet, backend, config)
+        stored = restart_taker._channel_ring_store
+        assert stored is not None
+        successful = [
+            item for item in stored.load_all().records if item.manifest is not None
+        ]
+        assert len(successful) == 1
+        restarted_record = successful[0]
+        assert restarted_record.state is RingLifecycleState.CONFIRMED_OPEN
+        assert restarted_record.final_tx == raw_tx
+        assert_maintenance_enrollments(
+            tmp_path, restarted_record, taker_node_id, endpoints
+        )
+        maintenance_backend = lnd_backends[LND_SERVICES.index("lnd-taker")]
+        maintenance = MaintenanceService(
+            maintenance_backend,
+            ChannelMaintenanceConfig(),
+            tmp_path / "maintenance",
+            taker_node_id,
+        )
+        await maintenance.tick()
+        status = maintenance_status(tmp_path / "maintenance", taker_node_id)
+        assert status["enrollments"] == {"enrolled": 2}
+        assert status["payment_phase"] is None
+        maintained = await maintenance_backend.list_maintenance_channels()
+        assert len(maintained) == 2
+        assert all(
+            channel.local_base_fee_msat == 0 and channel.local_fee_ppm == 0
+            for channel in maintained
+        )
+        changed_point = maintained[0].channel_point
+        await asyncio.to_thread(
+            lncli,
+            "lnd-taker",
+            "updatechanpolicy",
+            f"--chan_point={changed_point}",
+            "--base_fee_msat=7",
+            "--fee_rate_ppm=0",
+            f"--time_lock_delta={maintained[0].local_cltv_delta}",
+        )
+        await maintenance.tick()
+        after_policy_change = await maintenance_backend.list_maintenance_channels()
+        assert (
+            next(
+                item
+                for item in after_policy_change
+                if item.channel_point == changed_point
+            ).local_base_fee_msat
+            == 7
+        )
+
+        channel_points = [f"{txid}:{edge.output_index}" for edge in manifest.edges]
+        assert len(channel_points) == len(set(channel_points)) == 4
+        closing_txids: set[str] = set()
+        for channel_point in channel_points:
+            closer = node_service[endpoints[channel_point][0]]
+            block_height = int(await bitcoin_rpc("getblockcount"))
+            closing_txid = await asyncio.to_thread(close_channel, closer, channel_point)
+            assert closing_txid not in closing_txids
+            closing_txids.add(closing_txid)
+            await wait_for_mempool_transaction(closing_txid)
+            mined_blocks = await bitcoin_rpc("generatetoaddress", [1, destination])
+            assert len(mined_blocks) == 1
+            assert int(await bitcoin_rpc("getblockcount")) == block_height + 1
+            await assert_confirmed_cooperative_close(closing_txid, channel_point)
+            await wait_for_closed_channel(channel_point)
+        assert len(closing_txids) == 4
+        await bitcoin_rpc("generatetoaddress", [6, destination])
+        await wait_for_no_ring_channels()
+        await assert_no_pending_channels()
+    finally:
+        cleanup_failures: list[BaseException] = []
+        for active_taker in (restart_taker, taker):
+            if active_taker is None:
+                continue
+            try:
+                await active_taker.stop(close_wallet=False)
+            except BaseException as exc:
+                cleanup_failures.append(exc)
+        cleanup_results = await asyncio.gather(
+            *(item.close() for item in lnd_backends), return_exceptions=True
+        )
+        cleanup_failures.extend(
+            result for result in cleanup_results if isinstance(result, BaseException)
+        )
+        try:
+            await wallet.close()
         except BaseException as exc:
             cleanup_failures.append(exc)
         if sys.exc_info()[0] is None and cleanup_failures:

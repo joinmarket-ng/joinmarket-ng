@@ -48,6 +48,7 @@ from jmcore.protocol import (
     COMMAND_PREFIX,
     FEATURE_CHANNEL_INPUT_V1,
     FEATURE_COFUNDED_CHANNEL_RING_V1,
+    FEATURE_COFUNDED_CHANNEL_RING_V2,
     FEATURE_NEUTRINO_COMPAT,
     FEATURE_NICK_AUTH,
     FEATURE_PEERLIST_FEATURES,
@@ -253,6 +254,7 @@ class DirectoryClient:
         on_disconnect: Callable[[], None] | None = None,
         neutrino_compat: bool = False,
         cofunded_channel_ring_v1: bool = False,
+        cofunded_channel_ring_v2: bool = False,
         peerlist_timeout: float = 60.0,
         socks_username: str | None = None,
         socks_password: str | None = None,
@@ -329,6 +331,7 @@ class DirectoryClient:
             with contextlib.suppress(ValueError):
                 self.nick_auth_directory_id = directory_id_for_endpoint(self.host, self.port)
         self.cofunded_channel_ring_v1 = cofunded_channel_ring_v1
+        self.cofunded_channel_ring_v2 = cofunded_channel_ring_v2
         self.channel_input_v1 = channel_input_v1
 
         # Version negotiation state (set after handshake)
@@ -611,6 +614,8 @@ class DirectoryClient:
             our_features.add(FEATURE_NICK_AUTH)
         if self.cofunded_channel_ring_v1:
             our_features.add(FEATURE_COFUNDED_CHANNEL_RING_V1)
+        if self.cofunded_channel_ring_v2:
+            our_features.add(FEATURE_COFUNDED_CHANNEL_RING_V2)
         if self.channel_input_v1:
             our_features.add(FEATURE_CHANNEL_INPUT_V1)
         feature_set = FeatureSet(features=our_features)

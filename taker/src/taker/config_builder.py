@@ -301,7 +301,9 @@ def build_taker_config_kwargs(
         "taker_utxo_retries": settings.taker.taker_utxo_retries,
         "taker_utxo_amtpercent": settings.taker.taker_utxo_amtpercent,
         "max_maker_utxos": settings.taker.max_maker_utxos,
-        "channel_ring": ChannelRingConfig.from_settings(settings.taker.channel_ring),
+        "channel_ring": ChannelRingConfig.from_settings(
+            settings.taker.channel_ring, data_directory=effective_data_dir
+        ),
         "channel_input": ChannelInputConfig.from_settings(settings.taker.channel_input),
     }
 

@@ -37,6 +37,7 @@ from jmcore.paths import get_default_data_dir, read_nick_states
 from jmcore.protocol import (
     FEATURE_CHANNEL_INPUT_V1,
     FEATURE_COFUNDED_CHANNEL_RING_V1,
+    FEATURE_COFUNDED_CHANNEL_RING_V2,
     FEATURE_NEUTRINO_COMPAT,
     JM_VERSION,
 )
@@ -69,6 +70,7 @@ from taker.orderbook import (
     maker_selection_keys,
     offer_supports_channel_input_v1,
     offer_supports_cofunded_channel_ring_v1,
+    offer_supports_cofunded_channel_ring_v2,
 )
 from taker.podle_manager import PoDLEManager
 
@@ -248,6 +250,8 @@ class Taker(TakerMonitoringMixin):
                 config=config.channel_input,
                 network=config.network.value,
                 local_actor=self.nick,
+                maintenance_directory=config.channel_ring.maintenance_directory
+                or config.data_dir / "channel-maintenance",
             )
         self.state = TakerState.IDLE
         # Source mixdepth of the most recent ``do_coinjoin`` call. With
@@ -272,7 +276,12 @@ class Taker(TakerMonitoringMixin):
             nick_auth_directory_ids=config.nick_auth_directory_ids,
             allow_clearnet_connections=config.allow_clearnet_connections,
             neutrino_compat=neutrino_compat,
-            cofunded_channel_ring_v1=config.channel_ring.enabled,
+            cofunded_channel_ring_v1=(
+                config.channel_ring.enabled and not config.channel_ring.private_coordination
+            ),
+            cofunded_channel_ring_v2=(
+                config.channel_ring.enabled and config.channel_ring.private_coordination
+            ),
             channel_input_v1=False,
             stream_isolation=config.stream_isolation,
         )
@@ -1263,16 +1272,20 @@ class Taker(TakerMonitoringMixin):
     ) -> tuple[list[Any], str | None]:
         if not self.config.channel_ring.enabled:
             return offers, None
+        if self.config.channel_ring.private_coordination:
+            supports_ring = offer_supports_cofunded_channel_ring_v2
+            feature = FEATURE_COFUNDED_CHANNEL_RING_V2
+        else:
+            supports_ring = offer_supports_cofunded_channel_ring_v1
+            feature = FEATURE_COFUNDED_CHANNEL_RING_V1
         filtered = [
             offer
             for offer in offers
-            if offer_supports_cofunded_channel_ring_v1(offer)
-            and offer.ordertype is self.config.preferred_offer_type
+            if supports_ring(offer) and offer.ordertype is self.config.preferred_offer_type
         ]
         if len(filtered) < maker_count:
             return filtered, (
-                "Not enough makers explicitly advertise the exact configured "
-                "cofunded_channel_ring_v1 tr0 offer"
+                f"Not enough makers explicitly advertise the exact configured {feature} tr0 offer"
             )
         return filtered, None
 
@@ -1314,7 +1327,11 @@ class Taker(TakerMonitoringMixin):
     ) -> tuple[list[Any], set[str] | None]:
         if self.config.channel_ring.enabled:
             required_features = set(required_features or ())
-            required_features.add(FEATURE_COFUNDED_CHANNEL_RING_V1)
+            required_features.add(
+                FEATURE_COFUNDED_CHANNEL_RING_V2
+                if self.config.channel_ring.private_coordination
+                else FEATURE_COFUNDED_CHANNEL_RING_V1
+            )
         filtered, error = self._ring_filter_offers(offers, maker_count)
         if error is not None:
             self._session.last_failure_reason = error

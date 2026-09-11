@@ -22,7 +22,11 @@ dev = [
     "pytest-cov>=4.1.0",
     "pytest-timeout>=2.0.0",
     "ruff>=0.1.0",
+    "types-grpcio==1.83.0.20260730",
 ]
+
+[project.scripts]
+jm-channel-maintenance = "jmswap.maintenance_cli:main"
 
 [build-system]
 requires = ["setuptools>=68.0.0", "wheel"]

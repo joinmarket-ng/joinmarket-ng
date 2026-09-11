@@ -54,6 +54,7 @@ class MakerDirectoryPool(DirectoryClientPool):
         onion_host: str | None = None,
         onion_serving_port: int | None = None,
         cofunded_channel_ring_v1: bool = False,
+        cofunded_channel_ring_v2: bool = False,
         channel_input_v1: bool = False,
     ):
         self._config = config
@@ -62,6 +63,7 @@ class MakerDirectoryPool(DirectoryClientPool):
         self._onion_serving_port = onion_serving_port
         self._dir_creds: tuple[str | None, str | None]
         self._cofunded_channel_ring_v1 = cofunded_channel_ring_v1
+        self._cofunded_channel_ring_v2 = cofunded_channel_ring_v2
         self._channel_input_v1 = channel_input_v1
         super().__init__(
             directory_servers=list(config.directory_servers),
@@ -92,6 +94,7 @@ class MakerDirectoryPool(DirectoryClientPool):
         kwargs["neutrino_compat"] = self._neutrino_compat
         kwargs["allow_clearnet_connections"] = self._config.allow_clearnet_connections
         kwargs["cofunded_channel_ring_v1"] = self._cofunded_channel_ring_v1
+        kwargs["cofunded_channel_ring_v2"] = self._cofunded_channel_ring_v2
         kwargs["channel_input_v1"] = self._channel_input_v1
         return kwargs
 
@@ -108,6 +111,11 @@ class MakerDirectoryPool(DirectoryClientPool):
     def enable_cofunded_channel_ring_v1(self) -> None:
         """Advertise the feature on future connections after backend validation."""
         self._cofunded_channel_ring_v1 = True
+
+    def enable_cofunded_channel_ring_v2(self) -> None:
+        """Advertise private coordination only on future connections after validation."""
+        self._cofunded_channel_ring_v1 = False
+        self._cofunded_channel_ring_v2 = True
 
     def enable_channel_input_v1(self) -> None:
         """Advertise the feature on future connections after backend validation."""

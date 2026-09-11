@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import stat
 import time
 from collections.abc import Iterable, Mapping
@@ -15,6 +16,8 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from jmcore.cofunded_ring import (
+    ContactEnvelope,
+    CoordinatorParticipant,
     LocalContribution,
     PreparedIncomingState,
     PreparedOutgoingState,
@@ -26,7 +29,15 @@ from jmcore.cofunded_ring import (
     RingManifest,
     RingPlanPayload,
     RingPreparedPayload,
+    RingPrivateHelloPayload,
+    RingPrivateInvitePayload,
+    RingPrivatePlanPayload,
+    RingPrivatePreparedPayload,
     SignedReadinessAttestation,
+    contact_public_key,
+    cycle_context_hash,
+    decrypt_peer_contact,
+    encrypt_peer_contact,
 )
 
 
@@ -276,8 +287,12 @@ class RingParticipantRecord(StrictStoreModel):
     taker_session_identity: str = Field(min_length=1, max_length=256)
     local_role: RingParticipantRole
     local_position: int = Field(ge=0, le=31)
-    invite: RingInvitePayload | None = None
-    plan: RingPlanPayload | None = None
+    invite: RingInvitePayload | RingPrivateInvitePayload | None = None
+    plan: RingPlanPayload | RingPrivatePlanPayload | None = None
+    contact_secret: str | None = Field(default=None, repr=False)
+    maintenance_directory: Path | None = None
+    maintenance_enrollment_recorded: bool = False
+    local_contacts: dict[str, PrivateParticipant] = Field(default_factory=dict, repr=False)
     plan_hash: str | None = None
     local_contribution: LocalContribution | None = None
     local_input_outpoints: tuple[Outpoint, ...] = ()
@@ -297,9 +312,14 @@ class RingParticipantRecord(StrictStoreModel):
     local_readiness: tuple[SignedReadinessAttestation, ...] = ()
     readiness_set: tuple[SignedReadinessAttestation, ...] = ()
     readiness_hash: str | None = None
-    coordinator_participants: tuple[PrivateParticipant, ...] = ()
-    coordinator_plans: dict[str, RingPlanPayload] = Field(default_factory=dict)
-    coordinator_prepared: dict[str, RingPreparedPayload] = Field(default_factory=dict)
+    coordinator_participants: tuple[PrivateParticipant | CoordinatorParticipant, ...] = ()
+    coordinator_plans: dict[str, RingPlanPayload | RingPrivatePlanPayload] = Field(
+        default_factory=dict
+    )
+    coordinator_prepared: dict[str, RingPreparedPayload | RingPrivatePreparedPayload] = Field(
+        default_factory=dict
+    )
+    coordinator_hellos: dict[str, RingPrivateHelloPayload] = Field(default_factory=dict)
     coordinator_reached_keys: tuple[str, ...] = ()
     coordinator_ready_ack_keys: tuple[str, ...] = ()
     coordinator_sign_ack_keys: tuple[str, ...] = ()
@@ -328,6 +348,8 @@ class RingParticipantRecord(StrictStoreModel):
         local_position: int,
         local_input_outpoints: tuple[Outpoint, ...] = (),
         input_lock_owner: str | None = None,
+        private_coordination: bool = False,
+        maintenance_directory: Path | None = None,
         now: float | None = None,
     ) -> RingParticipantRecord:
         key_pair = RingKeyPair.generate()
@@ -342,9 +364,66 @@ class RingParticipantRecord(StrictStoreModel):
             local_position=local_position,
             local_input_outpoints=local_input_outpoints,
             input_lock_owner=input_lock_owner,
+            contact_secret=secrets.token_hex(32) if private_coordination else None,
+            maintenance_directory=maintenance_directory if private_coordination else None,
             created_at=timestamp,
             updated_at=timestamp,
         )
+
+    def backend_plan(self) -> RingPlanPayload:
+        """Resolve local contacts for backend calls, never for wire signing or hashing.
+
+        The original signed plan remains in ``plan``. The v2 projection is an
+        unsigned local value, not a coordinator-signed version-1 message.
+        """
+        if isinstance(self.plan, RingPlanPayload):
+            return self.plan
+        if not isinstance(self.plan, RingPrivatePlanPayload):
+            raise RingStoreError("ring record has no plan")
+        predecessor = self.local_contacts.get(self.plan.predecessor.participant_key)
+        successor = self.local_contacts.get(self.plan.successor.participant_key)
+        if predecessor is None or successor is None:
+            raise RingStoreError("authenticated neighbor contacts are incomplete")
+        values = self.plan.model_dump(
+            exclude={"v", "type", "sig", "neighbor_hellos", "predecessor", "successor"}
+        )
+        return RingPlanPayload(**values, predecessor=predecessor, successor=successor)
+
+    def contact_envelopes(self, local: PrivateParticipant) -> list[ContactEnvelope]:
+        if not isinstance(self.plan, RingPrivatePlanPayload) or self.contact_secret is None:
+            raise RingStoreError("private contact exchange requires durable keys and plan")
+        own = self.plan.neighbor_hellos[0].participant
+        if (
+            local.participant_key != self.ring_public_key
+            or own.encryption_key != contact_public_key(self.contact_secret)
+            or own.backend_limits != local.backend_limits
+        ):
+            raise RingStoreError("private plan substituted the local contact descriptor")
+        context = cycle_context_hash(
+            self.plan.network, self.round_nonce, self.revision, self.plan.cycle_keys
+        )
+        return [
+            encrypt_peer_contact(self.contact_secret, neighbor, local, context)
+            for neighbor in (self.plan.predecessor, self.plan.successor)
+        ]
+
+    def decrypt_contacts(self, envelopes: list[ContactEnvelope]) -> dict[str, PrivateParticipant]:
+        if not isinstance(self.plan, RingPrivatePlanPayload) or self.contact_secret is None:
+            raise RingStoreError("private contact exchange requires durable keys and plan")
+        neighbors = {
+            item.participant_key: item for item in (self.plan.predecessor, self.plan.successor)
+        }
+        if len(envelopes) != 2 or {item.sender_key for item in envelopes} != set(neighbors):
+            raise RingStoreError("contact delivery must contain exactly the two planned neighbors")
+        context = cycle_context_hash(
+            self.plan.network, self.round_nonce, self.revision, self.plan.cycle_keys
+        )
+        return {
+            item.sender_key: decrypt_peer_contact(
+                self.contact_secret, neighbors[item.sender_key], item, self.ring_public_key, context
+            )
+            for item in envelopes
+        }
 
     @property
     def key(self) -> RingRecordKey:
@@ -411,6 +490,7 @@ class RingParticipantRecord(StrictStoreModel):
     @field_validator(
         "round_nonce",
         "ring_secret",
+        "contact_secret",
         "ring_public_key",
         "plan_hash",
         "readiness_hash",
@@ -481,6 +561,25 @@ class RingParticipantRecord(StrictStoreModel):
             or self.plan.position != self.local_position
         ):
             raise ValueError("plan does not match participant record identity")
+        if isinstance(self.plan, RingPrivatePlanPayload):
+            if self.contact_secret is None:
+                raise ValueError("private plan requires its original contact secret")
+            own = self.plan.neighbor_hellos[0].participant
+            if own.encryption_key != contact_public_key(self.contact_secret):
+                raise ValueError("private plan substituted the local contact key")
+            neighbors = {
+                item.participant_key: item for item in (self.plan.predecessor, self.plan.successor)
+            }
+            if self.local_contacts and set(self.local_contacts) != set(neighbors):
+                raise ValueError("local contacts must cover exactly the planned neighbors")
+            for key, contact in self.local_contacts.items():
+                if (
+                    contact.participant_key != key
+                    or contact.backend_limits != neighbors[key].backend_limits
+                ):
+                    raise ValueError("stored contact does not match the planned descriptor")
+        elif self.local_contacts:
+            raise ValueError("decrypted contacts require a private plan")
         if self.manifest is not None and (
             self.manifest.round_nonce != self.round_nonce
             or self.manifest.revision != self.revision

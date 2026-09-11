@@ -685,6 +685,42 @@ jobs:
     needs: build-images
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      matrix:
+        include:
+          - suite: ring-e2e
+            private_coordination: 'false'
+            test_filter: test_rejected_revision_then_complete_four_party_ring
+            bitcoin_port: '20443'
+            directory_port: '25222'
+            orderbook_port: '28080'
+            tor_socks_port: '29050'
+            maker1_grpc_port: '21009'
+            maker2_grpc_port: '22009'
+            maker3_grpc_port: '23009'
+            taker_grpc_port: '24009'
+          - suite: ring-e2e-v2
+            private_coordination: 'true'
+            test_filter: test_private_coordination_complete_four_party_ring
+            bitcoin_port: '21443'
+            directory_port: '26222'
+            orderbook_port: '29080'
+            tor_socks_port: '30050'
+            maker1_grpc_port: '31009'
+            maker2_grpc_port: '32009'
+            maker3_grpc_port: '33009'
+            taker_grpc_port: '34009'
+          - suite: ring-e2e-maintenance
+            private_coordination: 'true'
+            test_filter: test_private_coordination_maintenance_triangle
+            bitcoin_port: '22443'
+            directory_port: '27222'
+            orderbook_port: '30080'
+            tor_socks_port: '31050'
+            maker1_grpc_port: '41009'
+            maker2_grpc_port: '42009'
+            maker3_grpc_port: '43009'
+            taker_grpc_port: '44009'
     permissions:
       contents: read
       packages: read
@@ -692,8 +728,17 @@ jobs:
       DIRECTORY_SERVER_IMAGE: ghcr.io/${{ github.repository }}/directory-server:ci-unsafe-do-not-run-${{ github.event.pull_request.head.sha || github.sha }}
       ORDERBOOK_WATCHER_IMAGE: ghcr.io/${{ github.repository }}/orderbook-watcher:ci-unsafe-do-not-run-${{ github.event.pull_request.head.sha || github.sha }}
       MAKER_IMAGE: ghcr.io/${{ github.repository }}/maker:ci-unsafe-do-not-run-${{ github.event.pull_request.head.sha || github.sha }}
-      RING_E2E_DATA_DIR: ${{ runner.temp }}/ring-e2e
-      RING_E2E_PROJECT: jm-ring-e2e
+      RING_E2E_DATA_DIR: ${{ runner.temp }}/${{ matrix.suite }}
+      RING_E2E_PROJECT: jm-${{ matrix.suite }}
+      RING_E2E_PRIVATE_COORDINATION: ${{ matrix.private_coordination }}
+      RING_E2E_BITCOIN_PORT: ${{ matrix.bitcoin_port }}
+      RING_E2E_DIRECTORY_PORT: ${{ matrix.directory_port }}
+      RING_E2E_ORDERBOOK_PORT: ${{ matrix.orderbook_port }}
+      RING_E2E_TOR_SOCKS_PORT: ${{ matrix.tor_socks_port }}
+      RING_E2E_MAKER1_GRPC_PORT: ${{ matrix.maker1_grpc_port }}
+      RING_E2E_MAKER2_GRPC_PORT: ${{ matrix.maker2_grpc_port }}
+      RING_E2E_MAKER3_GRPC_PORT: ${{ matrix.maker3_grpc_port }}
+      RING_E2E_TAKER_GRPC_PORT: ${{ matrix.taker_grpc_port }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -733,8 +778,9 @@ jobs:
           RING_E2E: '1'
         run: |
           pytest -c pytest.ini tests/e2e/test_cofunded_ring_e2e.py \
-            -m ring_e2e --fail-on-skip --no-cov -v -s --timeout=900 \
-            --junitxml=junit/ring-e2e.xml
+            tests/e2e/test_channel_maintenance_e2e.py \
+            -m ring_e2e -k "${{ matrix.test_filter }}" --fail-on-skip --no-cov -v -s --timeout=900 \
+            --junitxml=junit/${{ matrix.suite }}.xml
 
       - name: Show channel-ring logs
         if: always()
@@ -759,8 +805,8 @@ jobs:
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: ring-e2e-results
-          path: junit/ring-e2e.xml
+          name: ${{ matrix.suite }}-results
+          path: junit/${{ matrix.suite }}.xml
 
   test-tumbler:
     needs: build-images

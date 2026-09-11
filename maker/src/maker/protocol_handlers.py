@@ -35,6 +35,7 @@ from jmcore.protocol import (
     COMMAND_PREFIX,
     FEATURE_CHANNEL_INPUT_V1,
     FEATURE_COFUNDED_CHANNEL_RING_V1,
+    FEATURE_COFUNDED_CHANNEL_RING_V2,
     JM_VERSION,
     MessageType,
 )
@@ -781,7 +782,11 @@ class ProtocolHandlersMixin:
                     self._release_commitment_reservation(previous_session.commitment.hex())
 
                 if self.channel_ring_capability_validated:
-                    response.setdefault("features", []).append(FEATURE_COFUNDED_CHANNEL_RING_V1)
+                    response.setdefault("features", []).append(
+                        FEATURE_COFUNDED_CHANNEL_RING_V2
+                        if self.config.channel_ring.private_coordination
+                        else FEATURE_COFUNDED_CHANNEL_RING_V1
+                    )
                 if self.channel_input_capability_validated:
                     features = response.setdefault("features", [])
                     if FEATURE_CHANNEL_INPUT_V1 not in features:

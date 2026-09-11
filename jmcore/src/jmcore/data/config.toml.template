@@ -515,6 +515,11 @@
 # only tr0 offers, local TLS-authenticated LND, and a v3 onion Lightning URI.
 [maker.channel_ring]
 # enabled = false
+# Default false preserves legacy v1. Set true to require neighbor-encrypted v2.
+# private_coordination = false
+# For v2, defaults to data_dir/channel-maintenance. Share one directory per LND
+# node with jm-channel-maintenance; existing channels are never auto-enrolled.
+# maintenance_directory = "/home/user/.joinmarket-ng/channel-maintenance"
 # lnd_grpc_url = "https://127.0.0.1:10009"
 # lnd_tls_cert_path = "/home/user/.lnd/tls.cert"
 # lnd_macaroon_path = "/home/user/.lnd/data/chain/bitcoin/mainnet/admin.macaroon"
@@ -661,6 +666,9 @@
 # selection is unchanged while this feature is disabled or not orchestrated.
 [taker.channel_ring]
 # enabled = false
+# Default false preserves legacy v1. Set true to require neighbor-encrypted v2.
+# private_coordination = false
+# maintenance_directory = "/home/user/.joinmarket-ng/channel-maintenance"
 # lnd_grpc_url = "https://127.0.0.1:10009"
 # lnd_tls_cert_path = "/home/user/.lnd/tls.cert"
 # lnd_macaroon_path = "/home/user/.lnd/data/chain/bitcoin/mainnet/admin.macaroon"
@@ -709,6 +717,21 @@
 # phase_timeout_seconds = 120.0
 # max_active_sessions = 4
 # persistence_directory = "/home/user/.joinmarket-ng/channel-input-taker"
+
+# Node-local maintenance only operates on explicitly enrolled new v2 channels.
+# Run jm-channel-maintenance separately using the same LND identity and directory.
+# Zero routing fees do not eliminate HTLC, liquidity, or force-close risk.
+# A single four-node ring has no eligible triangle for current route discovery.
+[channel_maintenance]
+# enabled = true
+# interval_min_seconds = 900
+# interval_max_seconds = 3600
+# amount_min_sat = 1000
+# amount_max_sat = 50000
+# liquidity_margin_sat = 10000
+# max_spendable_percent = 10
+# payment_timeout_seconds = 30
+# peer_query_timeout_seconds = 5
 
 # ============================================================================
 # Tumbler Settings

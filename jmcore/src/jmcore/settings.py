@@ -55,6 +55,7 @@ from pydantic_settings import (
 )
 
 from jmcore.channel_input_config import ChannelInputSettings
+from jmcore.channel_maintenance import ChannelMaintenanceSettings
 from jmcore.channel_ring import ChannelRingSettings
 from jmcore.constants import DUST_THRESHOLD
 from jmcore.models import (
@@ -1575,6 +1576,9 @@ class JoinMarketSettings(BaseSettings):
 
     # Component-specific settings
     maker: MakerSettings = Field(default_factory=MakerSettings)
+    channel_maintenance: ChannelMaintenanceSettings = Field(
+        default_factory=ChannelMaintenanceSettings
+    )
     taker: TakerSettings = Field(default_factory=TakerSettings)
     tumbler: TumblerSettings = Field(default_factory=TumblerSettings)
     directory_server: DirectoryServerSettings = Field(default_factory=DirectoryServerSettings)

@@ -9,6 +9,7 @@ from pydantic import ValidationError
 from jmcore.channel_ring import ChannelRingConfig, ChannelRingSettings
 from jmcore.protocol import (
     FEATURE_COFUNDED_CHANNEL_RING_V1,
+    FEATURE_COFUNDED_CHANNEL_RING_V2,
     FEATURE_PEERLIST_FEATURES,
     FEATURE_PING,
     FeatureSet,
@@ -26,7 +27,7 @@ def enabled_values() -> dict[str, object]:
     }
 
 
-def test_only_one_cofunded_ring_feature_is_defined() -> None:
+def test_cofunded_ring_features_are_defined() -> None:
     import jmcore.protocol as protocol
 
     cofunded_features = {
@@ -34,8 +35,9 @@ def test_only_one_cofunded_ring_feature_is_defined() -> None:
         for name, value in vars(protocol).items()
         if name.startswith("FEATURE_") and isinstance(value, str) and "cofunded_channel" in value
     }
-    assert cofunded_features == {"cofunded_channel_ring_v1"}
+    assert cofunded_features == {"cofunded_channel_ring_v1", "cofunded_channel_ring_v2"}
     assert FEATURE_COFUNDED_CHANNEL_RING_V1 == "cofunded_channel_ring_v1"
+    assert FEATURE_COFUNDED_CHANNEL_RING_V2 == "cofunded_channel_ring_v2"
     for forbidden in (
         "channel_change",
         "channel_ring",

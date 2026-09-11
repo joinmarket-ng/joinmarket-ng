@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Protocol
 
 from jmcore.channel_input import (
@@ -77,6 +78,7 @@ class TakerChannelInputRegistry:
         config: ChannelInputConfig,
         network: Network,
         local_actor: str,
+        maintenance_directory: Path | None = None,
     ) -> None:
         self._store = store
         self._config = config
@@ -85,7 +87,36 @@ class TakerChannelInputRegistry:
         self._negotiations: dict[tuple[str, int], TakerChannelInputNegotiation] = {}
         self._locks: dict[tuple[str, int], asyncio.Lock] = {}
         self._admission_lock = asyncio.Lock()
+        self._maintenance_directory = maintenance_directory
         self._load()
+
+    def _sync_spend_admission(self, negotiation: TakerChannelInputNegotiation) -> None:
+        if self._maintenance_directory is None or not negotiation.freeze_intents:
+            return
+        from jmswap.maintenance import (
+            MaintenanceError,
+            claim_spend_channels,
+            release_spend_channels,
+        )
+
+        directory = self._maintenance_directory
+        node_id = negotiation.remote_hellos[0][1].peer_node_key
+        owner = f"taker:{negotiation.invite.session_id}:{negotiation.invite.attempt}"
+        points = tuple(
+            f"{intent.funding_outpoint.txid}:{intent.funding_outpoint.vout}"
+            for _, intent in negotiation.freeze_intents
+        )
+        try:
+            if negotiation.stage is TakerChannelInputStage.CANCELED:
+                release_spend_channels(directory, node_id, owner, points)
+            elif not claim_spend_channels(directory, node_id, owner, points):
+                raise TakerChannelInputRuntimeError(
+                    "channel input is busy with another local operation"
+                )
+        except MaintenanceError as exc:
+            raise TakerChannelInputRuntimeError(
+                "channel-input admission state is unavailable"
+            ) from exc
 
     @classmethod
     def load(
@@ -95,10 +126,17 @@ class TakerChannelInputRegistry:
         config: ChannelInputConfig,
         network: Network,
         local_actor: str,
+        maintenance_directory: Path | None = None,
     ) -> TakerChannelInputRegistry:
         """Restore all snapshots or fail before any capability is advertised."""
 
-        return cls(store=store, config=config, network=network, local_actor=local_actor)
+        return cls(
+            store=store,
+            config=config,
+            network=network,
+            local_actor=local_actor,
+            maintenance_directory=maintenance_directory,
+        )
 
     @property
     def session_count(self) -> int:
@@ -535,6 +573,8 @@ class TakerChannelInputRegistry:
             if snapshot.stage is TakerChannelInputStage.CANCELED and snapshot.invite.expiry <= int(
                 time.time()
             ):
+                if self._maintenance_directory is not None:
+                    self._sync_spend_admission(TakerChannelInputNegotiation.from_snapshot(snapshot))
                 try:
                     self._store.delete(snapshot)
                 except TakerChannelInputStoreError as exc:
@@ -676,6 +716,7 @@ class TakerChannelInputRegistry:
     async def _reconcile_one(
         self, negotiation: TakerChannelInputNegotiation, backend: TakerChannelInputBackend
     ) -> None:
+        self._sync_spend_admission(negotiation)
         if negotiation.stage is TakerChannelInputStage.CANCELED:
             return
         if negotiation.stage is TakerChannelInputStage.FREEZE_INTENDED:
@@ -801,3 +842,4 @@ class TakerChannelInputRegistry:
             raise TakerChannelInputRuntimeError(
                 "could not persist channel-input recovery state"
             ) from exc
+        self._sync_spend_admission(negotiation)

@@ -24,6 +24,7 @@ from jmcore.paths import get_ignored_makers_path
 from jmcore.protocol import (
     FEATURE_CHANNEL_INPUT_V1,
     FEATURE_COFUNDED_CHANNEL_RING_V1,
+    FEATURE_COFUNDED_CHANNEL_RING_V2,
     FEATURE_NEUTRINO_COMPAT,
     get_nick_version,
 )
@@ -34,7 +35,9 @@ from taker.config import MaxCjFee
 
 DEFAULT_MAKER_REPEAT_PENALTY = 0.8
 _MAX_REPEAT_PENALTY_DRAWS = 64
-_STRICT_ORDERBOOK_FEATURES = frozenset({FEATURE_COFUNDED_CHANNEL_RING_V1, FEATURE_CHANNEL_INPUT_V1})
+_STRICT_ORDERBOOK_FEATURES = frozenset(
+    {FEATURE_COFUNDED_CHANNEL_RING_V1, FEATURE_COFUNDED_CHANNEL_RING_V2, FEATURE_CHANNEL_INPUT_V1}
+)
 
 
 def maker_nick_selection_key(nick: str) -> str:
@@ -486,6 +489,11 @@ def _offer_confirms_features(offer: Offer, required_features: set[str]) -> bool:
 def offer_supports_cofunded_channel_ring_v1(offer: Offer) -> bool:
     """Recognize backend-validated ring support without changing offer selection."""
     return offer.features.get(FEATURE_COFUNDED_CHANNEL_RING_V1, False)
+
+
+def offer_supports_cofunded_channel_ring_v2(offer: Offer) -> bool:
+    """Recognize backend-validated private-coordinate ring support."""
+    return offer.features.get(FEATURE_COFUNDED_CHANNEL_RING_V2) is True
 
 
 def offer_supports_channel_input_v1(offer: Offer) -> bool:

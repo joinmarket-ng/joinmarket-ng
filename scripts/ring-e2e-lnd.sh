@@ -31,5 +31,6 @@ exec lnd \
     --tor.password=ring-e2e \
     --tor.skip-proxy-for-clearnet-targets \
     --protocol.simple-taproot-chans \
+    --protocol.option-scid-alias \
     --acceptortimeout=120s \
     --nobootstrap

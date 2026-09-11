@@ -7,7 +7,7 @@ import json
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -36,17 +36,23 @@ from jmcore.cofunded_ring import (
     ReadinessAttestation,
     RingCancelPayload,
     RingEdge,
+    RingHelloPayload,
     RingInvitePayload,
     RingKeyPair,
     RingManifest,
     RingOpenPayload,
+    RingPlanAckPayload,
     RingPlanPayload,
+    RingPreparedPayload,
+    RingPrivateHelloPayload,
+    RingPrivatePlanPayload,
     RingReadySetAckPayload,
     RingReadySetPayload,
     RingSignAckPayload,
     RingSignPayload,
     RingUnsignedPayload,
     SignedReadinessAttestation,
+    contact_public_key,
     encode_ring_message,
     manifest_hash,
     sign_attestation,
@@ -82,6 +88,7 @@ from maker.channel_ring import (
     _chain_hash,
     reconcile_ring_records,
 )
+from maker.coinjoin import CoinJoinSession as MakerCoinJoinSession
 from maker.coinjoin import CoinJoinState
 from maker.maker_session import MakerSession
 
@@ -483,6 +490,7 @@ class Harness:
     async def through_open(self) -> None:
         await self.machine.handle(self.invite())
         acknowledgments = await self.machine.handle(self.plan())
+        assert isinstance(acknowledgments[0], RingPlanAckPayload)
         plan_hash = acknowledgments[0].plan_hash
         await self.machine.handle(
             self.signed(
@@ -638,9 +646,11 @@ def harness(tmp_path: Path) -> Harness:
 
 async def test_complete_participant_flow_and_signature_persistence(harness: Harness) -> None:
     hello = await harness.machine.handle(harness.invite())
+    assert isinstance(hello[0], RingHelloPayload)
     assert hello[0].participant.node_id == LOCAL_NODE
     assert harness.record().state is RingLifecycleState.INVITED
     acknowledgments = await harness.machine.handle(harness.plan())
+    assert isinstance(acknowledgments[0], RingPlanAckPayload)
     assert harness.record().state is RingLifecycleState.ACCEPTOR_ARMED
     prepared = await harness.machine.handle(
         harness.signed(
@@ -652,6 +662,7 @@ async def test_complete_participant_flow_and_signature_persistence(harness: Harn
             )
         )
     )
+    assert isinstance(prepared[0], RingPreparedPayload)
     assert prepared[0].outgoing.script_pubkey == OUTGOING_SCRIPT
     assert "script_pubkey" not in prepared[0].incoming.model_dump()
 
@@ -744,6 +755,7 @@ async def test_script_and_residual_substitution_and_wrong_open_binding_are_rejec
 ) -> None:
     await harness.machine.handle(harness.invite())
     ack = await harness.machine.handle(harness.plan())
+    assert isinstance(ack[0], RingPlanAckPayload)
     with pytest.raises(MakerRingError, match="plan hash"):
         await harness.machine.handle(
             harness.signed(
@@ -799,6 +811,7 @@ async def test_paid_fee_above_advertised_raw_fee_preserves_acknowledged_residual
     await harness.machine.handle(harness.invite())
     plan = harness.plan(residual=1_001_000)
     acknowledgments = await harness.machine.handle(plan)
+    assert isinstance(acknowledgments[0], RingPlanAckPayload)
     await harness.machine.handle(
         harness.signed(
             RingOpenPayload(
@@ -918,6 +931,7 @@ async def test_cancel_before_verify_after_verify_and_after_sign_boundaries(tmp_p
         )
     )
     planned_response = await planned.machine.handle(planned_cancel)
+    assert isinstance(planned_response[0], RingCancelPayload)
     assert planned.record().state is RingLifecycleState.RETIRED
     assert planned.record().outgoing_open_started is False
     assert planned.lnd.canceled == []
@@ -935,6 +949,7 @@ async def test_cancel_before_verify_after_verify_and_after_sign_boundaries(tmp_p
         )
     )
     prepared_response = await prepared.machine.handle(prepared_cancel)
+    assert isinstance(prepared_response[0], RingCancelPayload)
     assert prepared.record().state is RingLifecycleState.RETIRED
     assert prepared.lnd.canceled == ["12" * 32]
     assert prepared_response[0].canceled_pending_ids == ["12" * 32]
@@ -1365,13 +1380,116 @@ async def test_signed_plan_rejection_releases_owned_podle_for_fresh_commitment(
     assert session.ring_participant is not None
     assert commitment in bot._reserved_commitments
     next_session = MakerSession(
-        SimpleNamespace(
-            taker_nick=taker_identity.nick,
-            session_timeout_sec=300,
-            commitment=bytes.fromhex("07" * 32),
+        cast(
+            MakerCoinJoinSession,
+            SimpleNamespace(
+                taker_nick=taker_identity.nick,
+                session_timeout_sec=300,
+                commitment=bytes.fromhex("07" * 32),
+            ),
         )
     )
     assert bot._reserve_podle_outpoint(podle_outpoint, next_session) is True
+    selected.send_private_message.assert_awaited_once_with(
+        taker_identity.nick, "ring", "ZW5jcnlwdGVk"
+    )
+
+
+async def test_signed_private_plan_rejection_uses_durable_plan_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    taker_identity = NickIdentity()
+    maker_identity = NickIdentity()
+    cycle = [_key(index) for index in (10, 11, 12, 13)]
+
+    def private_participant(index: int) -> dict[str, object]:
+        return {
+            "participant_key": _key(index),
+            "encryption_key": contact_public_key(f"{index:064x}"),
+            "backend_limits": _limits().model_dump(),
+        }
+
+    def signed_hello(index: int) -> dict[str, object]:
+        hello = RingPrivateHelloPayload.model_validate(
+            {
+                "round_nonce": "aa" * 32,
+                "revision": 0,
+                "signer_key": _key(index),
+                "participant": private_participant(index),
+            }
+        )
+        signed_hello = sign_payload(hello, _secret(index))
+        assert isinstance(signed_hello, RingPrivateHelloPayload)
+        return signed_hello.model_dump()
+
+    request = RingPrivatePlanPayload.model_validate(
+        {
+            "round_nonce": "aa" * 32,
+            "revision": 0,
+            "signer_key": cycle[0],
+            "network": "regtest",
+            "offer_type": "tr0absoffer",
+            "cycle_keys": cycle,
+            "position": 1,
+            "contribution": {
+                "participant_key": cycle[1],
+                "residual": 300_000,
+                "outgoing": 180_000,
+                "incoming": 120_000,
+            },
+            "predecessor": private_participant(10),
+            "successor": private_participant(12),
+            "incoming_edge": {
+                "edge_id": "21" * 32,
+                "pending_channel_id": "11" * 32,
+                "opener_key": cycle[0],
+                "acceptor_key": cycle[1],
+                "capacity": 250_000,
+                "push_amount": 120_000,
+                "policy": _policy().model_dump(),
+            },
+            "outgoing_edge": {
+                "edge_id": "22" * 32,
+                "pending_channel_id": "12" * 32,
+                "opener_key": cycle[1],
+                "acceptor_key": cycle[2],
+                "capacity": 300_000,
+                "push_amount": 100_000,
+                "policy": _policy().model_dump(),
+            },
+            "neighbor_hellos": [signed_hello(index) for index in (11, 10, 12)],
+        }
+    )
+    response = RingCancelPayload(
+        round_nonce="aa" * 32,
+        revision=0,
+        signer_key=_key(10),
+        reason_code="participant_rejection",
+    )
+    crypto = _WireCrypto("private plan")
+    inner = SimpleNamespace(
+        state=CoinJoinState.IOAUTH_SENT,
+        taker_nick=taker_identity.nick,
+        session_timeout_sec=300,
+        validate_channel=lambda received: received == "dir:selected",
+        crypto=crypto,
+        wallet=SimpleNamespace(release_coinjoin_inputs=Mock()),
+        our_utxos={},
+        input_lock_owner="maker:round-owner",
+        commitment=b"",
+    )
+    session = MakerSession(inner)  # type: ignore[arg-type]
+    participant = _RejectingWireParticipant(response)
+    session.ring_participant = participant  # type: ignore[assignment]
+    selected = SimpleNamespace(send_private_message=AsyncMock())
+    bot = _wire_maker_bot(maker_identity, selected)
+    ciphertext = "Y2lwaGVydGV4dA=="
+    signed = taker_identity.sign_message(ciphertext, ONION_HOSTID)
+    monkeypatch.setattr("maker.maker_session.decode_ring_message", lambda _plaintext: request)
+
+    await session.on_ring(bot, f"ring {signed}", "dir:selected")  # type: ignore[arg-type]
+
+    assert participant.handled == [request]
     selected.send_private_message.assert_awaited_once_with(
         taker_identity.nick, "ring", "ZW5jcnlwdGVk"
     )
@@ -1490,7 +1608,10 @@ async def test_ring_cancel_does_not_release_another_session_podle_reservation(
     session = MakerSession(inner)  # type: ignore[arg-type]
     session.ring_participant = _RetiringCancelWireParticipant(cancel)  # type: ignore[assignment]
     other_session = MakerSession(
-        SimpleNamespace(taker_nick="other", session_timeout_sec=300, commitment=b"")
+        cast(
+            MakerCoinJoinSession,
+            SimpleNamespace(taker_nick="other", session_timeout_sec=300, commitment=b""),
+        )
     )
     selected = SimpleNamespace(send_private_message=AsyncMock())
     bot = _wire_maker_bot(maker_identity, selected)
@@ -1539,17 +1660,20 @@ def test_restart_renews_maker_ring_lock_with_persisted_owner() -> None:
         pending_tx_timeout_min=30,
         pending_tx_abandon_hours=6,
     )
-    bot._channel_ring_store = SimpleNamespace(
-        load_all=lambda: SimpleNamespace(
-            records=(
-                SimpleNamespace(
-                    active=True,
-                    local_input_outpoints=(outpoint,),
-                    input_lock_owner="maker:persisted-owner",
+    bot._channel_ring_store = cast(
+        RingParticipantStore,
+        SimpleNamespace(
+            load_all=lambda: SimpleNamespace(
+                records=(
+                    SimpleNamespace(
+                        active=True,
+                        local_input_outpoints=(outpoint,),
+                        input_lock_owner="maker:persisted-owner",
+                    ),
                 ),
-            ),
-            corruptions=(),
-        )
+                corruptions=(),
+            )
+        ),
     )
 
     assert bot._renew_channel_ring_input_locks()
@@ -1573,9 +1697,10 @@ async def test_periodic_reconciliation_aborts_when_ring_lock_renewal_fails() -> 
     bot.config = SimpleNamespace(  # type: ignore[assignment]
         channel_ring=SimpleNamespace(phase_timeout_seconds=120.0)
     )
-    bot._renew_channel_ring_input_locks = Mock(return_value=False)
-
-    with patch("maker.channel_ring.reconcile_ring_records", new=AsyncMock()) as reconcile:
+    with (
+        patch.object(bot, "_renew_channel_ring_input_locks", return_value=False),
+        patch("maker.channel_ring.reconcile_ring_records", new=AsyncMock()) as reconcile,
+    ):
         with pytest.raises(RuntimeError, match="input-lock renewal failed"):
             await bot._periodic_channel_ring_reconciliation()
 

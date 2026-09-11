@@ -27,6 +27,7 @@ from jmswap.lnd import (
     LndEscrowStatus,
     LndFinalizedEscrowParent,
 )
+from jmswap.maintenance import claim_spend_channels
 from test_channel_input_negotiation import (
     _COORDINATOR_SECRET,
     _MAKER_SECRETS,
@@ -42,7 +43,11 @@ from test_channel_input_negotiation import (
     _plan,
 )
 
-from taker.channel_input_negotiation import TakerChannelInputNegotiation, TakerChannelInputStage
+from taker.channel_input_negotiation import (
+    TakerChannelInputNegotiation,
+    TakerChannelInputSnapshot,
+    TakerChannelInputStage,
+)
 from taker.channel_input_runtime import TakerChannelInputRegistry, TakerChannelInputRuntimeError
 from taker.channel_input_store import TakerChannelInputStore
 
@@ -283,6 +288,58 @@ def test_expired_canceled_tombstone_is_pruned(tmp_path: Path) -> None:
     assert store.load_all().records == ()
 
 
+def test_expired_canceled_tombstone_releases_only_its_owner_before_pruning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    negotiation = _new()
+    remote = _add_freeze(negotiation, "maker-a", 0)
+    negotiation.install_frozen_channel("maker-a", _frozen_snapshot(0))
+    cancel = negotiation.plan_cancel("local_freeze_failed")
+    negotiation.accept_cancel_ack("maker-a", _cancel_ack(negotiation, cancel, "maker-a", 0))
+    negotiation.accept_cancel_ack("maker-b", _unknown_hello_cancel_ack(negotiation, cancel, 1))
+    negotiation.accept_cancel_ack("maker-c", _unknown_hello_cancel_ack(negotiation, cancel, 2))
+    negotiation.record_local_resumed((remote.funding_outpoint,))
+    store = _store(tmp_path, negotiation)
+    directory = tmp_path / "maintenance"
+    points = tuple(
+        f"{intent.funding_outpoint.txid}:{intent.funding_outpoint.vout}"
+        for _, intent in negotiation.freeze_intents
+    )
+    owner = f"taker:{negotiation.invite.session_id}:{negotiation.invite.attempt}"
+    assert claim_spend_channels(directory, remote.peer_node_key, owner, points)
+    monkeypatch.setattr("taker.channel_input_runtime.time.time", lambda: 2_000)
+    original_delete = store.delete
+
+    def interrupted_delete(_snapshot: TakerChannelInputSnapshot) -> None:
+        raise RuntimeError("simulated crash before tombstone pruning")
+
+    monkeypatch.setattr(store, "delete", interrupted_delete)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        TakerChannelInputRegistry.load(
+            store=store,
+            config=_config(_candidate(0).funding_outpoint),
+            network="regtest",
+            local_actor="taker",
+            maintenance_directory=directory,
+        )
+
+    assert store.load_all().records == (negotiation.snapshot(),)
+    assert claim_spend_channels(directory, remote.peer_node_key, "other-local-operation", points)
+    monkeypatch.setattr(store, "delete", original_delete)
+
+    registry = TakerChannelInputRegistry.load(
+        store=store,
+        config=_config(_candidate(0).funding_outpoint),
+        network="regtest",
+        local_actor="taker",
+        maintenance_directory=directory,
+    )
+
+    assert registry.session_count == 0
+    assert store.load_all().records == ()
+    assert not claim_spend_channels(directory, remote.peer_node_key, "third-owner", points)
+
+
 @pytest.mark.asyncio
 async def test_freeze_recovery_queries_all_before_each_durable_mutation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -335,6 +392,75 @@ async def test_freeze_recovery_rejects_later_stage_before_mutation(tmp_path: Pat
     with pytest.raises(TakerChannelInputRuntimeError, match="later escrow"):
         await registry.reconcile_all(backend, _node(10))
     assert not any(event.startswith("freeze:") for event in backend.events)
+
+
+@pytest.mark.asyncio
+async def test_maintenance_guard_blocks_freeze_before_any_backend_call(tmp_path: Path) -> None:
+    negotiation = _new()
+    remote, _ = _freeze_intent(negotiation, 0)
+    directory = tmp_path / "maintenance"
+    points = tuple(
+        f"{intent.funding_outpoint.txid}:{intent.funding_outpoint.vout}"
+        for _, intent in negotiation.freeze_intents
+    )
+    assert claim_spend_channels(directory, remote.peer_node_key, "maintenance-dispatch", points)
+    registry = TakerChannelInputRegistry.load(
+        store=_store(tmp_path, negotiation),
+        config=_config(_candidate(0).funding_outpoint),
+        network="regtest",
+        local_actor="taker",
+        maintenance_directory=directory,
+    )
+    backend = FakeBackend()
+
+    with pytest.raises(TakerChannelInputRuntimeError, match="busy with another local operation"):
+        await registry.reconcile_all(backend, remote.peer_node_key)
+
+    assert backend.events == []
+
+
+@pytest.mark.asyncio
+async def test_maintenance_guard_is_durable_before_freeze_and_across_reload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    negotiation = _new()
+    remote, _ = _freeze_intent(negotiation, 0)
+    directory = tmp_path / "maintenance"
+    points = tuple(
+        f"{intent.funding_outpoint.txid}:{intent.funding_outpoint.vout}"
+        for _, intent in negotiation.freeze_intents
+    )
+    registry = TakerChannelInputRegistry.load(
+        store=_store(tmp_path, negotiation),
+        config=_config(_candidate(0).funding_outpoint),
+        network="regtest",
+        local_actor="taker",
+        maintenance_directory=directory,
+    )
+    backend = FakeBackend()
+    frozen = _frozen_snapshot(0)
+    backend.frozen[frozen.channel_id] = frozen
+    original_freeze = backend.freeze_channel_input
+
+    async def freeze(session_id: str, channel_id: str) -> FrozenChannelSnapshot:
+        assert not claim_spend_channels(
+            directory, remote.peer_node_key, "another-local-operation", points
+        )
+        return await original_freeze(session_id, channel_id)
+
+    monkeypatch.setattr(backend, "freeze_channel_input", freeze)
+    await registry.reconcile_all(backend, remote.peer_node_key)
+
+    TakerChannelInputRegistry.load(
+        store=registry._store,
+        config=_config(_candidate(0).funding_outpoint),
+        network="regtest",
+        local_actor="taker",
+        maintenance_directory=directory,
+    )
+    assert not claim_spend_channels(
+        directory, remote.peer_node_key, "another-local-operation", points
+    )
 
 
 @pytest.mark.asyncio

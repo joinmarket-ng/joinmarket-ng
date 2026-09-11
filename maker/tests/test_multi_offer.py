@@ -14,7 +14,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from jmcore.constants import DUST_THRESHOLD
 from jmcore.models import NetworkType, Offer, OfferType
-from jmcore.protocol import FEATURE_CHANNEL_INPUT_V1
+from jmcore.protocol import (
+    FEATURE_CHANNEL_INPUT_V1,
+    FEATURE_COFUNDED_CHANNEL_RING_V1,
+    FEATURE_COFUNDED_CHANNEL_RING_V2,
+)
 from loguru import logger
 
 from maker.bot import MakerBot
@@ -634,6 +638,35 @@ class TestMakerBotMultiOfferFill:
             ),
         ]
         return bot
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("private_coordination", [False, True])
+    @pytest.mark.parametrize("validated", [False, True])
+    async def test_fill_pubkey_advertises_configured_ring_version(
+        self, maker_bot: MakerBot, private_coordination: bool, validated: bool
+    ) -> None:
+        maker_bot.config.channel_ring = maker_bot.config.channel_ring.model_copy(
+            update={"private_coordination": private_coordination}
+        )
+        maker_bot.channel_ring_capability_validated = validated
+        response = {"nacl_pubkey": "abc123", "features": ["neutrino_compat"]}
+        with (
+            patch("maker.protocol_handlers.CoinJoinSession") as session_class,
+            patch("maker.protocol_handlers.check_commitment", return_value=True),
+            patch.object(maker_bot, "_send_response", new=AsyncMock()) as send,
+        ):
+            session_class.return_value.handle_fill = AsyncMock(return_value=(True, response))
+            await maker_bot._handle_fill("J5Taker123", f"fill 0 500000 taker_pk_hex P{'aa' * 32}")
+        send.assert_awaited_once()
+        expected = ["neutrino_compat"]
+        if validated:
+            expected.append(
+                FEATURE_COFUNDED_CHANNEL_RING_V2
+                if private_coordination
+                else FEATURE_COFUNDED_CHANNEL_RING_V1
+            )
+        assert send.call_args.args[1] == "pubkey"
+        assert send.call_args.args[2]["features"] == expected
 
     @pytest.mark.asyncio
     async def test_fill_relative_offer(self, maker_bot, mock_backend):

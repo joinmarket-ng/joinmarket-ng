@@ -29,6 +29,7 @@ from jmswap.lnd import (
     LndFinalizedEscrowParent,
     WitnessUtxo,
 )
+from jmswap.maintenance import claim_spend_channels
 from test_maker_channel_input_negotiation import (
     _approval_set,
     _cancel,
@@ -289,6 +290,74 @@ async def test_freeze_recovery_rejects_later_escrow_stage_before_mutation(tmp_pa
     with pytest.raises(MakerChannelInputRuntimeError, match="later escrow"):
         await registry.reconcile_all(backend, negotiation.local_node_key)
     assert not any(event.startswith("freeze:") for event in backend.events)
+
+
+@pytest.mark.asyncio
+async def test_maintenance_guard_blocks_freeze_before_any_backend_call(tmp_path: Path) -> None:
+    negotiation, frozen = _negotiation(channels=1)
+    _plan_freeze(negotiation, frozen)
+    directory = tmp_path / "maintenance"
+    points = tuple(
+        f"{intent.funding_outpoint.txid}:{intent.funding_outpoint.vout}"
+        for intent in negotiation.freeze_intents
+    )
+    assert claim_spend_channels(
+        directory, negotiation.local_node_key, "maintenance-dispatch", points
+    )
+    registry = MakerChannelInputRegistry.load(
+        store=_store(tmp_path, negotiation),
+        config=negotiation.config,
+        network=negotiation.network,
+        maintenance_directory=directory,
+    )
+    backend = FakeBackend()
+
+    with pytest.raises(MakerChannelInputRuntimeError, match="busy with another local operation"):
+        await registry.reconcile_all(backend, negotiation.local_node_key)
+
+    assert backend.events == []
+
+
+@pytest.mark.asyncio
+async def test_maintenance_guard_is_durable_before_freeze_and_across_reload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    negotiation, frozen = _negotiation(channels=1)
+    _plan_freeze(negotiation, frozen)
+    directory = tmp_path / "maintenance"
+    points = tuple(
+        f"{intent.funding_outpoint.txid}:{intent.funding_outpoint.vout}"
+        for intent in negotiation.freeze_intents
+    )
+    registry = MakerChannelInputRegistry.load(
+        store=_store(tmp_path, negotiation),
+        config=negotiation.config,
+        network=negotiation.network,
+        maintenance_directory=directory,
+    )
+    backend = FakeBackend()
+    for item in frozen:
+        backend.frozen[item.snapshot.channel_id] = item.snapshot
+    original_freeze = backend.freeze_channel_input
+
+    async def freeze(session_id: str, channel_id: str) -> FrozenChannelSnapshot:
+        assert not claim_spend_channels(
+            directory, negotiation.local_node_key, "another-local-operation", points
+        )
+        return await original_freeze(session_id, channel_id)
+
+    monkeypatch.setattr(backend, "freeze_channel_input", freeze)
+    await registry.reconcile_all(backend, negotiation.local_node_key)
+
+    MakerChannelInputRegistry.load(
+        store=registry._store,
+        config=negotiation.config,
+        network=negotiation.network,
+        maintenance_directory=directory,
+    )
+    assert not claim_spend_channels(
+        directory, negotiation.local_node_key, "another-local-operation", points
+    )
 
 
 @pytest.mark.asyncio
@@ -1256,6 +1325,53 @@ def test_expired_canceled_tombstone_is_pruned_and_releases_capacity(
 
     assert registry.session_count == 0
     assert store.load_all().records == ()
+
+
+def test_expired_canceled_tombstone_releases_only_its_owner_before_pruning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    negotiation, proposal = _prepared_negotiation(channels=1)
+    assert negotiation.accept_cancel("coordinator", _cancel(proposal)) is None
+    negotiation.record_canceled((proposal.recipient_terms[0].funding_outpoint,))
+    store = _store(tmp_path, negotiation)
+    directory = tmp_path / "maintenance"
+    points = tuple(
+        f"{intent.funding_outpoint.txid}:{intent.funding_outpoint.vout}"
+        for intent in negotiation.freeze_intents
+    )
+    owner = f"maker:{negotiation.invite.session_id}:{negotiation.invite.attempt}"
+    assert claim_spend_channels(directory, negotiation.local_node_key, owner, points)
+    monkeypatch.setattr("maker.channel_input_runtime.time.time", lambda: 2_000)
+    original_delete = store.delete
+
+    def interrupted_delete(_snapshot: MakerChannelInputSnapshot) -> None:
+        raise RuntimeError("simulated crash before tombstone pruning")
+
+    monkeypatch.setattr(store, "delete", interrupted_delete)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        MakerChannelInputRegistry.load(
+            store=store,
+            config=negotiation.config,
+            network=negotiation.network,
+            maintenance_directory=directory,
+        )
+
+    assert store.load_all().records == (negotiation.snapshot(),)
+    assert claim_spend_channels(
+        directory, negotiation.local_node_key, "other-local-operation", points
+    )
+    monkeypatch.setattr(store, "delete", original_delete)
+
+    registry = MakerChannelInputRegistry.load(
+        store=store,
+        config=negotiation.config,
+        network=negotiation.network,
+        maintenance_directory=directory,
+    )
+
+    assert registry.session_count == 0
+    assert store.load_all().records == ()
+    assert not claim_spend_channels(directory, negotiation.local_node_key, "third-owner", points)
 
 
 @pytest.mark.asyncio

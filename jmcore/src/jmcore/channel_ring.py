@@ -24,6 +24,8 @@ class ChannelRingSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     enabled: bool = False
+    private_coordination: bool = False
+    maintenance_directory: Path | None = None
     lnd_grpc_url: str = ""
     lnd_tls_cert_path: Path | None = None
     lnd_macaroon_path: Path | None = None
@@ -55,6 +57,8 @@ class ChannelRingConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
     enabled: bool = False
+    private_coordination: bool = False
+    maintenance_directory: Path | None = None
     lnd_grpc_url: str = ""
     lnd_tls_cert_path: Path | None = None
     lnd_macaroon_path: Path | None = None
@@ -80,9 +84,17 @@ class ChannelRingConfig(BaseModel):
     persistence_directory: Path | None = None
 
     @classmethod
-    def from_settings(cls, settings: ChannelRingSettings) -> ChannelRingConfig:
+    def from_settings(
+        cls, settings: ChannelRingSettings, *, data_directory: Path | None = None
+    ) -> ChannelRingConfig:
         values = settings.model_dump()
         values["allowed_csv_delays"] = tuple(settings.allowed_csv_delays)
+        if (
+            settings.private_coordination
+            and settings.maintenance_directory is None
+            and data_directory
+        ):
+            values["maintenance_directory"] = data_directory / "channel-maintenance"
         return cls(**values)
 
     @field_validator("lnd_grpc_url")

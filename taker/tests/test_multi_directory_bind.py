@@ -11,6 +11,7 @@ from jmcore.models import Offer, OfferType
 from jmcore.protocol import (
     FEATURE_CHANNEL_INPUT_V1,
     FEATURE_COFUNDED_CHANNEL_RING_V1,
+    FEATURE_COFUNDED_CHANNEL_RING_V2,
     FEATURE_NEUTRINO_COMPAT,
 )
 
@@ -283,6 +284,29 @@ def test_capabilities_are_forwarded_to_directory_and_direct_peer_clients(monkeyp
         FEATURE_NEUTRINO_COMPAT,
         FEATURE_COFUNDED_CHANNEL_RING_V1,
         FEATURE_CHANNEL_INPUT_V1,
+    }
+
+
+def test_private_ring_capability_is_forwarded_to_directory_and_direct_peer_clients(monkeypatch):
+    client = make_directory_client(cofunded_channel_ring_v2=True)
+
+    kwargs = client._build_client_kwargs("directory", 5222)
+    assert kwargs["cofunded_channel_ring_v1"] is False
+    assert kwargs["cofunded_channel_ring_v2"] is True
+    assert client._local_features().features == {FEATURE_COFUNDED_CHANNEL_RING_V2}
+
+    directory = MagicMock()
+    directory._active_peers = {"J5maker": "maker.onion:5222"}
+    client.clients = {"directory": directory}
+    peer = MagicMock()
+    peer.try_to_connect.return_value = None
+    onion_peer = MagicMock(return_value=peer)
+    monkeypatch.setattr("taker.multi_directory.OnionPeer", onion_peer)
+
+    client._try_direct_connect("J5maker")
+
+    assert onion_peer.call_args.kwargs["local_features"].features == {
+        FEATURE_COFUNDED_CHANNEL_RING_V2
     }
 
 

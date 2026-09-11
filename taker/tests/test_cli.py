@@ -4,10 +4,12 @@ Tests for taker CLI module.
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import click
 import pytest
+from jmcore.channel_ring import ChannelRingSettings
 from jmcore.models import NetworkType, OfferType
 from jmcore.nick_auth import NickAuthMode
 from typer.testing import CliRunner
@@ -875,6 +877,34 @@ class TestBuildTakerConfig:
 
         _, kwargs = mock_cls.call_args
         assert kwargs["include_mempool"] is False
+
+    @pytest.mark.parametrize("override", [False, True])
+    @pytest.mark.parametrize("explicit_maintenance_directory", [False, True])
+    def test_private_maintenance_directory_round_trip(
+        self,
+        sample_mnemonic: str,
+        mock_settings: MagicMock,
+        tmp_path: Path,
+        override: bool,
+        explicit_maintenance_directory: bool,
+    ) -> None:
+        mock_settings.get_data_dir.return_value = tmp_path / "settings"
+        maintenance_directory = tmp_path / "node" if explicit_maintenance_directory else None
+        mock_settings.taker.channel_ring = ChannelRingSettings(
+            private_coordination=True, maintenance_directory=maintenance_directory
+        )
+        config = build_taker_config(
+            settings=mock_settings,
+            mnemonic=sample_mnemonic,
+            passphrase="",
+            data_dir=tmp_path / "override" if override else None,
+        )
+        expected_data_dir = tmp_path / ("override" if override else "settings")
+        assert config.data_dir == expected_data_dir
+        assert config.channel_ring.private_coordination is True
+        assert config.channel_ring.maintenance_directory == (
+            maintenance_directory or expected_data_dir / "channel-maintenance"
+        )
 
     def test_data_dir_flows_to_config(self, sample_mnemonic: str, mock_settings: MagicMock) -> None:
         """Verify data_dir from settings flows into TakerConfig.

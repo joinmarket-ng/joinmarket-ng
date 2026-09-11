@@ -201,6 +201,25 @@ def test_parallel_runner_runs_repo_root_tests_separately() -> None:
     assert re.search(r"(?m)^\s+tests/$", unit_runner)
 
 
+def test_parallel_runner_has_an_isolated_private_ring_suite() -> None:
+    script = PARALLEL_TEST_SCRIPT.read_text()
+    ring_runner = script.split("run_suite_ring_e2e()", maxsplit=1)[1].split(
+        "run_suite_tumbler()", maxsplit=1
+    )[0]
+
+    assert "[ring-e2e]=11" in script
+    assert "[ring-e2e-v2]=12" in script
+    assert 'local suite="ring-e2e"' in script
+    assert 'RING_E2E_PRIVATE_COORDINATION="$private_coordination"' in ring_runner
+    assert (
+        'test_filter="test_private_coordination_complete_four_party_ring"'
+        in ring_runner
+    )
+    assert 'test_filter="test_private_coordination_maintenance_triangle"' in ring_runner
+    assert "[ring-e2e-maintenance]=13" in script
+    assert "tests/e2e/test_channel_maintenance_e2e.py" in ring_runner
+
+
 def test_parallel_runner_uses_shared_images() -> None:
     script = PARALLEL_TEST_SCRIPT.read_text()
 

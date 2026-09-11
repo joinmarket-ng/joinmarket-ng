@@ -39,6 +39,7 @@ from jmcore.cofunded_ring import (
     MAX_RING_CIPHERTEXT_BYTES,
     RingCancelPayload,
     RingPlanPayload,
+    RingPrivatePlanPayload,
     decode_ring_message,
     encode_ring_message,
 )
@@ -941,7 +942,9 @@ class MakerSession:
                 f"Rejected invalid or out-of-order !ring from {self.taker_nick} "
                 f"({type(exc).__name__})"
             )
-            if isinstance(payload, RingPlanPayload) and self.ring_participant is not None:
+            if isinstance(payload, (RingPlanPayload, RingPrivatePlanPayload)) and (
+                self.ring_participant is not None
+            ):
                 try:
                     responses = self.ring_participant.reject_plan(payload)
                     self._release_retired_ring_resources(bot)

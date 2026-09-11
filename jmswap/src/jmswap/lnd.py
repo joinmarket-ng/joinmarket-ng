@@ -11,11 +11,11 @@ import re
 import secrets
 import struct
 import time
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
 from enum import IntEnum, StrEnum
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from jmcore.bitcoin import (
     TxOutput,
@@ -48,6 +48,14 @@ _PSBT_MAGIC = b"\x70\x73\x62\x74\xff"
 _PSBT_GLOBAL_UNSIGNED_TX = 0x00
 _PSBT_IN_WITNESS_UTXO = 0x01
 _ONION_CONNECT_ATTEMPT_SECONDS = 125.0
+_MAINTENANCE_RPC_TIMEOUT_SECONDS = 10.0
+_MAX_MAINTENANCE_PAYMENT_TIMEOUT_SECONDS = 60
+_MAX_MAINTENANCE_CLTV_EXPOSURE = 288
+_MAINTENANCE_FINAL_CLTV_PADDING = 3
+_UINT32_MAX = (1 << 32) - 1
+_UINT64_MAX = (1 << 64) - 1
+_INT64_MAX = (1 << 63) - 1
+_MAX_CUSTOM_MESSAGE_PAYLOAD_BYTES = 8192
 
 Hex32 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 NodeId = Annotated[str, StringConstraints(pattern=r"^(02|03)[0-9a-f]{64}$")]
@@ -89,6 +97,75 @@ class LndRpcError(LndError):
 
 class LndEscrowCredentialError(LndError):
     """A ChannelEscrowRPC call was attempted without its dedicated macaroon."""
+
+
+@dataclass(frozen=True)
+class MaintenanceChannel:
+    """One LND channel and both published directional forwarding policies."""
+
+    channel_point: str
+    channel_id: int
+    peer_node_id: str
+    active: bool
+    private: bool
+    local_balance_sat: int
+    remote_balance_sat: int
+    local_reserve_sat: int
+    remote_reserve_sat: int
+    pending_htlc_count: int
+    local_alias: int | None
+    peer_alias: int | None
+    local_base_fee_msat: int
+    local_fee_ppm: int
+    remote_base_fee_msat: int
+    remote_fee_ppm: int
+    local_cltv_delta: int
+    remote_cltv_delta: int
+
+
+@dataclass(frozen=True)
+class PeerRouteHop:
+    """A caller-selected directed private route hint hop."""
+
+    node_id: str
+    channel_id: int
+    base_fee_msat: int
+    fee_ppm: int
+    cltv_delta: int
+
+
+@dataclass(frozen=True)
+class MaintenanceInvoice:
+    """An invoice created with exactly the caller-supplied private route hint."""
+
+    payment_hash: str
+    payment_request: str
+    expires_at: int
+    preimage: str | None = field(default=None, repr=False)
+
+
+@dataclass(frozen=True)
+class MaintenancePayment:
+    """A single observed payment state without retry or enrollment semantics."""
+
+    status: Literal["unknown", "in_flight", "succeeded", "failed"]
+    fee_msat: int | None
+
+
+@dataclass(frozen=True)
+class _MaintenanceExactRoute:
+    """Validated invoice data needed for one exact maintenance route."""
+
+    payment_hash: bytes
+    payment_addr: bytes
+    amount_msat: int
+    helper_peer_node_id: str
+    return_peer_node_id: str
+    helper_channel_alias: int
+    return_channel_alias: int
+    final_expiry: int
+    helper_expiry: int
+    total_time_lock: int
 
 
 class StrictModel(BaseModel):
@@ -280,6 +357,7 @@ class ExternalChannelRequest(StrictModel):
     fundee_csv_delay: Annotated[int, Field(ge=1, le=2016)]
     min_depth: Annotated[int, Field(ge=1, le=144)]
     timeout_seconds: Annotated[float, Field(gt=0, le=300)] = 30.0
+    scid_alias: bool = False
 
     @model_validator(mode="after")
     def validate_amounts(self) -> ExternalChannelRequest:
@@ -434,6 +512,7 @@ class InboundChannelExpectation(StrictModel):
     opener_csv_delay: Annotated[int, Field(ge=1, le=2016)]
     fundee_csv_delay: Annotated[int, Field(ge=1, le=2016)]
     min_depth: Annotated[int, Field(ge=1, le=144)]
+    scid_alias: bool = False
 
     @model_validator(mode="after")
     def validate_policy(self) -> InboundChannelExpectation:
@@ -633,7 +712,7 @@ def evaluate_channel_accept_request(
         (int(request.commitment_type) == FINAL_TAPROOT_COMMITMENT, "commitment type"),
         (int(request.channel_flags) == 0, "private channel flags"),
         (not bool(request.wants_zero_conf), "zero-conf flag"),
-        (not bool(request.wants_scid_alias), "SCID alias flag"),
+        (bool(request.wants_scid_alias) == expected.scid_alias, "SCID alias flag"),
         (int(request.channel_reserve) == expected.fundee_reserve_sat, "fundee reserve"),
         (int(request.csv_delay) == expected.fundee_csv_delay, "fundee CSV policy"),
         (
@@ -707,6 +786,8 @@ class LndBackend:
     _channel: Any = field(default=None, repr=False)
     _escrow_channel: Any = field(default=None, repr=False)
     _stub: Any = field(default=None, repr=False)
+    _router_stub: Any = field(default=None, repr=False)
+    _invoices_stub: Any = field(default=None, repr=False)
     _escrow_stub: Any = field(default=None, repr=False)
     _pending: dict[bytes, _PendingOpen] = field(default_factory=dict, repr=False)
     _seen_pending_ids: set[bytes] = field(default_factory=set, repr=False)
@@ -743,7 +824,7 @@ class LndBackend:
     def _ensure(self) -> None:
         if self._stub is not None:
             return
-        import grpc  # type: ignore[import-untyped]
+        import grpc
 
         from jmswap.lndrpc import lightning_pb2_grpc
 
@@ -760,6 +841,30 @@ class LndBackend:
             self._channel
         )
 
+    def _ensure_router(self) -> None:
+        self._ensure()
+        if self._router_stub is not None:
+            return
+        if self._channel is None:
+            raise LndRpcError("LND RouterRPC requires an authenticated LND channel")
+        from jmswap.lndrpc import router_pb2_grpc
+
+        self._router_stub = router_pb2_grpc.RouterStub(  # type: ignore[no-untyped-call]
+            self._channel
+        )
+
+    def _ensure_invoices(self) -> None:
+        self._ensure()
+        if self._invoices_stub is not None:
+            return
+        if self._channel is None:
+            raise LndRpcError("LND InvoicesRPC requires an authenticated LND channel")
+        from jmswap.lndrpc import invoices_pb2_grpc
+
+        self._invoices_stub = invoices_pb2_grpc.InvoicesStub(  # type: ignore[no-untyped-call]
+            self._channel
+        )
+
     def _ensure_escrow(self) -> None:
         if self._escrow_stub is not None:
             return
@@ -767,7 +872,7 @@ class LndBackend:
             raise LndEscrowCredentialError(
                 "ChannelEscrowRPC requires a dedicated escrow macaroon credential"
             )
-        import grpc  # type: ignore[import-untyped]
+        import grpc
 
         from jmswap.lndrpc import channelescrow_pb2_grpc
 
@@ -801,6 +906,8 @@ class LndBackend:
         self._channel = None
         self._escrow_channel = None
         self._stub = None
+        self._router_stub = None
+        self._invoices_stub = None
         self._escrow_stub = None
 
     @staticmethod
@@ -842,6 +949,272 @@ class LndBackend:
             raise ValueError("timeout_seconds must be positive")
 
     @staticmethod
+    def _validate_maintenance_timeout(timeout_seconds: int) -> None:
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, int)
+            or not 1 <= timeout_seconds <= _MAX_MAINTENANCE_PAYMENT_TIMEOUT_SECONDS
+        ):
+            raise ValueError(
+                f"timeout_seconds must be an integer from 1 to {_MAX_MAINTENANCE_PAYMENT_TIMEOUT_SECONDS}"
+            )
+
+    @staticmethod
+    def _validate_maintenance_uint(
+        name: str, value: int, maximum: int, *, minimum: int = 0
+    ) -> None:
+        if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+            raise ValueError(f"{name} must be an integer from {minimum} to {maximum}")
+
+    @staticmethod
+    def _is_not_found(error: Exception) -> bool:
+        import grpc
+
+        code = getattr(error, "code", None)
+        return callable(code) and code() == grpc.StatusCode.NOT_FOUND
+
+    @staticmethod
+    def _maintenance_payment_from_update(update: Any) -> MaintenancePayment:
+        try:
+            status = int(update.status)
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise LndValidationError("RouterRPC returned an invalid payment update") from exc
+        if status == ln.Payment.SUCCEEDED:
+            fee_msat = int(update.fee_msat)
+            if fee_msat != 0:
+                raise LndValidationError(
+                    f"maintenance payment settled with nonzero fee: {fee_msat} msat"
+                )
+            return MaintenancePayment(status="succeeded", fee_msat=fee_msat)
+        if status == ln.Payment.FAILED:
+            return MaintenancePayment(status="failed", fee_msat=None)
+        if status in (ln.Payment.IN_FLIGHT, ln.Payment.INITIATED):
+            return MaintenancePayment(status="in_flight", fee_msat=None)
+        return MaintenancePayment(status="unknown", fee_msat=None)
+
+    @classmethod
+    def _maintenance_node_id(cls, name: str, value: Any) -> str:
+        if not isinstance(value, str):
+            raise LndValidationError(f"{name} must be a compressed public key")
+        try:
+            return cls._validate_channel_input_peer_filter(value)
+        except ValueError as exc:
+            raise LndValidationError(f"{name} must be a compressed public key") from exc
+
+    @classmethod
+    def _maintenance_exact_route_from_invoice(
+        cls, invoice: Any, local_identity: str, block_height: Any
+    ) -> _MaintenanceExactRoute:
+        """Validate the fixed invoice shape and derive all route locktimes."""
+        try:
+            cls._validate_maintenance_uint("block height", block_height, _UINT32_MAX)
+            destination = cls._maintenance_node_id("invoice destination", invoice.destination)
+            if destination != local_identity:
+                raise LndValidationError("maintenance invoice destination is not this LND node")
+
+            amount_sat = invoice.num_satoshis
+            amount_msat = invoice.num_msat
+            cls._validate_maintenance_uint(
+                "invoice amount in satoshis", amount_sat, _INT64_MAX // 1000, minimum=1
+            )
+            cls._validate_maintenance_uint(
+                "invoice amount in millisatoshis", amount_msat, _INT64_MAX, minimum=1000
+            )
+            if amount_msat != amount_sat * 1000:
+                raise LndValidationError("maintenance invoice amount must be whole satoshis")
+
+            timestamp = invoice.timestamp
+            expiry = invoice.expiry
+            cls._validate_maintenance_uint("invoice timestamp", timestamp, _INT64_MAX, minimum=1)
+            cls._validate_maintenance_uint("invoice expiry", expiry, _INT64_MAX, minimum=1)
+            if timestamp + expiry <= int(time.time()):
+                raise LndValidationError("maintenance invoice has expired")
+
+            payment_hash = bytes.fromhex(str(invoice.payment_hash))
+            if len(payment_hash) != 32 or payment_hash.hex() != str(invoice.payment_hash):
+                raise LndValidationError("maintenance invoice has an invalid payment hash")
+            payment_addr = bytes(invoice.payment_addr)
+            if len(payment_addr) != 32:
+                raise LndValidationError("maintenance invoice has an invalid payment address")
+            if len(invoice.blinded_paths) != 0:
+                raise LndValidationError("maintenance invoice must not contain blinded paths")
+            if len(invoice.route_hints) != 1 or len(invoice.route_hints[0].hop_hints) != 2:
+                raise LndValidationError(
+                    "maintenance invoice must contain exactly one two-hop route hint"
+                )
+
+            helper_hint, return_hint = invoice.route_hints[0].hop_hints
+            helper_peer = cls._maintenance_node_id("maintenance helper peer", helper_hint.node_id)
+            return_peer = cls._maintenance_node_id("maintenance return peer", return_hint.node_id)
+            if len({local_identity, helper_peer, return_peer}) != 3:
+                raise LndValidationError(
+                    "maintenance route peers must be distinct from this LND node"
+                )
+            for label, hint in (("helper", helper_hint), ("return", return_hint)):
+                cls._validate_maintenance_uint(
+                    f"{label} channel alias", hint.chan_id, _UINT64_MAX, minimum=1
+                )
+                cls._validate_maintenance_uint(f"{label} base fee", hint.fee_base_msat, _UINT32_MAX)
+                cls._validate_maintenance_uint(
+                    f"{label} proportional fee", hint.fee_proportional_millionths, _UINT32_MAX
+                )
+                cls._validate_maintenance_uint(
+                    f"{label} CLTV delta",
+                    hint.cltv_expiry_delta,
+                    _MAX_MAINTENANCE_CLTV_EXPOSURE,
+                    minimum=1,
+                )
+                if hint.fee_base_msat != 0 or hint.fee_proportional_millionths != 0:
+                    raise LndValidationError("maintenance route hints must charge zero fees")
+
+            cltv_expiry = invoice.cltv_expiry
+            cls._validate_maintenance_uint(
+                "invoice CLTV expiry",
+                cltv_expiry,
+                _MAX_MAINTENANCE_CLTV_EXPOSURE,
+                minimum=1,
+            )
+            final_expiry = block_height + cltv_expiry + _MAINTENANCE_FINAL_CLTV_PADDING
+            helper_expiry = final_expiry + return_hint.cltv_expiry_delta
+            total_time_lock = helper_expiry + helper_hint.cltv_expiry_delta
+            if total_time_lock - block_height > _MAX_MAINTENANCE_CLTV_EXPOSURE:
+                raise LndValidationError("maintenance route CLTV exposure exceeds 288 blocks")
+            if (
+                final_expiry > _UINT32_MAX
+                or helper_expiry > _UINT32_MAX
+                or total_time_lock > _UINT32_MAX
+            ):
+                raise LndValidationError("maintenance route CLTV height exceeds uint32")
+            return _MaintenanceExactRoute(
+                payment_hash=payment_hash,
+                payment_addr=payment_addr,
+                amount_msat=amount_msat,
+                helper_peer_node_id=helper_peer,
+                return_peer_node_id=return_peer,
+                helper_channel_alias=helper_hint.chan_id,
+                return_channel_alias=return_hint.chan_id,
+                final_expiry=final_expiry,
+                helper_expiry=helper_expiry,
+                total_time_lock=total_time_lock,
+            )
+        except LndValidationError:
+            raise
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise LndValidationError(f"LND returned an invalid maintenance invoice: {exc}") from exc
+
+    @classmethod
+    def _validate_maintenance_route_channels(
+        cls, response: Any, route: _MaintenanceExactRoute, outgoing_channel_id: int
+    ) -> None:
+        """Bind the caller's first hop and invoice return alias to local channels."""
+        try:
+            outgoing: list[tuple[int, str, int, bool, bool]] = []
+            returns: list[tuple[int, str, int, bool, bool]] = []
+            for channel in response.channels:
+                channel_id = channel.chan_id
+                peer_node_id = cls._maintenance_node_id("channel peer", channel.remote_pubkey)
+                peer_alias = channel.peer_scid_alias
+                active = channel.active
+                private = channel.private
+                cls._validate_maintenance_uint("channel ID", channel_id, _UINT64_MAX, minimum=1)
+                cls._validate_maintenance_uint("channel peer alias", peer_alias, _UINT64_MAX)
+                if not isinstance(active, bool) or not isinstance(private, bool):
+                    raise ValueError("channel activity and privacy flags must be booleans")
+                observed = (channel_id, peer_node_id, peer_alias, active, private)
+                if channel_id == outgoing_channel_id:
+                    outgoing.append(observed)
+                if (
+                    peer_node_id == route.return_peer_node_id
+                    and peer_alias == route.return_channel_alias
+                ):
+                    returns.append(observed)
+            if len(outgoing) != 1:
+                raise LndValidationError("outgoing maintenance channel was not uniquely found")
+            if outgoing[0][1] != route.helper_peer_node_id:
+                raise LndValidationError(
+                    "outgoing maintenance channel does not belong to helper peer"
+                )
+            if not outgoing[0][3] or not outgoing[0][4]:
+                raise LndValidationError("outgoing maintenance channel must be active and private")
+            if len(returns) != 1:
+                raise LndValidationError("return maintenance channel was not uniquely found")
+            return_channel = returns[0]
+            if return_channel[0] == outgoing_channel_id:
+                raise LndValidationError(
+                    "return maintenance channel must differ from outgoing channel"
+                )
+            if not return_channel[3] or not return_channel[4]:
+                raise LndValidationError("return maintenance channel must be active and private")
+        except LndValidationError:
+            raise
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise LndValidationError(
+                f"LND returned invalid maintenance channel data: {exc}"
+            ) from exc
+
+    @staticmethod
+    def _maintenance_payment_from_attempt(attempt: Any, payment_hash: bytes) -> MaintenancePayment:
+        try:
+            status = int(attempt.status)
+            if status == ln.HTLCAttempt.SUCCEEDED:
+                if not attempt.HasField("route"):
+                    raise ValueError("successful attempt omitted its route")
+                route = attempt.route
+                if int(route.total_fees_msat) != 0 or int(route.total_fees) != 0:
+                    raise LndValidationError("maintenance payment settled with nonzero route fees")
+                if any(int(hop.fee_msat) != 0 or int(hop.fee) != 0 for hop in route.hops):
+                    raise LndValidationError(
+                        "maintenance payment settled with nonzero route hop fees"
+                    )
+                preimage = bytes(attempt.preimage)
+                if preimage and (
+                    len(preimage) != 32 or hashlib.sha256(preimage).digest() != payment_hash
+                ):
+                    raise LndValidationError("maintenance payment returned an invalid preimage")
+                return MaintenancePayment(status="succeeded", fee_msat=0)
+            if status == ln.HTLCAttempt.FAILED:
+                return MaintenancePayment(status="failed", fee_msat=None)
+            if status == ln.HTLCAttempt.IN_FLIGHT:
+                return MaintenancePayment(status="in_flight", fee_msat=None)
+            raise ValueError(f"unknown HTLC attempt status {status}")
+        except LndValidationError:
+            raise
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise LndValidationError(
+                f"RouterRPC returned an invalid maintenance attempt: {exc}"
+            ) from exc
+
+    @staticmethod
+    def _maintenance_channel_policies(edge: Any, peer_node_id: str) -> tuple[Any, Any] | None:
+        try:
+            node1_is_peer = str(edge.node1_pub) == peer_node_id
+            node2_is_peer = str(edge.node2_pub) == peer_node_id
+            if node1_is_peer == node2_is_peer:
+                return None
+            local_field, remote_field = (
+                ("node2_policy", "node1_policy")
+                if node1_is_peer
+                else ("node1_policy", "node2_policy")
+            )
+            if not edge.HasField(local_field) or not edge.HasField(remote_field):
+                return None
+            return getattr(edge, local_field), getattr(edge, remote_field)
+        except (AttributeError, TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _maintenance_channel_policy_pair(
+        cls, edges: Any, channel_point: str, peer_node_id: str
+    ) -> tuple[Any, Any] | None:
+        for edge in edges:
+            if str(edge.chan_point) != channel_point:
+                continue
+            policies = cls._maintenance_channel_policies(edge, peer_node_id)
+            if policies is not None:
+                return policies
+        return None
+
+    @staticmethod
     def _validate_channel_input_peer_filter(peer_node_pubkey: str) -> str:
         if (
             not isinstance(peer_node_pubkey, str)
@@ -860,7 +1233,7 @@ class LndBackend:
 
     @staticmethod
     def _escrow_error_details(error: Exception) -> str | None:
-        import grpc  # type: ignore[import-untyped]
+        import grpc
 
         status_code = getattr(error, "code", None)
         details = getattr(error, "details", None)
@@ -1495,6 +1868,528 @@ class LndBackend:
             if "already connected" not in str(exc).lower():
                 raise
 
+    async def list_maintenance_channels(self) -> tuple[MaintenanceChannel, ...]:
+        """Return channel observations with both policies, omitting incomplete graph edges."""
+        self._ensure()
+        try:
+            channels = await asyncio.wait_for(
+                self._stub.ListChannels(ln.ListChannelsRequest()), _MAINTENANCE_RPC_TIMEOUT_SECONDS
+            )
+        except TimeoutError as exc:
+            raise LndTimeoutError("ListChannels timed out for maintenance") from exc
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise LndRpcError(f"ListChannels failed for maintenance: {exc}") from exc
+        try:
+            graph = await asyncio.wait_for(
+                self._stub.DescribeGraph(ln.ChannelGraphRequest(include_unannounced=True)),
+                _MAINTENANCE_RPC_TIMEOUT_SECONDS,
+            )
+        except TimeoutError as exc:
+            raise LndTimeoutError("DescribeGraph timed out for maintenance") from exc
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise LndRpcError(f"DescribeGraph failed for maintenance: {exc}") from exc
+
+        observations: list[MaintenanceChannel] = []
+        try:
+            for channel in channels.channels:
+                policy_pair = self._maintenance_channel_policy_pair(
+                    graph.edges, str(channel.channel_point), str(channel.remote_pubkey)
+                )
+                if policy_pair is None:
+                    continue
+                local_policy, remote_policy = policy_pair
+                local_alias = int(channel.alias_scids[0]) if channel.alias_scids else None
+                peer_alias = int(channel.peer_scid_alias) if channel.peer_scid_alias else None
+                observations.append(
+                    MaintenanceChannel(
+                        channel_point=str(channel.channel_point),
+                        channel_id=int(channel.chan_id),
+                        peer_node_id=str(channel.remote_pubkey),
+                        active=bool(channel.active),
+                        private=bool(channel.private),
+                        local_balance_sat=int(channel.local_balance),
+                        remote_balance_sat=int(channel.remote_balance),
+                        local_reserve_sat=int(channel.local_constraints.chan_reserve_sat),
+                        remote_reserve_sat=int(channel.remote_constraints.chan_reserve_sat),
+                        pending_htlc_count=len(channel.pending_htlcs),
+                        local_alias=local_alias,
+                        peer_alias=peer_alias,
+                        local_base_fee_msat=int(local_policy.fee_base_msat),
+                        local_fee_ppm=int(local_policy.fee_rate_milli_msat),
+                        remote_base_fee_msat=int(remote_policy.fee_base_msat),
+                        remote_fee_ppm=int(remote_policy.fee_rate_milli_msat),
+                        local_cltv_delta=int(local_policy.time_lock_delta),
+                        remote_cltv_delta=int(remote_policy.time_lock_delta),
+                    )
+                )
+            return tuple(observations)
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise LndValidationError(
+                f"LND returned invalid maintenance channel data: {exc}"
+            ) from exc
+
+    async def send_peer_message(self, peer_node_id: str, message_type: int, payload: bytes) -> None:
+        """Send one bounded unknown-odd custom message to an authenticated peer."""
+        peer = self._validate_channel_input_peer_filter(peer_node_id)
+        self._validate_maintenance_uint("message_type", message_type, 0xFFFFFFFF, minimum=32768)
+        if message_type % 2 != 1:
+            raise ValueError("message_type must be an odd custom message type")
+        if not isinstance(payload, bytes) or len(payload) > _MAX_CUSTOM_MESSAGE_PAYLOAD_BYTES:
+            raise ValueError(
+                f"payload must be bytes no longer than {_MAX_CUSTOM_MESSAGE_PAYLOAD_BYTES} bytes"
+            )
+        self._ensure()
+        request = ln.SendCustomMessageRequest(
+            peer=bytes.fromhex(peer), type=message_type, data=payload
+        )
+        try:
+            await asyncio.wait_for(
+                self._stub.SendCustomMessage(request), _MAINTENANCE_RPC_TIMEOUT_SECONDS
+            )
+        except TimeoutError as exc:
+            raise LndTimeoutError("SendCustomMessage timed out") from exc
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise LndRpcError(f"SendCustomMessage failed: {exc}") from exc
+
+    async def subscribe_peer_messages(self, message_type: int) -> AsyncIterator[tuple[str, bytes]]:
+        """Yield bounded messages of one custom type with LND-attested peer identities."""
+        self._validate_maintenance_uint("message_type", message_type, 0xFFFFFFFF, minimum=32768)
+        if message_type % 2 != 1:
+            raise ValueError("message_type must be an odd custom message type")
+        self._ensure()
+        stream: Any = None
+        try:
+            stream = self._stub.SubscribeCustomMessages(ln.SubscribeCustomMessagesRequest())
+            async for message in stream:
+                if int(message.type) != message_type:
+                    continue
+                payload = bytes(message.data)
+                if len(payload) > _MAX_CUSTOM_MESSAGE_PAYLOAD_BYTES:
+                    continue
+                peer = bytes(message.peer)
+                if len(peer) != 33 or peer[0] not in (0x02, 0x03):
+                    continue
+                yield peer.hex(), payload
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise LndRpcError(f"SubscribeCustomMessages failed: {exc}") from exc
+        finally:
+            if stream is not None:
+                with contextlib.suppress(Exception):
+                    stream.cancel()
+
+    async def create_maintenance_invoice(
+        self, amount_sat: int, hops: Sequence[PeerRouteHop], expiry_seconds: int
+    ) -> MaintenanceInvoice:
+        """Create a hold invoice with one exact private route hint supplied by the caller."""
+        self._validate_maintenance_uint("amount_sat", amount_sat, (1 << 63) - 1, minimum=1)
+        self._validate_maintenance_uint("expiry_seconds", expiry_seconds, (1 << 63) - 1, minimum=1)
+        if isinstance(hops, (str, bytes)) or not isinstance(hops, Sequence) or not hops:
+            raise ValueError("hops must be a non-empty sequence of PeerRouteHop values")
+
+        hint_hops: list[Any] = []
+        for hop in hops:
+            if not isinstance(hop, PeerRouteHop):
+                raise ValueError("hops must contain only PeerRouteHop values")
+            node_id = self._validate_channel_input_peer_filter(hop.node_id)
+            self._validate_maintenance_uint(
+                "hop.channel_id", hop.channel_id, (1 << 64) - 1, minimum=1
+            )
+            self._validate_maintenance_uint("hop.base_fee_msat", hop.base_fee_msat, 0xFFFFFFFF)
+            self._validate_maintenance_uint("hop.fee_ppm", hop.fee_ppm, 0xFFFFFFFF)
+            self._validate_maintenance_uint("hop.cltv_delta", hop.cltv_delta, 0xFFFFFFFF, minimum=1)
+            hint_hops.append(
+                ln.HopHint(
+                    node_id=node_id,
+                    chan_id=hop.channel_id,
+                    fee_base_msat=hop.base_fee_msat,
+                    fee_proportional_millionths=hop.fee_ppm,
+                    cltv_expiry_delta=hop.cltv_delta,
+                )
+            )
+
+        self._ensure_invoices()
+        from jmswap.lndrpc import invoices_pb2 as invoices
+
+        created_at = int(time.time())
+        preimage = secrets.token_bytes(32)
+        payment_hash = hashlib.sha256(preimage).digest()
+        request = invoices.AddHoldInvoiceRequest(
+            hash=payment_hash,
+            value=amount_sat,
+            expiry=expiry_seconds,
+            private=False,
+            route_hints=[ln.RouteHint(hop_hints=hint_hops)],
+        )
+        try:
+            response = await asyncio.wait_for(
+                self._invoices_stub.AddHoldInvoice(request), _MAINTENANCE_RPC_TIMEOUT_SECONDS
+            )
+        except TimeoutError as exc:
+            raise LndTimeoutError("AddHoldInvoice timed out") from exc
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise LndRpcError(f"AddHoldInvoice failed: {exc}") from exc
+        try:
+            payment_request = str(response.payment_request)
+            if not payment_request:
+                raise ValueError("missing payment request")
+            return MaintenanceInvoice(
+                payment_hash=payment_hash.hex(),
+                payment_request=payment_request,
+                expires_at=created_at + expiry_seconds,
+                preimage=preimage.hex(),
+            )
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise LndValidationError(
+                f"AddHoldInvoice returned invalid maintenance invoice: {exc}"
+            ) from exc
+
+    @classmethod
+    def _validate_maintenance_invoice_settlement(
+        cls,
+        invoice: Any,
+        payment_hash: bytes,
+        return_channel_id: int,
+        amount_sat: int,
+        expected_htlc_state: int,
+    ) -> None:
+        """Bind a terminal or accepted hold invoice to one expected incoming HTLC."""
+        expected_amount_msat = amount_sat * 1000
+        try:
+            observed_hash = bytes(invoice.r_hash)
+            if len(observed_hash) != 32 or observed_hash != payment_hash:
+                raise LndValidationError(
+                    "maintenance invoice payment hash differs from the request"
+                )
+            for name, observed, expected in (
+                ("maintenance invoice value", invoice.value, amount_sat),
+                ("maintenance invoice value_msat", invoice.value_msat, expected_amount_msat),
+                (
+                    "maintenance invoice paid amount",
+                    invoice.amt_paid_msat,
+                    expected_amount_msat,
+                ),
+            ):
+                cls._validate_maintenance_uint(name, observed, _INT64_MAX, minimum=1)
+                if observed != expected:
+                    raise LndValidationError(f"{name} differs from the expected maintenance amount")
+
+            non_canceled_htlcs: list[tuple[Any, int]] = []
+            for htlc in invoice.htlcs:
+                htlc_state = int(htlc.state)
+                if htlc_state != ln.CANCELED:
+                    non_canceled_htlcs.append((htlc, htlc_state))
+            if len(non_canceled_htlcs) != 1:
+                raise LndValidationError(
+                    "maintenance invoice must contain exactly one non-canceled HTLC"
+                )
+            htlc, htlc_state = non_canceled_htlcs[0]
+            if htlc_state != expected_htlc_state:
+                raise LndValidationError("maintenance invoice HTLC has an unexpected state")
+            cls._validate_maintenance_uint(
+                "maintenance invoice HTLC channel ID", htlc.chan_id, _UINT64_MAX, minimum=1
+            )
+            cls._validate_maintenance_uint(
+                "maintenance invoice HTLC amount", htlc.amt_msat, _INT64_MAX, minimum=1
+            )
+            if htlc.chan_id != return_channel_id:
+                raise LndValidationError("maintenance invoice HTLC arrived on the wrong channel")
+            if htlc.amt_msat != expected_amount_msat:
+                raise LndValidationError("maintenance invoice HTLC amount differs from the request")
+        except LndValidationError:
+            raise
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise LndValidationError(f"LND returned an invalid maintenance invoice: {exc}") from exc
+
+    async def reconcile_maintenance_invoice(
+        self, payment_hash: str, preimage: str, return_channel_id: int, amount_sat: int
+    ) -> None:
+        """Settle an accepted hold invoice only after binding its incoming HTLC."""
+        if not isinstance(payment_hash, str) or re.fullmatch(r"[0-9a-f]{64}", payment_hash) is None:
+            raise ValueError("payment_hash must be a lowercase 32-byte hexadecimal value")
+        if not isinstance(preimage, str) or re.fullmatch(r"[0-9a-f]{64}", preimage) is None:
+            raise ValueError("preimage must be a lowercase 32-byte hexadecimal value")
+        self._validate_maintenance_uint(
+            "return_channel_id", return_channel_id, _UINT64_MAX, minimum=1
+        )
+        self._validate_maintenance_uint("amount_sat", amount_sat, _INT64_MAX // 1000, minimum=1)
+        payment_hash_bytes = bytes.fromhex(payment_hash)
+        preimage_bytes = bytes.fromhex(preimage)
+        if hashlib.sha256(preimage_bytes).digest() != payment_hash_bytes:
+            raise ValueError("preimage does not match payment_hash")
+
+        self._ensure_invoices()
+        from jmswap.lndrpc import invoices_pb2 as invoices
+
+        try:
+            invoice = await asyncio.wait_for(
+                self._stub.LookupInvoice(ln.PaymentHash(r_hash=payment_hash_bytes)),
+                _MAINTENANCE_RPC_TIMEOUT_SECONDS,
+            )
+        except TimeoutError as exc:
+            raise LndTimeoutError("LookupInvoice timed out for maintenance") from exc
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise LndRpcError(f"LookupInvoice failed for maintenance: {exc}") from exc
+
+        try:
+            state = int(invoice.state)
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise LndValidationError(f"LND returned an invalid maintenance invoice: {exc}") from exc
+        if state in (ln.Invoice.OPEN, ln.Invoice.CANCELED):
+            return
+        if state == ln.Invoice.ACCEPTED:
+            try:
+                self._validate_maintenance_invoice_settlement(
+                    invoice,
+                    payment_hash_bytes,
+                    return_channel_id,
+                    amount_sat,
+                    ln.ACCEPTED,
+                )
+            except LndValidationError:
+                try:
+                    await asyncio.wait_for(
+                        self._invoices_stub.CancelInvoice(
+                            invoices.CancelInvoiceMsg(payment_hash=payment_hash_bytes)
+                        ),
+                        _MAINTENANCE_RPC_TIMEOUT_SECONDS,
+                    )
+                except TimeoutError as exc:
+                    raise LndTimeoutError("CancelInvoice timed out for maintenance") from exc
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    raise LndRpcError(f"CancelInvoice failed for maintenance: {exc}") from exc
+                return
+            try:
+                await asyncio.wait_for(
+                    self._invoices_stub.SettleInvoice(
+                        invoices.SettleInvoiceMsg(preimage=preimage_bytes)
+                    ),
+                    _MAINTENANCE_RPC_TIMEOUT_SECONDS,
+                )
+            except TimeoutError as exc:
+                raise LndTimeoutError("SettleInvoice timed out for maintenance") from exc
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                raise LndRpcError(f"SettleInvoice failed for maintenance: {exc}") from exc
+            return
+        if state == ln.Invoice.SETTLED:
+            self._validate_maintenance_invoice_settlement(
+                invoice,
+                payment_hash_bytes,
+                return_channel_id,
+                amount_sat,
+                ln.SETTLED,
+            )
+            return
+        raise LndValidationError(f"maintenance invoice has unknown state {state}")
+
+    async def send_maintenance_payment(
+        self, payment_request: str, outgoing_channel_id: int, timeout_seconds: int
+    ) -> MaintenancePayment:
+        """Attempt one validated zero-fee self-payment over one exact route."""
+        if not isinstance(payment_request, str) or not payment_request:
+            raise ValueError("payment_request must be a non-empty string")
+        self._validate_maintenance_uint(
+            "outgoing_channel_id", outgoing_channel_id, _UINT64_MAX, minimum=1
+        )
+        self._validate_maintenance_timeout(timeout_seconds)
+        self._ensure()
+        try:
+            invoice = await asyncio.wait_for(
+                self._stub.DecodePayReq(ln.PayReqString(pay_req=payment_request)),
+                _MAINTENANCE_RPC_TIMEOUT_SECONDS,
+            )
+            info = await asyncio.wait_for(
+                self._stub.GetInfo(ln.GetInfoRequest()), _MAINTENANCE_RPC_TIMEOUT_SECONDS
+            )
+        except TimeoutError as exc:
+            raise LndTimeoutError("maintenance invoice validation timed out") from exc
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise LndRpcError(f"maintenance invoice validation failed: {exc}") from exc
+
+        local_identity = self._maintenance_node_id(
+            "LND identity", getattr(info, "identity_pubkey", None)
+        )
+        route = self._maintenance_exact_route_from_invoice(
+            invoice, local_identity, getattr(info, "block_height", None)
+        )
+        try:
+            channels = await asyncio.wait_for(
+                self._stub.ListChannels(ln.ListChannelsRequest()), _MAINTENANCE_RPC_TIMEOUT_SECONDS
+            )
+        except TimeoutError as exc:
+            raise LndTimeoutError("ListChannels timed out for maintenance payment") from exc
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise LndRpcError(f"ListChannels failed for maintenance payment: {exc}") from exc
+        self._validate_maintenance_route_channels(channels, route, outgoing_channel_id)
+
+        self._ensure_router()
+        from jmswap.lndrpc import router_pb2 as router
+
+        exact_route = ln.Route(
+            total_time_lock=route.total_time_lock,
+            total_fees_msat=0,
+            total_amt_msat=route.amount_msat,
+            first_hop_amount_msat=route.amount_msat,
+            hops=[
+                ln.Hop(
+                    chan_id=outgoing_channel_id,
+                    pub_key=route.helper_peer_node_id,
+                    amt_to_forward_msat=route.amount_msat,
+                    fee_msat=0,
+                    expiry=route.helper_expiry,
+                ),
+                ln.Hop(
+                    chan_id=route.helper_channel_alias,
+                    pub_key=route.return_peer_node_id,
+                    amt_to_forward_msat=route.amount_msat,
+                    fee_msat=0,
+                    expiry=route.final_expiry,
+                ),
+                ln.Hop(
+                    chan_id=route.return_channel_alias,
+                    pub_key=local_identity,
+                    amt_to_forward_msat=route.amount_msat,
+                    fee_msat=0,
+                    expiry=route.final_expiry,
+                    mpp_record=ln.MPPRecord(
+                        payment_addr=route.payment_addr, total_amt_msat=route.amount_msat
+                    ),
+                ),
+            ],
+        )
+        try:
+            attempt = await asyncio.wait_for(
+                self._router_stub.SendToRouteV2(
+                    router.SendToRouteRequest(
+                        payment_hash=route.payment_hash, route=exact_route, skip_temp_err=False
+                    )
+                ),
+                timeout_seconds,
+            )
+            return self._maintenance_payment_from_attempt(attempt, route.payment_hash)
+        except TimeoutError:
+            return MaintenancePayment(status="in_flight", fee_msat=None)
+        except asyncio.CancelledError:
+            raise
+        except LndError:
+            raise
+        except Exception as exc:
+            raise LndRpcError(f"RouterRPC SendToRouteV2 failed: {exc}") from exc
+
+    async def track_maintenance_payment(
+        self, payment_hash: str, timeout_seconds: int = 5
+    ) -> MaintenancePayment:
+        """Observe one existing payment without sending another attempt."""
+        if not isinstance(payment_hash, str) or re.fullmatch(r"[0-9a-f]{64}", payment_hash) is None:
+            raise ValueError("payment_hash must be a lowercase 32-byte hexadecimal value")
+        self._validate_maintenance_timeout(timeout_seconds)
+        self._ensure_router()
+        from jmswap.lndrpc import router_pb2 as router
+
+        stream: Any = None
+        try:
+            stream = self._router_stub.TrackPaymentV2(
+                router.TrackPaymentRequest(
+                    payment_hash=bytes.fromhex(payment_hash), no_inflight_updates=False
+                )
+            )
+            update = await asyncio.wait_for(stream.read(), timeout_seconds)
+            return self._maintenance_payment_from_update(update)
+        except TimeoutError:
+            return MaintenancePayment(status="in_flight", fee_msat=None)
+        except asyncio.CancelledError:
+            raise
+        except LndError:
+            raise
+        except Exception as exc:
+            if self._is_not_found(exc):
+                return MaintenancePayment(status="unknown", fee_msat=None)
+            raise LndRpcError(f"RouterRPC TrackPaymentV2 failed: {exc}") from exc
+        finally:
+            if stream is not None:
+                with contextlib.suppress(Exception):
+                    stream.cancel()
+
+    async def set_private_channel_zero_fee(self, channel_point: str) -> None:
+        """Set a private channel's local forwarding fee to zero without changing its CLTV."""
+        point = self._parse_escrow_outpoint(channel_point)
+        self._ensure()
+        try:
+            channels = await asyncio.wait_for(
+                self._stub.ListChannels(ln.ListChannelsRequest()), _MAINTENANCE_RPC_TIMEOUT_SECONDS
+            )
+        except TimeoutError as exc:
+            raise LndTimeoutError("ListChannels timed out for channel policy update") from exc
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise LndRpcError(f"ListChannels failed for channel policy update: {exc}") from exc
+        channel = next(
+            (item for item in channels.channels if str(item.channel_point) == channel_point), None
+        )
+        if channel is None:
+            raise LndValidationError(f"private maintenance channel not found: {channel_point}")
+        if not bool(channel.private):
+            raise LndValidationError("refusing to change forwarding policy on a public channel")
+
+        try:
+            graph = await asyncio.wait_for(
+                self._stub.DescribeGraph(ln.ChannelGraphRequest(include_unannounced=True)),
+                _MAINTENANCE_RPC_TIMEOUT_SECONDS,
+            )
+        except TimeoutError as exc:
+            raise LndTimeoutError("DescribeGraph timed out for channel policy update") from exc
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise LndRpcError(f"DescribeGraph failed for channel policy update: {exc}") from exc
+        policy_pair = self._maintenance_channel_policy_pair(
+            graph.edges, channel_point, str(channel.remote_pubkey)
+        )
+        if policy_pair is None:
+            raise LndValidationError("private maintenance channel lacks a local routing policy")
+        local_policy = policy_pair[0]
+
+        request = ln.PolicyUpdateRequest(
+            chan_point=ln.ChannelPoint(funding_txid_str=point.txid, output_index=point.vout),
+            base_fee_msat=0,
+            fee_rate_ppm=0,
+            time_lock_delta=int(local_policy.time_lock_delta),
+        )
+        try:
+            response = await asyncio.wait_for(
+                self._stub.UpdateChannelPolicy(request), _MAINTENANCE_RPC_TIMEOUT_SECONDS
+            )
+        except TimeoutError as exc:
+            raise LndTimeoutError("UpdateChannelPolicy timed out") from exc
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise LndRpcError(f"UpdateChannelPolicy failed: {exc}") from exc
+        if response.failed_updates:
+            raise LndRpcError(
+                f"UpdateChannelPolicy failed: {response.failed_updates[0].update_error}"
+            )
+
     async def start_external_channel(self, request: ExternalChannelRequest) -> FundingNegotiation:
         """Negotiate one externally funded channel, reporting failures as backend errors.
 
@@ -1539,7 +2434,7 @@ class LndBackend:
             private=True,
             commitment_type=ln.TAPROOT,
             zero_conf=False,
-            scid_alias=False,
+            scid_alias=request.scid_alias,
             remote_csv_delay=request.fundee_csv_delay,
             max_local_csv=request.opener_csv_delay,
             remote_chan_reserve_sat=request.fundee_reserve_sat,

@@ -431,7 +431,9 @@ def build_maker_config(
         orderbook_violation_warning_threshold=settings.maker.orderbook_violation_warning_threshold,
         orderbook_violation_severe_threshold=settings.maker.orderbook_violation_severe_threshold,
         orderbook_ban_duration=settings.maker.orderbook_ban_duration,
-        channel_ring=ChannelRingConfig.from_settings(settings.maker.channel_ring),
+        channel_ring=ChannelRingConfig.from_settings(
+            settings.maker.channel_ring, data_directory=effective_data_dir
+        ),
         channel_input=ChannelInputConfig.from_settings(settings.maker.channel_input),
     )
 
