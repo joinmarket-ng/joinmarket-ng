@@ -987,7 +987,10 @@ class CoinJoinSession:
         )
         total_output = sum(output.value for output in tx.outputs)
         fee = total_input - total_output
-        foreign_prevouts = dict(zip(foreign_inputs, foreign_utxos, strict=True))
+        foreign_prevouts = {
+            outpoint: utxo
+            for outpoint, (utxo, _) in zip(foreign_inputs, lookup_results, strict=True)
+        }
         input_scripts: list[str | bytes] = []
         missing_local_script = False
         for tx_input in tx.inputs:

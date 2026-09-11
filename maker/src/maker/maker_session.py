@@ -619,6 +619,33 @@ class MakerSession:
             logger.error("Failed to handle !auth")
             logger.bind(sensitive=True).error(f"Failed to handle !auth: {e}")
 
+    def _decrypt_transaction(self, encrypted_data: str) -> str | None:
+        """Decrypt and decode a size-bounded transaction payload."""
+        try:
+            decrypted = self.crypto.decrypt(encrypted_data)
+            logger.debug(f"Decrypted tx message length: {len(decrypted)}")
+        except Exception as e:
+            logger.error(f"Failed to decrypt tx message: {e}")
+            return None
+
+        try:
+            if len(decrypted) > MAX_UNSIGNED_TRANSACTION_B64_SIZE:
+                logger.warning("Encoded transaction exceeds maximum size")
+                return None
+            tx_bytes = base64.b64decode(decrypted, validate=True)
+            if len(tx_bytes) > MAX_UNSIGNED_TRANSACTION_SIZE:
+                logger.warning("Decoded transaction exceeds maximum size")
+                return None
+            tx_hex = tx_bytes.hex()
+            logger.bind(sensitive=True).debug(
+                f"Decoded transaction hex ({len(tx_bytes)} bytes): {tx_hex}"
+            )
+            return tx_hex
+        except Exception as e:
+            logger.error("Failed to decode transaction")
+            logger.bind(sensitive=True).error(f"Failed to decode transaction: {e}")
+            return None
+
     async def on_tx(self, bot: MakerBotProtocol, msg: str, source: str) -> None:
         """Process a decrypted !tx message and emit !sig signatures.
 
@@ -661,28 +688,8 @@ class MakerSession:
                 logger.error("Encryption not set up for this session")
                 return
 
-            try:
-                decrypted = self.crypto.decrypt(encrypted_data)
-                logger.debug(f"Decrypted tx message length: {len(decrypted)}")
-            except Exception as e:
-                logger.error(f"Failed to decrypt tx message: {e}")
-                return
-
-            try:
-                if len(decrypted) > MAX_UNSIGNED_TRANSACTION_B64_SIZE:
-                    logger.warning("Encoded transaction exceeds maximum size")
-                    return
-                tx_bytes = base64.b64decode(decrypted, validate=True)
-                if len(tx_bytes) > MAX_UNSIGNED_TRANSACTION_SIZE:
-                    logger.warning("Decoded transaction exceeds maximum size")
-                    return
-                tx_hex = tx_bytes.hex()
-                logger.bind(sensitive=True).debug(
-                    f"Decoded transaction hex ({len(tx_bytes)} bytes): {tx_hex}"
-                )
-            except Exception as e:
-                logger.error("Failed to decode transaction")
-                logger.bind(sensitive=True).error(f"Failed to decode transaction: {e}")
+            tx_hex = self._decrypt_transaction(encrypted_data)
+            if tx_hex is None:
                 return
 
             if self.channel_input_key is not None:

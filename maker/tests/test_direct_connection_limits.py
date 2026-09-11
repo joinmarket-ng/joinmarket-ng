@@ -229,10 +229,18 @@ async def test_verified_private_messages_continue_after_unauthenticated_deadline
     peer = NickIdentity(JM_VERSION)
     connection = _connection()
     connection.is_connected.side_effect = [True, True, True, False]
+    signed_payload = peer.sign_message("payload", ONION_HOSTID)
     messages = [
         _handshake(peer.nick),
-        _signed_message(peer, bot.nick, "fill", "payload"),
-        _signed_message(peer, bot.nick, "auth", "payload"),
+        *[
+            json.dumps(
+                {
+                    "type": MessageType.PRIVMSG.value,
+                    "line": f"{peer.nick}!{bot.nick}!{command} {signed_payload}",
+                }
+            ).encode()
+            for command in ("fill", "auth")
+        ],
     ]
     elapsed = [10.0, 20.0, 31.0]
 
@@ -253,9 +261,9 @@ async def test_verified_private_messages_continue_after_unauthenticated_deadline
     await bot._on_direct_connection(connection, "verified:1")
 
     bot._handle_fill.assert_awaited_once_with(
-        peer.nick, "fill payload", source="direct", generation_id=0
+        peer.nick, f"fill {signed_payload}", source="direct", generation_id=0
     )
     bot._handle_auth.assert_awaited_once_with(
-        peer.nick, "auth payload", source="direct", generation_id=0
+        peer.nick, f"auth {signed_payload}", source="direct", generation_id=0
     )
     connection.close.assert_awaited_once_with()
