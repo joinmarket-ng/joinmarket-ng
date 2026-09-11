@@ -234,6 +234,9 @@ def _run_refresh(
     data_dir = tmp_path / "data"
     venv_dir = tmp_path / "venv"
     data_dir.mkdir(exist_ok=True)
+    saved_installer = data_dir / "install.sh"
+    if not saved_installer.exists():
+        saved_installer.write_text(f'DEFAULT_VERSION="{parent_version}"\n')
     _write_mock_curl(bin_dir)
 
     script = f"""\
@@ -717,6 +720,137 @@ def test_authenticated_child_does_not_refresh_again_and_preserves_context(
     }
 
 
+def test_newer_bootstrap_hands_off_to_signed_stable_installer(
+    tmp_path: Path, signing_keys: tuple[SigningKey, SigningKey, SigningKey]
+) -> None:
+    trusted_keys = signing_keys[:2]
+    data_dir = tmp_path / "data"
+    venv_dir = tmp_path / "venv"
+    bootstrap = tmp_path / "bootstrap-install.sh"
+    bootstrap.write_text(_instrumented_lifecycle_candidate(trusted_keys, "1.2.4"))
+    stable_candidate = _instrumented_lifecycle_candidate(trusted_keys, "1.2.3")
+    release = _create_release_fixture(tmp_path, trusted_keys, stable_candidate)
+    _sign_with_trusted_quorum(release, trusted_keys)
+
+    result = _run_lifecycle_installer(
+        tmp_path,
+        bootstrap,
+        release,
+        data_dir=data_dir,
+        venv_dir=venv_dir,
+        latest_version="v1.2.3",
+        args=("--yes", "--maker", "--skip-tor"),
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Refusing to replace installer" not in result.stdout
+    assert stable_candidate == (data_dir / "install.sh").read_text()
+
+
+def test_bootstrap_respects_existing_saved_installer_rollback_baseline(
+    tmp_path: Path, signing_keys: tuple[SigningKey, SigningKey, SigningKey]
+) -> None:
+    trusted_keys = signing_keys[:2]
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    saved_copy = data_dir / "install.sh"
+    saved_source = _instrumented_lifecycle_candidate(trusted_keys, "1.2.4")
+    saved_copy.write_text(saved_source)
+    bootstrap = tmp_path / "bootstrap-install.sh"
+    bootstrap.write_text(_instrumented_lifecycle_candidate(trusted_keys, "1.2.5"))
+    release = _create_release_fixture(
+        tmp_path,
+        trusted_keys,
+        _instrumented_lifecycle_candidate(trusted_keys, "1.2.3"),
+    )
+    _sign_with_trusted_quorum(release, trusted_keys)
+
+    result = _run_lifecycle_installer(
+        tmp_path,
+        bootstrap,
+        release,
+        data_dir=data_dir,
+        venv_dir=tmp_path / "venv",
+        latest_version="v1.2.3",
+        args=("--yes", "--update", "--maker", "--skip-tor"),
+    )
+
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "An authenticated local updater already exists" in result.stdout
+    assert f'bash "{saved_copy}" --update' in result.stdout
+    assert (
+        "Refusing to replace installer 1.2.4 with older installer v1.2.3"
+        in result.stdout
+    )
+    assert saved_copy.read_text() == saved_source
+
+
+def test_bootstrap_fails_closed_for_invalid_saved_installer_version(
+    tmp_path: Path, signing_keys: tuple[SigningKey, SigningKey, SigningKey]
+) -> None:
+    trusted_keys = signing_keys[:2]
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    saved_copy = data_dir / "install.sh"
+    saved_copy.write_text("saved installer without version metadata\n")
+    bootstrap = tmp_path / "bootstrap-install.sh"
+    bootstrap.write_text(_instrumented_lifecycle_candidate(trusted_keys, "1.2.4"))
+    release = _create_release_fixture(
+        tmp_path,
+        trusted_keys,
+        _instrumented_lifecycle_candidate(trusted_keys, "1.2.3"),
+    )
+    _sign_with_trusted_quorum(release, trusted_keys)
+
+    result = _run_lifecycle_installer(
+        tmp_path,
+        bootstrap,
+        release,
+        data_dir=data_dir,
+        venv_dir=tmp_path / "venv",
+        latest_version="v1.2.3",
+        args=("--yes", "--update", "--maker", "--skip-tor"),
+    )
+
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "Saved trusted installer has invalid version metadata" in result.stdout
+    assert saved_copy.read_text() == "saved installer without version metadata\n"
+
+
+def test_saved_trusted_installer_still_rejects_signed_downgrade(
+    tmp_path: Path, signing_keys: tuple[SigningKey, SigningKey, SigningKey]
+) -> None:
+    trusted_keys = signing_keys[:2]
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    saved_copy = data_dir / "install.sh"
+    saved_source = _instrumented_lifecycle_candidate(trusted_keys, "1.2.4")
+    saved_copy.write_text(saved_source)
+    release = _create_release_fixture(
+        tmp_path,
+        trusted_keys,
+        _instrumented_lifecycle_candidate(trusted_keys, "1.2.3"),
+    )
+    _sign_with_trusted_quorum(release, trusted_keys)
+
+    result = _run_lifecycle_installer(
+        tmp_path,
+        saved_copy,
+        release,
+        data_dir=data_dir,
+        venv_dir=tmp_path / "venv",
+        latest_version="v1.2.3",
+        args=("--yes", "--update", "--maker", "--skip-tor"),
+    )
+
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert (
+        "Refusing to replace installer 1.2.4 with older installer v1.2.3"
+        in result.stdout
+    )
+    assert saved_copy.read_text() == saved_source
+
+
 @pytest.mark.parametrize("legacy_venv", [False, True], ids=["fresh", "legacy-update"])
 def test_trusted_copy_lifecycle_persists_and_refreshes_again(
     tmp_path: Path,
@@ -754,6 +888,7 @@ def test_trusted_copy_lifecycle_persists_and_refreshes_again(
     assert first.returncode == 0, first.stdout + first.stderr
     assert first.stdout.count("Authenticating the current installer") == 1
     assert first.stdout.count("Trusted installer saved") == 1
+    assert "An authenticated local updater already exists" not in first.stdout
     assert first_candidate == saved_copy.read_text()
     assert config.read_text() == "config-sentinel = 'preserve me'\n"
     assert venv_dir.is_dir()
@@ -784,6 +919,7 @@ def test_trusted_copy_lifecycle_persists_and_refreshes_again(
     assert second.returncode == 0, second.stdout + second.stderr
     assert second.stdout.count("Authenticating the current installer") == 1
     assert second.stdout.count("Trusted installer saved") == 1
+    assert "An authenticated local updater already exists" not in second.stdout
     assert second_candidate == saved_copy.read_text()
     assert config.read_text() == "config-sentinel = 'preserve me'\n"
     assert "lifecycle-mode=update" in second.stdout
@@ -798,9 +934,10 @@ def test_authenticated_candidate_failure_preserves_existing_saved_copy(
     data_dir = tmp_path / "data"
     data_dir.mkdir()
     old_copy = data_dir / "install.sh"
-    old_copy.write_text("known trusted installer\n")
+    old_source = _instrumented_lifecycle_candidate(trusted_keys, "1.2.3")
+    old_copy.write_text(old_source)
     bootstrap = tmp_path / "bootstrap-install.sh"
-    bootstrap.write_text(_instrumented_lifecycle_candidate(trusted_keys, "1.2.3"))
+    bootstrap.write_text(old_source)
     failed_candidate = _instrumented_lifecycle_candidate(
         trusted_keys, "1.2.3", fail_packages=True
     )
@@ -820,7 +957,7 @@ def test_authenticated_candidate_failure_preserves_existing_saved_copy(
     assert result.returncode != 0, result.stdout + result.stderr
     assert result.stdout.count("Installer signature from") == 2
     assert "Trusted installer saved" not in result.stdout
-    assert old_copy.read_text() == "known trusted installer\n"
+    assert old_copy.read_text() == old_source
     assert list(data_dir.glob(".install.sh.*")) == []
 
 
@@ -834,9 +971,10 @@ def test_authenticated_persistence_failure_preserves_existing_saved_copy(
     data_dir = tmp_path / "data"
     data_dir.mkdir()
     old_copy = data_dir / "install.sh"
-    old_copy.write_text("known trusted installer\n")
+    old_source = _instrumented_lifecycle_candidate(trusted_keys, "1.2.3")
+    old_copy.write_text(old_source)
     bootstrap = tmp_path / "bootstrap-install.sh"
-    bootstrap.write_text(_instrumented_lifecycle_candidate(trusted_keys, "1.2.3"))
+    bootstrap.write_text(old_source)
     candidate = _instrumented_lifecycle_candidate(trusted_keys, "1.2.3")
     release = _create_release_fixture(tmp_path, trusted_keys, candidate)
     _sign_with_trusted_quorum(release, trusted_keys)
@@ -855,7 +993,7 @@ def test_authenticated_persistence_failure_preserves_existing_saved_copy(
     assert result.returncode != 0, result.stdout + result.stderr
     assert result.stdout.count("Installer signature from") == 2
     assert "Could not save the trusted installer" in result.stdout
-    assert old_copy.read_text() == "known trusted installer\n"
+    assert old_copy.read_text() == old_source
     assert list(data_dir.glob(".install.sh.*")) == []
 
 

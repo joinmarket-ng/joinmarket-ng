@@ -200,18 +200,25 @@ class TestCheckForUpdatesFromGitHub:
     @pytest.mark.asyncio
     async def test_older_version_on_github(self) -> None:
         """Test when GitHub has an older version (e.g., running pre-release)."""
-        mock_response = _mock_release_response("v0.0.1")
+        mock_response = _mock_release_response("v1.2.3")
 
         mock_client = AsyncMock()
         mock_client.head = AsyncMock(return_value=mock_response)
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
         mock_client.__aexit__ = AsyncMock(return_value=False)
 
-        with patch("httpx.AsyncClient", return_value=mock_client):
+        with (
+            patch("httpx.AsyncClient", return_value=mock_client),
+            patch("jmcore.version.get_version_tuple", return_value=(1, 2, 4)),
+        ):
             result = await _check_for_updates_via_tor()
 
         assert result is not None
+        assert result.latest_version == "1.2.3"
         assert result.is_newer is False
+        mock_client.head.assert_awaited_once_with(
+            "https://github.com/joinmarket-ng/joinmarket-ng/releases/latest"
+        )
 
     @pytest.mark.asyncio
     async def test_network_error_returns_none(self) -> None:

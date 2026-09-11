@@ -5,6 +5,18 @@ wallet processes cleanly before updating. Let any active transaction or tumbler
 phase finish. Afterward, restart with the updated software and check wallet
 state; [resume a saved tumble explicitly](README-tumbler.md#resume-a-failed-plan).
 
+> **Existing users:** If you currently update by piping the `main` installer
+> from `curl`, switch to the authenticated local updater. It preserves the
+> trusted rollback baseline and avoids treating unreleased installer code as
+> the version already installed.
+
+```bash
+bash ~/.joinmarket-ng/install.sh --update
+```
+
+If that file does not exist yet, follow [Older Installations](#older-installations)
+once to create it.
+
 ## Saved Updater
 
 After a successful verified installation, update with the installer saved in

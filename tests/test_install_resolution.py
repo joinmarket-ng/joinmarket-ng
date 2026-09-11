@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -15,6 +16,54 @@ INSTALL_SH = REPO_ROOT / "install.sh"
 pytestmark = pytest.mark.skipif(
     shutil.which("bash") is None, reason="bash not available"
 )
+
+
+def _run_latest_version(payload: str) -> subprocess.CompletedProcess[str]:
+    script = f'''\
+source "{INSTALL_SH}"
+set +e
+
+curl() {{ printf '%s' "$TEST_GITHUB_RESPONSE"; }}
+version=$(get_latest_version)
+status=$?
+printf 'VERSION:%s\n' "$version"
+printf 'EXIT:%s\n' "$status"
+'''
+    return subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+        env={**os.environ, "TEST_GITHUB_RESPONSE": payload},
+    )
+
+
+def test_latest_version_uses_stable_release_response() -> None:
+    result = _run_latest_version(
+        '{"tag_name":"0.39.1","draft":false,"prerelease":false}\n'
+    )
+
+    assert result.stdout == "VERSION:0.39.1\nEXIT:0\n"
+    assert result.stderr == ""
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '{"message":"API rate limit exceeded"}\n',
+        '{"tag_name":"0.39.2","draft":false,"prerelease":true}\n',
+    ],
+    ids=["missing-tag", "prerelease-tag"],
+)
+def test_latest_version_failure_does_not_fall_back_to_embedded_version(
+    payload: str,
+) -> None:
+    result = _run_latest_version(payload)
+
+    assert result.stdout == "VERSION:\nEXIT:1\n"
+    assert "Could not determine the latest stable release from GitHub" in result.stderr
+    assert "0.39.2" not in result.stdout
 
 
 def _run_package_path(

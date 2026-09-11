@@ -22,7 +22,8 @@ VERSION = __version__
 
 logger = logging.getLogger(__name__)
 
-GITHUB_RELEASES_URL = "https://github.com/joinmarket-ng/joinmarket-ng/releases/latest"
+# GitHub's latest-release permalink excludes draft and prerelease releases.
+GITHUB_LATEST_STABLE_URL = "https://github.com/joinmarket-ng/joinmarket-ng/releases/latest"
 GITHUB_RELEASE_TAG_PATH = "/joinmarket-ng/joinmarket-ng/releases/tag/"
 
 
@@ -221,9 +222,9 @@ async def check_for_updates_from_github(
             follow_redirects=False,
             transport=transport,
         ) as client:
-            response = await client.head(GITHUB_RELEASES_URL)
+            response = await client.head(GITHUB_LATEST_STABLE_URL)
             if response.status_code in {405, 501}:
-                response = await client.get(GITHUB_RELEASES_URL)
+                response = await client.get(GITHUB_LATEST_STABLE_URL)
             if not 300 <= response.status_code < 400:
                 response.raise_for_status()
 

@@ -558,22 +558,28 @@ setup_tor() {
     fi
 }
 
-# Get latest release version from GitHub
+# Get the latest stable release version from GitHub. GitHub excludes drafts and
+# prereleases from the releases/latest endpoint. If that lookup is unavailable,
+# guessing from this script's embedded version could select an unpromoted release.
 get_latest_version() {
-    local version=""
+    local response="" version=""
     if command -v curl &> /dev/null; then
-        # Note: the GitHub API is rate-limited per source IP, so on shared CI
-        # runners curl can succeed but return a rate-limit JSON without a
-        # tag_name field. Fall back to DEFAULT_VERSION whenever the pipeline
-        # produces an empty string instead of relying on `|| echo`, which
-        # only fires when the final sed exits non-zero.
-        version=$(curl -sL "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" 2>/dev/null | \
-            grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+        response=$(curl -fsSL \
+            "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" 2>/dev/null || true)
     fi
-    if [ -z "$version" ]; then
-        version="$DEFAULT_VERSION"
+    if grep -Eq '"(draft|prerelease)"[[:space:]]*:[[:space:]]*true' <<< "$response"; then
+        response=""
+    else
+        version=$(sed -nE \
+            's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' \
+            <<< "$response")
     fi
-    echo "$version"
+    if ! is_release_version "$version"; then
+        print_error "Could not determine the latest stable release from GitHub." >&2
+        print_error "No version was selected; retry when releases/latest is available." >&2
+        return 1
+    fi
+    printf '%s\n' "$version"
 }
 
 # Resolve a version/tag/branch to a commit hash
@@ -674,7 +680,7 @@ release_is_older() {
 # Use a subprocess so temporary downloads survive the child installer but are
 # removed on failure as well as success. No downloaded shell is sourced here.
 refresh_installer() (
-    local version work_dir candidate fingerprint valid_sigs=0 candidate_version
+    local version work_dir candidate fingerprint valid_sigs=0 candidate_version trusted_version
     version=$(get_latest_version)
     if ! is_release_version "$version"; then
         print_error "Invalid installer release version: $version"
@@ -713,9 +719,20 @@ refresh_installer() (
         print_error "Signed installer does not match release $version or lacks trusted-copy support."
         exit 1
     fi
-    if release_is_older "$version" "$DEFAULT_VERSION"; then
-        print_error "Refusing to replace installer $DEFAULT_VERSION with older installer $version."
-        exit 1
+    if [[ -e "$DATA_DIR/install.sh" || -L "$DATA_DIR/install.sh" ]]; then
+        if ! trusted_version=$(sed -n \
+            's/^DEFAULT_VERSION="\([^"]*\)".*/\1/p' "$DATA_DIR/install.sh"); then
+            trusted_version=""
+        fi
+        if ! is_release_version "$trusted_version"; then
+            print_error "Saved trusted installer has invalid version metadata."
+            print_error "Refusing to replace it without a valid rollback baseline."
+            exit 1
+        fi
+        if release_is_older "$version" "$trusted_version"; then
+            print_error "Refusing to replace installer $trusted_version with older installer $version."
+            exit 1
+        fi
     fi
     local args=("$@")
     [[ "$MODE" == "update" ]] && args+=(--update)
@@ -2109,6 +2126,18 @@ main() {
         INSTALLER_AUTHENTICATED=true
     fi
     unset JMNG_VERIFIED_INSTALLER
+
+    if [[ "$INSTALLER_AUTHENTICATED" != "true" && -f "$DATA_DIR/install.sh" ]]; then
+        local using_saved_installer=false
+        if [[ -n "$INSTALLER_SOURCE" && "$INSTALLER_SOURCE" -ef "$DATA_DIR/install.sh" ]]; then
+            using_saved_installer=true
+        fi
+        if [[ "$using_saved_installer" != "true" ]]; then
+            print_warning "An authenticated local updater already exists."
+            print_info "For future updates, preserve its rollback protection with:"
+            print_info "bash \"$DATA_DIR/install.sh\" --update"
+        fi
+    fi
 
     # Guard against accidental global CA overrides from Neutrino TLS setup.
     sanitize_tls_environment
