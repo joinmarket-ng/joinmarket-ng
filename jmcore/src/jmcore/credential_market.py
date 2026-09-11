@@ -23,6 +23,7 @@ from jmcore.crypto import (
 from jmcore.external_podle import ExternalPoDLE, ExternalPoDLEOutpoint
 
 MAX_MARKET_BYTES = 16384
+MAX_MARKET_LISTING_BYTES = 2048
 MARKET_PODLE_RETRIES = 3
 Hex32 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 Pubkey = Annotated[str, Field(pattern=r"^(02|03)[0-9a-f]{64}$")]
@@ -316,6 +317,15 @@ class MarketListing(MarketModel):
     products: list[Product] = Field(min_length=1, max_length=2)
     price_sats: int = Field(ge=1, le=2100000000000000)
     expires_at: int = Field(ge=1, le=2**53 - 1)
+
+
+def accept_listing(raw: bytes, network: str, now: int) -> tuple[SignedDocument, MarketListing]:
+    signed = SignedDocument.model_validate(decode_document(raw))
+    candidate = MarketListing.model_validate(signed.body)
+    listing = signed.verified(MarketListing, candidate.seller_pubkey)
+    if listing.network != network or not now < listing.expires_at <= now + 120:
+        raise MarketError("Listing network or expiry mismatch")
+    return signed, listing
 
 
 class PaymentTerms(MarketModel):

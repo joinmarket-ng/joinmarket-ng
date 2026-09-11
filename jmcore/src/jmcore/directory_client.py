@@ -25,7 +25,13 @@ from typing import Any
 from loguru import logger
 
 from jmcore.btc_script import mk_freeze_script, redeem_script_to_p2wsh_script
-from jmcore.crypto import NickIdentity, verify_fidelity_bond_proof
+from jmcore.credential_market import (
+    MAX_MARKET_LISTING_BYTES,
+    MarketError,
+    canonical,
+    decode_document,
+)
+from jmcore.crypto import NickIdentity, verify_fidelity_bond_proof, verify_signed_privmsg
 from jmcore.models import FidelityBond, Offer, OfferType
 from jmcore.network import (
     ONION_HOSTID,
@@ -115,6 +121,16 @@ _NICK_AUTH_MESSAGE_TYPES = frozenset(
 _MAX_MARKET_PROOF_BYTES = 16 * 1024
 _MAX_MARKET_PROOF_BASE64_BYTES = 22 * 1024
 _MAX_MARKET_FAULTS = 64
+_MAX_MARKET_LISTINGS = 256
+_MAX_MARKET_LISTING_BASE64_BYTES = 4 * ((MAX_MARKET_LISTING_BYTES + 2) // 3)
+_MAX_MARKET_LISTING_WIRE_BYTES = (
+    len("moffer ")
+    + _MAX_MARKET_LISTING_BASE64_BYTES
+    + 1
+    + 66  # Compressed public key hex.
+    + 1
+    + 96  # DER signature base64.
+)
 
 
 # These are intentionally internal fixed limits. Directory responses are untrusted,
@@ -369,6 +385,9 @@ class DirectoryClient:
         # Fault proofs remain opaque here. Takers drain and verify them after
         # their ordinary batch bond verification has completed.
         self._market_faults: deque[bytes] = deque(maxlen=_MAX_MARKET_FAULTS)
+        # Listings are authenticated only when a caller explicitly drains this
+        # bounded public-message buffer. They never enter CoinJoin offer state.
+        self._market_listings: deque[tuple[str, str]] = deque(maxlen=_MAX_MARKET_LISTINGS)
 
         # In-flight GETPEERLIST sink. When non-None, the listen() receive loop
         # redirects PEERLIST payloads into this queue instead of handling them
@@ -532,6 +551,27 @@ class DirectoryClient:
         self._market_faults.clear()
         return faults
 
+    def drain_market_listings(self) -> list[tuple[str, bytes]]:
+        """Return and clear authenticated, canonical public ``moffer`` documents."""
+        listings: list[tuple[str, bytes]] = []
+        while self._market_listings:
+            sender, rest = self._market_listings.popleft()
+            authenticated, command, encoded = verify_signed_privmsg(sender, rest, ONION_HOSTID)
+            if not authenticated or command != "moffer":
+                continue
+            try:
+                raw = base64.b64decode(encoded, validate=True)
+                if (
+                    len(raw) > MAX_MARKET_LISTING_BYTES
+                    or base64.b64encode(raw).decode("ascii") != encoded
+                    or canonical(decode_document(raw)) != raw
+                ):
+                    continue
+            except (binascii.Error, MarketError, ValueError):
+                continue
+            listings.append((sender, raw))
+        return listings
+
     def _capture_market_fault(self, message: dict[str, Any]) -> None:
         """Capture only the exact public fault-proof wire form before crypto work."""
         if message.get("type") != MessageType.PUBMSG.value:
@@ -558,6 +598,37 @@ class DirectoryClient:
         if len(raw) > _MAX_MARKET_PROOF_BYTES or base64.b64encode(raw).decode("ascii") != encoded:
             return
         self._market_faults.append(raw)
+
+    def _capture_market_listing(self, message: dict[str, Any]) -> None:
+        """Capture bounded public ``moffer`` envelopes before signature verification."""
+        # Preserve this batch until authentication. An unverified newcomer must
+        # not evict an older valid envelope through deque's maxlen behavior.
+        if len(self._market_listings) >= _MAX_MARKET_LISTINGS:
+            return
+        if message.get("type") != MessageType.PUBMSG.value:
+            return
+        line = message.get("line")
+        if not isinstance(line, str) or not line.isascii():
+            return
+        parts = line.split(COMMAND_PREFIX, 2)
+        if len(parts) != 3 or not is_valid_nick(parts[0]) or parts[1] != "PUBLIC":
+            return
+        rest = parts[2]
+        if len(rest) > _MAX_MARKET_LISTING_WIRE_BYTES:
+            return
+        tokens = rest.split(" ")
+        if len(tokens) != 4 or tokens[0] != "moffer" or not all(tokens):
+            return
+        encoded = tokens[1]
+        if len(encoded) > _MAX_MARKET_LISTING_BASE64_BYTES:
+            return
+        try:
+            raw = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError):
+            return
+        if len(raw) > MAX_MARKET_LISTING_BYTES or base64.b64encode(raw).decode("ascii") != encoded:
+            return
+        self._market_listings.append((parts[0], rest))
 
     async def connect(self) -> None:
         """Connect to the directory server and perform handshake."""
@@ -1274,6 +1345,7 @@ class DirectoryClient:
                 self._discard_buffered_message(buffered_msg)
                 await self._reject_out_of_order_nick_auth(buffered_msg.get("type"))
                 self._capture_market_fault(buffered_msg)
+                self._capture_market_listing(buffered_msg)
                 logger.bind(sensitive=True).trace(
                     f"Processing buffered message type {buffered_msg.get('type')}: "
                     f"{buffered_msg.get('line', '')[:80]}..."
@@ -1316,6 +1388,7 @@ class DirectoryClient:
                     messages, response, total_message_bytes, "listen"
                 )
                 self._capture_market_fault(response)
+                self._capture_market_listing(response)
                 consecutive_errors = 0
 
             except TimeoutError:
@@ -1796,6 +1869,7 @@ class DirectoryClient:
                 await self._reject_out_of_order_nick_auth(msg_type)
                 line = message.get("line", "")
                 self._capture_market_fault(message)
+                self._capture_market_listing(message)
 
                 # Handle PEERLIST responses (from periodic or automatic requests)
                 if msg_type == MessageType.PEERLIST.value:

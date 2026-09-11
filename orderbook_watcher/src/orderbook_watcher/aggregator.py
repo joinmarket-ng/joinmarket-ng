@@ -27,6 +27,7 @@ from jmwallet.backends.base import BondVerificationRequest
 
 from orderbook_watcher.directory_client import DirectoryClient
 from orderbook_watcher.health_checker import MakerHealthChecker
+from orderbook_watcher.market import MarketListingCache
 
 BOND_CACHE_TTL_SECONDS = 60.0
 BOND_CACHE_MAX_SIZE = 4096
@@ -243,6 +244,7 @@ class OrderbookAggregator:
         self.current_orderbook: OrderBook = OrderBook()
         self._lock = asyncio.Lock()
         self.clients: dict[str, DirectoryClient] = {}
+        self._market_listings = MarketListingCache(network)
         self.listener_tasks: list[asyncio.Task[Any]] = []
         self._bond_calculation_task: asyncio.Task[Any] | None = None
         self._bond_queue = _LatestOrderbookQueue()
@@ -824,6 +826,31 @@ class OrderbookAggregator:
         # Start early feature discovery task - runs once after initial connections settle
         early_feature_task = asyncio.create_task(self._early_feature_discovery())
         self.listener_tasks.append(early_feature_task)
+
+        market_task = asyncio.create_task(self._periodic_market_discovery())
+        self.listener_tasks.append(market_task)
+
+    async def _request_market_listings(self) -> None:
+        async def request(client: DirectoryClient) -> None:
+            try:
+                await asyncio.wait_for(client.send_public_message("mbook"), timeout=10)
+            except Exception:
+                logger.debug("Credential listing discovery request failed")
+
+        await asyncio.gather(*(request(client) for client in tuple(self.clients.values())))
+
+    async def _periodic_market_discovery(self) -> None:
+        while True:
+            await self._request_market_listings()
+            await asyncio.sleep(30)
+
+    def get_market_offers(self) -> dict[str, list[dict[str, Any]]]:
+        """Drain signed public listings without affecting CoinJoin offer state."""
+        now = int(time.time())
+        for directory, client in tuple(self.clients.items()):
+            for seller_nick, raw in client.drain_market_listings():
+                self._market_listings.observe(seller_nick, raw, directory, now)
+        return self._market_listings.snapshot(now)
 
     async def _early_feature_discovery(self) -> None:
         """Run feature discovery shortly after startup to populate features quickly.
