@@ -78,9 +78,14 @@ RUN --mount=type=cache,target=/root/.cache/pip,id=jmng-pip-${SETUPTOOLS_VERSION}
         /build/jmwallet \
         /build/maker
 
+# Static bash completions shipped in the runtime image. Staged here so the
+# timestamp normalization below covers them and the production COPY layer stays
+# reproducible.
+COPY completions/*.bash completions/jm-completions-loader.sh /build/completions/
+
 # Normalize installed Python environment mtimes for reproducible COPY layer digests
 RUN if [ -n "$SOURCE_DATE_EPOCH" ]; then \
-        find /app -exec touch -d @${SOURCE_DATE_EPOCH} {} +; \
+        find /app /build/completions -exec touch -d @${SOURCE_DATE_EPOCH} {} +; \
     fi
 
 # =============================================================================
@@ -122,6 +127,15 @@ RUN useradd -m -u 1000 jm && \
 # Copy Python packages from builder and set permissions
 COPY --from=builder /app /app
 RUN chmod -R a+rX /app
+
+# Enable tab completion for the bundled CLIs in interactive shells
+# (docker compose exec maker bash). The bash-completion package is not
+# installed, so /etc/bash.bashrc sources the generated scripts directly.
+COPY --from=builder /build/completions /etc/bash_completion.d
+RUN echo '. /etc/bash_completion.d/jm-completions-loader.sh' >> /etc/bash.bashrc && \
+    if [ -n "$SOURCE_DATE_EPOCH" ]; then \
+        touch -d @${SOURCE_DATE_EPOCH} /etc/bash.bashrc; \
+    fi
 
 # Switch to non-root user
 USER jm

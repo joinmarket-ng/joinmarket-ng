@@ -91,10 +91,14 @@ COPY jmwalletd/pyproject.toml /build/jmwalletd/
 COPY tumbler/src /build/tumbler/src
 COPY tumbler/pyproject.toml /build/tumbler/
 
+# Static bash completions shipped in the runtime image (normalized below too).
+COPY completions/*.bash completions/jm-completions-loader.sh /build/completions/
+
 # Normalize file timestamps so local working-copy mtimes don't differ from CI clone
 RUN if [ -n "$SOURCE_DATE_EPOCH" ]; then \
         find /build/jmcore /build/jmwallet /build/maker /build/taker \
              /build/orderbook_watcher /build/jmwalletd /build/tumbler \
+             /build/completions \
              -exec touch -d @${SOURCE_DATE_EPOCH} {} +; \
     fi
 
@@ -133,6 +137,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
+
+# Reproducible builds: SOURCE_DATE_EPOCH for consistent timestamps
+ARG SOURCE_DATE_EPOCH
+
+# Enable tab completion for the bundled CLIs in interactive shells
+# (docker compose exec jmwalletd bash). The bash-completion package is not
+# installed, so /etc/bash.bashrc sources the generated scripts directly.
+COPY --from=builder /build/completions /etc/bash_completion.d
+RUN echo '. /etc/bash_completion.d/jm-completions-loader.sh' >> /etc/bash.bashrc && \
+    if [ -n "$SOURCE_DATE_EPOCH" ]; then \
+        touch -d @${SOURCE_DATE_EPOCH} /etc/bash.bashrc; \
+    fi
 
 RUN mkdir -p /root/.joinmarket-ng
 

@@ -157,6 +157,10 @@ source completions/jmwalletd.bash
 for f in completions/*.zsh; do source "$f"; done
 ```
 
+The `maker`, `taker`, and `jmwalletd` Docker images ship the same bash
+completions and load them automatically in interactive shells, so
+`docker compose exec maker bash` has tab completion for the bundled commands.
+
 ## Windows (Manual Install)
 
 `install.sh` targets Linux and macOS. Windows requires a manual Python install,
