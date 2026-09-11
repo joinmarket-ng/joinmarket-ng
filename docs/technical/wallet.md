@@ -168,14 +168,26 @@ no-change participant). The derived origin (`cj_out` / `cj_change` / `deposit`
 / `non_cj_change`) is persisted into the BIP-329 metadata store, so the work is
 done once and the display then surfaces the inferred status.
 
-The reconstruction is best-effort and bounded: it runs once per process during
-the bond-aware sync, skips addresses the local history already classifies (those
-remain authoritative) and addresses classified on a previous run, dedupes work
-per transaction, and degrades silently to the `deposit` / `non-cj-change`
-fallback when the backend cannot return a transaction. A blockchain rescan
-re-runs it so coins surfaced by the rescan are classified too. Only the imported
-backlog needs this; coins received while running are either this wallet's own
-CoinJoins (recorded in history) or genuine deposits.
+The reconstruction is best-effort and bounded: it runs during the bond-aware
+sync, skips addresses the local history already classifies (those remain
+authoritative) and addresses classified on a previous run, dedupes work per
+transaction, fetches each transaction at most once per process (so a backend
+that cannot return it is not re-queried on every sync), and degrades silently to
+the `deposit` / `non-cj-change` fallback. A blockchain rescan clears that
+per-process memory so coins surfaced by the rescan are classified too. Coins
+received while running are picked up on the next sync, so a plain deposit is
+labeled `deposit` without a restart.
+
+The same pass also persists this wallet's own confirmed CoinJoin history into the
+metadata store: every CoinJoin output address is labeled `jm:used:cj_out` and
+every CoinJoin change address `jm:used:cj_change`, including addresses whose
+coins have since been spent. Together with the on-chain classifications
+(`jm:used:deposit`, `jm:used:non_cj_change`) this makes a BIP-329 export of
+`wallet_metadata_<fp>.jsonl` self-describing when imported into another wallet
+such as Sparrow, instead of carrying a bare `jm:used` marker per address. Pending
+(unconfirmed) CoinJoin rows are not labeled until they confirm, and only
+addresses derived by this wallet are written (a taker's external destination is
+not).
 
 The reconstructed `cj-out` status is display metadata, not spend authority. The
 mixdepth 0 maker restriction starts with exact outpoints backed by this wallet's

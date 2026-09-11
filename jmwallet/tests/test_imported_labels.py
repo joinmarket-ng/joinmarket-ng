@@ -11,6 +11,7 @@ wallet display surfaces ``cj-out`` / ``cj-change``.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 
@@ -224,12 +225,168 @@ class TestReconstructImportedLabels:
         ws.utxo_cache = {0: [_utxo(txid="cjtx", value=CJ_AMOUNT, address="bcrt1qcjout")]}
 
         assert await ws.reconstruct_imported_labels() == 1
-        # Second call is a no-op (guard flag set); transaction not re-fetched.
+        # Second call is a no-op (coin classified); transaction not re-fetched.
         backend.get_transaction.reset_mock()
         assert await ws.reconstruct_imported_labels() == 0
         backend.get_transaction.assert_not_awaited()
         # force=True re-runs, but the coin is already classified so nothing new.
         assert await ws.reconstruct_imported_labels(force=True) == 0
+
+    @pytest.mark.asyncio
+    async def test_coins_arriving_while_running_are_classified_on_next_sync(
+        self, tmp_path, test_mnemonic, test_network
+    ) -> None:
+        """A deposit received after the first pass gets its origin without a restart."""
+        backend = _make_backend({"cjtx": _coinjoin_raw(), "paytx": _payment_raw()})
+        ws = _wallet(backend, tmp_path, test_mnemonic, test_network)
+        ws.utxo_cache = {0: [_utxo(txid="cjtx", value=CJ_AMOUNT, address="bcrt1qcjout")]}
+        assert await ws.reconstruct_imported_labels() == 1
+
+        deposit = _utxo(txid="paytx", value=50_000, address="bcrt1qdep", change=0)
+        ws.utxo_cache[0].append(deposit)
+        backend.get_transaction.reset_mock()
+
+        assert await ws.reconstruct_imported_labels() == 1
+        backend.get_transaction.assert_awaited_once_with("paytx")
+        assert ws.metadata_store.get_address_origins("bcrt1qdep") == {"deposit"}
+
+    @pytest.mark.asyncio
+    async def test_failed_fetch_is_not_retried_until_forced(
+        self, tmp_path, test_mnemonic, test_network
+    ) -> None:
+        backend = Mock()
+        backend.get_transaction = AsyncMock(return_value=None)
+        ws = _wallet(backend, tmp_path, test_mnemonic, test_network)
+        ws.utxo_cache = {0: [_utxo(txid="missing", value=CJ_AMOUNT, address="bcrt1qcjout")]}
+
+        assert await ws.reconstruct_imported_labels() == 0
+        backend.get_transaction.assert_awaited_once()
+        # Same unclassified coin: the backend is not queried again on every sync.
+        assert await ws.reconstruct_imported_labels() == 0
+        backend.get_transaction.assert_awaited_once()
+        # Clearing the attempted set (force, or a rescan) retries it.
+        assert await ws.reconstruct_imported_labels(force=True) == 0
+        assert backend.get_transaction.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_confirmed_history_origins_are_persisted(
+        self, tmp_path, test_mnemonic, test_network
+    ) -> None:
+        """Own CoinJoin history labels its output/change addresses in the JSONL export."""
+        backend = _make_backend({})
+        ws = _wallet(backend, tmp_path, test_mnemonic, test_network)
+        cj_addr = ws.get_address(0, 0, 0)
+        change_addr = ws.get_address(0, 1, 0)
+        entry = create_maker_history_entry(
+            taker_nick="J5taker",
+            cj_amount=CJ_AMOUNT,
+            fee_received=100,
+            txfee_contribution=50,
+            cj_address=cj_addr,
+            change_address=change_addr,
+            our_utxos=[("cc" * 32, 0)],
+            txid="a" * 64,
+            network=test_network,
+            wallet_fingerprint=ws.wallet_fingerprint,
+        )
+        entry.success = True
+        append_history_entry(entry, tmp_path)
+        # Both outputs already spent: no current coin, so this cannot come from
+        # the on-chain pass; the address record still gets a detailed origin.
+        ws.utxo_cache = {0: []}
+
+        assert await ws.reconstruct_imported_labels() == 0
+
+        backend.get_transaction.assert_not_awaited()
+        assert ws.metadata_store.get_address_origins(cj_addr) == {"cj_out"}
+        assert ws.metadata_store.get_address_origins(change_addr) == {"cj_change"}
+        labels = {
+            rec["ref"]: rec["label"]
+            for rec in map(json.loads, ws.metadata_store.path.read_text().splitlines())
+            if rec["type"] == "addr"
+        }
+        assert labels[cj_addr] == "jm:used:cj_out"
+        assert labels[change_addr] == "jm:used:cj_change"
+        # Idempotent: a second pass changes nothing on disk.
+        mtime = ws.metadata_store.path.stat().st_mtime_ns
+        assert await ws.reconstruct_imported_labels() == 0
+        assert ws.metadata_store.path.stat().st_mtime_ns == mtime
+
+    @pytest.mark.asyncio
+    async def test_history_origin_upgrades_bare_used_marker(
+        self, tmp_path, test_mnemonic, test_network
+    ) -> None:
+        backend = _make_backend({})
+        ws = _wallet(backend, tmp_path, test_mnemonic, test_network)
+        cj_addr = ws.get_address(0, 0, 0)
+        ws.metadata_store.mark_address_used(cj_addr)
+        assert ws.metadata_store.get_address_origins(cj_addr) == set()
+        entry = create_maker_history_entry(
+            taker_nick="J5taker",
+            cj_amount=CJ_AMOUNT,
+            fee_received=100,
+            txfee_contribution=50,
+            cj_address=cj_addr,
+            change_address=ws.get_address(0, 1, 0),
+            our_utxos=[("cc" * 32, 0)],
+            txid="a" * 64,
+            network=test_network,
+            wallet_fingerprint=ws.wallet_fingerprint,
+        )
+        entry.success = True
+        append_history_entry(entry, tmp_path)
+        ws.utxo_cache = {0: []}
+
+        await ws.reconstruct_imported_labels()
+
+        assert ws.metadata_store.get_address_origins(cj_addr) == {"cj_out"}
+
+    @pytest.mark.asyncio
+    async def test_pending_and_foreign_history_addresses_get_no_origin(
+        self, tmp_path, test_mnemonic, test_network
+    ) -> None:
+        backend = _make_backend({})
+        ws = _wallet(backend, tmp_path, test_mnemonic, test_network)
+        pending_addr = ws.get_address(0, 0, 0)
+        # Unconfirmed (success=False): must not be labeled until it confirms.
+        append_history_entry(
+            create_maker_history_entry(
+                taker_nick="J5taker",
+                cj_amount=CJ_AMOUNT,
+                fee_received=100,
+                txfee_contribution=50,
+                cj_address=pending_addr,
+                change_address=ws.get_address(0, 1, 0),
+                our_utxos=[("cc" * 32, 0)],
+                txid="a" * 64,
+                network=test_network,
+                wallet_fingerprint=ws.wallet_fingerprint,
+            ),
+            tmp_path,
+        )
+        # Confirmed, but the destination is not one of this wallet's addresses
+        # (e.g. a taker paying an external wallet): never written to our file.
+        external = create_maker_history_entry(
+            taker_nick="J5taker",
+            cj_amount=CJ_AMOUNT,
+            fee_received=100,
+            txfee_contribution=50,
+            cj_address="bcrt1qexternal",
+            change_address="bcrt1qforeignchange",
+            our_utxos=[("dd" * 32, 0)],
+            txid="b" * 64,
+            network=test_network,
+            wallet_fingerprint=ws.wallet_fingerprint,
+        )
+        external.success = True
+        append_history_entry(external, tmp_path)
+        ws.utxo_cache = {0: []}
+
+        await ws.reconstruct_imported_labels()
+
+        assert not ws.metadata_store.is_address_used(pending_addr)
+        assert not ws.metadata_store.is_address_used("bcrt1qexternal")
+        assert not ws.metadata_store.is_address_used("bcrt1qforeignchange")
 
     @pytest.mark.asyncio
     async def test_skips_already_classified_addresses(

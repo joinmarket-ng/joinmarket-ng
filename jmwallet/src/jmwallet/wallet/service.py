@@ -148,11 +148,11 @@ class WalletService(
         # persisted as observed-funded) are left spendable.
         self._observed_funded_addresses: set[str] = set()
         self._observed_outpoints: set[str] = set()
-        # Guards the once-per-process import-label reconstruction pass (see
-        # WalletSyncMixin.reconstruct_imported_labels). Coins received while
-        # running are either this wallet's own CoinJoins (recorded in history)
-        # or genuine deposits, so only the imported backlog needs scanning.
-        self._imported_labels_scanned: bool = False
+        # Transactions the on-chain label reconstruction has already fetched
+        # (or failed to fetch) in this process; each is attempted at most once
+        # so a backend that cannot return a transaction is not re-queried on
+        # every sync (see WalletSyncMixin.reconstruct_imported_labels).
+        self._label_reconstruction_attempted: set[str] = set()
         # Guards the once-per-process import-history reconstruction pass (see
         # WalletSyncMixin.reconstruct_imported_history). The automatic pass
         # only fires for wallets with no recorded history (seed imports);

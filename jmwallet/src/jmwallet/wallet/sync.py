@@ -102,8 +102,9 @@ class WalletSyncMixin:
     _canonical_bond_addresses: dict[str, tuple[int, int]] | None
     _fidelity_bond_recovery_checked: bool
     _fidelity_bond_recovery_in_progress: bool
-    # Guards the once-per-process import-label reconstruction pass.
-    _imported_labels_scanned: bool
+    # Transactions already fetched (or that failed to fetch) by the on-chain
+    # label reconstruction in this process; each is attempted at most once.
+    _label_reconstruction_attempted: set[str]
     # Guards the once-per-process import-history reconstruction pass.
     _imported_history_scanned: bool
     # Tracks a deferred/capped imported backfill within this process.
@@ -457,37 +458,38 @@ class WalletSyncMixin:
         force: bool = False,
         max_transactions: int = 1000,
     ) -> int:
-        """Reconstruct CoinJoin labels for an imported wallet from chain data.
+        """Persist address origin labels (``jm:used:<origin>``) from history and chain data.
 
-        JoinMarket-NG derives ``cj-out`` / ``cj-change`` address statuses from a
-        local CoinJoin history file written by this wallet's own maker/taker
-        activity. A wallet recovered from seed (or otherwise imported) has no
-        such file, so every funded coin falls back to ``deposit`` (external) or
-        ``non-cj-change`` (internal), even when it actually came from a CoinJoin.
+        Two sources feed the BIP-329 ``addr`` labels so an export carries more
+        than a bare ``jm:used`` marker:
 
-        This scans the current UTXO set, fetches the transaction that created
-        each unclassified funded coin, applies the same equal-output CoinJoin
-        heuristic the legacy client uses (:func:`jmcore.bitcoin.analyze_coinjoin_outputs`),
-        and persists the derived origin (``cj_out`` / ``cj_change`` / ``deposit``
-        / ``non_cj_change``) into the BIP-329 metadata store. The wallet display
-        then surfaces the correct status via
-        :meth:`UTXOMetadataStore.get_coinjoin_address_types`.
+        1. This wallet's own CoinJoin history is authoritative. Every confirmed
+           CoinJoin output address is persisted as ``cj_out`` and every CoinJoin
+           change address as ``cj_change``, whether or not the coin is still
+           unspent. Pending (unconfirmed) rows are skipped until they confirm.
+        2. Funded coins the history does not classify (an imported or
+           seed-recovered wallet has no history file; a running wallet's plain
+           deposits are never in it) are classified from the transaction that
+           created them, using the same equal-output CoinJoin heuristic the
+           legacy client uses (:func:`jmcore.bitcoin.analyze_coinjoin_outputs`):
+           ``cj_out`` / ``cj_change`` / ``deposit`` / ``non_cj_change``.
 
-        The pass is best-effort and bounded: it runs at most once per process
-        (unless ``force`` is set), skips addresses the local history already
-        classifies and addresses already classified on a previous run, dedupes
-        work by transaction, and degrades silently to the existing fallback when
-        the backend cannot return a transaction. Only the pre-existing imported
-        backlog needs this: coins received while running are either this
-        wallet's own CoinJoins (recorded in history) or genuine deposits (already
-        labeled correctly).
+        The wallet display surfaces the persisted CoinJoin origins via
+        :meth:`UTXOMetadataStore.get_coinjoin_address_types`, with the local
+        history file still winning on any conflict.
+
+        The on-chain step is best-effort and bounded: it skips addresses already
+        classified, dedupes work by transaction, fetches each transaction at most
+        once per process (a failed fetch is not retried until ``force`` or a
+        rescan), caps fetches per pass, and degrades silently to the existing
+        display fallback when the backend cannot return a transaction.
 
         Args:
-            force: Re-run even if a pass already completed in this process.
+            force: Retry transactions already attempted in this process.
             max_transactions: Safety cap on transactions fetched in one pass.
 
         Returns:
-            The number of coins newly classified.
+            The number of coins newly classified from chain data.
         """
         store = getattr(self, "metadata_store", None)
         if store is None or self.data_dir is None:
@@ -521,9 +523,6 @@ class WalletSyncMixin:
                 if utxo.label is None:
                     utxo.label = "cj-out"
 
-        if getattr(self, "_imported_labels_scanned", False) and not force:
-            return 0
-
         from jmcore.bitcoin import analyze_coinjoin_outputs, parse_transaction
 
         from jmwallet.history import (
@@ -534,11 +533,37 @@ class WalletSyncMixin:
             get_address_history_types,
         )
 
-        # Addresses this wallet's own CoinJoin history already classifies are
+        # Addresses this wallet's own CoinJoin history classifies are
         # authoritative; never override them with a heuristic guess (issue #517).
-        authoritative = set(
-            get_address_history_types(self.data_dir, wallet_fingerprint=self.wallet_fingerprint)
+        history_types = get_address_history_types(
+            self.data_dir, wallet_fingerprint=self.wallet_fingerprint
         )
+        authoritative = set(history_types)
+
+        # Persist the confirmed history classifications as address origins so
+        # the BIP-329 export labels CoinJoin outputs and change explicitly
+        # (``jm:used:cj_out`` / ``jm:used:cj_change``) instead of a bare
+        # ``jm:used``. Only addresses this wallet derives are labeled: a taker
+        # destination can be an external address that does not belong here.
+        # ``flagged`` (pending) rows are left alone until they confirm.
+        history_origin_by_type = {"cj_out": ORIGIN_CJ_OUT, "change": ORIGIN_CJ_CHANGE}
+        history_origins: dict[str, list[str]] = {}
+        for address, history_type in history_types.items():
+            origin = history_origin_by_type.get(history_type)
+            if origin is None or address not in self.address_cache:
+                continue
+            if origin in store.get_address_origins(address):
+                continue
+            history_origins.setdefault(origin, []).append(address)
+        for origin, addresses in history_origins.items():
+            try:
+                store.mark_addresses_used(addresses, origin)
+            except Exception as exc:  # pragma: no cover - disk failures are rare
+                logger.debug(f"Could not persist {origin} history origins: {exc}")
+
+        attempted = self._label_reconstruction_attempted
+        if force:
+            attempted.clear()
 
         # Group unclassified funded coins by the transaction that created them.
         by_txid: dict[str, list[UTXOInfo]] = {}
@@ -548,12 +573,13 @@ class WalletSyncMixin:
                     continue
                 if utxo.address in authoritative:
                     continue
+                if utxo.txid in attempted:
+                    continue
                 if store.get_address_origins(utxo.address) & CLASSIFIED_ORIGINS:
                     continue
                 by_txid.setdefault(utxo.txid, []).append(utxo)
 
         if not by_txid:
-            self._imported_labels_scanned = True
             return 0
 
         origin_to_addresses: dict[str, list[str]] = {}
@@ -563,9 +589,10 @@ class WalletSyncMixin:
             if fetched >= max_transactions:
                 logger.warning(
                     f"Import label reconstruction hit the {max_transactions}-transaction "
-                    "cap; remaining coins will be classified on a later run."
+                    "cap; remaining coins will be classified on the next sync."
                 )
                 break
+            attempted.add(txid)
             try:
                 tx = await self.backend.get_transaction(txid)
             except Exception as exc:  # pragma: no cover - backend/network dependent
@@ -603,7 +630,6 @@ class WalletSyncMixin:
             except Exception as exc:  # pragma: no cover - defensive
                 logger.debug(f"Could not persist {origin} origins: {exc}")
 
-        self._imported_labels_scanned = True
         if classified:
             logger.info(
                 f"Reconstructed CoinJoin labels for {classified} imported coin(s) "

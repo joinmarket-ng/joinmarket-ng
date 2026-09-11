@@ -677,9 +677,9 @@ async def _run_rescan(state: DaemonState, blockheight: int) -> None:
     finally:
         state.rescanning = False
         state.rescan_progress = 0.0
-        # A rescan can surface coins the wallet had never seen; allow the
-        # next sync to re-run import-label reconstruction over them.
-        ws._imported_labels_scanned = False
+        # A rescan can make transactions the label reconstruction previously
+        # failed to fetch available; let the next sync retry them.
+        ws._label_reconstruction_attempted.clear()
 
 
 @router.get("/wallet/{walletname}/rescanblockchain/{blockheight}", operation_id="rescanblockchain")

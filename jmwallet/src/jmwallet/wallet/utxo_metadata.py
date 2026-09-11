@@ -24,10 +24,17 @@ and Bitcoin Core's address-book-bound RPCs alone cannot give us that
 guarantee across restarts; the persistent ``addr`` records do.
 
 Label convention (informational, ignored by other BIP-329 consumers):
-``jm:used[:<origin>]`` where ``origin`` is one of ``deposit``, ``change``,
-``cj_out``, ``cj_in``, ``send`` (or a comma-separated combination). The
-``origin`` part is best-effort context; the mere presence of the record is
-the privacy-relevant fact.
+``jm:used[:<origin>]`` where ``origin`` is a comma-separated set drawn from
+``cj_out`` (equal-amount CoinJoin output), ``cj_change`` (our change inside a
+CoinJoin), ``deposit`` (non-CoinJoin coin on the external branch),
+``non_cj_change`` (non-CoinJoin coin on the internal branch), plus the
+bookkeeping tags ``legacy`` (migrated from the pre-0.30 shared file) and
+``onchain-verify`` (recorded by the deposit-address backend check). The
+CoinJoin origins come from this wallet's own confirmed CoinJoin history or,
+for imported wallets, from on-chain analysis (see
+``WalletSyncMixin.reconstruct_imported_labels``). The ``origin`` part is
+best-effort context; the mere presence of the record is the privacy-relevant
+fact.
 
 Reference: https://github.com/bitcoin/bips/blob/master/bip-0329.mediawiki
 """
@@ -264,8 +271,8 @@ class AddressRecord:
 
     Attributes:
         ref: Bitcoin address.
-        label: ``jm:used`` or ``jm:used:<origin>`` (``deposit``, ``change``,
-            ``cj_out``, ``cj_in``, ``send``).
+        label: ``jm:used`` or ``jm:used:<origin>`` (``cj_out``, ``cj_change``,
+            ``deposit``, ``non_cj_change``, ...; see the module docstring).
     """
 
     ref: str
