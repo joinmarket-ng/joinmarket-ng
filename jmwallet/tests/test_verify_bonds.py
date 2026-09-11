@@ -120,7 +120,9 @@ class TestBaseVerifyBonds:
         assert "unconfirmed" in results[0].error.lower()
 
     @pytest.mark.asyncio()
-    async def test_get_utxo_exception(self, mock_backend: BlockchainBackend) -> None:
+    async def test_get_utxo_exception(
+        self, mock_backend: BlockchainBackend, caplog: pytest.LogCaptureFixture
+    ) -> None:
         """verify_bonds handles exceptions from get_utxo gracefully."""
         mock_backend.get_utxo = AsyncMock(side_effect=ConnectionError("RPC down"))
 
@@ -130,6 +132,8 @@ class TestBaseVerifyBonds:
         assert len(results) == 1
         assert results[0].valid is False
         assert "RPC down" in results[0].error
+        assert bonds[0].txid not in caplog.text
+        assert "RPC down" not in caplog.text
 
     @pytest.mark.asyncio()
     async def test_scriptpubkey_mismatch(self, mock_backend: BlockchainBackend) -> None:

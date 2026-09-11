@@ -32,7 +32,7 @@ from jmcore.protocol import (
     UTXOMetadata,
     format_utxo_list,
 )
-from jmwallet.backends.base import BlockchainBackend
+from jmwallet.backends.base import UTXO, BlockchainBackend
 from jmwallet.wallet.models import UTXOInfo
 from jmwallet.wallet.service import WalletService
 from jmwallet.wallet.signing import (
@@ -44,6 +44,9 @@ from loguru import logger
 from maker.mixdepth_selection import MixdepthSelectionPolicy, mixdepth_attempt_order
 from maker.offer_math import required_maker_input
 from maker.tx_verification import find_output_index, verify_unsigned_transaction
+
+MINER_FEE_PREVOUT_LOOKUP_TIMEOUT_SEC = 10.0
+MINER_FEE_PREVOUT_LOOKUP_BATCH_SIZE = 10
 
 
 class CoinJoinState(StrEnum):
@@ -721,26 +724,69 @@ class CoinJoinSession:
             return "Session expired during miner-fee verification"
 
         tx = parse_transaction(tx_hex)
-        foreign_inputs = [
-            (tx_input.txid, tx_input.vout)
-            for tx_input in tx.inputs
-            if (tx_input.txid, tx_input.vout) not in self.our_utxos
-        ]
+        foreign_inputs = list(
+            dict.fromkeys(
+                (tx_input.txid, tx_input.vout)
+                for tx_input in tx.inputs
+                if (tx_input.txid, tx_input.vout) not in self.our_utxos
+            )
+        )
+
         # The wire transaction has no prevout values, so light clients cannot
         # independently verify a taker-reported fee for foreign inputs.
+        async def lookup_foreign_utxo(txid: str, vout: int) -> tuple[UTXO | None, Exception | None]:
+            try:
+                return await self.backend.get_utxo(txid, vout), None
+            except Exception as exc:
+                return None, exc
+
         try:
-            foreign_utxos = await asyncio.gather(
-                *(self.backend.get_utxo(txid, vout) for txid, vout in foreign_inputs)
+            async with asyncio.timeout(MINER_FEE_PREVOUT_LOOKUP_TIMEOUT_SEC):
+                lookup_results: list[tuple[UTXO | None, Exception | None]] = []
+                for offset in range(0, len(foreign_inputs), MINER_FEE_PREVOUT_LOOKUP_BATCH_SIZE):
+                    batch = foreign_inputs[offset : offset + MINER_FEE_PREVOUT_LOOKUP_BATCH_SIZE]
+                    lookup_results.extend(
+                        await asyncio.gather(
+                            *(lookup_foreign_utxo(txid, vout) for txid, vout in batch)
+                        )
+                    )
+        except TimeoutError:
+            logger.warning(
+                "Skipping minimum miner-fee verification because foreign prevout lookup timed out"
             )
-        except Exception as exc:
-            return f"Could not look up foreign prevouts for miner-fee verification: {exc}"
+            return None
         if self.is_timed_out() or (active_check is not None and not active_check()):
             return "Session expired during miner-fee verification"
-        if any(utxo is None for utxo in foreign_utxos):
+
+        missing_outpoints = [
+            outpoint
+            for outpoint, (utxo, error) in zip(foreign_inputs, lookup_results, strict=True)
+            if utxo is None and error is None
+        ]
+        if missing_outpoints:
+            logger.bind(sensitive=True).warning(
+                "Foreign prevout lookup reported spent or absent input(s): {}",
+                ", ".join(f"{txid}:{vout}" for txid, vout in missing_outpoints),
+            )
             return "Could not look up all foreign prevouts for miner-fee verification"
 
+        lookup_failures = [
+            (outpoint, error)
+            for outpoint, (_, error) in zip(foreign_inputs, lookup_results, strict=True)
+            if error is not None
+        ]
+        if lookup_failures:
+            logger.warning(
+                "Skipping minimum miner-fee verification because foreign prevout lookup failed"
+            )
+            logger.bind(sensitive=True).warning(
+                "Foreign prevout lookup failure(s): {}",
+                "; ".join(f"{txid}:{vout}: {error}" for (txid, vout), error in lookup_failures),
+            )
+            return None
+
         total_input = sum(utxo.value for utxo in self.our_utxos.values()) + sum(
-            utxo.value for utxo in foreign_utxos if utxo is not None
+            utxo.value for utxo, _ in lookup_results if utxo is not None
         )
         total_output = sum(output.value for output in tx.outputs)
         fee = total_input - total_output

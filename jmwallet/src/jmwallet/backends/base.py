@@ -407,7 +407,9 @@ class BlockchainBackend(ABC):
     @abstractmethod
     async def get_utxo(self, txid: str, vout: int) -> UTXO | None:
         """Get a specific UTXO from the blockchain UTXO set (gettxout).
-        Returns None if the UTXO does not exist or has been spent."""
+        Returns None if the UTXO does not exist or has been spent. Backend
+        failures raise so callers can distinguish an unavailable lookup from
+        an authoritative negative result."""
 
     async def scan_descriptors(
         self, descriptors: Sequence[str | dict[str, Any]]
@@ -658,10 +660,7 @@ class BlockchainBackend(ABC):
                     )
                 except Exception as e:
                     logger.warning(
-                        "Bond verification failed for %s:%d: %s",
-                        bond.txid,
-                        bond.vout,
-                        e,
+                        "Bond verification failed because backend lookup was unavailable"
                     )
                     return BondVerificationResult(
                         txid=bond.txid,

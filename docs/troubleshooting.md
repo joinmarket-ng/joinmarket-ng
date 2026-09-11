@@ -103,6 +103,11 @@ If a maker refuses to sign because the mining fee is too low, normal INFO logs
 show the proposed fee rate and the maker's required minimum in sat/vB. The maker
 sends that reason to the taker, which also displays it at INFO level. Review the
 reported minimum and your mining-fee settings before starting another round.
+A full-node maker also rejects a transaction when Bitcoin Core reports a foreign
+input as spent or absent; sensitive logs identify the outpoint. If the prevout
+lookup itself fails or times out, the maker warns and proceeds without the
+optional fee-rate check, matching the reference maker's transaction verification
+behavior, unless another lookup authoritatively reports a spent or absent input.
 A definite refusal before signing records the attempt as failed, rather than
 pending, on the maker and on the taker when it receives the refusal. Revealed
 addresses remain protected against reuse, and an honest refusal does not add

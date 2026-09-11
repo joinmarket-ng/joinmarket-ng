@@ -1084,6 +1084,19 @@ class TestDescriptorWalletBackendUnit:
         mock_backend._rpc_call.assert_awaited_once_with("listunspent", [0, 9999999])
 
     @pytest.mark.asyncio
+    async def test_get_utxo_distinguishes_absent_output_from_rpc_failure(
+        self, mock_backend: DescriptorWalletBackend
+    ) -> None:
+        txid = "ab" * 32
+        mock_backend._rpc_call = AsyncMock(side_effect=[[], None])
+
+        assert await mock_backend.get_utxo(txid, 1) is None
+
+        mock_backend._rpc_call = AsyncMock(side_effect=[[], RuntimeError("RPC busy")])
+        with pytest.raises(RuntimeError, match="RPC busy"):
+            await mock_backend.get_utxo(txid, 1)
+
+    @pytest.mark.asyncio
     async def test_get_wallet_balance(self, mock_backend: DescriptorWalletBackend):
         """Test getting wallet balance."""
         backend = mock_backend

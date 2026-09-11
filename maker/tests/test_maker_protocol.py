@@ -1591,7 +1591,7 @@ def _fee_policy_tx(output_value: int) -> str:
 
 @pytest.mark.asyncio
 async def test_maker_minimum_fee_policy_rejects_low_fee_and_missing_prevout():
-    from unittest.mock import AsyncMock, MagicMock
+    from unittest.mock import AsyncMock, MagicMock, patch
 
     from jmwallet.backends.base import UTXO
 
@@ -1617,9 +1617,136 @@ async def test_maker_minimum_fee_policy_rejects_low_fee_and_missing_prevout():
     assert await session._verify_minimum_miner_fee(_fee_policy_tx(19_000), None) is None
 
     backend.get_utxo.return_value = None
-    assert "Could not look up all foreign prevouts" in (
-        await session._verify_minimum_miner_fee(_fee_policy_tx(19_000), None)
+    with patch("maker.coinjoin.logger") as mock_logger:
+        assert "Could not look up all foreign prevouts" in (
+            await session._verify_minimum_miner_fee(_fee_policy_tx(19_000), None)
+        )
+
+    sensitive_warning = mock_logger.bind.return_value.warning
+    assert "spent or absent" in sensitive_warning.call_args.args[0]
+    assert f"{'bb' * 32}:1" in sensitive_warning.call_args.args[1]
+
+
+@pytest.mark.asyncio
+async def test_maker_minimum_fee_policy_skips_backend_lookup_failure():
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from maker.coinjoin import CoinJoinSession, CoinJoinState
+
+    backend = MagicMock()
+    backend.requires_neutrino_metadata.return_value = False
+    backend.get_utxo = AsyncMock(side_effect=RuntimeError("RPC busy"))
+    session = CoinJoinSession(
+        taker_nick="J5FeePolicy",
+        offer=MagicMock(),
+        wallet=MagicMock(),
+        backend=backend,
+        minimum_fee_rate_sat_vb=2.0,
     )
+    session.our_utxos = {("aa" * 32, 0): MagicMock(value=10_000)}
+    session.state = CoinJoinState.IOAUTH_SENT
+    session.wallet.network = "regtest"
+    session.wallet.renew_coinjoin_inputs.return_value = True
+
+    signed = AsyncMock(return_value=["signature"])
+    with (
+        patch("maker.coinjoin.logger") as mock_logger,
+        patch("maker.coinjoin.verify_unsigned_transaction", return_value=(True, "")),
+        patch.object(session, "_sign_transaction", new=signed),
+    ):
+        success, _ = await session.handle_tx(_fee_policy_tx(19_000))
+
+    assert success is True
+    signed.assert_awaited_once()
+    assert "Skipping minimum miner-fee verification" in mock_logger.warning.call_args.args[0]
+    sensitive_warning = mock_logger.bind.return_value.warning
+    assert f"{'bb' * 32}:1" in sensitive_warning.call_args.args[1]
+    assert "RPC busy" in sensitive_warning.call_args.args[1]
+
+
+@pytest.mark.asyncio
+async def test_maker_minimum_fee_policy_skips_backend_lookup_timeout():
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from maker.coinjoin import CoinJoinSession
+
+    active_lookups = 0
+
+    async def wait_forever(*_args: object) -> None:
+        nonlocal active_lookups
+        active_lookups += 1
+        try:
+            await asyncio.Event().wait()
+        finally:
+            active_lookups -= 1
+
+    backend = MagicMock()
+    backend.get_utxo = AsyncMock(side_effect=wait_forever)
+    session = CoinJoinSession(
+        taker_nick="J5FeePolicy",
+        offer=MagicMock(),
+        wallet=MagicMock(),
+        backend=backend,
+        minimum_fee_rate_sat_vb=2.0,
+    )
+    session.our_utxos = {("aa" * 32, 0): MagicMock(value=10_000)}
+
+    with (
+        patch("maker.coinjoin.MINER_FEE_PREVOUT_LOOKUP_TIMEOUT_SEC", 0.001),
+        patch("maker.coinjoin.logger") as mock_logger,
+    ):
+        error = await session._verify_minimum_miner_fee(_fee_policy_tx(19_000), None)
+
+    assert error is None
+    assert active_lookups == 0
+    backend.get_utxo.assert_awaited_once()
+    assert "lookup timed out" in mock_logger.warning.call_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_maker_minimum_fee_policy_bounds_foreign_prevout_lookup_concurrency():
+    from unittest.mock import AsyncMock, MagicMock
+
+    from jmcore.bitcoin import TxInput, TxOutput, serialize_transaction
+    from jmwallet.backends.base import UTXO
+
+    from maker.coinjoin import MINER_FEE_PREVOUT_LOOKUP_BATCH_SIZE, CoinJoinSession
+
+    active_lookups = 0
+    peak_lookups = 0
+
+    async def get_utxo(txid: str, vout: int) -> UTXO:
+        nonlocal active_lookups, peak_lookups
+        active_lookups += 1
+        peak_lookups = max(peak_lookups, active_lookups)
+        try:
+            await asyncio.sleep(0)
+            return UTXO(txid, vout, 10_000, "bcrt1qforeign", 1, "0014" + "22" * 20)
+        finally:
+            active_lookups -= 1
+
+    foreign_count = MINER_FEE_PREVOUT_LOOKUP_BATCH_SIZE * 2 + 1
+    foreign_inputs = [TxInput.from_hex(f"{index + 1:064x}", 0) for index in range(foreign_count)]
+    tx_hex = serialize_transaction(
+        version=2,
+        inputs=[TxInput.from_hex("aa" * 32, 0), *foreign_inputs],
+        outputs=[TxOutput(value=1, script=bytes.fromhex("0014" + "11" * 20))],
+        locktime=0,
+    ).hex()
+    backend = MagicMock()
+    backend.get_utxo = AsyncMock(side_effect=get_utxo)
+    session = CoinJoinSession(
+        taker_nick="J5FeePolicy",
+        offer=MagicMock(),
+        wallet=MagicMock(),
+        backend=backend,
+        minimum_fee_rate_sat_vb=2.0,
+    )
+    session.our_utxos = {("aa" * 32, 0): MagicMock(value=10_000)}
+
+    assert await session._verify_minimum_miner_fee(tx_hex, None) is None
+    assert peak_lookups == MINER_FEE_PREVOUT_LOOKUP_BATCH_SIZE
+    assert backend.get_utxo.await_count == foreign_count
 
 
 @pytest.mark.asyncio

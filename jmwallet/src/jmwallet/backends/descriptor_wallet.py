@@ -2272,7 +2272,7 @@ class DescriptorWalletBackend(BlockchainBackend):
         except Exception as e:
             logger.error("Failed to get UTXO")
             logger.bind(sensitive=True).error(f"Failed to get UTXO {txid}:{vout}: {e}")
-            return None
+            raise
 
     async def rescan_blockchain(self, start_height: int = 0) -> dict[str, Any]:
         """
