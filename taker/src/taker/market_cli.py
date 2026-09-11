@@ -48,6 +48,7 @@ from jmcore.credential_market import (
 from jmcore.crypto import NickIdentity
 from jmcore.external_podle import ExternalPoDLE, ExternalPoDLEOutpoint
 from jmcore.market_faults import MarketFaultCache
+from jmcore.paths import get_market_store_path
 from jmcore.podle import generate_podle
 from jmcore.protocol import JM_VERSION
 from jmcore.secure_files import (
@@ -539,8 +540,18 @@ def _command_export_podle(args: argparse.Namespace) -> None:
     _write_output(args.output, _serialized(record.model_dump(mode="json")), idempotent=True)
 
 
-def _seller_store(settings: JoinMarketSettings) -> MarketStore:
-    return MarketStore(_market_dir(settings) / "seller.sqlite")
+def _seller_store(settings: JoinMarketSettings, *, writable: bool = True) -> MarketStore:
+    _market_dir(settings)
+    store = MarketStore(get_market_store_path(settings.get_data_dir()))
+    try:
+        if writable and store.is_wallet_ledger:
+            raise MarketCLIError(
+                "wallet-bound seller commands are not available for activated ledgers"
+            )
+        return store
+    except BaseException:
+        store.close()
+        raise
 
 
 def _command_seller_add_inventory(args: argparse.Namespace) -> None:
@@ -589,7 +600,7 @@ def _command_seller_add_payment(args: argparse.Namespace) -> None:
 
 def _command_seller_pending(args: argparse.Namespace) -> None:
     settings = _settings(args)
-    store = _seller_store(settings)
+    store = _seller_store(settings, writable=False)
     try:
         quotes = [quote.model_dump(mode="json") for quote in store.pending(int(time.time()))]
     finally:
@@ -663,7 +674,7 @@ def _command_seller_settle(args: argparse.Namespace) -> None:
 
 
 def _command_seller_export(args: argparse.Namespace) -> None:
-    store = _seller_store(_settings(args))
+    store = _seller_store(_settings(args), writable=False)
     try:
         package = store.get_package(args.quote_id)
     finally:

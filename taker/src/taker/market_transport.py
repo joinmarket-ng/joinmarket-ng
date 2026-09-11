@@ -21,6 +21,7 @@ from typing import Any, TypeVar, cast
 from jmcore.credential_market import MAX_MARKET_BYTES, MarketError, canonical, decode_document
 from jmcore.crypto import NickIdentity, verify_signed_privmsg
 from jmcore.directory_client import DirectoryClient, DirectoryClientError
+from jmcore.market_keys import BoundMarketKeys, MarketKeyError
 from jmcore.network import ONION_HOSTID, HiddenServiceListener, OnionPeer, TCPConnection
 from jmcore.network import ConnectionError as NetworkConnectionError
 from jmcore.nick_auth import NickAuthMode
@@ -115,7 +116,7 @@ class MarketTransport(MultiDirectoryClient):
         stream_isolation: bool = True,
         nick_auth_mode: NickAuthMode = NickAuthMode.PREFER_VERIFIED,
         nick_auth_directory_ids: dict[str, str] | None = None,
-        encryption_private_key: PrivateKey | None = None,
+        encryption_private_key: PrivateKey | BoundMarketKeys | None = None,
         listing_callback: ListingCallback | None = None,
         responder: ResponderCallback | None = None,
         on_fault: FaultCallback | None = None,
@@ -124,8 +125,19 @@ class MarketTransport(MultiDirectoryClient):
         listen_port: int = 0,
         allow_clearnet_connections: bool = False,
     ) -> None:
-        if not isinstance(encryption_private_key, (PrivateKey, type(None))):
-            raise TypeError("encryption_private_key must be a nacl.public.PrivateKey")
+        if not isinstance(encryption_private_key, (PrivateKey, BoundMarketKeys, type(None))):
+            raise TypeError("encryption_private_key must be a PrivateKey or BoundMarketKeys")
+        if isinstance(encryption_private_key, BoundMarketKeys):
+            scope = encryption_private_key.scope
+            if scope.role != "seller":
+                raise MarketKeyError("Market transport provider key must have a seller scope")
+            if scope.network != network:
+                raise MarketKeyError(
+                    "Market transport provider key network does not match transport"
+                )
+            # Accessing the wallet identity rejects a capability closed before it
+            # reaches the provider, without retaining derived private material.
+            _ = encryption_private_key.wallet_id
         if listen_host is None and listen_port:
             raise ValueError("listen_port requires listen_host")
         self._validate_direct_location(network, direct_location, allow_clearnet_connections)
@@ -534,10 +546,14 @@ class MarketTransport(MultiDirectoryClient):
         if self.encryption_private_key is None or self.responder is None:
             return
         try:
-            decrypted = SealedBox(self.encryption_private_key).decrypt(self._decode_base64(data))
+            ciphertext = self._decode_base64(data)
+            if isinstance(self.encryption_private_key, BoundMarketKeys):
+                decrypted = self.encryption_private_key.decrypt_message(ciphertext)
+            else:
+                decrypted = SealedBox(self.encryption_private_key).decrypt(ciphertext)
             document = self._canonical_document(decrypted)
             request_id, reply_pubkey, body = self._request_envelope(document)
-        except (CryptoError, MarketError, TypeError, ValueError):
+        except (CryptoError, MarketError, MarketKeyError, TypeError, ValueError):
             return
 
         cache_key = (sender, request_id)

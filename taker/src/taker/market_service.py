@@ -29,7 +29,11 @@ from jmcore.credential_market import (
     verify_allocation,
     verify_authorization,
 )
+from jmcore.credential_market import (
+    accept_listing as accept_listing,
+)
 from jmcore.market_faults import MarketFaultCache
+from jmcore.market_keys import BoundMarketKeys, MarketKeyError
 from jmwallet.backends.base import BlockchainBackend, BondVerificationRequest
 from nacl.public import PrivateKey, SealedBox
 from pydantic import Field
@@ -103,8 +107,8 @@ class MarketService:
         self,
         store: MarketStore,
         authorization: SignedDocument,
-        signing_key: CKey,
-        encryption_key: PrivateKey,
+        signing_key: CKey | BoundMarketKeys,
+        encryption_key: PrivateKey | BoundMarketKeys,
         backend: BlockchainBackend,
         *,
         products: list[Product],
@@ -113,14 +117,19 @@ class MarketService:
         fault_cache: MarketFaultCache | None = None,
     ) -> None:
         self.authority = verify_authorization(authorization)
-        if signing_key.pub.hex() != self.authority.seller_pubkey:
-            raise MarketError("Wrong seller signing key")
         if not 1 <= quote_ttl <= 86400:
             raise MarketError("Invalid quote reservation lifetime")
         self.store = store
         self.authorization = authorization
         self.signing_key = signing_key
         self.encryption_key = encryption_key
+        self._wallet_bound = isinstance(signing_key, BoundMarketKeys)
+        if self._wallet_bound != isinstance(encryption_key, BoundMarketKeys):
+            raise MarketError("Seller signing and encryption keys must both be wallet-bound")
+        if self._wallet_bound:
+            self._validate_bound_keys()
+        if self._signing_public_key() != self.authority.seller_pubkey:
+            raise MarketError("Wrong seller signing key")
         self.backend = backend
         self.products = products
         self.price_sats = price_sats
@@ -129,6 +138,42 @@ class MarketService:
         self._verified_until = 0.0
         self._height = 0
         self._next_quote = 0.0
+
+    def _validate_bound_keys(self) -> None:
+        """Check that both wallet capabilities still authorize this seller session."""
+        if not self._wallet_bound:
+            return
+        if not isinstance(self.signing_key, BoundMarketKeys) or not isinstance(
+            self.encryption_key, BoundMarketKeys
+        ):
+            raise MarketError("Seller signing and encryption keys must both be wallet-bound")
+        if self.signing_key.wallet_id != self.encryption_key.wallet_id:
+            raise MarketError("Seller wallet-bound keys belong to different wallets")
+        if self.signing_key.scope != self.encryption_key.scope:
+            raise MarketError("Seller wallet-bound keys have different scopes")
+        if (
+            self.store.wallet_id != self.signing_key.wallet_id
+            or not self.store.is_wallet_ledger
+            or self.store.wallet_state() != "ready"
+        ):
+            raise MarketError("Seller wallet-bound keys require a ready matching market store")
+        self.signing_key.validate_seller_authorization(self.authority)
+        self.encryption_key.validate_seller_authorization(self.authority)
+
+    def _signing_public_key(self) -> str:
+        if isinstance(self.signing_key, BoundMarketKeys):
+            return self.signing_key.signing_public_key().hex()
+        return self.signing_key.pub.hex()
+
+    def _encryption_public_key(self) -> str:
+        if isinstance(self.encryption_key, BoundMarketKeys):
+            return self.encryption_key.encryption_public_key().hex()
+        return bytes(self.encryption_key.public_key).hex()
+
+    def _sign_document(self, body: MarketModel) -> SignedDocument:
+        if isinstance(self.signing_key, BoundMarketKeys):
+            return self.signing_key.sign_document(body)
+        return sign_document(body, self.signing_key)
 
     async def _check_stake(self) -> int:
         if time.monotonic() >= self._verified_until:
@@ -144,18 +189,20 @@ class MarketService:
 
     async def listing(self) -> bytes:
         await self._check_stake()
+        # The backend check can await. Revalidate durable wallet state and key
+        # ownership before exposing a fresh listing after it returns.
+        self._validate_bound_keys()
         return canonical(
-            sign_document(
+            self._sign_document(
                 MarketListing(
                     network=self.authority.bond.network,
                     period=self.authority.period,
                     seller_pubkey=self.authority.seller_pubkey,
-                    encryption_pubkey=bytes(self.encryption_key.public_key).hex(),
+                    encryption_pubkey=self._encryption_public_key(),
                     products=self.products,
                     price_sats=self.price_sats,
                     expires_at=int(time.time()) + 60,
-                ),
-                self.signing_key,
+                )
             )
         )
 
@@ -173,6 +220,7 @@ class MarketService:
                 return {"error": "busy"}
             self._next_quote = time.monotonic() + 1
             height = await self._check_stake()
+            self._validate_bound_keys()
             quote_document = self.store.create_quote(
                 self.authorization,
                 self.signing_key,
@@ -193,17 +241,8 @@ class MarketService:
                 quote.payment, self.authority.bond.network, int(time.time()), quote.expires_at
             )
             return {"quote": quote_document.model_dump(mode="json")}
-        except (ValueError, MarketStoreError):
+        except (MarketKeyError, ValueError, MarketStoreError):
             return {"error": "unavailable"}
-
-
-def accept_listing(raw: bytes, network: str, now: int) -> tuple[SignedDocument, MarketListing]:
-    signed = SignedDocument.model_validate(decode_document(raw))
-    candidate = MarketListing.model_validate(signed.body)
-    listing = signed.verified(MarketListing, candidate.seller_pubkey)
-    if listing.network != network or not now < listing.expires_at <= now + 120:
-        raise MarketError("Listing network or expiry mismatch")
-    return signed, listing
 
 
 async def accept_quote(

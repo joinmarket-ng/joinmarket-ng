@@ -19,6 +19,7 @@ import inspect
 import math
 import time
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Any, cast
 
 from jmcore.bitcoin import calculate_tx_vsize, get_address_type
@@ -31,7 +32,7 @@ from jmcore.logging_context import coinjoin_id_from_commitment, coinjoin_log_con
 from jmcore.market_faults import MarketFaultCache
 from jmcore.models import Offer
 from jmcore.notifications import get_notifier
-from jmcore.paths import read_nick_state
+from jmcore.paths import get_default_data_dir, read_nick_state
 from jmcore.protocol import FEATURE_NEUTRINO_COMPAT, JM_VERSION
 from jmcore.tasks import spawn_task
 from jmwallet.backends.base import BlockchainBackend, BondVerificationRequest
@@ -187,6 +188,16 @@ class Taker(TakerMonitoringMixin):
             config: Taker configuration
             confirmation_callback: Optional callback for user confirmation before proceeding
         """
+        podle_data_dir = config.data_dir
+        wallet_data_dir = getattr(wallet, "data_dir", None)
+        if isinstance(wallet_data_dir, Path):
+            podle_data_dir = (
+                get_default_data_dir() if podle_data_dir is None else podle_data_dir
+            ).resolve()
+            # Bind before activation too: this wallet may activate while the taker is running.
+            if wallet_data_dir.resolve() != podle_data_dir:
+                raise ValueError("Wallet and taker must use the same data directory")
+
         self.wallet = wallet
         self.backend = backend
         self.config = config
@@ -243,7 +254,10 @@ class Taker(TakerMonitoringMixin):
         self.market_fault_cache = MarketFaultCache(config.data_dir)
 
         # PoDLE manager for commitment tracking
-        self.podle_manager = PoDLEManager(config.data_dir)
+        wallet_id = getattr(wallet, "market_wallet_id", None)
+        self.podle_manager = PoDLEManager(
+            podle_data_dir, wallet_id=wallet_id if isinstance(wallet_id, str) else None
+        )
 
         # Per-CoinJoin state and protocol phases live in a dedicated
         # ``CoinJoinSession``. ``Taker`` owns persistent infrastructure
@@ -833,6 +847,7 @@ class Taker(TakerMonitoringMixin):
             await asyncio.gather(*self._background_tasks, return_exceptions=True)
         self._background_tasks.clear()
 
+        self.podle_manager.close()
         await self.directory_client.close_all()
         if close_wallet:
             await self.wallet.close()

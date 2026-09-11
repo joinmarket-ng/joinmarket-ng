@@ -14,6 +14,7 @@ authors = [
 license = {text = "GPL-3.0"}
 dependencies = [
     "pydantic>=2.5.0",
+    "typing-extensions>=4.6.1",
     "pydantic-settings>=2.1.0",
     "tomli>=2.0.0;python_version<'3.11'",
     "loguru>=0.7.2",

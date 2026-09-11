@@ -5,16 +5,35 @@ JoinMarket wallet service with mixdepth support.
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Iterable
+from dataclasses import replace
 from itertools import count, islice
 from pathlib import Path
 from threading import Lock
 from typing import Any
 
-from jmcore.btc_script import mk_freeze_script
+from bitcointx.core.key import CKey, CPubKey
+from jmcore.btc_script import derive_bond_address, mk_freeze_script
+from jmcore.constants import GENESIS_BLOCK_HASHES
+from jmcore.credential_market import (
+    BondCredential,
+    BondReference,
+    MarketAuthorization,
+    SignedDocument,
+    period_at_height,
+    sign_document,
+    verify_authorization,
+)
+from jmcore.crypto import bitcoin_message_hash_bytes, get_cert_msg
+from jmcore.external_podle import ExternalPoDLEOutpoint
+from jmcore.market_keys import BoundMarketKeys, MarketKeyError, MarketKeyScope, WalletMarketKeys
+from jmcore.market_store import MarketStore
+from jmcore.paths import get_market_store_path, get_used_commitments_path
+from jmcore.timenumber import timestamp_to_timenumber
 from loguru import logger
 
-from jmwallet.backends.base import BlockchainBackend
+from jmwallet.backends.base import BlockchainBackend, BondVerificationRequest
 from jmwallet.wallet.address import script_to_p2wsh_address
 from jmwallet.wallet.bip32 import HDKey, mnemonic_to_seed
 from jmwallet.wallet.coin_selection import CoinSelectionMixin
@@ -100,6 +119,7 @@ class WalletService(
 
         seed = mnemonic_to_seed(mnemonic, passphrase)
         self.master_key = HDKey.from_seed(seed)
+        self._market_keys = WalletMarketKeys(seed, network)
 
         coin_type = 0 if network == "mainnet" else 1
         self.root_path = f"m/84'/{coin_type}'"
@@ -1035,8 +1055,172 @@ class WalletService(
         """Return a copy of the reserved address -> user label mapping."""
         return dict(self.reserved_address_labels)
 
+    @property
+    def market_keys(self) -> WalletMarketKeys:
+        """Return this wallet session's non-exporting market key capability."""
+        return self._market_keys
+
+    @property
+    def market_wallet_id(self) -> str:
+        """Identify this wallet in private ledger state, across roles and networks."""
+        return self._market_keys.ledger_identity()
+
+    def activate_market_ledger(self, *, history_confirmed: bool = False) -> None:
+        """Explicitly reconcile local history, without starting market services.
+
+        Confirmation must come from an operator who has established that the
+        available history is complete. Neither a seed nor a backup proves this.
+        """
+        if history_confirmed is not True:
+            raise ValueError("Market ledger activation requires confirmed complete history")
+        if self.data_dir is None:
+            raise ValueError("Market ledger activation requires a wallet data directory")
+        wallet_id = self.market_wallet_id
+        with MarketStore(get_market_store_path(self.data_dir), wallet_id=wallet_id) as store:
+            store.activate_wallet(
+                get_used_commitments_path(self.data_dir), history_confirmed=history_confirmed
+            )
+
+    async def create_market_authorization(
+        self, outpoint: ExternalPoDLEOutpoint
+    ) -> tuple[BoundMarketKeys, SignedDocument]:
+        """Authorize a seller against an already-known, currently verified owned bond.
+
+        This does not sync the wallet, activate its ledger, or export a spending
+        key. The caller must separately require ledger readiness before serving.
+        """
+        self.market_wallet_id  # Reject a revoked wallet before any backend work.
+        outpoint = ExternalPoDLEOutpoint.model_validate(outpoint.model_dump())
+        matches = [
+            replace(utxo)
+            for utxo in self.utxo_cache.get(0, [])
+            if (utxo.txid, utxo.vout) == (outpoint.txid, outpoint.vout)
+        ]
+        if len(matches) != 1:
+            raise MarketKeyError("Seller bond must be an already-known wallet outpoint")
+        utxo = matches[0]
+        if utxo.locktime is None or utxo.confirmations < 1 or utxo.value <= 0:
+            raise MarketKeyError("Seller bond must be confirmed and timelocked")
+        timenumber = timestamp_to_timenumber(utxo.locktime)
+        key = self.get_fidelity_bond_key(0, utxo.locktime)
+        pubkey = key.get_public_key_bytes(compressed=True)
+        address = derive_bond_address(pubkey, utxo.locktime, self.network)
+        expected_path = f"{self.root_path}/0'/{FIDELITY_BOND_BRANCH}/{timenumber}"
+        if (
+            utxo.mixdepth != 0
+            or utxo.path != expected_path
+            or utxo.address != address.address
+            or utxo.scriptpubkey != address.scriptpubkey.hex()
+        ):
+            raise MarketKeyError("Seller bond does not match the wallet's canonical bond key")
+        try:
+            genesis = await self.backend.get_block_hash(0)
+            if not isinstance(genesis, str) or genesis != GENESIS_BLOCK_HASHES.get(self.network):
+                raise MarketKeyError("Seller backend genesis does not match the wallet network")
+            self.market_wallet_id
+            height = await self.backend.get_block_height()
+            median_time = await self.backend.get_median_time_past()
+            results = await self.backend.verify_bonds(
+                [
+                    BondVerificationRequest(
+                        txid=outpoint.txid,
+                        vout=outpoint.vout,
+                        utxo_pub=pubkey,
+                        locktime=utxo.locktime,
+                        address=address.address,
+                        scriptpubkey=address.scriptpubkey.hex(),
+                    )
+                ]
+            )
+        except MarketKeyError:
+            raise
+        except Exception as exc:
+            raise MarketKeyError(
+                "Could not verify seller bond against the configured chain"
+            ) from exc
+        if type(median_time) is not int or median_time < 0:
+            raise MarketKeyError("Seller backend median time is unavailable")
+        if utxo.locktime <= max(int(time.time()), median_time):
+            raise MarketKeyError("Seller bond is no longer timelocked")
+        if (
+            len(results) != 1
+            or not results[0].valid
+            or (results[0].txid, results[0].vout) != (outpoint.txid, outpoint.vout)
+            or results[0].confirmations < 1
+            or results[0].value != utxo.value
+        ):
+            raise MarketKeyError("Seller bond is unavailable or differs from wallet state")
+        scope = MarketKeyScope(
+            network=self.network,
+            chain_hash=genesis,
+            role="seller",
+            period=period_at_height(height),
+            bond=outpoint,
+        )
+        bound = self.market_keys.bind(scope)
+        authority = MarketAuthorization(
+            bond=BondReference(
+                network=self.network,
+                outpoint=outpoint,
+                pubkey=pubkey.hex(),
+                locktime=utxo.locktime,
+            ),
+            period=scope.period,
+            seller_pubkey=bound.signing_public_key().hex(),
+        )
+        authorization = sign_document(
+            authority, CKey.from_secret_bytes(key.get_private_key_bytes())
+        )
+        bound.wallet_id  # Do not return an authorization if the wallet was revoked during signing.
+        return bound, authorization
+
+    async def create_market_bond_credential(
+        self, authorization: SignedDocument, certificate_pubkey: str
+    ) -> BondCredential:
+        """Issue a renter certificate for the wallet's current native bond authority."""
+        authority = verify_authorization(authorization)
+        expiry = authority.period + 1
+        try:
+            validated_certificate = BondCredential(
+                bond=authority.bond,
+                cert_pubkey=certificate_pubkey,
+                cert_expiry=expiry,
+                cert_signature="00" * 8,
+            )
+            if not CPubKey(bytes.fromhex(validated_certificate.cert_pubkey)).is_fullyvalid():
+                raise ValueError("Certificate public key is not a valid secp256k1 point")
+        except (TypeError, ValueError) as exc:
+            raise MarketKeyError("Invalid renter certificate public key") from exc
+
+        bound, fresh_authorization = await self.create_market_authorization(authority.bond.outpoint)
+        fresh_authority = verify_authorization(fresh_authorization)
+        if (
+            authority.bond != fresh_authority.bond
+            or authority.period != fresh_authority.period
+            or authority.seller_pubkey != fresh_authority.seller_pubkey
+        ):
+            raise MarketKeyError("Requested authorization is not the current wallet authority")
+
+        bound.wallet_id
+        bond_key = self.get_fidelity_bond_key(0, fresh_authority.bond.locktime)
+        signature = CKey.from_secret_bytes(bond_key.get_private_key_bytes()).sign(
+            bitcoin_message_hash_bytes(
+                get_cert_msg(bytes.fromhex(validated_certificate.cert_pubkey), expiry)
+            )
+        )
+        bound.wallet_id
+        credential = BondCredential(
+            bond=fresh_authority.bond,
+            cert_pubkey=validated_certificate.cert_pubkey,
+            cert_expiry=expiry,
+            cert_signature=signature.hex(),
+        )
+        credential.verify()
+        return credential
+
     async def close(self) -> None:
         """Close backend connection"""
+        self._market_keys.close()
         await self.backend.close()
 
     # -- UTXO metadata (Group J) -------------------------------------------
