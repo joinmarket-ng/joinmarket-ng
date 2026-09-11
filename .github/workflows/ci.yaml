@@ -5,14 +5,19 @@ on:
     branches:
       - main
   pull_request_target:
-    # Fork PRs are gated by GitHub's fork-workflow approval before this starts.
     # Run from the base repository context, then explicitly check out the PR head
     # so the shared-image CI pipeline exercises the contributor's code.
     #
+    # pull_request_target runs are NOT gated by GitHub's fork-workflow approval
+    # setting (that only applies to pull_request), so fork code executes here
+    # unattended. This is acceptable only because the repository keeps no
+    # Actions secrets: there is nothing for a malicious PR to exfiltrate. Do not
+    # add secrets to this repository without first moving fork CI to the
+    # pull_request trigger.
+    #
     # Since June 2026, actions/checkout refuses fork-head checkouts under
     # pull_request_target by default (pwn-request hardening), so every such
-    # checkout step opts out via `allow-unsafe-pr-checkout: true`. This is a
-    # deliberate decision: fork runs require maintainer approval, checkouts use
+    # checkout step opts out via `allow-unsafe-pr-checkout: true`. Checkouts use
     # `persist-credentials: false`, the GITHUB_TOKEN is limited to
     # `contents: read` plus `packages: write` for CI-scoped image tags, build
     # caches are per-PR scoped, and CI images are quarantined under
