@@ -811,18 +811,33 @@ async def test_private_coordination_maintenance_triangle(tmp_path: Path) -> None
             raise
         # Exercise capability negotiation and advisory leases over real LND messages.
         # A new service conservatively quarantines remote pauses for a full minute.
+        # Payment retries share the peer request budget with capability, pause, and
+        # release messages. Start this phase with a fresh window on both peers.
         services[_LOCAL].config = services[_LOCAL].config.model_copy(
             update={"enabled": False}
         )
+        initiator = services[_LOCAL]
         helper = services[_HELPER]
         pause_deadline = asyncio.get_running_loop().time() + 75
         while True:
             helper_state = helper._read_state()
             assert helper_state is not None
-            if helper._monotonic_now() >= helper_state.spend_pause_quarantine_until:
+            last_sent = max(
+                initiator._outgoing_request_times.get(node_ids[_HELPER], ()), default=0
+            )
+            last_received = max(
+                helper._incoming_request_times.get(node_ids[_LOCAL], ()), default=0
+            )
+            if (
+                helper._monotonic_now() >= helper_state.spend_pause_quarantine_until
+                and initiator._now() >= last_sent + 60
+                and helper._now() >= last_received + 60
+            ):
                 break
             if asyncio.get_running_loop().time() >= pause_deadline:
-                raise RuntimeError("maintenance pause quarantine did not expire")
+                raise RuntimeError(
+                    "maintenance pause quarantine or request window did not expire"
+                )
             await asyncio.sleep(1)
         pause_point = opened[(_LOCAL, _HELPER)]
         pause = await services[_LOCAL].request_spend_pause(
