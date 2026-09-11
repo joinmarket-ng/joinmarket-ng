@@ -10,6 +10,12 @@ send payments, run a Lightning node, broadcast Bitcoin transactions, hold
 escrow, or provide fair exchange. Use it first on regtest with a small, capped
 exposure. Do not run unattended mainnet sales or purchases.
 
+The file-oriented seller commands below require a legacy, nonactivated seller
+store. Explicit wallet-ledger activation blocks those unbound seller writes and
+`serve`. Activated wallets use the authenticated daemon seller operations described
+below. Inspection and export remain available through the CLI. Activation does
+not enable automatic trading.
+
 The companion `jmp` repository contains the protocol drafts `jmp-0012.md`
 (Credential Market) and `jmp-0013.md` (Signed Market Fault Evidence) on branch
 `jmp-credential-market`. They are experimental, not stable interface references.
@@ -317,6 +323,209 @@ jm-market seller export \
   --quote-id "$QUOTE_ID" \
   --output market/recovered-finalized-package.json
 ```
+
+## Wallet-Native Key Capability
+
+The wallet service now constructs an in-memory market key capability directly
+from the binary BIP39 seed, including its passphrase. This is separate from the
+BIP32 spending tree. It exposes public keys, canonical market-document signing,
+and bounded NaCl sealed-box decryption, not private key export. Wallet close and
+daemon lock revoke subsequent operations through retained capability references.
+This is an in-process API boundary, not a sandbox or guaranteed memory erasure.
+
+Derivation uses [SLIP-0021](https://github.com/satoshilabs/slips/blob/master/slip-0021.md).
+The first label is the ASCII string `JoinMarket NG credential market`. Subsequent
+labels, each a separate child derivation, are:
+
+```text
+v1 / network / NETWORK / chain / GENESIS_HASH / role / ROLE / period / PERIOD
+   / bond / BOND_LABELS / trade / TRADE_LABELS / purpose / PURPOSE / algorithm / ALGORITHM
+```
+
+Hashes are lowercase hexadecimal ASCII and integers are minimal decimal ASCII.
+`BOND_LABELS` is `none`, or the three labels `outpoint / TXID / VOUT`.
+`TRADE_LABELS` is `none`, or `id / TRADE_ID`. The chain hash is the genesis block
+hash, never the moving tip. Inputs are canonical public context, not evidence of
+bond ownership or chain verification.
+
+Document signing uses purpose `document-signing` and algorithm
+`secp256k1-ecdsa-bitcoin-message`, followed by a decimal counter starting at `0`.
+Invalid secp256k1 scalars are rejected without modular reduction, trying up to
+256 counter labels. Encryption uses purpose `message-encryption` and algorithm
+`x25519-xsalsa20-poly1305-sealedbox`; NaCl applies the X25519 key clamping.
+Both take the last 32 bytes of their final SLIP-0021 node as key material.
+
+The wallet-native seller uses this capability for market signing and message
+decryption. The wallet separately signs delegated bond credentials internally
+after verifying its owned bond and the renter's public key. Buyer acquisition and
+renter key management still use the file-oriented CLI. Upgrading an existing
+installation does not create a market ledger, migrate key files, start a market
+service, or trigger rescans. Recovering keys from a seed does not recover
+allocation history; unknown or restored ledger state must not automatically enable
+issuance.
+
+The private ledger identifier is SHA256 of the key bytes of the additional
+`wallet-ledger-identity-v1` child of the application node. It identifies the same
+seed/passphrase across roles and networks, is not the eight-character wallet
+fingerprint, and must not be published as a market identity.
+
+The existing durable seller store is now shared as `jmcore.market_store`, with
+compatible imports retained in `taker.market_store`. New stores retain the
+version-1 schema until an explicit activation operation.
+
+### Wallet Ledger Activation
+
+The local Python API `WalletService.activate_market_ledger(history_confirmed=True)`
+binds the wallet's full private identifier to the shared ledger. The equivalent
+authenticated daemon endpoint is `POST /api/v1/wallet/{walletname}/market/ledger/activate`
+with `{"history_confirmed":true}`. Confirmation means the operator has established
+complete history, including all allocations and consumption; the API cannot
+establish that fact from a seed, an empty directory, or a structurally valid backup.
+
+Activation upgrades `market/seller.sqlite` to version 2, records a durable
+`seller.sqlite.wallet-ledger` intent, binds the exact absolute
+`cmtdata/commitments.json` path, and imports known consumption and external-pool
+records. An `activating` state is committed before history import. Success records
+`ready`; failure leaves `activating` or `recovery_required`, never a fresh empty
+ledger. Repeating activation cannot clear a recovery requirement.
+
+| Existing State | Behavior |
+| --- | --- |
+| No market database or intent | Existing CoinJoin behavior; no automatic market activation |
+| Valid version-1 store without native artifacts | Existing seller and CoinJoin behavior; no automatic migration |
+| Version-1 store with activation intent | Interrupted activation, fail closed without rebuilding |
+| Valid version-2 store and ready wallet | Ledger governs market inventory and local PoDLE claims |
+| Disabled wallet in a valid shared ledger | Ordinary local CoinJoin use remains allowed and recorded; seller writes are blocked |
+| Activating or recovery-required wallet | No market issuance or local PoDLE use for that wallet |
+| Missing or inconsistent version-2 metadata, intent, ownership, or database | Fail closed; preserve surviving state for recovery |
+
+One commitment-ownership row prevents a PoDLE hash from being both market
+inventory and locally usable, across periods and wallet switches. An external
+purchase is held locally before use, not consumed on import. The taker commits
+its used claim before projecting JSON and before returning the proof. A failed
+JSON write can burn an opening, but cannot release it for reuse. Selection uses
+a snapshot; final use rechecks the authoritative state under the shared lock.
+All operations spanning the stores take the JSON sidecar lock before SQLite.
+
+Only one wallet session is active. Its native seller can run alongside ordinary
+CoinJoin activity in that wallet. Switching wallets preserves existing
+ownership, including another wallet's unconsumed external holds. Closing a taker
+releases its cached ledger handle without closing a shared wallet when
+`close_wallet=False`.
+
+When a wallet has an explicit data directory, its taker must use the same
+canonical directory. Mismatches are rejected before taker initialization, even
+before market activation, because that wallet may activate while the taker is
+running. Relative paths and directory aliases resolving to the same location are
+accepted. On upgrade, callers that previously split wallet and taker state across
+directories must align their configuration; no history is moved, rewritten, or
+rescanned. Wallet services without an explicit data directory retain the existing
+taker-configured path behavior and cannot activate a wallet ledger without one.
+
+Known live database replacement or missing artifacts permanently stop that
+manager's native use. A complete, internally consistent rollback performed while
+the application is stopped cannot be detected from these local files alone.
+Known-restored ledgers must be marked recovery-required. Supported explicit
+maintenance is described below; it cannot reconstruct missing allocations. Do not
+delete metadata or run older writers concurrently to bypass these guards. The
+legacy local save-error suppression remains unchanged only before native activation.
+
+### Native Seller Operations
+
+These experimental endpoints require the unlocked wallet's JWT bearer token.
+All paths below are relative to `/api/v1/wallet/{walletname}/market`. The daemon
+rechecks authentication after acquiring its wallet lifecycle lock, including
+requests queued while the wallet is locked or switched.
+
+| Method and Path | Request or Result |
+| --- | --- |
+| `GET /ledger` | Read-only state, schema version, and a short diagnosis; no private wallet identifier or credential data |
+| `POST /seller/start` | `bond` outpoint, `products` list, positive `price_sats`, optional `quote_ttl`; returns 202 with startup status |
+| `GET /seller` | Starting, running, or stopped status, public seller identity, and sanitized startup error |
+| `POST /seller/stop` | Stop this seller; keep the wallet and shared backend open |
+| `POST /seller/inventory` | `{"product":"bond"}` for the configured owned bond, or `{"product":"podle","credential":...}` for a validated external opening |
+| `POST /seller/payments` | Externally generated `PaymentTerms`, as in the CLI workflow |
+| `GET /seller/pending` | Live signed quotes for this seller authority |
+| `POST /seller/settle/{quote_id}` | One locally verified settlement form, described below |
+
+Start accepts this shape (the outpoint is a placeholder, **NOT WIRE** data):
+
+```json
+{
+  "bond": {"txid": "<64-lowercase-hex, NOT WIRE>", "vout": 0},
+  "products": ["podle", "bond"],
+  "price_sats": 1000,
+  "quote_ttl": 300
+}
+```
+
+The bond must already be present in the wallet's cached mixdepth-0 state and match
+its canonical bond key, address, and script. Startup checks the backend's genesis,
+height, median time, confirmations, unspent value, and locktime. It opens only an
+existing ready ledger with the correct commitments binding. It does not activate
+the ledger, sync the wallet, or rescan to find a bond. Directory relay uses the
+configured Tor connection and a fresh nickname; native direct onion hosting is
+not configured by these endpoints.
+
+Queue inventory and payment requests explicitly after startup. The native quote
+lifetime is currently 1 to 900 seconds, default 300. Settlement accepts either
+`{"onchain_outpoint":"<txid:vout, NOT WIRE>"}` or
+`{"preimage":"<64-lowercase-hex, NOT WIRE>","acknowledge_ln_settlement":true}`.
+On-chain verification requires a full-node backend and an exact confirmed unspent
+output. A Lightning preimage must come from the operator's payment wallet or node,
+with explicit local settlement acknowledgment. Remote market messages cannot
+settle a trade, and none of these operations sends a payment.
+
+For a bond sale, the wallet creates the renter's delegated certificate internally
+before finalization. The bond spending key stays inside the wallet. Finalization
+persists the signed package and buyer-sealed delivery before returning. If an API
+response is lost or authentication expires after finalization, the buyer can still
+retrieve the saved delivery. Use `jm-market seller export` to recover a finalized
+package, including after expiry or restart; do not pay again based on an API error.
+
+Seller startup and settlement chain checks allow wallet lock to proceed. Lock
+revokes capabilities before stopping seller resources; a failed close keeps the
+wallet reserved until cleanup succeeds. Daemon shutdown also revokes market keys
+and stops its seller. Each runtime is bound to one retarget period; stop and start
+it explicitly for a new period. Services do not restart automatically on unlock.
+
+### Diagnosis, Recovery, and Directory Moves
+
+`GET /ledger` does not create directories or files, change permissions, repair
+SQLite, or import history. A journal, concurrent artifact change, or unreadable
+database produces an unavailable diagnosis. Missing or inconsistent authoritative
+state remains blocked. Diagnosis is an observation, never permission to skip the
+normal operational checks.
+
+Stop the daemon's seller and CoinJoin services before any ledger maintenance.
+All maintenance paths below use `POST` with a JSON body:
+
+| Path | Required Body | Supported Effect |
+| --- | --- | --- |
+| `/ledger/block` | `{}` | Mark the current wallet recovery-required, for example when a restore is known |
+| `/ledger/recover` | `{"history_confirmed":true}` | Merge confirmed history into an intact version-2 ledger in activating or recovery-required state |
+| `/ledger/rebind` | `history_confirmed: true`, `writers_stopped: true`, and `previous_commitments_path` | Rebind an intact moved ledger to this wallet directory's commitments file |
+
+Recovery requires an existing regular commitments JSON file and matching database
+and intent. It persists recovery-required before reading history, then merges and
+marks ready in one transaction. It never deletes tombstones, allocations,
+reservations, or ownership. Confirmed used entries can permanently consume local
+holds, including holds belonging to another wallet, while preserving their owner.
+A false used entry therefore burns that opening; a collision with market inventory
+refuses recovery. Recovery cannot activate a disabled wallet, repair version-1
+interrupted activation, rebuild a missing database or intent, or prove that a
+restored database includes every issued allocation.
+
+For a directory move, stop **all writers of both directories**, retain a complete
+copy of the database, its intent, and commitments history, and point the unlocked
+wallet and daemon at the destination. Supply the exact previous absolute
+commitments path to `/ledger/rebind`. The destination commitments file must exist.
+The operation does not copy files or recreate the old directory. It records a
+durable transition before merging history or changing either binding. Normal
+operations refuse a pending transition; retry the same explicitly confirmed
+rebind after an interruption. Successful completion retains the previous and new
+paths for exact retry validation and preserves each wallet's activation state.
+Rebinding does not clear a recovery requirement or detect a complete offline rollback.
 
 ## Buyer Workflow
 
