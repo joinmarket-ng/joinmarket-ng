@@ -39,6 +39,14 @@ To install a particular release, add `--version X.Y.Z`. This selects the
 application release; the saved installer still refreshes to the latest
 authenticated installer.
 
+When updating from the TUI, the output is saved in a private `update.log.*` file
+under your data directory's `logs` folder. After the update, a scrollable viewer
+opens at the end of the log so you can review configuration-template differences
+and any errors. Use the arrow keys or Page Up/Page Down to scroll, then press `q`
+to continue. If `less` is unavailable, the TUI waits for Enter instead. The log
+remains available after you leave the TUI. A successful update exits the TUI;
+a failed update returns to the update menu after review.
+
 ## Older Installations
 
 Installations created before the saved updater can migrate with one final HTTPS

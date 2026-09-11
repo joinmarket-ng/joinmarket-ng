@@ -260,6 +260,20 @@ pause() {
   clear
 }
 
+# Keep update output reviewable even when the parent menu clears the terminal.
+review_update_output() {
+    local update_log="$1"
+    echo ""
+    echo "Update output saved to: $update_log"
+    if [ -t 0 ] && [ -t 1 ] && command -v less >/dev/null 2>&1; then
+        # Ignore LESS options that could automatically close a short log.
+        LESS= LESSSECURE=1 less -R +G \
+            -P 'Update output (Up/Down or PgUp/PgDn to scroll, q to continue)' \
+            -- "$update_log" && return
+    fi
+    read -r -p "Press [Enter] after reviewing the update output to continue..." fakeEnterKey
+}
+
 # Helper: Get configured mnemonic file from config.toml
 get_mnemonic_file() {
     "$TUI_PYTHON" -m jmcore.config_file get \
@@ -2423,44 +2437,58 @@ except (json.JSONDecodeError, AttributeError):
 
         clear
 
-        if [ "$RASPIBLITZ" = "1" ]; then
-            if [ "$UCHOICE" = "VERSION" ]; then
-                sudo "$BONUS_SCRIPT" update "$TARGET_VERSION"
-            elif [ "$UCHOICE" = "DEV" ]; then
-                sudo "$BONUS_SCRIPT" update main
-            else
-                sudo "$BONUS_SCRIPT" update
-            fi
-            UPDATE_RC=$?
-        else
-            # Standalone: prefer the locally saved installer, which
-            # authenticates its own replacement against embedded GPG
-            # trust anchors before applying any update.
-            TRUSTED_INSTALLER="$DATA_DIR/install.sh"
-            if [ -f "$TRUSTED_INSTALLER" ]; then
-                echo "Running trusted installer copy..."
-                bash "$TRUSTED_INSTALLER" --update $UPDATE_ARGS -y
-                UPDATE_RC=$?
-            else
-                # First run on an installation that predates the trusted
-                # copy: bootstrap once over HTTPS, like the initial install.
-                echo "No trusted installer copy found; downloading installer..."
-                INSTALL_SCRIPT=$(mktemp)
-                curl -sSL "https://raw.githubusercontent.com/joinmarket-ng/joinmarket-ng/main/install.sh" -o "$INSTALL_SCRIPT"
-                bash "$INSTALL_SCRIPT" --update $UPDATE_ARGS -y
-                UPDATE_RC=$?
-                rm -f "$INSTALL_SCRIPT"
-            fi
-        fi
-
-        echo ""
-        if [ "$UPDATE_RC" -eq 0 ]; then
-            echo "Update complete. Please restart the TUI: jm-ng"
-        else
-            echo "ERROR: Update failed (exit code ${UPDATE_RC})."
-            echo "Review the output above for details."
-            echo "The previous installation is unchanged."
+        # Save both output streams in a private log for review without scrollback.
+        UPDATE_LOG=$(mktemp "$LOG_DIR/update.log.XXXXXX") || {
+            echo "ERROR: Cannot create an update log in $LOG_DIR."
             pause
+            continue
+        }
+        (
+            if [ "$RASPIBLITZ" = "1" ]; then
+                if [ "$UCHOICE" = "VERSION" ]; then
+                    sudo "$BONUS_SCRIPT" update "$TARGET_VERSION"
+                elif [ "$UCHOICE" = "DEV" ]; then
+                    sudo "$BONUS_SCRIPT" update main
+                else
+                    sudo "$BONUS_SCRIPT" update
+                fi
+                UPDATE_RC=$?
+            else
+                # Standalone: prefer the locally saved installer, which
+                # authenticates its own replacement against embedded GPG
+                # trust anchors before applying any update.
+                TRUSTED_INSTALLER="$DATA_DIR/install.sh"
+                if [ -f "$TRUSTED_INSTALLER" ]; then
+                    echo "Running trusted installer copy..."
+                    bash "$TRUSTED_INSTALLER" --update $UPDATE_ARGS -y
+                    UPDATE_RC=$?
+                else
+                    # First run on an installation that predates the trusted
+                    # copy: bootstrap once over HTTPS, like the initial install.
+                    echo "No trusted installer copy found; downloading installer..."
+                    INSTALL_SCRIPT=$(mktemp)
+                    curl -sSL "https://raw.githubusercontent.com/joinmarket-ng/joinmarket-ng/main/install.sh" -o "$INSTALL_SCRIPT"
+                    bash "$INSTALL_SCRIPT" --update $UPDATE_ARGS -y
+                    UPDATE_RC=$?
+                    rm -f "$INSTALL_SCRIPT"
+                fi
+            fi
+            exit "$UPDATE_RC"
+        ) 2>&1 | tee "$UPDATE_LOG"
+        UPDATE_RC=${PIPESTATUS[0]}
+
+        {
+            echo ""
+            if [ "$UPDATE_RC" -eq 0 ]; then
+                echo "Update complete. Please restart the TUI: jm-ng"
+            else
+                echo "ERROR: Update failed (exit code ${UPDATE_RC})."
+                echo "Review the output above for details."
+                echo "The previous installation is unchanged."
+            fi
+        } | tee -a "$UPDATE_LOG"
+        review_update_output "$UPDATE_LOG"
+        if [ "$UPDATE_RC" -ne 0 ]; then
             continue
         fi
         exit 0

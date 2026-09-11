@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import os
+import pty
+import select
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import patch
@@ -558,6 +562,167 @@ def test_tui_script_update_prefers_trusted_installer_copy() -> None:
     assert update_block.index('if [ -f "$TRUSTED_INSTALLER" ]') < update_block.index(
         "raw.githubusercontent.com/joinmarket-ng/joinmarket-ng/main/install.sh"
     )
+
+
+@pytest.fixture
+def update_review_function() -> str:
+    content = SCRIPT_PATH.read_text()
+    return (
+        "review_update_output() {"
+        + content.split("review_update_output() {", 1)[1].split("\n}", 1)[0]
+        + "\n}\n"
+    )
+
+
+def _read_until(fd: int, marker: bytes) -> bytes:
+    output = b""
+    deadline = time.monotonic() + 5
+    while marker not in output:
+        remaining = deadline - time.monotonic()
+        assert remaining > 0 and select.select([fd], [], [], remaining)[0], output
+        chunk = os.read(fd, 65536)
+        assert chunk, output
+        output += chunk
+    return output
+
+
+@pytest.mark.parametrize("installer", ["trusted", "bootstrap", "raspiblitz"])
+@pytest.mark.parametrize("exit_code", [0, 23])
+def test_tui_update_logs_output_and_waits_before_leaving(
+    tmp_path: Path, update_review_function: str, installer: str, exit_code: int
+) -> None:
+    """Run the update/completion branch with a fake installer and real pipe input."""
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    fake_installer = tmp_path / (
+        "install.sh" if installer == "trusted" else "fake-installer.sh"
+    )
+    fake_installer.write_text(
+        "printf 'config template diff\\n'\n"
+        "printf 'installer diagnostic\\n' >&2\n"
+        f"exit {exit_code}\n"
+    )
+    update_block = (
+        SCRIPT_PATH.read_text().split("    U)\n", 1)[1].split("\n    I)\n", 1)[0]
+    )
+    completion = update_block[
+        update_block.index("        # Save both output streams") :
+    ].split("      done", 1)[0]
+    script = (
+        update_review_function
+        + """
+        DATA_DIR="$1"
+        LOG_DIR="$DATA_DIR/logs"
+        RASPIBLITZ="$2"
+        BONUS_SCRIPT="$3"
+        UCHOICE=STABLE
+        UPDATE_ARGS=""
+        sudo() { bash "$@"; }
+        curl() { cp "$BONUS_SCRIPT" "${@: -1}"; }
+        clear() { echo UNEXPECTED_CLEAR; }
+        for attempt in once; do
+    """
+        + completion
+        + "\ndone\necho RETURNED_TO_UPDATE_MENU\n"
+    )
+
+    with subprocess.Popen(
+        [
+            "bash",
+            "-c",
+            script,
+            "bash",
+            str(tmp_path),
+            str(int(installer == "raspiblitz")),
+            str(fake_installer),
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    ) as process:
+        try:
+            assert process.stdout is not None
+            output = _read_until(process.stdout.fileno(), b"Update output saved to:")
+            assert process.poll() is None, "Update left before acknowledgment"
+            remainder, _ = process.communicate(input=b"\n", timeout=5)
+            output += remainder
+        finally:
+            if process.poll() is None:
+                process.kill()
+
+    assert process.returncode == 0, output
+    assert b"UNEXPECTED_CLEAR" not in output
+    logs = list(log_dir.glob("update.log.*"))
+    assert len(logs) == 1
+    assert logs[0].stat().st_mode & 0o777 == 0o600
+    log = logs[0].read_text()
+    assert "config template diff" in log
+    assert "installer diagnostic" in log
+    if exit_code == 0:
+        assert "Update complete" in log
+        assert b"RETURNED_TO_UPDATE_MENU" not in output
+    else:
+        assert f"ERROR: Update failed (exit code {exit_code})" in log
+        assert "Update complete" not in log
+        assert b"RETURNED_TO_UPDATE_MENU" in output
+
+
+@pytest.mark.parametrize("pager", ["available", "failed", "missing"])
+def test_tui_update_review_waits_in_terminal(
+    tmp_path: Path, update_review_function: str, pager: str
+) -> None:
+    """Exercise terminal detection, pager options, and both fallback paths."""
+    log = tmp_path / "update.log"
+    log.write_text("config template diff\n")
+    script = (
+        update_review_function
+        + """
+        export LESS=FX
+        clear() { echo UNEXPECTED_CLEAR; }
+        less() {
+            printf 'LESS=%s SECURE=%s\\n' "$LESS" "$LESSSECURE"
+            printf 'ARG=%s\\n' "$@"
+            if [ "$2" != "+G" ]; then return 2; fi
+            cat "${@: -1}"
+            if [ "$PAGER_MODE" = failed ]; then return 1; fi
+            echo PAGER_WAITING
+            read -r acknowledgment
+        }
+        PAGER_MODE="$2"
+        if [ "$PAGER_MODE" = missing ]; then command() { return 1; }; fi
+        review_update_output "$1"
+        echo REVIEW_FINISHED
+    """
+    )
+    master, slave = pty.openpty()
+    try:
+        with subprocess.Popen(
+            ["bash", "-c", script, "bash", str(log), pager],
+            stdin=slave,
+            stdout=slave,
+            stderr=slave,
+        ) as process:
+            try:
+                marker = (
+                    b"PAGER_WAITING" if pager == "available" else b"Press [Enter] after"
+                )
+                output = _read_until(master, marker)
+                assert process.poll() is None, "Review closed before acknowledgment"
+                assert b"REVIEW_FINISHED" not in output
+                if pager != "missing":
+                    assert b"LESS= SECURE=1" in output
+                    assert b"ARG=-R" in output
+                    assert b"config template diff" in output
+                os.write(master, b"\n")
+                output += _read_until(master, b"REVIEW_FINISHED")
+                assert process.wait(timeout=5) == 0
+                assert b"UNEXPECTED_CLEAR" not in output
+            finally:
+                if process.poll() is None:
+                    process.kill()
+    finally:
+        os.close(master)
+        os.close(slave)
 
 
 # ---------------------------------------------------------------------------
