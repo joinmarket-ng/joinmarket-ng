@@ -47,6 +47,11 @@ Automated dependency update pull requests are intentionally disabled. Maintainer
 refresh dependencies with the repository update scripts before releases, while
 GitHub vulnerability alerts and scheduled audits report issues between releases.
 
+Third-party GitHub Actions are pinned to full commit SHAs with the release
+version in a trailing comment, so a moved or compromised tag cannot change the
+code a workflow runs. Maintainers advance the pins deliberately, as with other
+dependencies.
+
 All high and critical image findings are retained in the workflow artifacts.
 Findings with a published fix block image promotion; findings without a fix
 produce warnings for maintainer review. Scanner matches identify affected

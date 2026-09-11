@@ -69,7 +69,7 @@ jobs:
       # aarch64 cross-compilation setup (only for aarch64 matrix entry)
       - name: Set up QEMU for aarch64
         if: matrix.arch == 'aarch64'
-        uses: docker/setup-qemu-action@v4
+        uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4.3.0
         with:
           platforms: arm64
 

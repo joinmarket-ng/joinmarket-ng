@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -47,6 +48,27 @@ def _workflow(name: str) -> dict[str, Any]:
 
 def test_dependency_updates_remain_maintainer_driven() -> None:
     assert not (REPO_ROOT / ".github" / "dependabot.yml").exists()
+
+
+def test_third_party_actions_are_pinned_to_commit_shas() -> None:
+    """Mutable tags let a moved or compromised upstream tag change workflow
+    code; only GitHub-owned actions (immutable releases) and local actions
+    may be referenced by tag."""
+    unpinned: list[str] = []
+    for workflow in sorted(WORKFLOWS.glob("*.yaml")):
+        for lineno, line in enumerate(
+            workflow.read_text(encoding="utf-8").splitlines(), start=1
+        ):
+            match = re.search(r"uses:\s*([^\s#]+)", line)
+            if not match:
+                continue
+            ref = match.group(1)
+            if ref.startswith(("./", "actions/", "github/")):
+                continue
+            _, _, version = ref.partition("@")
+            if not re.fullmatch(r"[0-9a-f]{40}", version):
+                unpinned.append(f"{workflow.name}:{lineno}: {ref}")
+    assert unpinned == []
 
 
 def _dockerfile_stage(path: str, stage: str) -> str:

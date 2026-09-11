@@ -14,7 +14,7 @@ jobs:
       issues: write
     steps:
       - name: Fast-forward pull request
-        uses: sequoia-pgp/fast-forward@v1
+        uses: sequoia-pgp/fast-forward@ea7628bedcb0b0b96e94383ada458d812fca4979 # v1.0.0
         with:
           merge: true
           comment: always
