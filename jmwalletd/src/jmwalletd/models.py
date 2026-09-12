@@ -414,6 +414,28 @@ class DoCoinjoinRequest(BaseModel):
     input_utxos: list[str] | None = None
 
 
+class TakerStatusResponse(BaseModel):
+    """GET /api/v1/wallet/{walletname}/taker/status response.
+
+    Reports the outcome of the most recent single-shot ``taker/coinjoin``
+    call (or the live one, while ``running`` is true), mirroring the
+    status/txid/error shape of ``TumblerPhaseResponse`` so a caller has
+    real evidence of what happened instead of inferring it from wallet-level
+    side effects such as a changed utxo set (issue #627).
+
+    ``status`` is a ``TakerState`` value (e.g. ``"complete"``, ``"failed"``,
+    ``"broadcasting"``) or ``None`` if no taker run has happened yet this
+    session. A ``txid`` being present does not by itself mean the CoinJoin
+    is final: check ``status == "complete"`` for a good broadcast, and
+    confirmation status separately via the wallet history.
+    """
+
+    running: bool
+    status: str | None = None
+    txid: str | None = None
+    error: str | None = None
+
+
 class TumblerPlanRequest(BaseModel):
     """POST /api/v1/wallet/{walletname}/tumbler/plan request.
 

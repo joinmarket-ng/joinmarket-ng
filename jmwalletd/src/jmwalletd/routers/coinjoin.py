@@ -27,6 +27,7 @@ from jmwalletd.models import (
     DirectSendResponse,
     DoCoinjoinRequest,
     StartMakerRequest,
+    TakerStatusResponse,
     TxInfo,
     TxInput,
     TxOutput,
@@ -174,9 +175,13 @@ async def do_coinjoin(
         state.last_broadcast_policy = None
         state.last_broadcast_method = None
         state.last_broadcast_fallback_reason = None
+        state.last_taker_status = None
+        state.last_taker_txid = None
+        state.last_taker_error = None
 
         async def _run_coinjoin() -> None:
             taker: Any | None = None
+            run_exception: Exception | None = None
             try:
                 jm_settings = get_settings()
                 bitcoin_network = (
@@ -209,7 +214,8 @@ async def do_coinjoin(
                     counterparty_count=body.counterparties,
                     input_utxos=body.input_utxos,
                 )
-            except Exception:
+            except Exception as exc:
+                run_exception = exc
                 logger.error("Coinjoin failed")
                 logger.bind(sensitive=True).exception("Coinjoin failed")
             finally:
@@ -222,11 +228,26 @@ async def do_coinjoin(
                     state.last_broadcast_fallback_reason = (
                         taker.last_broadcast_fallback_reason or None
                     )
+                    state.last_taker_status = taker.state.value if taker.state else None
+                    state.last_taker_txid = taker.txid or None
+                    # ``last_failure_reason`` covers the specific failure paths the
+                    # taker itself recognizes (e.g. a declined confirmation); fall
+                    # back to the exception that unwound this task for anything
+                    # else, so a caller polling /taker/status is never left with
+                    # a "failed" status and no reason.
+                    state.last_taker_error = taker.last_failure_reason or (
+                        str(run_exception) if run_exception is not None else None
+                    )
                     try:
                         await taker.stop(close_wallet=False)
                     except Exception:
                         logger.error("Taker teardown failed")
                         logger.bind(sensitive=True).exception("Taker teardown failed")
+                elif run_exception is not None:
+                    # The Taker never got constructed (e.g. config/backend setup
+                    # failed) -- still record something explaining why.
+                    state.last_taker_status = "failed"
+                    state.last_taker_error = str(run_exception)
                 state.activate_coinjoin_state(CoinjoinState.NOT_RUNNING)
                 state._taker_ref = None
 
@@ -274,6 +295,41 @@ async def stop_coinjoin(
     state._taker_ref = None
     state._taker_task = None
     return JSONResponse(content={}, status_code=202)
+
+
+# ---------------------------------------------------------------------------
+# GET /api/v1/wallet/{walletname}/taker/status
+# ---------------------------------------------------------------------------
+@router.get("/wallet/{walletname}/taker/status", operation_id="takerstatus")
+async def taker_status(
+    walletname: str,
+    _auth: dict[str, Any] = Depends(require_auth),
+    _wallet: None = Depends(require_wallet_match),
+    state: DaemonState = Depends(get_daemon_state),
+) -> TakerStatusResponse:
+    """Report the outcome of the most recent single-shot taker/coinjoin call.
+
+    While a run is in progress, reads live off the ``Taker`` instance so
+    callers can poll for phase changes; once it tears down, falls back to the
+    snapshot ``_run_coinjoin`` took right before doing so. Returns an "empty"
+    response (``status`` and ``txid`` both ``None``) if no taker run has
+    happened yet this session -- that is not itself evidence of anything.
+    """
+    taker = state._taker_ref
+    if taker is not None:
+        return TakerStatusResponse(
+            running=state.taker_running,
+            status=taker.state.value if taker.state else None,
+            txid=taker.txid or None,
+            error=taker.last_failure_reason or None,
+        )
+
+    return TakerStatusResponse(
+        running=state.taker_running,
+        status=state.last_taker_status,
+        txid=state.last_taker_txid,
+        error=state.last_taker_error,
+    )
 
 
 # ---------------------------------------------------------------------------
