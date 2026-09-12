@@ -15,6 +15,7 @@ from jmcore.secure_files import (
     ensure_private_file,
     ensure_sensitive_directory,
     ensure_sensitive_file,
+    exclusive_file_lock,
     read_private_file,
     read_sensitive_file,
 )
@@ -255,3 +256,37 @@ def test_ensure_sensitive_directory_preserves_existing_alias_mode(tmp_path: Path
 
     assert link.is_symlink()
     assert _mode(target) == 0o755
+
+
+def test_sidecar_lock_releases_after_exception_and_rejects_symlinks(tmp_path: Path) -> None:
+    lock = tmp_path / "state.lock"
+    with pytest.raises(RuntimeError), exclusive_file_lock(lock):
+        raise RuntimeError("failed operation")
+    with exclusive_file_lock(lock):
+        assert lock.stat().st_mode & 0o777 == 0o600
+    link = tmp_path / "link.lock"
+    link.symlink_to(lock)
+    with pytest.raises(OSError, match="symlink"), exclusive_file_lock(link):
+        pytest.fail("symlink lock acquired")
+
+
+def test_windows_sidecar_locks_one_stable_byte(tmp_path: Path, monkeypatch) -> None:
+    import sys
+    from types import SimpleNamespace
+
+    import jmcore.secure_files as secure_files
+
+    lock = tmp_path / "windows.lock"
+    calls: list[tuple[int, int, int]] = []
+
+    def locking(fd: int, operation: int, size: int) -> None:
+        calls.append((operation, size, os.lseek(fd, 0, os.SEEK_CUR)))
+
+    fake = SimpleNamespace(locking=locking, LK_LOCK=1, LK_UNLCK=2)
+    with monkeypatch.context() as context:
+        context.setitem(sys.modules, "msvcrt", fake)
+        context.setattr(secure_files.sys, "platform", "win32")
+        with exclusive_file_lock(lock):
+            pass
+    assert calls == [(1, 1, 0), (2, 1, 0)]
+    assert lock.read_bytes() == b"\0"

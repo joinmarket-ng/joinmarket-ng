@@ -313,6 +313,7 @@ class TestBuildTakerConfig:
         settings.taker.taker_utxo_age = 5
         settings.taker.taker_utxo_retries = 3
         settings.taker.taker_utxo_amtpercent = 20
+        settings.taker.external_podle_mode = "disabled"
         settings.taker.max_maker_utxos = 15
 
         # Wallet config
@@ -897,6 +898,22 @@ class TestBuildTakerConfig:
         assert config.taker_utxo_age == 7
         assert config.taker_utxo_retries == 5
         assert config.taker_utxo_amtpercent == 25
+
+    def test_external_podle_mode_flows_into_config(
+        self, sample_mnemonic: str, mock_settings: MagicMock
+    ) -> None:
+        mock_settings.taker.external_podle_mode = "only"
+
+        config = build_taker_config(
+            settings=mock_settings,
+            mnemonic=sample_mnemonic,
+            passphrase="",
+            destination="bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+            amount=100000,
+            mixdepth=0,
+        )
+
+        assert config.external_podle_mode == "only"
 
     def test_initial_confirmation_timeout_flows_into_config(
         self, sample_mnemonic: str, mock_settings: MagicMock

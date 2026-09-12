@@ -54,9 +54,11 @@ def get_commitment_blacklist_path(data_dir: Path | None = None) -> Path:
     return cmtdata_dir / "commitmentlist"
 
 
-def get_used_commitments_path(data_dir: Path | None = None) -> Path:
+def get_used_commitments_path(data_dir: Path | None = None, *, create: bool = True) -> Path:
     """
     Get the path to the used commitments file (for takers).
+
+    Set ``create=False`` with an explicit data directory for read-only inspection.
 
     Args:
         data_dir: Optional data directory (defaults to get_default_data_dir())
@@ -65,13 +67,23 @@ def get_used_commitments_path(data_dir: Path | None = None) -> Path:
         Path to cmtdata/commitments.json (compatible with reference JoinMarket)
     """
     if data_dir is None:
+        if not create:
+            raise ValueError("Read-only commitments paths require an explicit data directory")
         data_dir = get_default_data_dir()
 
     # Use cmtdata/ subdirectory
     cmtdata_dir = data_dir / "cmtdata"
-    cmtdata_dir.mkdir(parents=True, exist_ok=True)
+    if create:
+        cmtdata_dir.mkdir(parents=True, exist_ok=True)
 
     return cmtdata_dir / "commitments.json"
+
+
+def get_market_store_path(data_dir: Path | None = None) -> Path:
+    """Locate the shared market store without creating or activating it."""
+    if data_dir is None:
+        data_dir = get_default_data_dir()
+    return data_dir / "market" / "seller.sqlite"
 
 
 def get_ignored_makers_path(data_dir: Path | None = None) -> Path:

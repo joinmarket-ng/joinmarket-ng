@@ -11,12 +11,14 @@ Configuration is loaded with the following priority (highest to lowest):
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from typing import Annotated, Any
 
 import typer
 from jmcore.cli_common import resolve_mnemonic, setup_cli
 from jmcore.cli_help import SortedTyper
+from jmcore.external_podle import ExternalPoDLE
 from jmcore.models import NetworkType
 from jmcore.notifications import get_notifier
 from jmcore.paths import remove_nick_state, write_nick_state
@@ -26,6 +28,7 @@ from loguru import logger
 
 from taker.config import TakerConfig
 from taker.config_builder import build_taker_config
+from taker.podle_manager import ExternalPoDLEPoolError, PoDLEManager
 
 __all__ = ["app", "build_taker_config", "create_backend"]
 
@@ -34,6 +37,8 @@ app = SortedTyper(
     help="JoinMarket Taker - Execute CoinJoin transactions",
     no_args_is_help=True,
 )
+
+_MAX_EXTERNAL_PODLE_IMPORT_BYTES = 64 * 1024
 
 
 def create_backend(config: TakerConfig) -> Any:
@@ -548,6 +553,62 @@ async def _run_coinjoin(
         # Clean up nick state file on shutdown
         remove_nick_state(config.data_dir, "taker")
         await taker.stop()
+
+
+@app.command("import-podle")
+def import_podle(
+    record_file: Annotated[
+        Path,
+        typer.Argument(help="JSON file containing one external PoDLE record or a list of records"),
+    ],
+    data_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--data-dir",
+            "-d",
+            envvar="JOINMARKET_DATA_DIR",
+            help="Data directory for JoinMarket files",
+        ),
+    ] = None,
+    config_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--config-file",
+            envvar="JOINMARKET_CONFIG_FILE",
+            help="Config file path (decoupled from data dir). Defaults to <data-dir>/config.toml",
+        ),
+    ] = None,
+) -> None:
+    """Import external PoDLE records without printing their contents."""
+    try:
+        with record_file.open("rb") as f:
+            raw = f.read(_MAX_EXTERNAL_PODLE_IMPORT_BYTES + 1)
+    except OSError:
+        typer.echo("Could not read external PoDLE import file.", err=True)
+        raise typer.Exit(1)
+    if len(raw) > _MAX_EXTERNAL_PODLE_IMPORT_BYTES:
+        typer.echo("External PoDLE import file is too large.", err=True)
+        raise typer.Exit(1)
+    try:
+        payload = json.loads(raw)
+        records_data = payload if isinstance(payload, list) else [payload]
+        if not records_data or not all(isinstance(item, dict) for item in records_data):
+            raise ValueError
+        records = [ExternalPoDLE.model_validate(item) for item in records_data]
+    except Exception:
+        typer.echo("Invalid external PoDLE import file.", err=True)
+        raise typer.Exit(1)
+
+    if data_dir is None:
+        data_dir = setup_cli(None, config_file=config_file).get_data_dir()
+    manager = PoDLEManager(data_dir)
+    try:
+        imported = sum(manager.import_external(record) for record in records)
+        available = manager.external_count()
+    except ExternalPoDLEPoolError:
+        typer.echo("Could not safely update external PoDLE pool.", err=True)
+        raise typer.Exit(1)
+    typer.echo(f"Imported {imported} external PoDLE record(s). {available} available.")
 
 
 @app.command()

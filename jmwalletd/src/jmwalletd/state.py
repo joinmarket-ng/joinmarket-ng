@@ -17,7 +17,7 @@ import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
@@ -26,6 +26,11 @@ from jmcore.secure_files import ensure_private_directory
 from jmwalletd.auth import JMTokenAuthority
 from jmwalletd.errors import WalletLifecycleQueueFull
 from jmwalletd.log_buffer import get_log_buffer
+
+if TYPE_CHECKING:
+    from jmcore.settings import JoinMarketSettings
+    from jmcore.wallet_market import WalletMarketSellerOptions
+    from taker.wallet_market import WalletMarketSeller
 
 
 class CoinjoinState(enum.IntEnum):
@@ -122,6 +127,9 @@ class DaemonState:
         self._maker_task: asyncio.Task[None] | None = None
         self._taker_task: asyncio.Task[None] | None = None
         self._wallet_sync_task: asyncio.Task[None] | None = None
+        self._market_seller_ref: WalletMarketSeller | None = None
+        self._market_seller_task: asyncio.Task[None] | None = None
+        self._market_seller_error: str | None = None
 
         # Background transaction monitor: pushes a WebSocket notification for
         # every wallet transaction (deposits, coinjoins, sends), not just
@@ -248,6 +256,14 @@ class DaemonState:
         self._invalidate_ws_clients()
         self.token_authority.reset()
 
+        market_keys = getattr(self.wallet_service, "market_keys", None)
+        if market_keys is not None:
+            market_keys.close()
+
+        # Keep the wallet reserved if cleanup fails. Another wallet must not be
+        # installed while an old seller still owns transport or ledger resources.
+        await self.stop_market_seller()
+
         # Stop the maker if running.
         if self._maker_ref is not None:
             try:
@@ -334,6 +350,81 @@ class DaemonState:
         self.config_overrides.clear()
         get_log_buffer().clear()
         return False  # was not locked, we just locked it
+
+    def market_seller_status(self) -> dict[str, str | None]:
+        """Return current-wallet seller status, without exposing private ledger identity."""
+        if self._market_seller_ref is None:
+            result: dict[str, str | None] = {
+                "state": "stopped",
+                "nickname": None,
+                "seller_pubkey": None,
+            }
+        else:
+            result = self._market_seller_ref.status()
+            if self._market_seller_task is not None and not self._market_seller_task.done():
+                result["state"] = "starting"
+        result["error"] = self._market_seller_error
+        return result
+
+    async def start_market_seller(
+        self, settings: JoinMarketSettings, options: WalletMarketSellerOptions
+    ) -> None:
+        """Register startup while the caller holds ``wallet_lifecycle_lock``.
+
+        Chain and Tor work runs outside that lock. A wallet lock can therefore
+        revoke its capabilities and cancel startup without waiting for backend I/O.
+        """
+        from jmwalletd.errors import NoWalletFound, ServiceAlreadyStarted
+        from taker.wallet_market import WalletMarketSeller
+
+        if self.wallet_service is None:
+            raise NoWalletFound()
+        if self._market_seller_ref is not None:
+            if self._market_seller_ref.running or (
+                self._market_seller_task is not None and not self._market_seller_task.done()
+            ):
+                raise ServiceAlreadyStarted("Market seller is already starting or running.")
+            await self.stop_market_seller()
+        wallet = self.wallet_service
+        generation = self._wallet_generation
+        seller = WalletMarketSeller(wallet, settings, options)
+        self._market_seller_ref = seller
+        self._market_seller_error = None
+
+        async def start() -> None:
+            try:
+                await seller.start()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                if self._market_seller_ref is seller:
+                    self._market_seller_error = "Market seller startup failed."
+                logger.error("Market seller startup failed")
+                logger.bind(sensitive=True).exception("Market seller startup failed")
+            finally:
+                if (
+                    self._market_seller_ref is seller
+                    and self.wallet_service is wallet
+                    and self._wallet_generation == generation
+                ):
+                    self._market_seller_task = None
+                    self.broadcast_ws({"market_seller": self.market_seller_status()})
+
+        self._market_seller_task = asyncio.create_task(start(), name="wallet-market-seller-start")
+
+    async def stop_market_seller(self) -> None:
+        """Stop only this wallet's seller while the caller holds the lifecycle lock."""
+        seller = self._market_seller_ref
+        task = self._market_seller_task
+        if seller is not None:
+            await seller.stop()
+        if task is not None and task is not asyncio.current_task():
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        self._market_seller_ref = None
+        self._market_seller_task = None
+        self._market_seller_error = None
 
     def activate_coinjoin_state(self, state: CoinjoinState) -> None:
         """Update the coinjoin state and notify WebSocket clients."""

@@ -348,6 +348,7 @@ class TestSettingsDefaults:
         assert settings.taker.bondless_require_zero_fee is True
         assert settings.taker.initial_confirmation_timeout_sec == 300
         assert settings.taker.tx_broadcast == "random-peer"
+        assert settings.taker.external_podle_mode == "disabled"
 
 
 class TestSettingsFromEnv:
@@ -839,10 +840,16 @@ class TestTakerSettingsPodleFields:
             taker_utxo_age=10,
             taker_utxo_retries=7,
             taker_utxo_amtpercent=50,
+            external_podle_mode="only",
         )
         assert settings.taker_utxo_age == 10
         assert settings.taker_utxo_retries == 7
         assert settings.taker_utxo_amtpercent == 50
+        assert settings.external_podle_mode == "only"
+
+    def test_external_podle_mode_rejects_unsupported_values(self) -> None:
+        with pytest.raises(ValueError):
+            TakerSettings(external_podle_mode="fallback")  # type: ignore[arg-type]
 
     def test_taker_utxo_age_rejects_zero(self) -> None:
         """``taker_utxo_age`` must be >= 1; PoDLE commitments require

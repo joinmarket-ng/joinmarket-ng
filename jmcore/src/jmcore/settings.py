@@ -43,7 +43,7 @@ import re
 from decimal import Decimal, InvalidOperation
 from io import BytesIO
 from pathlib import Path
-from typing import Any, ClassVar, Self
+from typing import Any, ClassVar, Literal, Self
 
 from loguru import logger
 from pydantic import AliasChoices, BaseModel, Field, SecretStr, field_validator, model_validator
@@ -1049,6 +1049,13 @@ class TakerSettings(BaseModel):
         description=(
             "Minimum UTXO value as a percentage of the CoinJoin amount for "
             "PoDLE commitments (reference default: 20)."
+        ),
+    )
+    external_podle_mode: Literal["disabled", "only"] = Field(
+        default="disabled",
+        description=(
+            "Use imported external PoDLE credentials only, without selecting their backing "
+            "UTXOs as CoinJoin funding inputs."
         ),
     )
     max_cj_fee_rel: str = Field(
