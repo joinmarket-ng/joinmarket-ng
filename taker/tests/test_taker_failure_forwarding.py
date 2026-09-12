@@ -48,3 +48,11 @@ async def test_last_used_maker_keys_property_forwards() -> None:
     assert taker.last_used_maker_keys == set()
     taker._session.last_used_maker_keys = {"nick:J5Maker", f"bond:{'a' * 64}:0"}
     assert taker.last_used_maker_keys == {"nick:J5Maker", f"bond:{'a' * 64}:0"}
+
+
+@pytest.mark.asyncio
+async def test_txid_property_forwards() -> None:
+    taker = _taker()
+    assert taker.txid == ""
+    taker._session.txid = "f" * 64
+    assert taker.txid == "f" * 64

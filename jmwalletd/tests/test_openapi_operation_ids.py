@@ -53,6 +53,7 @@ EXPECTED_OPERATION_IDS: dict[tuple[str, str], str] = {
     ("post", "/api/v1/wallet/{walletname}/taker/direct-send"): "directsend",
     ("post", "/api/v1/wallet/{walletname}/taker/coinjoin"): "docoinjoin",
     ("get", "/api/v1/wallet/{walletname}/taker/stop"): "stopcoinjoin",
+    ("get", "/api/v1/wallet/{walletname}/taker/status"): "takerstatus",
     ("post", "/api/v1/wallet/{walletname}/maker/start"): "startmaker",
     ("get", "/api/v1/wallet/{walletname}/maker/stop"): "stopmaker",
     # tumbler.py (new in jm-ng; clean names so SDKs read naturally)

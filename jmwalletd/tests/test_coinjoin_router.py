@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import threading
 import time
 from typing import Any
 from unittest.mock import AsyncMock, Mock, call, patch
@@ -11,6 +13,7 @@ from fastapi.testclient import TestClient
 
 from jmwalletd.deps import get_daemon_state
 from jmwalletd.state import CoinjoinState
+from taker.models import TakerState
 
 
 @pytest.fixture
@@ -306,6 +309,9 @@ class TestDoCoinjoin:
         mock_taker.last_broadcast_policy = "random-peer"
         mock_taker.last_broadcast_method = "self-fallback"
         mock_taker.last_broadcast_fallback_reason = "peer_delivery_failed"
+        mock_taker.state = TakerState.COMPLETE
+        mock_taker.txid = "f" * 64
+        mock_taker.last_failure_reason = None
         mock_taker_cls.return_value = mock_taker
 
         from pathlib import Path
@@ -364,6 +370,239 @@ class TestDoCoinjoin:
         assert state.last_broadcast_policy == "random-peer"
         assert state.last_broadcast_method == "self-fallback"
         assert state.last_broadcast_fallback_reason == "peer_delivery_failed"
+        assert state.last_taker_status == "complete"
+        assert state.last_taker_txid == "f" * 64
+        assert state.last_taker_error is None
+
+    @patch("jmwalletd._backend.get_backend", new_callable=AsyncMock)
+    @patch("taker.taker.Taker")
+    @patch("taker.config.TakerConfig")
+    @patch("jmwalletd.routers.coinjoin.get_settings")
+    def test_start_coinjoin_reports_failed_on_exception_before_any_phase(
+        self,
+        mock_get_settings: Mock,
+        mock_config: Mock,
+        mock_taker_cls: Mock,
+        mock_backend: AsyncMock,
+        authed_client: tuple[TestClient, str],
+    ) -> None:
+        """A startup failure (e.g. no reachable directory server) must not
+        report as "idle" -- that reads as "nothing happened" rather than "it
+        failed" (issue #627 review)."""
+        client, token = authed_client
+        state = get_daemon_state()
+
+        mock_taker = AsyncMock()
+        mock_taker.state = TakerState.IDLE  # taker.start() raises before any transition
+        mock_taker.txid = ""
+        mock_taker.last_failure_reason = None
+        mock_taker.last_broadcast_policy = None
+        mock_taker.last_broadcast_method = None
+        mock_taker.last_broadcast_fallback_reason = None
+        mock_taker.start.side_effect = RuntimeError("Failed to connect to any directory server")
+        mock_taker_cls.return_value = mock_taker
+
+        from pathlib import Path
+
+        from jmcore.models import NetworkType
+        from jmcore.settings import JoinMarketSettings
+
+        mock_settings = JoinMarketSettings()
+        mock_settings.data_dir = Path("/tmp/jm-test")
+        mock_settings.network_config.network = NetworkType.SIGNET
+        mock_settings.network_config.bitcoin_network = NetworkType.REGTEST
+        mock_settings.network_config.directory_servers = ["testdirectoryfakeaddress.onion:5222"]
+        mock_settings.bitcoin.backend_type = "descriptor_wallet"
+        mock_settings.tor.socks_host = "127.0.0.1"
+        mock_settings.tor.socks_port = 9050
+        mock_settings.tor.stream_isolation = False
+        mock_settings.taker.minimum_makers = 4
+        mock_get_settings.return_value = mock_settings
+
+        resp = client.post(
+            "/api/v1/wallet/test_wallet.jmdat/taker/coinjoin",
+            json={
+                "mixdepth": 0,
+                "amount_sats": 100000,
+                "destination": "bcrt1qdest",
+                "counterparties": 3,
+                "txfee": 500,
+            },
+            headers=_auth_headers(token),
+        )
+        assert resp.status_code == 202
+
+        assert state.last_taker_status == "failed"
+        assert state.last_taker_txid is None
+        assert "Failed to connect to any directory server" in (state.last_taker_error or "")
+
+
+class TestStopCoinjoin:
+    @patch("jmwalletd._backend.get_backend", new_callable=AsyncMock)
+    @patch("taker.taker.Taker")
+    @patch("taker.config.TakerConfig")
+    @patch("jmwalletd.routers.coinjoin.get_settings")
+    def test_stop_mid_run_reports_cancelled_not_the_leftover_phase(
+        self,
+        mock_get_settings: Mock,
+        mock_config: Mock,
+        mock_taker_cls: Mock,
+        mock_backend: AsyncMock,
+        authed_client: tuple[TestClient, str],
+    ) -> None:
+        """/taker/stop cancels the background task rather than raising into
+        it, so without explicit handling the snapshot is left holding
+        whatever in-progress phase the taker happened to be in -- that is
+        not the final status (issue #627 review)."""
+        client, token = authed_client
+        state = get_daemon_state()
+
+        started = threading.Event()
+
+        mock_taker = AsyncMock()
+        mock_taker.state = TakerState.FETCHING_ORDERBOOK
+        mock_taker.txid = ""
+        mock_taker.last_failure_reason = None
+        mock_taker.last_broadcast_policy = None
+        mock_taker.last_broadcast_method = None
+        mock_taker.last_broadcast_fallback_reason = None
+
+        async def _blocks_until_cancelled(*_args: Any, **_kwargs: Any) -> None:
+            started.set()
+            await asyncio.sleep(10)  # cancelled by /taker/stop well before this elapses
+
+        mock_taker.do_coinjoin.side_effect = _blocks_until_cancelled
+        mock_taker_cls.return_value = mock_taker
+
+        from pathlib import Path
+
+        from jmcore.models import NetworkType
+        from jmcore.settings import JoinMarketSettings
+
+        mock_settings = JoinMarketSettings()
+        mock_settings.data_dir = Path("/tmp/jm-test")
+        mock_settings.network_config.network = NetworkType.SIGNET
+        mock_settings.network_config.bitcoin_network = NetworkType.REGTEST
+        mock_settings.network_config.directory_servers = ["testdirectoryfakeaddress.onion:5222"]
+        mock_settings.bitcoin.backend_type = "descriptor_wallet"
+        mock_settings.tor.socks_host = "127.0.0.1"
+        mock_settings.tor.socks_port = 9050
+        mock_settings.tor.stream_isolation = False
+        mock_settings.taker.minimum_makers = 4
+        mock_get_settings.return_value = mock_settings
+
+        # A bare (non-context-managed) TestClient tears its portal down and
+        # cancels any leftover background asyncio task after every single
+        # call, which would kill our still-"running" task before the second
+        # request even lands. Entering it as a context manager keeps one
+        # portal (and therefore the scheduled task) alive across both calls,
+        # matching a real client's two separate HTTP requests.
+        with client:
+            resp = client.post(
+                "/api/v1/wallet/test_wallet.jmdat/taker/coinjoin",
+                json={
+                    "mixdepth": 0,
+                    "amount_sats": 100000,
+                    "destination": "bcrt1qdest",
+                    "counterparties": 3,
+                    "txfee": 500,
+                },
+                headers=_auth_headers(token),
+            )
+            assert resp.status_code == 202
+            assert started.wait(timeout=5), "background taker task never started"
+            assert state.taker_running is True, "task must still be running when stop is called"
+
+            resp = client.get(
+                "/api/v1/wallet/test_wallet.jmdat/taker/stop",
+                headers=_auth_headers(token),
+            )
+            assert resp.status_code == 202
+
+        assert state.last_taker_status == "cancelled"
+        assert state.last_taker_txid is None
+
+    @patch("jmwalletd._backend.get_backend", new_callable=AsyncMock)
+    @patch("taker.taker.Taker")
+    @patch("taker.config.TakerConfig")
+    @patch("jmwalletd.routers.coinjoin.get_settings")
+    def test_stop_after_broadcast_keeps_complete_status_and_txid(
+        self,
+        mock_get_settings: Mock,
+        mock_config: Mock,
+        mock_taker_cls: Mock,
+        mock_backend: AsyncMock,
+        authed_client: tuple[TestClient, str],
+    ) -> None:
+        """A stop racing a just-completed broadcast must not overwrite the
+        good outcome: the txid is only ever set once the broadcast already
+        succeeded, so cancellation past that point has nothing left to
+        cancel (issue #627 review)."""
+        client, token = authed_client
+        state = get_daemon_state()
+
+        started = threading.Event()
+
+        mock_taker = AsyncMock()
+        mock_taker.state = TakerState.COMPLETE
+        mock_taker.txid = "e" * 64
+        mock_taker.last_failure_reason = None
+        mock_taker.last_broadcast_policy = None
+        mock_taker.last_broadcast_method = None
+        mock_taker.last_broadcast_fallback_reason = None
+
+        async def _completes_then_blocks(*_args: Any, **_kwargs: Any) -> None:
+            # The broadcast already happened by the time cancellation lands
+            # (e.g. it raced a client-initiated /taker/stop).
+            started.set()
+            await asyncio.sleep(10)
+
+        mock_taker.do_coinjoin.side_effect = _completes_then_blocks
+        mock_taker_cls.return_value = mock_taker
+
+        from pathlib import Path
+
+        from jmcore.models import NetworkType
+        from jmcore.settings import JoinMarketSettings
+
+        mock_settings = JoinMarketSettings()
+        mock_settings.data_dir = Path("/tmp/jm-test")
+        mock_settings.network_config.network = NetworkType.SIGNET
+        mock_settings.network_config.bitcoin_network = NetworkType.REGTEST
+        mock_settings.network_config.directory_servers = ["testdirectoryfakeaddress.onion:5222"]
+        mock_settings.bitcoin.backend_type = "descriptor_wallet"
+        mock_settings.tor.socks_host = "127.0.0.1"
+        mock_settings.tor.socks_port = 9050
+        mock_settings.tor.stream_isolation = False
+        mock_settings.taker.minimum_makers = 4
+        mock_get_settings.return_value = mock_settings
+
+        # See the comment in TestStopCoinjoin's other test: a persistent
+        # portal is required to keep the background task alive across the
+        # two separate calls below.
+        with client:
+            resp = client.post(
+                "/api/v1/wallet/test_wallet.jmdat/taker/coinjoin",
+                json={
+                    "mixdepth": 0,
+                    "amount_sats": 100000,
+                    "destination": "bcrt1qdest",
+                    "counterparties": 3,
+                    "txfee": 500,
+                },
+                headers=_auth_headers(token),
+            )
+            assert resp.status_code == 202
+            assert started.wait(timeout=5), "background taker task never started"
+
+            resp = client.get(
+                "/api/v1/wallet/test_wallet.jmdat/taker/stop",
+                headers=_auth_headers(token),
+            )
+            assert resp.status_code == 202
+
+        assert state.last_taker_status == "complete"
+        assert state.last_taker_txid == "e" * 64
 
 
 class TestBuildCoinjoinTakerConfig:
@@ -933,3 +1172,152 @@ class TestStopMaker:
         )
         # ServiceNotStarted is a 401 in jmwalletd/errors.py
         assert resp.status_code == 401
+
+
+class TestTakerStatus:
+    """GET /taker/status (issue #627): status/txid/error, live or snapshotted."""
+
+    def test_no_run_yet(self, authed_client: tuple[TestClient, str]) -> None:
+        client, token = authed_client
+
+        resp = client.get(
+            "/api/v1/wallet/test_wallet.jmdat/taker/status",
+            headers=_auth_headers(token),
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body == {
+            "running": False,
+            "status": None,
+            "txid": None,
+            "error": None,
+            "broadcast_method": None,
+        }
+
+    def test_reads_live_off_a_running_taker(self, authed_client: tuple[TestClient, str]) -> None:
+        client, token = authed_client
+        state = get_daemon_state()
+        state.activate_coinjoin_state(CoinjoinState.TAKER_RUNNING)
+
+        mock_taker = Mock()
+        mock_taker.state = TakerState.BROADCASTING
+        mock_taker.txid = ""
+        mock_taker.last_failure_reason = None
+        mock_taker.last_broadcast_method = None
+        state._taker_ref = mock_taker
+        # A stale snapshot from a previous run must not leak through while
+        # a new one is live.
+        state.last_taker_status = "failed"
+        state.last_taker_txid = None
+        state.last_taker_error = "previous run: no counterparties found"
+
+        resp = client.get(
+            "/api/v1/wallet/test_wallet.jmdat/taker/status",
+            headers=_auth_headers(token),
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "running": True,
+            "status": "broadcasting",
+            "txid": None,
+            "error": None,
+            "broadcast_method": None,
+        }
+
+    def test_running_is_false_during_a_tumble_even_though_taker_running_is_true(
+        self, authed_client: tuple[TestClient, str]
+    ) -> None:
+        """``taker_running`` is also set while a tumbler plan is driving its
+        own takers (see ``activate_coinjoin_state``), and ``_taker_ref`` stays
+        ``None`` throughout since the tumbler manages its takers internally.
+        Without deriving ``running`` from ``coinjoin_state`` specifically, a
+        tumble in progress would surface a stale single-shot snapshot
+        underneath a misleading ``running: true`` (issue #627 review)."""
+        client, token = authed_client
+        state = get_daemon_state()
+        state.activate_coinjoin_state(CoinjoinState.TUMBLER_RUNNING)
+        assert state.taker_running is True  # the pre-existing, broader flag
+        assert state._taker_ref is None
+
+        # Leftover from an earlier single-shot call, before the tumble started.
+        state.last_taker_status = "complete"
+        state.last_taker_txid = "b" * 64
+        state.last_taker_error = None
+
+        resp = client.get(
+            "/api/v1/wallet/test_wallet.jmdat/taker/status",
+            headers=_auth_headers(token),
+        )
+        assert resp.status_code == 200
+        assert resp.json()["running"] is False
+
+    def test_completed_status_includes_broadcast_method(
+        self, authed_client: tuple[TestClient, str]
+    ) -> None:
+        """``status == "complete"`` alone does not mean a verified broadcast:
+        a peer policy without mempool access reports completion once a maker
+        accepted delivery. Callers need ``broadcast_method`` to tell that
+        apart from a self-broadcast (issue #627 review)."""
+        client, token = authed_client
+        state = get_daemon_state()
+        state._taker_ref = None
+        state.taker_running = False
+        state.last_taker_status = "complete"
+        state.last_taker_txid = "c" * 64
+        state.last_taker_error = None
+        state.last_broadcast_method = "makers-unverified:2"
+
+        resp = client.get(
+            "/api/v1/wallet/test_wallet.jmdat/taker/status",
+            headers=_auth_headers(token),
+        )
+        assert resp.status_code == 200
+        assert resp.json()["broadcast_method"] == "makers-unverified:2"
+
+    def test_reports_completed_snapshot_after_teardown(
+        self, authed_client: tuple[TestClient, str]
+    ) -> None:
+        client, token = authed_client
+        state = get_daemon_state()
+        state._taker_ref = None
+        state.taker_running = False
+        state.last_taker_status = "complete"
+        state.last_taker_txid = "a" * 64
+        state.last_taker_error = None
+
+        resp = client.get(
+            "/api/v1/wallet/test_wallet.jmdat/taker/status",
+            headers=_auth_headers(token),
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "running": False,
+            "status": "complete",
+            "txid": "a" * 64,
+            "error": None,
+            "broadcast_method": None,
+        }
+
+    def test_reports_failed_snapshot_with_error_after_teardown(
+        self, authed_client: tuple[TestClient, str]
+    ) -> None:
+        client, token = authed_client
+        state = get_daemon_state()
+        state._taker_ref = None
+        state.taker_running = False
+        state.last_taker_status = "failed"
+        state.last_taker_txid = None
+        state.last_taker_error = "No suitable counterparties found."
+
+        resp = client.get(
+            "/api/v1/wallet/test_wallet.jmdat/taker/status",
+            headers=_auth_headers(token),
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "running": False,
+            "status": "failed",
+            "txid": None,
+            "error": "No suitable counterparties found.",
+            "broadcast_method": None,
+        }

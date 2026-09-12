@@ -84,6 +84,26 @@ class TestDaemonState:
         assert daemon_state.coinjoin_state == CoinjoinState.NOT_RUNNING
 
     @pytest.mark.asyncio
+    async def test_lock_wallet_clears_taker_status_snapshot(
+        self, daemon_state: DaemonState, mock_wallet_service: MagicMock
+    ) -> None:
+        """A leftover single-shot taker snapshot must not survive a wallet
+        switch: the next wallet's /taker/status would otherwise report an
+        outcome that belongs to a different wallet entirely (issue #627
+        review)."""
+        daemon_state.wallet_service = mock_wallet_service
+        daemon_state.wallet_name = "w.jmdat"
+        daemon_state.last_taker_status = "complete"
+        daemon_state.last_taker_txid = "d" * 64
+        daemon_state.last_taker_error = None
+
+        await daemon_state.lock_wallet()
+
+        assert daemon_state.last_taker_status is None
+        assert daemon_state.last_taker_txid is None
+        assert daemon_state.last_taker_error is None
+
+    @pytest.mark.asyncio
     async def test_lock_wallet_clears_logs_only_on_loaded_transition(
         self, daemon_state: DaemonState, mock_wallet_service: MagicMock
     ) -> None:

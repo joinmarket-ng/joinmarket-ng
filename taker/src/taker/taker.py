@@ -455,6 +455,17 @@ class Taker(TakerMonitoringMixin):
         return self._session.last_failure_reason
 
     @property
+    def txid(self) -> str:
+        """Txid of the most recently broadcast CoinJoin, or ``""`` if none.
+
+        Forwarded from the per-round :class:`CoinJoinSession` for the same
+        reason as ``last_failure_reason``: external consumers (e.g. the
+        jmwalletd taker status endpoint) need this after ``do_coinjoin``
+        returns without reaching into private session state.
+        """
+        return self._session.txid
+
+    @property
     def last_used_nicks(self) -> set[str]:
         """Maker nicks in the most recently broadcast CoinJoin."""
         return self._session.last_used_nicks
