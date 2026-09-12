@@ -113,6 +113,14 @@ class DaemonState:
         self.last_broadcast_policy: str | None = None
         self.last_broadcast_method: str | None = None
         self.last_broadcast_fallback_reason: str | None = None
+        # Outcome of the most recent single-shot taker run, snapshotted from
+        # the Taker instance's own TakerState before it is torn down (see
+        # ``_run_coinjoin`` in routers/coinjoin.py). Exposed via GET
+        # /taker/status so callers get real evidence of what happened instead
+        # of inferring it from wallet-level side effects (issue #627).
+        self.last_taker_status: str | None = None
+        self.last_taker_txid: str | None = None
+        self.last_taker_error: str | None = None
 
         # Runtime references to active taker/maker instances (for stop signals).
         self._taker_ref: Any = None

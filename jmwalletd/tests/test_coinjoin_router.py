@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 
 from jmwalletd.deps import get_daemon_state
 from jmwalletd.state import CoinjoinState
+from taker.models import TakerState
 
 
 @pytest.fixture
@@ -306,6 +307,9 @@ class TestDoCoinjoin:
         mock_taker.last_broadcast_policy = "random-peer"
         mock_taker.last_broadcast_method = "self-fallback"
         mock_taker.last_broadcast_fallback_reason = "peer_delivery_failed"
+        mock_taker.state = TakerState.COMPLETE
+        mock_taker.txid = "f" * 64
+        mock_taker.last_failure_reason = None
         mock_taker_cls.return_value = mock_taker
 
         from pathlib import Path
@@ -364,6 +368,9 @@ class TestDoCoinjoin:
         assert state.last_broadcast_policy == "random-peer"
         assert state.last_broadcast_method == "self-fallback"
         assert state.last_broadcast_fallback_reason == "peer_delivery_failed"
+        assert state.last_taker_status == "complete"
+        assert state.last_taker_txid == "f" * 64
+        assert state.last_taker_error is None
 
 
 class TestBuildCoinjoinTakerConfig:
@@ -933,3 +940,92 @@ class TestStopMaker:
         )
         # ServiceNotStarted is a 401 in jmwalletd/errors.py
         assert resp.status_code == 401
+
+
+class TestTakerStatus:
+    """GET /taker/status (issue #627): status/txid/error, live or snapshotted."""
+
+    def test_no_run_yet(self, authed_client: tuple[TestClient, str]) -> None:
+        client, token = authed_client
+
+        resp = client.get(
+            "/api/v1/wallet/test_wallet.jmdat/taker/status",
+            headers=_auth_headers(token),
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body == {"running": False, "status": None, "txid": None, "error": None}
+
+    def test_reads_live_off_a_running_taker(self, authed_client: tuple[TestClient, str]) -> None:
+        client, token = authed_client
+        state = get_daemon_state()
+        state.activate_coinjoin_state(CoinjoinState.TAKER_RUNNING)
+
+        mock_taker = Mock()
+        mock_taker.state = TakerState.BROADCASTING
+        mock_taker.txid = ""
+        mock_taker.last_failure_reason = None
+        state._taker_ref = mock_taker
+        # A stale snapshot from a previous run must not leak through while
+        # a new one is live.
+        state.last_taker_status = "failed"
+        state.last_taker_txid = None
+        state.last_taker_error = "previous run: no counterparties found"
+
+        resp = client.get(
+            "/api/v1/wallet/test_wallet.jmdat/taker/status",
+            headers=_auth_headers(token),
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "running": True,
+            "status": "broadcasting",
+            "txid": None,
+            "error": None,
+        }
+
+    def test_reports_completed_snapshot_after_teardown(
+        self, authed_client: tuple[TestClient, str]
+    ) -> None:
+        client, token = authed_client
+        state = get_daemon_state()
+        state._taker_ref = None
+        state.taker_running = False
+        state.last_taker_status = "complete"
+        state.last_taker_txid = "a" * 64
+        state.last_taker_error = None
+
+        resp = client.get(
+            "/api/v1/wallet/test_wallet.jmdat/taker/status",
+            headers=_auth_headers(token),
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "running": False,
+            "status": "complete",
+            "txid": "a" * 64,
+            "error": None,
+        }
+
+    def test_reports_failed_snapshot_with_error_after_teardown(
+        self, authed_client: tuple[TestClient, str]
+    ) -> None:
+        client, token = authed_client
+        state = get_daemon_state()
+        state._taker_ref = None
+        state.taker_running = False
+        state.last_taker_status = "failed"
+        state.last_taker_txid = None
+        state.last_taker_error = "No suitable counterparties found."
+
+        resp = client.get(
+            "/api/v1/wallet/test_wallet.jmdat/taker/status",
+            headers=_auth_headers(token),
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "running": False,
+            "status": "failed",
+            "txid": None,
+            "error": "No suitable counterparties found.",
+        }
