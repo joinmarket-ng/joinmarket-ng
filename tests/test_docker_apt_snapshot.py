@@ -180,8 +180,12 @@ def test_helper_resolves_apt_against_the_snapshot_and_cleans_up(tmp_path: Path) 
 
     rm_calls = [c for c in calls if c.startswith("rm ")]
     assert len(rm_calls) == 1
-    assert "/var/lib/apt/lists/*" in rm_calls[0]
-    assert "/var/cache/ldconfig/aux-cache" in rm_calls[0]
+    # The shell expands the globs before the (fake) rm sees them, so on a host
+    # with a populated /var/lib/apt the argv lists files instead of "*".
+    assert re.search(r" /var/lib/apt/lists/\S", rm_calls[0])
+    assert re.search(r" /var/log/apt/\S", rm_calls[0])
+    assert " /var/log/dpkg.log" in rm_calls[0]
+    assert " /var/cache/ldconfig/aux-cache" in rm_calls[0]
     # The temporary sources directory must not leak into the image layer.
     sources_dir = re.search(r"Dir::Etc::SourceList=(\S+)/snapshot\.sources", update)
     assert sources_dir is not None
