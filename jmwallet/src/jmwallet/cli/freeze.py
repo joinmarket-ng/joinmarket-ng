@@ -28,6 +28,7 @@ from jmwallet.utxo_tui import (
     build_display_items,
     format_address_column,
     seek_selectable,
+    utxo_sort_key,
 )
 
 if TYPE_CHECKING:
@@ -237,8 +238,9 @@ async def _freeze_utxos(
             print(f"No UTXOs found{md_msg}.")
             return
 
-        # Sort by derivation path (same order as wallet info extended)
-        all_utxos.sort(key=lambda u: u.path)
+        # Sort by derivation path (numeric components so indices >= 10 order
+        # correctly, matching the interactive UTXO selector).
+        all_utxos.sort(key=utxo_sort_key)
 
         # Build the display list with blank-line separators between mixdepths.
         display_items = _build_display_items(all_utxos)

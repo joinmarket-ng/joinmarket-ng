@@ -1813,16 +1813,22 @@ def _make_freeze_utxo(
 
 def test_freeze_sorts_utxos_by_path_not_mixdepth_value() -> None:
     """UTXOs must be sorted by derivation path, not mixdepth/value."""
+    from jmwallet.utxo_tui import utxo_sort_key
+
     utxos = [
         _make_freeze_utxo("a", mixdepth=1, path="m/84'/0'/1'/0/1", value=100000),
         _make_freeze_utxo("b", mixdepth=0, path="m/84'/0'/0'/0/0", value=50000),
         _make_freeze_utxo("c", mixdepth=1, path="m/84'/0'/1'/0/0", value=200000),
+        # Indices >= 10 must sort numerically: a string comparison would place
+        # ``.../0/10`` before ``.../0/2``.
+        _make_freeze_utxo("d", mixdepth=0, path="m/84'/0'/0'/0/10", value=70000),
+        _make_freeze_utxo("e", mixdepth=0, path="m/84'/0'/0'/0/2", value=80000),
     ]
 
     # Sort by path (as the freeze command does before building display items).
-    utxos.sort(key=lambda u: u.path)
+    utxos.sort(key=utxo_sort_key)
 
-    assert [u.txid for u in utxos] == ["b", "c", "a"]
+    assert [u.txid for u in utxos] == ["b", "e", "d", "c", "a"]
 
 
 def test_freeze_address_truncation_for_long_addresses() -> None:

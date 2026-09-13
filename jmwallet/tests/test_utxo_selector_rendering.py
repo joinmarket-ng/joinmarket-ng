@@ -12,7 +12,7 @@ from dataclasses import dataclass
 import pytest
 
 import jmwallet.utxo_selector as utxo_selector
-from jmwallet.utxo_tui import build_display_items
+from jmwallet.utxo_tui import build_display_items, utxo_sort_key
 from jmwallet.wallet.models import UTXOInfo
 from jmwallet.wallet.utxo_metadata import AUTO_FREEZE_REUSE_LABEL
 
@@ -155,7 +155,7 @@ def _run(
     min_confirmations: int = 0,
     excluded_outpoints: set[tuple[str, int]] | None = None,
 ) -> list[UTXOInfo]:
-    display_items = build_display_items(sorted(utxos, key=lambda utxo: utxo.path))
+    display_items = build_display_items(sorted(utxos, key=utxo_sort_key))
     result = utxo_selector._run_selector(
         screen,
         display_items,

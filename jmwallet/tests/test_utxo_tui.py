@@ -13,11 +13,20 @@ from jmwallet.utxo_tui import (
     build_display_items,
     format_address_column,
     seek_selectable,
+    utxo_sort_key,
 )
 from jmwallet.wallet.models import UTXOInfo
 
 
-def _utxo(mixdepth: int, value: int = 100_000, txid_char: str = "a", vout: int = 0) -> UTXOInfo:
+def _utxo(
+    mixdepth: int,
+    value: int = 100_000,
+    txid_char: str = "a",
+    vout: int = 0,
+    index: int = 0,
+    branch: int = 0,
+    path: str | None = None,
+) -> UTXOInfo:
     return UTXOInfo(
         txid=txid_char * 64,
         vout=vout,
@@ -25,7 +34,7 @@ def _utxo(mixdepth: int, value: int = 100_000, txid_char: str = "a", vout: int =
         address=f"bcrt1qmd{mixdepth}",
         confirmations=10,
         scriptpubkey="0014" + "aa" * 20,
-        path=f"m/84'/0'/{mixdepth}'/0/0",
+        path=path if path is not None else f"m/84'/0'/{mixdepth}'/{branch}/{index}",
         mixdepth=mixdepth,
     )
 
@@ -101,3 +110,48 @@ class TestAdjustScroll:
 
     def test_cursor_in_view_unchanged(self) -> None:
         assert adjust_scroll(5, 3, 10) == 3
+
+
+class TestUtxoSortKey:
+    """Regression: derivation paths must compare numerically (indices >= 10).
+
+    ``utxo_sort_key`` is the shared sort key used by both the freeze manager
+    and the interactive UTXO selector; a plain string comparison would place
+    ``.../0/10`` before ``.../0/2``.
+    """
+
+    def test_numeric_order_for_indices_ge_10(self) -> None:
+        utxos = [_utxo(0, index=i) for i in (1, 10, 2, 11, 0, 12, 3)]
+        ordered = sorted(utxos, key=utxo_sort_key)
+        assert [u.path.rsplit("/", 1)[-1] for u in ordered] == [
+            "0",
+            "1",
+            "2",
+            "3",
+            "10",
+            "11",
+            "12",
+        ]
+
+    def test_fidelity_bond_timenumber_orders_numerically(self) -> None:
+        # Fidelity-bond paths use branch 2 and a large timenumber as index.
+        utxos = [_utxo(0, branch=2, index=i) for i in (100, 9, 1_234_567)]
+        ordered = sorted(utxos, key=utxo_sort_key)
+        assert [u.path.rsplit("/", 1)[-1] for u in ordered] == ["9", "100", "1234567"]
+
+    def test_locktime_suffix_does_not_break_sort(self) -> None:
+        # Some code paths append ``:locktime`` to the bond path; the key must
+        # not crash and must keep bare and suffixed forms adjacent.
+        utxos = [
+            _utxo(0, branch=2, index=9),
+            _utxo(0, branch=2, index=9, path="m/84'/0'/0'/2/9:1893456000"),
+            _utxo(0, branch=2, index=12),
+            _utxo(0, branch=2, index=100, path="m/84'/0'/0'/2/100:1893456000"),
+        ]
+        ordered = sorted(utxos, key=utxo_sort_key)
+        assert [utxo_sort_key(u) for u in ordered] == [
+            (84, 0, 0, 2, 9),
+            (84, 0, 0, 2, 9, 1893456000),
+            (84, 0, 0, 2, 12),
+            (84, 0, 0, 2, 100, 1893456000),
+        ]

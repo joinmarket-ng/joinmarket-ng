@@ -25,6 +25,7 @@ from jmwallet.utxo_tui import (
     adjust_scroll,
     build_display_items,
     seek_selectable,
+    utxo_sort_key,
 )
 from jmwallet.wallet.utxo_metadata import AUTO_FREEZE_REUSE_LABEL
 
@@ -694,7 +695,7 @@ def select_utxos_interactive(
         raise RuntimeError("Interactive UTXO selection requires a terminal")
 
     # Sort UTXOs by derivation path (same order as freeze manager) and add separators
-    sorted_utxos = sorted(utxos, key=lambda u: u.path)
+    sorted_utxos = sorted(utxos, key=utxo_sort_key)
     display_items = build_display_items(sorted_utxos)
 
     return curses.wrapper(

@@ -13,6 +13,7 @@ This module holds the layout and navigation primitives they share:
 
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -22,6 +23,20 @@ if TYPE_CHECKING:
 
 # Width of the address column used by both TUIs so rows stay aligned.
 ADDRESS_COL_WIDTH = 42
+
+
+def utxo_sort_key(utxo: UTXOInfo) -> tuple[int, ...]:
+    """Numeric derivation-path sort key shared by the freeze manager and the
+    interactive UTXO selector.
+
+    Paths look like ``m/84'/0'/0'/0/3`` (receive), ``.../1/3`` (change) or
+    ``.../2/{timenumber}`` (fidelity bond). Comparing these as plain strings
+    misorders indices >= 10 (``.../0/10`` sorts before ``.../0/2``), so the
+    integer path components are compared instead. A fidelity-bond locktime
+    appended as ``:locktime`` adds a trailing tie-breaker and sorts
+    consistently with the bare ``.../2/{timenumber}`` form.
+    """
+    return tuple(int(part) for part in re.findall(r"\d+", utxo.path))
 
 
 def build_display_items(utxos: list[UTXOInfo]) -> list[UTXOInfo | None]:
