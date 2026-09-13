@@ -21,7 +21,8 @@ Utility scripts for JoinMarket NG development and operations.
 - **run_parallel_tests.sh** - Execute all test suites (including Docker-based e2e tests) in parallel using Docker Compose project isolation
 - **sign-release.sh** - Sign a release manifest (supports local-first and CI-first workflows)
 - **update_readme_help.py** - Update generated CLI help in component READMEs (run manually when CLI changes; user guides link to this reference)
-- **update-base-images.sh** - Update Docker base image digests
+- **update-base-images.sh** - Update Docker base image digests and the pinned Debian archive snapshot (`DEBIAN_SNAPSHOT`)
+- **docker-apt-install.sh** - Bind-mounted into Dockerfile `RUN` steps to install apt packages from `snapshot.debian.org` at `DEBIAN_SNAPSHOT`
 - **update-deps.sh** - Update project dependencies, including the maintained `python-bitcointx` release pin
 - **update-flatpak-deps.py** - Update Flatpak sources and pinned JAM Docker dependencies
 - **verify-release.sh** - Verify release signatures and optionally reproduce builds

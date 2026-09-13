@@ -145,9 +145,15 @@ def test_runtime_images_exclude_python_package_installers() -> None:
 
 
 def test_runtime_images_include_native_secp256k1() -> None:
+    # The package version comes from the pinned Debian snapshot
+    # (DEBIAN_SNAPSHOT); see tests/test_docker_apt_snapshot.py.
     for dockerfile, stages in RUNTIME_IMAGE_STAGES.items():
         for stage in stages:
-            assert "libsecp256k1-2=0.5.0-2+b1" in _dockerfile_stage(dockerfile, stage)
+            assert re.search(
+                r"^\s+libsecp256k1-2\s*\\$",
+                _dockerfile_stage(dockerfile, stage),
+                re.MULTILINE,
+            )
 
 
 def test_macos_uses_secp256k1_homebrew_formula() -> None:

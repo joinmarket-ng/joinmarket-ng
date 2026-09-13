@@ -312,8 +312,22 @@ to be byte-identical:
   metadata via `jmcore/setup.py` (writes `_build_info.py`). When unset,
   `setup.py` falls back to `git rev-parse`, but the docker build sandbox
   has no `.git` directory, so passing these explicitly is required.
-- Pinned base image digests, apt package versions, and pip build constraints
-  (`setuptools`, `wheel`) — all enforced in the Dockerfiles.
+- Pinned base image digests, the Debian archive snapshot, and pip build
+  constraints (`setuptools`, `wheel`), all enforced in the Dockerfiles.
+
+Apt packages are installed through `scripts/docker-apt-install.sh`, which
+points apt at `snapshot.debian.org` at the timestamp in `ARG DEBIAN_SNAPSHOT`
+instead of the live Debian archive. Debian mirrors only serve the current
+version of each package, so a build that resolves against the live archive
+stops reproducing (or, with per-package version pins, stops building) as soon
+as any package in the transitive closure is rebuilt. The snapshot pins the
+whole closure, including unpinned transitive dependencies, so a release keeps
+reproducing indefinitely. The pin is an explicit value in the Dockerfiles
+rather than being derived from `SOURCE_DATE_EPOCH` so that apt layers stay
+cached across commits and the Dockerfile is the single source of truth.
+`scripts/update-base-images.sh` advances it, together with the base image
+digests, only when the installed package set actually changes at the latest
+snapshot.
 
 `build-release.sh` derives commit/ref from the local git state and passes
 them as `--build-arg` to `docker buildx build`, mirroring CI's

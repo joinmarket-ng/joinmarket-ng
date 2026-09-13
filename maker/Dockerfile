@@ -11,20 +11,25 @@ ARG PYTHON_SLIM_DIGEST=sha256:cad9a2c871761c413caa6fdd6441c783451e740a48aaeba60a
 # Update versions with: ./scripts/update-base-images.sh
 ARG SETUPTOOLS_VERSION=84.0.0
 ARG WHEEL_VERSION=0.48.0
+# Debian archive snapshot (snapshot.debian.org) that apt resolves against.
+# Pins the whole transitive package closure so the build keeps reproducing
+# after the live archive rotates. See scripts/docker-apt-install.sh.
+# Update with: ./scripts/update-base-images.sh
+ARG DEBIAN_SNAPSHOT=20260913T082142Z
 
 FROM python:${PYTHON_VERSION}-slim@${PYTHON_SLIM_DIGEST} AS builder
 
 WORKDIR /build
 
-# Install build dependencies (sorted alphabetically, versions pinned for reproducibility)
-# Update versions with: ./scripts/update-base-images.sh
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential=12.12 \
-    git=1:2.47.3-0+deb13u1 \
-    libffi-dev=3.4.8-2 \
-    libsodium-dev=1.0.18-1+deb13u1 \
-    pkg-config=1.8.1-4 \
-    && rm -rf /var/lib/apt/lists/*
+# Install build dependencies (sorted alphabetically) from the pinned Debian snapshot
+ARG DEBIAN_SNAPSHOT
+RUN --mount=type=bind,source=scripts/docker-apt-install.sh,target=/tmp/docker-apt-install.sh \
+    sh /tmp/docker-apt-install.sh \
+    build-essential \
+    git \
+    libffi-dev \
+    libsodium-dev \
+    pkg-config
 
 # Reproducible builds: SOURCE_DATE_EPOCH must be set via --build-arg for reproducible builds
 # When not provided, pip install runs without it (non-reproducible but works)
@@ -95,17 +100,14 @@ FROM python:${PYTHON_VERSION}-slim@${PYTHON_SLIM_DIGEST} AS production
 
 WORKDIR /app
 
-# Install only runtime dependencies (no build tools)
-# Versions pinned for reproducible builds
-# Delete apt/dpkg logs and ldconfig cache for reproducible builds
+# Install only runtime dependencies (no build tools) from the pinned Debian snapshot
 # Package installers are build-only; remove pip and its vendored libraries.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libsecp256k1-2=0.5.0-2+b1 \
-    libsodium23=1.0.18-1+deb13u1 \
-    whiptail=0.52.25-1 \
-    && rm -rf /var/lib/apt/lists/* \
-    && rm -rf /var/log/dpkg.log /var/log/apt/* \
-    && rm -rf /var/cache/ldconfig/aux-cache \
+ARG DEBIAN_SNAPSHOT
+RUN --mount=type=bind,source=scripts/docker-apt-install.sh,target=/tmp/docker-apt-install.sh \
+    sh /tmp/docker-apt-install.sh \
+    libsecp256k1-2 \
+    libsodium23 \
+    whiptail \
     && rm -rf \
         /usr/local/bin/pip* \
         /usr/local/lib/python${PYTHON_VERSION%.*}/ensurepip \

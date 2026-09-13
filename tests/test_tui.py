@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import pty
+import re
 import select
 import subprocess
 import sys
@@ -1764,7 +1765,8 @@ def test_runtime_image_installs_whiptail(component: str) -> None:
     dockerfile = (REPO_ROOT / component / "Dockerfile").read_text()
     production = dockerfile.split("AS production", 1)
     assert len(production) == 2, f"{component} Dockerfile missing production stage"
-    assert "whiptail=" in production[1], (
+    # Package versions come from the pinned Debian snapshot (DEBIAN_SNAPSHOT).
+    assert re.search(r"^\s+whiptail\s*\\$", production[1], re.MULTILINE), (
         f"{component} production image must install whiptail for the jm-ng TUI"
     )
 

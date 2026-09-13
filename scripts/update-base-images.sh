@@ -2,7 +2,8 @@
 # =============================================================================
 # Update build pinning for reproducible builds
 #
-# This script updates base image digests, pinned apt package versions,
+# This script updates base image digests, the pinned Debian archive snapshot
+# (DEBIAN_SNAPSHOT, which fixes every apt package version transitively),
 # selected build-time dependency pins in Dockerfiles, JAM Docker sources, and
 # Flatpak manifest dependency sources/checksums to ensure reproducible builds.
 # Run this periodically to get security updates while maintaining reproducibility.
@@ -15,6 +16,7 @@
 #
 # Requirements:
 #   - docker with buildx
+#   - curl
 #   - sed
 #   - python3
 # =============================================================================
@@ -173,99 +175,118 @@ for dockerfile in "${DOCKERFILES[@]}"; do
 done
 
 # =============================================================================
-# Phase 2: Update pinned apt package versions
+# Phase 2: Update the pinned Debian archive snapshot
+#
+# Dockerfiles install apt packages from snapshot.debian.org at the timestamp in
+# ARG DEBIAN_SNAPSHOT (see scripts/docker-apt-install.sh), which pins the whole
+# transitive package closure. The pin is advanced only when the closure that
+# the Dockerfiles install actually differs at the latest snapshot, so a
+# no-op run leaves the Dockerfiles untouched.
 # =============================================================================
 echo ""
-log_info "Phase 2: Checking pinned apt package versions..."
+log_info "Phase 2: Checking pinned Debian archive snapshot..."
 
-# Collect all unique pinned packages from all Dockerfiles.
-# Matches patterns like: package=version or package=epoch:version.
-declare -A CURRENT_VERSIONS
+APT_INSTALL_HELPER="$PROJECT_ROOT/scripts/docker-apt-install.sh"
+SNAPSHOT_ARCHIVE_URL="https://snapshot.debian.org/archive/debian"
+
+# The pin must be identical across Dockerfiles: the update script and the
+# release scripts treat it as one value.
+CURRENT_SNAPSHOT=""
 for dockerfile in "${DOCKERFILES[@]}"; do
     [[ -f "$dockerfile" ]] || continue
-    while IFS= read -r match; do
-        pkg="${match%%=*}"
-        ver="${match#*=}"
-        # Remove trailing whitespace and backslash continuations
-        ver="${ver%% *}"
-        ver="${ver%\\}"
-        CURRENT_VERSIONS["$pkg"]="$ver"
-    done < <(grep -oP '^\s+\K[a-z][a-z0-9.+-]+=\S+' "$dockerfile" 2>/dev/null | \
-        sed 's/ *\\$//' || true)
+    pinned=$(grep -oP '^ARG DEBIAN_SNAPSHOT=\K[0-9]{8}T[0-9]{6}Z' "$dockerfile" | head -1 || true)
+    if [[ -z "$pinned" ]]; then
+        log_error "${dockerfile#$PROJECT_ROOT/}: missing ARG DEBIAN_SNAPSHOT=<timestamp>"
+        exit 1
+    fi
+    if [[ -n "$CURRENT_SNAPSHOT" && "$pinned" != "$CURRENT_SNAPSHOT" ]]; then
+        log_error "DEBIAN_SNAPSHOT differs between Dockerfiles ($CURRENT_SNAPSHOT vs $pinned)"
+        exit 1
+    fi
+    CURRENT_SNAPSHOT="$pinned"
 done
+log_info "Pinned snapshot: $CURRENT_SNAPSHOT"
 
-if [[ ${#CURRENT_VERSIONS[@]} -eq 0 ]]; then
-    log_warn "No pinned apt packages found in Dockerfiles"
+# Union of the packages every docker-apt-install.sh invocation installs: the
+# package names follow the helper call, one per continuation line.
+mapfile -t APT_PACKAGES < <(
+    awk '
+        /docker-apt-install\.sh \\$/ { collecting = 1; next }
+        collecting && match($0, /^[[:space:]]+[a-z0-9][a-z0-9.+-]*[[:space:]]*\\?$/) {
+            name = $1; sub(/\\$/, "", name); print name; next
+        }
+        { collecting = 0 }
+    ' "${DOCKERFILES[@]}" | sort -u
+)
+if [[ ${#APT_PACKAGES[@]} -eq 0 ]]; then
+    log_error "No docker-apt-install.sh package lists found in Dockerfiles"
+    exit 1
+fi
+log_info "Installed packages (${#APT_PACKAGES[@]}): ${APT_PACKAGES[*]}"
+
+# snapshot.debian.org redirects any timestamp to the latest snapshot taken at
+# or before it, so resolving "now" yields the newest existing snapshot ID.
+LATEST_SNAPSHOT=$(curl -fsS -o /dev/null -w '%{redirect_url}' \
+    "${SNAPSHOT_ARCHIVE_URL}/$(date -u +%Y%m%dT%H%M%SZ)/" | \
+    grep -oP '/archive/debian/\K[0-9]{8}T[0-9]{6}Z' || true)
+if [[ -z "$LATEST_SNAPSHOT" ]]; then
+    log_error "Could not resolve the latest snapshot from $SNAPSHOT_ARCHIVE_URL"
+    exit 1
+fi
+log_info "Latest snapshot: $LATEST_SNAPSHOT"
+
+# Installs the Dockerfile package set from a snapshot inside the slim base image
+# using the same helper the Dockerfiles run, then lists the resulting package
+# versions. Base-image packages are identical on both sides, so a diff shows
+# only what the snapshot change affects.
+installed_packages_at_snapshot() {
+    local snapshot="$1"
+    docker run --rm \
+        -e "DEBIAN_SNAPSHOT=$snapshot" \
+        -v "$APT_INSTALL_HELPER:/tmp/docker-apt-install.sh:ro" \
+        "python:${PYTHON_VERSION}-slim@${SLIM_DIGEST}" sh -c \
+        'sh /tmp/docker-apt-install.sh "$@" >/dev/null 2>&1 \
+            && dpkg-query -W -f "\${Package} \${Version}\n"' \
+        sh "${APT_PACKAGES[@]}"
+}
+
+if [[ "$CURRENT_SNAPSHOT" == "$LATEST_SNAPSHOT" ]]; then
+    log_info "Snapshot pin is already the latest snapshot"
 else
-    # Build the list of packages to query
-    PACKAGES=()
-    for pkg in "${!CURRENT_VERSIONS[@]}"; do
-        PACKAGES+=("$pkg")
-    done
-
-    log_info "Found ${#PACKAGES[@]} pinned packages: ${PACKAGES[*]}"
-    log_info "Querying latest versions from python:${PYTHON_VERSION}-slim..."
-
-    # Query latest candidate versions from the base image
-    # We use the slim image since that's what production stages use
-    APT_OUTPUT=$(docker run --rm "python:${PYTHON_VERSION}-slim" sh -c \
-        "apt-get update -qq 2>/dev/null && apt-cache policy ${PACKAGES[*]} 2>/dev/null" 2>/dev/null)
-
-    if [[ -z "$APT_OUTPUT" ]]; then
-        log_error "Failed to query apt package versions from base image"
+    log_info "Comparing package closure at $CURRENT_SNAPSHOT and $LATEST_SNAPSHOT..."
+    if ! LATEST_PACKAGES=$(installed_packages_at_snapshot "$LATEST_SNAPSHOT"); then
+        log_error "Installing the Dockerfile package set from snapshot $LATEST_SNAPSHOT failed"
         exit 1
     fi
 
-    # Parse apt-cache policy output to extract candidate versions
-    declare -A LATEST_VERSIONS
-    current_pkg=""
-    while IFS= read -r line; do
-        if [[ "$line" =~ ^([a-z][a-z0-9.+-]*): ]]; then
-            current_pkg="${BASH_REMATCH[1]}"
-        elif [[ "$line" =~ Candidate:\ (.+) ]]; then
-            if [[ -n "$current_pkg" ]]; then
-                LATEST_VERSIONS["$current_pkg"]="${BASH_REMATCH[1]}"
-            fi
+    snapshot_needs_update=false
+    if ! CURRENT_PACKAGES=$(installed_packages_at_snapshot "$CURRENT_SNAPSHOT"); then
+        # Typically the pinned snapshot predates the (just updated) base image
+        # and an exact-version dependency can no longer be satisfied.
+        log_warn "Installing the Dockerfile package set from snapshot $CURRENT_SNAPSHOT failed"
+        snapshot_needs_update=true
+    elif ! CLOSURE_DIFF=$(diff <(echo "$CURRENT_PACKAGES") <(echo "$LATEST_PACKAGES")); then
+        log_info "Package changes between snapshots:"
+        grep -E '^[<>]' <<< "$CLOSURE_DIFF" | sed 's/^</  -/; s/^>/  +/'
+        snapshot_needs_update=true
+    fi
+
+    if [[ "$snapshot_needs_update" == true ]]; then
+        log_info "DEBIAN_SNAPSHOT: update available"
+        log_info "  Current: $CURRENT_SNAPSHOT"
+        log_info "  Latest:  $LATEST_SNAPSHOT"
+        UPDATES_NEEDED=$((UPDATES_NEEDED + 1))
+        if [[ "$CHECK_ONLY" == false ]]; then
+            for dockerfile in "${DOCKERFILES[@]}"; do
+                [[ -f "$dockerfile" ]] || continue
+                sed -i "s|^ARG DEBIAN_SNAPSHOT=${CURRENT_SNAPSHOT}$|ARG DEBIAN_SNAPSHOT=${LATEST_SNAPSHOT}|" "$dockerfile"
+            done
+            UPDATES_MADE=$((UPDATES_MADE + 1))
+            log_info "DEBIAN_SNAPSHOT: Updated to $LATEST_SNAPSHOT in all Dockerfiles"
         fi
-    done <<< "$APT_OUTPUT"
-
-    # Compare and update versions
-    for pkg in "${!CURRENT_VERSIONS[@]}"; do
-        current_ver="${CURRENT_VERSIONS[$pkg]}"
-        latest_ver="${LATEST_VERSIONS[$pkg]:-}"
-
-        if [[ -z "$latest_ver" ]]; then
-            log_warn "$pkg: Could not determine latest version (package may not exist)"
-            continue
-        fi
-
-        if [[ "$current_ver" != "$latest_ver" ]]; then
-            log_info "$pkg: version update available"
-            log_info "  Current: $current_ver"
-            log_info "  Latest:  $latest_ver"
-            UPDATES_NEEDED=$((UPDATES_NEEDED + 1))
-
-            if [[ "$CHECK_ONLY" == false ]]; then
-                # Escape special regex characters in version strings for sed BRE.
-                # '.' -> '\.'  for literal dot.
-                # '+' -> '[+]' because '\+' in GNU sed BRE is a one-or-more quantifier,
-                #         not a literal '+'.  Using a bracket expression avoids that.
-                escaped_current=$(printf '%s' "$current_ver" | sed 's/\./\\./g; s/+/[+]/g')
-                # Replacement side: only '&', '/', '\' are special in sed replacements.
-                escaped_latest=$(printf '%s' "$latest_ver" | sed 's/[&/\\]/\\&/g')
-                for dockerfile in "${DOCKERFILES[@]}"; do
-                    [[ -f "$dockerfile" ]] || continue
-                    if grep -q "${pkg}=${current_ver}" "$dockerfile" 2>/dev/null; then
-                        sed -i "s|${pkg}=${escaped_current}|${pkg}=${escaped_latest}|g" "$dockerfile"
-                    fi
-                done
-                UPDATES_MADE=$((UPDATES_MADE + 1))
-                log_info "$pkg: Updated to $latest_ver in all Dockerfiles"
-            fi
-        else
-            log_info "$pkg: Up to date ($current_ver)"
-        fi
-    done
+    else
+        log_info "DEBIAN_SNAPSHOT: Up to date (no package changes since $CURRENT_SNAPSHOT)"
+    fi
 fi
 
 # =============================================================================
