@@ -361,9 +361,10 @@ git commit -m "build: add GPG signature for release $VERSION"
 # push the branch and open a pull request
 ```
 
-Once the signatures merge to `main`, `promote-release.yaml` verifies the
-quorum and promotes the pre-release automatically; no manual release edits
-are needed.
+Once the signatures merge to `main` (direct push or `/fast-forward` on the
+pull request), `promote-release.yaml` verifies the quorum and promotes the
+pre-release automatically; no manual release edits are needed. If it ever
+does not run, trigger it from the Actions tab (`workflow_dispatch`).
 
 ## Verify a Release
 

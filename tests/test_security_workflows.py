@@ -266,7 +266,10 @@ def test_promote_release_gates_publication_on_signature_quorum() -> None:
     assert "workflow_dispatch" in triggers
     # Race guard: signatures pushed before the Release workflow creates the
     # pre-release (observed with 0.39.1) must still promote once it exists.
-    assert triggers["workflow_run"]["workflows"] == ["Release"]
+    # Pushes made by the /fast-forward action's GITHUB_TOKEN never trigger the
+    # push event (0.39.1 and 0.39.2 signature PRs), so the completion of that
+    # workflow must re-check as well.
+    assert triggers["workflow_run"]["workflows"] == ["Release", "Fast-forward merge"]
     assert triggers["workflow_run"]["types"] == ["completed"]
 
     assert workflow["concurrency"]["group"] == "promote-release"
@@ -274,6 +277,10 @@ def test_promote_release_gates_publication_on_signature_quorum() -> None:
 
     job = workflow["jobs"]["promote"]
     assert job["permissions"] == {"contents": "write"}
+    assert job["if"] == (
+        "github.event_name != 'workflow_run' "
+        "|| github.event.workflow_run.conclusion == 'success'"
+    )
 
     checkout = next(
         step

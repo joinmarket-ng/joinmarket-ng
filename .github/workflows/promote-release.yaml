@@ -22,8 +22,14 @@ on:
   # Signatures can land on main before the Release workflow finishes creating
   # the pre-release (local-first signing, or a fast second signer). Re-check
   # after every Release run so an early quorum still promotes automatically.
+  #
+  # Signature PRs merged with /fast-forward are pushed by that workflow's
+  # GITHUB_TOKEN, and GitHub never creates workflow runs for events caused by
+  # GITHUB_TOKEN, so the push trigger above does not fire for them (0.39.1 and
+  # 0.39.2 needed a manual dispatch). The completion of the fast-forward
+  # workflow itself is a regular event, so re-check after it as well.
   workflow_run:
-    workflows: [Release]
+    workflows: [Release, Fast-forward merge]
     types: [completed]
   workflow_dispatch:
 
@@ -39,6 +45,9 @@ concurrency:
 
 jobs:
   promote:
+    # The fast-forward workflow runs (and is skipped) for every issue comment;
+    # only a successful upstream run can have changed what is promotable.
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
