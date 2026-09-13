@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import pytest
 import yaml
 
 
@@ -145,6 +146,36 @@ def test_release_scripts_build_jmwalletd_but_not_jam_ng() -> None:
         for array in arrays:
             assert '"jmwalletd"' in array
             assert '"jam-ng"' not in array
+
+
+def _script_image_matrix(script: Path) -> dict[str, tuple[str, str]]:
+    content = script.read_text()
+    arrays = {}
+    for key in ("IMAGES", "DOCKERFILES", "TARGETS"):
+        match = re.search(rf"^\s*{key}=\(([^)]*)\)", content, re.MULTILINE)
+        assert match, f"{script.name}: missing {key} array"
+        arrays[key] = re.findall(r'"([^"]*)"', match.group(1))
+    assert len(arrays["IMAGES"]) == len(arrays["DOCKERFILES"]) == len(arrays["TARGETS"])
+    return {
+        image: (dockerfile, target)
+        for image, dockerfile, target in zip(
+            arrays["IMAGES"], arrays["DOCKERFILES"], arrays["TARGETS"], strict=True
+        )
+    }
+
+
+@pytest.mark.parametrize("script_name", ["sign-release.sh", "verify-release.sh"])
+def test_reproduce_covers_every_image_in_the_release_manifest(script_name: str) -> None:
+    """Every image whose layers CI records in the manifest must be rebuilt by
+    --reproduce with the same Dockerfile and target, or a signer never checks it."""
+    release_jobs = yaml.safe_load(RELEASE_WORKFLOW.read_text())["jobs"]
+    matrix = release_jobs["build-candidate-images"]["strategy"]["matrix"]["include"]
+    expected = {
+        entry["image"]: (entry["dockerfile"], entry.get("target", ""))
+        for entry in matrix
+    }
+
+    assert _script_image_matrix(REPO_ROOT / "scripts" / script_name) == expected
 
 
 def test_parallel_playwright_uses_standalone_ng_http_endpoint() -> None:
