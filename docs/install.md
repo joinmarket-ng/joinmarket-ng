@@ -50,6 +50,13 @@ your system package manager.
 
 ### Tor Notes
 
+Before offering to configure Tor, the installer tries cookie authentication on
+`127.0.0.1:9051` as your current user, using the standard Linux cookie locations.
+If authentication succeeds, it keeps your existing Tor configuration without
+requiring sudo or restarting Tor. Otherwise, it follows the normal Tor setup
+checks. Custom control endpoints and cookie paths remain under manual control;
+use `--skip-tor` for those setups.
+
 [Tor requirements and manual configuration](setup.md#tor).
 
 ### Neutrino Service

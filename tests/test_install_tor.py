@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import shlex
 import shutil
+import socket
 import subprocess
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -195,3 +197,94 @@ def test_restart_failure_restores_original_and_retries_service(tmp_path: Path) -
     assert "restoring the previous configuration" in result.stdout
     assert torrc.read_text() == original
     assert _service_calls(service_log) == ["restart tor", "restart tor"]
+
+
+def _tor_probe_python() -> str:
+    """Exercise the standalone installer payload without requiring installed jmcore."""
+    function = INSTALL_SH.read_text().split("tor_control_accessible() {", 1)[1]
+    return function.split("<<'PY' 2>/dev/null\n", 1)[1].split("\nPY\n", 1)[0]
+
+
+@pytest.mark.parametrize(
+    "reply, status", [(b"250 OK\r\n", 0), (b"515 Bad cookie\r\n", 1), (b"", 1)]
+)
+@pytest.mark.parametrize(
+    "cookie_path",
+    ["/run/tor/control.authcookie", "/var/lib/tor/control_auth_cookie"],
+)
+def test_control_probe_authenticates_with_readable_cookie(
+    tmp_path: Path, reply: bytes, status: int, cookie_path: str
+) -> None:
+    cookie = bytes(range(32))
+    cookie_file = tmp_path / "cookie"
+    cookie_file.write_bytes(cookie)
+    payload = _tor_probe_python()
+    real_path = Path
+    client, server = socket.socketpair()
+
+    def resolve_cookie(name: str) -> Path:
+        return cookie_file if name == cookie_path else real_path(tmp_path / "missing")
+
+    with server:
+        server.sendall(reply)
+        server.shutdown(socket.SHUT_WR)
+        with (
+            patch("pathlib.Path", side_effect=resolve_cookie),
+            patch("socket.create_connection", return_value=client) as connect,
+            pytest.raises(SystemExit) as result,
+        ):
+            exec(payload, {})
+        assert result.value.code == status
+        connect.assert_called_once_with(("127.0.0.1", 9051), timeout=2)
+        assert server.recv(512) == b"AUTHENTICATE " + cookie.hex().encode() + b"\r\n"
+
+
+@pytest.mark.parametrize(
+    "failure", ["missing", "empty", "invalid", "unreadable", "refused", "timeout"]
+)
+def test_control_probe_failure_is_conservative(tmp_path: Path, failure: str) -> None:
+    cookie_file = tmp_path / "cookie"
+    if failure != "missing":
+        cookie_file.write_bytes(
+            b"" if failure == "empty" else b"a" * (31 if failure == "invalid" else 32)
+        )
+    payload = _tor_probe_python()
+    with (
+        patch("pathlib.Path", return_value=cookie_file),
+        patch(
+            "socket.create_connection",
+            side_effect=TimeoutError()
+            if failure == "timeout"
+            else ConnectionRefusedError(),
+        ) as connect,
+    ):
+        if failure == "unreadable":
+            with (
+                patch.object(Path, "read_bytes", side_effect=PermissionError()),
+                pytest.raises(SystemExit) as result,
+            ):
+                exec(payload, {})
+        else:
+            with pytest.raises(SystemExit) as result:
+                exec(payload, {})
+    assert result.value.code == 1
+    if failure not in {"refused", "timeout"}:
+        connect.assert_not_called()
+
+
+@pytest.mark.parametrize("accessible", [True, False])
+def test_setup_checks_access_before_system_configuration(accessible: bool) -> None:
+    script = f"""
+source {shlex.quote(str(INSTALL_SH))}
+tor_control_accessible() {{ return {0 if accessible else 1}; }}
+detect_os() {{ printf 'FALLBACK_SETUP\n'; exit 0; }}
+sudo() {{ printf 'UNEXPECTED_SUDO\n'; exit 1; }}
+setup_tor
+"""
+    result = subprocess.run(
+        ["bash", "-c", script], capture_output=True, text=True, timeout=10, check=False
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "UNEXPECTED_SUDO" not in result.stdout
+    assert ("existing Tor configuration can be kept" in result.stdout) is accessible
+    assert ("FALLBACK_SETUP" in result.stdout) is not accessible

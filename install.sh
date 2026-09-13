@@ -474,9 +474,46 @@ configure_torrc() {
     print_success "Tor configured"
 }
 
+# Probe as the invoking user, without sudo or additional Python dependencies.
+# Keep cookie discovery aligned with jmcore.config.detect_tor_cookie_path.
+# Only read known local cookie paths, never a path supplied by the peer.
+tor_control_accessible() {
+    command -v python3 &> /dev/null || return 1
+    python3 - <<'PY' 2>/dev/null
+import socket
+from pathlib import Path
+
+try:
+    for path in (
+        Path("/run/tor/control.authcookie"),
+        Path("/var/run/tor/control.authcookie"),
+        Path("/var/lib/tor/control_auth_cookie"),
+    ):
+        if path.exists() and path.stat().st_size > 0:
+            cookie = path.read_bytes()
+            break
+    else:
+        raise SystemExit(1)
+    if len(cookie) != 32:
+        raise SystemExit(1)
+    with socket.create_connection(("127.0.0.1", 9051), timeout=2) as connection:
+        connection.sendall(b"AUTHENTICATE " + cookie.hex().encode("ascii") + b"\r\n")
+        with connection.makefile("rb") as reply:
+            authenticated = reply.readline(512) == b"250 OK\r\n"
+    raise SystemExit(0 if authenticated else 1)
+except OSError:
+    raise SystemExit(1)
+PY
+}
+
 # Setup Tor
 setup_tor() {
     print_header "Setting Up Tor"
+
+    if tor_control_accessible; then
+        print_success "Tor control port is accessible with cookie authentication; existing Tor configuration can be kept"
+        return 0
+    fi
 
     detect_os
 
