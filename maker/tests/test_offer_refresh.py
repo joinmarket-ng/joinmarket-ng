@@ -79,7 +79,8 @@ def _make_bot(mock_wallet: MagicMock, mock_backend: MagicMock, delay_max: int) -
 def _recording_client(failures: int = 0) -> MagicMock:
     """Directory client recording public messages, failing the first N sends."""
     client = MagicMock()
-    client.sent: list[str] = []
+    sent: list[str] = []
+    client.sent = sent
     remaining = [failures]
 
     async def send_public_message(message: str) -> None:
