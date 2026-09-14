@@ -219,11 +219,12 @@ def test_control_probe_authenticates_with_readable_cookie(
     cookie_file = tmp_path / "cookie"
     cookie_file.write_bytes(cookie)
     payload = _tor_probe_python()
-    real_path = Path
+    # Python 3.11's Path constructor consults pathlib.Path, which we mock below.
+    missing_cookie = tmp_path / "missing"
     client, server = socket.socketpair()
 
     def resolve_cookie(name: str) -> Path:
-        return cookie_file if name == cookie_path else real_path(tmp_path / "missing")
+        return cookie_file if name == cookie_path else missing_cookie
 
     with server:
         server.sendall(reply)
