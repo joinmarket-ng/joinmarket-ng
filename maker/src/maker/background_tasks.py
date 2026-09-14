@@ -323,6 +323,14 @@ class BackgroundTasksMixin:
                 # Find disconnected directories
                 disconnected_servers = directory_pool.list_disconnected()
 
+                # This is the only place that sees every directory this
+                # generation may still reach (connected plus configured-but-down),
+                # so it owns pruning. Undelivered messages for a directory that
+                # is merely down are kept: a withdrawal must survive an outage.
+                generation.offer_delivery.prune(
+                    set(clients) | {node_id for _, node_id in disconnected_servers}
+                )
+
                 if not disconnected_servers:
                     continue
 
@@ -367,22 +375,31 @@ class BackgroundTasksMixin:
 
                         logger.debug(f"Reconnected to directory: {dir_server}")
 
-                        # Announce offers to newly connected directory.
-                        # Public broadcasts MUST NOT include the fidelity bond
-                        # proof. Takers receive the bond via privmsg in
-                        # response to !orderbook, matching the reference
-                        # protocol (see jmdaemon/message_channel.py in
-                        # joinmarket-clientserver, which asserts
+                        # Announce the currently exposed offers to the newly
+                        # connected directory. Public broadcasts MUST NOT
+                        # include the fidelity bond proof. Takers receive the
+                        # bond via privmsg in response to !orderbook, matching
+                        # the reference protocol (see jmdaemon/message_channel.py
+                        # in joinmarket-clientserver, which asserts
                         # `fidelity_bond_proof_msg is None` for public pit
                         # announcements).
-                        for offer in offers:
-                            try:
-                                offer_msg = self._format_offer_announcement(
+                        #
+                        # Queueing instead of sending directly keeps this
+                        # ordered behind any cancellation this directory still
+                        # owes, and keeps a failed message for a later retry.
+                        delivery = generation.offer_delivery
+                        delivery.queue(
+                            [new_node_id],
+                            {
+                                offer.oid: self._format_offer_announcement(
                                     offer, include_bond=False
                                 )
-                                await client.send_public_message(offer_msg)
-                            except Exception as e:
-                                logger.warning(f"Failed to announce offer to {new_node_id}: {e}")
+                                # Read at queue time: an offer refresh may have
+                                # adopted new terms since this cycle started.
+                                for offer in generation.current_offers
+                            },
+                        )
+                        await delivery.flush({new_node_id: client})
 
                         # Start listener task.
                         # Prune completed tasks first to prevent listen_tasks from growing

@@ -81,6 +81,10 @@ class OfferManager:
         # Max mixdepth balance the most recent create_offers() result was built
         # from. The bot compares fresh wallet state against this to decide when
         # announced offers are stale; None until offers have been created.
+        # create_offers() records it optimistically: a caller that does not
+        # adopt (announce) the returned offers must restore the previous value,
+        # otherwise the un-announced balance would look like the announced one
+        # and no rescan would ever retry.
         self.offer_balance: int | None = None
 
     async def get_mixdepth_offer_balances(self) -> dict[int, int]:

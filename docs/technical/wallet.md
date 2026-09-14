@@ -265,6 +265,13 @@ Both maker and taker support periodic rescanning:
 | `post_coinjoin_rescan_delay` | 60 | Delay after CoinJoin (maker) |
 
 **Maker:** After CoinJoin, rescans to detect balance changes and update offers automatically.
+The configured `offer_reannounce_delay_max` privacy delay applies to both public
+announcements and private orderbook responses. Until it expires, peers see the
+previous offers, while input reservations and live balance checks still protect
+against unfillable requests. Failed announcements and withdrawals are retained
+for retry on subsequent rescans or reconnection, using the same offer terms
+without rerandomizing them. Different directories can receive an update at
+different times when connections fail.
 
 **Taker:** Rescans between schedule entries to track pending confirmations.
 

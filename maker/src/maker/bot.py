@@ -1478,43 +1478,79 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
                 f"Max balance changed: {old_display} -> {new_max_balance:,} sats. "
                 "Updating offers..."
             )
-            await self._update_offers()
+            # The refresh ends by queueing and flushing the new state itself,
+            # which also retries anything a directory still owes.
+            await self._update_offers(expected_balance=new_max_balance)
         else:
             logger.bind(sensitive=True).debug(
                 f"Wallet re-synced (no change). Total balance: {total_balance:,} sats, "
                 f"max offer balance: {new_max_balance:,} sats"
             )
+            # Retry public offer messages a directory refused earlier. Retries
+            # are paced by the rescan cadence and repeat the exact payload built
+            # when those offers were adopted, so terms are never re-randomized.
+            await self._flush_offer_delivery()
 
-    async def _update_offers(self) -> None:
+    async def _update_offers(self, expected_balance: int | None = None) -> None:
         """Recreate and re-announce offers based on current wallet state.
 
         Called when wallet balance changes (after CoinJoin, external transaction,
         or deposit). This allows the maker to adapt to changing balances without
         requiring a restart.
+
+        ``expected_balance`` is the offer balance the caller observed. Refreshes
+        of one identity are serialized, so a second caller that queued behind an
+        overlapping rescan uses it to detect that the offers it wants already
+        exist and must not be rebuilt (which would re-randomize unchanged terms).
         """
+        generation = self._generation()
+        if generation is None:
+            return
+        async with generation.refresh_lock:
+            await self._refresh_offers_locked(generation, expected_balance)
+
+    async def _refresh_offers_locked(
+        self, generation: MakerGeneration, expected_balance: int | None
+    ) -> None:
+        """Build, delay, then adopt one identity's offers. Holds the refresh lock.
+
+        The freshly built offers stay invisible until adoption: private
+        !orderbook answers, direct responses and fill validation keep serving
+        the previously exposed terms for the whole privacy delay, so a private
+        query cannot bypass the publication deadline. Network delivery to each
+        directory can still complete later or require a retry.
+        """
+        if not self._can_publish_generation(generation):
+            # A rotation completed while this refresh waited for the lock. The
+            # retired identity must not touch the current identity's manager.
+            logger.debug("Skipping offer refresh: this identity no longer serves offers")
+            return
+        # Capture the identity-bound resources up front: a rotation during the
+        # privacy delay must not redirect this refresh onto a new identity.
+        offer_manager = self.offer_manager
+        identity_nick = generation.nick_identity.nick
+        delivery = generation.offer_delivery
+        # The balance the currently exposed offers were built from. It is
+        # restored unless the new offers are actually adopted, so a failed or
+        # cancelled refresh never looks like a completed one.
+        baseline = offer_manager.offer_balance
+        if expected_balance is not None and baseline == expected_balance:
+            logger.debug("Offers already refreshed for the observed balance, skipping rebuild")
+            # No rebuild happened, so retrying undelivered payloads here cannot
+            # change advertised terms, and balance churn that keeps producing
+            # the same offers can no longer starve those retries.
+            await self._deliver_pending(generation)
+            return
+
+        adopted = False
         try:
-            new_offers = await self.offer_manager.create_offers()
+            new_offers = await offer_manager.create_offers()
 
             if self.current_offers == new_offers:
                 logger.debug("Offers unchanged, skipping re-announcement")
+                adopted = True
+                await self._deliver_pending(generation)
                 return
-
-            old_oids = {offer.oid for offer in self.current_offers}
-            new_oids = {offer.oid for offer in new_offers}
-            canceled_oids = old_oids - new_oids
-
-            # Regenerate nick when offers change for additional privacy
-            # This makes it harder for observers to track maker activity over time
-            await self._regenerate_nick()
-
-            # Update offers with new nick (OfferManager.maker_nick was updated by _regenerate_nick)
-            for offer in new_offers:
-                offer.counterparty = self.nick
-
-            self.current_offers = new_offers
-            current_generation = self._generation()
-            if current_generation is not None:
-                current_generation.current_offers = new_offers
 
             delay_max = self.config.offer_reannounce_delay_max
             if delay_max > 0:
@@ -1524,16 +1560,105 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
                 )
                 await asyncio.sleep(delay)
 
-            await self._cancel_offers(canceled_oids)
+            if not self._can_publish_generation(generation):
+                logger.debug("Discarding refreshed offers: identity is no longer serving them")
+                return
+
+            # Regenerate nick when offers change for additional privacy
+            # This makes it harder for observers to track maker activity over time
+            await self._regenerate_nick()
+            if not self._can_publish_generation(generation):
+                return
+
+            # Directories that are down but still owe messages are targeted too:
+            # an announcement queued for an offer that has since disappeared has
+            # to be superseded by its withdrawal instead of being resurrected
+            # when that directory reconnects.
+            targets = set(self._generation_clients(generation.generation_id)) | set(
+                delivery.pending
+            )
+            queued_oids = {oid for entry in delivery.pending.values() for oid in entry}
+            withdrawn = ({offer.oid for offer in self.current_offers} | queued_oids) - {
+                offer.oid for offer in new_offers
+            }
+            desired: dict[int, str | None] = dict.fromkeys(withdrawn, None)
+            desired.update(self._public_offer_payloads(new_offers))
+
+            # Adopt and stage the complete publication without yielding: no peer
+            # may observe half an update, and no rotation may run between
+            # exposing the offers and queueing every message they imply.
+            for offer in new_offers:
+                # Publish under the identity that built these offers, never
+                # under one that became current during the delay.
+                offer.counterparty = identity_nick
+            self.current_offers = new_offers
+            generation.current_offers = new_offers
+            adopted = True
+            delivery.queue(targets, desired)
+
+            # One delivery pass per refresh: the call below re-queues the
+            # identical payloads and flushes them. Whatever a directory refuses
+            # stays queued for the next rescan instead of being retried on the
+            # spot.
             if new_offers:
                 await self._announce_offers()
+            else:
+                await self._cancel_offers(withdrawn)
+
+            undelivered = len(delivery.pending)
+            if new_offers:
                 offer_summary = ", ".join(f"oid={o.oid}:{o.maxsize:,}" for o in new_offers)
-                logger.info(f"Updated and re-announced {len(new_offers)} offer(s): {offer_summary}")
+                if undelivered:
+                    logger.info(
+                        f"Updated {len(new_offers)} offer(s), announcement still queued for "
+                        f"{undelivered} director(ies): {offer_summary}"
+                    )
+                else:
+                    logger.info(
+                        f"Updated and re-announced {len(new_offers)} offer(s): {offer_summary}"
+                    )
+            elif undelivered:
+                logger.warning(
+                    "No fillable liquidity remains; offer withdrawal still queued for "
+                    f"{undelivered} director(ies)"
+                )
             else:
                 logger.warning("Withdrew all offers because no fillable liquidity remains")
         except Exception as e:
             logger.error("Failed to update offers")
             logger.bind(sensitive=True).error(f"Failed to update offers: {e}")
+        finally:
+            if not adopted:
+                # Cancelled or failed before adoption: the exposed offers still
+                # describe ``baseline``, so restoring it keeps the next rescan's
+                # comparison honest and makes that rescan retry.
+                offer_manager.offer_balance = baseline
+
+    def _can_publish_generation(self, generation: MakerGeneration) -> bool:
+        """Whether this identity may still publish offers of its own."""
+        return (
+            generation.generation_id == self.current_generation_id
+            and self._generation(generation.generation_id) is generation
+            and generation.state is GenerationState.ACCEPTING
+        )
+
+    def _public_offer_payloads(self, offers: list[Offer]) -> dict[int, str | None]:
+        """Format the bond-free public announcement of each offer id."""
+        return {
+            offer.oid: self._format_offer_announcement(offer, include_bond=False)
+            for offer in offers
+        }
+
+    async def _deliver_pending(self, generation: MakerGeneration) -> None:
+        """Send whatever this generation's directories still owe."""
+        await generation.offer_delivery.flush(self._generation_clients(generation.generation_id))
+
+    async def _flush_offer_delivery(self) -> None:
+        """Retry public offer messages the current identity still owes."""
+        generation = self._generation()
+        if generation is None or generation.state is not GenerationState.ACCEPTING:
+            return
+        await self._deliver_pending(generation)
 
     async def _cancel_offers(self, offer_ids: set[int]) -> None:
         """Withdraw OIDs using the reference-compatible public cancel command."""
@@ -1545,13 +1670,12 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         self, generation: MakerGeneration, offer_ids: set[int]
     ) -> None:
         """Withdraw OIDs using the clients that announced this generation."""
-        for offer_id in sorted(offer_ids):
-            for client in self._generation_clients(generation.generation_id).values():
-                try:
-                    await client.send_public_message(f"cancel {offer_id}")
-                    logger.debug(f"Canceled offer {offer_id} on directory")
-                except Exception as e:
-                    logger.error(f"Failed to cancel offer {offer_id}: {e}")
+        if not offer_ids:
+            return
+        clients = self._generation_clients(generation.generation_id)
+        delivery = generation.offer_delivery
+        delivery.queue(clients, dict.fromkeys(offer_ids, None))
+        await delivery.flush(clients)
 
     async def _announce_offers(self) -> None:
         """Announce offers to all connected directory servers (public broadcast, NO bonds)"""
@@ -1562,15 +1686,10 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
 
     async def _announce_generation_offers(self, generation: MakerGeneration) -> None:
         """Announce offers using only the identity that owns them."""
-        for offer in generation.current_offers:
-            offer_msg = self._format_offer_announcement(offer, include_bond=False)
-
-            for client in generation.directory_clients.values():
-                try:
-                    await client.send_public_message(offer_msg)
-                    logger.debug("Announced offer to directory")
-                except Exception as e:
-                    logger.error(f"Failed to announce offer: {e}")
+        clients = self._generation_clients(generation.generation_id)
+        delivery = generation.offer_delivery
+        delivery.queue(clients, self._public_offer_payloads(generation.current_offers))
+        await delivery.flush(clients)
 
     def _format_offer_announcement(self, offer: Offer, include_bond: bool = False) -> str:
         """Format offer for announcement.

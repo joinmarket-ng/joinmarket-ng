@@ -1587,21 +1587,31 @@ class TestWalletRescanAndOfferUpdate:
 
     @pytest.mark.asyncio
     async def test_update_offers_cancels_only_removed_oid(self, maker_bot):
-        """Reduced dual offers withdraw the omitted OID and keep the surviving offer."""
+        """Reduced dual offers withdraw the omitted OID and keep the surviving offer.
+
+        The withdrawal and the surviving announcement are one publication, so
+        the withdrawal is asserted on the staged directory messages rather than
+        on a separate ``_cancel_offers`` call.
+        """
         from unittest.mock import AsyncMock
 
+        client = MagicMock()
+        client.send_public_message = AsyncMock()
+        maker_bot.directory_clients = {"dir": client}
         removed = maker_bot.current_offers[0].model_copy(update={"oid": 1})
         maker_bot.current_offers.append(removed)
         surviving = maker_bot.current_offers[0].model_copy(update={"maxsize": 524_288})
         maker_bot.offer_manager.create_offers = AsyncMock(return_value=[surviving])
-        maker_bot._cancel_offers = AsyncMock()
         maker_bot._announce_offers = AsyncMock()
 
         await maker_bot._update_offers()
 
         assert maker_bot.current_offers == [surviving]
-        maker_bot._cancel_offers.assert_awaited_once_with({1})
         maker_bot._announce_offers.assert_awaited_once_with()
+        assert maker_bot.generations[0].offer_delivery.pending["dir"] == {
+            1: None,
+            0: "sw0reloffer 0 100000 524288 1000 0.001",
+        }
 
     @pytest.mark.asyncio
     async def test_cancel_offers_broadcasts_reference_payload_in_oid_order(self, maker_bot):
