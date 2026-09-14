@@ -1042,12 +1042,9 @@ async def _show_wallet_info(
         # Show the wallet name and master fingerprint so users can pass the
         # fingerprint via --wallet-fingerprint to cold-wallet bond commands.
         if wallet.mnemonic_file is not None:
+            print(f"\n{_colorize('Wallet:', _ANSI_BOLD_YELLOW)} {wallet.mnemonic_file.name}")
             print(
-                f"\n{_colorize('Wallet:', _ANSI_BOLD_YELLOW)} {wallet.mnemonic_file.name}"
-            )
-            print(
-                f"{_colorize('Wallet fingerprint:', _ANSI_BOLD_YELLOW)} "
-                f"{wallet.wallet_fingerprint}"
+                f"{_colorize('Wallet fingerprint:', _ANSI_BOLD_YELLOW)} {wallet.wallet_fingerprint}"
             )
         else:
             print(
@@ -1355,7 +1352,8 @@ def _print_categorized_utxos(wallet: WalletService) -> None:
     addr_width = max((len(u.address) for u in normal_utxos), default=42)
     # Fixed-width confs/state columns so outpoints align in their own column.
     confs_width = max(
-        len("5+ conf" if u.confirmations >= 5 else f"{u.confirmations} conf") for u in all_utxos
+        (len("5+ conf" if u.confirmations >= 5 else f"{u.confirmations} conf") for u in all_utxos),
+        default=len("5+ conf"),
     )
     # Widest state label (``redeemable``) so outpoints stay aligned in their
     # own column for every row, including expired fidelity bonds.

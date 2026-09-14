@@ -17,13 +17,12 @@ import pytest
 from typer.testing import CliRunner
 
 from jmwallet.cli import app
+from jmwallet.wallet.models import UTXOInfo
 
 runner = CliRunner()
 
 
-def _make_utxo(txid: str, vout: int, value: int, address: str, md: int, **kw) -> object:
-    from jmwallet.wallet.models import UTXOInfo
-
+def _make_utxo(txid: str, vout: int, value: int, address: str, md: int, **kw) -> UTXOInfo:
     return UTXOInfo(
         txid=txid,
         vout=vout,
@@ -129,6 +128,27 @@ def test_categorized_utxos_sections_and_headers(categorized_wallet, capsys):
 
     # cj-change is empty -> single ``none`` line, not per-mixdepth.
     assert "  none" in out
+
+
+def test_categorized_utxos_empty_wallet_prints_none_for_every_section(capsys):
+    """A wallet with no UTXOs at all (fresh install) must not crash.
+
+    Regression: the confirmations column width was computed with ``max()``
+    over an empty iterable, raising ``ValueError``.
+    """
+    from jmwallet.cli import wallet as wallet_cli
+
+    mock_wallet = MagicMock()
+    mock_wallet.mixdepth_count = 5
+    mock_wallet.utxo_cache = {}
+    mock_wallet.address_cache = {}
+
+    with patch("sys.stdout.isatty", return_value=False):
+        wallet_cli._print_categorized_utxos(mock_wallet)
+        out = capsys.readouterr().out
+
+    assert out.count("  none") == 5
+    mock_wallet.get_utxo_label_from_wallet.assert_not_called()
 
 
 def test_categorized_utxos_row_state_and_frozen(categorized_wallet, capsys):
