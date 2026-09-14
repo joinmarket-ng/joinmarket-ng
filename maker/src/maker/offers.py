@@ -78,6 +78,36 @@ class OfferManager:
         self.wallet = wallet
         self.config = config
         self.maker_nick = maker_nick
+        # Max mixdepth balance the most recent create_offers() result was built
+        # from. The bot compares fresh wallet state against this to decide when
+        # announced offers are stale; None until offers have been created.
+        self.offer_balance: int | None = None
+
+    async def get_mixdepth_offer_balances(self) -> dict[int, int]:
+        """Per-mixdepth balance available for offers under the maker's policy.
+
+        Excludes fidelity bonds, unconfirmed coins below ``min_confirmations``,
+        restricted mixdepth 0 coins, and inputs locked by in-flight rounds.
+        """
+        locked_outpoints = self.wallet.get_locked_input_outpoints()
+        restrict_md0 = not self.config.allow_mixdepth_zero_merge
+        md0_mergeable_outpoints = (
+            await self.wallet.get_maker_rotation_lineage_outpoints() if restrict_md0 else None
+        )
+        balances: dict[int, int] = {}
+        for mixdepth in range(self.wallet.mixdepth_count):
+            balances[mixdepth] = await self.wallet.get_balance_for_offers(
+                mixdepth,
+                min_confirmations=self.config.min_confirmations,
+                restrict_md0=restrict_md0,
+                md0_mergeable_outpoints=md0_mergeable_outpoints,
+                exclude=locked_outpoints,
+            )
+        return balances
+
+    async def get_max_offer_balance(self) -> int:
+        """Largest single-mixdepth balance available for offers (0 when none)."""
+        return max((await self.get_mixdepth_offer_balances()).values(), default=0)
 
     async def create_offers(self) -> list[Offer]:
         """
@@ -97,22 +127,10 @@ class OfferManager:
             List of offers. Each offer gets a unique oid (0, 1, 2, ...).
         """
         try:
-            locked_outpoints = self.wallet.get_locked_input_outpoints()
-            restrict_md0 = not self.config.allow_mixdepth_zero_merge
-            md0_mergeable_outpoints = (
-                await self.wallet.get_maker_rotation_lineage_outpoints() if restrict_md0 else None
-            )
-            balances = {}
-            for mixdepth in range(self.wallet.mixdepth_count):
-                # Use balance for offers (excludes fidelity bonds)
-                balance = await self.wallet.get_balance_for_offers(
-                    mixdepth,
-                    min_confirmations=self.config.min_confirmations,
-                    restrict_md0=restrict_md0,
-                    md0_mergeable_outpoints=md0_mergeable_outpoints,
-                    exclude=locked_outpoints,
-                )
-                balances[mixdepth] = balance
+            balances = await self.get_mixdepth_offer_balances()
+            # Record what these offers are built from, even when the result is
+            # empty, so a later balance change is detected and re-evaluated.
+            self.offer_balance = max(balances.values(), default=0)
 
             available_mixdepths = {md: bal for md, bal in balances.items() if bal > 0}
 
@@ -202,6 +220,9 @@ class OfferManager:
             return offers
 
         except Exception as e:
+            # Nothing was announced from this attempt; force the next rescan
+            # to try again rather than treating the announced offers as current.
+            self.offer_balance = None
             logger.error("Failed to create offers")
             logger.bind(sensitive=True).error(f"Failed to create offers: {e}")
             raise

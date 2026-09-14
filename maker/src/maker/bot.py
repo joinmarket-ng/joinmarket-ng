@@ -1426,27 +1426,16 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
 
         This is the core rescan logic used by both post-CoinJoin resync
         and periodic rescan. It:
-        1. Saves the current max balance
-        2. Re-syncs the wallet
-        3. If max balance changed, recreates and re-announces offers
-        """
-        # Get current max balance available for offers before resync (excludes fidelity bonds)
-        old_max_balance = 0
-        locked_outpoints = self.wallet.get_locked_input_outpoints()
-        restrict_md0 = not self.config.allow_mixdepth_zero_merge
-        md0_mergeable_outpoints = (
-            await self.wallet.get_maker_rotation_lineage_outpoints() if restrict_md0 else None
-        )
-        for mixdepth in range(self.wallet.mixdepth_count):
-            balance = await self.wallet.get_balance_for_offers(
-                mixdepth,
-                min_confirmations=self.config.min_confirmations,
-                restrict_md0=restrict_md0,
-                md0_mergeable_outpoints=md0_mergeable_outpoints,
-                exclude=locked_outpoints,
-            )
-            old_max_balance = max(old_max_balance, balance)
+        1. Re-syncs the wallet
+        2. Compares the max balance available for offers against the balance
+           the currently announced offers were built from
+        3. If they differ, recreates and re-announces offers
 
+        The comparison is against the announced offers, not a pre-sync wallet
+        snapshot: inputs locked for a CoinJoin are already excluded from the
+        wallet's view before the transaction is signed, so a before/after sync
+        comparison would see no change and leave stale offers announced.
+        """
         # Sync wallet (use descriptor wallet if available for fast sync)
         from jmwallet.backends.descriptor_wallet import DescriptorWalletBackend
 
@@ -1468,35 +1457,25 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         # Update pending history immediately after sync (in case of restart)
         await self._update_pending_history()
 
-        # Get new max balance for offers after resync (excludes fidelity bonds)
-        new_max_balance = 0
-        locked_outpoints = self.wallet.get_locked_input_outpoints()
-        md0_mergeable_outpoints = (
-            await self.wallet.get_maker_rotation_lineage_outpoints() if restrict_md0 else None
-        )
-        for mixdepth in range(self.wallet.mixdepth_count):
-            balance = await self.wallet.get_balance_for_offers(
-                mixdepth,
-                min_confirmations=self.config.min_confirmations,
-                restrict_md0=restrict_md0,
-                md0_mergeable_outpoints=md0_mergeable_outpoints,
-                exclude=locked_outpoints,
-            )
-            new_max_balance = max(new_max_balance, balance)
+        # Max balance available for offers after resync (excludes fidelity bonds)
+        new_max_balance = await self.offer_manager.get_max_offer_balance()
+        offer_balance = self.offer_manager.offer_balance
 
         total_balance = await self.wallet.get_total_balance()
 
-        # If max balance changed, update offers and log at INFO so operators
-        # see balance/offer churn. When unchanged this rescan is a routine
-        # no-op (every `rescan_interval_sec`, default 10 min) and is logged
-        # at DEBUG to avoid flooding logs of long-running makers.
-        if old_max_balance != new_max_balance:
+        # If the announced offers were built from a different balance, update
+        # them and log at INFO so operators see balance/offer churn. When
+        # unchanged this rescan is a routine no-op (every `rescan_interval_sec`,
+        # default 10 min) and is logged at DEBUG to avoid flooding logs of
+        # long-running makers.
+        if offer_balance != new_max_balance:
             logger.info("Wallet balance changed, updating offers")
             logger.bind(sensitive=True).info(
                 f"Wallet re-synced. Total balance: {total_balance:,} sats"
             )
+            old_display = f"{offer_balance:,}" if offer_balance is not None else "none"
             logger.bind(sensitive=True).info(
-                f"Max balance changed: {old_max_balance:,} -> {new_max_balance:,} sats. "
+                f"Max balance changed: {old_display} -> {new_max_balance:,} sats. "
                 "Updating offers..."
             )
             await self._update_offers()

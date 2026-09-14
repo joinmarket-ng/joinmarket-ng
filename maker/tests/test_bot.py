@@ -1267,11 +1267,11 @@ class TestWalletRescanAndOfferUpdate:
         """Test that offers are updated when max balance changes."""
         from unittest.mock import AsyncMock
 
-        # Set up balances: first return old balance, then new balance
+        # Announced offers were built from old_balance; wallet now reports new_balance
         old_balance = 400_000
         new_balance = 600_000
-        balance_calls = [old_balance] * 5 + [new_balance] * 5
-        mock_wallet.get_balance_for_offers = AsyncMock(side_effect=balance_calls)
+        maker_bot.offer_manager.offer_balance = old_balance
+        mock_wallet.get_balance_for_offers = AsyncMock(return_value=new_balance)
 
         # Mock offer creation
         # maxsize is rounded to nearest power of 2 by OfferManager,
@@ -1298,7 +1298,7 @@ class TestWalletRescanAndOfferUpdate:
         maker_bot.offer_manager.create_offers.assert_called_once()
         maker_bot._announce_offers.assert_called_once()
         assert maker_bot.current_offers[0].maxsize == 524_288
-        assert mock_wallet.get_maker_rotation_lineage_outpoints.await_count == 2
+        assert mock_wallet.get_maker_rotation_lineage_outpoints.await_count == 1
         for call in mock_wallet.get_balance_for_offers.call_args_list:
             assert call.kwargs["md0_mergeable_outpoints"] == {"ab" * 32 + ":0"}
 
@@ -1307,7 +1307,8 @@ class TestWalletRescanAndOfferUpdate:
         """Test that offers are not updated when balance doesn't change."""
         from unittest.mock import AsyncMock
 
-        # Same balance before and after sync
+        # Wallet still reports the balance the announced offers were built from
+        maker_bot.offer_manager.offer_balance = 400_000
         mock_wallet.get_balance_for_offers = AsyncMock(return_value=400_000)
 
         maker_bot.offer_manager.create_offers = AsyncMock()
@@ -1321,6 +1322,47 @@ class TestWalletRescanAndOfferUpdate:
         # Offers should NOT have been updated (balance unchanged)
         maker_bot.offer_manager.create_offers.assert_not_called()
         maker_bot._announce_offers.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_resync_reannounces_after_coinjoin_when_inputs_were_already_locked(
+        self, maker_bot, mock_wallet
+    ):
+        """Regression: offers went stale after a CoinJoin because the spent inputs
+        were already locked (and excluded) before the post-CoinJoin resync, so a
+        before/after-sync comparison saw no change. The gate must compare the
+        wallet against the balance the announced offers were built from.
+        """
+        from unittest.mock import AsyncMock
+
+        from maker.offers import OfferManager
+
+        # Real OfferManager so offer_balance is recorded by create_offers().
+        maker_bot.offer_manager = OfferManager(mock_wallet, maker_bot.config, maker_bot.nick)
+        mock_wallet.get_locked_input_outpoints = MagicMock(return_value=set())
+        mock_wallet.get_balance_for_offers = AsyncMock(return_value=10_000_000)
+        with patch("maker.offers.get_best_fidelity_bond", new=AsyncMock(return_value=None)):
+            maker_bot.current_offers = await maker_bot.offer_manager.create_offers()
+        assert maker_bot.current_offers
+        assert maker_bot.offer_manager.offer_balance == 10_000_000
+
+        # A CoinJoin was signed: its inputs are locked and excluded from the
+        # offer balance both before and after the deferred resync.
+        mock_wallet.get_locked_input_outpoints = MagicMock(return_value={("ab" * 32, 0)})
+        mock_wallet.get_balance_for_offers = AsyncMock(return_value=4_000_000)
+        maker_bot._announce_offers = AsyncMock()
+
+        with patch("maker.offers.get_best_fidelity_bond", new=AsyncMock(return_value=None)):
+            await maker_bot._resync_wallet_and_update_offers()
+
+        maker_bot._announce_offers.assert_awaited_once()
+        assert maker_bot.offer_manager.offer_balance == 4_000_000
+        assert all(offer.maxsize <= 4_000_000 for offer in maker_bot.current_offers)
+
+        # A later routine rescan with the same wallet state is a no-op.
+        maker_bot._announce_offers.reset_mock()
+        with patch("maker.offers.get_best_fidelity_bond", new=AsyncMock(return_value=None)):
+            await maker_bot._resync_wallet_and_update_offers()
+        maker_bot._announce_offers.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_resync_rejects_expired_presigned_certificate(
@@ -1479,7 +1521,8 @@ class TestWalletRescanAndOfferUpdate:
 
         from loguru import logger
 
-        # Same balance before and after: routine no-op rescan
+        # Wallet matches the announced offers: routine no-op rescan
+        maker_bot.offer_manager.offer_balance = 400_000
         mock_wallet.get_balance_for_offers = AsyncMock(return_value=400_000)
         maker_bot.offer_manager.create_offers = AsyncMock()
         maker_bot._announce_offers = AsyncMock()
