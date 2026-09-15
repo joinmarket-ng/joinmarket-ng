@@ -11,6 +11,9 @@ dependencies = [
     "pydantic>=2.0.0",
     "typer>=0.9.0",
     "cryptography>=46.0.0",
+    "base58>=2.1.1,<3",
+    "bech32>=1.2.0,<2",
+    "bitstring>=4.3.0,<5",
 ]
 
 [project.optional-dependencies]
@@ -26,6 +29,7 @@ dev = [
 
 [project.scripts]
 jm-taker = "taker.cli:main"
+jm-market = "taker.market_cli:main"
 
 [build-system]
 requires = ["setuptools>=68.0.0", "wheel"]
@@ -33,6 +37,9 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"taker._vendor.bolt11" = ["LICENSE", "UPSTREAM", "py.typed"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
@@ -56,6 +63,10 @@ target-version = "py311"
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W", "UP"]
 ignore = []
+
+[tool.ruff.lint.per-file-ignores]
+# Keep upstream annotations and exception names for straightforward vendor updates.
+"src/taker/_vendor/bolt11/**" = ["UP", "N818"]
 
 [tool.ruff.format]
 quote-style = "double"

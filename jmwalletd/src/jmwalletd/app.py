@@ -53,7 +53,15 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     except Exception:
         logger.error("Failed to reconcile tumbler plans on startup")
         logger.bind(sensitive=True).exception("Failed to reconcile tumbler plans on startup")
-    yield
+    try:
+        yield
+    finally:
+        async with state.wallet_lifecycle_lock:
+            if state._market_seller_ref is not None or state._market_seller_task is not None:
+                keys = getattr(state.wallet_service, "market_keys", None)
+                if keys is not None:
+                    keys.close()
+                await state.stop_market_seller()
 
 
 def create_app(*, data_dir: Path | None = None) -> FastAPI:
@@ -149,6 +157,7 @@ def create_app(*, data_dir: Path | None = None) -> FastAPI:
     # ------------------------------------------------------------------
     from jmwalletd.routers.coinjoin import router as coinjoin_router
     from jmwalletd.routers.logs import router as logs_router
+    from jmwalletd.routers.market import router as market_router
     from jmwalletd.routers.obwatch import router as obwatch_router
     from jmwalletd.routers.tumbler import router as tumbler_router
     from jmwalletd.routers.wallet import router as wallet_router
@@ -161,6 +170,7 @@ def create_app(*, data_dir: Path | None = None) -> FastAPI:
     app.include_router(tumbler_router, prefix="/api/v1")
     app.include_router(obwatch_router, prefix="/api/v1")
     app.include_router(logs_router, prefix="/api/v1")
+    app.include_router(market_router, prefix="/api/v1")
 
     # JAM also calls /obwatch/* without the /api/v1 prefix.
     app.include_router(obwatch_router)

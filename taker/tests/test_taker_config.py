@@ -124,6 +124,11 @@ class TestTakerConfig:
         assert config.bondless_makers_allowance == 0.05
         assert config.bondless_makers_allowance_require_zero_fee is True
         assert config.initial_confirmation_timeout_sec == 300
+        assert config.external_podle_mode == "disabled"
+
+    def test_external_podle_mode_only_is_explicit(self, sample_mnemonic: str) -> None:
+        config = TakerConfig(mnemonic=sample_mnemonic, external_podle_mode="only")
+        assert config.external_podle_mode == "only"
 
     def test_direct_config_rejects_production_clearnet_directory(
         self, sample_mnemonic: str

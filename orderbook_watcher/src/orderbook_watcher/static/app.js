@@ -4,6 +4,24 @@ let sortDirection = 'desc';
 let offerSelectionProbabilities = new Map();
 let activeSelectionProbabilityTrigger = null;
 
+const OFFER_TAB_STORAGE_KEY = 'joinmarket-orderbook-offer-tab';
+const OFFER_TAB_NAMES = ['coinjoin', 'podle', 'bond'];
+const CREDENTIAL_MARKETS = {
+    podle: {
+        collection: 'podle_offers',
+        label: 'PoDLE',
+    },
+    bond: {
+        collection: 'bond_offers',
+        label: 'Fidelity Bond',
+    },
+};
+const credentialMarketState = {
+    podle: { searchText: '', sortColumn: 'price_sats', sortDirection: 'asc' },
+    bond: { searchText: '', sortColumn: 'price_sats', sortDirection: 'asc' },
+};
+let activeOfferTab = getPersistedOfferTab();
+
 const DEFAULT_MAKER_COUNT = 9;
 const BONDLESS_ALLOWANCE = 0.05;
 const SELECTION_SIMULATION_ROUNDS = 200000;
@@ -80,10 +98,168 @@ async function fetchOrderbook() {
         renderFeeQuantizationChart();
         updateDirectoryFilter();
         renderTable();
+        updateCredentialMarket();
         updateLastUpdate();
     } catch (error) {
         console.error('Failed to fetch orderbook:', error);
     }
+}
+
+function getPersistedOfferTab() {
+    try {
+        const tab = window.localStorage.getItem(OFFER_TAB_STORAGE_KEY);
+        return OFFER_TAB_NAMES.includes(tab) ? tab : 'coinjoin';
+    } catch (_error) {
+        return 'coinjoin';
+    }
+}
+
+function credentialText(value) {
+    if (typeof value === 'string') return value;
+    if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+    return '';
+}
+
+function credentialBody(observedOffer) {
+    if (!observedOffer || typeof observedOffer !== 'object') return null;
+    const listing = observedOffer.listing;
+    if (!listing || typeof listing !== 'object' || !listing.body || typeof listing.body !== 'object') {
+        return null;
+    }
+    return listing.body;
+}
+
+function getCredentialOffers(product) {
+    if (!orderbookData) return { status: 'loading', offers: [] };
+
+    const market = orderbookData.credential_market;
+    const config = CREDENTIAL_MARKETS[product];
+    if (!market || typeof market !== 'object' || !Array.isArray(market[config.collection])) {
+        return { status: 'unavailable', offers: [] };
+    }
+
+    const now = Date.now() / 1000;
+    const activeOffers = market[config.collection].filter(observedOffer => {
+        const body = credentialBody(observedOffer);
+        const expiresAt = Number(body?.expires_at);
+        return Number.isFinite(expiresAt) && expiresAt > now;
+    });
+    return { status: 'ready', offers: activeOffers };
+}
+
+function credentialValue(observedOffer, column) {
+    const body = credentialBody(observedOffer) || {};
+    if (column === 'seller_nick') return credentialText(observedOffer.seller_nick).toLowerCase();
+    return Number(body[column]) || 0;
+}
+
+function filterAndSortCredentialOffers(product, offers) {
+    const state = credentialMarketState[product];
+    const filtered = offers.filter(observedOffer => {
+        const seller = credentialText(observedOffer.seller_nick).toLowerCase();
+        return !state.searchText || seller.includes(state.searchText);
+    });
+
+    return filtered.sort((a, b) => {
+        const aValue = credentialValue(a, state.sortColumn);
+        const bValue = credentialValue(b, state.sortColumn);
+        const comparison = typeof aValue === 'string'
+            ? aValue.localeCompare(bValue)
+            : aValue - bValue;
+        return state.sortDirection === 'asc' ? comparison : -comparison;
+    });
+}
+
+function formatCredentialPrice(value) {
+    const price = Number(value);
+    return Number.isFinite(price) ? Math.round(price).toLocaleString() : '-';
+}
+
+function formatCredentialExpiry(value) {
+    const expiresAt = Number(value);
+    if (!Number.isFinite(expiresAt)) return '-';
+    return new Date(expiresAt * 1000).toLocaleString();
+}
+
+function appendCredentialDirectories(row, observedOffer) {
+    const directoryValue = appendTableCell(row, 'Directories', '', 'credential-directories');
+    const directories = Array.isArray(observedOffer.directory_nodes) ? observedOffer.directory_nodes : [];
+    const directoryList = document.createElement('span');
+    directoryList.className = 'credential-directory-list';
+
+    for (const directory of directories) {
+        const directoryText = credentialText(directory);
+        if (!directoryText) continue;
+        const directoryElement = document.createElement('span');
+        directoryElement.className = 'credential-directory';
+        directoryElement.textContent = directoryText;
+        directoryElement.title = directoryText;
+        directoryList.appendChild(directoryElement);
+    }
+
+    if (directoryList.childElementCount === 0) {
+        directoryValue.textContent = '-';
+    } else {
+        directoryValue.appendChild(directoryList);
+    }
+}
+
+function renderCredentialOfferRows(product, offers) {
+    const tbody = document.getElementById(`${product}-offers-tbody`);
+    const fragment = document.createDocumentFragment();
+
+    for (const observedOffer of offers) {
+        const body = credentialBody(observedOffer) || {};
+        const row = document.createElement('tr');
+        const seller = credentialText(observedOffer.seller_nick);
+        const sellerKey = credentialText(body.seller_pubkey);
+
+        const sellerValue = appendTableCell(row, 'Seller', seller, 'credential-seller');
+        sellerValue.title = seller;
+        const keyValue = appendTableCell(row, 'Seller Key', sellerKey, 'credential-key');
+        keyValue.title = sellerKey;
+        appendTableCell(row, 'Price (sats)', formatCredentialPrice(body.price_sats));
+        appendTableCell(row, 'Period', credentialText(body.period));
+        const expiryValue = appendTableCell(row, 'Expires', formatCredentialExpiry(body.expires_at));
+        expiryValue.title = credentialText(body.expires_at);
+        appendCredentialDirectories(row, observedOffer);
+        fragment.appendChild(row);
+    }
+
+    tbody.replaceChildren(fragment);
+}
+
+function updateCredentialMarket() {
+    Object.keys(CREDENTIAL_MARKETS).forEach(product => {
+        const config = CREDENTIAL_MARKETS[product];
+        const status = document.getElementById(`${product}-market-status`);
+        const count = document.getElementById(`${product}-offer-count`);
+        const { status: marketStatus, offers } = getCredentialOffers(product);
+
+        if (marketStatus === 'loading') {
+            count.textContent = '-';
+            status.textContent = `Loading ${config.label} offers...`;
+            renderCredentialOfferRows(product, []);
+            return;
+        }
+        if (marketStatus === 'unavailable') {
+            count.textContent = '-';
+            status.textContent = `${config.label} offer data is unavailable from this orderbook.`;
+            renderCredentialOfferRows(product, []);
+            return;
+        }
+
+        count.textContent = String(offers.length);
+        const visibleOffers = filterAndSortCredentialOffers(product, offers);
+        if (offers.length === 0) {
+            status.textContent = `No active ${config.label} offers.`;
+        } else if (visibleOffers.length === 0) {
+            status.textContent = `No ${config.label} offers match this search.`;
+        } else {
+            status.textContent = `${offers.length} active ${config.label} offer${offers.length === 1 ? '' : 's'}.`;
+        }
+        renderCredentialOfferRows(product, visibleOffers);
+    });
 }
 
 function updateStats() {
@@ -98,6 +274,7 @@ function updateStats() {
     ).size;
 
     document.getElementById('total-offers').textContent = orderbookData.offers.length;
+    document.getElementById('coinjoin-offer-count').textContent = orderbookData.offers.length;
     document.getElementById('directory-nodes').textContent = orderbookData.directory_nodes.length;
     document.getElementById('fidelity-bonds').textContent = bondsCount;
     document.getElementById('unique-makers').textContent = uniqueMakers;
@@ -1612,6 +1789,74 @@ function updateSortIndicators() {
     }
 }
 
+function activateOfferTab(tabName, focusTab = false) {
+    const selectedTab = OFFER_TAB_NAMES.includes(tabName) ? tabName : 'coinjoin';
+    activeOfferTab = selectedTab;
+
+    OFFER_TAB_NAMES.forEach(name => {
+        const tab = document.getElementById(`${name}-offers-tab`);
+        const panel = document.getElementById(`${name}-offers-panel`);
+        const active = name === selectedTab;
+        tab.classList.toggle('active', active);
+        tab.setAttribute('aria-selected', String(active));
+        tab.tabIndex = active ? 0 : -1;
+        panel.hidden = !active;
+        if (active && focusTab) tab.focus();
+    });
+
+    try {
+        window.localStorage.setItem(OFFER_TAB_STORAGE_KEY, selectedTab);
+    } catch (_error) {
+        // Private browsing and locked-down contexts can deny persistent storage.
+    }
+}
+
+function setupOfferTabs() {
+    const tabs = Array.from(document.querySelectorAll('.offer-tab'));
+    tabs.forEach(tab => {
+        tab.addEventListener('click', () => activateOfferTab(tab.dataset.offerTab));
+        tab.addEventListener('keydown', event => {
+            const currentIndex = tabs.indexOf(tab);
+            let targetIndex = null;
+            if (event.key === 'ArrowRight') targetIndex = (currentIndex + 1) % tabs.length;
+            if (event.key === 'ArrowLeft') targetIndex = (currentIndex - 1 + tabs.length) % tabs.length;
+            if (event.key === 'Home') targetIndex = 0;
+            if (event.key === 'End') targetIndex = tabs.length - 1;
+            if (targetIndex === null) return;
+
+            event.preventDefault();
+            activateOfferTab(tabs[targetIndex].dataset.offerTab, true);
+        });
+    });
+    activateOfferTab(activeOfferTab);
+}
+
+function setupCredentialMarketControls() {
+    Object.keys(CREDENTIAL_MARKETS).forEach(product => {
+        const search = document.getElementById(`${product}-search`);
+        const sort = document.getElementById(`${product}-sort`);
+        const direction = document.getElementById(`${product}-sort-direction`);
+        const state = credentialMarketState[product];
+
+        search.addEventListener('input', () => {
+            state.searchText = search.value.trim().toLowerCase();
+            updateCredentialMarket();
+        });
+        sort.addEventListener('change', () => {
+            state.sortColumn = sort.value;
+            updateCredentialMarket();
+        });
+        direction.addEventListener('click', () => {
+            state.sortDirection = state.sortDirection === 'asc' ? 'desc' : 'asc';
+            const ascending = state.sortDirection === 'asc';
+            direction.textContent = ascending ? '\u2191' : '\u2193';
+            direction.title = ascending ? 'Sort ascending' : 'Sort descending';
+            direction.setAttribute('aria-label', direction.title);
+            updateCredentialMarket();
+        });
+    });
+}
+
 function setupEventListeners() {
     document.querySelectorAll('th.sortable').forEach(th => {
         th.addEventListener('click', () => {
@@ -1644,6 +1889,9 @@ function setupEventListeners() {
     });
 
     setupFeeQuantToggle();
+    setupOfferTabs();
+    setupCredentialMarketControls();
+    window.setInterval(updateCredentialMarket, 30000);
 
     const closeModal = document.querySelector('.close-modal');
     if (closeModal) {

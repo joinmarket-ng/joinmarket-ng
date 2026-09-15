@@ -52,6 +52,146 @@ h2 {
     text-decoration: underline;
 }
 
+.offer-tabs {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-bottom: 24px;
+    border-bottom: 1px solid #30363d;
+    padding-bottom: 12px;
+}
+
+.offer-tab {
+    background: #0d1117;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    color: #c9d1d9;
+    cursor: pointer;
+    font-size: 0.9rem;
+    font-weight: 600;
+    padding: 8px 12px;
+}
+
+.offer-tab.active {
+    background: #1f6feb;
+    border-color: #1f6feb;
+    color: #fff;
+}
+
+.offer-tab:focus-visible,
+.credential-controls input:focus-visible,
+.credential-controls select:focus-visible,
+.credential-controls button:focus-visible {
+    outline: 2px solid #58a6ff;
+    outline-offset: 2px;
+}
+
+.offer-tab-count {
+    font-variant-numeric: tabular-nums;
+    margin-left: 4px;
+}
+
+.credential-market-panel {
+    padding-top: 2px;
+}
+
+.credential-market-heading {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 12px;
+}
+
+.credential-market-heading h2 {
+    margin-bottom: 0;
+}
+
+.credential-controls {
+    align-items: center;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-bottom: 12px;
+}
+
+.credential-controls label {
+    color: #8b949e;
+    font-size: 0.85rem;
+}
+
+.credential-controls input,
+.credential-controls select,
+.credential-controls button {
+    background: #0d1117;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    color: #c9d1d9;
+    font-size: 0.9rem;
+    min-width: 0;
+    padding: 7px 10px;
+}
+
+.credential-controls input {
+    width: min(260px, 100%);
+}
+
+.credential-controls button {
+    color: #58a6ff;
+    cursor: pointer;
+    font-size: 1rem;
+    height: 36px;
+    padding: 0;
+    width: 36px;
+}
+
+.credential-market-status {
+    color: #8b949e;
+    font-size: 0.9rem;
+    margin-bottom: 12px;
+}
+
+.credential-table-container {
+    border-bottom: 1px solid #30363d;
+    border-top: 1px solid #30363d;
+    overflow-x: auto;
+}
+
+.credential-table {
+    min-width: 760px;
+}
+
+.credential-table th {
+    font-size: 0.85rem;
+}
+
+.credential-table td {
+    vertical-align: top;
+}
+
+.credential-seller,
+.credential-key,
+.credential-directory {
+    font-family: monospace;
+    overflow-wrap: anywhere;
+}
+
+.credential-key {
+    color: #79c0ff;
+    font-size: 0.8rem;
+}
+
+.credential-directory-list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.credential-directory {
+    color: #8b949e;
+    font-size: 0.8rem;
+}
+
 .stats-grid {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
@@ -435,6 +575,70 @@ tbody tr:hover {
     .header-info {
         flex-wrap: wrap;
         gap: 6px 18px;
+    }
+
+    .offer-tabs {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1.4fr);
+        gap: 6px;
+        margin-bottom: 18px;
+    }
+
+    .offer-tab {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        height: 52px;
+        min-width: 0;
+        white-space: nowrap;
+        font-size: 0.8rem;
+        padding: 8px 6px;
+    }
+
+    .offer-tab-count {
+        margin-left: 0;
+    }
+
+    .credential-controls {
+        align-items: stretch;
+        display: grid;
+        grid-template-columns: auto minmax(0, 1fr) 36px;
+    }
+
+    .credential-controls label {
+        align-self: center;
+        white-space: nowrap;
+    }
+
+    .credential-controls input {
+        grid-column: 2 / 4;
+        width: 100%;
+    }
+
+    .credential-controls select {
+        min-width: 0;
+        width: 100%;
+    }
+
+    .credential-table-container {
+        border: 0;
+        overflow: visible;
+    }
+
+    .credential-table {
+        min-width: 0;
+    }
+
+    .credential-table tbody {
+        gap: 0;
+    }
+
+    .credential-table tbody tr {
+        background: transparent;
+        border: 0;
+        border-bottom: 1px solid #30363d;
+        border-radius: 0;
     }
 
     .stats-grid {
