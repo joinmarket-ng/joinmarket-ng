@@ -225,7 +225,7 @@ For full documentation, see [jmwallet Documentation](https://joinmarket-ng.githu
  See docs/fidelity-bond-operations.md for the maintained workflow.
 
 ╭─ Arguments ──────────────────────────────────────────────────────────────────╮
-│ *    pubkey      TEXT  Public key (hex, 33 bytes compressed) [required]      │
+│ *    pubkey      TEXT  [required]                                            │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ╭─ Options ────────────────────────────────────────────────────────────────────╮
 │ --allow-expired                        Allow a past/current locktime for     │
@@ -700,8 +700,7 @@ For full documentation, see [jmwallet Documentation](https://joinmarket-ng.githu
  Import a verified SeedSigner BIP46 fidelity-bond registration payload.
 
 ╭─ Arguments ──────────────────────────────────────────────────────────────────╮
-│   registration      [REGISTRATION]  Canonical SeedSigner BIP46 registration  │
-│                                     JSON                                     │
+│   registration      [REGISTRATION]                                           │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ╭─ Options ────────────────────────────────────────────────────────────────────╮
 │ --data-dir                    PATH  Data directory (default:                 │
@@ -750,7 +749,7 @@ For full documentation, see [jmwallet Documentation](https://joinmarket-ng.githu
  using the 'Standard (Electrum)' format.
 
 ╭─ Arguments ──────────────────────────────────────────────────────────────────╮
-│ *    address      TEXT  Bond address [required]                              │
+│ *    address      TEXT  [required]                                           │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ╭─ Options ────────────────────────────────────────────────────────────────────╮
 │ --backend             -b      TEXT     Backend: descriptor_wallet | neutrino │
@@ -962,7 +961,7 @@ For full documentation, see [jmwallet Documentation](https://joinmarket-ng.githu
  takers accept the certificate at its boundary block and reject it afterward.
 
 ╭─ Arguments ──────────────────────────────────────────────────────────────────╮
-│ *    bond_address      TEXT  Bond P2WSH address [required]                   │
+│ *    bond_address      TEXT  [required]                                      │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ╭─ Options ────────────────────────────────────────────────────────────────────╮
 │ --backend             -b      TEXT     Backend: descriptor_wallet | neutrino │
@@ -1125,7 +1124,7 @@ For full documentation, see [jmwallet Documentation](https://joinmarket-ng.githu
  Show detailed information about a specific fidelity bond.
 
 ╭─ Arguments ──────────────────────────────────────────────────────────────────╮
-│ *    address      TEXT  Bond address to show [required]                      │
+│ *    address      TEXT  [required]                                           │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ╭─ Options ────────────────────────────────────────────────────────────────────╮
 │ --config-file                      PATH  Config file path (decoupled from    │
@@ -1232,7 +1231,7 @@ For full documentation, see [jmwallet Documentation](https://joinmarket-ng.githu
  Send a simple transaction from wallet to an address.
 
 ╭─ Arguments ──────────────────────────────────────────────────────────────────╮
-│ *    destination      TEXT  Destination address [required]                   │
+│ *    destination      TEXT  [required]                                       │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ╭─ Options ────────────────────────────────────────────────────────────────────╮
 │ --allow-conflicts                                     Allow replacement of   │
@@ -1378,7 +1377,7 @@ For full documentation, see [jmwallet Documentation](https://joinmarket-ng.githu
  v0 and v2. The command never connects to a backend or broadcasts.
 
 ╭─ Arguments ──────────────────────────────────────────────────────────────────╮
-│   psbt_base64      [PSBT_BASE64]  Base64-encoded PSBT v0 or v2               │
+│   psbt_base64      [PSBT_BASE64]                                             │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ╭─ Options ────────────────────────────────────────────────────────────────────╮
 │ --config-file                   PATH                  Config file path       │
@@ -1465,8 +1464,8 @@ For full documentation, see [jmwallet Documentation](https://joinmarket-ng.githu
  NOTE: Sparrow Wallet also cannot sign CLTV timelock scripts.
 
 ╭─ Arguments ──────────────────────────────────────────────────────────────────╮
-│ *    bond_address      TEXT  Bond P2WSH address to spend [required]          │
-│ *    destination       TEXT  Destination address for the funds [required]    │
+│ *    bond_address      TEXT  [required]                                      │
+│ *    destination       TEXT  [required]                                      │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ╭─ Options ────────────────────────────────────────────────────────────────────╮
 │ --data-dir                    PATH     Data directory (default:              │
