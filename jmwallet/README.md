@@ -52,7 +52,7 @@ containing estimates.
 
 ## Signing PSBTs
 
-Use `jm-wallet sign-psbt` to inspect and partially sign wallet-owned PSBT v0
+Use `jm-wallet sign-psbt` to inspect and partially sign wallet-owned PSBT v0 or v2
 inputs without connecting to a blockchain backend or broadcasting:
 
 ```bash
@@ -67,6 +67,23 @@ wallet's BIP84 layout and the derived public key must match the prevout script.
 When key origins are absent, `--scan-range` controls bounded fallback discovery
 for regular wallet inputs. The historical `signpsbt` spelling remains available
 as a compatibility alias.
+
+Collaborative PSBTs may include unrelated P2WSH inputs, such as multisig channel
+funding inputs. These remain unsigned, and a supplied witness script must match
+its P2WSH hash. Bond ownership requires the canonical script and the wallet's
+derived key; P2WSH alone is not evidence of bond ownership. Inputs of other types
+besides native P2WPKH and P2WSH are currently rejected.
+
+When a foreign P2WSH input is present, its final witness size is unknown. Review
+shows a minimum vsize and a **fee rate upper bound**, which the configured fee
+cap enforces. This conservative bound can reject a transaction whose final fee
+rate would be below the cap. Amounts and fees are calculated from the supplied
+`witness_utxo` records; offline review does not verify them against the blockchain.
+
+Signed PSBTs retain their input version, record ordering, and other participants'
+records, including unknown and proprietary fields. For v2, signing also clears
+the input/output modifiable flags as required by BIP370 for `SIGHASH_ALL`.
+JoinMarket's PSBT exports remain v0 for compatibility with external signers.
 
 ## Documentation
 
@@ -1356,11 +1373,12 @@ For full documentation, see [jmwallet Documentation](https://joinmarket-ng.githu
  Inspect and partially sign wallet-owned native SegWit PSBT inputs offline.
 
  Supports regular P2WPKH wallet inputs and canonical JoinMarket fidelity bond
- P2WSH inputs. Every input must include witness_utxo data so the complete fee
- can be reviewed. The command never connects to a backend or broadcasts.
+ P2WSH inputs, while leaving unrelated P2WSH inputs unsigned. Every input must
+ include witness_utxo data so the complete fee can be reviewed. Accepts PSBT
+ v0 and v2. The command never connects to a backend or broadcasts.
 
 ╭─ Arguments ──────────────────────────────────────────────────────────────────╮
-│   psbt_base64      [PSBT_BASE64]  Base64-encoded PSBT v0                     │
+│   psbt_base64      [PSBT_BASE64]  Base64-encoded PSBT v0 or v2               │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ╭─ Options ────────────────────────────────────────────────────────────────────╮
 │ --config-file                   PATH                  Config file path       │

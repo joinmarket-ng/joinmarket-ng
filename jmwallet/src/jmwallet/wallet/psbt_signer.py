@@ -18,6 +18,7 @@ from jmcore.timenumber import timestamp_to_timenumber
 
 from jmwallet.wallet.models import UTXOInfo
 from jmwallet.wallet.psbt import (
+    PSBT_GLOBAL_TX_MODIFIABLE,
     PSBT_IN_BIP32_DERIVATION,
     PSBT_IN_FINAL_SCRIPTSIG,
     PSBT_IN_FINAL_SCRIPTWITNESS,
@@ -25,6 +26,8 @@ from jmwallet.wallet.psbt import (
     PSBT_IN_SIGHASH_TYPE,
     PSBT_IN_WITNESS_SCRIPT,
     PSBT_IN_WITNESS_UTXO,
+    TX_MODIFIABLE_INPUTS,
+    TX_MODIFIABLE_OUTPUTS,
     ParsedPSBT,
     PSBTError,
     PSBTKeyValue,
@@ -86,6 +89,7 @@ class PSBTSigningPlan:
     estimated_vsize: int
     source_psbt: bytes
     scan_range: int
+    fee_rate_is_upper_bound: bool = False
 
     @property
     def estimated_fee_rate(self) -> float:
@@ -140,6 +144,8 @@ class WalletPSBTSigningMixin:
 
         psbt = parse_psbt(psbt_bytes)
         transaction = psbt.transaction
+        if not transaction.inputs or not transaction.outputs:
+            raise PSBTError("PSBT signing requires at least one input and one output")
         outpoints = [(tx_input.txid, tx_input.vout) for tx_input in transaction.inputs]
         if len(set(outpoints)) != len(outpoints):
             raise PSBTError("PSBT unsigned transaction contains duplicate input outpoints")
@@ -161,10 +167,8 @@ class WalletPSBTSigningMixin:
             if input_type == "unsupported":
                 raise PSBTError(
                     f"PSBT input {index} has an unsupported prevout script; all inputs must be "
-                    "native P2WPKH or canonical JoinMarket fidelity bond P2WSH"
+                    "native P2WPKH or P2WSH"
                 )
-            if input_type == "p2wsh":
-                _validate_fidelity_bond_shape(input_map, witness_utxo, index)
             witness_utxos.append(witness_utxo)
             input_types.append(input_type)
             sighash_types.append(_parse_sighash_type(input_map, index))
@@ -236,6 +240,14 @@ class WalletPSBTSigningMixin:
         # larger CompactSize encodings used at 253 and above.
         estimated_vsize += len(encode_varint(len(transaction.inputs))) - 1
         estimated_vsize += len(encode_varint(len(transaction.outputs))) - 1
+        fee_rate_is_upper_bound = any(
+            plan.input_type == "p2wsh" and not plan.owned for plan in plans
+        )
+        if fee_rate_is_upper_bound:
+            # An arbitrary witness script does not reveal its eventual witness
+            # size. The stripped transaction is a lower bound on final vsize,
+            # so fee / this size is a conservative upper bound for the fee cap.
+            estimated_vsize = len(psbt.unsigned_tx)
         return PSBTSigningPlan(
             psbt=psbt,
             inputs=tuple(plans),
@@ -243,6 +255,7 @@ class WalletPSBTSigningMixin:
             estimated_vsize=estimated_vsize,
             source_psbt=bytes(psbt_bytes),
             scan_range=scan_range,
+            fee_rate_is_upper_bound=fee_rate_is_upper_bound,
         )
 
     def sign_psbt(self, plan: PSBTSigningPlan) -> PSBTSigningResult:
@@ -287,6 +300,19 @@ class WalletPSBTSigningMixin:
                 signed.signature,
             )
             signed_indices.append(input_plan.index)
+
+        if signed_indices and signing_plan.psbt.version == 2:
+            # All signatures produced here are SIGHASH_ALL without ANYONECANPAY.
+            # BIP370 requires disabling input/output modification after signing.
+            records = signing_plan.psbt.global_map.records
+            for index, record in enumerate(records):
+                if record.key == bytes([PSBT_GLOBAL_TX_MODIFIABLE]):
+                    records[index] = PSBTKeyValue(
+                        key=record.key,
+                        value=bytes(
+                            [record.value[0] & ~(TX_MODIFIABLE_INPUTS | TX_MODIFIABLE_OUTPUTS)]
+                        ),
+                    )
 
         return PSBTSigningResult(
             psbt=signing_plan.psbt.serialize(),
@@ -526,24 +552,6 @@ def _classify_input_script(script: bytes) -> PSBTInputType:
     if len(script) == 34 and script.startswith(b"\x00\x20"):
         return "p2wsh"
     return "unsupported"
-
-
-def _validate_fidelity_bond_shape(
-    input_map: PSBTMap, witness_utxo: WitnessUTXO, index: int
-) -> None:
-    witness_script_record = _record_for_type(input_map, PSBT_IN_WITNESS_SCRIPT)
-    if witness_script_record is None:
-        raise PSBTError(f"PSBT P2WSH input {index} is missing the fidelity bond witness_script")
-    witness_script = witness_script_record.value
-    if b"\x00\x20" + sha256(witness_script).digest() != witness_utxo.script_pubkey:
-        raise PSBTError(f"PSBT input {index} witness_script does not match its P2WSH witness_utxo")
-    try:
-        locktime, _ = parse_freeze_script(witness_script)
-        timestamp_to_timenumber(locktime)
-    except ValueError as exc:
-        raise PSBTError(
-            f"PSBT P2WSH input {index} is not a canonical JoinMarket fidelity bond: {exc}"
-        ) from exc
 
 
 def _classify_output_script(script: bytes) -> str:

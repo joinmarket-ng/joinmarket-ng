@@ -378,6 +378,11 @@ python scripts/finalize_bond_psbt.py --file signed-bond.psbt
 QR flow: sign `unsigned-bond.psbt` on the device, save the returned signed PSBT,
 and run `finalize_bond_psbt.py`.
 
+Bond exports and the standalone signing/finalization scripts in this workflow
+use PSBT v0, including the SeedSigner QR flow. Although `jm-wallet sign-psbt`
+can also review and sign PSBT v2 from integrations, it preserves the input
+version. Keep these exported bond PSBTs in v0 for the standalone finalizer.
+
 For a canonical JoinMarket wallet-derived bond, the offline wallet command can
 review the complete transaction and add the bond-key partial signature:
 

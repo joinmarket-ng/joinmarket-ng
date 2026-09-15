@@ -87,7 +87,7 @@ is the noninteractive alternative; see `jm-wallet send --help`.
 
 ## Signing PSBTs
 
-`sign-psbt` reviews and partially signs wallet-owned PSBT inputs offline. It
+`sign-psbt` reviews and partially signs wallet-owned PSBT v0 and v2 inputs offline. It
 does not connect to the configured backend or broadcast a transaction:
 
 ```bash
@@ -97,6 +97,18 @@ jm-wallet sign-psbt --input unsigned.psbt --output signed.psbt
 Review the displayed inputs, outputs, and fee before confirming. Use
 `jm-wallet sign-psbt --help` for supported PSBT input requirements and key
 discovery options.
+
+The signer signs regular wallet P2WPKH inputs and canonical wallet-derived fidelity
+bonds. Unrelated P2WSH inputs, including multisig channel funding inputs, remain
+unsigned. The returned PSBT preserves its version and other participants' records;
+v2 input/output modifiable flags are cleared when wallet signatures are added.
+
+Every input must provide `witness_utxo` data. With foreign P2WSH inputs, review
+displays a fee rate upper bound because their final witness sizes are unknown.
+The fee cap uses this conservative bound, which can reject transactions whose
+final fee rate would be lower. The displayed amounts come from the PSBT and are
+not verified against the blockchain by this offline command. Native P2WPKH and
+P2WSH are the currently supported input types.
 
 ## Reserving Deposit Addresses
 

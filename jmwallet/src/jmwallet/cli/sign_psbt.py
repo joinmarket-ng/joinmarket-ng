@@ -100,8 +100,13 @@ def _display_plan(plan: PSBTSigningPlan, network: str) -> None:
         typer.echo(f"  [{index}] {output.value:,} sats  {destination}")
 
     typer.echo(f"Fee:               {plan.fee:,} sats")
-    typer.echo(f"Estimated vsize:   {plan.estimated_vsize:,} vB")
-    typer.echo(f"Estimated fee rate:{plan.estimated_fee_rate:9.2f} sat/vB")
+    if plan.fee_rate_is_upper_bound:
+        typer.echo(f"Minimum vsize:     {plan.estimated_vsize:,} vB")
+        typer.echo(f"Fee rate upper bound:{plan.estimated_fee_rate:9.2f} sat/vB")
+        typer.echo("Foreign P2WSH witness sizes are unknown; the fee cap uses this upper bound.")
+    else:
+        typer.echo(f"Estimated vsize:   {plan.estimated_vsize:,} vB")
+        typer.echo(f"Estimated fee rate:{plan.estimated_fee_rate:9.2f} sat/vB")
     typer.echo(f"Wallet inputs:     {plan.owned_count}")
     typer.echo(f"Inputs to sign:    {plan.signable_count}")
     typer.echo("=" * 80)
@@ -123,7 +128,7 @@ def _write_result(signed_psbt: bytes, output_file: Path | None) -> None:
 
 @app.command("sign-psbt", no_args_is_help=True)
 def sign_psbt(
-    psbt_base64: Annotated[str | None, typer.Argument(help="Base64-encoded PSBT v0")] = None,
+    psbt_base64: Annotated[str | None, typer.Argument(help="Base64-encoded PSBT v0 or v2")] = None,
     input_file: Annotated[
         Path | None,
         typer.Option("--input", "-i", help="Read a binary or base64 PSBT from a file"),
@@ -172,8 +177,9 @@ def sign_psbt(
     """Inspect and partially sign wallet-owned native SegWit PSBT inputs offline.
 
     Supports regular P2WPKH wallet inputs and canonical JoinMarket fidelity bond
-    P2WSH inputs. Every input must include witness_utxo data so the complete fee
-    can be reviewed. The command never connects to a backend or broadcasts.
+    P2WSH inputs, while leaving unrelated P2WSH inputs unsigned. Every input must
+    include witness_utxo data so the complete fee can be reviewed. Accepts PSBT
+    v0 and v2. The command never connects to a backend or broadcasts.
     """
     settings = setup_cli(log_level, data_dir=data_dir, config_file=config_file)
     try:
@@ -203,7 +209,7 @@ def sign_psbt(
             enforce_fee_rate_cap(
                 plan.estimated_fee_rate,
                 settings.wallet.max_fee_rate_sat_vb,
-                source="PSBT estimated",
+                source="PSBT upper bound" if plan.fee_rate_is_upper_bound else "PSBT estimated",
             )
         else:
             logger.warning("PSBT pays a zero fee and may not be relayable")

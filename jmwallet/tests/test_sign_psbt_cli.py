@@ -6,6 +6,7 @@ import base64
 from hashlib import sha256
 from pathlib import Path
 
+import pytest
 from _jmwallet_test_helpers import TEST_MNEMONIC
 from jmcore.bitcoin import (
     TxInput,
@@ -19,11 +20,22 @@ from typer.testing import CliRunner
 from jmwallet.backends.offline import OfflineBackend
 from jmwallet.cli import app
 from jmwallet.wallet.psbt import (
+    PSBT_GLOBAL_FALLBACK_LOCKTIME,
+    PSBT_GLOBAL_INPUT_COUNT,
+    PSBT_GLOBAL_OUTPUT_COUNT,
+    PSBT_GLOBAL_TX_VERSION,
+    PSBT_GLOBAL_VERSION,
     PSBT_IN_BIP32_DERIVATION,
+    PSBT_IN_OUTPUT_INDEX,
     PSBT_IN_PARTIAL_SIG,
+    PSBT_IN_PREVIOUS_TXID,
+    PSBT_IN_SEQUENCE,
     PSBT_IN_WITNESS_SCRIPT,
     PSBT_IN_WITNESS_UTXO,
     PSBT_MAGIC,
+    PSBT_OUT_AMOUNT,
+    PSBT_OUT_SCRIPT,
+    PSBT_VERSION_2,
     parse_psbt,
 )
 from jmwallet.wallet.service import WalletService
@@ -201,3 +213,128 @@ def test_sign_psbt_signs_fidelity_bond_input(tmp_path: Path) -> None:
     assert "WALLET FIDELITY BOND" in result.stdout
     signed = parse_psbt(_extract_signed_psbt(result.stdout))
     assert any(record.key[0] == PSBT_IN_PARTIAL_SIG for record in signed.input_maps[0].records)
+
+
+# --- BIP370 (PSBT v2) and foreign P2WSH review ------------------------------
+
+
+def _to_v2(raw: bytes) -> bytes:
+    """Convert a single-output v0 fixture PSBT into BIP370 v2 bytes.
+
+    The BIP370 fields are prepended so the records already present keep their
+    order, and the fallback locktime reproduces the same transaction.
+    """
+    parsed = parse_psbt(raw)
+    transaction = parsed.transaction
+    global_records = [
+        (bytes([PSBT_GLOBAL_VERSION]), PSBT_VERSION_2.to_bytes(4, "little")),
+        (bytes([PSBT_GLOBAL_TX_VERSION]), transaction.version.to_bytes(4, "little")),
+        (bytes([PSBT_GLOBAL_INPUT_COUNT]), encode_varint(len(transaction.inputs))),
+        (bytes([PSBT_GLOBAL_OUTPUT_COUNT]), encode_varint(len(transaction.outputs))),
+        (bytes([PSBT_GLOBAL_FALLBACK_LOCKTIME]), transaction.locktime.to_bytes(4, "little")),
+    ]
+    result = bytearray(PSBT_MAGIC) + _map(*global_records)
+    for tx_input, input_map in zip(transaction.inputs, parsed.input_maps, strict=True):
+        result += _map(
+            (bytes([PSBT_IN_PREVIOUS_TXID]), tx_input.txid_le),
+            (bytes([PSBT_IN_OUTPUT_INDEX]), tx_input.vout.to_bytes(4, "little")),
+            (bytes([PSBT_IN_SEQUENCE]), tx_input.sequence.to_bytes(4, "little")),
+            *((record.key, record.value) for record in input_map.records),
+        )
+    for tx_output in transaction.outputs:
+        result += _map(
+            (bytes([PSBT_OUT_AMOUNT]), tx_output.value.to_bytes(8, "little")),
+            (bytes([PSBT_OUT_SCRIPT]), tx_output.script),
+        )
+    return bytes(result)
+
+
+def _owned_input_records(wallet: WalletService, value: int) -> list[tuple[bytes, bytes]]:
+    address = wallet.get_address(0, 0, 0)
+    key = wallet.get_key_for_address(address)
+    assert key is not None
+    pubkey = key.get_public_key_bytes(compressed=True)
+    path = (84 | HARDENED, 0 | HARDENED, 0 | HARDENED, 0, 0)
+    origin = wallet.master_key.fingerprint + b"".join(child.to_bytes(4, "little") for child in path)
+    return [
+        (bytes([PSBT_IN_WITNESS_UTXO]), _witness_utxo(value, pubkey_to_p2wpkh_script(pubkey))),
+        (bytes([PSBT_IN_BIP32_DERIVATION]) + pubkey, origin),
+    ]
+
+
+def _foreign_p2wsh_psbt(*, value: int, output_value: int) -> bytes:
+    """Build a PSBT with one owned P2WPKH input and one unowned P2WSH input."""
+    wallet = _wallet()
+    foreign_script = b"\x00\x20" + sha256(b"foreign witness script").digest()
+    unsigned_tx = serialize_transaction(
+        2,
+        [TxInput.from_hex("cc" * 32, 0), TxInput.from_hex("dd" * 32, 1)],
+        [TxOutput(output_value, b"\x00\x14" + b"\x44" * 20)],
+        0,
+    )
+    return (
+        PSBT_MAGIC
+        + _map((b"\x00", unsigned_tx))
+        + _map(*_owned_input_records(wallet, value))
+        + _map((bytes([PSBT_IN_WITNESS_UTXO]), _witness_utxo(value, foreign_script)))
+        + _map()
+    )
+
+
+def test_sign_psbt_round_trips_a_v2_input(tmp_path: Path) -> None:
+    raw = _to_v2(_regular_psbt())
+    assert parse_psbt(raw).version == PSBT_VERSION_2
+
+    result = CliRunner().invoke(
+        app,
+        _invoke_args(raw, tmp_path) + ["--yes"],
+        env={"MNEMONIC": TEST_MNEMONIC},
+    )
+
+    assert result.exit_code == 0, result.stdout
+    assert "WALLET REGULAR" in result.stdout
+    assert "Signed 1 input(s)" in result.stdout
+    signed = parse_psbt(_extract_signed_psbt(result.stdout))
+    assert signed.version == PSBT_VERSION_2
+    assert signed.unsigned_tx == parse_psbt(raw).unsigned_tx
+    assert any(record.key[0] == PSBT_IN_PARTIAL_SIG for record in signed.input_maps[0].records)
+
+
+def test_sign_psbt_displays_foreign_p2wsh_fee_rate_upper_bound(tmp_path: Path) -> None:
+    raw = _foreign_p2wsh_psbt(value=100_000, output_value=198_000)
+
+    result = CliRunner().invoke(
+        app,
+        _invoke_args(raw, tmp_path) + ["--yes"],
+        env={"MNEMONIC": TEST_MNEMONIC},
+    )
+
+    assert result.exit_code == 0, result.stdout
+    assert "Minimum vsize:     " in result.stdout
+    assert "Fee rate upper bound:" in result.stdout
+    assert "Estimated fee rate:" not in result.stdout
+    assert "Foreign P2WSH witness sizes are unknown" in result.stdout
+    assert "Signed 1 input(s)" in result.stdout
+    signed = parse_psbt(_extract_signed_psbt(result.stdout))
+    assert any(record.key[0] == PSBT_IN_PARTIAL_SIG for record in signed.input_maps[0].records)
+    assert not any(record.key[0] == PSBT_IN_PARTIAL_SIG for record in signed.input_maps[1].records)
+
+
+@pytest.mark.parametrize("psbt_version", [0, PSBT_VERSION_2])
+def test_sign_psbt_enforces_fee_cap_on_foreign_p2wsh_upper_bound(
+    tmp_path: Path, psbt_version: int
+) -> None:
+    raw = _foreign_p2wsh_psbt(value=1_000_000, output_value=1)
+    if psbt_version == PSBT_VERSION_2:
+        raw = _to_v2(raw)
+
+    result = CliRunner().invoke(
+        app,
+        _invoke_args(raw, tmp_path) + ["--yes"],
+        env={"MNEMONIC": TEST_MNEMONIC},
+    )
+
+    assert result.exit_code == 1
+    assert "PSBT upper bound fee rate" in result.stderr
+    assert "exceeds safety cap" in result.stderr
+    assert "Signed PSBT (base64):" not in result.stdout

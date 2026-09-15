@@ -6,6 +6,7 @@ from hashlib import sha256
 
 import pytest
 from bitcointx.core.key import CKey
+from bitcointx.core.script import OP_2, OP_CHECKMULTISIG, CScript
 from jmcore.bitcoin import (
     BIP32Derivation,
     PSBTInput,
@@ -18,15 +19,34 @@ from jmcore.bitcoin import (
     pubkey_to_p2wpkh_script,
     serialize_transaction,
 )
+from jmcore.btc_script import mk_freeze_script
 
 from jmwallet.wallet.psbt import (
+    PSBT_GLOBAL_FALLBACK_LOCKTIME,
+    PSBT_GLOBAL_INPUT_COUNT,
+    PSBT_GLOBAL_OUTPUT_COUNT,
+    PSBT_GLOBAL_TX_MODIFIABLE,
+    PSBT_GLOBAL_TX_VERSION,
+    PSBT_GLOBAL_VERSION,
     PSBT_IN_BIP32_DERIVATION,
+    PSBT_IN_OUTPUT_INDEX,
     PSBT_IN_PARTIAL_SIG,
+    PSBT_IN_PREVIOUS_TXID,
+    PSBT_IN_REQUIRED_TIME_LOCKTIME,
+    PSBT_IN_SEQUENCE,
     PSBT_IN_SIGHASH_TYPE,
     PSBT_IN_WITNESS_SCRIPT,
     PSBT_IN_WITNESS_UTXO,
     PSBT_MAGIC,
+    PSBT_OUT_AMOUNT,
+    PSBT_OUT_SCRIPT,
+    PSBT_VERSION_0,
+    PSBT_VERSION_2,
+    TX_MODIFIABLE_HAS_SIGHASH_SINGLE,
+    TX_MODIFIABLE_INPUTS,
+    TX_MODIFIABLE_OUTPUTS,
     PSBTError,
+    PSBTKeyValue,
     parse_psbt,
 )
 from jmwallet.wallet.service import WalletService
@@ -409,3 +429,368 @@ def test_fee_estimate_accounts_for_large_compact_size_counts(
     expected = estimate_vsize(["p2wpkh"] * len(inputs), ["p2wpkh"] * len(outputs)) + 2
 
     assert plan.estimated_vsize == expected
+
+
+# --- BIP370 (PSBT v2) and foreign P2WSH regression coverage ------------------
+
+
+def _to_v2(
+    raw: bytes,
+    *,
+    tx_modifiable: int | None = None,
+    required_time_locktimes: dict[int, int] | None = None,
+) -> bytes:
+    """Convert a v0 fixture PSBT into the equivalent BIP370 v2 serialization.
+
+    BIP370 fields are prepended to every map so the records already present keep
+    their relative order and stay easy to compare after signing. The locktime is
+    carried either by per-input required time locktimes or by the global
+    fallback locktime, so the reconstructed transaction is byte-identical to the
+    v0 unsigned transaction.
+    """
+    parsed = parse_psbt(raw)
+    transaction = parsed.transaction
+    global_records: list[tuple[bytes, bytes]] = [
+        (bytes([PSBT_GLOBAL_VERSION]), PSBT_VERSION_2.to_bytes(4, "little")),
+        (bytes([PSBT_GLOBAL_TX_VERSION]), transaction.version.to_bytes(4, "little")),
+        (bytes([PSBT_GLOBAL_INPUT_COUNT]), encode_varint(len(transaction.inputs))),
+        (bytes([PSBT_GLOBAL_OUTPUT_COUNT]), encode_varint(len(transaction.outputs))),
+    ]
+    if not required_time_locktimes:
+        global_records.append(
+            (bytes([PSBT_GLOBAL_FALLBACK_LOCKTIME]), transaction.locktime.to_bytes(4, "little"))
+        )
+    if tx_modifiable is not None:
+        global_records.append((bytes([PSBT_GLOBAL_TX_MODIFIABLE]), bytes([tx_modifiable])))
+    global_records.extend(
+        (record.key, record.value) for record in parsed.global_map.records if record.key != b"\x00"
+    )
+
+    input_records: list[list[tuple[bytes, bytes]]] = []
+    for index, (tx_input, input_map) in enumerate(
+        zip(transaction.inputs, parsed.input_maps, strict=True)
+    ):
+        records: list[tuple[bytes, bytes]] = [
+            (bytes([PSBT_IN_PREVIOUS_TXID]), tx_input.txid_le),
+            (bytes([PSBT_IN_OUTPUT_INDEX]), tx_input.vout.to_bytes(4, "little")),
+            (bytes([PSBT_IN_SEQUENCE]), tx_input.sequence.to_bytes(4, "little")),
+        ]
+        locktime = (required_time_locktimes or {}).get(index)
+        if locktime is not None:
+            records.append(
+                (bytes([PSBT_IN_REQUIRED_TIME_LOCKTIME]), locktime.to_bytes(4, "little"))
+            )
+        records.extend((record.key, record.value) for record in input_map.records)
+        input_records.append(records)
+
+    output_records: list[list[tuple[bytes, bytes]]] = []
+    for tx_output, output_map in zip(transaction.outputs, parsed.output_maps, strict=True):
+        output_records.append(
+            [
+                (bytes([PSBT_OUT_AMOUNT]), tx_output.value.to_bytes(8, "little")),
+                (bytes([PSBT_OUT_SCRIPT]), tx_output.script),
+                *((record.key, record.value) for record in output_map.records),
+            ]
+        )
+
+    result = bytearray(PSBT_MAGIC)
+    result.extend(_map(global_records))
+    for records in input_records:
+        result.extend(_map(records))
+    for records in output_records:
+        result.extend(_map(records))
+    return bytes(result)
+
+
+def _foreign_multisig_script() -> bytes:
+    """Build a 2-of-2 P2WSH witness script that no wallet key can satisfy."""
+    first = bytes(CKey.from_secret_bytes((7).to_bytes(32, "big")).pub)
+    second = bytes(CKey.from_secret_bytes((8).to_bytes(32, "big")).pub)
+    return bytes(CScript([OP_2, first, second, OP_2, OP_CHECKMULTISIG]))
+
+
+def _foreign_partial_signature() -> tuple[bytes, bytes]:
+    pubkey = bytes(CKey.from_secret_bytes((7).to_bytes(32, "big")).pub)
+    signature = b"\x30\x44\x02\x20" + b"\x11" * 32 + b"\x02\x20" + b"\x22" * 32 + b"\x01"
+    return pubkey, signature
+
+
+def _mixed_owned_and_foreign_p2wsh(wallet_service) -> tuple[bytes, bytes, bytes]:
+    """Build a v0 PSBT with one owned P2WPKH input and one foreign 2-of-2 P2WSH input."""
+    owned_records, pubkey, _ = _regular_input_records(wallet_service, 0, 0, 0, 60_000)
+    witness_script = _foreign_multisig_script()
+    script_pubkey = b"\x00\x20" + sha256(witness_script).digest()
+    foreign_pubkey, foreign_signature = _foreign_partial_signature()
+    foreign_records = [
+        (bytes([PSBT_IN_WITNESS_UTXO]), _witness_utxo(40_000, script_pubkey)),
+        (bytes([PSBT_IN_WITNESS_SCRIPT]), witness_script),
+        (bytes([PSBT_IN_PARTIAL_SIG]) + foreign_pubkey, foreign_signature),
+        (b"\xfcforeign", b"keep"),
+    ]
+    raw = _build_psbt(
+        [TxInput.from_hex("a1" * 32, 0), TxInput.from_hex("b2" * 32, 3)],
+        [TxOutput(value=98_000, script=b"\x00\x14" + b"\x21" * 20)],
+        [owned_records, foreign_records],
+        global_unknown=(b"\xfcglobal", b"keep"),
+        output_records=[[(b"\xfcout", b"keep")]],
+    )
+    return raw, pubkey, witness_script
+
+
+@pytest.mark.parametrize("psbt_version", [PSBT_VERSION_0, PSBT_VERSION_2])
+def test_signs_owned_input_beside_foreign_multisig_p2wsh(wallet_service, psbt_version: int) -> None:
+    """A foreign 2-of-2 P2WSH input stays untouched while the wallet input is signed."""
+    v0_raw, pubkey, _ = _mixed_owned_and_foreign_p2wsh(wallet_service)
+    raw = v0_raw if psbt_version == PSBT_VERSION_0 else _to_v2(v0_raw)
+    original = parse_psbt(raw)
+
+    plan = wallet_service.prepare_psbt_signing(raw, scan_range=0)
+    result = wallet_service.sign_psbt(plan)
+    signed = parse_psbt(result.psbt)
+
+    assert original.version == psbt_version
+    assert original.unsigned_tx == parse_psbt(v0_raw).unsigned_tx
+    assert plan.owned_count == 1
+    assert plan.inputs[1].input_type == "p2wsh"
+    assert not plan.inputs[1].owned
+    assert plan.inputs[1].wallet_input_type is None
+    assert plan.fee_rate_is_upper_bound
+    assert plan.estimated_vsize == len(original.unsigned_tx)
+    assert plan.fee == 2_000
+    assert result.signed_indices == (0,)
+    assert signed.version == psbt_version
+
+    # The foreign input map, including its partial signature and proprietary
+    # record, must survive signing byte for byte.
+    assert signed.input_maps[1].records == original.input_maps[1].records
+    assert signed.output_maps[0].records == original.output_maps[0].records
+    assert signed.global_map.records == original.global_map.records
+    assert signed.input_maps[0].records[:-1] == original.input_maps[0].records
+
+    signature_record = signed.input_maps[0].records[-1]
+    assert signature_record.key == bytes([PSBT_IN_PARTIAL_SIG]) + pubkey
+    # The signature must commit to the transaction that was reviewed, not to a
+    # transaction rebuilt from the signed PSBT.
+    assert verify_p2wpkh_signature(
+        parse_psbt(v0_raw).transaction,
+        0,
+        create_p2wpkh_script_code(pubkey),
+        60_000,
+        signature_record.value,
+        pubkey,
+    )
+
+
+def test_foreign_p2wsh_without_witness_script_is_unowned_and_untouched(wallet_service) -> None:
+    owned_records, _, _ = _regular_input_records(wallet_service, 0, 0, 0, 60_000)
+    script_pubkey = b"\x00\x20" + sha256(b"unknown script").digest()
+    foreign_records = [(bytes([PSBT_IN_WITNESS_UTXO]), _witness_utxo(40_000, script_pubkey))]
+    raw = _build_psbt(
+        [TxInput.from_hex("c3" * 32, 0), TxInput.from_hex("d4" * 32, 1)],
+        [TxOutput(value=98_000, script=b"\x00\x14" + b"\x31" * 20)],
+        [owned_records, foreign_records],
+    )
+    original = parse_psbt(raw)
+
+    plan = wallet_service.prepare_psbt_signing(raw, scan_range=0)
+    result = wallet_service.sign_psbt(plan)
+
+    assert not plan.inputs[1].owned
+    assert plan.fee_rate_is_upper_bound
+    assert plan.estimated_vsize == len(original.unsigned_tx)
+    assert result.signed_indices == (0,)
+    assert parse_psbt(result.psbt).input_maps[1].records == original.input_maps[1].records
+
+
+def test_rejects_foreign_p2wsh_witness_script_mismatch(wallet_service) -> None:
+    owned_records, _, _ = _regular_input_records(wallet_service, 0, 0, 0, 60_000)
+    foreign_records = [
+        (
+            bytes([PSBT_IN_WITNESS_UTXO]),
+            _witness_utxo(40_000, b"\x00\x20" + sha256(b"other script").digest()),
+        ),
+        (bytes([PSBT_IN_WITNESS_SCRIPT]), _foreign_multisig_script()),
+    ]
+    raw = _build_psbt(
+        [TxInput.from_hex("e5" * 32, 0), TxInput.from_hex("f6" * 32, 1)],
+        [TxOutput(value=98_000, script=b"\x00\x14" + b"\x41" * 20)],
+        [owned_records, foreign_records],
+    )
+
+    with pytest.raises(PSBTError, match="witness_script does not match its P2WSH witness_utxo"):
+        wallet_service.prepare_psbt_signing(raw, 0)
+
+
+def test_foreign_canonical_bond_stays_unowned_despite_wallet_key_origin(wallet_service) -> None:
+    """A canonical bond script for a foreign key is never claimed by the wallet."""
+    foreign_pubkey = bytes(CKey.from_secret_bytes((9).to_bytes(32, "big")).pub)
+    witness_script = mk_freeze_script(foreign_pubkey.hex(), BOND_LOCKTIME)
+    script_pubkey = b"\x00\x20" + sha256(witness_script).digest()
+    wallet_path = (84 | HARDENED, 0 | HARDENED, 0 | HARDENED, 0, 0)
+    records = [
+        (bytes([PSBT_IN_WITNESS_UTXO]), _witness_utxo(200_000, script_pubkey)),
+        (bytes([PSBT_IN_WITNESS_SCRIPT]), witness_script),
+        (
+            bytes([PSBT_IN_BIP32_DERIVATION]) + foreign_pubkey,
+            _origin(wallet_service.master_key.fingerprint, wallet_path),
+        ),
+    ]
+    # A final sequence and a zero locktime would be rejected for an owned bond,
+    # so reaching a plan at all proves the input was treated as foreign.
+    raw = _build_psbt(
+        [TxInput.from_hex("07" * 32, 0, sequence=0xFFFFFFFF)],
+        [TxOutput(value=199_000, script=b"\x00\x14" + b"\x51" * 20)],
+        [records],
+    )
+    original = parse_psbt(raw)
+
+    plan = wallet_service.prepare_psbt_signing(raw, scan_range=3)
+    result = wallet_service.sign_psbt(plan)
+
+    assert plan.owned_count == 0
+    assert plan.inputs[0].wallet_input_type is None
+    assert plan.fee_rate_is_upper_bound
+    assert plan.estimated_vsize == len(original.unsigned_tx)
+    assert result.signed_indices == ()
+    assert result.psbt == raw
+
+
+def test_v2_bond_signs_using_required_time_locktime(wallet_service) -> None:
+    address = wallet_service.get_fidelity_bond_address(0, BOND_LOCKTIME)
+    key = wallet_service.get_key_for_address(address)
+    assert key is not None
+    pubkey = key.get_public_key_bytes(compressed=True)
+    witness_script = wallet_service.get_fidelity_bond_script(0, BOND_LOCKTIME)
+    script_pubkey = b"\x00\x20" + sha256(witness_script).digest()
+    records = [
+        (bytes([PSBT_IN_WITNESS_UTXO]), _witness_utxo(200_000, script_pubkey)),
+        (bytes([PSBT_IN_WITNESS_SCRIPT]), witness_script),
+    ]
+    v0_raw = _build_psbt(
+        [TxInput.from_hex("18" * 32, 0, sequence=0xFFFFFFFE)],
+        [TxOutput(value=198_000, script=b"\x00\x14" + b"\x61" * 20)],
+        [records],
+        locktime=BOND_LOCKTIME,
+    )
+    raw = _to_v2(v0_raw, required_time_locktimes={0: BOND_LOCKTIME})
+    original = parse_psbt(raw)
+
+    plan = wallet_service.prepare_psbt_signing(raw, scan_range=0)
+    result = wallet_service.sign_psbt(plan)
+    signed = parse_psbt(result.psbt)
+
+    assert original.version == PSBT_VERSION_2
+    assert not any(
+        record.key == bytes([PSBT_GLOBAL_FALLBACK_LOCKTIME])
+        for record in original.global_map.records
+    )
+    assert original.transaction.locktime == BOND_LOCKTIME
+    assert plan.inputs[0].wallet_input_type == "fidelity-bond"
+    assert not plan.fee_rate_is_upper_bound
+    assert result.signed_indices == (0,)
+    signature = signed.input_maps[0].records[-1].value
+    assert signed.input_maps[0].records[-1].key == bytes([PSBT_IN_PARTIAL_SIG]) + pubkey
+    assert verify_p2wsh_signature(
+        original.transaction, 0, witness_script, 200_000, signature, pubkey
+    )
+
+
+@pytest.mark.parametrize("mutation", ["transaction", "map"])
+def test_rejects_v2_mutation_between_review_and_signing(wallet_service, mutation: str) -> None:
+    """v2 serialization omits the transaction, so both views must be rechecked."""
+    records, _, _ = _regular_input_records(wallet_service, 0, 0, 0, 100_000)
+    raw = _to_v2(
+        _build_psbt(
+            [TxInput.from_hex("29" * 32, 0)],
+            [TxOutput(value=99_000, script=b"\x00\x14" + b"\x71" * 20)],
+            [records],
+        )
+    )
+    plan = wallet_service.prepare_psbt_signing(raw, 0)
+    if mutation == "transaction":
+        plan.psbt.transaction.outputs[0].value = 1
+    else:
+        plan.psbt.output_maps[0].records[0] = PSBTKeyValue(
+            key=bytes([PSBT_OUT_AMOUNT]), value=(1).to_bytes(8, "little")
+        )
+
+    with pytest.raises(TransactionSigningError, match="changed after review"):
+        wallet_service.sign_psbt(plan)
+
+
+def test_signing_v2_clears_only_input_and_output_modifiable_bits(wallet_service) -> None:
+    records, _, _ = _regular_input_records(wallet_service, 0, 0, 0, 100_000)
+    unknown_bit = 0x80
+    flags = (
+        TX_MODIFIABLE_INPUTS
+        | TX_MODIFIABLE_OUTPUTS
+        | TX_MODIFIABLE_HAS_SIGHASH_SINGLE
+        | unknown_bit
+    )
+    raw = _to_v2(
+        _build_psbt(
+            [TxInput.from_hex("3a" * 32, 0)],
+            [TxOutput(value=99_000, script=b"\x00\x14" + b"\x81" * 20)],
+            [records],
+        ),
+        tx_modifiable=flags,
+    )
+    original = parse_psbt(raw)
+
+    result = wallet_service.sign_psbt(wallet_service.prepare_psbt_signing(raw, 0))
+    signed = parse_psbt(result.psbt)
+
+    assert result.signed_indices == (0,)
+    assert [record.key for record in signed.global_map.records] == [
+        record.key for record in original.global_map.records
+    ]
+    modifiable = next(
+        record.value
+        for record in signed.global_map.records
+        if record.key == bytes([PSBT_GLOBAL_TX_MODIFIABLE])
+    )
+    assert modifiable == bytes([TX_MODIFIABLE_HAS_SIGHASH_SINGLE | unknown_bit])
+
+
+def test_absent_tx_modifiable_stays_absent_after_signing_v2(wallet_service) -> None:
+    records, _, _ = _regular_input_records(wallet_service, 0, 0, 0, 100_000)
+    raw = _to_v2(
+        _build_psbt(
+            [TxInput.from_hex("4b" * 32, 0)],
+            [TxOutput(value=99_000, script=b"\x00\x14" + b"\x91" * 20)],
+            [records],
+        )
+    )
+    original = parse_psbt(raw)
+
+    result = wallet_service.sign_psbt(wallet_service.prepare_psbt_signing(raw, 0))
+    signed = parse_psbt(result.psbt)
+
+    assert result.signed_indices == (0,)
+    assert not any(
+        record.key == bytes([PSBT_GLOBAL_TX_MODIFIABLE]) for record in signed.global_map.records
+    )
+    assert signed.global_map.records == original.global_map.records
+
+
+def test_v2_psbt_is_byte_identical_when_nothing_new_is_signed(wallet_service) -> None:
+    """Modifiable flags are only cleared by this wallet when it adds a signature."""
+    records, _, _ = _regular_input_records(wallet_service, 0, 0, 0, 100_000)
+    v0_raw = _build_psbt(
+        [TxInput.from_hex("5c" * 32, 0)],
+        [TxOutput(value=99_000, script=b"\x00\x14" + b"\xa1" * 20)],
+        [records],
+    )
+    already_signed_v0 = wallet_service.sign_psbt(
+        wallet_service.prepare_psbt_signing(v0_raw, 0)
+    ).psbt
+    flags = TX_MODIFIABLE_INPUTS | TX_MODIFIABLE_OUTPUTS
+    raw = _to_v2(already_signed_v0, tx_modifiable=flags)
+
+    plan = wallet_service.prepare_psbt_signing(raw, 0)
+    result = wallet_service.sign_psbt(plan)
+
+    assert plan.inputs[0].already_signed
+    assert result.signed_indices == ()
+    assert result.already_signed_indices == (0,)
+    assert result.psbt == raw
