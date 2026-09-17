@@ -50,6 +50,19 @@ direct endpoint is intentional, such as a local service. Direct access exposes
 the watcher's source IP and the bond transactions it queries; it also ignores
 `HTTP_PROXY` and `HTTPS_PROXY` inherited by the process.
 
+## Direct maker probes
+
+Feature discovery probes prioritize descending fidelity bond value, then zero-fee
+offers, then makers with any enabled feature advertised in their offers, and
+finally ascending fees. Each maker uses its highest bond value, lowest fee, and
+features from any of its offers across directories. Absolute fees are compared
+as fee divided by maximum offer size; relative fees use their advertised rate.
+
+Each batch admits up to 4,096 distinct destinations, with at most five probes
+running concurrently. This allows broader coverage without increasing concurrent
+Tor connections. Large batches with unresponsive makers can take a long time to
+finish. These priorities are scheduling hints, not proof that a maker is honest.
+
 ## Docker
 
 `orderbook_watcher/docker-compose.yml` provides watcher + Tor.

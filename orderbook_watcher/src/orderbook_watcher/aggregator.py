@@ -262,6 +262,7 @@ class OrderbookAggregator:
             timeout=timeout,
             check_interval=600.0,  # Check each maker at most once per 10 minutes
             max_concurrent_checks=5,
+            max_checks_per_batch=4096,
             allow_clearnet_connections=allow_clearnet_connections,
             socks_username=self._hc_username,
             socks_password=self._hc_password,
@@ -543,14 +544,14 @@ class OrderbookAggregator:
         self,
         makers: list[tuple[str, str]],
     ) -> list[tuple[str, str]]:
-        """Sort makers for scanning: bonded (desc bond value), then bondless (asc fee).
+        """Sort by bond value, zero fees, advertised features, then ascending fees.
 
         During sybil attacks the orderbook may contain thousands of fake offers.
         Scanning them in arbitrary order wastes the limited concurrent-check
         slots on attackers while legitimate makers never get their features
         discovered.  By processing bonded makers first (highest bond value first)
-        and then bondless makers in ascending fee order we ensure the most
-        trustworthy and cheapest liquidity is scanned before the spam.
+        and then prioritizing zero-fee and feature-advertising makers, we give
+        useful bondless liquidity a chance before incremental-fee spam.
 
         Args:
             makers: List of (nick, location) tuples to prioritize.
@@ -562,11 +563,14 @@ class OrderbookAggregator:
         # We scan all clients for the best bond value and lowest fee for each nick.
         nick_bond_value: dict[str, int] = {}
         nick_fee_rate: dict[str, float] = {}
+        nicks_with_features: set[str] = set()
 
         for client in self.clients.values():
             for key, offer_ts in client.offers.items():
                 nick = key[0]
                 offer = offer_ts.offer
+                if any(offer.features.values()):
+                    nicks_with_features.add(nick)
 
                 # Track best (highest) bond value
                 bond_val = offer.fidelity_bond_value
@@ -590,16 +594,11 @@ class OrderbookAggregator:
                 if fee_rate < nick_fee_rate.get(nick, float("inf")):
                     nick_fee_rate[nick] = fee_rate
 
-        def sort_key(item: tuple[str, str]) -> tuple[int, float, float]:
+        def sort_key(item: tuple[str, str]) -> tuple[int, bool, bool, float]:
             nick = item[0]
             bond = nick_bond_value.get(nick, 0)
             fee = nick_fee_rate.get(nick, float("inf"))
-            # Primary: bonded first (group 0) vs bondless (group 1)
-            # Secondary for bonded: descending bond value (negate)
-            # Secondary for bondless: ascending fee rate
-            if bond > 0:
-                return (0, -bond, fee)
-            return (1, 0, fee)
+            return (-bond, fee != 0, nick not in nicks_with_features, fee)
 
         sorted_makers = sorted(makers, key=sort_key)
 
@@ -607,7 +606,8 @@ class OrderbookAggregator:
         bonded_count = sum(1 for n, _ in sorted_makers if nick_bond_value.get(n, 0) > 0)
         logger.info(
             f"Scan priority: {bonded_count} bonded makers first, "
-            f"{len(sorted_makers) - bonded_count} bondless (fee-ascending)"
+            f"{len(sorted_makers) - bonded_count} bondless "
+            "(zero fees, advertised features, then fee-ascending)"
         )
         return sorted_makers
 
@@ -619,7 +619,7 @@ class OrderbookAggregator:
         reference implementation directories that don't support peerlist_features).
 
         Makers are scanned in priority order: bonded makers first (descending
-        bond value), then bondless makers in ascending fee order.  This ensures
+        bond value), then zero fees, advertised features, and ascending fees. This ensures
         legitimate makers get their features discovered before sybil spam.
         """
         makers_to_check: list[tuple[str, str]] = []

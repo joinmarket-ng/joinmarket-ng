@@ -2,7 +2,8 @@
 Tests for maker scan prioritization in OrderbookAggregator.
 
 The orderbook watcher should scan bonded makers first (descending bond value),
-then bondless makers in ascending fee order.  This prevents sybil attacks from
+then zero-fee makers, feature advertisers, and the rest in ascending fee order.
+This prevents sybil attacks from
 consuming all scan slots before legitimate makers are checked.
 """
 
@@ -35,6 +36,7 @@ def _make_offer(
     minsize: int = 100_000,
     maxsize: int = 10_000_000,
     bond_value: int = 0,
+    features: dict[str, bool] | None = None,
 ) -> Offer:
     return Offer(
         counterparty=nick,
@@ -45,6 +47,7 @@ def _make_offer(
         txfee=0,
         cjfee=cjfee,
         fidelity_bond_value=bond_value,
+        features=features or {},
     )
 
 
@@ -89,6 +92,51 @@ def _build_aggregator_with_offers(
 
 class TestPrioritizeMakersForScan:
     """Tests for OrderbookAggregator._prioritize_makers_for_scan()."""
+
+    def test_zero_fees_then_any_enabled_feature_then_fee(self) -> None:
+        offers = [
+            _make_offer("cheap", cjfee="0.000001", features={"disabled": False}),
+            _make_offer("featured", cjfee="0.01", features={"future_feature": True}),
+            _make_offer("zero_abs", ordertype="sw0absoffer", cjfee=0),
+            _make_offer("zero_rel", cjfee="0.000"),
+            _make_offer("bonded", bond_value=1, cjfee="0.1"),
+            _make_offer("featured_cheap", cjfee="0.001", features={"ping": True}),
+        ]
+        makers = [(offer.counterparty, f"{i}.onion:5222") for i, offer in enumerate(offers)]
+        agg = _build_aggregator_with_offers(
+            [(nick, loc, offer) for (nick, loc), offer in zip(makers, offers, strict=True)]
+        )
+
+        assert [nick for nick, _ in agg._prioritize_makers_for_scan(makers)] == [
+            "bonded",
+            "zero_abs",
+            "zero_rel",
+            "featured_cheap",
+            "featured",
+            "cheap",
+        ]
+
+    def test_features_from_another_directory_and_offer_are_combined(self) -> None:
+        agg = _build_aggregator_with_offers(
+            [
+                ("multi", "m.onion:5222", _make_offer("multi", cjfee="0.001")),
+                ("cheap", "c.onion:5222", _make_offer("cheap", cjfee="0.000001")),
+            ]
+        )
+        other = _build_aggregator_with_offers(
+            [
+                (
+                    "multi",
+                    "m.onion:5222",
+                    _make_offer("multi", oid=1, cjfee="0.1", features={"ping": True}),
+                ),
+            ]
+        )
+        agg.clients["other:5222"] = other.clients["node1:5222"]
+        result = agg._prioritize_makers_for_scan(
+            [("cheap", "c.onion:5222"), ("multi", "m.onion:5222")]
+        )
+        assert [nick for nick, _ in result] == ["multi", "cheap"]
 
     def test_bonded_before_bondless(self) -> None:
         """Bonded makers should always come before bondless ones."""
@@ -408,6 +456,30 @@ class TestCheckMakersBatchPriority:
 
 class TestCheckMakersWithoutFeaturesPriority:
     """Verify _check_makers_without_features passes sorted list to batch."""
+
+    @pytest.mark.asyncio
+    async def test_large_scan_keeps_concurrency_bounded(self) -> None:
+        offers = [(f"maker{i}", f"{i}.onion:5222", _make_offer(f"maker{i}")) for i in range(300)]
+        agg = _build_aggregator_with_offers(offers)
+        active = 0
+        peak = 0
+        checked = 0
+
+        async def check(_nick: str, _location: str, _force: bool = False) -> MagicMock:
+            nonlocal active, peak, checked
+            active += 1
+            peak = max(peak, active)
+            await asyncio.sleep(0)
+            active -= 1
+            checked += 1
+            return MagicMock(reachable=False)
+
+        with patch.object(agg.health_checker, "check_maker", side_effect=check):
+            await agg._check_makers_without_features()
+
+        assert checked == 300
+        assert peak == 5
+        assert agg.health_checker.max_checks_per_batch == 4096
 
     @pytest.mark.asyncio
     async def test_bonded_makers_checked_before_sybil(self) -> None:
