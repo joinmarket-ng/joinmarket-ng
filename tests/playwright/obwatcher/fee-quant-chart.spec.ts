@@ -49,6 +49,7 @@ interface FixtureOffer {
   fidelity_bond_verification_stale?: boolean;
   directory_nodes?: string[];
   features?: Record<string, boolean>;
+  directly_reachable?: boolean;
 }
 
 const BOND_EXPIRY = 901_152;
@@ -740,6 +741,77 @@ test.describe("offer selection probability", () => {
 });
 
 test.describe("mobile layout", () => {
+  for (const width of [390, 800, 1280]) {
+    for (const reachable of [true, false]) {
+      test(`wraps the reachability badge independently at ${width}px (${reachable})`, async ({ page }) => {
+        await page.setViewportSize({ width, height: 844 });
+        const nick = "J5TestNickname123";
+        const server = await openChart(page, payload([{
+          ...DEFAULT_OFFERS[0],
+          counterparty: nick,
+          oid: 0,
+          minsize: 100_000,
+          directory_nodes: [],
+          directly_reachable: reachable,
+        }]));
+        try {
+          const nickname = page.locator(".counterparty-nick");
+          const badge = page.locator(".direct-badge");
+          await expect(nickname).toHaveText(nick);
+          await expect(badge).toHaveText(reachable ? "DIRECT" : "NO DIRECT");
+          const value = page.locator(".counterparty > .cell-value");
+          // Exercise both available widths independently of table column sizing.
+          for (const available of [180, 300]) {
+            await value.evaluate((element, size) => {
+              element.style.display = "block";
+              element.style.width = `${size}px`;
+            }, available);
+            const nickBox = (await nickname.boundingBox())!;
+            const badgeBox = (await badge.boundingBox())!;
+            if (available === 180) {
+              expect(badgeBox.y).toBeGreaterThanOrEqual(nickBox.y + nickBox.height);
+            } else {
+              expect(badgeBox.y).toBeLessThan(nickBox.y + nickBox.height);
+            }
+            for (const text of [nickname, badge]) {
+              const lines = await text.evaluate(element => {
+                const range = document.createRange();
+                range.selectNodeContents(element);
+                return new Set(Array.from(range.getClientRects(), rect => rect.y)).size;
+              });
+              expect(lines).toBe(1);
+            }
+          }
+        } finally {
+          server.close();
+        }
+      });
+    }
+  }
+
+  for (const width of [390, 800, 1280]) {
+    test(`keeps nicknames on one line at ${width}px`, async ({ page }) => {
+      await page.setViewportSize({ width, height: 844 });
+      const nick = "J5MobileLayoutMakerWithALongCounterpartyName";
+      const server = await openChart(page, payload([
+        { ...DEFAULT_OFFERS[0], counterparty: nick, oid: 0, minsize: 100_000,
+          directory_nodes: [], features: {} },
+      ]));
+      try {
+        const value = page.locator(".counterparty > .cell-value");
+        await expect(value).toHaveText(nick);
+        const lines = await value.evaluate((element) => {
+          const range = document.createRange();
+          range.selectNodeContents(element);
+          return new Set(Array.from(range.getClientRects(), (rect) => rect.y)).size;
+        });
+        expect(lines).toBe(1);
+      } finally {
+        server.close();
+      }
+    });
+  }
+
   test("contains long onion URLs and presents offers as labeled rows", async ({ page }) => {
     await page.setViewportSize({ width: 390, height: 844 });
     const onion = `${"directory".padEnd(56, "x")}.onion:5222`;

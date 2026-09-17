@@ -1536,8 +1536,14 @@ function renderTable() {
             row, 'Counterparty', offer.counterparty, 'counterparty'
         );
         if (directBadge) {
+            const nickname = document.createElement('span');
+            nickname.className = 'counterparty-nick';
+            nickname.textContent = offer.counterparty;
+            counterpartyValue.replaceChildren(nickname);
             counterpartyValue.appendChild(document.createTextNode(' '));
             counterpartyValue.appendChild(directBadge);
+        } else {
+            counterpartyValue.classList.add('counterparty-nick');
         }
         appendTableCell(row, 'Order ID', offer.oid);
         appendTableCell(row, 'Fee', formatFee(offer), feeClass);

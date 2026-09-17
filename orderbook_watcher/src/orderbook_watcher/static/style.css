@@ -352,7 +352,11 @@ tbody tr:hover {
 .counterparty {
     font-family: monospace;
     font-size: 0.9rem;
-    overflow-wrap: anywhere;
+}
+
+.counterparty-nick {
+    display: inline-block;
+    white-space: nowrap;
 }
 
 .selection-probability {
@@ -587,6 +591,14 @@ tbody tr:hover {
 
     td > .cell-value {
         text-align: right;
+    }
+
+    td.counterparty {
+        grid-template-columns: minmax(0, 1fr);
+    }
+
+    .counterparty > .cell-value {
+        overflow-x: auto;
     }
 
     td:last-child {
@@ -905,6 +917,7 @@ tbody tr:hover {
 /* Direct reachability indicator (issue #105) */
 .direct-badge {
     display: inline-block;
+    white-space: nowrap;
     margin-left: 6px;
     padding: 1px 5px;
     border-radius: 4px;
