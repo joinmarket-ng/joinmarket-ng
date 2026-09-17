@@ -34,25 +34,37 @@ def test_help_output_is_alphabetically_sorted() -> None:
     assert find_unsorted_help(app) == []
 
 
-def test_build_maker_config_auto_detects_tor_cookie() -> None:
-    """``build_maker_config`` must call ``detect_tor_cookie_path`` when no
-    explicit cookie was provided so the maker authenticates to Tor on hosts
-    that only configured the default cookie file (issue #471)."""
-    import inspect
+@pytest.mark.parametrize("configured_cookie", [None, "/configured.cookie"])
+def test_build_maker_config_auto_detects_tor_cookie(configured_cookie: str | None) -> None:
+    """Cookie detection remains a fallback after explicit configuration (#471)."""
+    from jmcore.settings import JoinMarketSettings
 
-    from maker import cli as cli_module
+    from maker.cli import build_maker_config
 
-    # The helper must be imported into the maker.cli namespace.
-    assert hasattr(cli_module, "detect_tor_cookie_path")
+    settings = JoinMarketSettings(tor={"cookie_path": configured_cookie})
+    with patch(
+        "jmcore.config.detect_tor_cookie_path", return_value=Path("/detected.cookie")
+    ) as detect:
+        config = build_maker_config(settings, "abandon " * 11 + "about", "")
+    assert config.tor_control.cookie_path == Path(configured_cookie or "/detected.cookie")
+    assert detect.call_count == (0 if configured_cookie else 1)
 
-    # And it must be called from the cookie-resolution block of
-    # ``build_maker_config``. Inspecting the source keeps this independent
-    # of JoinMarketSettings construction (which needs a full config.toml).
-    source = inspect.getsource(cli_module.build_maker_config)
-    assert "detect_tor_cookie_path()" in source
-    # Make sure the auto-detect is the fallback after the explicit settings
-    # branch, not a replacement for it.
-    assert source.index("settings.tor.cookie_path") < source.index("detect_tor_cookie_path()")
+
+@pytest.mark.parametrize("explicit_host", [None, "127.0.0.1"])
+def test_maker_tor_host_round_trip(explicit_host: str | None) -> None:
+    from jmcore.settings import JoinMarketSettings
+
+    from maker.cli import build_maker_config
+
+    tor = {"socks_host": "config-proxy.internal", "cookie_path": "/config.cookie"}
+    if explicit_host is not None:
+        tor["control_host"] = explicit_host
+    settings = JoinMarketSettings(tor=tor)
+    config = build_maker_config(
+        settings, "abandon " * 11 + "about", "", tor_socks_host="cli-proxy.internal"
+    )
+    assert config.socks_host == "cli-proxy.internal"
+    assert config.tor_control.host == (explicit_host or "cli-proxy.internal")
 
 
 def test_descriptor_scan_settings_reach_maker_backend() -> None:

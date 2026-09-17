@@ -6,6 +6,7 @@
 # section and key, then join them with a double underscore. For example:
 # [wallet] background_full_rescan -> WALLET__BACKGROUND_FULL_RESCAN
 # Environment variables take precedence over values in this file.
+# Unknown sections and keys warn at startup and are ignored.
 
 # ============================================================================
 # Core Settings
@@ -37,6 +38,9 @@
 # connection_timeout = 120.0
 
 # Control port settings (for hidden services)
+# Keep SOCKS and control settings together in [tor], not [tor_control].
+# When control_host is omitted, it follows the effective socks_host (including
+# environment/CLI overrides). Set it explicitly for a separate control endpoint.
 # control_enabled = true
 # control_host = "127.0.0.1"  # Defaults to socks_host if not set
 # control_port = 9051

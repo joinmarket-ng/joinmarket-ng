@@ -402,30 +402,33 @@ class TestSettingsFromEnv:
         assert wallet.scan_lookback_blocks == 10
 
     def test_legacy_background_full_scan_env_alias(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Keep accepting the environment name shipped by older JAM images."""
+        """Older JAM environment names now require an explicit rename."""
         monkeypatch.setenv("WALLET__BACKGROUND_FULL_SCAN", "false")
 
-        assert JoinMarketSettings().wallet.background_full_rescan is False
+        with pytest.raises(ValidationError, match="rename it to wallet.background_full_rescan"):
+            JoinMarketSettings()
 
     def test_legacy_background_full_scan_env_overrides_toml(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """The legacy environment alias retains environment-source priority."""
+        """A canonical TOML setting must not conceal a removed environment name."""
         config_path = tmp_path / "config.toml"
         config_path.write_text("[wallet]\nbackground_full_rescan = true\n")
         monkeypatch.setenv("JOINMARKET_CONFIG_FILE", str(config_path))
         monkeypatch.setenv("WALLET__BACKGROUND_FULL_SCAN", "false")
 
-        assert JoinMarketSettings().wallet.background_full_rescan is False
+        with pytest.raises(ValidationError, match="rename it to wallet.background_full_rescan"):
+            JoinMarketSettings()
 
     def test_canonical_background_full_rescan_env_precedes_legacy_alias(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The canonical name wins when both environment spellings are set."""
+        """Both spellings together still require removal of the legacy name."""
         monkeypatch.setenv("WALLET__BACKGROUND_FULL_RESCAN", "true")
         monkeypatch.setenv("WALLET__BACKGROUND_FULL_SCAN", "false")
 
-        assert JoinMarketSettings().wallet.background_full_rescan is True
+        with pytest.raises(ValidationError, match="rename it to wallet.background_full_rescan"):
+            JoinMarketSettings()
 
     def test_env_override_maker_settings(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Test that environment variables override maker settings."""

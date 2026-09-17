@@ -17,7 +17,7 @@ from typing import Annotated, Any
 import typer
 from jmcore.cli_common import resolve_mnemonic, setup_cli
 from jmcore.cli_help import SortedTyper
-from jmcore.config import TorControlConfig, detect_tor_cookie_path
+from jmcore.config import build_tor_control_config
 from jmcore.models import NetworkType, OfferType
 from jmcore.notifications import get_notifier
 from jmcore.paths import remove_nick_state, write_nick_state
@@ -164,35 +164,14 @@ def build_maker_config(
     effective_socks_port = tor_socks_port if tor_socks_port is not None else settings.tor.socks_port
 
     # Resolve Tor control settings
-    if disable_tor_control:
-        tor_control_cfg = TorControlConfig(enabled=False)
-    else:
-        # tor_control host defaults to tor.socks_host
-        effective_control_host = (
-            tor_control_host if tor_control_host is not None else settings.tor.control_host
-        )
-        effective_control_port = (
-            tor_control_port if tor_control_port is not None else settings.tor.control_port
-        )
-        effective_cookie_path = None
-        if tor_cookie_path is not None:
-            effective_cookie_path = tor_cookie_path
-        elif settings.tor.cookie_path:
-            effective_cookie_path = Path(settings.tor.cookie_path)
-        else:
-            # Auto-detect cookie at well-known Tor locations so the maker
-            # works out of the box on systems where install.sh / the distro
-            # configured CookieAuthentication without writing the path back
-            # into config.toml (issue #471).
-            effective_cookie_path = detect_tor_cookie_path()
-
-        tor_control_cfg = TorControlConfig(
-            enabled=settings.tor.control_enabled,
-            host=effective_control_host,
-            port=effective_control_port,
-            cookie_path=effective_cookie_path,
-            password=settings.tor.password if settings.tor.password else None,
-        )
+    tor_control_cfg = build_tor_control_config(
+        settings.tor,
+        socks_host=tor_socks_host,
+        control_host=tor_control_host,
+        control_port=tor_control_port,
+        cookie_path=tor_cookie_path,
+        disable_control=disable_tor_control,
+    )
 
     # Resolve maker-specific settings
     effective_onion_host = (

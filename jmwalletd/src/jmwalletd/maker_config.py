@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 
 from pydantic import SecretStr
 
-from jmcore.config import TorControlConfig, detect_tor_cookie_path
+from jmcore.config import build_tor_control_config
 from jmcore.models import OfferType
 from jmcore.settings import JoinMarketSettings
 from maker.config import MergeAlgorithm, OfferConfig
@@ -42,19 +42,6 @@ def _parse_mixdepth_selection_policy(value: str) -> MixdepthSelectionPolicy:
         raise ValueError(
             f"Invalid mixdepth selection policy: {value}. Must be balanced or concentrated"
         ) from exc
-
-
-def _build_tor_control_config(settings: JoinMarketSettings) -> TorControlConfig:
-    cookie_path = (
-        Path(settings.tor.cookie_path) if settings.tor.cookie_path else detect_tor_cookie_path()
-    )
-    return TorControlConfig(
-        enabled=settings.tor.control_enabled,
-        host=settings.tor.control_host,
-        port=settings.tor.control_port,
-        cookie_path=cookie_path,
-        password=settings.tor.password,
-    )
 
 
 def build_daemon_maker_config(
@@ -144,7 +131,7 @@ def build_daemon_maker_config(
         stream_isolation=settings.tor.stream_isolation,
         connection_timeout=settings.tor.connection_timeout,
         max_fee_rate_sat_vb=settings.wallet.max_fee_rate_sat_vb,
-        tor_control=_build_tor_control_config(settings),
+        tor_control=build_tor_control_config(settings.tor),
         onion_host=maker_settings.onion_host,
         onion_serving_host=maker_settings.onion_serving_host,
         onion_serving_port=maker_settings.onion_serving_port,

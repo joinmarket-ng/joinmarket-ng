@@ -46,7 +46,7 @@ from pathlib import Path
 from typing import Any, ClassVar, Self
 
 from loguru import logger
-from pydantic import AliasChoices, BaseModel, Field, SecretStr, field_validator, model_validator
+from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import (
     BaseSettings,
     EnvSettingsSource,
@@ -99,8 +99,8 @@ class TorSettings(BaseModel):
         description="Enable Tor control port integration for ephemeral hidden services",
     )
     control_host: str = Field(
-        default="127.0.0.1",
-        description="Tor control port host",
+        default_factory=lambda data: data["socks_host"],
+        description="Tor control port host (defaults to socks_host)",
     )
     control_port: int = Field(
         default=9051,
@@ -402,6 +402,16 @@ class NetworkSettings(BaseModel):
 class WalletSettings(BaseModel):
     """Wallet configuration."""
 
+    @model_validator(mode="before")
+    @classmethod
+    def reject_legacy_scan_name(cls, value: Any) -> Any:
+        if isinstance(value, dict) and "background_full_scan" in value:
+            raise ValueError(
+                "wallet.background_full_scan is no longer supported; rename it to "
+                "wallet.background_full_rescan (environment: WALLET__BACKGROUND_FULL_RESCAN)"
+            )
+        return value
+
     mixdepth_count: int = Field(
         default=5,
         ge=1,
@@ -479,7 +489,6 @@ class WalletSettings(BaseModel):
     )
     background_full_rescan: bool = Field(
         default=True,
-        validation_alias=AliasChoices("background_full_rescan", "background_full_scan"),
         description="Run full blockchain rescan in background",
     )
     scan_lookback_blocks: int = Field(
@@ -1412,6 +1421,12 @@ class OrderbookWatcherSettings(BaseModel):
     )
 
 
+class TuiSettings(BaseModel):
+    """Menu settings, consumed by the shell TUI rather than Python components."""
+
+    log_level: str = Field(default="WARNING", description="Log level for TUI-launched commands")
+
+
 class LoggingSettings(BaseModel):
     """Logging configuration."""
 
@@ -1438,18 +1453,6 @@ class _CommaListEnvSettingsSource(EnvSettingsSource):
     "a,b" or a bare single value "a" for list[str] fields, making container
     environment variable configuration more ergonomic.
     """
-
-    def __call__(self) -> dict[str, Any]:
-        data = super().__call__()
-
-        # AliasChoices is resolved after settings sources are merged. Normalize
-        # the legacy env spelling here so it still overrides the canonical TOML
-        # key, while retaining AliasChoices support for direct model input.
-        wallet = data.get("wallet")
-        if isinstance(wallet, dict) and "background_full_scan" in wallet:
-            wallet.setdefault("background_full_rescan", wallet["background_full_scan"])
-
-        return data
 
     def decode_complex_value(self, field_name: str, field_info: Any, value: Any) -> Any:
         if isinstance(value, str) and self._is_list_of_str(field_info):
@@ -1538,6 +1541,7 @@ class JoinMarketSettings(BaseSettings):
     wallet: WalletSettings = Field(default_factory=WalletSettings)
     notifications: NotificationSettings = Field(default_factory=NotificationSettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
+    tui: TuiSettings = Field(default_factory=TuiSettings)
 
     # Component-specific settings
     maker: MakerSettings = Field(default_factory=MakerSettings)
@@ -1590,6 +1594,31 @@ class JoinMarketSettings(BaseSettings):
         return self.bitcoin.neutrino_add_peers
 
 
+def _warn_unknown_settings(
+    values: dict[str, Any], model: type[BaseModel], prefix: str = ""
+) -> None:
+    """Report ignored TOML names without logging potentially sensitive values."""
+    for name, value in values.items():
+        path = f"{prefix}.{name}" if prefix else name
+        field = model.model_fields.get(name)
+        if field is None:
+            if path == "wallet.background_full_scan":
+                continue  # Validation reports the required rename as an error.
+            hint = ""
+            if path == "tor_control":
+                hint = (
+                    " Use [tor] control_enabled, control_host, control_port, "
+                    "cookie_path, and password instead."
+                )
+            logger.warning("Unknown config entry {!r} is ignored.{}", path, hint)
+        elif (
+            isinstance(value, dict)
+            and isinstance(field.annotation, type)
+            and issubclass(field.annotation, BaseModel)
+        ):
+            _warn_unknown_settings(value, field.annotation, path)
+
+
 class TomlConfigSettingsSource(PydanticBaseSettingsSource):
     """
     Custom settings source that reads from a TOML config file.
@@ -1630,6 +1659,7 @@ class TomlConfigSettingsSource(PydanticBaseSettingsSource):
             import tomllib
 
             self._config = tomllib.load(BytesIO(read_sensitive_file(config_path)))
+            _warn_unknown_settings(self._config, self.settings_cls)
 
             logger.info(f"Loaded config from {config_path}")
         except tomllib.TOMLDecodeError as e:
@@ -1723,6 +1753,7 @@ def generate_config_template() -> str:
         lines.append(f"[{prefix}]" if prefix else "")
         lines.append("")
 
+        defaults: dict[str, Any] = {}
         for field_name, field_info in model_cls.model_fields.items():
             # Get description
             desc = field_info.description or ""
@@ -1730,15 +1761,8 @@ def generate_config_template() -> str:
                 lines.append(f"# {desc}")
 
             # Get default value
-            default = field_info.default
-            factory = field_info.default_factory
-            if factory is not None:
-                # default_factory can be Callable[[], Any] or Callable[[dict], Any]
-                # We call with no args for the common case
-                try:
-                    default = factory()  # type: ignore[call-arg]
-                except TypeError:
-                    default = factory({})  # type: ignore[call-arg]
+            default = field_info.get_default(call_default_factory=True, validated_data=defaults)
+            defaults[field_name] = default
 
             # Format the value for TOML
             if isinstance(default, bool):
@@ -1799,6 +1823,7 @@ def generate_config_template() -> str:
     add_section("Wallet Settings", WalletSettings, "wallet")
     add_section("Notification Settings", NotificationSettings, "notifications")
     add_section("Logging Settings", LoggingSettings, "logging")
+    add_section("TUI Settings", TuiSettings, "tui")
     add_section("Maker Settings", MakerSettings, "maker")
     add_section("Taker Settings", TakerSettings, "taker")
     add_section("Directory Server Settings", DirectoryServerSettings, "directory_server")
@@ -2107,6 +2132,7 @@ __all__ = [
     "DirectoryServerSettings",
     "OrderbookWatcherSettings",
     "LoggingSettings",
+    "TuiSettings",
     "get_settings",
     "reset_settings",
     "get_config_path",

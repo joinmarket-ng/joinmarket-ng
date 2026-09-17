@@ -9,7 +9,7 @@ ensure consistency.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
 
@@ -17,6 +17,9 @@ from jmcore.constants import DUST_THRESHOLD
 from jmcore.models import NetworkType
 from jmcore.nick_auth import NickAuthMode, validate_directory_endpoint, validate_directory_id
 from jmcore.protocol import is_onion_hostname
+
+if TYPE_CHECKING:
+    from jmcore.settings import TorSettings
 
 
 class TorConfig(BaseModel):
@@ -96,6 +99,36 @@ def detect_tor_cookie_path() -> Path | None:
     return None
 
 
+def build_tor_control_config(
+    tor: TorSettings,
+    *,
+    socks_host: str | None = None,
+    control_host: str | None = None,
+    control_port: int | None = None,
+    cookie_path: Path | None = None,
+    disable_control: bool = False,
+) -> TorControlConfig:
+    """Resolve control settings and CLI overrides, including cookie auto-detection.
+
+    An explicit control host wins over the SOCKS host, even when the SOCKS
+    host is overridden on the CLI. An omitted control host follows SOCKS.
+    """
+    if disable_control:
+        return TorControlConfig(enabled=False)
+    host = tor.control_host
+    if "control_host" not in tor.model_fields_set and socks_host is not None:
+        host = socks_host
+    if cookie_path is None:
+        cookie_path = Path(tor.cookie_path) if tor.cookie_path else detect_tor_cookie_path()
+    return TorControlConfig(
+        enabled=tor.control_enabled,
+        host=control_host if control_host is not None else host,
+        port=control_port if control_port is not None else tor.control_port,
+        cookie_path=cookie_path,
+        password=tor.password,
+    )
+
+
 def create_tor_control_config_from_env() -> TorControlConfig:
     """
     Create TorControlConfig from environment variables with smart defaults.
@@ -117,20 +150,7 @@ def create_tor_control_config_from_env() -> TorControlConfig:
     from jmcore.settings import get_settings
 
     settings = get_settings()
-    tor = settings.tor
-
-    # Try to find cookie path
-    cookie_path: Path | None = (
-        Path(tor.cookie_path) if tor.cookie_path else detect_tor_cookie_path()
-    )
-
-    return TorControlConfig(
-        enabled=tor.control_enabled,
-        host=tor.control_host,
-        port=tor.control_port,
-        cookie_path=cookie_path,
-        password=tor.password,
-    )
+    return build_tor_control_config(settings.tor)
 
 
 class BackendConfig(BaseModel):
@@ -446,6 +466,7 @@ __all__ = [
     "TorConfig",
     "TorControlConfig",
     "create_tor_control_config_from_env",
+    "build_tor_control_config",
     "detect_tor_cookie_path",
     "BackendConfig",
     "WalletConfig",

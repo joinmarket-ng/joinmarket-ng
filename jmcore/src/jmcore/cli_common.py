@@ -19,7 +19,6 @@ Usage:
     from jmcore.cli_common import (
         resolve_backend_settings,
         resolve_mnemonic,
-        resolve_tor_settings,
         setup_cli,
     )
 
@@ -49,7 +48,13 @@ from pydantic import SecretStr, ValidationError
 from jmcore.crypto import validate_bip39_checksum
 from jmcore.log_filter import sensitive_log_filter
 from jmcore.models import NetworkType
-from jmcore.settings import JoinMarketSettings, get_config_path, get_settings, reset_settings
+from jmcore.settings import (
+    JoinMarketSettings,
+    TorSettings,
+    get_config_path,
+    get_settings,
+    reset_settings,
+)
 
 if TYPE_CHECKING:
     from loguru import Record
@@ -78,18 +83,6 @@ class ResolvedBackendSettings:
     neutrino_auth_token: str | None = None
     fee_estimate_url: str | None = None
     fee_estimate_proxy: str | None = None
-
-
-@dataclass
-class ResolvedTorSettings:
-    """Resolved Tor settings ready for use."""
-
-    socks_host: str
-    socks_port: int
-    control_enabled: bool
-    control_host: str
-    control_port: int
-    cookie_path: Path | None
 
 
 @dataclass
@@ -509,56 +502,6 @@ def resolve_backend_settings(
         neutrino_auth_token=resolved_neutrino_auth_token,
         fee_estimate_url=settings.bitcoin.fee_estimate_url,
         fee_estimate_proxy=resolved_fee_estimate_proxy,
-    )
-
-
-def resolve_tor_settings(
-    settings: JoinMarketSettings,
-    *,
-    socks_host: str | None = None,
-    socks_port: int | None = None,
-    control_host: str | None = None,
-    control_port: int | None = None,
-    cookie_path: Path | None = None,
-    disable_control: bool = False,
-) -> ResolvedTorSettings:
-    """
-    Resolve Tor settings with priority: CLI > Settings > Defaults.
-
-    Args:
-        settings: JoinMarketSettings instance
-        socks_host: CLI override for SOCKS host
-        socks_port: CLI override for SOCKS port
-        control_host: CLI override for control host
-        control_port: CLI override for control port
-        cookie_path: CLI override for cookie path
-        disable_control: Whether to disable Tor control
-
-    Returns:
-        ResolvedTorSettings with all values resolved
-    """
-    resolved_socks_host = socks_host if socks_host is not None else settings.tor.socks_host
-    resolved_socks_port = socks_port if socks_port is not None else settings.tor.socks_port
-
-    # Control port settings
-    control_enabled = not disable_control and settings.tor.control_enabled
-
-    resolved_control_host = control_host if control_host is not None else settings.tor.control_host
-    resolved_control_port = control_port if control_port is not None else settings.tor.control_port
-
-    resolved_cookie_path: Path | None = None
-    if cookie_path is not None:
-        resolved_cookie_path = cookie_path
-    elif settings.tor.cookie_path:
-        resolved_cookie_path = Path(settings.tor.cookie_path)
-
-    return ResolvedTorSettings(
-        socks_host=resolved_socks_host,
-        socks_port=resolved_socks_port,
-        control_enabled=control_enabled,
-        control_host=resolved_control_host,
-        control_port=resolved_control_port,
-        cookie_path=resolved_cookie_path,
     )
 
 
@@ -1142,7 +1085,7 @@ def generate_descriptor_wallet_name(
 
 def log_resolved_settings(
     backend: ResolvedBackendSettings,
-    tor: ResolvedTorSettings | None = None,
+    tor: TorSettings | None = None,
     directory_servers: list[str] | None = None,
     mnemonic_source: str | None = None,
 ) -> None:

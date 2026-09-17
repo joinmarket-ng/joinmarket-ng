@@ -60,6 +60,21 @@ an older release that predates the starter retains its full-template behavior.
 sections and keys absent from a user file. It returns a list of `section:<name>`
 and `key:<section>.<key>` strings, not a release-to-release comparison.
 
+Unknown TOML sections and keys produce warnings at load time and remain ignored.
+Warnings identify the setting name without printing its value. Newer-version
+settings therefore remain nonfatal when an older component reads the file.
+
+## Tor Control
+
+Both SOCKS and control settings belong in `[tor]`. Use `socks_host` and
+`socks_port` for outgoing connections, and `control_host`, `control_port`,
+`control_enabled`, `cookie_path`, and `password` for the control connection.
+
+When `control_host` is omitted, it follows the effective `socks_host`, including
+environment and maker CLI overrides. With neither host configured, both use
+`127.0.0.1`. An explicit control host takes precedence over this fallback,
+including when a CLI flag changes only the SOCKS host.
+
 ## Section Names
 
 Top-level sections in config use these names:
