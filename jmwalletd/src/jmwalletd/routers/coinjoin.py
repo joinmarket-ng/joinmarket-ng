@@ -62,11 +62,13 @@ def build_coinjoin_taker_config(
     ``config_overrides`` is the daemon's in-memory ``configset`` store; the
     fee policy JAM writes there (``[POLICY] tx_fees`` etc.) is applied on top
     of the settings so a sat/vB rate chosen in the UI is honored (issue #566).
+    A ``txfee`` on the request itself (the fee picked on JAM's Send page)
+    takes precedence over ``tx_fees`` for this CoinJoin only (issue #636).
     """
     from jmwalletd.fee_policy import resolve_policy_fee_overrides
     from taker.config_builder import build_taker_config_kwargs
 
-    fee_overrides = resolve_policy_fee_overrides(config_overrides)
+    fee_overrides = resolve_policy_fee_overrides(config_overrides, request_tx_fee=body.txfee)
     kwargs = build_taker_config_kwargs(
         jm_settings,
         mnemonic,
@@ -108,8 +110,12 @@ async def direct_send(
 
         # Honor the fee policy JAM stores via configset ([POLICY] tx_fees):
         # a manual sat/vB rate or block target set in the UI applies to
-        # direct sends too (issue #566).
-        fee_overrides = resolve_policy_fee_overrides(state.config_overrides)
+        # direct sends too (issue #566). A txfee on the request (the fee
+        # picked on JAM's Send page) takes precedence for this send only
+        # (issue #636).
+        fee_overrides = resolve_policy_fee_overrides(
+            state.config_overrides, request_tx_fee=body.txfee
+        )
         settings = get_settings()
         fee_target_blocks = fee_overrides.block_target
         if fee_overrides.fee_rate is None and fee_target_blocks is None:

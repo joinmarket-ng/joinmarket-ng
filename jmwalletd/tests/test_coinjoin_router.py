@@ -168,6 +168,130 @@ class TestDirectSend:
         assert kwargs["fee_target_blocks"] == 3
         assert kwargs["tx_fee_factor"] == 0.2
 
+    @patch("jmwalletd.send.do_direct_send")
+    @pytest.mark.parametrize(
+        ("configset_tx_fees", "request_tx_fee", "expected_fee_rate", "expected_target"),
+        [
+            (None, 25000, 25.0, None),
+            (None, 1, None, 1),
+            ("6", 40000, 40.0, None),
+            ("5000", 2, None, 2),
+        ],
+        ids=[
+            "rate-without-configset",
+            "target-without-configset",
+            "rate-clears-configset-target",
+            "target-clears-configset-rate",
+        ],
+    )
+    def test_direct_send_request_txfee_takes_precedence(
+        self,
+        mock_send: AsyncMock,
+        authed_client: tuple[TestClient, str],
+        configset_tx_fees: str | None,
+        request_tx_fee: int,
+        expected_fee_rate: float | None,
+        expected_target: int | None,
+    ) -> None:
+        """Regression (issue #636): the fee picked on JAM's Send page arrives
+        only as ``txfee`` in the request body and used to be dropped."""
+        client, token = authed_client
+        state = get_daemon_state()
+        if configset_tx_fees is not None:
+            state.config_overrides["POLICY"] = {"tx_fees": configset_tx_fees}
+        mock_send.return_value = Mock(
+            txid="txid123", tx_hex="rawhex", inputs=[], outputs=[], locktime=0, version=2
+        )
+
+        resp = client.post(
+            "/api/v1/wallet/test_wallet.jmdat/taker/direct-send",
+            json={
+                "mixdepth": 0,
+                "amount_sats": 1000,
+                "destination": "bcrt1qdest",
+                "txfee": request_tx_fee,
+            },
+            headers=_auth_headers(token),
+        )
+
+        assert resp.status_code == 200
+        kwargs = mock_send.call_args.kwargs
+        assert kwargs["fee_rate"] == expected_fee_rate
+        assert kwargs["fee_target_blocks"] == expected_target
+
+    @patch("jmwalletd.send.do_direct_send")
+    @pytest.mark.parametrize(
+        ("configset_tx_fees", "expected_fee_rate", "expected_target"),
+        [(None, None, 3), ("2000", 2.0, None)],
+        ids=["settings-default", "configset"],
+    )
+    def test_direct_send_request_txfee_does_not_leak_into_later_requests(
+        self,
+        mock_send: AsyncMock,
+        authed_client: tuple[TestClient, str],
+        configset_tx_fees: str | None,
+        expected_fee_rate: float | None,
+        expected_target: int | None,
+    ) -> None:
+        client, token = authed_client
+        state = get_daemon_state()
+        if configset_tx_fees is not None:
+            state.config_overrides["POLICY"] = {"tx_fees": configset_tx_fees}
+        overrides_before = {
+            section: dict(fields) for section, fields in state.config_overrides.items()
+        }
+        mock_send.return_value = Mock(
+            txid="txid123", tx_hex="rawhex", inputs=[], outputs=[], locktime=0, version=2
+        )
+        body = {"mixdepth": 0, "amount_sats": 1000, "destination": "bcrt1qdest"}
+
+        first = client.post(
+            "/api/v1/wallet/test_wallet.jmdat/taker/direct-send",
+            json={**body, "txfee": 40000},
+            headers=_auth_headers(token),
+        )
+        second = client.post(
+            "/api/v1/wallet/test_wallet.jmdat/taker/direct-send",
+            json=body,
+            headers=_auth_headers(token),
+        )
+
+        assert first.status_code == 200
+        assert second.status_code == 200
+        assert len(mock_send.call_args_list) == 2
+        first_kwargs, second_kwargs = (recorded.kwargs for recorded in mock_send.call_args_list)
+        assert first_kwargs["fee_rate"] == 40.0
+        assert first_kwargs["fee_target_blocks"] is None
+        assert second_kwargs["fee_rate"] == expected_fee_rate
+        assert second_kwargs["fee_target_blocks"] == expected_target
+        assert state.config_overrides == overrides_before
+
+    @patch("jmwalletd.send.do_direct_send")
+    def test_direct_send_rejects_unusable_request_txfee(
+        self,
+        mock_send: AsyncMock,
+        authed_client: tuple[TestClient, str],
+    ) -> None:
+        """A ``txfee`` too large to express in sat/vB is rejected, instead of
+        sending with the configset fee the caller did not ask for."""
+        client, token = authed_client
+        state = get_daemon_state()
+        state.config_overrides["POLICY"] = {"tx_fees": "5000"}
+
+        resp = client.post(
+            "/api/v1/wallet/test_wallet.jmdat/taker/direct-send",
+            json={
+                "mixdepth": 0,
+                "amount_sats": 1000,
+                "destination": "bcrt1qdest",
+                "txfee": 10**309,
+            },
+            headers=_auth_headers(token),
+        )
+
+        assert resp.status_code == 422
+        mock_send.assert_not_called()
+
     def test_direct_send_while_taker_running(self, authed_client: tuple[TestClient, str]) -> None:
         client, token = authed_client
         state = get_daemon_state()
@@ -436,6 +560,115 @@ class TestDoCoinjoin:
         assert state.last_taker_txid is None
         assert "Failed to connect to any directory server" in (state.last_taker_error or "")
 
+    @patch("jmwalletd._backend.get_backend", new_callable=AsyncMock)
+    @patch("taker.taker.Taker")
+    @patch("taker.config.TakerConfig")
+    @patch("jmwalletd.routers.coinjoin.get_settings")
+    @pytest.mark.parametrize(
+        ("configset_tx_fees", "expected_fee_rate", "expected_target"),
+        [(None, None, 3), ("2000", 2.0, None)],
+        ids=["settings-default", "configset"],
+    )
+    def test_request_txfee_applies_to_that_coinjoin_only(
+        self,
+        mock_get_settings: Mock,
+        mock_config: Mock,
+        mock_taker_cls: Mock,
+        mock_backend: AsyncMock,
+        authed_client: tuple[TestClient, str],
+        configset_tx_fees: str | None,
+        expected_fee_rate: float | None,
+        expected_target: int | None,
+    ) -> None:
+        """Regression (issue #636): ``txfee`` wins for the request it came with,
+        and neither a later request nor the configset store sees it."""
+        client, token = authed_client
+        state = get_daemon_state()
+        if configset_tx_fees is not None:
+            state.config_overrides["POLICY"] = {"tx_fees": configset_tx_fees}
+        overrides_before = {
+            section: dict(fields) for section, fields in state.config_overrides.items()
+        }
+
+        mock_taker = AsyncMock()
+        mock_taker.state = TakerState.COMPLETE
+        mock_taker.txid = "f" * 64
+        mock_taker.last_failure_reason = None
+        mock_taker.last_broadcast_policy = None
+        mock_taker.last_broadcast_method = None
+        mock_taker.last_broadcast_fallback_reason = None
+        mock_taker_cls.return_value = mock_taker
+
+        from pathlib import Path
+
+        from jmcore.models import NetworkType
+        from jmcore.settings import JoinMarketSettings
+
+        mock_settings = JoinMarketSettings()
+        mock_settings.data_dir = Path("/tmp/jm-test")
+        mock_settings.network_config.network = NetworkType.REGTEST
+        mock_settings.network_config.directory_servers = ["testdirectoryfakeaddress.onion:5222"]
+        mock_settings.bitcoin.backend_type = "descriptor_wallet"
+        mock_settings.taker.fee_rate = None
+        mock_settings.taker.fee_block_target = None
+        mock_settings.wallet.default_fee_block_target = 3
+        mock_get_settings.return_value = mock_settings
+
+        body: dict[str, Any] = {
+            "mixdepth": 0,
+            "amount_sats": 100000,
+            "destination": "bcrt1qdest",
+            "counterparties": 3,
+        }
+        first = client.post(
+            "/api/v1/wallet/test_wallet.jmdat/taker/coinjoin",
+            json={**body, "txfee": 40000},
+            headers=_auth_headers(token),
+        )
+        assert first.status_code == 202
+        second = client.post(
+            "/api/v1/wallet/test_wallet.jmdat/taker/coinjoin",
+            json=body,
+            headers=_auth_headers(token),
+        )
+        assert second.status_code == 202
+
+        assert len(mock_config.call_args_list) == 2
+        first_kwargs, second_kwargs = (recorded.kwargs for recorded in mock_config.call_args_list)
+        assert first_kwargs["fee_rate"] == 40.0
+        assert first_kwargs["fee_block_target"] is None
+        assert second_kwargs["fee_rate"] == expected_fee_rate
+        assert second_kwargs["fee_block_target"] == expected_target
+        assert state.config_overrides == overrides_before
+
+    @patch("taker.taker.Taker")
+    def test_coinjoin_rejects_unusable_request_txfee(
+        self,
+        mock_taker_cls: Mock,
+        authed_client: tuple[TestClient, str],
+    ) -> None:
+        """Same rejection as on direct-send: no CoinJoin starts with a fee the
+        caller did not ask for."""
+        client, token = authed_client
+        state = get_daemon_state()
+        state.config_overrides["POLICY"] = {"tx_fees": "5000"}
+
+        resp = client.post(
+            "/api/v1/wallet/test_wallet.jmdat/taker/coinjoin",
+            json={
+                "mixdepth": 0,
+                "amount_sats": 100000,
+                "destination": "bcrt1qdest",
+                "counterparties": 3,
+                "txfee": 10**309,
+            },
+            headers=_auth_headers(token),
+        )
+
+        assert resp.status_code == 422
+        mock_taker_cls.assert_not_called()
+        assert state.taker_running is False
+
 
 class TestStopCoinjoin:
     @patch("jmwalletd._backend.get_backend", new_callable=AsyncMock)
@@ -676,6 +909,7 @@ class TestBuildCoinjoinTakerConfig:
         mixdepth: int = 0,
         amount_sats: int = 100_000,
         destination: str = "bcrt1qdest",
+        txfee: int | None = None,
     ) -> object:
         from types import SimpleNamespace
 
@@ -684,6 +918,7 @@ class TestBuildCoinjoinTakerConfig:
             mixdepth=mixdepth,
             amount_sats=amount_sats,
             destination=destination,
+            txfee=txfee,
         )
 
     def _build(
@@ -835,6 +1070,61 @@ class TestBuildCoinjoinTakerConfig:
         )
         assert captured["fee_rate"] is None
         assert captured["fee_block_target"] == 3
+
+    # Regression (issue #636): the fee picked on JAM's Send page arrives only as
+    # ``txfee`` in the request body and must win over configset for this
+    # CoinJoin, including switching between a rate and a block target.
+
+    def test_request_txfee_rate_clears_configset_block_target(self) -> None:
+        captured = self._build(
+            body=self._body(txfee=25000),
+            jm_settings=self._settings(fee_rate=None, fee_block_target=None),
+            config_overrides={"POLICY": {"tx_fees": "6"}},
+        )
+        assert captured["fee_rate"] == 25.0
+        assert captured["fee_block_target"] is None
+
+    def test_request_txfee_block_target_clears_configset_rate(self) -> None:
+        captured = self._build(
+            body=self._body(txfee=2),
+            jm_settings=self._settings(fee_rate=None, fee_block_target=None),
+            config_overrides={"POLICY": {"tx_fees": "5000"}},
+        )
+        assert captured["fee_rate"] is None
+        assert captured["fee_block_target"] == 2
+
+    def test_request_txfee_block_target_wins_over_settings_fee_rate(self) -> None:
+        captured = self._build(
+            body=self._body(txfee=4),
+            jm_settings=self._settings(fee_rate=12.5),
+        )
+        assert captured["fee_rate"] is None
+        assert captured["fee_block_target"] == 4
+
+    @pytest.mark.parametrize("txfee", [None, 0], ids=["omitted", "zero"])
+    def test_omitted_or_zero_request_txfee_keeps_configset(self, txfee: int | None) -> None:
+        rate = self._build(
+            body=self._body(txfee=txfee),
+            jm_settings=self._settings(fee_rate=None, fee_block_target=None),
+            config_overrides={"POLICY": {"tx_fees": "5000"}},
+        )
+        assert rate["fee_rate"] == 5.0
+        assert rate["fee_block_target"] is None
+
+        target = self._build(
+            body=self._body(txfee=txfee),
+            jm_settings=self._settings(fee_rate=None, fee_block_target=None),
+            config_overrides={"POLICY": {"tx_fees": "6"}},
+        )
+        assert target["fee_rate"] is None
+        assert target["fee_block_target"] == 6
+
+        default = self._build(
+            body=self._body(txfee=txfee),
+            jm_settings=self._settings(fee_rate=None, fee_block_target=None),
+        )
+        assert default["fee_rate"] is None
+        assert default["fee_block_target"] == 3
 
 
 class TestStartMaker:

@@ -70,7 +70,11 @@ fee settings modal) takes precedence over the config file for direct sends,
 coinjoins, and tumbles. The reference `[POLICY] tx_fees` semantics apply:
 values from 1 to 1000 are a block confirmation target, values above 1000 are a
 fee rate in sat/kvB (for example `5000` means 5 sat/vB). These overrides are
-in-memory only and are cleared when the wallet is locked. On the neutrino
+in-memory only and are cleared when the wallet is locked. A `txfee` sent with a
+single `taker/direct-send` or `taker/coinjoin` request uses the same semantics
+and takes precedence over `[POLICY] tx_fees` for that request only; omit it or
+send `0` to use the configured value, and note that a value beyond the money
+supply is rejected rather than falling back to it. On the neutrino
 backend, block-target estimation uses the external fee source configured via
 `bitcoin.fee_estimate_url` (an onion-first fallback chain over Tor by default).
 Multiple comma-separated URLs are tried in order. When external estimation is

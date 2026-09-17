@@ -372,12 +372,20 @@ class DirectSendRequest(BaseModel):
     ``rbf`` controls BIP125 replacement signaling and defaults to ``True``.
     Set it to ``False`` to retain anti-fee-sniping locktime without opting in
     to replacement.
+
+    ``txfee`` sets the miner fee for this send only, with the reference
+    ``[POLICY] tx_fees`` semantics: ``1``-``1000`` is a block confirmation
+    target, anything above is a rate in sat/kvB (``5000`` is 5 sat/vB). It
+    takes precedence over a ``configset`` ``tx_fees`` value. Omit it or send
+    ``0`` to use the configured fee policy. A value beyond the money supply
+    is rejected here rather than silently falling back to the configured
+    policy, so an explicit fee is never replaced by a different one.
     """
 
     mixdepth: int = Field(..., ge=0)
     amount_sats: int = Field(..., ge=0, le=MAX_MONEY_SATS)
     destination: str
-    txfee: int | None = Field(default=None, ge=0)
+    txfee: int | None = Field(default=None, ge=0, le=MAX_MONEY_SATS)
     input_utxos: list[str] | None = None
     rbf: bool = True
 
@@ -404,13 +412,19 @@ class DoCoinjoinRequest(BaseModel):
     ``input_utxos`` is an optional explicit list of ``"txid:vout"`` strings.
     When given, the CoinJoin spends exactly those UTXOs. Omit the field to
     preserve automatic coin selection.
+
+    ``txfee`` sets the miner fee for this CoinJoin only, with the same
+    semantics and bounds as on ``DirectSendRequest``: ``1``-``1000`` is a
+    block target, anything above is a rate in sat/kvB. It takes precedence
+    over a ``configset`` ``tx_fees`` value; omit it or send ``0`` to use the
+    configured fee policy.
     """
 
     mixdepth: int = Field(..., ge=0)
     amount_sats: int = Field(..., ge=0, le=MAX_MONEY_SATS)
     counterparties: int = Field(..., ge=2, le=20)
     destination: str
-    txfee: int | None = Field(default=None, ge=0)
+    txfee: int | None = Field(default=None, ge=0, le=MAX_MONEY_SATS)
     input_utxos: list[str] | None = None
 
 

@@ -6,6 +6,7 @@ import pytest
 from pydantic import ValidationError
 
 from jmwalletd.models import (
+    MAX_MONEY_SATS,
     ConfigGetRequest,
     ConfigSetRequest,
     CreateWalletRequest,
@@ -269,6 +270,14 @@ class TestDirectSendRequest:
                 amount_sats=21_000_000 * 100_000_000 + 1,
                 destination="bcrt1qtest",
             )
+
+    @pytest.mark.parametrize("txfee", [MAX_MONEY_SATS + 1, 10**309])
+    def test_txfee_above_money_supply_rejected(self, txfee: int) -> None:
+        # JSON allows arbitrarily large integers, and 10**309 cannot even be
+        # expressed in sat/vB. Rejecting it keeps an explicit fee from being
+        # replaced by the global one (issue #636).
+        with pytest.raises(ValidationError):
+            DirectSendRequest(mixdepth=0, amount_sats=100, destination="bcrt1qtest", txfee=txfee)
 
 
 class TestDoCoinjoinRequest:

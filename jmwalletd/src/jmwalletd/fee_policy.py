@@ -1,26 +1,33 @@
-"""Resolve reference-style ``[POLICY]`` fee overrides set through ``configset``.
+"""Resolve reference-style fee overrides from ``configset`` and the request.
 
-JAM (and other clients written against the reference jmwalletd API) do not
-send fee parameters with each request. Instead they write them to the
-``[POLICY]`` config section via ``POST /configset`` and expect the daemon to
-honor those values for subsequent operations (direct sends, coinjoins, and
-tumbles). The daemon keeps them in ``DaemonState.config_overrides``; this
-module translates them into the override arguments understood by our config
-builders (issue #566: the values used to be stored and echoed back by
-``configget`` but never applied, so a sat/vB fee set in JAM was silently
-ignored and the taker fell back to block-target estimation, which fails on
-the neutrino backend).
+JAM (and other clients written against the reference jmwalletd API) set the
+fee policy globally rather than per request: they write it to the ``[POLICY]``
+config section via ``POST /configset`` and expect the daemon to honor those
+values for subsequent operations (direct sends, coinjoins, and tumbles). The
+daemon keeps them in ``DaemonState.config_overrides``. A single direct-send or
+coinjoin request may additionally carry a ``txfee`` of its own, which overrides
+the global ``tx_fees`` for that one request. This module translates both into
+the override arguments understood by our config builders (issue #566: the
+configset values were stored and echoed back by ``configget`` but never
+applied, so a sat/vB fee set in JAM was silently ignored and the taker fell
+back to block-target estimation, which fails on the neutrino backend; issue
+#636: a request ``txfee`` was accepted and then dropped the same way).
 
-Reference semantics for ``tx_fees``:
+Reference semantics, shared by ``tx_fees`` and a request ``txfee``:
 
-- ``1 <= tx_fees <= 1000``: block confirmation target for backend fee
+- ``1 <= value <= 1000``: block confirmation target for backend fee
   estimation.
-- ``tx_fees > 1000``: manual fee rate in satoshis per kilo-vbyte
-  (sat/vB = tx_fees / 1000).
+- ``value > 1000``: manual fee rate in satoshis per kilo-vbyte
+  (sat/vB = value / 1000).
 
-Values that fail to parse or are out of range are ignored with a warning so
-a bad override degrades to the configured settings instead of breaking the
-operation.
+A request ``txfee`` is never written back to the ``configset`` store, so it
+cannot leak into later requests.
+
+Configset values that fail to parse or are out of range are ignored with a
+warning, so a bad global override degrades to the configured settings instead
+of breaking the operation. A request ``txfee`` is bounded by the request
+models instead and rejected there, so an explicit per-send fee is never
+silently replaced by a different one.
 """
 
 from __future__ import annotations
@@ -41,7 +48,8 @@ class PolicyFeeOverrides(NamedTuple):
 
     ``None`` fields mean "no override; use the configured settings value".
     ``fee_rate`` (sat/vB) and ``block_target`` are mutually exclusive by
-    construction (both derive from ``tx_fees``).
+    construction (both derive from a single ``tx_fees`` or request ``txfee``
+    value).
     """
 
     fee_rate: float | None = None
@@ -54,20 +62,30 @@ class PolicyFeeOverrides(NamedTuple):
 
 def resolve_policy_fee_overrides(
     config_overrides: Mapping[str, Mapping[str, str]] | None,
+    *,
+    request_tx_fee: int | None = None,
 ) -> PolicyFeeOverrides:
     """Parse fee overrides from the in-memory ``configset`` store.
 
     Accepts the ``DaemonState.config_overrides`` mapping (section -> field ->
     raw string value) and returns the subset of fee policy knobs that our
     taker/spend config builders understand.
+
+    ``request_tx_fee`` is the optional ``txfee`` of a single direct-send or
+    coinjoin request. A positive value replaces ``[POLICY] tx_fees`` for that
+    request, and since it yields either a rate or a block target, it also
+    clears whichever of the two the configset value would have set. ``None``
+    or ``0`` keeps the configset value. Only the returned tuple is affected;
+    ``config_overrides`` is never modified.
     """
-    if not config_overrides:
-        return PolicyFeeOverrides()
-    policy = config_overrides.get("POLICY")
-    if not policy:
-        return PolicyFeeOverrides()
+    policy: Mapping[str, str] = (config_overrides or {}).get("POLICY") or {}
 
     fee_rate, block_target = _parse_tx_fees(policy.get("tx_fees"))
+    if request_tx_fee:
+        # Bounded by the request models, so it always converts; an unusable
+        # value is rejected there instead of falling back to another fee.
+        fee_rate, block_target = _split_tx_fee(request_tx_fee)
+
     return PolicyFeeOverrides(
         fee_rate=fee_rate,
         block_target=block_target,
@@ -92,17 +110,21 @@ def _parse_tx_fees(raw: str | None) -> tuple[float | None, int | None]:
     if value <= 0:
         logger.warning("Ignoring non-positive [POLICY] tx_fees override: {}", value)
         return None, None
+    try:
+        return _split_tx_fee(value)
+    except OverflowError:
+        logger.warning("Ignoring out-of-range [POLICY] tx_fees override: {}", value)
+        return None, None
+
+
+def _split_tx_fee(value: int) -> tuple[float | None, int | None]:
+    """Split a positive fee value into ``(fee_rate_sat_vb, block_target)``.
+
+    Raises ``OverflowError`` for a value too large to express in sat/vB.
+    """
     if value > TX_FEES_BLOCK_TARGET_MAX:
         # sat/kvB -> sat/vB (reference semantics).
-        try:
-            fee_rate = value / 1000.0
-        except OverflowError:
-            logger.warning("Ignoring out-of-range [POLICY] tx_fees override: {}", value)
-            return None, None
-        if not math.isfinite(fee_rate):
-            logger.warning("Ignoring out-of-range [POLICY] tx_fees override: {}", value)
-            return None, None
-        return fee_rate, None
+        return value / 1000.0, None
     return None, value
 
 
