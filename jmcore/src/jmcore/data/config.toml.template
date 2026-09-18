@@ -364,8 +364,9 @@
 # Minimum CoinJoin amount (in satoshis) that this maker will offer.
 #
 # Lower min_size lets you serve takers requesting smaller mixes at the cost of
-# producing smaller UTXOs. Note: the *advertised* minsize is randomized on each
-# offer announcement (see size_factor below) and clamped to the dust threshold.
+# producing smaller UTXOs. The advertised minsize is not randomized. It remains
+# subject to the dust threshold, relative-fee profitability floor, and dual-offer
+# fee intersection described below.
 #
 # Default: 100000 (matches the upstream JoinMarket reference; using a different
 # value may make jm-ng makers fingerprintable).
@@ -407,9 +408,11 @@
 # cj_fee_absolute = 500        # Absolute fee in satoshis (for sw0absoffer)
 # tx_fee_contribution = 0      # Mining fee contribution in satoshis
 
-# Offer randomization factors. Each advertised offer is sampled uniformly from
-# [value*(1-factor), value*(1+factor)] (size is sampled downward only) on every
-# announcement so observers cannot correlate balance changes with exact values.
+# Offer randomization factors. Fees are sampled uniformly from
+# [value*(1-factor), value*(1+factor)] on every announcement.
+# size_factor applies only to maxsize, sampled from
+# [available*(1-size_factor), available] to obscure exact fillable liquidity.
+# The minimum is not randomized, and dual-offer intersection boundaries stay pinned.
 # Set any factor to 0 to disable randomization for that field.
 # cjfee_factor defaults to 0 (no fee randomization) so a default maker stays
 # exactly on its quantization quantum. Randomized and other off-grid offers can

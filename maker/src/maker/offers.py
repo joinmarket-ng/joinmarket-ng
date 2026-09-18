@@ -534,15 +534,12 @@ class OfferManager:
             else:
                 base_min_size = effective_min_size
 
-            # Randomize min_size (clamped to dust threshold).  The dual-offer
-            # auto-split pins the boundary at the intersection; no randomization
-            # is applied to that edge so the two offers stay seamless.
+            # Keep the minimum stable so common configured values remain shared
+            # across makers. Preserve the dual-offer seam and the dust floor.
             if min_size_override is not None:
-                randomized_min_size = max(int(effective_min_size), DUST_THRESHOLD)
+                min_size = max(int(effective_min_size), DUST_THRESHOLD)
             else:
-                randomized_min_size = int(
-                    _randomize(base_min_size, offer_cfg.size_factor, low=DUST_THRESHOLD)
-                )
+                min_size = max(base_min_size, DUST_THRESHOLD)
 
             # Randomize max_size downward from available balance.  The
             # dual-offer auto-split pins this edge too.
@@ -557,21 +554,19 @@ class OfferManager:
             else:
                 randomized_max_size = max_available
 
-            if randomized_max_size <= randomized_min_size:
+            if randomized_max_size <= min_size:
                 logger.warning(
                     f"Offer {offer_id}: Randomized maxsize too small: "
-                    f"max_size={randomized_max_size} <= min_size={randomized_min_size} "
+                    f"max_size={randomized_max_size} <= min_size={min_size} "
                     f"(max_available={max_available})"
                 )
                 return None
 
-            offer = terms.model_copy(
-                update={"minsize": randomized_min_size, "maxsize": randomized_max_size}
-            )
+            offer = terms.model_copy(update={"minsize": min_size, "maxsize": randomized_max_size})
 
             logger.info(
                 f"Created offer {offer_id}: type={offer.ordertype.value}, "
-                f"size={randomized_min_size}-{randomized_max_size} "
+                f"size={min_size}-{randomized_max_size} "
                 f"(max_available={max_available}), "
                 f"cjfee={cjfee_str}, txfee={randomized_txfee}, "
                 f"bond_value={fidelity_bond_value}"

@@ -109,16 +109,8 @@ test.describe("Maker / Earn", () => {
     const offer = session.offer_list![0];
     expect(offer.ordertype).toBe("sw0absoffer");
     expect(offer.cjfee).toBeTruthy();
-    // The maker randomizes minsize on each announcement around the configured
-    // value by `size_factor` (default 0.1). Assert the published value lies
-    // within the allowed [base * (1 - size_factor), base * (1 + size_factor)]
-    // band rather than the configured base, to avoid spurious flakes.
-    const configuredMinSize = 100_000;
-    const sizeFactor = 0.1;
-    const minSizeLowerBound = Math.floor(configuredMinSize * (1 - sizeFactor));
-    const minSizeUpperBound = Math.ceil(configuredMinSize * (1 + sizeFactor));
-    expect(Number(offer.minsize)).toBeGreaterThanOrEqual(minSizeLowerBound);
-    expect(Number(offer.minsize)).toBeLessThanOrEqual(minSizeUpperBound);
+    // size_factor randomizes only maxsize; the configured minimum stays exact.
+    expect(Number(offer.minsize)).toBe(100_000);
 
     // Stop the maker.
     await walletApi.stopMaker(token);

@@ -1544,12 +1544,7 @@ if __name__ == "__main__":
 
 
 class TestOfferRandomization:
-    """Tests for the maker offer randomization (issue #468).
-
-    Defaults match the upstream JoinMarket yg-privacyenhanced reference so
-    jm-ng makers cannot be distinguished from reference makers by their
-    advertised values alone.
-    """
+    """Fees and maximum sizes can vary while minimum sizes retain their floors."""
 
     @pytest.fixture
     def randomized_wallet(self):
@@ -1731,8 +1726,57 @@ class TestOfferRandomization:
         assert 0 < numeric_cjfee < 1
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("offer_type", "configured_min", "txfee", "expected_min"),
+        [
+            (OfferType.SW0_RELATIVE, 100_000, 0, 100_000),
+            (OfferType.SW0_ABSOLUTE, 100_000, 0, 100_000),
+            (OfferType.SW0_RELATIVE, 200_000, 0, 200_000),
+            (OfferType.SW0_RELATIVE, 100_000, 1000, 1_500_000),
+            (OfferType.SW0_ABSOLUTE, 0, 0, DUST_THRESHOLD),
+        ],
+    )
+    async def test_size_factor_only_randomizes_maximum(
+        self,
+        randomized_wallet: MagicMock,
+        offer_type: OfferType,
+        configured_min: int,
+        txfee: int,
+        expected_min: int,
+    ) -> None:
+        cfg = MakerConfig(
+            mnemonic="test " * 12,
+            directory_servers=["localhost:5222"],
+            network=NetworkType.REGTEST,
+            offer_type=offer_type,
+            min_size=configured_min,
+            cj_fee_relative="0.001",
+            tx_fee_contribution=txfee,
+            cjfee_factor=0.0,
+            txfee_contribution_factor=0.0,
+            size_factor=0.0,
+        )
+        manager = OfferManager(randomized_wallet, cfg, "J5TestMaker")
+        with patch("maker.offers.get_best_fidelity_bond", new=AsyncMock(return_value=None)):
+            baseline = await manager.create_offers()
+            assert len(baseline) == 1
+            ceiling = baseline[0].maxsize
+            assert baseline[0].minsize == expected_min
+
+            cfg.size_factor = 0.1
+            for sample in (0.0, 0.5, 1.0):
+                with patch(
+                    "maker.offers.secure_random.uniform",
+                    side_effect=lambda low, high: low + sample * (high - low),
+                ):
+                    offers = await manager.create_offers()
+                assert len(offers) == 1
+                assert offers[0].minsize == expected_min
+                assert offers[0].maxsize == int(ceiling * 0.9 + sample * (ceiling * 0.1))
+
+    @pytest.mark.asyncio
     async def test_minsize_clamped_to_dust(self, randomized_wallet):
-        """Randomized minsize must never drop below the dust threshold."""
+        """The advertised minimum must never drop below the dust threshold."""
         from jmcore.constants import DUST_THRESHOLD
 
         cfg = MakerConfig(
@@ -1994,7 +2038,7 @@ class TestDualOfferAutoSplit:
 
         The auto-split must pin the abs.maxsize and rel.minsize to the exact
         intersection so the two offers stay seamless; randomization is still
-        applied to the *outer* (un-pinned) edges.
+        applied to the relative offer's maximum.
         """
         cfg = MakerConfig(
             mnemonic="test " * 12,
@@ -2007,7 +2051,7 @@ class TestDualOfferAutoSplit:
                     cj_fee_relative="0.001",
                     cjfee_factor=0.0,
                     txfee_contribution_factor=0.0,
-                    size_factor=0.2,  # randomize outer edges
+                    size_factor=0.2,  # randomize the relative maximum
                 ),
                 OfferConfig(
                     offer_type=OfferType.SW0_ABSOLUTE,
@@ -2029,6 +2073,7 @@ class TestDualOfferAutoSplit:
             # Seam stays exact regardless of randomization
             assert abs_.maxsize == 1_000_000
             assert rel.minsize == 1_000_000
+            assert abs_.minsize == 50_000
 
     def test_compute_overrides_helper_three_offers(self, wallet_10m):
         """Helper returns no overrides when there are not exactly two offers."""
@@ -2136,7 +2181,7 @@ class TestDualOfferAutoSplit:
                     cj_fee_absolute=1000,
                     cjfee_factor=0.0,
                     txfee_contribution_factor=0.0,
-                    size_factor=0.0,  # abs outer edge (minsize) is at dust threshold, not varied
+                    size_factor=0.0,  # the absolute offer's bounds stay fixed
                 ),
             ],
         )

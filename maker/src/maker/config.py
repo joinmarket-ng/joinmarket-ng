@@ -128,9 +128,8 @@ class OfferConfig(BaseModel):
         default=0.1,
         ge=0.0,
         description=(
-            "Randomization factor applied to minsize and maxsize on each offer "
-            "announcement. Set to 0 to disable. Default 0.1 matches the "
-            "upstream JoinMarket reference."
+            "Downward randomization factor applied only to maxsize on each offer "
+            "announcement. The minimum is not randomized. Set to 0 to disable. Default 0.1."
         ),
     )
 
@@ -298,7 +297,7 @@ class MakerConfig(WalletConfig):
         default=0.1,
         ge=0.0,
         description=(
-            "Randomization factor for minsize/maxsize in legacy single-offer mode. "
+            "Downward randomization factor for maxsize in legacy single-offer mode. "
             "See OfferConfig.size_factor."
         ),
     )
