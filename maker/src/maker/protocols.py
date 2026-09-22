@@ -185,6 +185,7 @@ class MakerBotProtocol(Protocol):
         message: str,
         level: str = "warning",
         interval: float = 10.0,
+        sensitive: bool = False,
     ) -> None: ...
 
     def _open_directory_outage(self) -> None: ...

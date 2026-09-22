@@ -2276,6 +2276,68 @@ class TestPendingConfirmationNotifications:
         assert pending_records[0][1]["sensitive"] is True
 
     @pytest.mark.asyncio
+    async def test_missing_pending_transactions_log_info_hourly_per_txid(
+        self, mock_wallet, config, tmp_path
+    ):
+        """Missing tx logs are quiet, while every pending tx keeps being checked."""
+        from datetime import datetime, timedelta
+
+        from jmwallet.history import TransactionHistoryEntry, append_history_entry
+        from loguru import logger
+
+        txids = ["ab" * 32, "cd" * 32]
+        for index, txid in enumerate(txids):
+            append_history_entry(
+                TransactionHistoryEntry(
+                    timestamp=(datetime.now() - timedelta(days=2)).isoformat(),
+                    role="maker",
+                    success=False,
+                    failure_reason="Pending confirmation",
+                    txid=txid,
+                    destination_address=f"bcrt1qmissing{index}",
+                    wallet_fingerprint="deadbeef",
+                    network="regtest",
+                ),
+                tmp_path,
+            )
+
+        backend = self._make_backend(confirmations=0)
+        backend.can_get_confirmations_by_txid.return_value = True
+        backend.get_transaction.return_value = None
+        bot = MakerBot(wallet=mock_wallet, backend=backend, config=config)
+        records: list[tuple[str, str, dict[str, object]]] = []
+        handler_id = logger.add(
+            lambda message: records.append(
+                (
+                    message.record["message"],
+                    message.record["level"].name,
+                    dict(message.record["extra"]),
+                )
+            )
+        )
+
+        clock = 10_000.0
+        try:
+            with patch("maker.bot.time.time", return_value=clock):
+                await bot._update_pending_history()
+            with patch("maker.bot.time.time", return_value=clock + 3599.0):
+                await bot._update_pending_history()
+            with patch("maker.bot.time.time", return_value=clock + 3600.0):
+                await bot._update_pending_history()
+        finally:
+            logger.remove(handler_id)
+
+        missing_records = [record for record in records if "not found after" in record[0]]
+        assert len(missing_records) == 4
+        assert all(record[1] == "INFO" for record in missing_records)
+        assert all(record[2]["sensitive"] is True for record in missing_records)
+        assert {txid[:16] for txid in txids} == {
+            message.split()[1].removesuffix("...") for message, _, _ in missing_records
+        }
+        assert backend.get_transaction.await_count == 6
+        assert {call.args[0] for call in backend.get_transaction.await_args_list} == set(txids)
+
+    @pytest.mark.asyncio
     async def test_notify_mempool_once_while_unconfirmed(self, mock_wallet, config, tmp_path):
         from unittest.mock import AsyncMock, patch
 

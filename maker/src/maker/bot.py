@@ -1362,7 +1362,12 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
                 listener_task.cancel()
 
     def _log_rate_limited(
-        self, key: str, message: str, level: str = "warning", interval: float = 10.0
+        self,
+        key: str,
+        message: str,
+        level: str = "warning",
+        interval: float = 10.0,
+        sensitive: bool = False,
     ) -> None:
         """
         Logs a message with rate limiting to prevent log spam.
@@ -1384,7 +1389,8 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         last_time = self._rate_limited_log_times.get(key, 0.0)
         if now - last_time >= interval:
             # Use getattr to call the correct logger method (e.g., logger.warning, logger.info)
-            log_method = getattr(logger, level, logger.warning)
+            target_logger = logger.bind(sensitive=True) if sensitive else logger
+            log_method = getattr(target_logger, level, target_logger.warning)
             log_method(message)
             self._rate_limited_log_times[key] = now
 

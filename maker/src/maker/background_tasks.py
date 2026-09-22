@@ -555,10 +555,13 @@ class BackgroundTasksMixin:
                     # A node may miss or evict a transaction that later confirms.
                     # Its absence cannot finalize the history row as failed.
                     if age_minutes > 30:
-                        # Log warning after 30 minutes
-                        logger.bind(sensitive=True).warning(
+                        self._log_rate_limited(
+                            f"pending-tx-not-found:{entry.txid}",
                             f"Transaction {entry.txid[:16]}... not found after "
-                            f"{age_minutes:.1f} minutes"
+                            f"{age_minutes:.1f} minutes",
+                            level="info",
+                            interval=3600.0,
+                            sensitive=True,
                         )
                     continue
 
