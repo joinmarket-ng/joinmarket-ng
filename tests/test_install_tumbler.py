@@ -150,5 +150,6 @@ def test_complete_profile_fetches_tumbler_lock_for_hash_verification() -> None:
         "maker/requirements.txt",
         "taker/requirements.txt",
         "tumbler/requirements.txt",
+        "jmwalletd/requirements.txt",
     ]
     assert any("--require-hashes" in line for line in _pip_lines(result))

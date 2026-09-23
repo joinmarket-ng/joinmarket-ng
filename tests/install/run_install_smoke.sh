@@ -23,7 +23,7 @@ echo "=== running install.sh against ref ${INSTALL_REF} ==="
 install_args=(-y --skip-tor --skip-verify --version "${INSTALL_REF}")
 case "${INSTALL_PROFILE}" in
     default)
-        expected_commands=(jm-wallet jm-tumbler jm-orderbook-watcher)
+        expected_commands=(jm-wallet jm-tumbler jmwalletd jm-orderbook-watcher)
         ;;
     taker)
         install_args+=(--taker)

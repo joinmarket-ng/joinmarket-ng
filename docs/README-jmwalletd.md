@@ -18,9 +18,12 @@ can talk to JoinMarket NG without modification.
 
 ## Installation
 
-`jmwalletd` is not installed by the `install.sh` installer. Install it from a
-clone of the repository in a virtualenv. It uses the maker, taker, and tumbler
-components at runtime, so install those too:
+The default complete profile of `install.sh` installs `jmwalletd`. On an older
+installation, first run `bash ~/.joinmarket-ng/install.sh --update` to refresh
+the saved installer, then run it again with `--update --jmwalletd` to add the
+daemon. Older saved installers do not recognize the new flag. Single-role
+installations can opt in with `--jmwalletd` (which also installs maker, taker,
+and tumbler). To install from a clone in a virtualenv instead:
 
 ```bash
 python -m venv jmvenv

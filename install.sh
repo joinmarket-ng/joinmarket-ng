@@ -1077,9 +1077,19 @@ prepare_dep_pinning() {
     # Only the components being installed contribute their locks. jmcore and
     # jmwallet are always installed; the remaining components are conditional.
     local pkgs=("jmcore" "jmwallet")
-    [[ "${INSTALL_MAKER:-true}" == "true" ]] && pkgs+=("maker")
-    [[ "${INSTALL_TAKER:-true}" == "true" ]] && pkgs+=("taker")
-    [[ "${INSTALL_TUMBLER:-false}" == "true" ]] && pkgs+=("tumbler")
+    # An already installed daemon needs its sibling packages even when the
+    # current update was invoked with a minimal role selection.
+    local daemon_installed=false
+    if pip show jmwalletd &> /dev/null; then
+        daemon_installed=true
+    fi
+    if [[ "${INSTALL_JMWALLETD:-false}" == "true" || "$daemon_installed" == "true" ]]; then
+        pkgs+=("maker" "taker" "tumbler" "jmwalletd")
+    else
+        [[ "${INSTALL_MAKER:-true}" == "true" ]] && pkgs+=("maker")
+        [[ "${INSTALL_TAKER:-true}" == "true" ]] && pkgs+=("taker")
+        [[ "${INSTALL_TUMBLER:-false}" == "true" ]] && pkgs+=("tumbler")
+    fi
     if [[ "${INSTALL_ORDERBOOK_WATCHER:-false}" == "true" ]] \
         || pip show joinmarket-orderbook-watcher &> /dev/null; then
         pkgs+=("orderbook_watcher")
@@ -1182,6 +1192,12 @@ apply_dep_pinning() {
 install_packages() {
     print_header "Installing JoinMarket-NG"
 
+    # Selection happens here, not at parse time: main may discover an
+    # existing venv and switch a fresh invocation to update mode.
+    if [[ "${INSTALL_TUMBLER:-false}" == "true" ]]; then
+        INSTALL_JMWALLETD=true
+    fi
+
     # Determine version to install
     if [[ -n "$INSTALL_VERSION" ]]; then
         VERSION="$INSTALL_VERSION"
@@ -1256,6 +1272,14 @@ install_packages() {
         print_success "Tumbler installed"
     fi
 
+    if [[ "${INSTALL_JMWALLETD:-false}" == "true" ]]; then
+        print_info "Installing jmwalletd..."
+        pip install "${git_base}#subdirectory=jmwalletd" \
+            "${git_base}#subdirectory=maker" "${git_base}#subdirectory=taker" \
+            "${git_base}#subdirectory=tumbler" "${pkg_extra[@]}" --quiet
+        print_success "jmwalletd installed"
+    fi
+
     if [[ "${INSTALL_ORDERBOOK_WATCHER:-false}" == "true" ]]; then
         print_info "Installing orderbook watcher..."
         pip install "${git_base}#subdirectory=orderbook_watcher" "${pkg_extra[@]}" --quiet
@@ -1317,6 +1341,7 @@ update_packages() {
     local maker_url="${git_base}#subdirectory=maker"
     local taker_url="${git_base}#subdirectory=taker"
     local tumbler_url="${git_base}#subdirectory=tumbler"
+    local jmwalletd_url="${git_base}#subdirectory=jmwalletd"
     local orderbook_watcher_url="${git_base}#subdirectory=orderbook_watcher"
 
     # Prepare dependency pinning anchored to the verified commit, then
@@ -1390,6 +1415,23 @@ update_packages() {
         pip install "$tumbler_url" "$core_url" "$wallet_url" "$maker_url" "$taker_url" \
             "${dep_extra[@]}" --quiet
         print_success "Tumbler installed"
+    fi
+
+    # An absent daemon on an older installation does not prove the previous
+    # profile. Only an explicit update flag adds it; existing installs update.
+    if pip show jmwalletd &> /dev/null; then
+        print_info "Updating jmwalletd..."
+        pip install --upgrade --force-reinstall --no-deps "$jmwalletd_url" --quiet
+        pip install --upgrade "$jmwalletd_url" "$core_url" "$wallet_url" \
+            "$maker_url" "$taker_url" "$tumbler_url" "${dep_extra[@]}" --quiet
+        print_success "jmwalletd updated"
+    elif [[ "${INSTALL_JMWALLETD:-false}" == "true" ]]; then
+        print_info "Installing jmwalletd..."
+        pip install "$jmwalletd_url" "$core_url" "$wallet_url" \
+            "$maker_url" "$taker_url" "$tumbler_url" "${dep_extra[@]}" --quiet
+        print_success "jmwalletd installed"
+    elif [[ "${INSTALL_TUMBLER:-false}" == "true" ]]; then
+        print_info "To add jmwalletd to this installation, rerun with --update --jmwalletd."
     fi
 
     # Preserve and update an existing watcher regardless of the selected
@@ -1989,6 +2031,8 @@ Options:
   --maker             Install maker component (installed by default)
   --taker             Install taker component (installed by default)
   --orderbook-watcher Install the orderbook watcher component
+  --jmwalletd         Install jmwalletd (and its maker/taker/tumbler dependencies)
+                      on fresh installations or opt in during updates
   --version VERSION   Install specific application version (default: latest)
                        The installer itself refreshes to the latest release.
   --dev               Install from main branch (for development)
@@ -2009,7 +2053,9 @@ Options:
 
 Note: When piped from curl, auto-confirm is enabled by default for Tor
       configuration and other prompts. Use --skip-tor to skip Tor setup.
-      By default, maker, taker, tumbler, and the orderbook watcher are installed.
+      By default, maker, taker, tumbler, jmwalletd, and the orderbook watcher
+      are installed on fresh installs. Updates only add jmwalletd with
+      --jmwalletd; already installed daemons are updated automatically.
       The first bootstrap trusts GitHub/HTTPS. Verified installs save a trusted
       copy at <data-dir>/install.sh for future updates. Unverified runs do not
       replace it. Older installations migrate with one final bootstrap run.
@@ -2046,6 +2092,7 @@ parse_args() {
     INSTALL_MAKER=""
     INSTALL_TAKER=""
     INSTALL_ORDERBOOK_WATCHER=""
+    INSTALL_JMWALLETD=false
     AUTO_YES=false
     SKIP_TOR=false
     INSTALL_VERSION=""
@@ -2080,6 +2127,13 @@ parse_args() {
                 ;;
             --orderbook-watcher)
                 INSTALL_ORDERBOOK_WATCHER=true
+                EXPLICIT_COMPONENTS=true
+                shift
+                ;;
+            --jmwalletd)
+                INSTALL_JMWALLETD=true
+                INSTALL_MAKER=true
+                INSTALL_TAKER=true
                 EXPLICIT_COMPONENTS=true
                 shift
                 ;;
