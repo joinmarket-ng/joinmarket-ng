@@ -32,7 +32,7 @@ python -m pip install -e ./jmcore -e ./jmwallet -e ./maker -e ./taker \
 Start the daemon:
 
 ```bash
-jmwalletd serve
+jmwalletd
 ```
 
 Defaults:
@@ -45,13 +45,13 @@ Common options:
 
 ```bash
 # run plain HTTP (useful in local Docker)
-jmwalletd serve --no-tls
+jmwalletd --no-tls
 
 # listen on all interfaces
-jmwalletd serve --host 0.0.0.0 --no-tls
+jmwalletd --host 0.0.0.0 --no-tls
 
 # custom data dir
-jmwalletd serve --data-dir /path/to/data
+jmwalletd --data-dir /path/to/data
 ```
 
 ## Configuration

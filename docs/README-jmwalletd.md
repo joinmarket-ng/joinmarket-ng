@@ -46,7 +46,7 @@ and neutrino, see the [Flatpak page](flatpak.md).
 Start the daemon:
 
 ```bash
-jmwalletd serve
+jmwalletd
 ```
 
 Defaults:
@@ -60,13 +60,13 @@ Common options:
 
 ```bash
 # run plain HTTP (useful behind a reverse proxy or in local Docker)
-jmwalletd serve --no-tls
+jmwalletd --no-tls
 
 # listen on all interfaces
-jmwalletd serve --host 0.0.0.0 --no-tls
+jmwalletd --host 0.0.0.0 --no-tls
 
 # custom data dir and config file
-jmwalletd serve --data-dir /path/to/data --config-file /path/to/config.toml
+jmwalletd --data-dir /path/to/data --config-file /path/to/config.toml
 ```
 
 The `JMWALLETD_HOST`, `JMWALLETD_NO_TLS`, `JOINMARKET_DATA_DIR`, and
