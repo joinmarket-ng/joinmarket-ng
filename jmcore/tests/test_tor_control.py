@@ -854,3 +854,103 @@ class TestTorControlClient:
             assert b"HiddenServicePoWDefensesEnabled" in setconf_data
 
             await client.close()
+
+
+async def _authenticated_client(tmp_path: Path, replies: list[bytes]) -> TorControlClient:
+    cookie_path = tmp_path / "control_auth_cookie"
+    cookie_path.write_bytes(b"validcookiedatav" * 2)
+    reader = AsyncMock()
+    reader.readline = AsyncMock(side_effect=[b"250 OK\r\n", *replies])
+    writer = MagicMock()
+    writer.wait_closed = AsyncMock()
+    writer.drain = AsyncMock()
+    with patch("asyncio.open_connection", return_value=(reader, writer)):
+        client = TorControlClient(cookie_path=cookie_path)
+        await client.connect()
+        await client.authenticate()
+    return client
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("replies", "expected"),
+    [
+        ([b"250-onions/current=abc\r\n", b"250 OK\r\n"], {"abc"}),
+        (
+            [b"250+onions/current=\r\n", b"abc\r\n", b"def\r\n", b".\r\n", b"250 OK\r\n"],
+            {"abc", "def"},
+        ),
+        ([b"551 No onion services of the specified type.\r\n"], set()),
+    ],
+)
+async def test_get_ephemeral_hidden_service_ids(
+    tmp_path: Path, replies: list[bytes], expected: set[str]
+) -> None:
+    client = await _authenticated_client(tmp_path, replies)
+    assert await client.get_ephemeral_hidden_service_ids() == expected
+
+
+@pytest.mark.asyncio
+async def test_get_ephemeral_hidden_service_ids_detects_closed_connection(
+    tmp_path: Path,
+) -> None:
+    client = await _authenticated_client(tmp_path, [b""])
+    with pytest.raises(TorControlError, match="Connection closed by Tor"):
+        await client.get_ephemeral_hidden_service_ids()
+
+
+@pytest.mark.asyncio
+async def test_get_ephemeral_hidden_service_ids_reports_filtered_command(
+    tmp_path: Path,
+) -> None:
+    from jmcore.tor_control import TorCommandRejectedError
+
+    client = await _authenticated_client(tmp_path, [b"510 Command filtered\r\n"])
+    with pytest.raises(TorCommandRejectedError):
+        await client.get_ephemeral_hidden_service_ids()
+
+
+@pytest.mark.asyncio
+async def test_truncated_data_block_fails_instead_of_spinning(tmp_path: Path) -> None:
+    client = await _authenticated_client(tmp_path, [b"250+onions/current=\r\n", b"abc\r\n", b""])
+    with pytest.raises(TorControlError, match="Connection closed by Tor"):
+        await client.get_ephemeral_hidden_service_ids()
+
+
+@pytest.mark.asyncio
+async def test_partial_reply_stops_later_commands_without_closing(tmp_path: Path) -> None:
+    import asyncio
+
+    stalled = asyncio.Event()
+    replies = [b"250-onions/current=abc\r\n"]
+
+    async def first_line_then_stall() -> bytes:
+        if replies:
+            return replies.pop(0)
+        await stalled.wait()
+        return b""
+
+    client = await _authenticated_client(tmp_path, [])
+    reader = client._reader
+    assert reader is not None
+    reader.readline = AsyncMock(side_effect=first_line_then_stall)
+
+    real_wait_for = asyncio.wait_for
+
+    async def short_wait_for(awaitable, timeout):  # type: ignore[no-untyped-def]
+        return await real_wait_for(awaitable, timeout=0.01)
+
+    with (
+        patch("jmcore.tor_control.asyncio.wait_for", side_effect=short_wait_for),
+        pytest.raises(TorControlError, match="Timeout"),
+    ):
+        await client.get_ephemeral_hidden_service_ids()
+
+    # The trailing "250 OK" of that reply may still arrive; it must not be
+    # read as the answer to the next command.
+    reader.readline = AsyncMock(return_value=b"250 OK\r\n")
+    with pytest.raises(TorControlError, match="out of sync"):
+        await client.get_ephemeral_hidden_service_ids()
+    assert client.is_connected
+    assert client._writer is not None
+    client._writer.close.assert_not_called()

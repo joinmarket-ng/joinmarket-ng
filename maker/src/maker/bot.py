@@ -33,6 +33,7 @@ from jmcore.tasks import parse_directory_address, spawn_task
 from jmcore.tor_control import (
     EphemeralHiddenService,
     TorAuthenticationError,
+    TorCommandRejectedError,
     TorControlClient,
     TorControlError,
 )
@@ -77,6 +78,13 @@ from maker.rate_limiting import (
 MAX_LOG_RATE_LIMIT_ENTRIES = 200000
 _DETACHED_SHUTDOWN_GRACE_SEC = 0.5
 MIN_FEE_POLICY_TTL_SEC = 60.0
+# How often to confirm Tor still publishes the current ephemeral onion, and
+# the cap for retry backoff while Tor cannot provide a replacement.
+TOR_ONION_CHECK_INTERVAL_SEC = 60.0
+TOR_ONION_RECOVERY_MAX_BACKOFF_SEC = 600.0
+# Consecutive failed checks required before replacing the identity, so one
+# slow control-port reply does not force a rotation.
+TOR_ONION_FAILURES_BEFORE_RECOVERY = 2
 
 
 def _get_fidelity_bond_linkable_utxos(
@@ -164,6 +172,9 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         self.current_generation_id = 0
         self._generation_lock = asyncio.Lock()
         self._identity_renewal_task: asyncio.Task[None] | None = None
+        self._tor_onion_monitor_task: asyncio.Task[None] | None = None
+        # Scheduled renewal and onion recovery must not rotate concurrently.
+        self._rotation_lock = asyncio.Lock()
 
         # Generic per-peer rate limiter (token bucket algorithm)
         # Generous burst (100 msgs) but low sustained rate (10 msg/s)
@@ -621,22 +632,40 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
             )
             directory_pool.clients = generation.directory_clients
             return generation
-        except Exception:
-            if directory_pool is not None:
-                await directory_pool.close_all()
-            if service is not None and tor_control is not None:
-                try:
-                    await tor_control.delete_ephemeral_hidden_service(service.service_id)
-                except Exception:
-                    pass
-            if tor_control is not None:
-                try:
-                    await tor_control.close()
-                except Exception:
-                    pass
-            if listener is not None:
-                await listener.stop()
+        except BaseException:
+            # Includes cancellation (maker shutdown during Tor setup): these
+            # resources are not yet owned by any generation, so nothing else
+            # would release them. Shutdown may cancel this task again, so the
+            # release runs as its own task and finishes regardless.
+            release = spawn_task(
+                self._release_unowned_generation_resources(
+                    directory_pool, tor_control, service, listener
+                )
+            )
+            await asyncio.shield(release)
             raise
+
+    @staticmethod
+    async def _release_unowned_generation_resources(
+        directory_pool: MakerDirectoryPool | None,
+        tor_control: TorControlClient | None,
+        service: EphemeralHiddenService | None,
+        listener: HiddenServiceListener | None,
+    ) -> None:
+        if directory_pool is not None:
+            await directory_pool.close_all()
+        if service is not None and tor_control is not None:
+            try:
+                await tor_control.delete_ephemeral_hidden_service(service.service_id)
+            except Exception:
+                pass
+        if tor_control is not None:
+            try:
+                await tor_control.close()
+            except Exception:
+                pass
+        if listener is not None:
+            await listener.stop()
 
     async def _close_generation(self, generation: MakerGeneration) -> None:
         """Close only resources owned by one retired generation."""
@@ -756,8 +785,21 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
             self._start_generation_listeners(old)
             self._resolve_directory_outage(len(old.directory_clients))
 
-    async def _rotate_generation(self) -> bool:
-        """Retire one identity, wait quietly, then publish its replacement."""
+    async def _rotate_generation(self, expected_generation_id: int | None = None) -> bool:
+        """Retire one identity, wait quietly, then publish its replacement.
+
+        With ``expected_generation_id``, a request that waited behind another
+        rotation is dropped (returning True) once that identity is already gone.
+        """
+        async with self._rotation_lock:
+            if (
+                expected_generation_id is not None
+                and self.current_generation_id != expected_generation_id
+            ):
+                return True
+            return await self._rotate_generation_locked()
+
+    async def _rotate_generation_locked(self) -> bool:
         replacement = await self._create_replacement_generation()
         if replacement is None:
             return False
@@ -869,6 +911,82 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
                     await self._rotate_generation()
                 except Exception as exc:
                     logger.warning(f"Maker identity renewal failed: {exc}")
+
+    async def _current_onion_is_published(self) -> bool | None:
+        """Whether Tor still lists the current generation's ephemeral onion.
+
+        Ephemeral onions are created non-detached, so Tor drops them silently
+        when their control connection closes (for example when Tor restarts).
+        Returns True when there is nothing to check, including mid-rotation,
+        and None when Tor refuses the query so liveness cannot be known.
+        """
+        generation = self._generation()
+        if generation is None or generation.state is not GenerationState.ACCEPTING:
+            return True
+        service = generation.ephemeral_hidden_service
+        tor_control = generation.tor_control
+        if service is None or tor_control is None:
+            return True
+        try:
+            service_ids = await tor_control.get_ephemeral_hidden_service_ids()
+        except TorCommandRejectedError as exc:
+            logger.bind(sensitive=True).debug(f"Tor refused onion check: {exc}")
+            return None
+        except (TorControlError, OSError) as exc:
+            logger.bind(sensitive=True).debug(f"Tor onion check failed: {exc}")
+            return False
+        return service.service_id in service_ids
+
+    async def _tor_onion_monitor(self) -> None:
+        """Replace the maker identity when Tor no longer holds its onion.
+
+        Without this, a maker whose Tor control connection dropped keeps
+        advertising a dead onion until the next scheduled renewal.
+        """
+        delay = TOR_ONION_CHECK_INTERVAL_SEC
+        failures = 0
+        failing_generation_id: int | None = None
+        while self.running:
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                return
+            if not self.running:
+                return
+            checked_generation_id = self.current_generation_id
+            published = await self._current_onion_is_published()
+            if published is None:
+                # A filtered control port (e.g. onion-grater) cannot prove the
+                # onion is gone, so never rotate on its answer.
+                logger.warning(
+                    "Tor control port refused the onion service check, "
+                    "disabling automatic onion recovery"
+                )
+                return
+            if published:
+                failures = 0
+                delay = TOR_ONION_CHECK_INTERVAL_SEC
+                continue
+            if checked_generation_id != failing_generation_id:
+                # Failures only count against the identity they were seen on.
+                failing_generation_id = checked_generation_id
+                failures = 0
+            failures += 1
+            if failures < TOR_ONION_FAILURES_BEFORE_RECOVERY:
+                continue
+            logger.error("Tor no longer holds the maker onion service, renewing maker identity")
+            try:
+                recovered = await self._rotate_generation(
+                    expected_generation_id=checked_generation_id
+                )
+            except Exception as exc:
+                logger.warning(f"Maker onion recovery failed: {exc}")
+                recovered = False
+            if recovered:
+                failures = 0
+                delay = TOR_ONION_CHECK_INTERVAL_SEC
+            else:
+                delay = min(delay * 2, TOR_ONION_RECOVERY_MAX_BACKOFF_SEC)
 
     def _start_generation_listeners(self, generation: MakerGeneration) -> None:
         for node_id, client in generation.directory_clients.items():
@@ -1255,6 +1373,12 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
             )
             self.listen_tasks.append(self._identity_renewal_task)
 
+            if self._ephemeral_hidden_service is not None:
+                self._tor_onion_monitor_task = asyncio.create_task(
+                    self._tor_onion_monitor(), name="maker-tor-onion-monitor"
+                )
+                self.listen_tasks.append(self._tor_onion_monitor_task)
+
             # Start periodic summary notification task (if enabled)
             notifier = get_notifier()
             if notifier.config.notify_summary:
@@ -1279,8 +1403,10 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         """Stop the maker bot"""
         logger.info("Stopping maker bot...")
         self.running = False
-        if self._identity_renewal_task is not None:
-            self._identity_renewal_task.cancel()
+        # Either task may be mid-rotation; cancel both so rollback runs first.
+        for rotation_task in (self._identity_renewal_task, self._tor_onion_monitor_task):
+            if rotation_task is not None:
+                rotation_task.cancel()
 
         # Stop the dedicated reaper, then independently expire every exact
         # session object. Handler cancellation and cleanup are bounded inside

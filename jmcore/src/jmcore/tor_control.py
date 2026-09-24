@@ -41,6 +41,12 @@ class TorHiddenServiceError(TorControlError):
     pass
 
 
+class TorCommandRejectedError(TorControlError):
+    """Tor (or a control-port filter) answered a command with an error status."""
+
+    pass
+
+
 @dataclass
 class HiddenServiceDoSConfig:
     """
@@ -241,6 +247,11 @@ class TorControlClient:
         self._authenticated = False
         self._read_lock = asyncio.Lock()
         self._write_lock = asyncio.Lock()
+        # Set when a reply was only partly read. Later replies could then be
+        # attributed to the wrong command, so the connection stops accepting
+        # commands. The socket stays open: closing it would drop every
+        # non-detached onion service it owns.
+        self._out_of_sync = False
 
         # Track created hidden services for cleanup
         self._hidden_services: list[EphemeralHiddenService] = []
@@ -274,6 +285,7 @@ class TorControlClient:
                 timeout=10.0,
             )
             self._connected = True
+            self._out_of_sync = False
             logger.bind(sensitive=True).info(
                 f"Connected to Tor control port at {self.control_host}:{self.control_port}"
             )
@@ -311,6 +323,8 @@ class TorControlClient:
         """Send a command to Tor control port."""
         if not self._connected or not self._writer:
             raise TorControlError("Not connected to Tor control port")
+        if self._out_of_sync:
+            raise TorControlError("Tor control connection is out of sync")
 
         async with self._write_lock:
             logger.trace("Tor control command sent")
@@ -328,48 +342,50 @@ class TorControlClient:
         if not self._connected or not self._reader:
             raise TorControlError("Not connected to Tor control port")
 
-        responses: list[tuple[str, str, str]] = []
-
         async with self._read_lock:
-            while True:
-                try:
-                    line = await asyncio.wait_for(self._reader.readline(), timeout=30.0)
-                except TimeoutError as e:
-                    raise TorControlError("Timeout reading from Tor control port") from e
+            try:
+                return await self._read_reply_lines()
+            except TorControlError:
+                self._out_of_sync = True
+                raise
 
-                if not line:
-                    raise TorControlError("Connection closed by Tor")
+    async def _read_line(self) -> str:
+        assert self._reader is not None
+        try:
+            line = await asyncio.wait_for(self._reader.readline(), timeout=30.0)
+        except TimeoutError as e:
+            raise TorControlError("Timeout reading from Tor control port") from e
+        if not line:
+            raise TorControlError("Connection closed by Tor")
+        return line.decode("utf-8").rstrip("\r\n")
 
-                line_str = line.decode("utf-8").rstrip("\r\n")
-                logger.trace("Tor control response received")
+    async def _read_reply_lines(self) -> list[tuple[str, str, str]]:
+        responses: list[tuple[str, str, str]] = []
+        while True:
+            line_str = await self._read_line()
+            logger.trace("Tor control response received")
 
-                if len(line_str) < 4:
-                    raise TorControlError(f"Invalid response format: {line_str}")
+            if len(line_str) < 4:
+                raise TorControlError(f"Invalid response format: {line_str}")
 
-                status_code = line_str[:3]
-                separator = line_str[3]
-                message = line_str[4:]
+            status_code = line_str[:3]
+            separator = line_str[3]
+            message = line_str[4:]
 
-                responses.append((status_code, separator, message))
+            responses.append((status_code, separator, message))
 
-                # Handle multi-line data responses (status+data)
-                if separator == "+":
-                    # Read until we see a line with just "."
-                    data_lines: list[str] = []
-                    while True:
-                        data_line = await self._reader.readline()
-                        data_str = data_line.decode("utf-8").rstrip("\r\n")
-                        if data_str == ".":
-                            break
-                        data_lines.append(data_str)
-                    # Store data as message content
-                    responses[-1] = (status_code, separator, "\n".join(data_lines))
+            # Handle multi-line data responses (status+data)
+            if separator == "+":
+                # Read until we see a line with just "."
+                data_lines: list[str] = []
+                while (data_str := await self._read_line()) != ".":
+                    data_lines.append(data_str)
+                # Store data as message content
+                responses[-1] = (status_code, separator, "\n".join(data_lines))
 
-                # Single line or last line of multi-line response
-                if separator == " ":
-                    break
-
-        return responses
+            # Single line or last line of multi-line response
+            if separator == " ":
+                return responses
 
     async def _command(self, command: str) -> list[tuple[str, str, str]]:
         """Send command and read response."""
@@ -386,7 +402,7 @@ class TorControlClient:
         # Check the last response (final status)
         status_code, _, message = responses[-1]
         if status_code != expected_code:
-            raise TorControlError(f"Tor command failed: {status_code} {message}")
+            raise TorCommandRejectedError(f"Tor command failed: {status_code} {message}")
 
     async def authenticate(self) -> None:
         """
@@ -658,6 +674,38 @@ class TorControlClient:
 
         # Remove from tracking
         self._hidden_services = [hs for hs in self._hidden_services if hs.service_id != service_id]
+
+    async def get_ephemeral_hidden_service_ids(self) -> set[str]:
+        """Return the ephemeral onion service IDs owned by this control connection.
+
+        Non-detached services created with ``ADD_ONION`` are listed here only
+        while this control connection stays open, so this doubles as a check
+        that the connection and its services are still alive. Raises
+        ``TorCommandRejectedError`` when Tor or a control-port filter refuses
+        the query, and ``TorControlError`` when the connection is closed or
+        unresponsive.
+        """
+        if not self._authenticated:
+            raise TorControlError("Not authenticated")
+
+        responses = await self._command("GETINFO onions/current")
+        status_code, _, message = responses[-1]
+        if status_code == "551" and "No onion services" in message:
+            return set()
+        self._check_success(responses)
+
+        service_ids: set[str] = set()
+        for status, separator, line in responses:
+            if status != "250":
+                continue
+            if separator == "+":
+                # Multi-line data block: one service ID per line.
+                service_ids.update(item.strip() for item in line.splitlines() if item.strip())
+            elif line.startswith("onions/current="):
+                value = line.split("=", 1)[1].strip()
+                if value:
+                    service_ids.add(value)
+        return service_ids
 
     async def get_version(self) -> str:
         """Get Tor version string."""

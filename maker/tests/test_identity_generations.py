@@ -16,7 +16,15 @@ from jmcore.models import NetworkType
 from jmcore.network import HiddenServiceListener, TCPConnection, connect_direct
 from jmcore.protocol import JM_VERSION, MessageType
 
-from maker.bot import MakerBot
+from maker.bot import (
+    TOR_ONION_CHECK_INTERVAL_SEC as CHECK_SEC,
+)
+from maker.bot import (
+    TOR_ONION_RECOVERY_MAX_BACKOFF_SEC as MAX_BACKOFF_SEC,
+)
+from maker.bot import (
+    MakerBot,
+)
 from maker.coinjoin import CoinJoinState
 from maker.config import MakerConfig
 from maker.directory_pool import MakerDirectoryPool
@@ -1165,3 +1173,279 @@ async def test_directory_status_reports_rotation_gap_as_info(
     assert len(status) == 1
     assert status[0][0] == level
     assert fragment in status[0][1]
+
+
+def _with_onion(bot: MakerBot, tor_control: MagicMock) -> MakerGeneration:
+    from jmcore.tor_control import EphemeralHiddenService
+
+    generation = bot._generation()
+    assert generation is not None
+    generation.tor_control = tor_control
+    generation.ephemeral_hidden_service = EphemeralHiddenService(service_id="abc")
+    return generation
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("listed", "error", "state", "expected"),
+    [
+        ({"abc"}, None, GenerationState.ACCEPTING, True),
+        ({"other"}, None, GenerationState.ACCEPTING, False),
+        (set(), None, GenerationState.ACCEPTING, False),
+        (None, "closed", GenerationState.ACCEPTING, False),
+        (None, "reset", GenerationState.ACCEPTING, False),
+        (None, "rejected", GenerationState.ACCEPTING, None),
+        (set(), None, GenerationState.GRACE, True),
+    ],
+)
+async def test_current_onion_is_published(
+    bot: MakerBot,
+    listed: set[str] | None,
+    error: str | None,
+    state: GenerationState,
+    expected: bool | None,
+) -> None:
+    from jmcore.tor_control import TorCommandRejectedError, TorControlError
+
+    tor_control = MagicMock()
+    side_effect = {
+        "closed": TorControlError("Connection closed by Tor"),
+        "reset": ConnectionResetError(),
+        "rejected": TorCommandRejectedError("Tor command failed: 510 Command filtered"),
+        None: None,
+    }[error]
+    tor_control.get_ephemeral_hidden_service_ids = AsyncMock(
+        return_value=listed, side_effect=side_effect
+    )
+    generation = _with_onion(bot, tor_control)
+    generation.state = state
+
+    assert await bot._current_onion_is_published() is expected
+
+
+@pytest.mark.asyncio
+async def test_current_onion_check_skips_makers_without_ephemeral_onion(bot: MakerBot) -> None:
+    assert await bot._current_onion_is_published() is True
+
+
+async def _run_onion_monitor(
+    bot: MakerBot, checks: list[bool | None], rotations: list[bool]
+) -> list[float]:
+    """Run the monitor over scripted check results; return the sleep delays."""
+    rotate = AsyncMock(side_effect=rotations)
+    delays = await _run_onion_monitor_with(bot, checks, rotate)
+    assert rotate.await_count == len(rotations)
+    return delays
+
+
+async def _run_onion_monitor_with(
+    bot: MakerBot, checks: list[bool | None], rotate: AsyncMock
+) -> list[float]:
+    bot.running = True
+    delays: list[float] = []
+    remaining = list(checks)
+
+    async def fake_sleep(delay: float) -> None:
+        delays.append(delay)
+        if not remaining:
+            bot.running = False
+
+    async def fake_check() -> bool | None:
+        return remaining.pop(0)
+
+    with (
+        patch("maker.bot.asyncio.sleep", side_effect=fake_sleep),
+        patch.object(bot, "_current_onion_is_published", side_effect=fake_check),
+        patch.object(bot, "_rotate_generation", rotate),
+    ):
+        await bot._tor_onion_monitor()
+    return delays
+
+
+@pytest.mark.asyncio
+async def test_onion_monitor_ignores_single_failed_check(bot: MakerBot) -> None:
+    await _run_onion_monitor(bot, [True, False, True, False, True], rotations=[])
+
+
+@pytest.mark.asyncio
+async def test_onion_monitor_renews_identity_after_repeated_failures(bot: MakerBot) -> None:
+
+    delays = await _run_onion_monitor(bot, [False, False, True], rotations=[True])
+    assert delays == [
+        CHECK_SEC,
+        CHECK_SEC,
+        CHECK_SEC,
+        CHECK_SEC,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_onion_monitor_backs_off_while_recovery_fails(bot: MakerBot) -> None:
+
+    delays = await _run_onion_monitor(
+        bot, [False] * 7, rotations=[False, False, False, False, False, False]
+    )
+    assert delays[:3] == [
+        CHECK_SEC,
+        CHECK_SEC,
+        CHECK_SEC * 2,
+    ]
+    assert max(delays) == MAX_BACKOFF_SEC
+
+
+@pytest.mark.asyncio
+async def test_rotations_are_serialized(bot: MakerBot) -> None:
+    active = 0
+    peak = 0
+
+    async def fake_rotation() -> bool:
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0.01)
+        active -= 1
+        return True
+
+    with patch.object(bot, "_rotate_generation_locked", side_effect=fake_rotation):
+        results = await asyncio.gather(bot._rotate_generation(), bot._rotate_generation())
+
+    assert results == [True, True]
+    assert peak == 1
+
+
+@pytest.mark.asyncio
+async def test_onion_monitor_stops_when_tor_refuses_the_check(bot: MakerBot) -> None:
+
+    delays = await _run_onion_monitor(bot, [False, None, False, False], rotations=[])
+    assert delays == [CHECK_SEC, CHECK_SEC]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["authenticate", "create_ephemeral_hidden_service"])
+async def test_replacement_construction_releases_resources_on_cancel(
+    bot: MakerBot, stage: str
+) -> None:
+    bot.config.tor_control.enabled = True
+    entered = asyncio.Event()
+
+    async def block(*_args: object, **_kwargs: object) -> None:
+        entered.set()
+        await asyncio.Event().wait()
+
+    tor = AsyncMock()
+    setattr(tor, stage, AsyncMock(side_effect=block))
+    listeners: list[HiddenServiceListener] = []
+    real_listener = HiddenServiceListener
+
+    def make_listener(**kwargs: object) -> HiddenServiceListener:
+        listener = real_listener(**kwargs)  # type: ignore[arg-type]
+        listeners.append(listener)
+        return listener
+
+    with (
+        patch("maker.bot.TorControlClient", return_value=tor),
+        patch("maker.bot.HiddenServiceListener", side_effect=make_listener),
+        patch.object(OfferManager, "create_offers", new=AsyncMock(return_value=[])),
+    ):
+        task = asyncio.create_task(bot._create_replacement_generation())
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert len(listeners) == 1
+    assert not listeners[0].running
+    assert listeners[0].server is None
+    tor.close.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_rotation_request_for_replaced_identity_is_dropped(bot: MakerBot) -> None:
+    with patch.object(bot, "_rotate_generation_locked", AsyncMock(return_value=True)) as rotate:
+        assert await bot._rotate_generation(expected_generation_id=7) is True
+        rotate.assert_not_awaited()
+        assert await bot._rotate_generation(expected_generation_id=bot.current_generation_id)
+        rotate.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_onion_monitor_failures_do_not_carry_across_identities(bot: MakerBot) -> None:
+    bot.running = True
+    checks = [False, False]
+
+    async def fake_sleep(_delay: float) -> None:
+        if not checks:
+            bot.running = False
+
+    async def fake_check() -> bool:
+        # Each failure is seen on a different identity (e.g. scheduled
+        # renewal replaced the first one between checks).
+        bot.current_generation_id += 1
+        return checks.pop(0)
+
+    with (
+        patch("maker.bot.asyncio.sleep", side_effect=fake_sleep),
+        patch.object(bot, "_current_onion_is_published", side_effect=fake_check),
+        patch.object(bot, "_rotate_generation", AsyncMock(return_value=True)) as rotate,
+    ):
+        await bot._tor_onion_monitor()
+
+    rotate.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_onion_monitor_recovery_targets_the_failing_identity(bot: MakerBot) -> None:
+    bot.current_generation_id = 3
+    with patch.object(bot, "_rotate_generation", AsyncMock(return_value=True)) as rotate:
+        await _run_onion_monitor_with(bot, [False, False], rotate)
+    rotate.assert_awaited_once_with(expected_generation_id=3)
+
+
+@pytest.mark.asyncio
+async def test_replacement_cleanup_survives_repeated_cancellation(bot: MakerBot) -> None:
+    """stop() cancels a rotating task twice; the second must not skip cleanup."""
+    bot.config.tor_control.enabled = True
+    entered = asyncio.Event()
+    closing = asyncio.Event()
+    release_close = asyncio.Event()
+
+    async def block_auth() -> None:
+        entered.set()
+        await asyncio.Event().wait()
+
+    async def slow_close() -> None:
+        closing.set()
+        await release_close.wait()
+
+    tor = AsyncMock()
+    tor.authenticate = AsyncMock(side_effect=block_auth)
+    tor.close = AsyncMock(side_effect=slow_close)
+    listeners: list[HiddenServiceListener] = []
+    real_listener = HiddenServiceListener
+
+    def make_listener(**kwargs: object) -> HiddenServiceListener:
+        listener = real_listener(**kwargs)  # type: ignore[arg-type]
+        listeners.append(listener)
+        return listener
+
+    with (
+        patch("maker.bot.TorControlClient", return_value=tor),
+        patch("maker.bot.HiddenServiceListener", side_effect=make_listener),
+        patch.object(OfferManager, "create_offers", new=AsyncMock(return_value=[])),
+    ):
+        task = asyncio.create_task(bot._create_replacement_generation())
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        task.cancel()
+        await asyncio.wait_for(closing.wait(), timeout=2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert listeners[0].running
+        release_close.set()
+        for _ in range(10):
+            if not listeners[0].running:
+                break
+            await asyncio.sleep(0)
+
+    assert not listeners[0].running
+    assert listeners[0].server is None

@@ -132,6 +132,30 @@ that UTXO in the CoinJoin rather than revealing a separate unspent coin. Manual
 and explicit input selection remain authoritative and can fail when the chosen
 set has no fresh commitment.
 
+## Maker Identity Renewal
+
+A maker periodically replaces its nick, ephemeral onion service, and
+directory connections, at a random interval of 12 to 24 hours by default
+(`identity_renewal_min_sec` / `identity_renewal_max_sec`). The replacement
+offers are built fresh, so their randomized fees and maximum size differ from
+the previous ones.
+
+The old identity first stops accepting new direct connections, keeps its
+directory routes for a grace period so in-flight rounds can finish, then
+disconnects from every directory. After a random quiet interval the new
+identity connects. The gap makes it harder to link the two nicks by timing,
+so the maker briefly shows no connected directories. This is expected: it is
+logged as rotation progress and does not send a disconnection notification.
+
+Ephemeral onions exist only while the maker's Tor control connection stays
+open. Every minute the maker asks Tor whether that connection still owns its
+onion. This detects a lost control connection (for example after a Tor
+restart); it does not prove the onion descriptor is published or reachable.
+After two failed checks on the same identity the maker renews its identity
+early instead of advertising a dead onion until the next scheduled renewal.
+If the control port refuses the check, as some filtering proxies do, the maker
+disables this recovery rather than treating the refusal as an outage.
+
 ## Fidelity Bonds
 
 Fidelity bonds let makers prove that they have locked bitcoin. Takers can use
