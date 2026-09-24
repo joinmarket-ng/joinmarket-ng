@@ -329,13 +329,16 @@ class HiddenServiceListener:
         """Stop accepting sockets; the caller owns existing connections."""
         async with self._lifecycle_lock:
             self.running = False
-            if self.server:
-                # close() releases the listening sockets immediately. wait_closed()
-                # would also wait for accepted connections, blocking maker rotation
-                # before its session drain and grace-period retirement can run.
-                self.server.close()
-                self.server = None
+            server, self.server = self.server, None
             self._stopped.set()
+            if server is None:
+                # Already stopped (maker rotation stops the old listener at
+                # rotation start and again at retirement). Stay quiet.
+                return
+            # close() releases the listening sockets immediately. wait_closed()
+            # would also wait for accepted connections, blocking maker rotation
+            # before its session drain and grace-period retirement can run.
+            server.close()
         logger.info("Hidden service listener stopped")
 
     def serve_forever(self) -> Coroutine[Any, Any, None]:

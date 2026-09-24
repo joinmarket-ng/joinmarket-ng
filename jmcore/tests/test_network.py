@@ -134,6 +134,25 @@ async def test_listener_stop_closes_in_progress_bind() -> None:
 
 
 @pytest.mark.asyncio
+async def test_listener_logs_stop_only_when_it_closes_a_server() -> None:
+    messages: list[str] = []
+    handler = logger.add(lambda message: messages.append(str(message.record["message"])))
+    listener = HiddenServiceListener()
+    try:
+        await listener.stop()
+        await listener.start()
+        await listener.stop()
+        await listener.stop()
+    finally:
+        logger.remove(handler)
+        await listener.stop()
+
+    assert messages.count("Hidden service listener stopped") == 1
+    assert not listener.running
+    assert listener.server is None
+
+
+@pytest.mark.asyncio
 async def test_tcp_connection_send():
     reader = AsyncMock()
     writer = Mock()

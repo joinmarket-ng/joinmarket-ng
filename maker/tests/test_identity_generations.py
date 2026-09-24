@@ -1125,3 +1125,43 @@ async def test_shutdown_closes_every_generation(bot: MakerBot) -> None:
     assert bot.generations == {}
     old_client.close.assert_awaited_once_with()
     new_client.close.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("state", "level", "fragment"),
+    [
+        (GenerationState.GRACE, "INFO", "identity rotation in progress"),
+        (GenerationState.ACCEPTING, "WARNING", "0/1 connected. Disconnected"),
+    ],
+)
+async def test_directory_status_reports_rotation_gap_as_info(
+    bot: MakerBot, state: GenerationState, level: str, fragment: str
+) -> None:
+    from loguru import logger
+
+    generation = bot._generation()
+    assert generation is not None
+    generation.state = state
+    bot.running = True
+    records: list[tuple[str, str]] = []
+    handler = logger.add(
+        lambda message: records.append(
+            (message.record["level"].name, str(message.record["message"]))
+        )
+    )
+
+    async def fake_sleep(delay: float) -> None:
+        if delay == 600:
+            bot.running = False
+
+    try:
+        with patch("maker.background_tasks.asyncio.sleep", side_effect=fake_sleep):
+            await bot._periodic_directory_connection_status()
+    finally:
+        logger.remove(handler)
+
+    status = [record for record in records if record[1].startswith("Directory connection status:")]
+    assert len(status) == 1
+    assert status[0][0] == level
+    assert fragment in status[0][1]

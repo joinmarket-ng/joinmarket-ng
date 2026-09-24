@@ -220,7 +220,15 @@ class BackgroundTasksMixin:
                     server for server, _node_id in self._directory_pool.list_disconnected()
                 ]
 
-                if disconnected_servers:
+                generation = self._generation()
+                if generation is not None and generation.state is GenerationState.GRACE:
+                    # Identity rotation deliberately drops the old nick from every
+                    # directory before the replacement connects. Not an outage.
+                    logger.info(
+                        f"Directory connection status: identity rotation in progress "
+                        f"({connected_count}/{total_servers} connected for the retiring identity)"
+                    )
+                elif disconnected_servers:
                     disconnected_str = ", ".join(disconnected_servers[:5])
                     if len(disconnected_servers) > 5:
                         disconnected_str += f", ... and {len(disconnected_servers) - 5} more"
