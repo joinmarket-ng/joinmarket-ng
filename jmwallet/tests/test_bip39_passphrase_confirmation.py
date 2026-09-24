@@ -45,7 +45,8 @@ def test_prompt_confirms_wallet_before_backend_access(
     assert "Continue with this wallet?" in result.output
     if passphrase:
         assert passphrase not in result.output
-    if answer == "y":
+    # Empty answer accepts the default (Yes); EOF (no answer) aborts.
+    if answer in ("y", ""):
         assert result.exit_code == 0, result.output
         show_info.assert_awaited_once()
         assert show_info.call_args.args[2] == passphrase
@@ -112,7 +113,7 @@ def test_confirmation_without_typer(
             side_effect=answer if isinstance(answer, BaseException) else None,
         ),
     ):
-        if answer == "yes":
+        if answer in ("yes", ""):
             _confirm_prompted_wallet(MNEMONIC, "test secret passphrase")
         else:
             with pytest.raises(ValueError, match="Wallet selection cancelled"):
@@ -144,9 +145,7 @@ def test_core_only_confirmation_still_requires_consent(
         else:
             with pytest.raises(typer.Abort):
                 resolve_mnemonic(settings, mnemonic=MNEMONIC, prompt_bip39_passphrase=True)
-        confirmation.assert_called_once_with(
-            "Continue with this wallet?", default=False, abort=True
-        )
+        confirmation.assert_called_once_with("Continue with this wallet?", default=True, abort=True)
     output = capsys.readouterr().out
     assert "BIP39 passphrase: set" in output
     assert "Wallet fingerprint unavailable" in output

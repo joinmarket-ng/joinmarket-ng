@@ -943,14 +943,14 @@ def _confirm_prompted_wallet(mnemonic: str, passphrase: str) -> None:
     except ImportError:
         print(message)
         try:
-            answer = input("Continue with this wallet? [y/N]: ")
+            answer = input("Continue with this wallet? [Y/n]: ")
         except (EOFError, KeyboardInterrupt):
             raise ValueError("Wallet selection cancelled") from None
-        if answer.strip().lower() not in ("y", "yes"):
+        if answer.strip().lower() not in ("", "y", "yes"):
             raise ValueError("Wallet selection cancelled") from None
     else:
         typer.echo(message)
-        typer.confirm("Continue with this wallet?", default=False, abort=True)
+        typer.confirm("Continue with this wallet?", default=True, abort=True)
 
 
 def resolve_bip39_passphrase(

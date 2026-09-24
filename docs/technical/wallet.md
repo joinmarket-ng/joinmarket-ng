@@ -33,7 +33,7 @@ BIP39_PASSPHRASE="my phrase" jm-wallet info
 When `--prompt-bip39-passphrase` prompts interactively, input stays hidden.
 After you press Enter, the CLI displays whether the passphrase is set or empty
 and the derived JoinMarket wallet fingerprint. It asks `Continue with this wallet?`
-before loading or scanning the wallet; the default is No. Compare the fingerprint
+before loading or scanning the wallet; the default is Yes. Compare the fingerprint
 with the one shown by a previous `jm-wallet info` invocation for the intended
 wallet. This identifies the wallet but cannot verify that a passphrase is correct:
 every passphrase derives a valid wallet.

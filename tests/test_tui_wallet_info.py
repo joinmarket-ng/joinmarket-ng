@@ -162,7 +162,8 @@ with patch('jmwallet.cli.wallet._show_wallet_info', show_info):
     )
     result = _run_test_shell(
         ["bash", str(shell_path)],
-        input_text=passphrase + ("\ny\n" if confirm else "\nn\n"),
+        # Confirm by pressing Enter to exercise the default-Yes prompt.
+        input_text=passphrase + ("\n\n" if confirm else "\nn\n"),
         env=env,
         timeout=30,
     )
