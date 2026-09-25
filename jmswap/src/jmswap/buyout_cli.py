@@ -75,6 +75,8 @@ from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import Annotated, Any, Self
 
+from jmcore import experimental
+from jmcore.experimental import experimental_warnings
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from jmswap.buyout_chain import ChainError
@@ -369,6 +371,8 @@ def _dispatch(arguments: argparse.Namespace) -> None:
     if not settings.enabled:
         # Acting requires an affirmative `enabled`; nothing is opened here.
         raise CommandError(DISABLED_CONTEXT)
+    for line in experimental_warnings([experimental.CHANNEL_BUYOUT], str(settings.network)):
+        print(line, file=sys.stderr)
     if arguments.command == "serve":
         with _sanitized(SERVE_CONTEXT):
             asyncio.run(_serve(settings, counterparty=arguments.counterparty))

@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 from typing import Literal
 
+from jmcore import experimental
 from jmcore.credential_market import (
     CredentialPackage,
     MarketError,
@@ -17,6 +18,7 @@ from jmcore.credential_market import (
     verify_authorization,
 )
 from jmcore.crypto import NickIdentity
+from jmcore.experimental import warn_experimental
 from jmcore.external_podle import ExternalPoDLE
 from jmcore.market_faults import MarketFaultCache
 from jmcore.market_store import MarketStore, MarketStoreUnavailableError
@@ -186,6 +188,7 @@ class WalletMarketSeller:
         )
         self._transport = transport
         self._nickname = transport.nick
+        warn_experimental([experimental.CREDENTIAL_MARKET], str(self.wallet.network))
 
         # The configured timeout governs Tor relay connection setup. Wallet bond
         # verification remains outside this window so it completes its full chain check.
