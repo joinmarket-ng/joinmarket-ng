@@ -1,0 +1,340 @@
+# Four-party co-funded channel-ring regtest stack (three makers plus one taker).
+#
+# LND runs the patched image built by lnd/Dockerfile, the same backend the
+# channel-buyout regtest suite uses, so a ring open and a later buyout exercise
+# one LND build instead of two.
+x-lnd: &lnd
+  image: ${JM_BUYOUT_LND_IMAGE:-jm-buyout-lnd:v0.21.3-beta}
+  entrypoint: ["/bin/sh", "/scripts/ring-e2e-lnd.sh"]
+  restart: "no"
+  volumes:
+    - ../scripts:/scripts:ro
+    - ${RING_E2E_DATA_DIR:-../tmp/ring-e2e}/tor:/tor:ro
+  networks: [ring-network]
+  depends_on:
+    ring-bitcoin:
+      condition: service_healthy
+    ring-tor:
+      condition: service_healthy
+  healthcheck:
+    test:
+      - CMD-SHELL
+      - >-
+        lncli --network=regtest
+        --tlscertpath=/root/.lnd/tls.cert
+        --macaroonpath=/root/.lnd/admin.macaroon
+        getinfo >/dev/null 2>&1
+    interval: 2s
+    timeout: 3s
+    retries: 90
+  profiles: [ring-e2e]
+
+x-maker-environment: &maker-environment
+  NETWORK_CONFIG__NETWORK: regtest
+  NETWORK_CONFIG__BITCOIN_NETWORK: regtest
+  BITCOIN__BACKEND_TYPE: descriptor_wallet
+  BITCOIN__RPC_URL: http://ring-bitcoin:18443
+  BITCOIN__RPC_USER: test
+  BITCOIN__RPC_PASSWORD: test
+  DIRECTORY_SERVERS: ring-directory:5222
+  LOGGING__LEVEL: DEBUG
+  WALLET__ADDRESS_TYPE: p2tr
+  MAKER__OFFER_TYPE: tr0absoffer
+  MAKER__MIN_SIZE: 100000
+  MAKER__CJ_FEE_ABSOLUTE: 100
+  # Absolute wire fee is CJ fee plus tx contribution: 100 + 400 = 500 sats.
+  MAKER__TX_FEE_CONTRIBUTION: 400
+  MAKER__TXFEE_CONTRIBUTION_FACTOR: 0
+  MAKER__SIZE_FACTOR: 0
+  MAKER__NO_FIDELITY_BOND: "true"
+  MAKER__OFFER_REANNOUNCE_DELAY_MAX: 0
+  # Keep the session routable through a ring phase timeout and cancellation.
+  MAKER__SESSION_TIMEOUT_SEC: 900
+  MAKER__PRE_SIGN_TIMEOUT_SEC: 900
+  MAKER__ONION_SERVING_HOST: 0.0.0.0
+  MAKER__CHANNEL_RING__ENABLED: "true"
+  MAKER__CHANNEL_RING__LND_GRPC_URL: https://127.0.0.1:10009
+  MAKER__CHANNEL_RING__MINIMUM_MAKERS: 3
+  MAKER__CHANNEL_RING__MIN_CHANNEL_CAPACITY: 1000000
+  MAKER__CHANNEL_RING__MAX_CHANNEL_CAPACITY: 20000000
+  MAKER__CHANNEL_RING__MAX_PUSH: 500000
+  MAKER__CHANNEL_RING__OPENER_RESERVE: 10000
+  MAKER__CHANNEL_RING__FUNDEE_RESERVE: 10000
+  MAKER__CHANNEL_RING__MAXIMUM_COMMITMENT_FEE: 100000
+  MAKER__CHANNEL_RING__SPENDABLE_MARGIN: 100000
+  MAKER__CHANNEL_RING__CONFIRMATION_DEPTH: 3
+  MAKER__CHANNEL_RING__ALLOWED_CSV_DELAYS: '[144]'
+  MAKER__CHANNEL_RING__MINIMUM_CSV_DELAY: 144
+  MAKER__CHANNEL_RING__MAXIMUM_CSV_DELAY: 144
+  MAKER__CHANNEL_RING__PHASE_TIMEOUT_SECONDS: 300
+  MAKER__CHANNEL_RING__OPEN_TIMEOUT_SECONDS: 300
+  MAKER__CHANNEL_RING__READINESS_TIMEOUT_SECONDS: 120
+  MAKER__CHANNEL_RING__MAX_ACTIVE_SESSIONS: 4
+  MAKER__CHANNEL_RING__MAX_VERIFIED_SESSIONS: 2
+  TOR__SOCKS_HOST: ring-tor
+  TOR__SOCKS_PORT: 9050
+  TOR__CONTROL_HOST: ring-tor
+  TOR__CONTROL_PORT: 9051
+  TOR__PASSWORD: ring-e2e
+
+x-maker: &maker
+  image: ${MAKER_IMAGE:-ring-e2e-maker:latest}
+  build:
+    context: ..
+    dockerfile: maker/Dockerfile
+  entrypoint: ["/bin/sh", "/scripts/ring-e2e-maker.sh"]
+  restart: "no"
+  group_add: ["0"]
+  environment: *maker-environment
+  volumes:
+    - ../scripts:/scripts:ro
+    - ${RING_E2E_DATA_DIR:-../tmp/ring-e2e}/tor:/tor:ro
+  depends_on:
+    ring-directory:
+      condition: service_healthy
+    ring-wallet-funder:
+      condition: service_completed_successfully
+  profiles: [ring-e2e]
+
+services:
+  ring-init:
+    image: busybox:1.37
+    command:
+      - sh
+      - -c
+      - >-
+        mkdir -p /data/tor /data/lnd-maker1 /data/lnd-maker2 /data/lnd-maker3
+        /data/lnd-taker /data/maker1 /data/maker2 /data/maker3 &&
+        chown -R 1000:1000 /data/tor /data/maker1 /data/maker2 /data/maker3
+    volumes:
+      - ${RING_E2E_DATA_DIR:-../tmp/ring-e2e}:/data
+    profiles: [ring-e2e]
+
+  ring-bitcoin:
+    image: lncm/bitcoind:v28.0
+    command:
+      - -regtest=1
+      - -server=1
+      - -txindex=1
+      - -fallbackfee=0.0002
+      - -rpcuser=test
+      - -rpcpassword=test
+      - -rpcallowip=0.0.0.0/0
+      - -rpcbind=0.0.0.0
+      - -zmqpubrawblock=tcp://0.0.0.0:28332
+      - -zmqpubrawtx=tcp://0.0.0.0:28333
+    volumes:
+      - ring-bitcoin-data:/data/.bitcoin
+    networks: [ring-network]
+    healthcheck:
+      test: ["CMD-SHELL", "bitcoin-cli -regtest -rpcuser=test -rpcpassword=test getblockchaininfo"]
+      interval: 2s
+      timeout: 2s
+      retries: 60
+    profiles: [ring-e2e]
+
+  ring-wallet-funder:
+    image: lncm/bitcoind:v28.0
+    entrypoint: ["/bin/sh", "/scripts/fund-ring-e2e-wallets.sh"]
+    volumes:
+      - ../scripts:/scripts:ro
+    networks: [ring-network]
+    depends_on:
+      ring-bitcoin:
+        condition: service_healthy
+    profiles: [ring-e2e]
+
+  ring-directory:
+    image: ${DIRECTORY_SERVER_IMAGE:-ring-e2e-directory:latest}
+    build:
+      context: ..
+      dockerfile: directory_server/Dockerfile
+    environment:
+      NETWORK_CONFIG__NETWORK: regtest
+      DIRECTORY_SERVER__HOST: 0.0.0.0
+      DIRECTORY_SERVER__PORT: 5222
+      LOGGING__LEVEL: DEBUG
+    networks: [ring-network]
+    healthcheck:
+      test: ["CMD", "jm-directory-ctl", "health"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+    depends_on:
+      ring-bitcoin:
+        condition: service_healthy
+    profiles: [ring-e2e]
+
+  ring-orderbook:
+    image: ${ORDERBOOK_WATCHER_IMAGE:-ring-e2e-orderbook:latest}
+    build:
+      context: ..
+      dockerfile: orderbook_watcher/Dockerfile
+    environment:
+      NETWORK_CONFIG__NETWORK: regtest
+      DIRECTORY_NODES: ring-directory:5222
+      LOGGING__LEVEL: DEBUG
+    networks: [ring-network]
+    depends_on:
+      ring-directory:
+        condition: service_healthy
+    profiles: [ring-e2e]
+
+  ring-tor:
+    image: ring-e2e-tor:latest
+    build:
+      context: ..
+      dockerfile: tests/e2e/Dockerfile.ring-tor
+    volumes:
+      - ../tests/e2e/ring-e2e-torrc:/etc/tor/torrc:ro
+      - ../scripts/ring-e2e-tor-health.sh:/scripts/ring-e2e-tor-health.sh:ro
+      - ../scripts/tor-bootstrap-health.sh:/scripts/tor-bootstrap-health.sh:ro
+      - ${RING_E2E_DATA_DIR:-../tmp/ring-e2e}/tor:/var/lib/tor
+    networks: [ring-network]
+    depends_on:
+      ring-init:
+        condition: service_completed_successfully
+      ring-onion-maker1:
+        condition: service_started
+      ring-onion-maker2:
+        condition: service_started
+      ring-onion-maker3:
+        condition: service_started
+      ring-onion-taker:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "/bin/bash", "/scripts/ring-e2e-tor-health.sh"]
+      interval: 2s
+      timeout: 2s
+      retries: 120
+    profiles: [ring-e2e]
+
+  ring-onion-maker1:
+    image: alpine/socat:1.8.0.3
+    command: ["tcp-listen:9735,fork,reuseaddr", "tcp:lnd-maker1:9735"]
+    networks: [ring-network]
+    profiles: [ring-e2e]
+
+  ring-onion-maker2:
+    image: alpine/socat:1.8.0.3
+    command: ["tcp-listen:9735,fork,reuseaddr", "tcp:lnd-maker2:9735"]
+    networks: [ring-network]
+    profiles: [ring-e2e]
+
+  ring-onion-maker3:
+    image: alpine/socat:1.8.0.3
+    command: ["tcp-listen:9735,fork,reuseaddr", "tcp:lnd-maker3:9735"]
+    networks: [ring-network]
+    profiles: [ring-e2e]
+
+  ring-onion-taker:
+    image: alpine/socat:1.8.0.3
+    command: ["tcp-listen:9735,fork,reuseaddr", "tcp:lnd-taker:9735"]
+    networks: [ring-network]
+    profiles: [ring-e2e]
+
+  lnd-maker1:
+    <<: *lnd
+    environment:
+      LND_NODE: lnd-maker1
+    volumes:
+      - ../scripts:/scripts:ro
+      - ${RING_E2E_DATA_DIR:-../tmp/ring-e2e}/tor:/tor:ro
+      - ${RING_E2E_DATA_DIR:-../tmp/ring-e2e}/lnd-maker1:/root/.lnd
+
+  lnd-maker2:
+    <<: *lnd
+    environment:
+      LND_NODE: lnd-maker2
+    volumes:
+      - ../scripts:/scripts:ro
+      - ${RING_E2E_DATA_DIR:-../tmp/ring-e2e}/tor:/tor:ro
+      - ${RING_E2E_DATA_DIR:-../tmp/ring-e2e}/lnd-maker2:/root/.lnd
+
+  lnd-maker3:
+    <<: *lnd
+    environment:
+      LND_NODE: lnd-maker3
+    volumes:
+      - ../scripts:/scripts:ro
+      - ${RING_E2E_DATA_DIR:-../tmp/ring-e2e}/tor:/tor:ro
+      - ${RING_E2E_DATA_DIR:-../tmp/ring-e2e}/lnd-maker3:/root/.lnd
+
+  lnd-taker:
+    <<: *lnd
+    environment:
+      LND_NODE: lnd-taker
+    volumes:
+      - ../scripts:/scripts:ro
+      - ${RING_E2E_DATA_DIR:-../tmp/ring-e2e}/tor:/tor:ro
+      - ${RING_E2E_DATA_DIR:-../tmp/ring-e2e}/lnd-taker:/root/.lnd
+
+  ring-maker1:
+    <<: *maker
+    network_mode: service:lnd-maker1
+    environment:
+      <<: *maker-environment
+      LND_NODE: lnd-maker1
+      MNEMONIC: avoid whisper mesh corn already blur sudden fine planet chicken hover sniff
+      TOR__TARGET_HOST: lnd-maker1
+    volumes:
+      - ../scripts:/scripts:ro
+      - ${RING_E2E_DATA_DIR:-../tmp/ring-e2e}/tor:/tor:ro
+      - ${RING_E2E_DATA_DIR:-../tmp/ring-e2e}/lnd-maker1:/lnd:ro
+      - ${RING_E2E_DATA_DIR:-../tmp/ring-e2e}/maker1:/home/jm/.joinmarket-ng
+    depends_on:
+      lnd-maker1:
+        condition: service_healthy
+      ring-directory:
+        condition: service_healthy
+      ring-wallet-funder:
+        condition: service_completed_successfully
+
+  ring-maker2:
+    <<: *maker
+    network_mode: service:lnd-maker2
+    environment:
+      <<: *maker-environment
+      LND_NODE: lnd-maker2
+      MNEMONIC: minute faint grape plate stock mercy tent world space opera apple rocket
+      TOR__TARGET_HOST: lnd-maker2
+    volumes:
+      - ../scripts:/scripts:ro
+      - ${RING_E2E_DATA_DIR:-../tmp/ring-e2e}/tor:/tor:ro
+      - ${RING_E2E_DATA_DIR:-../tmp/ring-e2e}/lnd-maker2:/lnd:ro
+      - ${RING_E2E_DATA_DIR:-../tmp/ring-e2e}/maker2:/home/jm/.joinmarket-ng
+    depends_on:
+      lnd-maker2:
+        condition: service_healthy
+      ring-directory:
+        condition: service_healthy
+      ring-wallet-funder:
+        condition: service_completed_successfully
+
+  ring-maker3:
+    <<: *maker
+    network_mode: service:lnd-maker3
+    environment:
+      <<: *maker-environment
+      LND_NODE: lnd-maker3
+      MNEMONIC: echo rural present blue chapter game keen keen keen keen keen keen
+      MAKER__CHANNEL_RING__FUNDEE_RESERVE: ${RING_E2E_MAKER3_FUNDEE_RESERVE:-10000}
+      TOR__TARGET_HOST: lnd-maker3
+    volumes:
+      - ../scripts:/scripts:ro
+      - ${RING_E2E_DATA_DIR:-../tmp/ring-e2e}/tor:/tor:ro
+      - ${RING_E2E_DATA_DIR:-../tmp/ring-e2e}/lnd-maker3:/lnd:ro
+      - ${RING_E2E_DATA_DIR:-../tmp/ring-e2e}/maker3:/home/jm/.joinmarket-ng
+    depends_on:
+      lnd-maker3:
+        condition: service_healthy
+      ring-directory:
+        condition: service_healthy
+      ring-wallet-funder:
+        condition: service_completed_successfully
+
+networks:
+  ring-network:
+
+volumes:
+  ring-bitcoin-data:

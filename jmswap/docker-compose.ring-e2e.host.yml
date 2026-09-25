@@ -1,0 +1,33 @@
+# Loopback port publishing for the ring stack, used by the host-side pytest suite.
+services:
+  ring-bitcoin:
+    ports:
+      - "127.0.0.1:${RING_E2E_BITCOIN_PORT:-20443}:18443"
+
+  ring-directory:
+    ports:
+      - "127.0.0.1:${RING_E2E_DIRECTORY_PORT:-25222}:5222"
+
+  ring-orderbook:
+    ports:
+      - "127.0.0.1:${RING_E2E_ORDERBOOK_PORT:-28080}:8000"
+
+  ring-tor:
+    ports:
+      - "127.0.0.1:${RING_E2E_TOR_SOCKS_PORT:-29050}:9050"
+
+  lnd-maker1:
+    ports:
+      - "127.0.0.1:${RING_E2E_MAKER1_GRPC_PORT:-21009}:10009"
+
+  lnd-maker2:
+    ports:
+      - "127.0.0.1:${RING_E2E_MAKER2_GRPC_PORT:-22009}:10009"
+
+  lnd-maker3:
+    ports:
+      - "127.0.0.1:${RING_E2E_MAKER3_GRPC_PORT:-23009}:10009"
+
+  lnd-taker:
+    ports:
+      - "127.0.0.1:${RING_E2E_TAKER_GRPC_PORT:-24009}:10009"

@@ -15,6 +15,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any, Protocol
 
+from jmcore.channel_ring_store import RingParticipantStore
 from jmcore.crypto import NickIdentity
 from jmcore.deduplication import MessageDeduplicator
 from jmcore.directory_client import DirectoryClient
@@ -36,6 +37,7 @@ from maker.rate_limiting import (
 )
 
 if TYPE_CHECKING:
+    from jmswap.channel_ring import InitializedChannelRingBackend
     from jmwallet.history import TransactionHistoryEntry
 
     from maker.direct_connection import DirectConnectionState
@@ -91,6 +93,9 @@ class MakerBotProtocol(Protocol):
     _pending_signed_rounds: dict[tuple[int, str, str], PendingSignedRound]
     _pending_signed_rounds_lock: asyncio.Lock
     minimum_fee_rate_sat_vb: float
+    channel_ring_capability_validated: bool
+    _channel_ring_backend: InitializedChannelRingBackend | None
+    _channel_ring_store: RingParticipantStore | None
 
     # -- Cross-mixin methods --
 
@@ -111,6 +116,10 @@ class MakerBotProtocol(Protocol):
     ) -> None: ...
 
     async def _handle_tx(
+        self, taker_nick: str, msg: str, source: str = "unknown", generation_id: int | None = None
+    ) -> None: ...
+
+    async def _handle_ring(
         self, taker_nick: str, msg: str, source: str = "unknown", generation_id: int | None = None
     ) -> None: ...
 

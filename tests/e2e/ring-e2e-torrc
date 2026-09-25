@@ -1,0 +1,25 @@
+# Test-only Tor daemon for the four LND peer endpoints.
+DataDirectory /var/lib/tor
+Log notice stdout
+SocksPort 0.0.0.0:9050
+ControlPort 0.0.0.0:9051
+CookieAuthentication 0
+HashedControlPassword 16:B71AF1358BECFE1A608ED040AB0857A7598DCD6F452513F9DBB9851032
+
+HiddenServiceDir /var/lib/tor/lnd-maker1
+# These forwarders are test-only Compose transport mappings. The externally
+# exercised peer endpoint remains the generated v3 onion service.
+HiddenServicePort 9735 ring-onion-maker1:9735
+HiddenServiceVersion 3
+
+HiddenServiceDir /var/lib/tor/lnd-maker2
+HiddenServicePort 9735 ring-onion-maker2:9735
+HiddenServiceVersion 3
+
+HiddenServiceDir /var/lib/tor/lnd-maker3
+HiddenServicePort 9735 ring-onion-maker3:9735
+HiddenServiceVersion 3
+
+HiddenServiceDir /var/lib/tor/lnd-taker
+HiddenServicePort 9735 ring-onion-taker:9735
+HiddenServiceVersion 3

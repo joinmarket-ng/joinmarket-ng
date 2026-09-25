@@ -1,0 +1,8 @@
+FROM debian:trixie-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends tor ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --uid 1000 --create-home ring-tor
+
+USER 1000:1000
+ENTRYPOINT ["tor", "-f", "/etc/tor/torrc"]
