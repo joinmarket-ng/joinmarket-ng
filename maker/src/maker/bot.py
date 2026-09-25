@@ -16,12 +16,14 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from jmcore import experimental
 from jmcore.channel_ring import ChannelRingConfig
 from jmcore.channel_ring_store import RingParticipantRecord, RingParticipantStore
 from jmcore.commitment_blacklist import set_blacklist_path
 from jmcore.crypto import NickIdentity
 from jmcore.deduplication import MessageDeduplicator
 from jmcore.directory_client import DirectoryClient
+from jmcore.experimental import warn_experimental
 from jmcore.fee_policy import resolve_min_fee_rate
 from jmcore.models import Offer
 from jmcore.network import HiddenServiceListener, TCPConnection
@@ -1095,6 +1097,14 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
             build_ref = get_build_ref() or "unknown"
             logger.info(f"Starting maker bot (version={version}, commit={commit}, ref={build_ref})")
             logger.bind(sensitive=True).info(f"Starting maker bot (nick: {self.nick})")
+            warn_experimental(
+                [
+                    *([experimental.TAPROOT_PIT] if self.config.address_type == "p2tr" else []),
+                    *([experimental.CHANNEL_RING] if self.config.channel_ring.enabled else []),
+                    *([experimental.CHANNEL_BUYOUT] if self.buyout is not None else []),
+                ],
+                str(self.config.bitcoin_network or self.config.network),
+            )
 
             await self._initialize_minimum_fee_policy()
 

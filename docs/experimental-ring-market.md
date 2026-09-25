@@ -3,7 +3,9 @@
 > **Warning: experimental, not audited.** Protocols and on-disk formats may
 > change incompatibly, and bugs can lose funds. Start on signet. Use mainnet
 > only with a dedicated wallet, dedicated LND nodes, and small amounts you can
-> afford to lose. Every feature on this page is disabled by default.
+> afford to lose. Trading, Taproot/ring participation, and market-fault exclusion
+> are disabled by default. Public listing discovery remains available without
+> enabling trading.
 >
 > When one is enabled, the process logs:
 >
@@ -203,6 +205,11 @@ A taker that must use purchased openings sets:
 [taker]
 external_podle_mode = "only"
 ```
+
+To additionally exclude makers with independently verified market-fault evidence,
+set `[taker] market_fault_exclusion = true`. This selection policy is independent
+of credential purchases and remains opt-in during the experimental phase. A later
+release is intended to make it opt-out. Existing fault-cache files do not enable it.
 
 With `"only"` the taker never falls back to a wallet PoDLE; with no usable
 opening the CoinJoin stops. Use the taker's data directory as the market data
