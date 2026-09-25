@@ -426,7 +426,10 @@ class MakerSession:
                         fee_received=0,
                         txfee_contribution=0,
                         cj_address=self.cj_address,
-                        change_address=self.change_address,
+                        # Escrow change belongs to the buyout journal, not to
+                        # wallet address history; ``our_utxos`` is already
+                        # wallet-only, so the entry stays purely ours.
+                        change_address=self.inner.wallet_change_address,
                         our_utxos=our_utxos,
                         txid=None,
                         network=bot.config.network.value,
@@ -656,7 +659,9 @@ class MakerSession:
                             fee_received=fee_received,
                             txfee_contribution=txfee_contribution,
                             cj_address=self.cj_address,
-                            change_address=self.change_address,
+                            # Escrow change is never a wallet address (see the
+                            # !auth path above).
+                            change_address=self.inner.wallet_change_address,
                             our_utxos=our_utxos,
                             txid=txid,
                             network=bot.config.network.value,

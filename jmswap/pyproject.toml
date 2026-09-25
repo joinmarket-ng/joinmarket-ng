@@ -1,0 +1,78 @@
+[project]
+name = "jmswap"
+version = "0.39.2"
+description = "Bitcoin primitives for JoinMarket channel-buyout swaps"
+requires-python = ">=3.11"
+dependencies = [
+    "jmcore",
+    "pydantic>=2.5.0",
+    "rfc8785>=0.1.2",
+    # ChannelEscrow gRPC backend; the checked-in gencode needs protobuf 7.
+    "grpcio>=1.84.0",
+    "protobuf>=7.35.1,<8",
+    "httpx>=0.25.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "grpcio-tools>=1.84.0",
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-cov>=4.1.0",
+    "pytest-timeout>=2.0.0",
+    "mypy>=1.5.0",
+    "ruff>=0.1.0",
+    "types-grpcio>=1.83.0",
+]
+
+[project.scripts]
+jm-buyout = "jmswap.buyout_cli:main"
+
+[build-system]
+requires = ["setuptools>=68.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+jmswap = ["py.typed", "lndrpc/*.pyi"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = '-v --cov=jmswap --cov-report=html --cov-report=term --timeout=60 -m "not docker"'
+markers = ["docker: requires a disposable Docker regtest node"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+
+[[tool.mypy.overrides]]
+module = "grpc.*"
+ignore_missing_imports = true
+
+# protoc output is not typed to this project's standard; the .pyi files still
+# type the messages for callers.
+[[tool.mypy.overrides]]
+module = "jmswap.lndrpc.*"
+ignore_errors = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["src/jmswap/lndrpc"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP", "B", "C4", "SIM"]
+ignore = ["E501"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"

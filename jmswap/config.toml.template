@@ -1,0 +1,197 @@
+# Private channel-buyout service configuration (JMP-0011 draft).
+#
+# Copy this file, edit the [buyout] table and point the service at it with an
+# explicit path. Nothing is discovered: this file is read, validated and that is
+# all. No certificate, macaroon or journal named here is opened at load time,
+# nothing is created, and no node or wallet is contacted.
+#
+# Every example below is regtest with placeholder keys. Do not reuse them, and
+# never point this file at mainnet funds you have not deliberately committed.
+#
+# Relative paths are resolved against the directory of this file.
+
+[buyout]
+
+# Run the buyout service at all. Default: false.
+#
+# Enabling it is also the settlement authorization: sessions created from now on
+# may pay and sweep. It is not retroactive. A session already in the journal
+# keeps the authorization it was recorded with, and disabling the service does
+# not revoke an authorization already written for a live session.
+enabled = false
+
+# Permit force-close recovery of NEW sessions after their agreed maximum freeze
+# interval. This spends on-chain fees and can invalidate an unconfirmed parent.
+# Never applied retroactively; paid or uncertain-payment sessions are excluded.
+# Default: false. Unsigned sessions can be canceled at their agreed freeze TTL.
+automatic_force_close = false
+
+# Bitcoin network of the node, the channels and the payout address.
+# One of "regtest", "signet", "testnet", "mainnet". Required when enabled.
+network = "regtest"
+
+# SQLite journal of buyout sessions. Required when enabled. The runtime creates
+# and opens it; loading this file does not.
+journal = "buyout-sessions.sqlite"
+
+# ---------------------------------------------------------------------------
+# Lightning node (LND with the pinned channel-escrow backend)
+# ---------------------------------------------------------------------------
+
+# gRPC target as host:port, with no scheme and no path. Required when enabled.
+lnd_endpoint = "127.0.0.1:10009"
+
+# This node's own identity public key, compressed secp256k1 hex.
+# Required when enabled, and it may not appear in allowed_peers.
+lnd_identity = "03c129eb0cbe4a12a9ea9f298196334ad5c85882330f604d865ef9ccdd562e4a0b"
+
+# TLS certificate of the node. Required when enabled.
+lnd_tls_cert = "lnd/tls.cert"
+
+# Macaroon for lnrpc.Lightning and routerrpc.Router (peer messages, invoices,
+# payments). Required when enabled.
+lnd_peer_macaroon = "lnd/buyout-peer.macaroon"
+
+# Macaroon for the channel-escrow service (freeze, prepare, sign, finalize).
+# Keep it separate from the peer macaroon. Required when enabled.
+lnd_escrow_macaroon = "lnd/buyout-escrow.macaroon"
+
+# Optional route hints this node pays buyout invoices through, used only when
+# the graph does not advertise a route to the payee (an unannounced channel,
+# say). They are payer-only: they never reach an invoice or a counterparty, and
+# they change no fee, CLTV or timeout bound. Leave it out to pay as before.
+# Each hint is an array of hops (at most 20 hints, 20 hops each), written
+# inline because TOML has no array-of-array-of-tables syntax. Hop fields are
+# LND's own: node_id (compressed hex), chan_id (positive uint64), fee_base_msat
+# and fee_proportional_millionths (uint32), cltv_expiry_delta (positive uint16).
+# payment_route_hints = [
+#     [
+#         { node_id = "0292f803dd1db5884b5c616db7bf6e3e9541d3ca2f4bb87ee4e2f1e03311eeb1e9", chan_id = 123456789, fee_base_msat = 1000, fee_proportional_millionths = 1, cltv_expiry_delta = 80 },
+#     ],
+# ]
+
+# ---------------------------------------------------------------------------
+# Bitcoin Core (already synchronized, txindex enabled; never modified here)
+# ---------------------------------------------------------------------------
+
+# JSON-RPC endpoint, http or https. Required when enabled.
+# Credentials must not be embedded in the URL; use the two keys below.
+bitcoin_rpc_url = "http://127.0.0.1:18443/"
+
+# RPC user and password. Required when enabled. The password is held as a secret
+# and never appears in logs, reprs or validation errors.
+bitcoin_rpc_user = "buyout"
+bitcoin_rpc_password = "regtest-placeholder-password"
+
+# ---------------------------------------------------------------------------
+# Counterparties and payout
+# ---------------------------------------------------------------------------
+
+# Channel peers this service will buy out or be bought out by, as compressed
+# secp256k1 identity keys. Required (non-empty, no duplicates) when enabled.
+# Everything else is refused, so this list is the peer allowlist.
+allowed_peers = [
+    "0292f803dd1db5884b5c616db7bf6e3e9541d3ca2f4bb87ee4e2f1e03311eeb1e9",
+]
+
+# Where this node is paid on chain (its side of the escrow split). Must be a
+# P2TR (witness v1) address of the configured network. Required when enabled.
+payout_address = "bcrt1pksg0vjls5jwvrjxvx46hrj5lnpawelc9h4l0gppy6wts2aaapc9ssgsfk3"
+
+# JoinMarket wallet mixdepth the buyer side spends from and pays back into.
+# Non-negative integer. Required when enabled.
+mixdepth = 0
+
+# JoinMarket wallet fingerprint (8 lowercase hex characters) that the buyer side
+# must use. Optional here; the buyer integration requires it.
+# wallet_fingerprint = "0a1b2c3d"
+
+# Seconds between settlement polls. Positive and finite. Default: 5.
+poll_interval_seconds = 5
+
+# ---------------------------------------------------------------------------
+# [buyout.policy]: economic terms this node proposes and accepts.
+#
+# Every key is optional and shown with its default. Bounds are the JMP-0011 wire
+# bounds; a policy that no counterparty could agree with is rejected here rather
+# than at negotiation time. "network" and "settlement_enabled" are not policy
+# keys: they come from [buyout] above and naming them here is an error.
+# ---------------------------------------------------------------------------
+
+[buyout.policy]
+
+# Relative timelock of the counterparty's split output, in blocks. Must cover
+# buyer_settlement_depth + cltv_limit + 36 (the split safety margin).
+csv_delay = 432
+
+# Fee of the presigned split, in satoshis, and the rate it is derived from. The
+# exact fee is re-derived per attempt from the measured split size; a mismatch
+# is rejected when the parent is validated.
+split_fee = 154
+split_fee_rate_sat_vb = 1
+
+# Smallest split output either side will accept, in satoshis.
+min_split_output = 1000
+
+# Satoshis the buyer keeps back from its own split share to pay for a unilateral
+# claim sweep.
+sweep_fee_reserve = 10000
+
+# Confirmations the buyer waits on the parent before it pays, and the longest
+# HTLC it will accept for that payment, in blocks. Default: 360. If omitted,
+# cltv_limit is min(360, csv_delay - buyer_settlement_depth - 36).
+# For an explicitly controlled, risk-accepted signet session, an operator may
+# set buyer_settlement_depth = 3 and settlement_depth = 1. This changes NEW
+# negotiated sessions only. The escrow's 2-of-2 spend does not prevent another
+# CoinJoin participant from replacing the unconfirmed parent via its own input.
+# Do not use a lower depth to work around a missing or inconsistent parent.
+buyer_settlement_depth = 6
+cltv_limit = 360
+
+# Blocks the buyer allows the counterparty to answer a cooperative sweep.
+sweep_response_blocks = 1
+
+# As buyer: the most this node will pay above the entitlement, and the most it
+# will compensate a timeout. As counterparty: the least it will accept for both.
+buyout_fee = 0
+timeout_compensation = 0
+
+# Confirmations the counterparty waits on the parent before it invoices.
+# Must not exceed buyer_settlement_depth.
+settlement_depth = 3
+
+# Blocks the counterparty promises to wait for the parent, and the longest
+# freeze it commits to. Protocol minimums are 6 and 144.
+parent_wait_blocks = 6
+max_freeze_blocks = 144
+
+# Blocks a freeze stays valid before the attempt is abandoned.
+freeze_ttl_blocks = 6
+
+# Seconds a proposal stays valid. A counterparty rejects anything beyond 600.
+proposal_lifetime_seconds = 120
+
+# ---------------------------------------------------------------------------
+# [buyout.settlement]: payment and chain-fee budget of settlement.
+# Every key is optional and shown with its default.
+# ---------------------------------------------------------------------------
+
+[buyout.settlement]
+
+# Most this node will pay in Lightning routing fees for one buyout, in satoshis.
+payment_fee_limit_sat = 1000
+
+# How long one payment attempt may run, in seconds.
+payment_timeout_seconds = 60
+
+# Lifetime of the invoice the counterparty issues, in seconds. Must be greater
+# than payment_timeout_seconds, otherwise a buyer with this same configuration
+# would refuse the invoice.
+invoice_expiry_seconds = 3600
+
+# Most this node will spend on one escrow spend (cooperative sweep, claim or
+# split broadcast), in satoshis. An attempt that would exceed it fails instead.
+max_chain_fee_sat = 10000
+
+# Blocks to wait before fee-bumping an unconfirmed escrow spend.
+bump_after_blocks = 1

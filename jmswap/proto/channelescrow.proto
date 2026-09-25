@@ -1,0 +1,113 @@
+syntax = "proto3";
+
+package channelescrowrpc;
+
+option go_package = "github.com/lightningnetwork/lnd/lnrpc/channelescrowrpc";
+
+service ChannelEscrow {
+    rpc FreezeChannel (FreezeChannelRequest) returns (FreezeChannelResponse);
+    rpc PrepareParent (PrepareParentRequest) returns (PrepareParentResponse);
+    rpc BeginSigning (BeginSigningRequest) returns (BeginSigningResponse);
+    rpc SignParent (SignParentRequest) returns (SignParentResponse);
+    rpc FinalizeParent (FinalizeParentRequest) returns (FinalizeParentResponse);
+    rpc Status (StatusRequest) returns (StatusResponse);
+    rpc Cancel (CancelRequest) returns (CancelResponse);
+}
+
+message ChannelPoint {
+    bytes funding_txid = 1;
+    uint32 output_index = 2;
+}
+
+message PrevOut {
+    int64 value_sat = 1;
+    bytes pk_script = 2;
+}
+
+message FreezeChannelRequest {
+    ChannelPoint channel_point = 1;
+    bytes session_id = 2;
+}
+
+message FreezeChannelResponse {
+    int64 capacity_sat = 1;
+    int64 local_claim_sat = 2;
+    int64 remote_claim_sat = 3;
+    bytes peer_pubkey = 4;
+    ChannelPoint funding_outpoint = 5;
+    bytes funding_script = 6;
+    bytes local_funding_pubkey = 7;
+    bytes remote_funding_pubkey = 8;
+}
+
+message PrepareParentRequest {
+    ChannelPoint channel_point = 1;
+    bytes session_id = 2;
+    bytes raw_parent_tx = 3;
+    repeated PrevOut prev_outs = 4;
+    uint32 channel_input_index = 5;
+}
+
+message PrepareParentResponse {
+    bytes txid = 1;
+}
+
+message BeginSigningRequest {
+    ChannelPoint channel_point = 1;
+    bytes session_id = 2;
+    bool restart_attempt = 3;
+}
+
+message BeginSigningResponse {
+    bytes attempt_id = 1;
+    bytes local_public_nonce = 2;
+}
+
+message SignParentRequest {
+    ChannelPoint channel_point = 1;
+    bytes session_id = 2;
+    bytes attempt_id = 3;
+    bytes remote_public_nonce = 4;
+}
+
+message SignParentResponse {
+    bytes local_partial_signature = 1;
+}
+
+message FinalizeParentRequest {
+    ChannelPoint channel_point = 1;
+    bytes session_id = 2;
+    bytes attempt_id = 3;
+    bytes remote_partial_signature = 4;
+}
+
+message FinalizeParentResponse {
+    bytes raw_tx = 1;
+    bytes txid = 2;
+}
+
+message StatusRequest {
+    ChannelPoint channel_point = 1;
+    bytes session_id = 2;
+}
+
+message StatusResponse {
+    uint32 stage = 1;
+    bytes parent_txid = 2;
+    bool finalized = 3;
+    bytes durable_local_public_nonce = 4;
+    bytes durable_remote_public_nonce = 5;
+    bytes durable_local_partial_signature = 6;
+    bytes finalized_parent_tx = 7;
+    bytes active_attempt_id = 8;
+    bytes active_local_public_nonce = 9;
+}
+
+message CancelRequest {
+    ChannelPoint channel_point = 1;
+    bytes session_id = 2;
+}
+
+message CancelResponse {
+    bool link_resumed = 1;
+}
