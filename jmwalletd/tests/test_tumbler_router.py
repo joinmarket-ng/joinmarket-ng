@@ -1051,6 +1051,7 @@ class TestBuildTumblerTakerConfig:
 
         settings: Any = self._settings()
         settings.taker.max_cj_fee_abs = 777
+        settings.taker.market_fault_exclusion = True
         settings.taker.maker_timeout_sec = 90
         settings.taker.order_wait_time = 60.0
         settings.taker.orderbook_min_wait = 45.0
@@ -1070,6 +1071,7 @@ class TestBuildTumblerTakerConfig:
         )
 
         assert captured["max_cj_fee"].abs_fee == 777
+        assert captured["market_fault_exclusion"] is True
         assert captured["maker_timeout_sec"] == 90
         assert captured["order_wait_time"] == 60.0
         assert captured["orderbook_min_wait"] == 45.0

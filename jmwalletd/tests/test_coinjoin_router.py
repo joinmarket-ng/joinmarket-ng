@@ -971,7 +971,9 @@ class TestBuildCoinjoinTakerConfig:
     def test_forwards_core_taker_policy_fields(self) -> None:
         from taker.config import MaxCjFee
 
-        captured = self._build(body=self._body(), jm_settings=self._settings())
+        settings: Any = self._settings()
+        settings.taker.market_fault_exclusion = True
+        captured = self._build(body=self._body(), jm_settings=settings)
         max_cj_fee = captured["max_cj_fee"]
         assert isinstance(max_cj_fee, MaxCjFee)
         assert max_cj_fee.abs_fee == 500
@@ -984,6 +986,7 @@ class TestBuildCoinjoinTakerConfig:
         assert captured["orderbook_quiet_period"] == 20.0
         assert captured["broadcast_peer_count"] == 3
         assert captured["taker_utxo_age"] == 5
+        assert captured["market_fault_exclusion"] is True
 
     def test_fee_rate_takes_precedence_over_block_target(self) -> None:
         captured = self._build(
