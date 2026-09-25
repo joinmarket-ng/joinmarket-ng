@@ -1053,11 +1053,11 @@ class TestAddressToScriptpubkey:
 
     def test_p2tr_address(self) -> None:
         """P2TR address should produce OP_1 <32-byte> scriptpubkey."""
-        import bech32 as bech32_lib
+        from bitcointx.segwit_addr import encode
 
         # Create a synthetic P2TR address (witness version 1, 32-byte program)
         pubkey_x = b"\xdd" * 32
-        addr = bech32_lib.encode("bcrt", 1, pubkey_x)
+        addr = encode("bcrt", 1, pubkey_x)
         assert addr is not None
 
         spk = address_to_scriptpubkey(addr)
@@ -1376,10 +1376,10 @@ class TestGetAddressType:
 
     def test_p2tr(self) -> None:
         """P2TR address should be detected."""
-        import bech32 as bech32_lib
+        from bitcointx.segwit_addr import encode
 
         x_only = b"\xcd" * 32
-        addr = bech32_lib.encode("bcrt", 1, x_only)
+        addr = encode("bcrt", 1, x_only)
         assert addr is not None
         assert get_address_type(addr) == "p2tr"
 
