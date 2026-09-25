@@ -11,6 +11,7 @@ from jmcore.bitcoin import (
     encode_varint,
     estimate_vsize,
     pubkey_to_p2wpkh_script,
+    script_to_p2wsh_address,
     serialize_transaction,
 )
 from jmcore.btc_script import parse_freeze_script
@@ -122,11 +123,16 @@ class WalletPSBTSigningMixin:
     mixdepth_count: int
     root_path: str
     master_key: HDKey
+    address_cache: dict[str, tuple[int, int, int]]
+    fidelity_bond_locktime_cache: dict[str, int]
 
     def get_address(self, mixdepth: int, change: int, index: int) -> str:  # pragma: no cover
         raise NotImplementedError
 
     def get_fidelity_bond_address(self, index: int, locktime: int) -> str:  # pragma: no cover
+        raise NotImplementedError
+
+    def get_fidelity_bond_path(self, index: int) -> str:  # pragma: no cover
         raise NotImplementedError
 
     def get_key_for_address(self, address: str) -> HDKey | None:  # pragma: no cover
@@ -378,13 +384,14 @@ class WalletPSBTSigningMixin:
         except ValueError:
             return None
 
-        address = self.get_fidelity_bond_address(timenumber, locktime)
-        key = self.get_key_for_address(address)
-        if key is None:
-            return None
+        address = script_to_p2wsh_address(witness_script, self.network)
+        path = self.get_fidelity_bond_path(timenumber)
+        key = self.master_key.derive(path)
         pubkey = key.get_public_key_bytes(compressed=True)
         if pubkey != script_pubkey:
             return None
+        self.address_cache[address] = (0, 2, timenumber)
+        self.fidelity_bond_locktime_cache[address] = locktime
 
         tx_input = psbt.transaction.inputs[index]
         if psbt.transaction.locktime < locktime:
@@ -404,7 +411,7 @@ class WalletPSBTSigningMixin:
             address=address,
             confirmations=0,
             scriptpubkey=witness_utxo.script_pubkey.hex(),
-            path=f"{self.root_path}/0'/2/{timenumber}",
+            path=path,
             mixdepth=0,
             locktime=locktime,
         )

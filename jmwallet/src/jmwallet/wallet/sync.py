@@ -135,6 +135,9 @@ class WalletSyncMixin:
     def get_fidelity_bond_key(self, index: int, locktime: int) -> HDKey:
         raise NotImplementedError
 
+    def get_fidelity_bond_path(self, index: int) -> str:
+        raise NotImplementedError
+
     def get_fidelity_bond_script(self, index: int, locktime: int) -> bytes:
         raise NotImplementedError
 
@@ -830,7 +833,7 @@ class WalletSyncMixin:
                 locktime, timenumber = address_to_info[address_lower]
                 self._record_history_address(address)
                 for utxo in addr_utxos:
-                    path = f"{self.root_path}/0'/{FIDELITY_BOND_BRANCH}/{timenumber}:{locktime}"
+                    path = f"{self.get_fidelity_bond_path(timenumber)}:{locktime}"
                     utxo_info = _make_utxo_info(
                         txid=utxo.txid,
                         vout=utxo.vout,
@@ -1011,7 +1014,7 @@ class WalletSyncMixin:
                 locktime, idx = address_to_locktime[address_lower]
                 self.address_cache[address_lower] = (0, FIDELITY_BOND_BRANCH, idx)
                 self.fidelity_bond_locktime_cache[address_lower] = locktime
-                path = f"{self.root_path}/0'/{FIDELITY_BOND_BRANCH}/{idx}:{locktime}"
+                path = f"{self.get_fidelity_bond_path(idx)}:{locktime}"
 
                 utxo_info = _make_utxo_info(
                     txid=utxo.txid,
@@ -1615,7 +1618,7 @@ class WalletSyncMixin:
                 key = self.get_fidelity_bond_key(timenumber, locktime)
                 pubkey_hex = key.get_public_key_bytes(compressed=True).hex()
                 witness_script = self.get_fidelity_bond_script(timenumber, locktime)
-                path = f"{self.root_path}/0'/{FIDELITY_BOND_BRANCH}/{timenumber}"
+                path = self.get_fidelity_bond_path(timenumber)
                 bond_info = create_bond_info(
                     address=address,
                     locktime=locktime,
@@ -1779,7 +1782,7 @@ class WalletSyncMixin:
                         confirmations = max(0, tip_height - utxo_height + 1)
 
                     # Path format for fidelity bonds: m/84'/0'/0'/2/index:locktime
-                    path = f"{self.root_path}/0'/{FIDELITY_BOND_BRANCH}/{index}:{locktime}"
+                    path = f"{self.get_fidelity_bond_path(index)}:{locktime}"
 
                     utxo_info = _make_utxo_info(
                         txid=utxo_data["txid"],
@@ -1839,7 +1842,7 @@ class WalletSyncMixin:
                     )
                     continue
                 locktime, bond_index = bond_info
-                path = f"{self.root_path}/0'/{FIDELITY_BOND_BRANCH}/{bond_index}:{locktime}"
+                path = f"{self.get_fidelity_bond_path(bond_index)}:{locktime}"
                 self._record_history_address(source_address)
                 fidelity_bond_utxos.append(
                     _make_utxo_info(
@@ -2299,7 +2302,7 @@ class WalletSyncMixin:
             # Check if this is a fidelity bond
             if address in bond_address_to_info:
                 locktime, index = bond_address_to_info[address]
-                path = f"{self.root_path}/0'/{FIDELITY_BOND_BRANCH}/{index}:{locktime}"
+                path = f"{self.get_fidelity_bond_path(index)}:{locktime}"
                 # Track that this address has had UTXOs
                 self._record_history_address(address)
                 utxo_info = _make_utxo_info(
@@ -2338,9 +2341,7 @@ class WalletSyncMixin:
                         # Get index from address_cache (should have been set during import)
                         cached = self.address_cache.get(address)
                         index = cached[2] if cached else -1
-                        path = (
-                            f"{self.root_path}/0'/{FIDELITY_BOND_BRANCH}/{index}:{cached_locktime}"
-                        )
+                        path = f"{self.get_fidelity_bond_path(index)}:{cached_locktime}"
                         self._record_history_address(address)
                         utxo_info = _make_utxo_info(
                             txid=utxo.txid,
@@ -2378,8 +2379,7 @@ class WalletSyncMixin:
                         )
                         self.fidelity_bond_locktime_cache[address] = canonical_locktime
                         path = (
-                            f"{self.root_path}/0'/{FIDELITY_BOND_BRANCH}/"
-                            f"{canonical_index}:{canonical_locktime}"
+                            f"{self.get_fidelity_bond_path(canonical_index)}:{canonical_locktime}"
                         )
                         self._record_history_address(address)
                         utxo_info = _make_utxo_info(
@@ -2421,7 +2421,7 @@ class WalletSyncMixin:
                 bond_locktime = self.fidelity_bond_locktime_cache.get(address)
 
                 if bond_locktime is not None:
-                    path = f"{self.root_path}/0'/{FIDELITY_BOND_BRANCH}/{index}:{bond_locktime}"
+                    path = f"{self.get_fidelity_bond_path(index)}:{bond_locktime}"
                     self._record_history_address(address)
                     utxo_info = _make_utxo_info(
                         txid=utxo.txid,

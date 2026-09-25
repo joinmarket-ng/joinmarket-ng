@@ -10,7 +10,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from jmwallet.wallet.constants import FIDELITY_BOND_BRANCH
 from jmwallet.wallet.models import AddressInfo, AddressStatus, UTXOInfo
 from jmwallet.wallet.utxo_metadata import AUTO_FREEZE_REUSE_LABEL
 
@@ -40,6 +39,9 @@ class WalletDisplayMixin:
         raise NotImplementedError
 
     def get_receive_address(self, mixdepth: int, index: int) -> str:
+        raise NotImplementedError
+
+    def get_fidelity_bond_path(self, index: int) -> str:
         raise NotImplementedError
 
     def get_next_address_index(self, mixdepth: int, change: int) -> int:
@@ -577,7 +579,7 @@ class WalletDisplayMixin:
             if address in self.address_cache:
                 _, _, index = self.address_cache[address]
                 balance = address_balances.get(address, 0)
-                path = f"{self.root_path}/0'/{FIDELITY_BOND_BRANCH}/{index}:{locktime}"
+                path = f"{self.get_fidelity_bond_path(index)}:{locktime}"
 
                 addresses.append(
                     AddressInfo(
