@@ -23,6 +23,7 @@ from collections.abc import Awaitable, Callable, Iterable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
+from jmcore import experimental
 from jmcore.bitcoin import calculate_tx_vsize, get_address_type
 from jmcore.bond_calc import calculate_timelocked_fidelity_bond_value
 from jmcore.btc_script import derive_bond_address
@@ -30,6 +31,7 @@ from jmcore.channel_ring_store import RingParticipantStore
 from jmcore.commitment_blacklist import set_blacklist_path
 from jmcore.credential_market import BondReference
 from jmcore.crypto import NickIdentity
+from jmcore.experimental import warn_experimental
 from jmcore.fee_policy import fee_rate_meets_minimum
 from jmcore.logging_context import coinjoin_id_from_commitment, coinjoin_log_context
 from jmcore.market_faults import MarketFaultCache
@@ -572,6 +574,7 @@ class Taker(TakerMonitoringMixin):
 
         This should be called after sync_wallet() and any fund validation.
         """
+        self.warn_experimental_features()
         if self.config.channel_ring.enabled or self.config.channel_ring.nodes:
             if not self.backend.has_mempool_access() or not (
                 self.backend.can_get_confirmations_by_txid()
@@ -694,6 +697,22 @@ class Taker(TakerMonitoringMixin):
         if self._channel_ring_nodes is not None:
             ring_task = asyncio.create_task(self._periodic_channel_ring_reconciliation())
             self._background_tasks.append(ring_task)
+
+    def warn_experimental_features(self) -> None:
+        """Warn once about every experimental feature this taker has enabled."""
+        warn_experimental(
+            [
+                *([experimental.TAPROOT_PIT] if self.config.address_type == "p2tr" else []),
+                *([experimental.CHANNEL_RING] if self.config.channel_ring.enabled else []),
+                *(
+                    [experimental.CREDENTIAL_MARKET]
+                    if self.config.external_podle_mode == "only"
+                    or self.config.market_fault_exclusion
+                    else []
+                ),
+            ],
+            str(self.config.bitcoin_network or self.config.network),
+        )
 
     async def start(self) -> None:
         """
