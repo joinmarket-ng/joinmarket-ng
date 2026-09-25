@@ -7,7 +7,7 @@ from __future__ import annotations
 from enum import StrEnum
 
 from jmcore.config import WalletConfig
-from jmcore.models import OfferType, normalize_relative_fee
+from jmcore.models import OfferType, normalize_relative_fee, offer_output_script_type
 from jmcore.randomness import secure_random
 from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
 
@@ -321,6 +321,18 @@ class TakerConfig(WalletConfig):
             )
         if self.min_fee_rate_sat_vb > self.max_fee_rate_sat_vb:
             raise ValueError("min_fee_rate_sat_vb must not exceed max_fee_rate_sat_vb")
+        return self
+
+    @model_validator(mode="after")
+    def validate_offer_family(self) -> TakerConfig:
+        """Reject a preferred pit the wallet cannot serve (rigid pit, JMP-0010)."""
+        expected_address_type = offer_output_script_type(self.preferred_offer_type)
+        if expected_address_type != self.address_type:
+            raise ValueError(
+                f"preferred_offer_type {self.preferred_offer_type.value!r} requires a "
+                f"{expected_address_type!r} wallet, but address_type is "
+                f"{self.address_type!r}"
+            )
         return self
 
 

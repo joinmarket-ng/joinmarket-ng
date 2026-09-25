@@ -15,6 +15,7 @@ from jmcore.paths import (
     get_commitment_blacklist_path,
     get_default_data_dir,
     get_ignored_makers_path,
+    get_nick_state_component,
     get_nick_state_path,
     get_used_commitments_path,
     get_wallet_metadata_path,
@@ -22,6 +23,49 @@ from jmcore.paths import (
     remove_nick_state,
     write_nick_state,
 )
+
+
+class TestNickStateComponent:
+    """Tests for per-pit nick state filename components."""
+
+    def test_segwit_components_are_unsuffixed(self) -> None:
+        """The default SegWit pit keeps the legacy maker/taker filenames."""
+        assert get_nick_state_component("maker", "p2wpkh") == "maker"
+        assert get_nick_state_component("taker", "p2wpkh") == "taker"
+
+    def test_taproot_components_are_suffixed(self) -> None:
+        """The Taproot pit uses its own fixed filenames."""
+        assert get_nick_state_component("maker", "p2tr") == "maker_taproot"
+        assert get_nick_state_component("taker", "p2tr") == "taker_taproot"
+
+    def test_unsupported_address_type_raises(self) -> None:
+        """An unknown address type must fail rather than alias another pit."""
+        with pytest.raises(ValueError, match="Unsupported address_type"):
+            get_nick_state_component("maker", "p2pkh")
+
+    def test_pits_do_not_share_nick_files(self, tmp_path: Path) -> None:
+        """A SegWit and a Taproot maker in one data dir stay isolated."""
+        write_nick_state(tmp_path, get_nick_state_component("maker", "p2wpkh"), "J5SEGWIT")
+        write_nick_state(tmp_path, get_nick_state_component("maker", "p2tr"), "J5TAPROOT")
+
+        assert read_nick_state(tmp_path, get_nick_state_component("maker", "p2wpkh")) == "J5SEGWIT"
+        assert read_nick_state(tmp_path, get_nick_state_component("maker", "p2tr")) == "J5TAPROOT"
+
+        # Removing one pit's file leaves the other pit untouched.
+        assert remove_nick_state(tmp_path, get_nick_state_component("maker", "p2tr")) is True
+        assert read_nick_state(tmp_path, get_nick_state_component("maker", "p2wpkh")) == "J5SEGWIT"
+        assert read_nick_state(tmp_path, get_nick_state_component("maker", "p2tr")) is None
+
+    def test_legacy_segwit_file_is_read_by_default_pit(self, tmp_path: Path) -> None:
+        """A nick file written by an older version stays readable after upgrade."""
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        (state_dir / "maker.nick").write_text("J5LEGACYMAKER\n")
+
+        assert (
+            read_nick_state(tmp_path, get_nick_state_component("maker", "p2wpkh"))
+            == "J5LEGACYMAKER"
+        )
 
 
 class TestNickStateFiles:

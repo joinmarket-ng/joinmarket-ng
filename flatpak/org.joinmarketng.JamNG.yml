@@ -94,13 +94,14 @@ modules:
       - -DSECP256K1_ENABLE_MODULE_RECOVERY=ON
       - -DSECP256K1_ENABLE_MODULE_ECDH=ON
       - -DSECP256K1_ENABLE_MODULE_SCHNORRSIG=ON
+      - -DSECP256K1_ENABLE_MODULE_MUSIG=ON
       - -DSECP256K1_BUILD_BENCHMARK=OFF
       - -DSECP256K1_BUILD_TESTS=OFF
       - -DSECP256K1_BUILD_EXHAUSTIVE_TESTS=OFF
     sources:
       - type: git
         url: https://github.com/bitcoin-core/secp256k1.git
-        commit: e3a885d42a7800c1ccebad94ad1e2b82c4df5c65
+        commit: 6e2c8bc4ecdc6e71dbe7a368f360d8d453ce435d # v0.8.0
 
   # =========================================================================
   # Module 5: neutrino-api (pre-built Go binary)

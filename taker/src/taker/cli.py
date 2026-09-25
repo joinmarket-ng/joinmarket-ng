@@ -19,7 +19,7 @@ from jmcore.cli_common import resolve_mnemonic, setup_cli
 from jmcore.cli_help import SortedTyper
 from jmcore.models import NetworkType
 from jmcore.notifications import get_notifier
-from jmcore.paths import remove_nick_state, write_nick_state
+from jmcore.paths import get_nick_state_component, remove_nick_state, write_nick_state
 from jmcore.settings import JoinMarketSettings, ensure_config_file
 from jmwallet.wallet.service import WalletService
 from loguru import logger
@@ -437,6 +437,7 @@ async def _run_coinjoin(
         max_sats_freeze_reuse=config.max_sats_freeze_reuse,
         reconstruct_history=config.reconstruct_history,
         mnemonic_file=config.mnemonic_file,
+        address_type=config.address_type,
     )
 
     # Create confirmation callback
@@ -480,13 +481,18 @@ async def _run_coinjoin(
     # Create taker
     taker = Taker(wallet, backend, config, confirmation_callback=confirmation_callback)
 
+    # One taker per CoinJoin pit: the nick state filename is fixed per address type.
+    nick_component = get_nick_state_component("taker", config.address_type)
+
     try:
         # Write nick state file for external tracking and cross-component protection
         nick = taker.nick
         data_dir = config.data_dir
-        write_nick_state(data_dir, "taker", nick)
+        write_nick_state(data_dir, nick_component, nick)
         logger.info("Taker nick state written")
-        logger.bind(sensitive=True).info(f"Nick state written to {data_dir}/state/taker.nick")
+        logger.bind(sensitive=True).info(
+            f"Nick state written to {data_dir}/state/{nick_component}.nick"
+        )
 
         # Send startup notification (including nick)
         notifier = get_notifier(settings, component_name="Taker")
@@ -546,7 +552,7 @@ async def _run_coinjoin(
 
     finally:
         # Clean up nick state file on shutdown
-        remove_nick_state(config.data_dir, "taker")
+        remove_nick_state(config.data_dir, nick_component)
         await taker.stop()
 
 

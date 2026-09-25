@@ -160,6 +160,31 @@ class HDKey:
         pubkey_hex = self.get_public_key_bytes(compressed=True).hex()
         return pubkey_to_p2wpkh_address(pubkey_hex, network)
 
+    def get_p2tr_internal_xonly(self) -> bytes:
+        """Get the 32-byte x-only internal public key (BIP86)."""
+        return self.get_public_key_bytes(compressed=True)[1:]
+
+    def get_p2tr_output_xonly(self) -> bytes:
+        """Get the 32-byte x-only BIP86 output key (tweaked, used in scriptPubKey)."""
+        from jmcore.bitcoin import taproot_tweak_pubkey
+
+        _parity, output_xonly = taproot_tweak_pubkey(self.get_p2tr_internal_xonly())
+        return output_xonly
+
+    def get_p2tr_address(self, network: str = "mainnet") -> str:
+        """Get the P2TR (Taproot, BIP86 key-path) bech32m address for this key."""
+        from jmcore.bitcoin import create_p2tr_scriptpubkey, scriptpubkey_to_address
+
+        return scriptpubkey_to_address(
+            create_p2tr_scriptpubkey(self.get_p2tr_output_xonly()), network
+        )
+
+    def get_p2tr_private_key(self) -> bytes:
+        """Get the 32-byte tweaked private key for BIP86 Taproot key-path signing."""
+        from jmcore.bitcoin import taproot_tweak_privkey
+
+        return taproot_tweak_privkey(self.get_private_key_bytes())
+
     def sign(self, message: bytes) -> bytes:
         """Sign a message with this key (uses SHA256 hashing)."""
         return cast(

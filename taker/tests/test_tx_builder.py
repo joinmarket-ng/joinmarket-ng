@@ -242,6 +242,27 @@ class TestCalculateTxFee:
         # 1063 * 5 = 5315 sats
         assert fee == 5315
 
+    def test_taproot_fee_differs_from_segwit(self) -> None:
+        """Taproot (p2tr) inputs/outputs are sized differently from segwit."""
+        segwit = calculate_tx_fee(
+            num_taker_inputs=1,
+            num_maker_inputs=2,
+            num_outputs=5,
+            fee_rate=10,
+            script_type="p2wpkh",
+        )
+        taproot = calculate_tx_fee(
+            num_taker_inputs=1,
+            num_maker_inputs=2,
+            num_outputs=5,
+            fee_rate=10,
+            script_type="p2tr",
+        )
+        # p2tr key-path inputs are ~57.5 vbytes (vs 68) but p2tr outputs are
+        # 43 vbytes (vs 31); the two families produce different estimates.
+        assert taproot != segwit
+        assert taproot > 0
+
 
 class TestCoinJoinTxBuilder:
     """Tests for CoinJoinTxBuilder class."""

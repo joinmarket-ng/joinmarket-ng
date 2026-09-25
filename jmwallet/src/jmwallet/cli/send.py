@@ -414,6 +414,7 @@ def send(
             input_utxos=input_utxo,
             allow_conflicts=allow_conflicts,
             rbf=rbf,
+            address_type=settings.wallet.address_type,
         )
     )
 
@@ -440,6 +441,7 @@ async def _send_transaction(
     input_utxos: list[str] | None = None,
     allow_conflicts: bool = False,
     rbf: bool = True,
+    address_type: str = "p2wpkh",
 ) -> None:
     """Send transaction implementation."""
     if allow_conflicts and not input_utxos:
@@ -552,6 +554,7 @@ async def _send_transaction(
         max_sats_freeze_reuse=max_sats_freeze_reuse,
         reconstruct_history=reconstruct_history,
         mnemonic_file=mnemonic_file,
+        address_type=address_type,
     )
 
     try:
@@ -705,8 +708,6 @@ async def _send_transaction(
         from bitcointx import ChainParams
         from bitcointx.wallet import CCoinAddress, CCoinAddressError
 
-        from jmwallet.wallet.address import pubkey_to_p2wpkh_script
-
         # Convert destination to scriptPubKey — CCoinAddress validates the
         # bech32 checksum, rejects wrong-network addresses, and handles all
         # supported address types (P2WPKH, P2WSH, P2TR, …).
@@ -745,9 +746,19 @@ async def _send_transaction(
                 )
                 raise typer.Exit(1)
 
-            change_script = pubkey_to_p2wpkh_script(
-                change_key.get_public_key_bytes(compressed=True).hex()
-            )
+            # Derive the script from the wallet's own change address instead of
+            # a hardcoded P2WPKH template, so a Taproot (BIP86) wallet does not
+            # pay change to a script its tr() descriptors cannot see.
+            try:
+                with ChainParams(chain):
+                    change_script = bytes(CCoinAddress(change_addr).to_scriptPubKey())
+            except CCoinAddressError as exc:
+                logger.error(
+                    "Failed to encode change address script; cannot build a safe transaction"
+                )
+                logger.bind(sensitive=True).error(f"Invalid change address {change_addr}: {exc}")
+                raise typer.Exit(1) from exc
+
             outputs.append(
                 DirectTxOutput(
                     value_sats=change_amount,

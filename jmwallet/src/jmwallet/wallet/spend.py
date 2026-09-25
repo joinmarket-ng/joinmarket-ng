@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 from jmcore.bitcoin import (
     TxInput,
     TxOutput,
+    create_p2tr_scriptpubkey,
     get_txid,
     scriptpubkey_to_address,
     serialize_transaction,
@@ -507,16 +508,18 @@ async def _reconstruct_conflicted_input(
         if not _is_signable_fidelity_bond(wallet, reconstructed):
             msg = f"Input UTXO {outpoint} is a fidelity bond this wallet cannot sign"
             raise ValueError(msg)
-    elif not reconstructed.is_p2wpkh:
-        msg = f"Input UTXO {outpoint} must be a wallet P2WPKH output"
+    elif not (reconstructed.is_p2wpkh or reconstructed.is_p2tr):
+        msg = f"Input UTXO {outpoint} must be a wallet P2WPKH or P2TR output"
         raise ValueError(msg)
     else:
         key = wallet.get_key_for_address(address)
         if key is None:
             msg = f"Input UTXO {outpoint} has no signing key"
             raise ValueError(msg)
-        expected_script = pubkey_to_p2wpkh_script(
-            key.get_public_key_bytes(compressed=True).hex()
+        expected_script = (
+            create_p2tr_scriptpubkey(key.get_p2tr_output_xonly())
+            if reconstructed.is_p2tr
+            else pubkey_to_p2wpkh_script(key.get_public_key_bytes(compressed=True).hex())
         ).hex()
         if scriptpubkey.lower() != expected_script:
             msg = f"Input UTXO {outpoint} script does not match this wallet's signing key"
@@ -684,7 +687,17 @@ def build_and_sign_direct_tx(
 
     witnesses: list[list[bytes]] = []
     for index, utxo in enumerate(ordered_utxos):
-        witness = wallet.sign_input(parsed, index, utxo).witness
+        if utxo.is_p2tr:
+            # BIP341 commits to every input's amount and script, in transaction order.
+            witness = wallet.sign_input(
+                parsed,
+                index,
+                utxo,
+                prevout_values=[item.value for item in ordered_utxos],
+                prevout_scripts=[bytes.fromhex(item.scriptpubkey) for item in ordered_utxos],
+            ).witness
+        else:
+            witness = wallet.sign_input(parsed, index, utxo).witness
         if not witness or any(not isinstance(item, bytes) or not item for item in witness):
             raise ValueError(f"Wallet returned an invalid witness for input {index}")
         witnesses.append(witness)
@@ -848,9 +861,11 @@ async def prepare_direct_send(
         if change_key is None:
             msg = f"Cannot derive key for change address {change_addr}"
             raise ValueError(msg)
-        change_script = pubkey_to_p2wpkh_script(
-            change_key.get_public_key_bytes(compressed=True).hex()
-        )
+        # Derive the script from the address the wallet reports, not from a
+        # hardcoded P2WPKH template: a Taproot (BIP86) wallet would otherwise
+        # pay change to a P2WPKH script that its own tr() descriptors cannot
+        # see, silently hiding the funds.
+        change_script = _decode_bech32_scriptpubkey(change_addr, network=network)
 
     outputs = [
         DirectTxOutput(

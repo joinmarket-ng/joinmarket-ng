@@ -19,7 +19,7 @@ from jmcore.bitcoin import (
     calculate_sweep_amount,
 )
 from jmcore.fee_quantization import QUANT_ABS, QUANT_REL, quantize_abs_up, quantize_rel_up
-from jmcore.models import Offer, OfferType
+from jmcore.models import Offer, OfferType, is_absolute_offer_type
 from jmcore.paths import get_ignored_makers_path
 from jmcore.protocol import FEATURE_NEUTRINO_COMPAT, get_nick_version
 from jmcore.randomness import secure_random
@@ -107,14 +107,14 @@ def choose_with_repeat_penalty(
 
 def is_quantized_cj_fee(offer: Offer) -> bool:
     """Return whether an offer advertises a fee exactly on its public grid."""
-    if offer.ordertype in (OfferType.SW0_ABSOLUTE, OfferType.SWA_ABSOLUTE):
+    if is_absolute_offer_type(offer.ordertype):
         return int(offer.cjfee) in QUANT_ABS
     return Decimal(str(offer.cjfee)) in QUANT_REL
 
 
 def _paid_fee_policy(offer: Offer, round_up_cj_fees: bool) -> int | Decimal | None:
     """Return the fee policy paid for an offer, or None when it cannot be rounded."""
-    if offer.ordertype in (OfferType.SW0_ABSOLUTE, OfferType.SWA_ABSOLUTE):
+    if is_absolute_offer_type(offer.ordertype):
         advertised_absolute = int(offer.cjfee)
         return quantize_abs_up(advertised_absolute) if round_up_cj_fees else advertised_absolute
 
@@ -139,7 +139,7 @@ def calculate_cj_fee(offer: Offer, cj_amount: int, round_up_cj_fees: bool = Fals
     policy = _paid_fee_policy(offer, round_up_cj_fees)
     if policy is None:
         raise ValueError(f"Offer from {offer.counterparty} has no upper fee quantum")
-    if offer.ordertype in (OfferType.SW0_ABSOLUTE, OfferType.SWA_ABSOLUTE):
+    if is_absolute_offer_type(offer.ordertype):
         return int(policy)
     return calculate_relative_fee(cj_amount, str(policy))
 
@@ -216,7 +216,7 @@ def is_fee_within_limits(
     policy = _paid_fee_policy(offer, round_up_cj_fees)
     if policy is None:
         return False
-    if offer.ordertype in (OfferType.SW0_ABSOLUTE, OfferType.SWA_ABSOLUTE):
+    if is_absolute_offer_type(offer.ordertype):
         return int(policy) <= max_cj_fee.abs_fee
     return Decimal(policy) <= Decimal(max_cj_fee.rel_fee)
 
@@ -765,6 +765,7 @@ def choose_orders(
     require_quantized_cj_fees: bool = False,
     round_up_cj_fees: bool = False,
     equalize_cj_fees: bool = False,
+    allowed_types: set[OfferType] | None = None,
 ) -> tuple[dict[str, Offer], int]:
     """
     Choose n orders from the orderbook for a CoinJoin.
@@ -782,6 +783,11 @@ def choose_orders(
         required_features: Feature names that makers must support (passed to filter_offers)
         penalized_maker_keys: Recent maker nick and bond keys to probabilistically penalize
         maker_repeat_penalty: Per-repeated-maker acceptance multiplier
+        require_quantized_cj_fees: Require advertised fees to be on the public grid
+        round_up_cj_fees: Round selected maker fees up to public fee quanta
+        equalize_cj_fees: Pay every selected maker the highest realized fee
+        allowed_types: Offer types allowed for this round, restricting makers to a single
+            output script family (rigid pit, JMP-0010). Defaults to all sw0* types.
 
     Returns:
         (dict of counterparty -> offer, total_cj_fee)
@@ -807,6 +813,7 @@ def choose_orders(
         required_features=required_features,
         require_quantized_cj_fees=require_quantized_cj_fees,
         round_up_cj_fees=round_up_cj_fees,
+        allowed_types=allowed_types,
     )
 
     # Dedupe by maker (keep cheapest offer per counterparty)
@@ -875,6 +882,7 @@ def choose_sweep_orders(
     require_quantized_cj_fees: bool = False,
     round_up_cj_fees: bool = False,
     equalize_cj_fees: bool = False,
+    allowed_types: set[OfferType] | None = None,
 ) -> tuple[dict[str, Offer], int, int]:
     """
     Choose n orders for a sweep transaction (no change).
@@ -896,6 +904,11 @@ def choose_sweep_orders(
         required_features: Feature names that makers must support (passed to filter_offers)
         penalized_maker_keys: Recent maker nick and bond keys to probabilistically penalize
         maker_repeat_penalty: Per-repeated-maker acceptance multiplier
+        require_quantized_cj_fees: Require advertised fees to be on the public grid
+        round_up_cj_fees: Round selected maker fees up to public fee quanta
+        equalize_cj_fees: Pay every selected maker the highest realized fee
+        allowed_types: Offer types allowed for this round, restricting makers to a single
+            output script family (rigid pit, JMP-0010). Defaults to all sw0* types.
 
     Returns:
         (dict of counterparty -> offer, cj_amount, total_cj_fee)
@@ -928,6 +941,7 @@ def choose_sweep_orders(
         required_features=required_features,
         require_quantized_cj_fees=require_quantized_cj_fees,
         round_up_cj_fees=round_up_cj_fees,
+        allowed_types=allowed_types,
     )
 
     # Dedupe by maker
@@ -991,7 +1005,7 @@ def choose_sweep_orders(
         rel_fees = []
 
         for offer in selected:
-            if offer.ordertype in (OfferType.SW0_ABSOLUTE, OfferType.SWA_ABSOLUTE):
+            if is_absolute_offer_type(offer.ordertype):
                 policy = _paid_fee_policy(offer, round_up_cj_fees)
                 assert isinstance(policy, int)
                 sum_abs_fees += policy
@@ -1041,6 +1055,7 @@ class OrderbookManager:
         require_quantized_cj_fees: bool = False,
         round_up_cj_fees: bool = False,
         equalize_cj_fees: bool = False,
+        allowed_types: set[OfferType] | None = None,
     ):
         self.max_cj_fee = max_cj_fee
         self.bondless_makers_allowance = bondless_makers_allowance
@@ -1048,6 +1063,7 @@ class OrderbookManager:
         self.require_quantized_cj_fees = require_quantized_cj_fees
         self.round_up_cj_fees = round_up_cj_fees
         self.equalize_cj_fees = equalize_cj_fees
+        self.allowed_types = allowed_types
         self.offers: list[Offer] = []
         self.bonds: dict[str, Any] = {}  # maker -> bond info
         self.ignored_makers: set[str] = set()
@@ -1237,6 +1253,7 @@ class OrderbookManager:
             require_quantized_cj_fees=self.require_quantized_cj_fees,
             round_up_cj_fees=self.round_up_cj_fees,
             equalize_cj_fees=self.equalize_cj_fees,
+            allowed_types=self.allowed_types,
         )
         if len(result) >= n or not soft:
             return result, fee
@@ -1267,6 +1284,7 @@ class OrderbookManager:
             require_quantized_cj_fees=self.require_quantized_cj_fees,
             round_up_cj_fees=self.round_up_cj_fees,
             equalize_cj_fees=self.equalize_cj_fees,
+            allowed_types=self.allowed_types,
         )
         result.update(topup_result)
         if not self.equalize_cj_fees:
@@ -1340,6 +1358,7 @@ class OrderbookManager:
             require_quantized_cj_fees=self.require_quantized_cj_fees,
             round_up_cj_fees=self.round_up_cj_fees,
             equalize_cj_fees=self.equalize_cj_fees,
+            allowed_types=self.allowed_types,
         )
         if len(result[0]) >= n or not soft:
             return result
@@ -1364,4 +1383,5 @@ class OrderbookManager:
             require_quantized_cj_fees=self.require_quantized_cj_fees,
             round_up_cj_fees=self.round_up_cj_fees,
             equalize_cj_fees=self.equalize_cj_fees,
+            allowed_types=self.allowed_types,
         )

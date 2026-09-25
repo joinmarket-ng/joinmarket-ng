@@ -4,7 +4,10 @@ Tests for taker configuration module.
 
 from __future__ import annotations
 
+from typing import Literal
+
 import pytest
+from jmcore.models import OfferType
 from pydantic import ValidationError
 
 from taker.config import (
@@ -150,6 +153,44 @@ class TestTakerConfig:
                 mnemonic=sample_mnemonic,
                 min_fee_rate_sat_vb=2.0,
                 max_fee_rate_sat_vb=1.0,
+            )
+
+    @pytest.mark.parametrize(
+        ("address_type", "preferred_offer_type"),
+        [
+            ("p2wpkh", OfferType.SW0_RELATIVE),
+            ("p2wpkh", OfferType.SW0_ABSOLUTE),
+            ("p2tr", OfferType.TR0_RELATIVE),
+            ("p2tr", OfferType.TR0_ABSOLUTE),
+        ],
+    )
+    def test_preferred_offer_family_matches_wallet_address_type(
+        self,
+        sample_mnemonic: str,
+        address_type: Literal["p2wpkh", "p2tr"],
+        preferred_offer_type: OfferType,
+    ) -> None:
+        config = TakerConfig(
+            mnemonic=sample_mnemonic,
+            address_type=address_type,
+            preferred_offer_type=preferred_offer_type,
+        )
+        assert config.preferred_offer_type == preferred_offer_type
+
+    def test_taproot_pit_on_segwit_wallet_is_rejected(self, sample_mnemonic: str) -> None:
+        with pytest.raises(ValidationError, match="requires a 'p2tr' wallet"):
+            TakerConfig(
+                mnemonic=sample_mnemonic,
+                address_type="p2wpkh",
+                preferred_offer_type=OfferType.TR0_RELATIVE,
+            )
+
+    def test_segwit_pit_on_taproot_wallet_is_rejected(self, sample_mnemonic: str) -> None:
+        with pytest.raises(ValidationError, match="requires a 'p2wpkh' wallet"):
+            TakerConfig(
+                mnemonic=sample_mnemonic,
+                address_type="p2tr",
+                preferred_offer_type=OfferType.SW0_RELATIVE,
             )
 
     @pytest.mark.parametrize(
@@ -552,3 +593,118 @@ class TestSchedule:
         schedule.advance()
         assert schedule.is_complete()
         assert schedule.current_entry() is None
+
+
+class TestPreferredOfferTypeRoundTrip:
+    """Settings-to-config wiring for the rigid pit offer family."""
+
+    def test_preferred_offer_type_propagates_to_taker_config(self, sample_mnemonic: str) -> None:
+        from jmcore.models import OfferType
+        from jmcore.settings import (
+            JoinMarketSettings,
+            NetworkSettings,
+            TakerSettings,
+            WalletSettings,
+        )
+
+        from taker.cli import build_taker_config
+
+        settings = JoinMarketSettings(
+            wallet=WalletSettings(mnemonic=sample_mnemonic, address_type="p2tr"),
+            network=NetworkSettings(network="regtest"),
+            taker=TakerSettings(preferred_offer_type=OfferType.TR0_RELATIVE),
+        )
+
+        config = build_taker_config(
+            settings=settings,
+            mnemonic=sample_mnemonic,
+            passphrase="",
+            mixdepth=0,
+            amount=100_000,
+            destination="bcrt1qxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        )
+
+        assert config.preferred_offer_type == OfferType.TR0_RELATIVE
+
+    def test_preferred_offer_type_defaults_to_sw0(self, sample_mnemonic: str) -> None:
+        from jmcore.models import OfferType
+        from jmcore.settings import (
+            JoinMarketSettings,
+            NetworkSettings,
+            TakerSettings,
+            WalletSettings,
+        )
+
+        from taker.cli import build_taker_config
+
+        settings = JoinMarketSettings(
+            wallet=WalletSettings(mnemonic=sample_mnemonic),
+            network=NetworkSettings(network="regtest"),
+            taker=TakerSettings(),
+        )
+
+        config = build_taker_config(
+            settings=settings,
+            mnemonic=sample_mnemonic,
+            passphrase="",
+            mixdepth=0,
+            amount=100_000,
+            destination="bcrt1qxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        )
+
+        assert config.preferred_offer_type == OfferType.SW0_RELATIVE
+
+    def test_taproot_absolute_pit_propagates_to_taker_config(self, sample_mnemonic: str) -> None:
+        from jmcore.settings import (
+            JoinMarketSettings,
+            NetworkSettings,
+            TakerSettings,
+            WalletSettings,
+        )
+
+        from taker.cli import build_taker_config
+
+        settings = JoinMarketSettings(
+            wallet=WalletSettings(mnemonic=sample_mnemonic, address_type="p2tr"),
+            network=NetworkSettings(network="regtest"),
+            taker=TakerSettings(preferred_offer_type=OfferType.TR0_ABSOLUTE),
+        )
+
+        config = build_taker_config(
+            settings=settings,
+            mnemonic=sample_mnemonic,
+            passphrase="",
+            mixdepth=0,
+            amount=100_000,
+            destination="bcrt1qxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        )
+
+        assert config.preferred_offer_type == OfferType.TR0_ABSOLUTE
+        assert config.address_type == "p2tr"
+
+    def test_mismatched_pit_and_wallet_fails_before_start(self, sample_mnemonic: str) -> None:
+        """A tr0 pit on a p2wpkh wallet must be rejected while building the config."""
+        from jmcore.settings import (
+            JoinMarketSettings,
+            NetworkSettings,
+            TakerSettings,
+            WalletSettings,
+        )
+
+        from taker.cli import build_taker_config
+
+        settings = JoinMarketSettings(
+            wallet=WalletSettings(mnemonic=sample_mnemonic),
+            network=NetworkSettings(network="regtest"),
+            taker=TakerSettings(preferred_offer_type=OfferType.TR0_RELATIVE),
+        )
+
+        with pytest.raises(ValidationError, match="requires a 'p2tr' wallet"):
+            build_taker_config(
+                settings=settings,
+                mnemonic=sample_mnemonic,
+                passphrase="",
+                mixdepth=0,
+                amount=100_000,
+                destination="bcrt1qxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            )

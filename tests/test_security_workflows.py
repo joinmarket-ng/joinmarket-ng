@@ -29,9 +29,9 @@ PRODUCTION_LOCKS = {
     "tumbler/requirements.txt",
 }
 BITCOINTX_PACKAGES = {"jmcore", "jmwallet", "jmwalletd"}
-BITCOINTX_VERSION = "2.1.1"
+BITCOINTX_VERSION = "2.2.0"
 BITCOINTX_WHEEL_SHA256 = (
-    "2f82999aa557da5f501bf10ca51dd830bcf16aba27ed8d976065c798454c11c6"
+    "c14297225f11ded3bb6220d520e74a3c144ca28a25455e621aa21b5db31fe36b"
 )
 RUNTIME_IMAGE_STAGES = {
     "directory_server/Dockerfile": {"production", "debug"},
@@ -186,6 +186,23 @@ def test_bitcointx_dependency_is_pinned_to_release_wheel() -> None:
             assert "coincurve" not in lock
             assert expected_url in lock
             assert BITCOINTX_WHEEL_SHA256 in lock
+
+
+def test_bitcointx_standalone_scripts_document_the_same_pin() -> None:
+    """The standalone bond scripts install python-bitcointx outside the locks."""
+    expected_pin = (
+        "https://github.com/m0wer/python-bitcointx/releases/download/"
+        f"python-bitcointx-v{BITCOINTX_VERSION}/"
+        f"python_bitcointx-{BITCOINTX_VERSION}-py3-none-any.whl"
+        f"#sha256={BITCOINTX_WHEEL_SHA256}"
+    )
+    for script_name in (
+        "derive_bond_pubkey.py",
+        "sign_bond_cert_reference.py",
+        "sign_bond_mnemonic.py",
+    ):
+        script = (REPO_ROOT / "scripts" / script_name).read_text(encoding="utf-8")
+        assert expected_pin in script
 
 
 def test_main_and_release_promotions_depend_on_image_scans() -> None:

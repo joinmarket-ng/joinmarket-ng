@@ -18,7 +18,7 @@ dependencies = [
     "tomli>=2.0.0;python_version<'3.11'",
     "loguru>=0.7.2",
     # Maintained fork with Python 3.14 and modern libsecp256k1 compatibility.
-    "python-bitcointx @ https://github.com/m0wer/python-bitcointx/releases/download/python-bitcointx-v2.1.1/python_bitcointx-2.1.1-py3-none-any.whl#sha256=2f82999aa557da5f501bf10ca51dd830bcf16aba27ed8d976065c798454c11c6",
+    "python-bitcointx @ https://github.com/m0wer/python-bitcointx/releases/download/python-bitcointx-v2.2.0/python_bitcointx-2.2.0-py3-none-any.whl#sha256=c14297225f11ded3bb6220d520e74a3c144ca28a25455e621aa21b5db31fe36b",
     "httpx[socks]>=0.27.0",
     "httpx-socks>=0.9.0",
     # Async SOCKS5 client used by jmcore.network.connect_via_tor
@@ -69,6 +69,11 @@ target-version = "py311"
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W", "UP", "B", "C4", "SIM"]
 ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# musig2.py uses BIP327/BIP340 single-letter point names (P, Q, R) verbatim so
+# the implementation stays readable against the spec.
+"src/jmcore/musig2.py" = ["N806"]
 
 [tool.mypy]
 python_version = "3.11"

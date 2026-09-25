@@ -642,3 +642,30 @@ class TestOrderBook:
         grouped = ob.get_offers_by_directory()
         assert "unknown" in grouped
         assert len(grouped["unknown"]) == 1
+
+
+class TestOfferFamily:
+    """Offer output script family helpers (rigid pit, JMP-0010)."""
+
+    def test_offer_output_script_type(self) -> None:
+        from jmcore.models import offer_output_script_type
+
+        assert offer_output_script_type(OfferType.SW0_RELATIVE) == "p2wpkh"
+        assert offer_output_script_type(OfferType.SW0_ABSOLUTE) == "p2wpkh"
+        assert offer_output_script_type(OfferType.TR0_RELATIVE) == "p2tr"
+        assert offer_output_script_type(OfferType.TR0_ABSOLUTE) == "p2tr"
+
+    def test_offer_types_for_family_taproot(self) -> None:
+        from jmcore.models import offer_types_for_family
+
+        fam = offer_types_for_family(OfferType.TR0_RELATIVE)
+        assert fam == {OfferType.TR0_RELATIVE, OfferType.TR0_ABSOLUTE}
+        # A taproot preference must not admit segwit makers.
+        assert OfferType.SW0_RELATIVE not in fam
+
+    def test_offer_types_for_family_segwit(self) -> None:
+        from jmcore.models import offer_types_for_family
+
+        fam = offer_types_for_family(OfferType.SW0_ABSOLUTE)
+        assert fam == {OfferType.SW0_RELATIVE, OfferType.SW0_ABSOLUTE}
+        assert OfferType.TR0_RELATIVE not in fam

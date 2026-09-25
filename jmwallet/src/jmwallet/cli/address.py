@@ -69,6 +69,7 @@ class _AddressContext:
     mixdepth_count: int
     max_sats_freeze_reuse: int
     reconstruct_history: bool
+    address_type: str = "p2wpkh"
 
 
 @address_app.callback()
@@ -161,6 +162,7 @@ def _resolve_address_context(options: _AddressOptions) -> _AddressContext:
         mixdepth_count=settings.wallet.mixdepth_count,
         max_sats_freeze_reuse=settings.wallet.max_sats_freeze_reuse,
         reconstruct_history=settings.wallet.reconstruct_history,
+        address_type=settings.wallet.address_type,
     )
 
 
@@ -212,6 +214,7 @@ async def _build_wallet(c: _AddressContext) -> tuple[WalletService, str]:
         max_sats_freeze_reuse=c.max_sats_freeze_reuse,
         reconstruct_history=c.reconstruct_history,
         mnemonic_file=c.mnemonic_file,
+        address_type=c.address_type,
     )
     return wallet, bs.backend_type
 

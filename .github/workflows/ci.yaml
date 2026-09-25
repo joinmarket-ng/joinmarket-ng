@@ -396,12 +396,14 @@ jobs:
           $build = Join-Path $source "build"
           git init $source
           git -C $source remote add origin https://github.com/bitcoin-core/secp256k1.git
-          git -C $source fetch --depth 1 origin e3a885d42a7800c1ccebad94ad1e2b82c4df5c65
+          git -C $source fetch --depth 1 origin 6e2c8bc4ecdc6e71dbe7a368f360d8d453ce435d
           git -C $source checkout --detach FETCH_HEAD
           cmake -S $source -B $build `
             -DBUILD_SHARED_LIBS=ON `
             -DSECP256K1_ENABLE_MODULE_RECOVERY=ON `
             -DSECP256K1_ENABLE_MODULE_ECDH=ON `
+            -DSECP256K1_ENABLE_MODULE_SCHNORRSIG=ON `
+            -DSECP256K1_ENABLE_MODULE_MUSIG=ON `
             -DSECP256K1_BUILD_TESTS=OFF `
             -DSECP256K1_BUILD_BENCHMARK=OFF `
             -DSECP256K1_BUILD_EXHAUSTIVE_TESTS=OFF
@@ -421,6 +423,7 @@ jobs:
           # Install from source in editable mode mirrors the documented
           # Windows quick start.
           pip install ./jmcore ./taker ./jmwallet
+          python -c 'from bitcointx.core.secp256k1 import get_secp256k1; assert get_secp256k1().cap.has_musig'
       - name: Install Tor, start it, and fetch the signet orderbook
         shell: pwsh
         # Chocolatey's tor package is unreliable across runner images, so

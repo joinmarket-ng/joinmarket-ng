@@ -37,7 +37,7 @@ USAGE:
   python scripts/derive_bond_pubkey.py --locktime 2026-02 --info
 
 REQUIREMENTS:
-  pip install "python-bitcointx @ https://github.com/m0wer/python-bitcointx/releases/download/python-bitcointx-v2.1.1/python_bitcointx-2.1.1-py3-none-any.whl#sha256=2f82999aa557da5f501bf10ca51dd830bcf16aba27ed8d976065c798454c11c6"
+  pip install "python-bitcointx @ https://github.com/m0wer/python-bitcointx/releases/download/python-bitcointx-v2.2.0/python_bitcointx-2.2.0-py3-none-any.whl#sha256=c14297225f11ded3bb6220d520e74a3c144ca28a25455e621aa21b5db31fe36b"
   # Install native libsecp256k1 through your operating system package manager.
 
 OUTPUT:

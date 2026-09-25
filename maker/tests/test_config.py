@@ -3,6 +3,7 @@ Tests for maker configuration validation.
 """
 
 from pathlib import Path
+from typing import Literal
 
 import pytest
 from jmcore.models import OfferType
@@ -43,6 +44,57 @@ def test_direct_config_rejects_production_clearnet_directory() -> None:
 def test_minimum_fee_floor_cannot_exceed_maximum_fee_rate() -> None:
     with pytest.raises(ValidationError, match="min_fee_rate_sat_vb"):
         MakerConfig(mnemonic=TEST_MNEMONIC, min_fee_rate_sat_vb=2.0, max_fee_rate_sat_vb=1.0)
+
+
+@pytest.mark.parametrize(
+    ("address_type", "offer_type"),
+    [
+        ("p2wpkh", OfferType.SW0_RELATIVE),
+        ("p2wpkh", OfferType.SW0_ABSOLUTE),
+        ("p2tr", OfferType.TR0_RELATIVE),
+        ("p2tr", OfferType.TR0_ABSOLUTE),
+    ],
+)
+def test_offer_family_matches_wallet_address_type(
+    address_type: Literal["p2wpkh", "p2tr"], offer_type: OfferType
+) -> None:
+    config = MakerConfig(
+        mnemonic=TEST_MNEMONIC,
+        address_type=address_type,
+        offer_type=offer_type,
+    )
+    assert config.offer_type == offer_type
+
+
+def test_taproot_offer_on_segwit_wallet_is_rejected() -> None:
+    with pytest.raises(ValidationError, match="requires a 'p2tr' wallet"):
+        MakerConfig(
+            mnemonic=TEST_MNEMONIC,
+            address_type="p2wpkh",
+            offer_type=OfferType.TR0_RELATIVE,
+        )
+
+
+def test_segwit_offer_on_taproot_wallet_is_rejected() -> None:
+    with pytest.raises(ValidationError, match="requires a 'p2wpkh' wallet"):
+        MakerConfig(
+            mnemonic=TEST_MNEMONIC,
+            address_type="p2tr",
+            offer_type=OfferType.SW0_ABSOLUTE,
+        )
+
+
+def test_mixed_offer_families_are_rejected() -> None:
+    """A maker serves exactly one pit, so even one foreign offer config fails."""
+    with pytest.raises(ValidationError, match="requires a 'p2wpkh' wallet"):
+        MakerConfig(
+            mnemonic=TEST_MNEMONIC,
+            address_type="p2tr",
+            offer_configs=[
+                OfferConfig(offer_type=OfferType.TR0_RELATIVE),
+                OfferConfig(offer_type=OfferType.SW0_ABSOLUTE),
+            ],
+        )
 
 
 def test_maximum_maker_lock_windows_fit_metadata_ttl_cap() -> None:
@@ -475,6 +527,31 @@ class TestBuildMakerConfig:
         assert config.offer_type == OfferType.SW0_RELATIVE
         assert config.cj_fee_relative == "0.002"
 
+    def test_tr0_relative_offer_logs_relative_fee(self) -> None:
+        """A tr0 relative offer must not be logged as an absolute fee."""
+        from jmcore.settings import JoinMarketSettings
+        from loguru import logger
+
+        from maker.cli import build_maker_config
+
+        settings = JoinMarketSettings()
+        settings.wallet.address_type = "p2tr"
+        settings.maker.offer_type = "tr0reloffer"
+
+        records: list[str] = []
+        sink_id = logger.add(
+            lambda message: records.append(message.record["message"]), level="INFO"
+        )
+        try:
+            build_maker_config(settings=settings, mnemonic=TEST_MNEMONIC, passphrase="")
+        finally:
+            logger.remove(sink_id)
+
+        offer_messages = [message for message in records if message.startswith("Offer config:")]
+        assert len(offer_messages) == 1
+        assert "relative fee=" in offer_messages[0]
+        assert "absolute fee=" not in offer_messages[0]
+
     def test_max_sats_freeze_reuse_forwarded(self) -> None:
         """``wallet.max_sats_freeze_reuse`` must reach the MakerConfig (#529)."""
         from jmcore.settings import JoinMarketSettings
@@ -489,6 +566,89 @@ class TestBuildMakerConfig:
             passphrase="",
         )
         assert config.max_sats_freeze_reuse == 9_999
+
+    def test_wallet_address_type_forwarded(self) -> None:
+        """wallet.address_type must reach the MakerConfig."""
+        from jmcore.settings import JoinMarketSettings
+
+        from maker.cli import build_maker_config
+
+        settings = JoinMarketSettings()
+        assert settings.wallet.address_type == "p2wpkh"
+        config = build_maker_config(
+            settings=settings,
+            mnemonic=TEST_MNEMONIC,
+            passphrase="",
+        )
+        assert config.address_type == "p2wpkh"
+
+        settings.wallet.address_type = "p2tr"
+        settings.maker.offer_type = "tr0reloffer"
+        config = build_maker_config(
+            settings=settings,
+            mnemonic=TEST_MNEMONIC,
+            passphrase="",
+        )
+        assert config.address_type == "p2tr"
+
+    def test_taproot_wallet_serves_taproot_offers(self) -> None:
+        """A p2tr wallet must produce tr0 offers for every fee source (JMP-0010)."""
+        from jmcore.settings import JoinMarketSettings
+
+        from maker.cli import build_maker_config
+
+        settings = JoinMarketSettings()
+        settings.wallet.address_type = "p2tr"
+        settings.maker.offer_type = "tr0absoffer"
+
+        # Offer family from settings.
+        config = build_maker_config(settings=settings, mnemonic=TEST_MNEMONIC, passphrase="")
+        assert config.offer_type == OfferType.TR0_ABSOLUTE
+
+        # CLI relative/absolute fees pick the family from the wallet.
+        config = build_maker_config(
+            settings=settings, mnemonic=TEST_MNEMONIC, passphrase="", cj_fee_relative="0.002"
+        )
+        assert config.offer_type == OfferType.TR0_RELATIVE
+        assert config.cj_fee_relative == "0.002"
+
+        config = build_maker_config(
+            settings=settings, mnemonic=TEST_MNEMONIC, passphrase="", cj_fee_absolute=2_000
+        )
+        assert config.offer_type == OfferType.TR0_ABSOLUTE
+        assert config.cj_fee_absolute == 2_000
+
+        # Dual offers stay inside the Taproot pit.
+        config = build_maker_config(
+            settings=settings, mnemonic=TEST_MNEMONIC, passphrase="", dual_offers=True
+        )
+        assert [offer.offer_type for offer in config.offer_configs] == [
+            OfferType.TR0_RELATIVE,
+            OfferType.TR0_ABSOLUTE,
+        ]
+
+    def test_taproot_wallet_with_segwit_offer_type_is_rejected(self) -> None:
+        """A tr0 wallet configured with an sw0 offer must fail before the bot starts."""
+        from jmcore.settings import JoinMarketSettings
+
+        from maker.cli import build_maker_config
+
+        settings = JoinMarketSettings()
+        settings.wallet.address_type = "p2tr"
+        settings.maker.offer_type = "sw0reloffer"
+        with pytest.raises(ValidationError, match="requires a 'p2wpkh' wallet"):
+            build_maker_config(settings=settings, mnemonic=TEST_MNEMONIC, passphrase="")
+
+    def test_segwit_wallet_with_taproot_offer_type_is_rejected(self) -> None:
+        """An sw0 wallet configured with a tr0 offer must fail before the bot starts."""
+        from jmcore.settings import JoinMarketSettings
+
+        from maker.cli import build_maker_config
+
+        settings = JoinMarketSettings()
+        settings.maker.offer_type = "tr0reloffer"
+        with pytest.raises(ValidationError, match="requires a 'p2tr' wallet"):
+            build_maker_config(settings=settings, mnemonic=TEST_MNEMONIC, passphrase="")
 
     def test_max_sats_freeze_reuse_defaults_to_freeze_all(self) -> None:
         """Default ``max_sats_freeze_reuse`` is -1 (freeze all reuse)."""

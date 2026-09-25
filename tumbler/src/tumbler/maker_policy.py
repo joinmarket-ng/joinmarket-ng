@@ -6,7 +6,7 @@ to diversify the role/timing of the funded wallet's CoinJoin participation.
 Two policies must be enforced for *those* maker sessions, regardless of how
 the user has configured the standalone ``maker`` bot:
 
-1. **Zero absolute fee, sw0absoffer.** The session is short-lived and
+1. **Zero absolute fee in the wallet's pit.** The session is short-lived and
    bondless (see #2), so the offer would otherwise be ignored by takers
    filtering on fees and bonds. A 0-sat absolute offer is the cheapest
    way to be picked. Absolute offers only advertise/use ``cjfee_a``;
@@ -39,7 +39,9 @@ def apply_tumbler_maker_policy(config: MakerConfig) -> MakerConfig:
     Mutates and returns ``config`` for convenience. The function is
     idempotent: re-applying it has no effect.
     """
-    config.offer_type = OfferType.SW0_ABSOLUTE
+    config.offer_type = (
+        OfferType.TR0_ABSOLUTE if config.address_type == "p2tr" else OfferType.SW0_ABSOLUTE
+    )
     config.cj_fee_absolute = 0
     # Absolute offers ignore cj_fee_relative, but pin it to a harmless
     # default instead of carrying through an operator-specific value into

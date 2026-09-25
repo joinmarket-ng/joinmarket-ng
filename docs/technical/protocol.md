@@ -121,6 +121,14 @@ When a maker receives a relay request (`!hp2` via privmsg from another maker), i
 3. Makers verify transaction (critical security checks), sign, return `!sig`
 4. Taker assembles fully signed transaction
 
+For a tr0 P2TR input, the decrypted `!sig` argument is exactly
+`base64(0x40 || signature[64] || 0x20 || output_key[32])`. The signature uses
+BIP341 `SIGHASH_DEFAULT` with no appended sighash byte, and the final witness
+contains only that 64-byte signature. The taker rejects 65-byte signatures,
+trailing payload data, and output keys that do not match an unmatched maker
+input. A tr0 round contains only P2TR key-path inputs and P2TR outputs (JMP-0010);
+the `sw0` pit keeps its script-specific JMP-0001 signature format.
+
 **Phase 5: Broadcast**
 
 Broadcast policies (configurable):

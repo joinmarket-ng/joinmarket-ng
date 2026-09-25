@@ -199,7 +199,7 @@ class PoDLEManager:
             found = False
             for index in range(max_retries):
                 try:
-                    podle = generate_podle(private_key, utxo_str, index)
+                    podle = generate_podle(private_key, utxo_str, index, p2tr=utxo.is_p2tr)
                     commitment_hex = podle.commitment.hex()
                     if commitment_hex in self.used_commitments:
                         logger.debug("PoDLE commitment retry index already used")

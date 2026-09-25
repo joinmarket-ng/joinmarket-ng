@@ -9,12 +9,59 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Literal
 
 from jmcore.secure_files import (
     atomic_write_sensitive_file,
     ensure_sensitive_directory,
     read_sensitive_file,
 )
+
+NickRole = Literal["maker", "taker"]
+
+# Filename suffix appended to a role for each non-default CoinJoin pit. The
+# default (SegWit v0) pit deliberately has no suffix so existing deployments
+# keep using ``state/maker.nick`` and ``state/taker.nick``.
+_NICK_STATE_SUFFIX_BY_ADDRESS_TYPE: dict[str, str] = {
+    "p2wpkh": "",
+    "p2tr": "_taproot",
+}
+
+
+def get_nick_state_component(role: NickRole, address_type: str) -> str:
+    """
+    Get the nick state filename component for a role in a CoinJoin pit.
+
+    JoinMarket peers of different address types trade in separate pits, and a
+    single wallet can run one maker and one taker per pit. The nick state
+    filename is therefore derived from the role plus the pit's address type:
+
+    - ``p2wpkh`` (SegWit v0, the default pit): ``maker`` / ``taker``
+    - ``p2tr`` (Taproot): ``maker_taproot`` / ``taker_taproot``
+
+    The SegWit v0 names are unsuffixed on purpose so that existing installations
+    and external tooling keep reading and writing the same files as before.
+
+    Args:
+        role: ``'maker'`` or ``'taker'``
+        address_type: Wallet/pit address type (e.g. ``'p2wpkh'``, ``'p2tr'``)
+
+    Returns:
+        Component name to pass to the ``*_nick_state`` helpers.
+
+    Raises:
+        ValueError: If ``address_type`` has no defined pit naming. Guessing a
+            filename would let two different pits share one nick file, so an
+            unknown type is rejected rather than defaulted.
+    """
+    try:
+        suffix = _NICK_STATE_SUFFIX_BY_ADDRESS_TYPE[address_type]
+    except KeyError:
+        raise ValueError(
+            f"Unsupported address_type for nick state: {address_type!r} "
+            f"(expected one of {sorted(_NICK_STATE_SUFFIX_BY_ADDRESS_TYPE)})"
+        ) from None
+    return f"{role}{suffix}"
 
 
 def get_default_data_dir() -> Path:

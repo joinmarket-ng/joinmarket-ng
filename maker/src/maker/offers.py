@@ -14,7 +14,8 @@ from jmcore.models import (
     MAX_RELATIVE_FEE_EXPONENT,
     MAX_RELATIVE_FEE_PRECISION,
     Offer,
-    OfferType,
+    is_absolute_offer_type,
+    offer_output_script_type,
 )
 from jmcore.randomness import secure_random
 from jmwallet.wallet.service import WalletService
@@ -78,6 +79,7 @@ class OfferManager:
         self.wallet = wallet
         self.config = config
         self.maker_nick = maker_nick
+        self._validate_offer_types_match_wallet()
         # Max mixdepth balance the most recent create_offers() result was built
         # from. The bot compares fresh wallet state against this to decide when
         # announced offers are stale; None until offers have been created.
@@ -112,6 +114,31 @@ class OfferManager:
     async def get_max_offer_balance(self) -> int:
         """Largest single-mixdepth balance available for offers (0 when none)."""
         return max((await self.get_mixdepth_offer_balances()).values(), default=0)
+
+    def _validate_offer_types_match_wallet(self) -> None:
+        """Reject a configured offer family the wallet cannot serve at all.
+
+        A rigid JMP-0010 pit requires the offer family's script type
+        (sw0 -> p2wpkh, tr0 -> p2tr) to match the wallet's address_type;
+        CoinJoinSession.__init__ already enforces this per round, but only
+        at !fill time -- a p2wpkh-wallet maker configured to announce tr0
+        offers would advertise them, get filled, and only then discover the
+        mismatch and refuse, wasting a round-trip and looking like a flaky
+        maker to the taker. Checking here at OfferManager construction
+        (maker startup) catches the misconfiguration immediately instead.
+        """
+        wallet_type = getattr(self.wallet, "address_type", None)
+        if wallet_type not in ("p2wpkh", "p2tr"):
+            return
+        for oc in self.config.get_effective_offer_configs():
+            pit_type = offer_output_script_type(oc.offer_type)
+            if pit_type != wallet_type:
+                raise ValueError(
+                    f"Configured offer_type {oc.offer_type.value!r} implies a "
+                    f"{pit_type!r} pit but the wallet is {wallet_type!r}; a rigid "
+                    f"JMP-0010 pit requires them to match (configure a "
+                    f"{wallet_type!r} offer family instead)."
+                )
 
     async def create_offers(self) -> list[Offer]:
         """
@@ -253,7 +280,7 @@ class OfferManager:
             _randomize(offer_cfg.tx_fee_contribution, offer_cfg.txfee_contribution_factor, low=0)
         )
 
-        if offer_cfg.offer_type in (OfferType.SW0_RELATIVE, OfferType.SWA_RELATIVE):
+        if not is_absolute_offer_type(offer_cfg.offer_type):
             cj_fee = Decimal(offer_cfg.cj_fee_relative)
             if cj_fee <= 0:
                 logger.error(f"Invalid cj_fee_relative: {offer_cfg.cj_fee_relative}. Must be > 0.")
@@ -347,16 +374,14 @@ class OfferManager:
         rel_idx: int | None = None
         abs_idx: int | None = None
         for idx, cfg in enumerate(offer_configs):
-            if cfg.offer_type in (OfferType.SW0_RELATIVE, OfferType.SWA_RELATIVE):
+            if not is_absolute_offer_type(cfg.offer_type):
                 if rel_idx is not None:
                     return empty  # two relative offers -> not a dual rel+abs pair
                 rel_idx = idx
-            elif cfg.offer_type in (OfferType.SW0_ABSOLUTE, OfferType.SWA_ABSOLUTE):
+            else:
                 if abs_idx is not None:
                     return empty  # two absolute offers
                 abs_idx = idx
-            else:  # pragma: no cover - guarded by OfferType enum
-                return empty
 
         if rel_idx is None or abs_idx is None:
             return empty
@@ -526,7 +551,7 @@ class OfferManager:
 
             # Determine base_min_size: for relative offers enforce a
             # profitability floor using the already-randomized fee values.
-            if offer_cfg.offer_type in (OfferType.SW0_RELATIVE, OfferType.SWA_RELATIVE):
+            if not is_absolute_offer_type(offer_cfg.offer_type):
                 min_size_for_profit = (
                     int(1.5 * randomized_txfee / numeric_cjfee) if numeric_cjfee > 0 else 0
                 )

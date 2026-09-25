@@ -553,6 +553,18 @@ class BlockchainBackend(ABC):
         # Default: all backends can provide metadata for their own UTXOs
         return True
 
+    def can_resolve_foreign_prevouts(self) -> bool:
+        """Whether this backend can resolve arbitrary (foreign) prevout metadata.
+
+        A Taproot (tr0) maker's BIP341 sighash commits to the value and
+        scriptPubKey of *every* input in the CoinJoin, including the other
+        participants' inputs, so the maker must be able to look up arbitrary
+        outpoints it does not own. A full-node/descriptor backend can (via RPC);
+        a light client (Neutrino) cannot. Defaults to False; backends that can
+        answer arbitrary outpoint queries override this to True.
+        """
+        return False
+
     async def verify_tx_output(
         self,
         txid: str,

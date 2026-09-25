@@ -30,6 +30,7 @@ ARG DEBIAN_SNAPSHOT
 RUN --mount=type=bind,source=scripts/docker-apt-install.sh,target=/tmp/docker-apt-install.sh \
     sh /tmp/docker-apt-install.sh \
     build-essential \
+    cmake \
     libffi-dev \
     libsodium-dev \
     pkg-config
@@ -38,6 +39,10 @@ RUN --mount=type=bind,source=scripts/docker-apt-install.sh,target=/tmp/docker-ap
 # When not provided, pip install runs without it (non-reproducible but works)
 # Usage: docker build --build-arg SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) ...
 ARG SOURCE_DATE_EPOCH
+
+# Keep the MuSig2-capable native library inside the copied runtime environment.
+RUN --mount=type=bind,source=scripts/build_secp256k1.py,target=/tmp/build_secp256k1.py \
+    python /tmp/build_secp256k1.py --prefix /opt/venv --build-dir /build/secp256k1
 
 # Stamp the commit/ref into the built wheels (issue #451).
 ARG JOINMARKET_BUILD_COMMIT
@@ -142,7 +147,9 @@ RUN --mount=type=bind,source=scripts/docker-apt-install.sh,target=/tmp/docker-ap
         /usr/local/lib/python${PYTHON_VERSION%.*}/site-packages/pip-*.dist-info
 
 COPY --from=builder /opt/venv /opt/venv
+RUN printf '/opt/venv/lib\n' > /etc/ld.so.conf.d/jmng-secp256k1.conf && ldconfig
 ENV PATH="/opt/venv/bin:$PATH"
+RUN python -c 'from bitcointx.core.secp256k1 import get_secp256k1; assert get_secp256k1().cap.has_musig'
 
 # Reproducible builds: SOURCE_DATE_EPOCH for consistent timestamps
 ARG SOURCE_DATE_EPOCH
