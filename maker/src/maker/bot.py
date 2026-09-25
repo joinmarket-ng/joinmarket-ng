@@ -23,7 +23,7 @@ from jmcore.fee_policy import resolve_min_fee_rate
 from jmcore.models import Offer
 from jmcore.network import HiddenServiceListener, TCPConnection
 from jmcore.notifications import get_notifier
-from jmcore.paths import read_nick_state
+from jmcore.paths import get_nick_state_component, read_nick_state
 from jmcore.protocol import (
     JM_VERSION,
 )
@@ -128,6 +128,20 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         self.nick_identity = NickIdentity(JM_VERSION)
         self.nick = self.nick_identity.nick
 
+        # A Taproot (tr0) maker signs BIP341 sighashes that commit to every
+        # input's prevout, including foreign participants' inputs, so it needs a
+        # backend that can resolve arbitrary outpoints. A light client (Neutrino)
+        # cannot; fail fast at startup rather than advertising tr0 offers and
+        # refusing every fill (see docs/technical/production-checklist.md).
+        if getattr(self.wallet, "address_type", None) == "p2tr" and not (
+            backend.can_resolve_foreign_prevouts()
+        ):
+            raise ValueError(
+                "A tr0 (Taproot) maker requires a backend that can resolve arbitrary "
+                "prevouts (Bitcoin Core / descriptor wallet); the configured light-client "
+                "backend cannot, so it could never sign a tr0 CoinJoin. Use a Core backend "
+                "or configure a p2wpkh (sw0) wallet instead."
+            )
         self.directory_clients: dict[str, DirectoryClient] = {}
         # Shared connection plumbing (parsing, SOCKS isolation creds,
         # DirectoryClient construction, retry loop). The pool stores its
@@ -267,7 +281,10 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         # Own wallet nicks to exclude from CoinJoin sessions (self-CoinJoin protection)
         # Read the taker nick from state file if running both components from same wallet
         self._own_wallet_nicks: set[str] = set()
-        taker_nick = read_nick_state(config.data_dir, "taker")
+        # Only the taker trading in the same pit can meet us in a CoinJoin.
+        taker_nick = read_nick_state(
+            config.data_dir, get_nick_state_component("taker", config.address_type)
+        )
         if taker_nick:
             self._own_wallet_nicks.add(taker_nick)
             logger.info(f"Self-CoinJoin protection: excluding taker nick {taker_nick}")

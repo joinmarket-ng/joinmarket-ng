@@ -44,6 +44,22 @@ def test_policy_disables_fidelity_bond() -> None:
     assert config.no_fidelity_bond is True
 
 
+def test_policy_preserves_taproot_pit() -> None:
+    config = _baseline_config(
+        address_type="p2tr",
+        offer_type=OfferType.TR0_RELATIVE,
+        offer_configs=[OfferConfig(offer_type=OfferType.TR0_RELATIVE)],
+    )
+
+    apply_tumbler_maker_policy(config)
+
+    assert config.offer_type == OfferType.TR0_ABSOLUTE
+    assert config.get_effective_offer_configs()[0].offer_type == OfferType.TR0_ABSOLUTE
+    assert config.cj_fee_absolute == 0
+    assert config.no_fidelity_bond is True
+    assert config.offer_configs == []
+
+
 def test_policy_clears_multi_offer_configs() -> None:
     """Multi-offer takes precedence; tumbler must clear it to enforce policy."""
     config = _baseline_config(

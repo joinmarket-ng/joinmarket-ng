@@ -20,9 +20,9 @@ from jmcore.cli_common import resolve_mnemonic, select_mnemonic_source, setup_cl
 from jmcore.cli_help import SortedTyper, version_options
 from jmcore.config import build_tor_control_config
 from jmcore.maker_env import parse_maker_env
-from jmcore.models import NetworkType, OfferType
+from jmcore.models import NetworkType, OfferType, is_absolute_offer_type
 from jmcore.notifications import get_notifier
-from jmcore.paths import remove_nick_state, write_nick_state
+from jmcore.paths import get_nick_state_component, remove_nick_state, write_nick_state
 from jmcore.secure_files import read_private_file
 from jmcore.settings import (
     JoinMarketSettings,
@@ -246,6 +246,15 @@ def build_maker_config(
     # Resolve dual_offers: CLI bool (True/False) overrides settings when explicitly passed
     effective_dual_offers = dual_offers if dual_offers is not None else settings.maker.dual_offers
 
+    # The offer family follows the wallet: a p2tr wallet serves the Taproot pit
+    # (tr0), a p2wpkh wallet the native-segwit pit (sw0). See JMP-0010.
+    relative_offer_type = (
+        OfferType.TR0_RELATIVE if settings.wallet.address_type == "p2tr" else OfferType.SW0_RELATIVE
+    )
+    absolute_offer_type = (
+        OfferType.TR0_ABSOLUTE if settings.wallet.address_type == "p2tr" else OfferType.SW0_ABSOLUTE
+    )
+
     if effective_dual_offers:
         # Create both relative and absolute offers
         # Use CLI values if provided, otherwise use settings
@@ -260,7 +269,7 @@ def build_maker_config(
 
         offer_configs = [
             OfferConfig(
-                offer_type=OfferType.SW0_RELATIVE,
+                offer_type=relative_offer_type,
                 min_size=min_sz,
                 cj_fee_relative=rel_fee,
                 cj_fee_absolute=abs_fee,
@@ -270,7 +279,7 @@ def build_maker_config(
                 size_factor=settings.maker.size_factor,
             ),
             OfferConfig(
-                offer_type=OfferType.SW0_ABSOLUTE,
+                offer_type=absolute_offer_type,
                 min_size=min_sz,
                 cj_fee_relative=rel_fee,
                 cj_fee_absolute=abs_fee,
@@ -281,7 +290,7 @@ def build_maker_config(
             ),
         ]
         # Set dummy values for legacy fields (they won't be used)
-        parsed_offer_type = OfferType.SW0_RELATIVE
+        parsed_offer_type = relative_offer_type
         actual_cj_fee_relative = rel_fee
         actual_cj_fee_absolute = abs_fee
     elif cj_fee_relative is not None and cj_fee_absolute is not None:
@@ -291,12 +300,12 @@ def build_maker_config(
         )
     elif cj_fee_absolute is not None:
         # User explicitly set absolute fee via CLI
-        parsed_offer_type = OfferType.SW0_ABSOLUTE
+        parsed_offer_type = absolute_offer_type
         actual_cj_fee_relative = settings.maker.cj_fee_relative
         actual_cj_fee_absolute = cj_fee_absolute
     elif cj_fee_relative is not None:
         # User explicitly set relative fee via CLI
-        parsed_offer_type = OfferType.SW0_RELATIVE
+        parsed_offer_type = relative_offer_type
         actual_cj_fee_relative = cj_fee_relative
         actual_cj_fee_absolute = settings.maker.cj_fee_absolute
     else:
@@ -307,7 +316,7 @@ def build_maker_config(
         except ValueError:
             raise ValueError(
                 f"Invalid offer_type in config: {settings.maker.offer_type}. "
-                "Must be one of: sw0reloffer, sw0absoffer"
+                "Must be one of: sw0reloffer, sw0absoffer, tr0reloffer, tr0absoffer"
             )
         actual_cj_fee_relative = settings.maker.cj_fee_relative
         actual_cj_fee_absolute = settings.maker.cj_fee_absolute
@@ -343,17 +352,18 @@ def build_maker_config(
         logger.info(f"Dual offers mode: creating {len(offer_configs)} offers")
         for i, oc in enumerate(offer_configs):
             fee_str = (
-                f"rel={oc.cj_fee_relative}"
-                if oc.offer_type in (OfferType.SW0_RELATIVE, OfferType.SWA_RELATIVE)
-                else f"abs={oc.cj_fee_absolute} sats"
+                f"abs={oc.cj_fee_absolute} sats"
+                if is_absolute_offer_type(oc.offer_type)
+                else f"rel={oc.cj_fee_relative}"
             )
             logger.info(f"  Offer {i}: type={oc.offer_type.value}, {fee_str}")
     else:
         # Single offer mode
+        rel_pct = float(actual_cj_fee_relative) * 100
         fee_str = (
-            f"relative fee={actual_cj_fee_relative} ({float(actual_cj_fee_relative) * 100:.4f}%)"
-            if parsed_offer_type in (OfferType.SW0_RELATIVE, OfferType.SWA_RELATIVE)
-            else f"absolute fee={actual_cj_fee_absolute} sats"
+            f"absolute fee={actual_cj_fee_absolute} sats"
+            if is_absolute_offer_type(parsed_offer_type)
+            else f"relative fee={actual_cj_fee_relative} ({rel_pct:.4f}%)"
         )
         logger.info(f"Offer config: type={parsed_offer_type.value}, {fee_str}")
 
@@ -393,6 +403,7 @@ def build_maker_config(
         connection_timeout=settings.tor.connection_timeout,
         mixdepth_count=settings.wallet.mixdepth_count,
         gap_limit=settings.wallet.gap_limit,
+        address_type=settings.wallet.address_type,
         scan_range=settings.wallet.scan_range,
         dust_threshold=settings.wallet.dust_threshold,
         max_sats_freeze_reuse=settings.wallet.max_sats_freeze_reuse,
@@ -511,6 +522,7 @@ def create_wallet_service(config: MakerConfig) -> WalletService:
         max_sats_freeze_reuse=config.max_sats_freeze_reuse,
         reconstruct_history=config.reconstruct_history,
         mnemonic_file=config.mnemonic_file,
+        address_type=config.address_type,
     )
     return wallet
 
@@ -816,8 +828,11 @@ def start(
 
     wallet = create_wallet_service(config)
 
+    # One maker per CoinJoin pit: the nick state filename is fixed per address type.
+    nick_component = get_nick_state_component("maker", config.address_type)
+
     def _publish_maker_nick(_old_nick: str, new_nick: str) -> None:
-        write_nick_state(config.data_dir, "maker", new_nick)
+        write_nick_state(config.data_dir, nick_component, new_nick)
 
     bot = MakerBot(
         wallet,
@@ -850,9 +865,11 @@ def start(
             # Write nick state file for external tracking and cross-component protection
             nick = bot.nick
             data_dir = config.data_dir
-            write_nick_state(data_dir, "maker", nick)
+            write_nick_state(data_dir, nick_component, nick)
             logger.info("Maker nick state written")
-            logger.bind(sensitive=True).info(f"Nick state written to {data_dir}/state/maker.nick")
+            logger.bind(sensitive=True).info(
+                f"Nick state written to {data_dir}/state/{nick_component}.nick"
+            )
 
             # Send startup notification immediately (including nick)
             notifier = get_notifier(settings, component_name="Maker")
@@ -868,7 +885,7 @@ def start(
             pass
         finally:
             # Clean up nick state file on shutdown
-            remove_nick_state(config.data_dir, "maker")
+            remove_nick_state(config.data_dir, nick_component)
             await bot.stop()
 
     try:
